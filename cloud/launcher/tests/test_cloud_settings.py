@@ -2,6 +2,7 @@
 
 Every set below is derived from the code's own tables (SETTINGS, SECRET_SHAPES), with a completeness test, so a new member that has no case here fails."""
 import contextlib, io, json, os, re, stat, sys, tempfile, unittest
+import urllib.parse as urllib_parse
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
@@ -45,7 +46,10 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
                         "https://", "https://ho st.example", "ftp://host.example", "https://host.example\\x", "https://-a.example.be", "https://a-.example.be",
                         "https://a..example.be", "https://.example.be", "https://a_b.example.be", "https://" + "a" * 64 + ".example.be",
                         "https://" + ".".join(["a" * 60] * 5 + ["bb"]), "https://host.example\t", "https://ho\tst.example", "https://host.example\x0b",
-                        "https://8.8.8.8 :6443", "https://8.8.8.8\x1f"],
+                        "https://8.8.8.8 :6443", "https://8.8.8.8\x1f", "https://host.example.be\x0c",
+                        "https://[", "https://[::1", "https://a]b", "https://host.example.be:99999999999", "https://host.example.be:-1", "https://host.0X1f",
+                        "https://x.0XAB", "https://0X7F000001", "https://METADATA.google.internal", "https://A.LOCALHOST", "https://" + ".".join(["a" * 63] * 3 + ["b" * 59, "be"]),
+                        "https://host.example.be:", "https://user:pw@host.example.be"],
     "CW_CLOUD_CA_FILE": ["relative.pem", "/home/user/../etc/x", "-x", "$HOME/x"],
     "CW_PULL_SECRET": ["A_B", "a b", "-", "a/b", "$(x)", "UPPER"],
     "CW_VAULT_SUBSCRIPTION": ["sub-example", "0000", "00000000-0000-0000-0000-00000000000g", "$(x)", "a;b", "00000000-0000-0000-0000-000000000000 "[:-1] + "0"],
@@ -159,7 +163,7 @@ class ValueRules(Dir):
             cw.check_repo_allowed("acme-org/widget-service", {"CW_ALLOWED_REPOS": raw})   # what the validator accepts, the check accepts
 
     GOOD_HOSTS = ("https://cluster.example.internal:6443", "https://cluster.example.internal", "https://cluster.example.internal/", "https://cluster.example.be",
-                  "https://api.example.de", "https://x.example.cd", "https://x.face", "https://a.dead", "https://a-b.example.be:1", "https://a.example.be:65535",
+                  "https://api.example.de", "https://x.example.cd", "https://x.face", "https://a.dead", "https://Cluster.Example.Be", "https://a.0xg", "https://a.0x1g", "https://HOST.EXAMPLE.DE:443", "https://a-b.example.be:1", "https://a.example.be:65535",
                   "https://aks-dns-1a2b3c4d.hcp.example.azmk8s.io:443", "https://" + ".".join(["a" * 63] * 3 + ["b" * 58, "be"]))
 
     def test_a_dns_name_is_accepted_and_every_ip_literal_is_refused_because_it_is_one(self):
@@ -180,21 +184,42 @@ class ValueRules(Dir):
         loose_netloc = re.compile(r"(.+?)(?::([0-9]{1,5}))?")
         every = lambda label: True
         none = lambda label: False
+        permissive_host = re.compile(r"[A-Za-z0-9.-]+")
+        loose_port_netloc = re.compile(r"([A-Za-z0-9.-]+)(?::(.*))?")
+        nobad = re.compile("(?!)")
         cases = (
             ("an IP literal in brackets", "https://[::1]", (("_NETLOC", loose_netloc), ("_HOST", anything), ("_has_letter", every))),
             ("an IPv4 literal", "https://127.0.0.1", (("_has_letter", every), ("_integer_host_label", none))),
             ("an all-digit last label", "https://a.2130706433", (("_has_letter", every), ("_integer_host_label", none))),
             ("a 0x last label", "https://a.0x7f000001", (("_integer_host_label", none),)),
-            ("an uppercase 0X last label", "https://a.0X7F", (("_integer_host_label", none),)),
+            ("an uppercase 0X last label (the lower-casing)", "https://a.0X7F", (("_norm", lambda host: host),)),
+            ("an uppercase 0X integer host", "https://0X7F000001", (("_norm", lambda host: host), ("_HOST", old_host))),
+            ("an uppercase metadata name (the lower-casing)", "https://METADATA.google.internal", (("_norm", lambda host: host),)),
+            ("an uppercase .localhost name (the lower-casing)", "https://A.LOCALHOST", (("_norm", lambda host: host),)),
             ("no letter in the last label", "https://a.1-2", (("_has_letter", every),)),
             ("port 0", "https://host.example:0", (("_port_ok", lambda port: True),)),
             ("port 65536", "https://host.example:65536", (("_port_ok", lambda port: True),)),
+            ("a port too long for the grammar", "https://host.example.be:99999999999", (("_NETLOC", loose_port_netloc), ("_port_ok", lambda port: True))),
+            ("a port that is not digits", "https://host.example.be:abc", (("_NETLOC", loose_port_netloc), ("_port_ok", lambda port: True))),
+            ("a signed port", "https://host.example.be:-1", (("_NETLOC", loose_port_netloc), ("_port_ok", lambda port: True))),
             ("a single label", "https://face", (("_HOST", old_host),)),
-            ("a name over 253 characters", "https://" + ".".join(["a" * 60] * 5 + ["bb"]), (("_MAX_HOST", 10 ** 6),)),
+            ("a trailing dot", "https://host.example.be.", (("_HOST", permissive_host), ("_has_letter", every))),
+            ("a leading hyphen", "https://-a.example.be", (("_HOST", permissive_host),)),
+            ("a trailing hyphen", "https://a-.example.be", (("_HOST", permissive_host),)),
+            ("an empty label", "https://a..example.be", (("_HOST", permissive_host),)),
+            ("a 64-character label", "https://" + "a" * 64 + ".example.be", (("_HOST", permissive_host),)),
+            ("a 254-character name", "https://" + ".".join(["a" * 63] * 3 + ["b" * 59, "be"]), (("_MAX_HOST", 10 ** 6),)),
+            ("a 307-character name", "https://" + ".".join(["a" * 60] * 5 + ["bb"]), (("_MAX_HOST", 10 ** 6), ("_HOST", permissive_host))),
             ("the metadata name", "https://metadata.google.internal", (("_REFUSED_HOSTS", ()),)),
             ("a .localhost name", "https://a.localhost", (("_REFUSED_SUFFIX", ".never-matches"),)),
+            ("a scheme that is not https", "http://host.example.be", (("_SCHEME", ""),)),
+            ("a path", "https://host.example.be/x", (("_PATHS", ("", "/", "/x")),)),
+            ("a query", "https://host.example.be?x=1", (("_BAD_CHARS", re.compile("(?!)")), ("_shape_ok", lambda parts: True))),
+            ("a fragment", "https://host.example.be#f", (("_BAD_CHARS", re.compile("(?!)")), ("_shape_ok", lambda parts: True))),
+            ("a user part", "https://user@host.example.be", (("_BAD_CHARS", nobad), ("_NETLOC", loose_netloc), ("_HOST", anything))),
             ("a tab that urlsplit would drop", "https://cluster.example.be\t", (("_BAD_CHARS", re.compile("(?!)")),)),
             ("a newline that urlsplit would drop", "https://cluster.example.be\n", (("_BAD_CHARS", re.compile("(?!)")),)),
+            ("a form feed", "https://cluster.example.be\x0c", (("_BAD_CHARS", nobad), ("_NETLOC", loose_netloc), ("_HOST", anything))),
         )
         for label, value, patches in cases:
             with self.subTest(label):
@@ -203,6 +228,32 @@ class ValueRules(Dir):
                     for name, replacement in patches:
                         stack.enter_context(mock.patch.object(cw, name, replacement))
                     self.assertTrue(server(value), "with its rule removed %r is still refused: the case does not test the rule" % label)
+
+    def test_a_url_that_does_not_parse_is_refused_and_never_raises(self):
+        server = cw.VALIDATORS["CW_CLOUD_SERVER"][1]
+        broken = ("https://[", "https://[::1", "https://a]b", "https://]")
+        for value in broken:
+            with self.subTest(value):
+                self.assertIsNone(cw._split(value))
+                self.assertFalse(server(value))
+        def escapes(value):   # a mutant: the ValueError is let out
+            return urllib_parse.urlsplit(value)
+        def accepts(value):   # a mutant: an unparsable URL is taken as a good one
+            try:
+                return urllib_parse.urlsplit(value)
+            except ValueError:
+                return urllib_parse.urlsplit("https://ok.example.be")
+        for value in broken:
+            with self.subTest(mutant="escape", value=value), mock.patch.object(cw, "_split", escapes):
+                with self.assertRaises(ValueError):
+                    server(value)
+            with self.subTest(mutant="accept", value=value), mock.patch.object(cw, "_split", accepts):
+                self.assertTrue(server(value))
+        # through the real parser: refused naming the key and the rule, never a traceback, never the value
+        for value in broken:
+            err = self.refused(body(dict(GOOD, CW_CLOUD_SERVER=value)))
+            self.assertIn("CW_CLOUD_SERVER", err)
+            self.assertIn(cw.VALIDATORS["CW_CLOUD_SERVER"][0], err)
 
     def test_the_server_rule_judges_the_string_as_written(self):
         server = cw.VALIDATORS["CW_CLOUD_SERVER"][1]

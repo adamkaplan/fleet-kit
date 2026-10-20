@@ -1102,12 +1102,20 @@ _NUMBER = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 _REFUSED_HOSTS = ("metadata.google.internal",)
 _REFUSED_SUFFIX = ".localhost"
 _MAX_HOST = 253
+_SCHEME = "https://"
+_PATHS = ("", "/")
 _BAD_CHARS = re.compile(r"[\s\x00-\x1f\x7f%?#@\\]")   # urlsplit silently drops a tab, CR or LF: judge the string as written, so none may be there
 
 
+def _norm(host):
+    """The host as compared: lower case (a name is not case-sensitive, so METADATA.google.internal and 0X7F000001 are the same as their lower-case forms)."""
+    return host.lower()
+
+
 def _integer_host_label(label):
-    """An all-digit label, or 0x and hex digits: the forms a resolver (inet_aton) reads as an integer address (2130706433, 127.1, 0x7f000001)."""
-    return label.isdigit() or bool(re.fullmatch(r"0[xX][0-9a-fA-F]*", label))
+    """An all-digit label, or 0x and hex digits (the label is lower-cased first): the forms a resolver (inet_aton) reads as an integer address
+    (2130706433, 127.1, 0x7f000001)."""
+    return label.isdigit() or bool(re.fullmatch(r"0x[0-9a-f]*", label))
 
 
 def _has_letter(label):
@@ -1118,22 +1126,35 @@ def _port_ok(port):
     return port is None or 0 < int(port) < 65536
 
 
+def _split(value):
+    """urlsplit, or None when it raises ValueError (an unbalanced [ or ], for one)."""
+    try:
+        return urllib.parse.urlsplit(value)
+    except ValueError:
+        return None
+
+
+def _shape_ok(parts):
+    return parts.path in _PATHS and not parts.query and not parts.fragment
+
+
 def _server_ok(value):
     """The cluster API address is always a DNS NAME, so every IP literal (IPv4, bracketed IPv6, integer, hex or octal forms) is refused by the one rule:
     https://NAME[:PORT], NAME with at least two labels of letters, digits and hyphens (1 to 63 characters, no leading or trailing hyphen), at most 253
-    characters in all, no trailing dot, a last label that has a letter and is neither all digits nor 0x and hex digits; a port of digits only, 1 to 65535."""
-    if not value.startswith("https://") or _BAD_CHARS.search(value):
+    characters in all, no trailing dot, a last label that has a letter and is neither all digits nor 0x and hex digits; a port of digits only, 1 to 65535.
+    The branches, each with a named test and a mutant: scheme, bad characters, an unparsable URL, the netloc grammar, path, query and fragment, the host
+    length, the port, the label grammar, the refused names, the refused suffix, a letter in the last label, an integer last label."""
+    if not value.startswith(_SCHEME) or _BAD_CHARS.search(value):
         return False
-    try:
-        parts = urllib.parse.urlsplit(value)
-    except ValueError:
+    parts = _split(value)
+    if parts is None:
         return False
     m = _NETLOC.fullmatch(parts.netloc)
-    if not m or parts.path not in ("", "/") or parts.query or parts.fragment:
+    if not m or not _shape_ok(parts):
         return False
     host, port = m.group(1), m.group(2)
-    low = host.lower()
-    last = low.rsplit(".", 1)[-1]
+    low = _norm(host)
+    last = _norm(low.rsplit(".", 1)[-1])
     return (len(host) <= _MAX_HOST and _port_ok(port) and bool(_HOST.fullmatch(host)) and low not in _REFUSED_HOSTS
             and not low.endswith(_REFUSED_SUFFIX) and _has_letter(last) and not _integer_host_label(last))
 
