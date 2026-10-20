@@ -241,7 +241,9 @@ def health_write(engine, state, now):
         state = state if state is not None else getattr(engine, "ci_record_state", None)
         recorder.ingest_prs(getattr(state, "pr_state", None))
         records = load_health_records()
-        body = recorder.body(records.read_tool_file(engine.state_dir), light=bool((getattr(engine, "config", None) or {}).get("v2_light")), watched=health_watched_repos(engine.state_dir))
+        listed = registry_read(engine.state_dir)   # the records are a view of the registry: only its agents' sessions; a read that is not whole drops nothing
+        body = recorder.body(records.read_tool_file(engine.state_dir), light=bool((getattr(engine, "config", None) or {}).get("v2_light")), watched=health_watched_repos(engine.state_dir),
+                             sessions=[a.get("session") for a in listed["agents"].values() if a.get("session")] if listed["whole"] else None)
         state_write(Path(engine.state_dir) / records.FILE, json.dumps(body, sort_keys=True), _without(body, "written_at"), HEARTBEAT_PR_STATE, nofollow=True)
     except Exception as err:
         _health_fault(engine, "write", err)
@@ -6711,6 +6713,34 @@ class RetiredUnreadable(Exception):
     """retired.json exists but cannot be read as the {name: record} map it is (#372): for the tester gate that is NOT the same as an empty list."""
 
 
+def registry_read(state_dir):
+    """THE read of the agent list: `registry.read` (docs/agent-registry.md, sec. 1), the one source every view uses. Never raises: a registry that cannot
+    be loaded or read is a read that is not whole ({"whole": False, "agents": {}, "retired": {}, "problem": ...}); a caller that ACTS on the list acts
+    only when `whole` is true (#805). `retired` is {name: record} (an additive field of the read)."""
+    try:
+        got = load_module("registry").read(str(state_dir))
+    except Exception as err:   # the module is missing or broken: nothing is read, and the problem is said
+        return {"whole": False, "version": 0, "agents": {}, "retired": {}, "problem": "the agent registry cannot be read: %s" % _one_line(str(err), 120)}
+    got = got if isinstance(got, dict) else {}
+    return {"whole": got.get("whole") is True, "version": got.get("version") or 0,
+            "agents": {n: a for n, a in (got.get("agents") or {}).items() if isinstance(a, dict)},
+            "retired": {n: r for n, r in (got.get("retired") or {}).items() if isinstance(r, dict)},
+            "problem": got.get("problem")}
+
+
+def registry_retired(state_dir):
+    """{name: retired record} from the registry: a display's read (a read that is not whole lists nobody)."""
+    return registry_read(state_dir)["retired"]
+
+
+def registry_retired_strict(state_dir):
+    """As `registry_retired`, but a read that is not whole raises RetiredUnreadable: the verdict authority fails closed (#372)."""
+    got = registry_read(state_dir)
+    if not got["whole"]:
+        raise RetiredUnreadable(got["problem"] or "the agent registry is not whole")
+    return got["retired"]
+
+
 def read_retired_strict(state_dir):
     """The retired map, or RetiredUnreadable. A MISSING file is an empty map (nobody retired); anything else that is not a JSON object of objects (corrupt,
     empty, garbage, a list, a record that is not an object, unreadable) raises. `read_retired` reads all of those as empty, which is right for a display but
@@ -7100,9 +7130,11 @@ def pane_health_status_lines(state_dir, now=None):
     """The `status` lines for detached or dead agents (nothing when every pane is attached or unknown)."""
     if state_dir is None:
         return []
-    data = read_pane_health(state_dir)
-    retired = read_retired(state_dir)
-    bad = [(n, v) for n, v in sorted(data["states"].items()) if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in retired]
+    seen = registry_read(state_dir)
+    if not seen["whole"]:
+        return ["      panes      the agent registry could not be read (%s): no pane state shown" % _one_line(str(seen["problem"]), 120)]
+    retired = seen["retired"]
+    bad = [(n, v) for n, v in sorted(seen["agents"].items()) if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in retired]
     clock = time.time() if now is None else now
     last = _read_small(state_dir, LAST_REPORT_FILE)
     gone = [n for n, v in sorted(retired.items()) if clock - (v.get("at") or 0) <= RETIRED_SHOW_DAYS * 86400]
@@ -7715,10 +7747,13 @@ def worktree_session_in_use(engine, root):
     from an incomplete (too long) list; a session missing from a complete list is gone and is no one's directory."""
     if engine.state_dir is None:
         return None
-    retired = read_retired(engine.state_dir)
+    seen = registry_read(engine.state_dir)
+    if not seen["whole"]:
+        return "cannot read the agent registry (%s): cannot say no session runs in it" % _one_line(str(seen["problem"]), 80)
+    retired = seen["retired"]
     known = {}
-    for name, info in (read_pane_health(engine.state_dir).get("agents") or {}).items():
-        if isinstance(info, dict) and isinstance(info.get("session"), str):
+    for name, info in seen["agents"].items():
+        if isinstance(info.get("session"), str):
             known[name] = info["session"]
     for name, obs in (getattr(getattr(engine, "discovery", None), "agents", None) or {}).items():
         if getattr(obs, "session_id", None):
@@ -7826,7 +7861,7 @@ def cmd_disk_reclaim_worktrees(args, runner, now):
             raise LaunchError("refused: only the operator or the Chief of Staff may --apply a worktree reclaim (%s is %s)" % (kind[1], "an agent" if kind[0] == "agent" else "not known"))
         if not worktree_config(config)["enabled"]:
             raise LaunchError("worktree reclaim is switched off (worktree_reclaim.enabled is false)")
-    retired = read_retired(state)
+    retired = registry_retired(state)
     registry = read_worktrees(state)
     todo = {p: e for p, e in registry.items() if isinstance(e, dict) and e.get("agent") in retired}
     removed = kept = 0
@@ -8073,7 +8108,7 @@ def cmd_read(args, runner, now):
 
 def watch_problem(engine, state, name, discovery):
     """None when `watch` may open a terminal on `name`, else one line: the worker is unknown or retired, or a terminal already runs it (named)."""
-    if name in read_retired(state):
+    if name in registry_retired(state):
         return "%s is retired (a finished worker): nothing to watch" % name
     seen = discovery.agents.get(name)
     if seen is None:
@@ -8092,7 +8127,7 @@ def cmd_watch(args, runner, now, socket_call=None):
     if not NAME_RE.match(name or ""):
         raise LaunchError("name the worker: `%s watch <name>`" % PROG)
     discovery = engine.discover(engine.now())
-    if name in read_retired(state):   # said first: a retired worker is not discovered, so the caller rule could only say "not your worker"
+    if name in registry_retired(state):   # said first: a retired worker is not discovered, so the caller rule could only say "not your worker"
         raise LaunchError("refused: %s is retired (a finished worker): nothing to watch" % name)
     who = reattach_caller_problem(engine, runner, now, discovery, name)
     if who:
@@ -8925,7 +8960,7 @@ class WorkerFacts:
             return []
         if not self.seam_applies(observation, issue):
             return []   # #793: only a coder or tester on a work item or an ask; anything not readable fails toward not nudging
-        kept = read_retired(state_dir).get(observation.name)
+        kept = registry_retired(state_dir).get(observation.name)
         if kept is not None and kept.get("session") in (None, observation.session_id):
             return []   # retired on purpose
         last = _read_small(state_dir, LAST_REPORT_FILE).get(observation.name)
@@ -8964,7 +8999,7 @@ class WorkerFacts:
         last = _read_small(state_dir, LAST_REPORT_FILE).get(observation.name)
         if not isinstance(last, dict) or last.get("state") != "working" or not _is_number(last.get("work_since")) or not isinstance(last.get("work_n"), int):
             return []   # a blocked, question or closing report (or none) is not this case
-        kept = read_retired(state_dir).get(observation.name)
+        kept = registry_retired(state_dir).get(observation.name)
         if kept is not None and kept.get("session") in (None, observation.session_id):
             return []
         repo = _fleet_repo(observation.fleet, engine.config) or engine.config.get("intent_repo")
@@ -9200,7 +9235,7 @@ def triage_stop(engine, source, observation, boss, idle_ms, reply):
     if now - observation.idle_at > engine.config["rider_max_age_seconds"]:
         return None  # a stop that old is not news, and a nudge would be late
     if engine.state_dir is not None:   # a RETIRED worker is finished on purpose: no nudge, no "stopped without reporting" to its boss (no state dir: triaged as before)
-        kept = read_retired(engine.state_dir).get(observation.name)
+        kept = registry_retired(engine.state_dir).get(observation.name)
         if kept is not None and kept.get("session") in (None, observation.session_id):
             return None
     boss_view = engine.discovery.agents.get(boss) if engine.discovery else None
@@ -9984,6 +10019,7 @@ def decisions_from_reports(engine, now):
     since = now - engine.config["decisions_lookback_hours"] * 3600
     bosses = sorted({resolve_boss(discovery, _boss_of(o)) for o in discovery.agents.values() if _boss_of(o)})
     repos = decision_repos(engine)
+    listed = registry_read(engine.state_dir) if engine.state_dir is not None else {"whole": False, "agents": {}}   # the decisions view: who is still an agent comes from the registry
     items, problems, sends, unread = [], [], {}, {}
     for boss in bosses:
         observation = discovery.agents.get(boss)
@@ -10015,8 +10051,8 @@ def decisions_from_reports(engine, now):
                                 "repo": item.get("repo") or _fleet_repo(sender.fleet, engine.config), "session": None})
         reports.sort(key=lambda r: r["at"])
         for report in reports:
-            if report["state"] not in ("question", "blocked") or report["sender"] not in discovery.agents:
-                continue  # not a decision, or the worker that asked no longer runs: no one is waiting
+            if report["state"] not in ("question", "blocked") or report["sender"] not in discovery.agents or (listed["whole"] and report["sender"] not in listed["agents"]):
+                continue  # not a decision, or the worker that asked is not in the registry (retired, gone): no one is waiting; a read that is not whole drops nothing
             worker = report["sender"]
             if worker not in unread:
                 try:
@@ -14445,7 +14481,7 @@ def testers_status(config, agents, fleets, state):
         repo_of = lambda fleet: _fleet_repo(fleet, config)
         repos = {repo_of(fleet) for fleet in fleets.values() if isinstance(fleet, dict) and fleet.get("role") == "orchestrator"} - {None}
         try:
-            retired = read_retired_strict(state)
+            retired = registry_retired_strict(state)
         except RetiredUnreadable:
             return ["      testers    retired file unreadable: launch-record testers disabled"]   # the same fail-closed rule the verdict gate applies
         return load_launch_testers().status_lines(config.get("plan_evaluators"), fleets, sessions, repos, repo_of, retired)
@@ -20396,7 +20432,7 @@ def launched_testers_for(ctx):
     except Exception:
         return {}, {}, {}
     try:
-        retired = read_retired_strict(ctx.engine.state_dir) if ctx.engine.state_dir is not None else {}
+        retired = registry_retired_strict(ctx.engine.state_dir) if ctx.engine.state_dir is not None else {}
     except Exception as err:   # a corrupt retired file could hide a retired tester: no launched tester counts, loudly (audit; `status` says so too)
         ctx.engine._note("testers.retired_unreadable", None, {"error": _one_line(str(err), 160), "effect": "launch-record testers disabled"})
         return {}, sessions, fleets
@@ -20752,7 +20788,7 @@ def item_agents(ctx):
         fleets = {name: (seen.fleet or {}) for name, seen in agents.items()}
         sessions = {name: seen.session_id for name, seen in agents.items()}
         state_dir = getattr(ctx.engine, "state_dir", None)
-        retired = read_retired_strict(state_dir) if state_dir is not None else {}
+        retired = registry_retired_strict(state_dir) if state_dir is not None else {}
     except Exception as err:
         raise ItemAgentsUnreadable("the running agents cannot be read (%s: %s)" % (type(err).__name__, _one_line(str(err), 120))) from None
     return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions, fleets
@@ -27642,17 +27678,20 @@ def load_tick(engine, discovery):
     links_gate = getattr(engine, "awaiting_held_links", False) and now - waited < HELD_LINKS_WAIT_SECONDS   # #796: a start's held-PR links must be whole before the first alert; it lapses after a bound
     cfg = engine.config.get("load_alert") or dict(health.DEFAULTS)
     reminders = read_reminders(engine.state_dir)
-    retired, last_reports = read_retired(engine.state_dir), _read_small(engine.state_dir, LAST_REPORT_FILE)
+    listed = registry_read(engine.state_dir)   # the load line is a view of the registry: an agent it does not list has no figures; a read that is not whole alerts nobody (#805)
+    if not listed["whole"]:
+        return []
+    retired, last_reports = listed["retired"], _read_small(engine.state_dir, LAST_REPORT_FILE)
     orchestrators = {}
     for name, seen in sorted(discovery.agents.items()):
         fleet = seen.fleet or {}
-        if fleet.get("role") != "orchestrator":
+        if fleet.get("role") != "orchestrator" or name not in listed["agents"]:
             continue
         entry = retired.get(name)
         if isinstance(entry, dict) and entry.get("session") in (None, getattr(seen, "session_id", None)):
             continue   # on the retired list (the same name and session rule as coder_finished): no load figures and no health row
         coders = [o for o in discovery.agents.values() if (o.fleet or {}).get("reports_to") == name and (o.fleet or {}).get("role") == "coder"
-                  and not coder_finished(o, retired, last_reports)]   # a retired coder, or one that made its final report, is on the books but not a coder of this workspace
+                  and o.name in listed["agents"] and not coder_finished(o, retired, last_reports)]   # a retired coder, or one that made its final report, is on the books but not a coder of this workspace
         orchestrators[name] = {"charter": fleet.get("charter") if _is_issue_number(fleet.get("charter")) else None,   # a fallback: the charter is found by the yaml that names the agent
                                "repo": _fleet_repo(fleet, engine.config) or (engine.intents.repo if engine.intents is not None else None),
                                "busy": sum(1 for c in coders if c.status == "working"), "idle": sum(1 for c in coders if c.status == "idle"),
