@@ -13186,9 +13186,6 @@ class TestChatClearHook(Base):
     def v2_ops(self, since=0):
         return [c for c in self.world.v2.calls[since:] if len(c) > 2 and c[1] == "api" and c[2] in ("session.message.list", "session.inbox.list", "session.get", "session.list")]
 
-    def chat_calls(self, since):
-        return [c for c in self.world.v2.calls[since:] if len(c) > 2 and c[1] == "api" and c[2].startswith("session.message") or len(c) > 2 and c[1] == "api" and c[2] == "session.inbox.list"]
-
     def run_pass_only(self, decisions=None):
         """Only the chat clear's own pass (the discovery is done): returns the calls it made."""
         self.engine.discover(self.world.clock.now())
@@ -13254,7 +13251,19 @@ class TestChatClearHook(Base):
         self.say("9 is good to go")
         with mock.patch.object(self.engine.v2, "message_list", side_effect=sb.V2Error("timeout", None, "slow")):
             self.hook()
+            self.hook()   # the same fault again: said once, not once per pass
         self.assertEqual((self.events("chat_clear.verdict"), len(self.events("chat_clear.read_refused"))), ([], 1))
+        self.assertIn("the read failed", self.events("chat_clear.read_refused")[0]["detail"]["why"])
+
+        self.assertEqual(self.cc_seen(), {})
+
+    def test_s4c_a_reply_that_is_not_a_list_judges_nothing_and_marks_nothing_seen(self):
+        self.light()
+        self.hook()
+        self.say("9 is good to go")
+        with mock.patch.object(self.engine.v2, "message_list", return_value=None):
+            self.hook()
+        self.assertEqual(self.events("chat_clear.verdict"), [])
         self.assertEqual(self.cc_seen(), {})
 
     def fixture(self):
@@ -13358,10 +13367,7 @@ class TestChatClearHook(Base):
         for index in sorted(cases):   # the mutant of each member: the same call with the light guard removed
             with self.subTest(member=sb.V2_LIGHT_OFF[index]):
                 mark = len(self.world.v2.calls)
-                try:
-                    cases[index][1]()
-                except Exception:
-                    pass
+                cases[index][1]()
                 self.assertNotEqual(self.v2_ops(mark), [], "%s makes a session call without light" % cases[index][0])
 
     def test_the_seen_file_is_private_bounded_and_empty_when_damaged(self):

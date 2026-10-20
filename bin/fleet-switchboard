@@ -22082,18 +22082,18 @@ def chat_clear_prompts(engine, session_id, now):
     """The owner's prompts the chat clear judges, newest first. Not under v2_light: as before (`newest_prompts`). UNDER v2_light this is the ONE allowed read of session
     history besides the write-gate's: ONE `session.message.list` of the newest CHAT_CLEAR_LIGHT_LIMIT user messages of THIS session (the Chief of Staff's), no inbox, no
     second page, no other session; fleet-sent records are dropped here and `persons_text` decides again. A page over CHAT_CLEAR_LIGHT_BYTES, or a read that fails, gives
-    None and an audit line saying why: nothing is judged and nothing is marked seen. Never raises."""
+    None and an audit line saying why (once per change, not once per pass; the byte bound is applied AFTER the read, the call itself is capped by its limit): nothing is judged and nothing is marked seen. Never raises."""
     if not getattr(engine, "light", False):
         return newest_prompts(engine, session_id)
     try:
         page = engine.v2.message_list(session_id, limit=CHAT_CLEAR_LIGHT_LIMIT, type="user")
     except Exception as err:
-        engine.audit.append(engine.actor, "chat_clear.read_refused", "chat_clear", {"why": "the read failed: %s" % _one_line(str(err), 160)})
+        engine._note("chat_clear.read_refused", "chat_clear", {"why": "the read failed: %s" % _one_line(str(err), 160)})
         return None
     page = page if isinstance(page, list) else []
     size = len(json.dumps(page, separators=(",", ":"), default=str))
     if size > CHAT_CLEAR_LIGHT_BYTES:
-        engine.audit.append(engine.actor, "chat_clear.read_refused", "chat_clear", {"why": "the page was %d bytes, over the bound of %d: nothing is judged" % (size, CHAT_CLEAR_LIGHT_BYTES),
+        engine._note("chat_clear.read_refused", "chat_clear", {"why": "the page was %d bytes, over the bound of %d: nothing is judged" % (size, CHAT_CLEAR_LIGHT_BYTES),
                                                                                     "bytes": size, "bound": CHAT_CLEAR_LIGHT_BYTES})
         return None
     engine._note("chat_clear.read", "chat_clear", {"records": len(page), "bytes": size, "light": True})
