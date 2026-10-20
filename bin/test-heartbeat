@@ -402,8 +402,29 @@ def fake_runner(returncode=0, stdout="herdr 0.9.0\n", stderr="", raises=None):
     return run
 
 
+class FakeRegistry:
+    """The registry's read API (docs/agent-registry.md), in memory: stands in for bin/registry.py until it is installed."""
+
+    def __init__(self, agents=None, whole=True, problem=None):
+        self.agents = agents or {}
+        self.whole = whole
+        self.problem = problem
+
+    def read(self, state_dir):
+        if not self.whole:
+            return {"whole": False, "version": 1, "agents": {}, "retired": {}, "problem": self.problem or "registry.json is not valid JSON: nothing read"}
+        return {"whole": True, "version": 1, "agents": dict(self.agents), "retired": {}, "problem": None}
+
+
+def registry_agents(*panes):
+    return {"role%d" % i: {"pane": pane, "workspace": pane.split(":")[0], "role": "worker"} for i, pane in enumerate(panes)}
+
+
 class Base(unittest.TestCase):
     def setUp(self):
+        saved = hb.registry
+        self.addCleanup(setattr, hb, "registry", saved)
+        hb.registry = FakeRegistry(registry_agents("w2:p2"))
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.home = Path(tmp.name)
@@ -1217,6 +1238,50 @@ class TestHerdrVerification(Base):
             hb.Herdr = original_transport
         self.assertIsNone(hb.read_state(self.state)["service"].get("fault"))
         self.assertEqual(self.pane()["attempts"][-1]["status"], "socket_unavailable")
+
+
+# ------------------------------------------------------- who exists: the registry
+
+class TestRegistryIdentity(Base):
+    def loop(self, herdr):
+        config = {"herdr": str(self.fake_bin()), "socket": "/tmp/x.sock"}
+        original = hb.Herdr
+        hb.Herdr = lambda cfg, **kw: herdr
+        try:
+            hb._loop_once(self.state, self.config, dict(config))
+        finally:
+            hb.Herdr = original
+
+    def test_s11_supervises_exactly_the_registry_agents_and_reads_no_agent_list(self):
+        hb.registry = FakeRegistry(registry_agents("w2:p2", "w3:p1", "w4:p1"))
+        # herdr lists a 4th, belled agent the registry does not know: it must not be supervised.
+        herdr = FakeHerdr(
+            tabs=[{"tab_id": "w%d:t1" % n, "workspace_id": "w%d" % n, "label": "%s x" % BELL} for n in (2, 3, 4, 9)],
+            agents=[{"pane_id": "w%d:p%d" % (n, 2 if n == 2 else 1), "tab_id": "w%d:t1" % n, "agent": "opencode", "agent_status": "idle"} for n in (2, 3, 4, 9)])
+        with quiet_stderr():
+            self.loop(herdr)
+        self.assertEqual(set(hb.read_state(self.state)["panes"]), {"w2:p2", "w3:p1", "w4:p1"})
+        self.assertEqual([c for c in herdr.calls if c[:2] in {("tab", "list"), ("agent", "list")}], [])
+
+    def test_s12_a_read_that_is_not_whole_nudges_nobody_and_says_why(self):
+        hb.registry = FakeRegistry(registry_agents("w2:p2"), whole=False)
+        herdr = FakeHerdr()
+        with self.assertLogs(level="ERROR") as logs:
+            logging.disable(logging.NOTSET)
+            try:
+                self.loop(herdr)
+            finally:
+                logging.disable(logging.CRITICAL)
+        self.assertEqual(herdr.sent, [])
+        self.assertEqual(herdr.calls, [])
+        self.assertEqual(len([l for l in logs.output if "was not whole" in l]), 1)
+        self.assertEqual(hb.read_state(self.state)["panes"], {})
+        self.assertIn("not whole", hb.read_state(self.state)["service"]["last_error"])
+
+    def test_no_registry_module_fails_closed(self):
+        hb.registry = None
+        self.assertEqual(hb.registry_targets()[0], [])
+        self.assertIn("not found", hb.registry_targets()[1])
 
 
 # ----------------------------------------------------------- config validation

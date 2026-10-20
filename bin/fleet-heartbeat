@@ -70,6 +70,45 @@ def _load_ack_module():
 
 ack, ACK_PATH = _load_ack_module()
 
+def _load_registry_module():
+    """The agent registry (bin/registry.py, beside this file), or None when it is not installed: then no pass can be whole."""
+    path = Path(__file__).resolve().parent / "registry.py"
+    if not path.is_file():
+        return None
+    loader = importlib.machinery.SourceFileLoader("fleet_heartbeat_registry", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+registry = _load_registry_module()
+
+
+def registry_state_dir():
+    """The daemon's state directory, where registry.json lives (FLEET_REGISTRY_DIR overrides, as for tests)."""
+    override = os.environ.get("FLEET_REGISTRY_DIR")
+    if override:
+        return Path(override)
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "fleet-switchboard"
+
+
+def registry_targets():
+    """Who exists, from the registry: (targets, problem). A read that is not whole gives no targets and one line saying why (fail closed).
+    A target is a registry agent with a pane; no list from herdr is read to decide who exists."""
+    if registry is None:
+        return [], "registry module not found: nothing supervised this pass"
+    found = registry.read(registry_state_dir())
+    if not found.get("whole"):
+        return [], "registry read was not whole (%s): nobody nudged this pass" % (found.get("problem") or "no reason given")
+    targets = []
+    for name, agent in sorted(found.get("agents", {}).items()):
+        if isinstance(agent, dict) and agent.get("pane"):
+            targets.append({"name": name, "pane_id": str(agent["pane"]), "workspace_id": agent.get("workspace"), "tab_id": None})
+    return targets, None
+
+
 utc = ack.utc
 atomic_write = ack.atomic_write
 stagger_offset = ack.stagger_offset
@@ -821,13 +860,10 @@ def _loop_once(state_dir, config_path, config):
 
     now = time.time()
     suspect = False
-    try:
-        targets = transport.discover()
-    except Unavailable as err:
-        logging.error("discovery failed: %s", err)
-        record_service(state_dir, last_error="discover:%s" % err)
-        targets = []
-        suspect = str(err) in HERDR_SUSPECT_STATUSES
+    targets, problem = registry_targets()
+    if problem:
+        logging.error("%s", problem)
+        record_service(state_dir, last_error="registry:%s" % problem)
 
     for target in targets:
         pane_id = target["pane_id"]
