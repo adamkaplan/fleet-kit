@@ -57825,6 +57825,41 @@ class TestHeavyCeilings(unittest.TestCase):
             self.assertEqual(self.hs.classify(command), kind)
             self.assertEqual(self.hs.classify(self.RUNNABLE[kind]), kind)
 
+    def test_m2_a_word_that_only_contains_a_kind_name_never_changes_the_kind(self):
+        """One case per matcher: a path, a filter value and a shell string that contain each kind's word; the kind stays that of the PROGRAM and its whole option words."""
+        words = [w for w in self.hs.E2E_WORDS if not w.startswith("-")]
+        self.assertTrue(words)
+        for word in words:
+            with self.subTest(word=word):
+                self.assertEqual(self.hs.classify(["bin/test-switchboard", "-k", "test_%s_tabs" % word]), "focused")
+                self.assertEqual(self.hs.classify(["bin/test-switchboard", "-k", word]), "focused", "a filter VALUE is not read")
+                self.assertEqual(self.hs.classify(["bin/test-switchboard", "/work/repo-%s/file" % word]), "full", "a path argument")
+                self.assertEqual(self.hs.classify(["sh", "-c", "cd /x/%s-app && bin/test-switchboard" % word]), "other", "a shell string is not read")
+                self.assertEqual(self.hs.classify(["cat", "/tmp/%s.txt" % word]), "other")
+                self.assertEqual(self.hs.classify(["python3", "/home/user/%s-notes/run.py" % word]), "other")
+                self.assertEqual(self.hs.classify(["bin/test-switchboard", "tests/test_%s.py" % word]), "focused", "a test file argument is a focused run, whatever its name")
+                self.assertEqual(self.hs.classify(["python3", "-m", word]), "e2e", "the program itself, or a whole word, is read")
+                self.assertEqual(self.hs.classify(["npx", word, "test"]), "e2e")
+                self.assertEqual(self.hs.classify(["timeout", "60", "bin/%s-runner" % word]), "e2e", "the program's own name")
+        self.assertEqual(self.hs.classify(["bin/test-switchboard", "--browser"]), "e2e", "a whole option word")
+        self.assertEqual(self.hs.classify(["python3", "-m", "unittest", "discover"]), "full", "a whole suite")
+        self.assertEqual(self.hs.classify(["python3", "-m", "unittest"]), "full")
+        self.assertEqual(self.hs.classify(["python3", "-m", "unittest", "-v", "a.b"]), "focused")
+        self.assertEqual(self.hs.classify(["pytest", "a/b.py::t"]), "focused")
+        self.assertEqual(self.hs.classify(["pytest"]), "full")
+        for command in (["make", "test"], ["npm", "test"], ["go", "test"]):
+            self.assertEqual(self.hs.classify(command), "full")
+        self.assertEqual(self.hs.classify([]), "other")
+
+    def test_the_configured_ceilings_never_pass_the_hard_maximum(self):
+        for key in ("full", "focused", "e2e", "other", "max"):
+            with self.subTest(key=key), self.assertRaises(self.hs.HeavyError):
+                self.hs.settings({"ceilings": {key: 14401}})
+        table = self.hs.ceiling_table({"ceilings": {"full": 99999999, "max": 99999999}})   # a config that was not validated reads as the default, never above the maximum
+        self.assertEqual(table["max"], 14400)
+        self.assertLessEqual(max(table.values()), 14400)
+        self.assertEqual(self.hs.resolve_ceiling("full", {}, "99999", {"ceilings": {"full": 14401}}), 14400)
+
     def test_s3_each_kind_has_its_default_and_a_configured_value_replaces_only_its_own(self):
         for kind, command, default in self.FAMILY:
             with self.subTest(kind=kind):
@@ -57896,47 +57931,74 @@ class TestHeavyCeilings(unittest.TestCase):
     def canary(self):
         return "".join(["sk", "-", "canary", "-", "930", "-", "abcdef"])   # built at run time: no secret-shaped literal in the file
 
-    def reported(self, command, **kw):
-        """A time stop reported through the REAL report_stop with a recording sender and audit; returns (told list, audit list, sent texts)."""
-        sent, audited = BoundedList(), BoundedList()
-
+    def hooks(self, sent, audited, answer="sent", audit_fails=False, order=None):
+        """The two-phase on_stop of the product, built from the REAL record_stop and tell_lane with a recording sender and audit."""
         def send(lane, text):
             sent.append((lane, text))
-            return kw.get("answer", "sent")
-        stop = lambda info, holder, lane: self.hs.report_stop(info, holder, lane, send, lambda *a: audited.append(a))
-        secret = self.canary()
-        code, _seen = self.drive(command + [secret], [5401], environ_extra={"FLEET_HEAVY_SECRET_930": secret, "FLEET_HEAVY_NAME": "lane-x"}, on_stop=stop, name="holder-x", **{k: v for k, v in kw.items() if k != "answer"})
-        return code, sent, audited, secret
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
 
-    def test_s7_the_audit_line_has_exactly_its_fields_and_no_argument_or_environment(self):
+        def audit(*a):
+            if order is not None:
+                order.append(("audit", len(self.signals)))   # how many signals had been sent when the line was written
+            if audit_fails:
+                raise OSError("the audit sink is full")
+            audited.append(a)
+        note = self.out.write
+
+        def on_stop(phase, info, holder, lane):
+            if phase == "decided":
+                self.hs.record_stop(info, holder, audit, note)
+            else:
+                self.hs.tell_lane(info, holder, lane, send, audit, 14400, note)
+        return on_stop
+
+    def reported(self, command, **kw):
+        """A time stop through the real hooks; returns (exit status, sent, audited, secret, order)."""
+        sent, audited, order = BoundedList(), BoundedList(), BoundedList()
+        stop = self.hooks(sent, audited, kw.pop("answer", "sent"), kw.pop("audit_fails", False), order)
+        secret = self.canary()
+        code, _seen = self.drive(command + [secret], [5401], environ_extra={"FLEET_HEAVY_SECRET_930": secret, "FLEET_HEAVY_NAME": "lane-x"}, on_stop=stop, name="holder-x", **kw)
+        return code, sent, audited, secret, order
+
+    def test_s7_the_audit_lines_have_exactly_their_fields_and_no_argument_or_environment(self):
         for kind, command, default in self.FAMILY:
             with self.subTest(kind=kind):
-                self.signals, self.exited = BoundedList(), threading.Event()
-                code, sent, audited, secret = self.reported(self.RUNNABLE[kind], ceiling=str(default))
+                self.signals, self.exited, self.out = BoundedList(), threading.Event(), BoundedOut()
+                code, sent, audited, secret, order = self.reported(self.RUNNABLE[kind], ceiling=str(default))
                 self.assertEqual(code, 124)
-                self.assertEqual(len(audited), 1)
-                event, subject, detail = audited[0]
-                self.assertEqual((event, subject), ("heavy.stopped", "holder-x"))
-                self.assertEqual(set(detail), {"kind", "ran_seconds", "ceiling_seconds", "pid", "reason", "source", "lane_told"})
-                self.assertEqual((detail["kind"], detail["ceiling_seconds"], detail["pid"], detail["source"], detail["lane_told"]), (kind, default, 4242, "wrapper", "sent"))
+                self.assertEqual([a[0] for a in audited], ["heavy.stopped", "heavy.lane_told"], "the stop is audited first, the message after")
+                (event, subject, detail), (_e2, _s2, told) = audited
+                self.assertEqual(subject, "holder-x")
+                self.assertEqual(set(detail), {"kind", "ran_seconds", "ceiling_seconds", "pid", "reason", "source"})
+                self.assertEqual((detail["kind"], detail["ceiling_seconds"], detail["pid"], detail["source"], detail["reason"]), (kind, default, 4242, "wrapper", "time"))
                 self.assertGreater(detail["ran_seconds"], default)
-                line = json.dumps(audited[0])
-                for text in (secret, "FLEET_HEAVY_SECRET_930", "lane-x" if False else secret):
+                self.assertEqual(told, {"pid": 4242, "source": "wrapper", "lane_told": "sent"})
+                self.assertEqual(order[0], ("audit", 0), "the heavy.stopped line is written before the first signal")
+                line = json.dumps(list(audited))
+                for text in (secret, "FLEET_HEAVY_SECRET_930", "PATH"):
                     self.assertNotIn(text, line)
 
     def test_s8_the_lane_is_told_once_with_fixed_words_and_an_unknown_name_is_said_in_the_audit(self):
-        for answer in ("sent", "unknown name", "failed"):
+        for answer in ("sent", "unknown name", "failed", KeyError("the sender is broken")):
             with self.subTest(answer=answer):
-                self.signals, self.exited = BoundedList(), threading.Event()
-                code, sent, audited, secret = self.reported(self.RUNNABLE["full"], answer=answer)
+                self.signals, self.exited, self.out = BoundedList(), threading.Event(), BoundedOut()
+                code, sent, audited, secret, order = self.reported(self.RUNNABLE["full"], answer=answer)
                 self.assertEqual(code, 124, "a message that fails never changes the exit status")
                 self.assertEqual(len(sent), 1, "told once, no retry")
                 self.assertEqual(sent[0][0], "lane-x", "the recorded lane, not the holder's name")
-                self.assertEqual(audited[0][2]["lane_told"], answer)
+                self.assertEqual(audited[1][2]["lane_told"], answer if isinstance(answer, str) else "failed")
                 self.assertRegex(sent[0][1], r"^heavy: your full run \(pid 4242\) was stopped after \d+ s; its ceiling was 5400 s \(FLEET_HEAVY_MAX_SECONDS or heavy --ceiling asks for more, up to 14400\)$")
-        raised = BoundedList()
-        self.hs.report_stop({"kind": "full", "pid": 1, "ran_seconds": 2, "ceiling_seconds": 1, "source": "wrapper"}, "h", "l", self.broken_sender, lambda *a: raised.append(a))
-        self.assertEqual(raised[0][2]["lane_told"], "failed", "a sender that raises reads as failed")
+
+    def test_m3_an_audit_sink_that_fails_never_prevents_the_stop_and_the_failure_is_on_the_record(self):
+        self.signals, self.exited, self.out = BoundedList(), threading.Event(), BoundedOut()
+        code, sent, audited, secret, order = self.reported(self.RUNNABLE["full"], audit_fails=True)
+        self.assertEqual(code, 124)
+        self.assertTrue(self.signals, "the run was stopped")
+        self.assertEqual(list(audited), [])
+        self.assertIn("could not write the audit line heavy.stopped (OSError: the audit sink is full): the run is stopped all the same", self.out.getvalue())
+        self.assertEqual(len(sent), 1, "the lane is still told")
 
     @staticmethod
     def broken_sender(lane, text):
@@ -57983,8 +58045,8 @@ class TestHeavyCeilings(unittest.TestCase):
             with self.subTest(form=form):
                 self.signals, self.exited = BoundedList(), threading.Event()
                 sent, audited = BoundedList(), BoundedList()
-                stop = lambda info, holder, lane: self.hs.report_stop(info, holder, lane, lambda l, t: sent.append(t) or "sent", lambda *a: audited.append(a))
-                self.drive(command, [5401], environ_extra=environ, on_stop=stop)
+                self.signals, self.exited, self.out = BoundedList(), threading.Event(), BoundedOut()
+                self.drive(command, [5401], environ_extra=environ, on_stop=self.hooks(sent, audited))
                 blob = json.dumps(list(sent) + list(audited))
                 for forbidden in (secret, "FLEET_HEAVY_SECRET_930", "PATH", "nowhere"):
                     self.assertNotIn(forbidden, blob)
@@ -58000,7 +58062,7 @@ class TestHeavyCeilings(unittest.TestCase):
 
     # ---- the orphan: the slot is really locked, the clock, the table, the signals and the lock listing are injected
 
-    def orphan_rig(self, record, rows=None, alive=lambda pid, start: False, held_by=(4242, 4243)):
+    def orphan_rig(self, record, rows=None, alive=lambda pid, start: False, held_by=(4242, 4243), survivor=False):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         path = os.path.join(tmp, "heavy-slot-0.lock")
@@ -58013,18 +58075,24 @@ class TestHeavyCeilings(unittest.TestCase):
 
         def record_signal(number, sig):
             signals.append((number, sig))
-            if sig == signal.SIGKILL:
+            if sig == signal.SIGKILL and not survivor:
                 gone.set()
         table = rows or [(4242, 1, 4242, 1, "t"), (4243, 4242, 4242, 1, "t"), (999, 1, 999, 1, "t"), (555, 1, 555, 1, "t")]
         dog = {"read_table": lambda: [] if gone.is_set() else table, "kill": record_signal, "killpg": record_signal, "lsof": lambda p: set(held_by), "grace": 0.001,
-               "sweep_pause": lambda s: None, "pause": lambda s: False, "me": (os.getpid(), os.getppid(), os.getpgrp())}
+               "sweep_pause": lambda s: None, "pause": lambda s: False, "me": (os.getpid(), os.getppid(), os.getpgrp()), "rounds": 1}
         return tmp, dog, signals, alive
 
-    def orphan(self, ran, record=None, **rig):
-        record = record or {"name": "h", "pid": 4242, "wrapper": 31337, "command": "x", "since": 1000, "kind": "full", "ceiling": 5400, "lane": "lane-x", "wstart": "w0"}
+    RECORD = {"name": "h", "pid": 4242, "wrapper": 31337, "command": "x", "since": 1000, "kind": "full", "ceiling": 5400, "lane": "lane-x", "wstart": "w0", "cstart": "c0"}
+
+    def orphan(self, ran, record=None, start_of=lambda pid: "c0", **rig):
+        record = record or dict(self.RECORD)
         tmp, dog, signals, alive = self.orphan_rig(record, **rig)
         told = BoundedList()
-        stopped = self.hs.check_orphans(tmp, 3, None, lambda: 1000.0 + ran, lambda info, holder, lane: told.append((info, holder, lane)), BoundedOut(), alive=alive, watchdog=dog)
+
+        def on_stop(phase, info, holder, lane):
+            told.append((phase, info, holder, lane, len(signals)))
+        stopped = self.hs.check_orphans(tmp, 3, None, lambda: 1000.0 + ran, on_stop, BoundedOut(), alive=alive, watchdog=dog, start_of=start_of)
+        self.orphan_args = (tmp, dog, alive, on_stop, start_of)
         return stopped, told, signals
 
     def test_s9_an_orphan_is_left_alone_at_its_ceiling_and_stopped_past_it_measured_from_the_slot_start(self):
@@ -58033,7 +58101,9 @@ class TestHeavyCeilings(unittest.TestCase):
         stopped, told, signals = self.orphan(5401)
         self.assertTrue({4242} <= {p for p, _s in signals} <= {4242, 4243}, "the run's group or tree, nothing else (999 and 555 are strangers)")
         self.assertEqual(len(stopped), 1)
-        info, holder, lane = told[0]
+        self.assertEqual([(t[0], t[4] == 0) for t in told[:1]], [("decided", True)], "the audit phase runs before the first signal")
+        self.assertEqual([t[0] for t in told], ["decided", "told"])
+        phase, info, holder, lane, _n = told[1]
         self.assertEqual((info["source"], info["kind"], info["ceiling_seconds"], info["pid"], info["ran_seconds"], holder, lane), ("orphan", "full", 5400, 4242, 5401, "h", "lane-x"))
         stopped, told, signals = self.orphan(99999, alive=lambda pid, start: True)
         self.assertEqual((stopped, list(signals)), ([], []), "a live wrapper's run is never touched by the orphan check")
@@ -58053,6 +58123,37 @@ class TestHeavyCeilings(unittest.TestCase):
         self.assertTrue({p for p, _s in signals} <= {4242, 4243}, signals)
         self.assertFalse({os.getpid(), os.getppid(), 1, 999, 555} & {p for p, _s in signals})
 
+    def test_m1_a_pid_from_the_record_is_a_root_only_with_its_recorded_start_time(self):
+        """The run's command has exited, a descendant (4300) keeps the lock, and the recorded command pid 4242 now belongs to a bystander."""
+        rows = [(4242, 1, 4242, 1, "bystander"), (4300, 1, 4300, 1, "t"), (555, 1, 555, 1, "t")]
+        base = dict(self.RECORD)
+        cases = (("another process has the pid", base, lambda pid: "someone-else"),
+                 ("an older record without the start time", {k: v for k, v in base.items() if k != "cstart"}, lambda pid: "c0"),
+                 ("an empty start time", dict(base, cstart=""), lambda pid: "c0"),
+                 ("the start time cannot be read", base, lambda pid: ""))
+        for name, record, start_of in cases:
+            with self.subTest(name):
+                stopped, told, signals = self.orphan(9000, record, start_of=start_of, rows=rows, held_by=(4300,))
+                self.assertEqual(len(stopped), 1)
+                self.assertEqual({p for p, _s in signals}, {4300}, "only the lock holder is signalled: not the pid of the record, not a stranger")
+        for pid in (1, 0, os.getpid(), os.getppid()):
+            with self.subTest(pid=pid):
+                stopped, told, signals = self.orphan(9000, dict(base, pid=pid), start_of=lambda p: "c0", rows=rows + [(pid, 1, pid, 1, "t")] if pid > 1 else rows, held_by=(4300,))
+                self.assertFalse({1, os.getpid(), os.getppid(), os.getpgrp()} & {p for p, _s in signals}, "pid 1, the checker, its parent and its group are never signalled")
+
+    def test_m1_with_the_matching_start_time_the_recorded_pid_is_still_stopped(self):
+        stopped, told, signals = self.orphan(9000, start_of=lambda pid: "c0")
+        self.assertIn(4242, {p for p, _s in signals})
+
+    def test_the_lane_is_told_once_for_a_run_that_survives_the_stop_and_is_stopped_again(self):
+        stopped, told, signals = self.orphan(9000, survivor=True)
+        tmp, dog, alive, on_stop, start_of = self.orphan_args
+        first = len(signals)
+        again = self.hs.check_orphans(tmp, 3, None, lambda: 1000.0 + 9100, on_stop, BoundedOut(), alive=alive, watchdog=dog, start_of=start_of)
+        self.assertEqual(len(again), 1, "the survivor is stopped again")
+        self.assertGreater(len(signals), first)
+        self.assertEqual([t[0] for t in told], ["decided", "told"], "reported once for the same run")
+
     def test_a_slot_that_changed_hands_during_the_stop_is_not_stopped(self):
         tmp, dog, signals, alive = self.orphan_rig({"name": "h", "pid": 4242, "wrapper": 31337, "command": "x", "since": 1000})
         newer = [0]
@@ -58063,7 +58164,7 @@ class TestHeavyCeilings(unittest.TestCase):
                 handle.write(json.dumps({"name": "n", "pid": 4242, "wrapper": 31337, "since": 5000}).encode())
             return {4242}
         dog["lsof"] = lsof
-        stopped = self.hs.check_orphans(tmp, 3, None, lambda: 20000.0, None, BoundedOut(), alive=alive, watchdog=dog)
+        stopped = self.hs.check_orphans(tmp, 3, None, lambda: 20000.0, None, BoundedOut(), alive=alive, watchdog=dog, start_of=lambda p: "c0")
         self.assertEqual((stopped, list(signals)), ([], []))
 
     def test_two_checkers_never_stop_and_report_the_same_orphan(self):
@@ -58083,7 +58184,7 @@ class TestHeavyCeilings(unittest.TestCase):
 
     def test_s11_every_case_named_in_the_ask_has_a_test(self):
         names = {n for n in dir(type(self)) if n.startswith("test_")}
-        for case in ("test_s2_", "test_s3_", "test_s4_", "test_s5_", "test_s6_", "test_s7_", "test_s8_", "test_s9_", "test_s10_", "test_s13_", "test_u1_", "test_u2_", "test_u3_"):
+        for case in ("test_s2_", "test_s3_", "test_s4_", "test_s5_", "test_s6_", "test_s7_", "test_s8_", "test_s9_", "test_s10_", "test_s13_", "test_u1_", "test_u2_", "test_u3_", "test_m1_", "test_m2_", "test_m3_"):
             self.assertTrue(any(n.startswith(case) for n in names), "no test for %s" % case)
         slots_tests = {n for n in dir(TestHeavySlots) if n.startswith("test_")}
         self.assertIn("test_s9_a_wrapper_killed_with_sigkill_leaves_a_run_that_the_orphan_bound_stops_and_audits", slots_tests)
@@ -58562,7 +58663,8 @@ class TestHeavySlots(Base):
         self.assertEqual(self.hs.check_orphans(self.state(), 3, None, lambda: time.time() + 100, lambda *a: told.append(a), io.StringIO()), [], "under the ceiling: left alone")
         stopped = self.hs.check_orphans(self.state(), 3, None, later, lambda *a: told.append(a), io.StringIO())
         self.assertEqual([(s["source"], s["kind"], s["pid"]) for s in stopped], [("orphan", "other", held["pid"])])
-        self.assertEqual((told[0][1], told[0][2]), ("orphan-lane", os.environ.get("FLEET_HEAVY_NAME") or os.environ.get("OPENCODE_SESSION_ID") or os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown"))
+        self.assertEqual((told[0][2], told[0][3]), ("orphan-lane", os.environ.get("FLEET_HEAVY_NAME") or os.environ.get("OPENCODE_SESSION_ID") or os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown"))
+        self.assertEqual([t[0] for t in told], ["decided", "told"])
         self.assertTrue(self.until(lambda: not self.hs.holders(self.state(), 3), 30), "the slot is free: the run is gone")
 
     def test_s1_four_callers_of_three_slots_queue_and_the_fourth_runs_when_one_frees(self):

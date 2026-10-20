@@ -24320,23 +24320,27 @@ def heavy_stop_send(engine, lane, text):
 
 
 def heavy_stop_reporter(module, config, make_engine, actor):
-    """`on_stop(info, holder, lane)` for the heavy module: the message to the lane (bounded) and the audit line `heavy.stopped`. `make_engine()` gives the engine to send with
-    and audit through; nothing here can raise into the stop."""
-    def on_stop(info, holder, lane):
-        box = {}
+    """`on_stop(phase, info, holder, lane)` for the heavy module. Phase "decided" (before the stop) writes the audit line `heavy.stopped`; phase "told" (after it) sends the
+    one bounded message to the lane and writes `heavy.lane_told`. `make_engine()` gives the engine to send with and audit through; a failure never stops the stop."""
+    box = {}
 
-        def send(name, text):
-            def work():
-                box["engine"] = make_engine()
-                return heavy_stop_send(box["engine"], name, text)
-            done, told = run_bounded(work, HEAVY_SEND_SECONDS)
-            return told if done else "failed"
+    def audit(event, subject, detail):
+        engine = box.get("engine")
+        log = engine.audit if engine is not None and engine.audit is not None else AuditLog(ensure_state_dir() / "audit.jsonl")
+        log.append(getattr(engine, "actor", actor), event, subject, detail)
 
-        def audit(event, subject, detail):
-            engine = box.get("engine")
-            log = engine.audit if engine is not None and engine.audit is not None else AuditLog(ensure_state_dir() / "audit.jsonl")
-            log.append(getattr(engine, "actor", actor), event, subject, detail)
-        module.report_stop(info, holder, lane, send, audit, module.ceiling_table(config)["max"])
+    def send(name, text):
+        def work():
+            box["engine"] = box.get("engine") or make_engine()
+            return heavy_stop_send(box["engine"], name, text)
+        done, told = run_bounded(work, HEAVY_SEND_SECONDS)
+        return told if done else "failed"
+
+    def on_stop(phase, info, holder, lane):
+        if phase == "decided":
+            module.record_stop(info, holder, audit, sys.stderr.write)
+        else:
+            module.tell_lane(info, holder, lane, send, audit, module.ceiling_table(config)["max"], sys.stderr.write)
     return on_stop
 
 
