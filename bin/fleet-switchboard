@@ -13345,7 +13345,7 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
             found["T2"] = {"missing": [g if isinstance(g, str) else "/".join(g) for g in group_missing],
                            "labels": sorted(item["labels"])[:8]}
         awaiting = any(str(l).endswith((":awaiting-user", ":awaiting-cos")) or "awaiting" in str(l) for l in item["labels"])
-        parked = triage_parked_now(item, now) and not awaiting  # a park reaches at most PARKED_MAX_DAYS ahead: `9999-12-31` does not park forever; # never exempts an owner-wait; T5 and the captain PRs are other rules
+        parked = triage_parked_now(item, now) and not awaiting  # a park reaches at most PARKED_MAX_DAYS ahead: `9999-12-31` does not park forever. It never exempts an owner-wait; T5 and the captain PRs are other rules
         if comments is not None and not item["section"] and not awaiting and not item["next_body"] and not parked \
                 and not item["open_sub"] and not any(c["next"] for c in comments) \
                 and age_updated >= (sla["t3_ask_days"] if ask else sla["t3_other_days"]):

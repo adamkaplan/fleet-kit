@@ -64,11 +64,6 @@ def ownerless_split(items, ctx, ours_logins, patterns, now, days=DEFAULT_DAYS, l
     return order(found), order(parked)
 
 
-def ownerless_stale(items, ctx, ours_logins, patterns, now, days=DEFAULT_DAYS, label_owners=None, lanes=(), parked_now=None):
-    """[(number, quiet_days)] the listed rows of `ownerless_split` (the oldest first)."""
-    return ownerless_split(items, ctx, ours_logins, patterns, now, days, label_owners, lanes, parked_now)[0]
-
-
 def summary_line(repo, rows, read, total, days=DEFAULT_DAYS, cut=False, parked=0):
     """The ONE line about a repository: how many, how old the oldest is, the five oldest as links, and how much of the list was read. Counts, ages and links only: no title, no text.
     When the list was CUT the read took the least recently updated first, so the count is a lower bound (`at least N`) and the oldest are the true oldest."""

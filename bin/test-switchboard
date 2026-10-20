@@ -26696,7 +26696,7 @@ class TestOwnerlessSummary(Base):
         self.add(self.PARKED, created=40, updated=30, author="alice", labels=["u:parked"], body="Parked until: %s" % self.day(30))
         self.add(60, created=15, author="alice")
         self.go()
-        self.assertEqual(self.hub.writes if hasattr(self.hub, "writes") else [], [])
+        self.assertFalse(hasattr(self.hub, "write"), "the fake hub has no write method: a write cannot even be asked for")
         self.assertFalse([a for a in self.runs if "--method" in a or "PATCH" in a or "POST" in a or "DELETE" in a])
 
     def test_a_not_whole_read_counts_nothing_and_sends_nothing(self):
