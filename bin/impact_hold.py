@@ -245,6 +245,8 @@ def _apply_impact_hold_locked(engine, repo, number, report, record, carry=None):
     live = raw.get("labels")
     if not isinstance(live, list):
         raise NoticeError("the pull request's labels cannot be read")
+    if raw.get("headRefOid") != head:
+        return 0   # (#891) the pull request moved since the rule judged it: every write below (an add, a restore, an adoption) is for the judged head only; the next pass judges the new one
     have = {(l.get("name") if isinstance(l, dict) else l) for l in live}
     want = [names["merge-captain"], names["hold-impact"]]
     if report.get("rehold"):   # the hold labels the owner's clear took off (#830): each is put back, and only an owner-tier hold label of the fleet

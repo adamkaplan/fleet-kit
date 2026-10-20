@@ -32661,6 +32661,50 @@ class TestImpactRejudge(LedgerBase):
         if case in ("hand_floor_holds", "cleared_other_head_floor_holds") and not wanted_by_floor:
             self.assertNotIn(label, [l for w in self.posts(10) for l in w[2]["labels"]], "a class the rule does not write is never written by it")
 
+    def test_a_pull_request_that_moved_since_it_was_judged_gets_nothing_adopted_added_or_restored(self):   # #891 M1: every write below the fresh read is for the judged head only
+        n = 10
+        self.files(n, "shims/gh")
+        self.passes([])
+        report = sb.pr_floor_report(self.engine, "acme/app", n)   # judged at LEDGER_HEAD: the rule holds it
+        self.assertEqual(report["head"], LEDGER_HEAD)
+        cases = {"adopt": (self.both(), None), "add": ([], None), "restore": ([self.names["hold-credential"]], "re-hold")}
+        for name, (labels, rehold) in cases.items():
+            self.prs[n] = {"headRefOid": LEDGER_NEW_HEAD, "changedFiles": 1, "files": [{"path": "docs/a.md"}], "labels": [{"name": l} for l in labels]}   # moved: the rule no longer holds it
+            self.adopt_state(clears={"acme/app#10": {"head": self.ADOPT_HEAD_OTHER, "reason": "x", "by": "own", "at": 1, "removed": [self.names["hold-credential"]]}} if rehold else {})
+            self.writes.clear()
+            spent = sb.apply_impact_hold(self.engine, "acme/app", n, dict(report, reasons=["x"], **({"rehold": "held again"} if rehold else {})), {})
+            self.assertEqual((spent, self.writes, self.recorded(n), self.adopted(n)), (0, [], None, []), name)
+
+    def test_every_consumer_of_the_hold_label_family_is_listed_with_what_it_does_with_the_owners_own_hold(self):   # #891 M2: derived from the code
+        import glob
+        refs = ("CAPTAIN_HOLD_LABELS", "OWNER_HOLD_KEY", "OTHER_HOLD_KEYS")
+        found, uses_owner = {}, {}
+        for path in sorted(glob.glob(str(Path(sb.KIT_ROOT) / "bin" / "*.py")) + [str(Path(sb.KIT_ROOT) / "bin" / "fleet-switchboard")]):
+            tree = ast.parse(Path(path).read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef):
+                    inside = list(ast.walk(node))
+                    names_in = {x.id for x in inside if isinstance(x, ast.Name)} | {x.attr for x in inside if isinstance(x, ast.Attribute)}
+                    if names_in & {"CAPTAIN_HOLD_LABELS", "OWNER_HOLD_KEY"} or any(isinstance(x, ast.Constant) and x.value == "hold-" for x in inside):
+                        found[node.name] = Path(path).name
+                        uses_owner[node.name] = "OWNER_HOLD_KEY" in names_in
+        # name: does its code name the owner's hold key (an exclusion or a refusal)? and the reason
+        table = {"fleet_labels": (True, "a remover: the merged cleanup never removes it"),
+                 "run_pass": (True, "the merged cleanup audits that it merged against it"),
+                 "_labels_ours": (True, "the record never lists it as ours"),
+                 "_apply_impact_hold_locked": (True, "the rule never writes, restores or adopts it"),
+                 "authors_hold_labels": (False, "the owner's plain clear lifts every fleet hold label, it included"),
+                 "impact_clear_core": (True, "the delegated clear refuses it; the plain clear lifts it"),
+                 "captain_escalation_leaves": (False, "a reader: a pull request carrying it is still held"),
+                 "pr_hold_reasons": (False, "a reader: it is a hold reason"),
+                 "label_hold_entries": (False, "a reader: it is a decision row"),
+                 "sweep_read_repo": (False, "a reader: it is a held pull request"),
+                 "sweep_verify": (False, "a reader: a closed unmerged pull request that carries it is still a finding")}
+        self.assertEqual(set(found), set(table), "a new consumer of the hold label family must be added to this table with a decision about hold-owner")
+        self.assertEqual({k: uses_owner[k] for k in table}, {k: v[0] for k, v in table.items()}, "a remover or an actor names the owner's key; a reader never filters it out")
+        self.assertEqual(sb.pr_hold_reasons([{"name": self.names["hold-owner"]}]), ["owner"])
+        self.assertIn(self.names["hold-owner"], sb.authors_hold_labels(self.names, {"labels": [self.names["hold-owner"]]}, []))
+
     ADOPT_CASES = ("hand_floor_holds", "hand_rehold_wants_it", "daemon_present", "absent", "not_holds_by_hand", "cleared_this_head",
                    "cleared_other_head_rated_here", "cleared_other_head_floor_holds")
 
@@ -68521,6 +68565,19 @@ class TestMergedLabels(Base):
         self.assertEqual(sorted(gh.removed), sorted(self.fleet), "3 labels removed, the bug label is not among them")
         (line,) = self.audit("merged.labels_removed")
         self.assertEqual((line["subject"], sorted(line["detail"]["labels"])), ("acme/api#7", sorted(self.fleet)), "1 audit line names the pull request and the 3 labels")
+
+    def test_the_owners_own_hold_stays_on_a_merged_pull_request_and_the_audit_says_it_merged_against_it(self):   # #891
+        owner = self.names["hold-owner"]
+        gh = FakeMergedGh({7: self.view(labels=self.fleet + [owner, "bug"])})
+        self.go({"acme/api#7": self.merged_entry(labels=self.fleet + [owner])}, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.fleet), "the 3 other labels come off; hold-owner is not among the removals")
+        self.assertNotIn(owner, sb.load_module("merged_labels").fleet_labels(sb, self.world.config))
+        (kept,) = self.audit("merged.owner_hold_kept")
+        self.assertEqual((kept["subject"], kept["detail"]["label"]), ("acme/api#7", owner))
+        gh = FakeMergedGh({8: self.view(labels=[owner])})
+        self.go({"acme/api#8": self.merged_entry(labels=[owner])}, gh)
+        self.assertEqual(gh.removed, [], "a pull request that carries only the owner's hold loses nothing")
+        self.assertEqual(len(self.audit("merged.owner_hold_kept")), 2)
 
     def test_s2_an_open_or_closed_unmerged_pull_request_loses_nothing(self):
         for state in ("open", "closed"):
