@@ -168,6 +168,9 @@ export function buildBlocks(inputs, now) {
   for (const [ws, members] of byWorkspace) {
     const lead = members.filter((m) => ROLES.includes(m.role)).sort((a, b) => (a.role === b.role ? a.name.localeCompare(b.name) : a.role === "orchestrator" ? -1 : 1))[0]
     if (!lead) continue
+    // A lead is drawn only while the switchboard watches it: it has a row in the pane states (attached, detached, not yet checked, or found dead).
+    // A retired lead has none (the daemon drops it), so its workspace is not drawn. Nothing else is read.
+    if (inputs.pane && !obj(states[lead.name]).state) continue
     const sessions = members.map((m) => m.session).filter((s) => typeof s === "string")
     // The Chief of Staff has no load row: what the owner is owed is its state and what waits on the owner (every open decision for the human tier).
     const ownerWaiting = listed ? listed.filter((d) => d && !d.closed && d.kind !== "notice" && (d.tier ?? "human") === "human").length : null
