@@ -5884,6 +5884,26 @@ class TestLaunch(Base):
             sb.pane_health_pass(self.engine, self.world.clock.now())
         self.assertEqual(len(calls), sb.PANE_CHECKS_PER_PASS)
 
+    def test_a_dead_agent_for_three_days_leaves_the_registry_only_at_a_view_read_never_on_a_pass(self):
+        """#919: the pane pass forgets the old pane-health row (it stops waking cos) but removes nothing from the registry; the next view read does."""
+        self.engine.state_dir = self.world.state
+        reg = sb.load_module("registry")
+        reg.upsert(self.world.state, "gone", {"pane": "w1:p9", "session": "ses_x", "role": "coder", "workspace": "w1"})
+        path = self.world.state / "registry.json"
+        doc = json.loads(path.read_text())
+        doc["agents"]["gone"]["state"] = "dead"
+        path.write_text(json.dumps(doc))
+        sb.write_pane_health(self.world.state, {"agents": {"gone": {"pane": "w1:p9", "session": "ses_x"}}, "missing": {"gone": 9},
+                                                "states": {"gone": {"state": "dead", "at": 1, "pane": "w1:p9", "session": "ses_x"}}})
+        self.engine.discover(self.world.clock.now())
+        sb.pane_health_pass(self.engine, 1 + sb.PANE_FORGET_SECONDS + 5)
+        self.assertNotIn("gone", sb.read_pane_health(self.world.state)["agents"])   # forgotten here (stops waking cos)
+        self.assertIn("gone", reg.read(self.world.state)["agents"])                 # but the registry keeps it: no removal on a pass
+        audit = self.world.state / "registry-audit.jsonl"
+        self.assertEqual([l for l in (audit.read_text().splitlines() if audit.exists() else []) if "reconcile_remove" in l], [])
+        self.assertEqual(sb.reconcile_agents_on_read(self.world.state, self.engine.herdr), ["gone"])   # the view read removes it
+        self.assertNotIn("gone", reg.read(self.world.state)["agents"])
+
     def test_a_forgotten_dead_agent_stops_waking_and_the_charter_pane_line_is_rewritten_only_when_present(self):
         self.engine.state_dir = self.world.state
         sb.write_pane_health(self.world.state, {"agents": {"gone": {"pane": "w1:p9", "session": "ses_x"}}, "missing": {"gone": 9},
