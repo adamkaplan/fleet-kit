@@ -1176,8 +1176,8 @@ def impact_plan(engine, report, labels, state, records, records_problem):
     names = label_names(engine.config)
     have = set(labels or ())
     pr = report["pr"]
-    if report.get("draft"):
-        return "none", []   # the daemon judges no draft pull request
+    if report.get("draft") and report.get("owner_decision") == "hold":
+        return "none", []   # the daemon adds no hold to a draft pull request (it still releases one the rule no longer holds, #999)
     if report.get("owner_decision") == "hold":
         carried = (state.get("carried", {}).get(pr) or {}).get("head") == report["head"] and impact_floor.carry_enabled(engine.config, report["pr"].rpartition("#")[0])
         if (state["clears"].get(pr) or {}).get("head") == report["head"] or carried:   # the owner's clear, or a clear carried over a pure merge of main (#510)
@@ -1207,7 +1207,7 @@ def cmd_impact_hold(args, runner, now):
         except impact_floor.MatrixError as err:   # the matrix file cannot be read: say so and stop, never read it as "no floor"
             sys.stderr.write("%s: impact hold: %s\n" % (PROG, _one_line(str(err), 200)))
             return EXIT_ERROR
-        if not has_floor:
+        if not has_floor and not any(pr.startswith(repo + "#") for pr in impact_ours(engine)[0]):   # a repo with no floor now is still judged while it holds labels of ours (#999)
             continue
         try:
             items = read_open_items(engine, runner, repo)[0]
@@ -1270,7 +1270,7 @@ def release_impact_hold(engine, repo, number, report, record):
         del state["applied"][pr]
         write_impact_state(engine.state_dir, state)
         engine.audit.append(engine.actor, "gate.hold_released", pr, {"head": report["head"], "removed": remove, "reasons": report.get("owner_reasons", [])[:5],
-                                                                      "rule": engine.__dict__.get("impact_rule")})
+                                                                      "reason": report.get("release_reason") or "rule no longer holds", "rule": engine.__dict__.get("impact_rule")})
         return len(remove)
 
 

@@ -34663,6 +34663,273 @@ def _adoption_cells():
 _adoption_cells()
 
 
+CHANGE_KINDS = ("base", "record", "matrix", "rating", "none")   # (#999) what can change under a hold the daemon put on, with the head unchanged: the ONE table every row below derives from
+
+
+class TestImpactReleaseEveryPass(TestImpactRejudge):
+    """#999: the daemon judges every pull request that carries labels it added at EVERY pass, so a hold the rule no longer makes is released whatever changed
+    (the base branch, a record, the matrix, a rating) with the head unchanged. The REAL pass over a fake GitHub that answers only what `gh pr view` answers
+    (the fields asked, the files of the current base); one table of change kinds x (the rule still holds / no longer holds); a mutant per row."""
+
+    HEAD = LEDGER_NEW_HEAD
+    PRN = "acme/app#9"
+
+    def setUp(self):
+        super().setUp()
+        self.fingerprint = "m1"
+        self.migrations_top = False
+        real = sb.impact_floor.load_matrix
+
+        def loaded(path=None):
+            matrix = real(path)
+            if self.migrations_top:
+                matrix["owner_hold"]["top_tier_paths"]["authority"] = list(matrix["owner_hold"]["top_tier_paths"]["authority"]) + ["migrations/**"]
+            return matrix
+        for patcher in (mock.patch.object(sb.impact_floor, "load_matrix", loaded), mock.patch.object(sb.impact_floor, "rule_fingerprint", lambda: self.fingerprint)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def view(self, path, base="1" * 40):
+        """The fake world's pull request: the files of its CURRENT base. A base change is a new `baseRefOid` and the diff of the new base."""
+        self.prs[9] = {"headRefOid": self.HEAD, "changedFiles": 1, "files": [{"path": path}], "baseRefOid": base, "labels": self.prs.get(9, {}).get("labels", [])}
+
+    def record(self, **fields):
+        entry = {"kind": "review_record", "pr": self.PRN, "head": self.HEAD, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "summary": "x"}
+        sb.plan_ledger.append_entry(self.world.state, dict(entry, **fields), 1)
+
+    def step(self, advance=1000):
+        self.passes([self.listed(9, self.live_labels, head=self.HEAD)], advance=advance)
+
+    def held_world(self, kind):
+        """A pull request this daemon holds at HEAD: the first pass puts the labels on, the second sees them."""
+        self.live_labels = []
+        if kind == "base":
+            self.view("shims/gh")
+        elif kind == "record":
+            self.view("docs/a.md")
+            self.record(impact_action="hold", impact_class="credentials")
+        elif kind == "matrix":
+            self.migrations_top = True
+            self.view("migrations/0002.sql")
+        elif kind == "rating":
+            self.view("docs/a.md")
+            (self.world.state / "impact-hold.json").write_text(json.dumps({"clears": {self.PRN: {"head": LEDGER_HEAD, "reason": "a false hold", "by": "own", "at": 1}}, "applied": {}}))
+        else:
+            self.view("shims/gh")
+        self.step(0)
+        self.assertEqual(len(self.posts(9)), 1, "the daemon held it (%s)" % kind)
+        self.live_labels = self.both()
+        self.step()
+        self.writes.clear()
+
+    def change(self, kind, holds):
+        if kind == "base":
+            self.view("shims/gh" if holds else "docs/a.md", base="2" * 40)
+        elif kind == "record":
+            self.record(impact_action="hold", impact_class="authority") if holds else self.record(impact_action="second-review")
+        elif kind == "matrix":
+            self.fingerprint = "m2"
+            self.migrations_top = holds
+        elif kind == "rating":
+            self.record(impact_action="second-review") if not holds else self.record()   # a record with no action rates nothing: the hold stands
+        else:
+            pass   # "none": the rule's answer and every input are as they were
+
+    def run_row(self, kind, holds, mutant=None):
+        with contextlib.ExitStack() as stack:
+            for target, replacement in (mutant or {}).items():
+                owner, _, name = target.rpartition(".")
+                stack.enter_context(mock.patch.object(getattr(sb, owner) if owner else sb, name, replacement))
+            self.held_world(kind)
+            self.change(kind, holds)
+            self.step()
+            self.step()   # the pass after: nothing more is written
+            return [w for w in self.removals(9)], self.events("gate.hold_released")
+
+    def check_row(self, kind, holds, mutant=None):
+        removed, released = self.run_row(kind, holds, mutant)
+        if holds:
+            self.assertEqual((removed, released, self.posts(9)), ([], [], []), "%s: the rule still holds: kept, no write, no audit line" % kind)
+        else:
+            self.assertEqual(sorted(w[1].rsplit("/", 1)[-1] for w in removed), sorted(urllib.parse.quote(n, safe="") for n in self.both()), "%s: released" % kind)
+            (line,) = released
+            self.assertEqual(line["detail"]["reason"], self.REASONS[kind])
+
+    REASONS = {"base": "base changed", "record": "record changed", "matrix": "rule changed", "rating": "record changed"}
+    # a row where the rule no longer holds after the change; "none" never releases (it cannot change what the rule says)
+    RELEASING = tuple(k for k in CHANGE_KINDS if k != "none")
+
+    def test_the_table_is_complete_and_every_kind_has_a_row_and_a_mutant(self):
+        self.assertEqual(set(CHANGE_KINDS), {"base", "record", "matrix", "rating", "none"})
+        self.assertEqual(set(self.REASONS), set(self.RELEASING), "a releasing kind with no reason")
+        self.assertEqual(set(self.MUTANTS), set(self.RELEASING), "a releasing kind with no mutant")
+        for kind in CHANGE_KINDS:   # every kind has both a still-held row and (but "none") a released row: both are driven by the table tests below
+            self.assertTrue(hasattr(self, "test_row_%s_still_held" % kind), kind)
+        for kind in self.RELEASING:
+            self.assertTrue(hasattr(self, "test_row_%s_released" % kind), kind)
+
+    def test_row_base_released(self):
+        self.check_row("base", False)
+
+    def test_row_base_still_held(self):
+        self.check_row("base", True)
+
+    def test_row_record_released(self):
+        self.check_row("record", False)
+
+    def test_row_record_still_held(self):
+        self.check_row("record", True)
+
+    def test_row_matrix_released(self):
+        self.check_row("matrix", False)
+
+    def test_row_matrix_still_held(self):
+        self.check_row("matrix", True)
+
+    def test_row_rating_released(self):
+        self.check_row("rating", False)
+
+    def test_row_rating_still_held(self):
+        self.check_row("rating", True)
+
+    def test_row_none_still_held(self):
+        self.check_row("none", True)
+
+    # The pre-fix daemon: the head-only memo (no pull request is "ours", so the memo skips), blind to one input each. Each releasing row must FAIL under its mutant.
+    NOT_OURS = {"impact_ours": lambda engine: (set(), None)}
+    NO_RECORDS = {"impact_records": lambda state_dir: ({}, None)}
+    FROZEN_RULE = {"impact_floor.rule_fingerprint": lambda: "frozen"}
+    MUTANTS = {
+        "base": dict(NOT_OURS),                                   # the memo as it was: head, rule and record, never the base (the bug)
+        "record": dict(NOT_OURS, **NO_RECORDS),                   # ... and blind to the record
+        "matrix": dict(NOT_OURS, **FROZEN_RULE),                  # ... and blind to the rule's version
+        "rating": dict(NOT_OURS, **NO_RECORDS),                   # ... and blind to the rating
+    }
+    NEW_HEAD_ONLY = dict(NOT_OURS, **dict(NO_RECORDS, **FROZEN_RULE))   # releases only when the head changes
+
+    def mutant_fails(self, kind, mutant):
+        with self.assertRaises(AssertionError):
+            self.check_row(kind, False, mutant)
+
+    def test_the_base_row_fails_under_the_head_only_memo(self):
+        self.mutant_fails("base", self.MUTANTS["base"])
+
+    def test_the_record_row_fails_under_a_memo_blind_to_the_record(self):
+        self.mutant_fails("record", self.MUTANTS["record"])
+
+    def test_the_matrix_row_fails_under_a_memo_blind_to_the_rule(self):
+        self.mutant_fails("matrix", self.MUTANTS["matrix"])
+
+    def test_the_rating_row_fails_under_a_memo_blind_to_the_rating(self):
+        self.mutant_fails("rating", self.MUTANTS["rating"])
+
+    def test_a_daemon_that_releases_only_on_a_new_head_fails_the_base_row_and_releases_on_the_new_head(self):
+        self.mutant_fails("base", self.NEW_HEAD_ONLY)
+
+    def test_every_releasing_kind_has_a_mutant_test(self):
+        for kind in self.RELEASING:
+            self.assertTrue(any(name.startswith("test_the_%s_row_fails" % kind) for name in dir(self)), kind)
+
+    # -- the person's label, the owner's clear, an unreadable input
+
+    def test_a_label_a_person_put_on_is_kept_when_the_base_changes(self):
+        self.held_world("base")
+        self.live_labels = self.both() + ["needs-docs"]
+        self.view("docs/a.md", base="2" * 40)
+        self.step()
+        self.assertEqual(sorted(w[1].rsplit("/", 1)[-1] for w in self.removals(9)), sorted(urllib.parse.quote(n, safe="") for n in self.both()))   # only the two labels it added
+        self.assertEqual([w for w in self.removals(9) if "needs-docs" in w[1]], [])
+
+    def test_an_owners_clear_is_not_undone_by_a_release_pass(self):
+        self.held_world("base")
+        cleared = {"head": self.HEAD, "reason": "a false hold", "by": "own", "at": 5}
+        state = json.loads((self.world.state / "impact-hold.json").read_text())
+        state["clears"][self.PRN] = cleared
+        (self.world.state / "impact-hold.json").write_text(json.dumps(state))
+        self.view("docs/a.md", base="2" * 40)
+        self.step()
+        self.assertEqual(json.loads((self.world.state / "impact-hold.json").read_text())["clears"][self.PRN], cleared)
+
+    def unreadable(self, patch, noted):
+        self.held_world("base")
+        self.view("docs/a.md", base="2" * 40)   # the rule no longer holds, but the input that says so cannot be read
+        with patch:
+            for _ in range(3):
+                self.step(500)
+        self.assertEqual(self.removals(9), [], "nothing released")
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] in noted]), 1, "said once, not at every pass")
+
+    def test_an_unreadable_matrix_keeps_every_label_and_says_so_once(self):
+        self.unreadable(mock.patch.object(sb.impact_floor, "rule_fingerprint", side_effect=sb.impact_floor.MatrixError("gone")), ("impact.error",))
+
+    def test_an_unreadable_record_ledger_keeps_every_label_and_says_not_checked_once(self):
+        self.unreadable(mock.patch.object(sb, "impact_records", lambda state_dir: ({}, "ledger unreadable")), ("impact.not_checked",))
+
+    def test_an_unreadable_hold_state_keeps_every_label_and_says_not_checked_once(self):
+        self.unreadable(mock.patch.object(sb, "read_impact_state", lambda state_dir: ({"clears": {}, "applied": {}}, "state unreadable")), ("impact.not_checked", "impact.state_unreadable"))
+
+    def test_the_documentation_says_when_a_hold_is_released(self):
+        text = (Path(__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
+        start = text.index("When a hold is released:")
+        paragraph = text[start:start + 1400]
+        for word in ("base branch", "matrix file", "impact review record", "rating", "draft", "gate.hold_released", "base changed", "rule changed", "record changed",
+                     "a person", "owner", "impact.not_checked"):
+            self.assertIn(word, paragraph)
+
+    # -- the rest of the family
+
+    def test_a_repo_whose_floor_is_now_empty_still_releases_what_it_held(self):
+        self.held_world("base")
+        self.view("docs/a.md", base="2" * 40)
+        with mock.patch.object(sb.impact_floor, "floor_for", lambda repo, config=None: ([], [], [])):
+            self.step()
+        self.assertEqual(len(self.removals(9)), 2)
+
+    def test_a_pull_request_that_went_draft_is_released_when_the_rule_no_longer_holds_it(self):
+        self.held_world("base")
+        self.view("docs/a.md", base="2" * 40)
+        self.passes([self.listed(9, self.both(), head=self.HEAD, draft=True)], advance=1000)
+        self.assertEqual(len(self.removals(9)), 2)
+
+    def test_a_draft_that_still_holds_keeps_its_labels(self):
+        self.held_world("base")
+        self.passes([self.listed(9, self.both(), head=self.HEAD, draft=True)], advance=1000)
+        self.assertEqual((self.removals(9), self.posts(9)), ([], []))
+
+    def test_the_dry_run_and_the_pass_decide_the_same_after_a_base_change(self):
+        self.held_world("base")
+        self.view("docs/a.md", base="2" * 40)
+        code, out, err = self.run_as("coder", "impact", "hold", "--dry-run", "--repo", "acme/app")
+        self.assertEqual(code, 0, err)
+        self.assertIn("acme/app#9  would remove", out)
+        self.step()
+        self.assertEqual(len(self.removals(9)), 2)
+
+    def test_fresh_judgement_stays_inside_the_pass_budget_and_the_oldest_judged_goes_first(self):
+        self.extra_config = dict(self.extra_config, impact_hold={"enabled": True, "calls_per_pass": 3})
+        self.configure()
+        for n in range(9, 14):
+            self.files(n, "shims/gh")
+        self.live_labels = {}
+        records = [self.listed(n) for n in range(9, 14)]
+        self.passes(records)
+        self.passes([self.listed(n, self.both()) for n in range(9, 14)], advance=1000)
+        self.passes([self.listed(n, self.both()) for n in range(9, 14)], advance=1000)
+        before = len(self.view_reads)
+        self.passes([self.listed(n, self.both()) for n in range(9, 14)], advance=1000)
+        self.assertLessEqual(len(self.view_reads) - before, 3)
+        for n in range(9, 14):
+            self.files(n, "docs/a.md")
+        for _ in range(6):   # a release spends its read and its removals, so one a pass: every one of the five is reached
+            self.passes([self.listed(n, self.both()) for n in range(9, 14)], advance=1000)
+        self.assertEqual(len({w[1].split("/")[4] for w in self.removals()}), 5)
+
+
+for _name in list(vars(TestImpactRejudge)):   # the subclass reuses the harness, not the tests
+    if _name.startswith("test") and _name not in vars(TestImpactReleaseEveryPass):
+        setattr(TestImpactReleaseEveryPass, _name, None)
+
+
 class TestImpactHold(LedgerBase):
     """#179 slice L4: the switchboard WRITES the hold (two labels), only when `impact_hold.enabled`, only for repos under `plan_gates`, head-bound
     owner clear, kill switches, idempotent, bounded. A fake gh records every write."""

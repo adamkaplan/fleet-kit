@@ -21919,7 +21919,8 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
             "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete,
             "top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "review_action": record[0] if record else None, "review_class": record[1] if record else None,   # #661: display data the delegated clear reads; no decision changes
             "changed_paths": [p for p in paths if isinstance(p, str)][:200], "unknown": unknown, "rated": [list(r) for r in rated],
-            "decision": decision, "reasons": reasons, "owner_decision": owner[0], "owner_reasons": owner[1], "draft": raw.get("isDraft") is True}
+            "decision": decision, "reasons": reasons, "owner_decision": owner[0], "owner_reasons": owner[1], "draft": raw.get("isDraft") is True,
+            "base": raw.get("baseRefOid")}
 
 
 def cmd_impact(args, runner, now):
@@ -22392,6 +22393,38 @@ def chat_clear_apply(engine, cc, pr, offer, quoted, message_id, now):
     return lines
 
 
+def _impact_release_reason(before, base, rule, record, head, new_head):
+    """The reason a hold no longer holds, from what the pull request was last judged on: `base changed`, `rule changed` (the matrix), `record changed` (the
+    impact review record or rating), `head changed`, else `rule no longer holds` (nothing remembered: a restart, or the first judgement). It only names; it decides nothing."""
+    if before is None:
+        return "rule no longer holds"
+    if new_head and head and new_head != head:
+        return "head changed"
+    if before[0] != base:
+        return "base changed"
+    if before[1] != rule:
+        return "rule changed"
+    if before[2] != record:
+        return "record changed"
+    return "rule no longer holds"
+
+
+def impact_ours(engine):
+    """({pr: True} for every pull request whose `applied` record in the hold state lists labels this daemon added, the problem or None). A state that cannot be read lists none."""
+    state, problem = read_impact_state(engine.state_dir)
+    if problem:
+        return set(), problem
+    return {pr for pr, entry in (state.get("applied") or {}).items() if isinstance(entry, dict)}, None
+
+
+def _impact_not_checked(engine, what, why):
+    """A hold that cannot be re-checked because an input cannot be read: its labels stay, and this says so ONCE for the episode (`impact.not_checked`)."""
+    if engine.__dict__.get("impact_not_checked") == what:
+        return
+    engine.__dict__["impact_not_checked"] = what
+    engine._note("impact.not_checked", None, {"input": what, "why": _one_line(str(why), 160), "kept": "every label this daemon added stays until it can be read"})
+
+
 def impact_would_hold_pass(engine, now):
     """The daemon hook (#179 L3, #451 slice 3): for the open PRs the ci recorder's list already holds (repos under `plan_gates`), decide the owner-hold
     rule once per (PR, head, version of the rule, impact review record), audit `gate.would_hold` when it holds, and, when `impact_hold` enforces, WRITE the hold
@@ -22416,14 +22449,22 @@ def impact_would_hold_pass(engine, now):
     hold_cfg = (engine.config.get("impact_hold") or {}) if isinstance(engine.config, dict) else {}
     budget = hold_cfg.get("calls_per_pass", cfg.get("calls_per_pass", IMPACT_PASS_CALLS))   # `impact_hold.calls_per_pass` wins when set
     records, records_problem = impact_records(engine.state_dir)
+    basis = engine.__dict__.setdefault("impact_basis", {})   # what each pull request was last judged on (base, rule, record): it NAMES a release's reason, it never skips a judgement
+    judged_at = engine.__dict__.setdefault("impact_judged_at", {})
+    ours_prs, state_problem = impact_ours(engine)   # the pull requests carrying labels this daemon added: judged afresh at every pass (#999), whatever the head-only memo says
+    if state_problem or (records_problem and ours_prs):
+        _impact_not_checked(engine, "the impact review ledger" if records_problem else "the hold state file", records_problem or state_problem)
+    else:
+        engine.__dict__.pop("impact_not_checked", None)
     unjudged, live = 0, set()
     for key, (_, listed) in sorted(state.lists.items()):
-        for record in listed:
+        for record in sorted(listed, key=lambda r: judged_at.get((key, r.get("number")), 0) if isinstance(r, dict) else 0):   # the one judged longest ago first: a small budget never starves a pull request
             number = record.get("number") if isinstance(record, dict) else None
             head = ((record.get("head") or {}).get("sha")) if isinstance(record, dict) else None
-            if not isinstance(number, int) or isinstance(number, bool) or not head or record.get("draft"):
+            if not isinstance(number, int) or isinstance(number, bool) or not head or (record.get("draft") and "%s#%d" % (key, number) not in ours_prs):
                 continue
             pr = "%s#%d" % (key, number)
+            ours = pr in ours_prs
             live.add((key, number))
             enforce = impact_floor.hold_mode(engine.config, key) == "enforce"
             earlier = reports.get((key, number))
@@ -22451,11 +22492,12 @@ def impact_would_hold_pass(engine, now):
             except impact_floor.MatrixError as err:   # fail LOUD: no judgement is made while the matrix file cannot be read (never read as "no floor")
                 _impact_matrix_episode(engine, now, err)
                 return
-            if not globs:
+            if not globs and not ours:   # a pull request holding our labels is judged even when the floor is now empty: the release is the point
                 continue
             signature = (head, rule, "unreadable" if records_problem else records.get((pr, head)))
-            if seen.get((key, number)) == signature:
-                continue
+            memo_hit = seen.get((key, number)) == signature
+            if memo_hit and not ours:
+                continue   # (#999) never for a pull request holding our labels: its base can change with the head, rule and record unchanged
             if budget <= 0:
                 unjudged += 1
                 continue
@@ -22473,6 +22515,13 @@ def impact_would_hold_pass(engine, now):
                 continue
             report["rule"] = rule
             owner = report.get("owner_decision")
+            judged_at[(key, number)] = now
+            if memo_hit and owner == "hold":   # held and nothing changed: kept, with no write and no audit line (it was judged afresh only to be sure)
+                basis[(key, number)] = (report.get("base"), rule, signature[2])
+                reports[(key, number)] = report
+                continue
+            if owner != "hold":
+                report["release_reason"] = _impact_release_reason(basis.get((key, number)), report.get("base"), rule, signature[2], head, report.get("head"))
             if owner == "hold":
                 engine.audit.append(engine.actor, "gate.would_hold", report["pr"],
                                     {"head": report["head"], "floor_paths": report["floor_paths"][:20], "reasons": report.get("owner_reasons", [])[:10],
@@ -22503,6 +22552,7 @@ def impact_would_hold_pass(engine, now):
                     unjudged += 1
                     continue
             seen[(key, number)] = (report["head"] or head, rule, "unreadable" if records_problem else records.get((pr, report["head"] or head)))
+            basis[(key, number)] = (report.get("base"), rule, seen[(key, number)][2])
             reports[(key, number)] = report
     _impact_matrix_recovered(engine, now)   # the file and the floor of every repo were read this pass: a standing episode is over
     if not unjudged and not records_problem and any(impact_floor.hold_mode(engine.config, key) == "enforce" for key, _ in live):
