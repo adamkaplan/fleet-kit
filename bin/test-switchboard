@@ -22905,6 +22905,7 @@ class OwnedInputs(WaitingInputs):
     counted back from the moment of each read (the daemon's pass re-reads the lists every few minutes), so time can pass and the lists stay fresh. The
     pull request list is `ci_record_pass`'s over a fake hub that honours the cut and the failure; the issue list is the triage's."""
     OLD, RECENT = 10 * 3600, 600
+    NO_HEAD = object()
 
     def wire_scene(self):
         self.scene = {"issues": {3: {"parent": 2}, 4: {"parent": 3}}, "prs": []}
@@ -22931,8 +22932,8 @@ class OwnedInputs(WaitingInputs):
             f = scene["issues"].get(n, {})
             record = {"number": n, "updated_at": sb.iso(now - f.get("age", self.OLD)), "created_at": sb.iso(now - self.OLD),
                       "labels": [{"name": l} for l in f.get("labels", ())]}
-            if f.get("bad_time"):
-                record["updated_at"] = "not a time"
+            if "raw_time" in f:
+                record["updated_at"] = f["raw_time"]
             if f.get("parent") is not None:
                 record["parent_issue_url"] = "https://api.github.com/repos/%s/issues/%d" % (f.get("parent_repo", self.REPO), f["parent"])
             return record
@@ -22940,9 +22941,13 @@ class OwnedInputs(WaitingInputs):
         engine.triage.units[(self.REPO, "issues")] = {"at": now, "data": [row(n) for n in range(1, 100)], "truncated": False, "error": None}
         sb.read_mark(engine, "issues:" + self.REPO, True, "", now)
         sb.read_mark(engine, "decisions", True, "", now)
-        self.hub.records = [{"number": p["number"], "body": p["body"], "updated_at": "not a time" if p["age"] == "never" else sb.iso(now - p["age"]), "created_at": sb.iso(now - p["created"]),
+        self.hub.records = [{"number": p["number"], "body": p["body"], "updated_at": p["age"][1] if isinstance(p["age"], tuple) else sb.iso(now - p["age"]), "created_at": sb.iso(now - p["created"]),
                              "head": {"sha": p["head"]}, "base": {"ref": p["base"]}, "labels": [{"name": l} for l in p.get("labels", ())],
                              **{k: v for k, v in p.items() if k in ("requested_reviewers", "requested_teams", "draft")}} for p in scene["prs"]]
+        for record, p in zip(self.hub.records, scene["prs"]):
+            if p["head"] is self.NO_HEAD:
+                del record["head"]   # a record with no head at all
+
         engine.__dict__.pop("ci_record_state", None)
         engine.__dict__.get("read_whole", {}).pop("pulls:" + self.REPO, None)
         sb.ci_record_pass(engine, now)
@@ -23034,25 +23039,72 @@ class TestWorkerOwned(OwnedInputs, ReportBase):
         self.late()
         self.assertEqual(len(self.stalled()), 1)
 
-    def test_an_owned_item_whose_time_or_head_cannot_be_read_is_not_judged_by_either_rule(self):
-        """An owned work item with no readable updated time, or an owned pull request with no readable head or time, is an input not read whole:
-        no wake and no nudge (default-deny), and the rule speaks once the input is readable."""
-        for name, bad in (("work item time", dict(issues={4: {"bad_time": True}})), ("pull request head", dict(prs=[self.pr(10, self.plan(3), head=0)])),
-                          ("pull request time", dict(prs=[self.pr(10, self.plan(3), age="never")]))):
+    BAD_TIMES = ("not a time", None, "", 12, [], "2026-13-45T99:00:00Z")
+
+    def readable_scene(self):
+        """The ONE setup both the bad scene and its control come from: the ask (#2), two work items (#3, #4) and two owned pull requests (#10, #11)."""
+        return dict(prs=[self.pr(10, self.plan(3)), self.pr(11, self.plan(4), head="b" * 40)])
+
+    def break_member(self, member, position, value):
+        """Make ONE member unreadable in ONE position (the first or the later item the member covers); returns the scene changes."""
+        scene = self.readable_scene()
+        if member == "assignment time":
+            return dict(scene, issues={2: {"raw_time": value}})
+        if member == "work item time":
+            return dict(scene, issues={(3, 4)[position]: {"raw_time": value}})
+        key = "head" if member == "pull request head" else "age"
+        prs = [dict(p) for p in scene["prs"]]
+        prs[position][key] = value
+        return dict(scene, prs=prs)
+
+    def test_an_owned_item_that_cannot_be_read_is_not_judged_for_every_member_position_and_bad_value(self):
+        """Derived from OWNED_READABLE (the guard's own member table): every member, in the first AND the later position of what it covers, with each
+        kind of bad value, through BOTH rules; each bad scene is built from the same setup as its control, so only the one input differs."""
+        cases = []
+        for member in sb.OWNED_READABLE:
+            if member == "pull request head":
+                values = (self.NO_HEAD, None, 0, 12, "", ["x"])   # a head that is missing, null, a number, empty, or not text
+            elif member == "pull request time":
+                values = tuple(("raw", v) for v in self.BAD_TIMES)   # the fake hub's marker for a raw updated_at
+            else:
+                values = self.BAD_TIMES
+            for position in ((0,) if member == "assignment time" else (0, 1)):
+                cases += [(member, position, value) for value in values]
+        self.assertEqual({member for member, _, _ in cases}, set(sb.OWNED_READABLE), "a member of the guard's table with no case here")
+        for member, position, value in cases:
             for rule in ("stalled", "seam"):
-                with self.subTest(input=name, rule=rule):
+                with self.subTest(member=member, position=position, value=repr(value), rule=rule):
                     self.setUp()
-                    if rule == "seam":
-                        self.idle()
-                    else:
-                        self.late()
-                    self.set_scene(**bad)
-                    self.assertEqual(self.said(rule), [], "not judged")
-                    self.setUp()
-                    self.set_scene(prs=[self.pr(10, self.plan(3))])
+                    self.set_scene(**self.break_member(member, position, value))
                     self.idle() if rule == "seam" else self.late()
-                    self.apply()
-                    self.assertEqual(len(self.said(rule)), 2 if rule == "seam" else 1, "the control with readable inputs speaks")
+                    self.assertEqual(self.said(rule), [], "not judged")
+        for rule in ("stalled", "seam"):
+            self.assertEqual(len(self.control(rule)), 2 if rule == "seam" else 1, "the control (same setup, every input readable) speaks")
+
+    def control(self, rule):
+        self.setUp()
+        self.set_scene(**self.readable_scene())
+        self.idle() if rule == "seam" else self.late()
+        return self.said(rule)
+
+    def test_every_member_of_the_readable_table_is_needed_a_mutant_that_drops_it_is_caught(self):
+        examples = {"assignment time": (0, {"issues": {2: {"raw_time": "not a time"}}}),
+                    "work item time": (1, {"issues": {4: {"raw_time": "not a time"}}}),
+                    "pull request head": (1, "head"), "pull request time": (1, "age")}
+        for member, (position, change) in examples.items():
+            with self.subTest(member):
+                scene = self.break_member(member, position, 0 if change == "head" else ("raw", "not a time")) if isinstance(change, str) else dict(self.readable_scene(), **change)
+                select, check = sb.OWNED_READABLE[member]
+                with mock.patch.dict(sb.OWNED_READABLE, {member: (lambda owned: [], check)}):
+                    self.setUp()
+                    self.set_scene(**scene)
+                    self.late()
+                    try:
+                        silent = self.said("stalled") == []
+                    except Exception:
+                        silent = False   # the mutant breaks the rule outright
+                    self.assertFalse(silent, "without this member's check the rule no longer stays silent on the bad input: the case above catches the mutant")
+        self.assertEqual(set(examples), set(sb.OWNED_READABLE))
 
     def said(self, rule):
         self.apply()

@@ -8718,6 +8718,30 @@ def worker_owned(records, pulls, issue, repo):
     return types.SimpleNamespace(issues=found["issue"] + found["work item"], numbers=ctx.numbers, pulls=found["pull request"])
 
 
+def _readable_time(r):
+    return parse_iso(r.get("updated_at")) is not None
+
+
+def _readable_head(r):
+    head = r.get("head")
+    return isinstance(head, dict) and isinstance(head.get("sha"), str) and bool(head["sha"])
+
+
+# #874: THE table of what must be readable on what a worker owns before a rule may judge it: member -> (which owned items, the check). `owned_readable`
+# LOOPS OVER it, so a member cannot be checked in code and not here; the tests are parametrised over it, each member in each position of the list.
+OWNED_READABLE = {
+    "assignment time": (lambda owned: owned.issues[:1], _readable_time),
+    "work item time": (lambda owned: owned.issues[1:], _readable_time),
+    "pull request head": (lambda owned: owned.pulls, _readable_head),
+    "pull request time": (lambda owned: owned.pulls, _readable_time),
+}
+
+
+def owned_readable(owned):
+    """True when every member of OWNED_READABLE reads on every owned item it covers (default-deny: one bad item anywhere is not readable)."""
+    return all(check(r) for select, check in OWNED_READABLE.values() for r in select(owned))
+
+
 # #874: every consumer of `worker_owned` and what it takes from the set. The two rules and every row of WAITING_GUARDS; a completeness test fails when
 # one is added to the code without a row here.
 WORKER_OWNED_CONSUMERS = {
@@ -8786,18 +8810,11 @@ def legitimately_waiting(engine, observation, issue, repo, last):
         if owned is None:
             return out
         w.issues, w.numbers, w.mine = owned.issues, owned.numbers, owned.pulls
-        times = [parse_iso(r.get("updated_at")) for r in owned.issues]
-        if any(t is None for t in times):
-            return out   # an owned issue whose time cannot be read: not judged
-        out.issue_at = max(times)
+        if not owned_readable(owned):
+            return out   # an owned item whose time or head cannot be read is an input not read whole: not judged
+        out.issue_at = max(parse_iso(r.get("updated_at")) for r in owned.issues)
         out.issues, out.pulls = owned.issues, owned.pulls
-        stamps = []
-        for r in owned.pulls:
-            sha = (r.get("head") or {}).get("sha") if isinstance(r.get("head"), dict) else None
-            at = parse_iso(r.get("updated_at"))
-            if not isinstance(sha, str) or at is None:
-                return out   # an owned pull request with no readable head or time: not judged
-            stamps.append((at, r["number"], sha))
+        stamps = [(parse_iso(r.get("updated_at")), r["number"], r["head"]["sha"]) for r in owned.pulls]
         if stamps:
             out.pr_at, out.number, out.head = max(stamps)   # the newest-moved one when several are owned
             out.pr = next(r for r in owned.pulls if r["number"] == out.number)
