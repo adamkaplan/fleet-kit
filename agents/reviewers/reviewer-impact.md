@@ -99,6 +99,25 @@ findings:
 - <rule id> | note | <file:line> | <why> | <what would resolve it>
 ```
 
+The coder session records your block; you never run the command. A block with no `impact-severity:` and `impact-probability:` line is recorded WITHOUT a score and clears nothing by score, so always give both.
+
+<!-- block-table:begin -->
+With --block, refused (the block carries them): --verdict, --head, --blocks, --notes, --impact-action; accepted: --reviewer, --summary, --impact-class, --impact-severity, --impact-probability, --impact-reason, and of these --impact-class, --impact-severity, --impact-probability, --impact-reason win over the block's own lines; the score comes from the block's impact-severity:, impact-probability: and impact-reason: lines, so a block without the first two is recorded WITHOUT a score
+<!-- block-table:end -->
+
+A full block, as you return it (the three `impact-` rating lines are what give the record its score):
+
+```
+verdict: approve
+head: 0123456789abcdef0123456789abcdef01234567
+impact-action: second-review
+impact-severity: Marginal
+impact-probability: Occasional
+impact-reason: a new stderr line on a record that succeeds; no stored data changes
+findings:
+- R-CODE-1 | note | bin/example:10 | an example note | none needed
+```
+
 `approve` means nothing blocks. `request-changes` needs at least one blocking finding that cites a rule. `comment` is proposals only.
 
 ## Never
