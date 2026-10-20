@@ -133,6 +133,225 @@ def count_call(args):
         pass
 
 
+# ---- the read cache and the low-budget warning (#867, clauses 3 and 4)
+# A repeated identical `gh api <path>` read of one agent on one account is answered from a short cache (at most CACHE_FRESH seconds), then revalidated with the
+# entity tag (a 304 does not count against GitHub's budget). The key is account + path + agent; any write by that agent drops its entries first. Every error in
+# here falls through to the real call. Only the exact shape `gh api <path>` (a GET with no flag) with stdout not a terminal is cached: anything else runs as before.
+CACHE_DIR = "gh-read-cache"
+CACHE_FRESH = 30          # seconds a cached answer is served without asking GitHub
+CACHE_STALE_MAX = 600     # seconds: the oldest answer served while the account is nearly out of budget, and the longest any entry is kept
+CACHE_BODY_MAX = 1048576
+CACHE_FILES_MAX = 200
+LOW_FRACTION = 0.15       # below this share of the hourly budget the shim says so, and serves a cached read instead of spending
+USAGE_FILE = "github-usage.json"   # the daemon's once-a-minute reading of the account's real usage (bin/agent_calls.py)
+USAGE_FRESH = 600
+WARN_EVERY = 60
+
+
+def state_directory():
+    return os.environ.get("FLEET_SWITCHBOARD_STATE") or os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"), "fleet-switchboard")
+
+
+def cacheable_read(args):
+    """The path of a call that is exactly `gh api <path>` (nothing else: no flag, no method, no field), else None."""
+    if len(args) == 2 and args[0] == "api" and args[1] and not args[1].startswith("-") and "\n" not in args[1] and len(args[1]) <= 2000:
+        return args[1]
+    return None
+
+
+def cache_directory(create=False):
+    """The cache directory (0700, owned by this user, not a link), or None. Only while a daemon has switched counting on (the fleet is in use)."""
+    state = state_directory()
+    if os.environ.get("FLEET_SHIM_CACHE") == "off" or not os.path.exists(os.path.join(state, CALLS_ON)):
+        return None
+    path = os.path.join(state, CACHE_DIR)
+    try:
+        if create and not os.path.lexists(path):
+            os.makedirs(path, mode=0o700, exist_ok=True)
+        info = os.lstat(path)
+    except OSError:
+        return None
+    import stat
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        return None
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            return None
+    return path
+
+
+def _digest(*parts):
+    import hashlib
+    return hashlib.sha256("\0".join(parts).encode("utf-8", "replace")).hexdigest()
+
+
+def cache_file(directory, agent, account, path):
+    return os.path.join(directory, "%s-%s.json" % (_digest(agent)[:16], _digest(account, agent, path)[:40]))
+
+
+def cache_load(file, now):
+    """(age, etag, body) of a stored answer, or None (missing, unreadable, malformed, or older than CACHE_STALE_MAX)."""
+    try:
+        with open(file) as handle:
+            entry = json.loads(handle.read(CACHE_BODY_MAX + 4096))
+        ts, etag, body = entry["ts"], entry.get("etag"), entry["body"]
+        if not isinstance(ts, (int, float)) or isinstance(ts, bool) or not isinstance(body, str) or not (etag is None or isinstance(etag, str)):
+            return None
+        age = now - ts
+        return (age, etag, body) if -5 <= age <= CACHE_STALE_MAX else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def cache_store(directory, file, etag, body, now):
+    """Write one entry (0600, a temp file renamed into place), then keep the directory bounded in count and age. Never raises."""
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
+        with os.fdopen(fd, "w") as out:
+            out.write(json.dumps({"ts": now, "etag": etag, "body": body}))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, file)
+        tmp = None
+        names = [n for n in os.listdir(directory) if n.endswith(".json")]
+        dated = []
+        for name in names:
+            try:
+                dated.append((os.stat(os.path.join(directory, name)).st_mtime, name))
+            except OSError:
+                pass
+        dated.sort()
+        for mtime, name in dated[:max(0, len(dated) - CACHE_FILES_MAX)] + [d for d in dated if now - d[0] > CACHE_STALE_MAX]:
+            try:
+                os.unlink(os.path.join(directory, name))
+            except OSError:
+                pass
+    except Exception:
+        pass
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def cache_drop(agent):
+    """A write by `agent`: every cached answer of that agent is dropped (never another agent's). Never raises."""
+    try:
+        directory = cache_directory()
+        if directory is None or not agent:
+            return
+        prefix = _digest(agent)[:16] + "-"
+        for name in os.listdir(directory):
+            if name.startswith(prefix):
+                try:
+                    os.unlink(os.path.join(directory, name))
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+def budget_low(account):
+    """(remaining, limit) when the daemon's fresh reading says this account is below LOW_FRACTION of its budget, else None."""
+    try:
+        with open(os.path.join(state_directory(), USAGE_FILE)) as handle:
+            body = json.loads(handle.read(200001))
+        row = body["accounts"][account]
+        remaining, limit, at = row["remaining"], row["limit"], body["at"]
+        numbers = (remaining, limit, at)
+        if not all(isinstance(n, (int, float)) and not isinstance(n, bool) for n in numbers) or limit <= 0 or time.time() - at > USAGE_FRESH:
+            return None
+        return (int(remaining), int(limit)) if remaining < LOW_FRACTION * limit else None
+    except Exception:
+        return None
+
+
+def warn_low(account, low):
+    """One line on stderr before a call that would spend, at most once a minute per account. Never raises."""
+    try:
+        directory = os.path.join(state_directory(), "gh-low-warned")
+        stamp = os.path.join(directory, _digest(account)[:16])
+        try:
+            if time.time() - os.stat(stamp).st_mtime < WARN_EVERY:
+                return
+        except OSError:
+            pass
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        with open(stamp, "w"):
+            pass
+        sys.stderr.write("gh: warning: the GitHub account %s has %d of %d requests left this hour (under %d%%); repeated reads are answered from a short cache\n"
+                         % (account, low[0], low[1], int(LOW_FRACTION * 100)))
+    except Exception:
+        pass
+
+
+def split_response(raw):
+    """(status, headers, body bytes) of `gh api -i` output, or None when it is not that shape."""
+    cut = raw.find(b"\r\n\r\n")
+    sep = 4
+    if cut < 0:
+        cut, sep = raw.find(b"\n\n"), 2
+    if cut < 0:
+        return None
+    head = raw[:cut].decode("latin-1").splitlines()
+    first = head[0].split() if head else []
+    if len(first) < 2 or not first[0].startswith("HTTP/") or not first[1].isdigit():
+        return None
+    headers = {}
+    for line in head[1:]:
+        key, colon, value = line.partition(":")
+        if colon:
+            headers[key.strip().lower()] = value.strip()
+    return int(first[1]), headers, raw[cut + sep:]
+
+
+def cached_read(gh, env, args, agent, account, low):
+    """Serve `gh api <path>` from the cache or through one conditional request. Returns an exit status, or None when the normal call should run (nothing was spent)."""
+    path = cacheable_read(args)
+    directory = cache_directory(create=True) if path and agent else None
+    if directory is None or sys.stdout.isatty():
+        return None
+    now = time.time()
+    file = cache_file(directory, agent, account, path)
+    entry = cache_load(file, now)
+    if entry is not None and (entry[0] <= CACHE_FRESH or low is not None):
+        sys.stdout.buffer.write(entry[2].encode("utf-8"))   # fresh, or the account is nearly out of budget: no request at all
+        sys.stdout.buffer.flush()
+        return 0
+    argv = [gh, "api", "-i"] + (["-H", "If-None-Match: " + entry[1]] if entry is not None and entry[1] else []) + [path]
+    done = subprocess.run(argv, capture_output=True, env=env)   # the one request (the real gh does not time out either)
+    parsed = split_response(done.stdout)
+    if parsed is None:   # not an answer this can interpret: say what gh said
+        sys.stdout.buffer.write(done.stdout)
+        sys.stderr.buffer.write(done.stderr)
+        count_call(args)
+        return done.returncode
+    status, headers, body = parsed
+    if status == 304 and entry is not None:
+        try:
+            cache_store(directory, file, entry[1], entry[2], now)   # fresh again; a 304 costs nothing, so it is not counted
+        except Exception:
+            pass
+        sys.stdout.buffer.write(entry[2].encode("utf-8"))
+        sys.stdout.buffer.flush()
+        return 0
+    count_call(args)
+    if 200 <= status < 300 and len(body) <= CACHE_BODY_MAX:
+        try:
+            cache_store(directory, file, headers.get("etag"), body.decode("utf-8"), now)
+        except Exception:
+            pass
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+    sys.stderr.buffer.write(done.stderr)
+    return done.returncode
+
+
 def real_gh():
     """The first executable named gh on PATH that is not this shim's own directory."""
     own = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
@@ -1169,6 +1388,25 @@ def run(args):
             return 1
     audit_write(args, lookup, "passed", write, hold_repo, hold_number)
     warn_text(args)
+    served = None
+    try:
+        own = os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1"
+        words = command_words(args)
+        if not own and words and words[0] not in NO_NETWORK_GROUPS:
+            ident = lookup.identity() if (write or cacheable_read(args)) else {}
+            agent = ident.get("name")
+            if write:
+                cache_drop(agent)   # a write by this agent: its cached answers go before the write runs
+            account = COUNT_ACCOUNT[0] or "default"
+            low = budget_low(account)
+            if low is not None:
+                warn_low(account, low)
+            if not write and plan is None and not APP_DIRS:
+                served = cached_read(gh, env, args, agent, account, low)
+    except Exception:
+        served = None   # the cache never fails the command
+    if served is not None:
+        return served
     count_call(args)
     if plan is None:
         if APP_DIRS:   # a token file has to be removed after the call: gh runs as a child, not in place of this process
