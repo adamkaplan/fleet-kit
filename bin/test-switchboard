@@ -41596,9 +41596,8 @@ class TestCloudReaperTemplates(Base):
         self.assertIn('Environment="CW_CLOUD_NAMESPACE=acme-cw"', text)
 
     def test_the_interval_is_never_slower_than_the_reapers_floor(self):
-        sys.path.insert(0, str(REPO / "cloud" / "launcher"))
-        import cloud_worker
-        self.assertLessEqual(sb.REAPER_INTERVAL_SECONDS, cloud_worker.REAP_FLOOR_SECONDS)
+        floor = int(re.search(r"(?m)^REAP_FLOOR_SECONDS = (\d+)", (REPO / "cloud" / "launcher" / "cloud_worker.py").read_text()).group(1))
+        self.assertLessEqual(sb.REAPER_INTERVAL_SECONDS, floor)
         self.assertGreater(sb.REAPER_INTERVAL_SECONDS, 0)
 
     def test_neither_holds_a_secret_a_placeholder_or_the_void(self):
