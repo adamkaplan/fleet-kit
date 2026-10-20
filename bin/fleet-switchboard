@@ -21022,33 +21022,33 @@ def impact_review_hold(state_dir, pr, head):
     --impact-action hold`): an input that can only ADD a hold, nothing it says lowers the floor. **Fail mode: toward hold.** When the ledger
     cannot be read or is not trustworthy the rating is UNKNOWN, and an unknown input holds (as an unreadable diff does, and as G1 already
     refuses on a bad ledger): `hold` is True and `problem` says why; the caller audits it (`impact.ledger_unreadable`)."""
-    try:
-        entries, problem = plan_ledger.read_ledger(state_dir)
-    except Exception as err:
-        entries, problem = [], "%s: %s" % (type(err).__name__, _one_line(str(err), 100))
+    entries, problem = impact_rating_entries(state_dir, pr, head)   # the one filter of the records at this head
     if problem:
         return True, "the ledger could not be read, so the independent rating is unknown: %s" % _one_line(str(problem), 120)
-    latest = None
-    for entry in entries:
-        if entry.get("kind") == "review_record" and entry.get("pr") == pr and entry.get("head") == head and entry.get("reviewer") == "impact":
-            latest = entry
+    latest = entries[-1] if entries else None
     return bool(latest and latest.get("impact_action") == "hold"), None
 
 
 def impact_review_record(state_dir, pr, head):
     """((action, class), problem): the independent impact reviewer's newest record for EXACTLY this head as (impact_action, impact_class) (None when there is
-    none), and what is wrong when the ledger cannot be read (the rating is then unknown: the owner decision reads it as a hold)."""
+    none), and what is wrong when the ledger cannot be read (the rating is then unknown: the owner decision reads it as a hold). The records come from `impact_rating_entries`, the one filter."""
+    entries, problem = impact_rating_entries(state_dir, pr, head)
+    if problem:
+        return None, problem
+    latest = entries[-1] if entries else None
+    return ((latest.get("impact_action"), latest.get("impact_class")) if latest else None), None
+
+
+def impact_rating_entries(state_dir, pr, head):
+    """([ledger entries], problem): every impact reviewer record of EXACTLY this pull request and head (the delegated clear's score is the highest of those whose recorded role counts: `delegated_clear.judge` decides which).
+    A ledger that cannot be read, or whose chain is broken, gives ([], why): the score is then unknown. #835."""
     try:
         entries, problem = plan_ledger.read_ledger(state_dir)
     except Exception as err:
-        return None, "%s: %s" % (type(err).__name__, _one_line(str(err), 100))
+        return [], "%s: %s" % (type(err).__name__, _one_line(str(err), 100))
     if problem:
-        return None, _one_line(str(problem), 120)
-    latest = None
-    for entry in entries:
-        if entry.get("kind") == "review_record" and entry.get("pr") == pr and entry.get("head") == head and entry.get("reviewer") == "impact":
-            latest = entry
-    return ((latest.get("impact_action"), latest.get("impact_class")) if latest else None), None
+        return [], _one_line(str(problem), 120)
+    return [e for e in entries if e.get("kind") == "review_record" and e.get("reviewer") == "impact" and e.get("pr") == pr and e.get("head") == head], None
 
 
 def _file_text_at(engine, repo, path, ref):
@@ -21151,7 +21151,7 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
 
 def cmd_impact(args, runner, now):
     """`impact floor|hold|clear`."""
-    return {"floor": cmd_impact_floor, "hold": cmd_impact_hold, "clear": cmd_impact_clear}[args.impact_action](args, runner, now)
+    return {"floor": cmd_impact_floor, "hold": cmd_impact_hold, "clear": cmd_impact_clear, "delegated": cmd_impact_delegated}[args.impact_action](args, runner, now)
 
 
 cmd_impact.direct = True   # no error mapping, no daemon start
@@ -22849,7 +22849,7 @@ def parse_review_block(text):
     if not isinstance(text, str) or not text.strip():
         return None, "no verdict block"
     lines = [l.strip() for l in text.splitlines()]
-    fields = {"verdict": None, "head": None, "impact_action": None, "impact_class": None, "blocks": 0, "notes": 0, "findings": 0}
+    fields = {"verdict": None, "head": None, "impact_action": None, "impact_class": None, "impact_severity": None, "impact_probability": None, "impact_reason": None, "blocks": 0, "notes": 0, "findings": 0}
     started = False
     for line in lines:
         if line.startswith("verdict:") and not started:
@@ -22860,6 +22860,12 @@ def parse_review_block(text):
             fields["impact_action"] = line.split(":", 1)[1].strip()
         elif started and line.startswith("impact-class:"):
             fields["impact_class"] = line.split(":", 1)[1].strip().lower()
+        elif started and line.startswith("impact-severity:"):
+            fields["impact_severity"] = line.split(":", 1)[1].strip()
+        elif started and line.startswith("impact-probability:"):
+            fields["impact_probability"] = line.split(":", 1)[1].strip()
+        elif started and line.startswith("impact-reason:"):
+            fields["impact_reason"] = line.split(":", 1)[1].strip()
         elif started and line.startswith("- "):
             parts = [p.strip() for p in line[2:].split("|")]
             if len(parts) >= 2 and parts[1] in ("block", "note"):
@@ -22885,6 +22891,24 @@ def parse_review_block(text):
 
 
 IMPACT_CLASS_RE = re.compile(r"[a-z][a-z-]{0,31}")
+IMPACT_RATING_FIELDS = ("impact_severity", "impact_probability", "impact_reason")   # the record's rating fields: the code's one table (parse, record, flags)
+RATING_INPUTS = IMPACT_RATING_FIELDS + ("impact_action", "impact_class", "block")   # every input of `review record` that decides the rating: read ONLY by `rating_inputs`, from the raw argv
+
+
+def rating_inputs(raw_argv):
+    """{dest: value} of the rating inputs GIVEN in `raw_argv` (a tuple of strings: the command line `main` captured before it built the shared parser), parsed by a PRIVATE minimal parser: the six flags of
+    RATING_INPUTS only, no abbreviation, no default (an absent flag is absent), nothing shared with `build_parser`. A registrar's `set_defaults`, a replaced or re-parsed subparser, a same-dest argument or a
+    wrapper on the namespace cannot change what this returns. A raw argv that is not a tuple or list of strings gives nothing (no rating). #835."""
+    if not isinstance(raw_argv, (tuple, list)) or not all(isinstance(x, str) for x in raw_argv):
+        return {}
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False, argument_default=argparse.SUPPRESS, exit_on_error=False)
+    for name in RATING_INPUTS:
+        parser.add_argument("--" + name.replace("_", "-"), dest=name)
+    try:
+        parsed, _ = parser.parse_known_args(list(raw_argv))
+    except (argparse.ArgumentError, SystemExit):
+        return {}
+    return dict(vars(parsed))
 
 
 def cmd_review(args, runner, now):
@@ -22925,34 +22949,50 @@ def cmd_review(args, runner, now):
             return EXIT_OK
         if args.reviewer not in plan_ledger.REVIEWERS:
             raise ReviewError("--reviewer must be one of %s" % ", ".join(plan_ledger.REVIEWERS))
-        if args.block is not None:   # the reviewer's returned text: the coder session records it
-            if args.verdict or args.head or args.blocks or args.notes or args.impact_action:
+        given = rating_inputs(getattr(args, "raw_argv", ()))   # #835: the rating's inputs come from the raw argv through a private parser, never from the shared namespace (a registrar's set_defaults, a replaced parser or a wrapper cannot reach them); a missing raw argv gives no rating
+        action, klass = given.get("impact_action"), given.get("impact_class")
+        rating_in = {name: given.get(name) for name in IMPACT_RATING_FIELDS}
+        if given.get("block") is not None:   # the reviewer's returned text: the coder session records it
+            if args.verdict or args.head or args.blocks or args.notes or action:
                 raise ReviewError("--block carries the verdict, head, counts and impact action itself: give nothing else")
-            fields, why = parse_review_block(_read_capped(args.block, REVIEW_TABLE_MAX))
+            fields, why = parse_review_block(_read_capped(given["block"], REVIEW_TABLE_MAX))
             if fields is None:
                 raise ReviewError("refused: %s" % why)
-            args.verdict, args.head, args.blocks, args.notes, args.impact_action = (fields["verdict"], fields["head"], fields["blocks"],
-                                                                                    fields["notes"], fields["impact_action"])
-            args.impact_class = args.impact_class or fields["impact_class"]
+            args.verdict, args.head, args.blocks, args.notes, action = (fields["verdict"], fields["head"], fields["blocks"], fields["notes"], fields["impact_action"])
+            klass = klass or fields["impact_class"]
+            for name in IMPACT_RATING_FIELDS:   # the rating's severity and probability (the score is derived from the matrix's cell), and the reason that names a floor rule
+                if rating_in[name] is None:
+                    rating_in[name] = fields[name]
         if args.verdict not in plan_ledger.REVIEW_VERDICTS:
             raise ReviewError("--verdict must be one of %s (or give --block with the reviewer's returned text)" % ", ".join(plan_ledger.REVIEW_VERDICTS))
-        for name in ("blocks", "notes"):
-            if getattr(args, name) < 0 or getattr(args, name) > 200:
+        for name, count in (("blocks", args.blocks), ("notes", args.notes)):
+            if count < 0 or count > 200:
                 raise ReviewError("--%s must be a number from 0 to 200" % name)
         if args.verdict == "approve" and args.blocks:
             raise ReviewError("an approve cannot carry blocking findings (%d given)" % args.blocks)
         if args.verdict == "request-changes" and not args.blocks:
             raise ReviewError("request-changes needs at least 1 blocking finding (a finding that cites no rule never blocks)")
-        if args.impact_action and args.reviewer != "impact":
+        if action and args.reviewer != "impact":
             raise ReviewError("--impact-action belongs to the impact reviewer")
-        impact_class = (getattr(args, "impact_class", None) or "").strip().lower() or None
+        impact_class = (klass or "").strip().lower() or None
         if impact_class is not None and args.reviewer != "impact":
             raise ReviewError("--impact-class belongs to the impact reviewer")
+        rating = {name: (rating_in[name] or "").strip() or None for name in IMPACT_RATING_FIELDS}
+        if any(rating.values()) and args.reviewer != "impact":
+            raise ReviewError("--impact-severity, --impact-probability and --impact-reason belong to the impact reviewer")
+        if rating["impact_severity"] or rating["impact_probability"]:
+            try:
+                cells = impact_floor._matrix_cached()["cells"]
+                known = isinstance(cells.get(rating["impact_severity"]), dict) and rating["impact_probability"] in cells[rating["impact_severity"]]
+            except (impact_floor.MatrixError, KeyError, TypeError, AttributeError):
+                raise ReviewError("refused: the impact matrix file cannot be read, so the rating cannot be checked (nothing was recorded)") from None
+            if not known:
+                raise ReviewError("the rating %r / %r is not a cell of the matrix (nothing was recorded)" % (str(rating["impact_severity"])[:30], str(rating["impact_probability"])[:30]))
         if impact_class is not None and not IMPACT_CLASS_RE.fullmatch(impact_class):
             raise ReviewError("impact-class must be one lower-case word naming the class of the impact (see the matrix file's classes), got %r" % impact_class[:40])
-        if args.impact_action == "hold" and impact_class is None:
+        if action == "hold" and impact_class is None:
             raise ReviewError("an impact hold must name its class (--impact-class or an `impact-class:` line): run the review again (nothing was recorded)")
-        if args.impact_action == "hold":   # #692: the class must be one the matrix file names (read now, never a list of our own)
+        if action == "hold":   # #692: the class must be one the matrix file names (read now, never a list of our own)
             try:
                 rule = impact_floor.owner_hold_rule(impact_floor._matrix_cached())
             except impact_floor.MatrixError as err:
@@ -22974,8 +23014,13 @@ def cmd_review(args, runner, now):
         entry = {"kind": "review_record", "pr": ref, "head": head, "reviewer": args.reviewer, "verdict": args.verdict,
                  "blocks": args.blocks, "notes": args.notes, "by": by,
                  "summary": plan_ledger.clip(redact_command_text(args.summary or ""), 200)}
-        if args.impact_action:
-            entry["impact_action"] = args.impact_action
+        if action:
+            entry["impact_action"] = action
+        if args.reviewer == "impact":
+            entry["by_role"] = kind[2] if kind[0] == "agent" and len(kind) > 2 and isinstance(kind[2], str) else None   # #835: the RECORDED role of the session that made the record (never a flag or a text): only the independent reviewer's rating counts
+        for name in IMPACT_RATING_FIELDS:
+            if rating[name]:
+                entry[name] = plan_ledger.clip(redact_command_text(rating[name]), 200)
         if impact_class:
             entry["impact_class"] = impact_class   # #451 slice 2: the class of the impact that drives the action; a missing one holds for the owner
         stored = plan_ledger.append_entry(state, entry, now())
@@ -23192,7 +23237,7 @@ def add_review_parsers(sub):
     blockers = rsub.add_parser("blockers", help="Read-only: the reviewers whose LATEST recorded result at the PR's head is request-changes (one line each)")
     blockers.add_argument("pr", help="owner/repo#N or the PR's URL")
     blockers.add_argument("--head", help="The commit to look at (default: the PR's head)")
-    record = rsub.add_parser("record", help="Record a reviewer's result for the PR's current head (the coder session records what the reviewer returned)")
+    record = rsub.add_parser("record", allow_abbrev=False, help="Record a reviewer's result for the PR's current head (the coder session records what the reviewer returned)")
     record.add_argument("pr", help="owner/repo#N or the PR's URL")
     record.add_argument("--reviewer", required=True, help="code | architecture | security | impact | test")
     record.add_argument("--head", help="The commit judged (default: the PR's head; a different one is refused)")
@@ -23202,6 +23247,8 @@ def add_review_parsers(sub):
     record.add_argument("--notes", type=int, default=0, help="Notes and proposals")
     record.add_argument("--impact-action", dest="impact_action", choices=("hold", "second-review", "none"),
                         help="The impact reviewer's action from the matrix")
+    for flag in IMPACT_RATING_FIELDS:
+        record.add_argument("--" + flag.replace("_", "-"), dest=flag, help="#835: the impact reviewer's rating (%s): the severity and the probability name a cell of the matrix, the reason names the floor rule it applied" % flag.split("_", 1)[1])
     record.add_argument("--impact-class", dest="impact_class", help="The class of the impact that drives the action (a class of the matrix file's owner_hold block)")
     record.add_argument("--summary", help="One line (at most 200 characters)")
     checkout = rsub.add_parser("checkout", help="Write the PR's exact head tree, its diff and the base copies of the touched files into .review/<head sha> here, read-only, and print the path; --remove <dir> removes one")
@@ -23665,6 +23712,9 @@ def add_impact_parsers(sub):
     hold = impact_sub.add_parser("hold", help="What the daemon would label as held right now (read-only dry run; the daemon writes the labels)")
     hold.add_argument("--dry-run", action="store_true", dest="dry_run")
     hold.add_argument("--repo", help="One repo (OWNER/REPO); default: every repo under plan_gates")
+    delegated = impact_sub.add_parser("delegated", help="List every clear the Chief of Staff made under an order of the owner's: the pull request, head, score, threshold and her judgement (read-only)")
+    delegated.add_argument("--json", action="store_true")
+    delegated.add_argument("--check", action="store_true", help="The fleet doctor's check: fail when a configured owner-file order no longer matches exactly one line of the owner's standing-orders file")
     clear = impact_sub.add_parser("clear", help="The owner's own terminal: clear a false impact hold for this head, with a reason (the Chief of Staff only under a standing order of the owner's, with --under-order)")
     clear.add_argument("pr", help="The pull request: owner/repo#N or its URL")
     clear.add_argument("--under-order", type=int, dest="under_order", metavar="N", help="The Chief of Staff only: clear under the owner's standing order N (it must be listed under delegated_clear in the configuration); recorded as her act under that order")
@@ -27780,6 +27830,7 @@ except Exception as _err:
 # those attributes, derived once everything is defined (see `derive_action_groups`), never lists to edit; `dispatch` asks the view AND the attribute
 # (a test that swaps a command's function for a recorder keeps the group the module defined).
 
+RATING_PATH_FUNCTIONS = ("cmd_review", "parse_review_block", "rating_inputs", "resolve_command", "dispatch", "call_command")   # `main` checks these are the same objects after the registrars ran (#835)
 COMMAND_NAME_RE = re.compile(r"[a-z][a-z0-9-]*")
 REGISTRAR_NAME_RE = re.compile(r"add_[a-z0-9_]+_parsers")
 COMMAND_ARGUMENTS = ("args", "runner", "now", "spawn", "socket_call", "wait")   # what a command function may ask for, by parameter name
@@ -27856,15 +27907,21 @@ def dispatch(args, known, runner=subprocess.run, now=time.time, wait=None, spawn
 def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen,
          socket_call=None):
     os.environ.setdefault(OWN_GH_ENV, "1")   # the gh calls of this process are the switchboard's own: never re-identified
+    raw = tuple(argv if argv is not None else sys.argv[1:])   # #835: the command line as typed, captured BEFORE any registrar runs: `review record` reads its rating inputs from this, never from the shared parser
+    held = {name: (globals()[name], globals()[name].__code__) for name in RATING_PATH_FUNCTIONS if name in globals()}
     parser = build_parser()
     try:
-        args, extra = parser.parse_known_args(argv)
+        args, extra = parser.parse_known_args(list(raw))
+        args.raw_argv = raw   # set here, after the parse: no registrar default, Action or wrapper can set it first
         if extra and args.action == "remind" and not (args.list_mine or args.cancel) and not any(word.startswith("-") for word in extra):
             args.text = list(args.text or []) + extra   # words after an option (`remind a 1h --issue 3 the text`): argparse lets an optional positional end early
         elif extra:
             parser.error("unrecognized arguments: %s" % " ".join(extra))
     except SystemExit as exit_:
         return EXIT_USAGE if exit_.code not in (0, None) else EXIT_OK
+    if getattr(args, "action", None) == "review" and (set(held) != set(RATING_PATH_FUNCTIONS) or any(globals().get(name) is not fn or fn.__code__ is not code for name, (fn, code) in held.items())):
+        sys.stderr.write("%s: review: a command registrar replaced code on the rating path: nothing was recorded\n" % PROG)   # a registrar reassigned one of the functions the rating is read and recorded by
+        return EXIT_ERROR
     return dispatch(args, parser.commands, runner=runner, now=now, wait=wait, spawn=spawn, socket_call=socket_call)
 
 
