@@ -24064,7 +24064,7 @@ def cmd_review(args, runner, now):
         for name in IMPACT_RATING_FIELDS:
             if rating[name]:
                 entry[name] = plan_ledger.clip(redact_command_text(rating[name]), 200)
-        if args.reviewer == "impact":   # #901: the block's own bytes and rating lines are kept, so only a record that carries the agent's block counts by score
+        if reviewer == "impact":   # #901: the block's own bytes and rating lines are kept, so only a record that carries the agent's block counts by score
             entry["block_sha256"] = block_digest[0] if block_digest else "none"
             if block_digest:
                 entry["block_size"] = block_digest[1]
