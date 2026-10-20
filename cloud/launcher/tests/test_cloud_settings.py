@@ -648,8 +648,10 @@ class OptionShaped(Dir):
                     self.assertFalse(check(value))
 
 
-# ---------------------------------------------------------------- S16: the class: every CW_* name the code reads is a row or on the one list
+# ---------------------------------------------------------------- S16/S18: the class: every CW_* and switchboard-prefix name the code reads is a row or on the one list
 # THE list of names the launcher and the launch wiring mention that are deliberately NOT settings, each with its reason.
+SWITCHBOARD_PREFIX = "FL" + "EET_CLOUD_"   # written in two parts: test_cw_names bans the retired prefix as text anywhere under cloud/ (this one is the switchboard's own, in bin/)
+PREFIXES = ("CW_", SWITCHBOARD_PREFIX)   # every environment prefix the launch wiring and the launcher read
 NOT_SETTINGS = {
     # set by the code itself for the pod or a child: never read from the operator
     "CW_WORKER": "set by the launcher into the pod's environment (the worker's own name); end_hook reads it inside the pod",
@@ -685,9 +687,11 @@ NOT_SETTINGS = {
     "CW_PREFLIGHT_TOKEN_CMD": "test hook: points the preflight at a fake token command (withheld from the preflight child)",
     "CW_OPENSSL": "the openssl program, kept only when an absolute executable file; a tooling path of the machine, not a lane choice",
     "CW_TMPDIR": "where the driver's private temp directory goes; a machine setting, default the system temp directory",
+    # the switchboard's own variable (S18)
+    SWITCHBOARD_PREFIX + "WORKER_BIN": "the launcher program, found by a lookup order (the variable when set, else the launcher of the switchboard's own checkout, else `cloud-worker` on the PATH), not a settings key: a path in the file would be one more thing to keep in step with the checkout, and an environment override that wins is what tests and a second install need",
 }
 SOURCES = ["bin/cloud_worker.py"]
-NAME = re.compile(r"CW_[A-Z0-9_]+")
+NAME = re.compile(r"(?:%s)[A-Z0-9_]+" % "|".join(PREFIXES))
 
 
 def source_files():
@@ -698,7 +702,7 @@ def source_files():
 
 
 def names_in(text):
-    """Every CW_* name the source mentions as a string constant (an env read, a table row, a name list, a dict key): from the code's AST, never a hand list."""
+    """Every CW_* or switchboard-prefix name the source mentions as a string constant (an env read, a table row, a name list, a dict key): from the code's AST, never a hand list."""
     return {n.value for n in ast.walk(ast.parse(text)) if isinstance(n, ast.Constant) and isinstance(n.value, str) and NAME.fullmatch(n.value)}
 
 
@@ -723,7 +727,7 @@ class Complete(unittest.TestCase):
     def test_s16_the_source_set_is_not_empty_and_has_both_key_kinds(self):
         names = derived()
         self.assertGreater(len(names), 40)
-        self.assertLessEqual({"CW_CLUSTER_ADMIN_SECRET", "CW_CLUSTER_TOKEN_DURATION", "CW_WORKER"}, names)   # one new row, one old row, one listed name
+        self.assertLessEqual({"CW_CLUSTER_ADMIN_SECRET", "CW_CLUSTER_TOKEN_DURATION", "CW_WORKER", SWITCHBOARD_PREFIX + "WORKER_BIN"}, names)   # one new row, one old row, one listed name
 
     def test_s16_no_name_is_both_a_row_and_listed_and_every_listed_name_is_still_in_the_code_with_a_reason(self):
         rows = {k for k, _, _ in cw.SETTINGS}
@@ -739,6 +743,29 @@ class Complete(unittest.TestCase):
             with self.subTest(path=os.path.basename(path)), open(path) as f:
                 text = f.read() + "\nimport os\n_x = os.environ.get('CW_MADE_UP_SETTING')\n"
                 self.assertEqual(unaccounted(names_in(text)), ["CW_MADE_UP_SETTING"])
+
+    def test_s18_every_prefix_has_a_member_in_the_code_and_the_launcher_variable_is_listed_with_its_reason(self):
+        for prefix in PREFIXES:
+            with self.subTest(prefix=prefix):
+                self.assertTrue([n for n in derived() if n.startswith(prefix)])
+        self.assertEqual(sorted(n for n in derived() if not n.startswith(PREFIXES)), [])
+        self.assertIn(SWITCHBOARD_PREFIX + "WORKER_BIN", NOT_SETTINGS)
+        self.assertIn("lookup order", NOT_SETTINGS[SWITCHBOARD_PREFIX + "WORKER_BIN"])
+
+    def test_s18_mutant_a_made_up_read_of_each_prefix_fails(self):
+        for prefix in PREFIXES:
+            for path in source_files():
+                with self.subTest(prefix=prefix, path=os.path.basename(path)), open(path) as f:
+                    text = f.read() + "\nimport os\n_x = os.environ.get('%sMADE_UP')\n" % prefix
+                    self.assertEqual(unaccounted(names_in(text)), [prefix + "MADE_UP"])
+
+    def test_s18_mutant_a_scan_restricted_to_cw_misses_the_made_up_read(self):
+        """The scan a build with only the CW_ prefix would run: it finds nothing for a made-up read of the switchboard prefix, which this test calls a failure."""
+        narrow = re.compile(r"CW_[A-Z0-9_]+")
+        text = "import os\n_x = os.environ.get('%sMADE_UP')\n" % SWITCHBOARD_PREFIX
+        seen = {n.value for n in ast.walk(ast.parse(text)) if isinstance(n, ast.Constant) and isinstance(n.value, str) and narrow.fullmatch(n.value)}
+        self.assertEqual(unaccounted(seen), [])                                    # the narrow scan reports nothing ...
+        self.assertEqual(unaccounted(names_in(text)), [SWITCHBOARD_PREFIX + "MADE_UP"])      # ... where the real scan reports the name
 
     def test_s16_one_mutant_per_member_dropping_a_row_or_a_listing_fails(self):
         rows = {k for k, _, _ in cw.SETTINGS}

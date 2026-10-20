@@ -36,6 +36,7 @@ from pathlib import Path
 
 H = {}   # the switchboard's own namespace, set by bind()
 
+_OWN_BIN = Path(__file__).resolve().parent   # fixed at import
 LAUNCHER_ENV = "FLEET_CLOUD_WORKER_BIN"   # the launcher program; default `cloud-worker` on PATH
 DEFAULT_LAUNCHER = "cloud-worker"
 CLOUD_DIR = "cloud"
@@ -351,8 +352,68 @@ def remote_v2(state, record, timeout=20, connect=None):
 
 # ---------------------------------------------------------------- the launcher (slice B): one program, called by argv
 
+def checkout_launcher_path():
+    """The launcher of the switchboard's OWN checkout: <checkout>/cloud/launcher/cloud-worker, found relative to this file (the checkout's real path:
+    a link in the checkout's location is followed once, here, so the walk judges the real parents)."""
+    return Path(__file__).resolve().parent.parent / "cloud" / "launcher" / "cloud-worker"
+
+
+_WALK = []
+
+
+def _walk():
+    """The one walk (bin/path_walk.py, beside this file), loaded once by path from where THIS module was imported."""
+    if not _WALK:
+        spec = importlib.util.spec_from_file_location("path_walk", str(_OWN_BIN / "path_walk.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _WALK.append(module)
+    return _WALK[0]
+
+
+def _checkout_launcher_problem(path):
+    """Why the checkout's launcher is not used, or None. The file and every parent go through the one walk of bin/path_walk.py (`entry_problem`,
+    `parents_problem`: lstat, never followed). The entry itself is the kit's `cloud-worker` link to its sibling `cloud_worker.py` (a bare file name in
+    the same directory): that target is the file judged: a regular file, executable, the user's, not group- or world-writable. A plain file is judged as it is."""
+    walk = _walk()
+    entry_problem, parents_problem = walk.entry_problem, walk.parents_problem
+    try:
+        found = os.lstat(path)
+    except OSError:
+        return "is not there"
+    target = path
+    if stat.S_ISLNK(found.st_mode):
+        link = os.readlink(path)
+        if not link or "/" in link or link in (".", ".."):
+            return "is a link that does not name a file beside it"
+        target = os.path.join(os.path.dirname(path), link)
+        try:
+            found = os.lstat(target)
+        except OSError:
+            return "is a link to a file that is not there"
+    if not stat.S_ISREG(found.st_mode):
+        return "is not a regular file"
+    if not found.st_mode & 0o100:
+        return "is not executable"
+    return entry_problem(found, "itself") or parents_problem(str(target))
+
+
+LAUNCHER_ORDER = ("variable", "checkout", "path")   # the lookup's sources, first wins; none left is a refusal (tests derive the ordering rules from this)
+
+
 def launcher_argv():
-    return [os.environ.get(LAUNCHER_ENV) or DEFAULT_LAUNCHER]
+    """The launcher program: the variable FLEET_CLOUD_WORKER_BIN when set (it wins, unchanged); else the launcher of this checkout when it is a safe
+    executable; else `cloud-worker` on the PATH; else a refusal naming the variable and the checkout path looked in (exit 2, nothing called)."""
+    given = os.environ.get(LAUNCHER_ENV)
+    if given:
+        return [given]
+    own = checkout_launcher_path()
+    if _checkout_launcher_problem(str(own)) is None:
+        return [str(own)]
+    if shutil.which(DEFAULT_LAUNCHER):
+        return [DEFAULT_LAUNCHER]
+    raise Refusal("no cloud launcher found: set %s to the launcher program, or run the switchboard from a checkout that holds %s (that file %s), "
+                  "or put `%s` on the PATH; nothing was called" % (LAUNCHER_ENV, own, _checkout_launcher_problem(str(own)), DEFAULT_LAUNCHER))
 
 
 def run_launcher(runner, command, worker, options=(), timeout=LAUNCH_SECONDS, password_fd=None, cluster=None, secrets=()):
@@ -1096,6 +1157,7 @@ def _launch(args, runner, now, reserve):
         options.append(CREATE_OPTION["stack"])
     if os.environ.get("CW_PULL_SECRET"):
         options += ["--pull-secret", os.environ["CW_PULL_SECRET"]]
+    launcher_argv()   # a launcher that cannot be found refuses here (exit 2), before the vault, the cluster or the launcher is touched
     recovery = VaultRecovery(cloud_dir(state) / VAULT_LOCK_NAME, lambda detail: _audit(engine, "cloud.vault_check", name, detail))
     with Cluster(recovery) as cluster:
         model = model_entry()
