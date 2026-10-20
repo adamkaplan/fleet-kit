@@ -32195,9 +32195,24 @@ class TestBlockTable(LedgerBase):
         code, out, err = self.record("--blocks", "0", "--notes", "0")
         self.assertEqual(code, 0, err)   # 0 is the default: cannot be told from absent
 
-    def test_a_flag_wins_over_the_blocks_line(self):
-        self.assertEqual(self.record("--impact-severity", "Critical", extra="impact-severity: Marginal\nimpact-probability: Remote\n")[0], 0)
-        self.assertEqual((self.records()[-1]["impact_severity"], self.records()[-1]["impact_probability"]), ("Critical", "Remote"))
+    WINNERS = (("--impact-class", "impact_class", "authority", "data"), ("--impact-severity", "impact_severity", "Critical", "Marginal"),
+               ("--impact-probability", "impact_probability", "Occasional", "Remote"), ("--impact-reason", "impact_reason", "the flag's reason", "the block's reason"))
+
+    def test_a_flag_wins_over_the_blocks_line_for_each_of_the_four_winning_rows(self):
+        self.assertEqual({dest for _, dest, mode in sb.BLOCK_FLAG_TABLE if mode == "wins"}, {dest for _, dest, _, _ in self.WINNERS})   # derived: a new winning row must be added here
+        block_lines = "impact-class: data\nimpact-severity: Marginal\nimpact-probability: Remote\nimpact-reason: the block's reason\n"
+        for flag, dest, flag_value, block_value in self.WINNERS:
+            with self.subTest(flag=flag):
+                action = "impact-action: hold\n"   # a hold needs a class; the block's own class line is "data"
+                path = self.world.state / "block.txt"
+                path.write_text("verdict: approve\nhead: %s\n%s%sfindings:\n" % (LEDGER_HEAD, action, block_lines))
+                code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path), flag, flag_value)
+                self.assertEqual(code, 0, err)
+                entry = self.records()[-1]
+                self.assertEqual(entry[dest], flag_value)
+                for _, d, _, bv in self.WINNERS:
+                    if d != dest:
+                        self.assertEqual(entry[d], bv, d)   # the other three keep the block's own lines
 
     def test_the_table_is_said_the_same_in_the_help_the_refusal_and_the_definition(self):
         text = sb.BLOCK_TABLE_TEXT
