@@ -31341,6 +31341,59 @@ class TestImpactFloorPure(unittest.TestCase):
         self.f = sb.load_impact_floor()
         self.matrix = self.f.load_matrix()
 
+    MATRIX_REL = "docs/review-laws/impact-matrix.json"
+
+    def _meaning_of(self, data):
+        return data["owner_hold"]["delegated_clear"]["meaning"]
+
+    def _without_meaning(self, data):
+        data = copy.deepcopy(data)
+        del data["owner_hold"]["delegated_clear"]["meaning"]
+        return data
+
+    def _matrix_at_base(self):
+        for ref in ("origin/main", "main"):
+            mb = subprocess.run(["git", "merge-base", "HEAD", ref], cwd=REPO, capture_output=True, text=True)
+            if mb.returncode == 0 and mb.stdout.strip():
+                shown = subprocess.run(["git", "show", mb.stdout.strip() + ":" + self.MATRIX_REL], cwd=REPO, capture_output=True, text=True)
+                if shown.returncode == 0:
+                    return json.loads(shown.stdout)
+        self.skipTest("no main ref to compare the matrix with (shallow checkout)")
+
+    def test_899_s3_only_the_delegated_clear_meaning_differs_from_main(self):
+        base = self._matrix_at_base()
+        self.assertEqual(self._without_meaning(self.matrix), self._without_meaning(base))   # count of other differences = 0
+
+    def test_899_u1_the_comparison_catches_a_changed_value_elsewhere(self):
+        base = self._matrix_at_base()
+        mutant = copy.deepcopy(self.matrix)
+        blk = mutant["owner_hold"]["delegated_clear"]
+        blk["closure_files"] = blk["closure_files"][:-1]
+        self.assertNotEqual(self._without_meaning(mutant), self._without_meaning(base))
+
+    def test_899_s1_the_meaning_says_which_refusal_applies_when_in_separate_sentences(self):
+        m = self._meaning_of(self.matrix)
+        sentences = [s.strip() for s in m.split(". ")]
+        self.assertEqual(len([s for s in sentences if "`never_path_classes`" in s]), 1)
+        self.assertEqual(len([s for s in sentences if "`top_tier_review_classes`" in s]), 1)
+        self.assertEqual(len([s for s in sentences if "WITHOUT a `max_level`" in s]), 1)
+        replaces = [s for s in sentences if "replaces" in s]
+        self.assertEqual(len(replaces), 1)
+        self.assertIn("WITH a `max_level`", replaces[0])
+        self.assertIn("`score`", replaces[0])
+        self.assertEqual(len([s for s in sentences if "either way" in s]), 1)
+        self.assertTrue(m.rstrip().endswith("."))
+
+    def test_899_s2_every_key_the_meaning_names_exists_and_the_doc_says_the_same(self):
+        m = self._meaning_of(self.matrix)
+        keys = set(re.findall(r"`([a-z_]+)`", m))
+        block = self.matrix["owner_hold"]["delegated_clear"]
+        self.assertTrue({"never_path_classes", "top_tier_review_classes", "clear_code_paths", "new_file_globs", "closure_files",
+                         "module_roots", "closure_roots", "clear_entry_points", "score", "max_level"} <= keys)
+        for k in keys - {"max_level"}:                      # max_level is the owner's configuration key, not a matrix key
+            self.assertIn(k, block, k)
+        self.assertEqual((REPO / "docs/switchboard.md").read_text().count(m), 1)
+
     def test_the_twenty_cells_return_the_stored_actions_and_the_review_laws_table_equals_the_matrix(self):
         got = {sev: {pr: self.f.cell_action(self.matrix, sev, pr)[1] for pr in IMPACT_TABLE[sev]} for sev in IMPACT_TABLE}
         self.assertEqual(got, IMPACT_TABLE)                      # byte-identical to the fixture: 20 of 20
