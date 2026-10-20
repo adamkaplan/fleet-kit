@@ -191,7 +191,8 @@ def made_up_pid():
     number above the largest live one and proves it is not alive; at the top of the range it wraps to the free numbers below)."""
     with _MADE_UP_LOCK:
         if _MADE_UP_NEXT[0] is None:
-            _MADE_UP_NEXT[0] = max(_live_pids() | {os.getpid(), os.getppid()}) + 1
+            # FLEET_TEST_PID_BASE pins where the first look starts (a run near the top of the range wraps, which no test may depend on); default: above the largest live process
+            _MADE_UP_NEXT[0] = int(os.environ.get("FLEET_TEST_PID_BASE") or 0) or max(_live_pids() | {os.getpid(), os.getppid()}) + 1
         limit, never = _pid_limit(), _ancestors() | {os.getpid(), os.getppid()}
         start = _MADE_UP_NEXT[0] if 1 < _MADE_UP_NEXT[0] <= limit else 2
         for pid in list(range(start, limit + 1)) + list(range(2, start)):
@@ -5428,10 +5429,10 @@ class TestLaunch(StandInPids, Base):
     def test_the_orphan_allow_list_picks_only_exact_matches_of_this_user_past_the_grace_and_never_a_protected_target(self):
         rows = self.orphan_rows()
         due, young = sb.orphan_reap_candidates(lambda: rows, {})
-        self.assertEqual(sorted((pid, kind) for pid, kind, _, _ in due), [(self.px[4001], "fake-agent"), (self.px[4002], "node-test"), (self.px[4003], "python-helper"), (self.px[4014], "python-helper")])
+        self.assertEqual(sorted((pid, kind) for pid, kind, _, _ in due), sorted([(self.px[4001], "fake-agent"), (self.px[4002], "node-test"), (self.px[4003], "python-helper"), (self.px[4014], "python-helper")]))
         self.assertEqual([pid for pid, *_ in young], [self.px[4004]])
         due, _ = sb.orphan_reap_candidates(lambda: rows, {"orphan_reaper": {"grace_hours": 8}})
-        self.assertEqual(sorted(pid for pid, *_ in due), [self.px[4002], self.px[4003], self.px[4014]], "the grace is configurable")
+        self.assertEqual(sorted(pid for pid, *_ in due), sorted([self.px[4002], self.px[4003], self.px[4014]]), "the grace is configurable")
         line = sb.orphan_status_line({}, lambda: rows)
         self.assertRegex(line, r"^4: .*%d.*past 6 h" % self.px[4001])
         self.assertIsNone(sb.orphan_status_line({"orphan_reaper": {"enabled": False}}, lambda: rows))
@@ -57228,6 +57229,27 @@ class TestMadeUpPids(unittest.TestCase):
                     add(node.elts[2], "row pgid")
         return sorted(set(hits))
 
+    @staticmethod
+    def sorted_against_a_positional_list(source, skip=("TestMadeUpPids",)):
+        """[line]: an assertion that sets `sorted(...)` of made-up numbers against a list LITERAL of two or more of them in the order they were asked for. The
+        numbers ascend only while the helper does not wrap at the top of the range, so the expected side is sorted too (`sorted([...])`)."""
+        tree = ast.parse(source)
+        skipped = {id(inner) for node in tree.body if isinstance(node, ast.ClassDef) and node.name in skip for inner in ast.walk(node)}
+        is_px = lambda n: isinstance(n, ast.Subscript) and isinstance(n.value, ast.Attribute) and n.value.attr == "px"
+        is_sorted = lambda n: isinstance(n, ast.Call) and getattr(n.func, "id", None) == "sorted"
+        hits = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", "") in ("assertEqual", "assertListEqual", "assertSequenceEqual") and id(node) not in skipped:
+                if any(is_sorted(a) for a in node.args[:2]):
+                    hits.extend(a.lineno for a in node.args[:2] if isinstance(a, (ast.List, ast.Tuple)) and sum(1 for x in ast.walk(a) if is_px(x)) >= 2)
+        return sorted(set(hits))
+
+    def test_no_test_sets_sorted_made_up_numbers_against_an_unsorted_list_of_them(self):
+        self.assertEqual(self.sorted_against_a_positional_list(Path(__file__).read_text()), [])
+        mutant = "self.assertEqual(sorted(sent), [self.px[1], self.px[2]])"
+        self.assertEqual(len(self.sorted_against_a_positional_list(mutant)), 1)
+        self.assertEqual(self.sorted_against_a_positional_list("self.assertEqual(sorted(sent), sorted([self.px[1], self.px[2]]))"), [])
+
     def test_no_integer_literal_stands_in_for_a_process_anywhere_in_the_test_file(self):
         self.assertEqual(self.pid_literals(Path(__file__).read_text()), [])
 
@@ -57253,19 +57275,18 @@ class TestMadeUpPids(unittest.TestCase):
                   "headless restart notice": [(TestHeadlessRestartNotice, None)],
                   "heavy readiness": [(TestHeavySlotsReadiness, "test_the_readiness_decision_is_the_final_record_not_the_lock_and_not_the_wrappers_first_record")]}
         for group, members in groups.items():
-            suite = unittest.TestSuite()
-            for cls, name in members:
-                real_parent = ("test_odd_file_names_in_the_state_directory_are_left_alone_and_never_stop_the_wrapper",)   # it uses the REAL parent as its live process
-                names = [name] if name else [n for n in dir(cls) if n.startswith("test") and callable(getattr(cls, n)) and n not in real_parent]
-                suite.addTests(cls(n) for n in names)
+            real_parent = ("test_odd_file_names_in_the_state_directory_are_left_alone_and_never_stop_the_wrapper",)   # it uses the REAL parent as its live process
+            chosen = [(cls, n) for cls, name in members
+                      for n in ([name] if name else [n for n in dir(cls) if n.startswith("test") and callable(getattr(cls, n)) and n not in real_parent])]
             parent, grand = 4243, 4242      # the old made-up numbers become the real parent and grandparent of this run
-            result = unittest.TestResult()
-            with mock.patch.object(os, "getppid", lambda: parent), mock.patch.object(module, "_ancestors", lambda: {os.getpid(), parent, grand}), \
-                    mock.patch.object(module, "_MADE_UP_NEXT", [4240]):
-                suite.run(result)
-            with self.subTest(group=group):
-                self.assertGreater(result.testsRun, 0)
-                self.assertEqual([str(e[0]) for e in result.failures + result.errors], [])
+            for base in (4240, _pid_limit() - 2):   # and once from near the top of the range, where the helper wraps to small numbers: no test may depend on the order
+                suite, result = unittest.TestSuite(cls(n) for cls, n in chosen), unittest.TestResult()   # a suite empties itself when it runs: one per base
+                with mock.patch.object(os, "getppid", lambda: parent), mock.patch.object(module, "_ancestors", lambda: {os.getpid(), parent, grand}), \
+                        mock.patch.object(module, "_MADE_UP_NEXT", [base]):
+                    suite.run(result)
+                with self.subTest(group=group, base=base):
+                    self.assertGreater(result.testsRun, 0)
+                    self.assertEqual([str(e[0]) for e in result.failures + result.errors], [])
 
     def test_the_old_numbers_are_never_handed_out_when_they_are_the_parent_and_grandparent(self):
         module = sys.modules[__name__]
@@ -57622,7 +57643,7 @@ class TestHeavyWatchdog(StandInPids, unittest.TestCase):
         dog.sample()
         live = dog.look()
         dog.signal(signal.SIGKILL, live)
-        self.assertEqual(sorted({target for target, _n in sent}), [self.px[4242], self.px[5000]], "the orphan that holds the lock goes; the one-look prober does not")
+        self.assertEqual(sorted({target for target, _n in sent}), sorted([self.px[4242], self.px[5000]]), "the orphan that holds the lock goes; the one-look prober does not")
 
     def test_s15_a_holder_seen_at_two_looks_with_a_gap_between_is_not_stopped(self):
         sent = BoundedList()
@@ -57648,8 +57669,8 @@ class TestHeavyWatchdog(StandInPids, unittest.TestCase):
         for dog in (a, b):
             dog.sample()
             dog.signal(signal.SIGKILL, dog.look())
-        self.assertEqual(sorted(set(sent_a)), [self.px[4242], self.px[5000]])
-        self.assertEqual(sorted(set(sent_b)), [self.px[4343], self.px[6000]])
+        self.assertEqual(sorted(set(sent_a)), sorted([self.px[4242], self.px[5000]]))
+        self.assertEqual(sorted(set(sent_b)), sorted([self.px[4343], self.px[6000]]))
 
     def test_the_lock_holder_list_is_for_the_same_user_only(self):
         self.assertIn("os.getuid()", inspect.getsource(self.hs.read_lock_holders))
@@ -57694,7 +57715,7 @@ class TestHeavyWatchdog(StandInPids, unittest.TestCase):
         rows = [(self.px[4242], 1, self.px[9003], 10, "t0"), (self.px[9001], self.px[4242], self.px[9003], 10, "w"), (self.px[9002], self.px[9001], self.px[9003], 10, "p"), (self.px[4300], self.px[4242], self.px[9003], 10, "A")]
         dog = self.hs.Watchdog(self.px[4242], ["x"], 16384, 0, self.out, 0.0, read_table=lambda: rows, killpg=record, kill=record, me=(self.px[9001], self.px[9002], self.px[9003]))
         dog.signal(signal.SIGKILL, dog.look())
-        self.assertEqual(sorted(target for target, _n in sent), [self.px[4242], self.px[4300]], "never the wrapper, its parent, nor its group")
+        self.assertEqual(sorted(target for target, _n in sent), sorted([self.px[4242], self.px[4300]]), "never the wrapper, its parent, nor its group")
 
     def test_s6_a_run_whose_parent_is_gone_exits_with_143(self):
         parents = iter([500, 500, 1])
