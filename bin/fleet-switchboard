@@ -21723,6 +21723,9 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
 
 def cmd_impact(args, runner, now):
     """`impact floor|hold|clear`."""
+    if REGISTRARS_RAN and args.impact_action == "clear":   # #924: at the point of effect too: the clear never runs in a process where a registrar ran
+        sys.stderr.write("%s: impact clear: refused: a command registrar ran in this process\n" % PROG)
+        return EXIT_ERROR
     return {"floor": cmd_impact_floor, "hold": cmd_impact_hold, "clear": cmd_impact_clear, "delegated": cmd_impact_delegated}[args.impact_action](args, runner, now)
 
 
@@ -23513,6 +23516,9 @@ def rating_inputs(raw_argv):
 def cmd_review(args, runner, now):
     """`review laws <pr>` (print the laws and overlay from the PR's base commit) and `review record <pr> --reviewer X ...` (a reviewer writes
     its result per head). Reads GitHub with GETs only; `record` writes the hash-chained ledger and the audit."""
+    if REGISTRARS_RAN and args.review_cmd == "record":   # #924: at the point of effect too: the record is never written in a process where a registrar ran
+        sys.stderr.write("%s: review record: refused: a command registrar ran in this process\n" % PROG)
+        return EXIT_ERROR
     if args.review_cmd == "measure":
         return cmd_review_measure(args, runner, now)
     if args.review_cmd == "checkout":
@@ -28009,6 +28015,18 @@ def build_parser():
         epilog="Config: $XDG_CONFIG_HOME/%s/config.json (optional). "
                "State: $XDG_STATE_HOME/%s/ (mode 0700). See docs/switchboard.md." % (PROG, PROG))
     sub = parser.add_subparsers(dest="action", required=True)
+    # Every `add_<name>_parsers(sub)` function of this module registers its commands: nothing is listed here, so a new command adds no shared line
+    # (the registrations used to be a list that every slice appended to, and any two in-flight slices conflicted on it). Alphabetical by function name.
+    for registrar in command_registrars():
+        registrar(sub)
+    sub.add_parser("version", help="Print the version")
+    parser.commands = frozenset(sub.choices)   # the registered subcommands: what `dispatch` may run
+    return parser
+
+
+def add_core_parsers(sub):
+    """The commands that were registered inline in `build_parser` (status, run, send, report, notice, ensure, poke, launch, pending, remind), moved here UNEDITED (#924): a flag of one
+    of them is no longer a line of the function that wires the registrars. Collected by name like every `add_<name>_parsers`; `build_parser` does not name it."""
     status = sub.add_parser("status", help="Config, clients, and every fleet agent with what is pending for it")
     status.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
     run = sub.add_parser("run", help="The daemon: observe, derive, decide, deliver, every poll seconds")
@@ -28102,13 +28120,6 @@ def build_parser():
                         "(or pull request) is closed or merged")
     remind.add_argument("--until-merged", metavar="OWNER/REPO#N", help="Drop the reminder, unsent, once this pull "
                         "request is merged")
-    # Every `add_<name>_parsers(sub)` function of this module registers its commands: nothing is listed here, so a new command adds no shared line
-    # (the registrations used to be a list that every slice appended to, and any two in-flight slices conflicted on it). Alphabetical by function name.
-    for registrar in command_registrars():
-        registrar(sub)
-    sub.add_parser("version", help="Print the version")
-    parser.commands = frozenset(sub.choices)   # the registered subcommands: what `dispatch` may run
-    return parser
 
 
 # ---- the load of each orchestrator and the threshold alert (#348); the logic is in bin/fleet_health.py, this supplies the facts
@@ -28432,7 +28443,43 @@ except Exception as _err:
 # those attributes, derived once everything is defined (see `derive_action_groups`), never lists to edit; `dispatch` asks the view AND the attribute
 # (a test that swaps a command's function for a recorder keeps the group the module defined).
 
-RATING_PATH_FUNCTIONS = ("cmd_review", "parse_review_block", "rating_inputs", "resolve_command", "dispatch", "call_command")   # `main` checks these are the same objects after the registrars ran (#835)
+def code_snapshot():
+    """{(where, name): (object, its code, defaults)} for EVERY binding at the top of this file (a function, a class, a constant, a proxy object, a module: the identity of each, and the attributes set on an instance such as the lazy `plan_ledger`) and, for each helper module of
+    `bin/` already loaded, every function and class and the module itself (#924). `main` takes it before the registrars run and compares it after, for every action: a command registrar that replaces or rebinds any of them (the clear's code, the rating's path, the ledger the clear
+    reads its score from) stops the command. Derived from what is loaded, never a list of names, so a binding added later is held the day it is added."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    held = {}
+    def take(where, namespace, everything):
+        for name, value in list(namespace.items()):
+            if isinstance(value, types.FunctionType):
+                held[(where, name)] = (value, (value.__code__, value.__defaults__, tuple(sorted((value.__kwdefaults__ or {}).items(), key=lambda item: item[0]))))
+            elif isinstance(value, type):
+                held[(where, name)] = (value, None)
+                for member, attribute in list(vars(value).items()):   # a method or attribute set on a held class
+                    held[(where + "." + name, member)] = (attribute, getattr(attribute, "__code__", None) if isinstance(attribute, types.FunctionType) else None)
+            elif everything and not name.startswith("__"):
+                held[(where, name)] = (value, None)   # a constant, a proxy, a module bound here: its identity
+                if not isinstance(value, types.ModuleType) and hasattr(value, "__dict__"):
+                    for attribute, member in list(vars(value).items()):   # the attributes set on an instance (the lazy proxy `plan_ledger` is one)
+                        held[(where + "#" + name, attribute)] = (member, None)
+    take("", globals(), True)
+    for module_name, module in list(sys.modules.items()):
+        path = getattr(module, "__file__", None)
+        if module_name != "__main__" and isinstance(path, str) and path.endswith(".py") and os.path.dirname(os.path.realpath(path)) == here and getattr(module, "__dict__", None) is not globals():
+            held[(module_name, None)] = (module, None)
+            take(module_name, vars(module), False)
+            held[("modules", module_name)] = (module, None)
+    return held
+
+
+def code_replaced(before, after):
+    """[names] in `before` (a `code_snapshot`) that `after` no longer has as the same object with the same code, defaults, class members and instance attributes, and the helper modules of `bin/` that were first loaded in between (a registrar cannot import one and
+    replace it unseen). Not held (the stated limit): module-level data mutated in place (a dict, a list), and builtins or the standard modules this function itself uses: a guard against an ordinary edit, not a sandbox."""
+    changed = sorted(("%s.%s" % key if key[0] else key[1]) if key[1] else "module " + key[0] for key, (obj, code) in before.items()
+                     if key not in after or after[key][0] is not obj or not (after[key][1] is code or (isinstance(code, tuple) and after[key][1] == code)))
+    added = sorted("%s.%s (set after the snapshot)" % (key[0].replace("#", "."), key[1]) for key in after if key not in before and ("#" in key[0] or "." in key[0]))   # an attribute newly set on a held instance or class
+    return changed + added + sorted("module %s (first loaded after the registrars ran)" % key[1] for key in after if key[0] == "modules" and key not in before)
+
 COMMAND_NAME_RE = re.compile(r"[a-z][a-z0-9-]*")
 REGISTRAR_NAME_RE = re.compile(r"add_[a-z0-9_]+_parsers")
 COMMAND_ARGUMENTS = ("args", "runner", "now", "spawn", "socket_call", "wait")   # what a command function may ask for, by parameter name
@@ -28506,25 +28553,59 @@ def dispatch(args, known, runner=subprocess.run, now=time.time, wait=None, spawn
     return EXIT_USAGE
 
 
+DIRECT_COMMANDS = {"review": ("review_cmd", "record"), "impact": ("impact_action", "clear")}   # #924: the action, the destination of its subcommand and the subcommand of the two commands that run BEFORE any registrar: `review record` and `impact clear`
+REGISTRARS_RAN = False   # True while `main` builds the full parser and parses with it (every registrar runs in that window); `cmd_review` (record), `cmd_impact` and `cmd_impact_clear` and `impact_clear_core` (the clear) REFUSE while it is True: a registrar that calls them is stopped at the point of effect
+
+
+def direct_command(raw):
+    """True when the command line is exactly `review record ...` or `impact clear ...` (the program name's first two words: the top-level parser has no option but -h). Anything else, spelled however argparse would take it, is NOT direct."""
+    return len(raw) >= 2 and raw[0] in DIRECT_COMMANDS and raw[1] == DIRECT_COMMANDS[raw[0]][1]
+
+
+def private_parser():
+    """The parser of the two direct commands: built from ONLY the registrars that belong to them (`add_review_parsers`, `add_impact_parsers`: rating and clear code in the closure). No other registrar is called, so no other registrar code runs in that process."""
+    parser = argparse.ArgumentParser(prog=PROG)
+    sub = parser.add_subparsers(dest="action", required=True)
+    add_review_parsers(sub)
+    add_impact_parsers(sub)
+    parser.commands = frozenset(sub.choices)
+    return parser
+
+
 def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen,
          socket_call=None):
+    global REGISTRARS_RAN
     os.environ.setdefault(OWN_GH_ENV, "1")   # the gh calls of this process are the switchboard's own: never re-identified
     raw = tuple(argv if argv is not None else sys.argv[1:])   # #835: the command line as typed, captured BEFORE any registrar runs: `review record` reads its rating inputs from this, never from the shared parser
-    held = {name: (globals()[name], globals()[name].__code__) for name in RATING_PATH_FUNCTIONS if name in globals()}
-    parser = build_parser()
+    snapshot, replaced_by = code_snapshot, code_replaced   # local references: a registrar that rebinds these names changes nothing here
+    if direct_command(raw):   # #924: `review record` and `impact clear` dispatch BEFORE any registrar runs: the parser is built from their own registrars only
+        parser, held = private_parser(), None
+    else:
+        REGISTRARS_RAN = True   # set before the registrars run: a registrar that resets it is seen by the snapshot below
+        held = snapshot()   # the code every command runs by, before any registrar runs (the backstop of the routes that still run registrars)
+        parser = build_parser()
     try:
-        args, extra = parser.parse_known_args(list(raw))
-        args.raw_argv = raw   # set here, after the parse: no registrar default, Action or wrapper can set it first
-        if extra and args.action == "remind" and not (args.list_mine or args.cancel) and not any(word.startswith("-") for word in extra):
-            args.text = list(args.text or []) + extra   # words after an option (`remind a 1h --issue 3 the text`): argparse lets an optional positional end early
-        elif extra:
-            parser.error("unrecognized arguments: %s" % " ".join(extra))
-    except SystemExit as exit_:
-        return EXIT_USAGE if exit_.code not in (0, None) else EXIT_OK
-    if getattr(args, "action", None) == "review" and (set(held) != set(RATING_PATH_FUNCTIONS) or any(globals().get(name) is not fn or fn.__code__ is not code for name, (fn, code) in held.items())):
-        sys.stderr.write("%s: review: a command registrar replaced code on the rating path: nothing was recorded\n" % PROG)   # a registrar reassigned one of the functions the rating is read and recorded by
-        return EXIT_ERROR
-    return dispatch(args, parser.commands, runner=runner, now=now, wait=wait, spawn=spawn, socket_call=socket_call)
+        try:
+            args, extra = parser.parse_known_args(list(raw))
+            args.raw_argv = raw   # set here, after the parse: no registrar default, Action or wrapper can set it first
+            if extra and args.action == "remind" and not (args.list_mine or args.cancel) and not any(word.startswith("-") for word in extra):
+                args.text = list(args.text or []) + extra   # words after an option (`remind a 1h --issue 3 the text`): argparse lets an optional positional end early
+            elif extra:
+                parser.error("unrecognized arguments: %s" % " ".join(extra))
+        except SystemExit as exit_:
+            return EXIT_USAGE if exit_.code not in (0, None) else EXIT_OK
+        if held is not None:
+            replaced = replaced_by(held, snapshot())   # for EVERY action (#924): the clear's code, the rating's path and every helper they read are the code that was loaded
+            REGISTRARS_RAN = False   # the registrars and the parse are over: what dispatch runs (the daemon's own chat clear among it) is not a registrar's call
+            if replaced:
+                sys.stderr.write("%s: %s: a command registrar replaced code a command runs by (%s): nothing ran\n" % (PROG, getattr(args, "action", "?"), ", ".join(replaced[:5])))
+                return EXIT_ERROR
+            if args.action in DIRECT_COMMANDS and vars(args).get(DIRECT_COMMANDS[args.action][0]) == DIRECT_COMMANDS[args.action][1]:   # a spelling the pre-dispatch did not take: it must not run after a registrar
+                sys.stderr.write("%s: %s %s: refused: a command registrar ran in this process; run it as `%s %s %s ...`\n" % (PROG, args.action, DIRECT_COMMANDS[args.action][1], PROG, args.action, DIRECT_COMMANDS[args.action][1]))
+                return EXIT_ERROR
+        return dispatch(args, parser.commands, runner=runner, now=now, wait=wait, spawn=spawn, socket_call=socket_call)
+    finally:
+        REGISTRARS_RAN = False
 
 
 # ============================================================================
