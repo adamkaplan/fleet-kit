@@ -2300,6 +2300,8 @@ class World:
         pane = self.herdr.new_pane_id()
         self.herdr.add(pane, sid, status)
         self.sessions[name], self.panes[name] = sid, pane
+        if meta.get("role") == "orchestrator" and isinstance(meta.get("charter"), int):   # #969: the registry is the record of a charter; a first-seen agent takes its launch value (as the pass does)
+            sb.load_module("registry").upsert(self.state, name, {"session": sid, "pane": pane, "role": "orchestrator", "charter": meta["charter"], "repo": meta.get("repo")})
         return sid
 
     def new_engine(self, actor="daemon", writable=True):
@@ -13830,6 +13832,267 @@ class TestClearMarker(Base):
             self.assertEqual(new.replace("MERGE: automatic", "MERGE: captain", 1), body)
         self.assertIsNone(sb.marker_edit(None))
         self.assertFalse(sb.pr_marker_state([], sb.marker_edit("MERGE: captain\n")[0], now=0)["captain"])
+
+
+class TestOneCharter(Base):
+    """#969: an orchestrator's charter is the registry row's `charter`, the one record; the lane lookup reads it and the live session's metadata (written once at launch) is never a second owner. Every test
+    drives the REAL lookups (`_lane_of_issue`, `lanes.charter_orchestrators`) over the REAL registry module and the real discovery of the fake service."""
+
+    REPO = "acme-org/widget-api"
+
+    def setUp(self):
+        super().setUp()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": self.REPO})
+        self.world = World(self, agents=(), config={"gh": FAKE_GH, "impact_hold": {"enabled": True}})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.engine = self.world.new_engine("daemon")
+        self.engine.state_dir = self.world.state
+        self.registry = sb.load_module("registry")
+        self.parents = {3: 1, 1: None}
+        self.engine.intents = types.SimpleNamespace(parent=lambda number, repo=None: self.parents.get(number), repo=self.REPO, header=lambda *a, **k: None)
+
+    def orchestrator(self, name, charter=None, issue=None, registry=True):
+        """A running orchestrator whose live SESSION metadata says `charter` and `issue`; its registry row (the first-seen fill the pass makes) holds the metadata charter unless `registry` is a value or False."""
+        fleet = {"role": "orchestrator", "repo": self.REPO}
+        if charter is not None:
+            fleet["charter"] = charter
+        if issue is not None:
+            fleet["issue"] = issue
+        sid = self.world.add_agent(name, fleet=fleet)   # (the harness fills the registry row from the metadata charter, as the pass does for a first-seen agent)
+        row = self.registry.read(self.world.state)["agents"].get(name)
+        if row is None:
+            self.registry.upsert(self.world.state, name, {"session": sid, "pane": self.world.panes[name], "role": "orchestrator", "charter": None, "repo": self.REPO})
+        if registry is not True:
+            self.set_registry(name, registry)
+
+    def set_registry(self, name, charter):
+        got = self.registry.set_charter(self.world.state, name, charter, "test")
+        self.assertIsNone(got["problem"], got)
+
+    def lane(self, number=1):
+        agents = self.engine.discover(self.world.clock.now()).agents
+        orchestrators = {n: a for n, a in agents.items() if (a.fleet or {}).get("role") == "orchestrator"}
+        return sb._lane_of_issue(self.engine, self.REPO, 3 if number == 1 else number, orchestrators)
+
+    # the shapes of a lookup: how the registry and the session metadata name charter 1, and what the lookup says. One table, driven row by row.
+    def shape_session_issue_only(self):
+        self.orchestrator("orch-a", charter=1)
+        self.orchestrator("orch-b", charter=2, issue=1, registry=None)   # the real case: its metadata `issue` is orch-a's charter; its registry row has no charter
+
+    def shape_session_charter_only(self):
+        self.orchestrator("orch-a", charter=1)
+        self.orchestrator("orch-b", charter=1, registry=None)   # its metadata charter says 1 too; the registry row has none
+
+    def shape_registry_two(self):
+        self.orchestrator("orch-a", charter=1)
+        self.orchestrator("orch-b", charter=1)
+
+    def shape_no_orchestrator(self):
+        self.orchestrator("orch-a", charter=2)
+
+    def shape_metadata_only_no_registry_owner(self):
+        self.orchestrator("orch-a", charter=1, registry=None)   # the session says 1, the registry gives it to nobody: the lookup is no more generous than the registry
+
+    def shape_one(self):
+        self.orchestrator("orch-a", charter=1)
+        self.orchestrator("orch-b", charter=2)
+
+    SHAPES = {   # shape name -> expected lookup result (a one-owner result, a many result with both names, or None)
+        "session_issue_only": ("one", "orch-a"),
+        "session_charter_only": ("one", "orch-a"),
+        "registry_two": ("many", ["orch-a", "orch-b"], 1),
+        "no_orchestrator": None,
+        "metadata_only_no_registry_owner": None,
+        "one": ("one", "orch-a"),
+    }
+
+    def test_every_shape_of_the_lookup_says_what_the_registry_says(self):
+        for name, expected in self.SHAPES.items():
+            with self.subTest(shape=name):
+                self.setUp()
+                getattr(self, "shape_" + name)()
+                found = self.lane()
+                self.assertEqual(found, expected)
+
+    def test_the_shapes_table_has_every_shape_method(self):
+        methods = {n[len("shape_"):] for n in dir(self) if n.startswith("shape_")}
+        self.assertEqual(methods, set(self.SHAPES))
+
+    def test_an_unreadable_registry_gives_no_lane(self):
+        self.shape_one()
+        (Path(self.world.state) / "registry.json").write_text("{not json")
+        self.assertIsNone(self.lane())
+
+    def test_the_metadata_of_a_session_is_not_read_for_a_lane_even_when_the_registry_has_no_row(self):
+        self.world.add_agent("orch-a", fleet={"role": "orchestrator", "charter": 1, "repo": self.REPO})
+        (Path(self.world.state) / "registry.json").unlink()   # no row at all: the metadata must not stand in for it
+        self.assertIsNone(self.lane())
+
+    def test_charter_orchestrators_of_move_reads_the_registry_too(self):
+        lanes = sb.load_module("lanes")
+        namespace = types.SimpleNamespace(engine=self.engine, **{n: getattr(sb, n) for n in lanes.NEEDS})
+        for name, expected in (("session_issue_only", ["orch-a"]), ("session_charter_only", ["orch-a"]), ("registry_two", []), ("no_orchestrator", []), ("one", ["orch-a"])):
+            with self.subTest(shape=name):
+                self.setUp()
+                getattr(self, "shape_" + name)()
+                namespace.engine = self.engine
+                discovery = self.engine.discover(self.world.clock.now())
+                self.assertEqual(lanes.charter_orchestrators(namespace, discovery, self.REPO, 1), expected)
+
+    # -- the pass: the registry keeps its charter, a first-seen agent takes the launch value, a disagreement is said once
+
+    def health(self):
+        self.engine.discover(self.world.clock.now())
+        sb.pane_health_pass(self.engine, self.world.clock.now())
+
+    def row(self, name):
+        return self.registry.read(self.world.state)["agents"][name]
+
+    def test_the_pass_keeps_a_corrected_charter_fills_a_first_seen_agent_and_says_a_disagreement_once(self):
+        self.orchestrator("orch-b", charter=1)           # first seen: the launch value is the row's
+        self.assertEqual(self.row("orch-b")["charter"], 1)
+        self.set_registry("orch-b", 7)                   # corrected through the command
+        for _ in range(3):
+            self.health()
+        self.assertEqual(self.row("orch-b")["charter"], 7, "the pass must not copy the session's metadata over the registry")
+        said = [e for e in self.world.audit() if e["event"] == "charter.disagree"]
+        self.assertEqual(len(said), 1)
+        self.assertEqual((said[0]["subject"], said[0]["detail"]["session_charter"]), ("orch-b", 1))
+        self.world.add_agent("orch-new", fleet={"role": "orchestrator", "charter": 9, "repo": self.REPO})
+        (Path(self.world.state) / "registry.json").write_text(json.dumps({"version": 1, "agents": {}, "retired": {}}))
+        self.health()
+        self.assertEqual(self.row("orch-new")["charter"], 9, "a first-seen agent takes its launch value")
+
+    def test_a_disagreement_is_said_once_per_agent_and_value_by_the_helper_itself(self):
+        notes = []
+        engine = types.SimpleNamespace(state_dir=self.world.state, _note=lambda event, subject, detail: notes.append((event, subject, detail["session_charter"])))
+        for value in (4, 4, 4, 5, 5, 4):
+            sb.charter_disagreement_once(engine, "orch-b", value)
+        self.assertEqual(notes, [("charter.disagree", "orch-b", 4), ("charter.disagree", "orch-b", 5)])
+
+    def test_adoption_and_the_plan_wake_route_name_the_registrys_owner_and_not_the_session_metadata(self):
+        self.shape_session_charter_only()     # orch-a owns charter 1 in the registry; orch-b's session metadata says 1 too
+        self.world.add_agent("worker", fleet={"role": "coder", "charter": 1, "repo": self.REPO, "issue": 40})
+        discovery = self.engine.discover(self.world.clock.now())
+        heir, why = sb.adoption_heir(self.engine, discovery, {}, discovery.agents["worker"])
+        self.assertEqual((heir, why), ("orch-a", "the charter's orchestrator"))
+        items = {5: {"parent": 4}, 4: {"parent": 1}}
+        ctx = {"charters": {1}, "asks": {4}}
+        route = sb.plan_wake_route(5, items, ctx, discovery, ["cos"], sb.registry_owners(self.engine))
+        self.assertEqual(route, (["orch-a"], "work item"))
+        self.assertEqual(sb.plan_wake_route(5, items, ctx, discovery, ["cos"]), ([], "work item"), "no registry owners given: nobody is guessed from the metadata")
+
+    def test_registry_charter_is_pure_and_total(self):
+        cases = (({}, "a", 3, (3, None)), ({"a": {"charter": 5}}, "a", 3, (5, 3)), ({"a": {"charter": 5}}, "a", 5, (5, None)), ({"a": {"charter": None}}, "a", 3, (None, 3)),
+                 ({"a": {"charter": 5}}, "a", None, (5, None)), ({"a": {"charter": 5}}, "a", True, (5, None)), ({}, "a", "3", (None, None)))
+        for registered, name, session, expected in cases:
+            with self.subTest(registered=registered, session=session):
+                self.assertEqual(sb.registry_charter(registered, name, session), expected)
+
+    # -- the command
+
+    def run_as(self, who, *argv):
+        if who is None:
+            os.environ.pop("HERDR_PANE_ID", None)
+        else:
+            os.environ["HERDR_PANE_ID"] = self.world.panes[who]
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_charter_set_is_audited_refused_for_an_agent_and_for_a_bad_value(self):
+        self.orchestrator("orch-b", charter=1)
+        self.world.add_agent("worker", fleet={"role": "coder", "reports_to": "orch-b", "repo": self.REPO})
+        before = self.row("orch-b")
+        code, out, err = self.run_as("worker", "charter", "set", "orch-b", "9")
+        self.assertEqual(code, 1, err)
+        self.assertEqual(self.row("orch-b"), before)
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "nine")
+        self.assertEqual(code, 2, err)
+        self.assertEqual(self.row("orch-b"), before)
+        code, out, err = self.run_as("cos", "charter", "set", "worker", "9")
+        self.assertEqual(code, 2, err)
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "9")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.row("orch-b")["charter"], 9)
+        done = [e for e in self.world.audit() if e["event"] == "charter.set"]
+        self.assertEqual([(e["detail"]["old"], e["detail"]["new"]) for e in done], [(1, 9)])
+        registry_audit = [json.loads(l) for l in (Path(self.world.state) / "registry-audit.jsonl").read_text().splitlines() if '"charter"' in l]
+        self.assertEqual([(e["old"], e["new"]) for e in registry_audit if e.get("event") == "charter"], [(1, 9)])
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "none")
+        self.assertEqual((code, self.row("orch-b")["charter"]), (0, None))
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "charter.refused"]), 3)
+
+    # -- the sweep and the report
+
+    def test_a_charter_two_orchestrators_record_is_a_sweep_finding_naming_both_and_the_report_prints_it(self):
+        self.shape_registry_two()
+        state = types.SimpleNamespace(repos={}, sources={}, unattributed=0)
+        found = sb.sweep_findings(self.engine, state, [], self.REPO, self.world.clock.now(), dict(sb.SWEEP_DEFAULTS), None)
+        self.assertIn(("S10", "%s#1" % self.REPO), found)
+        self.assertEqual(state.sources[("S10", "%s#1" % self.REPO)]["match"], "recorded by orch-a, orch-b")
+        code, out, err = self.run_as(None, "agents", "charters")
+        self.assertEqual(code, 0, err)
+        self.assertIn("charter #1 of %s is recorded by 2 orchestrators in the registry: orch-a, orch-b" % self.REPO, out)
+        self.setUp()
+        self.shape_one()
+        state = types.SimpleNamespace(repos={}, sources={}, unattributed=0)
+        self.assertEqual([f for f in sb.sweep_findings(self.engine, state, [], self.REPO, self.world.clock.now(), dict(sb.SWEEP_DEFAULTS), None) if f[0] == "S10"], [])
+
+    def test_the_report_shows_the_record_that_names_the_charter_for_the_orchestrator_that_does_not_own_it(self):
+        self.shape_session_issue_only()
+        code, out, err = self.run_as(None, "agents", "charters", "--json")
+        self.assertEqual(code, 0, err)
+        rows = {r["name"]: r for r in json.loads(out)["orchestrators"]}
+        self.assertEqual((rows["orch-b"]["registry_charter"], rows["orch-b"]["meta_charter"], rows["orch-b"]["meta_issue"]), (None, 2, 1))
+        self.assertEqual(rows["orch-b"]["metadata_names_other_charter"], [{"charter": 1, "field": "issue", "owner": "orch-a"}])
+        self.assertEqual(rows["orch-a"]["metadata_names_other_charter"], [])
+
+    def test_the_registry_writer_refuses_what_it_should(self):
+        self.shape_one()
+        self.assertIsNotNone(self.registry.set_charter(self.world.state, "ghost", 1, "t")["problem"])
+        self.assertIsNotNone(self.registry.set_charter(self.world.state, "orch-a", True, "t")["problem"])
+        self.assertIsNotNone(self.registry.set_charter(self.world.state, "orch-a", -2, "t")["problem"])
+        self.assertEqual(self.registry.set_charter(self.world.state, "orch-a", 1, "t"), {"changed": False, "problem": None})
+
+    def test_every_reader_of_an_agents_charter_is_in_the_table(self):
+        """The readers of a fleet's `charter` are DERIVED from the code (every function that reads the key with `.get("charter")` or `["charter"]`): each must be classified. A new reader fails this until it is listed."""
+        found = set()
+        for rel in ("bin/fleet-switchboard", "bin/impact_hold.py", "bin/lanes.py", "bin/fleet_health.py", "bin/registry.py", "bin/reassign.py"):
+            tree = ast.parse((REPO / rel).read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for sub in ast.walk(node):
+                        key = None
+                        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute) and sub.func.attr == "get" and sub.args and isinstance(sub.args[0], ast.Constant):
+                            key = sub.args[0].value
+                        elif isinstance(sub, ast.Subscript) and isinstance(sub.slice, ast.Constant):
+                            key = sub.slice.value
+                        if key == "charter":
+                            found.add((rel, node.name))
+        unlisted = sorted(found - set(self.READERS))
+        self.assertEqual(unlisted, [], "classify each new reader of a charter in READERS (registry, or exempt with its reason)")
+
+    READERS = {   # (file, function) -> "registry": decides WHO OWNS a charter and reads the registry's charter (#969); otherwise why it is exempt: it reads ONE agent's own launch context, or asks only whether a number is a charter, never counts owners
+        ("bin/impact_hold.py", "_lane_of_issue"): "registry", ("bin/lanes.py", "charter_orchestrators"): "registry",
+        ("bin/fleet-switchboard", "adoption_heir"): "registry", ("bin/fleet-switchboard", "plan_wake_route"): "registry",
+        ("bin/registry.py", "orchestrator_charters"): "registry", ("bin/registry.py", "duplicate_charters"): "registry", ("bin/registry.py", "set_charter"): "registry writer",
+        ("bin/registry.py", "change"): "the registry's own writer: it sets the row", ("bin/fleet-switchboard", "registry_charter"): "the pass's rule over the registry row",
+        ("bin/fleet-switchboard", "pane_health_pass"): "writes the registry row through registry_charter", ("bin/fleet-switchboard", "charters_report"): "display of both records, read-only",
+        ("bin/fleet-switchboard", "cmd_agents_charters"): "display", ("bin/fleet-switchboard", "cmd_charter"): "the audited writer",
+        ("bin/impact_hold.py", "clear_lane"): "carries the lookup's `charter` into the notice line", ("bin/impact_hold.py", "_notify_clear_body"): "words the notice line",
+        ("bin/fleet-switchboard", "worker_charter"): "a worker's own charter (its launch context)", ("bin/fleet-switchboard", "resume_agent"): "one agent's own repo lookup",
+        ("bin/fleet-switchboard", "charter_pane_update"): "one agent's own charter for its pane", ("bin/fleet-switchboard", "_fleet_repo"): "one agent's own repo",
+        ("bin/fleet-switchboard", "seam_applies"): "asks whether an issue number is known as a charter (a set test), never counts owners",
+        ("bin/fleet-switchboard", "read_order_notices"): "reads the order notices' own records", ("bin/fleet-switchboard", "order_groups"): "groups order notices",
+        ("bin/fleet-switchboard", "decisions_from_order_notices"): "words order notices", ("bin/fleet-switchboard", "asks_of_caller"): "the calling agent's own charters",
+        ("bin/fleet-switchboard", "register_item_tester"): "a boss's own charter (launch context)", ("bin/fleet-switchboard", "resolve_policy_context"): "one agent's own launch context",
+        ("bin/fleet-switchboard", "_valid_context"): "a cached own context", ("bin/fleet-switchboard", "load_tick"): "an orchestrator's own charter as a fallback for its own yaml",
+        ("bin/fleet-switchboard", "charter_orders"): "an agent's own charter's orders", ("bin/fleet-switchboard", "charter_guard"): "an agent's own charters",
+        ("bin/fleet-switchboard", "ask_context_of"): "an agent's own ask context", ("bin/fleet-switchboard", "__call__"): "an orchestrator's own orders",
+        ("bin/fleet_health.py", "figures"): "the health figures of one agent from the registry-derived info", ("bin/fleet_health.py", "_resolve_charters"): "the registry-derived info",
+        ("bin/fleet_health.py", "_refresh_asks"): "the registry-derived info", ("bin/fleet-switchboard", "_import_fleet"): "the launch/import writer of the session's metadata",
+    }
 
 
 class TestClearNotice(Base):

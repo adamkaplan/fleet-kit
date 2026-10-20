@@ -363,6 +363,46 @@ def upsert(state_dir, name, agent, now=None):
     return _mutate(state_dir, change, now)
 
 
+def is_charter(value):
+    """True for an issue number a charter can be (a positive int, never a bool)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def orchestrator_charters(agents):
+    """{name: charter number} of the orchestrators of a registry's `agents` that record a charter (rows with none are left out). The ONE reading of "whose charter is this" (#969)."""
+    return {name: row["charter"] for name, row in (agents or {}).items()
+            if isinstance(row, dict) and row.get("role") == "orchestrator" and is_charter(row.get("charter"))}
+
+
+def duplicate_charters(agents, repos=None):
+    """{(repo, charter): [names]} of a charter number recorded by two or more orchestrators of the same repo (sorted names). `repos` maps an agent name to its repo when the row has none."""
+    found = {}
+    for name, number in orchestrator_charters(agents).items():
+        row = agents[name]
+        repo = row.get("repo") or (repos or {}).get(name)
+        found.setdefault((repo, number), []).append(name)
+    return {key: sorted(names) for key, names in found.items() if len(names) > 1}
+
+
+def set_charter(state_dir, name, charter, by, now=None):
+    """Write an orchestrator's registry charter (an issue number, or None to clear it): the ONLY command-side writer of the field. One audit event with the old and the new value and who ran it.
+    Refused (nothing written, a problem line) for an agent not in the registry, one retired, or one that is not an orchestrator, and for a value that is not an issue number or None."""
+    def change(doc):
+        row = doc["agents"].get(name)
+        if not isinstance(row, dict) or name in doc["retired"]:
+            return False, [], "%s is not a registered agent" % name
+        if row.get("role") != "orchestrator":
+            return False, [], "%s is not an orchestrator" % name
+        if charter is not None and not is_charter(charter):
+            return False, [], "a charter is an issue number or none"
+        old = row.get("charter")
+        if old == charter:
+            return False, [], None
+        row["charter"] = charter
+        return True, [{"event": "charter", "name": name, "old": old, "new": charter, "by": by}], None
+    return _mutate(state_dir, change, now)
+
+
 def reconcile_remove(state_dir, name, evidence, whole):
     """Remove a DEAD agent. Refuses unless `whole` is True AND the registry's own check of the evidence shows it dead: the agent's recorded state is
     `dead`, and the live read lacked its pane (`evidence["pane_listed"]` false) and its process (`evidence["process_found"]` false)."""
