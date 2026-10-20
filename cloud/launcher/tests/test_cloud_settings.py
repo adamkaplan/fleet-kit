@@ -588,7 +588,7 @@ class WiringReceivesBoth(Dir):
                     self.assertNotIn(part, text.replace(self.path, "").replace("acme-cluster", ""))
 
     def test_s15_the_duration_rule_never_accepts_what_the_wiring_refuses(self):
-        """Derived parity: every string up to length 4 over a small alphabet. DANGEROUS direction (file accepts, wiring refuses) must be empty for all;
+        """Derived parity: every string up to length 5 over a small alphabet. DANGEROUS direction (file accepts, wiring refuses) must be empty for all;
         the other direction (the wiring accepts, the file refuses) is the documented 'stricter' (spaces are stripped by the wiring; a non-ASCII digit)."""
         import itertools
         wiring = load_wiring()
