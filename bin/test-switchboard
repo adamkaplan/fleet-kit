@@ -34957,6 +34957,11 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(args.impact_severity, "Critical", "the shared namespace does carry the value")
         os.environ["HERDR_PANE_ID"] = self.world.panes["rev"]
         with captured() as (o, e), mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: self.terminal_problem):
+            self.assertEqual(sb.cmd_review(args, self.route, self.world.clock.now), 2, "no raw argv: no reviewer and no verdict are read, so nothing is recorded (fail closed)")
+            self.assertIn("--reviewer must be one of", e.getvalue())
+        self.assertEqual([x for x in sb.plan_ledger.read_ledger(self.world.state)[0] if x["kind"] == "review_record"], [])
+        args.raw_argv = ("review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve")   # a raw argv with no rating on it: the namespace's values are still not read
+        with captured() as (o, e), mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: self.terminal_problem):
             self.assertEqual(sb.cmd_review(args, self.route, self.world.clock.now), 0, e.getvalue())
         entry = [x for x in sb.plan_ledger.read_ledger(self.world.state)[0] if x["kind"] == "review_record"][-1]
         self.assertEqual([k for k in entry if k.startswith("impact_")], [], "no rating, never one from the namespace")
