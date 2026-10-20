@@ -1,0 +1,13 @@
+{
+ "audit": "{\"action\": \"stop\", \"actor\": \"<ACTOR>\", \"cost_estimate_usd\": 0.0, \"ok\": true, \"reason\": \"operator; run record <RECORD>\", \"runtime_id\": \"pod/coder7-ffda\", \"ts\": \"2026-10-14T12:00:00Z\", \"worker\": \"coder7\"}",
+ "code": 0,
+ "files": [
+  "run.json",
+  "tally.json",
+  "transcript.jsonl"
+ ],
+ "note": "Captured from main (operator `stop coder7 --reason operator`, fake cluster, dirty work tree): output, stderr, run.json and audit line, with the record directory, run id, end time and actor replaced by placeholders. The branch must reproduce them, except `run.json` gains `end_hook`.",
+ "run_json": "{\"end\": \"<END>\", \"exit_reason\": \"operator\", \"head_sha\": null, \"repository\": \"acme-org/widget-service\", \"run_id\": \"<RUN_ID>\", \"start\": \"2026-10-14T12:00:00Z\", \"transcript\": \"saved\", \"transcript_truncated\": false, \"worker\": \"coder7\"}\n",
+ "stderr": "cloud-worker: run record: <RECORD>\ncloud-worker: WARNING: not saved (secret-looking names): .env\n",
+ "stdout": "{\"pushed\": true, \"record\": \"<RECORD>\", \"runtime_id\": \"pod/coder7-ffda\", \"skipped\": [\".env\"], \"wip_branch\": \"coder7/wip\", \"worker\": \"coder7\"}\n"
+}
