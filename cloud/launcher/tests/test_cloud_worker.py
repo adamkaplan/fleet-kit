@@ -43,6 +43,10 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(dir=self.TMP_BASE)
         self.addCleanup(self.tmp.cleanup)
         d = self.tmp.name
+        self.lock_root = os.path.join(d, "locks")   # never the user's real lock directory: tests of one suite run side by side
+        old_root = cw.REAPER_LOCK_ROOT
+        cw.REAPER_LOCK_ROOT = self.lock_root
+        self.addCleanup(setattr, cw, "REAPER_LOCK_ROOT", old_root)
         self.state = os.path.join(d, "kube.json")
         self.write_state({"pods": {}})
         self.env = {"CW_KUBECTL": os.path.join(HERE, "fake_kubectl"), "FAKE_KUBE_STATE": self.state,
@@ -545,7 +549,7 @@ class S5EndHook(Base):
         src = open(os.path.join(os.path.dirname(os.path.abspath(cw.__file__)), "cloud_worker.py")).read()
         fn = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and n.name == "_reap_main"][0]
         whys = sorted({ast.unparse(a.value)[:20] for a in ast.walk(fn) if isinstance(a, ast.Assign) and any(getattr(t, "id", "") == "why" for t in a.targets)})
-        self.assertEqual(len(whys), 3, whys)   # end of its pass, stopped by (a signal or an interrupt), an error: a form added needs its case
+        self.assertEqual(len(whys), 4, whys)   # end of its pass, stopped by (a signal or an interrupt), an error, not started (the lock): a form added needs its case (test_reaper_managed.ENDINGS)
         shape = r"cloud-worker: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ reaper exiting: "
         orig = cw.Launcher.reap
         self.addCleanup(setattr, cw.Launcher, "reap", orig)
