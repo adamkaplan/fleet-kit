@@ -266,6 +266,22 @@ def owner_hold_rule(matrix):
     return top, other, {c: list(g) for c, g in paths.items()}
 
 
+def clear_code_paths(matrix):
+    """The matrix's `owner_hold.delegated_clear.clear_code_paths` list (the files that ARE the clear and hold machinery: never delegated, and always held for the owner), the ONE
+    reader the floor and the delegated clear both use. Returns (list or None when the block is absent, problem or None); a block that is present but whose list is not a list of
+    non-empty strings is a problem (the floor then holds)."""
+    hold = matrix.get("owner_hold") if isinstance(matrix, dict) else None
+    block = hold.get("delegated_clear") if isinstance(hold, dict) else None
+    if block is None:
+        return None, None
+    if not isinstance(block, dict):
+        return None, "owner_hold.delegated_clear is malformed"
+    got = block.get("clear_code_paths")
+    if not (isinstance(got, list) and got and all(isinstance(x, str) and x.strip() for x in got)):
+        return None, "owner_hold.delegated_clear.clear_code_paths is missing or malformed"
+    return list(got), None
+
+
 def top_tier_hits(paths, matrix):
     """{class: [paths]} of the changed paths that match a top tier glob of the matrix file (a path may be named under more than one class)."""
     rule = owner_hold_rule(matrix)
@@ -477,6 +493,13 @@ def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=(), narrow=None
     lost = sorted({p for p in paths if isinstance(p, str) and escapes(p)})
     if lost:   # a path that leaves the repository cannot be judged as a file of it: hold
         reasons.append("path outside the repository or not normalisable: %s" % ", ".join(repr(p)[:60] for p in lost[:3]))
+    listed, problem = clear_code_paths(matrix)   # the clear and hold machinery, by name: never delegated, so always held for the owner
+    if problem:
+        reasons.append("%s: every change holds" % problem)
+    if listed:
+        machinery = sorted({p for p in paths if isinstance(p, str) and matches(p, listed)})
+        if machinery:
+            reasons.append("clear_code_paths (the clear and hold machinery, never delegated): %s" % ", ".join(machinery[:5]) + (" ..." if len(machinery) > 5 else ""))
     hits = top_tier_hits(paths, matrix)
     prose = []   # narrow paths whose permission block did not change: no hold from the path
     narrowed, limit = narrow_paths(matrix, paths)
