@@ -101,6 +101,8 @@ findings:
 
 The coder session records your block; you never run the command. A block with no `impact-severity:` and `impact-probability:` line is recorded WITHOUT a score and clears nothing by score, so always give both.
 
+A rating counts by score only because your block was recorded with it: the hash kept with the record proves a block was given, not that the agent produced it (a mistake-guard, as the recorded-role check is); the independent review and the audit remain the cover.
+
 <!-- block-table:begin -->
 With --block, refused (the block carries them): --verdict, --head, --blocks, --notes, --impact-action; accepted: --reviewer, --summary, --impact-class, --impact-severity, --impact-probability, --impact-reason, and of these --impact-class, --impact-severity, --impact-probability, --impact-reason win over the block's own lines; the score comes from the block's impact-severity:, impact-probability: and impact-reason: lines, so a block without the first two is recorded WITHOUT a score
 <!-- block-table:end -->

@@ -123,6 +123,24 @@ def order_text(orders, number):
     return None
 
 
+NO_AGENT_BLOCK = ("no agent block: the impact rating at this head carries no verdict block of the reviewer-impact agent for this head that agrees with its score (typed flags, a block for another head or a malformed one), "
+                  "so it clears nothing by score; record the agent's block with `review record --reviewer impact --block <file>`")   # #901: the ONE line the clear's refusal, `impact floor` and `gates` all say
+BLOCK_HASH_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def counts_by_block(entry):
+    """True when the record carries the block the agent returned: a sha256 of it (`block_sha256`), and its recorded severity and probability are exactly the block's own lines (`block_impact_severity`,
+    `block_impact_probability`, kept by `review record --block`). A flags-only record (`block_sha256` is `none`), a record made before blocks were kept, a malformed hash or a typed score that disagrees with the block does
+    not count. A mistake-guard: the hash proves a block was given, not that the agent produced it. #901."""
+    if not isinstance(entry, dict):
+        return False
+    digest = entry.get("block_sha256")
+    if not isinstance(digest, str) or not BLOCK_HASH_RE.fullmatch(digest):
+        return False
+    return (isinstance(entry.get("impact_severity"), str) and entry.get("impact_severity") == entry.get("block_impact_severity")
+            and isinstance(entry.get("impact_probability"), str) and entry.get("impact_probability") == entry.get("block_impact_probability"))
+
+
 def judge(block, cells, entries, report, threshold):
     """{"level": the score or None, "reasons": [why refused]} (no reasons: the score is at or below `threshold`, so the clear may go on). `block` is the matrix's score block, `cells` its `cells` (severity ->
     probability -> {"level"}), `entries` the ledger's entries (the caller filtered nothing: this checks kind, reviewer, pr, EXACT head and the recorded role again), `report` the owner-hold report (`pr`, `head`,
@@ -133,12 +151,15 @@ def judge(block, cells, entries, report, threshold):
     ladder = block["ladder"]
     if threshold not in block["delegable_levels"] or threshold not in ladder:
         return {"level": None, "reasons": ["the threshold %r is unknown: refused" % (threshold,)]}
-    counted, bad = [], 0
+    counted, bad, unblocked = [], 0, 0
     for entry in entries if isinstance(entries, list) else []:
         if not isinstance(entry, dict) or entry.get("kind") != "review_record" or entry.get("reviewer") != "impact" or entry.get("pr") != report.get("pr") or entry.get("head") != report.get("head") or not report.get("head"):
             continue
         if entry.get("by_role") not in block["rating_roles"]:
             continue   # the pull request's author, the Chief of Staff, any other role (or a record made before roles were kept) is not the independent rating
+        if not counts_by_block(entry):
+            unblocked += 1   # #901: only the agent's own block counts by score
+            continue
         level = ((cells.get(entry.get("impact_severity")) or {}).get(entry.get("impact_probability")) or {}).get("level") if isinstance(entry.get("impact_severity"), str) and isinstance(entry.get("impact_probability"), str) else None
         if level not in ladder:
             bad += 1
@@ -146,6 +167,8 @@ def judge(block, cells, entries, report, threshold):
             counted.append((ladder.index(level), level, entry))
     if bad:
         return {"level": None, "reasons": ["a rating at this head has no severity and probability the matrix knows: the score is unknown, refused"]}
+    if not counted and unblocked:
+        return {"level": None, "reasons": [NO_AGENT_BLOCK]}
     if not counted:
         return {"level": None, "reasons": ["there is no independent impact rating at this head: the score is unknown, refused"]}
     top = max(i for i, _, _ in counted)

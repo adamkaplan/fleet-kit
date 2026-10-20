@@ -20642,6 +20642,8 @@ def cmd_gates(args, runner, now):
         report["plan_changed"] = "the PR's plan is now %s; its entries were recorded against %s (they are void)" % (ctx.source, first)
     shares = overlap_shares_line(read_open_overlap(ctx.engine, ctx.repo, runner), ctx.number) if not ctx.unreadable else None   # #818: information only
     if args.json:
+        if isinstance(ctx.facts, dict) and rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head")):
+            report["rating_block"] = rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head"))
         if shares:
             report["shares"] = shares
         print(json.dumps(report, sort_keys=True))
@@ -20653,6 +20655,9 @@ def cmd_gates(args, runner, now):
             lines.append("PR not read: %s" % ctx.unreadable)
         if ctx.plan_problem:
             lines.append("plan not read: %s" % ctx.plan_problem)
+        note = rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head")) if isinstance(ctx.facts, dict) else None
+        if note:
+            lines.append("rating: %s" % note)
         if report.get("plan_changed"):
             lines.append("PLAN CHANGED: %s" % report["plan_changed"])
         print("\n".join(lines))
@@ -21085,6 +21090,19 @@ def impact_review_record(state_dir, pr, head):
     return ((latest.get("impact_action"), latest.get("impact_class")) if latest else None), None
 
 
+def rating_block_note(entries, pr, head):
+    """#901: the one line `no agent block` when the independent reviewer's records of `pr` at EXACTLY `head` exist and none carries the agent's block (it clears nothing by score), else None. The same
+    words as the clear's refusal (`delegated_clear.NO_AGENT_BLOCK`); display only, no decision reads it."""
+    try:
+        module = load_module("delegated_clear")
+        block = module.score_block()
+        roles = block["rating_roles"] if block else ["reviewer"]
+        mine = [e for e in entries if isinstance(e, dict) and e.get("kind") == "review_record" and e.get("reviewer") == "impact" and e.get("pr") == pr and e.get("head") == head and e.get("by_role") in roles]
+        return module.NO_AGENT_BLOCK if mine and not any(module.counts_by_block(e) for e in mine) else None
+    except Exception:
+        return None
+
+
 def impact_rating_entries(state_dir, pr, head):
     """([ledger entries], problem): every impact reviewer record of EXACTLY this pull request and head (the delegated clear's score is the highest of those whose recorded role counts: `delegated_clear.judge` decides which).
     A ledger that cannot be read, or whose chain is broken, gives ([], why): the score is then unknown. #835."""
@@ -21188,7 +21206,8 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
             reasons = reasons + [IMPACT_REVIEW_REASON]
         if review:
             decision = "hold"
-    return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude,
+    rating_entries = impact_rating_entries(engine.state_dir, "%s#%d" % (repo, number), head)[0] if engine.state_dir is not None and isinstance(head, str) else []
+    return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude, "rating_block": rating_block_note(rating_entries, "%s#%d" % (repo, number), head),
             "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete,
             "top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "review_action": record[0] if record else None, "review_class": record[1] if record else None,   # #661: display data the delegated clear reads; no decision changes
             "changed_paths": [p for p in paths if isinstance(p, str)][:200], "unknown": unknown, "rated": [list(r) for r in rated],
@@ -21255,6 +21274,8 @@ def cmd_impact_floor(args, runner, now):
             print("impact floor for %s at %s: %s, %s %s" % (report["pr"], (report["head"] or "unknown head")[:8], words, counted, stamp))
         for reason in report.get("owner_reasons") or []:
             print("  %s: %s" % ("why" if owner == "hold" else "because", reason))
+        if report.get("rating_block"):
+            print("  rating: %s" % report["rating_block"])
         if owner == "none" and not report.get("owner_reasons") and not cut and not blind:
             print("  because: no changed path is a top tier path of the matrix, and no independent review or rating holds it")
         if cut and owner != "hold":
@@ -23016,13 +23037,17 @@ def cmd_review(args, runner, now):
         given = rating_inputs(getattr(args, "raw_argv", ()))   # #835: the rating's inputs come from the raw argv through a private parser, never from the shared namespace (a registrar's set_defaults, a replaced parser or a wrapper cannot reach them); a missing raw argv gives no rating
         action, klass = given.get("impact_action"), given.get("impact_class")
         rating_in = {name: given.get(name) for name in IMPACT_RATING_FIELDS}
+        block_digest, block_fields = None, {}
         if given.get("block") is not None:   # the reviewer's returned text: the coder session records it
             carried = {"verdict": args.verdict, "head": args.head, "blocks": args.blocks, "notes": args.notes, "impact_action": action}
             if any(carried[dest] for flag, dest, mode in BLOCK_FLAG_TABLE if mode == "refused"):
                 raise ReviewError(BLOCK_TABLE_TEXT)
-            fields, why = parse_review_block(_read_capped(given["block"], REVIEW_TABLE_MAX))
+            block_text = _read_capped(given["block"], REVIEW_TABLE_MAX)
+            fields, why = parse_review_block(block_text)
             if fields is None:
                 raise ReviewError("refused: %s" % why)
+            block_raw = block_text.encode("utf-8")
+            block_digest, block_fields = (hashlib.sha256(block_raw).hexdigest(), len(block_raw)), {name: fields[name] for name in IMPACT_RATING_FIELDS}
             args.verdict, args.head, args.blocks, args.notes, action = (fields["verdict"], fields["head"], fields["blocks"], fields["notes"], fields["impact_action"])
             klass = klass or fields["impact_class"]
             for name in IMPACT_RATING_FIELDS:   # the rating's severity and probability (the score is derived from the matrix's cell), and the reason that names a floor rule
@@ -23086,6 +23111,13 @@ def cmd_review(args, runner, now):
         for name in IMPACT_RATING_FIELDS:
             if rating[name]:
                 entry[name] = plan_ledger.clip(redact_command_text(rating[name]), 200)
+        if args.reviewer == "impact":   # #901: the block's own bytes and rating lines are kept, so only a record that carries the agent's block counts by score
+            entry["block_sha256"] = block_digest[0] if block_digest else "none"
+            if block_digest:
+                entry["block_size"] = block_digest[1]
+                for name, value in block_fields.items():
+                    if value:
+                        entry["block_" + name] = plan_ledger.clip(redact_command_text(value), 200)
         if impact_class:
             entry["impact_class"] = impact_class   # #451 slice 2: the class of the impact that drives the action; a missing one holds for the owner
         stored = plan_ledger.append_entry(state, entry, now())
