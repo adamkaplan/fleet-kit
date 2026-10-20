@@ -57752,6 +57752,309 @@ class TestHeavyWatchdog(unittest.TestCase):
         self.assertLessEqual(logic.out.tell(), BoundedOut.LIMIT)
 
 
+class TestHeavyCeilings(unittest.TestCase):
+    """Ask #930: a time ceiling per KIND of heavy run, read from the command. The clock, the process table, the signals, the sender and the audit are injected, so nothing
+    waits for a real hour; the one real-process case (a wrapper killed with SIGKILL) is in TestHeavySlots."""
+
+    # THE family table of the test: the kind, a command of that kind, the default ceiling. Derived completeness: a kind in the code with no row here fails.
+    FAMILY = (
+        ("full", ["bin/test-switchboard"], 5400),
+        ("focused", ["bin/test-switchboard", "-k", "x"], 1800),
+        ("e2e", ["playwright", "test"], 3600),
+        ("other", ["ls"], 3600),
+    )
+    RUNNABLE = {"full": ["python3", "/nowhere/test-fake"], "focused": ["python3", "/nowhere/test-fake", "-k", "x"], "e2e": ["sh", "-c", "true", "e2e"], "other": ["sh", "-c", "true"]}   # commands that exist, for run()
+    CLASSIFY = (
+        (["bin/test-switchboard"], "full"), (["bin/test-switchboard", "-k", "x"], "focused"), (["tests/test_a.py"], "focused"),
+        (["python3", "-m", "unittest", "a.b"], "focused"), (["playwright", "test"], "e2e"), (["bin/run-e2e.sh"], "e2e"),
+        (["timeout", "60", "bin/test-switchboard"], "full"), (["ls"], "other"), (["sh", "x"], "other"),
+    )
+
+    def setUp(self):
+        self.hs = sb.load_heavy_slots()
+        self.now = [1000.0]
+        self.signals, self.out = BoundedList(), BoundedOut()
+        self.exited = threading.Event()
+        self.reads = BoundedList()
+
+    def drive(self, command, schedule, environ_extra=None, ceiling=None, config=None, short=False, on_stop=None, name="holder"):
+        """run() of `command` whose child is fake; the watchdog's reads move the clock to start + schedule[n] (seconds); returns (exit status, signals seen at each read)."""
+        test, seen = self, []
+        base = test.now[0]
+
+        class FakeChild:
+            pid = 4242
+
+            def __init__(child, argv, **kwargs):
+                pass
+
+            def wait(child):
+                if not test.exited.wait(30):
+                    raise AssertionError("the fake command was never stopped")
+                return -9
+
+        def read_table():
+            seen.append(len(test.signals))
+            if test.exited.is_set() or len(seen) > len(schedule):
+                test.exited.set()
+                return []
+            test.now[0] = base + schedule[len(seen) - 1]
+            return [(4242, 1, os.getpgrp(), 1), (4243, 4242, os.getpgrp(), 1), (777, 1, 777, 1)]   # a child and a grandchild of the run, and a stranger
+
+        def record(number, sig):
+            test.signals.append((number, sig))
+            if sig == signal.SIGKILL:
+                test.exited.set()
+
+        environ = {"PATH": os.environ["PATH"], "FLEET_HEAVY": "off"}
+        environ.update(environ_extra or {})
+        dog = {"read_table": read_table, "pause": lambda seconds: False, "killpg": record, "kill": record, "every": 0.0, "grace": 0.001, "sweep_pause": lambda s: None}
+        with mock.patch.object(self.hs.subprocess, "Popen", FakeChild):
+            code = self.hs.run(command, None, 3, 1, name, environ=environ, out=self.out, clock=lambda: test.now[0], sleep=lambda s: None, watchdog=dog,
+                               short=short, ceiling=ceiling, ceiling_config=config, on_stop=on_stop)
+        return code, seen
+
+    def test_s2_every_command_reads_as_its_kind_and_every_kind_has_a_row(self):
+        for command, kind in self.CLASSIFY:
+            with self.subTest(command=command):
+                self.assertEqual(self.hs.classify(command), kind)
+        self.assertEqual(self.hs.classify(["bin/test-switchboard"], short=True), "focused", "--short declares a short run")
+        self.assertEqual({row[0] for row in self.FAMILY}, {kind for kind, _s, _m in self.hs.KINDS}, "a kind with no row here, or a row with no kind")
+        self.assertEqual({kind for _c, kind in self.CLASSIFY}, {kind for kind, _s, _m in self.hs.KINDS}, "a kind no command above reads as")
+        for kind, command, _default in self.FAMILY:
+            self.assertEqual(self.hs.classify(command), kind)
+            self.assertEqual(self.hs.classify(self.RUNNABLE[kind]), kind)
+
+    def test_s3_each_kind_has_its_default_and_a_configured_value_replaces_only_its_own(self):
+        for kind, command, default in self.FAMILY:
+            with self.subTest(kind=kind):
+                self.assertEqual(self.hs.resolve_ceiling(kind, {}), default)
+                other = {"ceilings": {kind: 900}}
+                self.assertEqual(self.hs.resolve_ceiling(kind, {}, config=other), 900)
+                for rest, _c, rest_default in self.FAMILY:
+                    if rest != kind:
+                        self.assertEqual(self.hs.resolve_ceiling(rest, {}, config=other), rest_default)
+        self.assertEqual(self.hs.ceiling_table(None)["max"], 14400)
+        self.assertEqual(self.hs.resolve_ceiling("full", {}, "99999", {"ceilings": {"max": 7000}}), 7000, "the maximum is configurable")
+        self.assertGreaterEqual(min(d for _k, _c, d in self.FAMILY), 1800, "no default is below the repository's longest CI step limit")
+
+    def test_s4_an_unreadable_value_is_the_default_or_the_maximum_never_off(self):
+        for kind, _command, default in self.FAMILY:
+            for bad in ("lots", "-5", "1e3", "", " ", "5 s", None):
+                with self.subTest(kind=kind, value=bad):
+                    for got in (self.hs.resolve_ceiling(kind, {"FLEET_HEAVY_MAX_SECONDS": bad} if bad is not None else {}), self.hs.resolve_ceiling(kind, {}, bad)):
+                        self.assertEqual(got, default)
+            self.assertEqual(self.hs.resolve_ceiling(kind, {"FLEET_HEAVY_MAX_SECONDS": "99999999999999"}), 14400)
+            for bad in ("lots", 0, -1, True, 1.5, None):   # an unreadable configured value is the default
+                self.assertEqual(self.hs.resolve_ceiling(kind, {}, config={"ceilings": {kind: bad}}), default)
+
+    def test_s5_a_higher_request_is_honoured_up_to_the_maximum_and_zero_is_the_maximum(self):
+        for kind, _command, _default in self.FAMILY:
+            with self.subTest(kind=kind):
+                self.assertEqual(self.hs.resolve_ceiling(kind, {"FLEET_HEAVY_MAX_SECONDS": "10800"}), 10800)
+                self.assertEqual(self.hs.resolve_ceiling(kind, {}, "10800"), 10800)
+                self.assertEqual(self.hs.resolve_ceiling(kind, {}, "10800", None), 10800)
+                for big in ("16200", "99999999"):
+                    self.assertEqual(self.hs.resolve_ceiling(kind, {"FLEET_HEAVY_MAX_SECONDS": big}), 14400)
+                self.assertEqual(self.hs.resolve_ceiling(kind, {"FLEET_HEAVY_MAX_SECONDS": "0"}), 14400)
+                self.assertEqual(self.hs.resolve_ceiling(kind, {}, "0"), 14400)
+                self.assertEqual(self.hs.resolve_ceiling(kind, {"FLEET_HEAVY_MAX_SECONDS": "60"}), 60, "a request may be lower (preflight-pr)")
+                self.assertEqual(self.hs.resolve_ceiling(kind, {"FLEET_HEAVY_MAX_SECONDS": "60"}, "120"), 120, "--ceiling wins over the environment")
+
+    def test_s6_each_kind_runs_on_one_second_before_its_ceiling_and_is_stopped_past_it_with_124(self):
+        for kind, command, default in self.FAMILY:
+            with self.subTest(kind=kind, at="ceiling-1"):
+                self.signals, self.exited, self.out = BoundedList(), threading.Event(), BoundedOut()
+                code, seen = self.drive(self.RUNNABLE[kind], [default - 1, default + 1])
+                self.assertEqual(seen[:2], [0, 0], "before the ceiling nothing is signalled (the second read is the one at ceiling-1)")
+                self.assertEqual(code, 124)
+                self.assertEqual({p for p, _s in self.signals}, {4242, 4243}, "the child and the grandchild go, the stranger does not")
+                self.assertIn("time ceiling of %d s" % default, self.out.getvalue())
+            with self.subTest(kind=kind, at="exactly the ceiling"):
+                self.signals, self.exited, self.out = BoundedList(), threading.Event(), BoundedOut()
+                code, seen = self.drive(self.RUNNABLE[kind], [default, default + 1])
+                self.assertEqual(seen[1], 0, "at the ceiling itself the run still goes on (stopped past it)")
+                self.assertEqual(code, 124)
+
+    def test_u1_a_run_under_its_ceiling_prints_nothing_new_and_keeps_its_exit_status(self):
+        for status in (0, 3):
+            with self.subTest(status=status):
+                code = self.hs.run(["sh", "-c", "exit %d" % status], None, 3, 1, "who", environ={"PATH": os.environ["PATH"], "FLEET_HEAVY": "off"}, out=(out := BoundedOut()))
+                self.assertEqual((code, out.getvalue()), (status, ""))
+        out = BoundedOut()
+        self.assertEqual(self.hs.run(["no-such-command-930"], None, 3, 1, "who", environ={"PATH": os.environ["PATH"]}, out=out), 127)
+        self.assertEqual(out.getvalue(), "heavy: no-such-command-930: command not found\n")
+
+    def test_u2_the_old_configuration_stays_valid_and_unknown_keys_are_refused(self):
+        self.assertEqual(self.hs.settings(None), 3)
+        self.assertEqual(self.hs.settings({"slots": 2}), 2)
+        self.assertEqual(self.hs.settings({"slots": 2, "ceilings": {"full": 3600, "max": 7200}}), 2)
+        for bad in ({"slotz": 2}, {"ceilings": {"huge": 5}}, {"ceilings": {"full": 0}}, {"ceilings": {"full": "x"}}, {"ceilings": 5}):
+            with self.subTest(bad=bad), self.assertRaises(self.hs.HeavyError):
+                self.hs.settings(bad)
+
+    def canary(self):
+        return "".join(["sk", "-", "canary", "-", "930", "-", "abcdef"])   # built at run time: no secret-shaped literal in the file
+
+    def reported(self, command, **kw):
+        """A time stop reported through the REAL report_stop with a recording sender and audit; returns (told list, audit list, sent texts)."""
+        sent, audited = BoundedList(), BoundedList()
+
+        def send(lane, text):
+            sent.append((lane, text))
+            return kw.get("answer", "sent")
+        stop = lambda info, holder, lane: self.hs.report_stop(info, holder, lane, send, lambda *a: audited.append(a))
+        secret = self.canary()
+        code, _seen = self.drive(command + [secret], [5401], environ_extra={"FLEET_HEAVY_SECRET_930": secret, "FLEET_HEAVY_NAME": "lane-x"}, on_stop=stop, name="holder-x", **{k: v for k, v in kw.items() if k != "answer"})
+        return code, sent, audited, secret
+
+    def test_s7_the_audit_line_has_exactly_its_fields_and_no_argument_or_environment(self):
+        for kind, command, default in self.FAMILY:
+            with self.subTest(kind=kind):
+                self.signals, self.exited = BoundedList(), threading.Event()
+                code, sent, audited, secret = self.reported(self.RUNNABLE[kind], ceiling=str(default))
+                self.assertEqual(code, 124)
+                self.assertEqual(len(audited), 1)
+                event, subject, detail = audited[0]
+                self.assertEqual((event, subject), ("heavy.stopped", "holder-x"))
+                self.assertEqual(set(detail), {"kind", "ran_seconds", "ceiling_seconds", "pid", "reason", "source", "lane_told"})
+                self.assertEqual((detail["kind"], detail["ceiling_seconds"], detail["pid"], detail["source"], detail["lane_told"]), (kind, default, 4242, "wrapper", "sent"))
+                self.assertGreater(detail["ran_seconds"], default)
+                line = json.dumps(audited[0])
+                for text in (secret, "FLEET_HEAVY_SECRET_930", "lane-x" if False else secret):
+                    self.assertNotIn(text, line)
+
+    def test_s8_the_lane_is_told_once_with_fixed_words_and_an_unknown_name_is_said_in_the_audit(self):
+        for answer in ("sent", "unknown name", "failed"):
+            with self.subTest(answer=answer):
+                self.signals, self.exited = BoundedList(), threading.Event()
+                code, sent, audited, secret = self.reported(self.RUNNABLE["full"], answer=answer)
+                self.assertEqual(code, 124, "a message that fails never changes the exit status")
+                self.assertEqual(len(sent), 1, "told once, no retry")
+                self.assertEqual(sent[0][0], "lane-x", "the recorded lane, not the holder's name")
+                self.assertEqual(audited[0][2]["lane_told"], answer)
+                self.assertRegex(sent[0][1], r"^heavy: your full run \(pid 4242\) was stopped after \d+ s; its ceiling was 5400 s \(FLEET_HEAVY_MAX_SECONDS or heavy --ceiling asks for more, up to 14400\)$")
+        raised = BoundedList()
+        self.hs.report_stop({"kind": "full", "pid": 1, "ran_seconds": 2, "ceiling_seconds": 1, "source": "wrapper"}, "h", "l", lambda *a: 1 / 0, lambda *a: raised.append(a))
+        self.assertEqual(raised[0][2]["lane_told"], "failed", "a sender that raises reads as failed")
+
+    def test_s13_neither_the_message_nor_the_line_carries_a_canary_in_any_of_three_forms(self):
+        secret = self.canary()
+        for form, command, environ in (("argument", self.RUNNABLE["full"] + [secret], {}), ("environment", self.RUNNABLE["full"], {"FLEET_HEAVY_SECRET_930": secret}),
+                                       ("both", self.RUNNABLE["full"] + [secret], {"FLEET_HEAVY_SECRET_930": secret})):
+            with self.subTest(form=form):
+                self.signals, self.exited = BoundedList(), threading.Event()
+                sent, audited = BoundedList(), BoundedList()
+                stop = lambda info, holder, lane: self.hs.report_stop(info, holder, lane, lambda l, t: sent.append(t) or "sent", lambda *a: audited.append(a))
+                self.drive(command, [5401], environ_extra=environ, on_stop=stop)
+                blob = json.dumps(list(sent) + list(audited))
+                for forbidden in (secret, "FLEET_HEAVY_SECRET_930", "PATH", "nowhere"):
+                    self.assertNotIn(forbidden, blob)
+
+    def test_the_switchboard_sends_only_to_a_known_agent_and_says_so_for_an_unknown_name(self):
+        calls = []
+        engine = types.SimpleNamespace(now=lambda: 1.0, discover=lambda now: types.SimpleNamespace(agents={"coder-a": object()}), send=lambda *a, **k: calls.append(a) or {"sent": True})
+        self.assertEqual(sb.heavy_stop_send(engine, "coder-a", "text"), "sent")
+        self.assertEqual(sb.heavy_stop_send(engine, "nobody", "text"), "unknown name")
+        self.assertEqual(len(calls), 1, "nothing is sent for an unknown name")
+        engine.send = lambda *a, **k: {"sent": False}
+        self.assertEqual(sb.heavy_stop_send(engine, "coder-a", "text"), "failed")
+
+    # ---- the orphan: the slot is really locked, the clock, the table, the signals and the lock listing are injected
+
+    def orphan_rig(self, record, rows=None, alive=lambda pid, start: False, held_by=(4242, 4243)):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "heavy-slot-0.lock")
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        os.write(fd, json.dumps(record).encode())
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)   # the "run" holds the slot
+        gone = threading.Event()
+        signals = BoundedList()
+
+        def record_signal(number, sig):
+            signals.append((number, sig))
+            if sig == signal.SIGKILL:
+                gone.set()
+        table = rows or [(4242, 1, 4242, 1, "t"), (4243, 4242, 4242, 1, "t"), (999, 1, 999, 1, "t"), (555, 1, 555, 1, "t")]
+        dog = {"read_table": lambda: [] if gone.is_set() else table, "kill": record_signal, "killpg": record_signal, "lsof": lambda p: set(held_by), "grace": 0.001,
+               "sweep_pause": lambda s: None, "pause": lambda s: False, "me": (os.getpid(), os.getppid(), os.getpgrp())}
+        return tmp, dog, signals, alive
+
+    def orphan(self, ran, record=None, **rig):
+        record = record or {"name": "h", "pid": 4242, "wrapper": 31337, "command": "x", "since": 1000, "kind": "full", "ceiling": 5400, "lane": "lane-x", "wstart": "w0"}
+        tmp, dog, signals, alive = self.orphan_rig(record, **rig)
+        told = BoundedList()
+        stopped = self.hs.check_orphans(tmp, 3, None, lambda: 1000.0 + ran, lambda info, holder, lane: told.append((info, holder, lane)), BoundedOut(), alive=alive, watchdog=dog)
+        return stopped, told, signals
+
+    def test_s9_an_orphan_is_left_alone_at_its_ceiling_and_stopped_past_it_measured_from_the_slot_start(self):
+        stopped, told, signals = self.orphan(5400)
+        self.assertEqual((stopped, list(signals)), ([], []), "at the ceiling nothing is signalled")
+        stopped, told, signals = self.orphan(5401)
+        self.assertTrue({4242} <= {p for p, _s in signals} <= {4242, 4243}, "the run's group or tree, nothing else (999 and 555 are strangers)")
+        self.assertEqual(len(stopped), 1)
+        info, holder, lane = told[0]
+        self.assertEqual((info["source"], info["kind"], info["ceiling_seconds"], info["pid"], info["ran_seconds"], holder, lane), ("orphan", "full", 5400, 4242, 5401, "h", "lane-x"))
+        stopped, told, signals = self.orphan(99999, alive=lambda pid, start: True)
+        self.assertEqual((stopped, list(signals)), ([], []), "a live wrapper's run is never touched by the orphan check")
+
+    def test_s10_an_old_record_reads_as_other_and_a_reused_wrapper_pid_is_an_orphan(self):
+        old = {"name": "h", "pid": 4242, "wrapper": 31337, "command": "x", "since": 1000}
+        self.assertEqual(self.orphan(3600, old)[0], [])
+        stopped, told, signals = self.orphan(3601, old)
+        self.assertEqual((stopped[0]["kind"], stopped[0]["ceiling_seconds"]), ("other", 3600))
+        seen = []
+        stopped, told, signals = self.orphan(6000, alive=lambda pid, start: seen.append((pid, start)) or False)   # the start time recorded is the one asked for
+        self.assertEqual(seen, [(31337, "w0")])
+        self.assertEqual(len(stopped), 1, "a pid reused by another process (another start time) is judged gone")
+
+    def test_u3_an_orphan_stop_signals_only_the_runs_own_processes(self):
+        stopped, told, signals = self.orphan(9000, held_by=(4242, os.getpid(), os.getppid(), 1))
+        self.assertTrue({p for p, _s in signals} <= {4242, 4243}, signals)
+        self.assertFalse({os.getpid(), os.getppid(), 1, 999, 555} & {p for p, _s in signals})
+
+    def test_a_slot_that_changed_hands_during_the_stop_is_not_stopped(self):
+        tmp, dog, signals, alive = self.orphan_rig({"name": "h", "pid": 4242, "wrapper": 31337, "command": "x", "since": 1000})
+        newer = [0]
+
+        def lsof(path):   # the look finds the holders, and the slot is then taken by a newer run: its record has another start
+            with open(path, "r+b") as handle:
+                handle.truncate(0)
+                handle.write(json.dumps({"name": "n", "pid": 4242, "wrapper": 31337, "since": 5000}).encode())
+            return {4242}
+        dog["lsof"] = lsof
+        stopped = self.hs.check_orphans(tmp, 3, None, lambda: 20000.0, None, BoundedOut(), alive=alive, watchdog=dog)
+        self.assertEqual((stopped, list(signals)), ([], []))
+
+    def test_the_orphan_check_reports_nothing_and_stops_nothing_for_a_free_slot(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with open(os.path.join(tmp, "heavy-slot-0.lock"), "w") as handle:
+            handle.write(json.dumps({"name": "h", "pid": 4242, "wrapper": 31337, "since": 1}))
+        self.assertEqual(self.hs.check_orphans(tmp, 3, None, lambda: 10 ** 9, None, BoundedOut(), alive=lambda p, s: False), [])
+
+    def test_s11_every_case_named_in_the_ask_has_a_test(self):
+        names = {n for n in dir(type(self)) if n.startswith("test_")}
+        for case in ("test_s2_", "test_s3_", "test_s4_", "test_s5_", "test_s6_", "test_s7_", "test_s8_", "test_s9_", "test_s10_", "test_s13_", "test_u1_", "test_u2_", "test_u3_"):
+            self.assertTrue(any(n.startswith(case) for n in names), "no test for %s" % case)
+        slots_tests = {n for n in dir(TestHeavySlots) if n.startswith("test_")}
+        self.assertIn("test_s9_a_wrapper_killed_with_sigkill_leaves_a_run_that_the_orphan_bound_stops_and_audits", slots_tests)
+
+    def test_s1_s12_the_docs_state_the_cause_the_measured_table_the_ceilings_and_how_to_raise_one(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        start = text.index("### `heavy`: CPU slots")
+        section = text[start:text.index("\n### ", start + 10)]
+        for needle in ("measured from the slot start", "7200", "heavy.stopped", "--ceiling", "FLEET_HEAVY_MAX_SECONDS", "0 no longer means off", "bin/heavy_slots.py is read afresh"):
+            self.assertIn(needle, section)
+        for kind, _c, default in self.FAMILY:
+            self.assertRegex(section, r"\| *%s *\|[^\n]*\b%d\b" % (kind, default), "a table row for the kind %s with its default" % kind)
+            self.assertRegex(section, r"\| *%s *\|[^\n]*\| *[0-9]+ (runs|jobs|samples|holders)?" % kind)
+        self.assertIn("14400", section)
+        self.assertNotIn("default 7200", section)
+
+
 class TestHeavyFifo(unittest.TestCase):
     """Heavy slots in arrival order and the express slot (ask #620). The order file, the lock files and the process table are real or injected, the clock never
     moves on its own, the command is a fake, and every list is bounded; no test waits on a real slot."""
@@ -58191,6 +58494,26 @@ class TestHeavySlots(Base):
             time.sleep(self.READY_PAUSE)
         self.fail("holder %r not ready after %d reads of its record (%.1f s): expected %d ready holder(s) with the command's pid (not the wrapper pids %s), found %s (a '?' is a held lock whose record is not written yet)" % (
             name, max(1, tries), max(1, tries) * self.READY_PAUSE, count, pids, found))
+
+    def test_s9_a_wrapper_killed_with_sigkill_leaves_a_run_that_the_orphan_bound_stops_and_audits(self):
+        """The 2 h 13 min case for real: the watchdog lives in the wrapper, the wrapper is killed, the run keeps the slot; the orphan bound (clock moved past the ceiling)
+        stops the sleeping run and reports it with source orphan. A run whose wrapper is alive is not touched by the same check."""
+        if shutil.which("lsof") is None:
+            self.skipTest("lsof is needed to find what holds the slot")
+        wrapper = self.start("sleep", "300", name="orphan-lane")
+        self.assertTrue(self.until(lambda: any(h["pid"] and h["pid"] != wrapper.pid and h["name"] != "?" for h in self.hs.holders(self.state(), 3)), 120), self.why({"w": wrapper}))
+        held = self.hs.holders(self.state(), 3)[0]
+        later = lambda: time.time() + 4000   # past kind "other" (3600 s)
+        self.assertEqual(self.hs.check_orphans(self.state(), 3, None, later, None, io.StringIO()), [], "the wrapper is alive: its run is not an orphan")
+        os.kill(wrapper.pid, signal.SIGKILL)
+        wrapper.wait(timeout=30)
+        self.assertEqual([h["pid"] for h in self.hs.holders(self.state(), 3)], [held["pid"]], "the run still holds the slot")
+        told = []
+        self.assertEqual(self.hs.check_orphans(self.state(), 3, None, lambda: time.time() + 100, lambda *a: told.append(a), io.StringIO()), [], "under the ceiling: left alone")
+        stopped = self.hs.check_orphans(self.state(), 3, None, later, lambda *a: told.append(a), io.StringIO())
+        self.assertEqual([(s["source"], s["kind"], s["pid"]) for s in stopped], [("orphan", "other", held["pid"])])
+        self.assertEqual((told[0][1], told[0][2]), ("orphan-lane", os.environ.get("FLEET_HEAVY_NAME") or os.environ.get("OPENCODE_SESSION_ID") or os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown"))
+        self.assertTrue(self.until(lambda: not self.hs.holders(self.state(), 3), 30), "the slot is free: the run is gone")
 
     def test_s1_four_callers_of_three_slots_queue_and_the_fourth_runs_when_one_frees(self):
         """The integration check with real processes (the queue logic itself is tested deterministically in TestHeavyQueueLogic)."""
