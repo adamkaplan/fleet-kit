@@ -1534,7 +1534,7 @@ CONFIG_DIR_NAME = "fl" + "eet-switchboard"   # the switchboard's own config dire
 SETTINGS_PATH = None        # a test hook (a module attribute, no environment variable): None means the real path
 SETTINGS_FILE_MAX = 65536
 # The one table of settings: name, required (in the file), kind. Kinds: name (a plain name, list or address), path, command (run as given: a
-# command, never a value), digest-ref (an image reference that ends in @sha256:<64 hex>), number.
+# command, never a value), digest-ref (an image reference that ends in @sha256:<64 hex>), number, secret-name (a vault secret's name), duration (Nm or Nh).
 SETTINGS = (
     ("CW_ALLOWED_REPOS", True, "name"),            # comma-separated OWNER/NAME
     ("CW_TOOLING_REPO", False, "name"),
@@ -1555,6 +1555,8 @@ SETTINGS = (
     ("CW_APP_ID_CMD", False, "command"),
     ("CW_APP_INSTALLATION_CMD", False, "command"),
     ("CW_APP_KEY_CMD", False, "command"),
+    ("CW_CLUSTER_ADMIN_SECRET", False, "secret-name"),   # the NAME of the vault secret that holds the cluster administrator route (default cw-cluster-admin-kubeconfig), never its content
+    ("CW_CLUSTER_TOKEN_DURATION", False, "duration"),    # the cluster token's requested life (default 20m)
     ("CW_VAULT_CHECK_DIR", False, "path"),         # the checkout the vault access check runs from; needed only after a vault firewall refusal (see vault_check_dir_problem)
 )
 SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
@@ -1579,6 +1581,8 @@ _SECRET_NAME = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?")
 _VAULT_NAME = re.compile(r"[A-Za-z][A-Za-z0-9-]{1,22}[A-Za-z0-9]")
 _GUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 _BARE_PROGRAM = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._+-]*")
+_VAULT_SECRET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,126}")   # the vault secret-name grammar: a letter or digit first (the value reaches `az` as `--name <value>`, so it can never look like an option)
+_DURATION = re.compile(r"([0-9]{1,3})([mh])")   # the grammar of the launch wiring's own parse of CW_CLUSTER_TOKEN_DURATION (bin/cloud_worker.py `_duration`)
 _NUMBER = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 _REFUSED_HOSTS = ("metadata.google.internal",)
 _REFUSED_SUFFIX = ".localhost"
@@ -1653,6 +1657,12 @@ def _number_ok(value):
     return bool(_NUMBER.fullmatch(value)) and 0 < float(value) <= 100000
 
 
+def _duration_ok(value):
+    """Stricter than or equal to the launch wiring's `_duration` (a test holds it: whatever this accepts, the wiring accepts; the wiring also strips spaces and takes non-ASCII digits, this does not): 1 to 3 ASCII digits and m or h, from 1 minute to 60 minutes."""
+    m = _DURATION.fullmatch(value)
+    return bool(m) and 1 <= int(m.group(1)) * (60 if m.group(2) == "h" else 1) <= 60
+
+
 # THE table of value rules: one row per setting, the rule's words (shown in a refusal, never the value) and its test. DEFAULT-DENY: a setting with no
 # row is refused, and a test fails when SETTINGS and this table differ. Every value also refuses control characters (checked before this table).
 VALIDATORS = {
@@ -1676,6 +1686,8 @@ VALIDATORS = {
     "CW_APP_ID_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
     "CW_APP_INSTALLATION_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
     "CW_APP_KEY_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_CLUSTER_ADMIN_SECRET": ("a vault secret name: 1 to 127 letters, digits and hyphens, starting with a letter or digit", lambda v: bool(_VAULT_SECRET_NAME.fullmatch(v))),
+    "CW_CLUSTER_TOKEN_DURATION": ("a duration of 1 to 3 digits and m or h, from 1m to 60m (for example 20m or 1h)", _duration_ok),
     "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
 }
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")

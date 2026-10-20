@@ -18,7 +18,8 @@ OPTIONAL_SAMPLES = {"CW_TOOLING_REPO": "acme-org/tooling", "CW_CLOUD_CA_FILE": "
                     "CW_KUBECTL": "kubectl", "CW_MODEL_AUTH_FILE": "/home/user/auth.json", "CW_RUN_RECORD_DIR": "/home/user/runs",
                     "CW_CLOUD_SPEND_CAP_USD": "25", "CW_CLUSTER_TOKEN_CMD": "cat /home/user/token", "CW_CLUSTER_ADMIN_CMD": "cat /home/user/kc",
                     "CW_GIT_TOKEN_CMD": "cat /home/user/git", "CW_APP_ID_CMD": "cat /home/user/id", "CW_APP_INSTALLATION_CMD": "cat /home/user/inst",
-                    "CW_APP_KEY_CMD": "cat /home/user/key", "CW_VAULT_CHECK_DIR": "/home/user/check"}
+                    "CW_APP_KEY_CMD": "cat /home/user/key", "CW_VAULT_CHECK_DIR": "/home/user/check",
+                    "CW_CLUSTER_ADMIN_SECRET": "acme-cluster-admin", "CW_CLUSTER_TOKEN_DURATION": "20m"}
 SAMPLES = {   # one value per secret shape (built here, never a real secret)
     "a JWT": "eyJhbGciOiJIUzI1" + "." + "eyJzdWIiOiJ4eHh4",
     "a PEM header": "-----BEGIN " + "PRIVATE KEY-----",
@@ -62,6 +63,8 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
     "CW_CLUSTER_TOKEN_CMD": ["-x"], "CW_CLUSTER_ADMIN_CMD": ["--x"], "CW_GIT_TOKEN_CMD": ["-x"], "CW_APP_ID_CMD": ["-x"],
     "CW_APP_INSTALLATION_CMD": ["-x"], "CW_APP_KEY_CMD": ["-x"],
     "CW_VAULT_CHECK_DIR": ["check", "/a/../b", "-x"],
+    "CW_CLUSTER_ADMIN_SECRET": ["/home/user/secret", "a b", "a_b", "a.b", "a/b", "a" * 128, "a;b", "$(x)", "a\u00e9", "-x", "--help", "--", "--query", "-", "-a"],
+    "CW_CLUSTER_TOKEN_DURATION": ["-5m", "0m", "61m", "2h", "1000m", "20", "m", "20s", "1.5h", "20 m", "/tmp/20m", "20m5s", "\u0662\u0660m", "-1h", "0h"],
 }
 CONTROL = ["\t", "\x00", "\r", "\x0b", "\x0c", "\x1c", "\x1b", "\x7f", "\x01"]
 
@@ -98,7 +101,7 @@ class Tables(unittest.TestCase):
     def test_every_setting_has_a_known_kind_and_the_samples_cover_the_table(self):
         self.assertEqual({k for k, _, _ in cw.SETTINGS}, set(GOOD) | set(OPTIONAL_SAMPLES))
         self.assertEqual(set(cw.SETTING_REQUIRED), set(GOOD))
-        self.assertLessEqual({kind for _, _, kind in cw.SETTINGS}, {"name", "path", "command", "digest-ref", "number"})
+        self.assertLessEqual({kind for _, _, kind in cw.SETTINGS}, {"name", "path", "command", "digest-ref", "number", "secret-name", "duration"})
         self.assertEqual(len(cw.SETTINGS), len({k for k, _, _ in cw.SETTINGS}))
         self.assertIn(("CW_VAULT_CHECK_DIR", False, "path"), cw.SETTINGS)   # reserved for the pre-check, optional
 
@@ -517,6 +520,234 @@ class Driver(Dir):
         with redirect_stdout(out), redirect_stderr(err):
             code = cw.main(["create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main"], env)
         self.assertEqual(code, 0, err.getvalue())
+
+
+# ---------------------------------------------------------------- S15: the two keys reach the launch wiring exactly as from the environment
+import ast, glob, importlib.util  # noqa: E402
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
+
+
+def load_wiring():
+    """bin/cloud_worker.py (the launch wiring) by path, as the switchboard loads it."""
+    spec = importlib.util.spec_from_file_location("cw_wiring_for_settings_test", os.path.join(ROOT, "bin", "cloud_worker.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class WiringReceivesBoth(Dir):
+    def run_with_file(self, values):
+        wiring = load_wiring()
+        lib = wiring._lib()
+        self.write(body(values))
+        calls = []
+
+        def fake_capture(argv, env=None, feed=None, **kw):
+            calls.append(list(argv))
+            return (0, "fake-admin-config\n", "") if len(calls) == 1 else (0, "t" * 24 + "\n", "")
+        with mock.patch.dict(os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True), mock.patch.object(lib, "SETTINGS_PATH", self.path), \
+                mock.patch.object(wiring, "_capture", fake_capture):
+            source = wiring.use_settings()
+            wiring.cluster_token()
+        return source, calls
+
+    def test_s15_the_file_alone_gives_the_wiring_the_secret_name_and_the_duration(self):
+        source, calls = self.run_with_file(dict(GOOD, CW_CLUSTER_ADMIN_SECRET="acme-cluster-admin", CW_CLUSTER_TOKEN_DURATION="45m"))
+        self.assertEqual(source, self.path)
+        self.assertEqual(calls[0][calls[0].index("--name") + 1], "acme-cluster-admin")
+        self.assertIn("--duration=45m", calls[1])
+
+    def test_s15_the_environment_route_still_gives_the_same_values(self):
+        wiring = load_wiring()
+        calls = []
+
+        def fake_capture(argv, env=None, feed=None, **kw):
+            calls.append(list(argv))
+            return (0, "fake-admin-config\n", "") if len(calls) == 1 else (0, "t" * 24 + "\n", "")
+        env = {"CW_VAULT_SUBSCRIPTION": GOOD["CW_VAULT_SUBSCRIPTION"], "CW_VAULT_NAME": GOOD["CW_VAULT_NAME"],
+               "CW_CLUSTER_ADMIN_SECRET": "acme-cluster-admin", "CW_CLUSTER_TOKEN_DURATION": "45m"}
+        with mock.patch.object(wiring, "_capture", fake_capture):
+            wiring.cluster_token(env)
+        self.assertEqual(calls[0][calls[0].index("--name") + 1], "acme-cluster-admin")
+        self.assertIn("--duration=45m", calls[1])
+
+    def test_s15_a_bad_value_is_refused_through_the_wiring_with_exit_2_naming_the_key_and_no_value(self):
+        wiring = load_wiring()
+        for key, value in (("CW_CLUSTER_ADMIN_SECRET", "/home/user/secret"), ("CW_CLUSTER_ADMIN_SECRET", "acme secret"),
+                           ("CW_CLUSTER_ADMIN_SECRET", "acme\rsecret"), ("CW_CLUSTER_ADMIN_SECRET", "acme\nsecret"), ("CW_CLUSTER_TOKEN_DURATION", "-20m")):
+            with self.subTest(key=key, value=value):
+                self.write(body(dict(GOOD, **{key: value})))
+                with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(wiring._lib(), "SETTINGS_PATH", self.path):
+                    with self.assertRaises(wiring.Refusal) as caught:
+                        wiring.use_settings()
+                text = str(caught.exception)
+                if "\n" not in value:   # a literal newline ends the line: the rest is a second, malformed line (still refused, with no value)
+                    self.assertIn(key, text)
+                for part in ("home/user", "acme secret", "acme", "-20m"):
+                    self.assertNotIn(part, text.replace(self.path, "").replace("acme-cluster", ""))
+
+    def test_s15_the_duration_rule_never_accepts_what_the_wiring_refuses(self):
+        """Derived parity: every string up to length 5 over a small alphabet. DANGEROUS direction (file accepts, wiring refuses) must be empty for all;
+        the other direction (the wiring accepts, the file refuses) is the documented 'stricter' (spaces are stripped by the wiring; a non-ASCII digit)."""
+        import itertools
+        wiring = load_wiring()
+        alphabet = ["0", "1", "2", "6", "9", "m", "h", "s", " ", "-", "\u0662"]
+        dangerous, stricter = [], 0
+        for n in range(0, 6):
+            for chars in itertools.product(alphabet, repeat=n):
+                value = "".join(chars)
+                try:
+                    wiring._duration({"CW_CLUSTER_TOKEN_DURATION": value})
+                    wiring_ok = True
+                except wiring.Refusal:
+                    wiring_ok = False
+                file_ok = cw._duration_ok(value)
+                if file_ok and not wiring_ok:
+                    dangerous.append(value)
+                if wiring_ok and not file_ok and value.strip():
+                    stricter += 1
+        self.assertEqual(dangerous, [])
+        for good in ("1m", "20m", "60m", "1h", "01h", "060m"):   # the other way for what the launcher is documented to take: a unit or a bound dropped dies here
+            self.assertTrue(cw._duration_ok(good), good)
+        self.assertGreater(stricter, 0)   # the documented difference exists (spaces, a non-ASCII digit)
+
+    def test_s15_the_parity_alphabet_kills_each_width_unit_and_bound_mutant(self):
+        wiring = load_wiring()
+        def survives(pattern, bound=60):
+            def ok(v):
+                m = re.fullmatch(pattern, v)
+                return bool(m) and 1 <= int(m.group(1)) * (60 if m.group(2) == "h" else 1) <= bound
+            import itertools
+            for n in range(0, 6):
+                for chars in itertools.product("0126mhs", repeat=n):
+                    v = "".join(chars)
+                    try:
+                        wiring._duration({"CW_CLUSTER_TOKEN_DURATION": v}); w = True
+                    except wiring.Refusal:
+                        w = False
+                    if ok(v) and not w:
+                        return True
+            return False
+        self.assertFalse(survives(r"([0-9]{1,3})([mh])"))
+        self.assertTrue(survives(r"([0-9]{1,4})([mh])"))      # wider
+        self.assertTrue(survives(r"([0-9]{1,3})([mhs])"))     # a unit added
+        self.assertTrue(survives(r"([0-9]{1,3})([mh])", bound=61))   # a bound moved
+
+
+class OptionShaped(Dir):
+    def test_every_row_refuses_a_leading_hyphen_so_no_value_can_become_an_option_in_an_argument_list(self):
+        """Derived from the table: every setting's rule refuses an option-shaped value and a good sample with a hyphen put first. (A superset of the
+        rows that reach a kubectl/az/git/openssl argument list: a new row cannot slip in.)"""
+        samples = {**GOOD, **OPTIONAL_SAMPLES}
+        for key, (rule, check) in cw.VALIDATORS.items():
+            if key == "CW_CLUSTER_ADMIN_SECRET":
+                self.assertFalse(check(""))   # the row itself refuses empty (the generic reader treats an empty value as unset before the row)
+            for value in ("-x", "--help", "--", "--query", "-", "-" + samples[key]):
+                with self.subTest(key=key, value=value):
+                    self.assertFalse(check(value))
+
+
+# ---------------------------------------------------------------- S16: the class: every CW_* name the code reads is a row or on the one list
+# THE list of names the launcher and the launch wiring mention that are deliberately NOT settings, each with its reason.
+NOT_SETTINGS = {
+    # set by the code itself for the pod or a child: never read from the operator
+    "CW_WORKER": "set by the launcher into the pod's environment (the worker's own name); end_hook reads it inside the pod",
+    "CW_REPO": "set by the launcher into the pod's environment from --repo; read back from the pod spec",
+    "CW_BRANCH": "set by the launcher into the pod's environment from --branch",
+    "CW_IDLE_SECONDS": "set by the launcher into the pod's environment from --idle",
+    "CW_HARD_DEADLINE": "set by the launcher into the pod's environment from the hard limit",
+    "CW_AUDIT_RUNTIME_ID": "set by the launcher into the pod's environment (pod/NAME): an identifier, not a choice",
+    "CW_CLOUD_TOKEN_FILE": "set by the launch wiring for its child from the in-memory mint (a private temp file it removes); no operator names it",
+    "CW_WORKDIR": "the pod's own working directory (default /work/repo), read by the hook and the record inside the pod",
+    # the other login kind: a file with CW_CLOUD_SERVER (required) is the token route; these select kubectl's own context instead
+    "CW_KUBE_CONTEXT": "the other login kind (kubectl's own context); a lane with the settings file has the required CW_CLOUD_SERVER and so the token route, and the two never mix",
+    "CW_KUBECONFIG": "the other login kind (a kubeconfig path), see CW_KUBE_CONTEXT",
+    # defaults that a lane does not need to change
+    "CW_CLOUD_SERVICE_ACCOUNT": "the pod's service account, default cw-worker, a name the cluster setup fixes; not changed per lane",
+    "CW_CLOUD_AUDIT": "where the audit file goes, default under the state directory; a lane needs the default, tests and installs move it",
+    "CW_CLOUD_RECORD_DIR": "read-only override of where the reaper looks for the switchboard's records; the reaper's own wiring passes it",
+    "CW_CLOUD_DOMAIN": "the domain in the recorded worker URL (default example.internal); the switchboard reaches the worker by a tunnel, so it is cosmetic",
+    "CW_TOKEN_ENDPOINT": "the pod-side token mint's URL; needed only when no per-run secret carries git access, which `launch --cloud` always does",
+    "CW_RECORD_KEEP_DAYS": "tuning knob with a safe default (30 days)",
+    "CW_RECORD_MAX_BYTES": "tuning knob with a safe default (transcript cap)",
+    "CW_RECORD_SECONDS": "tuning knob with a safe default (how long the record may take)",
+    "CW_RECORD_TIMEOUT": "tuning knob with a safe default (record step limit)",
+    "CW_CREATE_TIMEOUT": "tuning knob with a safe default (900 seconds) of the driver",
+    "CW_HEALTH_TIMEOUT": "tuning knob with a safe default of the driver",
+    "CW_POLL_SECONDS": "tuning knob with a safe default of the driver",
+    "CW_PROGRESS_SECONDS": "tuning knob with a safe default of the driver",
+    "CW_RUN_TIMEOUT": "tuning knob with a safe default of the driver",
+    "CW_TUNNEL_TIMEOUT": "tuning knob with a safe default (30 seconds) of the tunnel wait",
+    # test-only hooks that point a step at a fake
+    "CW_LAUNCHER": "test hook: the driver runs another program as the launcher",
+    "CW_GITHUB_API_BASE": "test hook: points the App mint at a fake GitHub (and is withheld from the preflight child for that reason)",
+    "CW_PREFLIGHT_TOKEN_CMD": "test hook: points the preflight at a fake token command (withheld from the preflight child)",
+    "CW_OPENSSL": "the openssl program, kept only when an absolute executable file; a tooling path of the machine, not a lane choice",
+    "CW_TMPDIR": "where the driver's private temp directory goes; a machine setting, default the system temp directory",
+}
+SOURCES = ["bin/cloud_worker.py"]
+NAME = re.compile(r"CW_[A-Z0-9_]+")
+
+
+def source_files():
+    """The launch wiring and every launcher module (not tests, not the pod's own files); the `cloud-worker` entry is a symlink to cloud_worker.py."""
+    found = [os.path.join(ROOT, f) for f in SOURCES]
+    found += sorted(p for p in glob.glob(os.path.join(ROOT, "cloud", "launcher", "*.py")) if not os.path.islink(p))
+    return found
+
+
+def names_in(text):
+    """Every CW_* name the source mentions as a string constant (an env read, a table row, a name list, a dict key): from the code's AST, never a hand list."""
+    return {n.value for n in ast.walk(ast.parse(text)) if isinstance(n, ast.Constant) and isinstance(n.value, str) and NAME.fullmatch(n.value)}
+
+
+def derived():
+    out = set()
+    for path in source_files():
+        with open(path) as f:
+            out |= names_in(f.read())
+    return out
+
+
+def unaccounted(names, rows=None, listed=None):
+    rows = {k for k, _, _ in cw.SETTINGS} if rows is None else rows
+    listed = set(NOT_SETTINGS) if listed is None else listed
+    return sorted(set(names) - rows - listed)
+
+
+class Complete(unittest.TestCase):
+    def test_s16_every_name_the_code_mentions_is_a_row_or_on_the_one_list(self):
+        self.assertEqual(unaccounted(derived()), [], "add a settings row with a validator, or a reason to NOT_SETTINGS")
+
+    def test_s16_the_source_set_is_not_empty_and_has_both_key_kinds(self):
+        names = derived()
+        self.assertGreater(len(names), 40)
+        self.assertLessEqual({"CW_CLUSTER_ADMIN_SECRET", "CW_CLUSTER_TOKEN_DURATION", "CW_WORKER"}, names)   # one new row, one old row, one listed name
+
+    def test_s16_no_name_is_both_a_row_and_listed_and_every_listed_name_is_still_in_the_code_with_a_reason(self):
+        rows = {k for k, _, _ in cw.SETTINGS}
+        self.assertEqual(sorted(rows & set(NOT_SETTINGS)), [])
+        self.assertEqual(sorted(set(NOT_SETTINGS) - derived()), [], "a stale entry: its name is no longer in the code")
+        self.assertEqual(sorted(k for k, v in NOT_SETTINGS.items() if len(v) < 20), [])
+
+    def test_s16_every_row_is_in_the_code(self):
+        self.assertEqual(sorted({k for k, _, _ in cw.SETTINGS} - derived()), [])   # a row nobody reads is dead
+
+    def test_s16_mutant_a_made_up_environment_read_fails(self):
+        for path in source_files():
+            with self.subTest(path=os.path.basename(path)), open(path) as f:
+                text = f.read() + "\nimport os\n_x = os.environ.get('CW_MADE_UP_SETTING')\n"
+                self.assertEqual(unaccounted(names_in(text)), ["CW_MADE_UP_SETTING"])
+
+    def test_s16_one_mutant_per_member_dropping_a_row_or_a_listing_fails(self):
+        rows = {k for k, _, _ in cw.SETTINGS}
+        for name in sorted(rows):
+            with self.subTest(row=name):
+                self.assertEqual(unaccounted(derived(), rows=rows - {name}), [name])
+        for name in sorted(NOT_SETTINGS):
+            with self.subTest(listed=name):
+                self.assertEqual(unaccounted(derived(), listed=set(NOT_SETTINGS) - {name}), [name])
 
 
 if __name__ == "__main__":
