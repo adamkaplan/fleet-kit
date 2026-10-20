@@ -11,6 +11,7 @@ secret value is read once from an inherited descriptor and goes to kubectl's std
 import argparse
 import base64
 import copy
+import fcntl
 import datetime as dt
 import pwd
 import hashlib
@@ -159,6 +160,10 @@ CREDENTIAL_PATTERNS = [re.compile(p) for p in (
     r"-----BEGIN [A-Z ]*PRIVATE KEY", r"Bearer [A-Za-z0-9._-]{20,}", r"(?i)(client_secret|api[_-]?key)\"\s*:\s*\"[^\"]+")]
 SECRET_ENV_NAME = re.compile(r"(?i)(TOKEN|SECRET|PASSWORD|API_?KEY|CREDENTIAL|^PAT$|_PAT$)")
 ALLOWED_ENV_NAMES = {"CW_TOKEN_ENDPOINT"}  # a URL, not a token
+
+
+class ReaperLocked(Exception):
+    """Another reaper holds the lock, or the lock cannot be taken safely. Raised before any pass."""
 
 
 class CloudError(Exception):
@@ -439,38 +444,8 @@ VAULT_CHECK_MAX_ENTRIES = 200000       # a checkout with more entries than this 
 VAULT_CHECK_SKIP = (".git",)           # the top-level version-control directory is never loaded by the interpreter
 
 
-def _entry_problem(found, what):
-    """One lstat result judged: not a link, owned by the user, not group- or world-writable. Returns a reason or None."""
-    if stat.S_ISLNK(found.st_mode):
-        return "has %s that is a symlink" % what
-    if found.st_uid != os.getuid():
-        return "has %s that is not owned by the user" % what
-    if found.st_mode & 0o022:
-        return "has %s that is group- or world-writable" % what
-    return None
-
-
-def parents_problem(path):
-    """THE walk up from a trusted path (an absolute one): every parent from / down is judged with lstat, never followed: no symlink, owned by root or
-    the user, and not group- or world-writable unless it carries the sticky bit. A reason (never the path) or None. Every trusted path of the vault
-    check (the checkout and the lock's directory) goes through this one function."""
-    parts = [x for x in path.split("/") if x]
-    here = "/"
-    for part in [""] + parts[:-1]:
-        here = os.path.join(here, part) if part else "/"
-        try:
-            found = os.lstat(here)
-        except OSError:
-            return "has a parent that cannot be read"
-        if stat.S_ISLNK(found.st_mode):
-            return "has a parent that is a symlink"
-        if not stat.S_ISDIR(found.st_mode):
-            return "has a parent that is not a directory"
-        if found.st_uid not in (0, os.getuid()):
-            return "has a parent that is owned by another user"
-        if found.st_mode & 0o022 and not found.st_mode & stat.S_ISVTX:
-            return "has a parent that is group- or world-writable"
-    return None
+sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "bin"))   # LAST: the launcher's own modules win a name
+from path_walk import entry_problem as _entry_problem, parents_problem  # noqa: E402  (the one walk, also used by the installer)
 
 
 def vault_check_dir_problem(checkout):
@@ -1517,7 +1492,8 @@ class Launcher:
             if reason:
                 self.last_hook = None
                 try:
-                    res = self.stop(argparse.Namespace(worker=worker, reason=reason), reason)
+                    # by the run's own nonce where the pod carries one: a pod of another run under this name is left whole
+                    res = self.stop(argparse.Namespace(worker=worker, reason=reason, run_id=ann(pod, "run-id") or None), reason)
                     self.reap_results[worker] = {k: res.get(k) for k in ("pushed", "wip_branch", "skipped", "record")}
                     out.append((worker, reason, 0))
                 except CloudError as e:
@@ -1869,26 +1845,90 @@ def _run_id(v):
     return v
 
 
+REAP_FLOOR_SECONDS = 60   # the contract's once a minute: a pass is never further apart than this, whatever --loop says
+
+
+def _reap_exit_line(clock, why):
+    """The ONE line a reaper process writes when it ends: a UTC time and the reason. The reason is built by the caller
+    from a scrubbed message, never from a token or an environment value."""
+    now = clock() if clock else dt.datetime.now(dt.timezone.utc)
+    print("cloud-worker: %s reaper exiting: %s" % (iso(now), why), file=sys.stderr)
+
+
+REAPER_LOCK_ROOT = None   # tests point it at a temporary directory; None means the user's own directory, found where it is used
+
+
+def _lock_root():
+    """The user's lock directory from the password database, never from the environment: where every reaper of one user must agree.
+    Found when a reaper starts, not at import: a user with no password entry gets a reason from the reaper, not a broken launcher."""
+    if REAPER_LOCK_ROOT:
+        return REAPER_LOCK_ROOT
+    try:
+        return os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".local", "state", "cw-cloud", "locks")
+    except KeyError:
+        raise ReaperLocked("this user has no entry in the password database, so the reaper lock directory cannot be found")
+
+
+def reaper_identity(namespace):
+    """What makes two reapers rivals: the same user and the same namespace, and NOTHING about how either logs in (a token file, a kube
+    context, a kubeconfig, a server spelled two ways all reach the same pods). The lock is per user, so the user is the directory."""
+    return "namespace\n" + namespace
+
+
+def reaper_lock(identity, root=None):
+    """The one lock between a user's reapers of one namespace: an exclusive, non-blocking flock on a 0600 file named for a hash of
+    `identity`, in a private per-user directory (from the password database), held for the process's life; the kernel drops it when
+    the process dies, however it dies. Returns the open descriptor. Raises ReaperLocked for a second reaper, a directory or file that
+    is not the user's own, or a link at the path."""
+    directory = root or _lock_root()
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        dinfo = os.stat(directory)
+        if dinfo.st_uid != os.getuid() or dinfo.st_mode & 0o022:
+            raise ReaperLocked("the lock directory %s is not private to this user" % directory)
+        name = "reaper-%s.lock" % hashlib.sha256(identity.encode()).hexdigest()[:16]
+        fd = os.open(os.path.join(directory, name), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as e:
+        raise ReaperLocked("the reaper lock cannot be opened: %s" % e.strerror)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        os.close(fd)
+        raise ReaperLocked("the reaper lock file is not a private regular file of this user")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise ReaperLocked("another reaper holds the lock")
+    return fd
+
+
 def _reap_main(L, a, sleep):
     """The reaper's loop. Whatever ends it writes ONE line saying why (signal, error, or the end of the loop)."""
-    old, why = L._catch_signals(), None
+    old, why, lock = L._catch_signals(), None, None
     try:
+        lock = reaper_lock(reaper_identity(L.kube.ns))   # BEFORE the first pass: two reapers would both run an end hook for one pod
         while True:
             res = L.reap()
             print(json.dumps([dict({"worker": w, "reason": r, "exit": c}, **L.reap_results.get(w, {})) for w, r, c in res]))
             if not a.loop:
                 why = "end of its pass"
                 return EXIT_HOOK if any(c for _, _, c in res) else 0
-            sleep(min(a.loop, 60))  # never slower than the contract's once a minute
+            sleep(min(a.loop, REAP_FLOOR_SECONDS))
     except (Interrupted, KeyboardInterrupt) as e:
         why = "stopped by %s" % (e if isinstance(e, Interrupted) else "interrupt")
         raise
+    except ReaperLocked as e:
+        why = "not started: %s" % e
+        print("cloud-worker: %s" % e, file=sys.stderr)
+        return EXIT_REFUSED
     except BaseException as e:
         why = "error: %s" % L.kube.scrub(e, 200)
         raise
     finally:
+        if lock is not None:
+            os.close(lock)
         L._restore_signals(old)
-        print("cloud-worker: %s reaper exiting: %s" % (iso(L.clock()), why), file=sys.stderr)   # reason and UTC time, once
+        _reap_exit_line(L.clock, why)   # reason and UTC time, once
 
 
 def main(argv=None, env=None, clock=None, sleep=time.sleep):
@@ -1905,6 +1945,8 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
             print("cloud-worker: %s" % e, file=sys.stderr)
             return e.code
     if not token_mode(env) and not (env.get("CW_KUBE_CONTEXT") or "").strip():
+        if a.cmd == "reap":
+            _reap_exit_line(clock, "cluster login failed: no login is set (CW_KUBE_CONTEXT or the token-file settings)")
         print("cloud-worker: CW_KUBE_CONTEXT is not set; refusing to run (the active kubectl context is never used)", file=sys.stderr)
         return EXIT_USAGE
     kube = None
@@ -1917,6 +1959,8 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
         print(result["report"] if a.cmd == "report" and not a.json else json.dumps(result, sort_keys=True))
         return 0
     except CloudError as e:
+        if a.cmd == "reap" and kube is None:   # Kube() itself refused: the login (token file, server, kubeconfig) failed
+            _reap_exit_line(clock, "cluster login failed: %s" % scrub(e, (), 200))
         print("cloud-worker: %s" % (kube.scrub(e, 1500) if kube else scrub(e, (), 1500)), file=sys.stderr)
         return e.code
     except (Interrupted, KeyboardInterrupt):

@@ -7,6 +7,17 @@ Launcher, reaper, end hook and token mint for cloud workers, built to `docs/clou
   (default `~/.local/state/cw-cloud/audit.jsonl`, mode 0600). `reap` is one pass (or `--loop SECONDS`, never slower
   than 60); run it from a cron-like scheduler. It stops a pod past its hard deadline, or idle (not busy, last
   activity older than the idle time, read by `kubectl exec <pod> -- cw-worker-activity`; an unreadable answer is not a reason to stop).
+  **Managed reaper (opt-in).** The installer's `--with-cloud-reaper` option writes and loads a service from the two
+  reaper templates under `templates/` (a macOS LaunchAgent or a systemd user unit; the steps are in
+  `docs/cloud-operator-quickstart.md`): it runs `cloud-worker reap --loop 60` at login, restarts after any exit (30 s apart, so a
+  crash loop cannot spin) and logs under the switchboard state directory (`cloud-reaper-stderr.log`). It is opt-in, like the
+  heartbeat's service, because it needs a cluster login this machine may not have; the default install does not touch it, and the
+  installer's uninstall removes it. The template holds no secret: the installer copies only the non-secret `CW_*` settings it finds
+  in its own environment (names and file paths, never a token; a password in a URL is refused) and the reaper reads the operator's
+  token FILE by path. After the private settings file lands, the reaper reads it as the launcher does. Every ending writes one line
+  `<UTC time> reaper exiting: WHY`: end of its pass, stopped by a signal, stopped by an interrupt, an error (a crash in a pass), or
+  `cluster login failed: ...` (a login failure exits non-zero). A restarted reaper stops by name and finds no pod for one the last
+  pass already stopped, so nothing is stopped twice. Only one reaper runs at a time: it takes an exclusive lock (a 0600 file named for the user's namespace in `~/.local/state/cw-cloud/locks`, found through the password database, so a different audit file, state directory or login (a token file, a kube context, a kubeconfig) is still a rival; one user runs one reaper per namespace. The lock directory itself is checked for owner and mode, its parents are not walked, which is adequate for a lock) before its first pass and a second one exits at once with `not started: another reaper holds the lock` (the kernel drops the lock when a holder dies, however it dies). A stop uses the pod's own run id where the pod carries one. The installer writes the service file only when the target is a plain file of the user's own (never through a symlink), by temp file and rename, and its uninstall removes only a file the template makes (a regular file of the user's own with other content is overwritten by install, by rename, as the installer's own path; a symlink, a non-regular file, a foreign or group-writable file is refused). Path settings must be absolute paths of plain characters. A `path_walk` earlier on `sys.path` (the launcher directory or `PYTHONPATH`) would win over the kit's: that is the same user's own environment, not a boundary. While the Mac sleeps the reaper pauses.
 - `end_hook.py`, installed in the image as `cw-end-hook`: WIP commit, push to `<worker>/wip`, one JSON line.
 - `token_mint.py`, installed as `cw-token-mint`: mints a token at start and on demand, refuses more than 3600 s,
   writes it to a tmpfs file only.
