@@ -241,7 +241,9 @@ def health_write(engine, state, now):
         state = state if state is not None else getattr(engine, "ci_record_state", None)
         recorder.ingest_prs(getattr(state, "pr_state", None))
         records = load_health_records()
-        body = recorder.body(records.read_tool_file(engine.state_dir), light=bool((getattr(engine, "config", None) or {}).get("v2_light")), watched=health_watched_repos(engine.state_dir))
+        listed = registry_read(engine.state_dir)   # the records are a view of the registry: only its agents' sessions; a read that is not whole drops nothing
+        body = recorder.body(records.read_tool_file(engine.state_dir), light=bool((getattr(engine, "config", None) or {}).get("v2_light")), watched=health_watched_repos(engine.state_dir),
+                             retired_sessions={r.get("session") for r in listed["retired"].values() if r.get("session")} if listed["whole"] else None)
         state_write(Path(engine.state_dir) / records.FILE, json.dumps(body, sort_keys=True), _without(body, "written_at"), HEARTBEAT_PR_STATE, nofollow=True)
     except Exception as err:
         _health_fault(engine, "write", err)
@@ -346,7 +348,7 @@ DEFAULTS = {
     "cpu_guard": None,             # load over cores and swap: None = defaults (high_ratio 3 for 5 minutes, swap_percent 90 for 5 minutes, each wakes the Chief of Staff once per episode); false = off; or {"high_ratio": n, "minutes": n, "swap_percent": n, "swap_minutes": n}
     "disk_guard": None,            # free space of the state directory's volume: None = defaults (min_free_gb 50, hard_free_gb 10); false = off; or {"min_free_gb": n, "hard_free_gb": n}
     "reds": None,                  # `reds` (#342): {"reference_events": {"owner/repo": ["merge_group", "schedule"]}, "workflow": {"owner/repo": "ci.yml"}}: the events whose runs on the default branch are "main's runs" (default: push), and an optional override of the workflow (default: the one that holds the pull request's artifact)
-    "heavy": None,                 # CPU slots for `heavy -- <command>` (full suites, e2e runs): None = 3 slots; or {"slots": n}
+    "heavy": None,                 # CPU slots for `heavy -- <command>` (full suites, e2e runs): None = 3 slots; or {"slots": n, "ceilings": {"full": s, "focused": s, "e2e": s, "other": s, "max": s}}
     "docker_reaper": True,         # the daily removal of EXPIRED labelled docker containers, networks and volumes (`disk reap-docker`): false is the kill switch
     "v2_events": "auto",           # the daemon's news of sessions: "auto" (the service's event stream, where the HTTP route exists; reads only what an event did not say) or "off" (the old reads)
     "v2_plugin_events": "auto",    # the in-service plugin's pushed facts (#290 slice 6): "auto" (the daemon listens on its socket and marks the named session for one bounded read) or "off" (the session.list gate is the only signal)
@@ -2997,6 +2999,47 @@ class TempJanitorFacts:
             engine._note("janitor.error", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
 
 
+HEAVY_ORPHAN_INTERVAL = 60   # seconds between the daemon's looks for a run whose wrapper is gone
+
+
+class HeavyOrphanFacts:
+    """The daemon's look for orphaned heavy runs (ask #930): a run that keeps a slot after its wrapper (and so its watchdog) died is stopped past its ceiling, counted from
+    the slot's own start time, and audited like a wrapper's stop (`bin/heavy_slots.py check_orphans`). Once per `HEAVY_ORPHAN_INTERVAL`, on a thread (lsof and the grace
+    may take seconds: a pass never waits); returns no facts. `bin/heavy_slots.py` is loaded once by the daemon (a restart installs a change for this look); every `heavy` run loads it afresh."""
+
+    __name__ = "heavy_orphan_facts"
+
+    def __init__(self):
+        self.engine, self.thread, self.last = None, None, None
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def __call__(self):
+        engine = self.engine
+        if engine is None or engine.state_dir is None or getattr(engine, "temp_janitor_runner", None) is None:   # only the real daemon: a test engine and a command line have none
+            return []
+        if self.thread is not None and self.thread.is_alive():
+            return []
+        now = engine.now()
+        if self.last is not None and now - self.last < HEAVY_ORPHAN_INTERVAL:
+            return []
+        self.last = now
+        self.thread = threading.Thread(target=self._run, args=(engine,), name="heavy-orphans", daemon=True)
+        self.thread.start()
+        return []
+
+    def _run(self, engine):
+        try:
+            import io
+            module = load_heavy_slots()
+            config = engine.config.get("heavy")
+            reporter = heavy_stop_reporter(module, config, lambda: engine, engine.actor)
+            module.check_orphans(engine.state_dir, module.settings(config), config, time.time, reporter, io.StringIO())
+        except Exception as err:   # a look never stops the daemon
+            engine._note("heavy.orphan_check_error", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
+
+
 class Fact:
     """Something one fleet agent should be told.
 
@@ -3106,7 +3149,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), PlanWakeFacts(), AlertWakeFacts(), JobFacts(), PaneFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), PlanWakeFacts(), AlertWakeFacts(), JobFacts(), PaneFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts(), HeavyOrphanFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -6707,26 +6750,50 @@ def known_agent(state_dir, name, known=None):
 
 def known_session(state_dir, name, known):
     """The session of a fleet agent: the pane record's, else the retired record's."""
-    return known_agent(state_dir, name, known).get("session") or (read_retired(state_dir).get(name) or {}).get("session")
+    found = known_agent(state_dir, name, known).get("session")
+    return found or (registry_retired(state_dir).get(name) or {}).get("session")
 
 
 def read_retired(state_dir):
-    """The retired map, from the registry (`retired.json` is derived output of it now); a registry that is not whole reads as empty (display only)."""
-    return {k: v for k, v in load_module("registry").read(state_dir)["retired"].items() if isinstance(v, dict)}
+    """The retired map from the registry, the name `reassign.py` loads (display only: a registry that is not whole reads as empty). The same read as `registry_retired`."""
+    return registry_retired(state_dir)
 
 
 class RetiredUnreadable(Exception):
-    """retired.json exists but cannot be read as the {name: record} map it is (#372): for the tester gate that is NOT the same as an empty list."""
+    """The registry cannot be read whole (#372): for the tester gate that is NOT the same as an empty list of retired agents."""
+
+
+def registry_read(state_dir):
+    """THE read of the agent list: `registry.read` (docs/agent-registry.md, sec. 1), the one source every view uses. Never raises: a registry that cannot
+    be loaded or read is a read that is not whole ({"whole": False, "agents": {}, "retired": {}, "problem": ...}); a caller that ACTS on the list acts
+    only when `whole` is true (#805). `retired` is {name: record} (an additive field of the read)."""
+    try:
+        got = load_module("registry").read(str(state_dir))
+    except Exception as err:   # the module is missing or broken: nothing is read, and the problem is said
+        return {"whole": False, "version": 0, "agents": {}, "retired": {}, "problem": "the agent registry cannot be read: %s" % _one_line(str(err), 120)}
+    got = got if isinstance(got, dict) else {}
+    return {"whole": got.get("whole") is True, "version": got.get("version") or 0,
+            "agents": {n: a for n, a in (got.get("agents") or {}).items() if isinstance(a, dict)},
+            "retired": {n: r for n, r in (got.get("retired") or {}).items() if isinstance(r, dict)},
+            "problem": got.get("problem")}
+
+
+def registry_retired(state_dir):
+    """{name: retired record} from the registry: a display's read (a read that is not whole lists nobody)."""
+    return registry_read(state_dir)["retired"]
 
 
 def read_retired_strict(state_dir):
-    """The retired map, or RetiredUnreadable. A registry that is MISSING is an empty map (nobody retired); one that is not whole (corrupt, newer version,
-    unreadable) raises. `read_retired` reads all of those as empty, which is right for a display but would let a retired tester record verdicts again:
-    the verdict authority (launch-record testers) uses this one and fails closed."""
-    reg = load_module("registry").read(state_dir)
-    if not reg["whole"]:
-        raise RetiredUnreadable(reg["problem"] or "the agent registry cannot be read")
-    return {k: v for k, v in reg["retired"].items()}
+    """The name the adoption and close code loads: the same strict read as `registry_retired_strict`."""
+    return registry_retired_strict(state_dir)
+
+
+def registry_retired_strict(state_dir):
+    """As `registry_retired`, but a read that is not whole raises RetiredUnreadable: the verdict authority fails closed (#372)."""
+    got = registry_read(state_dir)
+    if not got["whole"]:
+        raise RetiredUnreadable(got["problem"] or "the agent registry is not whole")
+    return got["retired"]
 
 
 def _prune_last_reports(data):
@@ -7123,9 +7190,11 @@ def pane_health_status_lines(state_dir, now=None):
     """The `status` lines for detached or dead agents (nothing when every pane is attached or unknown)."""
     if state_dir is None:
         return []
-    data = read_pane_health(state_dir)
-    retired = read_retired(state_dir)
-    bad = [(n, v) for n, v in sorted(data["states"].items()) if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in retired]
+    seen = registry_read(state_dir)
+    if not seen["whole"]:
+        return ["      panes      the agent registry could not be read (%s): no pane state shown" % _one_line(str(seen["problem"]), 120)]
+    retired = seen["retired"]
+    bad = [(n, v) for n, v in sorted(seen["agents"].items()) if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in retired]
     clock = time.time() if now is None else now
     last = _read_small(state_dir, LAST_REPORT_FILE)
     gone = [n for n, v in sorted(retired.items()) if clock - (v.get("at") or 0) <= RETIRED_SHOW_DAYS * 86400]
@@ -7294,8 +7363,11 @@ def verify_account(engine, runner, fleet):
 def cmd_reattach_all(args, runner, now, socket_call=None):
     """`reattach --all-detached`: every agent the daemon found detached or dead, one by one; each failure is said and the rest continue."""
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
-    retired = read_retired(state)
-    names = sorted(n for n, v in read_pane_health(state)["states"].items() if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in retired)
+    listed = registry_read(state)   # the same list `status` shows: the registry's agents that are detached or dead (never pane-health.json); a read that is not whole acts on nothing
+    if not listed["whole"]:
+        sys.stderr.write("%s: the agent registry could not be read (%s): nothing reattached\n" % (PROG, _one_line(str(listed["problem"]), 120)))
+        return EXIT_ERROR
+    names = sorted(n for n, v in listed["agents"].items() if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in listed["retired"])
     if not names:
         print("no agent is detached or dead")
         return EXIT_OK
@@ -7745,7 +7817,7 @@ def cmd_retire(args, runner, now):
     if not NAME_RE.match(name or ""):
         raise LaunchError("name the agent: `%s retire <name>`" % PROG)
     discovery = engine.discover(engine.now())
-    hint = ((read_retired(state).get(name) or {}).get("session") if args.undo else None)   # a retired headless worker is not discovered: its boss is found from its stored session
+    hint = ((registry_retired(state).get(name) or {}).get("session") if args.undo else None)   # a retired headless worker is not discovered: its boss is found from its stored session
     who = reattach_caller_problem(engine, runner, now, discovery, name, hint, lost_headless=not args.undo)
     if who:
         if engine.audit is not None:
@@ -8022,10 +8094,13 @@ def worktree_session_in_use(engine, root):
     from an incomplete (too long) list; a session missing from a complete list is gone and is no one's directory."""
     if engine.state_dir is None:
         return None
-    retired = read_retired(engine.state_dir)
+    seen = registry_read(engine.state_dir)
+    if not seen["whole"]:
+        return "cannot read the agent registry (%s): cannot say no session runs in it" % _one_line(str(seen["problem"]), 80)
+    retired = seen["retired"]
     known = {}
-    for name, info in load_module("registry").read(engine.state_dir)["agents"].items():   # the registry's local agents (a cloud worker's session is not in the local service)
-        if isinstance(info, dict) and isinstance(info.get("session"), str) and (info.get("kind") or "local") == "local":
+    for name, info in seen["agents"].items():   # the registry's local agents (a cloud worker's session is not in the local service)
+        if isinstance(info.get("session"), str) and (info.get("kind") or "local") == "local":
             known[name] = info["session"]
     for name, obs in (getattr(getattr(engine, "discovery", None), "agents", None) or {}).items():
         if getattr(obs, "session_id", None):
@@ -8133,7 +8208,7 @@ def cmd_disk_reclaim_worktrees(args, runner, now):
             raise LaunchError("refused: only the operator or the Chief of Staff may --apply a worktree reclaim (%s is %s)" % (kind[1], "an agent" if kind[0] == "agent" else "not known"))
         if not worktree_config(config)["enabled"]:
             raise LaunchError("worktree reclaim is switched off (worktree_reclaim.enabled is false)")
-    retired = read_retired(state)
+    retired = registry_retired(state)
     registry = read_worktrees(state)
     todo = {p: e for p, e in registry.items() if isinstance(e, dict) and e.get("agent") in retired}
     removed = kept = 0
@@ -8425,7 +8500,7 @@ def bare_pane_context(engine, discovery, pane, now):
     entry = next((p for p in engine.herdr.pane_list() if isinstance(p, dict) and p.get("pane_id") == pane), None)
     held = [a for a in engine.herdr.agent_list() if isinstance(a, dict) and a.get("pane_id") == pane]
     processes = engine.herdr.pane_process_info(pane) if entry is not None else []
-    health = read_pane_health_strict_agents(engine.state_dir)
+    health = registry_agents_strict(engine.state_dir)   # the registry, never pane-health.json: a pane an agent holds is its pane
     worktrees = {os.path.realpath(p) for p in read_worktrees(engine.state_dir)}   # the REGISTERED worktrees only: an agent's own cwd is often the repo root the owner works in too
     window = engine.config.get("retire_idle_minutes")
     window = window if retire_idle_window_ok(window) else BARE_IDLE_DEFAULT_MINUTES
@@ -8433,22 +8508,12 @@ def bare_pane_context(engine, discovery, pane, now):
             "window": window, "now": now, "seen": (_read_small(engine.state_dir, BARE_PANES_FILE).get(pane) or None)}
 
 
-def read_pane_health_strict_agents(state_dir):
-    """pane-health.json for the close-pane guards: unreadable or damaged raises HerdrError (refuse), a missing file is no agents."""
-    try:
-        with open(str(Path(state_dir) / PANE_HEALTH_FILE), "rb") as handle:
-            raw = handle.read(1000001)
-    except FileNotFoundError:
-        return {"agents": {}}
-    except OSError as err:
-        raise HerdrError("unreadable", "%s cannot be read: %s" % (PANE_HEALTH_FILE, getattr(err, "strerror", None) or type(err).__name__)) from None
-    try:
-        data = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeError):
-        raise HerdrError("unreadable", "%s is not valid JSON" % PANE_HEALTH_FILE) from None
-    if not isinstance(data, dict) or not isinstance(data.get("agents"), dict) or not all(isinstance(v, dict) for v in data["agents"].values()):
-        raise HerdrError("unreadable", "%s is not a pane-health record" % PANE_HEALTH_FILE)
-    return data
+def registry_agents_strict(state_dir):
+    """The registry's agents for the close-pane guards: a read that is not whole raises HerdrError (refuse); a missing registry is no agents."""
+    got = registry_read(state_dir)
+    if not got["whole"]:
+        raise HerdrError("unreadable", "the agent registry cannot be read: %s" % _one_line(str(got["problem"]), 120))
+    return {"agents": got["agents"]}
 
 
 def bare_pane_problem(engine, discovery, pane, now):
@@ -8561,7 +8626,7 @@ def cmd_read(args, runner, now):
 
 def watch_problem(engine, state, name, discovery):
     """None when `watch` may open a terminal on `name`, else one line: the worker is unknown or retired, or a terminal already runs it (named)."""
-    if name in read_retired(state):
+    if name in registry_retired(state):
         return "%s is retired (a finished worker): nothing to watch" % name
     seen = discovery.agents.get(name)
     if seen is None:
@@ -8580,7 +8645,7 @@ def cmd_watch(args, runner, now, socket_call=None):
     if not NAME_RE.match(name or ""):
         raise LaunchError("name the worker: `%s watch <name>`" % PROG)
     discovery = engine.discover(engine.now())
-    if name in read_retired(state):   # said first: a retired worker is not discovered, so the caller rule could only say "not your worker"
+    if name in registry_retired(state):   # said first: a retired worker is not discovered, so the caller rule could only say "not your worker"
         raise LaunchError("refused: %s is retired (a finished worker): nothing to watch" % name)
     who = reattach_caller_problem(engine, runner, now, discovery, name)
     if who:
@@ -9131,13 +9196,18 @@ def _guard_last_report(w):
     return []
 
 
+def _label_names(labels):
+    return {(l.get("name") if isinstance(l, dict) else l) for l in (labels or [])}
+
+
 def _guard_awaiting_issue(w):
-    return ["an awaiting label on the issue"] if w.issue_labels & w.awaiting else []
+    return ["an awaiting label on the issue" if r["number"] == w.issue else "an awaiting label on #%d" % r["number"]
+            for r in w.issues if _label_names(r.get("labels")) & w.awaiting]
 
 
 def _guard_awaiting_pr(w):
     return ["an awaiting label on pull request #%d" % r["number"] for r in w.mine
-            if {(l.get("name") if isinstance(l, dict) else l) for l in (r.get("labels") or [])} & w.awaiting]
+            if _label_names(r.get("labels")) & w.awaiting]
 
 
 def _guard_ci(w):
@@ -9174,7 +9244,7 @@ def _guard_reminder(w):
     except ReminderError:
         raise _Unread() from None   # an unreadable file, or a reminder with no readable time (read_reminders refuses it): fails toward saying nothing
     for reminder in reminders:
-        if (reminder.get("to") == w.observation.name and reminder.get("issue") == w.issue and reminder["at"] > w.now
+        if (reminder.get("to") == w.observation.name and _is_issue_number(reminder.get("issue")) and reminder["issue"] in w.numbers and reminder["at"] > w.now
                 and "while_running" not in (reminder.get("condition") or {})):   # the checkpoint `launch` sets is the boss's, not the worker waiting
             return ["it set a reminder for later"]
     return []
@@ -9184,7 +9254,7 @@ def _guard_decision(w):
     body = read_decisions_file(w.engine.state_dir / DECISIONS_FILE)
     if body is None:
         raise _Unread()
-    refs = {(w.key, w.issue)} | {(w.key, r["number"]) for r in w.mine}
+    refs = {(w.key, n) for n in w.numbers} | {(w.key, r["number"]) for r in w.mine}
     for d in body["decisions"]:
         if not isinstance(d, dict):
             continue
@@ -9192,6 +9262,98 @@ def _guard_decision(w):
         if d.get("tier", "human") == "human" and ref and (plan_ledger.normal_repo(ref[0]), ref[1]) in refs:
             return ["a decision waits on the owner"]
     return []
+
+
+def _owned_issue(ctx):
+    return [r for r in ctx.records if isinstance(r, dict) and r.get("number") == ctx.issue and "pull_request" not in r][:1]
+
+
+def _owned_work_items(ctx):
+    """The issues below the assignment through the parent links of the issue list: a visited set and a depth bound make a cycle end the walk."""
+    plain = [r for r in ctx.records if isinstance(r, dict) and isinstance(r.get("number"), int) and "pull_request" not in r]
+    found, seen, frontier = [], {ctx.issue}, {ctx.issue}
+    for _ in range(TRIAGE_ANCESTOR_DEPTH):   # the one bound on parent links (defined with the triage walk below; read at call time)
+        nxt = set()
+        for r in plain:
+            parent, url = parent_of(r), r.get("parent_issue_url")
+            if r["number"] in seen or parent not in frontier or (isinstance(url, str) and not re.search(r"/repos/%s/issues/" % re.escape(ctx.key), url, re.I)):
+                continue   # another repository's parent is not this assignment's
+            found.append(r)
+            seen.add(r["number"])
+            nxt.add(r["number"])
+        frontier = nxt
+        if not frontier:
+            break
+    return found
+
+
+def _owned_pulls(ctx):
+    return [r for r in ctx.pulls if isinstance(r, dict) and isinstance(r.get("number"), int) and any(
+        isinstance(ref, list) and ref[1] in ctx.numbers and plan_ledger.normal_repo(ref[0] or ctx.repo) == ctx.key for ref in pr_body_refs(r.get("body")))]
+
+
+# #874: THE table of what a worker owns: kind -> (where the daemon already holds it, the builder). `worker_owned` LOOPS OVER it in this order (a
+# later kind may read the numbers of the earlier ones), so a kind cannot exist in code and not here; the tests are parametrised over it.
+OWNED_KINDS = {
+    "issue": ("the assignment's issue, from the triage issue list", _owned_issue),
+    "work item": ("its sub-issues at any depth (bounded, cycle-safe), from the same list's parent links", _owned_work_items),
+    "pull request": ("every open pull request whose strict references (pr_body_refs) name the assignment or a work item, any base branch, from the open-pull-request list", _owned_pulls),
+}
+
+
+def worker_owned(records, pulls, issue, repo):
+    """#874: THE one function that says what a worker owns, from lists the daemon already holds (no read): `issues` (the assignment first, then its
+    work items), `pulls` (every open pull request naming any of them through a strict reference, whatever its base branch) and `numbers`. None when
+    the assignment is not in the list (not judged). The caller has already checked that the lists were read whole."""
+    ctx = types.SimpleNamespace(records=records, pulls=pulls, issue=issue, repo=repo, key=plan_ledger.normal_repo(repo), numbers=set())
+    found = {}
+    for kind, (_, build) in OWNED_KINDS.items():
+        found[kind] = build(ctx)
+        if kind != "pull request":
+            ctx.numbers |= {r["number"] for r in found[kind]}
+        if kind == "issue" and not found[kind]:
+            return None
+    return types.SimpleNamespace(issues=found["issue"] + found["work item"], numbers=ctx.numbers, pulls=found["pull request"])
+
+
+def _readable_time(r):
+    return parse_iso(r.get("updated_at")) is not None
+
+
+def _readable_head(r):
+    head = r.get("head")
+    return isinstance(head, dict) and isinstance(head.get("sha"), str) and bool(head["sha"])
+
+
+# #874: THE table of what must be readable on what a worker owns before a rule may judge it: member -> (which owned items, the check). `owned_readable`
+# LOOPS OVER it, so a member cannot be checked in code and not here; the tests are parametrised over it, each member in each position of the list.
+OWNED_READABLE = {
+    "assignment time": (lambda owned: owned.issues[:1], _readable_time),
+    "work item time": (lambda owned: owned.issues[1:], _readable_time),
+    "pull request head": (lambda owned: owned.pulls, _readable_head),
+    "pull request time": (lambda owned: owned.pulls, _readable_time),
+}
+
+
+def owned_readable(owned):
+    """True when every member of OWNED_READABLE reads on every owned item it covers (default-deny: one bad item anywhere is not readable)."""
+    return all(check(r) for select, check in OWNED_READABLE.values() for r in select(owned))
+
+
+# #874: every consumer of `worker_owned` and what it takes from the set. The two rules and every row of WAITING_GUARDS; a completeness test fails when
+# one is added to the code without a row here.
+WORKER_OWNED_CONSUMERS = {
+    "stalled-working": "the newest movement of every owned issue and pull request, and the head of each owned pull request",
+    "idle-at-a-seam": "the waiting verdict only",
+    "last-report": "nothing from the set (the report record only)",
+    "awaiting-issue": "an awaiting label on any owned issue",
+    "awaiting-pr": "an awaiting label on any owned pull request",
+    "ci": "CI running at the head of any owned pull request",
+    "review-requested": "a review requested on any owned pull request",
+    "review-window": "any owned pull request younger than the review window",
+    "reminder": "a reminder for the worker naming any owned issue",
+    "decision": "a human decision on any owned issue or pull request",
+}
 
 
 # #816: THE table of waiting guards: name -> (needs the daemon's lists, check). The predicate LOOPS OVER it, so a guard cannot exist in code and
@@ -9217,10 +9379,11 @@ def legitimately_waiting(engine, observation, issue, repo, last):
     one is requested on a non-draft pull request, or such a pull request is younger than `review_window_minutes` (the list holds no reviews, so
     "no review yet" is the window). Without the daemon's whole lists (a repository outside `plan_gates` never gets its open-PR list read) the
     answer is "unread": both rules are silent there, by the read-whole rule."""
-    out = types.SimpleNamespace(state="unread", reason="", codes=[], issue_at=None, pr=None, number=None, head=None, pr_at=None)
+    out = types.SimpleNamespace(state="unread", reason="", codes=[], issue_at=None, pr=None, number=None, head=None, pr_at=None,
+                                issues=[], pulls=[], heads={})
     now, key = engine.now(), plan_ledger.normal_repo(repo)
-    w = types.SimpleNamespace(engine=engine, observation=observation, issue=issue, repo=repo, key=key, last=last, now=now, mine=[], issue_labels=set(),
-                              awaiting=set(), state=getattr(engine, "ci_record_state", None), window=engine.config.get("review_window_minutes", 60) * 60)
+    w = types.SimpleNamespace(engine=engine, observation=observation, issue=issue, repo=repo, key=key, last=last, now=now, mine=[],
+                              awaiting=set(), issues=[], numbers={issue}, state=getattr(engine, "ci_record_state", None), window=engine.config.get("review_window_minutes", 60) * 60)
     found = []
     def run(early):
         for name, (needs, check) in WAITING_GUARDS.items():
@@ -9240,22 +9403,21 @@ def legitimately_waiting(engine, observation, issue, repo, last):
             return out   # an open-PR list that is not being re-read is no evidence
         units = getattr(getattr(engine, "triage", None), "units", None) or {}
         records = (units.get((repo, "issues")) or {}).get("data") or []
-        item = next((r for r in records if isinstance(r, dict) and r.get("number") == issue and "pull_request" not in r), None)
-        out.issue_at = parse_iso(item.get("updated_at")) if item else None
-        if item is None or out.issue_at is None:
-            return out
         pulls = ((getattr(w.state, "lists", None) or {}).get(key) or (0, []))[1]
-        w.mine = [r for r in pulls if isinstance(r, dict) and isinstance(r.get("number"), int)
-                  and any(isinstance(ref, list) and ref[1] == issue and plan_ledger.normal_repo(ref[0] or repo) == key for ref in pr_body_refs(r.get("body")))]
-        pr = max(w.mine, key=lambda r: parse_iso(r.get("updated_at")) or 0, default=None)   # the newest-moved one when several name the issue
-        if pr is not None:
-            out.pr, out.number = pr, pr["number"]
-            out.head = (pr.get("head") or {}).get("sha") if isinstance(pr.get("head"), dict) else None
-            out.pr_at = parse_iso(pr.get("updated_at"))
-            if not isinstance(out.head, str) or out.pr_at is None:
-                return out
+        owned = worker_owned(records, pulls, issue, repo)
+        if owned is None:
+            return out
+        w.issues, w.numbers, w.mine = owned.issues, owned.numbers, owned.pulls
+        if not owned_readable(owned):
+            return out   # an owned item whose time or head cannot be read is an input not read whole: not judged
+        out.issue_at = max(parse_iso(r.get("updated_at")) for r in owned.issues)
+        out.issues, out.pulls = owned.issues, owned.pulls
+        stamps = [(parse_iso(r.get("updated_at")), r["number"], r["head"]["sha"]) for r in owned.pulls]
+        if stamps:
+            out.pr_at, out.number, out.head = max(stamps)   # the newest-moved one when several are owned
+            out.pr = next(r for r in owned.pulls if r["number"] == out.number)
+            out.heads = {n: h for _, n, h in stamps}
         w.awaiting = triage_awaiting_labels(engine)
-        w.issue_labels = {(l.get("name") if isinstance(l, dict) else l) for l in (item.get("labels") or [])}
         run(False)
     except _Unread:
         out.state = "unread"
@@ -9330,7 +9492,7 @@ class WorkerFacts:
         self.requests = []       # PR 14: the pending requests of every blocked agent in the last call (decisions)
         self._summaries = {}     # (session, idle ms) -> text; a cache, rebuilt after a restart
         self._stops = {}         # (session, idle ms) -> the facts of that stop (PR 13); a cache, rebuilt likewise
-        self._heads = {}         # #811: worker -> (the pull request head last seen, when a change of it was seen); memory only
+        self._heads = {}         # #811, #874: worker -> {owned pull request number: (the head last seen, when a change of it was seen)}; memory only
         self._no_forms = False   # v2 does not know the form operation (UNVERIFIED name)
 
     def bind(self, engine):
@@ -9413,7 +9575,7 @@ class WorkerFacts:
             return []
         if not self.seam_applies(observation, issue):
             return []   # #793: only a coder or tester on a work item or an ask; anything not readable fails toward not nudging
-        kept = read_retired(state_dir).get(observation.name)
+        kept = registry_retired(state_dir).get(observation.name)
         if kept is not None and kept.get("session") in (None, observation.session_id):
             return []   # retired on purpose
         last = _read_small(state_dir, LAST_REPORT_FILE).get(observation.name)
@@ -9452,7 +9614,7 @@ class WorkerFacts:
         last = _read_small(state_dir, LAST_REPORT_FILE).get(observation.name)
         if not isinstance(last, dict) or last.get("state") != "working" or not _is_number(last.get("work_since")) or not isinstance(last.get("work_n"), int):
             return []   # a blocked, question or closing report (or none) is not this case
-        kept = read_retired(state_dir).get(observation.name)
+        kept = registry_retired(state_dir).get(observation.name)
         if kept is not None and kept.get("session") in (None, observation.session_id):
             return []
         repo = _fleet_repo(observation.fleet, engine.config) or engine.config.get("intent_repo")
@@ -9469,10 +9631,13 @@ class WorkerFacts:
             return []
         if ctx.pr is not None:
             moved = max(moved, ctx.pr_at)
-            seen = self._heads.get(observation.name)   # a head this process saw change is movement now, whatever GitHub's clock says
-            if seen is None or seen[0] != head:        # recorded BEFORE the waiting verdict is used: a head that moved during a guard is still movement
-                self._heads[observation.name] = (head, now if seen is not None else 0)
-            moved = max(moved, self._heads[observation.name][1])
+            known = self._heads.get(observation.name)   # a head this process saw change on ANY owned pull request is movement now, whatever GitHub's clock says
+            kept = {}
+            for pr_number, pr_head in ctx.heads.items():   # recorded BEFORE the waiting verdict is used: a head that moved during a guard is still movement
+                seen = (known or {}).get(pr_number)
+                kept[pr_number] = seen if seen is not None and seen[0] == pr_head else (pr_head, now if known is not None and seen is not None else 0)
+            self._heads[observation.name] = kept
+            moved = max([moved] + [t for _, t in kept.values()])
         if ctx.state == "waiting":
             return []
         since = max(moved, last["work_since"])
@@ -9688,7 +9853,7 @@ def triage_stop(engine, source, observation, boss, idle_ms, reply):
     if now - observation.idle_at > engine.config["rider_max_age_seconds"]:
         return None  # a stop that old is not news, and a nudge would be late
     if engine.state_dir is not None:   # a RETIRED worker is finished on purpose: no nudge, no "stopped without reporting" to its boss (no state dir: triaged as before)
-        kept = read_retired(engine.state_dir).get(observation.name)
+        kept = registry_retired(engine.state_dir).get(observation.name)
         if kept is not None and kept.get("session") in (None, observation.session_id):
             return None
     boss_view = engine.discovery.agents.get(boss) if engine.discovery else None
@@ -10472,6 +10637,7 @@ def decisions_from_reports(engine, now):
     since = now - engine.config["decisions_lookback_hours"] * 3600
     bosses = sorted({resolve_boss(discovery, _boss_of(o)) for o in discovery.agents.values() if _boss_of(o)})
     repos = decision_repos(engine)
+    listed = registry_read(engine.state_dir) if engine.state_dir is not None else {"whole": False, "retired": {}}   # the decisions view: who is still an agent comes from the registry
     items, problems, sends, unread = [], [], {}, {}
     for boss in bosses:
         observation = discovery.agents.get(boss)
@@ -10503,8 +10669,8 @@ def decisions_from_reports(engine, now):
                                 "repo": item.get("repo") or _fleet_repo(sender.fleet, engine.config), "session": None})
         reports.sort(key=lambda r: r["at"])
         for report in reports:
-            if report["state"] not in ("question", "blocked") or report["sender"] not in discovery.agents:
-                continue  # not a decision, or the worker that asked no longer runs: no one is waiting
+            if report["state"] not in ("question", "blocked") or report["sender"] not in discovery.agents or (listed["whole"] and report["sender"] in listed["retired"]):
+                continue  # not a decision, or the worker that asked is retired in the registry (or no longer runs): no one is waiting; a read that is not whole drops nothing
             worker = report["sender"]
             if worker not in unread:
                 try:
@@ -12137,11 +12303,17 @@ def record_github_calls(engine):
         state_write(path, json.dumps(summary, sort_keys=True) + "\n", _without(summary, "at"), STATE_HEARTBEAT_SECONDS, nofollow=True)
         cursor, fresh = getattr(engine, "agent_calls_cursor", None), {}   # #367: the daemon's new calls, and the agent shells' spool, into the hourly count
         with accounts.lock:
-            for at, account, _, _ in accounts.calls:
+            for at, account, endpoint, _ in accounts.calls:
                 if cursor is None or at > cursor:
-                    fresh[account] = fresh.get(account, 0) + 1
+                    fresh.setdefault(account, {})
+                    key = "api " + endpoint   # the form the shim writes (a command), so the one reduction reads it
+                    fresh[account][key] = fresh[account].get(key, 0) + 1   # the daemon is the lane "daemon"; its calls carry their endpoint class
         if agent_calls.fold(str(engine.state_dir), engine.now(), fresh) or not fresh:
             engine.agent_calls_cursor = engine.now()   # advanced only once the calls are written: a failed write is counted at the next pass
+        last_usage = getattr(engine, "usage_read_at", None)
+        if last_usage is None or engine.now() - last_usage >= agent_calls.USAGE_EVERY:
+            engine.usage_read_at = engine.now()   # once a minute, tried again next minute whatever happens
+            agent_calls.record_usage(str(engine.state_dir), engine.now(), accounts.read_usage())
     except Exception as err:
         try:
             engine._note("github_calls.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
@@ -13504,6 +13676,13 @@ def parked_until(body, labels):
     except ValueError:
         return None
     return day.timestamp() + 86400.0
+
+
+def triage_parked_now(item, now):
+    """True while a normalised item is parked: its `parked_until` (read by `parked_until` above, the one date reader) is in the future and within PARKED_MAX_DAYS. T3 and the
+    ownerless line share this one definition; the owner-wait exemption is T3's own."""
+    until = item.get("parked_until")
+    return until is not None and now < until <= now + PARKED_MAX_DAYS * 86400.0
 TRIAGE_NEXT_RE = re.compile(r"^[ \t]*(?:next(?: steps?)?[ \t]*:|[-*][ \t]+\[[ xX]\])", re.I | re.M)
 TRIAGE_REVIEW_RE = re.compile(r"\b(?:review of [0-9a-f]{7}|approved?|changes requested|lgtm)\b", re.I)
 
@@ -13851,8 +14030,7 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
             found["T2"] = {"missing": [g if isinstance(g, str) else "/".join(g) for g in group_missing],
                            "labels": sorted(item["labels"])[:8]}
         awaiting = any(str(l).endswith((":awaiting-user", ":awaiting-cos")) or "awaiting" in str(l) for l in item["labels"])
-        until = item.get("parked_until")   # a park reaches at most PARKED_MAX_DAYS ahead: `9999-12-31` does not park forever
-        parked = until is not None and now < until <= now + PARKED_MAX_DAYS * 86400.0 and not awaiting  # never exempts an owner-wait; T5 and the captain PRs are other rules
+        parked = triage_parked_now(item, now) and not awaiting  # a park reaches at most PARKED_MAX_DAYS ahead: `9999-12-31` does not park forever. It never exempts an owner-wait; T5 and the captain PRs are other rules
         if comments is not None and not item["section"] and not awaiting and not item["next_body"] and not parked \
                 and not item["open_sub"] and not any(c["next"] for c in comments) \
                 and age_updated >= (sla["t3_ask_days"] if ask else sla["t3_other_days"]):
@@ -14252,10 +14430,10 @@ def triage_ownerless_pass(engine, state, cfg, now):
                     items[item["number"]] = item
             lanes = {name.lower() for name, agent in (discovery.agents.items() if discovery else [])   # a known lane: an orchestrator the daemon holds for the repository
                      if (agent.fleet or {}).get("role") == "orchestrator" and (_fleet_repo(agent.fleet or {}, engine.config) == repo or (agent.fleet or {}).get("repo") == repo)}
-            rows = module.ownerless_stale(items, triage_context(engine, repo, items, discovery), ours, options["owner_labels"], now, options["days"],
-                                          options["label_owners"].get(repo), lanes)
+            rows, parked = module.ownerless_split(items, triage_context(engine, repo, items, discovery), ours, options["owner_labels"], now, options["days"],
+                                                  options["label_owners"].get(repo), lanes, triage_parked_now)   # #889: a future-parked issue is counted apart, never listed
             read, total = len(unit["data"]), unit.get("total")
-            shown[repo] = {"count": len(rows), "read": read, "total": total, "oldest_days": int(rows[0][1]) if rows else None}
+            shown[repo] = {"count": len(rows), "parked": len(parked), "read": read, "total": total, "oldest_days": int(rows[0][1]) if rows else None}
             if not rows:
                 continue
             sent = _read_small(engine.state_dir, OWNERLESS_FILE)
@@ -14263,7 +14441,7 @@ def triage_ownerless_pass(engine, state, cfg, now):
                 continue
             sent[repo] = {"at": int(now)}
             _write_small(engine.state_dir, OWNERLESS_FILE, sent)   # before the send: at most one line a day, even when a send fails
-            line = module.summary_line(repo, rows, read, total, options["days"], unit.get("truncated") is True)
+            line = module.summary_line(repo, rows, read, total, options["days"], unit.get("truncated") is True, len(parked))
             names = ["chief-of-staff"] + sorted(name for name, agent in (discovery.agents.items() if discovery else [])
                                                 if _is_orchestrator(agent) and _fleet_repo(agent.fleet or {}, engine.config) == repo)
             told = []
@@ -14274,7 +14452,7 @@ def triage_ownerless_pass(engine, state, cfg, now):
                         told.append(name)
                 except Exception as err:   # a failed send is audited, never retried into a second line
                     engine._note("triage.ownerless_send_failed", repo, {"to": name, "error": _one_line(str(err), 120)})
-            engine._note("triage.ownerless", repo, {"count": len(rows), "read": read, "total": total, "told": told})
+            engine._note("triage.ownerless", repo, {"count": len(rows), "parked": len(parked), "read": read, "total": total, "told": told})
     except Exception as err:
         engine._note("triage.ownerless_error", "", {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
     return shown
@@ -14958,7 +15136,7 @@ def testers_status(config, agents, fleets, state):
         repo_of = lambda fleet: _fleet_repo(fleet, config)
         repos = {repo_of(fleet) for fleet in fleets.values() if isinstance(fleet, dict) and fleet.get("role") == "orchestrator"} - {None}
         try:
-            retired = read_retired_strict(state)
+            retired = registry_retired_strict(state)
         except RetiredUnreadable:
             return ["      testers    retired file unreadable: launch-record testers disabled"]   # the same fail-closed rule the verdict gate applies
         return load_launch_testers().status_lines(config.get("plan_evaluators"), fleets, sessions, repos, repo_of, retired)
@@ -14996,8 +15174,8 @@ def triage_status_lines(triage):
         if text:
             lines.append("      triage     " + text)
     for repo_of, info in sorted((triage.get("ownerless") or {}).items()):
-        lines.append("      triage     ownerless in %s: %d open issue(s) with no owner and quiet; read %s of %s open item(s)" % (
-            repo_of, info.get("count", 0), info.get("read"), info.get("total") if info.get("total") is not None else "an unknown number"))
+        lines.append("      triage     ownerless in %s: %d open issue(s) with no owner and quiet; parked %d; read %s of %s open item(s)" % (
+            repo_of, info.get("count", 0), info.get("parked", 0), info.get("read"), info.get("total") if info.get("total") is not None else "an unknown number"))
     if triage.get("truncated"):
         lines.append("      triage     lists capped for " + ", ".join(triage["truncated"]))
     cadence = triage_digest.digest_line(triage.get("digest"), parse_iso(triage.get("at")) or time.time(), triage.get("digest_interval_minutes", 60))   # #406
@@ -17557,7 +17735,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
         report["v2_calls"] = v2_calls_status(state, now())
-        report["github_calls"] = github_calls_status(state, now()) + agent_calls.status_lines(str(state), now())   # #367
+        report["github_calls"] = github_calls_status(state, now()) + agent_calls.status_lines(str(state), now()) + agent_calls.usage_lines(str(state), now())   # #367
         if config_ok and disk_guard_settings(config) is not None:
             report["disk"] = disk_status_line(config, state)   # one stat of the volume
         if config_ok:
@@ -18142,6 +18320,9 @@ def launch_memory_check(args, engine, state, runner, now):
 
 
 def cmd_launch(args, runner, now, socket_call=None):
+    if getattr(args, "stack", False) and not getattr(args, "cloud", False):   # before anything is read or called: the option is the cloud launcher's
+        sys.stderr.write("%s: --stack needs --cloud: the nested Docker stack is a cloud worker's pod; nothing was created\n" % PROG)
+        return EXIT_USAGE
     if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
         return run_cloud("cmd_launch", args, runner, now)
     refuse_cloud_name(args.name)   # a name that has a cloud record is not launched locally (#640)
@@ -18864,8 +19045,7 @@ def _says_rate_limited(*texts):
 
 def _endpoint_of(path):
     """A path as the counter groups it: no repo, no query, numbers as `#` (`repos/o/r/issues/12/parent` -> `issues/#/parent`)."""
-    bare = re.sub(r"^repos/[^/]+/[^/]+/?", "", path.split("?")[0])
-    return re.sub(r"\d+", "#", bare) or "repo"
+    return agent_calls.reduce_endpoint("api " + path)[4:]   # the allow-listed class: no repository, owner or name (#867)
 
 
 class RepoExcluded(AccountError):
@@ -19024,6 +19204,27 @@ class GhAccounts:
             if reset is not None:
                 self._pause(account, reset, status)
         return subprocess.CompletedProcess(argv, done.returncode or 1, body, done.stderr or ("HTTP %d" % status))
+
+    def read_usage(self):
+        """{account: (used, remaining, limit, reset)} from `gh api rate_limit` for each account this fleet reads with (the `gh_users` accounts, and the default
+        token when one is set). That endpoint does not count against the budget, and it is NOT counted here either (it does not go through `read`, and the
+        child carries the switchboard's own marker). Bounded: at most 8 accounts, one call each, each with the call timeout. Never raises; an account that
+        cannot be read is left out."""
+        found = {}
+        names = sorted({a for a in (self.config.get("gh_users") or {}).values() if isinstance(a, str) and a})[:agent_calls.USAGE_ACCOUNTS]
+        for account in names + ([None] if self.default_available() else []):
+            try:
+                env = dict(self.environ, **{OWN_GH_ENV: "1"})
+                if account is not None:
+                    env["GH_TOKEN"] = self.token_for(account)
+                done = self.runner([self.config["gh"], "api", "rate_limit"], capture_output=True, text=True,
+                                   timeout=self.config["call_timeout_seconds"], stdin=subprocess.DEVNULL, env=env)
+                got = agent_calls.parse_usage(done.stdout or "") if done.returncode == 0 else None
+                if got is not None:
+                    found[account or "default"] = got
+            except Exception:
+                continue
+        return found
 
     def _pause(self, account, until, status):
         with self.lock:
@@ -20922,7 +21123,7 @@ def launched_testers_for(ctx):
     except Exception:
         return {}, {}, {}
     try:
-        retired = read_retired_strict(ctx.engine.state_dir) if ctx.engine.state_dir is not None else {}
+        retired = registry_retired_strict(ctx.engine.state_dir) if ctx.engine.state_dir is not None else {}
     except Exception as err:   # a corrupt retired file could hide a retired tester: no launched tester counts, loudly (audit; `status` says so too)
         ctx.engine._note("testers.retired_unreadable", None, {"error": _one_line(str(err), 160), "effect": "launch-record testers disabled"})
         return {}, sessions, fleets
@@ -21278,7 +21479,7 @@ def item_agents(ctx):
         fleets = {name: (seen.fleet or {}) for name, seen in agents.items()}
         sessions = {name: seen.session_id for name, seen in agents.items()}
         state_dir = getattr(ctx.engine, "state_dir", None)
-        retired = read_retired_strict(state_dir) if state_dir is not None else {}
+        retired = registry_retired_strict(state_dir) if state_dir is not None else {}
     except Exception as err:
         raise ItemAgentsUnreadable("the running agents cannot be read (%s: %s)" % (type(err).__name__, _one_line(str(err), 120))) from None
     return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions, fleets
@@ -24794,8 +24995,46 @@ def add_reds_parsers(sub):
     reds.add_argument("pr", help="OWNER/REPO#N")
 
 
-def cmd_heavy(args):
-    """`heavy [--slots N] [--wait-max S] -- <command...>`: run the command in a CPU slot (ask #34); its exit status is ours."""
+HEAVY_SEND_SECONDS = 45   # the one message to the lane after a stop is bounded: a stop never waits on it for long
+
+
+def heavy_stop_send(engine, lane, text):
+    """Tell `lane` of a stopped heavy run through the engine's own delivery: "sent", "unknown name" (no such agent: nothing is sent) or "failed"."""
+    discovery = engine.discover(engine.now())
+    target = resolve_boss(discovery, lane)
+    if target not in discovery.agents:
+        return "unknown name"
+    outcome = engine.send("switchboard", target, text)
+    return "sent" if outcome.get("sent") else "failed"
+
+
+def heavy_stop_reporter(module, config, make_engine, actor):
+    """`on_stop(phase, info, holder, lane)` for the heavy module. Phase "decided" (before the stop) writes the audit line `heavy.stopped`; phase "told" (after it) sends the
+    one bounded message to the lane and writes `heavy.lane_told`. `make_engine()` gives the engine to send with and audit through; a failure never stops the stop."""
+    box = {}
+
+    def audit(event, subject, detail):
+        engine = box.get("engine")
+        log = engine.audit if engine is not None and engine.audit is not None else AuditLog(ensure_state_dir() / "audit.jsonl")
+        log.append(getattr(engine, "actor", actor), event, subject, detail)
+
+    def send(name, text):
+        def work():
+            box["engine"] = box.get("engine") or make_engine()
+            return heavy_stop_send(box["engine"], name, text)
+        done, told = run_bounded(work, HEAVY_SEND_SECONDS)
+        return told if done else "failed"
+
+    def on_stop(phase, info, holder, lane):
+        if phase == "decided":
+            module.record_stop(info, holder, audit, sys.stderr.write)
+        else:
+            module.tell_lane(info, holder, lane, send, audit, module.ceiling_table(config)["max"], sys.stderr.write)
+    return on_stop
+
+
+def cmd_heavy(args, runner=subprocess.run, now=time.time):
+    """`heavy [--slots N] [--wait-max S] [--ceiling S] -- <command...>`: run the command in a CPU slot (ask #34); its exit status is ours."""
     module = load_heavy_slots()
     command = list(args.command)
     if command[:1] == ["--"]:
@@ -24807,7 +25046,8 @@ def cmd_heavy(args):
             raise module.HeavyError("--slots must be from 1 to %d" % module.SLOTS_MAX)
         if args.wait_max is not None and args.wait_max < 0:
             raise module.HeavyError("--wait-max must be 0 or more")
-        configured = module.settings(load_config().get("heavy") if config_path().exists() else None)
+        heavy_config = load_config().get("heavy") if config_path().exists() else None
+        configured = module.settings(heavy_config)
     except (module.HeavyError, ConfigError) as err:
         sys.stderr.write("%s: heavy: %s\n" % (PROG, err))
         return EXIT_USAGE
@@ -24816,8 +25056,9 @@ def cmd_heavy(args):
     except Exception as err:   # a state directory that cannot be made or is refused: the command still runs, without a slot (heavy never fails someone else's command)
         sys.stderr.write("heavy: no slot (%s): running without one\n" % _one_line(str(err), 160))
         state = None
+    reporter = heavy_stop_reporter(module, heavy_config, lambda: build_engine(runner, now, "cli")[0], "heavy") if state is not None else None
     return module.run(command, state, args.slots or configured, module.DEFAULT_WAIT_MAX if args.wait_max is None else args.wait_max, args.name,
-                      short=bool(getattr(args, "short", False)))
+                      short=bool(getattr(args, "short", False)), ceiling=getattr(args, "ceiling", None), ceiling_config=heavy_config, on_stop=reporter)
 
 
 cmd_heavy.direct = True   # the wrapper of someone else's command: no daemon start, no error mapping
@@ -24831,6 +25072,7 @@ def add_heavy_parsers(sub):
     heavy.add_argument("--slots", type=int, help="How many commands may run at once (default: config heavy.slots, else 3)")
     heavy.add_argument("--wait-max", type=int, dest="wait_max", help="Give up after this many seconds without a slot: exit 75 (default 1800)")
     heavy.add_argument("--short", action="store_true", help="The command is short: when the ordinary slots are busy it may use the one express slot, and the wrapper stops it after 120 seconds (exit 124)")
+    heavy.add_argument("--ceiling", help="Ask for a longer (or shorter) time ceiling in seconds than the kind of command's default, up to the hard maximum (14400); 0 reads as the maximum, an unreadable value as the default")
     heavy.add_argument("--name", help="Who the slot is held for (default: FLEET_HEAVY_NAME, the OpenCode session id, the user)")
     heavy.add_argument("command", nargs=argparse.REMAINDER, help="-- <command...>")
 
@@ -28089,7 +28331,8 @@ def build_parser():
     launch.add_argument("--branch", help="With --cloud: the branch the worker starts on")
     launch.add_argument("--idle", help="With --cloud: stop after this long idle (default 10m)")
     launch.add_argument("--hard", help="With --cloud: stop after this long whatever it does (default 2h)")
-    launch.add_argument("--shape", help="With --cloud: the pod shape, S or M")
+    launch.add_argument("--shape", help="With --cloud: the pod shape, S (2 CPU, 4 GiB; the launcher's default) or M (4 CPU, 8 GiB)")
+    launch.add_argument("--stack", action="store_true", help="With --cloud: a pod that can run a nested Docker stack (the Sysbox runtime class, its own user namespace, no capability added, no privileged mode). Off by default; the launch without it is unchanged. The first pod on a fresh node may wait for the node's runtime: the launcher retries")
     pending = sub.add_parser("pending", help="What is pending for an agent, and why it waits or is held")
     pending.add_argument("name", help="The agent's fleet name")
     pending.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")
@@ -28203,7 +28446,10 @@ def load_tick(engine, discovery):
     links_gate = getattr(engine, "awaiting_held_links", False) and now - waited < HELD_LINKS_WAIT_SECONDS   # #796: a start's held-PR links must be whole before the first alert; it lapses after a bound
     cfg = engine.config.get("load_alert") or dict(health.DEFAULTS)
     reminders = read_reminders(engine.state_dir)
-    retired, last_reports = read_retired(engine.state_dir), _read_small(engine.state_dir, LAST_REPORT_FILE)
+    listed = registry_read(engine.state_dir)   # the load line is a view of the registry: a retired agent has no figures; a read that is not whole alerts nobody (#805)
+    if not listed["whole"]:
+        return []
+    retired, last_reports = listed["retired"], _read_small(engine.state_dir, LAST_REPORT_FILE)
     orchestrators = {}
     for name, seen in sorted(discovery.agents.items()):
         fleet = seen.fleet or {}
@@ -28566,6 +28812,13 @@ PROFILE_DIRS = ("config", "data", "state", "cache", "tmp", "home")
 V2_PACKAGE, V2_VERSION = "@opencode/cli", "2.0.22"  # what the Lab and the trial install; a test keeps them equal
 SERVICE_LABEL = "com.fleet-kit.switchboard"
 SERVICE_UNIT = "fleet-kit-switchboard.service"
+REAPER_LABEL = "com.fleet-kit.cloud-reaper"
+REAPER_UNIT = "fleet-kit-cloud-reaper.service"
+REAPER_INTERVAL_SECONDS = 60   # seconds between the managed reaper's passes: never slower than the reaper's own floor (REAP_FLOOR_SECONDS in cloud_worker.py)
+# The reaper's NON-SECRET settings the installer copies from its own environment into the service (names of a cluster or a
+# namespace, paths of files). A token is never among them: the reaper reads the token FILE by path.
+REAPER_SETTING_NAMES = ("CW_KUBE_CONTEXT", "CW_KUBECONFIG", "CW_KUBECTL", "CW_CLOUD_SERVER", "CW_CLOUD_TOKEN_FILE",
+                        "CW_CLOUD_CA_FILE", "CW_CLOUD_NAMESPACE", "CW_CLOUD_RECORD_DIR", "CW_RUN_RECORD_DIR", "CW_CLOUD_AUDIT")
 HERDR_PLUGIN_ID = "fleet-switchboard"
 COS_NAME = "cos"
 COS_AGENT = "chief-of-staff"
@@ -28945,16 +29198,61 @@ class InstallError(Exception):
     """A step of `install` cannot go on, and says why and what to do."""
 
 
-def write_if_changed(path, content):
-    """Write `content` unless the file already holds it. True when it wrote."""
+def current_uid():
+    return os.getuid()
+
+
+def check_writable_target(path):
+    """Refuse a target this installer must not write: a symlink, anything but a regular file, a file another user owns or one
+    another user can write. A missing file is fine. Raises InstallError naming the path and the reason."""
     path = Path(path)
+    try:
+        info = os.lstat(str(path))
+    except FileNotFoundError:
+        return
+    except OSError as err:
+        raise InstallError("cannot look at %s: %s" % (path, _one_line(str(err), 100))) from None
+    if stat.S_ISLNK(info.st_mode):
+        raise InstallError("%s is a symbolic link; the installer never writes through one (remove it first)" % path)
+    if not stat.S_ISREG(info.st_mode):
+        raise InstallError("%s is not a regular file; the installer leaves it alone" % path)
+    if info.st_uid != current_uid():
+        raise InstallError("%s is owned by another user; the installer leaves it alone" % path)
+    if info.st_mode & 0o022:
+        raise InstallError("%s can be written by its group or others (mode %o); fix it and run again" % (path, info.st_mode & 0o777))
+
+
+def write_if_changed(path, content):
+    """Write `content` unless the file already holds it. True when it wrote. The target is checked first
+    (check_writable_target), and a write goes to a temporary file beside it and is renamed over it, so a file
+    that appears in between is replaced, never written through."""
+    path = Path(path)
+    check_writable_target(path)
     try:
         if path.read_text() == content:
             return False
     except OSError:
         pass
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
+    mask = os.umask(0)
+    os.umask(mask)
+    mode = (0o666 & ~mask) & ~0o022
+    try:
+        mode = stat.S_IMODE(os.lstat(str(path)).st_mode)   # a replaced file keeps its mode
+    except OSError:
+        pass
+    fd, temp = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(content)
+        os.chmod(temp, mode)
+        os.replace(temp, str(path))
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
     return True
 
 
@@ -29362,6 +29660,66 @@ def render_service(kind, values, kit_root=KIT_ROOT):
     for placeholder, value in values.items():
         text = text.replace(placeholder, xml_escape(value) if kind == "launchd" else value.replace("%", "%%"))
     return text
+
+
+def reaper_file_path(kind):
+    if kind == "launchd":
+        return Path.home() / "Library" / "LaunchAgents" / (REAPER_LABEL + ".plist")
+    if kind == "systemd":
+        return _xdg("XDG_CONFIG_HOME", ".config") / "systemd" / "user" / REAPER_UNIT
+    return None
+
+
+REAPER_PATH_SETTINGS = ("CW_KUBECONFIG", "CW_CLOUD_TOKEN_FILE", "CW_CLOUD_CA_FILE", "CW_CLOUD_RECORD_DIR", "CW_RUN_RECORD_DIR", "CW_CLOUD_AUDIT")
+REAPER_NAME_SETTINGS = ("CW_KUBE_CONTEXT", "CW_CLOUD_NAMESPACE")
+REAPER_SETTING_SHAPES = {   # name -> the one shape its value may have; anything else is refused by name
+    "path": re.compile(r"/[A-Za-z0-9._+@=,:/-]{1,1000}"),
+    "command": re.compile(r"(/[A-Za-z0-9._+@=,:/-]{1,1000}|[A-Za-z0-9._-]{1,64})"),
+    "name": re.compile(r"[A-Za-z0-9._:@/-]{1,253}"),
+    "server": re.compile(r"https://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]{0,200})?"),
+}
+
+
+def reaper_setting_kind(name):
+    return ("path" if name in REAPER_PATH_SETTINGS else "name" if name in REAPER_NAME_SETTINGS
+            else "server" if name == "CW_CLOUD_SERVER" else "command")
+
+
+def reaper_settings(env):
+    """The settings of REAPER_SETTING_NAMES that `env` holds, as {name: value}. Each value must have the one shape its setting
+    has: a path (absolute, plain characters, no `..`), a command (a bare name or such a path), a name, or an https server
+    address with no user, query or fragment. Anything else is refused by name (never printed): a service file is readable by any
+    process of the user, and a token pasted into the wrong setting must not reach it."""
+    found = {}
+    for name in REAPER_SETTING_NAMES:
+        value = (env.get(name) or "").strip()
+        if not value:
+            continue
+        kind = reaper_setting_kind(name)
+        bad = not REAPER_SETTING_SHAPES[kind].fullmatch(value) or "/../" in value + "/" or value.endswith("/..")
+        if kind in ("name", "command") and not value.startswith("/") and (re.search(r"[A-Za-z0-9]{32,}", value) or "://" in value):
+            bad = True   # a name is short and is no address; a long run of letters and digits is shaped like a pasted token
+        if bad:
+            raise InstallError("%s cannot go into the reaper's service file (it must be %s)" % (name, {
+                "path": "an absolute path of plain characters", "command": "a command name or an absolute path of plain characters",
+                "name": "a short name", "server": "an https address with no user, query or fragment"}[kind]))
+        found[name] = value
+    return found
+
+
+def render_reaper(kind, values, settings, kit_root=KIT_ROOT):
+    """The reaper's LaunchAgent or systemd user unit from its template in templates/. `settings` is reaper_settings()."""
+    name = REAPER_LABEL + ".plist" if kind == "launchd" else REAPER_UNIT
+    text = (Path(kit_root) / "templates" / name).read_text()
+    if kind == "launchd":
+        block = "\n".join("\t\t<key>%s</key>\n\t\t<string>%s</string>" % (k, xml_escape(v)) for k, v in sorted(settings.items()))
+    else:
+        block = "\n".join('Environment="%s=%s"' % (k, v.replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"'))
+                          for k, v in sorted(settings.items()))
+    values = dict(values, __REAP_SECONDS__=str(REAPER_INTERVAL_SECONDS))
+    for placeholder, value in values.items():
+        text = text.replace(placeholder, xml_escape(value) if kind == "launchd" else value.replace("%", "%%"))
+    return text.replace("__REAPER_ENV__", block)
 
 
 def service_values(kit_root, path_dirs):
@@ -29877,6 +30235,7 @@ class Installer:
 
     def step_service(self, config):
         path, text = service_file_path(self.kind), self.service_text(config)
+        check_writable_target(path)   # before any read or any load: a symlink or a foreign file stops the install here
         on_disk = path.read_text() if path.exists() else None
         loaded = self.loaded()
         if on_disk == text and loaded:
@@ -29896,6 +30255,113 @@ class Installer:
             self.run_checked(command, " ".join(command))
         self.say("service", "done", str(path))
 
+    # -- 5b: the cloud reaper's service (opt-in, like the heartbeat's: it needs a cluster login this machine may not have)
+    def reaper_command_problem(self):
+        """None when the file the reaper service runs and every parent above it are the user's own and not writable by others,
+        else the reason. It is the launcher's one walk (bin/path_walk.py, loaded from THIS kit's bin, which the installer already
+        runs from): the walk never executes the file it judges."""
+        import importlib.util
+        script = Path(self.kit_root) / "cloud" / "launcher" / "cloud_worker.py"
+        if not script.is_file():
+            return "is missing"
+        spec = importlib.util.spec_from_file_location("fleet_kit_path_walk", str(Path(__file__).resolve().parent / "path_walk.py"))
+        walk = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(walk)
+        return walk.parents_problem(str(script)) or walk.entry_problem(os.lstat(str(script)), "the reaper program")
+
+    def reaper_text(self, config):
+        return render_reaper(self.kind, service_values(self.kit_root, service_path_dirs(self.kit_root, [shutil.which("python3")])),
+                             reaper_settings(os.environ), self.kit_root)
+
+    def reaper_loaded(self):
+        uid = os.getuid()
+        if self.kind == "launchd":
+            argv = ["launchctl", "print", "gui/%d/%s" % (uid, REAPER_LABEL)]
+        else:
+            argv = ["systemctl", "--user", "is-enabled", REAPER_UNIT]
+        return self.runner(argv, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL).returncode == 0
+
+    def reaper_load_commands(self, path):
+        if self.kind == "launchd":
+            return [["launchctl", "bootstrap", "gui/%d" % os.getuid(), str(path)]]
+        return [["systemctl", "--user", "daemon-reload"], ["systemctl", "--user", "enable", "--now", REAPER_UNIT]]
+
+    def reaper_unload_commands(self):
+        if self.kind == "launchd":
+            return [["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), REAPER_LABEL)]]
+        return [["systemctl", "--user", "disable", "--now", REAPER_UNIT]]
+
+    def step_reaper(self, config):
+        path, text = reaper_file_path(self.kind), self.reaper_text(config)
+        check_writable_target(path)
+        problem = self.reaper_command_problem()
+        if problem:
+            raise InstallError("the reaper service would run %s, which %s; fix that and run again"
+                               % (Path(self.kit_root) / "cloud" / "launcher" / "cloud_worker.py", problem))
+        on_disk = path.read_text() if path.exists() else None
+        loaded = self.reaper_loaded()
+        if on_disk == text and loaded:
+            return self.say("cloud reaper", "already done", str(path))
+        what = "load" if on_disk == text else "write and load"
+        commands = " && ".join(" ".join(c) for c in self.reaper_load_commands(path))
+        self.say("cloud reaper", "will run" if not self.dry else "would run", "%s: %s" % (what, commands))
+        if self.dry:
+            return self.say("cloud reaper", "would be done", str(path))
+        ensure_state_dir()
+        if on_disk != text:
+            if loaded:
+                for command in self.reaper_unload_commands():
+                    self.run_checked(command, " ".join(command))
+            write_if_changed(path, text)
+        for command in self.reaper_load_commands(path):
+            self.run_checked(command, " ".join(command))
+        self.say("cloud reaper", "done", str(path))
+
+    def reaper_is_ours(self, path, text):
+        """True when the file at `path` is a rendering of the reaper template: the CW_* settings lines are set aside on BOTH sides and
+        blank lines are collapsed on both, so the settings the file was written with do not matter."""
+        def bare(body):
+            if self.kind == "launchd":
+                body = re.sub(r"[ \t]*<key>CW_[A-Z_]+</key>\s*<string>[^\n]*</string>[ \t]*\n?", "", body)
+            else:
+                body = re.sub(r'(?m)^Environment="CW_[A-Z_]+=[^\n]*"[ \t]*\n?', "", body)
+            return re.sub(r"\n\s*\n+", "\n", body)
+        try:
+            return bare(text) == bare(render_reaper(self.kind, service_values(self.kit_root, service_path_dirs(self.kit_root, [shutil.which("python3")])), {}, self.kit_root))
+        except OSError:
+            return False
+
+    def remove_reaper(self):
+        """Uninstall: unload the reaper's job (it is named by this installer's label, so it is this installer's to stop, whoever
+        wrote the file) and delete its file, but only a file this installer's template makes. A file that is not ours (or a symlink)
+        is named and left. Silent when it never was installed."""
+        path = reaper_file_path(self.kind)
+        note = None
+        removable = True
+        if os.path.lexists(str(path)):
+            try:
+                check_writable_target(path)
+                removable = self.reaper_is_ours(path, path.read_text())
+                if not removable:
+                    note = "%s is not the file this installer writes; left alone" % path
+            except InstallError as err:
+                removable, note = False, str(err)
+        loaded = self.reaper_loaded()
+        if loaded:
+            self.say("cloud reaper", "would run" if self.dry else "will run", " && ".join(" ".join(c) for c in self.reaper_unload_commands()))
+            if not self.dry:
+                for command in self.reaper_unload_commands():
+                    self.run_checked(command, " ".join(command))
+        if note:
+            return self.say("cloud reaper", "skipped (%s%s)" % (note, "; the job is unloaded" if loaded and not self.dry else ""))
+        had = os.path.lexists(str(path))
+        if had and not self.dry:
+            path.unlink()
+            if self.kind == "systemd":
+                self.run_checked(["systemctl", "--user", "daemon-reload"], "systemctl --user daemon-reload")
+        if had or loaded:
+            self.result("cloud reaper", had, "%s %s" % ("would remove" if self.dry else "removed", path), "not installed")
+
     # -- 6: the daemon, and what status says
     def step_ensure(self, ensure, status):
         if self.dry:
@@ -29913,7 +30379,7 @@ class Installer:
         except ConfigError as err:
             raise InstallError(str(err)) from None
 
-    def install(self, explicit_opencode=None, with_service=True, with_link=True, ensure=None, status=None):
+    def install(self, explicit_opencode=None, with_service=True, with_link=True, ensure=None, status=None, with_reaper=False):
         config = self.read_config()
         binary, version = self.find_v2(explicit_opencode, config)
         self.result("opencode v2", binary != config.get("opencode_executable"), "%s (v%s)" % (binary, version),
@@ -29938,6 +30404,8 @@ class Installer:
             self.say("service", "skipped (no service manager known for this platform)")
         else:
             self.step_service(config)
+            if with_reaper:
+                self.step_reaper(config)
         self.step_ensure(ensure or (lambda: ensure_daemon(ensure_state_dir(), self.spawn)),
                          status or (lambda: format_status(collect_status(self.runner, self.now, self.platform))))
 
@@ -29951,8 +30419,19 @@ class Installer:
             self.say("service", "skipped (no service manager known for this platform)")
         else:
             path = service_file_path(self.kind)
-            had = path.exists()
-            if self.loaded():
+            ours = True
+            if os.path.lexists(str(path)):
+                try:
+                    check_writable_target(path)
+                    ours = PROG in path.read_text()   # the file this installer wrote names the program
+                except InstallError as err:
+                    ours = False
+                    self.say("service", "skipped (%s)" % err)
+                else:
+                    if not ours:
+                        self.say("service", "skipped (%s is not the file this installer writes; left alone)" % path)
+            had = ours and path.exists()
+            if ours and self.loaded():
                 self.say("service", "would run" if self.dry else "will run", " && ".join(" ".join(c) for c in self.unload_commands()))
                 if not self.dry:
                     for command in self.unload_commands():
@@ -29961,7 +30440,10 @@ class Installer:
                 path.unlink()
                 if self.kind == "systemd":
                     self.run_checked(["systemctl", "--user", "daemon-reload"], "systemctl --user daemon-reload")
-            self.result("service", had, "removed %s" % path, "not installed")
+            if ours:
+                self.result("service", had, "%s %s" % ("would remove" if self.dry else "removed", path), "not installed")
+        if self.kind is not None:
+            self.remove_reaper()   # whatever --no-service says: the reaper's service is its own opt-in
         if with_link:
             state = self.plugin_linked(config)
             if state["state"] == "linked":
@@ -30052,7 +30534,7 @@ def cmd_install(args, runner, now, spawn=subprocess.Popen):
         if args.uninstall:
             installer.uninstall(not args.no_service, not args.no_herdr_link)
         else:
-            installer.install(args.opencode, not args.no_service, not args.no_herdr_link)
+            installer.install(args.opencode, not args.no_service, not args.no_herdr_link, with_reaper=args.with_cloud_reaper)
     except InstallError as err:
         sys.stderr.write("%s: install stopped: %s\n" % (PROG, err))
         return EXIT_ERROR
@@ -30070,6 +30552,9 @@ def add_install_parsers(sub):
     install.add_argument("--opencode", help="The OpenCode v2 binary (absolute path); default: the configured one, "
                                            "then the known places")
     install.add_argument("--no-service", dest="no_service", action="store_true", help="Do not install the service")
+    install.add_argument("--with-cloud-reaper", dest="with_cloud_reaper", action="store_true",
+                         help="Also install and load the cloud worker reaper as a service (opt-in: it needs a cluster login; "
+                              "its non-secret CW_* settings are copied from this environment)")
     install.add_argument("--no-herdr-link", dest="no_herdr_link", action="store_true",
                          help="Do not link herdr's plugin (it starts the daemon whenever herdr starts)")
     install.add_argument("--shared-profile", dest="shared_profile", action="store_true",

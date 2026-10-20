@@ -11,6 +11,8 @@ fixed plan snapshot, at most 3 rounds, objections merged only by the planner, a 
 escalation for an objection that survives round 3. It reports its cost and what the reviewers caught. `launch` keeps checking for the
 consensus record in shadow (E4); refusing is a later, owner-held step.
 
+Exempt when enforced: a launch of the reviewer role (a standing independent reviewer has no plan); every other role still needs a readable `PLAN:` line. The exemption is keyed by the role the launch itself records (never by a name, nor by a line a worker writes in a brief), and it is a launch-time exemption only: a reviewer's verdicts still bind to a pull request's head.
+
 ## What is code and what is agent work
 
 | Deterministic code (the switchboard) | Agent work (prompts) |
@@ -243,6 +245,7 @@ R5 is built: the closing round, the consensus write, `plan review report`, and E
   the final plan hash, tier, lanes and rounds. A blocking objection raised on the final text escalates instead. Editing the plan afterwards voids it.
 - **E4**: `launch_findings` already reads a `consensus` at the plan's current hash, so a plan reviewed by the engine makes the launch check quiet and an edit brings
   `would_refuse` back; it stays shadow (enforcing it is the owner-held step). An overridden consensus is still shown.
+  Exempt when enforced: a launch of the reviewer role (a standing independent reviewer has no plan); every other role still needs a readable `PLAN:` line. The exemption is keyed by the role the launch itself records (never by a name, nor by a line a worker writes in a brief), and it is a launch-time exemption only: a reviewer's verdicts still bind to a pull request's head.
 - **`plan review report <review>`**: per round and lane the wall time, verdict and objections by severity; how many the planner accepted and rejected (the response
   entry records the counts); the objection titles (what the reviewers caught); sessions, wall time, rounds to consensus, escalations. Token and money cost are not
   measured (the harness records none yet), and the report says so.
