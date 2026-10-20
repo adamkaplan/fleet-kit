@@ -11632,11 +11632,17 @@ def record_github_calls(engine):
         state_write(path, json.dumps(summary, sort_keys=True) + "\n", _without(summary, "at"), STATE_HEARTBEAT_SECONDS, nofollow=True)
         cursor, fresh = getattr(engine, "agent_calls_cursor", None), {}   # #367: the daemon's new calls, and the agent shells' spool, into the hourly count
         with accounts.lock:
-            for at, account, _, _ in accounts.calls:
+            for at, account, endpoint, _ in accounts.calls:
                 if cursor is None or at > cursor:
-                    fresh[account] = fresh.get(account, 0) + 1
+                    fresh.setdefault(account, {})
+                    key = "api " + endpoint   # the form the shim writes (a command), so the one reduction reads it
+                    fresh[account][key] = fresh[account].get(key, 0) + 1   # the daemon is the lane "daemon"; its calls carry their endpoint class
         if agent_calls.fold(str(engine.state_dir), engine.now(), fresh) or not fresh:
             engine.agent_calls_cursor = engine.now()   # advanced only once the calls are written: a failed write is counted at the next pass
+        last_usage = getattr(engine, "usage_read_at", None)
+        if last_usage is None or engine.now() - last_usage >= agent_calls.USAGE_EVERY:
+            engine.usage_read_at = engine.now()   # once a minute, tried again next minute whatever happens
+            agent_calls.record_usage(str(engine.state_dir), engine.now(), accounts.read_usage())
     except Exception as err:
         try:
             engine._note("github_calls.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
@@ -17050,7 +17056,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
         report["v2_calls"] = v2_calls_status(state, now())
-        report["github_calls"] = github_calls_status(state, now()) + agent_calls.status_lines(str(state), now())   # #367
+        report["github_calls"] = github_calls_status(state, now()) + agent_calls.status_lines(str(state), now()) + agent_calls.usage_lines(str(state), now())   # #367
         if config_ok and disk_guard_settings(config) is not None:
             report["disk"] = disk_status_line(config, state)   # one stat of the volume
         if config_ok:
@@ -18344,8 +18350,7 @@ def _says_rate_limited(*texts):
 
 def _endpoint_of(path):
     """A path as the counter groups it: no repo, no query, numbers as `#` (`repos/o/r/issues/12/parent` -> `issues/#/parent`)."""
-    bare = re.sub(r"^repos/[^/]+/[^/]+/?", "", path.split("?")[0])
-    return re.sub(r"\d+", "#", bare) or "repo"
+    return agent_calls.reduce_endpoint("api " + path)[4:]   # the allow-listed class: no repository, owner or name (#867)
 
 
 class RepoExcluded(AccountError):
@@ -18504,6 +18509,27 @@ class GhAccounts:
             if reset is not None:
                 self._pause(account, reset, status)
         return subprocess.CompletedProcess(argv, done.returncode or 1, body, done.stderr or ("HTTP %d" % status))
+
+    def read_usage(self):
+        """{account: (used, remaining, limit, reset)} from `gh api rate_limit` for each account this fleet reads with (the `gh_users` accounts, and the default
+        token when one is set). That endpoint does not count against the budget, and it is NOT counted here either (it does not go through `read`, and the
+        child carries the switchboard's own marker). Bounded: at most 8 accounts, one call each, each with the call timeout. Never raises; an account that
+        cannot be read is left out."""
+        found = {}
+        names = sorted({a for a in (self.config.get("gh_users") or {}).values() if isinstance(a, str) and a})[:agent_calls.USAGE_ACCOUNTS]
+        for account in names + ([None] if self.default_available() else []):
+            try:
+                env = dict(self.environ, **{OWN_GH_ENV: "1"})
+                if account is not None:
+                    env["GH_TOKEN"] = self.token_for(account)
+                done = self.runner([self.config["gh"], "api", "rate_limit"], capture_output=True, text=True,
+                                   timeout=self.config["call_timeout_seconds"], stdin=subprocess.DEVNULL, env=env)
+                got = agent_calls.parse_usage(done.stdout or "") if done.returncode == 0 else None
+                if got is not None:
+                    found[account or "default"] = got
+            except Exception:
+                continue
+        return found
 
     def _pause(self, account, until, status):
         with self.lock:
