@@ -154,7 +154,7 @@ Turn it on: set the cluster settings in your shell (`CW_KUBE_CONTEXT`, or `CW_CL
 `CW_CLOUD_NAMESPACE`), then run `fleet-switchboard install --with-cloud-reaper`. It writes a LaunchAgent (macOS) or a systemd
 user unit (Linux), loads it, and starts it at login. Nothing secret is written: only names and file paths.
 
-Turn it off: `fleet-switchboard install --uninstall` unloads and removes it (with the switchboard's own service).
+Turn it off: `fleet-switchboard install --uninstall` unloads and removes it (with the switchboard's own service); `--uninstall --no-service` removes the reaper too and leaves the switchboard's own service. A file at that path that the installer did not write is named and left alone. Only one reaper runs at a time: a hand-started `cloud-worker reap --loop` beside the service exits with `not started: another reaper holds the lock`. Path settings (`CW_CLOUD_TOKEN_FILE` and the others) must be absolute paths of plain characters; a pasted token is refused by name.
 
 Its log: `cloud-reaper-stderr.log` in the switchboard state directory (journalctl on Linux). Each time it ends it writes one line
 `<UTC time> reaper exiting: WHY`, and the service then restarts it.

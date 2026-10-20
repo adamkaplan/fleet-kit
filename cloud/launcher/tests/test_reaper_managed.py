@@ -270,6 +270,7 @@ class TwoReapersOneCluster(base.Base):
         lock = os.path.join(d, "reaper.lock")
         victim = os.path.join(self.tmp.name, "victim")
         open(victim, "w").close()
+        os.chmod(victim, 0o600)   # a private file of the user, so only refusing the link itself can stop the symlink row
         rows = {
             "a symlink": lambda: os.symlink(victim, lock),
             "a directory": lambda: os.mkdir(lock),

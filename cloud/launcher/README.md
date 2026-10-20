@@ -17,7 +17,7 @@ Launcher, reaper, end hook and token mint for cloud workers, built to `docs/clou
   token FILE by path. After the private settings file lands, the reaper reads it as the launcher does. Every ending writes one line
   `<UTC time> reaper exiting: WHY`: end of its pass, stopped by a signal, stopped by an interrupt, an error (a crash in a pass), or
   `cluster login failed: ...` (a login failure exits non-zero). A restarted reaper stops by name and finds no pod for one the last
-  pass already stopped, so nothing is stopped twice. While the Mac sleeps the reaper pauses.
+  pass already stopped, so nothing is stopped twice. Only one reaper runs at a time: it takes an exclusive lock (`reaper.lock`, 0600, beside the audit file) before its first pass and a second one exits at once with `not started: another reaper holds the lock` (the kernel drops the lock when a holder dies, however it dies). A stop uses the pod's own run id where the pod carries one. The installer writes the service file only when the target is a plain file of the user's own (never through a symlink), by temp file and rename, and its uninstall removes only a file the template makes. Path settings must be absolute paths of plain characters. While the Mac sleeps the reaper pauses.
 - `end_hook.py`, installed in the image as `cw-end-hook`: WIP commit, push to `<worker>/wip`, one JSON line.
 - `token_mint.py`, installed as `cw-token-mint`: mints a token at start and on demand, refuses more than 3600 s,
   writes it to a tmpfs file only.

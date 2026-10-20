@@ -28890,8 +28890,8 @@ def reaper_settings(env):
             continue
         kind = reaper_setting_kind(name)
         bad = not REAPER_SETTING_SHAPES[kind].fullmatch(value) or "/../" in value + "/" or value.endswith("/..")
-        if kind == "name" and re.search(r"[A-Za-z0-9]{32,}", value):
-            bad = True   # a name is short; a long run of letters and digits is shaped like a pasted token
+        if kind in ("name", "command") and not value.startswith("/") and (re.search(r"[A-Za-z0-9]{32,}", value) or "://" in value):
+            bad = True   # a name is short and is no address; a long run of letters and digits is shaped like a pasted token
         if bad:
             raise InstallError("%s cannot go into the reaper's service file (it must be %s)" % (name, {
                 "path": "an absolute path of plain characters", "command": "a command name or an absolute path of plain characters",

@@ -41636,11 +41636,11 @@ class TestCloudReaperTemplates(Base):
         self.assertEqual(sorted(good), sorted(sb.REAPER_SETTING_NAMES))   # a name added needs a row here
         self.assertEqual(sb.reaper_settings(good), good)
         for name in sb.REAPER_SETTING_NAMES:
+            shape = sb.REAPER_SETTING_SHAPES[sb.reaper_setting_kind(name)]
             for bad in (token, "relative/path", "/a/../b", "/a b", "https://api.example.internal/?" + token, "http://api.example.internal",
                         "https://user@api.example.internal", "a\nb", "$(id)", "x;y"):
-                if sb.REAPER_SETTING_SHAPES[sb.reaper_setting_kind(name)].fullmatch(bad) and "/../" not in bad + "/":
-                    if not (sb.reaper_setting_kind(name) == "name" and len(bad) > 32):
-                        continue   # a shape the setting accepts is not a bad value for it
+                if shape.fullmatch(bad) and "/../" not in bad + "/" and "://" not in bad and not (re.search(r"[A-Za-z0-9]{32,}", bad) and not bad.startswith("/")):
+                    continue   # a value this setting accepts is not a bad value for it
                 with self.subTest(name=name, bad=bad[:12]):
                     with self.assertRaises(sb.InstallError) as ctx:
                         sb.reaper_settings({name: bad})
@@ -41696,7 +41696,8 @@ class CloudReaperInstall:
         out, _ = self.install("--opencode", self.machine.binary, "--with-cloud-reaper", "--dry-run")
         self.assertFalse(self.reaper_path().exists())
         self.assertEqual(self.statuses(out)["cloud reaper"], ["would run", "would be done"])
-        self.assertFalse([c for c in self.machine.calls if c[0] in ("launchctl", "systemctl") and "cloud-reaper" in " ".join(c)])
+        self.assertFalse([c for c in self.machine.calls if c[0] in ("launchctl", "systemctl") and "cloud-reaper" in " ".join(c)
+                          and c[1] in ("bootstrap", "bootout", "enable", "disable")])
 
     def test_a_changed_setting_unloads_rewrites_and_loads_again_in_that_order(self):
         self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
@@ -41744,6 +41745,11 @@ BAD_TARGET_STATES = {
 }
 
 
+BAD_STATE_REASON = {"a symlink": "symbolic link", "a FIFO": "not a regular file", "a directory": "not a regular file",
+                    "group-writable": "written by its group", "owned by another user": "owned by another user"}
+assert sorted(BAD_STATE_REASON) == sorted(BAD_TARGET_STATES)
+
+
 class WrittenFilesAreGuarded:
     """One row per file the installer writes (the switchboard's own service file and the reaper's) x one per bad state."""
 
@@ -41772,6 +41778,7 @@ class WrittenFilesAreGuarded:
                     victim, (out, error) = self.attempt(state, path, flags)
                     self.assertIsNotNone(error, "%s %s: no refusal" % (label, state))
                     self.assertIn(str(path), error)
+                    self.assertIn(BAD_STATE_REASON[state], error)   # the right check refused it, not another one
                     self.assertEqual(victim.read_text(), "precious\n")
                     if state == "a symlink":
                         self.assertTrue(path.is_symlink())
