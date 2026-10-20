@@ -34835,7 +34835,7 @@ class TestImpactHold(LedgerBase):
     # ---- #835 round 4: the rating's inputs are immune to the shared parser (a registrar's defaults, a replaced parser, a wrapper), at the point of use
 
     RATING_FLAGS = ("--reviewer", "impact", "--verdict", "approve")
-    HOSTILE_DEFAULTS = {"impact_severity": "Negligible", "impact_probability": "Improbable", "impact_reason": "floor-authority", "impact_action": "none", "impact_class": "data", "block": "/nonexistent/block.txt"}
+    HOSTILE_DEFAULTS = {"impact_severity": "Negligible", "impact_probability": "Improbable", "impact_reason": "floor-authority", "impact_action": "none", "impact_class": "data", "block": "/nonexistent/block.txt", "confirms_carry": True}
 
     def record_run(self, flags=(), registrars=(), argv=None):
         """Run the REAL `review record` as the reviewer role with hostile registrars injected into the module's globals before the real `build_parser()` runs. (code, stderr, the entry written without its chain fields or None)."""
@@ -34961,6 +34961,43 @@ class TestImpactHold(LedgerBase):
         entry = [x for x in sb.plan_ledger.read_ledger(self.world.state)[0] if x["kind"] == "review_record"][-1]
         self.assertEqual([k for k in entry if k.startswith("impact_")], [], "no rating, never one from the namespace")
 
+    def test_815_every_input_of_review_record_is_classified_from_the_parser_and_the_code(self):
+        """The class: every input `review record` takes is either read ONLY from the raw argv (PRIVATE_INPUTS: it can change what the clear, the carry or the score reads) or listed with the reason it cannot
+        (REVIEW_RECORD_PUBLIC_INPUTS). Derived from the real parser and from the code, so a flag added later fails here until it is classified."""
+        import ast
+        parser = sb.build_parser()
+        (top,) = [a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction"]
+        record = top.choices["review"]._subparsers._group_actions[0].choices["record"]
+        dests = {a.dest for a in record._actions if a.dest != "help"}
+        private, public = set(sb.PRIVATE_INPUTS), set(sb.REVIEW_RECORD_PUBLIC_INPUTS)
+        self.assertEqual(sorted(dests - private - public), [], "an input of `review record` nobody classified")
+        self.assertEqual(sorted((private | public) - dests - {"review_cmd"}), [], "a classified input the parser does not take")
+        self.assertEqual(private & public, set(), "an input is private or public, never both")
+        self.assertTrue(all(isinstance(r, str) and len(r) > 20 for r in sb.REVIEW_RECORD_PUBLIC_INPUTS.values()), "every public input carries its reason")
+        self.assertTrue({"reviewer", "verdict", "confirms_carry", "block"} <= private)
+        node = next(n for n in ast.parse(self.real_source()).body if isinstance(n, ast.FunctionDef) and n.name == "cmd_review")
+        read = {x.attr for x in ast.walk(node) if isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "args"}
+        self.assertEqual(sorted(read - public - {"raw_argv"}), [], "cmd_review reads an input from the shared namespace that is not listed as public")
+        parsed = sb.record_inputs(("review", "record", "acme/app#9", "--reviewer", "code", "--verdict", "approve", "--confirms-carry"))
+        self.assertEqual(parsed, {"reviewer": "code", "verdict": "approve", "confirms_carry": True})
+        self.assertEqual(sb.record_inputs(("review", "record", "acme/app#9", "--reviewer", "code")), {"reviewer": "code"}, "an absent flag is absent")
+        self.assertEqual(sb.record_inputs(("--confirms-car",)), {}, "no abbreviation")
+        self.assertEqual((sb.record_inputs(None), sb.record_inputs(("a", 3))), ({}, {}), "no raw argv: nothing")
+
+    def test_815_a_hostile_default_for_the_verdict_or_the_confirmation_records_nothing(self):
+        self.record_pr_setup()
+        def registrar(sub):
+            record = sub.choices["review"]._subparsers._group_actions[0].choices["record"]
+            record.set_defaults(verdict="approve", confirms_carry=True)
+        code, err, entry = self.record_run(argv=["review", "record", self.PR, "--reviewer", "code"], registrars=[("add_zzz_parsers", registrar)])
+        self.assertEqual((code, entry), (2, None), err)
+        self.assertIn("--verdict must be one of", err)
+        code, err, entry = self.record_run(argv=["review", "record", self.PR, "--reviewer", "code", "--verdict", "approve"], registrars=[("add_zzz_parsers", registrar)])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("carry_confirmed", entry, "an approve with no flag on the command line is never a confirmation, whatever the shared namespace says")
+        code, err, entry = self.record_run(argv=["review", "record", self.PR, "--reviewer", "code", "--verdict", "approve", "--confirms-carry"], registrars=[("add_zzz_parsers", registrar)])
+        self.assertEqual((code, entry["carry_confirmed"], "by_role" in entry), (0, True, True), err)
+
     def test_the_private_parser_reads_the_edge_cases_of_a_command_line_as_the_shared_parser_does(self):
         base = ["review", "record", "acme/app#9", "--reviewer", "impact", "--verdict", "approve"]
         given = lambda *more: sb.rating_inputs(tuple(base + list(more)))
@@ -34996,7 +35033,7 @@ class TestImpactHold(LedgerBase):
         daemon = ast.parse(self.real_source())
         for name in ("cmd_review", "parse_review_block"):
             node = next(n for n in daemon.body if isinstance(n, ast.FunctionDef) and n.name == name)
-            reads = sorted({"args.%s" % x.attr for x in ast.walk(node) if isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "args" and x.attr in sb.RATING_INPUTS}
+            reads = sorted({"args.%s" % x.attr for x in ast.walk(node) if isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "args" and x.attr in sb.PRIVATE_INPUTS}
                            | {"getattr(args, ...)" for x in ast.walk(node) if isinstance(x, ast.Call) and getattr(x.func, "id", "") == "getattr" and x.args and isinstance(x.args[0], ast.Name) and x.args[0].id == "args"
                               and not (len(x.args) > 1 and isinstance(x.args[1], ast.Constant) and x.args[1].value == "raw_argv")}
                            | {"setattr(args, ...)" for x in ast.walk(node) if isinstance(x, ast.Call) and getattr(x.func, "id", "") == "setattr"})

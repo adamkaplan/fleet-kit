@@ -22914,20 +22914,46 @@ IMPACT_RATING_FIELDS = ("impact_severity", "impact_probability", "impact_reason"
 RATING_INPUTS = IMPACT_RATING_FIELDS + ("impact_action", "impact_class", "block")   # every input of `review record` that decides the rating: read ONLY by `rating_inputs`, from the raw argv
 
 
-def rating_inputs(raw_argv):
-    """{dest: value} of the rating inputs GIVEN in `raw_argv` (a tuple of strings: the command line `main` captured before it built the shared parser), parsed by a PRIVATE minimal parser: the six flags of
-    RATING_INPUTS only, no abbreviation, no default (an absent flag is absent), nothing shared with `build_parser`. A registrar's `set_defaults`, a replaced or re-parsed subparser, a same-dest argument or a
-    wrapper on the namespace cannot change what this returns. A raw argv that is not a tuple or list of strings gives nothing (no rating). #835."""
+CARRY_FLAG_INPUTS = ("confirms_carry",)   # (#815) a flag with no value: whether a record confirms a carry
+DECISION_INPUTS = ("reviewer", "verdict")   # (#815) what the carry and the score read from a record besides the rating: the reviewer role it is for, and its verdict (a confirmation is an approve)
+PRIVATE_INPUTS = RATING_INPUTS + DECISION_INPUTS + CARRY_FLAG_INPUTS   # every input of `review record` that can change what the clear, the carry or the score reads: read ONLY from the raw argv
+REVIEW_RECORD_PUBLIC_INPUTS = {   # the inputs of `review record` read from the shared namespace, each with the reason it cannot change what the clear, the carry or the score reads
+    "review_cmd": "selects the subcommand; the record branch is the one that writes",
+    "pr": "required positional: the record binds to the pull request GitHub resolves from it (`ref` in the audit line); argparse refuses its absence and no value of it reaches a rating, a verdict or a confirmation",
+    "head": "only checked against the pull request's head (a different one is refused); the head recorded is GitHub's, never this value",
+    "blocks": "a count that can only refuse (an approve with blocking findings); neither the carry nor the score reads it",
+    "notes": "a count; neither the carry nor the score reads it",
+    "summary": "free text, redacted and clipped; neither the carry nor the score reads it",
+}
+
+
+def _private_parse(raw_argv, values, flags):
+    """{dest: value} of the inputs of `values` (each takes a value) and `flags` (each takes none: True) GIVEN in `raw_argv` (a tuple of strings: the command line `main` captured before it built the shared
+    parser), parsed by a PRIVATE minimal parser: no abbreviation, no default (an absent input is absent), nothing shared with `build_parser`. A registrar's `set_defaults`, a replaced or re-parsed subparser, a
+    same-dest argument or a wrapper on the namespace cannot change what this returns. A raw argv that is not a tuple or list of strings gives nothing."""
     if not isinstance(raw_argv, (tuple, list)) or not all(isinstance(x, str) for x in raw_argv):
         return {}
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False, argument_default=argparse.SUPPRESS, exit_on_error=False)
-    for name in RATING_INPUTS:
+    for name in values:
         parser.add_argument("--" + name.replace("_", "-"), dest=name)
+    for name in flags:
+        parser.add_argument("--" + name.replace("_", "-"), dest=name, action="store_true", default=argparse.SUPPRESS)
     try:
         parsed, _ = parser.parse_known_args(list(raw_argv))
     except (argparse.ArgumentError, SystemExit):
         return {}
     return dict(vars(parsed))
+
+
+def rating_inputs(raw_argv):
+    """{dest: value} of the rating inputs GIVEN in `raw_argv`: the six flags of RATING_INPUTS, through `_private_parse`. A raw argv that is not a tuple or list of strings gives nothing (no rating). #835."""
+    return _private_parse(raw_argv, RATING_INPUTS, ())
+
+
+def record_inputs(raw_argv):
+    """{dest: value} of DECISION_INPUTS and CARRY_FLAG_INPUTS GIVEN in `raw_argv`, through `_private_parse` (#815): the reviewer and the verdict of a record, and whether it confirms a carry. Nothing given
+    (or a raw argv that is missing) gives nothing: no reviewer, no verdict, no confirmation."""
+    return _private_parse(raw_argv, DECISION_INPUTS, CARRY_FLAG_INPUTS)
 
 
 def cmd_review(args, runner, now):
@@ -22966,40 +22992,42 @@ def cmd_review(args, runner, now):
             if missing:
                 sys.stderr.write("%s: review laws: not at the base commit: %s\n" % (PROG, ", ".join(missing)))
             return EXIT_OK
-        if args.reviewer not in plan_ledger.REVIEWERS:
+        chosen = record_inputs(getattr(args, "raw_argv", ()))   # (#815) the reviewer, the verdict and the confirmation come from the raw argv too (same reason as the rating's inputs)
+        reviewer, verdict, confirms = chosen.get("reviewer"), chosen.get("verdict"), chosen.get("confirms_carry") is True
+        if reviewer not in plan_ledger.REVIEWERS:
             raise ReviewError("--reviewer must be one of %s" % ", ".join(plan_ledger.REVIEWERS))
         given = rating_inputs(getattr(args, "raw_argv", ()))   # #835: the rating's inputs come from the raw argv through a private parser, never from the shared namespace (a registrar's set_defaults, a replaced parser or a wrapper cannot reach them); a missing raw argv gives no rating
         action, klass = given.get("impact_action"), given.get("impact_class")
         rating_in = {name: given.get(name) for name in IMPACT_RATING_FIELDS}
         if given.get("block") is not None:   # the reviewer's returned text: the coder session records it
-            if args.verdict or args.head or args.blocks or args.notes or action:
+            if verdict or args.head or args.blocks or args.notes or action:
                 raise ReviewError("--block carries the verdict, head, counts and impact action itself: give nothing else")
             fields, why = parse_review_block(_read_capped(given["block"], REVIEW_TABLE_MAX))
             if fields is None:
                 raise ReviewError("refused: %s" % why)
-            args.verdict, args.head, args.blocks, args.notes, action = (fields["verdict"], fields["head"], fields["blocks"], fields["notes"], fields["impact_action"])
+            verdict, args.head, args.blocks, args.notes, action = (fields["verdict"], fields["head"], fields["blocks"], fields["notes"], fields["impact_action"])
             klass = klass or fields["impact_class"]
             for name in IMPACT_RATING_FIELDS:   # the rating's severity and probability (the score is derived from the matrix's cell), and the reason that names a floor rule
                 if rating_in[name] is None:
                     rating_in[name] = fields[name]
-        if args.verdict not in plan_ledger.REVIEW_VERDICTS:
+        if verdict not in plan_ledger.REVIEW_VERDICTS:
             raise ReviewError("--verdict must be one of %s (or give --block with the reviewer's returned text)" % ", ".join(plan_ledger.REVIEW_VERDICTS))
         for name, count in (("blocks", args.blocks), ("notes", args.notes)):
             if count < 0 or count > 200:
                 raise ReviewError("--%s must be a number from 0 to 200" % name)
-        if args.verdict == "approve" and args.blocks:
+        if verdict == "approve" and args.blocks:
             raise ReviewError("an approve cannot carry blocking findings (%d given)" % args.blocks)
-        if args.verdict == "request-changes" and not args.blocks:
+        if verdict == "request-changes" and not args.blocks:
             raise ReviewError("request-changes needs at least 1 blocking finding (a finding that cites no rule never blocks)")
-        if args.confirms_carry and args.verdict != "approve":
+        if confirms and verdict != "approve":
             raise ReviewError("--confirms-carry belongs to an approve: a reviewer who found a change to the pull request's own lines does not confirm it")
-        if action and args.reviewer != "impact":
+        if action and reviewer != "impact":
             raise ReviewError("--impact-action belongs to the impact reviewer")
         impact_class = (klass or "").strip().lower() or None
-        if impact_class is not None and args.reviewer != "impact":
+        if impact_class is not None and reviewer != "impact":
             raise ReviewError("--impact-class belongs to the impact reviewer")
         rating = {name: (rating_in[name] or "").strip() or None for name in IMPACT_RATING_FIELDS}
-        if any(rating.values()) and args.reviewer != "impact":
+        if any(rating.values()) and reviewer != "impact":
             raise ReviewError("--impact-severity, --impact-probability and --impact-reason belong to the impact reviewer")
         if rating["impact_severity"] or rating["impact_probability"]:
             try:
@@ -23032,14 +23060,14 @@ def cmd_review(args, runner, now):
         if kind[0] == "unknown":
             raise ReviewError("refused: %s" % kind[1])
         by = kind[1] if kind[0] == "agent" else "person"
-        entry = {"kind": "review_record", "pr": ref, "head": head, "reviewer": args.reviewer, "verdict": args.verdict,
+        entry = {"kind": "review_record", "pr": ref, "head": head, "reviewer": reviewer, "verdict": verdict,
                  "blocks": args.blocks, "notes": args.notes, "by": by,
                  "summary": plan_ledger.clip(redact_command_text(args.summary or ""), 200)}
-        if args.confirms_carry:
+        if confirms:
             entry["carry_confirmed"] = True   # (#815) read by `impact_hold.carry_confirmer`: only a reviewer's own record at the head it judged
         if action:
             entry["impact_action"] = action
-        if args.reviewer == "impact" or args.confirms_carry:   # (#815) a carry confirmation is read by the same recorded role as a rating
+        if reviewer == "impact" or confirms:   # (#815) a carry confirmation is read by the same recorded role as a rating
             entry["by_role"] = kind[2] if kind[0] == "agent" and len(kind) > 2 and isinstance(kind[2], str) else None   # #835: the RECORDED role of the session that made the record (never a flag or a text): only the independent reviewer's rating counts
         for name in IMPACT_RATING_FIELDS:
             if rating[name]:
@@ -23048,12 +23076,12 @@ def cmd_review(args, runner, now):
             entry["impact_class"] = impact_class   # #451 slice 2: the class of the impact that drives the action; a missing one holds for the owner
         stored = plan_ledger.append_entry(state, entry, now())
         if engine.audit is not None:
-            engine.audit.append(engine.actor, "review.record", ref, {"reviewer": args.reviewer, "verdict": args.verdict, "head": head[:12],
+            engine.audit.append(engine.actor, "review.record", ref, {"reviewer": reviewer, "verdict": verdict, "head": head[:12],
                                                                     "by": by, "seq": stored["seq"], "chain": stored["hash"]})
         entries, problem = plan_ledger.read_ledger(state)
         got = plan_ledger.review_records_at(entries, ref, head)
         print("recorded %s review %s at %s (%s): %d of %d reviewers recorded at this head%s" % (
-            args.reviewer, args.verdict, head[:8], ref, len(got["recorded"]), len(got["expected"]),
+            reviewer, verdict, head[:8], ref, len(got["recorded"]), len(got["expected"]),
             "; missing %s" % ", ".join(got["missing"]) if got["missing"] else ""))
         return EXIT_OK
     except (ReviewError, plan_ledger.LedgerError, ConfigError, IdentityUncertain, CallerError) as err:
