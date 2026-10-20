@@ -34254,7 +34254,7 @@ class TestImpactHold(LedgerBase):
     CONFIG_SAMPLES = {"no file at all": None, "an empty object": {}, "every key of the table set": {"gh": "/usr/bin/gh", "call_timeout_seconds": 7, "intent_repo": "acme/intents", "awaiting_label": "me:wait", "awaiting_cos_label": "me:cos",
                                                                                                         "herdr": "/opt/herdr", "opencode": "/opt/opencode", "opencode_env": {"A_B": "c"}, "v2_transport": "cli", "impact_hold": {"enabled": True}, "delegated_clear": {"orders": []}},
                       "keys the entry does not read": {"poll_seconds": 5, "triage": {"enabled": False}}}
-    CONFIG_INVALID = {"gh": "", "call_timeout_seconds": 0, "intent_repo": "not a repo", "awaiting_label": "a,b", "awaiting_cos_label": "x\ny", "herdr": "", "opencode": "relative/path", "opencode_env": {"bad name": "x"}, "v2_transport": "pigeon"}
+    CONFIG_INVALID = {"gh": "", "call_timeout_seconds": 0, "intent_repo": "not a repo", "awaiting_label": "a,b", "awaiting_cos_label": "x\ny", "herdr": "", "opencode": "relative/path", "opencode_env": {"bad name": "x"}, "v2_transport": "pigeon", "excluded_repos": 5, "impact_floor": 5, "impact_hold": "no", "delegated_clear": 5}
 
     def entry_config_file(self, content):
         import tempfile
@@ -34289,11 +34289,19 @@ class TestImpactHold(LedgerBase):
                 for key in sb.ENTRY_CONFIG_KEYS:
                     self.assertEqual(config.get(key), whole.get(key), "%s: the entry's value equals the whole loader's" % key)
                 self.assertEqual(sorted(set(config) - set(sb.ENTRY_CONFIG_KEYS)), [], "nothing but the table's keys")
-        with self.subTest("the mutant: an entry that loads the whole configuration hands over far more than the table"):
-            path = self.entry_config_file({})
-            with mock.patch.object(sb, "entry_config", sb.load_config):
-                config = sb.entry_config(path)
-            self.assertGreater(len(set(config) - set(sb.ENTRY_CONFIG_KEYS)), 20, "a build that loads the whole configuration carries the daemon's other settings: the table's test sees it")
+        def outside_reads(fn, path):
+            del reads[:]
+            with mock.patch.object(json, "loads", lambda text, **k: Recorder(real_loads(text, **k))):
+                fn(path)
+            return sorted(set(reads) - set(sb.ENTRY_CONFIG_KEYS))
+        path = self.entry_config_file({})
+        self.assertEqual(outside_reads(sb.entry_config, path), [], "the real entry reads only its table")
+        def reads_an_extra_key(path):   # a real mutant of the entry: it also looks at a key the table does not name
+            config = sb.entry_config(path)
+            json.loads(Path(path).read_text()).get("poll_seconds")
+            return config
+        self.assertEqual(outside_reads(reads_an_extra_key, path), ["poll_seconds"], "the recorder sees a read outside the table")
+        self.assertGreater(len(sb.load_config(path)), 3 * len(sb.ENTRY_CONFIG_KEYS), "the whole loader hands over the daemon's other settings: the table's equality test fails for an entry built on it")
 
     def test_a_bad_value_of_each_key_the_entry_reads_refuses_with_the_whole_loaders_own_words(self):
         for key, bad in self.CONFIG_INVALID.items():
@@ -34304,6 +34312,13 @@ class TestImpactHold(LedgerBase):
                 with self.assertRaises(sb.ConfigError) as entry:
                     sb.entry_config(path)
                 self.assertEqual(str(entry.exception), str(whole.exception))
+        with self.subTest("an unreadable path"):
+            directory = self.entry_config_file(None).parent
+            with self.assertRaises(sb.ConfigError) as whole:
+                sb.load_config(directory)
+            with self.assertRaises(sb.ConfigError) as entry:
+                sb.entry_config(directory)
+            self.assertEqual(str(entry.exception), str(whole.exception))
         for label, text in (("not JSON", "{not json"), ("not an object", "[1]")):
             with self.subTest(label):
                 path = self.entry_config_file(None)
@@ -34311,6 +34326,7 @@ class TestImpactHold(LedgerBase):
                 with self.assertRaises(sb.ConfigError):
                     sb.entry_config(path)
 
+    @unittest.skipIf(sys.version_info < (3, 11), "the engine constructor is named by co_qualname, new in Python 3.11")
     def test_the_context_has_what_the_clear_reads_and_builds_neither_the_engine_nor_the_whole_configuration(self):
         import tempfile
         state_home = Path(tempfile.mkdtemp(prefix="entry-state-"))
@@ -34330,7 +34346,6 @@ class TestImpactHold(LedgerBase):
             self.assertTrue(hasattr(context, member), member)
         self.assertEqual((context.actor, context.state_dir, context.config), ("cli", state, config))
         self.assertIsNotNone(context.audit)
-        read_only, _, _ = None, None, None
         with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(state_home), "XDG_CONFIG_HOME": str(state_home)}):
             read_only, _, _ = sb.clear_context(self.route, self.world.clock.now, "cli", writable=False)
         self.assertIsNone(read_only.audit)
@@ -34342,6 +34357,7 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(len(lines), 1)
 
     def test_slice_a_is_not_wired_nothing_in_the_clear_or_the_record_calls_the_entry_and_both_run_as_on_main(self):
+        """A TEMPORARY slice guard (#996): slice A builds the entry and does not wire it; slice B wires it and replaces this test with the trace and equality tests."""
         import ast
         names = ("entry_config", "clear_context", "entry_caller_kind", "identity_clients")
         callers = {name: set() for name in names}
@@ -34366,15 +34382,46 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(code, 0, err)
         self.assertEqual(calls, [], "the real clear and the real record never called the entry")
 
-    def test_the_owner_only_check_has_one_body_for_both_constructors(self):
+    def test_the_entrys_owner_only_check_gives_the_same_answer_as_the_engines_for_each_kind_of_caller_and_builds_its_clients_from_the_entrys_keys(self):
+        built = []
+        class FakeV2:
+            def __init__(self, binary, env, runner, timeout, transport="auto"):
+                built.append(("v2", binary, dict(env), timeout, transport))
+        class FakeHerdr:
+            def __init__(self, binary, runner, socket_call=None):
+                built.append(("herdr", binary))
+        path = self.entry_config_file({"opencode": "/opt/opencode", "opencode_env": {"A": "b"}, "v2_transport": "cli", "herdr": "/opt/herdr", "call_timeout_seconds": 9})
+        callers = {"a person at a shell": (sb.CallerError("no agent"), None), "an agent": ({"name": "worker-1", "role": "coder"}, None), "an uncertain identity": (sb.IdentityUncertain("two panes"), None),
+                   "a registry that cannot be read": (sb.V2Error("down"), None), "a person whose terminal is not the owner's": (sb.CallerError("no agent"), "not a terminal")}
+        for label, (outcome, terminal_problem) in callers.items():
+            with self.subTest(label):
+                def caller_fleet(herdr, v2, environ, outcome=outcome):
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+                engine = types.SimpleNamespace(herdr=FakeHerdr("/opt/herdr", None), v2=FakeV2("/opt/opencode", {"A": "b"}, None, 9, "cli"))
+                del built[:]
+                with mock.patch.object(sb, "caller_fleet", caller_fleet), mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: terminal_problem), \
+                        mock.patch.object(sb, "build_engine", lambda *a, **k: (engine, None, None)), mock.patch.object(sb, "HerdrClient", FakeHerdr), mock.patch.object(sb, "V2Client", FakeV2), \
+                        mock.patch.object(sb, "config_path", lambda: path):
+                    old = sb.gates_caller_kind(self.route, self.world.clock.now)
+                    del built[:]
+                    new = sb.entry_caller_kind(self.route, self.world.clock.now)
+                self.assertEqual(new, old, "the same answer for %s" % label)
+                self.assertEqual(sorted(built), [("herdr", "/opt/herdr"), ("v2", "/opt/opencode", {"A": "b"}, 9, "cli")], "the clients are built once each, from the entry's own keys")
+
+    def test_the_owner_only_check_has_one_body_for_both_constructors_and_the_context_keeps_the_engines_two_audit_bodies(self):
         import ast
         tree = ast.parse((BIN / "fleet-switchboard").read_text())
-        defs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+        defs = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
         calls = lambda name: {getattr(x.func, "id", None) for x in ast.walk(defs[name]) if isinstance(x, ast.Call)}
         self.assertIn("caller_kind", calls("gates_caller_kind"))
         self.assertIn("caller_kind", calls("entry_caller_kind"))
         self.assertIn("caller_fleet", calls("caller_kind"))
         self.assertNotIn("caller_fleet", calls("gates_caller_kind") | calls("entry_caller_kind"), "the identity rule is in the one body")
+        method = lambda cls, name: next(m for m in defs[cls].body if isinstance(m, ast.FunctionDef) and m.name == name)
+        for name in ("_external", "_note"):
+            self.assertEqual(ast.unparse(method("ClearContext", name).body), ast.unparse(method("Switchboard", name).body), "the context's %s is the engine's, word for word" % name)
 
     # ---- #940 slice 1: ONE closure, derived from the clear's real call graph, read by the refusal and the owner hold
 

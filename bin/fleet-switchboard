@@ -10083,11 +10083,15 @@ def repo_of_tag(tag, repos):
     return decision_core.repo_of_tag(tag, repos)
 
 
-def validate_awaiting_labels(config, source):
+def validate_awaiting_label(config, source):
     label = config["awaiting_label"]
     if label is not None and (not isinstance(label, str) or not label.strip() or "\n" in label or "," in label):
         raise ConfigError("%s: 'awaiting_label' must be a label name without a comma or a newline, or null (the "
                           "default, `<OS user>:awaiting-user`), got %r" % (source, label))
+
+
+def validate_awaiting_cos_label(config, source):
+    label = config["awaiting_label"]
     cos_label = config["awaiting_cos_label"]
     if cos_label is not None and (not isinstance(cos_label, str) or not cos_label.strip() or "\n" in cos_label
                                   or "," in cos_label):
@@ -10098,10 +10102,11 @@ def validate_awaiting_labels(config, source):
 
 
 def validate_decisions_config(config, source):
+    validate_awaiting_label(config, source)
     hours = config["decisions_lookback_hours"]
     if not _is_number(hours) or hours <= 0:
         raise ConfigError("%s: 'decisions_lookback_hours' must be a positive number, got %r" % (source, hours))
-    validate_awaiting_labels(config, source)
+    validate_awaiting_cos_label(config, source)
     grace = config["decisions_cos_grace_seconds"]
     if not _is_number(grace) or grace < 0:
         raise ConfigError("%s: 'decisions_cos_grace_seconds' must be a number of seconds, 0 or more, got %r"
@@ -18053,9 +18058,12 @@ def entry_config(path=None):
     validate_positive_key(config, "call_timeout_seconds", source)
     validate_gh_key(config, source)
     validate_intent_repo_key(config, source)
-    validate_awaiting_labels(config, source)
-    for key in ("excluded_repos", "impact_floor"):   # a key its module declares: the module's default, then its validator
-        apply_declared_key(config, raw, key, CONFIG_MUST_DECLARE[key], source)
+    validate_awaiting_label(config, source)
+    validate_awaiting_cos_label(config, source)
+    declared = config_declarations()
+    for key in ENTRY_CONFIG_KEYS:   # a key its module declares (excluded_repos, impact_floor, delegated_clear...): the module's default, then its validator
+        if key in declared:
+            apply_declared_key(config, raw, key, declared[key], source)
     validate_impact_hold_key(config, source)
     return config
 
