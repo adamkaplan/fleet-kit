@@ -29,12 +29,6 @@ The reviewers read this file together with `CODING_STANDARDS.md`, `SECURITY_STAN
 - **R-LAW-16 A block about behaviour names its check.** A finding that blocks because of how the change behaves, when a test or check in the change's own tree exercises that behaviour, names that test or check and says whether it covers the claim. A green covering check at the head drops the finding or lowers it to a note, with the reason. A pending check, a failing one, or `no checks reported` does not clear a finding: only a green covering check does, and a result that is pending or absent counts as not read. A reviewer that cannot read the check result says `check result not read`, and its finding stays at most a note: it is reported, it cites this rule, and it never blocks (R-LAW-14). A reviewer still never runs, builds or tests anything (R-LAW-2): reading the head's check results is reading. _check: search: a blocking finding about behaviour names a test or check, or says `check result not read`._
 - **R-LAW-17 A missing verdict is never the author's to chase.** A reviewer that has not posted at the head is waited for or re-run by the reviewing side, once per head, never by the author of the change (the author's first invocation of its reviewers, before offering the change, is not a chase); the author's own review of its work is recorded as its own and counts for nothing in place of the missing one. _check: note only: judged by the reviewing side at the head._
 
-## Deciding from text
-
-When a function decides from text (an error message, a substring, a pattern, a name list), the first-round finding asks for an allow-list, a structured field or exact equality, and for a completeness test derived from the code, with one mutant per member, so the class is closed in one round and not found one instance at a time.
-
-Example (neutral names). A function in `acme/widget-api` decides whether a request is a read or a write by looking for the word `list` in the command line, so `list-and-delete` is taken for a read. The first-round finding does not name that one command. It asks for a table of the allowed commands, each with its kind, so that the decision is exact equality against the table, and for a test that walks the table and fails when a command is missing from it, with one mutant per row (remove the row, flip its kind) so that every command is proved, not the one that was noticed.
-
 ## Verdict format
 
 A review ends with exactly one block:

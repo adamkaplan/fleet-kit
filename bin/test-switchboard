@@ -63990,9 +63990,9 @@ STRUCTURAL_RULE = ("When a function decides from text (an error message, a subst
 
 
 def structural_rule_homes(root):
-    """Every file that must carry STRUCTURAL_RULE, derived from the tree: each reviewer definition found in the directory (no count), the review skill, the review laws."""
+    """Every file that must carry STRUCTURAL_RULE, derived from the tree: each reviewer definition found in the directory (no count), the review skill, the rule's own page in the review laws' documentation."""
     root = Path(root)
-    return sorted((root / "agents" / "reviewers").glob("*.md")) + [root / "skills" / "fleet-review" / "SKILL.md", root / "docs" / "review-laws" / "REVIEW_LAWS.md"]
+    return sorted((root / "agents" / "reviewers").glob("*.md")) + [root / "skills" / "fleet-review" / "SKILL.md", root / "docs" / "review-laws" / "structural-rule.md"]
 
 
 def structural_rule_problems(root):
@@ -64044,8 +64044,8 @@ class TestStructuralRuleInReviewing(unittest.TestCase):
                 target.write_text(target.read_text() + "\n" + STRUCTURAL_RULE.replace("an allow-list", "a list of allowed values") + "\n")
                 self.assertEqual([name for name, _ in structural_rule_problems(root)], [victim.name])
 
-    def test_the_laws_carry_one_example_with_neutral_names(self):
-        text = (REPO / "docs" / "review-laws" / "REVIEW_LAWS.md").read_text()
+    def test_the_rule_page_carries_one_example_with_neutral_names(self):
+        text = (REPO / "docs" / "review-laws" / "structural-rule.md").read_text()
         example = text.split("Example (neutral names).", 1)[1].split("\n\n", 1)[0]
         self.assertEqual(text.count("Example (neutral names)."), 1)
         for word in ("acme/", "`list`", "table of the allowed commands", "one mutant per row"):
