@@ -11688,11 +11688,17 @@ def record_github_calls(engine):
         state_write(path, json.dumps(summary, sort_keys=True) + "\n", _without(summary, "at"), STATE_HEARTBEAT_SECONDS, nofollow=True)
         cursor, fresh = getattr(engine, "agent_calls_cursor", None), {}   # #367: the daemon's new calls, and the agent shells' spool, into the hourly count
         with accounts.lock:
-            for at, account, _, _ in accounts.calls:
+            for at, account, endpoint, _ in accounts.calls:
                 if cursor is None or at > cursor:
-                    fresh[account] = fresh.get(account, 0) + 1
+                    fresh.setdefault(account, {})
+                    key = "api " + endpoint   # the form the shim writes (a command), so the one reduction reads it
+                    fresh[account][key] = fresh[account].get(key, 0) + 1   # the daemon is the lane "daemon"; its calls carry their endpoint class
         if agent_calls.fold(str(engine.state_dir), engine.now(), fresh) or not fresh:
             engine.agent_calls_cursor = engine.now()   # advanced only once the calls are written: a failed write is counted at the next pass
+        last_usage = getattr(engine, "usage_read_at", None)
+        if last_usage is None or engine.now() - last_usage >= agent_calls.USAGE_EVERY:
+            engine.usage_read_at = engine.now()   # once a minute, tried again next minute whatever happens
+            agent_calls.record_usage(str(engine.state_dir), engine.now(), accounts.read_usage())
     except Exception as err:
         try:
             engine._note("github_calls.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
@@ -13047,6 +13053,13 @@ def parked_until(body, labels):
     except ValueError:
         return None
     return day.timestamp() + 86400.0
+
+
+def triage_parked_now(item, now):
+    """True while a normalised item is parked: its `parked_until` (read by `parked_until` above, the one date reader) is in the future and within PARKED_MAX_DAYS. T3 and the
+    ownerless line share this one definition; the owner-wait exemption is T3's own."""
+    until = item.get("parked_until")
+    return until is not None and now < until <= now + PARKED_MAX_DAYS * 86400.0
 TRIAGE_NEXT_RE = re.compile(r"^[ \t]*(?:next(?: steps?)?[ \t]*:|[-*][ \t]+\[[ xX]\])", re.I | re.M)
 TRIAGE_REVIEW_RE = re.compile(r"\b(?:review of [0-9a-f]{7}|approved?|changes requested|lgtm)\b", re.I)
 
@@ -13394,8 +13407,7 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
             found["T2"] = {"missing": [g if isinstance(g, str) else "/".join(g) for g in group_missing],
                            "labels": sorted(item["labels"])[:8]}
         awaiting = any(str(l).endswith((":awaiting-user", ":awaiting-cos")) or "awaiting" in str(l) for l in item["labels"])
-        until = item.get("parked_until")   # a park reaches at most PARKED_MAX_DAYS ahead: `9999-12-31` does not park forever
-        parked = until is not None and now < until <= now + PARKED_MAX_DAYS * 86400.0 and not awaiting  # never exempts an owner-wait; T5 and the captain PRs are other rules
+        parked = triage_parked_now(item, now) and not awaiting  # a park reaches at most PARKED_MAX_DAYS ahead: `9999-12-31` does not park forever. It never exempts an owner-wait; T5 and the captain PRs are other rules
         if comments is not None and not item["section"] and not awaiting and not item["next_body"] and not parked \
                 and not item["open_sub"] and not any(c["next"] for c in comments) \
                 and age_updated >= (sla["t3_ask_days"] if ask else sla["t3_other_days"]):
@@ -13795,10 +13807,10 @@ def triage_ownerless_pass(engine, state, cfg, now):
                     items[item["number"]] = item
             lanes = {name.lower() for name, agent in (discovery.agents.items() if discovery else [])   # a known lane: an orchestrator the daemon holds for the repository
                      if (agent.fleet or {}).get("role") == "orchestrator" and (_fleet_repo(agent.fleet or {}, engine.config) == repo or (agent.fleet or {}).get("repo") == repo)}
-            rows = module.ownerless_stale(items, triage_context(engine, repo, items, discovery), ours, options["owner_labels"], now, options["days"],
-                                          options["label_owners"].get(repo), lanes)
+            rows, parked = module.ownerless_split(items, triage_context(engine, repo, items, discovery), ours, options["owner_labels"], now, options["days"],
+                                                  options["label_owners"].get(repo), lanes, triage_parked_now)   # #889: a future-parked issue is counted apart, never listed
             read, total = len(unit["data"]), unit.get("total")
-            shown[repo] = {"count": len(rows), "read": read, "total": total, "oldest_days": int(rows[0][1]) if rows else None}
+            shown[repo] = {"count": len(rows), "parked": len(parked), "read": read, "total": total, "oldest_days": int(rows[0][1]) if rows else None}
             if not rows:
                 continue
             sent = _read_small(engine.state_dir, OWNERLESS_FILE)
@@ -13806,7 +13818,7 @@ def triage_ownerless_pass(engine, state, cfg, now):
                 continue
             sent[repo] = {"at": int(now)}
             _write_small(engine.state_dir, OWNERLESS_FILE, sent)   # before the send: at most one line a day, even when a send fails
-            line = module.summary_line(repo, rows, read, total, options["days"], unit.get("truncated") is True)
+            line = module.summary_line(repo, rows, read, total, options["days"], unit.get("truncated") is True, len(parked))
             names = ["chief-of-staff"] + sorted(name for name, agent in (discovery.agents.items() if discovery else [])
                                                 if _is_orchestrator(agent) and _fleet_repo(agent.fleet or {}, engine.config) == repo)
             told = []
@@ -13817,7 +13829,7 @@ def triage_ownerless_pass(engine, state, cfg, now):
                         told.append(name)
                 except Exception as err:   # a failed send is audited, never retried into a second line
                     engine._note("triage.ownerless_send_failed", repo, {"to": name, "error": _one_line(str(err), 120)})
-            engine._note("triage.ownerless", repo, {"count": len(rows), "read": read, "total": total, "told": told})
+            engine._note("triage.ownerless", repo, {"count": len(rows), "parked": len(parked), "read": read, "total": total, "told": told})
     except Exception as err:
         engine._note("triage.ownerless_error", "", {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
     return shown
@@ -14539,8 +14551,8 @@ def triage_status_lines(triage):
         if text:
             lines.append("      triage     " + text)
     for repo_of, info in sorted((triage.get("ownerless") or {}).items()):
-        lines.append("      triage     ownerless in %s: %d open issue(s) with no owner and quiet; read %s of %s open item(s)" % (
-            repo_of, info.get("count", 0), info.get("read"), info.get("total") if info.get("total") is not None else "an unknown number"))
+        lines.append("      triage     ownerless in %s: %d open issue(s) with no owner and quiet; parked %d; read %s of %s open item(s)" % (
+            repo_of, info.get("count", 0), info.get("parked", 0), info.get("read"), info.get("total") if info.get("total") is not None else "an unknown number"))
     if triage.get("truncated"):
         lines.append("      triage     lists capped for " + ", ".join(triage["truncated"]))
     cadence = triage_digest.digest_line(triage.get("digest"), parse_iso(triage.get("at")) or time.time(), triage.get("digest_interval_minutes", 60))   # #406
@@ -17100,7 +17112,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
         report["v2_calls"] = v2_calls_status(state, now())
-        report["github_calls"] = github_calls_status(state, now()) + agent_calls.status_lines(str(state), now())   # #367
+        report["github_calls"] = github_calls_status(state, now()) + agent_calls.status_lines(str(state), now()) + agent_calls.usage_lines(str(state), now())   # #367
         if config_ok and disk_guard_settings(config) is not None:
             report["disk"] = disk_status_line(config, state)   # one stat of the volume
         if config_ok:
@@ -18394,8 +18406,7 @@ def _says_rate_limited(*texts):
 
 def _endpoint_of(path):
     """A path as the counter groups it: no repo, no query, numbers as `#` (`repos/o/r/issues/12/parent` -> `issues/#/parent`)."""
-    bare = re.sub(r"^repos/[^/]+/[^/]+/?", "", path.split("?")[0])
-    return re.sub(r"\d+", "#", bare) or "repo"
+    return agent_calls.reduce_endpoint("api " + path)[4:]   # the allow-listed class: no repository, owner or name (#867)
 
 
 class RepoExcluded(AccountError):
@@ -18554,6 +18565,27 @@ class GhAccounts:
             if reset is not None:
                 self._pause(account, reset, status)
         return subprocess.CompletedProcess(argv, done.returncode or 1, body, done.stderr or ("HTTP %d" % status))
+
+    def read_usage(self):
+        """{account: (used, remaining, limit, reset)} from `gh api rate_limit` for each account this fleet reads with (the `gh_users` accounts, and the default
+        token when one is set). That endpoint does not count against the budget, and it is NOT counted here either (it does not go through `read`, and the
+        child carries the switchboard's own marker). Bounded: at most 8 accounts, one call each, each with the call timeout. Never raises; an account that
+        cannot be read is left out."""
+        found = {}
+        names = sorted({a for a in (self.config.get("gh_users") or {}).values() if isinstance(a, str) and a})[:agent_calls.USAGE_ACCOUNTS]
+        for account in names + ([None] if self.default_available() else []):
+            try:
+                env = dict(self.environ, **{OWN_GH_ENV: "1"})
+                if account is not None:
+                    env["GH_TOKEN"] = self.token_for(account)
+                done = self.runner([self.config["gh"], "api", "rate_limit"], capture_output=True, text=True,
+                                   timeout=self.config["call_timeout_seconds"], stdin=subprocess.DEVNULL, env=env)
+                got = agent_calls.parse_usage(done.stdout or "") if done.returncode == 0 else None
+                if got is not None:
+                    found[account or "default"] = got
+            except Exception:
+                continue
+        return found
 
     def _pause(self, account, until, status):
         with self.lock:

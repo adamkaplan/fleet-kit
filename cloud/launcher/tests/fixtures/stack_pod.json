@@ -20,6 +20,7 @@
       "name": "coder7-ffda"
     },
     "spec": {
+      "activeDeadlineSeconds": 29100,
       "automountServiceAccountToken": false,
       "containers": [
         {
@@ -156,6 +157,7 @@
       "name": "coder7-ffda"
     },
     "spec": {
+      "activeDeadlineSeconds": 29100,
       "automountServiceAccountToken": false,
       "containers": [
         {

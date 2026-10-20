@@ -89,7 +89,7 @@ def _stack_shape_differs(pod):
 # dnsPolicy/dnsConfig, priorityClassName, hostname, an init or ephemeral container, a hostPort... are refused until a deliberate edit
 # here (and to the frozen fixture tests/fixtures/stack_pod.json) allows them.
 STACK_METADATA_KEYS = {"name", "labels", "annotations"}
-STACK_SPEC_KEYS = {"restartPolicy", "serviceAccountName", "automountServiceAccountToken", "securityContext", "containers", "volumes",
+STACK_SPEC_KEYS = {"restartPolicy", "activeDeadlineSeconds", "serviceAccountName", "automountServiceAccountToken", "securityContext", "containers", "volumes",
                    "imagePullSecrets", "runtimeClassName", "hostUsers", "nodeSelector"}
 STACK_CONTAINER_KEYS = {"name", "image", "securityContext", "env", "resources", "readinessProbe", "volumeMounts"}
 STACK_VOLUMES = {"tokens": {"name": "tokens", "emptyDir": {"medium": "Memory"}}, "scratch": {"name": "scratch", "emptyDir": {}}}
@@ -140,6 +140,11 @@ FORBIDDEN_POD_FIELDS = {
 def forbidden_pod_fields(pod):
     return [name for name, has in FORBIDDEN_POD_FIELDS.items() if has(pod)]
 DEFAULT_MAX_HARD = "8h"  # OPEN in the contract: value
+# The cluster-side floor: every pod carries spec.activeDeadlineSeconds = the --max-hard cap + this grace, so the kubelet
+# ends a pod even when no reaper runs. The cap, not the current hard deadline: Kubernetes lets that field be lowered on
+# a running pod but never raised, so a value at the initial hard limit would make `extend` (within the cap) a lie. The
+# grace lets the reaper (which writes the run record and runs the end hook) normally act first.
+POD_DEADLINE_GRACE_SECONDS = 300
 DEFAULT_SPEND_CAP_USD = 25.0  # the prototype's cap; applies when CW_CLOUD_SPEND_CAP_USD is unset or empty
 LABEL = "cw-worker"
 REPORT_PATH = "/home/worker/report"  # the worker's final one-line report, written here inside the pod (the image's workdir)
@@ -166,6 +171,10 @@ class CloudError(Exception):
 
 class _FreshNodeRace(Exception):
     """The pod's sandbox failed on the handler-not-known message: the node's containerd was not yet configured."""
+
+
+class _PodVanished(Exception):
+    """The pending stack pod existed and then a get said not found (seen on a fresh node when its runtime restarted)."""
 
 
 class Interrupted(BaseException):
@@ -339,13 +348,19 @@ def _abs_executable(path):
     return bool(path) and os.path.isabs(path) and os.path.isfile(path) and os.access(path, os.X_OK)
 
 
-def _preflight_env(env, home):
-    """The child's whole environment: the allow-listed names, a fixed PATH, an empty private HOME and TMPDIR, and where `az` keeps its sign-in
-    (the caller's AZURE_CONFIG_DIR when it is an absolute existing directory, else the account's own ~/.azure from the password database, never $HOME)."""
-    clean = {k: v for k, v in env.items() if k in PREFLIGHT_ENV_NAMES or k.startswith("LC_")}
+def _scrubbed_env(env, home, names, openssl=True, real_home=False):
+    """THE scrubbed child environment (the preflight and the vault access check both use it): the allow-listed `names` (and LC_*), a fixed PATH, an
+    empty private HOME and TMPDIR, and where `az` keeps its sign-in (the caller's AZURE_CONFIG_DIR when it is an absolute existing directory, else the
+    account's own ~/.azure from the password database, never $HOME)."""
+    clean = {k: v for k, v in env.items() if k in names or k.startswith("LC_")}
     clean["PATH"] = PREFLIGHT_PATH
     clean["HOME"] = home
     clean["TMPDIR"] = home
+    if real_home:   # the vault access check keeps its own log under the user's home: the PASSWORD DATABASE's home, never the HOME variable
+        try:
+            clean["HOME"] = pwd.getpwuid(os.getuid()).pw_dir
+        except (KeyError, OSError):
+            pass
     cfg = env.get("AZURE_CONFIG_DIR") or ""
     if not (os.path.isabs(cfg) and os.path.isdir(cfg)):
         try:
@@ -355,8 +370,13 @@ def _preflight_env(env, home):
     if cfg:
         clean["AZURE_CONFIG_DIR"] = cfg
     ossl = env.get("CW_OPENSSL") or ""
-    if _abs_executable(ossl):
+    if openssl and _abs_executable(ossl):
         clean["CW_OPENSSL"] = ossl
+    return clean
+
+
+def _preflight_env(env, home):
+    clean = _scrubbed_env(env, home, PREFLIGHT_ENV_NAMES)
     clean.update(PREFLIGHT_TEST_ENV)
     return clean
 
@@ -378,6 +398,212 @@ def check_repo_preflight(repo, env):
     if not lines:
         raise CloudError("refused: the repository preflight for %s printed nothing; nothing was created" % scrub(repo, (), 120), EXIT_USAGE)
     return scrub(lines[-1], (), 300)
+
+
+# ---------------------------------------------------------------- the vault access check (#876 slice 2)
+# A program of another repository, run UNCHANGED from a configured checkout (CW_VAULT_CHECK_DIR), only after a vault read was refused by the vault's
+# firewall. Contract (agreed with its owner, who announces any change first): the module below, run with `check` from the root of the checkout; no other
+# argument, option, environment or file; limit 300 s; it adds at most ONE single-address rule, only this machine's own address; it prints a count line.
+VAULT_CHECK_KEY = "CW_VAULT_CHECK_DIR"
+VAULT_CHECK_MODULE = "scripts.v2.cw_vault_firewall"
+VAULT_CHECK_FILE = "scripts/v2/cw_vault_firewall.py"
+VAULT_CHECK_ARGS = ("check",)           # the whole argument list after the module: never an address, never an option
+VAULT_CHECK_SECONDS = 300               # the check's own run limit
+VAULT_CHECK_GRACE = 15                  # ours, on top, before the process group is killed
+VAULT_CHECK_ENV_NAMES = ()              # nothing is passed from the caller: the child gets PATH, a private HOME and TMPDIR, AZURE_CONFIG_DIR and LC_*
+VAULT_CHECK_PYTHON = None               # a test hook (a module attribute): None means python3 found on the fixed PATH
+# The exit codes, one table: code -> (outcome, the launch continues, what it means). Any other code (or no code: killed, timed out, not run) is treated as 40.
+VAULT_CHECK_CODES = {
+    0: ("answered", True, "the vault answered; nothing was changed"),
+    10: ("added", True, "an address was added and the vault now answers"),
+    20: ("refused-by-its-rules", False, "the check refused by its own rules (its cap of 6 rules is reached, or an address it will not add)"),
+    30: ("added-still-refused", False, "an address was added but the vault still refused after 90 seconds"),
+    40: ("failed", False, "the check failed for another reason"),
+}
+VAULT_CHECK_FALLBACK = 40
+_COUNT_LINE = re.compile(r"rules (\d{1,4}) -> (\d{1,4})(?:, (\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?Z?)?))?")
+
+
+class CheckResult:
+    """What one run of the check came to: its exit code UNCHANGED (None when it was killed, timed out or never ran), the outcome name, and the
+    counts of its count line (None, None when none was found). Never an address."""
+    def __init__(self, code, outcome, before=None, after=None, line=None):
+        self.code, self.outcome, self.before, self.after, self.line = code, outcome, before, after, line
+
+    @property
+    def effective(self):
+        return self.code if self.code in VAULT_CHECK_CODES else VAULT_CHECK_FALLBACK
+
+
+VAULT_CHECK_MAX_ENTRIES = 200000       # a checkout with more entries than this is refused (a bounded walk)
+VAULT_CHECK_SKIP = (".git",)           # the top-level version-control directory is never loaded by the interpreter
+
+
+def _entry_problem(found, what):
+    """One lstat result judged: not a link, owned by the user, not group- or world-writable. Returns a reason or None."""
+    if stat.S_ISLNK(found.st_mode):
+        return "has %s that is a symlink" % what
+    if found.st_uid != os.getuid():
+        return "has %s that is not owned by the user" % what
+    if found.st_mode & 0o022:
+        return "has %s that is group- or world-writable" % what
+    return None
+
+
+def parents_problem(path):
+    """THE walk up from a trusted path (an absolute one): every parent from / down is judged with lstat, never followed: no symlink, owned by root or
+    the user, and not group- or world-writable unless it carries the sticky bit. A reason (never the path) or None. Every trusted path of the vault
+    check (the checkout and the lock's directory) goes through this one function."""
+    parts = [x for x in path.split("/") if x]
+    here = "/"
+    for part in [""] + parts[:-1]:
+        here = os.path.join(here, part) if part else "/"
+        try:
+            found = os.lstat(here)
+        except OSError:
+            return "has a parent that cannot be read"
+        if stat.S_ISLNK(found.st_mode):
+            return "has a parent that is a symlink"
+        if not stat.S_ISDIR(found.st_mode):
+            return "has a parent that is not a directory"
+        if found.st_uid not in (0, os.getuid()):
+            return "has a parent that is owned by another user"
+        if found.st_mode & 0o022 and not found.st_mode & stat.S_ISVTX:
+            return "has a parent that is group- or world-writable"
+    return None
+
+
+def vault_check_dir_problem(checkout):
+    """None when `checkout` is a usable checkout, else ONE short reason (never the path's content). `python3 -m` loads anything under the checkout,
+    so EVERY entry is judged (lstat, never followed): an absolute path to an existing directory that is not a symlink, owned by the user, with every
+    entry (directories, files, links, every __init__.py) owned by the user, not group- or world-writable and not a symlink; every parent judged by
+    parents_problem; and scripts/v2/cw_vault_firewall.py a regular file. The top-level .git directory is not walked."""
+    if not isinstance(checkout, str) or not checkout.strip() or not os.path.isabs(checkout) or ".." in checkout.split("/"):
+        return "is not an absolute path"
+    checkout = checkout.rstrip("/") or "/"
+    problem = parents_problem(checkout)
+    if problem:
+        return problem
+    try:
+        top = os.lstat(checkout)
+    except OSError:
+        return "has no checkout directory"
+    problem = _entry_problem(top, "the checkout")
+    if problem:
+        return problem
+    if not stat.S_ISDIR(top.st_mode):
+        return "is not a directory"
+    module = os.path.join(checkout, VAULT_CHECK_FILE)
+    try:
+        found = os.lstat(module)
+    except OSError:
+        return "has no module"
+    if not stat.S_ISREG(found.st_mode):
+        return "has a module that is not a regular file"
+    count, stack = 0, [checkout]
+    while stack:
+        here = stack.pop()
+        try:
+            names = os.listdir(here)
+        except OSError:
+            return "has a directory that cannot be read"
+        for name in names:
+            if here == checkout and name in VAULT_CHECK_SKIP:
+                continue
+            count += 1
+            if count > VAULT_CHECK_MAX_ENTRIES:
+                return "has more than %d entries" % VAULT_CHECK_MAX_ENTRIES
+            full = os.path.join(here, name)
+            try:
+                found = os.lstat(full)
+            except OSError:
+                return "has an entry that cannot be read"
+            problem = _entry_problem(found, "an entry")
+            if problem:
+                return problem
+            if stat.S_ISDIR(found.st_mode):
+                stack.append(full)
+    return None
+
+
+def _check_python():
+    if VAULT_CHECK_PYTHON:
+        return VAULT_CHECK_PYTHON
+    found = shutil.which("python3", path=PREFLIGHT_PATH)
+    return os.path.abspath(found) if found else None
+
+
+def _kill_group(child):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(child.pid, sig)
+        except OSError:
+            pass
+        try:
+            child.wait(5)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    try:   # the whole group, also what the child left behind
+        os.killpg(child.pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def vault_check_ready(env):
+    """(checkout, python3) when the check may run, else a CloudError (exit 2, naming CW_VAULT_CHECK_DIR, never the path) and NOTHING has run."""
+    checkout = (env.get(VAULT_CHECK_KEY) or "").strip()
+    if not checkout:
+        raise CloudError("refused: %s is not set: the vault refused this machine and the owner of the vault access check provides the checkout it runs "
+                         "from; nothing was changed" % VAULT_CHECK_KEY, EXIT_USAGE)
+    problem = vault_check_dir_problem(checkout)
+    if problem:
+        raise CloudError("refused: %s %s: the owner of the vault access check provides the checkout; nothing was run" % (VAULT_CHECK_KEY, problem), EXIT_USAGE)
+    python = _check_python()
+    if not python:
+        raise CloudError("refused: python3 was not found for the vault access check; nothing was run", EXIT_USAGE)
+    return checkout, python
+
+
+def run_vault_check(env):
+    """THE one call of the vault access check: runs the module with the argument list [python3, -m, MODULE, check] from the checkout (after
+    vault_check_ready), in a scrubbed environment, for at most VAULT_CHECK_SECONDS (+ grace; the process group is killed), and returns a CheckResult
+    carrying the exit code unchanged. Its output is read for the count line only and is never printed or kept."""
+    checkout, python = vault_check_ready(env)
+    argv = [python, "-m", VAULT_CHECK_MODULE] + list(VAULT_CHECK_ARGS)
+    out = ""
+    try:
+        with tempfile.TemporaryDirectory(prefix="cw-vcheck-") as home:
+            out_path = os.path.join(home, "out")   # a file, not a pipe: a grandchild that keeps it open cannot hold us up
+            with open(out_path, "wb") as sink:
+                child = subprocess.Popen(argv, cwd=checkout, env=_scrubbed_env(env, home, VAULT_CHECK_ENV_NAMES, openssl=False, real_home=True),
+                                         stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.DEVNULL, start_new_session=True)
+                try:
+                    child.wait(timeout=VAULT_CHECK_SECONDS + VAULT_CHECK_GRACE)
+                except subprocess.TimeoutExpired:
+                    _kill_group(child)
+                    return CheckResult(None, "timed-out")
+                except BaseException:
+                    _kill_group(child)
+                    raise
+                try:   # whatever the check left running in its group ends with it
+                    os.killpg(child.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            with open(out_path, "rb") as source:
+                out = source.read(100001).decode("utf-8", "replace")
+    except OSError:
+        return CheckResult(None, "not-run")
+    code = child.returncode
+    outcome = VAULT_CHECK_CODES[code][0] if code in VAULT_CHECK_CODES else "unknown-code"
+    before = after = line = None
+    for text in out[:100000].splitlines():
+        found = _COUNT_LINE.search(text)
+        if found:
+            before, after = int(found.group(1)), int(found.group(2))
+            line = "rules %d -> %d%s" % (before, after, ", " + found.group(3) if found.group(3) else "")   # rebuilt from the parts, never echoed
+            break
+    return CheckResult(code, outcome, before, after, line)
 
 
 def token_mode(env):
@@ -667,6 +893,11 @@ def read_run_secret_values(fds):
     return values
 
 
+def pod_deadline_floor(max_hard):
+    """The pod's own activeDeadlineSeconds: the cap (a duration text, never empty) plus the grace; always finite."""
+    return parse_duration(max_hard or DEFAULT_MAX_HARD) + POD_DEADLINE_GRACE_SECONDS
+
+
 def render_pod(a, worker, name, now, hard, env, run_names=()):
     image = a.image or env.get("CW_CLOUD_IMAGE")
     if not image:
@@ -691,9 +922,10 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
         "name": name, "labels": {"app": LABEL, "cw/worker": worker, "azure.workload.identity/use": "true"},
         "annotations": {"cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
                         "cw/idle-seconds": e["CW_IDLE_SECONDS"], "cw/shape": a.shape,
-                        "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard))),
+                        "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard or DEFAULT_MAX_HARD))),
                         **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {})}},
-        "spec": {"restartPolicy": "Never", "serviceAccountName": env.get("CW_CLOUD_SERVICE_ACCOUNT", "cw-worker"),
+        "spec": {"restartPolicy": "Never", "activeDeadlineSeconds": pod_deadline_floor(a.max_hard),
+                 "serviceAccountName": env.get("CW_CLOUD_SERVICE_ACCOUNT", "cw-worker"),
                   "automountServiceAccountToken": False,
                   "securityContext": copy.deepcopy(POD_SECURITY_CONTEXT),
                  "containers": [{"name": "worker", "image": image,
@@ -949,31 +1181,64 @@ class Launcher:
         """Wait for a stack pod; on the fresh-node race (the runtime handler is not yet known to the node's containerd) delete
         THE POD ONLY and create it again with the same run id and nonce, at most STACK_ATTEMPTS times inside
         STACK_RACE_WINDOW_SECONDS. The password Secret and the per-run Secret are made once, before the first attempt, and are
-        never touched here: the pod refers to them by name, so a second attempt reads the same objects. Any other failure is not retried."""
+        never touched here: the pod refers to them by name, so a second attempt reads the same objects. The same bounded retry also
+        recreates a pod that VANISHES while pending (it was seen, then a get says not found); a pod never seen, and any other
+        failure, are not retried."""
         deadline = self.clock() + dt.timedelta(seconds=STACK_RACE_WINDOW_SECONDS)
         attempt = 1
         while True:
+            seen = []   # this attempt's pod: set once a get returned it
+
+            def watch(pod, seen=seen):
+                if pod is None and seen:
+                    raise _PodVanished("pod vanished")
+                if pod is not None:
+                    seen.append(1)
+                    self._raise_on_race(name, pod)
             try:
-                self._wait_ready(name, seconds, lambda pod: self._raise_on_race(name, pod))
-            except _FreshNodeRace as race:
+                self._wait_ready(name, seconds, watch)
+            except (_FreshNodeRace, _PodVanished) as race:
                 last = attempt >= STACK_ATTEMPTS or self.clock() >= deadline
                 self.audit(worker, "pod/" + name, "create-attempt", 0.0, False,
                            "attempt %d of %d: %s%s" % (attempt, STACK_ATTEMPTS, race, "; giving up" if last else "; recreating the pod"))
                 if last:
+                    if isinstance(race, _PodVanished):
+                        raise CloudError("the worker pod could not start: the pod vanished while pending (the fresh-node race: the node's "
+                                         "runtime restarted); gave up after %d attempt(s)" % attempt) from None
                     raise CloudError("the worker pod could not start: the node's runtime handler %s was not ready (the fresh-node race: %s); "
                                      "gave up after %d attempt(s)" % (STACK_RUNTIME_CLASS, race, attempt)) from None
                 if self._mine("pod", name) is False:
                     self.foreign.append("pod/" + name)
                     raise CloudError("the pod %s is not this call's (its run id does not match); left whole" % name) from None
+                self._refuse_if_removed(name, made)   # a stop, the reaper or someone else removed this call's own objects: not the race
                 self.kube.delete_pod_and_wait(name)
                 attempt += 1
                 self._make(made, "pod", self.kube.apply, spec)
+                self._refuse_if_removed(name, made)   # a stop that deleted the pod, then its Secrets, may have landed between the check and here
                 continue
             except CloudError as e:
                 self.audit(worker, "pod/" + name, "create-attempt", 0.0, False, "attempt %d of %d: %s" % (attempt, STACK_ATTEMPTS, e))
                 raise
+            self._refuse_if_removed(name, made)   # the stop's Secret deletes may have come after the pod went: never report a pod whose Secrets are gone
             self.audit(worker, "pod/" + name, "create-attempt", 0.0, True, "attempt %d of %d: ready" % (attempt, STACK_ATTEMPTS))
             return
+
+    def _refuse_if_removed(self, name, made):
+        gone = self._own_objects_gone(name, made)
+        if gone:
+            raise CloudError("the worker pod was removed from outside (%s no longer exist(s) or are not this call's): not recreated, and not reported ready" % ", ".join(gone)) from None
+
+    def _own_objects_gone(self, name, made):
+        """The Secrets this call made that are no longer this call's in the cluster: missing, or (with a run id) carrying another's."""
+        gone = []   # a get that errors (not "not found") raises CloudError: the create fails, it never reads as "still there"
+        for kind, label, get in (("secret", "secret/%s-pw" % name, lambda: self.kube.get_secret(name + "-pw")),
+                                 ("run", "secret/%s-run" % name, lambda: self.kube.get_run_secret(name))):
+            if not made[kind]:
+                continue
+            obj = get()
+            if not obj or (self.run_id and ((obj.get("metadata") or {}).get("labels") or {}).get("cw/run-id") != self.run_id):
+                gone.append(label)
+        return gone
 
     def _raise_on_race(self, name, pod):
         uid = (pod or {}).get("metadata", {}).get("uid")
@@ -1290,7 +1555,7 @@ SETTINGS = (
     ("CW_APP_ID_CMD", False, "command"),
     ("CW_APP_INSTALLATION_CMD", False, "command"),
     ("CW_APP_KEY_CMD", False, "command"),
-    ("CW_VAULT_CHECK_DIR", False, "path"),         # reserved for the vault pre-check's checkout path: read and validated, not used yet
+    ("CW_VAULT_CHECK_DIR", False, "path"),         # the checkout the vault access check runs from; needed only after a vault firewall refusal (see vault_check_dir_problem)
 )
 SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
 SETTING_REQUIRED = tuple(name for name, required, _ in SETTINGS if required)
