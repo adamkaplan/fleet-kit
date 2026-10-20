@@ -71168,7 +71168,11 @@ class TestAdoption(LanesCase):
                 self.assertEqual([r for r in self.rows() if r["detail"]["worker"] == "w1"], [])
         sb._write_small(self.world.state, sb.RETIRED_FILE, {"orch-a": {"at": 1, "by": "x", "reason": "r", "session": self.world.sessions["orch-a"]}})
         self.daemon_pass()
-        self.assertEqual(self.boss("w1"), "chief-of-staff", "a retirement that names this session does count (charter 1 has no other orchestrator)")
+        diag = {"registry": json.loads((Path(self.world.state) / "registry.json").read_text()) if (Path(self.world.state) / "registry.json").exists() else None,
+                "retired_json": (Path(self.world.state) / "retired.json").read_text() if (Path(self.world.state) / "retired.json").exists() else None,
+                "sessions": self.world.sessions, "made_up_by_test": dict(_MADE_UP_BY_TEST), "fresh": _MADE_UP_FRESH[0], "next": _MADE_UP_NEXT[0], "limit": _pid_limit(),
+                "clock": self.world.clock.now(), "boss_rows": self.rows(), "all_events": [e["event"] for e in self.world.audit()][-12:]}
+        self.assertEqual(self.boss("w1"), "chief-of-staff", "DIAG %s" % json.dumps(diag, default=str, sort_keys=True)[:6000])
 
     def test_a_live_heir_whose_retired_record_names_no_session_is_still_an_heir(self):   # S8: the heir side of the same rule
         self.worker("w1", "gone", charter=1)
