@@ -70730,9 +70730,7 @@ OLD_AGENT_SOURCES = re.compile(r"read_pane_health|read_retired|PANE_HEALTH_FILE|
 # The ONLY places outside bin/registry.py that may still name an old source. Each is slice 2's (#917: retire, reattach, known_agent, the pane pass, the
 # cloud log read, reassign) or the writer of the derived file. The list may only SHRINK: a test below fails when an entry no longer matches anything.
 OLD_SOURCE_ALLOWED = {
-    "fleet-switchboard": {"<module>", "read_pane_health", "write_pane_health", "read_retired", "read_retired_strict", "known_agent", "known_session",
-                          "pane_health_pass", "cmd_reattach", "cmd_reattach_all", "_reattach_locked", "reattach_caller_problem", "cmd_retire"},
-    "cloud_worker.py": {"cmd_read"},
+    "fleet-switchboard": {"<module>", "read_pane_health", "write_pane_health", "known_session", "pane_health_pass", "cmd_reattach_all", "_reattach_locked", "cmd_retire"},
     "reassign.py": {"<module>", "run_reassign"},
 }
 # Live observers: they ask herdr which panes exist right now (`agent list`). Each is a NAMED entry with its reason, never a silent skip. fleet-heartbeat is
