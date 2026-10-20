@@ -31,6 +31,20 @@ MOVED = ('rating_at',
          'clear_lane',
          '_notify_clear_body',
          'notify_clear',
+         '_clear_words',
+         '_clear_notice_key',
+         'clear_notice_record',
+         'clear_notice_queued',
+         '_clear_notice_deliver',
+         'clear_notice_pass',
+         'whole_skipped_note',
+         '_clear_notice_drop',
+         '_pending_read',
+         '_clear_num',
+         '_clear_retry_delay',
+         '_clear_poison',
+         '_clear_audit',
+         'clear_remind_pass',
          'authors_hold_labels',
          'impact_clear_core',
          'cmd_impact_clear',
@@ -435,47 +449,159 @@ def clear_lane(engine, repo, number, body):
     return notice_lane, "the notice" if notice_lane else None, extra
 
 
+def _clear_words(reason):
+    """The owner's words as they may be stored and said: line breaks become spaces, other control characters vanish BEFORE the redaction (a token cannot hide behind one), then redacted, one line, bounded."""
+    flat = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", re.sub(r"[\n\r\t]", " ", reason or ""))
+    return plan_ledger.clip(" ".join(redact_command_text(flat).split()), 300)
+
+
+def _clear_notice_key(repo, number, head, kind):
+    return "%s#%d@%s:%s" % (repo, number, head, kind)
+
+
+def _clear_num(value):
+    """A stored time or count as a number: anything else (a string, a bool, a nan) reads as 0, so one bad entry cannot raise in a sort or a comparison."""
+    return value if _finite(value) and not isinstance(value, bool) else 0
+
+
+def _clear_retry_delay(attempts):
+    """THE spacing of a retry (a notice or a reminder), from the number of attempts made: CLEAR_NOTICE_BACKOFF, the last step repeating. Retries are spaced in time and bounded by AGE (CLEAR_NOTICE_MAX_AGE_SECONDS), never by a count of fast tries."""
+    steps = CLEAR_NOTICE_BACKOFF
+    return steps[min(max(int(_clear_num(attempts)), 1), len(steps)) - 1]
+
+
+def _clear_audit(engine, event, subject, detail):
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, event, subject, detail)
+
+
+def _pending_read(engine):
+    """The pending notices, read whole. A file that is missing is empty; a file that is NOT valid (not JSON, or not an object) is kept aside as `clear-notice-pending.json.corrupt` and audited (`gate.clear_notice_corrupt`) BEFORE anything is
+    written, so the next write never silently overwrites what it could not read; an entry that is not an object is audited (`gate.clear_notice_quarantined`) and left out. A file that cannot be read for another reason raises: the callers audit it and write nothing."""
+    path = Path(engine.state_dir) / CLEAR_PENDING_FILE
+    try:
+        with open(str(path), "rb") as handle:
+            raw = handle.read(1000001)
+    except FileNotFoundError:
+        return {}
+    try:
+        data = json.loads(raw.decode("utf-8")) if len(raw) <= 1000000 else None
+    except (ValueError, UnicodeError):
+        data = None
+    if not isinstance(data, dict):
+        os.replace(str(path), str(path) + ".corrupt")
+        _clear_audit(engine, "gate.clear_notice_corrupt", CLEAR_PENDING_FILE, {"kept_as": CLEAR_PENDING_FILE + ".corrupt"})
+        return {}
+    for key, value in data.items():
+        if not isinstance(value, dict):
+            _clear_audit(engine, "gate.clear_notice_quarantined", str(key)[:120], {"why": "the entry is not an object"})
+    return {k: v for k, v in data.items() if isinstance(v, dict)}
+
+
+def _clear_poison(entry):
+    """The reason an entry of the pending file cannot be worked on (a field of the wrong shape), or None. One such entry is quarantined, never allowed to stop the others."""
+    repo, number, head = entry.get("repo"), entry.get("number"), entry.get("head")
+    if not (isinstance(repo, str) and isinstance(number, int) and not isinstance(number, bool) and isinstance(head, str) and entry.get("kind") in CLEAR_NOTICE_KINDS):
+        return "the record is not a notice"
+    for field in ("at", "claimed", "attempts", "next_at"):
+        value = entry.get(field, 0)
+        if isinstance(value, bool) or not _finite(value):
+            return "the field %s is not a number" % field
+    if not isinstance(entry.get("sent", []), list) or (entry.get("under_order") is not None and not (isinstance(entry["under_order"], dict) and "number" in entry["under_order"])):
+        return "the field sent or under_order has the wrong shape"
+    return None
+
+
+def clear_notice_record(engine, kind, repo, number, head, reason=None, body=None, previous=None, under_order=None):
+    """Write the PENDING notice of a clear (or of a carry) BEFORE any send is tried, so a send that fails, times out or is cut off with the command's process leaves a record the daemon pass
+    finishes. Nothing is written for a notice already delivered, or already pending (it keeps its attempts and what was sent). Bounded (CLEAR_PENDING_MAX; the oldest dropped is audited). Never raises."""
+    try:
+        if engine.state_dir is None:
+            return
+        if kind not in CLEAR_NOTICE_KINDS:
+            raise ValueError("unknown notice kind %r" % (kind,))
+        key = _clear_notice_key(repo, number, head, kind)
+        with impact_state_lock(engine.state_dir):
+            if key in _read_small(engine.state_dir, CLEAR_NOTIFIED_FILE):
+                return
+            pending = _pending_read(engine)
+            if key in pending:
+                return
+            pending[key] = {"repo": repo, "number": number, "head": head, "kind": kind, "words": _clear_words(reason), "body": (body or "")[:CLEAR_PENDING_BODY_MAX] if isinstance(body, str) else "",
+                            "previous": previous, "under_order": under_order, "at": int(engine.now()), "claimed": 0, "attempts": 0, "next_at": 0, "sent": []}
+            dropped = []
+            if len(pending) > CLEAR_PENDING_MAX:
+                for old in sorted(pending, key=lambda k: _clear_num(pending[k].get("at")))[:len(pending) - CLEAR_PENDING_MAX]:
+                    del pending[old]
+                    dropped.append(old)
+            _write_small(engine.state_dir, CLEAR_PENDING_FILE, pending)
+        for old in dropped:   # the cap loses the oldest: said, never silent
+            _clear_audit(engine, "gate.clear_notice_dropped_cap", old, {"key": old, "why": "more than %d pending notices: the oldest is dropped" % CLEAR_PENDING_MAX})
+    except Exception as err:   # the clear is recorded: a notice that cannot even be queued is audited, never fatal
+        engine._note("gate.clear_notify_failed", "%s#%d" % (repo, number), {"error": _one_line("queue: %s: %s" % (type(err).__name__, err), 160)})
+
+
+def clear_notice_queued(engine, kind, repo, number, head):
+    """True while the notice of this clear is pending (not yet delivered): the clear command then says it is queued for delivery."""
+    try:
+        return engine.state_dir is not None and _clear_notice_key(repo, number, head, kind) in _pending_read(engine)
+    except Exception:
+        return False
+
+
 def _notify_clear_body(engine, abandoned, kind, repo, number, head, reason=None, body=None, previous=None, under_order=None):
     """(the work of `notify_clear`, run on its own thread; `abandoned` is set when the caller gave up waiting: then nothing more is audited) #541: tell the Chief of Staff, and the orchestrator whose lane merges the pull request, at once that the owner cleared it (`kind` "clear": his command or his words in the chat, called
-    ONCE from `impact_clear_core`) or that his clear carried to a new head (`kind` "carry": from `previous`, called once from the carry decision). One line. Once per pull request, head and kind (a
-    small private file). The caller has already RECORDED the clear; nothing here can undo it: a failure is audited and swallowed. An unknown lane says `lane unknown` and only the Chief of Staff is told:
-    nobody is guessed. Returns the audit detail it wrote, or None when nothing was sent."""
+    ONCE from `impact_clear_core`) or that his clear carried to a new head (`kind` "carry": from `previous`, called once from the carry decision). One line. The caller has already RECORDED the clear; nothing here can undo it: a failure is audited and swallowed.
+    An unknown lane says `lane unknown` and only the Chief of Staff is told: nobody is guessed. The notice is a PENDING record (`clear_notice_record`) until every recipient has it: this works on that record under a short claim (the command and the daemon are two
+    processes), sends only to the recipients not yet told, and on full delivery removes the record and writes the once-per-head mark (`clear-notified.json`). A failure leaves the record for the daemon's pass. Returns the audit detail it wrote, or None when nothing was sent."""
     pr = "%s#%d" % (repo, number)
+    key = _clear_notice_key(repo, number, head, kind)
     try:
         if engine.state_dir is None or engine.audit is None:
             return None
-        key = "%s@%s:%s" % (pr, head, kind)
-        with impact_state_lock(engine.state_dir):   # the command and the daemon are two processes: the check and the mark are one step (the send is outside it)
-            seen = _read_small(engine.state_dir, CLEAR_NOTIFIED_FILE)
-            if key in seen:
+        clear_notice_record(engine, kind, repo, number, head, reason, body, previous, under_order)
+        with impact_state_lock(engine.state_dir):   # the command and the daemon are two processes: the check and the claim are one step (the send is outside it)
+            if key in _read_small(engine.state_dir, CLEAR_NOTIFIED_FILE):
                 return None
-            seen[key] = {"at": int(engine.now())}
-            if len(seen) > CLEAR_NOTIFIED_MAX:
-                for old in sorted(seen, key=lambda k: seen[k].get("at", 0))[:len(seen) - CLEAR_NOTIFIED_MAX]:
-                    del seen[old]
-            _write_small(engine.state_dir, CLEAR_NOTIFIED_FILE, seen)   # before the send: at most once, even when the send fails
-        lane, how, extra = clear_lane(engine, repo, number, body)
+            pending = _pending_read(engine)
+            entry = pending.get(key)
+            now = int(engine.now())
+            if entry is None or _clear_poison(entry) or now - entry.get("claimed", 0) < CLEAR_NOTICE_CLAIM_SECONDS or now < entry.get("next_at", 0):
+                return None   # gone, malformed (the pass quarantines it), another process is delivering it, or it is not due yet
+            entry["claimed"], entry["attempts"] = now, int(entry.get("attempts", 0)) + 1
+            _write_small(engine.state_dir, CLEAR_PENDING_FILE, pending)
+        words, under_order, previous = entry.get("words") or "", entry.get("under_order"), entry.get("previous")
+        lane, how, extra = clear_lane(engine, repo, number, entry.get("body") or None)
         unknown = ("lane unclear: plan lane %s, notice by %s" % tuple(extra["unclear"]) if extra.get("unclear") else "lane unknown") + (": charter #%s has %d orchestrators: %s" % (extra.get("charter"), len(extra["candidates"]), ", ".join(extra["candidates"])) if extra.get("candidates") else "")
         if kind == "carry":
             line = "owner's clear carried %s from %s to %s; %s" % (pr, (previous or "?")[:8], head[:8], "%s merges it" % lane if lane else unknown)
+        elif kind != "clear":
+            raise ValueError("unknown notice kind %r" % (kind,))   # a kind of the table with no wording is a defect, never a silent send
+        elif under_order:   # #661: the same line, naming the Chief of Staff as the clearer and the owner's order
+            scored = " (score %s, threshold %s)" % (under_order.get("score"), under_order["threshold"]) if under_order.get("threshold") else ""   # #835: a clear by score shows both
+            line = "%s cleared %s at %s under the owner's standing order %s%s: \"%s\"; %s" % (under_order.get("by") or "the chief of staff", pr, head[:8], under_order["number"], scored, words, "%s merges it" % lane if lane else unknown)
         else:
-            flat = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", re.sub(r"[\n\r\t]", " ", reason or ""))   # line breaks become spaces, other control characters vanish BEFORE the redaction: a token cannot hide behind one
-            words = " ".join(redact_command_text(flat).split())
-            if under_order:   # #661: the same line, naming the Chief of Staff as the clearer and the owner's order
-                scored = " (score %s, threshold %s)" % (under_order.get("score"), under_order["threshold"]) if under_order.get("threshold") else ""
-                line = "%s cleared %s at %s under the owner's standing order %s%s: \"%s\"; %s" % (under_order.get("by") or "the chief of staff", pr, head[:8], under_order["number"], scored, plan_ledger.clip(words, 300), "%s merges it" % lane if lane else unknown)
-            else:
-                line = "owner cleared %s at %s: \"%s\"; %s" % (pr, head[:8], plan_ledger.clip(words, 300), "%s merges it" % lane if lane else unknown)
+            line = "owner cleared %s at %s: \"%s\"; %s" % (pr, head[:8], words, "%s merges it" % lane if lane else unknown)
         sent, failed = [], []
+        already = list(entry.get("sent") or [])
         for name in ["chief-of-staff"] + ([lane] if lane else []):
+            if name in already:
+                sent.append(name)   # told on an earlier attempt: never told twice
+                continue
             try:
                 outcome = engine.send("switchboard", name, line)
                 if isinstance(outcome, dict) and outcome.get("sent") is False:
                     failed.append("%s: %s" % (name, _one_line(str(outcome.get("reason") or outcome.get("action") or "not delivered"), 100)))
-                else:
-                    sent.append(name)
+                    continue
             except Exception as err:   # a send that fails never undoes the clear
                 failed.append("%s: %s" % (name, _one_line(str(err), 100)))
+                continue
+            sent.append(name)
+            with impact_state_lock(engine.state_dir):   # told: remembered at once, so a retry after a cut-off never repeats it
+                pending = _pending_read(engine)
+                if key in pending:
+                    pending[key]["sent"] = sorted(set(pending[key].get("sent") or []) | {name})
+                    _write_small(engine.state_dir, CLEAR_PENDING_FILE, pending)
         detail = {"head": head, "kind": kind, "lane": lane, "lane_from": how, "sent": sent}
         if extra.get("candidates"):
             detail["candidates"] = extra["candidates"]
@@ -483,6 +609,20 @@ def _notify_clear_body(engine, abandoned, kind, repo, number, head, reason=None,
             detail["lane_unclear"] = extra["unclear"]   # the plan's lane and the notice sender's lane differ: neither is told to merge
         if failed:
             detail["failed"] = failed
+        with impact_state_lock(engine.state_dir):
+            pending = _pending_read(engine)
+            if not failed:   # every recipient has it: the record goes and the once-per-head mark is written
+                pending.pop(key, None)
+                seen = _read_small(engine.state_dir, CLEAR_NOTIFIED_FILE)
+                seen[key] = {"at": int(engine.now())}
+                if len(seen) > CLEAR_NOTIFIED_MAX:
+                    for old in sorted(seen, key=lambda k: seen[k].get("at", 0))[:len(seen) - CLEAR_NOTIFIED_MAX]:
+                        del seen[old]
+                _write_small(engine.state_dir, CLEAR_NOTIFIED_FILE, seen)
+            elif key in pending:
+                pending[key]["claimed"] = 0
+                pending[key]["next_at"] = int(engine.now()) + _clear_retry_delay(pending[key].get("attempts"))   # the next try is SPACED (never at the pass cadence)
+            _write_small(engine.state_dir, CLEAR_PENDING_FILE, pending)
         if not abandoned.is_set():
             engine.audit.append(engine.actor, "gate.clear_notified" if sent else "gate.clear_notify_failed", pr, detail)
         return detail
@@ -496,11 +636,13 @@ def _notify_clear_body(engine, abandoned, kind, repo, number, head, reason=None,
 
 
 def notify_clear(engine, kind, repo, number, head, reason=None, body=None, previous=None, under_order=None):
-    """#541: the notice of an owner clear (or of a carry), LAST, after everything else of it is done and bounded by a deadline: the work (lane lookup, sends) runs on its own thread and the
-    caller waits at most NOTIFY_CLEAR_DEADLINE_SECONDS. On a timeout, an interrupt or an exception it gives up, audits `gate.clear_notify_failed` once with the reason, and returns None: the clear's
+    """#541: the notice of an owner clear (or of a carry), LAST, after everything else of it is done and bounded by a deadline: the notice is first QUEUED as a pending record (a file write), then the work (lane lookup, sends)
+    runs on its own thread and the caller waits at most NOTIFY_CLEAR_DEADLINE_SECONDS. The deadline keeps the command from hanging; it does not decide delivery: on a timeout, an interrupt or an exception it gives up, audits
+    `gate.clear_notify_failed` once with the reason, returns None, and the notice stays PENDING for the daemon's pass (`clear_notice_pass`), which delivers it: "queued for delivery" is a success for the command. The clear's
     result, exit status and output are exactly as without a notice. (A send still running when it gives up is left to finish on its daemon thread; it audits nothing more.)"""
     pr = "%s#%d" % (repo, number)
     abandoned, result = threading.Event(), []
+    clear_notice_record(engine, kind, repo, number, head, reason, body, previous, under_order)
 
     def work():
         result.append(_notify_clear_body(engine, abandoned, kind, repo, number, head, reason, body, previous, under_order))
@@ -521,6 +663,147 @@ def notify_clear(engine, kind, repo, number, head, reason=None, body=None, previ
     except BaseException:
         pass
     return None
+
+
+def _clear_notice_deliver(engine, entry):
+    """Deliver one pending entry, as the command does (same claim, same line, same once-per-head mark)."""
+    abandoned = threading.Event()
+    return _notify_clear_body(engine, abandoned, entry["kind"], entry["repo"], entry["number"], entry["head"], entry.get("words"), entry.get("body"), entry.get("previous"), entry.get("under_order"))
+
+
+def clear_notice_pass(engine, now):
+    """The daemon's pass over the PENDING clear notices (`clear-notice-pending.json`) and over the cleared pull requests that are ready. Never raises.
+    Notices: one that is not due (claimed, or before its `next_at`: a failed delivery is retried after CLEAR_NOTICE_BACKOFF, 1 minute then longer, then hourly) is skipped without a read. A due one is judged against a FRESH read of its pull request (one `gh pr view` per
+    pull request and pass; a read that fails is not whole, so nothing is dropped, nothing is sent and it is tried again). Merged or closed: dropped. A head that is not the cleared head: dropped (the clear is void). Older than
+    CLEAR_NOTICE_MAX_AGE_SECONDS: dropped and audited (`gate.clear_notice_abandoned`), never silently: the budget is TIME, not a count of tries. Otherwise delivered like the command does it, to the recipients not yet told. An entry of the
+    wrong shape is quarantined (`gate.clear_notice_quarantined`) and the others go on. At most CLEAR_NOTICE_PASS_MAX deliveries a pass. Reminder: `clear_remind_pass`."""
+    if engine.state_dir is None or engine.audit is None:
+        return
+    try:
+        with impact_state_lock(engine.state_dir):
+            pending = _pending_read(engine)
+        done, reads = 0, {}
+        for key, entry in sorted(pending.items(), key=lambda kv: _clear_num(kv[1].get("at"))):
+            if done >= CLEAR_NOTICE_PASS_MAX:
+                break
+            try:
+                why = _clear_poison(entry)
+                if why:
+                    _clear_notice_drop(engine, key, why, event="gate.clear_notice_quarantined")
+                    continue
+                repo, number, head = entry["repo"], entry["number"], entry["head"]
+                if now - entry.get("claimed", 0) < CLEAR_NOTICE_CLAIM_SECONDS or now < entry.get("next_at", 0):
+                    continue   # the command (or an earlier pass) is delivering it, or its retry is not due
+                pr = "%s#%d" % (repo, number)
+                try:
+                    if pr not in reads:
+                        reads[pr] = read_pr_json(engine, repo, number)
+                    raw = reads[pr]
+                    state, live = raw.get("state"), raw.get("headRefOid")
+                except Exception as err:   # not read whole: no drop, no send; again next pass
+                    whole_skipped_note(engine, key, err)
+                    continue
+                if state in ("MERGED", "CLOSED"):
+                    _clear_notice_drop(engine, key, "the pull request is %s" % state.lower(), pr=pr)
+                elif not isinstance(live, str) or not live or not isinstance(state, str):
+                    continue   # an answer without a head or state is not a whole read
+                elif live != head:
+                    _clear_notice_drop(engine, key, "the head changed: the clear is void", pr=pr)
+                elif now - entry.get("at", 0) > CLEAR_NOTICE_MAX_AGE_SECONDS:
+                    _clear_notice_drop(engine, key, "gave up: pending for more than %d hours" % (CLEAR_NOTICE_MAX_AGE_SECONDS // 3600), pr=pr, event="gate.clear_notice_abandoned")
+                else:
+                    done += 1
+                    _clear_notice_deliver(engine, entry)
+            except Exception as err:   # one entry never stops the others
+                engine._note("gate.clear_notify_failed", key, {"error": _one_line("entry: %s: %s" % (type(err).__name__, err), 160)})
+    except Exception as err:
+        engine._note("gate.clear_notify_failed", None, {"error": _one_line("pass: %s: %s" % (type(err).__name__, err), 160)})
+    try:
+        clear_remind_pass(engine, now)
+    except Exception as err:
+        engine._note("gate.clear_remind_failed", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+
+
+def whole_skipped_note(engine, key, err):
+    """One line, once per notice and error text, saying a pending notice could not be judged (its pull request was not read): it is kept."""
+    said = engine.__dict__.setdefault("clear_notice_said", set())
+    if len(said) >= 500:
+        said.clear()   # bounded: a long-lived daemon says it again at worst
+    if (key, str(err)) not in said:
+        said.add((key, str(err)))
+        engine._note("gate.clear_notice_unread", key, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+
+
+def _clear_notice_drop(engine, key, why, pr=None, event="gate.clear_notice_dropped"):
+    with impact_state_lock(engine.state_dir):
+        pending = _pending_read(engine)
+        if pending.pop(key, None) is not None:
+            _write_small(engine.state_dir, CLEAR_PENDING_FILE, pending)
+    engine.audit.append(engine.actor, event, pr or key, {"key": key, "why": why})
+
+
+def clear_remind_pass(engine, now):
+    """(#827) A held pull request the owner CLEARED, that the lane has not merged `clear_remind_minutes` (default 15) after the clear while it is open at the cleared head, mergeable and its gates READY (the daemon's own examination at that
+    head), gets ONE reminder to its lane, "cleared, merge it", once per head (`clear-reminded.json`). The read-whole rule: the open-list input of its repository (`pulls:<repo>`) must have been read whole, else no reminder. A lane that cannot be
+    resolved is not guessed: audited once, marked, nobody told. A failed send is retried after CLEAR_NOTICE_BACKOFF and given up (audited) after CLEAR_NOTICE_MAX_AGE_SECONDS."""
+    picture = getattr(engine, "ci_record_state", None)
+    if picture is None:
+        return
+    minutes = (engine.config or {}).get("clear_remind_minutes", DEFAULTS["clear_remind_minutes"])
+    clears, problem = read_impact_state(engine.state_dir)
+    if problem:
+        return
+    with impact_state_lock(engine.state_dir):
+        reminded = _read_small(engine.state_dir, CLEAR_REMINDED_FILE)
+    for pr, clear in sorted(clears["clears"].items()):
+        head, at = clear.get("head"), clear.get("at")
+        if not isinstance(head, str) or not _finite(at) or now - at < minutes * 60 or "%s@%s" % (pr, head) in reminded and reminded["%s@%s" % (pr, head)].get("done"):
+            continue
+        repo, _, number = pr.rpartition("#")
+        key = plan_ledger.normal_repo(repo)
+        view = picture.pr_state.get("%s#%s" % (key, number)) or {}
+        if whole_skipped(engine, "clear-remind", "pulls:" + key) or view.get("state") != "open" or view.get("head") != head or view.get("examined_head") != head \
+                or str(view.get("mergeable") or "").upper() != "MERGEABLE" or not (isinstance(view.get("gates"), dict) and view["gates"].get("ready") is True):
+            continue
+        mark = "%s@%s" % (pr, head)
+        try:
+            raw = read_pr_json(engine, repo, int(number))
+            if raw.get("state") != "OPEN" or raw.get("headRefOid") != head:
+                continue
+            lane, how, extra = clear_lane(engine, repo, int(number), raw.get("body"))
+        except Exception as err:
+            whole_skipped_note(engine, mark, err)
+            continue
+        earlier = reminded.get(mark) or {}
+        if now < _clear_num(earlier.get("next_at")):
+            continue   # a failed send is retried after CLEAR_NOTICE_BACKOFF, never at the pass cadence
+        entry = {"at": int(now), "first": int(_clear_num(earlier.get("first")) or now), "attempts": int(_clear_num(earlier.get("attempts"))) + 1, "done": False}
+        if not lane:
+            entry["done"] = True
+            engine.audit.append(engine.actor, "gate.clear_remind_skipped", pr, {"head": head, "why": "lane unknown: nobody is guessed"})
+        else:
+            failure = None
+            try:
+                outcome = engine.send("switchboard", lane, "%s is cleared by the owner at %s, mergeable and its gates are READY: cleared, merge it" % (pr, head[:8]))
+                if isinstance(outcome, dict) and outcome.get("sent") is False:
+                    failure = _one_line(str(outcome.get("reason") or outcome.get("action") or "not delivered"), 100)
+            except Exception as err:
+                failure = _one_line("%s: %s" % (type(err).__name__, err), 100)
+            if failure is None:
+                entry["done"] = True
+                engine.audit.append(engine.actor, "gate.clear_reminded", pr, {"head": head, "lane": lane, "attempts": entry["attempts"]})   # only a reminder that was SENT
+            elif now - entry["first"] > CLEAR_NOTICE_MAX_AGE_SECONDS:
+                entry["done"] = True   # given up after a long time, loudly and as what it is: never recorded as sent
+                engine.audit.append(engine.actor, "gate.clear_remind_abandoned", pr, {"head": head, "lane": lane, "attempts": entry["attempts"], "error": failure})
+            else:
+                entry["next_at"] = int(now) + _clear_retry_delay(entry["attempts"])
+        with impact_state_lock(engine.state_dir):
+            reminded = _read_small(engine.state_dir, CLEAR_REMINDED_FILE)
+            reminded[mark] = entry
+            if len(reminded) > CLEAR_NOTIFIED_MAX:
+                for old in sorted(reminded, key=lambda k: reminded[k].get("at", 0))[:len(reminded) - CLEAR_NOTIFIED_MAX]:
+                    del reminded[old]
+            _write_small(engine.state_dir, CLEAR_REMINDED_FILE, reminded)
 
 
 def authors_hold_labels(names, raw, already):
@@ -601,6 +884,8 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
         engine.audit.append(engine.actor, "gate.hold_cleared", pr, detail)   # inside the lock
     lines = ["cleared the impact hold of %s at %s: removed %s; the daemon will not re-add it for this head" % (pr, head_now[:8], ", ".join(remove))] + neutralise_marker(engine, runner, repo, number, head_now, raw)
     notify_clear(engine, "clear", repo, number, head_now, reason=reason, body=raw.get("body"), under_order=under_order and dict(under_order, by=who))   # LAST: the state, the labels, the marker line and the audit are all done; it can neither delay nor alter them
+    if clear_notice_queued(engine, "clear", repo, number, head_now):
+        lines.append("the notice to the lane is queued for delivery: the daemon delivers it (the clear itself is recorded)")   # a success for the command: the deadline only keeps it from hanging
     return lines
 
 

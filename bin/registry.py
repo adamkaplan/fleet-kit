@@ -105,8 +105,13 @@ def _old_retired(state_dir):
 
 
 def pane_record(row):
-    """What a retirement keeps of an agent row."""
-    return {k: row[k] for k in RECORD_FIELDS if isinstance(row, dict) and row.get(k) is not None}
+    """What a retirement keeps of an agent row: the pane fields, and for a non-local agent its `kind` and `run_id` (so `unretire` restores a cloud worker as one)."""
+    out = {k: row[k] for k in RECORD_FIELDS if isinstance(row, dict) and row.get(k) is not None}
+    if isinstance(row, dict) and row.get("kind") not in (None, "local"):
+        out["kind"] = row["kind"]
+        if row.get("run_id") is not None:
+            out["run_id"] = row["run_id"]
+    return out
 
 
 def _agent(fields, state="idle", since=None):
@@ -146,7 +151,7 @@ def fold_old(state_dir, now=None):
                 rec = json.loads(path.read_text())
             except (OSError, ValueError):
                 continue
-            if isinstance(rec, dict) and path.name[:-5] not in agents:
+            if isinstance(rec, dict) and path.name[:-5] not in agents and not covers(retired.get(path.name[:-5]), rec.get("session")):
                 agents[path.name[:-5]] = _agent({"session": rec.get("session"), "repo": rec.get("repo"), "kind": "cloud",
                                                  "run_id": rec.get("run_id") or rec.get("runtime_id")}, "idle", now)
     return {"whole": True, "version": VERSION, "agents": agents, "retired": retired, "problem": None}
@@ -182,7 +187,11 @@ def _derive(state_dir, doc):
         pass
 
 
-def _audit(state_dir, events):
+def _stamp(now):
+    return int(time.time() if now is None else now)
+
+
+def _audit(state_dir, events, now=None):
     if not events:
         return
     path = Path(state_dir) / AUDIT
@@ -196,7 +205,7 @@ def _audit(state_dir, events):
         fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a") as handle:
             for event in events:
-                handle.write(json.dumps(dict(event, at=int(time.time())), sort_keys=True) + "\n")
+                handle.write(json.dumps(dict({"at": _stamp(now)}, **event), sort_keys=True) + "\n")
     except OSError:
         pass
 
@@ -273,7 +282,7 @@ def covers(entry, session):
     return isinstance(entry, dict) and entry.get("session") is not None and entry.get("session") == session
 
 
-def _mutate(state_dir, change):
+def _mutate(state_dir, change, now=None):
     """One locked read-change-write. `change(doc)` returns (changed, events, problem)."""
     try:
         with _Lock(state_dir):
@@ -286,7 +295,7 @@ def _mutate(state_dir, change):
             if changed:
                 _write_atomic(Path(state_dir) / FILE, _text(doc))
                 _derive(state_dir, doc)
-            _audit(state_dir, events)   # a change that wrote nothing may still carry an event (a REFUSED removal is audited with its reason)
+            _audit(state_dir, events, now)   # a change that wrote nothing may still carry an event (a REFUSED removal is audited with its reason)
             return {"changed": changed, "problem": problem}
     except TimeoutError as err:
         return {"changed": False, "problem": str(err)}
@@ -299,32 +308,32 @@ def _prune(retired, now):
         retired.pop(old, None)
 
 
-def _retire(state_dir, name, by, reason, auto, event, session=None, record=None, extra=None):
+def _retire(state_dir, name, by, reason, auto, event, session=None, record=None, extra=None, now=None):
     def change(doc):
-        now = int(time.time())
+        now_ = _stamp(now)
         row = doc["agents"].pop(name, None)
         if row is None and session is None and name not in doc["retired"]:
             pass   # nothing known of it: retired with no session, which covers nothing
-        _prune(doc["retired"], now)
-        entry = {"at": now, "by": by, "reason": reason, "session": session or (row or {}).get("session"), "auto": bool(auto)}
+        _prune(doc["retired"], now_)
+        entry = {"at": now_, "by": by, "reason": reason, "session": session or (row or {}).get("session"), "auto": bool(auto)}
         rec = record if record is not None else (pane_record(row) if row else None)
         if rec:
             entry["record"] = rec
         entry.update(extra or {})
         doc["retired"][name] = entry
         return True, [{"event": event, "name": name, "by": by, "reason": reason, "auto": bool(auto), "session": entry["session"]}], None
-    return _mutate(state_dir, change)
+    return _mutate(state_dir, change, now)
 
 
-def retire(state_dir, name, by, reason, auto=False, session=None, record=None, extra=None):
+def retire(state_dir, name, by, reason, auto=False, session=None, record=None, extra=None, now=None):
     """The agent keeps its record under `retired` and leaves `agents`. `session`, `record` and `extra` (optional) carry what the caller knows when the
     agent has no row (a lost headless worker, a retirement of an agent seen only by discovery)."""
-    return _retire(state_dir, name, by, reason, auto, "retire", session, record, extra)
+    return _retire(state_dir, name, by, reason, auto, "retire", session, record, extra, now)
 
 
-def close(state_dir, name, by, reason, session=None, record=None, extra=None):
+def close(state_dir, name, by, reason, session=None, record=None, extra=None, now=None):
     """The pane is closed on purpose: as `retire`, with the reason recorded."""
-    return _retire(state_dir, name, by, reason, False, "close", session, record, extra)
+    return _retire(state_dir, name, by, reason, False, "close", session, record, extra, now)
 
 
 def unretire(state_dir, name):
@@ -340,18 +349,18 @@ def unretire(state_dir, name):
     return _mutate(state_dir, change)
 
 
-def upsert(state_dir, name, agent):
+def upsert(state_dir, name, agent, now=None):
     """Add or update an agent. NO CHURN: nothing changed writes nothing (`changed: false`). An agent retired for this very session is refused."""
     def change(doc):
         old = doc["agents"].get(name)
         if covers(doc["retired"].get(name), (agent or {}).get("session")):
             return False, [], "%s is retired for this session" % name
-        new = _agent(dict(agent or {}), (old or {}).get("state") or "idle", (old or {}).get("since"))
+        new = _agent(dict(agent or {}), (old or {}).get("state") or "idle", (old or {}).get("since") or _stamp(now))
         if old == new:
             return False, [], None
         doc["agents"][name] = new
         return True, [{"event": "update" if old else "add", "name": name}] if not old else [], None   # an audit line on add only: a change of state is no event
-    return _mutate(state_dir, change)
+    return _mutate(state_dir, change, now)
 
 
 def reconcile_remove(state_dir, name, evidence, whole):

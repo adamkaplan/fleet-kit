@@ -40,7 +40,7 @@ ${EDITOR:-vi} ~/.config/fleet-switchboard/cloud.env
 ls -l ~/.config/fleet-switchboard/cloud.env   # -rw-------
 ```
 
-Each setting's name, whether the file requires it, and its kind (name, path, command, digest-ref, number):
+Each setting's name, whether the file requires it, and its kind (name, path, command, digest-ref, number, secret-name, duration):
 
 | Setting | Required | Kind | What it is |
 |---|---|---|---|
@@ -59,9 +59,13 @@ Each setting's name, whether the file requires it, and its kind (name, path, com
 | `CW_CLOUD_SPEND_CAP_USD` | no | number | spend cap in USD for one create (default 25; an invalid value refuses) |
 | `CW_CLUSTER_TOKEN_CMD` | no | command | a command that prints a short-lived cluster token (instead of the vault route) |
 | `CW_CLUSTER_ADMIN_CMD` | no | command | a command that prints the cluster administrator kubeconfig (instead of the vault read) |
+| `CW_CLUSTER_ADMIN_SECRET` | no | secret-name | the name of the vault secret that holds the cluster administrator kubeconfig (default `cw-cluster-admin-kubeconfig`): 1 to 127 letters, digits and hyphens; the name, never its content |
+| `CW_CLUSTER_TOKEN_DURATION` | no | duration | the cluster token's requested life: 1 to 3 digits and `m` or `h`, from `1m` to `60m` (default `20m`; `1h` is the same as `60m`) |
 | `CW_GIT_TOKEN_CMD` | no | command | a command that prints the one-hour git token; default is the GitHub App mint beside the launcher (`app_token.py`) |
 | `CW_APP_ID_CMD`, `CW_APP_INSTALLATION_CMD`, `CW_APP_KEY_CMD` | no | command | commands that print the GitHub App's id, installation id and key instead of the vault read (`app_token.py`) |
 | `CW_VAULT_CHECK_DIR` | no (needed once the vault refuses this machine) | path | the checkout of the vault access check, an absolute path (see section 2b) |
+
+Names the code reads that are deliberately not settings (set by the launcher itself, the other login kind, tuning knobs with safe defaults, test hooks) are listed, each with its reason, in `cloud/launcher/tests/test_cloud_settings.py` (`NOT_SETTINGS`); a test fails when the code reads a `CW_*` name that is neither a row here nor on that list.
 
 The template (neutral placeholders; copy, edit, keep only what you need, and set the file to `0600`):
 
@@ -95,6 +99,9 @@ CW_CLOUD_NAMESPACE=cw
 # optional commands that print a token (the command, never the token)
 # CW_CLUSTER_TOKEN_CMD=/home/user/bin/print-cluster-token
 # CW_CLUSTER_ADMIN_CMD=/home/user/bin/print-cluster-kubeconfig
+# optional: the vault secret that holds the cluster administrator kubeconfig (the name), and the token's life
+# CW_CLUSTER_ADMIN_SECRET=acme-cluster-admin
+# CW_CLUSTER_TOKEN_DURATION=20m
 # CW_GIT_TOKEN_CMD=/home/user/bin/print-git-token
 # CW_APP_ID_CMD=/home/user/bin/print-app-id
 # CW_APP_INSTALLATION_CMD=/home/user/bin/print-app-installation
@@ -177,6 +184,20 @@ fleet-switchboard retire coder7
   history; the preflight only checks that this protection exists.
 - It holds no cluster credential and no other model provider entry.
 - It ends at its idle or hard deadline whether or not anyone retires it.
+
+## 4b. The reaper runs by itself (opt-in)
+
+Turn it on: set the cluster settings in your shell (`CW_KUBE_CONTEXT`, or `CW_CLOUD_SERVER` and `CW_CLOUD_TOKEN_FILE`, plus
+`CW_CLOUD_NAMESPACE`), then run `fleet-switchboard install --with-cloud-reaper`. It writes a LaunchAgent (macOS) or a systemd
+user unit (Linux), loads it, and starts it at login. Nothing secret is written: only names and file paths.
+
+Turn it off: `fleet-switchboard install --uninstall` unloads and removes it (with the switchboard's own service); `--uninstall --no-service` removes the reaper too and leaves the switchboard's own service. A file at that path that the installer did not write is named and left alone. Only one reaper runs at a time: a hand-started `cloud-worker reap --loop` beside the service exits with `not started: another reaper holds the lock`. Path settings (`CW_CLOUD_TOKEN_FILE` and the others) must be absolute paths of plain characters; a pasted token is refused by name.
+
+Its log: `cloud-reaper-stderr.log` in the switchboard state directory (journalctl on Linux). Each time it ends it writes one line
+`<UTC time> reaper exiting: WHY`, and the service then restarts it.
+
+When the Mac sleeps, the reaper pauses. Workers keep their pod-side floor (the pod's own limit, the cap plus 300 s, PR #880 once it
+merges), so a sleeping Mac delays a stop but cannot leave a worker running past that floor.
 
 ## 5. Known gaps
 
