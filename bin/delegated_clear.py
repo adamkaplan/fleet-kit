@@ -171,62 +171,208 @@ def daemon_roots(rule):
     return sorted(set(rule["closure_roots"]) | set(rule.get("rating_roots") or []))
 
 
-def refusals(rule, report, files, matches=None, closure=None, scored=None):
-    """[reasons] a delegated clear is refused for this pull request; [] when none. `rule` is the matrix's `owner_hold.delegated_clear` block; `report` is the owner-hold report the
+# ---- the changed-file list of a pull request: read in full, or refused with ONE named reason (#967)
+
+FILE_PAGE = 100       # GitHub's pull request files API answers at most this many a page
+FILE_LIMIT = 3000     # ...and lists at most this many files for one pull request, however many pages are asked for
+FILE_PAGES = FILE_LIMIT // FILE_PAGE + 1   # the last page asked (the one after the 3000th file) is how the API says it is done
+
+# THE one table of why a file list was not read in full: the kind, and the words a person reads (and the audit holds). A kind is never reworded by a caller; a test derives the kinds
+# used in the code from this table and fails when one is missing, and the documentation carries one line for each.
+FILE_REFUSALS = {
+    "read_failed": "the changed files could not be read after one retry (%s)",
+    "not_a_list": "GitHub's answer for the changed files was not a list (%s)",
+    "over_limit": "the pull request has more than %d changed files, more than GitHub lists: too many to read in full",
+    "head_moved": "the pull request's head moved while it was being checked (%s, then %s): nothing was cleared",
+    "cut": "GitHub itself says the file list is cut: it listed %d of %d changed files",
+    "no_source": "%d renamed or copied file(s) with no known source path (%s)",
+    "not_recorded": "the file list was not read in full (no reason was recorded)",
+}
+
+
+class FileListError(Exception):
+    """The file list was not read in full. `kind` is a key of FILE_REFUSALS; `str(err)` is its words."""
+
+    def __init__(self, kind, *args):
+        self.kind = kind
+        super().__init__(FILE_REFUSALS[kind] % args)
+
+    def cause(self):
+        """the cause record of this refusal: the kind `file_list`, the rule being the file-list kind"""
+        return {"kind": "file_list", "path": None, "rule": self.kind, "text": str(self)}
+
+
+def error_class(err):
+    """One short phrase for a failed read: the class (a timeout or gh that could not run, a gh failure with its HTTP status, an answer that is not JSON, an answer over the size cap) and a clipped detail."""
+    detail = " ".join(str(err).split())[:100]
+    status = re.search(r"\bHTTP (\d{3})\b", detail)
+    reason = getattr(err, "reason", None)
+    if isinstance(err, json.JSONDecodeError):
+        return "the answer was not JSON"
+    if reason == "unavailable":
+        return "gh unavailable: %s" % detail
+    if reason == "gh":
+        return "gh failed%s: %s" % (" with HTTP %s" % status.group(1) if status else "", detail)
+    if isinstance(err, ValueError):
+        return "the answer was rejected: %s" % detail
+    return "%s: %s" % (type(err).__name__, detail)
+
+
+def read_with_retry(get, path, is_good, what=""):
+    """`get(path)`, tried twice at most: a failure or an answer that is not what was asked for is tried once more, and the SECOND outcome is the one named."""
+    last = None
+    for _ in (1, 2):
+        try:
+            answer = get(path)
+        except Exception as err:
+            last = FileListError("read_failed", what + error_class(err))
+            continue
+        if is_good(answer):
+            return answer
+        last = FileListError("not_a_list", "%sa %s" % (what, type(answer).__name__))
+    raise last
+
+
+def read_pr_files(get, repo, number):
+    """(files, pull) of a pull request: EVERY changed file, in order, or FileListError naming why not. `get(path)` is a GET that raises on any failure. The pages are asked until the API says it is done
+    (a page of fewer than 100; the page after the 3000th file is the last a full list can need), each page once more on a failure, and a list is never returned in part. The pull request's own count
+    of changed files is read first: more than 3000 is refused before any page is read, and a list whose length differs from it at the end is the ONE case GitHub itself says is cut."""
+    pull = read_with_retry(get, "repos/%s/pulls/%d" % (repo, number), lambda a: isinstance(a, dict), "the pull request: ")
+    total = pull.get("changed_files")
+    total = total if isinstance(total, int) and not isinstance(total, bool) else None
+    if total is not None and total > FILE_LIMIT:
+        raise FileListError("over_limit", FILE_LIMIT)
+    files = []
+    for page in range(1, FILE_PAGES + 1):
+        got = read_with_retry(get, "repos/%s/pulls/%d/files?per_page=%d&page=%d" % (repo, number, FILE_PAGE, page), lambda a: isinstance(a, list), "page %d: " % page)
+        files.extend(f for f in got if isinstance(f, dict))
+        if len(got) < FILE_PAGE:
+            break
+    else:
+        raise FileListError("over_limit", FILE_LIMIT)   # the page after the 3000th file still has files
+    if total is None:
+        raise FileListError("read_failed", "the pull request's count of changed files was missing")
+    if total != len(files):
+        raise FileListError("cut", len(files), total)
+    return files, pull
+
+
+def list_words(report):
+    """The words for a report (`pr_floor_report`) whose file list is not whole: the reason recorded for it, else what its own fields say; the fallback wording never says "cut"."""
+    if report.get("list_problem"):
+        return report["list_problem"]
+    if report.get("unknown"):
+        return report["unknown"]
+    if report.get("renamed_no_source"):
+        return FILE_REFUSALS["no_source"] % (len(report["renamed_no_source"]), ", ".join(str(x) for x in report["renamed_no_source"]))
+    if report.get("complete") is False and all(isinstance(report.get(k), int) for k in ("files_read", "files_total")):
+        return "GitHub listed %s of %s changed files" % (report.get("files_read"), report.get("files_total"))
+    return FILE_REFUSALS["not_recorded"]
+
+
+# THE one table of the causes a delegated clear is refused for: the kind, and the rule it comes from (a key of the matrix's `owner_hold.delegated_clear` block, or the name of the check that made it).
+# A refusal is a list of cause records {"kind", "path", "rule", "text"} made by `causes_of`; the readable reason is the `text` of each, joined: ONE table, so the audit's records and the person's words
+# are the same rows. A test derives every kind used in the code and fails when one is missing here or has no driver.
+CAUSE_RULES = {
+    "rule_unreadable": "delegated_clear",
+    "rule_malformed": "delegated_clear",
+    "decision_unreadable": "owner_hold",
+    "file_list": "file_list",
+    "never_class": "never_path_classes",
+    "no_review": "review",
+    "review_no_class": "review",
+    "review_top_class": "top_tier_review_classes",
+    "score": "score",
+    "files_unreadable": "file_list",
+    "file_unreadable": "file_list",
+    "path_unreadable": "file_list",
+    "clear_code": "clear_code_paths",
+    "new_file": "new_file_globs",
+    "closure_unmapped": "closure_files",
+    "closure": "closure_files",
+    "order": "delegated_clear",
+    "owner_hold_label": "hold_labels",
+    "person_hold_label": "hold_labels",
+}
+
+
+def whole_line(text):
+    """`text` on one line with nothing cut: the audit file and the terminal hold what the reason says (#967)."""
+    return " ".join(str(text or "").split())
+
+
+def cause(kind, text, path=None):
+    """One cause record: the kind (a key of CAUSE_RULES), the path it is about (or None), the rule it comes from and the words."""
+    return {"kind": kind, "path": path, "rule": CAUSE_RULES[kind], "text": text}
+
+
+def causes_of(rule, report, files, matches=None, closure=None, scored=None):
+    """[cause records] a delegated clear is refused for this pull request; [] when none. `rule` is the matrix's `owner_hold.delegated_clear` block; `report` is the owner-hold report the
     daemon uses (`pr_floor_report`: its decision, its top tier path hits by class, the independent review's class, whether the file list is complete); `files` is the pull request's
     changed files ([{"filename", "previous_filename", "status"}]) or None when they could not be read. `matches(path, globs)` is the owner-hold floor's OWN path matcher (case-,
     normalisation- and spelling-insensitive: `./bin/x`, `bin//x`, `BIN/X`, a `..`, a rename's source all read as the file they name): the caller passes it, this module holds no second one.
     `closure` is {file name: [reasons] or None}: what `closure_refusals` said for each changed file of `closure_files` (None: it could not be mapped). `scored` is `judge`'s answer for an order with a
     max_level: then the score is the only rule about the pull request's classes (the path-class and review-class refusals below are not made), and the machinery refusals stay."""
     if not isinstance(rule, dict) or not isinstance(report, dict) or matches is None:
-        return ["the delegated-clear rule or the owner-hold decision cannot be read"]
+        return [cause("rule_unreadable", "the delegated-clear rule or the owner-hold decision cannot be read")]
     for key in ("never_path_classes", "top_tier_review_classes", "clear_code_paths", "new_file_globs", "closure_files"):
         if not isinstance(rule.get(key), list) or not all(isinstance(x, str) for x in rule[key]):
-            return ["the delegated-clear rule is malformed (%s)" % key]
+            return [cause("rule_malformed", "the delegated-clear rule is malformed (%s)" % key)]
     if report.get("owner_decision") not in ("hold", "second-review", "none"):
-        return ["the owner-hold decision cannot be read"]
+        return [cause("decision_unreadable", "the owner-hold decision cannot be read")]
     if report.get("complete") is not True or report.get("unknown") or report.get("renamed_no_source"):
-        return ["the pull request's changes cannot be read in full (%s)" % (report.get("unknown") or "the file list is cut")]
-    reasons = list(scored["reasons"]) if isinstance(scored, dict) else []
+        return [cause("file_list", "the pull request's changes cannot be read in full (%s)" % list_words(report))]
+    found = [cause("score", text) for text in (scored["reasons"] if isinstance(scored, dict) else [])]
     hits = report.get("top_tier_hits") or {}
     for cls in sorted(hits) if scored is None else ():
         if cls.lower() in {c.lower() for c in rule["never_path_classes"]}:
-            reasons.append("it changes a %s path (%s): that stays the owner's own clear" % (cls, ", ".join(hits[cls][:3])))
+            found.append(cause("never_class", "it changes a %s path (%s): that stays the owner's own clear" % (cls, ", ".join(hits[cls])), ", ".join(hits[cls])))
     if report.get("review_action") is None and scored is None:
-        reasons.append("no independent review is recorded at this head: unknown is refused")
+        found.append(cause("no_review", "no independent review is recorded at this head: unknown is refused"))
     review = report.get("review_class")
     if review is None and report.get("review_action") == "hold" and scored is None:
-        reasons.append("the independent review holds it with no class named: unknown is refused")
+        found.append(cause("review_no_class", "the independent review holds it with no class named: unknown is refused"))
     if isinstance(review, str) and review.lower() in {c.lower() for c in rule["top_tier_review_classes"]} and scored is None:
-        reasons.append("the independent review's class is %s, a top tier class: that stays the owner's own clear" % review)
+        found.append(cause("review_top_class", "the independent review's class is %s, a top tier class: that stays the owner's own clear" % review))
     if files is None:
-        reasons.append("the changed files cannot be read, so a change to the clear code cannot be ruled out")
-        return reasons
+        found.append(cause("files_unreadable", "the changed files cannot be read, so a change to the clear code cannot be ruled out"))
+        return found
     named = set(report.get("changed_paths") or [])
     for item in files:
         if not isinstance(item, dict) or not isinstance(item.get("filename"), str):
-            reasons.append("a changed file cannot be read: refused")
+            found.append(cause("file_unreadable", "a changed file cannot be read: refused"))
             continue
         both = [x for x in (item.get("filename"), item.get("previous_filename")) if x is not None]
         if any(not isinstance(x, str) or "\x00" in x for x in both):
-            reasons.append("a changed path cannot be read (%r): refused" % str(both)[:60])
+            found.append(cause("path_unreadable", "a changed path cannot be read (%r): refused" % str(both)))
             continue
         for path in both:
             if matches(path, rule["clear_code_paths"]):
-                reasons.append("it changes a file that is the clear or hold machinery or that the daemon loads (%s): that stays the owner's own clear" % path[:80])
+                found.append(cause("clear_code", "it changes a file that is the clear or hold machinery or that the daemon loads (%s): that stays the owner's own clear" % path, path))
         if any(matches(path, rule["new_file_globs"]) for path in both) and (item.get("status") in ("added", "removed", "renamed", "copied") or item.get("previous_filename")):
-            reasons.append("it adds, deletes or renames a file under a directory the daemon loads at start (%s): that stays the owner's own clear" % item["filename"][:80])
+            found.append(cause("new_file", "it adds, deletes or renames a file under a directory the daemon loads at start (%s): that stays the owner's own clear" % item["filename"], item["filename"]))
         for path in both:
             if matches(path, rule["closure_files"]):
                 mapped = (closure or {}).get(item["filename"])
                 if mapped is None:
-                    reasons.append("the change to %s cannot be mapped to its definitions: refused" % path[:60])
+                    found.append(cause("closure_unmapped", "the change to %s cannot be mapped to its definitions: refused" % path, path))
                 else:
-                    reasons.extend(mapped)
+                    found.extend(cause("closure", text, path) for text in mapped)
     for path in sorted(p for p in named if isinstance(p, str)):
         if matches(path, rule["clear_code_paths"]):
-            reasons.append("it changes a file that is the clear or hold machinery or that the daemon loads (%s): that stays the owner's own clear" % path[:80])
-    return sorted(set(reasons))
+            found.append(cause("clear_code", "it changes a file that is the clear or hold machinery or that the daemon loads (%s): that stays the owner's own clear" % path, path))
+    seen, out = set(), []
+    for item in sorted(found, key=lambda c: c["text"]):   # the readable list is sorted and has no repeat, as it always was; the records are the same rows
+        key = (item["kind"], item["path"], item["text"])
+        if key not in seen:
+            seen.add(key)
+            out.append(item)
+    return out
+
+
+def refusals(rule, report, files, matches=None, closure=None, scored=None):
+    """[reasons] a delegated clear is refused for this pull request; [] when none: the words of `causes_of`, sorted, one for each distinct text."""
+    return sorted(set(c["text"] for c in causes_of(rule, report, files, matches, closure, scored)))
 
 
 # ---- the daemon file: which top-level definitions a changed line is in (ast, never hunk headers), and whether any of them is in the clear closure

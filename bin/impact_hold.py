@@ -872,11 +872,11 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
                 remove += authors_hold_labels(names, raw, remove)   # #742: the OWNER's clear lifts the author's own hold with the floor's, from THIS read (the PR's labels at the cleared head)
             elif names[OWNER_HOLD_KEY] in authors_hold_labels(names, raw, remove):   # #891: whatever the score, with its OWN audited reason
                 why = "%s carries %s, the owner's own hold: only the owner's plain clear lifts it, never the Chief of Staff under an order, whatever the score" % (pr, names[OWNER_HOLD_KEY])
-                engine.audit.append(engine.actor, "gate.hold_clear_refused", pr, {"head": current, "by": who, "under_order": under_order["number"], "owner_hold": True, "why": _one_line(why, 300)})
+                engine.audit.append(engine.actor, "gate.hold_clear_refused", pr, {"head": current, "by": who, "under_order": under_order["number"], "owner_hold": True, "why": load_module("delegated_clear").whole_line(why), "causes": [load_module("delegated_clear").cause("owner_hold_label", why)]})
                 raise NoticeError(why)
             elif names["merge-captain"] in authors_hold_labels(names, raw, remove):
                 why = "%s carries a %s label the switchboard did not add: it is a person's own hold, not the Chief of Staff's to lift under an order; the owner clears it" % (pr, names["merge-captain"])
-                engine.audit.append(engine.actor, "gate.hold_clear_refused", pr, {"head": current, "by": who, "under_order": under_order["number"], "why": _one_line(why, 300)})
+                engine.audit.append(engine.actor, "gate.hold_clear_refused", pr, {"head": current, "by": who, "under_order": under_order["number"], "why": load_module("delegated_clear").whole_line(why), "causes": [load_module("delegated_clear").cause("person_hold_label", why)]})
                 raise NoticeError(why)   # nothing is written: the check runs before the clear is recorded
         else:
             remove = list(remove)
@@ -989,46 +989,46 @@ def delegated_clear_score(engine, module, report, threshold):
 def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info=None):
     """(report, None) when this pull request may be cleared under an order, else (None, why). The owner-hold decision is the daemon's own (`pr_floor_report`: no second rule), the rule (the classes
     never delegated and the clear code) is the matrix's `owner_hold.delegated_clear`; anything unreadable is refused. #661. With a `threshold` (the order's max_level, #835) the SCORE of the
-    independent rating at this head is the rule about the pull request's classes; `info` (a dict) gets the score it read, for the audit of a refusal too."""
+    independent rating at this head is the rule about the pull request's classes; `info` (a dict) gets the score it read, and the cause records of a refusal, for the audit."""
+    def refused(found):
+        if info is not None:
+            info["causes"] = found   # the records the audit keeps next to the readable reason (#967)
+        return None, "; ".join(c["text"] for c in found)
+    module = load_module("delegated_clear")
     try:
-        report = pr_floor_report(engine, repo, number)
+        paged = {}   # the floor reads the paged file list when `gh pr view` cannot vouch for its own: the clear reads that one, never a second
+        report = pr_floor_report(engine, repo, number, paged=paged)
         rule = (impact_floor.load_matrix().get("owner_hold") or {}).get("delegated_clear")
     except (impact_floor.MatrixError, NoticeError, ValueError) as err:
-        return None, "the owner-hold decision or its rule cannot be read (%s): refused" % _one_line(str(err), 140)
+        return refused([module.cause("rule_unreadable", "the owner-hold decision or its rule cannot be read (%s): refused" % module.whole_line(str(err)))])
     files, get = [], impact_carry_get(engine, runner, repo)
+    if paged.get("error") is not None:
+        return refused([paged["error"].cause()])
     try:
-        for page in range(1, 31):
-            got = get("repos/%s/pulls/%d/files?per_page=100&page=%d" % (repo, number, page))
-            if not isinstance(got, list):
-                raise ValueError("not a list")
-            files.extend(f for f in got if isinstance(f, dict))
-            if len(got) < 100:
-                break
-        else:
-            files = None   # more than 3000 files: not read in full
-    except Exception:
-        files = None
-    module, base_sha, closure = load_module("delegated_clear"), None, {}
+        files = paged["files"] if "files" in paged else module.read_pr_files(get, repo, number)[0]   # every page, one retry each, or ONE named reason: a failed read is never called a cut list (#967)
+    except module.FileListError as err:
+        return refused([err.cause()])
+    base_sha, closure = None, {}
     if files is not None:   # the file list and the decision must be of ONE head: the head read again after the files must still be the one the decision read
         try:
-            pull = get("repos/%s/pulls/%d" % (repo, number))
+            pull = module.read_with_retry(get, "repos/%s/pulls/%d" % (repo, number), lambda a: isinstance(a, dict), "the pull request again: ")
             after, base_sha = (pull.get("head") or {}).get("sha"), (pull.get("base") or {}).get("sha")
             if after == report.get("head") and base_sha and any(f.get("status") == "modified" for f in files):   # the files' patches are against the MERGE-BASE, not the base branch's tip: read the blobs at that commit
-                compared = get("repos/%s/compare/%s...%s?per_page=1" % (repo, base_sha, after))
+                compared = module.read_with_retry(get, "repos/%s/compare/%s...%s?per_page=1" % (repo, base_sha, after), lambda a: isinstance(a, dict), "the comparison with the base: ")
                 base_sha = ((compared or {}).get("merge_base_commit") or {}).get("sha")
-        except Exception:
-            after = None
+        except module.FileListError as err:
+            return refused([err.cause()])
         if after != report.get("head"):
-            return None, "the pull request's head moved while it was being checked (%s, then %s): nothing was cleared" % (str(report.get("head"))[:8], str(after)[:8])
+            return refused([module.FileListError("head_moved", str(report.get("head"))[:8], str(after)[:8]).cause()])
         for item in files:   # a changed file of the daemon's own: each changed LINE is mapped to its definition by the ast of the file it belongs to
             if isinstance(item.get("filename"), str) and impact_floor.matches(item["filename"], (rule or {}).get("closure_files") or []) and not impact_floor.matches(item["filename"], (rule or {}).get("clear_code_paths") or []) and item.get("status") == "modified":
                 closure[item["filename"]] = delegated_clear_map(engine, runner, repo, item, base_sha, rule)
     scored = delegated_clear_score(engine, module, report, threshold) if threshold is not None else None
     if scored is not None and info is not None:
         info["score"] = scored["level"]
-    reasons = module.refusals(rule, report, files, impact_floor.matches, closure, scored)
-    if reasons:
-        return None, "; ".join(reasons)
+    found = module.causes_of(rule, report, files, impact_floor.matches, closure, scored)
+    if found:
+        return refused(found)
     return report, None
 
 
@@ -1049,8 +1049,8 @@ def cmd_impact_clear(args, runner, now):
             delegated, why = delegated_clear_checks(engine, runner, now, kind, under)
             if delegated is None:
                 if engine.audit is not None:
-                    engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), {"by": who, "under_order": under, "why": _one_line(why, 300)})
-                sys.stderr.write("%s: impact clear: refused: %s\n" % (PROG, _one_line(why, 400)))
+                    engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), {"by": who, "under_order": under, "why": load_module("delegated_clear").whole_line(why), "causes": [load_module("delegated_clear").cause("order", why)]})
+                sys.stderr.write("%s: impact clear: refused: %s\n" % (PROG, load_module("delegated_clear").whole_line(why)))
                 return EXIT_USAGE
         else:
             if engine.audit is not None:
@@ -1092,8 +1092,8 @@ def cmd_impact_clear(args, runner, now):
             report, why = delegated_clear_pr_checks(engine, runner, repo, number, delegated.get("threshold"), info)
             if why:
                 if engine.audit is not None:
-                    engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), dict({"by": kind[1], "under_order": delegated["number"], "why": _one_line(why, 300)}, **({"score": info.get("score"), "threshold": delegated["threshold"]} if delegated.get("threshold") else {})))
-                sys.stderr.write("%s: impact clear: refused: %s\n" % (PROG, _one_line(why, 600)))
+                    engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), dict({"by": kind[1], "under_order": delegated["number"], "why": load_module("delegated_clear").whole_line(why), "causes": info.get("causes") or [load_module("delegated_clear").cause("order", why)]}, **({"score": info.get("score"), "threshold": delegated["threshold"]} if delegated.get("threshold") else {})))
+                sys.stderr.write("%s: impact clear: refused: %s\n" % (PROG, load_module("delegated_clear").whole_line(why)))
                 return EXIT_USAGE
             extra = {"head": report["head"], "via": "order:%d" % delegated["number"], "under_order": dict(delegated, score=info.get("score"))}
         for line in impact_clear_core(engine, runner, repo, number, kind[1], plan_ledger.clip(redact_command_text(reason), 300), **extra):

@@ -4556,6 +4556,35 @@ A pull request held for the owner (`merge-captain` or a `hold-*` label) is a row
 - **Which refusal applies when (the matrix's own words, `owner_hold.delegated_clear.meaning`).** What the Chief of Staff's clear under the owner's standing order may NEVER lift (bin/delegated_clear.py reads this block and holds no path, class or function name of its own). For an order WITHOUT a `max_level`, two refusals apply. The first refuses a pull request whose top tier path hits include a class of `never_path_classes`. The second refuses a pull request whose independent review's class is one of `top_tier_review_classes` (or none is recorded). For an order WITH a `max_level`, the score rule in `score` replaces those two refusals. The refusals below apply either way, with or without a `max_level`. A pull request that changes ANY file matching `clear_code_paths` (the clear and hold machinery by name, and the directories the daemon and the CLI load at start) is refused. A pull request that ADDS, DELETES or RENAMES a file matching `new_file_globs` (a new file under bin/ is loaded at config load) is refused. A pull request that changes a file of `closure_files` (the daemon file and the bin modules the clear loads or runs (the daemon's imports at load, the config readers every module declares, and a recorded run of the clear: a test derives the list); for a module other than the daemon file ANY import-time statement, and the functions of `module_roots`) on a line that belongs to the CLEAR CLOSURE is refused: the definitions reachable by name from `closure_roots`, the module-level bindings they read, any other top-level statement, or a definition that refers to a `clear_entry_points` name. Other changes under bin/ (an authority module edit that does not change who may do what) are allowed.
 - **What it does.** The clear is bound to the head the checks read, removes the same labels, wakes the same clear notice (`<name> cleared <repo#N> at <head8> under the owner's standing order N: "<reason>"; <lane> merges it`) and is audited as `gate.hold_cleared` with `by` (her name), `under_order`, `order` (the order's text) and `reason`; a refusal is `gate.hold_clear_refused`. `--revoke` under an order works too, and it removes ANY clear of the pull request, the owner's own included (it fails toward safe: the hold returns; `gate.clear_revoked` records `under_order`).
 
+### How the delegated clear reads a pull request's file list (#967)
+
+The clear needs the whole list of a pull request's changed files, with the source path of every rename. It reads it in one way and refuses with one named reason, never with a guess.
+
+- **How it is read.** The floor (`pr_floor_report`, which the daemon's pass, gate G6 and `impact floor` all use) reads `gh pr view --json files` first. That list holds 100 files at most and gives no source path for a rename. Only when it cannot vouch for itself (it lists fewer files than `changedFiles`, or has a rename with no source) the paged list is read: the pull request's files API, 100 a page, until a page of fewer than 100 files says it is done, one retry of each page that failed, up to 3000 files (the most GitHub lists). The clear reads the same list for its own checks and does not read it twice. A list is never used in part.
+- **Fail closed only on a real error.** A page that fails twice, an answer that is not a list, a pull request of more than 3000 files, a head that moved and a count that disagrees with the list are each a refusal that says which of them it was, in one line. The line is the one the person reads and the one in the audit (`gate.hold_clear_refused`, `why`).
+
+What each refusal means, and what to do:
+
+- `read_failed`: "the changed files could not be read after one retry" and the class of the failure (a timeout or a `gh` that could not run, a `gh` failure with its HTTP status, an answer that is not JSON, an answer over the size cap) and which read (the pull request or a numbered page). Nothing is wrong with the pull request; run the clear again.
+- `not_a_list`: "GitHub's answer for the changed files was not a list". GitHub answered something else twice; run it again, and say so if it repeats.
+- `over_limit`: "more than 3000 changed files". GitHub lists no more than that, so the list cannot be read in full; this stays the owner's own clear.
+- `head_moved`: "the pull request's head moved while it was being checked". A push arrived between the reads; nothing was cleared; run the clear again at the new head.
+- `cut`: "GitHub itself says the file list is cut": the pull request's own count of changed files differs from the list read. This is the only refusal that says the list is cut.
+- `no_source`: "no known source path": a renamed or copied file whose source GitHub did not give, so a top tier path could be the source. The owner's own clear.
+- `not_recorded`: "no reason was recorded": a report that was not whole and carries no reason. The clear never makes one; it exists so the words never say "cut" for it.
+
+**The audit keeps the whole reason, and the causes as data.** `gate.hold_clear_refused` holds the refusal's reason with no character cut (the audit file's own rotation is the only bound), and the line printed to the person is the same whole line. Next to it the detail has `causes`, a list of records `{kind, path, rule, text}` made from one table (`CAUSE_RULES` in `bin/delegated_clear.py`) that the words are made from too: `path` is the file the cause is about, `rule` the key of the matrix's `owner_hold.delegated_clear` block (or the check) it comes from, `text` its words. The kinds:
+
+- `rule_unreadable`, `rule_malformed`, `decision_unreadable`: the rule or the owner-hold decision could not be read.
+- `file_list`: the file list was not read in full; its `rule` is one of the file-list kinds above.
+- `files_unreadable`, `file_unreadable`, `path_unreadable`: a changed file or path could not be read.
+- `never_class`, `review_top_class`, `no_review`, `review_no_class`, `score`: the pull request's class, its independent review or its score.
+- `clear_code`, `new_file`, `closure_unmapped`, `closure`: a change to the clear's own code or to what it loads.
+- `order`: the standing order or the caller was refused before the pull request was read.
+- `owner_hold_label`, `person_hold_label`: the pull request carries a hold that is a person's own.
+
+Other audit lines that clip text stay as they were, because they are not on this path: the carry's void reason and the marker line (200 characters), the clear's and the revoke's own reason typed by a person (300), and the reasons of a release (five of them, 160 characters each).
+
 ### The delegated clear by impact score (#835)
 
 The Chief of Staff may clear a held pull request on her own judgement when its independent impact rating, at the head as it is now, is at or below a level the owner sets. It works in any watched repository. The owner is asked only for the changes that rate above it.
