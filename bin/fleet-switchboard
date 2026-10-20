@@ -21641,6 +21641,8 @@ def cmd_item_prove(args, runner, now):
     pin = iv.pinned(ctx.entries, ctx.item)
     if not pin:
         raise LedgerCommandError("%s has no reference commit yet: its orchestrator launches a tester with --issue for it first (that registration pins the commit)" % ctx.item)
+    if args.head and args.head != pin:   # #994: a proof is stored at the pin; a head that is not the pin is refused, never ignored
+        raise LedgerCommandError("--head %s is not the reference commit (%s): a proof belongs to the commit it judged; nothing was recorded" % (args.head[:12], pin[:12]))
     refused = 0
     for sid in dict.fromkeys(args.scenario):
         try:
@@ -23624,7 +23626,7 @@ def add_ledger_parsers(sub):
     waive.add_argument("pr", help="The pull request: owner/repo#N or its URL")
     waive.add_argument("--gates", required=True, help="Comma-separated gates: G0a,G0b,G0c,G1,G2/G3,G4,G5")
     waive.add_argument("--reason", required=True, help="Why (at least %d characters)" % plan_ledger.WAIVER_REASON_MIN)
-    waive.add_argument("--head", help="The PR head sha (default: read from GitHub)")
+    waive.add_argument("--head", help="The PR head sha (default: read from GitHub); a short head (7 or more hex characters) is resolved to the full head, or refused")
     gates = sub.add_parser("gates", help="Read-only: the plan's gates G0a to G8 for a PR, what each needs and who decides it. "
                                          "Also `gates mode <repo> shadow|enforce|off`, `gates off|on` (the global kill file) and "
                                          "`gates preflight <repo>`. May add one `shares <file> with #N` line when another open PR changes the same files "

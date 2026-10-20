@@ -32634,6 +32634,8 @@ class TestHeadResolution(LedgerBase):
         ("empty", "", None, "not a commit sha"),
         ("over_long", FULL + "0", None, "longer than a sha"),
         ("not_the_prs_head", "fedcba9", None, "is not the PR's head"),
+        ("full_other_commit", "c" * 40, None, "is not the PR's head"),   # review-blockers (read only) looks at an older full head on purpose: see run_table
+        ("padded", "  " + FULL[:8] + " ", FULL, None),
     )
     MEMBERS = ("waive", "prove", "verdict", "review-record", "review-blockers")   # every command that resolves a head: one table, run for each
 
@@ -32671,6 +32673,8 @@ class TestHeadResolution(LedgerBase):
         self.prepare(member)
         failed = []
         for name, given, recorded, text in self.TABLE:
+            if name == "full_other_commit" and member == "review-blockers":
+                continue
             code, out, err, new = self.call(member, given)
             if recorded is not None and member == "review-blockers":
                 good = code == 0 and out.startswith("code recorded request-changes") and out.strip().endswith(" at " + self.FULL[:8])
@@ -32735,13 +32739,22 @@ class TestHeadResolution(LedgerBase):
         def prefix_as_given(given, known, unreadable=None, read_only=False):
             out = real(given, known, unreadable, read_only)
             return given.lower() if given and out == known and len(given) < 40 else out
-        return {"as_given": (as_given, "short_unique"), "no_hex": (no_hex, "non_hex"), "no_floor": (no_floor, "short_ambiguous"),
+        def no_strip(given, known, unreadable=None, read_only=False):
+            if given is not None and given != given.strip():
+                raise sb.LedgerCommandError("--head has spaces around it")
+            return real(given, known, unreadable, read_only)
+
+        def any_full(given, known, unreadable=None, read_only=False):
+            return given if given and re.fullmatch(r"[0-9a-f]{40}", given) else real(given, known, unreadable, read_only)
+        return {"no_strip": (no_strip, "padded"), "any_full": (any_full, "full_other_commit"), "as_given": (as_given, "short_unique"), "no_hex": (no_hex, "non_hex"), "no_floor": (no_floor, "short_ambiguous"),
                 "no_prefix": (no_prefix, "not_the_prs_head"), "no_lower": (no_lower, "uppercase"), "accept_empty": (accept_empty, "empty"),
                 "no_overlong": (no_overlong, "over_long"), "prefix_as_given": (prefix_as_given, "short_unique")}
 
     def test_each_mutant_of_the_resolver_fails_its_row_on_every_command(self):
         for member in self.MEMBERS:
             for name, (mutant, row) in self.resolver_mutants().items():
+                if member == "review-blockers" and name == "any_full":
+                    continue   # a read-only look at an older full head is allowed
                 if member == "review-record" and name in ("as_given", "no_lower", "prefix_as_given"):
                     continue   # `review record` stores the head it read from GitHub, never the given text: these mutants change nothing it writes (the refusal rows still run)
                 with self.subTest(member=member, mutant=name):
@@ -32759,9 +32772,36 @@ class TestHeadResolution(LedgerBase):
 
     def test_the_table_names_every_shape_and_each_refusal_row_has_a_mutant(self):
         self.assertEqual({row[0] for row in self.TABLE},
-                         {"full", "short_unique", "uppercase", "no_head", "short_ambiguous", "too_short", "non_hex", "empty", "over_long", "not_the_prs_head"})
+                         {"full", "short_unique", "uppercase", "no_head", "short_ambiguous", "too_short", "non_hex", "empty", "over_long", "not_the_prs_head", "full_other_commit", "padded"})
         covered = {row for _, row in self.resolver_mutants().values()}
-        self.assertEqual({row[0] for row in self.TABLE if row[2] is None} - {"too_short"}, covered - {"short_unique", "uppercase"})
+        self.assertEqual({row[0] for row in self.TABLE if row[2] is None} - {"too_short"}, covered - {"short_unique", "uppercase", "padded"})
+
+    def test_a_legacy_waiver_with_a_short_head_never_applies_the_gate_compares_the_full_head_exactly(self):
+        # rows written before #994 can hold a short head: a prefix reading would make them apply (and a 7-character one to ANY head that begins with it)
+        def forge(head):
+            sb.plan_ledger.append_entry(self.world.state, {"kind": "waiver", "pr": self.PR, "head": head, "gates": ["G1"], "reason": "x" * 30, "by": "cos",
+                                                           "result": "pass", "expires": self.world.clock.now() + 3600}, self.world.clock.now())
+        forge(self.FULL[:8])                                    # a short head OF the current head
+        self.assertEqual(self.row(self.gates()[1], "G1")["status"], "missing")
+        forge(self.FULL[:7])                                    # a prefix the current head and another commit share
+        self.assertEqual(self.row(self.gates()[1], "G1")["status"], "missing")
+        self.pr["headRefOid"] = self.FULL[:7] + "9" * 33        # another head with that prefix
+        self.assertEqual(self.row(self.gates()[1], "G1")["status"], "missing")
+        entries, _ = sb.plan_ledger.read_ledger(self.world.state)
+        self.assertEqual(sb.plan_ledger.valid_waivers(entries, self.PR, self.FULL, self.world.clock.now()), {})
+        forge(self.FULL)                                        # the full head still applies
+        self.pr["headRefOid"] = self.FULL
+        self.assertEqual(self.row(self.gates()[1], "G1")["status"], "waived")
+
+    def test_the_docs_and_help_say_a_short_head_is_resolved_to_the_full_one(self):
+        docs = (REPO / "docs" / "switchboard.md").read_text()
+        self.assertIn("The ledger always holds the **full 40-character head** (#994)", docs)
+        self.assertIn("a `--head` in short form (7 or more hex characters, any case) that is a prefix of the pull request's current head is resolved to that full head", docs)
+        with captured() as (out, _):
+            with self.assertRaises(SystemExit):
+                sb.build_parser().parse_args(["waive", "--help"])
+        flat = " ".join(out.getvalue().split())
+        self.assertIn("a short head (7 or more hex characters) is resolved to the full head, or refused", flat)
 
     def test_a_short_head_when_the_pr_head_cannot_be_read_is_refused_and_a_full_one_taken_by_every_command(self):
         for member in ("waive", "prove", "verdict"):
@@ -32810,7 +32850,7 @@ class TestHeadResolution(LedgerBase):
     RESOLVING = {("prove",), ("verdict",), ("waive",), ("review", "record"), ("review", "blockers")}
     NAMED_EXCEPTIONS = {("review", "checkout"): "requires a full 40-character head and refuses a short one (tested below)",
                         ("item-verdict",): "compared exactly with the pinned reference commit (tested in TestItemVerdicts)",
-                        ("item-prove",): "records the pinned reference commit and never the flag (tested in TestItemVerdicts)",
+                        ("item-prove",): "compared exactly with the pinned reference commit, like item-verdict (tested in TestItemVerdicts)",
                         ("gates",): "read-only; the head is read from GitHub (tested below)"}
 
     def head_commands(self):
@@ -75524,7 +75564,12 @@ class TestItemVerdicts(unittest.TestCase):
         self.assertIsNone(code)
         self.assertIn("is not the reference commit", why)
         self.assertEqual(self.verdicts(), [])
-        self.assertEqual(self.prove("c1", head=self.PIN[:8])[0], sb.EXIT_OK)
+        for given in (self.PIN[:8], "f" * 40):   # #994: an item proof stores the pin, so a head that is not the pin is refused, never ignored
+            code, why = self.prove("c1", head=given)
+            self.assertIsNone(code)
+            self.assertIn("is not the reference commit", why)
+        self.assertEqual([e for e in self.entries() if e.get("kind") == "proof"], [])
+        self.assertEqual(self.prove("c1", head=self.PIN)[0], sb.EXIT_OK)   # the pin itself is accepted
         self.assertEqual([e["head"] for e in self.entries() if e.get("kind") == "proof"], [self.PIN])
 
     def register_world(self, **page_changes):
