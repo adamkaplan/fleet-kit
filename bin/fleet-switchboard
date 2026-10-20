@@ -25267,6 +25267,38 @@ def agents_found(runner, opencode, timeout):
         return "bad", "the service answered something that is not the agent list (%s)" % err
 
 
+def agent_body(text):
+    """The prose of an agent file: what follows its front matter (the model line, the permissions and the mode are in the front matter, so they are not compared)."""
+    return text.split("\n---\n", 1)[1] if "\n---\n" in text else text
+
+
+def default_installed_agents_dir():
+    """Where `install` writes the agent files of the private profile. Under the test suite there is none unless a test names one: the suite never reads the machine's own profile."""
+    if os.environ.get("FLEET_SWITCHBOARD_UNDER_TEST"):
+        return None
+    return _xdg("XDG_DATA_HOME", ".local/share") / PROG / "profile" / "config" / "opencode" / "agents"
+
+
+def stale_installed_agents(installed_dir, expected=None, root=None):
+    """[(name, path)] of the agents whose installed file has a body that is not the kit's (the model line is not compared). An agent with no installed file, or no kit file, is not listed."""
+    out = []
+    if installed_dir is None:
+        return out
+    for name in sorted(expected or EXPECTED_AGENTS):
+        found = agent_definition(name, root)
+        if found is None:
+            continue
+        try:
+            kit = agent_body(Path(found[2]).read_text())
+            installed = Path(installed_dir) / (name + ".md")
+            current = agent_body(installed.read_text())
+        except (OSError, ValueError):
+            continue
+        if kit != current:
+            out.append((name, str(installed)))
+    return out
+
+
 def agents_problems(found, expected=None, root=None, unchecked=None):
     """One line per agent of ours that is missing, in the wrong mode, short of a rule its definition declares, or whose definition has lines
     the check cannot read. `unchecked` (a list, when given) collects the agents whose rules were NOT compared (no definition found): only the mode was."""
@@ -25305,6 +25337,9 @@ def cmd_agents(args, runner, now):
         return EXIT_ERROR
     unchecked = []
     problems = agents_problems(payload, unchecked=unchecked)
+    installed_dir = Path(args.installed_dir) if args.installed_dir else default_installed_agents_dir()
+    for name, path in stale_installed_agents(installed_dir):
+        problems.append("%s: out of date (the installed copy %s has a different wording from the kit's); run `%s install`, then restart the service" % (name, path, PROG))
     if problems:
         for line in problems:
             print("FAIL  " + line)
@@ -25326,6 +25361,7 @@ def add_agents_parsers(sub):
                                                "lacks a rule its definition declares. A service that is not running is reported, not failed. Run it after installing the agents and "
                                                "restarting the service.")
     verify.add_argument("--strict", action="store_true", help="Exit 1 when the service cannot be asked (default: say so and exit 0)")
+    verify.add_argument("--installed-dir", default=None, help="The folder of installed agent files to compare bodies with (default: the private profile's agents folder)")
     verify.add_argument("--opencode", default="opencode", help="The opencode executable (default: opencode on PATH)")
     verify.add_argument("--timeout", type=int, default=AGENTS_VERIFY_TIMEOUT, help="Seconds to wait for the service (default %d)" % AGENTS_VERIFY_TIMEOUT)
 
