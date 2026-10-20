@@ -1,0 +1,29 @@
+# The items the parity table's GAP rows may cite, kept by hand (cloud/tests/check-parity-table reads this file).
+# When an item closes or merges, move its line from open to closed in the SAME change that flips its row: a GAP citing a closed item,
+# or a GAP naming no open item, fails the check. A number the check finds in a GAP and in neither list also fails.
+# Format: `open N` or `closed N` (an issue or a pull request number), one per line.
+open 543
+open 829
+closed 370
+closed 371
+closed 539
+closed 545
+closed 634
+closed 637
+closed 639
+closed 682
+closed 654
+closed 657
+closed 658
+closed 659
+closed 665
+closed 691
+closed 832
+closed 651
+closed 747
+closed 755
+closed 761
+open 856
+open 863
+closed 705
+closed 860
