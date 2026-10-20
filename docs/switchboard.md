@@ -2519,7 +2519,13 @@ Whether a PR is held for the owner, and why, is state in **labels** the switchbo
 (`<user>:...`, the OS user). `fleet-switchboard labels ensure` creates them in every watched repo (or `--repo`), idempotently and with
 each repo's own gh account: `<user>:merge-captain` (held for the owner), `<user>:merge-automatic` (merges on green CI and independent
 review), and the reasons a PR is held, one or more of `<user>:hold-security`, `hold-credential`, `hold-contract`, `hold-policy`,
-`hold-prod-config`, `hold-other-area` (an area owned by another team), `hold-impact` (the impact floor or an independent rating, #179: written by the switchboard).
+`hold-prod-config`, `hold-other-area` (an area owned by another team), `hold-impact` (the impact floor or an independent rating, #179: written by the switchboard), and `hold-owner` (the owner's own hold; only the owner lifts it).
+
+**Adoption (#891).** A `merge-captain` or `hold-impact` label a person or a lane put on by hand, on a pull request the owner-hold rule also holds at its
+current head, is recorded at the daemon's next pass as a label it added itself (`gate.label_adopted`: pull request, head, label), so the Chief of Staff's
+delegated clear can lift it. A label a person put there on purpose becomes liftable by score in that case. A pull request the rule does not hold keeps a person's
+label as a person's; a cut label read or an unreadable state adopts nothing. `hold-owner` is never adopted, never put back by a re-hold, and the delegated clear refuses it
+whatever the score (an audited `gate.hold_clear_refused` with `owner_hold`); only the owner's plain clear lifts it, and `labels ensure` creates it like the others.
 
 **One rule, one helper.** `is_captain(pr)` (a dict with `labels` and `body`) is the only place that decides it, used by the PR facts
 (and so the captain decision), the sweep's S2 and the triage's T6/T7: a PR is captain when it carries `merge-captain`, **or**, during the

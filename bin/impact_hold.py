@@ -13,6 +13,7 @@ daemon's globals and are not meant to be called from this module's own namespace
 import types
 
 MOVED = ('rating_at',
+         '_plan_hold',
          'rehold_reason',
          'gate_floor_fact',
          'read_impact_state',
@@ -213,10 +214,11 @@ def _consume_record(state, pr, clear=None):
     del state["applied"][pr]
 
 
-def _labels_ours(names, state, pr):
+def _labels_ours(names, state, pr, wide=False):
     """The labels this daemon added to `pr`, from its own record in impact-hold.json: [] when it has none, or when the owner's clear came after it (the clear took
     them off: whatever is there now is somebody else's). A record written before the list existed (`merge_label_added` only) is read as the hold label plus the
-    merge label when it says it added that one: the hold label is the fleet's own."""
+    merge label when it says it added that one: the hold label is the fleet's own. `wide` (#891, adoption and the merge of a re-apply) keeps every fleet hold label the record lists
+    (a re-hold restores the classes an owner's clear took off), not only the two the release and the clear act on."""
     ours = state["applied"].get(pr)
     if not isinstance(ours, dict):
         return []
@@ -225,7 +227,8 @@ def _labels_ours(names, state, pr):
         return []
     listed = ours.get("added")
     if isinstance(listed, list):
-        return [l for l in listed if l in (names["hold-impact"], names["merge-captain"])]
+        kept = {name for key, name in names.items() if (key == "merge-captain" or key.startswith("hold-")) and key != OWNER_HOLD_KEY} if wide else (names["hold-impact"], names["merge-captain"])
+        return [l for l in listed if l in kept]
     return [names["hold-impact"]] + ([names["merge-captain"]] if ours.get("merge_label_added") is True else [])
 
 
@@ -256,26 +259,39 @@ def _apply_impact_hold_locked(engine, repo, number, report, record, carry=None):
     live = raw.get("labels")
     if not isinstance(live, list):
         raise NoticeError("the pull request's labels cannot be read")
+    if raw.get("headRefOid") != head:
+        return 0   # (#891) the pull request moved since the rule judged it: every write below (an add, a restore, an adoption) is for the judged head only; the next pass judges the new one
     have = {(l.get("name") if isinstance(l, dict) else l) for l in live}
     want = [names["merge-captain"], names["hold-impact"]]
     if report.get("rehold"):   # the hold labels the owner's clear took off (#830): each is put back, and only an owner-tier hold label of the fleet
-        allowed = {name for key, name in names.items() if key.startswith("hold-")}
+        allowed = {name for key, name in names.items() if key.startswith("hold-") and key != OWNER_HOLD_KEY}   # the owner's own hold is never put back by the daemon
         want += [l for l in (cleared.get("removed") or []) if l in allowed and l not in want]
     missing = [l for l in want if l not in have]
-    if not missing:
+    # #891: a label of `want` that is ALREADY on the pull request and that the record did not add (a person or a lane put it on) is the daemon's own once this rule holds the pull request
+    # at its head: it is recorded as one it added. Only here, only for the labels the rule itself writes, only from a whole read of the labels and of the state.
+    recorded = set(_labels_ours(names, state, pr, wide=True))
+    adopt = []
+    if not problem and not [l for l in have if not (isinstance(l, str) and l)]:
+        adopt = [l for l in want if l in have and l not in recorded]
+    if not missing and not adopt:
         return 1
     runner = getattr(engine, "gh_runner", None) or subprocess.run
     spent = 1
-    ensured = engine.__dict__.setdefault("impact_labels_ensured", set())
-    if repo not in ensured:
-        ensure_labels(engine, runner, repo)
-        ensured.add(repo)
-        spent += len(LABEL_SPECS)
-    change_issue_labels(engine, runner, repo, number, add=missing)
-    spent += 1
-    added = sorted(set(_labels_ours(names, state, pr)) | set(missing))   # a re-apply MERGES into what an earlier apply added: it never forgets one
+    if missing:
+        ensured = engine.__dict__.setdefault("impact_labels_ensured", set())
+        if repo not in ensured:
+            ensure_labels(engine, runner, repo)
+            ensured.add(repo)
+            spent += len(LABEL_SPECS)
+        change_issue_labels(engine, runner, repo, number, add=missing)
+        spent += 1
+    added = sorted(recorded | set(missing) | set(adopt))   # a re-apply MERGES into what an earlier apply added: it never forgets one
     state["applied"][pr] = {"head": head, "merge_label_added": names["merge-captain"] in added, "added": added, "at": int(engine.now())}
     write_impact_state(engine.state_dir, state)
+    for label in adopt:   # after the record is written (a restart finds it recorded and adopts nothing more)
+        engine.audit.append(engine.actor, "gate.label_adopted", pr, {"head": head, "label": label})
+    if not missing:
+        return spent
     engine.audit.append(engine.actor, "gate.hold_applied", pr, {"head": head, "labels": missing, "reasons": report["reasons"],
                                                                  "floor_paths": report["floor_paths"][:20], "globs": report["globs"][:20]})
     if report.get("rehold"):   # said once per head: the labels were missing, so this is the pass that put them back
@@ -854,6 +870,10 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
                 remove.append(names["merge-captain"])
             if under_order is None:
                 remove += authors_hold_labels(names, raw, remove)   # #742: the OWNER's clear lifts the author's own hold with the floor's, from THIS read (the PR's labels at the cleared head)
+            elif names[OWNER_HOLD_KEY] in authors_hold_labels(names, raw, remove):   # #891: whatever the score, with its OWN audited reason
+                why = "%s carries %s, the owner's own hold: only the owner's plain clear lifts it, never the Chief of Staff under an order, whatever the score" % (pr, names[OWNER_HOLD_KEY])
+                engine.audit.append(engine.actor, "gate.hold_clear_refused", pr, {"head": current, "by": who, "under_order": under_order["number"], "owner_hold": True, "why": _one_line(why, 300)})
+                raise NoticeError(why)
             elif names["merge-captain"] in authors_hold_labels(names, raw, remove):
                 why = "%s carries a %s label the switchboard did not add: it is a person's own hold, not the Chief of Staff's to lift under an order; the owner clears it" % (pr, names["merge-captain"])
                 engine.audit.append(engine.actor, "gate.hold_clear_refused", pr, {"head": current, "by": who, "under_order": under_order["number"], "why": _one_line(why, 300)})
@@ -1138,9 +1158,20 @@ def cmd_impact_delegated(args, runner, now):
     return EXIT_OK
 
 
+def _plan_hold(names, state, pr, have):
+    """("add", missing) | ("adopt", labels already there that the record does not list: #891) | ("held", []) for a pull request the rule holds now."""
+    want = (names["merge-captain"], names["hold-impact"])
+    missing = [l for l in want if l not in have]
+    if missing:
+        return "add", missing
+    recorded = set(_labels_ours(names, state, pr, wide=True))
+    adopt = [l for l in want if l not in recorded]
+    return ("adopt", adopt) if adopt else ("held", [])
+
+
 def impact_plan(engine, report, labels, state, records, records_problem):
     """What the daemon would do with one judged pull request, as (what, labels): ("add", the labels it would add), ("held", []) already labelled,
-    ("cleared", []) the owner cleared this head, ("release", the labels it would remove: only those its own record lists and the pull request has now) or
+    ("adopt", the labels it would record as its own: a hold label already on a pull request the rule holds, put there by hand, #891), ("cleared", []) the owner cleared this head, ("release", the labels it would remove: only those its own record lists and the pull request has now) or
     ("none", []). The dry run prints this; the daemon's pass makes the same decisions (a test runs both over the same pull requests)."""
     names = label_names(engine.config)
     have = set(labels or ())
@@ -1151,11 +1182,9 @@ def impact_plan(engine, report, labels, state, records, records_problem):
         carried = (state.get("carried", {}).get(pr) or {}).get("head") == report["head"] and impact_floor.carry_enabled(engine.config, report["pr"].rpartition("#")[0])
         if (state["clears"].get(pr) or {}).get("head") == report["head"] or carried:   # the owner's clear, or a clear carried over a pure merge of main (#510)
             return "cleared", []
-        missing = [l for l in (names["merge-captain"], names["hold-impact"]) if l not in have]
-        return ("add", missing) if missing else ("held", [])
+        return _plan_hold(names, state, pr, have)
     if not records_problem and rehold_reason(engine, state, pr.rpartition("#")[0], pr, report.get("head")):   # (#830) held again at a new head
-        missing = [l for l in (names["merge-captain"], names["hold-impact"]) if l not in have]
-        return ("add", missing) if missing else ("held", [])
+        return _plan_hold(names, state, pr, have)
     if records_problem or not isinstance(state["applied"].get(pr), dict):
         return "none", []
     return "release", [l for l in _labels_ours(names, state, pr) if l in have]
@@ -1195,10 +1224,11 @@ def cmd_impact_hold(args, runner, now):
                 continue
             what, labels = impact_plan(engine, report, item["labels"], read_impact_state(state)[0], records, records_problem)
             reasons = "; ".join(report.get("owner_reasons") or [])[:160]
-            if what in ("add", "held", "cleared"):
+            if what in ("add", "adopt", "held", "cleared"):
                 shown += 1
                 print("%s  %s  %s" % (report["pr"], "cleared by the owner for this head: no label" if what == "cleared" else
-                                      ("would add %s" % ", ".join(labels) if labels else "already labelled"), reasons))
+                                      ("would adopt %s as its own (put there by hand)" % ", ".join(labels) if what == "adopt" else
+                                       "would add %s" % ", ".join(labels) if labels else "already labelled"), reasons))
             elif what == "release" and labels:
                 released += 1
                 print("%s  would remove %s (labels its record says the daemon added; the rule no longer holds it)" % (report["pr"], ", ".join(labels)))

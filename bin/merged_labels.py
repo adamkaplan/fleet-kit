@@ -17,13 +17,14 @@ The logic is here; `bin/fleet-switchboard` calls `run_pass` from the daemon's pa
 RETRY_SECONDS = 300
 DONE_MAX = 500   # pull requests remembered as handled (memory only; an event is not replayed)
 
-NEEDS = ("label_names", "CAPTAIN_HOLD_LABELS", "read_pr_json", "change_issue_labels", "load_module", "_one_line", "subprocess")
+NEEDS = ("label_names", "CAPTAIN_HOLD_LABELS", "OWNER_HOLD_KEY", "read_pr_json", "change_issue_labels", "load_module", "_one_line", "subprocess")
 
 
 def fleet_labels(sb, config):
-    """The exact label names this module may remove: the fleet's `merge-captain` and every `hold-*` label of its prefix."""
+    """The exact label names this module may remove: the fleet's `merge-captain` and every `hold-*` label of its prefix EXCEPT the owner's own hold (#891: only the owner's plain
+    clear lifts it, and it stays on a merged pull request as the evidence it merged against one)."""
     names = sb.label_names(config)
-    return {names[key] for key in ("merge-captain",) + tuple(sb.CAPTAIN_HOLD_LABELS) if key in names}
+    return {names[key] for key in ("merge-captain",) + tuple(sb.CAPTAIN_HOLD_LABELS) if key in names and key != sb.OWNER_HOLD_KEY}
 
 
 def label_set(raw):
@@ -54,7 +55,7 @@ def run_pass(sb, engine, now, calls):
             continue
         number = int(number)
         carried = sorted(ours & label_set(entry.get("labels")))
-        if not carried:
+        if not carried and sb.label_names(engine.config)[sb.OWNER_HOLD_KEY] not in label_set(entry.get("labels")):   # #891: the owner's own hold is read too, to be said and kept
             _done(memory, ref, now)   # the merge event carried no fleet label: nothing to do, no read
             continue
         if not watched(sb, engine, repo):
@@ -78,7 +79,11 @@ def run_pass(sb, engine, now, calls):
             engine.audit.append(engine.actor, "merged.labels_skipped", ref, {"fresh_state": sb._one_line(str(fresh_state), 20)})
             _done(memory, ref, now)
             continue
-        remove = sorted(ours & label_set(raw.get("labels")))
+        present = label_set(raw.get("labels"))
+        remove = sorted(ours & present)
+        owner_hold = sb.label_names(engine.config)[sb.OWNER_HOLD_KEY]
+        if owner_hold in present:   # #891: kept, and said once per merged pull request
+            engine.audit.append(engine.actor, "merged.owner_hold_kept", ref, {"pr": ref, "label": owner_hold, "why": "merged against the owner's own hold: only the owner's plain clear lifts it"})
         if remove:
             runner = getattr(engine, "gh_runner", None) or sb.subprocess.run
             try:
