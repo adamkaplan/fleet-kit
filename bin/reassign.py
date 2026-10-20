@@ -47,7 +47,7 @@ def _clean(raw):
                 and isinstance(entry.get("session"), str) and entry["session"]
                 and isinstance(entry.get("at"), (int, float)) and not isinstance(entry.get("at"), bool)):
             found[worker] = {"boss": entry["boss"], "was": str(entry.get("was") or "")[:64], "original": str(entry.get("original") or "")[:64], "session": entry["session"][:128],
-                             "by": str(entry.get("by") or "")[:64], "at": float(entry["at"])}
+                             "by": str(entry.get("by") or "")[:64], "at": float(entry["at"]), "adopted": entry.get("adopted") is True}
     return found
 
 
@@ -74,6 +74,31 @@ def read_overrides(state_dir):
         return {}, "%s cannot be read (%s): no override applies" % (FILE, str(err)[:80])
     _cache[str(path)] = (key, found)
     return found, None
+
+
+class OverridesUnreadable(Exception):
+    """boss-overrides.json exists but cannot be read in full as {"overrides": {worker: record}} (#838)."""
+
+
+def read_overrides_strict(state_dir):
+    """The raw record of `{worker: entry}` or OverridesUnreadable. A MISSING file is an empty record; corrupt, truncated, empty, a list, a table that is not an
+    object, an entry that is not an object, too large or unreadable all raise. `read_overrides` (a damaged file means no override applies) is right for
+    discovery; a WRITE of a boss must not start from a damaged file."""
+    path = Path(state_dir) / FILE
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return {}
+    except OSError as err:
+        raise OverridesUnreadable("%s cannot be read: %s" % (FILE, err.strerror or type(err).__name__)) from None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        raise OverridesUnreadable("%s is not valid JSON" % FILE) from None
+    items = data.get("overrides") if isinstance(data, dict) else None
+    if len(raw) > MAX_BYTES or not isinstance(items, dict) or not all(isinstance(v, dict) for v in items.values()):
+        raise OverridesUnreadable("%s is not a record of boss overrides" % FILE)
+    return items
 
 
 def overlay(state_dir, fleet, session_id):
@@ -116,8 +141,8 @@ def write_overrides(state_dir, overrides):
 
 
 def prune(overrides, retired, now):
-    """Drop the overrides of retired workers and those older than MAX_AGE_DAYS. Returns the number dropped."""
-    gone = [w for w, e in overrides.items() if w in retired or now - e["at"] > MAX_AGE_DAYS * 86400]
+    """Drop the overrides of retired workers (not an adoption: #838) and those older than MAX_AGE_DAYS. Returns the number dropped."""
+    gone = [w for w, e in overrides.items() if (w in retired and not e.get("adopted")) or now - e["at"] > MAX_AGE_DAYS * 86400]   # an ADOPTION of a retired worker stays: its pane may be open and still needs a boss (#838)
     for worker in gone:
         overrides.pop(worker, None)
     return len(gone)
