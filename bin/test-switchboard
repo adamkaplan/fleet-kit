@@ -72352,6 +72352,65 @@ class TestPullFileListRead(LedgerBase):
         self.assertEqual(why, None)
         self.assertEqual([api.pages_asked(n) for n in (1, 2, 3, 4)], [1, 1, 1, 0], "the floor read the pages; the clear did not read them again")
 
+    def count_words(self, count):
+        api = self.serve(FakePullFiles.make(38))
+        api.count = count
+        return self.check()[1]
+
+    ENTRY_SHAPES = (   # (label, the entry at position 51 of page 2, the detail the refusal gives)
+        ("a string", "bad", "a str, not an object"),
+        ("null", None, "a NoneType, not an object"),
+        ("a list", ["a"], "a list, not an object"),
+        ("an object with no filename", {"status": "modified"}, "no file name"),
+        ("a filename that is a number", {"filename": 5, "status": "modified"}, "no file name"),
+        ("an empty filename", {"filename": "", "status": "modified"}, "no file name"),
+    )
+
+    def entry_refusal(self, entry, floor=False):
+        """the refusal for `entry` at position 51 of page 2 of 250 files, through the clear or through the floor"""
+        api = self.serve(FakePullFiles.make(250))
+        api.files[150] = entry
+        if floor:
+            report = sb.pr_floor_report(self.engine, self.REPO, 9)
+            self.assertEqual(report["complete"], False)
+            return report["list_problem"]
+        return self.check()[1]
+
+    def nameless_words(self, name, floor=False):
+        return self.entry_refusal({"filename": name, "status": "modified"}, floor)
+
+    def test_a_count_that_is_missing_not_a_number_or_negative_says_which(self):
+        for count, words in ((None, "was missing"), ("12", "was not a number"), (12.5, "was not a number"), (True, "was not a number"), (-1, "was negative (-1)")):
+            with self.subTest(count=count):
+                why = self.count_words(count)
+                self.assertIn(words, why)
+                self.assertNotIn("cut", why)
+                self.assertNotIn("after one retry", why)
+
+    def test_every_shape_of_a_bad_entry_is_refused_with_its_kind_its_page_and_its_one_based_position_through_the_clear_and_the_floor(self):
+        for label, entry, detail in self.ENTRY_SHAPES:
+            for floor in (False, True):
+                with self.subTest(shape=label, floor=floor):
+                    why = self.entry_refusal(entry, floor)
+                    self.assertIn("page 2, position 51 on the page (counting from 1) of the changed files is not a file entry (%s)" % detail, why)
+                    self.assertNotIn("cut", why)
+
+    def test_s9_a_mutant_for_each_branch_and_for_the_position_of_a_bad_entry_is_caught(self):
+        def every_shape():
+            for label, entry, detail in self.ENTRY_SHAPES:
+                self.assertIn("page 2, position 51 on the page (counting from 1) of the changed files is not a file entry (%s)" % detail, self.entry_refusal(entry))
+        check_line = '    if not isinstance(entry.get("filename"), str) or not entry["filename"]:'
+        mutants = {
+            "a non-object entry is skipped": ('            if not isinstance(entry, dict):\n', '            if False:\n'),
+            "a missing or non-text name is kept": (check_line, '    if not entry.get("filename"):'),
+            "an empty name is kept": (check_line, '    if not isinstance(entry.get("filename"), str):'),
+            "the position counts from 0": ("enumerate(got, 1)", "enumerate(got)"),
+        }
+        for label, (old, new) in mutants.items():
+            with self.subTest(mutant=label):
+                self.assertFalse(self.survives(self.mutant(old, new), every_shape), "the mutant %s is not caught" % label)
+        every_shape()
+
     def test_u4_a_view_that_vouches_for_its_list_makes_no_paged_read_for_the_floor(self):
         api = self.serve(FakePullFiles.make(38))
         report = sb.pr_floor_report(self.engine, self.REPO, 9)
@@ -72487,6 +72546,7 @@ class TestPullFileListRead(LedgerBase):
         self.assertLessEqual(len(json.dumps(parts)), module.AUDIT_LINE_MAX + 5000)
         self.assertNotIn("causes_omitted", module.audit_parts("why", many[:5]))
 
+    # NOTE: the writers are found by a scan of the source text, so a writer that builds the audit line another way (not `engine.audit.append(... "gate.hold_clear_refused" ...)` on one line) is not caught by the scan; the behavioural halves below drive the real writers.
     def test_s15_no_writer_of_a_refusal_on_the_clear_path_cuts_the_reason(self):
         text = (BIN / "impact_hold.py").read_text()
         appends = [m.group(0) for m in re.finditer(r'engine\.audit\.append\([^\n]*"gate\.hold_clear_refused"[^\n]*', text)]
@@ -72595,7 +72655,7 @@ class TestPullFileListRead(LedgerBase):
 
     def words(self, kind):
         return {"read_failed": "after one retry", "not_a_list": "was not a list", "over_limit": "more than 3000 changed files", "head_moved": "head moved",
-                "cut": "GitHub itself says the file list is cut", "bad_entry": "is not a file entry", "no_count": "count of changed files was missing", "no_source": "no known source path", "not_recorded": "no reason was recorded"}[kind]
+                "cut": "GitHub itself says the file list is cut", "bad_entry": "is not a file entry", "no_count": "count of changed files was", "no_source": "no known source path", "not_recorded": "no reason was recorded"}[kind]
 
     def drive(self, kind, detail=None):
         """the refusal text the real clear gives for each kind of failure in the table (`detail` picks which failed read for read_failed)"""
@@ -72758,13 +72818,18 @@ class TestPullFileListRead(LedgerBase):
             self.assertIn("count of changed files was missing", self.drive("no_count"))
 
         mutants = {
-            "a missing count is not refused as such": ('        raise FileListError("no_count")', '        pass', nocount),
+            "a missing count is not refused as such": ('    if total is None:\n        raise FileListError("no_count", "missing")', '    if total is None:\n        total = 0', nocount),
+            "a count that is not a number is accepted": ('    if not isinstance(total, int) or isinstance(total, bool):\n        raise FileListError("no_count", "not a number (%s)" % type(total).__name__)', '    if False:\n        pass', lambda: self.assertIn("was not a number", self.count_words("12"))),
+            "a negative count is accepted": ('    if total < 0:\n        raise FileListError("no_count", "negative (%d)" % total)', '    if False:\n        pass', lambda: self.assertIn("was negative", self.count_words(-1))),
+            "a nameless entry is kept": ('    if not isinstance(entry.get("filename"), str) or not entry["filename"]:', '    if False:', lambda: self.assertIn("no file name", self.nameless_words(""))),
+            "a non-string name is kept": ('    if not isinstance(entry.get("filename"), str) or not entry["filename"]:', '    if not entry.get("filename"):', lambda: self.assertIn("no file name", self.nameless_words(5))),
+            "an empty name is kept": ('    if not isinstance(entry.get("filename"), str) or not entry["filename"]:', '    if not isinstance(entry.get("filename"), str):', lambda: self.assertIn("no file name", self.nameless_words(""))),
             "an entry that is not a file is dropped": ('                raise FileListError("bad_entry", page, position, "a %s, not an object" % type(entry).__name__)', '                continue', dropped),
             "one page only": ('        if len(got) < FILE_PAGE:\n            break', '        break', whole),
             "every failure is a cut list": ('FileListError("read_failed", what + error_class(err))', 'FileListError("cut", 0, 0)', lambda: self.assertIn("after one retry", self.drive("read_failed"))),
             "no retry": ("    for _ in (1, 2):", "    for _ in (1,):", transient),
             "an endless retry": ("    for _ in (1, 2):", "    for _ in (1, 2, 3, 4, 5, 6):", exactly_twice),
-            "no limit": ("    if total is not None and total > FILE_LIMIT:\n        raise FileListError(\"over_limit\", FILE_LIMIT)", "    pass", over),
+            "no limit": ("    if total > FILE_LIMIT:\n        raise FileListError(\"over_limit\", FILE_LIMIT)", "    pass", over),
             "no count check": ("    if total != len(files):\n        raise FileListError(\"cut\", len(files), total)\n", "", count),
         }
         for label, (old, new, check) in mutants.items():

@@ -4570,8 +4570,8 @@ What each refusal means, and what to do:
 - `over_limit`: "more than 3000 changed files". GitHub lists no more than that, so the list cannot be read in full; this stays the owner's own clear.
 - `head_moved`: "the pull request's head moved while it was being checked". A push arrived between the reads; nothing was cleared; run the clear again at the new head.
 - `cut`: "GitHub itself says the file list is cut": the pull request's own count of changed files differs from the list read. This is the only refusal that says the list is cut.
-- `bad_entry`: "is not a file entry": GitHub's answer was a list, but an entry of it (named by page and position) is not a file with a name. It is refused with its place, never dropped, so the count is never made to differ by the reader.
-- `no_count`: "count of changed files was missing": the pull request's own count of changed files was not in GitHub's answer, so the list cannot be checked against it.
+- `bad_entry`: "is not a file entry": GitHub's answer was a list, but an entry of it (named by its page and its position on that page, counting from 1) is not a file with a name. It is refused with its place, never dropped, so the count is never made to differ by the reader.
+- `no_count`: "count of changed files was missing", "was not a number" or "was negative": the pull request's own count of changed files could not be used, so the list cannot be checked against it.
 - `no_source`: "no known source path": a renamed or copied file whose source GitHub did not give, so a top tier path could be the source. The owner's own clear.
 - `not_recorded`: "no reason was recorded": a report that was not whole and carries no reason. The clear never makes one; it exists so the words never say "cut" for it.
 
@@ -4585,7 +4585,7 @@ What each refusal means, and what to do:
 - `order`: the standing order or the caller was refused before the pull request was read.
 - `owner_hold_label`, `person_hold_label`: the pull request carries a hold that is a person's own.
 
-Other audit lines that clip text stay as they were, because they are not on this path: the carry's void reason and the marker line (200 characters), the clear's and the revoke's own reason typed by a person (300), and the reasons of a release (five of them, 160 characters each).
+The reasons of the clear path (the order checks, the score, the refusal printed for an error) are whole too. Other audit lines that clip text stay as they were, because they are not on this path: the carry's void reason and the marker line (200 characters), the clear's and the revoke's own reason typed by a person (300), and the reasons of a release (five of them, 160 characters each).
 
 ### The delegated clear by impact score (#835)
 

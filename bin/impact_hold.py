@@ -927,7 +927,7 @@ def delegated_clear_checks(engine, runner, now, kind, number):
         try:
             line = module.file_order_line(cos_orders_text_of(read_cos_orders(engine.config)["raw"]), orders[number])
         except (CosOrdersError, OSError) as err:
-            return None, "the owner's standing-orders file cannot be read (%s): refused" % _one_line(str(err), 120)
+            return None, "the owner's standing-orders file cannot be read (%s): refused" % module.whole_line(str(err))
         if line is None:
             return None, "the owner's standing-orders file has no single line that is the text order %d is bound to (it was edited, removed or repeated): refused" % number
         return {"number": number, "text": re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", line), "threshold": threshold, "source": module.OWNER_FILE}, None
@@ -935,7 +935,7 @@ def delegated_clear_checks(engine, runner, now, kind, number):
         reader = _intent_reader(runner, now)
         text = module.order_text(fetch_orders(reader, charter, engine.config.get("intent_repo")), number)
     except (IntentError, ConfigError, OSError) as err:
-        return None, "the charter's orders cannot be read (%s): refused" % _one_line(str(err), 120)
+        return None, "the charter's orders cannot be read (%s): refused" % module.whole_line(str(err))
     if text is None:
         return None, "order %d does not exist on charter #%d" % (number, charter)
     if module.order_hash(text) != orders[number]:   # the order numbers are POSITIONS: the text bound in the configuration must still be the text at that number
@@ -980,7 +980,7 @@ def delegated_clear_score(engine, module, report, threshold):
         block = module.score_block()
         scored = module.judge(block, impact_floor.load_matrix().get("cells"), entries, report, threshold) if not problem and block is not None else None
     except Exception as err:
-        scored, problem = None, "%s: %s" % (type(err).__name__, _one_line(str(err), 80))
+        scored, problem = None, "%s: %s" % (type(err).__name__, module.whole_line(str(err)))
     if scored is None:
         scored = {"level": None, "reasons": ["the independent rating cannot be read (%s): the score is unknown, refused" % (problem or "no score rule")]}
     return scored
@@ -1099,13 +1099,13 @@ def cmd_impact_clear(args, runner, now):
         for line in impact_clear_core(engine, runner, repo, number, kind[1], plan_ledger.clip(redact_command_text(reason), 300), **extra):
             print(line)
     except (NoticeError, IntentError) as err:
-        sys.stderr.write("%s: impact clear: %s\n" % (PROG, _one_line(str(err), 300)))
+        sys.stderr.write("%s: impact clear: %s\n" % (PROG, load_module("delegated_clear").whole_line(str(err))))
         return EXIT_ERROR
     except ImpactStateBusy as err:   # the lock wait ran out: one line, nothing half done
         sys.stderr.write("%s: impact clear: %s; nothing was changed, try again in a moment\n" % (PROG, _one_line(str(err), 200)))
         return EXIT_ERROR
     except RuntimeError as err:      # no audit sink, or the corrupt state file could not be set aside: retrying does not help until it is fixed
-        sys.stderr.write("%s: impact clear: refused: %s; nothing was changed\n" % (PROG, _one_line(str(err), 200)))
+        sys.stderr.write("%s: impact clear: refused: %s; nothing was changed\n" % (PROG, load_module("delegated_clear").whole_line(str(err))))
         return EXIT_ERROR
     return EXIT_OK
 

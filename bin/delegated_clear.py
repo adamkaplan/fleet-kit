@@ -185,8 +185,8 @@ FILE_REFUSALS = {
     "over_limit": "the pull request has more than %d changed files, more than GitHub lists: too many to read in full",
     "head_moved": "the pull request's head moved while it was being checked (%s, then %s): nothing was cleared",
     "cut": "GitHub itself says the file list is cut: it listed %d of %d changed files",
-    "bad_entry": "page %d, position %d of the changed files is not a file entry (%s)",
-    "no_count": "the pull request's count of changed files was missing, so the list cannot be checked against it",
+    "bad_entry": "page %d, position %d on the page (counting from 1) of the changed files is not a file entry (%s)",
+    "no_count": "the pull request's count of changed files was %s, so the list cannot be checked against it",
     "no_source": "%d renamed or copied file(s) with no known source path (%s)",
     "not_recorded": "the file list was not read in full (no reason was recorded)",
 }
@@ -241,8 +241,13 @@ def read_pr_files(get, repo, number):
     of changed files is read first: more than 3000 is refused before any page is read, and a list whose length differs from it at the end is the ONE case GitHub itself says is cut."""
     pull = read_with_retry(get, "repos/%s/pulls/%d" % (repo, number), lambda a: isinstance(a, dict), "the pull request: ")
     total = pull.get("changed_files")
-    total = total if isinstance(total, int) and not isinstance(total, bool) else None
-    if total is not None and total > FILE_LIMIT:
+    if total is None:
+        raise FileListError("no_count", "missing")
+    if not isinstance(total, int) or isinstance(total, bool):
+        raise FileListError("no_count", "not a number (%s)" % type(total).__name__)
+    if total < 0:
+        raise FileListError("no_count", "negative (%d)" % total)
+    if total > FILE_LIMIT:
         raise FileListError("over_limit", FILE_LIMIT)
     files = []
     for page in range(1, FILE_PAGES + 1):
@@ -257,8 +262,6 @@ def read_pr_files(get, repo, number):
             break
     else:
         raise FileListError("over_limit", FILE_LIMIT)   # the page after the 3000th file still has files
-    if total is None:
-        raise FileListError("no_count")
     if total != len(files):
         raise FileListError("cut", len(files), total)
     return files, pull
