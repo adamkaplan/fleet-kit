@@ -53,6 +53,44 @@ def merged_links(prs, repo):
     return links
 
 
+def _ref(record, side):
+    """The branch name of one side (`base` or `head`) of a pull request record, or None when it is not readable as a non-empty string."""
+    part = record.get(side) if isinstance(record, dict) else None
+    ref = part.get("ref") if isinstance(part, dict) else None
+    return ref if isinstance(ref, str) and ref else None
+
+
+def split_batch_waiting(prs, links, integration_branch):
+    """(judged, waiting): `links` (from `merged_links`) split by whether the change is still waiting for the batch.
+
+    A link waits only when its pull request merged with a base that EQUALS the configured integration branch and no merged batch pull request is in the
+    records already read: one whose head is the integration branch and whose base is the repository's default branch, merged at or after the member.
+    Anything else is judged as before: no integration branch configured (not a non-empty string), a base that cannot be read, another branch, the
+    default branch, or a doubt of any kind. Reads nothing new; the branch name comes only from the configuration."""
+    if not (isinstance(integration_branch, str) and integration_branch):
+        return links, {}
+    records = {}
+    batches = []
+    for record in prs or []:
+        if not isinstance(record, dict) or not record.get("merged_at"):
+            continue
+        number = _number(record.get("number"))
+        if number is not None:
+            records[number] = record
+        base = record.get("base")
+        default = ((base.get("repo") or {}).get("default_branch") if isinstance(base, dict) and isinstance(base.get("repo"), dict) else None)
+        if _ref(record, "head") == integration_branch and isinstance(default, str) and default and _ref(record, "base") == default:
+            batches.append(str(record["merged_at"]))
+    judged, waiting = {}, {}
+    for issue, link in links.items():
+        member = records.get(link["pr"])
+        if member is not None and _ref(member, "base") == integration_branch and not any(at >= str(link["merged_at"]) for at in batches):
+            waiting[issue] = link
+        else:
+            judged[issue] = link
+    return judged, waiting
+
+
 def evidence(link, merged_age_days):
     """The finding's evidence: the PR that merged, its link, and how long ago."""
     return {"pr": link["pr"], "pr_url": link["url"], "merged_days": round(merged_age_days, 2)}
