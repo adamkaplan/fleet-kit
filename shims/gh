@@ -16,6 +16,7 @@ not understand, runs the real gh unchanged: this must never block a command.
 import importlib.util
 import json
 import os
+import posixpath
 import re
 import shutil
 import signal
@@ -1046,6 +1047,53 @@ def refusal_text(err):
     return "gh: no GitHub account is mapped for %s: git cannot authenticate as a guess (add the repository or its owner to gh_users)\n" % _clean_reason(str(err))
 
 
+SHARED_TEMP_DIRS = ("/tmp", "/private/tmp")
+
+
+def shared_body_file(args, env=None):
+    """The --body-file / -F path (absolute) whose PARENT directory is a shared temp directory, else None. String analysis only: the path is
+    never opened, stat'ed or read, and '..' is folded lexically. The shared directories are /tmp, /private/tmp and the parent of this
+    agent's own TMPDIR (the profile's shared temp root, which the launch exports as FLEET_AGENT_TMPDIR). Fails open: any error is None."""
+    try:
+        env = os.environ if env is None else env
+        if not args or args[0] == "api":   # `gh api -F key=value` is a field, not a file
+            return None
+        shared = {posixpath.normpath(d) for d in SHARED_TEMP_DIRS}
+        own = env.get("FLEET_AGENT_TMPDIR") or ""
+        if own.startswith("/") and posixpath.normpath(own) != "/":
+            shared.add(posixpath.dirname(posixpath.normpath(own)))
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "--":
+                return None
+            value = None
+            if arg in ("--body-file", "-F"):
+                value = args[i + 1] if i + 1 < len(args) else None
+            elif arg.startswith("--body-file="):
+                value = arg[len("--body-file="):]
+            elif arg.startswith("-F") and not arg.startswith("--"):
+                value = arg[2:].lstrip("=") if arg[2:3] == "=" else arg[2:]
+            if value is not None and value.startswith("/"):
+                if posixpath.dirname(posixpath.normpath(value)) in shared:
+                    return value
+            i += 1
+    except Exception:
+        return None
+    return None
+
+
+def warn_shared_body_file(args):
+    """One stderr line when a body file sits directly in a shared temp directory (#767). Never refuses, never changes anything."""
+    try:
+        path = shared_body_file(args)
+        if path:
+            sys.stderr.write("gh: warning: %s is directly in a shared temp directory, where another agent can write the same name: put it under $TMPDIR "
+                             "(for example $TMPDIR/body.md, or a directory from `mktemp -d`)\n" % re.sub(r"[^\x20-\x7e]", "?", path)[:200])
+    except Exception:
+        pass
+
+
 def main(args):
     try:
         return run(args)
@@ -1059,6 +1107,7 @@ def run(args):
         sys.stderr.write("gh: not found on PATH (the fleet shim found no real gh behind it)\n")
         return 127
     plan = None
+    warn_shared_body_file(args)
     args, over_found, over_reason = take_over_review(args)   # the shim's own flag never reaches gh or the signing
     write = is_write(args)
     lookup = Lookup(write=write)   # one identity lookup, one deadline, for the name and the account together

@@ -181,6 +181,20 @@ def _raise_interrupted(signum, frame):
 TOKEN_SHAPES = [re.compile(p) for p in (
     r"gh[pousr]_[A-Za-z0-9]{6,}", r"github_pat_[A-Za-z0-9_]{6,}", r"eyJ[A-Za-z0-9_-]{6,}(?:\.[A-Za-z0-9_-]*)*",
     r"[A-Za-z0-9+/]{40,}={0,2}", r"[A-Za-z0-9_-]{40,}", r"[0-9a-fA-F]{40,}")]  # standard and URL-safe base64, hex
+# Credentials by SHAPE (a push error that echoes a request): an Authorization header of any scheme (any case and spacing,
+# also quoted as in JSON), and the user:password of a URL of any scheme (the password may be percent-encoded). Each is
+# replaced whole; they run BEFORE the token shapes so the surrounding text survives.
+CREDENTIAL_SHAPES = [(re.compile(p, re.I), r) for p, r in (
+    # the rest of the header line goes, and its folded continuation lines (a line that starts with a space or tab): a
+    # multi-parameter scheme (Digest user="u", response="...") is not cut at its first comma
+    (r"""\bauthorization["']?[ \t]*[:=][ \t]*[^\r\n]*(?:\r?\n[ \t]+[^\r\n]*)*""", "authorization: [redacted]"),
+    # URL userinfo stays INSIDE ITS OWN PART: the user holds no / ? # @ :, and a password holds no / ? # (it may hold @ and : : the last @ before the part ends closes it), so
+    # host/path/query is never userinfo (a scoped package, an @user path, ?email=a@b, a port). Every quantifier is bounded
+    # (hostile text cannot make the scan quadratic).
+    (r"""\b([a-z][a-z0-9+.-]{0,30}://)[^\s/?#@:'"<>]{0,200}(?::[^\s/?#'"<>]{0,500})?@""", r"\1[redacted]@"),
+    # An UNENCODED reserved character in a password (user:p/a?b#c@host): a ':' straight after the user, a password that is
+    # not just a port (digits then / ? # or the end), up to the last @ within the bound.
+    (r"""\b([a-z][a-z0-9+.-]{0,30}://)[^\s/?#@:'"<>]{0,200}:(?!\d+(?:[/?#\s'"<>]|$))[^\s'"<>]{0,500}@""", r"\1[redacted]@"))]
 SCRUB_INPUT_MAX = 200000
 SCRUB_OUTPUT_MAX = 2 * SCRUB_INPUT_MAX   # a limit above the input maximum: redaction lengthens text (8 characters become 10), and a cut there would be silent
 MIN_FRAGMENT = 8
@@ -207,6 +221,8 @@ def scrub(text, secrets_known=(), limit=300):
                 out.append(text[i])
                 i += 1
         text = "".join(out)
+    for pat, repl in CREDENTIAL_SHAPES:
+        text = pat.sub(repl, text)
     for pat in TOKEN_SHAPES:
         text = pat.sub("[redacted]", text)
     return re.sub(r"[^\x20-\x7e]", "?", text)[:limit]
@@ -1017,15 +1033,19 @@ class Launcher:
                 # Secrets, and say so.
                 self._remove(name, nonce)
                 print("cloud-worker: pod was %s; end hook not run; deleted" % phase, file=sys.stderr)
+                self._hook_record(info, {"ran": False, "pushed": False, "wip_branch": None, "skipped": [], "note": "pod was %s; end hook not run" % phase})
                 return {"worker": worker, "runtime_id": "pod/" + name, "pushed": False, "wip_branch": None,
                         "skipped": [], "note": "pod was %s; end hook not run" % phase, "record": info.get("record", "")}
             try:
                 res = self.run_hook(name)
             except CloudError as e:
                 res = {"pushed": False, "wip_branch": None, "error": str(e)}
-            if res.get("error"):
+            view = self._hook_view(res)   # every field text from the pod: a string, scrubbed, short
+            self.last_hook = {k: view[k] for k in ("pushed", "wip_branch", "error")}
+            self._hook_record(info, dict(view, ran=True))
+            if view["error"]:
                 self.kube.annotate(name, kept="true")  # the pod is kept: the commit is not safe yet
-                raise CloudError("end hook could not push, pod kept: %s" % res["error"], EXIT_HOOK)
+                raise CloudError("end hook could not push, pod kept: %s" % view["error"], EXIT_HOOK)
             try:
                 self.kube.annotate(name, hook_ran="true")
             finally:
@@ -1042,7 +1062,7 @@ class Launcher:
             if skipped:  # these files were not pushed and went with the pod: say so, loudly
                 print("cloud-worker: WARNING: not saved (secret-looking names): %s" % ", ".join(skipped), file=sys.stderr)
             return {"worker": worker, "runtime_id": "pod/" + name, "pushed": bool(res.get("pushed")),
-                    "wip_branch": res.get("wip_branch"), "skipped": skipped, "record": info.get("record", "")}
+                    "wip_branch": view["wip_branch"], "skipped": skipped, "record": info.get("record", "")}
         return self._audited(worker, "stop", go, audit_reason)
 
     def _remove(self, name, nonce):
@@ -1063,6 +1083,26 @@ class Launcher:
                 left.append(label)
         if left:
             raise CloudError("delete incomplete; REMAINS: %s; delete each with: %s" % (", ".join(left), "; ".join(self._delete_cmd(l) for l in left)))
+
+    def _hook_view(self, res):
+        """The end hook's answer as it may be shown or kept: pushed a bool, wip_branch a scrubbed string or None, the
+        skipped names strings (at most 50), note and error scrubbed. Never raises."""
+        def text(v, limit=300):
+            return self.kube.scrub(v, limit) if isinstance(v, str) and v else ""
+        try:
+            raw = res.get("skipped")
+            return {"pushed": bool(res.get("pushed")), "wip_branch": text(res.get("wip_branch"), 200) or None,
+                    "skipped": [text(x, 200) for x in raw if isinstance(x, str)][:50] if isinstance(raw, list) else [],
+                    "note": text(res.get("note")), "error": text(res.get("error")) or ("end hook gave an unreadable error" if res.get("error") else "")}
+        except Exception:
+            return {"pushed": False, "wip_branch": None, "skipped": [], "note": "", "error": "end hook answer unreadable"}
+
+    def _hook_record(self, info, hook):
+        if info.get("record"):
+            try:
+                self.recorder.add_hook(info["record"], hook)
+            except Exception:   # add_hook never raises; a stop is never held back by the record
+                pass
 
     def prune_records(self, a):
         """Remove run records older than --days (default CW_RECORD_KEEP_DAYS, else 30): only this tool's per-run directories."""
@@ -1182,6 +1222,7 @@ class Launcher:
     def reap(self):
         """One pass: stop every pod past its hard deadline or idle too long. Returns [(worker, reason, exit)]."""
         out, now = [], self.clock()
+        self.reap_results, self.last_hook = {}, None
         for pod in self.kube.list_pods():
             worker = ann(pod, "worker")
             reason = None
@@ -1202,10 +1243,13 @@ class Launcher:
                 if act and not act[0] and act[1] is not None and (now - act[1]).total_seconds() >= int(ann(pod, "idle-seconds", "600")):
                     reason = "idle"
             if reason:
+                self.last_hook = None
                 try:
-                    self.stop(argparse.Namespace(worker=worker, reason=reason), reason)
+                    res = self.stop(argparse.Namespace(worker=worker, reason=reason), reason)
+                    self.reap_results[worker] = {k: res.get(k) for k in ("pushed", "wip_branch", "skipped", "record")}
                     out.append((worker, reason, 0))
                 except CloudError as e:
+                    self.reap_results[worker] = dict(self.last_hook or {})
                     out.append((worker, reason, e.code))
         return out
 
@@ -1266,6 +1310,28 @@ def _run_id(v):
     return v
 
 
+def _reap_main(L, a, sleep):
+    """The reaper's loop. Whatever ends it writes ONE line saying why (signal, error, or the end of the loop)."""
+    old, why = L._catch_signals(), None
+    try:
+        while True:
+            res = L.reap()
+            print(json.dumps([dict({"worker": w, "reason": r, "exit": c}, **L.reap_results.get(w, {})) for w, r, c in res]))
+            if not a.loop:
+                why = "end of its pass"
+                return EXIT_HOOK if any(c for _, _, c in res) else 0
+            sleep(min(a.loop, 60))  # never slower than the contract's once a minute
+    except (Interrupted, KeyboardInterrupt) as e:
+        why = "stopped by %s" % (e if isinstance(e, Interrupted) else "interrupt")
+        raise
+    except BaseException as e:
+        why = "error: %s" % L.kube.scrub(e, 200)
+        raise
+    finally:
+        L._restore_signals(old)
+        print("cloud-worker: %s reaper exiting: %s" % (iso(L.clock()), why), file=sys.stderr)   # reason and UTC time, once
+
+
 def main(argv=None, env=None, clock=None, sleep=time.sleep):
     env = os.environ if env is None else env
     try:
@@ -1280,12 +1346,7 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
         kube = Kube(env)
         L = Launcher(kube, env, clock, sleep)
         if a.cmd == "reap":
-            while True:
-                res = L.reap()
-                print(json.dumps([{"worker": w, "reason": r, "exit": c} for w, r, c in res]))
-                if not a.loop:
-                    return EXIT_HOOK if any(c for _, _, c in res) else 0
-                sleep(min(a.loop, 60))  # never slower than the contract's once a minute
+            return _reap_main(L, a, sleep)
         result = getattr(L, a.cmd.replace("-", "_"))(a)
         print(result["report"] if a.cmd == "report" and not a.json else json.dumps(result, sort_keys=True))
         return 0

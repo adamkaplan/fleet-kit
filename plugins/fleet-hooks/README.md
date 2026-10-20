@@ -101,3 +101,7 @@ never blocked on, and counted: the count reaches the next child in `FLEET_SWITCH
 `policy.dropped`. Errors in this path are swallowed; nothing is written to stdout.
 
 The cached mode is **per session**, so one agent's shadow reply never makes another's calls asynchronous, and a session with no cached mode awaits. A flip (shadow to enforcing or back) is told to the next child in `FLEET_SWITCHBOARD_MODE_FLIPS` and audited as `policy.mode`, so the window up to 30 s is visible.
+
+## A private `TMPDIR` for a launched headless worker (#846)
+
+The shell hook also sets `TMPDIR` for a session of a launched headless worker (found from `<state>/headless/<name>.json` and the command's `OPENCODE_SESSION_ID`) to `<data>/fleet-switchboard/profile/tmp/<agent name>`, mode 0700, made on first use. Nothing else in the environment changes. A terminal worker, any session with no launch record, and a failed directory (one stderr line, the shared `TMPDIR` kept) leave the command as it was. Needs a plugin install and an OpenCode service restart. See "A private TMPDIR per agent" in `docs/switchboard.md`.
