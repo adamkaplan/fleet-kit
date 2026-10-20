@@ -173,10 +173,12 @@ def judge(block, cells, entries, report, threshold):
             continue
         if entry.get("by_role") not in block["rating_roles"]:
             continue   # the pull request's author, the Chief of Staff, any other role (or a record made before roles were kept) is not the independent rating
-        typed = ((cells.get(entry.get("impact_severity")) or {}).get(entry.get("impact_probability")) or {}).get("level") if isinstance(entry.get("impact_severity"), str) and isinstance(entry.get("impact_probability"), str) else None
         if not counts_by_block(entry) or entry.get("verdict") == "incomplete":
-            if typed in ladder:
-                uncounted_idx.append(ladder.index(typed))   # remembered: a higher uncounted rating refuses (below)
+            for sev_key, prob_key in (("impact_severity", "impact_probability"), ("block_impact_severity", "block_impact_probability")):   # the typed score AND the block's own lines: the higher of the two is remembered
+                sev, prob = entry.get(sev_key), entry.get(prob_key)
+                seen = ((cells.get(sev) or {}).get(prob) or {}).get("level") if isinstance(sev, str) and isinstance(prob, str) else None
+                if seen in ladder:
+                    uncounted_idx.append(ladder.index(seen))   # remembered: a higher uncounted rating refuses (below)
         if not counts_by_block(entry):
             unblocked += 1   # #901: only the agent's own block counts by score. A record without one is IGNORED on purpose (it counts for nothing, as every record made before blocks were kept), so a valid blocked record beside it still clears; the guard is `counts_by_block`, a mistake-guard, and a blocked record whose score the matrix does not know still refuses (`bad`)
             continue

@@ -32510,8 +32510,12 @@ class TestAgentBlockCounts(TestBlockTable):
         incomplete_high = dict(base, impact_severity=high[0], impact_probability=high[1], block_sha256="b" * 64, block_impact_severity=high[0], block_impact_probability=high[1], verdict="incomplete")
         report = {"pr": self.PR, "head": LEDGER_HEAD}
         judge = lambda entries: mod.judge(mod.score_block(), cells, entries, report, "Serious")
+        # a record whose BLOCK says high but whose typed flags say low (a flag wins over the block's line, so it does not count): the block's own higher score is what refuses
+        block_high_typed_low = dict(base, impact_severity=low[0], impact_probability=low[1], block_sha256="c" * 64, block_impact_severity=high[0], block_impact_probability=high[1])
+        shapes = {"flags only, higher": flags_high, "incomplete, higher": incomplete_high, "block high, typed low": block_high_typed_low}
+        self.assertEqual(sorted(shapes), sorted(["flags only, higher", "incomplete, higher", "block high, typed low"]))
         self.assertEqual(judge([counted])["reasons"], [])
-        for label, others in (("flags only, higher", [flags_high]), ("incomplete, higher", [incomplete_high])):
+        for label, others in ((l, [e]) for l, e in shapes.items()):
             for order in (lambda e: [counted] + e, lambda e: e + [counted]):
                 with self.subTest(label=label):
                     self.assertEqual(judge(order(others))["reasons"], [mod.HIGHER_UNCOUNTED])
