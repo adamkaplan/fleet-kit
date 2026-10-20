@@ -59123,6 +59123,170 @@ class TestDockerReaper(Base):
         self.assertIsNone(source.thread)
 
 
+class TestJanitorLiveKeeps(Base):
+    """Ask #932: the janitor keeps what a live agent owns, uses or touched (the registry, the access time, a file a live process holds open), and every doubt
+    keeps. Fixture directories and fakes for the registry, the clock and the open-file check only: the real temp directory is never read. Each entry here is one
+    the old rule (modification and change time only) would have removed."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("coder",), config={})
+        self.jan = sb.load_disk_janitor()
+        self.temp = self.home / "jtmp"
+        self.temp.mkdir()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "temp_janitor": {"dir": str(self.temp)}})
+        self.world.clock.t = time.time() + 10 * 86400   # a change time cannot be set back: the clock moves forward instead
+        self.now = self.world.clock.now()
+        (self.world.state / "state-marker.json").write_text("{}")
+        self.open_paths = []
+        self.lsof_error = None
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+
+    def routed(self, argv, **kwargs):
+        if argv[0] == "lsof":
+            if "-d" in argv:
+                return subprocess.CompletedProcess(argv, 0, "p1\nfcwd\nn/\n", "")
+            if self.lsof_error:
+                raise self.lsof_error
+            return subprocess.CompletedProcess(argv, 0, "p1\n" + "".join("fx\nn%s\n" % p for p in self.open_paths), "")
+        return self.world.route(argv, **kwargs)
+
+    def old(self, name, days=10, directory=False, atime_days=None):
+        path = self.temp / name
+        if directory:
+            path.mkdir()
+            (path / "inner.txt").write_text("x")
+        else:
+            path.write_text("x")
+        stamp = self.now - days * 86400
+        read = self.now - (days if atime_days is None else atime_days) * 86400
+        for p in ([path / "inner.txt"] if directory else []) + [path]:
+            os.utime(str(p), (read, stamp))
+        return path
+
+    def apply(self):
+        with captured() as (out, err):
+            code = sb.main(["disk", "janitor", "--apply"], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertEqual(code, 0, err.getvalue())
+        return out.getvalue()
+
+    def registry(self, agents=None, retired=None):
+        (self.world.state / sb.PANE_HEALTH_FILE).write_text(json.dumps({"agents": agents or {}, "states": {}, "missing": {}}))
+        (self.world.state / sb.RETIRED_FILE).write_text(json.dumps(retired or {}))
+
+    def test_s1_an_entry_a_live_or_recently_retired_agent_owns_is_kept(self):
+        tmpdir = self.old("live", directory=True)              # the agent's own TMPDIR
+        holds = self.old("holds-a-cwd", directory=True)                # it contains the agent's working directory
+        (holds / "work").mkdir()
+        recent = self.old("retired-recently", directory=True)          # a retired agent's working directory, retired 2 days ago
+        stale = self.old("retired-long-ago", directory=True)           # retired 20 days ago: the registry no longer holds it
+        self.registry({"live": {"cwd": str(holds / "work"), "session": "ses_a"}},
+                      {"gone": {"at": self.now - 2 * 86400, "session": "ses_b", "record": {"cwd": str(recent)}},
+                       "older": {"at": self.now - 20 * 86400, "session": "ses_c", "record": {"cwd": str(stale)}}})
+        with mock.patch.object(sb, "agent_tmp_root", lambda config: self.temp):
+            out = self.apply()
+        for kept in (tmpdir, holds, recent):
+            self.assertTrue(kept.exists(), kept.name)
+        names = [n for n, _ in sb.janitor_agent_roots(self.world.engine, self.now, 7)]
+        self.assertIn("gone", names)
+        self.assertNotIn("older", names, "retired past the janitor's own day limit: no longer held by the registry")
+        self.assertIn("kept live: it is, holds or sits inside", out)
+        # an entry that sits INSIDE an agent's directory
+        inside = self.old("sits-inside", directory=True)
+        self.registry({"live": {"cwd": str(self.temp), "session": "ses_a"}})
+        self.apply()
+        self.assertTrue(inside.exists())
+
+    def test_s1_the_one_function_is_the_only_reader_of_the_agent_list(self):
+        entry = self.old("owned-by-the-fake", directory=True)
+        seen = []
+
+        def fake(engine, now, days):
+            seen.append(days)
+            return [("fake-agent", str(entry))]
+        with mock.patch.object(sb, "janitor_agent_roots", fake):
+            self.apply()
+        self.assertTrue(entry.exists())
+        self.assertEqual(seen[0], 7)
+        self.assertFalse(any("pane-health" in l for l in inspect.getsource(sb.janitor_busy_function).splitlines()), "the busy function does not read the agent files itself")
+
+    def test_s2_a_read_keeps_an_entry_and_a_clock_decides(self):
+        read = self.old("read-yesterday.log", atime_days=1)
+        untouched = self.old("untouched.log")
+        self.apply()
+        self.assertTrue(read.exists(), "10 days by modification, 1 day by access")
+        self.assertFalse(untouched.exists())
+        directory = self.old("dir-read-yesterday", directory=True, atime_days=1)
+        self.apply()
+        self.assertTrue(directory.exists(), "a file read inside a directory keeps the directory")
+
+    def test_s2_a_directorys_own_access_time_is_not_counted(self):
+        plain = self.old("listed-only", directory=True)
+        os.utime(str(plain), (self.now, self.now - 10 * 86400))   # only the directory's own access time is new (listing it does that)
+        (plain / "inner.txt").touch()
+        os.utime(str(plain / "inner.txt"), (self.now - 10 * 86400,) * 2)
+        self.apply()
+        self.assertFalse(plain.exists())
+
+    def test_s3_a_file_a_live_process_has_open_keeps_its_entry(self):
+        held = self.old("held-open", directory=True)
+        free = self.old("not-open", directory=True)
+        self.open_paths = [str(held / "inner.txt"), "/somewhere/else"]
+        out = self.apply()
+        self.assertTrue(held.exists())
+        self.assertFalse(free.exists())
+        self.assertIn("kept held-open: a live process has a file of it open", out)
+
+    def test_s7_every_doubt_keeps_and_the_pass_ends_in_time(self):
+        unreadable_registry = self.old("registry-doubt", directory=True)
+        (self.world.state / sb.PANE_HEALTH_FILE).write_text("{not json")
+        started = time.monotonic()
+        out = self.apply()
+        self.assertTrue(unreadable_registry.exists())
+        self.assertIn("pane-health.json cannot be read", out)
+        self.registry()
+        atime = self.old("atime-doubt")
+        with mock.patch.object(self.jan, "_atime", side_effect=OSError("no atime")):
+            self.apply()
+        self.assertTrue(atime.exists())
+        timeout = self.old("open-check-timeout", directory=True)
+        self.lsof_error = subprocess.TimeoutExpired(["lsof"], 30)
+        out = self.apply()
+        self.assertTrue(timeout.exists())
+        self.assertIn("did not finish", out)
+        self.assertLess(time.monotonic() - started, 10)
+        self.lsof_error = None
+        self.apply()
+        self.assertFalse(timeout.exists(), "with every source readable and nothing holding it, the same entry goes")
+
+    def test_u1_an_entry_nothing_owns_uses_or_touched_is_removed_as_before(self):
+        gone = [self.old("old-%d.log" % n) for n in range(2)] + [self.old("old-dir", directory=True)]
+        self.registry({"live": {"cwd": str(self.home / "elsewhere")}})
+        self.apply()
+        self.assertEqual([p.exists() for p in gone], [False, False, False])
+
+    def test_the_janitors_own_preview_does_not_keep_the_entries_it_lists(self):
+        listed = self.old("listed-in-the-preview.log")
+        other = self.old("named-by-another-event.log")
+        lines = [{"event": "janitor.would_remove", "detail": {"names": ["listed-in-the-preview.log"]}},
+                 {"event": "temp.removed", "subject": "listed-in-the-preview.log"},
+                 {"event": "launched", "subject": "coder", "detail": {"note": "see named-by-another-event.log"}}]
+        (self.world.state / "audit.jsonl").write_text("".join(json.dumps(l) + "\n" for l in lines))
+        self.apply()
+        self.assertFalse(listed.exists())
+        self.assertTrue(other.exists(), "a record by anything else still names it")
+
+    def test_the_rule_fingerprint_follows_the_rule_and_never_a_name(self):
+        base = self.jan.rule_fingerprint({"days": 7, "keep": ["a"]})
+        self.assertEqual(base, self.jan.rule_fingerprint({"days": 7, "keep": ["a"], "dir": "/x/y"}))
+        self.assertNotEqual(base, self.jan.rule_fingerprint({"days": 8, "keep": ["a"]}))
+        self.assertNotEqual(base, self.jan.rule_fingerprint({"days": 7, "keep": ["b"]}))
+        with mock.patch.object(self.jan, "RULE_VERSION", "3"):
+            self.assertNotEqual(base, self.jan.rule_fingerprint({"days": 7, "keep": ["a"]}))
+        self.assertNotEqual(self.jan.preview_fingerprint(base, ["a"]), self.jan.preview_fingerprint(base, ["b"]))
+
+
 class TestDaemonTempJanitor(Base):
     """Ask #762: the daemon applies the weekly temp janitor itself (the Docker reaper's path), on the janitor's own rule, dry until `daemon_apply` is on.
     Fixture directories and fakes only: the real temp directory is never read or written."""
@@ -59171,10 +59335,18 @@ class TestDaemonTempJanitor(Base):
         os.utime(str(link), (self.now - 10 * 86400,) * 2, follow_symlinks=False)
         return gone, [named, marked, self.old("recent.txt", days=1), elsewhere]
 
-    def daemon(self, temp_janitor=None, runner=True):
+    def ack(self, cfg):
+        """The preview was sent and the yes recorded, for the rule `cfg` makes (the state a daemon that has been cleared is in)."""
+        rule = self.jan.rule_fingerprint(self.jan.settings(cfg))
+        (self.world.state / sb.TEMP_JANITOR_GATE_FILE).write_text(json.dumps({"rule": rule, "preview": "p" * 16, "sent": True, "count": 0}))
+        (self.world.state / sb.TEMP_JANITOR_ACK_FILE).write_text(json.dumps({"rule": rule, "preview": "p" * 16, "by": "cos", "at": 1}))
+
+    def daemon(self, temp_janitor=None, runner=True, acked=True):
         engine = self.world.engine
         cfg = {"dir": str(self.temp), "keep": ["keepme-*"]}
         cfg.update(temp_janitor or {})
+        if acked and cfg.get("daemon_apply"):
+            self.ack(cfg)
         engine.config = dict(engine.config, temp_janitor=cfg)
         engine.temp_janitor_runner = self.routed if runner else None
         engine.now = lambda: self.now
@@ -59333,6 +59505,102 @@ class TestDaemonTempJanitor(Base):
         self.addCleanup(os.chmod, str(stamp), 0o600)
         self.go(source)
         self.assertEqual(len(self.events("janitor.would_remove")), 1)
+
+    # -- ask #932: a changed selection rule makes one preview and applies nothing until the yes to that exact preview is recorded
+
+    def preview_facts(self, engine, source):
+        engine.discover(self.now)
+        return [f for f in source() if f.kind == "janitor"]
+
+    def week(self, engine):
+        self.now += 7 * 86400
+        engine.now = lambda: self.now
+
+    def record_ack(self, preview):
+        os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+        with captured() as (out, err):
+            code = sb.main(["disk", "janitor-ack", preview], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return code, err.getvalue()
+
+    def test_s4_one_preview_then_nothing_is_applied_until_the_yes_to_that_exact_preview(self):
+        victim = self.old("scratch-old-unnamed.log")
+        engine, source = self.daemon({"daemon_apply": True}, acked=False)
+        self.go(source)
+        self.assertTrue(victim.exists(), "no yes: nothing is removed")
+        self.assertEqual(self.events("temp.removed"), [])
+        facts = self.preview_facts(engine, source)
+        self.assertEqual(len(facts), 1, "ONE preview message")
+        self.assertEqual(facts[0].recipient, "cos")
+        preview = json.loads((self.world.state / sb.TEMP_JANITOR_GATE_FILE).read_text())["preview"]
+        self.assertIn("scratch-old-unnamed.log", facts[0].summary)
+        self.assertIn("janitor-ack %s" % preview, facts[0].summary)
+        # a week later: still no yes, still no second message, still nothing removed
+        self.week(engine)
+        self.go(source)
+        self.assertEqual(self.preview_facts(engine, source), [])
+        self.assertTrue(victim.exists())
+        self.assertEqual(self.events("temp.removed"), [])
+        # a yes for an older preview is refused and records nothing
+        code, err = self.record_ack("0" * 16)
+        self.assertEqual(code, 1)
+        self.assertIn("no pending temp janitor preview", err)
+        self.assertFalse((self.world.state / sb.TEMP_JANITOR_ACK_FILE).exists())
+        self.week(engine)
+        self.go(source)
+        self.assertTrue(victim.exists())
+        # the yes to the exact preview: the next weekly run applies
+        code, err = self.record_ack(preview)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.events("janitor.ack")), 1)
+        self.week(engine)
+        self.go(source)
+        self.assertFalse(victim.exists())
+        self.assertEqual([e["subject"] for e in self.events("temp.removed")], ["scratch-old-unnamed.log"])
+
+    def test_s4_a_changed_rule_needs_a_new_preview_and_a_new_yes(self):
+        engine, source = self.daemon({"daemon_apply": True}, acked=False)
+        self.old("first-old.log")
+        self.go(source)
+        self.preview_facts(engine, source)
+        first = json.loads((self.world.state / sb.TEMP_JANITOR_GATE_FILE).read_text())["preview"]
+        self.assertEqual(self.record_ack(first)[0], 0)
+        second_victim = self.old("second-old.log")
+        engine, source = self.daemon({"daemon_apply": True, "days": 8}, acked=False)   # the rule changed: days 7 -> 8
+        self.week(engine)
+        self.go(source)
+        self.assertTrue(second_victim.exists(), "the yes was for the old rule")
+        self.assertEqual(self.events("temp.removed"), [])
+        facts = self.preview_facts(engine, source)
+        self.assertEqual(len(facts), 1, "a new preview")
+        newest = json.loads((self.world.state / sb.TEMP_JANITOR_GATE_FILE).read_text())["preview"]
+        self.assertNotEqual(first, newest)
+        self.week(engine)
+        self.go(source)
+        self.assertTrue(second_victim.exists(), "the old yes does not carry over")
+        self.assertEqual(self.record_ack(newest)[0], 0)
+        self.week(engine)
+        self.go(source)
+        self.assertFalse(second_victim.exists())
+
+    def test_s4_a_record_in_doubt_applies_nothing(self):
+        victim = self.old("scratch-old-unnamed.log")
+        engine, source = self.daemon({"daemon_apply": True}, acked=True)
+        (self.world.state / sb.TEMP_JANITOR_ACK_FILE).write_text("{broken")
+        self.go(source)
+        self.assertTrue(victim.exists())
+        self.assertEqual(self.events("janitor.would_remove")[0]["detail"]["gate"], "unreadable")
+
+    def test_s8_a_name_is_only_in_the_private_audit_and_the_message(self):
+        engine, source = self.daemon({"daemon_apply": True}, acked=False)
+        self.old("distinctive-fixture-name.log")
+        self.go(source)
+        facts = self.preview_facts(engine, source)
+        self.assertIn("distinctive-fixture-name.log", facts[0].summary)
+        for event in ("janitor.preview",):
+            self.assertEqual(len(self.events(event)), 1)
+        public = json.dumps([e for e in self.world.audit() if e["event"] in ("janitor.preview", "janitor.ack")])
+        public += (self.world.state / sb.TEMP_JANITOR_GATE_FILE).read_text()
+        self.assertNotIn("distinctive-fixture-name", public)
 
     def test_a_failure_inside_the_run_is_one_janitor_error_and_removes_nothing(self):
         victim = self.old("old-file.txt")
