@@ -60272,7 +60272,7 @@ class TestHeavyWatchdog(StandInPids, unittest.TestCase):
         self.assertLessEqual(logic.out.tell(), BoundedOut.LIMIT)
 
 
-class TestHeavyCeilings(unittest.TestCase):
+class TestHeavyCeilings(StandInPids, unittest.TestCase):
     """Ask #930: a time ceiling per KIND of heavy run, read from the command. The clock, the process table, the signals, the sender and the audit are injected, so nothing
     waits for a real hour; the one real-process case (a wrapper killed with SIGKILL) is in TestHeavySlots."""
 
@@ -60303,7 +60303,7 @@ class TestHeavyCeilings(unittest.TestCase):
         base = test.now[0]
 
         class FakeChild:
-            pid = 4242
+            pid = self.px[4242]
 
             def __init__(child, argv, **kwargs):
                 pass
@@ -60319,7 +60319,7 @@ class TestHeavyCeilings(unittest.TestCase):
                 test.exited.set()
                 return []
             test.now[0] = base + schedule[len(seen) - 1]
-            return [(4242, 1, os.getpgrp(), 1), (4243, 4242, os.getpgrp(), 1), (777, 1, 777, 1)]   # a child and a grandchild of the run, and a stranger
+            return [(self.px[4242], 1, os.getpgrp(), 1), (self.px[4243], self.px[4242], os.getpgrp(), 1), (self.px[777], 1, self.px[777], 1)]   # a child and a grandchild of the run, and a stranger
 
         def record(number, sig):
             test.signals.append((number, sig))
@@ -60426,7 +60426,7 @@ class TestHeavyCeilings(unittest.TestCase):
                 code, seen = self.drive(self.RUNNABLE[kind], [default - 1, default + 1])
                 self.assertEqual(seen[:2], [0, 0], "before the ceiling nothing is signalled (the second read is the one at ceiling-1)")
                 self.assertEqual(code, 124)
-                self.assertEqual({p for p, _s in self.signals}, {4242, 4243}, "the child and the grandchild go, the stranger does not")
+                self.assertEqual({p for p, _s in self.signals}, {self.px[4242], self.px[4243]}, "the child and the grandchild go, the stranger does not")
                 self.assertIn("time ceiling of %d s" % default, self.out.getvalue())
             with self.subTest(kind=kind, at="exactly the ceiling"):
                 self.signals, self.exited, self.out = BoundedList(), threading.Event(), BoundedOut()
@@ -60495,9 +60495,9 @@ class TestHeavyCeilings(unittest.TestCase):
                 (event, subject, detail), (_e2, _s2, told) = audited
                 self.assertEqual(subject, "holder-x")
                 self.assertEqual(set(detail), {"kind", "ran_seconds", "ceiling_seconds", "pid", "reason", "source"})
-                self.assertEqual((detail["kind"], detail["ceiling_seconds"], detail["pid"], detail["source"], detail["reason"]), (kind, default, 4242, "wrapper", "time"))
+                self.assertEqual((detail["kind"], detail["ceiling_seconds"], detail["pid"], detail["source"], detail["reason"]), (kind, default, self.px[4242], "wrapper", "time"))
                 self.assertGreater(detail["ran_seconds"], default)
-                self.assertEqual(told, {"pid": 4242, "source": "wrapper", "lane_told": "sent"})
+                self.assertEqual(told, {"pid": self.px[4242], "source": "wrapper", "lane_told": "sent"})
                 self.assertEqual(order[0], ("audit", 0), "the heavy.stopped line is written before the first signal")
                 line = json.dumps(list(audited))
                 for text in (secret, "FLEET_HEAVY_SECRET_930", "PATH"):
@@ -60512,7 +60512,7 @@ class TestHeavyCeilings(unittest.TestCase):
                 self.assertEqual(len(sent), 1, "told once, no retry")
                 self.assertEqual(sent[0][0], "lane-x", "the recorded lane, not the holder's name")
                 self.assertEqual(audited[1][2]["lane_told"], answer if isinstance(answer, str) else "failed")
-                self.assertRegex(sent[0][1], r"^heavy: your full run \(pid 4242\) was stopped after \d+ s; its ceiling was 5400 s \(FLEET_HEAVY_MAX_SECONDS or heavy --ceiling asks for more, up to 14400\)$")
+                self.assertRegex(sent[0][1], r"^heavy: your full run \(pid %d\) was stopped after \d+ s; its ceiling was 5400 s \(FLEET_HEAVY_MAX_SECONDS or heavy --ceiling asks for more, up to 14400\)$" % self.px[4242])
 
     def test_m3_an_audit_sink_that_fails_never_prevents_the_stop_and_the_failure_is_on_the_record(self):
         self.signals, self.exited, self.out = BoundedList(), threading.Event(), BoundedOut()
@@ -60537,7 +60537,7 @@ class TestHeavyCeilings(unittest.TestCase):
         test = self
 
         class FakeChild:
-            pid = 4242
+            pid = self.px[4242]
 
             def __init__(child, argv, **kwargs):
                 pass
@@ -60553,7 +60553,7 @@ class TestHeavyCeilings(unittest.TestCase):
                 self.exited.set()
                 return []
             self.now[0] += 121
-            return [(4242, 1, os.getpgrp(), 1)]
+            return [(self.px[4242], 1, os.getpgrp(), 1)]
         dog = {"read_table": table, "pause": lambda s: False, "killpg": lambda n, g: self.exited.set(), "kill": lambda n, g: self.exited.set(), "lsof": lambda path: set(), "every": 0.0, "grace": 0.001, "sweep_pause": lambda s: None}
         with mock.patch.object(self.hs.subprocess, "Popen", FakeChild):
             code = self.hs.run(self.RUNNABLE["full"], tmp, 3, 5, "w", environ={"PATH": os.environ["PATH"]}, out=self.out, clock=lambda: self.now[0], sleep=lambda s: None,
@@ -60585,7 +60585,8 @@ class TestHeavyCeilings(unittest.TestCase):
 
     # ---- the orphan: the slot is really locked, the clock, the table, the signals and the lock listing are injected
 
-    def orphan_rig(self, record, rows=None, alive=lambda pid, start: False, held_by=(4242, 4243), survivor=False):
+    def orphan_rig(self, record, rows=None, alive=lambda pid, start: False, held_by=None, survivor=False):
+        held_by = held_by or (self.px[4242], self.px[4243])
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         path = os.path.join(tmp, "heavy-slot-0.lock")
@@ -60600,12 +60601,14 @@ class TestHeavyCeilings(unittest.TestCase):
             signals.append((number, sig))
             if sig == signal.SIGKILL and not survivor:
                 gone.set()
-        table = rows or [(4242, 1, 4242, 1, "t"), (4243, 4242, 4242, 1, "t"), (999, 1, 999, 1, "t"), (555, 1, 555, 1, "t")]
+        table = rows or [(self.px[4242], 1, self.px[4242], 1, "t"), (self.px[4243], self.px[4242], self.px[4242], 1, "t"), (self.px[999], 1, self.px[999], 1, "t"), (self.px[555], 1, self.px[555], 1, "t")]
         dog = {"read_table": lambda: [] if gone.is_set() else table, "kill": record_signal, "killpg": record_signal, "lsof": lambda p: set(held_by), "grace": 0.001,
                "sweep_pause": lambda s: None, "pause": lambda s: False, "me": (os.getpid(), os.getppid(), os.getpgrp()), "rounds": 1}
         return tmp, dog, signals, alive
 
-    RECORD = {"name": "h", "pid": 4242, "wrapper": 31337, "command": "x", "since": 1000, "kind": "full", "ceiling": 5400, "lane": "lane-x", "wstart": "w0", "cstart": "c0"}
+    @property
+    def RECORD(self):
+        return {"name": "h", "pid": self.px[4242], "wrapper": self.px[31337], "command": "x", "since": 1000, "kind": "full", "ceiling": 5400, "lane": "lane-x", "wstart": "w0", "cstart": "c0"}
 
     def orphan(self, ran, record=None, start_of=lambda pid: "c0", **rig):
         record = record or dict(self.RECORD)
@@ -60622,33 +60625,33 @@ class TestHeavyCeilings(unittest.TestCase):
         stopped, told, signals = self.orphan(5400)
         self.assertEqual((stopped, list(signals)), ([], []), "at the ceiling nothing is signalled")
         stopped, told, signals = self.orphan(5401)
-        self.assertTrue({4242} <= {p for p, _s in signals} <= {4242, 4243}, "the run's group or tree, nothing else (999 and 555 are strangers)")
+        self.assertTrue({self.px[4242]} <= {p for p, _s in signals} <= {self.px[4242], self.px[4243]}, "the run's group or tree, nothing else (self.px[999] and self.px[555] are strangers)")
         self.assertEqual(len(stopped), 1)
         self.assertEqual([(t[0], t[4] == 0) for t in told[:1]], [("decided", True)], "the audit phase runs before the first signal")
         self.assertEqual([t[0] for t in told], ["decided", "told"])
         phase, info, holder, lane, _n = told[1]
-        self.assertEqual((info["source"], info["kind"], info["ceiling_seconds"], info["pid"], info["ran_seconds"], holder, lane), ("orphan", "full", 5400, 4242, 5401, "h", "lane-x"))
+        self.assertEqual((info["source"], info["kind"], info["ceiling_seconds"], info["pid"], info["ran_seconds"], holder, lane), ("orphan", "full", 5400, self.px[4242], 5401, "h", "lane-x"))
         stopped, told, signals = self.orphan(99999, alive=lambda pid, start: True)
         self.assertEqual((stopped, list(signals)), ([], []), "a live wrapper's run is never touched by the orphan check")
 
     def test_s10_an_old_record_reads_as_other_and_a_reused_wrapper_pid_is_an_orphan(self):
-        old = {"name": "h", "pid": 4242, "wrapper": 31337, "command": "x", "since": 1000}
+        old = {"name": "h", "pid": self.px[4242], "wrapper": self.px[31337], "command": "x", "since": 1000}
         self.assertEqual(self.orphan(3600, old)[0], [])
         stopped, told, signals = self.orphan(3601, old)
         self.assertEqual((stopped[0]["kind"], stopped[0]["ceiling_seconds"]), ("other", 3600))
         seen = []
         stopped, told, signals = self.orphan(6000, alive=lambda pid, start: seen.append((pid, start)) or False)   # the start time recorded is the one asked for
-        self.assertEqual(seen, [(31337, "w0")])
+        self.assertEqual(seen, [(self.px[31337], "w0")])
         self.assertEqual(len(stopped), 1, "a pid reused by another process (another start time) is judged gone")
 
     def test_u3_an_orphan_stop_signals_only_the_runs_own_processes(self):
-        stopped, told, signals = self.orphan(9000, held_by=(4242, os.getpid(), os.getppid(), 1))
-        self.assertTrue({p for p, _s in signals} <= {4242, 4243}, signals)
-        self.assertFalse({os.getpid(), os.getppid(), 1, 999, 555} & {p for p, _s in signals})
+        stopped, told, signals = self.orphan(9000, held_by=(self.px[4242], os.getpid(), os.getppid(), 1))
+        self.assertTrue({p for p, _s in signals} <= {self.px[4242], self.px[4243]}, signals)
+        self.assertFalse({os.getpid(), os.getppid(), 1, self.px[999], self.px[555]} & {p for p, _s in signals})
 
     def test_m1_a_pid_from_the_record_is_a_root_only_with_its_recorded_start_time(self):
-        """The run's command has exited, a descendant (4300) keeps the lock, and the recorded command pid 4242 now belongs to a bystander."""
-        rows = [(4242, 1, 4242, 1, "bystander"), (4300, 1, 4300, 1, "t"), (555, 1, 555, 1, "t")]
+        """The run's command has exited, a descendant (self.px[4300]) keeps the lock, and the recorded command pid self.px[4242] now belongs to a bystander."""
+        rows = [(self.px[4242], 1, self.px[4242], 1, "bystander"), (self.px[4300], 1, self.px[4300], 1, "t"), (self.px[555], 1, self.px[555], 1, "t")]
         base = dict(self.RECORD)
         cases = (("another process has the pid", base, lambda pid: "someone-else"),
                  ("an older record without the start time", {k: v for k, v in base.items() if k != "cstart"}, lambda pid: "c0"),
@@ -60656,17 +60659,17 @@ class TestHeavyCeilings(unittest.TestCase):
                  ("the start time cannot be read", base, lambda pid: ""))
         for name, record, start_of in cases:
             with self.subTest(name):
-                stopped, told, signals = self.orphan(9000, record, start_of=start_of, rows=rows, held_by=(4300,))
+                stopped, told, signals = self.orphan(9000, record, start_of=start_of, rows=rows, held_by=(self.px[4300],))
                 self.assertEqual(len(stopped), 1)
-                self.assertEqual({p for p, _s in signals}, {4300}, "only the lock holder is signalled: not the pid of the record, not a stranger")
+                self.assertEqual({p for p, _s in signals}, {self.px[4300]}, "only the lock holder is signalled: not the pid of the record, not a stranger")
         for pid in (1, 0, os.getpid(), os.getppid()):
             with self.subTest(pid=pid):
-                stopped, told, signals = self.orphan(9000, dict(base, pid=pid), start_of=lambda p: "c0", rows=rows + [(pid, 1, pid, 1, "t")] if pid > 1 else rows, held_by=(4300,))
+                stopped, told, signals = self.orphan(9000, dict(base, pid=pid), start_of=lambda p: "c0", rows=rows + [(pid, 1, pid, 1, "t")] if pid > 1 else rows, held_by=(self.px[4300],))
                 self.assertFalse({1, os.getpid(), os.getppid(), os.getpgrp()} & {p for p, _s in signals}, "pid 1, the checker, its parent and its group are never signalled")
 
     def test_m1_with_the_matching_start_time_the_recorded_pid_is_still_stopped(self):
         stopped, told, signals = self.orphan(9000, start_of=lambda pid: "c0")
-        self.assertIn(4242, {p for p, _s in signals})
+        self.assertIn(self.px[4242], {p for p, _s in signals})
 
     def test_m3_a_report_hook_that_fails_before_the_stop_is_said_and_the_run_is_stopped_all_the_same(self):
         self.signals, self.exited, self.out = BoundedList(), threading.Event(), BoundedOut()
@@ -60682,7 +60685,7 @@ class TestHeavyCeilings(unittest.TestCase):
         """The two checkers (the daemon and a waiting wrapper) meet: a tick whose stop does not happen must leave the run unreported."""
         for case in ("the orphan lock is busy", "the holders are not seen twice", "the slot changed hands"):
             with self.subTest(case):
-                holders = [4242, 4243]
+                holders = [self.px[4242], self.px[4243]]
                 base = {k: v for k, v in self.RECORD.items() if k != "cstart" or case != "the holders are not seen twice"}   # no recorded start: only lock holders are roots
                 tmp, dog, signals, alive = self.orphan_rig(dict(base), held_by=holders)
                 gate = os.open(os.path.join(tmp, self.hs.ORPHAN_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
@@ -60712,7 +60715,7 @@ class TestHeavyCeilings(unittest.TestCase):
                 if case == "the orphan lock is busy":
                     fcntl.flock(gate, fcntl.LOCK_UN)
                 elif case == "the holders are not seen twice":
-                    holders[:] = [4242, 4243]
+                    holders[:] = [self.px[4242], self.px[4243]]
                 else:
                     state["swap"] = False
                     with open(slot, "r+b") as handle:
@@ -60732,20 +60735,20 @@ class TestHeavyCeilings(unittest.TestCase):
         self.assertEqual([t[0] for t in told], ["decided", "told"], "reported once for the same run")
 
     def test_a_slot_that_changed_hands_during_the_stop_is_not_stopped(self):
-        tmp, dog, signals, alive = self.orphan_rig({"name": "h", "pid": 4242, "wrapper": 31337, "command": "x", "since": 1000})
+        tmp, dog, signals, alive = self.orphan_rig({"name": "h", "pid": self.px[4242], "wrapper": self.px[31337], "command": "x", "since": 1000})
         newer = [0]
 
         def lsof(path):   # the look finds the holders, and the slot is then taken by a newer run: its record has another start
             with open(path, "r+b") as handle:
                 handle.truncate(0)
-                handle.write(json.dumps({"name": "n", "pid": 4242, "wrapper": 31337, "since": 5000}).encode())
-            return {4242}
+                handle.write(json.dumps({"name": "n", "pid": self.px[4242], "wrapper": self.px[31337], "since": 5000}).encode())
+            return {self.px[4242]}
         dog["lsof"] = lsof
         stopped = self.hs.check_orphans(tmp, 3, None, lambda: 20000.0, None, BoundedOut(), alive=alive, watchdog=dog, start_of=lambda p: "c0")
         self.assertEqual((stopped, list(signals)), ([], []))
 
     def test_two_checkers_never_stop_and_report_the_same_orphan(self):
-        tmp, dog, signals, alive = self.orphan_rig({"name": "h", "pid": 4242, "wrapper": 31337, "command": "x", "since": 1000})
+        tmp, dog, signals, alive = self.orphan_rig({"name": "h", "pid": self.px[4242], "wrapper": self.px[31337], "command": "x", "since": 1000})
         gate = os.open(os.path.join(tmp, self.hs.ORPHAN_LOCK), os.O_RDWR | os.O_CREAT, 0o600)   # another checker is at it
         self.addCleanup(os.close, gate)
         fcntl.flock(gate, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -60756,7 +60759,7 @@ class TestHeavyCeilings(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         with open(os.path.join(tmp, "heavy-slot-0.lock"), "w") as handle:
-            handle.write(json.dumps({"name": "h", "pid": 4242, "wrapper": 31337, "since": 1}))
+            handle.write(json.dumps({"name": "h", "pid": self.px[4242], "wrapper": self.px[31337], "since": 1}))
         self.assertEqual(self.hs.check_orphans(tmp, 3, None, lambda: 10 ** 9, None, BoundedOut(), alive=lambda p, s: False), [])
 
     def test_s11_every_case_named_in_the_ask_has_a_test(self):
