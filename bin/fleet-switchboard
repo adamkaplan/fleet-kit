@@ -13287,7 +13287,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
                         item.get("created"), now, SWEEP_S6A_GRACE) and sweep_ours(
                         engine, repo, number, item.get("author", ""), item.get("assignees"), notices):
                     found.add(("S6a", ref_text(repo, number)))   # only OUR PR: another team's author may carry the line
-                if "disagree" in item["captain_findings"] and not sweep_clear_agrees(engine, repo, number, item["labels"], item.get("marker")):
+                if "disagree" in item["captain_findings"] and not impact_rehold_open(engine.state_dir, repo, number) and not sweep_clear_agrees(engine, repo, number, item["labels"], item.get("marker")):   # (#815) a re-hold at this head is not a disagreement
                     found.add(("S6b", ref_text(repo, number)))
     for repo, picture in state.repos.items():
         if repo in defer or "*" in defer:
@@ -13400,6 +13400,8 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
             return False
         if kind == "S6a" and sweep_within(parse_iso(data.get("created_at")), now, SWEEP_S6A_GRACE):
             return False   # opened a moment ago: the label is applied after it opens
+        if kind == "S6b" and impact_rehold_open(engine.state_dir, repo, number):
+            return False   # (#815) held again at this head: the line and the label are being reconciled
         return is_pr and want in pr_marker_state(names, body)["findings"] and not (kind == "S6b" and sweep_clear_agrees(engine, repo, number, names, pr_marker(body)))
     if kind in ("S1a", "S1b"):
         if is_pr:
@@ -22110,6 +22112,22 @@ def impact_records(state_dir):
     return found, None
 
 
+def impact_carry_marks(state_dir):
+    """({(pr, head): n}, problem): how many reviewer records at each pull request and head carry a confirmation for a conflict-resolving carry (#815). Read with the ledger, whole or not at
+    all; it only decides when the carry is tried again, never whether it holds (the carry reads the ledger itself)."""
+    try:
+        entries, problem = plan_ledger.read_ledger(state_dir)
+    except Exception as err:
+        return {}, "%s: %s" % (type(err).__name__, _one_line(str(err), 100))
+    if problem:
+        return {}, _one_line(str(problem), 120)
+    found = {}
+    for entry in entries:
+        if entry.get("kind") == "review_record" and entry.get("carry_confirmed") is True:
+            found[(entry.get("pr"), entry.get("head"))] = found.get((entry.get("pr"), entry.get("head")), 0) + 1
+    return found, None
+
+
 def _impact_rehold_now(engine, repo, number, pr, report, record):
     """(#830) True when this judged pull request is HELD AGAIN at its head (a clear recorded for another head, none for this one, no rating here) and the hold was applied (or already
     stands). Only on a whole read: an unreadable state or ledger returns False and changes nothing here (the caller then releases nothing either: `records_problem`). Raises on a failed
@@ -22416,6 +22434,7 @@ def impact_would_hold_pass(engine, now):
     hold_cfg = (engine.config.get("impact_hold") or {}) if isinstance(engine.config, dict) else {}
     budget = hold_cfg.get("calls_per_pass", cfg.get("calls_per_pass", IMPACT_PASS_CALLS))   # `impact_hold.calls_per_pass` wins when set
     records, records_problem = impact_records(engine.state_dir)
+    marks = impact_carry_marks(engine.state_dir)[0]
     unjudged, live = 0, set()
     for key, (_, listed) in sorted(state.lists.items()):
         for record in listed:
@@ -22453,7 +22472,7 @@ def impact_would_hold_pass(engine, now):
                 return
             if not globs:
                 continue
-            signature = (head, rule, "unreadable" if records_problem else records.get((pr, head)))
+            signature = (head, rule, "unreadable" if records_problem else records.get((pr, head))) + ((marks[(pr, head)],) if (pr, head) in marks else ())   # (#815) a new confirmation re-judges
             if seen.get((key, number)) == signature:
                 continue
             if budget <= 0:
@@ -22502,7 +22521,7 @@ def impact_would_hold_pass(engine, now):
                     engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
                     unjudged += 1
                     continue
-            seen[(key, number)] = (report["head"] or head, rule, "unreadable" if records_problem else records.get((pr, report["head"] or head)))
+            seen[(key, number)] = (report["head"] or head, rule, "unreadable" if records_problem else records.get((pr, report["head"] or head))) + ((marks[(pr, report["head"] or head)],) if (pr, report["head"] or head) in marks else ())
             reports[(key, number)] = report
     _impact_matrix_recovered(engine, now)   # the file and the floor of every repo were read this pass: a standing episode is over
     if not unjudged and not records_problem and any(impact_floor.hold_mode(engine.config, key) == "enforce" for key, _ in live):
@@ -23679,6 +23698,7 @@ BLOCK_FLAG_TABLE = (   # (flag, dest, mode): `refused` (the block carries it: gi
     ("--reviewer", "reviewer", "accepted"), ("--summary", "summary", "accepted"),
     ("--verdict", "verdict", "refused"), ("--head", "head", "refused"), ("--blocks", "blocks", "refused"), ("--notes", "notes", "refused"), ("--impact-action", "impact_action", "refused"),
     ("--impact-class", "impact_class", "wins"), ("--impact-severity", "impact_severity", "wins"), ("--impact-probability", "impact_probability", "wins"), ("--impact-reason", "impact_reason", "wins"),
+    ("--confirms-carry", "confirms_carry", "accepted"),   # (#815) a flag with no value: the reviewer's own confirmation, never a line of the block
 )
 
 
@@ -23695,20 +23715,46 @@ NO_SCORE_TEXT = ("recorded WITHOUT a score (no impact severity and probability):
 RATING_INPUTS = IMPACT_RATING_FIELDS + ("impact_action", "impact_class", "block")   # every input of `review record` that decides the rating: read ONLY by `rating_inputs`, from the raw argv
 
 
-def rating_inputs(raw_argv):
-    """{dest: value} of the rating inputs GIVEN in `raw_argv` (a tuple of strings: the command line `main` captured before it built the shared parser), parsed by a PRIVATE minimal parser: the six flags of
-    RATING_INPUTS only, no abbreviation, no default (an absent flag is absent), nothing shared with `build_parser`. A registrar's `set_defaults`, a replaced or re-parsed subparser, a same-dest argument or a
-    wrapper on the namespace cannot change what this returns. A raw argv that is not a tuple or list of strings gives nothing (no rating). #835."""
+CARRY_FLAG_INPUTS = ("confirms_carry",)   # (#815) a flag with no value: whether a record confirms a carry
+DECISION_INPUTS = ("reviewer", "verdict")   # (#815) what the carry and the score read from a record besides the rating: the reviewer role it is for, and its verdict (a confirmation is an approve)
+PRIVATE_INPUTS = RATING_INPUTS + DECISION_INPUTS + CARRY_FLAG_INPUTS   # every input of `review record` that can change what the clear, the carry or the score reads: read ONLY from the raw argv
+REVIEW_RECORD_PUBLIC_INPUTS = {   # the inputs of `review record` read from the shared namespace, each with the reason it cannot change what the clear, the carry or the score reads
+    "review_cmd": "selects the subcommand; the record branch is the one that writes",
+    "pr": "required positional: the record binds to the pull request GitHub resolves from it (`ref` in the audit line); argparse refuses its absence and no value of it reaches a rating, a verdict or a confirmation",
+    "head": "only checked against the pull request's head (a different one is refused); the head recorded is GitHub's, never this value",
+    "blocks": "a count that can only refuse (an approve with blocking findings); neither the carry nor the score reads it",
+    "notes": "a count; neither the carry nor the score reads it",
+    "summary": "free text, redacted and clipped; neither the carry nor the score reads it",
+}
+
+
+def _private_parse(raw_argv, values, flags):
+    """{dest: value} of the inputs of `values` (each takes a value) and `flags` (each takes none: True) GIVEN in `raw_argv` (a tuple of strings: the command line `main` captured before it built the shared
+    parser), parsed by a PRIVATE minimal parser: no abbreviation, no default (an absent input is absent), nothing shared with `build_parser`. A registrar's `set_defaults`, a replaced or re-parsed subparser, a
+    same-dest argument or a wrapper on the namespace cannot change what this returns. A raw argv that is not a tuple or list of strings gives nothing."""
     if not isinstance(raw_argv, (tuple, list)) or not all(isinstance(x, str) for x in raw_argv):
         return {}
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False, argument_default=argparse.SUPPRESS, exit_on_error=False)
-    for name in RATING_INPUTS:
+    for name in values:
         parser.add_argument("--" + name.replace("_", "-"), dest=name)
+    for name in flags:
+        parser.add_argument("--" + name.replace("_", "-"), dest=name, action="store_true", default=argparse.SUPPRESS)
     try:
         parsed, _ = parser.parse_known_args(list(raw_argv))
     except (argparse.ArgumentError, SystemExit):
         return {}
     return dict(vars(parsed))
+
+
+def rating_inputs(raw_argv):
+    """{dest: value} of the rating inputs GIVEN in `raw_argv`: the six flags of RATING_INPUTS, through `_private_parse`. A raw argv that is not a tuple or list of strings gives nothing (no rating). #835."""
+    return _private_parse(raw_argv, RATING_INPUTS, ())
+
+
+def record_inputs(raw_argv):
+    """{dest: value} of DECISION_INPUTS and CARRY_FLAG_INPUTS GIVEN in `raw_argv`, through `_private_parse` (#815): the reviewer and the verdict of a record, and whether it confirms a carry. Nothing given
+    (or a raw argv that is missing) gives nothing: no reviewer, no verdict, no confirmation."""
+    return _private_parse(raw_argv, DECISION_INPUTS, CARRY_FLAG_INPUTS)
 
 
 def cmd_review(args, runner, now):
@@ -23747,39 +23793,43 @@ def cmd_review(args, runner, now):
             if missing:
                 sys.stderr.write("%s: review laws: not at the base commit: %s\n" % (PROG, ", ".join(missing)))
             return EXIT_OK
-        if args.reviewer not in plan_ledger.REVIEWERS:
+        chosen = record_inputs(getattr(args, "raw_argv", ()))   # (#815) the reviewer, the verdict and the confirmation come from the raw argv too (same reason as the rating's inputs)
+        reviewer, verdict, confirms = chosen.get("reviewer"), chosen.get("verdict"), chosen.get("confirms_carry") is True
+        if reviewer not in plan_ledger.REVIEWERS:
             raise ReviewError("--reviewer must be one of %s" % ", ".join(plan_ledger.REVIEWERS))
         given = rating_inputs(getattr(args, "raw_argv", ()))   # #835: the rating's inputs come from the raw argv through a private parser, never from the shared namespace (a registrar's set_defaults, a replaced parser or a wrapper cannot reach them); a missing raw argv gives no rating
         action, klass = given.get("impact_action"), given.get("impact_class")
         rating_in = {name: given.get(name) for name in IMPACT_RATING_FIELDS}
         if given.get("block") is not None:   # the reviewer's returned text: the coder session records it
-            carried = {"verdict": args.verdict, "head": args.head, "blocks": args.blocks, "notes": args.notes, "impact_action": action}
+            carried = {"verdict": verdict, "head": args.head, "blocks": args.blocks, "notes": args.notes, "impact_action": action}
             if any(carried[dest] for flag, dest, mode in BLOCK_FLAG_TABLE if mode == "refused"):
                 raise ReviewError(BLOCK_TABLE_TEXT)
             fields, why = parse_review_block(_read_capped(given["block"], REVIEW_TABLE_MAX))
             if fields is None:
                 raise ReviewError("refused: %s" % why)
-            args.verdict, args.head, args.blocks, args.notes, action = (fields["verdict"], fields["head"], fields["blocks"], fields["notes"], fields["impact_action"])
+            verdict, args.head, args.blocks, args.notes, action = (fields["verdict"], fields["head"], fields["blocks"], fields["notes"], fields["impact_action"])
             klass = klass or fields["impact_class"]
             for name in IMPACT_RATING_FIELDS:   # the rating's severity and probability (the score is derived from the matrix's cell), and the reason that names a floor rule
                 if rating_in[name] is None:
                     rating_in[name] = fields[name]
-        if args.verdict not in plan_ledger.REVIEW_VERDICTS:
+        if verdict not in plan_ledger.REVIEW_VERDICTS:
             raise ReviewError("--verdict must be one of %s (or give --block with the reviewer's returned text)" % ", ".join(plan_ledger.REVIEW_VERDICTS))
         for name, count in (("blocks", args.blocks), ("notes", args.notes)):
             if count < 0 or count > 200:
                 raise ReviewError("--%s must be a number from 0 to 200" % name)
-        if args.verdict == "approve" and args.blocks:
+        if verdict == "approve" and args.blocks:
             raise ReviewError("an approve cannot carry blocking findings (%d given)" % args.blocks)
-        if args.verdict == "request-changes" and not args.blocks:
+        if verdict == "request-changes" and not args.blocks:
             raise ReviewError("request-changes needs at least 1 blocking finding (a finding that cites no rule never blocks)")
-        if action and args.reviewer != "impact":
+        if confirms and verdict != "approve":
+            raise ReviewError("--confirms-carry belongs to an approve: a reviewer who found a change to the pull request's own lines does not confirm it")
+        if action and reviewer != "impact":
             raise ReviewError("--impact-action belongs to the impact reviewer")
         impact_class = (klass or "").strip().lower() or None
-        if impact_class is not None and args.reviewer != "impact":
+        if impact_class is not None and reviewer != "impact":
             raise ReviewError("--impact-class belongs to the impact reviewer")
         rating = {name: (rating_in[name] or "").strip() or None for name in IMPACT_RATING_FIELDS}
-        if any(rating.values()) and args.reviewer != "impact":
+        if any(rating.values()) and reviewer != "impact":
             raise ReviewError("--impact-severity, --impact-probability and --impact-reason belong to the impact reviewer")
         if rating["impact_severity"] or rating["impact_probability"]:
             try:
@@ -23812,12 +23862,14 @@ def cmd_review(args, runner, now):
         if kind[0] == "unknown":
             raise ReviewError("refused: %s" % kind[1])
         by = kind[1] if kind[0] == "agent" else "person"
-        entry = {"kind": "review_record", "pr": ref, "head": head, "reviewer": args.reviewer, "verdict": args.verdict,
+        entry = {"kind": "review_record", "pr": ref, "head": head, "reviewer": reviewer, "verdict": verdict,
                  "blocks": args.blocks, "notes": args.notes, "by": by,
                  "summary": plan_ledger.clip(redact_command_text(args.summary or ""), 200)}
+        if confirms:
+            entry["carry_confirmed"] = True   # (#815) read by `impact_hold.carry_confirmer`: only a reviewer's own record at the head it judged
         if action:
             entry["impact_action"] = action
-        if args.reviewer == "impact":
+        if reviewer == "impact" or confirms:   # (#815) a carry confirmation is read by the same recorded role as a rating
             entry["by_role"] = kind[2] if kind[0] == "agent" and len(kind) > 2 and isinstance(kind[2], str) else None   # #835: the RECORDED role of the session that made the record (never a flag or a text): only the independent reviewer's rating counts
         for name in IMPACT_RATING_FIELDS:
             if rating[name]:
@@ -23826,14 +23878,14 @@ def cmd_review(args, runner, now):
             entry["impact_class"] = impact_class   # #451 slice 2: the class of the impact that drives the action; a missing one holds for the owner
         stored = plan_ledger.append_entry(state, entry, now())
         if engine.audit is not None:
-            engine.audit.append(engine.actor, "review.record", ref, {"reviewer": args.reviewer, "verdict": args.verdict, "head": head[:12],
+            engine.audit.append(engine.actor, "review.record", ref, {"reviewer": reviewer, "verdict": verdict, "head": head[:12],
                                                                     "by": by, "seq": stored["seq"], "chain": stored["hash"]})
         entries, problem = plan_ledger.read_ledger(state)
         got = plan_ledger.review_records_at(entries, ref, head)
         print("recorded %s review %s at %s (%s): %d of %d reviewers recorded at this head%s" % (
-            args.reviewer, args.verdict, head[:8], ref, len(got["recorded"]), len(got["expected"]),
+            reviewer, verdict, head[:8], ref, len(got["recorded"]), len(got["expected"]),
             "; missing %s" % ", ".join(got["missing"]) if got["missing"] else ""))
-        if args.reviewer == "impact" and not (entry.get("impact_severity") and entry.get("impact_probability")):
+        if reviewer == "impact" and not (entry.get("impact_severity") and entry.get("impact_probability")):
             sys.stderr.write("%s: review: %s\n" % (PROG, NO_SCORE_TEXT))
         return EXIT_OK
     except (ReviewError, plan_ledger.LedgerError, ConfigError, IdentityUncertain, CallerError) as err:
@@ -24053,6 +24105,8 @@ def add_review_parsers(sub):
     for flag in IMPACT_RATING_FIELDS:
         record.add_argument("--" + flag.replace("_", "-"), dest=flag, help="#835: the impact reviewer's rating (%s): the severity and the probability name a cell of the matrix, the reason names the floor rule it applied" % flag.split("_", 1)[1])
     record.add_argument("--impact-class", dest="impact_class", help="The class of the impact that drives the action (a class of the matrix file's owner_hold block)")
+    record.add_argument("--confirms-carry", dest="confirms_carry", action="store_true",
+                        help="(#815) With an approve: the resolution of a conflict in a merge of main touched no line this pull request adds or removes, so the owner's clear may carry to this head")
     record.add_argument("--summary", help="One line (at most 200 characters)")
     checkout = rsub.add_parser("checkout", help="Write the PR's exact head tree, its diff and the base copies of the touched files into .review/<head sha> here, read-only, and print the path; --remove <dir> removes one")
     checkout.add_argument("pr", nargs="?", help="owner/repo#N or the PR's URL")

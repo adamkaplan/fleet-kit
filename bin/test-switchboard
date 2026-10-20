@@ -14142,6 +14142,217 @@ class TestClearCarry(unittest.TestCase):
         self.assertEqual(imports, ["hashlib", "json"], "the carry imports no floor, glob or class code: it decides from GitHub's answers alone")
 
 
+class TestConflictCarry(unittest.TestCase):
+    """#815: an owner clear carries over a merge of main whose conflict was resolved by hand, only on unchanged added and removed LINES, with no protected path touched and a confirmation. Real git."""
+
+    REPO = "acme-org/widget-api"
+    RESOLVED = "zero\none\nTWO\nTHREE\nfour\nfive\nsix\nseven\n"
+
+    def setUp(self):
+        self.cc = sb.load_module("clear_carry")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name) / "repo"
+        self.api = build_carry_repo(self.dir)
+        self.base_main = self.api.rev("main")
+        self.arm()
+
+    def arm(self):
+        self.cleared = self.api.rev("feature")
+        self.fp = self.cc.own_change_fingerprint(self.api.get, self.REPO, 7)[0]
+        self.lfp = self.cc.own_change_fingerprint(self.api.get, self.REPO, 7, lines=True)[0]
+
+    def write(self, path, text):
+        target = self.dir / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+
+    def conflict_merge(self, resolved=None, main_files=(), after=None):
+        """Main edits the line next to the pull request's (a real conflict) and moves the file down; the merge is resolved by hand. `after()` may change more before the merge commit."""
+        g = self.api.git
+        g("checkout", "-q", "main")
+        self.write("a.txt", "zero\none\ntwo\nTHREE\nfour\nfive\nsix\nseven\n")
+        for path in main_files:
+            self.write(path, "from main\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "main moves")
+        g("checkout", "-q", "feature")
+        self.assertNotEqual(subprocess.run(["git", "-C", str(self.dir), "merge", "--no-commit", "--no-ff", "main"], capture_output=True).returncode, 0, "the fixture must really conflict")
+        self.write("a.txt", resolved or self.RESOLVED)
+        if after:
+            after()
+        g("add", "-A")
+        g("commit", "-q", "-m", "merge main, conflict resolved")
+        return self.api.rev("feature")
+
+    def decide(self, new, confirm=lambda head: "ledger entry 1", protected="table", lines=True):
+        return self.cc.decide(self.api.get, self.REPO, 7, self.cleared, self.fp, new, lines_fingerprint=self.lfp if lines else None, confirm=confirm,
+                              protected=sb.impact_floor.carry_never_paths() if protected == "table" else protected)
+
+    def test_s1_a_conflict_resolved_by_hand_with_the_lines_unchanged_carries_only_through_the_lines_route(self):
+        new = self.conflict_merge()
+        pure = self.cc.decide(self.api.get, self.REPO, 7, self.cleared, self.fp, new)
+        self.assertFalse(pure["carried"], "the pure route refuses it, as before")
+        self.assertIn("both parents", pure["reason"])
+        verdict = self.decide(new)
+        self.assertEqual((verdict["carried"], verdict["route"], verdict["reason"], verdict["confirmation"], verdict["from"], verdict["to"], verdict["lines_fingerprint"]),
+                         (True, "lines", None, "ledger entry 1", self.cleared, new, self.lfp))
+
+    def test_the_lines_fingerprint_ignores_context_and_line_numbers_and_sees_every_added_or_removed_line(self):
+        patch = "@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three"
+        moved = "@@ -40,5 +41,5 @@\n zero\n one\n-two\n+TWO\n THREE\n four"
+        self.assertEqual(self.cc.changed_lines(patch), ["-two", "+TWO"])
+        self.assertEqual(self.cc.changed_lines(patch), self.cc.changed_lines(moved))
+        for other in ("@@ -1,3 +1,3 @@\n one\n-two\n+TWO!\n three", "@@ -1,3 +1,3 @@\n one\n-twp\n+TWO\n three", "@@ -1,3 +1,3 @@\n one\n+TWO\n three", "@@ -1,3 +1,4 @@\n one\n-two\n+TWO\n+x\n three"):
+            self.assertNotEqual(self.cc.changed_lines(patch), self.cc.changed_lines(other), other)
+        self.assertEqual(self.cc.changed_lines("@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b"), ["-a", "\\ No newline at end of file", "+b"])
+        self.assertEqual(self.cc.changed_lines("@@ -1 +1 @@\n a\n\\ No newline at end of file\n-b\n+c"), ["-b", "+c"], "a marker after a context line is about the surroundings")
+
+    def test_s2_one_added_or_removed_line_that_differs_is_refused_and_so_is_a_commit_of_its_own(self):
+        def edit(path, text):
+            return lambda: self.write(path, text)
+        cases = (("an added line edited", dict(resolved=self.RESOLVED.replace("TWO\n", "TWO!\n")), "a.txt"),
+                 ("a removed line kept", dict(resolved=self.RESOLVED.replace("TWO\n", "two\nTWO\n")), "a.txt"),
+                 ("the change dropped", dict(resolved=self.RESOLVED.replace("TWO", "two")), "a.txt"),
+                 ("a line added by the resolution", dict(resolved=self.RESOLVED + "extra\n"), "a.txt"),
+                 ("the added file edited", dict(after=edit("c.txt", "new file edited\n")), "c.txt"),
+                 ("the added file dropped", dict(after=lambda: self.api.git("rm", "-q", "-f", "c.txt")), "c.txt"),
+                 ("a file added by the resolution", dict(after=edit("d.txt", "sneaked in\n")), "d.txt"))
+        for label, kwargs, named in cases:
+            with self.subTest(label):
+                g = self.api.git
+                g("checkout", "-q", "-B", "feature", self.cleared)
+                g("branch", "-q", "-f", "main", self.base_main)
+                verdict = self.decide(self.conflict_merge(**kwargs))
+                self.assertFalse(verdict["carried"], label)
+                self.assertEqual(verdict["route"], None, label)
+                self.assertIn("differs", verdict["reason"], label)
+                self.assertFalse(verdict["waiting"], "a changed line is not a missing confirmation: %s" % label)
+        g = self.api.git
+        g("checkout", "-q", "-B", "feature", self.cleared)
+        g("branch", "-q", "-f", "main", self.base_main)
+        new = self.conflict_merge()
+        self.write("e.txt", "own\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "own")
+        verdict = self.decide(self.api.rev("feature"))
+        self.assertFalse(verdict["carried"])
+        self.assertIn("commit of the pull request's own", verdict["reason"])
+
+    def test_s3_every_member_of_the_table_is_refused_when_a_merge_touches_it_or_the_pull_request_changes_it(self):
+        table = sb.impact_floor.carry_never_paths()
+        self.assertGreaterEqual(len(table), 4)
+        for path in table:
+            for how in ("a merge touches it", "the pull request's own change touches it"):
+                with self.subTest(path=path, how=how):
+                    self.tearDown_repo()
+                    g = self.api.git
+                    if how.startswith("the pull"):
+                        self.write(path, "own change\n")
+                        g("add", "-A")
+                        g("commit", "-q", "-m", "own change in a protected path")
+                    self.arm()
+                    verdict = self.decide(self.conflict_merge(main_files=([path] if not how.startswith("the pull") else [])))
+                    self.assertFalse(verdict["carried"], (path, how))
+                    self.assertIn("never carried", verdict["reason"], (path, how))
+                    self.assertFalse(verdict["waiting"])
+
+    def tearDown_repo(self):
+        shutil.rmtree(str(self.dir))
+        self.api = build_carry_repo(self.dir)
+
+    def test_a_protected_path_is_matched_in_any_case_and_spelling(self):
+        for spelled in ("BIN/Impact_Hold.py", "./bin/impact_hold.py", "bin\\impact_hold.py", "/bin/impact_hold.py"):
+            self.assertEqual(self.cc._norm(spelled), "bin/impact_hold.py", spelled)
+        self.assertEqual(self.cc._norm(".github/x"), ".github/x", "a leading dot of a name is not a ./ prefix")
+
+    def test_a_rename_away_from_a_protected_path_and_an_odd_spelling_are_refused_through_decide(self):
+        g = self.api.git
+        g("checkout", "-q", "main")
+        self.write("bin/impact_hold.py", "x = 1\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "main gets the file")
+        self.base_main = self.api.rev("main")
+        g("checkout", "-q", "feature")
+        g("merge", "-q", "--no-edit", "main")
+        g("mv", "bin/impact_hold.py", "bin/other_name.py")
+        g("commit", "-q", "-m", "the pull request renames it away")
+        self.arm()
+        verdict = self.decide(self.conflict_merge())
+        self.assertFalse(verdict["carried"], "the rename's previous path is a protected path")
+        self.assertIn("impact_hold.py", verdict["reason"])
+        self.tearDown_repo()
+        self.base_main = self.api.rev("main")
+        self.arm()
+        verdict = self.decide(self.conflict_merge(main_files=["BIN/Impact_Hold.py"]))
+        self.assertFalse(verdict["carried"], "an odd spelling is the same path")
+        self.assertIn("never carried", verdict["reason"])
+
+    def test_the_table_is_the_clear_code_the_matrix_names_and_every_clear_or_hold_module(self):
+        table = set(sb.impact_floor.carry_never_paths())
+        root = Path(sb.__file__).resolve().parent.parent
+        matrix = json.loads((root / "docs/review-laws/impact-matrix.json").read_text())
+        listed = set(matrix["owner_hold"]["delegated_clear"]["clear_code_paths"]) if "owner_hold" in matrix else set(matrix["delegated_clear"]["clear_code_paths"])
+        self.assertEqual(sorted(table - listed), [], "every protected path is one the matrix lists as the clear's own code")
+        exact = {x for x in listed if "*" not in x}
+        self.assertEqual(sorted(exact - table), [], "every exact path the matrix lists as the clear's own code is never carried (plan_ledger decides who may confirm)")
+        left_out = sorted(listed - table)
+        self.assertTrue(all("*" in x for x in left_out), "only the directory globs are left out, on purpose: %s" % left_out)
+        for path in table:
+            self.assertTrue((root / path).exists(), path)
+        named = {"bin/%s" % p.name for p in (root / "bin").glob("*.py") if re.search(r"clear|hold|floor", p.name)}
+        self.assertEqual(sorted(named - table), [], "a bin module named for the clear, the hold or the floor is in the table")
+        self.assertIn("docs/review-laws/impact-matrix.json", table)
+
+    def test_s4_the_confirmation_is_asked_for_exactly_this_head_and_an_empty_answer_leaves_the_carry_waiting(self):
+        new = self.conflict_merge()
+        asked = []
+        for label, confirm in (("none", lambda head: None), ("empty", lambda head: ""), ("a void", lambda head: (_ for _ in ()).throw(self.cc.CarryVoid("no confirmation at this head")))):
+            verdict = self.decide(new, confirm=lambda head, c=confirm: (asked.append(head), c(head))[1])
+            self.assertFalse(verdict["carried"], label)
+            self.assertTrue(verdict["waiting"], label)
+            self.assertIn("no confirmation", verdict["reason"], label)
+        self.assertEqual(set(asked), {new})
+        self.assertFalse(self.decide(new, confirm=None)["carried"], "no confirmation source: refused")
+        self.assertFalse(self.decide(new, lines=False)["carried"], "a clear with no lines fingerprint: refused")
+
+    def test_s3_no_table_given_refuses_the_conflict_route(self):
+        new = self.conflict_merge()
+        for protected in (None, (), []):
+            self.assertFalse(self.decide(new, protected=protected)["carried"], repr(protected))
+
+    def test_u2_a_cut_omitted_or_unreadable_input_refuses_the_carry(self):
+        new = self.conflict_merge(after=lambda: (self.dir / "b.bin").write_bytes(b"\x00\x01\xff\xfe" * 8))
+        verdict = self.decide(new)
+        self.assertFalse(verdict["carried"], "an omitted patch (a binary file) is never read as unchanged")
+        g = self.api.git
+        g("checkout", "-q", "-B", "feature", self.cleared)
+        g("branch", "-q", "-f", "main", self.base_main)
+        new = self.conflict_merge()
+        self.assertTrue(self.decide(new)["carried"], "control: the same merge without the binary file carries")
+        for label, setup in (("the file list is cut", lambda: setattr(self.api, "changed_files_override", 99)), ("a read fails", lambda: setattr(self.api, "fail", "/files"))):
+            with self.subTest(label):
+                setup()
+                self.addCleanup(setattr, self.api, "changed_files_override", None)
+                self.addCleanup(setattr, self.api, "fail", None)
+                verdict = self.decide(new)
+                self.assertFalse(verdict["carried"], label)
+                self.assertTrue(verdict["reason"], label)
+                self.api.changed_files_override, self.api.fail = None, None
+        # the head moves while it is read
+        real = self.api.get
+        moved = []
+
+        def get(path):
+            answer = real(path)
+            if path.endswith("pulls/7/files?per_page=100&page=1") and not moved:
+                moved.append(1)
+                self.api.git("commit", "-q", "--allow-empty", "-m", "moved")
+            return answer
+        self.api.get = get
+        self.assertFalse(self.decide(new)["carried"])
+
+
 class TestClearMarker(Base):
     """#522: the owner's clear also changes the first line `MERGE: captain` of the body to `MERGE: automatic`, through ONE shared function, never on a carry, never undoing the clear."""
 
@@ -15147,7 +15358,7 @@ class TestClearCarryInTheDaemon(Base):
 
     def route(self, argv, **kwargs):
         if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
-            raw = {"state": "OPEN", "headRefOid": self.api.rev("feature"), "title": "t", "labels": [{"name": n} for n in self.labels], "body": getattr(self, "body", "")}
+            raw = {"state": "OPEN", "headRefOid": self.api.rev("feature"), "title": "t", "labels": [{"name": n} for n in self.labels], "body": getattr(self, "body", ""), "author": {"login": getattr(self, "author_login", "bot")}}
             return subprocess.CompletedProcess(argv, 0, json.dumps(raw), "")
         if argv[0] == FAKE_GH and argv[1] == "api" and "--method" in argv:
             method = argv[argv.index("--method") + 1]
@@ -15202,6 +15413,18 @@ class TestClearCarryInTheDaemon(Base):
         self.assertEqual(len(self.events("gate.clear_carried")), 1)
         self.assertEqual(([w for w in self.writes if w[1].endswith("/pulls/7")], self.body), ([], before))
         self.assertFalse(sb.pr_marker_state([], self.body, now=0)["captain"], "the gate reads no hold from the text")
+
+    def test_891_a_carried_clear_touches_no_hold_label_and_a_re_hold_never_writes_the_owners_own_hold(self):
+        owner_hold = self.names[sb.OWNER_HOLD_KEY]
+        self.clear()
+        self.writes.clear()
+        new = self.merge_main()
+        self.assertEqual(self.hold(new, labels=(owner_hold,)), 0)
+        self.assertEqual((len(self.events("gate.clear_carried")), self.writes), (1, []), "carried: no label is added, adopted or removed, the owner's own hold included")
+        self.writes.clear()
+        changed = self.api.rev("feature")
+        self.assertEqual(self.hold(changed, labels=(owner_hold,)), 0)   # the same head again: still nothing
+        self.assertEqual([w for w in self.adds() if owner_hold in json.dumps(w)], [], "the owner's own hold is never written by the daemon")
 
     def test_830_a_pure_merge_carry_is_not_held_again_and_a_changed_pull_request_is(self):
         self.clear()
@@ -15404,6 +15627,399 @@ class TestClearCarryInTheDaemon(Base):
         entry = sb.read_impact_state(self.world.state)[0]
         self.assertEqual(entry["clears"][self.PR]["head"], carried)
         self.assertEqual(entry.get("carried", {}), {}, "the earlier carry is not part of the new clear")
+
+
+class TestConflictCarryInTheDaemon(Base):
+    """#815 in the daemon: the carry reads the ledger for the reviewer's confirmation, waits (and holds) until there is one, audits one line naming both heads, and lifts what it held."""
+
+    REPO, PR = TestClearCarryInTheDaemon.REPO, TestClearCarryInTheDaemon.PR
+    RESOLVED = TestConflictCarry.RESOLVED
+    route, events, adds, clear, hold = (TestClearCarryInTheDaemon.__dict__[n] for n in ("route", "events", "adds", "clear", "hold"))
+    write, conflict_merge = TestConflictCarry.__dict__["write"], TestConflictCarry.__dict__["conflict_merge"]
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name) / "repo"
+        self.api = build_carry_repo(self.dir)
+        self.writes, self.api_gets, self.labels = [], 0, []
+        self.base_main = self.api.rev("main")
+        self.build(carry=True)
+
+    def build(self, carry):
+        impact = {"enabled": True, "carry_clear": carry} if carry is not None else {"enabled": True}
+        self.world = World(self, agents=(), config={"gh": FAKE_GH, "impact_hold": impact, "plan_evaluators": {"reviewer": ["rev1"]}})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.engine = self.world.new_engine("daemon")
+        self.engine.gh_runner, self.engine.state_dir = self.route, self.world.state
+        self.names = sb.label_names(self.engine.config)
+
+    def confirm(self, head, by="rev1", reviewer="code", verdict="approve", flag=True, pr=None, by_role="reviewer"):
+        entry = {"kind": "review_record", "pr": pr or self.PR, "head": head, "reviewer": reviewer, "verdict": verdict, "blocks": 0 if verdict != "request-changes" else 1, "notes": 0, "by": by, "summary": "", "by_role": by_role}
+        if flag:
+            entry["carry_confirmed"] = True
+        return sb.plan_ledger.append_entry(self.world.state, entry, self.world.clock.now())
+
+    def held_state(self):
+        return sb.read_impact_state(self.world.state)[0]
+
+    def test_s1_s6_u1_a_confirmed_conflict_resolution_carries_audits_one_line_with_both_heads_and_writes_no_clear(self):
+        cleared = self.clear()
+        before = json.dumps(self.held_state()["clears"], sort_keys=True)
+        new = self.conflict_merge()
+        stored = self.confirm(new)
+        self.assertEqual(self.hold(new), 0)
+        self.assertEqual(self.adds(), [], "no hold written")
+        (carried,) = self.events("gate.clear_carried")
+        detail = carried["detail"]
+        self.assertEqual((detail["head"], detail["from"], detail["route"]), (new, cleared, "lines"))
+        self.assertRegex(detail["head"], r"^[0-9a-f]{40}$")
+        self.assertRegex(detail["from"], r"^[0-9a-f]{40}$")
+        self.assertNotEqual(detail["head"], detail["from"])
+        clears = self.held_state()["clears"]
+        self.assertEqual((detail["fingerprint"], detail["lines_fingerprint"]), (clears[self.PR]["fingerprint"], clears[self.PR]["lines_fingerprint"]))
+        self.assertIn("by rev1", detail["confirmation"])
+        self.assertIn(str(stored["seq"]), detail["confirmation"])
+        self.assertEqual(json.dumps(clears, sort_keys=True), before, "the owner's clear record is byte-identical: only the carried record is new")
+        self.assertEqual(clears[self.PR]["head"], cleared, "the clear is untouched: still the owner's, at its own head")
+        self.assertEqual(self.held_state()["carried"][self.PR]["route"], "lines")
+        gets = self.api_gets
+        for _ in range(3):
+            self.assertEqual(self.hold(new), 0)
+        self.assertEqual((len(self.events("gate.clear_carried")), self.api_gets), (1, gets), "a second pass writes and reads nothing")
+        self.assertEqual(sb.rehold_reason(self.engine, self.held_state(), self.REPO, self.PR, new), None, "#830's one reading of 'held again' agrees: carried")
+
+    def test_s4_a_missing_stale_forged_or_self_made_confirmation_never_carries_and_the_pull_request_is_held_meanwhile(self):
+        cleared = self.clear()
+        cases = (("absent", lambda new: None),
+                 ("recorded for the cleared head", lambda new: self.confirm(cleared)),
+                 ("recorded for another head", lambda new: self.confirm("a" * 40)),
+                 ("recorded for another pull request", lambda new: self.confirm(new, pr="acme-org/widget-api#8")),
+                 ("by an unregistered name", lambda new: self.confirm(new, by="mallory")),
+                 ("by the person's own terminal", lambda new: self.confirm(new, by="person")),
+                 ("by an agent whose recorded role is not the reviewer's", lambda new: self.confirm(new, by_role="coder")),
+                 ("with no recorded role (a record made before roles were kept)", lambda new: self.confirm(new, by_role=None)),
+                 ("without the confirmation flag", lambda new: self.confirm(new, flag=False)),
+                 ("with a request-changes verdict", lambda new: self.confirm(new, verdict="request-changes")),
+                 ("by the writer of the pull request", lambda new: (sb.plan_ledger.append_entry(self.world.state, {"kind": "proof", "pr": self.PR, "scenario": "S1", "result": "pass", "by": "rev1", "head": new, "plan_ref": "x"}, self.world.clock.now()), self.confirm(new))),
+                 ("by a sender of its notice", lambda new: (sb.record_pr_notice(self.world.state, self.REPO, 7, "rev1", "n", self.world.clock.now()), self.confirm(new))),
+                 ("a comment or a label only", lambda new: setattr(self, "body", "carry-confirmed: yes\nMERGE: captain")))
+        for label, make in cases:
+            with self.subTest(label):
+                g = self.api.git
+                g("checkout", "-q", "-B", "feature", cleared)
+                g("branch", "-q", "-f", "main", self.base_main)
+                self.clear_again(cleared)
+                self.writes.clear()
+                self.labels = []
+                new = self.conflict_merge()
+                make(new)
+                self.assertGreater(self.hold(new), 0, label)
+                self.assertEqual(len(self.adds()), 1, label)
+                self.assertEqual(self.events("gate.clear_carried"), [], label)
+                state = self.held_state()
+                self.assertNotIn(self.PR, state.get("carried", {}), label)
+                self.assertNotIn(self.PR, state.get("carry_void", {}), "a missing confirmation is a wait, not a void: %s" % label)
+                self.assertEqual(state["carry_wait"][self.PR]["head"], new, label)
+
+    def test_s4b_a_confirmation_the_same_writer_took_back_or_one_by_the_reported_author_or_with_an_unreadable_ledger_never_carries(self):
+        cleared = self.clear()
+        for label in ("superseded by the same writer, without the flag", "superseded by a request-changes", "the author GitHub reports", "an unreadable ledger"):
+            with self.subTest(label):
+                g = self.api.git
+                g("checkout", "-q", "-B", "feature", cleared)
+                g("branch", "-q", "-f", "main", self.base_main)
+                self.clear_again(cleared)
+                self.writes.clear()
+                self.labels = []
+                self.author_login = "bot"
+                new = self.conflict_merge()
+                if label.startswith("superseded by the same"):
+                    self.confirm(new)
+                    self.confirm(new, flag=False)
+                elif label.startswith("superseded by a request"):
+                    self.confirm(new)
+                    self.confirm(new, verdict="request-changes")
+                elif label.startswith("the author"):
+                    self.author_login = "rev1"
+                    self.confirm(new)
+                else:
+                    self.confirm(new)
+                    with open(str(Path(self.world.state) / "plan-ledger.jsonl"), "a") as handle:
+                        handle.write("not json\n")
+                self.assertGreater(self.hold(new), 0, label)
+                self.assertEqual(self.events("gate.clear_carried"), [], label)
+                self.assertNotIn(self.PR, self.held_state().get("carried", {}), label)
+            self.author_login = "bot"
+        g = self.api.git
+        g("checkout", "-q", "-B", "feature", cleared)
+        g("branch", "-q", "-f", "main", self.base_main)
+        for name in ("plan-ledger.jsonl", "plan-ledger.head"):
+            (Path(self.world.state) / name).unlink(missing_ok=True)
+        self.clear_again(cleared)
+        new = self.conflict_merge()
+        self.confirm(new)
+        self.assertEqual(self.hold(new), 0, "control: with none of those, the same merge carries")
+
+    def test_s4c_an_unreadable_score_block_refuses_every_confirmation(self):
+        cleared = self.clear()
+        module = sb.load_module("delegated_clear")
+        for label, patch in (("none", mock.patch.object(module, "score_block", return_value=None)), ("raises", mock.patch.object(module, "score_block", side_effect=OSError("gone")))):
+            with self.subTest(label):
+                g = self.api.git
+                g("checkout", "-q", "-B", "feature", cleared)
+                g("branch", "-q", "-f", "main", self.base_main)
+                self.clear_again(cleared)
+                self.writes.clear()
+                self.labels = []
+                new = self.conflict_merge()
+                self.confirm(new)
+                with patch:
+                    self.assertGreater(self.hold(new), 0, label)
+                self.assertEqual(self.events("gate.clear_carried"), [], label)
+                self.assertIn(self.PR, self.held_state()["carry_wait"], "a missing role list is a wait, not a carry: %s" % label)
+
+    def clear_again(self, cleared):
+        """the next case starts from the same owner clear: rebuild its state"""
+        self.build(carry=True)
+        g = self.api.git
+        g("checkout", "-q", "-B", "feature", cleared)
+        self.clear()
+
+    def test_s5_a_push_after_the_confirmation_needs_a_new_one_and_a_late_one_carries_and_lifts_the_hold(self):
+        cleared = self.clear()
+        self.world.clock.t += 60
+        b = self.conflict_merge()
+        self.confirm(b)
+        self.assertEqual(self.hold(b), 0)
+        self.assertEqual(len(self.events("gate.clear_carried")), 1)
+        g = self.api.git
+        g("checkout", "-q", "main")
+        (Path(self.dir) / "m9.txt").write_text("more main\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "main moves again")
+        g("checkout", "-q", "feature")
+        g("merge", "-q", "--no-edit", "main")
+        c = self.api.rev("feature")
+        self.assertGreater(self.hold(c), 0, "no confirmation at the new head: held")
+        self.assertEqual(len(self.events("gate.clear_carried")), 1, "the confirmation for B does not carry C")
+        added = [l for w in self.adds() for l in (w[2] or {}).get("labels", [])]
+        self.assertTrue(added)
+        self.labels = list(added)
+        self.writes.clear()
+        gets = self.api_gets
+        self.hold(c)
+        self.assertEqual(self.api_gets, gets, "still waiting and nothing new in the ledger: no read of GitHub")
+        self.confirm(c)
+        self.assertEqual(self.hold(c), 0)
+        self.assertEqual(len(self.events("gate.clear_carried")), 2)
+        removed = [w for w in self.writes if w[0] == "DELETE"]
+        self.assertTrue(removed, "the labels this daemon put on the head while the confirmation was missing are lifted")
+        self.assertNotIn(self.PR, self.held_state()["applied"])
+        self.assertEqual(self.held_state()["carried"][self.PR]["head"], c)
+
+    def test_s7_a_credential_or_identity_path_change_is_carried_like_any_other(self):
+        for path in ("shims/launcher.sh", "cloud/launcher/repo-approvals.json", "bin/switchboard-trial"):
+            with self.subTest(path):
+                self.build(carry=True)
+                g = self.api.git
+                g("checkout", "-q", "-B", "feature", "main")
+                g("reset", "-q", "--hard", "main")
+                shutil.rmtree(str(self.dir))
+                self.api = build_carry_repo(self.dir)
+                self.write(path, "own change\n")
+                self.api.git("add", "-A")
+                self.api.git("commit", "-q", "-m", "own change in a sensitive path")
+                cleared = self.clear()
+                new = self.conflict_merge()
+                self.confirm(new)
+                self.assertEqual(self.hold(new), 0, path)
+                self.assertEqual(self.held_state()["carried"][self.PR]["from"], cleared)
+
+    def test_a_new_clear_and_a_revoke_both_forget_a_waiting_carry(self):
+        self.clear()
+        new = self.conflict_merge()
+        self.assertGreater(self.hold(new), 0)
+        self.assertIn(self.PR, self.held_state()["carry_wait"])
+        self.labels = [self.names["merge-captain"], self.names["hold-impact"]]
+        sb.impact_clear_core(self.engine, self.route, self.REPO, 7, "owner", "cleared again at the new head: a fixture")
+        self.assertNotIn(self.PR, self.held_state().get("carry_wait", {}), "a new clear")
+        self.assertEqual(self.held_state()["clears"][self.PR]["head"], new)
+        state = self.held_state()
+        state["carry_wait"] = {self.PR: {"head": "c" * 40, "marks": 0, "reason": "waiting again, for the new clear"}}
+        sb.write_impact_state(self.world.state, state)
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "impact_hold": {"enabled": True, "carry_clear": True}})
+        with mock.patch.object(sb, "gates_caller_kind", return_value=("person", "owner")):
+            self.assertEqual(sb.cmd_impact_clear(types.SimpleNamespace(pr=self.PR, reason="take the clear back, it was a mistake", revoke=True), self.route, self.world.clock.now), 0)
+        self.assertNotIn(self.PR, self.held_state().get("carry_wait", {}), "a revoke")
+
+    def test_s8_with_the_switch_off_nothing_new_is_stored_and_no_conflict_carry_is_made(self):
+        self.build(carry=None)
+        gets = self.api_gets
+        cleared = self.clear()
+        entry = self.held_state()["clears"][self.PR]
+        self.assertEqual(sorted(entry), ["at", "by", "head", "reason", "removed"], "the clear stores no fingerprint of either form: it is as it was before the carry existed")
+        self.assertEqual(self.api_gets, gets)
+        new = self.conflict_merge()
+        self.confirm(new)
+        self.assertGreater(self.hold(new), 0)
+        self.assertEqual((self.events("gate.clear_carried"), self.events("gate.clear_carry_void")), ([], []))
+        self.assertEqual(self.held_state().get("carried", {}), {})
+
+    def test_the_clear_stores_the_lines_fingerprint_next_to_the_full_one_and_the_pure_merge_still_carries(self):
+        cleared = self.clear()
+        entry = self.held_state()["clears"][self.PR]
+        self.assertTrue(entry["lines_fingerprint"].startswith("sha256:"))
+        self.assertNotEqual(entry["lines_fingerprint"], entry["fingerprint"])
+        g = self.api.git
+        g("checkout", "-q", "main")
+        (Path(self.dir) / "m1.txt").write_text("from main\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "main moves")
+        g("checkout", "-q", "feature")
+        g("merge", "-q", "--no-edit", "main")
+        new = self.api.rev("feature")
+        self.assertEqual(self.hold(new), 0)
+        (carried,) = self.events("gate.clear_carried")
+        self.assertNotIn("route", carried["detail"], "the pure carry's audit line reads as before")
+
+    # -- clause (7): a re-hold puts the body's first line back to `MERGE: captain`
+
+    def own_commit(self):
+        g = self.api.git
+        (Path(self.dir) / "d.txt").write_text("own\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "own commit")
+        return self.api.rev("feature")
+
+    def rehold(self, head):
+        report = {"pr": self.PR, "head": head, "reasons": ["held again"], "floor_paths": [], "globs": [], "rehold": "held again"}
+        return sb.apply_impact_hold(self.engine, self.REPO, 7, report, {"labels": []})
+
+    def body_patches(self):
+        return [w for w in self.writes if w[0] == "PATCH" and w[1].endswith("/pulls/7")]
+
+    def test_s9_a_re_hold_rewrites_the_first_line_to_captain_once_per_head_and_audits_it_in_the_reapplied_line(self):
+        self.body = "MERGE: captain\n\nthe change\n"
+        self.clear()
+        self.assertEqual(self.body, "MERGE: automatic\n\nthe change\n")
+        self.writes.clear()
+        new = self.own_commit()
+        self.assertGreater(self.rehold(new), 0)
+        self.assertEqual(self.body, "MERGE: captain\n\nthe change\n", "only the marker changed")
+        self.assertEqual(len(self.body_patches()), 1)
+        (done,) = self.events("gate.hold_reapplied")
+        self.assertEqual(done["detail"]["marker"], {"before": "MERGE: automatic", "after": "MERGE: captain"})
+        self.labels = [l for w in self.adds() for l in w[2]["labels"]]
+        for _ in range(3):
+            self.rehold(new)
+        self.assertEqual((len(self.body_patches()), len(self.events("gate.hold_reapplied"))), (1, 1), "once per head")
+        self.assertTrue(sb.impact_rehold_open(self.world.state, self.REPO, 7))
+
+    def test_s10_a_carried_clear_never_rewrites_the_body_and_marks_no_re_hold(self):
+        self.body = "MERGE: captain\n\nthe change\n"
+        self.clear()
+        self.writes.clear()
+        new = self.conflict_merge()
+        self.confirm(new)
+        self.assertEqual(self.hold(new), 0)
+        self.assertEqual((self.body_patches(), self.body), ([], "MERGE: automatic\n\nthe change\n"))
+        self.assertFalse(sb.impact_rehold_open(self.world.state, self.REPO, 7))
+
+    def test_s11_a_body_with_no_merge_line_or_one_that_already_says_captain_is_left_alone(self):
+        for label, body in (("no MERGE line", "just text\nMERGE: automatic\n"), ("already captain", "MERGE: captain\nx\n"), ("empty", ""), ("a MERGE word inside", "see MERGE: automatic below\n")):
+            with self.subTest(label):
+                self.build(carry=True)
+                g = self.api.git
+                g("checkout", "-q", "-B", "feature", "main")
+                self.writes.clear()
+                self.labels = []
+                self.body = body
+                self.clear()
+                self.writes.clear()
+                self.labels = []
+                self.body = body   # whatever the clear left, the body now reads as the case says
+                before = self.body
+                (Path(self.dir) / ("e_%d.txt" % len(label))).write_text("own\n")
+                g("add", "-A")
+                g("commit", "-q", "-m", "own commit")
+                self.assertGreater(self.rehold(self.api.rev("feature")), 0)
+                self.assertEqual((self.body_patches(), self.body), ([], before))
+                (done,) = self.events("gate.hold_reapplied")[-1:]
+                self.assertNotIn("marker", done["detail"], label)
+
+    def test_s12_an_unreadable_body_writes_nothing_and_the_labels_still_stand(self):
+        self.body = "MERGE: captain\n\nthe change\n"
+        self.clear()
+        self.writes.clear()
+        new = self.own_commit()
+        reads, real = [], self.route
+
+        def route(argv, **kwargs):
+            if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+                reads.append(1)
+                if len(reads) == 2:   # the read right before the write
+                    return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 502")
+            return real(argv, **kwargs)
+        self.engine.gh_runner = route
+        self.assertGreater(self.rehold(new), 0)
+        self.assertEqual((self.body_patches(), self.body), ([], "MERGE: automatic\n\nthe change\n"))
+        self.assertEqual(len(self.adds()), 1, "the hold labels are written all the same")
+        (done,) = self.events("gate.hold_reapplied")
+        self.assertIn("error", done["detail"]["marker"])
+
+    def test_s12b_a_body_read_back_that_is_not_the_one_written_is_said_and_the_labels_stand(self):
+        self.body = "MERGE: captain\n\nthe change\n"
+        self.clear()
+        self.writes.clear()
+        new = self.own_commit()
+        reads, real = [], self.route
+
+        def route(argv, **kwargs):
+            done = real(argv, **kwargs)
+            if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+                reads.append(1)
+                if len(reads) == 3:   # the read back after the write
+                    raw = json.loads(done.stdout)
+                    raw["body"] = "MERGE: automatic\n\nnot what was written\n"
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(raw), "")
+            return done
+        self.engine.gh_runner = route
+        self.assertGreater(self.rehold(new), 0)
+        (done,) = self.events("gate.hold_reapplied")
+        self.assertEqual(done["detail"]["marker"], {"error": "the body read back is not the one written"})
+        self.assertEqual(len(self.adds()), 1)
+
+    def test_s13_a_body_that_changed_while_it_was_being_edited_is_not_written(self):
+        self.body = "MERGE: captain\n\nthe change\n"
+        self.clear()
+        self.writes.clear()
+        new = self.own_commit()
+        reads, real = [], self.route
+
+        def route(argv, **kwargs):
+            if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+                reads.append(1)
+                if len(reads) == 2:
+                    self.body = "MERGE: automatic\n\nthe author edited this\n"
+            return real(argv, **kwargs)
+        self.engine.gh_runner = route
+        self.rehold(new)
+        self.assertEqual((self.body_patches(), self.body), ([], "MERGE: automatic\n\nthe author edited this\n"))
+
+    def test_a_conflict_merge_after_a_rewritten_history_or_with_a_changed_line_is_void_not_waiting(self):
+        self.clear()
+        new = self.conflict_merge(resolved=self.RESOLVED.replace("TWO", "TWO!"))
+        self.confirm(new)
+        self.assertGreater(self.hold(new), 0)
+        self.assertEqual(self.events("gate.clear_carried"), [])
+        state = self.held_state()
+        self.assertIn(self.PR, state["carry_void"])
+        self.assertIn("differs", state["carry_void"][self.PR]["reason"])
+        gets = self.api_gets
+        self.hold(new)
+        self.assertEqual(self.api_gets, gets, "a void is decided once per head")
 
 
 class TestHeadlessPresence(Base):
@@ -27583,6 +28199,14 @@ class TestCaptainSweepFindings(TestSweep):
         self.sweep()
         self.assertEqual(self.found(), [("S6a", "acme/api#40"), ("S6b", "acme/api#41"), ("S6b", "acme/api#42")])
 
+    def test_815_a_re_hold_at_this_head_is_not_a_disagreement_and_only_a_re_hold_is_exempt(self):
+        captain = self.USER.replace("awaiting-user", "merge-captain")
+        self.hub.open = {42: sweep_issue(42, "MERGE: automatic\nx", [captain], pr=True), 45: sweep_issue(45, "MERGE: automatic\nx", [captain], pr=True)}
+        sb.write_impact_state(self.engine.state_dir, {"clears": {}, "applied": {"acme/api#42": {"head": "a" * 40, "added": [], "at": 1, "rehold": True}, "acme/api#45": {"head": "b" * 40, "added": [], "at": 1}}})
+        self.sweep()
+        self.sweep()
+        self.assertEqual(self.found(), [("S6b", "acme/api#45")], "a plain disagreement is still said; a re-hold's is not")
+
     def test_s6b_a_recorded_clear_at_the_current_head_makes_the_leftover_author_label_agree_with_an_automatic_line(self):
         captain = self.USER.replace("awaiting-user", "merge-captain")
         head, other = "a" * 40, "b" * 40
@@ -33521,6 +34145,18 @@ class TestImpactClassAndNarrowForm(LedgerBase):
         code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-action", action, *more)
         return code, out, err
 
+    def test_815_confirms_carry_is_stored_with_an_approve_and_refused_otherwise(self):
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "code", "--verdict", "approve", "--confirms-carry")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([e.get("carry_confirmed") for e in self.ledger() if e["kind"] == "review_record"], [True])
+        for verdict, extra in (("request-changes", ("--blocks", "1")), ("comment", ()), ("incomplete", ())):
+            code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "code", "--verdict", verdict, "--confirms-carry", *extra)
+            self.assertEqual(code, 2, verdict)
+            self.assertIn("belongs to an approve", err)
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "code", "--verdict", "approve")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([e.get("carry_confirmed") for e in self.ledger() if e["kind"] == "review_record"], [True, None], "no flag: nothing stored, as before")
+
     # -- S1: the record
 
     def test_s1_the_record_keeps_its_class_refuses_a_bad_one_and_may_have_none(self):
@@ -33835,7 +34471,8 @@ class TestBlockTable(LedgerBase):
         return self.run_as("coder", "review", "record", self.PR, "--reviewer", reviewer, "--block", self.block(extra, "impact-action: none\n" if reviewer == "impact" else ""), *more)
 
     ROW_FLAGS = {"--verdict": ("approve",), "--head": (LEDGER_HEAD,), "--blocks": ("1",), "--notes": ("1",), "--impact-action": ("none",),
-                 "--impact-class": ("data",), "--impact-severity": ("Marginal",), "--impact-probability": ("Remote",), "--impact-reason": ("a reason",), "--summary": ("one line",)}
+                 "--impact-class": ("data",), "--impact-severity": ("Marginal",), "--impact-probability": ("Remote",), "--impact-reason": ("a reason",), "--summary": ("one line",),
+                 "--confirms-carry": ()}   # (#815) a flag with no value: stored as True
 
     def test_the_table_has_every_record_flag_once(self):
         parser = sb.build_parser()
@@ -33864,7 +34501,7 @@ class TestBlockTable(LedgerBase):
                     self.assertEqual(code, 0, err)
                     self.assertEqual(len(self.records()), before + 1)
                     if flag != "--summary":
-                        self.assertEqual(self.records()[-1][dest], self.ROW_FLAGS[flag][0])
+                        self.assertEqual(self.records()[-1].get("carry_confirmed" if dest == "confirms_carry" else dest), (self.ROW_FLAGS[flag] or (True,))[0])
         code, out, err = self.record("--blocks", "0", "--notes", "0")
         self.assertEqual(code, 0, err)   # 0 is the default: cannot be told from absent
 
@@ -34468,7 +35105,9 @@ class TestImpactRejudge(LedgerBase):
         if expected:
             self.assertIn(label, record["added"], "an adopted label is in the record a daemon-added label is kept in")
             self.assertEqual(record["merge_label_added"], self.names["merge-captain"] in record["added"])
-            self.assertEqual(sorted(record), ["added", "at", "head", "merge_label_added"], "the record keeps its shape")
+            rehold = case == "hand_rehold_wants_it"   # (#815) the record carries `rehold: True` ONLY when the pass was a re-hold (the sweep reads it); an adoption of any other case does not
+            self.assertEqual(sorted(record), ["added", "at", "head", "merge_label_added"] + (["rehold"] if rehold else []), "the record keeps its shape")
+            self.assertEqual(record.get("rehold"), True if rehold else None, "the re-hold mark is written for a re-hold and for nothing else")
         elif case in ("not_holds_by_hand", "cleared_this_head", "cleared_other_head_rated_here"):
             self.assertIsNone(record if case != "cleared_this_head" else None, "nothing was written")
         if case in ("hand_floor_holds", "cleared_other_head_floor_holds") and not wanted_by_floor:
@@ -36388,7 +37027,7 @@ class TestImpactHold(LedgerBase):
     # ---- #835 round 4: the rating's inputs are immune to the shared parser (a registrar's defaults, a replaced parser, a wrapper), at the point of use
 
     RATING_FLAGS = ("--reviewer", "impact", "--verdict", "approve")
-    HOSTILE_DEFAULTS = {"impact_severity": "Negligible", "impact_probability": "Improbable", "impact_reason": "floor-authority", "impact_action": "none", "impact_class": "data", "block": "/nonexistent/block.txt"}
+    HOSTILE_DEFAULTS = {"impact_severity": "Negligible", "impact_probability": "Improbable", "impact_reason": "floor-authority", "impact_action": "none", "impact_class": "data", "block": "/nonexistent/block.txt", "confirms_carry": True}
 
     def record_run(self, flags=(), registrars=(), argv=None):
         """Run the REAL `review record` as the reviewer role with hostile registrars injected into the module's globals before the real `build_parser()` runs. (code, stderr, the entry written without its chain fields or None)."""
@@ -36510,9 +37149,51 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(args.impact_severity, "Critical", "the shared namespace does carry the value")
         os.environ["HERDR_PANE_ID"] = self.world.panes["rev"]
         with captured() as (o, e), mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: self.terminal_problem):
+            self.assertEqual(sb.cmd_review(args, self.route, self.world.clock.now), 2, "no raw argv: no reviewer and no verdict are read, so nothing is recorded (fail closed)")
+            self.assertIn("--reviewer must be one of", e.getvalue())
+        self.assertEqual([x for x in sb.plan_ledger.read_ledger(self.world.state)[0] if x["kind"] == "review_record"], [])
+        args.raw_argv = ("review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve")   # a raw argv with no rating on it: the namespace's values are still not read
+        with captured() as (o, e), mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: self.terminal_problem):
             self.assertEqual(sb.cmd_review(args, self.route, self.world.clock.now), 0, e.getvalue())
         entry = [x for x in sb.plan_ledger.read_ledger(self.world.state)[0] if x["kind"] == "review_record"][-1]
         self.assertEqual([k for k in entry if k.startswith("impact_")], [], "no rating, never one from the namespace")
+
+    def test_815_every_input_of_review_record_is_classified_from_the_parser_and_the_code(self):
+        """The class: every input `review record` takes is either read ONLY from the raw argv (PRIVATE_INPUTS: it can change what the clear, the carry or the score reads) or listed with the reason it cannot
+        (REVIEW_RECORD_PUBLIC_INPUTS). Derived from the real parser and from the code, so a flag added later fails here until it is classified."""
+        import ast
+        parser = sb.build_parser()
+        (top,) = [a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction"]
+        record = top.choices["review"]._subparsers._group_actions[0].choices["record"]
+        dests = {a.dest for a in record._actions if a.dest != "help"}
+        private, public = set(sb.PRIVATE_INPUTS), set(sb.REVIEW_RECORD_PUBLIC_INPUTS)
+        self.assertEqual(sorted(dests - private - public), [], "an input of `review record` nobody classified")
+        self.assertEqual(sorted((private | public) - dests - {"review_cmd"}), [], "a classified input the parser does not take")
+        self.assertEqual(private & public, set(), "an input is private or public, never both")
+        self.assertTrue(all(isinstance(r, str) and len(r) > 20 for r in sb.REVIEW_RECORD_PUBLIC_INPUTS.values()), "every public input carries its reason")
+        self.assertTrue({"reviewer", "verdict", "confirms_carry", "block"} <= private)
+        node = next(n for n in ast.parse(self.real_source()).body if isinstance(n, ast.FunctionDef) and n.name == "cmd_review")
+        read = {x.attr for x in ast.walk(node) if isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "args"}
+        self.assertEqual(sorted(read - public - {"raw_argv"}), [], "cmd_review reads an input from the shared namespace that is not listed as public")
+        parsed = sb.record_inputs(("review", "record", "acme/app#9", "--reviewer", "code", "--verdict", "approve", "--confirms-carry"))
+        self.assertEqual(parsed, {"reviewer": "code", "verdict": "approve", "confirms_carry": True})
+        self.assertEqual(sb.record_inputs(("review", "record", "acme/app#9", "--reviewer", "code")), {"reviewer": "code"}, "an absent flag is absent")
+        self.assertEqual(sb.record_inputs(("--confirms-car",)), {}, "no abbreviation")
+        self.assertEqual((sb.record_inputs(None), sb.record_inputs(("a", 3))), ({}, {}), "no raw argv: nothing")
+
+    def test_815_a_hostile_default_for_the_verdict_or_the_confirmation_records_nothing(self):
+        self.record_pr_setup()
+        def registrar(sub):
+            record = sub.choices["review"]._subparsers._group_actions[0].choices["record"]
+            record.set_defaults(verdict="approve", confirms_carry=True)
+        code, err, entry = self.record_run(argv=["review", "record", self.PR, "--reviewer", "code"], registrars=[("add_zzz_parsers", registrar)])
+        self.assertEqual((code, entry), (2, None), err)
+        self.assertIn("--verdict must be one of", err)
+        code, err, entry = self.record_run(argv=["review", "record", self.PR, "--reviewer", "code", "--verdict", "approve"], registrars=[("add_zzz_parsers", registrar)])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("carry_confirmed", entry, "an approve with no flag on the command line is never a confirmation, whatever the shared namespace says")
+        code, err, entry = self.record_run(argv=["review", "record", self.PR, "--reviewer", "code", "--verdict", "approve", "--confirms-carry"], registrars=[("add_zzz_parsers", registrar)])
+        self.assertEqual((code, entry["carry_confirmed"], "by_role" in entry), (0, True, True), err)
 
     def test_the_private_parser_reads_the_edge_cases_of_a_command_line_as_the_shared_parser_does(self):
         base = ["review", "record", "acme/app#9", "--reviewer", "impact", "--verdict", "approve"]
@@ -36549,7 +37230,7 @@ class TestImpactHold(LedgerBase):
         daemon = ast.parse(self.real_source())
         for name in ("cmd_review", "parse_review_block"):
             node = next(n for n in daemon.body if isinstance(n, ast.FunctionDef) and n.name == name)
-            reads = sorted({"args.%s" % x.attr for x in ast.walk(node) if isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "args" and x.attr in sb.RATING_INPUTS}
+            reads = sorted({"args.%s" % x.attr for x in ast.walk(node) if isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "args" and x.attr in sb.PRIVATE_INPUTS}
                            | {"getattr(args, ...)" for x in ast.walk(node) if isinstance(x, ast.Call) and getattr(x.func, "id", "") == "getattr" and x.args and isinstance(x.args[0], ast.Name) and x.args[0].id == "args"
                               and not (len(x.args) > 1 and isinstance(x.args[1], ast.Constant) and x.args[1].value == "raw_argv")}
                            | {"setattr(args, ...)" for x in ast.walk(node) if isinstance(x, ast.Call) and getattr(x.func, "id", "") == "setattr"})
