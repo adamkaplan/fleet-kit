@@ -135,9 +135,11 @@ runs the vault access check once and reads the vault once more. Any other vault 
 unreachable) is not retried and runs nothing. The check belongs to its owner and is run unchanged: it adds at most one single-address rule,
 only this machine's own address, and never removes or widens a rule. `launch` gives it no address and no option.
 
-Set `CW_VAULT_CHECK_DIR` to the checkout the owner of the vault access check provides. It must be an absolute path to a directory that is
-not a symlink, is owned by you and is not group- or world-writable, and holds the check's module as a regular file (the same holds for
-the module's own folders). A missing key or a bad path refuses the launch (exit status 2), names `CW_VAULT_CHECK_DIR` and runs nothing; an unset key
+Set `CW_VAULT_CHECK_DIR` to the checkout the owner of the vault access check provides. Because `python3 -m` loads anything under the checkout,
+**every entry** of it is judged without following links: each directory and file (every `__init__.py` too) must be owned by you, not
+group- or world-writable and not a symlink (the top-level `.git` directory is not walked). The module must be a regular file, and
+**every parent** of the checkout up to `/` must be a real directory owned by root or you and not group- or world-writable (a sticky one is fine). The lock file's parents get the same check.
+A missing key or a bad path refuses the launch (exit status 2), names `CW_VAULT_CHECK_DIR` and runs nothing; an unset key
 does not matter while the vault already answers. The check runs from that checkout as you, with a cleaned environment (a fixed `PATH`, no `PYTHON*` and none of your variables, your `az` sign-in found as for the preflight) and
 a limit of 300 seconds. Its `HOME` is your real home taken from the password database, never from the `HOME` variable, so the check's own log line goes under your home as its owner expects (ask its owner for the exact file); `TMPDIR` is a private directory removed afterwards.
 

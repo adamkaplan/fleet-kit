@@ -1480,7 +1480,7 @@ def note(kind):
 note("start")
 if cfg.get("grandchild"):
     import subprocess
-    sub = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])   # keeps the check's stdout open
+    sub = subprocess.Popen([sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"])   # keeps the check's stdout open
     with open(str(root / "grandchild.pid"), "w") as f:
         f.write(str(sub.pid))
 time.sleep(cfg.get("sleep", 0))
@@ -1791,6 +1791,19 @@ class TestVaultCheckPath(VaultBase):
                               (mk(stat.S_IFREG | 0o646), "writable")):
             self.assertIn(reason, self.lib._entry_problem(found, "an entry"))
         self.assertIsNone(self.lib._entry_problem(mk(stat.S_IFREG | 0o644), "an entry"))
+
+    def test_each_parent_branch_has_its_own_reason(self):
+        for label, mode, reason in (("link", "link", "symlink"), ("group", 0o775, "writable"), ("world", 0o777, "writable")):
+            nest = self.home / ("p-" + label)
+            real = self.home / ("r-" + label)
+            real.mkdir()
+            (real / "c").mkdir()
+            if mode == "link":
+                os.symlink(str(real), str(nest))
+            else:
+                real.chmod(mode)
+                nest = real
+            self.assertIn(reason, self.lib.parents_problem(str(nest / "c" / "x")), label)
 
     def test_a_sticky_parent_is_accepted_and_one_owned_by_another_user_is_not(self):
         sticky = self.home / "sticky"
