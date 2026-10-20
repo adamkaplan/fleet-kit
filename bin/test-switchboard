@@ -8890,6 +8890,23 @@ class TestAgentRegistryInventory(unittest.TestCase):
                 with self.subTest(path=str(path.relative_to(REPO))):
                     self.assertIn((str(path.relative_to(REPO)), "pane-health.json"), table)
 
+    @staticmethod
+    def rows_without_the_record(pairs, root=None):
+        """Rows whose file never touches their record (a made-up row)."""
+        root = Path(root or REPO)
+        return sorted((f, r) for f, r in pairs if r in TestAgentRegistryInventory.RECORDS and not re.search(TestAgentRegistryInventory.RECORDS[r], (root / f).read_text(errors="replace")))
+
+    def test_every_row_names_a_record_its_file_touches(self):
+        self.assertEqual(self.rows_without_the_record(self.in_table(self.DOC.read_text())), [])
+
+    def test_a_made_up_row_is_found(self):
+        root = Path(tempfile.mkdtemp(prefix="registry-rows-"))
+        self.addCleanup(shutil.rmtree, str(root), True)
+        (root / "a.py").write_text("print('nothing here')\n")
+        (root / "b.py").write_text("open('pane-health.json')\n")
+        found = self.rows_without_the_record({("a.py", "pane-health.json"), ("b.py", "pane-health.json")}, root)
+        self.assertEqual(found, [("a.py", "pane-health.json")])
+
     def test_every_cited_file_exists(self):
         for path, record in self.in_table(self.DOC.read_text()):
             with self.subTest(path=path, record=record):

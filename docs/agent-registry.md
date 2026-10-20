@@ -83,9 +83,11 @@ Each call takes the lock, reads, changes, and writes by the atomic rule below, i
 - `registry.unretire(state_dir, name)`: the reverse (`retire --undo`).
 - `registry.close(state_dir, name, by, reason)`: the pane is closed on purpose; as `retire`, with `reason` recorded.
 - `registry.reconcile_remove(state_dir, name, evidence, whole)`: removes a dead agent. The registry ITSELF checks the evidence (the agent's recorded state and what the live read lacked: pane, process), not only the caller's `whole` flag; it refuses (`changed: false`) when `whole` is not true or when the evidence does not show the agent dead. It appends an audit line carrying that evidence. A test calls it with `whole=True` for a live agent and requires the refusal.
-- `registry.upsert(state_dir, name, agent)`: discovery's and launch's way to add or update an agent. NO CHURN: when nothing changed it writes nothing and returns `changed: false`. An audit line is written only on add, remove, retire and close, never on a no-op.
+- `registry.upsert(state_dir, name, agent)`: discovery's and launch's way to add or update an agent. NO CHURN: when nothing changed it writes nothing and returns `changed: false`. An agent retired for the same session is refused (`changed: false`, with a problem). An audit line is written on add, remove, retire and close, and on a REFUSED removal (`reconcile_refused`, with the evidence and the reason, both when the read was not whole and when the evidence does not show the agent dead); never on a no-op. v1.1 note (additive): refusals of a removal are audited too.
 - The #870 rule: a retired record with no `session` covers nothing. The fields of a pruned pane record come from `retired[name].record`, for `unretire`, `known_agent`, `reattach` and the cloud log read (slice 2 pins each by a test).
 - Cloud workers are agents: a record carries `"kind": "cloud"` and the `run_id` the launcher already keeps (`state/cloud/<name>.json`). Views list them like any agent. `retire`, `close` and `reconcile_remove` work on them as on a local agent, the registry change in one step, and the stop of the pod stays the cloud launcher's act. The cloud launcher and reaper are WRITERS (they `upsert` and `retire`); the cloud log read is a READER.
+
+- Retention and audit file: retired entries older than 4 weeks (`RETIRED_KEEP_SECONDS`) are pruned on a write. Audit lines go to `registry-audit.jsonl` in the state directory.
 
 ### 3. The file
 
@@ -104,7 +106,7 @@ role, charter, repo, workspace, cwd).
 ### 4. The lock
 
 An exclusive `flock` on `registry.lock` beside the file, held for the whole read-change-write of a write call. Readers take no lock: they
-rely on the atomic write. LOCK ORDER: the registry lock first, then the boss-record lock (`boss-overrides`), never the reverse.
+rely on the atomic write. The lock is waited for up to 5 seconds (`LOCK_SECONDS`); a timeout is returned as a problem (`changed: false`), not raised. LOCK ORDER: the registry lock first, then the boss-record lock (`boss-overrides`), never the reverse.
 
 ### 5. The atomic write
 
