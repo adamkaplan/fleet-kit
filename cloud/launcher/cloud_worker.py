@@ -88,7 +88,7 @@ def _stack_shape_differs(pod):
 # dnsPolicy/dnsConfig, priorityClassName, hostname, an init or ephemeral container, a hostPort... are refused until a deliberate edit
 # here (and to the frozen fixture tests/fixtures/stack_pod.json) allows them.
 STACK_METADATA_KEYS = {"name", "labels", "annotations"}
-STACK_SPEC_KEYS = {"restartPolicy", "serviceAccountName", "automountServiceAccountToken", "securityContext", "containers", "volumes",
+STACK_SPEC_KEYS = {"restartPolicy", "activeDeadlineSeconds", "serviceAccountName", "automountServiceAccountToken", "securityContext", "containers", "volumes",
                    "imagePullSecrets", "runtimeClassName", "hostUsers", "nodeSelector"}
 STACK_CONTAINER_KEYS = {"name", "image", "securityContext", "env", "resources", "readinessProbe", "volumeMounts"}
 STACK_VOLUMES = {"tokens": {"name": "tokens", "emptyDir": {"medium": "Memory"}}, "scratch": {"name": "scratch", "emptyDir": {}}}
@@ -139,6 +139,11 @@ FORBIDDEN_POD_FIELDS = {
 def forbidden_pod_fields(pod):
     return [name for name, has in FORBIDDEN_POD_FIELDS.items() if has(pod)]
 DEFAULT_MAX_HARD = "8h"  # OPEN in the contract: value
+# The cluster-side floor: every pod carries spec.activeDeadlineSeconds = the --max-hard cap + this grace, so the kubelet
+# ends a pod even when no reaper runs. The cap, not the current hard deadline: Kubernetes lets that field be lowered on
+# a running pod but never raised, so a value at the initial hard limit would make `extend` (within the cap) a lie. The
+# grace lets the reaper (which writes the run record and runs the end hook) normally act first.
+POD_DEADLINE_GRACE_SECONDS = 300
 DEFAULT_SPEND_CAP_USD = 25.0  # the prototype's cap; applies when CW_CLOUD_SPEND_CAP_USD is unset or empty
 LABEL = "cw-worker"
 REPORT_PATH = "/home/worker/report"  # the worker's final one-line report, written here inside the pod (the image's workdir)
@@ -660,6 +665,11 @@ def read_run_secret_values(fds):
     return values
 
 
+def pod_deadline_floor(max_hard):
+    """The pod's own activeDeadlineSeconds: the cap (a duration text, never empty) plus the grace; always finite."""
+    return parse_duration(max_hard or DEFAULT_MAX_HARD) + POD_DEADLINE_GRACE_SECONDS
+
+
 def render_pod(a, worker, name, now, hard, env, run_names=()):
     image = a.image or env.get("CW_CLOUD_IMAGE")
     if not image:
@@ -684,9 +694,10 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
         "name": name, "labels": {"app": LABEL, "cw/worker": worker, "azure.workload.identity/use": "true"},
         "annotations": {"cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
                         "cw/idle-seconds": e["CW_IDLE_SECONDS"], "cw/shape": a.shape,
-                        "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard))),
+                        "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard or DEFAULT_MAX_HARD))),
                         **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {})}},
-        "spec": {"restartPolicy": "Never", "serviceAccountName": env.get("CW_CLOUD_SERVICE_ACCOUNT", "cw-worker"),
+        "spec": {"restartPolicy": "Never", "activeDeadlineSeconds": pod_deadline_floor(a.max_hard),
+                 "serviceAccountName": env.get("CW_CLOUD_SERVICE_ACCOUNT", "cw-worker"),
                   "automountServiceAccountToken": False,
                   "securityContext": copy.deepcopy(POD_SECURITY_CONTEXT),
                  "containers": [{"name": "worker", "image": image,

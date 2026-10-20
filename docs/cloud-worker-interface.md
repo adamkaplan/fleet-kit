@@ -14,7 +14,7 @@ One program, `cloud-worker <command>`; every command takes `--json` (one JSON ob
 |---|---|---|---|
 | `create <worker>` | `--repo OWNER/NAME`, `--branch B`, `--idle 10m` (default), `--hard 2h` (default), `--shape S\|M`, `--stack` | the endpoint record (section 3) plus `runtime_id` | starts one pod from the image with the environment of section 2; returns only once the worker answers |
 | `stop <worker>` | `--reason TEXT`; `--run-id NONCE`; `--record-dir DIR`; `--no-record` | `{worker, runtime_id, pushed, wip_branch, skipped, record}` | first writes the run record (below), then runs the end hook (section 5), then rewrites the record's `run.json` once with the hook's result (`end_hook`: `ran`, `pushed`, `wip_branch`, `skipped`, `note`, `error`), then deletes the pod and its scratch volume. `record` is the record directory, `""` when none could be made |
-| `extend <worker>` | `--hard +1h` or an ISO time; `--idle 30m` | the new deadlines | moves the deadlines; never past `--max-hard` (default 8h, **OPEN**: value) |
+| `extend <worker>` | `--hard +1h` or an ISO time; `--idle 30m` | the new deadlines | moves the deadlines; never past `--max-hard` (default 8h, **OPEN**: value); the pod itself carries a cluster-side floor at that cap (section 6) |
 | `delete <worker>` | `--force` | `{worker, runtime_id, deleted}` | removes the pod and its leftovers without the end hook; refused unless the hook ran or `--force` is given; used by the reaper after a kept pod is resolved |
 | `report <worker>` | none (`--json` for an object) | one line: the worker's report | read only; `kubectl exec <pod> -- head -c ... /home/worker/report`, scrubbed, one line, at most 2000 characters; exit `3` with `no report yet` when the file is missing or empty. Nothing of the switchboard is in the pod |
 | `prune-records` | `--days N` (default `$CW_RECORD_KEEP_DAYS`, else `30`); `--record-dir DIR` | `{root, days, removed}` | removes this tool's per-run record directories older than N days; nothing else (see the run record) |
@@ -111,6 +111,13 @@ A clean tree whose HEAD is already pushed pushes nothing and reports `pushed: fa
   A worker mid-task (a long build, a waiting model call) is not idle. The reaper reads this from the worker's own session state.
 - **Hard limit** = `CW_HARD_DEADLINE`, absolute. At the deadline the end hook runs and the pod is stopped,
   whatever the activity. `extend` is the only way to move it; the reaper re-reads the record at each pass.
+- **Cluster-side floor.** Every pod the launcher builds (shapes S and M alike) sets `spec.activeDeadlineSeconds` to the
+  `--max-hard` cap plus `POD_DEADLINE_GRACE_SECONDS` (300 s; the cap's default is 8h, so always finite). The kubelet then ends
+  the pod even when no reaper runs. It is the cap, not the current hard limit, because Kubernetes lets that field be lowered
+  on a running pod but never raised: a value at the initial hard limit would make `extend` within the cap impossible. The grace
+  lets the reaper, which writes the run record and runs the end hook, normally act first. A pod the floor ends has phase
+  `Failed` and reason `DeadlineExceeded`: no hook runs and unpushed work is lost, so the floor is a last resort. `stop` and the
+  reaper treat a `Failed` pod as already ended and delete it and its Secrets (the run record is still written first).
 - Both stops are checked at least every minute and take effect within 3 minutes of the limit (plan scenarios S2, S3).
 - **OPEN**: how a worker asks for its own extension (a command inside the pod, or only an operator).
 
