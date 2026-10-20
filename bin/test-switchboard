@@ -68752,7 +68752,7 @@ class TestAdoption(LanesCase):
         for label, record in (("no session", {"at": 1, "by": "x", "reason": "r", "session": None}), ("another session", {"at": 1, "by": "x", "reason": "r", "session": "ses_old"}),
                               ("an empty session", {"at": 1, "by": "x", "reason": "r", "session": ""})):
             with self.subTest(label):
-                sb._write_small(self.world.state, sb.RETIRED_FILE, {"orch-a": record})
+                self.put_retired("orch-a", record)
                 self.daemon_pass()
                 self.assertEqual(self.boss("w1"), "orch-a", "orch-a is live: nothing to fill")
                 self.assertEqual([r for r in self.rows() if r["detail"]["worker"] == "w1"], [])
