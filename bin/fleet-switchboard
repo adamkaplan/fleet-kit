@@ -25280,7 +25280,7 @@ def default_installed_agents_dir():
 
 
 def stale_installed_agents(installed_dir, expected=None, root=None):
-    """[(name, path)] of the agents whose installed file has a body that is not the kit's (the model line is not compared). An agent with no installed file, or no kit file, is not listed."""
+    """[(name, path)] of the agents whose installed file has a body that is not the kit's (the model line is not compared). An agent with no installed file, or no kit file, is not listed; an installed file that is there but cannot be read is."""
     out = []
     if installed_dir is None:
         return out
@@ -25288,11 +25288,14 @@ def stale_installed_agents(installed_dir, expected=None, root=None):
         found = agent_definition(name, root)
         if found is None:
             continue
+        installed = Path(installed_dir) / (name + ".md")
         try:
             kit = agent_body(Path(found[2]).read_text())
-            installed = Path(installed_dir) / (name + ".md")
             current = agent_body(installed.read_text())
+        except FileNotFoundError:
+            continue   # nothing installed under that name: nothing to compare
         except (OSError, ValueError):
+            out.append((name, str(installed)))   # present but unreadable: said as out of date, never passed over
             continue
         if kit != current:
             out.append((name, str(installed)))

@@ -64052,14 +64052,14 @@ class TestStructuralRuleInReviewing(unittest.TestCase):
             self.assertIn(word, example)
 
     def test_the_rule_is_in_the_body_never_in_the_front_matter_of_a_definition(self):
+        done = subprocess.run(["git", "merge-base", "HEAD", "origin/integration"], cwd=str(REPO), capture_output=True, text=True)
+        if done.returncode != 0:
+            self.skipTest("no origin/integration here to compare the front matter with (a shallow clone): the front matter is not compared")
         for path in sorted((REPO / "agents" / "reviewers").glob("*.md")):
             with self.subTest(definition=path.name):
                 front, body = path.read_text().split("\n---\n", 1)
                 self.assertNotIn("decides from text", front)
                 self.assertIn(STRUCTURAL_RULE, " ".join(body.split()))
-                done = subprocess.run(["git", "merge-base", "HEAD", "origin/integration"], cwd=str(REPO), capture_output=True, text=True)
-                if done.returncode != 0:
-                    continue   # no base to compare with here (a shallow clone): the checks above still hold
                 base = subprocess.run(["git", "show", "%s:agents/reviewers/%s" % (done.stdout.strip(), path.name)], cwd=str(REPO), capture_output=True, text=True)
                 if base.returncode == 0:   # a definition that is new since the base has nothing to compare with
                     self.assertEqual(front, base.stdout.split("\n---\n", 1)[0], "the front matter (permissions, mode, steps, model) is as it was at the base")
@@ -64094,6 +64094,16 @@ class TestStructuralRuleInReviewing(unittest.TestCase):
             sb.install_agents(root, model="acme-llm/other-model")
             code, out = self.verify(Path(root) / "agents")
             self.assertEqual(code, 0, out)
+
+    def test_an_installed_file_that_cannot_be_read_is_said_not_passed_over(self):
+        with tempfile.TemporaryDirectory() as root:
+            sb.install_agents(root)
+            installed = Path(root) / "agents" / "coder.md"
+            installed.unlink()
+            installed.mkdir()   # there, but not a file that can be read
+            code, out = self.verify(Path(root) / "agents")
+            self.assertEqual(code, 1)
+            self.assertIn("FAIL  coder: out of date", out)
 
     def test_an_agent_with_no_installed_file_is_not_called_out_of_date(self):
         with tempfile.TemporaryDirectory() as root:
