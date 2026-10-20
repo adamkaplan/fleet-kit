@@ -74241,12 +74241,12 @@ OLD_SOURCE_ALLOWED = {
     ("bin/fleet-switchboard", "pane_health_pass", "pane-health.json"): "2026-12-20, last slice of #903 (slice 2 owns it): the pane pass writes the derived file",
     ("bin/fleet-switchboard", "pane_health_pass", "read_pane_health"): "2026-12-20, last slice of #903 (slice 2 owns it): the pane pass reads the pane states it wrote (derived)",
 }
-# Live observers: they ask herdr which panes exist right now (`agent list`). Each is a NAMED entry with its reason, never a silent skip. fleet-heartbeat is
-# a dated, PENDING entry (the Chief of Staff decided: no standing exception); the other two are the live source the registry is fed from.
+# Live observers: the call sites that ask herdr which panes exist right now (`"agent", "list"`), keyed by (file, function), each a NAMED entry with its reason,
+# never a silent skip. fleet-heartbeat is DATED (the Chief of Staff's choice: remove by 2026-11-03); the other two are the live source the registry is fed from.
 LIVE_OBSERVERS = {
-    "fleet-heartbeat": "2026-11-03, remove by (cos): live-pane observation (bell filter); identity from the registry; the bell moves into the registry in #973",
-    "fleet-switchboard": "discovery and the pane check: the live source the registry is fed from (herdr and the v2 service), not a record of who exists",
-    "proof-switchboard": "the proof harness finds the pane of one session in a lab; it keeps no list",
+    ("bin/fleet-heartbeat", "tabs_with_agents"): "2026-11-03, remove by (cos): live-pane observation (bell filter); identity from the registry; the bell moves into the registry in #973",
+    ("bin/fleet-switchboard", "agent_list"): "discovery's own herdr client: the live source the registry is fed from (herdr and the v2 service), not a record of who exists",
+    ("bin/proof-switchboard", "pane_of_session"): "the proof harness finds the pane of one session in a lab; it keeps no list",
 }
 # Views that read an old file from outside Python, from their own installed copy: derived output of the registry until the last slice (docs/agent-registry.md).
 DERIVED_VIEWS = {"plugins/fleet-decisions-tui/health.mjs": "pane-health.json"}
@@ -74564,20 +74564,153 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
     def test_a_live_read_of_herdr_agents_is_a_named_exception_with_its_reason(self):
         found = set()
         for path in sorted(BIN.iterdir()):
-            if path.is_file() and not path.name.startswith("test") and path.name != "registry.py":
-                try:
-                    if re.search(r"\"agent\",\s*\"list\"", path.read_text()):
-                        found.add(path.name)
-                except (OSError, UnicodeError):
-                    pass
+            if not path.is_file() or path.name.startswith("test") or path.name == "registry.py":
+                continue
+            try:
+                tree = ast.parse(path.read_text())
+            except (OSError, UnicodeError, SyntaxError):
+                continue
+            for fn in ast.walk(tree):
+                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for call in ast.walk(fn):
+                        if isinstance(call, ast.Call):
+                            parts = [a.value for a in call.args if isinstance(a, ast.Constant)]
+                            if any(parts[i:i + 2] == ["agent", "list"] for i in range(len(parts))):
+                                found.add(("bin/" + path.name, fn.name))
         self.assertEqual(found - set(LIVE_OBSERVERS), set(), "a new reader of the live agent list: read the registry, or name it in LIVE_OBSERVERS with a reason")
         self.assertEqual(set(LIVE_OBSERVERS) - found, set(), "an entry of LIVE_OBSERVERS no longer reads the live list: remove it")
-        for name, reason in LIVE_OBSERVERS.items():
-            self.assertGreater(len(reason), 40, name)
-        dated = {n: r for n, r in LIVE_OBSERVERS.items() if re.match(r"\d{4}-\d{2}-\d{2}\b", r)}
-        self.assertIn("fleet-heartbeat", dated, "the heartbeat is a DATED entry, never a standing one")
-        for name, reason in dated.items():
-            self.assertGreaterEqual(reason[:10], _dt.date.today().isoformat(), "%s is past its remove-by date" % name)
+        for key, reason in LIVE_OBSERVERS.items():
+            self.assertGreater(len(reason), 40, key)
+        dated = {k: r for k, r in LIVE_OBSERVERS.items() if re.match(r"\d{4}-\d{2}-\d{2}\b", r)}
+        self.assertEqual(set(dated), {("bin/fleet-heartbeat", "tabs_with_agents")}, "the heartbeat is a DATED entry, never a standing one")
+        for key, reason in dated.items():
+            self.assertGreaterEqual(reason[:10], _dt.date.today().isoformat(), "%s is past its remove-by date" % (key,))
+
+    def test_the_scan_catches_every_way_a_new_view_can_name_an_old_source(self):
+        cases = {
+            "a function": ("def a_view(s):\n    return read_pane_health(s)\n", [("a_view", "read_pane_health")]),
+            "an alias": ("from m import read_pane_health as rr\n\ndef v(s):\n    return rr(s)\n", [("<module>", "read_pane_health"), ("v", "read_pane_health")]),
+            "a concatenation": ("def v(s):\n    return open('pane-' + 'health.json').read()\n", [("v", "pane-health.json")]),
+            "a file name": ("def v(s):\n    return open(s + '/retired.json').read()\n", [("v", "retired.json")]),
+            "not python": ("cat $STATE/pane-health.json\n", [("<text>", "pane-health.json")]),
+            "a join": ("def v(s):\n    return open('-'.join(['pane', 'health']) + '.json')\n", [("v", "pane-health.json")]),
+            "a join of the whole name": ("def v(s):\n    return open('.'.join(['retired', 'json']))\n", [("v", "retired.json")]),
+            "an f-string": ("def v(s):\n    return open(f'{s}/retired.json')\n", [("v", "retired.json")]),
+            "a format": ("def v(s):\n    return open('%s/pane-health.json' % s)\n", [("v", "pane-health.json")]),
+            "a chain with a variable": ("def v(s):\n    return open(s + '/retired' + '.json')\n", [("v", "retired.json")]),
+            "a clean view": ("def ok(s):\n    return registry_read(s)\n", []),
+        }
+        for label, (text, want) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(old_source_reads("x", text), want)
+        self.assertNotIn("bin/registry.py", [p for p in tracked_files() if scanned(p)])
+        self.assertIn("bin/fleet-switchboard", [p for p in tracked_files() if scanned(p)])
+        self.assertTrue(any(p.startswith("plugins/") and scanned(p) for p in tracked_files()), "the scan reaches subdirectories")
+
+    # Every function that reads the registry through the seam is a view; each has the test that retires an agent (or breaks the registry) and checks that view.
+    # The table is checked against the code: a new caller of the seam with no row fails `test_every_view_that_reads_the_registry_has_its_retire_test`.
+    VIEW_TESTS = {
+        "health_write": ("test_the_health_records_keep_everything_when_the_registry_is_not_whole_or_the_retirement_has_no_session", "health_file_usage"),
+        "pane_health_status_lines": ("test_s2_a_retired_agent_leaves_every_view_at_its_next_read", "pane_health_status_lines"),
+        "decisions_from_reports": ("test_s2_a_retired_agent_leaves_every_view_at_its_next_read", "fresh()"),
+        "load_tick": ("test_a_half_read_registry_alerts_nobody_and_a_retired_orchestrator_has_no_figures", "load_tick"),
+        "_strict_retired": ("test_a_live_boss_whose_retired_record_names_no_session_keeps_its_worker", "retire"),
+        "bare_pane_context": ("test_an_unreadable_input_of_the_context_refuses_the_close", "close-pane"),
+        "cmd_reattach_all": ("test_reattach_all_detached_acts_on_the_registrys_list_and_nothing_on_a_half_read", "cmd_reattach_all"),
+        "worktree_session_in_use": ("test_a_worktree_that_is_the_session_directory_of_a_non_retired_agent_is_kept_though_its_pane_sits_elsewhere", "worktree_in_use"),
+        "cmd_disk_reclaim_worktrees": ("test_the_sweep_is_a_dry_run_by_default_only_considers_retired_agents_and_apply_is_the_operators_or_cos", "reclaim-worktrees"),
+        "watch_problem": ("test_known_session_and_watch_follow_the_registrys_retired_record", "watch_problem"),
+        "cmd_watch": ("test_watch_refuses_a_worker_with_a_terminal_an_unknown_name_and_a_retired_worker_and_opens_nothing", "watch"),
+        "WorkerFacts.seam_facts": ("test_a_retired_worker_gets_nothing_and_another_name_does_not_silence_it", "seam"),
+        "WorkerFacts.stalled_facts": ("test_a_retired_worker_gets_none", "stalled"),
+        "triage_stop": ("test_a_retired_worker_is_not_nudged_nor_reported_as_stopped_and_the_model_is_not_asked", "triage"),
+        "testers_status": ("test_a_corrupt_or_unreadable_retired_file_disables_every_launched_tester_and_says_so", "testers_status"),
+        "launched_testers_for": ("test_a_retired_tester_stops_counting_and_is_not_listed", "verdict"),
+        "item_agents": ("test_item_agents_fails_closed_on_a_half_read_registry", "item_agents"),
+        "known_session": ("test_known_session_and_watch_follow_the_registrys_retired_record", "known_session"),
+        "cmd_retire": ("test_retire_frees_the_name_of_a_headless_worker_and_undo_restores_the_record_unless_the_name_was_taken", "undo"),
+    }
+
+    def registry_callers(self):
+        """Every function (or method) of bin/fleet-switchboard that calls the registry seam, found by the AST."""
+        seam = {"registry_read", "registry_retired", "registry_retired_strict", "read_retired", "read_retired_strict", "registry_agents_strict"}
+        tree = ast.parse((BIN / "fleet-switchboard").read_text())
+        found = set()
+        for node in tree.body:
+            owners = [(node.name, node)] if isinstance(node, ast.FunctionDef) else \
+                     [(node.name + "." + m.name, m) for m in node.body if isinstance(m, ast.FunctionDef)] if isinstance(node, ast.ClassDef) else []
+            for name, fn in owners:
+                if name not in seam and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in seam for c in ast.walk(fn)):
+                    found.add(name)
+        return found
+
+    def test_every_view_that_reads_the_registry_has_its_retire_test(self):
+        callers = self.registry_callers()
+        self.assertEqual(callers - set(self.VIEW_TESTS), set(), "a view reads the registry and has no retire-then-check test in VIEW_TESTS")
+        self.assertEqual(set(self.VIEW_TESTS) - callers, set(), "VIEW_TESTS names a function that no longer reads the registry")
+        text = Path(__file__).read_text() if "__file__" in globals() else (BIN / "test-switchboard").read_text()
+        for view, test in sorted(self.VIEW_TESTS.items()):
+            with self.subTest(view=view):
+                test, token = test
+                found = re.search(r"    def %s\(self.*?(?=\n    def |\nclass |\Z)" % re.escape(test), text, re.S)
+                self.assertIsNotNone(found, "%s names a test that does not exist" % view)
+                self.assertIn(token, found.group(0), "%s: the mapped test %s never reaches the view (it should contain %r)" % (view, test, token))
+
+    def test_a_half_read_registry_alerts_nobody_and_a_retired_orchestrator_has_no_figures(self):
+        state = str(self.world.state)
+        reg = self.registry()
+        engine = types.SimpleNamespace(state_dir=state, now=lambda: time.time(), audit=None, actor="daemon", intents=None,
+                                       config={"load_alert": sb.load_fleet_health().validate({"enabled": True}, "x")})
+        orch = lambda n: types.SimpleNamespace(name=n, session_id="s-" + n, fleet={"role": "orchestrator", "charter": 1, "repo": "acme/widget"}, status="idle")
+        discovery = types.SimpleNamespace(agents={"o-live": orch("o-live"), "o-gone": orch("o-gone")}, problems=[])
+        reg.upsert(state, "o-live", {"session": "s-o-live", "role": "orchestrator"})
+        reg.upsert(state, "o-gone", {"session": "s-o-gone", "role": "orchestrator"})
+        reg.retire(state, "o-gone", "x", "finished", session="s-o-gone")
+        sb.load_tick(engine, discovery)
+        self.assertEqual(set(json.loads((self.world.state / "load.json").read_text())["latest"]), {"o-live"})
+        (self.world.state / "load.json").unlink()
+        (self.world.state / "registry.json").write_text("{not json")   # not whole: the tick does nothing (no figures, no alert) (#805)
+        self.assertEqual(sb.load_tick(engine, discovery), [])
+        self.assertFalse((self.world.state / "load.json").exists())
+
+    def test_reattach_all_detached_acts_on_the_registrys_list_and_nothing_on_a_half_read(self):
+        state = self.world.state
+        reg = self.registry()
+        for name in ("a-1", "a-2", "a-3"):
+            reg.upsert(str(state), name, {"session": "ses_" + name, "pane": "p_" + name, "state": "detached"})
+        reg.retire(str(state), "a-3", "x", "finished", session="ses_a-3")
+        stale = {"agents": {"old-%d" % i: {"session": "ses_old%d" % i} for i in range(16)}, "states": {"old-%d" % i: {"state": "detached", "pane": "p"} for i in range(16)}, "missing": {}}
+        (state / "pane-health.json").write_text(json.dumps(stale))
+        acted = []
+        with mock.patch.object(sb, "cmd_reattach", side_effect=lambda one, *a, **k: acted.append(one.name) or sb.EXIT_OK):
+            code = sb.cmd_reattach_all(types.SimpleNamespace(workspace=None), subprocess.run, self.world.clock.now, None)
+        self.assertEqual((code, sorted(acted)), (sb.EXIT_OK, ["a-1", "a-2"]), "the registry's detached, not retired agents; never the stale file's 16")
+        (state / "registry.json").write_text("{not json")
+        acted.clear()
+        with mock.patch.object(sb, "cmd_reattach", side_effect=lambda one, *a, **k: acted.append(one.name) or sb.EXIT_OK):
+            code = sb.cmd_reattach_all(types.SimpleNamespace(workspace=None), subprocess.run, self.world.clock.now, None)
+        self.assertEqual((code, acted), (sb.EXIT_ERROR, []))
+
+    def test_known_session_and_watch_follow_the_registrys_retired_record(self):
+        state = str(self.world.state)
+        reg = self.registry()
+        reg.upsert(state, "k-1", {"session": "ses_k1", "pane": "p1"})
+        reg.retire(state, "k-1", "x", "finished", session="ses_k1")
+        self.assertEqual(sb.known_session(state, "k-1", None), "ses_k1", "a retired agent's session is found in the registry")
+        reg.upsert(state, "k-2", {"session": "ses_k2", "pane": "p2"})
+        reg.retire(state, "k-2", "x", "finished", session="ses_k2", extra={"headless": {"session": "ses_k2"}})   # a headless worker: no pane record is kept, ONLY the retired record names the session
+        self.assertEqual(sb.known_agent(state, "k-2"), {}, "no pane record")
+        self.assertEqual(sb.known_session(state, "k-2", None), "ses_k2", "the fallback reads the retired record")
+        engine = types.SimpleNamespace()
+        self.assertIn("is retired", sb.watch_problem(engine, state, "k-1", types.SimpleNamespace(agents={})))
+        reg.unretire(state, "k-1")
+        self.assertNotIn("is retired", sb.watch_problem(engine, state, "k-1", types.SimpleNamespace(agents={})) or "")
+
+    def test_item_agents_fails_closed_on_a_half_read_registry(self):
+        (self.world.state / "registry.json").write_text("{not json")
+        ctx = types.SimpleNamespace(engine=types.SimpleNamespace(now=lambda: 1, state_dir=str(self.world.state), discover=lambda now: types.SimpleNamespace(agents={})), repo="acme/api", config={})
+        with self.assertRaises(sb.ItemAgentsUnreadable):
+            sb.item_agents(ctx)
 
     def test_the_sidebar_plugin_is_a_view_of_derived_output_and_is_listed(self):
         for rel, source in DERIVED_VIEWS.items():
