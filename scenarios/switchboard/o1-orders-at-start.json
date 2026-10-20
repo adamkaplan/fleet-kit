@@ -81,13 +81,15 @@
       "name": "once-each",
       "that": "message_count",
       "to": "platform",
-      "count": 1
+      "count": 2,
+      "why": "The orders arrive once (see the delivered expectation); the other message is its note, and the one fact about its coder that stopped without reporting"
     },
     {
       "name": "coder-once",
       "that": "message_count",
       "to": "coder",
-      "count": 1
+      "count": 2,
+      "why": "The orders arrive once (see the delivered expectation); the other message is its note, and the nudge to report: the coder has a boss now (an orphan is adopted by its charter's orchestrator, #838)"
     },
     {
       "name": "no-machine-turn",

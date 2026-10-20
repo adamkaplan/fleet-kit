@@ -2081,7 +2081,8 @@ class FakeHerdr:
         panes = []
         for pane in sorted(self.panes):
             entry = self.panes[pane]
-            panes.append({"pane_id": pane, "cwd": entry.get("cwd") or "/tmp", "foreground_cwd": entry.get("foreground_cwd") or entry.get("cwd") or "/tmp"})
+            panes.append({"pane_id": pane, "cwd": entry.get("cwd") or "/tmp", "foreground_cwd": entry.get("foreground_cwd") or entry.get("cwd") or "/tmp",
+                          **({"revision": entry["revision"]} if "revision" in entry else {})})
         panes.extend(getattr(self, "plain_terminals", []))
         return {"result": {"type": "pane_list", "panes": panes}}
 
@@ -2140,10 +2141,19 @@ class FakeHerdr:
             self.toasts.append({"title": title, "body": (flags.get("--body") or [None])[0], "at": now})
         return {"result": {"type": "notification_show", "shown": reason is None, "reason": reason or "shown"}}
 
+    def _plain(self, pane):
+        return next((t for t in getattr(self, "plain_terminals", []) if t["pane_id"] == pane), None)
+
     def _process_info(self, rest):
         positional, flags = parse_flags(rest, ("--pane",))
         if positional or len(flags.get("--pane", [])) != 1:
             raise ValueError("pane process-info takes --pane <ID>")
+        plain = self._plain(flags["--pane"][0])
+        if plain is not None and plain.get("process_fails"):
+            raise LookupError("process info of %s cannot be read" % plain["pane_id"])
+        if plain is not None:   # a terminal with no agent: its foreground processes are what the test says (default: a bare shell)
+            return {"result": {"type": "pane_process_info", "process_info": {"pane_id": plain["pane_id"], "shell_pid": 1,
+                                                                              "foreground_processes": [{"cmdline": n, "name": n, "pid": 1} for n in plain.get("processes", ["zsh"])]}}}
         pane = self._pane(flags["--pane"][0])
         program = self.panes[pane].get("program")
         processes = [{"cmdline": program, "name": program.split(" ")[0].rsplit("/", 1)[-1], "pid": 4242}] if program else []
@@ -2188,6 +2198,11 @@ class FakeHerdr:
         positional, _ = parse_flags(rest, ())
         if len(positional) != 1:
             raise ValueError("pane close takes one pane id")
+        plain = self._plain(positional[0])
+        if plain is not None:
+            self.plain_terminals.remove(plain)
+            self.closed.append(positional[0])
+            return {"result": {"type": "ok"}}
         if positional[0] in self.shell_panes:
             self.shell_panes.discard(positional[0])
             self.closed.append(positional[0])
@@ -4170,6 +4185,92 @@ class TestLaunch(Base):
         self.assertIn('export TMPDIR="${{FLEET_AGENT_TMPDIR:-$PROFILE/tmp}}"', sb.PRIVATE_WRAPPER_TEXT)
         self.assertIn('export TMPDIR="${FLEET_AGENT_TMPDIR:-$PROFILE/tmp}"', sb.PRIVATE_WRAPPER_TEXT.format(**{k: "x" for k in ("profile", "gh_config", "gh", "gh_user_flag", "fleet_bin", "state", "shims", "kit_bin", "key_pattern", "pane_env", "v2")}))
 
+    # --- #947: files under an OS-cleaned temp area vanish after 3 days unread; durable scratch lives where the OS never looks
+    @staticmethod
+    def os_tmp_clean(top, now, days=3):
+        """The operating system's rule, simulated on a directory of this test (never the real /tmp): a regular file whose access, modification AND change
+        times are all older than `days` whole days is deleted (`find -atime +3 -mtime +3 -ctime +3 -delete`, the daily /tmp cleaner). Returns the removed names."""
+        gone = []
+        for dirpath, _dirs, files in os.walk(str(top)):
+            for name in files:
+                path = os.path.join(dirpath, name)
+                info = os.lstat(path)
+                if all(int((now - t) // 86400) > days for t in (info.st_atime, info.st_mtime, info.st_ctime)):
+                    os.unlink(path)
+                    gone.append(name)
+        return sorted(gone)
+
+    CLEANED_AREAS = ("/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", "/var/folders", "/private/var/folders")
+
+    def durable_roots(self):
+        """Every durable scratch root the docs section names, computed with XDG_DATA_HOME a PLAIN STRING under no cleaned area (the root functions touch no file):
+        the pane's wrapper root, the headless root, and the wrapper's own fallback `$PROFILE/tmp` (for the Chief of Staff and the lanes). Returns (data, {name: root})."""
+        data = "/home/user/.local/share"
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": data}):
+            wrapper = "%s/%s/bin/%s" % (data, sb.PROG, sb.WRAPPER_NAME)
+            text = sb.PRIVATE_WRAPPER_TEXT.format(**dict({k: "x" for k in ("gh_config", "gh", "gh_user_flag", "fleet_bin", "state", "shims", "kit_bin", "key_pattern", "pane_env", "v2")},
+                                                         profile="%s/%s/profile" % (data, sb.PROG)))
+            fallback = re.search(r'FLEET_AGENT_TMPDIR:-\$PROFILE/tmp', text)
+            profile = re.search(r"^PROFILE=(\S+)$", text, re.M).group(1)
+            return data, {"pane": str(sb.agent_tmp_root({"opencode": wrapper})), "headless": str(sb.headless_tmp_root()),
+                          "fallback": (profile + "/tmp") if fallback else "missing"}
+
+    def test_s3_a_file_unread_for_three_days_is_gone_in_a_cleaned_area(self):
+        cleaned = self.home / "os-temp" / "agent-scratch"
+        cleaned.mkdir(parents=True)
+        for name in ("tool.sh", "fresh.sh"):
+            (cleaned / name).write_text("echo hi\n")
+        now = time.time()
+        os.utime(str(cleaned / "tool.sh"), (now - 10 * 86400, now - 10 * 86400))
+        later = now + 5 * 86400   # the cleaner's clock: a change time cannot be set back, so the clock moves forward instead
+        self.assertEqual(self.os_tmp_clean(cleaned, later), ["fresh.sh", "tool.sh"])   # the reproduction: a file unread for 3 days is gone
+
+    def check_durable_roots(self):
+        data, roots = self.durable_roots()
+        self.assertEqual(set(roots), {"pane", "headless", "fallback"})
+        away = [os.path.realpath(a) for a in self.CLEANED_AREAS] + [os.path.realpath(tempfile.gettempdir()), tempfile.gettempdir()]
+        for name, root in roots.items():
+            self.assertTrue(root.startswith(data + "/"), (name, root))
+            for area in away:
+                self.assertFalse(root == area or root.startswith(area.rstrip("/") + "/"), (name, root, area))
+
+    def test_s3_every_durable_root_is_under_the_data_directory_and_under_no_cleaned_area(self):
+        self.check_durable_roots()
+
+    def test_s3_a_root_moved_into_the_per_user_temp_area_fails_the_check(self):
+        for target in ("agent_tmp_root", "headless_tmp_root"):
+            with self.subTest(mutant=target):
+                moved = Path(tempfile.gettempdir()) / sb.PROG / "profile" / "tmp"
+                with mock.patch.object(sb, target, (lambda config: moved) if target == "agent_tmp_root" else (lambda: moved)):
+                    with self.assertRaises(AssertionError):
+                        self.check_durable_roots()
+
+    def test_s3_a_wrapper_fallback_into_the_shared_temp_area_fails_the_check(self):
+        mutant = sb.PRIVATE_WRAPPER_TEXT.replace("$PROFILE/tmp", "/tmp")
+        self.assertNotEqual(mutant, sb.PRIVATE_WRAPPER_TEXT)
+        with mock.patch.object(sb, "PRIVATE_WRAPPER_TEXT", mutant), self.assertRaises(AssertionError):
+            self.check_durable_roots()
+
+    def test_u1_a_retire_still_removes_an_empty_private_dir_and_keeps_a_non_empty_one(self):
+        root = self.wrapper_world()
+        (root / "coder").mkdir(parents=True)
+        self.assertEqual(sb.reclaim_agent_tmp(self.engine, "coder"), ["%s: removed (empty)" % (root / "coder")])
+        (root / "coder2").mkdir()
+        (root / "coder2" / "note").write_text("x")
+        self.assertIn("kept", sb.reclaim_agent_tmp(self.engine, "coder2")[0])   # a non-empty one is kept: nothing empties it
+        self.assertTrue((root / "coder2" / "note").exists())
+
+    def test_s4_the_shared_name_agents_take_the_profile_root_not_an_os_cleaned_area(self):
+        # the wrapper exports FLEET_AGENT_TMPDIR when set, else the profile's tmp: so the Chief of Staff and the lanes (skipped by name) still land under the profile
+        self.assertIn('export TMPDIR="${{FLEET_AGENT_TMPDIR:-$PROFILE/tmp}}"', sb.PRIVATE_WRAPPER_TEXT)
+        doc = (Path(__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
+        section = doc.split("### What may delete under agent scratch", 1)[1].split("\n### ", 1)[0]
+        may, never = section.split("**What may delete under agent scratch**", 1)[1].split("**What never deletes**", 1)
+        for word in ("the OS cleaners", "the temp janitor", "**EMPTY**", "removing its own files"):
+            self.assertIn(word, may)
+        for word in ("worktree removal", "**non-empty**", "other agents' files", "docker reaper"):
+            self.assertIn(word, never)
+
     def test_nothing_is_typed_and_focus_is_never_asked_for(self):
         self.launch()
         self.assertEqual(self.world.herdr.typing_attempts, [])
@@ -6090,7 +6191,7 @@ class TestLaunch(Base):
                     if isinstance(node, ast.Attribute) and node.attr == "pane_close":
                         callers.add(function.name)
         # two closers, each narrow: the pane a launch opened itself, and `retire --close` (re-reads the pane, matches the agent's session, boss only)
-        self.assertEqual(callers, {"close_own_pane", "retire_close_pane"})
+        self.assertEqual(callers, {"close_own_pane", "retire_close_pane", "cmd_close_pane"})   # #838: and `close-pane` (the Chief of Staff alone, a bare shell no record names, six guards)
         for function in ast.walk(tree):
             if isinstance(function, ast.FunctionDef) and function.name == "launch_agent":
                 calls = [n.func.id for n in ast.walk(function) if isinstance(n, ast.Call)
@@ -54264,6 +54365,7 @@ class TestExternalDecisionSync(ExternalWorld):
         self.run_pass()
         self.assertEqual(self.fake.items[self.ext_of("issue")]["state"], "withdrawn")
 
+    @mock.patch.object(sb, "adoption_pass", new=lambda *a, **k: None)   # #838: a boss that is gone is replaced by an adoption within a pass; this test is about the pass that sees it unreadable first (adoption is TestAdoption's)
     def test_an_unreadable_boss_does_not_stop_an_answered_report_of_another_boss_leaving(self):
         """#80: web-orch is gone (its reports cannot be read); api-coder's answered question still leaves."""
         self.turn_on(repos=[API, WEB])
@@ -68917,6 +69019,592 @@ class LanesCase(IntentCase):
         return [n for n in self.gh.issues if n in (1, 10) and self.gh.issues[number].get("parent") == n]
 
 
+class TestAdoption(LanesCase):
+    """#838: no orphan workers. Charter 1 is orch-a's, charter 10 orch-b's; the Chief of Staff is `chief-of-staff`."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(sb, "owner_terminal_problem", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ, {}, clear=False)       # HERDR_PANE_ID and the session variable are restored after each test
+        env.start()
+        self.addCleanup(env.stop)
+        self.as_agent("chief-of-staff")
+        self.world.herdr.closed.clear()
+
+    def boss(self, name):
+        discovery = self.world.new_engine().discover(self.world.clock.now())
+        return sb.boss_name(discovery, discovery.agents[name])
+
+    def worker(self, name, boss, charter=None, issue=None, idle=True):
+        fleet = {"role": "coder", "reports_to": boss}
+        if charter is not None:
+            fleet["charter"] = charter
+        if issue is not None:
+            fleet["issue"] = issue
+        self.world.add_agent(name, fleet=fleet)
+        if idle:
+            self.world.herdr.panes[self.world.panes[name]]["status"] = "idle"
+
+    def daemon_pass(self):
+        engine = self.world.new_engine()
+        engine.discover(self.world.clock.now())
+        sb.adoption_pass(engine, self.world.clock.now())
+
+    def rows(self, event="boss.adopted"):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def record_path(self):
+        return Path(self.world.state) / "boss-overrides.json"
+
+    def operator(self):
+        os.environ.pop("HERDR_PANE_ID", None)
+        os.environ.pop(sb.SESSION_ENV, None)
+
+    def as_role(self, name):
+        os.environ["HERDR_PANE_ID"] = self.world.panes[name]
+
+    def test_a_pass_gives_every_worker_with_no_live_boss_its_heir_once_and_audits_it(self):   # S1 S6 S7
+        self.worker("w1", "gone", charter=1)
+        self.worker("w2", None, charter=1)
+        self.worker("w3", "ghost", charter=10)
+        self.worker("w4", "gone")
+        self.daemon_pass()
+        self.assertEqual([self.boss(n) for n in ("w1", "w2", "w3", "w4")], ["orch-a", "orch-a", "orch-b", "chief-of-staff"])
+        mine = {"w1", "w2", "w3", "w4"}
+        self.assertEqual(self.boss("worker"), "orch-a", "a worker with a live boss is not touched")
+        rows = [r for r in self.rows() if r["detail"]["worker"] in mine]
+        self.assertEqual(sorted((r["detail"]["worker"], r["detail"]["heir"], r["detail"]["path"]) for r in rows),
+                         [("w1", "orch-a", "pass"), ("w2", "orch-a", "pass"), ("w3", "orch-b", "pass"), ("w4", "chief-of-staff", "pass")])
+        self.assertTrue(all(r["detail"]["why"].startswith("boss gone") and r["detail"]["by"] == sb.ADOPT_BY_DAEMON for r in rows))
+        before = len(self.rows())
+        self.daemon_pass()
+        self.assertEqual(len(self.rows()), before, "a second pass writes nothing")
+
+    def test_no_heir_changes_nothing_and_says_so_once(self):   # S7
+        sid = self.world.sessions["chief-of-staff"]
+        self.world.v2.sessions[sid]["metadata"]["fleet"]["role"] = "coder"
+        self.worker("w4", "gone")
+        engine = self.world.new_engine()          # the daemon's engine lives across passes: it remembers it said so
+        for _ in range(2):
+            engine.discover(self.world.clock.now())
+            sb.adoption_pass(engine, self.world.clock.now())
+        self.assertFalse(self.record_path().exists(), "0 boss records written")
+        self.assertEqual(len([r for r in self.rows("boss.no_heir") if r["detail"]["worker"] == "w4"]), 1)
+
+    def test_a_live_boss_a_forged_live_name_and_another_charters_orchestrator_never_adopt(self):   # S8
+        self.worker("forged", "orch-b", charter=1)            # a forged boss name that is a live agent
+        self.worker("elsewhere", "orch-a", charter=10)        # live boss; the charter's own orchestrator is another one
+        self.daemon_pass()
+        self.assertEqual((self.boss("forged"), self.boss("elsewhere")), ("orch-b", "orch-a"))
+        self.assertEqual([r for r in self.rows() if r["detail"]["worker"] in ("forged", "elsewhere", "worker")], [], "0 rows, 0 boss records for them")
+        self.worker("orphan10", "gone", charter=10)
+        self.daemon_pass()
+        self.assertEqual(self.boss("orphan10"), "orch-b", "never the orchestrator of another charter")
+
+    def test_a_retired_boss_that_still_has_a_pane_is_not_a_boss(self):   # S1
+        self.worker("w1", "orch-a", charter=1)
+        self.operator()
+        self.assertEqual(self.main("retire", "orch-a")[0], 0)
+        self.assertEqual(self.boss("w1"), "chief-of-staff", "orch-a is retired and charter 1 has no other orchestrator")
+
+    def test_retiring_an_orchestrator_re_points_its_workers_in_the_same_command(self):   # S2
+        self.world.add_agent("orch-a2", fleet={"role": "orchestrator", "charter": 1})
+        self.worker("w1", "orch-a", charter=1)
+        self.worker("w2", "orch-a", charter=1)
+        self.as_agent("chief-of-staff")
+        code, out, err = self.main("retire", "orch-a")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([self.boss(n) for n in ("w1", "w2", "worker")], ["orch-a2"] * 3, "no daemon pass ran (worker has no charter of its own: its old boss's)")
+        rows = self.rows()
+        self.assertEqual(sorted(r["detail"]["worker"] for r in rows), ["w1", "w2", "worker"])
+        self.assertTrue(all(r["detail"]["path"] == "retire" and r["detail"]["was"] == "orch-a" and r["detail"]["heir"] == "orch-a2" for r in rows))
+        self.assertIn("adopted: w1 now reports to orch-a2", out)
+
+    def test_retiring_an_orchestrator_with_no_replacement_gives_its_workers_to_the_chief_of_staff(self):   # S2
+        self.worker("w1", "orch-a", charter=1)
+        self.main("retire", "orch-a")
+        self.assertEqual((self.boss("w1"), self.boss("worker")), ("chief-of-staff", "chief-of-staff"))
+
+    def launch_orchestrator(self, name):
+        return self.main("launch", name, "--agent", "coder", "--dir", str(self.home), "--headless", "--role", "orchestrator", "--charter", "1")
+
+    def test_relaunching_an_orchestrator_under_the_same_name_leaves_no_worker_orphaned(self):   # S3
+        self.worker("w1", "orch-gone", charter=1)
+        code, out, err = self.launch_orchestrator("orch-gone")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.boss("w1"), "orch-gone", "the relaunched agent is the live boss")
+        self.assertEqual([r for r in self.rows() if r["detail"]["worker"] == "w1"], [], "nothing needed re-pointing: 0 rows for it")
+
+    def test_a_replacement_orchestrator_inherits_the_workers_of_its_charter(self):   # S4
+        self.worker("w1", "orch-a", charter=1)
+        del self.world.herdr.panes[self.world.panes["orch-a"]]          # orch-a is gone
+        code, out, err = self.launch_orchestrator("orch-new")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.boss("w1"), "orch-new")
+        self.assertEqual(sorted((r["detail"]["worker"], r["detail"]["path"]) for r in self.rows()), [("w1", "replace")])   # `worker` has no charter and its boss is gone: the next pass gives it to the Chief of Staff
+
+    def test_moving_an_ask_re_points_its_workers_and_only_its_workers(self):   # S5
+        self.worker("other", "orch-a", charter=1, issue=4)
+        code, out, err = self.main("move", "2", "--to", "10")
+        self.assertEqual(code, 0, err)
+        self.assertEqual((self.boss("worker"), self.boss("other")), ("orch-b", "orch-a"))
+        (row,) = self.rows()
+        self.assertEqual((row["detail"]["worker"], row["detail"]["path"], row["detail"]["heir"]), ("worker", "move", "orch-b"))
+
+    DAMAGED = {"corrupt": b"{not json", "truncated": b'{"overrides": {"w', "a list": b"[]", "a record that is not an object": b'{"overrides": {"w": 5}}',
+               "unreadable (a directory)": "dir"}
+
+    def damage(self, file, shape):
+        path = Path(self.world.state) / file
+        if path.exists() and path.is_dir():
+            return
+        if path.exists():
+            path.unlink()
+        if shape == "dir":
+            path.mkdir()
+        elif file == sb.RETIRED_FILE and shape == b'{"overrides": {"w": 5}}':
+            path.write_bytes(b'{"w": 5}')
+        else:
+            path.write_bytes(shape)
+
+    def test_a_record_that_cannot_be_read_in_full_changes_nothing_for_every_strict_record(self):   # S9 (one case per member of the table, per shape)
+        files = [f for f, _ in sb.ADOPT_STRICT_RECORDS]
+        self.assertEqual(files, [sb.RETIRED_FILE, "boss-overrides.json"], "the table the code loops over is the list under test")
+        for file in files:
+            for label, shape in self.DAMAGED.items():
+                with self.subTest(file=file, shape=label):
+                    self.worker("w-%d" % len(self.world.panes), "gone", charter=1)
+                    self.damage(file, shape)
+                    before = {f: ((Path(self.world.state) / f).read_bytes() if (Path(self.world.state) / f).is_file() else None) for f in files}
+                    self.daemon_pass()
+                    self.assertEqual(self.rows(), [], "no boss written")
+                    after = {f: ((Path(self.world.state) / f).read_bytes() if (Path(self.world.state) / f).is_file() else None) for f in files}
+                    self.assertEqual(before, after)
+                    path = Path(self.world.state) / file
+                    if path.is_dir():
+                        path.rmdir()
+                    elif path.exists():
+                        path.unlink()
+
+    def test_an_agent_list_that_cannot_be_read_adopts_nothing(self):   # S9 (the agent list)
+        self.worker("w1", "gone", charter=1)
+        engine = self.world.new_engine()
+        discovery = engine.discover(self.world.clock.now())
+        discovery.problems.append("session list failed")
+        engine.discovery = discovery
+        sb.adoption_pass(engine, self.world.clock.now())
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(sb.adopt_workers(engine, "pass", "x", discovery)[1][:20], "the agent list canno")
+
+    def test_a_boss_set_between_the_plan_and_the_write_is_never_overwritten(self):   # judged again under the lock
+        self.worker("w1", "gone", charter=1)
+        real = sb._read_strict_records
+        sid = self.world.sessions["w1"]
+
+        def concurrent_reassign(state):
+            records = real(state)
+            module = sb.load_module("reassign")
+            module.write_overrides(state, {"w1": {"boss": "orch-b", "was": "gone", "original": "gone", "session": sid, "by": "chief-of-staff", "at": float(self.world.clock.now())}})
+            return records
+
+        with mock.patch.object(sb, "_read_strict_records", concurrent_reassign):
+            self.daemon_pass()
+        self.assertEqual(self.boss("w1"), "orch-b", "the boss set in the gap stands")
+        self.assertEqual([r for r in self.rows() if r["detail"]["worker"] == "w1"], [])
+
+    def retired_orphan(self, name="w1", boss="gone", charter=None):
+        self.worker(name, boss, charter=charter)
+        self.operator()
+        self.assertEqual(self.main("retire", name)[0], 0)
+        self.world.herdr.closed.clear()
+        self.as_agent("chief-of-staff")
+
+    def test_the_chief_of_staff_adopts_a_retired_orphan_and_closes_it_as_its_boss(self):   # S10
+        self.retired_orphan()
+        pane = self.world.panes["w1"]
+        retired_before = sb.read_retired(self.world.state)["w1"]
+        code, out, err = self.main("retire", "w1", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.herdr.closed, [pane])
+        (closed,) = self.rows("fleetpane.closed")
+        self.assertEqual((closed["subject"], closed["detail"]["pane"], closed["detail"]["by"]), ("w1", pane, "chief-of-staff"))
+        self.assertIn("adopted by chief-of-staff", closed["detail"]["boss_rule"])
+        self.assertNotIn("command", json.dumps(closed))
+        (row,) = self.rows()
+        self.assertEqual((row["detail"]["path"], row["detail"]["heir"]), ("close", "chief-of-staff"))
+        module = sb.load_module("reassign")
+        records = module.read_overrides(self.world.state)[0]
+        module.prune(records, sb.read_retired(self.world.state), self.world.clock.now())
+        self.assertIn("w1", records, "an adoption of a retired worker survives the housekeeping")
+
+    def test_the_close_stays_refused_for_a_live_worker_a_live_boss_and_another_orchestrator(self):   # S12 U2
+        self.worker("live", "gone")                                      # not retired
+        self.retired_orphan("w2", "orch-a")                              # retired, boss live
+        self.retired_orphan("w3", "gone")                                # retired, boss gone
+        cases = [("chief-of-staff", "live"), ("chief-of-staff", "w2"), ("orch-b", "w3")]
+        for who, name in cases:
+            with self.subTest(who=who, worker=name):
+                self.as_agent(who)
+                before = {f: ((Path(self.world.state) / f).read_bytes() if (Path(self.world.state) / f).exists() else None) for f in (sb.RETIRED_FILE, "boss-overrides.json")}
+                code, out, err = self.main("retire", name, "--close")
+                self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+                after = {f: ((Path(self.world.state) / f).read_bytes() if (Path(self.world.state) / f).exists() else None) for f in before}
+                self.assertEqual(before, after)
+        self.assertNotIn("live", sb.read_retired(self.world.state))
+        self.as_agent("chief-of-staff")
+        self.assertIn("may not close live's pane", self.main("retire", "live", "--close")[2])
+
+    # ---- close-pane
+    def bare_world(self, **entry):
+        wt = self.home / "wt-bare"
+        wt.mkdir(exist_ok=True)
+        sb.register_worktree(self.world.state, str(wt), "worker", None, "wt-bare", 1)
+        base = {"pane_id": "w1:p90", "cwd": str(wt), "foreground_cwd": str(wt), "revision": 7, "processes": ["zsh"]}
+        base.update(entry)
+        (Path(self.world.state) / sb.BARE_PANES_FILE).unlink(missing_ok=True)      # nothing remembered of any pane: every case starts as a first run
+        self.world.herdr.closed.clear()
+        self.world.herdr.plain_terminals = [base]
+        return base
+
+    def test_the_chief_of_staff_closes_an_idle_bare_shell_inside_a_fleet_worktree(self):   # S11
+        self.bare_world()
+        code, out, err = self.main("close-pane", "w1:p90")
+        self.assertEqual((code, self.world.herdr.closed), (1, []), "the first run only notes its revision")
+        self.assertIn("not been seen idle", err)
+        self.world.tick(11 * 60)
+        code, out, err = self.main("close-pane", "w1:p90")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.herdr.closed, ["w1:p90"])
+        (row,) = self.rows("fleetpane.closed")
+        self.assertEqual((row["detail"]["by"], row["detail"]["pane"]), ("chief-of-staff", "w1:p90"))
+        self.assertTrue(row["detail"]["cwd"].endswith("wt-bare"))
+        self.assertNotIn("command", json.dumps(row))
+
+    # (guard, variant) -> (marker the refusal names, what a build WITHOUT the guard does: "closes" or None when another check refuses first)
+    GUARD_CASES = {
+        ("own-pane", "env"): ("the one you are in", "closes"),
+        ("listed", "absent"): ("is not listed", None),
+        ("unnamed", "pane-health record only"): ("is named by an agent record", "closes"),
+        ("unnamed", "herdr agent list only"): ("is named by an agent record", "closes"),
+        ("bare-shell", "a job runs"): ("has a foreground job", "closes"),
+        ("bare-shell", "no process reported"): ("has a foreground job", "closes"),
+        ("worktree", "outside any worktree"): ("not inside a fleet worktree", "closes"),
+        ("worktree", "below an agent's own cwd"): ("not inside a fleet worktree", "closes"),
+        ("idle", "first run"): ("not been seen idle", "closes"),
+    }
+
+    def break_guard(self, guard, variant):
+        """The one fact that makes exactly `guard` fail, in the way `variant` says, on an otherwise closable pane. Returns the pane id."""
+        self.bare_world()
+        plain = self.world.herdr.plain_terminals[0]
+        pane = "w1:p90"
+        if guard == "own-pane":
+            os.environ["HERDR_PANE_ID"] = pane
+            os.environ[sb.SESSION_ENV] = self.world.sessions["chief-of-staff"]
+        elif guard == "listed":
+            self.world.herdr.plain_terminals = []
+        elif guard == "unnamed" and variant == "pane-health record only":
+            (Path(self.world.state) / sb.PANE_HEALTH_FILE).write_text(json.dumps({"agents": {"ghost": {"pane": pane, "session": "ses_x"}}, "states": {}, "missing": {}}))
+        elif guard == "unnamed":   # herdr's own agent list names a pane that is no fleet agent (a session with no fleet metadata)
+            self.world.herdr.plain_terminals = []
+            session = self.world.v2.create_session({})
+            pane = self.world.herdr.new_pane_id()
+            self.world.herdr.add(pane, session, "idle", program="zsh")
+            self.world.herdr.panes[pane].update({"cwd": plain["cwd"], "foreground_cwd": plain["cwd"], "revision": 7})
+        elif guard == "bare-shell" and variant == "a job runs":
+            plain["processes"] = ["vim"]
+        elif guard == "bare-shell":
+            plain["processes"] = []
+        elif guard == "worktree" and variant == "outside any worktree":
+            plain["cwd"] = plain["foreground_cwd"] = "/tmp"
+        elif guard == "worktree":   # the owner's shell in a directory below an agent's own cwd (a repository root), not in a registered worktree
+            root = self.home / "repo-root"
+            (root / "docs").mkdir(parents=True, exist_ok=True)
+            (Path(self.world.state) / sb.PANE_HEALTH_FILE).write_text(json.dumps({"agents": {"orch": {"pane": "w9:p9", "session": "ses_y", "cwd": str(root)}}, "states": {}, "missing": {}}))
+            plain["cwd"] = plain["foreground_cwd"] = str(root / "docs")
+        elif guard == "idle":
+            pass
+        else:
+            raise AssertionError("a case with no setup: %s / %s" % (guard, variant))
+        return pane
+
+    def close_pane_twice(self, pane):
+        self.main("close-pane", pane)
+        self.world.tick(11 * 60)
+        return self.main("close-pane", pane)
+
+    def check_guard(self, guard, variant):
+        marker, without = self.GUARD_CASES[(guard, variant)]
+        pane = self.break_guard(guard, variant)
+        code, out, err = self.main("close-pane", pane) if guard == "idle" else self.close_pane_twice(pane)
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        self.assertIn(marker, err)
+        refused = self.rows("fleetpane.close_refused")[-1]
+        self.assertIn(marker, refused["detail"]["why"])
+        self.assertIn("cwd", refused["detail"])
+        mutant = tuple(g for g in sb.BARE_PANE_GUARDS if g[0] != guard)      # the same case on a build without this guard
+        with mock.patch.object(sb, "BARE_PANE_GUARDS", mutant):
+            code, out, err = self.main("close-pane", pane)          # the first run notes the revision (and closes, when the idle guard is the one removed)
+            if not self.world.herdr.closed:
+                self.world.tick(11 * 60)
+                code, out, err = self.main("close-pane", pane)
+        if without == "closes":
+            self.assertEqual((code, self.world.herdr.closed), (0, [pane]), "without the %s guard (%s) it closes: %s" % (guard, variant, err))
+        else:
+            self.assertEqual((code, self.world.herdr.closed), (1, []), "a pane herdr does not have cannot be closed by any build")
+
+    def test_the_guard_table_is_whole_and_every_guard_has_a_case(self):   # S11a completeness
+        guards = [g for g, _ in sb.bare_pane_guards()]
+        self.assertEqual(guards, ["own-pane", "listed", "unnamed", "bare-shell", "worktree", "idle"])
+        self.assertEqual({g for g, _ in self.GUARD_CASES}, set(guards), "every guard has at least one case, and no case names a guard that is not in the table")
+        for guard, variant in self.GUARD_CASES:
+            self.assertTrue(getattr(type(self), "test_guard_%s__%s" % (guard.replace("-", "_"), re.sub(r"\W+", "_", variant)), None), (guard, variant))
+
+    def test_every_guard_denies_by_default_on_a_missing_empty_or_unreadable_input(self):   # the default-deny table: one row per guard
+        base = {"pane": "w1:p90", "entry": {"cwd": "/x", "foreground_cwd": "/x", "revision": 3}, "held": [], "processes": [{"name": "zsh"}], "worktrees": {"/x"},
+                "discovery": types.SimpleNamespace(agents={}), "health": {"agents": {}}, "window": 10, "now": 10 ** 6, "seen": {"revision": 3, "since": 0}}
+        self.assertEqual([g(base) for _, g in sb.bare_pane_guards()], [None] * 6, "the base case passes every guard")
+        denies = {"listed": {"entry": None}, "bare-shell": {"processes": []}, "worktree": {"entry": {}}, "idle": {"seen": None}}
+        not_input_guards = {"own-pane": "reads the caller's environment, which has nothing to be missing", "unnamed": "absence of a name IS the pass; its unreadable inputs raise before the guards (tested through the command)"}
+        self.assertEqual(set(denies) | set(not_input_guards), {g for g, _ in sb.bare_pane_guards()})
+        for guard, change in denies.items():
+            for label, ctx in ((guard, dict(base, **change)),):
+                self.assertTrue(dict(sb.bare_pane_guards())[guard](ctx), "%s denies on %s" % (guard, change))
+        for guard, change in (("worktree", {"entry": {"cwd": "", "foreground_cwd": None}}), ("idle", {"entry": {"cwd": "/x", "foreground_cwd": "/x"}}), ("worktree", {"worktrees": set()})):
+            self.assertTrue(dict(sb.bare_pane_guards())[guard](dict(base, **change)), (guard, change))
+
+    def test_an_unreadable_input_of_the_context_refuses_the_close(self):   # unreadable: herdr's pane list, agent list, process list, the pane-health record
+        for label, patch in (("pane list", mock.patch.object(sb.HerdrClient, "pane_list", side_effect=sb.HerdrError("down", "herdr is down"))),
+                             ("agent list", mock.patch.object(sb.HerdrClient, "agent_list", side_effect=sb.HerdrError("down", "herdr is down"))),
+                             ("process list", mock.patch.object(sb.HerdrClient, "pane_process_info", side_effect=sb.HerdrError("down", "herdr is down")))):
+            with self.subTest(label):
+                self.bare_world()
+                self.main("close-pane", "w1:p90")
+                self.assertEqual(self.world.herdr.closed, [], "the first run only notes it")
+                self.world.tick(11 * 60)
+                with patch:
+                    code, out, err = self.main("close-pane", "w1:p90")
+                self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+                self.assertIn("cannot be read", err)
+        self.bare_world()
+        self.main("close-pane", "w1:p90")
+        self.world.tick(11 * 60)
+        (Path(self.world.state) / sb.PANE_HEALTH_FILE).write_bytes(b"{not json")
+        code, out, err = self.main("close-pane", "w1:p90")
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        self.assertIn("cannot be read", err)
+
+    def test_a_pane_an_agent_holds_changed_between_looks_or_unreadable_is_never_closed(self):   # S11b
+        self.bare_world()
+        self.main("close-pane", "w1:p90")
+        self.world.tick(11 * 60)
+        agent_pane = self.world.panes["worker"]
+        code, out, err = self.main("close-pane", agent_pane)
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        self.assertIn("named by an agent record", err)
+        real, calls = sb.bare_pane_problem, []
+
+        def owner_changes(*args):
+            calls.append(1)
+            if len(calls) == 2:
+                self.world.herdr.plain_terminals[0]["processes"] = ["vim"]   # a job started between the first look and the close
+            return real(*args)
+
+        with mock.patch.object(sb, "bare_pane_problem", owner_changes):
+            code, out, err = self.main("close-pane", "w1:p90")
+        self.assertEqual((len(calls), code, self.world.herdr.closed), (2, 1, []), err)
+        with mock.patch.object(sb.HerdrClient, "pane_list", side_effect=sb.HerdrError("down", "herdr is down")):
+            code, out, err = self.main("close-pane", "w1:p90")
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        self.assertEqual(len(self.rows("fleetpane.close_refused")), 4)
+
+    def test_only_the_chief_of_staff_may_close_a_pane_no_record_names(self):   # S11c
+        self.bare_world()
+        self.world.add_agent("cos", fleet={"role": "coder"})            # named like the Chief of Staff, without the role
+        self.main("close-pane", "w1:p90")
+        self.world.tick(11 * 60)
+        callers = [("orch-a", None), ("worker", None), ("cos", None), ("chief-of-staff", ("unknown", "an uncertain identity"))]
+        for who, kind in callers:
+            with self.subTest(who=who):
+                self.as_agent(who)
+                with mock.patch.object(sb, "gates_caller_kind", return_value=kind) if kind else mock.patch.object(sb, "BARE_PANES_FILE", sb.BARE_PANES_FILE):
+                    code, out, err = self.main("close-pane", "w1:p90")
+                self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+                self.assertIn("only the Chief of Staff", err)
+        self.assertEqual(len(self.rows("fleetpane.close_refused")), 5, "each refusal is audited with the caller")
+
+    def test_every_path_in_the_table_is_taken_by_a_real_command_and_no_other_path_is(self):   # the paths table, proved by behaviour
+        seen = []
+        real_adopt, real_repoint = sb.adopt_workers, sb.repoint_workers
+        with mock.patch.object(sb, "adopt_workers", lambda engine, path, *a, **k: (seen.append(path), real_adopt(engine, path, *a, **k))[1]), \
+                mock.patch.object(sb, "repoint_workers", lambda engine, names, heir, path, by: (seen.append(path), real_repoint(engine, names, heir, path, by))[1]):
+            self.main("move", "2", "--to", "10")                                            # move
+            self.worker("w-pass", "gone", charter=10)
+            self.daemon_pass()                                                              # pass
+            self.main("retire", "orch-a")                                                   # retire
+            self.launch_orchestrator("orch-new")                                            # relaunch, replace
+            self.retired_orphan("w-close", "gone")
+            self.main("retire", "w-close", "--close")                                       # close
+        self.assertEqual(set(seen), set(sb.ADOPT_PATHS))
+        with self.assertRaises(ValueError):
+            sb.write_boss_records(self.world.new_engine(), None, [(None, None, "x", "y")], "invented", "x")
+
+    def test_an_entry_the_boss_record_reader_would_drop_is_kept_when_a_boss_is_written(self):   # the strict table is the base of the write
+        self.worker("w1", "gone", charter=1)
+        path = self.record_path()
+        path.write_text(json.dumps({"overrides": {"stray": {"note": "not a boss entry"}}}))
+        self.daemon_pass()
+        self.assertEqual(self.boss("w1"), "orch-a")
+        self.assertIn("stray", json.loads(path.read_text())["overrides"])
+
+    def test_a_boss_that_is_back_or_an_heir_that_is_gone_since_the_plan_stops_the_write(self):   # judged again under the lock
+        self.worker("w1", "orch-late", charter=1)
+        real = sb._read_strict_records
+
+        def boss_comes_back(state):
+            records = real(state)
+            self.world.add_agent("orch-late", fleet={"role": "orchestrator", "charter": 1})
+            return records
+
+        with mock.patch.object(sb, "_read_strict_records", boss_comes_back):
+            self.daemon_pass()
+        self.assertEqual(self.boss("w1"), "orch-late")
+        self.assertEqual([r for r in self.rows() if r["detail"]["worker"] == "w1"], [])
+
+    def test_a_damaged_record_stops_every_other_path_too_and_the_problem_is_said(self):   # S9 on retire, launch, move and close
+        self.worker("w1", "orch-a", charter=1)
+        self.world.herdr.panes[self.world.panes["worker"]]["status"] = "idle"
+        (Path(self.world.state) / "boss-overrides.json").write_bytes(b"{not json")
+        before = (Path(self.world.state) / "boss-overrides.json").read_bytes()
+        code, out, err = self.main("move", "2", "--to", "10")
+        self.assertIn("is not valid JSON: no worker was re-pointed", err)
+        self.assertEqual(self.boss("worker"), "orch-a")
+        code, out, err = self.main("retire", "orch-a")
+        self.assertIn("were not re-pointed", err)
+        self.assertEqual(self.boss("w1"), "orch-a", "orch-a is retired but its workers keep the record they had")
+        code, out, err = self.launch_orchestrator("orch-b2")
+        self.assertIn("were not re-pointed", err + out)
+        self.retired_orphan("w9", "gone")
+        code, out, err = self.main("retire", "w9", "--close")
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        self.assertEqual((Path(self.world.state) / "boss-overrides.json").read_bytes(), before)
+        self.assertEqual(self.rows(), [])
+
+    def put_retired(self, name, record):   # the registry is the one source (#903); retired.json is derived output, so a hand-written file is never read
+        reg = sb.load_module("registry")
+        reg.unretire(self.world.state, name)
+        reg.retire(self.world.state, name, record["by"], record["reason"], session=record["session"] or None, now=record["at"])
+        if not record["session"]:
+            reg._mutate(self.world.state, lambda doc: (doc["retired"][name].update(session=record["session"]) or True, [], None))
+
+    def test_a_live_boss_whose_retired_record_names_no_session_keeps_its_worker(self):   # S8: a retirement covers only the session it names
+        self.worker("w1", "orch-a", charter=1)
+        for label, record in (("no session", {"at": 1, "by": "x", "reason": "r", "session": None}), ("another session", {"at": 1, "by": "x", "reason": "r", "session": "ses_old"}),
+                              ("an empty session", {"at": 1, "by": "x", "reason": "r", "session": ""})):
+            with self.subTest(label):
+                self.put_retired("orch-a", record)
+                self.daemon_pass()
+                self.assertEqual(self.boss("w1"), "orch-a", "orch-a is live: nothing to fill")
+                self.assertEqual([r for r in self.rows() if r["detail"]["worker"] == "w1"], [])
+        self.put_retired("orch-a", {"at": 1, "by": "x", "reason": "r", "session": self.world.sessions["orch-a"]})
+        self.daemon_pass()
+        self.assertEqual(self.boss("w1"), "chief-of-staff", "a retirement that names this session does count (charter 1 has no other orchestrator)")
+
+    def test_a_live_heir_whose_retired_record_names_no_session_is_still_an_heir(self):   # S8: the heir side of the same rule
+        self.worker("w1", "gone", charter=1)
+        self.put_retired("orch-a", {"at": 1, "by": "x", "reason": "r", "session": None})
+        self.daemon_pass()
+        self.assertEqual(self.boss("w1"), "orch-a")
+
+    def test_the_caller_is_judged_by_role_not_by_name(self):   # U3 S11c: a real Chief of Staff under another name is allowed, an agent named for the role without it is refused
+        self.bare_world()
+        sid = self.world.sessions["chief-of-staff"]
+        self.world.v2.sessions[sid]["metadata"]["fleet"]["role"] = "coder"            # the agent NAMED chief-of-staff has no role now
+        self.world.add_agent("deputy", fleet={"role": "chief-of-staff"})
+        self.as_agent("chief-of-staff")
+        code, out, err = self.main("close-pane", "w1:p90")
+        self.assertEqual((code, self.world.herdr.closed), (1, []))
+        self.assertIn("only the Chief of Staff", err)
+        self.as_agent("deputy")
+        self.main("close-pane", "w1:p90")
+        self.world.tick(11 * 60)
+        code, out, err = self.main("close-pane", "w1:p90")
+        self.assertEqual((code, self.world.herdr.closed), (0, ["w1:p90"]), err)
+
+    def test_only_the_heir_adopts_before_a_close_and_another_caller_adopts_nothing(self):   # S12: adopt_before_close for any caller would pass the other tests
+        self.retired_orphan("w1", "gone", charter=1)                       # its heir is orch-a (charter 1), not the Chief of Staff
+        before = {f: ((Path(self.world.state) / f).read_bytes() if (Path(self.world.state) / f).exists() else None) for f in (sb.RETIRED_FILE, "boss-overrides.json")}
+        self.as_agent("chief-of-staff")
+        code, out, err = self.main("retire", "w1", "--close")
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        self.assertIn("may not close w1's pane", err)
+        self.assertEqual([r for r in self.rows() if r["detail"]["worker"] == "w1"], [], "the Chief of Staff is not its heir: 0 adoption rows")
+        self.assertEqual({f: ((Path(self.world.state) / f).read_bytes() if (Path(self.world.state) / f).exists() else None) for f in before}, before)
+        self.daemon_pass()                                                   # the next pass gives it to its heir, who then closes it as its boss
+        self.as_agent("orch-a")
+        code, out, err = self.main("retire", "w1", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.herdr.closed, [self.world.panes["w1"]])
+        (row,) = [r for r in self.rows() if r["detail"]["worker"] == "w1"]
+        self.assertEqual((row["detail"]["heir"], row["detail"]["path"], row["detail"]["by"]), ("orch-a", "pass", sb.ADOPT_BY_DAEMON))
+
+    # ---- the family: every reader of a worker's boss
+    @staticmethod
+    def scan(sources):
+        """{"file:function"} of every function in the given {file: source text} that reads `reports_to` raw (`.get("reports_to")` or `["reports_to"]`)."""
+        import ast
+        found = set()
+        for rel, text in sources.items():
+            def walk(node, stack):
+                for child in ast.iter_child_nodes(node):
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        walk(child, stack + [child.name])
+                        continue
+                    if (isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute) and child.func.attr == "get" and child.args
+                            and isinstance(child.args[0], ast.Constant) and child.args[0].value == "reports_to") \
+                            or (isinstance(child, ast.Subscript) and isinstance(child.slice, ast.Constant) and child.slice.value == "reports_to"
+                                and isinstance(child.ctx, ast.Load)):
+                        found.add("%s:%s" % (rel, ".".join(stack[:1] if not stack or not stack[0][0].isupper() else stack[-1:])))
+                    walk(child, stack)
+            walk(ast.parse(text), [])
+        return found
+
+    def sites(self):
+        names = ["bin/fleet-switchboard"] + sorted(str(p.relative_to(REPO)) for p in (REPO / "bin").glob("*.py"))
+        return self.scan({rel: (REPO / rel).read_text() for rel in names})
+
+    def test_every_reader_of_a_workers_boss_is_in_the_table_and_the_table_has_no_stale_member(self):   # S15
+        self.assertEqual(self.sites(), set(sb.BOSS_READ_SITES), "a new raw reader must go through boss_name, or be named in BOSS_READ_SITES with its reason")
+
+    def test_the_scan_finds_a_raw_reader_when_one_is_planted(self):   # S15 mutant: the real scan, fed a planted source, reports it
+        planted = {"bin/planted.py": "def load_row(o):\n    return o.fleet.get('reports_to') == 'x'\n\ndef other(o):\n    return o.fleet['reports_to']\n\ndef safe(o):\n    return boss_name(o)\n"}
+        self.assertEqual(self.scan(planted), {"bin/planted.py:load_row", "bin/planted.py:other"})
+        table = set(sb.BOSS_READ_SITES) | {"bin/planted.py:other"}      # a table that names only one of the two planted readers
+        self.assertNotEqual(self.sites() | self.scan(planted), table, "the table test fails on the planted reader the table does not name")
+
+    def test_an_adopted_worker_is_seen_under_its_heir_by_every_behavioural_reader(self):   # S15
+        self.worker("w1", "gone", charter=1)
+        self.daemon_pass()
+        engine = self.world.new_engine()
+        discovery = engine.discover(self.world.clock.now())
+        obs = discovery.agents["w1"]
+        readers = {
+            "boss_name": lambda: sb.boss_name(discovery, obs),
+            "notice_boss": lambda: sb.notice_boss(engine, "w1"),
+            "work rows": lambda: next(r["reports_to"] for r in sb.EngineWorkHost(engine).agents() if r["name"] == "w1"),
+            "reattach caller rule (its heir may reattach)": lambda: "orch-a" if (self.as_agent("orch-a"), sb.reattach_caller_problem(engine, self.world.route, self.world.clock.now, discovery, "w1"))[1] is None else None,
+        }
+        for label, read in readers.items():
+            with self.subTest(reader=label):
+                self.assertEqual(read(), "orch-a")
+
+
+for _guard, _variant in TestAdoption.GUARD_CASES:   # S11a: one case (and its mutant) per guard of the table the command loops over, per way it can fail
+    setattr(TestAdoption, "test_guard_%s__%s" % (_guard.replace("-", "_"), re.sub(r"\W+", "_", _variant)), (lambda g, v: lambda self: self.check_guard(g, v))(_guard, _variant))
+
+
 class TestMoveAnAsk(LanesCase):
     def setUp(self):
         super().setUp()
@@ -68961,13 +69649,13 @@ class TestMoveAnAsk(LanesCase):
         self.assertIn("worker (reports to orch-a)", note)
         self.assertIn("label: me:awaiting-cos", note)
 
-    def test_s12_workers_keep_their_boss_and_the_old_notice_names_them(self):
+    def test_s12_the_workers_follow_the_ask_and_the_old_notice_names_them(self):
         self.main("move", "2", "--to", "10")
         sid = self.world.sessions["worker"]
-        self.assertEqual(self.world.v2.sessions[sid]["metadata"]["fleet"]["reports_to"], "orch-a")
+        self.assertEqual(self.world.v2.sessions[sid]["metadata"]["fleet"]["reports_to"], "orch-a", "the session's own metadata is never rewritten")   # #838: the boss RECORD moves the worker, see TestAdoption
         (notice,) = [a["text"] for a in self.world.admissions("orch-a")]
         self.assertIn("worker", notice)
-        self.assertIn("boss is unchanged", notice)
+        self.assertIn("they now report to orch-b", notice)
 
     def test_s15_the_remaining_asks_of_the_old_charter_are_listed(self):
         code, out, _ = self.main("move", "2", "--to", "10")
