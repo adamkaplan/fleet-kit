@@ -21,7 +21,65 @@ SPOOL_LIMIT = 262144
 FOLD_LINES = 20000
 HOURS_KEPT = 48
 ACCOUNT_LIMIT = 60
+LANE_LIMIT = 64
+LANES_PER_HOUR = 40       # distinct lanes kept in one hour; more fold into "other"
+ENDPOINTS_PER_CELL = 30   # distinct endpoint classes kept per lane and account in one hour; more fold into "other"
+DAEMON_LANE = "daemon"
+UNKNOWN_LANE = "unknown"  # a spool line from before lanes were recorded, or whose lane cannot be read
+USAGE_FILE = "github-usage.json"
 _SAFE = re.compile(r"[^A-Za-z0-9._@-]")
+_LANE_SAFE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+# ---- the endpoint class: an ALLOW-LIST, never a filter of what is there (#867). Only the words below can appear in it: a name (repository, owner, user,
+# team, branch, file) is not on any list, so it cannot be recorded. The same code is in shims/gh (`reduce_endpoint`) and bin/agent_calls.py: a test runs both.
+GROUPS = frozenset("api pr issue repo browse release run workflow gist search auth label ruleset status project cache codespace secret variable ssh-key "
+                   "gpg-key org extension alias config completion help version attestation agent-task copilot preview skill".split())
+VERBS = frozenset("view list create edit close reopen merge comment review checks diff status checkout ready delete download watch clone fork sync rerun "
+                  "cancel enable disable get set remove lock unlock transfer pin unpin develop archive unarchive rename upload verify trusted-root login logout "
+                  "refresh token setup-git switch import export".split())
+API_TOP = frozenset("orgs users user teams search gists notifications rate_limit graphql installation app repositories enterprises marketplace_listing "
+                    "emojis meta licenses gitignore codes_of_conduct events feeds octocat zen versions applications authorizations assignments classrooms".split())
+API_SUB = frozenset("issues pulls comments commits contents git refs trees blobs tags branches releases assets labels milestones events actions runs jobs "
+                    "workflows artifacts check-runs check-suites statuses status reviews files requested_reviewers timeline parent sub_issues reactions collaborators "
+                    "hooks deployments environments rulesets protection merge compare readme languages contributors forks stargazers subscribers pages dependabot "
+                    "code-scanning secret-scanning teams topics traffic license rate_limit logs attempts rerun cancel dispatches installation subscription "
+                    "assignees invitations keys comments pending_deployments approvals dependencies blocked_by blocking copilot".split())
+
+
+def reduce_endpoint(text):
+    """`api issues/#` for a call whatever its form (a URL with a host, a leading slash, a query, a repository path, a name anywhere): only allow-listed words
+    survive. `api <top word>` for orgs, users, teams, search and the like (the name after it is dropped); a repository path keeps its own words after
+    `repos/<owner>/<name>/`, numbers as `#`, and stops at the first word not on the list. A command that is not `api` keeps its first word and a second one only when
+    that is a known verb. Anything unknown is the first word alone, or `other`. Idempotent."""
+    words = str(text).split()
+    if not words:
+        return "other"
+    first = re.sub(r"[^a-z0-9_-]", "", words[0].lower())
+    if first not in GROUPS:
+        return "other"
+    if first != "api":
+        second = re.sub(r"[^a-z0-9_-]", "", words[1].lower()) if len(words) > 1 else ""
+        return first + (" " + second if second in VERBS else "")
+    if len(words) < 2:
+        return "api"
+    path = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*", "", words[1].split("?")[0].split("#")[0] if "://" in words[1] else words[1].split("?")[0])
+    segs = [s for s in path.split("/") if s]
+    if not segs:
+        return "api repo"
+    if segs[0] == "repos":
+        segs = segs[3:]
+    elif segs[0] in API_TOP:
+        return "api " + segs[0]
+    kept = []
+    for seg in segs[:12]:
+        if re.fullmatch(r"[0-9]+|#", seg):
+            kept.append("#")
+        elif seg in API_SUB:
+            kept.append(seg)
+        else:
+            break
+    return "api " + ("/".join(kept) or "repo")
 
 
 def _number(value):
@@ -30,6 +88,14 @@ def _number(value):
 
 def _account(value):
     return _SAFE.sub("?", str(value))[:ACCOUNT_LIMIT] or "default"
+
+
+def _lane(value):
+    return (_LANE_SAFE.sub("?", value)[:LANE_LIMIT] or UNKNOWN_LANE) if isinstance(value, str) else UNKNOWN_LANE
+
+
+def _endpoint(value):
+    return reduce_endpoint(value) if isinstance(value, str) else "other"
 
 
 def _hour(ts):
@@ -46,6 +112,7 @@ def _read_json(path):
 
 
 def _write_json(path, body):
+    tmp = None
     try:
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".agent-calls-")
         with os.fdopen(fd, "w") as handle:
@@ -53,12 +120,17 @@ def _write_json(path, body):
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
         return True
-    except OSError:
+    except (OSError, ValueError, TypeError):
+        if tmp:
+            try:
+                os.unlink(tmp)   # a failure after the temp file was made leaves nothing behind
+            except OSError:
+                pass
         return False
 
 
 def _spool_lines(path):
-    """[(ts, account)] from a spool file; a line that is not what the shim writes is skipped."""
+    """[(ts, account, lane, endpoint)] from a spool file; a line that is not what the shim writes is skipped. A line with no lane (an older shim) is lane `unknown`."""
     found = []
     try:
         with open(path) as handle:
@@ -70,10 +142,38 @@ def _spool_lines(path):
                 except ValueError:
                     continue
                 if isinstance(row, dict) and _number(row.get("ts")) and isinstance(row.get("account"), str):
-                    found.append((float(row["ts"]), _account(row["account"])))
+                    found.append((float(row["ts"]), _account(row["account"]), _lane(row.get("lane")), _endpoint(row.get("endpoint"))))
     except OSError:
         pass
     return found
+
+
+def _clean_lanes(raw):
+    """{lane: {account: {endpoint: n}}} from a record, whatever its shape; what is not a count is dropped."""
+    clean = {}
+    if not isinstance(raw, dict):
+        return clean
+    for lane, accounts in raw.items():
+        if not isinstance(accounts, dict):
+            continue
+        for account, endpoints in accounts.items():
+            if not isinstance(endpoints, dict):
+                continue
+            for endpoint, n in endpoints.items():
+                if _number(n) and n > 0:
+                    cell = clean.setdefault(_lane(lane), {}).setdefault(_account(account), {})
+                    cell[_endpoint(endpoint)] = cell.get(_endpoint(endpoint), 0) + int(n)
+    return clean
+
+
+def _add_lane(lanes, lane, account, endpoint, n=1):
+    """Bounded: past LANES_PER_HOUR lanes or ENDPOINTS_PER_CELL classes a count goes to `other`."""
+    if lane not in lanes and len(lanes) >= LANES_PER_HOUR:
+        lane = "other"
+    cell = lanes.setdefault(lane, {}).setdefault(account, {})
+    if endpoint not in cell and len(cell) >= ENDPOINTS_PER_CELL:
+        endpoint = "other"
+    cell[endpoint] = cell.get(endpoint, 0) + n
 
 
 def load_hours(state_dir):
@@ -86,11 +186,15 @@ def load_hours(state_dir):
             if key.isdigit() and isinstance(row, dict):
                 clean[key] = {side: {_account(a): int(n) for a, n in (row.get(side) or {}).items() if _number(n) and n >= 0}
                               for side in ("agent", "daemon") if isinstance(row.get(side), dict)}
+                lanes = _clean_lanes(row.get("lanes"))
+                if lanes:
+                    clean[key]["lanes"] = lanes
     return clean, float(since) if _number(since) else None
 
 
 def fold(state_dir, now, daemon_delta=None):
-    """Fold the shim's spool and the daemon's new calls ({account: n}) into the hourly buckets. Returns True when something was written."""
+    """Fold the shim's spool and the daemon's new calls into the hourly buckets. A daemon call count is {account: n} or {account: {endpoint: n}}
+    (the second is recorded under the lane `daemon` by endpoint class). Returns True when something was written."""
     if not state_dir:
         return False
     hours_path = os.path.join(state_dir, HOURS_FILE)
@@ -104,17 +208,33 @@ def fold(state_dir, now, daemon_delta=None):
     except OSError:
         pass
     lines = _spool_lines(folding) if os.path.exists(folding) else []
-    delta = {_account(a): int(n) for a, n in (daemon_delta or {}).items() if _number(n) and n > 0}
+    delta, detail = {}, {}
+    for a, n in (daemon_delta or {}).items():
+        if isinstance(n, dict):
+            parts = {}
+            for e, c in n.items():
+                if _number(c) and c > 0:
+                    parts[_endpoint(e)] = parts.get(_endpoint(e), 0) + int(c)   # classes that reduce to one word ADD, never overwrite
+            if parts:
+                detail[_account(a)] = parts
+                delta[_account(a)] = sum(parts.values())
+        elif _number(n) and n > 0:
+            delta[_account(a)] = int(n)
     if not lines and not delta:
         return False
     hours, since = load_hours(state_dir)
-    for ts, account in lines:
-        row = hours.setdefault(str(_hour(min(ts, now))), {}).setdefault("agent", {})
+    for ts, account, lane, endpoint in lines:
+        bucket = hours.setdefault(str(_hour(min(ts, now))), {})
+        row = bucket.setdefault("agent", {})
         row[account] = row.get(account, 0) + 1
+        _add_lane(bucket.setdefault("lanes", {}), lane, account, endpoint)
     for account, n in delta.items():
-        row = hours.setdefault(str(_hour(now)), {}).setdefault("daemon", {})
+        bucket = hours.setdefault(str(_hour(now)), {})
+        row = bucket.setdefault("daemon", {})
         row[account] = row.get(account, 0) + n
-    first = min(([since] if since is not None else []) + [ts for ts, _ in lines] + [now])
+        for endpoint, c in (detail.get(account) or {"other": n}).items():
+            _add_lane(bucket.setdefault("lanes", {}), DAEMON_LANE, account, endpoint, c)
+    first = min(([since] if since is not None else []) + [line[0] for line in lines] + [now])
     for old in sorted(hours, key=int)[:-HOURS_KEPT]:
         del hours[old]
     written = _write_json(os.path.join(state_dir, HOURS_FILE), {"v": 1, "since": first, "hours": hours})
@@ -126,13 +246,36 @@ def fold(state_dir, now, daemon_delta=None):
     return written
 
 
+def lane_lines(*sources):
+    """The last hour's calls per lane (the daemon is lane `daemon`) and, under it, per account with the top endpoint classes. Several {lane: {account: {endpoint: n}}} are added."""
+    total = {}
+    for source in sources:
+        for lane, accounts in source.items():
+            for account, endpoints in accounts.items():
+                for endpoint, n in endpoints.items():
+                    _add_lane(total, lane, account, endpoint, n)
+    if not total:
+        return []
+    per_lane = sorted(((lane, sum(sum(e.values()) for e in accounts.values())) for lane, accounts in total.items()), key=lambda kv: (-kv[1], kv[0]))
+    lines = ["      github     this hour per lane: " + ", ".join("%s %d" % kv for kv in per_lane)]
+    for lane, n in per_lane[:8]:
+        parts = []
+        for account, endpoints in sorted(total[lane].items(), key=lambda kv: -sum(kv[1].values())):
+            top = ", ".join("%s %d" % kv for kv in sorted(endpoints.items(), key=lambda kv: (-kv[1], kv[0]))[:3])
+            parts.append("%s %d (%s)" % (account, sum(endpoints.values()), top))
+        lines.append("      github       lane %s: %s" % (lane, "; ".join(parts)))
+    return lines
+
+
 def status_lines(state_dir, now):
     """The `status` lines: agent-shell calls this hour per account, then the last 6 hours (agent shell and daemon). Without any record: one line."""
     hours, since = load_hours(state_dir)
     here = {}
-    for ts, account in _spool_lines(os.path.join(state_dir, SPOOL)) + _spool_lines(os.path.join(state_dir, SPOOL + ".fold")):   # not yet folded
+    unfolded = {}   # lanes of the spool not yet folded
+    for ts, account, lane, endpoint in _spool_lines(os.path.join(state_dir, SPOOL)) + _spool_lines(os.path.join(state_dir, SPOOL + ".fold")):   # not yet folded
         if _hour(ts) == _hour(now):
             here[account] = here.get(account, 0) + 1
+            _add_lane(unfolded, lane, account, endpoint)
     if since is None and not here:
         return ["      github     agent-shell calls: not recorded"]
     if since is None:
@@ -141,6 +284,7 @@ def status_lines(state_dir, now):
     for account, n in (hours.get(current, {}).get("agent") or {}).items():
         here[account] = here.get(account, 0) + n
     lines = ["      github     agent shell calls this hour: " + (", ".join("%s %d" % kv for kv in sorted(here.items())) or "none")]
+    lines += lane_lines(hours.get(current, {}).get("lanes") or {}, unfolded)
     for back in range(5, -1, -1):
         start = _hour(now) - back * 3600
         label = time.strftime("%H:00", time.gmtime(start))
@@ -153,3 +297,73 @@ def status_lines(state_dir, now):
             agent += sum(n for a, n in here.items()) - sum((row.get("agent") or {}).values())   # this hour's spool is counted too
         lines.append("      github     hour %sZ: agent shell %d, daemon %d" % (label, agent, daemon))
     return lines
+
+
+# ---- the account's real usage (clause 2): `gh api rate_limit` does not count against the budget; the daemon reads it once a minute per account.
+
+USAGE_EVERY = 60
+USAGE_ACCOUNTS = 8
+
+
+def parse_usage(text):
+    """(used, remaining, limit, reset) from `gh api rate_limit` output (the `core` bucket), or None when it is not that shape."""
+    try:
+        core = json.loads(text)["resources"]["core"]
+        figures = [core[k] for k in ("used", "remaining", "limit", "reset")]
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not all(_number(v) and v >= 0 for v in figures):
+        return None
+    return tuple(int(v) for v in figures)
+
+
+def record_usage(state_dir, now, readings):
+    """Keep {account: (used, remaining, limit, reset)} where `status` reads it. Never raises; returns True when written."""
+    if not state_dir or not readings:
+        return False
+    body = {"v": 1, "at": now, "accounts": {_account(a): {"used": u, "remaining": r, "limit": l, "reset": t}
+                                           for a, (u, r, l, t) in list(readings.items())[:USAGE_ACCOUNTS]}}
+    return _write_json(os.path.join(state_dir, USAGE_FILE), body)
+
+
+def recorded_in_window(hours, account, window_start, now):
+    """Calls recorded (agent shells plus the daemon) for `account` since `window_start`: an hour bucket counts in proportion to how much of it lies in the window."""
+    total = 0.0
+    for key, row in hours.items():
+        start = int(key)
+        end = min(start + 3600, now)
+        if end <= start or end <= window_start:
+            continue
+        share = (end - max(start, window_start)) / float(end - start)
+        total += share * ((row.get("agent") or {}).get(account, 0) + (row.get("daemon") or {}).get(account, 0))
+    return int(round(total))
+
+
+def usage_lines(state_dir, now):
+    """The `status` lines for real usage: per account used, remaining and reset, the calls recorded in the same window and the difference
+    (spent outside the shim and the daemon). A reading older than 5 minutes says so; none says `not recorded`."""
+    body = _read_json(os.path.join(state_dir, USAGE_FILE)) if state_dir else None
+    accounts = body.get("accounts") if body else None
+    if not isinstance(accounts, dict) or not accounts or not _number(body.get("at")):
+        return ["      github     real usage: not recorded"]
+    hours, _ = load_hours(state_dir)
+    unfolded = {}
+    for ts, account, _lane_name, _endpoint_name in _spool_lines(os.path.join(state_dir, SPOOL)) + _spool_lines(os.path.join(state_dir, SPOOL + ".fold")):
+        unfolded.setdefault(_hour(ts), {}).setdefault("agent", {})
+        unfolded[_hour(ts)]["agent"][account] = unfolded[_hour(ts)]["agent"].get(account, 0) + 1
+    merged = {k: {"agent": dict((v.get("agent") or {})), "daemon": v.get("daemon") or {}} for k, v in hours.items()}
+    for start, row in unfolded.items():
+        cell = merged.setdefault(str(start), {"agent": {}, "daemon": {}})["agent"]
+        for account, n in row["agent"].items():
+            cell[account] = cell.get(account, 0) + n
+    age = now - body["at"]
+    lines = []
+    for account, row in sorted(accounts.items()):
+        if not all(_number(row.get(k)) for k in ("used", "remaining", "reset")):
+            continue
+        used, reset = int(row["used"]), float(row["reset"])
+        recorded = recorded_in_window(merged, _account(account), reset - 3600, now)
+        lines.append("      github     real usage %s: used %d, remaining %d, resets %sZ; recorded %d, outside the shim and the daemon about %d%s"
+                     % (_account(account), used, int(row["remaining"]), time.strftime("%H:%M", time.gmtime(reset)), recorded, max(0, used - recorded),
+                        "" if age <= 300 else " (read %d min ago)" % (age // 60)))
+    return lines or ["      github     real usage: not recorded"]

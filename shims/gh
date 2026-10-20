@@ -36,6 +36,8 @@ TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_EN
 
 
 COUNT_ACCOUNT = [None]
+COUNT_LANE = [None]   # the caller's fleet name (else its role), set when the identity lookup ran for the call: nothing is looked up for the counter
+LANE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 CALLS_SPOOL = "agent-calls.jsonl"
 CALLS_LIMIT = 262144
 CALLS_ON = "agent-calls-hours.json"   # the daemon makes this file: counting is on only while a daemon folds the spool
@@ -44,15 +46,70 @@ NO_NETWORK_GROUPS = ("auth", "config", "alias", "completion", "extension", "help
 APP_SKIP_GROUPS = ("config", "completion", "help", "version")   # only the groups that provably make no call skip the App path: `extension` and `alias` can run programs that call out, `auth` handles tokens
 
 
+# the endpoint class: an ALLOW-LIST, never a filter of what is there (#867). Only the words below can appear in it: a name (repository, owner, user,
+# team, branch, file) is not on any list, so it cannot be recorded. The same code is in shims/gh (`reduce_endpoint`) and bin/agent_calls.py: a test runs both.
+GROUPS = frozenset("api pr issue repo browse release run workflow gist search auth label ruleset status project cache codespace secret variable ssh-key "
+                   "gpg-key org extension alias config completion help version attestation agent-task copilot preview skill".split())
+VERBS = frozenset("view list create edit close reopen merge comment review checks diff status checkout ready delete download watch clone fork sync rerun "
+                  "cancel enable disable get set remove lock unlock transfer pin unpin develop archive unarchive rename upload verify trusted-root login logout "
+                  "refresh token setup-git switch import export".split())
+API_TOP = frozenset("orgs users user teams search gists notifications rate_limit graphql installation app repositories enterprises marketplace_listing "
+                    "emojis meta licenses gitignore codes_of_conduct events feeds octocat zen versions applications authorizations assignments classrooms".split())
+API_SUB = frozenset("issues pulls comments commits contents git refs trees blobs tags branches releases assets labels milestones events actions runs jobs "
+                    "workflows artifacts check-runs check-suites statuses status reviews files requested_reviewers timeline parent sub_issues reactions collaborators "
+                    "hooks deployments environments rulesets protection merge compare readme languages contributors forks stargazers subscribers pages dependabot "
+                    "code-scanning secret-scanning teams topics traffic license rate_limit logs attempts rerun cancel dispatches installation subscription "
+                    "assignees invitations keys comments pending_deployments approvals dependencies blocked_by blocking copilot".split())
+
+
+def reduce_endpoint(text):
+    """`api issues/#` for a call whatever its form (a URL with a host, a leading slash, a query, a repository path, a name anywhere): only allow-listed words
+    survive. `api <top word>` for orgs, users, teams, search and the like (the name after it is dropped); a repository path keeps its own words after
+    `repos/<owner>/<name>/`, numbers as `#`, and stops at the first word not on the list. A command that is not `api` keeps its first word and a second one only when
+    that is a known verb. Anything unknown is the first word alone, or `other`. Idempotent."""
+    words = str(text).split()
+    if not words:
+        return "other"
+    first = re.sub(r"[^a-z0-9_-]", "", words[0].lower())
+    if first not in GROUPS:
+        return "other"
+    if first != "api":
+        second = re.sub(r"[^a-z0-9_-]", "", words[1].lower()) if len(words) > 1 else ""
+        return first + (" " + second if second in VERBS else "")
+    if len(words) < 2:
+        return "api"
+    path = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*", "", words[1].split("?")[0].split("#")[0] if "://" in words[1] else words[1].split("?")[0])
+    segs = [s for s in path.split("/") if s]
+    if not segs:
+        return "api repo"
+    if segs[0] == "repos":
+        segs = segs[3:]
+    elif segs[0] in API_TOP:
+        return "api " + segs[0]
+    kept = []
+    for seg in segs[:12]:
+        if re.fullmatch(r"[0-9]+|#", seg):
+            kept.append("#")
+        elif seg in API_SUB:
+            kept.append(seg)
+        else:
+            break
+    return "api " + ("/".join(kept) or "repo")
+
+
 def call_endpoint(args):
-    """The class of a gh call for the counter: `api issues/#` (numbers as `#`, no repo, no query) or the first two words (`pr view`). Never a value."""
+    """The class of a gh call for the counter, reduced to allow-listed words only (`api issues/#`, `pr view`): never a value, a repository, an owner or a name."""
     words = command_words(args)
     if not words:
         return None
-    if words[0] == "api" and len(words) > 1:
-        bare = re.sub(r"^/?repos/[^/]+/[^/]+/?", "", words[1].split("?")[0])
-        return "api " + (re.sub(r"\d+", "#", bare) or "repo")[:60]
-    return " ".join(words[:2])[:40]
+    return reduce_endpoint(" ".join(words[:2]))
+
+
+def call_lane():
+    """The lane of this call: the fleet name (else the role) from the SAME identity answer the shim already fetched, else `unknown`. The caller's environment is never
+    read for it (a caller could name any lane). A name or a role only: never a value of an argument."""
+    candidate = COUNT_LANE[0]
+    return candidate if isinstance(candidate, str) and LANE_RE.match(candidate) else "unknown"
 
 
 def count_call(args):
@@ -69,12 +126,306 @@ def count_call(args):
             os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"), "fleet-switchboard")
         path = os.path.join(state, CALLS_SPOOL)
         if endpoint and os.path.exists(os.path.join(state, CALLS_ON)) and (not os.path.exists(path) or os.path.getsize(path) < CALLS_LIMIT):
-            line = json.dumps({"ts": int(time.time()), "account": COUNT_ACCOUNT[0] or "default", "endpoint": endpoint}, sort_keys=True)
+            line = json.dumps({"ts": int(time.time()), "account": COUNT_ACCOUNT[0] or "default", "endpoint": endpoint, "lane": call_lane()}, sort_keys=True)
             fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
             with os.fdopen(fd, "a") as out:
                 out.write(line + "\n")
     except Exception:
         pass
+
+
+# ---- the read cache and the low-budget warning (#867, clauses 3 and 4)
+# A repeated identical `gh api <path>` read of one agent on one account is answered from a short cache (at most CACHE_FRESH seconds), then revalidated with the
+# entity tag (a 304 does not count against GitHub's budget). The key is account + path + agent; any write by that agent drops its entries first. Every error in
+# here falls through to the real call. Only the exact shape `gh api <path>` (a GET with no flag) with stdout not a terminal is cached: anything else runs as before.
+CACHE_DIR = "gh-read-cache"
+CACHE_FRESH = 30          # seconds a cached answer is served without asking GitHub
+CACHE_STALE_MAX = 600     # seconds: the oldest answer served while the account is nearly out of budget, and the longest any entry is kept
+CACHE_BODY_MAX = 1048576
+CACHE_FILES_MAX = 200
+LOW_FRACTION = 0.15       # below this share of the hourly budget the shim says so, and serves a cached read instead of spending
+USAGE_FILE = "github-usage.json"   # the daemon's once-a-minute reading of the account's real usage (bin/agent_calls.py)
+USAGE_FRESH = 600
+WARN_EVERY = 60
+
+
+def state_directory():
+    return os.environ.get("FLEET_SWITCHBOARD_STATE") or os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"), "fleet-switchboard")
+
+
+NEVER_CACHED = frozenset("rate_limit user applications installation app notifications authorizations check-runs check-suites statuses status runs jobs".split())
+# paths whose answer is a STATE (the budget itself, the account, a build or check in progress) that a caller reads to see what is true now, not a fact that lasts:
+# never cached and never served from the cache. Checked on the normalised path, on every segment.
+
+
+def normal_api_path(path):
+    """The path as GitHub reads it: no scheme or host, no query or fragment, percent-decoding applied, lower case, no empty segment, no `api/v3` prefix of an enterprise host."""
+    import urllib.parse
+    text = path.split("#")[0].split("?")[0]
+    text = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*", "", text)
+    text = urllib.parse.unquote(urllib.parse.unquote(text)).lower()
+    segments = [seg for seg in text.split("/") if seg]
+    if segments[:2] == ["api", "v3"]:
+        segments = segments[2:]
+    return segments
+
+
+def never_cached(path):
+    """True for a path that reports a state (see NEVER_CACHED): its first word, or any word after `repos/<owner>/<name>/` (the owner and the name are a name, not a word)."""
+    try:
+        segments = normal_api_path(path)
+        if not segments or any(seg.startswith("..") for seg in segments):
+            return True
+        words = segments[3:] if segments[0] == "repos" else segments[:1]
+        return any(seg in NEVER_CACHED for seg in words)
+    except Exception:
+        return True
+
+
+def cacheable_read(args):
+    """The path of a call that is exactly `gh api <path>` (nothing else: no flag, no method, no field) and not one of the paths that report a state, else None."""
+    if len(args) == 2 and args[0] == "api" and args[1] and not args[1].startswith("-") and "\n" not in args[1] and len(args[1]) <= 2000 and not never_cached(args[1]):
+        return args[1]
+    return None
+
+
+def cache_directory(create=False):
+    """The cache directory (0700, owned by this user, not a link), or None. Only while a daemon has switched counting on (the fleet is in use)."""
+    state = state_directory()
+    if os.environ.get("FLEET_SHIM_CACHE") == "off" or not os.path.exists(os.path.join(state, CALLS_ON)):
+        return None
+    path = os.path.join(state, CACHE_DIR)
+    try:
+        if create and not os.path.lexists(path):
+            os.makedirs(path, mode=0o700, exist_ok=True)
+        info = os.lstat(path)
+    except OSError:
+        return None
+    import stat
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        return None
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            return None
+    return path
+
+
+def _digest(*parts):
+    import hashlib
+    return hashlib.sha256("\0".join(parts).encode("utf-8", "replace")).hexdigest()
+
+
+def cache_file(directory, agent, account, path):
+    return os.path.join(directory, "%s-%s.json" % (_digest(agent)[:16], _digest(account, agent, path)[:40]))
+
+
+def cache_load(file, now):
+    """(age, etag, body) of a stored answer, or None (missing, unreadable, malformed, or older than CACHE_STALE_MAX)."""
+    try:
+        with open(file) as handle:
+            entry = json.loads(handle.read(CACHE_BODY_MAX + 4096))
+        ts, etag, body = entry["ts"], entry.get("etag"), entry["body"]
+        if not isinstance(ts, (int, float)) or isinstance(ts, bool) or not isinstance(body, str) or not (etag is None or isinstance(etag, str)):
+            return None
+        age = now - ts
+        return (age, etag, body) if -5 <= age <= CACHE_STALE_MAX else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def cache_store(directory, file, etag, body, now):
+    """Write one entry (0600, a temp file renamed into place), then keep the directory bounded in count and age. Never raises."""
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
+        with os.fdopen(fd, "w") as out:
+            out.write(json.dumps({"ts": now, "etag": etag, "body": body}))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, file)
+        tmp = None
+        names = [n for n in os.listdir(directory) if n.endswith(".json")]
+        dated = []
+        for name in names:
+            try:
+                dated.append((os.stat(os.path.join(directory, name)).st_mtime, name))
+            except OSError:
+                pass
+        dated.sort()
+        for mtime, name in dated[:max(0, len(dated) - CACHE_FILES_MAX)] + [d for d in dated if now - d[0] > CACHE_STALE_MAX]:
+            try:
+                os.unlink(os.path.join(directory, name))
+            except OSError:
+                pass
+    except Exception:
+        pass
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+WRITE_GRACE = 10   # seconds after an agent's write began during which its reads neither use nor fill the cache (a write that is still running may not have taken effect yet)
+
+
+def _marker(directory, agent):
+    return os.path.join(directory, ".w-" + _digest(agent)[:16])
+
+
+def write_marker(directory, agent):
+    """(nonce, time) of the agent's last write mark, or None."""
+    try:
+        with open(_marker(directory, agent)) as handle:
+            row = json.loads(handle.read(500))
+        return (str(row["n"]), float(row["ts"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def cache_mark(agent):
+    """Note that `agent` has a write under way (or just ended): a new nonce and the time. A read that began before this does not store its answer. Never raises."""
+    try:
+        directory = cache_directory()
+        if directory is None or not agent:
+            return
+        tmp = _marker(directory, agent) + ".%d" % os.getpid()
+        with open(tmp, "w") as handle:
+            handle.write(json.dumps({"n": "%d-%s" % (os.getpid(), os.urandom(6).hex()), "ts": time.time()}))
+        os.replace(tmp, _marker(directory, agent))
+    except Exception:
+        pass
+
+
+def cache_drop(agent):
+    """A write by `agent`: mark it, then drop every cached answer of that agent (never another agent's). Never raises."""
+    try:
+        cache_mark(agent)
+        directory = cache_directory()
+        if directory is None or not agent:
+            return
+        prefix = _digest(agent)[:16] + "-"
+        for name in os.listdir(directory):
+            if name.startswith(prefix):
+                try:
+                    os.unlink(os.path.join(directory, name))
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+def budget_low(account):
+    """(remaining, limit) when the daemon's fresh reading says this account is below LOW_FRACTION of its budget, else None."""
+    try:
+        with open(os.path.join(state_directory(), USAGE_FILE)) as handle:
+            body = json.loads(handle.read(200001))
+        row = body["accounts"][account]
+        remaining, limit, at = row["remaining"], row["limit"], body["at"]
+        numbers = (remaining, limit, at)
+        if not all(isinstance(n, (int, float)) and not isinstance(n, bool) for n in numbers) or limit <= 0 or time.time() - at > USAGE_FRESH:
+            return None
+        return (int(remaining), int(limit)) if remaining < LOW_FRACTION * limit else None
+    except Exception:
+        return None
+
+
+def warn_low(account, low):
+    """One line on stderr before a call that would spend, at most once a minute per account. Never raises."""
+    try:
+        directory = os.path.join(state_directory(), "gh-low-warned")
+        stamp = os.path.join(directory, _digest(account)[:16])
+        try:
+            if time.time() - os.stat(stamp).st_mtime < WARN_EVERY:
+                return
+        except OSError:
+            pass
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        with open(stamp, "w"):
+            pass
+        sys.stderr.write("gh: warning: the GitHub account %s has %d of %d requests left this hour (under %d%%); repeated reads are answered from a short cache\n"
+                         % (account, low[0], low[1], int(LOW_FRACTION * 100)))
+    except Exception:
+        pass
+
+
+def split_response(raw):
+    """(status, headers, body bytes) of `gh api -i` output, or None when it is not that shape."""
+    cut = raw.find(b"\r\n\r\n")
+    sep = 4
+    if cut < 0:
+        cut, sep = raw.find(b"\n\n"), 2
+    if cut < 0:
+        return None
+    head = raw[:cut].decode("latin-1").splitlines()
+    first = head[0].split() if head else []
+    if len(first) < 2 or not first[0].startswith("HTTP/") or not first[1].isdigit():
+        return None
+    headers = {}
+    for line in head[1:]:
+        key, colon, value = line.partition(":")
+        if colon:
+            headers[key.strip().lower()] = value.strip()
+    return int(first[1]), headers, raw[cut + sep:]
+
+
+def cached_read(gh, env, args, agent, account, low):
+    """Serve `gh api <path>` from the cache or through one conditional request. Returns an exit status, or None when the normal call should run (nothing was spent)."""
+    path = cacheable_read(args)
+    if path and ("{" in path or os.environ.get("GH_HOST") or os.environ.get("GH_REPO")):
+        path = None   # gh fills `{owner}`, `{repo}` and `{branch}` from the working directory, and these variables change the target: the key could not tell
+    directory = cache_directory(create=True) if path and agent else None
+    if directory is None or sys.stdout.isatty():
+        return None
+    now = time.time()
+    marker = write_marker(directory, agent)
+    if marker is not None and abs(now - marker[1]) <= WRITE_GRACE:
+        return None   # this agent's write began a moment ago: nothing is served from the cache and nothing is stored; the plain call runs
+    file = cache_file(directory, agent, account, path)
+    entry = cache_load(file, now)
+    if entry is not None and (entry[0] <= CACHE_FRESH or low is not None):
+        sys.stdout.buffer.write(entry[2].encode("utf-8"))   # fresh, or the account is nearly out of budget: no request at all
+        sys.stdout.buffer.flush()
+        return 0
+    argv = [gh, "api", "-i"] + (["-H", "If-None-Match: " + entry[1]] if entry is not None and entry[1] else []) + [path]
+    done = subprocess.run(argv, capture_output=True, env=env)   # the one request (the real gh does not time out either)
+    # from here a request is SPENT: whatever happens below, this returns its status and never lets the caller run a second request
+    count_now = True
+    try:
+        parsed = split_response(done.stdout)
+        if parsed is None:   # not an answer this can interpret: say what gh said
+            sys.stdout.buffer.write(done.stdout)
+            sys.stderr.buffer.write(done.stderr)
+            return done.returncode
+        status, headers, body = parsed
+        raced = write_marker(directory, agent) != marker   # a write by this agent began or ended since the request began: this answer may be older than the write
+        if status == 304 and entry is not None:
+            count_now = False   # a 304 costs nothing, so it is not counted
+            if not raced:
+                cache_store(directory, file, entry[1], entry[2], now)
+            sys.stdout.buffer.write(entry[2].encode("utf-8"))
+            sys.stdout.buffer.flush()
+            return 0
+        if 200 <= status < 300 and len(body) <= CACHE_BODY_MAX and not raced:
+            try:
+                cache_store(directory, file, headers.get("etag"), body.decode("utf-8"), now)
+            except Exception:
+                pass
+        sys.stdout.buffer.write(body)
+        sys.stdout.buffer.flush()
+        sys.stderr.buffer.write(done.stderr)
+        return done.returncode
+    except Exception:
+        return done.returncode
+    finally:
+        try:
+            if count_now:
+                count_call(args)
+        except Exception:
+            pass
 
 
 def real_gh():
@@ -166,6 +517,7 @@ class Lookup:
             data = None
         if isinstance(data, dict):
             name, repo = data.get("name"), data.get("repo")
+            COUNT_LANE[0] = name if isinstance(name, str) and NAME_RE.match(name) else (data.get("role") if isinstance(data.get("role"), str) else None)
             self._ident = {"name": name if isinstance(name, str) and NAME_RE.match(name) else None,
                            "repo": repo if isinstance(repo, str) and REPO_RE.match(repo) else None,
                            "own": data.get("own") is not False,
@@ -176,6 +528,7 @@ class Lookup:
             self.failed = True                 # neither form answered: a failure, not an old switchboard
         name = plain.stdout.strip() if plain is not None and plain.returncode == 0 else ""
         self._ident = {"name": name if NAME_RE.match(name) else None, "repo": None}
+        COUNT_LANE[0] = self._ident["name"]
         return self._ident
 
 
@@ -1159,6 +1512,25 @@ def run(args):
             return 1
     audit_write(args, lookup, "passed", write, hold_repo, hold_number)
     warn_text(args)
+    served = None
+    try:
+        own = os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1"
+        words = command_words(args)
+        if not own and words and words[0] not in NO_NETWORK_GROUPS:
+            ident = lookup.identity() if (write or cacheable_read(args)) else {}
+            agent = ident.get("name")
+            if write:
+                cache_drop(agent)   # a write by this agent: its cached answers go before the write runs
+            account = COUNT_ACCOUNT[0] or "default"
+            low = budget_low(account)
+            if low is not None:
+                warn_low(account, low)
+            if not write and plan is None and not APP_DIRS:
+                served = cached_read(gh, env, args, agent, account, low)
+    except Exception:
+        served = None   # the cache never fails the command
+    if served is not None:
+        return served
     count_call(args)
     if plan is None:
         if APP_DIRS:   # a token file has to be removed after the call: gh runs as a child, not in place of this process
@@ -1171,6 +1543,8 @@ def run(args):
     argv, stdin_text, temp = plan
     try:
         done = subprocess.run([gh] + argv, input=stdin_text, text=True if stdin_text is not None else None, env=env)
+        if write:
+            cache_mark(lookup.identity().get("name"))   # the write has ended (an exec'd write cannot say so: the grace window covers it)
         return done.returncode
     finally:
         if temp:

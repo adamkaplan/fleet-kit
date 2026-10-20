@@ -97,6 +97,17 @@ def _load(name, path):
 
 
 sb = _load("t_fleet_switchboard", SWITCHBOARD)
+
+
+def set_retired(state, retired):
+    """A test sets the retired map: in the registry when it exists (the record), and in retired.json (its derived copy), as the registry itself would."""
+    state = Path(state)
+    (state / "retired.json").write_text(json.dumps(retired))
+    path = state / "registry.json"
+    if path.exists():
+        doc = json.loads(path.read_text())
+        doc["retired"] = retired
+        path.write_text(json.dumps(doc))
 sc = _load("t_fleet_scenario", SCENARIO)
 
 
@@ -249,7 +260,7 @@ class TestConfig(Base):
         self.assertFalse(self.config_file.exists())
         self.assertEqual(sb.load_config(), {
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
-            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "send_timeout_seconds": 60, "poll_seconds": 5,
+            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "clear_remind_minutes": 15, "send_timeout_seconds": 60, "poll_seconds": 5,
             "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "launch_default": "headless",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
@@ -4828,7 +4839,7 @@ class TestLaunch(Base):
 
     def test_a_retired_listing_is_dropped_from_status_after_the_show_days(self):
         day = 86400
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"fresh": {"at": 1000, "by": "x", "reason": "y", "session": "s", "auto": False},
+        set_retired(self.world.state, {"fresh": {"at": 1000, "by": "x", "reason": "y", "session": "s", "auto": False},
                                                             "stale": {"at": 1000 - 1, "by": "x", "reason": "y", "session": "s", "auto": False}})
         inside = sb.pane_health_status_lines(self.world.state, 1000 + sb.RETIRED_SHOW_DAYS * day)          # fresh is exactly at the edge, stale just past it
         self.assertTrue(inside and "fresh" in inside[0] and "stale" not in inside[0])
@@ -4873,7 +4884,7 @@ class TestLaunch(Base):
         self.assertEqual(sorted(sb.prune_retired(old, 10 ** 9 + 5)), ["y"])
         self.as_("boss")
         self.health()
-        with mock.patch.object(sb, "_write_small", side_effect=OSError(28, "No space left")):
+        with mock.patch.object(sb.load_module("registry"), "_write_atomic", side_effect=OSError(28, "No space left")):
             code, out, err = self.run_cli("retire", "worker")
         self.assertNotEqual(code, 0)
         self.assertIn("was not retired, try again", err)
@@ -4883,7 +4894,7 @@ class TestLaunch(Base):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         self.worker()
         self.health()
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"worker": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "ses_an_old_one", "auto": False}})
+        set_retired(self.world.state, {"worker": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "ses_an_old_one", "auto": False}})
         self.kill("worker")
         for n in range(sb.PANE_MISSING_PASSES):
             self.health(n)
@@ -5073,7 +5084,7 @@ class TestLaunch(Base):
         sb.register_worktree(self.world.state, str(live_wt), "boss", None, "w-live", 1)            # an agent that is NOT retired
         sb.register_worktree(self.world.state, str(gone_wt), "worker", None, "w-gone", 1)
         self.git(self.repo_main, "worktree", "remove", str(gone_wt))                                # already deleted by hand
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"worker": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "s", "auto": False}})
+        set_retired(self.world.state, {"worker": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "s", "auto": False}})
         os.environ["HERDR_PANE_ID"] = self.world.panes["stranger"]
         code, out, err = self.run_cli("disk", "reclaim-worktrees")
         self.assertEqual(code, 0, err)
@@ -5257,9 +5268,9 @@ class TestLaunch(Base):
         status, line = sb.reclaim_worktree(engine, subprocess.run, str(wt), {"agent": "worker"}, True)
         self.assertEqual((status, wt.exists()), ("kept", True), line)
         self.assertIn("runs in it", line)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"elsewhere": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "s", "auto": False}})
+        set_retired(self.world.state, {"elsewhere": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "s", "auto": False}})
         self.assertIsNone(sb.worktree_in_use(engine, str(wt)), "a retired agent's session no longer holds it")
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {})
+        set_retired(self.world.state, {})
         self.world.v2.sessions[self.world.sessions["elsewhere"]]["directory"] = str(wt) + "2"        # a sibling sharing a name prefix
         self.assertIsNone(sb.worktree_in_use(engine, str(wt)))
         with mock.patch.object(sb.V2Client, "session_list_page", side_effect=sb.V2Error("timeout", None, "slow")):
@@ -5875,12 +5886,17 @@ class TestLaunch(Base):
             data["states"][n] = {"state": "unknown", "session": "ses_" + n}
         data["agents"]["relaunch"] = row("ses_new", "orchestrator")      # retired under an OLD session, running again under a new one
         sb.write_pane_health(self.world.state, data)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {**{n: self.retired_entry("ses_" + n) for n in ("r1", "r2", "r3")},
-                                                            "relaunch": self.retired_entry("ses_old")})
+        reg = sb.load_module("registry")                                 # the agent list is the registry's: the rows and the retirements go there
+        for n in ("r1", "r2", "r3"):
+            reg.upsert(self.world.state, n, data["agents"][n], now=int(self.world.clock.now()))
+            reg.retire(self.world.state, n, "x", "finished", now=int(self.world.clock.now()))
+        reg.upsert(self.world.state, "relaunch", {"session": "ses_old", "pane": "w1:p9"}, now=int(self.world.clock.now()))
+        reg.retire(self.world.state, "relaunch", "x", "finished", now=int(self.world.clock.now()))
+        reg.upsert(self.world.state, "relaunch", data["agents"]["relaunch"], now=int(self.world.clock.now()))
         self.health(1)
         agents = sb.read_pane_health(self.world.state)
         self.assertEqual(sorted(agents["agents"]), ["coder", "platform", "relaunch"])
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"platform": self.retired_entry(None), "coder": self.retired_entry(None)})   # a record with NO session covers nothing
+        set_retired(self.world.state, {"platform": self.retired_entry(None), "coder": self.retired_entry(None)})   # a record with NO session covers nothing
         self.health(2)
         self.assertEqual(sorted(sb.read_pane_health(self.world.state)["agents"]), ["coder", "platform", "relaunch"])
         self.assertFalse(sb.retired_agent({"x": {"session": None}}, "x", None))
@@ -5905,14 +5921,16 @@ class TestLaunch(Base):
         data = sb.read_pane_health(self.world.state)
         data["agents"]["old"] = {"session": "ses_old", "pane": "w1:p9", "role": "orchestrator", "workspace": "w9"}
         sb.write_pane_health(self.world.state, data)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"old": self.retired_entry("ses_old")})
+        sb.load_module("registry").upsert(self.world.state, "old", data["agents"]["old"])
+        set_retired(self.world.state, {"old": self.retired_entry("ses_old")})
         path = self.world.state / sb.PANE_HEALTH_FILE
         before = path.read_bytes()
         discovery = self.engine.discover(self.world.clock.now())
         discovery.problems = ["list not whole"]                         # the agent list is a half-read
         sb.pane_health_pass(self.engine, self.world.clock.now() + 1)
         self.assertEqual(path.read_bytes(), before)
-        with mock.patch.object(sb, "read_retired_strict", side_effect=sb.RetiredUnreadable("half")):   # the retired list is a half-read, yet `read_retired` still names "old"
+        reg = sb.load_module("registry")
+        with mock.patch.object(reg, "read", return_value=reg._empty(False, "half")):   # the registry read is not whole: the pass acts on nothing
             self.health(2)
         self.assertIn("old", sb.read_pane_health(self.world.state)["agents"])
         self.health(3)                                                   # a whole read prunes it
@@ -5954,6 +5972,84 @@ class TestLaunch(Base):
         self.assertEqual(code, 0, err)
         self.assertEqual(json.loads(out)["session"], session)
         self.assertEqual(sb.read_pane_health(self.world.state)["agents"].get("worker", {}).get("workspace"), before["workspace"])   # --undo put the whole record back
+
+    def test_the_pass_drops_the_state_of_an_orphan_and_keeps_a_listed_undiscovered_a_discovered_unlisted_and_a_cloud_name(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.engine.state_dir = self.world.state
+        self.health()
+        now, reg = int(self.world.clock.now()), sb.load_module("registry")
+        reg.upsert(self.world.state, "gone", {"session": "ses_gone", "pane": "w1:p9", "state": "dead"}, now=now)            # listed, not discovered: a dead agent's alert
+        reg.upsert(self.world.state, "pod1", {"session": "ses_pod", "kind": "cloud", "run_id": "run_example"}, now=now)    # a cloud row: no pane state
+        data = sb.read_pane_health(self.world.state)
+        for name in ("orphan", "gone", "nodisc"):
+            data["states"][name] = {"state": sb.PANE_DEAD, "why": "x", "pane": "w1:p9", "session": "ses_" + name, "at": now}
+        data["missing"]["orphan"] = 2
+        sb.write_pane_health(self.world.state, data)
+        self.engine.discover(self.world.clock.now())
+        self.engine.discovery.agents["nodisc"] = sb.Observation("nodisc", "ses_nodisc", None, "idle", {"role": "coder"})   # discovered, with no pane: never listed by the pass
+        sb.pane_health_pass(self.engine, self.world.clock.now() + 1)
+        health = sb.read_pane_health(self.world.state)
+        self.assertNotIn("orphan", health["states"])                    # in neither the registry nor discovery: dropped, with its missing count
+        self.assertNotIn("orphan", health["missing"])
+        self.assertEqual(health["states"]["gone"]["state"], sb.PANE_DEAD)   # the dead agent's state stays: its alert is read from it
+        self.assertIn("gone", self.engine.pane_alerts)
+        self.assertIn("nodisc", health["states"])                       # discovered: kept
+        self.assertNotIn("pod1", health["states"])                      # a cloud row has no pane state, and the registry keeps it
+        self.assertEqual(reg.get(self.world.state, "pod1")["run_id"], "run_example")
+
+    def test_s5_the_registry_gives_reattach_retire_undo_and_the_cloud_log_read_the_same_results_with_a_clean_environment(self):
+        for key in [k for k in os.environ if k.startswith(("HERDR_", "OPENCODE_")) and k != "HERDR_PANE_ID"]:
+            self.addCleanup(os.environ.__setitem__, key, os.environ[key])
+            del os.environ[key]
+        self.addCleanup(os.environ.pop, "HERDR_WORKSPACE_ID", None)
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.worker()
+        self.health()
+        session = self.world.sessions["worker"]
+        reg = sb.load_module("registry")
+        self.assertEqual(reg.get(self.world.state, "worker")["session"], session)            # the pass registered it
+        self.assertEqual(reg.get(self.world.state, "worker")["workspace"], sb.read_pane_health(self.world.state)["agents"]["worker"]["workspace"])
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "worker", "--reason", "done")[0], 0)
+        self.assertNotIn("worker", reg.read(self.world.state)["agents"])
+        self.assertEqual(sb.known_agent(self.world.state, "worker")["session"], session)   # what the cloud log read finds
+        self.kill("worker")
+        self.health(1)
+        self.assertEqual(self.run_cli("retire", "--undo", "worker")[0], 0)
+        self.assertEqual(reg.get(self.world.state, "worker")["session"], session)
+        code, out, err = self.run_cli("reattach", "worker")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["session"], session)
+
+    def test_a_registry_that_is_not_whole_makes_reattach_retire_and_the_close_guard_change_nothing(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.worker()
+        self.health()
+        text = json.dumps({"version": 7, "agents": {}, "retired": {}})
+        (self.world.state / "registry.json").write_text(text)
+        self.as_("boss")
+        for argv in (("retire", "worker"), ("reattach", "worker"), ("retire", "worker", "--close")):
+            with self.subTest(argv=argv):
+                code, out, err = self.run_cli(*argv)
+                self.assertNotEqual(code, 0)
+                self.assertIn("registry", err)
+        discovery = self.engine.discover(self.world.clock.now())
+        pane, why = sb.retire_close_problem(self.engine, self.world.route, self.world.clock.now, discovery, "worker", discovery.agents["worker"], False)
+        self.assertEqual(pane, None)
+        self.assertIn("registry cannot be read", why)
+        before = (self.world.state / "pane-health.json").read_bytes()
+        self.health(5)                                                       # the pass acts on nothing either
+        self.assertEqual((self.world.state / "registry.json").read_text(), text)
+        self.assertEqual((self.world.state / "pane-health.json").read_bytes(), before)
+
+    def test_a_cloud_worker_in_the_registry_is_never_judged_by_the_pane_pass(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        reg = sb.load_module("registry")
+        reg.upsert(self.world.state, "pod1", {"session": "ses_pod", "repo": "acme-org/widget-service", "kind": "cloud", "run_id": "run_example"})
+        for n in range(sb.PANE_MISSING_PASSES + 1):
+            self.health(n)
+        self.assertEqual(reg.get(self.world.state, "pod1")["run_id"], "run_example")
+        self.assertNotIn("pod1", sb.read_pane_health(self.world.state)["states"])
 
     def test_reattach_by_a_dead_panes_remembered_record_and_it_refuses_when_the_session_is_gone(self):
         os.environ["HERDR_WORKSPACE_ID"] = "w1"
@@ -8869,7 +8965,8 @@ class TestHygiene(unittest.TestCase):
         self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", top)
         self.assertNotIn("cancel-in-progress: true", workflow, "an unconditional cancel would cancel a push to main")
         self.assertNotIn("github.ref }}", top, "a push to main must not share a group: GitHub drops a PENDING run of a shared group even without cancel-in-progress")
-        self.assertEqual(workflow.count("macos-latest"), 1, "one macOS job per run: a single matrix entry")
+        entries = [e.strip() for line in jobs.splitlines() for m in [re.match(r"\s+os:\s*\[(.*?)\]\s*(?:#.*)?$", line)] if m for e in m.group(1).split(",")]
+        self.assertEqual(entries.count("macos-latest"), 2, "one macOS job per job of the run (the two jobs `test` and `test-cloud`, ask #868): a single matrix entry in each")
         on = top.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
         self.assertIn("\n  workflow_dispatch:\n", on, "a head can be re-run without a push")
         self.assertNotIn("inputs:", workflow, "a dispatch takes no inputs")
@@ -11226,7 +11323,7 @@ class TestAgentShellCalls(Base):
         for leak in ("secrettoken", "faketoken", "secretbody", "queryvalue", "acme/app"):
             self.assertNotIn(leak, text)
         row = json.loads(text.splitlines()[0])
-        self.assertEqual((row["account"], row["endpoint"], sorted(row)), ("acme-a", "api issues/#", ["account", "endpoint", "ts"]))
+        self.assertEqual((row["account"], row["endpoint"], sorted(row)), ("acme-a", "api issues/#", ["account", "endpoint", "lane", "ts"]))   # the lane is the one field added (#867)
 
     def test_nothing_is_counted_until_the_daemon_has_switched_counting_on_and_the_switchboards_own_calls_are_not(self):
         (self.state / "agent-calls-hours.json").unlink()
@@ -11271,6 +11368,185 @@ class TestAgentShellCalls(Base):
         hours, _ = sb.agent_calls.load_hours(str(self.state))
         self.assertEqual(sum(sum(r.get("daemon", {}).values()) for r in hours.values()), 2)
 
+    def test_lane_s1_calls_are_split_per_lane_and_account_and_status_shows_them(self):
+        self.shim("api", "repos/acme/app/issues/5")                                        # lane worker (the fake switchboard's whoami name)
+        self.shim("api", "repos/acme/app/issues/6")
+        self.users({"acme/app": "acme-b"})
+        self.shim("pr", "view", "3", env={"FLEET_SWITCHBOARD_BIN": "/nonexistent"})          # no identity and no role: unknown
+        self.shim("pr", "view", "3", env={"FLEET_SWITCHBOARD_BIN": "/nonexistent", "FLEET_SWITCHBOARD_ROLE": "tester"})   # a caller's variable never names its lane
+        self.assertEqual([json.loads(l).get("lane") for l in (self.state / "agent-calls.jsonl").read_text().splitlines()], ["worker", "worker", "unknown", "unknown"])
+        sb.agent_calls.fold(str(self.state), time.time(), {"acme-a": {"issues/#": 2}})
+        hours, _ = sb.agent_calls.load_hours(str(self.state))
+        lanes = {}
+        for row in hours.values():
+            for lane, accounts in row.get("lanes", {}).items():
+                lanes[lane] = sum(sum(e.values()) for e in accounts.values())
+        self.assertEqual(lanes, {"worker": 2, "unknown": 2, "daemon": 2})
+        text = "\n".join(sb.agent_calls.status_lines(str(self.state), time.time()))
+        self.assertIn("this hour per lane: daemon 2, unknown 2, worker 2", text)
+        self.assertIn("lane worker: acme-a 2 (api issues/# 2)", text)
+
+    def test_lane_an_old_spool_line_without_a_lane_is_read_as_unknown_and_a_hostile_lane_is_cleaned(self):
+        (self.state / "agent-calls.jsonl").write_text(json.dumps({"ts": int(time.time()), "account": "acme-a", "endpoint": "pr view"}) + "\n"
+                                                      + json.dumps({"ts": int(time.time()), "account": "acme-a", "endpoint": "pr view", "lane": "a b\nc"}) + "\n")
+        text = "\n".join(sb.agent_calls.status_lines(str(self.state), time.time()))
+        self.assertIn("unknown 1", text)
+        self.assertIn("a?b?c 1", text)
+        self.assertNotIn("a b", text)
+
+    def test_lane_s7_no_value_reaches_the_record_beside_the_lane(self):
+        self.shim("api", "repos/acme/app/issues/5?token=queryvalue", "-f", "body=secretbody", env={"GH_TOKEN": "secrettoken"})
+        row = json.loads((self.state / "agent-calls.jsonl").read_text().splitlines()[0])
+        self.assertEqual(sorted(row), ["account", "endpoint", "lane", "ts"])
+        sb.agent_calls.fold(str(self.state), time.time())
+        record = (self.state / "agent-calls-hours.json").read_text()
+        for leak in ("secrettoken", "secretbody", "queryvalue", "acme/app"):
+            self.assertNotIn(leak, record)
+
+    def test_daemon_classes_keep_their_class_and_two_that_reduce_alike_add(self):
+        now = time.time()
+        sb.agent_calls.fold(str(self.state), now, {"acme-a": {"api issues/#": 2, "api pulls/#": 1, "api graphql": 1}})
+        sb.agent_calls.fold(str(self.state), now, {"acme-b": {"api zz-one": 2, "api zz-two": 1, "browse x": 1}})   # three classes that all reduce to `other`/`api repo`/`browse`
+        hours, _ = sb.agent_calls.load_hours(str(self.state))
+        row = list(hours.values())[-1]
+        self.assertEqual(row["daemon"], {"acme-a": 4, "acme-b": 4})
+        cells = row["lanes"]["daemon"]
+        self.assertEqual(cells["acme-a"], {"api issues/#": 2, "api pulls/#": 1, "api graphql": 1})
+        self.assertEqual(sum(cells["acme-b"].values()), 4)
+        self.assertEqual(cells["acme-b"]["api repo"], 3)                                  # two classes reduced to one word: 2 + 1, not the last one
+        accounts = sb.GhAccounts({"gh": FAKE_GH, "call_timeout_seconds": 5, "gh_users": {}}, lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "{}", ""), time.time, environ={})
+        engine = types.SimpleNamespace(accounts=accounts, state_dir=self.state, now=time.time, _note=lambda *a, **k: None)
+        for path in ("repos/acme/app/issues/1", "repos/acme/app/pulls/2", "graphql"):
+            accounts.read(accounts.runner, path, "acme/app", 5)
+        sb.record_github_calls(engine)
+        hours, _ = sb.agent_calls.load_hours(str(self.state))
+        mine = list(hours.values())[-1]["lanes"]["daemon"]["default"]
+        self.assertEqual(mine, {"api issues/#": 1, "api pulls/#": 1, "api graphql": 1})   # the daemon's own classes survive the fold
+
+    def test_lane_a_failed_write_leaves_no_temp_file(self):
+        with mock.patch.object(sb.agent_calls.os, "replace", side_effect=OSError("no")):
+            self.assertFalse(sb.agent_calls._write_json(str(self.state / "x.json"), {"a": 1}))
+        self.assertEqual([f.name for f in self.state.iterdir() if f.name.startswith(".agent-calls-")], [])
+
+    def test_lane_lanes_are_bounded_per_hour(self):
+        lanes = "\n".join(json.dumps({"ts": int(time.time()), "account": "a", "endpoint": "pr view", "lane": "l%d" % i}) for i in range(60))
+        (self.state / "agent-calls.jsonl").write_text(lanes + "\n")
+        sb.agent_calls.fold(str(self.state), time.time())
+        hours, _ = sb.agent_calls.load_hours(str(self.state))
+        row = list(hours.values())[0]["lanes"]
+        self.assertLessEqual(len(row), sb.agent_calls.LANES_PER_HOUR + 1)
+        self.assertEqual(sum(sum(e.values()) for a in row.values() for e in a.values()), 60)
+
+    def test_lane_s10_an_unreadable_spool_still_runs_the_command(self):
+        (self.state / "agent-calls.jsonl").mkdir()
+        done = self.shim("api", "repos/acme/app/issues/5")
+        self.assertEqual((done.returncode, done.stdout.strip()), (7, "real gh out"))
+
+    def test_usage_s2_the_daemon_records_real_usage_once_a_minute_without_counting_it(self):
+        reset = int(time.time() // 3600) * 3600 + 3600   # the window then covers this whole hour bucket: no proration in the figure
+        asked = []
+
+        def runner(argv, **kw):
+            asked.append((argv, kw.get("env", {}).get("FLEET_SWITCHBOARD_OWN_GH")))
+            if argv[1:3] == ["auth", "token"]:
+                return subprocess.CompletedProcess(argv, 0, "tok\n", "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"resources": {"core": {"limit": 5000, "used": 4000, "remaining": 1000, "reset": reset}}}), "")
+
+        clock = [time.time()]
+        accounts = sb.GhAccounts({"gh": FAKE_GH, "call_timeout_seconds": 5, "gh_users": {"acme/*": "acme-a"}}, runner, lambda: clock[0], environ={})
+        engine = types.SimpleNamespace(accounts=accounts, state_dir=self.state, now=lambda: clock[0], _note=lambda *a, **k: None)
+        sb.agent_calls.fold(str(self.state), clock[0], {"acme-a": 100})
+        sb.record_github_calls(engine)
+        sb.record_github_calls(engine)                                                       # inside the minute: no second read
+        self.assertEqual(len([a for a in asked if a[0][1:] == ["api", "rate_limit"]]), 1)
+        self.assertEqual([a[1] for a in asked if a[0][1:] == ["api", "rate_limit"]], ["1"])  # the switchboard's own marker: the shim never counts it
+        self.assertEqual(len(accounts.calls), 0, "the rate-limit read is not a counted call")
+        body = json.loads((self.state / "github-usage.json").read_text())["accounts"]["acme-a"]
+        self.assertEqual((body["used"], body["remaining"], body["reset"]), (4000, 1000, reset))
+        text = "\n".join(sb.agent_calls.usage_lines(str(self.state), clock[0]))
+        self.assertIn("real usage acme-a: used 4000, remaining 1000", text)
+        self.assertIn("recorded 100, outside the shim and the daemon about 3900", text)
+        clock[0] += 61
+        sb.record_github_calls(engine)
+        self.assertEqual(len([a for a in asked if a[0][1:] == ["api", "rate_limit"]]), 2)
+
+    def test_usage_a_garbled_read_is_left_out_and_never_raises(self):
+        accounts = sb.GhAccounts({"gh": FAKE_GH, "call_timeout_seconds": 5, "gh_users": {"acme/*": "acme-a"}}, lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "not json", ""),
+                                 time.time, environ={})
+        self.assertEqual(accounts.read_usage(), {})
+        self.assertIn("not recorded", "\n".join(sb.agent_calls.usage_lines(str(self.state), time.time())))
+
+    def test_usage_the_default_token_the_account_cap_a_failed_runner_and_a_stale_reading(self):
+        good = json.dumps({"resources": {"core": {"limit": 5000, "used": 10, "remaining": 4990, "reset": int(time.time()) + 600}}})
+        users = {"acme/r%d" % i: "acct%d" % i for i in range(12)}
+
+        def runner(argv, **kw):
+            if argv[1:3] == ["auth", "token"]:
+                return subprocess.CompletedProcess(argv, 0, "tok\n", "")
+            if kw["env"].get("GH_TOKEN") == "tok" and "acct3" in str(self.__dict__.get("bad", "")):
+                raise OSError("boom")
+            return subprocess.CompletedProcess(argv, 0, good, "")
+
+        accounts = sb.GhAccounts({"gh": FAKE_GH, "call_timeout_seconds": 5, "gh_users": users}, runner, time.time, environ={"GH_TOKEN": "inherited"})
+        found = accounts.read_usage()
+        self.assertEqual(len(found), sb.agent_calls.USAGE_ACCOUNTS + 1)    # the cap, plus the default token's reading
+        self.assertIn("default", found)
+        failing = sb.GhAccounts({"gh": FAKE_GH, "call_timeout_seconds": 5, "gh_users": {"acme/*": "a"}},
+                                lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "no"), time.time, environ={})
+        self.assertEqual(failing.read_usage(), {})
+        sb.agent_calls.record_usage(str(self.state), time.time() - 900, {"a": (1, 4999, 5000, int(time.time()) + 600)})
+        self.assertIn("(read 15 min ago)", "\n".join(sb.agent_calls.usage_lines(str(self.state), time.time())))
+
+    def test_lane_endpoint_classes_per_lane_and_account_are_bounded(self):
+        rows = "\n".join(json.dumps({"ts": int(time.time()), "account": "a", "endpoint": "api " + sorted(sb.agent_calls.API_SUB)[i], "lane": "w"}) for i in range(40))
+        (self.state / "agent-calls.jsonl").write_text(rows + "\n")
+        sb.agent_calls.fold(str(self.state), time.time())
+        cell = list(sb.agent_calls.load_hours(str(self.state))[0].values())[0]["lanes"]["w"]["a"]
+        self.assertEqual((len(cell), sum(cell.values()), cell["other"]), (sb.agent_calls.ENDPOINTS_PER_CELL + 1, 40, 10))
+
+    def shim_module(self):
+        import importlib.machinery
+        loader = importlib.machinery.SourceFileLoader("gh_shim_endpoint", str(SHIM))
+        spec = importlib.util.spec_from_loader("gh_shim_endpoint", loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        return module
+
+    def test_endpoint_class_s7_no_name_reaches_any_record_from_any_call_shape(self):
+        """PC-1 as a class: an allow-list, so a name-bearing and a name-free variant of every gh shape records no name token (shim, spool, fold, status)."""
+        shim = self.shim_module()
+        name = "zzname"
+        shapes = [["api", "https://api.github.com/repos/acme-%s/app-%s/pulls/5" % (name, name)], ["api", "repos/acme-%s/app-%s/issues/5?q=%s" % (name, name, name)],
+                  ["api", "/repos/o-%s/n-%s/contents/dir-%s/file-%s.py" % (name, name, name, name)], ["api", "orgs/acme-%s/members" % name], ["api", "users/bob-%s/repos" % name],
+                  ["api", "teams/t-%s" % name], ["api", "search/issues?q=repo:acme-%s/app" % name], ["api", "user/repos"], ["api", "graphql"], ["api", "rate_limit"],
+                  ["api", "repos/o/n/git/ref/heads/feature-%s" % name], ["api", "http://host-%s.example/repos/o/n/issues/1" % name],
+                  ["browse", "acme-%s/app" % name], ["repo", "clone", "acme-%s/app" % name], ["repo", "view", "acme-%s/app" % name], ["pr", "view", "5", "-R", "acme-%s/app" % name],
+                  ["pr", "list"], ["issue", "list"], ["issue", "view", "acme-%s" % name], ["release", "view", "v-%s" % name], ["run", "view", "123"], ["workflow", "run", "ci-%s.yml" % name],
+                  ["gist", "view", "g-%s" % name], ["search", "prs", name], ["auth", "status"], ["label", "list"], ["ruleset", "view", "r-%s" % name],
+                  ["frobnicate-%s" % name, "x"], ["pr", "wibble-%s" % name]]
+        for args in shapes:
+            got = shim.call_endpoint(args)
+            self.assertNotIn(name, got, args)
+            self.assertNotIn("acme", got)
+            self.assertEqual(got, sb.agent_calls.reduce_endpoint(got), "idempotent")                     # the daemon side reduces again to the same
+            self.assertEqual(sb.agent_calls.reduce_endpoint(" ".join(shim.command_words(args)[:2])), got, "the shim and the daemon side are one rule")
+            self.assertNotIn(name, sb.agent_calls._endpoint("api https://api.github.com/repos/acme/app-%s/x" % name))
+        self.assertEqual(shim.call_endpoint(["api", "https://api.github.com/repos/acme/app/pulls/5"]), "api pulls/#")
+        self.assertEqual((shim.call_endpoint(["api", "orgs/acme-org/members"]), shim.call_endpoint(["browse", "acme/app"])), ("api orgs", "browse"))
+        self.assertEqual(shim.call_endpoint(["pr", "wibble"]), "pr")
+        self.assertEqual(shim.call_endpoint(["frob", "x"]), "other")
+
+    def test_endpoint_class_an_old_or_hostile_spool_line_cannot_carry_a_name_in(self):
+        (self.state / "agent-calls.jsonl").write_text(json.dumps({"ts": int(time.time()), "account": "a", "lane": "w", "endpoint": "api https://api.github.com/repos/acme/app-zzname/pulls/#"}) + "\n"
+                                                      + json.dumps({"ts": int(time.time()), "account": "a", "lane": "w", "endpoint": "browse acme/zzname"}) + "\n")
+        sb.agent_calls.fold(str(self.state), time.time())
+        self.assertNotIn("zzname", (self.state / "agent-calls-hours.json").read_text())
+        self.assertNotIn("zzname", "\n".join(sb.agent_calls.status_lines(str(self.state), time.time())))
+
+    def test_endpoint_class_the_daemons_own_record_is_reduced_too(self):
+        self.assertEqual(sb._endpoint_of("orgs/acme-org/members?x=1"), "orgs")
+        self.assertEqual(sb._endpoint_of("repos/acme/app/issues/12/parent"), "issues/#/parent")
+
     def test_the_fold_moves_the_spool_into_the_hours_and_loses_no_line(self):
         for _ in range(2):
             self.shim("api", "repos/acme/app/issues/5")
@@ -11280,6 +11556,312 @@ class TestAgentShellCalls(Base):
         hours, since = sb.agent_calls.load_hours(str(self.state))
         self.assertEqual(sum(sum(r.get("agent", {}).values()) for r in hours.values()), 2)
         self.assertEqual(stat.S_IMODE(os.stat(str(self.state / "agent-calls-hours.json")).st_mode), 0o600)
+
+
+class TestShimReadCache(Base):
+    """#867 clauses 3 and 4: a repeated identical `gh api <path>` read is answered from a short cache and revalidated with the entity tag; a write by the same agent
+    drops it; below 15 percent of the budget the shim says so once and serves a cached read instead of spending."""
+
+    def setUp(self):
+        TestAgentShellCalls.setUp(self)
+        (self.bin / "gh").write_text(
+            "#!/bin/sh\n[ \"$1\" = auth ] && { echo faketoken; exit 0; }\necho \"$@\" >> \"$FAKE_LOG\"\n"
+            "case \"$*\" in\n *If-None-Match*) printf 'HTTP/2.0 304 Not Modified\\r\\n\\r\\n'; exit 0;;\n"
+            " \"api -i \"*) printf 'HTTP/2.0 200 OK\\r\\nEtag: \"v1\"\\r\\n\\r\\n{\"n\":1}'; exit 0;;\n"
+            " \"api \"*) printf '{\"n\":1}'; exit 0;;\nesac\necho wrote\nexit 0\n")
+        self.log = self.home / "fake.log"
+        self.other = self.home / "othersb"
+        self.other.write_text(self.sb.read_text().replace("worker", "other"))
+        self.other.chmod(0o755)
+
+    def run_shim(self, *args, env=None):
+        return TestAgentShellCalls.shim(self, *args, env=dict({"FAKE_LOG": str(self.log)}, **(env or {})))
+
+    def network(self):
+        return self.log.read_text().splitlines() if self.log.exists() else []
+
+    def age(self, seconds):
+        cache = self.state / "gh-read-cache"
+        for name in os.listdir(cache):
+            if name.startswith(".w-"):
+                mark = json.loads((cache / name).read_text())
+                mark["ts"] -= seconds   # an agent's write mark ages with the entries
+                (cache / name).write_text(json.dumps(mark))
+                continue
+            entry = json.loads((cache / name).read_text())
+            entry["ts"] -= seconds
+            (cache / name).write_text(json.dumps(entry))
+
+    def usage(self, remaining, limit=5000, account="acme-a"):
+        (self.state / "github-usage.json").write_text(json.dumps({"v": 1, "at": time.time(), "accounts": {account: {"used": limit - remaining, "remaining": remaining, "limit": limit, "reset": time.time() + 900}}}))
+
+    users = TestAgentShellCalls.users
+    shim_module = TestAgentShellCalls.shim_module
+    PATH = "repos/acme/app/issues/5"
+
+    def test_s3_a_repeated_read_is_served_from_the_cache_then_revalidated_and_a_304_is_not_counted(self):
+        first = self.run_shim("api", self.PATH)
+        second = self.run_shim("api", self.PATH)
+        self.assertEqual((first.stdout, second.stdout, second.returncode), ('{"n":1}', '{"n":1}', 0))
+        self.assertEqual(len(self.network()), 1, "2 reads, 1 network call")
+        self.age(31)
+        third = self.run_shim("api", self.PATH)
+        self.assertEqual(third.stdout, '{"n":1}')
+        self.assertEqual(len(self.network()), 2)
+        self.assertIn("If-None-Match: \"v1\"", self.network()[1])
+        self.assertEqual(len((self.state / "agent-calls.jsonl").read_text().splitlines()), 1, "the 304 is not counted as a call")
+
+    def test_s8_a_write_by_the_same_agent_drops_its_entries_and_another_agents_write_does_not(self):
+        self.run_shim("api", self.PATH)
+        self.run_shim("api", self.PATH)
+        self.assertEqual(len(self.network()), 1)
+        self.run_shim("api", self.PATH, env={"FLEET_SWITCHBOARD_BIN": str(self.other)})   # the other agent has its own entry (key includes the agent)
+        self.assertEqual(len(self.network()), 2)
+        self.run_shim("issue", "edit", "5", "-t", "x", env={"FLEET_SWITCHBOARD_BIN": str(self.other)})   # a write by the other agent
+        self.run_shim("api", self.PATH)
+        self.assertEqual(len([l for l in self.network() if l.startswith("api")]), 2, "the first agent's entry survived the other agent's write")
+        self.run_shim("issue", "edit", "5", "-t", "x")                                     # a write by the first agent
+        self.run_shim("api", self.PATH)
+        self.assertEqual(len([l for l in self.network() if l.startswith("api")]), 3, "its next read goes to GitHub")
+
+    def test_s4_below_15_percent_one_warning_a_cached_read_is_served_and_a_write_is_never_refused(self):
+        self.usage(500)
+        first = self.run_shim("api", self.PATH)
+        self.assertEqual(first.stderr.count("warning"), 1)
+        write = self.run_shim("issue", "edit", "5", "-t", "x")
+        self.assertEqual((write.returncode, write.stderr.count("warning")), (0, 0))      # one line a minute
+        self.age(20)                                                                      # past the write's grace window
+        self.run_shim("api", self.PATH)                                                   # the write dropped the entry: this read spends and stores
+        before = len(self.network())
+        self.age(100)                                                                     # older than the fresh bound, still in the stale bound
+        again = self.run_shim("api", self.PATH)
+        self.assertEqual((again.stdout, len(self.network())), ('{"n":1}', before), "served from the cache instead of spending")
+
+    def test_s5_s9_far_from_the_limit_output_and_exit_status_are_those_of_the_plain_call(self):
+        self.usage(3000)
+        for args in (("api", self.PATH), ("issue", "edit", "5", "-t", "x"), ("pr", "view", "3")):
+            plain = self.run_shim(*args, env={"FLEET_SHIM_CACHE": "off"})
+            now = self.run_shim(*args)
+            self.assertEqual((now.stdout, now.stderr, now.returncode), (plain.stdout, plain.stderr, plain.returncode), args)
+            self.assertNotIn("warning", now.stderr)
+
+    def test_s10_a_cache_that_cannot_be_written_still_reaches_gh(self):
+        (self.state / "gh-read-cache").write_text("not a directory")
+        (self.state / "agent-calls.jsonl").mkdir()
+        done = self.run_shim("api", self.PATH)
+        self.assertEqual((done.returncode, done.stdout, len(self.network())), (0, '{"n":1}', 1))
+
+    def test_edges_an_error_answer_garbage_a_corrupt_entry_and_a_304_with_no_entry_pass_through_and_cache_nothing(self):
+        gh = self.bin / "gh"
+        good = gh.read_text()
+        gh.write_text("#!/bin/sh\n[ \"$1\" = auth ] && { echo faketoken; exit 0; }\necho \"$@\" >> \"$FAKE_LOG\"\n"
+                      "case \"$FAKE_MODE\" in\n 404) printf 'HTTP/2.0 404 Not Found\\r\\n\\r\\n{\"message\":\"Not Found\"}'; echo 'gh: Not Found (HTTP 404)' >&2; exit 1;;\n"
+                      " garbage) printf 'not http at all'; exit 0;;\n 304) printf 'HTTP/2.0 304 Not Modified\\r\\n\\r\\n'; exit 0;;\nesac\nexit 0\n")
+        for mode, code, out in (("404", 1, '{"message":"Not Found"}'), ("garbage", 0, "not http at all"), ("304", 0, "")):
+            done = self.run_shim("api", self.PATH, env={"FAKE_MODE": mode})
+            self.assertEqual((done.returncode, done.stdout), (code, out), mode)
+            if mode == "404":
+                self.assertIn("HTTP 404", done.stderr)
+            cache = self.state / "gh-read-cache"
+            self.assertEqual([n for n in (os.listdir(cache) if cache.exists() else []) if n.endswith(".json")], [], mode)
+        gh.write_text(good)
+        self.run_shim("api", self.PATH)
+        cache = self.state / "gh-read-cache"
+        for name in os.listdir(cache):
+            (cache / name).write_text("{not json")
+        before = len(self.network())
+        self.assertEqual(self.run_shim("api", self.PATH).stdout, '{"n":1}')
+        self.assertEqual(len(self.network()), before + 1, "a corrupt entry is a miss")
+        self.age(700)
+        before = len(self.network())
+        self.run_shim("api", self.PATH)
+        self.assertEqual(len(self.network()), before + 1, "an entry older than the bound is a miss")
+
+    def test_edges_low_budget_with_no_entry_spends_and_a_stale_reading_is_ignored(self):
+        self.usage(100)
+        first = self.run_shim("api", self.PATH)
+        self.assertEqual((first.stdout, len(self.network())), ('{"n":1}', 1))          # nothing to serve: it spends, never refuses
+        (self.state / "github-usage.json").write_text(json.dumps({"v": 1, "at": time.time() - 3600, "accounts": {"acme-a": {"used": 4900, "remaining": 100, "limit": 5000, "reset": time.time()}}}))
+        shutil.rmtree(str(self.state / "gh-low-warned"), ignore_errors=True)
+        self.age(100)
+        again = self.run_shim("api", self.PATH)
+        self.assertEqual((again.stderr, len(self.network())), ("", 2), "a reading an hour old is ignored: no warning, and the stale entry is revalidated")
+
+    def test_edges_a_path_that_names_the_working_directory_or_a_host_is_not_cached(self):
+        self.run_shim("api", "repos/{owner}/{repo}/issues")
+        self.run_shim("api", self.PATH, env={"GH_HOST": "ghe.example"})
+        cache = self.state / "gh-read-cache"
+        self.assertEqual([n for n in (os.listdir(cache) if cache.exists() else []) if n.endswith(".json")], [])
+
+    def test_edges_a_failed_output_after_the_request_never_makes_a_second_request(self):
+        module = self.shim_module()
+        calls = []
+        real_run = module.subprocess.run
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, b'HTTP/2.0 200 OK\r\nEtag: "v1"\r\n\r\n{"n":1}', b"")
+
+        class Broken:
+            def isatty(self):
+                return False
+
+            @property
+            def buffer(self):
+                raise BrokenPipeError("closed")
+
+        os.environ["FLEET_SWITCHBOARD_STATE"] = str(self.state)
+        self.addCleanup(os.environ.pop, "FLEET_SWITCHBOARD_STATE", None)
+        with mock.patch.object(module.subprocess, "run", fake_run), mock.patch.object(module.sys, "stdout", Broken()):
+            status = module.cached_read("gh", {}, ["api", self.PATH], "worker", "acme-a", None)
+        self.assertEqual((status, len(calls)), (0, 1))
+
+    def test_m2_paths_that_report_a_state_are_never_cached_in_any_spelling(self):
+        forms = ["rate_limit", "/rate_limit", "rate_limit?x=1", "RATE_LIMIT", "rate_limit/", "https://api.github.com/rate_limit", "%72ate_limit", "%2572ate_limit", "repos/../rate_limit",
+                 "api/v3/rate_limit", "user", "user/", "applications/abc/token", "installation/repositories", "notifications",
+                 "repos/acme/app/commits/abc/check-runs", "repos/acme/app/commits/abc/status", "repos/acme/app/actions/runs/1", "repos/acme/app/actions/jobs/2"]
+        for form in forms:
+            self.log.write_text("") if self.log.exists() else None
+            self.run_shim("api", form)
+            self.run_shim("api", form)
+            self.assertEqual(len(self.network()), 2, form)
+            cache = self.state / "gh-read-cache"
+            self.assertEqual([n for n in (os.listdir(cache) if cache.exists() else []) if n.endswith(".json")], [], form)
+
+    def test_m2_the_table_is_what_the_shim_denies(self):
+        module = self.shim_module()
+        for word in module.NEVER_CACHED:
+            self.assertTrue(module.never_cached("repos/o/n/%s" % word) or module.never_cached(word), word)
+            self.assertIsNone(module.cacheable_read(["api", "/%s/" % word.upper()]), word)
+        self.assertIsNotNone(module.cacheable_read(["api", "repos/acme/app/issues/5"]))
+        self.assertIsNotNone(module.cacheable_read(["api", "repos/user/status/issues/1"]), "an owner or repository NAMED like a state word is still a name")
+
+    def test_m1_a_read_in_flight_across_a_write_by_the_same_agent_never_stores_its_old_answer(self):
+        module = self.shim_module()
+        os.environ["FLEET_SWITCHBOARD_STATE"] = str(self.state)
+        self.addCleanup(os.environ.pop, "FLEET_SWITCHBOARD_STATE", None)
+        out = io.BytesIO()
+
+        class Out:
+            def isatty(self):
+                return False
+            buffer = out
+
+        for write_finishes_first in (True, False):
+            shutil.rmtree(str(self.state / "gh-read-cache"), ignore_errors=True)
+
+            def slow_read(argv, **kw):
+                module.cache_drop("worker")                      # the same agent's write begins while the request is in flight
+                if write_finishes_first:
+                    module.cache_mark("worker")                  # and ends before the read does
+                return subprocess.CompletedProcess(argv, 0, b'HTTP/2.0 200 OK\r\nEtag: "v1"\r\n\r\n{"old":1}', b"")
+
+            with mock.patch.object(module.subprocess, "run", slow_read), mock.patch.object(module.sys, "stdout", Out()):
+                module.cache_directory(create=True)
+                os.utime(str(self.state / "gh-read-cache"))
+                status = module.cached_read("gh", {}, ["api", self.PATH], "worker", "acme-a", None)
+            self.assertEqual(status, 0)
+            cache = self.state / "gh-read-cache"
+            self.assertEqual([n for n in os.listdir(cache) if n.endswith(".json")], [], "the pre-write answer was not stored (write finishing first: %s)" % write_finishes_first)
+
+    def test_m1_a_read_made_inside_the_grace_window_after_a_write_goes_to_github_and_stores_nothing(self):
+        self.run_shim("api", self.PATH)
+        self.run_shim("issue", "edit", "5", "-t", "x")
+        before = len(self.network())
+        self.run_shim("api", self.PATH)
+        self.run_shim("api", self.PATH)
+        self.assertEqual(len(self.network()), before + 2)
+        self.age(20)
+        self.run_shim("api", self.PATH)
+        self.run_shim("api", self.PATH)
+        self.assertEqual(len(self.network()), before + 3, "after the window the cache works again")
+
+    def test_cross_calls_two_accounts_do_not_share_and_a_paginated_read_is_not_served_from_the_cache(self):
+        self.run_shim("api", self.PATH)
+        self.users({"acme/app": "acme-b"})
+        self.run_shim("api", self.PATH)
+        self.assertEqual(len(self.network()), 2, "another account is another key")
+        self.run_shim("api", self.PATH, "--paginate")
+        self.assertEqual(len(self.network()), 3, "a call of another shape is never answered from the cache")
+
+    def overlapped(self, module, entry_age, answer, write_between=True):
+        """Run cached_read for a path with an entry of `entry_age` seconds, while a write by the same agent happens during the request. Returns (status, files left)."""
+        os.environ["FLEET_SWITCHBOARD_STATE"] = str(self.state)
+        self.addCleanup(os.environ.pop, "FLEET_SWITCHBOARD_STATE", None)
+        shutil.rmtree(str(self.state / "gh-read-cache"), ignore_errors=True)
+        directory = module.cache_directory(create=True)
+        file = module.cache_file(directory, "worker", "acme-a", self.PATH)
+        module.cache_store(directory, file, '"v1"', '{"old":1}', time.time() - entry_age)
+        out = io.BytesIO()
+
+        class Out:
+            def isatty(self):
+                return False
+            buffer = out
+
+        def request(argv, **kw):
+            if write_between:
+                module.cache_drop("worker")   # the same agent writes while the request is in flight
+            return subprocess.CompletedProcess(argv, 0, answer, b"")
+
+        with mock.patch.object(module.subprocess, "run", request), mock.patch.object(module.sys, "stdout", Out()):
+            status = module.cached_read("gh", {}, ["api", self.PATH], "worker", "acme-a", None)
+        return status, [n for n in os.listdir(directory) if n.endswith(".json")], out.getvalue()
+
+    def test_every_store_of_the_cache_is_guarded_by_the_write_mark_and_each_is_pinned(self):
+        """Completeness: the shim's cache is written in exactly these places; a new one must be added here with an overlapped test."""
+        source = SHIM.read_text()
+        self.assertEqual(source.count("cache_store("), 3, "one definition and two call sites (the 304 refresh and the 2xx store): pin any new one below")
+        self.assertEqual(source.count("not raced"), 2, "both call sites are behind the write mark")
+        module = self.shim_module()
+        # the 304 refresh: an old entry is revalidated while the same agent writes: nothing is rewritten, and the next read goes to GitHub
+        status, files, out = self.overlapped(module, 40, b"HTTP/2.0 304 Not Modified\r\n\r\n")
+        self.assertEqual((status, files), (0, []))
+        # the 2xx store: same overlap
+        status, files, out = self.overlapped(module, 40, b'HTTP/2.0 200 OK\r\nEtag: "v2"\r\n\r\n{"new":1}')
+        self.assertEqual((status, files, out), (0, [], b'{"new":1}'))
+        # and with no write in between both are stored (the guard is not a blanket refusal)
+        status, files, out = self.overlapped(module, 40, b"HTTP/2.0 304 Not Modified\r\n\r\n", write_between=False)
+        self.assertEqual((status, len(files), out), (0, 1, b'{"old":1}'))
+        # the drop itself removes only this agent's entries
+        directory = module.cache_directory()
+        other = module.cache_file(directory, "someone", "acme-a", self.PATH)
+        module.cache_store(directory, other, None, "{}", time.time())
+        module.cache_drop("worker")
+        self.assertTrue(os.path.exists(other))
+
+    def test_m2_double_percent_encoding_is_read_as_what_it_decodes_to(self):
+        module = self.shim_module()
+        self.assertEqual(module.normal_api_path("%2572ate_limit"), ["rate_limit"])
+        self.assertTrue(module.never_cached("%2572ate_limit"))
+
+    def test_the_cache_is_private_and_holds_no_token(self):
+        self.run_shim("api", self.PATH, env={"GH_TOKEN": "secrettoken"})
+        cache = self.state / "gh-read-cache"
+        self.assertEqual(stat.S_IMODE(os.stat(str(cache)).st_mode), 0o700)
+        for name in os.listdir(cache):
+            self.assertEqual(stat.S_IMODE(os.stat(str(cache / name)).st_mode), 0o600)
+            self.assertNotIn("acme", name)
+            for leak in ("secrettoken", "faketoken", "acme-a"):
+                self.assertNotIn(leak, (cache / name).read_text())
+
+    def test_only_the_plain_get_shape_is_cached_and_the_cache_is_bounded(self):
+        self.run_shim("api", self.PATH, "--jq", ".n")
+        self.run_shim("api", self.PATH, "-X", "GET")
+        self.run_shim("pr", "view", "3")
+        self.assertFalse((self.state / "gh-read-cache").exists() and os.listdir(self.state / "gh-read-cache"))
+        module = TestAgentShellCalls.shim_module(self)
+        directory = self.state / "gh-read-cache"
+        directory.mkdir(exist_ok=True)
+        module.CACHE_FILES_MAX = 10
+        for i in range(15):
+            module.cache_store(str(directory), str(directory / ("a%02d.json" % i)), None, "{}", time.time())
+        self.assertLessEqual(len([n for n in os.listdir(directory) if n.endswith(".json")]), 10)
+        old = directory / "old.json"
+        old.write_text("{}")
+        os.utime(str(old), (time.time() - 3600, time.time() - 3600))
+        module.cache_store(str(directory), str(directory / "new.json"), None, "{}", time.time())
+        self.assertFalse(old.exists(), "an entry older than the age bound is removed")
 
 
 class TestIntentReader(IntentCase):
@@ -13661,7 +14243,9 @@ class TestClearNotice(Base):
 
     def route(self, argv, **kwargs):
         if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
-            raw = {"state": "OPEN", "headRefOid": self.head, "title": "t", "labels": [{"name": n} for n in self.labels], "body": self.body}
+            if getattr(self, "unreadable", False):
+                return subprocess.CompletedProcess(argv, 1, "", "HTTP 502")
+            raw = {"state": getattr(self, "pr_state", "OPEN"), "headRefOid": self.head, "title": "t", "labels": [{"name": n} for n in self.labels], "body": self.body}
             return subprocess.CompletedProcess(argv, 0, json.dumps(raw), "")
         if argv[0] == FAKE_GH and argv[1] == "api" and "--method" in argv:
             self.order.append(argv[argv.index("--method") + 1] + " " + argv[2].rsplit("/", 1)[-1])
@@ -13929,6 +14513,346 @@ class TestClearNotice(Base):
         self.clear()
         (cleared,) = self.events("gate.hold_cleared")
         self.assertEqual(cleared["detail"]["removed"], [self.names["hold-impact"], self.names["merge-captain"]], "#742: the author's merge label comes off with the clear")
+
+
+    # ---- #827: a recorded clear's notice is never lost: pending record, the daemon pass, one reminder
+
+    def pending(self):
+        return sb._read_small(self.world.state, sb.CLEAR_PENDING_FILE)
+
+    def delivered(self):
+        return sb._read_small(self.world.state, sb.CLEAR_NOTIFIED_FILE)
+
+    def later(self, seconds=sb.CLEAR_NOTICE_CLAIM_SECONDS + 1):
+        self.world.clock.t += seconds
+        return self.world.clock.now()
+
+    def pass_(self, seconds=None):
+        sb.clear_notice_pass(self.engine, self.later() if seconds is None else self.later(seconds))
+
+    def block_sends(self):
+        """Every send blocks until released: the notice times out at the deadline, as a slow send does under load. Returns the event."""
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self.real_send = self.engine.send
+        self.send_returned = []
+
+        def slow(*a, **k):
+            release.wait(30)   # only a safety: the tests release it themselves
+            self.send_returned.append(1)
+            return self.real_send(*a, **k)
+        self.engine.send = slow
+        return release
+
+    def settle(self):
+        for late in [t for t in threading.enumerate() if t.name == "clear-notice"]:
+            late.join(5)
+
+    def test_s2_a_notice_that_times_out_is_pending_the_command_says_queued_and_the_next_pass_delivers_it_exactly_once(self):
+        release = self.block_sends()
+        with mock.patch.object(sb, "NOTIFY_CLEAR_DEADLINE_SECONDS", 0.05):
+            lines = self.clear()
+        self.assertEqual((release.is_set(), self.send_returned), (False, []), "the command returned while the send was still blocked: it did not wait for it (no clock)")
+        self.assertTrue(any("queued for delivery" in l for l in lines), lines)
+        key = sb._clear_notice_key(self.REPO, 7, self.HEAD, "clear")
+        self.assertIn(key, self.pending())
+        self.assertNotIn(key, self.delivered())
+        release.set()
+        self.settle()   # the late thread of the command may finish its own sends: it is the same record, told once
+        self.engine.send = self.real_send
+        self.pass_()
+        self.pass_()
+        self.assertEqual(len(self.told("cos")), 1)
+        self.assertEqual(self.pending(), {})
+        self.assertIn(key, self.delivered())
+
+    def test_s2_a_notice_cut_off_with_the_process_is_delivered_by_the_pass_to_both_recipients(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        self.engine.send = lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt())   # the process dies in the first send
+        self.clear()
+        key = sb._clear_notice_key(self.REPO, 7, self.HEAD, "clear")
+        self.assertIn(key, self.pending())
+        self.assertEqual((self.told("cos"), self.told("orch-a")), ([], []))
+        self.engine.send = self.world.new_engine("daemon").send
+        self.pass_()
+        self.assertEqual((len(self.told("cos")), len(self.told("orch-a"))), (1, 1))
+        self.assertEqual(self.pending(), {})
+
+    def test_s3_a_delivered_notice_is_never_repeated_and_only_the_recipient_not_yet_told_is_told_on_a_retry(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        real = self.engine.send
+        self.engine.send = lambda s, r, t, **k: {"sent": False, "reason": "down"} if r == "orch-a" else real(s, r, t, **k)
+        self.clear()
+        key = sb._clear_notice_key(self.REPO, 7, self.HEAD, "clear")
+        self.assertEqual(self.pending()[key]["sent"], ["chief-of-staff"])
+        self.engine.send = real
+        self.pass_()
+        self.pass_()
+        self.pass_()
+        self.assertEqual((len(self.told("cos")), len(self.told("orch-a"))), (1, 1), "cos was told once, the lane once")
+        self.assertEqual(self.pending(), {})
+        sb.notify_clear(self.engine, "clear", self.REPO, 7, self.HEAD, reason="again", body="")
+        self.assertEqual((len(self.told("cos")), len(self.told("orch-a"))), (1, 1), "a delivered notice is not made again")
+
+    def make_pending(self, kind):
+        """One pending notice of `kind`, made by the real `notify_clear` with a send that fails; every kind of `sb.CLEAR_NOTICE_KINDS` has its own call."""
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        extra = {"clear": dict(reason="a fixture"), "carry": dict(previous="f" * 40)}[kind]
+        sb.notify_clear(self.engine, kind, self.REPO, 7, self.HEAD, body="", **extra)
+        self.assertEqual(list(self.pending()), [sb._clear_notice_key(self.REPO, 7, self.HEAD, kind)])
+        self.engine.send = self.world.new_engine("daemon").send
+
+    def test_the_kinds_table_is_complete_derived_from_the_callers(self):
+        import ast
+        seen = set()
+        for path in (BIN / "fleet-switchboard", BIN / "impact_hold.py"):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "notify_clear" and len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
+                    seen.add(node.args[1].value)
+        self.assertEqual(seen, set(sb.CLEAR_NOTICE_KINDS), "every kind a caller notifies is in the table, and the table holds no other")
+        sb.clear_notice_record(self.engine, "nonsense", self.REPO, 7, self.HEAD)
+        self.assertEqual(self.pending(), {}, "a kind outside the table is never recorded")
+
+    def test_s4_for_every_kind_a_pull_request_merged_or_closed_or_with_a_new_head_drops_the_pending_record_and_sends_nothing(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            for label, state, head in (("merged", "MERGED", self.HEAD), ("closed", "CLOSED", self.HEAD), ("head changed", "OPEN", "b" * 40)):
+                with self.subTest(kind=kind, why=label):
+                    self.setUp()
+                    self.make_pending(kind)
+                    self.pr_state, self.head = state, head
+                    self.pass_()
+                    self.assertEqual(self.pending(), {})
+                    self.assertEqual(self.world.admissions("cos"), [])
+                    (event,) = self.events("gate.clear_notice_dropped")
+                    self.assertTrue(event["detail"]["why"], label)
+
+    def test_s8_for_every_kind_a_pull_request_that_cannot_be_read_whole_keeps_the_record_and_sends_nothing(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            with self.subTest(kind=kind):
+                self.setUp()
+                self.make_pending(kind)
+                self.unreadable = True
+                self.pass_()
+                self.assertEqual(len(self.pending()), 1)
+                self.assertEqual((self.world.admissions("cos"), self.events("gate.clear_notice_dropped")), ([], []))
+                self.unreadable = False
+                self.pass_()
+                self.assertEqual((len(self.world.admissions("cos")), self.pending()), (1, {}))
+
+    def test_s2_for_every_kind_and_the_standing_order_variant_a_failed_notice_is_pending_and_the_pass_delivers_it_once(self):
+        order = {"number": 5, "text": "clear fixtures", "by": "cos"}
+        paths = [(kind, {}) for kind in sb.CLEAR_NOTICE_KINDS] + [("clear", {"under_order": order})]
+        for kind, extra in paths:
+            with self.subTest(kind=kind, extra=sorted(extra)):
+                self.setUp()
+                self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+                kw = dict(extra, **({"previous": "f" * 40} if kind == "carry" else {"reason": "a fixture"}))
+                sb.notify_clear(self.engine, kind, self.REPO, 7, self.HEAD, body="", **kw)
+                self.assertIn(sb._clear_notice_key(self.REPO, 7, self.HEAD, kind), self.pending())
+                self.engine.send = self.world.new_engine("daemon").send
+                self.pass_()
+                self.pass_()
+                (told,) = self.world.admissions("cos")
+                self.assertEqual(self.pending(), {})
+                self.assertIn(self.HEAD[:8], told["text"])
+                self.assertEqual(("under the owner's standing order" in told["text"], "carried" in told["text"]), (bool(extra), kind == "carry"))
+
+    def test_the_notice_wording_is_the_same_whether_the_command_or_the_pass_sends_it(self):
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        self.clear(reason="the same words")
+        self.engine.send = self.world.new_engine("daemon").send
+        self.pass_()
+        (line,) = self.told("cos")
+        self.assertTrue(line.startswith('owner cleared %s at %s: "the same words"; ' % (self.PR, "a" * 8)), line)
+
+    def test_a_token_in_the_reason_is_never_written_to_the_pending_file(self):
+        token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0" * 2
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        self.clear(reason="x " + token)
+        self.assertNotIn("a1B2c3D4e5F6g7H8i9J0", (Path(self.world.state) / sb.CLEAR_PENDING_FILE).read_text())
+
+    # -- the one reminder
+
+    def ready_pr(self, mergeable="MERGEABLE", ready=True, state="open", head=None, examined=None, whole=True):
+        picture = self.engine.__dict__.setdefault("ci_record_state", sb.CiRecordState())
+        head = head or self.HEAD
+        picture.pr_state["%s#7" % self.REPO] = {"state": state, "head": head, "mergeable": mergeable, "gates": {"ready": ready, "missing": []}, "examined_head": examined or head}
+        sb.read_mark(self.engine, "pulls:" + self.REPO, whole, "" if whole else "cut", self.world.clock.now())
+
+    def reminders(self):
+        return [a for a in self.world.admissions("orch-a") if "cleared, merge it" in a["text"]]
+
+    def test_s6_one_reminder_per_head_after_the_delay_and_a_new_cleared_head_gets_its_own(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        self.clear()
+        self.ready_pr()
+        self.pass_(14 * 60 - sb.CLEAR_NOTICE_CLAIM_SECONDS - 1)
+        self.assertEqual(self.reminders(), [], "not before clear_remind_minutes")
+        self.pass_(120)
+        self.pass_()
+        self.pass_()
+        self.assertEqual(len(self.reminders()), 1)
+        self.head = "c" * 40
+        self.clear()
+        self.ready_pr(head="c" * 40)
+        self.pass_(15 * 60)
+        self.pass_()
+        self.assertEqual(len(self.reminders()), 2)
+
+    def count_sends(self, only=None, to=None):
+        """Wrap the engine's send: every call to it is counted (the ones whose text holds `only`, when given); a send that always fails. Returns the list of calls."""
+        calls = []
+
+        def down(sender, recipient, text, **kw):
+            if (only is None or only in text) and (to is None or recipient == to):
+                calls.append(self.world.clock.now())
+                return {"sent": False, "reason": "down"}
+            return self.real_send(sender, recipient, text, **kw)
+        self.real_send = self.world.new_engine("daemon").send
+        self.engine.send = down
+        return calls
+
+    def run_cadence(self, seconds, step=5):
+        """The daemon's REAL pass cadence: a pass every `step` seconds of the fake clock for `seconds` (never one jump per pass)."""
+        for _ in range(seconds // step):
+            sb.clear_notice_pass(self.engine, self.later(step))
+
+    def test_s3_for_every_kind_a_lane_that_is_down_for_ten_minutes_still_gets_the_notice_when_it_is_back_and_the_retries_are_spaced(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            with self.subTest(kind=kind):
+                self.setUp()
+                calls = self.count_sends(to="chief-of-staff")
+                extra = {"clear": dict(reason="a fixture"), "carry": dict(previous="f" * 40)}[kind]
+                sb.notify_clear(self.engine, kind, self.REPO, 7, self.HEAD, body="", **extra)
+                self.assertEqual(len(calls), 1, "the command tries once")
+                self.run_cadence(55)
+                self.assertEqual(len(calls), 1, "nothing is retried in the first minute: the 5 s passes do not spend the tries")
+                self.run_cadence(545)   # ten minutes in all
+                self.assertEqual(len(calls), 1 + len(sb.CLEAR_NOTICE_BACKOFF[:3]), "retries after the backoff steps (1, 2 and 5 minutes), not one per pass")
+                self.assertEqual(len(self.pending()), 1, "ten minutes down: still pending, not given up")
+                self.assertEqual(self.events("gate.clear_notice_abandoned"), [])
+                self.engine.send = self.real_send   # the lane is back
+                self.run_cadence(sb.CLEAR_NOTICE_BACKOFF[3] + 5)
+                self.assertEqual(self.pending(), {})
+                self.assertEqual(len(self.world.admissions("cos")), 1, "told once")
+
+    def test_s3_for_every_kind_a_notice_pending_for_longer_than_the_age_bound_is_given_up_loudly_never_by_a_count(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            with self.subTest(kind=kind):
+                self.setUp()
+                calls = self.count_sends(to="chief-of-staff")
+                extra = {"clear": dict(reason="a fixture"), "carry": dict(previous="f" * 40)}[kind]
+                sb.notify_clear(self.engine, kind, self.REPO, 7, self.HEAD, body="", **extra)
+                self.run_cadence(3600)
+                self.assertEqual(len(self.pending()), 1, "an hour of failures is not a reason to give up")
+                before = len(calls)
+                sb.clear_notice_pass(self.engine, self.later(sb.CLEAR_NOTICE_MAX_AGE_SECONDS))
+                (event,) = self.events("gate.clear_notice_abandoned")
+                self.assertIn("gave up", event["detail"]["why"])
+                self.assertEqual((self.pending(), len(calls)), ({}, before))
+
+    def test_a_malformed_pending_entry_is_quarantined_and_the_notices_after_it_are_still_delivered(self):
+        self.make_pending("clear")
+        pending = self.pending()
+        (good,) = pending
+        for label, bad in {"at": {"at": "x"}, "claimed": {"claimed": "y"}, "next_at": {"next_at": []}, "not a notice": {"kind": "nope"}, "under_order": {"under_order": 3}}.items():
+            with self.subTest(label):
+                poisoned = dict(pending, poison=dict(dict(pending[good], number=9), **bad))
+                poisoned["poison"]["at"] = poisoned["poison"].get("at", 0)
+                sb._write_small(self.world.state, sb.CLEAR_PENDING_FILE, poisoned)
+                sb.clear_notice_pass(self.engine, self.later())
+                self.assertEqual(self.pending(), {}, "the good one is delivered and the poison is gone")
+                self.assertTrue(self.events("gate.clear_notice_quarantined"))
+                self.world.admissions("cos").clear() if False else None
+                self.setUp()
+                self.make_pending("clear")
+                pending = self.pending()
+                (good,) = pending
+
+    def test_the_cap_of_pending_notices_audits_what_it_drops(self):
+        filler = {sb._clear_notice_key(self.REPO, 100 + i, "e" * 40, "clear"): {"repo": self.REPO, "number": 100 + i, "head": "e" * 40, "kind": "clear", "at": i + 1, "claimed": 0, "attempts": 0, "sent": []} for i in range(sb.CLEAR_PENDING_MAX)}
+        sb._write_small(self.world.state, sb.CLEAR_PENDING_FILE, filler)
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        sb.notify_clear(self.engine, "clear", self.REPO, 7, self.HEAD, reason="x", body="")
+        self.assertEqual(len(self.pending()), sb.CLEAR_PENDING_MAX)
+        (event,) = self.events("gate.clear_notice_dropped_cap")
+        self.assertIn("oldest", event["detail"]["why"])
+
+    def test_a_corrupt_pending_file_is_kept_aside_and_audited_never_overwritten_silently(self):
+        path = Path(self.world.state) / sb.CLEAR_PENDING_FILE
+        path.write_text("{ this is not json")
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        sb.notify_clear(self.engine, "clear", self.REPO, 7, self.HEAD, reason="x", body="")
+        self.assertEqual(Path(str(path) + ".corrupt").read_text(), "{ this is not json")
+        self.assertTrue(self.events("gate.clear_notice_corrupt"))
+        self.assertEqual(len(self.pending()), 1, "the new notice is recorded in a fresh file")
+
+    def test_one_pull_request_is_read_once_per_pass_however_many_notices_are_pending_for_it(self):
+        self.make_pending("clear")
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        sb.notify_clear(self.engine, "carry", self.REPO, 7, self.HEAD, body="", previous="f" * 40)
+        self.engine.send = self.world.new_engine("daemon").send
+        self.assertEqual(len(self.pending()), 2)
+        self.later()
+        reads = []
+        real = sb.read_pr_json
+        with mock.patch.object(sb, "read_pr_json", side_effect=lambda *a, **k: (reads.append(1), real(*a, **k))[1]):
+            sb.clear_notice_pass(self.engine, self.later())
+        self.assertEqual(len(reads), 1)
+
+    def test_a_reminder_send_that_always_fails_is_spaced_by_the_backoff_given_up_only_by_age_and_never_recorded_as_sent(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        self.clear()
+        self.ready_pr()
+        calls = self.count_sends(only="cleared, merge it")
+        self.run_cadence(15 * 60)
+        first = len(calls)
+        self.assertEqual(first, 1, "the first reminder is tried once at the delay")
+        self.run_cadence(10 * 60)
+        self.assertEqual(len(calls), 1 + len(sb.CLEAR_NOTICE_BACKOFF[:3]) - 1 + (1 if sb.CLEAR_NOTICE_BACKOFF[0] + sb.CLEAR_NOTICE_BACKOFF[1] + sb.CLEAR_NOTICE_BACKOFF[2] <= 10 * 60 else 0), "spaced by the backoff, not one per pass")
+        self.assertEqual(self.events("gate.clear_remind_abandoned"), [])
+        sb.clear_notice_pass(self.engine, self.later(sb.CLEAR_NOTICE_MAX_AGE_SECONDS))
+        self.assertEqual(self.events("gate.clear_reminded"), [], "a reminder that was never delivered is not recorded as sent")
+        (event,) = self.events("gate.clear_remind_abandoned")
+        self.assertIn("down", event["detail"]["error"])
+
+    def test_s7_no_reminder_when_not_mergeable_not_ready_not_open_at_the_cleared_head_or_not_examined_there(self):
+        cases = {"conflicting": dict(mergeable="CONFLICTING"), "gates not ready": dict(ready=False), "draft": dict(state="draft"), "gone": dict(state="gone"),
+                 "head moved": dict(head="d" * 40, examined="d" * 40), "not examined at the head": dict(examined="d" * 40)}
+        for label, kw in cases.items():
+            with self.subTest(label):
+                self.setUp()
+                sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+                self.clear()
+                self.ready_pr(**kw)
+                self.pass_(16 * 60)
+                self.assertEqual(self.reminders(), [], label)
+
+    def test_s8_a_list_that_is_not_whole_gives_no_reminder_and_the_reminder_comes_when_it_is(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        self.clear()
+        self.ready_pr(whole=False)
+        self.pass_(16 * 60)
+        self.assertEqual(self.reminders(), [])
+        self.ready_pr()
+        self.pass_()
+        self.assertEqual(len(self.reminders()), 1)
+
+    def test_a_lane_that_cannot_be_resolved_is_not_guessed_and_nobody_is_reminded(self):
+        self.body = "no plan here\n"
+        self.no_ledger_plan()
+        self.clear()
+        self.ready_pr()
+        self.pass_(16 * 60)
+        self.assertEqual([a for n in ("orch-a", "orch-b", "worker") for a in self.world.admissions(n) if "cleared, merge it" in a["text"]], [])
+        self.assertEqual(len(self.events("gate.clear_remind_skipped")), 1)
+
+    def test_the_remind_delay_is_a_configuration_key_with_a_default_of_15(self):
+        self.assertEqual(sb.DEFAULTS["clear_remind_minutes"], 15)
+        self.assertEqual(sb.validate_config({"clear_remind_minutes": 5})["clear_remind_minutes"], 5)
+        for bad in (0, -1, "x", True):
+            with self.subTest(bad), self.assertRaises(sb.ConfigError):
+                sb.validate_config({"clear_remind_minutes": bad})
 
 
 class TestClearRemovesTheAuthorsHold(Base):
@@ -22249,7 +23173,8 @@ class StalledHub:
         self.paths.append(path)
         if self.fail:
             raise sb.GitHubUnavailable("the list could not be read")
-        return list(self.records), self.cut
+        limit = (cap or 1) * 100   # the real reader stops at its page cap and says so
+        return list(self.records)[:limit], self.cut or len(self.records) > limit
 
 
 class WaitingInputs:
@@ -22413,9 +23338,9 @@ class TestIdleAtASeam(WaitingInputs, ReportBase):
 
     def test_a_retired_worker_gets_nothing_and_another_name_does_not_silence_it(self):
         self.idle_after("working")
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"other": {"at": 1, "by": "x", "reason": "y", "session": None, "auto": False}})
+        set_retired(self.world.state, {"other": {"at": 1, "by": "x", "reason": "y", "session": None, "auto": False}})
         self.assertEqual(len(self.seam(self.derive())), 2)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"coder": {"at": 1, "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
+        set_retired(self.world.state, {"coder": {"at": 1, "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
         self.assertEqual(self.seam(self.derive()), [])
 
     def test_a_worker_that_resumes_and_idles_again_starts_a_new_stretch_with_its_own_clock(self):
@@ -22614,7 +23539,7 @@ class TestStalledWorking(WaitingInputs, ReportBase):
     def test_a_retired_worker_gets_none(self):
         self.late()
         self.assertEqual(len(self.stalled()), 1)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"coder": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
+        set_retired(self.world.state, {"coder": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
         self.assertEqual(self.stalled(), [])
 
     def test_an_idle_worker_is_the_seam_rules_alone(self):
@@ -22994,6 +23919,480 @@ class TestLegitimateWaiting(WaitingInputs, ReportBase):
     def test_a_bad_review_window_is_refused(self):
         with self.assertRaises(sb.ConfigError):
             sb.validate_config({"review_window_minutes": 0})
+
+
+class OwnedInputs(WaitingInputs):
+    """#874: the daemon's lists for a scene of an ask (#2), its work item (#3), a work item below it (#4) and an unrelated issue (#5). Ages are
+    counted back from the moment of each read (the daemon's pass re-reads the lists every few minutes), so time can pass and the lists stay fresh. The
+    pull request list is `ci_record_pass`'s over a fake hub that honours the cut and the failure; the issue list is the triage's."""
+    OLD, RECENT = 10 * 3600, 600
+    NO_HEAD = object()
+
+    def wire_scene(self):
+        self.scene = {"issues": {3: {"parent": 2}, 4: {"parent": 3}}, "prs": []}
+        self.wire_inputs()
+
+    def pr(self, number, body, age=None, base="main", created=None, head=None, **extra):
+        return dict({"number": number, "body": body, "age": self.OLD if age is None else age, "created": 86400 if created is None else created, "base": base,
+                     "head": "a" * 40 if head is None else head}, **extra)
+
+    def plan(self, n):
+        return "PLAN: https://github.com/%s/issues/%d\n" % (self.REPO, n)
+
+    def set_scene(self, prs=None, issues=None, **issue_extra):
+        if prs is not None:
+            self.scene["prs"] = prs
+        for n, fields in (issues or {}).items():
+            self.scene["issues"].setdefault(n, {}).update(fields)
+        self.apply()
+
+    def apply(self):
+        engine, scene = self.world.engine, self.scene
+        now = self.world.clock.now()
+        def row(n):
+            f = scene["issues"].get(n, {})
+            record = {"number": n, "updated_at": sb.iso(now - f.get("age", self.OLD)), "created_at": sb.iso(now - self.OLD),
+                      "labels": [{"name": l} for l in f.get("labels", ())]}
+            if "raw_time" in f:
+                record["updated_at"] = f["raw_time"]
+            if f.get("parent") is not None:
+                record["parent_issue_url"] = "https://api.github.com/repos/%s/issues/%d" % (f.get("parent_repo", self.REPO), f["parent"])
+            return record
+        engine.triage = sb.TriageState()
+        engine.triage.units[(self.REPO, "issues")] = {"at": now, "data": [row(n) for n in range(1, 100)], "truncated": False, "error": None}
+        sb.read_mark(engine, "issues:" + self.REPO, True, "", now)
+        sb.read_mark(engine, "decisions", True, "", now)
+        self.hub.records = [{"number": p["number"], "body": p["body"], "updated_at": p["age"][1] if isinstance(p["age"], tuple) else sb.iso(now - p["age"]), "created_at": sb.iso(now - p["created"]),
+                             "head": {"sha": p["head"]}, "base": {"ref": p["base"]}, "labels": [{"name": l} for l in p.get("labels", ())],
+                             **{k: v for k, v in p.items() if k in ("requested_reviewers", "requested_teams", "draft")}} for p in scene["prs"]]
+        for record, p in zip(self.hub.records, scene["prs"]):
+            if p["head"] is self.NO_HEAD:
+                del record["head"]   # a record with no head at all
+
+        engine.__dict__.pop("ci_record_state", None)
+        engine.__dict__.get("read_whole", {}).pop("pulls:" + self.REPO, None)
+        sb.ci_record_pass(engine, now)
+
+    def owned(self):
+        engine = self.world.engine
+        records = engine.triage.units[(self.REPO, "issues")]["data"]
+        pulls = engine.ci_record_state.lists[sb.plan_ledger.normal_repo(self.REPO)][1]
+        return sb.worker_owned(records, pulls, 2, self.REPO)
+
+    def owned_numbers(self):
+        got = self.owned()
+        return sorted(r["number"] for r in got.issues), sorted(r["number"] for r in got.pulls)
+
+
+class TestWorkerOwned(OwnedInputs, ReportBase):
+    """#874: the ONE function that says what a worker owns (the ask, its work items, every open pull request naming any of them), and its three
+    consumers (the stalled-working rule, the idle-at-a-seam rule, the waiting predicate's guards) driven through the real engine pass."""
+
+    def setUp(self):
+        super().setUp()
+        self.wire_scene()
+        self.world.tick(1)
+        for _ in range(5):
+            self.report("working", "migrating the tables")
+        self.world.tick(1)
+
+    # -- the set (S1, S2, S12) --------------------------------------------------------------------------------------------------------------
+    def test_S1_the_set_is_the_ask_its_work_items_at_any_depth_and_every_pull_request_naming_any_of_them(self):
+        self.set_scene(prs=[
+            self.pr(10, self.plan(3)),
+            self.pr(11, "Part of #4\n"),
+            self.pr(12, self.plan(2), base="integration"),
+            self.pr(13, self.plan(5)),
+        ])
+        self.assertEqual(self.owned_numbers(), ([2, 3, 4], [10, 11, 12]))
+
+    def test_S1_every_kind_of_the_table_is_built_and_each_mutant_changes_the_answer(self):
+        self.set_scene(prs=[self.pr(10, self.plan(3)), self.pr(12, self.plan(2), base="integration")])
+        self.assertEqual(self.owned_numbers(), ([2, 3, 4], [10, 12]))
+        want = {"issue": ([], []), "work item": ([2], [12]), "pull request": ([2, 3, 4], [])}   # what survives when this kind is dropped
+        self.assertEqual(set(want), set(sb.OWNED_KINDS), "a kind in the production table with no case here")
+        for kind, expected in want.items():
+            with self.subTest(kind):
+                description, build = sb.OWNED_KINDS[kind]
+                self.assertTrue(description)
+                with mock.patch.dict(sb.OWNED_KINDS, {kind: (description, lambda ctx: [])}):
+                    got = self.owned()
+                    self.assertEqual(got if got is None else self.owned_numbers(), None if kind == "issue" else expected)
+
+    def test_S1_a_mutant_that_matches_only_the_assignments_own_number_or_ignores_the_base_branch_is_caught(self):
+        self.set_scene(prs=[self.pr(10, self.plan(3)), self.pr(12, self.plan(2), base="integration")])
+        real = sb._owned_pulls
+        def own_only(ctx):
+            return [r for r in real(types.SimpleNamespace(**dict(vars(ctx), numbers={ctx.issue})))]
+        def main_only(ctx):
+            return [r for r in real(ctx) if (r.get("base") or {}).get("ref") == "main"]
+        for mutant, pulls in ((own_only, [12]), (main_only, [10])):
+            with self.subTest(mutant.__name__):
+                description, _ = sb.OWNED_KINDS["pull request"]
+                with mock.patch.dict(sb.OWNED_KINDS, {"pull request": (description, mutant)}):
+                    self.assertEqual(self.owned_numbers()[1], pulls)
+
+    def test_S2_a_stray_mention_owns_nothing_and_a_parent_cycle_returns(self):
+        self.set_scene(prs=[
+            self.pr(10, "Fixes the thing the work item #3 asked about\n"),
+            self.pr(11, "Summary\n\nPLAN: https://github.com/%s/issues/3\n" % self.REPO),      # a later line is not the PLAN line
+            self.pr(12, "> Closes #3\n"),                                                       # a quoted line
+            self.pr(13, "Related to #3\n"),                                                     # not a strict form
+            self.pr(14, "Closes acme/other-service#3\n"),                                      # another repository's number
+        ])
+        self.assertEqual(self.owned_numbers()[1], [])
+        self.set_scene(issues={2: {"parent": 4}})   # 2 -> 4 -> 3 -> 2
+        self.assertEqual(self.owned_numbers()[0], [2, 3, 4])
+        self.set_scene(issues={5: {"parent": 5}, 3: {"parent": 3, "parent_repo": "acme/other-service"}})
+        self.assertEqual(self.owned_numbers()[0], [2], "a self-parent and another repository's parent are no work items")
+
+    def test_S2_a_chain_deeper_than_the_bound_ends_the_walk(self):
+        for n in range(6, 20):
+            self.scene["issues"][n] = {"parent": n - 1 if n > 6 else 2}
+        self.apply()
+        issues = self.owned_numbers()[0]
+        self.assertIn(6 + sb.TRIAGE_ANCESTOR_DEPTH - 1, issues)
+        self.assertNotIn(6 + sb.TRIAGE_ANCESTOR_DEPTH, issues, "the walk is bounded")
+
+    def test_S12_a_stray_mention_does_not_move_or_hold_an_idle_assignment_and_the_rule_wakes_once(self):
+        self.set_scene(prs=[self.pr(10, "Looks at #3 in prose\n", age=self.RECENT, created=self.OLD)])
+        self.assertEqual(self.owned_numbers()[1], [])
+        self.late()
+        self.assertEqual(len(self.stalled()), 1)
+
+    BAD_TIMES = ("not a time", None, "", 12, [], "2026-13-45T99:00:00Z")
+
+    def readable_scene(self):
+        """The ONE setup both the bad scene and its control come from: the ask (#2), two work items (#3, #4) and two owned pull requests (#10, #11)."""
+        return dict(prs=[self.pr(10, self.plan(3)), self.pr(11, self.plan(4), head="b" * 40)])
+
+    def break_member(self, member, position, value):
+        """Make ONE member unreadable in ONE position (the first or the later item the member covers); returns the scene changes."""
+        scene = self.readable_scene()
+        if member == "assignment time":
+            return dict(scene, issues={2: {"raw_time": value}})
+        if member == "work item time":
+            return dict(scene, issues={(3, 4)[position]: {"raw_time": value}})
+        key = "head" if member == "pull request head" else "age"
+        prs = [dict(p) for p in scene["prs"]]
+        prs[position][key] = value
+        return dict(scene, prs=prs)
+
+    def test_an_owned_item_that_cannot_be_read_is_not_judged_for_every_member_position_and_bad_value(self):
+        """Derived from OWNED_READABLE (the guard's own member table): every member, in the first AND the later position of what it covers, with each
+        kind of bad value, through BOTH rules; each bad scene is built from the same setup as its control, so only the one input differs."""
+        cases = []
+        for member in sb.OWNED_READABLE:
+            if member == "pull request head":
+                values = (self.NO_HEAD, None, 0, 12, "", ["x"])   # a head that is missing, null, a number, empty, or not text
+            elif member == "pull request time":
+                values = tuple(("raw", v) for v in self.BAD_TIMES)   # the fake hub's marker for a raw updated_at
+            else:
+                values = self.BAD_TIMES
+            for position in ((0,) if member == "assignment time" else (0, 1)):
+                cases += [(member, position, value) for value in values]
+        self.assertEqual({member for member, _, _ in cases}, set(sb.OWNED_READABLE), "a member of the guard's table with no case here")
+        for member, position, value in cases:
+            for rule in ("stalled", "seam"):
+                with self.subTest(member=member, position=position, value=repr(value), rule=rule):
+                    self.setUp()
+                    self.set_scene(**self.break_member(member, position, value))
+                    self.idle() if rule == "seam" else self.late()
+                    self.assertEqual(self.said(rule), [], "not judged")
+        for rule in ("stalled", "seam"):
+            self.assertEqual(len(self.control(rule)), 2 if rule == "seam" else 1, "the control (same setup, every input readable) speaks")
+
+    def control(self, rule):
+        self.setUp()
+        self.set_scene(**self.readable_scene())
+        self.idle() if rule == "seam" else self.late()
+        return self.said(rule)
+
+    def test_every_member_of_the_readable_table_is_needed_a_mutant_that_drops_it_is_caught(self):
+        examples = {"assignment time": (0, {"issues": {2: {"raw_time": "not a time"}}}),
+                    "work item time": (1, {"issues": {4: {"raw_time": "not a time"}}}),
+                    "pull request head": (1, "head"), "pull request time": (1, "age")}
+        for member, (position, change) in examples.items():
+            with self.subTest(member):
+                scene = self.break_member(member, position, 0 if change == "head" else ("raw", "not a time")) if isinstance(change, str) else dict(self.readable_scene(), **change)
+                select, check = sb.OWNED_READABLE[member]
+                with mock.patch.dict(sb.OWNED_READABLE, {member: (lambda owned: [], check)}):
+                    self.setUp()
+                    self.set_scene(**scene)
+                    self.late()
+                    try:
+                        silent = self.said("stalled") == []
+                    except TypeError:
+                        silent = False   # without the time check, max() over an unreadable time breaks the rule outright (the only crash expected)
+                    self.assertFalse(silent, "without this member's check the rule no longer stays silent on the bad input: the case above catches the mutant")
+        self.assertEqual(set(examples), set(sb.OWNED_READABLE))
+
+    def reminder_answer(self, issue, owned=3):
+        """What the waiting predicate answers when the (hand-edited) reminders file holds `issue`, for a worker that owns `owned` (3 is a work item;
+        1 is made a work item too, so that a bool, which is equal to 1, can match)."""
+        self.setUp()
+        self.set_scene(issues={1: {"parent": 2}})
+        now = self.world.clock.now
+        sb.add_reminder(self.world.state, "coder", now() + 600, now(), "look", issue=owned)
+        items = sb.read_reminders(self.world.state)
+        items[0]["issue"] = issue
+        sb.write_reminders(self.world.state, items)
+        try:
+            got = self.predicate()
+        except TypeError:
+            return "raised"
+        return got.state
+
+    # every value is built FROM an owned number (3, or 1 for the bool), so each one would match a set test if the type check let it through
+    BAD_REMINDER_ISSUES = (("a list", [3], 3), ("a dict", {"n": 3}, 3), ("a string", "3", 3), ("a float equal to an owned number", 3.0, 3),
+                           ("a bool equal to an owned number", True, 1), ("null", None, 3))
+
+    def test_a_reminder_whose_issue_is_not_an_int_never_raises_and_holds_nothing(self):
+        """A list, a dict, a string, null, a float and a bool in a hand-edited reminders file all answer "clear" (never an exception). A list or dict, a
+        string and null answer as the old `==` did. A float equal to an owned number (3.0) and a bool equal to one (True, with 1 owned) used to hold under
+        `==`: rejecting them is the deliberate, safer answer (only an int that is not a bool names an issue), and this test pins it."""
+        for name, bad, owned in self.BAD_REMINDER_ISSUES:
+            with self.subTest(issue=name):
+                self.assertEqual(self.reminder_answer(bad, owned), "clear")
+        for owned in (3, 4, 1):
+            with self.subTest(control=owned):
+                self.assertEqual(self.reminder_answer(owned, owned), "waiting", "a real int on an owned issue still waits")
+
+    def test_one_mutant_per_allowed_type_of_the_issue_check_is_caught(self):
+        raw = lambda value: True                                                       # no check: a list or dict raises
+        any_int = lambda value: isinstance(value, int)                                 # a bool passes
+        int_or_float = lambda value: isinstance(value, (int, float)) and not isinstance(value, bool)   # a float passes
+        for name, mutant in (("no check", raw), ("a bool is an int", any_int), ("a float is a number", int_or_float)):
+            with self.subTest(mutant=name):
+                with mock.patch.object(sb, "_is_issue_number", mutant):
+                    answers = {label: self.reminder_answer(bad, owned) for label, bad, owned in self.BAD_REMINDER_ISSUES}
+                self.assertNotEqual(set(answers.values()), {"clear"}, "this mutant must change the answer of at least one bad value: %s" % answers)
+
+    def said(self, rule):
+        self.apply()
+        return [f for f in self.derive() if (":seam:" if rule == "seam" else ":stalled:") in f.key]
+
+    # -- the rules (S3, S4, S5) -------------------------------------------------------------------------------------------------------------
+    def stalled(self):
+        self.apply()
+        return [f for f in self.derive() if ":stalled:" in f.key]
+
+    def seam(self):
+        self.apply()
+        return [f for f in self.derive() if ":seam:" in f.key]
+
+    def late(self, hours=2.5):
+        self.world.tick(int(hours * 3600) - 60)
+        self.apply()
+        self.world.tick(60)
+
+    def test_S3_a_work_item_pull_request_that_moved_is_movement_the_asks_old_time_alone_would_wake(self):
+        self.set_scene(prs=[self.pr(10, self.plan(3))])
+        self.late()
+        self.assertEqual(len(self.stalled()), 1, "everything owned is old: one wake")
+        self.set_scene(prs=[self.pr(10, self.plan(3), age=self.RECENT)])
+        self.assertEqual(self.stalled(), [])
+
+    def test_S4_movement_of_any_owned_thing_counts_and_the_wake_names_the_ask_when_all_is_old(self):
+        self.set_scene(prs=[self.pr(10, self.plan(3)), self.pr(11, self.plan(4), head="b" * 40)])
+        self.late()
+        self.assertEqual(len(self.stalled()), 1)
+        self.set_scene(issues={4: {"age": self.RECENT}})
+        self.assertEqual(self.stalled(), [], "a work item updated 10 minutes ago")
+        self.set_scene(issues={4: {"age": self.OLD}})
+        self.assertEqual(len(self.stalled()), 1)
+        self.set_scene(prs=[self.pr(10, self.plan(3)), self.pr(11, self.plan(4), head="c" * 40)])
+        self.assertEqual(self.stalled(), [], "the head of the SECOND owned pull request changed, under an old updated time")
+        self.late()
+        (wake,) = self.stalled()
+        self.assertRegex(wake.summary, r"^no movement for 2\.5h on acme/widget-service#1[01] ")
+
+    def test_S4_the_head_of_each_owned_pull_request_is_remembered_on_its_own(self):
+        self.set_scene(prs=[self.pr(10, self.plan(3)), self.pr(11, self.plan(4))])
+        self.stalled()
+        self.late()
+        self.assertEqual(len(self.stalled()), 1)
+        self.set_scene(prs=[self.pr(10, self.plan(3)), self.pr(11, self.plan(4), head="d" * 40)])
+        self.assertEqual(self.stalled(), [])
+        self.assertEqual(sorted(self.engine_heads()), [10, 11])
+
+    def engine_heads(self):
+        for source in self.world.engine.sources:
+            heads = getattr(source, "_heads", None)
+            if heads is not None:
+                return heads["coder"]
+        self.fail("the rule's head memory is not found")
+
+    def idle(self):
+        self.stop("all quiet")
+        self.world.tick(sb.SEAM_IDLE_SECONDS + 100)
+
+    def test_S5_a_coder_waiting_on_ci_or_review_of_its_work_item_pull_request_is_not_nudged(self):
+        self.idle()
+        cases = (
+            ("ci running", dict(), ["in_progress"]),
+            ("review requested", dict(requested_reviewers=[{"login": "reviewer-one"}]), None),
+            ("younger than the review window", dict(created=600), None),
+        )
+        for name, extra, checks in cases:
+            with self.subTest(name):
+                self.set_scene(prs=[self.pr(10, self.plan(3), **extra)])
+                if checks:
+                    self.world.engine.ci_record_state.pr_state["%s#10" % self.REPO].update(
+                        {"examined_head": "a" * 40, "checks": [{"name": "ci", "conclusion": c} for c in checks]})
+                    self.assertEqual(self.derive_seam(), [])
+                else:
+                    self.assertEqual(self.seam(), [])
+        self.set_scene(prs=[self.pr(10, self.plan(3))])
+        self.world.engine.ci_record_state.pr_state["%s#10" % self.REPO].update(
+            {"examined_head": "a" * 40, "checks": [{"name": "ci", "conclusion": "success"}]})
+        self.assertEqual(sorted((f.kind, f.recipient) for f in self.derive_seam()), [("nudge", "coder"), ("worker.idle", "platform")])
+
+    def derive_seam(self):
+        return [f for f in self.derive() if ":seam:" in f.key]
+
+    # -- the guards (S6) --------------------------------------------------------------------------------------------------------------------
+    def observation(self):
+        self.world.engine.discover(self.world.clock.now())
+        return self.world.engine.discovery.agents["coder"]
+
+    def predicate(self):
+        last = sb._read_small(self.world.state, sb.LAST_REPORT_FILE).get("coder")
+        return sb.legitimately_waiting(self.world.engine, self.observation(), 2, self.REPO, last)
+
+    def item_triggers(self):
+        """One trigger per guard, each on a WORK ITEM (#3) or on the pull request that names it (#10)."""
+        cfg, now = self.world.engine.config, self.world.clock.now
+        pr = lambda **extra: self.set_scene(prs=[self.pr(10, self.plan(3), **extra)])
+        def ci():
+            pr()
+            self.world.engine.ci_record_state.pr_state["%s#10" % self.REPO].update(
+                {"examined_head": "a" * 40, "checks": [{"name": "ci", "conclusion": "in_progress"}]})
+        def decision(number):
+            pr()
+            (self.world.state / sb.DECISIONS_FILE).write_text(json.dumps({"decisions": [{"tier": "human", "kind": "captain", "repo": self.REPO, "number": number}], "errors": []}))
+        return {
+            "awaiting-issue": lambda: self.set_scene(issues={3: {"labels": [sb.awaiting_cos_label(cfg)]}}),
+            "awaiting-pr": lambda: pr(labels=[sb.awaiting_label(cfg)]),
+            "ci": ci,
+            "review-requested": lambda: pr(requested_reviewers=[{"login": "reviewer-one"}]),
+            "review-window": lambda: pr(created=600),
+            "reminder": lambda: (pr(), sb.add_reminder(self.world.state, "coder", now() + 600, now(), "look", issue=3)),
+            "decision": lambda: decision(3),
+        }
+
+    def test_S6_every_guard_holds_on_an_owned_work_item_or_its_pull_request_and_the_tables_are_complete(self):
+        triggers = self.item_triggers()
+        self.assertEqual(set(triggers) | {"last-report"}, set(sb.WAITING_GUARDS), "a guard in the production table with no work-item case here")
+        self.assertEqual(set(sb.WORKER_OWNED_CONSUMERS), set(sb.WAITING_GUARDS) | {"stalled-working", "idle-at-a-seam"}, "a consumer of the set with no row stating what it takes")
+        self.assertEqual(self.predicate().state, "clear")
+        for code, arrange in triggers.items():
+            with self.subTest(code):
+                self.setUp()
+                arrange()
+                got = self.predicate()
+                self.assertEqual((got.state, got.codes), ("waiting", [code]))
+
+    def test_S6_a_decision_on_the_work_items_pull_request_waits_too(self):
+        self.set_scene(prs=[self.pr(10, self.plan(3))])
+        (self.world.state / sb.DECISIONS_FILE).write_text(json.dumps({"decisions": [{"tier": "human", "kind": "captain", "repo": self.REPO, "number": 10}], "errors": []}))
+        self.assertEqual(self.predicate().codes, ["decision"])
+
+    def test_S9_each_guard_that_still_reads_the_old_lookup_is_caught(self):
+        """One mutant per guard (the table's own rows): the guard sees only the assignment and the pull requests naming it, so its work-item case no longer holds."""
+        triggers = self.item_triggers()
+        for code in triggers:
+            with self.subTest(code):
+                self.setUp()
+                triggers[code]()
+                needs, check = sb.WAITING_GUARDS[code]
+                def old(w, check=check):
+                    narrow = types.SimpleNamespace(**dict(vars(w), issues=w.issues[:1], numbers={w.issue}, mine=[r for r in w.mine if any(ref[1] == w.issue for ref in sb.pr_body_refs(r.get("body")))]))
+                    return check(narrow)
+                with mock.patch.dict(sb.WAITING_GUARDS, {code: (needs, old)}):
+                    self.assertNotIn(code, self.predicate().codes, "the mutant of %s must stop holding" % code)
+                self.assertEqual(self.predicate().codes, [code])
+
+    # -- the read-whole rule and no new read (S7, S10, S11) --------------------------------------------------------------------------------
+    def not_whole(self):
+        """The inputs, each made not-whole in turn: (name, break, mend)."""
+        now = self.world.clock.now
+        def cut(on):
+            self.hub.cut = on
+            self.apply()
+        def fail(on):
+            self.hub.fail = on
+            self.apply()
+        def mark(name, on):
+            sb.read_mark(self.world.engine, name, on, "" if on else "cut", now())
+        return {
+            "pull list cut": (lambda: cut(True), lambda: cut(False)),
+            "pull list failed": (lambda: fail(True), lambda: fail(False)),
+            "pull list stale": (lambda: self.world.tick(sb.STALLED_LIST_MAX_AGE + 60), self.apply),
+            "issue list not whole": (lambda: mark("issues:" + self.REPO, False), self.apply),
+            "decision list not whole": (lambda: mark("decisions", False), self.apply),
+        }
+
+    def test_S7_S11_a_list_that_is_not_whole_gives_no_wake_and_no_nudge_and_no_call_then_one_when_whole(self):
+        for rule in ("stalled", "seam"):
+            for name, (do, mend) in self.not_whole().items():
+                with self.subTest(rule=rule, input=name):
+                    self.setUp()
+                    self.set_scene(prs=[self.pr(10, self.plan(3))])
+                    if rule == "seam":
+                        self.idle()
+                    else:
+                        self.late()
+                    mend()
+                    do()
+                    self.assertEqual([f for f in self.derive() if (":seam:" if rule == "seam" else ":stalled:") in f.key], [], name)
+                    mend()
+                    self.apply()
+                    want = 2 if rule == "seam" else 1
+                    self.assertEqual(len([f for f in self.derive() if (":seam:" if rule == "seam" else ":stalled:") in f.key]), want)
+
+    def test_S10_the_rules_make_no_read_of_their_own(self):
+        self.set_scene(prs=[self.pr(10, self.plan(3))])
+        paths = list(self.hub.paths)
+        self.assertEqual(paths, ["repos/%s/pulls?state=open&per_page=100" % self.REPO] * len(paths))
+        self.late()
+        before = list(self.hub.paths)
+        self.derive()
+        self.assertEqual(self.hub.paths, before, "judging a worker reads nothing")   # the gh runner of wire_inputs raises on any call
+
+    # -- ask -> work item -> PR through all three rules (S8) -------------------------------------------------------------------------------
+    CASES = {   # case -> (issue changes, the pull requests, does the worker still speak)
+        "ask only, the pull request names the ask": (dict(issues={3: {"parent": None}, 4: {"parent": None}}), lambda s: [s.pr(10, s.plan(2))], False),
+        "work item, the pull request names the work item": (dict(), lambda s: [s.pr(10, s.plan(3))], False),
+        "a pull request into an integration branch": (dict(), lambda s: [s.pr(10, s.plan(3), base="integration")], False),
+        "a pull request naming only the ask": (dict(), lambda s: [s.pr(10, s.plan(2))], False),
+        "no pull request": (dict(), lambda s: [], True),
+        "control: a pull request naming an unrelated issue": (dict(), lambda s: [s.pr(10, s.plan(5))], True),
+    }
+
+    def run_case(self, case, rule):
+        self.setUp()
+        issues, make, _ = self.CASES[case]
+        self.set_scene(issues=issues)
+        if rule == "stalled":
+            self.set_scene(prs=make(self))
+            self.late()
+            self.set_scene(prs=[dict(p, age=self.RECENT) for p in make(self)])
+            return [f for f in self.derive() if ":stalled:" in f.key]
+        self.idle()
+        self.set_scene(prs=[dict(p, requested_reviewers=[{"login": "reviewer-one"}]) for p in make(self)])
+        return [f for f in self.derive() if ":seam:" in f.key]
+
+    def test_S8_every_case_through_the_stalled_rule_the_seam_rule_and_the_waiting_predicate(self):
+        for case, (_, make, speaks) in self.CASES.items():
+            for rule, count in (("stalled", 1), ("seam", 2)):
+                with self.subTest(case=case, rule=rule):
+                    self.assertEqual(len(self.run_case(case, rule)), count if speaks else 0)
+            with self.subTest(case=case, rule="waiting"):
+                self.setUp()
+                issues, make, _ = self.CASES[case]
+                self.set_scene(issues=issues, prs=[dict(p, requested_reviewers=[{"login": "reviewer-one"}]) for p in make(self)])
+                self.assertEqual(self.predicate().state, "clear" if speaks else "waiting")
 
 
 class TestStoppedNews(PR4Base):
@@ -26081,6 +27480,37 @@ class TestCaptainSweepFindings(TestSweep):
         self.sweep()
         self.assertEqual(self.found(), [("S6a", "acme/api#40"), ("S6b", "acme/api#41"), ("S6b", "acme/api#42")])
 
+    def test_s6b_a_recorded_clear_at_the_current_head_makes_the_leftover_author_label_agree_with_an_automatic_line(self):
+        captain = self.USER.replace("awaiting-user", "merge-captain")
+        head, other = "a" * 40, "b" * 40
+        picture = self.engine.__dict__.setdefault("ci_record_state", sb.CiRecordState())
+        self.engine.state_dir = self.world.state
+        state = {"clears": {"acme/api#50": {"head": head, "by": "owner", "at": 1}, "acme/api#51": {"head": other, "by": "owner", "at": 1}}, "applied": {}}
+        sb.write_impact_state(self.world.state, state)
+        for number in (50, 51, 52, 53):
+            picture.pr_state["acme/api#%d" % number] = {"state": "open", "head": head}
+        picture.pr_state["acme/api#53"] = {"state": "open"}   # head unknown: agrees with nothing
+        self.hub.open = {50: sweep_issue(50, "MERGE: automatic\nx", [captain], pr=True),   # cleared at this head
+                         51: sweep_issue(51, "MERGE: automatic\nx", [captain], pr=True),   # cleared at ANOTHER head
+                         52: sweep_issue(52, "MERGE: automatic\nx", [captain], pr=True),   # never cleared
+                         53: sweep_issue(53, "MERGE: automatic\nx", [captain], pr=True)}   # cleared? no: head unknown
+        sb.write_impact_state(self.world.state, dict(state, clears=dict(state["clears"], **{"acme/api#53": {"head": head, "by": "owner", "at": 1}})))
+        self.sweep()
+        self.sweep()
+        self.assertEqual(self.found(), [("S6b", "acme/api#51"), ("S6b", "acme/api#52"), ("S6b", "acme/api#53")])
+
+    def test_s6b_the_clear_only_excuses_a_captain_label_beside_an_automatic_line(self):
+        automatic = self.USER.replace("awaiting-user", "merge-automatic")
+        head = "a" * 40
+        picture = self.engine.__dict__.setdefault("ci_record_state", sb.CiRecordState())
+        self.engine.state_dir = self.world.state
+        sb.write_impact_state(self.world.state, {"clears": {"acme/api#60": {"head": head, "by": "owner", "at": 1}}, "applied": {}})
+        picture.pr_state["acme/api#60"] = {"state": "open", "head": head}
+        self.hub.open = {60: sweep_issue(60, "MERGE: captain\nx", [automatic], pr=True)}   # the other disagreement is not the author's leftover label
+        self.sweep()
+        self.sweep()
+        self.assertEqual(self.found(), [("S6b", "acme/api#60")])
+
     def test_s9_a_merge_or_hold_label_left_on_a_merged_or_closed_pr_is_flagged_and_nothing_is_removed(self):
         captain = self.USER.replace("awaiting-user", "merge-captain")
         hold = self.USER.replace("awaiting-user", "hold-impact")
@@ -26599,6 +28029,114 @@ class TestOwnerlessSummary(Base):
         self.assertFalse(module.is_claimed(base, ctx))
         for change in ({"assignees": ["x"]}, {"number": 5}, {"number": 6}, {"number": 7}, {"owner_body": True}):
             self.assertTrue(module.is_claimed(dict(base, **change), ctx), change)
+
+    # #889: an ownerless, quiet issue parked until a future date is counted apart as `parked`; ONE table of cases drives every output of the family (OUTPUTS).
+    PARKED = 50          # the case issue: quiet 30 days, so older than everything else (a wrong build shows in the oldest age and in the links)
+    OUTPUTS = ("count", "oldest", "links", "parked_total", "send_gate", "report", "report_line", "audit")
+
+    def day(self, offset):
+        return datetime.datetime.fromtimestamp(self.world.clock.now() + offset * 86400, datetime.timezone.utc).strftime("%Y-%m-%d")
+
+    def cases(self):
+        lab, other = ["u:parked"], ["u:parked-ish"]
+        return {   # kind: (labels, body, hidden)
+            "future date": (lab, "Parked until: %s" % self.day(30), True),
+            "tomorrow": (lab, "Parked until: %s" % self.day(1), True),
+            "today": (lab, "Parked until: %s" % self.day(0), True),                 # parked through the end of that UTC day, as the reader and T3 say
+            "past date": (lab, "Parked until: %s" % self.day(-2), False),
+            "no date": (lab, "nothing here", False),
+            "malformed date": (lab, "Parked until: 2099-1-1", False),
+            "impossible date": (lab, "Parked until: 2099-02-30", False),
+            "two date lines": (lab, "Parked until: %s\nParked until: %s" % (self.day(30), self.day(40)), False),
+            "label without date": (lab, "", False),
+            "date without label": ([], "Parked until: %s" % self.day(30), False),
+            "another label": (other, "Parked until: %s" % self.day(30), False),
+            "date beyond the ceiling": (lab, "Parked until: 9999-12-31", False),
+            "date in a quote": (lab, "> Parked until: %s" % self.day(30), False),
+        }
+
+    def run_case(self, labels, body):
+        self.hub.open[self.TEAM] = {}
+        self.add(self.PARKED, created=40, updated=30, author="alice", labels=labels, body=body)
+        for n in (60, 61, 62):
+            self.add(n, created=15, updated=10 + n - 60, author="alice")
+        self.go()
+        state = sb.triage_state(self.engine)
+        return {"lines": self.lines("cos"), "shown": state.current.get("ownerless", {}).get(self.TEAM),
+                "report": "\n".join(sb.triage_status_lines(state.current)),
+                "audit": [e for e in self.world.audit() if e["event"] == "triage.ownerless"]}
+
+    def test_every_case_agrees_across_every_output_of_the_family(self):
+        link = "https://github.com/acme/web/issues/%d" % self.PARKED
+        for kind, (labels, body, hidden) in self.cases().items():
+            with self.subTest(kind):
+                self.setUp()
+                out = self.run_case(labels, body)
+                (line,) = out["lines"]
+                listed, parked, oldest = (3, 1, 12) if hidden else (4, 0, 30)
+                checked = {
+                    "count": "%d open issue(s)" % listed in line,
+                    "oldest": "oldest quiet for %d day(s)" % oldest in line,
+                    "links": (link in line) is (not hidden) and line.count("https://github.com/acme/web/issues/") == listed,
+                    "parked_total": "parked %d;" % parked in line,
+                    "send_gate": len(out["lines"]) == 1,
+                    "report": out["shown"]["count"] == listed and out["shown"]["parked"] == parked and out["shown"]["oldest_days"] == oldest,
+                    "report_line": "%d open issue(s) with no owner and quiet; parked %d;" % (listed, parked) in out["report"],
+                    "audit": out["audit"][-1]["detail"]["count"] == listed and out["audit"][-1]["detail"]["parked"] == parked,
+                }
+                self.assertEqual(set(checked), set(self.OUTPUTS))
+                self.assertEqual({k: v for k, v in checked.items() if not v}, {}, line)
+
+    def test_the_table_has_every_kind_of_case_the_ask_names(self):
+        self.assertTrue({"future date", "today", "past date", "no date", "malformed date", "label without date", "date without label"} <= set(self.cases()))
+        self.assertGreater(len([1 for c in self.cases().values() if c[2]]), 0)
+        self.assertGreater(len([1 for c in self.cases().values() if not c[2]]), 0)
+
+    def test_only_parked_issues_send_no_line_but_are_counted_in_the_report(self):
+        self.add(self.PARKED, created=40, updated=30, author="alice", labels=["u:parked"], body="Parked until: %s" % self.day(30))
+        self.go()
+        self.assertEqual(self.lines("cos"), [])
+        self.assertEqual(sb.triage_state(self.engine).current["ownerless"][self.TEAM]["parked"], 1)
+
+    def test_a_parked_issue_that_is_owned_or_recently_touched_is_not_counted_as_parked(self):
+        body = "Parked until: %s" % self.day(30)
+        self.add(self.PARKED, created=40, updated=30, author="alice", labels=["u:parked"], body=body, assignees=["carol"])
+        self.add(51, created=40, updated=1, author="alice", labels=["u:parked"], body=body)
+        self.add(52, created=40, updated=30, author="alice", labels=["u:parked"], body=body, pr=True)
+        self.go()
+        self.assertEqual(sb.triage_state(self.engine).current["ownerless"][self.TEAM]["parked"], 0)
+
+    def test_the_rule_reads_the_one_date_reader_and_has_no_parser_of_its_own(self):
+        import inspect
+        source = inspect.getsource(sb.load_module("triage_ownerless"))
+        for word in ("strptime", "Parked until", "re.compile", "datetime"):
+            self.assertNotIn(word, source)
+        self.assertIn("parked_until(", inspect.getsource(sb.triage_norm))
+        self.assertIn("triage_parked_now(", inspect.getsource(sb.triage_rules))   # T3 uses the same predicate
+
+    def test_the_parked_predicate_is_the_only_input_a_mutant_can_change(self):
+        module = sb.load_module("triage_ownerless")
+        item = {"number": 1, "pr": False, "state": "open", "labels": set(), "author": "alice", "assignees": [], "updated": 0.0, "owner_body": False}
+        ctx = {"chain": set(), "owned": set(), "unresolved": set()}
+        now = 10 * 86400.0
+        self.assertEqual(module.ownerless_split({1: item}, ctx, (), (), now), ([(1, 10.0)], []))
+        self.assertEqual(module.ownerless_split({1: item}, ctx, (), (), now, parked_now=lambda i, n: True), ([], [(1, 10.0)]))
+
+    def test_nothing_is_written_to_any_issue_with_parked_issues_present(self):
+        self.add(self.PARKED, created=40, updated=30, author="alice", labels=["u:parked"], body="Parked until: %s" % self.day(30))
+        self.add(60, created=15, author="alice")
+        self.go()
+        self.assertFalse(hasattr(self.hub, "write"), "the fake hub has no write method: a write cannot even be asked for")
+        self.assertFalse([a for a in self.runs if "--method" in a or "PATCH" in a or "POST" in a or "DELETE" in a])
+
+    def test_a_not_whole_read_counts_nothing_and_sends_nothing(self):
+        self.add(self.PARKED, created=40, updated=30, author="alice", labels=["u:parked"], body="Parked until: %s" % self.day(30))
+        self.add(60, created=15, author="alice")
+        with mock.patch.object(self.engine.herdr, "agent_list", side_effect=sb.HerdrError("down")):
+            self.engine.discover(self.world.clock.now())
+        self.go()
+        self.assertEqual(self.told("cos"), [])
+        self.assertNotIn(self.TEAM, sb.triage_state(self.engine).current.get("ownerless", {}))
 
 
 class TestTriageDigest(Base):
@@ -28408,7 +29946,7 @@ class TestUnreportedStop(ReportBase):
     def retire_entry(self, **fields):
         entry = {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}
         entry.update(fields)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"coder": entry} if entry is not None else {})
+        set_retired(self.world.state, {"coder": entry} if entry is not None else {})
         for source in self.world.engine.sources:                      # a stop is judged once and remembered: forget it so the next look decides afresh
             getattr(source, "_stops", {}).clear()
 
@@ -28424,7 +29962,7 @@ class TestUnreportedStop(ReportBase):
         self.world.engine.state_dir = self.world.state
         self.retire_entry(session="ses_a_session_this_worker_no_longer_has")
         self.assertIn("nudge", [f.kind for f in self.facts()], "a stale retirement of an older session still lets the stop be nudged")
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"someone-else": {"at": 1, "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
+        set_retired(self.world.state, {"someone-else": {"at": 1, "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
         for source in self.world.engine.sources:
             getattr(source, "_stops", {}).clear()
         self.assertIn("nudge", [f.kind for f in self.facts()], "another name's retirement does nothing")
@@ -29416,12 +30954,12 @@ class TestLaunchTesters(LedgerBase):
 
     def test_a_retired_tester_stops_counting_and_is_not_listed(self):
         retired = {"ltst": {"at": 1, "by": "orch", "reason": "done", "session": self.world.sessions["ltst"], "auto": False}}
-        (self.world.state / sb.RETIRED_FILE).write_text(json.dumps(retired))
+        set_retired(self.world.state, retired)
         code, _, err = self.verdict("ltst", "S2", "tester")
         self.assertEqual(code, 2)
         self.assertIn("not registered", err)
         retired["ltst"]["session"] = "ses_an_older_launch"   # a relaunch under the same name is a new session: retirement of the old one does not cover it
-        (self.world.state / sb.RETIRED_FILE).write_text(json.dumps(retired))
+        set_retired(self.world.state, retired)
         self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
         retired["ltst"]["session"] = self.world.sessions["ltst"]
         self.assertEqual(sb.load_launch_testers().launched({"ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"}, "orch": {"role": "orchestrator", "repo": "acme/app"}},
@@ -40745,6 +42283,7 @@ class InstallFakes:
         self.calls, self.version = [], version
         self.linked = False
         self.loaded = False
+        self.reaper_loaded = False
         self.fail = {}
         self.integration_calls, self.integration_reports_at = [], None
         self.binary = str(home / "v2dir" / "opencode.exe")
@@ -40789,18 +42328,19 @@ class InstallFakes:
             shown = self.integration_reports_at or target
             state = "current (v13)" if os.path.exists(target) else "not installed"
             return ok("claude: current (v10) (/elsewhere/hooks/herdr-agent-state.sh)\nopencode: %s (%s)\n" % (state, shown))
+        reaper = "cloud-reaper" in " ".join(argv)   # the reaper's service is loaded and unloaded on its own
         if argv[0] == "launchctl":
             if argv[1] == "print":
-                return subprocess.CompletedProcess(argv, 0 if self.loaded else 113, "", "")
-            self.loaded = argv[1] == "bootstrap"
+                return subprocess.CompletedProcess(argv, 0 if (self.reaper_loaded if reaper else self.loaded) else 113, "", "")
+            setattr(self, "reaper_loaded" if reaper else "loaded", argv[1] == "bootstrap")
             return ok()
         if argv[0] == "systemctl":
             if "is-enabled" in argv:
-                return subprocess.CompletedProcess(argv, 0 if self.loaded else 1, "", "")
+                return subprocess.CompletedProcess(argv, 0 if (self.reaper_loaded if reaper else self.loaded) else 1, "", "")
             if "enable" in argv:
-                self.loaded = True
+                setattr(self, "reaper_loaded" if reaper else "loaded", True)
             if "disable" in argv:
-                self.loaded = False
+                setattr(self, "reaper_loaded" if reaper else "loaded", False)
             return ok()
         raise AssertionError("install reached for a real program: %r" % argv)
 
@@ -40847,7 +42387,7 @@ class InstallCase(Base):
                 installer.uninstall(not args.no_service, not args.no_herdr_link)
             else:
                 installer.install(args.opencode, not args.no_service, not args.no_herdr_link,
-                                  status=lambda: status)
+                                  status=lambda: status, with_reaper=args.with_cloud_reaper)
         except sb.InstallError as err:
             return out.getvalue(), str(err)
         return out.getvalue(), None
@@ -41534,6 +43074,405 @@ class TestServiceTemplates(Base):
                 captured():
             code = sb.main(["run", "--standby"], runner=world.route, now=world.clock.now)
         self.assertEqual((code, slept, ran), (0, [sb.STANDBY_SECONDS], [1]))
+
+
+# Every field of the reaper's two templates: field -> what it must hold. A field added to a template needs a row.
+REAPER_PLIST_FIELDS = {
+    "Label": lambda v, ctx: v == "com.fleet-kit.cloud-reaper",
+    "ProgramArguments": lambda v, ctx: v[1:3] == ["-B", str(REPO / "cloud/launcher/cloud_worker.py")] and v[3:] == ["reap", "--loop", str(sb.REAPER_INTERVAL_SECONDS)],
+    "EnvironmentVariables": lambda v, ctx: v["HOME"] == str(Path.home()) and "/usr/bin" in v["PATH"].split(":"),
+    "RunAtLoad": lambda v, ctx: v is True,
+    "KeepAlive": lambda v, ctx: v is True,
+    "ThrottleInterval": lambda v, ctx: isinstance(v, int) and v >= 10,
+    "StandardErrorPath": lambda v, ctx: v == str(sb.state_dir_path() / "cloud-reaper-stderr.log"),
+    "StandardOutPath": lambda v, ctx: v == str(sb.state_dir_path() / "cloud-reaper-stdout.log"),
+    "ProcessType": lambda v, ctx: v == "Background",
+    "WorkingDirectory": lambda v, ctx: v == str(Path.home()),
+}
+REAPER_UNIT_FIELDS = {
+    ("Unit", "Description"): lambda v: "reaper" in v,
+    ("Service", "Type"): lambda v: v == "simple",
+    ("Service", "ExecStart"): lambda v: v.endswith("cloud/launcher/cloud_worker.py\" reap --loop %d" % sb.REAPER_INTERVAL_SECONDS),
+    ("Service", "WorkingDirectory"): lambda v: v == str(Path.home()),
+    ("Service", "Environment"): lambda v: "=" in v,
+    ("Service", "Restart"): lambda v: v == "always",
+    ("Service", "RestartSec"): lambda v: int(v) >= 10,
+    ("Service", "StandardOutput"): lambda v: v == "journal",
+    ("Service", "StandardError"): lambda v: v == "journal",
+    ("Install", "WantedBy"): lambda v: v == "default.target",
+}
+
+
+class TestCloudReaperTemplates(Base):
+    def values(self):
+        return sb.service_values(REPO, ["/opt/tools/bin", "/usr/bin"])
+
+    def plist(self, settings=None):
+        import plistlib
+        text = sb.render_reaper("launchd", self.values(), settings or {}, REPO)
+        return text, plistlib.loads(text.encode())
+
+    def test_every_plist_field_has_a_row_and_each_row_holds(self):
+        text, body = self.plist({"CW_CLOUD_NAMESPACE": "acme-cw"})
+        self.assertEqual(sorted(body), sorted(REAPER_PLIST_FIELDS))
+        for key, check in REAPER_PLIST_FIELDS.items():
+            with self.subTest(field=key):
+                self.assertTrue(check(body[key], None), body[key])
+        self.assertEqual(body["EnvironmentVariables"]["CW_CLOUD_NAMESPACE"], "acme-cw")
+
+    def test_every_unit_field_has_a_row_and_each_row_holds(self):
+        import configparser
+        text = sb.render_reaper("systemd", self.values(), {"CW_CLOUD_NAMESPACE": "acme-cw"}, REPO)
+        parser = configparser.ConfigParser(strict=False, interpolation=None)
+        parser.optionxform = str
+        parser.read_string(text)
+        found = {(sec, key) for sec in parser.sections() for key in parser[sec]}
+        self.assertEqual(found, set(REAPER_UNIT_FIELDS))
+        for (sec, key), check in REAPER_UNIT_FIELDS.items():
+            with self.subTest(field=(sec, key)):
+                self.assertTrue(check(parser[sec][key]), parser[sec][key])
+        self.assertIn('Environment="CW_CLOUD_NAMESPACE=acme-cw"', text)
+
+    def test_the_interval_is_never_slower_than_the_reapers_floor(self):
+        floor = int(re.search(r"(?m)^REAP_FLOOR_SECONDS = (\d+)", (REPO / "cloud" / "launcher" / "cloud_worker.py").read_text()).group(1))
+        self.assertLessEqual(sb.REAPER_INTERVAL_SECONDS, floor)
+        self.assertGreater(sb.REAPER_INTERVAL_SECONDS, 0)
+
+    def test_neither_holds_a_secret_a_placeholder_or_the_void(self):
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": PR16_KEY}):
+            self.check_neither_holds_a_secret()
+
+    def check_neither_holds_a_secret(self):
+        for kind, name in (("launchd", "com.fleet-kit.cloud-reaper.plist"), ("systemd", "fleet-kit-cloud-reaper.service")):
+            rendered = sb.render_reaper(kind, self.values(), {}, REPO)
+            self.assertNotIn(PR16_KEY, rendered)
+            bare = re.sub(r"<!--.*?-->|#.*", "", rendered, flags=re.S)
+            self.assertNotRegex(bare, r"(?i)secret|password|bearer|ghp_")
+            self.assertNotIn("/dev/null", bare)
+            for value in sorted({str(v) for v in self.values().values()}, key=len, reverse=True):
+                bare = bare.replace(value, "")
+            self.assertIsNone(re.search(r"__[A-Z][A-Z0-9_]*__", bare), name)
+            for number, line in enumerate((REPO / "templates" / name).read_text().splitlines(), 1):
+                self.assertIsNone(FORBIDDEN_IN_PUBLIC_TEXT.search(line), "%s:%d" % (name, number))
+
+    def test_a_setting_that_is_a_password_url_or_two_lines_is_refused_by_name_and_never_printed(self):
+        pw = "".join(chr(98 + (i * 5) % 24) for i in range(20))   # built at run time
+        for value in ("https://user:%s@api.example.internal" % pw, "a\nb"):
+            with self.assertRaises(sb.InstallError) as ctx:
+                sb.reaper_settings({"CW_CLOUD_SERVER": value})
+            self.assertIn("CW_CLOUD_SERVER", str(ctx.exception))
+            self.assertNotIn(pw, str(ctx.exception))
+        self.assertEqual(sb.reaper_settings({"CW_CLOUD_SERVER": "https://api.example.internal", "PATH": "/x", "CW_BOGUS": "1"}),
+                         {"CW_CLOUD_SERVER": "https://api.example.internal"})
+
+    def test_every_setting_has_one_shape_and_a_pasted_token_is_refused_by_name(self):
+        token = "".join(chr(97 + (i * 11) % 26) for i in range(48))   # built at run time: not a literal
+        good = {"CW_KUBE_CONTEXT": "acme-cw", "CW_CLOUD_NAMESPACE": "acme-cw", "CW_CLOUD_SERVER": "https://api.example.internal:6443",
+                "CW_CLOUD_TOKEN_FILE": "/home/user/.cw/token", "CW_KUBECONFIG": "/home/user/.kube/config", "CW_KUBECTL": "kubectl",
+                "CW_CLOUD_CA_FILE": "/home/user/ca.pem", "CW_CLOUD_RECORD_DIR": "/home/user/runs", "CW_RUN_RECORD_DIR": "/home/user/runs",
+                "CW_CLOUD_AUDIT": "/home/user/audit.jsonl"}
+        self.assertEqual(sorted(good), sorted(sb.REAPER_SETTING_NAMES))   # a name added needs a row here
+        self.assertEqual(sb.reaper_settings(good), good)
+        for name in sb.REAPER_SETTING_NAMES:
+            shape = sb.REAPER_SETTING_SHAPES[sb.reaper_setting_kind(name)]
+            for bad in (token, "relative/path", "/a/../b", "/a b", "https://api.example.internal/?" + token, "http://api.example.internal",
+                        "https://user@api.example.internal", "a\nb", "$(id)", "x;y"):
+                if shape.fullmatch(bad) and "/../" not in bad + "/" and "://" not in bad and not (re.search(r"[A-Za-z0-9]{32,}", bad) and not bad.startswith("/")):
+                    continue   # a value this setting accepts is not a bad value for it
+                with self.subTest(name=name, bad=bad[:12]):
+                    with self.assertRaises(sb.InstallError) as ctx:
+                        sb.reaper_settings({name: bad})
+                    self.assertIn(name, str(ctx.exception))
+                    self.assertNotIn(token, str(ctx.exception))
+
+    def test_the_setting_names_hold_no_token_value_name(self):
+        for name in sb.REAPER_SETTING_NAMES:
+            self.assertNotIn("PASSWORD", name)
+            self.assertFalse(name.endswith("_TOKEN"), name)   # a path to the token FILE is allowed, a token is not
+
+
+class CloudReaperInstall:
+    def reaper_path(self):
+        if self.PLATFORM == "darwin":
+            return self.home / "Library" / "LaunchAgents" / "com.fleet-kit.cloud-reaper.plist"
+        return self.home / "xdg-config" / "systemd" / "user" / "fleet-kit-cloud-reaper.service"
+
+    def reaper_calls(self):
+        return [c for c in self.machine.calls if c[0] in ("launchctl", "systemctl") and "cloud-reaper" in " ".join(c)
+                or c[:3] == ["systemctl", "--user", "daemon-reload"]]
+
+    def test_the_default_install_does_not_touch_the_reaper(self):
+        out, error = self.install("--opencode", self.machine.binary)
+        self.assertIsNone(error, error)
+        self.assertFalse(self.reaper_path().exists())
+        self.assertNotIn("cloud reaper", out)
+        self.assertFalse([c for c in self.machine.calls if "cloud-reaper" in " ".join(c)])
+
+    def test_opt_in_writes_loads_once_and_a_second_run_changes_nothing(self):
+        out, error = self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.assertIsNone(error, error)
+        self.assertTrue(self.reaper_path().is_file())
+        self.assertEqual(self.statuses(out)["cloud reaper"], ["will run", "done"])
+        loads = [c for c in self.machine.calls if c[:2] == (["launchctl", "bootstrap"] if self.PLATFORM == "darwin" else [""])[:2]
+                 and str(self.reaper_path()) in c] if self.PLATFORM == "darwin" else \
+            [c for c in self.machine.calls if c[:4] == ["systemctl", "--user", "enable", "--now"] and c[4] == "fleet-kit-cloud-reaper.service"]
+        self.assertEqual(len(loads), 1)
+        second, _ = self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.assertEqual(self.statuses(second)["cloud reaper"], ["already done"])
+
+    def test_uninstall_unloads_and_removes_it_and_a_never_installed_one_is_silent(self):
+        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        out, _ = self.install("--uninstall")
+        self.assertFalse(self.reaper_path().exists())
+        off = ["launchctl", "bootout", "gui/%d/com.fleet-kit.cloud-reaper" % os.getuid()] if self.PLATFORM == "darwin" else \
+            ["systemctl", "--user", "disable", "--now", "fleet-kit-cloud-reaper.service"]
+        self.assertIn(off, self.machine.calls)
+        out2, _ = self.install("--uninstall")
+        self.assertNotIn("cloud reaper", out2)
+
+    def test_a_dry_run_writes_nothing(self):
+        out, _ = self.install("--opencode", self.machine.binary, "--with-cloud-reaper", "--dry-run")
+        self.assertFalse(self.reaper_path().exists())
+        self.assertEqual(self.statuses(out)["cloud reaper"], ["would run", "would be done"])
+        self.assertFalse([c for c in self.machine.calls if c[0] in ("launchctl", "systemctl") and "cloud-reaper" in " ".join(c)
+                          and c[1] in ("bootstrap", "bootout", "enable", "disable")])
+
+    def test_a_changed_setting_unloads_rewrites_and_loads_again_in_that_order(self):
+        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        before = len(self.machine.calls)
+        with mock.patch.dict(os.environ, {"CW_CLOUD_NAMESPACE": "acme-cw"}):
+            out, error = self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.assertIsNone(error, error)
+        order = [c for c in self.machine.calls[before:] if "cloud-reaper" in " ".join(c) and "print" not in c and "is-enabled" not in c]
+        self.assertEqual(len(order), 2, order)
+        self.assertIn("disable" if self.PLATFORM == "linux" else "bootout", order[0])
+        self.assertIn("enable" if self.PLATFORM == "linux" else "bootstrap", order[1])
+        self.assertIn("acme-cw", self.reaper_path().read_text())
+
+    def test_a_failing_load_stops_the_install_with_the_command_named(self):
+        self.machine.fail["bootstrap" if self.PLATFORM == "darwin" else "enable --now fleet-kit-cloud-reaper"] = 5
+        out, error = self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.assertIsNotNone(error)
+        self.assertRegex(error, "bootstrap|enable")
+
+    SAMPLE_SETTINGS = {"CW_KUBE_CONTEXT": "acme-cw", "CW_CLOUD_NAMESPACE": "acme-cw", "CW_CLOUD_SERVER": "https://api.example.internal:6443",
+                       "CW_CLOUD_TOKEN_FILE": "/home/user/.cw/token", "CW_KUBECONFIG": "/home/user/.kube/config", "CW_KUBECTL": "kubectl",
+                       "CW_CLOUD_CA_FILE": "/home/user/ca.pem", "CW_CLOUD_RECORD_DIR": "/home/user/runs", "CW_RUN_RECORD_DIR": "/home/user/runs",
+                       "CW_CLOUD_AUDIT": "/home/user/audit.jsonl"}
+
+    def test_uninstall_removes_and_unloads_a_reaper_installed_with_any_one_setting_and_with_all(self):
+        self.assertEqual(sorted(self.SAMPLE_SETTINGS), sorted(sb.REAPER_SETTING_NAMES))   # a name added needs a row
+        cases = [{name: value} for name, value in self.SAMPLE_SETTINGS.items()] + [dict(self.SAMPLE_SETTINGS), {}]
+        for settings in cases:
+            with self.subTest(settings=sorted(settings)):
+                self.setUp()
+                with mock.patch.dict(os.environ, settings):
+                    self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+                self.assertTrue(self.reaper_path().is_file())
+                self.assertTrue(self.machine.reaper_loaded)
+                out, error = self.install("--uninstall")
+                self.assertIsNone(error, error)
+                self.assertFalse(self.reaper_path().exists(), out)
+                self.assertFalse(self.machine.reaper_loaded)   # unloaded, not just deleted
+
+    def test_a_file_that_is_not_ours_is_left_but_the_job_is_still_unloaded(self):
+        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.reaper_path().write_text("a file someone else made\n")
+        out, _ = self.install("--uninstall")
+        self.assertTrue(self.reaper_path().exists())
+        self.assertFalse(self.machine.reaper_loaded)
+        self.assertIn("the job is unloaded", out)
+
+    def test_uninstall_with_no_service_still_unloads_and_removes_the_reaper(self):
+        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        out, _ = self.install("--uninstall", "--no-service")
+        self.assertFalse(self.reaper_path().exists())
+        self.assertTrue(self.service_path().exists())   # the switchboard's own service is what --no-service leaves
+        self.assertFalse(self.machine.reaper_loaded)
+
+    def test_the_settings_come_from_the_environment_and_a_password_one_stops_the_install(self):
+        with mock.patch.dict(os.environ, {"CW_CLOUD_NAMESPACE": "acme-cw"}):
+            self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.assertIn("CW_CLOUD_NAMESPACE", self.reaper_path().read_text())
+        self.assertIn("acme-cw", self.reaper_path().read_text())
+        with mock.patch.dict(os.environ, {"CW_CLOUD_SERVER": "https://u:p4ss@api.example.internal"}):
+            out, error = self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.assertIn("CW_CLOUD_SERVER", error)
+        self.assertNotIn("p4ss", error + out)
+
+
+# The states a file the installer writes can be found in: name -> how to make it at `path` (victim is a file elsewhere)
+BAD_TARGET_STATES = {
+    "a symlink": lambda path, victim: os.symlink(str(victim), str(path)),
+    "a FIFO": lambda path, victim: os.mkfifo(str(path)),
+    "a directory": lambda path, victim: os.mkdir(str(path)),
+    "group-writable": lambda path, victim: (path.write_text("mine\n"), os.chmod(str(path), 0o664)),
+    "owned by another user": lambda path, victim: path.write_text("mine\n"),   # the installer is made to see another uid
+}
+
+
+BAD_STATE_REASON = {"a symlink": "symbolic link", "a FIFO": "not a regular file", "a directory": "not a regular file",
+                    "group-writable": "written by its group", "owned by another user": "owned by another user"}
+assert sorted(BAD_STATE_REASON) == sorted(BAD_TARGET_STATES)
+
+
+class WrittenFilesAreGuarded:
+    """One row per file the installer writes (the switchboard's own service file and the reaper's) x one per bad state."""
+
+    def targets(self):
+        return {"service": (self.service_path(), ()), "cloud reaper": (self.reaper_path(), ("--with-cloud-reaper",))}
+
+    def attempt(self, state, path, flags, uninstall=False):
+        victim = self.home / "victim"
+        victim.write_text("precious\n")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        BAD_TARGET_STATES[state](path, victim)
+        patch = mock.patch.object(sb, "current_uid", return_value=os.getuid() + 1) if state == "owned by another user" else mock.patch.object(sb, "current_uid", sb.current_uid)
+        with patch:
+            if uninstall:
+                result = self.install("--uninstall")
+            else:
+                result = self.install("--opencode", self.machine.binary, *flags)
+        return victim, result
+
+    def test_install_refuses_each_bad_state_for_each_file_and_changes_nothing(self):
+        for label, (path, flags) in self.targets().items():
+            for state in BAD_TARGET_STATES:
+                with self.subTest(file=label, state=state):
+                    self.setUp()   # a fresh machine for each row
+                    path, flags = self.targets()[label]
+                    victim, (out, error) = self.attempt(state, path, flags)
+                    self.assertIsNotNone(error, "%s %s: no refusal" % (label, state))
+                    self.assertIn(str(path), error)
+                    self.assertIn(BAD_STATE_REASON[state], error)   # the right check refused it, not another one
+                    self.assertEqual(victim.read_text(), "precious\n")
+                    if state == "a symlink":
+                        self.assertTrue(path.is_symlink())
+                    loads = [c for c in self.machine.calls if c[0] in ("launchctl", "systemctl") and c[1] in ("bootstrap", "enable")
+                             and (label != "cloud reaper" or "cloud-reaper" in " ".join(c))]
+                    self.assertEqual(loads, [])
+
+    def test_uninstall_leaves_each_bad_state_for_each_file_alone_and_says_so(self):
+        for label, (path, flags) in self.targets().items():
+            for state in BAD_TARGET_STATES:
+                with self.subTest(file=label, state=state):
+                    self.setUp()
+                    path, flags = self.targets()[label]
+                    victim, (out, error) = self.attempt(state, path, flags, uninstall=True)
+                    self.assertIsNone(error, error)
+                    self.assertEqual(victim.read_text(), "precious\n")
+                    self.assertTrue(os.path.lexists(str(path)), "%s %s was removed" % (label, state))
+                    self.assertIn("skipped", out)
+
+    def test_uninstall_removes_only_the_file_this_installers_template_makes(self):
+        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.reaper_path().write_text("a file someone else made\n")
+        out, error = self.install("--uninstall")
+        self.assertTrue(self.reaper_path().exists())
+        self.assertIn("is not the file this installer writes", out)
+        self.reaper_path().unlink()
+
+    def test_a_replaced_file_is_replaced_by_rename_never_written_through(self):
+        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        inode = os.stat(str(self.reaper_path())).st_ino
+        with mock.patch.dict(os.environ, {"CW_CLOUD_NAMESPACE": "acme-cw"}):
+            self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.assertNotEqual(os.stat(str(self.reaper_path())).st_ino, inode)
+        self.assertEqual([p.name for p in self.reaper_path().parent.iterdir() if p.name.startswith(".")], [])   # no temp file left
+
+
+class TestTheReapersCommandPathIsWalked(InstallCase):
+    """The service runs one file: the launcher's own walk (one copy, in cloud_worker.py) judges it and every parent above it."""
+
+    def kit(self):
+        root = Path(os.path.realpath(str(self.home))) / "kit"
+        shutil.copytree(REPO / "cloud" / "launcher", root / "cloud" / "launcher", ignore=shutil.ignore_patterns("tests", "__pycache__"), symlinks=True)
+        shutil.copytree(REPO / "templates", root / "templates")
+        for path in [root] + [p for p in root.rglob("*")]:
+            os.chmod(str(path), 0o755 if path.is_dir() or os.access(str(path), os.X_OK) else 0o644)
+        return root
+
+    def problem(self, root):
+        installer = sb.Installer(self.machine, self.daemons, time.time, "darwin", root, dry_run=True, out=io.StringIO(),
+                                 shared_profile=False, profile=None, gh_user=None)
+        return installer.reaper_command_problem()
+
+    def test_a_clean_copy_passes_and_each_bad_state_is_named(self):
+        root = self.kit()
+        self.assertIsNone(self.problem(root))
+        script = root / "cloud" / "launcher" / "cloud_worker.py"
+        rows = {
+            "the file is group-writable": (lambda: os.chmod(str(script), 0o664), lambda: os.chmod(str(script), 0o644), "group- or world-writable"),
+            "the launcher directory is group-writable": (lambda: os.chmod(str(script.parent), 0o775), lambda: os.chmod(str(script.parent), 0o755), "parent that is group- or world-writable"),
+            "the kit root is group-writable": (lambda: os.chmod(str(root), 0o775), lambda: os.chmod(str(root), 0o755), "parent that is group- or world-writable"),
+        }
+        for name, (make, undo, reason) in rows.items():
+            with self.subTest(row=name):
+                make()
+                self.assertIn(reason, self.problem(root) or "")
+                undo()
+        self.assertIsNone(self.problem(root))
+
+    def test_the_file_being_judged_is_never_run(self):
+        root = self.kit()
+        script = root / "cloud" / "launcher" / "cloud_worker.py"
+        marker = root / "ran"
+        script.write_text("open(%r, 'w').write('ran')\n" % str(marker))
+        os.chmod(str(script), 0o666)   # writable by others: it must be refused, and not imported on the way
+        self.assertIn("group- or world-writable", self.problem(root) or "")
+        self.assertFalse(marker.exists())
+
+    def test_a_symlinked_parent_is_named(self):
+        root = self.kit()
+        real = root / "elsewhere"
+        (root / "cloud" / "launcher").rename(real)
+        os.symlink(str(real), str(root / "cloud" / "launcher"))
+        self.assertIn("symlink", self.problem(root) or "")
+
+    def test_a_symlinked_file_or_parent_is_named(self):
+        root = self.kit()
+        script = root / "cloud" / "launcher" / "cloud_worker.py"
+        real = root / "elsewhere.py"
+        script.rename(real)
+        os.symlink(str(real), str(script))
+        self.assertIn("symlink", self.problem(root) or "")
+
+    def test_the_install_refuses_before_writing_when_the_path_is_bad(self):
+        with mock.patch.object(sb.Installer, "reaper_command_problem", return_value="has a parent that is group- or world-writable"):
+            out, error = self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.assertIn("cloud_worker.py", error)
+        self.assertFalse((self.home / "Library" / "LaunchAgents" / "com.fleet-kit.cloud-reaper.plist").exists())
+        self.assertFalse([c for c in self.machine.calls if "cloud-reaper" in " ".join(c) and c[1] == "bootstrap"])
+
+
+class TestCloudReaperInstallOnMacOS(CloudReaperInstall, WrittenFilesAreGuarded, InstallCase):
+    PLATFORM = "darwin"
+
+    def test_the_written_plist_is_loaded_at_login_restarts_and_lints(self):
+        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        import plistlib
+        body = plistlib.loads(self.reaper_path().read_bytes())
+        self.assertIs(body["RunAtLoad"], True)
+        self.assertIs(body["KeepAlive"], True)
+        boots = [c for c in self.machine.calls if c[:2] == ["launchctl", "bootstrap"] and c[-1] == str(self.reaper_path())]
+        self.assertEqual(len(boots), 1)
+        if not shutil.which("plutil"):
+            self.skipTest("plutil is macOS only")
+        done = subprocess.run(["plutil", "-lint", str(self.reaper_path())], capture_output=True)
+        self.assertEqual(done.returncode, 0, done.stdout.decode() + done.stderr.decode())
+
+
+class TestCloudReaperInstallOnLinux(CloudReaperInstall, WrittenFilesAreGuarded, InstallCase):
+    PLATFORM = "linux"
+
+    def test_the_written_unit_is_enabled_now_and_verifies(self):
+        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.assertIn(["systemctl", "--user", "enable", "--now", "fleet-kit-cloud-reaper.service"], self.machine.calls)
+        if not shutil.which("systemd-analyze"):
+            self.skipTest("systemd-analyze is not here")
+        done = subprocess.run(["systemd-analyze", "verify", str(self.reaper_path())], capture_output=True)
+        for word in (b"Unknown key", b"Invalid", b"Failed to parse", b"Unknown section"):
+            self.assertNotIn(word, done.stderr)
 
 
 class TestTheTrialSharesTheInstaller(Base):
@@ -67192,7 +69131,7 @@ class TestReassign(IntentCase):
         ra = sb.load_module("reassign")
         self.world.add_agent("worker2", fleet={"role": "coder", "issue": 4, "reports_to": "orch-a"})
         self.assertEqual(self.main("reassign", "worker2", "--to", "orch-b", "--consent-from", "orch-a")[0], 0)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"worker2": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
+        set_retired(self.world.state, {"worker2": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
         self.assertEqual(self.reassign()[0], 0)
         self.assertEqual(sorted(ra.read_overrides(self.world.state)[0]), ["worker"], "the retired worker's override is gone")
 
@@ -67236,15 +69175,15 @@ class TestReassign(IntentCase):
         self.assertIn("may not reattach", got["orch-a"])
 
     def test_a_retired_or_excluded_orchestrator_is_refused_as_the_target_and_as_the_consenting_boss(self):
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"orch-b": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
+        set_retired(self.world.state, {"orch-b": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
         code, _, err = self.reassign()
         self.assertEqual(code, 2)
         self.assertIn("the target orch-b is retired", err)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"orch-a": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
+        set_retired(self.world.state, {"orch-a": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
         code, _, err = self.reassign()
         self.assertEqual(code, 2)
         self.assertIn("the consenting boss orch-a is retired", err)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {})
+        set_retired(self.world.state, {})
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO, "excluded_repos": [FAKE_REPO]})
         code, _, err = self.reassign()
         self.assertEqual(code, 2)
@@ -68197,6 +70136,21 @@ class TestNewestCiRuns(unittest.TestCase):
         self.assertEqual(sb.pr_ci_of(rollup), "failing", "a red check is not hidden by the other workflow's green")
         self.assertEqual(len(sb.pr_checks_of(rollup)), 2)
 
+    CLOUD_SPLIT = ("test (ubuntu-latest)", "test (macos-latest)", "test-cloud (ubuntu-latest)", "test-cloud (macos-latest)")
+
+    def test_s4_a_red_or_pending_check_of_the_split_cloud_job_decides_the_verdict_with_no_list_of_names(self):
+        """Ask #868: the launcher and worker suites run as their own job; the verdict reads every check of the head, so each member of the
+        four-name family is checked in turn: red reads failing, pending reads pending, all green reads green."""
+        for odd in self.CLOUD_SPLIT:
+            red = [ci_run("test", n, "FAILURE" if n == odd else "SUCCESS", "2026-10-15T16:00:00Z") for n in self.CLOUD_SPLIT]
+            self.assertEqual(sb.pr_ci_of(red), "failing", odd)
+            self.assertEqual(sb.pr_ci_of(list(reversed(red))), "failing", odd)
+            pending = [ci_run("test", n, "" if n == odd else "SUCCESS", "2026-10-15T16:00:00Z", status="IN_PROGRESS" if n == odd else "COMPLETED")
+                       for n in self.CLOUD_SPLIT]
+            self.assertEqual(sb.pr_ci_of(pending), "pending", odd)
+        green = [ci_run("test", n, "SUCCESS", "2026-10-15T16:00:00Z") for n in self.CLOUD_SPLIT]
+        self.assertEqual(sb.pr_ci_of(green), "green")
+
     def test_an_older_run_that_finishes_after_a_newer_one_started_does_not_hide_the_running_one(self):
         older = ci_run("ci", "test", "SUCCESS", "2026-10-15T10:30:00Z", "2026-10-15T10:00:00Z")   # started 10:00, finished 10:30
         newer = ci_run("ci", "test", "", None, "2026-10-15T10:20:00Z", status="IN_PROGRESS")        # started 10:20, still running
@@ -68881,6 +70835,176 @@ class TestMessageTimesDelivery(Base):
         self.assertTrue(self.send("second")["sent"])
         self.assertNotIn("supersedes", self.waiting()[-1].splitlines()[0], "an implausible time is not shown")
         self.assertEqual(sb.clock_utc(1e30), "??:??Z")
+
+
+class TestAgentRegistry(unittest.TestCase):
+    """Slice 2 of #903: bin/registry.py by itself (the frozen interface of docs/agent-registry.md): atomic write, version rule, the fold of today's
+    records, the registry's own check of a removal's evidence. HERDR_* and OPENCODE_* are unset for every test."""
+
+    def setUp(self):
+        for key in [k for k in os.environ if k.startswith(("HERDR_", "OPENCODE_"))]:
+            self.addCleanup(os.environ.__setitem__, key, os.environ[key])
+            del os.environ[key]
+        self.state = Path(tempfile.mkdtemp(prefix="registry-test"))
+        self.addCleanup(shutil.rmtree, str(self.state), True)
+        self.reg = sb.load_module("registry")
+
+    def old_records(self, **extra):
+        row = {"session": "ses_a", "pane": "w1:p1", "role": "coder", "charter": 903, "repo": "acme-org/widget-service",
+               "workspace": "w1", "cwd": "/home/user/work", "seen": 5}
+        (self.state / "pane-health.json").write_text(json.dumps({"agents": {"alpha": dict(row, **extra)}, "states": {"alpha": {"state": "detached"}}, "missing": {}}))
+
+    def test_s8_every_field_the_old_readers_use_is_in_the_registry_after_the_fold(self):
+        self.old_records()
+        row = self.reg.read(self.state)["agents"]["alpha"]
+        for field in ("session", "pane", "role", "charter", "repo", "workspace", "cwd"):
+            with self.subTest(field=field):
+                self.assertEqual(row[field], {"session": "ses_a", "pane": "w1:p1", "role": "coder", "charter": 903, "repo": "acme-org/widget-service",
+                                              "workspace": "w1", "cwd": "/home/user/work"}[field])
+        self.assertEqual((row["state"], row["kind"], row["run_id"]), ("detached", "local", None))
+        self.assertEqual(oct((self.state / "registry.json").stat().st_mode & 0o777), "0o600")
+
+    def test_the_fold_keeps_a_retirement_with_its_record_headless_copy_and_a_cloud_worker_with_its_run_id(self):
+        entry = {"at": int(time.time()), "by": "boss", "reason": "done", "session": "ses_b", "auto": False,
+                 "record": {"pane": "w1:p2", "workspace": "w1", "cwd": "/home/user/b"}, "headless": {"session": "ses_b", "name": "beta"}}
+        (self.state / "retired.json").write_text(json.dumps({"beta": entry}))
+        (self.state / "cloud").mkdir()
+        (self.state / "cloud" / "gamma.json").write_text(json.dumps({"worker": "gamma", "repo": "acme-org/widget-service", "runtime_id": "rt_1", "run_id": "run_example", "session": "ses_c"}))
+        got = self.reg.read(self.state)
+        self.assertEqual(got["retired"]["beta"], entry)
+        self.assertEqual(self.reg.get_retired(self.state, "beta"), entry)
+        self.assertEqual((got["agents"]["gamma"]["kind"], got["agents"]["gamma"]["run_id"], got["agents"]["gamma"]["session"]), ("cloud", "run_example", "ses_c"))
+
+    def test_a_retired_record_with_no_session_covers_nothing_and_known_agent_finds_no_one(self):
+        (self.state / "retired.json").write_text(json.dumps({"beta": {"at": 1, "by": "x", "reason": "r", "session": None, "record": {"pane": "p"}}}))
+        self.assertEqual(sb.known_agent(self.state, "beta"), {})
+        self.assertFalse(self.reg.covers(self.reg.get_retired(self.state, "beta"), None))
+        self.assertTrue(self.reg.upsert(self.state, "beta", {"session": "ses_new", "pane": "p9"})["changed"])   # not refused as retired
+
+    def test_known_agent_reads_a_retired_agents_record_from_the_registry_alone(self):
+        self.assertTrue(self.reg.upsert(self.state, "alpha", {"session": "ses_a", "pane": "w1:p1", "workspace": "w1", "cwd": "/home/user/work", "role": "coder"})["changed"])
+        self.assertTrue(self.reg.retire(self.state, "alpha", "boss", "done")["changed"])
+        self.assertNotIn("alpha", self.reg.read(self.state)["agents"])
+        kept = sb.known_agent(self.state, "alpha")
+        self.assertEqual((kept["session"], kept["workspace"], kept["cwd"]), ("ses_a", "w1", "/home/user/work"))
+        self.assertTrue(self.reg.unretire(self.state, "alpha")["changed"])
+        self.assertEqual(self.reg.get(self.state, "alpha")["workspace"], "w1")
+        self.assertEqual(sb.read_retired(self.state), {})
+
+    def test_a_newer_version_reads_nothing_says_so_and_a_writer_writes_nothing(self):
+        text = json.dumps({"version": 9, "agents": {"a": {"session": "ses_x"}}, "retired": {}})
+        (self.state / "registry.json").write_text(text)
+        got = self.reg.read(self.state)
+        self.assertEqual((got["whole"], got["agents"], got["problem"]), (False, {}, "registry.json is version 9; this reader knows 1: nothing read"))
+        self.assertEqual(self.reg.upsert(self.state, "b", {"session": "ses_y"}), {"changed": False, "problem": got["problem"]})
+        self.assertEqual((self.state / "registry.json").read_text(), text)
+        with self.assertRaises(sb.RetiredUnreadable):
+            sb.read_retired_strict(self.state)
+        for bad in ("{", "[]", '{"version": "1"}', '{"version": 1, "agents": []}'):
+            (self.state / "registry.json").write_text(bad)
+            self.assertFalse(self.reg.read(self.state)["whole"], bad)
+
+    def test_s6_two_writers_and_a_reader_never_see_a_torn_file_in_1000_rounds(self):
+        self.reg.upsert(self.state, "seed", {"session": "ses_seed", "cwd": "x" * 5000})
+        stop, torn = threading.Event(), []
+
+        def write(tag):
+            n = 0
+            while not stop.is_set():
+                n += 1
+                self.reg.upsert(self.state, "w%s" % tag, {"session": "ses_%s_%d" % (tag, n), "cwd": "y" * 3000})
+
+        threads = [threading.Thread(target=write, args=(t,)) for t in "ab"]
+        for t in threads:
+            t.start()
+        try:
+            for _ in range(1000):
+                got = self.reg.read(self.state)
+                if not got["whole"] or "seed" not in got["agents"]:
+                    torn.append(got["problem"])
+        finally:
+            stop.set()
+            for t in threads:
+                t.join()
+        self.assertEqual(torn, [])
+        self.assertEqual([p.name for p in self.state.iterdir() if p.name.endswith(".tmp")], [])
+
+    def test_upsert_with_nothing_changed_writes_and_audits_nothing(self):
+        self.assertTrue(self.reg.upsert(self.state, "a", {"session": "ses_a", "pane": "p1"})["changed"])
+        path = self.state / "registry.json"
+        before = (path.read_bytes(), path.stat().st_mtime_ns, (self.state / "registry-audit.jsonl").read_text())
+        self.assertEqual(self.reg.upsert(self.state, "a", {"session": "ses_a", "pane": "p1"}), {"changed": False, "problem": None})
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, (self.state / "registry-audit.jsonl").read_text()), before)
+
+    def test_reconcile_remove_checks_the_evidence_itself_and_audits_a_removal(self):
+        self.reg.upsert(self.state, "a", {"session": "ses_a", "pane": "p1", "state": "working"})
+        alive = {"pane_listed": True, "process_found": True}
+        self.assertEqual(self.reg.reconcile_remove(self.state, "a", alive, True)["changed"], False)     # whole=True is not enough for a live agent
+        self.assertEqual(self.reg.reconcile_remove(self.state, "a", {"pane_listed": False, "process_found": False}, True)["changed"], False)   # recorded state is not dead
+        self.reg.upsert(self.state, "a", {"session": "ses_a", "pane": "p1", "state": "dead"})
+        gone = {"pane_listed": False, "process_found": False}
+        self.assertEqual(self.reg.reconcile_remove(self.state, "a", gone, False)["changed"], False)    # a partial read removes nothing
+        self.assertIn("a", self.reg.read(self.state)["agents"])
+        self.assertTrue(self.reg.reconcile_remove(self.state, "a", gone, True)["changed"])
+        self.assertNotIn("a", self.reg.read(self.state)["agents"])
+        lines = [json.loads(l) for l in (self.state / "registry-audit.jsonl").read_text().splitlines()]
+        self.assertEqual([l["event"] for l in lines if l["event"] == "reconcile_remove"], ["reconcile_remove"])
+        self.assertEqual([l for l in lines if l["event"] == "reconcile_remove"][0]["evidence"], gone)
+        refused = [l for l in lines if l["event"] == "reconcile_refused"]
+        self.assertEqual(len(refused), 3)                                   # live evidence, state not dead, partial read: each audited with evidence and reason
+        self.assertEqual(refused[0]["evidence"], alive)
+        self.assertTrue(all(l["why"] and "nothing removed" in l["why"] for l in refused))
+
+    def test_a_dead_row_is_removed_only_when_each_evidence_key_shows_it_gone_and_each_refusal_is_audited(self):
+        gone = {"pane_listed": False, "process_found": False}
+        cases = {"pane_listed true": {"pane_listed": True, "process_found": False}, "process_found true": {"pane_listed": False, "process_found": True},
+                 "pane_listed missing": {"process_found": False}, "process_found missing": {"pane_listed": False}, "evidence None": None,
+                 "evidence a string": "gone", "evidence a list": [gone]}
+        for label, evidence in cases.items():
+            with self.subTest(label=label):
+                self.reg.upsert(self.state, "d", {"session": "ses_d", "state": "dead"})
+                before = len([l for l in (self.state / "registry-audit.jsonl").read_text().splitlines() if "reconcile_refused" in l])
+                got = self.reg.reconcile_remove(self.state, "d", evidence, True)
+                self.assertEqual(got["changed"], False)
+                self.assertIn("d", self.reg.read(self.state)["agents"])
+                after = [json.loads(l) for l in (self.state / "registry-audit.jsonl").read_text().splitlines() if "reconcile_refused" in l]
+                self.assertEqual(len(after), before + 1)
+                self.assertEqual(after[-1]["evidence"], evidence if isinstance(evidence, dict) else None)
+        self.assertTrue(self.reg.reconcile_remove(self.state, "d", gone, True)["changed"])
+
+    def test_retire_then_undo_keeps_a_local_a_cloud_and_a_headless_row_what_it_was(self):
+        self.reg.upsert(self.state, "loc", {"session": "ses_l", "pane": "p1", "workspace": "w1"})
+        self.reg.upsert(self.state, "cld", {"session": "ses_c", "repo": "acme-org/widget-service", "kind": "cloud", "run_id": "run_example"})
+        self.reg.retire(self.state, "loc", "boss", "done")
+        self.reg.retire(self.state, "cld", "cloud-worker", "done")
+        self.reg.retire(self.state, "hdl", "boss", "done", session="ses_h", extra={"headless": {"session": "ses_h"}})
+        for name in ("loc", "cld", "hdl"):
+            self.assertTrue(self.reg.unretire(self.state, name)["changed"])
+        agents = self.reg.read(self.state)["agents"]
+        self.assertEqual((agents["loc"]["kind"], agents["loc"]["run_id"], agents["loc"]["workspace"]), ("local", None, "w1"))
+        self.assertEqual((agents["cld"]["kind"], agents["cld"]["run_id"], agents["cld"]["session"]), ("cloud", "run_example", "ses_c"))
+        self.assertNotIn("hdl", agents)                                       # a headless worker comes back from its own launch record, not as a pane row
+
+    def test_the_fold_does_not_bring_back_a_retired_cloud_worker_but_a_relaunch_under_the_name_stays(self):
+        (self.state / "cloud").mkdir()
+        (self.state / "cloud" / "w1.json").write_text(json.dumps({"worker": "w1", "session": "ses_c", "run_id": "r1"}))
+        (self.state / "cloud" / "w2.json").write_text(json.dumps({"worker": "w2", "session": "ses_new", "run_id": "r2"}))
+        (self.state / "retired.json").write_text(json.dumps({"w1": {"at": int(time.time()), "by": "x", "reason": "r", "session": "ses_c"},
+                                                            "w2": {"at": int(time.time()), "by": "x", "reason": "r", "session": "ses_old"}}))
+        got = self.reg.read(self.state)
+        self.assertEqual(sorted(got["agents"]), ["w2"])
+        self.assertEqual(sorted(got["retired"]), ["w1", "w2"])
+
+    def test_retire_and_close_leave_agents_keep_the_record_and_audit(self):
+        for name in ("a", "b"):
+            self.reg.upsert(self.state, name, {"session": "ses_" + name, "pane": "p", "workspace": "w1"})
+        self.reg.retire(self.state, "a", "boss", "done", auto=True)
+        self.reg.close(self.state, "b", "boss", "pane closed")
+        got = self.reg.read(self.state)
+        self.assertEqual(got["agents"], {})
+        self.assertEqual((got["retired"]["a"]["auto"], got["retired"]["b"]["reason"], got["retired"]["b"]["record"]["workspace"]), (True, "pane closed", "w1"))
+        self.assertEqual(sorted(json.loads(l)["event"] for l in (self.state / "registry-audit.jsonl").read_text().splitlines() if "retire" in l or "close" in l), ["close", "retire"])
+        self.assertEqual(json.loads((self.state / "retired.json").read_text()).keys(), {"a", "b"})   # derived output, the old format
 
 
 class TestPaneWarningRule(unittest.TestCase):
