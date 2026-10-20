@@ -58,8 +58,8 @@ class PodDeadline(base.Base):
         with open(src) as f:
             text = f.read()
         self.assertEqual(len(re.findall(r'"kind":\s*"Pod"', text)), 1)
-        self.assertEqual(len(re.findall(r'"restartPolicy"', text)), 1)
-        self.assertEqual(len(re.findall(r'"activeDeadlineSeconds"', text)), 1)
+        self.assertEqual(len(re.findall(r'"restartPolicy":\s*"Never"', text)), 1)
+        self.assertEqual(len(re.findall(r'"activeDeadlineSeconds":\s*pod_deadline_floor', text)), 1)
         self.assertGreaterEqual(len(BUILDERS), 2)
 
     def test_the_run_secret_variant_of_the_builder_carries_the_floor(self):
@@ -73,6 +73,16 @@ class PodDeadline(base.Base):
                 pod = cw.render_pod(a, "coder7", "cw-coder7", now, now + dt.timedelta(hours=1), self.env, ["model-key"])
                 self.assertEqual(pod["spec"]["activeDeadlineSeconds"], 7200 + cw.POD_DEADLINE_GRACE_SECONDS)
                 self.assertIn("projected", pod["spec"]["volumes"][0])
+
+    def test_every_frozen_fixture_case_including_the_stack_pod_carries_the_floor(self):
+        # The cases the frozen fixtures are built from (default and stack, S and M, run secrets, pull secret): all go through render_pod.
+        import test_cloud_stack as st
+        cases = {**st.CASES, **st.STACK_CASES}
+        self.assertTrue(any(a.__dict__.get("stack") for a, _ in cases.values()))
+        for name, (a, names) in sorted(cases.items()):
+            with self.subTest(case=name):
+                pod = st.build(a, names)
+                self.assertEqual(pod["spec"]["activeDeadlineSeconds"], 8 * 3600 + cw.POD_DEADLINE_GRACE_SECONDS)
 
     def test_a_pod_the_floor_killed_is_still_cleaned_up_by_stop_and_by_the_reaper(self):
         """A regression guard on stop and reap (unchanged by this PR): a Failed/DeadlineExceeded pod and its Secrets still go."""

@@ -3103,7 +3103,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), PlanWakeFacts(), JobFacts(), PaneFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), PlanWakeFacts(), AlertWakeFacts(), JobFacts(), PaneFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -3518,7 +3518,7 @@ def collapse_riders(facts, now, max_age):
 
 
 DESCRIBED_AS = {"send": "message", "report": "report", "worker.idle": "finished", "worker.stopped": "stopped",
-                "worker.blocked": "blocked", "nudge": "nudge", "sweep": "sweep", "triage": "triage", "plan": "plan posted", "disk": "disk guard"}
+                "worker.blocked": "blocked", "nudge": "nudge", "sweep": "sweep", "triage": "triage", "plan": "plan posted", "alert": "alert issue", "disk": "disk guard"}
 
 
 def _line_of(text, limit):
@@ -6673,6 +6673,36 @@ def prune_retired(retired, now):
     return retired
 
 
+def retired_agent(retired, name, session):
+    """True when `name` is retired for THIS session (a retirement with no session covers any); a relaunch under the same name is not."""
+    entry = retired.get(name)
+    return isinstance(entry, dict) and entry.get("session") is not None and entry.get("session") == session   # no session on the record: it covers nothing
+
+
+RETIRED_RECORD_FIELDS = ("pane", "role", "charter", "repo", "workspace", "cwd")   # what the pane record holds besides the session (and `seen`, which nothing reads)
+
+
+def pane_record_of(row):
+    """What a retirement keeps of a pane record (`record` in retired.json), so the prune loses nothing a reader needs."""
+    return {k: row[k] for k in RETIRED_RECORD_FIELDS if isinstance(row, dict) and row.get(k) is not None}
+
+
+def known_agent(state_dir, name, known=None):
+    """The pane record of a fleet agent: the live one, else (a retired agent is pruned from the pane record) the one kept in retired.json with its session.
+    {} when neither exists. The one lookup every reader of a possibly pruned agent uses."""
+    if known:
+        return known
+    entry = read_retired(state_dir).get(name)
+    if not isinstance(entry, dict) or entry.get("headless") or not entry.get("session"):
+        return {}
+    return dict(entry["record"] if isinstance(entry.get("record"), dict) else {}, session=entry["session"])
+
+
+def known_session(state_dir, name, known):
+    """The session of a fleet agent: the pane record's, else the retired record's."""
+    return known_agent(state_dir, name, known).get("session") or (read_retired(state_dir).get(name) or {}).get("session")
+
+
 def read_retired(state_dir):
     return _read_small(state_dir, RETIRED_FILE)
 
@@ -6815,6 +6845,11 @@ def pane_health_pass(engine, now):
     data = read_pane_health(engine.state_dir)
     agents, states, missing = data["agents"], data["states"], data["missing"]
     retired = read_retired(engine.state_dir)
+    try:
+        read_retired_strict(engine.state_dir)
+        retired_whole = True
+    except RetiredUnreadable:
+        retired_whole = False   # a half-read retired list removes nothing (#805)
     names = list(discovery.agents)
     sessions = [o.session_id for o in discovery.agents.values()]
     budget = PANE_CHECKS_PER_PASS
@@ -6872,7 +6907,7 @@ def pane_health_pass(engine, now):
             if last.get("state") in ("done", "failed") and 0 <= now - (last.get("at") or 0) <= lookback:
                 # its boss closed the tab AFTER the worker's final `done`/`failed` report: finished on purpose, not dead
                 entry = {"at": int(now), "by": "the switchboard", "reason": "its pane closed after its final %s report" % last["state"],
-                         "session": agents[name].get("session"), "auto": True}
+                         "session": agents[name].get("session"), "auto": True, "record": pane_record_of(agents[name])}
                 try:
                     with agent_lock(engine.state_dir, "files", seconds=2):
                         current = prune_retired(read_retired(engine.state_dir), now)
@@ -6895,6 +6930,10 @@ def pane_health_pass(engine, now):
             if engine.audit is not None:
                 engine.audit.append(engine.actor, "fleetpane.dead", name, {"pane": agents[name].get("pane"), "session": agents[name].get("session")})
     engine.pane_alerts = {n: v for n, v in states.items() if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n in agents and n not in retired}
+    if retired_whole:   # a retired agent (name AND session) leaves the record the pane draws from; its session stays in retired.json for reattach and --undo
+        for name in [n for n in agents if retired_agent(retired, n, agents[n].get("session"))]:
+            for table in (agents, states, missing):
+                table.pop(name, None)
     try:
         write_pane_health(engine.state_dir, {"agents": agents, "states": states, "missing": missing, "at": int(now)})
     except OSError as err:
@@ -7141,9 +7180,10 @@ def reattach_caller_problem(engine, runner, now, discovery, name, session=None, 
         return None
     if target is None:   # a dead agent is not discovered: its boss is in the session's STORED metadata
         try:
-            known = read_pane_health(engine.state_dir)["agents"].get(name) or {}
-            stored = _fleet_meta(engine.v2.session_get(session or known.get("session"))) or {} if (session or known.get("session")) else {}
-            stored = load_module("reassign").overlay(engine.state_dir, stored, session or known.get("session")) if stored else stored   # a reassigned worker's new boss, not the one it was launched with
+            known = known_agent(engine.state_dir, name, read_pane_health(engine.state_dir)["agents"].get(name))
+            known_sid = session or known.get("session")
+            stored = _fleet_meta(engine.v2.session_get(known_sid)) or {} if known_sid else {}
+            stored = load_module("reassign").overlay(engine.state_dir, stored, known_sid) if stored else stored   # a reassigned worker's new boss, not the one it was launched with
             boss = resolve_boss(discovery, stored.get("reports_to")) if stored.get("reports_to") else None
         except Exception:
             boss = None
@@ -7155,7 +7195,7 @@ def reattach_caller_problem(engine, runner, now, discovery, name, session=None, 
 
 
 def _reattach_locked(args, runner, now, engine, state, name, discovery):
-    known = read_pane_health(state)["agents"].get(name) or {}
+    known = known_agent(state, name, read_pane_health(state)["agents"].get(name))
     seen = discovery.agents.get(name)
     session_id = args.session or (seen.session_id if seen else None) or known.get("session")
     if not session_id:
@@ -7414,7 +7454,7 @@ def cmd_retire(args, runner, now):
         raise LaunchError("refused: %s" % who)
     reason = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", args.reason or "").split())[:200]
     seen = discovery.agents.get(name)
-    known = read_pane_health(state)["agents"].get(name) or {}
+    known = known_agent(state, name, read_pane_health(state)["agents"].get(name))   # a pruned retired agent is still known
     close_pane, close_by, close_note, headless_kept = None, None, None, None
     if getattr(args, "close", False) and not args.undo and seen is not None and seen.headless:
         close_note = "headless: it has no terminal, so there is nothing to close"
@@ -7446,6 +7486,8 @@ def cmd_retire(args, runner, now):
             data = read_pane_health(state)
             data["states"].pop(name, None)
             data["missing"].pop(name, None)
+            if entry.get("session") and not entry.get("headless") and name not in data["agents"]:
+                data["agents"][name] = dict(entry["record"] if isinstance(entry.get("record"), dict) else {}, session=entry["session"])   # the retire pruned its row: put back all of it
             try:
                 write_pane_health(state, data)
             except OSError:
@@ -7463,6 +7505,8 @@ def cmd_retire(args, runner, now):
         prune_retired(retired, now())
         retired[name] = {"at": int(now()), "by": identify_who(engine, runner, now), "reason": reason or "finished",
                          "session": (seen.session_id if seen else None) or known.get("session"), "auto": False}
+        if known:
+            retired[name]["record"] = pane_record_of(known)   # the pane record is pruned below: keep what reattach and --undo read
         if headless_lost:
             retired[name]["session"] = headless_kept["session"]
         if headless_kept is not None:
@@ -7473,6 +7517,8 @@ def cmd_retire(args, runner, now):
             raise LaunchError("%s could not be written (%s): %s was not retired, try again" % (RETIRED_FILE, err.strerror or err, name)) from None
     data = read_pane_health(state)
     data["states"].pop(name, None)
+    data["agents"].pop(name, None)   # pruned in the same step as the retire: the session is in retired.json
+    data["missing"].pop(name, None)
     try:
         write_pane_health(state, data)
     except OSError:
@@ -12327,6 +12373,7 @@ class SweepState:
         self.alarmed = {}        # (kind, ref) -> time cos was last told
         self.withdrawn = set()   # refs already audited as withdrawn
         self.logged = set()      # (kind, ref, day): findings already audited today
+        self.woken_logged = set()  # (kind, ref, day): of those, the ones audited as woken (a later wake the same day is audited once more)
         self.facts = {}          # key -> (summary, created): the pending cos facts, until they age out
         self.deferred_since = {}  # repo or "*" -> when S3 was first deferred for it
         self.confirmed = {}      # (kind, ref) -> when a fresh read last bore the finding out
@@ -12347,6 +12394,7 @@ def sweep_alarmed_load(engine, state, now, cfg):
         at = record.get("at")
         if kind in SWEEP_KINDS and isinstance(at, (int, float)) and not isinstance(at, bool) and now - at < cfg["realarm_hours"] * 3600:
             state.alarmed.setdefault((kind, ref), at)
+            state.logged.add((kind, ref, int(now // 86400)))   # raised inside the window: a restart does not log it again
 
 
 def sweep_alarmed_save(engine, state, now, cfg):
@@ -12783,12 +12831,21 @@ def sweep_decisions(engine, decisions, now, errors=()):
                                                           "why": "a fresh read does not bear it out"})
     findings.sort()
     day = int(now // 86400)
+    due = [(k, r) for k, r in findings
+           if cfg["enabled"] and now - state.alarmed.get((k, r), 0) >= cfg["realarm_hours"] * 3600]   # what is queued this pass
+    woken = sweep_queue_fact(state, due, now, cfg) if due else set()   # #849: "woken" = the pass's wake carried the finding: the pairs the queue function set the re-alarm memory for
+    if due:
+        sweep_alarmed_save(engine, state, now, cfg)
     for kind, ref in findings:
-        if (kind, ref, day) not in state.logged:
+        once = (kind, ref, day)
+        if once not in state.logged or ((kind, ref) in woken and once not in state.woken_logged):
             if len(state.logged) > 5000:
                 state.logged.clear()
-            state.logged.add((kind, ref, day))
-            detail = {"kind": kind, "ref": ref, "what": SWEEP_KINDS[kind], "woken": cfg["enabled"]}
+                state.woken_logged.clear()
+            state.logged.add(once)
+            if (kind, ref) in woken:
+                state.woken_logged.add(once)
+            detail = {"kind": kind, "ref": ref, "what": SWEEP_KINDS[kind], "woken": (kind, ref) in woken}
             if (kind, ref) in state.sources:
                 detail["source"] = state.sources[(kind, ref)]["source"]   # #805: what raised it, so the reason is readable from the audit
                 detail["match"] = _one_line(state.sources[(kind, ref)]["match"], 80)
@@ -12804,12 +12861,6 @@ def sweep_decisions(engine, decisions, now, errors=()):
                      "deferred": deferred, "unchecked": unchecked,
                      "unattributed": getattr(state, "unattributed", 0)}
     sweep_write(engine, state)
-    if cfg["enabled"]:
-        due = [(k, r) for k, r in findings
-               if now - state.alarmed.get((k, r), 0) >= cfg["realarm_hours"] * 3600]
-        if due:
-            sweep_queue_fact(state, due, now, cfg)
-            sweep_alarmed_save(engine, state, now, cfg)
     return kept if cfg["enabled"] else decisions
 
 
@@ -12829,6 +12880,7 @@ def sweep_queue_fact(state, due, now, cfg):
     state.facts[key] = (summary, now)
     for old in [k for k, (_, at) in state.facts.items() if now - at > cfg["realarm_hours"] * 7200]:
         del state.facts[old]
+    return set(due)   # every due finding is carried (named, or counted in "+N more") and remembered
 
 
 def sweep_write(engine, state):
@@ -12879,7 +12931,7 @@ class SweepFacts:
 
 TRIAGE_DEFAULTS = {"enabled": False, "repos": None, "required_labels": {}, "sla": {}, "sla_overrides": {},
                    "our_logins": None, "daily_summary": True, "realarm_hours": 24, "max_findings": 30,
-                   "calls_per_pass": 30, "pass_seconds": 10, "backoff": True, "digest_interval_minutes": 60, "ownerless": None}
+                   "calls_per_pass": 30, "pass_seconds": 10, "backoff": True, "digest_interval_minutes": 60, "ownerless": None, "alert_labels": {}}
 # Every `_days` value is in days and may be a fraction (2/24 is two hours); `t7_ours_hours` is in hours.
 TRIAGE_SLA = {"t1_days": 1, "t2_days": 1 / 24, "t3_ask_days": 1, "t3_other_days": 3, "t5_days": 1, "t6_days": 2,
               "t7_ours_hours": 4, "t7_other_days": 2, "t8_days": 1, "t9_days": 3, "t11_days": 1}
@@ -12967,6 +13019,48 @@ def triage_owner_name(body):
     return None
 
 
+def _alert_not_a_map(raw, repos):
+    return None if isinstance(raw, dict) else "must be a map of OWNER/REPO to a list of label names, got %r" % (type(raw).__name__,)
+
+
+def _alert_bad_repo(raw, repos):
+    bad = [r for r in raw if not (isinstance(r, str) and REPO_RE.match(r))] if isinstance(raw, dict) else []
+    return "the repository name must be OWNER/REPO, got %r" % (bad[0],) if bad else None
+
+
+def _alert_labels_not_a_list(raw, repos):
+    bad = [r for r, v in raw.items() if not isinstance(v, list)] if isinstance(raw, dict) else []
+    return "%r must name a list of label names" % (bad[0],) if bad else None
+
+
+def _alert_bad_label(raw, repos):
+    for repo, labels in (raw.items() if isinstance(raw, dict) else []):
+        for label in labels if isinstance(labels, list) else []:
+            if not (isinstance(label, str) and label.strip() and label == label.strip() and "," not in label):
+                return "%r holds a label that is not a non-empty string without surrounding spaces or a comma: %r" % (repo, label)
+    return None
+
+
+def _alert_duplicate_label(raw, repos):
+    for repo, labels in (raw.items() if isinstance(raw, dict) else []):
+        labels = [l for l in labels if isinstance(l, str)] if isinstance(labels, list) else []
+        if len(set(labels)) != len(labels):
+            return "%r names a label twice" % (repo,)
+    return None
+
+
+def _alert_repo_not_read(raw, repos):
+    if repos is None or not isinstance(raw, dict):
+        return None   # with no `triage.repos` the watched repositories are read
+    missing = [r for r in raw if isinstance(r, str) and r not in repos]
+    return "%r is not in triage.repos, so its issues are never read" % (missing[0],) if missing else None
+
+
+# (code, check(alert_labels, triage_repos) -> a problem text or None), in the order they are applied: the one table the validator and its tests read.
+ALERT_SHAPE_CHECKS = [("not-a-map", _alert_not_a_map), ("bad-repo", _alert_bad_repo), ("labels-not-a-list", _alert_labels_not_a_list),
+                      ("bad-label", _alert_bad_label), ("duplicate-label", _alert_duplicate_label), ("repo-not-read", _alert_repo_not_read)]
+
+
 def validate_triage_config(config, source):
     """`triage`: absent, null or {} runs in shadow (findings audited, nobody woken); `enabled` true adds only the wake of
     the Chief of Staff; `false` turns it fully off. Nothing here can make it write to GitHub: there is no such code."""
@@ -13020,6 +13114,10 @@ def validate_triage_config(config, source):
             raise ConfigError("%s.ownerless.limit' must be a whole number from 100 to 2000, got %r" % (where, own["limit"]))
         if "owner_labels" in own and not (isinstance(own["owner_labels"], list) and all(isinstance(x, str) and x for x in own["owner_labels"])):
             raise ConfigError("%s.ownerless.owner_labels' must be a list of label names or patterns (agent:*), got %r" % (where, own["owner_labels"]))
+    for code, check in ALERT_SHAPE_CHECKS:   # #851: one table of the shapes `alert_labels` may not take; each is a named error
+        bad = check(section["alert_labels"], section["repos"])
+        if bad:
+            raise ConfigError("%s.alert_labels' %s: %s" % (where, code, bad))
     cap = section["max_findings"]
     if not isinstance(cap, int) or isinstance(cap, bool) or not 1 <= cap <= 200:
         raise ConfigError("%s.max_findings' must be a whole number from 1 to 200, got %r" % (where, cap))
@@ -13097,7 +13195,7 @@ class TriageState:
         self.enriched = {}       # (rule, ref) -> evidence the fresh read added
         self.live = {}           # #576: (repo, number) -> {"token": the issue's updated time, "info": the label's age facts or None, "at"}: one timeline read each
         self.reasons = {}        # (rule, ref) -> the worded reason of a finding that carries one (`awaiting-live expired`)
-        self.logged, self.facts, self.current = set(), {}, {}
+        self.logged, self.woken_logged, self.facts, self.current = set(), set(), {}, {}
         self.started, self.day, self.day_counts = 0, None, {}
         self.summarised = None
         self.seen = None         # #349: the stale digest's memory (bin/triage_digest.py), loaded at the first pass
@@ -13765,6 +13863,10 @@ def triage_pass(engine, decisions, now, errors=()):
     except Exception as err:
         engine._note("plan_wake.error", "", {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
     triage_mark_reads(engine, state, repos, errors, now)
+    try:
+        alert_wake_pass(engine, state, cfg, now)   # #851: an alert issue wakes its repository's orchestrator once, from the lists just held
+    except Exception as err:
+        engine._note("alert_wake.error", "", {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
     candidates, unchecked_units, truncated = triage_findings(engine, state, repos, decisions, cfg, now, errors)
     findings, unchecked, unchecked_other, oldest = [], 0, 0, 0.0
     why = {}   # #605: repo -> {reason: count}, and its other-owner share and oldest age, for the report
@@ -13818,12 +13920,6 @@ def triage_pass(engine, decisions, now, errors=()):
             other_owner += 1   # a flag, never counted as one of our findings
         else:
             counts[rule] = counts.get(rule, 0) + 1
-        if (rule, ref, day) not in state.logged:
-            if len(state.logged) > 20000:
-                state.logged.clear()
-            state.logged.add((rule, ref, day))
-            engine._note("triage.finding", ref, {"rule": rule, "ref": ref, "what": TRIAGE_KINDS[rule],
-                                                 "evidence": evidence, "woken": cfg["enabled"], "applied": False})
     for repo_of, units_missing in unchecked_units.items():   # a unit not read yet is a finding that could not be judged
         if units_missing:
             why.setdefault(repo_of, {"reasons": {}, "other_owner": 0, "oldest": 0.0})["reasons"]["not read yet"] = len(units_missing)
@@ -13850,6 +13946,7 @@ def triage_pass(engine, decisions, now, errors=()):
     owner_t6 = triage_owner_tier_t6(engine, decisions)
     due, invalid = triage_digest_due(engine, state, [(r, ref) for r, ref, _ in findings if r != "OO"],
                                      [(r, ref) for r, ref, _ in candidates if r != "OO"], cfg, now, owner_t6)
+    triage_logged_seed(state, due, cfg, now, day)   # #849: before the commit below rewrites the memory
     if cfg["enabled"] and cfg.get("backoff", True):   # #406: warm up first, then at most one digest per interval; a held digest keeps its memory untouched
         before = state.meta["swept"]
         open_units = sum(len(u) for u in unchecked_units.values()) + sum(1 for r in repos if (r, "issues") not in state.units and r not in state.unreadable)   # a list not read yet is a finding not checked
@@ -13872,6 +13969,7 @@ def triage_pass(engine, decisions, now, errors=()):
             engine._note("triage.rollup", None, {"text": rolled, "at": iso(now)})
             triage_digest.write_seen(engine.state_dir, state.seen, state.meta)
     if cfg["enabled"] and (due or invalid):   # never a wake solely for other-owner flags: they ride along when a wake happens anyway
+        state.carried = set()
         text = triage_queue_fact(state, due, now, cfg, len(flagged), invalid)
         triage_digest.cost_record(engine.state_dir, now, text)
         state.meta["last"] = now
@@ -13883,7 +13981,34 @@ def triage_pass(engine, decisions, now, errors=()):
             state.alarmed[pair] = now
         for rule, _ in due:
             state.day_counts[rule] = state.day_counts.get(rule, 0) + 1
+        woken = set(state.carried) | set(flagged)   # #849: what the digest carried, and the other-owner flags that rode along (counted in its text, remembered below)
+    else:
+        woken = set()
+    for rule, ref, evidence in findings:   # #849: the audit line says what was done: woken only when this pass queued a wake for it
+        once = (rule, ref, day)
+        if once not in state.logged or ((rule, ref) in woken and once not in state.woken_logged):
+            if len(state.logged) > 20000:
+                state.logged.clear()
+                state.woken_logged.clear()
+            state.logged.add(once)
+            if (rule, ref) in woken:
+                state.woken_logged.add(once)
+            engine._note("triage.finding", ref, {"rule": rule, "ref": ref, "what": TRIAGE_KINDS[rule],
+                                                 "evidence": evidence, "woken": (rule, ref) in woken, "applied": False})
     triage_daily_summary(engine, state, cfg, now, day, repos)
+
+
+def triage_logged_seed(state, due, cfg, now, day):
+    """Once per process: what the persisted digest memory listed inside the re-alarm window (and is not due again now) was
+    already audited before the restart, so it is not logged again (#849). Needs the memory loaded."""
+    if getattr(state, "logged_seeded", False) or state.seen is None:
+        return
+    state.logged_seeded = True
+    again = set(due)
+    for key, rec in state.seen.items():
+        rule, _, ref = key.partition(" ")
+        if rule in TRIAGE_KINDS and (rule, ref) not in again and now - rec["at"] < cfg["realarm_hours"] * 3600:
+            state.logged.add((rule, ref, day))
 
 
 def triage_digest_items(state):
@@ -13956,6 +14081,7 @@ def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
     state.facts[key] = (summary, now)
     for old in [k for k, (_, at) in state.facts.items() if now - at > cfg["realarm_hours"] * 7200 and "summary" not in k]:
         del state.facts[old]
+    state.carried = set(shown)   # #849: what this digest carried and remembered; an overflow beyond the cap stays due
     return summary
 
 
@@ -14175,6 +14301,138 @@ class PlanWakeFacts:
         if not wake or not wake.facts:
             return []
         return [Fact(key, name, "plan", text, created, issue=number, sender="switchboard", repo=repo)
+                for key, (text, created, name, repo, number) in sorted(wake.facts.items())]
+
+
+# ---- #851: an open issue carrying a configured alert label wakes that repository's orchestrator once per issue and label. Reads only what the triage pass holds.
+
+ALERT_WAKE_FILE = "alert-wake.json"   # {"<repo>#<number> <label>": {"at": epoch}}: what was already told (private; survives a restart)
+ALERT_WAKES_PER_PASS = 5              # a burst is told in steps of this many issues; the rest is named in one line and follows on the next passes
+ALERT_TITLE_CHARS = 100
+ALERT_FACT_KEEP = 2 * 86400
+ALERT_MEMORY_MAX = 5000
+ALERT_KEY_RE = re.compile(r"^[^#\s]+#[0-9]+ \S.*$")
+ALERT_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+class AlertWakeState:
+    """What was told (`told`: key -> when) and the lines still waiting (`lines`: key -> {recipient: text}), both kept in ALERT_WAKE_FILE: a line is kept there
+    until it is old enough (ALERT_FACT_KEEP) and loaded back as a fact at start, so a daemon that stops between queueing and delivery still delivers it. The
+    fact key is stable, and a key already in the recipient's inbox is never delivered again, so re-queueing cannot repeat a delivered wake."""
+
+    def __init__(self, state_dir, now=None):
+        self.told, self.lines, self.facts, self.problem = {}, {}, {}, None
+        try:
+            with open(str(Path(state_dir) / ALERT_WAKE_FILE), "rb") as handle:
+                raw = json.loads(handle.read(1000001).decode("utf-8"))   # a bounded read: the file is ours, but a runaway one must not be loaded whole
+            if isinstance(raw, dict):
+                for key, value in list(raw.items())[:ALERT_MEMORY_MAX]:
+                    if not (isinstance(key, str) and ALERT_KEY_RE.match(key) and isinstance(value, dict) and _is_number(value.get("at"))):
+                        continue   # a malformed key is dropped, never parsed later
+                    self.told[key] = value["at"]
+                    lines = value.get("lines")
+                    if now is not None and isinstance(lines, dict) and now - value["at"] < ALERT_FACT_KEEP:
+                        repo, _, rest = key.partition("#")
+                        number = int(rest.split(" ", 1)[0])
+                        self.lines[key] = {n: l for n, l in lines.items() if isinstance(n, str) and isinstance(l, str)}
+                        for name, text in self.lines[key].items():
+                            self.facts["alert:%s:%s" % (key, name)] = (text, value["at"], name, repo, number)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, UnicodeError) as err:
+            self.problem = "alert-wake.json cannot be read, so alert issues may be told again: %s" % _one_line(type(err).__name__, 40)
+
+
+def alert_wake_state(engine):
+    state = getattr(engine, "alert_wake", None)
+    if state is None:
+        state = engine.alert_wake = AlertWakeState(engine.state_dir, engine.now())
+        if state.problem:
+            engine._note("alert_wake.error", "", {"error": state.problem})
+    return state
+
+
+def alert_line(repo, number, title, label):
+    """The one line the orchestrator reads. The title is the issue author's text: one line, bounded, quoted, and data (never an instruction)."""
+    return "alert issue %s#%d \"%s\" carries label %s" % (repo, number, _one_line(ALERT_CONTROL_RE.sub(" ", title), ALERT_TITLE_CHARS).replace('"', "'"), label)
+
+
+def alert_wake_pass(engine, state, cfg, now):
+    """Judges an input only when it was read whole: a repository whose issue list was not (cut, failed, never read) wakes nothing and forgets nothing,
+    and neither does a pass whose roster of agents was not read whole."""
+    configured = {r: list(l) for r, l in (cfg.get("alert_labels") or {}).items() if l}
+    if not configured or engine.state_dir is None:
+        return
+    wake = alert_wake_state(engine)
+    for old in [k for k, v in wake.facts.items() if now - v[1] > ALERT_FACT_KEEP]:
+        del wake.facts[old]
+    if whole_skipped(engine, "alert_wake", "agents"):
+        return
+    discovery, changed = getattr(engine, "discovery", None), False
+    for repo, labels in sorted(configured.items()):
+        if whole_skipped(engine, "alert_wake", "issues:" + repo):
+            continue
+        unit = state.units.get((repo, "issues"))
+        if unit is None:
+            continue
+        open_numbers, pending = set(), []
+        for record in unit["data"]:
+            item = triage_norm(record)
+            if item is None or item["pr"] or item["state"] != "open":
+                continue
+            open_numbers.add(item["number"])
+            title = record.get("title") if isinstance(record.get("title"), str) else ""
+            for label in labels:
+                key = "%s#%d %s" % (repo, item["number"], label)
+                if label in item["labels"] and key not in wake.told:
+                    pending.append((item["number"], label, key, title))
+        names = sorted(n for n, a in (discovery.agents.items() if discovery else []) if _is_orchestrator(a) and _fleet_repo(a.fleet or {}, engine.config) == repo)
+        pending.sort(key=lambda p: (p[0], labels.index(p[1])))
+        if names:   # nobody to tell: nothing is remembered, so the first orchestrator of the repository is told
+            for number, label, key, title in pending[:ALERT_WAKES_PER_PASS]:
+                for name in names:
+                    wake.facts["alert:%s:%s" % (key, name)] = (alert_line(repo, number, title, label), now, name, repo, number)
+                wake.lines[key] = {name: wake.facts["alert:%s:%s" % (key, name)][0] for name in names}
+                wake.told[key] = now
+                changed = True
+                engine._note("alert_wake.sent", "%s#%d" % (repo, number), {"label": label, "to": names})
+            rest = pending[ALERT_WAKES_PER_PASS:]
+            if rest:
+                digest = hashlib.sha256("\n".join(p[2] for p in rest).encode()).hexdigest()[:12]
+                for old in [k for k in wake.facts if k.startswith("alert:%s:more:" % repo)]:
+                    del wake.facts[old]   # one summary line per repository: a newer count replaces one not yet delivered
+                for name in names:
+                    wake.facts["alert:%s:more:%s:%s" % (repo, digest, name)] = (
+                        "%d more alert issue(s) of %s will be told on the next passes" % (len(rest), repo), now, name, repo, None)
+        for key in [k for k in wake.told if k.startswith(repo + "#") and int(k[len(repo) + 1:].split(" ", 1)[0]) not in open_numbers]:
+            del wake.told[key]   # a closed issue is forgotten, on a whole read only
+            wake.lines.pop(key, None)
+            changed = True
+    if changed:
+        keep = {k: dict({"at": at}, **({"lines": wake.lines[k]} if k in wake.lines and now - at < ALERT_FACT_KEEP else {}))
+                for k, at in sorted(wake.told.items(), key=lambda kv: kv[1])[-ALERT_MEMORY_MAX:]}
+        try:
+            _write_small(engine.state_dir, ALERT_WAKE_FILE, keep)
+        except OSError as err:
+            engine._note("alert_wake.error", "", {"error": "alert-wake.json was not saved, so a restart may tell again: %s" % _one_line(type(err).__name__, 40)})
+
+
+class AlertWakeFacts:
+    """The alert lines, as ordinary facts: the usual rule picks a note or a wake, and a key found in the recipient's inbox is never delivered again."""
+
+    __name__ = "alert_wake_facts"
+
+    def __init__(self):
+        self.engine = None
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def __call__(self):
+        wake = getattr(self.engine, "alert_wake", None) if self.engine else None
+        if not wake or not wake.facts:
+            return []
+        return [Fact(key, name, "alert", text, created, issue=number, sender="switchboard", repo=repo)
                 for key, (text, created, name, repo, number) in sorted(wake.facts.items())]
 
 
@@ -20810,33 +21068,33 @@ def impact_review_hold(state_dir, pr, head):
     --impact-action hold`): an input that can only ADD a hold, nothing it says lowers the floor. **Fail mode: toward hold.** When the ledger
     cannot be read or is not trustworthy the rating is UNKNOWN, and an unknown input holds (as an unreadable diff does, and as G1 already
     refuses on a bad ledger): `hold` is True and `problem` says why; the caller audits it (`impact.ledger_unreadable`)."""
-    try:
-        entries, problem = plan_ledger.read_ledger(state_dir)
-    except Exception as err:
-        entries, problem = [], "%s: %s" % (type(err).__name__, _one_line(str(err), 100))
+    entries, problem = impact_rating_entries(state_dir, pr, head)   # the one filter of the records at this head
     if problem:
         return True, "the ledger could not be read, so the independent rating is unknown: %s" % _one_line(str(problem), 120)
-    latest = None
-    for entry in entries:
-        if entry.get("kind") == "review_record" and entry.get("pr") == pr and entry.get("head") == head and entry.get("reviewer") == "impact":
-            latest = entry
+    latest = entries[-1] if entries else None
     return bool(latest and latest.get("impact_action") == "hold"), None
 
 
 def impact_review_record(state_dir, pr, head):
     """((action, class), problem): the independent impact reviewer's newest record for EXACTLY this head as (impact_action, impact_class) (None when there is
-    none), and what is wrong when the ledger cannot be read (the rating is then unknown: the owner decision reads it as a hold)."""
+    none), and what is wrong when the ledger cannot be read (the rating is then unknown: the owner decision reads it as a hold). The records come from `impact_rating_entries`, the one filter."""
+    entries, problem = impact_rating_entries(state_dir, pr, head)
+    if problem:
+        return None, problem
+    latest = entries[-1] if entries else None
+    return ((latest.get("impact_action"), latest.get("impact_class")) if latest else None), None
+
+
+def impact_rating_entries(state_dir, pr, head):
+    """([ledger entries], problem): every impact reviewer record of EXACTLY this pull request and head (the delegated clear's score is the highest of those whose recorded role counts: `delegated_clear.judge` decides which).
+    A ledger that cannot be read, or whose chain is broken, gives ([], why): the score is then unknown. #835."""
     try:
         entries, problem = plan_ledger.read_ledger(state_dir)
     except Exception as err:
-        return None, "%s: %s" % (type(err).__name__, _one_line(str(err), 100))
+        return [], "%s: %s" % (type(err).__name__, _one_line(str(err), 100))
     if problem:
-        return None, _one_line(str(problem), 120)
-    latest = None
-    for entry in entries:
-        if entry.get("kind") == "review_record" and entry.get("pr") == pr and entry.get("head") == head and entry.get("reviewer") == "impact":
-            latest = entry
-    return ((latest.get("impact_action"), latest.get("impact_class")) if latest else None), None
+        return [], _one_line(str(problem), 120)
+    return [e for e in entries if e.get("kind") == "review_record" and e.get("reviewer") == "impact" and e.get("pr") == pr and e.get("head") == head], None
 
 
 def _file_text_at(engine, repo, path, ref):
@@ -20939,7 +21197,7 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
 
 def cmd_impact(args, runner, now):
     """`impact floor|hold|clear`."""
-    return {"floor": cmd_impact_floor, "hold": cmd_impact_hold, "clear": cmd_impact_clear}[args.impact_action](args, runner, now)
+    return {"floor": cmd_impact_floor, "hold": cmd_impact_hold, "clear": cmd_impact_clear, "delegated": cmd_impact_delegated}[args.impact_action](args, runner, now)
 
 
 cmd_impact.direct = True   # no error mapping, no daemon start
@@ -22637,7 +22895,7 @@ def parse_review_block(text):
     if not isinstance(text, str) or not text.strip():
         return None, "no verdict block"
     lines = [l.strip() for l in text.splitlines()]
-    fields = {"verdict": None, "head": None, "impact_action": None, "impact_class": None, "blocks": 0, "notes": 0, "findings": 0}
+    fields = {"verdict": None, "head": None, "impact_action": None, "impact_class": None, "impact_severity": None, "impact_probability": None, "impact_reason": None, "blocks": 0, "notes": 0, "findings": 0}
     started = False
     for line in lines:
         if line.startswith("verdict:") and not started:
@@ -22648,6 +22906,12 @@ def parse_review_block(text):
             fields["impact_action"] = line.split(":", 1)[1].strip()
         elif started and line.startswith("impact-class:"):
             fields["impact_class"] = line.split(":", 1)[1].strip().lower()
+        elif started and line.startswith("impact-severity:"):
+            fields["impact_severity"] = line.split(":", 1)[1].strip()
+        elif started and line.startswith("impact-probability:"):
+            fields["impact_probability"] = line.split(":", 1)[1].strip()
+        elif started and line.startswith("impact-reason:"):
+            fields["impact_reason"] = line.split(":", 1)[1].strip()
         elif started and line.startswith("- "):
             parts = [p.strip() for p in line[2:].split("|")]
             if len(parts) >= 2 and parts[1] in ("block", "note"):
@@ -22673,6 +22937,24 @@ def parse_review_block(text):
 
 
 IMPACT_CLASS_RE = re.compile(r"[a-z][a-z-]{0,31}")
+IMPACT_RATING_FIELDS = ("impact_severity", "impact_probability", "impact_reason")   # the record's rating fields: the code's one table (parse, record, flags)
+RATING_INPUTS = IMPACT_RATING_FIELDS + ("impact_action", "impact_class", "block")   # every input of `review record` that decides the rating: read ONLY by `rating_inputs`, from the raw argv
+
+
+def rating_inputs(raw_argv):
+    """{dest: value} of the rating inputs GIVEN in `raw_argv` (a tuple of strings: the command line `main` captured before it built the shared parser), parsed by a PRIVATE minimal parser: the six flags of
+    RATING_INPUTS only, no abbreviation, no default (an absent flag is absent), nothing shared with `build_parser`. A registrar's `set_defaults`, a replaced or re-parsed subparser, a same-dest argument or a
+    wrapper on the namespace cannot change what this returns. A raw argv that is not a tuple or list of strings gives nothing (no rating). #835."""
+    if not isinstance(raw_argv, (tuple, list)) or not all(isinstance(x, str) for x in raw_argv):
+        return {}
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False, argument_default=argparse.SUPPRESS, exit_on_error=False)
+    for name in RATING_INPUTS:
+        parser.add_argument("--" + name.replace("_", "-"), dest=name)
+    try:
+        parsed, _ = parser.parse_known_args(list(raw_argv))
+    except (argparse.ArgumentError, SystemExit):
+        return {}
+    return dict(vars(parsed))
 
 
 def cmd_review(args, runner, now):
@@ -22713,34 +22995,50 @@ def cmd_review(args, runner, now):
             return EXIT_OK
         if args.reviewer not in plan_ledger.REVIEWERS:
             raise ReviewError("--reviewer must be one of %s" % ", ".join(plan_ledger.REVIEWERS))
-        if args.block is not None:   # the reviewer's returned text: the coder session records it
-            if args.verdict or args.head or args.blocks or args.notes or args.impact_action:
+        given = rating_inputs(getattr(args, "raw_argv", ()))   # #835: the rating's inputs come from the raw argv through a private parser, never from the shared namespace (a registrar's set_defaults, a replaced parser or a wrapper cannot reach them); a missing raw argv gives no rating
+        action, klass = given.get("impact_action"), given.get("impact_class")
+        rating_in = {name: given.get(name) for name in IMPACT_RATING_FIELDS}
+        if given.get("block") is not None:   # the reviewer's returned text: the coder session records it
+            if args.verdict or args.head or args.blocks or args.notes or action:
                 raise ReviewError("--block carries the verdict, head, counts and impact action itself: give nothing else")
-            fields, why = parse_review_block(_read_capped(args.block, REVIEW_TABLE_MAX))
+            fields, why = parse_review_block(_read_capped(given["block"], REVIEW_TABLE_MAX))
             if fields is None:
                 raise ReviewError("refused: %s" % why)
-            args.verdict, args.head, args.blocks, args.notes, args.impact_action = (fields["verdict"], fields["head"], fields["blocks"],
-                                                                                    fields["notes"], fields["impact_action"])
-            args.impact_class = args.impact_class or fields["impact_class"]
+            args.verdict, args.head, args.blocks, args.notes, action = (fields["verdict"], fields["head"], fields["blocks"], fields["notes"], fields["impact_action"])
+            klass = klass or fields["impact_class"]
+            for name in IMPACT_RATING_FIELDS:   # the rating's severity and probability (the score is derived from the matrix's cell), and the reason that names a floor rule
+                if rating_in[name] is None:
+                    rating_in[name] = fields[name]
         if args.verdict not in plan_ledger.REVIEW_VERDICTS:
             raise ReviewError("--verdict must be one of %s (or give --block with the reviewer's returned text)" % ", ".join(plan_ledger.REVIEW_VERDICTS))
-        for name in ("blocks", "notes"):
-            if getattr(args, name) < 0 or getattr(args, name) > 200:
+        for name, count in (("blocks", args.blocks), ("notes", args.notes)):
+            if count < 0 or count > 200:
                 raise ReviewError("--%s must be a number from 0 to 200" % name)
         if args.verdict == "approve" and args.blocks:
             raise ReviewError("an approve cannot carry blocking findings (%d given)" % args.blocks)
         if args.verdict == "request-changes" and not args.blocks:
             raise ReviewError("request-changes needs at least 1 blocking finding (a finding that cites no rule never blocks)")
-        if args.impact_action and args.reviewer != "impact":
+        if action and args.reviewer != "impact":
             raise ReviewError("--impact-action belongs to the impact reviewer")
-        impact_class = (getattr(args, "impact_class", None) or "").strip().lower() or None
+        impact_class = (klass or "").strip().lower() or None
         if impact_class is not None and args.reviewer != "impact":
             raise ReviewError("--impact-class belongs to the impact reviewer")
+        rating = {name: (rating_in[name] or "").strip() or None for name in IMPACT_RATING_FIELDS}
+        if any(rating.values()) and args.reviewer != "impact":
+            raise ReviewError("--impact-severity, --impact-probability and --impact-reason belong to the impact reviewer")
+        if rating["impact_severity"] or rating["impact_probability"]:
+            try:
+                cells = impact_floor._matrix_cached()["cells"]
+                known = isinstance(cells.get(rating["impact_severity"]), dict) and rating["impact_probability"] in cells[rating["impact_severity"]]
+            except (impact_floor.MatrixError, KeyError, TypeError, AttributeError):
+                raise ReviewError("refused: the impact matrix file cannot be read, so the rating cannot be checked (nothing was recorded)") from None
+            if not known:
+                raise ReviewError("the rating %r / %r is not a cell of the matrix (nothing was recorded)" % (str(rating["impact_severity"])[:30], str(rating["impact_probability"])[:30]))
         if impact_class is not None and not IMPACT_CLASS_RE.fullmatch(impact_class):
             raise ReviewError("impact-class must be one lower-case word naming the class of the impact (see the matrix file's classes), got %r" % impact_class[:40])
-        if args.impact_action == "hold" and impact_class is None:
+        if action == "hold" and impact_class is None:
             raise ReviewError("an impact hold must name its class (--impact-class or an `impact-class:` line): run the review again (nothing was recorded)")
-        if args.impact_action == "hold":   # #692: the class must be one the matrix file names (read now, never a list of our own)
+        if action == "hold":   # #692: the class must be one the matrix file names (read now, never a list of our own)
             try:
                 rule = impact_floor.owner_hold_rule(impact_floor._matrix_cached())
             except impact_floor.MatrixError as err:
@@ -22762,8 +23060,13 @@ def cmd_review(args, runner, now):
         entry = {"kind": "review_record", "pr": ref, "head": head, "reviewer": args.reviewer, "verdict": args.verdict,
                  "blocks": args.blocks, "notes": args.notes, "by": by,
                  "summary": plan_ledger.clip(redact_command_text(args.summary or ""), 200)}
-        if args.impact_action:
-            entry["impact_action"] = args.impact_action
+        if action:
+            entry["impact_action"] = action
+        if args.reviewer == "impact":
+            entry["by_role"] = kind[2] if kind[0] == "agent" and len(kind) > 2 and isinstance(kind[2], str) else None   # #835: the RECORDED role of the session that made the record (never a flag or a text): only the independent reviewer's rating counts
+        for name in IMPACT_RATING_FIELDS:
+            if rating[name]:
+                entry[name] = plan_ledger.clip(redact_command_text(rating[name]), 200)
         if impact_class:
             entry["impact_class"] = impact_class   # #451 slice 2: the class of the impact that drives the action; a missing one holds for the owner
         stored = plan_ledger.append_entry(state, entry, now())
@@ -22980,7 +23283,7 @@ def add_review_parsers(sub):
     blockers = rsub.add_parser("blockers", help="Read-only: the reviewers whose LATEST recorded result at the PR's head is request-changes (one line each)")
     blockers.add_argument("pr", help="owner/repo#N or the PR's URL")
     blockers.add_argument("--head", help="The commit to look at (default: the PR's head)")
-    record = rsub.add_parser("record", help="Record a reviewer's result for the PR's current head (the coder session records what the reviewer returned)")
+    record = rsub.add_parser("record", allow_abbrev=False, help="Record a reviewer's result for the PR's current head (the coder session records what the reviewer returned)")
     record.add_argument("pr", help="owner/repo#N or the PR's URL")
     record.add_argument("--reviewer", required=True, help="code | architecture | security | impact | test")
     record.add_argument("--head", help="The commit judged (default: the PR's head; a different one is refused)")
@@ -22990,6 +23293,8 @@ def add_review_parsers(sub):
     record.add_argument("--notes", type=int, default=0, help="Notes and proposals")
     record.add_argument("--impact-action", dest="impact_action", choices=("hold", "second-review", "none"),
                         help="The impact reviewer's action from the matrix")
+    for flag in IMPACT_RATING_FIELDS:
+        record.add_argument("--" + flag.replace("_", "-"), dest=flag, help="#835: the impact reviewer's rating (%s): the severity and the probability name a cell of the matrix, the reason names the floor rule it applied" % flag.split("_", 1)[1])
     record.add_argument("--impact-class", dest="impact_class", help="The class of the impact that drives the action (a class of the matrix file's owner_hold block)")
     record.add_argument("--summary", help="One line (at most 200 characters)")
     checkout = rsub.add_parser("checkout", help="Write the PR's exact head tree, its diff and the base copies of the touched files into .review/<head sha> here, read-only, and print the path; --remove <dir> removes one")
@@ -23453,6 +23758,9 @@ def add_impact_parsers(sub):
     hold = impact_sub.add_parser("hold", help="What the daemon would label as held right now (read-only dry run; the daemon writes the labels)")
     hold.add_argument("--dry-run", action="store_true", dest="dry_run")
     hold.add_argument("--repo", help="One repo (OWNER/REPO); default: every repo under plan_gates")
+    delegated = impact_sub.add_parser("delegated", help="List every clear the Chief of Staff made under an order of the owner's: the pull request, head, score, threshold and her judgement (read-only)")
+    delegated.add_argument("--json", action="store_true")
+    delegated.add_argument("--check", action="store_true", help="The fleet doctor's check: fail when a configured owner-file order no longer matches exactly one line of the owner's standing-orders file")
     clear = impact_sub.add_parser("clear", help="The owner's own terminal: clear a false impact hold for this head, with a reason (the Chief of Staff only under a standing order of the owner's, with --under-order)")
     clear.add_argument("pr", help="The pull request: owner/repo#N or its URL")
     clear.add_argument("--under-order", type=int, dest="under_order", metavar="N", help="The Chief of Staff only: clear under the owner's standing order N (it must be listed under delegated_clear in the configuration); recorded as her act under that order")
@@ -27568,6 +27876,7 @@ except Exception as _err:
 # those attributes, derived once everything is defined (see `derive_action_groups`), never lists to edit; `dispatch` asks the view AND the attribute
 # (a test that swaps a command's function for a recorder keeps the group the module defined).
 
+RATING_PATH_FUNCTIONS = ("cmd_review", "parse_review_block", "rating_inputs", "resolve_command", "dispatch", "call_command")   # `main` checks these are the same objects after the registrars ran (#835)
 COMMAND_NAME_RE = re.compile(r"[a-z][a-z0-9-]*")
 REGISTRAR_NAME_RE = re.compile(r"add_[a-z0-9_]+_parsers")
 COMMAND_ARGUMENTS = ("args", "runner", "now", "spawn", "socket_call", "wait")   # what a command function may ask for, by parameter name
@@ -27644,15 +27953,21 @@ def dispatch(args, known, runner=subprocess.run, now=time.time, wait=None, spawn
 def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen,
          socket_call=None):
     os.environ.setdefault(OWN_GH_ENV, "1")   # the gh calls of this process are the switchboard's own: never re-identified
+    raw = tuple(argv if argv is not None else sys.argv[1:])   # #835: the command line as typed, captured BEFORE any registrar runs: `review record` reads its rating inputs from this, never from the shared parser
+    held = {name: (globals()[name], globals()[name].__code__) for name in RATING_PATH_FUNCTIONS if name in globals()}
     parser = build_parser()
     try:
-        args, extra = parser.parse_known_args(argv)
+        args, extra = parser.parse_known_args(list(raw))
+        args.raw_argv = raw   # set here, after the parse: no registrar default, Action or wrapper can set it first
         if extra and args.action == "remind" and not (args.list_mine or args.cancel) and not any(word.startswith("-") for word in extra):
             args.text = list(args.text or []) + extra   # words after an option (`remind a 1h --issue 3 the text`): argparse lets an optional positional end early
         elif extra:
             parser.error("unrecognized arguments: %s" % " ".join(extra))
     except SystemExit as exit_:
         return EXIT_USAGE if exit_.code not in (0, None) else EXIT_OK
+    if getattr(args, "action", None) == "review" and (set(held) != set(RATING_PATH_FUNCTIONS) or any(globals().get(name) is not fn or fn.__code__ is not code for name, (fn, code) in held.items())):
+        sys.stderr.write("%s: review: a command registrar replaced code on the rating path: nothing was recorded\n" % PROG)   # a registrar reassigned one of the functions the rating is read and recorded by
+        return EXIT_ERROR
     return dispatch(args, parser.commands, runner=runner, now=now, wait=wait, spawn=spawn, socket_call=socket_call)
 
 
@@ -29371,13 +29686,11 @@ def cmd_restart(args, runner, spawn=subprocess.Popen, kill=os.kill, sleep=time.s
         if pid is None:
             sys.stderr.write("%s: restart refused: the lock says a daemon runs but not which pid\n" % PROG)
             return EXIT_ERROR
-        try:
-            done = runner(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, timeout=10,
-                          stdin=subprocess.DEVNULL)
-            command = (done.stdout or "").strip()
-        except (OSError, subprocess.SubprocessError):
-            command = ""
-        if PROG not in command or not re.search(r"\brun\b", command):
+        if daemon_pid_refusal(pid):
+            sys.stderr.write("%s: restart refused: %s; nothing was signalled\n" % (PROG, daemon_pid_refusal(pid)))
+            return EXIT_ERROR
+        ours, command = daemon_process_is_ours(runner, pid)   # ONE check of "is this pid our `run`", shared with `daemon stop`
+        if not ours:
             sys.stderr.write("%s: restart refused: pid %d is not a %s daemon (it is: %s); nothing was signalled\n"
                              % (PROG, pid, PROG, _one_line(command, 80) or "not running or unreadable"))
             return EXIT_ERROR
@@ -29398,6 +29711,281 @@ def cmd_restart(args, runner, spawn=subprocess.Popen, kill=os.kill, sleep=time.s
             waited += 0.1
     print("daemon %s" % ensure_daemon(state, spawn))
     return EXIT_OK
+
+
+# ---------------------------------------------------------------- `daemon status | start | stop | restart` (#858)
+#
+# One command for the daemon, however it was started (a launchd job, or `ensure`). It touches no state file: it ends or begins a
+# process, and reads daemon.json, run.lock, decisions.json and github-watch.json. The one file it makes is its own command lock.
+# docs/switchboard.md, "The daemon command".
+
+DAEMON_HEALTH_WAIT = 120     # seconds `start` and `restart` wait for a healthy daemon
+DAEMON_STOP_WAIT = RESTART_PATIENCE   # seconds a stopping daemon has to let go of run.lock: one bound for `restart` and `daemon stop`
+DAEMON_STEP = 0.2            # seconds between two looks inside a wait
+DAEMON_CALL_TIMEOUT = 30     # seconds one launchctl or ps call may take
+DAEMON_COMMAND_LOCK = "daemon-command.lock"
+daemon_sleep = time.sleep    # a test replaces these three; production never does
+daemon_clock = time.monotonic
+daemon_signal = os.kill
+
+
+class DaemonCommandError(Exception):
+    """A daemon command that did not do what it was asked, in one plain line."""
+
+
+@contextmanager
+def daemon_command_lock(state_dir):
+    """One daemon command at a time: a second one is refused at once, never queued."""
+    fd = os.open(str(Path(state_dir) / DAEMON_COMMAND_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise DaemonCommandError("another daemon command is running; wait for it to finish") from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def launchd_job(runner, platform=None):
+    """(state, pid) of the daemon's launchd job: "loaded" (and its pid, or None), "installed" (the plist is there, the job is not loaded),
+    or "none" (no job, or not launchd). launchctl's own words are never kept: the answer is the exit status."""
+    if service_kind(platform) != "launchd":
+        return "none", None
+    try:
+        done = runner(["launchctl", "print", "gui/%d/%s" % (os.getuid(), SERVICE_LABEL)], capture_output=True, text=True,
+                      timeout=DAEMON_CALL_TIMEOUT, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        done = None
+    if done is not None and done.returncode == 0:
+        found = re.search(r"(?m)^\s*pid = (\d+)\s*$", done.stdout or "")
+        return "loaded", int(found.group(1)) if found else None
+    path = service_file_path("launchd")
+    return ("installed" if path is not None and path.is_file() else "none"), None
+
+
+def daemon_process_is_ours(runner, pid):
+    """(True, command) when `pid` runs THIS program's `run`: a program named fleet-switchboard whose next word is `run`."""
+    try:
+        done = runner(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, timeout=DAEMON_CALL_TIMEOUT,
+                      stdin=subprocess.DEVNULL)
+        command = (done.stdout or "").strip() if done.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        command = ""
+    return daemon_argv_is_ours(command), command
+
+
+def daemon_argv_is_ours(command):
+    """The ONE shape that is this program's `run`, by argument shape and not by which interpreter it is: [a Python interpreter (any case: python,
+    python3.13, Python, pythonw, the macOS framework Python.app) with its own leading -flags, or nothing for a shebang-launched script]
+    <path>/fleet-switchboard run [--standby]. Nothing else: a different program, `run` not right after the program, `run` inside another
+    word, another flag or an unreadable command line is not it. (`--standby` is the one flag the service's own command line carries.)"""
+    words = command.split()
+    index = 0
+    if words and re.fullmatch(r"pythonw?[0-9.]*", os.path.basename(words[0]), re.IGNORECASE):
+        index = 1
+        while index < len(words) and words[index].startswith("-"):
+            index += 1
+    rest = words[index:]
+    return len(rest) >= 2 and os.path.basename(rest[0]) == PROG and rest[1:] in (["run"], ["run", "--standby"])
+
+
+def daemon_pid_refusal(pid):
+    """Why this pid is never signalled whatever the record says (pid 1 and below, this process, its parent), or None."""
+    if pid <= 1:
+        return "pid %d is not a daemon's" % pid
+    if pid in (os.getpid(), os.getppid()):
+        return "pid %d is this command or its parent" % pid
+    return None
+
+
+def daemon_snapshot(state_dir, runner, now, platform=None):
+    """What is true of the daemon now: running, pid, how it was started, since when, and the reasons it is not healthy ([] = healthy)."""
+    state_dir = Path(state_dir)
+    info = {"running": False, "pid": None, "how": None, "since": None, "reasons": [], "healthy": False, "record_pid": None, "job": "none"}
+    if not state_dir.is_dir() or not run_lock_held(state_dir):
+        return info
+    info["running"] = True
+    try:
+        info["pid"] = int((state_dir / "run.lock").read_text().strip())
+    except (OSError, ValueError):
+        pass
+    try:
+        record = json.loads((state_dir / DAEMON_RECORD).read_text())
+    except (OSError, ValueError):
+        record = {}
+    record = record if isinstance(record, dict) else {}
+    info["record_pid"] = record.get("pid") if isinstance(record.get("pid"), int) else None
+    mine = info["pid"] is not None and info["record_pid"] == info["pid"]
+    started = parse_iso(record["started_at"]) if mine and isinstance(record.get("started_at"), str) else None
+    info["since"] = record["started_at"] if started is not None else None
+    state, job_pid = launchd_job(runner, platform)
+    info["job"] = state
+    info["how"] = "launchd" if state == "loaded" and job_pid is not None and job_pid == info["pid"] else "ensure"
+    current = now()
+    reasons = info["reasons"]
+    decisions = decisions_report(state_dir, current)
+    if decisions["stale"]:
+        reasons.append("the decisions file is stale: %s" % (decisions["message"] or "not current"))
+    else:
+        try:
+            if started is not None and (state_dir / DECISIONS_FILE).stat().st_mtime < started - 1:
+                reasons.append("the decisions file has not been written since this daemon started")
+        except OSError:
+            pass
+    try:
+        snapshot = json.loads((state_dir / WATCH_FILE).read_text())
+    except (OSError, ValueError):
+        snapshot = {}
+    if isinstance(snapshot, dict) and snapshot.get("pid") == info["pid"]:
+        watches = snapshot.get("watches") or []
+        if not isinstance(watches, list):
+            reasons.append("the forwarder snapshot is unreadable (watches is not a list)")
+            watches = []
+        for watch in watches:
+            if isinstance(watch, dict):
+                alarm = forwarder_health(watch, current)["alarm"]
+                if alarm:
+                    reasons.append("the forwarder for %s is unhealthy: %s" % (watch.get("repo"), alarm))
+    info["healthy"] = not reasons
+    return info
+
+
+def daemon_status_text(info):
+    if not info["running"]:
+        return "daemon: not running"
+    lines = ["daemon: running (%s), pid %s, since %s" % (info["how"], info["pid"] if info["pid"] is not None else "unknown",
+                                                           info["since"] or "unknown")]
+    lines.append("daemon: healthy" if info["healthy"] else "daemon: unhealthy")
+    lines.extend("  - %s" % reason for reason in info["reasons"])
+    return "\n".join(lines)
+
+
+def daemon_wait_healthy(state_dir, runner, now, out):
+    """Wait, bounded, until the daemon is healthy. True when it is; else prints what it saw and returns False."""
+    deadline = daemon_clock() + DAEMON_HEALTH_WAIT
+    while True:
+        info = daemon_snapshot(state_dir, runner, now)
+        if info["running"] and info["healthy"]:
+            return True
+        if daemon_clock() >= deadline:
+            out.write("daemon: not healthy after %ds: %s\n" % (DAEMON_HEALTH_WAIT, "not running" if not info["running"]
+                                                              else "; ".join(info["reasons"]) or "unknown"))
+            return False
+        daemon_sleep(DAEMON_STEP)
+
+
+def daemon_stop(state_dir, runner, now, out):
+    """Stop the daemon. Returns what was done; raises DaemonCommandError when nothing may be signalled or it did not stop."""
+    info = daemon_snapshot(state_dir, runner, now)
+    if not info["running"]:
+        return "not running: nothing to stop"
+    pid = info["pid"]
+    if pid is None:
+        raise DaemonCommandError("the lock is held but names no pid; nothing was signalled")
+    if info["record_pid"] != pid:
+        raise DaemonCommandError("the lock names pid %d but the daemon record names %s; nothing was signalled"
+                                 % (pid, info["record_pid"] if info["record_pid"] is not None else "no pid"))
+    if daemon_pid_refusal(pid):
+        raise DaemonCommandError("%s; nothing was signalled" % daemon_pid_refusal(pid))
+    ours, command = daemon_process_is_ours(runner, pid)
+    if not ours:
+        raise DaemonCommandError("pid %d is not a %s daemon (%s); nothing was signalled"
+                                 % (pid, PROG, _one_line(command, 80) or "not running or unreadable"))
+    if info["how"] == "launchd":
+        try:
+            done = runner(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), SERVICE_LABEL)], capture_output=True, text=True,
+                          timeout=DAEMON_CALL_TIMEOUT, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            done = None
+        if done is None or done.returncode != 0:
+            raise DaemonCommandError("launchd would not unload the job; pid %d was left running" % pid)
+        what = "unloaded the launchd job (pid %d)" % pid
+    else:
+        if not run_lock_held(state_dir):
+            return "the daemon stopped by itself; nothing was signalled"
+        try:
+            daemon_signal(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError as err:
+            raise DaemonCommandError("could not signal pid %d: %s" % (pid, err.strerror or err)) from None
+        what = "sent SIGTERM to pid %d" % pid
+        if info["job"] == "loaded":
+            what += " (the launchd job is loaded and may start it again)"
+    deadline = daemon_clock() + DAEMON_STOP_WAIT
+    while run_lock_held(state_dir):
+        if daemon_clock() >= deadline:
+            raise DaemonCommandError("pid %d did not stop within %ds; it was asked to, and nothing stronger was sent" % (pid, DAEMON_STOP_WAIT))
+        daemon_sleep(DAEMON_STEP)
+    return "%s; run.lock is clear" % what
+
+
+def daemon_start(state_dir, runner, now, spawn, out):
+    """Begin a daemon (launchd when its job exists, else the `ensure` path) and wait for it to be healthy."""
+    state, _ = launchd_job(runner)
+    if run_lock_held(state_dir):
+        how = "already running"
+    elif state == "none":
+        out.write("the launchd job is not installed: starting the daemon the way `%s ensure` does\n" % PROG)
+        ensure_daemon(state_dir, spawn)
+        how = "started by ensure"
+    else:
+        argv = (["launchctl", "kickstart", "gui/%d/%s" % (os.getuid(), SERVICE_LABEL)] if state == "loaded"
+                else ["launchctl", "bootstrap", "gui/%d" % os.getuid(), str(service_file_path("launchd"))])
+        try:
+            done = runner(argv, capture_output=True, text=True, timeout=DAEMON_CALL_TIMEOUT, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            done = None
+        if done is None or done.returncode != 0:
+            raise DaemonCommandError("launchd would not start the job (%s)" % argv[1])
+        how = "started through launchd (%s)" % argv[1]
+    if not daemon_wait_healthy(state_dir, runner, now, out):
+        raise DaemonCommandError("the daemon was %s but is not healthy" % how)
+    return "%s; healthy" % how
+
+
+def cmd_daemon(args, runner, now, spawn=subprocess.Popen):
+    """`daemon status | start | stop | restart`. Direct: it never starts a daemon on its own account."""
+    state = state_dir_path()
+    out = sys.stdout
+    action = args.daemon_action
+    try:
+        if action == "status":
+            info = daemon_snapshot(state, runner, now)
+            print(daemon_status_text(info))
+            return EXIT_OK if info["running"] and info["healthy"] else EXIT_ERROR
+        state = ensure_state_dir()
+        with daemon_command_lock(state):
+            started = daemon_clock()
+            if action == "stop":
+                print("daemon stop: %s" % daemon_stop(state, runner, now, out))
+            elif action == "start":
+                print("daemon start: %s" % daemon_start(state, runner, now, spawn, out))
+            else:
+                first = daemon_stop(state, runner, now, out)
+                second = daemon_start(state, runner, now, spawn, out)
+                print("daemon restart: %s; %s; %.1f seconds" % (first, second, daemon_clock() - started))
+        return EXIT_OK
+    except (DaemonCommandError, LockError) as err:
+        sys.stderr.write("%s: daemon %s: %s\n" % (PROG, action, _one_line(str(err))))
+        return EXIT_ERROR
+
+
+cmd_daemon.direct = True   # no daemon start, no error mapping
+
+
+def add_daemon_parsers(sub):
+    daemon = sub.add_parser("daemon", allow_abbrev=False, help="Manage the daemon however it was started (launchd or `ensure`): `daemon status | start | stop | restart`",
+                            description="One command for the daemon. `status` says whether it runs, how it was started, its pid, since when and whether it is healthy. "
+                                        "`stop` ends it (SIGTERM, only to a pid the daemon record and run.lock agree on whose command is this program's `run`; "
+                                        "`launchctl bootout` under a loaded launchd job). `start` begins it (launchd when its job exists, else the `ensure` path) and waits up to "
+                                        "%d seconds for it to be healthy. `restart` is stop then start. No state file is touched." % DAEMON_HEALTH_WAIT)
+    actions = daemon.add_subparsers(dest="daemon_action", required=True)
+    for name, text in (("status", "running or not, how it was started, pid, since when, healthy or not (exit 1 when not running or unhealthy)"),
+                       ("start", "start the daemon and wait until it is healthy"), ("stop", "stop the daemon and wait for run.lock to clear"),
+                       ("restart", "stop then start; prints what it did and the seconds taken")):
+        actions.add_parser(name, allow_abbrev=False, help=text)
 
 
 INSTALL_COMMANDS = {"key": cmd_key}

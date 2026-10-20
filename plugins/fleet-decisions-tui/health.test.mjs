@@ -132,10 +132,21 @@ test("context with no percent shows the size used; with neither it says not reco
   assert.match(blockLines(none, 120).map(text)[1], /ctx not recorded/)
 })
 
-test("an agent the pane file does not know, or a missing pane file, is a state not recorded, not dead", () => {
-  const unknown = buildBlocks({ ...full, pane: { ...pane, states: {} } }, NOW).find((b) => b.name === "alpha")
-  assert.equal(unknown.state, null)
-  assert.match(text(blockLines(unknown, 80)[0]), /alpha\s+\?\s/)
+test("a workspace whose lead has no row in the pane states (a retired lane) is not drawn", () => {
+  assert.equal(buildBlocks({ ...full, pane: { ...pane, states: {} } }, NOW).length, 0)
+})
+
+test("S2 S9: two workspaces, one lead live and one retired and absent from the states: one block, the live one; no other input is read", () => {
+  const two = { agents: { live: { role: "orchestrator", workspace: "w1", session: "ses_1" }, old: { role: "orchestrator", workspace: "w2", session: "ses_2" } }, states: { live: { state: "attached" } }, missing: {} }
+  const blocks = buildBlocks({ pane: two, load: null, records: null, decisions: null }, NOW)
+  assert.deepEqual(blocks.map((b) => b.name), ["live"])
+  // a detached lead and a lead found dead are still drawn (they need repair); only a lead with no row is dropped
+  const kept = { ...two, states: { live: { state: "detached" }, old: { state: "dead" } } }
+  assert.deepEqual(buildBlocks({ pane: kept }, NOW).map((b) => b.name).sort(), ["live", "old"])
+  const seen = []
+  const probe = new Proxy({ pane: two }, { get: (t, k) => (seen.push(String(k)), t[k]) })
+  buildBlocks(probe, NOW)
+  assert.ok(seen.every((k) => ["pane", "load", "records", "decisions"].includes(k)), seen.join())
 })
 
 test("hottest first is by heat, not by name", () => {
