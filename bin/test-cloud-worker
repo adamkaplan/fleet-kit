@@ -15,6 +15,7 @@ import json
 import os
 import re
 import stat
+import shutil
 import signal
 import subprocess
 import sys
@@ -1466,6 +1467,332 @@ class TestSettingsFile(Base):
         for text in captures:
             for value in planted:
                 self.assertNotIn(value, text)
+
+
+FAKE_CHECK = """import json, os, sys, time
+from pathlib import Path
+root = Path(__file__).resolve().parents[2]
+cfg = json.loads((root / "fake.json").read_text())
+def note(kind):
+    with open(str(root / "runs.jsonl"), "a") as f:
+        f.write(json.dumps({"kind": kind, "t": time.time(), "argv": sys.argv[1:], "cwd": os.getcwd(), "env": sorted(os.environ), "pid": os.getpid(),
+                            "pgid": os.getpgid(0), "home": os.environ.get("HOME")}) + "\\n")
+note("start")
+time.sleep(cfg.get("sleep", 0))
+if cfg.get("fixes"):
+    (root / "fixed").write_text("x")
+print("checking address " + cfg.get("address", "addr-marker"))
+print(cfg.get("line", "rules 3 -> 4, 2026-10-19"))
+sys.stderr.write("address " + cfg.get("address", "addr-marker") + "\\n")
+note("end")
+sys.exit(cfg["code"])
+"""
+
+AZ_VAULT = """#!/bin/sh
+echo run >> "$STUB_DIR/az.log"
+mode=$(cat "$STUB_DIR/az_mode" 2>/dev/null)
+if [ "$mode" = firewall ] && [ ! -e "$FAKE_CHECKOUT/fixed" ]; then
+  echo "(Forbidden) Client address is not authorized and caller is not a trusted service. Code: Forbidden Inner error: ForbiddenByFirewall" >&2
+  exit 1
+fi
+if [ "$mode" = down ]; then
+  echo "vault unreachable" >&2
+  exit 1
+fi
+if [ "$mode" = auth ]; then
+  echo "(Forbidden) The user, group or application does not have secrets get permission on key vault. Inner error: AccessDenied" >&2
+  exit 1
+fi
+cat "$STUB_DIR/admin_kubeconfig"
+"""
+
+
+class VaultBase(Base):
+    """#876 slice 2: the vault access check, run by `launch --cloud` only after a vault read was refused for the firewall (offline: a fake `az` and a
+    fake check module in a temp checkout)."""
+
+    def setUp(self):
+        super().setUp()
+        self.lib = sb.load_module("cloud_worker").bind(sb.__dict__)._lib()
+        self.cw = sb.load_module("cloud_worker")
+        (self.stub_dir / "az").write_text(AZ_VAULT)
+        (self.stub_dir / "az").chmod(0o755)
+        self.checkout = self.home / "checkout"
+        self.make_checkout()
+        os.environ["FAKE_CHECKOUT"] = str(self.checkout)
+        os.environ["CW_VAULT_CHECK_DIR"] = str(self.checkout)
+        (self.stub_dir / "az_mode").write_text("firewall")
+        recorder = self.home / "python-recorder"
+        recorder.write_text('#!/bin/sh\nprintf "%%s\\n" "$@" > "%s/python-args"\nexec "%s" "$@"\n' % (self.stub_dir, sys.executable))
+        recorder.chmod(0o755)
+        hook = mock.patch.object(self.lib, "VAULT_CHECK_PYTHON", str(recorder))
+        hook.start()
+        self.addCleanup(hook.stop)
+
+    def make_checkout(self, code=0, fixes=True, **extra):
+        module = self.checkout / "scripts" / "v2" / "cw_vault_firewall.py"
+        module.parent.mkdir(parents=True, exist_ok=True)
+        module.write_text(FAKE_CHECK)
+        (self.checkout / "fake.json").write_text(json.dumps(dict(extra, code=code, fixes=fixes)))
+        for path in (self.checkout, self.checkout / "scripts", module.parent):
+            path.chmod(0o755)
+        module.chmod(0o644)
+
+    def runs(self):
+        path = self.checkout / "runs.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def check_runs(self):
+        return [r for r in self.runs() if r["kind"] == "start"]
+
+    def az_reads(self):
+        path = self.stub_dir / "az.log"
+        return len(path.read_text().splitlines()) if path.exists() else 0
+
+    def all_audit_lines(self):
+        return [line for p in self.state.rglob("*") if p.is_file() for line in p.read_text(errors="replace").splitlines() if "cloud.vault_check" in line]
+
+    def audit_lines(self):
+        return self.all_audit_lines()[getattr(self, "seen", 0):]
+
+
+class TestVaultCheckRelay(VaultBase):
+    """S6, S8, S8c, U3: the five exit codes, one table."""
+
+    def test_the_table_is_the_five_codes_of_the_contract(self):
+        self.assertEqual(sorted(self.lib.VAULT_CHECK_CODES), [0, 10, 20, 30, 40])
+        self.assertEqual([c for c, row in sorted(self.lib.VAULT_CHECK_CODES.items()) if row[1]], [0, 10])   # only these continue
+
+    def test_s6_each_exit_code_is_relayed_audited_once_and_the_count_line_is_printed_for_10_only(self):
+        codes = sorted(self.lib.VAULT_CHECK_CODES) + [7, 255]   # 7 and 255: a code the contract does not have is treated as 40 (a stop)
+        for code in codes:
+            with self.subTest(code=code):
+                for stale in (self.checkout / "runs.jsonl", self.checkout / "fixed", self.stub_dir / "az.log", self.stub_dir / "calls.log"):
+                    stale.unlink(missing_ok=True)
+                self.make_checkout(code=code, fixes=code in (0, 10), address="addr-marker-%d" % code)
+                for old in self.state.glob("cloud/*.json"):
+                    old.unlink()
+                self.audit_lines_clear()
+                got, out, err = self.launch()
+                continues = code in (0, 10)
+                self.assertEqual(got, 0 if continues else 2, err)
+                self.assertEqual(len(self.check_runs()), 1)
+                lines = self.audit_lines()
+                self.assertEqual(len(lines), 1, lines)
+                self.assertIn('"exit": %d' % code, lines[0])
+                self.assertEqual(err.count("rules 3 -> 4, 2026-10-19"), 1 if code == 10 else 0, err)
+                self.assertEqual(out.count("rules 3 -> 4"), 0)
+                if not continues:
+                    self.assertIn("the owner of the vault access check", err)
+                    self.assertIn("exit %d" % code, err)
+                    self.assertEqual(self.stub_calls(), [], "something was created")
+                for text in [out, err] + lines:
+                    self.assertNotIn("addr-marker", text)
+                self.audit_lines_clear()
+
+    def audit_lines_clear(self):
+        self.seen = len(self.all_audit_lines())
+
+    def test_s8c_the_count_line_is_printed_once_and_audited_with_the_counts_and_no_address(self):
+        self.make_checkout(code=10, fixes=True, address="addr-marker-xyz")
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err.count("rules 3 -> 4, 2026-10-19"), 1, err)
+        (line,) = self.audit_lines()
+        self.assertIn('"rules_before": 3', line)
+        self.assertIn('"rules_after": 4', line)
+        self.assertIn('"exit": 10', line)
+        for text in (out, err, line):
+            self.assertNotIn("addr-marker", text)
+
+    def test_s8_a_firewall_refusal_runs_the_check_once_and_reads_twice(self):
+        self.make_checkout(code=10, fixes=True)
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual((len(self.check_runs()), self.az_reads()), (1, 2))
+        self.assertEqual(len(self.audit_lines()), 1)
+
+    def test_s8_a_read_the_vault_already_answers_never_runs_the_check(self):
+        (self.stub_dir / "az_mode").write_text("ok")
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual((len(self.check_runs()), self.az_reads(), self.audit_lines()), (0, 1, []))
+
+    def test_s8_the_retry_is_once_even_when_the_vault_still_refuses(self):
+        self.make_checkout(code=0, fixes=False)   # the check says "answered", the vault disagrees
+        code, out, err = self.launch()
+        self.assertEqual(code, 2, err)
+        self.assertEqual((len(self.check_runs()), self.az_reads()), (1, 2))
+        self.assertIn("the owner of the vault access check", err)
+        self.assertEqual(self.stub_calls(), [])
+
+    def test_s8_any_other_vault_error_is_not_retried_and_runs_no_check(self):
+        for mode in ("auth", "down"):
+            with self.subTest(mode=mode):
+                (self.stub_dir / "az.log").unlink(missing_ok=True)
+                (self.stub_dir / "az_mode").write_text(mode)
+                (self.stub_dir / "vault_down").write_text("x") if mode == "down" else None
+                code, out, err = self.launch()
+                self.assertEqual(code, 2, err)
+                self.assertEqual((len(self.check_runs()), self.az_reads(), self.audit_lines()), (0, 1, []))
+
+    def test_an_off_list_repository_never_runs_the_check(self):
+        os.environ["CW_ALLOWED_REPOS"] = "acme-org/other"
+        code, out, err = self.launch()
+        self.assertEqual(code, 2, err)
+        self.assertEqual((len(self.check_runs()), self.az_reads()), (0, 0))
+
+    def test_u3_the_argument_list_is_exactly_the_module_and_check_and_the_cwd_is_the_checkout(self):
+        self.make_checkout(code=10, fixes=True)
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual((self.stub_dir / "python-args").read_text().split("\n")[:-1], ["-m", "scripts.v2.cw_vault_firewall", "check"])
+        (start,) = self.check_runs()
+        self.assertEqual(start["argv"], ["check"])
+        self.assertEqual(os.path.realpath(start["cwd"]), os.path.realpath(str(self.checkout)))
+
+    def test_u3_the_child_environment_is_scrubbed_and_each_poisoned_name_is_absent(self):
+        poison = {"CW_VAULT_NAME": "x", "CW_VAULT_SUBSCRIPTION": "x", "CW_APP_KEY_CMD": "x", "PYTHONPATH": "/nowhere", "HTTPS_PROXY": "http://proxy.example.internal",
+                  "GH_TOKEN": "x", "CW_OPENSSL": "/usr/bin/openssl", "LANG": "C", "CW_VAULT_CHECK_DIR": str(self.checkout), "AZURE_CLI_X": "x", "CW_ALLOWED_REPOS_X": "x"}
+        self.make_checkout(code=10, fixes=True)
+        with mock.patch.dict(os.environ, poison):
+            code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        (start,) = self.check_runs()
+        keys = set(start["env"])
+        for name in poison:
+            self.assertNotIn(name, keys, name)
+        self.assertEqual({k for k in keys if not k.startswith("LC_")} - {"__CF_USER_TEXT_ENCODING", "SHLVL", "PWD", "_"}, {"PATH", "HOME", "TMPDIR", "AZURE_CONFIG_DIR"})   # SHLVL, PWD, _: the recording sh wrapper's own
+        self.assertNotEqual(start["home"], os.environ["HOME"])   # a private HOME, not the user's
+
+    def test_the_audit_and_lock_files_are_private(self):
+        self.make_checkout(code=10, fixes=True)
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        lock = self.state / "cloud" / self.cw.VAULT_LOCK_NAME
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+
+
+class TestVaultCheckPath(VaultBase):
+    """S6b: a missing key or a bad checkout refuses naming the key, runs nothing, and never prints the path."""
+
+    def test_s6b_each_bad_path_refuses_naming_the_key_and_runs_nothing(self):
+        cases = {}
+        cases["no key"] = lambda: os.environ.pop("CW_VAULT_CHECK_DIR")
+        cases["missing directory"] = lambda: os.environ.update(CW_VAULT_CHECK_DIR=str(self.home / "nope"))
+        cases["relative path"] = lambda: os.environ.update(CW_VAULT_CHECK_DIR="checkout")
+        cases["dot-dot path"] = lambda: os.environ.update(CW_VAULT_CHECK_DIR=str(self.checkout) + "/../checkout")
+        cases["a file, not a directory"] = lambda: os.environ.update(CW_VAULT_CHECK_DIR=str(self.checkout / "fake.json"))
+        for name, rel, _kind in self.lib.VAULT_CHECK_PATH_ROWS:
+            target = self.checkout / rel if rel else self.checkout
+            cases["group-writable " + name] = lambda t=target: t.chmod(0o775)
+            cases["world-writable " + name] = lambda t=target: t.chmod(0o757)
+            cases["missing " + name] = lambda t=target: (os.unlink(str(t)) if t.is_file() else shutil.rmtree(str(t)))
+            if rel:
+                cases["symlink " + name] = lambda t=target: (shutil.move(str(t), str(t) + ".real"), os.symlink(str(t) + ".real", str(t)))
+        cases["checkout is a symlink"] = lambda: (os.symlink(str(self.checkout), str(self.home / "link")), os.environ.update(CW_VAULT_CHECK_DIR=str(self.home / "link")))
+        cases["module is a directory"] = lambda: (os.unlink(str(self.checkout / self.lib.VAULT_CHECK_FILE)), os.mkdir(str(self.checkout / self.lib.VAULT_CHECK_FILE)))
+        for label, spoil in cases.items():
+            with self.subTest(label):
+                shutil.rmtree(str(self.checkout), ignore_errors=True)
+                for leftover in (self.home / "link",):
+                    if leftover.is_symlink():
+                        leftover.unlink()
+                self.make_checkout(code=10, fixes=True)
+                os.environ["CW_VAULT_CHECK_DIR"] = str(self.checkout)
+                spoil()
+                (self.stub_dir / "az.log").unlink(missing_ok=True)
+                for old in self.state.glob("cloud/*.json"):
+                    old.unlink()
+                code, out, err = self.launch()
+                self.assertEqual(code, 2, (label, err))
+                self.assertIn("CW_VAULT_CHECK_DIR", err)
+                self.assertEqual(len(self.check_runs()), 0, label)
+                self.assertEqual(self.audit_lines(), [])
+                self.assertNotIn(str(self.home), err)   # never the path
+                self.assertEqual(self.stub_calls(), [])
+
+    def test_the_path_rows_are_the_four_the_plan_names(self):
+        self.assertEqual([rel for rel, _ in [(r, n) for n, r, _ in self.lib.VAULT_CHECK_PATH_ROWS]], ["", "scripts", "scripts/v2", self.lib.VAULT_CHECK_FILE])
+
+    def test_a_not_owned_directory_is_refused_by_the_owner_row(self):
+        with mock.patch.object(os, "getuid", lambda: os.stat(str(self.checkout)).st_uid + 1):
+            self.assertIn("not owned by the user", self.lib.vault_check_dir_problem(str(self.checkout)))
+
+    def test_an_unset_key_does_not_refuse_a_launch_the_vault_already_answers(self):
+        (self.stub_dir / "az_mode").write_text("ok")
+        os.environ.pop("CW_VAULT_CHECK_DIR")
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+
+
+class TestVaultCheckProcess(VaultBase):
+    """The run limit kills the process group; two launches never run the check at once (S8b)."""
+
+    def test_a_check_past_its_limit_is_killed_and_is_a_stop(self):
+        self.make_checkout(code=10, fixes=True, sleep=30)
+        with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 1), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0):
+            started = time.time()
+            code, out, err = self.launch()
+        self.assertEqual(code, 2, err)
+        self.assertLess(time.time() - started, 15)
+        self.assertIn("the owner of the vault access check", err)
+        (start,) = self.check_runs()
+        time.sleep(0.3)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(start["pid"], 0)
+        (line,) = self.audit_lines()
+        self.assertIn('"outcome": "timed-out"', line)
+
+    def recover(self, results, index):
+        env = dict(os.environ)
+        recovery = self.cw.VaultRecovery(self.state / "cloud" / "vault-check.lock", None)
+        recovery.lock_path = str(self.home / "vault.lock")
+        read = lambda: self.cw._capture(["az", "keyvault", "secret", "show"], env=env)
+        results[index] = recovery(read, env)
+
+    def two_launches(self):
+        results = [None, None]
+        threads = [threading.Thread(target=self.recover, args=(results, i)) for i in (0, 1)]
+        threads[0].start()
+        time.sleep(0.4)   # the first holds the lock (the check sleeps) when the second arrives
+        threads[1].start()
+        for thread in threads:
+            thread.join(60)
+        return results
+
+    def intervals(self):
+        starts = [r["t"] for r in self.runs() if r["kind"] == "start"]
+        ends = [r["t"] for r in self.runs() if r["kind"] == "end"]
+        return sorted(zip(starts, ends))
+
+    def test_s8b_two_launches_run_the_check_once_and_the_second_reads_again_first(self):
+        self.make_checkout(code=10, fixes=True, sleep=1.5)
+        results = self.two_launches()
+        self.assertEqual(len(self.check_runs()), 1)
+        self.assertEqual([r[0] for r in results], [0, 0])
+        self.assertEqual(self.az_reads(), 2 + 0)   # the second's re-read answered: no read after a check of its own
+
+    def test_s8b_when_the_re_read_is_still_refused_the_second_runs_its_own_check_with_no_overlap(self):
+        self.make_checkout(code=0, fixes=False, sleep=1.0)
+        self.two_launches()
+        spans = self.intervals()
+        self.assertEqual(len(spans), 2)
+        self.assertLessEqual(spans[0][1], spans[1][0], "the two checks overlapped")
+
+    def test_a_lock_that_is_not_freed_in_time_refuses_naming_the_lock(self):
+        self.make_checkout(code=0, fixes=False, sleep=3)
+        env = dict(os.environ)
+        results = [None]
+        holder = threading.Thread(target=self.recover, args=(results, 0))
+        holder.start()
+        time.sleep(0.5)
+        recovery = self.cw.VaultRecovery(self.home / "vault.lock", None, sleep=lambda s: time.sleep(0.05), clock=time.monotonic)
+        with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 0), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0), mock.patch.object(self.cw, "VAULT_LOCK_GRACE", 0.3):
+            with self.assertRaises(self.cw.Refusal) as caught:
+                recovery(lambda: self.cw._capture(["az", "x"], env=env), env)
+        self.assertIn("vault-check.lock", str(caught.exception))
+        holder.join(30)
 
 
 if __name__ == "__main__":

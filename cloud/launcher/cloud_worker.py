@@ -230,10 +230,11 @@ def _abs_executable(path):
     return bool(path) and os.path.isabs(path) and os.path.isfile(path) and os.access(path, os.X_OK)
 
 
-def _preflight_env(env, home):
-    """The child's whole environment: the allow-listed names, a fixed PATH, an empty private HOME and TMPDIR, and where `az` keeps its sign-in
-    (the caller's AZURE_CONFIG_DIR when it is an absolute existing directory, else the account's own ~/.azure from the password database, never $HOME)."""
-    clean = {k: v for k, v in env.items() if k in PREFLIGHT_ENV_NAMES or k.startswith("LC_")}
+def _scrubbed_env(env, home, names, openssl=True):
+    """THE scrubbed child environment (the preflight and the vault access check both use it): the allow-listed `names` (and LC_*), a fixed PATH, an
+    empty private HOME and TMPDIR, and where `az` keeps its sign-in (the caller's AZURE_CONFIG_DIR when it is an absolute existing directory, else the
+    account's own ~/.azure from the password database, never $HOME)."""
+    clean = {k: v for k, v in env.items() if k in names or k.startswith("LC_")}
     clean["PATH"] = PREFLIGHT_PATH
     clean["HOME"] = home
     clean["TMPDIR"] = home
@@ -246,8 +247,13 @@ def _preflight_env(env, home):
     if cfg:
         clean["AZURE_CONFIG_DIR"] = cfg
     ossl = env.get("CW_OPENSSL") or ""
-    if _abs_executable(ossl):
+    if openssl and _abs_executable(ossl):
         clean["CW_OPENSSL"] = ossl
+    return clean
+
+
+def _preflight_env(env, home):
+    clean = _scrubbed_env(env, home, PREFLIGHT_ENV_NAMES)
     clean.update(PREFLIGHT_TEST_ENV)
     return clean
 
@@ -269,6 +275,142 @@ def check_repo_preflight(repo, env):
     if not lines:
         raise CloudError("refused: the repository preflight for %s printed nothing; nothing was created" % scrub(repo, (), 120), EXIT_USAGE)
     return scrub(lines[-1], (), 300)
+
+
+# ---------------------------------------------------------------- the vault access check (#876 slice 2)
+# A program of another repository, run UNCHANGED from a configured checkout (CW_VAULT_CHECK_DIR), only after a vault read was refused by the vault's
+# firewall. Contract (agreed with its owner, who announces any change first): the module below, run with `check` from the root of the checkout; no other
+# argument, option, environment or file; limit 300 s; it adds at most ONE single-address rule, only this machine's own address; it prints a count line.
+VAULT_CHECK_KEY = "CW_VAULT_CHECK_DIR"
+VAULT_CHECK_MODULE = "scripts.v2.cw_vault_firewall"
+VAULT_CHECK_FILE = "scripts/v2/cw_vault_firewall.py"
+VAULT_CHECK_ARGS = ("check",)           # the whole argument list after the module: never an address, never an option
+VAULT_CHECK_SECONDS = 300               # the check's own run limit
+VAULT_CHECK_GRACE = 15                  # ours, on top, before the process group is killed
+VAULT_CHECK_ENV_NAMES = ()              # nothing is passed from the caller: the child gets PATH, a private HOME and TMPDIR, AZURE_CONFIG_DIR and LC_*
+VAULT_CHECK_PYTHON = None               # a test hook (a module attribute): None means python3 found on the fixed PATH
+# The exit codes, one table: code -> (outcome, the launch continues, what it means). Any other code (or no code: killed, timed out, not run) is treated as 40.
+VAULT_CHECK_CODES = {
+    0: ("answered", True, "the vault answered; nothing was changed"),
+    10: ("added", True, "an address was added and the vault now answers"),
+    20: ("refused-by-its-rules", False, "the check refused by its own rules (its cap of 6 rules is reached, or an address it will not add)"),
+    30: ("added-still-refused", False, "an address was added but the vault still refused after 90 seconds"),
+    40: ("failed", False, "the check failed for another reason"),
+}
+VAULT_CHECK_FALLBACK = 40
+_COUNT_LINE = re.compile(r"rules (\d{1,4}) -> (\d{1,4})(?:, (\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?Z?)?))?")
+
+
+class CheckResult:
+    """What one run of the check came to: its exit code UNCHANGED (None when it was killed, timed out or never ran), the outcome name, and the
+    counts of its count line (None, None when none was found). Never an address."""
+    def __init__(self, code, outcome, before=None, after=None, line=None):
+        self.code, self.outcome, self.before, self.after, self.line = code, outcome, before, after, line
+
+    @property
+    def effective(self):
+        return self.code if self.code in VAULT_CHECK_CODES else VAULT_CHECK_FALLBACK
+
+
+# One row per rule of the checkout: (name, relative path, kind). Each row is judged with lstat (a link is never followed) and must be owned by the
+# user and not group- or world-writable, because this program runs it as the user.
+VAULT_CHECK_PATH_ROWS = (
+    ("the checkout", "", "dir"),
+    ("scripts", "scripts", "dir"),
+    ("scripts/v2", "scripts/v2", "dir"),
+    ("the module", VAULT_CHECK_FILE, "file"),
+)
+
+
+def vault_check_dir_problem(checkout):
+    """None when `checkout` is a usable checkout, else ONE short reason (never the path's content): an absolute path to an existing directory that
+    is not a symlink, owned by the user, not group- or world-writable, holding scripts/v2/cw_vault_firewall.py as a regular file."""
+    if not isinstance(checkout, str) or not checkout.strip() or not os.path.isabs(checkout) or ".." in checkout.split("/"):
+        return "is not an absolute path"
+    for name, rel, kind in VAULT_CHECK_PATH_ROWS:
+        path = os.path.join(checkout, rel) if rel else checkout
+        try:
+            found = os.lstat(path)
+        except OSError:
+            return "has no %s" % name
+        if stat.S_ISLNK(found.st_mode):
+            return "has %s as a symlink" % name
+        if not (stat.S_ISDIR(found.st_mode) if kind == "dir" else stat.S_ISREG(found.st_mode)):
+            return "has %s that is not a %s" % (name, "directory" if kind == "dir" else "regular file")
+        if found.st_uid != os.getuid():
+            return "has %s that is not owned by the user" % name
+        if found.st_mode & 0o022:
+            return "has %s that is group- or world-writable" % name
+    return None
+
+
+def _check_python():
+    if VAULT_CHECK_PYTHON:
+        return VAULT_CHECK_PYTHON
+    found = shutil.which("python3", path=PREFLIGHT_PATH)
+    return os.path.abspath(found) if found else None
+
+
+def _kill_group(child):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(child.pid, sig)
+        except OSError:
+            pass
+        try:
+            child.wait(5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def vault_check_ready(env):
+    """(checkout, python3) when the check may run, else a CloudError (exit 2, naming CW_VAULT_CHECK_DIR, never the path) and NOTHING has run."""
+    checkout = (env.get(VAULT_CHECK_KEY) or "").strip()
+    if not checkout:
+        raise CloudError("refused: %s is not set: the vault refused this machine and the owner of the vault access check provides the checkout it runs "
+                         "from; nothing was changed" % VAULT_CHECK_KEY, EXIT_USAGE)
+    problem = vault_check_dir_problem(checkout)
+    if problem:
+        raise CloudError("refused: %s %s: the owner of the vault access check provides the checkout; nothing was run" % (VAULT_CHECK_KEY, problem), EXIT_USAGE)
+    python = _check_python()
+    if not python:
+        raise CloudError("refused: python3 was not found for the vault access check; nothing was run", EXIT_USAGE)
+    return checkout, python
+
+
+def run_vault_check(env):
+    """THE one call of the vault access check: runs the module with the argument list [python3, -m, MODULE, check] from the checkout (after
+    vault_check_ready), in a scrubbed environment, for at most VAULT_CHECK_SECONDS (+ grace; the process group is killed), and returns a CheckResult
+    carrying the exit code unchanged. Its output is read for the count line only and is never printed or kept."""
+    checkout, python = vault_check_ready(env)
+    argv = [python, "-m", VAULT_CHECK_MODULE] + list(VAULT_CHECK_ARGS)
+    out = ""
+    try:
+        with tempfile.TemporaryDirectory(prefix="cw-vcheck-") as home:
+            child = subprocess.Popen(argv, cwd=checkout, env=_scrubbed_env(env, home, VAULT_CHECK_ENV_NAMES, openssl=False), stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace", start_new_session=True)
+            try:
+                out, _ = child.communicate(timeout=VAULT_CHECK_SECONDS + VAULT_CHECK_GRACE)
+            except subprocess.TimeoutExpired:
+                _kill_group(child)
+                child.communicate()
+                return CheckResult(None, "timed-out")
+            except BaseException:
+                _kill_group(child)
+                raise
+    except OSError:
+        return CheckResult(None, "not-run")
+    code = child.returncode
+    outcome = VAULT_CHECK_CODES[code][0] if code in VAULT_CHECK_CODES else "unknown-code"
+    before = after = line = None
+    for text in out[:100000].splitlines():
+        found = _COUNT_LINE.search(text)
+        if found:
+            before, after = int(found.group(1)), int(found.group(2))
+            line = "rules %d -> %d%s" % (before, after, ", " + found.group(3) if found.group(3) else "")   # rebuilt from the parts, never echoed
+            break
+    return CheckResult(code, outcome, before, after, line)
 
 
 def token_mode(env):
@@ -1118,7 +1260,7 @@ SETTINGS = (
     ("CW_APP_ID_CMD", False, "command"),
     ("CW_APP_INSTALLATION_CMD", False, "command"),
     ("CW_APP_KEY_CMD", False, "command"),
-    ("CW_VAULT_CHECK_DIR", False, "path"),         # reserved for the vault pre-check's checkout path: read and validated, not used yet
+    ("CW_VAULT_CHECK_DIR", False, "path"),         # the checkout the vault access check runs from; needed only after a vault firewall refusal (see vault_check_dir_problem)
 )
 SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
 SETTING_REQUIRED = tuple(name for name, required, _ in SETTINGS if required)

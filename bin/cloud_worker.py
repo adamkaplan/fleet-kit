@@ -478,6 +478,14 @@ class Refusal(CloudError):
 
 VAULT_CHECK = ("run the platform team's firewall check for the vault (the vault pre-check) first; nothing was changed and no other credential "
                "was tried")
+# What a vault refusal FOR THE FIREWALL looks like: the text `az` prints for the vault's data plane (Microsoft documents both: the message and the inner
+# error code). Matched case-insensitively in the error text only (never printed). Any other vault error (no permission, no such secret, not signed
+# in, unreachable) matches neither and is never retried and never runs the check.
+FIREWALL_MARKERS = ("client address is not authorized and caller is not a trusted service", "forbiddenbyfirewall")
+VAULT_LOCK_NAME = "vault-check.lock"
+VAULT_LOCK_GRACE = 45          # on top of the check's own run limit: how long a second launch waits for the lock
+VAULT_LOCK_POLL = 0.2
+VAULT_OWNER = "the owner of the vault access check"
 MAX_TOKEN_SECONDS = 3600
 HANDLED_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
 TOKEN_CMD_SECONDS = 60
@@ -609,11 +617,81 @@ def _duration(env):
     return "%dm" % minutes
 
 
-def cluster_token(env=None, now=None):
+def firewall_refused(ran):
+    """True when a vault read's result (exit code, stdout, stderr; None when it could not run) is the vault's FIREWALL refusing this machine."""
+    if ran is None or ran[0] == 0:
+        return False
+    text = (ran[2] or "").lower()
+    return any(marker in text for marker in FIREWALL_MARKERS)
+
+
+class VaultRecovery:
+    """After a vault read was refused for the firewall: run the vault access check ONCE, then read again ONCE. One exclusive file lock (0600, in the
+    private state directory) is held around the check and the read after it, because the check has no lock of its own and two runs at once are
+    untested. A launch that has to WAIT for the lock reads the vault again first: the run it waited for may have fixed it, and then it does not run
+    the check. `audit(detail)` writes the one audit line of a run (an outcome, the exit code and the counts: never an address)."""
+
+    def __init__(self, lock_path, audit=None, sleep=time.sleep, clock=time.monotonic):
+        self.lock_path, self.audit, self.sleep, self.clock = str(lock_path), audit, sleep, clock
+
+    def _lock(self):
+        try:
+            fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            found = os.fstat(fd)
+            if found.st_uid != os.getuid() or not stat.S_ISREG(found.st_mode):
+                os.close(fd)
+                raise Refusal("the vault check lock is not the user's own regular file; refused, nothing was called")
+            os.fchmod(fd, 0o600)
+        except OSError as err:
+            raise Refusal("the vault check lock cannot be made (%s); nothing was called" % (err.strerror or err)) from None
+        waited, deadline = False, self.clock() + _lib().VAULT_CHECK_SECONDS + _lib().VAULT_CHECK_GRACE + VAULT_LOCK_GRACE
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd, waited
+            except OSError:
+                waited = True
+            if self.clock() >= deadline:
+                os.close(fd)
+                raise Refusal("the vault check lock %s was not freed in time (another launch is running the vault access check); nothing was created" % VAULT_LOCK_NAME)
+            self.sleep(VAULT_LOCK_POLL)
+
+    def __call__(self, read, env):
+        lib = _lib()
+        try:
+            lib.vault_check_ready(env)   # a missing key or a bad checkout refuses here, before the lock, and runs nothing
+        except lib.CloudError as err:
+            raise Refusal(str(err).replace("refused: ", "", 1)) from None
+        fd, waited = self._lock()
+        try:
+            if waited:   # the run we waited for may have fixed it
+                ran = read()
+                if not firewall_refused(ran):
+                    return ran
+            try:
+                result = lib.run_vault_check(env)
+            except lib.CloudError as err:
+                raise Refusal(str(err).replace("refused: ", "", 1)) from None
+            if self.audit is not None:
+                self.audit({"exit": result.code, "outcome": result.outcome, "rules_before": result.before, "rules_after": result.after})
+            code = result.effective
+            if not lib.VAULT_CHECK_CODES[code][1]:
+                raise Refusal("the vault access check stopped this launch (exit %s: %s); ask %s; it adds at most one address and never removes one, "
+                              "so nothing more is done here; nothing was created" % (result.code if result.code is not None else "none", lib.VAULT_CHECK_CODES[code][2], VAULT_OWNER))
+            if code == 10:
+                sys.stderr.write("%s: the vault access check added an address: %s: forward this line to whoever records it\n"
+                                 % (H["PROG"], result.line or "its count line was not found in its output; ask " + VAULT_OWNER))
+            return read()
+        finally:
+            os.close(fd)   # releases the lock
+
+
+def cluster_token(env=None, now=None, recovery=None):
     """A cluster token of at most one hour, minted NOW, in memory. CW_CLUSTER_TOKEN_CMD (a command that prints one), else the default: the cluster
     administrator kubeconfig is read from the vault (CW_CLUSTER_ADMIN_CMD, else `az keyvault secret show` with CW_VAULT_SUBSCRIPTION and
     CW_VAULT_NAME) and `kubectl create token cw-operator --duration=20m` is run with it on a pipe. Nothing is cached or kept. A failure is a
-    Refusal that names the vault pre-check; no other credential or context is ever tried."""
+    Refusal that names the vault pre-check; no other credential or context is ever tried. With `recovery` (launch only), a vault read refused for
+    the firewall runs the vault access check once and reads once more."""
     env = dict(os.environ if env is None else env)
     clock = time.time() if now is None else now
 
@@ -635,9 +713,16 @@ def cluster_token(env=None, now=None):
                 fail("set CW_VAULT_SUBSCRIPTION and CW_VAULT_NAME")
             argv = ["az", "keyvault", "secret", "show", "--subscription", sub, "--vault-name", vault,
                     "--name", env.get("CW_CLUSTER_ADMIN_SECRET") or "cw-cluster-admin-kubeconfig", "--query", "value", "-o", "tsv"]
-        ran = _capture(argv, env=env)
+        def read():
+            return _capture(argv, env=env)
+        ran = read()
+        recovered = False
+        if recovery is not None and not admin and firewall_refused(ran):   # only the default vault read, only a firewall refusal, once
+            ran = recovery(read, env)
+            recovered = True
         if ran is None or ran[0] != 0 or not ran[1].strip() or len(ran[1]) > 1000000:
-            fail("the administrator credential could not be read from the vault")
+            fail("the administrator credential could not be read from the vault" + (
+                " even after the vault access check; ask " + VAULT_OWNER if recovered else ""))
         admin_config = ran[1]
         minted = _capture([env.get("CW_KUBECTL", "kubectl"), "--kubeconfig", "/dev/fd/{fd}", "-n", env.get("CW_CLOUD_NAMESPACE", "cw"), "create",
                            "token", "cw-operator", "--duration=" + _duration(env)], env=dict(env, KUBECONFIG=os.devnull), feed=admin_config)
@@ -746,7 +831,8 @@ class Cluster:
     place it touches disk: the launcher's tokenFile mechanism needs a file), and removes the directory on every way out: normal end, failure,
     SIGINT, SIGTERM, SIGHUP and SIGQUIT. A stale directory of a killed command is swept at the start of every command. No token is kept between commands."""
 
-    def __init__(self):
+    def __init__(self, recovery=None):
+        self.recovery = recovery
         self.known = set()
         self.dir = None
         self.kubeconfig = None
@@ -767,7 +853,7 @@ class Cluster:
                 raise Refusal("CW_CLOUD_SERVER is not set: no cluster to reach; nothing was changed")
             root = private_root()
             sweep_stale(root)
-            token = cluster_token()
+            token = cluster_token(recovery=self.recovery)
             self.add(token)
             self.dir = tempfile.mkdtemp(prefix="cmd-%d-" % os.getpid(), dir=str(root))
             self.server = server
@@ -999,7 +1085,8 @@ def _launch(args, runner, now, reserve):
             options += [flag, str(value)]
     if os.environ.get("CW_PULL_SECRET"):
         options += ["--pull-secret", os.environ["CW_PULL_SECRET"]]
-    with Cluster() as cluster:
+    recovery = VaultRecovery(cloud_dir(state) / VAULT_LOCK_NAME, lambda detail: _audit(engine, "cloud.vault_check", name, detail))
+    with Cluster(recovery) as cluster:
         model = model_entry()
         cluster.add(model)
         token = git_token(repo, cluster)
