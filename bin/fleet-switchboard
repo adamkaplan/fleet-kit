@@ -3064,8 +3064,9 @@ class TempJanitorFacts:
         _write_small(engine.state_dir, TEMP_JANITOR_GATE_FILE, {"rule": rule, "preview": preview, "sent": False, "count": len(names)})
         shown = ", ".join(_plain(n, 60) for n in names[:TEMP_JANITOR_PREVIEW_NAMES])
         text = ("temp janitor: its selection rule changed, so nothing is applied until you say yes to this preview. It WOULD remove %d entr%s (%d bytes): %s%s. "
-                "To say yes to exactly this preview: `%s disk janitor-ack %s`. A later change of the rule makes a new preview and needs a new yes; "
-                "the daemon removes anything only while `temp_janitor.daemon_apply` is true." % (
+                "To say yes to this preview: `%s disk janitor-ack %s`. The yes covers the RULE this preview was made under: later weekly runs under the same rule remove "
+                "whatever qualifies then, not only the names listed; a change of the rule makes a new preview and needs a new yes. The daemon removes anything only while "
+                "`temp_janitor.daemon_apply` is true. If this message is lost no apply happens until the rule changes again." % (
                     len(names), "y" if len(names) == 1 else "ies", sum(o["bytes"] for o in outcome), shown or "nothing",
                     " and %d more" % (len(names) - TEMP_JANITOR_PREVIEW_NAMES) if len(names) > TEMP_JANITOR_PREVIEW_NAMES else "", PROG, preview))
         self.outbox = (preview, rule, text)
@@ -24229,7 +24230,13 @@ def janitor_busy_function(engine, runner, janitor):
             lines = (done.stdout or "").splitlines()
             if len(lines) > 2000000:
                 raise janitor.Unknown("the open-file check listed more than 2000000 lines: a file past the limit would not protect its entry")
-            held["open"] = [os.path.realpath(l[1:]) for l in lines if l.startswith("n/")]
+            limit, resolved = time.monotonic() + JANITOR_OPEN_SECONDS, []
+            for l in lines:
+                if l.startswith("n/"):
+                    if time.monotonic() > limit:
+                        raise janitor.Unknown("resolving the open-file list took longer than %d s" % JANITOR_OPEN_SECONDS)
+                    resolved.append(os.path.realpath(l[1:]))
+            held["open"] = resolved
         return held["open"]
 
     def process_directories():
