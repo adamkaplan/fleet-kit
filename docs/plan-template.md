@@ -22,6 +22,8 @@ constraint (`PC-n`) with its reason.
 Recorded as an issue, or a section of one, **in the repo the work concerns**. Required:
 
 1. **Done-when**: the ask's clauses, copied, numbered `(1) ... (2) ...` as in the ask.
+   A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, and a Done-when the work item carries itself must still match exactly.
+   A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused.
 2. **Scenarios**: the yaml block below, including unchanged (U) ones.
 3. **Constraints** (`PC-n`): what must hold, and why.
 4. **Out of scope**.
@@ -194,3 +196,10 @@ fails with `DW-2 is not covered by any S scenario`. Every clause needs a scenari
 
 A proof (`prove`) and a verdict count when both exist at the same head and plan hash, in either order; the daemon records the `ci` verdict
 itself within minutes of green checks. A push voids every proof and verdict, so after one they are made again.
+
+## Why a work item reads its ask, and a pull request can claim
+
+Two recorded cases (numbers are neutral) led to the two rules after the Done-when item above.
+
+1. **Case 1, the structure gate (G0a).** Work item `#124` belongs to ask `#123` and had no Done-when of its own, because the Done-when lives on the ask. The gate read the Done-when of the issue the plan is on, found none, and failed with `plan check fails: 1 defect` until the ask's Done-when was pasted into the work item. `plan check --ask` already read another issue's Done-when, but the gate did not use it.
+2. **Case 2, the proof gate (G1).** Ask `#123` shipped in two pull requests, `#201` and `#202`, under one plan that had no way to say which scenarios each proves. The first pull request showed the second's scenarios as missing proofs until the ask was split into two work items.

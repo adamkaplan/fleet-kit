@@ -19827,6 +19827,18 @@ def fetch_plan(reader, repo, number, comment_id=None):
     return text, "%s of %s#%d" % (source, repo, number), parse_intent(body)[1]
 
 
+def _parent_ask_done_when(reader, repo, number):
+    """The Done-when of the ASK that is the native sub-issue parent of issue `number`, or None. Like `IntentReader.ask_of`, a parent counts as the ask only
+    when it has a parent of its own (the charter): the issue under a charter is itself the ask, and a charter's Done-when is never borrowed."""
+    try:
+        parent = reader.parent(number, repo)
+        if parent is None or reader.parent(parent, repo) is None:
+            return None
+        return reader.issue(parent, repo).done_when
+    except IntentError as err:
+        raise PlanInputError("cannot read the parent ask of %s#%d: %s" % (repo, number, err)) from None
+
+
 def load_plan(args, runner, now):
     """(text, source label, result) of the plan `args` names (source, file, ask, done_when), checked. Raises
     PlanInputError, ValueError (an unreadable block) or the readers' errors."""
@@ -19866,6 +19878,8 @@ def load_plan(args, runner, now):
             plan_own = issue_done if issue_done and issue_done != done_when else None
         else:
             done_when = issue_done
+            if not done_when:   # a work item states no Done-when of its own: its ask's is the authority (the sub-issue parent, never a "Work item of" line)
+                done_when = _parent_ask_done_when(reader, repo, number)
     if args.ask and args.file and not args.done_when:
         raise PlanInputError("--ask needs a plan read from GitHub; for --file give --done-when TEXT")
     return text, source, plan_check.check(text, done_when, plan_own)
@@ -20836,6 +20850,11 @@ def _scenario_of(ctx, sid):
         raise LedgerCommandError("the plan has no scenario %s (it has %s)" % (sid, ", ".join(x.get("id", "?") for x in ctx.plan["scenarios_parsed"][:12])))
     if plan_ledger.claim_of(found) != "pr":
         raise LedgerCommandError("%s is claimed at the epic, not per PR: it is proven at the epic's integrated head" % sid)
+    mine, left, why = plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], (ctx.facts or {}).get("body"))
+    if why:
+        raise LedgerCommandError("refused: " + why)
+    if found not in mine:
+        raise LedgerCommandError("%s is not on this pull request's `CLAIMS:` line: it stays claimed by the epic's other pull requests" % sid)
     return found
 
 
@@ -20938,8 +20957,10 @@ def cmd_verdict(args, runner, now):
         if args.scenario:
             raise LedgerCommandError("--all takes no scenario id: it records every scenario the plan names for --as %s" % args.evaluator)
         _plan_usable(ctx)
-        targets = [x for x in ctx.plan["scenarios_parsed"]
-                   if plan_ledger.claim_of(x) == "pr" and plan_ledger.evaluator_of(x) == args.evaluator]
+        mine, _, why = plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], (ctx.facts or {}).get("body"))
+        if why:
+            raise LedgerCommandError("refused: " + why)
+        targets = [x for x in mine if plan_ledger.evaluator_of(x) == args.evaluator]
         if not targets:
             raise LedgerCommandError("no per-PR scenario of this plan is judged by %s: nothing was recorded" % args.evaluator)
         named = args.evaluator
@@ -22755,7 +22776,10 @@ def ci_record_core(ctx, now, quiet=False):
     out.update(head=head, ci=ci)
     if ctx.plan is None or ctx.plan["result"] != "pass":
         return dict(out, status="no-plan", why="no passing plan for the PR (%s)" % (ctx.plan_problem or "run `plan check`"))
-    wanted = [x for x in ctx.plan["scenarios_parsed"] if plan_ledger.claim_of(x) == "pr" and plan_ledger.evaluator_of(x) == "ci"]
+    mine, _, why = plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], (ctx.facts or {}).get("body"))
+    if why:
+        return dict(out, status="no-plan", why="the claim line is refused: " + why)
+    wanted = [x for x in mine if plan_ledger.evaluator_of(x) == "ci"]
     out["scenarios"] = [x["id"] for x in wanted]
     detail = {"head": head, "ci": ci, "scenarios": out["scenarios"], "at": int(now())}
     if not head:

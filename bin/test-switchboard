@@ -16246,7 +16246,7 @@ class TestPlanningSkill(unittest.TestCase):
     def test_it_is_a_short_skill_with_the_frontmatter_the_others_have(self):
         text = self.SKILL.read_text()
         self.assertTrue(text.startswith("---\nname: fleet-planning\ndescription: "))
-        self.assertLessEqual(len(text.split()), 1100, "the skill must be cheap to load")
+        self.assertLessEqual(len(text.split()), 1200, "the skill must be cheap to load")
         for phrase in ("PLAN: <link>", "fleet-switchboard plan check", "plan review", "docs/plan-template.md", "discriminates", "What the reviewers attack"):
             self.assertIn(phrase, text)
         self.assertIn("not built yet", text)  # the review engine is part 2: said plainly
@@ -72223,6 +72223,202 @@ class TestBatchingDocs(unittest.TestCase):
         section = self.section()
         for phrase in ("a force push", "a rebase of a shared branch", "an agent changing a ruleset"):
             self.assertEqual(section.count(phrase), 1, phrase)
+
+
+# #943: a work item reads its parent ask's Done-when, and a pull request's `CLAIMS:` line narrows what its proof gate counts.
+PARENT_RULE = ("A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, "
+               "and a Done-when the work item carries itself must still match exactly.")
+CLAIM_RULE = ("A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, "
+              "the others stay claimed by the epic, and a claim naming an undeclared scenario is refused.")
+WORK_ITEM_PLAN = LEDGER_PLAN.split("```yaml", 1)[0].split("## Intent", 1)[0] + "```yaml" + LEDGER_PLAN.split("```yaml", 1)[1]
+
+
+class TestParentAskDoneWhen(LedgerBase):
+    """#943: the issue numbers are neutral. 30 is a work item, 20 its ask, 10 the charter; 40 is an ask under the charter with no Done-when."""
+
+    ASK_DONE = "(1) an owner can commission an agent; (2) it answers a chat message."
+
+    def setUp(self):
+        super().setUp()
+        self.issues = {
+            10: {"number": 10, "state": "open", "title": "charter", "body": "## Intent\nRun it.\nDone when: (1) charter-only clause.\n", "parent": None},
+            20: {"number": 20, "state": "open", "title": "ask", "body": "## Intent\nCommissioning works.\nDone when: %s\n" % self.ASK_DONE, "parent": 10},
+            30: {"number": 30, "state": "open", "title": "work item", "body": WORK_ITEM_PLAN, "parent": 20},
+            40: {"number": 40, "state": "open", "title": "ask with no Done-when", "body": WORK_ITEM_PLAN, "parent": 10},
+            50: {"number": 50, "state": "open", "title": "work item with its own Done-when", "parent": 20,
+                 "body": "## Intent\nIts own.\nDone when: (1) only one clause here.\n" + WORK_ITEM_PLAN},
+        }
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and "--method" not in argv and "-X" not in argv and argv[1] == "api":
+            found = re.search(r"/issues/(\d+)(/parent|/comments[^ ]*)?$", argv[2])
+            if found and int(found.group(1)) in self.issues:
+                issue = self.issues[int(found.group(1))]
+                if found.group(2) == "/parent":
+                    parent = self.issues.get(issue["parent"])
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(parent), "") if parent else subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
+                if found.group(2):
+                    return subprocess.CompletedProcess(argv, 0, "[]", "")
+                return subprocess.CompletedProcess(argv, 0, json.dumps(dict(issue, updated_at="2026-01-01T00:00:00Z")), "")
+        return super().route(argv, **kwargs)
+
+    def check(self, number):
+        code, out, err = self.run_as("coder", "plan", "check", "acme/app#%d" % number, "--json")
+        return code, (json.loads(out) if out.strip().startswith("{") else {"error": err})
+
+    def assert_the_rule(self):
+        code, result = self.check(30)
+        self.assertEqual((code, result.get("result")), (0, "pass"), result)   # checked against the PARENT ask's two clauses (DW-2 exists only there)
+        code, result = self.check(50)
+        self.assertEqual(code, 1, result)                                    # its own one-clause Done-when decides: DW-2 is not a clause of it
+        self.assertEqual(result["result"], "fail")
+        self.assertTrue(any("DW-2" in str(d) or "covers" in str(d) for d in result["defects"]), result)
+
+    def test_s2_a_work_item_is_checked_against_its_parent_ask_and_one_with_its_own_done_when_against_that(self):
+        self.assert_the_rule()
+
+    def test_a_work_item_that_carries_its_own_done_when_is_not_given_the_parents(self):
+        code, result = self.check(50)
+        self.assertEqual(code, 1)
+        self.assertNotIn("charter-only", json.dumps(result))
+
+    def test_an_ask_with_no_done_when_never_borrows_the_charters(self):
+        code, result = self.check(40)
+        self.assertEqual(code, 1, result)
+        self.assertTrue(any(d.get("code") == "no-done-when" for d in result.get("defects", [])) or "no-done-when" in json.dumps(result), result)
+
+    def test_s5_a_mutant_that_reads_the_done_when_of_the_wrong_issue_fails_the_rule_test(self):
+        def wrong(reader, repo, number):
+            return reader.issue(10, repo).done_when   # the charter, not the parent ask
+        with mock.patch.object(sb, "_parent_ask_done_when", wrong):
+            with self.assertRaises(AssertionError):
+                self.assert_the_rule()
+        with mock.patch.object(sb, "_parent_ask_done_when", lambda reader, repo, number: None):   # a mutant that never reads the parent
+            with self.assertRaises(AssertionError):
+                self.assert_the_rule()
+
+    def test_the_structure_gate_and_prove_take_the_work_items_done_when_from_its_parent(self):
+        self.pr["body"] = "PLAN: acme/app#30\ncanon: updated the docs"
+        code, report, err = self.gates()
+        self.assertIsNotNone(report, err)
+        self.assertEqual(self.row(report, "G0a")["status"], "ok", self.row(report, "G0a"))
+        self.assertEqual(self.prove("coder", "S1")[0], 0)
+
+    def test_the_gate_on_an_issue_with_no_done_anywhere_fails_as_before(self):
+        self.issues[30]["parent"] = None
+        self.pr["body"] = "PLAN: acme/app#30\ncanon: updated the docs"
+        code, report, err = self.gates()
+        self.assertEqual(self.row(report, "G0a")["status"], "missing")
+
+
+class TestPrClaimLine(LedgerBase):
+    """#943: `CLAIMS:` directly under `PLAN:`; the neutral plan is LEDGER_PLAN (per-PR S1, S2 (epic by default: tester measure? no, live: pr), S3, U1; S4 epic)."""
+
+    def setUp(self):
+        super().setUp()
+        self.configure(evaluators={"reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]})
+        self.scenarios = sb.plan_check.parse_scenarios(sb.plan_check.scenario_block(LEDGER_PLAN))
+
+    def body(self, claims):
+        self.pr["body"] = "PLAN: acme/app#7\n%scanon: updated the docs" % ("CLAIMS: %s\n" % claims if claims is not None else "")
+
+    def g1(self):
+        code, report, err = self.gates()
+        self.assertIn(code, (0, 1), err)
+        return self.row(report, "G1")
+
+    def assert_counts_only_the_claim(self):
+        self.body("S1 S3 U1")
+        for sid in ("S1", "S3", "U1"):
+            self.assertEqual(self.prove("coder", sid)[0], 0)
+        for who, sid, ev in (("cibot", "S1", "ci"), ("rev", "S3", "reviewer"), ("cibot", "U1", "ci")):
+            self.assertEqual(self.verdict(who, sid, ev)[0], 0)
+        row = self.g1()
+        self.assertEqual(row["status"], "ok", row)
+        self.assertIn("3 of 3 claimed scenarios proven", row["detail"])
+        self.assertIn("left to the epic's other pull requests by the CLAIMS line: S2", row["detail"])
+        code, _, err = self.prove("coder", "S2")
+        self.assertNotEqual(code, 0)
+        self.assertIn("not on this pull request's `CLAIMS:` line", err)
+
+    def test_s3_the_gate_counts_exactly_the_claimed_scenarios_and_leaves_the_rest_to_the_epic(self):
+        self.assert_counts_only_the_claim()
+
+    def test_s5_a_mutant_that_counts_unclaimed_scenarios_fails_the_claim_test(self):
+        every = lambda scenarios, body: ([s for s in scenarios if sb.plan_ledger.claim_of(s) == "pr"], [], None)
+        with mock.patch.object(sb.plan_ledger, "pr_scenarios", every):
+            with self.assertRaises(AssertionError):
+                self.assert_counts_only_the_claim()
+
+    def test_s8_a_claim_naming_an_undeclared_scenario_or_an_epic_one_is_refused_and_all_declared_count(self):
+        for bad in ("S1 S9", "S4"):
+            with self.subTest(claims=bad):
+                self.body(bad)
+                row = self.g1()
+                self.assertEqual(row["status"], "missing", row)
+                self.assertTrue(any(m.startswith("refused:") for m in row["missing"]), row)
+                code, _, err = self.prove("coder", "S1")
+                self.assertNotEqual(code, 0)
+                self.assertIn("refused", err)
+        self.assertEqual(self.ledger(), [])
+        self.body("S1 S2 S3 U1")
+        ids, error = sb.plan_ledger.pr_claim(self.pr["body"], self.scenarios)
+        self.assertEqual((ids, error), (["S1", "S2", "S3", "U1"], None))
+        self.assertEqual([s["id"] for s in sb.plan_ledger.pr_scenarios(self.scenarios, self.pr["body"])[0]], ["S1", "S2", "S3", "U1"])
+        self.body("")
+        self.assertIn("names no scenario", sb.plan_ledger.pr_claim("PLAN: x\nCLAIMS:\n", self.scenarios)[1])
+
+    def test_s4_a_pull_request_without_a_claim_line_behaves_exactly_as_before(self):
+        baseline = ["S1", "S2", "S3", "U1"]
+        for body in (None, "", "PLAN: acme/app#7", "PLAN: acme/app#7\ncanon: n/a docs", "PLAN: acme/app#7\n\nCLAIMS: S1", "CLAIMS: S1\nPLAN: acme/app#7",
+                     "Notes\nPLAN: acme/app#7 and CLAIMS: S1", "PLAN: acme/app#7\n    CLAIMS", "no plan here\nCLAIMS: S9"):
+            with self.subTest(body=body):
+                claimed, left, error = sb.plan_ledger.pr_scenarios(self.scenarios, body)
+                self.assertEqual(([s["id"] for s in claimed], left, error), (baseline, [], None))
+        self.body(None)
+        for sid in ("S1", "S2", "S3", "U1"):
+            self.assertEqual(self.prove("coder", sid)[0], 0, sid)
+        row = self.g1()
+        self.assertIn("of 4 claimed scenarios", row["detail"])
+        self.assertNotIn("CLAIMS", row["detail"])
+
+    def test_every_reader_of_a_prs_claimed_scenarios_goes_through_pr_scenarios(self):
+        """The family: plan check does not read a claim; G1 (evaluate_gates), prove/verdict (`_scenario_of`, `verdict --all`) and the ci recorder (`ci_record_core`) each call `pr_scenarios`;
+        the item commands have no pull request body and read `slice:` instead."""
+        text = (BIN / "fleet-switchboard").read_text()
+        self.assertEqual(text.count("plan_ledger.pr_scenarios("), 3)
+        self.assertEqual((BIN / "plan_ledger.py").read_text().count("pr_scenarios("), 2)   # its definition and the G1 call
+
+
+class TestPlanRulesWordedAlike(unittest.TestCase):
+    """#943: the template and the planning skill carry both rules in the same words; the finding states its two recorded cases with neutral numbers."""
+
+    def squash(self, path):
+        return " ".join(path.read_text().split())
+
+    def test_s6_both_rules_are_one_identical_sentence_in_the_template_and_the_skill(self):
+        for path in (REPO / "docs" / "plan-template.md", REPO / "skills" / "fleet-planning" / "SKILL.md"):
+            text = self.squash(path)
+            for rule in (PARENT_RULE, CLAIM_RULE):
+                self.assertEqual(text.count(rule), 1, (path.name, rule[:40]))
+
+    def test_the_rules_in_the_code_match_the_words(self):
+        self.assertIn("CLAIMS:", PARENT_RULE + CLAIM_RULE)
+        self.assertIn("`CLAIMS: S3 S4 S5`", CLAIM_RULE)
+
+    def test_s1_the_finding_states_two_recorded_cases_each_with_its_failing_gate_and_reason(self):
+        text = (REPO / "docs" / "plan-template.md").read_text().split("## Why a work item reads its ask, and a pull request can claim", 1)[1]
+        cases = re.findall(r"(?m)^\d\. \*\*Case \d, [^*]*\((G0a|G1)\)\.\*\*", text)
+        self.assertEqual(cases, ["G0a", "G1"])
+        self.assertIn("plan check fails: 1 defect", text)
+        self.assertIn("missing proofs", text)
+        self.assertEqual(sorted(set(re.findall(r"#\d+", text))), ["#123", "#124", "#201", "#202"])
+
+    def test_s9_the_fixtures_name_no_repository_but_the_neutral_one(self):
+        source = (REPO / "bin" / "test-switchboard").read_text()
+        block = source[source.index("class TestParentAskDoneWhen"):source.index("class TestPlanRulesWordedAlike")]
+        for repo in set(re.findall(r"\b[a-z][\w.-]*/[a-z][\w.-]*#\d+", block)):
+            self.assertTrue(repo.startswith("acme/"), repo)
 
 
 if __name__ == "__main__":
