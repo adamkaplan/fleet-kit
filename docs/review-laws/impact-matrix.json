@@ -509,6 +509,7 @@
         "bin/launch_testers.py": "loaded only by the tester launch command, not the clear",
         "bin/merged_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/orders_copy.py": "loaded only by `cmd_orders_copy`, not the clear",
+        "bin/registry.py": "loaded only by the registry readers and writers (`retire`, `reattach`, `known_agent`, the pane pass, the cloud commands), not by the clear",
         "bin/resume_brief.py": "loaded only by `cmd_launch`, not the clear",
         "bin/review_checkout.py": "loaded only by `cmd_review_checkout`, the reviewer checkout command, not the clear",
         "bin/triage_ownerless.py": "loaded only by the triage passes, which the clear does not run",
