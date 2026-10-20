@@ -35,7 +35,7 @@
 	<array>
 		<string>__PYTHON__</string>
 		<string>-B</string>
-		<string>__PREFIX__/cloud/launcher/cloud-worker</string>
+		<string>__PREFIX__/cloud/launcher/cloud_worker.py</string>
 		<string>reap</string>
 		<string>--loop</string>
 		<string>__REAP_SECONDS__</string>

@@ -41541,7 +41541,7 @@ class TestServiceTemplates(Base):
 # Every field of the reaper's two templates: field -> what it must hold. A field added to a template needs a row.
 REAPER_PLIST_FIELDS = {
     "Label": lambda v, ctx: v == "com.fleet-kit.cloud-reaper",
-    "ProgramArguments": lambda v, ctx: v[1:3] == ["-B", str(REPO / "cloud/launcher/cloud-worker")] and v[3:] == ["reap", "--loop", str(sb.REAPER_INTERVAL_SECONDS)],
+    "ProgramArguments": lambda v, ctx: v[1:3] == ["-B", str(REPO / "cloud/launcher/cloud_worker.py")] and v[3:] == ["reap", "--loop", str(sb.REAPER_INTERVAL_SECONDS)],
     "EnvironmentVariables": lambda v, ctx: v["HOME"] == str(Path.home()) and "/usr/bin" in v["PATH"].split(":"),
     "RunAtLoad": lambda v, ctx: v is True,
     "KeepAlive": lambda v, ctx: v is True,
@@ -41554,7 +41554,7 @@ REAPER_PLIST_FIELDS = {
 REAPER_UNIT_FIELDS = {
     ("Unit", "Description"): lambda v: "reaper" in v,
     ("Service", "Type"): lambda v: v == "simple",
-    ("Service", "ExecStart"): lambda v: v.endswith("cloud/launcher/cloud-worker\" reap --loop %d" % sb.REAPER_INTERVAL_SECONDS),
+    ("Service", "ExecStart"): lambda v: v.endswith("cloud/launcher/cloud_worker.py\" reap --loop %d" % sb.REAPER_INTERVAL_SECONDS),
     ("Service", "WorkingDirectory"): lambda v: v == str(Path.home()),
     ("Service", "Environment"): lambda v: "=" in v,
     ("Service", "Restart"): lambda v: v == "always",
@@ -41813,6 +41813,54 @@ class WrittenFilesAreGuarded:
             self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
         self.assertNotEqual(os.stat(str(self.reaper_path())).st_ino, inode)
         self.assertEqual([p.name for p in self.reaper_path().parent.iterdir() if p.name.startswith(".")], [])   # no temp file left
+
+
+class TestTheReapersCommandPathIsWalked(InstallCase):
+    """The service runs one file: the launcher's own walk (one copy, in cloud_worker.py) judges it and every parent above it."""
+
+    def kit(self):
+        root = Path(os.path.realpath(str(self.home))) / "kit"
+        shutil.copytree(REPO / "cloud" / "launcher", root / "cloud" / "launcher", ignore=shutil.ignore_patterns("tests", "__pycache__"), symlinks=True)
+        shutil.copytree(REPO / "templates", root / "templates")
+        for path in [root] + [p for p in root.rglob("*")]:
+            os.chmod(str(path), 0o755 if path.is_dir() or os.access(str(path), os.X_OK) else 0o644)
+        return root
+
+    def problem(self, root):
+        installer = sb.Installer(self.machine, self.daemons, time.time, "darwin", root, dry_run=True, out=io.StringIO(),
+                                 shared_profile=False, profile=None, gh_user=None)
+        return installer.reaper_command_problem()
+
+    def test_a_clean_copy_passes_and_each_bad_state_is_named(self):
+        root = self.kit()
+        self.assertIsNone(self.problem(root))
+        script = root / "cloud" / "launcher" / "cloud_worker.py"
+        rows = {
+            "the file is group-writable": (lambda: os.chmod(str(script), 0o664), lambda: os.chmod(str(script), 0o644), "group- or world-writable"),
+            "the launcher directory is group-writable": (lambda: os.chmod(str(script.parent), 0o775), lambda: os.chmod(str(script.parent), 0o755), "parent that is group- or world-writable"),
+            "the kit root is group-writable": (lambda: os.chmod(str(root), 0o775), lambda: os.chmod(str(root), 0o755), "parent that is group- or world-writable"),
+        }
+        for name, (make, undo, reason) in rows.items():
+            with self.subTest(row=name):
+                make()
+                self.assertIn(reason, self.problem(root) or "")
+                undo()
+        self.assertIsNone(self.problem(root))
+
+    def test_a_symlinked_file_or_parent_is_named(self):
+        root = self.kit()
+        script = root / "cloud" / "launcher" / "cloud_worker.py"
+        real = root / "elsewhere.py"
+        script.rename(real)
+        os.symlink(str(real), str(script))
+        self.assertIn("symlink", self.problem(root) or "")
+
+    def test_the_install_refuses_before_writing_when_the_path_is_bad(self):
+        with mock.patch.object(sb.Installer, "reaper_command_problem", return_value="has a parent that is group- or world-writable"):
+            out, error = self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.assertIn("cloud_worker.py", error)
+        self.assertFalse((self.home / "Library" / "LaunchAgents" / "com.fleet-kit.cloud-reaper.plist").exists())
+        self.assertFalse([c for c in self.machine.calls if "cloud-reaper" in " ".join(c) and c[1] == "bootstrap"])
 
 
 class TestCloudReaperInstallOnMacOS(CloudReaperInstall, WrittenFilesAreGuarded, InstallCase):

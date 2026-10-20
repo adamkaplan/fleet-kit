@@ -23,7 +23,7 @@ Description=Fleet Kit cloud worker reaper (stops idle and overdue cloud workers)
 
 [Service]
 Type=simple
-ExecStart="__PYTHON__" -B "__PREFIX__/cloud/launcher/cloud-worker" reap --loop __REAP_SECONDS__
+ExecStart="__PYTHON__" -B "__PREFIX__/cloud/launcher/cloud_worker.py" reap --loop __REAP_SECONDS__
 WorkingDirectory=__HOME__
 Environment="HOME=__HOME__"
 Environment="PATH=__PATH__"
