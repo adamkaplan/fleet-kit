@@ -293,7 +293,21 @@
     "note": "top_tier_outside_floor lists the top tier paths that are deliberately not in the floor globs (the floor excludes agent definitions, which are captain pull requests); a test checks that every other top tier path is inside the floor. bin/fleet-switchboard selects accounts and mints tokens but is not a top tier path (it would hold nearly every change): a change there to credentials or identity must be rated with that class by the independent review.",
     "delegated_clear": {
       "meaning": "What the Chief of Staff's clear under the owner's standing order may NEVER lift (bin/delegated_clear.py reads this block and holds no path, class or function name of its own): a pull request whose top tier path hits include a class of `never_path_classes`; whose independent review's class is one of `top_tier_review_classes` (or none is recorded); that changes ANY file matching `clear_code_paths` (the clear and hold machinery by name, and the directories the daemon and the CLI load at start); that ADDS, DELETES or RENAMES a file matching `new_file_globs` (a new file under bin/ is loaded at config load); or that changes a file of `closure_files` (the daemon file and the bin modules the clear loads or runs (the daemon's imports at load, the config readers every module declares, and a recorded run of the clear: a test derives the list); for a module other than the daemon file ANY import-time statement, and the functions of `module_roots`) on a line that belongs to the CLEAR CLOSURE: the definitions reachable by name from `closure_roots`, the module-level bindings they read, any other top-level statement, or a definition that refers to a `clear_entry_points` name. Other changes under bin/ (an authority module edit that does not change who may do what) are allowed.",
-      "never_path_classes": [
+      "score": {
+      "meaning": "The score rule (#835), used for an order that sets max_level: the score is the highest LEVEL of the matrix's cells for the independent impact reviewer's records at the pull request's exact head, on the ladder below. A changed path of a top tier class (the rule ids below name the classes) makes `floor.lowest_level` the lowest score allowed: a rating below it on such a path is refused, and the rating's reason must name the rule id. Only a level of `delegable_levels` may be cleared: High is always the owner's. Only a record whose recorded role is in `rating_roles` counts. The clear code holds no level, rule id or role of its own.",
+      "ladder": ["Low", "Medium", "Serious", "High"],
+      "delegable_levels": ["Low", "Medium", "Serious"],
+      "rating_roles": ["reviewer"],
+      "floor": {
+        "lowest_level": "Serious",
+        "rules": {
+          "floor-credentials": "credentials",
+          "floor-identity": "identity",
+          "floor-authority": "authority"
+        }
+      }
+    },
+    "never_path_classes": [
         "credentials",
         "identity"
       ],
@@ -394,6 +408,20 @@
           "validate"
         ]
       },
+      "dynamic_actions": [
+        "review"
+      ],
+      "rating_roots": [
+        "add_review_parsers",
+        "build_parser",
+        "call_command",
+        "cmd_review",
+        "command_registrars",
+        "dispatch",
+        "main",
+        "resolve_command",
+        "parse_review_block"
+      ],
       "closure_roots": [
         "CLEAR_NOTICE_BACKOFF",
         "CLEAR_NOTICE_CLAIM_SECONDS",
@@ -407,6 +435,7 @@
         "CLEAR_PENDING_MAX",
         "CLEAR_REMINDED_FILE",
         "ConfigError",
+        "CosOrdersError",
         "DEFAULTS",
         "EXIT_ERROR",
         "EXIT_OK",
@@ -423,6 +452,7 @@
         "Path",
         "_PLAN_ISSUE_RE",
         "_PLAN_REF_SHORT",
+        "_audit_tail",
         "_finite",
         "_gh_write",
         "_intent_reader",
@@ -436,16 +466,20 @@
         "build_engine",
         "change_issue_labels",
         "checked_plan",
+        "cos_orders_text_of",
         "ensure_labels",
+        "ensure_state_dir",
         "fetch_orders",
         "gates_caller_kind",
         "impact_carry_get",
         "impact_floor",
+        "impact_rating_entries",
         "impact_records",
         "impact_review_record",
         "impact_state_lock",
         "json",
         "label_names",
+        "load_config",
         "load_module",
         "notice_senders",
         "os",
@@ -454,6 +488,7 @@
         "pr_floor_report",
         "pr_marker",
         "re",
+        "read_cos_orders",
         "read_open_items",
         "read_pr_json",
         "read_pr_notices",

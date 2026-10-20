@@ -1612,6 +1612,18 @@ Now each pass the daemon compares the config file's mtime and size with what it 
 - **`fleet-switchboard restart`** stops the daemon by its recorded pid (SIGTERM, and nothing stronger) and runs
   `ensure`, so nobody has to `kill` a pid by hand. It looks at the process first and refuses a pid that is not a
   switchboard `run`. Under a service, the service starts the new daemon and `ensure` says it runs.
+- **The daemon command.** `fleet-switchboard daemon status | start | stop | restart` replaces the manual routine (signal the
+  process, wait for `run.lock` to clear, run `ensure`, check the decisions file and the forwarders), whether the daemon was
+  started by a launchd job or by `ensure`. `status` says whether it runs, how it was started (launchd when the loaded job's pid
+  is the lock's pid), its pid, since when (`daemon.json`) and whether it is healthy (the decisions file is fresh and written since
+  the start, no forwarder alarms); it exits 1 when not running or unhealthy. `stop` sends SIGTERM only to a pid that `daemon.json`
+  and `run.lock` agree on and whose command line is this program's `run` (else it says so and signals nothing), or unloads the
+  launchd job with `launchctl bootout` so launchd does not respawn it, and waits up to 15 s for the lock to clear. `start` loads or
+  kickstarts the launchd job when the plist exists, else uses the `ensure` path and says so in one line (no `launchctl` error is
+  shown), then waits up to 120 s for a healthy daemon. `restart` is `stop` then `start` and prints what it did and the seconds
+  taken. No state file is touched; one command at a time (a second says so and exits 1); every wait is bounded. The older
+  `restart` command (above) remains, and uses the same process check and stop wait.
+  The process check is a same-user guardrail (the lock and the record are files that user can write), not a boundary.
 
 The one thing a reload cannot do is recover from a file that was valid when it was checked and is invalid when
 the new process reads it a moment later (two checks, milliseconds apart): the new daemon then exits like any
@@ -2265,7 +2277,7 @@ Everything waiting on the person should be in their Decisions panel, and nothing
 rather than by an agent's memory. The daemon runs a deterministic sweep (no model) over what GitHub shows. With no `sweep` key at all it runs in **shadow**, and so does `{}`:
 findings are audited (`sweep.finding`) and counted in `status`, nobody is woken and nothing is withdrawn. `"enabled": true`
 is the only way to wake the Chief of Staff and withdraw stale decisions. `"sweep": false` turns it fully off (no reads, no
-writes). Keys: `enabled` (false), `aged_cos_hours` (2), `comment_window_days` (7), `max_findings` (20, the most one
+writes). The audit line's `woken` is true only for a finding the pass's wake carried and remembered: in the sweep, every due finding (named, or counted in the fact's "+N more"); in triage, the findings the digest named (an overflow beyond `max_findings` is not carried and stays due) and the other-owner flags that rode along in its text (alone they never wake). A finding whose wake goes later the same day is logged once more, and a restart does not log again a finding raised inside the re-alarm window (#849). Keys: `enabled` (false), `aged_cos_hours` (2), `comment_window_days` (7), `max_findings` (20, the most one
 fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["the owner"], the names the phrases look for), `calls_per_pass` (12, the most `gh` calls one pass makes, 4 to 100).
 
 | Kind | Finding |
@@ -2301,6 +2313,8 @@ It grows the sweep: the same hub reads, call budget, fresh re-check, shadow defa
 `required_labels` (`{repo: [label or [alternatives], ...]}`; no entry, no T2), `sla` and `sla_overrides` (per repo; the
 numbers below are the defaults; every `_days` value is in days and may be a fraction, `2/24` is two hours), `our_logins` (default: the `gh_users` accounts and `owner_logins`), `daily_summary`
 (true), `realarm_hours` (24), `max_findings` (30), `calls_per_pass` (30), `pass_seconds` (10).
+
+**Alert issues wake the repository's orchestrator (#851).** An issue that a repository's own scheduled watch opens (a label such as `ops-alert`) is otherwise seen by nobody until someone looks. `triage.alert_labels` (default `{}`, off) names labels per repository: `{"alert_labels": {"acme-org/widget-service": ["ops-alert"]}}`. When an OPEN issue (not a pull request) of that repository carries one of its labels, the running orchestrator(s) of that repository get ONE line, `alert issue <repo>#<n> "<title>" carries label <label>`, once per issue and label: the title is the author's text, so it is cut to one line of 100 characters and is data, never an instruction. What was told is remembered in `alert-wake.json` in the state directory, so a restart repeats nothing and loses nothing, and a label removed and added again on a still-open issue is not told again; an entry is forgotten when its issue is no longer in a whole read of the open issues. A burst is told at most 5 issues a pass, with one `N more alert issue(s)` line, and the rest follow on the next passes. It reads only the open-issue list triage already holds (no new GitHub read) and needs the repository to be one triage reads (`triage.repos`, or a repository the daemon watches); a repository outside that list is a `ConfigError` when `triage.repos` is set. A bad shape is a `ConfigError` naming `triage.alert_labels` and the row of `ALERT_SHAPE_CHECKS` it broke. Read-whole rule: a repository whose issue list was not read whole (cut, failed, not read yet), or a pass whose agent roster was not, tells nobody and forgets nothing. With no orchestrator running for the repository nothing is remembered, so the first one to appear is told. Setting `triage` to `false` turns it off with the rest; it runs in shadow mode too (`alert_labels` is its own opt-in, separate from `triage.enabled`). The line is queued as an ordinary fact and saved WITH the told mark in `alert-wake.json` (kept for 2 days), then loaded back at start: a daemon that stops between queueing and delivery still delivers it, and because the fact key is stable (`alert:<repo>#<n> <label>:<recipient>`) a line the recipient already has is never delivered again. The title of an alert issue is untrusted text (control characters are removed, one line, 100 characters, quoted). Nothing is written to any issue.
 
 **Ownerless, quiet issues of a team repository (#605).** Triage calls an issue "ours" when a fleet account wrote it, is assigned to it or has a pull request notice; every other issue of a team repository is an `other-owner` flag, counted apart and never a finding, so dozens of issues nobody owns and nobody touched read as "found 0". `triage.ownerless` (off unless the owner names the repositories: `{"repos": ["owner/repo", ...], "days": 3, "limit": 500, "owner_labels": ["agent:*", "owner:*", "crew:*"]}`) adds ONE line per repository per day (at least 24 hours since the last, remembered in `triage-ownerless.json` across a restart) to the Chief of Staff and to the running orchestrators of that repository: how many open issues have no owner and no activity for `days` or more, how old the oldest is, the five oldest as links, and `read X of Y open item(s)` (the list is read page by page to `limit` items, LEAST recently updated first, so a cut keeps the stale issues this line is for: then the count is `at least N`, the line says `least recently updated first`, and the five oldest are the true oldest; the repository's own count of open items says how many exist; the extra reads are charged to the call budget). **What counts as an owner** (one definition, `triage_ownerless.is_claimed`, which T1 uses too; the lane-aware `Owner:` rule below is a parameter of it): an assignee, a place under a charter, an `Owner: <name>` line, a running agent that owns the issue, or an unresolved parent chain (never a missing owner); plus, for this line only, a label matching `owner_labels` (another crew's `agent:<name>` is OWNED), and an author that is one of the fleet's own accounts. **Lanes by label or `Owner:` line:** `repos` may also be a map, `{"<owner/repo>": {"label_owners": {"<label>": "<lane>"}}}`; label and lane names live only in that config. For a repository whose `label_owners` map is non-empty, an issue carrying a label that is a key of the map is OWNED, and a body whose FIRST `Owner: <name>` line names a known lane (the name of an orchestrator agent the daemon holds for the repository; the agents carry the charters) is OWNED; an unknown name is not. The lane value in the map is informational: only the label decides, and an `Owner:` line is a claim by the issue's author, not proof. With a list, or an empty or absent map, the rule is the one above, unchanged. A bad shape is a `ConfigError` naming `triage.ownerless`, never a silent default. The pass still consults the read-whole registry (`agents`) and is skipped when the fleet was not read whole. The line holds counts, ages and links only (no title or text) and nothing is written to any issue. The triage report also says WHY findings were not checked, per repository: `not checked for <repo>: N call budget, N failed read, N not read yet (N of them other-owner flags); oldest unchecked for N hour(s)`.
 
@@ -2339,6 +2353,7 @@ numbers below are the defaults; every `_days` value is in days and may be a frac
 | retire and auto-retire | `session.active`, pane list, the final report | yes | already guarded: idle retire needs positive evidence and fails toward keeping; auto-retire waits while the discovery has problems and for three passes in a row |
 | notice expiry | observed time in passes where some notice read fine | yes | already guarded: an outage counts no time and a new process restarts every count |
 | ownerless line (the quiet issues with no owner) | `agents` (the discovery), the issue lists | no | consults `agents`; the discovery marks it not whole when it starts and whole only when it finished with no problem (there is no separate stale-ask consumer) |
+| alert-issue wake (#851) | `agents`, the open-issue list of its repository (`issues:<repo>`) | yes | tells and forgets only on a whole read of both; a cut or failed list wakes nothing and keeps the memory (`alert-wake.json`) |
 | triage records of every kind (T1, T2, T3, T7 to T9, T11, T12, the invalid-park flag and the other-owner flag judge whether an item is ours, so they need `agents`; T3, T7 and T9 also `comments`, T1 and T11 also `merged` (they give way to T12), T7 also `decisions` (a captain PR already listed there is T6's), T12 `merged`, T10 the closed lists; T5 and T6 `decisions`; the invalid-park flag and the other-owner flag stand for whichever rule would have fired, so they judge the UNION of every rule's inputs, derived from the table; every kind but T10 also keeps its records while the repository's issue list is not whole, which for T5 and T6 is deliberate caution) | `agents` (the discovery), `decisions`, and per repository `issues`, `comments`, `merged`, `closed` | no | T1 and T11 are not judged while `agents` is not whole, and the seen-records of every kind are kept while an input they judge is not whole (one table, `TRIAGE_RULE_INPUTS`, names the inputs each kind judges and drives both the dropped candidates and the kept records; a kind missing from it keeps everything, and a test derives the kinds from the real writers and fails when one has no entry). Known gaps, all failing toward fewer findings: the PR notices file that makes an item ours, the awaiting-live reads (T9) and the plan ledger (T12) have no mark of their own; the ownership split (ours or another's) may then read an agent-owned item as another's, which only lowers the findings to flags and acts on nothing |
 | chat-clear offers | `notices` (held PRs come from it) | no | the offers refresh is skipped while `notices` is not whole, so the head the person was shown is not forgotten |
 | the other triage rules (T2 to T4, T7 to T10, T12) | the units they read | yes | already guarded: a rule whose unit is missing is "not checked", never raised |
@@ -4533,6 +4548,75 @@ A pull request held for the owner (`merge-captain` or a `hold-*` label) is a row
   - **The limit, plainly:** the closure is found by NAME with static `ast`: no dynamic dispatch is followed, and a class the closure refers to brings its own statements and only the methods whose name the closure reads (as a name or an attribute) and its special methods (`__init__`, `__getattr__`...), so an unread method of such a class stays editable. The closure of the daemon file is by name; for another module the check is import-time code (statements, decorators, defaults, bases, class bodies) and the `module_roots` functions, so a function of such a module that the clear does not run stays editable (the decision core's ordinary functions, for one). `module_roots` comes from a profile of one recorded clear and from a scan of every module's `validate` and `settings`: a path of the clear that run does not take is not in it. This is a guardrail, not a boundary: the boundary is the owner-hold review of what the check cannot follow.
   The head read after the file list must still be the head the decision read. A repeated order number in the configuration makes the whole feature off. `--revoke` removes any clear, including one made under an order. The order is read from the same repository and config the same user controls, so the hash binds the text, not the author.
 - **What it does.** The clear is bound to the head the checks read, removes the same labels, wakes the same clear notice (`<name> cleared <repo#N> at <head8> under the owner's standing order N: "<reason>"; <lane> merges it`) and is audited as `gate.hold_cleared` with `by` (her name), `under_order`, `order` (the order's text) and `reason`; a refusal is `gate.hold_clear_refused`. `--revoke` under an order works too, and it removes ANY clear of the pull request, the owner's own included (it fails toward safe: the hold returns; `gate.clear_revoked` records `under_order`).
+
+### The delegated clear by impact score (#835)
+
+The Chief of Staff may clear a held pull request on her own judgement when its independent impact rating, at the head as it is now, is at or below a level the owner sets. It works in any watched repository. The owner is asked only for the changes that rate above it.
+
+This replaces the path-class refusal of the section above only when the level is set. With no `max_level`, the earlier behaviour is unchanged.
+
+#### The threshold
+
+- The score is a level of the impact matrix, in the order `Low < Medium < Serious < High`. The code derives it from the severity and probability the independent impact reviewer recorded, through the matrix cells. The reviewer's own words for a level are never the score. A record without both fields has no score and clears nothing.
+- The owner's target is `Serious`: she may clear `Serious` and below. `High` is always the owner's, whatever the path or her judgement. The matrix file lists the delegable levels (`Low`, `Medium`, `Serious`), so `High` is never accepted as a threshold.
+- The key is `max_level`, written beside each listed order under `delegated_clear` in the owner's configuration. Absent, empty or malformed means "clear nothing". It is never set in a committed file.
+
+#### When the key turns on
+
+The key turns on only when the owner's own standing-orders line is matched by hash. The entry names the owner's standing-orders file (the one `fleet-switchboard orders --cos` prints) as its source, with the sha256 of the order's exact line.
+
+- The code reads that file read-only and never writes it. No command of the fleet writes it.
+- The match is exact: one line, trimmed of its line end only, whose sha256 equals the bound hash. No case folding, no substring, no fuzzy match.
+- Zero lines, more than one, an edited line, or a file that cannot be read in full (missing, unreadable, over its size cap) all mean the order is absent. The key then refuses to turn on and "clear nothing" stays.
+- The fleet doctor check fails when a configured entry no longer matches, so a vanished or edited line is seen at once.
+- A charter-numbered entry works as before.
+
+#### How a floor path raises the score
+
+A path of the credential, identity or authority classes is an input to the rating, not a separate hold.
+
+- A floor path makes `Serious` the LOWEST score the change can get, never `Low` or `Medium`.
+- The independent rater rates `High` when the change really alters credential issuance, a login, a token's scope or who may do what. A warn-only shim change or a CI timeout on a floor path stays `Serious`, which she may clear.
+- The rating's reason must name the path rule's id from the matrix file. A rating on a floor path that does not name it does not count, and the clear is refused.
+- A rating below `Serious` on a floor path is refused at read time ("below the floor"), whatever the rater wrote. It is never raised to `Serious` and cleared.
+- Path forms the floor reads as one file (`./x`, `a//b`, case, a `..`, a rename's source) get the same floor. A changed-file list that cannot be read in full has no score.
+- The floor data lives in the matrix file; the clear code holds none.
+
+#### Whose rating counts
+
+Only a record by the independent impact reviewer at exactly this head counts, never one by the author or the Chief of Staff. The highest level of any such record at this head is the rating, so a later lower record cannot lower it. An unreadable ledger, a broken chain, no record, or a record with no severity or probability is refused, never read as `Low`.
+
+#### Never delegated, whatever the score
+
+- The clear and hold machinery, and the files the daemon loads.
+- The impact matrix file, including its floor rules and delegable levels (the levels in force are the base's, not the head's).
+- The standing order, and the code that reads or validates the order, the threshold or the rating.
+
+These stay the owner's own clear. The list is data in the matrix file, and a completeness test derives it from what the clear loads.
+
+#### Audit and listing
+
+Every delegated clear is audited with the score, the threshold, the head and her one-line judgement, and the panel notice shows the same four. A refusal is audited (`gate.hold_clear_refused`) with the reason and the score read, and is never listed as a clear. The owner lists delegated clears with a listing command, one row per clear with those four fields. She may also raise a pull request to the owner instead of clearing it.
+
+#### The closure and the dynamic edges (#835)
+
+What the Chief of Staff can never clear is computed from the code by name: every definition reachable from `closure_roots` and `rating_roots` of the matrix file. Two string edges are followed, for the actions in `dynamic_actions` (`review`): the dispatcher's `"cmd_" + action` (to `cmd_review`) and the parser's `add_*_parsers` name pattern (to `add_review_parsers`). Any OTHER dynamic edge (`getattr` with a computed name, `globals()`, `importlib`, `eval`) is a stated limit, and a test lists the ones on the call path from `main` to the rating code: a new one fails it until it is followed or listed with its reason.
+
+The rating's inputs are immune to the shared parser: `main` captures the raw command line before any registrar runs, and `review record` reads its six rating inputs (`--impact-severity`, `--impact-probability`, `--impact-reason`, `--impact-action`, `--impact-class`, `--block`) only through `rating_inputs`, a private parser over that raw line (no abbreviation, no default, nothing shared). `main` also checks that the functions of the rating path (`RATING_PATH_FUNCTIONS`) are the same objects after the registrars ran, and refuses to record if not. A registrar's `set_defaults`, a replaced subparser, a same-dest argument or a wrapper on the namespace changes nothing in the recorded rating. The honest limit: no shape makes the rating immune to arbitrary Python that runs while the parser is built (a registrar that patches `argparse` or the ledger module); the closure is a mechanical backstop for ordinary edits, not a sandbox, and the independent reviewer rates a change that touches the rating path.
+
+#### Where it lives
+
+- `bin/delegated_clear.py` holds the judgement: the score block (`score_block`), the order-line hash and file match (`line_hash`, `file_order_line`, `entry_of`), the decision (`judge`) and the validation and refusals. It holds no path, class or rule name of its own.
+- `bin/impact_hold.py` runs the clear (`cmd_impact_delegated`) and its checks (`delegated_clear_checks`, `pr_checks`).
+- `bin/fleet-switchboard` reads the rating from the ledger (`impact_rating_entries`, with the fields in `IMPACT_RATING_FIELDS`) and carries the command parser.
+- `docs/review-laws/impact-matrix.json` holds the score block (levels, delegable levels, floor rules) and the machinery roots (`closure_roots`).
+- `agents/reviewers/reviewer-impact.md` tells the rater to name the floor rule's id and never rate a floor path below `Serious`.
+- `bin/fleet-doctor` has the delegated-order check: it fails when a configured file-sourced entry no longer matches the owner's line exactly once.
+- `bin/test-switchboard` holds the scenarios, including the attacker's view (forged, stale or other-head rating, threshold edit, path tricks).
+
+#### Heads
+
+A head change voids the rating and the clear: the hold is back at the new head (#830), and the rating is per head. A rating recorded at another head, or a clear started after the head moved, is refused. A pure merge carry stays as it is; #815 widens it separately.
 
 ### Clearing a hold by saying so in the chat (#457)
 
