@@ -63042,10 +63042,10 @@ class TestJanitorLiveKeeps(Base):
     def test_s7_a_retired_list_that_cannot_be_read_keeps_everything(self):
         entry = self.old("retired-doubt", directory=True)
         (self.world.state / sb.PANE_HEALTH_FILE).write_text(json.dumps({"agents": {}, "states": {}, "missing": {}}))
-        (self.world.state / sb.RETIRED_FILE).write_text("[1, 2")
+        (self.world.state / "registry.json").write_text("[1, 2")   # the registry is the one source of retirements (#929); retired.json is derived and never read
         out = self.apply()
         self.assertTrue(entry.exists())
-        self.assertIn("retired.json cannot be read", out)
+        self.assertIn("cannot read the agent registry", out)
 
     def test_u1_an_entry_nothing_owns_uses_or_touched_is_removed_as_before(self):
         gone = [self.old("old-%d.log" % n) for n in range(2)] + [self.old("old-dir", directory=True)]
@@ -75597,6 +75597,8 @@ OLD_SOURCE_ALLOWED = {
     ("bin/fleet-switchboard", "cmd_retire", "read_pane_health"): "2026-12-20, last slice of #903 (slice 2 owns it): retire prunes the derived pane record it rewrites",
     ("bin/fleet-switchboard", "pane_health_pass", "pane-health.json"): "2026-12-20, last slice of #903 (slice 2 owns it): the pane pass writes the derived file",
     ("bin/fleet-switchboard", "pane_health_pass", "read_pane_health"): "2026-12-20, last slice of #903 (slice 2 owns it): the pane pass reads the pane states it wrote (derived)",
+    ("bin/fleet-switchboard", "janitor_agent_roots", "PANE_HEALTH_FILE"): "2026-12-20, last slice of #903 (the temp janitor, #936, owns it): it reads the live agents' working directories from the derived pane record",
+    ("bin/fleet-switchboard", "janitor_agent_roots", "RETIRED_FILE"): "2026-12-20, last slice of #903 (the temp janitor, #936, owns it): only the name in its unreadable-record message, the read itself is read_retired_strict (the registry's)",
 }
 # Live observers: the call sites that ask herdr which panes exist right now (`"agent", "list"`), keyed by (file, function), each a NAMED entry with its reason,
 # never a silent skip. fleet-heartbeat is DATED (the Chief of Staff's choice: remove by 2026-11-03); the other two are the live source the registry is fed from.
@@ -75848,6 +75850,7 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
         "launched_testers_for": ("test_a_retired_tester_stops_counting_and_is_not_listed", "verdict"),
         "item_agents": ("test_item_agents_fails_closed_on_a_half_read_registry", "item_agents"),
         "known_session": ("test_known_session_and_watch_follow_the_registrys_retired_record", "known_session"),
+        "janitor_agent_roots": ("test_s1_an_entry_a_live_or_recently_retired_agent_owns_is_kept", "janitor_agent_roots"),
         "cmd_retire": ("test_retire_frees_the_name_of_a_headless_worker_and_undo_restores_the_record_unless_the_name_was_taken", "undo"),
     }
 
