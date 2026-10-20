@@ -8597,13 +8597,18 @@ def _guard_last_report(w):
     return []
 
 
+def _label_names(labels):
+    return {(l.get("name") if isinstance(l, dict) else l) for l in (labels or [])}
+
+
 def _guard_awaiting_issue(w):
-    return ["an awaiting label on the issue"] if w.issue_labels & w.awaiting else []
+    return ["an awaiting label on the issue" if r["number"] == w.issue else "an awaiting label on #%d" % r["number"]
+            for r in w.issues if _label_names(r.get("labels")) & w.awaiting]
 
 
 def _guard_awaiting_pr(w):
     return ["an awaiting label on pull request #%d" % r["number"] for r in w.mine
-            if {(l.get("name") if isinstance(l, dict) else l) for l in (r.get("labels") or [])} & w.awaiting]
+            if _label_names(r.get("labels")) & w.awaiting]
 
 
 def _guard_ci(w):
@@ -8640,7 +8645,7 @@ def _guard_reminder(w):
     except ReminderError:
         raise _Unread() from None   # an unreadable file, or a reminder with no readable time (read_reminders refuses it): fails toward saying nothing
     for reminder in reminders:
-        if (reminder.get("to") == w.observation.name and reminder.get("issue") == w.issue and reminder["at"] > w.now
+        if (reminder.get("to") == w.observation.name and reminder.get("issue") in w.numbers and reminder["at"] > w.now
                 and "while_running" not in (reminder.get("condition") or {})):   # the checkpoint `launch` sets is the boss's, not the worker waiting
             return ["it set a reminder for later"]
     return []
@@ -8650,7 +8655,7 @@ def _guard_decision(w):
     body = read_decisions_file(w.engine.state_dir / DECISIONS_FILE)
     if body is None:
         raise _Unread()
-    refs = {(w.key, w.issue)} | {(w.key, r["number"]) for r in w.mine}
+    refs = {(w.key, n) for n in w.numbers} | {(w.key, r["number"]) for r in w.mine}
     for d in body["decisions"]:
         if not isinstance(d, dict):
             continue
@@ -8658,6 +8663,75 @@ def _guard_decision(w):
         if d.get("tier", "human") == "human" and ref and (plan_ledger.normal_repo(ref[0]), ref[1]) in refs:
             return ["a decision waits on the owner"]
     return []
+
+
+def _owned_issue(ctx):
+    return [r for r in ctx.records if isinstance(r, dict) and r.get("number") == ctx.issue and "pull_request" not in r][:1]
+
+
+def _owned_work_items(ctx):
+    """The issues below the assignment through the parent links of the issue list: a visited set and a depth bound make a cycle end the walk."""
+    plain = [r for r in ctx.records if isinstance(r, dict) and isinstance(r.get("number"), int) and "pull_request" not in r]
+    found, seen, frontier = [], {ctx.issue}, {ctx.issue}
+    for _ in range(OWNED_DEPTH):
+        nxt = set()
+        for r in plain:
+            parent, url = parent_of(r), r.get("parent_issue_url")
+            if r["number"] in seen or parent not in frontier or (isinstance(url, str) and not re.search(r"/repos/%s/issues/" % re.escape(ctx.key), url, re.I)):
+                continue   # another repository's parent is not this assignment's
+            found.append(r)
+            seen.add(r["number"])
+            nxt.add(r["number"])
+        frontier = nxt
+        if not frontier:
+            break
+    return found
+
+
+def _owned_pulls(ctx):
+    return [r for r in ctx.pulls if isinstance(r, dict) and isinstance(r.get("number"), int) and any(
+        isinstance(ref, list) and ref[1] in ctx.numbers and plan_ledger.normal_repo(ref[0] or ctx.repo) == ctx.key for ref in pr_body_refs(r.get("body")))]
+
+
+OWNED_DEPTH = 8   # parent links followed below the assignment (the same bound as TRIAGE_ANCESTOR_DEPTH)
+# #874: THE table of what a worker owns: kind -> (where the daemon already holds it, the builder). `worker_owned` LOOPS OVER it in this order (a
+# later kind may read the numbers of the earlier ones), so a kind cannot exist in code and not here; the tests are parametrised over it.
+OWNED_KINDS = {
+    "issue": ("the assignment's issue, from the triage issue list", _owned_issue),
+    "work item": ("its sub-issues at any depth (bounded, cycle-safe), from the same list's parent links", _owned_work_items),
+    "pull request": ("every open pull request whose strict references (pr_body_refs) name the assignment or a work item, any base branch, from the open-pull-request list", _owned_pulls),
+}
+
+
+def worker_owned(records, pulls, issue, repo):
+    """#874: THE one function that says what a worker owns, from lists the daemon already holds (no read): `issues` (the assignment first, then its
+    work items), `pulls` (every open pull request naming any of them through a strict reference, whatever its base branch) and `numbers`. None when
+    the assignment is not in the list (not judged). The caller has already checked that the lists were read whole."""
+    ctx = types.SimpleNamespace(records=records, pulls=pulls, issue=issue, repo=repo, key=plan_ledger.normal_repo(repo), numbers=set())
+    found = {}
+    for kind, (_, build) in OWNED_KINDS.items():
+        found[kind] = build(ctx)
+        if kind != "pull request":
+            ctx.numbers |= {r["number"] for r in found[kind]}
+        if kind == "issue" and not found[kind]:
+            return None
+    return types.SimpleNamespace(issues=found["issue"] + found["work item"], numbers=ctx.numbers, pulls=found["pull request"])
+
+
+# #874: every consumer of `worker_owned` and what it takes from the set. The two rules and every row of WAITING_GUARDS; a completeness test fails when
+# one is added to the code without a row here.
+WORKER_OWNED_CONSUMERS = {
+    "stalled-working": "the newest movement of every owned issue and pull request, and the head of each owned pull request",
+    "idle-at-a-seam": "the waiting verdict only",
+    "last-report": "nothing from the set (the report record only)",
+    "awaiting-issue": "an awaiting label on any owned issue",
+    "awaiting-pr": "an awaiting label on any owned pull request",
+    "ci": "CI running at the head of any owned pull request",
+    "review-requested": "a review requested on any owned pull request",
+    "review-window": "any owned pull request younger than the review window",
+    "reminder": "a reminder for the worker naming any owned issue",
+    "decision": "a human decision on any owned issue or pull request",
+}
 
 
 # #816: THE table of waiting guards: name -> (needs the daemon's lists, check). The predicate LOOPS OVER it, so a guard cannot exist in code and
@@ -8683,10 +8757,11 @@ def legitimately_waiting(engine, observation, issue, repo, last):
     one is requested on a non-draft pull request, or such a pull request is younger than `review_window_minutes` (the list holds no reviews, so
     "no review yet" is the window). Without the daemon's whole lists (a repository outside `plan_gates` never gets its open-PR list read) the
     answer is "unread": both rules are silent there, by the read-whole rule."""
-    out = types.SimpleNamespace(state="unread", reason="", codes=[], issue_at=None, pr=None, number=None, head=None, pr_at=None)
+    out = types.SimpleNamespace(state="unread", reason="", codes=[], issue_at=None, pr=None, number=None, head=None, pr_at=None,
+                                issues=[], pulls=[], heads={})
     now, key = engine.now(), plan_ledger.normal_repo(repo)
-    w = types.SimpleNamespace(engine=engine, observation=observation, issue=issue, repo=repo, key=key, last=last, now=now, mine=[], issue_labels=set(),
-                              awaiting=set(), state=getattr(engine, "ci_record_state", None), window=engine.config.get("review_window_minutes", 60) * 60)
+    w = types.SimpleNamespace(engine=engine, observation=observation, issue=issue, repo=repo, key=key, last=last, now=now, mine=[],
+                              awaiting=set(), issues=[], numbers={issue}, state=getattr(engine, "ci_record_state", None), window=engine.config.get("review_window_minutes", 60) * 60)
     found = []
     def run(early):
         for name, (needs, check) in WAITING_GUARDS.items():
@@ -8706,22 +8781,28 @@ def legitimately_waiting(engine, observation, issue, repo, last):
             return out   # an open-PR list that is not being re-read is no evidence
         units = getattr(getattr(engine, "triage", None), "units", None) or {}
         records = (units.get((repo, "issues")) or {}).get("data") or []
-        item = next((r for r in records if isinstance(r, dict) and r.get("number") == issue and "pull_request" not in r), None)
-        out.issue_at = parse_iso(item.get("updated_at")) if item else None
-        if item is None or out.issue_at is None:
-            return out
         pulls = ((getattr(w.state, "lists", None) or {}).get(key) or (0, []))[1]
-        w.mine = [r for r in pulls if isinstance(r, dict) and isinstance(r.get("number"), int)
-                  and any(isinstance(ref, list) and ref[1] == issue and plan_ledger.normal_repo(ref[0] or repo) == key for ref in pr_body_refs(r.get("body")))]
-        pr = max(w.mine, key=lambda r: parse_iso(r.get("updated_at")) or 0, default=None)   # the newest-moved one when several name the issue
-        if pr is not None:
-            out.pr, out.number = pr, pr["number"]
-            out.head = (pr.get("head") or {}).get("sha") if isinstance(pr.get("head"), dict) else None
-            out.pr_at = parse_iso(pr.get("updated_at"))
-            if not isinstance(out.head, str) or out.pr_at is None:
-                return out
+        owned = worker_owned(records, pulls, issue, repo)
+        if owned is None:
+            return out
+        w.issues, w.numbers, w.mine = owned.issues, owned.numbers, owned.pulls
+        times = [parse_iso(r.get("updated_at")) for r in owned.issues]
+        if any(t is None for t in times):
+            return out   # an owned issue whose time cannot be read: not judged
+        out.issue_at = max(times)
+        out.issues, out.pulls = owned.issues, owned.pulls
+        stamps = []
+        for r in owned.pulls:
+            sha = (r.get("head") or {}).get("sha") if isinstance(r.get("head"), dict) else None
+            at = parse_iso(r.get("updated_at"))
+            if not isinstance(sha, str) or at is None:
+                return out   # an owned pull request with no readable head or time: not judged
+            stamps.append((at, r["number"], sha))
+        if stamps:
+            out.pr_at, out.number, out.head = max(stamps)   # the newest-moved one when several are owned
+            out.pr = next(r for r in owned.pulls if r["number"] == out.number)
+            out.heads = {n: h for _, n, h in stamps}
         w.awaiting = triage_awaiting_labels(engine)
-        w.issue_labels = {(l.get("name") if isinstance(l, dict) else l) for l in (item.get("labels") or [])}
         run(False)
     except _Unread:
         out.state = "unread"
@@ -8796,7 +8877,7 @@ class WorkerFacts:
         self.requests = []       # PR 14: the pending requests of every blocked agent in the last call (decisions)
         self._summaries = {}     # (session, idle ms) -> text; a cache, rebuilt after a restart
         self._stops = {}         # (session, idle ms) -> the facts of that stop (PR 13); a cache, rebuilt likewise
-        self._heads = {}         # #811: worker -> (the pull request head last seen, when a change of it was seen); memory only
+        self._heads = {}         # #811, #874: worker -> {owned pull request number: (the head last seen, when a change of it was seen)}; memory only
         self._no_forms = False   # v2 does not know the form operation (UNVERIFIED name)
 
     def bind(self, engine):
@@ -8935,10 +9016,13 @@ class WorkerFacts:
             return []
         if ctx.pr is not None:
             moved = max(moved, ctx.pr_at)
-            seen = self._heads.get(observation.name)   # a head this process saw change is movement now, whatever GitHub's clock says
-            if seen is None or seen[0] != head:        # recorded BEFORE the waiting verdict is used: a head that moved during a guard is still movement
-                self._heads[observation.name] = (head, now if seen is not None else 0)
-            moved = max(moved, self._heads[observation.name][1])
+            known = self._heads.get(observation.name)   # a head this process saw change on ANY owned pull request is movement now, whatever GitHub's clock says
+            kept = {}
+            for pr_number, pr_head in ctx.heads.items():   # recorded BEFORE the waiting verdict is used: a head that moved during a guard is still movement
+                seen = (known or {}).get(pr_number)
+                kept[pr_number] = seen if seen is not None and seen[0] == pr_head else (pr_head, now if known is not None and seen is not None else 0)
+            self._heads[observation.name] = kept
+            moved = max([moved] + [t for _, t in kept.values()])
         if ctx.state == "waiting":
             return []
         since = max(moved, last["work_since"])
