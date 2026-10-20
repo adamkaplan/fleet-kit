@@ -2,6 +2,7 @@
 pod the last pass already stopped. Offline: the fake kubectl and a fake clock. Every ending of the process is one row of ENDINGS."""
 import ast
 import io
+import itertools
 import json
 import os
 import re
@@ -143,14 +144,29 @@ class OnePassOverMixedPods(base.Base):
         self.write_state(st)
         self.clock.advance(minutes=11)
 
-    def test_one_idle_one_past_hard_one_unreadable_gives_two_stops_and_one_line(self):
-        res = cw.Launcher(cw.Kube(self.env), self.env, self.clock).reap()
-        self.assertEqual(sorted(r[:2] for r in res), [("bad1", "unreadable deadline"), ("idle1", "idle"), ("past1", "hard limit")])
-        self.assertEqual(sorted(r[2] for r in res), [0, 0, 1])
-        self.assertEqual(sorted(l["worker"] for l in self.audit_lines() if l["action"] == "stop"), ["idle1", "past1"])
-        self.assertIsNone(self.pod("idle1"))
-        self.assertIsNone(self.pod("past1"))
-        self.assertIsNotNone(self.pod("bad1"))
+    def _list_in_order(self, order):
+        st = self.st()
+        pods = st["pods"]
+        st["pods"] = {cw.pod_name(w): pods[cw.pod_name(w)] for w in order}
+        self.write_state(st)
+        self.assertEqual([p["metadata"]["name"] for p in cw.Kube(self.env).list_pods()], [cw.pod_name(w) for w in order])
+
+    def test_one_idle_one_past_hard_one_unreadable_gives_two_stops_and_one_line_in_every_order(self):
+        """The bad pod may come first, second or last: a pass that stops at it (return or raise) or skips the next pod fails."""
+        for order in itertools.permutations(("idle1", "past1", "bad1")):
+            with self.subTest(order=order):
+                self.setUp()   # a fresh cluster for each order
+                self._list_in_order(order)
+                code, out, _ = self.run_cli("reap")
+                self.assertEqual(code, cw.EXIT_HOOK)   # the pass finishes, with the documented non-zero status
+                res = json.loads(out)
+                self.assertEqual(sorted((r["worker"], r["reason"]) for r in res), [("bad1", "unreadable deadline"), ("idle1", "idle"), ("past1", "hard limit")])
+                self.assertEqual(sorted(r["exit"] for r in res), [0, 0, 1])
+                self.assertEqual(sorted((l["worker"], l.get("reason", "").split(";")[0]) for l in self.audit_lines() if l["action"] == "stop"),
+                                 sorted([("idle1", "idle"), ("past1", "hard limit")]))
+                self.assertIsNone(self.pod("idle1"))
+                self.assertIsNone(self.pod("past1"))
+                self.assertIsNotNone(self.pod("bad1"))
 
     def test_the_loop_goes_on_after_the_unreadable_pod(self):
         passes = []
