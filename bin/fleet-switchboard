@@ -15410,6 +15410,37 @@ CHECKPOINT_MAX_SECONDS = 30 * 86400  # a checkpoint or overdue further out than 
 CHECKPOINT_MAX_DIGITS = 6
 
 
+def how_long(seconds):
+    """A length of time as words, exact to the second: `15 min`, `1 min 30 s`, `2 h 5 min`, `1 d 2 h`. Never rounds: the line a lane reads must be the stored time."""
+    seconds = int(round(abs(seconds)))
+    parts = []
+    for unit, size in (("d", 86400), ("h", 3600), ("min", 60), ("s", 1)):
+        count, seconds = divmod(seconds, size)
+        if count:
+            parts.append("%d %s" % (count, unit))
+    return " ".join(parts) if parts else "0 s"
+
+
+def reminder_when(at, now):
+    """The words the three routes print for one reminder, built from the STORED time and the same `now`: `in 15 min, at 2030-01-02T15:05:05Z` (or `15 min ago`)."""
+    return ("in %s" % how_long(at - now) if at >= now else "%s ago" % how_long(now - at)) + ", at %s" % iso(at)
+
+
+def _print_when_now(now):
+    try:
+        return iso(now)
+    except Exception:
+        return str(now)
+
+
+def _print_when(at, now):
+    """`reminder_when`, but the printing never fails a command: a reminder that was made still exits 0 (the plain clock time is the fallback)."""
+    try:
+        return reminder_when(at, now)
+    except Exception:
+        return "at %s" % at
+
+
 def _cp_when(text, moment):
     """parse_when for a checkpoint flag, bounded: too many digits or further than CHECKPOINT_MAX_SECONDS is refused."""
     if re.search(r"[0-9]{%d}" % (CHECKPOINT_MAX_DIGITS + 1), text):
@@ -15483,8 +15514,8 @@ def set_checkpoint_reminders(engine, state, name, boss, issue, repo, brief, chec
             engine.audit.append("cli", "reminder.add", item["to"], {"id": item["id"], "at": iso(item["at"]),
                                                                    "from": item.get("from"), "issue": issue,
                                                                    "repo": repo, "for": "checkpoint-" + which})
-        notes[:0] = ["%s reminder at %s" % (which, iso(item["at"])) for which, item in made]
-        return "checkpoint reminders: " + "; ".join(notes) if notes else None
+        notes[:0] = ["%s reminder %s" % (which, _print_when(item["at"], moment)) for which, item in made]
+        return "checkpoint reminders (now %s): " % _print_when_now(moment) + "; ".join(notes) if notes else None
     except (ReminderError, OSError, ValueError, OverflowError) as err:
         return "no checkpoint reminders: %s" % _one_line(str(err), 200)
 
@@ -15561,7 +15592,7 @@ def cmd_remind(args, runner, now):
     engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),
                                                           "from": sender, "issue": number, "repo": repo})
     print(item["id"])
-    sys.stderr.write("%s: reminder for %s at %s\n" % (PROG, args.name, iso(item["at"])))
+    sys.stderr.write("%s: reminder for %s %s (now %s)\n" % (PROG, args.name, _print_when(item["at"], moment), _print_when_now(moment)))
     return EXIT_OK
 
 
