@@ -11943,7 +11943,7 @@ class TestChatClearOffers(unittest.TestCase):
 
     NAMES = {"merge-captain": "u:merge-captain", "hold-impact": "u:hold-impact", "hold-credential": "u:hold-credential",
              "hold-policy": "u:hold-policy", "hold-security": "u:hold-security", "hold-contract": "u:hold-contract",
-             "hold-prod-config": "u:hold-prod-config", "hold-other-area": "u:hold-other-area", "parked": "u:parked"}
+             "hold-prod-config": "u:hold-prod-config", "hold-other-area": "u:hold-other-area", "hold-owner": "u:hold-owner", "parked": "u:parked"}
 
     def setUp(self):
         self.cc = sb.load_module("chat_clear")
@@ -46553,7 +46553,7 @@ class TestSupersede(WriteWorld):
 
 class TestLabelsEnsure(WriteWorld):
     NEW = ("parked", "merge-captain", "merge-automatic", "hold-security", "hold-credential", "hold-contract", "hold-policy",
-           "hold-prod-config", "hold-other-area", "hold-impact")
+           "hold-prod-config", "hold-other-area", "hold-impact", "hold-owner")
     WANT = sorted(["me:awaiting-cos", "me:awaiting-user", sb.orchestrator_label()]
                   + ["%s:%s" % (sb.orchestrator_label().split(":")[0], k) for k in NEW])
 
