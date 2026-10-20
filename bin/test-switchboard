@@ -66033,12 +66033,105 @@ class TestReviewerSubagents(LedgerBase):
         return out
 
     def test_gates_shows_how_many_of_the_five_recorded_at_the_head_and_a_push_voids_them(self):
-        self.assertIn("reviewers (shadow, not counted; recorded by the PR's own session, so not independent): 0 of 5 recorded at %s; missing code, architecture, security, impact, test" % LEDGER_HEAD[:8], self.gates_text())
+        self.assertIn("reviewers (plan-review panel verdicts: shadow, not counted by any gate): 0 of 5 recorded at %s; missing code, architecture, security, impact, test" % LEDGER_HEAD[:8], self.gates_text())
         for role in self.ROLES:
             self.assertEqual(self.record("coder", role)[0], 0)
-        self.assertIn("not independent): 5 of 5 recorded at %s: architecture approve, code approve, impact approve, security approve, test approve" % LEDGER_HEAD[:8], self.gates_text())
+        self.assertIn("not counted by any gate): 5 of 5 recorded at %s: architecture approve, code approve, impact approve, security approve, test approve" % LEDGER_HEAD[:8], self.gates_text())
         self.pr["headRefOid"] = "c" * 40   # a push
-        self.assertIn("not independent): 0 of 5 recorded at cccccccc", self.gates_text())
+        self.assertIn("not counted by any gate): 0 of 5 recorded at cccccccc", self.gates_text())
+
+    # -- #892: the caption is true of the panel line alone, and the impact rating has its own line
+
+    def rate_at_head(self, level, role, head=LEDGER_HEAD):
+        cells = sb.impact_floor.load_matrix()["cells"]
+        severity, probability = next((s, p) for s in cells for p in cells[s] if cells[s][p]["level"] == level)
+        entry = {"kind": "review_record", "pr": self.PR, "head": head, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": role,
+                 "impact_severity": severity, "impact_probability": probability, "impact_action": "none"}
+        sb.plan_ledger.append_entry(self.world.state, entry, self.world.clock.now())
+
+    def rating_lines(self):
+        return [line.strip() for line in self.gates_text().splitlines() if "impact rating at" in line]
+
+    def test_s1_the_shadow_caption_says_what_the_panel_line_is_and_nothing_about_the_independent_rating(self):
+        self.record("coder", "code")
+        text = self.gates_text()
+        shadow = [line for line in text.splitlines() if line.strip().startswith("reviewers (")]
+        self.assertEqual(len(shadow), 1)
+        self.assertIn("plan-review panel verdicts: shadow, not counted by any gate", shadow[0])
+        self.assertNotIn("not independent", text)
+
+    def test_s2_a_counted_rating_is_named_with_its_level_and_that_its_role_counts(self):
+        self.rate_at_head("Medium", "reviewer")
+        lines = self.rating_lines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("Medium", lines[0])
+        self.assertIn("counts", lines[0])
+        self.assertNotIn("not counted", lines[0])
+
+    def test_s3_s6_a_rating_by_a_role_that_does_not_count_is_recorded_not_counted_and_no_rating_is_said(self):
+        self.assertEqual(self.rating_lines(), ["impact rating at %s: no impact rating recorded" % LEDGER_HEAD[:8]])
+        self.rate_at_head("High", "coder")
+        lines = self.rating_lines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("not counted", lines[0])
+        self.assertNotIn("counts", lines[0])
+        self.rate_at_head("Low", "reviewer", head="d" * 40)   # another head's rating is not this head's
+        self.assertIn("not counted", self.rating_lines()[0])
+
+    def rate_unscored(self, role, severity="Huge", probability="Remote"):
+        entry = {"kind": "review_record", "pr": self.PR, "head": LEDGER_HEAD, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": role,
+                 "impact_severity": severity, "impact_probability": probability, "impact_action": "none"}
+        sb.plan_ledger.append_entry(self.world.state, entry, self.world.clock.now())
+
+    def test_s3_a_counting_role_with_no_usable_score_is_not_told_as_a_role_that_does_not_count(self):
+        self.rate_unscored("reviewer")   # an unknown cell: the role counts, the score does not
+        line = self.rating_lines()[0]
+        self.assertIn("recorded role counts", line)
+        self.assertIn("no usable score", line)
+        self.assertNotIn("not counted", line)
+
+    def test_s3_the_four_shapes_read_differently_and_a_failed_read_is_unknown(self):
+        said = {}
+        said["none"] = self.rating_lines()[0]
+        self.rate_unscored("coder", "Marginal", "Remote")   # a valid cell by a role that does not count
+        said["not-role"] = self.rating_lines()[0]
+        self.assertEqual(len(set(said.values())), 2)
+        self.assertIn("not counted", said["not-role"])
+        with mock.patch.object(sb.plan_ledger, "impact_rating_fact", side_effect=RuntimeError("boom")):
+            self.assertIn("unknown", self.rating_lines()[0])   # a failure inside the reading is said as unknown, never raised out of `gates`
+        with mock.patch.object(sb.impact_floor, "_matrix_cached", side_effect=RuntimeError("no matrix")):
+            self.assertIn("unknown", self.rating_lines()[0])   # an exception never escapes `gates`
+
+    def test_s3_every_unreadable_branch_says_unknown_and_never_no_rating_while_a_record_exists(self):
+        self.rate_at_head("Medium", "reviewer")
+        module = sb.load_module("delegated_clear")
+        cases = {"the score block cannot be read": mock.patch.object(module, "score_block", return_value=None),
+                 "the matrix has no cells": mock.patch.object(sb.impact_floor, "_matrix_cached", return_value={"cells": {}}),
+                 "the matrix cannot be read": mock.patch.object(sb.impact_floor, "_matrix_cached", side_effect=RuntimeError("no matrix")),
+                 "the scoring raises": mock.patch.object(module, "judge", side_effect=RuntimeError("boom")),
+                 "the shaping raises": mock.patch.object(sb.plan_ledger, "impact_rating_fact", side_effect=RuntimeError("boom"))}
+        for label, patch in cases.items():
+            with self.subTest(branch=label), patch:
+                lines = self.rating_lines()
+                self.assertEqual(len(lines), 1, label)
+                self.assertIn("unknown", lines[0], label)
+                self.assertNotIn("no impact rating recorded", lines[0], label)
+                self.assertNotIn("not counted", lines[0], label)
+
+    def test_s4_s5_the_line_changes_no_gate_and_is_the_engines_own_reading(self):
+        def gates():
+            code, out, err = self.run_as("coder", "gates", self.PR, "--json")
+            body = json.loads(out)
+            return code, body["ready"], [(g["gate"], g["status"]) for g in body["gates"]], body["impact_rating"]
+        before = gates()
+        self.assertEqual(before[3], {"recorded": False})
+        self.rate_at_head("Medium", "reviewer")
+        after = gates()
+        self.assertEqual(before[:3], after[:3])   # no exit code, readiness or gate status moved
+        entries, _ = sb.impact_rating_entries(self.world.state, self.PR, LEDGER_HEAD)
+        cells = sb.impact_floor.load_matrix()["cells"]
+        top = entries[-1]
+        self.assertEqual(after[3], {"recorded": True, "role_counts": True, "scored": True, "level": cells[top["impact_severity"]][top["impact_probability"]]["level"]})
 
     def test_the_shadow_line_never_changes_whether_the_pr_is_ready(self):
         def ready():

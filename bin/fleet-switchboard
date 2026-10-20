@@ -21445,6 +21445,7 @@ def cmd_gates(args, runner, now):
                                         now=now())
     report["plan_problem"] = ctx.plan_problem
     report["pr_unreadable"] = ctx.unreadable
+    report["impact_rating"] = gate_impact_rating(ctx.state, ctx.pr, ctx.facts.get("head"))   # #892: output text only; no gate reads it
     gates_carried_note(report, ctx)
     plan_ledger.enforced_view(report, enforced_gates_of(ctx))
     first = next((e.get("plan_ref") for e in ctx.entries if e.get("pr") == ctx.pr and e.get("plan_ref")), None)
@@ -21906,6 +21907,27 @@ def impact_rating_entries(state_dir, pr, head):
     if problem:
         return [], _one_line(str(problem), 120)
     return [e for e in entries if e.get("kind") == "review_record" and e.get("reviewer") == "impact" and e.get("pr") == pr and e.get("head") == head], None
+
+
+def gate_impact_rating(state_dir, pr, head):
+    """What the `gates` impact-rating line says (#892), from the engine's own records and rule and nothing computed here: `impact_rating_entries` (the one filter of the independent
+    reviewer's records at EXACTLY this head) and `delegated_clear.judge` (the level of the highest record whose recorded role counts, from the matrix cell: the SAME function the delegated
+    clear scores with). `plan_ledger.impact_rating_fact` shapes the answer. None when there is no head. A ledger it cannot read is said, never guessed."""
+    if not head or state_dir is None:
+        return None
+    entries, problem = impact_rating_entries(state_dir, pr, head)
+    if problem:
+        return {"problem": problem}
+    try:   # never an exception out of `gates`: what cannot be read is said as unknown
+        module = load_module("delegated_clear")
+        block = module.score_block()
+        cells = impact_floor._matrix_cached()["cells"]
+        if not block or not cells:
+            return {"problem": "the score rule or the matrix could not be read"}
+        level = module.judge(block, cells, entries, {"pr": pr, "head": head, "top_tier_hits": {}}, block["delegable_levels"][0]).get("level") if entries else None
+        return plan_ledger.impact_rating_fact(entries, level, block["rating_roles"])
+    except Exception as err:
+        return {"problem": _one_line("%s: %s" % (type(err).__name__, err), 100)}
 
 
 def _file_text_at(engine, repo, path, ref):
