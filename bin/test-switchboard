@@ -32666,11 +32666,10 @@ class TestImpactRejudge(LedgerBase):
 
     def test_the_adoption_table_is_the_labels_the_code_names_by_the_cases_and_every_cell_has_its_test(self):
         labels = [name for _, name in self.adopt_labels()]
-        self.assertEqual(len(labels), 9, "the captain marker and 8 hold classes (hold-owner is one of them)")
-        self.assertIn(self.names["hold-owner"], labels)
+        self.assertIn(self.names["hold-owner"], labels, "hold-owner is a member (no count is pinned: a later class is a new row by derivation)")
         from_specs = {self.names[key] for key, _, _ in sb.LABEL_SPECS if key.startswith("hold-")}
         self.assertEqual({n for k, n in self.adopt_labels() if k != "merge-captain"}, from_specs, "the label bootstrap creates exactly the hold classes the table names")
-        import chat_clear as cc
+        cc = sb.load_module("chat_clear")
         self.assertEqual(set(cc.HOLD_KEYS + cc.OTHER_HOLD_KEYS), {k for k, _ in self.adopt_labels() if k != "merge-captain"}, "the chat clear names every hold class, offered or not")
         self.assertFalse(cc.is_offerable(self.names, [self.names["hold-impact"], self.names["hold-owner"]]), "a chat clear never offers the owner's own hold")
         self.assertEqual(sorted(labels), sorted(sb.authors_hold_labels(self.names, {"labels": list(self.names.values())}, [])),
