@@ -7102,16 +7102,45 @@ def pane_health_status_lines(state_dir, now=None):
         return []
     data = read_pane_health(state_dir)
     retired = read_retired(state_dir)
-    bad = [(n, v) for n, v in sorted(data["states"].items()) if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in retired]
+    bad = [(n, v) for n, v in sorted(data["states"].items()) if v.get("state") == PANE_DETACHED and n not in retired]   # a dead agent is removed on read (reconcile_on_read), never drawn (#919)
     clock = time.time() if now is None else now
-    last = _read_small(state_dir, LAST_REPORT_FILE)
     gone = [n for n, v in sorted(retired.items()) if clock - (v.get("at") or 0) <= RETIRED_SHOW_DAYS * 86400]
     tail = (["      retired    %d finished worker(s), not watched: %s (`%s retire --undo <name>` reverses)" % (len(gone), ", ".join(gone[:8]), PROG)] if gone else [])
     if not bad:
         return tail
     return ["      panes      %d agent(s) need repair: %s" % (len(bad), "; ".join("%s %s (pane %s)" % (n, v["state"].upper(), v.get("pane")) for n, v in bad[:6]))
-            ] + ["        run `%s reattach <name>`" % PROG] + [
-        "        %s: %s" % (_one_line(n, 60), dead_hint.hint(n, last.get(n), clock)) for n, v in bad[:6] if v.get("state") == PANE_DEAD] + tail
+            ] + ["        run `%s reattach <name>`" % PROG] + tail
+
+
+def herdr_live_check(herdr):
+    """A `live_check` for agent_reconcile: asks herdr right now whether the agent's pane exists and runs a process. {"pane": bool|None, "process": bool|None};
+    None means herdr could not say (never a verdict, so nothing is removed on it)."""
+    def check(name, agent):
+        pane = agent.get("pane")
+        if not pane:
+            return {"pane": False, "process": False}
+        try:
+            herdr.pane_get(pane)
+        except HerdrError as err:
+            text = str(err).lower()
+            gone = "not found" in text or "no such" in text or "unknown pane" in text
+            return {"pane": False, "process": False} if gone else {"pane": None, "process": None}
+        try:
+            return {"pane": True, "process": bool(herdr.pane_process_info(pane))}
+        except HerdrError:
+            return {"pane": True, "process": None}
+    return check
+
+
+def reconcile_agents_on_read(state_dir, herdr):
+    """A view's reconcile on read (#919): read the registry, and remove through `registry.reconcile_remove` each agent herdr shows no pane and no
+    process for, right now. Only a whole read acts. No registry module or file: nothing to do. Returns the names removed; never raises."""
+    try:
+        reg = load_module("registry")
+        agent_reconcile = load_module("agent_reconcile")
+        return agent_reconcile.reconcile_on_read(state_dir, reg.read(state_dir), herdr_live_check(herdr), reg)
+    except Exception:
+        return []
 
 
 def charter_pane_update(engine, runner, fleet, new_pane):
@@ -17070,6 +17099,8 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["sweep"] = sweep_summary(state)  # #117
         report["triage"] = triage_summary(state)  # #130
         report["ci_record"] = ci_record_status_line(state, now())
+        if config_ok:
+            reconcile_agents_on_read(state, herdr)   # the view checks right now and removes a dead agent through the registry (#919)
         report["pane_lines"] = pane_health_status_lines(state, now()) + headless_route_status_lines(state)
         report["catching_up"] = catching_up_lines(state, now())
         report["v2_link"] = v2_link_status_line(state, now())
