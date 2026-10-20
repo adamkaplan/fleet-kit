@@ -99,13 +99,21 @@ def registry_targets():
     A target is a registry agent with a pane; the bell opt-in (policy) is applied after, from herdr's labels, and never adds an agent."""
     if registry is None:
         return [], "registry module not found: nothing supervised this pass"
-    found = registry.read(registry_state_dir())
-    if not found.get("whole"):
-        return [], "registry read was not whole (%s): nobody nudged this pass" % (found.get("problem") or "no reason given")
+    try:
+        found = registry.read(registry_state_dir())
+    except Exception as err:   # a read that raises is a read that is not whole
+        return [], "registry read failed (%s): nobody nudged this pass" % type(err).__name__
+    if not isinstance(found, dict) or found.get("whole") is not True:
+        reason = found.get("problem") if isinstance(found, dict) else None
+        return [], "registry read was not whole (%s): nobody nudged this pass" % (reason or "no reason given")
+    agents = found.get("agents")
+    if not isinstance(agents, dict):
+        return [], "registry read was not whole (agents is not a map): nobody nudged this pass"
     targets = []
-    for name, agent in sorted(found.get("agents", {}).items()):
-        if isinstance(agent, dict) and agent.get("pane"):
-            targets.append({"name": name, "pane_id": str(agent["pane"]), "workspace_id": agent.get("workspace"), "tab_id": None})
+    for name, agent in sorted(agents.items(), key=lambda kv: str(kv[0])):
+        pane = agent.get("pane") if isinstance(agent, dict) else None
+        if isinstance(pane, str) and pane.strip():
+            targets.append({"name": str(name), "pane_id": pane, "workspace_id": agent.get("workspace"), "tab_id": None})
     return targets, None
 
 
@@ -577,8 +585,8 @@ class Herdr:
         return [t for t in self.tabs_with_agents() if t["supervised"]]
 
     def belled_panes(self):
-        """Supervision POLICY, not identity: the pane ids whose tab label carries the bell. It never says who exists (the registry does)."""
-        return {t["pane_id"] for t in self.tabs_with_agents() if t["supervised"]}
+        """Supervision POLICY, not identity: {pane id: its tab row} for the tabs whose label carries the bell. It never says who exists (the registry does)."""
+        return {t["pane_id"]: t for t in self.tabs_with_agents() if t["supervised"]}
 
     def inspect_pane(self, pane_id):
         """Is it safe to send right now? Returns (status, observed telemetry).
@@ -871,7 +879,8 @@ def _loop_once(state_dir, config_path, config):
     elif targets:
         try:
             belled = transport.belled_panes()
-            targets = [t for t in targets if t["pane_id"] in belled]
+            targets = [dict(t, tab_id=belled[t["pane_id"]].get("tab_id"), workspace_id=belled[t["pane_id"]].get("workspace_id") or t["workspace_id"])
+                       for t in targets if t["pane_id"] in belled]
         except Unavailable as err:
             logging.error("opt-in labels unavailable: %s", err)
             record_service(state_dir, last_error="discover:%s" % err)

@@ -1295,6 +1295,59 @@ class TestRegistryIdentity(Base):
         self.assertEqual(hb.read_state(self.state)["panes"], {})
         self.assertIn("not whole", hb.read_state(self.state)["service"]["last_error"])
 
+    def test_a_registry_agent_with_no_usable_pane_is_not_a_target(self):
+        for pane in (None, "", "  ", 5, ["w2:p2"]):
+            hb.registry = FakeRegistry({"a": {"pane": pane}, "b": {"pane": "w2:p2"}, "c": "not a dict", "d": {"kind": "cloud", "pane": None, "session": "ses_example"}, "e": {"role": "worker"}})
+            self.assertEqual([t["pane_id"] for t in hb.registry_targets()[0]], ["w2:p2"], pane)
+            self.assertIsNone(hb.registry_targets()[1])
+
+    def test_a_read_that_is_not_the_documented_shape_gives_no_targets_and_a_line(self):
+        class Raises:
+            def read(self, d):
+                raise RuntimeError("boom")
+
+        class Returns:
+            def __init__(self, value):
+                self.value = value
+
+            def read(self, d):
+                return self.value
+        good = {"version": 1, "agents": {"a": {"pane": "w2:p2"}}, "retired": {}, "problem": None}
+        cases = [Raises(), Returns(None), Returns([]), Returns(dict(good, whole="false")), Returns(dict(good, whole=1)), Returns(dict(good, whole=None)),
+                 Returns(dict(good, whole=True, agents=[])), Returns(dict(good, whole=True, agents=None))]
+        for reg in cases:
+            hb.registry = reg
+            targets, problem = hb.registry_targets()
+            self.assertEqual(targets, [])
+            self.assertTrue(problem)
+        hb.registry = Returns(dict(good, whole=True))
+        self.assertEqual(len(hb.registry_targets()[0]), 1)
+
+    def test_a_raising_read_does_not_end_the_pass_and_is_recorded(self):
+        class Raises:
+            def read(self, d):
+                raise RuntimeError("boom")
+        hb.registry = Raises()
+        herdr = FakeHerdr()
+        with quiet_stderr():
+            self.loop(herdr)
+        self.assertEqual(herdr.sent, [])
+        self.assertIn("read failed", hb.read_state(self.state)["service"]["last_error"])
+
+    def test_two_registry_agents_on_one_pane_nudge_it_once(self):
+        hb.registry = FakeRegistry({"a": {"pane": "w2:p2"}, "b": {"pane": "w2:p2"}})
+        self.seed(next_due=1.0)
+        herdr = FakeHerdr()
+        with quiet_stderr():
+            self.loop(herdr)
+        self.assertEqual(len(herdr.sent), 1)
+
+    def test_the_target_carries_the_tab_from_herdr(self):
+        herdr = FakeHerdr()
+        with quiet_stderr():
+            self.loop(herdr)
+        self.assertEqual(self.pane()["tab_id"], "w2:t2")
+
     def test_no_registry_module_fails_closed(self):
         hb.registry = None
         self.assertEqual(hb.registry_targets()[0], [])
