@@ -67,6 +67,8 @@ if cmd == "apply" or (cmd == "create" and args[1:2] == ["-f"]):   # `create -f` 
             st.setdefault("secret_bodies", {})[obj["metadata"]["name"]] = {"password": obj["stringData"]["password"]}
         st.setdefault("secret_labels", {})[obj["metadata"]["name"]] = obj["metadata"].get("labels", {})
     else:
+        for k in st.pop("late_kills", []):   # the stop's Secret deletes land after the recreate was decided
+            st.get("secrets", {}).pop(k, None)
         st["uid_counter"] = st.get("uid_counter", 0) + 1
         obj["metadata"]["uid"] = "uid-%d" % st["uid_counter"]
         plan = st.get("plan", [])   # per-create outcomes: "race" (event), "vanish" (Pending, gone at its second get), "race_vanish" (both), else ok
@@ -84,8 +86,8 @@ if cmd == "apply" or (cmd == "create" and args[1:2] == ["-f"]):   # `create -f` 
             event = "RuntimeClass handler sysbox-runc does not support user namespaces: the handler sysbox-runc is not known"
         elif st.get("other_failure"):
             event = st["other_failure"]
-        obj["status"] = {"phase": "Pending" if st.get("never_ready") or event or (step or "").startswith("vanish") and step != "race_vanish" else "Running",
-                         "conditions": [] if st.get("never_ready") or event or (step or "").startswith("vanish") and step != "race_vanish" else [{"type": "Ready", "status": "True"}]}
+        obj["status"] = {"phase": "Pending" if st.get("never_ready") or event or step == "never_ready_pod" or (step or "").startswith("vanish") and step != "race_vanish" else "Running",
+                         "conditions": [] if st.get("never_ready") or event or step == "never_ready_pod" or (step or "").startswith("vanish") and step != "race_vanish" else [{"type": "Ready", "status": "True"}]}
         if event:
             st.setdefault("events", []).append({"reason": "FailedCreatePodSandBox", "message": "Failed to create pod sandbox: " + event,
                                                 "involvedObject": {"kind": "Pod", "name": obj["metadata"]["name"], "uid": obj["metadata"]["uid"]}})
@@ -137,7 +139,12 @@ elif cmd == "get" and args[1] == "pod":
         if pod.get("seen_once"):
             del st["pods"][args[2]]
             for k in pod.get("vanish_kills", []):
-                st.get("secrets", {}).pop(args[2] + "-" + k, None)
+                if k.startswith("swap-"):   # a Secret of the same name that carries another run's id
+                    st.setdefault("secret_labels", {})[args[2] + "-" + k[5:]] = {"cw/run-id": "ffffffffffffffff"}
+                elif k.startswith("late-"):   # a stop in flight: the Secrets go on the NEXT call after the pod's
+                    st.setdefault("late_kills", []).append(args[2] + "-" + k[5:])
+                else:
+                    st.get("secrets", {}).pop(args[2] + "-" + k, None)
             save(); missing('pods "%s"' % args[2])
         pod["seen_once"] = True; save()
     print(json.dumps(pod))

@@ -377,8 +377,26 @@ class FreshNodeRace(Base):
         self.assertEqual(len(self.pod_creates()), 1)
         self.assertEqual(self.st()["pods"], {})
 
-    def test_the_reapers_stop_is_the_same(self):   # the reaper deletes pod and both Secrets just as a stop does
-        self.assertIn("removed from outside", self._outside("pw,run"))
+    def test_a_stop_in_flight_whose_secret_deletes_come_after_the_recreate(self):   # kills: no check after the recreate
+        err = self._outside("late-pw,late-run")
+        self.assertIn("removed from outside", err)
+        self.assertEqual(len(self.pod_creates()), 2)   # the recreate happened, was refused as ready, and the cleanup ran
+        self.assertEqual(self.st()["pods"], {})
+        self.assertFalse(self.audit_lines()[-1]["ok"])
+
+    def test_the_recreate_is_checked_before_it_is_waited_on(self):   # kills: no check straight after the recreate (the ready check alone is too late)
+        self.patch_state(plan=["vanish:late-pw,late-run", "never_ready_pod"])
+        r = self._run_secret()
+        try:
+            out, err = self.stack("--stack", "--run-secret-fd", "tok=%d" % r, code=cw.EXIT_CLOUD)
+        finally:
+            os.close(r)
+        self.assertIn("removed from outside", err)
+        self.assertEqual(len(self.pod_creates()), 2)
+        self.assertEqual(len(self.attempts()), 1)   # the second pod was never waited on
+
+    def test_a_secret_of_another_run_is_not_this_calls(self):   # kills: a presence-only check
+        self.assertIn("removed from outside", self._outside("swap-pw"))
         self.assertEqual(len(self.pod_creates()), 1)
 
     def test_a_secret_deleted_alone_is_not_recreated(self):
