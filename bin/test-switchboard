@@ -58054,7 +58054,7 @@ class TestHeavyCeilings(unittest.TestCase):
         text = (REPO / "docs" / "switchboard.md").read_text()
         start = text.index("### `heavy`: CPU slots")
         section = text[start:text.index("\n### ", start + 10)]
-        for needle in ("measured from the slot start", "7200", "heavy.stopped", "--ceiling", "FLEET_HEAVY_MAX_SECONDS", "0 no longer means off", "bin/heavy_slots.py is read afresh"):
+        for needle in ("measured from the slot start", "7200", "heavy.stopped", "--ceiling", "FLEET_HEAVY_MAX_SECONDS", "0 no longer means off", "is read afresh by every `heavy` run"):
             self.assertIn(needle, section)
         for kind, _c, default in self.FAMILY:
             self.assertRegex(section, r"\| *%s *\|[^\n]*\b%d\b" % (kind, default), "a table row for the kind %s with its default" % kind)
