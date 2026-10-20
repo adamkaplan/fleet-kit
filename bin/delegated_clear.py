@@ -170,7 +170,7 @@ def judge(block, cells, entries, report, threshold):
         if entry.get("by_role") not in block["rating_roles"]:
             continue   # the pull request's author, the Chief of Staff, any other role (or a record made before roles were kept) is not the independent rating
         if not counts_by_block(entry):
-            unblocked += 1   # #901: only the agent's own block counts by score
+            unblocked += 1   # #901: only the agent's own block counts by score. A record without one is IGNORED on purpose (it counts for nothing, as every record made before blocks were kept), so a valid blocked record beside it still clears; the guard is `counts_by_block`, a mistake-guard, and a blocked record whose score the matrix does not know still refuses (`bad`)
             continue
         if entry.get("verdict") == "incomplete":
             incomplete += 1   # #901 clause 8: a rater that read only part of the change says `incomplete`: it counts for nothing

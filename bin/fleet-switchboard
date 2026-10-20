@@ -21099,8 +21099,8 @@ def rating_block_note(entries, pr, head):
         roles = block["rating_roles"] if block else ["reviewer"]
         mine = [e for e in entries if isinstance(e, dict) and e.get("kind") == "review_record" and e.get("reviewer") == "impact" and e.get("pr") == pr and e.get("head") == head and e.get("by_role") in roles]
         return module.uncounted_line(mine)
-    except Exception:
-        return None
+    except Exception as err:   # display only, but never silent: the line says the note could not be made
+        return "no rating note: the clear module or the matrix could not be read (%s)" % type(err).__name__
 
 
 def impact_rating_entries(state_dir, pr, head):
@@ -21222,6 +21222,16 @@ def cmd_impact(args, runner, now):
 cmd_impact.direct = True   # no error mapping, no daemon start
 
 
+IMPACT_MATRIX_PATHS_MAX = 50   # paths printed per floor rule by `impact matrix --for-rater`
+IMPACT_MATRIX_PATH_LEN = 200
+
+
+def _printable_path(path):
+    """A changed file's path as safe display text: control characters (an escape sequence in a file name) become `?`, and it is cut at IMPACT_MATRIX_PATH_LEN. The reader of `impact matrix --for-rater` is a rater agent or a person's terminal."""
+    text = "".join(c if c.isprintable() else "?" for c in str(path))
+    return text if len(text) <= IMPACT_MATRIX_PATH_LEN else text[:IMPACT_MATRIX_PATH_LEN - 1] + "\u2026"
+
+
 def impact_matrix_words(for_rater=None):
     """{"severities", "probabilities", "cells": {severity: {probability: {"level", "action"}}}, "floor_rules": {rule id: class}, "for_rater": the pull request's floor hits or None}: the kit's matrix file's own words
     (the same loader the clear reads), so a rater in a repository with no review laws gets them from the file and never retypes them. #901."""
@@ -21244,7 +21254,7 @@ def cmd_impact_matrix(args, runner, now):
             rules = impact_matrix_words()["floor_rules"]
             hits = report.get("top_tier_hits") or {}
             for_rater = {"pr": report["pr"], "head": report["head"], "complete": report.get("complete"),
-                         "floor_hits": {rule_id: sorted(hits.get(cls) or []) for rule_id, cls in sorted(rules.items()) if hits.get(cls)},
+                         "floor_hits": {rule_id: [_printable_path(p) for p in sorted(hits.get(cls) or [])[:IMPACT_MATRIX_PATHS_MAX]] for rule_id, cls in sorted(rules.items()) if hits.get(cls)},
                          "owner_decision": report.get("owner_decision")}
         words = impact_matrix_words(for_rater)
     except (impact_floor.MatrixError, NoticeError, ValueError) as err:

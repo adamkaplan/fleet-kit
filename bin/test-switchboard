@@ -32322,7 +32322,6 @@ class TestAgentBlockCounts(TestBlockTable):
             return self.record()
         if shape == "old":
             code = self.run_as("coder", *base, "--verdict", "approve", "--impact-action", "none", "--impact-severity", "Marginal", "--impact-probability", "Remote")
-            path = self.world.state / "plan-ledger.jsonl"   # an entry written before this change: no block keys at all (the ledger is rewritten with its chain, so the hash is recomputed by the real writer)
             return code
 
     def score(self, last=1):
@@ -32468,6 +32467,36 @@ class TestAgentBlockCounts(TestBlockTable):
         text = self.run_as("coder", "impact", "matrix", "--for-rater", self.PR)[1]
         for rule_id, paths in expected.items():
             self.assertIn("floor hit %s: %s" % (rule_id, ", ".join(paths)), text)
+
+    def test_an_incomplete_record_beside_a_complete_block_does_not_stop_the_complete_one_counting(self):
+        mod = sb.load_module("delegated_clear")
+        for verdict in ("incomplete", "approve"):
+            path = self.world.state / "v.txt"
+            path.write_text("verdict: %s\nhead: %s\nimpact-action: none\n%sfindings:\n" % (verdict, LEDGER_HEAD, self.SCORED))
+            self.assertEqual(self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))[0], 0)
+        scored = self.score(last=2)
+        self.assertEqual(scored["reasons"], [])
+        self.assertEqual(scored["level"], sb.impact_floor.load_matrix()["cells"]["Marginal"]["Remote"]["level"])
+
+    def test_for_rater_with_no_floor_hit_says_none_and_an_unreadable_matrix_is_refused_in_a_line(self):
+        out = self.run_as("coder", "impact", "matrix", "--for-rater", self.PR)[1]
+        self.assertIn("floor hit: none", out)
+        with mock.patch.object(sb.impact_floor, "load_matrix", side_effect=sb.impact_floor.MatrixError("unreadable")):
+            code, out, err = self.run_as("coder", "impact", "matrix")
+        self.assertEqual(code, 2)
+        self.assertIn("impact matrix:", err)
+
+    def test_a_file_name_with_control_characters_is_printed_safely_and_capped(self):
+        self.assertEqual(sb._printable_path("shims/gh\x1b[2J\x07"), "shims/gh?[2J?")
+        self.assertEqual(len(sb._printable_path("a" * 1000)), sb.IMPACT_MATRIX_PATH_LEN)
+        paths = ["shims/gh"] + ["docs/%d.md" % n for n in range(3)]
+        self.pr = dict(self.pr, changedFiles=len(paths), files=[{"path": p, "additions": 1, "deletions": 0} for p in paths])
+        hits = json.loads(self.run_as("coder", "impact", "matrix", "--for-rater", self.PR, "--json")[1])["for_rater"]["floor_hits"]
+        self.assertTrue(all(len(v) <= sb.IMPACT_MATRIX_PATHS_MAX and all(p.isprintable() for p in v) for v in hits.values()))
+
+    def test_a_failure_to_make_the_rating_note_says_so(self):
+        with mock.patch.object(sb, "load_module", side_effect=RuntimeError("x")):
+            self.assertIn("no rating note", sb.rating_block_note([{"kind": "review_record"}], self.PR, LEDGER_HEAD))
 
     def test_the_limit_is_said_in_the_docs_and_the_definition(self):
         for path in ("docs/switchboard.md", "agents/reviewers/reviewer-impact.md"):
