@@ -97,6 +97,17 @@ def _load(name, path):
 
 
 sb = _load("t_fleet_switchboard", SWITCHBOARD)
+
+
+def set_retired(state, retired):
+    """A test sets the retired map: in the registry when it exists (the record), and in retired.json (its derived copy), as the registry itself would."""
+    state = Path(state)
+    (state / "retired.json").write_text(json.dumps(retired))
+    path = state / "registry.json"
+    if path.exists():
+        doc = json.loads(path.read_text())
+        doc["retired"] = retired
+        path.write_text(json.dumps(doc))
 sc = _load("t_fleet_scenario", SCENARIO)
 
 
@@ -249,7 +260,7 @@ class TestConfig(Base):
         self.assertFalse(self.config_file.exists())
         self.assertEqual(sb.load_config(), {
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
-            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "send_timeout_seconds": 60, "poll_seconds": 5,
+            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "clear_remind_minutes": 15, "send_timeout_seconds": 60, "poll_seconds": 5,
             "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "launch_default": "headless",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
@@ -2070,7 +2081,8 @@ class FakeHerdr:
         panes = []
         for pane in sorted(self.panes):
             entry = self.panes[pane]
-            panes.append({"pane_id": pane, "cwd": entry.get("cwd") or "/tmp", "foreground_cwd": entry.get("foreground_cwd") or entry.get("cwd") or "/tmp"})
+            panes.append({"pane_id": pane, "cwd": entry.get("cwd") or "/tmp", "foreground_cwd": entry.get("foreground_cwd") or entry.get("cwd") or "/tmp",
+                          **({"revision": entry["revision"]} if "revision" in entry else {})})
         panes.extend(getattr(self, "plain_terminals", []))
         return {"result": {"type": "pane_list", "panes": panes}}
 
@@ -2129,10 +2141,19 @@ class FakeHerdr:
             self.toasts.append({"title": title, "body": (flags.get("--body") or [None])[0], "at": now})
         return {"result": {"type": "notification_show", "shown": reason is None, "reason": reason or "shown"}}
 
+    def _plain(self, pane):
+        return next((t for t in getattr(self, "plain_terminals", []) if t["pane_id"] == pane), None)
+
     def _process_info(self, rest):
         positional, flags = parse_flags(rest, ("--pane",))
         if positional or len(flags.get("--pane", [])) != 1:
             raise ValueError("pane process-info takes --pane <ID>")
+        plain = self._plain(flags["--pane"][0])
+        if plain is not None and plain.get("process_fails"):
+            raise LookupError("process info of %s cannot be read" % plain["pane_id"])
+        if plain is not None:   # a terminal with no agent: its foreground processes are what the test says (default: a bare shell)
+            return {"result": {"type": "pane_process_info", "process_info": {"pane_id": plain["pane_id"], "shell_pid": 1,
+                                                                              "foreground_processes": [{"cmdline": n, "name": n, "pid": 1} for n in plain.get("processes", ["zsh"])]}}}
         pane = self._pane(flags["--pane"][0])
         program = self.panes[pane].get("program")
         processes = [{"cmdline": program, "name": program.split(" ")[0].rsplit("/", 1)[-1], "pid": 4242}] if program else []
@@ -2177,6 +2198,11 @@ class FakeHerdr:
         positional, _ = parse_flags(rest, ())
         if len(positional) != 1:
             raise ValueError("pane close takes one pane id")
+        plain = self._plain(positional[0])
+        if plain is not None:
+            self.plain_terminals.remove(plain)
+            self.closed.append(positional[0])
+            return {"result": {"type": "ok"}}
         if positional[0] in self.shell_panes:
             self.shell_panes.discard(positional[0])
             self.closed.append(positional[0])
@@ -4828,7 +4854,7 @@ class TestLaunch(Base):
 
     def test_a_retired_listing_is_dropped_from_status_after_the_show_days(self):
         day = 86400
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"fresh": {"at": 1000, "by": "x", "reason": "y", "session": "s", "auto": False},
+        set_retired(self.world.state, {"fresh": {"at": 1000, "by": "x", "reason": "y", "session": "s", "auto": False},
                                                             "stale": {"at": 1000 - 1, "by": "x", "reason": "y", "session": "s", "auto": False}})
         inside = sb.pane_health_status_lines(self.world.state, 1000 + sb.RETIRED_SHOW_DAYS * day)          # fresh is exactly at the edge, stale just past it
         self.assertTrue(inside and "fresh" in inside[0] and "stale" not in inside[0])
@@ -4873,7 +4899,7 @@ class TestLaunch(Base):
         self.assertEqual(sorted(sb.prune_retired(old, 10 ** 9 + 5)), ["y"])
         self.as_("boss")
         self.health()
-        with mock.patch.object(sb, "_write_small", side_effect=OSError(28, "No space left")):
+        with mock.patch.object(sb.load_module("registry"), "_write_atomic", side_effect=OSError(28, "No space left")):
             code, out, err = self.run_cli("retire", "worker")
         self.assertNotEqual(code, 0)
         self.assertIn("was not retired, try again", err)
@@ -4883,7 +4909,7 @@ class TestLaunch(Base):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         self.worker()
         self.health()
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"worker": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "ses_an_old_one", "auto": False}})
+        set_retired(self.world.state, {"worker": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "ses_an_old_one", "auto": False}})
         self.kill("worker")
         for n in range(sb.PANE_MISSING_PASSES):
             self.health(n)
@@ -5073,7 +5099,7 @@ class TestLaunch(Base):
         sb.register_worktree(self.world.state, str(live_wt), "boss", None, "w-live", 1)            # an agent that is NOT retired
         sb.register_worktree(self.world.state, str(gone_wt), "worker", None, "w-gone", 1)
         self.git(self.repo_main, "worktree", "remove", str(gone_wt))                                # already deleted by hand
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"worker": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "s", "auto": False}})
+        set_retired(self.world.state, {"worker": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "s", "auto": False}})
         os.environ["HERDR_PANE_ID"] = self.world.panes["stranger"]
         code, out, err = self.run_cli("disk", "reclaim-worktrees")
         self.assertEqual(code, 0, err)
@@ -5257,9 +5283,9 @@ class TestLaunch(Base):
         status, line = sb.reclaim_worktree(engine, subprocess.run, str(wt), {"agent": "worker"}, True)
         self.assertEqual((status, wt.exists()), ("kept", True), line)
         self.assertIn("runs in it", line)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"elsewhere": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "s", "auto": False}})
+        set_retired(self.world.state, {"elsewhere": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "s", "auto": False}})
         self.assertIsNone(sb.worktree_in_use(engine, str(wt)), "a retired agent's session no longer holds it")
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {})
+        set_retired(self.world.state, {})
         self.world.v2.sessions[self.world.sessions["elsewhere"]]["directory"] = str(wt) + "2"        # a sibling sharing a name prefix
         self.assertIsNone(sb.worktree_in_use(engine, str(wt)))
         with mock.patch.object(sb.V2Client, "session_list_page", side_effect=sb.V2Error("timeout", None, "slow")):
@@ -5875,12 +5901,17 @@ class TestLaunch(Base):
             data["states"][n] = {"state": "unknown", "session": "ses_" + n}
         data["agents"]["relaunch"] = row("ses_new", "orchestrator")      # retired under an OLD session, running again under a new one
         sb.write_pane_health(self.world.state, data)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {**{n: self.retired_entry("ses_" + n) for n in ("r1", "r2", "r3")},
-                                                            "relaunch": self.retired_entry("ses_old")})
+        reg = sb.load_module("registry")                                 # the agent list is the registry's: the rows and the retirements go there
+        for n in ("r1", "r2", "r3"):
+            reg.upsert(self.world.state, n, data["agents"][n], now=int(self.world.clock.now()))
+            reg.retire(self.world.state, n, "x", "finished", now=int(self.world.clock.now()))
+        reg.upsert(self.world.state, "relaunch", {"session": "ses_old", "pane": "w1:p9"}, now=int(self.world.clock.now()))
+        reg.retire(self.world.state, "relaunch", "x", "finished", now=int(self.world.clock.now()))
+        reg.upsert(self.world.state, "relaunch", data["agents"]["relaunch"], now=int(self.world.clock.now()))
         self.health(1)
         agents = sb.read_pane_health(self.world.state)
         self.assertEqual(sorted(agents["agents"]), ["coder", "platform", "relaunch"])
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"platform": self.retired_entry(None), "coder": self.retired_entry(None)})   # a record with NO session covers nothing
+        set_retired(self.world.state, {"platform": self.retired_entry(None), "coder": self.retired_entry(None)})   # a record with NO session covers nothing
         self.health(2)
         self.assertEqual(sorted(sb.read_pane_health(self.world.state)["agents"]), ["coder", "platform", "relaunch"])
         self.assertFalse(sb.retired_agent({"x": {"session": None}}, "x", None))
@@ -5905,14 +5936,16 @@ class TestLaunch(Base):
         data = sb.read_pane_health(self.world.state)
         data["agents"]["old"] = {"session": "ses_old", "pane": "w1:p9", "role": "orchestrator", "workspace": "w9"}
         sb.write_pane_health(self.world.state, data)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"old": self.retired_entry("ses_old")})
+        sb.load_module("registry").upsert(self.world.state, "old", data["agents"]["old"])
+        set_retired(self.world.state, {"old": self.retired_entry("ses_old")})
         path = self.world.state / sb.PANE_HEALTH_FILE
         before = path.read_bytes()
         discovery = self.engine.discover(self.world.clock.now())
         discovery.problems = ["list not whole"]                         # the agent list is a half-read
         sb.pane_health_pass(self.engine, self.world.clock.now() + 1)
         self.assertEqual(path.read_bytes(), before)
-        with mock.patch.object(sb, "read_retired_strict", side_effect=sb.RetiredUnreadable("half")):   # the retired list is a half-read, yet `read_retired` still names "old"
+        reg = sb.load_module("registry")
+        with mock.patch.object(reg, "read", return_value=reg._empty(False, "half")):   # the registry read is not whole: the pass acts on nothing
             self.health(2)
         self.assertIn("old", sb.read_pane_health(self.world.state)["agents"])
         self.health(3)                                                   # a whole read prunes it
@@ -5955,6 +5988,84 @@ class TestLaunch(Base):
         self.assertEqual(json.loads(out)["session"], session)
         self.assertEqual(sb.read_pane_health(self.world.state)["agents"].get("worker", {}).get("workspace"), before["workspace"])   # --undo put the whole record back
 
+    def test_the_pass_drops_the_state_of_an_orphan_and_keeps_a_listed_undiscovered_a_discovered_unlisted_and_a_cloud_name(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.engine.state_dir = self.world.state
+        self.health()
+        now, reg = int(self.world.clock.now()), sb.load_module("registry")
+        reg.upsert(self.world.state, "gone", {"session": "ses_gone", "pane": "w1:p9", "state": "dead"}, now=now)            # listed, not discovered: a dead agent's alert
+        reg.upsert(self.world.state, "pod1", {"session": "ses_pod", "kind": "cloud", "run_id": "run_example"}, now=now)    # a cloud row: no pane state
+        data = sb.read_pane_health(self.world.state)
+        for name in ("orphan", "gone", "nodisc"):
+            data["states"][name] = {"state": sb.PANE_DEAD, "why": "x", "pane": "w1:p9", "session": "ses_" + name, "at": now}
+        data["missing"]["orphan"] = 2
+        sb.write_pane_health(self.world.state, data)
+        self.engine.discover(self.world.clock.now())
+        self.engine.discovery.agents["nodisc"] = sb.Observation("nodisc", "ses_nodisc", None, "idle", {"role": "coder"})   # discovered, with no pane: never listed by the pass
+        sb.pane_health_pass(self.engine, self.world.clock.now() + 1)
+        health = sb.read_pane_health(self.world.state)
+        self.assertNotIn("orphan", health["states"])                    # in neither the registry nor discovery: dropped, with its missing count
+        self.assertNotIn("orphan", health["missing"])
+        self.assertEqual(health["states"]["gone"]["state"], sb.PANE_DEAD)   # the dead agent's state stays: its alert is read from it
+        self.assertIn("gone", self.engine.pane_alerts)
+        self.assertIn("nodisc", health["states"])                       # discovered: kept
+        self.assertNotIn("pod1", health["states"])                      # a cloud row has no pane state, and the registry keeps it
+        self.assertEqual(reg.get(self.world.state, "pod1")["run_id"], "run_example")
+
+    def test_s5_the_registry_gives_reattach_retire_undo_and_the_cloud_log_read_the_same_results_with_a_clean_environment(self):
+        for key in [k for k in os.environ if k.startswith(("HERDR_", "OPENCODE_")) and k != "HERDR_PANE_ID"]:
+            self.addCleanup(os.environ.__setitem__, key, os.environ[key])
+            del os.environ[key]
+        self.addCleanup(os.environ.pop, "HERDR_WORKSPACE_ID", None)
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.worker()
+        self.health()
+        session = self.world.sessions["worker"]
+        reg = sb.load_module("registry")
+        self.assertEqual(reg.get(self.world.state, "worker")["session"], session)            # the pass registered it
+        self.assertEqual(reg.get(self.world.state, "worker")["workspace"], sb.read_pane_health(self.world.state)["agents"]["worker"]["workspace"])
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "worker", "--reason", "done")[0], 0)
+        self.assertNotIn("worker", reg.read(self.world.state)["agents"])
+        self.assertEqual(sb.known_agent(self.world.state, "worker")["session"], session)   # what the cloud log read finds
+        self.kill("worker")
+        self.health(1)
+        self.assertEqual(self.run_cli("retire", "--undo", "worker")[0], 0)
+        self.assertEqual(reg.get(self.world.state, "worker")["session"], session)
+        code, out, err = self.run_cli("reattach", "worker")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["session"], session)
+
+    def test_a_registry_that_is_not_whole_makes_reattach_retire_and_the_close_guard_change_nothing(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.worker()
+        self.health()
+        text = json.dumps({"version": 7, "agents": {}, "retired": {}})
+        (self.world.state / "registry.json").write_text(text)
+        self.as_("boss")
+        for argv in (("retire", "worker"), ("reattach", "worker"), ("retire", "worker", "--close")):
+            with self.subTest(argv=argv):
+                code, out, err = self.run_cli(*argv)
+                self.assertNotEqual(code, 0)
+                self.assertIn("registry", err)
+        discovery = self.engine.discover(self.world.clock.now())
+        pane, why = sb.retire_close_problem(self.engine, self.world.route, self.world.clock.now, discovery, "worker", discovery.agents["worker"], False)
+        self.assertEqual(pane, None)
+        self.assertIn("registry cannot be read", why)
+        before = (self.world.state / "pane-health.json").read_bytes()
+        self.health(5)                                                       # the pass acts on nothing either
+        self.assertEqual((self.world.state / "registry.json").read_text(), text)
+        self.assertEqual((self.world.state / "pane-health.json").read_bytes(), before)
+
+    def test_a_cloud_worker_in_the_registry_is_never_judged_by_the_pane_pass(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        reg = sb.load_module("registry")
+        reg.upsert(self.world.state, "pod1", {"session": "ses_pod", "repo": "acme-org/widget-service", "kind": "cloud", "run_id": "run_example"})
+        for n in range(sb.PANE_MISSING_PASSES + 1):
+            self.health(n)
+        self.assertEqual(reg.get(self.world.state, "pod1")["run_id"], "run_example")
+        self.assertNotIn("pod1", sb.read_pane_health(self.world.state)["states"])
+
     def test_reattach_by_a_dead_panes_remembered_record_and_it_refuses_when_the_session_is_gone(self):
         os.environ["HERDR_WORKSPACE_ID"] = "w1"
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
@@ -5994,7 +6105,7 @@ class TestLaunch(Base):
                     if isinstance(node, ast.Attribute) and node.attr == "pane_close":
                         callers.add(function.name)
         # two closers, each narrow: the pane a launch opened itself, and `retire --close` (re-reads the pane, matches the agent's session, boss only)
-        self.assertEqual(callers, {"close_own_pane", "retire_close_pane"})
+        self.assertEqual(callers, {"close_own_pane", "retire_close_pane", "cmd_close_pane"})   # #838: and `close-pane` (the Chief of Staff alone, a bare shell no record names, six guards)
         for function in ast.walk(tree):
             if isinstance(function, ast.FunctionDef) and function.name == "launch_agent":
                 calls = [n.func.id for n in ast.walk(function) if isinstance(n, ast.Call)
@@ -11944,7 +12055,7 @@ class TestChatClearOffers(unittest.TestCase):
 
     NAMES = {"merge-captain": "u:merge-captain", "hold-impact": "u:hold-impact", "hold-credential": "u:hold-credential",
              "hold-policy": "u:hold-policy", "hold-security": "u:hold-security", "hold-contract": "u:hold-contract",
-             "hold-prod-config": "u:hold-prod-config", "hold-other-area": "u:hold-other-area", "parked": "u:parked"}
+             "hold-prod-config": "u:hold-prod-config", "hold-other-area": "u:hold-other-area", "hold-owner": "u:hold-owner", "parked": "u:parked"}
 
     def setUp(self):
         self.cc = sb.load_module("chat_clear")
@@ -12851,6 +12962,7 @@ class TestChatClearHook(Base):
         report = {"pr": self.PR, "head": self.H1, "reasons": ["x"], "floor_paths": [], "globs": []}
         self.assertEqual(sb.apply_impact_hold(self.engine, self.REPO, 9, report, {"labels": []}), 0, "the same head: the daemon does not re-add the hold")
         self.assertEqual([w for w in self.writes if w[0] == "POST"], [w for w in self.writes if w[1].endswith("/comments")])
+        self.pr["headRefOid"] = self.H2   # the pull request really is at the new head (#891: a write is only for the head the pull request has when it is read)
         self.assertGreater(sb.apply_impact_hold(self.engine, self.REPO, 9, dict(report, head=self.H2), {"labels": []}), 0, "a new head is judged and held again")
 
     def test_s11_the_core_removes_only_owner_tier_labels_and_refuses_anything_else_or_a_moved_head(self):
@@ -13662,7 +13774,9 @@ class TestClearNotice(Base):
 
     def route(self, argv, **kwargs):
         if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
-            raw = {"state": "OPEN", "headRefOid": self.head, "title": "t", "labels": [{"name": n} for n in self.labels], "body": self.body}
+            if getattr(self, "unreadable", False):
+                return subprocess.CompletedProcess(argv, 1, "", "HTTP 502")
+            raw = {"state": getattr(self, "pr_state", "OPEN"), "headRefOid": self.head, "title": "t", "labels": [{"name": n} for n in self.labels], "body": self.body}
             return subprocess.CompletedProcess(argv, 0, json.dumps(raw), "")
         if argv[0] == FAKE_GH and argv[1] == "api" and "--method" in argv:
             self.order.append(argv[argv.index("--method") + 1] + " " + argv[2].rsplit("/", 1)[-1])
@@ -13930,6 +14044,346 @@ class TestClearNotice(Base):
         self.clear()
         (cleared,) = self.events("gate.hold_cleared")
         self.assertEqual(cleared["detail"]["removed"], [self.names["hold-impact"], self.names["merge-captain"]], "#742: the author's merge label comes off with the clear")
+
+
+    # ---- #827: a recorded clear's notice is never lost: pending record, the daemon pass, one reminder
+
+    def pending(self):
+        return sb._read_small(self.world.state, sb.CLEAR_PENDING_FILE)
+
+    def delivered(self):
+        return sb._read_small(self.world.state, sb.CLEAR_NOTIFIED_FILE)
+
+    def later(self, seconds=sb.CLEAR_NOTICE_CLAIM_SECONDS + 1):
+        self.world.clock.t += seconds
+        return self.world.clock.now()
+
+    def pass_(self, seconds=None):
+        sb.clear_notice_pass(self.engine, self.later() if seconds is None else self.later(seconds))
+
+    def block_sends(self):
+        """Every send blocks until released: the notice times out at the deadline, as a slow send does under load. Returns the event."""
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self.real_send = self.engine.send
+        self.send_returned = []
+
+        def slow(*a, **k):
+            release.wait(30)   # only a safety: the tests release it themselves
+            self.send_returned.append(1)
+            return self.real_send(*a, **k)
+        self.engine.send = slow
+        return release
+
+    def settle(self):
+        for late in [t for t in threading.enumerate() if t.name == "clear-notice"]:
+            late.join(5)
+
+    def test_s2_a_notice_that_times_out_is_pending_the_command_says_queued_and_the_next_pass_delivers_it_exactly_once(self):
+        release = self.block_sends()
+        with mock.patch.object(sb, "NOTIFY_CLEAR_DEADLINE_SECONDS", 0.05):
+            lines = self.clear()
+        self.assertEqual((release.is_set(), self.send_returned), (False, []), "the command returned while the send was still blocked: it did not wait for it (no clock)")
+        self.assertTrue(any("queued for delivery" in l for l in lines), lines)
+        key = sb._clear_notice_key(self.REPO, 7, self.HEAD, "clear")
+        self.assertIn(key, self.pending())
+        self.assertNotIn(key, self.delivered())
+        release.set()
+        self.settle()   # the late thread of the command may finish its own sends: it is the same record, told once
+        self.engine.send = self.real_send
+        self.pass_()
+        self.pass_()
+        self.assertEqual(len(self.told("cos")), 1)
+        self.assertEqual(self.pending(), {})
+        self.assertIn(key, self.delivered())
+
+    def test_s2_a_notice_cut_off_with_the_process_is_delivered_by_the_pass_to_both_recipients(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        self.engine.send = lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt())   # the process dies in the first send
+        self.clear()
+        key = sb._clear_notice_key(self.REPO, 7, self.HEAD, "clear")
+        self.assertIn(key, self.pending())
+        self.assertEqual((self.told("cos"), self.told("orch-a")), ([], []))
+        self.engine.send = self.world.new_engine("daemon").send
+        self.pass_()
+        self.assertEqual((len(self.told("cos")), len(self.told("orch-a"))), (1, 1))
+        self.assertEqual(self.pending(), {})
+
+    def test_s3_a_delivered_notice_is_never_repeated_and_only_the_recipient_not_yet_told_is_told_on_a_retry(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        real = self.engine.send
+        self.engine.send = lambda s, r, t, **k: {"sent": False, "reason": "down"} if r == "orch-a" else real(s, r, t, **k)
+        self.clear()
+        key = sb._clear_notice_key(self.REPO, 7, self.HEAD, "clear")
+        self.assertEqual(self.pending()[key]["sent"], ["chief-of-staff"])
+        self.engine.send = real
+        self.pass_()
+        self.pass_()
+        self.pass_()
+        self.assertEqual((len(self.told("cos")), len(self.told("orch-a"))), (1, 1), "cos was told once, the lane once")
+        self.assertEqual(self.pending(), {})
+        sb.notify_clear(self.engine, "clear", self.REPO, 7, self.HEAD, reason="again", body="")
+        self.assertEqual((len(self.told("cos")), len(self.told("orch-a"))), (1, 1), "a delivered notice is not made again")
+
+    def make_pending(self, kind):
+        """One pending notice of `kind`, made by the real `notify_clear` with a send that fails; every kind of `sb.CLEAR_NOTICE_KINDS` has its own call."""
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        extra = {"clear": dict(reason="a fixture"), "carry": dict(previous="f" * 40)}[kind]
+        sb.notify_clear(self.engine, kind, self.REPO, 7, self.HEAD, body="", **extra)
+        self.assertEqual(list(self.pending()), [sb._clear_notice_key(self.REPO, 7, self.HEAD, kind)])
+        self.engine.send = self.world.new_engine("daemon").send
+
+    def test_the_kinds_table_is_complete_derived_from_the_callers(self):
+        import ast
+        seen = set()
+        for path in (BIN / "fleet-switchboard", BIN / "impact_hold.py"):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "notify_clear" and len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
+                    seen.add(node.args[1].value)
+        self.assertEqual(seen, set(sb.CLEAR_NOTICE_KINDS), "every kind a caller notifies is in the table, and the table holds no other")
+        sb.clear_notice_record(self.engine, "nonsense", self.REPO, 7, self.HEAD)
+        self.assertEqual(self.pending(), {}, "a kind outside the table is never recorded")
+
+    def test_s4_for_every_kind_a_pull_request_merged_or_closed_or_with_a_new_head_drops_the_pending_record_and_sends_nothing(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            for label, state, head in (("merged", "MERGED", self.HEAD), ("closed", "CLOSED", self.HEAD), ("head changed", "OPEN", "b" * 40)):
+                with self.subTest(kind=kind, why=label):
+                    self.setUp()
+                    self.make_pending(kind)
+                    self.pr_state, self.head = state, head
+                    self.pass_()
+                    self.assertEqual(self.pending(), {})
+                    self.assertEqual(self.world.admissions("cos"), [])
+                    (event,) = self.events("gate.clear_notice_dropped")
+                    self.assertTrue(event["detail"]["why"], label)
+
+    def test_s8_for_every_kind_a_pull_request_that_cannot_be_read_whole_keeps_the_record_and_sends_nothing(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            with self.subTest(kind=kind):
+                self.setUp()
+                self.make_pending(kind)
+                self.unreadable = True
+                self.pass_()
+                self.assertEqual(len(self.pending()), 1)
+                self.assertEqual((self.world.admissions("cos"), self.events("gate.clear_notice_dropped")), ([], []))
+                self.unreadable = False
+                self.pass_()
+                self.assertEqual((len(self.world.admissions("cos")), self.pending()), (1, {}))
+
+    def test_s2_for_every_kind_and_the_standing_order_variant_a_failed_notice_is_pending_and_the_pass_delivers_it_once(self):
+        order = {"number": 5, "text": "clear fixtures", "by": "cos"}
+        paths = [(kind, {}) for kind in sb.CLEAR_NOTICE_KINDS] + [("clear", {"under_order": order})]
+        for kind, extra in paths:
+            with self.subTest(kind=kind, extra=sorted(extra)):
+                self.setUp()
+                self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+                kw = dict(extra, **({"previous": "f" * 40} if kind == "carry" else {"reason": "a fixture"}))
+                sb.notify_clear(self.engine, kind, self.REPO, 7, self.HEAD, body="", **kw)
+                self.assertIn(sb._clear_notice_key(self.REPO, 7, self.HEAD, kind), self.pending())
+                self.engine.send = self.world.new_engine("daemon").send
+                self.pass_()
+                self.pass_()
+                (told,) = self.world.admissions("cos")
+                self.assertEqual(self.pending(), {})
+                self.assertIn(self.HEAD[:8], told["text"])
+                self.assertEqual(("under the owner's standing order" in told["text"], "carried" in told["text"]), (bool(extra), kind == "carry"))
+
+    def test_the_notice_wording_is_the_same_whether_the_command_or_the_pass_sends_it(self):
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        self.clear(reason="the same words")
+        self.engine.send = self.world.new_engine("daemon").send
+        self.pass_()
+        (line,) = self.told("cos")
+        self.assertTrue(line.startswith('owner cleared %s at %s: "the same words"; ' % (self.PR, "a" * 8)), line)
+
+    def test_a_token_in_the_reason_is_never_written_to_the_pending_file(self):
+        token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0" * 2
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        self.clear(reason="x " + token)
+        self.assertNotIn("a1B2c3D4e5F6g7H8i9J0", (Path(self.world.state) / sb.CLEAR_PENDING_FILE).read_text())
+
+    # -- the one reminder
+
+    def ready_pr(self, mergeable="MERGEABLE", ready=True, state="open", head=None, examined=None, whole=True):
+        picture = self.engine.__dict__.setdefault("ci_record_state", sb.CiRecordState())
+        head = head or self.HEAD
+        picture.pr_state["%s#7" % self.REPO] = {"state": state, "head": head, "mergeable": mergeable, "gates": {"ready": ready, "missing": []}, "examined_head": examined or head}
+        sb.read_mark(self.engine, "pulls:" + self.REPO, whole, "" if whole else "cut", self.world.clock.now())
+
+    def reminders(self):
+        return [a for a in self.world.admissions("orch-a") if "cleared, merge it" in a["text"]]
+
+    def test_s6_one_reminder_per_head_after_the_delay_and_a_new_cleared_head_gets_its_own(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        self.clear()
+        self.ready_pr()
+        self.pass_(14 * 60 - sb.CLEAR_NOTICE_CLAIM_SECONDS - 1)
+        self.assertEqual(self.reminders(), [], "not before clear_remind_minutes")
+        self.pass_(120)
+        self.pass_()
+        self.pass_()
+        self.assertEqual(len(self.reminders()), 1)
+        self.head = "c" * 40
+        self.clear()
+        self.ready_pr(head="c" * 40)
+        self.pass_(15 * 60)
+        self.pass_()
+        self.assertEqual(len(self.reminders()), 2)
+
+    def count_sends(self, only=None, to=None):
+        """Wrap the engine's send: every call to it is counted (the ones whose text holds `only`, when given); a send that always fails. Returns the list of calls."""
+        calls = []
+
+        def down(sender, recipient, text, **kw):
+            if (only is None or only in text) and (to is None or recipient == to):
+                calls.append(self.world.clock.now())
+                return {"sent": False, "reason": "down"}
+            return self.real_send(sender, recipient, text, **kw)
+        self.real_send = self.world.new_engine("daemon").send
+        self.engine.send = down
+        return calls
+
+    def run_cadence(self, seconds, step=5):
+        """The daemon's REAL pass cadence: a pass every `step` seconds of the fake clock for `seconds` (never one jump per pass)."""
+        for _ in range(seconds // step):
+            sb.clear_notice_pass(self.engine, self.later(step))
+
+    def test_s3_for_every_kind_a_lane_that_is_down_for_ten_minutes_still_gets_the_notice_when_it_is_back_and_the_retries_are_spaced(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            with self.subTest(kind=kind):
+                self.setUp()
+                calls = self.count_sends(to="chief-of-staff")
+                extra = {"clear": dict(reason="a fixture"), "carry": dict(previous="f" * 40)}[kind]
+                sb.notify_clear(self.engine, kind, self.REPO, 7, self.HEAD, body="", **extra)
+                self.assertEqual(len(calls), 1, "the command tries once")
+                self.run_cadence(55)
+                self.assertEqual(len(calls), 1, "nothing is retried in the first minute: the 5 s passes do not spend the tries")
+                self.run_cadence(545)   # ten minutes in all
+                self.assertEqual(len(calls), 1 + len(sb.CLEAR_NOTICE_BACKOFF[:3]), "retries after the backoff steps (1, 2 and 5 minutes), not one per pass")
+                self.assertEqual(len(self.pending()), 1, "ten minutes down: still pending, not given up")
+                self.assertEqual(self.events("gate.clear_notice_abandoned"), [])
+                self.engine.send = self.real_send   # the lane is back
+                self.run_cadence(sb.CLEAR_NOTICE_BACKOFF[3] + 5)
+                self.assertEqual(self.pending(), {})
+                self.assertEqual(len(self.world.admissions("cos")), 1, "told once")
+
+    def test_s3_for_every_kind_a_notice_pending_for_longer_than_the_age_bound_is_given_up_loudly_never_by_a_count(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            with self.subTest(kind=kind):
+                self.setUp()
+                calls = self.count_sends(to="chief-of-staff")
+                extra = {"clear": dict(reason="a fixture"), "carry": dict(previous="f" * 40)}[kind]
+                sb.notify_clear(self.engine, kind, self.REPO, 7, self.HEAD, body="", **extra)
+                self.run_cadence(3600)
+                self.assertEqual(len(self.pending()), 1, "an hour of failures is not a reason to give up")
+                before = len(calls)
+                sb.clear_notice_pass(self.engine, self.later(sb.CLEAR_NOTICE_MAX_AGE_SECONDS))
+                (event,) = self.events("gate.clear_notice_abandoned")
+                self.assertIn("gave up", event["detail"]["why"])
+                self.assertEqual((self.pending(), len(calls)), ({}, before))
+
+    def test_a_malformed_pending_entry_is_quarantined_and_the_notices_after_it_are_still_delivered(self):
+        self.make_pending("clear")
+        pending = self.pending()
+        (good,) = pending
+        for label, bad in {"at": {"at": "x"}, "claimed": {"claimed": "y"}, "next_at": {"next_at": []}, "not a notice": {"kind": "nope"}, "under_order": {"under_order": 3}}.items():
+            with self.subTest(label):
+                poisoned = dict(pending, poison=dict(dict(pending[good], number=9), **bad))
+                poisoned["poison"]["at"] = poisoned["poison"].get("at", 0)
+                sb._write_small(self.world.state, sb.CLEAR_PENDING_FILE, poisoned)
+                sb.clear_notice_pass(self.engine, self.later())
+                self.assertEqual(self.pending(), {}, "the good one is delivered and the poison is gone")
+                self.assertTrue(self.events("gate.clear_notice_quarantined"))
+                self.world.admissions("cos").clear() if False else None
+                self.setUp()
+                self.make_pending("clear")
+                pending = self.pending()
+                (good,) = pending
+
+    def test_the_cap_of_pending_notices_audits_what_it_drops(self):
+        filler = {sb._clear_notice_key(self.REPO, 100 + i, "e" * 40, "clear"): {"repo": self.REPO, "number": 100 + i, "head": "e" * 40, "kind": "clear", "at": i + 1, "claimed": 0, "attempts": 0, "sent": []} for i in range(sb.CLEAR_PENDING_MAX)}
+        sb._write_small(self.world.state, sb.CLEAR_PENDING_FILE, filler)
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        sb.notify_clear(self.engine, "clear", self.REPO, 7, self.HEAD, reason="x", body="")
+        self.assertEqual(len(self.pending()), sb.CLEAR_PENDING_MAX)
+        (event,) = self.events("gate.clear_notice_dropped_cap")
+        self.assertIn("oldest", event["detail"]["why"])
+
+    def test_a_corrupt_pending_file_is_kept_aside_and_audited_never_overwritten_silently(self):
+        path = Path(self.world.state) / sb.CLEAR_PENDING_FILE
+        path.write_text("{ this is not json")
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        sb.notify_clear(self.engine, "clear", self.REPO, 7, self.HEAD, reason="x", body="")
+        self.assertEqual(Path(str(path) + ".corrupt").read_text(), "{ this is not json")
+        self.assertTrue(self.events("gate.clear_notice_corrupt"))
+        self.assertEqual(len(self.pending()), 1, "the new notice is recorded in a fresh file")
+
+    def test_one_pull_request_is_read_once_per_pass_however_many_notices_are_pending_for_it(self):
+        self.make_pending("clear")
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        sb.notify_clear(self.engine, "carry", self.REPO, 7, self.HEAD, body="", previous="f" * 40)
+        self.engine.send = self.world.new_engine("daemon").send
+        self.assertEqual(len(self.pending()), 2)
+        self.later()
+        reads = []
+        real = sb.read_pr_json
+        with mock.patch.object(sb, "read_pr_json", side_effect=lambda *a, **k: (reads.append(1), real(*a, **k))[1]):
+            sb.clear_notice_pass(self.engine, self.later())
+        self.assertEqual(len(reads), 1)
+
+    def test_a_reminder_send_that_always_fails_is_spaced_by_the_backoff_given_up_only_by_age_and_never_recorded_as_sent(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        self.clear()
+        self.ready_pr()
+        calls = self.count_sends(only="cleared, merge it")
+        self.run_cadence(15 * 60)
+        first = len(calls)
+        self.assertEqual(first, 1, "the first reminder is tried once at the delay")
+        self.run_cadence(10 * 60)
+        self.assertEqual(len(calls), 1 + len(sb.CLEAR_NOTICE_BACKOFF[:3]) - 1 + (1 if sb.CLEAR_NOTICE_BACKOFF[0] + sb.CLEAR_NOTICE_BACKOFF[1] + sb.CLEAR_NOTICE_BACKOFF[2] <= 10 * 60 else 0), "spaced by the backoff, not one per pass")
+        self.assertEqual(self.events("gate.clear_remind_abandoned"), [])
+        sb.clear_notice_pass(self.engine, self.later(sb.CLEAR_NOTICE_MAX_AGE_SECONDS))
+        self.assertEqual(self.events("gate.clear_reminded"), [], "a reminder that was never delivered is not recorded as sent")
+        (event,) = self.events("gate.clear_remind_abandoned")
+        self.assertIn("down", event["detail"]["error"])
+
+    def test_s7_no_reminder_when_not_mergeable_not_ready_not_open_at_the_cleared_head_or_not_examined_there(self):
+        cases = {"conflicting": dict(mergeable="CONFLICTING"), "gates not ready": dict(ready=False), "draft": dict(state="draft"), "gone": dict(state="gone"),
+                 "head moved": dict(head="d" * 40, examined="d" * 40), "not examined at the head": dict(examined="d" * 40)}
+        for label, kw in cases.items():
+            with self.subTest(label):
+                self.setUp()
+                sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+                self.clear()
+                self.ready_pr(**kw)
+                self.pass_(16 * 60)
+                self.assertEqual(self.reminders(), [], label)
+
+    def test_s8_a_list_that_is_not_whole_gives_no_reminder_and_the_reminder_comes_when_it_is(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        self.clear()
+        self.ready_pr(whole=False)
+        self.pass_(16 * 60)
+        self.assertEqual(self.reminders(), [])
+        self.ready_pr()
+        self.pass_()
+        self.assertEqual(len(self.reminders()), 1)
+
+    def test_a_lane_that_cannot_be_resolved_is_not_guessed_and_nobody_is_reminded(self):
+        self.body = "no plan here\n"
+        self.no_ledger_plan()
+        self.clear()
+        self.ready_pr()
+        self.pass_(16 * 60)
+        self.assertEqual([a for n in ("orch-a", "orch-b", "worker") for a in self.world.admissions(n) if "cleared, merge it" in a["text"]], [])
+        self.assertEqual(len(self.events("gate.clear_remind_skipped")), 1)
+
+    def test_the_remind_delay_is_a_configuration_key_with_a_default_of_15(self):
+        self.assertEqual(sb.DEFAULTS["clear_remind_minutes"], 15)
+        self.assertEqual(sb.validate_config({"clear_remind_minutes": 5})["clear_remind_minutes"], 5)
+        for bad in (0, -1, "x", True):
+            with self.subTest(bad), self.assertRaises(sb.ConfigError):
+                sb.validate_config({"clear_remind_minutes": bad})
 
 
 class TestClearRemovesTheAuthorsHold(Base):
@@ -22414,9 +22868,9 @@ class TestIdleAtASeam(WaitingInputs, ReportBase):
 
     def test_a_retired_worker_gets_nothing_and_another_name_does_not_silence_it(self):
         self.idle_after("working")
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"other": {"at": 1, "by": "x", "reason": "y", "session": None, "auto": False}})
+        set_retired(self.world.state, {"other": {"at": 1, "by": "x", "reason": "y", "session": None, "auto": False}})
         self.assertEqual(len(self.seam(self.derive())), 2)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"coder": {"at": 1, "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
+        set_retired(self.world.state, {"coder": {"at": 1, "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
         self.assertEqual(self.seam(self.derive()), [])
 
     def test_a_worker_that_resumes_and_idles_again_starts_a_new_stretch_with_its_own_clock(self):
@@ -22615,7 +23069,7 @@ class TestStalledWorking(WaitingInputs, ReportBase):
     def test_a_retired_worker_gets_none(self):
         self.late()
         self.assertEqual(len(self.stalled()), 1)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"coder": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
+        set_retired(self.world.state, {"coder": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
         self.assertEqual(self.stalled(), [])
 
     def test_an_idle_worker_is_the_seam_rules_alone(self):
@@ -26082,6 +26536,37 @@ class TestCaptainSweepFindings(TestSweep):
         self.sweep()
         self.assertEqual(self.found(), [("S6a", "acme/api#40"), ("S6b", "acme/api#41"), ("S6b", "acme/api#42")])
 
+    def test_s6b_a_recorded_clear_at_the_current_head_makes_the_leftover_author_label_agree_with_an_automatic_line(self):
+        captain = self.USER.replace("awaiting-user", "merge-captain")
+        head, other = "a" * 40, "b" * 40
+        picture = self.engine.__dict__.setdefault("ci_record_state", sb.CiRecordState())
+        self.engine.state_dir = self.world.state
+        state = {"clears": {"acme/api#50": {"head": head, "by": "owner", "at": 1}, "acme/api#51": {"head": other, "by": "owner", "at": 1}}, "applied": {}}
+        sb.write_impact_state(self.world.state, state)
+        for number in (50, 51, 52, 53):
+            picture.pr_state["acme/api#%d" % number] = {"state": "open", "head": head}
+        picture.pr_state["acme/api#53"] = {"state": "open"}   # head unknown: agrees with nothing
+        self.hub.open = {50: sweep_issue(50, "MERGE: automatic\nx", [captain], pr=True),   # cleared at this head
+                         51: sweep_issue(51, "MERGE: automatic\nx", [captain], pr=True),   # cleared at ANOTHER head
+                         52: sweep_issue(52, "MERGE: automatic\nx", [captain], pr=True),   # never cleared
+                         53: sweep_issue(53, "MERGE: automatic\nx", [captain], pr=True)}   # cleared? no: head unknown
+        sb.write_impact_state(self.world.state, dict(state, clears=dict(state["clears"], **{"acme/api#53": {"head": head, "by": "owner", "at": 1}})))
+        self.sweep()
+        self.sweep()
+        self.assertEqual(self.found(), [("S6b", "acme/api#51"), ("S6b", "acme/api#52"), ("S6b", "acme/api#53")])
+
+    def test_s6b_the_clear_only_excuses_a_captain_label_beside_an_automatic_line(self):
+        automatic = self.USER.replace("awaiting-user", "merge-automatic")
+        head = "a" * 40
+        picture = self.engine.__dict__.setdefault("ci_record_state", sb.CiRecordState())
+        self.engine.state_dir = self.world.state
+        sb.write_impact_state(self.world.state, {"clears": {"acme/api#60": {"head": head, "by": "owner", "at": 1}}, "applied": {}})
+        picture.pr_state["acme/api#60"] = {"state": "open", "head": head}
+        self.hub.open = {60: sweep_issue(60, "MERGE: captain\nx", [automatic], pr=True)}   # the other disagreement is not the author's leftover label
+        self.sweep()
+        self.sweep()
+        self.assertEqual(self.found(), [("S6b", "acme/api#60")])
+
     def test_s9_a_merge_or_hold_label_left_on_a_merged_or_closed_pr_is_flagged_and_nothing_is_removed(self):
         captain = self.USER.replace("awaiting-user", "merge-captain")
         hold = self.USER.replace("awaiting-user", "hold-impact")
@@ -28409,7 +28894,7 @@ class TestUnreportedStop(ReportBase):
     def retire_entry(self, **fields):
         entry = {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}
         entry.update(fields)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"coder": entry} if entry is not None else {})
+        set_retired(self.world.state, {"coder": entry} if entry is not None else {})
         for source in self.world.engine.sources:                      # a stop is judged once and remembered: forget it so the next look decides afresh
             getattr(source, "_stops", {}).clear()
 
@@ -28425,7 +28910,7 @@ class TestUnreportedStop(ReportBase):
         self.world.engine.state_dir = self.world.state
         self.retire_entry(session="ses_a_session_this_worker_no_longer_has")
         self.assertIn("nudge", [f.kind for f in self.facts()], "a stale retirement of an older session still lets the stop be nudged")
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"someone-else": {"at": 1, "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
+        set_retired(self.world.state, {"someone-else": {"at": 1, "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
         for source in self.world.engine.sources:
             getattr(source, "_stops", {}).clear()
         self.assertIn("nudge", [f.kind for f in self.facts()], "another name's retirement does nothing")
@@ -29417,12 +29902,12 @@ class TestLaunchTesters(LedgerBase):
 
     def test_a_retired_tester_stops_counting_and_is_not_listed(self):
         retired = {"ltst": {"at": 1, "by": "orch", "reason": "done", "session": self.world.sessions["ltst"], "auto": False}}
-        (self.world.state / sb.RETIRED_FILE).write_text(json.dumps(retired))
+        set_retired(self.world.state, retired)
         code, _, err = self.verdict("ltst", "S2", "tester")
         self.assertEqual(code, 2)
         self.assertIn("not registered", err)
         retired["ltst"]["session"] = "ses_an_older_launch"   # a relaunch under the same name is a new session: retirement of the old one does not cover it
-        (self.world.state / sb.RETIRED_FILE).write_text(json.dumps(retired))
+        set_retired(self.world.state, retired)
         self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
         retired["ltst"]["session"] = self.world.sessions["ltst"]
         self.assertEqual(sb.load_launch_testers().launched({"ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"}, "orch": {"role": "orchestrator", "repo": "acme/app"}},
@@ -31342,6 +31827,38 @@ class TestImpactFloorPure(unittest.TestCase):
         self.f = sb.load_impact_floor()
         self.matrix = self.f.load_matrix()
 
+    MATRIX_REL = "docs/review-laws/impact-matrix.json"
+
+    def _meaning_of(self, data):
+        return data["owner_hold"]["delegated_clear"]["meaning"]
+
+    def test_899_s1_the_meaning_says_which_refusal_applies_when_in_separate_sentences(self):
+        m = self._meaning_of(self.matrix)
+        sentences = [s.strip() for s in m.split(". ")]
+        self.assertEqual(len([s for s in sentences if "`never_path_classes`" in s]), 1)
+        self.assertEqual(len([s for s in sentences if "`top_tier_review_classes`" in s]), 1)
+        self.assertEqual(len([s for s in sentences if "WITHOUT a `max_level`" in s]), 1)
+        replaces = [s for s in sentences if "replaces" in s]
+        self.assertEqual(len(replaces), 1)
+        self.assertIn("WITH a `max_level`", replaces[0])
+        self.assertIn("`score`", replaces[0])
+        self.assertEqual(len([s for s in sentences if "either way" in s]), 1)
+        either = [i for i, s in enumerate(sentences) if "either way" in s][0]
+        self.assertIn("The refusals below apply either way", sentences[either])      # names the later group, not the replaced two
+        self.assertGreater(either, max(i for i, s in enumerate(sentences) if "`top_tier_review_classes`" in s))
+        self.assertLess(either, min(i for i, s in enumerate(sentences) if "`clear_code_paths`" in s))
+        self.assertTrue(m.rstrip().endswith("."))
+
+    def test_899_s2_every_key_the_meaning_names_exists_and_the_doc_says_the_same(self):
+        m = self._meaning_of(self.matrix)
+        keys = set(re.findall(r"`([a-z_]+)`", m))
+        block = self.matrix["owner_hold"]["delegated_clear"]
+        self.assertTrue({"never_path_classes", "top_tier_review_classes", "clear_code_paths", "new_file_globs", "closure_files",
+                         "module_roots", "closure_roots", "clear_entry_points", "score", "max_level"} <= keys)
+        for k in keys - {"max_level"}:                      # max_level is the owner's configuration key, not a matrix key
+            self.assertIn(k, block, k)
+        self.assertEqual((REPO / "docs/switchboard.md").read_text().count(m), 1)
+
     def test_the_twenty_cells_return_the_stored_actions_and_the_review_laws_table_equals_the_matrix(self):
         got = {sev: {pr: self.f.cell_action(self.matrix, sev, pr)[1] for pr in IMPACT_TABLE[sev]} for sev in IMPACT_TABLE}
         self.assertEqual(got, IMPACT_TABLE)                      # byte-identical to the fixture: 20 of 20
@@ -31989,7 +32506,7 @@ class TestImpactClassAndNarrowForm(LedgerBase):
         rule = sb.load_impact_floor().owner_hold_rule(sb.load_impact_floor().load_matrix())
         classes = rule[0] + rule[1]
         self.assertEqual(len(classes), 10)
-        self.assertEqual(text.count("impact-class"), 1)
+        self.assertEqual(text.count("impact-class: <class of the hold"), 1)   # the block's class line is said once (the --block table names the flag too, #895)
         self.assertIn("always names its class", text)
         self.assertIn("A hold without a class is rejected", text)
         self.assertNotIn("Leave the class line out", text)
@@ -32142,6 +32659,146 @@ class TestImpactClassAndNarrowForm(LedgerBase):
                             "a # line inside a tracked block is content")
 
 
+class TestBlockTable(LedgerBase):
+    """#895: `review record --block`: one table of what goes with it, said the same in the help, the refusal and the agent definition; a record with no score says so on stderr."""
+
+    def setUp(self):
+        super().setUp()
+        self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}})
+        self.configure()
+        self.pr = dict(self.pr, baseRefOid="c" * 40, changedFiles=1, files=[{"path": "docs/a.md", "additions": 1, "deletions": 0}])
+
+    def block(self, extra="", action="impact-action: none\n"):
+        path = self.world.state / "block.txt"
+        path.write_text("verdict: approve\nhead: %s\n%s%sfindings:\n" % (LEDGER_HEAD, action, extra))
+        return str(path)
+
+    def records(self):
+        return [e for e in self.ledger() if e["kind"] == "review_record"]
+
+    def record(self, *more, reviewer="impact", extra=""):
+        return self.run_as("coder", "review", "record", self.PR, "--reviewer", reviewer, "--block", self.block(extra, "impact-action: none\n" if reviewer == "impact" else ""), *more)
+
+    ROW_FLAGS = {"--verdict": ("approve",), "--head": (LEDGER_HEAD,), "--blocks": ("1",), "--notes": ("1",), "--impact-action": ("none",),
+                 "--impact-class": ("data",), "--impact-severity": ("Marginal",), "--impact-probability": ("Remote",), "--impact-reason": ("a reason",), "--summary": ("one line",)}
+
+    def test_the_table_has_every_record_flag_once(self):
+        parser = sb.build_parser()
+        sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction)).choices["review"]
+        record = next(a for a in sub._actions if isinstance(a, argparse._SubParsersAction)).choices["record"]
+        flags = {o for a in record._actions for o in a.option_strings if o.startswith("--") and o not in ("--help", "--block")}
+        listed = [flag for flag, _, _ in sb.BLOCK_FLAG_TABLE]
+        self.assertEqual(sorted(listed), sorted(set(listed)))
+        self.assertEqual(set(listed), flags)
+        self.assertEqual({mode for _, _, mode in sb.BLOCK_FLAG_TABLE} - {"refused", "accepted", "wins"}, set())
+        self.assertEqual(sorted(self.ROW_FLAGS), sorted(set(listed) - {"--reviewer"}))
+
+    def test_each_row_does_what_the_table_says(self):
+        for flag, dest, mode in sb.BLOCK_FLAG_TABLE:
+            if flag == "--reviewer":
+                continue
+            with self.subTest(flag=flag):
+                before = len(self.records())
+                pair = ("--impact-probability", "Remote") if flag == "--impact-severity" else ("--impact-severity", "Marginal") if flag == "--impact-probability" else ()
+                code, out, err = self.record(flag, *self.ROW_FLAGS[flag], *pair)
+                if mode == "refused":
+                    self.assertEqual(code, 2)
+                    self.assertIn(sb.BLOCK_TABLE_TEXT, err)
+                    self.assertEqual(len(self.records()), before)
+                else:
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(len(self.records()), before + 1)
+                    if flag != "--summary":
+                        self.assertEqual(self.records()[-1][dest], self.ROW_FLAGS[flag][0])
+        code, out, err = self.record("--blocks", "0", "--notes", "0")
+        self.assertEqual(code, 0, err)   # 0 is the default: cannot be told from absent
+
+    WINNERS = (("--impact-class", "impact_class", "authority", "data"), ("--impact-severity", "impact_severity", "Critical", "Marginal"),
+               ("--impact-probability", "impact_probability", "Occasional", "Remote"), ("--impact-reason", "impact_reason", "the flag's reason", "the block's reason"))
+
+    def test_a_flag_wins_over_the_blocks_line_for_each_of_the_four_winning_rows(self):
+        self.assertEqual({dest for _, dest, mode in sb.BLOCK_FLAG_TABLE if mode == "wins"}, {dest for _, dest, _, _ in self.WINNERS})   # derived: a new winning row must be added here
+        block_lines = "impact-class: data\nimpact-severity: Marginal\nimpact-probability: Remote\nimpact-reason: the block's reason\n"
+        for flag, dest, flag_value, block_value in self.WINNERS:
+            with self.subTest(flag=flag):
+                action = "impact-action: hold\n"   # a hold needs a class; the block's own class line is "data"
+                path = self.world.state / "block.txt"
+                path.write_text("verdict: approve\nhead: %s\n%s%sfindings:\n" % (LEDGER_HEAD, action, block_lines))
+                code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path), flag, flag_value)
+                self.assertEqual(code, 0, err)
+                entry = self.records()[-1]
+                self.assertEqual(entry[dest], flag_value)
+                for _, d, _, bv in self.WINNERS:
+                    if d != dest:
+                        self.assertEqual(entry[d], bv, d)   # the other three keep the block's own lines
+
+    def test_the_table_is_said_the_same_in_the_help_the_refusal_and_the_definition(self):
+        text = sb.BLOCK_TABLE_TEXT
+        self.assertEqual(text, sb.block_table_text())
+        sub = next(a for a in sb.build_parser()._actions if isinstance(a, argparse._SubParsersAction)).choices["review"]
+        record = next(a for a in sub._actions if isinstance(a, argparse._SubParsersAction)).choices["record"]
+        self.assertIn(text, next(a for a in record._actions if "--block" in a.option_strings).help)
+        definition = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
+        self.assertEqual(definition.split("<!-- block-table:begin -->\n", 1)[1].split("\n<!-- block-table:end -->", 1)[0], text)
+        self.assertEqual(self.record("--head", LEDGER_HEAD)[2].count(text), 1)
+        self.assertEqual((REPO / "bin" / "fleet-switchboard").read_text().count('("--verdict", "verdict", "refused")'), 1)
+
+    def test_the_definitions_example_block_parses_to_a_record_with_a_score(self):
+        definition = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
+        example = definition.split("A full block, as you return it", 1)[1].split("```\n", 2)[1]
+        example = example.replace("0123456789abcdef0123456789abcdef01234567", LEDGER_HEAD)
+        path = self.world.state / "example.txt"
+        path.write_text(example)
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))
+        self.assertEqual((code, err), (0, ""), err)
+        entry = self.records()[-1]
+        self.assertEqual((entry["impact_severity"], entry["impact_probability"]), ("Marginal", "Occasional"))
+        self.assertTrue(entry["impact_reason"])
+
+    def test_the_refusal_names_the_block_lines_that_carry_the_score(self):
+        err = self.record("--head", LEDGER_HEAD)[2]
+        for word in ("impact-severity:", "impact-probability:", "impact-reason:", "WITHOUT a score"):
+            self.assertIn(word, err)
+
+    def test_the_warning_with_and_without_a_score(self):
+        scored = "impact-severity: Marginal\nimpact-probability: Remote\n"
+        cases = ((dict(), True), (dict(extra=scored), False), (dict(extra="impact-reason: why\n"), True))
+        for kwargs, warns in cases:
+            with self.subTest(**kwargs):
+                before = len(self.records())
+                code, out, err = self.record(**kwargs)
+                self.assertEqual(code, 0)
+                self.assertEqual(len(self.records()), before + 1)
+                self.assertTrue(out.startswith("recorded impact review"))
+                if warns:
+                    self.assertEqual(len(err.strip().splitlines()), 1)
+                    for word in ("WITHOUT a score", "clears nothing by score", "--impact-severity", "--impact-probability"):
+                        self.assertIn(word, err)
+                else:
+                    self.assertEqual(err, "")
+        code, out, err = self.record("--impact-severity", "Marginal", "--impact-probability", "Remote")
+        self.assertEqual((code, err), (0, ""))
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve")
+        self.assertEqual(code, 0)
+        self.assertIn("WITHOUT a score", err)
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-severity", "Marginal", "--impact-probability", "Remote")
+        self.assertEqual((code, err), (0, ""))
+
+    def test_other_reviewers_never_get_the_warning(self):
+        for reviewer in ("code", "architecture", "security", "test"):
+            with self.subTest(reviewer=reviewer):
+                code, out, err = self.record(reviewer=reviewer)
+                self.assertEqual((code, err), (0, ""))
+
+    def test_the_family_of_only_x_refusals_says_what_it_accepts(self):
+        code, out, err = self.run_as("coder", "review", "checkout", self.PR, "--remove", "somewhere")
+        self.assertNotEqual(code, 0, err)   # refused (its own exit code, not changed here)
+        self.assertIn("--remove takes only the directory", err)
+        code, out, err = self.run_as("coder", "notice", "withdraw", self.PR, "a note")
+        self.assertEqual(code, 2)
+        self.assertIn("notice withdraw takes only the PR", err)
+
+
 class TestImpactRejudge(LedgerBase):
     """#451 slice 3: the daemon's hold labels follow the OWNER-HOLD rule; a hold it applied that no longer holds is taken off (only the labels it added);
     the list is posted once for each version of the rule; an unreadable matrix file changes nothing and says so once. A fake gh records every write."""
@@ -32196,7 +32853,7 @@ class TestImpactRejudge(LedgerBase):
         for item in records:   # the pull request's labels as the live read sees them
             self.prs.setdefault(item["number"], {})["labels"] = [dict(l) for l in item["labels"]]
         for number, names in (live or {}).items():   # ... unless somebody changed them since the list was read
-            self.prs.setdefault(number, {})["labels"] = [{"name": n} for n in names]
+            self.prs.setdefault(number, {})["labels"] = [{"name": n} if isinstance(n, str) else n for n in names]   # a non-name entry is a cut read
         if not hasattr(self, "engine"):
             self.hub = FakeHub({"acme/app": records})
             self.engine = self.world.new_engine("daemon")
@@ -32373,18 +33030,19 @@ class TestImpactRejudge(LedgerBase):
         late = {"clears": {"p": {"at": "soon"}}, "applied": {"p": {"added": [hold], "at": 1}}}
         self.assertEqual(sb._labels_ours(names, late, "p"), [], "a clear whose time cannot be read counts as after the record")
 
-    def test_a_label_a_person_added_after_the_list_was_read_is_never_claimed_by_the_record(self):
+    def test_a_label_a_person_added_after_the_list_was_read_is_adopted_because_the_rule_holds_the_pull_request(self):   # #891: this was "never claimed" before adoption
         self.files(10, "shims/gh")
         self.passes([self.listed(10)], live={10: [self.names["merge-captain"]]})   # the list said no labels; by the write the person's merge label is there
         self.assertEqual([w[2]["labels"] for w in self.posts(10)], [[self.names["hold-impact"]]], "only the missing label is added")
         recorded = json.loads((self.world.state / "impact-hold.json").read_text())["applied"]["acme/app#10"]
-        self.assertEqual((recorded["added"], recorded["merge_label_added"]), ([self.names["hold-impact"]], False))
-        self.files(10, "docs/a.md")   # the pull request stops holding: the release takes off the daemon's label only
+        self.assertEqual((recorded["added"], recorded["merge_label_added"]), (sorted(self.both()), True), "the person's label is adopted: the rule holds this head")
+        self.assertEqual([e["detail"]["label"] for e in self.events("gate.label_adopted")], [self.names["merge-captain"]])
+        self.files(10, "docs/a.md")   # the pull request stops holding: the release takes off the daemon's labels, adopted ones included
         self.writes.clear()
         with mock.patch.object(sb.impact_floor, "rule_fingerprint", lambda: "version-two"):
             self.passes([self.listed(10, [self.names["hold-impact"], self.names["merge-captain"]])], advance=400,
                         live={10: [self.names["hold-impact"], self.names["merge-captain"]]})
-        self.assertEqual([w[1].rsplit("/", 1)[-1] for w in self.removals(10)], [urllib.parse.quote(self.names["hold-impact"], safe="")])
+        self.assertEqual(sorted(w[1].rsplit("/", 1)[-1] for w in self.removals(10)), sorted(urllib.parse.quote(n, safe="") for n in self.both()))
 
     def test_the_dry_run_and_the_daemon_make_the_same_decisions_over_the_same_pull_requests(self):
         names = self.names
@@ -32582,6 +33240,272 @@ class TestImpactRejudge(LedgerBase):
         self.files(10, "shims/gh", head=LEDGER_NEW_HEAD)
         self.passes([self.listed(10, head=LEDGER_NEW_HEAD)], advance=400)
         self.assertEqual(len(self.posts(10)), 1, "a new head is held again")
+
+    # -- #891: a hold label put on by hand is the daemon's own once the rule holds the pull request at its head
+
+    ADOPT_HEAD_OTHER = "c" * 40
+    ADOPT_ORDER = {"number": 5, "text": "the owner's standing order"}
+
+    def adopt_labels(self):
+        """Every hold label the daemon can add or clear, DERIVED from the code: the captain marker and each `hold-*` class (the key sets the clear and the label pass use)."""
+        keys = ("merge-captain",) + tuple(sb.CAPTAIN_HOLD_LABELS)
+        return [(key, self.names[key]) for key in keys]
+
+    def adopt_state(self, **parts):
+        state = {"clears": {}, "applied": {}}
+        state.update(parts)
+        (self.world.state / "impact-hold.json").write_text(json.dumps(state))
+
+    def fresh_pass(self, records, live=None):
+        """One more pass of the REAL daemon that re-judges every pull request (the rule's fingerprint is new, so the pass's own memory of a judged head does not skip it)."""
+        self.fresh = getattr(self, "fresh", 0) + 1
+        with mock.patch.object(sb.impact_floor, "rule_fingerprint", lambda k=self.fresh: "fresh-%d" % k):
+            self.passes(records, advance=400, live=live)
+
+    def adopted(self, number=10):
+        return [e["detail"] for e in self.events("gate.label_adopted") if e["subject"] == "acme/app#%d" % number]
+
+    def recorded(self, number=10):
+        return sb.read_impact_state(self.world.state)[0]["applied"].get("acme/app#%d" % number)
+
+    def rated_here(self, number=10, head=LEDGER_HEAD):
+        sb.plan_ledger.append_entry(self.world.state, {"kind": "review_record", "pr": "acme/app#%d" % number, "head": head, "reviewer": "impact", "verdict": "approve",
+                                                       "blocks": 0, "notes": 0, "by": "rev", "by_role": "reviewer", "impact_action": "second-review", "summary": "x"}, 1)
+
+    def run_adopt_case(self, label, case):
+        """One (label, case) cell of the table: drive the REAL pass (or the real re-hold function) and return nothing; the assertions are in the cell."""
+        n = 10
+        captain, impact = self.names["merge-captain"], self.names["hold-impact"]
+        wanted_by_floor = label in (captain, impact)
+        if case in ("hand_floor_holds", "daemon_present", "absent", "cleared_this_head", "cleared_other_head_floor_holds"):
+            self.files(n, "shims/gh")
+        else:
+            self.files(n, "docs/a.md")
+        on_pr = [] if case == "absent" else [label]
+        if case == "daemon_present":
+            self.adopt_state(applied={"acme/app#%d" % n: {"head": LEDGER_HEAD, "merge_label_added": label == captain, "added": [label], "at": 5}})
+        elif case == "cleared_this_head":
+            self.adopt_state(clears={"acme/app#%d" % n: {"head": LEDGER_HEAD, "reason": "x", "by": "own", "at": 1, "removed": [label]}})
+        elif case in ("cleared_other_head_floor_holds", "hand_rehold_wants_it", "cleared_other_head_rated_here"):
+            self.adopt_state(clears={"acme/app#%d" % n: {"head": self.ADOPT_HEAD_OTHER, "reason": "x", "by": "own", "at": 1, "removed": [label]}})
+        if case == "cleared_other_head_rated_here":
+            self.rated_here(n)
+        if case == "hand_rehold_wants_it":
+            self.passes([])   # the engine
+            self.prs[n]["labels"] = [{"name": l} for l in on_pr]
+            report = sb.pr_floor_report(self.engine, "acme/app", n)
+            self.assertTrue(sb._impact_rehold_now(self.engine, "acme/app", n, "acme/app#%d" % n, report, {"labels": []}), "the re-hold path holds it again")
+        else:
+            self.passes([self.listed(n, on_pr)], live={n: on_pr})
+        return wanted_by_floor
+
+    def assert_adopt_cell(self, label, case):
+        wanted_by_floor = self.run_adopt_case(label, case)
+        got, record = self.adopted(), self.recorded()
+        if case in ("hand_floor_holds", "cleared_other_head_floor_holds"):
+            expected = [label] if wanted_by_floor else []   # `hold-owner` is not a label the rule writes: never adopted
+        elif case == "hand_rehold_wants_it":
+            expected = [] if label == self.names[sb.OWNER_HOLD_KEY] else [label]   # the owner's own hold is never the daemon's, a re-hold does not restore it
+        else:
+            expected = []
+        self.assertEqual([d["label"] for d in got], expected, "%s / %s" % (label, case))
+        self.assertTrue(all(d["head"] == (LEDGER_HEAD) for d in got))
+        if expected:
+            self.assertIn(label, record["added"], "an adopted label is in the record a daemon-added label is kept in")
+            self.assertEqual(record["merge_label_added"], self.names["merge-captain"] in record["added"])
+            self.assertEqual(sorted(record), ["added", "at", "head", "merge_label_added"], "the record keeps its shape")
+        elif case in ("not_holds_by_hand", "cleared_this_head", "cleared_other_head_rated_here"):
+            self.assertIsNone(record if case != "cleared_this_head" else None, "nothing was written")
+        if case in ("hand_floor_holds", "cleared_other_head_floor_holds") and not wanted_by_floor:
+            self.assertNotIn(label, [l for w in self.posts(10) for l in w[2]["labels"]], "a class the rule does not write is never written by it")
+
+    def test_a_pull_request_that_moved_since_it_was_judged_gets_nothing_adopted_added_or_restored(self):   # #891 M1: every write below the fresh read is for the judged head only
+        n = 10
+        self.files(n, "shims/gh")
+        self.passes([])
+        report = sb.pr_floor_report(self.engine, "acme/app", n)   # judged at LEDGER_HEAD: the rule holds it
+        self.assertEqual(report["head"], LEDGER_HEAD)
+        cases = {"adopt": (self.both(), None), "add": ([], None), "restore": ([self.names["hold-credential"]], "re-hold")}
+        for name, (labels, rehold) in cases.items():
+            self.prs[n] = {"headRefOid": LEDGER_NEW_HEAD, "changedFiles": 1, "files": [{"path": "docs/a.md"}], "labels": [{"name": l} for l in labels]}   # moved: the rule no longer holds it
+            self.adopt_state(clears={"acme/app#10": {"head": self.ADOPT_HEAD_OTHER, "reason": "x", "by": "own", "at": 1, "removed": [self.names["hold-credential"]]}} if rehold else {})
+            self.writes.clear()
+            spent = sb.apply_impact_hold(self.engine, "acme/app", n, dict(report, reasons=["x"], **({"rehold": "held again"} if rehold else {})), {})
+            self.assertEqual((spent, self.writes, self.recorded(n), self.adopted(n)), (0, [], None, []), name)
+
+    def test_every_consumer_of_the_hold_label_family_is_listed_with_what_it_does_with_the_owners_own_hold(self):   # #891 M2: derived from the code
+        import glob
+        refs = ("CAPTAIN_HOLD_LABELS", "OWNER_HOLD_KEY", "OTHER_HOLD_KEYS")
+        found, uses_owner = {}, {}
+        for path in sorted(glob.glob(str(Path(sb.KIT_ROOT) / "bin" / "*.py")) + [str(Path(sb.KIT_ROOT) / "bin" / "fleet-switchboard")]):
+            tree = ast.parse(Path(path).read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef):
+                    inside = list(ast.walk(node))
+                    names_in = {x.id for x in inside if isinstance(x, ast.Name)} | {x.attr for x in inside if isinstance(x, ast.Attribute)}
+                    if names_in & {"CAPTAIN_HOLD_LABELS", "OWNER_HOLD_KEY"} or any(isinstance(x, ast.Constant) and x.value == "hold-" for x in inside):
+                        found[node.name] = Path(path).name
+                        uses_owner[node.name] = "OWNER_HOLD_KEY" in names_in
+        # name: does its code name the owner's hold key (an exclusion or a refusal)? and the reason
+        table = {"fleet_labels": (True, "a remover: the merged cleanup never removes it"),
+                 "run_pass": (True, "the merged cleanup audits that it merged against it"),
+                 "_labels_ours": (True, "the record never lists it as ours"),
+                 "_apply_impact_hold_locked": (True, "the rule never writes, restores or adopts it"),
+                 "authors_hold_labels": (False, "the owner's plain clear lifts every fleet hold label, it included"),
+                 "impact_clear_core": (True, "the delegated clear refuses it; the plain clear lifts it"),
+                 "captain_escalation_leaves": (False, "a reader: a pull request carrying it is still held"),
+                 "pr_hold_reasons": (False, "a reader: it is a hold reason"),
+                 "label_hold_entries": (False, "a reader: it is a decision row"),
+                 "sweep_read_repo": (False, "a reader: it is a held pull request"),
+                 "sweep_verify": (False, "a reader: a closed unmerged pull request that carries it is still a finding")}
+        self.assertEqual(set(found), set(table), "a new consumer of the hold label family must be added to this table with a decision about hold-owner")
+        self.assertEqual({k: uses_owner[k] for k in table}, {k: v[0] for k, v in table.items()}, "a remover or an actor names the owner's key; a reader never filters it out")
+        self.assertEqual(sb.pr_hold_reasons([{"name": self.names["hold-owner"]}]), ["owner"])
+        self.assertIn(self.names["hold-owner"], sb.authors_hold_labels(self.names, {"labels": [self.names["hold-owner"]]}, []))
+
+    ADOPT_CASES = ("hand_floor_holds", "hand_rehold_wants_it", "daemon_present", "absent", "not_holds_by_hand", "cleared_this_head",
+                   "cleared_other_head_rated_here", "cleared_other_head_floor_holds")
+
+    def test_the_adoption_table_is_the_labels_the_code_names_by_the_cases_and_every_cell_has_its_test(self):
+        labels = [name for _, name in self.adopt_labels()]
+        self.assertIn(self.names["hold-owner"], labels, "hold-owner is a member (no count is pinned: a later class is a new row by derivation)")
+        from_specs = {self.names[key] for key, _, _ in sb.LABEL_SPECS if key.startswith("hold-")}
+        self.assertEqual({n for k, n in self.adopt_labels() if k != "merge-captain"}, from_specs, "the label bootstrap creates exactly the hold classes the table names")
+        cc = sb.load_module("chat_clear")
+        self.assertEqual(set(cc.HOLD_KEYS + cc.OTHER_HOLD_KEYS), {k for k, _ in self.adopt_labels() if k != "merge-captain"}, "the chat clear names every hold class, offered or not")
+        self.assertFalse(cc.is_offerable(self.names, [self.names["hold-impact"], self.names["hold-owner"]]), "a chat clear never offers the owner's own hold")
+        self.assertEqual(sorted(labels), sorted(sb.authors_hold_labels(self.names, {"labels": list(self.names.values())}, [])),
+                         "the table's labels are the labels the clear classes as the fleet's own holds (one derivation)")
+        made = {name[len("test_adoption_cell_"):] for name in dir(type(self)) if name.startswith("test_adoption_cell_")}
+        want = {"%s__%s" % (key.replace("-", "_"), case) for key, _ in self.adopt_labels() for case in self.ADOPT_CASES}
+        self.assertEqual(made, want, "one test per label and case: a new class or case without one fails here")
+
+    def test_a_hand_label_adopted_is_recorded_audited_once_and_the_delegated_clear_lifts_it(self):
+        n = 10
+        self.files(n, "shims/gh")
+        self.passes([self.listed(n, self.both())], live={n: self.both()})
+        self.assertEqual(sorted(d["label"] for d in self.adopted()), sorted(self.both()))
+        self.assertEqual(self.posts(n), [], "nothing was written to GitHub: the labels were there")
+        self.assertEqual((self.recorded()["added"], self.recorded()["merge_label_added"]), (sorted(self.both()), True))
+        lines = sb.impact_clear_core(self.engine, self.route, "acme/app", n, "boss", "a judged false hold", head=LEDGER_HEAD, via="order:5", under_order=self.ADOPT_ORDER)
+        self.assertTrue(lines[0].startswith("cleared the impact hold"), lines)
+        self.assertEqual(sorted(w[1].rsplit("/", 1)[-1] for w in self.removals(n)), sorted(urllib.parse.quote(l, safe="") for l in self.both()))
+
+    def test_the_owners_own_hold_is_refused_by_the_delegated_clear_whatever_the_score_with_its_own_reason_and_lifted_by_the_owners_plain_clear(self):
+        n, owner = 10, self.names["hold-owner"]
+        self.files(n, "shims/gh")
+        everything = self.both() + [owner]
+        self.passes([self.listed(n, everything)], live={n: everything})
+        self.assertEqual(sorted(d["label"] for d in self.adopted()), sorted(self.both()), "adopted: the rule's labels, never the owner's own hold")
+        self.assertNotIn(owner, self.recorded()["added"])
+        for order in (dict(self.ADOPT_ORDER), dict(self.ADOPT_ORDER, threshold="High", score="Low")):
+            with self.assertRaises(sb.NoticeError) as raised:
+                sb.impact_clear_core(self.engine, self.route, "acme/app", n, "boss", "r", head=LEDGER_HEAD, via="order:5", under_order=order)
+            self.assertIn("owner's own hold", str(raised.exception))
+        self.assertEqual((self.removals(n), self.events("gate.hold_cleared")), ([], []))
+        refused = [e for e in self.events("gate.hold_clear_refused")]
+        self.assertEqual([(e["detail"]["owner_hold"], "owner's own hold" in e["detail"]["why"]) for e in refused], [(True, True)] * 2, "its own audited reason")
+        sb.impact_clear_core(self.engine, self.route, "acme/app", n, "owner", "r", head=LEDGER_HEAD)   # the owner's PLAIN clear
+        self.assertIn(urllib.parse.quote(owner, safe=""), [w[1].rsplit("/", 1)[-1] for w in self.removals(n)])
+
+    def test_a_re_hold_never_puts_the_owners_own_hold_back_and_a_record_that_lists_it_does_not_make_it_ours(self):
+        n, owner = 10, self.names["hold-owner"]
+        self.files(n, "docs/a.md")
+        self.adopt_state(clears={"acme/app#10": {"head": self.ADOPT_HEAD_OTHER, "reason": "x", "by": "own", "at": 1, "removed": [owner, self.names["hold-impact"]]}})
+        self.passes([self.listed(n)], live={n: []})
+        self.assertEqual([l for w in self.posts(n) for l in w[2]["labels"] if l == owner], [], "not restored")
+        names = self.names
+        listed = {"clears": {}, "applied": {"p": {"added": [owner, names["hold-impact"]], "at": 1, "head": "h", "merge_label_added": False}}}
+        self.assertEqual(sb._labels_ours(names, listed, "p", wide=True), [names["hold-impact"]])
+
+    def test_without_adoption_the_same_hand_label_is_refused_and_a_label_on_a_pull_request_the_rule_does_not_hold_stays_a_persons(self):
+        n = 10
+        self.files(n, "docs/a.md")   # the rule does not hold this one
+        self.passes([self.listed(n, self.both())], live={n: self.both()})
+        self.assertEqual((self.adopted(), self.recorded()), ([], None))
+        with self.assertRaises(sb.NoticeError) as raised:
+            sb.impact_clear_core(self.engine, self.route, "acme/app", n, "boss", "r", head=LEDGER_HEAD, via="order:5", under_order=self.ADOPT_ORDER)
+        self.assertIn("a person's own hold", str(raised.exception))
+        self.assertEqual(self.removals(n), [])
+        self.assertEqual(self.events("gate.hold_cleared"), [])
+
+    def test_adoption_is_once_across_passes_and_a_restart_and_a_clear_and_a_new_head_treat_it_as_the_daemons_own(self):
+        n = 10
+        self.files(n, "shims/gh")
+        for _ in range(3):
+            self.fresh_pass([self.listed(n, self.both())], live={n: self.both()})
+        self.assertEqual(len(self.adopted()), 2, "2 labels, each audited once over 3 passes")
+        del self.engine   # a restart: the engine is new, the state file is all that is left
+        self.fresh_pass([self.listed(n, self.both())], live={n: self.both()})
+        self.assertEqual(len(self.adopted()), 2, "a restart adopts and audits nothing more")
+        sb.impact_clear_core(self.engine, self.route, "acme/app", n, "boss", "r", head=LEDGER_HEAD, via="order:5", under_order=self.ADOPT_ORDER)
+        self.assertIsNone(self.recorded(), "a clear consumes the record exactly as for a daemon label")
+        self.files(n, "shims/gh", head=LEDGER_NEW_HEAD)
+        self.writes.clear()
+        self.fresh_pass([self.listed(n, head=LEDGER_NEW_HEAD)], live={n: []})
+        self.assertEqual(sorted(l for w in self.posts(n) for l in w[2]["labels"]), sorted(self.both()), "re-applied at the new head")
+        self.assertEqual(self.recorded()["head"], LEDGER_NEW_HEAD)
+        self.assertEqual(len(self.adopted()), 2, "re-applied labels are the daemon's, never adopted")
+
+    def test_a_cut_label_read_or_a_state_noted_unreadable_adopts_nothing(self):
+        n, captain = 10, self.names["merge-captain"]
+        self.files(n, "shims/gh")
+        self.passes([self.listed(n)], live={n: []})
+        for cut in ([{"name": captain}, {"name": None}], [{"name": captain}, {}], [captain, 7]):
+            self.adopt_state()
+            self.prs[n]["labels"] = cut
+            self.fresh_pass([self.listed(n)], live={n: cut})
+            self.assertEqual(self.adopted(), [], repr(cut))
+            self.assertNotIn(captain, (self.recorded(n) or {}).get("added", []), repr(cut))
+        self.prs[n]["labels"] = [{"name": captain}]
+        (self.world.state / "impact-hold.json").write_text("{not json")
+        self.fresh_pass([self.listed(n)], live={n: [captain]})
+        self.assertEqual(self.adopted(), [], "a state noted unreadable in this pass adopts nothing in it")
+        report = sb.pr_floor_report(self.engine, "acme/app", n)
+        self.adopt_state()
+        self.prs[n]["labels"] = None   # the labels field is not a list at all: the apply raises, as before, and nothing is recorded
+        with self.assertRaises(Exception):
+            sb.apply_impact_hold(self.engine, "acme/app", n, dict(report, reasons=["x"]), {})
+        self.assertEqual(self.adopted(), [])
+
+    def test_a_pull_request_of_a_repository_the_daemon_does_not_watch_is_never_adopted_or_written(self):
+        self.files(10, "shims/gh")
+        self.passes([])
+        other = self.listed(11, self.both())
+        self.prs[11] = dict(self.prs.get(10), labels=[{"name": l} for l in self.both()])
+        self.hub.prs["acme/other"] = [other]   # listed by the hub, but the repository is under neither plan_gates nor impact_floor
+        before = len(self.writes)
+        sb.ci_record_pass(self.engine, self.t + 400)
+        sb.impact_would_hold_pass(self.engine, self.t + 400)
+        self.assertEqual((self.adopted(11), len(self.writes) - before), ([], 0))
+        self.assertIsNone(sb.read_impact_state(self.world.state)[0]["applied"].get("acme/other#11"))
+        self.assertEqual([e for e in self.events("gate.label_adopted") if e["subject"].startswith("acme/other")], [])
+
+    def test_an_adopting_pass_makes_no_extra_gh_call_and_the_dry_run_names_the_adoption(self):
+        n = 10
+        self.files(n, "shims/gh")
+        self.passes([self.listed(n, self.both())], live={n: self.both()})
+        self.assertEqual(self.view_reads, [n], "one floor read, as for any judged pull request")
+        code, out, err = self.run_as("coder", "impact", "hold", "--dry-run", "--repo", "acme/app")
+        self.assertEqual(code, 0, err)
+        self.assertIn("already labelled", out, "after the adoption it is recorded: nothing more to adopt")
+        del self.engine
+        self.adopt_state()
+        before = len(self.adopted())
+        code, out, err = self.run_as("coder", "impact", "hold", "--dry-run", "--repo", "acme/app")
+        self.assertIn("would adopt", out)
+        self.assertEqual(len(self.adopted()), before, "the dry run writes and audits nothing")
+
+
+def _adoption_cells():
+    for _key in ("merge-captain",) + tuple(sb.CAPTAIN_HOLD_LABELS):
+        for _case in TestImpactRejudge.ADOPT_CASES:
+            def cell(self, _key=_key, _case=_case):
+                self.assert_adopt_cell(self.names[_key], _case)
+            setattr(TestImpactRejudge, "test_adoption_cell_%s__%s" % (_key.replace("-", "_"), _case), cell)
+
+
+_adoption_cells()
 
 
 class TestImpactHold(LedgerBase):
@@ -46331,7 +47255,7 @@ class TestSupersede(WriteWorld):
 
 class TestLabelsEnsure(WriteWorld):
     NEW = ("parked", "merge-captain", "merge-automatic", "hold-security", "hold-credential", "hold-contract", "hold-policy",
-           "hold-prod-config", "hold-other-area", "hold-impact")
+           "hold-prod-config", "hold-other-area", "hold-impact", "hold-owner")
     WANT = sorted(["me:awaiting-cos", "me:awaiting-user", sb.orchestrator_label()]
                   + ["%s:%s" % (sb.orchestrator_label().split(":")[0], k) for k in NEW])
 
@@ -52689,6 +53613,7 @@ class TestExternalDecisionSync(ExternalWorld):
         self.run_pass()
         self.assertEqual(self.fake.items[self.ext_of("issue")]["state"], "withdrawn")
 
+    @mock.patch.object(sb, "adoption_pass", new=lambda *a, **k: None)   # #838: a boss that is gone is replaced by an adoption within a pass; this test is about the pass that sees it unreadable first (adoption is TestAdoption's)
     def test_an_unreadable_boss_does_not_stop_an_answered_report_of_another_boss_leaving(self):
         """#80: web-orch is gone (its reports cannot be read); api-coder's answered question still leaves."""
         self.turn_on(repos=[API, WEB])
@@ -61838,7 +62763,7 @@ class TestReviewerSubagents(LedgerBase):
     def test_block_takes_nothing_else_and_the_flag_form_is_still_there(self):
         code, out, err = self.record_block("coder", "code", self.block_text(), "--verdict", "approve")
         self.assertEqual(code, 2)
-        self.assertIn("give nothing else", err)
+        self.assertIn(sb.BLOCK_TABLE_TEXT, err)
         self.assertEqual(self.record("coder", "code", "approve")[0], 0)
 
     # -- the shadow line
@@ -66774,8 +67699,15 @@ class TestClearCodePathsAlwaysHeld(unittest.TestCase):
 
     def test_s7_one_reader_serves_the_floor_and_the_clear_and_the_rule_names_no_path(self):
         self.assertEqual(self.floor.clear_code_paths(self.matrix), (self.listed, None))
-        source = (BIN / "impact_hold.py").read_text()
-        self.assertIn("impact_floor.clear_code_paths(matrix)", source)
+        matrix = json.loads(json.dumps(self.matrix))
+        matrix["owner_hold"]["delegated_clear"]["clear_code_paths"].append("brand/new/**")   # one entry added to the matrix: the floor holds it AND the clear refuses it
+        self.assertEqual(self.reason_of("brand/new/a.py", matrix)[0], "hold")
+        listed, problem = self.floor.clear_code_paths(matrix)
+        self.assertIsNone(problem)
+        report = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": False, "top_tier_hits": {}, "review_action": "none", "review_class": None, "changed_paths": []}
+        refused = self.clear.refusals(dict(matrix["owner_hold"]["delegated_clear"], clear_code_paths=listed), report,
+                                      [{"filename": "brand/new/a.py", "previous_filename": None, "status": "modified"}], self.floor.matches, {}, {"reasons": [], "level": "Low"})
+        self.assertEqual(len(refused), 1, refused)
         import ast
         tree = ast.parse((BIN / "impact_floor.py").read_text())
         constants = {n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
@@ -67314,7 +68246,7 @@ class TestReassign(IntentCase):
         ra = sb.load_module("reassign")
         self.world.add_agent("worker2", fleet={"role": "coder", "issue": 4, "reports_to": "orch-a"})
         self.assertEqual(self.main("reassign", "worker2", "--to", "orch-b", "--consent-from", "orch-a")[0], 0)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"worker2": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
+        set_retired(self.world.state, {"worker2": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
         self.assertEqual(self.reassign()[0], 0)
         self.assertEqual(sorted(ra.read_overrides(self.world.state)[0]), ["worker"], "the retired worker's override is gone")
 
@@ -67358,15 +68290,15 @@ class TestReassign(IntentCase):
         self.assertIn("may not reattach", got["orch-a"])
 
     def test_a_retired_or_excluded_orchestrator_is_refused_as_the_target_and_as_the_consenting_boss(self):
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"orch-b": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
+        set_retired(self.world.state, {"orch-b": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
         code, _, err = self.reassign()
         self.assertEqual(code, 2)
         self.assertIn("the target orch-b is retired", err)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"orch-a": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
+        set_retired(self.world.state, {"orch-a": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
         code, _, err = self.reassign()
         self.assertEqual(code, 2)
         self.assertIn("the consenting boss orch-a is retired", err)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {})
+        set_retired(self.world.state, {})
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO, "excluded_repos": [FAKE_REPO]})
         code, _, err = self.reassign()
         self.assertEqual(code, 2)
@@ -67463,6 +68395,592 @@ class LanesCase(IntentCase):
         return [n for n in self.gh.issues if n in (1, 10) and self.gh.issues[number].get("parent") == n]
 
 
+class TestAdoption(LanesCase):
+    """#838: no orphan workers. Charter 1 is orch-a's, charter 10 orch-b's; the Chief of Staff is `chief-of-staff`."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(sb, "owner_terminal_problem", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ, {}, clear=False)       # HERDR_PANE_ID and the session variable are restored after each test
+        env.start()
+        self.addCleanup(env.stop)
+        self.as_agent("chief-of-staff")
+        self.world.herdr.closed.clear()
+
+    def boss(self, name):
+        discovery = self.world.new_engine().discover(self.world.clock.now())
+        return sb.boss_name(discovery, discovery.agents[name])
+
+    def worker(self, name, boss, charter=None, issue=None, idle=True):
+        fleet = {"role": "coder", "reports_to": boss}
+        if charter is not None:
+            fleet["charter"] = charter
+        if issue is not None:
+            fleet["issue"] = issue
+        self.world.add_agent(name, fleet=fleet)
+        if idle:
+            self.world.herdr.panes[self.world.panes[name]]["status"] = "idle"
+
+    def daemon_pass(self):
+        engine = self.world.new_engine()
+        engine.discover(self.world.clock.now())
+        sb.adoption_pass(engine, self.world.clock.now())
+
+    def rows(self, event="boss.adopted"):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def record_path(self):
+        return Path(self.world.state) / "boss-overrides.json"
+
+    def operator(self):
+        os.environ.pop("HERDR_PANE_ID", None)
+        os.environ.pop(sb.SESSION_ENV, None)
+
+    def as_role(self, name):
+        os.environ["HERDR_PANE_ID"] = self.world.panes[name]
+
+    def test_a_pass_gives_every_worker_with_no_live_boss_its_heir_once_and_audits_it(self):   # S1 S6 S7
+        self.worker("w1", "gone", charter=1)
+        self.worker("w2", None, charter=1)
+        self.worker("w3", "ghost", charter=10)
+        self.worker("w4", "gone")
+        self.daemon_pass()
+        self.assertEqual([self.boss(n) for n in ("w1", "w2", "w3", "w4")], ["orch-a", "orch-a", "orch-b", "chief-of-staff"])
+        mine = {"w1", "w2", "w3", "w4"}
+        self.assertEqual(self.boss("worker"), "orch-a", "a worker with a live boss is not touched")
+        rows = [r for r in self.rows() if r["detail"]["worker"] in mine]
+        self.assertEqual(sorted((r["detail"]["worker"], r["detail"]["heir"], r["detail"]["path"]) for r in rows),
+                         [("w1", "orch-a", "pass"), ("w2", "orch-a", "pass"), ("w3", "orch-b", "pass"), ("w4", "chief-of-staff", "pass")])
+        self.assertTrue(all(r["detail"]["why"].startswith("boss gone") and r["detail"]["by"] == sb.ADOPT_BY_DAEMON for r in rows))
+        before = len(self.rows())
+        self.daemon_pass()
+        self.assertEqual(len(self.rows()), before, "a second pass writes nothing")
+
+    def test_no_heir_changes_nothing_and_says_so_once(self):   # S7
+        sid = self.world.sessions["chief-of-staff"]
+        self.world.v2.sessions[sid]["metadata"]["fleet"]["role"] = "coder"
+        self.worker("w4", "gone")
+        engine = self.world.new_engine()          # the daemon's engine lives across passes: it remembers it said so
+        for _ in range(2):
+            engine.discover(self.world.clock.now())
+            sb.adoption_pass(engine, self.world.clock.now())
+        self.assertFalse(self.record_path().exists(), "0 boss records written")
+        self.assertEqual(len([r for r in self.rows("boss.no_heir") if r["detail"]["worker"] == "w4"]), 1)
+
+    def test_a_live_boss_a_forged_live_name_and_another_charters_orchestrator_never_adopt(self):   # S8
+        self.worker("forged", "orch-b", charter=1)            # a forged boss name that is a live agent
+        self.worker("elsewhere", "orch-a", charter=10)        # live boss; the charter's own orchestrator is another one
+        self.daemon_pass()
+        self.assertEqual((self.boss("forged"), self.boss("elsewhere")), ("orch-b", "orch-a"))
+        self.assertEqual([r for r in self.rows() if r["detail"]["worker"] in ("forged", "elsewhere", "worker")], [], "0 rows, 0 boss records for them")
+        self.worker("orphan10", "gone", charter=10)
+        self.daemon_pass()
+        self.assertEqual(self.boss("orphan10"), "orch-b", "never the orchestrator of another charter")
+
+    def test_a_retired_boss_that_still_has_a_pane_is_not_a_boss(self):   # S1
+        self.worker("w1", "orch-a", charter=1)
+        self.operator()
+        self.assertEqual(self.main("retire", "orch-a")[0], 0)
+        self.assertEqual(self.boss("w1"), "chief-of-staff", "orch-a is retired and charter 1 has no other orchestrator")
+
+    def test_retiring_an_orchestrator_re_points_its_workers_in_the_same_command(self):   # S2
+        self.world.add_agent("orch-a2", fleet={"role": "orchestrator", "charter": 1})
+        self.worker("w1", "orch-a", charter=1)
+        self.worker("w2", "orch-a", charter=1)
+        self.as_agent("chief-of-staff")
+        code, out, err = self.main("retire", "orch-a")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([self.boss(n) for n in ("w1", "w2", "worker")], ["orch-a2"] * 3, "no daemon pass ran (worker has no charter of its own: its old boss's)")
+        rows = self.rows()
+        self.assertEqual(sorted(r["detail"]["worker"] for r in rows), ["w1", "w2", "worker"])
+        self.assertTrue(all(r["detail"]["path"] == "retire" and r["detail"]["was"] == "orch-a" and r["detail"]["heir"] == "orch-a2" for r in rows))
+        self.assertIn("adopted: w1 now reports to orch-a2", out)
+
+    def test_retiring_an_orchestrator_with_no_replacement_gives_its_workers_to_the_chief_of_staff(self):   # S2
+        self.worker("w1", "orch-a", charter=1)
+        self.main("retire", "orch-a")
+        self.assertEqual((self.boss("w1"), self.boss("worker")), ("chief-of-staff", "chief-of-staff"))
+
+    def launch_orchestrator(self, name):
+        return self.main("launch", name, "--agent", "coder", "--dir", str(self.home), "--headless", "--role", "orchestrator", "--charter", "1")
+
+    def test_relaunching_an_orchestrator_under_the_same_name_leaves_no_worker_orphaned(self):   # S3
+        self.worker("w1", "orch-gone", charter=1)
+        code, out, err = self.launch_orchestrator("orch-gone")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.boss("w1"), "orch-gone", "the relaunched agent is the live boss")
+        self.assertEqual([r for r in self.rows() if r["detail"]["worker"] == "w1"], [], "nothing needed re-pointing: 0 rows for it")
+
+    def test_a_replacement_orchestrator_inherits_the_workers_of_its_charter(self):   # S4
+        self.worker("w1", "orch-a", charter=1)
+        del self.world.herdr.panes[self.world.panes["orch-a"]]          # orch-a is gone
+        code, out, err = self.launch_orchestrator("orch-new")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.boss("w1"), "orch-new")
+        self.assertEqual(sorted((r["detail"]["worker"], r["detail"]["path"]) for r in self.rows()), [("w1", "replace")])   # `worker` has no charter and its boss is gone: the next pass gives it to the Chief of Staff
+
+    def test_moving_an_ask_re_points_its_workers_and_only_its_workers(self):   # S5
+        self.worker("other", "orch-a", charter=1, issue=4)
+        code, out, err = self.main("move", "2", "--to", "10")
+        self.assertEqual(code, 0, err)
+        self.assertEqual((self.boss("worker"), self.boss("other")), ("orch-b", "orch-a"))
+        (row,) = self.rows()
+        self.assertEqual((row["detail"]["worker"], row["detail"]["path"], row["detail"]["heir"]), ("worker", "move", "orch-b"))
+
+    DAMAGED = {"corrupt": b"{not json", "truncated": b'{"overrides": {"w', "a list": b"[]", "a record that is not an object": b'{"overrides": {"w": 5}}',
+               "unreadable (a directory)": "dir"}
+
+    def damage(self, file, shape):
+        path = Path(self.world.state) / file
+        if path.exists() and path.is_dir():
+            return
+        if path.exists():
+            path.unlink()
+        if shape == "dir":
+            path.mkdir()
+        elif file == sb.RETIRED_FILE and shape == b'{"overrides": {"w": 5}}':
+            path.write_bytes(b'{"w": 5}')
+        else:
+            path.write_bytes(shape)
+
+    def test_a_record_that_cannot_be_read_in_full_changes_nothing_for_every_strict_record(self):   # S9 (one case per member of the table, per shape)
+        files = [f for f, _ in sb.ADOPT_STRICT_RECORDS]
+        self.assertEqual(files, [sb.RETIRED_FILE, "boss-overrides.json"], "the table the code loops over is the list under test")
+        for file in files:
+            for label, shape in self.DAMAGED.items():
+                with self.subTest(file=file, shape=label):
+                    self.worker("w-%d" % len(self.world.panes), "gone", charter=1)
+                    self.damage(file, shape)
+                    before = {f: ((Path(self.world.state) / f).read_bytes() if (Path(self.world.state) / f).is_file() else None) for f in files}
+                    self.daemon_pass()
+                    self.assertEqual(self.rows(), [], "no boss written")
+                    after = {f: ((Path(self.world.state) / f).read_bytes() if (Path(self.world.state) / f).is_file() else None) for f in files}
+                    self.assertEqual(before, after)
+                    path = Path(self.world.state) / file
+                    if path.is_dir():
+                        path.rmdir()
+                    elif path.exists():
+                        path.unlink()
+
+    def test_an_agent_list_that_cannot_be_read_adopts_nothing(self):   # S9 (the agent list)
+        self.worker("w1", "gone", charter=1)
+        engine = self.world.new_engine()
+        discovery = engine.discover(self.world.clock.now())
+        discovery.problems.append("session list failed")
+        engine.discovery = discovery
+        sb.adoption_pass(engine, self.world.clock.now())
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(sb.adopt_workers(engine, "pass", "x", discovery)[1][:20], "the agent list canno")
+
+    def test_a_boss_set_between_the_plan_and_the_write_is_never_overwritten(self):   # judged again under the lock
+        self.worker("w1", "gone", charter=1)
+        real = sb._read_strict_records
+        sid = self.world.sessions["w1"]
+
+        def concurrent_reassign(state):
+            records = real(state)
+            module = sb.load_module("reassign")
+            module.write_overrides(state, {"w1": {"boss": "orch-b", "was": "gone", "original": "gone", "session": sid, "by": "chief-of-staff", "at": float(self.world.clock.now())}})
+            return records
+
+        with mock.patch.object(sb, "_read_strict_records", concurrent_reassign):
+            self.daemon_pass()
+        self.assertEqual(self.boss("w1"), "orch-b", "the boss set in the gap stands")
+        self.assertEqual([r for r in self.rows() if r["detail"]["worker"] == "w1"], [])
+
+    def retired_orphan(self, name="w1", boss="gone", charter=None):
+        self.worker(name, boss, charter=charter)
+        self.operator()
+        self.assertEqual(self.main("retire", name)[0], 0)
+        self.world.herdr.closed.clear()
+        self.as_agent("chief-of-staff")
+
+    def test_the_chief_of_staff_adopts_a_retired_orphan_and_closes_it_as_its_boss(self):   # S10
+        self.retired_orphan()
+        pane = self.world.panes["w1"]
+        retired_before = sb.read_retired(self.world.state)["w1"]
+        code, out, err = self.main("retire", "w1", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.herdr.closed, [pane])
+        (closed,) = self.rows("fleetpane.closed")
+        self.assertEqual((closed["subject"], closed["detail"]["pane"], closed["detail"]["by"]), ("w1", pane, "chief-of-staff"))
+        self.assertIn("adopted by chief-of-staff", closed["detail"]["boss_rule"])
+        self.assertNotIn("command", json.dumps(closed))
+        (row,) = self.rows()
+        self.assertEqual((row["detail"]["path"], row["detail"]["heir"]), ("close", "chief-of-staff"))
+        module = sb.load_module("reassign")
+        records = module.read_overrides(self.world.state)[0]
+        module.prune(records, sb.read_retired(self.world.state), self.world.clock.now())
+        self.assertIn("w1", records, "an adoption of a retired worker survives the housekeeping")
+
+    def test_the_close_stays_refused_for_a_live_worker_a_live_boss_and_another_orchestrator(self):   # S12 U2
+        self.worker("live", "gone")                                      # not retired
+        self.retired_orphan("w2", "orch-a")                              # retired, boss live
+        self.retired_orphan("w3", "gone")                                # retired, boss gone
+        cases = [("chief-of-staff", "live"), ("chief-of-staff", "w2"), ("orch-b", "w3")]
+        for who, name in cases:
+            with self.subTest(who=who, worker=name):
+                self.as_agent(who)
+                before = {f: ((Path(self.world.state) / f).read_bytes() if (Path(self.world.state) / f).exists() else None) for f in (sb.RETIRED_FILE, "boss-overrides.json")}
+                code, out, err = self.main("retire", name, "--close")
+                self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+                after = {f: ((Path(self.world.state) / f).read_bytes() if (Path(self.world.state) / f).exists() else None) for f in before}
+                self.assertEqual(before, after)
+        self.assertNotIn("live", sb.read_retired(self.world.state))
+        self.as_agent("chief-of-staff")
+        self.assertIn("may not close live's pane", self.main("retire", "live", "--close")[2])
+
+    # ---- close-pane
+    def bare_world(self, **entry):
+        wt = self.home / "wt-bare"
+        wt.mkdir(exist_ok=True)
+        sb.register_worktree(self.world.state, str(wt), "worker", None, "wt-bare", 1)
+        base = {"pane_id": "w1:p90", "cwd": str(wt), "foreground_cwd": str(wt), "revision": 7, "processes": ["zsh"]}
+        base.update(entry)
+        (Path(self.world.state) / sb.BARE_PANES_FILE).unlink(missing_ok=True)      # nothing remembered of any pane: every case starts as a first run
+        self.world.herdr.closed.clear()
+        self.world.herdr.plain_terminals = [base]
+        return base
+
+    def test_the_chief_of_staff_closes_an_idle_bare_shell_inside_a_fleet_worktree(self):   # S11
+        self.bare_world()
+        code, out, err = self.main("close-pane", "w1:p90")
+        self.assertEqual((code, self.world.herdr.closed), (1, []), "the first run only notes its revision")
+        self.assertIn("not been seen idle", err)
+        self.world.tick(11 * 60)
+        code, out, err = self.main("close-pane", "w1:p90")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.herdr.closed, ["w1:p90"])
+        (row,) = self.rows("fleetpane.closed")
+        self.assertEqual((row["detail"]["by"], row["detail"]["pane"]), ("chief-of-staff", "w1:p90"))
+        self.assertTrue(row["detail"]["cwd"].endswith("wt-bare"))
+        self.assertNotIn("command", json.dumps(row))
+
+    # (guard, variant) -> (marker the refusal names, what a build WITHOUT the guard does: "closes" or None when another check refuses first)
+    GUARD_CASES = {
+        ("own-pane", "env"): ("the one you are in", "closes"),
+        ("listed", "absent"): ("is not listed", None),
+        ("unnamed", "pane-health record only"): ("is named by an agent record", "closes"),
+        ("unnamed", "herdr agent list only"): ("is named by an agent record", "closes"),
+        ("bare-shell", "a job runs"): ("has a foreground job", "closes"),
+        ("bare-shell", "no process reported"): ("has a foreground job", "closes"),
+        ("worktree", "outside any worktree"): ("not inside a fleet worktree", "closes"),
+        ("worktree", "below an agent's own cwd"): ("not inside a fleet worktree", "closes"),
+        ("idle", "first run"): ("not been seen idle", "closes"),
+    }
+
+    def break_guard(self, guard, variant):
+        """The one fact that makes exactly `guard` fail, in the way `variant` says, on an otherwise closable pane. Returns the pane id."""
+        self.bare_world()
+        plain = self.world.herdr.plain_terminals[0]
+        pane = "w1:p90"
+        if guard == "own-pane":
+            os.environ["HERDR_PANE_ID"] = pane
+            os.environ[sb.SESSION_ENV] = self.world.sessions["chief-of-staff"]
+        elif guard == "listed":
+            self.world.herdr.plain_terminals = []
+        elif guard == "unnamed" and variant == "pane-health record only":
+            (Path(self.world.state) / sb.PANE_HEALTH_FILE).write_text(json.dumps({"agents": {"ghost": {"pane": pane, "session": "ses_x"}}, "states": {}, "missing": {}}))
+        elif guard == "unnamed":   # herdr's own agent list names a pane that is no fleet agent (a session with no fleet metadata)
+            self.world.herdr.plain_terminals = []
+            session = self.world.v2.create_session({})
+            pane = self.world.herdr.new_pane_id()
+            self.world.herdr.add(pane, session, "idle", program="zsh")
+            self.world.herdr.panes[pane].update({"cwd": plain["cwd"], "foreground_cwd": plain["cwd"], "revision": 7})
+        elif guard == "bare-shell" and variant == "a job runs":
+            plain["processes"] = ["vim"]
+        elif guard == "bare-shell":
+            plain["processes"] = []
+        elif guard == "worktree" and variant == "outside any worktree":
+            plain["cwd"] = plain["foreground_cwd"] = "/tmp"
+        elif guard == "worktree":   # the owner's shell in a directory below an agent's own cwd (a repository root), not in a registered worktree
+            root = self.home / "repo-root"
+            (root / "docs").mkdir(parents=True, exist_ok=True)
+            (Path(self.world.state) / sb.PANE_HEALTH_FILE).write_text(json.dumps({"agents": {"orch": {"pane": "w9:p9", "session": "ses_y", "cwd": str(root)}}, "states": {}, "missing": {}}))
+            plain["cwd"] = plain["foreground_cwd"] = str(root / "docs")
+        elif guard == "idle":
+            pass
+        else:
+            raise AssertionError("a case with no setup: %s / %s" % (guard, variant))
+        return pane
+
+    def close_pane_twice(self, pane):
+        self.main("close-pane", pane)
+        self.world.tick(11 * 60)
+        return self.main("close-pane", pane)
+
+    def check_guard(self, guard, variant):
+        marker, without = self.GUARD_CASES[(guard, variant)]
+        pane = self.break_guard(guard, variant)
+        code, out, err = self.main("close-pane", pane) if guard == "idle" else self.close_pane_twice(pane)
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        self.assertIn(marker, err)
+        refused = self.rows("fleetpane.close_refused")[-1]
+        self.assertIn(marker, refused["detail"]["why"])
+        self.assertIn("cwd", refused["detail"])
+        mutant = tuple(g for g in sb.BARE_PANE_GUARDS if g[0] != guard)      # the same case on a build without this guard
+        with mock.patch.object(sb, "BARE_PANE_GUARDS", mutant):
+            code, out, err = self.main("close-pane", pane)          # the first run notes the revision (and closes, when the idle guard is the one removed)
+            if not self.world.herdr.closed:
+                self.world.tick(11 * 60)
+                code, out, err = self.main("close-pane", pane)
+        if without == "closes":
+            self.assertEqual((code, self.world.herdr.closed), (0, [pane]), "without the %s guard (%s) it closes: %s" % (guard, variant, err))
+        else:
+            self.assertEqual((code, self.world.herdr.closed), (1, []), "a pane herdr does not have cannot be closed by any build")
+
+    def test_the_guard_table_is_whole_and_every_guard_has_a_case(self):   # S11a completeness
+        guards = [g for g, _ in sb.bare_pane_guards()]
+        self.assertEqual(guards, ["own-pane", "listed", "unnamed", "bare-shell", "worktree", "idle"])
+        self.assertEqual({g for g, _ in self.GUARD_CASES}, set(guards), "every guard has at least one case, and no case names a guard that is not in the table")
+        for guard, variant in self.GUARD_CASES:
+            self.assertTrue(getattr(type(self), "test_guard_%s__%s" % (guard.replace("-", "_"), re.sub(r"\W+", "_", variant)), None), (guard, variant))
+
+    def test_every_guard_denies_by_default_on_a_missing_empty_or_unreadable_input(self):   # the default-deny table: one row per guard
+        base = {"pane": "w1:p90", "entry": {"cwd": "/x", "foreground_cwd": "/x", "revision": 3}, "held": [], "processes": [{"name": "zsh"}], "worktrees": {"/x"},
+                "discovery": types.SimpleNamespace(agents={}), "health": {"agents": {}}, "window": 10, "now": 10 ** 6, "seen": {"revision": 3, "since": 0}}
+        self.assertEqual([g(base) for _, g in sb.bare_pane_guards()], [None] * 6, "the base case passes every guard")
+        denies = {"listed": {"entry": None}, "bare-shell": {"processes": []}, "worktree": {"entry": {}}, "idle": {"seen": None}}
+        not_input_guards = {"own-pane": "reads the caller's environment, which has nothing to be missing", "unnamed": "absence of a name IS the pass; its unreadable inputs raise before the guards (tested through the command)"}
+        self.assertEqual(set(denies) | set(not_input_guards), {g for g, _ in sb.bare_pane_guards()})
+        for guard, change in denies.items():
+            for label, ctx in ((guard, dict(base, **change)),):
+                self.assertTrue(dict(sb.bare_pane_guards())[guard](ctx), "%s denies on %s" % (guard, change))
+        for guard, change in (("worktree", {"entry": {"cwd": "", "foreground_cwd": None}}), ("idle", {"entry": {"cwd": "/x", "foreground_cwd": "/x"}}), ("worktree", {"worktrees": set()})):
+            self.assertTrue(dict(sb.bare_pane_guards())[guard](dict(base, **change)), (guard, change))
+
+    def test_an_unreadable_input_of_the_context_refuses_the_close(self):   # unreadable: herdr's pane list, agent list, process list, the pane-health record
+        for label, patch in (("pane list", mock.patch.object(sb.HerdrClient, "pane_list", side_effect=sb.HerdrError("down", "herdr is down"))),
+                             ("agent list", mock.patch.object(sb.HerdrClient, "agent_list", side_effect=sb.HerdrError("down", "herdr is down"))),
+                             ("process list", mock.patch.object(sb.HerdrClient, "pane_process_info", side_effect=sb.HerdrError("down", "herdr is down")))):
+            with self.subTest(label):
+                self.bare_world()
+                self.main("close-pane", "w1:p90")
+                self.assertEqual(self.world.herdr.closed, [], "the first run only notes it")
+                self.world.tick(11 * 60)
+                with patch:
+                    code, out, err = self.main("close-pane", "w1:p90")
+                self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+                self.assertIn("cannot be read", err)
+        self.bare_world()
+        self.main("close-pane", "w1:p90")
+        self.world.tick(11 * 60)
+        (Path(self.world.state) / sb.PANE_HEALTH_FILE).write_bytes(b"{not json")
+        code, out, err = self.main("close-pane", "w1:p90")
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        self.assertIn("cannot be read", err)
+
+    def test_a_pane_an_agent_holds_changed_between_looks_or_unreadable_is_never_closed(self):   # S11b
+        self.bare_world()
+        self.main("close-pane", "w1:p90")
+        self.world.tick(11 * 60)
+        agent_pane = self.world.panes["worker"]
+        code, out, err = self.main("close-pane", agent_pane)
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        self.assertIn("named by an agent record", err)
+        real, calls = sb.bare_pane_problem, []
+
+        def owner_changes(*args):
+            calls.append(1)
+            if len(calls) == 2:
+                self.world.herdr.plain_terminals[0]["processes"] = ["vim"]   # a job started between the first look and the close
+            return real(*args)
+
+        with mock.patch.object(sb, "bare_pane_problem", owner_changes):
+            code, out, err = self.main("close-pane", "w1:p90")
+        self.assertEqual((len(calls), code, self.world.herdr.closed), (2, 1, []), err)
+        with mock.patch.object(sb.HerdrClient, "pane_list", side_effect=sb.HerdrError("down", "herdr is down")):
+            code, out, err = self.main("close-pane", "w1:p90")
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        self.assertEqual(len(self.rows("fleetpane.close_refused")), 4)
+
+    def test_only_the_chief_of_staff_may_close_a_pane_no_record_names(self):   # S11c
+        self.bare_world()
+        self.world.add_agent("cos", fleet={"role": "coder"})            # named like the Chief of Staff, without the role
+        self.main("close-pane", "w1:p90")
+        self.world.tick(11 * 60)
+        callers = [("orch-a", None), ("worker", None), ("cos", None), ("chief-of-staff", ("unknown", "an uncertain identity"))]
+        for who, kind in callers:
+            with self.subTest(who=who):
+                self.as_agent(who)
+                with mock.patch.object(sb, "gates_caller_kind", return_value=kind) if kind else mock.patch.object(sb, "BARE_PANES_FILE", sb.BARE_PANES_FILE):
+                    code, out, err = self.main("close-pane", "w1:p90")
+                self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+                self.assertIn("only the Chief of Staff", err)
+        self.assertEqual(len(self.rows("fleetpane.close_refused")), 5, "each refusal is audited with the caller")
+
+    def test_every_path_in_the_table_is_taken_by_a_real_command_and_no_other_path_is(self):   # the paths table, proved by behaviour
+        seen = []
+        real_adopt, real_repoint = sb.adopt_workers, sb.repoint_workers
+        with mock.patch.object(sb, "adopt_workers", lambda engine, path, *a, **k: (seen.append(path), real_adopt(engine, path, *a, **k))[1]), \
+                mock.patch.object(sb, "repoint_workers", lambda engine, names, heir, path, by: (seen.append(path), real_repoint(engine, names, heir, path, by))[1]):
+            self.main("move", "2", "--to", "10")                                            # move
+            self.worker("w-pass", "gone", charter=10)
+            self.daemon_pass()                                                              # pass
+            self.main("retire", "orch-a")                                                   # retire
+            self.launch_orchestrator("orch-new")                                            # relaunch, replace
+            self.retired_orphan("w-close", "gone")
+            self.main("retire", "w-close", "--close")                                       # close
+        self.assertEqual(set(seen), set(sb.ADOPT_PATHS))
+        with self.assertRaises(ValueError):
+            sb.write_boss_records(self.world.new_engine(), None, [(None, None, "x", "y")], "invented", "x")
+
+    def test_an_entry_the_boss_record_reader_would_drop_is_kept_when_a_boss_is_written(self):   # the strict table is the base of the write
+        self.worker("w1", "gone", charter=1)
+        path = self.record_path()
+        path.write_text(json.dumps({"overrides": {"stray": {"note": "not a boss entry"}}}))
+        self.daemon_pass()
+        self.assertEqual(self.boss("w1"), "orch-a")
+        self.assertIn("stray", json.loads(path.read_text())["overrides"])
+
+    def test_a_boss_that_is_back_or_an_heir_that_is_gone_since_the_plan_stops_the_write(self):   # judged again under the lock
+        self.worker("w1", "orch-late", charter=1)
+        real = sb._read_strict_records
+
+        def boss_comes_back(state):
+            records = real(state)
+            self.world.add_agent("orch-late", fleet={"role": "orchestrator", "charter": 1})
+            return records
+
+        with mock.patch.object(sb, "_read_strict_records", boss_comes_back):
+            self.daemon_pass()
+        self.assertEqual(self.boss("w1"), "orch-late")
+        self.assertEqual([r for r in self.rows() if r["detail"]["worker"] == "w1"], [])
+
+    def test_a_damaged_record_stops_every_other_path_too_and_the_problem_is_said(self):   # S9 on retire, launch, move and close
+        self.worker("w1", "orch-a", charter=1)
+        self.world.herdr.panes[self.world.panes["worker"]]["status"] = "idle"
+        (Path(self.world.state) / "boss-overrides.json").write_bytes(b"{not json")
+        before = (Path(self.world.state) / "boss-overrides.json").read_bytes()
+        code, out, err = self.main("move", "2", "--to", "10")
+        self.assertIn("is not valid JSON: no worker was re-pointed", err)
+        self.assertEqual(self.boss("worker"), "orch-a")
+        code, out, err = self.main("retire", "orch-a")
+        self.assertIn("were not re-pointed", err)
+        self.assertEqual(self.boss("w1"), "orch-a", "orch-a is retired but its workers keep the record they had")
+        code, out, err = self.launch_orchestrator("orch-b2")
+        self.assertIn("were not re-pointed", err + out)
+        self.retired_orphan("w9", "gone")
+        code, out, err = self.main("retire", "w9", "--close")
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        self.assertEqual((Path(self.world.state) / "boss-overrides.json").read_bytes(), before)
+        self.assertEqual(self.rows(), [])
+
+    def put_retired(self, name, record):   # the registry is the one source (#903); retired.json is derived output, so a hand-written file is never read
+        reg = sb.load_module("registry")
+        reg.unretire(self.world.state, name)
+        reg.retire(self.world.state, name, record["by"], record["reason"], session=record["session"] or None, now=record["at"])
+        if not record["session"]:
+            reg._mutate(self.world.state, lambda doc: (doc["retired"][name].update(session=record["session"]) or True, [], None))
+
+    def test_a_live_boss_whose_retired_record_names_no_session_keeps_its_worker(self):   # S8: a retirement covers only the session it names
+        self.worker("w1", "orch-a", charter=1)
+        for label, record in (("no session", {"at": 1, "by": "x", "reason": "r", "session": None}), ("another session", {"at": 1, "by": "x", "reason": "r", "session": "ses_old"}),
+                              ("an empty session", {"at": 1, "by": "x", "reason": "r", "session": ""})):
+            with self.subTest(label):
+                self.put_retired("orch-a", record)
+                self.daemon_pass()
+                self.assertEqual(self.boss("w1"), "orch-a", "orch-a is live: nothing to fill")
+                self.assertEqual([r for r in self.rows() if r["detail"]["worker"] == "w1"], [])
+        self.put_retired("orch-a", {"at": 1, "by": "x", "reason": "r", "session": self.world.sessions["orch-a"]})
+        self.daemon_pass()
+        self.assertEqual(self.boss("w1"), "chief-of-staff", "a retirement that names this session does count (charter 1 has no other orchestrator)")
+
+    def test_a_live_heir_whose_retired_record_names_no_session_is_still_an_heir(self):   # S8: the heir side of the same rule
+        self.worker("w1", "gone", charter=1)
+        self.put_retired("orch-a", {"at": 1, "by": "x", "reason": "r", "session": None})
+        self.daemon_pass()
+        self.assertEqual(self.boss("w1"), "orch-a")
+
+    def test_the_caller_is_judged_by_role_not_by_name(self):   # U3 S11c: a real Chief of Staff under another name is allowed, an agent named for the role without it is refused
+        self.bare_world()
+        sid = self.world.sessions["chief-of-staff"]
+        self.world.v2.sessions[sid]["metadata"]["fleet"]["role"] = "coder"            # the agent NAMED chief-of-staff has no role now
+        self.world.add_agent("deputy", fleet={"role": "chief-of-staff"})
+        self.as_agent("chief-of-staff")
+        code, out, err = self.main("close-pane", "w1:p90")
+        self.assertEqual((code, self.world.herdr.closed), (1, []))
+        self.assertIn("only the Chief of Staff", err)
+        self.as_agent("deputy")
+        self.main("close-pane", "w1:p90")
+        self.world.tick(11 * 60)
+        code, out, err = self.main("close-pane", "w1:p90")
+        self.assertEqual((code, self.world.herdr.closed), (0, ["w1:p90"]), err)
+
+    def test_only_the_heir_adopts_before_a_close_and_another_caller_adopts_nothing(self):   # S12: adopt_before_close for any caller would pass the other tests
+        self.retired_orphan("w1", "gone", charter=1)                       # its heir is orch-a (charter 1), not the Chief of Staff
+        before = {f: ((Path(self.world.state) / f).read_bytes() if (Path(self.world.state) / f).exists() else None) for f in (sb.RETIRED_FILE, "boss-overrides.json")}
+        self.as_agent("chief-of-staff")
+        code, out, err = self.main("retire", "w1", "--close")
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        self.assertIn("may not close w1's pane", err)
+        self.assertEqual([r for r in self.rows() if r["detail"]["worker"] == "w1"], [], "the Chief of Staff is not its heir: 0 adoption rows")
+        self.assertEqual({f: ((Path(self.world.state) / f).read_bytes() if (Path(self.world.state) / f).exists() else None) for f in before}, before)
+        self.daemon_pass()                                                   # the next pass gives it to its heir, who then closes it as its boss
+        self.as_agent("orch-a")
+        code, out, err = self.main("retire", "w1", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.herdr.closed, [self.world.panes["w1"]])
+        (row,) = [r for r in self.rows() if r["detail"]["worker"] == "w1"]
+        self.assertEqual((row["detail"]["heir"], row["detail"]["path"], row["detail"]["by"]), ("orch-a", "pass", sb.ADOPT_BY_DAEMON))
+
+    # ---- the family: every reader of a worker's boss
+    @staticmethod
+    def scan(sources):
+        """{"file:function"} of every function in the given {file: source text} that reads `reports_to` raw (`.get("reports_to")` or `["reports_to"]`)."""
+        import ast
+        found = set()
+        for rel, text in sources.items():
+            def walk(node, stack):
+                for child in ast.iter_child_nodes(node):
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        walk(child, stack + [child.name])
+                        continue
+                    if (isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute) and child.func.attr == "get" and child.args
+                            and isinstance(child.args[0], ast.Constant) and child.args[0].value == "reports_to") \
+                            or (isinstance(child, ast.Subscript) and isinstance(child.slice, ast.Constant) and child.slice.value == "reports_to"
+                                and isinstance(child.ctx, ast.Load)):
+                        found.add("%s:%s" % (rel, ".".join(stack[:1] if not stack or not stack[0][0].isupper() else stack[-1:])))
+                    walk(child, stack)
+            walk(ast.parse(text), [])
+        return found
+
+    def sites(self):
+        names = ["bin/fleet-switchboard"] + sorted(str(p.relative_to(REPO)) for p in (REPO / "bin").glob("*.py"))
+        return self.scan({rel: (REPO / rel).read_text() for rel in names})
+
+    def test_every_reader_of_a_workers_boss_is_in_the_table_and_the_table_has_no_stale_member(self):   # S15
+        self.assertEqual(self.sites(), set(sb.BOSS_READ_SITES), "a new raw reader must go through boss_name, or be named in BOSS_READ_SITES with its reason")
+
+    def test_the_scan_finds_a_raw_reader_when_one_is_planted(self):   # S15 mutant: the real scan, fed a planted source, reports it
+        planted = {"bin/planted.py": "def load_row(o):\n    return o.fleet.get('reports_to') == 'x'\n\ndef other(o):\n    return o.fleet['reports_to']\n\ndef safe(o):\n    return boss_name(o)\n"}
+        self.assertEqual(self.scan(planted), {"bin/planted.py:load_row", "bin/planted.py:other"})
+        table = set(sb.BOSS_READ_SITES) | {"bin/planted.py:other"}      # a table that names only one of the two planted readers
+        self.assertNotEqual(self.sites() | self.scan(planted), table, "the table test fails on the planted reader the table does not name")
+
+    def test_an_adopted_worker_is_seen_under_its_heir_by_every_behavioural_reader(self):   # S15
+        self.worker("w1", "gone", charter=1)
+        self.daemon_pass()
+        engine = self.world.new_engine()
+        discovery = engine.discover(self.world.clock.now())
+        obs = discovery.agents["w1"]
+        readers = {
+            "boss_name": lambda: sb.boss_name(discovery, obs),
+            "notice_boss": lambda: sb.notice_boss(engine, "w1"),
+            "work rows": lambda: next(r["reports_to"] for r in sb.EngineWorkHost(engine).agents() if r["name"] == "w1"),
+            "reattach caller rule (its heir may reattach)": lambda: "orch-a" if (self.as_agent("orch-a"), sb.reattach_caller_problem(engine, self.world.route, self.world.clock.now, discovery, "w1"))[1] is None else None,
+        }
+        for label, read in readers.items():
+            with self.subTest(reader=label):
+                self.assertEqual(read(), "orch-a")
+
+
+for _guard, _variant in TestAdoption.GUARD_CASES:   # S11a: one case (and its mutant) per guard of the table the command loops over, per way it can fail
+    setattr(TestAdoption, "test_guard_%s__%s" % (_guard.replace("-", "_"), re.sub(r"\W+", "_", _variant)), (lambda g, v: lambda self: self.check_guard(g, v))(_guard, _variant))
+
+
 class TestMoveAnAsk(LanesCase):
     def setUp(self):
         super().setUp()
@@ -67507,13 +69025,13 @@ class TestMoveAnAsk(LanesCase):
         self.assertIn("worker (reports to orch-a)", note)
         self.assertIn("label: me:awaiting-cos", note)
 
-    def test_s12_workers_keep_their_boss_and_the_old_notice_names_them(self):
+    def test_s12_the_workers_follow_the_ask_and_the_old_notice_names_them(self):
         self.main("move", "2", "--to", "10")
         sid = self.world.sessions["worker"]
-        self.assertEqual(self.world.v2.sessions[sid]["metadata"]["fleet"]["reports_to"], "orch-a")
+        self.assertEqual(self.world.v2.sessions[sid]["metadata"]["fleet"]["reports_to"], "orch-a", "the session's own metadata is never rewritten")   # #838: the boss RECORD moves the worker, see TestAdoption
         (notice,) = [a["text"] for a in self.world.admissions("orch-a")]
         self.assertIn("worker", notice)
-        self.assertIn("boss is unchanged", notice)
+        self.assertIn("they now report to orch-b", notice)
 
     def test_s15_the_remaining_asks_of_the_old_charter_are_listed(self):
         code, out, _ = self.main("move", "2", "--to", "10")
@@ -68436,6 +69954,19 @@ class TestMergedLabels(Base):
         (line,) = self.audit("merged.labels_removed")
         self.assertEqual((line["subject"], sorted(line["detail"]["labels"])), ("acme/api#7", sorted(self.fleet)), "1 audit line names the pull request and the 3 labels")
 
+    def test_the_owners_own_hold_stays_on_a_merged_pull_request_and_the_audit_says_it_merged_against_it(self):   # #891
+        owner = self.names["hold-owner"]
+        gh = FakeMergedGh({7: self.view(labels=self.fleet + [owner, "bug"])})
+        self.go({"acme/api#7": self.merged_entry(labels=self.fleet + [owner])}, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.fleet), "the 3 other labels come off; hold-owner is not among the removals")
+        self.assertNotIn(owner, sb.load_module("merged_labels").fleet_labels(sb, self.world.config))
+        (kept,) = self.audit("merged.owner_hold_kept")
+        self.assertEqual((kept["subject"], kept["detail"]["label"]), ("acme/api#7", owner))
+        gh = FakeMergedGh({8: self.view(labels=[owner])})
+        self.go({"acme/api#8": self.merged_entry(labels=[owner])}, gh)
+        self.assertEqual(gh.removed, [], "a pull request that carries only the owner's hold loses nothing")
+        self.assertEqual(len(self.audit("merged.owner_hold_kept")), 2)
+
     def test_s2_an_open_or_closed_unmerged_pull_request_loses_nothing(self):
         for state in ("open", "closed"):
             gh = FakeMergedGh({8: self.view("OPEN" if state == "open" else "CLOSED")})
@@ -69018,6 +70549,176 @@ class TestMessageTimesDelivery(Base):
         self.assertTrue(self.send("second")["sent"])
         self.assertNotIn("supersedes", self.waiting()[-1].splitlines()[0], "an implausible time is not shown")
         self.assertEqual(sb.clock_utc(1e30), "??:??Z")
+
+
+class TestAgentRegistry(unittest.TestCase):
+    """Slice 2 of #903: bin/registry.py by itself (the frozen interface of docs/agent-registry.md): atomic write, version rule, the fold of today's
+    records, the registry's own check of a removal's evidence. HERDR_* and OPENCODE_* are unset for every test."""
+
+    def setUp(self):
+        for key in [k for k in os.environ if k.startswith(("HERDR_", "OPENCODE_"))]:
+            self.addCleanup(os.environ.__setitem__, key, os.environ[key])
+            del os.environ[key]
+        self.state = Path(tempfile.mkdtemp(prefix="registry-test"))
+        self.addCleanup(shutil.rmtree, str(self.state), True)
+        self.reg = sb.load_module("registry")
+
+    def old_records(self, **extra):
+        row = {"session": "ses_a", "pane": "w1:p1", "role": "coder", "charter": 903, "repo": "acme-org/widget-service",
+               "workspace": "w1", "cwd": "/home/user/work", "seen": 5}
+        (self.state / "pane-health.json").write_text(json.dumps({"agents": {"alpha": dict(row, **extra)}, "states": {"alpha": {"state": "detached"}}, "missing": {}}))
+
+    def test_s8_every_field_the_old_readers_use_is_in_the_registry_after_the_fold(self):
+        self.old_records()
+        row = self.reg.read(self.state)["agents"]["alpha"]
+        for field in ("session", "pane", "role", "charter", "repo", "workspace", "cwd"):
+            with self.subTest(field=field):
+                self.assertEqual(row[field], {"session": "ses_a", "pane": "w1:p1", "role": "coder", "charter": 903, "repo": "acme-org/widget-service",
+                                              "workspace": "w1", "cwd": "/home/user/work"}[field])
+        self.assertEqual((row["state"], row["kind"], row["run_id"]), ("detached", "local", None))
+        self.assertEqual(oct((self.state / "registry.json").stat().st_mode & 0o777), "0o600")
+
+    def test_the_fold_keeps_a_retirement_with_its_record_headless_copy_and_a_cloud_worker_with_its_run_id(self):
+        entry = {"at": int(time.time()), "by": "boss", "reason": "done", "session": "ses_b", "auto": False,
+                 "record": {"pane": "w1:p2", "workspace": "w1", "cwd": "/home/user/b"}, "headless": {"session": "ses_b", "name": "beta"}}
+        (self.state / "retired.json").write_text(json.dumps({"beta": entry}))
+        (self.state / "cloud").mkdir()
+        (self.state / "cloud" / "gamma.json").write_text(json.dumps({"worker": "gamma", "repo": "acme-org/widget-service", "runtime_id": "rt_1", "run_id": "run_example", "session": "ses_c"}))
+        got = self.reg.read(self.state)
+        self.assertEqual(got["retired"]["beta"], entry)
+        self.assertEqual(self.reg.get_retired(self.state, "beta"), entry)
+        self.assertEqual((got["agents"]["gamma"]["kind"], got["agents"]["gamma"]["run_id"], got["agents"]["gamma"]["session"]), ("cloud", "run_example", "ses_c"))
+
+    def test_a_retired_record_with_no_session_covers_nothing_and_known_agent_finds_no_one(self):
+        (self.state / "retired.json").write_text(json.dumps({"beta": {"at": 1, "by": "x", "reason": "r", "session": None, "record": {"pane": "p"}}}))
+        self.assertEqual(sb.known_agent(self.state, "beta"), {})
+        self.assertFalse(self.reg.covers(self.reg.get_retired(self.state, "beta"), None))
+        self.assertTrue(self.reg.upsert(self.state, "beta", {"session": "ses_new", "pane": "p9"})["changed"])   # not refused as retired
+
+    def test_known_agent_reads_a_retired_agents_record_from_the_registry_alone(self):
+        self.assertTrue(self.reg.upsert(self.state, "alpha", {"session": "ses_a", "pane": "w1:p1", "workspace": "w1", "cwd": "/home/user/work", "role": "coder"})["changed"])
+        self.assertTrue(self.reg.retire(self.state, "alpha", "boss", "done")["changed"])
+        self.assertNotIn("alpha", self.reg.read(self.state)["agents"])
+        kept = sb.known_agent(self.state, "alpha")
+        self.assertEqual((kept["session"], kept["workspace"], kept["cwd"]), ("ses_a", "w1", "/home/user/work"))
+        self.assertTrue(self.reg.unretire(self.state, "alpha")["changed"])
+        self.assertEqual(self.reg.get(self.state, "alpha")["workspace"], "w1")
+        self.assertEqual(sb.read_retired(self.state), {})
+
+    def test_a_newer_version_reads_nothing_says_so_and_a_writer_writes_nothing(self):
+        text = json.dumps({"version": 9, "agents": {"a": {"session": "ses_x"}}, "retired": {}})
+        (self.state / "registry.json").write_text(text)
+        got = self.reg.read(self.state)
+        self.assertEqual((got["whole"], got["agents"], got["problem"]), (False, {}, "registry.json is version 9; this reader knows 1: nothing read"))
+        self.assertEqual(self.reg.upsert(self.state, "b", {"session": "ses_y"}), {"changed": False, "problem": got["problem"]})
+        self.assertEqual((self.state / "registry.json").read_text(), text)
+        with self.assertRaises(sb.RetiredUnreadable):
+            sb.read_retired_strict(self.state)
+        for bad in ("{", "[]", '{"version": "1"}', '{"version": 1, "agents": []}'):
+            (self.state / "registry.json").write_text(bad)
+            self.assertFalse(self.reg.read(self.state)["whole"], bad)
+
+    def test_s6_two_writers_and_a_reader_never_see_a_torn_file_in_1000_rounds(self):
+        self.reg.upsert(self.state, "seed", {"session": "ses_seed", "cwd": "x" * 5000})
+        stop, torn = threading.Event(), []
+
+        def write(tag):
+            n = 0
+            while not stop.is_set():
+                n += 1
+                self.reg.upsert(self.state, "w%s" % tag, {"session": "ses_%s_%d" % (tag, n), "cwd": "y" * 3000})
+
+        threads = [threading.Thread(target=write, args=(t,)) for t in "ab"]
+        for t in threads:
+            t.start()
+        try:
+            for _ in range(1000):
+                got = self.reg.read(self.state)
+                if not got["whole"] or "seed" not in got["agents"]:
+                    torn.append(got["problem"])
+        finally:
+            stop.set()
+            for t in threads:
+                t.join()
+        self.assertEqual(torn, [])
+        self.assertEqual([p.name for p in self.state.iterdir() if p.name.endswith(".tmp")], [])
+
+    def test_upsert_with_nothing_changed_writes_and_audits_nothing(self):
+        self.assertTrue(self.reg.upsert(self.state, "a", {"session": "ses_a", "pane": "p1"})["changed"])
+        path = self.state / "registry.json"
+        before = (path.read_bytes(), path.stat().st_mtime_ns, (self.state / "registry-audit.jsonl").read_text())
+        self.assertEqual(self.reg.upsert(self.state, "a", {"session": "ses_a", "pane": "p1"}), {"changed": False, "problem": None})
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, (self.state / "registry-audit.jsonl").read_text()), before)
+
+    def test_reconcile_remove_checks_the_evidence_itself_and_audits_a_removal(self):
+        self.reg.upsert(self.state, "a", {"session": "ses_a", "pane": "p1", "state": "working"})
+        alive = {"pane_listed": True, "process_found": True}
+        self.assertEqual(self.reg.reconcile_remove(self.state, "a", alive, True)["changed"], False)     # whole=True is not enough for a live agent
+        self.assertEqual(self.reg.reconcile_remove(self.state, "a", {"pane_listed": False, "process_found": False}, True)["changed"], False)   # recorded state is not dead
+        self.reg.upsert(self.state, "a", {"session": "ses_a", "pane": "p1", "state": "dead"})
+        gone = {"pane_listed": False, "process_found": False}
+        self.assertEqual(self.reg.reconcile_remove(self.state, "a", gone, False)["changed"], False)    # a partial read removes nothing
+        self.assertIn("a", self.reg.read(self.state)["agents"])
+        self.assertTrue(self.reg.reconcile_remove(self.state, "a", gone, True)["changed"])
+        self.assertNotIn("a", self.reg.read(self.state)["agents"])
+        lines = [json.loads(l) for l in (self.state / "registry-audit.jsonl").read_text().splitlines()]
+        self.assertEqual([l["event"] for l in lines if l["event"] == "reconcile_remove"], ["reconcile_remove"])
+        self.assertEqual([l for l in lines if l["event"] == "reconcile_remove"][0]["evidence"], gone)
+        refused = [l for l in lines if l["event"] == "reconcile_refused"]
+        self.assertEqual(len(refused), 3)                                   # live evidence, state not dead, partial read: each audited with evidence and reason
+        self.assertEqual(refused[0]["evidence"], alive)
+        self.assertTrue(all(l["why"] and "nothing removed" in l["why"] for l in refused))
+
+    def test_a_dead_row_is_removed_only_when_each_evidence_key_shows_it_gone_and_each_refusal_is_audited(self):
+        gone = {"pane_listed": False, "process_found": False}
+        cases = {"pane_listed true": {"pane_listed": True, "process_found": False}, "process_found true": {"pane_listed": False, "process_found": True},
+                 "pane_listed missing": {"process_found": False}, "process_found missing": {"pane_listed": False}, "evidence None": None,
+                 "evidence a string": "gone", "evidence a list": [gone]}
+        for label, evidence in cases.items():
+            with self.subTest(label=label):
+                self.reg.upsert(self.state, "d", {"session": "ses_d", "state": "dead"})
+                before = len([l for l in (self.state / "registry-audit.jsonl").read_text().splitlines() if "reconcile_refused" in l])
+                got = self.reg.reconcile_remove(self.state, "d", evidence, True)
+                self.assertEqual(got["changed"], False)
+                self.assertIn("d", self.reg.read(self.state)["agents"])
+                after = [json.loads(l) for l in (self.state / "registry-audit.jsonl").read_text().splitlines() if "reconcile_refused" in l]
+                self.assertEqual(len(after), before + 1)
+                self.assertEqual(after[-1]["evidence"], evidence if isinstance(evidence, dict) else None)
+        self.assertTrue(self.reg.reconcile_remove(self.state, "d", gone, True)["changed"])
+
+    def test_retire_then_undo_keeps_a_local_a_cloud_and_a_headless_row_what_it_was(self):
+        self.reg.upsert(self.state, "loc", {"session": "ses_l", "pane": "p1", "workspace": "w1"})
+        self.reg.upsert(self.state, "cld", {"session": "ses_c", "repo": "acme-org/widget-service", "kind": "cloud", "run_id": "run_example"})
+        self.reg.retire(self.state, "loc", "boss", "done")
+        self.reg.retire(self.state, "cld", "cloud-worker", "done")
+        self.reg.retire(self.state, "hdl", "boss", "done", session="ses_h", extra={"headless": {"session": "ses_h"}})
+        for name in ("loc", "cld", "hdl"):
+            self.assertTrue(self.reg.unretire(self.state, name)["changed"])
+        agents = self.reg.read(self.state)["agents"]
+        self.assertEqual((agents["loc"]["kind"], agents["loc"]["run_id"], agents["loc"]["workspace"]), ("local", None, "w1"))
+        self.assertEqual((agents["cld"]["kind"], agents["cld"]["run_id"], agents["cld"]["session"]), ("cloud", "run_example", "ses_c"))
+        self.assertNotIn("hdl", agents)                                       # a headless worker comes back from its own launch record, not as a pane row
+
+    def test_the_fold_does_not_bring_back_a_retired_cloud_worker_but_a_relaunch_under_the_name_stays(self):
+        (self.state / "cloud").mkdir()
+        (self.state / "cloud" / "w1.json").write_text(json.dumps({"worker": "w1", "session": "ses_c", "run_id": "r1"}))
+        (self.state / "cloud" / "w2.json").write_text(json.dumps({"worker": "w2", "session": "ses_new", "run_id": "r2"}))
+        (self.state / "retired.json").write_text(json.dumps({"w1": {"at": int(time.time()), "by": "x", "reason": "r", "session": "ses_c"},
+                                                            "w2": {"at": int(time.time()), "by": "x", "reason": "r", "session": "ses_old"}}))
+        got = self.reg.read(self.state)
+        self.assertEqual(sorted(got["agents"]), ["w2"])
+        self.assertEqual(sorted(got["retired"]), ["w1", "w2"])
+
+    def test_retire_and_close_leave_agents_keep_the_record_and_audit(self):
+        for name in ("a", "b"):
+            self.reg.upsert(self.state, name, {"session": "ses_" + name, "pane": "p", "workspace": "w1"})
+        self.reg.retire(self.state, "a", "boss", "done", auto=True)
+        self.reg.close(self.state, "b", "boss", "pane closed")
+        got = self.reg.read(self.state)
+        self.assertEqual(got["agents"], {})
+        self.assertEqual((got["retired"]["a"]["auto"], got["retired"]["b"]["reason"], got["retired"]["b"]["record"]["workspace"]), (True, "pane closed", "w1"))
+        self.assertEqual(sorted(json.loads(l)["event"] for l in (self.state / "registry-audit.jsonl").read_text().splitlines() if "retire" in l or "close" in l), ["close", "retire"])
+        self.assertEqual(json.loads((self.state / "retired.json").read_text()).keys(), {"a", "b"})   # derived output, the old format
 
 
 class TestPaneWarningRule(unittest.TestCase):
