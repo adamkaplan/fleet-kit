@@ -58028,6 +58028,14 @@ class TestHeavyCeilings(unittest.TestCase):
         stopped = self.hs.check_orphans(tmp, 3, None, lambda: 20000.0, None, BoundedOut(), alive=alive, watchdog=dog)
         self.assertEqual((stopped, list(signals)), ([], []))
 
+    def test_two_checkers_never_stop_and_report_the_same_orphan(self):
+        tmp, dog, signals, alive = self.orphan_rig({"name": "h", "pid": 4242, "wrapper": 31337, "command": "x", "since": 1000})
+        gate = os.open(os.path.join(tmp, self.hs.ORPHAN_LOCK), os.O_RDWR | os.O_CREAT, 0o600)   # another checker is at it
+        self.addCleanup(os.close, gate)
+        fcntl.flock(gate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.assertEqual(self.hs.check_orphans(tmp, 3, None, lambda: 20000.0, None, BoundedOut(), alive=alive, watchdog=dog), [])
+        self.assertEqual(list(signals), [])
+
     def test_the_orphan_check_reports_nothing_and_stops_nothing_for_a_free_slot(self):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
