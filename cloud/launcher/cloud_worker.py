@@ -995,7 +995,7 @@ class Launcher:
 
     def _own_objects_gone(self, name, made):
         """The Secrets this call made that are no longer this call's in the cluster: missing, or (with a run id) carrying another's."""
-        gone = []
+        gone = []   # a get that errors (not "not found") raises CloudError: the create fails, it never reads as "still there"
         for kind, label, get in (("secret", "secret/%s-pw" % name, lambda: self.kube.get_secret(name + "-pw")),
                                  ("run", "secret/%s-run" % name, lambda: self.kube.get_run_secret(name))):
             if not made[kind]:
