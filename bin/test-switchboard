@@ -8797,6 +8797,82 @@ def _stdlib_roots():
     return tuple(os.path.realpath(p) for p in paths)
 
 
+class TestAgentRegistryInventory(unittest.TestCase):
+    """docs/agent-registry.md (#906): every reader or writer of an agent list or record in the code is a row of its inventory, and the
+    interface spec has its sections and its freeze line."""
+    DOC = REPO / "docs" / "agent-registry.md"
+    RECORDS = {
+        "pane-health.json": r"pane-health\.json|PANE_HEALTH_FILE|read_pane_health|write_pane_health|PANE_FILE",
+        "retired.json": r"retired\.json|RETIRED_FILE|read_retired|known_agent",
+        "last-reports.json": r"last-reports\.json|LAST_REPORT_FILE|record_last_report",
+        "boss-overrides.json": r"boss-overrides\.json|\.overlay\(",
+        "boss-resolution": r"resolve_boss\(|boss_name\(",
+        "discovery.agents": r"discovery\.agents|\.discover\(",
+        "health-records.json": r"health-records\.json|health_records|RECORDS_FILE",
+        "tool-rate.json": r"tool-rate\.json|TALLY_FILE|TOOL_FILE",
+        "load.json": r"load\.json|LOAD_FILE",
+        "decisions.json": r"decisions\.json|DECISIONS_FILE",
+        "headless-records": r"headless-service\.json|headless-route\.json|HEADLESS_SERVICE_FILE|HEADLESS_ROUTE_FILE|headless/",
+    }
+    SECTIONS = ("### 1. Read API", "### 2. Write API", "### 3. The file", "### 4. The lock", "### 5. The atomic write", "### 6. The version rule")
+
+    @staticmethod
+    def sources():
+        found = [BIN / "fleet-switchboard"] + sorted(BIN.glob("*.py"))
+        for pattern in ("*.mjs", "*.tsx", "*.js"):
+            found += sorted((REPO / "plugins").glob("*/" + pattern))
+        return [f for f in found if "test" not in f.name and "node_modules" not in f.parts]
+
+    @classmethod
+    def in_code(cls):
+        pairs = set()
+        for path in cls.sources():
+            text = path.read_text(errors="replace")
+            for record, regex in cls.RECORDS.items():
+                if re.search(regex, text):
+                    pairs.add((str(path.relative_to(REPO)), record))
+        return pairs
+
+    @classmethod
+    def spec_gaps(cls, text):
+        gaps = [h for h in cls.SECTIONS + ("## Migration rule",) if "\n" + h + "\n" not in text]
+        if "FROZEN: when fleetkit and fleet-daemon have each commented agreement on #906 (no earlier)." not in text:
+            gaps.append("the FROZEN line")
+        return gaps
+
+    @staticmethod
+    def in_table(text):
+        pairs = set()
+        for line in text.splitlines():
+            cells = [c.strip().strip("`") for c in line.split("|")[1:-1]]
+            if len(cells) == 6 and ":" in cells[0] and not cells[0].startswith("file:"):
+                pairs.add((cells[0].rsplit(":", 1)[0], cells[1]))
+        return pairs
+
+    def test_every_reader_and_writer_in_the_code_is_a_row_of_the_inventory(self):
+        in_code = self.in_code()
+        self.assertGreaterEqual(len(in_code), 25)   # the scan itself is alive
+        missing = sorted(in_code - self.in_table(self.DOC.read_text()))
+        self.assertEqual(missing, [], "readers or writers missing from docs/agent-registry.md")
+
+    def test_every_cited_file_exists(self):
+        for path, record in self.in_table(self.DOC.read_text()):
+            with self.subTest(path=path, record=record):
+                self.assertTrue((REPO / path).is_file(), path)
+
+    def test_a_removed_row_is_found_missing(self):
+        lines = [l for l in self.DOC.read_text().splitlines() if "plugins/fleet-decisions-tui/health.mjs" not in l or "`pane-health.json`" not in l]
+        self.assertIn(("plugins/fleet-decisions-tui/health.mjs", "pane-health.json"), self.in_code() - self.in_table("\n".join(lines)))
+
+    def test_the_spec_has_its_six_sections_and_the_freeze_line(self):
+        self.assertEqual(self.spec_gaps(self.DOC.read_text()), [])
+
+    def test_a_spec_without_the_version_rule_is_found_incomplete(self):
+        text = self.DOC.read_text().replace("### 6. The version rule", "### 6. Other")
+        self.assertEqual(self.spec_gaps(text), ["### 6. The version rule"])
+        self.assertEqual(self.spec_gaps(self.DOC.read_text().replace("FROZEN:", "Frozen:")), ["the FROZEN line"])
+
+
 class TestHygiene(unittest.TestCase):
     FILES = ("fleet-switchboard", "fleet-scenario", "test-switchboard", "proof-switchboard", "switchboard-trial")
 
