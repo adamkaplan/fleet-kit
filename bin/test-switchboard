@@ -9175,7 +9175,7 @@ class WorkflowPlanPins(unittest.TestCase):
         check("    branches: [main]\n" in on, "a push to main")
         check(re.search(r'^    - cron: "\d{1,2} \d{1,2} \* \* \*"$', on, re.M), "a daily schedule")
         check(re.findall(r"uses: (\S+)", text) == ["actions/checkout@v5"] * 3, "the only action is actions/checkout@v5 (no third-party action)")
-        check("permissions:\n  contents: read\n" in top and top.count("permissions:") == 1, "contents: read only")
+        check("permissions:\n  contents: read\n\n" in top and top.count("permissions:") == 1, "contents: read only")
         check("secrets." not in text.replace("secrets.PRIVATE_NAMES", ""), "no new secret")
         check("cancel-in-progress: ${{ github.event_name == 'pull_request' }}" in top, "the concurrency rule is unchanged")
         check(re.findall(r"^  ([a-z][a-z-]*):$", jobs, re.M) == ["plan", "test", "test-cloud"], "the jobs")

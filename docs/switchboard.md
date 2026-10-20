@@ -4465,7 +4465,7 @@ so the steps and minutes the gates cost can be reported.
 - a push to `main` and a manual dispatch: both legs;
 - the nightly (05:00 UTC, the default branch's workflow file): both legs for `main` and for `integration`, named `nightly <ref> (<os>)` so they cannot be mistaken for a required name; a missing `integration` branch drops that leg.
 
-Only the macOS result of a draft into `main`, or of an `integration` pull request that touches no listed path, is absent. Telling the daemon of a failed nightly is a later slice of ask #990. A pull request is re-run with a re-run, never by closing and reopening it (a close and reopen cancels its run and queues a new macOS job): `gh run rerun <id>`, or `gh workflow run test.yml --ref <branch>`.
+Only the macOS result of a draft into `main`, or of an `integration` pull request that touches no listed path, is absent. Telling the daemon of a failed nightly is a later slice of ask #990. In short, a pull request is re-run with a re-run, never by closing and reopening it (a close and reopen cancels its run and queues a new macOS job): `gh run rerun <id>`, or `gh workflow run test.yml --ref <branch>`.
 
 **The built-in `ci` recorder.** `fleet-switchboard gates ci-record <repo#N>` makes the switchboard itself record the `ci` verdict. It reads the PR's
 check runs at its **current head** through `gh` (the repo's account) and only when they are all complete and green records a passing `ci`
