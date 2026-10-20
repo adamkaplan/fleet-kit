@@ -27446,6 +27446,22 @@ def add_v1_move_parsers(sub):
     move.add_argument("--json", action="store_true", help="Print the report as JSON")
 
 
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Route facts to fleet agents as OpenCode v2 messages. Never types into a pane.",
+        epilog="Config: $XDG_CONFIG_HOME/%s/config.json (optional). "
+               "State: $XDG_STATE_HOME/%s/ (mode 0700). See docs/switchboard.md." % (PROG, PROG))
+    sub = parser.add_subparsers(dest="action", required=True)
+    # Every `add_<name>_parsers(sub)` function of this module registers its commands: nothing is listed here, so a new command adds no shared line
+    # (the registrations used to be a list that every slice appended to, and any two in-flight slices conflicted on it). Alphabetical by function name.
+    for registrar in command_registrars():
+        registrar(sub)
+    sub.add_parser("version", help="Print the version")
+    parser.commands = frozenset(sub.choices)   # the registered subcommands: what `dispatch` may run
+    return parser
+
+
 def add_core_parsers(sub):
     """The commands that were registered inline in `build_parser` (status, run, send, report, notice, ensure, poke, launch, pending, remind), moved here UNEDITED (#924): a flag of one
     of them is no longer a line of the function that wires the registrars. Collected by name like every `add_<name>_parsers`; `build_parser` does not name it."""
@@ -27542,22 +27558,6 @@ def add_core_parsers(sub):
                         "(or pull request) is closed or merged")
     remind.add_argument("--until-merged", metavar="OWNER/REPO#N", help="Drop the reminder, unsent, once this pull "
                         "request is merged")
-
-
-def build_parser():
-    parser = argparse.ArgumentParser(
-        prog=PROG,
-        description="Route facts to fleet agents as OpenCode v2 messages. Never types into a pane.",
-        epilog="Config: $XDG_CONFIG_HOME/%s/config.json (optional). "
-               "State: $XDG_STATE_HOME/%s/ (mode 0700). See docs/switchboard.md." % (PROG, PROG))
-    sub = parser.add_subparsers(dest="action", required=True)
-    # Every `add_<name>_parsers(sub)` function of this module registers its commands: nothing is listed here, so a new command adds no shared line
-    # (the registrations used to be a list that every slice appended to, and any two in-flight slices conflicted on it). Alphabetical by function name.
-    for registrar in command_registrars():
-        registrar(sub)
-    sub.add_parser("version", help="Print the version")
-    parser.commands = frozenset(sub.choices)   # the registered subcommands: what `dispatch` may run
-    return parser
 
 
 # ---- the load of each orchestrator and the threshold alert (#348); the logic is in bin/fleet_health.py, this supplies the facts

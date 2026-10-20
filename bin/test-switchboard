@@ -21808,7 +21808,7 @@ class TestPR10Source(unittest.TestCase):
     def test_the_import_command_runs_only_the_clients_it_is_given(self):
         source = SWITCHBOARD.read_text()
         start = source.index(self.SECTION)
-        section = source[start:source.index("\ndef build_parser")]
+        section = source[start:source.index("\ndef build_parser")]   # this test pins the import section, which ends at `build_parser`; `add_core_parsers` (the moved commands, #924) is defined AFTER `build_parser`, so its help text is outside it and is held by the surface walk instead
         self.assertNotIn("subprocess.run", section, "the runner is injected")
         self.assertNotIn("herdr", section.replace("herdr's", "").lower().replace("herdr_", ""))
 
