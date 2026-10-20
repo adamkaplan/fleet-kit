@@ -501,7 +501,6 @@
         "gates_caller_kind"
       ],
       "closure_exempt": {
-        "bin/agent_reconcile.py": "loaded only by `reconcile_agents_on_read`, called by `collect_status` (the status view), not the clear",
         "bin/closed_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/cloud_worker.py": "loaded only by `run_cloud` and `cmd_status`: the cloud commands, not the clear",
         "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
@@ -510,7 +509,6 @@
         "bin/launch_testers.py": "loaded only by the tester launch command, not the clear",
         "bin/merged_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/orders_copy.py": "loaded only by `cmd_orders_copy`, not the clear",
-        "bin/registry.py": "loaded here only by the status view (`reconcile_agents_on_read`, the dead-row check); slice 2 (#917) decides its own entry when it lands",
         "bin/resume_brief.py": "loaded only by `cmd_launch`, not the clear",
         "bin/review_checkout.py": "loaded only by `cmd_review_checkout`, the reviewer checkout command, not the clear",
         "bin/triage_ownerless.py": "loaded only by the triage passes, which the clear does not run",
