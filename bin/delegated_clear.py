@@ -492,12 +492,13 @@ def _own_scope(unit):
     return own, glob
 
 
-def _registrar_unit(unit, names, added, helpers=None, opaque=()):
+def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=()):
     """[(verb, closure name)] a registrar (a function, a class, or the lambda a registrar name is assigned) does to the closure, counting only the nodes that touch a line in `added` (`None`: every line). `names` are the
     closure names. `helpers`, when a set is given, collects the names the unit refers to that are not closure names and not its own (a helper it may call: the caller reads those too). A call of a name in `opaque` (a
     module-level binding that is not a def, a class or a lambda, so it cannot be read) is a finding."""
     own, glob = _own_scope(unit)
     own -= glob   # a name declared `global` is the module's, whatever is stored into it
+    live = set(names) - set(literals)   # the closure names a registrar could RUN: a name the module binds only to a literal (a tuple of strings) is data, so iterating it or passing it on runs nothing
     if helpers is not None:
         helpers.update(x.id for x in ast.walk(unit) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id not in own and x.id not in names)
     def namespace(expr):   # globals(), vars(), x.__dict__, frame.f_globals, sys.modules...
@@ -511,6 +512,10 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=()):
         for x in ast.walk(unit):
             if isinstance(x, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and getattr(x, "value", None) is not None:
                 pairs.extend((t, x.value) for t in (x.targets if isinstance(x, ast.Assign) else [x.target]))
+            elif isinstance(x, (ast.For, ast.AsyncFor, ast.comprehension)):
+                pairs.append((x.target, x.iter))
+            elif isinstance(x, (ast.With, ast.AsyncWith)):
+                pairs.extend((i.optional_vars, i.context_expr) for i in x.items if i.optional_vars is not None)
             elif isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
                 arguments = x.args
                 positional = arguments.posonlyargs + arguments.args
@@ -518,10 +523,9 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=()):
                 pairs.extend((ast.Name(id=a.arg, ctx=ast.Store()), d) for a, d in zip(arguments.kwonlyargs, arguments.kw_defaults) if d is not None)
         for target, value in pairs:
             base = _root(value)
-            via = base if (base in tainted or (base in names and base not in own) or base in NAMESPACE_REACHERS) else None
-            if via is None and isinstance(value, ast.Call) and base not in own:   # `p = partial(plan_ledger.f)`: what a call outside the registrar is handed comes back in it
-                handed = [_root(a.value if isinstance(a, ast.keyword) else a) for a in list(value.args) + list(value.keywords)]
-                via = next((h for h in handed if h in tainted or (h in names and h not in own)), None)
+            via = base if (base in tainted or (base in live and base not in own) or base in NAMESPACE_REACHERS) else None
+            if via is None and base not in own:   # a value built from a closure name in ANY way (a container, a conditional, an `or`, an argument of a call outside the registrar): the target holds it
+                via = next((y.id for y in ast.walk(value) if isinstance(y, ast.Name) and isinstance(y.ctx, ast.Load) and (y.id in tainted or (y.id in live and y.id not in own))), None)
             if via is None and any(namespace(y) for y in ast.walk(value)):
                 via = "a namespace"
             if via is not None:
@@ -531,13 +535,18 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=()):
                         changed = True
     def reaches(expr):
         base = _root(expr)
-        return (base is not None and (base in tainted or (base in names and base not in own) or base in NAMESPACE_REACHERS)) or any(namespace(y) for y in ast.walk(expr))
+        return (base is not None and (base in tainted or (base in live and base not in own) or base in NAMESPACE_REACHERS)) or any(namespace(y) for y in ast.walk(expr))
     found = set()
     def note(node, verb, name):
         if added is None or _spans(node, added):
             found.add((verb, name))
     unreadable = "a name that cannot be read"
     for x in ast.walk(unit):
+        if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):   # a decorator, a base class or a class keyword runs when the definition does
+            for expr in list(x.decorator_list) + (list(x.bases) + [k.value for k in x.keywords] if isinstance(x, ast.ClassDef) else []):
+                for y in ast.walk(expr):
+                    if isinstance(y, ast.Name) and (y.id in tainted or (y.id in live and y.id not in own)):
+                        note(x, "calls", tainted.get(y.id, y.id))
         if isinstance(x, (ast.Import, ast.ImportFrom)):
             bound = [a.name.split(".")[0] for a in x.names] + [a.asname for a in x.names if a.asname] + ([x.module.split(".")[0]] if isinstance(x, ast.ImportFrom) and x.module else [])
             hits = sorted(n for n in bound if n in names)
@@ -550,12 +559,12 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=()):
         elif isinstance(x, ast.Call):
             callee = _root(x.func)
             fname = x.func.id if isinstance(x.func, ast.Name) else (x.func.attr if isinstance(x.func, ast.Attribute) else None)
-            if callee is not None and ((callee in names and callee not in own) or callee in tainted):
+            if callee is not None and ((callee in live and callee not in own) or callee in tainted):
                 note(x, "calls", tainted.get(callee, callee))
             elif callee is not None and callee not in own:   # a closure name handed to something that is not the registrar's own object (`partial(f)`, `Thread(target=f)`, `map(f, xs)`): it may run it
                 for a in list(x.args) + list(x.keywords):
                     handed = _root(a.value if isinstance(a, ast.keyword) else a)
-                    if handed in tainted or (handed in names and handed not in own):
+                    if handed in tainted or (handed in live and handed not in own):
                         note(x, "calls", tainted.get(handed, handed))
             if isinstance(x.func, ast.Name) and x.func.id in opaque and x.func.id not in own and x.func.id not in names:
                 note(x, "calls", "a helper that cannot be read (%s)" % x.func.id)
@@ -668,11 +677,32 @@ def registrar_findings(base_src, head_src, rule):
                             node.value.lineno, node.value.end_lineno = node.lineno, node.end_lineno
                         else:
                             opaque.add(y.id)
-        elif isinstance(node, ast.ImportFrom):
-            opaque.update((a.asname or a.name) for a in node.names if (a.asname or a.name) not in names)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            opaque.update((a.asname or a.name.split(".")[0]) for a in node.names if (a.asname or a.name.split(".")[0]) not in names)
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try)):   # names these bind at module level (`for f in ...`, `with x as f`, `except E as f`)
+            targets = [node.target] if isinstance(node, (ast.For, ast.AsyncFor)) else [i.optional_vars for i in getattr(node, "items", []) if i.optional_vars is not None]
+            opaque.update(y.id for t in targets for y in ast.walk(t) if isinstance(y, ast.Name) and y.id not in names)
+            opaque.update(h.name for h in getattr(node, "handlers", []) if h.name and h.name not in names)
+    bound_to, literals = {}, set()   # a closure name every module-level binding of which is a literal is data
+    for tree in (base, head):
+        for node in _module_statements(tree.body):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and getattr(node, "value", None) is not None:
+                try:
+                    ast.literal_eval(node.value)
+                    literal = True
+                except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+                    literal = False
+                for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                    for y in ast.walk(target):
+                        if isinstance(y, ast.Name):
+                            bound_to[y.id] = bound_to.get(y.id, True) and literal
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom)):
+                for bound in ([node.name] if hasattr(node, "name") else [(a.asname or a.name.split(".")[0]) for a in node.names]):
+                    bound_to[bound] = False
+    literals = {n for n, ok in bound_to.items() if ok and n in names}
     def read(label, unit, lines_counted):
         helpers = set()
-        for verb, hit in _registrar_unit(unit, names, lines_counted, helpers, opaque):
+        for verb, hit in _registrar_unit(unit, names, lines_counted, helpers, opaque, literals):
             found.append((label, verb, hit))
         return helpers
     for node in _module_statements(head.body):

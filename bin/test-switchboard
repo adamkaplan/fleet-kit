@@ -32384,6 +32384,27 @@ class TestRegistrarFloor(LedgerBase):
         got, why = self.reg("def add_a_parsers(sub):\n    t = sub.add_parser('x', type=issue_arg)\n    t.add_argument('--a', type=int, default=%s)\n" % binding)
         self.assertEqual(got, [], "the registrar's own parser, handed a closure name as a value, is not held")
 
+    def test_a_closure_name_carried_in_a_container_a_conditional_a_loop_or_a_decorator_is_held(self):
+        function, binding, module = self.pick()
+        cases = {
+            "a tuple element": "fn = (%s,)[0]\nfn()" % function, "a tuple unpack": "a, b = %s, 1\na()" % function, "an or": "fn = None or %s\nfn()" % function,
+            "a conditional": "fn = %s if sub else None\nfn()" % function, "a dict value": "d = {'k': %s}\nd['k']()" % function, "a loop target": "for f in (%s,):\n    f()" % function,
+            "a with target": "with %s as f:\n    f()" % function, "a comprehension target": "[f() for f in (%s,)]" % function,
+        }
+        for label, body in cases.items():
+            with self.subTest(label):
+                got = self.found_unit(body)
+                self.assertIn(("add_zzz_parsers", "calls", function), got, got)
+        for label, text in {"a decorator": "@%s\ndef add_a_parsers(sub):\n    pass\n" % function, "a decorator call": "@%s(1)\ndef add_a_parsers(sub):\n    pass\n" % function,
+                            "a base class": "class add_a_parsers(%s):\n    pass\n" % function, "a class keyword": "class add_a_parsers(metaclass=%s):\n    pass\n" % function}.items():
+            with self.subTest(label):
+                self.assertIn(("add_a_parsers", "calls", function), self.reg(text)[0])
+        for label, text in {"a plain import": "import sys as hh\ndef add_a_parsers(sub):\n    hh()\n", "a with target": "with open('x') as hh:\n    pass\ndef add_a_parsers(sub):\n    hh()\n",
+                            "a for target": "for hh in ():\n    pass\ndef add_a_parsers(sub):\n    hh()\n", "an except name": "try:\n    pass\nexcept Exception as hh:\n    pass\ndef add_a_parsers(sub):\n    hh()\n"}.items():
+            with self.subTest(label):
+                self.assertIn(("add_a_parsers", "calls", "a helper that cannot be read (hh)"), self.reg(text)[0])
+        self.assertEqual(self.found_unit("t = sub.add_parser('x', type=%s)\nt.usage = 'u'\nt.add_argument('--a', default=%s)" % (function, binding)), [], "the registrar's own parser is not tainted by a value handed to it")
+
     def test_a_pattern_weakened_in_the_head_a_size_over_the_cap_and_a_lambda_that_resets_its_lines_are_held_or_read(self):
         function, binding, module = self.pick()
         hostile = "def add_a_parsers(sub):\n    %s()\n" % function
