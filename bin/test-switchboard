@@ -5886,10 +5886,13 @@ class TestLaunch(Base):
             data["states"][n] = {"state": "unknown", "session": "ses_" + n}
         data["agents"]["relaunch"] = row("ses_new", "orchestrator")      # retired under an OLD session, running again under a new one
         sb.write_pane_health(self.world.state, data)
-        for n in ("r1", "r2", "r3", "relaunch"):                         # the agent list is the registry's: the rows go there too
-            sb.load_module("registry").upsert(self.world.state, n, data["agents"][n])
-        set_retired(self.world.state, {**{n: self.retired_entry("ses_" + n) for n in ("r1", "r2", "r3")},
-                                                            "relaunch": self.retired_entry("ses_old")})
+        reg = sb.load_module("registry")                                 # the agent list is the registry's: the rows and the retirements go there
+        for n in ("r1", "r2", "r3"):
+            reg.upsert(self.world.state, n, data["agents"][n], now=int(self.world.clock.now()))
+            reg.retire(self.world.state, n, "x", "finished", now=int(self.world.clock.now()))
+        reg.upsert(self.world.state, "relaunch", {"session": "ses_old", "pane": "w1:p9"}, now=int(self.world.clock.now()))
+        reg.retire(self.world.state, "relaunch", "x", "finished", now=int(self.world.clock.now()))
+        reg.upsert(self.world.state, "relaunch", data["agents"]["relaunch"], now=int(self.world.clock.now()))
         self.health(1)
         agents = sb.read_pane_health(self.world.state)
         self.assertEqual(sorted(agents["agents"]), ["coder", "platform", "relaunch"])

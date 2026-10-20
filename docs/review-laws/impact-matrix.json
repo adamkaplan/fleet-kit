@@ -354,6 +354,7 @@
         "bin/queue_ejections.py",
         "bin/reassign.py",
         "bin/reds.py",
+        "bin/registry.py",
         "bin/report_fold.py",
         "bin/spotlight_guard.py",
         "bin/triage_digest.py",
@@ -395,6 +396,9 @@
           "validate"
         ],
         "bin/reassign.py": [
+          "*"
+        ],
+        "bin/registry.py": [
           "*"
         ],
         "bin/reds.py": [
@@ -509,8 +513,6 @@
         "bin/launch_testers.py": "loaded only by the tester launch command, not the clear",
         "bin/merged_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/orders_copy.py": "loaded only by `cmd_orders_copy`, not the clear",
-        "bin/agent_reconcile.py": "loaded only by `cmd_status`'s view reconcile (a status read), which the clear never calls",
-        "bin/registry.py": "loaded by `known_agent`, `read_retired`, `pane_health_pass`, `cmd_reattach`, `cmd_retire`, `retire_close_problem` and the cloud launch and retire: the daemon's pane pass and the CLI's agent commands, which the clear does not run",
         "bin/resume_brief.py": "loaded only by `cmd_launch`, not the clear",
         "bin/review_checkout.py": "loaded only by `cmd_review_checkout`, the reviewer checkout command, not the clear",
         "bin/triage_ownerless.py": "loaded only by the triage passes, which the clear does not run",

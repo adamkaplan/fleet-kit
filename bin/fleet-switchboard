@@ -6930,6 +6930,9 @@ def pane_health_pass(engine, now):
                             "pane": agents[name].get("pane"), "session": agents[name].get("session"), "at": int(now)}
             if engine.audit is not None:
                 engine.audit.append(engine.actor, "fleetpane.dead", name, {"pane": agents[name].get("pane"), "session": agents[name].get("session")})
+    for table in (states, missing):   # a state or a missing count for a name the registry does not list (retired, retired-and-removed) and discovery does not show is an orphan: it goes
+        for name in [n for n in table if n not in agents and n not in discovery.agents]:
+            table.pop(name, None)
     engine.pane_alerts = {n: v for n, v in states.items() if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n in agents and n not in retired}
     if retired_whole:   # a retired agent (name AND session) leaves the record the pane draws from; its session stays in retired.json for reattach and --undo
         for name in [n for n in agents if retired_agent(retired, n, agents[n].get("session"))]:
