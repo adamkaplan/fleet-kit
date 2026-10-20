@@ -650,6 +650,8 @@ class OptionShaped(Dir):
 
 # ---------------------------------------------------------------- S16/S18: the class: every CW_* and switchboard-prefix name the code reads is a row or on the one list
 # THE list of names the launcher and the launch wiring mention that are deliberately NOT settings, each with its reason.
+SWITCHBOARD_PREFIX = "FL" + "EET_CLOUD_"   # written in two parts: test_cw_names bans the retired prefix as text anywhere under cloud/ (this one is the switchboard's own, in bin/)
+PREFIXES = ("CW_", SWITCHBOARD_PREFIX)   # every environment prefix the launch wiring and the launcher read
 NOT_SETTINGS = {
     # set by the code itself for the pod or a child: never read from the operator
     "CW_WORKER": "set by the launcher into the pod's environment (the worker's own name); end_hook reads it inside the pod",
@@ -688,8 +690,6 @@ NOT_SETTINGS = {
     # the switchboard's own variable (S18)
     SWITCHBOARD_PREFIX + "WORKER_BIN": "the launcher program, found by a lookup order (the variable when set, else the launcher of the switchboard's own checkout, else `cloud-worker` on the PATH), not a settings key: a path in the file would be one more thing to keep in step with the checkout, and an environment override that wins is what tests and a second install need",
 }
-SWITCHBOARD_PREFIX = "FL" + "EET_CLOUD_"   # written in two parts: test_cw_names bans the retired prefix as text anywhere under cloud/ (this one is the switchboard's own, in bin/)
-PREFIXES = ("CW_", SWITCHBOARD_PREFIX)   # every environment prefix the launch wiring and the launcher read
 SOURCES = ["bin/cloud_worker.py"]
 NAME = re.compile(r"(?:%s)[A-Z0-9_]+" % "|".join(PREFIXES))
 
