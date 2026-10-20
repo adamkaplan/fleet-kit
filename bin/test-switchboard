@@ -13213,15 +13213,19 @@ class TestChatClearHook(Base):
         import ast
         tree = ast.parse(Path(sb.__file__).read_text())
         fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
-        routes = set()
+        derived = set()
         for name in ("_chat_clear_act", "chat_clear_apply"):
             for c in ast.walk(fns[name]):
-                if isinstance(c, ast.Call):
-                    f = c.func
-                    routes.add((f.attr if isinstance(f, ast.Attribute) else f.id))
-        self.assertEqual(routes & {"send", "comment_as", "impact_clear_core", "show", "chat_clear_apply"}, {"send", "comment_as", "impact_clear_core", "show", "chat_clear_apply"})
-        written = {"append", "send", "comment_as", "impact_clear_core", "show", "chat_clear_apply", "mark_seen", "read_pr_json", "question_text", "head_matches", "head_matches", "quote", "owner_tier_labels", "is_offerable", "label_names", "get", "verify", "rpartition", "replace", "join", "int", "dict", "isinstance", "str", "getattr", "_one_line", "type", "upper", "NoticeError"}
-        self.assertEqual(routes - written, set(), "a new call in the clear's act: derive its test and add it here")
+                if isinstance(c, ast.Call) and any(isinstance(x, ast.Name) and x.id in ("engine", "runner") for x in ast.walk(c)):   # every call that is handed the engine or the gh runner: a route to the world
+                    derived.add(ast.unparse(c.func))
+        cases = {"chat_clear_apply": "test_light_live_route_clear_core_comment_and_confirmation_write_nothing", "impact_clear_core": "test_light_live_route_clear_core_comment_and_confirmation_write_nothing",
+                 "comment_as": "test_light_live_route_clear_core_comment_and_confirmation_write_nothing", "engine.send": "test_light_live_route_the_question_to_the_chief_of_staff_and_the_shown_offer_write_nothing",
+                 "cc.show": "test_light_live_route_the_question_to_the_chief_of_staff_and_the_shown_offer_write_nothing",
+                 "engine.audit.append": "assert_all_shadow (the audit is the shadow's own record)", "read_pr_json": "a read: only reached after the live check", "label_names": "a read of the config", "getattr": "a read of the runner"}
+        self.assertEqual(derived, set(cases), "a new call that reaches the world has no case: write its test and add its row here")
+        for case in cases.values():
+            if case.startswith("test_"):
+                self.assertTrue(hasattr(type(self), case), case)
 
     # ---- #977: the one allowed session read under v2_light
 
@@ -61672,6 +61676,7 @@ class TestV2LightGuards(Base):
         ("triage_stop", 1): (3, "stop", ()),
         ("synthetic_lines", 1): (5, "lines", (("transcript_lines", 1),)),
         ("transcript_lines", 1): (5, "transcript", ()),
+        ("chat_clear_live_now", 1): ("chat", "the live decision: shadow under light; pinned by TestChatClearHook test_light_live_route_* and test_light_live_every_route_*", ()),
         ("chat_clear_prompts", 1): ("chat", "the ONE allowed read: pinned by TestChatClearHook (S1 to S4)", ()),
     }
 

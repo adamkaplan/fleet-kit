@@ -22034,7 +22034,7 @@ def chat_clear_live_now(engine):
     shadow is simply the configured mode, else a short reason."""
     if not chat_clear_config(engine.config)["live"]:
         return False, None
-    if (getattr(engine, "config", None) or {}).get("v2_light") or getattr(engine, "light", False):   # #977: under v2_light the chat clear is SHADOW even with `live: true` (the owner's key AND light off, as before the light read existed)
+    if getattr(engine, "light", False):   # #977: under v2_light the chat clear is SHADOW even with `live: true` (the owner's key AND light off, as before the light read existed)
         return False, "v2_light"
     if os.path.lexists(str(Path(engine.state_dir) / CHAT_CLEAR_OFF_FILE)):   # ANY entry, even a dangling symlink, is the panic stop
         return False, "kill file"
