@@ -47,8 +47,8 @@ rebuilt from another record.
 | `plugins/fleet-decisions-tui/tui.tsx:2` | `decisions.json` | the TUI section renders it through decisions.mjs | nobody (reader only) | sidebar | derived (reader) |
 | `plugins/fleet-decisions-tui/health.mjs:3` | `pane-health.json` | reads which agents sit in which workspace and their state | nobody (reader only) | sidebar health view (the sidebar's own read of the agent list, from its own installed copy of the plugin: a view) | derived (reader) |
 | `bin/cloud_worker.py:101` | `cloud-records` | one record per cloud worker in `state/cloud/<name>.json`: run id, pod, repo, branch | `cloud_worker.cmd_launch`, the cloud reaper and `cmd_retire` (stop) | `route`, the cloud log read (`cmd_read`), `status` | primary for cloud workers; slice 2 mirrors them into the registry |
-| `bin/fleet-heartbeat:506` | `heartbeat-agent-list` | `Herdr.tabs_with_agents`: the supervised panes from `herdr agent list`; per-pane health in its own `state.json` and `fleet-heartbeat status --json` | `fleet-heartbeat` (its own state file) | `fleet-heartbeat status`, `fleet-doctor` through that output | derived (a live-pane observer; whether it is a view is open, see the note below) |
-| `bin/fleet-heartbeat:825` | `discovery.agents` | the heartbeat's own `Herdr.discover()` of panes (not the switchboard's discovery), for its per-pane health | `fleet-heartbeat` (its own state file) | `fleet-heartbeat` | derived (a live-pane observer) |
+| `bin/fleet-heartbeat:506` | `heartbeat-agent-list` | `Herdr.tabs_with_agents`: the supervised-pane set from `herdr agent list`. IDENTITY (who exists) derives from the registry in slice 3; BOOKKEEPING (its nudge state and per-pane health in its own `state.json`, `fleet-heartbeat status --json`) stays its own | `fleet-heartbeat` (bookkeeping only) | `fleet-heartbeat status`, `fleet-doctor` through that output | derived: a view of the registry for identity |
+| `bin/fleet-heartbeat:825` | `discovery.agents` | the heartbeat's own `Herdr.discover()` of panes, for its per-pane health. IDENTITY from the registry in slice 3; the per-pane health and nudge state are BOOKKEEPING | `fleet-heartbeat` (bookkeeping only) | `fleet-heartbeat` | derived: a view of the registry for identity |
 | `bin/switchboard-trial:483` | `decisions.json` | comment and environment only: the trial lab gives the sidebar plugin the daemon's state directory | nobody | nobody (the plugin reads it) | derived |
 | `bin/fleet-switchboard:4400` | `headless-records` | launch records `state/headless/<name>.json` and `headless-service.json` (boss per worker) and `headless-route.json` | `launch` (headless), the restart notice | discovery of headless workers, the restart notice, route checks | primary for headless workers |
 | `bin/agent_presence.py:25` | `headless-records` | scans `state/headless/*.json` | nobody (reader only) | presence checks | primary (reader) |
@@ -63,15 +63,16 @@ session, above); sweeps and the hooks plugin appear above only where they read o
 
 ### 1. Read API
 
-`registry.read(state_dir) -> Read` where `Read` is `{"whole": bool, "version": int, "agents": {name: Agent}, "problem": str|None}`.
+`registry.read(state_dir) -> Read` where `Read` is `{"whole": bool, "version": int, "agents": {name: Agent}, "retired": {name: Retired}, "problem": str|None}`.
 
 - `whole` is true only when the file was read, parsed and its version is known. A missing file is whole and empty (nobody registered).
-- A read that is not whole (unreadable, torn, invalid, newer version) returns `agents: {}`, `whole: false` and a one-line `problem`. A caller that
+- A read that is not whole (unreadable, torn, invalid, newer version) returns `agents: {}`, `retired: {}`, `whole: false` and a one-line `problem`. A caller that
   acts on the list (the #805 rule) acts only when `whole` is true.
 - `registry.get(state_dir, name) -> Agent|None` reads the same way; `None` with a problem is not "absent".
 - `registry.get_retired(state_dir, name) -> Retired|None` returns the retired record (session, at, by, reason, `record`), read the same way.
 - A consumer that ACTS on a read (the close-pane guard `retire_close_problem`, `reattach`, `reconcile_remove`) fails CLOSED when `whole` is false: it takes no action on a half read.
-- Consumers (slice 2 lists them in its plan): `status`, `reattach`, `retire`/`--undo`, the close-pane guard (`retire_close_problem`), `known_agent`, the cloud log read, the sidebar plugin, decisions, the load line and the health records.
+- `fleet-heartbeat` is a consumer of `Read` and obeys the whole-read rule: a heartbeat pass whose read is not whole nudges NOTHING (fail closed).
+- Consumers (slice 2 lists them in its plan): `status`, `reattach`, `retire`/`--undo`, the close-pane guard (`retire_close_problem`), `known_agent`, the cloud log read, the sidebar plugin, `fleet-heartbeat`, decisions, the load line and the health records.
 - The state `dead` is never rendered: a view shows a live state or nothing. A dead agent is removed by reconcile on read, not drawn (slice 4's test asserts it).
 
 ### 2. Write API
@@ -131,4 +132,4 @@ Clear-machinery files by slice (a slice that touches one says so in its plan and
 
 FROZEN: when the product, chief-of-staff and daemon lanes have each commented agreement on #906 (no earlier). After it a change needs all three lanes to agree again.
 
-Status: FROZEN 2026-10-20 (the product, chief-of-staff and daemon lanes agreed on #906).
+Status: FROZEN 2026-10-20, v1.1 additive (2026-10-20) (the product, chief-of-staff and daemon lanes agreed on #906).
