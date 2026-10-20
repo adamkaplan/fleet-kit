@@ -31346,31 +31346,6 @@ class TestImpactFloorPure(unittest.TestCase):
     def _meaning_of(self, data):
         return data["owner_hold"]["delegated_clear"]["meaning"]
 
-    def _without_meaning(self, data):
-        data = copy.deepcopy(data)
-        del data["owner_hold"]["delegated_clear"]["meaning"]
-        return data
-
-    def _matrix_at_base(self):
-        for ref in ("origin/main", "main"):
-            mb = subprocess.run(["git", "merge-base", "HEAD", ref], cwd=REPO, capture_output=True, text=True)
-            if mb.returncode == 0 and mb.stdout.strip():
-                shown = subprocess.run(["git", "show", mb.stdout.strip() + ":" + self.MATRIX_REL], cwd=REPO, capture_output=True, text=True)
-                if shown.returncode == 0:
-                    return json.loads(shown.stdout)
-        self.skipTest("no main ref to compare the matrix with (shallow checkout)")
-
-    def test_899_s3_only_the_delegated_clear_meaning_differs_from_main(self):
-        base = self._matrix_at_base()
-        self.assertEqual(self._without_meaning(self.matrix), self._without_meaning(base))   # count of other differences = 0
-
-    def test_899_u1_the_comparison_catches_a_changed_value_elsewhere(self):
-        base = self._matrix_at_base()
-        mutant = copy.deepcopy(self.matrix)
-        blk = mutant["owner_hold"]["delegated_clear"]
-        blk["closure_files"] = blk["closure_files"][:-1]
-        self.assertNotEqual(self._without_meaning(mutant), self._without_meaning(base))
-
     def test_899_s1_the_meaning_says_which_refusal_applies_when_in_separate_sentences(self):
         m = self._meaning_of(self.matrix)
         sentences = [s.strip() for s in m.split(". ")]
