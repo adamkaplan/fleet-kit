@@ -4185,6 +4185,92 @@ class TestLaunch(Base):
         self.assertIn('export TMPDIR="${{FLEET_AGENT_TMPDIR:-$PROFILE/tmp}}"', sb.PRIVATE_WRAPPER_TEXT)
         self.assertIn('export TMPDIR="${FLEET_AGENT_TMPDIR:-$PROFILE/tmp}"', sb.PRIVATE_WRAPPER_TEXT.format(**{k: "x" for k in ("profile", "gh_config", "gh", "gh_user_flag", "fleet_bin", "state", "shims", "kit_bin", "key_pattern", "pane_env", "v2")}))
 
+    # --- #947: files under an OS-cleaned temp area vanish after 3 days unread; durable scratch lives where the OS never looks
+    @staticmethod
+    def os_tmp_clean(top, now, days=3):
+        """The operating system's rule, simulated on a directory of this test (never the real /tmp): a regular file whose access, modification AND change
+        times are all older than `days` whole days is deleted (`find -atime +3 -mtime +3 -ctime +3 -delete`, the daily /tmp cleaner). Returns the removed names."""
+        gone = []
+        for dirpath, _dirs, files in os.walk(str(top)):
+            for name in files:
+                path = os.path.join(dirpath, name)
+                info = os.lstat(path)
+                if all(int((now - t) // 86400) > days for t in (info.st_atime, info.st_mtime, info.st_ctime)):
+                    os.unlink(path)
+                    gone.append(name)
+        return sorted(gone)
+
+    CLEANED_AREAS = ("/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", "/var/folders", "/private/var/folders")
+
+    def durable_roots(self):
+        """Every durable scratch root the docs section names, computed with XDG_DATA_HOME a PLAIN STRING under no cleaned area (the root functions touch no file):
+        the pane's wrapper root, the headless root, and the wrapper's own fallback `$PROFILE/tmp` (for the Chief of Staff and the lanes). Returns (data, {name: root})."""
+        data = "/home/user/.local/share"
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": data}):
+            wrapper = "%s/%s/bin/%s" % (data, sb.PROG, sb.WRAPPER_NAME)
+            text = sb.PRIVATE_WRAPPER_TEXT.format(**dict({k: "x" for k in ("gh_config", "gh", "gh_user_flag", "fleet_bin", "state", "shims", "kit_bin", "key_pattern", "pane_env", "v2")},
+                                                         profile="%s/%s/profile" % (data, sb.PROG)))
+            fallback = re.search(r'FLEET_AGENT_TMPDIR:-\$PROFILE/tmp', text)
+            profile = re.search(r"^PROFILE=(\S+)$", text, re.M).group(1)
+            return data, {"pane": str(sb.agent_tmp_root({"opencode": wrapper})), "headless": str(sb.headless_tmp_root()),
+                          "fallback": (profile + "/tmp") if fallback else "missing"}
+
+    def test_s3_a_file_unread_for_three_days_is_gone_in_a_cleaned_area(self):
+        cleaned = self.home / "os-temp" / "agent-scratch"
+        cleaned.mkdir(parents=True)
+        for name in ("tool.sh", "fresh.sh"):
+            (cleaned / name).write_text("echo hi\n")
+        now = time.time()
+        os.utime(str(cleaned / "tool.sh"), (now - 10 * 86400, now - 10 * 86400))
+        later = now + 5 * 86400   # the cleaner's clock: a change time cannot be set back, so the clock moves forward instead
+        self.assertEqual(self.os_tmp_clean(cleaned, later), ["fresh.sh", "tool.sh"])   # the reproduction: a file unread for 3 days is gone
+
+    def check_durable_roots(self):
+        data, roots = self.durable_roots()
+        self.assertEqual(set(roots), {"pane", "headless", "fallback"})
+        away = [os.path.realpath(a) for a in self.CLEANED_AREAS] + [os.path.realpath(tempfile.gettempdir()), tempfile.gettempdir()]
+        for name, root in roots.items():
+            self.assertTrue(root.startswith(data + "/"), (name, root))
+            for area in away:
+                self.assertFalse(root == area or root.startswith(area.rstrip("/") + "/"), (name, root, area))
+
+    def test_s3_every_durable_root_is_under_the_data_directory_and_under_no_cleaned_area(self):
+        self.check_durable_roots()
+
+    def test_s3_a_root_moved_into_the_per_user_temp_area_fails_the_check(self):
+        for target in ("agent_tmp_root", "headless_tmp_root"):
+            with self.subTest(mutant=target):
+                moved = Path(tempfile.gettempdir()) / sb.PROG / "profile" / "tmp"
+                with mock.patch.object(sb, target, (lambda config: moved) if target == "agent_tmp_root" else (lambda: moved)):
+                    with self.assertRaises(AssertionError):
+                        self.check_durable_roots()
+
+    def test_s3_a_wrapper_fallback_into_the_shared_temp_area_fails_the_check(self):
+        mutant = sb.PRIVATE_WRAPPER_TEXT.replace("$PROFILE/tmp", "/tmp")
+        self.assertNotEqual(mutant, sb.PRIVATE_WRAPPER_TEXT)
+        with mock.patch.object(sb, "PRIVATE_WRAPPER_TEXT", mutant), self.assertRaises(AssertionError):
+            self.check_durable_roots()
+
+    def test_u1_a_retire_still_removes_an_empty_private_dir_and_keeps_a_non_empty_one(self):
+        root = self.wrapper_world()
+        (root / "coder").mkdir(parents=True)
+        self.assertEqual(sb.reclaim_agent_tmp(self.engine, "coder"), ["%s: removed (empty)" % (root / "coder")])
+        (root / "coder2").mkdir()
+        (root / "coder2" / "note").write_text("x")
+        self.assertIn("kept", sb.reclaim_agent_tmp(self.engine, "coder2")[0])   # a non-empty one is kept: nothing empties it
+        self.assertTrue((root / "coder2" / "note").exists())
+
+    def test_s4_the_shared_name_agents_take_the_profile_root_not_an_os_cleaned_area(self):
+        # the wrapper exports FLEET_AGENT_TMPDIR when set, else the profile's tmp: so the Chief of Staff and the lanes (skipped by name) still land under the profile
+        self.assertIn('export TMPDIR="${{FLEET_AGENT_TMPDIR:-$PROFILE/tmp}}"', sb.PRIVATE_WRAPPER_TEXT)
+        doc = (Path(__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
+        section = doc.split("### What may delete under agent scratch", 1)[1].split("\n### ", 1)[0]
+        may, never = section.split("**What may delete under agent scratch**", 1)[1].split("**What never deletes**", 1)
+        for word in ("the OS cleaners", "the temp janitor", "**EMPTY**", "removing its own files"):
+            self.assertIn(word, may)
+        for word in ("worktree removal", "**non-empty**", "other agents' files", "docker reaper"):
+            self.assertIn(word, never)
+
     def test_nothing_is_typed_and_focus_is_never_asked_for(self):
         self.launch()
         self.assertEqual(self.world.herdr.typing_attempts, [])
