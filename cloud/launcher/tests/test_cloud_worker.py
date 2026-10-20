@@ -453,6 +453,126 @@ class S5EndHook(Base):
         work, _ = make_repo(self.tmp.name, "r", dirty=True)
         self.assertEqual(end_hook.run(work, "coder7")["skipped"], [".env"])
 
+    def _record_json(self):
+        d = os.path.join(os.path.dirname(self.env["CW_CLOUD_AUDIT"]), "runs")
+        names = os.listdir(d)
+        self.assertEqual(len(names), 1)
+        with open(os.path.join(d, names[0], "run.json")) as f:
+            return json.load(f)
+
+    def test_a_reaper_stop_records_and_prints_the_hook_result(self):
+        work, _ = make_repo(self.tmp.name, "r", dirty=True)
+        self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
+        self.create("coder7", "--hard", "1h")
+        self.set_activity("coder7", True, T0)
+        self.clock.advance(hours=2)
+        code, out, err = self.run_cli("reap")
+        self.assertEqual(code, 0, err)
+        row = json.loads(out)[0]
+        self.assertEqual((row["pushed"], row["wip_branch"], row["skipped"]), (True, "coder7/wip", [".env"]))
+        hook = self._record_json()["end_hook"]
+        self.assertEqual((hook["pushed"], hook["wip_branch"], hook["skipped"]), (True, "coder7/wip", [".env"]))
+
+    def test_a_failed_push_is_in_the_record_and_the_pod_is_kept(self):
+        work, _ = make_repo(self.tmp.name, "r", dirty=True)
+        subprocess.run(["git", "-C", work, "remote", "set-url", "origin", os.path.join(self.tmp.name, "gone.git")], check=True)
+        self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
+        self.create("coder7")
+        self.assertEqual(self.run_cli("stop", "coder7")[0], 1)
+        hook = self._record_json()["end_hook"]
+        self.assertEqual((hook["pushed"], bool(hook["error"])), (False, True))
+        self.assertIsNotNone(self.pod())
+
+    def test_a_record_that_cannot_be_updated_never_blocks_the_stop(self):
+        work, _ = make_repo(self.tmp.name, "r", dirty=True)
+        self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
+        self.create("coder7")
+        orig = cw.run_record.Recorder.__dict__["add_hook"]
+        cw.run_record.Recorder.add_hook = staticmethod(lambda d, h: (_ for _ in ()).throw(OSError("full")))
+        self.addCleanup(setattr, cw.run_record.Recorder, "add_hook", orig)
+        code, out, _ = self.run_cli("stop", "coder7")
+        self.assertEqual((code, json.loads(out)["pushed"]), (0, True))
+        self.assertIsNone(self.pod())
+
+    def test_a_failed_reaper_stop_still_prints_what_the_hook_said(self):
+        work, _ = make_repo(self.tmp.name, "r", dirty=True)
+        subprocess.run(["git", "-C", work, "remote", "set-url", "origin", os.path.join(self.tmp.name, "gone.git")], check=True)
+        self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
+        self.create("coder7", "--hard", "1h")
+        self.set_activity("coder7", True, T0)
+        self.clock.advance(hours=2)
+        row = json.loads(self.run_cli("reap")[1])[0]
+        self.assertEqual((row["exit"], row["pushed"], bool(row["error"])), (1, False, True))
+
+    def test_a_record_update_that_fails_says_so_once(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            cw.run_record.Recorder.add_hook(os.path.join(self.tmp.name, "absent"), {"ran": True})
+        self.assertEqual(err.getvalue().count("run record not updated with the end hook result"), 1)
+
+    def test_the_hook_answer_is_typed_scrubbed_and_short_before_it_is_kept(self):
+        L = cw.Launcher(cw.Kube(self.env), self.env, self.clock)
+        L.kube.add_secrets("s3cr3t-value-123456")
+        v = L._hook_view({"pushed": 1, "wip_branch": "b/s3cr3t-value-123456" + "x" * 500, "skipped": [".env", 7, None] + ["f"] * 80,
+                          "note": {"a": 1}, "error": "\x1b[31mboom"})
+        self.assertNotIn("s3cr3t-value-123456", json.dumps(v))
+        self.assertLessEqual(len(v["wip_branch"]), 200)
+        self.assertEqual((v["pushed"], v["note"]), (True, ""))
+        self.assertTrue(all(isinstance(x, str) for x in v["skipped"]) and len(v["skipped"]) <= 50)
+        self.assertEqual(L._hook_view({"wip_branch": 5})["wip_branch"], None)
+
+    def test_no_record_means_no_end_hook_write(self):
+        work, _ = make_repo(self.tmp.name, "r", dirty=True)
+        self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
+        self.create("coder7")
+        code, out, _ = self.run_cli("stop", "coder7", "--no-record")
+        self.assertEqual((code, json.loads(out)["pushed"]), (0, True))
+        self.assertFalse(os.path.isdir(os.path.join(os.path.dirname(self.env["CW_CLOUD_AUDIT"]), "runs")))
+
+    def test_the_reaper_says_why_it_exits_once_on_a_plain_error(self):
+        orig = cw.Launcher.reap
+        cw.Launcher.reap = lambda self_: (_ for _ in ()).throw(RuntimeError("boom"))
+        self.addCleanup(setattr, cw.Launcher, "reap", orig)
+        # the line is written by the finally block; run_cli's stderr is discarded on a raise, so call main directly
+        err = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+            cw.main(["reap"], self.env, self.clock, lambda s: None)
+        self.assertEqual(err.getvalue().count("reaper exiting: error: boom"), 1)
+        self.assertRegex(err.getvalue(), r"cloud-worker: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ reaper exiting: error: boom")
+
+    def test_every_exit_reason_the_code_writes_carries_the_time(self):
+        import ast
+        src = open(os.path.join(os.path.dirname(os.path.abspath(cw.__file__)), "cloud_worker.py")).read()
+        fn = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and n.name == "_reap_main"][0]
+        whys = sorted({ast.unparse(a.value)[:20] for a in ast.walk(fn) if isinstance(a, ast.Assign) and any(getattr(t, "id", "") == "why" for t in a.targets)})
+        self.assertEqual(len(whys), 3, whys)   # end of its pass, stopped by (a signal or an interrupt), an error: a form added needs its case
+        shape = r"cloud-worker: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ reaper exiting: "
+        orig = cw.Launcher.reap
+        self.addCleanup(setattr, cw.Launcher, "reap", orig)
+        cw.Launcher.reap = lambda self_: (_ for _ in ()).throw(KeyboardInterrupt())
+        code, _, err = self.run_cli("reap", "--loop", "5")
+        self.assertEqual(code, cw.EXIT_INTERRUPTED)
+        self.assertRegex(err, shape + "stopped by interrupt")
+        self.assertEqual(err.count("reaper exiting:"), 1)
+
+    def test_the_reaper_says_why_it_exits_once(self):
+        code, _, err = self.run_cli("reap")
+        self.assertEqual(code, 0)
+        self.assertEqual(err.count("reaper exiting:"), 1)
+        self.assertIn("end of its pass", err)
+        self.assertRegex(err, r"cloud-worker: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ reaper exiting: end of its pass")
+
+        def boom(self_):
+            raise cw.Interrupted("signal 15")
+        orig = cw.Launcher.reap
+        cw.Launcher.reap = boom
+        self.addCleanup(setattr, cw.Launcher, "reap", orig)
+        code, _, err = self.run_cli("reap", "--loop", "5")
+        self.assertEqual(code, cw.EXIT_INTERRUPTED)
+        self.assertEqual(err.count("reaper exiting:"), 1)
+        self.assertIn("signal 15", err)
+        self.assertRegex(err, r"cloud-worker: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ reaper exiting: stopped by signal 15")
+
     def test_reaper_keeps_a_pod_whose_push_failed(self):
         work, _ = make_repo(self.tmp.name, "r", dirty=True)
         subprocess.run(["git", "-C", work, "remote", "set-url", "origin", os.path.join(self.tmp.name, "gone.git")], check=True)
