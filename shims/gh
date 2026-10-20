@@ -313,6 +313,8 @@ def split_response(raw):
 def cached_read(gh, env, args, agent, account, low):
     """Serve `gh api <path>` from the cache or through one conditional request. Returns an exit status, or None when the normal call should run (nothing was spent)."""
     path = cacheable_read(args)
+    if path and ("{" in path or os.environ.get("GH_HOST") or os.environ.get("GH_REPO")):
+        path = None   # gh fills `{owner}`, `{repo}` and `{branch}` from the working directory, and these variables change the target: the key could not tell
     directory = cache_directory(create=True) if path and agent else None
     if directory is None or sys.stdout.isatty():
         return None
@@ -325,31 +327,38 @@ def cached_read(gh, env, args, agent, account, low):
         return 0
     argv = [gh, "api", "-i"] + (["-H", "If-None-Match: " + entry[1]] if entry is not None and entry[1] else []) + [path]
     done = subprocess.run(argv, capture_output=True, env=env)   # the one request (the real gh does not time out either)
-    parsed = split_response(done.stdout)
-    if parsed is None:   # not an answer this can interpret: say what gh said
-        sys.stdout.buffer.write(done.stdout)
-        sys.stderr.buffer.write(done.stderr)
-        count_call(args)
-        return done.returncode
-    status, headers, body = parsed
-    if status == 304 and entry is not None:
-        try:
-            cache_store(directory, file, entry[1], entry[2], now)   # fresh again; a 304 costs nothing, so it is not counted
-        except Exception:
-            pass
-        sys.stdout.buffer.write(entry[2].encode("utf-8"))
+    # from here a request is SPENT: whatever happens below, this returns its status and never lets the caller run a second request
+    count_now = True
+    try:
+        parsed = split_response(done.stdout)
+        if parsed is None:   # not an answer this can interpret: say what gh said
+            sys.stdout.buffer.write(done.stdout)
+            sys.stderr.buffer.write(done.stderr)
+            return done.returncode
+        status, headers, body = parsed
+        if status == 304 and entry is not None:
+            count_now = False   # a 304 costs nothing, so it is not counted
+            cache_store(directory, file, entry[1], entry[2], now)
+            sys.stdout.buffer.write(entry[2].encode("utf-8"))
+            sys.stdout.buffer.flush()
+            return 0
+        if 200 <= status < 300 and len(body) <= CACHE_BODY_MAX:
+            try:
+                cache_store(directory, file, headers.get("etag"), body.decode("utf-8"), now)
+            except Exception:
+                pass
+        sys.stdout.buffer.write(body)
         sys.stdout.buffer.flush()
-        return 0
-    count_call(args)
-    if 200 <= status < 300 and len(body) <= CACHE_BODY_MAX:
+        sys.stderr.buffer.write(done.stderr)
+        return done.returncode
+    except Exception:
+        return done.returncode
+    finally:
         try:
-            cache_store(directory, file, headers.get("etag"), body.decode("utf-8"), now)
+            if count_now:
+                count_call(args)
         except Exception:
             pass
-    sys.stdout.buffer.write(body)
-    sys.stdout.buffer.flush()
-    sys.stderr.buffer.write(done.stderr)
-    return done.returncode
 
 
 def real_gh():

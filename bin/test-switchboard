@@ -11311,6 +11311,71 @@ class TestShimReadCache(Base):
         done = self.run_shim("api", self.PATH)
         self.assertEqual((done.returncode, done.stdout, len(self.network())), (0, '{"n":1}', 1))
 
+    def test_edges_an_error_answer_garbage_a_corrupt_entry_and_a_304_with_no_entry_pass_through_and_cache_nothing(self):
+        gh = self.bin / "gh"
+        good = gh.read_text()
+        gh.write_text("#!/bin/sh\n[ \"$1\" = auth ] && { echo faketoken; exit 0; }\necho \"$@\" >> \"$FAKE_LOG\"\n"
+                      "case \"$FAKE_MODE\" in\n 404) printf 'HTTP/2.0 404 Not Found\\r\\n\\r\\n{\"message\":\"Not Found\"}'; echo 'gh: Not Found (HTTP 404)' >&2; exit 1;;\n"
+                      " garbage) printf 'not http at all'; exit 0;;\n 304) printf 'HTTP/2.0 304 Not Modified\\r\\n\\r\\n'; exit 0;;\nesac\nexit 0\n")
+        for mode, code, out in (("404", 1, '{"message":"Not Found"}'), ("garbage", 0, "not http at all"), ("304", 0, "")):
+            done = self.run_shim("api", self.PATH, env={"FAKE_MODE": mode})
+            self.assertEqual((done.returncode, done.stdout), (code, out), mode)
+            if mode == "404":
+                self.assertIn("HTTP 404", done.stderr)
+            cache = self.state / "gh-read-cache"
+            self.assertEqual([n for n in (os.listdir(cache) if cache.exists() else []) if n.endswith(".json")], [], mode)
+        gh.write_text(good)
+        self.run_shim("api", self.PATH)
+        cache = self.state / "gh-read-cache"
+        for name in os.listdir(cache):
+            (cache / name).write_text("{not json")
+        before = len(self.network())
+        self.assertEqual(self.run_shim("api", self.PATH).stdout, '{"n":1}')
+        self.assertEqual(len(self.network()), before + 1, "a corrupt entry is a miss")
+        self.age(700)
+        before = len(self.network())
+        self.run_shim("api", self.PATH)
+        self.assertEqual(len(self.network()), before + 1, "an entry older than the bound is a miss")
+
+    def test_edges_low_budget_with_no_entry_spends_and_a_stale_reading_is_ignored(self):
+        self.usage(100)
+        first = self.run_shim("api", self.PATH)
+        self.assertEqual((first.stdout, len(self.network())), ('{"n":1}', 1))          # nothing to serve: it spends, never refuses
+        (self.state / "github-usage.json").write_text(json.dumps({"v": 1, "at": time.time() - 3600, "accounts": {"acme-a": {"used": 4900, "remaining": 100, "limit": 5000, "reset": time.time()}}}))
+        shutil.rmtree(str(self.state / "gh-low-warned"), ignore_errors=True)
+        self.age(100)
+        again = self.run_shim("api", self.PATH)
+        self.assertEqual((again.stderr, len(self.network())), ("", 2), "a reading an hour old is ignored: no warning, and the stale entry is revalidated")
+
+    def test_edges_a_path_that_names_the_working_directory_or_a_host_is_not_cached(self):
+        self.run_shim("api", "repos/{owner}/{repo}/issues")
+        self.run_shim("api", self.PATH, env={"GH_HOST": "ghe.example"})
+        cache = self.state / "gh-read-cache"
+        self.assertEqual([n for n in (os.listdir(cache) if cache.exists() else []) if n.endswith(".json")], [])
+
+    def test_edges_a_failed_output_after_the_request_never_makes_a_second_request(self):
+        module = self.shim_module()
+        calls = []
+        real_run = module.subprocess.run
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, b'HTTP/2.0 200 OK\r\nEtag: "v1"\r\n\r\n{"n":1}', b"")
+
+        class Broken:
+            def isatty(self):
+                return False
+
+            @property
+            def buffer(self):
+                raise BrokenPipeError("closed")
+
+        os.environ["FLEET_SWITCHBOARD_STATE"] = str(self.state)
+        self.addCleanup(os.environ.pop, "FLEET_SWITCHBOARD_STATE", None)
+        with mock.patch.object(module.subprocess, "run", fake_run), mock.patch.object(module.sys, "stdout", Broken()):
+            status = module.cached_read("gh", {}, ["api", self.PATH], "worker", "acme-a", None)
+        self.assertEqual((status, len(calls)), (0, 1))
+
     def test_the_cache_is_private_and_holds_no_token(self):
         self.run_shim("api", self.PATH, env={"GH_TOKEN": "secrettoken"})
         cache = self.state / "gh-read-cache"
