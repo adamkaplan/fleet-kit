@@ -10,6 +10,7 @@ secret value is read once from an inherited descriptor and goes to kubectl's std
 """
 import argparse
 import base64
+import fcntl
 import datetime as dt
 import pwd
 import hashlib
@@ -49,6 +50,10 @@ CREDENTIAL_PATTERNS = [re.compile(p) for p in (
     r"-----BEGIN [A-Z ]*PRIVATE KEY", r"Bearer [A-Za-z0-9._-]{20,}", r"(?i)(client_secret|api[_-]?key)\"\s*:\s*\"[^\"]+")]
 SECRET_ENV_NAME = re.compile(r"(?i)(TOKEN|SECRET|PASSWORD|API_?KEY|CREDENTIAL|^PAT$|_PAT$)")
 ALLOWED_ENV_NAMES = {"CW_TOKEN_ENDPOINT"}  # a URL, not a token
+
+
+class ReaperLocked(Exception):
+    """Another reaper holds the lock, or the lock cannot be taken safely. Raised before any pass."""
 
 
 class CloudError(Exception):
@@ -1080,7 +1085,8 @@ class Launcher:
             if reason:
                 self.last_hook = None
                 try:
-                    res = self.stop(argparse.Namespace(worker=worker, reason=reason), reason)
+                    # by the run's own nonce where the pod carries one: a pod of another run under this name is left whole
+                    res = self.stop(argparse.Namespace(worker=worker, reason=reason, run_id=ann(pod, "run-id") or None), reason)
                     self.reap_results[worker] = {k: res.get(k) for k in ("pushed", "wip_branch", "skipped", "record")}
                     out.append((worker, reason, 0))
                 except CloudError as e:
@@ -1428,10 +1434,36 @@ def _reap_exit_line(clock, why):
     print("cloud-worker: %s reaper exiting: %s" % (iso(now), why), file=sys.stderr)
 
 
+def reaper_lock(audit_path):
+    """The one lock between reapers: an exclusive, non-blocking flock on a 0600 file in the private state directory (the audit
+    file's), held for the process's life; the kernel drops it when the process dies, however it dies. Returns the open file.
+    Raises ReaperLocked for a second reaper, a state directory or lock file that is not the user's own, or a link at the path."""
+    directory = os.path.dirname(os.path.abspath(audit_path))
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        dinfo = os.stat(directory)
+        if dinfo.st_uid != os.getuid() or dinfo.st_mode & 0o022:
+            raise ReaperLocked("the state directory %s is not private to this user" % directory)
+        fd = os.open(os.path.join(directory, "reaper.lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as e:
+        raise ReaperLocked("the reaper lock cannot be opened: %s" % e.strerror)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        os.close(fd)
+        raise ReaperLocked("the reaper lock file is not a private regular file of this user")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise ReaperLocked("another reaper holds the lock")
+    return fd
+
+
 def _reap_main(L, a, sleep):
     """The reaper's loop. Whatever ends it writes ONE line saying why (signal, error, or the end of the loop)."""
-    old, why = L._catch_signals(), None
+    old, why, lock = L._catch_signals(), None, None
     try:
+        lock = reaper_lock(L.audit_path)   # BEFORE the first pass: two reapers would both run an end hook for one pod
         while True:
             res = L.reap()
             print(json.dumps([dict({"worker": w, "reason": r, "exit": c}, **L.reap_results.get(w, {})) for w, r, c in res]))
@@ -1442,10 +1474,16 @@ def _reap_main(L, a, sleep):
     except (Interrupted, KeyboardInterrupt) as e:
         why = "stopped by %s" % (e if isinstance(e, Interrupted) else "interrupt")
         raise
+    except ReaperLocked as e:
+        why = "not started: %s" % e
+        print("cloud-worker: %s" % e, file=sys.stderr)
+        return EXIT_REFUSED
     except BaseException as e:
         why = "error: %s" % L.kube.scrub(e, 200)
         raise
     finally:
+        if lock is not None:
+            os.close(lock)
         L._restore_signals(old)
         _reap_exit_line(L.clock, why)   # reason and UTC time, once
 

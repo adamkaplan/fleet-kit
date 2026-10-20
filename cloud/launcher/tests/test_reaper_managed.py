@@ -6,6 +6,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -26,6 +27,7 @@ ENDINGS = {
     "crash in a pass": ("error: boom", "_reap_main"),
     "login failure: token file unusable": ("cluster login failed: token unavailable", "main"),
     "login failure: no login set": ("cluster login failed: no login is set", "main"),
+    "another reaper holds the lock": ("not started: another reaper holds the lock", "_reap_main"),
 }
 
 
@@ -51,6 +53,9 @@ class ReaperEndings(base.Base):
             env.update(CW_CLOUD_TOKEN_FILE=os.path.join(self.tmp.name, "missing"), CW_CLOUD_SERVER="https://api.example.internal")
         elif name.startswith("login failure: no login"):
             del env["CW_KUBE_CONTEXT"]
+        elif name == "another reaper holds the lock":
+            self.holder = cw.reaper_lock(env["CW_CLOUD_AUDIT"])
+            self.addCleanup(os.close, self.holder)
         try:
             with redirect_stderr(err), redirect_stdout(io.StringIO()):
                 code = cw.main(argv, env, self.clock, sleep)
@@ -66,6 +71,8 @@ class ReaperEndings(base.Base):
                 self.assertRegex(err, LINE + re.escape(reason))
                 if name != "end of a single pass":
                     self.assertNotEqual(code, 0, name)
+                if name == "another reaper holds the lock":
+                    self.assertEqual(code, cw.EXIT_REFUSED)
                 for other, (r, _) in ENDINGS.items():   # a generic reason for every exit fails here
                     if other != name and not r.startswith(reason[:15]):
                         self.assertNotIn("reaper exiting: " + r, err)
@@ -97,8 +104,8 @@ class ReaperEndings(base.Base):
         self.assertEqual(len(sites["main"]), 2)
         fn = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_reap_main"][0]
         whys = {ast.unparse(a.value)[:20] for a in ast.walk(fn) if isinstance(a, ast.Assign) and any(getattr(t, "id", "") == "why" for t in a.targets)}
-        self.assertEqual(len(whys), 3, whys)   # pass, stopped by (signal or interrupt), error
-        self.assertEqual(sum(1 for _, w in ENDINGS.values() if w == "_reap_main"), 4)   # the 3 forms: pass, stopped (x2), error
+        self.assertEqual(len(whys), 4, whys)   # pass, stopped by (signal or interrupt), error, not started
+        self.assertEqual(sum(1 for _, w in ENDINGS.values() if w == "_reap_main"), 5)   # the 4 forms: pass, stopped (x2), error, lock
         self.assertEqual(sum(1 for _, w in ENDINGS.values() if w == "main"), 2)
         for call in sites["main"]:   # a login reason names the login and carries no environment value
             self.assertIn("cluster login failed", ast.unparse(call))
@@ -202,6 +209,85 @@ class RestartMeetsAStoppedPod(base.Base):
         self.assertEqual(len(self.calls("exec")), execs)       # the end hook did not run again
         self.assertIsNone(self.pod("past1"))
         self.assertEqual([l["ok"] for l in self.stops()], [True, True])   # the second is the by-name stop that found nothing
+
+
+class TwoReapersOneCluster(base.Base):
+    def setUp(self):
+        super().setUp()
+        self.create("past1", "--hard", "10m")
+        self.create("past2", "--hard", "10m", "--run-id", "aaaaaaaa11111111")
+        _clean_hook(self)
+        for w in ("past1", "past2"):
+            self.set_activity(w, True, base.T0)
+        self.clock.advance(minutes=11)
+
+    def calls(self):
+        with open(self.env["FAKE_KUBE_CALLS"]) as f:
+            return [json.loads(x) for x in f]
+
+    def test_a_second_reaper_started_while_the_first_stops_exits_and_touches_nothing(self):
+        seen, real = {}, cw.Launcher.stop
+
+        def stop_with_a_rival(self_, a, reason=None):
+            if "second" not in seen:   # the rival starts while the first reaper is in the middle of a pass
+                before = len(self.calls())
+                err = io.StringIO()
+                with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                    seen["second"] = cw.main(["reap"], self.env, self.clock, lambda s: None)
+                seen["err"], seen["calls"] = err.getvalue(), len(self.calls()) - before
+            return real(self_, a, reason)
+        cw.Launcher.stop = stop_with_a_rival
+        self.addCleanup(setattr, cw.Launcher, "stop", real)
+        code, out, err = self.run_cli("reap")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(seen["second"], cw.EXIT_REFUSED)
+        self.assertEqual(seen["calls"], 0)   # the second reaper made no kubectl call at all
+        self.assertRegex(seen["err"], LINE + "not started: another reaper holds the lock")
+        hooks = [c for c in self.calls() if "cw-end-hook" in c]
+        self.assertEqual(len(hooks), 2)   # one end hook per pod, never two for one pod
+        self.assertEqual(sorted(l["worker"] for l in self.audit_lines() if l["action"] == "stop"), ["past1", "past2"])
+
+    def test_the_stop_carries_the_pods_own_run_id_where_it_has_one(self):
+        self.run_cli("reap")
+        reasons = {l["worker"]: l["reason"] for l in self.audit_lines() if l["action"] == "stop"}
+        self.assertIn("run-id=aaaaaaaa11111111", reasons["past2"])
+        self.assertNotIn("run-id", reasons["past1"])   # a pod made without one is stopped by name, as before
+
+    def test_a_killed_holder_releases_the_lock(self):
+        code = ("import sys,time;sys.path.insert(0,%r);import cloud_worker as c;c.reaper_lock(sys.argv[1]);print('held',flush=True);time.sleep(60)" % cw.__file__.rsplit("/", 1)[0])
+        holder = subprocess.Popen([sys.executable, "-c", code, self.env["CW_CLOUD_AUDIT"]], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        self.assertEqual(self.run_cli("reap")[0], cw.EXIT_REFUSED)   # alive: refused
+        holder.send_signal(signal.SIGKILL)
+        holder.wait()
+        self.assertEqual(self.run_cli("reap")[0], 0)   # killed with no chance to clean up: the kernel let go
+
+    def test_a_lock_path_that_is_not_the_users_private_file_is_refused(self):
+        d = os.path.dirname(self.env["CW_CLOUD_AUDIT"])
+        lock = os.path.join(d, "reaper.lock")
+        victim = os.path.join(self.tmp.name, "victim")
+        open(victim, "w").close()
+        rows = {
+            "a symlink": lambda: os.symlink(victim, lock),
+            "a directory": lambda: os.mkdir(lock),
+            "group readable": lambda: (open(lock, "w").close(), os.chmod(lock, 0o640)),
+            "a FIFO": lambda: os.mkfifo(lock),
+        }
+        for name, make in rows.items():
+            with self.subTest(row=name):
+                if os.path.lexists(lock):
+                    os.path.isdir(lock) and not os.path.islink(lock) and os.rmdir(lock) or (os.path.lexists(lock) and os.unlink(lock))
+                make()
+                with self.assertRaises(cw.ReaperLocked):
+                    cw.reaper_lock(self.env["CW_CLOUD_AUDIT"])
+        os.unlink(lock)
+        os.chmod(d, 0o770)
+        with self.assertRaises(cw.ReaperLocked):   # a state directory others can write
+            cw.reaper_lock(self.env["CW_CLOUD_AUDIT"])
+        os.chmod(d, 0o700)
 
 
 if __name__ == "__main__":

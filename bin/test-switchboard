@@ -41601,7 +41601,10 @@ class TestCloudReaperTemplates(Base):
         self.assertGreater(sb.REAPER_INTERVAL_SECONDS, 0)
 
     def test_neither_holds_a_secret_a_placeholder_or_the_void(self):
-        os.environ["OPENROUTER_API_KEY"] = PR16_KEY
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": PR16_KEY}):
+            self.check_neither_holds_a_secret()
+
+    def check_neither_holds_a_secret(self):
         for kind, name in (("launchd", "com.fleet-kit.cloud-reaper.plist"), ("systemd", "fleet-kit-cloud-reaper.service")):
             rendered = sb.render_reaper(kind, self.values(), {}, REPO)
             self.assertNotIn(PR16_KEY, rendered)
@@ -41623,6 +41626,26 @@ class TestCloudReaperTemplates(Base):
             self.assertNotIn(pw, str(ctx.exception))
         self.assertEqual(sb.reaper_settings({"CW_CLOUD_SERVER": "https://api.example.internal", "PATH": "/x", "CW_BOGUS": "1"}),
                          {"CW_CLOUD_SERVER": "https://api.example.internal"})
+
+    def test_every_setting_has_one_shape_and_a_pasted_token_is_refused_by_name(self):
+        token = "".join(chr(97 + (i * 11) % 26) for i in range(48))   # built at run time: not a literal
+        good = {"CW_KUBE_CONTEXT": "acme-cw", "CW_CLOUD_NAMESPACE": "acme-cw", "CW_CLOUD_SERVER": "https://api.example.internal:6443",
+                "CW_CLOUD_TOKEN_FILE": "/home/user/.cw/token", "CW_KUBECONFIG": "/home/user/.kube/config", "CW_KUBECTL": "kubectl",
+                "CW_CLOUD_CA_FILE": "/home/user/ca.pem", "CW_CLOUD_RECORD_DIR": "/home/user/runs", "CW_RUN_RECORD_DIR": "/home/user/runs",
+                "CW_CLOUD_AUDIT": "/home/user/audit.jsonl"}
+        self.assertEqual(sorted(good), sorted(sb.REAPER_SETTING_NAMES))   # a name added needs a row here
+        self.assertEqual(sb.reaper_settings(good), good)
+        for name in sb.REAPER_SETTING_NAMES:
+            for bad in (token, "relative/path", "/a/../b", "/a b", "https://api.example.internal/?" + token, "http://api.example.internal",
+                        "https://user@api.example.internal", "a\nb", "$(id)", "x;y"):
+                if sb.REAPER_SETTING_SHAPES[sb.reaper_setting_kind(name)].fullmatch(bad) and "/../" not in bad + "/":
+                    if not (sb.reaper_setting_kind(name) == "name" and len(bad) > 32):
+                        continue   # a shape the setting accepts is not a bad value for it
+                with self.subTest(name=name, bad=bad[:12]):
+                    with self.assertRaises(sb.InstallError) as ctx:
+                        sb.reaper_settings({name: bad})
+                    self.assertIn(name, str(ctx.exception))
+                    self.assertNotIn(token, str(ctx.exception))
 
     def test_the_setting_names_hold_no_token_value_name(self):
         for name in sb.REAPER_SETTING_NAMES:
@@ -41672,7 +41695,33 @@ class CloudReaperInstall:
     def test_a_dry_run_writes_nothing(self):
         out, _ = self.install("--opencode", self.machine.binary, "--with-cloud-reaper", "--dry-run")
         self.assertFalse(self.reaper_path().exists())
-        self.assertIn("would", out)
+        self.assertEqual(self.statuses(out)["cloud reaper"], ["would run", "would be done"])
+        self.assertFalse([c for c in self.machine.calls if c[0] in ("launchctl", "systemctl") and "cloud-reaper" in " ".join(c)])
+
+    def test_a_changed_setting_unloads_rewrites_and_loads_again_in_that_order(self):
+        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        before = len(self.machine.calls)
+        with mock.patch.dict(os.environ, {"CW_CLOUD_NAMESPACE": "acme-cw"}):
+            out, error = self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.assertIsNone(error, error)
+        order = [c for c in self.machine.calls[before:] if "cloud-reaper" in " ".join(c) and "print" not in c and "is-enabled" not in c]
+        self.assertEqual(len(order), 2, order)
+        self.assertIn("disable" if self.PLATFORM == "linux" else "bootout", order[0])
+        self.assertIn("enable" if self.PLATFORM == "linux" else "bootstrap", order[1])
+        self.assertIn("acme-cw", self.reaper_path().read_text())
+
+    def test_a_failing_load_stops_the_install_with_the_command_named(self):
+        self.machine.fail["bootstrap" if self.PLATFORM == "darwin" else "enable --now fleet-kit-cloud-reaper"] = 5
+        out, error = self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.assertIsNotNone(error)
+        self.assertRegex(error, "bootstrap|enable")
+
+    def test_uninstall_with_no_service_still_unloads_and_removes_the_reaper(self):
+        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        out, _ = self.install("--uninstall", "--no-service")
+        self.assertFalse(self.reaper_path().exists())
+        self.assertTrue(self.service_path().exists())   # the switchboard's own service is what --no-service leaves
+        self.assertFalse(self.machine.reaper_loaded)
 
     def test_the_settings_come_from_the_environment_and_a_password_one_stops_the_install(self):
         with mock.patch.dict(os.environ, {"CW_CLOUD_NAMESPACE": "acme-cw"}):
@@ -41685,7 +41734,81 @@ class CloudReaperInstall:
         self.assertNotIn("p4ss", error + out)
 
 
-class TestCloudReaperInstallOnMacOS(CloudReaperInstall, InstallCase):
+# The states a file the installer writes can be found in: name -> how to make it at `path` (victim is a file elsewhere)
+BAD_TARGET_STATES = {
+    "a symlink": lambda path, victim: os.symlink(str(victim), str(path)),
+    "a FIFO": lambda path, victim: os.mkfifo(str(path)),
+    "a directory": lambda path, victim: os.mkdir(str(path)),
+    "group-writable": lambda path, victim: (path.write_text("mine\n"), os.chmod(str(path), 0o664)),
+    "owned by another user": lambda path, victim: path.write_text("mine\n"),   # the installer is made to see another uid
+}
+
+
+class WrittenFilesAreGuarded:
+    """One row per file the installer writes (the switchboard's own service file and the reaper's) x one per bad state."""
+
+    def targets(self):
+        return {"service": (self.service_path(), ()), "cloud reaper": (self.reaper_path(), ("--with-cloud-reaper",))}
+
+    def attempt(self, state, path, flags, uninstall=False):
+        victim = self.home / "victim"
+        victim.write_text("precious\n")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        BAD_TARGET_STATES[state](path, victim)
+        patch = mock.patch.object(sb, "current_uid", return_value=os.getuid() + 1) if state == "owned by another user" else mock.patch.object(sb, "current_uid", sb.current_uid)
+        with patch:
+            if uninstall:
+                result = self.install("--uninstall")
+            else:
+                result = self.install("--opencode", self.machine.binary, *flags)
+        return victim, result
+
+    def test_install_refuses_each_bad_state_for_each_file_and_changes_nothing(self):
+        for label, (path, flags) in self.targets().items():
+            for state in BAD_TARGET_STATES:
+                with self.subTest(file=label, state=state):
+                    self.setUp()   # a fresh machine for each row
+                    path, flags = self.targets()[label]
+                    victim, (out, error) = self.attempt(state, path, flags)
+                    self.assertIsNotNone(error, "%s %s: no refusal" % (label, state))
+                    self.assertIn(str(path), error)
+                    self.assertEqual(victim.read_text(), "precious\n")
+                    if state == "a symlink":
+                        self.assertTrue(path.is_symlink())
+                    loads = [c for c in self.machine.calls if c[0] in ("launchctl", "systemctl") and c[1] in ("bootstrap", "enable")
+                             and (label != "cloud reaper" or "cloud-reaper" in " ".join(c))]
+                    self.assertEqual(loads, [])
+
+    def test_uninstall_leaves_each_bad_state_for_each_file_alone_and_says_so(self):
+        for label, (path, flags) in self.targets().items():
+            for state in BAD_TARGET_STATES:
+                with self.subTest(file=label, state=state):
+                    self.setUp()
+                    path, flags = self.targets()[label]
+                    victim, (out, error) = self.attempt(state, path, flags, uninstall=True)
+                    self.assertIsNone(error, error)
+                    self.assertEqual(victim.read_text(), "precious\n")
+                    self.assertTrue(os.path.lexists(str(path)), "%s %s was removed" % (label, state))
+                    self.assertIn("skipped", out)
+
+    def test_uninstall_removes_only_the_file_this_installers_template_makes(self):
+        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.reaper_path().write_text("a file someone else made\n")
+        out, error = self.install("--uninstall")
+        self.assertTrue(self.reaper_path().exists())
+        self.assertIn("is not the file this installer writes", out)
+        self.reaper_path().unlink()
+
+    def test_a_replaced_file_is_replaced_by_rename_never_written_through(self):
+        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        inode = os.stat(str(self.reaper_path())).st_ino
+        with mock.patch.dict(os.environ, {"CW_CLOUD_NAMESPACE": "acme-cw"}):
+            self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.assertNotEqual(os.stat(str(self.reaper_path())).st_ino, inode)
+        self.assertEqual([p.name for p in self.reaper_path().parent.iterdir() if p.name.startswith(".")], [])   # no temp file left
+
+
+class TestCloudReaperInstallOnMacOS(CloudReaperInstall, WrittenFilesAreGuarded, InstallCase):
     PLATFORM = "darwin"
 
     def test_the_written_plist_is_loaded_at_login_restarts_and_lints(self):
@@ -41702,7 +41825,7 @@ class TestCloudReaperInstallOnMacOS(CloudReaperInstall, InstallCase):
         self.assertEqual(done.returncode, 0, done.stdout.decode() + done.stderr.decode())
 
 
-class TestCloudReaperInstallOnLinux(CloudReaperInstall, InstallCase):
+class TestCloudReaperInstallOnLinux(CloudReaperInstall, WrittenFilesAreGuarded, InstallCase):
     PLATFORM = "linux"
 
     def test_the_written_unit_is_enabled_now_and_verifies(self):
@@ -41711,7 +41834,8 @@ class TestCloudReaperInstallOnLinux(CloudReaperInstall, InstallCase):
         if not shutil.which("systemd-analyze"):
             self.skipTest("systemd-analyze is not here")
         done = subprocess.run(["systemd-analyze", "verify", str(self.reaper_path())], capture_output=True)
-        self.assertNotIn(b"Unknown key", done.stderr)
+        for word in (b"Unknown key", b"Invalid", b"Failed to parse", b"Unknown section"):
+            self.assertNotIn(word, done.stderr)
 
 
 class TestTheTrialSharesTheInstaller(Base):
