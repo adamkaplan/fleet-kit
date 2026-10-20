@@ -629,6 +629,11 @@ def _binds_registrar(node, patterns):
     return []
 
 
+class Findings(list):
+    """The findings of `registrar_findings`: a plain list of (registrar, verb, name) that also carries `closure`, the closure names the lint derived (so a reason can say which name the closure derivation names)."""
+    closure = frozenset()
+
+
 def registrar_findings(base_src, head_src, rule):
     """([(registrar, verb, closure name)], None) for a pull request's own base and head text of the daemon file, or (None, why) when they cannot be read (the caller holds, fail closed). A finding is an
     import, a call or a rebinding of a closure name by a registrar on a line the pull request added; an untouched line or a removed one gives none. A registrar is whatever binds a name the daemon file's own
@@ -724,7 +729,9 @@ def registrar_findings(base_src, head_src, rule):
             key = node.slice
             if not (isinstance(key, ast.Constant) and isinstance(key.value, str)) or any(p.fullmatch(key.value) for p in patterns):
                 found.append(("a module-level write into globals()", "rebinds", "a registrar bound in a form that cannot be read"))
-    return sorted(set(found)), None
+    result = Findings(sorted(set(found)))
+    result.closure = frozenset(names)
+    return result, None
 
 
 def decode_blob(answer):

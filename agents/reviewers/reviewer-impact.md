@@ -84,8 +84,7 @@ unsure of the class, name a top tier one. A hold without a class is rejected and
 
 When a changed file matches a floor path rule of the matrix (`owner_hold.delegated_clear.score.floor`), name that rule's id in your `impact-reason:`, never rate below Serious, and rate High when the change alters credential issuance, a login, a token's scope or who may do what. The switchboard derives the score from the cell of your severity and probability, never from your words. Write the rule id as a word of its own in a plain sentence, never as `<rule id>: ...` (the redaction of the record hides what follows a colon after such a word).
 
-A registrar that imports, calls or rebinds a name of the clear's closure is rated High, whatever its other effects.
-A registrar that does more than set up its own parsers (an import, a call of anything but its own parser's methods, a store into anything but its own parser, a reach into a namespace) is rated High too.
+A registrar that imports anything, writes outside its own names, or calls a function it neither defines nor receives (every import, call or rebinding of a name of the clear's closure among them) is rated High, whatever its other effects.
 
 ## Verdict block
 

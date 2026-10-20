@@ -456,16 +456,19 @@ def class_is_top_tier(matrix, cls):
 
 
 def registrar_reasons(registrar):
-    """[reasons] the registrar lint (#964) holds a pull request for the owner. `registrar` is None when the daemon file did not change (nothing was read), else {"findings": [(registrar, verb, closure name)], "why": None
-    or the reason the diff could not be read}. An unreadable diff holds (fail closed); a finding holds and names the registrar and the closure name. The reason says the same words as the rater's line."""
+    """[reasons] the registrar lint (#964) holds a pull request for the owner. `registrar` is None when the daemon file did not change (nothing was read), else {"findings": [(registrar, verb, name)], "closure": [the closure
+    names] or absent, "why": None or the reason the diff could not be read}. An unreadable diff holds (fail closed); a finding holds and names the registrar and, when the closure derivation names it, the closure name,
+    otherwise says that the shape is not allowed. The reason says the same words as the rater's line."""
     if registrar is None:
         return []
     if not isinstance(registrar, dict) or registrar.get("why") or not isinstance(registrar.get("findings"), list):
         return ["registrar diff could not be read (%s): held" % str((registrar or {}).get("why") if isinstance(registrar, dict) else "unreadable")[:120]]
-    return ["registrar %s %s %s: %s" % (name, verb, hit, REGISTRAR_RULE_TEXT) for name, verb, hit in registrar["findings"]]
+    closure = set(registrar.get("closure") or ())
+    return ["registrar %s %s closure name %s: %s" % (name, verb, hit, REGISTRAR_RULE_TEXT) if hit in closure
+            else "registrar %s %s %s: this shape is not allowed in a registrar (%s)" % (name, verb, hit, REGISTRAR_RULE_TEXT) for name, verb, hit in registrar["findings"]]
 
 
-REGISTRAR_RULE_TEXT = "a registrar that imports, calls or rebinds a name of the clear's closure is held for the owner; a registrar that does more than set up its own parsers is held for the owner"
+REGISTRAR_RULE_TEXT = "a registrar that imports anything, writes outside its own names, or calls a function it neither defines nor receives (every import, call or rebinding of a name of the clear's closure among them) is held for the owner"
 
 
 def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=(), narrow=None, record=None, registrar=None):

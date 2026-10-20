@@ -32224,10 +32224,15 @@ class TestRegistrarFloor(LedgerBase):
             with self.subTest(label):
                 got = self.found_unit(body)
                 self.assertTrue(any(g[1] == verb and (name is None or g[2] == name) for g in got), (label, got))
-                reasons = sb.impact_floor.registrar_reasons({"findings": got, "why": None})
+                reasons = sb.impact_floor.registrar_reasons({"findings": got, "closure": self.names, "why": None})
                 self.assertEqual(len(reasons), len(got))
                 for finding, reason in zip(got, reasons):
-                    self.assertIn("registrar add_zzz_parsers %s %s" % finding[1:], reason)
+                    self.assertIn("registrar add_zzz_parsers %s " % finding[1], reason)
+                    self.assertIn(finding[2], reason)
+                    if finding[2] in self.names:
+                        self.assertIn("closure name %s" % finding[2], reason)
+                    else:
+                        self.assertIn("this shape is not allowed in a registrar", reason)
 
     def test_a_registrar_that_only_sets_up_its_own_parser_is_not_held(self):
         for label, body in self.allowed_table().items():
@@ -32536,7 +32541,7 @@ class TestRegistrarFloor(LedgerBase):
         report = sb.pr_floor_report(self.engine(), "acme/app", 9)
         self.assertEqual((shown["owner_decision"], shown["owner_reasons"]), (report["owner_decision"], report["owner_reasons"]))
         self.assertEqual(report["owner_decision"], "hold")
-        self.assertTrue(any("registrar add_zzz_parsers rebinds %s" % binding in r for r in report["owner_reasons"]), report["owner_reasons"])
+        self.assertTrue(any("registrar add_zzz_parsers rebinds closure name %s" % binding in r for r in report["owner_reasons"]), report["owner_reasons"])
         self.assertEqual(report["registrar_reasons"], [r for r in report["owner_reasons"] if r.startswith("registrar ")])
         refused = self.dc.refusals(self.rule, report, [{"filename": "bin/fleet-switchboard", "status": "modified"}], matches=sb.impact_floor.matches, closure={"bin/fleet-switchboard": []})
         self.assertTrue(any("registrar add_zzz_parsers rebinds" in r and "stays the owner's own clear" in r for r in refused), refused)
@@ -32572,23 +32577,19 @@ class TestRegistrarFloor(LedgerBase):
         self.assertFalse(any("registrar" in r for r in self.dc.refusals(self.rule, report, [], matches=sb.impact_floor.matches, closure={})))
 
     # ---- the rater's line and the documentation say it in the same words
-    RATER = "A registrar that imports, calls or rebinds a name of the clear's closure is rated High, whatever its other effects."
-    RATER2 = "A registrar that does more than set up its own parsers (an import, a call of anything but its own parser's methods, a store into anything but its own parser, a reach into a namespace) is rated High too."
-    HOLD = "a registrar that imports, calls or rebinds a name of the clear's closure is held for the owner"
-    HOLD2 = "a registrar that does more than set up its own parsers is held for the owner"
+    RATER = "A registrar that imports anything, writes outside its own names, or calls a function it neither defines nor receives (every import, call or rebinding of a name of the clear's closure among them) is rated High, whatever its other effects."
+    HOLD = "a registrar that imports anything, writes outside its own names, or calls a function it neither defines nor receives (every import, call or rebinding of a name of the clear's closure among them) is held for the owner"
     CONTROL = "In one process a hostile registrar can always undo a guard; this hold and this rating are the control."
 
     def test_the_rater_line_is_in_the_definition_once_and_the_documentation_says_the_rule_and_the_line_in_the_same_words(self):
         definition = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
         docs = (REPO / "docs" / "switchboard.md").read_text()
-        for line in (self.RATER, self.RATER2):
-            self.assertEqual(definition.count(line), 1, line)
-            self.assertEqual(docs.count(line), 1, line)
-        for line in (self.HOLD, self.HOLD2):
-            self.assertEqual(docs.count(line), 1, line)
+        self.assertEqual(definition.count(self.RATER), 1)
+        self.assertEqual(docs.count(self.RATER), 1)
+        self.assertEqual(docs.count(self.HOLD), 1)
         self.assertEqual(docs.count(self.CONTROL), 1)
-        self.assertEqual(sb.impact_floor.REGISTRAR_RULE_TEXT, self.HOLD + "; " + self.HOLD2)
-        for word in ("imports", "calls", "rebinds", "closure", "High"):
+        self.assertEqual(sb.impact_floor.REGISTRAR_RULE_TEXT, self.HOLD)
+        for word in ("imports", "writes", "calls", "neither defines nor receives", "closure", "High"):
             self.assertIn(word, self.RATER)
 
     def test_the_definition_permission_block_is_the_pinned_one(self):
