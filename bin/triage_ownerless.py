@@ -3,7 +3,7 @@
 Triage calls an issue `ours` when a fleet account wrote it, is assigned to it, or has a pull request notice. Every other issue of a team repository is an
 `other-owner` flag, counted apart and never a finding, so dozens of issues nobody owns and nobody touched for days read as "found 0". This module says which
 open ISSUES of such a repository have NO owner (the one rule T1 uses: `is_claimed`), carry no owner label, were not written by the fleet and have been quiet
-for `days` or more, and builds the one daily line about them (counts, the age of the oldest, links: no issue text) and the per-repository breakdown of what
+for `days` or more, and builds the one daily line about them (counts, the age of the oldest, links, how many are parked until a future date and so left out: no issue text) and the per-repository breakdown of what
 the triage could not check, and why.
 
 Pure: plain values in, plain values out. No file, GitHub or agent.
@@ -43,11 +43,13 @@ def lane_named(item, lanes):
     return bool(name) and name.lower() in lanes
 
 
-def ownerless_stale(items, ctx, ours_logins, patterns, now, days=DEFAULT_DAYS, label_owners=None, lanes=()):
-    """[(number, quiet_days)] of the open ISSUES (not pull requests) that have no owner, no owner label, were not written by one of `ours_logins`, and were last touched `days`
-    or more days ago; the oldest first. With a non-empty `label_owners` map for the repository, a label of the map owns the issue and an `Owner:` line owns it
-    only when it names one of `lanes`; with none, the rule is the one before the map existed."""
-    found, strict = [], bool(label_owners)
+def ownerless_split(items, ctx, ours_logins, patterns, now, days=DEFAULT_DAYS, label_owners=None, lanes=(), parked_now=None):
+    """([listed], [parked]) rows `(number, quiet_days)`, the oldest first, of the open ISSUES (not pull requests) that have no owner, no owner label, were not written by one of
+    `ours_logins`, and were last touched `days` or more days ago. With a non-empty `label_owners` map for the repository, a label of the map owns the issue and an `Owner:` line owns it
+    only when it names one of `lanes`; with none, the rule is the one before the map existed. `parked_now(item, now)` is the daemon's ONE reading of "parked until a future date"
+    (None: nothing is parked): an issue that would be listed and is parked moves to the second list. This is the only place the parked rule lives; every count, age and link of the
+    line derives from the first list and the parked total from the second."""
+    found, parked, strict = [], [], bool(label_owners)
     for number, item in items.items():
         if item.get("pr") or item.get("state") != "open":
             continue
@@ -57,16 +59,22 @@ def ownerless_stale(items, ctx, ours_logins, patterns, now, days=DEFAULT_DAYS, l
             continue
         quiet = (now - item["updated"]) / 86400.0
         if quiet >= days:
-            found.append((number, round(quiet, 1)))
-    return sorted(found, key=lambda row: (-row[1], row[0]))
+            (parked if parked_now is not None and parked_now(item, now) else found).append((number, round(quiet, 1)))
+    order = lambda rows: sorted(rows, key=lambda row: (-row[1], row[0]))
+    return order(found), order(parked)
 
 
-def summary_line(repo, rows, read, total, days=DEFAULT_DAYS, cut=False):
+def ownerless_stale(items, ctx, ours_logins, patterns, now, days=DEFAULT_DAYS, label_owners=None, lanes=(), parked_now=None):
+    """[(number, quiet_days)] the listed rows of `ownerless_split` (the oldest first)."""
+    return ownerless_split(items, ctx, ours_logins, patterns, now, days, label_owners, lanes, parked_now)[0]
+
+
+def summary_line(repo, rows, read, total, days=DEFAULT_DAYS, cut=False, parked=0):
     """The ONE line about a repository: how many, how old the oldest is, the five oldest as links, and how much of the list was read. Counts, ages and links only: no title, no text.
     When the list was CUT the read took the least recently updated first, so the count is a lower bound (`at least N`) and the oldest are the true oldest."""
     links = ", ".join("https://github.com/%s/issues/%d" % (repo, number) for number, _ in rows[:OLDEST])
-    return "ownerless in %s: %s%d open issue(s) with no owner and no activity for %d day(s) or more; oldest quiet for %d day(s); oldest %d: %s; read %s of %s open item(s)%s" % (
-        repo, "at least " if cut else "", len(rows), days, int(rows[0][1]), min(OLDEST, len(rows)), links, read,
+    return "ownerless in %s: %s%d open issue(s) with no owner and no activity for %d day(s) or more; oldest quiet for %d day(s); oldest %d: %s; parked %d; read %s of %s open item(s)%s" % (
+        repo, "at least " if cut else "", len(rows), days, int(rows[0][1]), min(OLDEST, len(rows)), links, parked, read,
         total if total is not None else "an unknown number", ", least recently updated first" if cut else "")
 
 

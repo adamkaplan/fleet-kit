@@ -12945,6 +12945,13 @@ def parked_until(body, labels):
     except ValueError:
         return None
     return day.timestamp() + 86400.0
+
+
+def triage_parked_now(item, now):
+    """True while a normalised item is parked: its `parked_until` (read by `parked_until` above, the one date reader) is in the future and within PARKED_MAX_DAYS. T3 and the
+    ownerless line share this one definition; the owner-wait exemption is T3's own."""
+    until = item.get("parked_until")
+    return until is not None and now < until <= now + PARKED_MAX_DAYS * 86400.0
 TRIAGE_NEXT_RE = re.compile(r"^[ \t]*(?:next(?: steps?)?[ \t]*:|[-*][ \t]+\[[ xX]\])", re.I | re.M)
 TRIAGE_REVIEW_RE = re.compile(r"\b(?:review of [0-9a-f]{7}|approved?|changes requested|lgtm)\b", re.I)
 
@@ -13292,8 +13299,7 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
             found["T2"] = {"missing": [g if isinstance(g, str) else "/".join(g) for g in group_missing],
                            "labels": sorted(item["labels"])[:8]}
         awaiting = any(str(l).endswith((":awaiting-user", ":awaiting-cos")) or "awaiting" in str(l) for l in item["labels"])
-        until = item.get("parked_until")   # a park reaches at most PARKED_MAX_DAYS ahead: `9999-12-31` does not park forever
-        parked = until is not None and now < until <= now + PARKED_MAX_DAYS * 86400.0 and not awaiting  # never exempts an owner-wait; T5 and the captain PRs are other rules
+        parked = triage_parked_now(item, now) and not awaiting  # a park reaches at most PARKED_MAX_DAYS ahead: `9999-12-31` does not park forever; # never exempts an owner-wait; T5 and the captain PRs are other rules
         if comments is not None and not item["section"] and not awaiting and not item["next_body"] and not parked \
                 and not item["open_sub"] and not any(c["next"] for c in comments) \
                 and age_updated >= (sla["t3_ask_days"] if ask else sla["t3_other_days"]):
@@ -13693,10 +13699,10 @@ def triage_ownerless_pass(engine, state, cfg, now):
                     items[item["number"]] = item
             lanes = {name.lower() for name, agent in (discovery.agents.items() if discovery else [])   # a known lane: an orchestrator the daemon holds for the repository
                      if (agent.fleet or {}).get("role") == "orchestrator" and (_fleet_repo(agent.fleet or {}, engine.config) == repo or (agent.fleet or {}).get("repo") == repo)}
-            rows = module.ownerless_stale(items, triage_context(engine, repo, items, discovery), ours, options["owner_labels"], now, options["days"],
-                                          options["label_owners"].get(repo), lanes)
+            rows, parked = module.ownerless_split(items, triage_context(engine, repo, items, discovery), ours, options["owner_labels"], now, options["days"],
+                                                  options["label_owners"].get(repo), lanes, triage_parked_now)   # #889: a future-parked issue is counted apart, never listed
             read, total = len(unit["data"]), unit.get("total")
-            shown[repo] = {"count": len(rows), "read": read, "total": total, "oldest_days": int(rows[0][1]) if rows else None}
+            shown[repo] = {"count": len(rows), "parked": len(parked), "read": read, "total": total, "oldest_days": int(rows[0][1]) if rows else None}
             if not rows:
                 continue
             sent = _read_small(engine.state_dir, OWNERLESS_FILE)
@@ -13704,7 +13710,7 @@ def triage_ownerless_pass(engine, state, cfg, now):
                 continue
             sent[repo] = {"at": int(now)}
             _write_small(engine.state_dir, OWNERLESS_FILE, sent)   # before the send: at most one line a day, even when a send fails
-            line = module.summary_line(repo, rows, read, total, options["days"], unit.get("truncated") is True)
+            line = module.summary_line(repo, rows, read, total, options["days"], unit.get("truncated") is True, len(parked))
             names = ["chief-of-staff"] + sorted(name for name, agent in (discovery.agents.items() if discovery else [])
                                                 if _is_orchestrator(agent) and _fleet_repo(agent.fleet or {}, engine.config) == repo)
             told = []
@@ -13715,7 +13721,7 @@ def triage_ownerless_pass(engine, state, cfg, now):
                         told.append(name)
                 except Exception as err:   # a failed send is audited, never retried into a second line
                     engine._note("triage.ownerless_send_failed", repo, {"to": name, "error": _one_line(str(err), 120)})
-            engine._note("triage.ownerless", repo, {"count": len(rows), "read": read, "total": total, "told": told})
+            engine._note("triage.ownerless", repo, {"count": len(rows), "parked": len(parked), "read": read, "total": total, "told": told})
     except Exception as err:
         engine._note("triage.ownerless_error", "", {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
     return shown
@@ -14437,8 +14443,8 @@ def triage_status_lines(triage):
         if text:
             lines.append("      triage     " + text)
     for repo_of, info in sorted((triage.get("ownerless") or {}).items()):
-        lines.append("      triage     ownerless in %s: %d open issue(s) with no owner and quiet; read %s of %s open item(s)" % (
-            repo_of, info.get("count", 0), info.get("read"), info.get("total") if info.get("total") is not None else "an unknown number"))
+        lines.append("      triage     ownerless in %s: %d open issue(s) with no owner and quiet; parked %d; read %s of %s open item(s)" % (
+            repo_of, info.get("count", 0), info.get("parked", 0), info.get("read"), info.get("total") if info.get("total") is not None else "an unknown number"))
     if triage.get("truncated"):
         lines.append("      triage     lists capped for " + ", ".join(triage["truncated"]))
     cadence = triage_digest.digest_line(triage.get("digest"), parse_iso(triage.get("at")) or time.time(), triage.get("digest_interval_minutes", 60))   # #406
