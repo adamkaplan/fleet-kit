@@ -5973,6 +5973,30 @@ class TestLaunch(Base):
         self.assertEqual(json.loads(out)["session"], session)
         self.assertEqual(sb.read_pane_health(self.world.state)["agents"].get("worker", {}).get("workspace"), before["workspace"])   # --undo put the whole record back
 
+    def test_the_pass_drops_the_state_of_an_orphan_and_keeps_a_listed_undiscovered_a_discovered_unlisted_and_a_cloud_name(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.engine.state_dir = self.world.state
+        self.health()
+        now, reg = int(self.world.clock.now()), sb.load_module("registry")
+        reg.upsert(self.world.state, "gone", {"session": "ses_gone", "pane": "w1:p9", "state": "dead"}, now=now)            # listed, not discovered: a dead agent's alert
+        reg.upsert(self.world.state, "pod1", {"session": "ses_pod", "kind": "cloud", "run_id": "run_example"}, now=now)    # a cloud row: no pane state
+        data = sb.read_pane_health(self.world.state)
+        for name in ("orphan", "gone", "nodisc"):
+            data["states"][name] = {"state": sb.PANE_DEAD, "why": "x", "pane": "w1:p9", "session": "ses_" + name, "at": now}
+        data["missing"]["orphan"] = 2
+        sb.write_pane_health(self.world.state, data)
+        self.engine.discover(self.world.clock.now())
+        self.engine.discovery.agents["nodisc"] = sb.Observation("nodisc", "ses_nodisc", None, "idle", {"role": "coder"})   # discovered, with no pane: never listed by the pass
+        sb.pane_health_pass(self.engine, self.world.clock.now() + 1)
+        health = sb.read_pane_health(self.world.state)
+        self.assertNotIn("orphan", health["states"])                    # in neither the registry nor discovery: dropped, with its missing count
+        self.assertNotIn("orphan", health["missing"])
+        self.assertEqual(health["states"]["gone"]["state"], sb.PANE_DEAD)   # the dead agent's state stays: its alert is read from it
+        self.assertIn("gone", self.engine.pane_alerts)
+        self.assertIn("nodisc", health["states"])                       # discovered: kept
+        self.assertNotIn("pod1", health["states"])                      # a cloud row has no pane state, and the registry keeps it
+        self.assertEqual(reg.get(self.world.state, "pod1")["run_id"], "run_example")
+
     def test_s5_the_registry_gives_reattach_retire_undo_and_the_cloud_log_read_the_same_results_with_a_clean_environment(self):
         for key in [k for k in os.environ if k.startswith(("HERDR_", "OPENCODE_")) and k != "HERDR_PANE_ID"]:
             self.addCleanup(os.environ.__setitem__, key, os.environ[key])
