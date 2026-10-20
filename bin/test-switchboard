@@ -4884,7 +4884,7 @@ class TestLaunch(Base):
         self.assertEqual(sorted(sb.prune_retired(old, 10 ** 9 + 5)), ["y"])
         self.as_("boss")
         self.health()
-        with mock.patch.object(sb, "_write_small", side_effect=OSError(28, "No space left")):
+        with mock.patch.object(sb.load_module("registry"), "_write_atomic", side_effect=OSError(28, "No space left")):
             code, out, err = self.run_cli("retire", "worker")
         self.assertNotEqual(code, 0)
         self.assertIn("was not retired, try again", err)
@@ -5886,6 +5886,8 @@ class TestLaunch(Base):
             data["states"][n] = {"state": "unknown", "session": "ses_" + n}
         data["agents"]["relaunch"] = row("ses_new", "orchestrator")      # retired under an OLD session, running again under a new one
         sb.write_pane_health(self.world.state, data)
+        for n in ("r1", "r2", "r3", "relaunch"):                         # the agent list is the registry's: the rows go there too
+            sb.load_module("registry").upsert(self.world.state, n, data["agents"][n])
         set_retired(self.world.state, {**{n: self.retired_entry("ses_" + n) for n in ("r1", "r2", "r3")},
                                                             "relaunch": self.retired_entry("ses_old")})
         self.health(1)
@@ -5916,6 +5918,7 @@ class TestLaunch(Base):
         data = sb.read_pane_health(self.world.state)
         data["agents"]["old"] = {"session": "ses_old", "pane": "w1:p9", "role": "orchestrator", "workspace": "w9"}
         sb.write_pane_health(self.world.state, data)
+        sb.load_module("registry").upsert(self.world.state, "old", data["agents"]["old"])
         set_retired(self.world.state, {"old": self.retired_entry("ses_old")})
         path = self.world.state / sb.PANE_HEALTH_FILE
         before = path.read_bytes()
@@ -5923,7 +5926,8 @@ class TestLaunch(Base):
         discovery.problems = ["list not whole"]                         # the agent list is a half-read
         sb.pane_health_pass(self.engine, self.world.clock.now() + 1)
         self.assertEqual(path.read_bytes(), before)
-        with mock.patch.object(sb, "read_retired_strict", side_effect=sb.RetiredUnreadable("half")):   # the retired list is a half-read, yet `read_retired` still names "old"
+        reg = sb.load_module("registry")
+        with mock.patch.object(reg, "read", return_value=reg._empty(False, "half")):   # the registry read is not whole: the pass acts on nothing
             self.health(2)
         self.assertIn("old", sb.read_pane_health(self.world.state)["agents"])
         self.health(3)                                                   # a whole read prunes it
@@ -69081,6 +69085,46 @@ class TestAgentRegistry(unittest.TestCase):
         self.assertEqual(len(refused), 3)                                   # live evidence, state not dead, partial read: each audited with evidence and reason
         self.assertEqual(refused[0]["evidence"], alive)
         self.assertTrue(all(l["why"] and "nothing removed" in l["why"] for l in refused))
+
+    def test_a_dead_row_is_removed_only_when_each_evidence_key_shows_it_gone_and_each_refusal_is_audited(self):
+        gone = {"pane_listed": False, "process_found": False}
+        cases = {"pane_listed true": {"pane_listed": True, "process_found": False}, "process_found true": {"pane_listed": False, "process_found": True},
+                 "pane_listed missing": {"process_found": False}, "process_found missing": {"pane_listed": False}, "evidence None": None,
+                 "evidence a string": "gone", "evidence a list": [gone]}
+        for label, evidence in cases.items():
+            with self.subTest(label=label):
+                self.reg.upsert(self.state, "d", {"session": "ses_d", "state": "dead"})
+                before = len([l for l in (self.state / "registry-audit.jsonl").read_text().splitlines() if "reconcile_refused" in l])
+                got = self.reg.reconcile_remove(self.state, "d", evidence, True)
+                self.assertEqual(got["changed"], False)
+                self.assertIn("d", self.reg.read(self.state)["agents"])
+                after = [json.loads(l) for l in (self.state / "registry-audit.jsonl").read_text().splitlines() if "reconcile_refused" in l]
+                self.assertEqual(len(after), before + 1)
+                self.assertEqual(after[-1]["evidence"], evidence if isinstance(evidence, dict) else None)
+        self.assertTrue(self.reg.reconcile_remove(self.state, "d", gone, True)["changed"])
+
+    def test_retire_then_undo_keeps_a_local_a_cloud_and_a_headless_row_what_it_was(self):
+        self.reg.upsert(self.state, "loc", {"session": "ses_l", "pane": "p1", "workspace": "w1"})
+        self.reg.upsert(self.state, "cld", {"session": "ses_c", "repo": "acme-org/widget-service", "kind": "cloud", "run_id": "run_example"})
+        self.reg.retire(self.state, "loc", "boss", "done")
+        self.reg.retire(self.state, "cld", "cloud-worker", "done")
+        self.reg.retire(self.state, "hdl", "boss", "done", session="ses_h", extra={"headless": {"session": "ses_h"}})
+        for name in ("loc", "cld", "hdl"):
+            self.assertTrue(self.reg.unretire(self.state, name)["changed"])
+        agents = self.reg.read(self.state)["agents"]
+        self.assertEqual((agents["loc"]["kind"], agents["loc"]["run_id"], agents["loc"]["workspace"]), ("local", None, "w1"))
+        self.assertEqual((agents["cld"]["kind"], agents["cld"]["run_id"], agents["cld"]["session"]), ("cloud", "run_example", "ses_c"))
+        self.assertNotIn("hdl", agents)                                       # a headless worker comes back from its own launch record, not as a pane row
+
+    def test_the_fold_does_not_bring_back_a_retired_cloud_worker_but_a_relaunch_under_the_name_stays(self):
+        (self.state / "cloud").mkdir()
+        (self.state / "cloud" / "w1.json").write_text(json.dumps({"worker": "w1", "session": "ses_c", "run_id": "r1"}))
+        (self.state / "cloud" / "w2.json").write_text(json.dumps({"worker": "w2", "session": "ses_new", "run_id": "r2"}))
+        (self.state / "retired.json").write_text(json.dumps({"w1": {"at": int(time.time()), "by": "x", "reason": "r", "session": "ses_c"},
+                                                            "w2": {"at": int(time.time()), "by": "x", "reason": "r", "session": "ses_old"}}))
+        got = self.reg.read(self.state)
+        self.assertEqual(sorted(got["agents"]), ["w2"])
+        self.assertEqual(sorted(got["retired"]), ["w1", "w2"])
 
     def test_retire_and_close_leave_agents_keep_the_record_and_audit(self):
         for name in ("a", "b"):
