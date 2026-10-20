@@ -13175,6 +13175,54 @@ class TestChatClearHook(Base):
             with self.assertRaises(sb.ConfigError, msg=bad):
                 sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "chat_clear": bad})
 
+    # ---- #977 defect: live=true AND v2_light=true is SHADOW, on every route that could write
+
+    def light_live(self):
+        self.live = True
+        self.build(live=True, extra={"v2_light": True})
+        self.assertTrue(self.engine.light)
+        self.assertEqual(sb.chat_clear_live_now(self.engine), (False, "v2_light"))
+
+    def assert_all_shadow(self):
+        self.assertEqual(self.writes, [], "no label, no comment")
+        self.assertEqual(self.cos_texts(), [], "nothing sent")
+        self.assertEqual(self.events("gate.hold_cleared"), [])
+        self.assertEqual(self.events("chat_clear.failed"), [])
+        verdicts = self.events("chat_clear.verdict")
+        self.assertTrue(verdicts)
+        self.assertTrue(all(v["detail"]["live"] is False and "v2_light" in (v["detail"]["shadow"] or "") for v in verdicts), verdicts)
+        self.assertIn("v2_light", self.events("chat_clear.mode")[-1]["detail"]["why"])
+
+    def test_light_live_route_clear_core_comment_and_confirmation_write_nothing(self):
+        self.light_live()
+        self.shown_then_say("9 is good to go")
+        self.assertEqual(self.events("chat_clear.verdict")[-1]["detail"]["action"], "clear", "the judge would clear: only the switch stops it")
+        self.assert_all_shadow()
+
+    def test_light_live_route_the_question_to_the_chief_of_staff_and_the_shown_offer_write_nothing(self):
+        self.light_live()
+        self.hook()
+        offers = sb.load_module("chat_clear").read_offers(self.world.state)
+        self.say("9 is good to go")
+        self.hook(self.decisions(head=self.H2))   # the head moved: the live answer would be a question
+        self.assertEqual(self.events("chat_clear.verdict")[-1]["detail"]["action"], "ask")
+        self.assert_all_shadow()
+        self.assertEqual(sb.load_module("chat_clear").read_offers(self.world.state)[self.PR]["head"], offers[self.PR]["head"], "nothing was shown to him: the offer's shown head is kept")
+
+    def test_light_live_every_route_that_can_write_is_behind_the_one_live_decision(self):
+        import ast
+        tree = ast.parse(Path(sb.__file__).read_text())
+        fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        routes = set()
+        for name in ("_chat_clear_act", "chat_clear_apply"):
+            for c in ast.walk(fns[name]):
+                if isinstance(c, ast.Call):
+                    f = c.func
+                    routes.add((f.attr if isinstance(f, ast.Attribute) else f.id))
+        self.assertEqual(routes & {"send", "comment_as", "impact_clear_core", "show", "chat_clear_apply"}, {"send", "comment_as", "impact_clear_core", "show", "chat_clear_apply"})
+        written = {"append", "send", "comment_as", "impact_clear_core", "show", "chat_clear_apply", "mark_seen", "read_pr_json", "question_text", "head_matches", "head_matches", "quote", "owner_tier_labels", "is_offerable", "label_names", "get", "verify", "rpartition", "replace", "join", "int", "dict", "isinstance", "str", "getattr", "_one_line", "type", "upper", "NoticeError"}
+        self.assertEqual(routes - written, set(), "a new call in the clear's act: derive its test and add it here")
+
     # ---- #977: the one allowed session read under v2_light
 
     FIXTURE = Path(__file__).resolve().parent.parent / "scenarios" / "chat-clear" / "owner-prompt-records.json"

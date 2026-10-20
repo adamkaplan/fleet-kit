@@ -22034,6 +22034,8 @@ def chat_clear_live_now(engine):
     shadow is simply the configured mode, else a short reason."""
     if not chat_clear_config(engine.config)["live"]:
         return False, None
+    if (getattr(engine, "config", None) or {}).get("v2_light") or getattr(engine, "light", False):   # #977: under v2_light the chat clear is SHADOW even with `live: true` (the owner's key AND light off, as before the light read existed)
+        return False, "v2_light"
     if os.path.lexists(str(Path(engine.state_dir) / CHAT_CLEAR_OFF_FILE)):   # ANY entry, even a dangling symlink, is the panic stop
         return False, "kill file"
     try:
@@ -22141,8 +22143,8 @@ def _chat_clear_pass(engine, decisions, now):
             engine.audit.append(engine.actor, "chat_clear.dropped", "chat_clear", {"message_id": message["id"], "why": "the offers went away before the message was judged"})
             return
         verdict = cc.decide(engine.jev, message["text"], offers, message["created"], now, bar)
-        live_now, _ = chat_clear_live_now(engine)   # AGAIN, right before acting: a kill file or a broken config that appears during this pass stops the very next message
-        _chat_clear_act(engine, cc, dict(cfg, live=live_now), message, verdict, offers, current_heads, now)
+        live_now, shadow_why = chat_clear_live_now(engine)   # AGAIN, right before acting: a kill file or a broken config that appears during this pass stops the very next message
+        _chat_clear_act(engine, cc, dict(cfg, live=live_now, shadow=shadow_why), message, verdict, offers, current_heads, now)
 
 
 def _chat_clear_act(engine, cc, cfg, message, verdict, offers, current_heads, now):
@@ -22155,7 +22157,7 @@ def _chat_clear_act(engine, cc, cfg, message, verdict, offers, current_heads, no
         verdict = dict(verdict, question=cc.question_text("head_changed", offers, [pr], current_heads), shown=[pr])
     detail = {"message_id": message["id"], "quote": quoted, "action": action, "why": why, "pr": pr, "live": live, "would_clear": action == "clear",
               "probabilities": judge.get("probabilities"), "jev_choice": judge.get("jev_choice"), "model": judge.get("model"), "reason": judge.get("reason"),
-              "screen": (verdict.get("screen") or {}).get("why")}
+              "screen": (verdict.get("screen") or {}).get("why"), "shadow": None if live else cfg.get("shadow")}
     engine.audit.append(engine.actor, "chat_clear.verdict", pr or "chat_clear", detail)
     if action == "none" or not live:
         return   # shadow: the verdict is logged and nothing else happens
