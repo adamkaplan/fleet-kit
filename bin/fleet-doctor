@@ -285,6 +285,15 @@ if [ -x "$sb_here" ]; then
   fi
 fi
 
+# #835: an order the delegated clear reads from the owner's own standing-orders file must still be exactly one line of it.
+if [ -x "$sb_here" ]; then
+  if run_to 20 "$sb_here" impact delegated --check; then
+    emit ok delegated-order "$(printf '%s' "$LAST_OUT" | head -n1)"
+  else
+    emit FAIL delegated-order "$(printf '%s' "$LAST_OUT" | head -n1)"
+  fi
+fi
+
 if ! have copilot; then
   emit WARN skills "skipped — copilot not installed"
 else
