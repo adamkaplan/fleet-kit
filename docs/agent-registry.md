@@ -117,6 +117,6 @@ Clear-machinery files by slice (a slice that touches one says so in its plan and
 
 ## Freeze
 
-FROZEN: when fleetkit and fleet-daemon have each commented agreement on #906 (no earlier). Until then this interface may change; after it a change needs both to agree again.
+FROZEN: when fleetkit, cos and fleet-daemon have each commented agreement on #906 (no earlier). Until then this interface may change; after it a change needs both to agree again.
 
 Status: not frozen.
