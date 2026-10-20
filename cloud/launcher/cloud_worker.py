@@ -20,6 +20,7 @@ import math
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -179,6 +180,12 @@ def _repo_key(text):
     return (owner + "/" + name).lower()
 
 
+def allowed_repo_keys(raw):
+    """The allow-list's entries as keys (a None for an entry that is not exactly OWNER/NAME). THE parse of CW_ALLOWED_REPOS: the check below and
+    the settings file's validator both call it."""
+    return [_repo_key(x.strip()) for x in raw.split(",")]
+
+
 def check_repo_allowed(repo, env):
     """The one allow-list check (the launcher's create and the driver both call it). Raises CloudError(EXIT_USAGE) before anything is
     made. CW_ALLOWED_REPOS: comma-separated OWNER/NAME, exact and case-insensitive; unset, empty or any malformed entry refuses.
@@ -186,7 +193,7 @@ def check_repo_allowed(repo, env):
     raw = (env.get("CW_ALLOWED_REPOS") or "").strip()
     if not raw:
         raise CloudError("refused: %s is not on the cloud allow-list (CW_ALLOWED_REPOS is unset or empty)" % scrub(repo, (), 120), EXIT_USAGE)
-    allowed = [_repo_key(x.strip()) for x in raw.split(",")]
+    allowed = allowed_repo_keys(raw)
     if None in allowed:
         raise CloudError("refused: CW_ALLOWED_REPOS has an entry that is not OWNER/NAME; nothing was created", EXIT_USAGE)
     tooling = (env.get("CW_TOOLING_REPO") or "").strip()
@@ -1081,6 +1088,281 @@ class Launcher:
                     out.append((worker, reason, e.code))
         return out
 
+# ---------------------------------------------------------------- the settings file
+# ONE private file holds the operator's settings. `apply_settings` is the only reader: `launch --cloud` (bin/cloud_worker.py) and this driver's
+# `main` both call it. When the file exists it is the only source (the environment is read ONLY when there is no file); a key set in BOTH with a
+# different value is refused, naming both sources and never a value. Nothing is run or expanded on read, and a value that looks like a secret is refused.
+SETTINGS_FILE_NAME = "cloud.env"
+CONFIG_DIR_NAME = "fl" + "eet-switchboard"   # the switchboard's own config directory (written in two parts: the names check keeps the retired prefix out of cloud/)
+SETTINGS_PATH = None        # a test hook (a module attribute, no environment variable): None means the real path
+SETTINGS_FILE_MAX = 65536
+# The one table of settings: name, required (in the file), kind. Kinds: name (a plain name, list or address), path, command (run as given: a
+# command, never a value), digest-ref (an image reference that ends in @sha256:<64 hex>), number.
+SETTINGS = (
+    ("CW_ALLOWED_REPOS", True, "name"),            # comma-separated OWNER/NAME
+    ("CW_TOOLING_REPO", False, "name"),
+    ("CW_CLOUD_IMAGE", True, "digest-ref"),
+    ("CW_CLOUD_SERVER", True, "name"),             # the cluster API address
+    ("CW_CLOUD_CA_FILE", False, "path"),
+    ("CW_PULL_SECRET", False, "name"),             # the NAME of a Secret, never its content
+    ("CW_VAULT_SUBSCRIPTION", True, "name"),
+    ("CW_VAULT_NAME", True, "name"),
+    ("CW_CLOUD_NAMESPACE", True, "name"),
+    ("CW_KUBECTL", False, "path"),
+    ("CW_MODEL_AUTH_FILE", False, "path"),
+    ("CW_RUN_RECORD_DIR", False, "path"),
+    ("CW_CLOUD_SPEND_CAP_USD", False, "number"),
+    ("CW_CLUSTER_TOKEN_CMD", False, "command"),
+    ("CW_CLUSTER_ADMIN_CMD", False, "command"),
+    ("CW_GIT_TOKEN_CMD", False, "command"),
+    ("CW_APP_ID_CMD", False, "command"),
+    ("CW_APP_INSTALLATION_CMD", False, "command"),
+    ("CW_APP_KEY_CMD", False, "command"),
+    ("CW_VAULT_CHECK_DIR", False, "path"),         # reserved for the vault pre-check's checkout path: read and validated, not used yet
+)
+SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
+SETTING_REQUIRED = tuple(name for name, required, _ in SETTINGS if required)
+# The secret shapes a value is refused for: (shape name, pattern, kinds it applies to; None = every kind). One row per shape.
+_PREFIXES = ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "glpat-", "sk-", "xoxb-", "xoxp-", "xoxa-", "AKIA", "AIza", "Bearer ")
+SECRET_SHAPES = tuple(
+    ("token prefix " + prefix.strip(), re.compile(r"(?<![A-Za-z0-9])" + re.escape(prefix) + r"[A-Za-z0-9._~+/=-]{8,}"), None) for prefix in _PREFIXES
+) + (
+    ("a JWT", re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}"), None),
+    ("a PEM header", re.compile(r"-----BEGIN "), None),
+    ("a URL with a password", re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]*:[^/\s@]+@"), None),
+    ("a 40-character hex string", re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{40}(?![0-9A-Fa-f])"), ("command",)),
+)
+_IMAGE_CHARS = re.compile(r"[a-z0-9._/:-]+")
+_IMAGE_REF = re.compile(r"(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]{1,5})?/)?[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*@sha256:[0-9a-f]{64}")
+_DNS_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_HOST = re.compile(r"(?:%s\.)+%s" % (_DNS_LABEL, _DNS_LABEL))   # at least two labels
+_NETLOC = re.compile(r"([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?")
+_NAMESPACE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+_SECRET_NAME = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?")
+_VAULT_NAME = re.compile(r"[A-Za-z][A-Za-z0-9-]{1,22}[A-Za-z0-9]")
+_GUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_BARE_PROGRAM = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._+-]*")
+_NUMBER = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+_REFUSED_HOSTS = ("metadata.google.internal",)
+_REFUSED_SUFFIX = ".localhost"
+_MAX_HOST = 253
+_SCHEME = "https://"
+_PATHS = ("", "/")
+_BAD_CHARS = re.compile(r"[\s\x00-\x1f\x7f%?#@\\]")   # urlsplit silently drops a tab, CR or LF: judge the string as written, so none may be there
+
+
+def _norm(host):
+    """The host as compared: lower case (a name is not case-sensitive, so METADATA.google.internal and 0X7F000001 are the same as their lower-case forms)."""
+    return host.lower()
+
+
+def _integer_host_label(label):
+    """An all-digit label, or 0x and hex digits (the label is lower-cased first): the forms a resolver (inet_aton) reads as an integer address
+    (2130706433, 127.1, 0x7f000001)."""
+    return label.isdigit() or bool(re.fullmatch(r"0x[0-9a-f]*", label))
+
+
+def _has_letter(label):
+    return any(c.isalpha() for c in label)
+
+
+def _port_ok(port):
+    return port is None or 0 < int(port) < 65536
+
+
+def _split(value):
+    """urlsplit, or None when it raises ValueError (an unbalanced [ or ], for one)."""
+    try:
+        return urllib.parse.urlsplit(value)
+    except ValueError:
+        return None
+
+
+def _shape_ok(parts):
+    return parts.path in _PATHS and not parts.query and not parts.fragment
+
+
+def _server_ok(value):
+    """The cluster API address is always a DNS NAME, so every IP literal (IPv4, bracketed IPv6, integer, hex or octal forms) is refused by the one rule:
+    https://NAME[:PORT], NAME with at least two labels of letters, digits and hyphens (1 to 63 characters, no leading or trailing hyphen), at most 253
+    characters in all, no trailing dot, a last label that has a letter and is neither all digits nor 0x and hex digits; a port of digits only, 1 to 65535.
+    The branches, each with a named test and a mutant: scheme, bad characters, an unparsable URL, the netloc grammar, path, query and fragment, the host
+    length, the port, the label grammar, the refused names, the refused suffix, a letter in the last label, an integer last label."""
+    if not value.startswith(_SCHEME) or _BAD_CHARS.search(value):
+        return False
+    parts = _split(value)
+    if parts is None:
+        return False
+    m = _NETLOC.fullmatch(parts.netloc)
+    if not m or not _shape_ok(parts):
+        return False
+    host, port = m.group(1), m.group(2)
+    low = _norm(host)
+    last = _norm(low.rsplit(".", 1)[-1])
+    return (len(host) <= _MAX_HOST and _port_ok(port) and bool(_HOST.fullmatch(host)) and low not in _REFUSED_HOSTS
+            and not low.endswith(_REFUSED_SUFFIX) and _has_letter(last) and not _integer_host_label(last))
+
+
+def _allowed_ok(value):
+    keys = allowed_repo_keys(value)
+    return None not in keys   # the one function the launch's allow-list check uses
+
+
+def _path_ok(value):
+    return os.path.isabs(value) and ".." not in value.split("/")
+
+
+def _number_ok(value):
+    return bool(_NUMBER.fullmatch(value)) and 0 < float(value) <= 100000
+
+
+# THE table of value rules: one row per setting, the rule's words (shown in a refusal, never the value) and its test. DEFAULT-DENY: a setting with no
+# row is refused, and a test fails when SETTINGS and this table differ. Every value also refuses control characters (checked before this table).
+VALIDATORS = {
+    "CW_ALLOWED_REPOS": ("a comma-separated list of OWNER/NAME entries, no wildcard", _allowed_ok),
+    "CW_TOOLING_REPO": ("one OWNER/NAME", lambda v: _repo_key(v) is not None),
+    "CW_CLOUD_IMAGE": ("an image by digest, [registry[:port]/]path@sha256:<64 lowercase hex>, no tag, nothing else",
+                       lambda v: bool(_IMAGE_CHARS.fullmatch(v.split("@")[0])) and bool(_IMAGE_REF.fullmatch(v))),
+    "CW_CLOUD_SERVER": ("an https URL whose host is a DNS name (no IP literal of any form, no user, query, fragment, path, file: or http:)", _server_ok),
+    "CW_CLOUD_CA_FILE": ("an absolute path with no .. segment", _path_ok),
+    "CW_PULL_SECRET": ("a Kubernetes name (lowercase letters, digits, - and .)", lambda v: bool(_SECRET_NAME.fullmatch(v))),
+    "CW_VAULT_SUBSCRIPTION": ("a subscription GUID", lambda v: bool(_GUID.fullmatch(v))),
+    "CW_VAULT_NAME": ("a vault name: 3 to 24 letters, digits and hyphens, starting with a letter", lambda v: bool(_VAULT_NAME.fullmatch(v))),
+    "CW_CLOUD_NAMESPACE": ("a DNS label that is not default or kube-*", lambda v: bool(_NAMESPACE.fullmatch(v)) and v != "default" and not v.startswith("kube-")),
+    "CW_KUBECTL": ("an absolute path with no .. segment, or a bare program name", lambda v: _path_ok(v) or bool(_BARE_PROGRAM.fullmatch(v))),
+    "CW_MODEL_AUTH_FILE": ("an absolute path with no .. segment", _path_ok),
+    "CW_RUN_RECORD_DIR": ("an absolute path with no .. segment", _path_ok),
+    "CW_CLOUD_SPEND_CAP_USD": ("a number above 0 and at most 100000", _number_ok),
+    "CW_CLUSTER_TOKEN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_CLUSTER_ADMIN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_GIT_TOKEN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_APP_ID_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_APP_INSTALLATION_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_APP_KEY_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
+}
+_SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
+
+
+def settings_path(env=None):
+    """Where the file is: $XDG_CONFIG_HOME (default ~/.config) / <the switchboard's config directory> / cloud.env, beside the switchboard's own config."""
+    if SETTINGS_PATH is not None:
+        return str(SETTINGS_PATH)
+    env = os.environ if env is None else env
+    base = env.get("XDG_CONFIG_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".config")
+    return os.path.join(base, CONFIG_DIR_NAME, SETTINGS_FILE_NAME)
+
+
+def _bad(path, why):
+    return CloudError("refused: the settings file %s %s; nothing was called" % (path, why), EXIT_USAGE)
+
+
+def _read_settings_file(path):
+    """The file's text, or None when there is none. Refuses (CloudError, exit 2) a symlink, a file that is not a regular file, one owned by
+    another user, one with any group or other permission bit, and one in a directory that is group- or world-writable or owned by another user.
+    The checks are on the opened descriptor, so the file cannot change between the check and the read."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        raise _bad(path, "cannot be examined (%s)" % type(err).__name__) from None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except OSError as err:
+        raise _bad(path, "is a symlink or cannot be opened (%s): it must be a regular file" % type(err).__name__) from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise _bad(path, "is not a regular file")
+        if st.st_nlink != 1:
+            raise _bad(path, "has more than one hard link: it must be the only name of the file")
+        if st.st_uid != os.geteuid():
+            raise _bad(path, "is owned by another user")
+        if stat.S_IMODE(st.st_mode) & 0o177:
+            raise _bad(path, "has mode %04o: it must be 0600 (nobody else may read or write it)" % stat.S_IMODE(st.st_mode))
+        parent = os.stat(os.path.dirname(os.path.abspath(path)))
+        if parent.st_uid != os.geteuid():
+            raise _bad(path, "is in a directory owned by another user")
+        if stat.S_IMODE(parent.st_mode) & 0o022:
+            raise _bad(path, "is in a directory that is group- or world-writable (mode %04o)" % stat.S_IMODE(parent.st_mode))
+        if st.st_size > SETTINGS_FILE_MAX:
+            raise _bad(path, "is over %d bytes" % SETTINGS_FILE_MAX)
+        raw = b""
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            raw = f.read(SETTINGS_FILE_MAX + 1)
+    finally:
+        os.close(fd)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise _bad(path, "is not UTF-8 text") from None
+
+
+def parse_settings(text, path="the settings file"):
+    """KEY=VALUE lines into {key: value}. `#` starts a comment line and blank lines are skipped. The value is the rest of the line, verbatim:
+    no quoting, no expansion, nothing is run. A bad line, an unknown or repeated key, a quoted value, and a secret-shaped value are refused naming the
+    line number and the key, never the value. An empty value counts as not set."""
+    values = {}
+    for number, line in enumerate(text.split("\n"), 1):
+        lead = line.lstrip(" \t")   # a tab is allowed in leading indentation and inside a comment line, nowhere else
+        bad = [c for c in lead if (ord(c) < 32 and not (c == "\t" and lead.startswith("#"))) or ord(c) == 127]
+        if bad:
+            key = line.split("=", 1)[0].strip() if "=" in line and line.split("=", 1)[0].strip() in SETTING_KINDS else None
+            raise _bad(path, "line %d%s has a control character (a NUL, a carriage return or another: use plain LF text)" % (number, " (%s)" % key if key else ""))
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = _SETTING_LINE.fullmatch(line.strip())
+        if not m:
+            raise _bad(path, "line %d is not KEY=VALUE" % number)
+        key, value = m.group(1), m.group(2).strip()
+        kind = SETTING_KINDS.get(key)
+        if kind is None:
+            raise _bad(path, "line %d: %s is not a setting this launcher knows" % (number, key))
+        if key in values:
+            raise _bad(path, "line %d: %s is set twice" % (number, key))
+        if value[:1] in "\"'" and value[-1:] == value[:1] and len(value) > 1:
+            raise _bad(path, "line %d: %s is quoted (the value is taken as written, with no quotes)" % (number, key))
+        for shape, pattern, kinds in SECRET_SHAPES:
+            if (kinds is None or kind in kinds) and pattern.search(value):
+                raise _bad(path, "line %d: the value of %s looks like a secret (%s); the file holds no secret" % (number, key, shape))
+        if value:
+            rule = VALIDATORS.get(key)
+            if rule is None or not rule[1](value):
+                raise _bad(path, "line %d: %s must be %s" % (number, key, rule[0] if rule else "a setting with a value rule (it has none: refused)"))
+            values[key] = value
+    missing = [name for name in SETTING_REQUIRED if name not in values]
+    if missing:
+        raise _bad(path, "lacks the required setting%s %s" % ("s" if len(missing) > 1 else "", ", ".join(missing)))
+    return values
+
+
+def apply_settings(env=None, path=None):
+    """THE reader of the operator's settings. Returns the source used: the file's path when it exists (its values then replace every setting of
+    the table in `env`, which defaults to the process environment), else "environment" (nothing changes). A setting that the file and the
+    environment BOTH set to different values is refused, naming both sources and no value."""
+    env = os.environ if env is None else env
+    path = path or settings_path(env)
+    text = _read_settings_file(path)
+    if text is None:
+        return "environment"
+    values = parse_settings(text, path)
+    clash = [name for name, _, _ in SETTINGS if env.get(name) and name in values and env[name].strip() != values[name]]
+    if clash:
+        raise CloudError("refused: %s is set differently in the file %s and in the environment: unset one (the file is the one source when it exists); "
+                         "nothing was called" % (", ".join(clash), path), EXIT_USAGE)
+    before = {name: env[name] for name, _, _ in SETTINGS if name in env}
+    try:   # everything was validated above; if the environment still refuses a value, put every setting back as it was
+        for name, _, _ in SETTINGS:
+            env.pop(name, None)
+        env.update(values)
+    except Exception:
+        for name, _, _ in SETTINGS:
+            env.pop(name, None)
+        env.update(before)
+        raise CloudError("refused: the settings file %s could not be applied; nothing was changed" % path, EXIT_USAGE) from None
+    return path
+
 
 def build_parser():
     p = argparse.ArgumentParser(prog="cloud-worker")
@@ -1159,11 +1441,18 @@ def _reap_main(L, a, sleep):
 
 
 def main(argv=None, env=None, clock=None, sleep=time.sleep):
+    explicit = env is not None
     env = os.environ if env is None else env
     try:
         a = build_parser().parse_args(argv)
     except SystemExit as e:
         return EXIT_USAGE if e.code else 0
+    if not explicit:   # the real process reads the settings file; a caller that passes its own environment has made its own choice
+        try:
+            apply_settings(env)
+        except CloudError as e:
+            print("cloud-worker: %s" % e, file=sys.stderr)
+            return e.code
     if not token_mode(env) and not (env.get("CW_KUBE_CONTEXT") or "").strip():
         print("cloud-worker: CW_KUBE_CONTEXT is not set; refusing to run (the active kubectl context is never used)", file=sys.stderr)
         return EXIT_USAGE
