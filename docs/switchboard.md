@@ -4288,7 +4288,7 @@ whose records are later slices; G7 and G8 are epic and deploy gates and show `n/
 `fleet-switchboard waive <repo#N> --gates G0a,G1,... --reason "<at least 20 characters>" [--head <sha>]` is the chief of staff's override
 for a hotfix, per `docs/plan-gate-engine-design.md`. Who: the chief of staff, or the owner at a terminal (the one shared check of `gates mode` and
 `verdict --as owner`, `gates_caller_kind`: an unknown session is refused, never read as a person, and a no-session caller must be on a
-controlling terminal with no agent process above it, so `env -u` on a pipe is refused; a strong mistake-guard, not a boundary). Which gates: G0a, G0b, G0c, G1, G2/G3, G4, G5.
+controlling terminal with no agent process above it, so `env -u` on a pipe is refused; a strong mistake-guard, not a boundary). Which gates: G0a, G0b, G0c, G1, G2/G3, G4, G5, and `MG` (the merge gate, below).
 **G6 (a held PR: the owner's hold), G7 and G8 are refused**, and a hand-written ledger entry naming them is ignored. A **writer of the PR**
 (one who recorded its proof or sent its notice, or its GitHub author) cannot waive its gates, and a ledger that does not verify takes no
 waiver and honours none. The waiver is a hash-chained ledger entry (`kind waiver`: who, why, PR, head, gates, expiry) and a `plan.waiver`
@@ -4296,6 +4296,49 @@ audit line. It is bound to **the head it was recorded at** (a push needs a new o
 retroactive plan; a waiver for another head, another PR or after its expiry does nothing. `gates` and `gates-check` honour a valid waiver:
 the gate reads `waived (by <who>, <reason>, due <time>)`, never `ok`, and the report lists `WAIVED (not passed)`. The cos permission corpus
 and allowed commands still have to be extended with `waive` (a permission change, held for the owner).
+
+## The merge gate and the merge lock: the fleet's own merge queue (#962)
+
+**It is the fleet's own merge queue.** Two pull requests that were each green against an older default branch can merge minutes apart and fail together (the
+recorded case: two pull requests merged 8 minutes apart, each green on CI that ran before the other landed, and a test failed on the default branch after the
+second). The gate makes a merge into a *gated branch* wait for proof that the pull request's last green run tested the branch **as it is now**, and lets one merge
+into that branch happen at a time. No head changes to make sure of it.
+
+**The configuration.** `merge_gate` in the switchboard config:
+
+```json
+{"merge_gate": {"repos": {"acme-org/widget-service": {}, "acme-org/widget-api": {"branches": ["main", "integration"]}},
+                "wait_minutes": 45, "lock_minutes": 20}}
+```
+
+A listed repository gates its **default branch**; `branches` names others. The integration branch is **not** gated unless a repository's `branches` lists it. A
+repository that is not listed is not enforced and nothing is asked of it (so removing the key is the rollback).
+
+**`fleet-switchboard merge-gate <repo#N>`** reads and writes nothing. It prints one block: the branch tip now; the branch tip the pull request's last CI run
+was computed on; whether they are equal; the run's result at the current head (a red run names its failing job); the latest completed run of each workflow on the
+branch itself; and whether a merge is allowed now and why. A run, a read or a state it does not know is never read as green. The tip a run was computed on is the
+branch tip GitHub recorded for the run (`pull_requests[].base.sha` of the workflow run); both reads come from one shared reader (`bin/pr_reading.py`), the same one
+the clear packet (#952) will call.
+
+**`merge-gate <repo#N> --pass`** is the merger's step. When the branch has moved, it runs that pull request's CI again **on the current merge ref**, without
+touching the head or any label, so no review, proof or clear is voided. The smallest safe way found is to **close the pull request and reopen it at once**: the
+`reopened` event starts CI on a merge ref GitHub computes fresh. A re-run of the old run reuses the old merge ref; a `workflow_dispatch` run tests the head alone;
+an `update-branch` or a push changes the head. A pull request **held for the owner** is not closed by the gate: it blocks and names `--pass --rerun-held`, which its
+orchestrator uses once the owner's clear is known to survive (it is bound to the head, which does not change). The gate waits up to `wait_minutes` (default 45) and
+passes only on green; a red run blocks and names the failing job, a timeout blocks and says the limit. On green it records the pass for that exact head and branch tip
+and takes the lock.
+
+**The lock.** One file per repository and branch in the switchboard's state directory (`merge-gate/`): the holder's name, since when, the process and the pull
+request. It is held from the gate pass until the `gh pr merge` call returns (the shim releases it, whatever the merge returned; `merge-gate --release` frees it
+early). A lock whose holder has held it longer than `lock_minutes` (default 20) without merging, or whose holder process is gone (after a two-minute grace, because
+the shell that ran the gate exits before the merge follows), is **recovered**; a second merger is told **who holds it, since when and when to retry**.
+
+**Enforcement is in the `gh` shim** (`shims/gh`, a credentials path). Before `gh pr merge` into a gated branch of a listed repository it asks `merge-gate --check`
+and **refuses in one line** unless a gate pass for this exact head and branch tip is recorded and the caller holds the lock; a merge that goes through is bound to
+the checked head and `--auto` is refused. While the latest completed run on the branch is red, no merge into it is allowed. It fails closed: no switchboard, no
+answer in time or an unreadable state refuses. **The only ways around it are the owner's own terminal** (the same rule as `waive` and `gates mode`) **and a logged
+waiver** of the chief of staff: `fleet-switchboard waive <repo#N> --gates MG --reason "..."`, a hash-chained ledger entry and an audit line, bound to the pull
+request's head and expiring after 24 hours. The waiver is also how the one merge that fixes a red branch goes in.
 
 ## `gates-check`, the gate modes and the kill switches (#107, slice 3a)
 

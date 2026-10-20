@@ -72225,6 +72225,567 @@ class TestBatchingDocs(unittest.TestCase):
             self.assertEqual(section.count(phrase), 1, phrase)
 
 
+# ---------------------------------------------------------------------------------------------------------------- #962: the fleet's own merge queue
+
+MG_TIP, MG_NEWTIP, MG_HEAD = "1" * 40, "2" * 40, "a" * 40
+
+
+def mg_iso(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+class FakeMergeGitHub:
+    """A fake GitHub for the merge gate: `fake(argv) -> (code, out, err)`. Reads and writes are logged apart; a close then reopen starts a new run on the
+    CURRENT tip that finishes `rerun_after` seconds later with `rerun_result` (None: never). `sleep` moves the clock and finishes what is due."""
+
+    def __init__(self, number=12, repo="acme-org/widget-service", start=1_800_000_000):
+        self.number, self.repo, self.now = number, repo, start
+        self.tip, self.head, self.base, self.default, self.state, self.labels = MG_TIP, MG_HEAD, "main", "main", "OPEN", []
+        self.runs = [self.make_run(1, "ci", 10, "completed", "success", MG_TIP, start - 600)]
+        self.branch_runs = [{"id": 90, "name": "ci", "workflow_id": 10, "head_sha": MG_TIP, "conclusion": "success", "status": "completed", "created_at": mg_iso(start - 900)}]
+        self.jobs = {2: [{"name": "unit-tests", "conclusion": "failure"}, {"name": "lint", "conclusion": "success"}]}
+        self.reads, self.writes, self.broken = [], [], set()
+        self.rerun_after, self.rerun_result, self.reopen_fails, self.due = 60, "success", False, []
+
+    def clock(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+        for run in list(self.due):
+            if self.now >= run["_due"]:
+                run.update(status="completed", conclusion=self.rerun_result)
+                self.due.remove(run)
+
+    def make_run(self, rid, name, workflow, status, conclusion, base, created):
+        return {"id": rid, "name": name, "workflow_id": workflow, "status": status, "conclusion": conclusion, "head_sha": self.head if hasattr(self, "head") else MG_HEAD,
+                "created_at": mg_iso(created), "pull_requests": [{"number": self.number, "base": {"sha": base, "ref": "main"}}]}
+
+    def __call__(self, argv):
+        if argv[0] == "api" and argv[1] == "-X":
+            self.writes.append(list(argv))
+            state = argv[-1].split("=", 1)[1]
+            if state == "closed":
+                self.state = "CLOSED"
+            elif self.reopen_fails:
+                return 1, "", "HTTP 502"
+            else:
+                self.state = "OPEN"
+                run = self.make_run(2, "ci", 10, "in_progress", None, self.tip, self.now)
+                run["_due"] = self.now + self.rerun_after
+                if self.rerun_result is not None:
+                    self.due.append(run)
+                self.runs = [run]
+            return 0, "{}", ""
+        self.reads.append(list(argv))
+        key = " ".join(argv)
+        if any(word in key for word in self.broken):
+            return 1, "", "HTTP 500 boom"
+        if argv[:2] == ["pr", "view"]:
+            return 0, json.dumps({"headRefOid": self.head, "baseRefName": self.base, "state": self.state, "isDraft": False, "labels": [{"name": n} for n in self.labels]}), ""
+        path = argv[1]
+        if path == "repos/%s" % self.repo:
+            return 0, json.dumps({"default_branch": self.default}), ""
+        if "/git/ref/heads/" in path:
+            return 0, json.dumps({"object": {"sha": self.tip}}), ""
+        if "event=pull_request" in path:
+            return 0, json.dumps({"workflow_runs": [{k: v for k, v in r.items() if k != "_due"} for r in self.runs]}), ""
+        if "event=push" in path:
+            return 0, json.dumps({"workflow_runs": self.branch_runs}), ""
+        found = re.search(r"/runs/(\d+)/jobs", path)
+        if found:
+            return 0, json.dumps({"jobs": self.jobs.get(int(found.group(1)), [])}), ""
+        return 1, "", "HTTP 404"
+
+
+class MergeGateBase(Base):
+    def setUp(self):
+        super().setUp()
+        self.gate = sb.load_module("merge_gate")
+        self.reading = sb.load_module("pr_reading")
+        self.fake = FakeMergeGitHub()
+        self.repo, self.n = self.fake.repo, self.fake.number
+        self.state = self.home / "mg-state"
+        self.state.mkdir()
+        self.conf = self.gate.settings({"merge_gate": {"repos": {self.repo: {}}}})
+
+    def facts(self):
+        return self.gate.read_facts(self.reading, self.fake, self.repo, self.n, self.conf)
+
+    def run_pass(self, who="coder-a", gate=None, **more):
+        gate = gate or self.gate
+        return gate.gate_pass(self.reading, self.fake, self.conf, self.state, self.repo, self.n, who, 4242, self.fake.clock, self.fake.sleep,
+                              alive=lambda pid: True, **more)
+
+    def check(self, caller="coder-a", person=False, waived=False, gate=None):
+        gate = gate or self.gate
+        return gate.check_merge(self.reading, self.fake, self.conf, self.state, self.repo, self.n, caller, person, lambda head: waived, self.fake.clock,
+                                alive=lambda pid: True)
+
+    def moved(self):
+        self.fake.tip = MG_NEWTIP
+
+
+class TestMergeGateDecision(MergeGateBase):
+    """The read-only block and the decision (#962 clauses 2, 3, 6, 7)."""
+
+    def tree(self):
+        return sorted(str(p.relative_to(self.home)) for p in self.home.rglob("*"))
+
+    def test_a_branch_that_has_not_moved_is_allowed_and_the_block_says_six_facts_and_writes_nothing(self):
+        before = self.tree()
+        facts = self.facts()
+        allowed, reason, need = self.gate.decide(facts)
+        text = self.gate.block(facts, allowed, reason)
+        self.assertEqual((allowed, need), (True, None))
+        for label in ("branch tip now:", "CI computed on tip:", "equal:", "CI result at head", "latest run on branch:", "merge allowed now:"):
+            self.assertEqual(sum(1 for line in text.splitlines() if label in line), 1, label)
+        self.assertIn("equal:                    yes", text)
+        self.assertEqual((self.fake.writes, self.tree()), ([], before), "reading writes no file, label, comment or branch")
+
+    def test_a_branch_that_moved_is_not_allowed_and_names_the_rerun_as_the_way_forward(self):
+        self.moved()
+        facts = self.facts()
+        allowed, reason, need = self.gate.decide(facts)
+        self.assertEqual((allowed, need), (False, "rerun"))
+        self.assertIn("moved after the last green run", reason)
+        self.assertIn("equal:                    no", self.gate.block(facts, allowed, reason))
+        self.assertEqual(self.fake.writes, [], "the read-only command never re-runs anything")
+
+    def test_unreadable_unknown_and_pending_runs_each_block_with_a_reason(self):
+        cases = []
+        for broken in ("actions/runs?head_sha", "git/ref/heads"):
+            fake = FakeMergeGitHub()
+            fake.broken = {broken}
+            cases.append(fake)
+        pending = FakeMergeGitHub()
+        pending.runs[0].update(status="in_progress", conclusion=None)
+        cases.append(pending)
+        unknown = FakeMergeGitHub()
+        unknown.runs[0].update(conclusion="startup_failure")
+        cases.append(unknown)
+        for fake in cases:
+            with self.subTest(broken=sorted(fake.broken), runs=[r["conclusion"] for r in fake.runs]):
+                facts = self.gate.read_facts(self.reading, fake, self.repo, self.n, self.conf)
+                allowed, reason, _ = self.gate.decide(facts)
+                self.assertFalse(allowed)
+                self.assertTrue(reason)
+
+    def test_a_red_pull_request_run_names_the_failing_job(self):
+        self.fake.runs[0].update(id=2, conclusion="failure")
+        allowed, reason, _ = self.gate.decide(self.facts())
+        self.assertFalse(allowed)
+        self.assertIn("ci / unit-tests", reason)
+        self.assertNotIn("lint", reason)
+
+    def test_a_red_latest_run_on_the_branch_blocks_every_merge_into_it(self):
+        self.fake.branch_runs[0]["conclusion"] = "failure"
+        allowed, reason, _ = self.gate.decide(self.facts())
+        self.assertFalse(allowed)
+        self.assertIn("latest completed run on main is red", reason)
+
+    def test_a_cancelled_branch_run_is_a_superseded_run_not_a_red_branch(self):
+        self.fake.branch_runs[0]["conclusion"] = "cancelled"
+        self.assertTrue(self.gate.decide(self.facts())[0])
+
+    def test_gated_branches_default_to_the_default_branch_and_the_integration_branch_only_when_listed(self):
+        gate = self.gate
+        none = gate.settings({"merge_gate": {"repos": {self.repo: {}}}})
+        listed = gate.settings({"merge_gate": {"repos": {self.repo: {"branches": ["main", "integration"]}}}})
+        other = gate.settings({"merge_gate": {"repos": {self.repo: {"branches": ["release"]}}}})
+        self.assertEqual([gate.is_gated(c, self.repo, b, "main") for c in (none, listed, other) for b in ("main", "integration")],
+                         [True, False, True, True, False, False])
+        self.assertFalse(gate.is_gated(gate.settings({}), self.repo, "main", "main"), "a repository not listed is not enforced")
+
+    def test_the_integration_branch_is_allowed_without_a_gate_pass_when_the_key_does_not_list_it(self):
+        self.fake.base = "integration"
+        self.moved()
+        self.assertEqual(self.check()[:2], (True, "branch integration is not gated"))
+
+    def test_the_configuration_key_is_validated(self):
+        gate = self.gate
+        gate.validate({"repos": {"acme-org/widget-service": {"branches": ["main"]}}, "wait_minutes": 45})
+        for bad in ({"repos": []}, {"repos": {"nope": {}}}, {"repos": {self.repo: {"branches": []}}}, {"wait_minutes": 0}, {"other": 1}, []):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                gate.validate(bad)
+        self.assertEqual(gate.settings({"merge_gate": {}})["wait"], 45 * 60, "the wait defaults to 45 minutes")
+
+
+class TestMergeGateRerun(MergeGateBase):
+    """The re-run on the current merge ref (clause 3, PC-2): head and labels untouched, wait, green allows, red or timeout blocks."""
+
+    def baseline(self):
+        return (self.fake.head, list(self.fake.labels))
+
+    def test_a_moved_branch_is_rerun_without_a_change_of_head_or_labels_and_allowed_on_green(self):
+        self.moved()
+        before = self.baseline()
+        ok, lines = self.run_pass()
+        self.assertTrue(ok, lines)
+        self.assertEqual(self.baseline(), before, "the head and the labels are identical to the baseline")
+        self.assertEqual([w[-1] for w in self.fake.writes], ["state=closed", "state=open"], "the only writes: close and reopen the pull request")
+        self.assertEqual(self.gate.read_pass(self.state, self.repo, self.n)["tip"], MG_NEWTIP)
+        self.assertTrue(any("gate passed" in l for l in lines))
+
+    def test_a_red_rerun_blocks_and_names_the_failing_job(self):
+        self.moved()
+        self.fake.rerun_result = "failure"
+        ok, lines = self.run_pass()
+        self.assertFalse(ok)
+        self.assertIn("unit-tests", lines[-1])
+        self.assertIsNone(self.gate.read_pass(self.state, self.repo, self.n))
+        self.assertIsNone(self.gate.read_lock(self.state, self.repo, "main"))
+
+    def test_a_rerun_that_does_not_finish_in_time_blocks_and_says_the_limit(self):
+        self.moved()
+        self.fake.rerun_result = None
+        ok, lines = self.run_pass(wait_seconds=300)
+        self.assertFalse(ok)
+        self.assertIn("within 5 minutes", lines[-1])
+        self.assertEqual(self.fake.writes[-1][-1], "state=open", "the pull request is open again")
+
+    def test_a_held_pull_request_is_not_closed_by_the_gate_unless_told_to(self):
+        self.moved()
+        self.fake.labels = ["fleet:merge-captain"]
+        ok, lines = self.run_pass()
+        self.assertFalse(ok)
+        self.assertEqual(self.fake.writes, [])
+        self.assertIn("--rerun-held", lines[-1])
+        ok, lines = self.run_pass(allow_held=True)
+        self.assertTrue(ok, lines)
+        self.assertEqual(self.fake.labels, ["fleet:merge-captain"])
+
+    def test_a_reopen_that_fails_says_how_to_reopen(self):
+        self.moved()
+        self.fake.reopen_fails = True
+        ok, lines = self.run_pass()
+        self.assertFalse(ok)
+        self.assertIn("gh pr reopen 12", lines[-1])
+
+    def test_an_unmoved_branch_is_not_rerun(self):
+        ok, lines = self.run_pass()
+        self.assertTrue(ok, lines)
+        self.assertEqual(self.fake.writes, [])
+
+
+class TestMergeGateLock(MergeGateBase):
+    """One merge into a branch at a time (clause 4)."""
+
+    def take(self, who, now, pid=4242, lease=1200, alive=lambda p: True):
+        return self.gate.acquire(self.state, self.repo, "main", who, pid, "%s#%d" % (self.repo, self.n), now, lease, alive)
+
+    def test_a_second_merger_is_told_who_holds_the_lock_and_when_to_retry(self):
+        self.assertTrue(self.take("coder-a", 1000)[0])
+        ok, lock, said = self.take("coder-b", 1100)
+        self.assertFalse(ok)
+        self.assertEqual(lock["holder"], "coder-a")
+        self.assertIn("coder-a holds the merge lock on %s main since" % self.repo, said)
+        self.assertIn("retry in about", said)
+
+    def test_a_lock_whose_lease_ran_out_is_recovered(self):
+        self.take("coder-a", 1000)
+        ok, lock, said = self.take("coder-b", 1000 + 1201)
+        self.assertTrue(ok)
+        self.assertIn("recovered a stale lock of coder-a", said)
+        self.assertEqual(self.gate.read_lock(self.state, self.repo, "main")["holder"], "coder-b")
+
+    def test_a_lock_whose_holder_process_is_gone_is_recovered_after_the_grace(self):
+        self.take("coder-a", 1000, pid=999999)
+        self.assertFalse(self.take("coder-b", 1000 + 60, alive=lambda p: False)[0], "inside the grace the merge of the holder may still follow")
+        ok, _, said = self.take("coder-b", 1000 + self.gate.HOLDER_GRACE + 5, alive=lambda p: False)
+        self.assertTrue(ok)
+        self.assertIn("its holder is gone", said)
+
+    def test_only_the_holder_releases_and_the_same_holder_may_take_it_again(self):
+        self.take("coder-a", 1000)
+        self.assertFalse(self.gate.release(self.state, self.repo, "main", "coder-b"))
+        self.assertTrue(self.take("coder-a", 1010)[0])
+        self.assertTrue(self.gate.release(self.state, self.repo, "main", "coder-a"))
+        self.assertIsNone(self.gate.read_lock(self.state, self.repo, "main"))
+
+    def test_the_gate_pass_of_a_second_merger_is_blocked_by_the_lock_of_the_first(self):
+        self.assertTrue(self.run_pass("coder-a")[0])
+        ok, lines = self.run_pass("coder-b")
+        self.assertFalse(ok)
+        self.assertIn("coder-a holds the merge lock", lines[-1])
+
+
+class TestMergeGateCheck(MergeGateBase):
+    """What the shim asks before a merge (clause 5, 6): a pass for the exact head and tip, the lock held by the caller; two ways around."""
+
+    def test_no_pass_is_a_refusal_in_one_line_naming_the_command(self):
+        allowed, why, head = self.check()
+        self.assertEqual((allowed, head), (False, None))
+        self.assertNotIn("\n", why)
+        self.assertIn("merge-gate acme-org/widget-service#12 --pass", why)
+
+    def test_a_pass_for_this_head_and_tip_with_the_lock_held_by_the_caller_is_allowed_and_bound_to_the_head(self):
+        self.assertTrue(self.run_pass()[0])
+        allowed, why, head = self.check()
+        self.assertEqual((allowed, head), (True, MG_HEAD))
+        self.assertTrue(why.startswith(self.gate.GATE_PASSED))
+
+    def test_a_pass_for_an_older_tip_or_head_is_refused(self):
+        self.assertTrue(self.run_pass()[0])
+        self.moved()
+        self.assertIn("gate pass is stale", self.check()[1])
+        self.fake.tip = MG_TIP
+        self.assertTrue(self.check()[0])
+        self.fake.head = "b" * 40
+        self.assertFalse(self.check()[0])
+
+    def test_the_lock_must_be_held_by_the_caller(self):
+        self.assertTrue(self.run_pass("coder-a")[0])
+        allowed, why, _ = self.check(caller="coder-b")
+        self.assertFalse(allowed)
+        self.assertIn("coder-a holds the merge lock", why)
+        self.gate.release(self.state, self.repo, "main", "coder-a")
+        self.assertIn("nobody holds the merge lock", self.check(caller="coder-a")[1])
+
+    def test_the_owners_own_terminal_and_a_logged_waiver_are_the_two_ways_around(self):
+        self.assertEqual(self.check(person=True)[:3:2], (True, MG_HEAD))
+        allowed, why, head = self.check(waived=True)
+        self.assertEqual((allowed, head), (True, MG_HEAD))
+        self.assertIn("waiver", why)
+
+    def test_a_red_branch_refuses_a_merge_even_with_a_pass_unless_a_waiver_names_it(self):
+        self.assertTrue(self.run_pass()[0])
+        self.fake.branch_runs[0]["conclusion"] = "failure"
+        allowed, why, _ = self.check()
+        self.assertFalse(allowed)
+        self.assertIn("latest completed run on main is red", why)
+        self.assertTrue(self.check(waived=True)[0], "the merge the waiver names goes in")
+
+    def test_an_unreadable_pull_request_fails_closed_in_one_line(self):
+        self.fake.broken = {"pr view"}
+        allowed, why, _ = self.check()
+        self.assertFalse(allowed)
+        self.assertEqual(why.count("\n"), 0)
+
+    def test_the_integration_branch_is_allowed_and_a_gated_one_is_not_without_a_pass(self):
+        self.fake.base = "integration"
+        self.assertTrue(self.check()[0])
+        self.fake.base = "main"
+        self.assertFalse(self.check()[0])
+
+
+class TestMergeGateMutants(MergeGateBase):
+    """Each rule is tested against a copy of the module with that rule removed: the test that guards it must fail (clause 8)."""
+
+    def mutant(self, old, new):
+        source = (BIN / "merge_gate.py").read_text()
+        self.assertEqual(source.count(old), 1, "the mutation target must be in the module exactly once: " + old)
+        module = types.ModuleType("merge_gate_mutant")
+        exec(compile(source.replace(old, new), "merge_gate_mutant.py", "exec"), module.__dict__)
+        return module
+
+    def scenario_moved_branch_needs_a_rerun(self, gate):
+        self.moved()
+        allowed, reason, need = gate.decide(gate.read_facts(self.reading, self.fake, self.repo, self.n, self.conf))
+        self.assertEqual((allowed, need), (False, "rerun"))
+
+    def scenario_no_lock_no_merge(self, gate):
+        self.assertTrue(self.run_pass("coder-a", gate=gate)[0])
+        self.assertFalse(self.check(caller="coder-b", gate=gate)[0])
+
+    def scenario_stale_pass_is_refused(self, gate):
+        self.assertTrue(self.run_pass(gate=gate)[0])
+        self.moved()
+        self.assertFalse(self.check(gate=gate)[0])
+
+    CASES = (("skip the base comparison", 'if facts["run_base"] != facts["tip"]:', "if False:", "scenario_moved_branch_needs_a_rerun"),
+             ("skip the lock", 'if lock is None or stale or lock.get("holder") != caller:', "if False:", "scenario_no_lock_no_merge"),
+             ("accept a stale gate pass", 'if got.get("head") != facts["head"] or got.get("branch") != facts["branch"] or got.get("tip") != facts["tip"]:',
+              "if False:", "scenario_stale_pass_is_refused"))
+
+    def test_the_unmutated_module_passes_every_scenario(self):
+        for _, _, _, name in self.CASES:
+            with self.subTest(scenario=name):
+                self.setUp()
+                getattr(self, name)(self.gate)
+
+    def test_each_mutant_fails_its_scenario(self):
+        for label, old, new, name in self.CASES:
+            with self.subTest(mutant=label):
+                self.setUp()
+                with self.assertRaises(AssertionError):
+                    getattr(self, name)(self.mutant(old, new))
+
+
+class TestMergeGateCommand(LedgerBase):
+    """The command itself: read-only by default, `--check` for the shim, the owner's terminal and the chief of staff's logged waiver (`waive --gates MG`)."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake = FakeMergeGitHub(number=9, repo="acme/app")
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.extra_config = {"merge_gate": {"repos": {"acme/app": {}}}, "plan_gates": {"repos": {"acme/app": {"mode": "enforce"}}}}
+        self.configure()
+        self.pr.update(headRefOid=MG_HEAD)
+
+    def route(self, argv, **kwargs):
+        if argv[0] != FAKE_GH:
+            return self.world.route(argv, **kwargs)
+        if argv[1:3] == ["pr", "view"] and "headRefOid,baseRefName,state,isDraft,labels" not in argv:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.pr), "")
+        code, out, err = self.fake(argv[1:])
+        return subprocess.CompletedProcess(argv, code, out, err)
+
+    def test_the_default_form_prints_one_block_and_writes_nothing(self):
+        before = sorted(p.name for p in self.world.state.rglob("*"))
+        code, out, err = self.run_as("coder", "merge-gate", self.PR)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sum(1 for l in out.splitlines() if l.startswith("merge-gate ")), 1)
+        self.assertIn("merge allowed now:        yes", out)
+        self.assertEqual((self.fake.writes, sorted(p.name for p in self.world.state.rglob("*"))), ([], before))
+
+    def test_the_shim_question_refuses_an_agent_without_a_pass_and_passes_the_owners_terminal_and_a_waiver(self):
+        code, out, err = self.run_as("coder", "merge-gate", self.PR, "--check", "--json")
+        self.assertEqual(code, 10)
+        self.assertFalse(json.loads(out)["allowed"])
+        code, out, err = self.run_as(None, "merge-gate", self.PR, "--check", "--json")
+        self.assertEqual((code, json.loads(out)["reason"]), (0, "the owner's own terminal"))
+        self.assertEqual(self.run_as("cos", "waive", self.PR, "--gates", "MG", "--reason", "the merge that fixes the red branch on main")[0], 0)
+        code, out, err = self.run_as("coder", "merge-gate", self.PR, "--check", "--json")
+        self.assertEqual((code, json.loads(out)["allowed"]), (0, True))
+        self.fake.head = "c" * 40
+        self.pr.update(headRefOid="c" * 40)
+        self.assertEqual(self.run_as("coder", "merge-gate", self.PR, "--check", "--json")[0], 10, "a waiver is for the head it was logged at")
+
+    def test_pass_takes_the_lock_for_the_caller_and_the_check_then_allows_and_release_frees_it(self):
+        code, out, err = self.run_as("coder", "merge-gate", self.PR, "--pass")
+        self.assertEqual(code, 0, err)
+        code, out, err = self.run_as("coder", "merge-gate", self.PR, "--check", "--json")
+        payload = json.loads(out)
+        self.assertEqual((code, payload["allowed"], payload["locked"], payload["head"]), (0, True, True, MG_HEAD))
+        self.assertEqual(self.run_as("other", "merge-gate", self.PR, "--check", "--json")[0], 10)
+        self.assertEqual(self.run_as("coder", "merge-gate", self.PR, "--release")[0], 0)
+        self.assertEqual(self.run_as("coder", "merge-gate", self.PR, "--check", "--json")[0], 10)
+
+    def test_a_waiver_for_the_merge_gate_is_a_gate_the_waive_command_knows_and_gates_other_than_it_still_work(self):
+        self.assertEqual(self.run_as("cos", "waive", self.PR, "--gates", "mg,G1", "--reason", "the merge that fixes the red branch on main")[0], 0)
+        (entry,) = self.ledger()
+        self.assertEqual(entry["gates"], ["MG", "G1"])
+
+
+class TestGhShimMergeGate(Base):
+    """The shim asks `merge-gate --check` before `gh pr merge` into a repository listed under `merge_gate.repos`; it fails closed there and nowhere else."""
+
+    def setUp(self):
+        super().setUp()
+        self.bin = self.home / "realbin"
+        self.bin.mkdir()
+        self.log = self.home / "gh-log.json"
+        fake = self.bin / "gh"
+        fake.write_text("#!/usr/bin/env python3\nimport json,os,sys\n"
+                        "if sys.argv[1:3] == ['repo', 'view']:\n    print(os.environ.get('FAKE_REPO') or ''); sys.exit(0)\n"
+                        "if sys.argv[1:3] == ['pr', 'view']:\n    print('{\"reviews\": [], \"headRefOid\": \"' + 'a'*40 + '\"}'); sys.exit(0)\n"
+                        "json.dump({'argv': sys.argv[1:]}, open(%r,'w'))\nsys.exit(0)\n" % str(self.log))
+        fake.chmod(0o755)
+        self.calls = self.home / "mg-calls.log"
+        self.sb = self.home / "fakesb"
+        self.sb.write_text("#!/bin/sh\n"
+                           "if [ \"$1\" = whoami ]; then\n  echo '{\"name\": \"worker\", \"repo\": \"acme/app\"}'; exit 0; fi\n"
+                           "if [ \"$1\" = review ]; then exit 0; fi\n"
+                           "if [ \"$1\" = merge-gate ]; then\n  echo \"$@ own=$FLEET_SWITCHBOARD_OWN_GH\" >> %r\n"
+                           "  [ -n \"$FAKE_MG_SLEEP\" ] && sleep $FAKE_MG_SLEEP\n  [ \"$3\" = --release ] && exit 0\n"
+                           "  echo \"$FAKE_MG_JSON\"; exit ${FAKE_MG_EXIT:-0}\nfi\nexit 2\n" % str(self.calls))
+        self.sb.chmod(0o755)
+        subprocess.run([str(self.sb), "whoami"], capture_output=True, timeout=60)
+        (self.home / ".config" / "fleet-switchboard").mkdir(parents=True)
+        (self.home / ".config" / "fleet-switchboard" / "config.json").write_text(json.dumps({"merge_gate": {"repos": {"acme/app": {}}}}))
+        self.state = self.home / "state"
+        self.state.mkdir()
+
+    HEAD = "a" * 40
+
+    def run_shim(self, *args, env=None, binary=True):
+        environ = {"PATH": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home), "FLEET_SWITCHBOARD_STATE": str(self.state),
+                   "FLEET_SHIM_LOOKUP_SECONDS": SHIM_LOOKUP_SECONDS, "FLEET_SHIM_GATE_SECONDS": SHIM_LOOKUP_SECONDS, "FAKE_REPO": "acme/app"}
+        if binary:
+            environ["FLEET_SWITCHBOARD_BIN"] = str(self.sb)
+        environ.update(env or {})
+        if self.log.exists():
+            self.log.unlink()
+        done = subprocess.run([sys.executable, str(SHIM), *args], capture_output=True, text=True, env=environ, timeout=60)
+        return done, (json.loads(self.log.read_text()) if self.log.exists() else None)
+
+    def merge_calls(self):
+        return self.calls.read_text().splitlines() if self.calls.exists() else []
+
+    MERGE = ("pr", "merge", "12", "-R", "acme/app", "--squash")
+
+    def allowed(self, locked=True):
+        return {"FAKE_MG_JSON": json.dumps({"allowed": True, "reason": "x", "head": self.HEAD, "locked": locked})}
+
+    def test_a_refusal_is_one_line_and_the_real_gh_does_not_run(self):
+        done, seen = self.run_shim(*self.MERGE, env={"FAKE_MG_EXIT": "10", "FAKE_MG_JSON": json.dumps(
+            {"allowed": False, "reason": "merge of acme/app#12 refused: no gate pass recorded; run `fleet-switchboard merge-gate acme/app#12 --pass` first"})})
+        self.assertEqual((done.returncode, seen), (10, None))
+        self.assertEqual(len(done.stderr.strip().splitlines()), 1)
+        self.assertIn("no gate pass recorded", done.stderr)
+        self.assertEqual(self.merge_calls(), ["merge-gate acme/app#12 --check --json own=1"])
+
+    def test_an_allowed_merge_is_bound_to_the_checked_head_and_releases_the_lock_when_it_returns(self):
+        done, seen = self.run_shim(*self.MERGE, env=self.allowed())
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(seen["argv"], list(self.MERGE) + ["--match-head-commit", self.HEAD])
+        self.assertEqual(self.merge_calls()[-1], "merge-gate acme/app#12 --release own=1")
+
+    def test_an_allowed_merge_without_the_lock_releases_nothing(self):
+        done, seen = self.run_shim(*self.MERGE, env=self.allowed(locked=False))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(len(self.merge_calls()), 1)
+
+    def test_the_lock_is_released_even_when_the_merge_fails(self):
+        (self.bin / "gh").write_text((self.bin / "gh").read_text().replace("sys.exit(0)\n", "sys.exit(0)\n", 1).rsplit("sys.exit(0)", 1)[0] + "sys.exit(9)\n")
+        done, seen = self.run_shim(*self.MERGE, env=self.allowed())
+        self.assertEqual(done.returncode, 9)
+        self.assertEqual(self.merge_calls()[-1], "merge-gate acme/app#12 --release own=1")
+
+    def test_the_gate_fails_closed_without_a_switchboard_on_an_error_and_on_a_late_answer(self):
+        done, seen = self.run_shim(*self.MERGE, binary=False)
+        self.assertEqual((done.returncode, seen), (10, None))
+        self.assertIn("cannot be asked", done.stderr)
+        done, seen = self.run_shim(*self.MERGE, env={"FAKE_MG_EXIT": "1", "FAKE_MG_JSON": "{}"})
+        self.assertEqual((done.returncode, seen), (10, None))
+        self.assertIn("could not decide", done.stderr)
+        done, seen = self.run_shim(*self.MERGE, env=dict(self.allowed(), FAKE_MG_SLEEP="5", FLEET_SHIM_MERGE_GATE_SECONDS="1"))
+        self.assertEqual((done.returncode, seen), (10, None))
+        self.assertIn("did not answer in time", done.stderr)
+
+    def test_a_repository_that_is_not_listed_and_a_command_that_is_not_a_merge_are_not_asked(self):
+        done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/other", "--squash")
+        self.assertEqual((done.returncode, self.merge_calls()), (0, []))
+        done, seen = self.run_shim("pr", "ready", "12", "-R", "acme/app")
+        self.assertEqual((done.returncode, self.merge_calls()), (0, []))
+
+    def test_auto_merge_is_refused_for_a_gated_repository(self):
+        done, seen = self.run_shim(*self.MERGE, "--auto", env=self.allowed())
+        self.assertEqual((done.returncode, seen), (10, None))
+        self.assertIn("--auto", done.stderr)
+
+
+class TestMergeGateDocs(unittest.TestCase):
+    """Clause 9 and the neutral-names rule: the section says the gate, the lock, the waiver and that it is the fleet's own merge queue; neither it nor the
+    new files hold a real pull request number or a private name."""
+
+    def section(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        return text.split("## The merge gate and the merge lock", 1)[1].split("\n## ", 1)[0]
+
+    def test_the_section_states_the_gate_the_lock_the_waiver_and_the_queue(self):
+        section = self.section()
+        self.assertIn("**It is the fleet's own merge queue.**", section)
+        for statement in ("`fleet-switchboard merge-gate <repo#N>`** reads and writes nothing", "**The lock.**", "--gates MG"):
+            self.assertEqual(section.count(statement), 1, statement)
+
+    def test_the_configuration_example_uses_neutral_names(self):
+        section = self.section()
+        self.assertIn("acme-org/widget-service", section)
+        self.assertEqual(re.findall(r"#\d{3,}", section), ["#962", "#952"])
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.

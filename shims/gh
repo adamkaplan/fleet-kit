@@ -975,6 +975,100 @@ def gate_bind_merge(args, parsed, repo, number, payload):
     return ("args", new + [MATCH_FLAG, head])
 
 
+# ---- the merge gate (#962): the fleet's own merge queue. Before `gh pr merge` into a GATED branch of a repository listed under `merge_gate.repos` in the
+# switchboard config, the shim asks `fleet-switchboard merge-gate <repo#N> --check --json`. That command decides everything (the owner's own terminal and a
+# logged waiver of the chief of staff pass; any other caller needs a gate pass for the exact head and branch tip and the merge lock) and exits 10 to refuse.
+# FAIL CLOSED for a listed repository: no switchboard, no answer in time or any exit but 0 and 10 refuses with one line. Nothing is asked for a repository that
+# is not listed. A merge that goes through is bound to the checked head (`--match-head-commit`), `--auto` is refused, and the lock is released when the merge returns.
+MERGE_GATE_SECONDS = 30.0
+
+
+def merge_gate_seconds():
+    try:
+        return min(120.0, max(1.0, float(os.environ.get("FLEET_SHIM_MERGE_GATE_SECONDS", MERGE_GATE_SECONDS))))
+    except ValueError:
+        return MERGE_GATE_SECONDS
+
+
+def merge_gate_repos():
+    """The lower-cased repos listed under `merge_gate.repos` in the switchboard config; empty when none (then nothing is asked)."""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    try:
+        with open(os.path.join(base, "fleet-switchboard", "config.json")) as handle:
+            repos = (json.load(handle).get("merge_gate") or {}).get("repos")
+    except (OSError, ValueError, AttributeError):
+        return set()
+    return {str(name).lower() for name in repos} if isinstance(repos, dict) else set()
+
+
+def merge_gate_probe(args, lookup, gh):
+    """None (run as given), ("refuse", one line) or ("go", args, release_ref): the merge may run with these args; `release_ref` is the pull request whose lock is
+    released when the merge returns (None when no lock was used). Never raises past a refusal: an unexpected error in a listed repository refuses."""
+    try:
+        if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1" or len(args) < 2 or args[0] != "pr" or args[1] != "merge":
+            return None
+        listed = merge_gate_repos()
+        if not listed:
+            return None
+        parsed = gate_parse(args)
+        if parsed is None:
+            return None
+        deadline = time.time() + merge_gate_seconds()
+        env = None
+        if gh is not None:
+            try:
+                env = account_env(gh, lookup)
+            except AppMintRefused as err:
+                return ("refuse", str(err))
+            except Exception:
+                env = None
+        repo, number = gate_resolve(parsed, gh, env, deadline)
+        if repo is None or repo.lower() not in listed:
+            return None
+        ref = "%s#%d" % (repo, number)
+        binary = switchboard_binary()
+        if not binary:
+            return ("refuse", "gh: merge of %s refused: the merge gate cannot be asked (no switchboard); the owner's own terminal or a logged waiver of the chief of staff goes around it" % ref)
+        try:
+            done = subprocess.run([binary, "merge-gate", ref, "--check", "--json"], capture_output=True, text=True, timeout=merge_gate_seconds(),
+                                  stdin=subprocess.DEVNULL, env=dict(os.environ, FLEET_SWITCHBOARD_OWN_GH="1"))
+        except (subprocess.SubprocessError, OSError):
+            return ("refuse", "gh: merge of %s refused: the merge gate did not answer in time (it fails closed); retry, or ask the chief of staff for a logged waiver" % ref)
+        try:
+            payload = json.loads(done.stdout.strip().splitlines()[-1]) if done.stdout.strip() else {}
+        except ValueError:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        if done.returncode == 10:
+            line = gate_clean((payload.get("reason") or done.stderr or "").strip().splitlines()[0] if (payload.get("reason") or done.stderr or "").strip() else "")
+            if payload.get("reason"):
+                line = "merge of %s refused: %s" % (ref, line) if not line.startswith("merge of") else line
+            return ("refuse", "gh: " + (line or "merge of %s refused by the merge gate" % ref)[:400])
+        if done.returncode != 0 or payload.get("allowed") is not True:
+            return ("refuse", "gh: merge of %s refused: the merge gate could not decide (exit %d; it fails closed)" % (ref, done.returncode))
+        head = payload.get("head")
+        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+            return ("refuse", "gh: merge of %s refused: the merge gate gave no head to bind the merge to" % ref)
+        bound = gate_bind_merge(args, parsed, repo, number, {"head": head})
+        if bound is None or bound[0] == "refuse":
+            return ("refuse", bound[1] if bound else "gh: merge of %s refused: the merge could not be bound to the checked head" % ref)
+        return ("go", bound[1], ref if payload.get("locked") is True else None)
+    except Exception:
+        return ("refuse", "gh: merge refused: the merge gate hit an unexpected error (it fails closed); retry")
+
+
+def merge_gate_release(ref):
+    """Release the merge lock of `ref` (best effort: a lock that is not released is recovered by its lease)."""
+    try:
+        binary = switchboard_binary()
+        if binary:
+            subprocess.run([binary, "merge-gate", ref, "--release"], capture_output=True, text=True, timeout=merge_gate_seconds(),
+                           stdin=subprocess.DEVNULL, env=dict(os.environ, FLEET_SWITCHBOARD_OWN_GH="1"))
+    except Exception:
+        pass
+
+
 HOLD_MODULE = [None, False]   # (module, tried): gh_hold.py beside this file, loaded by path (a plain `import` would need a package)
 
 
@@ -1132,6 +1226,14 @@ def run(args):
         return 10
     if verdict is not None:
         args = verdict[1]
+    merged = merge_gate_probe(args, lookup, gh)
+    release_ref = None
+    if merged is not None and merged[0] == "refuse":
+        sys.stderr.write(gate_clean(merged[1]) + "\n")
+        audit_write(args, lookup, "refused", write, hold_repo, hold_number)
+        return 10
+    if merged is not None:
+        args, release_ref = merged[1], merged[2]
     credential = is_git_credential(args)
     extra = {"credential": True} if credential else {}   # only the git credential route passes the keyword: every other call is exactly as it was
     try:
@@ -1160,6 +1262,11 @@ def run(args):
     audit_write(args, lookup, "passed", write, hold_repo, hold_number)
     warn_text(args)
     count_call(args)
+    if plan is None and release_ref:   # a merge under the lock: the lock is released when the merge returns, whatever it returned
+        try:
+            return subprocess.run([gh] + args, env=env).returncode
+        finally:
+            merge_gate_release(release_ref)
     if plan is None:
         if APP_DIRS:   # a token file has to be removed after the call: gh runs as a child, not in place of this process
             child = subprocess.Popen([gh] + args, env=env)
