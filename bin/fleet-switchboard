@@ -243,7 +243,7 @@ def health_write(engine, state, now):
         records = load_health_records()
         listed = registry_read(engine.state_dir)   # the records are a view of the registry: only its agents' sessions; a read that is not whole drops nothing
         body = recorder.body(records.read_tool_file(engine.state_dir), light=bool((getattr(engine, "config", None) or {}).get("v2_light")), watched=health_watched_repos(engine.state_dir),
-                             sessions=[a.get("session") for a in listed["agents"].values() if a.get("session")] if listed["whole"] else None)
+                             retired_sessions={r.get("session") for r in listed["retired"].values() if r.get("session")} if listed["whole"] else None)
         state_write(Path(engine.state_dir) / records.FILE, json.dumps(body, sort_keys=True), _without(body, "written_at"), HEARTBEAT_PR_STATE, nofollow=True)
     except Exception as err:
         _health_fault(engine, "write", err)
@@ -10019,7 +10019,7 @@ def decisions_from_reports(engine, now):
     since = now - engine.config["decisions_lookback_hours"] * 3600
     bosses = sorted({resolve_boss(discovery, _boss_of(o)) for o in discovery.agents.values() if _boss_of(o)})
     repos = decision_repos(engine)
-    listed = registry_read(engine.state_dir) if engine.state_dir is not None else {"whole": False, "agents": {}}   # the decisions view: who is still an agent comes from the registry
+    listed = registry_read(engine.state_dir) if engine.state_dir is not None else {"whole": False, "retired": {}}   # the decisions view: who is still an agent comes from the registry
     items, problems, sends, unread = [], [], {}, {}
     for boss in bosses:
         observation = discovery.agents.get(boss)
@@ -10051,8 +10051,8 @@ def decisions_from_reports(engine, now):
                                 "repo": item.get("repo") or _fleet_repo(sender.fleet, engine.config), "session": None})
         reports.sort(key=lambda r: r["at"])
         for report in reports:
-            if report["state"] not in ("question", "blocked") or report["sender"] not in discovery.agents or (listed["whole"] and report["sender"] not in listed["agents"]):
-                continue  # not a decision, or the worker that asked is not in the registry (retired, gone): no one is waiting; a read that is not whole drops nothing
+            if report["state"] not in ("question", "blocked") or report["sender"] not in discovery.agents or (listed["whole"] and report["sender"] in listed["retired"]):
+                continue  # not a decision, or the worker that asked is retired in the registry (or no longer runs): no one is waiting; a read that is not whole drops nothing
             worker = report["sender"]
             if worker not in unread:
                 try:
@@ -27678,20 +27678,20 @@ def load_tick(engine, discovery):
     links_gate = getattr(engine, "awaiting_held_links", False) and now - waited < HELD_LINKS_WAIT_SECONDS   # #796: a start's held-PR links must be whole before the first alert; it lapses after a bound
     cfg = engine.config.get("load_alert") or dict(health.DEFAULTS)
     reminders = read_reminders(engine.state_dir)
-    listed = registry_read(engine.state_dir)   # the load line is a view of the registry: an agent it does not list has no figures; a read that is not whole alerts nobody (#805)
+    listed = registry_read(engine.state_dir)   # the load line is a view of the registry: a retired agent has no figures; a read that is not whole alerts nobody (#805)
     if not listed["whole"]:
         return []
     retired, last_reports = listed["retired"], _read_small(engine.state_dir, LAST_REPORT_FILE)
     orchestrators = {}
     for name, seen in sorted(discovery.agents.items()):
         fleet = seen.fleet or {}
-        if fleet.get("role") != "orchestrator" or name not in listed["agents"]:
+        if fleet.get("role") != "orchestrator":
             continue
         entry = retired.get(name)
         if isinstance(entry, dict) and entry.get("session") in (None, getattr(seen, "session_id", None)):
             continue   # on the retired list (the same name and session rule as coder_finished): no load figures and no health row
         coders = [o for o in discovery.agents.values() if (o.fleet or {}).get("reports_to") == name and (o.fleet or {}).get("role") == "coder"
-                  and o.name in listed["agents"] and not coder_finished(o, retired, last_reports)]   # a retired coder, or one that made its final report, is on the books but not a coder of this workspace
+                  and not coder_finished(o, retired, last_reports)]   # a retired coder, or one that made its final report, is on the books but not a coder of this workspace
         orchestrators[name] = {"charter": fleet.get("charter") if _is_issue_number(fleet.get("charter")) else None,   # a fallback: the charter is found by the yaml that names the agent
                                "repo": _fleet_repo(fleet, engine.config) or (engine.intents.repo if engine.intents is not None else None),
                                "busy": sum(1 for c in coders if c.status == "working"), "idle": sum(1 for c in coders if c.status == "idle"),
