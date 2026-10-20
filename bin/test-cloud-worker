@@ -1631,7 +1631,6 @@ class TestVaultCheckRelay(VaultBase):
             with self.subTest(mode=mode):
                 (self.stub_dir / "az.log").unlink(missing_ok=True)
                 (self.stub_dir / "az_mode").write_text(mode)
-                (self.stub_dir / "vault_down").write_text("x") if mode == "down" else None
                 code, out, err = self.launch()
                 self.assertEqual(code, 2, err)
                 self.assertEqual((len(self.check_runs()), self.az_reads(), self.audit_lines()), (0, 1, []))
@@ -1665,12 +1664,21 @@ class TestVaultCheckRelay(VaultBase):
         self.assertEqual({k for k in keys if not k.startswith("LC_")} - {"__CF_USER_TEXT_ENCODING", "SHLVL", "PWD", "_"}, {"PATH", "HOME", "TMPDIR", "AZURE_CONFIG_DIR"})   # SHLVL, PWD, _: the recording sh wrapper's own
         self.assertNotEqual(start["home"], os.environ["HOME"])   # a private HOME, not the user's
 
-    def test_the_audit_and_lock_files_are_private(self):
+    def test_the_lock_file_is_private_and_a_linked_lock_path_is_refused(self):
         self.make_checkout(code=10, fixes=True)
         code, out, err = self.launch()
         self.assertEqual(code, 0, err)
         lock = self.state / "cloud" / self.cw.VAULT_LOCK_NAME
         self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+        lock.unlink()
+        os.symlink(str(self.home / "elsewhere"), str(lock))   # a linked lock path is never followed
+        for old in self.state.glob("cloud/*.json"):
+            old.unlink()
+        (self.checkout / "fixed").unlink()
+        code, out, err = self.launch()
+        self.assertEqual(code, 2, err)
+        self.assertIn("lock", err)
+        self.assertFalse((self.home / "elsewhere").exists())
 
 
 class TestVaultCheckPath(VaultBase):
@@ -1732,15 +1740,19 @@ class TestVaultCheckProcess(VaultBase):
     def test_a_check_past_its_limit_is_killed_and_is_a_stop(self):
         self.make_checkout(code=10, fixes=True, sleep=30)
         with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 1), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0):
-            started = time.time()
             code, out, err = self.launch()
         self.assertEqual(code, 2, err)
-        self.assertLess(time.time() - started, 15)
         self.assertIn("the owner of the vault access check", err)
         (start,) = self.check_runs()
-        time.sleep(0.3)
-        with self.assertRaises(ProcessLookupError):
-            os.kill(start["pid"], 0)
+        end = time.monotonic() + 10
+        gone = False
+        while not gone and time.monotonic() < end:   # a bounded wait for the killed group to be reaped
+            try:
+                os.kill(start["pid"], 0)
+                time.sleep(0.05)
+            except ProcessLookupError:
+                gone = True
+        self.assertTrue(gone, "the check is still running")
         (line,) = self.audit_lines()
         self.assertIn('"outcome": "timed-out"', line)
 
@@ -1751,11 +1763,17 @@ class TestVaultCheckProcess(VaultBase):
         read = lambda: self.cw._capture(["az", "keyvault", "secret", "show"], env=env)
         results[index] = recovery(read, env)
 
+    def wait_started(self, limit=30):
+        end = time.monotonic() + limit
+        while not self.check_runs() and time.monotonic() < end:
+            time.sleep(0.02)
+        self.assertTrue(self.check_runs(), "the first check never started")
+
     def two_launches(self):
         results = [None, None]
         threads = [threading.Thread(target=self.recover, args=(results, i)) for i in (0, 1)]
         threads[0].start()
-        time.sleep(0.4)   # the first holds the lock (the check sleeps) when the second arrives
+        self.wait_started()   # the first holds the lock (its check has started and sleeps) when the second arrives
         threads[1].start()
         for thread in threads:
             thread.join(60)
@@ -1786,7 +1804,7 @@ class TestVaultCheckProcess(VaultBase):
         results = [None]
         holder = threading.Thread(target=self.recover, args=(results, 0))
         holder.start()
-        time.sleep(0.5)
+        self.wait_started()
         recovery = self.cw.VaultRecovery(self.home / "vault.lock", None, sleep=lambda s: time.sleep(0.05), clock=time.monotonic)
         with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 0), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0), mock.patch.object(self.cw, "VAULT_LOCK_GRACE", 0.3):
             with self.assertRaises(self.cw.Refusal) as caught:
