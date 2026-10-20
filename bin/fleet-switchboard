@@ -25134,6 +25134,8 @@ def cmd_disk_janitor(args, runner, now):
         raise LaunchError("refused: --apply needs --i-reviewed <fingerprint> naming the preview you just read. Run `%s disk janitor` (a dry run), read the list, "
                           "and pass the fingerprint it prints. The weekly run is the daemon's, under a recorded yes (`disk janitor-ack`); nothing else removes anything" % PROG)
     weekly = bool(getattr(args, "weekly", False))
+    if args.apply and weekly:
+        raise LaunchError("refused: --weekly is the daemon's run: a hand-run --apply takes no --weekly (the preview you read was made under the ordinary budget)")
     audit = lambda name, detail: engine.audit.append(engine.actor, "temp.removed", _plain(name, 120), detail)
     with worktree_sweep(engine):   # one session.list for every in-use check of this run
         preview = []   # the dry run's list: its fingerprint is the daemon's, by the same function (`preview_fingerprint`), so a yes and this flag name the same thing
@@ -25143,7 +25145,7 @@ def cmd_disk_janitor(args, runner, now):
             if reviewed != fingerprint:
                 raise LaunchError("refused: --i-reviewed %s is not this preview's fingerprint (%s): the rule or the list changed since you read it. Nothing was removed; "
                                   "run the dry run again and read it" % (_one_line(reviewed, 40), fingerprint))
-            lines, removed, kept = janitor.run(temp, state, now(), cfg, True, audit, busy=janitor_busy_function(engine, runner, janitor), weekly=weekly)
+            lines, removed, kept = janitor.run(temp, state, now(), cfg, True, audit, busy=janitor_busy_function(engine, runner, janitor), weekly=False)
     for line in lines:
         print(_plain(line, 300))
     print("%s: %d %s, %d kept (%s)" % (PROG, removed, "removed" if args.apply else "would be removed (a dry run: add --apply --i-reviewed %s)" % fingerprint, kept, _plain(temp, 160)))

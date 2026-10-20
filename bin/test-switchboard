@@ -60014,6 +60014,55 @@ class TestTempJanitor(Base):
         expected = self.jan.preview_fingerprint(self.jan.rule_fingerprint(cfg), ["old-a.log", "old-b.log"])
         self.assertIn("preview fingerprint: %s" % expected, dry)
 
+    def fingerprint(self, *argv):
+        code, dry, err = self.raw_cli(*argv)
+        self.assertEqual(code, 0, err)
+        return re.findall(r"preview fingerprint: ([0-9a-f]{16})", dry)[-1]
+
+    def test_958_s8_a_scripted_run_with_no_terminal_is_refused_and_a_typed_current_fingerprint_applies(self):
+        victim = self.old("old-unnamed.log")
+        fingerprint = self.fingerprint()
+        person = os.environ.get("HERDR_PANE_ID")
+        os.environ["HERDR_PANE_ID"] = "p_unknown_pane"   # a script or an agent: not established as the owner's terminal
+        code, out, err = self.raw_cli("--apply", "--i-reviewed", fingerprint)
+        self.assertEqual(code, 1)
+        self.assertIn("only the operator or the Chief of Staff may --apply", err)
+        self.assertTrue(victim.exists())
+        if person is None:
+            os.environ.pop("HERDR_PANE_ID", None)
+        else:
+            os.environ["HERDR_PANE_ID"] = person
+        code, out, err = self.raw_cli("--apply", "--i-reviewed", fingerprint)
+        self.assertEqual(code, 0, err)
+        self.assertFalse(victim.exists())
+
+    def test_958_s10_five_kinds_of_wrong_fingerprint_are_each_refused(self):
+        victim = self.old("old-unnamed.log")
+        good = self.fingerprint()
+        cases = {"stale after a name change": None, "stale after a rule change": None, "empty": ("--i-reviewed", ""), "malformed": ("--i-reviewed", "not-a-hash"),
+                 "with --weekly": ("--apply", "--weekly", "--i-reviewed", good)}
+        refused = 0
+        for name in cases:
+            if name == "stale after a name change":
+                extra = self.old("old-extra.log")
+                argv = ("--apply", "--i-reviewed", good)
+            elif name == "stale after a rule change":
+                self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "temp_janitor": {"dir": str(self.temp), "days": 3}})
+                argv = ("--apply", "--i-reviewed", good)
+            elif name == "with --weekly":
+                argv = cases[name]
+            else:
+                argv = ("--apply",) + cases[name]
+            code, out, err = self.raw_cli(*argv)
+            self.assertNotEqual(code, 0, name)
+            self.assertTrue(victim.exists(), name)
+            refused += 1
+        self.assertEqual(refused, 5)
+        self.assertTrue(extra.exists())
+
+    def test_958_the_command_is_one_function_with_the_daemon(self):
+        self.assertIn("janitor.preview_fingerprint(janitor.rule_fingerprint(cfg)", inspect.getsource(sb.cmd_disk_janitor))
+
     def test_the_cap_per_call_and_a_failed_removal_are_said_and_a_failed_removal_is_not_audited(self):
         for i in range(3):
             self.old("capped-%d.txt" % i)
@@ -63728,6 +63777,42 @@ class TestWeeklyJobRewrite(Base):
         self.assertEqual(path.read_text(), text)
         self.assertEqual(self.backups(), [])
         self.assertIn("skipped", self.step(platform="linux"))
+
+    def test_958_s11_unreadable_symlink_none_and_a_second_run_change_nothing_and_the_first_backup_survives(self):
+        original = self.plist(self.OLD, "real.plist")[1]
+        os.symlink(str(self.agents / "real.plist"), str(self.agents / "link.plist"))
+        (self.agents / "real.plist").rename(self.agents / "real.txt")
+        before = {p.name: p.read_bytes() for p in self.agents.iterdir() if not p.is_symlink()}
+        locked, locked_text = self.plist(self.OLD, "locked.plist")
+        os.chmod(str(locked), 0)
+        try:
+            self.step()
+        finally:
+            os.chmod(str(locked), 0o644)
+        self.assertEqual(self.backups(), [])
+        self.assertEqual(locked.read_text(), locked_text, "an unreadable file is left as it is")
+        self.assertEqual({p.name: p.read_bytes() for p in self.agents.iterdir() if not p.is_symlink() and p.name != "locked.plist"}, before)
+        for p in list(self.agents.iterdir()):
+            p.unlink()
+        path, text = self.plist(self.OLD)
+        self.step()
+        first = (self.agents / self.backups()[0]).read_bytes()
+        self.step()
+        self.step()
+        self.assertEqual(len(self.backups()), 1)
+        self.assertEqual((self.agents / self.backups()[0]).read_bytes(), first)
+        self.assertEqual(first, text.encode())
+
+    def test_958_s7_the_documentation_snippet_is_what_the_installer_produces(self):
+        docs = (Path(sb.__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
+        start = docs.index("<?xml version", docs.index("com.example.fleet-disk-prune.plist"))
+        snippet = docs[start:docs.index("```", start)]
+        self.assertIn("%s disk prune</string>" % self.PROG, snippet)
+        old = snippet.replace("%s disk prune</string>" % self.PROG, "%s</string>" % self.OLD)
+        (self.agents / "x.plist").write_text(old)
+        self.step()
+        self.assertEqual((self.agents / "x.plist").read_text(), snippet)
+        self.assertEqual(len(re.findall(r"`--i-reviewed", docs)) > 0, True)
 
     def test_958_every_old_snippet_command_the_docs_ever_showed_has_no_janitor_apply_now(self):
         docs = (Path(sb.__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
@@ -72848,7 +72933,7 @@ class TestTempJanitorResume(Base):
         self.assertFalse(parser.parse_args(["disk", "janitor", "--apply"]).weekly)
         source = inspect.getsource(sb.cmd_disk_janitor)
         self.assertIn('weekly = bool(getattr(args, "weekly", False))', source)
-        self.assertEqual(source.count("weekly=weekly"), 2, "the preview and the apply read the same budget")
+        self.assertIn("weekly=weekly, outcome=preview", source)
 
     def test_a_dry_run_reads_the_cursor_and_never_moves_it_and_the_file_is_private(self):
         self.twelve()
