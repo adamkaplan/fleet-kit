@@ -34384,7 +34384,8 @@ class TestImpactHold(LedgerBase):
         rows = dict(re.findall(r"^\| `([a-z_]+)` \| (.+) \|$", section, re.M))
         self.assertEqual(rows, rule["rating_roots_why"], "docs/switchboard.md lists the matrix's roots with the matrix's words (0 differences)")
         self.assertEqual(sorted(rows), sorted(rule["rating_roots"]))
-        self.assertIn("rating_roots_why", rule["meaning"] if "meaning" in rule else json.dumps(sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]) + (sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"].get("meaning") or ""))
+        meaning = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]["meaning"] if "meaning" in sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"] else sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"].get("meaning", "")
+        self.assertIn("rating_roots_why", json.dumps(sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]))
         source = (BIN / "delegated_clear.py").read_text()
         for name in set(rule["rating_roots"]) | set(rule["closure_roots"]):
             if len(name) > 4:
@@ -34751,6 +34752,29 @@ class TestImpactHold(LedgerBase):
                 patcher.stop()
                 sb.cmd_impact_clear = original
             self.assertEqual(code, 1, err)
+        with self.subTest("a default of a function the clear runs by, and a method of a class it uses"):
+            import inspect
+            defaults_of = next(n for n in daemon_names if getattr(sb, n).__defaults__)   # a function of the closure with defaults
+            klass = next(v for n, v in sorted(vars(sb).items()) if inspect.isclass(v) and v.__module__ == sb.__name__ and any(inspect.isfunction(m) for m in vars(v).values()))
+            method = next(n for n, m in vars(klass).items() if inspect.isfunction(m))
+            def tweak_default(sub):
+                fn = getattr(sb, defaults_of)
+                fn.__defaults__ = tuple(reversed(fn.__defaults__)) if len(fn.__defaults__) > 1 else (object(),)
+            def tweak_method(sub):
+                original = getattr(klass, method)
+                setattr(klass, method, lambda *a, **k: original(*a, **k))
+            for label, registrar in (("a default", tweak_default), ("a method", tweak_method)):
+                fn = getattr(sb, defaults_of)
+                saved, original_method = fn.__defaults__, vars(klass)[method]
+                patcher = mock.patch.object(sb, "add_zzz_parsers", registrar, create=True)
+                patcher.start()
+                try:
+                    code, out, err = self.under()
+                finally:
+                    patcher.stop()
+                    fn.__defaults__ = saved
+                    setattr(klass, method, original_method)
+                self.assertEqual(code, 1, "%s: %s" % (label, err))
         with self.subTest("an action that is neither the clear nor the record"):
             patcher = mock.patch.object(sb, "add_zzz_parsers", self.reassign_registrar("dispatch"), create=True)
             patcher.start()

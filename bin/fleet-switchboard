@@ -27889,9 +27889,11 @@ def code_snapshot():
     def take(where, namespace):
         for name, value in list(namespace.items()):
             if isinstance(value, types.FunctionType):
-                held[(where, name)] = (value, value.__code__)
+                held[(where, name)] = (value, (value.__code__, value.__defaults__, tuple(sorted((value.__kwdefaults__ or {}).items(), key=lambda item: item[0]))))
             elif isinstance(value, type):
                 held[(where, name)] = (value, None)
+                for member, attribute in list(vars(value).items()):   # a method or attribute set on a held class
+                    held[(where + "." + name, member)] = (attribute, getattr(attribute, "__code__", None) if isinstance(attribute, types.FunctionType) else None)
     take("", globals())
     for module_name, module in list(sys.modules.items()):
         path = getattr(module, "__file__", None)
@@ -27902,9 +27904,12 @@ def code_snapshot():
 
 
 def code_replaced(before, after):
-    """[names] in `before` (a `code_snapshot`) that `after` no longer has as the same object with the same code."""
+    """[names] in `before` (a `code_snapshot`) that `after` no longer has as the same object with the same code, defaults and class members. Not held (the stated limit): module-level data mutated in place, a helper module first loaded after the snapshot, and
+    builtins or the standard modules this function itself uses: a guard against an ordinary edit, not a sandbox."""
     return sorted(("%s.%s" % key if key[0] else key[1]) if key[1] else "module " + key[0] for key, (obj, code) in before.items()
-                  if key not in after or after[key][0] is not obj or after[key][1] is not code)
+                  if key not in after or after[key][0] is not obj or not (after[key][1] is code or (isinstance(code, tuple) and after[key][1] == code)))
+
+
 COMMAND_NAME_RE = re.compile(r"[a-z][a-z0-9-]*")
 REGISTRAR_NAME_RE = re.compile(r"add_[a-z0-9_]+_parsers")
 COMMAND_ARGUMENTS = ("args", "runner", "now", "spawn", "socket_call", "wait")   # what a command function may ask for, by parameter name
