@@ -57935,8 +57935,46 @@ class TestHeavyCeilings(unittest.TestCase):
                 self.assertEqual(audited[0][2]["lane_told"], answer)
                 self.assertRegex(sent[0][1], r"^heavy: your full run \(pid 4242\) was stopped after \d+ s; its ceiling was 5400 s \(FLEET_HEAVY_MAX_SECONDS or heavy --ceiling asks for more, up to 14400\)$")
         raised = BoundedList()
-        self.hs.report_stop({"kind": "full", "pid": 1, "ran_seconds": 2, "ceiling_seconds": 1, "source": "wrapper"}, "h", "l", lambda *a: 1 / 0, lambda *a: raised.append(a))
+        self.hs.report_stop({"kind": "full", "pid": 1, "ran_seconds": 2, "ceiling_seconds": 1, "source": "wrapper"}, "h", "l", self.broken_sender, lambda *a: raised.append(a))
         self.assertEqual(raised[0][2]["lane_told"], "failed", "a sender that raises reads as failed")
+
+    @staticmethod
+    def broken_sender(lane, text):
+        raise KeyError("the sender is broken")
+
+    def test_the_express_slot_keeps_its_120_s_ceiling_whatever_the_kind(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for index in range(3):   # the three ordinary slots are busy: a --short run takes the express one
+            fd = os.open(os.path.join(tmp, "heavy-slot-%d.lock" % index), os.O_RDWR | os.O_CREAT, 0o600)
+            self.addCleanup(os.close, fd)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        test = self
+
+        class FakeChild:
+            pid = 4242
+
+            def __init__(child, argv, **kwargs):
+                pass
+
+            def wait(child):
+                test.exited.wait(30)
+                return -9
+        reads = BoundedList()
+
+        def table():
+            reads.append(1)
+            if len(reads) > 2 or self.exited.is_set():
+                self.exited.set()
+                return []
+            self.now[0] += 121
+            return [(4242, 1, os.getpgrp(), 1)]
+        dog = {"read_table": table, "pause": lambda s: False, "killpg": lambda n, g: self.exited.set(), "kill": lambda n, g: self.exited.set(), "lsof": lambda path: set(), "every": 0.0, "grace": 0.001, "sweep_pause": lambda s: None}
+        with mock.patch.object(self.hs.subprocess, "Popen", FakeChild):
+            code = self.hs.run(self.RUNNABLE["full"], tmp, 3, 5, "w", environ={"PATH": os.environ["PATH"]}, out=self.out, clock=lambda: self.now[0], sleep=lambda s: None,
+                               watchdog=dog, short=True, ceiling="99999", line={"start_of": lambda pid: "t0", "alive": lambda pid, start: True})
+        self.assertEqual(code, 124)
+        self.assertIn("time ceiling of 120 s", self.out.getvalue())
 
     def test_s13_neither_the_message_nor_the_line_carries_a_canary_in_any_of_three_forms(self):
         secret = self.canary()
