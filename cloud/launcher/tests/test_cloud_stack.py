@@ -409,7 +409,7 @@ class FreshNodeRace(Base):
         "before the ready line (pre-ready)": "test_a_stop_whose_secret_deletes_land_after_the_recreate_check_is_not_reported_ready",
     }
 
-    def test_every_stop_race_check_has_a_named_test(self):   # kills: a check listed here with no test
+    def test_every_stop_race_check_has_a_named_test(self):   # a guard only: the named tests exist (each check's mutant was run and dies)
         for check, name in self.STOP_RACE_CHECKS.items():
             with self.subTest(check=check):
                 self.assertTrue(callable(getattr(self, name, None)), name)
