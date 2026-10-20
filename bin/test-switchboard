@@ -186,7 +186,7 @@ def _live_pids():
         return set()
 
 
-_MADE_UP_BLOCK = [64]            # a test is given room for this many numbers above the base, or the helper wraps BEFORE its first number
+_MADE_UP_BLOCK = [1024]          # a test is given room for this many numbers above the base, or the helper wraps BEFORE its first number (no test asks for more: a test pins it)
 _MADE_UP_FRESH = [True]          # the next call is the first of a test (set at the start of every test run)
 _MADE_UP_TEST = [None]           # the id of the test that is running
 _MADE_UP_BY_TEST = {}            # test id -> the numbers it was given, in order: recorded WHERE THE HELPER IS CALLED, by any caller
@@ -58155,6 +58155,21 @@ class TestMadeUpPids(unittest.TestCase):
                     self.assertEqual(len(set(got)), 5)
                 if base > _pid_limit() - _MADE_UP_BLOCK[0] - 1:
                     self.assertLess(Asks.numbers[0][0], base)   # it wrapped, and before the first number of the test
+
+    def test_no_test_asks_for_more_numbers_than_the_reserve_and_the_hungriest_one_passes_from_any_base(self):
+        """The reserve is at least what any test asks (checked over every request recorded so far, by any caller), and the test that asks for the most, run from
+        bases inside and outside the last stretch of the range, passes: a test cannot run out of numbers because of where the machine's pids stand."""
+        module = sys.modules[__name__]
+        hungriest = max(_MADE_UP_BY_TEST, key=lambda test: len(_MADE_UP_BY_TEST[test]))
+        self.assertLessEqual(len(_MADE_UP_BY_TEST[hungriest]), _MADE_UP_BLOCK[0], hungriest)
+        name = "test_s6_no_number_is_given_twice_in_a_hundred_and_a_restarted_base_does_not_repeat"
+        self.assertGreaterEqual(len(_MADE_UP_BY_TEST.get("%s.%s.%s" % (__name__, type(self).__name__, name), [0] * 100)), 100)
+        for base in (200, _pid_limit() - 98, _pid_limit() - 68, _pid_limit() - 2, _pid_limit() - 1023, _pid_limit() - 1025):
+            result = unittest.TestResult()
+            with mock.patch.object(module, "_MADE_UP_NEXT", [base]):
+                type(self)(name).run(result)
+            with self.subTest(base=base):
+                self.assertEqual([str(e[0]) for e in result.failures + result.errors], [])
 
     def test_every_test_that_has_asked_for_numbers_so_far_in_this_process_was_given_them_in_ascending_order(self):
         """Recorded WHERE THE HELPER IS CALLED, by any caller (a fixture, a fake, a mixin): the registry holds every test that asked, with its numbers."""
