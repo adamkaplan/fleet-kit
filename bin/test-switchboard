@@ -11462,6 +11462,312 @@ class TestAgentShellCalls(Base):
         self.assertEqual(stat.S_IMODE(os.stat(str(self.state / "agent-calls-hours.json")).st_mode), 0o600)
 
 
+class TestShimReadCache(Base):
+    """#867 clauses 3 and 4: a repeated identical `gh api <path>` read is answered from a short cache and revalidated with the entity tag; a write by the same agent
+    drops it; below 15 percent of the budget the shim says so once and serves a cached read instead of spending."""
+
+    def setUp(self):
+        TestAgentShellCalls.setUp(self)
+        (self.bin / "gh").write_text(
+            "#!/bin/sh\n[ \"$1\" = auth ] && { echo faketoken; exit 0; }\necho \"$@\" >> \"$FAKE_LOG\"\n"
+            "case \"$*\" in\n *If-None-Match*) printf 'HTTP/2.0 304 Not Modified\\r\\n\\r\\n'; exit 0;;\n"
+            " \"api -i \"*) printf 'HTTP/2.0 200 OK\\r\\nEtag: \"v1\"\\r\\n\\r\\n{\"n\":1}'; exit 0;;\n"
+            " \"api \"*) printf '{\"n\":1}'; exit 0;;\nesac\necho wrote\nexit 0\n")
+        self.log = self.home / "fake.log"
+        self.other = self.home / "othersb"
+        self.other.write_text(self.sb.read_text().replace("worker", "other"))
+        self.other.chmod(0o755)
+
+    def run_shim(self, *args, env=None):
+        return TestAgentShellCalls.shim(self, *args, env=dict({"FAKE_LOG": str(self.log)}, **(env or {})))
+
+    def network(self):
+        return self.log.read_text().splitlines() if self.log.exists() else []
+
+    def age(self, seconds):
+        cache = self.state / "gh-read-cache"
+        for name in os.listdir(cache):
+            if name.startswith(".w-"):
+                mark = json.loads((cache / name).read_text())
+                mark["ts"] -= seconds   # an agent's write mark ages with the entries
+                (cache / name).write_text(json.dumps(mark))
+                continue
+            entry = json.loads((cache / name).read_text())
+            entry["ts"] -= seconds
+            (cache / name).write_text(json.dumps(entry))
+
+    def usage(self, remaining, limit=5000, account="acme-a"):
+        (self.state / "github-usage.json").write_text(json.dumps({"v": 1, "at": time.time(), "accounts": {account: {"used": limit - remaining, "remaining": remaining, "limit": limit, "reset": time.time() + 900}}}))
+
+    users = TestAgentShellCalls.users
+    shim_module = TestAgentShellCalls.shim_module
+    PATH = "repos/acme/app/issues/5"
+
+    def test_s3_a_repeated_read_is_served_from_the_cache_then_revalidated_and_a_304_is_not_counted(self):
+        first = self.run_shim("api", self.PATH)
+        second = self.run_shim("api", self.PATH)
+        self.assertEqual((first.stdout, second.stdout, second.returncode), ('{"n":1}', '{"n":1}', 0))
+        self.assertEqual(len(self.network()), 1, "2 reads, 1 network call")
+        self.age(31)
+        third = self.run_shim("api", self.PATH)
+        self.assertEqual(third.stdout, '{"n":1}')
+        self.assertEqual(len(self.network()), 2)
+        self.assertIn("If-None-Match: \"v1\"", self.network()[1])
+        self.assertEqual(len((self.state / "agent-calls.jsonl").read_text().splitlines()), 1, "the 304 is not counted as a call")
+
+    def test_s8_a_write_by_the_same_agent_drops_its_entries_and_another_agents_write_does_not(self):
+        self.run_shim("api", self.PATH)
+        self.run_shim("api", self.PATH)
+        self.assertEqual(len(self.network()), 1)
+        self.run_shim("api", self.PATH, env={"FLEET_SWITCHBOARD_BIN": str(self.other)})   # the other agent has its own entry (key includes the agent)
+        self.assertEqual(len(self.network()), 2)
+        self.run_shim("issue", "edit", "5", "-t", "x", env={"FLEET_SWITCHBOARD_BIN": str(self.other)})   # a write by the other agent
+        self.run_shim("api", self.PATH)
+        self.assertEqual(len([l for l in self.network() if l.startswith("api")]), 2, "the first agent's entry survived the other agent's write")
+        self.run_shim("issue", "edit", "5", "-t", "x")                                     # a write by the first agent
+        self.run_shim("api", self.PATH)
+        self.assertEqual(len([l for l in self.network() if l.startswith("api")]), 3, "its next read goes to GitHub")
+
+    def test_s4_below_15_percent_one_warning_a_cached_read_is_served_and_a_write_is_never_refused(self):
+        self.usage(500)
+        first = self.run_shim("api", self.PATH)
+        self.assertEqual(first.stderr.count("warning"), 1)
+        write = self.run_shim("issue", "edit", "5", "-t", "x")
+        self.assertEqual((write.returncode, write.stderr.count("warning")), (0, 0))      # one line a minute
+        self.age(20)                                                                      # past the write's grace window
+        self.run_shim("api", self.PATH)                                                   # the write dropped the entry: this read spends and stores
+        before = len(self.network())
+        self.age(100)                                                                     # older than the fresh bound, still in the stale bound
+        again = self.run_shim("api", self.PATH)
+        self.assertEqual((again.stdout, len(self.network())), ('{"n":1}', before), "served from the cache instead of spending")
+
+    def test_s5_s9_far_from_the_limit_output_and_exit_status_are_those_of_the_plain_call(self):
+        self.usage(3000)
+        for args in (("api", self.PATH), ("issue", "edit", "5", "-t", "x"), ("pr", "view", "3")):
+            plain = self.run_shim(*args, env={"FLEET_SHIM_CACHE": "off"})
+            now = self.run_shim(*args)
+            self.assertEqual((now.stdout, now.stderr, now.returncode), (plain.stdout, plain.stderr, plain.returncode), args)
+            self.assertNotIn("warning", now.stderr)
+
+    def test_s10_a_cache_that_cannot_be_written_still_reaches_gh(self):
+        (self.state / "gh-read-cache").write_text("not a directory")
+        (self.state / "agent-calls.jsonl").mkdir()
+        done = self.run_shim("api", self.PATH)
+        self.assertEqual((done.returncode, done.stdout, len(self.network())), (0, '{"n":1}', 1))
+
+    def test_edges_an_error_answer_garbage_a_corrupt_entry_and_a_304_with_no_entry_pass_through_and_cache_nothing(self):
+        gh = self.bin / "gh"
+        good = gh.read_text()
+        gh.write_text("#!/bin/sh\n[ \"$1\" = auth ] && { echo faketoken; exit 0; }\necho \"$@\" >> \"$FAKE_LOG\"\n"
+                      "case \"$FAKE_MODE\" in\n 404) printf 'HTTP/2.0 404 Not Found\\r\\n\\r\\n{\"message\":\"Not Found\"}'; echo 'gh: Not Found (HTTP 404)' >&2; exit 1;;\n"
+                      " garbage) printf 'not http at all'; exit 0;;\n 304) printf 'HTTP/2.0 304 Not Modified\\r\\n\\r\\n'; exit 0;;\nesac\nexit 0\n")
+        for mode, code, out in (("404", 1, '{"message":"Not Found"}'), ("garbage", 0, "not http at all"), ("304", 0, "")):
+            done = self.run_shim("api", self.PATH, env={"FAKE_MODE": mode})
+            self.assertEqual((done.returncode, done.stdout), (code, out), mode)
+            if mode == "404":
+                self.assertIn("HTTP 404", done.stderr)
+            cache = self.state / "gh-read-cache"
+            self.assertEqual([n for n in (os.listdir(cache) if cache.exists() else []) if n.endswith(".json")], [], mode)
+        gh.write_text(good)
+        self.run_shim("api", self.PATH)
+        cache = self.state / "gh-read-cache"
+        for name in os.listdir(cache):
+            (cache / name).write_text("{not json")
+        before = len(self.network())
+        self.assertEqual(self.run_shim("api", self.PATH).stdout, '{"n":1}')
+        self.assertEqual(len(self.network()), before + 1, "a corrupt entry is a miss")
+        self.age(700)
+        before = len(self.network())
+        self.run_shim("api", self.PATH)
+        self.assertEqual(len(self.network()), before + 1, "an entry older than the bound is a miss")
+
+    def test_edges_low_budget_with_no_entry_spends_and_a_stale_reading_is_ignored(self):
+        self.usage(100)
+        first = self.run_shim("api", self.PATH)
+        self.assertEqual((first.stdout, len(self.network())), ('{"n":1}', 1))          # nothing to serve: it spends, never refuses
+        (self.state / "github-usage.json").write_text(json.dumps({"v": 1, "at": time.time() - 3600, "accounts": {"acme-a": {"used": 4900, "remaining": 100, "limit": 5000, "reset": time.time()}}}))
+        shutil.rmtree(str(self.state / "gh-low-warned"), ignore_errors=True)
+        self.age(100)
+        again = self.run_shim("api", self.PATH)
+        self.assertEqual((again.stderr, len(self.network())), ("", 2), "a reading an hour old is ignored: no warning, and the stale entry is revalidated")
+
+    def test_edges_a_path_that_names_the_working_directory_or_a_host_is_not_cached(self):
+        self.run_shim("api", "repos/{owner}/{repo}/issues")
+        self.run_shim("api", self.PATH, env={"GH_HOST": "ghe.example"})
+        cache = self.state / "gh-read-cache"
+        self.assertEqual([n for n in (os.listdir(cache) if cache.exists() else []) if n.endswith(".json")], [])
+
+    def test_edges_a_failed_output_after_the_request_never_makes_a_second_request(self):
+        module = self.shim_module()
+        calls = []
+        real_run = module.subprocess.run
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, b'HTTP/2.0 200 OK\r\nEtag: "v1"\r\n\r\n{"n":1}', b"")
+
+        class Broken:
+            def isatty(self):
+                return False
+
+            @property
+            def buffer(self):
+                raise BrokenPipeError("closed")
+
+        os.environ["FLEET_SWITCHBOARD_STATE"] = str(self.state)
+        self.addCleanup(os.environ.pop, "FLEET_SWITCHBOARD_STATE", None)
+        with mock.patch.object(module.subprocess, "run", fake_run), mock.patch.object(module.sys, "stdout", Broken()):
+            status = module.cached_read("gh", {}, ["api", self.PATH], "worker", "acme-a", None)
+        self.assertEqual((status, len(calls)), (0, 1))
+
+    def test_m2_paths_that_report_a_state_are_never_cached_in_any_spelling(self):
+        forms = ["rate_limit", "/rate_limit", "rate_limit?x=1", "RATE_LIMIT", "rate_limit/", "https://api.github.com/rate_limit", "%72ate_limit", "%2572ate_limit", "repos/../rate_limit",
+                 "api/v3/rate_limit", "user", "user/", "applications/abc/token", "installation/repositories", "notifications",
+                 "repos/acme/app/commits/abc/check-runs", "repos/acme/app/commits/abc/status", "repos/acme/app/actions/runs/1", "repos/acme/app/actions/jobs/2"]
+        for form in forms:
+            self.log.write_text("") if self.log.exists() else None
+            self.run_shim("api", form)
+            self.run_shim("api", form)
+            self.assertEqual(len(self.network()), 2, form)
+            cache = self.state / "gh-read-cache"
+            self.assertEqual([n for n in (os.listdir(cache) if cache.exists() else []) if n.endswith(".json")], [], form)
+
+    def test_m2_the_table_is_what_the_shim_denies(self):
+        module = self.shim_module()
+        for word in module.NEVER_CACHED:
+            self.assertTrue(module.never_cached("repos/o/n/%s" % word) or module.never_cached(word), word)
+            self.assertIsNone(module.cacheable_read(["api", "/%s/" % word.upper()]), word)
+        self.assertIsNotNone(module.cacheable_read(["api", "repos/acme/app/issues/5"]))
+        self.assertIsNotNone(module.cacheable_read(["api", "repos/user/status/issues/1"]), "an owner or repository NAMED like a state word is still a name")
+
+    def test_m1_a_read_in_flight_across_a_write_by_the_same_agent_never_stores_its_old_answer(self):
+        module = self.shim_module()
+        os.environ["FLEET_SWITCHBOARD_STATE"] = str(self.state)
+        self.addCleanup(os.environ.pop, "FLEET_SWITCHBOARD_STATE", None)
+        out = io.BytesIO()
+
+        class Out:
+            def isatty(self):
+                return False
+            buffer = out
+
+        for write_finishes_first in (True, False):
+            shutil.rmtree(str(self.state / "gh-read-cache"), ignore_errors=True)
+
+            def slow_read(argv, **kw):
+                module.cache_drop("worker")                      # the same agent's write begins while the request is in flight
+                if write_finishes_first:
+                    module.cache_mark("worker")                  # and ends before the read does
+                return subprocess.CompletedProcess(argv, 0, b'HTTP/2.0 200 OK\r\nEtag: "v1"\r\n\r\n{"old":1}', b"")
+
+            with mock.patch.object(module.subprocess, "run", slow_read), mock.patch.object(module.sys, "stdout", Out()):
+                module.cache_directory(create=True)
+                os.utime(str(self.state / "gh-read-cache"))
+                status = module.cached_read("gh", {}, ["api", self.PATH], "worker", "acme-a", None)
+            self.assertEqual(status, 0)
+            cache = self.state / "gh-read-cache"
+            self.assertEqual([n for n in os.listdir(cache) if n.endswith(".json")], [], "the pre-write answer was not stored (write finishing first: %s)" % write_finishes_first)
+
+    def test_m1_a_read_made_inside_the_grace_window_after_a_write_goes_to_github_and_stores_nothing(self):
+        self.run_shim("api", self.PATH)
+        self.run_shim("issue", "edit", "5", "-t", "x")
+        before = len(self.network())
+        self.run_shim("api", self.PATH)
+        self.run_shim("api", self.PATH)
+        self.assertEqual(len(self.network()), before + 2)
+        self.age(20)
+        self.run_shim("api", self.PATH)
+        self.run_shim("api", self.PATH)
+        self.assertEqual(len(self.network()), before + 3, "after the window the cache works again")
+
+    def test_cross_calls_two_accounts_do_not_share_and_a_paginated_read_is_not_served_from_the_cache(self):
+        self.run_shim("api", self.PATH)
+        self.users({"acme/app": "acme-b"})
+        self.run_shim("api", self.PATH)
+        self.assertEqual(len(self.network()), 2, "another account is another key")
+        self.run_shim("api", self.PATH, "--paginate")
+        self.assertEqual(len(self.network()), 3, "a call of another shape is never answered from the cache")
+
+    def overlapped(self, module, entry_age, answer, write_between=True):
+        """Run cached_read for a path with an entry of `entry_age` seconds, while a write by the same agent happens during the request. Returns (status, files left)."""
+        os.environ["FLEET_SWITCHBOARD_STATE"] = str(self.state)
+        self.addCleanup(os.environ.pop, "FLEET_SWITCHBOARD_STATE", None)
+        shutil.rmtree(str(self.state / "gh-read-cache"), ignore_errors=True)
+        directory = module.cache_directory(create=True)
+        file = module.cache_file(directory, "worker", "acme-a", self.PATH)
+        module.cache_store(directory, file, '"v1"', '{"old":1}', time.time() - entry_age)
+        out = io.BytesIO()
+
+        class Out:
+            def isatty(self):
+                return False
+            buffer = out
+
+        def request(argv, **kw):
+            if write_between:
+                module.cache_drop("worker")   # the same agent writes while the request is in flight
+            return subprocess.CompletedProcess(argv, 0, answer, b"")
+
+        with mock.patch.object(module.subprocess, "run", request), mock.patch.object(module.sys, "stdout", Out()):
+            status = module.cached_read("gh", {}, ["api", self.PATH], "worker", "acme-a", None)
+        return status, [n for n in os.listdir(directory) if n.endswith(".json")], out.getvalue()
+
+    def test_every_store_of_the_cache_is_guarded_by_the_write_mark_and_each_is_pinned(self):
+        """Completeness: the shim's cache is written in exactly these places; a new one must be added here with an overlapped test."""
+        source = SHIM.read_text()
+        self.assertEqual(source.count("cache_store("), 3, "one definition and two call sites (the 304 refresh and the 2xx store): pin any new one below")
+        self.assertEqual(source.count("not raced"), 2, "both call sites are behind the write mark")
+        module = self.shim_module()
+        # the 304 refresh: an old entry is revalidated while the same agent writes: nothing is rewritten, and the next read goes to GitHub
+        status, files, out = self.overlapped(module, 40, b"HTTP/2.0 304 Not Modified\r\n\r\n")
+        self.assertEqual((status, files), (0, []))
+        # the 2xx store: same overlap
+        status, files, out = self.overlapped(module, 40, b'HTTP/2.0 200 OK\r\nEtag: "v2"\r\n\r\n{"new":1}')
+        self.assertEqual((status, files, out), (0, [], b'{"new":1}'))
+        # and with no write in between both are stored (the guard is not a blanket refusal)
+        status, files, out = self.overlapped(module, 40, b"HTTP/2.0 304 Not Modified\r\n\r\n", write_between=False)
+        self.assertEqual((status, len(files), out), (0, 1, b'{"old":1}'))
+        # the drop itself removes only this agent's entries
+        directory = module.cache_directory()
+        other = module.cache_file(directory, "someone", "acme-a", self.PATH)
+        module.cache_store(directory, other, None, "{}", time.time())
+        module.cache_drop("worker")
+        self.assertTrue(os.path.exists(other))
+
+    def test_m2_double_percent_encoding_is_read_as_what_it_decodes_to(self):
+        module = self.shim_module()
+        self.assertEqual(module.normal_api_path("%2572ate_limit"), ["rate_limit"])
+        self.assertTrue(module.never_cached("%2572ate_limit"))
+
+    def test_the_cache_is_private_and_holds_no_token(self):
+        self.run_shim("api", self.PATH, env={"GH_TOKEN": "secrettoken"})
+        cache = self.state / "gh-read-cache"
+        self.assertEqual(stat.S_IMODE(os.stat(str(cache)).st_mode), 0o700)
+        for name in os.listdir(cache):
+            self.assertEqual(stat.S_IMODE(os.stat(str(cache / name)).st_mode), 0o600)
+            self.assertNotIn("acme", name)
+            for leak in ("secrettoken", "faketoken", "acme-a"):
+                self.assertNotIn(leak, (cache / name).read_text())
+
+    def test_only_the_plain_get_shape_is_cached_and_the_cache_is_bounded(self):
+        self.run_shim("api", self.PATH, "--jq", ".n")
+        self.run_shim("api", self.PATH, "-X", "GET")
+        self.run_shim("pr", "view", "3")
+        self.assertFalse((self.state / "gh-read-cache").exists() and os.listdir(self.state / "gh-read-cache"))
+        module = TestAgentShellCalls.shim_module(self)
+        directory = self.state / "gh-read-cache"
+        directory.mkdir(exist_ok=True)
+        module.CACHE_FILES_MAX = 10
+        for i in range(15):
+            module.cache_store(str(directory), str(directory / ("a%02d.json" % i)), None, "{}", time.time())
+        self.assertLessEqual(len([n for n in os.listdir(directory) if n.endswith(".json")]), 10)
+        old = directory / "old.json"
+        old.write_text("{}")
+        os.utime(str(old), (time.time() - 3600, time.time() - 3600))
+        module.cache_store(str(directory), str(directory / "new.json"), None, "{}", time.time())
+        self.assertFalse(old.exists(), "an entry older than the age bound is removed")
+
+
 class TestIntentReader(IntentCase):
     def test_reads_the_intent_lines_of_an_issue(self):
         issue = self.reader.issue(2)
