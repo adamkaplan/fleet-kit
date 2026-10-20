@@ -241,7 +241,9 @@ def health_write(engine, state, now):
         state = state if state is not None else getattr(engine, "ci_record_state", None)
         recorder.ingest_prs(getattr(state, "pr_state", None))
         records = load_health_records()
-        body = recorder.body(records.read_tool_file(engine.state_dir), light=bool((getattr(engine, "config", None) or {}).get("v2_light")), watched=health_watched_repos(engine.state_dir))
+        listed = registry_read(engine.state_dir)   # the records are a view of the registry: only its agents' sessions; a read that is not whole drops nothing
+        body = recorder.body(records.read_tool_file(engine.state_dir), light=bool((getattr(engine, "config", None) or {}).get("v2_light")), watched=health_watched_repos(engine.state_dir),
+                             retired_sessions={r.get("session") for r in listed["retired"].values() if r.get("session")} if listed["whole"] else None)
         state_write(Path(engine.state_dir) / records.FILE, json.dumps(body, sort_keys=True), _without(body, "written_at"), HEARTBEAT_PR_STATE, nofollow=True)
     except Exception as err:
         _health_fault(engine, "write", err)
@@ -6748,26 +6750,50 @@ def known_agent(state_dir, name, known=None):
 
 def known_session(state_dir, name, known):
     """The session of a fleet agent: the pane record's, else the retired record's."""
-    return known_agent(state_dir, name, known).get("session") or (read_retired(state_dir).get(name) or {}).get("session")
+    found = known_agent(state_dir, name, known).get("session")
+    return found or (registry_retired(state_dir).get(name) or {}).get("session")
 
 
 def read_retired(state_dir):
-    """The retired map, from the registry (`retired.json` is derived output of it now); a registry that is not whole reads as empty (display only)."""
-    return {k: v for k, v in load_module("registry").read(state_dir)["retired"].items() if isinstance(v, dict)}
+    """The retired map from the registry, the name `reassign.py` loads (display only: a registry that is not whole reads as empty). The same read as `registry_retired`."""
+    return registry_retired(state_dir)
 
 
 class RetiredUnreadable(Exception):
-    """retired.json exists but cannot be read as the {name: record} map it is (#372): for the tester gate that is NOT the same as an empty list."""
+    """The registry cannot be read whole (#372): for the tester gate that is NOT the same as an empty list of retired agents."""
+
+
+def registry_read(state_dir):
+    """THE read of the agent list: `registry.read` (docs/agent-registry.md, sec. 1), the one source every view uses. Never raises: a registry that cannot
+    be loaded or read is a read that is not whole ({"whole": False, "agents": {}, "retired": {}, "problem": ...}); a caller that ACTS on the list acts
+    only when `whole` is true (#805). `retired` is {name: record} (an additive field of the read)."""
+    try:
+        got = load_module("registry").read(str(state_dir))
+    except Exception as err:   # the module is missing or broken: nothing is read, and the problem is said
+        return {"whole": False, "version": 0, "agents": {}, "retired": {}, "problem": "the agent registry cannot be read: %s" % _one_line(str(err), 120)}
+    got = got if isinstance(got, dict) else {}
+    return {"whole": got.get("whole") is True, "version": got.get("version") or 0,
+            "agents": {n: a for n, a in (got.get("agents") or {}).items() if isinstance(a, dict)},
+            "retired": {n: r for n, r in (got.get("retired") or {}).items() if isinstance(r, dict)},
+            "problem": got.get("problem")}
+
+
+def registry_retired(state_dir):
+    """{name: retired record} from the registry: a display's read (a read that is not whole lists nobody)."""
+    return registry_read(state_dir)["retired"]
 
 
 def read_retired_strict(state_dir):
-    """The retired map, or RetiredUnreadable. A registry that is MISSING is an empty map (nobody retired); one that is not whole (corrupt, newer version,
-    unreadable) raises. `read_retired` reads all of those as empty, which is right for a display but would let a retired tester record verdicts again:
-    the verdict authority (launch-record testers) uses this one and fails closed."""
-    reg = load_module("registry").read(state_dir)
-    if not reg["whole"]:
-        raise RetiredUnreadable(reg["problem"] or "the agent registry cannot be read")
-    return {k: v for k, v in reg["retired"].items()}
+    """The name the adoption and close code loads: the same strict read as `registry_retired_strict`."""
+    return registry_retired_strict(state_dir)
+
+
+def registry_retired_strict(state_dir):
+    """As `registry_retired`, but a read that is not whole raises RetiredUnreadable: the verdict authority fails closed (#372)."""
+    got = registry_read(state_dir)
+    if not got["whole"]:
+        raise RetiredUnreadable(got["problem"] or "the agent registry is not whole")
+    return got["retired"]
 
 
 def _prune_last_reports(data):
@@ -7164,9 +7190,11 @@ def pane_health_status_lines(state_dir, now=None):
     """The `status` lines for detached or dead agents (nothing when every pane is attached or unknown)."""
     if state_dir is None:
         return []
-    data = read_pane_health(state_dir)
-    retired = read_retired(state_dir)
-    bad = [(n, v) for n, v in sorted(data["states"].items()) if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in retired]
+    seen = registry_read(state_dir)
+    if not seen["whole"]:
+        return ["      panes      the agent registry could not be read (%s): no pane state shown" % _one_line(str(seen["problem"]), 120)]
+    retired = seen["retired"]
+    bad = [(n, v) for n, v in sorted(seen["agents"].items()) if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in retired]
     clock = time.time() if now is None else now
     last = _read_small(state_dir, LAST_REPORT_FILE)
     gone = [n for n, v in sorted(retired.items()) if clock - (v.get("at") or 0) <= RETIRED_SHOW_DAYS * 86400]
@@ -7335,8 +7363,11 @@ def verify_account(engine, runner, fleet):
 def cmd_reattach_all(args, runner, now, socket_call=None):
     """`reattach --all-detached`: every agent the daemon found detached or dead, one by one; each failure is said and the rest continue."""
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
-    retired = read_retired(state)
-    names = sorted(n for n, v in read_pane_health(state)["states"].items() if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in retired)
+    listed = registry_read(state)   # the same list `status` shows: the registry's agents that are detached or dead (never pane-health.json); a read that is not whole acts on nothing
+    if not listed["whole"]:
+        sys.stderr.write("%s: the agent registry could not be read (%s): nothing reattached\n" % (PROG, _one_line(str(listed["problem"]), 120)))
+        return EXIT_ERROR
+    names = sorted(n for n, v in listed["agents"].items() if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in listed["retired"])
     if not names:
         print("no agent is detached or dead")
         return EXIT_OK
@@ -7786,7 +7817,7 @@ def cmd_retire(args, runner, now):
     if not NAME_RE.match(name or ""):
         raise LaunchError("name the agent: `%s retire <name>`" % PROG)
     discovery = engine.discover(engine.now())
-    hint = ((read_retired(state).get(name) or {}).get("session") if args.undo else None)   # a retired headless worker is not discovered: its boss is found from its stored session
+    hint = ((registry_retired(state).get(name) or {}).get("session") if args.undo else None)   # a retired headless worker is not discovered: its boss is found from its stored session
     who = reattach_caller_problem(engine, runner, now, discovery, name, hint, lost_headless=not args.undo)
     if who:
         if engine.audit is not None:
@@ -8063,10 +8094,13 @@ def worktree_session_in_use(engine, root):
     from an incomplete (too long) list; a session missing from a complete list is gone and is no one's directory."""
     if engine.state_dir is None:
         return None
-    retired = read_retired(engine.state_dir)
+    seen = registry_read(engine.state_dir)
+    if not seen["whole"]:
+        return "cannot read the agent registry (%s): cannot say no session runs in it" % _one_line(str(seen["problem"]), 80)
+    retired = seen["retired"]
     known = {}
-    for name, info in load_module("registry").read(engine.state_dir)["agents"].items():   # the registry's local agents (a cloud worker's session is not in the local service)
-        if isinstance(info, dict) and isinstance(info.get("session"), str) and (info.get("kind") or "local") == "local":
+    for name, info in seen["agents"].items():   # the registry's local agents (a cloud worker's session is not in the local service)
+        if isinstance(info.get("session"), str) and (info.get("kind") or "local") == "local":
             known[name] = info["session"]
     for name, obs in (getattr(getattr(engine, "discovery", None), "agents", None) or {}).items():
         if getattr(obs, "session_id", None):
@@ -8174,7 +8208,7 @@ def cmd_disk_reclaim_worktrees(args, runner, now):
             raise LaunchError("refused: only the operator or the Chief of Staff may --apply a worktree reclaim (%s is %s)" % (kind[1], "an agent" if kind[0] == "agent" else "not known"))
         if not worktree_config(config)["enabled"]:
             raise LaunchError("worktree reclaim is switched off (worktree_reclaim.enabled is false)")
-    retired = read_retired(state)
+    retired = registry_retired(state)
     registry = read_worktrees(state)
     todo = {p: e for p, e in registry.items() if isinstance(e, dict) and e.get("agent") in retired}
     removed = kept = 0
@@ -8466,7 +8500,7 @@ def bare_pane_context(engine, discovery, pane, now):
     entry = next((p for p in engine.herdr.pane_list() if isinstance(p, dict) and p.get("pane_id") == pane), None)
     held = [a for a in engine.herdr.agent_list() if isinstance(a, dict) and a.get("pane_id") == pane]
     processes = engine.herdr.pane_process_info(pane) if entry is not None else []
-    health = read_pane_health_strict_agents(engine.state_dir)
+    health = registry_agents_strict(engine.state_dir)   # the registry, never pane-health.json: a pane an agent holds is its pane
     worktrees = {os.path.realpath(p) for p in read_worktrees(engine.state_dir)}   # the REGISTERED worktrees only: an agent's own cwd is often the repo root the owner works in too
     window = engine.config.get("retire_idle_minutes")
     window = window if retire_idle_window_ok(window) else BARE_IDLE_DEFAULT_MINUTES
@@ -8474,22 +8508,12 @@ def bare_pane_context(engine, discovery, pane, now):
             "window": window, "now": now, "seen": (_read_small(engine.state_dir, BARE_PANES_FILE).get(pane) or None)}
 
 
-def read_pane_health_strict_agents(state_dir):
-    """pane-health.json for the close-pane guards: unreadable or damaged raises HerdrError (refuse), a missing file is no agents."""
-    try:
-        with open(str(Path(state_dir) / PANE_HEALTH_FILE), "rb") as handle:
-            raw = handle.read(1000001)
-    except FileNotFoundError:
-        return {"agents": {}}
-    except OSError as err:
-        raise HerdrError("unreadable", "%s cannot be read: %s" % (PANE_HEALTH_FILE, getattr(err, "strerror", None) or type(err).__name__)) from None
-    try:
-        data = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeError):
-        raise HerdrError("unreadable", "%s is not valid JSON" % PANE_HEALTH_FILE) from None
-    if not isinstance(data, dict) or not isinstance(data.get("agents"), dict) or not all(isinstance(v, dict) for v in data["agents"].values()):
-        raise HerdrError("unreadable", "%s is not a pane-health record" % PANE_HEALTH_FILE)
-    return data
+def registry_agents_strict(state_dir):
+    """The registry's agents for the close-pane guards: a read that is not whole raises HerdrError (refuse); a missing registry is no agents."""
+    got = registry_read(state_dir)
+    if not got["whole"]:
+        raise HerdrError("unreadable", "the agent registry cannot be read: %s" % _one_line(str(got["problem"]), 120))
+    return {"agents": got["agents"]}
 
 
 def bare_pane_problem(engine, discovery, pane, now):
@@ -8602,7 +8626,7 @@ def cmd_read(args, runner, now):
 
 def watch_problem(engine, state, name, discovery):
     """None when `watch` may open a terminal on `name`, else one line: the worker is unknown or retired, or a terminal already runs it (named)."""
-    if name in read_retired(state):
+    if name in registry_retired(state):
         return "%s is retired (a finished worker): nothing to watch" % name
     seen = discovery.agents.get(name)
     if seen is None:
@@ -8621,7 +8645,7 @@ def cmd_watch(args, runner, now, socket_call=None):
     if not NAME_RE.match(name or ""):
         raise LaunchError("name the worker: `%s watch <name>`" % PROG)
     discovery = engine.discover(engine.now())
-    if name in read_retired(state):   # said first: a retired worker is not discovered, so the caller rule could only say "not your worker"
+    if name in registry_retired(state):   # said first: a retired worker is not discovered, so the caller rule could only say "not your worker"
         raise LaunchError("refused: %s is retired (a finished worker): nothing to watch" % name)
     who = reattach_caller_problem(engine, runner, now, discovery, name)
     if who:
@@ -9551,7 +9575,7 @@ class WorkerFacts:
             return []
         if not self.seam_applies(observation, issue):
             return []   # #793: only a coder or tester on a work item or an ask; anything not readable fails toward not nudging
-        kept = read_retired(state_dir).get(observation.name)
+        kept = registry_retired(state_dir).get(observation.name)
         if kept is not None and kept.get("session") in (None, observation.session_id):
             return []   # retired on purpose
         last = _read_small(state_dir, LAST_REPORT_FILE).get(observation.name)
@@ -9590,7 +9614,7 @@ class WorkerFacts:
         last = _read_small(state_dir, LAST_REPORT_FILE).get(observation.name)
         if not isinstance(last, dict) or last.get("state") != "working" or not _is_number(last.get("work_since")) or not isinstance(last.get("work_n"), int):
             return []   # a blocked, question or closing report (or none) is not this case
-        kept = read_retired(state_dir).get(observation.name)
+        kept = registry_retired(state_dir).get(observation.name)
         if kept is not None and kept.get("session") in (None, observation.session_id):
             return []
         repo = _fleet_repo(observation.fleet, engine.config) or engine.config.get("intent_repo")
@@ -9829,7 +9853,7 @@ def triage_stop(engine, source, observation, boss, idle_ms, reply):
     if now - observation.idle_at > engine.config["rider_max_age_seconds"]:
         return None  # a stop that old is not news, and a nudge would be late
     if engine.state_dir is not None:   # a RETIRED worker is finished on purpose: no nudge, no "stopped without reporting" to its boss (no state dir: triaged as before)
-        kept = read_retired(engine.state_dir).get(observation.name)
+        kept = registry_retired(engine.state_dir).get(observation.name)
         if kept is not None and kept.get("session") in (None, observation.session_id):
             return None
     boss_view = engine.discovery.agents.get(boss) if engine.discovery else None
@@ -10613,6 +10637,7 @@ def decisions_from_reports(engine, now):
     since = now - engine.config["decisions_lookback_hours"] * 3600
     bosses = sorted({resolve_boss(discovery, _boss_of(o)) for o in discovery.agents.values() if _boss_of(o)})
     repos = decision_repos(engine)
+    listed = registry_read(engine.state_dir) if engine.state_dir is not None else {"whole": False, "retired": {}}   # the decisions view: who is still an agent comes from the registry
     items, problems, sends, unread = [], [], {}, {}
     for boss in bosses:
         observation = discovery.agents.get(boss)
@@ -10644,8 +10669,8 @@ def decisions_from_reports(engine, now):
                                 "repo": item.get("repo") or _fleet_repo(sender.fleet, engine.config), "session": None})
         reports.sort(key=lambda r: r["at"])
         for report in reports:
-            if report["state"] not in ("question", "blocked") or report["sender"] not in discovery.agents:
-                continue  # not a decision, or the worker that asked no longer runs: no one is waiting
+            if report["state"] not in ("question", "blocked") or report["sender"] not in discovery.agents or (listed["whole"] and report["sender"] in listed["retired"]):
+                continue  # not a decision, or the worker that asked is retired in the registry (or no longer runs): no one is waiting; a read that is not whole drops nothing
             worker = report["sender"]
             if worker not in unread:
                 try:
@@ -15111,7 +15136,7 @@ def testers_status(config, agents, fleets, state):
         repo_of = lambda fleet: _fleet_repo(fleet, config)
         repos = {repo_of(fleet) for fleet in fleets.values() if isinstance(fleet, dict) and fleet.get("role") == "orchestrator"} - {None}
         try:
-            retired = read_retired_strict(state)
+            retired = registry_retired_strict(state)
         except RetiredUnreadable:
             return ["      testers    retired file unreadable: launch-record testers disabled"]   # the same fail-closed rule the verdict gate applies
         return load_launch_testers().status_lines(config.get("plan_evaluators"), fleets, sessions, repos, repo_of, retired)
@@ -21098,7 +21123,7 @@ def launched_testers_for(ctx):
     except Exception:
         return {}, {}, {}
     try:
-        retired = read_retired_strict(ctx.engine.state_dir) if ctx.engine.state_dir is not None else {}
+        retired = registry_retired_strict(ctx.engine.state_dir) if ctx.engine.state_dir is not None else {}
     except Exception as err:   # a corrupt retired file could hide a retired tester: no launched tester counts, loudly (audit; `status` says so too)
         ctx.engine._note("testers.retired_unreadable", None, {"error": _one_line(str(err), 160), "effect": "launch-record testers disabled"})
         return {}, sessions, fleets
@@ -21454,7 +21479,7 @@ def item_agents(ctx):
         fleets = {name: (seen.fleet or {}) for name, seen in agents.items()}
         sessions = {name: seen.session_id for name, seen in agents.items()}
         state_dir = getattr(ctx.engine, "state_dir", None)
-        retired = read_retired_strict(state_dir) if state_dir is not None else {}
+        retired = registry_retired_strict(state_dir) if state_dir is not None else {}
     except Exception as err:
         raise ItemAgentsUnreadable("the running agents cannot be read (%s: %s)" % (type(err).__name__, _one_line(str(err), 120))) from None
     return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions, fleets
@@ -25055,6 +25080,91 @@ PREFLIGHT_CLASSES = (
     ("public-names", 60, (("python3", "bin/check-public-names"),), None),
     ("cloud", 600, (("bin/test-cloud-worker",), ("bin/test-cloud-launcher",), ("cloud/tests/test-cloud",)), "cloud/"),
 )
+# The preflight sub-checks CI runs for the pull request itself (#942): (command, the name it is shown by). Each row is skipped, with a line that says so, when the
+# workflow at the base runs that command on `pull_request`; every other sub-check of PREFLIGHT_CLASSES always runs. Not being able to tell is a run.
+PREFLIGHT_CI_SKIPS = (("bin/test-cloud-launcher", "cloud launcher"),)
+PREFLIGHT_WORKFLOW = ".github/workflows/test.yml"
+PREFLIGHT_STEP_IF = ("${{ !cancelled() }}", "${{ always() }}", "${{ success() }}", "${{ success() || failure() }}", "always()", "success()")   # a step condition that still runs it
+
+
+PREFLIGHT_JOB_KEYS_HIDING = ("if", "continue-on-error")   # job-level keys after which a failure of the job cannot fail CI (or the job may not run): the job does not count
+PREFLIGHT_SWALLOW = r"\|\|\s*(true|:|exit 0)\b|\bset\s+\+e\b"   # a run line that swallows the command's failure
+
+
+def job_hides(line):
+    """True for a job-level key (four spaces) of PREFLIGHT_JOB_KEYS_HIDING that can hide the job's failure: any `if`, any `continue-on-error` other than false."""
+    key = re.match(r"    (%s)\s*:\s*(.*)$" % "|".join(re.escape(k) for k in PREFLIGHT_JOB_KEYS_HIDING), line)
+    return bool(key) and not (key.group(1) == "continue-on-error" and re.match(r"false\b", key.group(2).strip()))
+
+
+def workflow_job_running(text, command):
+    """The name of a job of the workflow `text` that runs `command` on `pull_request`, or None when it cannot be told: a text-only reading (no YAML library), the
+    safe side being None. The job needs no job-level `if`; the step that runs the command needs no `continue-on-error` and no condition but one of PREFLIGHT_STEP_IF."""
+    lines = text.splitlines()
+    try:
+        top = next(i for i, line in enumerate(lines) if re.match(r"on\s*:", line))
+        jobs = next(i for i, line in enumerate(lines) if line.rstrip() == "jobs:")
+    except StopIteration:
+        return None
+    head = lines[top]
+    block = [head] + [line for line in lines[top + 1:jobs] if line.startswith((" ", "\t")) or not line.strip()]
+    if not any(re.match(r"\s*(on\s*:\s*)?(\[.*\bpull_request\b.*\]|pull_request\s*:?)\s*(#.*)?$", line) or re.match(r"on\s*:.*\bpull_request\b", line) for line in block if not line.lstrip().startswith("#")):
+        return None
+    for number, line in enumerate(block):   # a filter under the trigger (paths, branches, types ...) or an inline mapping: CI may not run for this pull request
+        if re.match(r"\s+pull_request\s*:\s*(#.*)?$", line):
+            indent = len(line) - len(line.lstrip())
+            nested = [l for l in block[number + 1:] if l.strip() and not l.lstrip().startswith("#")][:1]
+            if nested and len(nested[0]) - len(nested[0].lstrip()) > indent:
+                return None
+        if re.match(r"on\s*:.*\{", line) or re.match(r"\s+pull_request\s*:\s*\S", line) and not re.match(r"\s+pull_request\s*:\s*(#.*)?$", line):
+            return None
+    name, found = None, []
+    for line in lines[jobs + 1:]:
+        if line and not line.startswith(" ") and not line.startswith("#"):
+            break
+        job = re.fullmatch(r"  ([A-Za-z0-9_-]+):\s*", line)
+        if job:
+            name = job.group(1)
+            found.append((name, []))
+        elif found:
+            found[-1][1].append(line)
+    for name, body in found:
+        if any(job_hides(line) for line in body):
+            continue
+        steps, current = [], None
+        for line in body:
+            if re.match(r"      - ", line):
+                current = [line]
+                steps.append(current)
+            elif current is not None:
+                current.append(line)
+        for step in steps:
+            live = [line for line in step if not line.lstrip().startswith("#") and not re.match(r"\s*(- )?name\s*:", line)]
+            runs = [re.sub(r"^\s*(- )?(run\s*:\s*(\|[-+]?\s*)?)?", "", line) for line in live]
+            starts = [line for line in runs if re.match(r"%s(\s|$)" % re.escape(command), line)]   # the command is the FIRST word of a line, not a mention
+            if not starts:
+                continue
+            conditions = [re.sub(r"^\s*(- )?if\s*:\s*", "", line).strip() for line in step if re.match(r"\s*(- )?if\s*:", line)]
+            hidden = any(re.match(r"\s*(- )?continue-on-error\s*:\s*(?!false\b)", line) for line in step) or any(c not in PREFLIGHT_STEP_IF for c in conditions)
+            if hidden or any(re.search(PREFLIGHT_SWALLOW, line) for line in runs):
+                continue
+            return name
+    return None
+
+
+def preflight_ci_runs(runner, root, command, changed):
+    """The job name when CI runs `command` for this pull request (the workflow file runs it on `pull_request`, and this branch does not change the workflow, so the file
+    in the work tree is the one at the base), else None. It reads a file and makes no git call."""
+    if changed is None or PREFLIGHT_WORKFLOW in changed:
+        return None
+    try:
+        with open(os.path.join(root, PREFLIGHT_WORKFLOW), encoding="utf-8") as handle:
+            text = handle.read(262144)
+    except (OSError, UnicodeDecodeError):
+        return None
+    return workflow_job_running(text, command)
+
+
 PREFLIGHT_CEILING_MAX = 3600   # the absolute maximum of any class's ceiling, in seconds: a hung class still ends
 
 
@@ -25104,6 +25214,12 @@ def cmd_preflight_pr(args, runner, now):
             ceiling = preflight_ceiling(base_ceiling, load1, cores)
             if under is not None and changed is not None and not any(path.startswith(under) for path in changed):
                 continue
+            commands = list(commands)
+            for skipped, shown in PREFLIGHT_CI_SKIPS:
+                job = preflight_ci_runs(runner, root, skipped, changed) if (skipped,) in commands else None
+                if job:
+                    commands.remove((skipped,))
+                    print("preflight-pr: %s: skipped, CI runs it for this pull request (job %s)" % (shown, job))
             env = dict(os.environ, FLEET_HEAVY_MAX_SECONDS=str(ceiling))   # the ceiling runs INSIDE the slot (heavy's watchdog starts when the slot is granted): a wait in the queue is never a timeout
             sys.stderr.write("preflight-pr: %s: waiting for a slot, then running (ceiling %ds once running)\n" % (name, ceiling))
             if under is not None:
@@ -25119,6 +25235,9 @@ def cmd_preflight_pr(args, runner, now):
                     break
                 if done.returncode == 124:
                     verdict, tail = "FAIL", "timed out after %ds running, its ceiling (load average %.1f on %d cores)" % (ceiling, load1, cores)
+                    break
+                if done.returncode == 64 and "heavy: refused: a full-suite job is already queued or running" in (done.stderr or ""):   # heavy's refusal (a test that itself exits 64 is a failure)
+                    verdict, tail = "FAIL", "refused: a full-suite job is already queued or running in this worktree (the tests did not run)"
                     break
                 if done.returncode == 75:
                     verdict, tail = "NOSLOT", "no heavy slot came in time (the tests did not run)"
@@ -25267,6 +25386,41 @@ def agents_found(runner, opencode, timeout):
         return "bad", "the service answered something that is not the agent list (%s)" % err
 
 
+def agent_body(text):
+    """The prose of an agent file: what follows its front matter (the model line, the permissions and the mode are in the front matter, so they are not compared)."""
+    return text.split("\n---\n", 1)[1] if "\n---\n" in text else text
+
+
+def default_installed_agents_dir():
+    """Where `install` writes the agent files of the private profile. Under the test suite there is none unless a test names one: the suite never reads the machine's own profile."""
+    if os.environ.get(UNDER_TEST_ENV):
+        return None
+    return _xdg("XDG_DATA_HOME", ".local/share") / PROG / "profile" / "config" / "opencode" / "agents"
+
+
+def stale_installed_agents(installed_dir, expected=None, root=None):
+    """[(name, path)] of the agents whose installed file has a body that is not the kit's (the model line is not compared). An agent with no installed file, or no kit file, is not listed; an installed file that is there but cannot be read is."""
+    out = []
+    if installed_dir is None:
+        return out
+    for name in sorted(expected or EXPECTED_AGENTS):
+        found = agent_definition(name, root)
+        if found is None:
+            continue
+        installed = Path(installed_dir) / (name + ".md")
+        try:
+            kit = agent_body(Path(found[2]).read_text())
+            current = agent_body(installed.read_text())
+        except FileNotFoundError:
+            continue   # nothing installed under that name: nothing to compare
+        except (OSError, ValueError):
+            out.append((name, str(installed)))   # present but unreadable: said as out of date, never passed over
+            continue
+        if kit != current:
+            out.append((name, str(installed)))
+    return out
+
+
 def agents_problems(found, expected=None, root=None, unchecked=None):
     """One line per agent of ours that is missing, in the wrong mode, short of a rule its definition declares, or whose definition has lines
     the check cannot read. `unchecked` (a list, when given) collects the agents whose rules were NOT compared (no definition found): only the mode was."""
@@ -25305,6 +25459,9 @@ def cmd_agents(args, runner, now):
         return EXIT_ERROR
     unchecked = []
     problems = agents_problems(payload, unchecked=unchecked)
+    installed_dir = Path(args.installed_dir) if args.installed_dir else default_installed_agents_dir()
+    for name, path in stale_installed_agents(installed_dir):
+        problems.append("%s: out of date (the installed copy %s has a different wording from the kit's); run `%s install`, then restart the service" % (name, path, PROG))
     if problems:
         for line in problems:
             print("FAIL  " + line)
@@ -25326,6 +25483,7 @@ def add_agents_parsers(sub):
                                                "lacks a rule its definition declares. A service that is not running is reported, not failed. Run it after installing the agents and "
                                                "restarting the service.")
     verify.add_argument("--strict", action="store_true", help="Exit 1 when the service cannot be asked (default: say so and exit 0)")
+    verify.add_argument("--installed-dir", default=None, help="The folder of installed agent files to compare bodies with (default: the private profile's agents folder)")
     verify.add_argument("--opencode", default="opencode", help="The opencode executable (default: opencode on PATH)")
     verify.add_argument("--timeout", type=int, default=AGENTS_VERIFY_TIMEOUT, help="Seconds to wait for the service (default %d)" % AGENTS_VERIFY_TIMEOUT)
 
@@ -28416,7 +28574,10 @@ def load_tick(engine, discovery):
     links_gate = getattr(engine, "awaiting_held_links", False) and now - waited < HELD_LINKS_WAIT_SECONDS   # #796: a start's held-PR links must be whole before the first alert; it lapses after a bound
     cfg = engine.config.get("load_alert") or dict(health.DEFAULTS)
     reminders = read_reminders(engine.state_dir)
-    retired, last_reports = read_retired(engine.state_dir), _read_small(engine.state_dir, LAST_REPORT_FILE)
+    listed = registry_read(engine.state_dir)   # the load line is a view of the registry: a retired agent has no figures; a read that is not whole alerts nobody (#805)
+    if not listed["whole"]:
+        return []
+    retired, last_reports = listed["retired"], _read_small(engine.state_dir, LAST_REPORT_FILE)
     orchestrators = {}
     for name, seen in sorted(discovery.agents.items()):
         fleet = seen.fleet or {}
