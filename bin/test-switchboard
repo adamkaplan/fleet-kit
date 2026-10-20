@@ -36048,6 +36048,38 @@ class B:
         self.assertIn("passed", defs, "a function passed as a callback to a parameter is a name the closure reads")
         self.assertNotIn("delta", members["A"], "a name nothing spells out stays outside")
 
+    def test_the_spelled_out_names_of_a_computed_attribute_are_candidates_only_where_the_name_is_computed(self):
+        """The mutant the review named (#995): the merge of the spelled-out names into the references, and the trigger that makes it happen. A computed getattr, setattr or hasattr makes every identifier string of ITS OWN function a candidate method name; a literal name, or no such call, makes none."""
+        import ast
+        dc = sb.load_module("delegated_clear")
+        template = """
+def entry(n):
+    box = Box()
+    %s
+    return ("alpha", "beta")
+class Box:
+    def alpha(self):
+        return 1
+    def beta(self):
+        return 2
+    def gamma(self):
+        return 3
+"""
+        cases = {"a computed getattr": ("getattr(box, n)()", ["alpha", "beta"]), "a computed hasattr": ("hasattr(box, n)", ["alpha", "beta"]), "a computed setattr": ("setattr(box, n, 1)", ["alpha", "beta"]),
+                 "a literal name (no computed one)": ("getattr(box, 'gamma')()", ["gamma"]), "no attribute call at all": ("box.alpha()", ["alpha"])}
+        for label, (call, expected) in cases.items():
+            with self.subTest(label):
+                members = dc.closure(ast.parse(template % call), ["entry"])[3]["Box"]
+                self.assertEqual(sorted(m for m in members if m in ("alpha", "beta", "gamma")), expected, label)
+        with self.subTest("the mutant: no merge of the spelled-out names"):
+            source = open(BIN / "delegated_clear.py").read()
+            mutant_source = source.replace("        if not set(spelled_out) <= refs:", "        if False and not set(spelled_out) <= refs:", 1)
+            self.assertNotEqual(mutant_source, source)
+            namespace = {"__name__": "mutant_dc", "__file__": str(BIN / "delegated_clear.py")}
+            exec(compile(mutant_source, "mutant_delegated_clear", "exec"), namespace)
+            members = namespace["closure"](ast.parse(template % "getattr(box, n)()"), ["entry"])[3]["Box"]
+            self.assertNotIn("beta", members, "without the merge the computed attribute's candidates are lost: the test above fails on this build")
+
     @unittest.skipIf(sys.version_info < (3, 11), "the trace names a method by co_qualname, new in Python 3.11")
     def traced_definitions(self, run, source_path, handlers=()):
         """The top-level definitions of `source_path` (and the methods of its classes) that executed while `run()` ran, by a profile hook: {(top-level name, method or None)}. With `handlers` (names of daemon

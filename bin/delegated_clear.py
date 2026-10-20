@@ -356,6 +356,8 @@ def closure(tree, roots, dynamic_actions=()):
                         nodes.extend(binds[x.id])
                 elif isinstance(x, ast.Attribute):
                     refs.add(x.attr)
+                elif isinstance(x, ast.Call) and getattr(x.func, "id", "") in ("getattr", "setattr", "hasattr") and len(x.args) > 1 and isinstance(x.args[1], ast.Constant) and isinstance(x.args[1].value, str):
+                    refs.add(x.args[1].value)   # an attribute named by a literal: that name is a reference
                 elif isinstance(x, ast.Call) and getattr(x.func, "id", "") in ("getattr", "setattr", "hasattr") and not (len(x.args) > 1 and isinstance(x.args[1], ast.Constant)):
                     spelled_out.extend(c.value for c in ast.walk(unit) if isinstance(c, ast.Constant) and isinstance(c.value, str) and c.value.isidentifier())   # an attribute named at run time: every name the function spells out as a string is a candidate (#940)
                 elif isinstance(x, ast.Constant) and x.value == "cmd_":
