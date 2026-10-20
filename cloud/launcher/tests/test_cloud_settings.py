@@ -1,7 +1,7 @@
 """The settings file (#876, slice 1): the one reader `apply_settings`, its refusals, and the driver's use of it. Offline, no cluster.
 
 Every set below is derived from the code's own tables (SETTINGS, SECRET_SHAPES), with a completeness test, so a new member that has no case here fails."""
-import io, json, os, re, stat, sys, tempfile, unittest
+import contextlib, io, json, os, re, stat, sys, tempfile, unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
@@ -35,9 +35,17 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
                        "X/y@sha256:" + "ab12" * 16, "a b@sha256:" + "ab12" * 16, "x;y@sha256:" + "ab12" * 16, "x:1.2",
                        "a@sha256:" + "ab12" * 16 + "@sha256:" + "ab12" * 16, "reg.example/../x@sha256:" + "ab12" * 16, "x//y@sha256:" + "ab12" * 16],
     "CW_CLOUD_SERVER": ["http://169.254.169.254", "file:///x", "-flag", "x y", "cluster.example.internal", "https://user@host.example", "https://host.example/path",
-                        "https://host.example?x=1", "https://host.example#f", "https://127.0.0.1", "https://localhost", "https://169.254.169.254", "https://[::1]",
-                        "https://0.0.0.0", "https://2130706433", "https://metadata.google.internal", "https://host.example:99999", "https://a.localhost", "https://metadata", "https://[ff0e::1]", "https://[::ffff:8.8.8.8]", "https://[64:ff9b::808:808]", "https://[2002:808:808::1]", "https://[2001:0:4136:e378:8000:63bf:3fff:fdd2]", "https://[2606:4700:4700::1111%25eth0]", "https://[2606:4700:4700::1111%eth0]", "https://host.example\t", "https://ho\tst.example", "https://host.example\x0b", "https://8.8.8.8 :6443", "https://8.8.8.8\x1f", "https://0x7f000001", "https://017700000001", "https://127.1", "https://0177.0.0.1", "https://0x7f.0.0.1", "https://host.example.", "https://a.0x7f", "https://10.0.0.4", "https://192.168.1.1", "https://100.64.0.1", "https://[fd00:ec2::254]", "https://[fe80::1]", "https://224.0.0.1", "https://[::ffff:10.0.0.1]", "https://0x7f000001:6443", "https://12345", "https://1.2.3", "https://host.example:abc",
-                        "https://", "https://ho st.example", "https://[::ffff:127.0.0.1]", "ftp://host.example", "https://host.example\\x"],
+                        "https://host.example?x=1", "https://host.example#f", "https://127.0.0.1", "https://8.8.8.8", "https://10.0.0.4:6443", "https://localhost",
+                        "https://169.254.169.254", "https://[::1]", "https://[::127.0.0.1]", "https://[::ffff:127.0.0.1]", "https://[::ffff:8.8.8.8]",
+                        "https://[2002::]", "https://[2001::]", "https://[fe80::1]", "https://[2606:4700:4700::1111]", "https://[2606:4700:4700::1111%25eth0]",
+                        "https://[ff0e::1]", "https://0.0.0.0", "https://2130706433", "https://0x7f000001", "https://0X7F000001", "https://017700000001",
+                        "https://127.1", "https://0177.0.0.1", "https://0x7f.0.0.1", "https://a.0x7f", "https://a.0X", "https://12345", "https://1.2.3",
+                        "https://metadata.google.internal", "https://metadata", "https://a.localhost", "https://face", "https://host.example.",
+                        "https://host.example:0", "https://host.example:65536", "https://host.example:99999", "https://host.example:abc", "https://host.example:+80",
+                        "https://", "https://ho st.example", "ftp://host.example", "https://host.example\\x", "https://-a.example.be", "https://a-.example.be",
+                        "https://a..example.be", "https://.example.be", "https://a_b.example.be", "https://" + "a" * 64 + ".example.be",
+                        "https://" + ".".join(["a" * 60] * 5 + ["bb"]), "https://host.example\t", "https://ho\tst.example", "https://host.example\x0b",
+                        "https://8.8.8.8 :6443", "https://8.8.8.8\x1f"],
     "CW_CLOUD_CA_FILE": ["relative.pem", "/home/user/../etc/x", "-x", "$HOME/x"],
     "CW_PULL_SECRET": ["A_B", "a b", "-", "a/b", "$(x)", "UPPER"],
     "CW_VAULT_SUBSCRIPTION": ["sub-example", "0000", "00000000-0000-0000-0000-00000000000g", "$(x)", "a;b", "00000000-0000-0000-0000-000000000000 "[:-1] + "0"],
@@ -150,43 +158,55 @@ class ValueRules(Dir):
             self.assertTrue(cw.VALIDATORS["CW_ALLOWED_REPOS"][1](raw))
             cw.check_repo_allowed("acme-org/widget-service", {"CW_ALLOWED_REPOS": raw})   # what the validator accepts, the check accepts
 
-    def test_a_good_server_form_is_accepted(self):
-        for value in ("https://cluster.example.internal:6443", "https://cluster.example.internal", "https://cluster.example.internal/", "https://8.8.8.8:6443", "https://[2606:4700:4700::1111]:443", "https://aks-dns-1a2b3c4d.hcp.example.azmk8s.io:443", "https://cluster.example.be", "https://api.example.de", "https://x.example.cd", "https://face", "https://a.dead"):
+    GOOD_HOSTS = ("https://cluster.example.internal:6443", "https://cluster.example.internal", "https://cluster.example.internal/", "https://cluster.example.be",
+                  "https://api.example.de", "https://x.example.cd", "https://x.face", "https://a.dead", "https://a-b.example.be:1", "https://a.example.be:65535",
+                  "https://aks-dns-1a2b3c4d.hcp.example.azmk8s.io:443", "https://" + ".".join(["a" * 63] * 3 + ["b" * 58, "be"]))
+
+    def test_a_dns_name_is_accepted_and_every_ip_literal_is_refused_because_it_is_one(self):
+        server = cw.VALIDATORS["CW_CLOUD_SERVER"][1]
+        self.assertEqual(len(self.GOOD_HOSTS[-1]) - len("https://"), 253)   # the longest name there is
+        for value in self.GOOD_HOSTS:
             with self.subTest(value):
-                self.assertTrue(cw.VALIDATORS["CW_CLOUD_SERVER"][1](value))
+                self.assertTrue(server(value))
+        for value in HOSTILE["CW_CLOUD_SERVER"]:
+            if re.match(r"https://(\[|[0-9xX.]+(:[0-9]+)?$)", value):
+                with self.subTest(value):
+                    self.assertFalse(server(value))   # an IP literal of any form
 
-    def test_each_host_alias_rule_is_the_one_that_catches_its_aliases(self):
+    def test_each_server_rule_has_a_mutant_that_lets_its_hostile_value_through(self):
         server = cw.VALIDATORS["CW_CLOUD_SERVER"][1]
-        with mock.patch.object(cw, "_integer_host_label", lambda label: False):
-            self.assertTrue(server("https://0x7f000001"))   # the 0x rule removed: the hex alias gets through
-            self.assertFalse(server("https://2130706433"))  # (the letter rule still holds the all-digit ones)
-        with mock.patch.object(cw, "_has_letter", lambda label: True):
-            self.assertFalse(server("https://2130706433"))   # the digit rule alone refuses it
-            self.assertFalse(server("https://127.1"))
-        with mock.patch.object(cw, "_has_letter", lambda label: True), mock.patch.object(cw, "_integer_host_label", lambda label: False):
-            for alias in ("https://2130706433", "https://127.1", "https://017700000001", "https://0x7f.0.0.1", "https://0177.0.0.1"):
-                self.assertTrue(server(alias), alias)   # both rules removed: every alias gets through
-
-    def test_each_server_sub_rule_is_caught_only_by_its_own_hostile_value(self):
-        server = cw.VALIDATORS["CW_CLOUD_SERVER"][1]
-        cases = (("_REFUSED_HOSTS", (), "https://metadata"), ("_REFUSED_HOSTS", (), "https://localhost"), ("_REFUSED_SUFFIX", ".never-matches", "https://a.localhost"),
-                 ("_BAD_CHARS", re.compile("(?!)"), "https://8.8.8.8\t:6443"), ("_BAD_CHARS", re.compile("(?!)"), "https://cluster.example.be\n"),
-                 ("_BAD_CHARS", re.compile("(?!)"), "https://[2606:4700:4700::1111%25eth0]"), ("_V4_EMBEDDING_NETS", (), "https://[::ffff:8.8.8.8]"),
-                 ("_V4_EMBEDDING_NETS", (), "https://[64:ff9b::808:808]"))
-        for name, replacement, value in cases:
-            with self.subTest(rule=name, value=value):
+        anything = re.compile(".+")
+        old_host = re.compile(r"(?:%s\.)*%s" % (cw._DNS_LABEL, cw._DNS_LABEL))
+        loose_netloc = re.compile(r"(.+?)(?::([0-9]{1,5}))?")
+        every = lambda label: True
+        none = lambda label: False
+        cases = (
+            ("an IP literal in brackets", "https://[::1]", (("_NETLOC", loose_netloc), ("_HOST", anything), ("_has_letter", every))),
+            ("an IPv4 literal", "https://127.0.0.1", (("_has_letter", every), ("_integer_host_label", none))),
+            ("an all-digit last label", "https://a.2130706433", (("_has_letter", every), ("_integer_host_label", none))),
+            ("a 0x last label", "https://a.0x7f000001", (("_integer_host_label", none),)),
+            ("an uppercase 0X last label", "https://a.0X7F", (("_integer_host_label", none),)),
+            ("no letter in the last label", "https://a.1-2", (("_has_letter", every),)),
+            ("port 0", "https://host.example:0", (("_port_ok", lambda port: True),)),
+            ("port 65536", "https://host.example:65536", (("_port_ok", lambda port: True),)),
+            ("a single label", "https://face", (("_HOST", old_host),)),
+            ("a name over 253 characters", "https://" + ".".join(["a" * 60] * 5 + ["bb"]), (("_MAX_HOST", 10 ** 6),)),
+            ("the metadata name", "https://metadata.google.internal", (("_REFUSED_HOSTS", ()),)),
+            ("a .localhost name", "https://a.localhost", (("_REFUSED_SUFFIX", ".never-matches"),)),
+            ("a tab that urlsplit would drop", "https://cluster.example.be\t", (("_BAD_CHARS", re.compile("(?!)")),)),
+            ("a newline that urlsplit would drop", "https://cluster.example.be\n", (("_BAD_CHARS", re.compile("(?!)")),)),
+        )
+        for label, value, patches in cases:
+            with self.subTest(label):
                 self.assertFalse(server(value))
-                with mock.patch.object(cw, name, replacement):
-                    self.assertTrue(server(value), "with %s removed the value is still refused: the case does not test it" % name)
-        for value in ("https://[ff0e::1]", "https://224.0.0.1"):
-            with self.subTest(rule="_multicast", value=value):
-                self.assertFalse(server(value))
-                with mock.patch.object(cw, "_multicast", lambda ip: False):
-                    self.assertTrue(server(value))
+                with contextlib.ExitStack() as stack:
+                    for name, replacement in patches:
+                        stack.enter_context(mock.patch.object(cw, name, replacement))
+                    self.assertTrue(server(value), "with its rule removed %r is still refused: the case does not test the rule" % label)
 
     def test_the_server_rule_judges_the_string_as_written(self):
         server = cw.VALIDATORS["CW_CLOUD_SERVER"][1]
-        for value in ("https://127.0.0.1\t", "https://host\t.example", "https://8.8.8.8\n", "https://8.8.8.8\r", "https://cluster.example.be\x00"):
+        for value in ("https://127.0.0.1\t", "https://host\t.example", "https://cluster.example.be\n", "https://cluster.example.be\r", "https://cluster.example.be\x00"):
             self.assertFalse(server(value), repr(value))
 
     def test_a_bad_file_leaves_the_environment_byte_identical(self):

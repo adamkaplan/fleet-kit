@@ -46,7 +46,7 @@ Each setting's name, whether the file requires it, and its kind (name, path, com
 |---|---|---|---|
 | `CW_ALLOWED_REPOS` | yes | name | comma-separated `OWNER/NAME` the launcher may use, e.g. `acme-org/widget-service`; no wildcard. Unset or empty refuses everything. |
 | `CW_CLOUD_IMAGE` | yes | digest-ref | the worker image, by digest: `name@sha256:<64 hex>`; a tag refuses. (`--image` on the command line stays as it was.) |
-| `CW_CLOUD_SERVER` | yes | name | the cluster API address, an `https://host[:port]` URL (no user, query, fragment or path; no `http:` or `file:`; the host is a name whose last label has a letter, is not all digits and does not start with `0x` (so `.be`, `.de`, `.cd` are fine), or a public IP literal (no zone id, no whitespace, no IPv6 form that embeds an IPv4 address such as mapped, NAT64 or 6to4); integer forms such as `2130706433` or `0x7f000001`, and any loopback, link-local, private or metadata address, are refused, so a cluster on a private address needs a DNS name) |
+| `CW_CLOUD_SERVER` | yes | name | the cluster API address: `https://NAME[:PORT]`, where NAME is a DNS name with at least two labels (an IP address of any form, including `[::1]`, `127.1` and `0x7f000001`, is refused: a cluster reached by IP needs a DNS name), a last label that has a letter and is not all digits or `0x`, and a port from 1 to 65535; no user, query, fragment, path, `file:` or `http:` |
 | `CW_VAULT_SUBSCRIPTION` | yes | name | the vault's subscription, a GUID |
 | `CW_VAULT_NAME` | yes | name | the vault's name: 3 to 24 letters, digits and hyphens, starting with a letter |
 | `CW_CLOUD_NAMESPACE` | yes | name | the namespace the workers live in: a DNS label; `default` and `kube-*` are refused |

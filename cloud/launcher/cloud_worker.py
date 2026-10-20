@@ -1091,17 +1091,18 @@ SECRET_SHAPES = tuple(
 _IMAGE_CHARS = re.compile(r"[a-z0-9._/:-]+")
 _IMAGE_REF = re.compile(r"(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]{1,5})?/)?[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*@sha256:[0-9a-f]{64}")
 _DNS_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
-_HOST = re.compile(r"(?:%s\.)*%s" % (_DNS_LABEL, _DNS_LABEL))
+_HOST = re.compile(r"(?:%s\.)+%s" % (_DNS_LABEL, _DNS_LABEL))   # at least two labels
+_NETLOC = re.compile(r"([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?")
 _NAMESPACE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _SECRET_NAME = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?")
 _VAULT_NAME = re.compile(r"[A-Za-z][A-Za-z0-9-]{1,22}[A-Za-z0-9]")
 _GUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 _BARE_PROGRAM = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._+-]*")
 _NUMBER = re.compile(r"[0-9]+(?:\.[0-9]+)?")
-_REFUSED_HOSTS = ("localhost", "metadata", "metadata.google.internal")
+_REFUSED_HOSTS = ("metadata.google.internal",)
 _REFUSED_SUFFIX = ".localhost"
+_MAX_HOST = 253
 _BAD_CHARS = re.compile(r"[\s\x00-\x1f\x7f%?#@\\]")   # urlsplit silently drops a tab, CR or LF: judge the string as written, so none may be there
-_V4_EMBEDDING_NETS = tuple(__import__("ipaddress").ip_network(n) for n in ("::ffff:0:0/96", "64:ff9b::/96", "2002::/16", "2001::/32"))   # IPv4-mapped, NAT64, 6to4, Teredo
 
 
 def _integer_host_label(label):
@@ -1113,35 +1114,28 @@ def _has_letter(label):
     return any(c.isalpha() for c in label)
 
 
-def _embeds_ipv4(ip):
-    """An IPv6 literal that carries an IPv4 address inside (mapped, NAT64, 6to4, Teredo): a cluster address has no use for one, and it can reach a loopback or private address."""
-    return ip.version == 6 and any(ip in net for net in _V4_EMBEDDING_NETS)
-
-
-def _multicast(ip):
-    return ip.is_multicast
+def _port_ok(port):
+    return port is None or 0 < int(port) < 65536
 
 
 def _server_ok(value):
-    import ipaddress
+    """The cluster API address is always a DNS NAME, so every IP literal (IPv4, bracketed IPv6, integer, hex or octal forms) is refused by the one rule:
+    https://NAME[:PORT], NAME with at least two labels of letters, digits and hyphens (1 to 63 characters, no leading or trailing hyphen), at most 253
+    characters in all, no trailing dot, a last label that has a letter and is neither all digits nor 0x and hex digits; a port of digits only, 1 to 65535."""
     if not value.startswith("https://") or _BAD_CHARS.search(value):
         return False
     try:
         parts = urllib.parse.urlsplit(value)
-        port = parts.port
-        host = parts.hostname
     except ValueError:
         return False
-    if not host or parts.path not in ("", "/") or (port is not None and not 0 < port < 65536):
+    m = _NETLOC.fullmatch(parts.netloc)
+    if not m or parts.path not in ("", "/") or parts.query or parts.fragment:
         return False
-    try:
-        ip = ipaddress.ip_address(host)   # the stdlib's canonical parse: only a dotted-quad IPv4 or an IPv6 literal gets here
-    except ValueError:
-        low = host.lower()
-        last = low.rsplit(".", 1)[-1]   # an all-numeric or hex-looking last label (2130706433, 127.1, 0x7f000001, 0177.0.0.1) is an integer host a resolver may read as an address
-        return (bool(_HOST.fullmatch(host)) and low not in _REFUSED_HOSTS and not low.endswith(_REFUSED_SUFFIX) and _has_letter(last)
-                and not _integer_host_label(last))
-    return ip.is_global and not _multicast(ip) and not _embeds_ipv4(ip)   # not loopback, link-local, private, shared, reserved, unspecified, multicast or a metadata address
+    host, port = m.group(1), m.group(2)
+    low = host.lower()
+    last = low.rsplit(".", 1)[-1]
+    return (len(host) <= _MAX_HOST and _port_ok(port) and bool(_HOST.fullmatch(host)) and low not in _REFUSED_HOSTS
+            and not low.endswith(_REFUSED_SUFFIX) and _has_letter(last) and not _integer_host_label(last))
 
 
 def _allowed_ok(value):
@@ -1164,7 +1158,7 @@ VALIDATORS = {
     "CW_TOOLING_REPO": ("one OWNER/NAME", lambda v: _repo_key(v) is not None),
     "CW_CLOUD_IMAGE": ("an image by digest, [registry[:port]/]path@sha256:<64 lowercase hex>, no tag, nothing else",
                        lambda v: bool(_IMAGE_CHARS.fullmatch(v.split("@")[0])) and bool(_IMAGE_REF.fullmatch(v))),
-    "CW_CLOUD_SERVER": ("an https URL with a host (no user, query, fragment, path, file: or http:; a host name whose last label has a letter, is not all digits and does not start with 0x, or a public IP literal: no loopback, link-local, private or metadata address)", _server_ok),
+    "CW_CLOUD_SERVER": ("an https URL whose host is a DNS name (no IP literal of any form, no user, query, fragment, path, file: or http:)", _server_ok),
     "CW_CLOUD_CA_FILE": ("an absolute path with no .. segment", _path_ok),
     "CW_PULL_SECRET": ("a Kubernetes name (lowercase letters, digits, - and .)", lambda v: bool(_SECRET_NAME.fullmatch(v))),
     "CW_VAULT_SUBSCRIPTION": ("a subscription GUID", lambda v: bool(_GUID.fullmatch(v))),
