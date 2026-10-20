@@ -14626,6 +14626,24 @@ class TestConflictCarryInTheDaemon(Base):
         self.confirm(new)
         self.assertEqual(self.hold(new), 0, "control: with none of those, the same merge carries")
 
+    def test_s4c_an_unreadable_score_block_refuses_every_confirmation(self):
+        cleared = self.clear()
+        module = sb.load_module("delegated_clear")
+        for label, patch in (("none", mock.patch.object(module, "score_block", return_value=None)), ("raises", mock.patch.object(module, "score_block", side_effect=OSError("gone")))):
+            with self.subTest(label):
+                g = self.api.git
+                g("checkout", "-q", "-B", "feature", cleared)
+                g("branch", "-q", "-f", "main", self.base_main)
+                self.clear_again(cleared)
+                self.writes.clear()
+                self.labels = []
+                new = self.conflict_merge()
+                self.confirm(new)
+                with patch:
+                    self.assertGreater(self.hold(new), 0, label)
+                self.assertEqual(self.events("gate.clear_carried"), [], label)
+                self.assertIn(self.PR, self.held_state()["carry_wait"], "a missing role list is a wait, not a carry: %s" % label)
+
     def clear_again(self, cleared):
         """the next case starts from the same owner clear: rebuild its state"""
         self.build(carry=True)
