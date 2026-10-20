@@ -32268,6 +32268,8 @@ class TestRegistrarFloor(LedgerBase):
             "a frame's f_globals": ("inspect.currentframe().f_globals['k'] = 1", ("rebinds", None)),
             "a list append then a read": ("box = []\nbox.append(%s)\nbox[0]()" % function, ("uses", function)),
             "a match subject": ("match %s:\n    case m:\n        m()" % function, ("uses", function)),
+            "a parameter default that reaches a module": ("def inner(p, m=%s):\n    m.x = 1" % module, ("rebinds", None)),
+            "the parser name rebound to a module": ("sub = %s\nsub.system('x')" % module, ("rebinds", "sub")),
             "a bare read": ("%s" % function, ("uses", function)),
             "a loop source": ("for f in [%s]:\n    pass" % function, ("uses", function)),
             "a closure name handed to a foreign call": ("print(%s)" % function, ("uses", function)),
@@ -32404,6 +32406,7 @@ class TestRegistrarFloor(LedgerBase):
         got, why = self.dc.registrar_findings("import re\nREGISTRAR_NAME_RE = re.compile(r'add_[a-z0-9_]+_parsers')\n", self.base_src, self.rule)
         self.assertIsNone(why)
         # the one read the rule cannot clear: the loader loop at the top of the file writes `globals()[<variable>]`, a key the lint cannot read, so an edit of that line is held for the owner (it is the clear's own loader)
+        got = [g for g in got if g[0] != "a named registration helper"]   # (every line counted as added also counts the named helpers' lines: their edit-hold is tested on its own)
         self.assertEqual(got, [("a module-level write into globals()", "rebinds", "a registrar bound in a form that cannot be read")])
         self.assertIn("globals()[_function] = _make_loader(", self.base_src)
 
@@ -32472,10 +32475,105 @@ class TestRegistrarFloor(LedgerBase):
         got, why = self.reg("add_a_parsers = lambda sub: %s()" % function)
         self.assertIn(("add_a_parsers", "calls", function), got)
 
+    FORBIDDEN_BUILTINS = ("getattr", "setattr", "delattr", "eval", "exec", "compile", "globals", "locals", "vars", "__import__", "open")
+
+    def test_the_allow_table_names_pure_builtins_only_and_none_of_the_forbidden_ones(self):
+        import builtins as builtins_module
+        allow = self.rule["registrar_allow"]
+        self.assertEqual(set(allow["pure_builtins"]) & set(self.FORBIDDEN_BUILTINS), set(), "a builtin that can reach or rebind another object is in the table")
+        for name in allow["pure_builtins"]:
+            self.assertTrue(hasattr(builtins_module, name), name)
+            self.assertNotIn(name, self.FORBIDDEN_BUILTINS)
+        self.assertEqual(len(allow["pure_builtins"]), len(set(allow["pure_builtins"])), "a member twice")
+        self.assertEqual(sorted(allow), ["helpers", "meaning", "pure_builtins"])
+
+    def test_every_helper_of_the_table_is_a_pure_function_of_the_daemon_file_and_never_an_unprotected_edit(self):
+        import ast
+        allow = self.rule["registrar_allow"]
+        pure = set(allow["pure_builtins"]) | set(allow["helpers"]) | {"super", "ValueError", "argparse", "_ISSUE_REF"}   # what these helpers call today: the table's own names, super, an exception, the argparse error and a compiled pattern
+        definitions = {n.name: n for n in self.tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+        for helper in allow["helpers"]:
+            with self.subTest(helper):
+                node = definitions.get(helper)
+                self.assertIsNotNone(node, "a helper of the table is a function or class of the daemon file")
+                own = {a.arg for a in ast.walk(node) if isinstance(a, ast.arg)} | {x.id for x in ast.walk(node) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store)} | {"cls", "self"}
+                for x in ast.walk(node):
+                    self.assertNotIsInstance(x, (ast.Import, ast.ImportFrom, ast.Global, ast.Nonlocal), "a helper imports or declares a global")
+                    if isinstance(x, (ast.Attribute, ast.Subscript)) and isinstance(x.ctx, (ast.Store, ast.Del)):
+                        self.assertIn(self.dc._root(x.value), own, "a helper writes outside its own names: %s" % ast.unparse(x))
+                    if isinstance(x, ast.Call):
+                        root = self.dc._root(x.func)
+                        self.assertTrue(root in own or root in pure or (isinstance(x.func, ast.Attribute) and isinstance(x.func.value, ast.Call) and self.dc._root(x.func.value.func) == "super"), "a helper calls %s" % ast.unparse(x.func))
+                        self.assertNotIn(root, self.FORBIDDEN_BUILTINS)
+                # protected: inside the closure (an edit is the owner's clear by the closure rule), or held by the lint when edited
+                line = node.body[-1].end_lineno
+                lines = self.base_src.split("\n")
+                edited = "\n".join(lines[:line] + ["%sx_edit = 1" % (" " * node.body[-1].col_offset)] + lines[line:])
+                got, why = self.dc.registrar_findings(self.base_src, edited, self.rule)
+                self.assertIsNone(why)
+                self.assertTrue(helper in self.names or ("a named registration helper", "rebinds", helper) in got, "an unprotected helper: %s" % helper)
+
+    def test_every_daemon_file_callable_a_real_registrar_hands_to_its_parser_is_in_the_table(self):
+        """Derived from the real registrars (never listed here): every module-level function or class they refer to, and what those call in turn, is a helper of the table."""
+        import ast
+        allow = self.rule["registrar_allow"]
+        definitions = {n.name: n for n in self.tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+        pattern = self.dc.registrar_pattern(self.tree)
+        used, todo = set(), []
+        for node in self.tree.body:
+            if isinstance(node, ast.FunctionDef) and pattern.fullmatch(node.name):
+                local = {a.arg for a in ast.walk(node) if isinstance(a, ast.arg)} | {x.id for x in ast.walk(node) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store)}
+                for call in (c for c in ast.walk(node) if isinstance(c, ast.Call)):   # handed to something: a bare name as an argument or a keyword value (`type=issue_arg`); a function the registrar CALLS is read by the lint as part of it
+                    todo.extend(v.id for v in [a.value if isinstance(a, ast.keyword) else a for a in list(call.args) + list(call.keywords)] if isinstance(v, ast.Name) and v.id in definitions and v.id not in local and not pattern.fullmatch(v.id))
+        first = set(todo)
+        self.assertTrue(first, "the real registrars hand at least one helper to their parser")
+        while todo:
+            name = todo.pop()
+            if name in used:
+                continue
+            used.add(name)
+            todo.extend(x.id for x in ast.walk(definitions[name]) if isinstance(x, ast.Name) and x.id in definitions and x.id != name)
+        self.assertEqual(first - set(allow["helpers"]), set(), "a function a registrar hands to its parser is not in the allow table")
+        self.assertEqual(used - set(allow["helpers"]), set(), "a function the helpers call is not in the allow table")
+
+    def test_a_registrar_split_like_the_one_in_review_is_not_held_and_a_helper_edit_is(self):
+        """S19: a daemon file in which the helpers are OUTSIDE the closure (as after the split), a registrar that hands one to its parser and uses the table's builtins."""
+        fake = ("import re\nREGISTRAR_NAME_RE = re.compile(r'add_[a-z0-9_]+_parsers')\n_REF = re.compile('x')\n"
+                "class IssueNo(int):\n    def __new__(cls, n):\n        self = super().__new__(cls, n)\n        self.repo = None\n        return self\n"
+                "def parse_ref(text):\n    found = _REF.match(text.strip()) if isinstance(text, str) else None\n    if not found or int(text) < 1:\n        raise ValueError(str(text))\n    return IssueNo(int(text))\n"
+                "def ref_arg(text):\n    return parse_ref(text)\ndef main():\n    return 1\n")
+        rule = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": ["int", "isinstance", "str"], "helpers": ["IssueNo", "parse_ref", "ref_arg"]}}
+        registrar = "def add_x_parsers(sub):\n    t = sub.add_parser('x')\n    t.add_argument('--issue', type=ref_arg, default=int('1'))\n"
+        self.assertEqual(self.dc.registrar_findings(fake, fake + registrar, rule), ([], None))
+        self.assertEqual(self.dc.registrar_findings(fake, fake + registrar, dict(rule, registrar_allow={"pure_builtins": [], "helpers": []}))[0] != [], True, "with no table the same edit is held")
+        edited = (fake + registrar).replace("    return IssueNo(int(found.group(1)))" if False else "    return IssueNo(int(text))\n", "    x = 1\n    return IssueNo(int(text))\n")
+        got, why = self.dc.registrar_findings(fake + registrar, edited, rule)
+        self.assertEqual([g[1:] for g in got], [("rebinds", "parse_ref")], got)
+
+    def test_every_member_of_the_allow_table_is_pinned_by_a_mutant_of_the_table(self):
+        """A mutant per member: the registrar that uses the member is held without it and not with it."""
+        fake = "import re\nREGISTRAR_NAME_RE = re.compile(r'add_[a-z0-9_]+_parsers')\ndef hlp(t):\n    import os\ndef main():\n    return 1\n"
+        allow = self.rule["registrar_allow"]
+        for builtin in allow["pure_builtins"]:
+            with self.subTest(builtin):
+                text = fake + "def add_a_parsers(sub):\n    sub.add_parser('x', help=%s(['a']))\n" % builtin
+                with_it = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": [builtin], "helpers": []}}
+                without = dict(with_it, registrar_allow={"pure_builtins": [x for x in allow["pure_builtins"] if x != builtin], "helpers": []})
+                self.assertEqual(self.dc.registrar_findings(fake, text, with_it)[0], [], builtin)
+                self.assertTrue(self.dc.registrar_findings(fake, text, without)[0], "the mutant without %s is not held" % builtin)
+        for helper in allow["helpers"]:
+            with self.subTest(helper):
+                text = fake.replace("def hlp(t):", "def %s(t):" % helper) + "def add_a_parsers(sub):\n    sub.add_parser('x', type=%s)\n" % helper
+                with_it = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": [], "helpers": [helper]}}
+                without = dict(with_it, registrar_allow={"pure_builtins": [], "helpers": [x for x in allow["helpers"] if x != helper]})
+                self.assertEqual(self.dc.registrar_findings(fake.replace("def hlp(t):", "def %s(t):" % helper), text, with_it)[0], [], helper)
+                self.assertTrue(self.dc.registrar_findings(fake.replace("def hlp(t):", "def %s(t):" % helper), text, without)[0], "the mutant without %s is not held" % helper)
+
     # ---- the mutants: a small daemon file with its own closure, the table run on the REAL lint and on a copy of it with ONE thing changed
     FAKE = ("import re\nimport json\nREGISTRAR_NAME_RE = re.compile(r'add_[a-z0-9_]+_parsers')\nFIELDS = ('a', 'b')\nHOOKS = []\n"
-            "def fn():\n    return json.dumps(HOOKS)\ndef main():\n    fn()\n    return FIELDS, HOOKS, re\n")
-    FAKE_RULE = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": []}
+            "def fn():\n    return json.dumps(HOOKS)\ndef main():\n    fn()\n    return FIELDS, HOOKS, re\n"
+            "def hh(text):\n    import os\n    return os.fspath(text)\n")   # a registration helper OUTSIDE the closure (as on a registrar split), whose body a registrar's lint would hold
+    FAKE_RULE = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": ["int", "str"], "helpers": ["hh"]}}
 
     def table_failures(self, dc):
         """[row that does not hold] for the table below, run on the lint module `dc` (the real one, or a mutant of it)."""
@@ -32516,7 +32614,26 @@ class TestRegistrarFloor(LedgerBase):
             ("defined function", "def inner(v):\n    return v\nsub.add_parser('x', help=inner('a'))"),
         ):
             clean(label, reg(body))
+        clean("a pure builtin of the table", reg("sub.add_parser('x', default=int('1'), help=str(2))"))
+        has("a builtin outside the table", reg("sorted(sub)"), ("calls", "sorted"))
+        clean("a named helper is not read as part of the registrar", reg("t = sub.add_parser('x')\nt.add_argument('--i', type=hh)\nhh('1')"))
+        try:   # a changed line of a named helper holds; the same edit elsewhere does not
+            got, why = dc.registrar_findings(fake, fake.replace("    import os\n", "    import os\n    x = 1\n"), rule)
+            if why or [g[1:] for g in got] != [("rebinds", "hh")]:
+                bad.append("a helper edit holds")
+        except Exception:
+            bad.append("a helper edit holds")
+        try:
+            got, why = dc.registrar_findings(fake, fake, dict(rule, registrar_allow={"pure_builtins": "int", "helpers": []}))
+            if got is not None or not why:
+                bad.append("an unreadable table holds")
+        except Exception:
+            bad.append("an unreadable table holds")
         clean("a clean readable helper", "def _h(p):\n    p.add_parser('x')\n" + reg("_h(sub)"))
+        has("a default that is not data", "def add_zz_parsers(sub, m=json):\n    pass\n", ("rebinds", "m"))
+        has("a parser name rebound", reg("sub = json\nsub.x = 1"), ("rebinds", "sub"))
+        has("a derived parser name rebound", reg("t = sub.add_parser('x')\nt = json\nt.x = 1"), ("rebinds", "t"))
+        clean("a literal default is data", "def _h(p, suppress=False):\n    p.add_parser('x')\n" + reg("_h(sub)"))
         has("helper through", "def _h():\n    global HOOKS\n    HOOKS = 1\n" + reg("_h()"), ("rebinds", "HOOKS"))
         has("helper lambda", "h = lambda: fn()\n" + reg("h()"), ("calls", "fn"))
         has("helper class", "class H:\n    def __call__(self):\n        fn()\n" + reg("H()"), ("calls", "fn"))
@@ -32591,6 +32708,13 @@ class TestRegistrarFloor(LedgerBase):
         ("the base's registrar pattern is not united", "patterns = [p for p in (registrar_pattern(base), registrar_pattern(head)) if p is not None]", "patterns = [registrar_pattern(head)]"),
         ("a helper is not followed", "for ref in sorted(refs & set(defs)):", "for ref in []:"),
         ("an opaque helper is not held", "if isinstance(x.func, ast.Name) and x.func.id in opaque", "if False and isinstance(x.func, ast.Name) and x.func.id in opaque"),
+        ("the table's builtins are not read", "x.func.id in builtins and x.func.id not in own", "False"),
+        ("the table's helpers are not allowed callees", "or x.func.id in named_helpers or", "or"),
+        ("a named helper is still read as part of a registrar", "if node.name not in names and node.name not in named:", "if node.name not in names:"),
+        ("an edit of a named helper is not held", "and node.name in named and _spans(node, numbers):", "and False:"),
+        ("an unreadable table passes", 'return None, "the registrar allow table of the rule cannot be read"', "pass"),
+        ("a default that is not data is not held", "for a, default in param_defaults:", "for a, default in []:"),
+        ("a rebound parser name is not held", '                    note(x, "rebinds", y.id)', "                    pass"),
         ("a registrar bound under an if is not read", "for node in _module_statements(head.body):\n        for name, unit in _binds_registrar(node, patterns):", "for node in head.body:\n        for name, unit in _binds_registrar(node, patterns):"),
         ("a registrar bound as a lambda is not read", "isinstance(value, ast.Lambda) and isinstance(target, ast.Name) else None", "False else None"),
         ("a registrar bound in a form that cannot be read passes", 'found.append((name, "rebinds", "a registrar bound in a form that cannot be read"))', "pass"),
@@ -32663,8 +32787,8 @@ class TestRegistrarFloor(LedgerBase):
         self.assertFalse(any("registrar" in r for r in self.dc.refusals(self.rule, report, [], matches=sb.impact_floor.matches, closure={})))
 
     # ---- the rater's line and the documentation say it in the same words
-    RATER = "A registrar that imports anything, writes outside its own names, or calls a function it neither defines nor receives (every import, call or rebinding of a name of the clear's closure among them) is rated High, whatever its other effects."
-    HOLD = "a registrar that imports anything, writes outside its own names, or calls a function it neither defines nor receives (every import, call or rebinding of a name of the clear's closure among them) is held for the owner"
+    RATER = "A registrar that imports anything, writes outside its own names, or calls a function it neither defines nor receives, except the named registration helpers and the pure builtins of one table (every import, call or rebinding of a name of the clear's closure among them) is rated High, whatever its other effects."
+    HOLD = "a registrar that imports anything, writes outside its own names, or calls a function it neither defines nor receives, except the named registration helpers and the pure builtins of one table (every import, call or rebinding of a name of the clear's closure among them) is held for the owner"
     CONTROL = "In one process a hostile registrar can always undo a guard; this hold and this rating are the control."
 
     def test_the_rater_line_is_in_the_definition_once_and_the_documentation_says_the_rule_and_the_line_in_the_same_words(self):

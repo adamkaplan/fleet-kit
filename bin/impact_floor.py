@@ -468,7 +468,7 @@ def registrar_reasons(registrar):
             else "registrar %s %s %s: this shape is not allowed in a registrar (%s)" % (name, verb, hit, REGISTRAR_RULE_TEXT) for name, verb, hit in registrar["findings"]]
 
 
-REGISTRAR_RULE_TEXT = "a registrar that imports anything, writes outside its own names, or calls a function it neither defines nor receives (every import, call or rebinding of a name of the clear's closure among them) is held for the owner"
+REGISTRAR_RULE_TEXT = "a registrar that imports anything, writes outside its own names, or calls a function it neither defines nor receives, except the named registration helpers and the pure builtins of one table (every import, call or rebinding of a name of the clear's closure among them) is held for the owner"
 
 
 def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=(), narrow=None, record=None, registrar=None):

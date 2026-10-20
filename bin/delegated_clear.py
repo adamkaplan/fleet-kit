@@ -487,7 +487,7 @@ def _own_scope(unit):
     return own, glob
 
 
-def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), readable=()):
+def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), readable=(), builtins=(), named_helpers=()):
     """[(verb, name)] a registrar (a function, a class, or the lambda a registrar name is assigned) does that a registrar may not, counting only the nodes that touch a line in `added` (`None`: every line). It is
     DEFAULT-DENY: a registrar sets up its own parsers and nothing else, so in it is a finding (named by the closure name when it touches one, else by what it touches): an import; a call of anything that is not a method of its
     own parser objects or a function it defines itself; a store into, or delete of, an attribute or an item of anything that is not its own parser object, or a `global` statement; a reach into a namespace by attribute
@@ -496,12 +496,23 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), re
     module-level binding that cannot be read) is a finding; `literals` are the closure names bound only to an immutable literal (data, not a closure name for the use rule)."""
     own, glob = _own_scope(unit)
     own -= glob   # a name declared `global` is the module's, whatever is stored into it
-    live = set(names) - set(literals)
+    live = set(names) - set(literals) - set(named_helpers)   # a named registration helper (the allow table) is pure by its own test: using it runs nothing of the closure
     if helpers is not None:
         helpers.update(x.id for x in ast.walk(unit) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id not in own and x.id not in names)
     arguments = getattr(unit, "args", None)
-    parser = {a.arg for a in (arguments.posonlyargs + arguments.args + arguments.kwonlyargs)} if isinstance(arguments, ast.arguments) else set()   # its own parser objects: what it is handed, and what it builds from them
-    data, grew = set(), True   # names that hold a literal (a string, a tuple of strings) or an element of one: calling `.replace` on them runs nothing
+    parser, data, param_defaults = set(), set(), []   # its own parser objects: what it is handed, and what it builds from them (a parameter with a literal default is data, one with any other default is a finding)
+    if isinstance(arguments, ast.arguments):
+        positional = arguments.posonlyargs + arguments.args
+        defaults = dict(zip([a.arg for a in positional[len(positional) - len(arguments.defaults):]], arguments.defaults))
+        defaults.update({a.arg: d for a, d in zip(arguments.kwonlyargs, arguments.kw_defaults) if d is not None})
+        for a in positional + arguments.kwonlyargs:
+            if a.arg not in defaults:
+                parser.add(a.arg)
+            elif _is_data(defaults[a.arg], set()):
+                data.add(a.arg)
+            else:
+                param_defaults.append((a, defaults[a.arg]))
+    grew = True   # names that hold a literal (a string, a tuple of strings) or an element of one: calling `.replace` on them runs nothing
     while grew:
         before, grew = len(data), False
         for x in ast.walk(unit):
@@ -532,6 +543,23 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), re
             if c in names:
                 return c
         return next((c for c in candidates if isinstance(c, str) and c), "a name that cannot be read")
+    for a, default in param_defaults:   # `def register(parser, m=sys.modules["__main__"])`: a default that runs or reaches something is not the registrar's own
+        note(a, "rebinds", a.arg)
+    for x in ast.walk(unit):   # a parser name rebound to anything that is not built from a parser (`parser = os`) is a finding, and the name is no longer its own
+        targets = []
+        if isinstance(x, ast.Assign) and _root(x.value) not in parser and not _is_data(x.value, data | set(literals)):
+            targets = x.targets
+        elif isinstance(x, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)) and getattr(x, "value", None) is not None and _root(x.value) not in parser:
+            targets = [x.target]
+        elif isinstance(x, (ast.With, ast.AsyncWith)):
+            targets = [i.optional_vars for i in x.items if i.optional_vars is not None]
+        elif isinstance(x, (ast.For, ast.AsyncFor, ast.comprehension)) and _root(x.iter) not in parser and not _is_data(x.iter, data | set(literals)) \
+                and not (isinstance(x.iter, (ast.Tuple, ast.List)) and x.iter.elts and all(isinstance(e, ast.Name) and e.id in parser for e in x.iter.elts)):
+            targets = [x.target]
+        for t in targets:
+            for y in ast.walk(t):
+                if isinstance(y, ast.Name) and y.id in parser:
+                    note(x, "rebinds", y.id)
     allowed, callee_roots = set(), set()
     for x in ast.walk(unit):
         if isinstance(x, ast.Call):
@@ -556,7 +584,7 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), re
             fname = x.func.id if isinstance(x.func, ast.Name) else (x.func.attr if isinstance(x.func, ast.Attribute) else None)
             if fname in ("__import__", "import_module"):
                 note(x, "imports", label(callee))
-            elif callee in parser or callee in data or (isinstance(x.func, ast.Name) and (x.func.id in defined or x.func.id in readable)) or (isinstance(x.func, ast.Attribute) and _root(x.func) is None and isinstance(x.func.value, ast.Constant)):
+            elif callee in parser or callee in data or (isinstance(x.func, ast.Name) and (x.func.id in defined or x.func.id in readable or x.func.id in named_helpers or (x.func.id in builtins and x.func.id not in own))) or (isinstance(x.func, ast.Attribute) and _root(x.func) is None and isinstance(x.func.value, ast.Constant)):
                 pass   # a method of its own parser, a function it defines, a method of a literal (`"..." .format`)
             else:
                 note(x, "calls", label(callee, fname))
@@ -570,8 +598,6 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), re
             note(x, "rebinds", label(x.attr, _root(x.value)))   # a dunder or a frame field reaches a namespace: what it can write cannot be read
         elif isinstance(x, ast.Name) and x.id in ("__builtins__", "__import__", "__loader__", "__spec__", "__dict__") :
             note(x, "rebinds", label(x.id))
-        elif isinstance(x, (ast.Match,)) if hasattr(ast, "Match") else False:
-            pass
         if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id in live and x.id not in own and (id(x) not in allowed or id(x) in callee_roots):   # THE USE RULE
             note(x, "uses", x.id)
     return sorted(found)
@@ -661,10 +687,14 @@ def registrar_findings(base_src, head_src, rule):
     if lines is None:
         return None, "the diff of the daemon file cannot be read"
     added = set(lines[1])
+    allow = rule.get("registrar_allow") if isinstance(rule, dict) else None
+    if allow is not None and not (isinstance(allow, dict) and all(isinstance(allow.get(k, []), list) and all(isinstance(v, str) for v in allow.get(k, [])) for k in ("pure_builtins", "helpers"))):
+        return None, "the registrar allow table of the rule cannot be read"
+    pure_builtins, named = set((allow or {}).get("pure_builtins", [])), set((allow or {}).get("helpers", []))
     found, defs, opaque = [], {}, set()   # the helpers: what the module binds, by any form, that is not the closure; `opaque` are the bindings that cannot be read
     for node in _module_statements(head.body):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node.name not in names:
+            if node.name not in names and node.name not in named:
                 defs[node.name] = node
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
             for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
@@ -703,7 +733,7 @@ def registrar_findings(base_src, head_src, rule):
     literals = {n for n, ok in bound_to.items() if ok and n in names}
     def read(label, unit, lines_counted):
         helpers = set()
-        for verb, hit in _registrar_unit(unit, names, lines_counted, helpers, opaque, literals, set(defs)):
+        for verb, hit in _registrar_unit(unit, names, lines_counted, helpers, opaque, literals, set(defs), pure_builtins, named):
             found.append((label, verb, hit))
         return helpers
     for node in _module_statements(head.body):
@@ -729,6 +759,10 @@ def registrar_findings(base_src, head_src, rule):
             key = node.slice
             if not (isinstance(key, ast.Constant) and isinstance(key.value, str)) or any(p.fullmatch(key.value) for p in patterns):
                 found.append(("a module-level write into globals()", "rebinds", "a registrar bound in a form that cannot be read"))
+    for tree, numbers in ((head, set(lines[1])), (base, set(lines[0]))):   # a changed line of a named registration helper: it is not read as part of a registrar, so an edit of it holds
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in named and _spans(node, numbers):
+                found.append(("a named registration helper", "rebinds", node.name))
     result = Findings(sorted(set(found)))
     result.closure = frozenset(names)
     return result, None
