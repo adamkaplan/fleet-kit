@@ -63081,6 +63081,263 @@ class TestDockerReaper(Base):
         self.assertIsNone(source.thread)
 
 
+class TestJanitorLiveKeeps(Base):
+    """Ask #932: the janitor keeps what a live agent owns, uses or touched (the registry, the access time, a file a live process holds open), and every doubt
+    keeps. Fixture directories and fakes for the registry, the clock and the open-file check only: the real temp directory is never read. Each entry here is one
+    the old rule (modification and change time only) would have removed."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("coder",), config={})
+        self.jan = sb.load_disk_janitor()
+        self.temp = self.home / "jtmp"
+        self.temp.mkdir()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "temp_janitor": {"dir": str(self.temp)}})
+        self.world.clock.t = time.time() + 10 * 86400   # a change time cannot be set back: the clock moves forward instead
+        self.now = self.world.clock.now()
+        (self.world.state / "state-marker.json").write_text("{}")
+        self.open_paths = []
+        self.open_timeouts = []
+        self.lsof_code = 0
+        self.lsof_error = None
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+
+    def routed(self, argv, **kwargs):
+        if argv[0] == "lsof":
+            if "-d" in argv:
+                return subprocess.CompletedProcess(argv, 0, "p1\nfcwd\nn/\n", "")
+            self.open_timeouts.append(kwargs.get("timeout"))
+            if self.lsof_error:
+                raise self.lsof_error
+            if self.lsof_code:
+                return subprocess.CompletedProcess(argv, self.lsof_code, "", "")
+            return subprocess.CompletedProcess(argv, 0, "p1\n" + "".join("fx\nn%s\n" % p for p in self.open_paths), "")
+        return self.world.route(argv, **kwargs)
+
+    def old(self, name, days=10, directory=False, atime_days=None):
+        path = self.temp / name
+        if directory:
+            path.mkdir()
+            (path / "inner.txt").write_text("x")
+        else:
+            path.write_text("x")
+        stamp = self.now - days * 86400
+        read = self.now - (days if atime_days is None else atime_days) * 86400
+        for p in ([path / "inner.txt"] if directory else []) + [path]:
+            os.utime(str(p), (read, stamp))
+        return path
+
+    def apply(self):
+        with captured() as (out, err):
+            code = sb.main(["disk", "janitor", "--apply"], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertEqual(code, 0, err.getvalue())
+        return out.getvalue()
+
+    def registry(self, agents=None, retired=None):
+        (self.world.state / sb.PANE_HEALTH_FILE).write_text(json.dumps({"agents": agents or {}, "states": {}, "missing": {}}))
+        (self.world.state / sb.RETIRED_FILE).write_text(json.dumps(retired or {}))
+
+    def test_s1_an_entry_a_live_or_recently_retired_agent_owns_is_kept(self):
+        tmpdir = self.old("live", directory=True)              # the agent's own TMPDIR
+        holds = self.old("holds-a-cwd", directory=True)                # it contains the agent's working directory
+        (holds / "work").mkdir()
+        recent = self.old("retired-recently", directory=True)          # a retired agent's working directory, retired 2 days ago
+        stale = self.old("retired-long-ago", directory=True)           # retired 20 days ago: the registry no longer holds it
+        self.registry({"live": {"cwd": str(holds / "work"), "session": "ses_a"}},
+                      {"gone": {"at": self.now - 2 * 86400, "session": "ses_b", "record": {"cwd": str(recent)}},
+                       "older": {"at": self.now - 20 * 86400, "session": "ses_c", "record": {"cwd": str(stale)}}})
+        with mock.patch.object(sb, "agent_tmp_root", lambda config: self.temp):
+            out = self.apply()
+        for kept in (tmpdir, holds, recent):
+            self.assertTrue(kept.exists(), kept.name)
+        names = [n for n, _ in sb.janitor_agent_roots(self.world.engine, self.now, 7)]
+        self.assertIn("gone", names)
+        self.assertNotIn("older", names, "retired past the janitor's own day limit: no longer held by the registry")
+        self.assertIn("kept live: it is, holds or sits inside", out)
+        # an entry that sits INSIDE an agent's directory
+        inside = self.old("sits-inside", directory=True)
+        self.registry({"live": {"cwd": str(self.temp), "session": "ses_a"}})
+        self.apply()
+        self.assertTrue(inside.exists())
+
+    def test_s1_the_one_function_is_the_only_reader_of_the_agent_list(self):
+        entry = self.old("owned-by-the-fake", directory=True)
+        seen = []
+
+        def fake(engine, now, days):
+            seen.append(days)
+            return [("fake-agent", str(entry))]
+        with mock.patch.object(sb, "janitor_agent_roots", fake):
+            self.apply()
+        self.assertTrue(entry.exists())
+        self.assertEqual(seen[0], 7)
+
+    def test_s2_a_read_keeps_an_entry_and_a_clock_decides(self):
+        read = self.old("read-yesterday.log", atime_days=1)
+        untouched = self.old("untouched.log")
+        self.apply()
+        self.assertTrue(read.exists(), "10 days by modification, 1 day by access")
+        self.assertFalse(untouched.exists())
+        directory = self.old("dir-read-yesterday", directory=True, atime_days=1)
+        self.apply()
+        self.assertTrue(directory.exists(), "a file read inside a directory keeps the directory")
+
+    def test_s2_a_directorys_own_access_time_is_not_counted(self):
+        plain = self.old("listed-only", directory=True)
+        os.utime(str(plain), (self.now, self.now - 10 * 86400))   # only the directory's own access time is new (listing it does that)
+        (plain / "inner.txt").touch()
+        os.utime(str(plain / "inner.txt"), (self.now - 10 * 86400,) * 2)
+        self.apply()
+        self.assertFalse(plain.exists())
+
+    def test_s3_a_file_a_live_process_has_open_keeps_its_entry(self):
+        held = self.old("held-open", directory=True)
+        free = self.old("not-open", directory=True)
+        self.open_paths = [str(held / "inner.txt"), "/somewhere/else"]
+        out = self.apply()
+        self.assertTrue(held.exists())
+        self.assertFalse(free.exists())
+        self.assertIn("kept held-open: a live process has a file of it open", out)
+
+    def test_s7_every_doubt_keeps_and_the_pass_ends_in_time(self):
+        unreadable_registry = self.old("registry-doubt", directory=True)
+        (self.world.state / sb.PANE_HEALTH_FILE).write_text("{not json")
+        out = self.apply()
+        self.assertTrue(unreadable_registry.exists())
+        self.assertIn("pane-health.json cannot be read", out)
+        self.registry()
+        atime = self.old("atime-doubt")
+        with mock.patch.object(self.jan, "_atime", side_effect=OSError("no atime")):
+            self.apply()
+        self.assertTrue(atime.exists())
+        timeout = self.old("open-check-timeout", directory=True)
+        self.lsof_error = subprocess.TimeoutExpired(["lsof"], 30)
+        out = self.apply()
+        self.assertTrue(timeout.exists())
+        self.assertIn("did not finish", out)
+        self.lsof_error = None
+        self.apply()
+        self.assertFalse(timeout.exists(), "with every source readable and nothing holding it, the same entry goes")
+
+    def test_s7_a_registry_that_raises_anything_keeps_the_entry(self):
+        entry = self.old("registry-raises", directory=True)
+        with mock.patch.object(sb, "janitor_agent_roots", side_effect=RuntimeError("boom")):
+            out = self.apply()
+        self.assertTrue(entry.exists())
+        self.assertIn("agent registry cannot be read", out)
+
+    def test_s7_the_open_file_check_is_bounded_and_every_failure_of_it_keeps(self):
+        entry = self.old("open-check-fails", directory=True)
+        self.lsof_code = 2
+        out = self.apply()
+        self.assertTrue(entry.exists())
+        self.assertIn("the open-file check failed", out)
+        self.assertEqual(set(self.open_timeouts), {sb.JANITOR_OPEN_SECONDS})
+        self.lsof_code = 0
+        with mock.patch.object(sb, "JANITOR_OPEN_SECONDS", -1):   # the resolving of the list is bounded too
+            self.open_paths = ["/x"]
+            out = self.apply()
+        self.assertTrue(entry.exists())
+        self.assertIn("resolving the open-file list took longer", out)
+
+    def test_s7_an_access_time_that_cannot_be_read_inside_a_directory_keeps_it(self):
+        entry = self.old("inner-atime-doubt", directory=True)
+        real = self.jan._atime
+        with mock.patch.object(self.jan, "_atime", lambda info: (_ for _ in ()).throw(OSError("x")) if info.st_size == 1 and info.st_mode & 0o100000 else real(info)):
+            self.apply()
+        self.assertTrue(entry.exists())
+
+    def test_s7_a_retired_entry_with_a_time_that_cannot_be_read_counts_as_recent(self):
+        self.registry({}, {"odd": {"at": "yesterday", "session": "ses_x", "record": {"cwd": str(self.temp / "odd-cwd")}}})
+        self.assertIn("odd", [n for n, _ in sb.janitor_agent_roots(self.world.engine, self.now, 7)])
+
+    def test_s4_the_records_in_doubt_are_read_as_doubt(self):
+        for text in ("{" , json.dumps({"rule": ["not", "scalar"]}), json.dumps({"rule": "x" * 5000})):
+            (self.world.state / sb.TEMP_JANITOR_GATE_FILE).write_text(text)
+            self.assertEqual(sb.read_janitor_record(self.world.state, sb.TEMP_JANITOR_GATE_FILE), (False, {}))
+        self.assertEqual(sb.janitor_apply_allowed(self.world.state, "r")[1], "unreadable")
+
+    def test_a_links_own_access_time_is_not_a_read(self):
+        link = self.temp / "old-link"
+        os.symlink(str(self.home), str(link))
+        os.utime(str(link), (self.now, self.now - 10 * 86400), follow_symlinks=False)   # only the link's access time is new
+        self.apply()
+        self.assertFalse(os.path.lexists(str(link)))
+
+    def test_the_fingerprint_covers_every_setting_that_changes_what_is_selected(self):
+        keys = set(self.jan.DEFAULTS)
+        self.assertEqual(keys, set(self.jan.SELECTION_KEYS) | set(self.jan.OTHER_KEYS), "every setting is classified as selecting or not")
+        self.assertFalse(set(self.jan.SELECTION_KEYS) & set(self.jan.OTHER_KEYS))
+        base = {"days": 7, "keep": [], "dir": str(self.temp)}
+        other = {"days": 8, "keep": ["x"], "dir": str(self.home)}
+        for key in self.jan.SELECTION_KEYS:
+            with self.subTest(key=key):
+                self.assertNotEqual(self.jan.rule_fingerprint(base), self.jan.rule_fingerprint(dict(base, **{key: other[key]})))
+        for key in self.jan.OTHER_KEYS:
+            with self.subTest(key=key):
+                self.assertEqual(self.jan.rule_fingerprint(base), self.jan.rule_fingerprint(dict(base, **{key: 123})))
+
+    def test_each_of_is_contains_and_sits_inside_keeps_on_its_own(self):
+        entry = self.old("the-entry", directory=True)
+        (entry / "work").mkdir()
+        for label, root in (("is", entry), ("contains", entry / "work"), ("sits inside", self.temp)):
+            with self.subTest(label), mock.patch.object(sb, "janitor_agent_roots", lambda e, n, d, root=root: [("fake", str(root))]):
+                self.assertTrue(sb.janitor_busy_function(self.world.engine, self.routed, self.jan)(str(entry)), label)
+        with mock.patch.object(sb, "janitor_agent_roots", lambda e, n, d: [("fake", str(self.home / "elsewhere"))]):
+            self.assertIsNone(sb.janitor_busy_function(self.world.engine, self.routed, self.jan)(str(entry)))
+
+    def test_a_process_working_in_an_entry_and_a_file_open_in_it_each_keep_it_on_their_own(self):
+        entry = self.old("the-entry", directory=True)
+        busy_for = lambda: sb.janitor_busy_function(self.world.engine, self.routed, self.jan)
+        with mock.patch.object(sb, "janitor_agent_roots", lambda e, n, d: []):
+            self.assertIsNone(busy_for()(str(entry)))
+            self.open_paths = [str(entry)]
+            self.assertIn("file of it open", busy_for()(str(entry)))
+            self.open_paths = [str(entry).upper()]   # a case-insensitive volume may spell it otherwise
+            self.assertIn("file of it open", busy_for()(str(entry)))
+            self.open_paths = []
+            real = self.routed
+            cwd = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "p1\nfcwd\nn%s\n" % entry, "") if "-d" in argv else real(argv, **kw)
+            self.assertIn("working directory", sb.janitor_busy_function(self.world.engine, cwd, self.jan)(str(entry)))
+            upper = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "p1\nfcwd\nn%s\n" % str(entry).upper(), "") if "-d" in argv else real(argv, **kw)
+            self.assertIn("working directory", sb.janitor_busy_function(self.world.engine, upper, self.jan)(str(entry)))
+
+    def test_s7_a_retired_list_that_cannot_be_read_keeps_everything(self):
+        entry = self.old("retired-doubt", directory=True)
+        (self.world.state / sb.PANE_HEALTH_FILE).write_text(json.dumps({"agents": {}, "states": {}, "missing": {}}))
+        (self.world.state / sb.RETIRED_FILE).write_text("[1, 2")
+        out = self.apply()
+        self.assertTrue(entry.exists())
+        self.assertIn("retired.json cannot be read", out)
+
+    def test_u1_an_entry_nothing_owns_uses_or_touched_is_removed_as_before(self):
+        gone = [self.old("old-%d.log" % n) for n in range(2)] + [self.old("old-dir", directory=True)]
+        self.registry({"live": {"cwd": str(self.home / "elsewhere")}})
+        self.apply()
+        self.assertEqual([p.exists() for p in gone], [False, False, False])
+
+    def test_the_janitors_own_preview_does_not_keep_the_entries_it_lists(self):
+        listed = self.old("listed-in-the-preview.log")
+        other = self.old("named-by-another-event.log")
+        lines = [{"event": "janitor.would_remove", "detail": {"names": ["listed-in-the-preview.log"]}},
+                 {"event": "temp.removed", "subject": "listed-in-the-preview.log"},
+                 {"event": "launched", "subject": "coder", "detail": {"note": "see named-by-another-event.log"}}]
+        (self.world.state / "audit.jsonl").write_text("".join(json.dumps(l) + "\n" for l in lines))
+        self.apply()
+        self.assertFalse(listed.exists())
+        self.assertTrue(other.exists(), "a record by anything else still names it")
+
+    def test_the_rule_fingerprint_follows_the_rule_and_never_a_name(self):
+        base = self.jan.rule_fingerprint({"days": 7, "keep": ["a"]})
+        self.assertNotEqual(base, self.jan.rule_fingerprint({"days": 7, "keep": ["a"], "dir": "/x/y"}), "another directory is another rule")
+        self.assertNotEqual(base, self.jan.rule_fingerprint({"days": 8, "keep": ["a"]}))
+        self.assertNotEqual(base, self.jan.rule_fingerprint({"days": 7, "keep": ["b"]}))
+        with mock.patch.object(self.jan, "RULE_VERSION", "3"):
+            self.assertNotEqual(base, self.jan.rule_fingerprint({"days": 7, "keep": ["a"]}))
+        self.assertNotEqual(self.jan.preview_fingerprint(base, ["a"]), self.jan.preview_fingerprint(base, ["b"]))
+
+
 class TestDaemonTempJanitor(Base):
     """Ask #762: the daemon applies the weekly temp janitor itself (the Docker reaper's path), on the janitor's own rule, dry until `daemon_apply` is on.
     Fixture directories and fakes only: the real temp directory is never read or written."""
@@ -63129,10 +63386,18 @@ class TestDaemonTempJanitor(Base):
         os.utime(str(link), (self.now - 10 * 86400,) * 2, follow_symlinks=False)
         return gone, [named, marked, self.old("recent.txt", days=1), elsewhere]
 
-    def daemon(self, temp_janitor=None, runner=True):
+    def ack(self, cfg):
+        """The preview was sent and the yes recorded, for the rule `cfg` makes (the state a daemon that has been cleared is in)."""
+        rule = self.jan.rule_fingerprint(self.jan.settings(cfg))
+        (self.world.state / sb.TEMP_JANITOR_GATE_FILE).write_text(json.dumps({"rule": rule, "preview": "p" * 16, "sent": True, "count": 0, "nonce": "n1"}))
+        (self.world.state / sb.TEMP_JANITOR_ACK_FILE).write_text(json.dumps({"rule": rule, "preview": "p" * 16, "nonce": "n1", "by": "cos", "at": 1}))
+
+    def daemon(self, temp_janitor=None, runner=True, acked=True):
         engine = self.world.engine
         cfg = {"dir": str(self.temp), "keep": ["keepme-*"]}
         cfg.update(temp_janitor or {})
+        if acked and cfg.get("daemon_apply"):
+            self.ack(cfg)
         engine.config = dict(engine.config, temp_janitor=cfg)
         engine.temp_janitor_runner = self.routed if runner else None
         engine.now = lambda: self.now
@@ -63291,6 +63556,231 @@ class TestDaemonTempJanitor(Base):
         self.addCleanup(os.chmod, str(stamp), 0o600)
         self.go(source)
         self.assertEqual(len(self.events("janitor.would_remove")), 1)
+
+    # -- ask #932: a changed selection rule makes one preview and applies nothing until the yes to that exact preview is recorded
+
+    def preview_facts(self, engine, source):
+        engine.discover(self.now)
+        return [f for f in source() if f.kind == "janitor"]
+
+    def week(self, engine):
+        self.now += 7 * 86400
+        engine.now = lambda: self.now
+
+    def record_ack(self, preview):
+        os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+        with captured() as (out, err):
+            code = sb.main(["disk", "janitor-ack", preview], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return code, err.getvalue()
+
+    def test_s4_one_preview_then_nothing_is_applied_until_the_yes_to_that_exact_preview(self):
+        victim = self.old("scratch-old-unnamed.log")
+        engine, source = self.daemon({"daemon_apply": True}, acked=False)
+        self.go(source)
+        self.assertTrue(victim.exists(), "no yes: nothing is removed")
+        self.assertEqual(self.events("temp.removed"), [])
+        facts = self.preview_facts(engine, source)
+        self.assertEqual(len(facts), 1, "ONE preview message")
+        self.assertEqual(facts[0].recipient, "cos")
+        preview = json.loads((self.world.state / sb.TEMP_JANITOR_GATE_FILE).read_text())["preview"]
+        self.assertIn("scratch-old-unnamed.log", facts[0].summary)
+        self.assertIn("janitor-ack %s" % preview, facts[0].summary)
+        # a week later: still no yes, still no second message, still nothing removed
+        self.week(engine)
+        self.go(source)
+        self.assertEqual(self.preview_facts(engine, source), [])
+        self.assertTrue(victim.exists())
+        self.assertEqual(self.events("temp.removed"), [])
+        # a yes for an older preview is refused and records nothing
+        code, err = self.record_ack("0" * 16)
+        self.assertEqual(code, 1)
+        self.assertIn("no pending temp janitor preview", err)
+        self.assertFalse((self.world.state / sb.TEMP_JANITOR_ACK_FILE).exists())
+        self.week(engine)
+        self.go(source)
+        self.assertTrue(victim.exists())
+        # the yes to the exact preview: the next weekly run applies
+        code, err = self.record_ack(preview)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.events("janitor.ack")), 1)
+        self.week(engine)
+        self.go(source)
+        self.assertFalse(victim.exists())
+        self.assertEqual([e["subject"] for e in self.events("temp.removed")], ["scratch-old-unnamed.log"])
+
+    def test_s4_a_changed_rule_needs_a_new_preview_and_a_new_yes(self):
+        engine, source = self.daemon({"daemon_apply": True}, acked=False)
+        self.old("first-old.log")
+        self.go(source)
+        self.preview_facts(engine, source)
+        first = json.loads((self.world.state / sb.TEMP_JANITOR_GATE_FILE).read_text())["preview"]
+        self.assertEqual(self.record_ack(first)[0], 0)
+        second_victim = self.old("second-old.log")
+        engine, source = self.daemon({"daemon_apply": True, "days": 8}, acked=False)   # the rule changed: days 7 -> 8
+        self.week(engine)
+        self.go(source)
+        self.assertTrue(second_victim.exists(), "the yes was for the old rule")
+        self.assertEqual(self.events("temp.removed"), [])
+        facts = self.preview_facts(engine, source)
+        self.assertEqual(len(facts), 1, "a new preview")
+        newest = json.loads((self.world.state / sb.TEMP_JANITOR_GATE_FILE).read_text())["preview"]
+        self.assertNotEqual(first, newest)
+        self.week(engine)
+        self.go(source)
+        self.assertTrue(second_victim.exists(), "the old yes does not carry over")
+        self.assertEqual(self.record_ack(newest)[0], 0)
+        self.week(engine)
+        self.go(source)
+        self.assertFalse(second_victim.exists())
+
+    def test_s4_a_record_in_doubt_applies_nothing(self):
+        victim = self.old("scratch-old-unnamed.log")
+        engine, source = self.daemon({"daemon_apply": True}, acked=True)
+        (self.world.state / sb.TEMP_JANITOR_ACK_FILE).write_text("{broken")
+        self.go(source)
+        self.assertTrue(victim.exists())
+        self.assertEqual(self.events("janitor.would_remove")[0]["detail"]["gate"], "unreadable")
+
+    def test_s4_a_yes_recorded_under_another_rule_applies_nothing(self):
+        victim = self.old("scratch-old-unnamed.log")
+        engine, source = self.daemon({"daemon_apply": True}, acked=True)
+        ack = self.world.state / sb.TEMP_JANITOR_ACK_FILE
+        ack.write_text(json.dumps(dict(json.loads(ack.read_text()), rule="another-rule")))
+        self.go(source)
+        self.assertTrue(victim.exists())
+
+    def test_s4_an_ordinary_agent_and_an_unknown_caller_cannot_record_the_yes(self):
+        self.old("scratch-old-unnamed.log")
+        engine, source = self.daemon({"daemon_apply": True}, acked=False)
+        self.go(source)
+        self.preview_facts(engine, source)
+        preview = json.loads((self.world.state / sb.TEMP_JANITOR_GATE_FILE).read_text())["preview"]
+        for pane in (self.world.panes["coder"], "p_unknown_pane"):
+            os.environ["HERDR_PANE_ID"] = pane
+            with captured() as (out, err):
+                code = sb.main(["disk", "janitor-ack", preview], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            self.assertEqual(code, 1)
+            self.assertIn("only the operator or the Chief of Staff", err.getvalue())
+            self.assertFalse((self.world.state / sb.TEMP_JANITOR_ACK_FILE).exists())
+
+    def test_s4_with_no_chief_of_staff_running_the_preview_waits_and_is_then_sent_once(self):
+        self.old("scratch-old-unnamed.log")
+        engine, source = self.daemon({"daemon_apply": True}, acked=False)
+        self.go(source)
+        found = engine.discover(self.now)
+        with mock.patch.object(engine, "discovery", type("D", (), {"agents": {}, "problems": []})()):
+            self.assertEqual([f for f in source() if f.kind == "janitor"], [])
+        self.assertFalse(json.loads((self.world.state / sb.TEMP_JANITOR_GATE_FILE).read_text())["sent"])
+        self.assertEqual(len(self.preview_facts(engine, source)), 1)
+        self.assertTrue(json.loads((self.world.state / sb.TEMP_JANITOR_GATE_FILE).read_text())["sent"])
+
+    def test_s4_a_gate_that_moved_before_delivery_sends_nothing_stale(self):
+        self.old("scratch-old-unnamed.log")
+        engine, source = self.daemon({"daemon_apply": True}, acked=False)
+        self.go(source)
+        gate = self.world.state / sb.TEMP_JANITOR_GATE_FILE
+        gate.write_text(json.dumps(dict(json.loads(gate.read_text()), preview="another-preview")))
+        self.assertEqual(self.preview_facts(engine, source), [])
+        self.assertFalse(json.loads(gate.read_text()).get("sent"))
+
+    def test_s4_a_gate_that_cannot_be_marked_sent_is_retried(self):
+        self.old("scratch-old-unnamed.log")
+        engine, source = self.daemon({"daemon_apply": True}, acked=False)
+        self.go(source)
+        with mock.patch.object(sb, "_write_small", side_effect=OSError("full")):
+            self.assertEqual(self.preview_facts(engine, source), [])
+        self.assertEqual(len(self.preview_facts(engine, source)), 1)
+
+    def test_s4_every_comparison_of_the_gate_is_pinned(self):
+        state = self.world.state
+        gate = {"rule": "r1", "preview": "p1", "sent": True, "count": 1, "nonce": "n1"}
+        ack = {"rule": "r1", "preview": "p1", "nonce": "n1", "by": "cos", "at": 1}
+
+        def allowed(gate_changes=None, ack_changes=None, rule="r1"):
+            (state / sb.TEMP_JANITOR_GATE_FILE).write_text(json.dumps(dict(gate, **(gate_changes or {}))))
+            (state / sb.TEMP_JANITOR_ACK_FILE).write_text(json.dumps(dict(ack, **(ack_changes or {}))))
+            return sb.janitor_apply_allowed(state, rule)[0]
+        self.assertTrue(allowed())
+        self.assertFalse(allowed(rule="r2"), "another rule")
+        self.assertFalse(allowed(ack_changes={"rule": "r2"}), "a yes under another rule")
+        self.assertFalse(allowed(ack_changes={"preview": "p0"}), "a yes to another preview")
+        self.assertFalse(allowed(gate_changes={"sent": False}), "a preview nobody was told")
+        self.assertFalse(allowed(ack_changes={"nonce": "n0"}), "a yes given to an earlier preview")
+        self.assertFalse(allowed(gate_changes={"nonce": ""}, ack_changes={"nonce": ""}), "no nonce at all")
+
+    def test_s4_the_daemons_apply_follows_each_comparison_of_the_gate(self):
+        cases = {"all match": ({}, {}, True), "ack under another rule": ({}, {"rule": "other"}, False), "ack to another preview": ({}, {"preview": "other"}, False),
+                 "preview never sent": ({"sent": False}, {}, False), "ack to an earlier preview (nonce)": ({}, {"nonce": "old"}, False)}
+        for label, (gate_changes, ack_changes, applies) in cases.items():
+            with self.subTest(label):
+                for p in self.temp.iterdir():
+                    p.unlink()
+                victim = self.old("scratch-old-unnamed.log")
+                (self.world.state / sb.TEMP_JANITOR_FILE).unlink(missing_ok=True)
+                engine, source = self.daemon({"daemon_apply": True}, acked=True)
+                gate_path, ack_path = self.world.state / sb.TEMP_JANITOR_GATE_FILE, self.world.state / sb.TEMP_JANITOR_ACK_FILE
+                gate_path.write_text(json.dumps(dict(json.loads(gate_path.read_text()), **gate_changes)))
+                ack_path.write_text(json.dumps(dict(json.loads(ack_path.read_text()), **ack_changes)))
+                self.go(source)
+                self.assertEqual(not victim.exists(), applies, label)
+                self.now += 7 * 86400
+                engine.now = lambda: self.now
+
+    def test_s4_two_previews_under_one_rule_carry_different_nonces(self):
+        self.old("scratch-old-unnamed.log")
+        engine, source = self.daemon({"daemon_apply": True}, acked=False)
+        gate = self.world.state / sb.TEMP_JANITOR_GATE_FILE
+        self.go(source)
+        first = json.loads(gate.read_text())
+        self.week(engine)
+        self.go(source)   # the first preview was never handed over: a second one is made under the same rule
+        second = json.loads(gate.read_text())
+        self.assertEqual(first["rule"], second["rule"])
+        self.assertNotEqual(first["nonce"], second["nonce"])
+        self.assertTrue(first["nonce"] and second["nonce"])
+
+    def test_s4_a_yes_cannot_be_recorded_for_a_preview_nobody_was_told_of(self):
+        self.old("scratch-old-unnamed.log")
+        engine, source = self.daemon({"daemon_apply": True}, acked=False)
+        self.go(source)   # the gate exists with sent false: the message was never handed over
+        gate = json.loads((self.world.state / sb.TEMP_JANITOR_GATE_FILE).read_text())
+        self.assertFalse(gate["sent"])
+        code, err = self.record_ack(gate["preview"])
+        self.assertEqual(code, 1)
+        self.assertFalse((self.world.state / sb.TEMP_JANITOR_ACK_FILE).exists())
+
+    def test_s4_a_rule_that_changes_and_comes_back_needs_a_new_yes(self):
+        victim = self.old("scratch-old-unnamed.log")
+        engine, source = self.daemon({"daemon_apply": True}, acked=False)
+        self.go(source)
+        self.preview_facts(engine, source)
+        first = json.loads((self.world.state / sb.TEMP_JANITOR_GATE_FILE).read_text())["preview"]
+        self.assertEqual(self.record_ack(first)[0], 0)
+        engine, source = self.daemon({"daemon_apply": True, "days": 8}, acked=False)   # the rule moves to B
+        self.week(engine)
+        self.go(source)
+        self.assertFalse((self.world.state / sb.TEMP_JANITOR_ACK_FILE).exists(), "a new preview ends the earlier yes")
+        self.preview_facts(engine, source)
+        engine, source = self.daemon({"daemon_apply": True}, acked=False)   # and back to A, same names
+        self.week(engine)
+        self.go(source)
+        self.preview_facts(engine, source)
+        self.week(engine)
+        self.go(source)
+        self.assertTrue(victim.exists(), "the old yes does not unlock it again")
+        self.assertEqual(self.events("temp.removed"), [])
+
+    def test_s8_a_name_is_only_in_the_private_audit_and_the_message(self):
+        engine, source = self.daemon({"daemon_apply": True}, acked=False)
+        self.old("distinctive-fixture-name.log")
+        self.go(source)
+        facts = self.preview_facts(engine, source)
+        self.assertIn("distinctive-fixture-name.log", facts[0].summary)
+        for event in ("janitor.preview",):
+            self.assertEqual(len(self.events(event)), 1)
+        public = json.dumps([e for e in self.world.audit() if e["event"] in ("janitor.preview", "janitor.ack")])
+        public += (self.world.state / sb.TEMP_JANITOR_GATE_FILE).read_text()
+        self.assertNotIn("distinctive-fixture-name", public)
 
     def test_a_failure_inside_the_run_is_one_janitor_error_and_removes_nothing(self):
         victim = self.old("old-file.txt")
@@ -65807,12 +66297,105 @@ class TestReviewerSubagents(LedgerBase):
         return out
 
     def test_gates_shows_how_many_of_the_five_recorded_at_the_head_and_a_push_voids_them(self):
-        self.assertIn("reviewers (shadow, not counted; recorded by the PR's own session, so not independent): 0 of 5 recorded at %s; missing code, architecture, security, impact, test" % LEDGER_HEAD[:8], self.gates_text())
+        self.assertIn("reviewers (plan-review panel verdicts: shadow, not counted by any gate): 0 of 5 recorded at %s; missing code, architecture, security, impact, test" % LEDGER_HEAD[:8], self.gates_text())
         for role in self.ROLES:
             self.assertEqual(self.record("coder", role)[0], 0)
-        self.assertIn("not independent): 5 of 5 recorded at %s: architecture approve, code approve, impact approve, security approve, test approve" % LEDGER_HEAD[:8], self.gates_text())
+        self.assertIn("not counted by any gate): 5 of 5 recorded at %s: architecture approve, code approve, impact approve, security approve, test approve" % LEDGER_HEAD[:8], self.gates_text())
         self.pr["headRefOid"] = "c" * 40   # a push
-        self.assertIn("not independent): 0 of 5 recorded at cccccccc", self.gates_text())
+        self.assertIn("not counted by any gate): 0 of 5 recorded at cccccccc", self.gates_text())
+
+    # -- #892: the caption is true of the panel line alone, and the impact rating has its own line
+
+    def rate_at_head(self, level, role, head=LEDGER_HEAD):
+        cells = sb.impact_floor.load_matrix()["cells"]
+        severity, probability = next((s, p) for s in cells for p in cells[s] if cells[s][p]["level"] == level)
+        entry = {"kind": "review_record", "pr": self.PR, "head": head, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": role,
+                 "impact_severity": severity, "impact_probability": probability, "impact_action": "none"}
+        sb.plan_ledger.append_entry(self.world.state, entry, self.world.clock.now())
+
+    def rating_lines(self):
+        return [line.strip() for line in self.gates_text().splitlines() if "impact rating at" in line]
+
+    def test_s1_the_shadow_caption_says_what_the_panel_line_is_and_nothing_about_the_independent_rating(self):
+        self.record("coder", "code")
+        text = self.gates_text()
+        shadow = [line for line in text.splitlines() if line.strip().startswith("reviewers (")]
+        self.assertEqual(len(shadow), 1)
+        self.assertIn("plan-review panel verdicts: shadow, not counted by any gate", shadow[0])
+        self.assertNotIn("not independent", text)
+
+    def test_s2_a_counted_rating_is_named_with_its_level_and_that_its_role_counts(self):
+        self.rate_at_head("Medium", "reviewer")
+        lines = self.rating_lines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("Medium", lines[0])
+        self.assertIn("counts", lines[0])
+        self.assertNotIn("not counted", lines[0])
+
+    def test_s3_s6_a_rating_by_a_role_that_does_not_count_is_recorded_not_counted_and_no_rating_is_said(self):
+        self.assertEqual(self.rating_lines(), ["impact rating at %s: no impact rating recorded" % LEDGER_HEAD[:8]])
+        self.rate_at_head("High", "coder")
+        lines = self.rating_lines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("not counted", lines[0])
+        self.assertNotIn("counts", lines[0])
+        self.rate_at_head("Low", "reviewer", head="d" * 40)   # another head's rating is not this head's
+        self.assertIn("not counted", self.rating_lines()[0])
+
+    def rate_unscored(self, role, severity="Huge", probability="Remote"):
+        entry = {"kind": "review_record", "pr": self.PR, "head": LEDGER_HEAD, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": role,
+                 "impact_severity": severity, "impact_probability": probability, "impact_action": "none"}
+        sb.plan_ledger.append_entry(self.world.state, entry, self.world.clock.now())
+
+    def test_s3_a_counting_role_with_no_usable_score_is_not_told_as_a_role_that_does_not_count(self):
+        self.rate_unscored("reviewer")   # an unknown cell: the role counts, the score does not
+        line = self.rating_lines()[0]
+        self.assertIn("recorded role counts", line)
+        self.assertIn("no usable score", line)
+        self.assertNotIn("not counted", line)
+
+    def test_s3_the_four_shapes_read_differently_and_a_failed_read_is_unknown(self):
+        said = {}
+        said["none"] = self.rating_lines()[0]
+        self.rate_unscored("coder", "Marginal", "Remote")   # a valid cell by a role that does not count
+        said["not-role"] = self.rating_lines()[0]
+        self.assertEqual(len(set(said.values())), 2)
+        self.assertIn("not counted", said["not-role"])
+        with mock.patch.object(sb.plan_ledger, "impact_rating_fact", side_effect=RuntimeError("boom")):
+            self.assertIn("unknown", self.rating_lines()[0])   # a failure inside the reading is said as unknown, never raised out of `gates`
+        with mock.patch.object(sb.impact_floor, "_matrix_cached", side_effect=RuntimeError("no matrix")):
+            self.assertIn("unknown", self.rating_lines()[0])   # an exception never escapes `gates`
+
+    def test_s3_every_unreadable_branch_says_unknown_and_never_no_rating_while_a_record_exists(self):
+        self.rate_at_head("Medium", "reviewer")
+        module = sb.load_module("delegated_clear")
+        cases = {"the score block cannot be read": mock.patch.object(module, "score_block", return_value=None),
+                 "the matrix has no cells": mock.patch.object(sb.impact_floor, "_matrix_cached", return_value={"cells": {}}),
+                 "the matrix cannot be read": mock.patch.object(sb.impact_floor, "_matrix_cached", side_effect=RuntimeError("no matrix")),
+                 "the scoring raises": mock.patch.object(module, "judge", side_effect=RuntimeError("boom")),
+                 "the shaping raises": mock.patch.object(sb.plan_ledger, "impact_rating_fact", side_effect=RuntimeError("boom"))}
+        for label, patch in cases.items():
+            with self.subTest(branch=label), patch:
+                lines = self.rating_lines()
+                self.assertEqual(len(lines), 1, label)
+                self.assertIn("unknown", lines[0], label)
+                self.assertNotIn("no impact rating recorded", lines[0], label)
+                self.assertNotIn("not counted", lines[0], label)
+
+    def test_s4_s5_the_line_changes_no_gate_and_is_the_engines_own_reading(self):
+        def gates():
+            code, out, err = self.run_as("coder", "gates", self.PR, "--json")
+            body = json.loads(out)
+            return code, body["ready"], [(g["gate"], g["status"]) for g in body["gates"]], body["impact_rating"]
+        before = gates()
+        self.assertEqual(before[3], {"recorded": False})
+        self.rate_at_head("Medium", "reviewer")
+        after = gates()
+        self.assertEqual(before[:3], after[:3])   # no exit code, readiness or gate status moved
+        entries, _ = sb.impact_rating_entries(self.world.state, self.PR, LEDGER_HEAD)
+        cells = sb.impact_floor.load_matrix()["cells"]
+        top = entries[-1]
+        self.assertEqual(after[3], {"recorded": True, "role_counts": True, "scored": True, "level": cells[top["impact_severity"]][top["impact_probability"]]["level"]})
 
     def test_the_shadow_line_never_changes_whether_the_pr_is_ready(self):
         def ready():

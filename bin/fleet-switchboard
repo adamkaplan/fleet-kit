@@ -2904,6 +2904,37 @@ class DockerReapFacts:
 TEMP_JANITOR_FILE = "temp-janitor-daemon.json"
 TEMP_JANITOR_INTERVAL = 6 * 86400   # the weekly gate: never twice within 6 days
 TEMP_JANITOR_NAMES = 200            # names carried by one audit line (the count says the rest)
+TEMP_JANITOR_GATE_FILE = "temp-janitor-gate.json"   # {"rule", "preview", "sent", "count"}: the rule the last preview was made under (hashes and a count, never a name)
+TEMP_JANITOR_ACK_FILE = "temp-janitor-ack.json"     # {"rule", "preview", "by", "at"}: the recorded yes, written by `disk janitor-ack <preview>` only
+TEMP_JANITOR_PREVIEW_NAMES = 25     # names listed in the preview message (the count says the rest)
+
+
+def read_janitor_record(state_dir, name):
+    """(ok, dict): a missing file is (True, {}); one that cannot be read in full or is not an object of text and numbers is (False, {}): the doubt applies nothing."""
+    try:
+        with open(str(Path(state_dir) / name), "rb") as handle:
+            raw = json.loads(handle.read(4097).decode("utf-8"))
+    except FileNotFoundError:
+        return True, {}
+    except (OSError, ValueError, UnicodeError):
+        return False, {}
+    if not isinstance(raw, dict) or not all(isinstance(v, (str, int, float, bool)) for v in raw.values()):
+        return False, {}
+    return True, raw
+
+
+def janitor_apply_allowed(state_dir, rule):
+    """(allowed, state): True only when the last preview was SENT under THIS rule and a yes is recorded for that very preview. state is one of
+    `acked`, `no_preview` (none sent under this rule), `awaiting_ack` or `unreadable`. Every doubt is False."""
+    gate_ok, gate = read_janitor_record(state_dir, TEMP_JANITOR_GATE_FILE)
+    ack_ok, ack = read_janitor_record(state_dir, TEMP_JANITOR_ACK_FILE)
+    if not gate_ok or not ack_ok:
+        return False, "unreadable"
+    if gate.get("rule") != rule or gate.get("sent") is not True or not gate.get("preview"):
+        return False, "no_preview"
+    if ack.get("rule") == rule and ack.get("preview") == gate["preview"] and gate.get("nonce") and ack.get("nonce") == gate["nonce"]:   # the nonce is new for every preview: a yes given to an earlier one (the rule may have come back) never counts
+        return True, "acked"
+    return False, "awaiting_ack"
 
 
 class TempJanitorFacts:
@@ -2918,9 +2949,32 @@ class TempJanitorFacts:
 
     def __init__(self):
         self.engine, self.thread, self.noted = None, None, False
+        self.outbox = None   # (preview fingerprint, text) made by the thread, handed to the Chief of Staff by the next main-thread pass
 
     def bind(self, engine):
         self.engine = engine
+
+    def _hand_over(self, engine):
+        """The preview the thread made: ONE message to each Chief of Staff, keyed by the preview (so a repeat is never a second message); the gate is marked
+        `sent` only now, once there is someone to tell. With no Chief of Staff running it waits for the next pass."""
+        box = self.outbox
+        discovery = getattr(engine, "discovery", None)
+        chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff") if discovery is not None and not discovery.problems else []
+        if box is None or not chiefs:
+            return []
+        preview, rule, text = box
+        ok, gate = read_janitor_record(engine.state_dir, TEMP_JANITOR_GATE_FILE)
+        if not ok or gate.get("preview") != preview:
+            self.outbox = None   # the gate moved on or cannot be read: nothing is marked, and the next run makes a new preview
+            return []
+        try:
+            _write_small(engine.state_dir, TEMP_JANITOR_GATE_FILE, dict(gate, sent=True))
+        except OSError:
+            return []   # not marked sent: the next pass tries again (the same key is never delivered twice)
+        self.outbox = None
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "janitor.preview", "temp", {"rule": rule, "preview": preview, "count": gate.get("count"), "to": chiefs})
+        return [Fact("janitor.preview:%s" % preview, name, "janitor", text, engine.now(), sender="switchboard") for name in chiefs]
 
     def _last(self, state_dir):
         """(ok, time or None): a missing file is (True, None); a file that cannot be read in full is (False, None): the doubt keeps everything."""
@@ -2946,6 +3000,9 @@ class TempJanitorFacts:
             return []
         if self.thread is not None and self.thread.is_alive():
             return []
+        handed = self._hand_over(engine) if self.outbox is not None else []
+        if handed:
+            return handed
         ok, last = self._last(engine.state_dir)
         if not ok:
             if not self.noted:
@@ -2977,7 +3034,9 @@ class TempJanitorFacts:
         try:
             janitor = load_disk_janitor()
             cfg = janitor.settings(engine.config.get("temp_janitor"))
-            apply = cfg["daemon_apply"] is True
+            rule = janitor.rule_fingerprint(cfg)
+            allowed, gate_state = janitor_apply_allowed(engine.state_dir, rule)   # a changed rule, a missing yes or a record in doubt: nothing is applied
+            apply = cfg["daemon_apply"] is True and allowed
             temp = Path(cfg["dir"]) if cfg.get("dir") else janitor.default_dir()
             outcome = []
             started = time.monotonic()
@@ -2994,9 +3053,32 @@ class TempJanitorFacts:
             notes = [_plain(l, 200) for l in lines if not l.startswith(("removed ", "would remove "))][:20]
             detail = {"count": len(outcome), "bytes": sum(o["bytes"] for o in outcome), "names": [_plain(o["name"], 120) for o in outcome[:TEMP_JANITOR_NAMES]],
                       "budget_seconds": cfg["weekly_scan_seconds"], "used_seconds": used, "kept": kept, "notes": notes}
+            if not apply:
+                detail["gate"] = gate_state if cfg["daemon_apply"] is True else "dry_run"
             engine.audit.append(engine.actor, "janitor.summary" if apply else "janitor.would_remove", "temp", detail)
+            if not apply and gate_state == "no_preview":
+                self._make_preview(engine, janitor, rule, outcome, cfg)
         except Exception as err:   # a janitor never stops the daemon
             engine._note("janitor.error", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
+
+    def _make_preview(self, engine, janitor, rule, outcome, cfg):
+        """The selection rule changed (or was never previewed): record the preview's fingerprint in the gate, and queue ONE message to the Chief of Staff. The
+        names go in that message only (and in the private `janitor.would_remove` audit line above); the gate file and the `janitor.preview` audit line hold hashes and a count."""
+        names = [o["name"] for o in outcome]
+        preview = janitor.preview_fingerprint(rule, names)
+        try:   # a new preview ends every earlier yes
+            os.unlink(str(Path(engine.state_dir) / TEMP_JANITOR_ACK_FILE))
+        except FileNotFoundError:
+            pass
+        _write_small(engine.state_dir, TEMP_JANITOR_GATE_FILE, {"rule": rule, "preview": preview, "sent": False, "count": len(names), "nonce": uuid.uuid4().hex})
+        shown = ", ".join(_plain(n, 60) for n in names[:TEMP_JANITOR_PREVIEW_NAMES])
+        text = ("temp janitor: its selection rule changed, so nothing is applied until you say yes to this preview. It WOULD remove %d entr%s (%d bytes): %s%s. "
+                "To say yes to this preview: `%s disk janitor-ack %s`. The yes covers the RULE this preview was made under: later weekly runs under the same rule remove "
+                "whatever qualifies then, not only the names listed; a change of the rule makes a new preview and needs a new yes. The daemon removes anything only while "
+                "`temp_janitor.daemon_apply` is true. If this message is lost no apply happens until the rule changes again." % (
+                    len(names), "y" if len(names) == 1 else "ies", sum(o["bytes"] for o in outcome), shown or "nothing",
+                    " and %d more" % (len(names) - TEMP_JANITOR_PREVIEW_NAMES) if len(names) > TEMP_JANITOR_PREVIEW_NAMES else "", PROG, preview))
+        self.outbox = (preview, rule, text)
 
 
 HEAVY_ORPHAN_INTERVAL = 60   # seconds between the daemon's looks for a run whose wrapper is gone
@@ -3564,7 +3646,7 @@ def collapse_riders(facts, now, max_age):
 
 
 DESCRIBED_AS = {"send": "message", "report": "report", "worker.idle": "finished", "worker.stopped": "stopped",
-                "worker.blocked": "blocked", "nudge": "nudge", "sweep": "sweep", "triage": "triage", "plan": "plan posted", "alert": "alert issue", "disk": "disk guard"}
+                "worker.blocked": "blocked", "nudge": "nudge", "sweep": "sweep", "triage": "triage", "plan": "plan posted", "alert": "alert issue", "disk": "disk guard", "janitor": "janitor preview"}
 
 
 def _line_of(text, limit):
@@ -21431,6 +21513,7 @@ def cmd_gates(args, runner, now):
                                         now=now())
     report["plan_problem"] = ctx.plan_problem
     report["pr_unreadable"] = ctx.unreadable
+    report["impact_rating"] = gate_impact_rating(ctx.state, ctx.pr, ctx.facts.get("head"))   # #892: output text only; no gate reads it
     gates_carried_note(report, ctx)
     plan_ledger.enforced_view(report, enforced_gates_of(ctx))
     first = next((e.get("plan_ref") for e in ctx.entries if e.get("pr") == ctx.pr and e.get("plan_ref")), None)
@@ -21892,6 +21975,27 @@ def impact_rating_entries(state_dir, pr, head):
     if problem:
         return [], _one_line(str(problem), 120)
     return [e for e in entries if e.get("kind") == "review_record" and e.get("reviewer") == "impact" and e.get("pr") == pr and e.get("head") == head], None
+
+
+def gate_impact_rating(state_dir, pr, head):
+    """What the `gates` impact-rating line says (#892), from the engine's own records and rule and nothing computed here: `impact_rating_entries` (the one filter of the independent
+    reviewer's records at EXACTLY this head) and `delegated_clear.judge` (the level of the highest record whose recorded role counts, from the matrix cell: the SAME function the delegated
+    clear scores with). `plan_ledger.impact_rating_fact` shapes the answer. None when there is no head. A ledger it cannot read is said, never guessed."""
+    if not head or state_dir is None:
+        return None
+    entries, problem = impact_rating_entries(state_dir, pr, head)
+    if problem:
+        return {"problem": problem}
+    try:   # never an exception out of `gates`: what cannot be read is said as unknown
+        module = load_module("delegated_clear")
+        block = module.score_block()
+        cells = impact_floor._matrix_cached()["cells"]
+        if not block or not cells:
+            return {"problem": "the score rule or the matrix could not be read"}
+        level = module.judge(block, cells, entries, {"pr": pr, "head": head, "top_tier_hits": {}}, block["delegable_levels"][0]).get("level") if entries else None
+        return plan_ledger.impact_rating_fact(entries, level, block["rating_roles"])
+    except Exception as err:
+        return {"problem": _one_line("%s: %s" % (type(err).__name__, err), 100)}
 
 
 def _file_text_at(engine, repo, path, ref):
@@ -24962,11 +25066,83 @@ def cmd_disk_report(args, runner, now):
     return EXIT_OK
 
 
+JANITOR_OPEN_SECONDS = 30   # the open-file check's own time limit: past it the entries are kept, never waited for
+
+
+def janitor_agent_roots(engine, now, days):
+    """[(agent name, directory)]: the working directory and the private temp directory of every agent the registry holds NOW, live, or retired within `days`.
+    THE ONE FUNCTION that reads the agent list for the janitor: when the one registry (#929) lands, only its body changes. Raises janitor.Unknown when a
+    record exists and cannot be read (the janitor then keeps every entry); a missing record is an empty one."""
+    if engine.state_dir is None:
+        raise janitor_unknown("there is no state directory")
+    live, retired_at = {}, {}
+    try:
+        with open(str(Path(engine.state_dir) / PANE_HEALTH_FILE), "rb") as handle:
+            raw = json.loads(handle.read(1000001).decode("utf-8"))
+        if not isinstance(raw, dict) or not isinstance(raw.get("agents", {}), dict):
+            raise ValueError("not a map of agents")
+    except FileNotFoundError:
+        raw = {}
+    except (OSError, ValueError, UnicodeError) as err:
+        raise janitor_unknown("%s cannot be read (%s)" % (PANE_HEALTH_FILE, _one_line(str(err), 60)))
+    for name, info in (raw.get("agents") or {}).items():
+        live[name] = info.get("cwd") if isinstance(info, dict) else None
+    for name in (getattr(getattr(engine, "discovery", None), "agents", None) or {}):
+        live.setdefault(name, None)
+    try:
+        retired = read_retired_strict(engine.state_dir)
+    except RetiredUnreadable as err:
+        raise janitor_unknown("%s cannot be read (%s)" % (RETIRED_FILE, _one_line(str(err), 60)))
+    cutoff = now - days * 86400
+    for name, entry in retired.items():
+        at = entry.get("at")
+        if not isinstance(at, (int, float)) or isinstance(at, bool) or at >= cutoff:   # a time that cannot be read counts as recent: the doubt keeps
+            record = entry.get("record") if isinstance(entry.get("record"), dict) else {}
+            retired_at[name] = record.get("cwd")
+    roots = []
+    for name, cwd in sorted(dict(retired_at, **live).items()):
+        if isinstance(cwd, str) and os.path.isabs(cwd):
+            roots.append((name, cwd))
+        if NAME_RE.fullmatch(name or "") and not agent_tmp_shared_name(name):   # the shared directory is the janitor's own: it is no one agent's
+            for base in (agent_tmp_root(engine.config), headless_tmp_root()):
+                if base is not None:
+                    roots.append((name, str(base / name)))
+    return roots
+
+
+def janitor_unknown(message):
+    return load_disk_janitor().Unknown(message)
+
+
 def janitor_busy_function(engine, runner, janitor):
     """`busy(path)` for the temp janitor: why an entry is in use, else None; raises janitor.Unknown when something cannot be read (the entry is then kept).
     In use = a herdr pane (an agent's or a plain terminal) works in it, a non-retired agent's session runs in it (both from `worktree_in_use`), or ANY live
     process has it as its working directory (one `lsof -a -d cwd -Fn` per run, bounded by a timeout)."""
     held = {}
+    days = (engine.config.get("temp_janitor") or {}).get("days", 7)
+    if isinstance(days, bool) or not isinstance(days, int):
+        days = 7
+
+    def open_paths():
+        """The paths of every file a live process holds open (one `lsof -Fn` per run, bounded by a timeout). A timeout, an error or a list too long raises Unknown."""
+        if "open" not in held:
+            try:
+                done = runner(["lsof", "-n", "-P", "-Fn"], capture_output=True, text=True, timeout=JANITOR_OPEN_SECONDS, stdin=subprocess.DEVNULL)
+            except (OSError, subprocess.SubprocessError) as err:   # includes a timeout
+                raise janitor.Unknown("the open-file check did not finish: %s" % _one_line(str(err), 80))
+            if done.returncode not in (0, 1) or (done.returncode == 1 and not (done.stdout or "").strip()):
+                raise janitor.Unknown("the open-file check failed (exit %s)" % done.returncode)
+            lines = (done.stdout or "").splitlines()
+            if len(lines) > 2000000:
+                raise janitor.Unknown("the open-file check listed more than 2000000 lines: a file past the limit would not protect its entry")
+            limit, resolved = time.monotonic() + JANITOR_OPEN_SECONDS, []
+            for l in lines:
+                if l.startswith("n/"):
+                    if time.monotonic() > limit:
+                        raise janitor.Unknown("resolving the open-file list took longer than %d s" % JANITOR_OPEN_SECONDS)
+                    resolved.append(os.path.realpath(l[1:]))
+            held["open"] = resolved
+        return held["open"]
 
     def process_directories():
         if "dirs" not in held:
@@ -24987,9 +25163,22 @@ def janitor_busy_function(engine, runner, janitor):
         if why:
             return why
         root = os.path.realpath(path).rstrip("/") + "/"
+        try:
+            roots = janitor_agent_roots(engine, engine.now(), days)
+        except janitor.Unknown:
+            raise
+        except Exception as err:   # a registry that cannot be read keeps the entry
+            raise janitor.Unknown("the agent registry cannot be read (%s)" % _one_line("%s: %s" % (type(err).__name__, err), 80))
+        for name, where in roots:
+            here = os.path.realpath(where).rstrip("/") + "/"
+            if here.casefold().startswith(root.casefold()) or root.casefold().startswith(here.casefold()):   # case-folded: a case-insensitive volume may spell it otherwise (over-keeping is the safe side)   # it is, contains or sits inside the agent's directory
+                return "it is, holds or sits inside the temp or working directory of agent %s" % _plain(name, 60)
         for where in process_directories():
-            if (where.rstrip("/") + "/").startswith(root):
+            if (where.rstrip("/") + "/").casefold().startswith(root.casefold()):
                 return "a live process has it as its working directory (%s)" % _plain(where, 100)
+        for where in open_paths():
+            if (where.rstrip("/") + "/").casefold().startswith(root.casefold()):
+                return "a live process has a file of it open"
         return None
     return busy
 
@@ -25016,10 +25205,26 @@ def cmd_disk_janitor(args, runner, now):
     return EXIT_OK
 
 
+def cmd_disk_janitor_ack(args, runner, now):
+    """`disk janitor-ack <preview>`: record the yes to the temp janitor's would-remove preview the daemon sent. Only the operator or the Chief of Staff; the
+    fingerprint must be the pending preview's (a yes to an older one is refused, and the daemon compares it again before it applies anything)."""
+    kind = gates_caller_kind(runner, now)
+    if not (kind[0] == "person" or (kind[0] == "agent" and len(kind) > 2 and kind[2] == "chief-of-staff")):
+        raise LaunchError("refused: only the operator or the Chief of Staff may record the yes to a temp janitor preview (%s is %s)" % (kind[1], "an agent" if kind[0] == "agent" else "not known"))
+    engine, state, _ = build_engine(runner, now, "cli", writable=True)
+    ok, gate = read_janitor_record(state, TEMP_JANITOR_GATE_FILE)
+    if not ok or gate.get("sent") is not True or gate.get("preview") != args.preview:
+        raise LaunchError("no pending temp janitor preview has the fingerprint %s (it may be an older one: the newest is in the Chief of Staff's message): nothing recorded" % _one_line(args.preview, 40))
+    _write_small(state, TEMP_JANITOR_ACK_FILE, {"rule": gate["rule"], "preview": gate["preview"], "nonce": gate.get("nonce", ""), "by": kind[1], "at": now()})
+    engine.audit.append(engine.actor, "janitor.ack", "temp", {"rule": gate["rule"], "preview": gate["preview"], "by": kind[1]})
+    print("%s: recorded the yes to temp janitor preview %s (rule %s): the daemon may apply while temp_janitor.daemon_apply is true" % (PROG, gate["preview"], gate["rule"]))
+    return EXIT_OK
+
+
 def cmd_disk(args, runner, now):
     """The `disk` group: `prune` (the disk guard, #319), `reap-docker` (#326) and `reclaim-worktrees` / `register-worktree` (the worktree lifecycle, #321)."""
     try:   # `direct` skips dispatch's error mapping, so refusals are mapped here for every subcommand
-        return {"report": cmd_disk_report, None: cmd_disk_report, "prune": cmd_disk_prune, "reap-docker": cmd_disk_reap_docker, "janitor": cmd_disk_janitor, "reap-orphans": cmd_disk_reap_orphans, "reclaim-worktrees": cmd_disk_reclaim_worktrees, "register-worktree": cmd_disk_register_worktree}[args.disk_action](args, runner, now)
+        return {"report": cmd_disk_report, None: cmd_disk_report, "prune": cmd_disk_prune, "reap-docker": cmd_disk_reap_docker, "janitor": cmd_disk_janitor, "janitor-ack": cmd_disk_janitor_ack, "reap-orphans": cmd_disk_reap_orphans, "reclaim-worktrees": cmd_disk_reclaim_worktrees, "register-worktree": cmd_disk_register_worktree}[args.disk_action](args, runner, now)
     except (LaunchError, ConfigError, CallerError, LockError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err))))
         return EXIT_ERROR
@@ -25316,6 +25521,10 @@ def add_disk_parsers(sub):
                                               "protects. Never follows a link, never touches another user's entry. Each removal is one temp.removed audit line.")
     janitor.add_argument("--apply", action="store_true", help="Remove them (the default only lists)")
     janitor.add_argument("--weekly", action="store_true", help="The weekly job: scan under the longer budget temp_janitor.weekly_scan_seconds (default 600 s) instead of scan_seconds (60 s)")
+    ack = disk_sub.add_parser("janitor-ack", allow_abbrev=False, help="record the yes to the temp janitor's would-remove preview (the Chief of Staff's or the operator's)",
+                              description="The daemon sends the Chief of Staff one would-remove preview after any change of the janitor's selection rule and applies nothing until "
+                                          "the yes to that exact preview is recorded here. A changed rule makes a new preview and needs a new yes.")
+    ack.add_argument("preview", help="the preview's fingerprint, as the message gives it")
     orphans = disk_sub.add_parser("reap-orphans", allow_abbrev=False, help="Signal (SIGTERM, then SIGKILL) orphaned test helpers past the grace: parent launchd, an exact allow-list; a dry run unless --apply")
     orphans.add_argument("--apply", action="store_true", help="Do it (default: a dry run)")
     reclaim = disk_sub.add_parser("reclaim-worktrees", allow_abbrev=False, help="Remove the registered worktrees of retired agents when clean and pushed; else keep and say why (a dry run unless --apply)")
