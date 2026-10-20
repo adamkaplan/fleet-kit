@@ -22991,7 +22991,7 @@ def cmd_review(args, runner, now):
             raise ReviewError("an approve cannot carry blocking findings (%d given)" % args.blocks)
         if args.verdict == "request-changes" and not args.blocks:
             raise ReviewError("request-changes needs at least 1 blocking finding (a finding that cites no rule never blocks)")
-        if getattr(args, "confirms_carry", False) and args.verdict != "approve":
+        if args.confirms_carry and args.verdict != "approve":
             raise ReviewError("--confirms-carry belongs to an approve: a reviewer who found a change to the pull request's own lines does not confirm it")
         if action and args.reviewer != "impact":
             raise ReviewError("--impact-action belongs to the impact reviewer")
@@ -23035,11 +23035,11 @@ def cmd_review(args, runner, now):
         entry = {"kind": "review_record", "pr": ref, "head": head, "reviewer": args.reviewer, "verdict": args.verdict,
                  "blocks": args.blocks, "notes": args.notes, "by": by,
                  "summary": plan_ledger.clip(redact_command_text(args.summary or ""), 200)}
-        if getattr(args, "confirms_carry", False):
+        if args.confirms_carry:
             entry["carry_confirmed"] = True   # (#815) read by `impact_hold.carry_confirmer`: only a reviewer's own record at the head it judged
         if action:
             entry["impact_action"] = action
-        if args.reviewer == "impact" or getattr(args, "confirms_carry", False):   # (#815) a carry confirmation is read by the same recorded role as a rating
+        if args.reviewer == "impact" or args.confirms_carry:   # (#815) a carry confirmation is read by the same recorded role as a rating
             entry["by_role"] = kind[2] if kind[0] == "agent" and len(kind) > 2 and isinstance(kind[2], str) else None   # #835: the RECORDED role of the session that made the record (never a flag or a text): only the independent reviewer's rating counts
         for name in IMPACT_RATING_FIELDS:
             if rating[name]:
