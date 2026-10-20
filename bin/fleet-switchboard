@@ -20840,15 +20840,19 @@ def _scenario_of(ctx, sid):
 
 
 HEAD_MIN = 7   # git's own floor for an unambiguous short sha; a shorter prefix is refused
+FULL_HEAD_RE = re.compile(r"[0-9a-f]{40}")   # the one pattern of a full commit sha
 
 
-def resolve_head(given, known, unreadable=None):
+def resolve_head(given, known, unreadable=None, read_only=False):
     """THE one resolver of a head a caller names for a pull request (#994). `given` is the --head text (None: not given), `known` the
     pull request's current full head (None: unreadable). Returns the FULL 40-character head, never the text as given, or raises
     LedgerCommandError with one line. A prefix matches the current head only: a pull request has one, so it matches one commit or none;
-    the only ambiguous prefix is one too short for git to call unambiguous."""
+    the only ambiguous prefix is one too short for git to call unambiguous. `read_only` (a command that only LOOKS, never records) also
+    lets a FULL head that is not the current one through, to read an older head's records; a short head is still resolved or refused.
+    Fail mode, on purpose: when the pull request's head cannot be read, a FULL given head is used as given (as before this change; the
+    gates compare it exactly, so a wrong one binds to nothing) and a short one is refused."""
     if given is None:
-        if not known or not re.fullmatch(r"[0-9a-f]{40}", known):
+        if not known or not FULL_HEAD_RE.fullmatch(known):
             raise LedgerCommandError("the PR head is unknown (%s): pass --head <full 40-character sha>" % (unreadable or "not a sha"))
         return known
     text = given.strip().lower()
@@ -20858,8 +20862,10 @@ def resolve_head(given, known, unreadable=None):
         raise LedgerCommandError("--head %s... is longer than a sha: give the full 40-character head, or none (nothing was recorded)" % text[:12])
     if len(text) < HEAD_MIN:
         raise LedgerCommandError("--head %s is too short to name one commit (at least %d characters, else ambiguous): give the full 40-character head, or none (nothing was recorded)" % (text, HEAD_MIN))
-    if not known or not re.fullmatch(r"[0-9a-f]{40}", known):
-        if len(text) == 40:
+    if read_only and FULL_HEAD_RE.fullmatch(text):
+        return text
+    if not known or not FULL_HEAD_RE.fullmatch(known):
+        if FULL_HEAD_RE.fullmatch(text):
             return text
         raise LedgerCommandError("cannot resolve --head %s: the PR head could not be read (%s): give the full 40-character head (nothing was recorded)" % (text, unreadable or "unknown"))
     if not known.startswith(text):
@@ -23552,10 +23558,7 @@ def cmd_review(args, runner, now):
             if problem:
                 raise ReviewError("the ledger is not trustworthy: %s" % problem)
             try:
-                if isinstance(args.head, str) and re.fullmatch(r"[0-9a-f]{40}", args.head):
-                    at = args.head   # read-only: the records of ANY full head may be looked at (an older head's blockers)
-                else:   # a short head reads as the PR's full head, a bad one is refused (#994)
-                    at = resolve_head(args.head, head) if args.head is not None or head else None
+                at = resolve_head(args.head, head, read_only=True) if args.head is not None or head else None   # #994: a short head reads as the PR's full head
             except LedgerCommandError as err:
                 raise ReviewError(str(err)) from None
             latest = {}
@@ -23634,7 +23637,7 @@ def cmd_review(args, runner, now):
             valid = rule[0] + rule[1]
             if impact_class not in valid:
                 raise ReviewError("an impact hold must name a class of the matrix (%s), got %r: run the review again (nothing was recorded)" % (", ".join(valid), impact_class))
-        if not head or not re.fullmatch(r"[0-9a-f]{40}", head):
+        if not head or not FULL_HEAD_RE.fullmatch(head):
             raise ReviewError("the PR head is unknown: nothing was recorded")
         try:
             resolve_head(args.head, head)   # the one resolver (#994); the record holds the PR's full head, read above

@@ -30923,8 +30923,8 @@ class TestWaive(LedgerBase):
 
 class TestHeadResolution(LedgerBase):
     """#994: a head a caller names for a pull request is resolved to the pull request's FULL head before anything is recorded, or refused.
-    One table of head shapes, run against the real `waive` through `main`, with a mutant of the one resolver per row; the fake GitHub answers
-    only the full head (the real one never expands a short sha). Neutral names."""
+    One table of head shapes, run against EVERY command that resolves a head (the real commands, through `main`), with mutants of the one
+    resolver; the fake GitHub answers only the full head (the real one never expands a short sha). Neutral names."""
 
     FULL = "abcdef0123456789abcdef0123456789abcdef01"
     REASON = "hotfix for a broken release: the plan follows within a day"
@@ -30942,6 +30942,7 @@ class TestHeadResolution(LedgerBase):
         ("over_long", FULL + "0", None, "longer than a sha"),
         ("not_the_prs_head", "fedcba9", None, "is not the PR's head"),
     )
+    MEMBERS = ("waive", "prove", "verdict", "review-record", "review-blockers")   # every command that resolves a head: one table, run for each
 
     def setUp(self):
         super().setUp()
@@ -30950,33 +30951,60 @@ class TestHeadResolution(LedgerBase):
         self.pr["headRefOid"] = self.FULL
         self.configure()
 
-    def waive(self, head=NONE):
+    def call(self, member, head=NONE):
+        """(exit code, stdout, stderr, the entries the command wrote) of one real command with `head`."""
         more = () if head is self.NONE else ("--head", head)
-        return self.run_as("cos", "waive", self.PR, "--gates", "G1", "--reason", self.REASON, *more)
+        before = self.ledger()
+        if member == "waive":
+            code, out, err = self.run_as("cos", "waive", self.PR, "--gates", "G1", "--reason", self.REASON, *more)
+        elif member == "prove":
+            code, out, err = self.prove("coder", "S1", *more)
+        elif member == "verdict":
+            code, out, err = self.verdict("cibot", "S1", "ci", "pass", *more)
+        elif member == "review-record":
+            code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "code", "--verdict", "approve", *more)
+        else:
+            code, out, err = self.run_as("coder", "review", "blockers", self.PR, *more)
+        return code, out, err, self.ledger()[len(before):]
 
-    def run_table(self):
-        """The names of the rows that do not behave as TABLE says."""
+    def prepare(self, member):
+        if member == "verdict":
+            self.assertEqual(self.prove("coder", "S1")[0], 0)   # a verdict judges a proven scenario
+        if member == "review-blockers":
+            self.assertEqual(self.run_as("coder", "review", "record", self.PR, "--reviewer", "code", "--verdict", "request-changes", "--blocks", "1")[0], 0)
+
+    def run_table(self, member):
+        """The names of the rows that do not behave as TABLE says for `member`."""
+        self.prepare(member)
         failed = []
         for name, given, recorded, text in self.TABLE:
-            before, audit_before = self.ledger(), len([e for e in self.world.audit() if e["event"] == "gate.waiver.refused"])
-            code, out, err = self.waive(given)
-            after = self.ledger()
-            if recorded is not None:
-                good = code == 0 and len(after) == len(before) + 1 and after[-1]["head"] == recorded
+            code, out, err, new = self.call(member, given)
+            if recorded is not None and member == "review-blockers":
+                good = code == 0 and out.startswith("code recorded request-changes") and out.strip().endswith(" at " + self.FULL[:8])
+            elif recorded is not None:   # a proof the same head already has is "already recorded": no new row, but no row may hold anything but the full head
+                good = code == 0 and (len(new) == 1 or member == "prove") and {e["head"] for e in self.ledger() if e["kind"] != "review_record" or member == "review-record"} == {recorded}
             else:
-                refused = [e for e in self.world.audit() if e["event"] == "gate.waiver.refused"]
-                good = (code == 2 and text in err and len(err.strip().splitlines()) == 1 and after == before
-                        and len(refused) == audit_before + 1)
+                good = code == 2 and text in err and len(err.strip().splitlines()) == 1 and new == [] and out == ""
             if not good:
                 failed.append(name)
         return failed
 
-    def test_every_row_of_the_table_behaves_on_the_real_command(self):
-        self.assertEqual(self.run_table(), [])
+    def test_every_row_of_the_table_behaves_on_every_command_that_resolves_a_head(self):
+        for member in self.MEMBERS:
+            with self.subTest(member=member):
+                self.assertEqual(self.run_table(member), [])
+
+    def test_a_refused_waive_head_is_audited_and_the_ledger_is_untouched(self):
+        for name, given, recorded, text in self.TABLE:
+            if recorded is None:
+                before = len([e for e in self.world.audit() if e["event"] == "gate.waiver.refused"])
+                self.assertEqual(self.call("waive", given)[0], 2, name)
+                self.assertEqual(len([e for e in self.world.audit() if e["event"] == "gate.waiver.refused"]), before + 1, name)
+        self.assertEqual(self.ledger(), [])
 
     def test_the_recorded_case_a_short_head_is_stored_in_full_and_the_gate_reads_waived(self):
         # the cause: the short head used to be stored as given, so the exact comparison read it as another head
-        self.assertEqual(self.waive(self.FULL[:8])[0], 0)
+        self.assertEqual(self.call("waive", self.FULL[:8])[0], 0)
         (entry,) = self.ledger()
         self.assertEqual(len(entry["head"]), 40)
         report = self.gates()[1]
@@ -30984,73 +31012,113 @@ class TestHeadResolution(LedgerBase):
         (event,) = [e for e in self.world.audit() if e["event"] == "plan.waiver"]
         self.assertEqual(event["detail"]["head"], self.FULL)
 
-    def mutants(self):
+    def resolver_mutants(self):
         real = sb.resolve_head
 
         def hexlike(given):
             return given is not None and given != "" and re.fullmatch(r"[0-9a-fA-F]+", given) is not None
 
-        def as_given(given, known, unreadable=None):
-            return given if given else real(given, known, unreadable)
+        def as_given(given, known, unreadable=None, read_only=False):
+            return given if given else real(given, known, unreadable, read_only)
 
-        def no_hex(given, known, unreadable=None):
-            return known if given and not hexlike(given) else real(given, known, unreadable)
+        def no_hex(given, known, unreadable=None, read_only=False):
+            return known if given and not hexlike(given) else real(given, known, unreadable, read_only)
 
-        def no_floor(given, known, unreadable=None):
-            return known if hexlike(given) and len(given) < 7 else real(given, known, unreadable)
+        def no_floor(given, known, unreadable=None, read_only=False):
+            return known if hexlike(given) and len(given) < 7 else real(given, known, unreadable, read_only)
 
-        def no_prefix(given, known, unreadable=None):
-            return given if hexlike(given) and 7 <= len(given) <= 40 and not known.startswith(given.lower()) else real(given, known, unreadable)
+        def no_prefix(given, known, unreadable=None, read_only=False):
+            return given if hexlike(given) and 7 <= len(given) <= 40 and not known.startswith(given.lower()) else real(given, known, unreadable, read_only)
 
-        def no_lower(given, known, unreadable=None):
-            return given if given and given != given.lower() and hexlike(given) else real(given, known, unreadable)
+        def no_lower(given, known, unreadable=None, read_only=False):
+            return given if given and given != given.lower() and hexlike(given) else real(given, known, unreadable, read_only)
 
-        def accept_empty(given, known, unreadable=None):
-            return known if given == "" else real(given, known, unreadable)
+        def accept_empty(given, known, unreadable=None, read_only=False):
+            return known if given == "" else real(given, known, unreadable, read_only)
 
-        def no_overlong(given, known, unreadable=None):
-            return known if given and hexlike(given) and len(given) > 40 else real(given, known, unreadable)
+        def no_overlong(given, known, unreadable=None, read_only=False):
+            return known if given and hexlike(given) and len(given) > 40 else real(given, known, unreadable, read_only)
 
-        def prefix_as_given(given, known, unreadable=None):
-            out = real(given, known, unreadable)
+        def prefix_as_given(given, known, unreadable=None, read_only=False):
+            out = real(given, known, unreadable, read_only)
             return given.lower() if given and out == known and len(given) < 40 else out
         return {"as_given": (as_given, "short_unique"), "no_hex": (no_hex, "non_hex"), "no_floor": (no_floor, "short_ambiguous"),
                 "no_prefix": (no_prefix, "not_the_prs_head"), "no_lower": (no_lower, "uppercase"), "accept_empty": (accept_empty, "empty"),
                 "no_overlong": (no_overlong, "over_long"), "prefix_as_given": (prefix_as_given, "short_unique")}
 
-    def test_each_mutant_of_the_resolver_fails_its_row(self):
-        for name, (mutant, row) in self.mutants().items():
-            with self.subTest(mutant=name):
-                with mock.patch.object(sb, "resolve_head", mutant):
-                    failed = self.run_table()
-                self.assertIn(row, failed, "the %s mutant must fail the %s row" % (name, row))
+    def test_each_mutant_of_the_resolver_fails_its_row_on_every_command(self):
+        for member in self.MEMBERS:
+            for name, (mutant, row) in self.resolver_mutants().items():
+                if member == "review-record" and name in ("as_given", "no_lower", "prefix_as_given"):
+                    continue   # `review record` stores the head it read from GitHub, never the given text: these mutants change nothing it writes (the refusal rows still run)
+                with self.subTest(member=member, mutant=name):
+                    with mock.patch.object(sb, "resolve_head", mutant):
+                        failed = self.run_table(member)
+                    self.assertIn(row, failed, "the %s mutant must fail the %s row of %s" % (name, row, member))
 
-    def test_the_table_has_a_row_for_every_shape_and_a_mutant_for_every_refusal_row(self):
-        names = {row[0] for row in self.TABLE}
-        self.assertEqual(names, {"full", "short_unique", "uppercase", "no_head", "short_ambiguous", "too_short", "non_hex", "empty", "over_long", "not_the_prs_head"})
-        covered = {row for _, row in self.mutants().values()}
+    def test_a_command_that_accepts_any_head_fails_its_refusal_rows(self):
+        # the mutant of a caller that drops the resolver: whatever is given passes, per command
+        for member in self.MEMBERS:
+            with self.subTest(member=member):
+                with mock.patch.object(sb, "resolve_head", lambda given, known, unreadable=None, read_only=False: known):
+                    failed = self.run_table(member)
+                self.assertTrue({"non_hex", "empty", "over_long", "not_the_prs_head"} <= set(failed), failed)
+
+    def test_the_table_names_every_shape_and_each_refusal_row_has_a_mutant(self):
+        self.assertEqual({row[0] for row in self.TABLE},
+                         {"full", "short_unique", "uppercase", "no_head", "short_ambiguous", "too_short", "non_hex", "empty", "over_long", "not_the_prs_head"})
+        covered = {row for _, row in self.resolver_mutants().values()}
         self.assertEqual({row[0] for row in self.TABLE if row[2] is None} - {"too_short"}, covered - {"short_unique", "uppercase"})
 
-    def test_a_short_head_when_the_pr_head_cannot_be_read_is_refused_and_a_full_one_recorded(self):
+    def test_a_short_head_when_the_pr_head_cannot_be_read_is_refused_and_a_full_one_taken_by_every_command(self):
+        for member in ("waive", "prove", "verdict"):
+            with self.subTest(member=member):
+                self.pr["headRefOid"] = self.FULL
+                self.prepare(member)
+                self.pr["headRefOid"] = None
+                code, out, err, new = self.call(member, self.FULL[:8])
+                self.assertEqual((code, new), (2, []), err)
+                self.assertRegex(err, "cannot resolve|unknown")
+                self.assertEqual(self.call(member, self.FULL)[0], 0)
         self.pr["headRefOid"] = None
-        code, out, err = self.waive(self.FULL[:8])
-        self.assertEqual((code, self.ledger()), (2, []))
-        self.assertIn("cannot resolve", err)
-        self.assertEqual(self.waive(self.FULL)[0], 0)
-        self.assertEqual(self.ledger()[0]["head"], self.FULL)
+        for member in ("review-record", "review-blockers"):
+            with self.subTest(member=member):
+                code, out, err, new = self.call(member, self.FULL[:8])
+                self.assertEqual((code, new), (2, []))
+                self.assertRegex(err, "cannot resolve|unknown")
 
-    def test_no_prefix_of_one_to_six_characters_is_taken(self):
-        for n in range(1, 7):
-            code, out, err = self.waive(self.FULL[:n])
-            self.assertEqual((code, self.ledger()), (2, []), n)
-            self.assertIn("at least 7", err)
+    def test_a_mutant_that_falls_back_to_the_given_head_when_the_pr_head_is_unreadable_is_caught(self):
+        real = sb.resolve_head
+        self.pr["headRefOid"] = None
+        with mock.patch.object(sb, "resolve_head", lambda given, known, unreadable=None, read_only=False: given if known is None and given else real(given, known, unreadable, read_only)):
+            code, out, err, new = self.call("waive", self.FULL[:8])
+        self.assertEqual(code, 0)   # the mutant records 8 characters: the real build refuses (test above)
+        self.assertEqual(len(new[0]["head"]), 8)
 
-    # ---- the family: every command that records or reads by a head resolves it the same way
+    def test_review_blockers_reads_any_full_head_and_refuses_a_bad_one(self):
+        self.prepare("review-blockers")
+        other = "f" * 40
+        code, out, err, _ = self.call("review-blockers", other)
+        self.assertEqual((code, out), (0, ""))   # a full head that is not the PR's is looked at (nothing recorded there)
+        sb.plan_ledger.append_entry(self.world.state, {"kind": "review_record", "pr": self.PR, "head": other, "reviewer": "test", "verdict": "request-changes",
+                                                       "blocks": 1, "notes": 0, "by": "coder", "summary": "x"}, 1)
+        code, out, err, _ = self.call("review-blockers", other)
+        self.assertEqual(out.strip(), "test recorded request-changes (1 blocking finding(s)) at " + other[:8])
+
+    def test_a_short_head_of_another_commit_is_refused_even_when_a_record_exists_for_it(self):
+        other = "f" * 40
+        sb.plan_ledger.append_entry(self.world.state, {"kind": "review_record", "pr": self.PR, "head": other, "reviewer": "test", "verdict": "request-changes",
+                                                       "blocks": 1, "notes": 0, "by": "coder", "summary": "x"}, 1)
+        code, out, err, _ = self.call("review-blockers", other[:8])
+        self.assertEqual(code, 2)
+        self.assertIn("is not the PR's head", err)
+
+    # ---- the family: the commands with a --head flag
     RESOLVING = {("prove",), ("verdict",), ("waive",), ("review", "record"), ("review", "blockers")}
-    NAMED_EXCEPTIONS = {("review", "checkout"): "requires a full 40-character head and refuses a short one",
-                        ("item-verdict",): "compared exactly with the pinned reference commit; a short head is refused, never stored",
-                        ("item-prove",): "records the pinned reference commit and never the flag",
-                        ("gates",): "read-only; the head is read from GitHub"}
+    NAMED_EXCEPTIONS = {("review", "checkout"): "requires a full 40-character head and refuses a short one (tested below)",
+                        ("item-verdict",): "compared exactly with the pinned reference commit (tested in TestItemVerdicts)",
+                        ("item-prove",): "records the pinned reference commit and never the flag (tested in TestItemVerdicts)",
+                        ("gates",): "read-only; the head is read from GitHub (tested below)"}
 
     def head_commands(self):
         found = set()
@@ -31067,33 +31135,17 @@ class TestHeadResolution(LedgerBase):
 
     def test_every_command_with_a_head_flag_is_resolved_or_a_named_exception(self):
         self.assertEqual(self.head_commands() - self.RESOLVING - set(self.NAMED_EXCEPTIONS), set(), "a command with --head that resolves nothing and is not a named exception")
-        self.assertTrue(self.RESOLVING <= self.head_commands())
+        self.assertEqual(self.head_commands(), self.RESOLVING | set(self.NAMED_EXCEPTIONS))   # and every listed one has the flag
+        self.assertEqual({m.replace("-", " ").split()[0] if m.startswith("review") else m for m in self.MEMBERS},
+                         {path[0] for path in self.RESOLVING})   # the table runs for every resolving command
 
-    def test_a_new_caller_of_the_head_helper_must_go_through_the_one_resolver(self):
-        source = Path(sb.__file__).read_text()
-        body = source[source.index("def _head_of(ctx, args):"):source.index("def _record(ctx, args, now, entry):")]
-        self.assertIn("resolve_head(", body)
-        users = [m.start() for m in re.finditer(r"_head_of\(ctx, args\)", source)]
-        self.assertEqual(len(users), 4)   # prove, verdict, waive and the waive guard: a new caller changes this and needs a case in the family tests
-
-    def test_prove_and_verdict_record_the_full_head_for_a_short_one(self):
-        short = self.FULL[:8]
-        self.assertEqual(self.prove("coder", "S1", "--head", short)[0], 0)
-        self.assertEqual(self.verdict("cibot", "S1", "ci", "pass", "--head", short)[0], 0)
-        self.assertEqual([e["head"] for e in self.ledger()], [self.FULL, self.FULL])
-        self.assertEqual(self.prove("coder", "S2", "--head", "fedcba9")[0], 2)
-        self.assertEqual(len(self.ledger()), 2)
-
-    def test_review_record_and_blockers_resolve_a_short_head(self):
-        short = self.FULL[:8]
-        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "code", "--verdict", "request-changes", "--blocks", "1", "--head", short)
-        self.assertEqual(code, 0, err)
-        self.assertEqual([e["head"] for e in self.ledger()], [self.FULL])
-        code, out, err = self.run_as("coder", "review", "blockers", self.PR, "--head", short)
-        self.assertIn("code recorded request-changes", out)
-        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "code", "--verdict", "approve", "--head", "zzzzzzzz")
-        self.assertEqual(code, 2)
-        self.assertEqual(len(self.ledger()), 1)
+    def test_review_checkout_refuses_a_short_head_and_gates_ignores_the_flag(self):
+        code, out, err = self.run_as("coder", "review", "checkout", self.PR, "--head", self.FULL[:8])
+        self.assertNotEqual(code, 0)
+        self.assertIn("full 40-character", err)
+        before = self.gates()[1]["head"]
+        self.assertEqual(self.gates("--head", "ffffffff")[1]["head"], before)
+        self.assertEqual(self.ledger(), [])
 
 
 class TestPrSharesFiles(LedgerBase):
@@ -72176,8 +72228,8 @@ class TestItemVerdicts(unittest.TestCase):
         self.assertFalse(names & {"KINDS", "ITEM_KINDS", "EVIDENCE_KINDS"}, "read_ledger must not judge kinds: an older build must read a ledger with item entries")
 
     # ---- item-prove and the refusals of the registration
-    def prove(self, caller, sid="S1", item_key=None):
-        args = types.SimpleNamespace(item=item_key or self.ITEM, scenario=[sid], plan=None, ask=None, head=None, evidence="ran it", result="pass", command=None)
+    def prove(self, caller, sid="S1", item_key=None, head=None):
+        args = types.SimpleNamespace(item=item_key or self.ITEM, scenario=[sid], plan=None, ask=None, head=head, evidence="ran it", result="pass", command=None)
         with mock.patch.object(sb, "item_context", lambda a, r, n, w: self.ctx()), mock.patch.object(sb, "identify_caller", lambda *a: caller):
             try:
                 return sb.cmd_item_prove(args, None, self.now), None
@@ -72199,6 +72251,15 @@ class TestItemVerdicts(unittest.TestCase):
         self.assertIn("wrote or runs", why)
         self.assertEqual(self.prove("c1", sid="S3")[0], sb.EXIT_PARTIAL)   # an epic-claimed scenario is not claimed by an item
         self.assertEqual(len([e for e in self.entries() if e.get("kind") == "proof"]), 2)    # c1's S1 and t1's S2; S3 recorded nothing
+
+    def test_a_short_head_is_refused_by_an_item_verdict_and_never_stored_by_an_item_proof(self):
+        self.register()
+        code, why = self.verdict("t1", head=self.PIN[:8])
+        self.assertIsNone(code)
+        self.assertIn("is not the reference commit", why)
+        self.assertEqual(self.verdicts(), [])
+        self.assertEqual(self.prove("c1", head=self.PIN[:8])[0], sb.EXIT_OK)
+        self.assertEqual([e["head"] for e in self.entries() if e.get("kind") == "proof"], [self.PIN])
 
     def register_world(self, **page_changes):
         self.pages.update({"repos/%s/issues/777" % self.REPO: {"user": {"login": "human"}, "body": "", "state": "open", "parent_issue_url": "https://api.github.com/repos/acme-org/widget-service/issues/770"},
