@@ -42,7 +42,7 @@ def _load_registry():
 def evidence_of(agent, live):
     """The evidence handed to the registry: the recorded state, and what the live check found. `live` is {"pane": bool|None, "process": bool|None}
     where None means "could not be checked" (then there is no evidence of death and nothing is removed)."""
-    return {"state": agent.get("state"), "pane": live.get("pane"), "process": live.get("process"), "checked_at": int(time.time())}
+    return {"state": agent.get("state"), "pane_listed": live.get("pane"), "process_found": live.get("process"), "checked_at": int(time.time())}
 
 
 def has_no_live_data(agent, live):
@@ -53,7 +53,7 @@ def has_no_live_data(agent, live):
 def reconcile_on_read(state_dir, read, live_check, registry=None):
     """Called by a view with the registry read it is drawing from. Returns the names removed.
 
-    Acts only on a whole read. For each agent whose recorded state is `dead`, or that the live check finds with no pane and no process, it
+    Acts only on a whole read. For each agent whose recorded state is `dead` (the registry refuses any other), it
     checks right now (`live_check(name, agent)` -> {"pane":, "process":}) and, when both are gone, calls `registry.reconcile_remove`.
     The registry decides again from the evidence: a refusal leaves the agent in place. Never raises: a failure removes nothing."""
     if not isinstance(read, dict) or read.get("whole") is not True:
@@ -63,6 +63,8 @@ def reconcile_on_read(state_dir, read, live_check, registry=None):
     for name, agent in sorted((read.get("agents") or {}).items()):
         if not isinstance(agent, dict):
             continue
+        if agent.get("state") != DEAD:
+            continue   # the registry removes only an agent recorded dead; the pane pass records it, a view never marks one
         try:
             live = live_check(name, agent) or {}
         except Exception:

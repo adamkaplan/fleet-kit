@@ -66250,28 +66250,6 @@ class TestCoderBooks(Base):
         self.assertFalse(finished("nobody"))
 
 
-class FakeRegistry:
-    """A minimal local fake of registry.py's read and reconcile_remove (docs/agent-registry.md): the real module is slice 2's. It refuses on a
-    partial read and on evidence that does not show the agent gone, as the spec says the registry itself does, and keeps an audit list."""
-
-    def __init__(self, agents, whole=True):
-        self.agents, self.whole, self.audit_lines, self.calls = dict(agents), whole, [], []
-
-    def read(self, state_dir):
-        if not self.whole:
-            return {"whole": False, "version": 1, "agents": {}, "problem": "registry.json is unreadable"}
-        return {"whole": True, "version": 1, "agents": dict(self.agents), "problem": None}
-
-    def reconcile_remove(self, state_dir, name, evidence, whole):
-        self.calls.append((name, evidence, whole))
-        gone = evidence.get("pane") is False and evidence.get("process") is False
-        if whole is not True or name not in self.agents or not gone:
-            return {"changed": False, "problem": "refused: the evidence does not show %s gone" % name}
-        del self.agents[name]
-        self.audit_lines.append({"event": "registry.reconcile_remove", "name": name, "evidence": evidence})
-        return {"changed": True, "problem": None}
-
-
 class TestReconcileOnRead(unittest.TestCase):
     """Slice 4 of #903 (#919): reconcile on read, never a question mark, dead never drawn."""
 
@@ -66286,42 +66264,67 @@ class TestReconcileOnRead(unittest.TestCase):
         self.dir = Path(tempfile.mkdtemp(prefix="recon"))
         self.addCleanup(shutil.rmtree, self.dir, True)
 
+    def registry(self, whole=True):
+        """The REAL registry module (slice 2) over a state directory holding the three agents; `whole=False` corrupts the file so the read is partial."""
+        reg = sb.load_module("registry")
+        for name, agent in self.AGENTS.items():
+            reg.upsert(self.dir, name, agent)
+        self.reg_state(reg)
+        if not whole:
+            (self.dir / "registry.json").write_text("{torn")
+        return reg
+
+    def reg_state(self, reg):
+        path = self.dir / "registry.json"
+        doc = json.loads(path.read_text())
+        for name, agent in self.AGENTS.items():
+            doc["agents"][name]["state"] = agent["state"]
+        path.write_text(json.dumps(doc))
+
+    def audit_lines(self):
+        path = self.dir / "registry-audit.jsonl"
+        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
     @staticmethod
     def live(gone=("ghost",)):
         return lambda name, agent: {"pane": name not in gone, "process": name not in gone}
 
     def test_s3_a_whole_read_removes_the_dead_agent_once_with_one_audit_line(self):
-        reg = FakeRegistry(self.AGENTS)
+        reg = self.registry()
         removed = self.mod.reconcile_on_read(self.dir, reg.read(self.dir), self.live(), reg)
         self.assertEqual(removed, ["ghost"])
-        self.assertEqual(len(reg.audit_lines), 1)
-        self.assertEqual(reg.audit_lines[0]["evidence"]["pane"], False)
-        self.assertEqual(sorted(reg.agents), ["alpha", "bare"])
+        lines = [l for l in self.audit_lines() if l.get("event") == "reconcile_remove"]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["evidence"]["pane_listed"], False)
+        self.assertEqual(sorted(reg.read(self.dir)["agents"]), ["alpha", "bare"])
 
     def test_s3_a_partial_read_removes_nothing_and_asks_the_registry_nothing(self):
-        reg = FakeRegistry(self.AGENTS, whole=False)
+        reg = self.registry(whole=False)
         removed = self.mod.reconcile_on_read(self.dir, reg.read(self.dir), self.live(), reg)
-        self.assertEqual((removed, reg.calls, reg.audit_lines), ([], [], []))
-        self.assertEqual(sorted(reg.agents), ["alpha", "bare", "ghost"])
+        self.assertEqual(removed, [])
+        self.assertEqual([l for l in self.audit_lines() if l.get("event") == "reconcile_remove"], [])
+        self.assertEqual((self.dir / "registry.json").read_text(), "{torn")   # untouched
 
     def test_s3_a_stub_that_ignores_the_whole_flag_is_caught(self):
         """The discriminator: with a read that is not whole, a view that acted anyway would remove 1 where 0 are expected."""
-        reg = FakeRegistry(self.AGENTS, whole=False)
+        reg = self.registry(whole=False)
         forged = dict(reg.read(self.dir), agents=dict(self.AGENTS))
-        self.assertEqual(self.mod.reconcile_on_read(self.dir, forged, self.live(), reg), [])
+        self.assertEqual(self.mod.reconcile_on_read(self.dir, forged, self.live(), reg), [])   # the flag is read from the read itself
 
     def test_s3_the_registry_refuses_a_live_agent_even_with_whole_true(self):
-        reg = FakeRegistry(self.AGENTS)
-        result = reg.reconcile_remove(self.dir, "alpha", {"state": "working", "pane": True, "process": True}, True)
-        self.assertFalse(result["changed"])
-        self.assertIn("alpha", reg.agents)
+        reg = self.registry()
+        result = reg.reconcile_remove(self.dir, "alpha", {"state": "working", "pane_listed": False, "process_found": False}, True)
+        self.assertFalse(result["changed"])   # recorded `working`: refused whatever the caller says
+        self.assertIn("alpha", reg.read(self.dir)["agents"])
+        self.assertFalse(reg.reconcile_remove(self.dir, "ghost", {"pane_listed": False, "process_found": False}, False)["changed"])
+        self.assertTrue(self.mod.reconcile_on_read(self.dir, reg.read(self.dir), lambda n, a: {"pane": True, "process": True}, reg) == [])
 
     def test_s3_an_unchecked_agent_is_not_removed(self):
         """herdr could not say (None): no evidence of death, so nothing is asked of the registry."""
-        reg = FakeRegistry(self.AGENTS)
+        reg = self.registry()
         unknown = lambda name, agent: {"pane": None, "process": None}
         self.assertEqual(self.mod.reconcile_on_read(self.dir, reg.read(self.dir), unknown, reg), [])
-        self.assertEqual(reg.calls, [])
+        self.assertIn("ghost", reg.read(self.dir)["agents"])
         broken = lambda name, agent: 1 / 0
         self.assertEqual(self.mod.reconcile_on_read(self.dir, reg.read(self.dir), broken, reg), [])
 
@@ -66361,11 +66364,11 @@ class TestReconcileOnRead(unittest.TestCase):
         self.assertEqual(hits, [])
 
     def test_s7_a_day_of_daemon_passes_with_no_view_reading_removes_nothing(self):
-        reg = FakeRegistry(self.AGENTS)
+        reg = self.registry()
         for _ in range(24 * 12):   # a pass is a read of nothing: only a view's reconcile_on_read can call the registry
-            pass
-        self.assertEqual((reg.calls, reg.audit_lines), ([], []))
-        self.assertEqual(sorted(reg.agents), sorted(self.AGENTS))
+            reg.read(self.dir)
+        self.assertEqual([l for l in self.audit_lines() if l.get("event") == "reconcile_remove"], [])
+        self.assertEqual(sorted(reg.read(self.dir)["agents"]), sorted(self.AGENTS))
 
     def views(self):
         """The text of the four Python views drawn over a state directory that holds a dead agent, a live one and one with no state row."""
@@ -66399,9 +66402,9 @@ class TestReconcileOnRead(unittest.TestCase):
                 self.assertNotIn("dead", text.lower())
 
     def test_s10_a_dead_agent_is_not_drawn_and_its_neighbours_are(self):
-        reg = FakeRegistry(self.AGENTS)
+        reg = self.registry()
         self.assertEqual(sorted(self.mod.drawn_agents(reg.read(self.dir))), ["alpha", "bare"])
-        self.assertEqual(self.mod.drawn_agents(FakeRegistry(self.AGENTS, whole=False).read(self.dir)), {})
+        self.assertEqual(self.mod.drawn_agents(self.registry(whole=False).read(self.dir)), {})
         self.assertIsNone(self.mod.drawable_state("dead"))
         self.assertIsNone(self.mod.drawable_state("?"))
 
