@@ -32193,6 +32193,9 @@ class TestImpactFloorOwnerDecision(LedgerBase):
         self.assertNotIn("owner_decide(", source, "no second copy of the rule")
 
 
+VERBS = ["add_argument", "add_argument_group", "add_mutually_exclusive_group", "add_parser", "add_subparsers", "set_defaults"]   # pinned equal to the matrix by a test of the allow table
+
+
 class TestRegistrarFloor(LedgerBase):
     """#964: a registrar that imports, calls or rebinds a name of the clear's closure is held for the owner by the floor, with no rating. The REAL daemon file, the REAL closure and the REAL matrix: both lists are derived
     from them. In one process a hostile registrar can always undo a guard; this hold and this rating are the control."""
@@ -32226,7 +32229,7 @@ class TestRegistrarFloor(LedgerBase):
         """The same lint over a registrar written alone, with the real closure names: [(registrar, verb, name)] (the whole-file route is `found`, used where the diff matters)."""
         import ast
         unit = ast.parse("def add_zzz_parsers(sub):\n    " + body.replace("\n", "\n    ") + "\n").body[0]
-        return [("add_zzz_parsers", v, n) for v, n in self.dc._registrar_unit(unit, set(self.names), set(range(1, 1000)))]
+        return [("add_zzz_parsers", v, n) for v, n in self.dc._registrar_unit(unit, set(self.names), set(range(1, 1000)), verbs=VERBS)]
 
     def pick(self):
         """One closure definition, one binding and one imported module of the real closure (derived: the first of each, never named here)."""
@@ -32270,6 +32273,11 @@ class TestRegistrarFloor(LedgerBase):
             "a match subject": ("match %s:\n    case m:\n        m()" % function, ("uses", function)),
             "a parameter default that reaches a module": ("def inner(p, m=%s):\n    m.x = 1" % module, ("rebinds", None)),
             "the parser name rebound to a module": ("sub = %s\nsub.system('x')" % module, ("rebinds", "sub")),
+            "a handed parser's choices replaced": ('sub.choices["review"] = sub.add_parser("zzz")', ("rebinds", None)),
+            "a handed parser's command map edited": ('sub._name_parser_map.pop("review")', ("uses", "_name_parser_map")),
+            "another command's parser rewritten": ('sub.choices["impact"].set_defaults(impact_action="floor")', ("uses", "choices")),
+            "a write onto a function reached through an action": ('p = sub.add_parser("zzz")\np._actions[-1].type.mark = 1', ("rebinds", "mark")),
+            "another command's actions rewritten": ('for a in sub.choices["review"]._actions:\n    a.default = "x"', ("uses", "choices")),
             "a bare read": ("%s" % function, ("uses", function)),
             "a loop source": ("for f in [%s]:\n    pass" % function, ("uses", function)),
             "a closure name handed to a foreign call": ("print(%s)" % function, ("uses", function)),
@@ -32285,6 +32293,9 @@ class TestRegistrarFloor(LedgerBase):
             "its own parser's actions": "a = sub.add_parser('a')\nfor action in a._actions:\n    action.default = 1",
             "a constant read of a module": "t = sub.add_parser('x')\nt.add_argument('--a', default=argparse.SUPPRESS)",
             "a flag with a computed help": "t = sub.add_parser('x')\nt.add_argument('--a', help='%d' % 1 + 'x'.join(['a']))",
+            "a built parser's actions read and set to literals (the ledger registrar)": "v = sub.add_parser('v')\nfor action in v._actions:\n    action.nargs, action.default = '?', None",
+            "a chain of its own parser's methods": "sub.add_parser('x').add_argument('--a')",
+            "a literal stored on a parser it built": "t = sub.add_parser('x')\nt.usage = 'u'",
             "a function it defines itself": "def inner(v):\n    return v\nsub.add_parser('x', help=inner('a'))",
         }
 
@@ -32406,7 +32417,7 @@ class TestRegistrarFloor(LedgerBase):
         got, why = self.dc.registrar_findings("import re\nREGISTRAR_NAME_RE = re.compile(r'add_[a-z0-9_]+_parsers')\n", self.base_src, self.rule)
         self.assertIsNone(why)
         # the one read the rule cannot clear: the loader loop at the top of the file writes `globals()[<variable>]`, a key the lint cannot read, so an edit of that line is held for the owner (it is the clear's own loader)
-        got = [g for g in got if g[0] != "a named registration helper"]   # (every line counted as added also counts the named helpers' lines: their edit-hold is tested on its own)
+        got = [g for g in got if g[0] != "a name of the allow table"]   # (every line counted as added also counts the named helpers' lines: their edit-hold is tested on its own)
         self.assertEqual(got, [("a module-level write into globals()", "rebinds", "a registrar bound in a form that cannot be read")])
         self.assertIn("globals()[_function] = _make_loader(", self.base_src)
 
@@ -32485,7 +32496,10 @@ class TestRegistrarFloor(LedgerBase):
             self.assertTrue(hasattr(builtins_module, name), name)
             self.assertNotIn(name, self.FORBIDDEN_BUILTINS)
         self.assertEqual(len(allow["pure_builtins"]), len(set(allow["pure_builtins"])), "a member twice")
-        self.assertEqual(sorted(allow), ["helpers", "meaning", "pure_builtins"])
+        self.assertEqual(sorted(allow), ["helpers", "meaning", "parser_methods", "pure_builtins"])
+        self.assertEqual(allow["parser_methods"], VERBS, "the verbs this test file writes its rules with are the matrix's")
+        for member in ("choices", "_name_parser_map", "_actions", "_defaults", "_registries", "parser_class", "parse_args", "register", "__setattr__"):
+            self.assertNotIn(member, allow["parser_methods"], "a member of the handed parser that reaches other commands is not a verb")
 
     def test_every_helper_of_the_table_is_a_pure_function_of_the_daemon_file_and_never_an_unprotected_edit(self):
         import ast
@@ -32542,10 +32556,10 @@ class TestRegistrarFloor(LedgerBase):
                 "class IssueNo(int):\n    def __new__(cls, n):\n        self = super().__new__(cls, n)\n        self.repo = None\n        return self\n"
                 "def parse_ref(text):\n    found = _REF.match(text.strip()) if isinstance(text, str) else None\n    if not found or int(text) < 1:\n        raise ValueError(str(text))\n    return IssueNo(int(text))\n"
                 "def ref_arg(text):\n    return parse_ref(text)\ndef main():\n    return 1\n")
-        rule = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": ["int", "isinstance", "str"], "helpers": ["IssueNo", "parse_ref", "ref_arg"]}}
+        rule = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": ["int", "isinstance", "str"], "helpers": ["IssueNo", "parse_ref", "ref_arg"], "parser_methods": VERBS}}
         registrar = "def add_x_parsers(sub):\n    t = sub.add_parser('x')\n    t.add_argument('--issue', type=ref_arg, default=int('1'))\n"
         self.assertEqual(self.dc.registrar_findings(fake, fake + registrar, rule), ([], None))
-        self.assertEqual(self.dc.registrar_findings(fake, fake + registrar, dict(rule, registrar_allow={"pure_builtins": [], "helpers": []}))[0] != [], True, "with no table the same edit is held")
+        self.assertEqual(self.dc.registrar_findings(fake, fake + registrar, dict(rule, registrar_allow={"pure_builtins": [], "helpers": [], "parser_methods": VERBS}))[0] != [], True, "with no table the same edit is held")
         edited = (fake + registrar).replace("    return IssueNo(int(found.group(1)))" if False else "    return IssueNo(int(text))\n", "    x = 1\n    return IssueNo(int(text))\n")
         got, why = self.dc.registrar_findings(fake + registrar, edited, rule)
         self.assertEqual([g[1:] for g in got], [("rebinds", "parse_ref")], got)
@@ -32557,23 +32571,23 @@ class TestRegistrarFloor(LedgerBase):
         for builtin in allow["pure_builtins"]:
             with self.subTest(builtin):
                 text = fake + "def add_a_parsers(sub):\n    sub.add_parser('x', help=%s(['a']))\n" % builtin
-                with_it = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": [builtin], "helpers": []}}
-                without = dict(with_it, registrar_allow={"pure_builtins": [x for x in allow["pure_builtins"] if x != builtin], "helpers": []})
+                with_it = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": [builtin], "helpers": [], "parser_methods": VERBS}}
+                without = dict(with_it, registrar_allow={"pure_builtins": [x for x in allow["pure_builtins"] if x != builtin], "helpers": [], "parser_methods": VERBS})
                 self.assertEqual(self.dc.registrar_findings(fake, text, with_it)[0], [], builtin)
                 self.assertTrue(self.dc.registrar_findings(fake, text, without)[0], "the mutant without %s is not held" % builtin)
         for helper in allow["helpers"]:
             with self.subTest(helper):
                 text = fake.replace("def hlp(t):", "def %s(t):" % helper) + "def add_a_parsers(sub):\n    sub.add_parser('x', type=%s)\n" % helper
-                with_it = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": [], "helpers": [helper]}}
-                without = dict(with_it, registrar_allow={"pure_builtins": [], "helpers": [x for x in allow["helpers"] if x != helper]})
+                with_it = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": [], "helpers": [helper], "parser_methods": VERBS}}
+                without = dict(with_it, registrar_allow={"pure_builtins": [], "helpers": [x for x in allow["helpers"] if x != helper], "parser_methods": VERBS})
                 self.assertEqual(self.dc.registrar_findings(fake.replace("def hlp(t):", "def %s(t):" % helper), text, with_it)[0], [], helper)
                 self.assertTrue(self.dc.registrar_findings(fake.replace("def hlp(t):", "def %s(t):" % helper), text, without)[0], "the mutant without %s is not held" % helper)
 
     # ---- the mutants: a small daemon file with its own closure, the table run on the REAL lint and on a copy of it with ONE thing changed
     FAKE = ("import re\nimport json\nREGISTRAR_NAME_RE = re.compile(r'add_[a-z0-9_]+_parsers')\nFIELDS = ('a', 'b')\nHOOKS = []\n"
-            "def fn():\n    return json.dumps(HOOKS)\ndef main():\n    fn()\n    return FIELDS, HOOKS, re\n"
-            "def hh(text):\n    import os\n    return os.fspath(text)\n")   # a registration helper OUTSIDE the closure (as on a registrar split), whose body a registrar's lint would hold
-    FAKE_RULE = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": ["int", "str"], "helpers": ["hh"]}}
+            "def fn():\n    return json.dumps(HOOKS)\ndef main():\n    fn()\n    return FIELDS, HOOKS, re, hh\n"
+            "def hh(text):\n    import os\n    return os.fspath(text)\ndef hh2(text):\n    import os\n    return text\n")   # a registration helper OUTSIDE the closure (as on a registrar split), whose body a registrar's lint would hold
+    FAKE_RULE = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": ["int", "str"], "helpers": ["hh", "hh2"], "parser_methods": VERBS}}
 
     def table_failures(self, dc):
         """[row that does not hold] for the table below, run on the lint module `dc` (the real one, or a mutant of it)."""
@@ -32614,17 +32628,49 @@ class TestRegistrarFloor(LedgerBase):
             ("defined function", "def inner(v):\n    return v\nsub.add_parser('x', help=inner('a'))"),
         ):
             clean(label, reg(body))
+        try:   # a DELETION-only edit of a named helper holds (the base side)
+            got, why = dc.registrar_findings(fake, fake.replace("    import os\n", ""), rule)
+            if why or ("rebinds", "hh") not in [g[1:] for g in got]:
+                bad.append("a deletion in a helper holds")
+        except Exception:
+            bad.append("a deletion in a helper holds")
+        for label, body in (("with-as", "with local_cm as sub:\n    pass"), ("for", "for sub in other_iterable:\n    pass"), ("walrus", "(sub := other)"),
+                            ("augmented", "sub += other"), ("annotated", "sub: object = other"), ("assign", "sub = other")):
+            has("a parser name rebound by " + label, reg(body), ("rebinds", "sub"))
+        clean("a named helper outside the closure is not read as part of the registrar", reg("sub.add_parser('x', type=hh2)"))
+        clean("a named helper used as a value anywhere is allowed", reg("x = hh"))   # it is pure by its own test and protected by the edit hold: using it runs nothing of the closure
+        has("a lowercase read of a closure name is a use", reg("x = json.dumps"), ("uses", "json"))
+        has("a helper defined again under an if", "if True:\n    def hh(t):\n        pass\n", ("rebinds", "hh"))
+        has("a helper rebound by an assignment", "hh = lambda t: t\n", ("rebinds", "hh"))
+        has("a helper rebound by an import", "from os import path as hh\n", ("rebinds", "hh"))
+        has("a builtin of the table rebound", "int = print\n", ("rebinds", "int"))
+        has("a rebound builtin is no longer allowed", "int = print\n" + reg("sub.add_parser('x', default=int('1'))"), ("calls", "int"))
+        try:   # a decorator added above a named helper is a changed line of it
+            got, why = dc.registrar_findings(fake, fake.replace("def hh(text):", "@deco\ndef hh(text):"), rule)
+            if why or ("rebinds", "hh") not in [g[1:] for g in got]:
+                bad.append("a decorator on a helper holds")
+        except Exception:
+            bad.append("a decorator on a helper holds")
+        for label, body, want in (("handle choices replaced", "sub.choices['review'] = sub.add_parser('z')", ("uses", "choices")), ("handle map edited", "sub._name_parser_map.pop('review')", ("uses", "_name_parser_map")),
+                                  ("another command's parser rewritten", "sub.choices['impact'].set_defaults(a=1)", ("uses", "choices")), ("a non-verb method on the handle", "sub.parse_args([])", ("uses", "parse_args")),
+                                  ("a non-verb method on a built parser", "t = sub.add_parser('x')\nt.parse_args([])", ("calls", "t")),
+                                  ("an alias of the handle is not a parser it built", "t = sub\nt.default = None", ("rebinds", "default")),
+                                  ("a deep store through a built parser", "t = sub.add_parser('x')\nt._actions[0].default = None", ("rebinds", "default")),
+                                  ("a non-literal store on a built parser", "t = sub.add_parser('x')\nt.default = other", ("rebinds", "default"))):
+            has(label, reg(body), want)
+        clean("a built parser's actions read and set to literals", reg("v = sub.add_parser('v')\nfor action in v._actions:\n    action.nargs, action.default = '?', None"))
+        clean("a chain of its own parser's methods", reg("sub.add_parser('x').add_argument('--a')"))
         clean("a pure builtin of the table", reg("sub.add_parser('x', default=int('1'), help=str(2))"))
         has("a builtin outside the table", reg("sorted(sub)"), ("calls", "sorted"))
         clean("a named helper is not read as part of the registrar", reg("t = sub.add_parser('x')\nt.add_argument('--i', type=hh)\nhh('1')"))
         try:   # a changed line of a named helper holds; the same edit elsewhere does not
-            got, why = dc.registrar_findings(fake, fake.replace("    import os\n", "    import os\n    x = 1\n"), rule)
+            got, why = dc.registrar_findings(fake, fake.replace("    import os\n", "    import os\n    x = 1\n", 1), rule)
             if why or [g[1:] for g in got] != [("rebinds", "hh")]:
                 bad.append("a helper edit holds")
         except Exception:
             bad.append("a helper edit holds")
         try:
-            got, why = dc.registrar_findings(fake, fake, dict(rule, registrar_allow={"pure_builtins": "int", "helpers": []}))
+            got, why = dc.registrar_findings(fake, fake, dict(rule, registrar_allow={"pure_builtins": "int", "helpers": [], "parser_methods": VERBS}))
             if got is not None or not why:
                 bad.append("an unreadable table holds")
         except Exception:
@@ -32694,13 +32740,13 @@ class TestRegistrarFloor(LedgerBase):
         ("imports are not held", 'note(x, "imports", label(*bound))', "pass"),
         ("a global statement is not held", 'note(x, "rebinds", label(*x.names))', "pass"),
         ("a call of anything is not held", 'note(x, "calls", label(callee, fname))', "pass"),
-        ("a store outside the parser is not held", "if _root(x.value) not in parser:", "if False:"),
+        ("a store outside the parser is not held", "if id(x) not in literal_stores:", "if False:"),
         ("a dunder or frame field is not held", 'x.attr.startswith("__") and x.attr.endswith("__") or x.attr.startswith("f_")', "False"),
         ("__builtins__ is not held", 'x.id in ("__builtins__", "__import__", "__loader__", "__spec__", "__dict__")', "False"),
         ("the use rule is off", 'note(x, "uses", x.id)', "pass"),
-        ("a value of the own parser is not allowed", "if _root(x.func) in parser:", "if False:"),
-        ("an object built from the parser is not its own", "isinstance(x, ast.Assign) and _root(x.value) in parser", "False"),
-        ("a loop over the parser's objects is not its own", "(_root(x.iter) in parser or", "(False or"),
+        ("a value of the own parser is not allowed", "if verb_chain(x):\n                for arg in list(x.args)", "if False:\n                for arg in list(x.args)"),
+        ("an object built from the parser is not its own", "if isinstance(x, ast.Assign) and verb_chain(x.value):\n                sources = x.targets", "if False:\n                sources = x.targets"),
+        ("a loop over the parser's objects is not its own", "elif isinstance(x, (ast.For, ast.comprehension)) and ((isinstance(x.iter, (ast.Tuple, ast.List))", "elif isinstance(x, (ast.For, ast.comprehension)) and ((False and isinstance(x.iter, (ast.Tuple, ast.List))"),
         ("a call on data is not allowed", "callee in data or", "False or"),
         ("a readable helper is not allowed", "x.func.id in readable", "False"),
         ("the removed lines count as added", "added = set(lines[1])", "added = set(lines[0]) | set(lines[1])"),
@@ -32711,8 +32757,26 @@ class TestRegistrarFloor(LedgerBase):
         ("the table's builtins are not read", "x.func.id in builtins and x.func.id not in own", "False"),
         ("the table's helpers are not allowed callees", "or x.func.id in named_helpers or", "or"),
         ("a named helper is still read as part of a registrar", "if node.name not in names and node.name not in named:", "if node.name not in names:"),
-        ("an edit of a named helper is not held", "and node.name in named and _spans(node, numbers):", "and False:"),
+        ("an edit of a name of the table is not held", "if bound in table and _spans_from_decorators(node, numbers):", "if False:"),
         ("an unreadable table passes", 'return None, "the registrar allow table of the rule cannot be read"', "pass"),
+        ("a nested statement is not read for the table", "for node in _module_statements(tree.body):\n            for bound in _bound_here(node):", "for node in tree.body:\n            for bound in _bound_here(node):"),
+        ("a decorator is not part of a helper", "start = min([node.lineno] + [d.lineno for d in getattr(node, \"decorator_list\", [])])\n    return any(n in numbers", "start = node.lineno\n    return any(n in numbers"),
+        ("a rebound builtin stays allowed", "pure_builtins = pure_builtins - rebound", "pass"),
+        ("a deletion in a named helper is not held", "for tree, numbers in ((head, set(lines[1])), (base, set(lines[0]))):", "for tree, numbers in ((head, set(lines[1])),):"),
+        ("a with-as parser name is not held", "elif isinstance(x, (ast.With, ast.AsyncWith)):\n            targets = [i.optional_vars for i in x.items if i.optional_vars is not None]", "elif False:\n            targets = [i.optional_vars for i in x.items if i.optional_vars is not None]"),
+        ("a for parser name is not held", "elif isinstance(x, (ast.For, ast.AsyncFor, ast.comprehension)) and not _is_data(", "elif False and not _is_data("),
+        ("a walrus parser name is not held", "(ast.AugAssign, ast.AnnAssign, ast.NamedExpr)) and getattr(x, \"value\", None) is not None and not verb_chain(x.value)", "(ast.AugAssign, ast.AnnAssign)) and getattr(x, \"value\", None) is not None and not verb_chain(x.value)"),
+        ("an augmented parser name is not held", "(ast.AugAssign, ast.AnnAssign, ast.NamedExpr)) and getattr(x, \"value\", None) is not None and not verb_chain(x.value)", "(ast.AnnAssign, ast.NamedExpr)) and getattr(x, \"value\", None) is not None and not verb_chain(x.value)"),
+        ("an annotated parser name is not held", "(ast.AugAssign, ast.AnnAssign, ast.NamedExpr)) and getattr(x, \"value\", None) is not None and not verb_chain(x.value)", "(ast.AugAssign, ast.NamedExpr)) and getattr(x, \"value\", None) is not None and not verb_chain(x.value)"),
+        ("a named helper counts as a closure use", "live = set(names) - set(literals) - set(named_helpers)", "live = set(names) - set(literals)"),
+        ("an upper-case attribute read is always a constant", "isinstance(x.ctx, ast.Load) and x.attr.isupper() and isinstance(x.value, ast.Name):", "isinstance(x.ctx, ast.Load) and True and isinstance(x.value, ast.Name):"),
+        ("any method of the handle is a verb", "if not (isinstance(func, ast.Attribute) and func.attr in verbs):", "if not isinstance(func, ast.Attribute):"),
+        ("a member of the handle is not held", "x.attr not in verbs and isinstance(_chain_root(x), ast.Name) and _chain_root(x).id in handle and not x.attr.isupper()", "False"),
+        ("any assignment builds a parser", "if isinstance(x, ast.Assign) and verb_chain(x.value):\n                sources = x.targets", "if isinstance(x, ast.Assign):\n                sources = x.targets"),
+        ("a store through a built parser at any depth", "isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) and t.value.id in built}", "isinstance(t, ast.Attribute) and getattr(_chain_root(t), \"id\", None) in built}"),
+        ("a non-literal store on a built parser is allowed", "and _is_data(x.value, data | set(literals)) for target in x.targets", "for target in x.targets"),
+        ("a built parser's actions are not its own", "or (isinstance(x.iter, ast.Attribute) and isinstance(x.iter.value, ast.Name) and x.iter.value.id in built)):\n                sources = [x.target]   # `for p in", "or False):\n                sources = [x.target]   # `for p in"),
+        ("a chain of verbs is only one call long", "or verb_chain(inner)", "or False"),
         ("a default that is not data is not held", "for a, default in param_defaults:", "for a, default in []:"),
         ("a rebound parser name is not held", '                    note(x, "rebinds", y.id)', "                    pass"),
         ("a registrar bound under an if is not read", "for node in _module_statements(head.body):\n        for name, unit in _binds_registrar(node, patterns):", "for node in head.body:\n        for name, unit in _binds_registrar(node, patterns):"),
