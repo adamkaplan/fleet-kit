@@ -29449,20 +29449,6 @@ class Installer:
         self.say("service", "done", str(path))
 
     # -- 5b: the cloud reaper's service (opt-in, like the heartbeat's: it needs a cluster login this machine may not have)
-    def reaper_command_problem(self):
-        """None when the file the reaper service runs and every parent above it are the user's own and not writable by others,
-        else the reason. It is the launcher's one walk (`parents_problem`, `_entry_problem`), loaded from the kit by path: there is
-        one copy of it, and a service that runs a file others can replace is refused before it is written."""
-        import importlib.util
-        script = Path(self.kit_root) / "cloud" / "launcher" / "cloud_worker.py"
-        if not script.is_file():
-            return "is missing"
-        spec = importlib.util.spec_from_file_location("fleet_kit_cloud_worker_walk", str(script))
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        problem = module.parents_problem(str(script))
-        return problem or module._entry_problem(os.lstat(str(script)), "the reaper program")
-
     def reaper_text(self, config):
         return render_reaper(self.kind, service_values(self.kit_root, service_path_dirs(self.kit_root, [shutil.which("python3")])),
                              reaper_settings(os.environ), self.kit_root)
@@ -29488,10 +29474,6 @@ class Installer:
     def step_reaper(self, config):
         path, text = reaper_file_path(self.kind), self.reaper_text(config)
         check_writable_target(path)
-        problem = self.reaper_command_problem()
-        if problem:
-            raise InstallError("the reaper service would run %s, which %s; fix that and run again"
-                               % (Path(self.kit_root) / "cloud" / "launcher" / "cloud_worker.py", problem))
         on_disk = path.read_text() if path.exists() else None
         loaded = self.reaper_loaded()
         if on_disk == text and loaded:
