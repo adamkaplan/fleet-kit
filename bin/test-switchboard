@@ -74998,6 +74998,19 @@ class TestGhShimMergeGate(Base):
             with self.subTest(shape=name):
                 self.assertTrue(self.refused_call(args), args)
 
+    def test_an_unknown_flag_before_the_verb_is_never_read_as_the_end_of_the_command(self):
+        """The fallback of `canonical_pr_merge`: a word that is not a known verb, with `merge` after it, is read as a merge (an unknown flag's value was taken for the verb)."""
+        for args in (["pr", "--no-such-flag", "value", "merge", "12", "-R", "acme/app"], ["pr", "--no-such-flag=1", "merge", "12", "-R", "acme/app"]):
+            with self.subTest(args=args):
+                if self.calls.exists():
+                    self.calls.unlink()
+                done, seen = self.run_shim(*args, env={"FAKE_MG_EXIT": "10", "FAKE_MG_JSON": json.dumps({"allowed": False, "reason": "no gate pass recorded"})})
+                self.assertEqual((done.returncode, seen), (10, None), done.stderr)
+        self.mutated_shim('merge = next((w for w in words[2:] if w[1] == "merge"), None)', "merge = None")
+        done, seen = self.run_shim("pr", "--no-such-flag", "value", "merge", "12", "-R", "acme/app")
+        self.assertEqual(done.returncode, 0, "without the fallback that spelling reaches the real gh: the test pins it")
+        self.shim_path = None
+
     def test_a_shim_that_reads_only_the_second_word_misses_the_generated_shapes(self):
         self.mutated_shim("    words = command_word_positions(args)\n    if len(words) < 2 or words[0][1] != \"pr\":", "    return args\n    words = command_word_positions(args)\n    if len(words) < 2 or words[0][1] != \"pr\":")
         self.assertFalse(all(self.refused_call(a) for a in self.call_shapes().values()))
