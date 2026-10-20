@@ -4668,10 +4668,22 @@ class TestLaunch(Base):
     def test_dead_hint_s1b_once_the_registry_holds_the_agents_status_does_not_draw_a_dead_one(self):
         now = self.world.clock.now()
         self.dead_worker({"state": "working", "at": now - 3 * 3600})
-        (self.world.state / "registry.json").write_text(json.dumps({"version": 1, "agents": {}, "retired": {}}))   # #919: the registry removes it on read
+        path = self.world.state / "registry.json"
+        reg = sb.load_module("registry")
+        pane = sb.read_pane_health(self.world.state)["agents"]["worker"]
+        reg.upsert(self.world.state, "worker", {"session": pane["session"], "pane": pane["pane"], "role": "coder", "workspace": "w1"})
+        doc = json.loads(path.read_text())
+        doc["agents"]["worker"]["state"] = "dead"
+        path.write_text(json.dumps(doc))
         lines = "\n".join(sb.pane_health_status_lines(self.world.state, now))
-        self.assertNotIn("DEAD", lines)
+        self.assertNotIn("DEAD", lines)   # the registry holds it dead: the reconcile removes it, so it is not drawn
         self.assertNotIn("worker", lines)
+        for label, text in (("empty registry", json.dumps({"version": 1, "agents": {}, "retired": {}})), ("torn file", "{torn"),
+                            ("only another agent", json.dumps({"version": 1, "agents": {"other": {"state": "dead", "session": "ses_x"}}, "retired": {}})),
+                            ("the agent recorded live", json.dumps({"version": 1, "agents": {"worker": {"state": "idle", "session": pane["session"]}}, "retired": {}}))):
+            with self.subTest(registry=label):
+                path.write_text(text)
+                self.assertIn("worker DEAD", "\n".join(sb.pane_health_status_lines(self.world.state, now)))   # nothing could remove it: the row stays
 
     def test_reading_status_removes_a_dead_agent_through_the_registry_once_with_one_audit_line(self):
         """S3 through the real status path: `collect_status` over a registry holding a dead agent whose pane herdr no longer has."""
@@ -66360,7 +66372,7 @@ class TestReconcileOnRead(unittest.TestCase):
                 self.reason = reason
 
             def pane_get(self, pane):
-                raise sb.HerdrError(self.reason, "pane not found" if self.reason == "exit" else "cannot reach herdr: No such file or directory")
+                raise sb.HerdrError(self.reason, "pane %s not found" % pane if self.reason == "exit" else "cannot reach herdr: No such file or directory")
         reg = self.registry()
         self.assertEqual(sb.reconcile_agents_on_read(self.dir, Herdr("unavailable")), [])
         self.assertIn("ghost", reg.read(self.dir)["agents"])
@@ -66397,27 +66409,40 @@ class TestReconcileOnRead(unittest.TestCase):
                     self.assertEqual(rec.calls[0][2], True)
                     self.assertEqual((rec.calls[0][1]["pane_listed"], rec.calls[0][1]["process_found"]), (False, False))
 
-    def test_s3_herdr_live_check_says_gone_only_when_herdr_says_no_such_pane(self):
+    def test_s3_herdr_live_check_says_gone_only_when_herdr_answers_that_this_pane_is_missing(self):
         class Herdr:
             def __init__(self, error=None, procs=()):
                 self.error, self.procs = error, procs
 
             def pane_get(self, pane):
                 if self.error:
-                    raise sb.HerdrError(*(self.error if isinstance(self.error, tuple) else ("exit", self.error)))
+                    raise sb.HerdrError(*self.error)
                 return {}
 
             def pane_process_info(self, pane):
                 return list(self.procs)
         agent = {"pane": "p_1"}
-        self.assertEqual(sb.herdr_live_check(Herdr(("exit", "pane not found")))("a", agent), {"pane": False, "process": False})
-        # herdr down or missing: its OS text says "No such file or directory", which is NOT a gone pane
-        for reason in ("unavailable", "timeout", "bad_json", "bad_shape"):
-            self.assertEqual(sb.herdr_live_check(Herdr((reason, "cannot reach herdr: No such file or directory")))("a", agent), {"pane": None, "process": None})
-        self.assertEqual(sb.herdr_live_check(Herdr("socket closed"))("a", agent), {"pane": None, "process": None})
+        gone, unknown = {"pane": False, "process": False}, {"pane": None, "process": None}
+        cases = [
+            (("exit", json.dumps({"code": "pane_not_found", "message": "pane p_1 not found"})), gone),
+            (("exit", "pane p_1 not found"), gone),
+            (("exit", "Error: connect /tmp/herdr.sock: No such file or directory"), unknown),
+            (("exit", "workspace not found"), unknown),
+            (("exit", "pane p_2 not found"), unknown),            # another pane
+            (("exit", "pane p_10 not found"), unknown),           # a longer id that contains this one
+            (("exit", "exit 1"), unknown),
+            (("unavailable", "cannot run herdr: No such file or directory"), unknown),
+            (("unavailable", "cannot reach herdr's socket /tmp/h.sock: pane p_1 not found"), unknown),
+            (("timeout", "herdr did not answer within 5s"), unknown),
+            (("bad_json", "herdr returned non-JSON: pane p_1 not found"), unknown),
+            (("bad_shape", "expected result.pane in herdr's reply"), unknown),
+        ]
+        for error, expected in cases:
+            with self.subTest(error=error):
+                self.assertEqual(sb.herdr_live_check(Herdr(error))("a", agent), expected)
         self.assertEqual(sb.herdr_live_check(Herdr(procs=[{"cmdline": "x"}]))("a", agent), {"pane": True, "process": True})
         self.assertEqual(sb.herdr_live_check(Herdr())("a", agent), {"pane": True, "process": False})
-        self.assertEqual(sb.herdr_live_check(Herdr())("a", {}), {"pane": False, "process": False})
+        self.assertEqual(sb.herdr_live_check(Herdr())("a", {}), gone)
 
     def test_s7_only_a_view_reads_ever_calls_reconcile_remove(self):
         """Derived from the code: every call of `reconcile_remove` in the program, plugins and modules sits in agent_reconcile.py (the view's
