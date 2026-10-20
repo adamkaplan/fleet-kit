@@ -32498,6 +32498,26 @@ class TestAgentBlockCounts(TestBlockTable):
         with mock.patch.object(sb, "load_module", side_effect=RuntimeError("x")):
             self.assertIn("no rating note", sb.rating_block_note([{"kind": "review_record"}], self.PR, LEDGER_HEAD))
 
+    def test_an_uncounted_rating_that_is_higher_than_the_counted_one_refuses_and_a_lower_one_is_ignored(self):
+        mod = sb.load_module("delegated_clear")
+        cells = sb.impact_floor.load_matrix()["cells"]
+        low = ("Negligible", "Improbable")
+        high = ("Critical", "Frequent")
+        base = dict(kind="review_record", pr=self.PR, head=LEDGER_HEAD, reviewer="impact", by_role="reviewer", verdict="approve")
+        counted = dict(base, impact_severity=low[0], impact_probability=low[1], block_sha256="a" * 64, block_impact_severity=low[0], block_impact_probability=low[1])
+        flags_high = dict(base, impact_severity=high[0], impact_probability=high[1], block_sha256="none")
+        flags_low = dict(base, impact_severity=low[0], impact_probability=low[1], block_sha256="none")
+        incomplete_high = dict(base, impact_severity=high[0], impact_probability=high[1], block_sha256="b" * 64, block_impact_severity=high[0], block_impact_probability=high[1], verdict="incomplete")
+        report = {"pr": self.PR, "head": LEDGER_HEAD}
+        judge = lambda entries: mod.judge(mod.score_block(), cells, entries, report, "Serious")
+        self.assertEqual(judge([counted])["reasons"], [])
+        for label, others in (("flags only, higher", [flags_high]), ("incomplete, higher", [incomplete_high])):
+            for order in (lambda e: [counted] + e, lambda e: e + [counted]):
+                with self.subTest(label=label):
+                    self.assertEqual(judge(order(others))["reasons"], [mod.HIGHER_UNCOUNTED])
+        self.assertEqual(judge([counted, flags_low])["reasons"], [])   # a lower or equal uncounted rating is ignored
+        self.assertEqual(judge([counted, dict(flags_high, impact_probability=None)])["reasons"], [])   # a record with no readable score is ignored
+
     def test_the_limit_is_said_in_the_docs_and_the_definition(self):
         for path in ("docs/switchboard.md", "agents/reviewers/reviewer-impact.md"):
             text = (REPO / path).read_text()
