@@ -21160,6 +21160,7 @@ def cmd_gates(args, runner, now):
                                         now=now())
     report["plan_problem"] = ctx.plan_problem
     report["pr_unreadable"] = ctx.unreadable
+    report["impact_rating"] = gate_impact_rating(ctx.state, ctx.pr, ctx.facts.get("head"))   # #892: output text only; no gate reads it
     gates_carried_note(report, ctx)
     plan_ledger.enforced_view(report, enforced_gates_of(ctx))
     first = next((e.get("plan_ref") for e in ctx.entries if e.get("pr") == ctx.pr and e.get("plan_ref")), None)
@@ -21621,6 +21622,36 @@ def impact_rating_entries(state_dir, pr, head):
     if problem:
         return [], _one_line(str(problem), 120)
     return [e for e in entries if e.get("kind") == "review_record" and e.get("reviewer") == "impact" and e.get("pr") == pr and e.get("head") == head], None
+
+
+def gate_impact_rating(state_dir, pr, head):
+    """What the `gates` impact-rating line says (#892), read from the engine's own records and rule and computed from nothing else: `impact_rating_entries` (the one filter of the
+    independent reviewer's records at EXACTLY this head), the matrix cell of the recorded severity and probability for its level, and `delegated_clear.score_block`'s
+    `rating_roles` for whether the recorded role counts. None when there is no head. Never raises: a record it cannot read is said, not guessed."""
+    if not head or state_dir is None:
+        return None
+    entries, problem = impact_rating_entries(state_dir, pr, head)
+    if problem:
+        return {"problem": problem}
+    if not entries:
+        return {"recorded": False}
+    block = load_module("delegated_clear").score_block()
+    try:
+        cells = impact_floor._matrix_cached()["cells"]
+    except Exception:
+        cells = {}
+
+    def level_of(entry):
+        return ((cells.get(entry.get("impact_severity")) or {}).get(entry.get("impact_probability")) or {}).get("level")
+    roles = block["rating_roles"] if block else []
+    ladder = block["ladder"] if block else []
+    counted = [(ladder.index(level_of(e)), e) for e in entries if e.get("by_role") in roles and level_of(e) in ladder]   # the delegated clear's own rule: the HIGHEST level of the counted records
+    if counted:
+        top = max(counted, key=lambda pair: pair[0])[1]
+        return {"recorded": True, "level": level_of(top), "role": top.get("by_role"), "counts": True}
+    newest = entries[-1]
+    role = newest.get("by_role") if isinstance(newest.get("by_role"), str) else None
+    return {"recorded": True, "level": level_of(newest), "role": role, "counts": False}   # recorded by a role that does not count (or with no cell): shown, never as counted
 
 
 def _file_text_at(engine, repo, path, ref):

@@ -498,6 +498,21 @@ def enforced_view(report, enforced):
     return report
 
 
+def impact_rating_line(rating, head):
+    """The ONE line `gates` prints about the independent impact rating at the head (#892). `rating` is what the switchboard read from the engine's own rating records
+    (`gate_impact_rating`): {"problem"} (the ledger could not be read), {"recorded": False}, or {"recorded": True, "level", "role", "counts"}. Output text only."""
+    at = (head or "?")[:8]
+    if rating.get("problem"):
+        return "impact rating at %s: unknown (%s)" % (at, rating["problem"])
+    if not rating.get("recorded"):
+        return "impact rating at %s: no impact rating recorded" % at
+    level = rating.get("level") or "level unknown"
+    role = rating.get("role") or "unrecorded role"
+    if rating.get("counts"):
+        return "impact rating at %s: %s, recorded by role %s; its role counts as the independent rating" % (at, level, role)
+    return "impact rating at %s: %s, recorded by role %s; recorded, not counted as the independent rating" % (at, level, role)
+
+
 def render_gates(report, pr):
     """The lines `gates` prints."""
     if report.get("enforced"):
@@ -523,9 +538,12 @@ def render_gates(report, pr):
     for s in report.get("scenarios", []):
         for note in s["void"]:
             lines.append("  %s: %s" % (s["id"], note))
+    rating = report.get("impact_rating")
+    if isinstance(rating, dict):
+        lines.append("  " + impact_rating_line(rating, report.get("head")))
     reviews = report.get("reviews")
     if reviews:
-        lines.append("  reviewers (shadow, not counted; recorded by the PR's own session, so not independent): %d of %d recorded at %s%s" % (
+        lines.append("  reviewers (plan-review panel verdicts: shadow, not counted by any gate): %d of %d recorded at %s%s" % (
             len(reviews["recorded"]), len(reviews["expected"]), (report.get("head") or "?")[:8],
             ": " + ", ".join("%s %s" % kv for kv in sorted(reviews["recorded"].items())) if reviews["recorded"] else "")
             + ("; missing %s" % ", ".join(reviews["missing"]) if reviews["missing"] else ""))
