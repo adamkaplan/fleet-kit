@@ -498,6 +498,17 @@ def enforced_view(report, enforced):
     return report
 
 
+def impact_rating_fact(entries, level):
+    """The impact-rating fact `gates` shows (#892): `entries` are the independent reviewer's records at exactly this head, `level` is what the delegated clear's own scoring says of them
+    (the level of the highest record whose recorded role counts; None when none counts). Counted only when the scoring found a level; a record by any other role is shown as recorded, not counted."""
+    if not entries:
+        return {"recorded": False}
+    if level:
+        return {"recorded": True, "counts": True, "level": level}
+    role = entries[-1].get("by_role")
+    return {"recorded": True, "counts": False, "role": role if isinstance(role, str) else None}
+
+
 def impact_rating_line(rating, head):
     """The ONE line `gates` prints about the independent impact rating at the head (#892). `rating` is what the switchboard read from the engine's own rating records
     (`gate_impact_rating`): {"problem"} (the ledger could not be read), {"recorded": False}, or {"recorded": True, "level", "role", "counts"}. Output text only."""
@@ -506,11 +517,9 @@ def impact_rating_line(rating, head):
         return "impact rating at %s: unknown (%s)" % (at, rating["problem"])
     if not rating.get("recorded"):
         return "impact rating at %s: no impact rating recorded" % at
-    level = rating.get("level") or "level unknown"
-    role = rating.get("role") or "unrecorded role"
     if rating.get("counts"):
-        return "impact rating at %s: %s, recorded by role %s; its role counts as the independent rating" % (at, level, role)
-    return "impact rating at %s: %s, recorded by role %s; recorded, not counted as the independent rating" % (at, level, role)
+        return "impact rating at %s: %s; its recorded role counts as the independent rating" % (at, rating.get("level"))
+    return "impact rating at %s: recorded by role %s; recorded, not counted as the independent rating" % (at, rating.get("role") or "unrecorded")
 
 
 def render_gates(report, pr):

@@ -62832,7 +62832,7 @@ class TestReviewerSubagents(LedgerBase):
         entries, _ = sb.impact_rating_entries(self.world.state, self.PR, LEDGER_HEAD)
         cells = sb.impact_floor.load_matrix()["cells"]
         top = entries[-1]
-        self.assertEqual(after[3], {"recorded": True, "role": "reviewer", "counts": True, "level": cells[top["impact_severity"]][top["impact_probability"]]["level"]})
+        self.assertEqual(after[3], {"recorded": True, "counts": True, "level": cells[top["impact_severity"]][top["impact_probability"]]["level"]})
 
     def test_the_shadow_line_never_changes_whether_the_pr_is_ready(self):
         def ready():

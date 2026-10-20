@@ -21625,33 +21625,23 @@ def impact_rating_entries(state_dir, pr, head):
 
 
 def gate_impact_rating(state_dir, pr, head):
-    """What the `gates` impact-rating line says (#892), read from the engine's own records and rule and computed from nothing else: `impact_rating_entries` (the one filter of the
-    independent reviewer's records at EXACTLY this head), the matrix cell of the recorded severity and probability for its level, and `delegated_clear.score_block`'s
-    `rating_roles` for whether the recorded role counts. None when there is no head. Never raises: a record it cannot read is said, not guessed."""
+    """What the `gates` impact-rating line says (#892), from the engine's own records and rule and nothing computed here: `impact_rating_entries` (the one filter of the independent
+    reviewer's records at EXACTLY this head) and `delegated_clear.judge` (the level of the highest record whose recorded role counts, from the matrix cell: the SAME function the delegated
+    clear scores with). `plan_ledger.impact_rating_fact` shapes the answer. None when there is no head. A ledger it cannot read is said, never guessed."""
     if not head or state_dir is None:
         return None
     entries, problem = impact_rating_entries(state_dir, pr, head)
     if problem:
         return {"problem": problem}
-    if not entries:
-        return {"recorded": False}
     block = load_module("delegated_clear").score_block()
     try:
         cells = impact_floor._matrix_cached()["cells"]
     except Exception:
-        cells = {}
-
-    def level_of(entry):
-        return ((cells.get(entry.get("impact_severity")) or {}).get(entry.get("impact_probability")) or {}).get("level")
-    roles = block["rating_roles"] if block else []
-    ladder = block["ladder"] if block else []
-    counted = [(ladder.index(level_of(e)), e) for e in entries if e.get("by_role") in roles and level_of(e) in ladder]   # the delegated clear's own rule: the HIGHEST level of the counted records
-    if counted:
-        top = max(counted, key=lambda pair: pair[0])[1]
-        return {"recorded": True, "level": level_of(top), "role": top.get("by_role"), "counts": True}
-    newest = entries[-1]
-    role = newest.get("by_role") if isinstance(newest.get("by_role"), str) else None
-    return {"recorded": True, "level": level_of(newest), "role": role, "counts": False}   # recorded by a role that does not count (or with no cell): shown, never as counted
+        cells = None
+    level = None
+    if entries and block and cells:
+        level = load_module("delegated_clear").judge(block, cells, entries, {"pr": pr, "head": head, "top_tier_hits": {}}, block["delegable_levels"][0]).get("level")
+    return plan_ledger.impact_rating_fact(entries, level)
 
 
 def _file_text_at(engine, repo, path, ref):
