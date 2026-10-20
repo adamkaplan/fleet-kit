@@ -13155,25 +13155,214 @@ class TestChatClearHook(Base):
         self.assertEqual(len(self.events("chat_clear.comment_failed")), 1)
         self.assertEqual(len(self.events("gate.hold_cleared")) - cleared_before, 1, "the clear stands; only the comment failed")
 
-    def test_enabled_false_and_v2_light_read_nothing_and_judge_nothing(self):
+    def test_enabled_false_reads_nothing_and_judges_nothing_and_v2_light_still_reads_once(self):
         self.live = True
         self.build(extra={"chat_clear": {"live": True, "enabled": False}})
         self.hook()
         self.say("9 is good to go")
         self.hook()
         self.assertEqual((self.jev.calls, self.writes, self.events("chat_clear.offers")), ([], [], []))
-        self.build(live=True)
+        self.build(live=False)
         self.hook()
         self.say("9 is good to go")
         self.engine.light = True
         self.hook()
-        self.assertEqual((self.jev.calls, self.writes), ([], []), "v2_light: no background read of his session")
+        self.assertEqual((len(self.jev.calls), self.writes), (1, []), "#977: v2_light keeps the chat clear's one read, in shadow: judged once, nothing written")
         self.engine.light = False
         self.hook()
-        self.assertEqual(len(self.jev.calls), 1, "the message was not lost: it is read when the light mode ends")
+        self.assertEqual(len(self.jev.calls), 1, "judged once: it is not read and judged again when the light mode ends")
         for bad in ({"enabled": "no"}, {"enabled": 0, "live": False}):
             with self.assertRaises(sb.ConfigError, msg=bad):
                 sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "chat_clear": bad})
+
+    # ---- #977: the one allowed session read under v2_light
+
+    FIXTURE = Path(__file__).resolve().parent.parent / "scenarios" / "chat-clear" / "owner-prompt-records.json"
+
+    def light(self, **extra):
+        self.build(extra=dict({"v2_light": True}, **extra))
+        self.assertTrue(self.engine.light)
+
+    def v2_ops(self, since=0):
+        return [c for c in self.world.v2.calls[since:] if len(c) > 2 and c[1] == "api" and c[2] in ("session.message.list", "session.inbox.list", "session.get", "session.list")]
+
+    def chat_calls(self, since):
+        return [c for c in self.world.v2.calls[since:] if len(c) > 2 and c[1] == "api" and c[2].startswith("session.message") or len(c) > 2 and c[1] == "api" and c[2] == "session.inbox.list"]
+
+    def run_pass_only(self, decisions=None):
+        """Only the chat clear's own pass (the discovery is done): returns the calls it made."""
+        self.engine.discover(self.world.clock.now())
+        sb.decisions_from_notices(self.engine, self.world.clock.now())
+        mark = len(self.world.v2.calls)
+        sb.chat_clear_pass(self.engine, self.decisions() if decisions is None else decisions, self.world.clock.now())
+        return [c for c in self.world.v2.calls[mark:] if len(c) > 2 and c[1] == "api"]
+
+    def test_s1_under_v2_light_the_pass_reads_the_chief_of_staffs_session_once_and_judges_both_new_messages(self):
+        self.light()
+        self.hook()                                  # the offer is recorded
+        self.say("9 is good to go")
+        self.say("9 is fine, go ahead")
+        calls = self.run_pass_only()
+        reads = [c for c in calls if c[2] == "session.message.list"]
+        self.assertEqual(len(reads), 1, calls)
+        self.assertIn("sessionID=" + self.world.sessions["cos"], reads[0])
+        self.assertEqual(len(self.events("chat_clear.verdict")), 2)
+
+    def test_s2_under_v2_light_no_other_session_and_no_inbox_compaction_or_list_call_is_made(self):
+        self.light()
+        self.hook()
+        self.say("9 is good to go")
+        self.world.v2.start_turn(self.world.sessions["coder"], "a prompt in another session", fleet=False)
+        calls = self.run_pass_only()
+        other = [c for c in calls if c[2] != "session.message.list" or "sessionID=" + self.world.sessions["cos"] not in c]
+        self.assertEqual(other, [], "nothing but the one read of the Chief of Staff's session: %s" % other)
+        (read,) = calls
+        self.assertIn("type=user", read)
+        self.assertIn("limit=%d" % sb.CHAT_CLEAR_LIGHT_LIMIT, read)
+
+    def test_s3_only_the_unseen_messages_are_judged_and_without_an_offer_nothing_is_read(self):
+        self.light()
+        self.say("9 is good to go")
+        self.assertEqual(self.run_pass_only(decisions=[]), [], "no offer: no read of his messages")
+        self.hook()
+        self.say("9 is fine")
+        self.hook()
+        self.assertEqual(len(self.events("chat_clear.verdict")), 2)
+        before = len(self.events("chat_clear.verdict"))
+        self.hook()
+        self.assertEqual(len(self.events("chat_clear.verdict")), before, "a message already seen is not judged again")
+
+    def test_s4_a_page_over_the_bound_is_read_for_nothing_and_the_audit_says_why(self):
+        self.light()
+        self.hook()
+        self.say("9 is good to go")
+        with mock.patch.object(sb, "CHAT_CLEAR_LIGHT_BYTES", 100):
+            self.hook()
+        self.assertEqual(self.events("chat_clear.verdict"), [])
+        (refused,) = self.events("chat_clear.read_refused")
+        self.assertIn("over the bound of 100", refused["detail"]["why"])
+        self.assertEqual(self.cc_seen(), {}, "nothing was marked seen: the message waits")
+        self.hook()
+        self.assertEqual(len(self.events("chat_clear.verdict")), 1, "within the bound again: judged")
+
+    def cc_seen(self):
+        return sb.load_module("chat_clear").read_seen(self.world.state)
+
+    def test_s4b_a_failed_read_is_audited_and_judges_nothing(self):
+        self.light()
+        self.hook()
+        self.say("9 is good to go")
+        with mock.patch.object(self.engine.v2, "message_list", side_effect=sb.V2Error("timeout", None, "slow")):
+            self.hook()
+        self.assertEqual((self.events("chat_clear.verdict"), len(self.events("chat_clear.read_refused"))), ([], 1))
+        self.assertEqual(self.cc_seen(), {})
+
+    def fixture(self):
+        return json.loads(self.FIXTURE.read_text())
+
+    def test_s6_the_real_record_shape_is_still_read_as_the_persons_and_the_fleets_are_not(self):
+        data, cc = self.fixture(), sb.load_module("chat_clear")
+        self.assertEqual(len(data["person"]), 3)
+        for record in data["person"]:
+            self.assertEqual(cc.persons_text(record), record["text"], "the extraction no longer matches the recorded shape")
+        for record in data["fleet"]:
+            self.assertIsNone(cc.persons_text(record))
+        self.assertEqual(sorted(data["person"][0]), ["agents", "files", "id", "text", "time", "type"], "the recorded key set")
+
+    def test_s6b_the_recorded_shape_goes_through_the_real_pass_and_is_judged(self):
+        self.light()
+        self.hook()
+        now_ms = self.world.clock.ms(self.world.clock.now())
+        for n, record in enumerate(self.fixture()["person"] + self.fixture()["fleet"]):
+            record = dict(record, time={"created": now_ms - 1000 * (10 - n)}, sessionID=self.world.sessions["cos"])
+            self.world.v2.sessions[self.world.sessions["cos"]]["messages"].append(record)
+        self.hook()
+        ids = sorted(e["detail"]["message_id"] for e in self.events("chat_clear.verdict"))
+        self.assertEqual(ids, ["msg_fixture01", "msg_fixture02", "msg_fixture03"], "the three person records, never the two the fleet wrote")
+
+    def test_s7_the_fixture_holds_no_message_text_but_the_filler(self):
+        data = self.fixture()
+        for record in data["person"] + data["fleet"]:
+            body = record["text"].replace("[switchboard] ", "")
+            self.assertEqual(body.replace(data["filler"], "").strip(), "", record["id"])
+
+    def test_s8_shadow_with_v2_light_on_a_clear_verdict_is_audited_and_nothing_is_cleared(self):
+        self.light()
+        self.hook()
+        self.say("9 is good to go")
+        self.hook()
+        (verdict,) = self.events("chat_clear.verdict")
+        self.assertEqual((verdict["detail"]["live"], verdict["detail"]["would_clear"], verdict["detail"]["action"]), (False, True, "clear"))
+        self.assertEqual((self.writes, self.events("gate.hold_cleared"), self.cos_texts()), ([], [], []))
+
+    def test_s9_the_switches_are_the_owners_and_a_pass_changes_neither(self):
+        self.assertIs(sb.DEFAULTS["v2_light"], False)
+        self.assertEqual(sb.chat_clear_config({}), {"enabled": True, "live": False})
+        self.light()
+        config = json.dumps(self.engine.config, sort_keys=True, default=str)
+        self.hook()
+        self.say("9 is good to go")
+        self.hook()
+        self.assertTrue(self.engine.light)
+        self.assertEqual(json.dumps(self.engine.config, sort_keys=True, default=str), config)
+        self.assertFalse(sb.chat_clear_live_now(self.engine)[0])
+
+    def test_u3_the_fake_session_source_is_no_more_generous_than_the_real_one(self):
+        self.light()
+        cos, coder = self.world.sessions["cos"], self.world.sessions["coder"]
+        for n in range(15):
+            self.say("message %d" % n)
+        self.world.v2.start_turn(coder, "elsewhere", fleet=False)
+        page = self.engine.v2.message_list(cos, limit=10, type="user")
+        self.assertEqual(len(page), 10, "it honours limit")
+        self.assertTrue(all(m["type"] == "user" for m in page), "it honours type")
+        self.assertEqual([m["text"] for m in page][:2], ["message 14", "message 13"], "newest first")
+        self.assertTrue(all(m["sessionID"] == cos for m in page), "it returns nothing of another session")
+
+    # the table of what v2_light keeps OFF: one case per member of V2_LIGHT_OFF, derived from it (S: completeness). Each case calls the real
+    # code path under light and expects an empty answer and no call to the session service.
+    def light_off_cases(self):
+        e, sid = self.engine, self.world.sessions["cos"]
+        now = self.world.clock.now()
+        obs = next(iter(e.discover(now).agents.values()))
+        worker_facts = next(f for f in e.sources if isinstance(f, sb.WorkerFacts))
+        return {
+            0: ("the person's last prompt", lambda: (e.reads.human_prompts_newest(sid), sb.inbox_human_prompts(e, sid), e.reads.last_human_prompt(sid, now, 1) if hasattr(e.reads, "last_human_prompt") else None)),
+            1: ("compactions", lambda: e.reads.compaction_page(sid, 5, now)),
+            2: ("inbox", lambda: e.reads.inbox(sid, now)),
+            3: ("stop summary", lambda: (worker_facts.last_reply(sid, 1), sb.triage_stop(e, None, obs, "boss", 1, ""))),
+            4: ("landed-checks", lambda: e.delivered_keys(sid, 0)[1]),
+            5: ("report-answered", lambda: (sb.transcript_lines(e, sid, 0), sb.transcript_lines(e, sid, 0))),
+            6: ("brief scan", lambda: sb.brief_in_transcript(e, sid)),
+        }
+
+    def test_u1_every_other_optional_read_stays_off_under_v2_light_one_case_per_member(self):
+        self.light()
+        cases = self.light_off_cases()
+        self.assertEqual(sorted(cases), list(range(len(sb.V2_LIGHT_OFF))), "completeness: a case for every member of V2_LIGHT_OFF and no case without one")
+        sid = self.world.sessions["cos"]
+        self.say("a prompt")
+        self.world.v2.start_turn(sid, "another", fleet=True)
+        for index, (name, call) in sorted(cases.items()):
+            with self.subTest(member=sb.V2_LIGHT_OFF[index]):
+                mark = len(self.world.v2.calls)
+                call()
+                self.assertEqual(self.v2_ops(mark), [], "%s: no session call under light" % name)
+
+    def test_u1b_each_case_would_read_without_light_so_the_table_can_fail(self):
+        # the mutant of every member: with light off the same case makes a session call, so a case that passes under light proves something
+        self.build()
+        self.assertFalse(self.engine.light)
+        self.say("a prompt")
+        cases = self.light_off_cases()
+        for index in sorted(cases):   # the mutant of each member: the same call with the light guard removed
+            with self.subTest(member=sb.V2_LIGHT_OFF[index]):
+                mark = len(self.world.v2.calls)
+                try:
+                    cases[index][1]()
+                except Exception:
+                    pass
+                self.assertNotEqual(self.v2_ops(mark), [], "%s makes a session call without light" % cases[index][0])
 
     def test_the_seen_file_is_private_bounded_and_empty_when_damaged(self):
         cc = sb.load_module("chat_clear")
