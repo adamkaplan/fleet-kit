@@ -70742,22 +70742,29 @@ class TestAdoption(LanesCase):
         self.assertEqual((Path(self.world.state) / "boss-overrides.json").read_bytes(), before)
         self.assertEqual(self.rows(), [])
 
+    def put_retired(self, name, record):   # the registry is the one source (#903); retired.json is derived output, so a hand-written file is never read
+        reg = sb.load_module("registry")
+        reg.unretire(self.world.state, name)
+        reg.retire(self.world.state, name, record["by"], record["reason"], session=record["session"] or None, now=record["at"])
+        if not record["session"]:
+            reg._mutate(self.world.state, lambda doc: (doc["retired"][name].update(session=record["session"]) or True, [], None))
+
     def test_a_live_boss_whose_retired_record_names_no_session_keeps_its_worker(self):   # S8: a retirement covers only the session it names
         self.worker("w1", "orch-a", charter=1)
         for label, record in (("no session", {"at": 1, "by": "x", "reason": "r", "session": None}), ("another session", {"at": 1, "by": "x", "reason": "r", "session": "ses_old"}),
                               ("an empty session", {"at": 1, "by": "x", "reason": "r", "session": ""})):
             with self.subTest(label):
-                set_retired(self.world.state, {"orch-a": record})
+                self.put_retired("orch-a", record)
                 self.daemon_pass()
                 self.assertEqual(self.boss("w1"), "orch-a", "orch-a is live: nothing to fill")
                 self.assertEqual([r for r in self.rows() if r["detail"]["worker"] == "w1"], [])
-        set_retired(self.world.state, {"orch-a": {"at": 1, "by": "x", "reason": "r", "session": self.world.sessions["orch-a"]}})
+        self.put_retired("orch-a", {"at": 1, "by": "x", "reason": "r", "session": self.world.sessions["orch-a"]})
         self.daemon_pass()
         self.assertEqual(self.boss("w1"), "chief-of-staff", "a retirement that names this session does count (charter 1 has no other orchestrator)")
 
     def test_a_live_heir_whose_retired_record_names_no_session_is_still_an_heir(self):   # S8: the heir side of the same rule
         self.worker("w1", "gone", charter=1)
-        set_retired(self.world.state, {"orch-a": {"at": 1, "by": "x", "reason": "r", "session": None}})
+        self.put_retired("orch-a", {"at": 1, "by": "x", "reason": "r", "session": None})
         self.daemon_pass()
         self.assertEqual(self.boss("w1"), "orch-a")
 
