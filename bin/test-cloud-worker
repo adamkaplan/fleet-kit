@@ -1640,6 +1640,20 @@ class TestVaultCheckRelay(VaultBase):
                 self.assertEqual(code, 2, err)
                 self.assertEqual((len(self.check_runs()), self.az_reads(), self.audit_lines()), (0, 1, []))
 
+    def test_an_operator_admin_command_that_prints_the_firewall_text_is_not_retried_and_runs_no_check(self):
+        self.make_checkout(code=10, fixes=True)
+        os.environ["CW_CLUSTER_ADMIN_CMD"] = "echo ForbiddenByFirewall >&2; exit 1"
+        code, out, err = self.launch()
+        self.assertEqual(code, 2, err)
+        self.assertEqual((len(self.check_runs()), self.az_reads(), self.audit_lines()), (0, 0, []))
+
+    def test_a_mint_with_no_recovery_never_runs_the_check(self):
+        self.make_checkout(code=10, fixes=True)
+        self.assertIsNone(self.cw.Cluster().recovery)   # every command but launch builds its login this way
+        with self.assertRaises(self.cw.Refusal):
+            self.cw.cluster_token(env=dict(os.environ))
+        self.assertEqual((len(self.check_runs()), self.az_reads()), (0, 1))
+
     def test_an_off_list_repository_never_runs_the_check(self):
         os.environ["CW_ALLOWED_REPOS"] = "acme-org/other"
         code, out, err = self.launch()
