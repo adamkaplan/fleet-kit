@@ -28005,6 +28005,13 @@ PROFILE_DIRS = ("config", "data", "state", "cache", "tmp", "home")
 V2_PACKAGE, V2_VERSION = "@opencode/cli", "2.0.22"  # what the Lab and the trial install; a test keeps them equal
 SERVICE_LABEL = "com.fleet-kit.switchboard"
 SERVICE_UNIT = "fleet-kit-switchboard.service"
+REAPER_LABEL = "com.fleet-kit.cloud-reaper"
+REAPER_UNIT = "fleet-kit-cloud-reaper.service"
+REAPER_INTERVAL_SECONDS = 60   # seconds between the managed reaper's passes: never slower than the reaper's own floor (REAP_FLOOR_SECONDS in cloud_worker.py)
+# The reaper's NON-SECRET settings the installer copies from its own environment into the service (names of a cluster or a
+# namespace, paths of files). A token is never among them: the reaper reads the token FILE by path.
+REAPER_SETTING_NAMES = ("CW_KUBE_CONTEXT", "CW_KUBECONFIG", "CW_KUBECTL", "CW_CLOUD_SERVER", "CW_CLOUD_TOKEN_FILE",
+                        "CW_CLOUD_CA_FILE", "CW_CLOUD_NAMESPACE", "CW_CLOUD_RECORD_DIR", "CW_RUN_RECORD_DIR", "CW_CLOUD_AUDIT")
 HERDR_PLUGIN_ID = "fleet-switchboard"
 COS_NAME = "cos"
 COS_AGENT = "chief-of-staff"
@@ -28803,6 +28810,44 @@ def render_service(kind, values, kit_root=KIT_ROOT):
     return text
 
 
+def reaper_file_path(kind):
+    if kind == "launchd":
+        return Path.home() / "Library" / "LaunchAgents" / (REAPER_LABEL + ".plist")
+    if kind == "systemd":
+        return _xdg("XDG_CONFIG_HOME", ".config") / "systemd" / "user" / REAPER_UNIT
+    return None
+
+
+def reaper_settings(env):
+    """The settings of REAPER_SETTING_NAMES that `env` holds, as {name: value}. A value that is not one plain line, or is a
+    URL with a password in it, is refused by name (never printed): a service file is readable by any process of the user."""
+    found = {}
+    for name in REAPER_SETTING_NAMES:
+        value = (env.get(name) or "").strip()
+        if not value:
+            continue
+        if re.search(r"[\x00-\x1f\x7f]", value) or re.search(r"://[^/\s@]*:[^/\s@]*@", value):
+            raise InstallError("%s cannot go into the reaper's service file (not one plain line, or it holds a password); "
+                               "set it to a name or a path" % name)
+        found[name] = value
+    return found
+
+
+def render_reaper(kind, values, settings, kit_root=KIT_ROOT):
+    """The reaper's LaunchAgent or systemd user unit from its template in templates/. `settings` is reaper_settings()."""
+    name = REAPER_LABEL + ".plist" if kind == "launchd" else REAPER_UNIT
+    text = (Path(kit_root) / "templates" / name).read_text()
+    if kind == "launchd":
+        block = "\n".join("\t\t<key>%s</key>\n\t\t<string>%s</string>" % (k, xml_escape(v)) for k, v in sorted(settings.items()))
+    else:
+        block = "\n".join('Environment="%s=%s"' % (k, v.replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"'))
+                          for k, v in sorted(settings.items()))
+    values = dict(values, __REAP_SECONDS__=str(REAPER_INTERVAL_SECONDS))
+    for placeholder, value in values.items():
+        text = text.replace(placeholder, xml_escape(value) if kind == "launchd" else value.replace("%", "%%"))
+    return text.replace("__REAPER_ENV__", block)
+
+
 def service_values(kit_root, path_dirs):
     """The placeholders of both service templates. No secret is among them: the key comes from its file."""
     return {"__PYTHON__": sys.executable, "__HOME__": str(Path.home()), "__PREFIX__": str(kit_root),
@@ -29335,6 +29380,67 @@ class Installer:
             self.run_checked(command, " ".join(command))
         self.say("service", "done", str(path))
 
+    # -- 5b: the cloud reaper's service (opt-in, like the heartbeat's: it needs a cluster login this machine may not have)
+    def reaper_text(self, config):
+        return render_reaper(self.kind, service_values(self.kit_root, service_path_dirs(self.kit_root, [shutil.which("python3")])),
+                             reaper_settings(os.environ), self.kit_root)
+
+    def reaper_loaded(self):
+        uid = os.getuid()
+        if self.kind == "launchd":
+            argv = ["launchctl", "print", "gui/%d/%s" % (uid, REAPER_LABEL)]
+        else:
+            argv = ["systemctl", "--user", "is-enabled", REAPER_UNIT]
+        return self.runner(argv, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL).returncode == 0
+
+    def reaper_load_commands(self, path):
+        if self.kind == "launchd":
+            return [["launchctl", "bootstrap", "gui/%d" % os.getuid(), str(path)]]
+        return [["systemctl", "--user", "daemon-reload"], ["systemctl", "--user", "enable", "--now", REAPER_UNIT]]
+
+    def reaper_unload_commands(self):
+        if self.kind == "launchd":
+            return [["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), REAPER_LABEL)]]
+        return [["systemctl", "--user", "disable", "--now", REAPER_UNIT]]
+
+    def step_reaper(self, config):
+        path, text = reaper_file_path(self.kind), self.reaper_text(config)
+        on_disk = path.read_text() if path.exists() else None
+        loaded = self.reaper_loaded()
+        if on_disk == text and loaded:
+            return self.say("cloud reaper", "already done", str(path))
+        what = "load" if on_disk == text else "write and load"
+        commands = " && ".join(" ".join(c) for c in self.reaper_load_commands(path))
+        self.say("cloud reaper", "will run" if not self.dry else "would run", "%s: %s" % (what, commands))
+        if self.dry:
+            return self.say("cloud reaper", "would be done", str(path))
+        ensure_state_dir()
+        if on_disk != text:
+            if loaded:
+                for command in self.reaper_unload_commands():
+                    self.run_checked(command, " ".join(command))
+            write_if_changed(path, text)
+        for command in self.reaper_load_commands(path):
+            self.run_checked(command, " ".join(command))
+        self.say("cloud reaper", "done", str(path))
+
+    def remove_reaper(self):
+        """Uninstall: unload and delete the reaper's service when it is there. Silent when it never was."""
+        path = reaper_file_path(self.kind)
+        had = path.exists()
+        if not (had or self.reaper_loaded()):
+            return
+        if self.reaper_loaded():
+            self.say("cloud reaper", "would run" if self.dry else "will run", " && ".join(" ".join(c) for c in self.reaper_unload_commands()))
+            if not self.dry:
+                for command in self.reaper_unload_commands():
+                    self.run_checked(command, " ".join(command))
+        if had and not self.dry:
+            path.unlink()
+            if self.kind == "systemd":
+                self.run_checked(["systemctl", "--user", "daemon-reload"], "systemctl --user daemon-reload")
+        self.result("cloud reaper", had, "removed %s" % path, "not installed")
+
     # -- 6: the daemon, and what status says
     def step_ensure(self, ensure, status):
         if self.dry:
@@ -29352,7 +29458,7 @@ class Installer:
         except ConfigError as err:
             raise InstallError(str(err)) from None
 
-    def install(self, explicit_opencode=None, with_service=True, with_link=True, ensure=None, status=None):
+    def install(self, explicit_opencode=None, with_service=True, with_link=True, ensure=None, status=None, with_reaper=False):
         config = self.read_config()
         binary, version = self.find_v2(explicit_opencode, config)
         self.result("opencode v2", binary != config.get("opencode_executable"), "%s (v%s)" % (binary, version),
@@ -29377,6 +29483,8 @@ class Installer:
             self.say("service", "skipped (no service manager known for this platform)")
         else:
             self.step_service(config)
+            if with_reaper:
+                self.step_reaper(config)
         self.step_ensure(ensure or (lambda: ensure_daemon(ensure_state_dir(), self.spawn)),
                          status or (lambda: format_status(collect_status(self.runner, self.now, self.platform))))
 
@@ -29401,6 +29509,7 @@ class Installer:
                 if self.kind == "systemd":
                     self.run_checked(["systemctl", "--user", "daemon-reload"], "systemctl --user daemon-reload")
             self.result("service", had, "removed %s" % path, "not installed")
+            self.remove_reaper()
         if with_link:
             state = self.plugin_linked(config)
             if state["state"] == "linked":
@@ -29491,7 +29600,7 @@ def cmd_install(args, runner, now, spawn=subprocess.Popen):
         if args.uninstall:
             installer.uninstall(not args.no_service, not args.no_herdr_link)
         else:
-            installer.install(args.opencode, not args.no_service, not args.no_herdr_link)
+            installer.install(args.opencode, not args.no_service, not args.no_herdr_link, with_reaper=args.with_cloud_reaper)
     except InstallError as err:
         sys.stderr.write("%s: install stopped: %s\n" % (PROG, err))
         return EXIT_ERROR
@@ -29509,6 +29618,9 @@ def add_install_parsers(sub):
     install.add_argument("--opencode", help="The OpenCode v2 binary (absolute path); default: the configured one, "
                                            "then the known places")
     install.add_argument("--no-service", dest="no_service", action="store_true", help="Do not install the service")
+    install.add_argument("--with-cloud-reaper", dest="with_cloud_reaper", action="store_true",
+                         help="Also install and load the cloud worker reaper as a service (opt-in: it needs a cluster login; "
+                              "its non-secret CW_* settings are copied from this environment)")
     install.add_argument("--no-herdr-link", dest="no_herdr_link", action="store_true",
                          help="Do not link herdr's plugin (it starts the daemon whenever herdr starts)")
     install.add_argument("--shared-profile", dest="shared_profile", action="store_true",

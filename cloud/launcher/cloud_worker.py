@@ -1136,6 +1136,16 @@ def _run_id(v):
     return v
 
 
+REAP_FLOOR_SECONDS = 60   # the contract's once a minute: a pass is never further apart than this, whatever --loop says
+
+
+def _reap_exit_line(clock, why):
+    """The ONE line a reaper process writes when it ends: a UTC time and the reason. The reason is built by the caller
+    from a scrubbed message, never from a token or an environment value."""
+    now = clock() if clock else dt.datetime.now(dt.timezone.utc)
+    print("cloud-worker: %s reaper exiting: %s" % (iso(now), why), file=sys.stderr)
+
+
 def _reap_main(L, a, sleep):
     """The reaper's loop. Whatever ends it writes ONE line saying why (signal, error, or the end of the loop)."""
     old, why = L._catch_signals(), None
@@ -1146,7 +1156,7 @@ def _reap_main(L, a, sleep):
             if not a.loop:
                 why = "end of its pass"
                 return EXIT_HOOK if any(c for _, _, c in res) else 0
-            sleep(min(a.loop, 60))  # never slower than the contract's once a minute
+            sleep(min(a.loop, REAP_FLOOR_SECONDS))
     except (Interrupted, KeyboardInterrupt) as e:
         why = "stopped by %s" % (e if isinstance(e, Interrupted) else "interrupt")
         raise
@@ -1155,7 +1165,7 @@ def _reap_main(L, a, sleep):
         raise
     finally:
         L._restore_signals(old)
-        print("cloud-worker: %s reaper exiting: %s" % (iso(L.clock()), why), file=sys.stderr)   # reason and UTC time, once
+        _reap_exit_line(L.clock, why)   # reason and UTC time, once
 
 
 def main(argv=None, env=None, clock=None, sleep=time.sleep):
@@ -1165,6 +1175,8 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
     except SystemExit as e:
         return EXIT_USAGE if e.code else 0
     if not token_mode(env) and not (env.get("CW_KUBE_CONTEXT") or "").strip():
+        if a.cmd == "reap":
+            _reap_exit_line(clock, "cluster login failed: no login is set (CW_KUBE_CONTEXT or the token-file settings)")
         print("cloud-worker: CW_KUBE_CONTEXT is not set; refusing to run (the active kubectl context is never used)", file=sys.stderr)
         return EXIT_USAGE
     kube = None
@@ -1177,6 +1189,8 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
         print(result["report"] if a.cmd == "report" and not a.json else json.dumps(result, sort_keys=True))
         return 0
     except CloudError as e:
+        if a.cmd == "reap" and kube is None:   # Kube() itself refused: the login (token file, server, kubeconfig) failed
+            _reap_exit_line(clock, "cluster login failed: %s" % scrub(e, (), 200))
         print("cloud-worker: %s" % (kube.scrub(e, 1500) if kube else scrub(e, (), 1500)), file=sys.stderr)
         return e.code
     except (Interrupted, KeyboardInterrupt):

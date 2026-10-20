@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  com.fleet-kit.cloud-reaper — LaunchAgent TEMPLATE for the cloud worker reaper.
+
+  This file is a template, not a plist you can load. `fleet-switchboard install` with its with-cloud-reaper flag
+  fills the placeholders, writes the result to ~/Library/LaunchAgents/com.fleet-kit.cloud-reaper.plist
+  and loads it (opt-in: the default install does not touch it):
+
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fleet-kit.cloud-reaper.plist
+
+  `fleet-switchboard install` with its uninstall flag unloads it again:
+
+    launchctl bootout gui/$(id -u)/com.fleet-kit.cloud-reaper
+
+  Placeholders, between double underscores: PYTHON, PREFIX, HOME, PATH, STATE_DIR (where it logs),
+  REAP_SECONDS (the seconds between passes; one named constant in the installer, never slower than
+  the reaper's own floor of once a minute) and REAPER_ENV (the reaper's NON-SECRET settings read from
+  the installer's environment: names of a cluster, a namespace, paths of files).
+
+  There is nothing private in this file. The reaper holds no credential: it reads the namespaced
+  operator's token FILE by path and builds its own private kubeconfig at each start. When the settings
+  file of the cloud launcher lands, the reaper reads it as the launcher does.
+
+  When the Mac sleeps the reaper pauses; the worker's own pod-side limit still ends it.
+
+  There is exactly one copy of this file. Do not keep a second one for the installer.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.fleet-kit.cloud-reaper</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>__PYTHON__</string>
+		<string>-B</string>
+		<string>__PREFIX__/cloud/launcher/cloud-worker</string>
+		<string>reap</string>
+		<string>--loop</string>
+		<string>__REAP_SECONDS__</string>
+	</array>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>__HOME__</string>
+		<key>PATH</key>
+		<string>__PATH__</string>
+__REAPER_ENV__
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+
+	<!-- A reaper that cannot log in or crashes restarts slowly and visibly, never in a tight loop. -->
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+
+	<!-- Never /dev/null: the reaper writes one line saying why it exits; the installer makes the directory first. -->
+	<key>StandardErrorPath</key>
+	<string>__STATE_DIR__/cloud-reaper-stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>__STATE_DIR__/cloud-reaper-stdout.log</string>
+
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>WorkingDirectory</key>
+	<string>__HOME__</string>
+</dict>
+</plist>

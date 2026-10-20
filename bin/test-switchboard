@@ -40745,6 +40745,7 @@ class InstallFakes:
         self.calls, self.version = [], version
         self.linked = False
         self.loaded = False
+        self.reaper_loaded = False
         self.fail = {}
         self.integration_calls, self.integration_reports_at = [], None
         self.binary = str(home / "v2dir" / "opencode.exe")
@@ -40789,18 +40790,19 @@ class InstallFakes:
             shown = self.integration_reports_at or target
             state = "current (v13)" if os.path.exists(target) else "not installed"
             return ok("claude: current (v10) (/elsewhere/hooks/herdr-agent-state.sh)\nopencode: %s (%s)\n" % (state, shown))
+        reaper = "cloud-reaper" in " ".join(argv)   # the reaper's service is loaded and unloaded on its own
         if argv[0] == "launchctl":
             if argv[1] == "print":
-                return subprocess.CompletedProcess(argv, 0 if self.loaded else 113, "", "")
-            self.loaded = argv[1] == "bootstrap"
+                return subprocess.CompletedProcess(argv, 0 if (self.reaper_loaded if reaper else self.loaded) else 113, "", "")
+            setattr(self, "reaper_loaded" if reaper else "loaded", argv[1] == "bootstrap")
             return ok()
         if argv[0] == "systemctl":
             if "is-enabled" in argv:
-                return subprocess.CompletedProcess(argv, 0 if self.loaded else 1, "", "")
+                return subprocess.CompletedProcess(argv, 0 if (self.reaper_loaded if reaper else self.loaded) else 1, "", "")
             if "enable" in argv:
-                self.loaded = True
+                setattr(self, "reaper_loaded" if reaper else "loaded", True)
             if "disable" in argv:
-                self.loaded = False
+                setattr(self, "reaper_loaded" if reaper else "loaded", False)
             return ok()
         raise AssertionError("install reached for a real program: %r" % argv)
 
@@ -40847,7 +40849,7 @@ class InstallCase(Base):
                 installer.uninstall(not args.no_service, not args.no_herdr_link)
             else:
                 installer.install(args.opencode, not args.no_service, not args.no_herdr_link,
-                                  status=lambda: status)
+                                  status=lambda: status, with_reaper=args.with_cloud_reaper)
         except sb.InstallError as err:
             return out.getvalue(), str(err)
         return out.getvalue(), None
@@ -41534,6 +41536,183 @@ class TestServiceTemplates(Base):
                 captured():
             code = sb.main(["run", "--standby"], runner=world.route, now=world.clock.now)
         self.assertEqual((code, slept, ran), (0, [sb.STANDBY_SECONDS], [1]))
+
+
+# Every field of the reaper's two templates: field -> what it must hold. A field added to a template needs a row.
+REAPER_PLIST_FIELDS = {
+    "Label": lambda v, ctx: v == "com.fleet-kit.cloud-reaper",
+    "ProgramArguments": lambda v, ctx: v[1:3] == ["-B", str(REPO / "cloud/launcher/cloud-worker")] and v[3:] == ["reap", "--loop", str(sb.REAPER_INTERVAL_SECONDS)],
+    "EnvironmentVariables": lambda v, ctx: v["HOME"] == str(Path.home()) and "/usr/bin" in v["PATH"].split(":"),
+    "RunAtLoad": lambda v, ctx: v is True,
+    "KeepAlive": lambda v, ctx: v is True,
+    "ThrottleInterval": lambda v, ctx: isinstance(v, int) and v >= 10,
+    "StandardErrorPath": lambda v, ctx: v == str(sb.state_dir_path() / "cloud-reaper-stderr.log"),
+    "StandardOutPath": lambda v, ctx: v == str(sb.state_dir_path() / "cloud-reaper-stdout.log"),
+    "ProcessType": lambda v, ctx: v == "Background",
+    "WorkingDirectory": lambda v, ctx: v == str(Path.home()),
+}
+REAPER_UNIT_FIELDS = {
+    ("Unit", "Description"): lambda v: "reaper" in v,
+    ("Service", "Type"): lambda v: v == "simple",
+    ("Service", "ExecStart"): lambda v: v.endswith("cloud/launcher/cloud-worker\" reap --loop %d" % sb.REAPER_INTERVAL_SECONDS),
+    ("Service", "WorkingDirectory"): lambda v: v == str(Path.home()),
+    ("Service", "Environment"): lambda v: "=" in v,
+    ("Service", "Restart"): lambda v: v == "always",
+    ("Service", "RestartSec"): lambda v: int(v) >= 10,
+    ("Service", "StandardOutput"): lambda v: v == "journal",
+    ("Service", "StandardError"): lambda v: v == "journal",
+    ("Install", "WantedBy"): lambda v: v == "default.target",
+}
+
+
+class TestCloudReaperTemplates(Base):
+    def values(self):
+        return sb.service_values(REPO, ["/opt/tools/bin", "/usr/bin"])
+
+    def plist(self, settings=None):
+        import plistlib
+        text = sb.render_reaper("launchd", self.values(), settings or {}, REPO)
+        return text, plistlib.loads(text.encode())
+
+    def test_every_plist_field_has_a_row_and_each_row_holds(self):
+        text, body = self.plist({"CW_CLOUD_NAMESPACE": "acme-cw"})
+        self.assertEqual(sorted(body), sorted(REAPER_PLIST_FIELDS))
+        for key, check in REAPER_PLIST_FIELDS.items():
+            with self.subTest(field=key):
+                self.assertTrue(check(body[key], None), body[key])
+        self.assertEqual(body["EnvironmentVariables"]["CW_CLOUD_NAMESPACE"], "acme-cw")
+
+    def test_every_unit_field_has_a_row_and_each_row_holds(self):
+        import configparser
+        text = sb.render_reaper("systemd", self.values(), {"CW_CLOUD_NAMESPACE": "acme-cw"}, REPO)
+        parser = configparser.ConfigParser(strict=False, interpolation=None)
+        parser.optionxform = str
+        parser.read_string(text)
+        found = {(sec, key) for sec in parser.sections() for key in parser[sec]}
+        self.assertEqual(found, set(REAPER_UNIT_FIELDS))
+        for (sec, key), check in REAPER_UNIT_FIELDS.items():
+            with self.subTest(field=(sec, key)):
+                self.assertTrue(check(parser[sec][key]), parser[sec][key])
+        self.assertIn('Environment="CW_CLOUD_NAMESPACE=acme-cw"', text)
+
+    def test_the_interval_is_never_slower_than_the_reapers_floor(self):
+        sys.path.insert(0, str(REPO / "cloud" / "launcher"))
+        import cloud_worker
+        self.assertLessEqual(sb.REAPER_INTERVAL_SECONDS, cloud_worker.REAP_FLOOR_SECONDS)
+        self.assertGreater(sb.REAPER_INTERVAL_SECONDS, 0)
+
+    def test_neither_holds_a_secret_a_placeholder_or_the_void(self):
+        os.environ["OPENROUTER_API_KEY"] = PR16_KEY
+        for kind, name in (("launchd", "com.fleet-kit.cloud-reaper.plist"), ("systemd", "fleet-kit-cloud-reaper.service")):
+            rendered = sb.render_reaper(kind, self.values(), {}, REPO)
+            self.assertNotIn(PR16_KEY, rendered)
+            bare = re.sub(r"<!--.*?-->|#.*", "", rendered, flags=re.S)
+            self.assertNotRegex(bare, r"(?i)secret|password|bearer|ghp_")
+            self.assertNotIn("/dev/null", bare)
+            for value in sorted({str(v) for v in self.values().values()}, key=len, reverse=True):
+                bare = bare.replace(value, "")
+            self.assertIsNone(re.search(r"__[A-Z][A-Z0-9_]*__", bare), name)
+            for number, line in enumerate((REPO / "templates" / name).read_text().splitlines(), 1):
+                self.assertIsNone(FORBIDDEN_IN_PUBLIC_TEXT.search(line), "%s:%d" % (name, number))
+
+    def test_a_setting_that_is_a_password_url_or_two_lines_is_refused_by_name_and_never_printed(self):
+        pw = "".join(chr(98 + (i * 5) % 24) for i in range(20))   # built at run time
+        for value in ("https://user:%s@api.example.internal" % pw, "a\nb"):
+            with self.assertRaises(sb.InstallError) as ctx:
+                sb.reaper_settings({"CW_CLOUD_SERVER": value})
+            self.assertIn("CW_CLOUD_SERVER", str(ctx.exception))
+            self.assertNotIn(pw, str(ctx.exception))
+        self.assertEqual(sb.reaper_settings({"CW_CLOUD_SERVER": "https://api.example.internal", "PATH": "/x", "CW_BOGUS": "1"}),
+                         {"CW_CLOUD_SERVER": "https://api.example.internal"})
+
+    def test_the_setting_names_hold_no_token_value_name(self):
+        for name in sb.REAPER_SETTING_NAMES:
+            self.assertNotIn("PASSWORD", name)
+            self.assertFalse(name.endswith("_TOKEN"), name)   # a path to the token FILE is allowed, a token is not
+
+
+class CloudReaperInstall:
+    def reaper_path(self):
+        if self.PLATFORM == "darwin":
+            return self.home / "Library" / "LaunchAgents" / "com.fleet-kit.cloud-reaper.plist"
+        return self.home / "xdg-config" / "systemd" / "user" / "fleet-kit-cloud-reaper.service"
+
+    def reaper_calls(self):
+        return [c for c in self.machine.calls if c[0] in ("launchctl", "systemctl") and "cloud-reaper" in " ".join(c)
+                or c[:3] == ["systemctl", "--user", "daemon-reload"]]
+
+    def test_the_default_install_does_not_touch_the_reaper(self):
+        out, error = self.install("--opencode", self.machine.binary)
+        self.assertIsNone(error, error)
+        self.assertFalse(self.reaper_path().exists())
+        self.assertNotIn("cloud reaper", out)
+        self.assertFalse([c for c in self.machine.calls if "cloud-reaper" in " ".join(c)])
+
+    def test_opt_in_writes_loads_once_and_a_second_run_changes_nothing(self):
+        out, error = self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.assertIsNone(error, error)
+        self.assertTrue(self.reaper_path().is_file())
+        self.assertEqual(self.statuses(out)["cloud reaper"], ["will run", "done"])
+        loads = [c for c in self.machine.calls if c[:2] == (["launchctl", "bootstrap"] if self.PLATFORM == "darwin" else [""])[:2]
+                 and str(self.reaper_path()) in c] if self.PLATFORM == "darwin" else \
+            [c for c in self.machine.calls if c[:4] == ["systemctl", "--user", "enable", "--now"] and c[4] == "fleet-kit-cloud-reaper.service"]
+        self.assertEqual(len(loads), 1)
+        second, _ = self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.assertEqual(self.statuses(second)["cloud reaper"], ["already done"])
+
+    def test_uninstall_unloads_and_removes_it_and_a_never_installed_one_is_silent(self):
+        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        out, _ = self.install("--uninstall")
+        self.assertFalse(self.reaper_path().exists())
+        off = ["launchctl", "bootout", "gui/%d/com.fleet-kit.cloud-reaper" % os.getuid()] if self.PLATFORM == "darwin" else \
+            ["systemctl", "--user", "disable", "--now", "fleet-kit-cloud-reaper.service"]
+        self.assertIn(off, self.machine.calls)
+        out2, _ = self.install("--uninstall")
+        self.assertNotIn("cloud reaper", out2)
+
+    def test_a_dry_run_writes_nothing(self):
+        out, _ = self.install("--opencode", self.machine.binary, "--with-cloud-reaper", "--dry-run")
+        self.assertFalse(self.reaper_path().exists())
+        self.assertIn("would", out)
+
+    def test_the_settings_come_from_the_environment_and_a_password_one_stops_the_install(self):
+        with mock.patch.dict(os.environ, {"CW_CLOUD_NAMESPACE": "acme-cw"}):
+            self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.assertIn("CW_CLOUD_NAMESPACE", self.reaper_path().read_text())
+        self.assertIn("acme-cw", self.reaper_path().read_text())
+        with mock.patch.dict(os.environ, {"CW_CLOUD_SERVER": "https://u:p4ss@api.example.internal"}):
+            out, error = self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.assertIn("CW_CLOUD_SERVER", error)
+        self.assertNotIn("p4ss", error + out)
+
+
+class TestCloudReaperInstallOnMacOS(CloudReaperInstall, InstallCase):
+    PLATFORM = "darwin"
+
+    def test_the_written_plist_is_loaded_at_login_restarts_and_lints(self):
+        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        import plistlib
+        body = plistlib.loads(self.reaper_path().read_bytes())
+        self.assertIs(body["RunAtLoad"], True)
+        self.assertIs(body["KeepAlive"], True)
+        boots = [c for c in self.machine.calls if c[:2] == ["launchctl", "bootstrap"] and c[-1] == str(self.reaper_path())]
+        self.assertEqual(len(boots), 1)
+        if not shutil.which("plutil"):
+            self.skipTest("plutil is macOS only")
+        done = subprocess.run(["plutil", "-lint", str(self.reaper_path())], capture_output=True)
+        self.assertEqual(done.returncode, 0, done.stdout.decode() + done.stderr.decode())
+
+
+class TestCloudReaperInstallOnLinux(CloudReaperInstall, InstallCase):
+    PLATFORM = "linux"
+
+    def test_the_written_unit_is_enabled_now_and_verifies(self):
+        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.assertIn(["systemctl", "--user", "enable", "--now", "fleet-kit-cloud-reaper.service"], self.machine.calls)
+        if not shutil.which("systemd-analyze"):
+            self.skipTest("systemd-analyze is not here")
+        done = subprocess.run(["systemd-analyze", "verify", str(self.reaper_path())], capture_output=True)
+        self.assertNotIn(b"Unknown key", done.stderr)
 
 
 class TestTheTrialSharesTheInstaller(Base):

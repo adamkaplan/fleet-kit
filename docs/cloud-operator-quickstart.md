@@ -67,6 +67,20 @@ fleet-switchboard retire coder7
 - It holds no cluster credential and no other model provider entry.
 - It ends at its idle or hard deadline whether or not anyone retires it.
 
+## 4b. The reaper runs by itself (opt-in)
+
+Turn it on: set the cluster settings in your shell (`CW_KUBE_CONTEXT`, or `CW_CLOUD_SERVER` and `CW_CLOUD_TOKEN_FILE`, plus
+`CW_CLOUD_NAMESPACE`), then run `fleet-switchboard install --with-cloud-reaper`. It writes a LaunchAgent (macOS) or a systemd
+user unit (Linux), loads it, and starts it at login. Nothing secret is written: only names and file paths.
+
+Turn it off: `fleet-switchboard install --uninstall` unloads and removes it (with the switchboard's own service).
+
+Its log: `cloud-reaper-stderr.log` in the switchboard state directory (journalctl on Linux). Each time it ends it writes one line
+`<UTC time> reaper exiting: WHY`, and the service then restarts it.
+
+When the Mac sleeps, the reaper pauses. Workers keep their pod-side floor (the pod's own limit, the cap plus 300 s, PR #880 once it
+merges), so a sleeping Mac delays a stop but cannot leave a worker running past that floor.
+
 ## 5. Known gaps
 
 - Stopping a worker by name alone: #682.

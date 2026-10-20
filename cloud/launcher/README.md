@@ -7,6 +7,17 @@ Launcher, reaper, end hook and token mint for cloud workers, built to `docs/clou
   (default `~/.local/state/cw-cloud/audit.jsonl`, mode 0600). `reap` is one pass (or `--loop SECONDS`, never slower
   than 60); run it from a cron-like scheduler. It stops a pod past its hard deadline, or idle (not busy, last
   activity older than the idle time, read by `kubectl exec <pod> -- cw-worker-activity`; an unreadable answer is not a reason to stop).
+  **Managed reaper (opt-in).** The installer's `--with-cloud-reaper` option writes and loads a service from the two
+  reaper templates under `templates/` (a macOS LaunchAgent or a systemd user unit; the steps are in
+  `docs/cloud-operator-quickstart.md`): it runs `cloud-worker reap --loop 60` at login, restarts after any exit (30 s apart, so a
+  crash loop cannot spin) and logs under the switchboard state directory (`cloud-reaper-stderr.log`). It is opt-in, like the
+  heartbeat's service, because it needs a cluster login this machine may not have; the default install does not touch it, and the
+  installer's uninstall removes it. The template holds no secret: the installer copies only the non-secret `CW_*` settings it finds
+  in its own environment (names and file paths, never a token; a password in a URL is refused) and the reaper reads the operator's
+  token FILE by path. After the private settings file lands, the reaper reads it as the launcher does. Every ending writes one line
+  `<UTC time> reaper exiting: WHY`: end of its pass, stopped by a signal, stopped by an interrupt, an error (a crash in a pass), or
+  `cluster login failed: ...` (a login failure exits non-zero). A restarted reaper stops by name and finds no pod for one the last
+  pass already stopped, so nothing is stopped twice. While the Mac sleeps the reaper pauses.
 - `end_hook.py`, installed in the image as `cw-end-hook`: WIP commit, push to `<worker>/wip`, one JSON line.
 - `token_mint.py`, installed as `cw-token-mint`: mints a token at start and on demand, refuses more than 3600 s,
   writes it to a tmpfs file only.

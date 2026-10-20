@@ -1,0 +1,40 @@
+# fleet-kit-cloud-reaper.service — systemd --user unit TEMPLATE for the cloud worker reaper.
+#
+# The Linux sibling of com.fleet-kit.cloud-reaper.plist. This file is a template, not a unit you can
+# load. `fleet-switchboard install --with-cloud-reaper` fills the placeholders, writes the result to
+# ~/.config/systemd/user/fleet-kit-cloud-reaper.service and runs (opt-in: the default install skips it):
+#
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now fleet-kit-cloud-reaper.service
+#
+# `fleet-switchboard install --uninstall` runs `systemctl --user disable --now` and removes the file.
+#
+# Placeholders, between double underscores: PYTHON, PREFIX, HOME, PATH, REAP_SECONDS (seconds between
+# passes, never slower than the reaper's own floor of once a minute) and REAPER_ENV (the reaper's
+# NON-SECRET settings read from the installer's environment).
+#
+# There is nothing private in this file: the reaper reads the operator's token FILE by path. When the
+# cloud launcher's settings file lands, the reaper reads it as the launcher does.
+#
+# Read the log with: journalctl --user -u fleet-kit-cloud-reaper.service
+
+[Unit]
+Description=Fleet Kit cloud worker reaper (stops idle and overdue cloud workers)
+
+[Service]
+Type=simple
+ExecStart="__PYTHON__" -B "__PREFIX__/cloud/launcher/cloud-worker" reap --loop __REAP_SECONDS__
+WorkingDirectory=__HOME__
+Environment="HOME=__HOME__"
+Environment="PATH=__PATH__"
+__REAPER_ENV__
+
+Restart=always
+RestartSec=30
+
+# Never /dev/null: with Restart=always a fatal start-up error sent nowhere is an invisible restart loop.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
