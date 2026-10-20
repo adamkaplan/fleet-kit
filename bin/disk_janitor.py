@@ -45,12 +45,17 @@ class Unknown(Exception):
     """Raised by the caller's `busy` function when it cannot say whether something uses an entry: the entry is then KEPT (fail closed)."""
 
 
+SELECTION_KEYS = ("days", "keep", "dir")   # the settings that change WHAT is selected: all in the rule's fingerprint
+OTHER_KEYS = ("enabled", "scan_seconds", "weekly_scan_seconds", "daemon_apply")   # how or whether it runs, never what: a test needs every setting in exactly one of the two tuples
+
+
 def rule_fingerprint(cfg):
-    """A short hash of the SELECTION RULE: the version string, the constants the rule reads and the settings that change what is selected (`days`, `keep`).
-    The daemon sends one preview when it changes and applies nothing until a yes to it is recorded. Never the directory or any name."""
+    """A short hash of the SELECTION RULE: the version string, the constants the rule reads and every setting in SELECTION_KEYS (`days`, `keep` and the
+    RESOLVED directory). The daemon sends one preview when it changes and applies nothing until a yes to it is recorded. Never a name."""
     cfg = cfg or {}
+    where = os.path.realpath(str(cfg.get("dir") or default_dir()))
     text = json.dumps({"version": RULE_VERSION, "walk": WALK_ENTRIES, "marker": KEEP_MARKER, "min_name": MIN_NAME, "days": cfg.get("days", DEFAULTS["days"]),
-                       "keep": sorted(cfg.get("keep") or [])}, sort_keys=True)
+                       "keep": sorted(cfg.get("keep") or []), "dir": where}, sort_keys=True)
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 

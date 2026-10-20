@@ -2927,7 +2927,7 @@ def janitor_apply_allowed(state_dir, rule):
         return False, "unreadable"
     if gate.get("rule") != rule or gate.get("sent") is not True or not gate.get("preview"):
         return False, "no_preview"
-    if ack.get("rule") == rule and ack.get("preview") == gate["preview"]:
+    if ack.get("rule") == rule and ack.get("preview") == gate["preview"] and gate.get("nonce") and ack.get("nonce") == gate["nonce"]:   # the nonce is new for every preview: a yes given to an earlier one (the rule may have come back) never counts
         return True, "acked"
     return False, "awaiting_ack"
 
@@ -3061,7 +3061,11 @@ class TempJanitorFacts:
         names go in that message only (and in the private `janitor.would_remove` audit line above); the gate file and the `janitor.preview` audit line hold hashes and a count."""
         names = [o["name"] for o in outcome]
         preview = janitor.preview_fingerprint(rule, names)
-        _write_small(engine.state_dir, TEMP_JANITOR_GATE_FILE, {"rule": rule, "preview": preview, "sent": False, "count": len(names)})
+        try:   # a new preview ends every earlier yes
+            os.unlink(str(Path(engine.state_dir) / TEMP_JANITOR_ACK_FILE))
+        except FileNotFoundError:
+            pass
+        _write_small(engine.state_dir, TEMP_JANITOR_GATE_FILE, {"rule": rule, "preview": preview, "sent": False, "count": len(names), "nonce": uuid.uuid4().hex})
         shown = ", ".join(_plain(n, 60) for n in names[:TEMP_JANITOR_PREVIEW_NAMES])
         text = ("temp janitor: its selection rule changed, so nothing is applied until you say yes to this preview. It WOULD remove %d entr%s (%d bytes): %s%s. "
                 "To say yes to this preview: `%s disk janitor-ack %s`. The yes covers the RULE this preview was made under: later weekly runs under the same rule remove "
@@ -24266,7 +24270,7 @@ def janitor_busy_function(engine, runner, janitor):
             raise janitor.Unknown("the agent registry cannot be read (%s)" % _one_line("%s: %s" % (type(err).__name__, err), 80))
         for name, where in roots:
             here = os.path.realpath(where).rstrip("/") + "/"
-            if here.startswith(root) or root.startswith(here):   # it is, contains or sits inside the agent's directory
+            if here.casefold().startswith(root.casefold()) or root.casefold().startswith(here.casefold()):   # case-folded: a case-insensitive volume may spell it otherwise (over-keeping is the safe side)   # it is, contains or sits inside the agent's directory
                 return "it is, holds or sits inside the temp or working directory of agent %s" % _plain(name, 60)
         for where in process_directories():
             if (where.rstrip("/") + "/").startswith(root):
@@ -24310,7 +24314,7 @@ def cmd_disk_janitor_ack(args, runner, now):
     ok, gate = read_janitor_record(state, TEMP_JANITOR_GATE_FILE)
     if not ok or gate.get("sent") is not True or gate.get("preview") != args.preview:
         raise LaunchError("no pending temp janitor preview has the fingerprint %s (it may be an older one: the newest is in the Chief of Staff's message): nothing recorded" % _one_line(args.preview, 40))
-    _write_small(state, TEMP_JANITOR_ACK_FILE, {"rule": gate["rule"], "preview": gate["preview"], "by": kind[1], "at": now()})
+    _write_small(state, TEMP_JANITOR_ACK_FILE, {"rule": gate["rule"], "preview": gate["preview"], "nonce": gate.get("nonce", ""), "by": kind[1], "at": now()})
     engine.audit.append(engine.actor, "janitor.ack", "temp", {"rule": gate["rule"], "preview": gate["preview"], "by": kind[1]})
     print("%s: recorded the yes to temp janitor preview %s (rule %s): the daemon may apply while temp_janitor.daemon_apply is true" % (PROG, gate["preview"], gate["rule"]))
     return EXIT_OK

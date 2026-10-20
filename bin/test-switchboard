@@ -59307,6 +59307,48 @@ class TestJanitorLiveKeeps(Base):
         self.apply()
         self.assertFalse(os.path.lexists(str(link)))
 
+    def test_the_fingerprint_covers_every_setting_that_changes_what_is_selected(self):
+        keys = set(self.jan.DEFAULTS)
+        self.assertEqual(keys, set(self.jan.SELECTION_KEYS) | set(self.jan.OTHER_KEYS), "every setting is classified as selecting or not")
+        self.assertFalse(set(self.jan.SELECTION_KEYS) & set(self.jan.OTHER_KEYS))
+        base = {"days": 7, "keep": [], "dir": str(self.temp)}
+        other = {"days": 8, "keep": ["x"], "dir": str(self.home)}
+        for key in self.jan.SELECTION_KEYS:
+            with self.subTest(key=key):
+                self.assertNotEqual(self.jan.rule_fingerprint(base), self.jan.rule_fingerprint(dict(base, **{key: other[key]})))
+        for key in self.jan.OTHER_KEYS:
+            with self.subTest(key=key):
+                self.assertEqual(self.jan.rule_fingerprint(base), self.jan.rule_fingerprint(dict(base, **{key: 123})))
+
+    def test_each_of_is_contains_and_sits_inside_keeps_on_its_own(self):
+        entry = self.old("the-entry", directory=True)
+        (entry / "work").mkdir()
+        for label, root in (("is", entry), ("contains", entry / "work"), ("sits inside", self.temp)):
+            with self.subTest(label), mock.patch.object(sb, "janitor_agent_roots", lambda e, n, d, root=root: [("fake", str(root))]):
+                self.assertTrue(sb.janitor_busy_function(self.world.engine, self.routed, self.jan)(str(entry)), label)
+        with mock.patch.object(sb, "janitor_agent_roots", lambda e, n, d: [("fake", str(self.home / "elsewhere"))]):
+            self.assertIsNone(sb.janitor_busy_function(self.world.engine, self.routed, self.jan)(str(entry)))
+
+    def test_a_process_working_in_an_entry_and_a_file_open_in_it_each_keep_it_on_their_own(self):
+        entry = self.old("the-entry", directory=True)
+        busy_for = lambda: sb.janitor_busy_function(self.world.engine, self.routed, self.jan)
+        with mock.patch.object(sb, "janitor_agent_roots", lambda e, n, d: []):
+            self.assertIsNone(busy_for()(str(entry)))
+            self.open_paths = [str(entry)]
+            self.assertIn("file of it open", busy_for()(str(entry)))
+            self.open_paths = []
+            real = self.routed
+            cwd = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "p1\nfcwd\nn%s\n" % entry, "") if "-d" in argv else real(argv, **kw)
+            self.assertIn("working directory", sb.janitor_busy_function(self.world.engine, cwd, self.jan)(str(entry)))
+
+    def test_s7_a_retired_list_that_cannot_be_read_keeps_everything(self):
+        entry = self.old("retired-doubt", directory=True)
+        (self.world.state / sb.PANE_HEALTH_FILE).write_text(json.dumps({"agents": {}, "states": {}, "missing": {}}))
+        (self.world.state / sb.RETIRED_FILE).write_text("[1, 2")
+        out = self.apply()
+        self.assertTrue(entry.exists())
+        self.assertIn("retired.json cannot be read", out)
+
     def test_u1_an_entry_nothing_owns_uses_or_touched_is_removed_as_before(self):
         gone = [self.old("old-%d.log" % n) for n in range(2)] + [self.old("old-dir", directory=True)]
         self.registry({"live": {"cwd": str(self.home / "elsewhere")}})
@@ -59326,7 +59368,7 @@ class TestJanitorLiveKeeps(Base):
 
     def test_the_rule_fingerprint_follows_the_rule_and_never_a_name(self):
         base = self.jan.rule_fingerprint({"days": 7, "keep": ["a"]})
-        self.assertEqual(base, self.jan.rule_fingerprint({"days": 7, "keep": ["a"], "dir": "/x/y"}))
+        self.assertNotEqual(base, self.jan.rule_fingerprint({"days": 7, "keep": ["a"], "dir": "/x/y"}), "another directory is another rule")
         self.assertNotEqual(base, self.jan.rule_fingerprint({"days": 8, "keep": ["a"]}))
         self.assertNotEqual(base, self.jan.rule_fingerprint({"days": 7, "keep": ["b"]}))
         with mock.patch.object(self.jan, "RULE_VERSION", "3"):
@@ -59385,8 +59427,8 @@ class TestDaemonTempJanitor(Base):
     def ack(self, cfg):
         """The preview was sent and the yes recorded, for the rule `cfg` makes (the state a daemon that has been cleared is in)."""
         rule = self.jan.rule_fingerprint(self.jan.settings(cfg))
-        (self.world.state / sb.TEMP_JANITOR_GATE_FILE).write_text(json.dumps({"rule": rule, "preview": "p" * 16, "sent": True, "count": 0}))
-        (self.world.state / sb.TEMP_JANITOR_ACK_FILE).write_text(json.dumps({"rule": rule, "preview": "p" * 16, "by": "cos", "at": 1}))
+        (self.world.state / sb.TEMP_JANITOR_GATE_FILE).write_text(json.dumps({"rule": rule, "preview": "p" * 16, "sent": True, "count": 0, "nonce": "n1"}))
+        (self.world.state / sb.TEMP_JANITOR_ACK_FILE).write_text(json.dumps({"rule": rule, "preview": "p" * 16, "nonce": "n1", "by": "cos", "at": 1}))
 
     def daemon(self, temp_janitor=None, runner=True, acked=True):
         engine = self.world.engine
@@ -59686,6 +59728,72 @@ class TestDaemonTempJanitor(Base):
         with mock.patch.object(sb, "_write_small", side_effect=OSError("full")):
             self.assertEqual(self.preview_facts(engine, source), [])
         self.assertEqual(len(self.preview_facts(engine, source)), 1)
+
+    def test_s4_every_comparison_of_the_gate_is_pinned(self):
+        state = self.world.state
+        gate = {"rule": "r1", "preview": "p1", "sent": True, "count": 1, "nonce": "n1"}
+        ack = {"rule": "r1", "preview": "p1", "nonce": "n1", "by": "cos", "at": 1}
+
+        def allowed(gate_changes=None, ack_changes=None, rule="r1"):
+            (state / sb.TEMP_JANITOR_GATE_FILE).write_text(json.dumps(dict(gate, **(gate_changes or {}))))
+            (state / sb.TEMP_JANITOR_ACK_FILE).write_text(json.dumps(dict(ack, **(ack_changes or {}))))
+            return sb.janitor_apply_allowed(state, rule)[0]
+        self.assertTrue(allowed())
+        self.assertFalse(allowed(rule="r2"), "another rule")
+        self.assertFalse(allowed(ack_changes={"rule": "r2"}), "a yes under another rule")
+        self.assertFalse(allowed(ack_changes={"preview": "p0"}), "a yes to another preview")
+        self.assertFalse(allowed(gate_changes={"sent": False}), "a preview nobody was told")
+        self.assertFalse(allowed(ack_changes={"nonce": "n0"}), "a yes given to an earlier preview")
+        self.assertFalse(allowed(gate_changes={"nonce": ""}, ack_changes={"nonce": ""}), "no nonce at all")
+
+    def test_s4_the_daemons_apply_follows_each_comparison_of_the_gate(self):
+        cases = {"all match": ({}, {}, True), "ack under another rule": ({}, {"rule": "other"}, False), "ack to another preview": ({}, {"preview": "other"}, False),
+                 "preview never sent": ({"sent": False}, {}, False), "ack to an earlier preview (nonce)": ({}, {"nonce": "old"}, False)}
+        for label, (gate_changes, ack_changes, applies) in cases.items():
+            with self.subTest(label):
+                for p in self.temp.iterdir():
+                    p.unlink()
+                victim = self.old("scratch-old-unnamed.log")
+                (self.world.state / sb.TEMP_JANITOR_FILE).unlink(missing_ok=True)
+                engine, source = self.daemon({"daemon_apply": True}, acked=True)
+                gate_path, ack_path = self.world.state / sb.TEMP_JANITOR_GATE_FILE, self.world.state / sb.TEMP_JANITOR_ACK_FILE
+                gate_path.write_text(json.dumps(dict(json.loads(gate_path.read_text()), **gate_changes)))
+                ack_path.write_text(json.dumps(dict(json.loads(ack_path.read_text()), **ack_changes)))
+                self.go(source)
+                self.assertEqual(not victim.exists(), applies, label)
+                self.now += 7 * 86400
+                engine.now = lambda: self.now
+
+    def test_s4_a_yes_cannot_be_recorded_for_a_preview_nobody_was_told_of(self):
+        self.old("scratch-old-unnamed.log")
+        engine, source = self.daemon({"daemon_apply": True}, acked=False)
+        self.go(source)   # the gate exists with sent false: the message was never handed over
+        gate = json.loads((self.world.state / sb.TEMP_JANITOR_GATE_FILE).read_text())
+        self.assertFalse(gate["sent"])
+        code, err = self.record_ack(gate["preview"])
+        self.assertEqual(code, 1)
+        self.assertFalse((self.world.state / sb.TEMP_JANITOR_ACK_FILE).exists())
+
+    def test_s4_a_rule_that_changes_and_comes_back_needs_a_new_yes(self):
+        victim = self.old("scratch-old-unnamed.log")
+        engine, source = self.daemon({"daemon_apply": True}, acked=False)
+        self.go(source)
+        self.preview_facts(engine, source)
+        first = json.loads((self.world.state / sb.TEMP_JANITOR_GATE_FILE).read_text())["preview"]
+        self.assertEqual(self.record_ack(first)[0], 0)
+        engine, source = self.daemon({"daemon_apply": True, "days": 8}, acked=False)   # the rule moves to B
+        self.week(engine)
+        self.go(source)
+        self.assertFalse((self.world.state / sb.TEMP_JANITOR_ACK_FILE).exists(), "a new preview ends the earlier yes")
+        self.preview_facts(engine, source)
+        engine, source = self.daemon({"daemon_apply": True}, acked=False)   # and back to A, same names
+        self.week(engine)
+        self.go(source)
+        self.preview_facts(engine, source)
+        self.week(engine)
+        self.go(source)
+        self.assertTrue(victim.exists(), "the old yes does not unlock it again")
+        self.assertEqual(self.events("temp.removed"), [])
 
     def test_s8_a_name_is_only_in_the_private_audit_and_the_message(self):
         engine, source = self.daemon({"daemon_apply": True}, acked=False)
