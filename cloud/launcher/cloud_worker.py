@@ -11,6 +11,7 @@ secret value is read once from an inherited descriptor and goes to kubectl's std
 import argparse
 import base64
 import copy
+import fcntl
 import datetime as dt
 import pwd
 import hashlib
@@ -21,6 +22,7 @@ import math
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -160,6 +162,10 @@ SECRET_ENV_NAME = re.compile(r"(?i)(TOKEN|SECRET|PASSWORD|API_?KEY|CREDENTIAL|^P
 ALLOWED_ENV_NAMES = {"CW_TOKEN_ENDPOINT"}  # a URL, not a token
 
 
+class ReaperLocked(Exception):
+    """Another reaper holds the lock, or the lock cannot be taken safely. Raised before any pass."""
+
+
 class CloudError(Exception):
     audited = False  # True when the failure already wrote its own audit line
 
@@ -297,6 +303,12 @@ def _repo_key(text):
     return (owner + "/" + name).lower()
 
 
+def allowed_repo_keys(raw):
+    """The allow-list's entries as keys (a None for an entry that is not exactly OWNER/NAME). THE parse of CW_ALLOWED_REPOS: the check below and
+    the settings file's validator both call it."""
+    return [_repo_key(x.strip()) for x in raw.split(",")]
+
+
 def check_repo_allowed(repo, env):
     """The one allow-list check (the launcher's create and the driver both call it). Raises CloudError(EXIT_USAGE) before anything is
     made. CW_ALLOWED_REPOS: comma-separated OWNER/NAME, exact and case-insensitive; unset, empty or any malformed entry refuses.
@@ -304,7 +316,7 @@ def check_repo_allowed(repo, env):
     raw = (env.get("CW_ALLOWED_REPOS") or "").strip()
     if not raw:
         raise CloudError("refused: %s is not on the cloud allow-list (CW_ALLOWED_REPOS is unset or empty)" % scrub(repo, (), 120), EXIT_USAGE)
-    allowed = [_repo_key(x.strip()) for x in raw.split(",")]
+    allowed = allowed_repo_keys(raw)
     if None in allowed:
         raise CloudError("refused: CW_ALLOWED_REPOS has an entry that is not OWNER/NAME; nothing was created", EXIT_USAGE)
     tooling = (env.get("CW_TOOLING_REPO") or "").strip()
@@ -341,13 +353,19 @@ def _abs_executable(path):
     return bool(path) and os.path.isabs(path) and os.path.isfile(path) and os.access(path, os.X_OK)
 
 
-def _preflight_env(env, home):
-    """The child's whole environment: the allow-listed names, a fixed PATH, an empty private HOME and TMPDIR, and where `az` keeps its sign-in
-    (the caller's AZURE_CONFIG_DIR when it is an absolute existing directory, else the account's own ~/.azure from the password database, never $HOME)."""
-    clean = {k: v for k, v in env.items() if k in PREFLIGHT_ENV_NAMES or k.startswith("LC_")}
+def _scrubbed_env(env, home, names, openssl=True, real_home=False):
+    """THE scrubbed child environment (the preflight and the vault access check both use it): the allow-listed `names` (and LC_*), a fixed PATH, an
+    empty private HOME and TMPDIR, and where `az` keeps its sign-in (the caller's AZURE_CONFIG_DIR when it is an absolute existing directory, else the
+    account's own ~/.azure from the password database, never $HOME)."""
+    clean = {k: v for k, v in env.items() if k in names or k.startswith("LC_")}
     clean["PATH"] = PREFLIGHT_PATH
     clean["HOME"] = home
     clean["TMPDIR"] = home
+    if real_home:   # the vault access check keeps its own log under the user's home: the PASSWORD DATABASE's home, never the HOME variable
+        try:
+            clean["HOME"] = pwd.getpwuid(os.getuid()).pw_dir
+        except (KeyError, OSError):
+            pass
     cfg = env.get("AZURE_CONFIG_DIR") or ""
     if not (os.path.isabs(cfg) and os.path.isdir(cfg)):
         try:
@@ -357,8 +375,13 @@ def _preflight_env(env, home):
     if cfg:
         clean["AZURE_CONFIG_DIR"] = cfg
     ossl = env.get("CW_OPENSSL") or ""
-    if _abs_executable(ossl):
+    if openssl and _abs_executable(ossl):
         clean["CW_OPENSSL"] = ossl
+    return clean
+
+
+def _preflight_env(env, home):
+    clean = _scrubbed_env(env, home, PREFLIGHT_ENV_NAMES)
     clean.update(PREFLIGHT_TEST_ENV)
     return clean
 
@@ -380,6 +403,182 @@ def check_repo_preflight(repo, env):
     if not lines:
         raise CloudError("refused: the repository preflight for %s printed nothing; nothing was created" % scrub(repo, (), 120), EXIT_USAGE)
     return scrub(lines[-1], (), 300)
+
+
+# ---------------------------------------------------------------- the vault access check (#876 slice 2)
+# A program of another repository, run UNCHANGED from a configured checkout (CW_VAULT_CHECK_DIR), only after a vault read was refused by the vault's
+# firewall. Contract (agreed with its owner, who announces any change first): the module below, run with `check` from the root of the checkout; no other
+# argument, option, environment or file; limit 300 s; it adds at most ONE single-address rule, only this machine's own address; it prints a count line.
+VAULT_CHECK_KEY = "CW_VAULT_CHECK_DIR"
+VAULT_CHECK_MODULE = "scripts.v2.cw_vault_firewall"
+VAULT_CHECK_FILE = "scripts/v2/cw_vault_firewall.py"
+VAULT_CHECK_ARGS = ("check",)           # the whole argument list after the module: never an address, never an option
+VAULT_CHECK_SECONDS = 300               # the check's own run limit
+VAULT_CHECK_GRACE = 15                  # ours, on top, before the process group is killed
+VAULT_CHECK_ENV_NAMES = ()              # nothing is passed from the caller: the child gets PATH, a private HOME and TMPDIR, AZURE_CONFIG_DIR and LC_*
+VAULT_CHECK_PYTHON = None               # a test hook (a module attribute): None means python3 found on the fixed PATH
+# The exit codes, one table: code -> (outcome, the launch continues, what it means). Any other code (or no code: killed, timed out, not run) is treated as 40.
+VAULT_CHECK_CODES = {
+    0: ("answered", True, "the vault answered; nothing was changed"),
+    10: ("added", True, "an address was added and the vault now answers"),
+    20: ("refused-by-its-rules", False, "the check refused by its own rules (its cap of 6 rules is reached, or an address it will not add)"),
+    30: ("added-still-refused", False, "an address was added but the vault still refused after 90 seconds"),
+    40: ("failed", False, "the check failed for another reason"),
+}
+VAULT_CHECK_FALLBACK = 40
+_COUNT_LINE = re.compile(r"rules (\d{1,4}) -> (\d{1,4})(?:, (\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?Z?)?))?")
+
+
+class CheckResult:
+    """What one run of the check came to: its exit code UNCHANGED (None when it was killed, timed out or never ran), the outcome name, and the
+    counts of its count line (None, None when none was found). Never an address."""
+    def __init__(self, code, outcome, before=None, after=None, line=None):
+        self.code, self.outcome, self.before, self.after, self.line = code, outcome, before, after, line
+
+    @property
+    def effective(self):
+        return self.code if self.code in VAULT_CHECK_CODES else VAULT_CHECK_FALLBACK
+
+
+VAULT_CHECK_MAX_ENTRIES = 200000       # a checkout with more entries than this is refused (a bounded walk)
+VAULT_CHECK_SKIP = (".git",)           # the top-level version-control directory is never loaded by the interpreter
+
+
+sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "bin"))   # LAST: the launcher's own modules win a name
+from path_walk import entry_problem as _entry_problem, parents_problem  # noqa: E402  (the one walk, also used by the installer)
+
+
+def vault_check_dir_problem(checkout):
+    """None when `checkout` is a usable checkout, else ONE short reason (never the path's content). `python3 -m` loads anything under the checkout,
+    so EVERY entry is judged (lstat, never followed): an absolute path to an existing directory that is not a symlink, owned by the user, with every
+    entry (directories, files, links, every __init__.py) owned by the user, not group- or world-writable and not a symlink; every parent judged by
+    parents_problem; and scripts/v2/cw_vault_firewall.py a regular file. The top-level .git directory is not walked."""
+    if not isinstance(checkout, str) or not checkout.strip() or not os.path.isabs(checkout) or ".." in checkout.split("/"):
+        return "is not an absolute path"
+    checkout = checkout.rstrip("/") or "/"
+    problem = parents_problem(checkout)
+    if problem:
+        return problem
+    try:
+        top = os.lstat(checkout)
+    except OSError:
+        return "has no checkout directory"
+    problem = _entry_problem(top, "the checkout")
+    if problem:
+        return problem
+    if not stat.S_ISDIR(top.st_mode):
+        return "is not a directory"
+    module = os.path.join(checkout, VAULT_CHECK_FILE)
+    try:
+        found = os.lstat(module)
+    except OSError:
+        return "has no module"
+    if not stat.S_ISREG(found.st_mode):
+        return "has a module that is not a regular file"
+    count, stack = 0, [checkout]
+    while stack:
+        here = stack.pop()
+        try:
+            names = os.listdir(here)
+        except OSError:
+            return "has a directory that cannot be read"
+        for name in names:
+            if here == checkout and name in VAULT_CHECK_SKIP:
+                continue
+            count += 1
+            if count > VAULT_CHECK_MAX_ENTRIES:
+                return "has more than %d entries" % VAULT_CHECK_MAX_ENTRIES
+            full = os.path.join(here, name)
+            try:
+                found = os.lstat(full)
+            except OSError:
+                return "has an entry that cannot be read"
+            problem = _entry_problem(found, "an entry")
+            if problem:
+                return problem
+            if stat.S_ISDIR(found.st_mode):
+                stack.append(full)
+    return None
+
+
+def _check_python():
+    if VAULT_CHECK_PYTHON:
+        return VAULT_CHECK_PYTHON
+    found = shutil.which("python3", path=PREFLIGHT_PATH)
+    return os.path.abspath(found) if found else None
+
+
+def _kill_group(child):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(child.pid, sig)
+        except OSError:
+            pass
+        try:
+            child.wait(5)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    try:   # the whole group, also what the child left behind
+        os.killpg(child.pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def vault_check_ready(env):
+    """(checkout, python3) when the check may run, else a CloudError (exit 2, naming CW_VAULT_CHECK_DIR, never the path) and NOTHING has run."""
+    checkout = (env.get(VAULT_CHECK_KEY) or "").strip()
+    if not checkout:
+        raise CloudError("refused: %s is not set: the vault refused this machine and the owner of the vault access check provides the checkout it runs "
+                         "from; nothing was changed" % VAULT_CHECK_KEY, EXIT_USAGE)
+    problem = vault_check_dir_problem(checkout)
+    if problem:
+        raise CloudError("refused: %s %s: the owner of the vault access check provides the checkout; nothing was run" % (VAULT_CHECK_KEY, problem), EXIT_USAGE)
+    python = _check_python()
+    if not python:
+        raise CloudError("refused: python3 was not found for the vault access check; nothing was run", EXIT_USAGE)
+    return checkout, python
+
+
+def run_vault_check(env):
+    """THE one call of the vault access check: runs the module with the argument list [python3, -m, MODULE, check] from the checkout (after
+    vault_check_ready), in a scrubbed environment, for at most VAULT_CHECK_SECONDS (+ grace; the process group is killed), and returns a CheckResult
+    carrying the exit code unchanged. Its output is read for the count line only and is never printed or kept."""
+    checkout, python = vault_check_ready(env)
+    argv = [python, "-m", VAULT_CHECK_MODULE] + list(VAULT_CHECK_ARGS)
+    out = ""
+    try:
+        with tempfile.TemporaryDirectory(prefix="cw-vcheck-") as home:
+            out_path = os.path.join(home, "out")   # a file, not a pipe: a grandchild that keeps it open cannot hold us up
+            with open(out_path, "wb") as sink:
+                child = subprocess.Popen(argv, cwd=checkout, env=_scrubbed_env(env, home, VAULT_CHECK_ENV_NAMES, openssl=False, real_home=True),
+                                         stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.DEVNULL, start_new_session=True)
+                try:
+                    child.wait(timeout=VAULT_CHECK_SECONDS + VAULT_CHECK_GRACE)
+                except subprocess.TimeoutExpired:
+                    _kill_group(child)
+                    return CheckResult(None, "timed-out")
+                except BaseException:
+                    _kill_group(child)
+                    raise
+                try:   # whatever the check left running in its group ends with it
+                    os.killpg(child.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            with open(out_path, "rb") as source:
+                out = source.read(100001).decode("utf-8", "replace")
+    except OSError:
+        return CheckResult(None, "not-run")
+    code = child.returncode
+    outcome = VAULT_CHECK_CODES[code][0] if code in VAULT_CHECK_CODES else "unknown-code"
+    before = after = line = None
+    for text in out[:100000].splitlines():
+        found = _COUNT_LINE.search(text)
+        if found:
+            before, after = int(found.group(1)), int(found.group(2))
+            line = "rules %d -> %d%s" % (before, after, ", " + found.group(3) if found.group(3) else "")   # rebuilt from the parts, never echoed
+            break
+    return CheckResult(code, outcome, before, after, line)
 
 
 def token_mode(env):
@@ -1293,13 +1492,301 @@ class Launcher:
             if reason:
                 self.last_hook = None
                 try:
-                    res = self.stop(argparse.Namespace(worker=worker, reason=reason), reason)
+                    # by the run's own nonce where the pod carries one: a pod of another run under this name is left whole
+                    res = self.stop(argparse.Namespace(worker=worker, reason=reason, run_id=ann(pod, "run-id") or None), reason)
                     self.reap_results[worker] = {k: res.get(k) for k in ("pushed", "wip_branch", "skipped", "record")}
                     out.append((worker, reason, 0))
                 except CloudError as e:
                     self.reap_results[worker] = dict(self.last_hook or {})
                     out.append((worker, reason, e.code))
         return out
+
+# ---------------------------------------------------------------- the settings file
+# ONE private file holds the operator's settings. `apply_settings` is the only reader: `launch --cloud` (bin/cloud_worker.py) and this driver's
+# `main` both call it. When the file exists it is the only source (the environment is read ONLY when there is no file); a key set in BOTH with a
+# different value is refused, naming both sources and never a value. Nothing is run or expanded on read, and a value that looks like a secret is refused.
+SETTINGS_FILE_NAME = "cloud.env"
+CONFIG_DIR_NAME = "fl" + "eet-switchboard"   # the switchboard's own config directory (written in two parts: the names check keeps the retired prefix out of cloud/)
+SETTINGS_PATH = None        # a test hook (a module attribute, no environment variable): None means the real path
+SETTINGS_FILE_MAX = 65536
+# The one table of settings: name, required (in the file), kind. Kinds: name (a plain name, list or address), path, command (run as given: a
+# command, never a value), digest-ref (an image reference that ends in @sha256:<64 hex>), number, secret-name (a vault secret's name), duration (Nm or Nh).
+SETTINGS = (
+    ("CW_ALLOWED_REPOS", True, "name"),            # comma-separated OWNER/NAME
+    ("CW_TOOLING_REPO", False, "name"),
+    ("CW_CLOUD_IMAGE", True, "digest-ref"),
+    ("CW_CLOUD_SERVER", True, "name"),             # the cluster API address
+    ("CW_CLOUD_CA_FILE", False, "path"),
+    ("CW_PULL_SECRET", False, "name"),             # the NAME of a Secret, never its content
+    ("CW_VAULT_SUBSCRIPTION", True, "name"),
+    ("CW_VAULT_NAME", True, "name"),
+    ("CW_CLOUD_NAMESPACE", True, "name"),
+    ("CW_KUBECTL", False, "path"),
+    ("CW_MODEL_AUTH_FILE", False, "path"),
+    ("CW_RUN_RECORD_DIR", False, "path"),
+    ("CW_CLOUD_SPEND_CAP_USD", False, "number"),
+    ("CW_CLUSTER_TOKEN_CMD", False, "command"),
+    ("CW_CLUSTER_ADMIN_CMD", False, "command"),
+    ("CW_GIT_TOKEN_CMD", False, "command"),
+    ("CW_APP_ID_CMD", False, "command"),
+    ("CW_APP_INSTALLATION_CMD", False, "command"),
+    ("CW_APP_KEY_CMD", False, "command"),
+    ("CW_CLUSTER_ADMIN_SECRET", False, "secret-name"),   # the NAME of the vault secret that holds the cluster administrator route (default cw-cluster-admin-kubeconfig), never its content
+    ("CW_CLUSTER_TOKEN_DURATION", False, "duration"),    # the cluster token's requested life (default 20m)
+    ("CW_VAULT_CHECK_DIR", False, "path"),         # the checkout the vault access check runs from; needed only after a vault firewall refusal (see vault_check_dir_problem)
+)
+SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
+SETTING_REQUIRED = tuple(name for name, required, _ in SETTINGS if required)
+# The secret shapes a value is refused for: (shape name, pattern, kinds it applies to; None = every kind). One row per shape.
+_PREFIXES = ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "glpat-", "sk-", "xoxb-", "xoxp-", "xoxa-", "AKIA", "AIza", "Bearer ")
+SECRET_SHAPES = tuple(
+    ("token prefix " + prefix.strip(), re.compile(r"(?<![A-Za-z0-9])" + re.escape(prefix) + r"[A-Za-z0-9._~+/=-]{8,}"), None) for prefix in _PREFIXES
+) + (
+    ("a JWT", re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}"), None),
+    ("a PEM header", re.compile(r"-----BEGIN "), None),
+    ("a URL with a password", re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]*:[^/\s@]+@"), None),
+    ("a 40-character hex string", re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{40}(?![0-9A-Fa-f])"), ("command",)),
+)
+_IMAGE_CHARS = re.compile(r"[a-z0-9._/:-]+")
+_IMAGE_REF = re.compile(r"(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]{1,5})?/)?[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*@sha256:[0-9a-f]{64}")
+_DNS_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_HOST = re.compile(r"(?:%s\.)+%s" % (_DNS_LABEL, _DNS_LABEL))   # at least two labels
+_NETLOC = re.compile(r"([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?")
+_NAMESPACE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+_SECRET_NAME = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?")
+_VAULT_NAME = re.compile(r"[A-Za-z][A-Za-z0-9-]{1,22}[A-Za-z0-9]")
+_GUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_BARE_PROGRAM = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._+-]*")
+_VAULT_SECRET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,126}")   # the vault secret-name grammar: a letter or digit first (the value reaches `az` as `--name <value>`, so it can never look like an option)
+_DURATION = re.compile(r"([0-9]{1,3})([mh])")   # the grammar of the launch wiring's own parse of CW_CLUSTER_TOKEN_DURATION (bin/cloud_worker.py `_duration`)
+_NUMBER = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+_REFUSED_HOSTS = ("metadata.google.internal",)
+_REFUSED_SUFFIX = ".localhost"
+_MAX_HOST = 253
+_SCHEME = "https://"
+_PATHS = ("", "/")
+_BAD_CHARS = re.compile(r"[\s\x00-\x1f\x7f%?#@\\]")   # urlsplit silently drops a tab, CR or LF: judge the string as written, so none may be there
+
+
+def _norm(host):
+    """The host as compared: lower case (a name is not case-sensitive, so METADATA.google.internal and 0X7F000001 are the same as their lower-case forms)."""
+    return host.lower()
+
+
+def _integer_host_label(label):
+    """An all-digit label, or 0x and hex digits (the label is lower-cased first): the forms a resolver (inet_aton) reads as an integer address
+    (2130706433, 127.1, 0x7f000001)."""
+    return label.isdigit() or bool(re.fullmatch(r"0x[0-9a-f]*", label))
+
+
+def _has_letter(label):
+    return any(c.isalpha() for c in label)
+
+
+def _port_ok(port):
+    return port is None or 0 < int(port) < 65536
+
+
+def _split(value):
+    """urlsplit, or None when it raises ValueError (an unbalanced [ or ], for one)."""
+    try:
+        return urllib.parse.urlsplit(value)
+    except ValueError:
+        return None
+
+
+def _shape_ok(parts):
+    return parts.path in _PATHS and not parts.query and not parts.fragment
+
+
+def _server_ok(value):
+    """The cluster API address is always a DNS NAME, so every IP literal (IPv4, bracketed IPv6, integer, hex or octal forms) is refused by the one rule:
+    https://NAME[:PORT], NAME with at least two labels of letters, digits and hyphens (1 to 63 characters, no leading or trailing hyphen), at most 253
+    characters in all, no trailing dot, a last label that has a letter and is neither all digits nor 0x and hex digits; a port of digits only, 1 to 65535.
+    The branches, each with a named test and a mutant: scheme, bad characters, an unparsable URL, the netloc grammar, path, query and fragment, the host
+    length, the port, the label grammar, the refused names, the refused suffix, a letter in the last label, an integer last label."""
+    if not value.startswith(_SCHEME) or _BAD_CHARS.search(value):
+        return False
+    parts = _split(value)
+    if parts is None:
+        return False
+    m = _NETLOC.fullmatch(parts.netloc)
+    if not m or not _shape_ok(parts):
+        return False
+    host, port = m.group(1), m.group(2)
+    low = _norm(host)
+    last = _norm(low.rsplit(".", 1)[-1])
+    return (len(host) <= _MAX_HOST and _port_ok(port) and bool(_HOST.fullmatch(host)) and low not in _REFUSED_HOSTS
+            and not low.endswith(_REFUSED_SUFFIX) and _has_letter(last) and not _integer_host_label(last))
+
+
+def _allowed_ok(value):
+    keys = allowed_repo_keys(value)
+    return None not in keys   # the one function the launch's allow-list check uses
+
+
+def _path_ok(value):
+    return os.path.isabs(value) and ".." not in value.split("/")
+
+
+def _number_ok(value):
+    return bool(_NUMBER.fullmatch(value)) and 0 < float(value) <= 100000
+
+
+def _duration_ok(value):
+    """Stricter than or equal to the launch wiring's `_duration` (a test holds it: whatever this accepts, the wiring accepts; the wiring also strips spaces and takes non-ASCII digits, this does not): 1 to 3 ASCII digits and m or h, from 1 minute to 60 minutes."""
+    m = _DURATION.fullmatch(value)
+    return bool(m) and 1 <= int(m.group(1)) * (60 if m.group(2) == "h" else 1) <= 60
+
+
+# THE table of value rules: one row per setting, the rule's words (shown in a refusal, never the value) and its test. DEFAULT-DENY: a setting with no
+# row is refused, and a test fails when SETTINGS and this table differ. Every value also refuses control characters (checked before this table).
+VALIDATORS = {
+    "CW_ALLOWED_REPOS": ("a comma-separated list of OWNER/NAME entries, no wildcard", _allowed_ok),
+    "CW_TOOLING_REPO": ("one OWNER/NAME", lambda v: _repo_key(v) is not None),
+    "CW_CLOUD_IMAGE": ("an image by digest, [registry[:port]/]path@sha256:<64 lowercase hex>, no tag, nothing else",
+                       lambda v: bool(_IMAGE_CHARS.fullmatch(v.split("@")[0])) and bool(_IMAGE_REF.fullmatch(v))),
+    "CW_CLOUD_SERVER": ("an https URL whose host is a DNS name (no IP literal of any form, no user, query, fragment, path, file: or http:)", _server_ok),
+    "CW_CLOUD_CA_FILE": ("an absolute path with no .. segment", _path_ok),
+    "CW_PULL_SECRET": ("a Kubernetes name (lowercase letters, digits, - and .)", lambda v: bool(_SECRET_NAME.fullmatch(v))),
+    "CW_VAULT_SUBSCRIPTION": ("a subscription GUID", lambda v: bool(_GUID.fullmatch(v))),
+    "CW_VAULT_NAME": ("a vault name: 3 to 24 letters, digits and hyphens, starting with a letter", lambda v: bool(_VAULT_NAME.fullmatch(v))),
+    "CW_CLOUD_NAMESPACE": ("a DNS label that is not default or kube-*", lambda v: bool(_NAMESPACE.fullmatch(v)) and v != "default" and not v.startswith("kube-")),
+    "CW_KUBECTL": ("an absolute path with no .. segment, or a bare program name", lambda v: _path_ok(v) or bool(_BARE_PROGRAM.fullmatch(v))),
+    "CW_MODEL_AUTH_FILE": ("an absolute path with no .. segment", _path_ok),
+    "CW_RUN_RECORD_DIR": ("an absolute path with no .. segment", _path_ok),
+    "CW_CLOUD_SPEND_CAP_USD": ("a number above 0 and at most 100000", _number_ok),
+    "CW_CLUSTER_TOKEN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_CLUSTER_ADMIN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_GIT_TOKEN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_APP_ID_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_APP_INSTALLATION_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_APP_KEY_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_CLUSTER_ADMIN_SECRET": ("a vault secret name: 1 to 127 letters, digits and hyphens, starting with a letter or digit", lambda v: bool(_VAULT_SECRET_NAME.fullmatch(v))),
+    "CW_CLUSTER_TOKEN_DURATION": ("a duration of 1 to 3 digits and m or h, from 1m to 60m (for example 20m or 1h)", _duration_ok),
+    "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
+}
+_SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
+
+
+def settings_path(env=None):
+    """Where the file is: $XDG_CONFIG_HOME (default ~/.config) / <the switchboard's config directory> / cloud.env, beside the switchboard's own config."""
+    if SETTINGS_PATH is not None:
+        return str(SETTINGS_PATH)
+    env = os.environ if env is None else env
+    base = env.get("XDG_CONFIG_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".config")
+    return os.path.join(base, CONFIG_DIR_NAME, SETTINGS_FILE_NAME)
+
+
+def _bad(path, why):
+    return CloudError("refused: the settings file %s %s; nothing was called" % (path, why), EXIT_USAGE)
+
+
+def _read_settings_file(path):
+    """The file's text, or None when there is none. Refuses (CloudError, exit 2) a symlink, a file that is not a regular file, one owned by
+    another user, one with any group or other permission bit, and one in a directory that is group- or world-writable or owned by another user.
+    The checks are on the opened descriptor, so the file cannot change between the check and the read."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        raise _bad(path, "cannot be examined (%s)" % type(err).__name__) from None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except OSError as err:
+        raise _bad(path, "is a symlink or cannot be opened (%s): it must be a regular file" % type(err).__name__) from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise _bad(path, "is not a regular file")
+        if st.st_nlink != 1:
+            raise _bad(path, "has more than one hard link: it must be the only name of the file")
+        if st.st_uid != os.geteuid():
+            raise _bad(path, "is owned by another user")
+        if stat.S_IMODE(st.st_mode) & 0o177:
+            raise _bad(path, "has mode %04o: it must be 0600 (nobody else may read or write it)" % stat.S_IMODE(st.st_mode))
+        parent = os.stat(os.path.dirname(os.path.abspath(path)))
+        if parent.st_uid != os.geteuid():
+            raise _bad(path, "is in a directory owned by another user")
+        if stat.S_IMODE(parent.st_mode) & 0o022:
+            raise _bad(path, "is in a directory that is group- or world-writable (mode %04o)" % stat.S_IMODE(parent.st_mode))
+        if st.st_size > SETTINGS_FILE_MAX:
+            raise _bad(path, "is over %d bytes" % SETTINGS_FILE_MAX)
+        raw = b""
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            raw = f.read(SETTINGS_FILE_MAX + 1)
+    finally:
+        os.close(fd)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise _bad(path, "is not UTF-8 text") from None
+
+
+def parse_settings(text, path="the settings file"):
+    """KEY=VALUE lines into {key: value}. `#` starts a comment line and blank lines are skipped. The value is the rest of the line, verbatim:
+    no quoting, no expansion, nothing is run. A bad line, an unknown or repeated key, a quoted value, and a secret-shaped value are refused naming the
+    line number and the key, never the value. An empty value counts as not set."""
+    values = {}
+    for number, line in enumerate(text.split("\n"), 1):
+        lead = line.lstrip(" \t")   # a tab is allowed in leading indentation and inside a comment line, nowhere else
+        bad = [c for c in lead if (ord(c) < 32 and not (c == "\t" and lead.startswith("#"))) or ord(c) == 127]
+        if bad:
+            key = line.split("=", 1)[0].strip() if "=" in line and line.split("=", 1)[0].strip() in SETTING_KINDS else None
+            raise _bad(path, "line %d%s has a control character (a NUL, a carriage return or another: use plain LF text)" % (number, " (%s)" % key if key else ""))
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = _SETTING_LINE.fullmatch(line.strip())
+        if not m:
+            raise _bad(path, "line %d is not KEY=VALUE" % number)
+        key, value = m.group(1), m.group(2).strip()
+        kind = SETTING_KINDS.get(key)
+        if kind is None:
+            raise _bad(path, "line %d: %s is not a setting this launcher knows" % (number, key))
+        if key in values:
+            raise _bad(path, "line %d: %s is set twice" % (number, key))
+        if value[:1] in "\"'" and value[-1:] == value[:1] and len(value) > 1:
+            raise _bad(path, "line %d: %s is quoted (the value is taken as written, with no quotes)" % (number, key))
+        for shape, pattern, kinds in SECRET_SHAPES:
+            if (kinds is None or kind in kinds) and pattern.search(value):
+                raise _bad(path, "line %d: the value of %s looks like a secret (%s); the file holds no secret" % (number, key, shape))
+        if value:
+            rule = VALIDATORS.get(key)
+            if rule is None or not rule[1](value):
+                raise _bad(path, "line %d: %s must be %s" % (number, key, rule[0] if rule else "a setting with a value rule (it has none: refused)"))
+            values[key] = value
+    missing = [name for name in SETTING_REQUIRED if name not in values]
+    if missing:
+        raise _bad(path, "lacks the required setting%s %s" % ("s" if len(missing) > 1 else "", ", ".join(missing)))
+    return values
+
+
+def apply_settings(env=None, path=None):
+    """THE reader of the operator's settings. Returns the source used: the file's path when it exists (its values then replace every setting of
+    the table in `env`, which defaults to the process environment), else "environment" (nothing changes). A setting that the file and the
+    environment BOTH set to different values is refused, naming both sources and no value."""
+    env = os.environ if env is None else env
+    path = path or settings_path(env)
+    text = _read_settings_file(path)
+    if text is None:
+        return "environment"
+    values = parse_settings(text, path)
+    clash = [name for name, _, _ in SETTINGS if env.get(name) and name in values and env[name].strip() != values[name]]
+    if clash:
+        raise CloudError("refused: %s is set differently in the file %s and in the environment: unset one (the file is the one source when it exists); "
+                         "nothing was called" % (", ".join(clash), path), EXIT_USAGE)
+    before = {name: env[name] for name, _, _ in SETTINGS if name in env}
+    try:   # everything was validated above; if the environment still refuses a value, put every setting back as it was
+        for name, _, _ in SETTINGS:
+            env.pop(name, None)
+        env.update(values)
+    except Exception:
+        for name, _, _ in SETTINGS:
+            env.pop(name, None)
+        env.update(before)
+        raise CloudError("refused: the settings file %s could not be applied; nothing was changed" % path, EXIT_USAGE) from None
+    return path
 
 
 def build_parser():
@@ -1358,35 +1845,108 @@ def _run_id(v):
     return v
 
 
+REAP_FLOOR_SECONDS = 60   # the contract's once a minute: a pass is never further apart than this, whatever --loop says
+
+
+def _reap_exit_line(clock, why):
+    """The ONE line a reaper process writes when it ends: a UTC time and the reason. The reason is built by the caller
+    from a scrubbed message, never from a token or an environment value."""
+    now = clock() if clock else dt.datetime.now(dt.timezone.utc)
+    print("cloud-worker: %s reaper exiting: %s" % (iso(now), why), file=sys.stderr)
+
+
+REAPER_LOCK_ROOT = None   # tests point it at a temporary directory; None means the user's own directory, found where it is used
+
+
+def _lock_root():
+    """The user's lock directory from the password database, never from the environment: where every reaper of one user must agree.
+    Found when a reaper starts, not at import: a user with no password entry gets a reason from the reaper, not a broken launcher."""
+    if REAPER_LOCK_ROOT:
+        return REAPER_LOCK_ROOT
+    try:
+        return os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".local", "state", "cw-cloud", "locks")
+    except KeyError:
+        raise ReaperLocked("this user has no entry in the password database, so the reaper lock directory cannot be found")
+
+
+def reaper_identity(namespace):
+    """What makes two reapers rivals: the same user and the same namespace, and NOTHING about how either logs in (a token file, a kube
+    context, a kubeconfig, a server spelled two ways all reach the same pods). The lock is per user, so the user is the directory."""
+    return "namespace\n" + namespace
+
+
+def reaper_lock(identity, root=None):
+    """The one lock between a user's reapers of one namespace: an exclusive, non-blocking flock on a 0600 file named for a hash of
+    `identity`, in a private per-user directory (from the password database), held for the process's life; the kernel drops it when
+    the process dies, however it dies. Returns the open descriptor. Raises ReaperLocked for a second reaper, a directory or file that
+    is not the user's own, or a link at the path."""
+    directory = root or _lock_root()
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        dinfo = os.stat(directory)
+        if dinfo.st_uid != os.getuid() or dinfo.st_mode & 0o022:
+            raise ReaperLocked("the lock directory %s is not private to this user" % directory)
+        name = "reaper-%s.lock" % hashlib.sha256(identity.encode()).hexdigest()[:16]
+        fd = os.open(os.path.join(directory, name), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as e:
+        raise ReaperLocked("the reaper lock cannot be opened: %s" % e.strerror)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        os.close(fd)
+        raise ReaperLocked("the reaper lock file is not a private regular file of this user")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise ReaperLocked("another reaper holds the lock")
+    return fd
+
+
 def _reap_main(L, a, sleep):
     """The reaper's loop. Whatever ends it writes ONE line saying why (signal, error, or the end of the loop)."""
-    old, why = L._catch_signals(), None
+    old, why, lock = L._catch_signals(), None, None
     try:
+        lock = reaper_lock(reaper_identity(L.kube.ns))   # BEFORE the first pass: two reapers would both run an end hook for one pod
         while True:
             res = L.reap()
             print(json.dumps([dict({"worker": w, "reason": r, "exit": c}, **L.reap_results.get(w, {})) for w, r, c in res]))
             if not a.loop:
                 why = "end of its pass"
                 return EXIT_HOOK if any(c for _, _, c in res) else 0
-            sleep(min(a.loop, 60))  # never slower than the contract's once a minute
+            sleep(min(a.loop, REAP_FLOOR_SECONDS))
     except (Interrupted, KeyboardInterrupt) as e:
         why = "stopped by %s" % (e if isinstance(e, Interrupted) else "interrupt")
         raise
+    except ReaperLocked as e:
+        why = "not started: %s" % e
+        print("cloud-worker: %s" % e, file=sys.stderr)
+        return EXIT_REFUSED
     except BaseException as e:
         why = "error: %s" % L.kube.scrub(e, 200)
         raise
     finally:
+        if lock is not None:
+            os.close(lock)
         L._restore_signals(old)
-        print("cloud-worker: %s reaper exiting: %s" % (iso(L.clock()), why), file=sys.stderr)   # reason and UTC time, once
+        _reap_exit_line(L.clock, why)   # reason and UTC time, once
 
 
 def main(argv=None, env=None, clock=None, sleep=time.sleep):
+    explicit = env is not None
     env = os.environ if env is None else env
     try:
         a = build_parser().parse_args(argv)
     except SystemExit as e:
         return EXIT_USAGE if e.code else 0
+    if not explicit:   # the real process reads the settings file; a caller that passes its own environment has made its own choice
+        try:
+            apply_settings(env)
+        except CloudError as e:
+            print("cloud-worker: %s" % e, file=sys.stderr)
+            return e.code
     if not token_mode(env) and not (env.get("CW_KUBE_CONTEXT") or "").strip():
+        if a.cmd == "reap":
+            _reap_exit_line(clock, "cluster login failed: no login is set (CW_KUBE_CONTEXT or the token-file settings)")
         print("cloud-worker: CW_KUBE_CONTEXT is not set; refusing to run (the active kubectl context is never used)", file=sys.stderr)
         return EXIT_USAGE
     kube = None
@@ -1399,6 +1959,8 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
         print(result["report"] if a.cmd == "report" and not a.json else json.dumps(result, sort_keys=True))
         return 0
     except CloudError as e:
+        if a.cmd == "reap" and kube is None:   # Kube() itself refused: the login (token file, server, kubeconfig) failed
+            _reap_exit_line(clock, "cluster login failed: %s" % scrub(e, (), 200))
         print("cloud-worker: %s" % (kube.scrub(e, 1500) if kube else scrub(e, (), 1500)), file=sys.stderr)
         return e.code
     except (Interrupted, KeyboardInterrupt):
