@@ -465,19 +465,38 @@ def _spans(node, added):
     return any(number in added for number in range(node.lineno, getattr(node, "end_lineno", node.lineno) + 1))
 
 
-def _registrar_unit(unit, names, added, helpers=None):
+def _own_scope(unit):
+    """([names bound in the unit's OWN scope], [names declared global]): its parameters, its stores and the names of the definitions in it, not what a nested function, lambda, class or comprehension binds (a name
+    bound only in an inner scope does not hide the module's name in this one)."""
+    own, glob, todo = set(), set(), [unit]
+    scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+    while todo:
+        node = todo.pop()
+        if isinstance(node, ast.arg):
+            own.add(node.arg)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            own.add(node.id)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            glob.update(node.names)
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, scopes) and child is not unit:
+                if not isinstance(child, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                    own.add(child.name)
+                if isinstance(child, ast.ClassDef):
+                    todo.extend(child.decorator_list)
+                continue
+            todo.append(child)
+    arguments = getattr(unit, "args", None)
+    if isinstance(arguments, ast.arguments):   # the unit's own parameters
+        own.update(a.arg for a in arguments.posonlyargs + arguments.args + arguments.kwonlyargs + [x for x in (arguments.vararg, arguments.kwarg) if x is not None])
+    return own, glob
+
+
+def _registrar_unit(unit, names, added, helpers=None, opaque=()):
     """[(verb, closure name)] a registrar (a function, a class, or the lambda a registrar name is assigned) does to the closure, counting only the nodes that touch a line in `added` (`None`: every line). `names` are the
-    closure names. `helpers`, when a set is given, collects the names the unit refers to that are not closure names and not its own (a helper it may call: the caller reads those too)."""
-    own, glob = set(), set()
-    for x in ast.walk(unit):
-        if isinstance(x, ast.arg):
-            own.add(x.arg)
-        elif isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del)):
-            own.add(x.id)
-        elif isinstance(x, DEF_KINDS) and x is not unit:
-            own.add(x.name)
-        elif isinstance(x, (ast.Global, ast.Nonlocal)):
-            glob.update(x.names)
+    closure names. `helpers`, when a set is given, collects the names the unit refers to that are not closure names and not its own (a helper it may call: the caller reads those too). A call of a name in `opaque` (a
+    module-level binding that is not a def, a class or a lambda, so it cannot be read) is a finding."""
+    own, glob = _own_scope(unit)
     own -= glob   # a name declared `global` is the module's, whatever is stored into it
     if helpers is not None:
         helpers.update(x.id for x in ast.walk(unit) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id not in own and x.id not in names)
@@ -500,6 +519,9 @@ def _registrar_unit(unit, names, added, helpers=None):
         for target, value in pairs:
             base = _root(value)
             via = base if (base in tainted or (base in names and base not in own) or base in NAMESPACE_REACHERS) else None
+            if via is None and isinstance(value, ast.Call) and base not in own:   # `p = partial(plan_ledger.f)`: what a call outside the registrar is handed comes back in it
+                handed = [_root(a.value if isinstance(a, ast.keyword) else a) for a in list(value.args) + list(value.keywords)]
+                via = next((h for h in handed if h in tainted or (h in names and h not in own)), None)
             if via is None and any(namespace(y) for y in ast.walk(value)):
                 via = "a namespace"
             if via is not None:
@@ -530,6 +552,13 @@ def _registrar_unit(unit, names, added, helpers=None):
             fname = x.func.id if isinstance(x.func, ast.Name) else (x.func.attr if isinstance(x.func, ast.Attribute) else None)
             if callee is not None and ((callee in names and callee not in own) or callee in tainted):
                 note(x, "calls", tainted.get(callee, callee))
+            elif callee is not None and callee not in own:   # a closure name handed to something that is not the registrar's own object (`partial(f)`, `Thread(target=f)`, `map(f, xs)`): it may run it
+                for a in list(x.args) + list(x.keywords):
+                    handed = _root(a.value if isinstance(a, ast.keyword) else a)
+                    if handed in tainted or (handed in names and handed not in own):
+                        note(x, "calls", tainted.get(handed, handed))
+            if isinstance(x.func, ast.Name) and x.func.id in opaque and x.func.id not in own and x.func.id not in names:
+                note(x, "calls", "a helper that cannot be read (%s)" % x.func.id)
             if fname in ("__import__", "import_module"):
                 note(x, "imports", unreadable)
             elif fname in ("eval", "exec", "compile"):
@@ -625,10 +654,25 @@ def registrar_findings(base_src, head_src, rule):
     if lines is None:
         return None, "the diff of the daemon file cannot be read"
     added = set(lines[1])
-    found, defs = [], {n.name: n for n in head.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name not in names}   # the helpers: module-level functions that are not the closure
+    found, defs, opaque = [], {}, set()   # the helpers: what the module binds, by any form, that is not the closure; `opaque` are the bindings that cannot be read
+    for node in _module_statements(head.body):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name not in names:
+                defs[node.name] = node
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                for y in ast.walk(target):
+                    if isinstance(y, ast.Name) and y.id not in names:
+                        if isinstance(getattr(node, "value", None), ast.Lambda) and isinstance(target, ast.Name):
+                            defs[y.id] = node.value
+                            node.value.lineno, node.value.end_lineno = node.lineno, node.end_lineno
+                        else:
+                            opaque.add(y.id)
+        elif isinstance(node, ast.ImportFrom):
+            opaque.update((a.asname or a.name) for a in node.names if (a.asname or a.name) not in names)
     def read(label, unit, lines_counted):
         helpers = set()
-        for verb, hit in _registrar_unit(unit, names, lines_counted, helpers):
+        for verb, hit in _registrar_unit(unit, names, lines_counted, helpers, opaque):
             found.append((label, verb, hit))
         return helpers
     for node in _module_statements(head.body):

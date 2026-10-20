@@ -32362,6 +32362,28 @@ class TestRegistrarFloor(LedgerBase):
             with self.subTest(label):
                 self.assertTrue(self.found_unit(body), label)
 
+    def test_a_closure_name_hidden_by_a_nested_scope_handed_to_a_call_or_reached_by_an_unreadable_helper_is_held(self):
+        function, binding, module = self.pick()
+        cases = {
+            "a nested parameter of the same name": ("def add_a_parsers(sub):\n    def _h(%s):\n        pass\n    %s.f()\n" % (module, module), "calls"),
+            "a nested loop target of the same name": ("def add_a_parsers(sub):\n    def _h():\n        for %s in ():\n            pass\n    %s.f()\n" % (module, module), "calls"),
+            "a comprehension target of the same name": ("def add_a_parsers(sub):\n    [0 for %s in ()]\n    %s.f()\n" % (module, module), "calls"),
+            "partial": ("def add_a_parsers(sub):\n    p = partial(%s.f)\n    p()\n" % module, "calls"),
+            "a thread target": ("def add_a_parsers(sub):\n    Thread(target=%s)\n" % function, "calls"),
+            "map": ("def add_a_parsers(sub):\n    list(map(%s, [1]))\n" % function, "calls"),
+            "a helper bound as a lambda": ("h = lambda: %s()\ndef add_a_parsers(sub):\n    h()\n" % function, "calls"),
+            "a helper that is a class": ("if True:\n    class H:\n        def __call__(self):\n            %s()\ndef add_a_parsers(sub):\n    H()\n" % function, "calls"),
+            "a helper that is a non-lambda binding": ("h = make()\ndef add_a_parsers(sub):\n    h()\n", "calls"),
+            "a helper that is imported": ("from somewhere import h\ndef add_a_parsers(sub):\n    h()\n", "calls"),
+        }
+        for label, (text, verb) in cases.items():
+            with self.subTest(label):
+                got, why = self.reg(text)
+                self.assertIsNone(why)
+                self.assertTrue(any(v == verb for _, v, _ in got), (label, got))
+        got, why = self.reg("def add_a_parsers(sub):\n    t = sub.add_parser('x', type=issue_arg)\n    t.add_argument('--a', type=int, default=%s)\n" % binding)
+        self.assertEqual(got, [], "the registrar's own parser, handed a closure name as a value, is not held")
+
     def test_a_pattern_weakened_in_the_head_a_size_over_the_cap_and_a_lambda_that_resets_its_lines_are_held_or_read(self):
         function, binding, module = self.pick()
         hostile = "def add_a_parsers(sub):\n    %s()\n" % function
