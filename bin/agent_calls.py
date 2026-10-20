@@ -9,6 +9,7 @@ hourly file keeps HOURS_KEPT hours. A corrupt file starts a fresh count. A figur
 Python 3.9+, standard library only; loaded by path from beside bin/fleet-switchboard.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -365,5 +366,76 @@ def usage_lines(state_dir, now):
         recorded = recorded_in_window(merged, _account(account), reset - 3600, now)
         lines.append("      github     real usage %s: used %d, remaining %d, resets %sZ; recorded %d, outside the shim and the daemon about %d%s"
                      % (_account(account), used, int(row["remaining"]), time.strftime("%H:%M", time.gmtime(reset)), recorded, max(0, used - recorded),
-                        "" if age <= 300 else " (read %d min ago)" % (age // 60)))
+                        ("" if age <= 300 else " (read %d min ago)" % (age // 60))
+                        + ("; below the low-budget line" if _number(row.get("limit")) and row["limit"] > 0 and row["remaining"] < LOW_FRACTION * row["limit"] else "")))
     return lines or ["      github     real usage: not recorded"]
+
+
+# ---- the top spender (#949): below the low-budget line the lane that spent most of the last hour is told, once an hour per account (the shim's wait on that agent's
+# uncached reads is in shims/gh; the same ranking and the same line are there, and a test runs both). There is NO per-agent cap, count or quota here or in any
+# configuration: the ranking is recomputed from the hourly record each time and nothing per agent is kept.
+
+LOW_FRACTION = 0.15            # below this share of the hourly budget: the line of the budget warning (#867); the same number is in shims/gh
+USAGE_FRESH = 600              # a reading older than this says nothing (the shim's rule)
+NOTICE_EVERY = 3600            # at most one message per account in this many seconds
+NOTICE_DIR = "gh-low-told"
+NOT_AGENTS = frozenset((DAEMON_LANE, UNKNOWN_LANE, "other"))
+
+
+def low_budget(state_dir, account, now):
+    """(remaining, limit) when the daemon's fresh reading puts `account` below LOW_FRACTION of its hourly budget, else None."""
+    body = _read_json(os.path.join(state_dir, USAGE_FILE)) if state_dir else None
+    try:
+        row = body["accounts"][account]
+        remaining, limit, at = row["remaining"], row["limit"], body["at"]
+    except (KeyError, TypeError):
+        return None
+    if not all(_number(n) for n in (remaining, limit, at)) or limit <= 0 or now - at > USAGE_FRESH:
+        return None
+    return (int(remaining), int(limit)) if remaining < LOW_FRACTION * limit else None
+
+
+def top_spender(state_dir, account, now):
+    """(agent, its calls, all agent calls) for the lane that spent most on `account` in the last hour (this hour and the one before it), or None. The daemon and
+    an unknown lane are never named. A ranking recomputed from the record: nothing is stored per agent."""
+    hours, _since = load_hours(state_dir)
+    spent = {}
+    for key in (str(_hour(now)), str(_hour(now) - 3600)):
+        for lane, accounts in (hours.get(key, {}).get("lanes") or {}).items():
+            if lane not in NOT_AGENTS:
+                spent[lane] = spent.get(lane, 0) + sum((accounts.get(account) or {}).values())
+    spent = {lane: n for lane, n in spent.items() if n > 0}
+    if not spent:
+        return None
+    top = sorted(spent.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+    return top[0], top[1], sum(spent.values())
+
+
+def claim_notice(state_dir, account, now):
+    """True once per NOTICE_EVERY seconds per account: the claim is a locked file's time, taken before the message goes (two callers at once send one)."""
+    import fcntl
+    directory = os.path.join(state_dir, NOTICE_DIR)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    name = hashlib.sha256(account.encode("utf-8")).hexdigest()[:16]
+    fd = os.open(os.path.join(directory, name), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        info = os.fstat(fd)
+        if info.st_size > 0 and 0 <= now - info.st_mtime < NOTICE_EVERY:
+            return False
+        os.ftruncate(fd, 0)
+        os.write(fd, b"1")
+        os.fsync(fd)
+        os.utime(fd, (now, now))
+        return True
+    finally:
+        os.close(fd)
+
+
+def notice_text(account, remaining, limit, agent, calls, total):
+    """The one message to the top spender's orchestrator. Fixed words and numbers only: the account's name, two budget figures and the agent's name."""
+    share = int(round(100.0 * calls / total)) if total else 0
+    return ("Low GitHub budget: the account %s has %d of %d requests left this hour. Top spender in the last hour: %s (%d of %d agent calls, %d%%). "
+            "While the account is low, only %s's reads that are not answered from the cache wait a few seconds each; nothing is refused, no write and no other agent "
+            "is slowed, there is no cap, and the wait ends when the account recovers."
+            % (account, remaining, limit, agent, calls, total, share, agent))

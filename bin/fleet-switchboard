@@ -15721,6 +15721,53 @@ def cmd_remind(args, runner, now):
 cmd_remind.ensure_on_use = True   # the daemon is alive when it runs
 
 
+def add_budget_notice_parsers(sub):
+    notice = sub.add_parser("budget-notice", help="Tell the orchestrator of the top spender that a GitHub account is low on budget (the gh shim runs this; at most once an hour per account)",
+                            description="`budget-notice --account NAME`: when the account's fresh reading is below the low-budget line, names the agent that made the most agent-shell "
+                                        "GitHub calls in the last hour to that agent's orchestrator (the Chief of Staff when it has none), in one message, at most once an hour per account. "
+                                        "It takes only the account's name: the budget, the ranking and the text all come from the daemon's own records, so a call to it cannot invent "
+                                        "a message. There is no per-agent cap: the shim only makes that agent's reads that are not answered from the cache wait a few seconds while the "
+                                        "account is low.")
+    notice.add_argument("--account", required=True, help="The gh account's name as `status` shows it")
+
+
+def cmd_budget_notice(args, runner, now):
+    """One message, only when the account is low, only once an hour per account, to the orchestrator of the top spender. Exit 0 whether or not a message went: the shim
+    never waits on the answer, and a quiet account is not an error."""
+    calls = load_module("agent_calls")
+    state = ensure_state_dir()
+    account = args.account
+    moment = now()
+    low = calls.low_budget(str(state), account, moment)
+    top = calls.top_spender(str(state), account, moment) if low is not None else None
+    if low is None or top is None:
+        print("no message: %s is not below the low-budget line, or nobody spent on it in the last hour" % _one_line(account, 40))
+        return EXIT_OK
+    engine, state, _config = build_engine(runner, now, "cli")
+    discovery = engine.discover(moment)
+    if discovery is None or discovery.problems:
+        print("no message: the agent list cannot be read")   # nothing was claimed: the next call tries again
+        return EXIT_OK
+    seen = discovery.agents.get(top[0])
+    boss = boss_name(discovery, seen) if seen is not None else None
+    chiefs = chiefs_of_staff(discovery)
+    to = boss if boss in discovery.agents else (chiefs[0] if len(chiefs) == 1 else None)
+    if to is None:
+        print("no message: %s has no orchestrator or Chief of Staff to tell" % top[0])
+        return EXIT_OK
+    if not calls.claim_notice(str(state), account, moment):
+        print("no message: one already went for this account in the last hour")
+        return EXIT_OK
+    text = calls.notice_text(_one_line(account, 40), low[0], low[1], top[0], top[1], top[2])
+    item = add_reminder(state, to, moment, moment, text)
+    engine.audit.append("cli", "budget.notice", to, {"account": _one_line(account, 40), "agent": top[0], "id": item["id"]})
+    print("told %s about %s" % (to, top[0]))
+    return EXIT_OK
+
+
+cmd_budget_notice.direct = True   # run by the gh shim: no daemon start, no error mapping
+
+
 # ======================================================= GitHub events (PR 5)
 #
 # One section, self-contained. The pieces, in the order they are built:
