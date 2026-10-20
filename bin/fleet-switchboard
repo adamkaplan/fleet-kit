@@ -7132,25 +7132,24 @@ def pane_health_status_lines(state_dir, now=None):
 
 
 def herdr_live_check(herdr):
-    """A `live_check` for agent_reconcile: asks herdr right now whether the agent's pane exists and runs a process. {"pane": bool|None, "process": bool|None};
-    None means herdr could not say (never a verdict, so nothing is removed on it)."""
+    """A `live_check` for agent_reconcile: asks herdr right now. {"pane": bool|None, "process": bool|None}; None means herdr could not say.
+    Evidence of death is a SUCCESSFUL, WHOLE `pane list` that does not hold this pane id (exact equality on the parsed `pane_id` field). Error text
+    is never read: any error, timeout, bad JSON, missing binary or socket, or a list of an unexpected shape is None (no evidence)."""
     def check(name, agent):
         pane = agent.get("pane")
         if not pane:
             return {"pane": False, "process": False}
         try:
-            herdr.pane_get(pane)
-        except HerdrError as err:
-            # Gone only when herdr ANSWERED with an error that NAMES THIS PANE as missing (reason "exit": the CLI path raises it for any non-zero exit,
-            # so an OS message or another object "not found" must not count). A down, slow or garbled herdr is no evidence either.
-            text = str(getattr(err, "detail", "") or "").lower()
-            names_this_pane = re.search(r"(?<![a-z0-9_:-])%s(?![a-z0-9_:-])" % re.escape(str(pane).lower()), text) is not None
-            missing = "not found" in text or "no such" in text or "unknown pane" in text
-            gone = getattr(err, "reason", None) == "exit" and names_this_pane and missing
-            return {"pane": False, "process": False} if gone else {"pane": None, "process": None}
+            panes = herdr.pane_list()
+        except Exception:
+            return {"pane": None, "process": None}
+        if not isinstance(panes, list) or not all(isinstance(p, dict) and isinstance(p.get("pane_id"), str) for p in panes):
+            return {"pane": None, "process": None}
+        if not any(p["pane_id"] == pane for p in panes):
+            return {"pane": False, "process": False}
         try:
             return {"pane": True, "process": bool(herdr.pane_process_info(pane))}
-        except HerdrError:
+        except Exception:
             return {"pane": True, "process": None}
     return check
 

@@ -66368,15 +66368,17 @@ class TestReconcileOnRead(unittest.TestCase):
 
     def test_s3_reconcile_agents_on_read_removes_through_the_real_registry_with_herdr_gone_and_keeps_it_when_herdr_is_down(self):
         class Herdr:
-            def __init__(self, reason):
-                self.reason = reason
+            def __init__(self, down):
+                self.down = down
 
-            def pane_get(self, pane):
-                raise sb.HerdrError(self.reason, "pane %s not found" % pane if self.reason == "exit" else "cannot reach herdr: No such file or directory")
+            def pane_list(self):
+                if self.down:
+                    raise sb.HerdrError("unavailable", "cannot run herdr: pane p_9 not found")
+                return [{"pane_id": "p_1"}, {"pane_id": "p_2"}]
         reg = self.registry()
-        self.assertEqual(sb.reconcile_agents_on_read(self.dir, Herdr("unavailable")), [])
+        self.assertEqual(sb.reconcile_agents_on_read(self.dir, Herdr(True)), [])
         self.assertIn("ghost", reg.read(self.dir)["agents"])
-        self.assertEqual(sb.reconcile_agents_on_read(self.dir, Herdr("exit")), ["ghost"])
+        self.assertEqual(sb.reconcile_agents_on_read(self.dir, Herdr(False)), ["ghost"])
         self.assertEqual(sorted(reg.read(self.dir)["agents"]), ["alpha", "bare"])
 
     def test_s3_the_callers_own_guards_with_a_recording_registry(self):
@@ -66409,40 +66411,52 @@ class TestReconcileOnRead(unittest.TestCase):
                     self.assertEqual(rec.calls[0][2], True)
                     self.assertEqual((rec.calls[0][1]["pane_listed"], rec.calls[0][1]["process_found"]), (False, False))
 
-    def test_s3_herdr_live_check_says_gone_only_when_herdr_answers_that_this_pane_is_missing(self):
+    def test_s3_herdr_live_check_gives_death_evidence_only_for_a_whole_list_that_lacks_the_exact_pane_id(self):
         class Herdr:
-            def __init__(self, error=None, procs=()):
-                self.error, self.procs = error, procs
+            def __init__(self, listing=None, error=None, procs=()):
+                self.listing, self.error, self.procs = listing, error, procs
 
-            def pane_get(self, pane):
+            def pane_list(self):
                 if self.error:
                     raise sb.HerdrError(*self.error)
-                return {}
+                return self.listing
 
             def pane_process_info(self, pane):
                 return list(self.procs)
         agent = {"pane": "p_1"}
         gone, unknown = {"pane": False, "process": False}, {"pane": None, "process": None}
-        cases = [
-            (("exit", json.dumps({"code": "pane_not_found", "message": "pane p_1 not found"})), gone),
-            (("exit", "pane p_1 not found"), gone),
-            (("exit", "Error: connect /tmp/herdr.sock: No such file or directory"), unknown),
-            (("exit", "workspace not found"), unknown),
-            (("exit", "pane p_2 not found"), unknown),            # another pane
-            (("exit", "pane p_10 not found"), unknown),           # a longer id that contains this one
-            (("exit", "exit 1"), unknown),
-            (("unavailable", "cannot run herdr: No such file or directory"), unknown),
-            (("unavailable", "cannot reach herdr's socket /tmp/h.sock: pane p_1 not found"), unknown),
-            (("timeout", "herdr did not answer within 5s"), unknown),
-            (("bad_json", "herdr returned non-JSON: pane p_1 not found"), unknown),
-            (("bad_shape", "expected result.pane in herdr's reply"), unknown),
-        ]
-        for error, expected in cases:
-            with self.subTest(error=error):
-                self.assertEqual(sb.herdr_live_check(Herdr(error))("a", agent), expected)
-        self.assertEqual(sb.herdr_live_check(Herdr(procs=[{"cmdline": "x"}]))("a", agent), {"pane": True, "process": True})
-        self.assertEqual(sb.herdr_live_check(Herdr())("a", agent), {"pane": True, "process": False})
-        self.assertEqual(sb.herdr_live_check(Herdr())("a", {}), gone)
+        cases = {
+            "listed and present, process running": (Herdr([{"pane_id": "p_1"}], procs=[{"cmdline": "x"}]), {"pane": True, "process": True}),
+            "listed and present, no process": (Herdr([{"pane_id": "p_1"}]), {"pane": True, "process": False}),
+            "listed and absent": (Herdr([{"pane_id": "p_2"}, {"pane_id": "p_3"}]), gone),
+            "empty list": (Herdr([]), gone),
+            "a pane whose id contains this one": (Herdr([{"pane_id": "p_10"}, {"pane_id": "xp_1"}]), gone),
+            "list errors with a socket path holding the id": (Herdr(error=("exit", "connect /tmp/p_1/herdr.sock: No such file or directory")), unknown),
+            "list errors: pane p_1 not found": (Herdr(error=("exit", "pane p_1 not found")), unknown),
+            "list errors: structured not found": (Herdr(error=("exit", json.dumps({"code": "pane_not_found", "message": "pane p_1 not found"}))), unknown),
+            "list errors: unavailable": (Herdr(error=("unavailable", "cannot run herdr: No such file or directory")), unknown),
+            "list errors: timeout": (Herdr(error=("timeout", "herdr did not answer within 5s")), unknown),
+            "list errors: bad json": (Herdr(error=("bad_json", "herdr returned non-JSON")), unknown),
+            "list errors: bad shape": (Herdr(error=("bad_shape", "expected result.panes in herdr's reply")), unknown),
+            "list is not a list": (Herdr({"panes": []}), unknown),
+            "an entry without a pane_id": (Herdr([{"pane_id": "p_2"}, {"id": "p_1"}]), unknown),
+            "an entry with a non-string pane_id": (Herdr([{"pane_id": 1}]), unknown),
+            "an entry that is not an object": (Herdr(["p_2"]), unknown),
+        }
+        for label, (herdr, expected) in cases.items():
+            with self.subTest(case=label):
+                self.assertEqual(sb.herdr_live_check(herdr)("a", agent), expected)
+        self.assertEqual(sb.herdr_live_check(Herdr([]))("a", {}), gone)
+
+    def test_s3_herdr_live_check_never_reads_error_text(self):
+        """Derived from the code: the function holds no text matching on an error (no substring test, no regex over a message)."""
+        import inspect
+        source = inspect.getsource(sb.herdr_live_check)
+        tree = ast.parse(source)
+        self.assertEqual([n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr in ("detail", "reason", "args", "strerror")], [])
+        self.assertEqual([n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", getattr(n.func, "attr", "")) in ("str", "search", "match", "lower")], [])
+        self.assertEqual([n for n in ast.walk(tree) if isinstance(n, ast.Compare) and any(isinstance(o, ast.In) for o in n.ops)], [])
+        self.assertNotIn("re.", source)
 
     def test_s7_only_a_view_reads_ever_calls_reconcile_remove(self):
         """Derived from the code: every call of `reconcile_remove` in the program, plugins and modules sits in agent_reconcile.py (the view's
