@@ -13914,16 +13914,6 @@ class TestClearNotice(Base):
         sb.notify_clear(self.engine, "clear", self.REPO, 7, self.HEAD, reason="again", body="")
         self.assertEqual((len(self.told("cos")), len(self.told("orch-a"))), (1, 1), "a delivered notice is not made again")
 
-    def test_s3_a_send_that_always_fails_is_tried_a_bounded_number_of_times_then_given_up_loudly(self):
-        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
-        self.clear()
-        for _ in range(sb.CLEAR_NOTICE_ATTEMPTS + 3):
-            self.pass_()
-        self.assertEqual(self.pending(), {})
-        (event,) = self.events("gate.clear_notice_abandoned")
-        self.assertIn("gave up", event["detail"]["why"])
-        self.assertEqual(self.told("cos"), [])
-
     def make_pending(self, kind):
         """One pending notice of `kind`, made by the real `notify_clear` with a send that fails; every kind of `sb.CLEAR_NOTICE_KINDS` has its own call."""
         self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
@@ -13968,19 +13958,6 @@ class TestClearNotice(Base):
                 self.unreadable = False
                 self.pass_()
                 self.assertEqual((len(self.world.admissions("cos")), self.pending()), (1, {}))
-
-    def test_s3_for_every_kind_a_send_that_always_fails_is_tried_a_bounded_number_of_times_then_given_up_loudly(self):
-        for kind in sb.CLEAR_NOTICE_KINDS:
-            with self.subTest(kind=kind):
-                self.setUp()
-                self.make_pending(kind)
-                self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
-                for _ in range(sb.CLEAR_NOTICE_ATTEMPTS + 3):
-                    self.pass_()
-                self.assertEqual(self.pending(), {})
-                (event,) = self.events("gate.clear_notice_abandoned")
-                self.assertIn("gave up", event["detail"]["why"])
-                self.assertEqual(self.world.admissions("cos"), [])
 
     def test_s2_for_every_kind_and_the_standing_order_variant_a_failed_notice_is_pending_and_the_pass_delivers_it_once(self):
         order = {"number": 5, "text": "clear fixtures", "by": "cos"}
@@ -14042,29 +14019,122 @@ class TestClearNotice(Base):
         self.pass_()
         self.assertEqual(len(self.reminders()), 2)
 
-    def test_a_reminder_send_that_always_fails_is_tried_a_bounded_number_of_times_spaced_by_the_claim_time_and_never_recorded_as_sent(self):
+    def count_sends(self, only=None, to=None):
+        """Wrap the engine's send: every call to it is counted (the ones whose text holds `only`, when given); a send that always fails. Returns the list of calls."""
+        calls = []
+
+        def down(sender, recipient, text, **kw):
+            if (only is None or only in text) and (to is None or recipient == to):
+                calls.append(self.world.clock.now())
+                return {"sent": False, "reason": "down"}
+            return self.real_send(sender, recipient, text, **kw)
+        self.real_send = self.world.new_engine("daemon").send
+        self.engine.send = down
+        return calls
+
+    def run_cadence(self, seconds, step=5):
+        """The daemon's REAL pass cadence: a pass every `step` seconds of the fake clock for `seconds` (never one jump per pass)."""
+        for _ in range(seconds // step):
+            sb.clear_notice_pass(self.engine, self.later(step))
+
+    def test_s3_for_every_kind_a_lane_that_is_down_for_ten_minutes_still_gets_the_notice_when_it_is_back_and_the_retries_are_spaced(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            with self.subTest(kind=kind):
+                self.setUp()
+                calls = self.count_sends(to="chief-of-staff")
+                extra = {"clear": dict(reason="a fixture"), "carry": dict(previous="f" * 40)}[kind]
+                sb.notify_clear(self.engine, kind, self.REPO, 7, self.HEAD, body="", **extra)
+                self.assertEqual(len(calls), 1, "the command tries once")
+                self.run_cadence(55)
+                self.assertEqual(len(calls), 1, "nothing is retried in the first minute: the 5 s passes do not spend the tries")
+                self.run_cadence(545)   # ten minutes in all
+                self.assertEqual(len(calls), 1 + len(sb.CLEAR_NOTICE_BACKOFF[:3]), "retries after the backoff steps (1, 2 and 5 minutes), not one per pass")
+                self.assertEqual(len(self.pending()), 1, "ten minutes down: still pending, not given up")
+                self.assertEqual(self.events("gate.clear_notice_abandoned"), [])
+                self.engine.send = self.real_send   # the lane is back
+                self.run_cadence(sb.CLEAR_NOTICE_BACKOFF[3] + 5)
+                self.assertEqual(self.pending(), {})
+                self.assertEqual(len(self.world.admissions("cos")), 1, "told once")
+
+    def test_s3_for_every_kind_a_notice_pending_for_longer_than_the_age_bound_is_given_up_loudly_never_by_a_count(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            with self.subTest(kind=kind):
+                self.setUp()
+                calls = self.count_sends(to="chief-of-staff")
+                extra = {"clear": dict(reason="a fixture"), "carry": dict(previous="f" * 40)}[kind]
+                sb.notify_clear(self.engine, kind, self.REPO, 7, self.HEAD, body="", **extra)
+                self.run_cadence(3600)
+                self.assertEqual(len(self.pending()), 1, "an hour of failures is not a reason to give up")
+                before = len(calls)
+                sb.clear_notice_pass(self.engine, self.later(sb.CLEAR_NOTICE_MAX_AGE_SECONDS))
+                (event,) = self.events("gate.clear_notice_abandoned")
+                self.assertIn("gave up", event["detail"]["why"])
+                self.assertEqual((self.pending(), len(calls)), ({}, before))
+
+    def test_a_malformed_pending_entry_is_quarantined_and_the_notices_after_it_are_still_delivered(self):
+        self.make_pending("clear")
+        pending = self.pending()
+        (good,) = pending
+        for label, bad in {"at": {"at": "x"}, "claimed": {"claimed": "y"}, "next_at": {"next_at": []}, "not a notice": {"kind": "nope"}, "under_order": {"under_order": 3}}.items():
+            with self.subTest(label):
+                poisoned = dict(pending, poison=dict(dict(pending[good], number=9), **bad))
+                poisoned["poison"]["at"] = poisoned["poison"].get("at", 0)
+                sb._write_small(self.world.state, sb.CLEAR_PENDING_FILE, poisoned)
+                sb.clear_notice_pass(self.engine, self.later())
+                self.assertEqual(self.pending(), {}, "the good one is delivered and the poison is gone")
+                self.assertTrue(self.events("gate.clear_notice_quarantined"))
+                self.world.admissions("cos").clear() if False else None
+                self.setUp()
+                self.make_pending("clear")
+                pending = self.pending()
+                (good,) = pending
+
+    def test_the_cap_of_pending_notices_audits_what_it_drops(self):
+        filler = {sb._clear_notice_key(self.REPO, 100 + i, "e" * 40, "clear"): {"repo": self.REPO, "number": 100 + i, "head": "e" * 40, "kind": "clear", "at": i + 1, "claimed": 0, "attempts": 0, "sent": []} for i in range(sb.CLEAR_PENDING_MAX)}
+        sb._write_small(self.world.state, sb.CLEAR_PENDING_FILE, filler)
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        sb.notify_clear(self.engine, "clear", self.REPO, 7, self.HEAD, reason="x", body="")
+        self.assertEqual(len(self.pending()), sb.CLEAR_PENDING_MAX)
+        (event,) = self.events("gate.clear_notice_dropped_cap")
+        self.assertIn("oldest", event["detail"]["why"])
+
+    def test_a_corrupt_pending_file_is_kept_aside_and_audited_never_overwritten_silently(self):
+        path = Path(self.world.state) / sb.CLEAR_PENDING_FILE
+        path.write_text("{ this is not json")
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        sb.notify_clear(self.engine, "clear", self.REPO, 7, self.HEAD, reason="x", body="")
+        self.assertEqual(Path(str(path) + ".corrupt").read_text(), "{ this is not json")
+        self.assertTrue(self.events("gate.clear_notice_corrupt"))
+        self.assertEqual(len(self.pending()), 1, "the new notice is recorded in a fresh file")
+
+    def test_one_pull_request_is_read_once_per_pass_however_many_notices_are_pending_for_it(self):
+        self.make_pending("clear")
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        sb.notify_clear(self.engine, "carry", self.REPO, 7, self.HEAD, body="", previous="f" * 40)
+        self.engine.send = self.world.new_engine("daemon").send
+        self.assertEqual(len(self.pending()), 2)
+        self.later()
+        reads = []
+        real = sb.read_pr_json
+        with mock.patch.object(sb, "read_pr_json", side_effect=lambda *a, **k: (reads.append(1), real(*a, **k))[1]):
+            sb.clear_notice_pass(self.engine, self.later())
+        self.assertEqual(len(reads), 1)
+
+    def test_a_reminder_send_that_always_fails_is_spaced_by_the_backoff_given_up_only_by_age_and_never_recorded_as_sent(self):
         sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
         self.clear()
         self.ready_pr()
-        calls = []
-        real = self.engine.send
-
-        def down(sender, recipient, text, **kw):
-            if "cleared, merge it" in text:
-                calls.append(1)
-                return {"sent": False, "reason": "down"}
-            return real(sender, recipient, text, **kw)
-        self.engine.send = down
-        self.pass_(15 * 60)
-        self.pass_(5)
-        self.pass_(5)
-        self.assertEqual(len(calls), 1, "passes inside the claim time do not spend the attempts")
-        for _ in range(sb.CLEAR_NOTICE_ATTEMPTS + 3):
-            self.pass_()
-        self.assertEqual(len(calls), sb.CLEAR_NOTICE_ATTEMPTS)
+        calls = self.count_sends(only="cleared, merge it")
+        self.run_cadence(15 * 60)
+        first = len(calls)
+        self.assertEqual(first, 1, "the first reminder is tried once at the delay")
+        self.run_cadence(10 * 60)
+        self.assertEqual(len(calls), 1 + len(sb.CLEAR_NOTICE_BACKOFF[:3]) - 1 + (1 if sb.CLEAR_NOTICE_BACKOFF[0] + sb.CLEAR_NOTICE_BACKOFF[1] + sb.CLEAR_NOTICE_BACKOFF[2] <= 10 * 60 else 0), "spaced by the backoff, not one per pass")
+        self.assertEqual(self.events("gate.clear_remind_abandoned"), [])
+        sb.clear_notice_pass(self.engine, self.later(sb.CLEAR_NOTICE_MAX_AGE_SECONDS))
         self.assertEqual(self.events("gate.clear_reminded"), [], "a reminder that was never delivered is not recorded as sent")
         (event,) = self.events("gate.clear_remind_abandoned")
-        self.assertEqual((event["detail"]["attempts"], "down" in event["detail"]["error"]), (sb.CLEAR_NOTICE_ATTEMPTS, True))
+        self.assertIn("down", event["detail"]["error"])
 
     def test_s7_no_reminder_when_not_mergeable_not_ready_not_open_at_the_cleared_head_or_not_examined_there(self):
         cases = {"conflicting": dict(mergeable="CONFLICTING"), "gates not ready": dict(ready=False), "draft": dict(state="draft"), "gone": dict(state="gone"),
