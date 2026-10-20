@@ -73635,6 +73635,39 @@ class TestFocusedLocalRuns(unittest.TestCase):
                 self.assertEqual(self.hs.classify(command), kind)
                 self.assertEqual(code == 64, kind == "full") if code is not None else None
 
+    def test_every_other_kind_runs_while_a_full_job_holds_the_worktree(self):
+        for kind, rest in (("focused", ["-k", "x"]), ("other", None), ("e2e", None)):
+            with self.subTest(kind=kind):
+                self.reset()
+                self.hold(self.A)
+                if rest is None:
+                    with mock.patch.object(self.hs, "classify", lambda command, short=False, kind=kind: kind):
+                        code, text = self.start([self.script], self.A)
+                else:
+                    code, text = self.start([self.script] + rest, self.A)
+                self.assertEqual(code, 0, text)
+
+    def test_the_wrapper_is_a_visible_holder_before_it_leaves_the_line(self):
+        seen = []
+        real = self.hs.Line.leave
+
+        def leave(line):
+            seen.extend(i for i in self.hs._held_records(self.state) if i.get("worktree") == self.A and i.get("kind") == "full")
+            return real(line)
+        with mock.patch.object(self.hs.Line, "leave", leave):
+            self.assertEqual(self.start([self.script], self.A)[0], 0)
+        self.assertTrue(seen, "no record naming the worktree when the line was left")
+
+    def test_preflight_reports_a_refused_sub_check_as_a_fail_that_says_so(self):
+        def runner(argv, **kwargs):
+            done = mock.Mock(returncode=64 if "heavy" in argv else 0, stdout="/r\n", stderr="")
+            return done
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), mock.patch.object(sb, "preflight_load", lambda: (0.0, 4)):
+            self.assertEqual(sb.cmd_preflight_pr(None, runner, time.time), 1)
+        self.assertIn("FAIL cli-surface (", out.getvalue())
+        self.assertIn("refused: a full-suite job is already queued or running", out.getvalue())
+
     def test_u2_the_refusal_reads_the_kind_from_the_one_classifier(self):
         self.hold(self.A)
         with mock.patch.object(self.hs, "classify", lambda command, short=False: "focused"):
@@ -73697,7 +73730,6 @@ class TestFocusedLocalRuns(unittest.TestCase):
         before = section.split(self.DEFAULT, 1)[0]
         for figure in ("19 full local runs", "14 worktrees", "Five of the 14 worktrees", "upper bound"):
             self.assertIn(figure, before)
-            self.assertNotIn(figure, section.split(self.DEFAULT, 1)[1].split("**", 1)[0] if False else "")
         self.assertEqual(text.count("**Focused by default, one full-suite job per worktree (#942).**"), 1)
 
     # ---- preflight: THE table of workflow cases (name, workflow text, changed files, expected job or None)
@@ -73718,6 +73750,10 @@ class TestFocusedLocalRuns(unittest.TestCase):
             ("step-condition-it-may-not-run", wf.replace("${{ !cancelled() }}", "${{ github.ref == 'x' }}"), ["cloud/x"], None),
             ("only-a-name-or-comment", wf.replace("          bin/test-cloud-launcher 2>&1 | tee out.txt", "          # bin/test-cloud-launcher\n          true"), ["cloud/x"], None),
             ("changed-files-unknown", wf, None, None),
+            ("list-form-trigger", wf.replace("on:\n  pull_request:\n  push:\n    branches: [main]\n", "on: [push, pull_request]\n"), ["cloud/x"], "test-cloud"),
+            ("trigger-with-paths-filter", wf.replace("  pull_request:\n", "  pull_request:\n    paths: ['docs/**']\n"), ["cloud/x"], None),
+            ("trigger-with-branches-filter", wf.replace("  pull_request:\n", "  pull_request:\n    branches: [main]\n"), ["cloud/x"], None),
+            ("pull-request-target-only", wf.replace("  pull_request:\n", "  pull_request_target:\n"), ["cloud/x"], None),
         )
 
     def preflight(self, workflow, changed):

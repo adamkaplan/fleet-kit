@@ -1124,6 +1124,8 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
                 out.flush()
                 next_report = now + every
             sleep(POLL_SECONDS)
+        if fd is not None and where:   # visible as a slot holder BEFORE it leaves the line, so a second full-suite job never finds it in neither (the full record follows)
+            _record(fd, name, os.getpid(), command[0], clock(), {"kind": kind, "worktree": where, "program": program_of(command)})
         if queue is not None and not (queue.leave() or queue.leave()):   # it has its slot (or none will come): out of the line at once; one more try before it says so
             out.write("heavy: could not leave the waiting order: the others pass this caller's ticket once its slot shows as held\n")
         env = dict(environ)
