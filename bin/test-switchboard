@@ -31358,6 +31358,10 @@ class TestImpactFloorPure(unittest.TestCase):
         self.assertIn("WITH a `max_level`", replaces[0])
         self.assertIn("`score`", replaces[0])
         self.assertEqual(len([s for s in sentences if "either way" in s]), 1)
+        either = [i for i, s in enumerate(sentences) if "either way" in s][0]
+        self.assertIn("The refusals below apply either way", sentences[either])      # names the later group, not the replaced two
+        self.assertGreater(either, max(i for i, s in enumerate(sentences) if "`top_tier_review_classes`" in s))
+        self.assertLess(either, min(i for i, s in enumerate(sentences) if "`clear_code_paths`" in s))
         self.assertTrue(m.rstrip().endswith("."))
 
     def test_899_s2_every_key_the_meaning_names_exists_and_the_doc_says_the_same(self):
