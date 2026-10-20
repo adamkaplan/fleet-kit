@@ -34925,6 +34925,27 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
         self.assertEqual(len({w[1].split("/")[4] for w in self.removals()}), 5)
 
 
+    def test_a_due_release_not_reached_waits_and_the_one_judged_longest_ago_goes_first(self):
+        self.extra_config = dict(self.extra_config, impact_hold={"enabled": True, "calls_per_pass": 3})
+        self.configure()
+        for n in (9, 10, 11):
+            self.files(n, "shims/gh")
+        everyone = lambda: [self.listed(n, self.both()) for n in (9, 10, 11)]
+        self.seed_applied([9, 10, 11])
+        self.passes(everyone())   # all three still hold: judged once (a read each, a budget of 3), kept
+        self.assertEqual((self.posts(), self.removals()), ([], []))
+        self.passes([self.listed(10, self.both())], advance=1000)   # judged again: 10 at this time ...
+        self.passes([self.listed(9, self.both())], advance=1000)    # ... and 9 later than 10; 11 was judged longest ago
+        for n in (9, 10, 11):
+            self.files(n, "docs/a.md")
+        order = []
+        for _ in range(3):
+            before = len(self.removals())
+            self.passes(everyone(), advance=1000)
+            order += sorted({w[1].split("/")[4] for w in self.removals()[before:]})
+        self.assertEqual(order, ["11", "10", "9"], "one release a pass at a budget of 3, the one judged longest ago first")
+
+
 for _name in list(vars(TestImpactRejudge)):   # the subclass reuses the harness, not the tests
     if _name.startswith("test") and _name not in vars(TestImpactReleaseEveryPass):
         setattr(TestImpactReleaseEveryPass, _name, None)
