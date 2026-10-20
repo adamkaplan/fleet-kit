@@ -23106,42 +23106,46 @@ class TestWorkerOwned(OwnedInputs, ReportBase):
                     self.assertFalse(silent, "without this member's check the rule no longer stays silent on the bad input: the case above catches the mutant")
         self.assertEqual(set(examples), set(sb.OWNED_READABLE))
 
-    def test_a_reminder_whose_issue_is_not_a_number_never_raises_and_holds_nothing(self):
-        """Every `in w.numbers` / `in ctx.numbers` of the change (the reminder guard, the decision refs, the parent walk, the pull request references) takes
-        a number from a place that already holds only numbers, except the reminders file, which a person can edit: a list, a dict, a string and a bool
-        there answer as the old `==` did (not waiting)."""
+    def reminder_answer(self, issue, owned=3):
+        """What the waiting predicate answers when the (hand-edited) reminders file holds `issue`, for a worker that owns `owned` (3 is a work item;
+        1 is made a work item too, so that a bool, which is equal to 1, can match)."""
+        self.setUp()
+        self.set_scene(issues={1: {"parent": 2}})
         now = self.world.clock.now
-        for name, bad in (("a list", [2]), ("a dict", {"n": 2}), ("a string", "2"), ("a bool", True), ("null", None), ("a float", 2.0)):
-            with self.subTest(issue=name):
-                self.setUp()
-                sb.add_reminder(self.world.state, "coder", now() + 600, now(), "look", issue=2)
-                items = sb.read_reminders(self.world.state)
-                items[0]["issue"] = bad
-                sb.write_reminders(self.world.state, items)
-                got = self.predicate()
-                self.assertEqual((got.state, got.codes), ("clear", []))
-        self.setUp()   # the control: a real number on a work item still waits
-        sb.add_reminder(self.world.state, "coder", now() + 600, now(), "look", issue=3)
-        self.assertEqual(self.predicate().codes, ["reminder"])
+        sb.add_reminder(self.world.state, "coder", now() + 600, now(), "look", issue=owned)
+        items = sb.read_reminders(self.world.state)
+        items[0]["issue"] = issue
+        sb.write_reminders(self.world.state, items)
+        try:
+            got = self.predicate()
+        except TypeError:
+            return "raised"
+        return got.state
 
-    def test_the_mutant_that_tests_membership_without_the_number_check_raises_on_a_list_and_a_dict(self):
-        now = self.world.clock.now
-        needs, check = sb.WAITING_GUARDS["reminder"]
-        def raw(w):
-            for reminder in sb.read_reminders(w.engine.state_dir):
-                if reminder.get("to") == w.observation.name and reminder.get("issue") in w.numbers:
-                    return ["it set a reminder for later"]
-            return []
-        for name, bad in (("a list", [2]), ("a dict", {"n": 2})):
+    # every value is built FROM an owned number (3, or 1 for the bool), so each one would match a set test if the type check let it through
+    BAD_REMINDER_ISSUES = (("a list", [3], 3), ("a dict", {"n": 3}, 3), ("a string", "3", 3), ("a float equal to an owned number", 3.0, 3),
+                           ("a bool equal to an owned number", True, 1), ("null", None, 3))
+
+    def test_a_reminder_whose_issue_is_not_an_int_never_raises_and_holds_nothing(self):
+        """A list, a dict, a string, null, a float and a bool in a hand-edited reminders file all answer "clear" (never an exception). A list or dict, a
+        string and null answer as the old `==` did. A float equal to an owned number (3.0) and a bool equal to one (True, with 1 owned) used to hold under
+        `==`: rejecting them is the deliberate, safer answer (only an int that is not a bool names an issue), and this test pins it."""
+        for name, bad, owned in self.BAD_REMINDER_ISSUES:
             with self.subTest(issue=name):
-                self.setUp()
-                sb.add_reminder(self.world.state, "coder", now() + 600, now(), "look", issue=2)
-                items = sb.read_reminders(self.world.state)
-                items[0]["issue"] = bad
-                sb.write_reminders(self.world.state, items)
-                with mock.patch.dict(sb.WAITING_GUARDS, {"reminder": (needs, raw)}):
-                    with self.assertRaises(TypeError):
-                        self.predicate()
+                self.assertEqual(self.reminder_answer(bad, owned), "clear")
+        for owned in (3, 4, 1):
+            with self.subTest(control=owned):
+                self.assertEqual(self.reminder_answer(owned, owned), "waiting", "a real int on an owned issue still waits")
+
+    def test_one_mutant_per_allowed_type_of_the_issue_check_is_caught(self):
+        raw = lambda value: True                                                       # no check: a list or dict raises
+        any_int = lambda value: isinstance(value, int)                                 # a bool passes
+        int_or_float = lambda value: isinstance(value, (int, float)) and not isinstance(value, bool)   # a float passes
+        for name, mutant in (("no check", raw), ("a bool is an int", any_int), ("a float is a number", int_or_float)):
+            with self.subTest(mutant=name):
+                with mock.patch.object(sb, "_is_issue_number", mutant):
+                    answers = {label: self.reminder_answer(bad, owned) for label, bad, owned in self.BAD_REMINDER_ISSUES}
+                self.assertNotEqual(set(answers.values()), {"clear"}, "this mutant must change the answer of at least one bad value: %s" % answers)
 
     def said(self, rule):
         self.apply()
