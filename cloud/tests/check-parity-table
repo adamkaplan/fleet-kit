@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# check-parity-table [FILE [LAW-IDS-FILE]]: the parity table's shape (no network). Exit 1 on a blank cell, a row with no status, a GAP with
-# no owner or item, an FK-LAW id not in the law-ids list, a status that is not exactly covered / covered another way / GAP, or no rows; 0 otherwise. It never judges whether a claim is true.
+# check-parity-table [FILE [LAW-IDS-FILE [ITEMS-FILE]]]: the parity table's shape (no network). Exit 1 on a blank cell, a row with no status, a GAP with
+# no owner or item, an FK-LAW id not in the law-ids list, a status that is not exactly covered / covered another way / GAP, a GAP that cites a closed item or names no open item (the lists are cloud/tests/parity-items.txt, kept by hand), or no rows; 0 otherwise. It never judges whether a claim is true.
 here=$(cd "$(dirname "$0")/../.." && pwd)
-exec python3 - "${1:-$here/docs/cloud-guard-parity.md}" "${2:-$here/docs/cloud-guard-law-ids.md}" <<'P'
+exec python3 - "${1:-$here/docs/cloud-guard-parity.md}" "${2:-$here/docs/cloud-guard-law-ids.md}" "${3:-$here/cloud/tests/parity-items.txt}" <<'P'
 import re, sys
 path, bad, rows = sys.argv[1], [], 0
 known = set()
@@ -12,6 +12,18 @@ except OSError:
     print("check-parity-table: cannot read the law ids %s" % sys.argv[2]); sys.exit(1)
 if not known:
     print("check-parity-table: no law ids listed in %s" % sys.argv[2]); sys.exit(1)
+items = {}
+try:
+    for ln in open(sys.argv[3]).read().splitlines():
+        m = re.match(r"^(open|closed) ([0-9]+)$", ln.strip())
+        if m:
+            if items.get(m.group(2), m.group(1)) != m.group(1):
+                print("check-parity-table: #%s is in both lists of %s" % (m.group(2), sys.argv[3])); sys.exit(1)
+            items[m.group(2)] = m.group(1)
+except OSError:
+    print("check-parity-table: cannot read the item lists %s" % sys.argv[3]); sys.exit(1)
+if "open" not in items.values() or "closed" not in items.values():
+    print("check-parity-table: the item lists %s need open and closed items" % sys.argv[3]); sys.exit(1)
 try:
     lines = open(path).read().splitlines()
 except OSError as e:
@@ -34,6 +46,15 @@ for n, line in enumerate(lines, 1):
     m = re.match(r"^GAP \(owner: ([^;]*); item: (.*)\)$", status)
     if status.startswith("GAP") and (not m or not m.group(1).strip() or not re.search(r"[A-Za-z0-9]", m.group(2)) or m.group(2).strip() in ("-", "n/a", "none", "tbd", "TBD")):
         bad.append("line %d: a GAP needs an owner and a real item" % n)
+    if m and m.group(1).strip():
+        nums = re.findall(r"#([0-9]+)", m.group(2))
+        for x in nums:
+            if x not in items:
+                bad.append("line %d: item #%s is in neither list of %s" % (n, x, sys.argv[3]))
+            elif items[x] == "closed":
+                bad.append("line %d: a GAP cites #%s, which is closed: flip the row" % (n, x))
+        if not any(items.get(x) == "open" for x in nums):
+            bad.append("line %d: a GAP names no open item" % n)
     laws = re.findall(r"[^\s,]+", cells[5])
     for law in laws:
         if law not in known:
