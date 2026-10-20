@@ -138,8 +138,8 @@ only this machine's own address, and never removes or widens a rule. `launch` gi
 Set `CW_VAULT_CHECK_DIR` to the checkout the owner of the vault access check provides. It must be an absolute path to a directory that is
 not a symlink, is owned by you and is not group- or world-writable, and holds the check's module as a regular file (the same holds for
 the module's own folders). A missing key or a bad path refuses the launch (exit status 2), names `CW_VAULT_CHECK_DIR` and runs nothing; an unset key
-does not matter while the vault already answers. The check runs from that checkout as you, with the same cleaned environment as the preflight (a private `HOME`, a fixed `PATH`, your `az` sign-in) and
-a limit of 300 seconds.
+does not matter while the vault already answers. The check runs from that checkout as you, with a cleaned environment (a fixed `PATH`, no `PYTHON*` and none of your variables, your `az` sign-in found as for the preflight) and
+a limit of 300 seconds. Its `HOME` is your real home taken from the password database, never from the `HOME` variable, so the check's own log line goes under your home as its owner expects (ask its owner for the exact file); `TMPDIR` is a private directory removed afterwards.
 
 Two launches never run it at once: one lock file (mode 0600, in the cloud state directory) is held around the check; a second launch waits,
 then reads the vault again first, and runs the check only if the vault still refuses.

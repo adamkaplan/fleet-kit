@@ -1662,7 +1662,9 @@ class TestVaultCheckRelay(VaultBase):
         for name in poison:
             self.assertNotIn(name, keys, name)
         self.assertEqual({k for k in keys if not k.startswith("LC_")} - {"__CF_USER_TEXT_ENCODING", "SHLVL", "PWD", "_"}, {"PATH", "HOME", "TMPDIR", "AZURE_CONFIG_DIR"})   # SHLVL, PWD, _: the recording sh wrapper's own
-        self.assertNotEqual(start["home"], os.environ["HOME"])   # a private HOME, not the user's
+        import pwd
+        self.assertEqual(start["home"], pwd.getpwuid(os.getuid()).pw_dir)   # the password database's home: the poisoned HOME variable is ignored
+        self.assertNotEqual(start["home"], os.environ["HOME"])
 
     def test_the_lock_file_is_private_and_a_linked_lock_path_is_refused(self):
         self.make_checkout(code=10, fixes=True)

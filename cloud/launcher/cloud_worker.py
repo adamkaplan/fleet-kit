@@ -230,7 +230,7 @@ def _abs_executable(path):
     return bool(path) and os.path.isabs(path) and os.path.isfile(path) and os.access(path, os.X_OK)
 
 
-def _scrubbed_env(env, home, names, openssl=True):
+def _scrubbed_env(env, home, names, openssl=True, real_home=False):
     """THE scrubbed child environment (the preflight and the vault access check both use it): the allow-listed `names` (and LC_*), a fixed PATH, an
     empty private HOME and TMPDIR, and where `az` keeps its sign-in (the caller's AZURE_CONFIG_DIR when it is an absolute existing directory, else the
     account's own ~/.azure from the password database, never $HOME)."""
@@ -238,6 +238,11 @@ def _scrubbed_env(env, home, names, openssl=True):
     clean["PATH"] = PREFLIGHT_PATH
     clean["HOME"] = home
     clean["TMPDIR"] = home
+    if real_home:   # the vault access check keeps its own log under the user's home: the PASSWORD DATABASE's home, never the HOME variable
+        try:
+            clean["HOME"] = pwd.getpwuid(os.getuid()).pw_dir
+        except (KeyError, OSError):
+            pass
     cfg = env.get("AZURE_CONFIG_DIR") or ""
     if not (os.path.isabs(cfg) and os.path.isdir(cfg)):
         try:
@@ -388,7 +393,7 @@ def run_vault_check(env):
     out = ""
     try:
         with tempfile.TemporaryDirectory(prefix="cw-vcheck-") as home:
-            child = subprocess.Popen(argv, cwd=checkout, env=_scrubbed_env(env, home, VAULT_CHECK_ENV_NAMES, openssl=False), stdin=subprocess.DEVNULL,
+            child = subprocess.Popen(argv, cwd=checkout, env=_scrubbed_env(env, home, VAULT_CHECK_ENV_NAMES, openssl=False, real_home=True), stdin=subprocess.DEVNULL,
                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace", start_new_session=True)
             try:
                 out, _ = child.communicate(timeout=VAULT_CHECK_SECONDS + VAULT_CHECK_GRACE)
