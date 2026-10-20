@@ -1252,16 +1252,33 @@ class TestRegistryIdentity(Base):
         finally:
             hb.Herdr = original
 
-    def test_s11_supervises_exactly_the_registry_agents_and_reads_no_agent_list(self):
+    def test_s11_supervises_exactly_the_registry_agents_and_herdr_adds_none(self):
         hb.registry = FakeRegistry(registry_agents("w2:p2", "w3:p1", "w4:p1"))
-        # herdr lists a 4th, belled agent the registry does not know: it must not be supervised.
+        # herdr lists a 4th, belled agent the registry does not know: it does not exist, so it is not supervised.
         herdr = FakeHerdr(
             tabs=[{"tab_id": "w%d:t1" % n, "workspace_id": "w%d" % n, "label": "%s x" % BELL} for n in (2, 3, 4, 9)],
             agents=[{"pane_id": "w%d:p%d" % (n, 2 if n == 2 else 1), "tab_id": "w%d:t1" % n, "agent": "opencode", "agent_status": "idle"} for n in (2, 3, 4, 9)])
         with quiet_stderr():
             self.loop(herdr)
         self.assertEqual(set(hb.read_state(self.state)["panes"]), {"w2:p2", "w3:p1", "w4:p1"})
-        self.assertEqual([c for c in herdr.calls if c[:2] in {("tab", "list"), ("agent", "list")}], [])
+
+    def test_a_registry_agent_without_the_bell_is_not_nudged(self):
+        hb.registry = FakeRegistry(registry_agents("w2:p2", "w3:p1"))
+        herdr = FakeHerdr(
+            tabs=[{"tab_id": "w2:t1", "workspace_id": "w2", "label": "%s x" % BELL}, {"tab_id": "w3:t1", "workspace_id": "w3", "label": "plain"}],
+            agents=[{"pane_id": "w2:p2", "tab_id": "w2:t1", "agent": "opencode", "agent_status": "idle"},
+                    {"pane_id": "w3:p1", "tab_id": "w3:t1", "agent": "opencode", "agent_status": "idle"}])
+        with quiet_stderr():
+            self.loop(herdr)
+        self.assertEqual(set(hb.read_state(self.state)["panes"]), {"w2:p2"})
+
+    def test_a_bell_tab_with_no_registry_agent_is_not_nudged(self):
+        hb.registry = FakeRegistry({})
+        herdr = FakeHerdr()
+        with quiet_stderr():
+            self.loop(herdr)
+        self.assertEqual(herdr.sent, [])
+        self.assertEqual(hb.read_state(self.state)["panes"], {})
 
     def test_s12_a_read_that_is_not_whole_nudges_nobody_and_says_why(self):
         hb.registry = FakeRegistry(registry_agents("w2:p2"), whole=False)

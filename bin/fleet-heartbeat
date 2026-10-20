@@ -96,7 +96,7 @@ def registry_state_dir():
 
 def registry_targets():
     """Who exists, from the registry: (targets, problem). A read that is not whole gives no targets and one line saying why (fail closed).
-    A target is a registry agent with a pane; no list from herdr is read to decide who exists."""
+    A target is a registry agent with a pane; the bell opt-in (policy) is applied after, from herdr's labels, and never adds an agent."""
     if registry is None:
         return [], "registry module not found: nothing supervised this pass"
     found = registry.read(registry_state_dir())
@@ -576,6 +576,10 @@ class Herdr:
         """
         return [t for t in self.tabs_with_agents() if t["supervised"]]
 
+    def belled_panes(self):
+        """Supervision POLICY, not identity: the pane ids whose tab label carries the bell. It never says who exists (the registry does)."""
+        return {t["pane_id"] for t in self.tabs_with_agents() if t["supervised"]}
+
     def inspect_pane(self, pane_id):
         """Is it safe to send right now? Returns (status, observed telemetry).
 
@@ -864,6 +868,15 @@ def _loop_once(state_dir, config_path, config):
     if problem:
         logging.error("%s", problem)
         record_service(state_dir, last_error="registry:%s" % problem)
+    elif targets:
+        try:
+            belled = transport.belled_panes()
+            targets = [t for t in targets if t["pane_id"] in belled]
+        except Unavailable as err:
+            logging.error("opt-in labels unavailable: %s", err)
+            record_service(state_dir, last_error="discover:%s" % err)
+            targets = []
+            suspect = str(err) in HERDR_SUSPECT_STATUSES
 
     for target in targets:
         pane_id = target["pane_id"]
