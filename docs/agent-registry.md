@@ -45,7 +45,8 @@ rebuilt from another record.
 | `plugins/fleet-decisions-tui/decisions.mjs:9` | `decisions.json` | reads the list for the sidebar | nobody (reader only) | Decisions section | derived (reader) |
 | `plugins/fleet-decisions-tui/health.mjs:15` | `decisions.json` | reads the list for the health block | nobody (reader only) | sidebar health view | derived (reader) |
 | `plugins/fleet-decisions-tui/tui.tsx:2` | `decisions.json` | the TUI section renders it through decisions.mjs | nobody (reader only) | sidebar | derived (reader) |
-| `plugins/fleet-decisions-tui/health.mjs:3` | `pane-health.json` | reads which agents sit in which workspace and their state | nobody (reader only) | sidebar health view (the sidebar's own read of the agent list) | derived (reader) |
+| `plugins/fleet-decisions-tui/health.mjs:3` | `pane-health.json` | reads which agents sit in which workspace and their state | nobody (reader only) | sidebar health view (the sidebar's own read of the agent list, from its own installed copy of the plugin: a view) | derived (reader) |
+| `bin/cloud_worker.py:101` | `cloud-records` | one record per cloud worker in `state/cloud/<name>.json`: run id, pod, repo, branch | `cloud_worker.cmd_launch`, the cloud reaper and `cmd_retire` (stop) | `route`, the cloud log read (`cmd_read`), `status` | primary for cloud workers; slice 2 mirrors them into the registry |
 | `bin/fleet-switchboard:4400` | `headless-records` | launch records `state/headless/<name>.json` and `headless-service.json` (boss per worker) and `headless-route.json` | `launch` (headless), the restart notice | discovery of headless workers, the restart notice, route checks | primary for headless workers |
 | `bin/agent_presence.py:25` | `headless-records` | scans `state/headless/*.json` | nobody (reader only) | presence checks | primary (reader) |
 | `plugins/fleet-hooks/index.js:407` | `headless-records` | reads the launch record to tell a headless worker | nobody (reader only) | the fleet-hooks plugin | primary (reader) |
@@ -63,6 +64,10 @@ session, above); sweeps and the hooks plugin appear above only where they read o
 - A read that is not whole (unreadable, torn, invalid, newer version) returns `agents: {}`, `whole: false` and a one-line `problem`. A caller that
   acts on the list (the #805 rule) acts only when `whole` is true.
 - `registry.get(state_dir, name) -> Agent|None` reads the same way; `None` with a problem is not "absent".
+- `registry.get_retired(state_dir, name) -> Retired|None` returns the retired record (session, at, by, reason, `record`), read the same way.
+- A consumer that ACTS on a read (the close-pane guard `retire_close_problem`, `reattach`, `reconcile_remove`) fails CLOSED when `whole` is false: it takes no action on a half read.
+- Consumers (slice 2 lists them in its plan): `status`, `reattach`, `retire`/`--undo`, the close-pane guard (`retire_close_problem`), `known_agent`, the cloud log read, the sidebar plugin, decisions, the load line and the health records.
+- The state `dead` is never rendered: a view shows a live state or nothing. A dead agent is removed by reconcile on read, not drawn (slice 4's test asserts it).
 
 ### 2. Write API
 
@@ -71,8 +76,10 @@ Each call takes the lock, reads, changes, and writes by the atomic rule below, i
 - `registry.retire(state_dir, name, by, reason, auto=False)`: the agent keeps its record under `retired` (session, pane record, at, by, reason) and leaves `agents`.
 - `registry.unretire(state_dir, name)`: the reverse (`retire --undo`).
 - `registry.close(state_dir, name, by, reason)`: the pane is closed on purpose; as `retire`, with `reason` recorded.
-- `registry.reconcile_remove(state_dir, name, reason, whole)`: removes a dead agent; refuses (`changed: false`) when `whole` is not true; appends an audit line with `reason`.
-- `registry.upsert(state_dir, name, agent)`: discovery's and launch's way to add or update an agent.
+- `registry.reconcile_remove(state_dir, name, evidence, whole)`: removes a dead agent. The registry ITSELF checks the evidence (the agent's recorded state and what the live read lacked: pane, process), not only the caller's `whole` flag; it refuses (`changed: false`) when `whole` is not true or when the evidence does not show the agent dead. It appends an audit line carrying that evidence. A test calls it with `whole=True` for a live agent and requires the refusal.
+- `registry.upsert(state_dir, name, agent)`: discovery's and launch's way to add or update an agent. NO CHURN: when nothing changed it writes nothing and returns `changed: false`. An audit line is written only on add, remove, retire and close, never on a no-op.
+- The #870 rule: a retired record with no `session` covers nothing. The fields of a pruned pane record come from `retired[name].record`, for `unretire`, `known_agent`, `reattach` and the cloud log read (slice 2 pins each by a test).
+- Cloud workers are agents: a record carries `"kind": "cloud"` and the `run_id` the launcher already keeps (`state/cloud/<name>.json`). Views list them like any agent. `retire`, `close` and `reconcile_remove` work on them as on a local agent, the registry change in one step, and the stop of the pod stays the cloud launcher's act. The cloud launcher and reaper are WRITERS (they `upsert` and `retire`); the cloud log read is a READER.
 
 ### 3. The file
 
@@ -81,7 +88,7 @@ Each call takes the lock, reads, changes, and writes by the atomic rule below, i
 ```json
 {"version": 1,
  "agents": {"<name>": {"session": "ses_example", "pane": "p_1", "role": "coder", "charter": 903, "repo": "acme-org/widget-service",
-                       "workspace": "w_1", "cwd": "/home/user/work", "state": "working", "since": 1760000000}},
+                       "workspace": "w_1", "cwd": "/home/user/work", "state": "working", "kind": "local", "run_id": null, "since": 1760000000}},
  "retired": {"<name>": {"at": 1760000100, "by": "orchestrator", "reason": "final report", "session": "ses_example", "auto": false, "record": {}}}}
 ```
 
@@ -91,7 +98,7 @@ role, charter, repo, workspace, cwd).
 ### 4. The lock
 
 An exclusive `flock` on `registry.lock` beside the file, held for the whole read-change-write of a write call. Readers take no lock: they
-rely on the atomic write.
+rely on the atomic write. LOCK ORDER: the registry lock first, then the boss-record lock (`boss-overrides`), never the reverse.
 
 ### 5. The atomic write
 
@@ -107,16 +114,16 @@ version rises only when a field changes meaning or goes away; a new optional fie
 
 Until the last slice, `pane-health.json`, `retired.json` and the other old files in the inventory are derived output of the registry:
 written from it, read by no view. Slice 2 folds today's records into the registry with no loss (reattach, `retire --undo` and the cloud
-log read give the same result, each with `HERDR_*` and `OPENCODE_*` unset). The old files go only in the last slice.
+log read give the same result, each with `HERDR_*` and `OPENCODE_*` unset). The old files go only in the last slice. The sidebar plugin is a view that reads `pane-health.json` from its own installed copy: its read is derived output until the last slice, and slice 3's "every view derives" test lists it.
 
 Clear-machinery files by slice (a slice that touches one says so in its plan and its pull request holds for the owner):
 
 - Slice 2: `bin/fleet-switchboard` (`retire`, `reattach`, `known_agent`, `pane_health_pass`) and `bin/reassign.py` (boss overrides); the boss records are not moved, only read.
 - Slice 3: none planned; if it edits `resolve_boss` or `boss_name` it says so.
-- Slice 4: none planned; the reconcile writes only through `registry.reconcile_remove`.
+- Slice 4: none planned; its test asserts no view renders `dead`; the reconcile writes only through `registry.reconcile_remove`.
 
 ## Freeze
 
-FROZEN: when fleetkit, cos and fleet-daemon have each commented agreement on #906 (no earlier). Until then this interface may change; after it a change needs both to agree again.
+FROZEN: when fleetkit, cos and fleet-daemon have each commented agreement on #906 (no earlier). After it a change needs all three to agree again.
 
-Status: not frozen.
+Status: FROZEN 2026-10-20 (fleetkit, cos, fleet-daemon agreed on #906).

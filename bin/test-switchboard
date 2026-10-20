@@ -8812,6 +8812,7 @@ class TestAgentRegistryInventory(unittest.TestCase):
         "tool-rate.json": r"tool-rate\.json|TALLY_FILE|TOOL_FILE",
         "load.json": r"load\.json|LOAD_FILE",
         "decisions.json": r"decisions\.json|DECISIONS_FILE",
+        "cloud-records": r"CLOUD_DIR|cloud_dir",
         "headless-records": r"headless-service\.json|headless-route\.json|HEADLESS_SERVICE_FILE|HEADLESS_ROUTE_FILE|headless/",
     }
     SECTIONS = ("### 1. Read API", "### 2. Write API", "### 3. The file", "### 4. The lock", "### 5. The atomic write", "### 6. The version rule")
