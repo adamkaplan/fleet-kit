@@ -11,6 +11,7 @@ Pure: plain values in, a list of reasons out (empty means allowed). The classes 
 """
 import ast
 import base64
+import difflib
 import hashlib
 import json
 import re
@@ -188,6 +189,11 @@ def refusals(rule, report, files, matches=None, closure=None, scored=None):
     if report.get("complete") is not True or report.get("unknown") or report.get("renamed_no_source"):
         return ["the pull request's changes cannot be read in full (%s)" % (report.get("unknown") or "the file list is cut")]
     reasons = list(scored["reasons"]) if isinstance(scored, dict) else []
+    held = report.get("registrar_reasons", [])
+    if not isinstance(held, list) or any(not isinstance(x, str) for x in held):
+        reasons.append("the registrar lint's answer cannot be read: refused")
+    else:
+        reasons.extend("%s: that stays the owner's own clear" % x[:160] for x in held)   # #964: whatever the rating says
     hits = report.get("top_tier_hits") or {}
     for cls in sorted(hits) if scored is None else ():
         if cls.lower() in {c.lower() for c in rule["never_path_classes"]}:
@@ -415,6 +421,174 @@ def closure_refusals(base_src, head_src, patch, roots, entry_points, module_leve
                 else:
                     reasons.append("it changes a module-level statement (%s line %d) that is not a definition or a binding: refused" % (side, number))
     return sorted(set(reasons))
+
+
+# ---- a command registrar that imports, calls or rebinds a name of the clear's closure (#964)
+# In one process a hostile registrar can always undo a guard: this lint, the floor that reads it and the independent rating are the control. Both lists are DERIVED here: the closure names from `closure`
+# (the one the clear uses, over the matrix's roots) and the registrars from the daemon file's own `REGISTRAR_NAME_RE`; this code holds neither. What it does hold are the names Python itself gives for reaching a
+# namespace by string, which are not closure names (`NAMESPACE_REACHERS`).
+
+NAMESPACE_REACHERS = ("globals", "vars", "locals", "setattr", "delattr", "getattr", "eval", "exec", "compile", "__import__", "import_module")
+SETTERS = ("setattr", "delattr", "__setattr__", "__delattr__")
+REGISTRAR_SOURCE_MAX = 4000000
+
+
+def registrar_pattern(tree):
+    """The compiled `REGISTRAR_NAME_RE` of a daemon file (read from its text, never held here), or None when it is not a literal `re.compile("...")`."""
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "REGISTRAR_NAME_RE" for t in node.targets):
+            call = node.value
+            if isinstance(call, ast.Call) and call.args and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str):
+                try:
+                    return re.compile(call.args[0].value)
+                except re.error:
+                    return None
+    return None
+
+
+def _root(node):
+    """The name an expression is built from: `a.b[c](d).e` is `a`; None when it starts from something else."""
+    while True:
+        if isinstance(node, ast.Attribute) or isinstance(node, ast.Subscript):
+            node = node.value
+        elif isinstance(node, ast.Call):
+            node = node.func
+        elif isinstance(node, ast.Starred):
+            node = node.value
+        else:
+            return node.id if isinstance(node, ast.Name) else None
+
+
+def _spans(node, added):
+    return any(number in added for number in range(node.lineno, getattr(node, "end_lineno", node.lineno) + 1))
+
+
+def _registrar_unit(unit, names, added):
+    """[(verb, closure name)] a registrar (a function, or the lambda a registrar name is assigned) does to the closure, counting only the nodes that touch a line in `added`. `names` are the closure names."""
+    own, glob = set(), set()
+    for x in ast.walk(unit):
+        if isinstance(x, ast.arg):
+            own.add(x.arg)
+        elif isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del)):
+            own.add(x.id)
+        elif isinstance(x, DEF_KINDS) and x is not unit:
+            own.add(x.name)
+        elif isinstance(x, (ast.Global, ast.Nonlocal)):
+            glob.update(x.names)
+    own -= glob   # a name declared `global` is the module's, whatever is stored into it
+    tainted = {}   # alias -> the closure name (or reacher) it came from
+    changed = True
+    while changed:   # an alias of a closure object (`m = plan_ledger`, `m = sys.modules[...]`): a name that holds what a closure name holds
+        changed = False
+        for x in ast.walk(unit):
+            if isinstance(x, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and getattr(x, "value", None) is not None:
+                base = _root(x.value)
+                targets = x.targets if isinstance(x, ast.Assign) else [x.target]
+                if base is not None and (base in tainted or (base in names and base not in own) or base in NAMESPACE_REACHERS):
+                    for t in targets:
+                        for y in ast.walk(t):
+                            if isinstance(y, ast.Name) and y.id not in tainted:
+                                tainted[y.id] = tainted.get(base, base)
+                                changed = True
+    def reaches(expr):
+        base = _root(expr)
+        return base is not None and (base in tainted or (base in names and base not in own) or base in NAMESPACE_REACHERS)
+    found = set()
+    def note(node, verb, name):
+        if _spans(node, added):
+            found.add((verb, name))
+    unreadable = "a name that cannot be read"
+    for x in ast.walk(unit):
+        if isinstance(x, (ast.Import, ast.ImportFrom)):
+            bound = [a.name.split(".")[0] for a in x.names] + [a.asname for a in x.names if a.asname] + ([x.module.split(".")[0]] if isinstance(x, ast.ImportFrom) and x.module else [])
+            hits = sorted(n for n in bound if n in names)
+            for n in hits or ([] if all(isinstance(a.name, str) for a in x.names) else [unreadable]):
+                note(x, "imports", n)
+        elif isinstance(x, (ast.Global, ast.Nonlocal)):
+            for n in x.names:
+                if n in names:
+                    note(x, "rebinds", n)
+        elif isinstance(x, ast.Call):
+            callee = _root(x.func)
+            fname = x.func.id if isinstance(x.func, ast.Name) else (x.func.attr if isinstance(x.func, ast.Attribute) else None)
+            if callee is not None and callee in names and callee not in own:
+                note(x, "calls", callee)
+            elif callee is not None and callee in tainted:
+                note(x, "calls", callee)
+            if fname in ("__import__", "import_module"):
+                note(x, "imports", unreadable)
+            elif fname in ("eval", "exec", "compile"):
+                note(x, "calls", fname)
+            elif fname in SETTERS or fname in ("getattr", "update", "pop", "setdefault"):
+                strings = [a.value for a in x.args if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+                target = x.func.value if isinstance(x.func, ast.Attribute) and fname not in ("getattr", "setattr", "delattr") else (x.args[0] if x.args else None)
+                named = sorted(n for n in strings if n in names)
+                if fname in ("getattr", "update", "pop", "setdefault"):
+                    if target is not None and reaches(target) and fname == "getattr" and named:
+                        note(x, "calls", named[0])
+                    elif fname != "getattr" and target is not None and reaches(target):
+                        note(x, "rebinds", named[0] if named else unreadable)
+                elif named:
+                    note(x, "rebinds", named[0])
+                elif target is None or reaches(target) or not (len(x.args) > 1 and isinstance(x.args[1], ast.Constant)):
+                    note(x, "rebinds", unreadable)
+        elif isinstance(x, (ast.Attribute, ast.Subscript)) and isinstance(x.ctx, (ast.Store, ast.Del)):
+            if isinstance(x, ast.Attribute) and x.attr in names:
+                note(x, "rebinds", x.attr)
+            elif reaches(x.value):
+                key = x.slice if isinstance(x, ast.Subscript) else None
+                base = _root(x.value)
+                base = tainted.get(base, base)
+                label = key.value if isinstance(key, ast.Constant) and isinstance(key.value, str) and key.value in names else (base if base in names else unreadable)
+                note(x, "rebinds", label)
+        elif isinstance(x, ast.Attribute) and x.attr == "__dict__":
+            note(x, "rebinds", unreadable)
+    return sorted(found)
+
+
+def registrar_findings(base_src, head_src, rule):
+    """([(registrar, verb, closure name)], None) for a pull request's own base and head text of the daemon file, or (None, why) when they cannot be read (the caller holds, fail closed). A finding is an
+    import, a call or a rebinding of a closure name by a registrar (`add_<x>_parsers`, or a registrar name assigned a lambda) on a line the pull request added; an untouched line or a removed one gives none.
+    The closure is the union of the base and the head (a pull request that ADDS a closure name counts); the registrar pattern is the union of both files' own `REGISTRAR_NAME_RE`."""
+    if not isinstance(base_src, str) or not isinstance(head_src, str) or len(base_src) > REGISTRAR_SOURCE_MAX or len(head_src) > REGISTRAR_SOURCE_MAX:
+        return None, "the daemon file before or after the change cannot be read"
+    try:
+        base, head = ast.parse(base_src), ast.parse(head_src)
+        roots, actions = daemon_roots(rule), rule.get("dynamic_actions") or ()
+    except (SyntaxError, ValueError, KeyError, TypeError, AttributeError):
+        return None, "the daemon file does not parse before or after the change, or the rule cannot be read"
+    patterns = [p for p in (registrar_pattern(base), registrar_pattern(head)) if p is not None]
+    if not patterns or registrar_pattern(head) is None:
+        return None, "the registrar name pattern of the daemon file cannot be read"
+    names = set()
+    for tree in (base, head):
+        reach = closure(tree, roots, actions)
+        names |= reach[0] | reach[1]
+    if not names:
+        return None, "the clear's closure is empty, so it cannot be told what a registrar touches"
+    patch = "\n".join(difflib.unified_diff(base_src.split("\n"), head_src.split("\n"), n=0, lineterm=""))
+    lines = changed_lines(patch)
+    if lines is None:
+        return None, "the diff of the daemon file cannot be read"
+    added = set(lines[1])
+    found = []
+    for node in head.body:
+        name = unit = None
+        if isinstance(node, ast.FunctionDef):
+            name, unit = node.name, node
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name, unit = node.targets[0].id, node.value
+        if name is None or not any(p.fullmatch(name) for p in patterns):
+            continue
+        if isinstance(node, ast.Assign):
+            if not isinstance(unit, ast.Lambda):
+                if _spans(node, added):
+                    found.append((name, "rebinds", "a registrar defined by assignment cannot be read"))
+                continue
+            unit.lineno, unit.end_lineno = node.lineno, node.end_lineno
+        for verb, hit in _registrar_unit(unit, names, added):
+            found.append((name, verb, hit))
+    return sorted(set(found)), None
 
 
 def decode_blob(answer):

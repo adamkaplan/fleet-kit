@@ -32107,6 +32107,293 @@ class TestImpactFloorOwnerDecision(LedgerBase):
         self.assertNotIn("owner_decide(", source, "no second copy of the rule")
 
 
+class TestRegistrarFloor(LedgerBase):
+    """#964: a registrar that imports, calls or rebinds a name of the clear's closure is held for the owner by the floor, with no rating. The REAL daemon file, the REAL closure and the REAL matrix: both lists are derived
+    from them. In one process a hostile registrar can always undo a guard; this hold and this rating are the control."""
+
+    BASE = "c" * 40
+    cache = None
+
+    def setUp(self):
+        super().setUp()
+        self.dc = sb.load_module("delegated_clear")
+        self.rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
+        if TestRegistrarFloor.cache is None:   # the real file and its closure, derived once for the class
+            import ast
+            source = (BIN / "fleet-switchboard").read_text()
+            tree = ast.parse(source)
+            reach = self.dc.closure(tree, self.dc.daemon_roots(self.rule), self.rule["dynamic_actions"])
+            TestRegistrarFloor.cache = (source, tree, sorted(reach[0] | reach[1]), sorted(reach[0]), sorted(reach[1]))
+        self.base_src, self.tree, self.names, self.defs, self.bindings = TestRegistrarFloor.cache
+        self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}})
+        self.configure()
+
+    def head_of(self, body, name="add_zzz_parsers", base=None):
+        return (base if base is not None else self.base_src) + "\n\ndef %s(sub):\n    %s\n" % (name, body.replace("\n", "\n    "))
+
+    def found(self, body, name="add_zzz_parsers", base=None):
+        got, why = self.dc.registrar_findings(base if base is not None else self.base_src, self.head_of(body, name, base), self.rule)
+        self.assertIsNone(why, why)
+        return got
+
+    def found_unit(self, body):
+        """The same lint over a registrar written alone, with the real closure names: [(registrar, verb, name)] (the whole-file route is `found`, used where the diff matters)."""
+        import ast
+        unit = ast.parse("def add_zzz_parsers(sub):\n    " + body.replace("\n", "\n    ") + "\n").body[0]
+        return [("add_zzz_parsers", v, n) for v, n in self.dc._registrar_unit(unit, set(self.names), set(range(1, 1000)))]
+
+    def pick(self):
+        """One closure definition, one binding and one imported module of the real closure (derived: the first of each, never named here)."""
+        import ast
+        modules = sorted(n for n in self.bindings if any(isinstance(x, (ast.Import, ast.ImportFrom)) and n in {(a.asname or a.name).split(".")[0] for a in x.names} for x in self.tree.body))
+        return self.defs[0], next(n for n in self.bindings if n not in modules), modules[0]
+
+    def hostile_table(self):
+        """{shape: (body, the verb it is held for)}, written against names derived from the closure. One table, used by the held test and the mutants."""
+        function, binding, module = self.pick()
+        return {
+            "an import": ("import %s" % module, "imports"),
+            "an import as a closure name": ("import json as %s" % binding, "imports"),
+            "a from import": ("from json import dumps as %s" % function, "imports"),
+            "a call": ("%s()" % function, "calls"),
+            "a call through an attribute": ("%s.thing()" % module, "calls"),
+            "an attribute rebind": ("%s.%s = None" % (module, function), "rebinds"),
+            "an attribute rebind of a closure name on an object": ("sub.%s = None" % function, "rebinds"),
+            "sys.modules": ("sys.modules[__name__].anything = None", "rebinds"),
+            "an alias": ("m = %s\nm.anything = None" % module, "rebinds"),
+            "globals()": ("globals()[%r] = None" % function, "rebinds"),
+            "globals() by a name that cannot be read": ("globals()[sub] = None", "rebinds"),
+            "setattr": ("setattr(sys.modules[__name__], %r, None)" % function, "rebinds"),
+            "setattr by a name that cannot be read": ("setattr(%s, sub, None)" % module, "rebinds"),
+            "a global statement": ("global %s\n%s = None" % (binding, binding), "rebinds"),
+            "a delete": ("del %s.%s" % (module, function), "rebinds"),
+            "a loop target": ("for %s.%s in (1,):\n    pass" % (module, function), "rebinds"),
+            "a __dict__ write": ("%s.__dict__.update(a=1)" % module, "rebinds"),
+            "an import by string": ("__import__('os')", "imports"),
+        }
+
+    def test_the_probe_a_registrar_rebinds_a_closure_name_in_the_process_and_the_floor_holds_the_same_edit(self):
+        """DW-1: the cause shown on the real module. Every shape works at run time (the guards share the namespace), and the floor holds the diff that carries it."""
+        import ast
+        function, binding, module = self.pick()
+        for name in (function, binding):
+            original = getattr(sb, name)
+            body = "global %s\n%s = F" % (name, name)
+            namespace = sb.__dict__
+            namespace["F"] = object()
+            try:
+                exec("def add_zzz_parsers(sub):\n    " + body.replace("\n", "\n    ") + "\n", namespace)
+                sb.build_parser()
+                self.assertIs(getattr(sb, name), namespace["F"], "the probe: the registrar rebound %s while the process ran" % name)
+            finally:
+                setattr(sb, name, original)
+                namespace.pop("add_zzz_parsers", None)
+                namespace.pop("F", None)
+            got = self.found(body)
+            self.assertIn(("add_zzz_parsers", "rebinds", name), got)
+        self.assertGreaterEqual(len(self.names), 100)
+
+    def test_every_hostile_shape_is_held_with_the_registrar_and_the_closure_name_in_the_reason(self):
+        for label, (body, verb) in self.hostile_table().items():
+            with self.subTest(label):
+                got = self.found_unit(body)
+                self.assertTrue(got, label)
+                self.assertTrue(all(g[0] == "add_zzz_parsers" and g[1] == verb for g in got) or any(g[1] == verb for g in got), (label, got))
+                reasons = sb.impact_floor.registrar_reasons({"findings": got, "why": None})
+                self.assertTrue(all("registrar add_zzz_parsers" in r for r in reasons) and reasons)
+                self.assertTrue(any(g[2] in reasons[i] for i, g in enumerate(got)))
+
+    def test_a_registrar_that_only_adds_a_flag_or_refers_to_a_name_without_calling_it_is_not_held(self):
+        function, binding, module = self.pick()
+        for body in ("thing = sub.add_parser('zzz', help='h')\nthing.add_argument('--x', type=issue_arg, default=argparse.SUPPRESS)\nthing.usage = 'u'",
+                     "decide = 1\ncopy = 2\nthing = sub.add_parser('zzz')\nthing.add_argument('--y', help=%s)" % binding,
+                     "def local():\n    return 1\nlocal()"):
+            with self.subTest(body):
+                self.assertEqual(self.found_unit(body), [])
+
+    def test_only_the_lines_the_pull_request_added_count_on_its_own_base_and_head(self):
+        hostile = "global %s\n%s = None" % (self.pick()[1], self.pick()[1])
+        base = self.head_of(hostile)                                           # the hostile line is already in the base
+        self.assertEqual(self.dc.registrar_findings(base, base, self.rule), ([], None), "untouched: not held")
+        other_line = base.replace("def add_zzz_parsers(sub):\n", "def add_zzz_parsers(sub):\n    thing = sub.add_parser('zzz')\n    thing.add_argument('--x')\n")
+        self.assertEqual(self.dc.registrar_findings(base, other_line, self.rule), ([], None), "a different line edited: not held")
+        removed = base.replace("    global %s\n    %s = None\n" % (self.pick()[1], self.pick()[1]), "    pass\n")
+        self.assertEqual(self.dc.registrar_findings(base, removed, self.rule), ([], None), "a removed hostile line: not held")
+        added = self.dc.registrar_findings(self.base_src, base, self.rule)[0]
+        self.assertEqual(len(added), 1)
+        self.assertEqual(added[0][:2], ("add_zzz_parsers", "rebinds"))
+
+    def test_a_change_to_a_function_that_is_not_a_registrar_is_not_held(self):
+        function, binding, module = self.pick()
+        for name in ("helper_zzz", "cmd_zzz", "add_zzz_parser"):
+            with self.subTest(name):
+                self.assertEqual(self.found("global %s\n%s = None\nimport %s" % (binding, binding, module), name=name), [])
+
+    def test_an_unreadable_diff_holds_and_says_so(self):
+        good = self.base_src
+        for label, (before, after) in {"no base": (None, good), "no head": (good, None), "head that does not parse": (good, good + "\ndef (:\n"),
+                                       "no registrar pattern": (good, good.replace("REGISTRAR_NAME_RE", "REGISTRAR_NAME_RX"))}.items():
+            with self.subTest(label):
+                got, why = self.dc.registrar_findings(before, after, self.rule)
+                self.assertIsNone(got)
+                self.assertTrue(why)
+                reasons = sb.impact_floor.registrar_reasons({"findings": [], "why": why})
+                self.assertEqual(len(reasons), 1)
+                self.assertIn("registrar diff could not be read", reasons[0])
+        self.assertEqual(self.dc.registrar_findings(good, good, {"closure_roots": [], "rating_roots": []})[0], None, "an empty closure cannot tell what a registrar touches: held")
+        self.assertEqual(sb.impact_floor.registrar_reasons(None), [], "the daemon file did not change: nothing to read")
+        self.assertEqual(len(sb.impact_floor.registrar_reasons("garbage")), 1)
+
+    def table_holds(self, names=None, pattern=None):
+        """True when every row of the table is found, with the closure (or a mutant of it) and the registrar pattern (or a mutant)."""
+        import ast, re
+        names = set(self.names if names is None else names)
+        for label, (body, verb) in self.hostile_table().items():
+            unit = ast.parse("def add_zzz_parsers(sub):\n    " + body.replace("\n", "\n    ") + "\n").body[0]
+            got = self.dc._registrar_unit(unit, names, set(range(1, 100))) if (pattern is None or pattern.fullmatch("add_zzz_parsers")) else []
+            if not any(v == verb for v, _ in got):
+                return False
+        return True
+
+    def test_mutants_the_table_fails_without_the_registrars_without_the_closure_and_for_each_closure_name(self):
+        import re
+        self.assertTrue(self.table_holds())
+        self.assertFalse(self.table_holds(names=[]), "a mutant that drops the closure names survives")
+        self.assertFalse(self.table_holds(pattern=re.compile("(?!)")), "a mutant that drops the registrars survives")
+        with mock.patch.object(self.dc, "registrar_pattern", lambda tree: re.compile("(?!)")):
+            got, why = self.dc.registrar_findings(self.base_src, self.head_of("global %s\n%s = None" % (self.pick()[1], self.pick()[1])), self.rule)
+            self.assertEqual(got, [], "with no registrar matched the hostile edit is not seen: the mutant must be caught by the table above")
+        function, binding, module = self.pick()
+        import ast
+        for name in self.names:   # a mutant for each member of the closure: without it, the registrar that rebinds it is not seen
+            with self.subTest(name):
+                for body, verb in (("global %s\n%s = None" % (name, name), "rebinds"), ("import %s" % name, "imports")):
+                    unit = ast.parse("def add_zzz_parsers(sub):\n    " + body.replace("\n", "\n    ") + "\n").body[0]
+                    full = self.dc._registrar_unit(unit, set(self.names), set(range(1, 100)))
+                    mutant = self.dc._registrar_unit(unit, set(self.names) - {name}, set(range(1, 100)))
+                    self.assertIn((verb, name), full)
+                    self.assertNotIn((verb, name), mutant)
+
+    def test_every_member_of_the_closure_is_covered_by_every_verb(self):
+        import ast
+        for name in self.names:
+            for body, verb in (("global %s\n%s = None" % (name, name), "rebinds"), ("import %s" % name, "imports"), ("%s.%s = None" % ("sub2", name), "rebinds")) + (("%s()" % name, "calls"),) * (name in self.defs or name in self.bindings):
+                unit = ast.parse("def add_zzz_parsers(sub):\n    " + body.replace("\n", "\n    ") + "\n").body[0]
+                self.assertTrue(any(v == verb for v, _ in self.dc._registrar_unit(unit, set(self.names), set(range(1, 100)))), (name, body))
+
+    def test_a_name_added_to_the_closure_and_a_registrar_added_later_are_covered_with_no_second_edit(self):
+        fake = ("import re\nREGISTRAR_NAME_RE = re.compile(r'add_[a-z0-9_]+_parsers')\ndef newhelper():\n    pass\ndef main():\n    newhelper()\n")
+        rule = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": []}
+        head = fake + "def add_zz_parsers(sub):\n    newhelper()\n"
+        self.assertEqual(self.dc.registrar_findings(fake, head, rule), ([("add_zz_parsers", "calls", "newhelper")], None))
+        grown = fake.replace("def main():\n    newhelper()\n", "def main():\n    newhelper()\n    later()\n") + "def later():\n    pass\n"
+        head2 = grown + "def add_qq_parsers(sub):\n    later()\n"
+        self.assertEqual(self.dc.registrar_findings(grown, head2, rule), ([("add_qq_parsers", "calls", "later")], None))
+        self.assertEqual(self.dc.registrar_findings(fake, fake + "def add_zz_parsers(sub):\n    other()\n", rule), ([], None), "a name outside the closure is not held")
+
+    def test_neither_list_is_written_in_the_rule(self):
+        import ast
+        names = set(self.names) | {n.name for n in self.tree.body if isinstance(n, ast.FunctionDef) and re.fullmatch(r"add_[a-z0-9_]+_parsers", n.name)}
+        for module, wanted in ((BIN / "delegated_clear.py", ("registrar_findings", "_registrar_unit", "registrar_pattern", "_root", "_spans")), (BIN / "impact_floor.py", ("registrar_reasons",))):
+            tree = ast.parse(module.read_text())
+            for fn in (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in wanted):
+                strings = {c.value for c in ast.walk(fn) if isinstance(c, ast.Constant) and isinstance(c.value, str)}
+                self.assertEqual(strings & names - {"REGISTRAR_NAME_RE"}, set(), "%s holds a closure name or a registrar name" % fn.name)   # the one name the daemon file declares its registrars by: the clear's own closure reads it by the same literal
+        self.assertEqual({"globals", "vars", "locals", "setattr", "delattr", "getattr", "eval", "exec", "compile", "__import__", "import_module"} & set(self.dc.NAMESPACE_REACHERS), set(self.dc.NAMESPACE_REACHERS))
+        self.assertEqual(set(self.dc.NAMESPACE_REACHERS) & set(self.names), set(), "the Python namespace reachers are not closure names")
+
+    def test_no_registrar_of_the_daemon_file_is_held_today_and_the_count_is_the_one_the_pattern_finds(self):
+        import ast
+        pattern = self.dc.registrar_pattern(self.tree)
+        registrars = [n for n in self.tree.body if isinstance(n, ast.FunctionDef) and pattern.fullmatch(n.name)]
+        self.assertGreaterEqual(len(registrars), 20)
+        allnew = {x for r in registrars for x in range(r.lineno, r.end_lineno + 1)}
+        for node in registrars:
+            with self.subTest(node.name):
+                self.assertEqual(self.dc._registrar_unit(node, set(self.names), allnew), [])
+
+    # ---- every consumer reads the one answer (pr_floor_report)
+    HOSTILE = "global %s\n%s = None"
+
+    def serve(self, head_src):
+        self.pr = dict(self.pr, baseRefOid=self.BASE, changedFiles=1, files=[{"path": "bin/fleet-switchboard", "additions": 3, "deletions": 0}])
+        base_src = self.base_src
+        def text(engine, repo, path, ref):
+            return base_src if ref == self.BASE else head_src
+        patcher = mock.patch.object(sb, "_file_text_at", text)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def engine(self):
+        engine = self.world.new_engine("daemon")
+        engine.gh_runner = self.route
+        engine.config, engine.state_dir = sb.load_config(), self.world.state
+        return engine
+
+    def test_the_cli_the_daemon_the_gate_and_the_delegated_clear_all_read_the_same_hold(self):
+        function, binding, module = self.pick()
+        self.serve(self.head_of(self.HOSTILE % (binding, binding)))
+        shown = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
+        report = sb.pr_floor_report(self.engine(), "acme/app", 9)
+        self.assertEqual((shown["owner_decision"], shown["owner_reasons"]), (report["owner_decision"], report["owner_reasons"]))
+        self.assertEqual(report["owner_decision"], "hold")
+        self.assertTrue(any("registrar add_zzz_parsers rebinds closure name %s" % binding in r for r in report["owner_reasons"]), report["owner_reasons"])
+        self.assertEqual(report["registrar_reasons"], [r for r in report["owner_reasons"] if r.startswith("registrar ")])
+        refused = self.dc.refusals(self.rule, report, [{"filename": "bin/fleet-switchboard", "status": "modified"}], matches=sb.impact_floor.matches, closure={"bin/fleet-switchboard": []})
+        self.assertTrue(any("registrar add_zzz_parsers rebinds closure name" in r and "stays the owner's own clear" in r for r in refused), refused)
+        # the gate reads the same report: G6 sees the hold
+        got = sb.gate_floor_fact(self.engine(), self.world.state, "acme/app", 9, report["head"])
+        self.assertEqual(got["decision"], "hold", got)
+        self.assertTrue(any("registrar add_zzz_parsers" in r for r in got["reasons"]))
+
+    def test_a_flag_only_registrar_edit_and_an_unchanged_daemon_file_do_not_add_a_reason(self):
+        self.serve(self.head_of("thing = sub.add_parser('zzz')\nthing.add_argument('--x', type=issue_arg)"))
+        report = sb.pr_floor_report(self.engine(), "acme/app", 9)
+        self.assertEqual(report["registrar_reasons"], [])
+        self.pr = dict(self.pr, changedFiles=1, files=[{"path": "docs/a.md", "additions": 1, "deletions": 0}])
+        report = sb.pr_floor_report(self.engine(), "acme/app", 9)
+        self.assertEqual(report["registrar_reasons"], [])
+        self.assertEqual(sb.impact_floor.registrar_reasons(None), [])
+
+    def test_an_unreadable_daemon_file_at_the_head_holds(self):
+        self.pr = dict(self.pr, baseRefOid=self.BASE, changedFiles=1, files=[{"path": "bin/fleet-switchboard", "additions": 3, "deletions": 0}])
+        with mock.patch.object(sb, "_file_text_at", side_effect=sb.IntentError("gh", "not readable")):
+            report = sb.pr_floor_report(self.engine(), "acme/app", 9)
+        self.assertEqual(report["owner_decision"], "hold")
+        self.assertTrue(any("registrar diff could not be read" in r for r in report["owner_reasons"]))
+
+    def test_the_delegated_clear_refuses_an_unreadable_answer_and_an_absent_one_adds_nothing(self):
+        report = {"owner_decision": "none", "complete": True, "registrar_reasons": "garbage", "review_action": "none"}
+        refused = self.dc.refusals(self.rule, report, [], matches=sb.impact_floor.matches, closure={})
+        self.assertTrue(any("registrar lint's answer cannot be read" in r for r in refused), refused)
+        report.pop("registrar_reasons")
+        self.assertFalse(any("registrar" in r for r in self.dc.refusals(self.rule, report, [], matches=sb.impact_floor.matches, closure={})))
+
+    # ---- the rater's line and the documentation say it in the same words
+    RATER = "A registrar that imports, calls or rebinds a name of the clear's closure is rated High, whatever its other effects."
+    HOLD = "a registrar that imports, calls or rebinds a name of the clear's closure is held for the owner"
+    CONTROL = "In one process a hostile registrar can always undo a guard; this hold and this rating are the control."
+
+    def test_the_rater_line_is_in_the_definition_once_and_the_documentation_says_the_rule_and_the_line_in_the_same_words(self):
+        definition = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
+        docs = (REPO / "docs" / "switchboard.md").read_text()
+        self.assertEqual(definition.count(self.RATER), 1)
+        self.assertEqual(docs.count(self.RATER), 1)
+        self.assertEqual(docs.count(self.HOLD[0].upper() + self.HOLD[1:]), 0)
+        self.assertEqual(docs.count(self.HOLD), 1)
+        self.assertEqual(docs.count(self.CONTROL), 1)
+        self.assertEqual(sb.impact_floor.REGISTRAR_RULE_TEXT, self.HOLD)
+        for word in ("imports", "calls", "rebinds", "closure", "High"):
+            self.assertIn(word, self.RATER)
+
+    def test_the_definition_permission_block_is_unchanged_by_the_line(self):
+        definition = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
+        front = definition.split("\n---\n", 1)[0]
+        base = subprocess.run(["git", "show", "origin/main:agents/reviewers/reviewer-impact.md"], cwd=REPO, capture_output=True, text=True)
+        if base.returncode == 0:
+            self.assertEqual(front, base.stdout.split("\n---\n", 1)[0])
+
+
 class TestImpactFloorCommandAndPass(LedgerBase):
     """`impact floor <pr>` and the daemon's advisory `gate.would_hold`: both read, neither writes a label, comment or ledger entry."""
 
