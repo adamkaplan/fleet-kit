@@ -52,6 +52,7 @@ MOVED = ('rating_at',
          'cmd_impact_delegated',
          'delegated_clear_checks',
          'delegated_clear_pr_checks',
+         'clear_closure_hold',
          'delegated_clear_score',
          'delegated_clear_map',
          '_gh_json',
@@ -984,6 +985,43 @@ def delegated_clear_score(engine, module, report, threshold):
     if scored is None:
         scored = {"level": None, "reasons": ["the independent rating cannot be read (%s): the score is unknown, refused" % (problem or "no score rule")]}
     return scored
+
+
+def clear_closure_hold(engine, repo, number, head):
+    """[reasons] the owner hold (#940) for a change to the daemon file that touches the clear's closure, read by the SAME mapper the delegated clear's refusal reads (`delegated_clear_map`, so one closure
+    derivation (`daemon_roots`) and one function judge both, and they cannot disagree). [] when the daemon file is not changed by this pull request. Fails toward the hold: a file list, a merge base or a text
+    that cannot be read, a head that moved while it was read, or a daemon file that is added, removed or renamed, each give a reason."""
+    try:
+        rule = (impact_floor.load_matrix().get("owner_hold") or {}).get("delegated_clear")
+        runner = engine.gh_runner or subprocess.run
+        get = impact_carry_get(engine, runner, repo)
+        files = []
+        for page in range(1, 31):
+            got = get("repos/%s/pulls/%d/files?per_page=100&page=%d" % (repo, number, page))
+            if not isinstance(got, list):
+                raise ValueError("not a list")
+            files.extend(f for f in got if isinstance(f, dict))
+            if len(got) < 100:
+                break
+        else:
+            return ["the pull request lists more than 3000 files: the change to the daemon file cannot be judged against the clear's closure, held"]
+        item = next((f for f in files if f.get("filename") == rule["daemon_file"] or f.get("previous_filename") == rule["daemon_file"]), None)
+        if item is None:
+            return []
+        if item.get("status") != "modified":
+            return ["the daemon file is %s by this pull request: held" % item.get("status")]
+        pull = get("repos/%s/pulls/%d" % (repo, number))
+        after, base_sha = (pull.get("head") or {}).get("sha"), (pull.get("base") or {}).get("sha")
+        if after != head or not base_sha:
+            return ["the pull request's head moved while the closure was being read: held"]
+        compared = get("repos/%s/compare/%s...%s?per_page=1" % (repo, base_sha, after))
+        base_sha = ((compared or {}).get("merge_base_commit") or {}).get("sha")
+        reasons = delegated_clear_map(engine, runner, repo, item, base_sha, rule)
+        if reasons is None:
+            return ["the change to the daemon file cannot be read or mapped to the clear's closure: held"]
+        return ["the change touches the clear's closure: %s" % reason for reason in reasons]
+    except Exception as err:
+        return ["the change to the daemon file cannot be judged against the clear's closure (%s): held" % _one_line(str(err), 100)]
 
 
 def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info=None):
