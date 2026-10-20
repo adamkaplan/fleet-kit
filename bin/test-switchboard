@@ -58148,6 +58148,16 @@ class TestHeavyCeilings(unittest.TestCase):
         stopped, told, signals = self.orphan(9000, start_of=lambda pid: "c0")
         self.assertIn(4242, {p for p, _s in signals})
 
+    def test_m3_a_report_hook_that_fails_before_the_stop_is_said_and_the_run_is_stopped_all_the_same(self):
+        self.signals, self.exited, self.out = BoundedList(), threading.Event(), BoundedOut()
+
+        def broken(phase, info, holder, lane):
+            raise RuntimeError("the hook is broken")
+        code, _seen = self.drive(self.RUNNABLE["full"], [5401], on_stop=broken)
+        self.assertEqual(code, 124)
+        self.assertTrue(self.signals)
+        self.assertEqual(self.out.getvalue().count("the stop report failed (RuntimeError: the hook is broken)"), 2, "said for the decided phase and for the told phase")
+
     def test_a_tick_that_does_not_stop_marks_nothing_and_the_next_stop_audits_and_tells_once(self):
         """The two checkers (the daemon and a waiting wrapper) meet: a tick whose stop does not happen must leave the run unreported."""
         for case in ("the orphan lock is busy", "the holders are not seen twice", "the slot changed hands"):
