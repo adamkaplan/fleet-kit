@@ -97,6 +97,17 @@ def _load(name, path):
 
 
 sb = _load("t_fleet_switchboard", SWITCHBOARD)
+
+
+def set_retired(state, retired):
+    """A test sets the retired map: in the registry when it exists (the record), and in retired.json (its derived copy), as the registry itself would."""
+    state = Path(state)
+    (state / "retired.json").write_text(json.dumps(retired))
+    path = state / "registry.json"
+    if path.exists():
+        doc = json.loads(path.read_text())
+        doc["retired"] = retired
+        path.write_text(json.dumps(doc))
 sc = _load("t_fleet_scenario", SCENARIO)
 
 
@@ -249,7 +260,7 @@ class TestConfig(Base):
         self.assertFalse(self.config_file.exists())
         self.assertEqual(sb.load_config(), {
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
-            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "send_timeout_seconds": 60, "poll_seconds": 5,
+            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "clear_remind_minutes": 15, "send_timeout_seconds": 60, "poll_seconds": 5,
             "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "launch_default": "headless",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
@@ -4828,7 +4839,7 @@ class TestLaunch(Base):
 
     def test_a_retired_listing_is_dropped_from_status_after_the_show_days(self):
         day = 86400
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"fresh": {"at": 1000, "by": "x", "reason": "y", "session": "s", "auto": False},
+        set_retired(self.world.state, {"fresh": {"at": 1000, "by": "x", "reason": "y", "session": "s", "auto": False},
                                                             "stale": {"at": 1000 - 1, "by": "x", "reason": "y", "session": "s", "auto": False}})
         inside = sb.pane_health_status_lines(self.world.state, 1000 + sb.RETIRED_SHOW_DAYS * day)          # fresh is exactly at the edge, stale just past it
         self.assertTrue(inside and "fresh" in inside[0] and "stale" not in inside[0])
@@ -4873,7 +4884,7 @@ class TestLaunch(Base):
         self.assertEqual(sorted(sb.prune_retired(old, 10 ** 9 + 5)), ["y"])
         self.as_("boss")
         self.health()
-        with mock.patch.object(sb, "_write_small", side_effect=OSError(28, "No space left")):
+        with mock.patch.object(sb.load_module("registry"), "_write_atomic", side_effect=OSError(28, "No space left")):
             code, out, err = self.run_cli("retire", "worker")
         self.assertNotEqual(code, 0)
         self.assertIn("was not retired, try again", err)
@@ -4883,7 +4894,7 @@ class TestLaunch(Base):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         self.worker()
         self.health()
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"worker": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "ses_an_old_one", "auto": False}})
+        set_retired(self.world.state, {"worker": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "ses_an_old_one", "auto": False}})
         self.kill("worker")
         for n in range(sb.PANE_MISSING_PASSES):
             self.health(n)
@@ -5073,7 +5084,7 @@ class TestLaunch(Base):
         sb.register_worktree(self.world.state, str(live_wt), "boss", None, "w-live", 1)            # an agent that is NOT retired
         sb.register_worktree(self.world.state, str(gone_wt), "worker", None, "w-gone", 1)
         self.git(self.repo_main, "worktree", "remove", str(gone_wt))                                # already deleted by hand
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"worker": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "s", "auto": False}})
+        set_retired(self.world.state, {"worker": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "s", "auto": False}})
         os.environ["HERDR_PANE_ID"] = self.world.panes["stranger"]
         code, out, err = self.run_cli("disk", "reclaim-worktrees")
         self.assertEqual(code, 0, err)
@@ -5257,9 +5268,9 @@ class TestLaunch(Base):
         status, line = sb.reclaim_worktree(engine, subprocess.run, str(wt), {"agent": "worker"}, True)
         self.assertEqual((status, wt.exists()), ("kept", True), line)
         self.assertIn("runs in it", line)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"elsewhere": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "s", "auto": False}})
+        set_retired(self.world.state, {"elsewhere": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "s", "auto": False}})
         self.assertIsNone(sb.worktree_in_use(engine, str(wt)), "a retired agent's session no longer holds it")
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {})
+        set_retired(self.world.state, {})
         self.world.v2.sessions[self.world.sessions["elsewhere"]]["directory"] = str(wt) + "2"        # a sibling sharing a name prefix
         self.assertIsNone(sb.worktree_in_use(engine, str(wt)))
         with mock.patch.object(sb.V2Client, "session_list_page", side_effect=sb.V2Error("timeout", None, "slow")):
@@ -5875,12 +5886,17 @@ class TestLaunch(Base):
             data["states"][n] = {"state": "unknown", "session": "ses_" + n}
         data["agents"]["relaunch"] = row("ses_new", "orchestrator")      # retired under an OLD session, running again under a new one
         sb.write_pane_health(self.world.state, data)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {**{n: self.retired_entry("ses_" + n) for n in ("r1", "r2", "r3")},
-                                                            "relaunch": self.retired_entry("ses_old")})
+        reg = sb.load_module("registry")                                 # the agent list is the registry's: the rows and the retirements go there
+        for n in ("r1", "r2", "r3"):
+            reg.upsert(self.world.state, n, data["agents"][n], now=int(self.world.clock.now()))
+            reg.retire(self.world.state, n, "x", "finished", now=int(self.world.clock.now()))
+        reg.upsert(self.world.state, "relaunch", {"session": "ses_old", "pane": "w1:p9"}, now=int(self.world.clock.now()))
+        reg.retire(self.world.state, "relaunch", "x", "finished", now=int(self.world.clock.now()))
+        reg.upsert(self.world.state, "relaunch", data["agents"]["relaunch"], now=int(self.world.clock.now()))
         self.health(1)
         agents = sb.read_pane_health(self.world.state)
         self.assertEqual(sorted(agents["agents"]), ["coder", "platform", "relaunch"])
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"platform": self.retired_entry(None), "coder": self.retired_entry(None)})   # a record with NO session covers nothing
+        set_retired(self.world.state, {"platform": self.retired_entry(None), "coder": self.retired_entry(None)})   # a record with NO session covers nothing
         self.health(2)
         self.assertEqual(sorted(sb.read_pane_health(self.world.state)["agents"]), ["coder", "platform", "relaunch"])
         self.assertFalse(sb.retired_agent({"x": {"session": None}}, "x", None))
@@ -5905,14 +5921,16 @@ class TestLaunch(Base):
         data = sb.read_pane_health(self.world.state)
         data["agents"]["old"] = {"session": "ses_old", "pane": "w1:p9", "role": "orchestrator", "workspace": "w9"}
         sb.write_pane_health(self.world.state, data)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"old": self.retired_entry("ses_old")})
+        sb.load_module("registry").upsert(self.world.state, "old", data["agents"]["old"])
+        set_retired(self.world.state, {"old": self.retired_entry("ses_old")})
         path = self.world.state / sb.PANE_HEALTH_FILE
         before = path.read_bytes()
         discovery = self.engine.discover(self.world.clock.now())
         discovery.problems = ["list not whole"]                         # the agent list is a half-read
         sb.pane_health_pass(self.engine, self.world.clock.now() + 1)
         self.assertEqual(path.read_bytes(), before)
-        with mock.patch.object(sb, "read_retired_strict", side_effect=sb.RetiredUnreadable("half")):   # the retired list is a half-read, yet `read_retired` still names "old"
+        reg = sb.load_module("registry")
+        with mock.patch.object(reg, "read", return_value=reg._empty(False, "half")):   # the registry read is not whole: the pass acts on nothing
             self.health(2)
         self.assertIn("old", sb.read_pane_health(self.world.state)["agents"])
         self.health(3)                                                   # a whole read prunes it
@@ -5954,6 +5972,84 @@ class TestLaunch(Base):
         self.assertEqual(code, 0, err)
         self.assertEqual(json.loads(out)["session"], session)
         self.assertEqual(sb.read_pane_health(self.world.state)["agents"].get("worker", {}).get("workspace"), before["workspace"])   # --undo put the whole record back
+
+    def test_the_pass_drops_the_state_of_an_orphan_and_keeps_a_listed_undiscovered_a_discovered_unlisted_and_a_cloud_name(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.engine.state_dir = self.world.state
+        self.health()
+        now, reg = int(self.world.clock.now()), sb.load_module("registry")
+        reg.upsert(self.world.state, "gone", {"session": "ses_gone", "pane": "w1:p9", "state": "dead"}, now=now)            # listed, not discovered: a dead agent's alert
+        reg.upsert(self.world.state, "pod1", {"session": "ses_pod", "kind": "cloud", "run_id": "run_example"}, now=now)    # a cloud row: no pane state
+        data = sb.read_pane_health(self.world.state)
+        for name in ("orphan", "gone", "nodisc"):
+            data["states"][name] = {"state": sb.PANE_DEAD, "why": "x", "pane": "w1:p9", "session": "ses_" + name, "at": now}
+        data["missing"]["orphan"] = 2
+        sb.write_pane_health(self.world.state, data)
+        self.engine.discover(self.world.clock.now())
+        self.engine.discovery.agents["nodisc"] = sb.Observation("nodisc", "ses_nodisc", None, "idle", {"role": "coder"})   # discovered, with no pane: never listed by the pass
+        sb.pane_health_pass(self.engine, self.world.clock.now() + 1)
+        health = sb.read_pane_health(self.world.state)
+        self.assertNotIn("orphan", health["states"])                    # in neither the registry nor discovery: dropped, with its missing count
+        self.assertNotIn("orphan", health["missing"])
+        self.assertEqual(health["states"]["gone"]["state"], sb.PANE_DEAD)   # the dead agent's state stays: its alert is read from it
+        self.assertIn("gone", self.engine.pane_alerts)
+        self.assertIn("nodisc", health["states"])                       # discovered: kept
+        self.assertNotIn("pod1", health["states"])                      # a cloud row has no pane state, and the registry keeps it
+        self.assertEqual(reg.get(self.world.state, "pod1")["run_id"], "run_example")
+
+    def test_s5_the_registry_gives_reattach_retire_undo_and_the_cloud_log_read_the_same_results_with_a_clean_environment(self):
+        for key in [k for k in os.environ if k.startswith(("HERDR_", "OPENCODE_")) and k != "HERDR_PANE_ID"]:
+            self.addCleanup(os.environ.__setitem__, key, os.environ[key])
+            del os.environ[key]
+        self.addCleanup(os.environ.pop, "HERDR_WORKSPACE_ID", None)
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.worker()
+        self.health()
+        session = self.world.sessions["worker"]
+        reg = sb.load_module("registry")
+        self.assertEqual(reg.get(self.world.state, "worker")["session"], session)            # the pass registered it
+        self.assertEqual(reg.get(self.world.state, "worker")["workspace"], sb.read_pane_health(self.world.state)["agents"]["worker"]["workspace"])
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "worker", "--reason", "done")[0], 0)
+        self.assertNotIn("worker", reg.read(self.world.state)["agents"])
+        self.assertEqual(sb.known_agent(self.world.state, "worker")["session"], session)   # what the cloud log read finds
+        self.kill("worker")
+        self.health(1)
+        self.assertEqual(self.run_cli("retire", "--undo", "worker")[0], 0)
+        self.assertEqual(reg.get(self.world.state, "worker")["session"], session)
+        code, out, err = self.run_cli("reattach", "worker")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["session"], session)
+
+    def test_a_registry_that_is_not_whole_makes_reattach_retire_and_the_close_guard_change_nothing(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.worker()
+        self.health()
+        text = json.dumps({"version": 7, "agents": {}, "retired": {}})
+        (self.world.state / "registry.json").write_text(text)
+        self.as_("boss")
+        for argv in (("retire", "worker"), ("reattach", "worker"), ("retire", "worker", "--close")):
+            with self.subTest(argv=argv):
+                code, out, err = self.run_cli(*argv)
+                self.assertNotEqual(code, 0)
+                self.assertIn("registry", err)
+        discovery = self.engine.discover(self.world.clock.now())
+        pane, why = sb.retire_close_problem(self.engine, self.world.route, self.world.clock.now, discovery, "worker", discovery.agents["worker"], False)
+        self.assertEqual(pane, None)
+        self.assertIn("registry cannot be read", why)
+        before = (self.world.state / "pane-health.json").read_bytes()
+        self.health(5)                                                       # the pass acts on nothing either
+        self.assertEqual((self.world.state / "registry.json").read_text(), text)
+        self.assertEqual((self.world.state / "pane-health.json").read_bytes(), before)
+
+    def test_a_cloud_worker_in_the_registry_is_never_judged_by_the_pane_pass(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        reg = sb.load_module("registry")
+        reg.upsert(self.world.state, "pod1", {"session": "ses_pod", "repo": "acme-org/widget-service", "kind": "cloud", "run_id": "run_example"})
+        for n in range(sb.PANE_MISSING_PASSES + 1):
+            self.health(n)
+        self.assertEqual(reg.get(self.world.state, "pod1")["run_id"], "run_example")
+        self.assertNotIn("pod1", sb.read_pane_health(self.world.state)["states"])
 
     def test_reattach_by_a_dead_panes_remembered_record_and_it_refuses_when_the_session_is_gone(self):
         os.environ["HERDR_WORKSPACE_ID"] = "w1"
@@ -14147,7 +14243,9 @@ class TestClearNotice(Base):
 
     def route(self, argv, **kwargs):
         if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
-            raw = {"state": "OPEN", "headRefOid": self.head, "title": "t", "labels": [{"name": n} for n in self.labels], "body": self.body}
+            if getattr(self, "unreadable", False):
+                return subprocess.CompletedProcess(argv, 1, "", "HTTP 502")
+            raw = {"state": getattr(self, "pr_state", "OPEN"), "headRefOid": self.head, "title": "t", "labels": [{"name": n} for n in self.labels], "body": self.body}
             return subprocess.CompletedProcess(argv, 0, json.dumps(raw), "")
         if argv[0] == FAKE_GH and argv[1] == "api" and "--method" in argv:
             self.order.append(argv[argv.index("--method") + 1] + " " + argv[2].rsplit("/", 1)[-1])
@@ -14415,6 +14513,346 @@ class TestClearNotice(Base):
         self.clear()
         (cleared,) = self.events("gate.hold_cleared")
         self.assertEqual(cleared["detail"]["removed"], [self.names["hold-impact"], self.names["merge-captain"]], "#742: the author's merge label comes off with the clear")
+
+
+    # ---- #827: a recorded clear's notice is never lost: pending record, the daemon pass, one reminder
+
+    def pending(self):
+        return sb._read_small(self.world.state, sb.CLEAR_PENDING_FILE)
+
+    def delivered(self):
+        return sb._read_small(self.world.state, sb.CLEAR_NOTIFIED_FILE)
+
+    def later(self, seconds=sb.CLEAR_NOTICE_CLAIM_SECONDS + 1):
+        self.world.clock.t += seconds
+        return self.world.clock.now()
+
+    def pass_(self, seconds=None):
+        sb.clear_notice_pass(self.engine, self.later() if seconds is None else self.later(seconds))
+
+    def block_sends(self):
+        """Every send blocks until released: the notice times out at the deadline, as a slow send does under load. Returns the event."""
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self.real_send = self.engine.send
+        self.send_returned = []
+
+        def slow(*a, **k):
+            release.wait(30)   # only a safety: the tests release it themselves
+            self.send_returned.append(1)
+            return self.real_send(*a, **k)
+        self.engine.send = slow
+        return release
+
+    def settle(self):
+        for late in [t for t in threading.enumerate() if t.name == "clear-notice"]:
+            late.join(5)
+
+    def test_s2_a_notice_that_times_out_is_pending_the_command_says_queued_and_the_next_pass_delivers_it_exactly_once(self):
+        release = self.block_sends()
+        with mock.patch.object(sb, "NOTIFY_CLEAR_DEADLINE_SECONDS", 0.05):
+            lines = self.clear()
+        self.assertEqual((release.is_set(), self.send_returned), (False, []), "the command returned while the send was still blocked: it did not wait for it (no clock)")
+        self.assertTrue(any("queued for delivery" in l for l in lines), lines)
+        key = sb._clear_notice_key(self.REPO, 7, self.HEAD, "clear")
+        self.assertIn(key, self.pending())
+        self.assertNotIn(key, self.delivered())
+        release.set()
+        self.settle()   # the late thread of the command may finish its own sends: it is the same record, told once
+        self.engine.send = self.real_send
+        self.pass_()
+        self.pass_()
+        self.assertEqual(len(self.told("cos")), 1)
+        self.assertEqual(self.pending(), {})
+        self.assertIn(key, self.delivered())
+
+    def test_s2_a_notice_cut_off_with_the_process_is_delivered_by_the_pass_to_both_recipients(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        self.engine.send = lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt())   # the process dies in the first send
+        self.clear()
+        key = sb._clear_notice_key(self.REPO, 7, self.HEAD, "clear")
+        self.assertIn(key, self.pending())
+        self.assertEqual((self.told("cos"), self.told("orch-a")), ([], []))
+        self.engine.send = self.world.new_engine("daemon").send
+        self.pass_()
+        self.assertEqual((len(self.told("cos")), len(self.told("orch-a"))), (1, 1))
+        self.assertEqual(self.pending(), {})
+
+    def test_s3_a_delivered_notice_is_never_repeated_and_only_the_recipient_not_yet_told_is_told_on_a_retry(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        real = self.engine.send
+        self.engine.send = lambda s, r, t, **k: {"sent": False, "reason": "down"} if r == "orch-a" else real(s, r, t, **k)
+        self.clear()
+        key = sb._clear_notice_key(self.REPO, 7, self.HEAD, "clear")
+        self.assertEqual(self.pending()[key]["sent"], ["chief-of-staff"])
+        self.engine.send = real
+        self.pass_()
+        self.pass_()
+        self.pass_()
+        self.assertEqual((len(self.told("cos")), len(self.told("orch-a"))), (1, 1), "cos was told once, the lane once")
+        self.assertEqual(self.pending(), {})
+        sb.notify_clear(self.engine, "clear", self.REPO, 7, self.HEAD, reason="again", body="")
+        self.assertEqual((len(self.told("cos")), len(self.told("orch-a"))), (1, 1), "a delivered notice is not made again")
+
+    def make_pending(self, kind):
+        """One pending notice of `kind`, made by the real `notify_clear` with a send that fails; every kind of `sb.CLEAR_NOTICE_KINDS` has its own call."""
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        extra = {"clear": dict(reason="a fixture"), "carry": dict(previous="f" * 40)}[kind]
+        sb.notify_clear(self.engine, kind, self.REPO, 7, self.HEAD, body="", **extra)
+        self.assertEqual(list(self.pending()), [sb._clear_notice_key(self.REPO, 7, self.HEAD, kind)])
+        self.engine.send = self.world.new_engine("daemon").send
+
+    def test_the_kinds_table_is_complete_derived_from_the_callers(self):
+        import ast
+        seen = set()
+        for path in (BIN / "fleet-switchboard", BIN / "impact_hold.py"):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "notify_clear" and len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
+                    seen.add(node.args[1].value)
+        self.assertEqual(seen, set(sb.CLEAR_NOTICE_KINDS), "every kind a caller notifies is in the table, and the table holds no other")
+        sb.clear_notice_record(self.engine, "nonsense", self.REPO, 7, self.HEAD)
+        self.assertEqual(self.pending(), {}, "a kind outside the table is never recorded")
+
+    def test_s4_for_every_kind_a_pull_request_merged_or_closed_or_with_a_new_head_drops_the_pending_record_and_sends_nothing(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            for label, state, head in (("merged", "MERGED", self.HEAD), ("closed", "CLOSED", self.HEAD), ("head changed", "OPEN", "b" * 40)):
+                with self.subTest(kind=kind, why=label):
+                    self.setUp()
+                    self.make_pending(kind)
+                    self.pr_state, self.head = state, head
+                    self.pass_()
+                    self.assertEqual(self.pending(), {})
+                    self.assertEqual(self.world.admissions("cos"), [])
+                    (event,) = self.events("gate.clear_notice_dropped")
+                    self.assertTrue(event["detail"]["why"], label)
+
+    def test_s8_for_every_kind_a_pull_request_that_cannot_be_read_whole_keeps_the_record_and_sends_nothing(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            with self.subTest(kind=kind):
+                self.setUp()
+                self.make_pending(kind)
+                self.unreadable = True
+                self.pass_()
+                self.assertEqual(len(self.pending()), 1)
+                self.assertEqual((self.world.admissions("cos"), self.events("gate.clear_notice_dropped")), ([], []))
+                self.unreadable = False
+                self.pass_()
+                self.assertEqual((len(self.world.admissions("cos")), self.pending()), (1, {}))
+
+    def test_s2_for_every_kind_and_the_standing_order_variant_a_failed_notice_is_pending_and_the_pass_delivers_it_once(self):
+        order = {"number": 5, "text": "clear fixtures", "by": "cos"}
+        paths = [(kind, {}) for kind in sb.CLEAR_NOTICE_KINDS] + [("clear", {"under_order": order})]
+        for kind, extra in paths:
+            with self.subTest(kind=kind, extra=sorted(extra)):
+                self.setUp()
+                self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+                kw = dict(extra, **({"previous": "f" * 40} if kind == "carry" else {"reason": "a fixture"}))
+                sb.notify_clear(self.engine, kind, self.REPO, 7, self.HEAD, body="", **kw)
+                self.assertIn(sb._clear_notice_key(self.REPO, 7, self.HEAD, kind), self.pending())
+                self.engine.send = self.world.new_engine("daemon").send
+                self.pass_()
+                self.pass_()
+                (told,) = self.world.admissions("cos")
+                self.assertEqual(self.pending(), {})
+                self.assertIn(self.HEAD[:8], told["text"])
+                self.assertEqual(("under the owner's standing order" in told["text"], "carried" in told["text"]), (bool(extra), kind == "carry"))
+
+    def test_the_notice_wording_is_the_same_whether_the_command_or_the_pass_sends_it(self):
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        self.clear(reason="the same words")
+        self.engine.send = self.world.new_engine("daemon").send
+        self.pass_()
+        (line,) = self.told("cos")
+        self.assertTrue(line.startswith('owner cleared %s at %s: "the same words"; ' % (self.PR, "a" * 8)), line)
+
+    def test_a_token_in_the_reason_is_never_written_to_the_pending_file(self):
+        token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0" * 2
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        self.clear(reason="x " + token)
+        self.assertNotIn("a1B2c3D4e5F6g7H8i9J0", (Path(self.world.state) / sb.CLEAR_PENDING_FILE).read_text())
+
+    # -- the one reminder
+
+    def ready_pr(self, mergeable="MERGEABLE", ready=True, state="open", head=None, examined=None, whole=True):
+        picture = self.engine.__dict__.setdefault("ci_record_state", sb.CiRecordState())
+        head = head or self.HEAD
+        picture.pr_state["%s#7" % self.REPO] = {"state": state, "head": head, "mergeable": mergeable, "gates": {"ready": ready, "missing": []}, "examined_head": examined or head}
+        sb.read_mark(self.engine, "pulls:" + self.REPO, whole, "" if whole else "cut", self.world.clock.now())
+
+    def reminders(self):
+        return [a for a in self.world.admissions("orch-a") if "cleared, merge it" in a["text"]]
+
+    def test_s6_one_reminder_per_head_after_the_delay_and_a_new_cleared_head_gets_its_own(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        self.clear()
+        self.ready_pr()
+        self.pass_(14 * 60 - sb.CLEAR_NOTICE_CLAIM_SECONDS - 1)
+        self.assertEqual(self.reminders(), [], "not before clear_remind_minutes")
+        self.pass_(120)
+        self.pass_()
+        self.pass_()
+        self.assertEqual(len(self.reminders()), 1)
+        self.head = "c" * 40
+        self.clear()
+        self.ready_pr(head="c" * 40)
+        self.pass_(15 * 60)
+        self.pass_()
+        self.assertEqual(len(self.reminders()), 2)
+
+    def count_sends(self, only=None, to=None):
+        """Wrap the engine's send: every call to it is counted (the ones whose text holds `only`, when given); a send that always fails. Returns the list of calls."""
+        calls = []
+
+        def down(sender, recipient, text, **kw):
+            if (only is None or only in text) and (to is None or recipient == to):
+                calls.append(self.world.clock.now())
+                return {"sent": False, "reason": "down"}
+            return self.real_send(sender, recipient, text, **kw)
+        self.real_send = self.world.new_engine("daemon").send
+        self.engine.send = down
+        return calls
+
+    def run_cadence(self, seconds, step=5):
+        """The daemon's REAL pass cadence: a pass every `step` seconds of the fake clock for `seconds` (never one jump per pass)."""
+        for _ in range(seconds // step):
+            sb.clear_notice_pass(self.engine, self.later(step))
+
+    def test_s3_for_every_kind_a_lane_that_is_down_for_ten_minutes_still_gets_the_notice_when_it_is_back_and_the_retries_are_spaced(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            with self.subTest(kind=kind):
+                self.setUp()
+                calls = self.count_sends(to="chief-of-staff")
+                extra = {"clear": dict(reason="a fixture"), "carry": dict(previous="f" * 40)}[kind]
+                sb.notify_clear(self.engine, kind, self.REPO, 7, self.HEAD, body="", **extra)
+                self.assertEqual(len(calls), 1, "the command tries once")
+                self.run_cadence(55)
+                self.assertEqual(len(calls), 1, "nothing is retried in the first minute: the 5 s passes do not spend the tries")
+                self.run_cadence(545)   # ten minutes in all
+                self.assertEqual(len(calls), 1 + len(sb.CLEAR_NOTICE_BACKOFF[:3]), "retries after the backoff steps (1, 2 and 5 minutes), not one per pass")
+                self.assertEqual(len(self.pending()), 1, "ten minutes down: still pending, not given up")
+                self.assertEqual(self.events("gate.clear_notice_abandoned"), [])
+                self.engine.send = self.real_send   # the lane is back
+                self.run_cadence(sb.CLEAR_NOTICE_BACKOFF[3] + 5)
+                self.assertEqual(self.pending(), {})
+                self.assertEqual(len(self.world.admissions("cos")), 1, "told once")
+
+    def test_s3_for_every_kind_a_notice_pending_for_longer_than_the_age_bound_is_given_up_loudly_never_by_a_count(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            with self.subTest(kind=kind):
+                self.setUp()
+                calls = self.count_sends(to="chief-of-staff")
+                extra = {"clear": dict(reason="a fixture"), "carry": dict(previous="f" * 40)}[kind]
+                sb.notify_clear(self.engine, kind, self.REPO, 7, self.HEAD, body="", **extra)
+                self.run_cadence(3600)
+                self.assertEqual(len(self.pending()), 1, "an hour of failures is not a reason to give up")
+                before = len(calls)
+                sb.clear_notice_pass(self.engine, self.later(sb.CLEAR_NOTICE_MAX_AGE_SECONDS))
+                (event,) = self.events("gate.clear_notice_abandoned")
+                self.assertIn("gave up", event["detail"]["why"])
+                self.assertEqual((self.pending(), len(calls)), ({}, before))
+
+    def test_a_malformed_pending_entry_is_quarantined_and_the_notices_after_it_are_still_delivered(self):
+        self.make_pending("clear")
+        pending = self.pending()
+        (good,) = pending
+        for label, bad in {"at": {"at": "x"}, "claimed": {"claimed": "y"}, "next_at": {"next_at": []}, "not a notice": {"kind": "nope"}, "under_order": {"under_order": 3}}.items():
+            with self.subTest(label):
+                poisoned = dict(pending, poison=dict(dict(pending[good], number=9), **bad))
+                poisoned["poison"]["at"] = poisoned["poison"].get("at", 0)
+                sb._write_small(self.world.state, sb.CLEAR_PENDING_FILE, poisoned)
+                sb.clear_notice_pass(self.engine, self.later())
+                self.assertEqual(self.pending(), {}, "the good one is delivered and the poison is gone")
+                self.assertTrue(self.events("gate.clear_notice_quarantined"))
+                self.world.admissions("cos").clear() if False else None
+                self.setUp()
+                self.make_pending("clear")
+                pending = self.pending()
+                (good,) = pending
+
+    def test_the_cap_of_pending_notices_audits_what_it_drops(self):
+        filler = {sb._clear_notice_key(self.REPO, 100 + i, "e" * 40, "clear"): {"repo": self.REPO, "number": 100 + i, "head": "e" * 40, "kind": "clear", "at": i + 1, "claimed": 0, "attempts": 0, "sent": []} for i in range(sb.CLEAR_PENDING_MAX)}
+        sb._write_small(self.world.state, sb.CLEAR_PENDING_FILE, filler)
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        sb.notify_clear(self.engine, "clear", self.REPO, 7, self.HEAD, reason="x", body="")
+        self.assertEqual(len(self.pending()), sb.CLEAR_PENDING_MAX)
+        (event,) = self.events("gate.clear_notice_dropped_cap")
+        self.assertIn("oldest", event["detail"]["why"])
+
+    def test_a_corrupt_pending_file_is_kept_aside_and_audited_never_overwritten_silently(self):
+        path = Path(self.world.state) / sb.CLEAR_PENDING_FILE
+        path.write_text("{ this is not json")
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        sb.notify_clear(self.engine, "clear", self.REPO, 7, self.HEAD, reason="x", body="")
+        self.assertEqual(Path(str(path) + ".corrupt").read_text(), "{ this is not json")
+        self.assertTrue(self.events("gate.clear_notice_corrupt"))
+        self.assertEqual(len(self.pending()), 1, "the new notice is recorded in a fresh file")
+
+    def test_one_pull_request_is_read_once_per_pass_however_many_notices_are_pending_for_it(self):
+        self.make_pending("clear")
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        sb.notify_clear(self.engine, "carry", self.REPO, 7, self.HEAD, body="", previous="f" * 40)
+        self.engine.send = self.world.new_engine("daemon").send
+        self.assertEqual(len(self.pending()), 2)
+        self.later()
+        reads = []
+        real = sb.read_pr_json
+        with mock.patch.object(sb, "read_pr_json", side_effect=lambda *a, **k: (reads.append(1), real(*a, **k))[1]):
+            sb.clear_notice_pass(self.engine, self.later())
+        self.assertEqual(len(reads), 1)
+
+    def test_a_reminder_send_that_always_fails_is_spaced_by_the_backoff_given_up_only_by_age_and_never_recorded_as_sent(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        self.clear()
+        self.ready_pr()
+        calls = self.count_sends(only="cleared, merge it")
+        self.run_cadence(15 * 60)
+        first = len(calls)
+        self.assertEqual(first, 1, "the first reminder is tried once at the delay")
+        self.run_cadence(10 * 60)
+        self.assertEqual(len(calls), 1 + len(sb.CLEAR_NOTICE_BACKOFF[:3]) - 1 + (1 if sb.CLEAR_NOTICE_BACKOFF[0] + sb.CLEAR_NOTICE_BACKOFF[1] + sb.CLEAR_NOTICE_BACKOFF[2] <= 10 * 60 else 0), "spaced by the backoff, not one per pass")
+        self.assertEqual(self.events("gate.clear_remind_abandoned"), [])
+        sb.clear_notice_pass(self.engine, self.later(sb.CLEAR_NOTICE_MAX_AGE_SECONDS))
+        self.assertEqual(self.events("gate.clear_reminded"), [], "a reminder that was never delivered is not recorded as sent")
+        (event,) = self.events("gate.clear_remind_abandoned")
+        self.assertIn("down", event["detail"]["error"])
+
+    def test_s7_no_reminder_when_not_mergeable_not_ready_not_open_at_the_cleared_head_or_not_examined_there(self):
+        cases = {"conflicting": dict(mergeable="CONFLICTING"), "gates not ready": dict(ready=False), "draft": dict(state="draft"), "gone": dict(state="gone"),
+                 "head moved": dict(head="d" * 40, examined="d" * 40), "not examined at the head": dict(examined="d" * 40)}
+        for label, kw in cases.items():
+            with self.subTest(label):
+                self.setUp()
+                sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+                self.clear()
+                self.ready_pr(**kw)
+                self.pass_(16 * 60)
+                self.assertEqual(self.reminders(), [], label)
+
+    def test_s8_a_list_that_is_not_whole_gives_no_reminder_and_the_reminder_comes_when_it_is(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        self.clear()
+        self.ready_pr(whole=False)
+        self.pass_(16 * 60)
+        self.assertEqual(self.reminders(), [])
+        self.ready_pr()
+        self.pass_()
+        self.assertEqual(len(self.reminders()), 1)
+
+    def test_a_lane_that_cannot_be_resolved_is_not_guessed_and_nobody_is_reminded(self):
+        self.body = "no plan here\n"
+        self.no_ledger_plan()
+        self.clear()
+        self.ready_pr()
+        self.pass_(16 * 60)
+        self.assertEqual([a for n in ("orch-a", "orch-b", "worker") for a in self.world.admissions(n) if "cleared, merge it" in a["text"]], [])
+        self.assertEqual(len(self.events("gate.clear_remind_skipped")), 1)
+
+    def test_the_remind_delay_is_a_configuration_key_with_a_default_of_15(self):
+        self.assertEqual(sb.DEFAULTS["clear_remind_minutes"], 15)
+        self.assertEqual(sb.validate_config({"clear_remind_minutes": 5})["clear_remind_minutes"], 5)
+        for bad in (0, -1, "x", True):
+            with self.subTest(bad), self.assertRaises(sb.ConfigError):
+                sb.validate_config({"clear_remind_minutes": bad})
 
 
 class TestClearRemovesTheAuthorsHold(Base):
@@ -22900,9 +23338,9 @@ class TestIdleAtASeam(WaitingInputs, ReportBase):
 
     def test_a_retired_worker_gets_nothing_and_another_name_does_not_silence_it(self):
         self.idle_after("working")
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"other": {"at": 1, "by": "x", "reason": "y", "session": None, "auto": False}})
+        set_retired(self.world.state, {"other": {"at": 1, "by": "x", "reason": "y", "session": None, "auto": False}})
         self.assertEqual(len(self.seam(self.derive())), 2)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"coder": {"at": 1, "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
+        set_retired(self.world.state, {"coder": {"at": 1, "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
         self.assertEqual(self.seam(self.derive()), [])
 
     def test_a_worker_that_resumes_and_idles_again_starts_a_new_stretch_with_its_own_clock(self):
@@ -23101,7 +23539,7 @@ class TestStalledWorking(WaitingInputs, ReportBase):
     def test_a_retired_worker_gets_none(self):
         self.late()
         self.assertEqual(len(self.stalled()), 1)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"coder": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
+        set_retired(self.world.state, {"coder": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
         self.assertEqual(self.stalled(), [])
 
     def test_an_idle_worker_is_the_seam_rules_alone(self):
@@ -27042,6 +27480,37 @@ class TestCaptainSweepFindings(TestSweep):
         self.sweep()
         self.assertEqual(self.found(), [("S6a", "acme/api#40"), ("S6b", "acme/api#41"), ("S6b", "acme/api#42")])
 
+    def test_s6b_a_recorded_clear_at_the_current_head_makes_the_leftover_author_label_agree_with_an_automatic_line(self):
+        captain = self.USER.replace("awaiting-user", "merge-captain")
+        head, other = "a" * 40, "b" * 40
+        picture = self.engine.__dict__.setdefault("ci_record_state", sb.CiRecordState())
+        self.engine.state_dir = self.world.state
+        state = {"clears": {"acme/api#50": {"head": head, "by": "owner", "at": 1}, "acme/api#51": {"head": other, "by": "owner", "at": 1}}, "applied": {}}
+        sb.write_impact_state(self.world.state, state)
+        for number in (50, 51, 52, 53):
+            picture.pr_state["acme/api#%d" % number] = {"state": "open", "head": head}
+        picture.pr_state["acme/api#53"] = {"state": "open"}   # head unknown: agrees with nothing
+        self.hub.open = {50: sweep_issue(50, "MERGE: automatic\nx", [captain], pr=True),   # cleared at this head
+                         51: sweep_issue(51, "MERGE: automatic\nx", [captain], pr=True),   # cleared at ANOTHER head
+                         52: sweep_issue(52, "MERGE: automatic\nx", [captain], pr=True),   # never cleared
+                         53: sweep_issue(53, "MERGE: automatic\nx", [captain], pr=True)}   # cleared? no: head unknown
+        sb.write_impact_state(self.world.state, dict(state, clears=dict(state["clears"], **{"acme/api#53": {"head": head, "by": "owner", "at": 1}})))
+        self.sweep()
+        self.sweep()
+        self.assertEqual(self.found(), [("S6b", "acme/api#51"), ("S6b", "acme/api#52"), ("S6b", "acme/api#53")])
+
+    def test_s6b_the_clear_only_excuses_a_captain_label_beside_an_automatic_line(self):
+        automatic = self.USER.replace("awaiting-user", "merge-automatic")
+        head = "a" * 40
+        picture = self.engine.__dict__.setdefault("ci_record_state", sb.CiRecordState())
+        self.engine.state_dir = self.world.state
+        sb.write_impact_state(self.world.state, {"clears": {"acme/api#60": {"head": head, "by": "owner", "at": 1}}, "applied": {}})
+        picture.pr_state["acme/api#60"] = {"state": "open", "head": head}
+        self.hub.open = {60: sweep_issue(60, "MERGE: captain\nx", [automatic], pr=True)}   # the other disagreement is not the author's leftover label
+        self.sweep()
+        self.sweep()
+        self.assertEqual(self.found(), [("S6b", "acme/api#60")])
+
     def test_s9_a_merge_or_hold_label_left_on_a_merged_or_closed_pr_is_flagged_and_nothing_is_removed(self):
         captain = self.USER.replace("awaiting-user", "merge-captain")
         hold = self.USER.replace("awaiting-user", "hold-impact")
@@ -29477,7 +29946,7 @@ class TestUnreportedStop(ReportBase):
     def retire_entry(self, **fields):
         entry = {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}
         entry.update(fields)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"coder": entry} if entry is not None else {})
+        set_retired(self.world.state, {"coder": entry} if entry is not None else {})
         for source in self.world.engine.sources:                      # a stop is judged once and remembered: forget it so the next look decides afresh
             getattr(source, "_stops", {}).clear()
 
@@ -29493,7 +29962,7 @@ class TestUnreportedStop(ReportBase):
         self.world.engine.state_dir = self.world.state
         self.retire_entry(session="ses_a_session_this_worker_no_longer_has")
         self.assertIn("nudge", [f.kind for f in self.facts()], "a stale retirement of an older session still lets the stop be nudged")
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"someone-else": {"at": 1, "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
+        set_retired(self.world.state, {"someone-else": {"at": 1, "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
         for source in self.world.engine.sources:
             getattr(source, "_stops", {}).clear()
         self.assertIn("nudge", [f.kind for f in self.facts()], "another name's retirement does nothing")
@@ -30485,12 +30954,12 @@ class TestLaunchTesters(LedgerBase):
 
     def test_a_retired_tester_stops_counting_and_is_not_listed(self):
         retired = {"ltst": {"at": 1, "by": "orch", "reason": "done", "session": self.world.sessions["ltst"], "auto": False}}
-        (self.world.state / sb.RETIRED_FILE).write_text(json.dumps(retired))
+        set_retired(self.world.state, retired)
         code, _, err = self.verdict("ltst", "S2", "tester")
         self.assertEqual(code, 2)
         self.assertIn("not registered", err)
         retired["ltst"]["session"] = "ses_an_older_launch"   # a relaunch under the same name is a new session: retirement of the old one does not cover it
-        (self.world.state / sb.RETIRED_FILE).write_text(json.dumps(retired))
+        set_retired(self.world.state, retired)
         self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
         retired["ltst"]["session"] = self.world.sessions["ltst"]
         self.assertEqual(sb.load_launch_testers().launched({"ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"}, "orch": {"role": "orchestrator", "repo": "acme/app"}},
@@ -68662,7 +69131,7 @@ class TestReassign(IntentCase):
         ra = sb.load_module("reassign")
         self.world.add_agent("worker2", fleet={"role": "coder", "issue": 4, "reports_to": "orch-a"})
         self.assertEqual(self.main("reassign", "worker2", "--to", "orch-b", "--consent-from", "orch-a")[0], 0)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"worker2": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
+        set_retired(self.world.state, {"worker2": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
         self.assertEqual(self.reassign()[0], 0)
         self.assertEqual(sorted(ra.read_overrides(self.world.state)[0]), ["worker"], "the retired worker's override is gone")
 
@@ -68706,15 +69175,15 @@ class TestReassign(IntentCase):
         self.assertIn("may not reattach", got["orch-a"])
 
     def test_a_retired_or_excluded_orchestrator_is_refused_as_the_target_and_as_the_consenting_boss(self):
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"orch-b": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
+        set_retired(self.world.state, {"orch-b": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
         code, _, err = self.reassign()
         self.assertEqual(code, 2)
         self.assertIn("the target orch-b is retired", err)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"orch-a": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
+        set_retired(self.world.state, {"orch-a": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
         code, _, err = self.reassign()
         self.assertEqual(code, 2)
         self.assertIn("the consenting boss orch-a is retired", err)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {})
+        set_retired(self.world.state, {})
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO, "excluded_repos": [FAKE_REPO]})
         code, _, err = self.reassign()
         self.assertEqual(code, 2)
@@ -70366,6 +70835,176 @@ class TestMessageTimesDelivery(Base):
         self.assertTrue(self.send("second")["sent"])
         self.assertNotIn("supersedes", self.waiting()[-1].splitlines()[0], "an implausible time is not shown")
         self.assertEqual(sb.clock_utc(1e30), "??:??Z")
+
+
+class TestAgentRegistry(unittest.TestCase):
+    """Slice 2 of #903: bin/registry.py by itself (the frozen interface of docs/agent-registry.md): atomic write, version rule, the fold of today's
+    records, the registry's own check of a removal's evidence. HERDR_* and OPENCODE_* are unset for every test."""
+
+    def setUp(self):
+        for key in [k for k in os.environ if k.startswith(("HERDR_", "OPENCODE_"))]:
+            self.addCleanup(os.environ.__setitem__, key, os.environ[key])
+            del os.environ[key]
+        self.state = Path(tempfile.mkdtemp(prefix="registry-test"))
+        self.addCleanup(shutil.rmtree, str(self.state), True)
+        self.reg = sb.load_module("registry")
+
+    def old_records(self, **extra):
+        row = {"session": "ses_a", "pane": "w1:p1", "role": "coder", "charter": 903, "repo": "acme-org/widget-service",
+               "workspace": "w1", "cwd": "/home/user/work", "seen": 5}
+        (self.state / "pane-health.json").write_text(json.dumps({"agents": {"alpha": dict(row, **extra)}, "states": {"alpha": {"state": "detached"}}, "missing": {}}))
+
+    def test_s8_every_field_the_old_readers_use_is_in_the_registry_after_the_fold(self):
+        self.old_records()
+        row = self.reg.read(self.state)["agents"]["alpha"]
+        for field in ("session", "pane", "role", "charter", "repo", "workspace", "cwd"):
+            with self.subTest(field=field):
+                self.assertEqual(row[field], {"session": "ses_a", "pane": "w1:p1", "role": "coder", "charter": 903, "repo": "acme-org/widget-service",
+                                              "workspace": "w1", "cwd": "/home/user/work"}[field])
+        self.assertEqual((row["state"], row["kind"], row["run_id"]), ("detached", "local", None))
+        self.assertEqual(oct((self.state / "registry.json").stat().st_mode & 0o777), "0o600")
+
+    def test_the_fold_keeps_a_retirement_with_its_record_headless_copy_and_a_cloud_worker_with_its_run_id(self):
+        entry = {"at": int(time.time()), "by": "boss", "reason": "done", "session": "ses_b", "auto": False,
+                 "record": {"pane": "w1:p2", "workspace": "w1", "cwd": "/home/user/b"}, "headless": {"session": "ses_b", "name": "beta"}}
+        (self.state / "retired.json").write_text(json.dumps({"beta": entry}))
+        (self.state / "cloud").mkdir()
+        (self.state / "cloud" / "gamma.json").write_text(json.dumps({"worker": "gamma", "repo": "acme-org/widget-service", "runtime_id": "rt_1", "run_id": "run_example", "session": "ses_c"}))
+        got = self.reg.read(self.state)
+        self.assertEqual(got["retired"]["beta"], entry)
+        self.assertEqual(self.reg.get_retired(self.state, "beta"), entry)
+        self.assertEqual((got["agents"]["gamma"]["kind"], got["agents"]["gamma"]["run_id"], got["agents"]["gamma"]["session"]), ("cloud", "run_example", "ses_c"))
+
+    def test_a_retired_record_with_no_session_covers_nothing_and_known_agent_finds_no_one(self):
+        (self.state / "retired.json").write_text(json.dumps({"beta": {"at": 1, "by": "x", "reason": "r", "session": None, "record": {"pane": "p"}}}))
+        self.assertEqual(sb.known_agent(self.state, "beta"), {})
+        self.assertFalse(self.reg.covers(self.reg.get_retired(self.state, "beta"), None))
+        self.assertTrue(self.reg.upsert(self.state, "beta", {"session": "ses_new", "pane": "p9"})["changed"])   # not refused as retired
+
+    def test_known_agent_reads_a_retired_agents_record_from_the_registry_alone(self):
+        self.assertTrue(self.reg.upsert(self.state, "alpha", {"session": "ses_a", "pane": "w1:p1", "workspace": "w1", "cwd": "/home/user/work", "role": "coder"})["changed"])
+        self.assertTrue(self.reg.retire(self.state, "alpha", "boss", "done")["changed"])
+        self.assertNotIn("alpha", self.reg.read(self.state)["agents"])
+        kept = sb.known_agent(self.state, "alpha")
+        self.assertEqual((kept["session"], kept["workspace"], kept["cwd"]), ("ses_a", "w1", "/home/user/work"))
+        self.assertTrue(self.reg.unretire(self.state, "alpha")["changed"])
+        self.assertEqual(self.reg.get(self.state, "alpha")["workspace"], "w1")
+        self.assertEqual(sb.read_retired(self.state), {})
+
+    def test_a_newer_version_reads_nothing_says_so_and_a_writer_writes_nothing(self):
+        text = json.dumps({"version": 9, "agents": {"a": {"session": "ses_x"}}, "retired": {}})
+        (self.state / "registry.json").write_text(text)
+        got = self.reg.read(self.state)
+        self.assertEqual((got["whole"], got["agents"], got["problem"]), (False, {}, "registry.json is version 9; this reader knows 1: nothing read"))
+        self.assertEqual(self.reg.upsert(self.state, "b", {"session": "ses_y"}), {"changed": False, "problem": got["problem"]})
+        self.assertEqual((self.state / "registry.json").read_text(), text)
+        with self.assertRaises(sb.RetiredUnreadable):
+            sb.read_retired_strict(self.state)
+        for bad in ("{", "[]", '{"version": "1"}', '{"version": 1, "agents": []}'):
+            (self.state / "registry.json").write_text(bad)
+            self.assertFalse(self.reg.read(self.state)["whole"], bad)
+
+    def test_s6_two_writers_and_a_reader_never_see_a_torn_file_in_1000_rounds(self):
+        self.reg.upsert(self.state, "seed", {"session": "ses_seed", "cwd": "x" * 5000})
+        stop, torn = threading.Event(), []
+
+        def write(tag):
+            n = 0
+            while not stop.is_set():
+                n += 1
+                self.reg.upsert(self.state, "w%s" % tag, {"session": "ses_%s_%d" % (tag, n), "cwd": "y" * 3000})
+
+        threads = [threading.Thread(target=write, args=(t,)) for t in "ab"]
+        for t in threads:
+            t.start()
+        try:
+            for _ in range(1000):
+                got = self.reg.read(self.state)
+                if not got["whole"] or "seed" not in got["agents"]:
+                    torn.append(got["problem"])
+        finally:
+            stop.set()
+            for t in threads:
+                t.join()
+        self.assertEqual(torn, [])
+        self.assertEqual([p.name for p in self.state.iterdir() if p.name.endswith(".tmp")], [])
+
+    def test_upsert_with_nothing_changed_writes_and_audits_nothing(self):
+        self.assertTrue(self.reg.upsert(self.state, "a", {"session": "ses_a", "pane": "p1"})["changed"])
+        path = self.state / "registry.json"
+        before = (path.read_bytes(), path.stat().st_mtime_ns, (self.state / "registry-audit.jsonl").read_text())
+        self.assertEqual(self.reg.upsert(self.state, "a", {"session": "ses_a", "pane": "p1"}), {"changed": False, "problem": None})
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, (self.state / "registry-audit.jsonl").read_text()), before)
+
+    def test_reconcile_remove_checks_the_evidence_itself_and_audits_a_removal(self):
+        self.reg.upsert(self.state, "a", {"session": "ses_a", "pane": "p1", "state": "working"})
+        alive = {"pane_listed": True, "process_found": True}
+        self.assertEqual(self.reg.reconcile_remove(self.state, "a", alive, True)["changed"], False)     # whole=True is not enough for a live agent
+        self.assertEqual(self.reg.reconcile_remove(self.state, "a", {"pane_listed": False, "process_found": False}, True)["changed"], False)   # recorded state is not dead
+        self.reg.upsert(self.state, "a", {"session": "ses_a", "pane": "p1", "state": "dead"})
+        gone = {"pane_listed": False, "process_found": False}
+        self.assertEqual(self.reg.reconcile_remove(self.state, "a", gone, False)["changed"], False)    # a partial read removes nothing
+        self.assertIn("a", self.reg.read(self.state)["agents"])
+        self.assertTrue(self.reg.reconcile_remove(self.state, "a", gone, True)["changed"])
+        self.assertNotIn("a", self.reg.read(self.state)["agents"])
+        lines = [json.loads(l) for l in (self.state / "registry-audit.jsonl").read_text().splitlines()]
+        self.assertEqual([l["event"] for l in lines if l["event"] == "reconcile_remove"], ["reconcile_remove"])
+        self.assertEqual([l for l in lines if l["event"] == "reconcile_remove"][0]["evidence"], gone)
+        refused = [l for l in lines if l["event"] == "reconcile_refused"]
+        self.assertEqual(len(refused), 3)                                   # live evidence, state not dead, partial read: each audited with evidence and reason
+        self.assertEqual(refused[0]["evidence"], alive)
+        self.assertTrue(all(l["why"] and "nothing removed" in l["why"] for l in refused))
+
+    def test_a_dead_row_is_removed_only_when_each_evidence_key_shows_it_gone_and_each_refusal_is_audited(self):
+        gone = {"pane_listed": False, "process_found": False}
+        cases = {"pane_listed true": {"pane_listed": True, "process_found": False}, "process_found true": {"pane_listed": False, "process_found": True},
+                 "pane_listed missing": {"process_found": False}, "process_found missing": {"pane_listed": False}, "evidence None": None,
+                 "evidence a string": "gone", "evidence a list": [gone]}
+        for label, evidence in cases.items():
+            with self.subTest(label=label):
+                self.reg.upsert(self.state, "d", {"session": "ses_d", "state": "dead"})
+                before = len([l for l in (self.state / "registry-audit.jsonl").read_text().splitlines() if "reconcile_refused" in l])
+                got = self.reg.reconcile_remove(self.state, "d", evidence, True)
+                self.assertEqual(got["changed"], False)
+                self.assertIn("d", self.reg.read(self.state)["agents"])
+                after = [json.loads(l) for l in (self.state / "registry-audit.jsonl").read_text().splitlines() if "reconcile_refused" in l]
+                self.assertEqual(len(after), before + 1)
+                self.assertEqual(after[-1]["evidence"], evidence if isinstance(evidence, dict) else None)
+        self.assertTrue(self.reg.reconcile_remove(self.state, "d", gone, True)["changed"])
+
+    def test_retire_then_undo_keeps_a_local_a_cloud_and_a_headless_row_what_it_was(self):
+        self.reg.upsert(self.state, "loc", {"session": "ses_l", "pane": "p1", "workspace": "w1"})
+        self.reg.upsert(self.state, "cld", {"session": "ses_c", "repo": "acme-org/widget-service", "kind": "cloud", "run_id": "run_example"})
+        self.reg.retire(self.state, "loc", "boss", "done")
+        self.reg.retire(self.state, "cld", "cloud-worker", "done")
+        self.reg.retire(self.state, "hdl", "boss", "done", session="ses_h", extra={"headless": {"session": "ses_h"}})
+        for name in ("loc", "cld", "hdl"):
+            self.assertTrue(self.reg.unretire(self.state, name)["changed"])
+        agents = self.reg.read(self.state)["agents"]
+        self.assertEqual((agents["loc"]["kind"], agents["loc"]["run_id"], agents["loc"]["workspace"]), ("local", None, "w1"))
+        self.assertEqual((agents["cld"]["kind"], agents["cld"]["run_id"], agents["cld"]["session"]), ("cloud", "run_example", "ses_c"))
+        self.assertNotIn("hdl", agents)                                       # a headless worker comes back from its own launch record, not as a pane row
+
+    def test_the_fold_does_not_bring_back_a_retired_cloud_worker_but_a_relaunch_under_the_name_stays(self):
+        (self.state / "cloud").mkdir()
+        (self.state / "cloud" / "w1.json").write_text(json.dumps({"worker": "w1", "session": "ses_c", "run_id": "r1"}))
+        (self.state / "cloud" / "w2.json").write_text(json.dumps({"worker": "w2", "session": "ses_new", "run_id": "r2"}))
+        (self.state / "retired.json").write_text(json.dumps({"w1": {"at": int(time.time()), "by": "x", "reason": "r", "session": "ses_c"},
+                                                            "w2": {"at": int(time.time()), "by": "x", "reason": "r", "session": "ses_old"}}))
+        got = self.reg.read(self.state)
+        self.assertEqual(sorted(got["agents"]), ["w2"])
+        self.assertEqual(sorted(got["retired"]), ["w1", "w2"])
+
+    def test_retire_and_close_leave_agents_keep_the_record_and_audit(self):
+        for name in ("a", "b"):
+            self.reg.upsert(self.state, name, {"session": "ses_" + name, "pane": "p", "workspace": "w1"})
+        self.reg.retire(self.state, "a", "boss", "done", auto=True)
+        self.reg.close(self.state, "b", "boss", "pane closed")
+        got = self.reg.read(self.state)
+        self.assertEqual(got["agents"], {})
+        self.assertEqual((got["retired"]["a"]["auto"], got["retired"]["b"]["reason"], got["retired"]["b"]["record"]["workspace"]), (True, "pane closed", "w1"))
+        self.assertEqual(sorted(json.loads(l)["event"] for l in (self.state / "registry-audit.jsonl").read_text().splitlines() if "retire" in l or "close" in l), ["close", "retire"])
+        self.assertEqual(json.loads((self.state / "retired.json").read_text()).keys(), {"a", "b"})   # derived output, the old format
 
 
 class TestPaneWarningRule(unittest.TestCase):

@@ -1168,8 +1168,21 @@ def _launch(args, runner, now, reserve):
             if _stop_after_failure(engine, runner, name, run_id, "launch interrupted", cluster):
                 remove_record(state, name)
             raise
+    _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"})   # a cloud worker is an agent (#903)
     print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
     return H["EXIT_OK"]
+
+
+def _registry_note(engine, what, state, name, *args):
+    """The cloud launcher and reaper are WRITERS of the agent registry: `upsert` on launch, `retire` once the pod is stopped. The stop itself stays
+    this launcher's act; a registry that cannot be written is said in the audit, never raised (the pod's own record is still the launcher's)."""
+    try:
+        registry = H["load_module"]("registry")
+        got = registry.upsert(state, name, args[0]) if what == "upsert" else registry.retire(state, name, "cloud-worker", args[0])
+        if got["problem"]:
+            _audit(engine, "cloud.registry_error", name, {"why": _one(got["problem"], 120)})
+    except Exception as err:
+        _audit(engine, "cloud.registry_error", name, {"why": _one(str(err), 120)})
 
 
 def _record_from_create(name, body):
@@ -1273,7 +1286,7 @@ def cmd_read(args, runner, now):
         return H["EXIT_OK"]
     else:   # a local agent, on the local service
         seen = engine.discover(engine.now()).agents.get(args.name)
-        session = seen.session_id if seen else H["known_agent"](state, args.name, H["read_pane_health"](state)["agents"].get(args.name)).get("session")
+        session = seen.session_id if seen else H["known_agent"](state, args.name).get("session")
         if not session:
             raise LaunchError("%s is not a fleet agent this switchboard has seen" % args.name)
         v2 = engine.v2
@@ -1402,6 +1415,7 @@ def cmd_retire(args, runner, now, record):
         raise LaunchError("stop of %s failed: %s: the record is kept" % (args.name, _reason(code, note)))
     # The run record (slice 3, #638) is written by the launcher's stop; no call is needed here when it lands: this is its hook point (after the
     # end hook, before the endpoint record goes).
+    _registry_note(engine, "retire", state, args.name, reason)
     remove_record(state, args.name)
     wip, pushed = (body or {}).get("wip_branch"), (body or {}).get("pushed")
     print("%s is retired: its pod and scratch volume are deleted%s" % (
