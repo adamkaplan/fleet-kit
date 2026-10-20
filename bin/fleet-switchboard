@@ -6710,11 +6710,11 @@ def known_agent(state_dir, name, known=None):
 def known_session(state_dir, name, known):
     """The session of a fleet agent: the pane record's, else the retired record's."""
     found = known_agent(state_dir, name, known).get("session")
-    return found or (read_retired(state_dir).get(name) or {}).get("session")
+    return found or (registry_retired(state_dir).get(name) or {}).get("session")
 
 
 def read_retired(state_dir):
-    """The retired map, from the registry (`retired.json` is derived output of it now); a registry that is not whole reads as empty (display only)."""
+    """The retired map from the registry, the name `reassign.py` loads (display only: a registry that is not whole reads as empty). The same read as `registry_retired`."""
     return registry_retired(state_dir)
 
 
@@ -6748,13 +6748,6 @@ def registry_retired_strict(state_dir):
     if not got["whole"]:
         raise RetiredUnreadable(got["problem"] or "the agent registry is not whole")
     return got["retired"]
-
-
-def read_retired_strict(state_dir):
-    """The retired map, or RetiredUnreadable. A registry that is MISSING is an empty map (nobody retired); one that is not whole (corrupt, newer version,
-    unreadable) raises. `read_retired` reads all of those as empty, which is right for a display but would let a retired tester record verdicts again:
-    the verdict authority (launch-record testers) uses this one and fails closed."""
-    return registry_retired_strict(state_dir)
 
 
 def _prune_last_reports(data):
@@ -7324,8 +7317,11 @@ def verify_account(engine, runner, fleet):
 def cmd_reattach_all(args, runner, now, socket_call=None):
     """`reattach --all-detached`: every agent the daemon found detached or dead, one by one; each failure is said and the rest continue."""
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
-    retired = read_retired(state)
-    names = sorted(n for n, v in read_pane_health(state)["states"].items() if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in retired)
+    listed = registry_read(state)   # the same list `status` shows: the registry's agents that are detached or dead (never pane-health.json); a read that is not whole acts on nothing
+    if not listed["whole"]:
+        sys.stderr.write("%s: the agent registry could not be read (%s): nothing reattached\n" % (PROG, _one_line(str(listed["problem"]), 120)))
+        return EXIT_ERROR
+    names = sorted(n for n, v in listed["agents"].items() if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in listed["retired"])
     if not names:
         print("no agent is detached or dead")
         return EXIT_OK
@@ -7505,7 +7501,7 @@ def cmd_retire(args, runner, now):
     if not NAME_RE.match(name or ""):
         raise LaunchError("name the agent: `%s retire <name>`" % PROG)
     discovery = engine.discover(engine.now())
-    hint = ((read_retired(state).get(name) or {}).get("session") if args.undo else None)   # a retired headless worker is not discovered: its boss is found from its stored session
+    hint = ((registry_retired(state).get(name) or {}).get("session") if args.undo else None)   # a retired headless worker is not discovered: its boss is found from its stored session
     who = reattach_caller_problem(engine, runner, now, discovery, name, hint, lost_headless=not args.undo)
     if who:
         if engine.audit is not None:
