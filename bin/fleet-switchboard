@@ -23205,7 +23205,7 @@ def cmd_review(args, runner, now):
         print("recorded %s review %s at %s (%s): %d of %d reviewers recorded at this head%s" % (
             reviewer, verdict, head[:8], ref, len(got["recorded"]), len(got["expected"]),
             "; missing %s" % ", ".join(got["missing"]) if got["missing"] else ""))
-        if args.reviewer == "impact" and not (entry.get("impact_severity") and entry.get("impact_probability")):
+        if reviewer == "impact" and not (entry.get("impact_severity") and entry.get("impact_probability")):
             sys.stderr.write("%s: review: %s\n" % (PROG, NO_SCORE_TEXT))
         return EXIT_OK
     except (ReviewError, plan_ledger.LedgerError, ConfigError, IdentityUncertain, CallerError) as err:
