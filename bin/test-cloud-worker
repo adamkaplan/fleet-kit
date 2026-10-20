@@ -103,6 +103,16 @@ tf = os.environ.get("CW_CLOUD_TOKEN_FILE")
 login = {"command": command, "argv": argv, "env": dict(os.environ), "token_ok": bool(tf) and hashlib.sha256(open(tf).read().encode()).hexdigest() == os.environ.get("STUB_TOKEN_SHA"),
          "token_mode": oct(os.stat(tf).st_mode & 0o777) if tf else None}
 open(os.environ["STUB_DIR"] + "/login.log", "a").write(json.dumps(login) + "\\n")
+CREATE_OPTIONS = ("--repo", "--branch", "--idle", "--hard", "--max-hard", "--shape", "--image", "--stack", "--wait", "--pull-secret", "--run-secret-fd", "--run-id", "--password-fd", "--json")   # what the launcher's create knows (main, fb4b9f2)
+if command == "create":
+    unknown = [a for a in argv[2:] if a.startswith("--") and a not in CREATE_OPTIONS]
+    if unknown:
+        sys.stderr.write("error: unrecognized arguments: " + " ".join(unknown) + "\\n")
+        sys.exit(2)
+    shape = argv[argv.index("--shape") + 1] if "--shape" in argv else "S"
+    if shape not in ("S", "M"):
+        sys.stderr.write("error: shape must be S or M\\n")
+        sys.exit(2)
 if command == "create":
     for item in argv:
         if "=" in item and item.split("=")[0] in ("model-auth", "git-token"):
@@ -297,6 +307,19 @@ class Base(unittest.TestCase):
         brief.write_text("Build the thing.\n")
         return self.main("launch", name, "--cloud", "--agent", "coder", "--repo", "acme-org/widget-service", "--branch", "main",
                          "--role", "coder", "--reports-to", "orch", "--brief-file", str(brief))
+
+    @staticmethod
+    def shaped(argv):
+        """The launcher's argument list with the per-run values (the run id, the descriptor numbers) replaced by a placeholder."""
+        run_id = argv[argv.index("--run-id") + 1]
+        return ["<run-id>" if a == run_id else re.sub(r"=\d+$", "=<fd>", a) if re.match(r"(model-auth|git-token)=\d+$", a) else
+                "<fd>" if argv[max(i - 1, 0)] in ("--password-fd", "--run-secret-fd") and a.isdigit() else a for i, a in enumerate(argv)]
+
+    def launch_with(self, *extra, repo="acme-org/widget-service", name="coder7"):
+        brief = self.home / "brief.txt"
+        brief.write_text("Build the thing.\n")
+        return self.main("launch", name, "--agent", "coder", "--repo", repo, "--branch", "main", "--role", "coder", "--reports-to", "orch",
+                         "--brief-file", str(brief), *extra)
 
     def everything_written(self):
         """All text the switchboard left behind (state files, the audit log), to prove the password is in none of it but its own file."""
@@ -1330,9 +1353,7 @@ class TestSettingsFile(Base):
         self.assertEqual(code, 0, err)
         self.assertEqual(err.count("cloud settings from environment"), 1)
         argv = [a for a in self.stub_calls()[0]]
-        run_id = argv[argv.index("--run-id") + 1]
-        shaped = ["<run-id>" if a == run_id else re.sub(r"=\d+$", "=<fd>", a) if re.match(r"(model-auth|git-token)=\d+$", a) else
-                  "<fd>" if argv[max(i - 1, 0)] in ("--password-fd", "--run-secret-fd") and a.isdigit() else a for i, a in enumerate(argv)]
+        shaped = self.shaped(argv)
         expected = json.loads((BIN.parent / "cloud" / "tests" / "fixtures" / "launch-create-argv.json").read_text())
         self.assertEqual(shaped, expected)
 
@@ -1466,6 +1487,121 @@ class TestSettingsFile(Base):
         for text in captures:
             for value in planted:
                 self.assertNotIn(value, text)
+
+
+
+class TestLaunchStack(Base):
+    """#910 (S9, S10): `launch --cloud --stack [--shape S|M]` hands the launcher's create the stack option, and only then."""
+
+    FIXTURES = BIN.parent / "cloud" / "tests" / "fixtures"
+    SHAPES = (None, "S", "M")
+    BAD_SHAPES = ("L", "m", "s", "XL", "2")
+
+    def create_argv(self):
+        calls = [c for c in self.stub_calls() if c[0] == "create"]
+        self.assertEqual(len(calls), 1)
+        return self.shaped(calls[0])
+
+    def nothing_was_called(self):
+        self.assertEqual(self.stub_calls(), [])           # the fake launcher
+        self.assertEqual(self.jsonl("kubectl.log"), [])   # the fake token command (the vault and the cluster)
+        self.assertEqual(self.jsonl("login.log"), [])
+
+    def test_s9_a_launch_without_stack_hands_the_stored_fixture_exactly(self):
+        code, out, err = self.launch_with("--cloud")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.create_argv(), json.loads((self.FIXTURES / "launch-create-argv.json").read_text()))   # taken from the base before this change
+
+    def test_s9_a_stack_launch_hands_the_stack_option_and_the_shape(self):
+        for shape in self.SHAPES:
+            with self.subTest(shape=shape):
+                self.state_clean()
+                extra = ("--shape", shape) if shape else ()
+                code, out, err = self.launch_with("--cloud", "--stack", *extra)
+                self.assertEqual(code, 0, err)
+                base = json.loads((self.FIXTURES / "launch-create-argv.json").read_text())
+                at = base.index("<run-id>") + 1
+                expected = base[:at] + list(extra) + ["--stack"] + base[at:]
+                self.assertEqual(self.create_argv(), expected)
+                self.assertEqual(self.create_argv().count("--stack"), 1)
+
+    def state_clean(self):
+        """Between two launches of one test: the fakes' call logs and the worker records start empty."""
+        for name in ("calls.log", "kubectl.log", "login.log"):
+            self.stub_dir.joinpath(name).unlink(missing_ok=True)
+        for path in list((self.state / "cloud").glob("*")) if (self.state / "cloud").exists() else []:
+            path.unlink()
+
+    def test_s9_shape_without_stack_is_handed_as_before(self):
+        code, out, err = self.launch_with("--cloud", "--shape", "M")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("--stack", self.create_argv())
+        self.assertEqual(self.create_argv()[self.create_argv().index("--shape") + 1], "M")
+
+    def test_s9_the_fake_launcher_refuses_an_option_it_does_not_know(self):
+        text = self.stub.read_text().replace('"--stack", ', "")
+        self.stub.write_text(text)
+        code, out, err = self.launch_with("--cloud", "--stack")
+        self.assertEqual(code, 1)   # the create failed: a wrong option name fails the test, it is not swallowed
+        self.assertIn("unrecognized arguments", err + out)
+
+    def test_s10_stack_without_cloud_is_refused_before_any_call(self):
+        for extra in ((), ("--headless",), ("--terminal",), ("--shape", "M"), ("--shape", "L"), ("--idle", "5m"), ("--hard", "1h")):
+            with self.subTest(extra=extra):
+                self.state_clean()
+                code, out, err = self.launch_with("--stack", *extra)
+                self.assertEqual(code, 2, err)
+                self.assertIn("--stack", err)
+                self.assertIn("--cloud", err)
+                self.nothing_was_called()
+
+    def test_s10_a_repository_off_the_allow_list_is_refused_before_any_call(self):
+        for shape in self.SHAPES:
+            with self.subTest(shape=shape):
+                self.state_clean()
+                code, out, err = self.launch_with("--cloud", "--stack", *(("--shape", shape) if shape else ()), repo="acme-org/other-service")
+                self.assertEqual(code, 2, err)
+                self.assertIn("acme-org/other-service", err)
+                self.nothing_was_called()
+
+    def test_s10_an_unknown_shape_is_refused_before_any_call(self):
+        for shape in self.BAD_SHAPES:
+            with self.subTest(shape=shape):
+                self.state_clean()
+                code, out, err = self.launch_with("--cloud", "--stack", "--shape", shape)
+                self.assertEqual(code, 2, err)
+                self.assertIn("--shape", err)
+                self.assertIn(repr(shape), err)
+                self.nothing_was_called()
+
+    def test_family_every_flag_combination_with_stack(self):
+        """The table of flag combinations is the product of the launch flags the code reads (cloud, mode, timing, shape); the oracle is stated once."""
+        import itertools
+        for cloud, mode, timing, shape in itertools.product((True, False), (None, "--headless", "--terminal"), (None, "--idle", "--hard"), self.SHAPES + self.BAD_SHAPES[:1]):
+            with self.subTest(cloud=cloud, mode=mode, timing=timing, shape=shape):
+                self.state_clean()
+                extra = (["--cloud"] if cloud else []) + (["--stack"]) + ([mode] if mode else []) + ([timing, "5m" if timing == "--idle" else "1h"] if timing else []) + (["--shape", shape] if shape else [])
+                code, out, err = self.launch_with(*extra)
+                if not cloud:
+                    self.assertEqual(code, 2, err)
+                    self.assertEqual(self.stub_calls(), [])
+                elif mode == "--headless":
+                    self.assertEqual(code, 1, err)   # unchanged: a cloud worker is never headless, and that check comes first
+                    self.assertEqual(self.stub_calls(), [])
+                elif shape in self.BAD_SHAPES[:1]:
+                    self.assertEqual(code, 2, err)
+                    self.assertEqual(self.nothing_was_called(), None)
+                else:
+                    self.assertEqual(code, 0, err)
+                    argv = self.create_argv()
+                    self.assertEqual(argv.count("--stack"), 1)
+                    self.assertEqual(argv.count("--shape"), 1 if shape else 0)
+                    if timing:
+                        self.assertEqual(argv[argv.index(timing) + 1], "5m" if timing == "--idle" else "1h")
+                    self.cleanup_worker()
+
+    def cleanup_worker(self):
+        self.assertEqual(self.main("retire", "coder7")[0], 0)
 
 
 if __name__ == "__main__":

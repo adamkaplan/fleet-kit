@@ -140,6 +140,21 @@ fleet-switchboard retire coder7
 
 `retire` stops the worker: the end hook pushes its work and the pod and its Secrets are deleted.
 
+### A worker with a nested Docker stack
+
+Add `--stack` (and, if you want, `--shape S|M`) to the same command for a worker that runs a Docker Compose stack inside its pod:
+
+```text
+fleet-switchboard launch coder7 --cloud --stack --agent coder --repo acme-org/widget-service --branch main \
+  --role coder --reports-to orch --brief-file /home/user/brief.txt
+```
+
+- `--stack` is handed to the launcher's `create` and only then: a launch without it builds exactly the pod it always did.
+- The pod runs on the Sysbox runtime class (`sysbox-runc`) in its own user namespace, as a non-root user. No capability is added, it is never privileged, and it has no host path, Docker socket or service-account token.
+- `--shape` is `S` (2 CPU, 4 GiB) or `M` (4 CPU, 8 GiB). Leave it out for the launcher's own default, `S` (4 GiB): the measured stack lane peaked at 0.8 to 1.35 GiB. The memory limit stays; the pod is never unlimited.
+- The first pod on a fresh node may wait for the node's runtime to be ready (a short delay, a few minutes at most); the launcher notices that case and creates the pod again, up to 3 attempts. You do not retry it.
+- `--stack` needs `--cloud`, and an unknown `--shape` is refused with `--stack`. Both refuse (exit 2) before any setting is read, any token is minted or any cluster call is made, and the order of section 2 is unchanged.
+
 ## 4. What a worker can and cannot do
 
 - It works on one repository and one branch with a one-hour git token and the model entry it was given, nothing else.
