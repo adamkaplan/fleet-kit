@@ -340,6 +340,7 @@ DEFAULTS = {
     "engaged_minutes": 10,
     "retire_idle_minutes": 10,     # `retire --close`: a pane herdr reads as working is closed without --force only when its session has had no turn and no activity this long
     "call_timeout_seconds": 20,
+    "clear_remind_minutes": 15,    # #827: a cleared, mergeable pull request with gates READY that the lane has not merged this long gets ONE reminder per head
     "send_timeout_seconds": 60,    # `send` as a whole (the sum of its v2 and herdr calls): past it, a clear failure line, never a silent minutes-long wait
     "poll_seconds": 5,
     "cpu_guard": None,             # load over cores and swap: None = defaults (high_ratio 3 for 5 minutes, swap_percent 90 for 5 minutes, each wakes the Chief of Staff once per episode); false = off; or {"high_ratio": n, "minutes": n, "swap_percent": n, "swap_minutes": n}
@@ -639,6 +640,8 @@ def validate_config(raw, source="config"):
     for key in ("v2_cache_seconds", "v2_reads_per_pass", "v2_reads_per_minute"):
         if not isinstance(config[key], int) or isinstance(config[key], bool) or config[key] < 0:
             raise ConfigError("%r must be a whole number of at least 0, got %r" % (key, config[key]))
+    if not _is_number(config["clear_remind_minutes"]) or config["clear_remind_minutes"] <= 0:
+        raise ConfigError("%r must be a number above 0, got %r" % ("clear_remind_minutes", config["clear_remind_minutes"]))
     for key in ("batch_seconds", "engaged_minutes", "call_timeout_seconds", "send_timeout_seconds", "poll_seconds",
                 "worker_lookback_hours", "stalled_working_hours", "review_window_minutes", "rider_max_age_seconds"):
         if not _is_number(config[key]) or config[key] <= 0:
@@ -6692,7 +6695,11 @@ def known_agent(state_dir, name, known=None):
     {} when neither exists. The one lookup every reader of a possibly pruned agent uses."""
     if known:
         return known
-    entry = read_retired(state_dir).get(name)
+    reg = load_module("registry").read(state_dir)   # the one registry (#903): the live row, else the retired record (#870: no session covers nothing)
+    row = reg["agents"].get(name)
+    if isinstance(row, dict) and row.get("session"):
+        return dict(row)
+    entry = reg["retired"].get(name)
     if not isinstance(entry, dict) or entry.get("headless") or not entry.get("session"):
         return {}
     return dict(entry["record"] if isinstance(entry.get("record"), dict) else {}, session=entry["session"])
@@ -6704,7 +6711,8 @@ def known_session(state_dir, name, known):
 
 
 def read_retired(state_dir):
-    return _read_small(state_dir, RETIRED_FILE)
+    """The retired map, from the registry (`retired.json` is derived output of it now); a registry that is not whole reads as empty (display only)."""
+    return {k: v for k, v in load_module("registry").read(state_dir)["retired"].items() if isinstance(v, dict)}
 
 
 class RetiredUnreadable(Exception):
@@ -6712,23 +6720,13 @@ class RetiredUnreadable(Exception):
 
 
 def read_retired_strict(state_dir):
-    """The retired map, or RetiredUnreadable. A MISSING file is an empty map (nobody retired); anything else that is not a JSON object of objects (corrupt,
-    empty, garbage, a list, a record that is not an object, unreadable) raises. `read_retired` reads all of those as empty, which is right for a display but
-    would let a retired tester record verdicts again: the verdict authority (launch-record testers) uses this one and fails closed."""
-    try:
-        with open(str(Path(state_dir) / RETIRED_FILE), "rb") as handle:
-            raw = handle.read(1000001)
-    except FileNotFoundError:
-        return {}
-    except OSError as err:
-        raise RetiredUnreadable("%s cannot be read: %s" % (RETIRED_FILE, getattr(err, "strerror", None) or type(err).__name__)) from None
-    try:
-        data = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeError):
-        raise RetiredUnreadable("%s is not valid JSON" % RETIRED_FILE) from None
-    if not isinstance(data, dict) or len(raw) > 1000000 or not all(isinstance(v, dict) for v in data.values()):
-        raise RetiredUnreadable("%s is not a map of retired agents" % RETIRED_FILE)
-    return data
+    """The retired map, or RetiredUnreadable. A registry that is MISSING is an empty map (nobody retired); one that is not whole (corrupt, newer version,
+    unreadable) raises. `read_retired` reads all of those as empty, which is right for a display but would let a retired tester record verdicts again:
+    the verdict authority (launch-record testers) uses this one and fails closed."""
+    reg = load_module("registry").read(state_dir)
+    if not reg["whole"]:
+        raise RetiredUnreadable(reg["problem"] or "the agent registry cannot be read")
+    return {k: v for k, v in reg["retired"].items()}
 
 
 def _prune_last_reports(data):
@@ -6842,14 +6840,19 @@ def pane_health_pass(engine, now):
     discovery = getattr(engine, "discovery", None)
     if discovery is None or discovery.problems or engine.state_dir is None:
         return
+    registry = load_module("registry")
+    reg = registry.read(engine.state_dir)
+    if not reg["whole"]:   # a half-read registry acts on nothing (#805): no upsert, no retire, no removal
+        engine._note("fleetpane.error", None, {"error": "pass skipped: %s" % _one_line(reg["problem"] or "registry not read", 100)})
+        return
     data = read_pane_health(engine.state_dir)
-    agents, states, missing = data["agents"], data["states"], data["missing"]
-    retired = read_retired(engine.state_dir)
-    try:
-        read_retired_strict(engine.state_dir)
-        retired_whole = True
-    except RetiredUnreadable:
-        retired_whole = False   # a half-read retired list removes nothing (#805)
+    states, missing = data["states"], data["missing"]
+    agents = {n: {k: v for k, v in row.items() if k in registry.AGENT_FIELDS} for n, row in reg["agents"].items()
+              if isinstance(row, dict) and (row.get("kind") or "local") == "local"}   # the agent list is the registry's; a cloud worker has no pane to judge
+    registered = {n: row for n, row in reg["agents"].items() if isinstance(row, dict)}
+    retired = reg["retired"]
+    retired_whole = True
+    forgotten = []
     names = list(discovery.agents)
     sessions = [o.session_id for o in discovery.agents.values()]
     budget = PANE_CHECKS_PER_PASS
@@ -6896,6 +6899,7 @@ def pane_health_pass(engine, now):
         if (states.get(name) or {}).get("state") == PANE_DEAD and now - ((states.get(name) or {}).get("at") or now) > PANE_FORGET_SECONDS:
             for table in (agents, states, missing):   # nobody repaired it in days: it stops waking cos
                 table.pop(name, None)
+            forgotten.append(name)
             continue
         if name in retired and retired[name].get("session") in (None, agents[name].get("session")):   # the name AND its session, as in the live branch
             states.pop(name, None)
@@ -6910,9 +6914,9 @@ def pane_health_pass(engine, now):
                          "session": agents[name].get("session"), "auto": True, "record": pane_record_of(agents[name])}
                 try:
                     with agent_lock(engine.state_dir, "files", seconds=2):
-                        current = prune_retired(read_retired(engine.state_dir), now)
-                        current[name] = entry
-                        _write_small(engine.state_dir, RETIRED_FILE, current)
+                        got = registry.retire(engine.state_dir, name, entry["by"], entry["reason"], auto=True, session=entry["session"], record=entry["record"], now=now)
+                        if got["problem"]:
+                            raise OSError(got["problem"])
                     retired[name] = entry
                     states.pop(name, None)
                     missing.pop(name, None)
@@ -6929,11 +6933,30 @@ def pane_health_pass(engine, now):
                             "pane": agents[name].get("pane"), "session": agents[name].get("session"), "at": int(now)}
             if engine.audit is not None:
                 engine.audit.append(engine.actor, "fleetpane.dead", name, {"pane": agents[name].get("pane"), "session": agents[name].get("session")})
+    for table in (states, missing):   # a state or a missing count for a name the registry does not list (retired, retired-and-removed) and discovery does not show is an orphan: it goes
+        for name in [n for n in table if n not in agents and n not in discovery.agents]:
+            table.pop(name, None)
     engine.pane_alerts = {n: v for n, v in states.items() if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n in agents and n not in retired}
     if retired_whole:   # a retired agent (name AND session) leaves the record the pane draws from; its session stays in retired.json for reattach and --undo
         for name in [n for n in agents if retired_agent(retired, n, agents[n].get("session"))]:
             for table in (agents, states, missing):
                 table.pop(name, None)
+    for name, row in sorted(agents.items()):   # the registry takes what the pass saw (no churn: only a changed row is written)
+        state_now = (states.get(name) or {}).get("state")
+        obs = discovery.agents.get(name)
+        live = state_now if state_now in (PANE_DETACHED, PANE_DEAD) else ((obs.status if obs is not None and obs.status in registry.STATES else None) or "idle")
+        new = dict(row, state=live)
+        old = registered.get(name)
+        if old is not None and all(old.get(k) == new.get(k) for k in registry.AGENT_FIELDS + ("state",)):
+            continue
+        got = registry.upsert(engine.state_dir, name, new, now=now)
+        if got["problem"] and not got["problem"].endswith("is retired for this session"):
+            engine._note("fleetpane.error", name, {"error": "registry not updated: %s" % _one_line(got["problem"], 100)})
+    for name in forgotten:   # the registry itself checks the evidence (its recorded state is dead; no pane, no process): never the flag alone
+        # what this pass SAW: discovery did not list the agent (no pane, no process) for PANE_FORGET_SECONDS while its recorded state stayed dead; the registry checks it itself
+        got = registry.reconcile_remove(engine.state_dir, name, {"pane_listed": name in discovery.agents, "process_found": name in discovery.agents, "why": "dead for over %d days" % (PANE_FORGET_SECONDS // 86400)}, True)
+        if got["problem"]:
+            engine._note("fleetpane.error", name, {"error": "registry not updated: %s" % _one_line(got["problem"], 100)})
     try:
         write_pane_health(engine.state_dir, {"agents": agents, "states": states, "missing": missing, "at": int(now)})
     except OSError as err:
@@ -7144,7 +7167,10 @@ def cmd_reattach(args, runner, now, socket_call=None):
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
     name = args.name
     discovery = engine.discover(engine.now())
-    if name in read_retired(state):
+    reg = load_module("registry").read(state)
+    if not reg["whole"]:   # acts on the registry: fails closed on a half read
+        raise LaunchError("the agent registry cannot be read (%s): nothing was changed" % _one_line(reg["problem"] or "unknown", 120))
+    if name in reg["retired"]:
         raise LaunchError("%s is retired (a finished worker): run `%s retire --undo %s` first if it should come back" % (name, PROG, name))
     who = reattach_caller_problem(engine, runner, now, discovery, name, getattr(args, "session", None))
     if who:
@@ -7180,7 +7206,7 @@ def reattach_caller_problem(engine, runner, now, discovery, name, session=None, 
         return None
     if target is None:   # a dead agent is not discovered: its boss is in the session's STORED metadata
         try:
-            known = known_agent(engine.state_dir, name, read_pane_health(engine.state_dir)["agents"].get(name))
+            known = known_agent(engine.state_dir, name)
             known_sid = session or known.get("session")
             stored = _fleet_meta(engine.v2.session_get(known_sid)) or {} if known_sid else {}
             stored = load_module("reassign").overlay(engine.state_dir, stored, known_sid) if stored else stored   # a reassigned worker's new boss, not the one it was launched with
@@ -7195,7 +7221,7 @@ def reattach_caller_problem(engine, runner, now, discovery, name, session=None, 
 
 
 def _reattach_locked(args, runner, now, engine, state, name, discovery):
-    known = known_agent(state, name, read_pane_health(state)["agents"].get(name))
+    known = known_agent(state, name)
     seen = discovery.agents.get(name)
     session_id = args.session or (seen.session_id if seen else None) or known.get("session")
     if not session_id:
@@ -7322,6 +7348,9 @@ def retire_close_problem(engine, runner, now, discovery, name, seen, force):
     never the caller's own pane or session. What: the pane the switchboard has for the agent, read again live, must still hold THAT agent's session
     (a stored pane id can name another terminal after a herdr restart). A pane herdr reads as working needs --force unless the session's own state shows it idle (`retire_idle_evidence`); --force is refused while a registered worktree of
     the agent holds uncommitted or unpushed work."""
+    reg = load_module("registry").read(engine.state_dir)
+    if not reg["whole"]:   # fails CLOSED: a pane is never closed on a half read of the registry
+        return None, "the agent registry cannot be read (%s): nothing was closed" % _one_line(reg["problem"] or "unknown", 100)
     kind = gates_caller_kind(runner, now)
     if kind[0] == "person":
         who = "the operator"
@@ -7454,7 +7483,7 @@ def cmd_retire(args, runner, now):
         raise LaunchError("refused: %s" % who)
     reason = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", args.reason or "").split())[:200]
     seen = discovery.agents.get(name)
-    known = known_agent(state, name, read_pane_health(state)["agents"].get(name))   # a pruned retired agent is still known
+    known = known_agent(state, name)   # a pruned retired agent is still known
     close_pane, close_by, close_note, headless_kept = None, None, None, None
     if getattr(args, "close", False) and not args.undo and seen is not None and seen.headless:
         close_note = "headless: it has no terminal, so there is nothing to close"
@@ -7469,7 +7498,10 @@ def cmd_retire(args, runner, now):
         who = reattach_caller_problem(engine, runner, now, discovery, name, hint, lost_headless=not args.undo)   # judged again inside the lock: check and write are one step
         if who:
             raise LaunchError("refused: %s" % who)
-        retired = read_retired(state)
+        reg = load_module("registry").read(state)
+        if not reg["whole"]:   # acts on the registry: fails closed on a half read
+            raise LaunchError("the agent registry cannot be read (%s): nothing was changed" % _one_line(reg["problem"] or "unknown", 120))
+        retired = reg["retired"]
         if args.undo:
             entry = retired.get(name)
             if entry is None:
@@ -7478,11 +7510,9 @@ def cmd_retire(args, runner, now):
             restored, restore_ok = restore_headless_record(engine, state, name, entry)   # FIRST: a record that cannot be put back leaves the retirement as it is, to try again
             if not restore_ok:
                 raise LaunchError("%s: nothing was changed, the retirement stays (try `%s retire --undo %s` again)" % (restored, PROG, name))
-            retired.pop(name, None)
-            try:
-                _write_small(state, RETIRED_FILE, retired)
-            except OSError as err:
-                raise LaunchError("%s could not be updated (%s): nothing changed, try `%s retire --undo %s` again" % (RETIRED_FILE, err.strerror or err, PROG, name)) from None
+            got = load_module("registry").unretire(state, name)
+            if got["problem"]:
+                raise LaunchError("the agent registry could not be updated (%s): nothing changed, try `%s retire --undo %s` again" % (_one_line(got["problem"], 100), PROG, name))
             data = read_pane_health(state)
             data["states"].pop(name, None)
             data["missing"].pop(name, None)
@@ -7502,19 +7532,16 @@ def cmd_retire(args, runner, now):
         headless_lost = seen is None and not known and headless_kept is not None   # a headless record with no session: the worker is lost, not unknown
         if seen is None and not known and not headless_lost:
             raise LaunchError("%s is not a fleet agent this switchboard has seen (see `%s status`)" % (name, PROG))
-        prune_retired(retired, now())
-        retired[name] = {"at": int(now()), "by": identify_who(engine, runner, now), "reason": reason or "finished",
-                         "session": (seen.session_id if seen else None) or known.get("session"), "auto": False}
-        if known:
-            retired[name]["record"] = pane_record_of(known)   # the pane record is pruned below: keep what reattach and --undo read
+        retired = {name: {"by": identify_who(engine, runner, now), "reason": reason or "finished"}}
+        session_of = (seen.session_id if seen else None) or known.get("session")
         if headless_lost:
-            retired[name]["session"] = headless_kept["session"]
-        if headless_kept is not None:
-            retired[name]["headless"] = headless_kept   # kept here so `retire --undo` can put the record back
-        try:
-            _write_small(state, RETIRED_FILE, retired)
-        except OSError as err:
-            raise LaunchError("%s could not be written (%s): %s was not retired, try again" % (RETIRED_FILE, err.strerror or err, name)) from None
+            session_of = headless_kept["session"]
+        retire_fn = load_module("registry").close if close_pane is not None else load_module("registry").retire
+        got = retire_fn(state, name, retired[name]["by"], retired[name]["reason"], session=session_of,
+                        record=pane_record_of(known) if known else None,   # the pane record is pruned: keep what reattach and --undo read
+                        extra={"headless": headless_kept} if headless_kept is not None else None, now=int(now()))   # kept so `retire --undo` can put the record back
+        if got["problem"]:
+            raise LaunchError("the agent registry could not be written (%s): %s was not retired, try again" % (_one_line(got["problem"], 100), name))
     data = read_pane_health(state)
     data["states"].pop(name, None)
     data["agents"].pop(name, None)   # pruned in the same step as the retire: the session is in retired.json
@@ -7717,8 +7744,8 @@ def worktree_session_in_use(engine, root):
         return None
     retired = read_retired(engine.state_dir)
     known = {}
-    for name, info in (read_pane_health(engine.state_dir).get("agents") or {}).items():
-        if isinstance(info, dict) and isinstance(info.get("session"), str):
+    for name, info in load_module("registry").read(engine.state_dir)["agents"].items():   # the registry's local agents (a cloud worker's session is not in the local service)
+        if isinstance(info, dict) and isinstance(info.get("session"), str) and (info.get("kind") or "local") == "local":
             known[name] = info["session"]
     for name, obs in (getattr(getattr(engine, "discovery", None), "agents", None) or {}).items():
         if getattr(obs, "session_id", None):
@@ -10355,7 +10382,8 @@ def pr_ci_of(rollup):
 CAPTAIN_MARK = "MERGE: captain"
 CAPTAIN_MERGE_LABELS = ("merge-captain", "merge-automatic")
 CAPTAIN_HOLD_LABELS = ("hold-security", "hold-credential", "hold-contract", "hold-policy", "hold-prod-config",
-                       "hold-other-area", "hold-impact")
+                       "hold-other-area", "hold-impact", "hold-owner")   # hold-owner (#891): the owner's own hold, only the owner's plain clear lifts it; the daemon never adds, adopts or lifts it
+OWNER_HOLD_KEY = "hold-owner"   # #891: the owner's own hold: never the daemon's (not added, not adopted, not restored by a re-hold), never lifted by a delegated clear
 # TRANSITION WINDOW (#133): a PR is held for the person when it carries the `merge-captain` label, OR (until this date, 30
 # days after the labels landed on 2026-10-11) when its body's first non-empty line says `MERGE: captain`. The line is read only inside the window.
 # TO DROP THE MARKER: set this to None (one line), after telling the Chief of Staff; the sweep's "marker without label" finding exists
@@ -10435,6 +10463,22 @@ def is_captain(pr, now=None):
     """THE one helper: whether a PR is held for the person. `pr` is a dict with `labels` (names or {"name"} dicts) and `body`;
     see `pr_marker_state` for the rule (label first, the first-line marker only inside the transition window)."""
     return pr_marker_state((pr or {}).get("labels"), (pr or {}).get("body"), now)["captain"]
+
+
+def sweep_clear_agrees(engine, repo, number, labels, marker):
+    """(#827, S6b) True when the ONLY disagreement of a pull request's merge label and its first-line marker is an author's `merge-captain` label still on it beside an automatic line, and the owner's clear is recorded for the
+    EXACT head the pull request has now (the daemon's own list read; an unknown head, an unreadable impact state or a clear on another head agree with nothing): the clear is the owner's answer for that head, so the leftover label is not a
+    disagreement to finish. Read-only."""
+    try:
+        kinds = _label_kind(labels, CAPTAIN_MERGE_LABELS)
+        if kinds != ["merge-captain"] or marker != "automatic" or engine.state_dir is None:
+            return False
+        pictures = getattr(engine, "ci_record_state", None)
+        head = ((pictures.pr_state.get("%s#%d" % (plan_ledger.normal_repo(repo), number)) if pictures is not None else None) or {}).get("head")
+        clears, problem = read_impact_state(engine.state_dir)
+        return not problem and isinstance(head, str) and bool(head) and (clears["clears"].get("%s#%d" % (repo, number)) or {}).get("head") == head
+    except Exception:
+        return False
 
 
 def pr_login(user):
@@ -11771,6 +11815,10 @@ def publish_decisions(engine):
     except Exception as err:
         engine._note("impact.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     try:
+        clear_notice_pass(engine, now)   # #827: delivers the clear notices still pending, drops one whose pull request merged, closed or changed head, and sends the one "cleared, merge it" reminder
+    except Exception as err:
+        engine._note("gate.clear_notify_failed", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
         merged_labels = load_module("merged_labels")   # #559: the merge and hold labels of a merged PR come off (fresh read, fleet labels only)
         merged_labels.run_pass(types.SimpleNamespace(**{n: globals()[n] for n in merged_labels.NEEDS}), engine, now,
                                ((engine.config.get("impact_hold") or {}).get("calls_per_pass") or IMPACT_PASS_CALLS))   # its own cap of gh reads, the impact hold's setting
@@ -12436,7 +12484,7 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
         items[number] = {"pr": _is_pr(record), "labels": names,
                          "section": sweep_has_section(body), "heading": sweep_has_heading(body),
                          "captain": is_captain({"labels": names, "body": body}),
-                         "captain_findings": pr_marker_state(names, body)["findings"], "holds": pr_hold_reasons(names),
+                         "captain_findings": pr_marker_state(names, body)["findings"], "holds": pr_hold_reasons(names), "marker": pr_marker(body),
                          "author": (pr_login(record.get("user")) or "").lower(),
                          "created": parse_iso(record.get("created_at")), "updated": parse_iso(record.get("updated_at")),
                          "assignees": [(pr_login(a) or "").lower() for a in record.get("assignees") or [] if isinstance(a, dict)],
@@ -12602,7 +12650,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
                         item.get("created"), now, SWEEP_S6A_GRACE) and sweep_ours(
                         engine, repo, number, item.get("author", ""), item.get("assignees"), notices):
                     found.add(("S6a", ref_text(repo, number)))   # only OUR PR: another team's author may carry the line
-                if "disagree" in item["captain_findings"]:
+                if "disagree" in item["captain_findings"] and not sweep_clear_agrees(engine, repo, number, item["labels"], item.get("marker")):
                     found.add(("S6b", ref_text(repo, number)))
     for repo, picture in state.repos.items():
         if repo in defer or "*" in defer:
@@ -12715,7 +12763,7 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
             return False
         if kind == "S6a" and sweep_within(parse_iso(data.get("created_at")), now, SWEEP_S6A_GRACE):
             return False   # opened a moment ago: the label is applied after it opens
-        return is_pr and want in pr_marker_state(names, body)["findings"]
+        return is_pr and want in pr_marker_state(names, body)["findings"] and not (kind == "S6b" and sweep_clear_agrees(engine, repo, number, names, pr_marker(body)))
     if kind in ("S1a", "S1b"):
         if is_pr:
             return False
@@ -21427,6 +21475,15 @@ def impact_carry_get(engine, runner, repo):
 
 CLEAR_NOTIFIED_FILE = "clear-notified.json"
 CLEAR_NOTIFIED_MAX = 400
+CLEAR_PENDING_FILE = "clear-notice-pending.json"   # #827: the notices of owner clears not yet delivered to everyone they are for
+CLEAR_PENDING_MAX = 100
+CLEAR_PENDING_BODY_MAX = 4000   # the pull request body as far as the lane lookup needs it (its PLAN line)
+CLEAR_NOTICE_KINDS = ("clear", "carry")   # THE one table of notice kinds: the record, the delivery and the pass accept these and no other; a test derives the callers from the code and fails on a kind missing here
+CLEAR_NOTICE_BACKOFF = (60, 120, 300, 900, 1800, 3600)   # seconds before the next try of a failed notice or reminder, by the number of tries made (the last step repeats): a lane that is down for a while still gets it
+CLEAR_NOTICE_MAX_AGE_SECONDS = 86400   # a notice or a reminder is given up (audited) only after this long: the budget is time, never a count of fast tries
+CLEAR_NOTICE_CLAIM_SECONDS = 90   # a delivery in flight is not started again within this (longer than a send is allowed to take)
+CLEAR_NOTICE_PASS_MAX = 3       # deliveries one daemon pass makes
+CLEAR_REMINDED_FILE = "clear-reminded.json"   # #827: the heads whose "cleared, merge it" reminder is done
 _PLAN_ISSUE_RE = re.compile(r"github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:issues|pull)/([0-9]+)")
 
 
@@ -31399,7 +31456,8 @@ LABEL_SPECS = (("orchestrator", "5319e7", "A charter: an orchestrator's standing
                ("hold-policy", "d93f0b", "Held: a policy or permission rule"),
                ("hold-prod-config", "d93f0b", "Held: production configuration"),
                ("hold-other-area", "d93f0b", "Held: an area owned by another team"),
-               ("hold-impact", "d93f0b", "Held: the impact floor or an independent rating says the change is high-impact"))
+               ("hold-impact", "d93f0b", "Held: the impact floor or an independent rating says the change is high-impact"),
+               ("hold-owner", "d93f0b", "The owner's own hold; only the owner lifts it"))
 
 
 def label_names(config):
