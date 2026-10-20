@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 
 MARK = "<!-- fleet-switchboard:from=%s -->"
 SIGNED_RE = re.compile(r"<!--\s*fleet-switchboard:from=[A-Za-z0-9_-]{1,64}\s*-->")
@@ -1032,20 +1033,74 @@ def merge_gate_repos():
     return {str(name).lower() for name in repos} if isinstance(repos, dict) else None   # a section that is there and malformed is not "nothing listed"
 
 
-API_MERGE_RE = re.compile(r"^/?repos/([^/]+/[^/]+)/pulls/([0-9]+)/merge/?$")
+API_MERGE_RE = re.compile(r"^repos/([^/]+/[^/]+)/pulls/([0-9]+)/merge$", re.I)
 API_WRITE_FLAGS = ("-f", "-F", "--field", "--raw-field", "--input")
 GRAPHQL_MERGE_WORDS = ("mergePullRequest", "enablePullRequestAutoMerge")
+
+
+VALUE_FLAGS = {"-R", "--repo", "--hostname", "-b", "--body", "-F", "--body-file", "-t", "--title", "--subject", "-A", "--author-email", "--match-head-commit",
+               "-B", "--base", "-H", "--head", "--header", "--assignee", "--label", "--milestone", "--project", "--reviewer",
+               "-q", "--jq", "--json", "-X", "--method", "-f", "--field", "--raw-field", "--input", "--cache", "--preview", "--state", "-S", "--search",
+               "-L", "--limit", "--template"}
+PR_VERBS = {"checkout", "checks", "close", "comment", "create", "diff", "edit", "list", "lock", "ready", "reopen", "review", "status", "unlock",
+            "update-branch", "view", "revert", "merge", "help"}
+
+
+def command_word_positions(args):
+    """[(index, word)] of the command words: the arguments that are not flags and not the value of a flag that takes one. A flag may stand anywhere between the
+    words (gh accepts `-R repo` and `--repo=repo` before the group, between the group and the verb, or after), so the verb is not at a fixed position."""
+    out, i = [], 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            break
+        if arg.startswith("-") and len(arg) > 1:
+            i += 2 if arg in VALUE_FLAGS else 1
+            continue
+        out.append((i, arg))
+        i += 1
+    return out
+
+
+def canonical_pr_merge(args):
+    """`gh pr merge` written with a flag between its words (`pr -R repo merge N`, `-R repo pr merge N`) is the same call as `pr merge -R repo N`: it is
+    returned in that one canonical form, which every check reads. A `pr` command whose second word is not a known verb but which has `merge` among its words
+    (an unknown flag's value was taken for the verb) is also read as a merge: the shim would rather refuse than miss one. Anything else comes back unchanged."""
+    words = command_word_positions(args)
+    if len(words) < 2 or words[0][1] != "pr":
+        return args
+    merge = next((w for w in words[1:2] if w[1] == "merge"), None)
+    if merge is None and words[1][1] not in PR_VERBS:
+        merge = next((w for w in words[2:] if w[1] == "merge"), None)
+    if merge is None:
+        return args
+    return ["pr", "merge"] + [a for i, a in enumerate(args) if i not in (words[0][0], merge[0])]
+
+
+def api_path(arg):
+    """THE one normaliser of a `gh api` path, as GitHub reads it: percent-decoded (until stable), cut at a query string or fragment, repeated slashes
+    collapsed, no leading or trailing slash. Case is folded by the matchers (re.I), never here, so a repository keeps its spelling."""
+    path = arg
+    for _ in range(3):
+        decoded = urllib.parse.unquote(path)
+        if decoded == path:
+            break
+        path = decoded
+    path = re.split(r"[?#]", path, 1)[0]
+    return re.sub(r"/{2,}", "/", path).strip("/")
 
 
 def merge_route(args):
     """Which merge route a command is, so the gate covers the class and not one spelling: ("pr", None) for `pr merge` (any shape), ("api", (repo, n)) for a
     write to `repos/R/pulls/N/merge`, ("api-unknown", why) for a merge-looking `gh api` whose pull request cannot be told (a placeholder, a variable,
     a query read from a file), ("graphql", None) for a GraphQL merge mutation, else None. Pure string analysis; nothing is run."""
+    args = canonical_pr_merge(args)
     if len(args) >= 2 and args[0] == "pr" and args[1] == "merge":
         return ("pr", None)
-    if not args or args[0] != "api":
+    words = command_word_positions(args)
+    if not words or words[0][1] != "api":
         return None
-    rest = args[1:]
+    rest = [a for i, a in enumerate(args) if i != words[0][0]]
     method, write, i = "GET", False, 0
     while i < len(rest):
         arg = rest[i]
@@ -1067,12 +1122,11 @@ def merge_route(args):
     for arg in rest:
         if arg.startswith("-"):
             continue
-        found = API_MERGE_RE.match(arg)
-        if found and not re.search(r"[{}$<>]", found.group(1)):
+        path = api_path(arg)
+        found = API_MERGE_RE.match(path)
+        if found and not re.search(r"[{}$<>:]", found.group(1)):
             return ("api", (found.group(1), int(found.group(2))))
-        if found:
-            return ("api-unknown", "the repository of that merge call is a placeholder")
-        if re.search(r"/pulls/[^/ ]*/merge/?$", arg):
+        if found or re.search(r"(^|/)pulls/[^/]*/merge(/|$)", path, re.I):
             return ("api-unknown", "the pull request of that merge call cannot be told")
     return None
 
@@ -1087,6 +1141,7 @@ def merge_gate_probe(args, lookup, gh):
     switchboard's own gh calls never merge through this shim. Routes covered: `pr merge` in any shape (one the shim cannot parse is refused), `gh api` writes to
     `pulls/N/merge`, GraphQL merge mutations. Not covered, and said in the docs: an alias the shim cannot see, the web UI, a push to the branch."""
     try:
+        args = canonical_pr_merge(args)
         route = merge_route(args)
         if route is None:
             return None
@@ -1305,6 +1360,7 @@ def run(args):
         return 127
     plan = None
     warn_shared_body_file(args)
+    args = canonical_pr_merge(args)   # one canonical form of `pr merge` for every probe below (#962)
     args, over_found, over_reason = take_over_review(args)   # the shim's own flag never reaches gh or the signing
     write = is_write(args)
     lookup = Lookup(write=write)   # one identity lookup, one deadline, for the name and the account together

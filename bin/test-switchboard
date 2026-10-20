@@ -72725,7 +72725,9 @@ class TestGhShimMergeGate(Base):
 
     HEAD = "a" * 40
 
-    def run_shim(self, *args, env=None, binary=True):
+    shim_path = None   # a mutated copy of the shim a test runs instead (the shim's own directory stays first on PATH)
+
+    def run_shim(self, *args, env=None, binary=True, linked=False):
         environ = {"PATH": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home), "FLEET_SWITCHBOARD_STATE": str(self.state),
                    "FLEET_SHIM_LOOKUP_SECONDS": SHIM_LOOKUP_SECONDS, "FLEET_SHIM_GATE_SECONDS": SHIM_LOOKUP_SECONDS, "FAKE_REPO": "acme/app"}
         if binary:
@@ -72735,7 +72737,7 @@ class TestGhShimMergeGate(Base):
             self.log.unlink()
         runner = ("import importlib.util, importlib.machinery, sys\nloader = importlib.machinery.SourceFileLoader('gh', %r)\nspec = importlib.util.spec_from_loader('gh', loader)\n"
                   "m = importlib.util.module_from_spec(spec)\nloader.exec_module(m)\nm.__file__ = %r\nm.MG_HOME = %r\nm.MG_BINARY = %r\nsys.exit(m.main(sys.argv[1:]))\n"
-                  % (str(SHIM), str(SHIM), str(self.home), str(self.sb) if binary else None))   # the gate's home and program are module attributes, never environment
+                  % (str(self.shim_path or SHIM), str(SHIM), str(self.home), str(self.sb) if binary and not linked else None))   # the gate's home and program are module attributes, never environment
         done = subprocess.run([sys.executable, "-c", runner, *args], capture_output=True, text=True, env=environ, timeout=60)
         return done, (json.loads(self.log.read_text()) if self.log.exists() else None)
 
@@ -72821,6 +72823,112 @@ class TestGhShimMergeGate(Base):
                 self.assertEqual(done.returncode, 0, args)
                 self.assertIsNotNone(seen)
 
+    BASE_PATH = "repos/acme/app/pulls/12/merge"
+
+    @classmethod
+    def api_spellings(cls):
+        """The matrix, GENERATED from the base path: each way a path can be written that GitHub reads as the same call."""
+        base, out = cls.BASE_PATH, {"base": cls.BASE_PATH}
+        out.update({"query": base + "?x=1", "empty query": base + "?", "fragment": base + "#a", "both": base + "/?a=b#c", "trailing slash": base + "/",
+                    "leading slash": "/" + base, "leading double slash": "//" + base, "upper case": base.upper(), "mixed case": "Repos/Acme/App/Pulls/12/Merge",
+                    "url form": "https://api.github.com/" + base, "owner placeholder": "repos/:owner/:repo/pulls/12/merge",
+                    "brace placeholder": "repos/{owner}/{repo}/pulls/12/merge", "variable": "repos/acme/app/pulls/$N/merge", "encoded number": "repos/acme/app/pulls/%7Bn%7D/merge",
+                    "pull as a name": "repos/acme/app/pulls/head/merge", "extra segment": base + "/extra"})
+        for i in range(len(base)):
+            if base[i] not in "/":   # percent-encode each character in turn
+                out["encoded %d" % i] = base[:i] + "%%%02x" % ord(base[i]) + base[i + 1:]
+        for i in range(len(base)):
+            if base[i] == "/":
+                out["double slash %d" % i] = base[:i] + "//" + base[i + 1:]
+        out["double encoded"] = base.replace("/", "%252f")
+        return out
+
+    API_SPELLINGS = ()   # kept for the mutant test below, filled from the generated matrix
+
+    def refused_api(self, spelling, **more):
+        done, seen = self.run_shim("api", "-X", "PUT", spelling, env={"FAKE_MG_EXIT": "10", "FAKE_MG_JSON": json.dumps({"allowed": False, "reason": "no gate pass recorded"})}, **more)
+        return done.returncode == 10 and seen is None
+
+    def test_every_spelling_of_the_api_merge_path_is_asked_or_refused(self):
+        matrix = self.api_spellings()
+        self.assertGreater(len(matrix), 40, "the matrix is derived from the base path, one entry per character and per slash")
+        for name, spelling in matrix.items():
+            with self.subTest(spelling=name):
+                self.assertTrue(self.refused_api(spelling), spelling)
+
+    def mutated_shim(self, old, new, count=1):
+        """A copy of the shim with one edit (`old` -> `new`), or with several when `old` is a list of (old, new) pairs."""
+        source = SHIM.read_text()
+        for one, other in (old if isinstance(old, list) else [(old, new)]):
+            self.assertEqual(source.count(one), count if not isinstance(old, list) else 1, one)
+            source = source.replace(one, other)
+        path = self.home / "gh-mutant"
+        path.write_text(source)
+        self.shim_path = path
+
+    def test_each_mutant_of_the_route_matching_lets_a_spelling_through_and_the_tests_see_it(self):
+        cases = (("a path is not percent-decoded", "decoded = urllib.parse.unquote(path)", "decoded = path"),
+                 ("a path is not cut at its query string or fragment", 're.split(r"[?#]", path, 1)[0]', "path"),
+                 ("a path is matched case-sensitively", [('/merge$", re.I)', '/merge$")'), ('(/|$)", path, re.I)', '(/|$)", path)')], None),
+                 ("repeated slashes are not collapsed", 're.sub(r"/{2,}", "/", ', "("),
+                 ("a gh placeholder is read as a repository", r'[{}$<>:]', r'[{}$<>]'),
+                 ("a merge path is only seen at the end of the argument", '(^|/)pulls/[^/]*/merge(/|$)', '(^|/)pulls/[^/]*/merge$'))
+        for label, old, new, *count in cases:
+            with self.subTest(mutant=label):
+                self.mutated_shim(old, new, *(count or [1]))
+                self.assertFalse(all(self.refused_api(sp) for sp in self.api_spellings().values()), label)
+        self.shim_path = None
+
+    def call_shapes(self):
+        """The invocations, GENERATED: each way of giving the repository (`-R r`, `-Rr`, `--repo r`, `--repo=r`, and the URL in place of the number) placed in every
+        position between the words of `pr merge 12`, with a boolean flag and a flag that takes a value (`--hostname`) mixed in."""
+        repo = "acme/app"
+        forms = {"-R r": ["-R", repo], "-Rr": ["-R" + repo], "--repo r": ["--repo", repo], "--repo=r": ["--repo=" + repo]}
+        shapes = {}
+        for name, flag in forms.items():
+            for extra_name, extra in (("", []), (" +squash", ["--squash"]), (" +hostname", ["--hostname", "github.com"])):
+                for slot in range(4):   # before `pr`, between `pr` and `merge`, between `merge` and the number, after the number
+                    words = [["pr"], ["merge"], ["12"], []]
+                    placed = [w for i, ws in enumerate(words) for w in ((flag + extra) if i == slot else []) + ws]
+                    shapes["%s%s at %d" % (name, extra_name, slot)] = placed
+        shapes["url instead of the number"] = ["pr", "merge", "https://github.com/%s/pull/12" % repo]
+        shapes["url, flag between"] = ["pr", "--squash", "merge", "https://github.com/%s/pull/12" % repo]
+        shapes["number first"] = ["pr", "merge", "12", "-R", repo, "--squash"]
+        return shapes
+
+    def refused_call(self, args):
+        if self.calls.exists():
+            self.calls.unlink()
+        done, seen = self.run_shim(*args, env={"FAKE_MG_EXIT": "10", "FAKE_MG_JSON": json.dumps({"allowed": False, "reason": "no gate pass recorded"})})
+        asked = any(l.startswith("merge-gate acme/app#12 --check") for l in self.merge_calls()) or "--hostname" in args   # `pr merge` has no --hostname: refused as not understood
+        return done.returncode == 10 and seen is None and asked
+
+    def test_every_placement_of_the_persistent_flags_asks_the_gate(self):
+        shapes = self.call_shapes()
+        self.assertGreater(len(shapes), 40)
+        for name, args in shapes.items():
+            with self.subTest(shape=name):
+                self.assertTrue(self.refused_call(args), args)
+
+    def test_a_shim_that_reads_only_the_second_word_misses_the_generated_shapes(self):
+        self.mutated_shim("    words = command_word_positions(args)\n    if len(words) < 2 or words[0][1] != \"pr\":", "    return args\n    words = command_word_positions(args)\n    if len(words) < 2 or words[0][1] != \"pr\":")
+        self.assertFalse(all(self.refused_call(a) for a in self.call_shapes().values()))
+        self.shim_path = None
+
+    def test_the_program_comes_from_the_account_home_and_never_from_the_environment_even_when_nothing_is_injected(self):
+        liar = self.home / "liar"
+        liar.write_text("#!/bin/sh\n[ \"$1\" = merge-gate ] && echo '{\"allowed\": true, \"head\": \"%s\"}'\n[ \"$1\" = whoami ] && echo '{\"name\": \"worker\", \"repo\": \"acme/app\"}'\nexit 0\n" % self.HEAD)
+        liar.chmod(0o755)
+        (self.home / ".local" / "bin").mkdir(parents=True)
+        (self.home / ".local" / "bin" / "fleet-switchboard").symlink_to(self.sb)
+        env = {"FAKE_MG_EXIT": "10", "FAKE_MG_JSON": json.dumps({"allowed": False, "reason": "no gate pass recorded"}), "FLEET_SWITCHBOARD_BIN": str(liar)}
+        done, seen = self.run_shim(*self.MERGE, env=env, linked=True)
+        self.assertEqual((done.returncode, seen), (10, None), done.stderr)
+        self.mutated_shim('binary = os.path.realpath(os.path.join(home,', 'binary = os.environ.get("FLEET_SWITCHBOARD_BIN") or os.path.realpath(os.path.join(home,')
+        done, seen = self.run_shim(*self.MERGE, env=env, linked=True)
+        self.assertEqual(done.returncode, 0, "the mutant that reads the program from the environment is caught by this test")
+        self.shim_path = None
+
     def test_an_allowed_api_merge_releases_the_lock_when_it_returns(self):
         done, seen = self.run_shim("api", "-X", "PUT", "repos/acme/app/pulls/12/merge", env=self.allowed())
         self.assertEqual((done.returncode, seen["argv"]), (0, ["api", "-X", "PUT", "repos/acme/app/pulls/12/merge"]))
@@ -72830,7 +72938,7 @@ class TestGhShimMergeGate(Base):
         other = self.home / "elsewhere"
         (other / "empty").mkdir(parents=True)
         liar = self.home / "liar"
-        liar.write_text("#!/bin/sh\necho '{\"allowed\": true, \"head\": \"%s\"}'\n" % self.HEAD)
+        liar.write_text("#!/bin/sh\n[ \"$1\" = merge-gate ] && echo '{\"allowed\": true, \"head\": \"%s\"}'\n[ \"$1\" = whoami ] && echo '{\"name\": \"worker\", \"repo\": \"acme/app\"}'\nexit 0\n" % self.HEAD)
         liar.chmod(0o755)
         refuse = {"FAKE_MG_EXIT": "10", "FAKE_MG_JSON": json.dumps({"allowed": False, "reason": "no gate pass recorded"})}
         for extra in ({"FLEET_SWITCHBOARD_OWN_GH": "1"}, {"XDG_CONFIG_HOME": str(other / "empty")}, {"HOME": str(other)}, {"FLEET_SWITCHBOARD_BIN": str(liar)}):
