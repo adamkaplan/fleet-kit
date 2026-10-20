@@ -73714,11 +73714,31 @@ class TestFocusedLocalRuns(unittest.TestCase):
                 with self.subTest(path=path, sentence=sentence[:30]):
                     self.assertEqual(text.count(sentence), 1)
 
-    def test_a_mutant_that_drops_the_exception_or_words_it_differently_fails_the_count(self):
+    def sentences_once(self, text):
+        text = " ".join(text.split())
+        return all(text.count(sentence) == 1 for sentence in (self.DEFAULT, self.EXCEPTION, self.REFUSAL))
+
+    def test_a_mutant_that_drops_the_exception_or_words_it_differently_fails_the_same_check(self):
         for path in self.FILES:
-            text = " ".join((REPO / path).read_text().split())
-            for mutant in (text.replace(self.EXCEPTION, ""), text.replace("to a test CI cannot run", "to a slow test")):
-                self.assertEqual(mutant.count(self.EXCEPTION), 0, path)
+            text = (REPO / path).read_text()
+            self.assertTrue(self.sentences_once(text), path)
+            for name, mutant in (("dropped", text.replace(self.EXCEPTION, "")), ("reworded", text.replace("to a test CI cannot run", "to a slow test")),
+                                 ("doubled", text + "\n" + self.EXCEPTION)):
+                with self.subTest(path=path, mutant=name):
+                    self.assertFalse(self.sentences_once(mutant))
+
+    def test_a_held_lock_with_a_dead_holder_is_not_refused_and_a_malformed_record_is_read_without_error(self):
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        fd = self.hs._take(self.state, 3)[0]
+        self.fds.append(fd)
+        self.hs._record(fd, "ghost", dead.pid, "x", time.time(), {"kind": "full", "worktree": self.A})
+        os.pwrite(fd, json.dumps({"kind": "full", "worktree": self.A, "name": "ghost", "pid": dead.pid, "wrapper": dead.pid}).encode(), 0)
+        self.assertIsNone(self.hs.refusal(self.state, self.A, []))
+        self.assertIsNone(self.hs.refusal(self.state, self.A, [{"kind": "full", "worktree": "/elsewhere"}]))
+        text = self.hs.refusal(self.state, self.A, [{"kind": "full", "worktree": self.A, "name": "\x1b[31mq", "pid": "x", "since": "y"}])
+        self.assertIn("pid unknown, since unknown time", text)
+        self.assertNotIn("\x1b", text)
 
     def test_the_sentences_name_roles_never_agents_or_people(self):
         for sentence in (self.DEFAULT, self.EXCEPTION, self.REFUSAL):
