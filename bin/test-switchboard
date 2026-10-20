@@ -73658,9 +73658,19 @@ class TestFocusedLocalRuns(unittest.TestCase):
             self.assertEqual(self.start([self.script], self.A)[0], 0)
         self.assertTrue(seen, "no record naming the worktree when the line was left")
 
+    def test_a_test_that_itself_exits_64_is_a_plain_failure_not_a_refusal(self):
+        def runner(argv, **kwargs):
+            return mock.Mock(returncode=64 if "heavy" in argv else 0, stdout="/r\n", stderr="usage error\n" if "heavy" in argv else "")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), mock.patch.object(sb, "preflight_load", lambda: (0.0, 4)):
+            self.assertEqual(sb.cmd_preflight_pr(None, runner, time.time), 1)
+        self.assertIn("FAIL cli-surface (", out.getvalue())
+        self.assertIn("exit 64:", out.getvalue())
+        self.assertNotIn("refused", out.getvalue())
+
     def test_preflight_reports_a_refused_sub_check_as_a_fail_that_says_so(self):
         def runner(argv, **kwargs):
-            done = mock.Mock(returncode=64 if "heavy" in argv else 0, stdout="/r\n", stderr="")
+            done = mock.Mock(returncode=64 if "heavy" in argv else 0, stdout="/r\n", stderr="heavy: refused: a full-suite job is already queued or running in this worktree (first, x, pid 1, since t)\n" if "heavy" in argv else "")
             return done
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), mock.patch.object(sb, "preflight_load", lambda: (0.0, 4)):
@@ -73727,18 +73737,70 @@ class TestFocusedLocalRuns(unittest.TestCase):
                 with self.subTest(path=path, mutant=name):
                     self.assertFalse(self.sentences_once(mutant))
 
-    def test_a_held_lock_with_a_dead_holder_is_not_refused_and_a_malformed_record_is_read_without_error(self):
-        dead = subprocess.Popen(["true"])
-        dead.wait()
+    def write_record(self, record):
+        """A slot held by this test with `record` written WHOLE (truncated first); read back as the dict meant, before anything is asserted of it."""
         fd = self.hs._take(self.state, 3)[0]
         self.fds.append(fd)
-        self.hs._record(fd, "ghost", dead.pid, "x", time.time(), {"kind": "full", "worktree": self.A})
-        os.pwrite(fd, json.dumps({"kind": "full", "worktree": self.A, "name": "ghost", "pid": dead.pid, "wrapper": dead.pid}).encode(), 0)
-        self.assertIsNone(self.hs.refusal(self.state, self.A, []))
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, json.dumps(record).encode(), 0)
+        self.assertEqual(self.hs._read_info(fd), record)
+        return fd
+
+    def dead_pid(self):
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        return dead.pid
+
+    LIVE_CASES = (   # (id, record fields, refused?)
+        ("both-dead", {"pid": "DEAD", "wrapper": "DEAD"}, False),
+        ("command-alive", {"pid": "LIVE", "wrapper": "DEAD"}, True),
+        ("wrapper-alive", {"pid": "DEAD", "wrapper": "LIVE"}, True),
+        ("pid-reused-by-another-process", {"pid": "LIVE", "cstart": "Mon Jan  1 00:00:00 1990", "wrapper": "DEAD"}, False),
+        ("wrapper-pid-reused", {"pid": "DEAD", "wrapper": "LIVE", "wstart": "Mon Jan  1 00:00:00 1990"}, False),
+        ("pid-with-its-real-start", {"pid": "LIVE", "cstart": "REAL", "wrapper": "DEAD"}, True),
+    )
+
+    def case(self, fields):
+        live, dead = os.getpid(), self.dead_pid()
+        record = {"kind": "full", "worktree": self.A, "name": "ghost", "program": "x", "since": 1}
+        for key, value in fields.items():
+            record[key] = live if value == "LIVE" else dead if value == "DEAD" else self.hs._start_of(live) if value == "REAL" else value
+        return record
+
+    def test_a_held_lock_is_refused_only_for_a_holder_that_is_really_running(self):
+        for name, fields, refused in self.LIVE_CASES:
+            with self.subTest(case=name):
+                self.reset()
+                self.write_record(self.case(fields))
+                self.assertEqual(self.hs.refusal(self.state, self.A, []) is not None, refused)
+
+    def test_mutants_of_the_liveness_rule_flip_a_case(self):
+        flips = {}
+        for label, patch in (("always-live", mock.patch.object(self.hs, "_pid_alive", lambda pid, start=None: True)),
+                             ("pid-only", mock.patch.object(self.hs, "LIVE_KEYS", (("pid", ""), ("wrapper", "")))),
+                             ("wrapper-half-dropped", mock.patch.object(self.hs, "LIVE_KEYS", (("pid", "cstart"),))),
+                             ("command-half-dropped", mock.patch.object(self.hs, "LIVE_KEYS", (("wrapper", "wstart"),)))):
+            with patch:
+                flips[label] = []
+                for name, fields, refused in self.LIVE_CASES:
+                    self.reset()
+                    self.write_record(self.case(fields))
+                    if (self.hs.refusal(self.state, self.A, []) is not None) != refused:
+                        flips[label].append(name)
+        self.assertEqual(flips, {"always-live": ["both-dead", "pid-reused-by-another-process", "wrapper-pid-reused"],
+                                 "pid-only": ["pid-reused-by-another-process", "wrapper-pid-reused"],
+                                 "wrapper-half-dropped": ["wrapper-alive"], "command-half-dropped": ["command-alive", "pid-with-its-real-start"]})
+
+    def test_a_malformed_record_is_read_without_error(self):
         self.assertIsNone(self.hs.refusal(self.state, self.A, [{"kind": "full", "worktree": "/elsewhere"}]))
         text = self.hs.refusal(self.state, self.A, [{"kind": "full", "worktree": self.A, "name": "\x1b[31mq", "pid": "x", "since": "y"}])
         self.assertIn("pid unknown, since unknown time", text)
         self.assertNotIn("\x1b", text)
+        fd = self.hs._take(self.state, 3)[0]
+        self.fds.append(fd)
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, b'{"kind": "full", "worktree"', 0)   # cut off: no record
+        self.assertIsNone(self.hs.refusal(self.state, self.A, []))
 
     def test_the_sentences_name_roles_never_agents_or_people(self):
         for sentence in (self.DEFAULT, self.EXCEPTION, self.REFUSAL):
@@ -73770,6 +73832,16 @@ class TestFocusedLocalRuns(unittest.TestCase):
             ("step-condition-it-may-not-run", wf.replace("${{ !cancelled() }}", "${{ github.ref == 'x' }}"), ["cloud/x"], None),
             ("only-a-name-or-comment", wf.replace("          bin/test-cloud-launcher 2>&1 | tee out.txt", "          # bin/test-cloud-launcher\n          true"), ["cloud/x"], None),
             ("changed-files-unknown", wf, None, None),
+            ("job-continue-on-error-true", wf.replace("    runs-on", "    continue-on-error: true\n    runs-on"), ["cloud/x"], None),
+            ("job-continue-on-error-expression", wf.replace("    runs-on", "    continue-on-error: ${{ matrix.x }}\n    runs-on"), ["cloud/x"], None),
+            ("job-continue-on-error-false-counts", wf.replace("    runs-on", "    continue-on-error: false\n    runs-on"), ["cloud/x"], "test-cloud"),
+            ("step-continue-on-error-expression", wf.replace("        run: |", "        continue-on-error: ${{ true }}\n        run: |"), ["cloud/x"], None),
+            ("run-only-echoes-the-name", wf.replace("          bin/test-cloud-launcher 2>&1 | tee out.txt", "          echo bin/test-cloud-launcher"), ["cloud/x"], None),
+            ("single-line-run-echo", wf.replace("        run: |\n          bin/test-cloud-launcher 2>&1 | tee out.txt", "        run: echo bin/test-cloud-launcher"), ["cloud/x"], None),
+            ("single-line-run-counts", wf.replace("        run: |\n          bin/test-cloud-launcher 2>&1 | tee out.txt", "        run: bin/test-cloud-launcher"), ["cloud/x"], "test-cloud"),
+            ("failure-swallowed-with-or-true", wf.replace("tee out.txt", "tee out.txt || true"), ["cloud/x"], None),
+            ("failure-swallowed-with-set-plus-e", wf.replace("          bin/test-cloud-launcher", "          set +e\n          bin/test-cloud-launcher"), ["cloud/x"], None),
+            ("mentioned-after-another-command", wf.replace("          bin/test-cloud-launcher", "          true; bin/test-cloud-launcher"), ["cloud/x"], None),
             ("list-form-trigger", wf.replace("on:\n  pull_request:\n  push:\n    branches: [main]\n", "on: [push, pull_request]\n"), ["cloud/x"], "test-cloud"),
             ("trigger-with-paths-filter", wf.replace("  pull_request:\n", "  pull_request:\n    paths: ['docs/**']\n"), ["cloud/x"], None),
             ("trigger-with-branches-filter", wf.replace("  pull_request:\n", "  pull_request:\n    branches: [main]\n"), ["cloud/x"], None),
@@ -73814,6 +73886,23 @@ class TestFocusedLocalRuns(unittest.TestCase):
                 else:
                     self.assertEqual(len(launcher), 1)
                     self.assertNotIn("skipped", out)
+
+    def test_every_job_level_key_that_can_hide_a_failure_is_refused_at_job_and_step_level(self):
+        wf = self.PR_ON + self.JOB
+        for key in sb.PREFLIGHT_JOB_KEYS_HIDING:
+            value = "'x'" if key == "if" else "true"
+            with self.subTest(key=key, level="job"):
+                self.assertIsNone(sb.workflow_job_running(wf.replace("    runs-on", "    %s: %s\n    runs-on" % (key, value)), "bin/test-cloud-launcher"))
+            with self.subTest(key=key, level="step"):
+                text = wf.replace("        run: |", "        %s: %s\n        run: |" % (key, value)).replace("        if: ${{ !cancelled() }}\n", "", 1 if key == "if" else 0)
+                self.assertIsNone(sb.workflow_job_running(text, "bin/test-cloud-launcher"))
+        self.assertEqual(sb.workflow_job_running(wf, "bin/test-cloud-launcher"), "test-cloud")
+
+    def test_a_mutant_that_forgets_a_job_level_key_skips_a_suite_ci_cannot_fail_on(self):
+        wf = self.PR_ON + self.JOB.replace("    runs-on", "    continue-on-error: true\n    runs-on")
+        with mock.patch.object(sb, "PREFLIGHT_JOB_KEYS_HIDING", ("if",)):
+            self.assertEqual(sb.workflow_job_running(wf, "bin/test-cloud-launcher"), "test-cloud")   # the weakened rule would skip it
+        self.assertIsNone(sb.workflow_job_running(wf, "bin/test-cloud-launcher"))
 
     def test_the_skip_leaves_the_other_cloud_suites_and_classes_as_they_were(self):
         code, out, heavy = self.preflight(self.PR_ON + self.JOB, ["cloud/x"])

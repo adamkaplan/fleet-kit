@@ -553,6 +553,9 @@ def held_by(state_dir, slots=DEFAULT_SLOTS):
     return pids
 
 
+LIVE_KEYS = (("pid", "cstart"), ("wrapper", "wstart"))   # a held slot's record names a live holder by the command's pid and start time, or the wrapper's
+
+
 def _held_records(state_dir, slots=DEFAULT_SLOTS):
     """The record of each slot held NOW (the express slot included), as the holder wrote it. Nothing is created."""
     found = []
@@ -570,23 +573,18 @@ def _held_records(state_dir, slots=DEFAULT_SLOTS):
                 if err.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
                     continue
             info = _read_info(fd)
-            if any(_pid_alive(info.get(key)) for key in ("pid", "wrapper")):   # a record the last holder left behind, under a lock a new holder has just taken, names nobody who is running
+            if any(_pid_alive(info.get(key), info.get(start)) for key, start in LIVE_KEYS):   # a record the last holder left behind, under a lock a new holder has just taken, names nobody who is running
                 found.append(info)
         finally:
             os.close(fd)
     return found
 
 
-def _pid_alive(pid):
+def _pid_alive(pid, start=None):
+    """Is the process the record names still there? With its recorded start time a reused pid is another process (the pid alone only when no start time was recorded)."""
     if not isinstance(pid, int) or isinstance(pid, bool) or pid < 2:
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return True
-    return True
+    return _alive(pid, start if isinstance(start, str) else "")
 
 
 def _since_text(since):
