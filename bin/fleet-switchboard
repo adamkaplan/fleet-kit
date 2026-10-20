@@ -22969,13 +22969,7 @@ def owner_terminal_problem(stdin=None, stdout=None, ps=None, start_pid=None, dep
 
 
 def caller_kind(clients):
-    """THE ONE human-terminal check: every command that must be run by the owner in person asks this function, and no other code
-    decides who is a person. Today: `verdict --as owner`, `gates mode`, `gates off|on`, `move` (its operator path) and `waive` (its chief-of-staff caller is an agent
-    session; its person path asks this function like the rest). Returns (kind, who[, role]).
-    "person" (the owner's own terminal: no agent session and no pane, or a session v2 knows is not a fleet
-    agent), "agent" (a fleet agent, even one nobody registered) or "unknown" (an uncertain identity: #138 refuses it, never reads
-    it as a person; or the registry cannot be read). All agents share one GitHub login, so the login cannot be the test: it is the
-    session identity. A mistake-guard, not a boundary: an agent that unsets its own session and pane variables looks like a person."""
+    """The ONE body of the human-terminal check (`gates_caller_kind` and `entry_caller_kind` differ only in how they build the clients): `clients()` returns (herdr, v2). See `gates_caller_kind`."""
     try:
         herdr, v2 = clients()
         fleet = caller_fleet(herdr, v2, os.environ)
@@ -22992,7 +22986,13 @@ def caller_kind(clients):
 
 
 def gates_caller_kind(runner, now):
-    """The check above, over the engine's own clients (every owner-only command)."""
+    """THE ONE human-terminal check: every command that must be run by the owner in person asks this function, and no other code
+    decides who is a person. Today: `verdict --as owner`, `gates mode`, `gates off|on`, `move` (its operator path) and `waive` (its chief-of-staff caller is an agent
+    session; its person path asks this function like the rest). Returns (kind, who[, role]).
+    "person" (the owner's own terminal: no agent session and no pane, or a session v2 knows is not a fleet
+    agent), "agent" (a fleet agent, even one nobody registered) or "unknown" (an uncertain identity: #138 refuses it, never reads
+    it as a person; or the registry cannot be read). All agents share one GitHub login, so the login cannot be the test: it is the
+    session identity. A mistake-guard, not a boundary: an agent that unsets its own session and pane variables looks like a person."""
     def clients():
         engine, _, _ = build_engine(runner, now, "cli", writable=False)
         return engine.herdr, engine.v2
