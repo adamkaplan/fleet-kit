@@ -54,7 +54,7 @@ class ReaperEndings(base.Base):
         elif name.startswith("login failure: no login"):
             del env["CW_KUBE_CONTEXT"]
         elif name == "another reaper holds the lock":
-            self.holder = cw.reaper_lock(cw.reaper_identity(env, "cw"))
+            self.holder = cw.reaper_lock(cw.reaper_identity("cw"))
             self.addCleanup(os.close, self.holder)
         try:
             with redirect_stderr(err), redirect_stdout(io.StringIO()):
@@ -214,7 +214,7 @@ class RestartMeetsAStoppedPod(base.Base):
 class TwoReapersOneCluster(base.Base):
     def test_a_second_reaper_with_another_audit_directory_is_still_a_rival(self):
         """The lock is keyed on what the reaper acts on (cluster and namespace), not on where it keeps its own files."""
-        holder = cw.reaper_lock(cw.reaper_identity(self.env, "cw"))
+        holder = cw.reaper_lock(cw.reaper_identity("cw"))
         self.addCleanup(os.close, holder)
         other = dict(self.env, CW_CLOUD_AUDIT=os.path.join(self.tmp.name, "elsewhere", "audit.jsonl"), XDG_STATE_HOME=os.path.join(self.tmp.name, "state"))
         before = len(self.calls())
@@ -224,16 +224,6 @@ class TwoReapersOneCluster(base.Base):
         self.assertEqual(code, cw.EXIT_REFUSED)
         self.assertRegex(err.getvalue(), LINE + "not started: another reaper holds the lock")
         self.assertEqual(len(self.calls()), before)   # no kubectl call: no end hook
-
-    def test_a_reaper_of_another_cluster_or_namespace_is_not_a_rival(self):
-        holder = cw.reaper_lock(cw.reaper_identity(self.env, "cw"))
-        self.addCleanup(os.close, holder)
-        for other in (dict(self.env, CW_KUBE_CONTEXT="acme-other"), dict(self.env, CW_CLOUD_NAMESPACE="other")):
-            with self.subTest(other=sorted(set(other.items()) - set(self.env.items()))):
-                err = io.StringIO()
-                with redirect_stderr(err), redirect_stdout(io.StringIO()):
-                    code = cw.main(["reap"], other, self.clock, lambda s: None)
-                self.assertNotEqual(code, cw.EXIT_REFUSED, err.getvalue())
 
     def setUp(self):
         super().setUp()
@@ -247,6 +237,67 @@ class TwoReapersOneCluster(base.Base):
     def calls(self):
         with open(self.env["FAKE_KUBE_CALLS"]) as f:
             return [json.loads(x) for x in f]
+
+    def logins(self):
+        """One rival per way of logging in (each a login the launcher accepts): none of them changes what the reaper acts on."""
+        tok = os.path.join(self.tmp.name, "token")
+        with open(tok, "w") as f:
+            f.write("".join(chr(97 + (i * 3) % 26) for i in range(40)))   # built at run time
+        by_server = lambda server: {"CW_CLOUD_SERVER": server, "CW_CLOUD_TOKEN_FILE": tok}
+        return {
+            "a kube context": {"CW_KUBE_CONTEXT": "acme-other"},
+            "a kubeconfig and a context": {"CW_KUBECONFIG": os.path.join(self.tmp.name, "kubeconfig"), "CW_KUBE_CONTEXT": "acme-cw"},
+            "a token file and a server": by_server("https://api.example.internal"),
+            "a server with a trailing slash": by_server("https://api.example.internal/"),
+            "a server in capitals": by_server("HTTPS://API.EXAMPLE.INTERNAL"),
+        }
+
+    def test_a_rival_is_a_rival_whatever_its_login_says(self):
+        holder = cw.reaper_lock(cw.reaper_identity("cw"))   # the service: a token-file login
+        self.addCleanup(os.close, holder)
+        for name, login in self.logins().items():
+            with self.subTest(login=name):
+                other = {k: v for k, v in self.env.items() if k != "CW_KUBE_CONTEXT"}
+                other.update(login)
+                before = len(self.calls())
+                err = io.StringIO()
+                with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                    code = cw.main(["reap"], other, self.clock, lambda s: None)
+                self.assertEqual(code, cw.EXIT_REFUSED, err.getvalue())
+                self.assertRegex(err.getvalue(), LINE + "not started: another reaper holds the lock")
+                self.assertEqual(len(self.calls()), before)
+
+    def test_the_key_holds_nothing_about_the_login(self):
+        import inspect
+        self.assertEqual(list(inspect.signature(cw.reaper_identity).parameters), ["namespace"])   # a login input put back changes this
+        self.assertEqual(cw.reaper_identity("cw"), cw.reaper_identity("cw"))
+        self.assertNotEqual(cw.reaper_identity("cw"), cw.reaper_identity("other"))
+
+    def test_a_reaper_of_another_namespace_is_not_a_rival(self):
+        holder = cw.reaper_lock(cw.reaper_identity("cw"))
+        self.addCleanup(os.close, holder)
+        other = dict(self.env, CW_CLOUD_NAMESPACE="other")
+        err = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(io.StringIO()):
+            code = cw.main(["reap"], other, self.clock, lambda s: None)
+        self.assertNotEqual(code, cw.EXIT_REFUSED, err.getvalue())
+
+    def test_a_user_with_no_password_entry_gets_a_reason_and_the_launcher_still_imports(self):
+        old = cw.REAPER_LOCK_ROOT
+        cw.REAPER_LOCK_ROOT = None
+        self.addCleanup(setattr, cw, "REAPER_LOCK_ROOT", old)
+        def nobody(uid):
+            raise KeyError(uid)
+        orig = cw.pwd.getpwuid
+        self.addCleanup(setattr, cw.pwd, "getpwuid", orig)
+        cw.pwd.getpwuid = nobody
+        with self.assertRaises(cw.ReaperLocked) as ctx:
+            cw.reaper_lock(cw.reaper_identity("cw"))
+        self.assertIn("password database", str(ctx.exception))
+        err = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(io.StringIO()):
+            code = cw.main(["status"], self.env, self.clock, lambda s: None)   # a command that takes no lock still works
+        self.assertEqual(code, 0, err.getvalue())
 
     def test_a_second_reaper_started_while_the_first_stops_exits_and_touches_nothing(self):
         seen, real = {}, cw.Launcher.stop
@@ -277,7 +328,7 @@ class TwoReapersOneCluster(base.Base):
         self.assertNotIn("run-id", reasons["past1"])   # a pod made without one is stopped by name, as before
 
     def test_a_killed_holder_releases_the_lock(self):
-        code = ("import sys,time;sys.path.insert(0,%r);import cloud_worker as c;c.reaper_lock(c.reaper_identity({'CW_KUBE_CONTEXT': 'acme-cw'}, 'cw'), sys.argv[1]);print('held',flush=True);time.sleep(60)" % cw.__file__.rsplit("/", 1)[0])
+        code = ("import sys,time;sys.path.insert(0,%r);import cloud_worker as c;c.reaper_lock(c.reaper_identity('cw'), sys.argv[1]);print('held',flush=True);time.sleep(60)" % cw.__file__.rsplit("/", 1)[0])
         holder = subprocess.Popen([sys.executable, "-c", code, self.lock_root], stdout=subprocess.PIPE, text=True)
         self.addCleanup(holder.stdout.close)
         self.addCleanup(holder.wait)
@@ -292,7 +343,7 @@ class TwoReapersOneCluster(base.Base):
 
     def test_a_lock_path_that_is_not_the_users_private_file_is_refused(self):
         d = self.lock_root
-        ident = cw.reaper_identity(self.env, "cw")
+        ident = cw.reaper_identity("cw")
         os.makedirs(d, mode=0o700, exist_ok=True)
         lock = os.path.join(d, "reaper-%s.lock" % __import__("hashlib").sha256(ident.encode()).hexdigest()[:16])
         victim = os.path.join(self.tmp.name, "victim")

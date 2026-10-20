@@ -1843,27 +1843,32 @@ def _reap_exit_line(clock, why):
     print("cloud-worker: %s reaper exiting: %s" % (iso(now), why), file=sys.stderr)
 
 
-def _user_state_dir():
-    """The user's state directory from the password database, never from the environment: where two reapers of one user must agree."""
-    return os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".local", "state", "cw-cloud")
+REAPER_LOCK_ROOT = None   # tests point it at a temporary directory; None means the user's own directory, found where it is used
 
 
-REAPER_LOCK_ROOT = os.path.join(_user_state_dir(), "locks")   # tests point it at a temporary directory
+def _lock_root():
+    """The user's lock directory from the password database, never from the environment: where every reaper of one user must agree.
+    Found when a reaper starts, not at import: a user with no password entry gets a reason from the reaper, not a broken launcher."""
+    if REAPER_LOCK_ROOT:
+        return REAPER_LOCK_ROOT
+    try:
+        return os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".local", "state", "cw-cloud", "locks")
+    except KeyError:
+        raise ReaperLocked("this user has no entry in the password database, so the reaper lock directory cannot be found")
 
 
-def reaper_identity(env, namespace):
-    """What a reaper ACTS ON: the cluster it logs in to and the namespace. Two reapers with this the same are rivals, whatever their audit
-    file, state directory or other settings say."""
-    return "\n".join([(env.get("CW_CLOUD_SERVER") or "").strip(), (env.get("CW_KUBE_CONTEXT") or "").strip(),
-                      (env.get("CW_KUBECONFIG") or "").strip(), namespace])
+def reaper_identity(namespace):
+    """What makes two reapers rivals: the same user and the same namespace, and NOTHING about how either logs in (a token file, a kube
+    context, a kubeconfig, a server spelled two ways all reach the same pods). The lock is per user, so the user is the directory."""
+    return "namespace\n" + namespace
 
 
 def reaper_lock(identity, root=None):
-    """The one lock between reapers of one cluster and namespace: an exclusive, non-blocking flock on a 0600 file named for a hash of
+    """The one lock between a user's reapers of one namespace: an exclusive, non-blocking flock on a 0600 file named for a hash of
     `identity`, in a private per-user directory (from the password database), held for the process's life; the kernel drops it when
     the process dies, however it dies. Returns the open descriptor. Raises ReaperLocked for a second reaper, a directory or file that
     is not the user's own, or a link at the path."""
-    directory = root or REAPER_LOCK_ROOT
+    directory = root or _lock_root()
     try:
         os.makedirs(directory, mode=0o700, exist_ok=True)
         dinfo = os.stat(directory)
@@ -1889,7 +1894,7 @@ def _reap_main(L, a, sleep):
     """The reaper's loop. Whatever ends it writes ONE line saying why (signal, error, or the end of the loop)."""
     old, why, lock = L._catch_signals(), None, None
     try:
-        lock = reaper_lock(reaper_identity(L.env, L.kube.ns))   # BEFORE the first pass: two reapers would both run an end hook for one pod
+        lock = reaper_lock(reaper_identity(L.kube.ns))   # BEFORE the first pass: two reapers would both run an end hook for one pod
         while True:
             res = L.reap()
             print(json.dumps([dict({"worker": w, "reason": r, "exit": c}, **L.reap_results.get(w, {})) for w, r, c in res]))
