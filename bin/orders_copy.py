@@ -23,8 +23,8 @@ NEEDS = ("PROG", "EXIT_OK", "EXIT_ERROR", "EXIT_USAGE", "OrdersError", "IntentEr
 
 
 def insert_bullet(sb, body, bullet):
-    """`body` with `bullet` (an order's whole text, as `section_orders` gives it) added to the section, verbatim. The placement, the
-    new section and the limit of 20 are the existing writer's: it writes a placeholder order, which is then replaced by `bullet`."""
+    """`body` with `bullet` (an order's whole text, as `section_orders` gives it) added to the section, verbatim. The placement and the
+    new section are the existing writer's: it writes a placeholder order, which is then replaced by `bullet`."""
     marked = sb.add_order_to_body(body, SENTINEL, SENTINEL_BY, SENTINEL_DATE)
     line = "- %s (ordered by %s, %s)" % (SENTINEL, SENTINEL_BY, SENTINEL_DATE)
     return marked.replace(line, "- " + bullet, 1)

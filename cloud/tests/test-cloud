@@ -719,5 +719,21 @@ planted "an unknown law id" "${row}s/FK-LAW-1,/FK-LAW-99,/"
 planted "'covered, mostly'" "${row}s/| covered |\$/| covered, mostly |/"
 planted "a GAP whose item is -" "${row}s/| covered |\$/| GAP (owner: x; item: -) |/"
 planted "a law id not in the list" "${row}s/FK-LAW-1,/FK-LAW-9,/"
+# the item lists (kept by hand in cloud/tests/parity-items.txt): one mutant per member of each list
+items="$here/tests/parity-items.txt"
+for n in $(sed -n 's/^closed \([0-9]*\)$/\1/p' "$items"); do   # every closed item, cited as the GAP's only item or beside an open one, fails
+  planted "a GAP citing closed item #$n" "${row}s/| covered |\$/| GAP (owner: x; item: #$n) |/"
+  planted "a GAP citing closed #$n next to an open item" "${row}s/| covered |\$/| GAP (owner: x; item: #543 and #$n) |/"
+done
+for n in $(sed -n 's/^open \([0-9]*\)$/\1/p' "$items"); do   # every open item is accepted
+  sed "${row}s/| covered |\$/| GAP (owner: x; item: #$n (open)) |/" "$tbl" > "$tmp/p.md"
+  "$chk" "$tmp/p.md" >/dev/null 2>&1 && ok "parity table: a GAP naming open item #$n passes" || bad "parity table: open item #$n refused"
+done
+planted "a GAP naming no open item" "${row}s/| covered |\$/| GAP (owner: x; item: a follow-up) |/"
+planted "a GAP naming an item in neither list" "${row}s/| covered |\$/| GAP (owner: x; item: #99999) |/"
+printf 'open 543\nopen 2\nclosed 2\n' > "$tmp/bad-items.txt"; "$chk" "$tbl" "$here/../docs/cloud-guard-law-ids.md" "$tmp/bad-items.txt" >/dev/null 2>&1; [ $? = 1 ] && ok "parity table: a number in both lists fails" || bad "parity table: a number in both lists"
+"$chk" "$tbl" "$here/../docs/cloud-guard-law-ids.md" "$tmp/no-such-items.txt" >/dev/null 2>&1; [ $? = 1 ] && ok "parity table: a missing item-lists file fails" || bad "parity table: a missing item-lists file"
+printf 'open 543\n' > "$tmp/one-sided.txt"; "$chk" "$tbl" "$here/../docs/cloud-guard-law-ids.md" "$tmp/one-sided.txt" >/dev/null 2>&1; [ $? = 1 ] && ok "parity table: lists with no closed item fail" || bad "parity table: lists with no closed item"
+printf 'closed 639\n' > "$tmp/one-sided.txt"; "$chk" "$tbl" "$here/../docs/cloud-guard-law-ids.md" "$tmp/one-sided.txt" >/dev/null 2>&1; [ $? = 1 ] && ok "parity table: lists with no open item fail" || bad "parity table: lists with no open item"
 printf '# empty\n' > "$tmp/e.md"; "$chk" "$tmp/e.md" >/dev/null 2>&1; [ $? = 1 ] && ok "parity table: no rows exits 1" || bad "parity table: no rows"
 [ $fail = 0 ] && echo "RESULT: PASS" || { echo "RESULT: FAIL"; exit 1; }

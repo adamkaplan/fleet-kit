@@ -297,7 +297,7 @@ class Driver:
         return bool(replies and isinstance(replies[-1].get("time"), dict) and replies[-1]["time"].get("completed"))
 
     def stop(self, reason):
-        rc, out, err = self.run_cloud_worker(["stop", self.a.worker, "--reason", reason], timeout=600)
+        rc, out, err = self.run_cloud_worker(["stop", self.a.worker, "--reason", reason, "--run-id", self.nonce], timeout=600)
         self.relay(err)
         if out.strip():
             last = out.strip().splitlines()[-1]
