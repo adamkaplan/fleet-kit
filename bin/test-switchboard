@@ -59260,6 +59260,13 @@ class TestJanitorLiveKeeps(Base):
         self.apply()
         self.assertFalse(timeout.exists(), "with every source readable and nothing holding it, the same entry goes")
 
+    def test_s7_a_registry_that_raises_anything_keeps_the_entry(self):
+        entry = self.old("registry-raises", directory=True)
+        with mock.patch.object(sb, "janitor_agent_roots", side_effect=RuntimeError("boom")):
+            out = self.apply()
+        self.assertTrue(entry.exists())
+        self.assertIn("agent registry cannot be read", out)
+
     def test_u1_an_entry_nothing_owns_uses_or_touched_is_removed_as_before(self):
         gone = [self.old("old-%d.log" % n) for n in range(2)] + [self.old("old-dir", directory=True)]
         self.registry({"live": {"cwd": str(self.home / "elsewhere")}})
@@ -59589,6 +59596,14 @@ class TestDaemonTempJanitor(Base):
         self.go(source)
         self.assertTrue(victim.exists())
         self.assertEqual(self.events("janitor.would_remove")[0]["detail"]["gate"], "unreadable")
+
+    def test_s4_a_yes_recorded_under_another_rule_applies_nothing(self):
+        victim = self.old("scratch-old-unnamed.log")
+        engine, source = self.daemon({"daemon_apply": True}, acked=True)
+        ack = self.world.state / sb.TEMP_JANITOR_ACK_FILE
+        ack.write_text(json.dumps(dict(json.loads(ack.read_text()), rule="another-rule")))
+        self.go(source)
+        self.assertTrue(victim.exists())
 
     def test_s8_a_name_is_only_in_the_private_audit_and_the_message(self):
         engine, source = self.daemon({"daemon_apply": True}, acked=False)
