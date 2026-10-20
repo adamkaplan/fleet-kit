@@ -57,6 +57,9 @@ QUEUE_LOCK = "heavy-queue.lock"
 QUEUE_MAX = 1000                        # entries read; more reads as a corrupt file
 QUEUE_BYTES = 262144
 TEMPORARY_NAME = re.compile(r"heavy-queue\.json\.([0-9]{1,9})\.tmp", re.ASCII)   # a temporary file of the order, with the pid of the process that wrote it
+HARD_MAX_SECONDS = 14400                # the longest any run may hold a slot (4 h); a request above it, or 0, reads as this: a bound always exists
+ORPHAN_LOCK = "heavy-orphan.lock"       # held (not blocking) by whoever is stopping an orphan, so two checkers never stop and report the same one
+STOP_TOLD = ("sent", "unknown name", "failed")   # what the audit says of the message to the lane
 PID_MAX = 2 ** 22                       # no pid is larger (Linux pid_max at most 4194304)
 FORWARDED = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
@@ -65,16 +68,139 @@ class HeavyError(Exception):
     """A refusal with a sentence for the caller."""
 
 
+SELECTORS = ("-k", "--filter", "-run", "-c", "-e", "-m")   # options whose NEXT word is a value (a filter, a shell string): the value is never read for a kind
+E2E_WORDS = ("playwright", "chromium", "chrome", "cypress", "puppeteer", "webdriver", "e2e", "--browser", "--headed")   # a WHOLE word of the command, or a part of the program's own name
+
+
+def _split(command):
+    """(program, rest): the program's basename and the words after it, once the wrappers that only start it are skipped (an interpreter given a script or `-m module`,
+    `timeout N`, `env VAR=x`, `taskpolicy -b`, `nice -n N`, `npx`). The kind is read from these and never from a substring of an argument."""
+    words = [str(word) for word in command]
+    while words:
+        base = os.path.basename(words[0])
+        if re.fullmatch(r"python[0-9.]*", base) or base in ("node", "sh", "bash", "zsh", "npx"):
+            if len(words) > 1 and words[1] == "-m":
+                words = words[2:]   # the module is the program
+                break
+            if len(words) > 1 and not words[1].startswith("-"):
+                words = words[1:]
+                continue
+            break
+        elif base == "timeout":
+            words = words[1:]
+            while words and (words[0].startswith("-") or re.fullmatch(r"[0-9.]+[smhd]?", words[0])):
+                words = words[1:]
+        elif base == "env":
+            words = words[1:]
+            while words and (words[0].startswith("-") or "=" in words[0]):
+                words = words[1:]
+        elif base in ("taskpolicy", "nice"):
+            words = words[1:]
+            while words and (words[0].startswith("-") or re.fullmatch(r"[0-9]+", words[0])):
+                words = words[1:]
+        else:
+            break
+    return (os.path.basename(words[0]).lower(), words[1:]) if words else ("", [])
+
+
+def _options(rest, any_option=False):
+    """The words of `rest` that are not the value of an option: always the value of a selector (-k, -c ...), and with `any_option` the word after any option-looking word
+    (`--name chrome`), except after the whole option words that select a kind themselves."""
+    skip, found = False, []
+    for word in rest:
+        if skip:
+            skip = False
+            continue
+        found.append(word)
+        if word in SELECTORS or (any_option and word.startswith("-") and "=" not in word and word not in E2E_WORDS):
+            skip = True
+    return found
+
+
+def _is_e2e(program, rest, short):
+    return any(tool in program for tool in E2E_WORDS if not tool.startswith("-")) or any(word.lower() in E2E_WORDS for word in _options(rest, any_option=True))
+
+
+def _is_focused(program, rest, short):
+    if short or any(word in ("-k", "--filter", "-run") for word in rest):
+        return True
+    named = [program] + [os.path.basename(word) for word in _options(rest)]
+    if any(re.fullmatch(r"(test_[^/]*\.py|[^/]*\.test\.[^/]*)", word) for word in named) or any(re.search(r"\.py::\S", word) for word in _options(rest)):
+        return True
+    chosen = [word for word in rest if not word.startswith("-")]
+    return program == "unittest" and bool(chosen) and chosen[0] != "discover"   # a dotted name is a focused run; bare or `discover` is the whole suite
+
+
+def _is_full(program, rest, short):
+    return (program.startswith("test-") or program in ("pytest", "unittest") or [program] + rest[:1] in (["make", "test"], ["npm", "test"], ["go", "test"]))
+
+
+# THE kind table: (kind, default ceiling in seconds, matcher(program, rest, short)); the first match wins, "other" matches everything. The defaults come from the
+# measured run times in docs/switchboard.md ("heavy"); e2e has no sample (a judgement).
+KINDS = (
+    ("e2e", 3600, _is_e2e),
+    ("focused", 1800, _is_focused),
+    ("full", 5400, _is_full),
+    ("other", 3600, lambda program, rest, short: True),
+)
+KIND_DEFAULTS = {kind: seconds for kind, seconds, _match in KINDS}
+
+
+def classify(command, short=False):
+    """The kind of run `command` is, read from the program and its whole option words: "e2e", "focused", "full" or "other". A path, a filter value or a shell
+    string that merely contains a kind's word does not change it."""
+    program, rest = _split(command)
+    for kind, _seconds, match in KINDS:
+        if match(program, rest, short):
+            return kind
+    return "other"
+
+
+def _whole(value, low=1, high=10 ** 9):
+    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+
+
 def settings(raw):
-    """The slot count from the config's `heavy` value (None, or {"slots": n}); HeavyError for anything else."""
+    """The slot count from the config's `heavy` value (None, or {"slots": n, "ceilings": {...}}); HeavyError for anything else."""
     if raw is None:
         return DEFAULT_SLOTS
-    if not isinstance(raw, dict) or set(raw) - {"slots"}:
-        raise HeavyError("'heavy' must be an object with only \"slots\" in it, got %r" % (raw,))
+    if not isinstance(raw, dict) or set(raw) - {"slots", "ceilings"}:
+        raise HeavyError("'heavy' must be an object with only \"slots\" and \"ceilings\" in it, got %r" % (raw,))
     slots = raw.get("slots", DEFAULT_SLOTS)
     if not isinstance(slots, int) or isinstance(slots, bool) or not 1 <= slots <= SLOTS_MAX:
         raise HeavyError("'heavy.slots' must be a whole number from 1 to %d, got %r" % (SLOTS_MAX, slots))
+    given = raw.get("ceilings", {})
+    if not isinstance(given, dict) or set(given) - set(KIND_DEFAULTS) - {"max"}:
+        raise HeavyError("'heavy.ceilings' must be an object with only %s and \"max\" in it, got %r" % (", ".join('"%s"' % kind for kind in KIND_DEFAULTS), given))
+    for key, value in given.items():
+        if not _whole(value, 1, HARD_MAX_SECONDS):
+            raise HeavyError("'heavy.ceilings.%s' must be a whole number of seconds from 1 to %d (the hard maximum), got %r" % (key, HARD_MAX_SECONDS, value))
     return slots
+
+
+def ceiling_table(raw):
+    """{kind: seconds, "max": seconds} from the config's `heavy` value, read leniently: a value that is not a whole number of 1 or more is the default (a ceiling is never off)."""
+    given = (raw or {}).get("ceilings") if isinstance(raw, dict) else None
+    given = given if isinstance(given, dict) else {}
+    top = given.get("max") if _whole(given.get("max"), 1, HARD_MAX_SECONDS) else HARD_MAX_SECONDS   # the configuration can only lower the maximum
+    table = {"max": top}
+    for kind, default in KIND_DEFAULTS.items():
+        value = given.get(kind) if _whole(given.get(kind), 1, HARD_MAX_SECONDS) else default
+        table[kind] = min(value, top)
+    return table
+
+
+def resolve_ceiling(kind, environ, request=None, config=None):
+    """The time ceiling in seconds of a run of `kind`: the kind's default (or the configured one), or the run's own request (`request`, i.e. --ceiling, else
+    FLEET_HEAVY_MAX_SECONDS) up to the hard maximum. A request of 0 reads as the maximum (a bound always exists); a request that is not a whole number reads as the default."""
+    table = ceiling_table(config)
+    top, default = table["max"], table.get(kind, table["other"])
+    raw = request if request is not None else environ.get(TIME_ENV)
+    text = "" if raw is None else str(raw).strip()
+    if re.fullmatch(r"[0-9]{1,30}", text):
+        wanted = int(text)
+        return top if wanted == 0 else min(wanted, top)
+    return default
 
 
 def should_take_slot(environ):
@@ -149,6 +275,23 @@ def _process_start(pid):
     except (subprocess.SubprocessError, OSError):
         return ""
     return " ".join(done.stdout.split()) if done.returncode == 0 else ""
+
+
+_POPEN = subprocess.Popen   # the real one, kept at import: start times are read with it (a test that replaces the command's Popen replaces nothing here)
+
+
+def _start_of(pid):
+    """The start time of `pid` for a slot record, "" when it cannot be had (the process is then named by its pid alone and never trusted as a root). Never raises."""
+    try:
+        with _POPEN(["ps", "-o", "lstart=", "-p", str(pid)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True) as proc:
+            out, _err = proc.communicate(timeout=5)
+        return " ".join(out.split()) if proc.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _own_start():
+    return _start_of(os.getpid())
 
 
 def _is_zombie(pid):
@@ -404,11 +547,12 @@ def _take(state_dir, slots):
     return None, None
 
 
-def _record(fd, name, pid, command, now):
-    """Write who holds the slot (truncating what the last holder wrote). Best effort: a slot without a record is still a held slot."""
+def _record(fd, name, pid, command, now, extra=None):
+    """Write who holds the slot (truncating what the last holder wrote). Best effort: a slot without a record is still a held slot. `extra`: kind, ceiling, lane and the
+    wrapper's start time (an old record without them reads as kind "other")."""
     try:
         os.ftruncate(fd, 0)
-        os.pwrite(fd, json.dumps({"name": name, "pid": pid, "wrapper": os.getpid(), "command": os.path.basename(command)[:80], "since": int(now)}).encode("utf-8"), 0)
+        os.pwrite(fd, json.dumps(dict(extra or {}, name=name, pid=pid, wrapper=os.getpid(), command=os.path.basename(command)[:80], since=int(now))).encode("utf-8"), 0)
     except OSError:
         pass
 
@@ -495,7 +639,8 @@ class Watchdog:
     be read stops nothing beyond the command itself (one note); the time ceiling needs no table."""
 
     def __init__(self, pid, command, mem_mb, max_seconds, out, started, read_table=read_process_table, clock=time.time, pause=None, killpg=os.killpg,
-                 kill=os.kill, every=WATCH_SECONDS, grace=KILL_GRACE_SECONDS, rounds=SWEEP_ROUNDS, sweep_every=SWEEP_SECONDS, sweep_pause=time.sleep, me=None, lock_path=None, lsof=read_lock_holders):
+                 kill=os.kill, every=WATCH_SECONDS, grace=KILL_GRACE_SECONDS, rounds=SWEEP_ROUNDS, sweep_every=SWEEP_SECONDS, sweep_pause=time.sleep, me=None, lock_path=None, lsof=read_lock_holders, hard_max=HARD_MAX_SECONDS, decided=None):
+        self.hard_max, self.decided = hard_max, decided
         self.pid, self.command, self.mem_mb, self.max_seconds, self.out, self.started = pid, command, mem_mb, max_seconds, out, started
         self.read_table, self.clock, self.killpg, self.kill, self.every, self.grace = read_table, clock, killpg, kill, every, grace
         self.rounds, self.sweep_every, self.sweep_pause = rounds, sweep_every, sweep_pause
@@ -503,7 +648,7 @@ class Watchdog:
         self.me = me if me is not None else (os.getpid(), os.getppid(), os.getpgrp())   # never signalled: this wrapper, its caller, its group
         self.stop_event = threading.Event()
         self.pause = pause or (lambda seconds: self.stop_event.wait(seconds))
-        self.peak_kb, self.reason, self.noted, self.survivors = 0, None, False, []
+        self.peak_kb, self.reason, self.noted, self.survivors, self.ran = 0, None, False, [], 0
         self.pgids = {}      # pid -> process group, as last seen
         self.seen = set()    # (pid, start time) of every process seen in the command's tree
         self.group = None    # the command's own process group, when it is not the wrapper's
@@ -570,6 +715,7 @@ class Watchdog:
         if self.mem_mb and self.peak_kb // 1024 > self.mem_mb:
             return "memory", live
         if self.max_seconds and self.clock() - self.started > self.max_seconds:
+            self.ran = int(self.clock() - self.started)
             return "time", live
         return None, live
 
@@ -579,10 +725,19 @@ class Watchdog:
             if reason:
                 self.reason = reason
                 self.say(reason)
-                self.signal(signal.SIGTERM, live, fallback=True)   # no table: at least the command itself
-                self.stop_event.wait(self.grace)   # the grace ends the moment the command is gone; its children may not have gone with it
-                self.sweep()
+                if self.decided is not None and reason == "time":
+                    try:
+                        self.decided()   # the audit line is written before the first signal
+                    except Exception as err:
+                        self.out.write("heavy: the stop report failed (%s)\n" % _plain("%s: %s" % (type(err).__name__, err), 120))
+                self.stop(live)
                 return
+
+    def stop(self, live):
+        """SIGTERM, the grace, then the sweep: the whole run."""
+        self.signal(signal.SIGTERM, live, fallback=True)   # no table: at least the command itself
+        self.stop_event.wait(self.grace)   # the grace ends the moment the command is gone; its children may not have gone with it
+        self.sweep()
 
     def sweep(self):
         """Kill what is left of the run, round after round, looking again each time (a child forked since is found; a process that is gone is not signalled)."""
@@ -615,8 +770,8 @@ class Watchdog:
             self.out.write("heavy: stopped `%s`: its process tree passed the memory ceiling of %d MB (peak %d MB); FLEET_HEAVY_MEM_MB changes it, 0 turns it off\n"
                            % (text, self.mem_mb, self.peak_kb // 1024))
         else:
-            self.out.write("heavy: stopped `%s`: it ran past the time ceiling of %d s (peak %d MB); FLEET_HEAVY_MAX_SECONDS changes it, 0 turns it off\n"
-                           % (text, self.max_seconds, self.peak_kb // 1024))
+            self.out.write("heavy: stopped `%s`: it ran past the time ceiling of %d s (peak %d MB); FLEET_HEAVY_MAX_SECONDS or --ceiling asks for more, up to %d s\n"
+                           % (text, self.max_seconds, self.peak_kb // 1024, self.hard_max))
         self.out.flush()
 
     def signal(self, number, live, fallback=False):
@@ -636,10 +791,171 @@ class Watchdog:
                 pass
 
 
+def record_stop(info, holder, audit, note=None):
+    """The audit line `heavy.stopped`, written BEFORE the stop (holder as the subject; detail: kind, ran_seconds, ceiling_seconds, pid, reason, source: fixed words and
+    numbers, never the environment or an argument). A sink that fails never prevents the stop: the failure is said on `note` instead."""
+    detail = {"kind": info["kind"], "ran_seconds": info["ran_seconds"], "ceiling_seconds": info["ceiling_seconds"], "pid": info["pid"], "reason": "time", "source": info["source"]}
+    try:
+        audit("heavy.stopped", holder, detail)
+    except Exception as err:
+        if note is not None:
+            note("heavy: could not write the audit line heavy.stopped (%s): the run is stopped all the same\n" % _plain("%s: %s" % (type(err).__name__, err), 120))
+
+
+def tell_lane(info, holder, lane, send, audit, hard_max=HARD_MAX_SECONDS, note=None):
+    """After the stop: tell the lane ONCE (`send(lane, text)` returns one of STOP_TOLD; an error reads as "failed") and write the audit line `heavy.lane_told` (pid and what
+    the lane was told). Fixed words and numbers only. Neither can change the stop or the exit code. Returns what the lane was told."""
+    text = ("heavy: your %s run (pid %d) was stopped after %d s; its ceiling was %d s (FLEET_HEAVY_MAX_SECONDS or heavy --ceiling asks for more, up to %d)"
+            % (info["kind"], info["pid"], info["ran_seconds"], info["ceiling_seconds"], hard_max))
+    try:
+        told = send(lane, text)
+    except Exception:
+        told = "failed"
+    told = told if told in STOP_TOLD else "failed"
+    try:
+        audit("heavy.lane_told", holder, {"pid": info["pid"], "source": info["source"], "lane_told": told})
+    except Exception as err:
+        if note is not None:
+            note("heavy: could not write the audit line heavy.lane_told (%s)\n" % _plain("%s: %s" % (type(err).__name__, err), 120))
+    return told
+
+
+def _held_record(state_dir, index):
+    """The record of slot `index` when its lock is held now, else None. Nothing is created."""
+    try:
+        fd = os.open(slot_path(state_dir, index), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return None   # free
+        except OSError as err:
+            if err.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                return None
+        return _read_info(fd)
+    finally:
+        os.close(fd)
+
+
+def check_orphans(state_dir, slots=DEFAULT_SLOTS, config=None, clock=time.time, on_stop=None, out=None, alive=_alive, watchdog=None, start_of=_start_of):
+    """Stop the runs that keep a slot with no wrapper left (the wrapper was killed: the watchdog lived in it). A held slot whose recorded wrapper (pid and start time)
+    is gone, and whose run is older than its ceiling counted from the record's own `since`, is stopped like a wrapper's run (SIGTERM, grace, sweep) and reported through
+    `on_stop(phase, info, holder, lane)`: phase "decided" BEFORE the stop (the audit line), phase "told" after it (the message to the lane). The stop is rooted in the
+    processes that HOLD THE SLOT'S LOCK (seen at two looks) and what they started; the record's own pid is a root only when its recorded start time matches the live
+    process (a pid reused by another process, or an older record with no start time, is never a root). Never the wrapper, its parent, its group or pid 1. A record
+    without a kind or ceiling (an older one) reads as kind "other". A run whose wrapper is alive is never touched. A run that is looked at again after a stop that left
+    survivors is stopped again but reported once (a marker `heavy-told-<slot>.json`, written when the audit line is: a tick that does not stop marks nothing). Returns the infos of what it stopped."""
+    out = sys.stderr if out is None else out
+    table = ceiling_table(config)
+    stopped = []
+    for index in list(range(slots)) + [EXPRESS]:
+        info = _held_record(state_dir, index)
+        if not info:
+            continue
+        wrapper, since = info.get("wrapper"), info.get("since")
+        if not _whole(wrapper, 1, PID_MAX) or isinstance(since, bool) or not isinstance(since, (int, float)):
+            continue
+        if wrapper == os.getpid() or alive(wrapper, info.get("wstart") if isinstance(info.get("wstart"), str) else ""):
+            continue
+        kind = info.get("kind") if info.get("kind") in KIND_DEFAULTS else "other"
+        ceiling = min(info["ceiling"] if _whole(info.get("ceiling"), 1, 10 ** 9) else table[kind], table["max"])
+        ran = clock() - since
+        if ran <= ceiling:
+            continue
+        pid = info.get("pid") if _whole(info.get("pid"), 2, PID_MAX) else 0
+        report = {"kind": kind, "ran_seconds": int(ran), "ceiling_seconds": ceiling, "pid": pid, "source": "orphan"}
+        holder, lane = _plain(info.get("name", "?")), _plain(info.get("lane", info.get("name", "?")))
+        first = not _reported(state_dir, index, info)
+        hooked = []
+
+        def decided():
+            if first and on_stop is not None:
+                hooked.append(1)
+                _mark_reported(state_dir, index, info)   # the stop is happening: from now on the run counts as reported
+                try:
+                    on_stop("decided", report, holder, lane)
+                except Exception as err:
+                    out.write("heavy: the stop report failed (%s)\n" % _plain("%s: %s" % (type(err).__name__, err), 120))
+        if not _stop_orphan(state_dir, index, info, out, clock, watchdog, start_of, decided):
+            continue
+        out.write("heavy: stopped an orphaned %s run (pid %d): its wrapper was gone and it ran past the time ceiling of %d s\n" % (kind, pid, ceiling))
+        out.flush()
+        stopped.append(report)
+        if hooked and on_stop is not None:
+            try:
+                on_stop("told", report, holder, lane)
+            except Exception as err:
+                out.write("heavy: the stop report failed (%s)\n" % _plain("%s: %s" % (type(err).__name__, err), 120))
+    return stopped
+
+
+def _marker_path(state_dir, index):
+    return os.path.join(str(state_dir), "heavy-told-%s.json" % index)
+
+
+def _marker_key(info):
+    return {"since": info.get("since"), "pid": info.get("pid")}
+
+
+def _reported(state_dir, index, info):
+    """True when this run (slot, `since`, pid) was already reported (by a stop that happened)."""
+    try:
+        with open(_marker_path(state_dir, index)) as handle:
+            return json.loads(handle.read(512)) == _marker_key(info)
+    except (OSError, ValueError):
+        return False
+
+
+def _mark_reported(state_dir, index, info):
+    """Written at the moment the audit line is: only a stop that HAPPENS marks the run reported. Without the marker (it cannot be written) the run may be told again,
+    the lesser harm."""
+    try:
+        fd = os.open(_marker_path(state_dir, index), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(_marker_key(info)))
+    except OSError:
+        pass
+
+
+def _stop_orphan(state_dir, index, info, out, clock, watchdog, start_of, decided):
+    """Stop what holds slot `index`; False when another checker is doing it, the slot changed hands meanwhile, or nothing holds the lock. `decided()` runs right before
+    the first signal."""
+    try:
+        gate = os.open(os.path.join(str(state_dir), ORPHAN_LOCK), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(gate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        pid = info.get("pid") if _whole(info.get("pid"), 2, PID_MAX) else 0
+        recorded = info.get("cstart")
+        if not (pid and isinstance(recorded, str) and recorded and start_of(pid) == recorded):
+            pid = 0   # no recorded start time, or another process now has the pid: only what holds the lock is a root
+        dog = Watchdog(pid, ["orphan"], 0, 0, out, clock(), clock=clock, **dict({"lock_path": slot_path(state_dir, index)}, **(watchdog or {})))
+        for _ in range(2):
+            dog.look()   # the lock's holders count when seen at two looks in a row
+        now = _held_record(state_dir, index)
+        if not now or now.get("since") != info.get("since") or now.get("pid") != info.get("pid"):
+            return False   # freed, or taken by another run since the check began: not this one
+        live = dog.look()
+        if not live:
+            return False
+        decided()
+        dog.stop(live)
+        return True
+    finally:
+        os.close(gate)
+
+
 def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name=None, environ=None, out=None, clock=time.time, sleep=time.sleep,
-        which=shutil.which, watchdog=None, short=False, line=None):
+        which=shutil.which, watchdog=None, short=False, line=None, ceiling=None, ceiling_config=None, on_stop=None):
     """Wait for a slot, run `command` in it, return its exit status. 75 when no slot came within `wait_max` seconds, 127 when the command does not exist.
-    A watchdog stops a runaway: 137 past the memory ceiling, 124 past the time ceiling (see `ceilings`); `watchdog` is a dict of Watchdog keyword arguments and `line` one of Line's (tests).
+    A watchdog stops a runaway: 137 past the memory ceiling, 124 past the time ceiling of the run's KIND (see `classify`, `resolve_ceiling`: `ceiling` is the run's own
+    request, else FLEET_HEAVY_MAX_SECONDS; `ceiling_config` the config's `heavy` value; `on_stop(phase, info, holder, lane)` is called with "decided" before a time stop and "told" after it (also for an orphan this wrapper finds while it waits)); `watchdog` is a dict of Watchdog keyword arguments and `line` one of Line's (tests).
     Callers wait in arrival order (`Line`); `short` declares the command short: it may use the express slot when the ordinary ones are busy and is stopped after
     EXPRESS_SECONDS by the watchdog."""
     environ = os.environ if environ is None else environ
@@ -711,6 +1027,10 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
                 out.flush()
                 return EXIT_TEMPFAIL
             if now >= next_report:
+                try:
+                    check_orphans(state_dir, slots, ceiling_config, clock, on_stop, out)   # a run whose wrapper died keeps a slot for nobody: bounded here, where it starves someone
+                except Exception:
+                    pass
                 held = holders(state_dir, slots)
                 where = ", place %d in line (%d ahead)" % (place, place - 1) if place is not None else ""
                 out.write("heavy: waiting for a slot (%d of %d busy: %s)%s\n" % (len(held), slots, _describe(held), where))
@@ -720,8 +1040,15 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
         if queue is not None and not (queue.leave() or queue.leave()):   # it has its slot (or none will come): out of the line at once; one more try before it says so
             out.write("heavy: could not leave the waiting order: the others pass this caller's ticket once its slot shows as held\n")
         env = dict(environ)
+        kind = classify(command, short)
+        mem_mb = ceilings(environ)[0]
+        max_seconds = resolve_ceiling(kind, environ, ceiling, ceiling_config)
+        if fd is not None and short and index == EXPRESS:   # the express slot's own time ceiling (an environment value may only make it shorter)
+            max_seconds = min(max_seconds, EXPRESS_SECONDS)
+        lane = holder_name(environ)
+        extra = {"kind": kind, "ceiling": max_seconds, "lane": lane, "wstart": _own_start() if fd is not None else ""}
         if fd is not None:
-            _record(fd, name, os.getpid(), command[0], clock())   # at once, so a killed holder's old record is never shown for this one
+            _record(fd, name, os.getpid(), command[0], clock(), extra)   # at once, so a killed holder's old record is never shown for this one
             os.set_inheritable(fd, True)   # the command keeps the lock: the slot is busy while it runs, whatever happens to this wrapper
             env[SLOT_ENV] = str(index)    # and a heavy inside it knows it is in a slot: it takes no second one (nested heavy never deadlocks)
         argv = (command_prefix(which) if unslotted not in ("", "inside") else []) + list(command)   # off or nested: the command as it is
@@ -731,17 +1058,21 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
             out.write("heavy: cannot run %s: %s\n" % (command[0], err.strerror or err))
             return EXIT_NOT_FOUND
         if fd is not None:
-            _record(fd, name, child["p"].pid, command[0], clock())
+            _record(fd, name, child["p"].pid, command[0], clock(), dict(extra, cstart=_start_of(child["p"].pid)))
         if got["signal"] is not None:   # it arrived between taking the slot and the start: the command gets it too
             try:
                 child["p"].send_signal(got["signal"])
             except OSError:
                 pass
-        mem_mb, max_seconds = ceilings(environ)
-        if fd is not None and short and index == EXPRESS:   # the express slot's own time ceiling (an environment value may only make it shorter)
-            max_seconds = EXPRESS_SECONDS if not max_seconds else min(max_seconds, EXPRESS_SECONDS)
         lock = slot_path(state_dir, index) if fd is not None else None
-        dog = Watchdog(child["p"].pid, command, mem_mb, max_seconds, out, clock(), clock=clock, **dict({"lock_path": lock}, **(watchdog or {})))
+        def stop_info():
+            return {"kind": kind, "ran_seconds": dog.ran, "ceiling_seconds": max_seconds, "pid": child["p"].pid, "source": "wrapper"}
+
+        def decided():   # before the first signal: the audit line
+            if on_stop is not None:
+                on_stop("decided", stop_info(), name, lane)
+        dog = Watchdog(child["p"].pid, command, mem_mb, max_seconds, out, clock(), clock=clock,
+                       **dict({"lock_path": lock, "hard_max": ceiling_table(ceiling_config)["max"], "decided": decided}, **(watchdog or {})))
         dog.start()
         try:
             while True:
@@ -752,6 +1083,11 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
                     continue
         finally:
             dog.finish()
+        if dog.reason == "time" and on_stop is not None:   # after the stop; it never changes the exit status
+            try:
+                on_stop("told", stop_info(), name, lane)
+            except Exception as err:
+                out.write("heavy: the stop report failed (%s)\n" % _plain("%s: %s" % (type(err).__name__, err), 120))
         if dog.exit_status():
             return dog.exit_status()
         return 128 - status if status < 0 else status   # a signal: 128 + n, as a shell reports it

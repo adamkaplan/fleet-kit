@@ -1,13 +1,15 @@
 """The temp-directory janitor (ask #321). Pure of the switchboard: the caller hands it the directories, the clock, the settings and an audit
 function. It looks at the TOP-LEVEL entries of the temp directory only, and an entry is removed (as a unit) when ALL of these hold:
 
-  - it is older than `days`: the latest modification, change or birth time of the entry and of anything inside it (a bounded walk; a tree too big to judge
-    is kept; the change time is what a restore with tar or cp -a cannot fake);
+  - it is older than `days`: the latest modification, change or birth time of the entry and of anything inside it, and the access time of every regular file
+    (a READ keeps it too; a directory's or a link's own access time is not counted, because listing the one and resolving the other, as this run does, would keep it for ever; a bounded walk; a
+    tree too big to judge, or an access time that cannot be read, is kept; the change time is what a restore with tar or cp -a cannot fake);
   - the fleet's own records do not name it: its full path, or its basename when that is at least six characters, does not occur in any state
     file of the state directory (`*.json` and `*.jsonl`, never the compressed archives; a big file is read by its tail);
   - it does not match a keep-list glob of the settings, and it does not hold a `.fleet-keep` marker at its top;
-  - nothing is using it: no process has it as its working directory, no pane of the fleet works in it, no live agent session runs in it (the caller's
-    `busy` function says; if it cannot say, the entry is KEPT);
+  - nothing is using it: no process has it as its working directory or holds a file of it open, no pane of the fleet works in it, no live agent session runs
+    in it, and it is not, does not contain and does not sit inside the temp directory or working directory of an agent the registry holds (live, or retired
+    within `days`) (the caller's `busy` function says; if it cannot say, the entry is KEPT);
   - it belongs to the user running this, and it is not the temp directory itself.
 
 A symlink is removed as a link and never followed; a directory is removed without following any link inside it. Nothing here touches a path
@@ -16,7 +18,9 @@ own memory: use the keep-list or a `.fleet-keep` marker for that."""
 
 import bisect
 import fnmatch
+import hashlib
 import json
+import math
 import os
 import shutil
 import stat
@@ -33,11 +37,31 @@ STATE_FILE_BYTES = 2000000    # of one state file read (its tail)
 STATE_TOTAL_BYTES = 16000000
 CURSOR_FILE = "temp-janitor-cursor.json"   # {"after": <the last name judged>}: a NAME, never a position
 BUDGET_MAX = 86400
+RULE_VERSION = "2"            # bump it when the selection rule changes in a way the constants below and the settings do not show: a new version needs a new preview and a new yes
 MIN_NAME = 6                  # a basename shorter than this is too common to count as naming something
 
 
 class Unknown(Exception):
     """Raised by the caller's `busy` function when it cannot say whether something uses an entry: the entry is then KEPT (fail closed)."""
+
+
+SELECTION_KEYS = ("days", "keep", "dir")   # the settings that change WHAT is selected: all in the rule's fingerprint
+OTHER_KEYS = ("enabled", "scan_seconds", "weekly_scan_seconds", "daemon_apply")   # how or whether it runs, never what: a test needs every setting in exactly one of the two tuples
+
+
+def rule_fingerprint(cfg):
+    """A short hash of the SELECTION RULE: the version string, the constants the rule reads and every setting in SELECTION_KEYS (`days`, `keep` and the
+    RESOLVED directory). The daemon sends one preview when it changes and applies nothing until a yes to it is recorded. Never a name."""
+    cfg = cfg or {}
+    where = os.path.realpath(str(cfg.get("dir") or default_dir()))
+    text = json.dumps({"version": RULE_VERSION, "walk": WALK_ENTRIES, "marker": KEEP_MARKER, "min_name": MIN_NAME, "days": cfg.get("days", DEFAULTS["days"]),
+                       "keep": sorted(cfg.get("keep") or []), "dir": where}, sort_keys=True)
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def preview_fingerprint(rule, names):
+    """The fingerprint of one would-remove preview: the rule's and the sorted names it listed. The yes is keyed by it."""
+    return hashlib.sha256(("%s\n%s" % (rule, "\n".join(sorted(names)))).encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def settings(raw):
@@ -102,6 +126,24 @@ def safe_dir(path):
     return True, ""
 
 
+AUDIT_FILE = "audit.jsonl"
+OWN_EVENTS = ("janitor.", "temp.")   # the janitor's own audit lines: a would-remove list names the entries it would remove, and that must not keep them
+
+
+def _without_own_events(data):
+    """`data` (the tail of the audit log) without the janitor's own event lines: its preview of what would go must not be what keeps it. A line that cannot be
+    read (a torn first line) is kept, as is any other event: only a parsed line of an own event is dropped."""
+    kept = []
+    for line in data.splitlines():
+        try:
+            event = json.loads(line).get("event")
+        except (ValueError, AttributeError):
+            event = None
+        if not (isinstance(event, str) and event.startswith(OWN_EVENTS)):
+            kept.append(line)
+    return "\n".join(kept)
+
+
 def named_text(state_dir):
     """(text, complete): the text of the fleet's own records, which a path must not occur in. A big file is read by its TAIL (by design: records older than
     that are not seen, and the docs say so). `complete` is False when the directory cannot be listed, a record cannot be read or the total limit was
@@ -128,6 +170,8 @@ def named_text(state_dir):
         except OSError:
             complete = False
             continue
+        if name == AUDIT_FILE:
+            data = _without_own_events(data)
         total += len(data)
         parts.append(data)
         if total > STATE_TOTAL_BYTES:
@@ -141,6 +185,20 @@ def _stamp(info):
     return max(info.st_mtime, info.st_ctime, getattr(info, "st_birthtime", 0) or 0)
 
 
+def _atime(info):
+    """The access time of a file or link, or raises ValueError when it is not a usable number (the caller then keeps the entry)."""
+    value = info.st_atime
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError("no usable access time")
+    return value
+
+
+def _read_stamp(info):
+    """`_stamp` plus the access time of a regular file (a read of its content counts as touching it). A directory's and a link's are not counted: listing the one and reading the other (`realpath` does, on Linux) is the janitor's own doing. Raises when the access time cannot be read."""
+    stamp = _stamp(info)
+    return max(stamp, _atime(info)) if stat.S_ISREG(info.st_mode) else stamp
+
+
 def _newest(path, deadline, clock=time.monotonic):
     """(newest mtime under path, complete): a bounded walk that never follows a link and never crosses onto another device. Incomplete when a
     directory cannot be read, the walk is too big or too slow, or another device is mounted inside."""
@@ -149,6 +207,10 @@ def _newest(path, deadline, clock=time.monotonic):
     except OSError:
         return None, False
     newest, seen, pending, complete = _stamp(info), 0, [], True
+    try:
+        newest = _read_stamp(info)
+    except Exception:
+        complete = False   # an access time that cannot be read: the entry is kept
     if stat.S_ISDIR(info.st_mode):
         pending.append(path)
     while pending:
@@ -167,7 +229,10 @@ def _newest(path, deadline, clock=time.monotonic):
                 except OSError:
                     complete = False
                     continue
-                newest = max(newest, _stamp(st))
+                try:
+                    newest = max(newest, _read_stamp(st))
+                except Exception:
+                    newest, complete = max(newest, _stamp(st)), False
                 if stat.S_ISDIR(st.st_mode):
                     if st.st_dev != info.st_dev:
                         complete = False
@@ -243,7 +308,7 @@ def judge(path, text, now, cfg, uid=None, clock=time.monotonic, busy=None):
         return row
     row["age_days"] = int((now - newest) / 86400)
     if not complete:
-        row["why"] = "too many files, too slow, unreadable or another device inside: kept"
+        row["why"] = "too many files, too slow, unreadable, an access time that cannot be read or another device inside: kept"
         return row
     if newest > now - cfg["days"] * 86400:
         row["why"] = "newer than %d day(s)" % cfg["days"]
