@@ -30921,6 +30921,181 @@ class TestWaive(LedgerBase):
             self.assertIn(word, flat)
 
 
+class TestHeadResolution(LedgerBase):
+    """#994: a head a caller names for a pull request is resolved to the pull request's FULL head before anything is recorded, or refused.
+    One table of head shapes, run against the real `waive` through `main`, with a mutant of the one resolver per row; the fake GitHub answers
+    only the full head (the real one never expands a short sha). Neutral names."""
+
+    FULL = "abcdef0123456789abcdef0123456789abcdef01"
+    REASON = "hotfix for a broken release: the plan follows within a day"
+    NONE = object()
+    # (row, --head given, recorded head or None for a refusal, text the refusal must contain)
+    TABLE = (
+        ("full", FULL, FULL, None),
+        ("short_unique", FULL[:8], FULL, None),
+        ("uppercase", FULL[:8].upper(), FULL, None),
+        ("no_head", NONE, FULL, None),
+        ("short_ambiguous", FULL[:6], None, "at least 7"),
+        ("too_short", "a", None, "at least 7"),
+        ("non_hex", "abcdzzzz", None, "not a commit sha"),
+        ("empty", "", None, "not a commit sha"),
+        ("over_long", FULL + "0", None, "longer than a sha"),
+        ("not_the_prs_head", "fedcba9", None, "is not the PR's head"),
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "enforce"}}}}
+        self.pr["headRefOid"] = self.FULL
+        self.configure()
+
+    def waive(self, head=NONE):
+        more = () if head is self.NONE else ("--head", head)
+        return self.run_as("cos", "waive", self.PR, "--gates", "G1", "--reason", self.REASON, *more)
+
+    def run_table(self):
+        """The names of the rows that do not behave as TABLE says."""
+        failed = []
+        for name, given, recorded, text in self.TABLE:
+            before, audit_before = self.ledger(), len([e for e in self.world.audit() if e["event"] == "gate.waiver.refused"])
+            code, out, err = self.waive(given)
+            after = self.ledger()
+            if recorded is not None:
+                good = code == 0 and len(after) == len(before) + 1 and after[-1]["head"] == recorded
+            else:
+                refused = [e for e in self.world.audit() if e["event"] == "gate.waiver.refused"]
+                good = (code == 2 and text in err and len(err.strip().splitlines()) == 1 and after == before
+                        and len(refused) == audit_before + 1)
+            if not good:
+                failed.append(name)
+        return failed
+
+    def test_every_row_of_the_table_behaves_on_the_real_command(self):
+        self.assertEqual(self.run_table(), [])
+
+    def test_the_recorded_case_a_short_head_is_stored_in_full_and_the_gate_reads_waived(self):
+        # the cause: the short head used to be stored as given, so the exact comparison read it as another head
+        self.assertEqual(self.waive(self.FULL[:8])[0], 0)
+        (entry,) = self.ledger()
+        self.assertEqual(len(entry["head"]), 40)
+        report = self.gates()[1]
+        self.assertEqual(self.row(report, "G1")["status"], "waived")
+        (event,) = [e for e in self.world.audit() if e["event"] == "plan.waiver"]
+        self.assertEqual(event["detail"]["head"], self.FULL)
+
+    def mutants(self):
+        real = sb.resolve_head
+
+        def hexlike(given):
+            return given is not None and given != "" and re.fullmatch(r"[0-9a-fA-F]+", given) is not None
+
+        def as_given(given, known, unreadable=None):
+            return given if given else real(given, known, unreadable)
+
+        def no_hex(given, known, unreadable=None):
+            return known if given and not hexlike(given) else real(given, known, unreadable)
+
+        def no_floor(given, known, unreadable=None):
+            return known if hexlike(given) and len(given) < 7 else real(given, known, unreadable)
+
+        def no_prefix(given, known, unreadable=None):
+            return given if hexlike(given) and 7 <= len(given) <= 40 and not known.startswith(given.lower()) else real(given, known, unreadable)
+
+        def no_lower(given, known, unreadable=None):
+            return given if given and given != given.lower() and hexlike(given) else real(given, known, unreadable)
+
+        def accept_empty(given, known, unreadable=None):
+            return known if given == "" else real(given, known, unreadable)
+
+        def no_overlong(given, known, unreadable=None):
+            return known if given and hexlike(given) and len(given) > 40 else real(given, known, unreadable)
+
+        def prefix_as_given(given, known, unreadable=None):
+            out = real(given, known, unreadable)
+            return given.lower() if given and out == known and len(given) < 40 else out
+        return {"as_given": (as_given, "short_unique"), "no_hex": (no_hex, "non_hex"), "no_floor": (no_floor, "short_ambiguous"),
+                "no_prefix": (no_prefix, "not_the_prs_head"), "no_lower": (no_lower, "uppercase"), "accept_empty": (accept_empty, "empty"),
+                "no_overlong": (no_overlong, "over_long"), "prefix_as_given": (prefix_as_given, "short_unique")}
+
+    def test_each_mutant_of_the_resolver_fails_its_row(self):
+        for name, (mutant, row) in self.mutants().items():
+            with self.subTest(mutant=name):
+                with mock.patch.object(sb, "resolve_head", mutant):
+                    failed = self.run_table()
+                self.assertIn(row, failed, "the %s mutant must fail the %s row" % (name, row))
+
+    def test_the_table_has_a_row_for_every_shape_and_a_mutant_for_every_refusal_row(self):
+        names = {row[0] for row in self.TABLE}
+        self.assertEqual(names, {"full", "short_unique", "uppercase", "no_head", "short_ambiguous", "too_short", "non_hex", "empty", "over_long", "not_the_prs_head"})
+        covered = {row for _, row in self.mutants().values()}
+        self.assertEqual({row[0] for row in self.TABLE if row[2] is None} - {"too_short"}, covered - {"short_unique", "uppercase"})
+
+    def test_a_short_head_when_the_pr_head_cannot_be_read_is_refused_and_a_full_one_recorded(self):
+        self.pr["headRefOid"] = None
+        code, out, err = self.waive(self.FULL[:8])
+        self.assertEqual((code, self.ledger()), (2, []))
+        self.assertIn("cannot resolve", err)
+        self.assertEqual(self.waive(self.FULL)[0], 0)
+        self.assertEqual(self.ledger()[0]["head"], self.FULL)
+
+    def test_no_prefix_of_one_to_six_characters_is_taken(self):
+        for n in range(1, 7):
+            code, out, err = self.waive(self.FULL[:n])
+            self.assertEqual((code, self.ledger()), (2, []), n)
+            self.assertIn("at least 7", err)
+
+    # ---- the family: every command that records or reads by a head resolves it the same way
+    RESOLVING = {("prove",), ("verdict",), ("waive",), ("review", "record"), ("review", "blockers")}
+    NAMED_EXCEPTIONS = {("review", "checkout"): "requires a full 40-character head and refuses a short one",
+                        ("item-verdict",): "compared exactly with the pinned reference commit; a short head is refused, never stored",
+                        ("item-prove",): "records the pinned reference commit and never the flag",
+                        ("gates",): "read-only; the head is read from GitHub"}
+
+    def head_commands(self):
+        found = set()
+
+        def walk(parser, path):
+            for action in parser._actions:
+                if "--head" in action.option_strings:
+                    found.add(path)
+                if isinstance(action, argparse._SubParsersAction):
+                    for name, sub in action.choices.items():
+                        walk(sub, path + (name,))
+        walk(sb.build_parser(), ())
+        return found
+
+    def test_every_command_with_a_head_flag_is_resolved_or_a_named_exception(self):
+        self.assertEqual(self.head_commands() - self.RESOLVING - set(self.NAMED_EXCEPTIONS), set(), "a command with --head that resolves nothing and is not a named exception")
+        self.assertTrue(self.RESOLVING <= self.head_commands())
+
+    def test_a_new_caller_of_the_head_helper_must_go_through_the_one_resolver(self):
+        source = Path(sb.__file__).read_text()
+        body = source[source.index("def _head_of(ctx, args):"):source.index("def _record(ctx, args, now, entry):")]
+        self.assertIn("resolve_head(", body)
+        users = [m.start() for m in re.finditer(r"_head_of\(ctx, args\)", source)]
+        self.assertEqual(len(users), 4)   # prove, verdict, waive and the waive guard: a new caller changes this and needs a case in the family tests
+
+    def test_prove_and_verdict_record_the_full_head_for_a_short_one(self):
+        short = self.FULL[:8]
+        self.assertEqual(self.prove("coder", "S1", "--head", short)[0], 0)
+        self.assertEqual(self.verdict("cibot", "S1", "ci", "pass", "--head", short)[0], 0)
+        self.assertEqual([e["head"] for e in self.ledger()], [self.FULL, self.FULL])
+        self.assertEqual(self.prove("coder", "S2", "--head", "fedcba9")[0], 2)
+        self.assertEqual(len(self.ledger()), 2)
+
+    def test_review_record_and_blockers_resolve_a_short_head(self):
+        short = self.FULL[:8]
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "code", "--verdict", "request-changes", "--blocks", "1", "--head", short)
+        self.assertEqual(code, 0, err)
+        self.assertEqual([e["head"] for e in self.ledger()], [self.FULL])
+        code, out, err = self.run_as("coder", "review", "blockers", self.PR, "--head", short)
+        self.assertIn("code recorded request-changes", out)
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "code", "--verdict", "approve", "--head", "zzzzzzzz")
+        self.assertEqual(code, 2)
+        self.assertEqual(len(self.ledger()), 1)
+
+
 class TestPrSharesFiles(LedgerBase):
     """#818: `gates` may print `shares <file> with #N`, and `decisions` a merge order among held pull requests that share files. Information only. Synthetic data."""
 
@@ -62726,7 +62901,7 @@ class TestReviewerSubagents(LedgerBase):
 
     def test_a_record_for_a_stale_head_a_bad_reviewer_or_an_inconsistent_verdict_is_refused_and_writes_nothing(self):
         cases = (("code", "approve", ("--head", "d" * 40), "is not the PR's head"),
-                 ("code", "approve", ("--head", "abc"), "is not the PR's head"),
+                 ("code", "approve", ("--head", "abc"), "too short to name one commit"),
                  ("tester", "approve", (), "--reviewer must be one of"),
                  ("code", "yes", (), "--verdict must be one of"),
                  ("code", "approve", ("--blocks", "1"), "cannot carry blocking findings"),
