@@ -124,6 +124,6 @@ Clear-machinery files by slice (a slice that touches one says so in its plan and
 
 ## Freeze
 
-FROZEN: when fleetkit, cos and fleet-daemon have each commented agreement on #906 (no earlier). After it a change needs all three to agree again.
+FROZEN: when the product, chief-of-staff and daemon lanes have each commented agreement on #906 (no earlier). After it a change needs all three lanes to agree again.
 
-Status: FROZEN 2026-10-20 (fleetkit, cos, fleet-daemon agreed on #906).
+Status: FROZEN 2026-10-20 (the product, chief-of-staff and daemon lanes agreed on #906).

@@ -8837,7 +8837,7 @@ class TestAgentRegistryInventory(unittest.TestCase):
     @classmethod
     def spec_gaps(cls, text):
         gaps = [h for h in cls.SECTIONS + ("## Migration rule",) if "\n" + h + "\n" not in text]
-        if "FROZEN: when fleetkit, cos and fleet-daemon have each commented agreement on #906 (no earlier)." not in text:
+        if "FROZEN: when the product, chief-of-staff and daemon lanes have each commented agreement on #906 (no earlier)." not in text:
             gaps.append("the FROZEN line")
         return gaps
 
