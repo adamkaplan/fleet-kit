@@ -73523,6 +73523,10 @@ class TestFocusedLocalRuns(unittest.TestCase):
         self.script = os.path.join(self.dir, "test-fake")   # a program that classifies as full
         Path(self.script).write_text("#!/bin/sh\nexit 0\n")
         os.chmod(self.script, 0o755)
+        self.bin = os.path.join(self.dir, "bin")   # the only PATH the child gets: a fake `timeout` (macOS ships none, Ubuntu ships GNU's); no real program is needed
+        os.mkdir(self.bin)
+        os.symlink(shutil.which("sh"), os.path.join(self.bin, "sh"))   # `sh -c` is on both runners
+        self.fake_timeout()
         self.children, self.fds = [], []
 
     def cleanup(self):
@@ -73534,8 +73538,13 @@ class TestFocusedLocalRuns(unittest.TestCase):
         self.children, self.fds = [], []
         shutil.rmtree(self.dir, True)
 
+    def fake_timeout(self):
+        path = os.path.join(self.bin, "timeout")
+        Path(path).write_text('#!/bin/sh\nshift\nexec "$@"\n')   # drops the duration, runs the rest
+        os.chmod(path, 0o755)
+
     def environ(self):
-        return {"PATH": os.environ["PATH"], "FLEET_HEAVY_NAME": "second"}
+        return {"PATH": self.bin, "FLEET_HEAVY_NAME": "second"}
 
     def start(self, command, worktree, short=False, wait_max=1):
         out = io.StringIO()
@@ -73603,6 +73612,13 @@ class TestFocusedLocalRuns(unittest.TestCase):
                 else:
                     self.assertEqual(code, 0, text)
                     self.assertNotIn("refused", text)
+
+    def test_a_mutant_without_the_fake_timeout_fails_the_wrapped_row_as_command_not_found_on_every_os(self):
+        row = [r for r in self.ROWS if r[0] == "wrapped-in-timeout"][0]
+        os.unlink(os.path.join(self.bin, "timeout"))
+        self.hold(self.A)
+        code, text = self.attempt(row)
+        self.assertEqual(code, 127, text)
 
     def test_a_mutant_that_never_refuses_lets_every_refused_row_run(self):
         for row in self.ROWS:
