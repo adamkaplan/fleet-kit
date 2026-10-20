@@ -975,6 +975,9 @@ class Launcher:
                 if self._mine("pod", name) is False:
                     self.foreign.append("pod/" + name)
                     raise CloudError("the pod %s is not this call's (its run id does not match); left whole" % name) from None
+                gone = self._own_objects_gone(name, made)
+                if gone:   # a stop, the reaper or someone else removed this call's own objects: the loss is theirs, not the race
+                    raise CloudError("the worker pod was removed from outside (%s no longer exist(s)): not recreated" % ", ".join(gone)) from None
                 self.kube.delete_pod_and_wait(name)
                 attempt += 1
                 self._make(made, "pod", self.kube.apply, spec)
@@ -984,6 +987,15 @@ class Launcher:
                 raise
             self.audit(worker, "pod/" + name, "create-attempt", 0.0, True, "attempt %d of %d: ready" % (attempt, STACK_ATTEMPTS))
             return
+
+    def _own_objects_gone(self, name, made):
+        """The Secrets this call made that are no longer in the cluster (a presence check, whatever the run id)."""
+        gone = []
+        if made["secret"] and not self.kube.get_secret(name + "-pw"):
+            gone.append("secret/%s-pw" % name)
+        if made["run"] and not self.kube.get_run_secret(name):
+            gone.append("secret/%s-run" % name)
+        return gone
 
     def _raise_on_race(self, name, pod):
         uid = (pod or {}).get("metadata", {}).get("uid")

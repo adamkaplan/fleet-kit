@@ -73,7 +73,7 @@ run id and nonce and without touching the per-run secrets, in two cases. First, 
 known (the exact `FailedCreatePodSandBox` message): the node's runtime is configured by the installer about 30 to 60
 seconds after scheduling. Second, the pending pod vanishes: a get that saw the pod then says not found, which live run B
 saw when that runtime restart took the Pending pod object with it. Each attempt writes one audit line (`attempt N of 3`,
-and `pod vanished` for the second case). A pod that was never seen, and every other failure, is not retried. After the
+and `pod vanished` for the second case). Before a recreate the launcher checks that this call's own Secrets are still there: a missing one means an outside deletion (a stop, the reaper), which fails the create without recreating. A pod that was never seen, and every other failure, is not retried. The window is checked after each attempt ends, so it bounds the count of attempts, not the wall time (worst case 3 times the `--wait` plus 150 s of delete wait). After the
 attempts or the window the create fails and the message names the race or the vanish. See `docs/cloud-worker-interface.md`.
 
 ## Driving a cloud worker from the switchboard (`launch --cloud`, `send`, `read`, `status`, `retire`)

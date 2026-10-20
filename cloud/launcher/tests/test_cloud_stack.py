@@ -358,15 +358,68 @@ class FreshNodeRace(Base):
         self.assertEqual(len(self.pod_creates()), 1)
         self.assertNotIn("vanished", self.reasons()[0])
 
-    def test_every_outcome_of_the_watch_loop_has_a_test(self):   # completeness: the table of outcomes the loop can end in
-        outcomes = {"ready", "race", "vanish", "never_seen", "other_failure", "cap", "window"}
-        tested = {"ready": "test_the_message_once_then_success", "race": "test_the_message_three_times_fails_and_leaves_nothing",
-                  "vanish": "test_vanish_twice_then_success", "never_seen": "test_a_pod_that_never_existed_is_not_retried",
-                  "other_failure": "test_a_different_failure_is_not_retried", "cap": "test_vanish_three_times_fails_names_it_and_leaves_nothing",
-                  "window": "test_vanish_respects_the_window"}
-        self.assertEqual(set(tested), outcomes)
-        for name in tested.values():
-            self.assertTrue(hasattr(self, name), name)
+    def _run_secret(self):
+        r, w = os.pipe(); os.write(w, b"x" * 12); os.close(w)
+        return r
+
+    def _outside(self, kills, *extra):
+        self.patch_state(plan=["vanish:" + kills, "ok"])
+        r = self._run_secret()
+        try:
+            out, err = self.stack("--stack", "--run-secret-fd", "tok=%d" % r, *extra, code=cw.EXIT_CLOUD)
+        finally:
+            os.close(r)
+        return err
+
+    def test_a_stop_during_the_window_is_not_recreated(self):   # kills: no check that the call's own objects remain
+        err = self._outside("pw,run")
+        self.assertIn("removed from outside", err)
+        self.assertEqual(len(self.pod_creates()), 1)
+        self.assertEqual(self.st()["pods"], {})
+
+    def test_the_reapers_stop_is_the_same(self):   # the reaper deletes pod and both Secrets just as a stop does
+        self.assertIn("removed from outside", self._outside("pw,run"))
+        self.assertEqual(len(self.pod_creates()), 1)
+
+    def test_a_secret_deleted_alone_is_not_recreated(self):
+        for kill in ("pw", "run"):
+            with self.subTest(kill=kill):
+                self.setUp()
+                self.assertIn("removed from outside", self._outside(kill))
+                self.assertEqual(len(self.pod_creates()), 1)
+
+    def test_a_pod_deleted_alone_with_the_secrets_present_is_recreated(self):
+        self.patch_state(plan=["vanish:", "ok"])
+        r = self._run_secret()
+        try:
+            self.stack("--stack", "--run-secret-fd", "tok=%d" % r)
+        finally:
+            os.close(r)
+        self.assertEqual(len(self.pod_creates()), 2)
+
+    # the table of watch-loop outcomes, derived from the loop: each is RUN here (name: plan, state, extra args, exit, pod creates, reason word)
+    OUTCOMES = {
+        "ready": ({}, [], 0, 1, "ready"),
+        "race": ({}, ["race", "ok"], 0, 2, "handler"),
+        "vanish": ({}, ["vanish", "ok"], 0, 2, "pod vanished"),
+        "race_then_vanish": ({}, ["race_vanish", "ok"], 0, 2, "handler"),
+        "never_seen": ({"hide_pod": True}, [], cw.EXIT_TIMEOUT, 1, "timed out"),
+        "other_failure": ({"other_failure": "failed to pull image: not found"}, [], cw.EXIT_TIMEOUT, 1, "timed out"),
+        "cap": ({}, ["vanish"] * 5, cw.EXIT_CLOUD, 3, "giving up"),
+        "outside_deletion": ({}, ["vanish:pw", "ok"], cw.EXIT_CLOUD, 1, "removed from outside"),
+    }
+
+    def test_every_outcome_of_the_watch_loop_is_run(self):   # kills: a branch emptied or an outcome with no row
+        for outcome, (state, plan, code, creates, word) in self.OUTCOMES.items():
+            with self.subTest(outcome=outcome):
+                self.setUp()
+                self.patch_state(plan=plan, **state)
+                c, out, err = self.run_cli("create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main", "--run-id", self.RUN_ID,
+                                           "--stack", "--wait", "10")
+                self.assertEqual(c, code, err)
+                self.assertEqual(len(self.pod_creates()), creates)
+                self.assertIn(word, err + " ".join(self.reasons()))
+                self.assertEqual(self.secrets_made(), [cw.pod_name("coder7") + "-pw"])   # never more than once
 
     def test_the_default_create_never_watches_a_vanish(self):
         self.stack()

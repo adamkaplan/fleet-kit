@@ -72,8 +72,10 @@ if cmd == "apply" or (cmd == "create" and args[1:2] == ["-f"]):   # `create -f` 
         plan = st.get("plan", [])   # per-create outcomes: "race" (event), "vanish" (Pending, gone at its second get), "race_vanish" (both), else ok
         step = plan.pop(0) if plan else None
         st["plan"] = plan
-        if step in ("vanish", "race_vanish"):
+        if step in ("vanish", "race_vanish") or (step or "").startswith("vanish:"):
             obj["vanish_after_get"] = True
+            # "vanish:pw,run": an outside deletion (a stop, the reaper) takes these Secrets too, at the moment the pod goes
+            obj["vanish_kills"] = [k for k in (step.split(":", 1)[1].split(",") if ":" in step else []) if k]
         event = None   # a sandbox failure the cluster records for THIS pod object (events outlive a deleted pod, as on a real cluster)
         if step in ("race", "race_vanish"):
             event = "RuntimeClass handler sysbox-runc does not support user namespaces: the handler sysbox-runc is not known"
@@ -82,8 +84,8 @@ if cmd == "apply" or (cmd == "create" and args[1:2] == ["-f"]):   # `create -f` 
             event = "RuntimeClass handler sysbox-runc does not support user namespaces: the handler sysbox-runc is not known"
         elif st.get("other_failure"):
             event = st["other_failure"]
-        obj["status"] = {"phase": "Pending" if st.get("never_ready") or event or step == "vanish" else "Running",
-                         "conditions": [] if st.get("never_ready") or event or step == "vanish" else [{"type": "Ready", "status": "True"}]}
+        obj["status"] = {"phase": "Pending" if st.get("never_ready") or event or (step or "").startswith("vanish") and step != "race_vanish" else "Running",
+                         "conditions": [] if st.get("never_ready") or event or (step or "").startswith("vanish") and step != "race_vanish" else [{"type": "Ready", "status": "True"}]}
         if event:
             st.setdefault("events", []).append({"reason": "FailedCreatePodSandBox", "message": "Failed to create pod sandbox: " + event,
                                                 "involvedObject": {"kind": "Pod", "name": obj["metadata"]["name"], "uid": obj["metadata"]["uid"]}})
@@ -133,7 +135,10 @@ elif cmd == "get" and args[1] == "pod":
     pod = st["pods"][args[2]]
     if pod.get("vanish_after_get"):   # the pod is seen once, then the object is gone (the runtime restart on a fresh node)
         if pod.get("seen_once"):
-            del st["pods"][args[2]]; save(); missing('pods "%s"' % args[2])
+            del st["pods"][args[2]]
+            for k in pod.get("vanish_kills", []):
+                st.get("secrets", {}).pop(args[2] + "-" + k, None)
+            save(); missing('pods "%s"' % args[2])
         pod["seen_once"] = True; save()
     print(json.dumps(pod))
 elif cmd == "get" and args[1] == "pods":
