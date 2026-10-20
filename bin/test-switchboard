@@ -62843,6 +62843,22 @@ class TestReviewerSubagents(LedgerBase):
         with mock.patch.object(sb.impact_floor, "_matrix_cached", side_effect=RuntimeError("no matrix")):
             self.assertIn("unknown", self.rating_lines()[0])   # an exception never escapes `gates`
 
+    def test_s3_every_unreadable_branch_says_unknown_and_never_no_rating_while_a_record_exists(self):
+        self.rate_at_head("Medium", "reviewer")
+        module = sb.load_module("delegated_clear")
+        cases = {"the score block cannot be read": mock.patch.object(module, "score_block", return_value=None),
+                 "the matrix has no cells": mock.patch.object(sb.impact_floor, "_matrix_cached", return_value={"cells": {}}),
+                 "the matrix cannot be read": mock.patch.object(sb.impact_floor, "_matrix_cached", side_effect=RuntimeError("no matrix")),
+                 "the scoring raises": mock.patch.object(module, "judge", side_effect=RuntimeError("boom")),
+                 "the shaping raises": mock.patch.object(sb.plan_ledger, "impact_rating_fact", side_effect=RuntimeError("boom"))}
+        for label, patch in cases.items():
+            with self.subTest(branch=label), patch:
+                lines = self.rating_lines()
+                self.assertEqual(len(lines), 1, label)
+                self.assertIn("unknown", lines[0], label)
+                self.assertNotIn("no impact rating recorded", lines[0], label)
+                self.assertNotIn("not counted", lines[0], label)
+
     def test_s4_s5_the_line_changes_no_gate_and_is_the_engines_own_reading(self):
         def gates():
             code, out, err = self.run_as("coder", "gates", self.PR, "--json")
