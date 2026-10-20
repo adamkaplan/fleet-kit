@@ -33558,10 +33558,14 @@ def hostile_parser_cases():
 HOSTILE_EXTRA_ARGV = {"an extra same-dest flag on review record": ["--zz", "Negligible"], "an extra same-dest flag on impact clear": ["--zz", "Negligible"]}   # the line the hostile flag is typed on
 
 
+HOSTILE_RAN = []   # one entry each time a hostile `build_parser` of the table is really called: the proof that a test ran it (the direct route never does)
+
+
 def hostile_build_parser(mutator):
     real = sb.build_parser
 
     def build():
+        HOSTILE_RAN.append(1)
         parser = real()
         mutator(parser)
         return parser
@@ -35308,8 +35312,7 @@ class TestImpactHold(LedgerBase):
         rows = dict(re.findall(r"^\| `([a-z_]+)` \| (.+) \|$", section, re.M))
         self.assertEqual(rows, rule["rating_roots_why"], "docs/switchboard.md lists the matrix's roots with the matrix's words (0 differences)")
         self.assertEqual(sorted(rows), sorted(rule["rating_roots"]))
-        meaning = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]["meaning"] if "meaning" in sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"] else sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"].get("meaning", "")
-        self.assertIn("rating_roots_why", json.dumps(sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]))
+        self.assertIn("rating_roots_why", rule["meaning"])   # the matrix text names the table of reasons
         source = (BIN / "delegated_clear.py").read_text()
         for name in set(rule["rating_roots"]) | set(rule["closure_roots"]):
             if len(name) > 4:
@@ -35329,7 +35332,7 @@ class TestImpactHold(LedgerBase):
         return sorted(rows, key=repr)
 
     def test_the_whole_parsed_surface_is_walked_each_command_is_registered_once_and_every_add_parser_is_seen(self):
-        """#924, the pure move: the full surface (every subparser at every depth) is walked from the real `build_parser()`. Nothing is compared with a stored copy (the per-command help fixtures and this walk are the
+        """#924, the pure move: NOTE the pin of a dropped flag or command is the per-command help fixture test (`test_every_subcommand_of_the_snapshot_still_exists_with_the_same_help`); this walk holds the invariants of the shape (each command once, nested flags present). The full surface:  (every subparser at every depth) is walked from the real `build_parser()`. Nothing is compared with a stored copy (the per-command help fixtures and this walk are the
         proof the move changed nothing; the before and after equality is measured on the base commit's text in the pull request)."""
         import ast
         parser = sb.build_parser()
@@ -35468,7 +35471,7 @@ class TestImpactHold(LedgerBase):
     RATING_FLAGS = ("--reviewer", "impact", "--verdict", "approve")
     HOSTILE_DEFAULTS = {"impact_severity": "Negligible", "impact_probability": "Improbable", "impact_reason": "floor-authority", "impact_action": "none", "impact_class": "data", "block": "/nonexistent/block.txt"}
 
-    def record_run(self, flags=(), registrars=(), argv=None, build=None):
+    def record_run(self, flags=(), registrars=(), argv=None, build=None, namespace=False):
         """Run the REAL `review record` as the reviewer role with hostile registrars injected into the module's globals before the real `build_parser()` runs. (code, stderr, the entry written without its chain fields or None)."""
         self.world.add_agent("rev", fleet={"role": "reviewer"}) if "rev" not in self.world.sessions else None
         self.ledger_reset()
@@ -35478,7 +35481,15 @@ class TestImpactHold(LedgerBase):
         for patcher in patchers:
             patcher.start()
         try:
-            if argv is None:
+            if namespace:   # #924: the hostile parser REALLY runs (the direct route of `main` never builds it): build it, parse the line, and hand the shared namespace to the real `cmd_review`
+                line = ["review", "record", self.PR, *self.RATING_FLAGS, *flags]
+                os.environ["HERDR_PANE_ID"] = self.world.panes["rev"]
+                with captured() as (o, e), mock.patch.object(sys, "argv", ["fleet-switchboard"] + line), mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: self.terminal_problem):
+                    args = sb.build_parser().parse_known_args(line)[0]
+                    args.raw_argv = tuple(line)
+                    code = sb.cmd_review(args, self.route, self.world.clock.now)
+                err = e.getvalue()
+            elif argv is None:
                 code, out, err = self.run_as("rev", "review", "record", self.PR, *self.RATING_FLAGS, *flags)
             else:
                 os.environ["HERDR_PANE_ID"] = self.world.panes["rev"]
@@ -35559,10 +35570,10 @@ class TestImpactHold(LedgerBase):
                 self.assertEqual((clean["impact_severity"], clean["impact_probability"], clean["impact_reason"], clean["impact_action"], clean["impact_class"]), ("Critical", "Improbable", "applied floor-authority", "second-review", "data"))
             for label, registrars in cases:
                 with self.subTest(flags=flags_label, registrar=label):
-                    code, err, entry = self.record_run(flags, registrars)
+                    code, err, entry = self.record_run(flags, registrars, namespace=True)   # the hostile registrar really runs, in the real build_parser, and the namespace it shaped reaches the real cmd_review
                     self.assertEqual((code, entry), (0, clean), err)
         with self.subTest("a registrar that rewrites sys.argv"):   # the raw tuple was captured before the registrars ran
-            code, err, entry = self.record_run(argv=["review", "record", self.PR, *self.RATING_FLAGS, *self.EXPLICIT], registrars=[("add_zzz_parsers", rewrites_argv)])
+            code, err, entry = self.record_run(self.EXPLICIT, registrars=[("add_zzz_parsers", rewrites_argv)], namespace=True)
             self.assertEqual(code, 0, err)
             clean_code, clean_err, clean = self.record_run(self.EXPLICIT)
             self.assertEqual(entry, clean)
@@ -35578,8 +35589,20 @@ class TestImpactHold(LedgerBase):
             self.assertEqual(clean_code, 0, clean_err)
             for label, mutator in cases:
                 with self.subTest(flags=flags_label, hostile=label):
-                    code, err, entry = self.record_run(tuple(flags) + tuple(HOSTILE_EXTRA_ARGV.get(label, [])) if "review record" in label or label not in HOSTILE_EXTRA_ARGV else flags, build=hostile_build_parser(mutator))
-                    self.assertTrue((code, entry) == (0, clean) or (code != 0 and entry is None), "the same record or fail closed: %r %r" % (code, err))
+                    del HOSTILE_RAN[:]
+                    code, err, entry = self.record_run(tuple(flags) + tuple(HOSTILE_EXTRA_ARGV.get(label, [])) if "review record" in label or label not in HOSTILE_EXTRA_ARGV else flags, build=hostile_build_parser(mutator), namespace=True)
+                    self.assertEqual(HOSTILE_RAN, [1], "the hostile build_parser really ran")
+                    self.assertEqual((code, entry), (0, clean), "the record is exactly what the command line says: %r" % (err,))
+
+    def test_the_direct_route_never_calls_build_parser_for_the_record(self):
+        """The direct route, named as that (#924): `review record` run through the real `main` takes the private parser, so a hostile `build_parser` is NEVER called, and the record is the clean one."""
+        self.record_pr_setup()
+        clean_code, clean_err, clean = self.record_run(self.EXPLICIT)
+        del HOSTILE_RAN[:]
+        for label, mutator in hostile_parser_cases():
+            with self.subTest(label):
+                code, err, entry = self.record_run(self.EXPLICIT, build=hostile_build_parser(mutator))
+                self.assertEqual((code, entry, HOSTILE_RAN), (0, clean, []), err)
 
     def test_the_table_of_hostile_parsers_really_changes_the_shared_parser(self):
         """Completeness of the table: each hostile mutator is effective (the namespace of the shared parser DOES carry a hostile value), so a pass of the two tests above is not a no-op."""
@@ -35597,10 +35620,12 @@ class TestImpactHold(LedgerBase):
         real = sb.rating_inputs
         def reads_namespace(raw_argv):   # the mutant: the shared parser's namespace is the source
             args, _ = hostile_build_parser(mutator)().parse_known_args(list(raw_argv))
-            return {k: getattr(args, k) for k in sb.RATING_INPUTS if getattr(args, k, None) is not None}
+            return {k: getattr(args, k) for k in sb.RATING_INPUTS if k != "block" and getattr(args, k, None) is not None}   # (the hostile `block` default would only make the record refuse)
+        del HOSTILE_RAN[:]
         with mock.patch.object(sb, "rating_inputs", reads_namespace):
-            code, err, entry = self.record_run((), build=hostile_build_parser(mutator))
-        self.assertTrue(code != 0 or "impact_severity" in (entry or {}), "the mutant records or refuses: %r" % (entry,))
+            code, err, entry = self.record_run((), build=hostile_build_parser(mutator), namespace=True)
+        self.assertGreaterEqual(len(HOSTILE_RAN), 2, "the hostile build_parser ran (to build the namespace, and inside the mutant)")
+        self.assertEqual((code, entry["impact_severity"]), (0, "Negligible"), "the mutant records the hostile default: the record test above would fail on it")
         clean_code, _, clean = self.record_run(())
         self.assertNotIn("impact_severity", clean)
 
@@ -36135,17 +36160,22 @@ def _hostile_clear_test(index):
     def test(self):
         label, mutator = hostile_parser_cases()[index]
         self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
-        with mock.patch.object(sb, "build_parser", hostile_build_parser(mutator)):
-            code, out, err = self.run_as("cos", "impact", "clear", self.PR, "--under-order", "17", "--reason", "the review confirms nothing touches credentials nor identity", *(HOSTILE_EXTRA_ARGV.get(label, []) if "impact clear" in label else []))
+        line = ["impact", "clear", self.PR, "--under-order", "17", "--reason", "the review confirms nothing touches credentials nor identity", *(HOSTILE_EXTRA_ARGV.get(label, []) if "impact clear" in label else [])]
+        del HOSTILE_RAN[:]
+        os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+        with captured() as (o, e), mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: self.terminal_problem):   # the hostile parser REALLY runs; its namespace reaches the real clear
+            args = hostile_build_parser(mutator)().parse_known_args(line)[0]
+            args.raw_argv = tuple(line)
+            code = sb.cmd_impact(args, self.route, self.world.clock.now)
+        err = e.getvalue()
+        self.assertEqual(HOSTILE_RAN, [1], "the hostile build_parser really ran")
         deletes = sorted(w[1].rsplit("/", 1)[1] for w in self.writes if w[0] == "DELETE")
         cleared = self.events("gate.hold_cleared")
-        if code == 0:   # the same clear as with the real parser (test_s1): the order, the head and the labels of the command line and the ledger
-            (event,) = cleared
-            detail = event["detail"]
-            self.assertEqual((detail["by"], detail["under_order"], detail["head"], detail["via"]), ("cos", 17, LEDGER_HEAD, "order:17"), label)
-            self.assertTrue(deletes, label)
-        else:   # or it fails closed: nothing cleared
-            self.assertEqual((cleared, deletes), ([], []), "%s: %s" % (label, err))
+        self.assertEqual(code, 0, "%s: %s" % (label, err))   # the same clear as with the real parser (test_s1): the order, the head and the labels of the command line and the ledger
+        (event,) = cleared
+        detail = event["detail"]
+        self.assertEqual((detail["by"], detail["under_order"], detail["head"], detail["via"]), ("cos", 17, LEDGER_HEAD, "order:17"), label)
+        self.assertTrue(deletes, label)
     return test
 
 
