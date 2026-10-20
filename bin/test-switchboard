@@ -58160,6 +58160,8 @@ class TestMadeUpPids(unittest.TestCase):
         """The reserve is at least what any test asks (checked over every request recorded so far, by any caller), and the test that asks for the most, run from
         bases inside and outside the last stretch of the range, passes: a test cannot run out of numbers because of where the machine's pids stand."""
         module = sys.modules[__name__]
+        for _ in range(100):
+            made_up_pid()                                  # its own ask, so it never depends on which tests ran before it (alone, the registry holds just this)
         hungriest = max(_MADE_UP_BY_TEST, key=lambda test: len(_MADE_UP_BY_TEST[test]))
         self.assertLessEqual(len(_MADE_UP_BY_TEST[hungriest]), _MADE_UP_BLOCK[0], hungriest)
         name = "test_s6_no_number_is_given_twice_in_a_hundred_and_a_restarted_base_does_not_repeat"
@@ -58173,7 +58175,9 @@ class TestMadeUpPids(unittest.TestCase):
 
     def test_every_test_that_has_asked_for_numbers_so_far_in_this_process_was_given_them_in_ascending_order(self):
         """Recorded WHERE THE HELPER IS CALLED, by any caller (a fixture, a fake, a mixin): the registry holds every test that asked, with its numbers."""
-        self.assertTrue(_MADE_UP_BY_TEST)
+        for _ in range(5):
+            made_up_pid()                                  # its own ask, so it never depends on which tests ran before it
+        self.assertIn(self.id(), _MADE_UP_BY_TEST)
         self.assertEqual([test for test, got in _MADE_UP_BY_TEST.items() if got != sorted(got) or len(set(got)) != len(got)], [])
 
     def test_the_old_numbers_are_never_handed_out_when_they_are_the_parent_and_grandparent(self):
