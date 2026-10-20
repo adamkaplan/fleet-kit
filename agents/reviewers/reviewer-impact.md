@@ -112,7 +112,7 @@ The coder session records your block; you never run the command. A block with no
 A rating counts by score only because your block was recorded with it: the hash kept with the record proves a block was given, not that the agent produced it (a mistake-guard, as the recorded-role check is); the independent review and the audit remain the cover. The record keeps only the block's hash and size, not its text, so keep your block text if an audit ever needs it.
 
 <!-- block-table:begin -->
-With --block, refused (the block carries them): --verdict, --head, --blocks, --notes, --impact-action; accepted: --reviewer, --summary, --impact-class, --impact-severity, --impact-probability, --impact-reason, and of these --impact-class, --impact-severity, --impact-probability, --impact-reason win over the block's own lines; the score comes from the block's impact-severity:, impact-probability: and impact-reason: lines, so a block without the first two is recorded WITHOUT a score
+With --block, refused (the block carries them): --verdict, --head, --blocks, --notes, --impact-action; accepted: --reviewer, --summary, --impact-class, --impact-severity, --impact-probability, --impact-reason, --confirms-carry, and of these --impact-class, --impact-severity, --impact-probability, --impact-reason win over the block's own lines; the score comes from the block's impact-severity:, impact-probability: and impact-reason: lines, so a block without the first two is recorded WITHOUT a score
 <!-- block-table:end -->
 
 A full block, as you return it (the three `impact-` rating lines are what give the record its score):
