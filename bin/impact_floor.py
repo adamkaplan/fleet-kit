@@ -462,10 +462,10 @@ def registrar_reasons(registrar):
         return []
     if not isinstance(registrar, dict) or registrar.get("why") or not isinstance(registrar.get("findings"), list):
         return ["registrar diff could not be read (%s): held" % str((registrar or {}).get("why") if isinstance(registrar, dict) else "unreadable")[:120]]
-    return ["registrar %s %s closure name %s: %s" % (name, verb, hit, REGISTRAR_RULE_TEXT) for name, verb, hit in registrar["findings"]]
+    return ["registrar %s %s %s: %s" % (name, verb, hit, REGISTRAR_RULE_TEXT) for name, verb, hit in registrar["findings"]]
 
 
-REGISTRAR_RULE_TEXT = "a registrar that imports, calls or rebinds a name of the clear's closure is held for the owner"
+REGISTRAR_RULE_TEXT = "a registrar that imports, calls or rebinds a name of the clear's closure is held for the owner; a registrar that does more than set up its own parsers is held for the owner"
 
 
 def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=(), narrow=None, record=None, registrar=None):
