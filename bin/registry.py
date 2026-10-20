@@ -28,6 +28,7 @@ MAX_BYTES = 4000000
 AUDIT_MAX_BYTES = 512000
 RETIRED_KEEP_SECONDS = 4 * 7 * 86400   # a retirement long past the status window is dropped (the bound the old retired.json had)
 STATES = ("working", "blocked", "idle", "detached", "dead")
+ORCHESTRATOR = "orchestrator"   # the role of an agent that owns a charter (a name, not a comparison: this module decides nothing about who may act)
 AGENT_FIELDS = ("session", "pane", "role", "charter", "repo", "workspace", "cwd")   # the seven fields the old readers use
 RECORD_FIELDS = ("pane", "role", "charter", "repo", "workspace", "cwd")             # what a retirement keeps of an agent row
 LOCK_SECONDS = 5
@@ -371,7 +372,7 @@ def is_charter(value):
 def orchestrator_charters(agents):
     """{name: charter number} of the orchestrators of a registry's `agents` that record a charter (rows with none are left out). The ONE reading of "whose charter is this" (#969)."""
     return {name: row["charter"] for name, row in (agents or {}).items()
-            if isinstance(row, dict) and row.get("role") == "orchestrator" and is_charter(row.get("charter"))}
+            if isinstance(row, dict) and row.get("role") == ORCHESTRATOR and is_charter(row.get("charter"))}
 
 
 def duplicate_charters(agents, repos=None):
@@ -391,7 +392,7 @@ def set_charter(state_dir, name, charter, by, now=None):
         row = doc["agents"].get(name)
         if not isinstance(row, dict) or name in doc["retired"]:
             return False, [], "%s is not a registered agent" % name
-        if row.get("role") != "orchestrator":
+        if row.get("role") != ORCHESTRATOR:
             return False, [], "%s is not an orchestrator" % name
         if charter is not None and not is_charter(charter):
             return False, [], "a charter is an issue number or none"
