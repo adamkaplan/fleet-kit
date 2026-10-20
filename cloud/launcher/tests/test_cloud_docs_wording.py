@@ -17,6 +17,18 @@ WINDOW = ("Limit: the checks judge the launcher file once, just before it runs. 
           "in that window, or edit the switchboard itself: the checks guard against OTHER users, not against yourself.")
 
 
+def says_url(text):
+    return GOOD in text
+
+
+def calls_it_a_host_name(text):
+    return BAD.search(text) is not None
+
+
+def has_window(text):
+    return WINDOW in text
+
+
 def read(rel):
     with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
         return f.read()
@@ -34,49 +46,66 @@ def template(text):
 
 
 QS = "docs/cloud-operator-quickstart.md"
-# the places, each a function text -> list of the description lines (derived: the table row, the template comment, the launcher README row, the help words)
+# the doc's name for a kind the code labels differently: the reader's kind label for the key stays "name", the doc calls it what it is
+DOC_KIND = {KEY: "https URL"}
+# the places, each a function () -> the description lines (derived: the table row, the template comment, the launcher README row, the help words)
 PLACES = {
     "quickstart settings row": lambda: row(read(QS)),
     "quickstart template": lambda: template(read(QS)),
-    "launcher README row": lambda: row(read("cloud/launcher/README.md").replace("| `%s` (`CW_CLOUD_CA_FILE`)" % KEY, "| `%s`" % KEY)),
+    "launcher README row": lambda: row(read("cloud/launcher/README.md")),
     "launch help (refusal words)": lambda: [cw.VALIDATORS[KEY][0]],
 }
+PROSE = ("docs/cloud-worker-interface.md",)
+
+
+def prose_lines(rel):
+    return [l for l in read(rel).splitlines() if "set `%s` (" % KEY in l or "set `%s`" % KEY in l and "TOKEN_FILE" in l and "Turn it on" not in l]
 
 
 class TestClusterServerWording(unittest.TestCase):
     def test_every_place_found(self):
         for name, get in PLACES.items():
             self.assertEqual(len(get()), 1, name)
+        for rel in PROSE:
+            self.assertTrue(prose_lines(rel), rel)
 
     def test_places_say_the_url(self):
         for name, get in PLACES.items():
             with self.subTest(name):
-                self.assertIn(GOOD, get()[0])
+                self.assertTrue(says_url(get()[0]))
+        for rel in PROSE:
+            for l in prose_lines(rel):
+                self.assertTrue(says_url(l), rel)
 
     def test_places_do_not_call_it_a_host_name(self):
         for name, get in PLACES.items():
             with self.subTest(name):
-                self.assertIsNone(BAD.search(get()[0]), get()[0])
+                self.assertFalse(calls_it_a_host_name(get()[0]), get()[0])
 
-    def test_every_doc_line_with_the_key_that_describes_it_says_the_url(self):
-        # the whole family: any prose line in the docs that sets or describes the key (not a table of other settings) names the URL
-        for rel in (QS, "docs/cloud-worker-interface.md", "cloud/launcher/README.md"):
-            for l in read(rel).splitlines():
-                if KEY in l and ("set `%s`" % KEY in l) and "CW_CLOUD_TOKEN_FILE" in l and "Turn it on" not in l and "logs in as" not in l:
-                    self.assertIn(GOOD, l, rel)
+    def test_doc_kinds_come_from_the_code(self):
+        # the quickstart's kind list is the code's kinds, with the doc's own name where DOC_KIND says so
+        text = read(QS)
+        m = re.search(r"its kind \(([^)]*)\):", text)
+        self.assertTrue(m)
+        listed = [k.strip() for k in m.group(1).split(",")]
+        expected = {DOC_KIND.get(n, k) for n, k in cw.SETTING_KINDS.items()} | set(DOC_KIND.values())
+        self.assertEqual(set(listed), expected)
+        self.assertIn("| %s |" % DOC_KIND[KEY], row(text)[0])
 
     def test_window_sentence_present(self):
-        self.assertIn(WINDOW, read(QS))
+        self.assertTrue(has_window(read(QS)))
 
-    # mutants: a copy of the text with the claim broken; the same check must then fail
+    # mutants: a copy of the text with the claim broken; the REAL check must then fail
     def test_mutants_are_caught(self):
         for name, get in PLACES.items():
             with self.subTest(name):
                 mutant = get()[0].replace(GOOD, "the cluster host name")
-                self.assertNotIn(GOOD, mutant)
-                self.assertIsNotNone(BAD.search(mutant))
-        self.assertNotIn(WINDOW, read(QS).replace("the checks guard against OTHER users", "the checks guard"))
-        self.assertIsNotNone(BAD.search("| `%s` | yes | name | x |" % KEY))
+                self.assertFalse(says_url(mutant))
+                self.assertTrue(calls_it_a_host_name(mutant))
+        qs = read(QS)
+        self.assertFalse(has_window(qs.replace(WINDOW, "")))
+        self.assertFalse(has_window(qs.replace("guard against OTHER users", "guard")))
+        self.assertTrue(calls_it_a_host_name(row(qs)[0].replace("| https URL |", "| name |")))
 
 
 if __name__ == "__main__":
