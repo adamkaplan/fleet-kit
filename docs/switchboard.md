@@ -4759,6 +4759,30 @@ Every agent `launch` (and `launch --resume`) starts in a pane gets its **own tem
 
 The `gh` shim also writes **one warning line** on stderr when a `--body-file`, `--body-file=PATH`, `-F PATH` or `-FPATH` names an absolute path whose parent directory *is* a shared temp directory (`/tmp`, `/private/tmp`, or the profile's shared temp root, the parent of the agent's own `TMPDIR`), and points at `$TMPDIR`. It looks at the path as text only (`..` is folded lexically): it never opens, stats or reads the file, never refuses, and never changes the arguments, the exit code, the signing or the credential route; any error in it is silent. A path under the agent's own `TMPDIR`, in a `mktemp -d` subdirectory, or a relative path gives no warning.
 
+### What may delete under agent scratch (#947)
+
+**The root of the "files vanish from the shared temp directory" report is the operating system, not the fleet.** On macOS two daily jobs clean the areas an agent's default `TMPDIR` and `/tmp` live in: one removes, from `/tmp`, every regular file whose access, modification and change times are all older than 3 days (about midnight local time); the other removes entries of the per-user temp area (`/var/folders/*/T`) not used for 3 days (about 03:35 local time). The rule is by **last use, not age**: a script written once and never read again goes after 3 days while an older helper that keeps being read survives, so the loss looks selective. The kit cannot turn this off, and a longer retention or a copy elsewhere only moves the cliff. So the rule is about *where things live*:
+
+- **`/tmp`, `$TMPDIR` outside the profile, and the shared agent temp directory under the per-user temp area are disposable: anything there "may vanish after 3 days without a read".** Keep nothing that must last there (tools, notes, pause files, briefs for a later session).
+- **Durable scratch is the private directory of the agent**, `<profile>/tmp/<agent name>` (a pane through the wrapper, or a headless worker through the `fleet-hooks` plugin, above). It sits under the profile in the user's data directory, outside both OS-cleaned areas. The wrapper's fallback `TMPDIR` for an agent with no directory of its own (the Chief of Staff and the plan review lanes, which are skipped by name) is the profile's `tmp`, also durable. A session that does not run through the wrapper keeps the OS's `TMPDIR`: its lasting files go in its worktree (committed or ignored) or under the data directory, never `/tmp`.
+- A test of this section (`test_s3_...` in `bin/test-switchboard`) simulates the OS rule on a fixture directory with a moved clock (never the real `/tmp`): a file unread for 3 days is gone in the cleaned area and the durable root is never under one.
+
+**What may delete under agent scratch**
+
+- the OS cleaners: `/tmp` and the per-user temp area, after 3 days without a read;
+- the temp janitor (`disk janitor`), once its apply is on, by its own rules (old, unnamed, not in use; a dry run until then, and it removed nothing in the loss windows that led to this section);
+- `retire`, only of the agent's own private directory and only when it is **EMPTY** (`os.rmdir`);
+- an agent removing its own files.
+
+**What never deletes**
+
+- a worktree removal (`git worktree remove` of a clean, pushed worktree) never touches a temp path;
+- `retire` of a **non-empty** private directory: it is kept and the line says how many files are left;
+- a coder cleaning other agents' files: nobody empties another agent's scratch;
+- the docker reaper, the orphan reaper and disk prune (they handle Docker volumes and images, processes, and the temp janitor's named entries).
+
+Not done here (follow-up): `job start` keeps its records in `fleet-jobs` under the default `TMPDIR`; under the wrapper that is the agent's private directory, elsewhere an OS-cleaned one. A `fleet-doctor` warning for a plan or job record that names a `/tmp`-like path as lasting storage was left out as not small.
+
 ### The orphan reaper (#321, slice S7)
 
 A process of this user whose parent is launchd (pid 1), that has run longer than the grace (`"orphan_reaper": {"grace_hours": 6}`, 0.5 to 720) and whose command matches an **allow-list of three command shapes** is an orphan of a finished test or agent: `fake-agent` (a python `fake-agent.py` under a `host-mctx` directory in this user's temp directory), `node-test` (a `node ... --test` runner whose command line names an absolute path in such a worktree or temp directory; a bare `node --test` is not matched) or `python-helper` (an absolute `.py` script that lives in a fleet worktree under `~/Code/fleet-kit.wt` or in this user's own temp directory (`$TMPDIR`), not all of `/tmp`). `status` lists them (`orphans  N: kind pid (age), ...`), `fleet-switchboard disk reap-orphans` lists them too (**a dry run by default**), and `disk reap-orphans --apply` (the operator or the Chief of Staff only) sends **SIGTERM, then SIGKILL after 5 seconds** if the same process is still there, at most 20 per run, each audited (`orphan.term`, `orphan.kill`). Never pid 1, this process or its parent, never another user's process, never one whose parent is not pid 1, never a command that names opencode, herdr, the switchboard, docker, ssh or tmux, never a command outside the allow-list. The process is read again just before each signal and must be the same pid, parent, owner and command, so a reused pid is not signalled. Nothing runs it on its own. The kill switch is `"orphan_reaper": {"enabled": false}`: no listing in `status`, and `--apply` refuses. The audit lines carry who applied the reap (`by`).
