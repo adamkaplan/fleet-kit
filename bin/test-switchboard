@@ -73607,14 +73607,14 @@ class TestFocusedLocalRuns(unittest.TestCase):
     def test_a_mutant_that_never_refuses_lets_every_refused_row_run(self):
         for row in self.ROWS:
             if row[5]:
-                with self.subTest(row=row[0]), mock.patch.object(self.hs, "refusal", lambda *a, **k: None):
+                with self.subTest(row=row[0]), mock.patch.object(self.hs, "second_job_notice", lambda *a, **k: None):
                     self.reset()
                     self.assertNotEqual(self.attempt(row)[0], 64)
 
     def test_a_mutant_that_always_refuses_stops_every_allowed_row(self):
         for row in self.ROWS:
             if not row[5]:
-                with self.subTest(row=row[0]), mock.patch.object(self.hs, "refusal", lambda *a, **k: "heavy: refused: x"):
+                with self.subTest(row=row[0]), mock.patch.object(self.hs, "second_job_notice", lambda *a, **k: "heavy: refused: x"):
                     self.reset()
                     code = self.attempt(row)[0]
                     if row[4] is not None and row[0] != "focused-not-refused":   # a focused run or an unknown worktree never asks
@@ -73660,7 +73660,7 @@ class TestFocusedLocalRuns(unittest.TestCase):
 
     def test_the_marker_preflight_looks_for_is_in_the_text_the_wrapper_writes(self):
         hs = sb.load_heavy_slots()
-        text = hs.refusal(self.state_for_marker(), "/work/a", [{"kind": "full", "worktree": "/work/a", "name": "n", "pid": 1, "since": 1}])
+        text = hs.second_job_notice(self.state_for_marker(), "/work/a", [{"kind": "full", "worktree": "/work/a", "name": "n", "pid": 1, "since": 1}])
         source = SWITCHBOARD.read_text()
         literal = re.search(r'"(heavy: refused: [^"]+)" in \(done\.stderr', source).group(1)
         self.assertTrue(text.startswith(literal), text)
@@ -73784,7 +73784,7 @@ class TestFocusedLocalRuns(unittest.TestCase):
             with self.subTest(case=name):
                 self.reset()
                 self.write_record(self.case(fields))
-                self.assertEqual(self.hs.refusal(self.state, self.A, []) is not None, refused)
+                self.assertEqual(self.hs.second_job_notice(self.state, self.A, []) is not None, refused)
 
     def test_mutants_of_the_liveness_rule_flip_a_case(self):
         flips = {}
@@ -73797,22 +73797,22 @@ class TestFocusedLocalRuns(unittest.TestCase):
                 for name, fields, refused in self.LIVE_CASES:
                     self.reset()
                     self.write_record(self.case(fields))
-                    if (self.hs.refusal(self.state, self.A, []) is not None) != refused:
+                    if (self.hs.second_job_notice(self.state, self.A, []) is not None) != refused:
                         flips[label].append(name)
         self.assertEqual(flips, {"always-live": ["both-dead", "pid-reused-by-another-process", "wrapper-pid-reused"],
                                  "pid-only": ["pid-reused-by-another-process", "wrapper-pid-reused"],
                                  "wrapper-half-dropped": ["wrapper-alive"], "command-half-dropped": ["command-alive", "pid-with-its-real-start"]})
 
     def test_a_malformed_record_is_read_without_error(self):
-        self.assertIsNone(self.hs.refusal(self.state, self.A, [{"kind": "full", "worktree": "/elsewhere"}]))
-        text = self.hs.refusal(self.state, self.A, [{"kind": "full", "worktree": self.A, "name": "\x1b[31mq", "pid": "x", "since": "y"}])
+        self.assertIsNone(self.hs.second_job_notice(self.state, self.A, [{"kind": "full", "worktree": "/elsewhere"}]))
+        text = self.hs.second_job_notice(self.state, self.A, [{"kind": "full", "worktree": self.A, "name": "\x1b[31mq", "pid": "x", "since": "y"}])
         self.assertIn("pid unknown, since unknown time", text)
         self.assertNotIn("\x1b", text)
         fd = self.hs._take(self.state, 3)[0]
         self.fds.append(fd)
         os.ftruncate(fd, 0)
         os.pwrite(fd, b'{"kind": "full", "worktree"', 0)   # cut off: no record
-        self.assertIsNone(self.hs.refusal(self.state, self.A, []))
+        self.assertIsNone(self.hs.second_job_notice(self.state, self.A, []))
 
     def test_the_sentences_name_roles_never_agents_or_people(self):
         for sentence in (self.DEFAULT, self.EXCEPTION, self.REFUSAL):

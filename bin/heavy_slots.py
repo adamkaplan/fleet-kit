@@ -447,9 +447,9 @@ class Line:
     def _mine(self, entry):
         return entry["pid"] == self.pid and entry["start"] == self.start
 
-    def _update(self, join, refuse=None):
+    def _update(self, join, second_job_check=None):
         """Under the lock: drop the entries of processes that are gone, add this caller at the end when `join` and not there yet, write back if changed; the entries.
-        `refuse(entries)` is asked under the lock, before this caller joins: a text to refuse with (Refused, nothing written) or None."""
+        `second_job_check(entries)` is asked under the lock, before this caller joins: a text to refuse with (Refused, nothing written) or None."""
         try:
             lock = self._locked()
         except OSError as err:
@@ -459,7 +459,7 @@ class Line:
             holding = self.held()
             kept = [entry for entry in entries if self._mine(entry) or (entry["pid"] not in holding and self._still_there(entry))]
             if join and not any(self._mine(entry) for entry in kept):
-                reason = refuse([entry for entry in kept if not self._mine(entry)]) if refuse is not None else None
+                reason = second_job_check([entry for entry in kept if not self._mine(entry)]) if second_job_check is not None else None
                 if reason:
                     raise Refused(reason)
                 kept.append(dict(self.meta, pid=self.pid, start=self.start, name=_plain(self.name, 40), short=self.short))
@@ -489,9 +489,9 @@ class Line:
         self.verified.pop(key, None)
         return False
 
-    def place(self, refuse=None):
-        """This caller's place in the line (1 is the head), joining at the end the first time. Raises QueueUnusable, and Refused when `refuse` says so."""
-        entries = self._update(True, refuse)
+    def place(self, second_job_check=None):
+        """This caller's place in the line (1 is the head), joining at the end the first time. Raises QueueUnusable, and Refused when `second_job_check` says so."""
+        entries = self._update(True, second_job_check)
         self.joined = True
         return next(index for index, entry in enumerate(entries, 1) if self._mine(entry))
 
@@ -592,7 +592,7 @@ def _since_text(since):
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since)) if isinstance(since, (int, float)) and not isinstance(since, bool) else "unknown time"
 
 
-def refusal(state_dir, worktree, entries, slots=DEFAULT_SLOTS):
+def second_job_notice(state_dir, worktree, entries, slots=DEFAULT_SLOTS):
     """The sentence that refuses a full-suite job in `worktree`, naming the first one already running (a held slot) or else queued (`entries`, in arrival order);
     None when there is none. Only live ones are read: a held slot is a lock that is held, an entry is dropped when its process is gone."""
     def one(info):
@@ -1081,7 +1081,7 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
             place = None
             if queue is not None:
                 try:
-                    place = queue.place((lambda entries: refusal(state_dir, where, entries, slots))) if where else queue.place()
+                    place = queue.place((lambda entries: second_job_notice(state_dir, where, entries, slots))) if where else queue.place()
                 except Refused as err:   # a first full-suite job of this worktree is queued or running: this one is not run
                     out.write("%s\n" % err)
                     out.flush()
