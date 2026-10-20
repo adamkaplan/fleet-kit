@@ -422,12 +422,18 @@
         "resolve_command",
         "parse_review_block",
         "code_snapshot",
-        "code_replaced"
+        "code_replaced",
+        "direct_command",
+        "private_parser",
+        "add_impact_parsers"
       ],
       "rating_roots_why": {
+        "direct_command": "recognises, from the raw command line before any registrar runs, the two commands (review record, impact clear) that run from the private parser",
+        "private_parser": "builds the parser of those two commands from only their own registrars, so no other registrar is called in that process",
+        "add_impact_parsers": "registers the flags of impact clear (and its sibling impact commands), one of the two registrars the private parser is built from",
         "code_snapshot": "takes the snapshot of every function and class main runs by, before the registrars run and after",
         "code_replaced": "compares the two snapshots: a registrar that replaced any function or class stops the command, for every action",
-        "main": "captures the raw command line before any registrar runs, sets raw_argv after the parse and runs the handler-swap check",
+        "main": "captures the raw command line before any registrar runs, sends review record and impact clear to the private parser, sets raw_argv after the parse and runs the backstop check for the other routes",
         "build_parser": "the wiring: the registrar loop that makes add_review_parsers exist and the set of commands dispatch may run (the other commands are registered outside it, in add_core_parsers, so a flag of another command is not on the clear's path)",
         "command_registrars": "decides which registrars run and in what order",
         "add_review_parsers": "registers the flags of review record, the rating's own flag set",
