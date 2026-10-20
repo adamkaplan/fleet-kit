@@ -1478,6 +1478,11 @@ def note(kind):
         f.write(json.dumps({"kind": kind, "t": time.time(), "argv": sys.argv[1:], "cwd": os.getcwd(), "env": sorted(os.environ), "pid": os.getpid(),
                             "pgid": os.getpgid(0), "home": os.environ.get("HOME")}) + "\\n")
 note("start")
+if cfg.get("grandchild"):
+    import subprocess
+    sub = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])   # keeps the check's stdout open
+    with open(str(root / "grandchild.pid"), "w") as f:
+        f.write(str(sub.pid))
 time.sleep(cfg.get("sleep", 0))
 if cfg.get("fixes"):
     (root / "fixed").write_text("x")
@@ -1661,7 +1666,12 @@ class TestVaultCheckRelay(VaultBase):
         keys = set(start["env"])
         for name in poison:
             self.assertNotIn(name, keys, name)
-        self.assertEqual({k for k in keys if not k.startswith("LC_")} - {"__CF_USER_TEXT_ENCODING", "SHLVL", "PWD", "_"}, {"PATH", "HOME", "TMPDIR", "AZURE_CONFIG_DIR"})   # SHLVL, PWD, _: the recording sh wrapper's own
+        ours = {"PATH", "HOME", "TMPDIR", "AZURE_CONFIG_DIR"}
+        # what a BARE python3 on the fixed PATH adds to such an environment by itself (the macOS /usr/bin/python3 shim adds SDKROOT and friends), plus the recording sh wrapper's own
+        bare = subprocess.run([shutil.which("python3", path=self.lib.PREFLIGHT_PATH), "-c", "import os,json;print(json.dumps(sorted(os.environ)))"], capture_output=True, text=True,
+                              env={"PATH": self.lib.PREFLIGHT_PATH, "HOME": str(self.home), "TMPDIR": str(self.home), "AZURE_CONFIG_DIR": str(self.home)}).stdout
+        shim = set(json.loads(bare)) - ours | {"SHLVL", "PWD", "_", "__CF_USER_TEXT_ENCODING"}
+        self.assertEqual({k for k in keys if not k.startswith("LC_")} - shim, ours)   # nothing of ours beyond the four, and nothing of the caller's
         import pwd
         self.assertEqual(start["home"], pwd.getpwuid(os.getuid()).pw_dir)   # the password database's home: the poisoned HOME variable is ignored
         self.assertNotEqual(start["home"], os.environ["HOME"])
@@ -1686,28 +1696,73 @@ class TestVaultCheckRelay(VaultBase):
 class TestVaultCheckPath(VaultBase):
     """S6b: a missing key or a bad checkout refuses naming the key, runs nothing, and never prints the path."""
 
+    def cases(self):
+        """ONE table of the bad checkouts: label -> (a function that spoils a fresh checkout, optionally the checkout to point the key at)."""
+        mod = self.checkout / "scripts" / "v2" / "cw_vault_firewall.py"
+        v2, scripts = mod.parent, self.checkout / "scripts"
+
+        def add_file(where, name, mode):
+            def spoil():
+                (where / name).write_text("x = 1\n")
+                (where / name).chmod(mode)
+            return spoil
+
+        def link(where, name):
+            return lambda: os.symlink(str(self.checkout / "fake.json"), str(where / name))
+
+        def parent(mode_or_link):
+            def spoil():
+                nest = self.home / "par"
+                nest.mkdir()
+                shutil.move(str(self.checkout), str(nest / "checkout"))
+                if mode_or_link == "link":
+                    os.rename(str(nest), str(self.home / "par-real"))
+                    os.symlink(str(self.home / "par-real"), str(nest))
+                else:
+                    nest.chmod(mode_or_link)
+                os.environ["CW_VAULT_CHECK_DIR"] = str(nest / "checkout")
+            return spoil
+        cases = {
+            "no key": lambda: os.environ.pop("CW_VAULT_CHECK_DIR"),
+            "missing directory": lambda: os.environ.update(CW_VAULT_CHECK_DIR=str(self.home / "nope")),
+            "relative path": lambda: os.environ.update(CW_VAULT_CHECK_DIR="checkout"),
+            "dot-dot path": lambda: os.environ.update(CW_VAULT_CHECK_DIR=str(self.checkout) + "/../checkout"),
+            "a file, not a directory": lambda: os.environ.update(CW_VAULT_CHECK_DIR=str(self.checkout / "fake.json")),
+            "checkout group-writable": lambda: self.checkout.chmod(0o775),
+            "checkout world-writable": lambda: self.checkout.chmod(0o757),
+            "checkout is a symlink": lambda: (os.symlink(str(self.checkout), str(self.home / "link")), os.environ.update(CW_VAULT_CHECK_DIR=str(self.home / "link"))),
+            "module missing": lambda: os.unlink(str(mod)),
+            "module a directory": lambda: (os.unlink(str(mod)), os.mkdir(str(mod))),
+            "module symlink": lambda: (os.unlink(str(mod)), os.symlink(str(self.checkout / "fake.json"), str(mod))),
+            "module group-writable": lambda: mod.chmod(0o664),
+            "module world-writable": lambda: mod.chmod(0o646),
+            "another file group-writable (a module it imports)": add_file(v2, "helper.py", 0o664),
+            "another file world-writable": add_file(v2, "helper.py", 0o666),
+            "an __init__.py world-writable": add_file(scripts, "__init__.py", 0o666),
+            "an __init__.py at the root group-writable": add_file(self.checkout, "__init__.py", 0o664),
+            "a directory group-writable": lambda: (v2 / "pkg").mkdir() or (v2 / "pkg").chmod(0o775),
+            "a directory deep inside world-writable": lambda: ((v2 / "a" / "b").mkdir(parents=True), (v2 / "a" / "b").chmod(0o777)),
+            "a symlink to a file": link(v2, "linked.py"),
+            "a symlink in a deep directory": lambda: ((v2 / "a").mkdir(), link(v2 / "a", "x.py")()),
+            "scripts is a symlink": lambda: (shutil.move(str(scripts), str(scripts) + ".real"), os.symlink(str(scripts) + ".real", str(scripts))),
+            "scripts/v2 is a symlink": lambda: (shutil.move(str(v2), str(v2) + ".real"), os.symlink(str(v2) + ".real", str(v2))),
+            "a parent group-writable": parent(0o775),
+            "a parent world-writable": parent(0o777),
+            "a symlink in the parents": parent("link"),
+        }
+        return cases
+
     def test_s6b_each_bad_path_refuses_naming_the_key_and_runs_nothing(self):
-        cases = {}
-        cases["no key"] = lambda: os.environ.pop("CW_VAULT_CHECK_DIR")
-        cases["missing directory"] = lambda: os.environ.update(CW_VAULT_CHECK_DIR=str(self.home / "nope"))
-        cases["relative path"] = lambda: os.environ.update(CW_VAULT_CHECK_DIR="checkout")
-        cases["dot-dot path"] = lambda: os.environ.update(CW_VAULT_CHECK_DIR=str(self.checkout) + "/../checkout")
-        cases["a file, not a directory"] = lambda: os.environ.update(CW_VAULT_CHECK_DIR=str(self.checkout / "fake.json"))
-        for name, rel, _kind in self.lib.VAULT_CHECK_PATH_ROWS:
-            target = self.checkout / rel if rel else self.checkout
-            cases["group-writable " + name] = lambda t=target: t.chmod(0o775)
-            cases["world-writable " + name] = lambda t=target: t.chmod(0o757)
-            cases["missing " + name] = lambda t=target: (os.unlink(str(t)) if t.is_file() else shutil.rmtree(str(t)))
-            if rel:
-                cases["symlink " + name] = lambda t=target: (shutil.move(str(t), str(t) + ".real"), os.symlink(str(t) + ".real", str(t)))
-        cases["checkout is a symlink"] = lambda: (os.symlink(str(self.checkout), str(self.home / "link")), os.environ.update(CW_VAULT_CHECK_DIR=str(self.home / "link")))
-        cases["module is a directory"] = lambda: (os.unlink(str(self.checkout / self.lib.VAULT_CHECK_FILE)), os.mkdir(str(self.checkout / self.lib.VAULT_CHECK_FILE)))
-        for label, spoil in cases.items():
+        for label, spoil in self.cases().items():
             with self.subTest(label):
+                for leftover in ("link", "par", "par-real"):
+                    path = self.home / leftover
+                    if path.is_symlink():
+                        path.unlink()
+                    elif path.exists():
+                        os.chmod(str(path), 0o755)
+                        shutil.rmtree(str(path), ignore_errors=True)
                 shutil.rmtree(str(self.checkout), ignore_errors=True)
-                for leftover in (self.home / "link",):
-                    if leftover.is_symlink():
-                        leftover.unlink()
                 self.make_checkout(code=10, fixes=True)
                 os.environ["CW_VAULT_CHECK_DIR"] = str(self.checkout)
                 spoil()
@@ -1717,17 +1772,45 @@ class TestVaultCheckPath(VaultBase):
                 code, out, err = self.launch()
                 self.assertEqual(code, 2, (label, err))
                 self.assertIn("CW_VAULT_CHECK_DIR", err)
-                self.assertEqual(len(self.check_runs()), 0, label)
+                self.assertEqual(len(self.check_runs()) + len(list(self.home.glob("par*/checkout/runs.jsonl"))), 0, label)
                 self.assertEqual(self.audit_lines(), [])
                 self.assertNotIn(str(self.home), err)   # never the path
                 self.assertEqual(self.stub_calls(), [])
 
-    def test_the_path_rows_are_the_four_the_plan_names(self):
-        self.assertEqual([rel for rel, _ in [(r, n) for n, r, _ in self.lib.VAULT_CHECK_PATH_ROWS]], ["", "scripts", "scripts/v2", self.lib.VAULT_CHECK_FILE])
+    def test_a_good_checkout_with_a_git_directory_and_pycache_is_accepted(self):
+        (self.checkout / ".git").mkdir()
+        os.symlink("/nonexistent", str(self.checkout / ".git" / "link"))   # the version-control directory is not loaded by python and is not walked
+        (self.checkout / "scripts" / "v2" / "__pycache__").mkdir()
+        self.assertIsNone(self.lib.vault_check_dir_problem(str(self.checkout)))
 
-    def test_a_not_owned_directory_is_refused_by_the_owner_row(self):
-        with mock.patch.object(os, "getuid", lambda: os.stat(str(self.checkout)).st_uid + 1):
-            self.assertIn("not owned by the user", self.lib.vault_check_dir_problem(str(self.checkout)))
+    def test_each_entry_branch_has_its_reason(self):
+        import types
+        user = os.getuid()
+        mk = lambda mode, uid=user: types.SimpleNamespace(st_mode=mode, st_uid=uid)
+        for found, reason in ((mk(stat.S_IFLNK | 0o777), "symlink"), (mk(stat.S_IFREG | 0o644, user + 1), "not owned"), (mk(stat.S_IFREG | 0o664), "writable"),
+                              (mk(stat.S_IFREG | 0o646), "writable")):
+            self.assertIn(reason, self.lib._entry_problem(found, "an entry"))
+        self.assertIsNone(self.lib._entry_problem(mk(stat.S_IFREG | 0o644), "an entry"))
+
+    def test_a_sticky_parent_is_accepted_and_one_owned_by_another_user_is_not(self):
+        sticky = self.home / "sticky"
+        sticky.mkdir()
+        sticky.chmod(0o1777)
+        (sticky / "x").mkdir()
+        self.assertIsNone(self.lib.parents_problem(str(sticky / "x" / "y")))
+        other = os.getuid() + 7
+        with mock.patch.object(os, "getuid", lambda: other):
+            self.assertIn("another user", self.lib.parents_problem(str(sticky / "x" / "y")))
+
+    def test_the_lock_directorys_parents_are_judged_by_the_same_walk(self):
+        self.make_checkout(code=10, fixes=True)
+        (self.home / "state").mkdir(exist_ok=True)
+        os.chmod(str(self.home / "state"), 0o777)
+        code, out, err = self.launch()
+        os.chmod(str(self.home / "state"), 0o755)
+        self.assertEqual(code, 2, err)
+        self.assertIn("vault check lock", err)
+        self.assertEqual(len(self.check_runs()), 0)
 
     def test_an_unset_key_does_not_refuse_a_launch_the_vault_already_answers(self):
         (self.stub_dir / "az_mode").write_text("ok")
@@ -1757,6 +1840,47 @@ class TestVaultCheckProcess(VaultBase):
         self.assertTrue(gone, "the check is still running")
         (line,) = self.audit_lines()
         self.assertIn('"outcome": "timed-out"', line)
+
+    def pid_gone(self, pid, limit=10):
+        end = time.monotonic() + limit
+        while time.monotonic() < end:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_a_grandchild_that_outlives_the_check_is_killed_and_does_not_hold_the_result(self):
+        self.make_checkout(code=10, fixes=True, grandchild=True)
+        started = time.monotonic()
+        result = self.lib.run_vault_check(dict(os.environ))
+        self.assertEqual((result.code, result.outcome), (10, "added"))
+        self.assertLess(time.monotonic() - started, 30, "the result waited for the grandchild's pipe")
+        self.assertTrue(self.pid_gone(int((self.checkout / "grandchild.pid").read_text())), "the grandchild survived")
+
+    def test_a_grandchild_is_killed_with_a_check_that_timed_out(self):
+        self.make_checkout(code=10, fixes=True, grandchild=True, sleep=30)
+        with mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 1), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0):
+            result = self.lib.run_vault_check(dict(os.environ))
+        self.assertEqual((result.code, result.outcome), (None, "timed-out"))
+        self.assertTrue(self.pid_gone(int((self.checkout / "grandchild.pid").read_text())), "the grandchild survived")
+
+    def test_a_holder_killed_with_no_chance_to_react_frees_the_lock(self):
+        lock = str(self.home / "holder.lock")
+        holder = subprocess.Popen([sys.executable, "-c", "import fcntl,os,sys,time\nfd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT,0o600)\nfcntl.flock(fd,fcntl.LOCK_EX)\nprint('held',flush=True)\ntime.sleep(60)", lock],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        recovery = self.cw.VaultRecovery(lock, None, sleep=lambda s: time.sleep(0.02))
+        with mock.patch.object(self.cw, "VAULT_LOCK_GRACE", 0), mock.patch.object(self.lib, "VAULT_CHECK_SECONDS", 0), mock.patch.object(self.lib, "VAULT_CHECK_GRACE", 0):
+            with self.assertRaises(self.cw.Refusal):   # held: refused after its bounded wait
+                recovery(lambda: None, dict(os.environ))
+        holder.kill()   # SIGKILL: the kernel frees the lock with the process
+        holder.wait()
+        fd, waited = recovery._lock()
+        os.close(fd)
+        self.assertFalse(waited)
 
     def recover(self, results, index):
         env = dict(os.environ)

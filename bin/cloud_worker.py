@@ -635,6 +635,9 @@ class VaultRecovery:
         self.lock_path, self.audit, self.sleep, self.clock = str(lock_path), audit, sleep, clock
 
     def _lock(self):
+        problem = _lib().parents_problem(os.path.abspath(self.lock_path))   # the same walk as the checkout's: the lock file's parents
+        if problem:
+            raise Refusal("the vault check lock %s; refused, nothing was called" % problem)
         try:
             fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
             found = os.fstat(fd)

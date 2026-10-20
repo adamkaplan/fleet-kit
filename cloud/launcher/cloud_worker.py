@@ -317,35 +317,94 @@ class CheckResult:
         return self.code if self.code in VAULT_CHECK_CODES else VAULT_CHECK_FALLBACK
 
 
-# One row per rule of the checkout: (name, relative path, kind). Each row is judged with lstat (a link is never followed) and must be owned by the
-# user and not group- or world-writable, because this program runs it as the user.
-VAULT_CHECK_PATH_ROWS = (
-    ("the checkout", "", "dir"),
-    ("scripts", "scripts", "dir"),
-    ("scripts/v2", "scripts/v2", "dir"),
-    ("the module", VAULT_CHECK_FILE, "file"),
-)
+VAULT_CHECK_MAX_ENTRIES = 200000       # a checkout with more entries than this is refused (a bounded walk)
+VAULT_CHECK_SKIP = (".git",)           # the top-level version-control directory is never loaded by the interpreter
+
+
+def _entry_problem(found, what):
+    """One lstat result judged: not a link, owned by the user, not group- or world-writable. Returns a reason or None."""
+    if stat.S_ISLNK(found.st_mode):
+        return "has %s that is a symlink" % what
+    if found.st_uid != os.getuid():
+        return "has %s that is not owned by the user" % what
+    if found.st_mode & 0o022:
+        return "has %s that is group- or world-writable" % what
+    return None
+
+
+def parents_problem(path):
+    """THE walk up from a trusted path (an absolute one): every parent from / down is judged with lstat, never followed: no symlink, owned by root or
+    the user, and not group- or world-writable unless it carries the sticky bit. A reason (never the path) or None. Every trusted path of the vault
+    check (the checkout and the lock's directory) goes through this one function."""
+    parts = [x for x in path.split("/") if x]
+    here = "/"
+    for part in [""] + parts[:-1]:
+        here = os.path.join(here, part) if part else "/"
+        try:
+            found = os.lstat(here)
+        except OSError:
+            return "has a parent that cannot be read"
+        if stat.S_ISLNK(found.st_mode):
+            return "has a parent that is a symlink"
+        if not stat.S_ISDIR(found.st_mode):
+            return "has a parent that is not a directory"
+        if found.st_uid not in (0, os.getuid()):
+            return "has a parent that is owned by another user"
+        if found.st_mode & 0o022 and not found.st_mode & stat.S_ISVTX:
+            return "has a parent that is group- or world-writable"
+    return None
 
 
 def vault_check_dir_problem(checkout):
-    """None when `checkout` is a usable checkout, else ONE short reason (never the path's content): an absolute path to an existing directory that
-    is not a symlink, owned by the user, not group- or world-writable, holding scripts/v2/cw_vault_firewall.py as a regular file."""
+    """None when `checkout` is a usable checkout, else ONE short reason (never the path's content). `python3 -m` loads anything under the checkout,
+    so EVERY entry is judged (lstat, never followed): an absolute path to an existing directory that is not a symlink, owned by the user, with every
+    entry (directories, files, links, every __init__.py) owned by the user, not group- or world-writable and not a symlink; every parent judged by
+    parents_problem; and scripts/v2/cw_vault_firewall.py a regular file. The top-level .git directory is not walked."""
     if not isinstance(checkout, str) or not checkout.strip() or not os.path.isabs(checkout) or ".." in checkout.split("/"):
         return "is not an absolute path"
-    for name, rel, kind in VAULT_CHECK_PATH_ROWS:
-        path = os.path.join(checkout, rel) if rel else checkout
+    checkout = checkout.rstrip("/") or "/"
+    problem = parents_problem(checkout)
+    if problem:
+        return problem
+    try:
+        top = os.lstat(checkout)
+    except OSError:
+        return "has no checkout directory"
+    problem = _entry_problem(top, "the checkout")
+    if problem:
+        return problem
+    if not stat.S_ISDIR(top.st_mode):
+        return "is not a directory"
+    module = os.path.join(checkout, VAULT_CHECK_FILE)
+    try:
+        found = os.lstat(module)
+    except OSError:
+        return "has no module"
+    if not stat.S_ISREG(found.st_mode):
+        return "has a module that is not a regular file"
+    count, stack = 0, [checkout]
+    while stack:
+        here = stack.pop()
         try:
-            found = os.lstat(path)
+            names = os.listdir(here)
         except OSError:
-            return "has no %s" % name
-        if stat.S_ISLNK(found.st_mode):
-            return "has %s as a symlink" % name
-        if not (stat.S_ISDIR(found.st_mode) if kind == "dir" else stat.S_ISREG(found.st_mode)):
-            return "has %s that is not a %s" % (name, "directory" if kind == "dir" else "regular file")
-        if found.st_uid != os.getuid():
-            return "has %s that is not owned by the user" % name
-        if found.st_mode & 0o022:
-            return "has %s that is group- or world-writable" % name
+            return "has a directory that cannot be read"
+        for name in names:
+            if here == checkout and name in VAULT_CHECK_SKIP:
+                continue
+            count += 1
+            if count > VAULT_CHECK_MAX_ENTRIES:
+                return "has more than %d entries" % VAULT_CHECK_MAX_ENTRIES
+            full = os.path.join(here, name)
+            try:
+                found = os.lstat(full)
+            except OSError:
+                return "has an entry that cannot be read"
+            problem = _entry_problem(found, "an entry")
+            if problem:
+                return problem
+            if stat.S_ISDIR(found.st_mode):
+                stack.append(full)
     return None
 
 
@@ -364,9 +423,13 @@ def _kill_group(child):
             pass
         try:
             child.wait(5)
-            return
+            break
         except subprocess.TimeoutExpired:
             continue
+    try:   # the whole group, also what the child left behind
+        os.killpg(child.pid, signal.SIGKILL)
+    except OSError:
+        pass
 
 
 def vault_check_ready(env):
@@ -393,17 +456,24 @@ def run_vault_check(env):
     out = ""
     try:
         with tempfile.TemporaryDirectory(prefix="cw-vcheck-") as home:
-            child = subprocess.Popen(argv, cwd=checkout, env=_scrubbed_env(env, home, VAULT_CHECK_ENV_NAMES, openssl=False, real_home=True), stdin=subprocess.DEVNULL,
-                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace", start_new_session=True)
-            try:
-                out, _ = child.communicate(timeout=VAULT_CHECK_SECONDS + VAULT_CHECK_GRACE)
-            except subprocess.TimeoutExpired:
-                _kill_group(child)
-                child.communicate()
-                return CheckResult(None, "timed-out")
-            except BaseException:
-                _kill_group(child)
-                raise
+            out_path = os.path.join(home, "out")   # a file, not a pipe: a grandchild that keeps it open cannot hold us up
+            with open(out_path, "wb") as sink:
+                child = subprocess.Popen(argv, cwd=checkout, env=_scrubbed_env(env, home, VAULT_CHECK_ENV_NAMES, openssl=False, real_home=True),
+                                         stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.DEVNULL, start_new_session=True)
+                try:
+                    child.wait(timeout=VAULT_CHECK_SECONDS + VAULT_CHECK_GRACE)
+                except subprocess.TimeoutExpired:
+                    _kill_group(child)
+                    return CheckResult(None, "timed-out")
+                except BaseException:
+                    _kill_group(child)
+                    raise
+                try:   # whatever the check left running in its group ends with it
+                    os.killpg(child.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            with open(out_path, "rb") as source:
+                out = source.read(100001).decode("utf-8", "replace")
     except OSError:
         return CheckResult(None, "not-run")
     code = child.returncode
