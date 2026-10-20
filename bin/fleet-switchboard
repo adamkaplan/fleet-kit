@@ -6188,6 +6188,16 @@ def reclaim_agent_tmp(engine, name, headless=False):
         return ["%s: kept (%s)" % (path, err.strerror or err)]
 
 
+def record_launch_charter(engine, name, session_id, fleet, pane=None):
+    """#969: a launch is the first sight of an orchestrator: its registry row takes the launch's `--charter` at once (the observation pass would only fill it later, after an adoption or a lane lookup may already
+    have looked). Only an orchestrator launched with a charter; a failure is left to the pass (never raises)."""
+    try:
+        if engine.state_dir is not None and (fleet or {}).get("role") == "orchestrator" and isinstance(fleet.get("charter"), int) and not isinstance(fleet.get("charter"), bool):
+            load_module("registry").upsert(engine.state_dir, name, {"session": session_id, "pane": pane, "role": "orchestrator", "charter": fleet["charter"], "repo": fleet.get("repo")}, now=engine.now())
+    except Exception:
+        pass
+
+
 def launch_agent(engine, name, agent, directory, workspace, role=None, reports_to=None, issue=None,
                  brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None, repo=None, launched_by=None):
     """Create a fleet agent: a v2 session, its own herdr tab, the brief.
@@ -6221,6 +6231,7 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
                                                       "fleet": fleet}) as result:
         session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet})["id"]
         result["session"] = session_id
+        record_launch_charter(engine, name, session_id, fleet)
     argv = [engine.config["opencode"], "-s", session_id]
     pane = None
     try:
@@ -6296,6 +6307,7 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
                 raise HeadlessRefused("the OpenCode service could not create the session (%s)" % _one_line(str(err), 120)) from err
             brief_started = False
             try:
+                record_launch_charter(engine, name, session_id, fleet)
                 ap.save_record(engine.state_dir, name, session_id, engine.v2.service_url(), now=engine.now())
                 info = engine.v2.session_get(session_id) or {}
                 if ((_fleet_meta(info) or {}).get("name")) != name:

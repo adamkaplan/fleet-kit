@@ -14080,6 +14080,7 @@ class TestOneCharter(Base):
         ("bin/registry.py", "change"): "the registry's own writer: it sets the row", ("bin/fleet-switchboard", "registry_charter"): "the pass's rule over the registry row",
         ("bin/fleet-switchboard", "pane_health_pass"): "writes the registry row through registry_charter", ("bin/fleet-switchboard", "charters_report"): "display of both records, read-only",
         ("bin/fleet-switchboard", "cmd_agents_charters"): "display", ("bin/fleet-switchboard", "cmd_charter"): "the audited writer",
+        ("bin/fleet-switchboard", "record_launch_charter"): "the launch writes the registry row (first sight)",
         ("bin/impact_hold.py", "clear_lane"): "carries the lookup's `charter` into the notice line", ("bin/impact_hold.py", "_notify_clear_body"): "words the notice line",
         ("bin/fleet-switchboard", "worker_charter"): "a worker's own charter (its launch context)", ("bin/fleet-switchboard", "resume_agent"): "one agent's own repo lookup",
         ("bin/fleet-switchboard", "charter_pane_update"): "one agent's own charter for its pane", ("bin/fleet-switchboard", "_fleet_repo"): "one agent's own repo",
@@ -68647,6 +68648,7 @@ class TestAdoption(LanesCase):
     def daemon_pass(self):
         engine = self.world.new_engine()
         engine.discover(self.world.clock.now())
+        sb.pane_health_pass(engine, self.world.clock.now())   # the daemon's own order (#969): the registry takes what the pass saw BEFORE the adoption pass reads it
         sb.adoption_pass(engine, self.world.clock.now())
 
     def rows(self, event="boss.adopted"):
@@ -68773,9 +68775,12 @@ class TestAdoption(LanesCase):
             for label, shape in self.DAMAGED.items():
                 with self.subTest(file=file, shape=label):
                     self.worker("w-%d" % len(self.world.panes), "gone", charter=1)
+                    (Path(self.world.state) / "registry.json").unlink(missing_ok=True)   # #969: the fake service's first-seen rows made a registry; this case is about the OLD records that have no registry yet, which fold from the damaged file
                     self.damage(file, shape)
                     before = {f: ((Path(self.world.state) / f).read_bytes() if (Path(self.world.state) / f).is_file() else None) for f in files}
-                    self.daemon_pass()
+                    engine = self.world.new_engine()   # the adoption pass alone: the observation pass would fold the old records and write the derived file this case is about
+                    engine.discover(self.world.clock.now())
+                    sb.adoption_pass(engine, self.world.clock.now())
                     self.assertEqual(self.rows(), [], "no boss written")
                     after = {f: ((Path(self.world.state) / f).read_bytes() if (Path(self.world.state) / f).is_file() else None) for f in files}
                     self.assertEqual(before, after)
@@ -69283,6 +69288,7 @@ class TestMoveAnAsk(LanesCase):
             fleet = self.world.v2.sessions[self.world.sessions[name]]["metadata"]["fleet"]
             del fleet["charter"]
             fleet["repo"] = FAKE_REPO
+            sb.load_module("registry").set_charter(self.world.state, name, None, "test")   # #969: nor does the registry row: the charter's own block names the orchestrator
         self.gh.bodies = {1: "```yaml\norchestrator: orch-a\nstatus: active\n```\n", 10: "```yaml\norchestrator: orch-b\nstatus: active\n```\n"}
 
     def notice_lines(self):
