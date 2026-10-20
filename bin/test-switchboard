@@ -62819,6 +62819,30 @@ class TestReviewerSubagents(LedgerBase):
         self.rate_at_head("Low", "reviewer", head="d" * 40)   # another head's rating is not this head's
         self.assertIn("not counted", self.rating_lines()[0])
 
+    def rate_unscored(self, role, severity="Huge", probability="Remote"):
+        entry = {"kind": "review_record", "pr": self.PR, "head": LEDGER_HEAD, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": role,
+                 "impact_severity": severity, "impact_probability": probability, "impact_action": "none"}
+        sb.plan_ledger.append_entry(self.world.state, entry, self.world.clock.now())
+
+    def test_s3_a_counting_role_with_no_usable_score_is_not_told_as_a_role_that_does_not_count(self):
+        self.rate_unscored("reviewer")   # an unknown cell: the role counts, the score does not
+        line = self.rating_lines()[0]
+        self.assertIn("recorded role counts", line)
+        self.assertIn("no usable score", line)
+        self.assertNotIn("not counted", line)
+
+    def test_s3_the_four_shapes_read_differently_and_a_failed_read_is_unknown(self):
+        said = {}
+        said["none"] = self.rating_lines()[0]
+        self.rate_unscored("coder", "Marginal", "Remote")   # a valid cell by a role that does not count
+        said["not-role"] = self.rating_lines()[0]
+        self.assertEqual(len(set(said.values())), 2)
+        self.assertIn("not counted", said["not-role"])
+        with mock.patch.object(sb.plan_ledger, "impact_rating_fact", side_effect=RuntimeError("boom")):
+            self.assertIn("unknown", self.rating_lines()[0])   # a failure inside the reading is said as unknown, never raised out of `gates`
+        with mock.patch.object(sb.impact_floor, "_matrix_cached", side_effect=RuntimeError("no matrix")):
+            self.assertIn("unknown", self.rating_lines()[0])   # an exception never escapes `gates`
+
     def test_s4_s5_the_line_changes_no_gate_and_is_the_engines_own_reading(self):
         def gates():
             code, out, err = self.run_as("coder", "gates", self.PR, "--json")
@@ -62832,7 +62856,7 @@ class TestReviewerSubagents(LedgerBase):
         entries, _ = sb.impact_rating_entries(self.world.state, self.PR, LEDGER_HEAD)
         cells = sb.impact_floor.load_matrix()["cells"]
         top = entries[-1]
-        self.assertEqual(after[3], {"recorded": True, "counts": True, "level": cells[top["impact_severity"]][top["impact_probability"]]["level"]})
+        self.assertEqual(after[3], {"recorded": True, "role_counts": True, "scored": True, "level": cells[top["impact_severity"]][top["impact_probability"]]["level"]})
 
     def test_the_shadow_line_never_changes_whether_the_pr_is_ready(self):
         def ready():

@@ -21633,15 +21633,16 @@ def gate_impact_rating(state_dir, pr, head):
     entries, problem = impact_rating_entries(state_dir, pr, head)
     if problem:
         return {"problem": problem}
-    block = load_module("delegated_clear").score_block()
-    try:
+    try:   # never an exception out of `gates`: what cannot be read is said as unknown
+        module = load_module("delegated_clear")
+        block = module.score_block()
         cells = impact_floor._matrix_cached()["cells"]
-    except Exception:
-        cells = None
-    level = None
-    if entries and block and cells:
-        level = load_module("delegated_clear").judge(block, cells, entries, {"pr": pr, "head": head, "top_tier_hits": {}}, block["delegable_levels"][0]).get("level")
-    return plan_ledger.impact_rating_fact(entries, level)
+        if not block or not cells:
+            return {"problem": "the score rule or the matrix could not be read"}
+        level = module.judge(block, cells, entries, {"pr": pr, "head": head, "top_tier_hits": {}}, block["delegable_levels"][0]).get("level") if entries else None
+        return plan_ledger.impact_rating_fact(entries, level, block["rating_roles"])
+    except Exception as err:
+        return {"problem": _one_line("%s: %s" % (type(err).__name__, err), 100)}
 
 
 def _file_text_at(engine, repo, path, ref):
