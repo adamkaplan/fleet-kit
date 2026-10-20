@@ -8869,7 +8869,8 @@ class TestHygiene(unittest.TestCase):
         self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", top)
         self.assertNotIn("cancel-in-progress: true", workflow, "an unconditional cancel would cancel a push to main")
         self.assertNotIn("github.ref }}", top, "a push to main must not share a group: GitHub drops a PENDING run of a shared group even without cancel-in-progress")
-        self.assertEqual(workflow.count("macos-latest"), 1, "one macOS job per run: a single matrix entry")
+        entries = [e.strip() for line in jobs.splitlines() for m in [re.match(r"\s+os:\s*\[(.*?)\]\s*(?:#.*)?$", line)] if m for e in m.group(1).split(",")]
+        self.assertEqual(entries.count("macos-latest"), 2, "one macOS job per job of the run (the two jobs `test` and `test-cloud`, ask #868): a single matrix entry in each")
         on = top.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
         self.assertIn("\n  workflow_dispatch:\n", on, "a head can be re-run without a push")
         self.assertNotIn("inputs:", workflow, "a dispatch takes no inputs")
@@ -68463,6 +68464,21 @@ class TestNewestCiRuns(unittest.TestCase):
         rollup = [ci_run("build", "test", "FAILURE", "2026-10-15T15:00:00Z"), ci_run("lint", "test", "SUCCESS", "2026-10-15T16:00:00Z")]
         self.assertEqual(sb.pr_ci_of(rollup), "failing", "a red check is not hidden by the other workflow's green")
         self.assertEqual(len(sb.pr_checks_of(rollup)), 2)
+
+    CLOUD_SPLIT = ("test (ubuntu-latest)", "test (macos-latest)", "test-cloud (ubuntu-latest)", "test-cloud (macos-latest)")
+
+    def test_s4_a_red_or_pending_check_of_the_split_cloud_job_decides_the_verdict_with_no_list_of_names(self):
+        """Ask #868: the launcher and worker suites run as their own job; the verdict reads every check of the head, so each member of the
+        four-name family is checked in turn: red reads failing, pending reads pending, all green reads green."""
+        for odd in self.CLOUD_SPLIT:
+            red = [ci_run("test", n, "FAILURE" if n == odd else "SUCCESS", "2026-10-15T16:00:00Z") for n in self.CLOUD_SPLIT]
+            self.assertEqual(sb.pr_ci_of(red), "failing", odd)
+            self.assertEqual(sb.pr_ci_of(list(reversed(red))), "failing", odd)
+            pending = [ci_run("test", n, "" if n == odd else "SUCCESS", "2026-10-15T16:00:00Z", status="IN_PROGRESS" if n == odd else "COMPLETED")
+                       for n in self.CLOUD_SPLIT]
+            self.assertEqual(sb.pr_ci_of(pending), "pending", odd)
+        green = [ci_run("test", n, "SUCCESS", "2026-10-15T16:00:00Z") for n in self.CLOUD_SPLIT]
+        self.assertEqual(sb.pr_ci_of(green), "green")
 
     def test_an_older_run_that_finishes_after_a_newer_one_started_does_not_hide_the_running_one(self):
         older = ci_run("ci", "test", "SUCCESS", "2026-10-15T10:30:00Z", "2026-10-15T10:00:00Z")   # started 10:00, finished 10:30
