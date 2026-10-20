@@ -1,0 +1,39 @@
+{
+  "applied": [
+    {
+      "apiVersion": "v1",
+      "kind": "Secret",
+      "metadata": {
+        "labels": {
+          "app": "cw-worker",
+          "cw/run-id": "abcdef0123456789"
+        },
+        "name": "coder7-ffda-pw"
+      },
+      "stringData": {
+        "password": "<password>"
+      },
+      "type": "Opaque"
+    }
+  ],
+  "secret_key_names": {
+    "coder7-ffda-run": [
+      "git-key",
+      "model-key"
+    ]
+  },
+  "secret_labels": {
+    "coder7-ffda-pw": {
+      "app": "cw-worker",
+      "cw/run-id": "abcdef0123456789"
+    },
+    "coder7-ffda-run": {
+      "cw/pod": "coder7-ffda",
+      "cw/run-id": "abcdef0123456789"
+    }
+  },
+  "secrets": [
+    "coder7-ffda-pw",
+    "coder7-ffda-run"
+  ]
+}

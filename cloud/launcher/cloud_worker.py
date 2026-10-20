@@ -10,6 +10,7 @@ secret value is read once from an inherited descriptor and goes to kubectl's std
 """
 import argparse
 import base64
+import copy
 import datetime as dt
 import pwd
 import hashlib
@@ -34,7 +35,116 @@ NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")  # the switchboard's agent name
 SHAPES = {"S": {"cpu": "2", "memory": "4Gi", "usd_per_hour": 0.10},
           "M": {"cpu": "4", "memory": "8Gi", "usd_per_hour": 0.20}}  # list-price estimates, not billed figures
 MAX_TOKEN_SECONDS = 3600
+
+# The pod shape of a worker that runs a nested Docker stack (`create --stack`, opt-in; the default pod is unchanged).
+# Shape S (2 CPU, 4 GiB limits) is the smallest existing shape that holds the stack lane's measured peak (1.0-1.35 GiB,
+# 1-2 CPUs) plus the worker and the daemon; the hard limits stay, never unlimited.
+STACK_RUNTIME_CLASS = "sysbox-runc"
+STACK_NODE_SELECTOR = {"sysbox-install": "yes"}   # the POOL label; never gate on sysbox-runtime=running (set before containerd knows the runtime)
+# live-probed with the cluster default only; the smallest set that lets a non-root worker start the daemon on Sysbox is to be
+# determined by the next live run, one variation at a time. Start: sudo needs allowPrivilegeEscalation (no_new_privs would
+# stop `sudo start-dockerd`); every capability stays dropped and none is added; never privileged. The pod-level seccomp profile
+# (RuntimeDefault) was not part of the probe either.
+STACK_SECURITY_CONTEXT = {"allowPrivilegeEscalation": True, "capabilities": {"drop": ["ALL"]}}
+STACK_RACE_WINDOW_SECONDS = 240   # a fresh node's containerd is configured ~30-60 s after the pod is scheduled; this bounds the retries
+STACK_ATTEMPTS = 3
+STACK_RACE_RE = re.compile(r"RuntimeClass handler \S+ does not support user namespaces: the handler \S+ is not known")
+
+
+def _containers(pod):
+    spec = pod.get("spec", {})
+    return [k for key in ("containers", "initContainers", "ephemeralContainers") for k in spec.get(key, [])]
+
+
+def _cap(name):
+    """A capability name as the container runtime reads it: case-insensitive, with or without a leading CAP_."""
+    n = str(name).upper()
+    return n[4:] if n.startswith("CAP_") else n
+
+
+def _caps_add(pod, wanted):
+    return any(_cap(c) in wanted for k in _containers(pod) for c in ((k.get("securityContext") or {}).get("capabilities") or {}).get("add") or [])
+
+
+def _is_stack(pod):
+    return "cw/stack" in (pod.get("metadata", {}).get("annotations") or {}) or "runtimeClassName" in pod.get("spec", {})
+
+
+def _stack_context_differs(pod):
+    """Allow-list: on a stack pod EVERY container's securityContext (init and ephemeral too) must equal STACK_SECURITY_CONTEXT,
+    so any other capability, a Unconfined profile, procMount, a root runAsUser... fails until the constant and its test change together."""
+    return _is_stack(pod) and any((k.get("securityContext") or {}) != STACK_SECURITY_CONTEXT for k in _containers(pod))
+
+
+def _stack_shape_differs(pod):
+    spec = pod.get("spec", {})
+    return _is_stack(pod) and not (
+        spec.get("runtimeClassName") == STACK_RUNTIME_CLASS and spec.get("hostUsers") is False
+        and spec.get("nodeSelector") == STACK_NODE_SELECTOR
+        and (pod.get("metadata", {}).get("annotations") or {}).get("cw/stack") == "true"
+        and spec.get("securityContext") == POD_SECURITY_CONTEXT)   # the WHOLE pod-level context: fsGroup, runAsGroup, supplementalGroups, sysctls, seLinuxOptions...
+
+
+# The allow-list of a stack pod's REST: a key outside these sets fails, so nodeName, tolerations, hostAliases, shareProcessNamespace,
+# dnsPolicy/dnsConfig, priorityClassName, hostname, an init or ephemeral container, a hostPort... are refused until a deliberate edit
+# here (and to the frozen fixture tests/fixtures/stack_pod.json) allows them.
+STACK_METADATA_KEYS = {"name", "labels", "annotations"}
+STACK_SPEC_KEYS = {"restartPolicy", "activeDeadlineSeconds", "serviceAccountName", "automountServiceAccountToken", "securityContext", "containers", "volumes",
+                   "imagePullSecrets", "runtimeClassName", "hostUsers", "nodeSelector"}
+STACK_CONTAINER_KEYS = {"name", "image", "securityContext", "env", "resources", "readinessProbe", "volumeMounts"}
+STACK_VOLUMES = {"tokens": {"name": "tokens", "emptyDir": {"medium": "Memory"}}, "scratch": {"name": "scratch", "emptyDir": {}}}
+STACK_MOUNT_PATHS = {"pw": "/run/cw", "tokens": "/run/cw-tmp", "scratch": "/work"}
+
+
+def _stack_rest_differs(pod):
+    if not _is_stack(pod):
+        return False
+    spec, ks = pod.get("spec", {}), pod.get("spec", {}).get("containers", [])
+    vols = spec.get("volumes", [])
+    pw = [v for v in vols if v.get("name") == "pw"]
+    return (
+        not set(pod.get("metadata", {})) <= STACK_METADATA_KEYS
+        or not set(spec) <= STACK_SPEC_KEYS
+        or spec.get("restartPolicy") != "Never" or not isinstance(spec.get("serviceAccountName"), str) or not spec.get("serviceAccountName")
+        or len(ks) != 1 or [k.get("name") for k in ks] != ["worker"]   # one container, named worker: no sidecar, even one with the stack context
+        or any(not set(k) <= STACK_CONTAINER_KEYS or not isinstance(k.get("image"), str) or not k.get("image") for k in ks)
+        or any(set(e) != {"name", "value"} for k in ks for e in k.get("env", []))   # no valueFrom / secretKeyRef; no envFrom (key allow-list)
+        or any(set((k.get("resources") or {})) != {"limits"} or set(k["resources"]["limits"]) != {"cpu", "memory"} for k in ks)   # limits stay
+        or any(k.get("readinessProbe") != {"tcpSocket": {"port": 4096}} for k in ks)
+        or any(set(m) - {"name", "mountPath", "readOnly"} or STACK_MOUNT_PATHS.get(m.get("name")) != m.get("mountPath")
+               for k in ks for m in k.get("volumeMounts", []))
+        or sorted(v.get("name") for v in vols) != ["pw", "scratch", "tokens"]   # no extra emptyDir, secret or configMap volume
+        or any(v != STACK_VOLUMES[v["name"]] for v in vols if v.get("name") in STACK_VOLUMES)
+        or len(pw) != 1 or len(set(pw[0]) - {"name"}) != 1 or not set(pw[0]) - {"name"} <= {"secret", "projected"})
+
+
+# The forbidden pod fields: ONE table (name -> does this pod have it). render_pod refuses a pod that has any of them (every
+# pod, stack or not); the tests parametrise over this table, so a member added here is tested without another edit.
+FORBIDDEN_POD_FIELDS = {
+    "hostPath": lambda p: any("hostPath" in v for v in p.get("spec", {}).get("volumes", [])),
+    "docker.sock": lambda p: "docker.sock" in json.dumps(p.get("spec", {})).lower(),
+    "privileged": lambda p: any((k.get("securityContext") or {}).get("privileged") for k in _containers(p)),
+    "hostNetwork": lambda p: bool(p.get("spec", {}).get("hostNetwork")),
+    "hostPID": lambda p: bool(p.get("spec", {}).get("hostPID")),
+    "hostIPC": lambda p: bool(p.get("spec", {}).get("hostIPC")),
+    "hostUsers true": lambda p: p.get("spec", {}).get("hostUsers") is True,
+    "capabilities add SYS_ADMIN/ALL": lambda p: _caps_add(p, ("SYS_ADMIN", "ALL")),
+    "stack security context differs from STACK_SECURITY_CONTEXT": _stack_context_differs,
+    "stack pod shape differs": _stack_shape_differs,
+    "stack pod has a field or object outside the stack allow-list": _stack_rest_differs,
+    "service-account token": lambda p: p.get("spec", {}).get("automountServiceAccountToken") is not False
+        or any("serviceAccountToken" in (s or {}) for v in p.get("spec", {}).get("volumes", []) for s in (v.get("projected") or {}).get("sources", [])),
+}
+
+
+def forbidden_pod_fields(pod):
+    return [name for name, has in FORBIDDEN_POD_FIELDS.items() if has(pod)]
 DEFAULT_MAX_HARD = "8h"  # OPEN in the contract: value
+# The cluster-side floor: every pod carries spec.activeDeadlineSeconds = the --max-hard cap + this grace, so the kubelet
+# ends a pod even when no reaper runs. The cap, not the current hard deadline: Kubernetes lets that field be lowered on
+# a running pod but never raised, so a value at the initial hard limit would make `extend` (within the cap) a lie. The
+# grace lets the reaper (which writes the run record and runs the end hook) normally act first.
+POD_DEADLINE_GRACE_SECONDS = 300
 DEFAULT_SPEND_CAP_USD = 25.0  # the prototype's cap; applies when CW_CLOUD_SPEND_CAP_USD is unset or empty
 LABEL = "cw-worker"
 REPORT_PATH = "/home/worker/report"  # the worker's final one-line report, written here inside the pod (the image's workdir)
@@ -57,6 +167,10 @@ class CloudError(Exception):
     def __init__(self, msg, code=EXIT_CLOUD):
         super().__init__(msg)
         self.code = code
+
+
+class _FreshNodeRace(Exception):
+    """The pod's sandbox failed on the handler-not-known message: the node's containerd was not yet configured."""
 
 
 class Interrupted(BaseException):
@@ -664,6 +778,14 @@ class Kube:
     def delete_pod(self, name):
         self.run(["delete", "pod", name, "--ignore-not-found", "--wait=false"])
 
+    def delete_pod_and_wait(self, name):
+        """Delete the pod and return only when it is gone (a recreate under the same name would find it terminating)."""
+        self.run(["delete", "pod", name, "--ignore-not-found", "--wait=true", "--timeout=120s"], timeout=150)
+
+    def pod_events(self, name):
+        out = self.run(["get", "events", "--field-selector", "involvedObject.kind=Pod,involvedObject.name=" + name, "-o", "json"])
+        return json.loads(out)["items"]
+
     def delete_secret(self, name):
         self.run(["delete", "secret", name + "-pw", "--ignore-not-found"])
 
@@ -730,6 +852,9 @@ def ann(pod, key, default=None):
 RUN_SECRET_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 RESERVED_RUN_NAMES = {"server-password"}
 SERVER_UID = 1000  # the image's non-root user
+# The pod-level security context of EVERY worker pod (the builder copies it; a stack pod must EQUAL it, whole).
+POD_SECURITY_CONTEXT = {"runAsNonRoot": True, "runAsUser": SERVER_UID, "runAsGroup": SERVER_UID, "fsGroup": SERVER_UID,
+                        "seccompProfile": {"type": "RuntimeDefault"}}
 MAX_RUN_SECRET_BYTES = 1024 * 1024  # a Kubernetes Secret holds about 1 MiB in all
 MAX_RUN_SECRETS = 8
 
@@ -764,10 +889,16 @@ def read_run_secret_values(fds):
     return values
 
 
+def pod_deadline_floor(max_hard):
+    """The pod's own activeDeadlineSeconds: the cap (a duration text, never empty) plus the grace; always finite."""
+    return parse_duration(max_hard or DEFAULT_MAX_HARD) + POD_DEADLINE_GRACE_SECONDS
+
+
 def render_pod(a, worker, name, now, hard, env, run_names=()):
     image = a.image or env.get("CW_CLOUD_IMAGE")
     if not image:
         raise CloudError("no image: pass --image or set CW_CLOUD_IMAGE", EXIT_USAGE)
+    stack = bool(getattr(a, "stack", False))
     endpoint = env.get("CW_TOKEN_ENDPOINT")
     if not endpoint and not run_names:  # git access then comes from a per-run secret instead
         raise CloudError("no token endpoint: set CW_TOKEN_ENDPOINT", EXIT_USAGE)
@@ -787,12 +918,12 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
         "name": name, "labels": {"app": LABEL, "cw/worker": worker, "azure.workload.identity/use": "true"},
         "annotations": {"cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
                         "cw/idle-seconds": e["CW_IDLE_SECONDS"], "cw/shape": a.shape,
-                        "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard))),
+                        "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard or DEFAULT_MAX_HARD))),
                         **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {})}},
-        "spec": {"restartPolicy": "Never", "serviceAccountName": env.get("CW_CLOUD_SERVICE_ACCOUNT", "cw-worker"),
+        "spec": {"restartPolicy": "Never", "activeDeadlineSeconds": pod_deadline_floor(a.max_hard),
+                 "serviceAccountName": env.get("CW_CLOUD_SERVICE_ACCOUNT", "cw-worker"),
                   "automountServiceAccountToken": False,
-                  "securityContext": {"runAsNonRoot": True, "runAsUser": SERVER_UID, "runAsGroup": SERVER_UID,
-                                      "fsGroup": SERVER_UID, "seccompProfile": {"type": "RuntimeDefault"}},
+                  "securityContext": copy.deepcopy(POD_SECURITY_CONTEXT),
                  "containers": [{"name": "worker", "image": image,
                                  "securityContext": {"allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}}, "env": [{"name": k, "value": v} for k, v in e.items()],
                                  "resources": {"limits": {"cpu": shape["cpu"], "memory": shape["memory"]}},
@@ -806,6 +937,15 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
     pull = getattr(a, "pull_secret", None)
     if pull:
         pod["spec"]["imagePullSecrets"] = [{"name": pull}]
+    if stack:
+        pod["metadata"]["annotations"]["cw/stack"] = "true"
+        pod["spec"]["runtimeClassName"] = STACK_RUNTIME_CLASS
+        pod["spec"]["hostUsers"] = False
+        pod["spec"]["nodeSelector"] = dict(STACK_NODE_SELECTOR)
+        pod["spec"]["containers"][0]["securityContext"] = copy.deepcopy(STACK_SECURITY_CONTEXT)
+    bad = forbidden_pod_fields(pod)
+    if bad:
+        raise CloudError("refusing a pod spec with a forbidden field: %s" % ", ".join(bad), EXIT_USAGE)
     return pod
 
 
@@ -911,7 +1051,10 @@ class Launcher:
                 if run_values:
                     self._make(made, "run", self.kube.create_run_secret, name, name, run_values, *([a.run_id] if getattr(a, "run_id", None) else []))
                 self._make(made, "pod", self.kube.apply, spec)
-                self._wait_ready(name, a.wait)
+                if getattr(a, "stack", False):
+                    self._start_stack_pod(worker, name, spec, made, a.wait)
+                else:
+                    self._wait_ready(name, a.wait)
                 if a.password_fd is not None:
                     with os.fdopen(os.dup(a.password_fd), "w") as f:
                         f.write(password)
@@ -1030,7 +1173,45 @@ class Launcher:
         err.audited = True
         raise err from None
 
-    def _wait_ready(self, name, seconds):
+    def _start_stack_pod(self, worker, name, spec, made, seconds):
+        """Wait for a stack pod; on the fresh-node race (the runtime handler is not yet known to the node's containerd) delete
+        THE POD ONLY and create it again with the same run id and nonce, at most STACK_ATTEMPTS times inside
+        STACK_RACE_WINDOW_SECONDS. The password Secret and the per-run Secret are made once, before the first attempt, and are
+        never touched here: the pod refers to them by name, so a second attempt reads the same objects. Any other failure is not retried."""
+        deadline = self.clock() + dt.timedelta(seconds=STACK_RACE_WINDOW_SECONDS)
+        attempt = 1
+        while True:
+            try:
+                self._wait_ready(name, seconds, lambda pod: self._raise_on_race(name, pod))
+            except _FreshNodeRace as race:
+                last = attempt >= STACK_ATTEMPTS or self.clock() >= deadline
+                self.audit(worker, "pod/" + name, "create-attempt", 0.0, False,
+                           "attempt %d of %d: %s%s" % (attempt, STACK_ATTEMPTS, race, "; giving up" if last else "; recreating the pod"))
+                if last:
+                    raise CloudError("the worker pod could not start: the node's runtime handler %s was not ready (the fresh-node race: %s); "
+                                     "gave up after %d attempt(s)" % (STACK_RUNTIME_CLASS, race, attempt)) from None
+                if self._mine("pod", name) is False:
+                    self.foreign.append("pod/" + name)
+                    raise CloudError("the pod %s is not this call's (its run id does not match); left whole" % name) from None
+                self.kube.delete_pod_and_wait(name)
+                attempt += 1
+                self._make(made, "pod", self.kube.apply, spec)
+                continue
+            except CloudError as e:
+                self.audit(worker, "pod/" + name, "create-attempt", 0.0, False, "attempt %d of %d: %s" % (attempt, STACK_ATTEMPTS, e))
+                raise
+            self.audit(worker, "pod/" + name, "create-attempt", 0.0, True, "attempt %d of %d: ready" % (attempt, STACK_ATTEMPTS))
+            return
+
+    def _raise_on_race(self, name, pod):
+        uid = (pod or {}).get("metadata", {}).get("uid")
+        for ev in self.kube.pod_events(name):
+            if uid and (ev.get("involvedObject") or {}).get("uid") not in (None, uid):
+                continue   # an event of an earlier pod of the same name
+            if ev.get("reason") == "FailedCreatePodSandBox" and STACK_RACE_RE.search(ev.get("message") or ""):
+                raise _FreshNodeRace(STACK_RACE_RE.search(ev["message"]).group(0))
+
+    def _wait_ready(self, name, seconds, on_pending=None):
         end = self.clock() + dt.timedelta(seconds=seconds)
         while True:
             pod = self.kube.get_pod(name)
@@ -1039,6 +1220,8 @@ class Launcher:
                 raise CloudError("worker pod failed to start")
             if any(c.get("type") == "Ready" and c.get("status") == "True" for c in status.get("conditions", [])):
                 return
+            if on_pending:
+                on_pending(pod)
             if self.clock() >= end:
                 raise CloudError("timed out waiting for the worker", EXIT_TIMEOUT)
             self.sleep(2)
@@ -1599,6 +1782,8 @@ def build_parser():
     c.add_argument("--max-hard", default=DEFAULT_MAX_HARD)
     c.add_argument("--shape", default="S")
     c.add_argument("--image")
+    c.add_argument("--stack", action="store_true",
+                   help="a pod for a worker that runs a nested Docker stack: the Sysbox runtime class, its own user namespace, the pool's node label; off by default (the default pod is unchanged)")
     c.add_argument("--wait", type=int, default=300)
     c.add_argument("--pull-secret", help="name of an existing image-pull Secret (pull-only) for imagePullSecrets")
     c.add_argument("--run-secret-fd", action="append", default=[], metavar="NAME=N",
