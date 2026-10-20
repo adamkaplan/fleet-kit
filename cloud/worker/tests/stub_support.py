@@ -43,10 +43,26 @@ def spawn(argv, **kw):
     return p
 
 
+def group_alive(pgid):
+    """True while some process still has this process group id. PermissionError (macOS, a group of only exited processes) counts as alive."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def stop_group(p, port=None):
-    """Kill the group spawn() made, wait for the child, close its pipes, and assert the port refuses connections (bounded retry)."""
+    """Kill the group spawn() made, wait for the child, close its pipes, and assert the port refuses connections (bounded retry).
+
+    When the leader was already reaped and no member of the group is left, nothing is signalled: the pid could since belong to a stranger
+    (a group id is reserved only while it has a member). A PermissionError from killpg after the leader has exited (macOS answers it for a
+    group of only exited processes) is swallowed: there is then nothing left to kill. A port that still answers after PORT_FREE_SECONDS raises."""
     pgid = getattr(p, "pgid", None)
-    if pgid is not None:
+    p.poll()
+    if pgid is not None and not (p.returncode is not None and not group_alive(pgid)):
         try:
             os.killpg(pgid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):

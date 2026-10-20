@@ -5,16 +5,20 @@ setUp that raises; the stub server ends by itself (SIGTERM even when the parent 
 of the cloud tests finds every place that starts a child process by its syntax tree, with one case per site and one mutant per site
 (the cleanup removed) that the scan must catch. Offline: loopback only. Children are only ever the ones this file started: never a name pattern."""
 import ast
+import http.client
 import io
 import os
+import re
 import shutil
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
@@ -42,12 +46,7 @@ def pid_alive(pid):
     return True
 
 
-def group_alive(pgid):
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return False
-    return True
+group_alive = stub_support.group_alive   # PermissionError (macOS: a group of only exited processes) counts as alive until it is reaped
 
 
 def run_inner(case):
@@ -56,7 +55,7 @@ def run_inner(case):
     return res
 
 
-GROUP_SCRIPT = "import os,subprocess,sys,time\nsubprocess.Popen(['sleep','300'])\nopen(sys.argv[1],'w').write(str(os.getpid()))\ntime.sleep(300)\n"   # a child with a grandchild
+GROUP_SCRIPT = "import os,subprocess,sys,time\nsubprocess.Popen([sys.executable,'-c','import time\\ntime.sleep(300)'])\nopen(sys.argv[1],'w').write(str(os.getpid()))\ntime.sleep(300)\n"   # a child with a grandchild
 
 
 def make_inner(kind, state):
@@ -178,10 +177,105 @@ class TestStubEndsByItself(unittest.TestCase):
         self.assertTrue(wait_until(lambda: p.poll() is not None, 6), "the idle stub is still running")
 
 
+class TestStopGroupPins(unittest.TestCase):
+    """What the helper promises, pinned one at a time: the port check, the pid-reuse guard, and the stub's idle timer."""
+
+    def listener(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        s.listen(5)
+        self.addCleanup(s.close)
+        return s, s.getsockname()[1]
+
+    def quick_child(self):
+        p = stub_support.spawn([sys.executable, "-c", "import time\ntime.sleep(300)"])
+        self.addCleanup(stub_support.stop_group, p)
+        return p
+
+    def test_m3_a_port_that_still_answers_makes_stop_group_raise(self):
+        s, port = self.listener()
+        p = self.quick_child()
+        old = stub_support.PORT_FREE_SECONDS
+        stub_support.PORT_FREE_SECONDS = 0.5
+        try:
+            with self.assertRaises(AssertionError):
+                stub_support.stop_group(p, port)
+        finally:
+            stub_support.PORT_FREE_SECONDS = old
+        self.assertFalse(group_alive(p.pgid), "the group is killed even when the port check fails")
+
+    def test_m3_a_port_that_frees_within_the_retry_passes(self):
+        s, port = self.listener()
+        p = self.quick_child()
+        timer = threading.Timer(0.5, s.close)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        old = stub_support.PORT_FREE_SECONDS
+        stub_support.PORT_FREE_SECONDS = 5
+        try:
+            stub_support.stop_group(p, port)   # raises when the port never frees
+        finally:
+            stub_support.PORT_FREE_SECONDS = old
+
+    def test_low_nothing_is_signalled_when_the_leader_was_reaped_and_the_group_is_empty(self):
+        p = stub_support.spawn([sys.executable, "-c", "pass"])
+        self.addCleanup(stub_support.stop_group, p)
+        p.wait()
+        self.assertTrue(wait_until(lambda: not group_alive(p.pgid)))
+        calls = []
+        real = os.killpg
+
+        def spy(pgid, sig):
+            calls.append((pgid, sig))
+            return real(pgid, sig)
+        with mock.patch.object(os, "killpg", spy):
+            stub_support.stop_group(p)
+        self.assertNotIn((p.pgid, signal.SIGKILL), calls)
+
+    def test_low_a_group_member_that_outlived_a_reaped_leader_is_still_killed(self):
+        code = "import subprocess,sys\nsubprocess.Popen([sys.executable,'-c','import time\\ntime.sleep(300)'])\n"
+        p = stub_support.spawn([sys.executable, "-c", code])
+        self.addCleanup(stub_support.stop_group, p)
+        p.wait()   # the leader is gone and reaped; its grandchild still holds the group
+        self.assertTrue(group_alive(p.pgid))
+        stub_support.stop_group(p)
+        self.assertTrue(wait_until(lambda: not group_alive(p.pgid)), "the member of the group is left")
+
+    def test_low_the_idle_timer_is_refreshed_by_requests(self):
+        port = stub_support.free_port()
+        p = stub_support.start(self, [sys.executable, STUB, str(port)], port=port, env=dict(os.environ, STUB_IDLE_SECONDS="2"))
+        self.assertTrue(wait_until(lambda: not stub_support.port_is_free(port)))
+        end = time.time() + 5   # longer than the 2 s cap, with a request every half second
+        while time.time() < end:
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+            c.request("GET", "/api/info")
+            c.getresponse().read()
+            c.close()
+            self.assertIsNone(p.poll(), "the stub ended while it was being asked")
+            time.sleep(0.5)
+        self.assertTrue(wait_until(lambda: p.poll() is not None, 6), "the stub did not end once the requests stopped")
+
+
 # ---- the scan -------------------------------------------------------------------------------------------------------------------
 
 HELPER = "stub_support"
-HELPER_OK = {"start", "exec_stub"}   # these register a cleanup, or hand the process a self-exit, by themselves
+# ONE table of every way a test starts a child or another thread of control. Names are canonical (imports and aliases resolved).
+STARTERS = {
+    "popen": {"subprocess.Popen"},
+    "blocking": {"subprocess.run", "subprocess.call", "subprocess.check_call", "subprocess.check_output", "subprocess.getoutput", "subprocess.getstatusoutput"},
+    "shell": {"os.system", "os.popen"},
+    "fork": {"os.fork", "os.forkpty", "pty.fork", "pty.spawn"},
+    "exec": {"os.execl", "os.execle", "os.execlp", "os.execlpe", "os.execv", "os.execve", "os.execvp", "os.execvpe", "os.posix_spawn", "os.posix_spawnp",
+             "os.spawnl", "os.spawnle", "os.spawnlp", "os.spawnlpe", "os.spawnv", "os.spawnve", "os.spawnvp", "os.spawnvpe"},
+    "process": {"multiprocessing.Process", "multiprocessing.Pool", "multiprocessing.get_context", "concurrent.futures.ProcessPoolExecutor"},
+    "async": {"asyncio.create_subprocess_exec", "asyncio.create_subprocess_shell"},
+    "thread": {"threading.Thread"},   # fine as a daemon (it dies with the test process); a non-daemon thread is a site that needs a cleanup
+}
+KIND_OF = {name: kind for kind, names in STARTERS.items() for name in names}
+CLEANUP_REGISTERS = {"addCleanup", "addClassCleanup", "enterContext"}
+ENDERS = {"kill", "terminate", "send_signal", "stop_group", "killpg"}   # what ENDS a process: wait or close alone does not
+BACKGROUND = re.compile(r"(?<![&])&\s*($|[;\n)])|\bnohup\b|\bsetsid\b|\bdisown\b")   # a shell string that backgrounds something
+SERVER_WORDS = re.compile(r"stub_server|serve_forever|http\.server")   # a blocking call whose argument is a server never returns
 # a child that a string of code starts inside another process: allowed only with this reason (the scan finds the string; a new one fails)
 EMBEDDED_OK = {("bin/test-cloud-worker", "grandchild.pid"): "a bounded grandchild (sleep 60) of a stub tool; the test asserts it is gone"}
 
@@ -226,6 +320,33 @@ def dotted(node):
     return ".".join(reversed(parts))
 
 
+def aliases_of(tree):
+    """name -> canonical dotted name, from every import (import a.b as x; from m import n as k)."""
+    out = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for a in n.names:
+                out[a.asname or a.name.split(".")[0]] = a.name if a.asname else a.name.split(".")[0]
+        elif isinstance(n, ast.ImportFrom) and n.module:
+            for a in n.names:
+                out[a.asname or a.name] = n.module + "." + a.name
+    return out
+
+
+def resolve(node, aliases):
+    """The canonical dotted name of a callee: through import aliases and through getattr(module, 'name')."""
+    if isinstance(node, ast.Name):
+        return aliases.get(node.id, node.id)
+    if isinstance(node, ast.Attribute):
+        base = resolve(node.value, aliases)
+        return base + "." + node.attr if base else None
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr" and len(node.args) >= 2 \
+            and isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str):
+        base = resolve(node.args[0], aliases)
+        return base + "." + node.args[1].value if base else None
+    return None
+
+
 def call_name(call):
     return dotted(call.func) or ""
 
@@ -253,18 +374,88 @@ def mentions(node, name):
     return False
 
 
+def ends_var(args, var):
+    """Do these call arguments end the process held in var (var.kill, a lambda that kills it, stop_group(var...))? wait or close alone does not."""
+    for a in args:
+        for sub in ast.walk(a):
+            if isinstance(sub, ast.Attribute) and sub.attr in ENDERS and dotted(sub.value) == var:
+                return True
+            if (isinstance(sub, ast.Name) and sub.id in ENDERS or isinstance(sub, ast.Attribute) and sub.attr in ENDERS) and any(mentions(b, var) for b in args):
+                return True
+    return False
+
+
 def cleanup_calls(func, name):
-    """The calls in the function that register or perform a cleanup for exactly this variable."""
+    """The calls in the function that register (or in a finally, perform) a cleanup that ENDS exactly this variable's process."""
     out = []
+    finals = {id(x) for t in ast.walk(func) if isinstance(t, ast.Try) for s in t.finalbody for x in ast.walk(s)}
     for n in ast.walk(func):
-        if isinstance(n, ast.Call) and call_name(n).rsplit(".", 1)[-1] in ("addCleanup", "addClassCleanup", "stop_group", "enterContext"):
-            if any(mentions(a, name) for a in n.args):
-                out.append(n)
+        if not isinstance(n, ast.Call):
+            continue
+        last = call_name(n).rsplit(".", 1)[-1]
+        if last in CLEANUP_REGISTERS and ends_var(n.args, name):
+            out.append(n)
+        elif id(n) in finals and (last == "stop_group" and any(mentions(a, name) for a in n.args) or last in ENDERS and call_name(n) == name + "." + last):
+            out.append(n)
     return out
 
 
+def scan_tree(rel, tree):
+    """The sites of one parsed file (rel is its path under the root): the same rules for a real file and for a mutant."""
+    sites = []
+    par = parents_of(tree)
+    aliases = aliases_of(tree)
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call):
+            canon = resolve(n.func, aliases) or ""
+            fn = enclosing_function(n, par)
+            fname = fn.name if fn else "<module>"
+            s = dict(file=rel, line=n.lineno, func=fname, node=n, tree=tree, par=par, name=canon)
+            if canon in (HELPER + ".start", HELPER + ".exec_stub"):
+                sites.append(dict(s, kind="helper", ok=True, why="through the helper"))
+                continue
+            if rel.endswith("stub_support.py") and (fname == "spawn" and canon == "subprocess.Popen" or fname == "exec_stub" and canon == "os.execv"):
+                sites.append(dict(s, kind="helper-itself", ok=True, why="the helper's own start (tested by the helper cases)"))
+                continue
+            kind = KIND_OF.get(canon) or ("exec" if canon.startswith("os.spawn") else None)
+            if canon == HELPER + ".spawn":
+                kind = "popen"
+            if kind is None:
+                continue
+            if kind == "blocking":
+                strings = [c.value for a in list(n.args) + [k.value for k in n.keywords] for c in ast.walk(a) if isinstance(c, ast.Constant) and isinstance(c.value, str)]
+                if any(BACKGROUND.search(x) or SERVER_WORDS.search(x) for x in strings):
+                    sites.append(dict(s, kind="blocking", ok=False, why="a blocking call that backgrounds a process or runs a server (it leaves a child or never returns)"))
+                continue   # a plain blocking call waits for its child inline: not a start site
+            if kind == "thread":
+                daemon = any(k.arg == "daemon" and isinstance(k.value, ast.Constant) and k.value.value is True for k in n.keywords)
+                sites.append(dict(s, kind="thread", ok=daemon, why="a daemon thread dies with the test process" if daemon else "a non-daemon thread outlives the test (daemon=True, or end it in a cleanup)"))
+                continue
+            var = None
+            p = par.get(n)
+            if isinstance(p, ast.Assign) and len(p.targets) == 1:
+                var = dotted(p.targets[0])
+            if kind in ("popen", "process") and var and fn is not None and cleanup_calls(fn, var):
+                sites.append(dict(s, kind=kind, var=var, fn=fn, ok=True, why="registers a cleanup that ends %s" % var))
+            else:
+                sites.append(dict(s, kind=kind, var=var, fn=fn, ok=False, why="starts a child (%s) with no cleanup that ENDS it (kill, terminate, stop_group; a wait alone does not): use stub_support.start" % canon))
+        elif isinstance(n, ast.Constant) and isinstance(n.value, str) and rel != THIS:
+            text = n.value
+            starts = "subprocess.Popen(" in text or "%s.spawn(" % HELPER in text
+            if not (starts or BACKGROUND.search(text)):
+                continue
+            ok = starts and "%s.stop_group(" % HELPER in text
+            reason = None
+            for (f, snip), why in EMBEDDED_OK.items():
+                if f == rel and snip in text:
+                    ok, reason = True, why
+            sites.append(dict(file=rel, line=n.lineno, func="<string>", node=n, tree=tree, par=par, name="string", kind="embedded", ok=ok,
+                              why=reason or ("the string stops its child with stop_group" if ok else "a string of code starts a child or backgrounds a process with no stop_group and no reason listed")))
+    return sites
+
+
 def find_sites(root):
-    """Every start site under root: dict(file, line, kind, func, ok, why, node, tree). The set comes from the code, never a list."""
+    """Every start site under root, from the syntax trees. The set comes from the code, never a list."""
     sites = []
     for path in py_files(root):
         tree = parse(path)
@@ -274,82 +465,8 @@ def find_sites(root):
     return sites
 
 
-def scan_tree(rel, tree):
-    """The sites of one parsed file (rel is its path under the root): the same rules for a real file and for a mutant."""
-    sites = []
-    if True:
-        par = parents_of(tree)
-        for n in ast.walk(tree):
-            if isinstance(n, ast.Call):
-                name = call_name(n)
-                last = name.rsplit(".", 1)[-1]
-                fn = enclosing_function(n, par)
-                fname = fn.name if fn else "<module>"
-                s = dict(file=rel, line=n.lineno, func=fname, node=n, tree=tree, par=par, name=name)
-                if name == "%s.%s" % (HELPER, "start") or name == "%s.exec_stub" % HELPER:
-                    sites.append(dict(s, kind="helper", ok=True, why="through the helper"))
-                elif rel.endswith("stub_support.py") and fname == "spawn" and last == "Popen":
-                    sites.append(dict(s, kind="helper-itself", ok=True, why="the helper's own spawn (tested by the helper cases)"))
-                elif rel.endswith("stub_support.py") and fname == "exec_stub" and name == "os.execv":
-                    sites.append(dict(s, kind="helper-itself", ok=True, why="the helper's own exec (the stub ends by itself)"))
-                elif last == "Popen" or name == "%s.spawn" % HELPER:
-                    var = None
-                    p = par.get(n)
-                    if isinstance(p, ast.Assign) and len(p.targets) == 1:
-                        var = dotted(p.targets[0])
-                    if isinstance(p, ast.withitem):
-                        sites.append(dict(s, kind="with", ok=True, why="a with block waits for it"))
-                    elif var and fn is not None and cleanup_calls(fn, var):
-                        sites.append(dict(s, kind="popen", var=var, fn=fn, ok=True, why="registers a cleanup for %s" % var))
-                    else:
-                        sites.append(dict(s, kind="popen", var=var, fn=fn, ok=False, why="starts a child and registers no cleanup for it (use stub_support.start, or addCleanup for the process)"))
-                elif name in ("os.execv", "os.execve", "os.execvp", "os.execvpe", "os.posix_spawn", "os.posix_spawnp") or name.startswith("os.spawn"):
-                    sites.append(dict(s, kind="exec", ok=False, why="becomes or starts a long-lived process outside the helper (use stub_support.exec_stub)"))
-            elif isinstance(n, ast.Constant) and isinstance(n.value, str) and rel != THIS and ("subprocess.Popen(" in n.value or "%s.spawn(" % HELPER in n.value):
-                ok = "%s.stop_group(" % HELPER in n.value
-                reason = None
-                for (f, snip), why in EMBEDDED_OK.items():
-                    if f == rel and snip in n.value:
-                        ok, reason = True, why
-                sites.append(dict(file=rel, line=n.lineno, func="<string>", node=n, tree=tree, par=par, name="string", kind="embedded", ok=ok,
-                                  why=reason or ("the string stops its child with stop_group" if ok else "a string of code starts a child with no stop_group and no reason listed")))
-    return sites
-
-
 def site_name(s):
     return "%s:%d" % (s["file"], s["line"])
-
-
-def mutate(tree, site):
-    """A copy of the tree with the site's cleanup removed. Returns the new source or None when this kind has none to remove."""
-    t = ast.parse(ast.unparse(tree))   # a private copy; the same site is found again by its place among the sites of its kind in the file
-    ordinal = [x["line"] for x in SITES if x["file"] == site["file"] and x["kind"] == site["kind"]].index(site["line"])
-    target = sorted([x for x in scan_tree(site["file"], t) if x["kind"] == site["kind"]], key=lambda x: x["line"])[ordinal]
-    par = target["par"]
-    node = target["node"]
-    kind = site["kind"]
-    if kind == "helper":
-        if call_name(node).endswith("exec_stub"):
-            new = ast.parse("os.execv(sys.executable, [sys.executable, 'stub', 'port'])").body[0].value
-        else:   # start(test, argv, port=..., **kw) -> Popen(argv, **kw): no cleanup is registered
-            node.args = node.args[1:]
-            node.keywords = [k for k in node.keywords if k.arg != "port"]
-            new = ast.Call(func=ast.parse("subprocess.Popen").body[0].value, args=node.args, keywords=node.keywords)
-        _replace(par[node], node, new)
-    elif kind == "popen":
-        fn = target["fn"]
-        for c in cleanup_calls(fn, target["var"]):
-            holder = par.get(c)
-            if isinstance(holder, ast.Expr):
-                _remove_stmt(par[holder], holder)
-            else:
-                return None
-    elif kind == "embedded":
-        node.value = node.value.replace("%s.stop_group(" % HELPER, "p.kill(")
-    else:
-        return None
-    ast.fix_missing_locations(t)
-    return ast.unparse(t)
 
 
 def _replace(parent, old, new):
@@ -373,11 +490,107 @@ def _remove_stmt(parent, stmt):
     raise AssertionError("statement not found")
 
 
+def mutate(tree, site, how="remove"):
+    """The source of a copy of the tree with this site's cleanup removed (how=remove), or reduced to a wait (how=wait). None: no such mutant."""
+    t = ast.parse(ast.unparse(tree))   # a private copy; the same site is found again by its place among the sites of its kind in the file
+    ordinal = [x["line"] for x in SITES if x["file"] == site["file"] and x["kind"] == site["kind"]].index(site["line"])
+    target = sorted([x for x in scan_tree(site["file"], t) if x["kind"] == site["kind"]], key=lambda x: x["line"])[ordinal]
+    par, node, kind = target["par"], target["node"], site["kind"]
+    if kind == "helper" and how == "remove":
+        if call_name(node).endswith("exec_stub"):
+            new = ast.parse("os.execv(sys.executable, [sys.executable, 'stub', 'port'])").body[0].value
+        else:   # start(test, argv, port=..., **kw) -> Popen(argv, **kw): no cleanup is registered
+            new = ast.Call(func=ast.parse("subprocess.Popen").body[0].value, args=node.args[1:], keywords=[k for k in node.keywords if k.arg != "port"])
+        _replace(par[node], node, new)
+    elif kind == "thread" and how == "remove":
+        node.keywords = [k for k in node.keywords if k.arg != "daemon"]
+    elif kind in ("popen", "process"):
+        var = target["var"]
+        calls = cleanup_calls(target["fn"], var)
+        if not calls:
+            return None
+        for c in calls:
+            if how == "remove":
+                holder = par.get(c)
+                if not isinstance(holder, ast.Expr):
+                    return None
+                _remove_stmt(par[holder], holder)
+            else:   # only wait for it
+                for sub in ast.walk(c):
+                    if isinstance(sub, ast.Attribute) and sub.attr in ENDERS and dotted(sub.value) == var:
+                        sub.attr = "wait"
+                if cleanup_calls_in(c, var):   # a stop_group(var, ...) style call
+                    wait = ast.Attribute(value=ast.parse(var, mode="eval").body, attr="wait", ctx=ast.Load())
+                    if call_name(c).rsplit(".", 1)[-1] in CLEANUP_REGISTERS:
+                        c.args, c.keywords = [wait], []
+                    else:
+                        c.func, c.args, c.keywords = wait, [], []
+    elif kind == "embedded":
+        node.value = node.value.replace("%s.stop_group(" % HELPER, "print(" if how == "remove" else "p.wait(")
+    else:
+        return None
+    ast.fix_missing_locations(t)
+    return ast.unparse(t)
+
+
+def cleanup_calls_in(call, var):
+    """Is this one call a stop_group-style ender (a function named in ENDERS taking var), after the attribute forms were turned into waits?"""
+    for sub in ast.walk(call):
+        if (isinstance(sub, ast.Name) and sub.id in ENDERS or isinstance(sub, ast.Attribute) and sub.attr in ENDERS) and any(mentions(b, var) for b in [call]):
+            return True
+    return False
+
+
 SITES = find_sites(ROOT)
 
 
+def mutable(s, how):
+    if s["kind"] == "helper-itself" or s["kind"] == "blocking":
+        return False
+    if s["kind"] == "embedded":
+        return "stop_group" in s["node"].value
+    if s["kind"] == "thread":
+        return how == "remove"
+    if s["kind"] == "helper":
+        return how == "remove"
+    return s["kind"] in ("popen", "process")
+
+
+PLANTED = {   # every way a test can start a child that the scan must NOT let through (each is a case): name -> source
+    "an aliased import of Popen": "from subprocess import Popen as P\ndef t():\n    P(['x'])\n",
+    "a module alias": "import subprocess as sp\ndef t():\n    sp.Popen(['x'])\n",
+    "getattr naming Popen": "import subprocess\ndef t():\n    getattr(subprocess, 'Popen')(['x'])\n",
+    "a shell run that backgrounds": "import subprocess\ndef t():\n    subprocess.run('nohup sleep 300 &', shell=True)\n",
+    "os.system": "import os\ndef t():\n    os.system('sleep 300 &')\n",
+    "os.popen": "import os\ndef t():\n    os.popen('sleep 300')\n",
+    "multiprocessing.Process": "import multiprocessing\ndef t():\n    multiprocessing.Process(target=print).start()\n",
+    "os.fork": "import os\ndef t():\n    os.fork()\n",
+    "pty.fork": "import pty\ndef t():\n    pty.fork()\n",
+    "asyncio.create_subprocess_exec": "import asyncio\nasync def t():\n    await asyncio.create_subprocess_exec('x')\n",
+    "a string with a shell background": "CODE = 'sleep 300 &\\n'\n",
+    "a string with nohup": "CODE = 'nohup sleep 300'\n",
+    "a blocking check_call of a server": "import subprocess\ndef t():\n    subprocess.check_call(['python3', 'stub_server.py', '1'])\n",
+    "a non-daemon thread": "import threading\ndef t():\n    threading.Thread(target=print).start()\n",
+    "an exec outside the helper": "import os\nos.execv('a', ['a'])\n",
+    "a process that is only waited for": "import subprocess\nclass T:\n    def t(self):\n        p = subprocess.Popen(['x'])\n        self.addCleanup(p.wait)\n",
+    "a process that is only closed": "import subprocess\nclass T:\n    def t(self):\n        p = subprocess.Popen(['x'])\n        self.addCleanup(p.stdout.close)\n",
+    "a cleanup for another process": "import subprocess\nclass T:\n    def t(self):\n        p = subprocess.Popen(['x'])\n        q = subprocess.Popen(['y'])\n        self.addCleanup(q.kill)\n",
+    "a cleanup in another function": "import subprocess\nclass T:\n    def a(self):\n        p = subprocess.Popen(['x'])\n    def b(self):\n        self.addCleanup(p.kill)\n",
+    "a popen with no cleanup": "import subprocess\nclass T:\n    def t(self):\n        p = subprocess.Popen(['x'])\n",
+}
+CONTROLS = {   # shapes that are fine
+    "a process killed by its cleanup": "import subprocess\nclass T:\n    def t(self):\n        p = subprocess.Popen(['x'])\n        self.addCleanup(p.kill)\n",
+    "a process ended by a lambda": "import subprocess\nclass T:\n    def t(self):\n        p = subprocess.Popen(['x'])\n        self.addCleanup(lambda: p.terminate())\n",
+    "a process ended in a finally": "import subprocess\ndef t():\n    p = subprocess.Popen(['x'])\n    try:\n        pass\n    finally:\n        p.kill()\n",
+    "the helper": "import stub_support\ndef t(self):\n    stub_support.start(self, ['x'])\n",
+    "a blocking run with a timeout": "import subprocess\ndef t():\n    subprocess.run(['x'], timeout=5)\n",
+    "a daemon thread": "import threading\ndef t():\n    threading.Thread(target=print, daemon=True).start()\n",
+    "a string with a stop": "CODE = 'p = stub_support.spawn([1])\\nstub_support.stop_group(p)'\n",
+}
+
+
 class TestScanFindsTheShape(unittest.TestCase):
-    """The scan on planted trees: it must tell the cleanup of THIS process from a cleanup of another call."""
+    """The scan on planted trees: every way to start a child outside the helper fails, the fine shapes pass (one case each)."""
 
     def scan(self, source):
         d = tempfile.mkdtemp()
@@ -387,31 +600,34 @@ class TestScanFindsTheShape(unittest.TestCase):
             f.write(source)
         return find_sites(d)
 
-    def test_a_popen_with_no_cleanup_fails(self):
-        s = self.scan("import subprocess\nclass T:\n    def t(self):\n        p = subprocess.Popen(['x'])\n")
-        self.assertEqual([x["ok"] for x in s], [False])
 
-    def test_a_cleanup_for_another_process_does_not_count(self):
-        s = self.scan("import subprocess\nclass T:\n    def t(self):\n        p = subprocess.Popen(['x'])\n        q = subprocess.Popen(['y'])\n        self.addCleanup(q.kill)\n")
-        self.assertEqual([x["ok"] for x in s], [False, True])
+def _planted(name, source):
+    def run(self):
+        sites = self.scan(source)
+        self.assertTrue(sites, "no site found: %s passes the scan unseen" % name)
+        self.assertTrue(any(not x["ok"] for x in sites), "%s is accepted" % name)
+    return run
 
-    def test_a_cleanup_in_another_function_does_not_count(self):
-        s = self.scan("import subprocess\nclass T:\n    def a(self):\n        p = subprocess.Popen(['x'])\n    def b(self):\n        self.addCleanup(p.kill)\n")
-        self.assertEqual([x["ok"] for x in s], [False])
 
-    def test_an_exec_outside_the_helper_fails_and_the_helper_passes(self):
-        s = self.scan("import os\nos.execv('a', ['a'])\n")
-        self.assertEqual([x["ok"] for x in s], [False])
-        s = self.scan("import stub_support\ndef t(self):\n    stub_support.start(self, ['x'])\n")
-        self.assertEqual([x["ok"] for x in s], [True])
+def _control(name, source):
+    def run(self):
+        sites = self.scan(source)
+        self.assertTrue(all(x["ok"] for x in sites), "%s is refused: %s" % (name, [x["why"] for x in sites if not x["ok"]]))
+    return run
 
-    def test_a_string_with_a_popen_needs_a_stop_or_a_listed_reason(self):
-        self.assertEqual([x["ok"] for x in self.scan("CODE = 'import subprocess\\np = subprocess.Popen([1])'\n")], [False])
-        self.assertEqual([x["ok"] for x in self.scan("CODE = 'p = stub_support.spawn([1])\\nstub_support.stop_group(p)'\n")], [True])
+
+def _tagname(text):
+    return "".join(c if c.isalnum() else "_" for c in text)
+
+
+for _n, _src in PLANTED.items():
+    setattr(TestScanFindsTheShape, "test_planted_" + _tagname(_n), _planted(_n, _src))
+for _n, _src in CONTROLS.items():
+    setattr(TestScanFindsTheShape, "test_control_" + _tagname(_n), _control(_n, _src))
 
 
 class TestEverySite(unittest.TestCase):
-    """One case per start site found in the cloud tests (generated below from SITES), and one mutant case per site."""
+    """One case per start site found in the cloud tests (generated below from SITES), and one mutant case per site and way."""
 
     def test_the_scan_finds_the_expected_families(self):
         kinds = {s["kind"] for s in SITES}
@@ -424,9 +640,10 @@ class TestEverySite(unittest.TestCase):
             self.assertIn(f, files)
 
     def test_the_cases_are_exactly_the_sites(self):
-        names = {n for n in dir(TestEverySite) if n.startswith("test_site_")}
-        self.assertEqual(len(names), len(SITES))
-        self.assertEqual(len({n for n in dir(TestEverySite) if n.startswith("test_mutant_")}), len([s for s in SITES if s["kind"] != "helper-itself" and not (s["kind"] == "embedded" and "stop_group" not in s["node"].value)]))
+        self.assertEqual(len({n for n in dir(TestEverySite) if n.startswith("test_site_")}), len(SITES))
+        want = sum(1 for s in SITES if mutable(s, "remove"))
+        self.assertEqual(len({n for n in dir(TestEverySite) if n.startswith("test_mutant_remove_")}), want)
+        self.assertEqual(len({n for n in dir(TestEverySite) if n.startswith("test_mutant_wait_")}), sum(1 for s in SITES if mutable(s, "wait")))
 
 
 def _case(s):
@@ -435,9 +652,9 @@ def _case(s):
     return run
 
 
-def _mutant_case(s):
+def _mutant_case(s, how):
     def run(self):
-        src = mutate(s["tree"], s)
+        src = mutate(s["tree"], s, how)
         self.assertIsNotNone(src, "no mutant for %s" % site_name(s))
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
@@ -448,16 +665,16 @@ def _mutant_case(s):
         with open(dest, "w") as f:
             f.write((first if first.startswith("#!") else "") + src)   # unparse drops the shebang that tells the scan it is Python
         bad = [x for x in find_sites(d) if not x["ok"]]
-        self.assertEqual([x["func"] for x in bad], [s["func"]] if s["kind"] != "embedded" else ["<string>"], "the scan missed the mutant of %s" % site_name(s))
+        self.assertEqual(sorted({x["func"] for x in bad}), [s["func"] if s["kind"] != "embedded" else "<string>"], "the scan missed the %s mutant of %s" % (how, site_name(s)))
     return run
 
 
 for _s in SITES:
-    _tag = "".join(c if c.isalnum() else "_" for c in site_name(_s))
+    _tag = _tagname(site_name(_s))
     setattr(TestEverySite, "test_site_" + _tag, _case(_s))
-    if _s["kind"] == "helper-itself" or (_s["kind"] == "embedded" and "stop_group" not in _s["node"].value):
-        continue   # the helper itself is tested above; a listed embedded site has no cleanup to remove
-    setattr(TestEverySite, "test_mutant_" + _tag, _mutant_case(_s))
+    for _how in ("remove", "wait"):
+        if mutable(_s, _how):
+            setattr(TestEverySite, "test_mutant_%s_%s" % (_how, _tag), _mutant_case(_s, _how))
 
 
 class TestDocsStateTheRule(unittest.TestCase):

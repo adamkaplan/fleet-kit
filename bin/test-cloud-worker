@@ -2327,7 +2327,7 @@ class TestVaultCheckProcess(VaultBase):
 
     def two_launches(self):
         results = [None, None]
-        threads = [threading.Thread(target=self.recover, args=(results, i)) for i in (0, 1)]
+        threads = [threading.Thread(target=self.recover, args=(results, i), daemon=True) for i in (0, 1)]
         threads[0].start()
         self.wait_started()   # the first holds the lock (its check has started and sleeps) when the second arrives
         threads[1].start()
@@ -2358,7 +2358,7 @@ class TestVaultCheckProcess(VaultBase):
         self.make_checkout(code=0, fixes=False, sleep=3)
         env = dict(os.environ)
         results = [None]
-        holder = threading.Thread(target=self.recover, args=(results, 0))
+        holder = threading.Thread(target=self.recover, args=(results, 0), daemon=True)
         holder.start()
         self.wait_started()
         recovery = self.cw.VaultRecovery(self.home / "vault.lock", None, sleep=lambda s: time.sleep(0.05), clock=time.monotonic)
