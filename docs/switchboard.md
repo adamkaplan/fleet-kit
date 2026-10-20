@@ -2277,7 +2277,7 @@ Everything waiting on the person should be in their Decisions panel, and nothing
 rather than by an agent's memory. The daemon runs a deterministic sweep (no model) over what GitHub shows. With no `sweep` key at all it runs in **shadow**, and so does `{}`:
 findings are audited (`sweep.finding`) and counted in `status`, nobody is woken and nothing is withdrawn. `"enabled": true`
 is the only way to wake the Chief of Staff and withdraw stale decisions. `"sweep": false` turns it fully off (no reads, no
-writes). Keys: `enabled` (false), `aged_cos_hours` (2), `comment_window_days` (7), `max_findings` (20, the most one
+writes). The audit line's `woken` is true only for a finding the pass's wake carried and remembered: in the sweep, every due finding (named, or counted in the fact's "+N more"); in triage, the findings the digest named (an overflow beyond `max_findings` is not carried and stays due) and the other-owner flags that rode along in its text (alone they never wake). A finding whose wake goes later the same day is logged once more, and a restart does not log again a finding raised inside the re-alarm window (#849). Keys: `enabled` (false), `aged_cos_hours` (2), `comment_window_days` (7), `max_findings` (20, the most one
 fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["the owner"], the names the phrases look for), `calls_per_pass` (12, the most `gh` calls one pass makes, 4 to 100).
 
 | Kind | Finding |
