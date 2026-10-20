@@ -164,6 +164,12 @@ def _repo_key(text):
     return (owner + "/" + name).lower()
 
 
+def allowed_repo_keys(raw):
+    """The allow-list's entries as keys (a None for an entry that is not exactly OWNER/NAME). THE parse of CW_ALLOWED_REPOS: the check below and
+    the settings file's validator both call it."""
+    return [_repo_key(x.strip()) for x in raw.split(",")]
+
+
 def check_repo_allowed(repo, env):
     """The one allow-list check (the launcher's create and the driver both call it). Raises CloudError(EXIT_USAGE) before anything is
     made. CW_ALLOWED_REPOS: comma-separated OWNER/NAME, exact and case-insensitive; unset, empty or any malformed entry refuses.
@@ -171,7 +177,7 @@ def check_repo_allowed(repo, env):
     raw = (env.get("CW_ALLOWED_REPOS") or "").strip()
     if not raw:
         raise CloudError("refused: %s is not on the cloud allow-list (CW_ALLOWED_REPOS is unset or empty)" % scrub(repo, (), 120), EXIT_USAGE)
-    allowed = [_repo_key(x.strip()) for x in raw.split(",")]
+    allowed = allowed_repo_keys(raw)
     if None in allowed:
         raise CloudError("refused: CW_ALLOWED_REPOS has an entry that is not OWNER/NAME; nothing was created", EXIT_USAGE)
     tooling = (env.get("CW_TOOLING_REPO") or "").strip()
@@ -1082,9 +1088,80 @@ SECRET_SHAPES = tuple(
     ("a URL with a password", re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]*:[^/\s@]+@"), None),
     ("a 40-character hex string", re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{40}(?![0-9A-Fa-f])"), ("command",)),
 )
-DIGEST_REF = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}")
-_SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
+_IMAGE_CHARS = re.compile(r"[a-z0-9._/:-]+")
+_IMAGE_REF = re.compile(r"(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]{1,5})?/)?[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*@sha256:[0-9a-f]{64}")
+_DNS_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_HOST = re.compile(r"(?:%s\.)*%s" % (_DNS_LABEL, _DNS_LABEL))
+_NAMESPACE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+_SECRET_NAME = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?")
+_VAULT_NAME = re.compile(r"[A-Za-z][A-Za-z0-9-]{1,22}[A-Za-z0-9]")
+_GUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_BARE_PROGRAM = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._+-]*")
 _NUMBER = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+_REFUSED_HOSTS = ("localhost", "metadata", "metadata.google.internal")
+
+
+def _server_ok(value):
+    import ipaddress
+    if not value.startswith("https://") or any(c in value for c in "?#@\\ "):
+        return False
+    try:
+        parts = urllib.parse.urlsplit(value)
+        port = parts.port
+        host = parts.hostname
+    except ValueError:
+        return False
+    if not host or parts.path not in ("", "/") or (port is not None and not 0 < port < 65536):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        low = host.lower()
+        return bool(_HOST.fullmatch(host)) and low not in _REFUSED_HOSTS and not low.endswith(".localhost") and any(c.isalpha() for c in low.rsplit(".", 1)[-1])
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    return not (ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved)
+
+
+def _allowed_ok(value):
+    keys = allowed_repo_keys(value)
+    return None not in keys   # the one function the launch's allow-list check uses
+
+
+def _path_ok(value):
+    return os.path.isabs(value) and ".." not in value.split("/")
+
+
+def _number_ok(value):
+    return bool(_NUMBER.fullmatch(value)) and 0 < float(value) <= 100000
+
+
+# THE table of value rules: one row per setting, the rule's words (shown in a refusal, never the value) and its test. DEFAULT-DENY: a setting with no
+# row is refused, and a test fails when SETTINGS and this table differ. Every value also refuses control characters (checked before this table).
+VALIDATORS = {
+    "CW_ALLOWED_REPOS": ("a comma-separated list of OWNER/NAME entries, no wildcard", _allowed_ok),
+    "CW_TOOLING_REPO": ("one OWNER/NAME", lambda v: _repo_key(v) is not None),
+    "CW_CLOUD_IMAGE": ("an image by digest, [registry[:port]/]path@sha256:<64 lowercase hex>, no tag, nothing else",
+                       lambda v: bool(_IMAGE_CHARS.fullmatch(v.split("@")[0])) and bool(_IMAGE_REF.fullmatch(v))),
+    "CW_CLOUD_SERVER": ("an https URL with a host (no user, query, fragment, path, file: or http:, and no loopback, link-local or metadata address)", _server_ok),
+    "CW_CLOUD_CA_FILE": ("an absolute path with no .. segment", _path_ok),
+    "CW_PULL_SECRET": ("a Kubernetes name (lowercase letters, digits, - and .)", lambda v: bool(_SECRET_NAME.fullmatch(v))),
+    "CW_VAULT_SUBSCRIPTION": ("a subscription GUID", lambda v: bool(_GUID.fullmatch(v))),
+    "CW_VAULT_NAME": ("a vault name: 3 to 24 letters, digits and hyphens, starting with a letter", lambda v: bool(_VAULT_NAME.fullmatch(v))),
+    "CW_CLOUD_NAMESPACE": ("a DNS label that is not default or kube-*", lambda v: bool(_NAMESPACE.fullmatch(v)) and v != "default" and not v.startswith("kube-")),
+    "CW_KUBECTL": ("an absolute path with no .. segment, or a bare program name", lambda v: _path_ok(v) or bool(_BARE_PROGRAM.fullmatch(v))),
+    "CW_MODEL_AUTH_FILE": ("an absolute path with no .. segment", _path_ok),
+    "CW_RUN_RECORD_DIR": ("an absolute path with no .. segment", _path_ok),
+    "CW_CLOUD_SPEND_CAP_USD": ("a number above 0 and at most 100000", _number_ok),
+    "CW_CLUSTER_TOKEN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_CLUSTER_ADMIN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_GIT_TOKEN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_APP_ID_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_APP_INSTALLATION_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_APP_KEY_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
+}
+_SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
 
 
 def settings_path(env=None):
@@ -1118,6 +1195,8 @@ def _read_settings_file(path):
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise _bad(path, "is not a regular file")
+        if st.st_nlink != 1:
+            raise _bad(path, "has more than one hard link: it must be the only name of the file")
         if st.st_uid != os.geteuid():
             raise _bad(path, "is owned by another user")
         if stat.S_IMODE(st.st_mode) & 0o177:
@@ -1145,7 +1224,11 @@ def parse_settings(text, path="the settings file"):
     no quoting, no expansion, nothing is run. A bad line, an unknown or repeated key, a quoted value, and a secret-shaped value are refused naming the
     line number and the key, never the value. An empty value counts as not set."""
     values = {}
-    for number, line in enumerate(text.splitlines(), 1):
+    for number, line in enumerate(text.split("\n"), 1):
+        bad = [c for c in line if (ord(c) < 32 and c != "\t") or ord(c) == 127]
+        if bad:
+            key = line.split("=", 1)[0].strip() if "=" in line and line.split("=", 1)[0].strip() in SETTING_KINDS else None
+            raise _bad(path, "line %d%s has a control character (a NUL, a carriage return or another: use plain LF text)" % (number, " (%s)" % key if key else ""))
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         m = _SETTING_LINE.fullmatch(line.strip())
@@ -1163,18 +1246,13 @@ def parse_settings(text, path="the settings file"):
             if (kinds is None or kind in kinds) and pattern.search(value):
                 raise _bad(path, "line %d: the value of %s looks like a secret (%s); the file holds no secret" % (number, key, shape))
         if value:
+            rule = VALIDATORS.get(key)
+            if rule is None or not rule[1](value):
+                raise _bad(path, "line %d: %s must be %s" % (number, key, rule[0] if rule else "a setting with a value rule (it has none: refused)"))
             values[key] = value
     missing = [name for name in SETTING_REQUIRED if name not in values]
     if missing:
         raise _bad(path, "lacks the required setting%s %s" % ("s" if len(missing) > 1 else "", ", ".join(missing)))
-    for key, value in values.items():
-        kind = SETTING_KINDS[key]
-        if kind == "digest-ref" and not DIGEST_REF.fullmatch(value):
-            raise _bad(path, "%s must name the image by digest (name@sha256:<64 hex>), not by a tag" % key)
-        if kind == "number" and not _NUMBER.fullmatch(value):
-            raise _bad(path, "%s must be a number" % key)
-        if kind == "path" and not os.path.isabs(value) and key != "CW_KUBECTL":
-            raise _bad(path, "%s must be an absolute path" % key)
     return values
 
 
@@ -1192,9 +1270,16 @@ def apply_settings(env=None, path=None):
     if clash:
         raise CloudError("refused: %s is set differently in the file %s and in the environment: unset one (the file is the one source when it exists); "
                          "nothing was called" % (", ".join(clash), path), EXIT_USAGE)
-    for name, _, _ in SETTINGS:
-        env.pop(name, None)
-    env.update(values)
+    before = {name: env[name] for name, _, _ in SETTINGS if name in env}
+    try:   # everything was validated above; if the environment still refuses a value, put every setting back as it was
+        for name, _, _ in SETTINGS:
+            env.pop(name, None)
+        env.update(values)
+    except Exception:
+        for name, _, _ in SETTINGS:
+            env.pop(name, None)
+        env.update(before)
+        raise CloudError("refused: the settings file %s could not be applied; nothing was changed" % path, EXIT_USAGE) from None
     return path
 
 

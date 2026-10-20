@@ -12,7 +12,7 @@ import cloud_worker as cw  # noqa: E402
 
 DIGEST = "registry.example.internal/acme/worker@sha256:" + "ab12" * 16
 GOOD = {"CW_ALLOWED_REPOS": "acme-org/widget-service", "CW_CLOUD_IMAGE": DIGEST, "CW_CLOUD_SERVER": "https://cluster.example.internal:6443",
-        "CW_VAULT_SUBSCRIPTION": "sub-example", "CW_VAULT_NAME": "vault-example", "CW_CLOUD_NAMESPACE": "cw"}
+        "CW_VAULT_SUBSCRIPTION": "00000000-0000-0000-0000-000000000000", "CW_VAULT_NAME": "vault-example", "CW_CLOUD_NAMESPACE": "cw"}
 OPTIONAL_SAMPLES = {"CW_TOOLING_REPO": "acme-org/tooling", "CW_CLOUD_CA_FILE": "/home/user/ca.pem", "CW_PULL_SECRET": "pull-example",
                     "CW_KUBECTL": "kubectl", "CW_MODEL_AUTH_FILE": "/home/user/auth.json", "CW_RUN_RECORD_DIR": "/home/user/runs",
                     "CW_CLOUD_SPEND_CAP_USD": "25", "CW_CLUSTER_TOKEN_CMD": "cat /home/user/token", "CW_CLUSTER_ADMIN_CMD": "cat /home/user/kc",
@@ -26,6 +26,32 @@ SAMPLES = {   # one value per secret shape (built here, never a real secret)
 }
 for _prefix in cw._PREFIXES:
     SAMPLES["token prefix " + _prefix.strip()] = "x " + _prefix + "A1b2C3d4E5f6G7h8"
+
+HOSTILE = {   # per key: values that must be refused (each through the REAL parse_settings)
+    "CW_ALLOWED_REPOS": ["*", "acme-org/*", "../../x", "/etc/passwd", "a b", "acme-org/widget-service,", ",acme-org/widget-service", "acme-org/..", "acme-org/x.git",
+                         "acme-org/a b", "acme-org/x,*", "$(x)/y"],
+    "CW_TOOLING_REPO": ["*", "acme-org", "acme-org/*", "../x", "a b/c", "acme-org/x,acme-org/y"],
+    "CW_CLOUD_IMAGE": ["$(x)@sha256:" + "ab12" * 16, "reg.example/x:tag@sha256:" + "ab12" * 16, "-flag@sha256:" + "ab12" * 16, "x@sha256:" + "ab12" * 16 + "z",
+                       "X/y@sha256:" + "ab12" * 16, "a b@sha256:" + "ab12" * 16, "x;y@sha256:" + "ab12" * 16, "x:1.2",
+                       "a@sha256:" + "ab12" * 16 + "@sha256:" + "ab12" * 16, "reg.example/../x@sha256:" + "ab12" * 16, "x//y@sha256:" + "ab12" * 16],
+    "CW_CLOUD_SERVER": ["http://169.254.169.254", "file:///x", "-flag", "x y", "cluster.example.internal", "https://user@host.example", "https://host.example/path",
+                        "https://host.example?x=1", "https://host.example#f", "https://127.0.0.1", "https://localhost", "https://169.254.169.254", "https://[::1]",
+                        "https://0.0.0.0", "https://2130706433", "https://metadata.google.internal", "https://host.example:99999", "https://host.example:abc",
+                        "https://", "https://ho st.example", "https://[::ffff:127.0.0.1]", "ftp://host.example", "https://host.example\\x"],
+    "CW_CLOUD_CA_FILE": ["relative.pem", "/home/user/../etc/x", "-x", "$HOME/x"],
+    "CW_PULL_SECRET": ["A_B", "a b", "-", "a/b", "$(x)", "UPPER"],
+    "CW_VAULT_SUBSCRIPTION": ["sub-example", "0000", "00000000-0000-0000-0000-00000000000g", "$(x)", "a;b", "00000000-0000-0000-0000-000000000000 "[:-1] + "0"],
+    "CW_VAULT_NAME": ["$(touch SENT)", "a;touch SENT", "ab", "a" * 25, "1abc", "a b", "a_b", "abc-"[:-1] + "/"],
+    "CW_CLOUD_NAMESPACE": ["a/b;c", "kube-system", "kube-public", "default", "A", "-a", "a-", "a b", "a" * 64, "$(x)"],
+    "CW_KUBECTL": ["../kubectl", "/x/../y", "-x", "a b", "$(x)", "a/b"],
+    "CW_MODEL_AUTH_FILE": ["auth.json", "/a/../b", "-x"],
+    "CW_RUN_RECORD_DIR": ["runs", "/a/../b", "-x"],
+    "CW_CLOUD_SPEND_CAP_USD": ["0", "-1", "1e3", "100001", "1.2.3", "abc", "0.0"],
+    "CW_CLUSTER_TOKEN_CMD": ["-x"], "CW_CLUSTER_ADMIN_CMD": ["--x"], "CW_GIT_TOKEN_CMD": ["-x"], "CW_APP_ID_CMD": ["-x"],
+    "CW_APP_INSTALLATION_CMD": ["-x"], "CW_APP_KEY_CMD": ["-x"],
+    "CW_VAULT_CHECK_DIR": ["check", "/a/../b", "-x"],
+}
+CONTROL = ["\x00", "\r", "\x0b", "\x0c", "\x1c", "\x1b", "\x7f", "\x01"]
 
 
 def body(values):
@@ -66,6 +92,95 @@ class Tables(unittest.TestCase):
 
     def test_the_samples_cover_every_secret_shape(self):
         self.assertEqual(set(SAMPLES), {name for name, _, _ in cw.SECRET_SHAPES})
+
+
+class ValueRules(Dir):
+    def test_every_setting_has_one_value_rule_and_a_hostile_list(self):
+        self.assertEqual(set(cw.VALIDATORS), set(cw.SETTING_KINDS))   # default-deny: a new setting without a rule fails here
+        self.assertEqual(set(HOSTILE), set(cw.SETTING_KINDS))
+        for key, (rule, check) in cw.VALIDATORS.items():
+            self.assertTrue(rule and callable(check), key)
+        for key in set(GOOD) | set(OPTIONAL_SAMPLES):   # the good samples satisfy their own row
+            value = {**GOOD, **OPTIONAL_SAMPLES}[key]
+            self.assertTrue(cw.VALIDATORS[key][1](value), key)
+
+    def test_every_hostile_value_is_refused_naming_the_key_and_the_rule_and_never_the_value(self):
+        for key, values in HOSTILE.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    err = self.refused(body(dict(GOOD, **{key: value})))
+                    self.assertIn(key, err)
+                    self.assertTrue(cw.VALIDATORS[key][0] in err or "control character" in err or "looks like a secret" in err, err)
+                    rest = err.replace(self.path, "").replace(cw.VALIDATORS[key][0], "")   # the text a value could leak into
+                    if len(value.strip()) >= 4:
+                        self.assertNotIn(value.strip(), rest)
+
+    def test_one_mutant_per_row_each_hostile_list_is_what_catches_it(self):
+        for key, values in HOSTILE.items():
+            with self.subTest(key=key), mock.patch.dict(cw.VALIDATORS, {key: ("anything", lambda v: True)}):
+                accepted = 0
+                for value in values:
+                    try:
+                        cw.parse_settings(body(dict(GOOD, **{key: value})), self.path)
+                        accepted += 1
+                    except cw.CloudError:
+                        pass
+                self.assertGreater(accepted, 0, "with the rule for %s removed, no hostile value got through: the list does not test the rule" % key)
+
+    def test_a_setting_with_no_row_is_refused(self):
+        with mock.patch.dict(cw.VALIDATORS):
+            del cw.VALIDATORS["CW_VAULT_NAME"]
+            self.assertIn("CW_VAULT_NAME", self.refused(body(GOOD)))
+
+    def test_a_control_character_in_any_value_or_line_is_refused_naming_the_line(self):
+        for key in set(GOOD) | set(OPTIONAL_SAMPLES):
+            for char in CONTROL:
+                with self.subTest(key=key, char=repr(char)):
+                    value = {**GOOD, **OPTIONAL_SAMPLES}[key] + char + "x"
+                    err = self.refused(body(dict(GOOD, **{key: value})))
+                    self.assertIn("control character", err)
+                    self.assertIn("line", err)
+        self.assertIn("control character", self.refused(body(GOOD).replace("\n", "\r\n")))   # a CRLF file
+
+    def test_the_allow_list_rule_is_the_function_the_launch_check_uses(self):
+        with mock.patch.object(cw, "allowed_repo_keys", wraps=cw.allowed_repo_keys) as used:
+            cw.parse_settings(body(GOOD), self.path)
+            self.assertTrue(used.called)
+        for raw in ("acme-org/widget-service,acme-org/widget-api", "ACME-ORG/Widget-Service"):
+            self.assertTrue(cw.VALIDATORS["CW_ALLOWED_REPOS"][1](raw))
+            cw.check_repo_allowed("acme-org/widget-service", {"CW_ALLOWED_REPOS": raw})   # what the validator accepts, the check accepts
+
+    def test_a_good_server_form_is_accepted(self):
+        for value in ("https://cluster.example.internal:6443", "https://cluster.example.internal", "https://cluster.example.internal/", "https://10.0.0.4:6443", "https://[2001:db8::1]:443", "https://aks-dns-1a2b3c4d.hcp.example.azmk8s.io:443"):
+            with self.subTest(value):
+                self.assertTrue(cw.VALIDATORS["CW_CLOUD_SERVER"][1](value))
+
+    def test_a_bad_file_leaves_the_environment_byte_identical(self):
+        env = dict(GOOD, CW_TOOLING_REPO="acme-org/tooling", HOME="/home/user")
+        before = dict(env)
+        self.refused(body(dict(GOOD, CW_VAULT_NAME="$(x)")), env=env)
+        self.assertEqual(env, before)
+
+    def test_if_the_environment_refuses_a_value_every_setting_is_put_back(self):
+        self.write(body(GOOD))
+
+        class Strict(dict):
+            calls = 0
+
+            def update(self, *a, **k):
+                Strict.calls += 1
+                if Strict.calls == 1:
+                    raise ValueError("embedded null byte")
+                super().update(*a, **k)
+        env = Strict({"CW_TOOLING_REPO": "acme-org/tooling"})
+        with self.assertRaises(cw.CloudError):
+            cw.apply_settings(env, self.path)
+        self.assertEqual(dict(env), {"CW_TOOLING_REPO": "acme-org/tooling"})
+
+    def test_a_second_hard_link_is_refused(self):
+        self.write(body(GOOD))
+        os.link(self.path, os.path.join(self.dir, "second"))
+        self.assertIn("hard link", self.refused())
 
 
 class Reader(Dir):

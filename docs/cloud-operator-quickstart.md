@@ -24,8 +24,12 @@ What the file must be (anything else refuses, naming the file and the problem, b
 - in a directory owned by you that is not group- or world-writable;
 - plain `KEY=VALUE` lines: `#` starts a comment line, blank lines are skipped, the value is the rest of the line as written. No quotes, no `$VAR` or `$(...)`
   expansion, and nothing is run when the file is read. A quoted value, an unknown key, a repeated key or a malformed line refuses;
+- **every value is checked against its own rule** (the table below; a setting with no rule is refused), and a value with a control character (a NUL, a carriage return, so a CRLF file too) is refused naming the line;
 - **no secret**: a value shaped like one (a token prefix such as `ghp_`, `github_pat_`, `sk-`, `AKIA`, `Bearer `; a JWT; a PEM header; a URL with a password;
-  a 40-character hex string inside a command) refuses, naming the key and never printing the value. A command that prints a secret is fine; the secret itself is not.
+  a 40-character hex string inside a command) refuses, naming the key and never printing the value. A command that prints a secret is fine; the secret itself is not. The shape check is a guardrail, not a boundary: other secret formats are not recognised, so keep secrets out of the file yourself;
+- a file with more than one hard link refuses. Settings are applied all at once: a refused file leaves the environment untouched.
+
+Known limits (not checked): only the file's own directory is checked for owner and write bits, so a group-writable grandparent such as `~/.config` at `0770`, and a symlink in the directory path (it is followed), are not caught; and with `CW_CLUSTER_TOKEN_CMD` set the two vault settings are still required, validated and then unused.
 
 Create it so that nobody else can ever read it (the template is below; fill in your own values):
 
@@ -40,12 +44,12 @@ Each setting's name, whether the file requires it, and its kind (name, path, com
 
 | Setting | Required | Kind | What it is |
 |---|---|---|---|
-| `CW_ALLOWED_REPOS` | yes | name | comma-separated `OWNER/NAME` the launcher may use, e.g. `acme-org/widget-service`. Unset or empty refuses everything. |
+| `CW_ALLOWED_REPOS` | yes | name | comma-separated `OWNER/NAME` the launcher may use, e.g. `acme-org/widget-service`; no wildcard. Unset or empty refuses everything. |
 | `CW_CLOUD_IMAGE` | yes | digest-ref | the worker image, by digest: `name@sha256:<64 hex>`; a tag refuses. (`--image` on the command line stays as it was.) |
-| `CW_CLOUD_SERVER` | yes | name | the cluster API address, for the service-account login |
-| `CW_VAULT_SUBSCRIPTION` | yes | name | the vault's subscription, for the cluster token route |
-| `CW_VAULT_NAME` | yes | name | the vault's name |
-| `CW_CLOUD_NAMESPACE` | yes | name | the namespace the workers live in |
+| `CW_CLOUD_SERVER` | yes | name | the cluster API address, an `https://host[:port]` URL (no user, query, fragment or path; no `http:` or `file:`; no loopback, link-local or metadata address) |
+| `CW_VAULT_SUBSCRIPTION` | yes | name | the vault's subscription, a GUID |
+| `CW_VAULT_NAME` | yes | name | the vault's name: 3 to 24 letters, digits and hyphens, starting with a letter |
+| `CW_CLOUD_NAMESPACE` | yes | name | the namespace the workers live in: a DNS label; `default` and `kube-*` are refused |
 | `CW_TOOLING_REPO` | no | name | the tooling's own repository: refused even when it is on the list |
 | `CW_CLOUD_CA_FILE` | no | path | absolute path to the cluster's CA certificate |
 | `CW_PULL_SECRET` | no | name | name of the image pull secret in the namespace (the name, never its content) |
@@ -70,7 +74,7 @@ CW_CLOUD_IMAGE=registry.example.internal/acme/worker@sha256:00000000000000000000
 # the cluster API address
 CW_CLOUD_SERVER=https://cluster.example.internal:6443
 # the vault that holds the cluster login
-CW_VAULT_SUBSCRIPTION=acme-subscription
+CW_VAULT_SUBSCRIPTION=00000000-0000-0000-0000-000000000000
 CW_VAULT_NAME=acme-vault
 # the namespace the workers live in
 CW_CLOUD_NAMESPACE=cw
