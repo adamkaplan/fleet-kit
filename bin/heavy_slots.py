@@ -103,22 +103,22 @@ def _split(command):
     return (os.path.basename(words[0]).lower(), words[1:]) if words else ("", [])
 
 
-def _options(rest):
-    """The words of `rest` that are not the value of a selector option (the value of -k, -c ... is read by nobody)."""
+def _options(rest, any_option=False):
+    """The words of `rest` that are not the value of an option: always the value of a selector (-k, -c ...), and with `any_option` the word after any option-looking word
+    (`--name chrome`), except after the whole option words that select a kind themselves."""
     skip, found = False, []
     for word in rest:
         if skip:
             skip = False
-        elif word in SELECTORS:
-            found.append(word)
+            continue
+        found.append(word)
+        if word in SELECTORS or (any_option and word.startswith("-") and "=" not in word and word not in E2E_WORDS):
             skip = True
-        else:
-            found.append(word)
     return found
 
 
 def _is_e2e(program, rest, short):
-    return any(tool in program for tool in E2E_WORDS if not tool.startswith("-")) or any(word.lower() in E2E_WORDS for word in _options(rest))
+    return any(tool in program for tool in E2E_WORDS if not tool.startswith("-")) or any(word.lower() in E2E_WORDS for word in _options(rest, any_option=True))
 
 
 def _is_focused(program, rest, short):
@@ -728,8 +728,8 @@ class Watchdog:
                 if self.decided is not None and reason == "time":
                     try:
                         self.decided()   # the audit line is written before the first signal
-                    except Exception:
-                        pass
+                    except Exception as err:
+                        self.out.write("heavy: the stop report failed (%s)\n" % _plain("%s: %s" % (type(err).__name__, err), 120))
                 self.stop(live)
                 return
 
@@ -846,7 +846,7 @@ def check_orphans(state_dir, slots=DEFAULT_SLOTS, config=None, clock=time.time, 
     processes that HOLD THE SLOT'S LOCK (seen at two looks) and what they started; the record's own pid is a root only when its recorded start time matches the live
     process (a pid reused by another process, or an older record with no start time, is never a root). Never the wrapper, its parent, its group or pid 1. A record
     without a kind or ceiling (an older one) reads as kind "other". A run whose wrapper is alive is never touched. A run that is looked at again after a stop that left
-    survivors is stopped again but reported once (a marker `heavy-told-<slot>.json`). Returns the infos of what it stopped."""
+    survivors is stopped again but reported once (a marker `heavy-told-<slot>.json`, written when the audit line is: a tick that does not stop marks nothing). Returns the infos of what it stopped."""
     out = sys.stderr if out is None else out
     table = ceiling_table(config)
     stopped = []
@@ -867,12 +867,13 @@ def check_orphans(state_dir, slots=DEFAULT_SLOTS, config=None, clock=time.time, 
         pid = info.get("pid") if _whole(info.get("pid"), 2, PID_MAX) else 0
         report = {"kind": kind, "ran_seconds": int(ran), "ceiling_seconds": ceiling, "pid": pid, "source": "orphan"}
         holder, lane = _plain(info.get("name", "?")), _plain(info.get("lane", info.get("name", "?")))
-        first = _first_report(state_dir, index, info)
+        first = not _reported(state_dir, index, info)
         hooked = []
 
         def decided():
             if first and on_stop is not None:
                 hooked.append(1)
+                _mark_reported(state_dir, index, info)   # the stop is happening: from now on the run counts as reported
                 try:
                     on_stop("decided", report, holder, lane)
                 except Exception as err:
@@ -882,7 +883,7 @@ def check_orphans(state_dir, slots=DEFAULT_SLOTS, config=None, clock=time.time, 
         out.write("heavy: stopped an orphaned %s run (pid %d): its wrapper was gone and it ran past the time ceiling of %d s\n" % (kind, pid, ceiling))
         out.flush()
         stopped.append(report)
-        if first and on_stop is not None:
+        if hooked and on_stop is not None:
             try:
                 on_stop("told", report, holder, lane)
             except Exception as err:
@@ -890,23 +891,32 @@ def check_orphans(state_dir, slots=DEFAULT_SLOTS, config=None, clock=time.time, 
     return stopped
 
 
-def _first_report(state_dir, index, info):
-    """True the first time this run (slot, `since`, pid) is stopped, False when it was already reported (the marker is written at once, so it is told once)."""
-    path = os.path.join(str(state_dir), "heavy-told-%s.json" % index)
-    key = {"since": info.get("since"), "pid": info.get("pid")}
+def _marker_path(state_dir, index):
+    return os.path.join(str(state_dir), "heavy-told-%s.json" % index)
+
+
+def _marker_key(info):
+    return {"since": info.get("since"), "pid": info.get("pid")}
+
+
+def _reported(state_dir, index, info):
+    """True when this run (slot, `since`, pid) was already reported (by a stop that happened)."""
     try:
-        with open(path) as handle:
-            if json.loads(handle.read(512)) == key:
-                return False
+        with open(_marker_path(state_dir, index)) as handle:
+            return json.loads(handle.read(512)) == _marker_key(info)
     except (OSError, ValueError):
-        pass
+        return False
+
+
+def _mark_reported(state_dir, index, info):
+    """Written at the moment the audit line is: only a stop that HAPPENS marks the run reported. Without the marker (it cannot be written) the run may be told again,
+    the lesser harm."""
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        fd = os.open(_marker_path(state_dir, index), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w") as handle:
-            handle.write(json.dumps(key))
+            handle.write(json.dumps(_marker_key(info)))
     except OSError:
-        pass   # no marker: it may be told again, which is the lesser harm
-    return True
+        pass
 
 
 def _stop_orphan(state_dir, index, info, out, clock, watchdog, start_of, decided):

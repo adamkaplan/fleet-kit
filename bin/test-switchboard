@@ -57837,6 +57837,9 @@ class TestHeavyCeilings(unittest.TestCase):
                 self.assertEqual(self.hs.classify(["sh", "-c", "cd /x/%s-app && bin/test-switchboard" % word]), "other", "a shell string is not read")
                 self.assertEqual(self.hs.classify(["cat", "/tmp/%s.txt" % word]), "other")
                 self.assertEqual(self.hs.classify(["python3", "/home/user/%s-notes/run.py" % word]), "other")
+                self.assertEqual(self.hs.classify(["bin/test-switchboard", "--name", word]), "full", "the VALUE of an option the table does not list")
+                self.assertEqual(self.hs.classify(["bin/test-switchboard", "--name=%s" % word]), "full")
+                self.assertEqual(self.hs.classify(["bin/test-switchboard", "-v", "tests/test_x.py"]), "focused", "a test file after a flag still counts")
                 self.assertEqual(self.hs.classify(["bin/test-switchboard", "tests/test_%s.py" % word]), "focused", "a test file argument is a focused run, whatever its name")
                 self.assertEqual(self.hs.classify(["python3", "-m", word]), "e2e", "the program itself, or a whole word, is read")
                 self.assertEqual(self.hs.classify(["npx", word, "test"]), "e2e")
@@ -58144,6 +58147,50 @@ class TestHeavyCeilings(unittest.TestCase):
     def test_m1_with_the_matching_start_time_the_recorded_pid_is_still_stopped(self):
         stopped, told, signals = self.orphan(9000, start_of=lambda pid: "c0")
         self.assertIn(4242, {p for p, _s in signals})
+
+    def test_a_tick_that_does_not_stop_marks_nothing_and_the_next_stop_audits_and_tells_once(self):
+        """The two checkers (the daemon and a waiting wrapper) meet: a tick whose stop does not happen must leave the run unreported."""
+        for case in ("the orphan lock is busy", "the holders are not seen twice", "the slot changed hands"):
+            with self.subTest(case):
+                holders = [4242, 4243]
+                base = {k: v for k, v in self.RECORD.items() if k != "cstart" or case != "the holders are not seen twice"}   # no recorded start: only lock holders are roots
+                tmp, dog, signals, alive = self.orphan_rig(dict(base), held_by=holders)
+                gate = os.open(os.path.join(tmp, self.hs.ORPHAN_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+                self.addCleanup(os.close, gate)
+                slot = os.path.join(tmp, "heavy-slot-0.lock")
+                real = dict(base)
+                told = BoundedList()
+                on_stop = lambda phase, info, holder, lane: told.append(phase)
+                state = {"swap": False}
+
+                def lsof(path):
+                    if state["swap"]:   # the slot is taken by a newer run while the look is made
+                        with open(path, "r+b") as handle:
+                            handle.truncate(0)
+                            handle.write(json.dumps(dict(real, since=5000)).encode())
+                    return set(holders)
+                dog["lsof"] = lsof
+                if case == "the orphan lock is busy":
+                    fcntl.flock(gate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                elif case == "the holders are not seen twice":
+                    holders[:] = []
+                else:
+                    state["swap"] = True
+                check = lambda: self.hs.check_orphans(tmp, 3, None, lambda: 1000.0 + 9000, on_stop, BoundedOut(), alive=alive, watchdog=dog, start_of=lambda p: "c0")
+                self.assertEqual((check(), list(told), list(signals)), ([], [], []), "tick 1: no stop, nothing reported")
+                self.assertFalse(os.path.exists(os.path.join(tmp, "heavy-told-0.json")), "tick 1 marks nothing")
+                if case == "the orphan lock is busy":
+                    fcntl.flock(gate, fcntl.LOCK_UN)
+                elif case == "the holders are not seen twice":
+                    holders[:] = [4242, 4243]
+                else:
+                    state["swap"] = False
+                    with open(slot, "r+b") as handle:
+                        handle.truncate(0)
+                        handle.write(json.dumps(real).encode())
+                self.assertEqual(len(check()), 1, "tick 2 stops the run")
+                self.assertEqual(list(told), ["decided", "told"], "audited once and told once")
+                self.assertTrue(os.path.exists(os.path.join(tmp, "heavy-told-0.json")))
 
     def test_the_lane_is_told_once_for_a_run_that_survives_the_stop_and_is_stopped_again(self):
         stopped, told, signals = self.orphan(9000, survivor=True)
