@@ -1207,7 +1207,7 @@ def cmd_impact_hold(args, runner, now):
         except impact_floor.MatrixError as err:   # the matrix file cannot be read: say so and stop, never read it as "no floor"
             sys.stderr.write("%s: impact hold: %s\n" % (PROG, _one_line(str(err), 200)))
             return EXIT_ERROR
-        if not has_floor and not any(pr.startswith(repo + "#") for pr in impact_ours(engine)[0]):   # a repo with no floor now is still judged while it holds labels of ours (#999)
+        if not has_floor and not any(pr.startswith(repo + "#") and isinstance(entry, dict) for pr, entry in (read_impact_state(state)[0].get("applied") or {}).items()):   # a repo with no floor now is still judged while it holds labels of ours (#999)
             continue
         try:
             items = read_open_items(engine, runner, repo)[0]

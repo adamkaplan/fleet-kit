@@ -34663,7 +34663,7 @@ def _adoption_cells():
 _adoption_cells()
 
 
-CHANGE_KINDS = ("base", "record", "matrix", "rating", "none")   # (#999) what can change under a hold the daemon put on, with the head unchanged: the ONE table every row below derives from
+CHANGE_KINDS = ("base", "record", "matrix", "rating", "head", "none")   # (#999) what can change under a hold the daemon put on, with the head unchanged: the ONE table every row below derives from
 
 
 class TestImpactReleaseEveryPass(TestImpactRejudge):
@@ -34703,7 +34703,7 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
     def held_world(self, kind):
         """A pull request this daemon holds at HEAD: the first pass puts the labels on, the second sees them."""
         self.live_labels = []
-        if kind == "base":
+        if kind in ("base", "head"):
             self.view("shims/gh")
         elif kind == "record":
             self.view("docs/a.md")
@@ -34727,6 +34727,9 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
             self.view("shims/gh" if holds else "docs/a.md", base="2" * 40)
         elif kind == "record":
             self.record(impact_action="hold", impact_class="authority") if holds else self.record(impact_action="second-review")
+        elif kind == "head":
+            self.HEAD = "c" * 40   # a push: the new head, on the same base
+            self.view("shims/gh" if holds else "docs/a.md")
         elif kind == "matrix":
             self.fingerprint = "m2"
             self.migrations_top = holds
@@ -34755,12 +34758,12 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
             (line,) = released
             self.assertEqual(line["detail"]["reason"], self.REASONS[kind])
 
-    REASONS = {"base": "base changed", "record": "record changed", "matrix": "rule changed", "rating": "record changed"}
+    REASONS = {"base": "base changed", "record": "record changed", "matrix": "rule changed", "rating": "record changed", "head": "head changed"}
     # a row where the rule no longer holds after the change; "none" never releases (it cannot change what the rule says)
     RELEASING = tuple(k for k in CHANGE_KINDS if k != "none")
 
     def test_the_table_is_complete_and_every_kind_has_a_row_and_a_mutant(self):
-        self.assertEqual(set(CHANGE_KINDS), {"base", "record", "matrix", "rating", "none"})
+        self.assertEqual(set(CHANGE_KINDS), set(self.REASONS) | {"none"}, "a kind with no reason, or a reason with no kind")
         self.assertEqual(set(self.REASONS), set(self.RELEASING), "a releasing kind with no reason")
         self.assertEqual(set(self.MUTANTS), set(self.RELEASING), "a releasing kind with no mutant")
         for kind in CHANGE_KINDS:   # every kind has both a still-held row and (but "none") a released row: both are driven by the table tests below
@@ -34792,6 +34795,12 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
     def test_row_rating_still_held(self):
         self.check_row("rating", True)
 
+    def test_row_head_released(self):
+        self.check_row("head", False)
+
+    def test_row_head_still_held(self):
+        self.check_row("head", True)
+
     def test_row_none_still_held(self):
         self.check_row("none", True)
 
@@ -34804,7 +34813,9 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
         "record": dict(NOT_OURS, **NO_RECORDS),                   # ... and blind to the record
         "matrix": dict(NOT_OURS, **FROZEN_RULE),                  # ... and blind to the rule's version
         "rating": dict(NOT_OURS, **NO_RECORDS),                   # ... and blind to the rating
+        "head": {"_impact_release_reason": lambda *a: "rule no longer holds"},   # a release that cannot say what changed
     }
+    REASON_BLIND = {"_impact_release_reason": lambda *a: "rule no longer holds"}
     NEW_HEAD_ONLY = dict(NOT_OURS, **dict(NO_RECORDS, **FROZEN_RULE))   # releases only when the head changes
 
     def mutant_fails(self, kind, mutant):
@@ -34825,6 +34836,9 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
 
     def test_a_daemon_that_releases_only_on_a_new_head_fails_the_base_row_and_releases_on_the_new_head(self):
         self.mutant_fails("base", self.NEW_HEAD_ONLY)
+
+    def test_the_head_row_fails_under_a_release_that_never_names_the_head(self):
+        self.mutant_fails("head", self.MUTANTS["head"])
 
     def test_every_releasing_kind_has_a_mutant_test(self):
         for kind in self.RELEASING:
@@ -34850,11 +34864,11 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
         self.step()
         self.assertEqual(json.loads((self.world.state / "impact-hold.json").read_text())["clears"][self.PRN], cleared)
 
-    def unreadable(self, patch, noted):
+    def unreadable(self, patch, noted, passes=3):
         self.held_world("base")
         self.view("docs/a.md", base="2" * 40)   # the rule no longer holds, but the input that says so cannot be read
         with patch:
-            for _ in range(3):
+            for _ in range(passes):
                 self.step(500)
         self.assertEqual(self.removals(9), [], "nothing released")
         self.assertEqual(len([e for e in self.world.audit() if e["event"] in noted]), 1, "said once, not at every pass")
@@ -34871,10 +34885,68 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
     def test_the_documentation_says_when_a_hold_is_released(self):
         text = (Path(__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
         start = text.index("When a hold is released:")
-        paragraph = text[start:start + 1400]
+        paragraph = text[text.rindex("\n", 0, start):text.index("\n", start)]
         for word in ("base branch", "matrix file", "impact review record", "rating", "draft", "gate.hold_released", "base changed", "rule changed", "record changed",
-                     "a person", "owner", "impact.not_checked"):
+                     "a person", "owner", "impact.not_checked", "head changed", "call budget"):
             self.assertIn(word, paragraph)
+
+    def test_not_checked_is_said_once_for_an_episode_and_again_for_the_next(self):
+        self.held_world("base")
+        self.view("docs/a.md", base="2" * 40)
+        count = lambda: len(self.events("impact.not_checked"))
+        broken = mock.patch.object(sb, "impact_records", lambda state_dir: ({}, "ledger unreadable"))
+        with broken:
+            for _ in range(3):
+                self.step(500)
+        self.assertEqual((count(), self.removals(9)), (1, []))
+        self.step(500)   # the ledger reads again: the rule no longer holds, so it is released (the episode is over)
+        self.assertEqual(len(self.removals(9)), 2)
+        self.held_world_again()
+        with broken:
+            for _ in range(3):
+                self.step(500)
+        self.assertEqual(count(), 2, "a second episode says it once more")
+
+    def held_world_again(self):
+        """The same pull request held again at a new head, so a second episode can begin."""
+        self.HEAD = "d" * 40
+        self.view("shims/gh")
+        self.live_labels = []
+        self.step(500)
+        self.live_labels = self.both()
+        self.step(500)
+        self.view("docs/a.md", base="3" * 40)
+
+    def test_a_hold_that_still_holds_gets_no_write_and_no_audit_line_at_later_passes(self):
+        self.held_world("base")
+        before = (len(self.events("gate.would_hold")), len(self.events("gate.hold_applied")), len(self.writes))
+        for _ in range(4):
+            self.step(500)
+        self.assertEqual((len(self.events("gate.would_hold")), len(self.events("gate.hold_applied")), len(self.writes)), before, "head, rule and record unchanged: judged, kept, silent")
+        self.assertEqual((self.removals(9), self.posts(9)), ([], []))
+
+    def test_the_quiet_keep_is_what_makes_a_holding_pull_request_silent(self):
+        applied = []
+        self.held_world("base")
+        with mock.patch.object(sb, "apply_impact_hold", lambda engine, repo, number, report, record: applied.append(number) or 0):
+            for _ in range(3):
+                self.step(500)
+        self.assertEqual(applied, [], "a hold that still holds is not re-applied at a pass")
+
+    # -- the dry run reads a draft the way the pass does
+
+    def test_the_dry_run_plans_a_release_for_a_draft_that_no_longer_holds_and_nothing_for_one_that_does(self):
+        self.held_world("base")
+        self.view("docs/a.md", base="2" * 40)
+        self.prs[9]["isDraft"] = True
+        code, out, err = self.run_as("coder", "impact", "hold", "--dry-run", "--repo", "acme/app")
+        self.assertEqual(code, 0, err)
+        self.assertIn("acme/app#9  would remove", out)
+        self.view("shims/gh")
+        self.prs[9]["isDraft"] = True
+        code, out, err = self.run_as("coder", "impact", "hold", "--dry-run", "--repo", "acme/app")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("acme/app#9", out, "a draft that holds is planned nothing")
 
     # -- the rest of the family
 
@@ -34926,24 +34998,36 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
 
 
     def test_a_due_release_not_reached_waits_and_the_one_judged_longest_ago_goes_first(self):
-        self.extra_config = dict(self.extra_config, impact_hold={"enabled": True, "calls_per_pass": 3})
+        self.extra_config = dict(self.extra_config, impact_hold={"enabled": True, "calls_per_pass": 1})
         self.configure()
         for n in (9, 10, 11):
             self.files(n, "shims/gh")
-        everyone = lambda: [self.listed(n, self.both()) for n in (9, 10, 11)]
+        forward = lambda: [self.listed(n, self.both()) for n in (9, 10, 11)]
+        backward = lambda: [self.listed(n, self.both()) for n in (11, 10, 9)]
         self.seed_applied([9, 10, 11])
-        self.passes(everyone())   # all three still hold: judged once (a read each, a budget of 3), kept
+        for _ in range(3):   # a budget of one read a pass: 9, then 10, then 11 is judged (all still hold: kept)
+            self.passes(forward(), advance=1000)
         self.assertEqual((self.posts(), self.removals()), ([], []))
-        self.passes([self.listed(10, self.both())], advance=1000)   # judged again: 10 at this time ...
-        self.passes([self.listed(9, self.both())], advance=1000)    # ... and 9 later than 10; 11 was judged longest ago
         for n in (9, 10, 11):
             self.files(n, "docs/a.md")
         order = []
-        for _ in range(3):
+        for _ in range(3):   # all three are due; the list now comes back in the other order, and a release is one a pass
             before = len(self.removals())
-            self.passes(everyone(), advance=1000)
+            self.passes(backward(), advance=1000)
             order += sorted({w[1].split("/")[4] for w in self.removals()[before:]})
-        self.assertEqual(order, ["11", "10", "9"], "one release a pass at a budget of 3, the one judged longest ago first")
+        self.assertEqual(order, ["9", "10", "11"], "one release a pass, the one judged longest ago first (not the list's order)")
+
+
+def _reason_mutant_test(kind):
+    def test(self):
+        self.mutant_fails(kind, self.REASON_BLIND)
+    test.__name__ = "test_the_%s_row_fails_when_the_release_never_says_what_changed" % kind
+    return test
+
+
+for _kind in TestImpactReleaseEveryPass.RELEASING:
+    _t = _reason_mutant_test(_kind)
+    setattr(TestImpactReleaseEveryPass, _t.__name__, _t)
 
 
 for _name in list(vars(TestImpactRejudge)):   # the subclass reuses the harness, not the tests
