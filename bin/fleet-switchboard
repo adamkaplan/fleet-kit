@@ -7342,6 +7342,273 @@ def retire_idle_evidence(engine, now, name, seen, herdr_status):
     return "herdr says working; the session has been idle %s and has no turn: treated as idle" % _idle_span_text(idle_for)
 
 
+# ---------------------------------------------------------------- no orphan workers (#838)
+#
+# A worker always has a boss that is a live agent. ONE step writes every boss change this ask makes (`write_boss_records`): the daemon pass,
+# the retire of an orchestrator, the launch of one (relaunch, replace), the move of an ask (split) and the close of a retired worker's pane
+# call it, so they cannot differ. The boss is written in the per-worker boss record of `bin/reassign.py` (bound to the worker's session), which
+# discovery applies, so every boss lookup follows it.
+
+ADOPT_ROLES = ("coder", "tester")   # the workers (the roles `WorkerFacts` reads); reviewers and orchestrators are not adopted
+ADOPT_PATHS = ("pass", "retire", "relaunch", "replace", "move", "close")   # the one table of the paths that change a boss; a test loops over it
+ADOPT_BY_DAEMON = "the switchboard"
+
+# Every function that reads a worker's boss from the raw `reports_to` text, and why it may. Anything else must go through `boss_name` (the lookup that
+# resolves the role alias and the boss record). A test scans this file for `reports_to` readers and fails when one is not in this table.
+BOSS_READ_SITES = {
+    "bin/fleet-switchboard:_boss_of": "the literal text; `boss_name` is built on it",
+    "bin/fleet-switchboard:notice_boss": "resolves the text through `resolve_boss`, over a discovery that already applies the boss record",
+    "bin/fleet-switchboard:reattach_caller_problem": "a dead agent is not discovered: its STORED metadata, overlaid with the boss record",
+    "bin/fleet-switchboard:adoption_orphans": "reads the old boss text only for the audit row and the `bosses` filter; presence is judged by `boss_name`",
+    "bin/fleet-switchboard:write_boss_records": "reads the launch-time boss text for the record's `original`",
+    "bin/reassign.py:run_reassign": "reads the launch-time boss text for the record's `original`",
+    "bin/work_sync.py:assignments": "reads the rows `WorkRows.agents` built with `_boss_of` over the discovery",
+    "bin/fleet_health.py:reconstruct_day": "history: the boss named in a past `v2.session.create` audit row",
+    "bin/item_verdicts.py:excluded": "reads the fleets the discovery built (the boss record already applied); it only EXCLUDES writers, so a worker adopted by a registered orchestrator is excluded too",
+    "bin/launch_testers.py:launched": "history: the boss named in a launch record, not a live lookup",
+    "bin/cloud_worker.py:cmd_retire": "a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record)",
+}
+
+
+class RecordUnreadable(Exception):
+    """A record an adoption or a close reads strictly cannot be read in full (#838): nothing is changed."""
+
+
+def _strict_retired(state):
+    try:
+        return read_retired_strict(state)
+    except RetiredUnreadable as err:
+        raise RecordUnreadable(str(err)) from None
+
+
+def _strict_overrides(state):
+    module = load_module("reassign")
+    try:
+        return module.read_overrides_strict(state)
+    except module.OverridesUnreadable as err:
+        raise RecordUnreadable(str(err)) from None
+
+
+# The records every boss change reads STRICTLY, in one table the code loops over (a test has one case and one mutant per member): (file, reader).
+ADOPT_STRICT_RECORDS = ((RETIRED_FILE, _strict_retired), ("boss-overrides.json", _strict_overrides))
+
+
+def _read_strict_records(state):
+    """{file: record} of every strict record, or RecordUnreadable naming the first that cannot be read in full."""
+    return {file: reader(state) for file, reader in ADOPT_STRICT_RECORDS}
+
+
+def _retired_entry_applies(retired, name, obs):
+    """True only when a retirement of `name` names THIS agent's session. A record with no session covers NOTHING (a live agent is never taken for a retired one on a
+    record that does not say which session was retired); the same rule as #870's, to be replaced by its one helper once that is on main."""
+    entry = retired.get(name)
+    return isinstance(entry, dict) and isinstance(entry.get("session"), str) and bool(entry["session"]) and entry["session"] == obs.session_id
+
+
+def boss_is_present(discovery, retired, boss):
+    """True when `boss` is a discovered agent that is not retired. A boss that is only hard to read still counts: no worker is taken from a boss on a doubt."""
+    obs = discovery.agents.get(boss) if isinstance(boss, str) else None
+    return obs is not None and not _retired_entry_applies(retired, boss, obs)
+
+
+def _heir_ok(discovery, retired, name, obs):
+    return not obs.problem and not _retired_entry_applies(retired, name, obs)
+
+
+def worker_charter(discovery, worker):
+    """The charter a worker belongs to: its own `charter`, else the charter of the orchestrator it reported to (still discovered, even if retired), else None."""
+    fleet = worker.fleet or {}
+    if _is_issue_number(fleet.get("charter")):
+        return fleet["charter"], fleet
+    old = discovery.agents.get(boss_name(discovery, worker) or "")
+    if old is not None and (old.fleet or {}).get("role") == "orchestrator" and _is_issue_number((old.fleet or {}).get("charter")):
+        return old.fleet["charter"], old.fleet
+    return None, fleet
+
+
+def adoption_heir(engine, discovery, retired, worker):
+    """(heir, why) for an orphan: the ONE live orchestrator of the worker's charter, else the ONE live Chief of Staff, else (None, None)."""
+    charter, fleet = worker_charter(discovery, worker)
+    if charter is not None:
+        repo = _fleet_repo(fleet, engine.config)
+        mine = sorted(n for n, o in discovery.agents.items()
+                      if (o.fleet or {}).get("role") == "orchestrator" and (o.fleet or {}).get("charter") == charter and n != worker.name
+                      and _fleet_repo(o.fleet, engine.config) == repo and _heir_ok(discovery, retired, n, o))
+        if len(mine) == 1:
+            return mine[0], "the charter's orchestrator"
+    chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff" and n != worker.name and _heir_ok(discovery, retired, n, o))
+    if len(chiefs) == 1:
+        return chiefs[0], "the Chief of Staff"
+    return None, None
+
+
+def adoption_orphans(engine, discovery, retired, names=None, bosses=None, charter=None):
+    """[(worker, old boss text or None, heir or None, heir's role)] for every worker whose boss is not a present agent. `names` limits the workers, `bosses`
+    the old boss (an orchestrator that was just retired or launched)."""
+    found = []
+    for name, obs in sorted(discovery.agents.items()):
+        if (obs.fleet or {}).get("role") not in ADOPT_ROLES or not obs.session_id or (names is not None and name not in names):
+            continue
+        boss = boss_name(discovery, obs)
+        if boss is not None and boss_is_present(discovery, retired, boss):
+            continue
+        if charter is not None and worker_charter(discovery, obs)[0] != charter:
+            continue
+        was = (obs.fleet or {}).get("reports_to")
+        if bosses is not None and was not in bosses and boss not in bosses:
+            continue
+        heir, why = adoption_heir(engine, discovery, retired, obs)
+        found.append((obs, was if isinstance(was, str) else None, heir, why))
+    return found
+
+
+def _retarget_overdue(engine, worker, was, heir):
+    """The worker's overdue-checkpoint reminder follows its boss (the same as `reassign`). Says nothing; a problem is only noted."""
+    if not was:
+        return
+    try:
+        namespace = types.SimpleNamespace(engine=engine, read_reminders=read_reminders, write_reminders=write_reminders, reminders_lock=reminders_lock)
+        load_module("reassign").retarget_reminders(namespace, worker, was, heir)
+    except Exception as err:
+        engine._note("boss.reminder_error", worker, {"error": _one_line(str(err), 100)})
+
+
+def write_boss_records(engine, discovery, assignments, path, by):
+    """THE ONE writer of a boss change of this ask. `assignments` is [(worker observation, old boss or None, heir name, why)]. Every record is read strictly: the
+    agent list (no problem), the retired record, the boss record: one that cannot be read in full means NOTHING is written. Written under the boss
+    record's lock in one atomic write, then audited, one row per worker. Returns ([(worker, heir)], problem or None)."""
+    state = engine.state_dir
+    if path not in ADOPT_PATHS:
+        raise ValueError("unknown adoption path %r" % (path,))
+    if not assignments:
+        return [], None
+    if state is None:
+        return [], "there is no state directory: no boss was changed"
+    if discovery is None or discovery.problems:
+        return [], "the agent list cannot be read in full: no boss was changed"
+    reassign = load_module("reassign")
+    try:
+        with reassign.locked(state):
+            records = _read_strict_records(state)
+            retired = records[RETIRED_FILE]
+            overrides, problem = reassign.read_overrides(state)
+            if problem:
+                return [], "the boss record cannot be read in full (%s): no boss was changed" % _one_line(problem, 100)
+            now = engine.now()
+            before = set(overrides)
+            reassign.prune(overrides, retired, now)
+            pruned = before - set(overrides)
+            done = []
+            fresh = engine.discover(engine.now())   # judged again under the lock, from a fresh look: the heir must still be a live agent, the worker's boss still gone
+            if fresh.problems:
+                return [], "the agent list cannot be read in full: no boss was changed"
+            kept = []
+            for obs, was, heir, why in assignments:
+                now_obs, now_heir = fresh.agents.get(obs.name), fresh.agents.get(heir)
+                if now_obs is None or now_obs.session_id != obs.session_id or now_heir is None or not _heir_ok(fresh, retired, heir, now_heir):
+                    continue
+                if path != "move" and boss_name(fresh, now_obs) is not None and boss_is_present(fresh, retired, boss_name(fresh, now_obs)) and boss_name(fresh, now_obs) != heir:
+                    continue   # its boss is back (relaunched) since the plan: nothing to fill
+                held = reassign.matching(overrides, obs.name, obs.session_id)
+                if held is not None and held["boss"] != (was or "") and held["boss"] != heir:
+                    continue   # judged again under the lock: someone gave it another boss since the plan was made (a reassign, a move): never overwritten
+                kept.append((obs, was, heir, why))
+                original = (held or {}).get("original") or (obs.fleet or {}).get("reports_to") or ""
+                overrides[obs.name] = {"boss": heir, "was": str(was or ""), "original": original, "session": obs.session_id, "by": by, "at": float(now),
+                                       "adopted": True}
+                done.append((obs.name, heir))
+            assignments = kept
+            if not kept:
+                return [], None
+            with engine._external("boss.adopt", "agents", {"path": path, "workers": [n for n, _ in done], "by": by}):
+                written = {k: v for k, v in records["boss-overrides.json"].items() if k not in pruned}   # the strict table is the base: an entry `_clean` would drop is never lost silently
+                written.update({name: overrides[name] for name, _ in done})
+                reassign.write_overrides(state, written)
+    except RecordUnreadable as err:
+        return [], "%s: no boss was changed" % _one_line(str(err), 100)
+    except (OSError, ValueError) as err:
+        return [], "the boss record could not be written (%s): no boss was changed" % _one_line(str(err), 100)
+    for obs, was, heir, why in assignments:
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "boss.adopted", "agent:%s" % obs.name, {"worker": obs.name, "was": was, "heir": heir, "why": why, "path": path, "by": by})
+        _retarget_overdue(engine, obs.name, was, heir)
+    return done, None
+
+
+def adopt_workers(engine, path, by, discovery=None, names=None, bosses=None, charter=None):
+    """Adopt every orphan (see `adoption_orphans`) by its heir. A worker with no heir changes nothing and is audited once. ([(worker, heir)], problem or None)."""
+    state = engine.state_dir
+    if state is None:
+        return [], None
+    try:
+        discovery = discovery if discovery is not None else engine.discover(engine.now())
+        if discovery.problems:
+            return [], "the agent list cannot be read in full: nothing was adopted"
+        retired = _read_strict_records(state)[RETIRED_FILE]
+    except RecordUnreadable as err:
+        return [], "%s: nothing was adopted" % _one_line(str(err), 100)
+    plan, noted = [], engine.__dict__.setdefault("adopt_no_heir", set())
+    for obs, was, heir, why in adoption_orphans(engine, discovery, retired, names, bosses, charter):
+        if heir is None:
+            if (obs.name, obs.session_id) not in noted and engine.audit is not None:
+                noted.add((obs.name, obs.session_id))
+                engine.audit.append(engine.actor, "boss.no_heir", "agent:%s" % obs.name, {"worker": obs.name, "was": was, "path": path, "why": "no heir: no live orchestrator of its charter and no Chief of Staff"})
+            continue
+        plan.append((obs, was, heir, "boss gone: %s" % why))
+    done, problem = write_boss_records(engine, discovery, plan, path, by)
+    return done, problem
+
+
+def adoption_pass(engine, now):
+    """The daemon pass: every worker whose boss is gone is adopted. Never raises; a problem is noted once per pass."""
+    discovery = getattr(engine, "discovery", None)
+    if discovery is None or discovery.problems or engine.state_dir is None:
+        return
+    done, problem = adopt_workers(engine, "pass", ADOPT_BY_DAEMON, discovery)
+    if problem:
+        engine._note("boss.adoption_error", None, {"error": _one_line(problem, 160)})
+
+
+def repoint_workers(engine, names, heir, path, by):
+    """Point the named workers at `heir` (a live orchestrator): the split of an ask. Judged on a fresh discovery. ([(worker, heir)], problem or None)."""
+    try:
+        discovery = engine.discover(engine.now())
+        retired = _read_strict_records(engine.state_dir)[RETIRED_FILE] if engine.state_dir is not None else {}
+    except RecordUnreadable as err:
+        return [], "%s: no worker was re-pointed" % _one_line(str(err), 100)
+    target = discovery.agents.get(heir)
+    if target is None or not _heir_ok(discovery, retired, heir, target) or (target.fleet or {}).get("role") != "orchestrator":
+        return [], "%s is not a live orchestrator: no worker was re-pointed" % heir
+    plan = []
+    for name in names:
+        obs = discovery.agents.get(name)
+        if obs is None or not obs.session_id or (obs.fleet or {}).get("role") not in ADOPT_ROLES or name == heir or boss_name(discovery, obs) == heir:
+            continue
+        plan.append((obs, boss_name(discovery, obs), heir, "its ask moved to the charter of %s" % heir))
+    return write_boss_records(engine, discovery, plan, path, by)
+
+
+def adopt_before_close(engine, runner, now, name):
+    """`retire <name> --close` by the agent that WOULD be the boss: a retired worker whose boss is gone is adopted first (one worker, the same heir rule), so the
+    close is judged by the ordinary boss rule. Only for an already retired worker and only when the caller is its heir; anything else changes nothing."""
+    kind = gates_caller_kind(runner, now)
+    if kind[0] != "agent" or engine.state_dir is None:
+        return
+    try:
+        discovery = engine.discover(engine.now())
+        retired = _read_strict_records(engine.state_dir)[RETIRED_FILE]
+    except Exception:
+        return   # fails closed: nothing is adopted, so the ordinary boss rule refuses the close (and says why)
+    seen = discovery.agents.get(name)
+    if seen is None or discovery.problems or not _retired_entry_applies(retired, name, seen):
+        return
+    for obs, was, heir, why in adoption_orphans(engine, discovery, retired, names={name}):
+        if heir == kind[1]:
+            done, _ = adopt_workers(engine, "close", kind[1], discovery, names={name})
+            if done:
+                engine.__dict__.setdefault("retire_close_route", {})[name] = "boss gone, adopted by %s (%s): its boss rule applies" % (heir, why)
+
+
 def retire_close_problem(engine, runner, now, discovery, name, seen, force):
     """(pane, None) when `retire --close` may close `name`'s pane now, else (None, why not). Judged BEFORE the retirement, so a refusal changes nothing.
     Who: the operator at their own terminal (any agent), the agent's recorded boss, or the Chief of Staff for an agent that reports to it DIRECTLY;
@@ -7395,6 +7662,9 @@ def retire_close_pane(engine, runner, now, name, pane, caller, force):
     who may, which pane, its session, its status and the worktree guard. Audited whether it closes or not. (status line, ok)"""
     detail = {"pane": pane, "by": caller}
     engine.__dict__.setdefault("retire_idle_seen", {}).pop(name, None)
+    route = engine.__dict__.get("retire_close_route", {}).get(name)
+    if route:
+        detail["boss_rule"] = route   # #838: why the boss rule did not stop it: the worker was adopted by its heir first
     try:
         fresh = engine.discover(engine.now())
         again, why = retire_close_problem(engine, runner, now, fresh, name, fresh.agents.get(name), force)
@@ -7488,6 +7758,10 @@ def cmd_retire(args, runner, now):
     if getattr(args, "close", False) and not args.undo and seen is not None and seen.headless:
         close_note = "headless: it has no terminal, so there is nothing to close"
     elif getattr(args, "close", False) and not args.undo:
+        if seen is not None:
+            adopt_before_close(engine, runner, now, name)   # #838: a retired worker with no live boss is adopted by its heir first, so the ordinary boss rule judges the close
+            discovery = engine.discover(engine.now())
+            seen = discovery.agents.get(name)
         close_pane, why = retire_close_problem(engine, runner, now, discovery, name, seen, getattr(args, "force", False))
         close_by = identify_who(engine, runner, now)
         if why:
@@ -7561,6 +7835,12 @@ def cmd_retire(args, runner, now):
         print("%s is retired: not watched, not reattached by --all-detached; %s (`%s retire --undo %s` reverses the retirement)" % (name, line, PROG, name))
     else:
         print("%s is retired: not watched, not reattached by --all-detached; nothing was deleted or closed (`%s retire --undo %s` reverses)" % (name, PROG, name))
+    if seen is not None and (seen.fleet or {}).get("role") == "orchestrator":
+        adopted, problem = adopt_workers(engine, "retire", identify_who(engine, runner, now), bosses={name})   # #838: its workers are inherited in the same step
+        for worker, heir in adopted:
+            print("adopted: %s now reports to %s" % (worker, heir))
+        if problem:
+            sys.stderr.write("%s: %s is retired, but its workers were not re-pointed (%s): the next daemon pass retries\n" % (PROG, name, _one_line(problem, 160)))
     try:
         for line in reclaim_for_agent(engine, runner, name, True, "retired"):   # its registered worktrees: removed when clean and pushed, else kept with the reason
             print("worktree: " + line)
@@ -8076,6 +8356,187 @@ def cmd_disk_reap_orphans(args, runner, now):
 def identify_who(engine, runner, now):
     kind = gates_caller_kind(runner, now)
     return "the operator" if kind[0] == "person" else str(kind[1])
+
+
+BARE_SHELLS = ("sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh")   # foreground processes of a pane that holds only a shell
+BARE_PANES_FILE = "bare-panes.json"   # {pane: {"revision", "since"}}: when herdr's revision of a pane was first seen as it is now (a pane that shows nothing new is idle)
+BARE_IDLE_DEFAULT_MINUTES = 10
+
+
+def _within_any(path, roots):
+    try:
+        real = os.path.realpath(path)
+    except (OSError, ValueError, TypeError):
+        return False
+    return any(real == r or real.startswith(r.rstrip("/") + "/") for r in roots)
+
+
+def bare_pane_guards():
+    """THE table of the guards `close-pane` applies, in order: (id, function(ctx) -> why not or None). The command loops over it and the tests are parametrised over it."""
+    return BARE_PANE_GUARDS
+
+
+def _guard_own_pane(ctx):
+    return "pane %s is the one you are in: never closed by you" % ctx["pane"] if os.environ.get("HERDR_PANE_ID") == ctx["pane"] else None
+
+
+def _guard_listed(ctx):
+    return None if ctx["entry"] is not None else "pane %s is not listed by herdr: nothing to close" % ctx["pane"]
+
+
+def _guard_unnamed(ctx):
+    pane = ctx["pane"]
+    if ctx["held"] or any(o.pane == pane for o in ctx["discovery"].agents.values()) \
+            or any(isinstance(v, dict) and v.get("pane") == pane for v in ctx["health"]["agents"].values()):
+        return "pane %s is named by an agent record: use `%s retire <name> --close` for its worker" % (pane, PROG)
+    return None
+
+
+def _guard_bare_shell(ctx):
+    names = [str(p.get("name") or "").lstrip("-") for p in ctx["processes"]]
+    if not names or any(n not in BARE_SHELLS for n in names):   # default deny: a pane that reports NO foreground process is not known to be a shell
+        return "pane %s has a foreground job (%s), not a bare shell: nothing was closed" % (ctx["pane"], _one_line(", ".join(n or "?" for n in names), 60))
+    return None
+
+
+def _guard_worktree(ctx):
+    entry = ctx["entry"] or {}
+    cwds = [c for c in (entry.get("cwd"), entry.get("foreground_cwd")) if isinstance(c, str) and c]
+    if not cwds or not all(_within_any(c, ctx["worktrees"]) for c in cwds):
+        return "pane %s is not inside a fleet worktree (%s): never an owner's own shell" % (ctx["pane"], _one_line(", ".join(cwds) or "no cwd", 80))
+    return None
+
+
+def _guard_idle(ctx):
+    seen, entry = ctx["seen"], ctx["entry"] or {}
+    if seen is None or seen.get("revision") != entry.get("revision") or entry.get("revision") is None \
+            or ctx["now"] - seen.get("since", ctx["now"]) < ctx["window"] * 60:
+        return "pane %s has not been seen idle for %d minutes (its revision is noted%s; run it again after that long without activity): nothing was closed" % (
+            ctx["pane"], ctx["window"], "" if not ctx.get("note_error") else ", BUT NOT WRITTEN: " + ctx["note_error"])
+    return None
+
+
+BARE_PANE_GUARDS = (("own-pane", _guard_own_pane), ("listed", _guard_listed), ("unnamed", _guard_unnamed), ("bare-shell", _guard_bare_shell),
+                    ("worktree", _guard_worktree), ("idle", _guard_idle))
+
+
+def bare_pane_context(engine, discovery, pane, now):
+    """What the guards read, from fresh reads. HerdrError for a read that fails (the command refuses: unreadable means no close)."""
+    entry = next((p for p in engine.herdr.pane_list() if isinstance(p, dict) and p.get("pane_id") == pane), None)
+    held = [a for a in engine.herdr.agent_list() if isinstance(a, dict) and a.get("pane_id") == pane]
+    processes = engine.herdr.pane_process_info(pane) if entry is not None else []
+    health = read_pane_health_strict_agents(engine.state_dir)
+    worktrees = {os.path.realpath(p) for p in read_worktrees(engine.state_dir)}   # the REGISTERED worktrees only: an agent's own cwd is often the repo root the owner works in too
+    window = engine.config.get("retire_idle_minutes")
+    window = window if retire_idle_window_ok(window) else BARE_IDLE_DEFAULT_MINUTES
+    return {"pane": pane, "entry": entry, "held": held, "processes": processes, "discovery": discovery, "health": health, "worktrees": worktrees,
+            "window": window, "now": now, "seen": (_read_small(engine.state_dir, BARE_PANES_FILE).get(pane) or None)}
+
+
+def read_pane_health_strict_agents(state_dir):
+    """pane-health.json for the close-pane guards: unreadable or damaged raises HerdrError (refuse), a missing file is no agents."""
+    try:
+        with open(str(Path(state_dir) / PANE_HEALTH_FILE), "rb") as handle:
+            raw = handle.read(1000001)
+    except FileNotFoundError:
+        return {"agents": {}}
+    except OSError as err:
+        raise HerdrError("unreadable", "%s cannot be read: %s" % (PANE_HEALTH_FILE, getattr(err, "strerror", None) or type(err).__name__)) from None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        raise HerdrError("unreadable", "%s is not valid JSON" % PANE_HEALTH_FILE) from None
+    if not isinstance(data, dict) or not isinstance(data.get("agents"), dict) or not all(isinstance(v, dict) for v in data["agents"].values()):
+        raise HerdrError("unreadable", "%s is not a pane-health record" % PANE_HEALTH_FILE)
+    return data
+
+
+def bare_pane_problem(engine, discovery, pane, now):
+    """None when every guard of the table passes, else the first why not. Reads, except that the idle guard first notes the pane's revision in `bare-panes.json`
+    (`note_bare_pane`); when that cannot be written the refusal says so."""
+    try:
+        ctx = bare_pane_context(engine, discovery, pane, now)
+    except (HerdrError, OSError, ValueError) as err:
+        return "pane %s cannot be read now (%s): nothing was closed" % (pane, _one_line(str(err), 100))
+    for guard_id, guard in bare_pane_guards():
+        if guard_id == "idle":   # only a pane that passed every other guard is remembered: a pane's idle time is how long herdr's revision of it stayed the same
+            ctx["note_error"] = note_bare_pane(engine, pane)
+            ctx["seen"] = _read_small(engine.state_dir, BARE_PANES_FILE).get(pane) or None
+        why = guard(ctx)
+        if why:
+            return why
+    return None
+
+
+def note_bare_pane(engine, pane):
+    """Remember the revision a pane shows and since when (kept while it does not change). None when noted, else a short reason it was not (the pane then
+    stays 'not yet seen idle': the close is never made on a note that was not written)."""
+    try:
+        entry = next((p for p in engine.herdr.pane_list() if isinstance(p, dict) and p.get("pane_id") == pane), None)
+        if entry is None or entry.get("revision") is None:
+            return "herdr gives no revision for it"
+        with agent_lock(engine.state_dir, "files"):
+            data = _read_small(engine.state_dir, BARE_PANES_FILE)
+            data = {k: v for k, v in data.items() if k == pane or k in {p.get("pane_id") for p in engine.herdr.pane_list() if isinstance(p, dict)}}
+            if (data.get(pane) or {}).get("revision") != entry["revision"]:
+                data[pane] = {"revision": entry["revision"], "since": int(engine.now())}
+            _write_small(engine.state_dir, BARE_PANES_FILE, data)
+        return None
+    except Exception as err:
+        return _one_line(str(err), 80)
+
+
+def cmd_close_pane(args, runner, now):
+    """`close-pane <pane-id>`: close a pane no record names (a bare shell). The Chief of Staff alone (its ROLE, from the fleet identity). The pane is judged
+    again from a fresh read just before the close. Audited whether it closes or not."""
+    engine, state, _ = build_engine(runner, now, "cli")
+    pane = args.pane
+    if not re.match(r"^[A-Za-z0-9:._-]{1,40}$", pane or ""):
+        raise LaunchError("name the pane: `%s close-pane <pane-id>`" % PROG)
+    kind = gates_caller_kind(runner, now)
+    who = "the operator" if kind[0] == "person" else str(kind[1])
+    if kind[0] != "agent" or len(kind) < 3 or kind[2] != "chief-of-staff":
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "fleetpane.close_refused", "pane:%s" % pane, {"pane": pane, "by": who, "cwd": None, "why": "only the Chief of Staff closes a pane no record names"})
+        raise LaunchError("refused: only the Chief of Staff may close a pane no record names (%s)" % who)
+    cwd = None
+    try:
+        cwd = next((p.get("cwd") for p in engine.herdr.pane_list() if isinstance(p, dict) and p.get("pane_id") == pane), None)
+    except Exception:
+        pass
+    discovery = engine.discover(engine.now())
+    problem = "the agent list cannot be read in full: nothing was closed" if discovery.problems else bare_pane_problem(engine, discovery, pane, engine.now())
+    try:
+        if problem is None:
+            # The point of effect: under one lock (two close-panes cannot both act), the caller's role and EVERY guard are read again, then the close. Only
+            # the instant between that last look and herdr's close remains (herdr has no close-if-unchanged), as for `retire --close`.
+            with agent_lock(state, "close-pane"):
+                again = gates_caller_kind(runner, now)
+                if again[0] != "agent" or len(again) < 3 or again[2] != "chief-of-staff":
+                    problem = "the caller is no longer established as the Chief of Staff"
+                else:
+                    fresh = engine.discover(engine.now())
+                    problem = "the agent list cannot be read in full: nothing was closed" if fresh.problems else bare_pane_problem(engine, fresh, pane, engine.now())
+                if problem is None:
+                    with engine._external("herdr.pane.close", "pane:%s" % pane, {"pane": pane, "why": "close-pane"}):
+                        engine.herdr.pane_close(pane)
+    except Exception as err:
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "fleetpane.close_failed", "pane:%s" % pane, {"pane": pane, "by": who, "cwd": cwd, "why": _one_line(str(err), 120)})
+        raise LaunchError("pane %s was not closed (%s)" % (pane, _one_line(str(err), 100))) from None
+    if problem is not None:
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "fleetpane.close_refused", "pane:%s" % pane, {"pane": pane, "by": who, "cwd": cwd, "why": _one_line(problem, 160)})
+        raise LaunchError("refused: %s" % problem)
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "fleetpane.closed", "pane:%s" % pane, {"pane": pane, "by": who, "cwd": cwd, "why": "no record names this pane (a bare shell in a fleet worktree, idle)"})
+    print("closed pane %s (a bare shell no record names: its memory is released)" % pane)
+    return EXIT_OK
+
+
+def add_close_pane_parsers(sub):
+    close = sub.add_parser("close-pane", help="Close a pane no record names (a bare shell, no agent): the Chief of Staff only; judged again just before the close")
+    close.add_argument("pane", help="The herdr pane id")
 
 
 def add_retire_parsers(sub):
@@ -11809,6 +12270,10 @@ def publish_decisions(engine):
         pane_health_pass(engine, now)   # the control plane: detached or dead panes, reads only, wakes the Chief of Staff
     except Exception as err:
         engine._note("fleetpane.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
+        adoption_pass(engine, now)   # #838: a worker whose boss is gone is adopted by its charter's orchestrator, else the Chief of Staff
+    except Exception as err:
+        engine._note("boss.adoption_error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     chat_clear_pass(engine, decisions, now)   # #457: the owner clears a held PR in his chat; SHADOW unless chat_clear.live; never raises
     try:
         impact_would_hold_pass(engine, now)   # #179 L3: audits gate.would_hold from the diff's floor; ADVISORY, writes nothing to GitHub
@@ -17798,6 +18263,19 @@ def cmd_launch(args, runner, now, socket_call=None):
     print(json.dumps(done, sort_keys=True))
     if done.get("identity"):
         sys.stderr.write("%s: %s\n" % (PROG, done["identity"]))
+    if args.role == "orchestrator":   # #838: a relaunched or replacement orchestrator inherits the workers its predecessor left, in the same step
+        launched_charter = int(re.search(r"(\d+)\s*$", str(args.charter)).group(1)) if args.charter and re.search(r"(\d+)\s*$", str(args.charter)) else None
+        for path, bosses in (("relaunch", {args.name}), ("replace", None)):
+            if path == "replace" and launched_charter is None:
+                continue   # a replacement is of a charter's orchestrator: with no charter named there is nothing to inherit
+            try:
+                adopted, problem = adopt_workers(engine, path, identify_who(engine, runner, now), bosses=bosses, charter=launched_charter if path == "replace" else None)
+            except Exception as err:
+                adopted, problem = [], "%s: %s" % (type(err).__name__, err)
+            for worker, heir in adopted:
+                print("adopted: %s now reports to %s" % (worker, heir))
+            if problem:
+                sys.stderr.write("%s: %s launched, but its workers were not re-pointed (%s): the next daemon pass retries\n" % (PROG, args.name, _one_line(problem, 160)))
     register_item_tester(engine, state, args, repo, launched_by, done, now)   # #770: a tester launched for a work item with no pull request is registered for that item only
     boss = args.reports_to
     if boss is None and (brief or getattr(args, "checkpoint", None) or getattr(args, "overdue", None)):
@@ -27825,7 +28303,7 @@ def load_tick(engine, discovery):
         entry = retired.get(name)
         if isinstance(entry, dict) and entry.get("session") in (None, getattr(seen, "session_id", None)):
             continue   # on the retired list (the same name and session rule as coder_finished): no load figures and no health row
-        coders = [o for o in discovery.agents.values() if (o.fleet or {}).get("reports_to") == name and (o.fleet or {}).get("role") == "coder"
+        coders = [o for o in discovery.agents.values() if boss_name(discovery, o) == name and (o.fleet or {}).get("role") == "coder"
                   and not coder_finished(o, retired, last_reports)]   # a retired coder, or one that made its final report, is on the books but not a coder of this workspace
         orchestrators[name] = {"charter": fleet.get("charter") if _is_issue_number(fleet.get("charter")) else None,   # a fallback: the charter is found by the yaml that names the agent
                                "repo": _fleet_repo(fleet, engine.config) or (engine.intents.repo if engine.intents is not None else None),
