@@ -8802,7 +8802,7 @@ class TestAgentRegistryInventory(unittest.TestCase):
     interface spec has its sections and its freeze line."""
     DOC = REPO / "docs" / "agent-registry.md"
     RECORDS = {
-        "pane-health.json": r"pane-health\.json|PANE_HEALTH_FILE|read_pane_health|write_pane_health|PANE_FILE",
+        "pane-health.json": r"pane-health\.json|PANE_HEALTH_FILE|PANE_FILE|read_pane_health|write_pane_health|pane_health_pass|pane_health_status",
         "retired.json": r"retired\.json|RETIRED_FILE|read_retired|known_agent",
         "last-reports.json": r"last-reports\.json|LAST_REPORT_FILE|record_last_report",
         "boss-overrides.json": r"boss-overrides\.json|\.overlay\(",
@@ -8813,25 +8813,37 @@ class TestAgentRegistryInventory(unittest.TestCase):
         "load.json": r"load\.json|LOAD_FILE",
         "decisions.json": r"decisions\.json|DECISIONS_FILE",
         "cloud-records": r"CLOUD_DIR|cloud_dir",
+        "heartbeat-agent-list": r"tabs_with_agents",
         "headless-records": r"headless-service\.json|headless-route\.json|HEADLESS_SERVICE_FILE|HEADLESS_ROUTE_FILE|headless/",
     }
     SECTIONS = ("### 1. Read API", "### 2. Write API", "### 3. The file", "### 4. The lock", "### 5. The atomic write", "### 6. The version rule")
 
     @staticmethod
-    def sources():
-        found = [BIN / "fleet-switchboard"] + sorted(BIN.glob("*.py"))
-        for pattern in ("*.mjs", "*.tsx", "*.js"):
-            found += sorted((REPO / "plugins").glob("*/" + pattern))
-        return [f for f in found if "test" not in f.name and "node_modules" not in f.parts]
+    def sources(root=None):
+        """Every tracked non-test source under bin/, plugins/ and cloud/ (from git, not globs): scripts with no extension, nested plugin files and the launcher included."""
+        root = Path(root or REPO)
+        listed = subprocess.run(["git", "ls-files", "bin", "plugins", "cloud"], cwd=str(root), capture_output=True, text=True, check=True).stdout.split("\n")
+        found = []
+        for name in listed:
+            path = root / name
+            parts = path.relative_to(root).parts
+            if not name or not path.is_file() or path.is_symlink() or "node_modules" in parts or "tests" in parts:
+                continue
+            base = path.name
+            if base.startswith("test-") or ".test." in base or base == "test-switchboard":
+                continue
+            if path.suffix in (".py", ".mjs", ".js", ".ts", ".tsx", ".sh") or (not path.suffix and path.read_bytes()[:2] == b"#!"):
+                found.append(path)
+        return found
 
     @classmethod
-    def in_code(cls):
+    def in_code(cls, root=None):
         pairs = set()
-        for path in cls.sources():
+        for path in cls.sources(root):
             text = path.read_text(errors="replace")
             for record, regex in cls.RECORDS.items():
                 if re.search(regex, text):
-                    pairs.add((str(path.relative_to(REPO)), record))
+                    pairs.add((str(path.relative_to(root or REPO)), record))
         return pairs
 
     @classmethod
@@ -8855,6 +8867,28 @@ class TestAgentRegistryInventory(unittest.TestCase):
         self.assertGreaterEqual(len(in_code), 25)   # the scan itself is alive
         missing = sorted(in_code - self.in_table(self.DOC.read_text()))
         self.assertEqual(missing, [], "readers or writers missing from docs/agent-registry.md")
+
+    def test_the_scan_sees_every_kind_of_source_and_a_new_reader_in_each_is_found(self):
+        """Blind spots closed as a class: an extensionless script, a nested plugin file and the cloud launcher each, with a mutant reader."""
+        root = Path(tempfile.mkdtemp(prefix="registry-scan-"))
+        self.addCleanup(shutil.rmtree, str(root), True)
+        subprocess.run(["git", "init", "-q"], cwd=str(root), check=True)
+        wanted = {"bin/fleet-x": "#!/usr/bin/env python3\nopen('pane-health.json')\n", "plugins/p/src/deep/x.mjs": "const f = 'retired.json'\n",
+                  "cloud/launcher/x.py": "F = 'last-reports.json'\n", "bin/test-x": "'pane-health.json'\n"}
+        for name, body in wanted.items():
+            (root / name).parent.mkdir(parents=True, exist_ok=True)
+            (root / name).write_text(body)
+        subprocess.run(["git", "add", "-A"], cwd=str(root), check=True)
+        self.assertEqual(self.in_code(root), {("bin/fleet-x", "pane-health.json"), ("plugins/p/src/deep/x.mjs", "retired.json"), ("cloud/launcher/x.py", "last-reports.json")})
+
+    def test_no_file_names_pane_health_outside_the_table(self):
+        """The bare string `pane-health` in any scanned source is a row; a reader that builds the path from parts or lists the state directory
+        is NOT found by a scan of text (the limit, stated in docs/agent-registry.md: slice 3's runtime test covers it)."""
+        table = self.in_table(self.DOC.read_text())
+        for path in self.sources():
+            if re.search(r"pane-health", path.read_text(errors="replace")):
+                with self.subTest(path=str(path.relative_to(REPO))):
+                    self.assertIn((str(path.relative_to(REPO)), "pane-health.json"), table)
 
     def test_every_cited_file_exists(self):
         for path, record in self.in_table(self.DOC.read_text()):

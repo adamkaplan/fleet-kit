@@ -32,7 +32,7 @@ rebuilt from another record.
 | `bin/lanes.py:55` | `discovery.agents` | looks up lanes by agent | nobody | lane resolution | derived (reader) |
 | `bin/queue_ejections.py:365` | `discovery.agents` | routes an ejection to an owner | nobody | `route_of` | derived (reader) |
 | `bin/reassign.py:164` | `discovery.agents` | finds the worker to reassign | nobody | `reassign` | derived (reader) |
-| `bin/fleet-switchboard:138` | `health-records.json` | per agent tool calls, tokens, context, pushes (derived figures) | the daemon via `health_records.Recorder` and `state_write` | the sidebar plugin, `fleet-doctor` | derived |
+| `bin/fleet-switchboard:138` | `health-records.json` | per agent tool calls, tokens, context, pushes (derived figures) | the daemon via `health_records.Recorder` and `state_write` | the sidebar plugin | derived |
 | `bin/health_records.py:5` | `health-records.json` | defines the file and its shape | `Recorder` (called by the daemon) | the sidebar plugin | derived |
 | `plugins/fleet-decisions-tui/health.mjs:3` | `health-records.json` | reads it for the sidebar's health block | nobody (reader only) | sidebar health view | derived (reader) |
 | `bin/health_records.py:30` | `tool-rate.json` | per session tool calls per minute | plugins/fleet-hooks (`TALLY_FILE`) | `health_records.read_tool_file` | derived |
@@ -47,9 +47,14 @@ rebuilt from another record.
 | `plugins/fleet-decisions-tui/tui.tsx:2` | `decisions.json` | the TUI section renders it through decisions.mjs | nobody (reader only) | sidebar | derived (reader) |
 | `plugins/fleet-decisions-tui/health.mjs:3` | `pane-health.json` | reads which agents sit in which workspace and their state | nobody (reader only) | sidebar health view (the sidebar's own read of the agent list, from its own installed copy of the plugin: a view) | derived (reader) |
 | `bin/cloud_worker.py:101` | `cloud-records` | one record per cloud worker in `state/cloud/<name>.json`: run id, pod, repo, branch | `cloud_worker.cmd_launch`, the cloud reaper and `cmd_retire` (stop) | `route`, the cloud log read (`cmd_read`), `status` | primary for cloud workers; slice 2 mirrors them into the registry |
+| `bin/fleet-heartbeat:506` | `heartbeat-agent-list` | `Herdr.tabs_with_agents`: the supervised panes from `herdr agent list`; per-pane health in its own `state.json` and `fleet-heartbeat status --json` | `fleet-heartbeat` (its own state file) | `fleet-heartbeat status`, `fleet-doctor` through that output | derived (a live-pane observer; whether it is a view is open, see the note below) |
+| `bin/fleet-heartbeat:825` | `discovery.agents` | the heartbeat's own `Herdr.discover()` of panes (not the switchboard's discovery), for its per-pane health | `fleet-heartbeat` (its own state file) | `fleet-heartbeat` | derived (a live-pane observer) |
+| `bin/switchboard-trial:483` | `decisions.json` | comment and environment only: the trial lab gives the sidebar plugin the daemon's state directory | nobody | nobody (the plugin reads it) | derived |
 | `bin/fleet-switchboard:4400` | `headless-records` | launch records `state/headless/<name>.json` and `headless-service.json` (boss per worker) and `headless-route.json` | `launch` (headless), the restart notice | discovery of headless workers, the restart notice, route checks | primary for headless workers |
 | `bin/agent_presence.py:25` | `headless-records` | scans `state/headless/*.json` | nobody (reader only) | presence checks | primary (reader) |
 | `plugins/fleet-hooks/index.js:407` | `headless-records` | reads the launch record to tell a headless worker | nobody (reader only) | the fleet-hooks plugin | primary (reader) |
+
+Limit of the scan: it matches the record names and the functions that read them in the text of every tracked source under `bin/`, `plugins/` and `cloud/`. A path built from parts, a listing of the state directory or a name held in a variable is not found; the scan can only fail on a name written out. Slice 3's runtime test covers the rest.
 
 Not an agent list, so not rows: the cloud log read keeps no list of its own (it reads `pane-health.json` and `retired.json` for one
 session, above); sweeps and the hooks plugin appear above only where they read or write one of these records.
