@@ -32518,6 +32518,11 @@ class TestAgentBlockCounts(TestBlockTable):
         self.assertEqual(judge([counted, flags_low])["reasons"], [])   # a lower or equal uncounted rating is ignored
         self.assertEqual(judge([counted, dict(flags_high, impact_probability=None)])["reasons"], [])   # a record with no readable score is ignored
 
+    def test_the_rater_honesty_sentence_is_in_the_definition_and_in_the_docs(self):
+        sentence = "Never adjust a rating to fit the floor: a rating below the floor is reported as it is and goes to the owner."
+        for path in ("agents/reviewers/reviewer-impact.md", "docs/switchboard.md"):
+            self.assertEqual((REPO / path).read_text().count(sentence), 1, path)
+
     def test_the_limit_is_said_in_the_docs_and_the_definition(self):
         for path in ("docs/switchboard.md", "agents/reviewers/reviewer-impact.md"):
             text = (REPO / path).read_text()

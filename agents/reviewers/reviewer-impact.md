@@ -90,6 +90,8 @@ Read EVERY hunk of the diff (in chunks if it is long). If you could not read all
 
 In a repository with no review laws you cannot read the kit's matrix file. Run `fleet-switchboard impact matrix --for-rater <pr>` (read-only): it prints the matrix's severities, probabilities and cells, the floor rule ids, and which floor rule ids the pull request's changed paths hit. Name every hit rule id in `impact-reason:`.
 
+Never adjust a rating to fit the floor: a rating below the floor is reported as it is and goes to the owner.
+
 ## Verdict block
 
 ```
