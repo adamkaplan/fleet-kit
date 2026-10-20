@@ -73148,16 +73148,16 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
         "cmd_reattach_all": "test_reattach_all_detached_acts_on_the_registrys_list_and_nothing_on_a_half_read",
         "worktree_session_in_use": "test_a_worktree_that_is_the_session_directory_of_a_non_retired_agent_is_kept_though_its_pane_sits_elsewhere",
         "cmd_disk_reclaim_worktrees": "test_the_sweep_is_a_dry_run_by_default_only_considers_retired_agents_and_apply_is_the_operators_or_cos",
-        "watch_problem": "test_watch_refuses_a_worker_with_a_terminal_an_unknown_name_and_a_retired_worker_and_opens_nothing",
+        "watch_problem": "test_known_session_and_watch_follow_the_registrys_retired_record",
         "cmd_watch": "test_watch_refuses_a_worker_with_a_terminal_an_unknown_name_and_a_retired_worker_and_opens_nothing",
         "WorkerFacts.seam_facts": "test_a_retired_worker_gets_nothing_and_another_name_does_not_silence_it",
         "WorkerFacts.stalled_facts": "test_a_retired_worker_gets_none",
         "triage_stop": "test_a_retired_worker_is_not_nudged_nor_reported_as_stopped_and_the_model_is_not_asked",
         "testers_status": "test_a_corrupt_or_unreadable_retired_file_disables_every_launched_tester_and_says_so",
         "launched_testers_for": "test_a_retired_tester_stops_counting_and_is_not_listed",
-        "item_agents": "test_item_agents_raises_when_discovery_or_the_retired_list_fails",
-        "known_session": "test_s8_a_pruned_retired_agent_is_still_found_by_the_retire_undo_reattach_and_the_boss_lookup",
-        "cmd_retire": "test_s8_a_pruned_retired_agent_is_still_found_by_the_retire_undo_reattach_and_the_boss_lookup",
+        "item_agents": "test_item_agents_fails_closed_on_a_half_read_registry",
+        "known_session": "test_known_session_and_watch_follow_the_registrys_retired_record",
+        "cmd_retire": "test_retire_frees_the_name_of_a_headless_worker_and_undo_restores_the_record_unless_the_name_was_taken",
     }
 
     def registry_callers(self):
@@ -73216,6 +73216,23 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
         with mock.patch.object(sb, "cmd_reattach", side_effect=lambda one, *a, **k: acted.append(one.name) or sb.EXIT_OK):
             code = sb.cmd_reattach_all(types.SimpleNamespace(workspace=None), subprocess.run, self.world.clock.now, None)
         self.assertEqual((code, acted), (sb.EXIT_ERROR, []))
+
+    def test_known_session_and_watch_follow_the_registrys_retired_record(self):
+        state = str(self.world.state)
+        reg = self.registry()
+        reg.upsert(state, "k-1", {"session": "ses_k1", "pane": "p1"})
+        reg.retire(state, "k-1", "x", "finished", session="ses_k1")
+        self.assertEqual(sb.known_session(state, "k-1", None), "ses_k1", "a retired agent's session is found in the registry")
+        engine = types.SimpleNamespace()
+        self.assertIn("is retired", sb.watch_problem(engine, state, "k-1", types.SimpleNamespace(agents={})))
+        reg.unretire(state, "k-1")
+        self.assertNotIn("is retired", sb.watch_problem(engine, state, "k-1", types.SimpleNamespace(agents={})) or "")
+
+    def test_item_agents_fails_closed_on_a_half_read_registry(self):
+        (self.world.state / "registry.json").write_text("{not json")
+        ctx = types.SimpleNamespace(engine=types.SimpleNamespace(now=lambda: 1, state_dir=str(self.world.state), discover=lambda now: types.SimpleNamespace(agents={})), repo="acme/api", config={})
+        with self.assertRaises(sb.ItemAgentsUnreadable):
+            sb.item_agents(ctx)
 
     def test_a_live_read_of_herdr_agents_is_a_named_exception_with_its_reason(self):
         found = set()
