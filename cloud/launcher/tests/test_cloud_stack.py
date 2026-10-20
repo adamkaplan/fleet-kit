@@ -275,6 +275,103 @@ class FreshNodeRace(Base):
         self.stack("--stack")
         self.assertEqual(self.pod()["spec"]["runtimeClassName"], "sysbox-runc")
 
+    # -- the pod that vanishes while pending (S11 and the table of watch outcomes) --
+    def pod_creates(self):
+        return [o for o in self.st()["applied"] if o["kind"] == "Pod"]
+
+    def reasons(self):
+        return [l["reason"] for l in self.attempts()]
+
+    def test_s11_the_message_then_the_pod_vanishes_then_success(self):   # kills: recreate only on the event message
+        self.patch_state(plan=["race_vanish", "ok"])
+        self.stack("--stack")
+        pods = self.pod_creates()
+        self.assertEqual(len(pods), 2)
+        self.assertEqual([p["metadata"]["annotations"]["cw/run-id"] for p in pods], [self.RUN_ID] * 2)
+        self.assertEqual(self.secrets_made(), [cw.pod_name("coder7") + "-pw"])   # one secret create
+        self.assertEqual(len(self.attempts()), 2)
+        self.assertIsNotNone(self.pod())
+
+    def test_vanish_with_no_message_then_success(self):   # kills: the vanish branch removed
+        self.patch_state(plan=["vanish", "ok"])
+        self.stack("--stack")
+        self.assertEqual(len(self.pod_creates()), 2)
+        self.assertIn("pod vanished", self.reasons()[0]); self.assertFalse(self.attempts()[0]["ok"])
+        self.assertTrue(self.attempts()[1]["ok"])
+        self.assertEqual(self.secrets_made(), [cw.pod_name("coder7") + "-pw"])
+
+    def test_message_then_vanish_then_success_across_pods(self):
+        self.patch_state(plan=["race", "vanish", "ok"])
+        self.stack("--stack")
+        self.assertEqual(len(self.pod_creates()), 3)
+        self.assertIn("handler", self.reasons()[0]); self.assertIn("pod vanished", self.reasons()[1])
+        self.assertEqual(self.secrets_made(), [cw.pod_name("coder7") + "-pw"])
+
+    def test_vanish_twice_then_success(self):
+        self.patch_state(plan=["vanish", "vanish", "ok"])
+        self.stack("--stack")
+        self.assertEqual(len(self.pod_creates()), 3)
+        self.assertEqual(len(self.attempts()), 3)
+        self.assertEqual([("attempt %d of 3" % i) in r for i, r in enumerate(self.reasons(), 1)], [True] * 3)
+        self.assertEqual(self.secrets_made(), [cw.pod_name("coder7") + "-pw"])   # kills: secrets recreated per attempt
+
+    def test_vanish_three_times_fails_names_it_and_leaves_nothing(self):   # kills: the attempt cap ignored
+        self.patch_state(plan=["vanish"] * 5)
+        out, err = self.stack("--stack", code=cw.EXIT_CLOUD)
+        self.assertIn("vanished", err)
+        self.assertEqual(len(self.pod_creates()), 3)
+        self.assertEqual(len(self.attempts()), 3)
+        self.assertIn("giving up", self.reasons()[2])
+        self.assertEqual(self.secrets_made(), [cw.pod_name("coder7") + "-pw"])   # made once
+        self.assertEqual(self.st()["pods"], {}); self.assertEqual(self.st()["secrets"], {})
+        self.assertFalse(self.audit_lines()[-1]["ok"])
+
+    def test_vanish_respects_the_window(self):   # kills: the deadline ignored on the vanish branch
+        self.patch_state(plan=["vanish"] * 3)
+        old, cw.STACK_RACE_WINDOW_SECONDS = cw.STACK_RACE_WINDOW_SECONDS, 0
+        try:
+            out, err = self.stack("--stack", code=cw.EXIT_CLOUD)
+        finally:
+            cw.STACK_RACE_WINDOW_SECONDS = old
+        self.assertIn("vanished", err)
+        self.assertEqual(len(self.pod_creates()), 1)
+
+    def test_a_pod_that_never_existed_is_not_retried(self):
+        self.patch_state(hide_pod=True)
+        out, err = self.stack("--stack", "--wait", "10", code=cw.EXIT_TIMEOUT)
+        self.assertEqual(len(self.pod_creates()), 1)
+        self.assertEqual(len(self.attempts()), 1)
+        self.assertNotIn("vanished", self.reasons()[0])
+
+    def test_the_run_secret_is_made_once_when_the_pod_vanishes(self):
+        r, w = os.pipe(); os.write(w, b"x" * 12); os.close(w)
+        self.patch_state(plan=["vanish", "ok"])
+        try:
+            self.stack("--stack", "--run-secret-fd", "tok=%d" % r)
+        finally:
+            os.close(r)
+        self.assertEqual(len([c for c in self.calls("generic") if c[c.index("generic") - 1] == "secret"]), 1)
+
+    def test_a_failed_phase_is_not_retried(self):
+        self.patch_state(other_failure="failed to pull image: not found")
+        self.stack("--stack", "--wait", "10", code=cw.EXIT_TIMEOUT)
+        self.assertEqual(len(self.pod_creates()), 1)
+        self.assertNotIn("vanished", self.reasons()[0])
+
+    def test_every_outcome_of_the_watch_loop_has_a_test(self):   # completeness: the table of outcomes the loop can end in
+        outcomes = {"ready", "race", "vanish", "never_seen", "other_failure", "cap", "window"}
+        tested = {"ready": "test_the_message_once_then_success", "race": "test_the_message_three_times_fails_and_leaves_nothing",
+                  "vanish": "test_vanish_twice_then_success", "never_seen": "test_a_pod_that_never_existed_is_not_retried",
+                  "other_failure": "test_a_different_failure_is_not_retried", "cap": "test_vanish_three_times_fails_names_it_and_leaves_nothing",
+                  "window": "test_vanish_respects_the_window"}
+        self.assertEqual(set(tested), outcomes)
+        for name in tested.values():
+            self.assertTrue(hasattr(self, name), name)
+
+    def test_the_default_create_never_watches_a_vanish(self):
+        self.stack()
+        self.assertEqual(self.calls("events"), [])
+
 
 def _with_caps(stack, caps, where="containers"):
     pod = build(_args(stack=stack))

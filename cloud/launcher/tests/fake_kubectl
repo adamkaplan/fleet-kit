@@ -69,14 +69,21 @@ if cmd == "apply" or (cmd == "create" and args[1:2] == ["-f"]):   # `create -f` 
     else:
         st["uid_counter"] = st.get("uid_counter", 0) + 1
         obj["metadata"]["uid"] = "uid-%d" % st["uid_counter"]
+        plan = st.get("plan", [])   # per-create outcomes: "race" (event), "vanish" (Pending, gone at its second get), "race_vanish" (both), else ok
+        step = plan.pop(0) if plan else None
+        st["plan"] = plan
+        if step in ("vanish", "race_vanish"):
+            obj["vanish_after_get"] = True
         event = None   # a sandbox failure the cluster records for THIS pod object (events outlive a deleted pod, as on a real cluster)
-        if st.get("race_creates", 0) > 0:   # the next N pod creates hit the fresh-node race
+        if step in ("race", "race_vanish"):
+            event = "RuntimeClass handler sysbox-runc does not support user namespaces: the handler sysbox-runc is not known"
+        elif st.get("race_creates", 0) > 0:   # the next N pod creates hit the fresh-node race
             st["race_creates"] -= 1
             event = "RuntimeClass handler sysbox-runc does not support user namespaces: the handler sysbox-runc is not known"
         elif st.get("other_failure"):
             event = st["other_failure"]
-        obj["status"] = {"phase": "Pending" if st.get("never_ready") or event else "Running",
-                         "conditions": [] if st.get("never_ready") or event else [{"type": "Ready", "status": "True"}]}
+        obj["status"] = {"phase": "Pending" if st.get("never_ready") or event or step == "vanish" else "Running",
+                         "conditions": [] if st.get("never_ready") or event or step == "vanish" else [{"type": "Ready", "status": "True"}]}
         if event:
             st.setdefault("events", []).append({"reason": "FailedCreatePodSandBox", "message": "Failed to create pod sandbox: " + event,
                                                 "involvedObject": {"kind": "Pod", "name": obj["metadata"]["name"], "uid": obj["metadata"]["uid"]}})
@@ -122,8 +129,13 @@ elif cmd == "get" and args[1] == "events":
     name = args[3].split("involvedObject.name=")[1]
     print(json.dumps({"items": [e for e in st.get("events", []) if e["involvedObject"]["name"] == name]}))
 elif cmd == "get" and args[1] == "pod":
-    if args[2] not in st.get("pods", {}): missing('pods "%s"' % args[2])
-    print(json.dumps(st["pods"][args[2]]))
+    if args[2] not in st.get("pods", {}) or st.get("hide_pod"): missing('pods "%s"' % args[2])   # hide_pod: the pod was never visible to a get
+    pod = st["pods"][args[2]]
+    if pod.get("vanish_after_get"):   # the pod is seen once, then the object is gone (the runtime restart on a fresh node)
+        if pod.get("seen_once"):
+            del st["pods"][args[2]]; save(); missing('pods "%s"' % args[2])
+        pod["seen_once"] = True; save()
+    print(json.dumps(pod))
 elif cmd == "get" and args[1] == "pods":
     items = list(st.get("pods", {}).values())
     if "-l" in args:  # honour a label selector `key=value`

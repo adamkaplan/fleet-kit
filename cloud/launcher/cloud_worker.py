@@ -167,6 +167,10 @@ class _FreshNodeRace(Exception):
     """The pod's sandbox failed on the handler-not-known message: the node's containerd was not yet configured."""
 
 
+class _PodVanished(Exception):
+    """The pending stack pod existed and then a get said not found (seen on a fresh node when its runtime restarted)."""
+
+
 class Interrupted(BaseException):
     """SIGINT or SIGTERM during create: not an Exception, so no handler in between swallows it."""
 
@@ -942,17 +946,30 @@ class Launcher:
         """Wait for a stack pod; on the fresh-node race (the runtime handler is not yet known to the node's containerd) delete
         THE POD ONLY and create it again with the same run id and nonce, at most STACK_ATTEMPTS times inside
         STACK_RACE_WINDOW_SECONDS. The password Secret and the per-run Secret are made once, before the first attempt, and are
-        never touched here: the pod refers to them by name, so a second attempt reads the same objects. Any other failure is not retried."""
+        never touched here: the pod refers to them by name, so a second attempt reads the same objects. The same bounded retry also
+        recreates a pod that VANISHES while pending (it was seen, then a get says not found); a pod never seen, and any other
+        failure, are not retried."""
         deadline = self.clock() + dt.timedelta(seconds=STACK_RACE_WINDOW_SECONDS)
         attempt = 1
         while True:
+            seen = []   # this attempt's pod: set once a get returned it
+
+            def watch(pod, seen=seen):
+                if pod is None and seen:
+                    raise _PodVanished("pod vanished")
+                if pod is not None:
+                    seen.append(1)
+                    self._raise_on_race(name, pod)
             try:
-                self._wait_ready(name, seconds, lambda pod: self._raise_on_race(name, pod))
-            except _FreshNodeRace as race:
+                self._wait_ready(name, seconds, watch)
+            except (_FreshNodeRace, _PodVanished) as race:
                 last = attempt >= STACK_ATTEMPTS or self.clock() >= deadline
                 self.audit(worker, "pod/" + name, "create-attempt", 0.0, False,
                            "attempt %d of %d: %s%s" % (attempt, STACK_ATTEMPTS, race, "; giving up" if last else "; recreating the pod"))
                 if last:
+                    if isinstance(race, _PodVanished):
+                        raise CloudError("the worker pod could not start: the pod vanished while pending (the fresh-node race: the node's "
+                                         "runtime restarted); gave up after %d attempt(s)" % attempt) from None
                     raise CloudError("the worker pod could not start: the node's runtime handler %s was not ready (the fresh-node race: %s); "
                                      "gave up after %d attempt(s)" % (STACK_RUNTIME_CLASS, race, attempt)) from None
                 if self._mine("pod", name) is False:
