@@ -4330,8 +4330,7 @@ and takes the lock.
 
 **The lock.** One file per repository and branch in the switchboard's state directory (`merge-gate/`): the holder's name, since when, the process and the pull
 request. It is held from the gate pass until the `gh pr merge` call returns (the shim releases it, whatever the merge returned; `merge-gate --release` frees it
-early). A lock whose holder has held it longer than `lock_minutes` (default 20) without merging, or whose holder process is gone (after a two-minute grace, because
-the shell that ran the gate exits before the merge follows), is **recovered**; a second merger is told **who holds it, since when and when to retry**.
+early). A lock whose holder has held it longer than `lock_minutes` (default 20) without merging, or, for the owner's own terminal only, whose holder process is gone (an agent's shell exits before its merge follows, so an agent's lock is recovered by the lease alone), is **recovered**; a second merger is told **who holds it, since when and when to retry**.
 
 **Enforcement is in the `gh` shim** (`shims/gh`, a credentials path). Before `gh pr merge` into a gated branch of a listed repository it asks `merge-gate --check`
 and **refuses in one line** unless a gate pass for this exact head and branch tip is recorded and the caller holds the lock; a merge that goes through is bound to
@@ -4339,6 +4338,18 @@ the checked head and `--auto` is refused. While the latest completed run on the 
 answer in time or an unreadable state refuses. **The only ways around it are the owner's own terminal** (the same rule as `waive` and `gates mode`) **and a logged
 waiver** of the chief of staff: `fleet-switchboard waive <repo#N> --gates MG --reason "..."`, a hash-chained ledger entry and an audit line, bound to the pull
 request's head and expiring after 24 hours. The waiver is also how the one merge that fixes a red branch goes in.
+
+**Which routes the shim covers, and which stay outside.** Covered, for a listed repository: `gh pr merge` in any shape (a shape the shim cannot parse is refused,
+never run), `gh api` with a write method (or `-f`, `-F`, `--input`) to `repos/<repo>/pulls/<N>/merge` (a placeholder or variable in the path is refused), and a
+GraphQL `mergePullRequest` or `enablePullRequestAutoMerge` mutation (refused while any repository is gated, because the mutation names a node id, not a
+repository). A call to the real `gh` that is not run through the shim is **outside**: a `gh` alias (`gh m 12`: the shim sees the alias, not the command),
+the web UI, and a `git push` to the branch. Neither the owner's own terminal nor the waiver is a hole in that list: they are the two stated ways around.
+**Same-user environment is a mistake-guard, not a boundary**, as everywhere in this repository: the gate does not read `FLEET_SWITCHBOARD_OWN_GH`, `HOME`,
+`XDG_CONFIG_HOME` or `FLEET_SWITCHBOARD_BIN` (it reads the configuration under the account's real home from the password database, and the program that
+`install` linked there), and tests pin those four as hostile cases; a worker that can run its own copy of `gh` or edit the configuration is stopped by GitHub's
+branch protection, not by this gate. Known limits: a merge is bound to the head (`--match-head-commit`), not to the branch tip, so a merge by the owner's
+terminal or under a waiver can move the branch between the check and the merge (the next check refuses the now stale pass); a pass costs a full CI run and up to
+`wait_minutes` on a busy branch; and closing the pull request for the re-run fires its `closed` and `reopened` events, which other automation may react to.
 
 ## `gates-check`, the gate modes and the kill switches (#107, slice 3a)
 

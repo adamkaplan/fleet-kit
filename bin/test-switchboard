@@ -72462,6 +72462,20 @@ class TestMergeGateRerun(MergeGateBase):
         self.assertFalse(ok)
         self.assertIn("gh pr reopen 12", lines[-1])
 
+    def test_a_branch_that_moves_while_the_lock_is_taken_is_not_passed(self):
+        real = self.gate.acquire
+
+        def acquire_then_move(*a, **k):
+            got = real(*a, **k)
+            self.fake.tip = MG_NEWTIP   # the branch moves after the facts were read and before the tip is read again
+            return got
+        with mock.patch.object(self.gate, "acquire", acquire_then_move):
+            ok, lines = self.run_pass()
+        self.assertFalse(ok)
+        self.assertIn("moved while the gate ran", lines[-1])
+        self.assertIsNone(self.gate.read_pass(self.state, self.repo, self.n))
+        self.assertIsNone(self.gate.read_lock(self.state, self.repo, "main"), "the lock is let go")
+
     def test_an_unmoved_branch_is_not_rerun(self):
         ok, lines = self.run_pass()
         self.assertTrue(ok, lines)
@@ -72593,10 +72607,22 @@ class TestMergeGateMutants(MergeGateBase):
         self.moved()
         self.assertFalse(self.check(gate=gate)[0])
 
+    def scenario_the_branch_moving_under_the_lock_blocks_the_pass(self, gate):
+        real = gate.acquire
+
+        def acquire_then_move(*a, **k):
+            got = real(*a, **k)
+            self.fake.tip = MG_NEWTIP
+            return got
+        gate.acquire = acquire_then_move
+        self.assertFalse(self.run_pass(gate=gate)[0])
+
     CASES = (("skip the base comparison", 'if facts["run_base"] != facts["tip"]:', "if False:", "scenario_moved_branch_needs_a_rerun"),
              ("skip the lock", 'if lock is None or stale or lock.get("holder") != caller:', "if False:", "scenario_no_lock_no_merge"),
              ("accept a stale gate pass", 'if got.get("head") != facts["head"] or got.get("branch") != facts["branch"] or got.get("tip") != facts["tip"]:',
-              "if False:", "scenario_stale_pass_is_refused"))
+              "if False:", "scenario_stale_pass_is_refused"),
+             ("skip the re-read under the lock", 'if tip != facts["tip"] or head != facts["head"] or tip != facts["run_base"]:', "if False:",
+              "scenario_the_branch_moving_under_the_lock_blocks_the_pass"))
 
     def test_the_unmutated_module_passes_every_scenario(self):
         for _, _, _, name in self.CASES:
@@ -72707,7 +72733,10 @@ class TestGhShimMergeGate(Base):
         environ.update(env or {})
         if self.log.exists():
             self.log.unlink()
-        done = subprocess.run([sys.executable, str(SHIM), *args], capture_output=True, text=True, env=environ, timeout=60)
+        runner = ("import importlib.util, importlib.machinery, sys\nloader = importlib.machinery.SourceFileLoader('gh', %r)\nspec = importlib.util.spec_from_loader('gh', loader)\n"
+                  "m = importlib.util.module_from_spec(spec)\nloader.exec_module(m)\nm.__file__ = %r\nm.MG_HOME = %r\nm.MG_BINARY = %r\nsys.exit(m.main(sys.argv[1:]))\n"
+                  % (str(SHIM), str(SHIM), str(self.home), str(self.sb) if binary else None))   # the gate's home and program are module attributes, never environment
+        done = subprocess.run([sys.executable, "-c", runner, *args], capture_output=True, text=True, env=environ, timeout=60)
         return done, (json.loads(self.log.read_text()) if self.log.exists() else None)
 
     def merge_calls(self):
@@ -72759,6 +72788,69 @@ class TestGhShimMergeGate(Base):
         self.assertEqual((done.returncode, self.merge_calls()), (0, []))
         done, seen = self.run_shim("pr", "ready", "12", "-R", "acme/app")
         self.assertEqual((done.returncode, self.merge_calls()), (0, []))
+
+    def test_an_exit_zero_that_does_not_say_allowed_is_refused(self):
+        for payload in ("{}", json.dumps({"allowed": False, "head": self.HEAD}), json.dumps({"allowed": "yes", "head": self.HEAD})):
+            with self.subTest(payload=payload):
+                done, seen = self.run_shim(*self.MERGE, env={"FAKE_MG_JSON": payload})
+                self.assertEqual((done.returncode, seen), (10, None))
+                self.assertIn("could not decide", done.stderr)
+
+    def test_every_route_that_merges_is_asked_and_what_it_cannot_see_is_the_stated_limit(self):
+        repo = "acme/app"
+        refused = (("pr", "merge", "--", "12", "-R", repo), ("pr", "merge", "12", "-R", repo, "--no-such-flag"), ("pr", "merge", "12", "--admin", "-R", repo),
+                   ("api", "-X", "PUT", "repos/%s/pulls/12/merge" % repo), ("api", "repos/%s/pulls/12/merge" % repo, "--method", "PUT", "-f", "merge_method=squash"),
+                   ("api", "--method=PUT", "/repos/%s/pulls/12/merge" % repo), ("api", "repos/{owner}/{repo}/pulls/12/merge", "-X", "PUT"),
+                   ("api", "repos/%s/pulls/$N/merge" % repo, "-X", "PUT"),
+                   ("api", "graphql", "-f", "query=mutation{mergePullRequest(input:{pullRequestId:\"x\"}){clientMutationId}}"),
+                   ("api", "graphql", "-f", "query=mutation{enablePullRequestAutoMerge(input:{pullRequestId:\"x\"}){clientMutationId}}"),
+                   ("api", "graphql", "--input", "query.json"), ("api", "graphql", "-F", "query=@query.graphql"))
+        for args in refused:
+            with self.subTest(args=args):
+                if self.calls.exists():
+                    self.calls.unlink()
+                done, seen = self.run_shim(*args, env={"FAKE_MG_EXIT": "10", "FAKE_MG_JSON": json.dumps({"allowed": False, "reason": "no gate pass recorded"})})
+                self.assertEqual((done.returncode, seen), (10, None), done.stderr)
+                self.assertTrue(done.stderr.strip().splitlines()[-1].startswith("gh: "), done.stderr)   # the refusal is the last line, in one line
+        unlisted = (("pr", "merge", "--", "12", "-R", "acme/other"), ("api", "-X", "PUT", "repos/acme/other/pulls/12/merge"),
+                    ("api", "repos/%s/pulls/12/merge" % repo), ("api", "repos/%s/pulls/12" % repo, "-X", "PATCH", "-f", "state=closed"),
+                    ("api", "graphql", "-f", "query={viewer{login}}"), ("m", "12"))   # the last one is an alias the shim cannot see: the documented limit
+        for args in unlisted:
+            with self.subTest(args=args):
+                done, seen = self.run_shim(*args, env={"FAKE_MG_EXIT": "10", "FAKE_MG_JSON": "{}"})
+                self.assertEqual(done.returncode, 0, args)
+                self.assertIsNotNone(seen)
+
+    def test_an_allowed_api_merge_releases_the_lock_when_it_returns(self):
+        done, seen = self.run_shim("api", "-X", "PUT", "repos/acme/app/pulls/12/merge", env=self.allowed())
+        self.assertEqual((done.returncode, seen["argv"]), (0, ["api", "-X", "PUT", "repos/acme/app/pulls/12/merge"]))
+        self.assertEqual(self.merge_calls()[-1], "merge-gate acme/app#12 --release own=1")
+
+    def test_a_worker_cannot_switch_the_gate_off_or_point_it_elsewhere_through_its_environment(self):
+        other = self.home / "elsewhere"
+        (other / "empty").mkdir(parents=True)
+        liar = self.home / "liar"
+        liar.write_text("#!/bin/sh\necho '{\"allowed\": true, \"head\": \"%s\"}'\n" % self.HEAD)
+        liar.chmod(0o755)
+        refuse = {"FAKE_MG_EXIT": "10", "FAKE_MG_JSON": json.dumps({"allowed": False, "reason": "no gate pass recorded"})}
+        for extra in ({"FLEET_SWITCHBOARD_OWN_GH": "1"}, {"XDG_CONFIG_HOME": str(other / "empty")}, {"HOME": str(other)}, {"FLEET_SWITCHBOARD_BIN": str(liar)}):
+            with self.subTest(env=sorted(extra)):
+                done, seen = self.run_shim(*self.MERGE, env=dict(refuse, **extra))
+                self.assertEqual((done.returncode, seen), (10, None), done.stderr)
+
+    def test_the_gate_reads_the_account_home_from_the_password_database_not_from_the_environment(self):
+        loader = importlib.machinery.SourceFileLoader("gh_shim_home", str(SHIM))
+        shim = importlib.util.module_from_spec(importlib.util.spec_from_loader("gh_shim_home", loader))
+        loader.exec_module(shim)
+        import pwd
+        with mock.patch.dict(os.environ, {"HOME": str(self.home / "elsewhere"), "XDG_CONFIG_HOME": str(self.home / "elsewhere")}):
+            self.assertEqual(shim.mg_home(), pwd.getpwuid(os.getuid()).pw_dir)
+
+    def test_a_configuration_that_cannot_be_read_refuses_a_merge(self):
+        (self.home / ".config" / "fleet-switchboard" / "config.json").write_text(json.dumps({"merge_gate": {"repos": "acme/app"}}))
+        done, seen = self.run_shim(*self.MERGE, env=self.allowed())
+        self.assertEqual((done.returncode, seen), (10, None))
+        self.assertIn("could not be read", done.stderr)
 
     def test_auto_merge_is_refused_for_a_gated_repository(self):
         done, seen = self.run_shim(*self.MERGE, "--auto", env=self.allowed())

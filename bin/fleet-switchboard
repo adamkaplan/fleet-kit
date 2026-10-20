@@ -22617,7 +22617,8 @@ def cmd_merge_gate(args, runner, now):
         print("released the merge lock on %s %s" % (repo, facts["branch"]) if done else "%s holds no merge lock on %s %s: nothing released" % (who, repo, facts["branch"]))
         return EXIT_OK
     if args.gate_pass:
-        ok, lines = gate.gate_pass(reading, gh, conf, state, repo, number, who, os.getppid(), now, MERGE_GATE_SLEEP, allow_held=args.rerun_held)
+        ok, lines = gate.gate_pass(reading, gh, conf, state, repo, number, who, os.getppid() if kind[0] == "person" else None, now,   # an agent's shell exits before its merge: only a person's own terminal has a process to watch
+                                     MERGE_GATE_SLEEP, allow_held=args.rerun_held)
         for line in lines:
             print(line)
         _gates_audit(engine, "merge_gate.pass" if ok else "merge_gate.blocked", ref, {"by": who, "result": _one_line(lines[-1] if lines else "", 300)})
