@@ -206,7 +206,7 @@ class FileListError(Exception):
 
 def error_class(err):
     """One short phrase for a failed read: the class (a timeout or gh that could not run, a gh failure with its HTTP status, an answer that is not JSON, an answer over the size cap) and a clipped detail."""
-    detail = " ".join(str(err).split())[:100]
+    detail = " ".join(str(err).split())
     status = re.search(r"\bHTTP (\d{3})\b", detail)
     reason = getattr(err, "reason", None)
     if isinstance(err, json.JSONDecodeError):
@@ -579,12 +579,12 @@ def closure_refusals(base_src, head_src, patch, roots, entry_points, module_leve
                     elif module_level and import_time(owner, number):
                         reasons.append("it changes import-time code of a module the clear loads (%s line %d, in %s): refused" % (side, number, owner.name))
                     elif used:
-                        reasons.append("it changes %s, which refers to a clear entry point (%s)" % (owner.name, ", ".join(sorted(used)[:3])))
+                        reasons.append("it changes %s, which refers to a clear entry point (%s)" % (owner.name, ", ".join(sorted(used))))
                 elif isinstance(owner, BIND_KINDS + (ast.Import, ast.ImportFrom)):
                     if module_level:
                         reasons.append("it changes import-time code of a module the clear loads (%s line %d): refused" % (side, number))
                     elif names & (in_globals | in_defs | in_refs):
-                        reasons.append("it changes the module-level binding of %s, which the clear reads" % ", ".join(sorted(names & (in_globals | in_defs | in_refs))[:3]))
+                        reasons.append("it changes the module-level binding of %s, which the clear reads" % ", ".join(sorted(names & (in_globals | in_defs | in_refs))))
                     elif len(owners) > 1:
                         reasons.append("a changed line (%s line %d) holds more than one top-level statement: refused" % (side, number))
                 elif isinstance(owner, ast.Expr) and isinstance(getattr(owner, "value", None), ast.Constant):

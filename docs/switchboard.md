@@ -4585,7 +4585,7 @@ What each refusal means, and what to do:
 - `order`: the standing order or the caller was refused before the pull request was read.
 - `owner_hold_label`, `person_hold_label`: the pull request carries a hold that is a person's own.
 
-The reasons of the clear path (the order checks, the score, the refusal printed for an error) are whole too. Other audit lines that clip text stay as they were, because they are not on this path: the carry's void reason and the marker line (200 characters), the clear's and the revoke's own reason typed by a person (300), and the reasons of a release (five of them, 160 characters each).
+The reasons of the clear path (the order checks, the score, the refusal printed for an error, the words of a failed `gh` call, the names a closure refusal lists) are whole too; the only clips left on that path are the person's own typed reason and the order's text kept in the clear's record (300 characters), and the revoke and lock-wait lines, which are not a refusal of a pull request. A test lists every clip on the path and fails when a new one appears. Other audit lines that clip text stay as they were, because they are not on this path: the carry's void reason and the marker line (200 characters), the clear's and the revoke's own reason typed by a person (300), and the reasons of a release (five of them, 160 characters each).
 
 ### The delegated clear by impact score (#835)
 
