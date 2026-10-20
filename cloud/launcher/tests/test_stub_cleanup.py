@@ -224,6 +224,42 @@ class TestStubParentDiesDuringStartup(unittest.TestCase):
         self.assertTrue(wait_until(lambda: not pid_alive(pid), 6), "a stub that lost its parent during startup is still running")
 
 
+class TestSpawnPassesWhatTheStubNeeds(unittest.TestCase):
+    """Everything stub_support.spawn passes to the child, each pinned through spawn itself: STUB_PARENT_PID, the new session, the caller's env."""
+
+    def probe(self, **kw):
+        code = "import os,json;print(json.dumps([os.environ.get('STUB_PARENT_PID'),os.getpgid(0)==os.getpid(),os.environ.get('SPAWN_PROBE'),os.getpid()]))"
+        p = stub_support.spawn([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True, **kw)
+        self.addCleanup(stub_support.stop_group, p)
+        import json
+        return json.loads(p.stdout.readline())
+
+    def test_the_child_is_told_the_starting_process_as_its_parent(self):
+        self.assertEqual(self.probe()[0], str(os.getpid()))
+
+    def test_the_child_leads_its_own_process_group(self):
+        self.assertTrue(self.probe()[1])
+
+    def test_a_given_env_is_kept_and_the_default_env_is_the_callers(self):
+        self.assertEqual(self.probe(env=dict(os.environ, SPAWN_PROBE="given"))[2], "given")
+        with mock.patch.dict(os.environ, {"SPAWN_PROBE": "inherited"}):
+            self.assertEqual(self.probe()[2], "inherited")
+
+    def test_a_stub_started_through_spawn_by_a_parent_that_exits_at_once_ends_by_itself(self):
+        port = stub_support.free_port()
+        # The parent starts the stub THROUGH spawn (a delayed exec, so the parent is gone before the stub looks) and exits: only the
+        # STUB_PARENT_PID that spawn passes lets the stub see that its parent is gone (its getppid() is already 1 or a reaper).
+        mid_code = ("import os,sys\nsys.path.insert(0,sys.argv[1])\nimport stub_support\n"
+                    "p=stub_support.spawn(['sh','-c','sleep 1; exec \"$0\" \"$@\"',sys.executable,sys.argv[2],sys.argv[3]])\n"
+                    "print(p.pid,flush=True)\nos._exit(0)\n")
+        mid = stub_support.spawn([sys.executable, "-c", mid_code, os.path.dirname(STUB), STUB, str(port)], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(stub_support.stop_group, mid, port)
+        pid = int(mid.stdout.readline())
+        mid.wait()
+        self.addCleanup(lambda: pid_alive(pid) and os.kill(pid, signal.SIGKILL))   # only our own recorded pid, whatever the result
+        self.assertTrue(wait_until(lambda: not pid_alive(pid), 6), "a stub started through spawn whose parent exited is still running")
+
+
 class TestStopGroupPins(unittest.TestCase):
     """What the helper promises, pinned one at a time: the port check, the pid-reuse guard, and the stub's idle timer."""
 
