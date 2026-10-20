@@ -136,6 +136,8 @@ def _pid_limit():
 
 
 def _pid_alive(pid):
+    """True when a process has this number. No such process is the ONLY answer that frees it: another user's process (PermissionError) and any other
+    error are alive (when in doubt a number is not handed out)."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -145,6 +147,34 @@ def _pid_alive(pid):
     except OSError:
         return True          # when in doubt it is alive
     return True
+
+
+_ANCESTORS = [None]
+
+
+def _ancestors():
+    """This process, its parent, its grandparent and so on up to 1: numbers a stand-in must never be (read once: a made-up number is asked for from inside
+    threads, and a table read there would be slow)."""
+    if _ANCESTORS[0] is None:
+        _ANCESTORS[0] = _read_ancestors()
+    return _ANCESTORS[0]
+
+
+def _read_ancestors():
+    chain, table = {os.getpid(), os.getppid()}, {}
+    try:
+        done = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, timeout=20)
+        for line in done.stdout.splitlines():
+            words = line.split()
+            if len(words) == 2 and all(w.isdigit() for w in words):
+                table[int(words[0])] = int(words[1])
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return chain
+    pid = os.getppid()
+    while pid > 1 and table.get(pid) and table[pid] not in chain:
+        pid = table[pid]
+        chain.add(pid)
+    return chain
 
 
 def _live_pids():
@@ -161,10 +191,10 @@ def made_up_pid():
     with _MADE_UP_LOCK:
         if _MADE_UP_NEXT[0] is None:
             _MADE_UP_NEXT[0] = max(_live_pids() | {os.getpid(), os.getppid()}) + 1
-        limit = _pid_limit()
+        limit, never = _pid_limit(), _ancestors() | {os.getpid(), os.getppid()}
         start = _MADE_UP_NEXT[0] if 1 < _MADE_UP_NEXT[0] <= limit else 2
         for pid in list(range(start, limit + 1)) + list(range(2, start)):
-            if pid in _MADE_UP_GIVEN or pid in (os.getpid(), os.getppid()) or _pid_alive(pid):
+            if pid in _MADE_UP_GIVEN or pid in never or _pid_alive(pid):
                 continue
             _MADE_UP_GIVEN.add(pid)
             _MADE_UP_NEXT[0] = pid + 1
@@ -4048,7 +4078,7 @@ class TestRender(Base):
 
 # ------------------------------------------------------------------- launching
 
-class TestLaunch(Base):
+class TestLaunch(StandInPids, Base):
     def setUp(self):
         super().setUp()
         self.world = World(self, agents=("platform",))
@@ -5375,34 +5405,34 @@ class TestLaunch(Base):
         me = os.getuid()
         H = 3600
         return [
-            (4001, 1, me, 7 * H, "/usr/bin/python3 %s --serve" % fake),                    # due: a fake agent in a temp host-mctx dir
-            (4002, 1, me, 9 * H, "node --test %s/t/a.test.js" % tmp),                      # due: a node test runner naming a temp path
-            (4003, 1, me, 8 * H, "python3 %s" % helper),                                   # due: a python helper in a fleet worktree
-            (4004, 1, me, 1 * H, "/usr/bin/python3 %s" % fake),                            # younger than the grace
-            (4005, 777, me, 9 * H, "node --test"),                                         # its parent is alive: not an orphan
-            (4006, 1, me + 1, 9 * H, "node --test"),                                       # another user's
+            (self.px[4001], 1, me, 7 * H, "/usr/bin/python3 %s --serve" % fake),                    # due: a fake agent in a temp host-mctx dir
+            (self.px[4002], 1, me, 9 * H, "node --test %s/t/a.test.js" % tmp),                      # due: a node test runner naming a temp path
+            (self.px[4003], 1, me, 8 * H, "python3 %s" % helper),                                   # due: a python helper in a fleet worktree
+            (self.px[4004], 1, me, 1 * H, "/usr/bin/python3 %s" % fake),                            # younger than the grace
+            (self.px[4005], self.px[777], me, 9 * H, "node --test"),                                         # its parent is alive: not an orphan
+            (self.px[4006], 1, me + 1, 9 * H, "node --test"),                                       # another user's
             (os.getpid(), 1, me, 9 * H, "node --test"),                                    # this process
-            (4007, 1, me, 9 * H, "node --test /x/opencode/test.js"),                       # names opencode
-            (4008, 1, me, 9 * H, "/usr/bin/python3 /opt/checkout/bin/x.py"),   # a main checkout script: not on the allow-list
-            (4009, 1, me, 9 * H, "sleep 1000"),                                            # not on the allow-list
-            (4010, 1, me, 9 * H, "node --test"),                                           # a bare node --test: no path to place it
-            (4011, 1, me, 9 * H, "node --test %s/ssh/t.js" % tmp),                         # names ssh
-            (4012, 1, me, 9 * H, "/usr/bin/python3 %s/../etc/x.py" % tmp),                 # a .. in the script path
-            (4013, 1, me, 9 * H, "/usr/bin/python3 relative/x.py"),                        # a relative script
-            (4014, 1, me, 9 * H, "/usr/bin/python3 %s/other/fake-agent.py" % tmp),         # a fake-agent.py outside host-mctx (still a temp python helper)
-            (4015, 1, me, 9 * H, "/usr/bin/python3 %s/herdr/x.py" % tmp),                  # names herdr
+            (self.px[4007], 1, me, 9 * H, "node --test /x/opencode/test.js"),                       # names opencode
+            (self.px[4008], 1, me, 9 * H, "/usr/bin/python3 /opt/checkout/bin/x.py"),   # a main checkout script: not on the allow-list
+            (self.px[4009], 1, me, 9 * H, "sleep 1000"),                                            # not on the allow-list
+            (self.px[4010], 1, me, 9 * H, "node --test"),                                           # a bare node --test: no path to place it
+            (self.px[4011], 1, me, 9 * H, "node --test %s/ssh/t.js" % tmp),                         # names ssh
+            (self.px[4012], 1, me, 9 * H, "/usr/bin/python3 %s/../etc/x.py" % tmp),                 # a .. in the script path
+            (self.px[4013], 1, me, 9 * H, "/usr/bin/python3 relative/x.py"),                        # a relative script
+            (self.px[4014], 1, me, 9 * H, "/usr/bin/python3 %s/other/fake-agent.py" % tmp),         # a fake-agent.py outside host-mctx (still a temp python helper)
+            (self.px[4015], 1, me, 9 * H, "/usr/bin/python3 %s/herdr/x.py" % tmp),                  # names herdr
             (1, 0, 0, 99 * H, "/sbin/launchd"),
         ]
 
     def test_the_orphan_allow_list_picks_only_exact_matches_of_this_user_past_the_grace_and_never_a_protected_target(self):
         rows = self.orphan_rows()
         due, young = sb.orphan_reap_candidates(lambda: rows, {})
-        self.assertEqual(sorted((pid, kind) for pid, kind, _, _ in due), [(4001, "fake-agent"), (4002, "node-test"), (4003, "python-helper"), (4014, "python-helper")])
-        self.assertEqual([pid for pid, *_ in young], [4004])
+        self.assertEqual(sorted((pid, kind) for pid, kind, _, _ in due), [(self.px[4001], "fake-agent"), (self.px[4002], "node-test"), (self.px[4003], "python-helper"), (self.px[4014], "python-helper")])
+        self.assertEqual([pid for pid, *_ in young], [self.px[4004]])
         due, _ = sb.orphan_reap_candidates(lambda: rows, {"orphan_reaper": {"grace_hours": 8}})
-        self.assertEqual(sorted(pid for pid, *_ in due), [4002, 4003, 4014], "the grace is configurable")
+        self.assertEqual(sorted(pid for pid, *_ in due), [self.px[4002], self.px[4003], self.px[4014]], "the grace is configurable")
         line = sb.orphan_status_line({}, lambda: rows)
-        self.assertRegex(line, r"^4: .*4001.*past 6 h")
+        self.assertRegex(line, r"^4: .*%d.*past 6 h" % self.px[4001])
         self.assertIsNone(sb.orphan_status_line({"orphan_reaper": {"enabled": False}}, lambda: rows))
         self.assertIsNone(sb.orphan_status_line({}, lambda: rows[3:4]))
 
@@ -5415,7 +5445,7 @@ class TestLaunch(Base):
 
         def fake_kill(pid, sig):
             sent.append((pid, sig))
-            if sig == signal.SIGTERM and pid != 4002:       # 4002 ignores SIGTERM
+            if sig == signal.SIGTERM and pid != self.px[4002]:       # 4002 ignores SIGTERM
                 alive.pop(pid, None)
             if sig == signal.SIGKILL:
                 alive.pop(pid, None)
@@ -5439,19 +5469,19 @@ class TestLaunch(Base):
             self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
             code, out, err = self.run_cli("disk", "reap-orphans", "--apply")
             self.assertEqual(code, 0, err)
-        self.assertEqual(sorted(sent), sorted([(4001, signal.SIGTERM), (4002, signal.SIGTERM), (4002, signal.SIGKILL), (4003, signal.SIGTERM), (4014, signal.SIGTERM)]))
-        self.assertIn("4001 fake-agent: terminated", out)
-        self.assertIn("4002 node-test: killed", out)
+        self.assertEqual(sorted(sent), sorted([(self.px[4001], signal.SIGTERM), (self.px[4002], signal.SIGTERM), (self.px[4002], signal.SIGKILL), (self.px[4003], signal.SIGTERM), (self.px[4014], signal.SIGTERM)]))
+        self.assertIn("%d fake-agent: terminated" % self.px[4001], out)
+        self.assertIn("%d node-test: killed" % self.px[4002], out)
         events = [e["event"] for e in self.world.audit() if e["event"].startswith("orphan.")]
         self.assertEqual(sorted(events), ["orphan.kill", "orphan.term", "orphan.term", "orphan.term", "orphan.term"])
         self.assertTrue(all(e["detail"]["by"] for e in self.world.audit() if e["event"].startswith("orphan.")), "the audit says who applied it")
-        self.assertIn(4004, alive, "a younger process and every protected one are left")
-        self.assertTrue({4005, 4006, 4007, 4008, 4009, 4010, 4011, 4012, 4013, 4015, 1} <= set(alive))
+        self.assertIn(self.px[4004], alive, "a younger process and every protected one are left")
+        self.assertTrue({self.px[4005], self.px[4006], self.px[4007], self.px[4008], self.px[4009], self.px[4010], self.px[4011], self.px[4012], self.px[4013], self.px[4015], 1} <= set(alive))
 
     def test_a_kill_that_fails_or_a_process_already_gone_is_said_the_cap_is_said_and_no_audit_means_no_signal(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         me, tmp = os.getuid(), Path(os.path.realpath(str(self.home)))
-        rows = [(5000 + n, 1, me, 9 * 3600, "node --test %s/t%d.test.js" % (tmp, n)) for n in range(sb.ORPHAN_MAX_PER_RUN + 2)]
+        rows = [(self.px[5000 + n], 1, me, 9 * 3600, "node --test %s/t%d.test.js" % (tmp, n)) for n in range(sb.ORPHAN_MAX_PER_RUN + 2)]
         engine = self.world.new_engine("cli")
         outcomes = iter([ProcessLookupError(), PermissionError(1, "nope")])
 
@@ -5479,22 +5509,22 @@ class TestLaunch(Base):
             reads["n"] += 1
             if reads["n"] == 1:
                 return rows
-            return [r if r[0] != 4002 else (4002, 1, r[2], r[3], "node server.js") for r in rows]     # the pid now names something else
+            return [r if r[0] != self.px[4002] else (self.px[4002], 1, r[2], r[3], "node server.js") for r in rows]     # the pid now names something else
 
         sent = []
         engine = self.world.new_engine("cli")
         out = sb.reap_orphans(engine, True, table, kill=lambda pid, sig: sent.append((pid, sig)), sleep=lambda s: None)
-        self.assertNotIn(4002, [pid for pid, _ in sent])
-        self.assertIn((4002, "node-test", "changed: not signalled"), out["results"])
-        self.assertTrue({(4001, signal.SIGTERM), (4003, signal.SIGTERM)} <= set(sent), "the unchanged ones are still signalled")
-        younger = lambda: [(r[0], r[1], r[2], 5, r[4]) if r[0] == 4003 else r for r in rows]       # a reused pid restarts at age 0
+        self.assertNotIn(self.px[4002], [pid for pid, _ in sent])
+        self.assertIn((self.px[4002], "node-test", "changed: not signalled"), out["results"])
+        self.assertTrue({(self.px[4001], signal.SIGTERM), (self.px[4003], signal.SIGTERM)} <= set(sent), "the unchanged ones are still signalled")
+        younger = lambda: [(r[0], r[1], r[2], 5, r[4]) if r[0] == self.px[4003] else r for r in rows]       # a reused pid restarts at age 0
         reads["n"], sent[:] = 0, []
         out = sb.reap_orphans(engine, True, lambda: rows if reads.__setitem__("n", reads["n"] + 1) or reads["n"] == 1 else younger(), kill=lambda pid, sig: sent.append((pid, sig)), sleep=lambda s: None)
-        self.assertNotIn(4003, [pid for pid, _ in sent], "a process that is now younger is another process")
-        parent = lambda: [(r[0], 2, r[2], r[3], r[4]) if r[0] == 4001 else r for r in rows]          # re-parented: no longer an orphan
+        self.assertNotIn(self.px[4003], [pid for pid, _ in sent], "a process that is now younger is another process")
+        parent = lambda: [(r[0], 2, r[2], r[3], r[4]) if r[0] == self.px[4001] else r for r in rows]          # re-parented: no longer an orphan
         reads["n"], sent[:] = 0, []
         sb.reap_orphans(engine, True, lambda: rows if reads.__setitem__("n", reads["n"] + 1) or reads["n"] == 1 else parent(), kill=lambda pid, sig: sent.append((pid, sig)), sleep=lambda s: None)
-        self.assertNotIn(4001, [pid for pid, _ in sent])
+        self.assertNotIn(self.px[4001], [pid for pid, _ in sent])
         for bad in ({"enabled": "no"}, {"grace_hours": 0}, {"grace_hours": True}, {"x": 1}, "yes"):
             with self.assertRaises(sb.ConfigError):
                 sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "orphan_reaper": bad})
@@ -38829,7 +38859,7 @@ class TestDaemonCommand(StandInPids, Base):
         code, out, _ = self.run_cmd("status")
         self.assertEqual(code, 0)
         self.assertIn("(launchd)", out)
-        self.job_pid = 9999     # a loaded job that does not hold the lock did not start this daemon
+        self.job_pid = self.px[9999]     # a loaded job that does not hold the lock did not start this daemon
         self.assertIn("(ensure)", self.run_cmd("status")[1])
 
     def test_status_with_no_daemon_exits_non_zero(self):
@@ -43834,7 +43864,7 @@ class TestHeadlessAnswerPath(WriteWorld):
         self.assertEqual(getattr(self.world.v2, "permission_replies", []), [], "no reply reached the service")
 
 
-class TestRetireLostHeadless(Base):
+class TestRetireLostHeadless(StandInPids, Base):
     """#678: `retire` of a headless worker whose session is gone (a record on file, nothing discovered): authority, the record, the remembered boss."""
 
     def setUp(self):
@@ -43909,7 +43939,7 @@ class TestRetireLostHeadless(Base):
     def test_a_live_headless_workers_remembered_boss_cannot_retire_it_when_its_real_boss_is_another(self):
         sid = self.world.v2.create_session({"fleet": {"name": "lostw", "role": "coder", "reports_to": "other", "headless": True}}, directory=str(self.home))
         self.ap.save_record(self.world.state, "lostw", sid, None, now=self.world.clock.now() - 1000)
-        (Path(self.world.state) / sb.HEADLESS_SERVICE_FILE).write_text(json.dumps({"service": {"pid": 100}, "bosses": {"lostw": "boss"}}))
+        (Path(self.world.state) / sb.HEADLESS_SERVICE_FILE).write_text(json.dumps({"service": {"pid": self.px[100]}, "bosses": {"lostw": "boss"}}))
         self.assertIn("lostw", self.engine.discover(self.world.clock.now()).agents)   # the session lives
         os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
         code, out, err = self.run_cli("retire", "lostw")
@@ -43930,7 +43960,7 @@ class TestRetireLostHeadless(Base):
         self.assertFalse(self.record.exists())
 
 
-class TestHeadlessRestartNotice(Base):
+class TestHeadlessRestartNotice(StandInPids, Base):
     """#433 slice 4 (S4, S5, S6, U1): a restart of the OpenCode service, or a session that is gone, is told to the worker's boss; never silent."""
 
     def setUp(self):
@@ -43938,7 +43968,7 @@ class TestHeadlessRestartNotice(Base):
         self.world = World(self, agents=("boss", "boss2", "termworker"))
         self.ap = sb.load_agent_presence()
         self.engine = self.world.new_engine("cli")
-        self.pid = [100]
+        self.pid = [self.px[100]]
         patch = mock.patch.object(sb.V2Client, "service_identity", lambda client: self.pid[0])
         patch.start()
         self.addCleanup(patch.stop)
@@ -43956,14 +43986,14 @@ class TestHeadlessRestartNotice(Base):
         self.worker("w1"); self.worker("w2", "boss2"); self.worker("w3")
         self.assertEqual(self.notices(), [], "the first process id ever seen is recorded, not announced")
         self.world.tick(60)
-        self.pid[0] = 200
+        self.pid[0] = self.px[200]
         first = self.notices()
         self.assertEqual(first, [("boss", "w1"), ("boss", "w3"), ("boss2", "w2")])
         self.assertEqual(self.notices(), first, "the same facts again: the delivery key makes them once")
         keys = {f.key for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"}
         self.assertEqual(len(keys), 3)
         self.assertEqual(sorted(a for a in self.engine.discover(self.world.clock.now()).agents if a.startswith("w")), ["w1", "w2", "w3"], "none is missing from discovery")
-        self.pid[0] = 300
+        self.pid[0] = self.px[300]
         self.assertEqual(len({f.key for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"} - keys), 3, "a second restart is a new notice")
 
     def test_an_outage_is_not_a_restart_and_a_terminal_worker_gets_no_notice(self):
@@ -43975,9 +44005,9 @@ class TestHeadlessRestartNotice(Base):
         self.assertEqual(found.status, "unknown")
         self.assertEqual(self.notices(), [])
         self.world.v2.down = False
-        self.pid[0] = 100                                                # back with the same identity
+        self.pid[0] = self.px[100]                                                # back with the same identity
         self.assertEqual(self.notices(), [])
-        self.pid[0] = 200
+        self.pid[0] = self.px[200]
         self.assertEqual([r for r, _ in self.notices()], ["boss"], "only the headless worker, never termworker")
 
     def test_a_restart_that_happens_during_an_outage_is_told_once_and_an_outage_with_the_same_process_is_not_a_restart(self):
@@ -43985,19 +44015,19 @@ class TestHeadlessRestartNotice(Base):
         self.notices()                                                    # pid 100 recorded
         self.pid[0] = None                                                # the service is down: nothing is compared
         self.assertEqual(self.notices(), [])
-        self.pid[0] = 200                                                 # it came back as a NEW process
+        self.pid[0] = self.px[200]                                                 # it came back as a NEW process
         first = self.notices()
         self.assertEqual(first, [("boss", "w1")], "exactly one notice for the restart that happened while it was down")
         self.assertEqual(len({f.key for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"}), 1)
         self.pid[0] = None
         self.assertEqual(self.notices(), first, "the same single notice while it is down again; no second one")
-        self.pid[0] = 200
+        self.pid[0] = self.px[200]
         self.assertEqual(len({f.key for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"}), 1, "the same restart, the same key")
 
     def test_the_notice_says_what_is_known_and_does_not_claim_the_session_was_resumed(self):
         self.worker("w1")
         self.notices()
-        self.pid[0] = 200
+        self.pid[0] = self.px[200]
         self.engine.discover(self.world.clock.now())
         text = [f.summary for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"][0]
         self.assertIn("restarted", text)
@@ -44018,7 +44048,7 @@ class TestHeadlessRestartNotice(Base):
     def test_a_worker_launched_after_the_restart_is_not_told_it_was_hit(self):
         self.worker("w1")
         self.notices()
-        self.pid[0] = 200
+        self.pid[0] = self.px[200]
         self.notices()
         self.world.tick(600)
         sid = self.world.v2.create_session({"fleet": {"name": "late", "role": "coder", "reports_to": "boss", "headless": True}}, directory=str(self.home))
@@ -44085,7 +44115,7 @@ class TestHeadlessRestartNotice(Base):
         self.world.v2.sessions[sid]["turn"] = None
         self.notices("headless.lost")                                    # the boss is remembered while the worker is seen
         del self.world.v2.sessions[sid]
-        self.pid[0] = 200
+        self.pid[0] = self.px[200]
         found = self.engine.discover(self.world.clock.now())
         self.assertNotIn("w1", found.agents)
         lost = [f for f in self.engine.collect_facts()[0] if f.kind == "headless.lost"]
@@ -44109,7 +44139,7 @@ class TestHeadlessRestartNotice(Base):
     def test_a_state_file_that_cannot_be_written_is_said_and_the_restart_notice_still_goes_out(self):
         self.worker("w1")
         self.notices()
-        self.pid[0] = 200
+        self.pid[0] = self.px[200]
         with mock.patch.object(sb, "_write_small", side_effect=OSError("disk full")):
             self.engine.discover(self.world.clock.now())
             facts = [f for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"]
@@ -53715,7 +53745,7 @@ class TestJobTool(unittest.TestCase):
             self.assertEqual(sb.job_starter(None, time.time), (None, None))
 
 
-class TestJobFacts(unittest.TestCase):
+class TestJobFacts(StandInPids, unittest.TestCase):
     """A dead job its starter has not looked at is one line to the starter's boss, once."""
 
     def setUp(self):
@@ -53732,7 +53762,8 @@ class TestJobFacts(unittest.TestCase):
         self.source = sb.JobFacts()
         self.source.bind(self.engine)
 
-    def record(self, name, session="ses_example1", pid=99999999, started=1000.0, starter="coder", **extra):
+    def record(self, name, session="ses_example1", pid=None, started=1000.0, starter="coder", **extra):
+        pid = pid or self.px[99999999]
         directory = self.root / name
         directory.mkdir()
         (directory / "job.json").write_text(json.dumps(dict({"name": name, "argv": ["x"], "pid": pid, "started": started, "token": None,
@@ -53780,7 +53811,7 @@ class TestJobFacts(unittest.TestCase):
         self.assertEqual(self.source(), [], "the dir is not private")
         os.chmod(str(self.root), 0o700)
         (self.root / "Bad Name").mkdir()
-        (self.root / "Bad Name" / "job.json").write_text(json.dumps({"name": "Bad Name", "pid": 99999999, "session": "ses_example1", "starter": "coder", "started": 1.0}))
+        (self.root / "Bad Name" / "job.json").write_text(json.dumps({"name": "Bad Name", "pid": self.px[99999999], "session": "ses_example1", "starter": "coder", "started": 1.0}))
         self.assertEqual([f.key for f in self.source()], ["job.dead:suite:1000"], "a name outside the pattern is skipped")
         with mock.patch.object(sb.os, "getuid", return_value=os.getuid() + 1):
             self.assertIsNone(sb.job_read("suite", self.root), "a record owned by someone else is not believed")
@@ -55598,29 +55629,117 @@ class TestMadeUpPids(unittest.TestCase):
         self.assertIn("this command or its parent", sb.daemon_pid_refusal(os.getpid()))
         self.assertIsNone(sb.daemon_pid_refusal(made_up_pid()))
 
-    def test_s1_s7_no_stand_in_process_number_is_a_literal_in_the_classes_that_stand_in_for_a_process(self):
-        tree = ast.parse(Path(__file__).read_text())
-        classes = ("TestDaemonCommand", "TestRestartCommand", "TestHeavyQueueLogic", "TestHeavyWatchdog", "TestHeavyFifo")
-        literals = {4242, 4243, 4300, 4301, 4343, 5000, 5001, 6000, 777, 778, 999, 9001, 9002, 9003}
-        found = []
-        for node in tree.body:
-            if isinstance(node, ast.ClassDef) and node.name in classes:
-                subscripts = {id(n.slice) for n in ast.walk(node) if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Attribute) and n.value.attr == "px"}
-                for inner in ast.walk(node):
-                    if isinstance(inner, ast.Constant) and type(inner.value) is int and inner.value in literals and id(inner) not in subscripts:
-                        found.append((node.name, inner.lineno, inner.value))
-        self.assertEqual(found, [])
+    def test_the_liveness_proof_pins_every_answer_of_the_system(self):
+        module = sys.modules[__name__]
+        for error, alive in ((ProcessLookupError(), False), (PermissionError(), True), (OSError(errno.EIO, "x"), True)):
+            with self.subTest(error=type(error).__name__), mock.patch.object(os, "kill", side_effect=error):
+                self.assertIs(module._pid_alive(5), alive)
+        with mock.patch.object(os, "kill", return_value=None):
+            self.assertTrue(module._pid_alive(5))
 
-    def test_s4_the_four_failing_tests_pass_when_the_old_number_4243_is_this_processs_own_parent(self):
-        cases = (("TestDaemonCommand", "test_S3_stop_ends_an_ensure_daemon_by_signal_and_a_launchd_daemon_by_bootout"),
-                 ("TestDaemonCommand", "test_a_launchd_refusal_is_said_plainly_and_the_daemon_is_left_running"),
-                 ("TestHeavyWatchdog", "test_s10_only_the_group_or_tree_the_wrapper_started_is_signalled_never_another_process"),
-                 ("TestHeavyWatchdog", "test_s3_the_time_stop_covers_the_tree_even_with_the_memory_ceiling_off"))
-        suite = unittest.TestSuite(globals()[cls](name) for cls, name in cases)
-        result = unittest.TestResult()
-        with mock.patch.object(os, "getppid", lambda: 4243), mock.patch.object(sys.modules[__name__], "_MADE_UP_NEXT", [4240]):
-            suite.run(result)
-        self.assertEqual((result.testsRun, [str(e[0]) for e in result.failures + result.errors]), (4, []))
+    def test_the_helper_never_returns_this_process_its_parent_or_its_grandparent(self):
+        module = sys.modules[__name__]
+        first = [None]
+        with mock.patch.object(module, "_MADE_UP_GIVEN", set()), mock.patch.object(module, "_pid_alive", lambda pid: False), mock.patch.object(module, "_MADE_UP_NEXT", [6000]):
+            with mock.patch.object(module, "_ancestors", lambda: {6000, 6001, 6002}), mock.patch.object(os, "getppid", lambda: 6003), mock.patch.object(os, "getpid", lambda: 6004):
+                got = [made_up_pid() for _ in range(3)]
+        self.assertEqual(got, [6005, 6006, 6007])
+        self.assertTrue({os.getpid(), os.getppid()} & set(module._ancestors()))
+
+    # -- the completeness scan: no integer literal stands in for a process anywhere in this file but through the helper
+
+    @staticmethod
+    def pid_literals(source, skip=("TestMadeUpPids",)):
+        """[(line, number, where)]: every integer literal above 1 in a position that names a process: a `pid=`, `ppid=`, `pgid=` or `*_pid=` keyword, a dict key
+        of that kind, an assignment or default for a name of that kind, a comparison with one, and the first two numbers of a process-table row (a tuple of
+        4 or 5 whose first two are integers, inside a list). A number from `self.px[...]`, the helper, is not a literal."""
+        tree = ast.parse(source)
+        parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+        skipped = {id(inner) for node in tree.body if isinstance(node, ast.ClassDef) and node.name in skip for inner in ast.walk(node)}
+        isint = lambda n: isinstance(n, ast.Constant) and type(n.value) is int
+        named = lambda name: any(name == k or name.endswith("_" + k) or name.startswith(k + "_") for k in ("pid", "ppid", "pgid", "pgrp"))
+        hits = []
+
+        def add(node, why):
+            if isint(node) and node.value > 1 and id(node) not in skipped:
+                hits.append((node.lineno, node.value, why))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.keyword) and node.arg and named(node.arg):
+                add(node.value, "keyword " + node.arg)
+            elif isinstance(node, ast.Dict):
+                for key, value in zip(node.keys, node.values):
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str) and named(key.value):
+                        add(value, "dict " + key.value)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    base = target.value if isinstance(target, ast.Subscript) else target
+                    name = getattr(base, "attr", None) or getattr(base, "id", None)
+                    if name and named(name):
+                        add(node.value, "assign " + name)
+                        for element in (node.value.elts if isinstance(node.value, (ast.List, ast.Tuple, ast.Set)) else []):
+                            add(element, "assign " + name)
+            elif isinstance(node, ast.arguments):
+                for arg, default in zip(node.args[len(node.args) - len(node.defaults):], node.defaults):
+                    if named(arg.arg):
+                        add(default, "default " + arg.arg)
+            elif isinstance(node, ast.Compare):
+                sides = [node.left] + node.comparators
+                if any(isinstance(side, ast.Name) and named(side.id) for side in sides):
+                    for side in sides:
+                        add(side, "compare")
+            elif isinstance(node, ast.Tuple) and 4 <= len(node.elts) <= 5 and isinstance(parents.get(node), (ast.List, ast.ListComp)) \
+                    and all(isint(e) or isinstance(e, (ast.Subscript, ast.Name, ast.Attribute, ast.Call)) for e in node.elts[:2]):
+                add(node.elts[0], "row pid")
+                add(node.elts[1], "row ppid")
+                if isint(node.elts[2]):
+                    add(node.elts[2], "row pgid")
+        return sorted(set(hits))
+
+    def test_no_integer_literal_stands_in_for_a_process_anywhere_in_the_test_file(self):
+        self.assertEqual(self.pid_literals(Path(__file__).read_text()), [])
+
+    def test_the_scan_catches_each_position_a_hard_coded_number_can_take(self):
+        mutants = ('rows = [(4001, 1, self.p, 7, "x")]', 'rows = [(self.px[1], 4001, self.p, 7)]', 'call(pid=4001)', 'call(shell_pid=4001)', 'x = {"pid": 4001}',
+                   'self.job_pid = 4001', 'self.pid[0] = 4001', 'def f(pid=4001): pass', 'if pid != 4001: pass', 'self.alive_pid = [4001]')
+        for source in mutants:
+            with self.subTest(source=source):
+                self.assertEqual([h[1] for h in self.pid_literals(source)], [4001])
+        for clean in ('rows = [(self.px[4001], 1, self.p, 7)]', 'call(pid=self.px[4001])', 'x = {"pid": 1}', 'for mode in (1, 2, 3, 4): pass', 'self.assertEqual(got, (5, 6, 7, 9))'):
+            with self.subTest(clean=clean):
+                self.assertEqual(self.pid_literals(clean), [])
+
+    def test_s4_each_group_that_stands_in_for_a_process_passes_when_its_old_numbers_are_the_real_parent_and_grandparent(self):
+        module = sys.modules[__name__]
+        groups = {"daemon command": [(TestDaemonCommand, None)],
+                  "heavy watchdog": [(TestHeavyWatchdog, None)],
+                  "heavy queue and fifo": [(TestHeavyQueueLogic, None), (TestHeavyFifo, None)],
+                  "orphan reaper": [(TestLaunch, name) for name in (
+                      "test_the_orphan_allow_list_picks_only_exact_matches_of_this_user_past_the_grace_and_never_a_protected_target",
+                      "test_the_reap_is_a_dry_run_by_default_signals_term_then_kill_audited_and_refuses_a_stranger_and_the_kill_switch",
+                      "test_a_pid_whose_command_changed_before_the_signal_is_not_signalled_and_the_orphan_config_is_validated")],
+                  "headless restart notice": [(TestHeadlessRestartNotice, None)],
+                  "heavy readiness": [(TestHeavySlotsReadiness, "test_the_readiness_decision_is_the_final_record_not_the_lock_and_not_the_wrappers_first_record")]}
+        for group, members in groups.items():
+            suite = unittest.TestSuite()
+            for cls, name in members:
+                real_parent = ("test_odd_file_names_in_the_state_directory_are_left_alone_and_never_stop_the_wrapper",)   # it uses the REAL parent as its live process
+                names = [name] if name else [n for n in dir(cls) if n.startswith("test") and callable(getattr(cls, n)) and n not in real_parent]
+                suite.addTests(cls(n) for n in names)
+            parent, grand = 4243, 4242      # the old made-up numbers become the real parent and grandparent of this run
+            result = unittest.TestResult()
+            with mock.patch.object(os, "getppid", lambda: parent), mock.patch.object(module, "_ancestors", lambda: {os.getpid(), parent, grand}), \
+                    mock.patch.object(module, "_MADE_UP_NEXT", [4240]):
+                suite.run(result)
+            with self.subTest(group=group):
+                self.assertGreater(result.testsRun, 0)
+                self.assertEqual([str(e[0]) for e in result.failures + result.errors], [])
+
+    def test_the_old_numbers_are_never_handed_out_when_they_are_the_parent_and_grandparent(self):
+        module = sys.modules[__name__]
+        with mock.patch.object(os, "getppid", lambda: 4243), mock.patch.object(module, "_ancestors", lambda: {os.getpid(), 4243, 4242}), \
+                mock.patch.object(module, "_MADE_UP_NEXT", [4240]), mock.patch.object(module, "_pid_alive", lambda pid: False):
+            got = [made_up_pid() for _ in range(5)]
+        self.assertFalse({4242, 4243} & set(got), got)
 
 
 class TestHeavyQueueLogic(StandInPids, unittest.TestCase):
@@ -55803,7 +55922,7 @@ class TestHeavyWatchdog(StandInPids, unittest.TestCase):
 
     def test_s1_a_child_of_the_command_that_grows_is_counted_and_stopped_with_the_command(self):
         """rev-wake's run: the command itself is small, its CHILD is the one that grows."""
-        rows = lambda n: [(self.px[4242], 100, self.px[4242], 2 * 1024), (self.px[4300], self.px[4242], self.px[4242], 9000 * 1024), (self.px[4301], self.px[4300], self.px[4242], 9000 * 1024), (self.px[999], 1, self.px[999], 1024)]
+        rows = lambda n: [(self.px[4242], self.px[100], self.px[4242], 2 * 1024), (self.px[4300], self.px[4242], self.px[4242], 9000 * 1024), (self.px[4301], self.px[4300], self.px[4242], 9000 * 1024), (self.px[999], 1, self.px[999], 1024)]
         self.stopping = threading.Event()
         code = self.run_watched(rows)
         self.assertEqual(code, 137)
@@ -56085,7 +56204,7 @@ class TestHeavyFifo(StandInPids, unittest.TestCase):
         self.addCleanup(shutil.rmtree, str(self.dir), True)
         self.out, self.takes, self.started, self.clock_calls = BoundedOut(), BoundedList(), BoundedList(), BoundedList()
         self.now = [1000.0]
-        self.alive = {1001, 1002, 1003, 1004, 1005}
+        self.alive = {self.px[1001], self.px[1002], self.px[1003], self.px[1004], self.px[1005]}
 
     def seed(self, pids):
         (self.dir / "heavy-queue.json").write_text(json.dumps({"entries": [{"pid": pid, "start": "t", "name": "w%d" % pid, "short": False} for pid in pids]}))
@@ -56127,41 +56246,41 @@ class TestHeavyFifo(StandInPids, unittest.TestCase):
         return lambda state, slots: (fd, 0)
 
     def test_s1_slots_go_to_the_callers_in_the_order_they_arrived(self):
-        self.seed([1001, 1002, 1003, 1004])
-        self.assertEqual(self.run_as(1004, self.free()), 75, "D arrived last: it never gets a slot while A B C wait")
+        self.seed([self.px[1001], self.px[1002], self.px[1003], self.px[1004]])
+        self.assertEqual(self.run_as(self.px[1004], self.free()), 75, "D arrived last: it never gets a slot while A B C wait")
         self.assertEqual(list(self.takes), [], "and it did not even try one")
-        self.assertEqual(self.entries(), [1001, 1002, 1003], "it left the line when it gave up; the others kept their places")
+        self.assertEqual(self.entries(), [self.px[1001], self.px[1002], self.px[1003]], "it left the line when it gave up; the others kept their places")
         order = []
-        for pid in (1001, 1002, 1003):
+        for pid in (self.px[1001], self.px[1002], self.px[1003]):
             self.assertEqual(self.run_as(pid, self.free()), 0)
             order.append(self.started[-1])
-        self.assertEqual(order, [1001, 1002, 1003])
+        self.assertEqual(order, [self.px[1001], self.px[1002], self.px[1003]])
         self.assertEqual(self.entries(), [], "each left the line when it took its slot")
-        self.assertEqual(self.run_as(1004, self.free()), 0)
+        self.assertEqual(self.run_as(self.px[1004], self.free()), 0)
 
     def test_s2_a_new_caller_polling_at_the_instant_a_slot_frees_does_not_take_it_from_an_earlier_waiter(self):
-        self.seed([1001])
-        self.assertEqual(self.run_as(1002, self.free(), wait_max=5), 75)
+        self.seed([self.px[1001]])
+        self.assertEqual(self.run_as(self.px[1002], self.free(), wait_max=5), 75)
         self.assertEqual(list(self.started), [])
-        self.assertEqual(self.entries(), [1001], "it also left the line when it gave up")
-        self.assertEqual(self.run_as(1001, self.free()), 0)
+        self.assertEqual(self.entries(), [self.px[1001]], "it also left the line when it gave up")
+        self.assertEqual(self.run_as(self.px[1001], self.free()), 0)
 
     def test_s3_a_waiter_at_the_head_that_died_does_not_block_the_one_behind_it(self):
-        self.seed([1001, 1002])
-        self.alive.discard(1001)
-        self.assertEqual(self.run_as(1002, self.free()), 0)
-        self.assertEqual(list(self.takes), [1002], "it took the slot at its first look, with no wait for the wait limit")
-        self.assertEqual(list(self.started), [1002])
+        self.seed([self.px[1001], self.px[1002]])
+        self.alive.discard(self.px[1001])
+        self.assertEqual(self.run_as(self.px[1002], self.free()), 0)
+        self.assertEqual(list(self.takes), [self.px[1002]], "it took the slot at its first look, with no wait for the wait limit")
+        self.assertEqual(list(self.started), [self.px[1002]])
 
     def test_s4_a_short_command_runs_in_the_express_slot_when_the_ordinary_ones_are_busy_and_a_second_waits_for_it_only(self):
         second = {}
 
         def while_first_runs():
-            second["status"] = self.run_as(1002, short=True, wait_max=15)
+            second["status"] = self.run_as(self.px[1002], short=True, wait_max=15)
             return 0
-        self.assertEqual(self.run_as(1001, short=True, on_child=while_first_runs), 0)
+        self.assertEqual(self.run_as(self.px[1001], short=True, on_child=while_first_runs), 0)
         self.assertEqual(second["status"], 75, "the express slot was held: the second one waited and gave up")
-        self.assertEqual(list(self.started), [1001])
+        self.assertEqual(list(self.started), [self.px[1001]])
 
     def test_s5_a_short_command_past_120_seconds_is_stopped_with_124_and_frees_the_express_slot(self):
         stopped = threading.Event()
@@ -56173,7 +56292,7 @@ class TestHeavyFifo(StandInPids, unittest.TestCase):
         rows = [(self.px[4242], 1, os.getpgrp(), 10, "c")]
         dog = {"read_table": lambda: [] if stopped.is_set() else rows, "pause": lambda seconds: stopped.wait(0.001), "killpg": record, "kill": record, "every": 0.001,
                "grace": 0.001, "sweep_pause": lambda s: None, "me": (self.px[9001], self.px[9002], self.px[9003]), "lsof": lambda path: set()}
-        code = self.run_as(1001, short=True, step=60.0, on_child=lambda: (stopped.wait(30), -9)[1], watchdog=dog)
+        code = self.run_as(self.px[1001], short=True, step=60.0, on_child=lambda: (stopped.wait(30), -9)[1], watchdog=dog)
         self.assertEqual(code, 124)
         self.assertIn("time ceiling of 120 s", self.out.getvalue())
         fd = self.hs._take_express(str(self.dir))
@@ -56181,8 +56300,8 @@ class TestHeavyFifo(StandInPids, unittest.TestCase):
         os.close(fd)
 
     def test_s6_the_waiting_line_says_the_place_in_the_order_and_names_the_holders(self):
-        self.seed([1001, 1002, 1003])
-        self.assertEqual(self.run_as(1003, report="5"), 75)
+        self.seed([self.px[1001], self.px[1002], self.px[1003]])
+        self.assertEqual(self.run_as(self.px[1003], report="5"), 75)
         text = self.out.getvalue()
         self.assertEqual(text.count("place 3 in line (2 ahead)"), 1, text)
         for name in ("who-a", "who-b", "who-c"):
@@ -56208,22 +56327,22 @@ class TestHeavyFifo(StandInPids, unittest.TestCase):
                 def take(state, slots):
                     attempts.append(1)
                     return self.free()(state, slots) if len(attempts) >= 2 else (None, None)
-                self.assertEqual(self.run_as(1002, take), 0)
+                self.assertEqual(self.run_as(self.px[1002], take), 0)
                 self.assertEqual(self.out.getvalue().count("no waiting order"), 1, self.out.getvalue())
                 self.assertEqual(len(attempts), 2)
 
     def test_s8_the_defaults_and_the_exit_status_of_giving_up_are_as_before(self):
         self.assertEqual((self.hs.DEFAULT_SLOTS, self.hs.DEFAULT_WAIT_MAX, self.hs.EXIT_TEMPFAIL), (3, 1800, 75))
         self.assertEqual(self.hs.settings(None), 3)
-        self.assertEqual(self.run_as(1001, wait_max=15), 75, "nobody waiting, no slot: gives up as before")
+        self.assertEqual(self.run_as(self.px[1001], wait_max=15), 75, "nobody waiting, no slot: gives up as before")
         self.assertIs(inspect.signature(self.hs.run).parameters["short"].default, False)
 
     def test_s10_entries_of_processes_that_are_gone_are_dropped_and_the_live_one_keeps_its_place(self):
-        self.seed([1001, 1002, 1003])
-        self.alive -= {1001, 1003}
-        line = self.hs.Line(str(self.dir), "w", pid=1002, alive=lambda p, st: p in self.alive, start_of=lambda p: "t")
+        self.seed([self.px[1001], self.px[1002], self.px[1003]])
+        self.alive -= {self.px[1001], self.px[1003]}
+        line = self.hs.Line(str(self.dir), "w", pid=self.px[1002], alive=lambda p, st: p in self.alive, start_of=lambda p: "t")
         self.assertEqual(line.place(), 1)
-        self.assertEqual(self.entries(), [1002])
+        self.assertEqual(self.entries(), [self.px[1002]])
 
     def test_s11_the_express_slot_has_its_own_lock_file_and_the_ordinary_ones_are_untouched(self):
         seen = {}
@@ -56241,7 +56360,7 @@ class TestHeavyFifo(StandInPids, unittest.TestCase):
             seen["express"] = locked(str(self.dir / "heavy-slot-express.lock"))
             seen["ordinary"] = [locked(str(self.dir / ("heavy-slot-%d.lock" % i))) for i in range(3)]
             return 0
-        self.assertEqual(self.run_as(1001, short=True, on_child=while_running), 0)
+        self.assertEqual(self.run_as(self.px[1001], short=True, on_child=while_running), 0)
         self.assertEqual(seen, {"express": True, "ordinary": [False, False, False]})
 
     def test_a_dead_waiters_pid_reused_by_another_process_is_not_that_waiter(self):
@@ -56255,12 +56374,12 @@ class TestHeavyFifo(StandInPids, unittest.TestCase):
         self.assertFalse(self.hs._alive(gone.pid, ""), "a pid that is gone is not alive")
 
     def test_a_short_write_never_leaves_a_half_written_order_file_or_a_temporary_file(self):
-        line = self.hs.Line(str(self.dir), "w", pid=1001, alive=lambda p, st: True, start_of=lambda p: "t")
+        line = self.hs.Line(str(self.dir), "w", pid=self.px[1001], alive=lambda p, st: True, start_of=lambda p: "t")
         line.place()
         before = (self.dir / "heavy-queue.json").read_text()
         with mock.patch.object(self.hs.os, "fsync", side_effect=OSError(5, "disk")):
             with self.assertRaises(self.hs.QueueUnusable):
-                self.hs.Line(str(self.dir), "w", pid=1002, alive=lambda p, st: True, start_of=lambda p: "t").place()
+                self.hs.Line(str(self.dir), "w", pid=self.px[1002], alive=lambda p, st: True, start_of=lambda p: "t").place()
         self.assertEqual((self.dir / "heavy-queue.json").read_text(), before, "the file is as it was")
         self.assertEqual([p.name for p in self.dir.iterdir() if p.name.endswith(".tmp")], [], "no temporary file is left")
 
@@ -56275,11 +56394,11 @@ class TestHeavyFifo(StandInPids, unittest.TestCase):
                 raise self.hs.QueueUnusable("the order file is corrupt")
             return real(line)
         with mock.patch.object(self.hs.Line, "place", once_then_fail):
-            self.assertEqual(self.run_as(1001, wait_max=25), 75)
+            self.assertEqual(self.run_as(self.px[1001], wait_max=25), 75)
         self.assertEqual(self.entries(), [], "it joined, then fell back, and is not in the line any more")
 
     def test_a_caller_that_is_not_short_never_uses_the_express_slot(self):
-        self.assertEqual(self.run_as(1001, short=False, wait_max=15), 75)
+        self.assertEqual(self.run_as(self.px[1001], short=False, wait_max=15), 75)
         self.assertEqual(list(self.started), [])
         self.assertFalse((self.dir / "heavy-slot-express.lock").exists(), "the express slot was not even opened")
 
@@ -56292,7 +56411,7 @@ class TestHeavyFifo(StandInPids, unittest.TestCase):
         self.assertIs(seen.get("short"), True)
 
     def test_an_oversize_file_a_bad_entry_and_a_lock_that_stays_held_are_unusable_not_trusted(self):
-        make = lambda: self.hs.Line(str(self.dir), "w", pid=1001, alive=lambda p, st: True, start_of=lambda p: "t", lock_tries=2, lock_pause=0.001)
+        make = lambda: self.hs.Line(str(self.dir), "w", pid=self.px[1001], alive=lambda p, st: True, start_of=lambda p: "t", lock_tries=2, lock_pause=0.001)
         (self.dir / "heavy-queue.json").write_text(" " * (self.hs.QUEUE_BYTES + 10))
         with self.assertRaises(self.hs.QueueUnusable):
             make().place()
@@ -56311,22 +56430,22 @@ class TestHeavyFifo(StandInPids, unittest.TestCase):
 
 
     def test_a_ticket_whose_owner_holds_a_slot_is_dropped_so_a_ghost_never_blocks_the_line(self):
-        self.seed([1001, 1002])
-        line = self.hs.Line(str(self.dir), "w", pid=1002, alive=lambda p, st: True, start_of=lambda p: "t", held=lambda: {1001})
-        self.assertEqual(line.place(), 1, "1001 holds a slot: its ticket is not a place in the line")
-        self.assertEqual(self.entries(), [1002])
+        self.seed([self.px[1001], self.px[1002]])
+        line = self.hs.Line(str(self.dir), "w", pid=self.px[1002], alive=lambda p, st: True, start_of=lambda p: "t", held=lambda: {self.px[1001]})
+        self.assertEqual(line.place(), 1, "self.px[1001] holds a slot: its ticket is not a place in the line")
+        self.assertEqual(self.entries(), [self.px[1002]])
 
     def test_a_caller_whose_ticket_could_not_be_removed_says_so_and_the_waiter_behind_it_still_gets_the_next_slot(self):
-        self.seed([1001, 1002])
+        self.seed([self.px[1001], self.px[1002]])
         attempts = []
         with mock.patch.object(self.hs.Line, "leave", lambda line: attempts.append(1) and False):
-            self.assertEqual(self.run_as(1001, self.free()), 0)
+            self.assertEqual(self.run_as(self.px[1001], self.free()), 0)
         self.assertGreaterEqual(len(attempts), 2, "it tried to leave again before saying so")
         self.assertEqual(self.out.getvalue().count("could not leave the waiting order"), 1, self.out.getvalue())
-        self.assertEqual(self.entries(), [1001, 1002], "the ghost is still in the file")
+        self.assertEqual(self.entries(), [self.px[1001], self.px[1002]], "the ghost is still in the file")
         self.out, self.takes, self.started = BoundedOut(), BoundedList(), BoundedList()
-        self.assertEqual(self.run_as(1002, self.free(), held={1001}), 0, "the waiter behind the ghost still takes the next free slot")
-        self.assertEqual(list(self.started), [1002])
+        self.assertEqual(self.run_as(self.px[1002], self.free(), held={self.px[1001]}), 0, "the waiter behind the ghost still takes the next free slot")
+        self.assertEqual(list(self.started), [self.px[1002]])
 
     def test_the_slot_record_names_the_wrapper_and_held_by_lists_it_with_the_express_holder(self):
         fd = os.open(str(self.dir / "heavy-slot-1.lock"), os.O_RDWR | os.O_CREAT, 0o600)
@@ -56359,7 +56478,7 @@ class TestHeavyFifo(StandInPids, unittest.TestCase):
         other = self.dir / "unrelated.tmp"
         for path in (stale, other):
             path.write_text("x")
-        self.hs.Line(str(self.dir), "w", pid=1001, alive=lambda p, st: True, start_of=lambda p: "t", held=lambda: set()).place()
+        self.hs.Line(str(self.dir), "w", pid=self.px[1001], alive=lambda p, st: True, start_of=lambda p: "t", held=lambda: set()).place()
         self.assertFalse(stale.exists(), "the dead process's temporary file is gone")
         self.assertTrue(other.exists(), "nothing else is touched")
         self.assertFalse(mine.exists(), "and its own was renamed into place")
@@ -56382,7 +56501,7 @@ class TestHeavyFifo(StandInPids, unittest.TestCase):
         link = self.dir / ("heavy-queue.json.%d.tmp" % (gone.pid + 2 if gone.pid < 2 ** 22 - 3 else 3))
         os.symlink(str(target), str(link))                                        # a symlink: never followed, left alone
         notes = BoundedList()
-        self.hs.Line(str(self.dir), "w", pid=1001, alive=lambda p, st: True, start_of=lambda p: "t", held=lambda: set(), note=notes.append).place()
+        self.hs.Line(str(self.dir), "w", pid=self.px[1001], alive=lambda p, st: True, start_of=lambda p: "t", held=lambda: set(), note=notes.append).place()
         for name in stray:
             self.assertTrue((self.dir / name).exists(), "left alone: %r" % name)
         self.assertTrue((self.dir / ("heavy-queue.json.%d.tmp" % live)).exists())
@@ -56392,8 +56511,8 @@ class TestHeavyFifo(StandInPids, unittest.TestCase):
 
     def test_a_sweep_that_raises_never_stops_the_command_and_says_so_once(self):
         with mock.patch.object(self.hs.os, "listdir", side_effect=RuntimeError("boom")):
-            self.assertEqual(self.run_as(1001, self.free()), 0)
-        self.assertEqual(list(self.started), [1001], "the command still ran")
+            self.assertEqual(self.run_as(self.px[1001], self.free()), 0)
+        self.assertEqual(list(self.started), [self.px[1001]], "the command still ran")
         self.assertEqual(self.out.getvalue().count("queue sweep failed: RuntimeError"), 1, self.out.getvalue())
 
     def test_the_numbers_read_from_files_and_ps_are_ascii_digits_only(self):
@@ -56821,7 +56940,7 @@ class TestHeavySlots(Base):
             self.assertEqual(found.lower().count(line), 1, path)
 
 
-class TestHeavySlotsReadiness(TestHeavySlots):
+class TestHeavySlotsReadiness(StandInPids, TestHeavySlots):
     """#688: the readiness helper of TestHeavySlots. Its own checks run here (the inherited tests below are removed: they run once, in TestHeavySlots, and the three
     that failed in CI run again in TestHeavySlotsSlowStart)."""
 
@@ -56856,13 +56975,13 @@ class TestHeavySlotsReadiness(TestHeavySlots):
         def held(name, command, pid):
             return {"slot": 0, "name": name, "command": command, "pid": pid, "since": 1}
         ready = self.holders_ready
-        self.assertFalse(ready([held("?", "?", None)], 1, "the-coder", [100]), "the lock is held, no record yet")
-        self.assertFalse(ready([held("the-coder", "sleep", 100)], 1, "the-coder", [100]), "the wrapper's own first record: the second write (truncate, then the command's pid) is still to come")
+        self.assertFalse(ready([held("?", "?", None)], 1, "the-coder", [self.px[100]]), "the lock is held, no record yet")
+        self.assertFalse(ready([held("the-coder", "sleep", self.px[100])], 1, "the-coder", [self.px[100]]), "the wrapper's own first record: the second write (truncate, then the command's pid) is still to come")
         self.assertFalse(ready([held("?", "?", None)], 1, None, []), "a '?' holder is never ready, with or without a name asked for")
-        self.assertFalse(ready([held("other", "sleep", 200)], 1, "the-coder", [100]), "the wrong holder")
-        self.assertFalse(ready([], 1, "the-coder", [100]), "no holder")
-        self.assertFalse(ready([held("the-coder", "sleep", 200), held("?", "?", None)], 2, None, [100]), "one of two is not ready")
-        self.assertTrue(ready([held("the-coder", "sleep", 200)], 1, "the-coder", [100]), "the command's pid: the final record")
+        self.assertFalse(ready([held("other", "sleep", self.px[200])], 1, "the-coder", [self.px[100]]), "the wrong holder")
+        self.assertFalse(ready([], 1, "the-coder", [self.px[100]]), "no holder")
+        self.assertFalse(ready([held("the-coder", "sleep", self.px[200]), held("?", "?", None)], 2, None, [self.px[100]]), "one of two is not ready")
+        self.assertTrue(ready([held("the-coder", "sleep", self.px[200])], 1, "the-coder", [self.px[100]]), "the command's pid: the final record")
 
     def test_the_helper_waits_through_the_wrappers_first_record_until_the_second_is_written(self):
         """The product's own two records, in order and with a deterministic gap: the helper returns only after the second."""
@@ -56871,14 +56990,14 @@ class TestHeavySlotsReadiness(TestHeavySlots):
         fd = os.open(str(state / "heavy-slot-0.lock"), os.O_RDWR | os.O_CREAT, 0o600)
         self.addCleanup(os.close, fd)
         fcntl.flock(fd, fcntl.LOCK_EX)
-        self.hs._record(fd, "the-coder", 100, "sleep", time.time())   # the wrapper's first record: pid 100 is the wrapper
-        wrapper = mock.Mock(pid=100)
+        self.hs._record(fd, "the-coder", self.px[100], "sleep", time.time())   # the wrapper's first record: pid 100 is the wrapper
+        wrapper = mock.Mock(pid=self.px[100])
         with self.assertRaises(AssertionError) as caught:
             self.ready_holders(1, name="the-coder", seconds=0.5, wrappers=[wrapper])
         self.assertIn("not ready", str(caught.exception))
-        self.hs._record(fd, "the-coder", 200, "sleep", time.time())   # the second: the command's pid
+        self.hs._record(fd, "the-coder", self.px[200], "sleep", time.time())   # the second: the command's pid
         (entry,) = self.ready_holders(1, name="the-coder", seconds=0.5, wrappers=[wrapper])
-        self.assertEqual(entry["pid"], 200)
+        self.assertEqual(entry["pid"], self.px[200])
 
 
 class TestHeavySlotsSlowStart(TestHeavySlots):
@@ -61426,7 +61545,7 @@ class V2TransportBase(Base):
         return sb.V2Client("/fake/bin/opencode", {}, self.runner, timeout, http=self.route(timeout), **kwargs)
 
 
-class TestV2Http(V2TransportBase):
+class TestV2Http(StandInPids, V2TransportBase):
     def test_a_read_goes_over_http_with_the_operations_own_path_and_query_and_the_same_decoded_result(self):
         client = self.client()
         self.assertEqual(client.server_info(), {"version": "2.0.24"})
@@ -61493,7 +61612,7 @@ class TestV2Http(V2TransportBase):
         self.assertEqual((len(self.cli_calls), client.calls_by_transport()), (1, {"cli-fallback": 1}), "a fallback counts once, as the CLI call that served it")
 
     def test_a_bad_service_file_uses_the_cli_and_the_service_is_not_contacted(self):
-        cases = (("none", lambda: None), ("stale pid", lambda: self.service.write_service_file(self.service_file, pid=99999999)),
+        cases = (("none", lambda: None), ("stale pid", lambda: self.service.write_service_file(self.service_file, pid=self.px[99999999])),
                  ("remote", lambda: self.service.write_service_file(self.service_file, url="http://203.0.113.9:80")),
                  ("a name, not a literal address", lambda: self.service.write_service_file(self.service_file, url="http://localhost:49374")),
                  ("world readable", lambda: self.service.write_service_file(self.service_file, mode=0o644)),
@@ -61506,7 +61625,7 @@ class TestV2Http(V2TransportBase):
                 writer()
                 self.cli_calls.clear()
                 before = len(self.service.requests)
-                client = sb.V2Client("/fake/bin/opencode", {}, self.runner, 5, http=self.route(alive=lambda pid: pid != 99999999))
+                client = sb.V2Client("/fake/bin/opencode", {}, self.runner, 5, http=self.route(alive=lambda pid: pid != self.px[99999999]))
                 self.assertEqual(client.session_active(), {"via": "cli"})
                 self.assertEqual(len(self.service.requests), before, "the service was not contacted")
         for good in ("http://127.0.0.1:49374", "http://[::1]:49374"):
