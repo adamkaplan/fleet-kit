@@ -32197,11 +32197,11 @@ class TestRegistrarFloor(LedgerBase):
         for label, (body, verb) in self.hostile_table().items():
             with self.subTest(label):
                 got = self.found_unit(body)
-                self.assertTrue(got, label)
-                self.assertTrue(all(g[0] == "add_zzz_parsers" and g[1] == verb for g in got) or any(g[1] == verb for g in got), (label, got))
+                self.assertTrue(any(g[0] == "add_zzz_parsers" and g[1] == verb for g in got), (label, got))
                 reasons = sb.impact_floor.registrar_reasons({"findings": got, "why": None})
-                self.assertTrue(all("registrar add_zzz_parsers" in r for r in reasons) and reasons)
-                self.assertTrue(any(g[2] in reasons[i] for i, g in enumerate(got)))
+                self.assertEqual(len(reasons), len(got))
+                for finding, reason in zip(got, reasons):
+                    self.assertIn("registrar add_zzz_parsers %s closure name %s" % finding[1:], reason)
 
     def test_a_registrar_that_only_adds_a_flag_or_refers_to_a_name_without_calling_it_is_not_held(self):
         function, binding, module = self.pick()
@@ -32260,9 +32260,6 @@ class TestRegistrarFloor(LedgerBase):
         self.assertTrue(self.table_holds())
         self.assertFalse(self.table_holds(names=[]), "a mutant that drops the closure names survives")
         self.assertFalse(self.table_holds(pattern=re.compile("(?!)")), "a mutant that drops the registrars survives")
-        with mock.patch.object(self.dc, "registrar_pattern", lambda tree: re.compile("(?!)")):
-            got, why = self.dc.registrar_findings(self.base_src, self.head_of("global %s\n%s = None" % (self.pick()[1], self.pick()[1])), self.rule)
-            self.assertEqual(got, [], "with no registrar matched the hostile edit is not seen: the mutant must be caught by the table above")
         function, binding, module = self.pick()
         import ast
         for name in self.names:   # a mutant for each member of the closure: without it, the registrar that rebinds it is not seen
@@ -32302,15 +32299,85 @@ class TestRegistrarFloor(LedgerBase):
         self.assertEqual({"globals", "vars", "locals", "setattr", "delattr", "getattr", "eval", "exec", "compile", "__import__", "import_module"} & set(self.dc.NAMESPACE_REACHERS), set(self.dc.NAMESPACE_REACHERS))
         self.assertEqual(set(self.dc.NAMESPACE_REACHERS) & set(self.names), set(), "the Python namespace reachers are not closure names")
 
-    def test_no_registrar_of_the_daemon_file_is_held_today_and_the_count_is_the_one_the_pattern_finds(self):
+    def test_no_registrar_of_the_daemon_file_or_a_helper_it_reaches_is_held_today_every_line_counted(self):
+        """The real file with EVERY line counted as added (an empty base): the registrars, their helpers and every binding of a registrar name are read and none is held."""
         import ast
         pattern = self.dc.registrar_pattern(self.tree)
         registrars = [n for n in self.tree.body if isinstance(n, ast.FunctionDef) and pattern.fullmatch(n.name)]
         self.assertGreaterEqual(len(registrars), 20)
-        allnew = {x for r in registrars for x in range(r.lineno, r.end_lineno + 1)}
-        for node in registrars:
-            with self.subTest(node.name):
-                self.assertEqual(self.dc._registrar_unit(node, set(self.names), allnew), [])
+        got, why = self.dc.registrar_findings("import re\nREGISTRAR_NAME_RE = re.compile(r'add_[a-z0-9_]+_parsers')\n", self.base_src, self.rule)
+        self.assertIsNone(why)
+        # the one read the rule cannot clear: the loader loop at the top of the file writes `globals()[<variable>]`, a key the lint cannot read, so an edit of that line is held for the owner (it is the clear's own loader)
+        self.assertEqual(got, [("a module-level write into globals()", "rebinds", "a registrar bound in a form that cannot be read")])
+        self.assertIn("globals()[_function] = _make_loader(", self.base_src)
+
+    def reg(self, text, base=None):
+        return self.dc.registrar_findings(self.base_src if base is None else base, (self.base_src if base is None else base) + "\n" + text + "\n", self.rule)
+
+    def test_a_registrar_bound_in_any_form_the_daemon_could_pick_up_is_read_or_held(self):
+        function, binding, module = self.pick()
+        hostile = "global %s\n        %s = None" % (binding, binding)
+        forms = {
+            "an async def": ("async def add_a_parsers(sub):\n    " + hostile.replace("        ", "    "), "rebinds"),
+            "a def under an if": ("if True:\n    def add_a_parsers(sub):\n        " + hostile, "rebinds"),
+            "a def under a try": ("try:\n    def add_a_parsers(sub):\n        %s()\nexcept Exception:\n    pass" % function, "calls"),
+            "a class": ("class add_a_parsers:\n    %s()" % function, "calls"),
+            "a lambda": ("add_a_parsers = lambda sub: %s()" % function, "calls"),
+            "an annotated lambda": ("add_a_parsers: object = lambda sub: %s()" % function, "calls"),
+            "a non-lambda value": ("add_a_parsers = make()", "rebinds"),
+            "a tuple target": ("add_a_parsers, other = 1, 2", "rebinds"),
+            "an import under the name": ("from json import dumps as add_a_parsers", "rebinds"),
+            "a write into globals()": ("globals()['add_a_parsers'] = print", "rebinds"),
+            "a write into globals() by a key that cannot be read": ("globals()[input()] = print", "rebinds"),
+        }
+        for label, (text, verb) in forms.items():
+            with self.subTest(label):
+                got, why = self.reg(text)
+                self.assertIsNone(why)
+                self.assertTrue(any(v == verb for _, v, _ in got), (label, got))
+
+    def test_a_helper_a_registrar_calls_is_read_as_part_of_it_and_an_untouched_helper_is_not_held_unless_a_changed_line_names_it(self):
+        function, binding, module = self.pick()
+        helper = "def _zzz_helper():\n    global %s\n    %s = None\n" % (binding, binding)
+        got, why = self.reg(helper + "def add_a_parsers(sub):\n    _zzz_helper()\n")
+        self.assertIn(("add_a_parsers (through _zzz_helper)", "rebinds", binding), got)
+        got, why = self.reg("def add_a_parsers(sub):\n    _zzz_helper2()\ndef _zzz_helper2():\n    _zzz_helper3()\ndef _zzz_helper3():\n    %s()\n" % function)
+        self.assertTrue(any(v == "calls" and "through _zzz_helper3" in r for r, v, _ in got), got)   # transitive
+        base = self.base_src + "\n" + helper + "def add_a_parsers(sub):\n    pass\n"   # a hostile helper already there, no registrar calls it
+        self.assertEqual(self.dc.registrar_findings(base, base, self.rule), ([], None))
+        edited = base.replace("def add_a_parsers(sub):\n    pass\n", "def add_a_parsers(sub):\n    thing = sub.add_parser('a')\n")
+        self.assertEqual(self.dc.registrar_findings(base, edited, self.rule), ([], None), "a different line of the registrar: the helper is not named")
+        calls = base.replace("def add_a_parsers(sub):\n    pass\n", "def add_a_parsers(sub):\n    _zzz_helper()\n")
+        self.assertIn(("add_a_parsers (through _zzz_helper)", "rebinds", binding), self.dc.registrar_findings(base, calls, self.rule)[0], "a changed line now calls the old hostile helper: all of it is read")
+
+    def test_a_namespace_written_or_handed_over_in_any_other_way_is_held(self):
+        for label, body in {
+            "__setitem__": "globals().__setitem__('n', 1)", "clear": "globals().clear()", "popitem": "globals().popitem()",
+            "operator.setitem": "operator.setitem(globals(), 'k', 1)", "a namespace in a keyword": "dict(a=globals())",
+            "a default that is a namespace": "def inner(g=globals()):\n    g['k'] = 1", "a lambda default": "f = lambda g=globals(): g.update(a=1)",
+            "a frame's f_globals": "inspect.currentframe().f_globals['k'] = 1", "an alias of a namespace": "g = globals()\nh = g\nh['k'] = 1",
+            "exec": "exec('x = 1')", "eval": "eval('1')", "compile": "compile('1', 'x', 'eval')", "importlib": "importlib.import_module('os')",
+            "an import_module attribute": "x.import_module('os')", "vars": "vars()['k'] = 1", "locals": "locals()['k'] = 1", "__globals__": "sub.__globals__['k'] = 1",
+        }.items():
+            with self.subTest(label):
+                self.assertTrue(self.found_unit(body), label)
+
+    def test_a_pattern_weakened_in_the_head_a_size_over_the_cap_and_a_lambda_that_resets_its_lines_are_held_or_read(self):
+        function, binding, module = self.pick()
+        hostile = "def add_a_parsers(sub):\n    %s()\n" % function
+        weakened = (self.base_src + "\n" + hostile).replace("REGISTRAR_NAME_RE = re.compile(r\"add_[a-z0-9_]+_parsers\")", "REGISTRAR_NAME_RE = re.compile(r\"nothing_matches_this\")")
+        self.assertNotEqual(weakened, self.base_src + "\n" + hostile, "the real file spells the pattern as this test expects")
+        got, why = self.dc.registrar_findings(self.base_src, weakened, self.rule)
+        self.assertTrue(any(v == "calls" for _, v, _ in got), "the base's pattern still names the registrar: the weakening does not hide it")
+        dropped = (self.base_src + "\n" + hostile).replace("REGISTRAR_NAME_RE = re.compile(", "REGISTRAR_NAME_RE = (")
+        got, why = self.dc.registrar_findings(self.base_src, dropped, self.rule)
+        self.assertIsNone(got)
+        self.assertIn("pattern", why)
+        with mock.patch.object(self.dc, "REGISTRAR_SOURCE_MAX", 100):
+            got, why = self.dc.registrar_findings(self.base_src, self.base_src, self.rule)
+        self.assertEqual((got, bool(why)), (None, True), "over the size cap: held")
+        got, why = self.reg("add_a_parsers = lambda sub: %s()" % function)
+        self.assertIn(("add_a_parsers", "calls", function), got)
 
     # ---- every consumer reads the one answer (pr_floor_report)
     HOSTILE = "global %s\n%s = None"
@@ -32362,11 +32429,14 @@ class TestRegistrarFloor(LedgerBase):
         self.assertEqual(report["owner_decision"], "hold")
         self.assertTrue(any("registrar diff could not be read" in r for r in report["owner_reasons"]))
 
-    def test_the_delegated_clear_refuses_an_unreadable_answer_and_an_absent_one_adds_nothing(self):
+    def test_the_delegated_clear_refuses_an_unreadable_answer_and_an_absent_one_and_a_clean_one_adds_nothing(self):
         report = {"owner_decision": "none", "complete": True, "registrar_reasons": "garbage", "review_action": "none"}
         refused = self.dc.refusals(self.rule, report, [], matches=sb.impact_floor.matches, closure={})
         self.assertTrue(any("registrar lint's answer cannot be read" in r for r in refused), refused)
         report.pop("registrar_reasons")
+        refused = self.dc.refusals(self.rule, report, [], matches=sb.impact_floor.matches, closure={})
+        self.assertTrue(any("registrar lint's answer cannot be read" in r for r in refused), "a report that did not run the lint is refused, never read as clean")
+        report["registrar_reasons"] = []
         self.assertFalse(any("registrar" in r for r in self.dc.refusals(self.rule, report, [], matches=sb.impact_floor.matches, closure={})))
 
     # ---- the rater's line and the documentation say it in the same words
@@ -32390,8 +32460,9 @@ class TestRegistrarFloor(LedgerBase):
         definition = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
         front = definition.split("\n---\n", 1)[0]
         base = subprocess.run(["git", "show", "origin/main:agents/reviewers/reviewer-impact.md"], cwd=REPO, capture_output=True, text=True)
-        if base.returncode == 0:
-            self.assertEqual(front, base.stdout.split("\n---\n", 1)[0])
+        if base.returncode != 0:
+            self.skipTest("origin/main cannot be read in this checkout: the permission block was not compared (said, not passed)")
+        self.assertEqual(front, base.stdout.split("\n---\n", 1)[0])
 
 
 class TestImpactFloorCommandAndPass(LedgerBase):

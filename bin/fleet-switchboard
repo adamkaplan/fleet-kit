@@ -21683,8 +21683,8 @@ def registrar_states(engine, repo, matrix, paths, base, head):
             raise IntentError("gh", "the base or head commit is unknown")
         before, after = _file_text_at(engine, repo, daemon_file, base), _file_text_at(engine, repo, daemon_file, head)
         found, why = load_module("delegated_clear").registrar_findings(before, after, rule)
-    except (IntentError, ImportError, OSError, RecursionError, MemoryError, ValueError) as err:
-        found, why = None, _one_line(str(err), 100)
+    except Exception as err:   # a read that fails or a lint that crashes is unreadable: a hold, never a crash of the report
+        found, why = None, _one_line("%s: %s" % (type(err).__name__, err), 100)
     return {"findings": found or [], "why": why}
 
 

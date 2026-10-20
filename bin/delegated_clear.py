@@ -189,7 +189,7 @@ def refusals(rule, report, files, matches=None, closure=None, scored=None):
     if report.get("complete") is not True or report.get("unknown") or report.get("renamed_no_source"):
         return ["the pull request's changes cannot be read in full (%s)" % (report.get("unknown") or "the file list is cut")]
     reasons = list(scored["reasons"]) if isinstance(scored, dict) else []
-    held = report.get("registrar_reasons", [])
+    held = report.get("registrar_reasons")
     if not isinstance(held, list) or any(not isinstance(x, str) for x in held):
         reasons.append("the registrar lint's answer cannot be read: refused")
     else:
@@ -426,10 +426,12 @@ def closure_refusals(base_src, head_src, patch, roots, entry_points, module_leve
 # ---- a command registrar that imports, calls or rebinds a name of the clear's closure (#964)
 # In one process a hostile registrar can always undo a guard: this lint, the floor that reads it and the independent rating are the control. Both lists are DERIVED here: the closure names from `closure`
 # (the one the clear uses, over the matrix's roots) and the registrars from the daemon file's own `REGISTRAR_NAME_RE`; this code holds neither. What it does hold are the names Python itself gives for reaching a
-# namespace by string, which are not closure names (`NAMESPACE_REACHERS`).
+# namespace by string, which are not closure names (`NAMESPACE_REACHERS`, `NAMESPACE_ATTRIBUTES`).
 
 NAMESPACE_REACHERS = ("globals", "vars", "locals", "setattr", "delattr", "getattr", "eval", "exec", "compile", "__import__", "import_module")
+NAMESPACE_ATTRIBUTES = ("__dict__", "f_globals", "f_locals", "__globals__", "__builtins__", "modules")   # an attribute that IS a namespace
 SETTERS = ("setattr", "delattr", "__setattr__", "__delattr__")
+READ_ONLY_METHODS = ("get", "keys", "items", "values", "copy", "__getitem__", "__contains__", "__len__", "__iter__")
 REGISTRAR_SOURCE_MAX = 4000000
 
 
@@ -463,8 +465,9 @@ def _spans(node, added):
     return any(number in added for number in range(node.lineno, getattr(node, "end_lineno", node.lineno) + 1))
 
 
-def _registrar_unit(unit, names, added):
-    """[(verb, closure name)] a registrar (a function, or the lambda a registrar name is assigned) does to the closure, counting only the nodes that touch a line in `added`. `names` are the closure names."""
+def _registrar_unit(unit, names, added, helpers=None):
+    """[(verb, closure name)] a registrar (a function, a class, or the lambda a registrar name is assigned) does to the closure, counting only the nodes that touch a line in `added` (`None`: every line). `names` are the
+    closure names. `helpers`, when a set is given, collects the names the unit refers to that are not closure names and not its own (a helper it may call: the caller reads those too)."""
     own, glob = set(), set()
     for x in ast.walk(unit):
         if isinstance(x, ast.arg):
@@ -476,26 +479,40 @@ def _registrar_unit(unit, names, added):
         elif isinstance(x, (ast.Global, ast.Nonlocal)):
             glob.update(x.names)
     own -= glob   # a name declared `global` is the module's, whatever is stored into it
+    if helpers is not None:
+        helpers.update(x.id for x in ast.walk(unit) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id not in own and x.id not in names)
+    def namespace(expr):   # globals(), vars(), x.__dict__, frame.f_globals, sys.modules...
+        return (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name) and expr.func.id in ("globals", "vars", "locals")) or (isinstance(expr, ast.Attribute) and expr.attr in NAMESPACE_ATTRIBUTES) \
+            or (isinstance(expr, ast.Subscript) and namespace(expr.value))
     tainted = {}   # alias -> the closure name (or reacher) it came from
     changed = True
-    while changed:   # an alias of a closure object (`m = plan_ledger`, `m = sys.modules[...]`): a name that holds what a closure name holds
+    while changed:   # an alias of a closure object or a namespace (`m = plan_ledger`, `g = globals()`, a parameter whose default is one): a name that holds what they hold
         changed = False
+        pairs = []
         for x in ast.walk(unit):
             if isinstance(x, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and getattr(x, "value", None) is not None:
-                base = _root(x.value)
-                targets = x.targets if isinstance(x, ast.Assign) else [x.target]
-                if base is not None and (base in tainted or (base in names and base not in own) or base in NAMESPACE_REACHERS):
-                    for t in targets:
-                        for y in ast.walk(t):
-                            if isinstance(y, ast.Name) and y.id not in tainted:
-                                tainted[y.id] = tainted.get(base, base)
-                                changed = True
+                pairs.extend((t, x.value) for t in (x.targets if isinstance(x, ast.Assign) else [x.target]))
+            elif isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                arguments = x.args
+                positional = arguments.posonlyargs + arguments.args
+                pairs.extend((ast.Name(id=a.arg, ctx=ast.Store()), d) for a, d in zip(positional[len(positional) - len(arguments.defaults):], arguments.defaults))
+                pairs.extend((ast.Name(id=a.arg, ctx=ast.Store()), d) for a, d in zip(arguments.kwonlyargs, arguments.kw_defaults) if d is not None)
+        for target, value in pairs:
+            base = _root(value)
+            via = base if (base in tainted or (base in names and base not in own) or base in NAMESPACE_REACHERS) else None
+            if via is None and any(namespace(y) for y in ast.walk(value)):
+                via = "a namespace"
+            if via is not None:
+                for y in ast.walk(target):
+                    if isinstance(y, ast.Name) and y.id not in tainted:
+                        tainted[y.id] = tainted.get(via, via)
+                        changed = True
     def reaches(expr):
         base = _root(expr)
-        return base is not None and (base in tainted or (base in names and base not in own) or base in NAMESPACE_REACHERS)
+        return (base is not None and (base in tainted or (base in names and base not in own) or base in NAMESPACE_REACHERS)) or any(namespace(y) for y in ast.walk(expr))
     found = set()
     def note(node, verb, name):
-        if _spans(node, added):
+        if added is None or _spans(node, added):
             found.add((verb, name))
     unreadable = "a name that cannot be read"
     for x in ast.walk(unit):
@@ -511,10 +528,8 @@ def _registrar_unit(unit, names, added):
         elif isinstance(x, ast.Call):
             callee = _root(x.func)
             fname = x.func.id if isinstance(x.func, ast.Name) else (x.func.attr if isinstance(x.func, ast.Attribute) else None)
-            if callee is not None and callee in names and callee not in own:
-                note(x, "calls", callee)
-            elif callee is not None and callee in tainted:
-                note(x, "calls", callee)
+            if callee is not None and ((callee in names and callee not in own) or callee in tainted):
+                note(x, "calls", tainted.get(callee, callee))
             if fname in ("__import__", "import_module"):
                 note(x, "imports", unreadable)
             elif fname in ("eval", "exec", "compile"):
@@ -532,6 +547,11 @@ def _registrar_unit(unit, names, added):
                     note(x, "rebinds", named[0])
                 elif target is None or reaches(target) or not (len(x.args) > 1 and isinstance(x.args[1], ast.Constant)):
                     note(x, "rebinds", unreadable)
+            elif isinstance(x.func, ast.Attribute) and reaches(x.func.value) and x.func.attr not in READ_ONLY_METHODS and (namespace(x.func.value) or _root(x.func.value) in tainted or _root(x.func.value) in NAMESPACE_REACHERS):
+                note(x, "rebinds", unreadable)   # `globals().__setitem__(k, v)`, `.clear()`, `.popitem()` on a namespace
+            if any(namespace(a.value if isinstance(a, ast.keyword) else a) or _root(a.value if isinstance(a, ast.keyword) else a) in tainted and tainted.get(_root(a.value if isinstance(a, ast.keyword) else a)) in ("a namespace",) + NAMESPACE_REACHERS
+                   for a in list(x.args) + list(x.keywords)):
+                note(x, "rebinds", unreadable)   # a namespace handed to a call (`operator.setitem(globals(), k, v)`, `f(g)`): what it does to it cannot be read
         elif isinstance(x, (ast.Attribute, ast.Subscript)) and isinstance(x.ctx, (ast.Store, ast.Del)):
             if isinstance(x, ast.Attribute) and x.attr in names:
                 note(x, "rebinds", x.attr)
@@ -541,21 +561,55 @@ def _registrar_unit(unit, names, added):
                 base = tainted.get(base, base)
                 label = key.value if isinstance(key, ast.Constant) and isinstance(key.value, str) and key.value in names else (base if base in names else unreadable)
                 note(x, "rebinds", label)
-        elif isinstance(x, ast.Attribute) and x.attr == "__dict__":
-            note(x, "rebinds", unreadable)
+        elif namespace(x) and isinstance(x, ast.Attribute):
+            note(x, "rebinds", unreadable)   # reaching a namespace at all: a closure name cannot be ruled out
     return sorted(found)
+
+
+def _module_statements(body):
+    """Every statement the module runs by itself: the body, and the bodies of an `if`, `try`, `with`, `for` or `while` in it; never the inside of a def or a class."""
+    for node in body:
+        yield node
+        if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try)):
+            for field in ("body", "orelse", "finalbody"):
+                yield from _module_statements(getattr(node, field, []))
+            for handler in getattr(node, "handlers", []):
+                yield from _module_statements(handler.body)
+
+
+def _binds_registrar(node, patterns):
+    """[(name, unit)] the registrars a module-level statement defines or binds: a def, an async def, a class, an assignment (plain, annotated, augmented, tuple or multi target) whose value is a lambda or anything else
+    (then the unit is None: it cannot be read), an import under a registrar name. Whatever `command_registrars` could pick up by name out of the module's globals."""
+    def named(name):
+        return isinstance(name, str) and any(p.fullmatch(name) for p in patterns)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return [(node.name, node)] if named(node.name) else []
+    if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        out = []
+        for target in targets:
+            for y in ast.walk(target):
+                if isinstance(y, ast.Name) and named(y.id):
+                    value = getattr(node, "value", None)
+                    out.append((y.id, value if isinstance(value, ast.Lambda) and isinstance(target, ast.Name) else None))
+        return out
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return [(a.asname or a.name.split(".")[0], None) for a in node.names if named(a.asname or a.name.split(".")[0])]
+    return []
 
 
 def registrar_findings(base_src, head_src, rule):
     """([(registrar, verb, closure name)], None) for a pull request's own base and head text of the daemon file, or (None, why) when they cannot be read (the caller holds, fail closed). A finding is an
-    import, a call or a rebinding of a closure name by a registrar (`add_<x>_parsers`, or a registrar name assigned a lambda) on a line the pull request added; an untouched line or a removed one gives none.
-    The closure is the union of the base and the head (a pull request that ADDS a closure name counts); the registrar pattern is the union of both files' own `REGISTRAR_NAME_RE`."""
+    import, a call or a rebinding of a closure name by a registrar on a line the pull request added; an untouched line or a removed one gives none. A registrar is whatever binds a name the daemon file's own
+    `REGISTRAR_NAME_RE` matches, wherever the module binds it (def, async def, class, assignment of any form, import, an `if` or `try` around it, a write into `globals()`); a registrar that cannot be read is held. A
+    function a registrar refers to that is not a closure name (a helper) is read as part of the registrar (every line of it when a changed line of the registrar names it). The closure is the union of the base and
+    the head (a pull request that ADDS a closure name counts); the registrar pattern is the union of both files' own `REGISTRAR_NAME_RE`."""
     if not isinstance(base_src, str) or not isinstance(head_src, str) or len(base_src) > REGISTRAR_SOURCE_MAX or len(head_src) > REGISTRAR_SOURCE_MAX:
         return None, "the daemon file before or after the change cannot be read"
     try:
         base, head = ast.parse(base_src), ast.parse(head_src)
         roots, actions = daemon_roots(rule), rule.get("dynamic_actions") or ()
-    except (SyntaxError, ValueError, KeyError, TypeError, AttributeError):
+    except (SyntaxError, ValueError, KeyError, TypeError, AttributeError, RecursionError, MemoryError):
         return None, "the daemon file does not parse before or after the change, or the rule cannot be read"
     patterns = [p for p in (registrar_pattern(base), registrar_pattern(head)) if p is not None]
     if not patterns or registrar_pattern(head) is None:
@@ -571,23 +625,37 @@ def registrar_findings(base_src, head_src, rule):
     if lines is None:
         return None, "the diff of the daemon file cannot be read"
     added = set(lines[1])
-    found = []
-    for node in head.body:
-        name = unit = None
-        if isinstance(node, ast.FunctionDef):
-            name, unit = node.name, node
-        elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            name, unit = node.targets[0].id, node.value
-        if name is None or not any(p.fullmatch(name) for p in patterns):
-            continue
-        if isinstance(node, ast.Assign):
-            if not isinstance(unit, ast.Lambda):
+    found, defs = [], {n.name: n for n in head.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name not in names}   # the helpers: module-level functions that are not the closure
+    def read(label, unit, lines_counted):
+        helpers = set()
+        for verb, hit in _registrar_unit(unit, names, lines_counted, helpers):
+            found.append((label, verb, hit))
+        return helpers
+    for node in _module_statements(head.body):
+        for name, unit in _binds_registrar(node, patterns):
+            if unit is None:
                 if _spans(node, added):
-                    found.append((name, "rebinds", "a registrar defined by assignment cannot be read"))
+                    found.append((name, "rebinds", "a registrar bound in a form that cannot be read"))
                 continue
-            unit.lineno, unit.end_lineno = node.lineno, node.end_lineno
-        for verb, hit in _registrar_unit(unit, names, added):
-            found.append((name, verb, hit))
+            if isinstance(unit, ast.Lambda):
+                unit.lineno, unit.end_lineno = node.lineno, node.end_lineno
+            done, todo = {}, [(name, unit, added)]
+            while todo:   # the registrar, then the helpers it refers to (all lines of a helper that a changed line of its caller names)
+                label, current, counted = todo.pop()
+                refs = read(name if label == name else "%s (through %s)" % (name, label), current, counted)
+                for ref in sorted(refs & set(defs)):
+                    full = counted is None or any(isinstance(n, ast.Name) and n.id == ref and _spans(n, added) for n in ast.walk(current))
+                    if ref not in done or (full and done[ref] is not None):
+                        done[ref] = None if full else added
+                        todo.append((ref, defs[ref], done[ref]))
+        # a write into the namespace at module level that names a registrar (or a key that cannot be read)
+    for node in ast.walk(head):
+        if isinstance(node, (ast.Subscript, ast.Call)) and _spans(node, added) and not isinstance(node, ast.Constant):
+            target = node.value if isinstance(node, ast.Subscript) else None
+            if isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del)) and isinstance(target, ast.Call) and isinstance(target.func, ast.Name) and target.func.id in ("globals", "vars"):
+                key = node.slice
+                if not (isinstance(key, ast.Constant) and isinstance(key.value, str)) or any(p.fullmatch(key.value) for p in patterns):
+                    found.append(("a module-level write into globals()", "rebinds", "a registrar bound in a form that cannot be read"))
     return sorted(set(found)), None
 
 
