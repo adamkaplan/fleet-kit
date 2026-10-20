@@ -27881,7 +27881,30 @@ except Exception as _err:
 # those attributes, derived once everything is defined (see `derive_action_groups`), never lists to edit; `dispatch` asks the view AND the attribute
 # (a test that swaps a command's function for a recorder keeps the group the module defined).
 
-RATING_PATH_FUNCTIONS = ("cmd_review", "parse_review_block", "rating_inputs", "resolve_command", "dispatch", "call_command")   # `main` checks these are the same objects after the registrars ran (#835)
+def code_snapshot():
+    """{(where, name): (object, its code)} for EVERY function and class defined at the top of this file and of each helper module of bin/ already loaded, and each of those modules (#924). `main` takes it before the registrars run and compares it after, for every
+    action: a command registrar that replaces any of them (the clear, the rating's path, a helper the clear reads) stops the command. Derived from what is loaded, never a list of names, so a function added later is held the day it is added."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    held = {}
+    def take(where, namespace):
+        for name, value in list(namespace.items()):
+            if isinstance(value, types.FunctionType):
+                held[(where, name)] = (value, value.__code__)
+            elif isinstance(value, type):
+                held[(where, name)] = (value, None)
+    take("", globals())
+    for module_name, module in list(sys.modules.items()):
+        path = getattr(module, "__file__", None)
+        if module_name != "__main__" and isinstance(path, str) and path.endswith(".py") and os.path.dirname(os.path.realpath(path)) == here and getattr(module, "__dict__", None) is not globals():
+            held[(module_name, None)] = (module, None)
+            take(module_name, vars(module))
+    return held
+
+
+def code_replaced(before, after):
+    """[names] in `before` (a `code_snapshot`) that `after` no longer has as the same object with the same code."""
+    return sorted(("%s.%s" % key if key[0] else key[1]) if key[1] else "module " + key[0] for key, (obj, code) in before.items()
+                  if key not in after or after[key][0] is not obj or after[key][1] is not code)
 COMMAND_NAME_RE = re.compile(r"[a-z][a-z0-9-]*")
 REGISTRAR_NAME_RE = re.compile(r"add_[a-z0-9_]+_parsers")
 COMMAND_ARGUMENTS = ("args", "runner", "now", "spawn", "socket_call", "wait")   # what a command function may ask for, by parameter name
@@ -27959,7 +27982,8 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
          socket_call=None):
     os.environ.setdefault(OWN_GH_ENV, "1")   # the gh calls of this process are the switchboard's own: never re-identified
     raw = tuple(argv if argv is not None else sys.argv[1:])   # #835: the command line as typed, captured BEFORE any registrar runs: `review record` reads its rating inputs from this, never from the shared parser
-    held = {name: (globals()[name], globals()[name].__code__) for name in RATING_PATH_FUNCTIONS if name in globals()}
+    snapshot, replaced_by = code_snapshot, code_replaced   # local references: a registrar that rebinds these names changes nothing here
+    held = snapshot()   # #924: the code every command runs by, before any registrar runs
     parser = build_parser()
     try:
         args, extra = parser.parse_known_args(list(raw))
@@ -27970,8 +27994,9 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
             parser.error("unrecognized arguments: %s" % " ".join(extra))
     except SystemExit as exit_:
         return EXIT_USAGE if exit_.code not in (0, None) else EXIT_OK
-    if getattr(args, "action", None) == "review" and (set(held) != set(RATING_PATH_FUNCTIONS) or any(globals().get(name) is not fn or fn.__code__ is not code for name, (fn, code) in held.items())):
-        sys.stderr.write("%s: review: a command registrar replaced code on the rating path: nothing was recorded\n" % PROG)   # a registrar reassigned one of the functions the rating is read and recorded by
+    replaced = replaced_by(held, snapshot())   # for EVERY action (#924): the clear's code, the rating's path and every helper they read are the code that was loaded
+    if replaced:
+        sys.stderr.write("%s: %s: a command registrar replaced code a command runs by (%s): nothing ran\n" % (PROG, getattr(args, "action", "?"), ", ".join(replaced[:5])))
         return EXIT_ERROR
     return dispatch(args, parser.commands, runner=runner, now=now, wait=wait, spawn=spawn, socket_call=socket_call)
 

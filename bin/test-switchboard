@@ -34261,7 +34261,7 @@ class TestImpactHold(LedgerBase):
 
     def rating_path_derived(self):
         """The definitions that belong to the rating's path, derived from the code: the call path from `main` to a rating target (with the two dynamic edges), the definitions that read, write or register a rating field and the
-        functions `main` guards (`RATING_PATH_FUNCTIONS`). (names, the parsed daemon, the matrix rule)."""
+        the definitions `main` itself names (its guard and the dispatch). (names, the parsed daemon, the matrix rule)."""
         import ast
         rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
         module = sb.load_module("delegated_clear")
@@ -34286,7 +34286,9 @@ class TestImpactHold(LedgerBase):
             if not more:
                 break
             on_path |= more
-        return (on_path & set(from_main)) | touching | set(sb.RATING_PATH_FUNCTIONS), daemon, rule
+        path = (on_path & set(from_main)) | touching | {x.id for x in ast.walk(defs["main"]) if isinstance(x, ast.Name) and x.id in defs}
+        handing = {c.func.id for n in path if n in defs for c in ast.walk(defs[n]) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in defs and any(k.arg is None for k in c.keywords)}   # what the path hands the handler's arguments to (`call_command(handler, **available)`)
+        return path | handing, daemon, rule
 
     def test_the_rating_roots_are_derived_from_the_code_and_each_is_classified_in_one_table(self):
         module = sb.load_module("delegated_clear")
@@ -34302,6 +34304,9 @@ class TestImpactHold(LedgerBase):
                 rest = dict(rule, rating_roots=[r for r in rule["rating_roots"] if r != root])
                 lost = sorted(n for n in derived if n not in module.closure(daemon, module.daemon_roots(rest), dynamic)[0])
                 self.assertEqual(lost, [], "%s is also reached by name from another root (main), so the list names it explicitly to hold it if that path changes" % root) if root != "main" else self.assertNotEqual(lost, [], "main is the root the others are reached from")
+        self.assertTrue({"code_snapshot", "code_replaced"} <= derived & set(rule["rating_roots"]), "the guard main runs is a derived root (the definitions main names itself)")
+        hand_list = "RATING_PATH" + "_FUNCTIONS"   # the hand-kept list of the old guard: gone, nothing to pin
+        self.assertEqual([f.name for f in list((REPO / "bin").glob("*")) + list((REPO / "docs").glob("*.md")) if f.is_file() and f.name != "test-switchboard" and hand_list in f.read_text(errors="replace")], [])
         self.assertEqual(sorted(n for n in derived if n.startswith("add_") and n != "add_review_parsers"), [], "no other registrar is on the rating's path (derived)")
 
     CORE = "add_core_parsers"
@@ -34674,20 +34679,88 @@ class TestImpactHold(LedgerBase):
         clean_code, _, clean = self.record_run(())
         self.assertNotIn("impact_severity", clean)
 
-    def test_a_registrar_that_reassigns_a_function_of_the_rating_path_stops_the_record(self):
+    def guarded_names(self):
+        """Every function the clear and the rating run by, DERIVED from the closure (never a list): (the daemon file's definitions in the closure of the matrix's roots, the functions of the helper modules the clear is made of)."""
+        import ast, inspect
+        module = sb.load_module("delegated_clear")
+        rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
+        daemon = ast.parse(self.real_source())
+        reach = module.closure(daemon, module.daemon_roots(rule), rule["dynamic_actions"])[0]
+        functions = {n.name for n in daemon.body if isinstance(n, ast.FunctionDef)}
+        daemon_names = sorted(n for n in reach if n in functions)
+        helper = {}
+        for name in ("impact_hold", "delegated_clear"):
+            mod = sb.load_module(name)
+            helper[name] = sorted(n for n, v in vars(mod).items() if inspect.isfunction(v) and v.__module__ == mod.__name__)
+        return daemon_names, helper
+
+    def reassign_registrar(self, name, module=None):
+        target = sb if module is None else sb.load_module(module)
+        original = getattr(target, name)
+        def same_behaviour(*a, **k):   # a DIFFERENT object that does what the original does: the harness keeps working, the guard must still see it
+            return original(*a, **k)
+        def registrar(sub):
+            setattr(target, name, same_behaviour)
+        return registrar
+
+    def test_a_registrar_that_reassigns_any_function_the_clear_or_the_rating_runs_by_stops_the_command_for_every_action(self):
+        """#924, the real `main()` with a real registrar that REASSIGNS one function (one case for each, derived from the closure by `guarded_names`): `review record` writes nothing, `impact clear` clears nothing, and any other action stops too."""
+        daemon_names, helper = self.guarded_names()
+        self.assertTrue({"cmd_review", "cmd_impact_clear", "dispatch", "rating_inputs", "impact_clear_core", "build_parser"} <= set(daemon_names) | set(helper["impact_hold"]) | {"build_parser"}, daemon_names[:5])
         self.record_pr_setup()
-        for name in sb.RATING_PATH_FUNCTIONS:
-            with self.subTest(function=name):
-                def registrar(sub, name=name):
-                    setattr(sb, name, lambda *a, **k: 0)
+        for name in daemon_names:
+            with self.subTest(record_function=name):
                 original = getattr(sb, name)
-                self.addCleanup(setattr, sb, name, original)   # the hostile registrar replaced it for real: put it back whatever happens
                 try:
-                    code, err, entry = self.record_run(self.EXPLICIT, [("add_zzz_parsers", registrar)])
+                    code, err, entry = self.record_run(self.EXPLICIT, [("add_zzz_parsers", self.reassign_registrar(name))])
                 finally:
                     setattr(sb, name, original)
                 self.assertEqual((code, entry), (1, None), err)
-                self.assertIn("a command registrar replaced code on the rating path", err)
+                self.assertIn("a command registrar replaced code a command runs by", err)
+
+    def test_a_registrar_that_reassigns_a_function_of_the_clear_leaves_the_hold_as_it_was(self):
+        daemon_names, helper = self.guarded_names()
+        self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
+        cases = [(name, None) for name in daemon_names] + [(name, module) for module, names in helper.items() for name in names]
+        self.assertGreater(len(cases), 100)
+        for name, module in cases:
+            with self.subTest(function=name, module=module):
+                target = sb if module is None else sb.load_module(module)
+                original = getattr(target, name)
+                registrar = self.reassign_registrar(name, module)
+                patcher = mock.patch.object(sb, "add_zzz_parsers", registrar, create=True)
+                patcher.start()
+                try:
+                    code, out, err = self.under()
+                finally:
+                    patcher.stop()
+                    setattr(target, name, original)
+                self.assertEqual(code, 1, err)
+                self.assertIn("a command registrar replaced code a command runs by", err)
+                self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [], "nothing was cleared")
+                self.assertEqual(self.events("gate.hold_cleared"), [])
+        with self.subTest("the sys.modules one-liner"):   # the probe of the review: the registrar names the module through sys.modules
+            def probe(sub):
+                vars(sb).update(cmd_impact_clear=lambda *a, **k: 0)   # the module's namespace, as `sys.modules[__name__].x = ...` writes it
+            original = sb.cmd_impact_clear
+            patcher = mock.patch.object(sb, "add_zzz_parsers", probe, create=True)
+            patcher.start()
+            try:
+                code, out, err = self.under()
+            finally:
+                patcher.stop()
+                sb.cmd_impact_clear = original
+            self.assertEqual(code, 1, err)
+        with self.subTest("an action that is neither the clear nor the record"):
+            patcher = mock.patch.object(sb, "add_zzz_parsers", self.reassign_registrar("dispatch"), create=True)
+            patcher.start()
+            original = sb.dispatch
+            try:
+                code, out, err = self.run_as("cos", "version")
+            finally:
+                patcher.stop()
+                sb.dispatch = original
+            self.assertEqual(code, 1, err)
 
     def test_a_direct_call_with_no_raw_argv_records_no_rating_whatever_the_namespace_carries(self):
         self.record_pr_setup()
@@ -34742,25 +34815,59 @@ class TestImpactHold(LedgerBase):
                            | {"setattr(args, ...)" for x in ast.walk(node) if isinstance(x, ast.Call) and getattr(x.func, "id", "") == "setattr"})
             self.assertEqual(reads, [], "%s reads no rating input from the shared namespace" % name)
 
-    def test_no_command_registrar_reaches_into_the_shared_parser_beyond_its_own_commands(self):
-        """Defence in depth (not the closure): the vocabulary a registrar may use is its own `sub.add_parser`, `add_argument`, `add_subparsers` and `set_defaults` on a parser it made. A NEW use of the rest fails here."""
+    @staticmethod
+    def registrar_findings(tree):
+        """What each `add_<name>_parsers` function of `tree` does beyond its own commands: {name: {finding}}. The assignment rule is derived by WALKING the registrar (#924): any assignment, deletion, augmented assignment or `global` statement whose target is not a local of the registrar
+        (an attribute or a subscript of anything that is not a name the registrar itself bound: a module, sys.modules, builtins, a global) is a finding."""
         import ast
         found = {}
-        for node in ast.parse(self.real_source()).body:
+        for node in tree.body:
             if not (isinstance(node, ast.FunctionDef) and re.fullmatch(r"add_[a-z0-9_]+_parsers", node.name)):
                 continue
+            local = {a.arg for a in node.args.args}
+            for x in ast.walk(node):
+                if isinstance(x, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.For, ast.comprehension, ast.withitem)):
+                    for target in ([x.target] if hasattr(x, "target") else [i for i in [getattr(x, "optional_vars", None)] if i is not None] if isinstance(x, ast.withitem) else x.targets):
+                        local |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)} if isinstance(target, (ast.Name, ast.Tuple, ast.List)) else set()
+            def root(target):
+                while isinstance(target, (ast.Attribute, ast.Subscript)):
+                    target = target.value
+                return target.id if isinstance(target, ast.Name) else None
             for x in ast.walk(node):
                 if isinstance(x, ast.Attribute) and x.attr in ("choices", "_name_parser_map", "_actions", "_subparsers"):
                     found.setdefault(node.name, set()).add("attribute " + x.attr)
-                if isinstance(x, ast.Call) and getattr(x.func, "id", getattr(x.func, "attr", None)) in ("globals", "setattr", "exec", "eval", "__import__", "import_module", "getattr", "vars"):
+                if isinstance(x, ast.Call) and getattr(x.func, "id", getattr(x.func, "attr", None)) in ("globals", "setattr", "delattr", "exec", "eval", "__import__", "import_module", "getattr", "vars", "locals"):
                     found.setdefault(node.name, set()).add("call " + getattr(x.func, "id", getattr(x.func, "attr", None)))
                 if isinstance(x, ast.Constant) and x.value == "review" and node.name != "add_review_parsers":
                     found.setdefault(node.name, set()).add('the string "review"')
-                if isinstance(x, (ast.Assign, ast.AugAssign)) and any(ast.unparse(t).startswith(("sys.argv", "os.environ", "argparse.")) for t in (x.targets if isinstance(x, ast.Assign) else [x.target])):
-                    found.setdefault(node.name, set()).add("an assignment to argv, the environment or argparse")
+                if isinstance(x, (ast.Global, ast.Nonlocal)):
+                    found.setdefault(node.name, set()).add("a global statement")
+                targets = x.targets if isinstance(x, (ast.Assign, ast.Delete)) else [x.target] if isinstance(x, (ast.AugAssign, ast.AnnAssign)) else []
+                for target in targets:
+                    for leaf in (target.elts if isinstance(target, (ast.Tuple, ast.List)) else [target]):
+                        if isinstance(leaf, (ast.Attribute, ast.Subscript)) and root(leaf) not in local:
+                            found.setdefault(node.name, set()).add("an assignment to something the registrar did not make (%s)" % ast.unparse(leaf)[:40])
+        return found
+
+    def test_no_command_registrar_reaches_into_the_shared_parser_beyond_its_own_commands(self):
+        """Defence in depth (not the closure): the vocabulary a registrar may use is its own `sub.add_parser`, `add_argument`, `add_subparsers` and `set_defaults` on a parser it made. A NEW use of the rest fails here."""
+        import ast
+        found = self.registrar_findings(ast.parse(self.real_source()))
         known = {"add_ledger_parsers": {"attribute _actions"},   # reads the actions of ITS OWN `verdict` parser to find its flags
                  "add_plan_parsers": {'the string "review"'}}   # its own `plan review` subcommand and a positional named review
         self.assertEqual(found, known, "a registrar uses the shared parser beyond its own commands: a NEW finding is a decision (the rating is immune to it, but the reviewer must look)")
+
+    def test_the_registrar_lint_finds_the_one_line_that_rewires_the_clear_and_every_shape_of_it(self):
+        import ast
+        probes = {"sys.modules": "sys.modules[__name__].cmd_impact_clear = EVIL", "a module attribute": "os.environ = {}", "a global": "cmd_impact_clear = EVIL\n    global cmd_impact_clear",
+                  "a subscript of globals": "globals()['cmd_impact_clear'] = EVIL", "setattr": "setattr(sys.modules[__name__], 'cmd_impact_clear', EVIL)", "a delete": "del builtins.print",
+                  "an augmented assignment": "sys.path += ['x']", "a tuple target": "a, sys.modules['x'] = 1, 2"}
+        for label, line in probes.items():
+            with self.subTest(label):
+                found = self.registrar_findings(ast.parse("def add_zzz_parsers(sub):\n    " + line + "\n"))
+                self.assertTrue(found.get("add_zzz_parsers"), "the lint finds: %s" % line)
+        clean = "def add_zzz_parsers(sub):\n    thing = sub.add_parser('zzz')\n    thing.add_argument('--x')\n    thing.usage = 'u'\n    for flag in ('a',):\n        thing.add_argument('--' + flag)\n"
+        self.assertEqual(self.registrar_findings(ast.parse(clean)), {}, "a registrar that only sets up its own parser is clean")
 
     def test_s20_s23_no_agent_command_writes_the_threshold_and_no_committed_file_sets_one(self):
         daemon = Path(sb.__file__).read_text()

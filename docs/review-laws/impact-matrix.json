@@ -420,9 +420,13 @@
         "dispatch",
         "main",
         "resolve_command",
-        "parse_review_block"
+        "parse_review_block",
+        "code_snapshot",
+        "code_replaced"
       ],
       "rating_roots_why": {
+        "code_snapshot": "takes the snapshot of every function and class main runs by, before the registrars run and after",
+        "code_replaced": "compares the two snapshots: a registrar that replaced any function or class stops the command, for every action",
         "main": "captures the raw command line before any registrar runs, sets raw_argv after the parse and runs the handler-swap check",
         "build_parser": "the wiring: the registrar loop that makes add_review_parsers exist and the set of commands dispatch may run (the other commands are registered outside it, in add_core_parsers, so a flag of another command is not on the clear's path)",
         "command_registrars": "decides which registrars run and in what order",
