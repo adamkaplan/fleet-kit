@@ -22949,7 +22949,8 @@ BLOCK_FLAG_TABLE = (   # (flag, dest, mode): `refused` (the block carries it: gi
 def block_table_text():
     """The table as one sentence: what `review record --block` refuses and what it accepts."""
     pick = lambda *modes: ", ".join(flag for flag, _, mode in BLOCK_FLAG_TABLE if mode in modes)
-    return ("With --block, refused (the block carries them): %s; accepted: %s, and of these %s win over the block's own lines"
+    return ("With --block, refused (the block carries them): %s; accepted: %s, and of these %s win over the block's own lines; "
+            "the score comes from the block's impact-severity:, impact-probability: and impact-reason: lines, so a block without the first two is recorded WITHOUT a score"
             % (pick("refused"), pick("accepted", "wins"), pick("wins")))
 
 
@@ -23100,7 +23101,7 @@ def cmd_review(args, runner, now):
             sys.stderr.write("%s: review: %s\n" % (PROG, NO_SCORE_TEXT))
         return EXIT_OK
     except (ReviewError, plan_ledger.LedgerError, ConfigError, IdentityUncertain, CallerError) as err:
-        sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 400)))
+        sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 700)))
         return EXIT_USAGE
 
 

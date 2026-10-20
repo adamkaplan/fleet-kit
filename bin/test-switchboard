@@ -32210,6 +32210,23 @@ class TestBlockTable(LedgerBase):
         self.assertEqual(self.record("--head", LEDGER_HEAD)[2].count(text), 1)
         self.assertEqual((REPO / "bin" / "fleet-switchboard").read_text().count('("--verdict", "verdict", "refused")'), 1)
 
+    def test_the_definitions_example_block_parses_to_a_record_with_a_score(self):
+        definition = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
+        example = definition.split("A full block, as you return it", 1)[1].split("```\n", 2)[1]
+        example = example.replace("0123456789abcdef0123456789abcdef01234567", LEDGER_HEAD)
+        path = self.world.state / "example.txt"
+        path.write_text(example)
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))
+        self.assertEqual((code, err), (0, ""), err)
+        entry = self.records()[-1]
+        self.assertEqual((entry["impact_severity"], entry["impact_probability"]), ("Marginal", "Occasional"))
+        self.assertTrue(entry["impact_reason"])
+
+    def test_the_refusal_names_the_block_lines_that_carry_the_score(self):
+        err = self.record("--head", LEDGER_HEAD)[2]
+        for word in ("impact-severity:", "impact-probability:", "impact-reason:", "WITHOUT a score"):
+            self.assertIn(word, err)
+
     def test_the_warning_with_and_without_a_score(self):
         scored = "impact-severity: Marginal\nimpact-probability: Remote\n"
         cases = ((dict(), True), (dict(extra=scored), False), (dict(extra="impact-reason: why\n"), True))
