@@ -31,7 +31,7 @@ jobs:
   #   - a pull request into main: both legs, macOS unconditional (a draft into main skips macOS until ready_for_review);
   #   - a pull request into any other branch (integration): macOS only when its diff touches a path of the ONE list file;
   #   - a push, a dispatch: both legs; the nightly: main and integration, each leg named `nightly <ref> (<os>)`.
-  # No third-party action: a plain `git diff --name-only`.
+  # No third-party action: a plain `git diff --no-renames --name-only`.
   plan:
     name: plan
     runs-on: ubuntu-latest
@@ -63,9 +63,18 @@ jobs:
               if base == "main":
                   macos = not draft
               else:
-                  patterns = [l.strip() for l in open(os.environ["PATH_LIST"]) if l.strip() and not l.lstrip().startswith("#")]
-                  diff = git("diff", "--name-only", "origin/" + base + "...HEAD")
-                  macos = diff.returncode != 0 or any(fnmatch.fnmatchcase(f, p) for f in diff.stdout.splitlines() for p in patterns)
+                  try:
+                      patterns = [l.strip() for l in open(os.environ["PATH_LIST"]) if l.strip() and not l.lstrip().startswith("#")]
+                  except OSError:
+                      patterns = []
+                  if not patterns:
+                      print("the platform-path list cannot be read or holds no pattern: running macOS (fail safe)")
+                  else:
+                      # --no-renames: a file moved OUT of a listed path is seen under its old name too.
+                      diff = git("diff", "--no-renames", "--name-only", "origin/" + base + "...HEAD")
+                      if diff.returncode != 0:
+                          print("the diff against origin/%s failed: running macOS (fail safe)" % base)
+                      macos = diff.returncode != 0 or any(fnmatch.fnmatchcase(f, p) for f in diff.stdout.splitlines() for p in patterns)
           oses = ["ubuntu-latest"] + (["macos-latest"] if macos else [])
           rows = []
           if event == "schedule":

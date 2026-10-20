@@ -9113,12 +9113,12 @@ class WorkflowPlanPins(unittest.TestCase):
     def touching(entry):
         return entry.replace("**", "sub/file.txt") if "**" in entry else entry
 
-    def plan(self, text, listtext, event, base="", draft=False, files=("docs/other.md",), integration=True):
+    def plan(self, text, listtext, event, base="", draft=False, files=("docs/other.md",), integration=True, moves=()):
         """Run the plan job's script from `text` and return the matrix rows it writes."""
         start = text.index("          python3 - <<'PY'\n")
         end = text.index("\n          PY\n", start)
         script = "\n".join(l[10:] for l in text[start:end + len("\n          PY")].splitlines()) + "\n"
-        tmp = self.repo_for(listtext, tuple(files), integration)
+        tmp = self.repo_for(listtext, tuple(files), integration, tuple(moves))
         out = Path(tmp) / "out.txt"
         out.write_text("")
         env = dict(os.environ, EVENT=event, BASE=base, DRAFT="true" if draft else "false", PATH_LIST=".github/macos-platform-paths.txt", GITHUB_OUTPUT=str(out))
@@ -9131,20 +9131,33 @@ class WorkflowPlanPins(unittest.TestCase):
     _repos = {}
 
     @classmethod
-    def repo_for(cls, listtext, files, integration):
+    def repo_for(cls, listtext, files, integration, moves=()):
         """A throwaway repository (made once per shape, the script only reads it): a base commit holding the list and, on top, a change that touches `files`."""
-        key = (listtext, files, integration)
+        key = (listtext, files, integration, moves)
         if key not in cls._repos:
             tmp = tempfile.mkdtemp(prefix="plan-pin-")
             def git(*args):
                 subprocess.run(["git", "-C", tmp, "-c", "user.name=t", "-c", "user.email=t@example.com"] + list(args), check=True, capture_output=True)
             git("init", "-q", "-b", "main")
             (Path(tmp) / ".github").mkdir()
-            (Path(tmp) / ".github" / "macos-platform-paths.txt").write_text(listtext)
+            if listtext is not None:
+                (Path(tmp) / ".github" / "macos-platform-paths.txt").write_text(listtext)
+            (Path(tmp) / "keep").write_text("x\n")
             git("add", "-A")
             git("commit", "-q", "-m", "base")
             for name in ("main", "integration") if integration else ("main",):
                 git("update-ref", "refs/remotes/origin/" + name, "HEAD")
+            for src, dst in moves:   # a file that exists on the base and is moved (same content) to another path
+                (Path(tmp) / src).parent.mkdir(parents=True, exist_ok=True)
+                (Path(tmp) / src).write_text("a moved file\n" * 20)
+            if moves:
+                git("add", "-A")
+                git("commit", "-q", "-m", "base2")
+                for name in ("main", "integration"):
+                    git("update-ref", "refs/remotes/origin/" + name, "HEAD")
+                for src, dst in moves:
+                    (Path(tmp) / dst).parent.mkdir(parents=True, exist_ok=True)
+                    git("mv", src, dst)
             for f in files:
                 path = Path(tmp) / f
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -9188,7 +9201,8 @@ class WorkflowPlanPins(unittest.TestCase):
         check(sorted(groups) == sorted(self.GROUPS) and all(groups.values()), "the list names all 5 groups")
         for entry in self.retypable(listtext):
             check(entry not in text, "an entry of the list is re-typed in the workflow: " + entry)
-        run = lambda *a, **k: self.plan(text, listtext, *a, **k)
+        def run(*a, **k):
+            return self.plan(text, k.pop("listtext", listtext), *a, **k)
         key = lambda rows: self.names(rows)
         both = list(self.REQUIRED)
         check(key(run("pull_request", "main")) == both, "a pull request into main ends with both required results")
@@ -9201,6 +9215,14 @@ class WorkflowPlanPins(unittest.TestCase):
         check(key(run("pull_request", "integration", files=("bin/fleet-switchboard",))) == ["test (ubuntu-latest)"], "the monolith is not on the list")
         for entry in self.entries(listtext):
             check(key(run("pull_request", "integration", files=(self.touching(entry),))) == both, "a pull request into integration touching " + entry + " runs macOS")
+        first = self.entries(listtext)[0] if self.entries(listtext) else None
+        if first:
+            src = self.touching(first)
+            check(key(run("pull_request", "integration", files=(), moves=((src, "docs/moved.txt"),))) == both, "a file moved OUT of a listed path runs macOS")
+        check(key(run("pull_request", "gone-branch")) == both, "a failed diff (no such base) runs macOS")
+        for bad in ("", "# group: shims\n\n", None):
+            check(key(run("pull_request", "integration", listtext=bad)) == both, "a list that is empty, comment-only or missing runs macOS")
+        check("fetch-depth: 0" in jobs.split("\n  test:\n", 1)[0], "the plan checkout has the full history")
         nightly = run("schedule")
         check(len(nightly) == 4 and sorted({r["ref"] for r in nightly}) == ["integration", "main"], "the nightly: main and integration, two operating systems each")
         check(all(r["name"].startswith("nightly ") and r["cloud"].startswith("nightly-cloud ") for r in nightly), "nightly names")
@@ -9220,6 +9242,12 @@ class WorkflowPlanPins(unittest.TestCase):
         source = inspect.getsource(WorkflowPlanPins)
         for entry in self.retypable(listtext):
             self.assertNotIn('"' + entry + '"', source, "the test re-types an entry: " + entry)
+        every = subprocess.run(["git", "-C", str(REPO), "ls-files"], capture_output=True, text=True).stdout.split("\n")
+        for entry in entries:
+            if any(c in entry for c in "*?["):
+                self.assertTrue([f for f in every if fnmatch.fnmatchcase(f, entry)], "a glob matches no tracked file: " + entry)
+            else:
+                self.assertIn(entry, every, "an entry is not a tracked file (typo?): " + entry)
         tracked = subprocess.run(["git", "-C", str(REPO), "ls-files", ".github"], capture_output=True, text=True).stdout.split()
         self.assertEqual([t for t in tracked if t.endswith(".txt")], [".github/macos-platform-paths.txt"])
 
@@ -9241,6 +9269,12 @@ class WorkflowPlanPins(unittest.TestCase):
             ("ready_for_review dropped", swap("types: [opened, synchronize, reopened, ready_for_review]", "types: [opened, synchronize, reopened]"), listtext),
             ("the path list not read", swap("PATH_LIST: .github/macos-platform-paths.txt", "PATH_LIST: .github/missing.txt"), listtext),
             ("the path list emptied", text, "# group: shims\n"),
+            ("renames detected", swap('"diff", "--no-renames", "--name-only"', '"diff", "--name-only"'), listtext),
+            ("a failed diff skips macOS", swap("macos = diff.returncode != 0 or any(", "macos = diff.returncode == 0 and any("), listtext),
+            ("an empty list runs no macOS", swap("if not patterns:", "if False:"), listtext),
+            ("a missing list crashes", swap("except OSError:", "except FileNotFoundError:\n                      raise"), listtext),
+            ("the plan checkout shallow", swap("    steps:\n      - uses: actions/checkout@v5\n        with:\n          fetch-depth: 0\n", "    steps:\n      - uses: actions/checkout@v5\n"), listtext),
+            ("edited among the types", swap("types: [opened, synchronize, reopened, ready_for_review]", "types: [opened, synchronize, reopened, ready_for_review, edited]"), listtext),
             ("the job renamed", swap("name: ${{ matrix.name }}", "name: macos-${{ matrix.os }}"), listtext),
             ("a third-party action", swap("      - name: Decide the runners\n", "      - uses: dorny/paths-filter@v3\n      - name: Decide the runners\n"), listtext),
             ("a wider permission", swap("permissions:\n  contents: read\n", "permissions:\n  contents: read\n  issues: write\n"), listtext),
@@ -9264,7 +9298,7 @@ class WorkflowPlanPins(unittest.TestCase):
         docs = (REPO / "docs" / "switchboard.md").read_text()
         section = docs.split("**Which runs happen when (the test workflow).**", 1)[1].split("\n\n**", 1)[0]
         for needle in ("18 minutes", "64", "195", "198", "44 percent", "39 percent", "pull request into `main`", "pull request into `integration`",
-                       "push to `main`", "nightly", "manual dispatch", "draft", "ready_for_review", ".github/macos-platform-paths.txt",
+                       "push to `main`", "nightly", "manual dispatch", "draft", "ready_for_review", ".github/macos-platform-paths.txt", "--no-renames", "is not re-planned by the retarget itself", "runs macOS and says so on the plan step",
                        "a pull request is re-run with a re-run, never by closing and reopening it"):
             self.assertIn(needle, section, needle)
 
