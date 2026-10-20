@@ -1642,6 +1642,18 @@ def _duration_ok(value):
 
 # THE table of value rules: one row per setting, the rule's words (shown in a refusal, never the value) and its test. DEFAULT-DENY: a setting with no
 # row is refused, and a test fails when SETTINGS and this table differ. Every value also refuses control characters (checked before this table).
+class _Rule(tuple):
+    """A row of VALIDATORS: (the rule's words, its test), and a flag `narrows` for a setting whose purpose is to NARROW what a credential may do.
+    A blank value of such a setting in the file is refused naming the key, never read as unset (unset means the broader default)."""
+    narrows = False
+
+
+def _narrowing(words, test):
+    row = _Rule((words, test))
+    row.narrows = True
+    return row
+
+
 VALIDATORS = {
     "CW_ALLOWED_REPOS": ("a comma-separated list of OWNER/NAME entries, no wildcard", _allowed_ok),
     "CW_TOOLING_REPO": ("one OWNER/NAME", lambda v: _repo_key(v) is not None),
@@ -1664,7 +1676,7 @@ VALIDATORS = {
     "CW_APP_INSTALLATION_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
     "CW_APP_KEY_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
     "CW_CLUSTER_ADMIN_SECRET": ("a vault secret name: 1 to 127 letters, digits and hyphens, starting with a letter or digit", lambda v: bool(_VAULT_SECRET_NAME.fullmatch(v))),
-    "CW_TOKEN_MODE": ("exactly default or read-only", lambda v: v in TOKEN_MODES),
+    "CW_TOKEN_MODE": _narrowing("exactly default or read-only", lambda v: v in TOKEN_MODES),
     "CW_CLUSTER_TOKEN_DURATION": ("a duration of 1 to 3 digits and m or h, from 1m to 60m (for example 20m or 1h)", _duration_ok),
     "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
 }
@@ -1729,7 +1741,7 @@ def _read_settings_file(path):
 def parse_settings(text, path="the settings file"):
     """KEY=VALUE lines into {key: value}. `#` starts a comment line and blank lines are skipped. The value is the rest of the line, verbatim:
     no quoting, no expansion, nothing is run. A bad line, an unknown or repeated key, a quoted value, and a secret-shaped value are refused naming the
-    line number and the key, never the value. An empty value counts as not set."""
+    line number and the key, never the value. An empty value counts as not set, except for a setting that narrows a credential (its VALIDATORS row has `narrows`): that is refused."""
     values = {}
     for number, line in enumerate(text.split("\n"), 1):
         lead = line.lstrip(" \t")   # a tab is allowed in leading indentation and inside a comment line, nowhere else
@@ -1753,6 +1765,8 @@ def parse_settings(text, path="the settings file"):
         for shape, pattern, kinds in SECRET_SHAPES:
             if (kinds is None or kind in kinds) and pattern.search(value):
                 raise _bad(path, "line %d: the value of %s looks like a secret (%s); the file holds no secret" % (number, key, shape))
+        if not value and getattr(VALIDATORS.get(key), "narrows", False):   # blank is not "unset" for a setting that narrows a credential
+            raise _bad(path, "line %d: %s is blank: give it a value or remove the line (a blank is never read as the broader default)" % (number, key))
         if value:
             rule = VALIDATORS.get(key)
             if rule is None or not rule[1](value):

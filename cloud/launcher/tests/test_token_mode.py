@@ -353,5 +353,52 @@ class Mint(unittest.TestCase):
         self.assertIn("permissions", quick)
 
 
+class NarrowingSettings(unittest.TestCase):
+    """A setting that NARROWS what a credential may do is never read as unset when blank: in the FILE and in the ENVIRONMENT. The set of such rows is
+    DERIVED from the flag on the VALIDATORS row; a new one fails the completeness test until it has an environment route here."""
+
+    REQUIRED = ("CW_ALLOWED_REPOS=acme-org/widget-service\nCW_CLOUD_IMAGE=registry.example.internal/acme/worker@sha256:" + "ab12" * 16 +
+                "\nCW_CLOUD_SERVER=https://cluster.example.internal:6443\nCW_VAULT_SUBSCRIPTION=00000000-0000-0000-0000-000000000000\n"
+                "CW_VAULT_NAME=vault-example\nCW_CLOUD_NAMESPACE=cw\n")
+    ENV_ROUTE = {"CW_TOKEN_MODE": lambda v: cw.token_mode_choice(None, {"CW_TOKEN_MODE": v})}
+    BLANKS = ("", "   ", "\t", '""', "''", " # a note", "#", "  \"\"  ")
+
+    @staticmethod
+    def narrowing():
+        return sorted(k for k, row in cw.VALIDATORS.items() if getattr(row, "narrows", False))
+
+    def test_every_narrowing_row_has_an_environment_route(self):
+        self.assertTrue(self.narrowing())
+        self.assertEqual(self.narrowing(), sorted(self.ENV_ROUTE))
+
+    def test_a_blank_value_in_the_file_is_refused_naming_the_key(self):
+        for key in self.narrowing():
+            for blank in self.BLANKS:
+                with self.subTest(key=key, blank=blank):
+                    with self.assertRaises(cw.CloudError) as caught:
+                        cw.parse_settings(self.REQUIRED + "%s=%s\n" % (key, blank), "/home/user/cloud.env")
+                    self.assertIn(key, str(caught.exception))
+
+    def test_a_blank_value_in_the_environment_is_refused_never_default(self):
+        for key in self.narrowing():
+            for blank in ("", " ", "\t", "  "):
+                with self.subTest(key=key, blank=blank), self.assertRaises(cw.CloudError) as caught:
+                    self.ENV_ROUTE[key](blank)
+                self.assertIn(key, str(caught.exception))
+
+    def test_a_real_value_still_reads_in_the_file_and_an_absent_line_is_unset(self):
+        self.assertEqual(cw.parse_settings(self.REQUIRED + "CW_TOKEN_MODE=read-only\n").get("CW_TOKEN_MODE"), "read-only")
+        self.assertNotIn("CW_TOKEN_MODE", cw.parse_settings(self.REQUIRED + "# no line\n"))
+
+    def test_mutant_the_flag_removed_from_a_row_lets_a_blank_through_the_file(self):
+        for key in self.narrowing():
+            words, test = cw.VALIDATORS[key]
+            with self.subTest(key=key), mock.patch.dict(cw.VALIDATORS, {key: (words, test)}):   # a plain row: no flag
+                self.assertNotIn(key, cw.parse_settings(self.REQUIRED + "%s=\n" % key))   # the blank is dropped: the broader default would apply
+
+    def test_a_blank_line_that_is_not_narrowing_is_still_unset(self):
+        self.assertNotIn("CW_PULL_SECRET", cw.parse_settings(self.REQUIRED + "CW_PULL_SECRET=\n"))
+
+
 if __name__ == "__main__":
     unittest.main()
