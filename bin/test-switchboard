@@ -22429,7 +22429,8 @@ class StalledHub:
         self.paths.append(path)
         if self.fail:
             raise sb.GitHubUnavailable("the list could not be read")
-        return list(self.records), self.cut
+        limit = (cap or 1) * 100   # the real reader stops at its page cap and says so
+        return list(self.records)[:limit], self.cut or len(self.records) > limit
 
 
 class WaitingInputs:
@@ -23174,6 +23175,480 @@ class TestLegitimateWaiting(WaitingInputs, ReportBase):
     def test_a_bad_review_window_is_refused(self):
         with self.assertRaises(sb.ConfigError):
             sb.validate_config({"review_window_minutes": 0})
+
+
+class OwnedInputs(WaitingInputs):
+    """#874: the daemon's lists for a scene of an ask (#2), its work item (#3), a work item below it (#4) and an unrelated issue (#5). Ages are
+    counted back from the moment of each read (the daemon's pass re-reads the lists every few minutes), so time can pass and the lists stay fresh. The
+    pull request list is `ci_record_pass`'s over a fake hub that honours the cut and the failure; the issue list is the triage's."""
+    OLD, RECENT = 10 * 3600, 600
+    NO_HEAD = object()
+
+    def wire_scene(self):
+        self.scene = {"issues": {3: {"parent": 2}, 4: {"parent": 3}}, "prs": []}
+        self.wire_inputs()
+
+    def pr(self, number, body, age=None, base="main", created=None, head=None, **extra):
+        return dict({"number": number, "body": body, "age": self.OLD if age is None else age, "created": 86400 if created is None else created, "base": base,
+                     "head": "a" * 40 if head is None else head}, **extra)
+
+    def plan(self, n):
+        return "PLAN: https://github.com/%s/issues/%d\n" % (self.REPO, n)
+
+    def set_scene(self, prs=None, issues=None, **issue_extra):
+        if prs is not None:
+            self.scene["prs"] = prs
+        for n, fields in (issues or {}).items():
+            self.scene["issues"].setdefault(n, {}).update(fields)
+        self.apply()
+
+    def apply(self):
+        engine, scene = self.world.engine, self.scene
+        now = self.world.clock.now()
+        def row(n):
+            f = scene["issues"].get(n, {})
+            record = {"number": n, "updated_at": sb.iso(now - f.get("age", self.OLD)), "created_at": sb.iso(now - self.OLD),
+                      "labels": [{"name": l} for l in f.get("labels", ())]}
+            if "raw_time" in f:
+                record["updated_at"] = f["raw_time"]
+            if f.get("parent") is not None:
+                record["parent_issue_url"] = "https://api.github.com/repos/%s/issues/%d" % (f.get("parent_repo", self.REPO), f["parent"])
+            return record
+        engine.triage = sb.TriageState()
+        engine.triage.units[(self.REPO, "issues")] = {"at": now, "data": [row(n) for n in range(1, 100)], "truncated": False, "error": None}
+        sb.read_mark(engine, "issues:" + self.REPO, True, "", now)
+        sb.read_mark(engine, "decisions", True, "", now)
+        self.hub.records = [{"number": p["number"], "body": p["body"], "updated_at": p["age"][1] if isinstance(p["age"], tuple) else sb.iso(now - p["age"]), "created_at": sb.iso(now - p["created"]),
+                             "head": {"sha": p["head"]}, "base": {"ref": p["base"]}, "labels": [{"name": l} for l in p.get("labels", ())],
+                             **{k: v for k, v in p.items() if k in ("requested_reviewers", "requested_teams", "draft")}} for p in scene["prs"]]
+        for record, p in zip(self.hub.records, scene["prs"]):
+            if p["head"] is self.NO_HEAD:
+                del record["head"]   # a record with no head at all
+
+        engine.__dict__.pop("ci_record_state", None)
+        engine.__dict__.get("read_whole", {}).pop("pulls:" + self.REPO, None)
+        sb.ci_record_pass(engine, now)
+
+    def owned(self):
+        engine = self.world.engine
+        records = engine.triage.units[(self.REPO, "issues")]["data"]
+        pulls = engine.ci_record_state.lists[sb.plan_ledger.normal_repo(self.REPO)][1]
+        return sb.worker_owned(records, pulls, 2, self.REPO)
+
+    def owned_numbers(self):
+        got = self.owned()
+        return sorted(r["number"] for r in got.issues), sorted(r["number"] for r in got.pulls)
+
+
+class TestWorkerOwned(OwnedInputs, ReportBase):
+    """#874: the ONE function that says what a worker owns (the ask, its work items, every open pull request naming any of them), and its three
+    consumers (the stalled-working rule, the idle-at-a-seam rule, the waiting predicate's guards) driven through the real engine pass."""
+
+    def setUp(self):
+        super().setUp()
+        self.wire_scene()
+        self.world.tick(1)
+        for _ in range(5):
+            self.report("working", "migrating the tables")
+        self.world.tick(1)
+
+    # -- the set (S1, S2, S12) --------------------------------------------------------------------------------------------------------------
+    def test_S1_the_set_is_the_ask_its_work_items_at_any_depth_and_every_pull_request_naming_any_of_them(self):
+        self.set_scene(prs=[
+            self.pr(10, self.plan(3)),
+            self.pr(11, "Part of #4\n"),
+            self.pr(12, self.plan(2), base="integration"),
+            self.pr(13, self.plan(5)),
+        ])
+        self.assertEqual(self.owned_numbers(), ([2, 3, 4], [10, 11, 12]))
+
+    def test_S1_every_kind_of_the_table_is_built_and_each_mutant_changes_the_answer(self):
+        self.set_scene(prs=[self.pr(10, self.plan(3)), self.pr(12, self.plan(2), base="integration")])
+        self.assertEqual(self.owned_numbers(), ([2, 3, 4], [10, 12]))
+        want = {"issue": ([], []), "work item": ([2], [12]), "pull request": ([2, 3, 4], [])}   # what survives when this kind is dropped
+        self.assertEqual(set(want), set(sb.OWNED_KINDS), "a kind in the production table with no case here")
+        for kind, expected in want.items():
+            with self.subTest(kind):
+                description, build = sb.OWNED_KINDS[kind]
+                self.assertTrue(description)
+                with mock.patch.dict(sb.OWNED_KINDS, {kind: (description, lambda ctx: [])}):
+                    got = self.owned()
+                    self.assertEqual(got if got is None else self.owned_numbers(), None if kind == "issue" else expected)
+
+    def test_S1_a_mutant_that_matches_only_the_assignments_own_number_or_ignores_the_base_branch_is_caught(self):
+        self.set_scene(prs=[self.pr(10, self.plan(3)), self.pr(12, self.plan(2), base="integration")])
+        real = sb._owned_pulls
+        def own_only(ctx):
+            return [r for r in real(types.SimpleNamespace(**dict(vars(ctx), numbers={ctx.issue})))]
+        def main_only(ctx):
+            return [r for r in real(ctx) if (r.get("base") or {}).get("ref") == "main"]
+        for mutant, pulls in ((own_only, [12]), (main_only, [10])):
+            with self.subTest(mutant.__name__):
+                description, _ = sb.OWNED_KINDS["pull request"]
+                with mock.patch.dict(sb.OWNED_KINDS, {"pull request": (description, mutant)}):
+                    self.assertEqual(self.owned_numbers()[1], pulls)
+
+    def test_S2_a_stray_mention_owns_nothing_and_a_parent_cycle_returns(self):
+        self.set_scene(prs=[
+            self.pr(10, "Fixes the thing the work item #3 asked about\n"),
+            self.pr(11, "Summary\n\nPLAN: https://github.com/%s/issues/3\n" % self.REPO),      # a later line is not the PLAN line
+            self.pr(12, "> Closes #3\n"),                                                       # a quoted line
+            self.pr(13, "Related to #3\n"),                                                     # not a strict form
+            self.pr(14, "Closes acme/other-service#3\n"),                                      # another repository's number
+        ])
+        self.assertEqual(self.owned_numbers()[1], [])
+        self.set_scene(issues={2: {"parent": 4}})   # 2 -> 4 -> 3 -> 2
+        self.assertEqual(self.owned_numbers()[0], [2, 3, 4])
+        self.set_scene(issues={5: {"parent": 5}, 3: {"parent": 3, "parent_repo": "acme/other-service"}})
+        self.assertEqual(self.owned_numbers()[0], [2], "a self-parent and another repository's parent are no work items")
+
+    def test_S2_a_chain_deeper_than_the_bound_ends_the_walk(self):
+        for n in range(6, 20):
+            self.scene["issues"][n] = {"parent": n - 1 if n > 6 else 2}
+        self.apply()
+        issues = self.owned_numbers()[0]
+        self.assertIn(6 + sb.TRIAGE_ANCESTOR_DEPTH - 1, issues)
+        self.assertNotIn(6 + sb.TRIAGE_ANCESTOR_DEPTH, issues, "the walk is bounded")
+
+    def test_S12_a_stray_mention_does_not_move_or_hold_an_idle_assignment_and_the_rule_wakes_once(self):
+        self.set_scene(prs=[self.pr(10, "Looks at #3 in prose\n", age=self.RECENT, created=self.OLD)])
+        self.assertEqual(self.owned_numbers()[1], [])
+        self.late()
+        self.assertEqual(len(self.stalled()), 1)
+
+    BAD_TIMES = ("not a time", None, "", 12, [], "2026-13-45T99:00:00Z")
+
+    def readable_scene(self):
+        """The ONE setup both the bad scene and its control come from: the ask (#2), two work items (#3, #4) and two owned pull requests (#10, #11)."""
+        return dict(prs=[self.pr(10, self.plan(3)), self.pr(11, self.plan(4), head="b" * 40)])
+
+    def break_member(self, member, position, value):
+        """Make ONE member unreadable in ONE position (the first or the later item the member covers); returns the scene changes."""
+        scene = self.readable_scene()
+        if member == "assignment time":
+            return dict(scene, issues={2: {"raw_time": value}})
+        if member == "work item time":
+            return dict(scene, issues={(3, 4)[position]: {"raw_time": value}})
+        key = "head" if member == "pull request head" else "age"
+        prs = [dict(p) for p in scene["prs"]]
+        prs[position][key] = value
+        return dict(scene, prs=prs)
+
+    def test_an_owned_item_that_cannot_be_read_is_not_judged_for_every_member_position_and_bad_value(self):
+        """Derived from OWNED_READABLE (the guard's own member table): every member, in the first AND the later position of what it covers, with each
+        kind of bad value, through BOTH rules; each bad scene is built from the same setup as its control, so only the one input differs."""
+        cases = []
+        for member in sb.OWNED_READABLE:
+            if member == "pull request head":
+                values = (self.NO_HEAD, None, 0, 12, "", ["x"])   # a head that is missing, null, a number, empty, or not text
+            elif member == "pull request time":
+                values = tuple(("raw", v) for v in self.BAD_TIMES)   # the fake hub's marker for a raw updated_at
+            else:
+                values = self.BAD_TIMES
+            for position in ((0,) if member == "assignment time" else (0, 1)):
+                cases += [(member, position, value) for value in values]
+        self.assertEqual({member for member, _, _ in cases}, set(sb.OWNED_READABLE), "a member of the guard's table with no case here")
+        for member, position, value in cases:
+            for rule in ("stalled", "seam"):
+                with self.subTest(member=member, position=position, value=repr(value), rule=rule):
+                    self.setUp()
+                    self.set_scene(**self.break_member(member, position, value))
+                    self.idle() if rule == "seam" else self.late()
+                    self.assertEqual(self.said(rule), [], "not judged")
+        for rule in ("stalled", "seam"):
+            self.assertEqual(len(self.control(rule)), 2 if rule == "seam" else 1, "the control (same setup, every input readable) speaks")
+
+    def control(self, rule):
+        self.setUp()
+        self.set_scene(**self.readable_scene())
+        self.idle() if rule == "seam" else self.late()
+        return self.said(rule)
+
+    def test_every_member_of_the_readable_table_is_needed_a_mutant_that_drops_it_is_caught(self):
+        examples = {"assignment time": (0, {"issues": {2: {"raw_time": "not a time"}}}),
+                    "work item time": (1, {"issues": {4: {"raw_time": "not a time"}}}),
+                    "pull request head": (1, "head"), "pull request time": (1, "age")}
+        for member, (position, change) in examples.items():
+            with self.subTest(member):
+                scene = self.break_member(member, position, 0 if change == "head" else ("raw", "not a time")) if isinstance(change, str) else dict(self.readable_scene(), **change)
+                select, check = sb.OWNED_READABLE[member]
+                with mock.patch.dict(sb.OWNED_READABLE, {member: (lambda owned: [], check)}):
+                    self.setUp()
+                    self.set_scene(**scene)
+                    self.late()
+                    try:
+                        silent = self.said("stalled") == []
+                    except TypeError:
+                        silent = False   # without the time check, max() over an unreadable time breaks the rule outright (the only crash expected)
+                    self.assertFalse(silent, "without this member's check the rule no longer stays silent on the bad input: the case above catches the mutant")
+        self.assertEqual(set(examples), set(sb.OWNED_READABLE))
+
+    def reminder_answer(self, issue, owned=3):
+        """What the waiting predicate answers when the (hand-edited) reminders file holds `issue`, for a worker that owns `owned` (3 is a work item;
+        1 is made a work item too, so that a bool, which is equal to 1, can match)."""
+        self.setUp()
+        self.set_scene(issues={1: {"parent": 2}})
+        now = self.world.clock.now
+        sb.add_reminder(self.world.state, "coder", now() + 600, now(), "look", issue=owned)
+        items = sb.read_reminders(self.world.state)
+        items[0]["issue"] = issue
+        sb.write_reminders(self.world.state, items)
+        try:
+            got = self.predicate()
+        except TypeError:
+            return "raised"
+        return got.state
+
+    # every value is built FROM an owned number (3, or 1 for the bool), so each one would match a set test if the type check let it through
+    BAD_REMINDER_ISSUES = (("a list", [3], 3), ("a dict", {"n": 3}, 3), ("a string", "3", 3), ("a float equal to an owned number", 3.0, 3),
+                           ("a bool equal to an owned number", True, 1), ("null", None, 3))
+
+    def test_a_reminder_whose_issue_is_not_an_int_never_raises_and_holds_nothing(self):
+        """A list, a dict, a string, null, a float and a bool in a hand-edited reminders file all answer "clear" (never an exception). A list or dict, a
+        string and null answer as the old `==` did. A float equal to an owned number (3.0) and a bool equal to one (True, with 1 owned) used to hold under
+        `==`: rejecting them is the deliberate, safer answer (only an int that is not a bool names an issue), and this test pins it."""
+        for name, bad, owned in self.BAD_REMINDER_ISSUES:
+            with self.subTest(issue=name):
+                self.assertEqual(self.reminder_answer(bad, owned), "clear")
+        for owned in (3, 4, 1):
+            with self.subTest(control=owned):
+                self.assertEqual(self.reminder_answer(owned, owned), "waiting", "a real int on an owned issue still waits")
+
+    def test_one_mutant_per_allowed_type_of_the_issue_check_is_caught(self):
+        raw = lambda value: True                                                       # no check: a list or dict raises
+        any_int = lambda value: isinstance(value, int)                                 # a bool passes
+        int_or_float = lambda value: isinstance(value, (int, float)) and not isinstance(value, bool)   # a float passes
+        for name, mutant in (("no check", raw), ("a bool is an int", any_int), ("a float is a number", int_or_float)):
+            with self.subTest(mutant=name):
+                with mock.patch.object(sb, "_is_issue_number", mutant):
+                    answers = {label: self.reminder_answer(bad, owned) for label, bad, owned in self.BAD_REMINDER_ISSUES}
+                self.assertNotEqual(set(answers.values()), {"clear"}, "this mutant must change the answer of at least one bad value: %s" % answers)
+
+    def said(self, rule):
+        self.apply()
+        return [f for f in self.derive() if (":seam:" if rule == "seam" else ":stalled:") in f.key]
+
+    # -- the rules (S3, S4, S5) -------------------------------------------------------------------------------------------------------------
+    def stalled(self):
+        self.apply()
+        return [f for f in self.derive() if ":stalled:" in f.key]
+
+    def seam(self):
+        self.apply()
+        return [f for f in self.derive() if ":seam:" in f.key]
+
+    def late(self, hours=2.5):
+        self.world.tick(int(hours * 3600) - 60)
+        self.apply()
+        self.world.tick(60)
+
+    def test_S3_a_work_item_pull_request_that_moved_is_movement_the_asks_old_time_alone_would_wake(self):
+        self.set_scene(prs=[self.pr(10, self.plan(3))])
+        self.late()
+        self.assertEqual(len(self.stalled()), 1, "everything owned is old: one wake")
+        self.set_scene(prs=[self.pr(10, self.plan(3), age=self.RECENT)])
+        self.assertEqual(self.stalled(), [])
+
+    def test_S4_movement_of_any_owned_thing_counts_and_the_wake_names_the_ask_when_all_is_old(self):
+        self.set_scene(prs=[self.pr(10, self.plan(3)), self.pr(11, self.plan(4), head="b" * 40)])
+        self.late()
+        self.assertEqual(len(self.stalled()), 1)
+        self.set_scene(issues={4: {"age": self.RECENT}})
+        self.assertEqual(self.stalled(), [], "a work item updated 10 minutes ago")
+        self.set_scene(issues={4: {"age": self.OLD}})
+        self.assertEqual(len(self.stalled()), 1)
+        self.set_scene(prs=[self.pr(10, self.plan(3)), self.pr(11, self.plan(4), head="c" * 40)])
+        self.assertEqual(self.stalled(), [], "the head of the SECOND owned pull request changed, under an old updated time")
+        self.late()
+        (wake,) = self.stalled()
+        self.assertRegex(wake.summary, r"^no movement for 2\.5h on acme/widget-service#1[01] ")
+
+    def test_S4_the_head_of_each_owned_pull_request_is_remembered_on_its_own(self):
+        self.set_scene(prs=[self.pr(10, self.plan(3)), self.pr(11, self.plan(4))])
+        self.stalled()
+        self.late()
+        self.assertEqual(len(self.stalled()), 1)
+        self.set_scene(prs=[self.pr(10, self.plan(3)), self.pr(11, self.plan(4), head="d" * 40)])
+        self.assertEqual(self.stalled(), [])
+        self.assertEqual(sorted(self.engine_heads()), [10, 11])
+
+    def engine_heads(self):
+        for source in self.world.engine.sources:
+            heads = getattr(source, "_heads", None)
+            if heads is not None:
+                return heads["coder"]
+        self.fail("the rule's head memory is not found")
+
+    def idle(self):
+        self.stop("all quiet")
+        self.world.tick(sb.SEAM_IDLE_SECONDS + 100)
+
+    def test_S5_a_coder_waiting_on_ci_or_review_of_its_work_item_pull_request_is_not_nudged(self):
+        self.idle()
+        cases = (
+            ("ci running", dict(), ["in_progress"]),
+            ("review requested", dict(requested_reviewers=[{"login": "reviewer-one"}]), None),
+            ("younger than the review window", dict(created=600), None),
+        )
+        for name, extra, checks in cases:
+            with self.subTest(name):
+                self.set_scene(prs=[self.pr(10, self.plan(3), **extra)])
+                if checks:
+                    self.world.engine.ci_record_state.pr_state["%s#10" % self.REPO].update(
+                        {"examined_head": "a" * 40, "checks": [{"name": "ci", "conclusion": c} for c in checks]})
+                    self.assertEqual(self.derive_seam(), [])
+                else:
+                    self.assertEqual(self.seam(), [])
+        self.set_scene(prs=[self.pr(10, self.plan(3))])
+        self.world.engine.ci_record_state.pr_state["%s#10" % self.REPO].update(
+            {"examined_head": "a" * 40, "checks": [{"name": "ci", "conclusion": "success"}]})
+        self.assertEqual(sorted((f.kind, f.recipient) for f in self.derive_seam()), [("nudge", "coder"), ("worker.idle", "platform")])
+
+    def derive_seam(self):
+        return [f for f in self.derive() if ":seam:" in f.key]
+
+    # -- the guards (S6) --------------------------------------------------------------------------------------------------------------------
+    def observation(self):
+        self.world.engine.discover(self.world.clock.now())
+        return self.world.engine.discovery.agents["coder"]
+
+    def predicate(self):
+        last = sb._read_small(self.world.state, sb.LAST_REPORT_FILE).get("coder")
+        return sb.legitimately_waiting(self.world.engine, self.observation(), 2, self.REPO, last)
+
+    def item_triggers(self):
+        """One trigger per guard, each on a WORK ITEM (#3) or on the pull request that names it (#10)."""
+        cfg, now = self.world.engine.config, self.world.clock.now
+        pr = lambda **extra: self.set_scene(prs=[self.pr(10, self.plan(3), **extra)])
+        def ci():
+            pr()
+            self.world.engine.ci_record_state.pr_state["%s#10" % self.REPO].update(
+                {"examined_head": "a" * 40, "checks": [{"name": "ci", "conclusion": "in_progress"}]})
+        def decision(number):
+            pr()
+            (self.world.state / sb.DECISIONS_FILE).write_text(json.dumps({"decisions": [{"tier": "human", "kind": "captain", "repo": self.REPO, "number": number}], "errors": []}))
+        return {
+            "awaiting-issue": lambda: self.set_scene(issues={3: {"labels": [sb.awaiting_cos_label(cfg)]}}),
+            "awaiting-pr": lambda: pr(labels=[sb.awaiting_label(cfg)]),
+            "ci": ci,
+            "review-requested": lambda: pr(requested_reviewers=[{"login": "reviewer-one"}]),
+            "review-window": lambda: pr(created=600),
+            "reminder": lambda: (pr(), sb.add_reminder(self.world.state, "coder", now() + 600, now(), "look", issue=3)),
+            "decision": lambda: decision(3),
+        }
+
+    def test_S6_every_guard_holds_on_an_owned_work_item_or_its_pull_request_and_the_tables_are_complete(self):
+        triggers = self.item_triggers()
+        self.assertEqual(set(triggers) | {"last-report"}, set(sb.WAITING_GUARDS), "a guard in the production table with no work-item case here")
+        self.assertEqual(set(sb.WORKER_OWNED_CONSUMERS), set(sb.WAITING_GUARDS) | {"stalled-working", "idle-at-a-seam"}, "a consumer of the set with no row stating what it takes")
+        self.assertEqual(self.predicate().state, "clear")
+        for code, arrange in triggers.items():
+            with self.subTest(code):
+                self.setUp()
+                arrange()
+                got = self.predicate()
+                self.assertEqual((got.state, got.codes), ("waiting", [code]))
+
+    def test_S6_a_decision_on_the_work_items_pull_request_waits_too(self):
+        self.set_scene(prs=[self.pr(10, self.plan(3))])
+        (self.world.state / sb.DECISIONS_FILE).write_text(json.dumps({"decisions": [{"tier": "human", "kind": "captain", "repo": self.REPO, "number": 10}], "errors": []}))
+        self.assertEqual(self.predicate().codes, ["decision"])
+
+    def test_S9_each_guard_that_still_reads_the_old_lookup_is_caught(self):
+        """One mutant per guard (the table's own rows): the guard sees only the assignment and the pull requests naming it, so its work-item case no longer holds."""
+        triggers = self.item_triggers()
+        for code in triggers:
+            with self.subTest(code):
+                self.setUp()
+                triggers[code]()
+                needs, check = sb.WAITING_GUARDS[code]
+                def old(w, check=check):
+                    narrow = types.SimpleNamespace(**dict(vars(w), issues=w.issues[:1], numbers={w.issue}, mine=[r for r in w.mine if any(ref[1] == w.issue for ref in sb.pr_body_refs(r.get("body")))]))
+                    return check(narrow)
+                with mock.patch.dict(sb.WAITING_GUARDS, {code: (needs, old)}):
+                    self.assertNotIn(code, self.predicate().codes, "the mutant of %s must stop holding" % code)
+                self.assertEqual(self.predicate().codes, [code])
+
+    # -- the read-whole rule and no new read (S7, S10, S11) --------------------------------------------------------------------------------
+    def not_whole(self):
+        """The inputs, each made not-whole in turn: (name, break, mend)."""
+        now = self.world.clock.now
+        def cut(on):
+            self.hub.cut = on
+            self.apply()
+        def fail(on):
+            self.hub.fail = on
+            self.apply()
+        def mark(name, on):
+            sb.read_mark(self.world.engine, name, on, "" if on else "cut", now())
+        return {
+            "pull list cut": (lambda: cut(True), lambda: cut(False)),
+            "pull list failed": (lambda: fail(True), lambda: fail(False)),
+            "pull list stale": (lambda: self.world.tick(sb.STALLED_LIST_MAX_AGE + 60), self.apply),
+            "issue list not whole": (lambda: mark("issues:" + self.REPO, False), self.apply),
+            "decision list not whole": (lambda: mark("decisions", False), self.apply),
+        }
+
+    def test_S7_S11_a_list_that_is_not_whole_gives_no_wake_and_no_nudge_and_no_call_then_one_when_whole(self):
+        for rule in ("stalled", "seam"):
+            for name, (do, mend) in self.not_whole().items():
+                with self.subTest(rule=rule, input=name):
+                    self.setUp()
+                    self.set_scene(prs=[self.pr(10, self.plan(3))])
+                    if rule == "seam":
+                        self.idle()
+                    else:
+                        self.late()
+                    mend()
+                    do()
+                    self.assertEqual([f for f in self.derive() if (":seam:" if rule == "seam" else ":stalled:") in f.key], [], name)
+                    mend()
+                    self.apply()
+                    want = 2 if rule == "seam" else 1
+                    self.assertEqual(len([f for f in self.derive() if (":seam:" if rule == "seam" else ":stalled:") in f.key]), want)
+
+    def test_S10_the_rules_make_no_read_of_their_own(self):
+        self.set_scene(prs=[self.pr(10, self.plan(3))])
+        paths = list(self.hub.paths)
+        self.assertEqual(paths, ["repos/%s/pulls?state=open&per_page=100" % self.REPO] * len(paths))
+        self.late()
+        before = list(self.hub.paths)
+        self.derive()
+        self.assertEqual(self.hub.paths, before, "judging a worker reads nothing")   # the gh runner of wire_inputs raises on any call
+
+    # -- ask -> work item -> PR through all three rules (S8) -------------------------------------------------------------------------------
+    CASES = {   # case -> (issue changes, the pull requests, does the worker still speak)
+        "ask only, the pull request names the ask": (dict(issues={3: {"parent": None}, 4: {"parent": None}}), lambda s: [s.pr(10, s.plan(2))], False),
+        "work item, the pull request names the work item": (dict(), lambda s: [s.pr(10, s.plan(3))], False),
+        "a pull request into an integration branch": (dict(), lambda s: [s.pr(10, s.plan(3), base="integration")], False),
+        "a pull request naming only the ask": (dict(), lambda s: [s.pr(10, s.plan(2))], False),
+        "no pull request": (dict(), lambda s: [], True),
+        "control: a pull request naming an unrelated issue": (dict(), lambda s: [s.pr(10, s.plan(5))], True),
+    }
+
+    def run_case(self, case, rule):
+        self.setUp()
+        issues, make, _ = self.CASES[case]
+        self.set_scene(issues=issues)
+        if rule == "stalled":
+            self.set_scene(prs=make(self))
+            self.late()
+            self.set_scene(prs=[dict(p, age=self.RECENT) for p in make(self)])
+            return [f for f in self.derive() if ":stalled:" in f.key]
+        self.idle()
+        self.set_scene(prs=[dict(p, requested_reviewers=[{"login": "reviewer-one"}]) for p in make(self)])
+        return [f for f in self.derive() if ":seam:" in f.key]
+
+    def test_S8_every_case_through_the_stalled_rule_the_seam_rule_and_the_waiting_predicate(self):
+        for case, (_, make, speaks) in self.CASES.items():
+            for rule, count in (("stalled", 1), ("seam", 2)):
+                with self.subTest(case=case, rule=rule):
+                    self.assertEqual(len(self.run_case(case, rule)), count if speaks else 0)
+            with self.subTest(case=case, rule="waiting"):
+                self.setUp()
+                issues, make, _ = self.CASES[case]
+                self.set_scene(issues=issues, prs=[dict(p, requested_reviewers=[{"login": "reviewer-one"}]) for p in make(self)])
+                self.assertEqual(self.predicate().state, "clear" if speaks else "waiting")
 
 
 class TestStoppedNews(PR4Base):
