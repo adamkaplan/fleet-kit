@@ -70108,7 +70108,7 @@ class TestAdoption(LanesCase):
         self.bare_world()
         self.main("close-pane", "w1:p90")
         self.world.tick(11 * 60)
-        (Path(self.world.state) / sb.PANE_HEALTH_FILE).write_bytes(b"{not json")
+        (Path(self.world.state) / "registry.json").write_bytes(b"{not json")   # the agent list the guards read
         code, out, err = self.main("close-pane", "w1:p90")
         self.assertEqual((code, self.world.herdr.closed), (1, []), err)
         self.assertIn("cannot be read", err)
@@ -70214,17 +70214,17 @@ class TestAdoption(LanesCase):
         for label, record in (("no session", {"at": 1, "by": "x", "reason": "r", "session": None}), ("another session", {"at": 1, "by": "x", "reason": "r", "session": "ses_old"}),
                               ("an empty session", {"at": 1, "by": "x", "reason": "r", "session": ""})):
             with self.subTest(label):
-                sb._write_small(self.world.state, sb.RETIRED_FILE, {"orch-a": record})
+                set_retired(self.world.state, {"orch-a": record})
                 self.daemon_pass()
                 self.assertEqual(self.boss("w1"), "orch-a", "orch-a is live: nothing to fill")
                 self.assertEqual([r for r in self.rows() if r["detail"]["worker"] == "w1"], [])
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"orch-a": {"at": 1, "by": "x", "reason": "r", "session": self.world.sessions["orch-a"]}})
+        set_retired(self.world.state, {"orch-a": {"at": 1, "by": "x", "reason": "r", "session": self.world.sessions["orch-a"]}})
         self.daemon_pass()
         self.assertEqual(self.boss("w1"), "chief-of-staff", "a retirement that names this session does count (charter 1 has no other orchestrator)")
 
     def test_a_live_heir_whose_retired_record_names_no_session_is_still_an_heir(self):   # S8: the heir side of the same rule
         self.worker("w1", "gone", charter=1)
-        sb._write_small(self.world.state, sb.RETIRED_FILE, {"orch-a": {"at": 1, "by": "x", "reason": "r", "session": None}})
+        set_retired(self.world.state, {"orch-a": {"at": 1, "by": "x", "reason": "r", "session": None}})
         self.daemon_pass()
         self.assertEqual(self.boss("w1"), "orch-a")
 
@@ -73692,6 +73692,10 @@ OLD_AGENT_SOURCES = re.compile(r"read_pane_health|PANE_HEALTH_FILE|RETIRED_FILE|
 # Each entry names who removes it and by when; the test fails on an entry that no longer matches (shrink it) and on one past its date. The scan covers every
 # tracked file that is not a test or a document: Python by AST (aliases and constant concatenations resolved), anything else by text.
 OLD_SOURCE_ALLOWED = {
+    ("bin/fleet-switchboard", "adopt_before_close", "RETIRED_FILE"): "2026-12-20, last slice of #903 (the adoption code owns it): only the key of the strict-record table, the read itself is the registry's",
+    ("bin/fleet-switchboard", "adopt_workers", "RETIRED_FILE"): "2026-12-20, last slice of #903 (the adoption code owns it): only the key of the strict-record table, the read itself is the registry's",
+    ("bin/fleet-switchboard", "repoint_workers", "RETIRED_FILE"): "2026-12-20, last slice of #903 (the adoption code owns it): only the key of the strict-record table, the read itself is the registry's",
+    ("bin/fleet-switchboard", "write_boss_records", "RETIRED_FILE"): "2026-12-20, last slice of #903 (the adoption code owns it): only the key of the strict-record table, the read itself is the registry's",
     ("bin/fleet-switchboard", "<module>", "PANE_HEALTH_FILE"): "2026-12-20, last slice of #903 (slice 2 owns it): the constant of the derived file",
     ("bin/fleet-switchboard", "<module>", "RETIRED_FILE"): "2026-12-20, last slice of #903 (slice 2 owns it): the constant of the derived file",
     ("bin/fleet-switchboard", "read_pane_health", "PANE_HEALTH_FILE"): "2026-12-20, last slice of #903 (slice 2 owns it): the derived-file reader",
@@ -73912,6 +73916,8 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
         "pane_health_status_lines": "test_s2_a_retired_agent_leaves_every_view_at_its_next_read",
         "decisions_from_reports": "test_s2_a_retired_agent_leaves_every_view_at_its_next_read",
         "load_tick": "test_a_half_read_registry_alerts_nobody_and_a_retired_orchestrator_has_no_figures",
+        "_strict_retired": "test_a_live_boss_whose_retired_record_names_no_session_keeps_its_worker",
+        "bare_pane_context": "test_an_unreadable_input_of_the_context_refuses_the_close",
         "cmd_reattach_all": "test_reattach_all_detached_acts_on_the_registrys_list_and_nothing_on_a_half_read",
         "worktree_session_in_use": "test_a_worktree_that_is_the_session_directory_of_a_non_retired_agent_is_kept_though_its_pane_sits_elsewhere",
         "cmd_disk_reclaim_worktrees": "test_the_sweep_is_a_dry_run_by_default_only_considers_retired_agents_and_apply_is_the_operators_or_cos",
@@ -73929,7 +73935,7 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
 
     def registry_callers(self):
         """Every function (or method) of bin/fleet-switchboard that calls the registry seam, found by the AST."""
-        seam = {"registry_read", "registry_retired", "registry_retired_strict", "read_retired"}
+        seam = {"registry_read", "registry_retired", "registry_retired_strict", "read_retired", "read_retired_strict", "registry_agents_strict"}
         tree = ast.parse((BIN / "fleet-switchboard").read_text())
         found = set()
         for node in tree.body:

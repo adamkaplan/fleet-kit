@@ -6742,6 +6742,11 @@ def registry_retired(state_dir):
     return registry_read(state_dir)["retired"]
 
 
+def read_retired_strict(state_dir):
+    """The name the adoption and close code loads: the same strict read as `registry_retired_strict`."""
+    return registry_retired_strict(state_dir)
+
+
 def registry_retired_strict(state_dir):
     """As `registry_retired`, but a read that is not whole raises RetiredUnreadable: the verdict authority fails closed (#372)."""
     got = registry_read(state_dir)
@@ -8454,7 +8459,7 @@ def bare_pane_context(engine, discovery, pane, now):
     entry = next((p for p in engine.herdr.pane_list() if isinstance(p, dict) and p.get("pane_id") == pane), None)
     held = [a for a in engine.herdr.agent_list() if isinstance(a, dict) and a.get("pane_id") == pane]
     processes = engine.herdr.pane_process_info(pane) if entry is not None else []
-    health = read_pane_health_strict_agents(engine.state_dir)
+    health = registry_agents_strict(engine.state_dir)   # the registry, never pane-health.json: a pane an agent holds is its pane
     worktrees = {os.path.realpath(p) for p in read_worktrees(engine.state_dir)}   # the REGISTERED worktrees only: an agent's own cwd is often the repo root the owner works in too
     window = engine.config.get("retire_idle_minutes")
     window = window if retire_idle_window_ok(window) else BARE_IDLE_DEFAULT_MINUTES
@@ -8462,22 +8467,12 @@ def bare_pane_context(engine, discovery, pane, now):
             "window": window, "now": now, "seen": (_read_small(engine.state_dir, BARE_PANES_FILE).get(pane) or None)}
 
 
-def read_pane_health_strict_agents(state_dir):
-    """pane-health.json for the close-pane guards: unreadable or damaged raises HerdrError (refuse), a missing file is no agents."""
-    try:
-        with open(str(Path(state_dir) / PANE_HEALTH_FILE), "rb") as handle:
-            raw = handle.read(1000001)
-    except FileNotFoundError:
-        return {"agents": {}}
-    except OSError as err:
-        raise HerdrError("unreadable", "%s cannot be read: %s" % (PANE_HEALTH_FILE, getattr(err, "strerror", None) or type(err).__name__)) from None
-    try:
-        data = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeError):
-        raise HerdrError("unreadable", "%s is not valid JSON" % PANE_HEALTH_FILE) from None
-    if not isinstance(data, dict) or not isinstance(data.get("agents"), dict) or not all(isinstance(v, dict) for v in data["agents"].values()):
-        raise HerdrError("unreadable", "%s is not a pane-health record" % PANE_HEALTH_FILE)
-    return data
+def registry_agents_strict(state_dir):
+    """The registry's agents for the close-pane guards: a read that is not whole raises HerdrError (refuse); a missing registry is no agents."""
+    got = registry_read(state_dir)
+    if not got["whole"]:
+        raise HerdrError("unreadable", "the agent registry cannot be read: %s" % _one_line(str(got["problem"]), 120))
+    return {"agents": got["agents"]}
 
 
 def bare_pane_problem(engine, discovery, pane, now):
