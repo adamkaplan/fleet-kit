@@ -8639,12 +8639,6 @@ def _guard_review_window(w):
     return found
 
 
-def _is_issue_number(value):
-    """An issue number is an int and not a bool: a hand-edited reminders file may hold a list, a dict, a string or a bool there, and a set test on an
-    unhashable one raises (the old `==` answered no)."""
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
 def _guard_reminder(w):
     try:
         reminders = read_reminders(w.engine.state_dir)
