@@ -64486,6 +64486,152 @@ class TestAgentsVerify(unittest.TestCase):
         self.assertIn("--strict", (REPO / "INSTALL.md").read_text())
 
 
+
+STRUCTURAL_RULE = ("When a function decides from text (an error message, a substring, a pattern, a name list), the first-round finding asks for an allow-list, "
+                   "a structured field or exact equality, and for a completeness test derived from the code, with one mutant per member, so the class is closed in one "
+                   "round and not found one instance at a time.")
+
+
+def structural_rule_homes(root):
+    """Every file that must carry STRUCTURAL_RULE, derived from the tree: each reviewer definition found in the directory (no count), the review skill, the rule's own page in the review laws' documentation."""
+    root = Path(root)
+    return sorted((root / "agents" / "reviewers").glob("*.md")) + [root / "skills" / "fleet-review" / "SKILL.md", root / "docs" / "review-laws" / "structural-rule.md"]
+
+
+def structural_rule_problems(root):
+    """[(file name, why)] for every home that does not hold the sentence exactly once, or holds a second near copy of it."""
+    out = []
+    for path in structural_rule_homes(root):
+        text = " ".join(path.read_text().split())
+        if text.count(STRUCTURAL_RULE) != 1:
+            out.append((path.name, "the shared sentence appears %d times, not once" % text.count(STRUCTURAL_RULE)))
+        elif text.count("decides from text") != 1:
+            out.append((path.name, "a second wording of the rule"))
+    return out
+
+
+class TestStructuralRuleInReviewing(unittest.TestCase):
+    """The rule "when a function decides from text, ask for the class in round one" is one sentence in every reviewer definition, the review skill and the laws, and
+    `agents verify` says when an installed definition is out of date."""
+
+    def tree(self, root):
+        for path in structural_rule_homes(REPO):
+            target = Path(root) / path.relative_to(REPO)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(path.read_text())
+
+    def test_the_sentence_is_in_every_definition_found_in_the_directory_and_in_the_skill_and_the_laws_once(self):
+        homes = structural_rule_homes(REPO)
+        self.assertGreaterEqual(len([h for h in homes if h.parent.name == "reviewers"]), 1)
+        self.assertEqual(structural_rule_problems(REPO), [])
+
+    def test_removing_the_sentence_from_any_one_file_fails_and_names_that_file(self):
+        for victim in structural_rule_homes(REPO):
+            with self.subTest(mutant=victim.name), tempfile.TemporaryDirectory() as root:
+                self.tree(root)
+                target = Path(root) / victim.relative_to(REPO)
+                target.write_text(target.read_text().replace(STRUCTURAL_RULE, ""))
+                self.assertEqual([name for name, _ in structural_rule_problems(root)], [victim.name])
+
+    def test_a_definition_added_to_the_directory_without_the_sentence_fails_with_no_edit_to_the_test(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.tree(root)
+            (Path(root) / "agents" / "reviewers" / "reviewer-zz.md").write_text("---\nname: reviewer-zz\n---\nbody\n")
+            self.assertEqual([name for name, _ in structural_rule_problems(root)], ["reviewer-zz.md"])
+
+    def test_a_second_wording_in_one_file_is_caught_too(self):
+        for victim in structural_rule_homes(REPO):
+            with self.subTest(mutant=victim.name), tempfile.TemporaryDirectory() as root:
+                self.tree(root)
+                target = Path(root) / victim.relative_to(REPO)
+                target.write_text(target.read_text() + "\n" + STRUCTURAL_RULE.replace("an allow-list", "a list of allowed values") + "\n")
+                self.assertEqual([name for name, _ in structural_rule_problems(root)], [victim.name])
+
+    def test_the_rule_page_carries_one_example_with_neutral_names(self):
+        text = (REPO / "docs" / "review-laws" / "structural-rule.md").read_text()
+        example = text.split("Example (neutral names).", 1)[1].split("\n\n", 1)[0]
+        self.assertEqual(text.count("Example (neutral names)."), 1)
+        for word in ("acme/", "`list`", "table of the allowed commands", "one mutant per row"):
+            self.assertIn(word, example)
+
+    FRONT_MATTER_SHA256 = {   # the front matter (permissions, mode, steps, model) of each definition, as a literal: this change moved none of it
+        "reviewer-architecture.md": "6ba86e43d65158f32f23a484ef5ecc37dd931c5c64838a4408914b8a64cdada9",
+        "reviewer-code.md": "780c9e18932f04f922a0a87d25bf31a2e1c7ea1f702bcee8406744d76219e913",
+        "reviewer-impact.md": "f94f58e5ae55912c10ed936118320e90d280a73f00657113df0ab7439192fa79",
+        "reviewer-security.md": "f10e5a595f25d6690bb7f92f7b5006ed39f3b1ce2a70967880151680e0d3c477",
+        "reviewer-test.md": "c1ef1b6c4bbd3dc43026d77cef875f32ac9d706a5ffa862b0c22b325433e932d",
+    }
+
+    def test_the_rule_is_in_the_body_never_in_the_front_matter_of_a_definition(self):
+        paths = sorted((REPO / "agents" / "reviewers").glob("*.md"))
+        self.assertEqual([p.name for p in paths], sorted(self.FRONT_MATTER_SHA256), "a definition added or removed: pin its front matter here")
+        for path in paths:
+            with self.subTest(definition=path.name):
+                front, body = path.read_text().split("\n---\n", 1)
+                self.assertNotIn("decides from text", front)
+                self.assertIn(STRUCTURAL_RULE, " ".join(body.split()))
+                self.assertEqual(hashlib.sha256(front.encode()).hexdigest(), self.FRONT_MATTER_SHA256[path.name], "the front matter changed")
+
+    def test_the_default_installed_folder_is_none_under_the_suite_and_the_install_folder_outside_it(self):
+        self.assertEqual(os.environ.get(sb.UNDER_TEST_ENV), "1")
+        self.assertIsNone(sb.default_installed_agents_dir())
+        with tempfile.TemporaryDirectory() as data, unittest.mock.patch.dict(os.environ, {"XDG_DATA_HOME": data}):
+            os.environ.pop(sb.UNDER_TEST_ENV, None)
+            self.assertEqual(sb.default_installed_agents_dir(), Path(data) / sb.PROG / "profile" / "config" / "opencode" / "agents")
+
+    def test_verify_with_no_folder_named_reads_no_installed_file_under_the_suite(self):
+        listing = TestAgentsVerify("listing").listing()
+        with unittest.mock.patch.object(sb, "stale_installed_agents", wraps=sb.stale_installed_agents) as spy, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            sb.main(["agents", "verify"], runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, listing, ""))
+        self.assertEqual(spy.call_args.args[0], None)
+
+    def verify(self, installed_dir):
+        listing = TestAgentsVerify("listing").listing()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), unittest.mock.patch.dict(os.environ):
+            code = sb.main(["agents", "verify", "--installed-dir", str(installed_dir)],
+                           runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, listing, ""))
+        return code, out.getvalue()
+
+    def test_a_stale_installed_body_is_out_of_date_by_name_and_install_makes_verify_pass(self):
+        for name in sb.EXPECTED_AGENTS:
+            with self.subTest(agent=name), tempfile.TemporaryDirectory() as root:
+                sb.install_agents(root)
+                installed = Path(root) / "agents" / (name + ".md")
+                installed.write_text(installed.read_text().replace(STRUCTURAL_RULE, "", 1) if STRUCTURAL_RULE in installed.read_text() else installed.read_text() + "\nold wording\n")
+                code, out = self.verify(Path(root) / "agents")
+                self.assertEqual(code, 1)
+                lines = [l for l in out.splitlines() if "out of date" in l]
+                self.assertEqual(len(lines), 1, out)
+                self.assertTrue(lines[0].startswith("FAIL  %s: out of date" % name), lines[0])
+                self.assertIn("fleet-switchboard install", lines[0])
+                sb.install_agents(root)
+                code, out = self.verify(Path(root) / "agents")
+                self.assertEqual(code, 0, out)
+                self.assertIn("agents: PASS", out)
+
+    def test_an_installed_copy_that_differs_only_in_its_model_line_passes(self):
+        with tempfile.TemporaryDirectory() as root:
+            sb.install_agents(root, model="acme-llm/other-model")
+            code, out = self.verify(Path(root) / "agents")
+            self.assertEqual(code, 0, out)
+
+    def test_an_installed_file_that_cannot_be_read_is_said_not_passed_over(self):
+        with tempfile.TemporaryDirectory() as root:
+            sb.install_agents(root)
+            installed = Path(root) / "agents" / "coder.md"
+            installed.unlink()
+            installed.mkdir()   # there, but not a file that can be read
+            code, out = self.verify(Path(root) / "agents")
+            self.assertEqual(code, 1)
+            self.assertIn("FAIL  coder: out of date", out)
+
+    def test_an_agent_with_no_installed_file_is_not_called_out_of_date(self):
+        with tempfile.TemporaryDirectory() as root:
+            code, out = self.verify(root)
+            self.assertEqual(code, 0, out)
+
 class TestOwnReviewLaws(unittest.TestCase):
     """fleet-kit's own laws at its root: installed from the starter set, so `review laws` works on fleet-kit itself."""
 
