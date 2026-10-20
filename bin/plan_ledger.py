@@ -314,17 +314,31 @@ UNTRACKED_WHY = {
 PER_PR_NONE_RE = re.compile(r"(?im)^[\s#>*-]*per-pr scenarios:\s*none\s+because\s+(\S.*)$")
 PLAN_LINK_RE = re.compile(r"(?m)^\s*PLAN:\s*(\S+)")
 CANON_RE = re.compile(r"(?im)^\s*canon:\s*(\S.*)$")
-CLAIMS_RE = re.compile(r"(?im)^[ \t]*PLAN:[^\n]*\n[ \t]*CLAIMS:[ \t]*(.*)$")
+HIDDEN_RE = re.compile(r"(?ms)^[ \t]*(```|~~~).*?(?:^[ \t]*\1[^\n]*$|\Z)|<!--.*?(?:-->|\Z)")   # a code fence or an HTML comment: text the reader of the rendered body does not take as the body's own
+PLAN_FIRST_RE = re.compile(r"(?m)^[ \t]*PLAN:[^\n]*")
+CLAIMS_UNDER_RE = re.compile(r"\n[ \t]*CLAIMS:[ \t]*(.*)")
+
+
+def visible_body(body):
+    return HIDDEN_RE.sub("", body or "")
+
+
+def claim_text(body):
+    """The text of the `CLAIMS:` line directly under the FIRST `PLAN:` line outside code fences and HTML comments, or None."""
+    shown = visible_body(body)
+    first = PLAN_FIRST_RE.search(shown)
+    found = CLAIMS_UNDER_RE.match(shown, first.end()) if first else None
+    return found.group(1) if found else None
 
 
 def pr_claim(body, scenarios):
     """(ids, error) for the claim line of a PR body: a `CLAIMS: S3 S4 S5` line directly under the `PLAN:` line names the scenarios THIS pull request proves.
     `ids` is None when the body has no claim line (the PR behaves as it always did: every scenario read as `pr` is its own). The error says why a claim is
     REFUSED: it names a scenario the plan does not declare, one the plan claims at the epic (a claim line only narrows), or names nothing."""
-    found = CLAIMS_RE.search(body or "")
-    if not found:
+    text = claim_text(body)
+    if text is None:
         return None, None
-    names = [n for n in re.split(r"[\s,;]+", found.group(1).strip()) if n]
+    names = [n for n in re.split(r"[\s,;]+", text.strip()) if n]
     if not names:
         return None, "the `CLAIMS:` line names no scenario: list the scenario ids this pull request proves (`CLAIMS: S3 S4`), or remove the line"
     by_id = {s.get("id"): s for s in scenarios}

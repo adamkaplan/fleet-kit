@@ -19828,15 +19828,42 @@ def fetch_plan(reader, repo, number, comment_id=None):
 
 
 def _parent_ask_done_when(reader, repo, number):
-    """The Done-when of the ASK that is the native sub-issue parent of issue `number`, or None. Like `IntentReader.ask_of`, a parent counts as the ask only
-    when it has a parent of its own (the charter): the issue under a charter is itself the ask, and a charter's Done-when is never borrowed."""
+    """The Done-when of the ASK that is the native sub-issue parent of issue `number` of `repo`, or None. Like `IntentReader.ask_of`, a parent counts as the ask only
+    when it has a parent of its own (the charter): the issue under a charter is itself the ask, and a charter's Done-when is never borrowed. Anything that is not
+    "the ask of this repository's work item" is REFUSED (PlanInputError), never read as another issue: a parent in another repository (the parent's repository comes
+    from the API payload, the reader's `parent()` keeps only the number), a pull request, the issue itself, and a cycle."""
+    where = "%s#%d" % (repo, number)
+
+    def parent_payload(of):
+        try:
+            found = reader._api("repos/%s/issues/%d/parent" % (repo, of), repo)
+        except IntentError as err:
+            if err.reason == "not_found":
+                return None
+            raise
+        if not isinstance(found, dict) or not isinstance(found.get("number"), int):
+            raise PlanInputError("the parent of %s#%d did not come back as an issue" % (repo, of))
+        if found.get("pull_request"):
+            raise PlanInputError("the parent of %s#%d is a pull request, not an ask" % (repo, of))
+        url = str(found.get("repository_url") or "").lower().rstrip("/")
+        if not url.endswith("/repos/" + repo.lower()):
+            raise PlanInputError("the parent of %s#%d (#%d) is in another repository (%s): a plan reads the Done-when of an ask of its own repository only"
+                                 % (repo, of, found["number"], url.rsplit("/repos/", 1)[-1] or "unknown"))
+        return found
     try:
-        parent = reader.parent(number, repo)
-        if parent is None or reader.parent(parent, repo) is None:
+        parent = parent_payload(number)
+        if parent is None:
             return None
-        return reader.issue(parent, repo).done_when
+        if parent["number"] == number:
+            raise PlanInputError("%s is its own parent" % where)
+        grand = parent_payload(parent["number"])
+        if grand is None:
+            return None
+        if grand["number"] in (number, parent["number"]):
+            raise PlanInputError("the parent chain of %s loops back on itself" % where)
+        return reader.issue(parent["number"], repo).done_when
     except IntentError as err:
-        raise PlanInputError("cannot read the parent ask of %s#%d: %s" % (repo, number, err)) from None
+        raise PlanInputError("cannot read the parent ask of %s: %s" % (where, err)) from None
 
 
 def load_plan(args, runner, now):
@@ -21182,6 +21209,7 @@ def cmd_gates(args, runner, now):
     report["plan_problem"] = ctx.plan_problem
     report["pr_unreadable"] = ctx.unreadable
     gates_carried_note(report, ctx)
+    claim_union_note(report, ctx, runner, now)
     plan_ledger.enforced_view(report, enforced_gates_of(ctx))
     first = next((e.get("plan_ref") for e in ctx.entries if e.get("pr") == ctx.pr and e.get("plan_ref")), None)
     report["plan_source"] = ctx.source
@@ -22365,6 +22393,42 @@ def cmd_gates_stats(args, runner, now):
         print("  mean: %.1f agent record(s), %.1f min first record to merge" % (
             sum(r["manual_records"] for r in got["prs"]) / len(got["prs"]), sum(r["minutes_to_merge"] for r in got["prs"]) / len(got["prs"])))
     return EXIT_OK
+
+
+def claim_union_note(report, ctx, runner, now):
+    """A pull request whose `CLAIMS:` line leaves scenarios to the epic's other pull requests: `gates` LISTS the ones no other OPEN or MERGED pull request under the same plan claims yet
+    (a pull request with no claim line claims every per-PR scenario). Reads GitHub with GETs only, CLI only; a failed read is said, never silent. It enforces nothing: the union gate at the
+    ask's last merge is a follow-up."""
+    try:
+        if ctx.plan is None or ctx.plan.get("result") != "pass":
+            return
+        mine = (ctx.facts or {}).get("body")
+        _, left, error = plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], mine)
+        row = next((r for r in report["gates"] if r["gate"] == "G1"), None)
+        if error or not left or row is None:
+            return
+        repo = ctx.pr.rsplit("#", 1)[0]
+        reader = IntentReader(ctx.config["gh"], repo, runner, now, ctx.config["call_timeout_seconds"], accounts=GhAccounts(ctx.config, runner, now))
+        listed = reader._api("repos/%s/pulls?state=all&sort=updated&direction=desc&per_page=100" % repo, repo)
+        if not isinstance(listed, list):
+            raise ValueError("the pull request list did not come back as a list")
+        covered = set()
+        for other in listed:
+            if not isinstance(other, dict) or other.get("number") == ctx.number:
+                continue
+            if other.get("state") != "open" and not other.get("merged_at"):
+                continue   # closed without a merge: it proves nothing
+            link = plan_ledger.PLAN_LINK_RE.search(plan_ledger.visible_body(other.get("body")))
+            if not link or not _same_plan(link.group(1).strip("<>.,"), ctx.source, ctx.config.get("intent_repo")):
+                continue
+            claimed, _, other_error = plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], other.get("body"))
+            if not other_error:
+                covered.update(x["id"] for x in claimed)
+        missing = [x["id"] for x in left if x["id"] not in covered]
+        report["unclaimed"] = missing
+        row["detail"] = (row.get("detail") or "") + "; claimed by no other open or merged pull request of this plan yet: %s" % (", ".join(missing) if missing else "none")
+    except Exception as err:   # said, never silent
+        report["unclaimed_error"] = _one_line("%s: %s" % (type(err).__name__, err), 160)
 
 
 def gates_carried_note(report, ctx):

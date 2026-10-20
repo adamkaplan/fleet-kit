@@ -72240,6 +72240,7 @@ class TestParentAskDoneWhen(LedgerBase):
 
     def setUp(self):
         super().setUp()
+        self.parent_override = {}
         self.issues = {
             10: {"number": 10, "state": "open", "title": "charter", "body": "## Intent\nRun it.\nDone when: (1) charter-only clause.\n", "parent": None},
             20: {"number": 20, "state": "open", "title": "ask", "body": "## Intent\nCommissioning works.\nDone when: %s\n" % self.ASK_DONE, "parent": 10},
@@ -72255,7 +72256,8 @@ class TestParentAskDoneWhen(LedgerBase):
             if found and int(found.group(1)) in self.issues:
                 issue = self.issues[int(found.group(1))]
                 if found.group(2) == "/parent":
-                    parent = self.issues.get(issue["parent"])
+                    parent = self.parent_override.get(int(found.group(1)), self.issues.get(issue["parent"]))
+                    parent = dict(parent, repository_url=parent.get("repository_url", "https://api.github.com/repos/acme/app")) if parent else None
                     return subprocess.CompletedProcess(argv, 0, json.dumps(parent), "") if parent else subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
                 if found.group(2):
                     return subprocess.CompletedProcess(argv, 0, "[]", "")
@@ -72296,6 +72298,27 @@ class TestParentAskDoneWhen(LedgerBase):
         with mock.patch.object(sb, "_parent_ask_done_when", lambda reader, repo, number: None):   # a mutant that never reads the parent
             with self.assertRaises(AssertionError):
                 self.assert_the_rule()
+
+    def test_a_parent_that_is_not_the_ask_of_this_repositorys_work_item_is_refused_whatever_its_shape(self):
+        """The class: cross-repo parent, the same number in another repository, itself, a cycle, a pull request. Each is refused with a plain error, never read as another issue."""
+        ask = self.issues[20]
+        cases = {
+            "cross-repo": dict(ask, number=5, repository_url="https://api.github.com/repos/other-org/other-repo"),
+            "same-number-other-repo": dict(ask, repository_url="https://api.github.com/repos/other-org/app"),
+            "self": dict(self.issues[30], number=30),
+            "pull-request": dict(ask, pull_request={"url": "x"}),
+        }
+        for name, payload in cases.items():
+            with self.subTest(case=name):
+                self.parent_override = {30: payload}
+                code, result = self.check(30)
+                self.assertEqual(code, 2, (name, result))
+                self.assertIn("error", result)
+        self.parent_override = {}
+        self.issues[20]["parent"] = 30   # a cycle: 30 -> 20 -> 30
+        code, result = self.check(30)
+        self.assertEqual(code, 2, result)
+        self.assertIn("loops back", json.dumps(result))
 
     def test_the_structure_gate_and_prove_take_the_work_items_done_when_from_its_parent(self):
         self.pr["body"] = "PLAN: acme/app#30\ncanon: updated the docs"
@@ -72346,7 +72369,7 @@ class TestPrClaimLine(LedgerBase):
 
     def test_s5_a_mutant_that_counts_unclaimed_scenarios_fails_the_claim_test(self):
         every = lambda scenarios, body: ([s for s in scenarios if sb.plan_ledger.claim_of(s) == "pr"], [], None)
-        with mock.patch.object(sb.plan_ledger, "pr_scenarios", every):
+        with mock.patch.object(sb.load_plan_ledger(), "pr_scenarios", every):
             with self.assertRaises(AssertionError):
                 self.assert_counts_only_the_claim()
 
@@ -72382,11 +72405,68 @@ class TestPrClaimLine(LedgerBase):
         self.assertIn("of 4 claimed scenarios", row["detail"])
         self.assertNotIn("CLAIMS", row["detail"])
 
+    def test_a_claim_line_hidden_in_a_code_fence_or_an_html_comment_narrows_nothing(self):
+        for body in ("PLAN: real#1\ncanon: x\n\n```\nPLAN: fake#9\nCLAIMS: S1\n```", "PLAN: real#1\n<!--\nPLAN: x\nCLAIMS: S1\n-->",
+                     "<!-- PLAN: x\nCLAIMS: S1 -->\nPLAN: real#1", "~~~\nPLAN: x\nCLAIMS: S1\n~~~\nPLAN: real#1\n", "PLAN: real#1\n```\nCLAIMS: S1\n```"):
+            with self.subTest(body=body):
+                claimed, left, error = sb.plan_ledger.pr_scenarios(self.scenarios, body)
+                self.assertEqual(([s["id"] for s in claimed], left, error), (["S1", "S2", "S3", "U1"], [], None))
+        claimed = sb.plan_ledger.pr_scenarios(self.scenarios, "```\nignored\n```\nPLAN: real#1\nCLAIMS: S1")[0]
+        self.assertEqual([s["id"] for s in claimed], ["S1"])
+
+    READERS = {"G1": "evaluate_gates", "prove": "_scenario_of", "verdict S": "_scenario_of", "verdict --all": "cmd_verdict", "ci recorder": "ci_record_core"}
+
+    def drive_readers(self):
+        """One PR claims S1 only (of S1, S2, S3, U1); each reader must see only S1."""
+        self.body("S1")
+        row = self.g1()
+        self.assertIn("claimed scenarios proven", row["detail"])
+        self.assertTrue(row["detail"].startswith("0 of 1 claimed"), row["detail"])                 # G1
+        self.assertNotEqual(self.prove("coder", "S3")[0], 0)                                         # prove
+        self.assertNotEqual(self.verdict("rev", "S3", "reviewer")[0], 0)                             # verdict S
+        self.assertEqual(self.prove("coder", "S1")[0], 0)
+        code, _, err = self.run_as("cibot", "verdict", "--all", "--pr", self.PR, "--as", "ci", "--result", "pass", "--head", LEDGER_HEAD, "--evidence", "judged it: matches the scenario")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([e["scenario"] for e in self.ledger() if e["kind"] == "verdict"], ["S1"])    # verdict --all
+        ctx = sb._ledger_context(types.SimpleNamespace(pr=self.PR, plan=None, ask=None, head=None), self.route, self.world.clock.now, False)
+        self.assertEqual(sb.ci_record_core(ctx, self.world.clock.now, quiet=True)["scenarios"], ["S1"])   # ci recorder
+
+    def test_each_reader_of_the_claim_sees_only_the_claimed_scenario_and_a_mutant_per_reader_fails(self):
+        self.drive_readers()
+        module = sb.load_plan_ledger()
+        real = module.pr_scenarios
+        for reader, caller in self.READERS.items():
+            with self.subTest(mutant=reader):
+                def every(scenarios, body, caller=caller):
+                    if sys._getframe(1).f_code.co_name == caller:
+                        return [s for s in scenarios if module.claim_of(s) == "pr"], [], None
+                    return real(scenarios, body)
+                self.setUp()
+                with mock.patch.object(module, "pr_scenarios", every):
+                    with self.assertRaises(AssertionError):
+                        self.drive_readers()
+
+    def test_s10_gates_lists_the_scenarios_no_other_open_or_merged_pull_request_of_the_plan_claims(self):
+        self.body("S1 S2")
+        others = [
+            {"number": 11, "state": "open", "merged_at": None, "body": "PLAN: acme/app#7\nCLAIMS: S2"},
+            {"number": 12, "state": "closed", "merged_at": None, "body": "PLAN: acme/app#7\nCLAIMS: S3"},          # closed unmerged: proves nothing
+            {"number": 13, "state": "closed", "merged_at": "2026-01-01T00:00:00Z", "body": "PLAN: acme/app#8\nCLAIMS: S3"},   # another plan
+            {"number": 9, "state": "open", "merged_at": None, "body": "PLAN: acme/app#7\nCLAIMS: S3"},                    # this PR itself
+        ]
+        route = self.route
+        self.route = lambda argv, **kw: (subprocess.CompletedProcess(argv, 0, json.dumps(others), "") if "/pulls?state=all" in " ".join(argv) else route(argv, **kw))
+        code, report, err = self.gates()
+        self.assertEqual(sorted(report["unclaimed"]), ["S3", "U1"])
+        self.assertIn("claimed by no other open or merged pull request of this plan yet: S3, U1", self.row(report, "G1")["detail"])
+        others[0]["body"] = "PLAN: acme/app#7\nCLAIMS: S3 U1"            # another PR now claims the rest: nothing is unclaimed
+        self.assertEqual(self.gates()[1]["unclaimed"], [])
+
     def test_every_reader_of_a_prs_claimed_scenarios_goes_through_pr_scenarios(self):
         """The family: plan check does not read a claim; G1 (evaluate_gates), prove/verdict (`_scenario_of`, `verdict --all`) and the ci recorder (`ci_record_core`) each call `pr_scenarios`;
         the item commands have no pull request body and read `slice:` instead."""
         text = (BIN / "fleet-switchboard").read_text()
-        self.assertEqual(text.count("plan_ledger.pr_scenarios("), 3)
+        self.assertEqual(text.count("plan_ledger.pr_scenarios("), 5)   # prove/verdict S, verdict --all, the ci recorder, and the two reads of the union note
         self.assertEqual((BIN / "plan_ledger.py").read_text().count("pr_scenarios("), 2)   # its definition and the G1 call
 
 
