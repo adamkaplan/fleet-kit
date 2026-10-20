@@ -59336,10 +59336,14 @@ class TestJanitorLiveKeeps(Base):
             self.assertIsNone(busy_for()(str(entry)))
             self.open_paths = [str(entry)]
             self.assertIn("file of it open", busy_for()(str(entry)))
+            self.open_paths = [str(entry).upper()]   # a case-insensitive volume may spell it otherwise
+            self.assertIn("file of it open", busy_for()(str(entry)))
             self.open_paths = []
             real = self.routed
             cwd = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "p1\nfcwd\nn%s\n" % entry, "") if "-d" in argv else real(argv, **kw)
             self.assertIn("working directory", sb.janitor_busy_function(self.world.engine, cwd, self.jan)(str(entry)))
+            upper = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "p1\nfcwd\nn%s\n" % str(entry).upper(), "") if "-d" in argv else real(argv, **kw)
+            self.assertIn("working directory", sb.janitor_busy_function(self.world.engine, upper, self.jan)(str(entry)))
 
     def test_s7_a_retired_list_that_cannot_be_read_keeps_everything(self):
         entry = self.old("retired-doubt", directory=True)
@@ -59763,6 +59767,19 @@ class TestDaemonTempJanitor(Base):
                 self.assertEqual(not victim.exists(), applies, label)
                 self.now += 7 * 86400
                 engine.now = lambda: self.now
+
+    def test_s4_two_previews_under_one_rule_carry_different_nonces(self):
+        self.old("scratch-old-unnamed.log")
+        engine, source = self.daemon({"daemon_apply": True}, acked=False)
+        gate = self.world.state / sb.TEMP_JANITOR_GATE_FILE
+        self.go(source)
+        first = json.loads(gate.read_text())
+        self.week(engine)
+        self.go(source)   # the first preview was never handed over: a second one is made under the same rule
+        second = json.loads(gate.read_text())
+        self.assertEqual(first["rule"], second["rule"])
+        self.assertNotEqual(first["nonce"], second["nonce"])
+        self.assertTrue(first["nonce"] and second["nonce"])
 
     def test_s4_a_yes_cannot_be_recorded_for_a_preview_nobody_was_told_of(self):
         self.old("scratch-old-unnamed.log")

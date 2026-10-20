@@ -24273,10 +24273,10 @@ def janitor_busy_function(engine, runner, janitor):
             if here.casefold().startswith(root.casefold()) or root.casefold().startswith(here.casefold()):   # case-folded: a case-insensitive volume may spell it otherwise (over-keeping is the safe side)   # it is, contains or sits inside the agent's directory
                 return "it is, holds or sits inside the temp or working directory of agent %s" % _plain(name, 60)
         for where in process_directories():
-            if (where.rstrip("/") + "/").startswith(root):
+            if (where.rstrip("/") + "/").casefold().startswith(root.casefold()):
                 return "a live process has it as its working directory (%s)" % _plain(where, 100)
         for where in open_paths():
-            if (where.rstrip("/") + "/").startswith(root):
+            if (where.rstrip("/") + "/").casefold().startswith(root.casefold()):
                 return "a live process has a file of it open"
         return None
     return busy
