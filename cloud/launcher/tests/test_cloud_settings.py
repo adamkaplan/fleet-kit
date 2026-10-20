@@ -63,7 +63,7 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
     "CW_CLUSTER_TOKEN_CMD": ["-x"], "CW_CLUSTER_ADMIN_CMD": ["--x"], "CW_GIT_TOKEN_CMD": ["-x"], "CW_APP_ID_CMD": ["-x"],
     "CW_APP_INSTALLATION_CMD": ["-x"], "CW_APP_KEY_CMD": ["-x"],
     "CW_VAULT_CHECK_DIR": ["check", "/a/../b", "-x"],
-    "CW_CLUSTER_ADMIN_SECRET": ["/home/user/secret", "a b", "a_b", "a.b", "a/b", "a" * 128, "a;b", "$(x)", "a\u00e9"],
+    "CW_CLUSTER_ADMIN_SECRET": ["/home/user/secret", "a b", "a_b", "a.b", "a/b", "a" * 128, "a;b", "$(x)", "a\u00e9", "-x", "--help", "--", "--query", "-", "-a"],
     "CW_CLUSTER_TOKEN_DURATION": ["-5m", "0m", "61m", "2h", "1000m", "20", "m", "20s", "1.5h", "20 m", "/tmp/20m", "20m5s", "\u0662\u0660m", "-1h", "0h"],
 }
 CONTROL = ["\t", "\x00", "\r", "\x0b", "\x0c", "\x1c", "\x1b", "\x7f", "\x01"]
@@ -587,17 +587,65 @@ class WiringReceivesBoth(Dir):
                 for part in ("home/user", "acme secret", "acme", "-20m"):
                     self.assertNotIn(part, text.replace(self.path, "").replace("acme-cluster", ""))
 
-    def test_s15_the_duration_rule_is_the_wirings_own_rule(self):
+    def test_s15_the_duration_rule_never_accepts_what_the_wiring_refuses(self):
+        """Derived parity: every string up to length 4 over a small alphabet. DANGEROUS direction (file accepts, wiring refuses) must be empty for all;
+        the other direction (the wiring accepts, the file refuses) is the documented 'stricter' (spaces are stripped by the wiring; a non-ASCII digit)."""
+        import itertools
         wiring = load_wiring()
-        candidates = ["1m", "20m", "60m", "61m", "0m", "1h", "2h", "01h", "000m", "060m", "1000m", "999m", "20", "m", "h", "20s", "1.5h", "20M", "5H", "-5m"]
-        for value in candidates:
-            try:
-                wiring._duration({"CW_CLUSTER_TOKEN_DURATION": value})
-                accepted = True
-            except wiring.Refusal:
-                accepted = False
-            with self.subTest(value=value):
-                self.assertEqual(cw._duration_ok(value), accepted)
+        alphabet = ["0", "1", "2", "6", "9", "m", "h", "s", " ", "-", "\u0662"]
+        dangerous, stricter = [], 0
+        for n in range(0, 6):
+            for chars in itertools.product(alphabet, repeat=n):
+                value = "".join(chars)
+                try:
+                    wiring._duration({"CW_CLUSTER_TOKEN_DURATION": value})
+                    wiring_ok = True
+                except wiring.Refusal:
+                    wiring_ok = False
+                file_ok = cw._duration_ok(value)
+                if file_ok and not wiring_ok:
+                    dangerous.append(value)
+                if wiring_ok and not file_ok and value.strip():
+                    stricter += 1
+        self.assertEqual(dangerous, [])
+        for good in ("1m", "20m", "60m", "1h", "01h", "060m"):   # the other way for what the launcher is documented to take: a unit or a bound dropped dies here
+            self.assertTrue(cw._duration_ok(good), good)
+        self.assertGreater(stricter, 0)   # the documented difference exists (spaces, a non-ASCII digit)
+
+    def test_s15_the_parity_alphabet_kills_each_width_unit_and_bound_mutant(self):
+        wiring = load_wiring()
+        def survives(pattern, bound=60):
+            def ok(v):
+                m = re.fullmatch(pattern, v)
+                return bool(m) and 1 <= int(m.group(1)) * (60 if m.group(2) == "h" else 1) <= bound
+            import itertools
+            for n in range(0, 6):
+                for chars in itertools.product("0126mhs", repeat=n):
+                    v = "".join(chars)
+                    try:
+                        wiring._duration({"CW_CLUSTER_TOKEN_DURATION": v}); w = True
+                    except wiring.Refusal:
+                        w = False
+                    if ok(v) and not w:
+                        return True
+            return False
+        self.assertFalse(survives(r"([0-9]{1,3})([mh])"))
+        self.assertTrue(survives(r"([0-9]{1,4})([mh])"))      # wider
+        self.assertTrue(survives(r"([0-9]{1,3})([mhs])"))     # a unit added
+        self.assertTrue(survives(r"([0-9]{1,3})([mh])", bound=61))   # a bound moved
+
+
+class OptionShaped(Dir):
+    def test_every_row_refuses_a_leading_hyphen_so_no_value_can_become_an_option_in_an_argument_list(self):
+        """Derived from the table: every setting's rule refuses an option-shaped value and a good sample with a hyphen put first. (A superset of the
+        rows that reach a kubectl/az/git/openssl argument list: a new row cannot slip in.)"""
+        samples = {**GOOD, **OPTIONAL_SAMPLES}
+        for key, (rule, check) in cw.VALIDATORS.items():
+            if key == "CW_CLUSTER_ADMIN_SECRET":
+                self.assertFalse(check(""))   # the row itself refuses empty (the generic reader treats an empty value as unset before the row)
+            for value in ("-x", "--help", "--", "--query", "-", "-" + samples[key]):
+                with self.subTest(key=key, value=value):
+                    self.assertFalse(check(value))
 
 
 # ---------------------------------------------------------------- S16: the class: every CW_* name the code reads is a row or on the one list
