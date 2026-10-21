@@ -25229,13 +25229,31 @@ def cmd_disk_janitor(args, runner, now):
         if not cfg["enabled"]:
             raise LaunchError("the temp janitor is switched off (temp_janitor.enabled is false)")
     temp = Path(cfg["dir"]) if cfg.get("dir") else janitor.default_dir()
+    reviewed = getattr(args, "i_reviewed", None)
+    if reviewed and not args.apply:
+        raise LaunchError("--i-reviewed names the preview an --apply may remove: add --apply, or drop the flag for a dry run")
+    if args.apply and not reviewed:
+        raise LaunchError("refused: --apply needs --i-reviewed <fingerprint> naming the preview you just read. Run `%s disk janitor` (a dry run), read the list, "
+                          "and pass the fingerprint it prints. The weekly run is the daemon's, under a recorded yes (`disk janitor-ack`); nothing else removes anything" % PROG)
+    weekly = bool(getattr(args, "weekly", False))
+    if args.apply and weekly:
+        raise LaunchError("refused: --weekly is the daemon's run: a hand-run --apply takes no --weekly (the preview you read was made under the ordinary budget)")
+    audit = lambda name, detail: engine.audit.append(engine.actor, "temp.removed", _plain(name, 120), detail)
     with worktree_sweep(engine):   # one session.list for every in-use check of this run
-        lines, removed, kept = janitor.run(temp, state, now(), cfg, bool(args.apply),
-                                           lambda name, detail: engine.audit.append(engine.actor, "temp.removed", _plain(name, 120), detail),
-                                           busy=janitor_busy_function(engine, runner, janitor), weekly=bool(getattr(args, "weekly", False)))
+        preview = []   # the dry run's list: its fingerprint is the daemon's, by the same function (`preview_fingerprint`), so a yes and this flag name the same thing
+        lines, removed, kept = janitor.run(temp, state, now(), cfg, False, audit, busy=janitor_busy_function(engine, runner, janitor), weekly=weekly, outcome=preview)
+        fingerprint = janitor.preview_fingerprint(janitor.rule_fingerprint(cfg), [o["name"] for o in preview])
+        if args.apply:
+            if reviewed != fingerprint:
+                raise LaunchError("refused: --i-reviewed %s is not this preview's fingerprint (%s): the rule or the list changed since you read it. Nothing was removed; "
+                                  "run the dry run again and read it" % (_one_line(reviewed, 40), fingerprint))
+            lines, removed, kept = janitor.run(temp, state, now(), cfg, True, audit, busy=janitor_busy_function(engine, runner, janitor), weekly=False,
+                                               only=set(o["name"] for o in preview))   # only what the fingerprint named: an entry that qualifies between the two scans is kept
     for line in lines:
         print(_plain(line, 300))
-    print("%s: %d %s, %d kept (%s)" % (PROG, removed, "removed" if args.apply else "would be removed (a dry run: add --apply)", kept, _plain(temp, 160)))
+    print("%s: %d %s, %d kept (%s)" % (PROG, removed, "removed" if args.apply else "would be removed (a dry run: add --apply --i-reviewed %s)" % fingerprint, kept, _plain(temp, 160)))
+    if not args.apply:
+        print("preview fingerprint: %s" % fingerprint)
     return EXIT_OK
 
 
@@ -25648,6 +25666,7 @@ def add_disk_parsers(sub):
                                               "temp_janitor.days (default 7) and that no state file of the fleet names, no keep glob matches and no .fleet-keep marker "
                                               "protects. Never follows a link, never touches another user's entry. Each removal is one temp.removed audit line.")
     janitor.add_argument("--apply", action="store_true", help="Remove them (the default only lists)")
+    janitor.add_argument("--i-reviewed", dest="i_reviewed", metavar="FINGERPRINT", default=None, help="With --apply: the preview fingerprint the dry run printed. Refused when it no longer matches the rule and the listed names")
     janitor.add_argument("--weekly", action="store_true", help="The weekly job: scan under the longer budget temp_janitor.weekly_scan_seconds (default 600 s) instead of scan_seconds (60 s)")
     ack = disk_sub.add_parser("janitor-ack", allow_abbrev=False, help="record the yes to the temp janitor's would-remove preview (the Chief of Staff's or the operator's)",
                               description="The daemon sends the Chief of Staff one would-remove preview after any change of the janitor's selection rule and applies nothing until "
@@ -30325,6 +30344,47 @@ def v2_version_of(runner, exe):
     return tuple(int(part) for part in match.groups()) if match else None
 
 
+OLD_JANITOR_COMMAND = "%(p)s disk prune; %(p)s disk janitor --apply --weekly"   # the weekly job the documentation used to show (#958): the janitor half is now the daemon's gated run
+JANITOR_JOB_TAIL = "; %(p)s disk janitor --apply --weekly"
+
+
+def weekly_job_scan(directory):
+    """[(path, state, detail)] for each `*.plist` file of `directory` that mentions `disk janitor --apply`: state `old` (the job's ProgramArguments are EXACTLY
+    `/bin/sh -c "<P> disk prune; <P> disk janitor --apply --weekly"`, one program path P twice, and the old command occurs once in the file's text: it may be
+    rewritten) or `other` (anything else: only reported, never changed). A file that cannot be read or parsed is `other`. The Docker prune part is never read as
+    anything but the text in front of the cut."""
+    import plistlib
+    found = []
+    try:
+        names = sorted(n for n in os.listdir(str(directory)) if n.endswith(".plist"))
+    except OSError:
+        return found
+    for name in names:
+        path = Path(directory) / name
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            text = path.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if "disk janitor --apply" not in text:
+            continue
+        try:
+            args = plistlib.loads(text.encode("utf-8")).get("ProgramArguments")
+        except Exception:
+            args = None
+        program = None
+        if isinstance(args, list) and len(args) == 3 and args[:2] == ["/bin/sh", "-c"] and isinstance(args[2], str):
+            first = args[2].split(" disk prune; ", 1)[0]
+            if first and " " not in first and args[2] == OLD_JANITOR_COMMAND % {"p": first}:
+                program = first
+        if program and text.count(OLD_JANITOR_COMMAND % {"p": program}) == 1:
+            found.append((path, "old", program))
+        else:
+            found.append((path, "other", "its command is not exactly the old snippet's"))
+    return found
+
+
 class Installer:
     """`fleet-switchboard install`: idempotent steps, each reported `done`, `already done` or `skipped (why)`.
 
@@ -30748,6 +30808,39 @@ class Installer:
             self.run_checked(command, " ".join(command))
         self.say("service", "done", str(path))
 
+    # -- 5c: the weekly disk job installed from the old documentation snippet (#958)
+    def step_janitor_job(self):
+        """The old snippet ran `disk janitor --apply --weekly` after `disk prune`: the daemon owns that run now, under a recorded yes, and the command refuses
+        without the reviewed fingerprint. A job file that is EXACTLY the old snippet's command is backed up (beside it, never over another backup) and has the
+        janitor part cut out (the Docker prune part is the text in front of the cut, byte for byte); any other file that runs the old command is only reported.
+        Nothing is reloaded: the person runs the `launchctl` line it prints."""
+        if self.kind != "launchd":
+            return self.say("weekly disk job", "skipped (no launchd here)")
+        directory = Path.home() / "Library" / "LaunchAgents"
+        found = weekly_job_scan(directory)
+        if not found:
+            return self.say("weekly disk job", "already done", "no job runs `disk janitor --apply`")
+        for path, state, detail in found:
+            if state != "old":
+                self.say("weekly disk job", "skipped", "%s runs `disk janitor --apply` but does not match the old snippet exactly (%s): change its command yourself to drop "
+                         "`; <program> disk janitor --apply --weekly`; nothing was changed" % (path, detail))
+                continue
+            text = path.read_text()
+            old = OLD_JANITOR_COMMAND % {"p": detail}
+            new = old[:-len(JANITOR_JOB_TAIL % {"p": detail})]
+            backup = path.with_name(path.name + ".bak-%d" % int(self.now()))
+            if self.dry:
+                self.say("weekly disk job", "would be done", "%s: back up to %s, then drop the janitor part" % (path, backup))
+                continue
+            check_writable_target(path)
+            if os.path.lexists(str(backup)):
+                self.say("weekly disk job", "skipped", "%s exists: nothing was changed" % backup)
+                continue
+            shutil.copy2(str(path), str(backup))
+            write_if_changed(path, text.replace(old, new))
+            self.say("weekly disk job", "done", "%s rewritten (backup %s); to load it: `launchctl bootout gui/$(id -u) %s; launchctl bootstrap gui/$(id -u) %s`" % (
+                path, backup, path, path))
+
     # -- 5b: the cloud reaper's service (opt-in, like the heartbeat's: it needs a cluster login this machine may not have)
     def reaper_command_problem(self):
         """None when the file the reaper service runs and every parent above it are the user's own and not writable by others,
@@ -30899,6 +30992,7 @@ class Installer:
             self.step_service(config)
             if with_reaper:
                 self.step_reaper(config)
+        self.step_janitor_job()
         self.step_ensure(ensure or (lambda: ensure_daemon(ensure_state_dir(), self.spawn)),
                          status or (lambda: format_status(collect_status(self.runner, self.now, self.platform))))
 
