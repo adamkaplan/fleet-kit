@@ -34727,6 +34727,263 @@ class TestBlockTable(LedgerBase):
         self.assertIn("notice withdraw takes only the PR", err)
 
 
+class TestAgentBlockCounts(TestBlockTable):
+    """#901: an impact rating counts by score only when it carries the verdict block the agent returned. Every shape is driven through the real `review record`, then scored by the real `judge`."""
+
+    SCORED = "impact-severity: Marginal\nimpact-probability: Remote\nimpact-reason: why\n"
+    # shape -> (record command arguments builder, recorded, counts by score)
+    SHAPES = {
+        "block present": ("block", True, True),
+        "block for another head": ("other-head", False, False),
+        "malformed block": ("malformed", False, False),
+        "flags only": ("flags", True, False),
+        "block disagreeing with the flags": ("disagree", True, False),
+        "block with no score lines": ("no-score", True, False),
+        "old record (no block keys)": ("old", True, False),
+    }
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(sb, "gates_caller_kind", return_value=("agent", "rev", "reviewer"))   # the recorded role of the session that records: the independent reviewer
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def make(self, shape):
+        base = ("review", "record", self.PR, "--reviewer", "impact")
+        if shape == "block":
+            return self.record(extra=self.SCORED)
+        if shape == "other-head":
+            path = self.world.state / "other.txt"
+            path.write_text("verdict: approve\nhead: %s\nimpact-action: none\n%sfindings:\n" % ("b" * 40, self.SCORED))
+            return self.run_as("coder", *base, "--block", str(path))
+        if shape == "malformed":
+            path = self.world.state / "bad.txt"
+            path.write_text("nothing like a verdict block\n")
+            return self.run_as("coder", *base, "--block", str(path))
+        if shape == "flags":
+            return self.run_as("coder", *base, "--verdict", "approve", "--impact-action", "none", "--impact-severity", "Marginal", "--impact-probability", "Remote")
+        if shape == "disagree":
+            return self.record("--impact-severity", "Critical", "--impact-probability", "Remote", extra=self.SCORED)
+        if shape == "no-score":
+            return self.record()
+        if shape == "old":
+            code = self.run_as("coder", *base, "--verdict", "approve", "--impact-action", "none", "--impact-severity", "Marginal", "--impact-probability", "Remote")
+            return code
+
+    def score(self, last=1):
+        mod = sb.load_module("delegated_clear")
+        entries = [e for e in self.ledger() if e["kind"] == "review_record"][-last:]
+        return mod.judge(mod.score_block(), sb.impact_floor.load_matrix()["cells"], entries, {"pr": self.PR, "head": LEDGER_HEAD}, "Serious")
+
+    def test_every_shape_records_as_the_table_says_and_counts_only_with_the_agents_block(self):
+        for name, (shape, recorded, counts) in self.SHAPES.items():
+            with self.subTest(shape=name):
+                before = len([e for e in self.ledger() if e["kind"] == "review_record"])
+                code, out, err = self.make(shape)
+                self.assertEqual(code == 0, recorded, err)
+                entries = [e for e in self.ledger() if e["kind"] == "review_record"]
+                self.assertEqual(len(entries), before + (1 if recorded else 0))
+                if not recorded:
+                    continue
+                if shape == "old":   # strip the block keys as an old record has none
+                    entry = dict(entries[-1])
+                    for key in [k for k in entry if k.startswith("block_")]:
+                        del entry[key]
+                    scored = sb.load_module("delegated_clear").judge(sb.load_module("delegated_clear").score_block(), sb.impact_floor.load_matrix()["cells"], [dict(entry, by_role="reviewer")], {"pr": self.PR, "head": LEDGER_HEAD}, "Serious")
+                else:
+                    scored = self.score()
+                if counts:
+                    self.assertEqual(scored["reasons"], [])
+                    self.assertEqual(scored["level"], sb.impact_floor.load_matrix()["cells"]["Marginal"]["Remote"]["level"])
+                else:
+                    self.assertIsNone(scored["level"])
+                    self.assertEqual(scored["reasons"], [sb.load_module("delegated_clear").NO_AGENT_BLOCK])
+
+    def test_the_shapes_table_covers_the_record_shapes_of_the_code(self):
+        self.assertEqual(sorted(shape for shape, _, _ in self.SHAPES.values()), sorted(["block", "other-head", "malformed", "flags", "disagree", "no-score", "old"]))
+        self.assertEqual(len(self.SHAPES), 7)
+
+    def test_the_record_keeps_the_blocks_hash_and_size_and_marks_a_flags_only_record(self):
+        path = self.world.state / "block.txt"
+        self.assertEqual(self.record(extra=self.SCORED)[0], 0)
+        entry = self.records()[-1]
+        raw = path.read_bytes()
+        self.assertEqual((entry["block_sha256"], entry["block_size"]), (hashlib.sha256(raw).hexdigest(), len(raw)))
+        self.assertEqual((entry["block_impact_severity"], entry["block_impact_probability"]), ("Marginal", "Remote"))
+        self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve")
+        self.assertEqual(self.records()[-1]["block_sha256"], "none")
+        self.assertNotIn("block_size", self.records()[-1])
+        self.run_as("coder", "review", "record", self.PR, "--reviewer", "code", "--verdict", "approve")
+        self.assertNotIn("block_sha256", self.records()[-1])
+
+    def test_a_malformed_hash_counts_for_nothing(self):
+        mod = sb.load_module("delegated_clear")
+        good = dict(kind="review_record", pr=self.PR, head=LEDGER_HEAD, reviewer="impact", by_role="reviewer", impact_severity="Marginal", impact_probability="Remote",
+                    block_impact_severity="Marginal", block_impact_probability="Remote")
+        self.assertTrue(mod.counts_by_block(dict(good, block_sha256="a" * 64)))
+        for bad in ("", "a" * 63, 12345, None, "A" * 64, "none"):
+            self.assertFalse(mod.counts_by_block(dict(good, block_sha256=bad)), bad)
+
+    def test_floor_gates_and_the_clear_name_the_missing_block_in_the_same_words(self):
+        line = sb.load_module("delegated_clear").NO_AGENT_BLOCK
+        self.make("flags")
+        code, out, err = self.run_as("coder", "impact", "floor", self.PR)
+        self.assertEqual(out.count(line), 1, out)
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        self.assertEqual(out.count(line), 1, out)
+        self.assertIn(line, self.score()["reasons"])
+        self.make("block")   # the newest record carries the agent's block: the line is gone
+        code, out, err = self.run_as("coder", "impact", "floor", self.PR)
+        self.assertNotIn("no agent block", out)
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        self.assertNotIn("no agent block", out)
+
+    VERDICT_BLOCKS = {"approve": "", "comment": "", "request-changes": "- R-CODE-1 | block | bin/x:1 | why | fix\n", "incomplete": ""}
+
+    def test_only_an_incomplete_verdict_fails_to_count_and_says_so_in_its_own_line(self):
+        mod = sb.load_module("delegated_clear")
+        for verdict, finding in self.VERDICT_BLOCKS.items():
+            with self.subTest(verdict=verdict):
+                path = self.world.state / "v.txt"
+                path.write_text("verdict: %s\nhead: %s\nimpact-action: none\n%sfindings:\n%s" % (verdict, LEDGER_HEAD, self.SCORED, finding))
+                code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))
+                self.assertEqual(code, 0, err)
+                scored = self.score()
+                if verdict == "incomplete":
+                    self.assertIsNone(scored["level"])
+                    self.assertEqual(scored["reasons"], [mod.INCOMPLETE_VERDICT])
+                    self.assertNotEqual(mod.INCOMPLETE_VERDICT, mod.NO_AGENT_BLOCK)
+                else:
+                    self.assertEqual(scored["reasons"], [])
+                    self.assertEqual(scored["level"], sb.impact_floor.load_matrix()["cells"]["Marginal"]["Remote"]["level"])
+        self.assertEqual(sorted(self.VERDICT_BLOCKS), sorted(sb.plan_ledger.REVIEW_VERDICTS))   # derived: a new verdict word must be added here
+
+    def test_floor_and_gates_say_the_incomplete_line_not_the_missing_block_line(self):
+        mod = sb.load_module("delegated_clear")
+        path = self.world.state / "v.txt"
+        path.write_text("verdict: incomplete\nhead: %s\nimpact-action: none\n%sfindings:\n" % (LEDGER_HEAD, self.SCORED))
+        self.assertEqual(self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))[0], 0)
+        for argv in (("impact", "floor", self.PR), ("gates", self.PR)):
+            out = self.run_as("coder", *argv)[1]
+            self.assertEqual(out.count(mod.INCOMPLETE_VERDICT), 1, argv)
+            self.assertEqual(out.count(mod.NO_AGENT_BLOCK), 0, argv)
+
+    def test_the_definition_says_read_every_hunk_return_incomplete_and_where_the_matrix_words_come_from(self):
+        text = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
+        for phrase in ("every hunk", "verdict: incomplete", "reads only the verdict word", "impact matrix --for-rater"):
+            self.assertIn(phrase, text.replace("EVERY", "every"))
+
+    def state_files(self):
+        return {str(p.relative_to(self.world.state)): p.read_bytes() for p in sorted(self.world.state.rglob("*")) if p.is_file()}
+
+    def test_impact_matrix_prints_the_files_words_cell_by_cell_and_writes_nothing(self):
+        before = self.state_files()
+        code, out, err = self.run_as("coder", "impact", "matrix", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.state_files(), before)
+        printed = json.loads(out)
+        file = json.loads((REPO / "docs" / "review-laws" / "impact-matrix.json").read_text())
+        for severity, row in file["cells"].items():
+            for probability, cell in row.items():
+                self.assertEqual(printed["cells"][severity][probability], cell, (severity, probability))
+        self.assertEqual(sum(len(r) for r in printed["cells"].values()), sum(len(r) for r in file["cells"].values()))
+        rules = file["owner_hold"]["delegated_clear"]["score"]["floor"]["rules"]
+        self.assertEqual(printed["floor_rules"], rules)
+        self.assertEqual((printed["severities"], printed["probabilities"]), (file["severities"], file["probabilities"]))
+        text = self.run_as("coder", "impact", "matrix")[1]
+        for severity, row in file["cells"].items():
+            for probability, cell in row.items():
+                self.assertIn("cell %s / %s: level %s, action %s" % (severity, probability, cell["level"], cell["action"]), text)
+        for rule_id, cls in rules.items():
+            self.assertIn("floor rule %s: class %s" % (rule_id, cls), text)
+
+    def test_impact_matrix_for_rater_prints_the_floor_reports_rule_ids_and_paths(self):
+        paths = ["shims/gh", "docs/a.md"]
+        self.pr = dict(self.pr, changedFiles=len(paths), files=[{"path": p, "additions": 1, "deletions": 0} for p in paths])
+        before = self.state_files()
+        code, out, err = self.run_as("coder", "impact", "matrix", "--for-rater", self.PR, "--json")
+        self.assertEqual(code, 0, err)
+        printed = json.loads(out)["for_rater"]
+        report = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
+        rules = json.loads((REPO / "docs" / "review-laws" / "impact-matrix.json").read_text())["owner_hold"]["delegated_clear"]["score"]["floor"]["rules"]
+        expected = {rule_id: sorted(report["top_tier_hits"][cls]) for rule_id, cls in rules.items() if report["top_tier_hits"].get(cls)}
+        self.assertTrue(expected, "the fixture changes a floor path")
+        self.assertEqual(printed["floor_hits"], expected)
+        self.assertEqual(self.state_files(), before)
+        text = self.run_as("coder", "impact", "matrix", "--for-rater", self.PR)[1]
+        for rule_id, paths in expected.items():
+            self.assertIn("floor hit %s: %s" % (rule_id, ", ".join(paths)), text)
+
+    def test_an_incomplete_record_beside_a_complete_block_does_not_stop_the_complete_one_counting(self):
+        mod = sb.load_module("delegated_clear")
+        for verdict in ("incomplete", "approve"):
+            path = self.world.state / "v.txt"
+            path.write_text("verdict: %s\nhead: %s\nimpact-action: none\n%sfindings:\n" % (verdict, LEDGER_HEAD, self.SCORED))
+            self.assertEqual(self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))[0], 0)
+        scored = self.score(last=2)
+        self.assertEqual(scored["reasons"], [])
+        self.assertEqual(scored["level"], sb.impact_floor.load_matrix()["cells"]["Marginal"]["Remote"]["level"])
+
+    def test_for_rater_with_no_floor_hit_says_none_and_an_unreadable_matrix_is_refused_in_a_line(self):
+        out = self.run_as("coder", "impact", "matrix", "--for-rater", self.PR)[1]
+        self.assertIn("floor hit: none", out)
+        with mock.patch.object(sb.impact_floor, "load_matrix", side_effect=sb.impact_floor.MatrixError("unreadable")):
+            code, out, err = self.run_as("coder", "impact", "matrix")
+        self.assertEqual(code, 2)
+        self.assertIn("impact matrix:", err)
+
+    def test_a_file_name_with_control_characters_is_printed_safely_and_capped(self):
+        self.assertEqual(sb._printable_path("shims/gh\x1b[2J\x07"), "shims/gh?[2J?")
+        self.assertEqual(len(sb._printable_path("a" * 1000)), sb.IMPACT_MATRIX_PATH_LEN)
+        paths = ["shims/gh"] + ["docs/%d.md" % n for n in range(3)]
+        self.pr = dict(self.pr, changedFiles=len(paths), files=[{"path": p, "additions": 1, "deletions": 0} for p in paths])
+        hits = json.loads(self.run_as("coder", "impact", "matrix", "--for-rater", self.PR, "--json")[1])["for_rater"]["floor_hits"]
+        self.assertTrue(all(len(v) <= sb.IMPACT_MATRIX_PATHS_MAX and all(p.isprintable() for p in v) for v in hits.values()))
+
+    def test_a_failure_to_make_the_rating_note_says_so(self):
+        with mock.patch.object(sb, "load_module", side_effect=RuntimeError("x")):
+            self.assertIn("no rating note", sb.rating_block_note([{"kind": "review_record"}], self.PR, LEDGER_HEAD))
+
+    def test_an_uncounted_rating_that_is_higher_than_the_counted_one_refuses_and_a_lower_one_is_ignored(self):
+        mod = sb.load_module("delegated_clear")
+        cells = sb.impact_floor.load_matrix()["cells"]
+        low = ("Negligible", "Improbable")
+        high = ("Critical", "Frequent")
+        base = dict(kind="review_record", pr=self.PR, head=LEDGER_HEAD, reviewer="impact", by_role="reviewer", verdict="approve")
+        counted = dict(base, impact_severity=low[0], impact_probability=low[1], block_sha256="a" * 64, block_impact_severity=low[0], block_impact_probability=low[1])
+        flags_high = dict(base, impact_severity=high[0], impact_probability=high[1], block_sha256="none")
+        flags_low = dict(base, impact_severity=low[0], impact_probability=low[1], block_sha256="none")
+        incomplete_high = dict(base, impact_severity=high[0], impact_probability=high[1], block_sha256="b" * 64, block_impact_severity=high[0], block_impact_probability=high[1], verdict="incomplete")
+        report = {"pr": self.PR, "head": LEDGER_HEAD}
+        judge = lambda entries: mod.judge(mod.score_block(), cells, entries, report, "Serious")
+        # a record whose BLOCK says high but whose typed flags say low (a flag wins over the block's line, so it does not count): the block's own higher score is what refuses
+        block_high_typed_low = dict(base, impact_severity=low[0], impact_probability=low[1], block_sha256="c" * 64, block_impact_severity=high[0], block_impact_probability=high[1])
+        shapes = {"flags only, higher": flags_high, "incomplete, higher": incomplete_high, "block high, typed low": block_high_typed_low}
+        self.assertEqual(sorted(shapes), sorted(["flags only, higher", "incomplete, higher", "block high, typed low"]))
+        self.assertEqual(judge([counted])["reasons"], [])
+        for label, others in ((l, [e]) for l, e in shapes.items()):
+            for order in (lambda e: [counted] + e, lambda e: e + [counted]):
+                with self.subTest(label=label):
+                    self.assertEqual(judge(order(others))["reasons"], [mod.HIGHER_UNCOUNTED])
+        self.assertEqual(judge([counted, flags_low])["reasons"], [])   # a lower or equal uncounted rating is ignored
+        self.assertEqual(judge([counted, dict(flags_high, impact_probability=None)])["reasons"], [])   # a record with no readable score is ignored
+
+    def test_the_rater_honesty_sentence_is_in_the_definition_and_in_the_docs(self):
+        sentence = "Never adjust a rating to fit the floor: a rating below the floor is reported as it is and goes to the owner."
+        for path in ("agents/reviewers/reviewer-impact.md", "docs/switchboard.md"):
+            self.assertEqual((REPO / path).read_text().count(sentence), 1, path)
+
+    def test_the_limit_is_said_in_the_docs_and_the_definition(self):
+        for path in ("docs/switchboard.md", "agents/reviewers/reviewer-impact.md"):
+            text = (REPO / path).read_text()
+            self.assertIn("not that the agent produced it", text, path)
+            self.assertIn("mistake-guard", text)
+
+    def test_only_the_scorer_reads_the_score_fields(self):
+        for name in ("impact_hold.py", "impact_floor.py", "plan_ledger.py"):   # the readers of a rating outside the scorer (the record's own warning is a writer)
+            text = (REPO / "bin" / name).read_text().replace("block_impact", "")
+            self.assertEqual(len(re.findall(r'get\("impact_(?:severity|probability)"\)', text)), 0, name)
+
 class TestImpactRejudge(LedgerBase):
     """#451 slice 3: the daemon's hold labels follow the OWNER-HOLD rule; a hold it applied that no longer holds is taken off (only the labels it added);
     the list is posted once for each version of the rule; an unreadable matrix file changes nothing and says so once. A fake gh records every write."""
@@ -37356,10 +37613,14 @@ class TestImpactHold(LedgerBase):
         for name in (sb.plan_ledger.LEDGER_FILE, sb.plan_ledger.HEAD_FILE):
             self.world.state.joinpath(name).unlink(missing_ok=True)
 
-    def rate(self, severity, probability, reason="", role="reviewer", head=LEDGER_HEAD, pr="acme/app#9", action="auto"):
+    def rate(self, severity, probability, reason="", role="reviewer", head=LEDGER_HEAD, pr="acme/app#9", action="auto", with_block=True):
         """Record a rating. `action` "auto" is the action of the cell (a helper that only emits VALID shapes: it hides a bad state, so every bad-shape test passes an explicit action or builds the raw record), None omits it."""
         entry = {"kind": "review_record", "pr": pr, "head": head, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": role,
                  "impact_severity": severity, "impact_probability": probability, "impact_reason": reason}
+        if with_block:   # #901: the rating carries the agent's block (its hash and its own rating lines), as `review record --block` keeps them
+            entry.update(block_sha256="a" * 64, block_size=200, block_impact_severity=severity, block_impact_probability=probability)
+        else:
+            entry["block_sha256"] = "none"
         cell = (sb.impact_floor.load_matrix()["cells"].get(severity) or {}).get(probability)
         if action == "auto" and cell:   # the action the reviewer would record for that cell (a record with no action rates nothing: #830's one reading)
             entry["impact_action"] = {"H": "hold", "2": "second-review", ".": "none"}[cell["action"]]
@@ -37460,7 +37721,8 @@ class TestImpactHold(LedgerBase):
             del block["floor"]["rules"][removed]
             cls = rules[removed]
             report = {"pr": "acme/app#9", "head": LEDGER_HEAD, "top_tier_hits": {cls: ["x"]}}
-            entries = [{"kind": "review_record", "pr": "acme/app#9", "head": LEDGER_HEAD, "reviewer": "impact", "by_role": "reviewer", "impact_severity": self.cell_of("Medium")[0], "impact_probability": self.cell_of("Medium")[1]}]
+            entries = [{"kind": "review_record", "pr": "acme/app#9", "head": LEDGER_HEAD, "reviewer": "impact", "by_role": "reviewer", "impact_severity": self.cell_of("Medium")[0], "impact_probability": self.cell_of("Medium")[1],
+                        "block_sha256": "a" * 64, "block_impact_severity": self.cell_of("Medium")[0], "block_impact_probability": self.cell_of("Medium")[1]}]
             mod = sb.load_module("delegated_clear")
             self.assertEqual(mod.judge(block, sb.impact_floor.load_matrix()["cells"], entries, report, "Serious")["reasons"], [], "the floor of %s lives in the data only" % cls)
             self.assertTrue(mod.judge(self.block(), sb.impact_floor.load_matrix()["cells"], entries, report, "Serious")["reasons"])
@@ -37821,7 +38083,8 @@ class TestImpactHold(LedgerBase):
             "good reason, unknown probability": ("bin/reassign.py", [dict(floor_good, prob="Sometimes")], True, "unknown"),
             "two records disagree: low then high": ("docs/notes.md", [good, dict(good, sev=high[0], prob=high[1])], True, "High"),
             "two records disagree: high then low": ("docs/notes.md", [dict(good, sev=high[0], prob=high[1]), good], True, "High"),
-            "a good record and an unreadable one at the same head": ("docs/notes.md", [good, dict(good, sev=None)], True, "unknown"),
+            "a good record and one with no score of the block's beside it: the second counts for nothing (#901) and the first clears": ("docs/notes.md", [good, dict(good, sev=None)], False, None),
+            "a good record beside one whose block carries a score the matrix does not know": ("docs/notes.md", [good, dict(good, sev="Huge")], True, "unknown"),
             "a record at another head only": ("docs/notes.md", [dict(good, head="d" * 40)], True, "no independent impact rating"),
             "a record for another pull request only": ("docs/notes.md", [dict(good, pr="acme/app#10")], True, "no independent impact rating"),
             "a record by the pull request's own author (a coder)": ("docs/notes.md", [dict(good, role="coder")], True, "no independent impact rating"),
@@ -37861,17 +38124,24 @@ class TestImpactHold(LedgerBase):
         """A ledger record built WITHOUT the helper: any shape, including those the record command refuses (an older record with an action and no severity or probability)."""
         entry = {"kind": "review_record", "pr": "acme/app#9", "head": LEDGER_HEAD, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": "reviewer"}
         entry.update(fields)
+        entry.setdefault("block_sha256", "a" * 64)   # #901: the record carries the agent's block, whose own lines equal the typed ones (a missing field stays missing)
+        for name in ("impact_severity", "impact_probability"):
+            if name in entry and entry[name] is not KEEP_OUT:
+                entry.setdefault("block_" + name, entry[name])
         return sb.plan_ledger.append_entry(self.world.state, {k: v for k, v in entry.items() if v is not KEEP_OUT}, self.world.clock.now())
 
     def test_raw_mixed_records_reach_the_real_judge_and_the_bad_one_refuses_in_either_order(self):
         low, high = self.cell_of("Low"), self.cell_of("High")
         valid = dict(impact_action="none", impact_severity=low[0], impact_probability=low[1])
         older = dict(impact_action="hold", impact_class="authority")   # every record made before this change: an action, no severity, no probability
-        shapes = {"an action and no severity or probability, after a valid Low": [valid, older], "the same, before it": [older, valid], "an action with an unknown severity": [valid, dict(valid, impact_severity="Huge")],
-                  "a good severity with no probability": [valid, dict(valid, impact_probability=KEEP_OUT)], "a good probability with no severity": [valid, dict(valid, impact_severity=KEEP_OUT)],
-                  "two records that disagree, low first": [valid, dict(valid, impact_severity=high[0], impact_probability=high[1], impact_action="hold")],
-                  "the author's record with an action": [dict(valid, by_role="coder")], "another head's record with an action": [dict(valid, head="d" * 40)]}
-        for label, records in shapes.items():
+        # shape: (records, refused). A record that carries no score of the agent's block is IGNORED by the score since #901 (it counts for nothing, as every record made before blocks were kept), so the valid record beside it still clears;
+        # a record whose block carries a score the matrix does not know, a higher disagreeing score, the author's and another head's record still refuse
+        shapes = {"an action and no severity or probability, after a valid Low": ([valid, older], False), "the same, before it": ([older, valid], False), "an action with an unknown severity": ([valid, dict(valid, impact_severity="Huge")], True),
+                  "a good severity with no probability": ([valid, dict(valid, impact_probability=KEEP_OUT)], False), "a good probability with no severity": ([valid, dict(valid, impact_severity=KEEP_OUT)], False),
+                  "two records that disagree, low first": ([valid, dict(valid, impact_severity=high[0], impact_probability=high[1], impact_action="hold")], True),
+                  "the older record alone (no score, no block score)": ([older], True),
+                  "the author's record with an action": ([dict(valid, by_role="coder")], True), "another head's record with an action": ([dict(valid, head="d" * 40)], True)}
+        for label, (records, refused) in shapes.items():
             with self.subTest(label):
                 self.writes.clear()
                 self.ledger_reset()
@@ -37880,9 +38150,10 @@ class TestImpactHold(LedgerBase):
                 for record in records:
                     self.raw_record(**record)
                 code, out, err = self.under()
-                self.assertEqual(code, 2, err)
-                self.assertEqual(self.deletes(), [])
-                self.assertTrue(any(t in err for t in ("no severity and probability", "High", "no independent impact rating")), err)
+                self.assertEqual(code == 2, refused, err)
+                if refused:
+                    self.assertEqual(self.deletes(), [])
+                    self.assertTrue(any(t in err for t in ("no severity and probability", "High", "no independent impact rating", "no agent block")), err)
         self.ledger_reset()   # the control: the valid record alone clears
         self.score_config("Serious")
         self.scored_pr()
@@ -60685,6 +60956,26 @@ class TestDiskReport(Base):
             self.assertIn(phrase, section.lower())
 
 
+def reviewed_janitor_argv(argv, run):
+    """`argv` for `disk janitor` with the reviewed fingerprint a person would copy from a dry run: `run(argv)` runs the command and returns its output text."""
+    argv = list(argv)
+    if "--apply" not in argv or "--i-reviewed" in argv:
+        return argv
+    dry = [a for a in argv if a != "--apply"]
+    text = run(dry)
+    found = re.findall(r"preview fingerprint: ([0-9a-f]{16})", text)
+    return argv + ["--i-reviewed", found[-1] if found else "0" * 16]
+
+
+def janitor_review(test, argv):
+    """The full `disk janitor` argv with the fingerprint of a dry run just made, as a person would copy it."""
+    def dry(args):
+        with captured() as (out, err):
+            sb.main(["disk", "janitor", *args], runner=test.routed, now=test.world.clock.now, socket_call=test.world.herdr.socket)
+        return out.getvalue()
+    return ["disk", "janitor", *reviewed_janitor_argv(argv, dry)]
+
+
 class TestTempJanitor(Base):
     """The temp-directory janitor (ask #321): old AND unnamed entries only, a dry run by default, links never followed, each removal audited."""
 
@@ -60728,10 +61019,17 @@ class TestTempJanitor(Base):
             os.utime(str(p), (stamp, stamp))
         return path
 
-    def run_cli(self, *argv):
+    def fingerprint_of(self, runner):
         with captured() as (out, err):
-            code = sb.main(["disk", "janitor", *argv], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
-        return code, out.getvalue(), err.getvalue()
+            sb.main(["disk", "janitor"], runner=runner, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return re.findall(r"preview fingerprint: ([0-9a-f]{16})", out.getvalue())[-1]
+
+    def run_cli(self, *argv):
+        def once(args):
+            with captured() as (out, err):
+                code = sb.main(["disk", "janitor", *args], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            return code, out.getvalue(), err.getvalue()
+        return once(reviewed_janitor_argv(argv, lambda a: once(a)[1]))
 
     def audits(self):
         return [e for e in self.world.audit() if e["event"] == "temp.removed"]
@@ -60816,6 +61114,111 @@ class TestTempJanitor(Base):
         self.assertEqual(code, 0, err)
         self.assertIn("would remove old-file.txt", out)
 
+    def raw_cli(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(["disk", "janitor", *argv], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_958_a_hand_run_apply_needs_the_reviewed_fingerprint_of_the_current_preview(self):
+        victim = self.old("old-unnamed.log")
+        code, out, err = self.raw_cli("--apply")
+        self.assertNotEqual(code, 0)
+        self.assertIn("--i-reviewed", err)
+        self.assertTrue(victim.exists(), "no flag: nothing removed")
+        code, out, err = self.raw_cli("--apply", "--i-reviewed", "0" * 16)   # a stale fingerprint
+        self.assertNotEqual(code, 0)
+        self.assertIn("is not this preview's fingerprint", err)
+        self.assertTrue(victim.exists(), "a stale fingerprint: nothing removed")
+        code, out, err = self.raw_cli("--i-reviewed", "0" * 16)   # the flag without --apply
+        self.assertNotEqual(code, 0)
+        code, dry, err = self.raw_cli()
+        self.assertEqual(code, 0, err)
+        fingerprint = re.findall(r"preview fingerprint: ([0-9a-f]{16})", dry)[-1]
+        self.assertTrue(victim.exists(), "a dry run removes nothing")
+        # the list changes after it was read: the fingerprint no longer matches
+        other = self.old("old-second.log")
+        code, out, err = self.raw_cli("--apply", "--i-reviewed", fingerprint)
+        self.assertNotEqual(code, 0)
+        self.assertTrue(victim.exists() and other.exists())
+        code, dry, err = self.raw_cli()
+        fingerprint = re.findall(r"preview fingerprint: ([0-9a-f]{16})", dry)[-1]
+        code, out, err = self.raw_cli("--apply", "--i-reviewed", fingerprint)
+        self.assertEqual(code, 0, err)
+        self.assertFalse(victim.exists() or other.exists())
+
+    def test_958_the_fingerprint_is_the_janitors_own_function_of_the_rule_and_the_listed_names(self):
+        self.old("old-a.log")
+        self.old("old-b.log")
+        code, dry, err = self.raw_cli()
+        cfg = self.jan.settings(sb.load_config().get("temp_janitor"))
+        expected = self.jan.preview_fingerprint(self.jan.rule_fingerprint(cfg), ["old-a.log", "old-b.log"])
+        self.assertIn("preview fingerprint: %s" % expected, dry)
+
+    def test_958_an_entry_that_qualifies_between_the_preview_and_the_apply_is_kept(self):
+        victim = self.old("old-reviewed.log")
+        real = self.jan.scan
+        calls = [0]
+
+        def scan_then_add(*a, **k):
+            calls[0] += 1
+            if calls[0] == 2:   # the command's own preview is the first scan, the apply's the second
+                self.old("old-new-arrival.log")
+            return real(*a, **k)
+        fingerprint = self.fingerprint()
+        calls[0] = 0
+        with mock.patch.object(self.jan, "scan", scan_then_add):
+            code, out, err = self.raw_cli("--apply", "--i-reviewed", fingerprint)
+        self.assertEqual(code, 0, err)
+        self.assertFalse(victim.exists())
+        self.assertTrue((self.temp / "old-new-arrival.log").exists())
+        self.assertIn("kept old-new-arrival.log: it was not in the preview you reviewed", out)
+
+    def fingerprint(self, *argv):
+        code, dry, err = self.raw_cli(*argv)
+        self.assertEqual(code, 0, err)
+        return re.findall(r"preview fingerprint: ([0-9a-f]{16})", dry)[-1]
+
+    def test_958_s8_a_scripted_run_with_no_terminal_is_refused_and_a_typed_current_fingerprint_applies(self):
+        victim = self.old("old-unnamed.log")
+        fingerprint = self.fingerprint()
+        person = os.environ.get("HERDR_PANE_ID")
+        os.environ["HERDR_PANE_ID"] = "p_unknown_pane"   # a script or an agent: not established as the owner's terminal
+        code, out, err = self.raw_cli("--apply", "--i-reviewed", fingerprint)
+        self.assertEqual(code, 1)
+        self.assertIn("only the operator or the Chief of Staff may --apply", err)
+        self.assertTrue(victim.exists())
+        if person is None:
+            os.environ.pop("HERDR_PANE_ID", None)
+        else:
+            os.environ["HERDR_PANE_ID"] = person
+        code, out, err = self.raw_cli("--apply", "--i-reviewed", fingerprint)
+        self.assertEqual(code, 0, err)
+        self.assertFalse(victim.exists())
+
+    def test_958_s10_five_kinds_of_wrong_fingerprint_are_each_refused(self):
+        victim = self.old("old-unnamed.log")
+        good = self.fingerprint()
+        cases = {"stale after a name change": None, "stale after a rule change": None, "empty": ("--i-reviewed", ""), "malformed": ("--i-reviewed", "not-a-hash"),
+                 "with --weekly": ("--apply", "--weekly", "--i-reviewed", good)}
+        refused = 0
+        for name in cases:
+            if name == "stale after a name change":
+                extra = self.old("old-extra.log")
+                argv = ("--apply", "--i-reviewed", good)
+            elif name == "stale after a rule change":
+                self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "temp_janitor": {"dir": str(self.temp), "days": 3}})
+                argv = ("--apply", "--i-reviewed", good)
+            elif name == "with --weekly":
+                argv = cases[name]
+            else:
+                argv = ("--apply",) + cases[name]
+            code, out, err = self.raw_cli(*argv)
+            self.assertNotEqual(code, 0, name)
+            self.assertTrue(victim.exists(), name)
+            refused += 1
+        self.assertEqual(refused, 5)
+        self.assertTrue(extra.exists())
+
     def test_the_cap_per_call_and_a_failed_removal_are_said_and_a_failed_removal_is_not_audited(self):
         for i in range(3):
             self.old("capped-%d.txt" % i)
@@ -60868,9 +61271,13 @@ class TestTempJanitor(Base):
         victim = self.old("touched-after-scan.txt")
         real = self.jan.scan
 
+        calls = [0]
+
         def scan_then_touch(*a, **k):
             rows = real(*a, **k)
-            os.utime(str(victim), (self.now, self.now))   # an agent writes to it between the scan and the removal
+            calls[0] += 1
+            if calls[0] == 3:   # the person's dry run, the command's own preview, then the apply's scan
+                os.utime(str(victim), (self.now, self.now))   # an agent writes to it between the scan and the removal
             return rows
         with mock.patch.object(self.jan, "scan", scan_then_touch):
             code, out, err = self.run_cli("--apply")
@@ -60946,7 +61353,7 @@ class TestTempJanitor(Base):
                     raise failure
                 return self.world.route(argv, **kwargs)
             with captured() as (out, err):
-                sb.main(["disk", "janitor", "--apply"], runner=boom, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+                sb.main(["disk", "janitor", "--apply", "--i-reviewed", self.fingerprint_of(boom)], runner=boom, now=self.world.clock.now, socket_call=self.world.herdr.socket)
             self.assertTrue(victim.exists())
             self.assertIn("lsof did not run", out.getvalue())
 
@@ -64011,7 +64418,7 @@ class TestJanitorLiveKeeps(Base):
 
     def apply(self):
         with captured() as (out, err):
-            code = sb.main(["disk", "janitor", "--apply"], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            code = sb.main(janitor_review(self, ["--apply"]), runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
         self.assertEqual(code, 0, err.getvalue())
         return out.getvalue()
 
@@ -64346,7 +64753,7 @@ class TestDaemonTempJanitor(Base):
             else:
                 os.environ["HERDR_PANE_ID"] = "p_unknown_pane"
             with captured() as (out, err):
-                code = sb.main(["disk", "janitor", "--apply"], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+                code = sb.main(janitor_review(self, ["--apply"]), runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
             self.assertEqual(code, 1)
             self.assertIn("only the operator or the Chief of Staff may --apply the temp janitor", err.getvalue())
             self.assertTrue(victim.exists())
@@ -64453,6 +64860,16 @@ class TestDaemonTempJanitor(Base):
         with captured() as (out, err):
             code = sb.main(["disk", "janitor-ack", preview], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
         return code, err.getvalue()
+
+    def test_958_the_commands_fingerprint_equals_the_daemons_preview_for_the_same_rule_and_names(self):
+        self.old("scratch-old-unnamed.log")
+        engine, source = self.daemon({"daemon_apply": True}, acked=False)
+        self.go(source)
+        preview = json.loads((self.world.state / sb.TEMP_JANITOR_GATE_FILE).read_text())["preview"]
+        os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+        with captured() as (out, err):
+            sb.main(["disk", "janitor", "--weekly"], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertIn("preview fingerprint: %s" % preview, out.getvalue())
 
     def test_s4_one_preview_then_nothing_is_applied_until_the_yes_to_that_exact_preview(self):
         victim = self.old("scratch-old-unnamed.log")
@@ -64728,10 +65145,172 @@ class TestDaemonTempJanitor(Base):
             self.assertNotIn(os.path.basename(argv[0]), ("gh", "curl", "git", "ssh"))
             self.assertNotIn("api", argv[:2] if os.path.basename(argv[0]) == "gh" else [])
 
-    def test_s11_the_docs_name_the_redundant_half_and_the_plist_example_is_unchanged(self):
+    def test_s11_the_docs_name_the_one_apply_path_and_the_plist_example_has_no_janitor(self):
         text = (Path(sb.__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
-        self.assertIn("the janitor half of the launchd job is redundant", text)
-        self.assertIn("disk prune; /home/user/.local/bin/fleet-switchboard disk janitor --apply --weekly</string>", text)
+        self.assertIn("There is one apply path (#958)", text)
+        self.assertIn("<string>/home/user/.local/bin/fleet-switchboard disk prune</string></array>", text)
+
+
+class TestWeeklyJobRewrite(Base):
+    """Ask #958: the installer drops the janitor from a weekly job installed from the old documentation snippet, and only from that."""
+    PROG = "/home/user/.local/bin/fleet-switchboard"
+    OLD = "%s disk prune; %s disk janitor --apply --weekly" % (PROG, PROG)
+
+    def setUp(self):
+        super().setUp()
+        self.agents = Path.home() / "Library" / "LaunchAgents"
+        self.agents.mkdir(parents=True, exist_ok=True)
+        self.assertTrue(str(self.agents).startswith(str(self.home)), "the test must never touch a real LaunchAgents")
+
+    def plist(self, command, name="com.example.fleet-disk-prune.plist", extra=""):
+        text = ('<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n  <key>Label</key><string>com.example.fleet-disk-prune</string>\n'
+                '  <key>ProgramArguments</key>\n  <array><string>/bin/sh</string><string>-c</string><string>%s</string></array>\n%s</dict>\n</plist>\n' % (command, extra))
+        (self.agents / name).write_text(text)
+        return self.agents / name, text
+
+    def step(self, platform="darwin", dry=False):
+        out = io.StringIO()
+        sb.Installer(subprocess.run, subprocess.Popen, lambda: 1700000000.0, platform, REPO, out=out, dry_run=dry).step_janitor_job()
+        return out.getvalue()
+
+    def backups(self):
+        return sorted(p.name for p in self.agents.iterdir() if ".bak-" in p.name)
+
+    def test_958_an_exact_match_is_backed_up_and_rewritten_and_the_prune_part_is_byte_identical(self):
+        path, text = self.plist(self.OLD)
+        out = self.step()
+        self.assertIn("done", out)
+        self.assertEqual(len(self.backups()), 1)
+        self.assertEqual((self.agents / self.backups()[0]).read_text(), text)
+        self.assertEqual(path.read_text(), text.replace(self.OLD, "%s disk prune" % self.PROG))
+        self.assertNotIn("disk janitor", path.read_text())
+        self.assertIn("%s disk prune" % self.PROG, path.read_text())   # the Docker prune command, unchanged
+        self.assertIn("already done", self.step())   # a second run changes nothing
+        self.assertEqual(len(self.backups()), 1)
+
+    def test_958_a_job_that_differs_by_one_character_is_reported_and_left_byte_identical(self):
+        for command in (self.OLD + " ", self.OLD.replace("--weekly", "--weekl"), self.OLD.replace("; ", ";  "),
+                        "%s disk prune; /other/fleet-switchboard disk janitor --apply --weekly" % self.PROG,
+                        self.OLD + "; echo hi"):
+            for old in self.agents.iterdir():
+                old.unlink()
+            path, text = self.plist(command)
+            before = hashlib.sha256(path.read_bytes()).hexdigest()
+            out = self.step()
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before, command)
+            self.assertEqual(self.backups(), [], command)
+            self.assertIn("nothing was changed", out)
+
+    def test_958_no_job_changes_nothing_and_a_dry_run_writes_nothing(self):
+        self.assertIn("already done", self.step())
+        self.assertEqual(list(self.agents.iterdir()), [])
+        path, text = self.plist(self.OLD)
+        self.assertIn("would be done", self.step(dry=True))
+        self.assertEqual(path.read_text(), text)
+        self.assertEqual(self.backups(), [])
+        self.assertIn("skipped", self.step(platform="linux"))
+
+    def test_958_s11_unreadable_symlink_none_and_a_second_run_change_nothing_and_the_first_backup_survives(self):
+        original = self.plist(self.OLD, "real.plist")[1]
+        os.symlink(str(self.agents / "real.plist"), str(self.agents / "link.plist"))
+        (self.agents / "real.plist").rename(self.agents / "real.txt")
+        before = {p.name: p.read_bytes() for p in self.agents.iterdir() if not p.is_symlink()}
+        locked, locked_text = self.plist(self.OLD, "locked.plist")
+        os.chmod(str(locked), 0)
+        try:
+            self.step()
+        finally:
+            os.chmod(str(locked), 0o644)
+        self.assertEqual(self.backups(), [])
+        self.assertEqual(locked.read_text(), locked_text, "an unreadable file is left as it is")
+        self.assertEqual({p.name: p.read_bytes() for p in self.agents.iterdir() if not p.is_symlink() and p.name != "locked.plist"}, before)
+        for p in list(self.agents.iterdir()):
+            p.unlink()
+        path, text = self.plist(self.OLD)
+        self.step()
+        first = (self.agents / self.backups()[0]).read_bytes()
+        self.step()
+        self.step()
+        self.assertEqual(len(self.backups()), 1)
+        self.assertEqual((self.agents / self.backups()[0]).read_bytes(), first)
+        self.assertEqual(first, text.encode())
+
+    def test_958_backup_collision_and_a_doubled_command_leave_the_file_alone(self):
+        path, text = self.plist(self.OLD)
+        taken = path.with_name(path.name + ".bak-1700000000")
+        taken.write_text("earlier backup")
+        out = self.step()
+        self.assertIn("exists", out)
+        self.assertEqual(path.read_text(), text)
+        self.assertEqual(taken.read_text(), "earlier backup")
+        taken.unlink()
+        twice = self.plist(self.OLD, "twice.plist", extra="  <key>Note</key><string>%s</string>\n" % self.OLD)
+        out = self.step()
+        self.assertEqual(twice[0].read_text(), twice[1])
+        self.assertIn("nothing was changed", out)
+
+    def test_958_each_part_of_the_exactness_rule_is_pinned_by_its_own_row(self):
+        """The rule has four parts: the program list's shape, the shell, the command's equality and the single occurrence. One row for each, and a plist plus
+        the old command in a second key for the count."""
+        prog = self.PROG
+        rows = {
+            "shell is zsh": ("/bin/zsh", "-c", self.OLD, None),
+            "shell is bash": ("/bin/bash", "-c", self.OLD, None),
+            "flag is -lc": ("/bin/sh", "-lc", self.OLD, None),
+            "flag is -e": ("/bin/sh", "-e", self.OLD, None),
+            "list has a fourth word": ("/bin/sh", "-c", self.OLD, "<string>extra</string>"),
+            "janitor flag differs": ("/bin/sh", "-c", self.OLD.replace("--apply", "--apply "), None),
+            "second program differs": ("/bin/sh", "-c", "%s disk prune; /elsewhere/fleet-switchboard disk janitor --apply --weekly" % prog, None),
+            "text after the command": ("/bin/sh", "-c", self.OLD + "; true", None),
+        }
+        for label, (shell, flag, command, more) in rows.items():
+            for old in self.agents.iterdir():
+                old.unlink()
+            path = self.agents / "job.plist"
+            path.write_text('<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n  <key>ProgramArguments</key>\n  <array><string>%s</string><string>%s</string>'
+                            '<string>%s</string>%s</array>\n</dict>\n</plist>\n' % (shell, flag, command, more or ""))
+            before = hashlib.sha256(path.read_bytes()).hexdigest()
+            out = self.step()
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before, label)
+            self.assertEqual(self.backups(), [], label)
+            self.assertIn("nothing was changed", out, label)
+        for old in self.agents.iterdir():
+            old.unlink()
+        path, text = self.plist(self.OLD, extra="  <key>Note</key><string>%s</string>\n" % self.OLD)   # the single occurrence
+        self.step()
+        self.assertEqual(path.read_text(), text)
+        self.assertEqual(self.backups(), [])
+
+    def test_958_a_symlinked_job_is_never_rewritten_through_the_link(self):
+        real = self.agents.parent / "real-job.plist"
+        real.write_text(self.plist(self.OLD, "tmp.plist")[1])
+        (self.agents / "tmp.plist").unlink()
+        os.symlink(str(real), str(self.agents / "job.plist"))
+        before = real.read_bytes()
+        try:
+            self.step()
+        except sb.InstallError:
+            pass   # the write check refuses the link: the install stops rather than writing through it
+        self.assertEqual(real.read_bytes(), before)
+        self.assertEqual([n for n in self.backups()], [])
+
+    def test_958_s7_the_documentation_snippet_is_what_the_installer_produces(self):
+        docs = (Path(sb.__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
+        start = docs.index("<?xml version", docs.index("com.example.fleet-disk-prune.plist"))
+        snippet = docs[start:docs.index("```", start)]
+        self.assertIn("%s disk prune</string>" % self.PROG, snippet)
+        old = snippet.replace("%s disk prune</string>" % self.PROG, "%s</string>" % self.OLD)
+        (self.agents / "x.plist").write_text(old)
+        self.step()
+        self.assertEqual((self.agents / "x.plist").read_text(), snippet)
+        self.assertIn("`--i-reviewed", docs)
+
+    def test_958_every_old_snippet_command_the_docs_ever_showed_has_no_janitor_apply_now(self):
+        docs = (Path(sb.__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
+        snippet = docs[docs.index("<key>Label</key><string>com.example.fleet-disk-prune</string>"):]
+        snippet = snippet[:snippet.index("</plist>")]
+        self.assertEqual(snippet.count("disk janitor --apply"), 0)
+        self.assertIn("--i-reviewed", docs)
 
 
 class TestComposeTrap(Base):
@@ -67337,7 +67916,8 @@ class TestReviewerSubagents(LedgerBase):
         cells = sb.impact_floor.load_matrix()["cells"]
         severity, probability = next((s, p) for s in cells for p in cells[s] if cells[s][p]["level"] == level)
         entry = {"kind": "review_record", "pr": self.PR, "head": head, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": role,
-                 "impact_severity": severity, "impact_probability": probability, "impact_action": "none"}
+                 "impact_severity": severity, "impact_probability": probability, "impact_action": "none",
+                 "block_sha256": "a" * 64, "block_size": 200, "block_impact_severity": severity, "block_impact_probability": probability}   # #901: the rating carries the agent's block, so the block scores it
         sb.plan_ledger.append_entry(self.world.state, entry, self.world.clock.now())
 
     def rating_lines(self):
@@ -72239,6 +72819,133 @@ class TestAuthorityModulesGuard(unittest.TestCase):
         self.assertTrue(words and all(isinstance(w, str) and re.fullmatch(r"[a-z]+", w) for w in words))
 
 
+class TestClearCodePathsAlwaysHeld(unittest.TestCase):
+    """Ask #939: a path of the matrix's `clear_code_paths` is never delegated, so the floor also HOLDS it for the owner. One table, derived from the matrix list;
+    the real floor and the real clear refusal are driven; the closure rule (modules and functions the clear merely loads) is NOT part of this (#940)."""
+
+    def setUp(self):
+        self.floor = sb.load_module("impact_floor")
+        self.clear = sb.load_module("delegated_clear")
+        self.matrix = self.floor.load_matrix()
+        self.rule = self.matrix["owner_hold"]["delegated_clear"]
+        self.listed = list(self.rule["clear_code_paths"])
+
+    def decide(self, paths, matrix=None):
+        matrix = matrix or self.matrix
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        return self.floor.owner_decide(matrix, paths, [], None, self.floor.floor_paths(paths, globs, exclude, force))
+
+    @staticmethod
+    def concrete(entry):
+        return entry.replace("**", "sub/x.txt").replace("*", "x")
+
+    def without(self, drop):
+        matrix = json.loads(json.dumps(self.matrix))
+        if drop is None:
+            del matrix["owner_hold"]["delegated_clear"]
+        else:
+            matrix["owner_hold"]["delegated_clear"]["clear_code_paths"] = [e for e in self.listed if e != drop] or ["nothing/at/all"]
+        return matrix
+
+    def rows(self):
+        return [(entry, self.concrete(entry)) for entry in self.listed]
+
+    def reason_of(self, path, matrix=None):
+        decision, reasons = self.decide([path], matrix)
+        return decision, [r for r in reasons if r.startswith("clear_code_paths")]
+
+    def test_s5_every_entry_of_the_list_is_held_with_the_reason_that_names_the_list(self):
+        rows = self.rows()
+        self.assertEqual(len(rows), len(self.listed))
+        self.assertGreaterEqual(len(rows), 14)
+        for entry, path in rows:
+            decision, why = self.reason_of(path)
+            self.assertEqual(decision, "hold", entry)
+            self.assertEqual(len(why), 1, "%s: the reason names the list and the path" % entry)
+            self.assertIn(path, why[0])
+
+    def test_s5_a_mutant_that_drops_the_list_or_one_entry_dies(self):
+        for entry, path in self.rows():
+            decision, why = self.reason_of(path, self.without(entry))
+            self.assertEqual(why, [], "dropping %s from the list must remove its reason" % entry)
+        for entry, path in self.rows():
+            with mock.patch.object(self.floor, "clear_code_paths", lambda matrix: (None, None)):
+                self.assertEqual(self.reason_of(path)[1], [], entry)
+
+    def test_s5_the_table_is_complete_for_a_new_entry(self):
+        matrix = json.loads(json.dumps(self.matrix))
+        matrix["owner_hold"]["delegated_clear"]["clear_code_paths"].append("brand/new/**")
+        self.assertEqual(self.reason_of("brand/new/a.py", matrix)[0], "hold")   # held with no code edit: the list is the only source
+        self.assertNotEqual(self.decide(["brand/new/a.py"])[0], "hold")
+        self.assertEqual(len(self.rows()), len(self.rule["clear_code_paths"]), "a row per entry, derived, never hand-listed")
+
+    def test_s2_a_rename_source_and_the_spellings_the_floor_normalises_are_held(self):
+        self.assertEqual(self.reason_of("bin/plan_check.py")[0], "hold")
+        for spelled in ("./bin/plan_check.py", "bin//plan_check.py", "BIN/PLAN_CHECK.PY"):
+            self.assertEqual(self.reason_of(spelled)[0], "hold", spelled)
+        self.assertEqual(self.decide(["bin/other_new_name.py", "bin/repo_exclusion.py"])[0], "hold", "a rename's old path is among the paths")
+
+    def test_s2b_a_closure_module_that_is_not_on_the_list_is_decided_as_before(self):
+        outside = [e for e in self.rule["closure_files"] if not self.floor.matches(e, self.listed)]
+        self.assertTrue(outside)
+        before = self.without(None)
+        for path in outside:
+            self.assertEqual(self.decide([path]), self.decide([path], before), path)
+            self.assertEqual(self.reason_of(path)[1], [], path)
+
+    def test_s3_a_pull_request_that_touches_no_listed_path_is_decided_as_before(self):
+        before = self.without(None)
+        for path in ("docs/notes.md", "README.md", "bin/fleet_health.py", "bin/decision_sync.py", "bin/triage_digest.py", "bin/fleet-switchboard", "cloud/launcher/app_token.py",
+                     "agents/x/y.md", "skills/a/SKILL.md", "bin/test-switchboard", "docs/switchboard.md"):
+            self.assertEqual(self.decide([path]), self.decide([path], before), path)
+
+    def test_the_three_entries_the_floor_did_not_hold_before_are_held_now(self):
+        before = self.without(None)
+        for path in ("bin/plan_check.py", "bin/repo_exclusion.py", "templates/com.example.plist"):
+            self.assertNotEqual(self.decide([path], before)[0], "hold", path)
+            self.assertEqual(self.decide([path])[0], "hold", path)
+
+    def test_a_malformed_list_holds_and_an_absent_block_does_not_widen_the_rule(self):
+        for bad in ("x", [], [1], [""]):
+            matrix = json.loads(json.dumps(self.matrix))
+            matrix["owner_hold"]["delegated_clear"]["clear_code_paths"] = bad
+            decision, reasons = self.decide(["docs/notes.md"], matrix)
+            self.assertEqual(decision, "hold", bad)
+            self.assertIn("clear_code_paths", reasons[0])
+
+    def test_s4_the_clear_still_refuses_every_entry_with_its_current_reason(self):
+        report = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": False, "top_tier_hits": {}, "review_action": "none", "review_class": None, "changed_paths": []}
+        for entry, path in self.rows():
+            files = [{"filename": path, "previous_filename": None, "status": "modified"}]
+            got = self.clear.refusals(self.rule, report, files, self.floor.matches, {}, {"reasons": [], "level": "Low"})
+            self.assertEqual(got, ["it changes a file that is the clear or hold machinery or that the daemon loads (%s): that stays the owner's own clear" % path], entry)
+
+    def test_s7_one_reader_serves_the_floor_and_the_clear_and_the_rule_names_no_path(self):
+        self.assertEqual(self.floor.clear_code_paths(self.matrix), (self.listed, None))
+        matrix = json.loads(json.dumps(self.matrix))
+        matrix["owner_hold"]["delegated_clear"]["clear_code_paths"].append("brand/new/**")   # one entry added to the matrix: the floor holds it AND the clear refuses it
+        self.assertEqual(self.reason_of("brand/new/a.py", matrix)[0], "hold")
+        listed, problem = self.floor.clear_code_paths(matrix)
+        self.assertIsNone(problem)
+        report = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": False, "top_tier_hits": {}, "review_action": "none", "review_class": None, "changed_paths": []}
+        refused = self.clear.refusals(dict(matrix["owner_hold"]["delegated_clear"], clear_code_paths=listed), report,
+                                      [{"filename": "brand/new/a.py", "previous_filename": None, "status": "modified"}], self.floor.matches, {}, {"reasons": [], "level": "Low"})
+        self.assertEqual(len(refused), 1, refused)
+        import ast
+        tree = ast.parse((BIN / "impact_floor.py").read_text())
+        constants = {n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+        self.assertEqual(sorted(constants & set(self.listed)), [], "a listed path is written in the floor's code")
+
+    def test_s6_the_docs_and_the_matrix_text_say_always_held_and_where_it_stops(self):
+        docs = (BIN.parent / "docs" / "switchboard.md").read_text()
+        meaning = self.rule["meaning"]
+        for text in (docs, meaning):
+            self.assertIn("always held", text.lower())
+            self.assertIn("clear_code_paths", text)
+            self.assertIn("closure", text)
+            self.assertIn("#940", text)
+
+
 class TestOwnerClearModule(unittest.TestCase):
     """Ask #532, slice 3: the code that decides who may clear, hold or release lives in bin/impact_hold.py (listed in the matrix), not in the daemon file. The names come from the
     module's own MOVED tuple and the paths from the matrix: this test has no list of its own."""
@@ -72428,13 +73135,14 @@ class TestOwnerHoldRule(unittest.TestCase):
             self.assertEqual(decision, "hold", path)
             self.assertTrue(any(path in reason for reason in reasons), (path, reasons))
 
-    def test_s3_the_launchd_template_the_cloud_image_and_a_docs_file_do_not_hold_for_the_owner(self):
-        paths = ["templates/com.fleet-kit.switchboard.plist", "cloud/launcher/Dockerfile", "docs/switchboard.md"]
+    def test_s3_the_cloud_image_and_a_docs_file_do_not_hold_for_the_owner_and_the_launchd_template_does_since_it_is_on_clear_code_paths(self):
+        paths = ["cloud/launcher/Dockerfile", "docs/switchboard.md"]
         decision, reasons = self.decide(paths)
-        self.assertEqual(decision, "second-review", reasons)
-        self.assertEqual(reasons, ["floor: 1 path(s) outside the top tier ask for a second independent review"])
+        self.assertEqual((decision, reasons), ("none", []))
         for path in paths:
             self.assertNotEqual(self.decide([path])[0], "hold", path)
+        decision, reasons = self.decide(["templates/com.fleet-kit.switchboard.plist"])   # #939: templates/** is on clear_code_paths, so it holds
+        self.assertEqual(decision, "hold", reasons)
 
     def test_s4_only_a_top_tier_or_unknown_class_at_a_hold_level_holds(self):
         self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "credentials")])[0], "hold")
@@ -73990,7 +74698,8 @@ class TestTempJanitorResume(Base):
         self.assertTrue(parser.parse_args(["disk", "janitor", "--apply", "--weekly"]).weekly)
         self.assertFalse(parser.parse_args(["disk", "janitor", "--apply"]).weekly)
         source = inspect.getsource(sb.cmd_disk_janitor)
-        self.assertIn('weekly=bool(getattr(args, "weekly", False))', source)
+        self.assertIn('weekly = bool(getattr(args, "weekly", False))', source)
+        self.assertIn("weekly=weekly, outcome=preview", source)
 
     def test_a_dry_run_reads_the_cursor_and_never_moves_it_and_the_file_is_private(self):
         self.twelve()

@@ -84,6 +84,14 @@ unsure of the class, name a top tier one. A hold without a class is rejected and
 
 When a changed file matches a floor path rule of the matrix (`owner_hold.delegated_clear.score.floor`), name that rule's id in your `impact-reason:`, never rate below Serious, and rate High when the change alters credential issuance, a login, a token's scope or who may do what. The switchboard derives the score from the cell of your severity and probability, never from your words. Write the rule id as a word of its own in a plain sentence, never as `<rule id>: ...` (the redaction of the record hides what follows a colon after such a word).
 
+## Read all of it, and where the matrix words come from
+
+Read EVERY hunk of the diff (in chunks if it is long). If you could not read all of it, return `verdict: incomplete` rather than shorten your reading: an incomplete rating counts for nothing by score, and the machine reads only the verdict word, never prose such as "read only part", so your honesty is the guard.
+
+In a repository with no review laws you cannot read the kit's matrix file. Run `fleet-switchboard impact matrix --for-rater <pr>` (read-only): it prints the matrix's severities, probabilities and cells, the floor rule ids, and which floor rule ids the pull request's changed paths hit. Name every hit rule id in `impact-reason:`.
+
+Never adjust a rating to fit the floor: a rating below the floor is reported as it is and goes to the owner.
+
 ## Verdict block
 
 ```
@@ -100,6 +108,8 @@ findings:
 ```
 
 The coder session records your block; you never run the command. A block with no `impact-severity:` and `impact-probability:` line is recorded WITHOUT a score and clears nothing by score, so always give both.
+
+A rating counts by score only because your block was recorded with it: the hash kept with the record proves a block was given, not that the agent produced it (a mistake-guard, as the recorded-role check is); the independent review and the audit remain the cover. The record keeps only the block's hash and size, not its text, so keep your block text if an audit ever needs it.
 
 <!-- block-table:begin -->
 With --block, refused (the block carries them): --verdict, --head, --blocks, --notes, --impact-action; accepted: --reviewer, --summary, --impact-class, --impact-severity, --impact-probability, --impact-reason, --confirms-carry, and of these --impact-class, --impact-severity, --impact-probability, --impact-reason win over the block's own lines; the score comes from the block's impact-severity:, impact-probability: and impact-reason: lines, so a block without the first two is recorded WITHOUT a score
