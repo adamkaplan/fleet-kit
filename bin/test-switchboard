@@ -35929,8 +35929,8 @@ class TestImpactHold(LedgerBase):
 
     def files_of_pr(self, *paths, patch="@@ -1 +1 @@\n-a\n+b", status="modified", mapped=None):
         self.mapped = [] if mapped is None else mapped
-        patcher = mock.patch.object(sb, "delegated_clear_map", lambda engine, runner, repo, item, base_sha, rule: (self.map_bases.append(base_sha), self.mapped)[1])
-        self.map_bases = []
+        patcher = mock.patch.object(sb, "delegated_clear_map", lambda engine, runner, repo, item, base_sha, rule: (self.map_bases.append(base_sha), self.map_rules.append(rule), self.mapped)[2])
+        self.map_bases, self.map_rules = [], []
         patcher.start()
         self.addCleanup(patcher.stop)
         listing = [{"filename": p, "patch": patch, "status": status, "sha": "e" * 40} for p in paths]
@@ -36310,7 +36310,7 @@ class Box:
                 self.assertEqual(sorted(m for m in members if m in ("alpha", "beta", "gamma")), expected, label)
         with self.subTest("the mutant: no merge of the spelled-out names"):
             source = open(BIN / "delegated_clear.py").read()
-            mutant_source = source.replace("        if not set(spelled_out) <= refs:", "        if False and not set(spelled_out) <= refs:", 1)
+            mutant_source = source.replace("        if len(spelled_out) != spelled_seen[0]:", "        if False and len(spelled_out) != spelled_seen[0]:", 1)
             self.assertNotEqual(mutant_source, source)
             namespace = {"__name__": "mutant_dc", "__file__": str(BIN / "delegated_clear.py")}
             exec(compile(mutant_source, "mutant_delegated_clear", "exec"), namespace)
@@ -36429,6 +36429,9 @@ class Box:
         self.assertIn("it changes cmd_review, part of the clear (head file)", refused[1])
         self.assertEqual(len(self.map_bases), 3, "the one mapper is called by the hold (its own report, and the report the refusal reads) and by the refusal, each with the merge-base")
         self.assertEqual(set(self.map_bases), {"m" * 40})
+        matrix_rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
+        self.assertEqual(len(self.map_rules), 3)
+        self.assertTrue(all(rule == matrix_rule for rule in self.map_rules), "the hold and the refusal give the mapper the SAME rule: the matrix's block, whole")
         self.files_of_pr("bin/fleet-switchboard", mapped=None)   # nothing the clear touches in the change: neither refuses nor holds for this reason
         report = sb.pr_floor_report(self.world.engine, "acme/app", 9)
         self.assertFalse([r for r in report["owner_reasons"] if "clear's closure" in r], report["owner_reasons"])
@@ -36436,6 +36439,38 @@ class Box:
             report = sb.pr_floor_report(self.world.engine, "acme/app", 9)
         self.assertEqual(report["owner_decision"], "hold")
         self.assertTrue([r for r in report["owner_reasons"] if "cannot be read or mapped to the clear's closure" in r], report["owner_reasons"])
+
+    def test_a_hold_that_gives_the_mapper_any_other_rule_than_the_refusals_is_caught_one_mutant_for_each_field_the_closure_reads(self):
+        """rev-1 of #995: the hold and the refusal call one mapper, but each builds its arguments: change ANY rule field in the hold's call only and the comparison must fail. The fields are the ones the mapper and the derivation read."""
+        import ast, copy
+        fields = ("rating_roots", "clear_entry_points", "dynamic_actions", "daemon_file", "module_roots", "closure_files")
+        read = set()
+        for name in ("delegated_clear_map", "clear_closure_hold"):
+            fn = next(n for n in ast.parse((BIN / "impact_hold.py").read_text()).body if isinstance(n, ast.FunctionDef) and n.name == name)
+            for x in ast.walk(fn):
+                if isinstance(x, ast.Subscript) and isinstance(x.value, ast.Name) and x.value.id == "rule" and isinstance(x.slice, ast.Constant):
+                    read.add(x.slice.value)
+                if isinstance(x, ast.Call) and getattr(x.func, "attr", "") == "get" and isinstance(x.func.value, ast.Name) and x.func.value.id == "rule" and x.args and isinstance(x.args[0], ast.Constant):
+                    read.add(x.args[0].value)
+        self.assertTrue(read <= set(fields) | {"daemon_file"}, "a rule field the mapper reads that has no mutant below: %s" % sorted(read - set(fields)))
+        self.delegate(); self.floor_pr(path="bin/fleet-switchboard"); self.files_of_pr("bin/fleet-switchboard", mapped=[])
+        self.world.engine.gh_runner, self.world.engine.config["gh"] = self.route, FAKE_GH
+        real_hold = sb.clear_closure_hold
+        matrix = sb.impact_floor.load_matrix()
+        for field in fields:
+            with self.subTest(mutant=field):
+                mutated = copy.deepcopy(matrix)
+                block = mutated["owner_hold"]["delegated_clear"]
+                block[field] = [] if isinstance(block[field], list) else ({} if isinstance(block[field], dict) else "bin/elsewhere")
+                def hold_with_other_rule(*a, __matrix=mutated, **k):
+                    with mock.patch.object(sb.impact_floor, "load_matrix", lambda *x, **y: __matrix):
+                        return real_hold(*a, **k)
+                del self.map_rules[:]
+                with mock.patch.object(sb, "clear_closure_hold", hold_with_other_rule):
+                    sb.pr_floor_report(self.world.engine, "acme/app", 9)
+                    sb.delegated_clear_pr_checks(self.world.engine, self.route, "acme/app", 9)
+                same = len(self.map_rules) == 3 and all(rule == self.map_rules[-1] for rule in self.map_rules)   # the hold twice (its own report and the refusal's) and the refusal once, each with the one rule
+                self.assertFalse(same, "with the %s of the hold's rule changed, the mapper saw other rules or was not called by the hold: the comparison test fails on this mutant" % field)
 
     def test_the_closure_hold_fails_toward_hold_on_every_unreadable_branch_and_is_silent_when_the_daemon_file_is_untouched(self):
         dc = sb.load_module("delegated_clear")
