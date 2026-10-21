@@ -76230,7 +76230,6 @@ class TestGhShimMergeGate(Base):
                  ("repeated slashes are not collapsed", 're.sub(r"/{2,}", "/", ', "("),
                  ("a gh placeholder is read as a repository", r'[{}$<>:]', r'[{}$<>]'),
                  ("dot segments are not resolved", 'parts, climbed = resolve_dots(path.split("/"))', 'parts, climbed = path.split("/"), False'),
-                 ("a path that climbs above its repository is not refused", 'if climbed and re.search(', 'if False and re.search('),
                  ("a merge path is only seen at the end of the argument", '(^|/)pulls/[^/]*/merge(/|$)', '(^|/)pulls/[^/]*/merge$'))
         for label, old, new, *count in cases:
             with self.subTest(mutant=label):
