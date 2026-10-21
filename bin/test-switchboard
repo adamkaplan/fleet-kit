@@ -77846,14 +77846,30 @@ class TestBlockedReport(Base):
                     self.fail("a write of %s bypasses blocked_update: %s" % (name, line.strip()))
 
     def test_two_interleaved_senders_lose_no_row(self):
+        """One sender is inside its read-modify-write (it has read, not yet written) while the other tries: the second must wait, so neither row is lost."""
         import threading
-        observation = self.blocked_observation()
-        workers = [threading.Thread(target=lambda n=n: sb.note_held_send(self.world.state, "coder", "s%d" % n, float(n), observation)) for n in range(12)]
+        inside, second_done = threading.Event(), threading.Event()
+        name = sb.BLOCKED_HELD_SENDS
+
+        def first(state):
+            inside.set()
+            second_done.wait(0.6)   # with the lock the second cannot finish meanwhile; without it, it does, and this write would drop its row
+            return dict(state, a={"rows": []})
+
+        def run_first():
+            sb.blocked_update(self.world.state, name, first)
+
+        def run_second():
+            inside.wait(5)
+            sb.blocked_update(self.world.state, name, lambda state: dict(state, b={"rows": []}))
+            second_done.set()
+
+        workers = [threading.Thread(target=run_first), threading.Thread(target=run_second)]
         for w in workers:
             w.start()
         for w in workers:
             w.join(10)
-        self.assertEqual(len(sb._read_small(self.world.state, sb.BLOCKED_HELD_SENDS)["coder"]["rows"]), 12)
+        self.assertEqual(sorted(sb._read_small(self.world.state, name)), ["a", "b"], "a read-modify-write was interleaved: a row was lost")
 
     def test_the_lists_are_bounded_and_the_next_over_is_cut(self):
         observation = self.blocked_observation()
@@ -78206,9 +78222,8 @@ class TestBlockedReport(Base):
 
 # ---- the blocked report's guards, bounds, validator, lock and config key: one row and one mutant each, derived from the code
 
-BLOCKED_FUNCTIONS = ("validate_blocked_alert_config", "blocked_alert_section", "blocked_kind", "blocked_update", "note_held_send", "blocked_sender",
-                     "blocked_line", "_refused_senders", "blocked_tick")
 BLOCKED_GUARD_KILLERS = {
+    '_named:len(items) > limit': 'test_the_line_names_at_most_so_many_senders_and_reminders_and_is_cut',
     'validate_blocked_alert_config:"blocked_alert" not in config or config["blocked_alert"] is None': 'test_a_block_that_ends_before_it_was_reported_says_nothing',
     'validate_blocked_alert_config:raw is False': 'test_the_alert_can_be_set_or_turned_off',
     'validate_blocked_alert_config:not isinstance(raw, dict)': 'test_the_alert_can_be_set_or_turned_off',
@@ -78257,23 +78272,34 @@ BLOCKED_TEXT_MUTANTS = {   # id: (anchor function or None, old text, new text, t
     'bound:BLOCKED_LINE_CHARS': (None, 'BLOCKED_LINE_CHARS = 1200', 'BLOCKED_LINE_CHARS = 12000', 'test_the_lists_are_bounded_and_the_next_over_is_cut'),
     'bound:BLOCKED_LINE_SENDERS': (None, 'BLOCKED_LINE_SENDERS = 10', 'BLOCKED_LINE_SENDERS = 100', 'test_the_line_names_at_most_so_many_senders_and_reminders_and_is_cut'),
     'bound:BLOCKED_LINE_REMINDERS': (None, 'BLOCKED_LINE_REMINDERS = 5', 'BLOCKED_LINE_REMINDERS = 50', 'test_the_line_names_at_most_so_many_senders_and_reminders_and_is_cut'),
-    'lock:flock': ('def blocked_lock', 'fcntl.flock(fd, fcntl.LOCK_EX)\n        yield', 'yield', 'test_every_write_site_takes_the_one_lock_and_goes_through_the_helper'),
+    'lock:flock': ('def blocked_lock', 'fcntl.flock(fd, fcntl.LOCK_EX)\n        yield', 'yield', 'test_two_interleaved_senders_lose_no_row'),
     'config-key:blocked_alert': (None, '"friction_wake", "blocked_alert", ', '"friction_wake", ', 'test_blocked_alert_is_a_known_config_key_and_an_unknown_key_inside_it_is_warned_about'),
     'validator:zero': ('def validate_blocked_alert_config', 'not _is_number(section[key]) or section[key] <= 0', 'not _is_number(section[key]) or section[key] < 0', 'test_the_alert_can_be_set_or_turned_off'),
     'guard-removed:boss-not-blocked': (None, 'boss and boss_seen is not None and not hold_reason(boss_seen)', 'boss and boss_seen is not None', 'test_a_boss_that_is_itself_blocked_is_not_told_and_the_chief_of_staff_alone_is'),
     'write:per-report': ('def blocked_tick', 'blocked_update(engine.state_dir, BLOCKED_ALERT_STATE, lambda _: state)', 'pass', 'test_each_report_is_written_at_once_so_a_crash_repeats_at_most_one'),
+    'wording:and-more': ('def _named', '" and %d more"', '" and %d others"', 'test_the_line_names_at_most_so_many_senders_and_reminders_and_is_cut'),
+    'wording:limit-slice': ('def _named', 'list(items)[:limit]', 'list(items)[:limit + 1]', 'test_the_line_names_at_most_so_many_senders_and_reminders_and_is_cut'),
     'sender:gate': (None, 'return who if isinstance(who, str) and NAME_RE.fullmatch(who) else "unknown"', 'return who if isinstance(who, str) else "unknown"', 'test_every_sink_of_a_caller_claimed_sender_name_shows_only_a_valid_agent_name'),
     'sender:fullmatch': (None, 'NAME_RE.fullmatch(who) else', 'NAME_RE.match(who) else', 'test_every_sink_of_a_caller_claimed_sender_name_shows_only_a_valid_agent_name'),
 }
 
 
+def blocked_functions(text):
+    """The names of every function of the report: those between `BLOCKED_ALERT_DEFAULTS` and the end of `blocked_tick`, derived from the code."""
+    tree = ast.parse(text)
+    first = next(n.lineno for n in tree.body if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "BLOCKED_ALERT_DEFAULTS")
+    last = next(n.end_lineno for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "blocked_tick")
+    return {n.name for n in tree.body if isinstance(n, ast.FunctionDef) and first <= n.lineno <= last}
+
+
 def blocked_guards(text):
     """{id: (start, end)} byte offsets of the test of every `if`, conditional expression and `while` in the report's functions: derived from the code."""
     tree, found, lines = ast.parse(text), {}, [0]
+    names = blocked_functions(text)
     for line in text.encode().split(b"\n"):
         lines.append(lines[-1] + len(line) + 1)
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name in BLOCKED_FUNCTIONS:
+        if isinstance(node, ast.FunctionDef) and node.name in names:
             for guard in ast.walk(node):
                 if isinstance(guard, (ast.If, ast.IfExp, ast.While)):
                     test = guard.test
@@ -78308,6 +78334,13 @@ class TestBlockedMutants(Base):
         self.assertEqual(set(re.findall(r"^[A-Z_]+ = ", text[text.index("BLOCKED_HELD_SENDS = "):text.index("def blocked_lock")], re.M)) - {"BLOCKED_HELD_SENDS = ", "BLOCKED_LOCK = "}, {c + " = " for c in constants})
         for row in BLOCKED_TEXT_MUTANTS.values():
             self.assertEqual(text.count(row[1]) if row[0] is None else 1, 1, row[1])
+
+    def test_no_function_of_the_report_lies_outside_the_derived_region(self):
+        text = SWITCHBOARD.read_text()
+        names = blocked_functions(text)
+        self.assertTrue({"blocked_tick", "blocked_update", "note_held_send", "blocked_lock", "blocked_sender"} <= names, names)
+        outside = {n.name for n in ast.parse(text).body if isinstance(n, ast.FunctionDef) and ("blocked" in n.name or n.name == "note_held_send")} - names
+        self.assertEqual(outside, set(), "a function of the report outside the region the table is derived from")
 
     def test_every_guard_negated_is_killed_by_its_named_test(self):
         text = SWITCHBOARD.read_bytes()
