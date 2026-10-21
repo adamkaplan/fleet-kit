@@ -71782,6 +71782,133 @@ class TestAuthorityModulesGuard(unittest.TestCase):
         self.assertTrue(words and all(isinstance(w, str) and re.fullmatch(r"[a-z]+", w) for w in words))
 
 
+class TestClearCodePathsAlwaysHeld(unittest.TestCase):
+    """Ask #939: a path of the matrix's `clear_code_paths` is never delegated, so the floor also HOLDS it for the owner. One table, derived from the matrix list;
+    the real floor and the real clear refusal are driven; the closure rule (modules and functions the clear merely loads) is NOT part of this (#940)."""
+
+    def setUp(self):
+        self.floor = sb.load_module("impact_floor")
+        self.clear = sb.load_module("delegated_clear")
+        self.matrix = self.floor.load_matrix()
+        self.rule = self.matrix["owner_hold"]["delegated_clear"]
+        self.listed = list(self.rule["clear_code_paths"])
+
+    def decide(self, paths, matrix=None):
+        matrix = matrix or self.matrix
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        return self.floor.owner_decide(matrix, paths, [], None, self.floor.floor_paths(paths, globs, exclude, force))
+
+    @staticmethod
+    def concrete(entry):
+        return entry.replace("**", "sub/x.txt").replace("*", "x")
+
+    def without(self, drop):
+        matrix = json.loads(json.dumps(self.matrix))
+        if drop is None:
+            del matrix["owner_hold"]["delegated_clear"]
+        else:
+            matrix["owner_hold"]["delegated_clear"]["clear_code_paths"] = [e for e in self.listed if e != drop] or ["nothing/at/all"]
+        return matrix
+
+    def rows(self):
+        return [(entry, self.concrete(entry)) for entry in self.listed]
+
+    def reason_of(self, path, matrix=None):
+        decision, reasons = self.decide([path], matrix)
+        return decision, [r for r in reasons if r.startswith("clear_code_paths")]
+
+    def test_s5_every_entry_of_the_list_is_held_with_the_reason_that_names_the_list(self):
+        rows = self.rows()
+        self.assertEqual(len(rows), len(self.listed))
+        self.assertGreaterEqual(len(rows), 14)
+        for entry, path in rows:
+            decision, why = self.reason_of(path)
+            self.assertEqual(decision, "hold", entry)
+            self.assertEqual(len(why), 1, "%s: the reason names the list and the path" % entry)
+            self.assertIn(path, why[0])
+
+    def test_s5_a_mutant_that_drops_the_list_or_one_entry_dies(self):
+        for entry, path in self.rows():
+            decision, why = self.reason_of(path, self.without(entry))
+            self.assertEqual(why, [], "dropping %s from the list must remove its reason" % entry)
+        for entry, path in self.rows():
+            with mock.patch.object(self.floor, "clear_code_paths", lambda matrix: (None, None)):
+                self.assertEqual(self.reason_of(path)[1], [], entry)
+
+    def test_s5_the_table_is_complete_for_a_new_entry(self):
+        matrix = json.loads(json.dumps(self.matrix))
+        matrix["owner_hold"]["delegated_clear"]["clear_code_paths"].append("brand/new/**")
+        self.assertEqual(self.reason_of("brand/new/a.py", matrix)[0], "hold")   # held with no code edit: the list is the only source
+        self.assertNotEqual(self.decide(["brand/new/a.py"])[0], "hold")
+        self.assertEqual(len(self.rows()), len(self.rule["clear_code_paths"]), "a row per entry, derived, never hand-listed")
+
+    def test_s2_a_rename_source_and_the_spellings_the_floor_normalises_are_held(self):
+        self.assertEqual(self.reason_of("bin/plan_check.py")[0], "hold")
+        for spelled in ("./bin/plan_check.py", "bin//plan_check.py", "BIN/PLAN_CHECK.PY"):
+            self.assertEqual(self.reason_of(spelled)[0], "hold", spelled)
+        self.assertEqual(self.decide(["bin/other_new_name.py", "bin/repo_exclusion.py"])[0], "hold", "a rename's old path is among the paths")
+
+    def test_s2b_a_closure_module_that_is_not_on_the_list_is_decided_as_before(self):
+        outside = [e for e in self.rule["closure_files"] if not self.floor.matches(e, self.listed)]
+        self.assertTrue(outside)
+        before = self.without(None)
+        for path in outside:
+            self.assertEqual(self.decide([path]), self.decide([path], before), path)
+            self.assertEqual(self.reason_of(path)[1], [], path)
+
+    def test_s3_a_pull_request_that_touches_no_listed_path_is_decided_as_before(self):
+        before = self.without(None)
+        for path in ("docs/notes.md", "README.md", "bin/fleet_health.py", "bin/decision_sync.py", "bin/triage_digest.py", "bin/fleet-switchboard", "cloud/launcher/app_token.py",
+                     "agents/x/y.md", "skills/a/SKILL.md", "bin/test-switchboard", "docs/switchboard.md"):
+            self.assertEqual(self.decide([path]), self.decide([path], before), path)
+
+    def test_the_three_entries_the_floor_did_not_hold_before_are_held_now(self):
+        before = self.without(None)
+        for path in ("bin/plan_check.py", "bin/repo_exclusion.py", "templates/com.example.plist"):
+            self.assertNotEqual(self.decide([path], before)[0], "hold", path)
+            self.assertEqual(self.decide([path])[0], "hold", path)
+
+    def test_a_malformed_list_holds_and_an_absent_block_does_not_widen_the_rule(self):
+        for bad in ("x", [], [1], [""]):
+            matrix = json.loads(json.dumps(self.matrix))
+            matrix["owner_hold"]["delegated_clear"]["clear_code_paths"] = bad
+            decision, reasons = self.decide(["docs/notes.md"], matrix)
+            self.assertEqual(decision, "hold", bad)
+            self.assertIn("clear_code_paths", reasons[0])
+
+    def test_s4_the_clear_still_refuses_every_entry_with_its_current_reason(self):
+        report = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": False, "top_tier_hits": {}, "review_action": "none", "review_class": None, "changed_paths": []}
+        for entry, path in self.rows():
+            files = [{"filename": path, "previous_filename": None, "status": "modified"}]
+            got = self.clear.refusals(self.rule, report, files, self.floor.matches, {}, {"reasons": [], "level": "Low"})
+            self.assertEqual(got, ["it changes a file that is the clear or hold machinery or that the daemon loads (%s): that stays the owner's own clear" % path], entry)
+
+    def test_s7_one_reader_serves_the_floor_and_the_clear_and_the_rule_names_no_path(self):
+        self.assertEqual(self.floor.clear_code_paths(self.matrix), (self.listed, None))
+        matrix = json.loads(json.dumps(self.matrix))
+        matrix["owner_hold"]["delegated_clear"]["clear_code_paths"].append("brand/new/**")   # one entry added to the matrix: the floor holds it AND the clear refuses it
+        self.assertEqual(self.reason_of("brand/new/a.py", matrix)[0], "hold")
+        listed, problem = self.floor.clear_code_paths(matrix)
+        self.assertIsNone(problem)
+        report = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": False, "top_tier_hits": {}, "review_action": "none", "review_class": None, "changed_paths": []}
+        refused = self.clear.refusals(dict(matrix["owner_hold"]["delegated_clear"], clear_code_paths=listed), report,
+                                      [{"filename": "brand/new/a.py", "previous_filename": None, "status": "modified"}], self.floor.matches, {}, {"reasons": [], "level": "Low"})
+        self.assertEqual(len(refused), 1, refused)
+        import ast
+        tree = ast.parse((BIN / "impact_floor.py").read_text())
+        constants = {n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+        self.assertEqual(sorted(constants & set(self.listed)), [], "a listed path is written in the floor's code")
+
+    def test_s6_the_docs_and_the_matrix_text_say_always_held_and_where_it_stops(self):
+        docs = (BIN.parent / "docs" / "switchboard.md").read_text()
+        meaning = self.rule["meaning"]
+        for text in (docs, meaning):
+            self.assertIn("always held", text.lower())
+            self.assertIn("clear_code_paths", text)
+            self.assertIn("closure", text)
+            self.assertIn("#940", text)
+
+
 class TestOwnerClearModule(unittest.TestCase):
     """Ask #532, slice 3: the code that decides who may clear, hold or release lives in bin/impact_hold.py (listed in the matrix), not in the daemon file. The names come from the
     module's own MOVED tuple and the paths from the matrix: this test has no list of its own."""
@@ -71971,13 +72098,14 @@ class TestOwnerHoldRule(unittest.TestCase):
             self.assertEqual(decision, "hold", path)
             self.assertTrue(any(path in reason for reason in reasons), (path, reasons))
 
-    def test_s3_the_launchd_template_the_cloud_image_and_a_docs_file_do_not_hold_for_the_owner(self):
-        paths = ["templates/com.fleet-kit.switchboard.plist", "cloud/launcher/Dockerfile", "docs/switchboard.md"]
+    def test_s3_the_cloud_image_and_a_docs_file_do_not_hold_for_the_owner_and_the_launchd_template_does_since_it_is_on_clear_code_paths(self):
+        paths = ["cloud/launcher/Dockerfile", "docs/switchboard.md"]
         decision, reasons = self.decide(paths)
-        self.assertEqual(decision, "second-review", reasons)
-        self.assertEqual(reasons, ["floor: 1 path(s) outside the top tier ask for a second independent review"])
+        self.assertEqual((decision, reasons), ("none", []))
         for path in paths:
             self.assertNotEqual(self.decide([path])[0], "hold", path)
+        decision, reasons = self.decide(["templates/com.fleet-kit.switchboard.plist"])   # #939: templates/** is on clear_code_paths, so it holds
+        self.assertEqual(decision, "hold", reasons)
 
     def test_s4_only_a_top_tier_or_unknown_class_at_a_hold_level_holds(self):
         self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "credentials")])[0], "hold")

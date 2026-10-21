@@ -1110,7 +1110,11 @@ def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info
     independent rating at this head is the rule about the pull request's classes; `info` (a dict) gets the score it read, for the audit of a refusal too."""
     try:
         report = pr_floor_report(engine, repo, number)
-        rule = (impact_floor.load_matrix().get("owner_hold") or {}).get("delegated_clear")
+        matrix = impact_floor.load_matrix()
+        rule = (matrix.get("owner_hold") or {}).get("delegated_clear")
+        listed, problem = impact_floor.clear_code_paths(matrix)   # the ONE reader of the list: the floor holds these paths, the clear refuses them
+        if isinstance(rule, dict) and listed is not None and problem is None:
+            rule = dict(rule, clear_code_paths=listed)
     except (impact_floor.MatrixError, NoticeError, ValueError) as err:
         return None, "the owner-hold decision or its rule cannot be read (%s): refused" % _one_line(str(err), 140)
     files, get = [], impact_carry_get(engine, runner, repo)
