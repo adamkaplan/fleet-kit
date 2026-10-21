@@ -35596,6 +35596,57 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
             self.step()
         self.assertEqual(len(self.removals(9)), 2)
 
+    NO_FLOOR = staticmethod(lambda repo, config=None: ([], [], []))
+
+    def test_the_dry_run_on_a_repo_with_no_floor_and_a_record_of_ours_plans_the_release(self):
+        self.held_world("base")
+        self.view("docs/a.md", base="2" * 40)
+        with mock.patch.object(sb.impact_floor, "floor_for", self.NO_FLOOR):
+            code, out, err = self.run_as("coder", "impact", "hold", "--dry-run", "--repo", "acme/app")
+        self.assertEqual(code, 0, err)
+        self.assertIn("acme/app#9  would remove", out)
+
+    def test_the_dry_run_on_a_repo_with_no_floor_and_no_record_skips_it(self):
+        self.view("shims/gh")
+        self.live_labels = []
+        self.step(0)   # listed and judged once; labels are then ours only if a record says so
+        (self.world.state / "impact-hold.json").write_text(json.dumps({"clears": {}, "applied": {}}))
+        self.live_labels = self.both()
+        self.prs[9]["labels"] = [{"name": n} for n in self.both()]
+        before = len(self.view_reads)
+        with mock.patch.object(sb.impact_floor, "floor_for", self.NO_FLOOR):
+            code, out, err = self.run_as("coder", "impact", "hold", "--dry-run", "--repo", "acme/app")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("acme/app#9", out)
+        self.assertEqual(len(self.view_reads), before, "a repo with no floor and no record of ours is not read")
+
+    def test_the_dry_run_skips_a_record_of_another_repo_when_the_floor_is_empty(self):
+        self.held_world("base")
+        self.view("docs/a.md", base="2" * 40)
+        state = json.loads((self.world.state / "impact-hold.json").read_text())
+        state["applied"] = {"acme/app-other#9": v for v in state["applied"].values()}
+        (self.world.state / "impact-hold.json").write_text(json.dumps(state))
+        with mock.patch.object(sb.impact_floor, "floor_for", self.NO_FLOOR):
+            code, out, err = self.run_as("coder", "impact", "hold", "--dry-run", "--repo", "acme/app")
+        self.assertNotIn("would remove", out)
+
+    def test_a_pull_request_no_longer_open_leaves_no_memo(self):
+        self.held_world("base")
+        self.assertIn(("acme/app", 9), self.engine.impact_basis)
+        self.assertIn(("acme/app", 9), self.engine.impact_judged_at)
+        self.passes([], advance=1000)
+        self.assertEqual((self.engine.impact_basis, self.engine.impact_judged_at), ({}, {}))
+
+    def test_the_kept_pass_refreshes_the_basis_so_a_later_release_names_the_last_base(self):
+        self.held_world("base")
+        self.view("shims/gh", base="2" * 40)   # still holds on a new base: kept
+        self.step()
+        self.assertEqual(self.removals(9), [])
+        self.view("docs/a.md", base="1" * 40)   # released on the first base again: the base DID change since the last judgement
+        self.step()
+        (line,) = self.events("gate.hold_released")
+        self.assertEqual(line["detail"]["reason"], "base changed")
+
     def test_a_pull_request_that_went_draft_is_released_when_the_rule_no_longer_holds_it(self):
         self.held_world("base")
         self.view("docs/a.md", base="2" * 40)
