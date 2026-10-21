@@ -4971,9 +4971,49 @@ class TestLaunch(StandInPids, Base):
         now = self.world.clock.now()
         self.dead_worker({"state": "working", "at": now - 3 * 3600})
         lines = "\n".join(sb.pane_health_status_lines(self.world.state, now))
-        self.assertIn("last report: working 3h ago", lines)   # a final done would have retired it already
-        self.assertIn("fleet-switchboard retire worker", lines)
-        self.assertIn("fleet-switchboard reattach worker", lines)
+        self.assertNotIn("DEAD", lines)   # the registry holds it dead: a view never draws a dead agent (S10); collect_status reconciles first and removes the provably dead one (#919)
+        text = sb.dead_hint.hint("worker", {"state": "working", "at": now - 3 * 3600}, now)
+        self.assertIn("last report: working 3h ago", text)   # a final done would have retired it already
+        self.assertIn("fleet-switchboard retire worker", text)
+        self.assertIn("fleet-switchboard reattach worker", text)
+
+    def test_dead_hint_s1b_the_view_never_draws_a_dead_agent_and_says_when_the_registry_is_unreadable(self):
+        now = self.world.clock.now()
+        self.dead_worker({"state": "working", "at": now - 3 * 3600})
+        path = self.world.state / "registry.json"
+        reg = sb.load_module("registry")
+        pane = sb.read_pane_health(self.world.state)["agents"]["worker"]
+        reg.upsert(self.world.state, "worker", {"session": pane["session"], "pane": pane["pane"], "role": "coder", "workspace": "w1"})
+        doc = json.loads(path.read_text())
+        doc["agents"]["worker"]["state"] = "dead"
+        path.write_text(json.dumps(doc))
+        self.assertNotIn("worker", "\n".join(sb.pane_health_status_lines(self.world.state, now)))   # held dead: not drawn
+        for label, text, want in (("empty registry", json.dumps({"version": 1, "agents": {}, "retired": {}}), None),
+                                  ("torn file", "{torn", "could not be read"),
+                                  ("only another agent", json.dumps({"version": 1, "agents": {"other": {"state": "idle", "session": "ses_x"}}, "retired": {}}), None),
+                                  ("the agent recorded live", json.dumps({"version": 1, "agents": {"worker": {"state": "idle", "session": pane["session"]}}, "retired": {}}), None)):
+            with self.subTest(registry=label):
+                path.write_text(text)
+                lines = "\n".join(sb.pane_health_status_lines(self.world.state, now))
+                self.assertNotIn("DEAD", lines)   # the registry is the only record: an agent it does not hold has no row, and no copy brings one back
+                if want:
+                    self.assertIn(want, lines)
+
+    def test_reading_status_removes_a_dead_agent_through_the_registry_once_with_one_audit_line(self):
+        """S3 through the real status path: `collect_status` over a registry holding a dead agent whose pane herdr no longer has."""
+        self.dead_worker()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        reg = sb.load_module("registry")
+        pane = sb.read_pane_health(self.world.state)["agents"]["worker"]
+        reg.upsert(self.world.state, "worker", {"session": pane["session"], "pane": pane["pane"], "role": "coder", "workspace": "w1"})
+        path = self.world.state / "registry.json"
+        doc = json.loads(path.read_text())
+        doc["agents"]["worker"]["state"] = "dead"
+        path.write_text(json.dumps(doc))
+        sb.collect_status(self.world.route, self.world.clock.now)
+        self.assertNotIn("worker", reg.read(self.world.state)["agents"])
+        audit = [json.loads(l) for l in (self.world.state / "registry-audit.jsonl").read_text().splitlines()]
+        self.assertEqual(len([l for l in audit if l.get("event") == "reconcile_remove"]), 1)
 
     def test_dead_hint_s2_the_wake_says_no_report_since_launch_and_both_hints(self):
         self.dead_worker()
@@ -5012,8 +5052,8 @@ class TestLaunch(StandInPids, Base):
 
     def test_dead_hint_s6_a_corrupt_file_says_no_report_since_launch(self):
         self.dead_worker(None)
-        lines = "\n".join(sb.pane_health_status_lines(self.world.state, self.world.clock.now()))
-        self.assertIn("no report since launch", lines)
+        facts = [f for f in sb.PaneFacts.__call__(self.fact_source()) if "worker is DEAD" in f.summary]
+        self.assertIn("no report since launch", facts[0].summary)   # the wake says it; status does not draw a dead agent the registry holds (#919)
 
     def test_dead_hint_s7_nothing_is_written(self):
         now = self.world.clock.now()
@@ -6144,6 +6184,26 @@ class TestLaunch(StandInPids, Base):
         with mock.patch.object(sb, "pane_state", lambda *a, **k: calls.append(1) or real(*a, **k)):
             sb.pane_health_pass(self.engine, self.world.clock.now())
         self.assertEqual(len(calls), sb.PANE_CHECKS_PER_PASS)
+
+    def test_a_dead_agent_for_three_days_leaves_the_registry_only_at_a_view_read_never_on_a_pass(self):
+        """#919: the pane pass forgets the old pane-health row (it stops waking cos) but removes nothing from the registry; the next view read does."""
+        self.engine.state_dir = self.world.state
+        reg = sb.load_module("registry")
+        reg.upsert(self.world.state, "gone", {"pane": "w1:p9", "session": "ses_x", "role": "coder", "workspace": "w1"})
+        path = self.world.state / "registry.json"
+        doc = json.loads(path.read_text())
+        doc["agents"]["gone"]["state"] = "dead"
+        path.write_text(json.dumps(doc))
+        sb.write_pane_health(self.world.state, {"agents": {"gone": {"pane": "w1:p9", "session": "ses_x"}}, "missing": {"gone": 9},
+                                                "states": {"gone": {"state": "dead", "at": 1, "pane": "w1:p9", "session": "ses_x"}}})
+        self.engine.discover(self.world.clock.now())
+        sb.pane_health_pass(self.engine, 1 + sb.PANE_FORGET_SECONDS + 5)
+        self.assertNotIn("gone", sb.read_pane_health(self.world.state)["agents"])   # forgotten here (stops waking cos)
+        self.assertIn("gone", reg.read(self.world.state)["agents"])                 # but the registry keeps it: no removal on a pass
+        audit = self.world.state / "registry-audit.jsonl"
+        self.assertEqual([l for l in (audit.read_text().splitlines() if audit.exists() else []) if "reconcile_remove" in l], [])
+        self.assertEqual(sb.reconcile_agents_on_read(self.world.state, self.engine.herdr), ["gone"])   # the view read removes it
+        self.assertNotIn("gone", reg.read(self.world.state)["agents"])
 
     def test_a_forgotten_dead_agent_stops_waking_and_the_charter_pane_line_is_rewritten_only_when_present(self):
         self.engine.state_dir = self.world.state
@@ -72368,6 +72428,228 @@ class TestCoderBooks(Base):
         self.assertFalse(finished("busy1"))
         self.assertFalse(finished("quiet"))
         self.assertFalse(finished("nobody"))
+
+
+class TestReconcileOnRead(unittest.TestCase):
+    """Slice 4 of #903 (#919): reconcile on read, never a question mark, dead never drawn."""
+
+    AGENTS = {
+        "alpha": {"session": "ses_a", "pane": "p_1", "role": "coder", "state": "working", "kind": "local"},
+        "ghost": {"session": "ses_g", "pane": "p_9", "role": "coder", "state": "dead", "kind": "local"},
+        "bare": {"session": "ses_b", "pane": "p_2", "role": "coder", "state": None, "kind": "local"},
+    }
+
+    def setUp(self):
+        self.mod = sb.load_module("agent_reconcile")
+        self.dir = Path(tempfile.mkdtemp(prefix="recon"))
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def registry(self, whole=True):
+        """The REAL registry module (slice 2) over a state directory holding the three agents; `whole=False` corrupts the file so the read is partial."""
+        reg = sb.load_module("registry")
+        for name, agent in self.AGENTS.items():
+            reg.upsert(self.dir, name, agent)
+        self.reg_state(reg)
+        if not whole:
+            (self.dir / "registry.json").write_text("{torn")
+        return reg
+
+    def reg_state(self, reg):
+        path = self.dir / "registry.json"
+        doc = json.loads(path.read_text())
+        for name, agent in self.AGENTS.items():
+            doc["agents"][name]["state"] = agent["state"]
+        path.write_text(json.dumps(doc))
+
+    def audit_lines(self):
+        path = self.dir / "registry-audit.jsonl"
+        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+    @staticmethod
+    def live(gone=("ghost",)):
+        return lambda name, agent: {"pane": name not in gone, "process": name not in gone}
+
+    def test_s3_a_whole_read_removes_the_dead_agent_once_with_one_audit_line(self):
+        reg = self.registry()
+        removed = self.mod.reconcile_on_read(self.dir, reg.read(self.dir), self.live(), reg)
+        self.assertEqual(removed, ["ghost"])
+        lines = [l for l in self.audit_lines() if l.get("event") == "reconcile_remove"]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["evidence"]["pane_listed"], False)
+        self.assertEqual(sorted(reg.read(self.dir)["agents"]), ["alpha", "bare"])
+
+    def test_s3_a_partial_read_removes_nothing_and_asks_the_registry_nothing(self):
+        reg = self.registry(whole=False)
+        removed = self.mod.reconcile_on_read(self.dir, reg.read(self.dir), self.live(), reg)
+        self.assertEqual(removed, [])
+        self.assertEqual([l for l in self.audit_lines() if l.get("event") == "reconcile_remove"], [])
+        self.assertEqual((self.dir / "registry.json").read_text(), "{torn")   # untouched
+
+    def test_s3_a_stub_that_ignores_the_whole_flag_is_caught(self):
+        """The discriminator: with a read that is not whole, a view that acted anyway would remove 1 where 0 are expected."""
+        reg = self.registry(whole=False)
+        forged = dict(reg.read(self.dir), agents=dict(self.AGENTS))
+        self.assertEqual(self.mod.reconcile_on_read(self.dir, forged, self.live(), reg), [])   # the flag is read from the read itself
+
+    def test_s3_the_registry_refuses_a_live_agent_even_with_whole_true(self):
+        reg = self.registry()
+        result = reg.reconcile_remove(self.dir, "alpha", {"state": "working", "pane_listed": False, "process_found": False}, True)
+        self.assertFalse(result["changed"])   # recorded `working`: refused whatever the caller says
+        self.assertIn("alpha", reg.read(self.dir)["agents"])
+        self.assertFalse(reg.reconcile_remove(self.dir, "ghost", {"pane_listed": False, "process_found": False}, False)["changed"])
+        self.assertTrue(self.mod.reconcile_on_read(self.dir, reg.read(self.dir), lambda n, a: {"pane": True, "process": True}, reg) == [])
+
+    def test_s3_an_unchecked_agent_is_not_removed(self):
+        """herdr could not say (None): no evidence of death, so nothing is asked of the registry."""
+        reg = self.registry()
+        unknown = lambda name, agent: {"pane": None, "process": None}
+        self.assertEqual(self.mod.reconcile_on_read(self.dir, reg.read(self.dir), unknown, reg), [])
+        self.assertIn("ghost", reg.read(self.dir)["agents"])
+        broken = lambda name, agent: 1 / 0
+        self.assertEqual(self.mod.reconcile_on_read(self.dir, reg.read(self.dir), broken, reg), [])
+
+    def test_s3_a_half_known_live_check_removes_nothing(self):
+        reg = self.registry()
+        for live in ({"pane": False, "process": None}, {"pane": True, "process": False}, {"pane": None, "process": False}):
+            self.assertEqual(self.mod.reconcile_on_read(self.dir, reg.read(self.dir), lambda n, a, live=live: live, reg), [], live)
+        self.assertIn("ghost", reg.read(self.dir)["agents"])
+
+    def test_s3_reconcile_agents_on_read_removes_through_the_real_registry_with_herdr_gone_and_keeps_it_when_herdr_is_down(self):
+        class Herdr:
+            def __init__(self, down):
+                self.down = down
+
+            def pane_list(self):
+                if self.down:
+                    raise sb.HerdrError("unavailable", "cannot run herdr: pane p_9 not found")
+                return [{"pane_id": "p_1"}, {"pane_id": "p_2"}]
+        reg = self.registry()
+        self.assertEqual(sb.reconcile_agents_on_read(self.dir, Herdr(True)), [])
+        self.assertIn("ghost", reg.read(self.dir)["agents"])
+        self.assertEqual(sb.reconcile_agents_on_read(self.dir, Herdr(False)), ["ghost"])
+        self.assertEqual(sorted(reg.read(self.dir)["agents"]), ["alpha", "bare"])
+
+    def test_s3_the_callers_own_guards_with_a_recording_registry(self):
+        """The caller's guards, not the registry's backstop: a recording fake counts the calls, so a removed guard shows."""
+        class Recording:
+            def __init__(self):
+                self.calls = []
+
+            def reconcile_remove(self, state_dir, name, evidence, whole):
+                self.calls.append((name, evidence, whole))
+                return {"changed": True, "problem": None}
+        dead = {"ghost": {"state": "dead", "pane": "p_9"}}
+        whole = {"whole": True, "agents": dead}
+        cases = {
+            "not whole": ({"whole": False, "agents": dead}, {"pane": False, "process": False}, 0),
+            "whole key missing": ({"agents": dead}, {"pane": False, "process": False}, 0),
+            "pane unchecked": (whole, {"pane": None, "process": False}, 0),
+            "process unchecked": (whole, {"pane": False, "process": None}, 0),
+            "process present": (whole, {"pane": False, "process": True}, 0),
+            "pane present": (whole, {"pane": True, "process": False}, 0),
+            "both gone": (whole, {"pane": False, "process": False}, 1),
+            "recorded live": ({"whole": True, "agents": {"ghost": {"state": "working"}}}, {"pane": False, "process": False}, 0),
+        }
+        for label, (read, live, count) in cases.items():
+            with self.subTest(case=label):
+                rec = Recording()
+                self.mod.reconcile_on_read(self.dir, read, lambda n, a, live=live: live, rec)
+                self.assertEqual(len(rec.calls), count)
+                if count:
+                    self.assertEqual(rec.calls[0][2], True)
+                    self.assertEqual((rec.calls[0][1]["pane_listed"], rec.calls[0][1]["process_found"]), (False, False))
+
+    def test_s3_herdr_live_check_gives_death_evidence_only_for_a_whole_list_that_lacks_the_exact_pane_id(self):
+        class Herdr:
+            def __init__(self, listing=None, error=None, procs=()):
+                self.listing, self.error, self.procs = listing, error, procs
+
+            def pane_list(self):
+                if self.error:
+                    raise sb.HerdrError(*self.error)
+                return self.listing
+
+            def pane_process_info(self, pane):
+                return list(self.procs)
+        agent = {"pane": "p_1"}
+        gone, unknown = {"pane": False, "process": False}, {"pane": None, "process": None}
+        cases = {
+            "listed and present, process running": (Herdr([{"pane_id": "p_1"}], procs=[{"cmdline": "x"}]), {"pane": True, "process": True}),
+            "listed and present, no process": (Herdr([{"pane_id": "p_1"}]), {"pane": True, "process": False}),
+            "listed and absent": (Herdr([{"pane_id": "p_2"}, {"pane_id": "p_3"}]), gone),
+            "empty list": (Herdr([]), gone),
+            "a pane whose id contains this one": (Herdr([{"pane_id": "p_10"}, {"pane_id": "xp_1"}]), gone),
+            "list errors with a socket path holding the id": (Herdr(error=("exit", "connect /tmp/p_1/herdr.sock: No such file or directory")), unknown),
+            "list errors: pane p_1 not found": (Herdr(error=("exit", "pane p_1 not found")), unknown),
+            "list errors: structured not found": (Herdr(error=("exit", json.dumps({"code": "pane_not_found", "message": "pane p_1 not found"}))), unknown),
+            "list errors: unavailable": (Herdr(error=("unavailable", "cannot run herdr: No such file or directory")), unknown),
+            "list errors: timeout": (Herdr(error=("timeout", "herdr did not answer within 5s")), unknown),
+            "list errors: bad json": (Herdr(error=("bad_json", "herdr returned non-JSON")), unknown),
+            "list errors: bad shape": (Herdr(error=("bad_shape", "expected result.panes in herdr's reply")), unknown),
+            "list is not a list": (Herdr({"panes": []}), unknown),
+            "an entry without a pane_id": (Herdr([{"pane_id": "p_2"}, {"id": "p_1"}]), unknown),
+            "an entry with a non-string pane_id": (Herdr([{"pane_id": 1}]), unknown),
+            "an entry that is not an object": (Herdr(["p_2"]), unknown),
+        }
+        for label, (herdr, expected) in cases.items():
+            with self.subTest(case=label):
+                self.assertEqual(sb.herdr_live_check(herdr)("a", agent), expected)
+        self.assertEqual(sb.herdr_live_check(Herdr([]))("a", {}), gone)
+
+    def test_s3_herdr_live_check_never_reads_error_text(self):
+        """Derived from the code: the function holds no text matching on an error (no substring test, no regex over a message)."""
+        import inspect
+        source = inspect.getsource(sb.herdr_live_check)
+        tree = ast.parse(source)
+        self.assertEqual([n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr in ("detail", "reason", "args", "strerror")], [])
+        self.assertEqual([n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", getattr(n.func, "attr", "")) in ("str", "search", "match", "lower")], [])
+        self.assertEqual([n for n in ast.walk(tree) if isinstance(n, ast.Compare) and any(isinstance(o, ast.In) for o in n.ops)], [])
+        self.assertNotIn("re.", source)
+
+    def test_s7_only_a_view_reads_ever_calls_reconcile_remove(self):
+        """Derived from the code: every call of `reconcile_remove` in the program, plugins and modules sits in agent_reconcile.py (the view's
+        helper) or in registry.py (its definition); the daemon's passes and sweeps hold none, so no removal exists without a read."""
+        allowed = {"agent_reconcile.py", "registry.py"}
+        roots = [BIN, BIN.parent / "plugins"]
+        hits = []
+        for root in roots:
+            for path in root.rglob("*"):
+                if not path.is_file() or "node_modules" in path.parts or path.name.startswith("test-") or ".test." in path.name:
+                    continue
+                if path.suffix not in (".py", ".mjs", ".js", ".tsx") and path.name != "fleet-switchboard":
+                    continue
+                if "reconcile_remove(" in path.read_text(errors="replace") and path.name not in allowed:
+                    hits.append(str(path.relative_to(BIN.parent)))
+        self.assertEqual(hits, [])
+
+    def views(self):
+        """The text of the four Python views drawn over a state directory that holds a dead agent, a live one and one with no state row."""
+        state = self.dir / "state"
+        state.mkdir()
+        panes = {"agents": {n: {"session": a["session"], "pane": a["pane"], "role": "coder", "workspace": "w1"} for n, a in self.AGENTS.items()},
+                 "states": {"alpha": {"state": "attached"}, "ghost": {"state": "dead", "pane": "p_9", "at": 1}}, "missing": {}}
+        (state / sb.PANE_HEALTH_FILE).write_text(json.dumps(panes))
+        (state / "registry.json").write_text(json.dumps({"version": 1, "agents": self.AGENTS, "retired": {}}))
+        load = {"latest": {"orch": {"open_asks": 1, "stalled": 0, "oldest_stall_hours": 0, "moved_1h": 0, "messages": 0, "decisions": 0, "busy": 1, "idle": 0}}, "alert": False}
+        (state / "load.json").write_text(json.dumps(load))
+        (state / "decisions.json").write_text(json.dumps({"decisions": [], "at": 0}))
+        recorder = sb.load_module("health_records").Recorder(lambda: 1000)
+        return {
+            "status": "\n".join(sb.pane_health_status_lines(state, 1000)),
+            "load line": "\n".join(sb.load_fleet_health().status_lines(state, 1000)),
+            "decisions": "\n".join(sb.format_decisions_status(sb.decisions_summary(state, lambda: 1000))),
+            "health records": json.dumps(recorder.body()),
+        }
+
+    def test_s4_no_python_view_prints_a_question_mark_for_an_agent_state(self):
+        for view, text in self.views().items():
+            with self.subTest(view=view):
+                self.assertNotIn("?", text.replace("`", "").replace("%s " % sb.PROG, "") if view == "decisions" else text)
+
+    def test_s10_no_python_view_draws_the_word_dead(self):
+        for view, text in self.views().items():
+            with self.subTest(view=view):
+                self.assertNotIn("dead", text.lower())
 
 
 class TestModuleLoader(Base):

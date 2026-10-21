@@ -7087,7 +7087,6 @@ def pane_health_pass(engine, now):
     registered = {n: row for n, row in reg["agents"].items() if isinstance(row, dict)}
     retired = reg["retired"]
     retired_whole = True
-    forgotten = []
     names = list(discovery.agents)
     sessions = [o.session_id for o in discovery.agents.values()]
     budget = PANE_CHECKS_PER_PASS
@@ -7137,7 +7136,6 @@ def pane_health_pass(engine, now):
         if (states.get(name) or {}).get("state") == PANE_DEAD and now - ((states.get(name) or {}).get("at") or now) > PANE_FORGET_SECONDS:
             for table in (agents, states, missing):   # nobody repaired it in days: it stops waking cos
                 table.pop(name, None)
-            forgotten.append(name)
             continue
         if name in retired and retired[name].get("session") in (None, agents[name].get("session")):   # the name AND its session, as in the live branch
             states.pop(name, None)
@@ -7190,11 +7188,7 @@ def pane_health_pass(engine, now):
         got = registry.upsert(engine.state_dir, name, new, now=now)
         if got["problem"] and not got["problem"].endswith("is retired for this session"):
             engine._note("fleetpane.error", name, {"error": "registry not updated: %s" % _one_line(got["problem"], 100)})
-    for name in forgotten:   # the registry itself checks the evidence (its recorded state is dead; no pane, no process): never the flag alone
-        # what this pass SAW: discovery did not list the agent (no pane, no process) for PANE_FORGET_SECONDS while its recorded state stayed dead; the registry checks it itself
-        got = registry.reconcile_remove(engine.state_dir, name, {"pane_listed": name in discovery.agents, "process_found": name in discovery.agents, "why": "dead for over %d days" % (PANE_FORGET_SECONDS // 86400)}, True)
-        if got["problem"]:
-            engine._note("fleetpane.error", name, {"error": "registry not updated: %s" % _one_line(got["problem"], 100)})
+    # No removal from the registry here: a dead agent leaves it only when a view reads it (reconcile_on_read, #919), never on a pass.
     try:
         write_pane_health(engine.state_dir, {"agents": agents, "states": states, "missing": missing, "at": int(now)})
     except OSError as err:
@@ -7625,7 +7619,9 @@ def pane_health_status_lines(state_dir, now=None):
     if not seen["whole"]:
         return ["      panes      the agent registry could not be read (%s): no pane state shown" % _one_line(str(seen["problem"]), 120)]
     retired = seen["retired"]
-    bad = [(n, v) for n, v in sorted(seen["agents"].items()) if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in retired]
+    # A dead agent is never drawn (#919, S10): the reconcile on read (run by `collect_status` first) removes the provably dead one, and one it could not remove is
+    # still not drawn as dead. The view reads only the registry: an agent it does not hold has no row, and a read that is not whole says so above.
+    bad = [(n, v) for n, v in sorted(seen["agents"].items()) if v.get("state") == PANE_DETACHED and n not in retired]
     clock = time.time() if now is None else now
     last = _read_small(state_dir, LAST_REPORT_FILE)
     gone = [n for n, v in sorted(retired.items()) if clock - (v.get("at") or 0) <= RETIRED_SHOW_DAYS * 86400]
@@ -7635,6 +7631,40 @@ def pane_health_status_lines(state_dir, now=None):
     return ["      panes      %d agent(s) need repair: %s" % (len(bad), "; ".join("%s %s (pane %s)" % (n, v["state"].upper(), v.get("pane")) for n, v in bad[:6]))
             ] + ["        run `%s reattach <name>`" % PROG] + [
         "        %s: %s" % (_one_line(n, 60), dead_hint.hint(n, last.get(n), clock)) for n, v in bad[:6] if v.get("state") == PANE_DEAD] + tail
+
+
+def herdr_live_check(herdr):
+    """A `live_check` for agent_reconcile: asks herdr right now. {"pane": bool|None, "process": bool|None}; None means herdr could not say.
+    Evidence of death is a SUCCESSFUL, WHOLE `pane list` that does not hold this pane id (exact equality on the parsed `pane_id` field). Error text
+    is never read: any error, timeout, bad JSON, missing binary or socket, or a list of an unexpected shape is None (no evidence)."""
+    def check(name, agent):
+        pane = agent.get("pane")
+        if not pane:
+            return {"pane": False, "process": False}
+        try:
+            panes = herdr.pane_list()
+        except Exception:
+            return {"pane": None, "process": None}
+        if not isinstance(panes, list) or not all(isinstance(p, dict) and isinstance(p.get("pane_id"), str) for p in panes):
+            return {"pane": None, "process": None}
+        if not any(p["pane_id"] == pane for p in panes):
+            return {"pane": False, "process": False}
+        try:
+            return {"pane": True, "process": bool(herdr.pane_process_info(pane))}
+        except Exception:
+            return {"pane": True, "process": None}
+    return check
+
+
+def reconcile_agents_on_read(state_dir, herdr):
+    """A view's reconcile on read (#919): read the registry, and remove through `registry.reconcile_remove` each agent herdr shows no pane and no
+    process for, right now. Only a whole read acts. No registry module or file: nothing to do. Returns the names removed; never raises."""
+    try:
+        reg = load_module("registry")
+        agent_reconcile = load_module("agent_reconcile")
+        return agent_reconcile.reconcile_on_read(state_dir, reg.read(state_dir), herdr_live_check(herdr), reg)
+    except Exception:
+        return []
 
 
 def charter_pane_update(engine, runner, fleet, new_pane):
@@ -18271,6 +18301,8 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["sweep"] = sweep_summary(state)  # #117
         report["triage"] = triage_summary(state)  # #130
         report["ci_record"] = ci_record_status_line(state, now())
+        if config_ok:
+            reconcile_agents_on_read(state, herdr)   # the view checks right now and removes a dead agent through the registry (#919)
         report["pane_lines"] = pane_health_status_lines(state, now()) + headless_route_status_lines(state)
         report["catching_up"] = catching_up_lines(state, now())
         report["v2_link"] = v2_link_status_line(state, now())

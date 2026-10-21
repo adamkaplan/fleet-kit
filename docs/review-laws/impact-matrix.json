@@ -536,6 +536,7 @@
         "gates_caller_kind"
       ],
       "closure_exempt": {
+        "bin/agent_reconcile.py": "loaded only by `reconcile_agents_on_read`, called by `cmd_status`'s view reconcile, which the clear never calls",
         "bin/closed_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/cloud_worker.py": "loaded only by `run_cloud` and `cmd_status`: the cloud commands, not the clear",
         "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
