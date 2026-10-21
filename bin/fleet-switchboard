@@ -4504,7 +4504,7 @@ class Switchboard:
                    for m in [re.search(r"(?:^|\s)(?:-s|--session)(?:\s+|=)(ses_\S+)", str(p.get("cmdline") or ""))] if m]
         if not running:
             return entry   # no session named by the process (a shell, another program, a fresh opencode): nothing contradicts the report, and the program guard and the pane's health verdict judge it as before
-        self._note("pane.report_disagrees", pane, {"pane": pane, "reported": reported, "process_runs": running[0] if running else None,
+        self._note("fleetpane.report_disagrees", pane, {"pane": pane, "reported": reported, "process_runs": running[0] if running else None,
                                                    "why": "the multiplexer reports one session, the pane's process runs another: the report is not trusted"})
         return dict(entry, agent_session=running[0], agent_status=None)
 
@@ -7140,7 +7140,7 @@ def pane_health_pass(engine, now):
             for table in (agents, states, missing):
                 table.pop(name, None)
             if engine.audit is not None:
-                engine.audit.append(engine.actor, "pane.cloud_repaired", name, {"was_pane": row.get("pane"), "why": "a cloud worker has no pane"})
+                engine.audit.append(engine.actor, "fleetpane.cloud_repaired", name, {"was_pane": row.get("pane"), "why": "a cloud worker has no pane"})
     retired = reg["retired"]
     retired_whole = True
     forgotten = []
@@ -7254,7 +7254,7 @@ def pane_health_pass(engine, now):
             continue
         got = registry.upsert(engine.state_dir, name, new, now=now)
         if got["problem"] and (got["problem"].startswith("pane ") or "has no pane" in got["problem"]):
-            engine._note("pane.bind_refused", name, {"why": _one_line(got["problem"], 160)})   # #1066: the refusal names both agents
+            engine._note("fleetpane.bind_refused", name, {"why": _one_line(got["problem"], 160)})   # #1066: the refusal names both agents
         elif got["problem"] and not got["problem"].endswith("is retired for this session"):
             engine._note("fleetpane.error", name, {"error": "registry not updated: %s" % _one_line(got["problem"], 100)})
     for name in forgotten:   # the registry itself checks the evidence (its recorded state is dead; no pane, no process): never the flag alone

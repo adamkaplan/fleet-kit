@@ -2951,6 +2951,7 @@ class TestDeliver(Base):
         plan = engine.plan("platform", engine.collect_facts()[0], engine.discover(self.world.clock.now()),
                            self.world.clock.now())
         self.world.herdr.panes[self.world.panes["platform"]]["session"] = self.world.sessions["coder"]
+        self.world.herdr.panes[self.world.panes["platform"]]["program"] = "%s -s %s" % (FAKE_OPENCODE, self.world.sessions["coder"])   # #1066: the process runs it too
         outcome = engine.deliver(plan)
         self.assertFalse(outcome["sent"])
         self.assertIn("no longer shows", outcome["reason"])
@@ -3907,7 +3908,7 @@ class TestPaneBoundByProcess(Base):
         self.assertNotEqual(rows["agent-a"]["state"], "dead")
         self.assertFalse(rows.get("agent-b", {}).get("pane"))
         self.run_pass()
-        lines = self.lines("pane.report_disagrees")
+        lines = self.lines("fleetpane.report_disagrees")
         self.assertEqual(len(lines), 1)
         self.assertIn(self.a, json.dumps(lines[0]))
         self.assertIn(self.b, json.dumps(lines[0]))
@@ -3982,7 +3983,7 @@ class TestServiceEnvironmentHoldsNoPane(Base):
     def test_S10_status_names_a_service_that_carries_one_and_the_clean_restart_and_restarts_nothing(self):
         state = Path(tempfile.mkdtemp())
         (state / "opencode").mkdir()
-        (state / "opencode" / "service.json").write_text(json.dumps({"pid": 4242}))
+        (state / "opencode" / "service.json").write_text(json.dumps({"pid": made_up_pid()}))
         calls = []
 
         def runner(argv, **kw):
@@ -28720,7 +28721,7 @@ class TestIdentityCheck(ReportBase):
         env = sb.daemon_environment(shell)
         for name in self.FOREIGN:
             self.assertNotIn(name, env)
-        self.assertEqual((env["PATH"], env["GH_TOKEN"], env["HERDR_SOCKET_PATH"]), ("/usr/bin", "default-token", "/s"))
+        self.assertEqual((env["PATH"], env["GH_TOKEN"], env["FLEET_SWITCHBOARD_HERDR_SOCKET"]), ("/usr/bin", "default-token", "/s"))
         self.assertNotIn("HERDR_PLUGIN_X", env)
         seen = []
         with mock.patch.dict(os.environ, shell, clear=True):
