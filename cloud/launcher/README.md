@@ -213,8 +213,15 @@ else, on stdout. It refuses (exit 1, one line on stderr naming the key, never a 
   is refused with a message that says so, before any pod exists. To cover a new repository, install the App on the account
   that owns it and add the repository to that installation (an App installed on two accounts mints for each of them);
 - the answer lists exactly the one repository and expires within 61 minutes; and
-- its `permissions` equal exactly `contents: write`, `pull_requests: write`, `metadata: read`: no extra key, no higher
-  level, none missing.
+- its `permissions` equal exactly `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read` (the one table, `EXPECTED_PERMISSIONS`; the request asks for the same four
+  and the answer is checked again): no extra key, no higher level, none missing.
+
+The worker can now read issues and their comments of its own repository (its ask and plan), through `issues: read`.
+It cannot write issues, labels, merges or settings; `issues: read` opens no write path, and the worker's `gh` wrapper
+still refuses every such write (a second line behind GitHub's own permission). The one owner step, in this order: merge the
+change, then add `issues: read` to the App's permissions and accept it on each installation. Until then a launch is refused
+before any pod exists, with one line that names `issues` and the owner step (the mint fails closed rather than also
+accepting the old set). The exact refusal GitHub gives for a permission granted but not yet accepted is not verified live.
 
 The private key travels only through a pipe to `openssl`; only `https://api.github.com` is used (`CW_GITHUB_API_BASE`
 may name a loopback `http` address, for tests).
