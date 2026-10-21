@@ -126,6 +126,26 @@ def check_dedupe_is_per_sender(module, test):
     test.assertEqual(inbox.count("agent-b", "k1"), 2)
 
 
+def check_newline_names_are_refused(module, test):
+    answer, inbox, _ = run(module, request(recipient="agent-b\n"))
+    test.assertEqual(answer["status"], 400)
+    test.assertEqual(inbox.items, {})
+    ns = dict(TABLE, **{"tok-nl": ok("agent-a\n")})
+    answer = module.handle(request(token="tok-nl", sender="agent-a\n"), reviewer_for(ns), FakeInbox(), lambda line: None)
+    test.assertEqual(answer["status"], 401)
+
+
+def check_inbox_failure_is_a_503(module, test):
+    class Broken:
+        def put_if_absent(self, *args):
+            raise OSError("disk")
+    lines = []
+    answer = module.handle(request(), reviewer_for(TABLE), Broken(), lines.append)
+    test.assertEqual(answer["status"], 503)
+    test.assertEqual(len(lines), 1)
+    test.assertIn("OSError", lines[0])
+
+
 def check_token_is_capped(module, test):
     seen = []
     answer = module.handle(request(token="t" * 5000), lambda t, a: seen.append(t) or ok("agent-a"), FakeInbox(), lambda line: None)
@@ -157,6 +177,25 @@ class TestChannel(unittest.TestCase):
 
     def test_two_senders_using_one_key_are_both_delivered(self):
         check_dedupe_is_per_sender(load(), self)
+
+    def test_a_newline_after_a_name_is_refused(self):
+        check_newline_names_are_refused(load(), self)
+
+    def test_a_failing_inbox_answers_503_with_one_audit_line(self):
+        check_inbox_failure_is_a_503(load(), self)
+
+    def test_no_audit_line_holds_a_token_on_any_path(self):
+        for req in (request(sender="agent-c"), request(token="tok-wrong-aud"), request(key=""), request()):
+            _, _, lines = run(load(), req)
+            for line in lines:
+                self.assertNotIn("tok-", line)
+
+    def test_identity_is_checked_before_the_body(self):
+        answer, _, _ = run(load(), request(token="tok-expired", key=""))
+        self.assertEqual(answer["status"], 401)
+        for bad in (request(sender=None), request(sender=5)):
+            self.assertEqual(run(load(), bad)[0]["status"], 403)
+        self.assertEqual(run(load(), {"authorization": "Bearer ", "body": {}})[0]["status"], 401)
 
     def test_an_oversized_token_never_reaches_the_reviewer(self):
         check_token_is_capped(load(), self)
@@ -202,7 +241,7 @@ class TestChannel(unittest.TestCase):
         self.assertEqual(seen, ["fleet-switchboard"])
 
     def test_a_malformed_body_is_a_400_after_the_identity_checks(self):
-        for bad in (request(recipient="Bad Name"), request(key=""), request(key="k" * 201), request(text=5), request(text="x" * 20001)):
+        for bad in (request(recipient="Bad Name"), request(key=""), request(key="k" * 201), request(key="a b"), request(key="a\nb"), request(text=5), request(text="x" * 20001)):
             answer, inbox, lines = run(load(), bad)
             self.assertEqual(answer["status"], 400)
             self.assertEqual((inbox.items, len(lines)), ({}, 1))
@@ -217,7 +256,7 @@ class TestMutants(unittest.TestCase):
     """Each mutant breaks one rule; the matching check must fail on it."""
 
     def failing(self, check, module):
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(Exception):   # a failed assertion, or the escaped error itself
             check(module, self)
 
     def test_a_handler_that_trusts_the_body_sender_fails_the_sender_check(self):
@@ -225,7 +264,7 @@ class TestMutants(unittest.TestCase):
         self.failing(check_sender_is_the_token, module)
 
     def test_a_handler_without_key_dedupe_fails_the_one_item_check(self):
-        module = mutant("    if not inbox.put_if_absent(recipient, \"%s/%s\" % (agent, key), item):", "    if False:")
+        module = mutant('"%s/%s" % (agent, key)', '"%s/%s" % (agent, __import__("os").urandom(4).hex())')
         self.failing(check_one_item_for_a_repeated_key, module)
 
     def test_a_handler_without_the_audience_check_fails_the_audience_check(self):
@@ -247,6 +286,14 @@ class TestMutants(unittest.TestCase):
     def test_a_handler_that_lets_a_reviewer_failure_through_fails_the_closed_check(self):
         module = mutant('return _refuse(audit, 503, "token review unavailable", error=type(err).__name__)', "review = {}")
         self.failing(check_fails_closed, module)
+
+    def test_a_handler_that_matches_names_loosely_fails_the_newline_check(self):
+        module = load(SOURCE.replace("NAME.fullmatch(", "NAME.match("))
+        self.failing(check_newline_names_are_refused, module)
+
+    def test_a_handler_that_lets_an_inbox_failure_escape_fails_the_503_check(self):
+        module = mutant('return _refuse(audit, 503, "inbox unavailable", error=type(err).__name__)', "raise")
+        self.failing(check_inbox_failure_is_a_503, module)
 
     def test_a_handler_without_the_token_cap_fails_the_cap_check(self):
         module = mutant("if len(token) > MAX_TOKEN:", "if False:")

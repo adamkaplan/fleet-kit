@@ -22,7 +22,12 @@ Rules:
     - A key already in the recipient's inbox is not delivered again (the same shape as the daemon's delivery dedupe:
       a key found in the inbox is never delivered twice); the repeat answers 200 with "duplicate": true. The key is
       scoped to the verified sender, so one agent cannot suppress another's message by using its key.
-    - A failing reviewer refuses (503): nothing is let through when the token cannot be checked.
+    - A failing reviewer refuses (503): nothing is let through when the token cannot be checked. A failing inbox also
+      answers 503 with one audit line. The audit sink itself is the caller's: an exception from it propagates.
+    - `text` is stored as received (bounded in length). Whatever later prints it must quote it and strip control
+      characters; the key is restricted to printable ASCII here.
+    - Names reserved by the system (a captain or switchboard account) are not refused here: the listener slice must
+      reject them, or the namespace must hold only agent accounts.
 """
 import re
 
@@ -31,7 +36,7 @@ SERVICE_ACCOUNT_PREFIX = "system:serviceaccount:"
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 NAMESPACE = "fleet-agents"
 MAX_TOKEN = 4096
-MAX_KEY = 200
+KEY = re.compile(r"[\x21-\x7e]{1,200}")   # printable ASCII, no spaces or control characters
 MAX_TEXT = 20000
 BEARER = "Bearer "
 
@@ -59,7 +64,7 @@ def agent_of(user, namespace):
     if not username.startswith(SERVICE_ACCOUNT_PREFIX):
         return None
     parts = username[len(SERVICE_ACCOUNT_PREFIX):].split(":")
-    if len(parts) != 2 or not namespace or parts[0] != namespace or not NAME.match(parts[1]):
+    if len(parts) != 2 or not namespace or parts[0] != namespace or not NAME.fullmatch(parts[1]):
         return None
     return parts[1]
 
@@ -92,14 +97,18 @@ def handle(request, reviewer, inbox, audit, audience=AUDIENCE, namespace=NAMESPA
     if sender != agent:
         return _refuse(audit, 403, "sender does not match token", token_agent=agent, claimed=sender)
     recipient, key, text = body.get("recipient"), body.get("key"), body.get("text")
-    if not isinstance(recipient, str) or not NAME.match(recipient):
+    if not isinstance(recipient, str) or not NAME.fullmatch(recipient):
         return _refuse(audit, 400, "bad recipient")
-    if not isinstance(key, str) or not key or len(key) > MAX_KEY:
+    if not isinstance(key, str) or not KEY.fullmatch(key):
         return _refuse(audit, 400, "bad key")
     if not isinstance(text, str) or len(text) > MAX_TEXT:
         return _refuse(audit, 400, "bad text")
     item = {"key": key, "sender": agent, "text": text}
-    if not inbox.put_if_absent(recipient, "%s/%s" % (agent, key), item):
+    try:
+        stored = inbox.put_if_absent(recipient, "%s/%s" % (agent, key), item)
+    except Exception as err:   # delivery failed: say so, so the sender retries with the same key
+        return _refuse(audit, 503, "inbox unavailable", error=type(err).__name__)
+    if not stored:
         return _reply(200, delivered=False, duplicate=True)
     audit("delivered sender=%s recipient=%s key=%s" % (agent, recipient, _clean(key)))
     return _reply(200, delivered=True, duplicate=False)
