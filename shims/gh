@@ -1430,17 +1430,39 @@ def canonical_pr_merge(args):
     return ["pr", "merge"] + [a for i, a in enumerate(args) if i not in (words[0][0], merge[0])]
 
 
-def api_path(arg):
-    """THE one normaliser of a `gh api` path, as GitHub reads it: percent-decoded (until stable), cut at a query string or fragment, repeated slashes
-    collapsed, no leading or trailing slash. Case is folded by the matchers (re.I), never here, so a repository keeps its spelling."""
+def resolve_dots(parts):
+    """(segments, climbed): `.` dropped and `..` taking the segment before it away, as GitHub resolves a path; `climbed` is True when a `..` would go above the first
+    segment (`repos`): such a path is never tied to a repository."""
+    out, climbed = [], False
+    for part in parts:
+        if part == ".":
+            continue
+        if part == "..":
+            if len(out) <= 1:
+                climbed = True
+            else:
+                out.pop()
+            continue
+        out.append(part)
+    return out, climbed
+
+
+def api_path_parts(arg):
+    """THE one normaliser of a `gh api` path, as GitHub reads it: percent-decoded (until stable), cut at a query string or fragment, repeated slashes collapsed, no leading
+    or trailing slash, `.` and `..` segments resolved. Returns (path, climbed). Case is folded by the matchers (re.I), never here, so a repository keeps its spelling."""
     path = arg
     for _ in range(3):
         decoded = urllib.parse.unquote(path)
         if decoded == path:
             break
         path = decoded
-    path = re.split(r"[?#]", path, 1)[0]
-    return re.sub(r"/{2,}", "/", path).strip("/")
+    path = re.sub(r"/{2,}", "/", re.split(r"[?#]", path, 1)[0]).strip("/")
+    parts, climbed = resolve_dots(path.split("/"))
+    return "/".join(parts), climbed
+
+
+def api_path(arg):
+    return api_path_parts(arg)[0]
 
 
 def merge_route(args):
@@ -1475,7 +1497,9 @@ def merge_route(args):
     for arg in rest:
         if arg.startswith("-"):
             continue
-        path = api_path(arg)
+        path, climbed = api_path_parts(arg)
+        if climbed and re.search(r"pulls/[^/]*/merge", urllib.parse.unquote(arg), re.I):
+            return ("api-unknown", "the path of that merge call climbs above its repository")
         found = API_MERGE_RE.match(path)
         if found and not re.search(r"[{}$<>:]", found.group(1)):
             return ("api", (found.group(1), int(found.group(2))))

@@ -295,6 +295,7 @@
     "note": "top_tier_outside_floor lists the top tier paths that are deliberately not in the floor globs (the floor excludes agent definitions, which are captain pull requests); a test checks that every other top tier path is inside the floor. bin/fleet-switchboard selects accounts and mints tokens but is not a top tier path (it would hold nearly every change): a change there to credentials or identity must be rated with that class by the independent review.",
     "never_carried_paths": [
       "bin/chat_clear.py",
+      "bin/merge_gate.py",
       "bin/clear_carry.py",
       "bin/delegated_clear.py",
       "bin/impact_floor.py",

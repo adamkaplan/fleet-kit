@@ -76193,6 +76193,11 @@ class TestGhShimMergeGate(Base):
             if base[i] == "/":
                 out["double slash %d" % i] = base[:i] + "//" + base[i + 1:]
         out["double encoded"] = base.replace("/", "%252f")
+        out.update({"dot segment": "repos/acme/app/pulls/12/../12/merge", "dot once": "repos/acme/app/pulls/./12/merge", "dot at the end": base + "/.",
+                    "dot-dot elsewhere": "repos/x/../acme/app/pulls/12/merge", "encoded dots": "repos/acme/app/pulls/12/%2e%2e/12/merge",
+                    "encoded dot": "repos/acme/app/pulls/%2e/12/merge", "double-encoded dots": "repos/acme/app/pulls/12/%252e%252e/12/merge",
+                    "dots, double slash and case": "REPOS/acme//app/PULLS/12/../12//MERGE", "climbs above repos": "repos/../repos/acme/app/pulls/12/merge",
+                    "climbs from the start": "../repos/acme/app/pulls/12/merge", "climbs far": "repos/acme/app/pulls/12/../../../../x/pulls/1/merge"})
         return out
 
     API_SPELLINGS = ()   # kept for the mutant test below, filled from the generated matrix
@@ -76224,6 +76229,8 @@ class TestGhShimMergeGate(Base):
                  ("a path is matched case-sensitively", [('/merge$", re.I)', '/merge$")'), ('(/|$)", path, re.I)', '(/|$)", path)')], None),
                  ("repeated slashes are not collapsed", 're.sub(r"/{2,}", "/", ', "("),
                  ("a gh placeholder is read as a repository", r'[{}$<>:]', r'[{}$<>]'),
+                 ("dot segments are not resolved", 'parts, climbed = resolve_dots(path.split("/"))', 'parts, climbed = path.split("/"), False'),
+                 ("a path that climbs above its repository is not refused", 'if climbed and re.search(', 'if False and re.search('),
                  ("a merge path is only seen at the end of the argument", '(^|/)pulls/[^/]*/merge(/|$)', '(^|/)pulls/[^/]*/merge$'))
         for label, old, new, *count in cases:
             with self.subTest(mutant=label):
