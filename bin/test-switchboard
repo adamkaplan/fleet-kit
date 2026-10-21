@@ -77706,6 +77706,177 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
                 self.assertIn(str(path.relative_to(BIN.parent)), DERIVED_VIEWS, "%s reads an old agent list: read the registry or list it as derived" % path)
 
 
+class TestPaneExit(Base):
+    """Why a pane ended (#1030): herdr's log is read read-only and bounded, and each exit becomes ONE `fleetpane.exit` audit line."""
+
+    NOW = 1_800_000_000.0
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform",))
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.engine = self.world.engine
+        self.engine.state_dir = self.world.state
+        self.engine.config = dict(self.engine.config, herdr_log=str(self.home / "herdr-server.log"))
+        self.log = self.home / "herdr-server.log"
+        self.jobs = self.home / "jobs"
+        self.jobs.mkdir(mode=0o700)
+        patcher = mock.patch.dict(os.environ, {sb.JOBS_DIR_ENV: str(self.jobs)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def stamp(offset):
+        return datetime.datetime.fromtimestamp(TestPaneExit.NOW + offset, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+
+    def exit_line(self, offset, pane, code, signal="None"):
+        return ('%s  INFO herdr::logging: pane child exited event="pane.exit" subsystem="pane" outcome="completed" pane_id=%s '
+                'status="ExitStatus { code: %d, signal: %s }"\n' % (self.stamp(offset), pane, code, signal))
+
+    def hangup_line(self, offset, pane):
+        return "%s  INFO herdr::pane: pane session terminated pane=%s pid=99 signal=Hangup\n" % (self.stamp(offset), pane)
+
+    def write_log(self, *lines):
+        self.log.write_text("".join(lines))
+
+    def run_pass(self, offset=10):
+        sb.pane_exit_pass(self.engine, self.NOW + offset)
+
+    def audit(self, event):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def three_kinds(self):
+        self.write_log(self.exit_line(-300, 11, 0), self.exit_line(-200, 12, 130), self.hangup_line(-199.9, 12), self.exit_line(-100, 13, 1), self.hangup_line(-99.5, 13))
+
+    def test_each_exit_is_one_line_with_pane_code_signal_and_herdr_time_once_over_two_passes(self):
+        self.three_kinds()
+        self.run_pass()
+        self.run_pass(20)
+        lines = self.audit("fleetpane.exit")
+        self.assertEqual(len(lines), 3)
+        by_pane = {e["detail"]["pane"]: e["detail"] for e in lines}
+        self.assertEqual((by_pane["11"]["code"], by_pane["11"]["signal"]), (0, None))
+        self.assertEqual((by_pane["12"]["code"], by_pane["12"]["signal"]), (130, "Hangup"))
+        self.assertEqual(by_pane["13"]["signal"], "Hangup")
+        self.assertEqual(by_pane["12"]["herdr_time"], self.stamp(-200))
+        self.assertEqual(self.audit("fleetpane.exit_burst"), [])
+
+    def test_a_signal_in_the_exit_status_is_kept(self):
+        self.write_log(self.exit_line(-5, 14, 0, 'Some("Terminated")'))
+        self.run_pass()
+        self.assertEqual(self.audit("fleetpane.exit")[0]["detail"]["signal"], "Terminated")
+
+    def test_the_agent_name_is_given_when_the_registry_knows_the_pane(self):
+        self.engine.discover(self.world.clock.now())
+        sb.pane_health_pass(self.engine, self.world.clock.now())
+        pane = self.world.panes["platform"]
+        number = pane.split(":p")[-1]
+        self.write_log(self.exit_line(-5, number, 130), self.exit_line(-4, "77777", 0))
+        self.run_pass()
+        agents = {e["detail"]["pane"]: e["detail"]["agent"] for e in self.audit("fleetpane.exit")}
+        self.assertEqual(agents, {number: "platform", "77777": None})
+
+    def test_a_pane_closed_by_a_fleet_command_is_marked_asked_with_who_asked_and_another_is_not(self):
+        entry = {"ts": self.stamp(-8), "actor": "cos", "event": "fleetpane.closed", "subject": "platform", "detail": {"pane": "w1:p21", "by": "cos"}}
+        self.world.audit_path.write_text(json.dumps(entry) + "\n")
+        self.write_log(self.exit_line(-5, 21, 0), self.exit_line(-4, 22, 0))
+        self.run_pass()
+        got = {e["detail"]["pane"]: e["detail"] for e in self.audit("fleetpane.exit")}
+        self.assertEqual((got["21"]["asked"], got["21"]["by"]), (True, "cos"))
+        self.assertEqual((got["22"]["asked"], got["22"]["by"]), (False, None))
+
+    def test_the_line_lists_the_heavy_runs_and_jobs_active_at_that_second_with_their_ages_and_not_one_that_ended(self):
+        at = self.NOW - 5
+        slots = sb.load_heavy_slots()
+        held = [{"name": "suite", "since": at - 40}, {"name": "later", "since": at + 50}]
+        record = {"name": "build", "pid": os.getpid(), "started": at - 90}
+        (self.jobs / "build").mkdir(mode=0o700)
+        (self.jobs / "build" / "job.json").write_text(json.dumps(record))
+        (self.jobs / "done").mkdir(mode=0o700)
+        (self.jobs / "done" / "job.json").write_text(json.dumps({"name": "done", "pid": os.getpid(), "started": at - 90}))
+        (self.jobs / "done" / "exit").write_text("0\n")
+        self.write_log(self.exit_line(-5, 31, 130))
+        with mock.patch.object(slots, "_held_records", return_value=held):
+            self.run_pass()
+        active = self.audit("fleetpane.exit")[0]["detail"]["active"]
+        self.assertEqual(sorted((a["kind"], a["name"], a["age"]) for a in active), [("heavy", "suite", 40), ("job", "build", 90)])
+
+    def test_three_panes_ending_within_two_seconds_make_one_summary_and_one_notice_and_two_far_apart_make_none(self):
+        self.engine.discover(self.world.clock.now())
+        self.assertEqual(self.engine.discovery.problems, [])
+        self.write_log(self.exit_line(-20, 41, 130), self.exit_line(-19, 42, 130), self.exit_line(-18, 43, 130), self.exit_line(-300, 44, 0), self.exit_line(-240, 45, 0))
+        self.run_pass()
+        self.run_pass(30)
+        bursts = self.audit("fleetpane.exit_burst")
+        self.assertEqual(len(bursts), 1)
+        self.assertEqual(bursts[0]["detail"]["panes"], ["41", "42", "43"])
+        self.assertEqual(len(self.audit("fleetpane.exit")), 5)
+        source = sb.PaneExitFacts()
+        source.bind(self.engine)
+        facts = source()
+        self.assertEqual([(f.recipient, f.kind) for f in facts], [("cos", "pane")])
+        self.assertIn("3 panes ended", facts[0].summary)
+        self.assertEqual(len({f.key for f in source()}), 1)
+
+    def test_a_missing_or_rotated_or_unreadable_log_gives_one_note_and_the_pass_goes_on(self):
+        self.run_pass()
+        self.run_pass(20)
+        self.assertEqual(len(self.audit("fleetpane.exit_note")), 1)
+        self.write_log(self.exit_line(-5, 51, 0), "x" * 2000)
+        self.run_pass(30)
+        self.write_log(self.exit_line(-4, 52, 0))   # shorter than before: rotated
+        self.run_pass(40)
+        self.assertEqual([e["detail"]["note"].split(" was ")[-1][:7] for e in self.audit("fleetpane.exit_note")][1:], ["rotated"])
+        self.assertEqual(len(self.audit("fleetpane.exit")), 2)
+        self.log.chmod(0)
+        try:
+            self.run_pass(50)
+        finally:
+            self.log.chmod(0o600)
+        self.assertIn("not read", self.audit("fleetpane.exit_note")[-1]["detail"]["note"])
+
+    def test_a_large_log_is_read_only_in_its_tail_and_is_never_changed(self):
+        filler = ("%s  INFO herdr::logging: filler\n" % self.stamp(-9000)) * 100000
+        self.write_log(filler, self.exit_line(-5, 61, 130))
+        before = (self.log.stat().st_size, self.log.stat().st_mtime_ns)
+        self.assertGreater(before[0], 2 * sb.PANE_EXIT_TAIL_BYTES)
+        reads = []
+        real = open
+
+        def spy(path, mode="r", *a, **k):
+            handle = real(path, mode, *a, **k)
+            if str(path) == str(self.log):
+                reads.append(mode)
+                inner = handle.read
+                handle.read = lambda n=-1: (reads.append(n), inner(n))[1]
+            return handle
+        with mock.patch("builtins.open", spy):
+            self.run_pass()
+        self.assertEqual([m for m in reads if isinstance(m, str)], ["rb"])
+        self.assertTrue(all(n <= sb.PANE_EXIT_TAIL_BYTES for n in reads if isinstance(n, int)))
+        self.assertEqual((self.log.stat().st_size, self.log.stat().st_mtime_ns), before)
+        self.assertEqual([e["detail"]["pane"] for e in self.audit("fleetpane.exit")], ["61"])
+
+    def test_an_exit_older_than_an_hour_at_the_first_look_is_not_written(self):
+        self.write_log(self.exit_line(-7200, 71, 0))
+        self.run_pass()
+        self.assertEqual(self.audit("fleetpane.exit"), [])
+
+    def test_the_documentation_names_the_cause_first_the_records_and_where_to_look(self):
+        text = (Path(SWITCHBOARD).resolve().parent.parent / "docs" / "switchboard.md").read_text()
+        start = text.index("### Why a pane ended")
+        section = text[start:text.index("\n### ", start + 5)]
+        self.assertLess(section.index("The cause, first"), section.index("Records that existed"))
+        self.assertLess(section.index("Records that existed"), section.index("Records that did not exist"))
+        existed, missing = section.split("Records that existed")[1].split("Records that did not exist")
+        self.assertIn("fleetpane.dead", existed + missing)
+        self.assertIn("05:26:07Z", existed)
+        self.assertIn("05:26:07Z", missing)
+        self.assertIn("fleetpane.exit", section)
+        self.assertIn("herdr-server.log", section)
+        self.assertIn("slot records", section)
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
