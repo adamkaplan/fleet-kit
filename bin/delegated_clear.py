@@ -124,6 +124,40 @@ def order_text(orders, number):
     return None
 
 
+NO_AGENT_BLOCK = ("no agent block: the impact rating at this head carries no verdict block of the reviewer-impact agent for this head that agrees with its score (typed flags, a block for another head or a malformed one), "
+                  "so it clears nothing by score; record the agent's block with `review record --reviewer impact --block <file>`")   # #901: the ONE line the clear's refusal, `impact floor` and `gates` all say
+BLOCK_HASH_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def counts_by_block(entry):
+    """True when the record carries the block the agent returned: a sha256 of it (`block_sha256`), and its recorded severity and probability are exactly the block's own lines (`block_impact_severity`,
+    `block_impact_probability`, kept by `review record --block`). A flags-only record (`block_sha256` is `none`), a record made before blocks were kept, a malformed hash or a typed score that disagrees with the block does
+    not count. A mistake-guard: the hash proves a block was given, not that the agent produced it. #901."""
+    if not isinstance(entry, dict):
+        return False
+    digest = entry.get("block_sha256")
+    if not isinstance(digest, str) or not BLOCK_HASH_RE.fullmatch(digest):
+        return False
+    return (isinstance(entry.get("impact_severity"), str) and entry.get("impact_severity") == entry.get("block_impact_severity")
+            and isinstance(entry.get("impact_probability"), str) and entry.get("impact_probability") == entry.get("block_impact_probability"))
+
+
+INCOMPLETE_VERDICT = ("the independent impact rating at this head is an `incomplete` verdict: the rater said it did not read the whole change, so it clears nothing by score; "
+                      "re-run the rating and record a complete one")   # #901 clause 8: one line, said by the clear's refusal, `impact floor` and `gates`
+
+
+HIGHER_UNCOUNTED = ("a rating at this head that does not count by score (no agent block, or an incomplete verdict) is higher than the score that counts, so the clear is refused: "
+                    "re-record that rating with the agent's complete block, or it stays the owner's")   # #901: an uncounted rating is never silently dropped when it is the higher one
+
+
+def uncounted_line(entries):
+    """The one line saying why records that exist do not count by score (`NO_AGENT_BLOCK` or `INCOMPLETE_VERDICT`), or None when one counts. `entries` are the independent reviewer's records at the head, already filtered by role. The machine reads only the verdict WORD, never prose."""
+    mine = [e for e in entries if isinstance(e, dict)]
+    if not mine or any(counts_by_block(e) and e.get("verdict") != "incomplete" for e in mine):
+        return None
+    return INCOMPLETE_VERDICT if any(counts_by_block(e) and e.get("verdict") == "incomplete" for e in mine) else NO_AGENT_BLOCK
+
+
 def judge(block, cells, entries, report, threshold):
     """{"level": the score or None, "reasons": [why refused]} (no reasons: the score is at or below `threshold`, so the clear may go on). `block` is the matrix's score block, `cells` its `cells` (severity ->
     probability -> {"level"}), `entries` the ledger's entries (the caller filtered nothing: this checks kind, reviewer, pr, EXACT head and the recorded role again), `report` the owner-hold report (`pr`, `head`,
@@ -134,12 +168,24 @@ def judge(block, cells, entries, report, threshold):
     ladder = block["ladder"]
     if threshold not in block["delegable_levels"] or threshold not in ladder:
         return {"level": None, "reasons": ["the threshold %r is unknown: refused" % (threshold,)]}
-    counted, bad = [], 0
+    counted, bad, unblocked, incomplete, uncounted_idx = [], 0, 0, 0, []
     for entry in entries if isinstance(entries, list) else []:
         if not isinstance(entry, dict) or entry.get("kind") != "review_record" or entry.get("reviewer") != "impact" or entry.get("pr") != report.get("pr") or entry.get("head") != report.get("head") or not report.get("head"):
             continue
         if entry.get("by_role") not in block["rating_roles"]:
             continue   # the pull request's author, the Chief of Staff, any other role (or a record made before roles were kept) is not the independent rating
+        if not counts_by_block(entry) or entry.get("verdict") == "incomplete":
+            for sev_key, prob_key in (("impact_severity", "impact_probability"), ("block_impact_severity", "block_impact_probability")):   # the typed score AND the block's own lines: the higher of the two is remembered
+                sev, prob = entry.get(sev_key), entry.get(prob_key)
+                seen = ((cells.get(sev) or {}).get(prob) or {}).get("level") if isinstance(sev, str) and isinstance(prob, str) else None
+                if seen in ladder:
+                    uncounted_idx.append(ladder.index(seen))   # remembered: a higher uncounted rating refuses (below)
+        if not counts_by_block(entry):
+            unblocked += 1   # #901: only the agent's own block counts by score. A record without one is IGNORED on purpose (it counts for nothing, as every record made before blocks were kept), so a valid blocked record beside it still clears; the guard is `counts_by_block`, a mistake-guard, and a blocked record whose score the matrix does not know still refuses (`bad`)
+            continue
+        if entry.get("verdict") == "incomplete":
+            incomplete += 1   # #901 clause 8: a rater that read only part of the change says `incomplete`: it counts for nothing
+            continue
         level = ((cells.get(entry.get("impact_severity")) or {}).get(entry.get("impact_probability")) or {}).get("level") if isinstance(entry.get("impact_severity"), str) and isinstance(entry.get("impact_probability"), str) else None
         if level not in ladder:
             bad += 1
@@ -147,11 +193,15 @@ def judge(block, cells, entries, report, threshold):
             counted.append((ladder.index(level), level, entry))
     if bad:
         return {"level": None, "reasons": ["a rating at this head has no severity and probability the matrix knows: the score is unknown, refused"]}
+    if not counted and unblocked:
+        return {"level": None, "reasons": [NO_AGENT_BLOCK]}
+    if not counted and incomplete:
+        return {"level": None, "reasons": [INCOMPLETE_VERDICT]}
     if not counted:
         return {"level": None, "reasons": ["there is no independent impact rating at this head: the score is unknown, refused"]}
     top = max(i for i, _, _ in counted)
     level = ladder[top]
-    reasons = []
+    reasons = [HIGHER_UNCOUNTED] if uncounted_idx and max(uncounted_idx) > top else []
     hits = report.get("top_tier_hits") or {}
     for rule_id, cls in sorted(block["floor"]["rules"].items()):
         if not hits.get(cls):
