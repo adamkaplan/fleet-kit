@@ -627,5 +627,44 @@ class TheDocs(unittest.TestCase):
         self.assertEqual(missing, [])
 
 
+class TheOsOwnSymlinkedParent(unittest.TestCase):
+    """A root-owned link the OS provides (macOS /var -> private/var) in the parent chain is fine; a link the user owns is still refused."""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.join(ROOT, "bin"))
+        import path_walk
+        self.walk = path_walk
+
+    def test_a_root_owned_link_in_the_parents_is_followed(self):
+        if not (os.path.islink("/var") and os.lstat("/var").st_uid == 0):
+            self.skipTest("no root-owned link at /var on this system")
+        import tempfile
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as d:
+            os.mkdir(os.path.join(d, "tokens"), 0o700)
+            self.assertIsNone(self.walk.parents_problem(os.path.join(d, "tokens", "token")))
+
+    def test_a_link_owned_by_the_user_is_refused(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            real = os.path.join(d, "real")
+            os.makedirs(os.path.join(real, "tokens"), 0o700)
+            os.symlink(real, os.path.join(d, "link"))
+            self.assertIn("symlink", self.walk.parents_problem(os.path.join(d, "link", "tokens", "token")) or "")
+
+    def test_a_mutant_that_follows_every_link_is_caught(self):
+        import tempfile
+        with open(self.walk.__file__) as f:
+            src = f.read()
+        mutant = src.replace("if found.st_uid != 0:", "if False:")
+        self.assertNotEqual(src, mutant)
+        ns = {"__name__": "mutant"}
+        exec(compile(mutant, "mutant", "exec"), ns)
+        with tempfile.TemporaryDirectory() as d:
+            real = os.path.join(d, "real")
+            os.makedirs(os.path.join(real, "tokens"), 0o700)
+            os.symlink(real, os.path.join(d, "link"))
+            self.assertIsNone(ns["parents_problem"](os.path.join(d, "link", "tokens", "token")))   # the mutant accepts it: the test above would fail
+
+
 if __name__ == "__main__":
     unittest.main()
