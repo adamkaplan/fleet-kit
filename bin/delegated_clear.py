@@ -166,9 +166,35 @@ def judge(block, cells, entries, report, threshold):
     return {"level": level, "reasons": reasons}
 
 
-def daemon_roots(rule):
-    """The daemon file's roots of the clear closure: `closure_roots` (what the clear command runs) and `rating_roots` (the code that WRITES and PARSES the independent rating the score is read from, #835): a change to a definition reachable from any of them is the owner's own clear."""
-    return sorted(set(rule["closure_roots"]) | set(rule.get("rating_roots") or []))
+_ROOTS_CACHE = {}
+
+
+def _tree_of(path):
+    """The parsed file at `path`, kept while its size and time are the same (the daemon file is 30,000 lines)."""
+    stat = Path(path).stat()   # an unreadable or unparsable install file raises here: every caller refuses or holds on it (`delegated_clear_map` returns None, `clear_closure_hold` holds), tested
+    key = (str(path), stat.st_size, stat.st_mtime_ns)
+    if key not in _ROOTS_CACHE:
+        _ROOTS_CACHE.clear()
+        _ROOTS_CACHE[key] = ast.parse(Path(path).read_text())
+    return _ROOTS_CACHE[key]
+
+
+def moved_roots(daemon_tree, hold_tree):
+    """The daemon names the clear's own module reads (#940): the moved code runs with the daemon's globals, so every name its functions read that the daemon defines or binds is a root. Derived from the two
+    files, never a list. (The loaders the daemon generates by a module-level loop are followed by `closure`, wherever a generated name is read.)"""
+    defs, binds = _index(daemon_tree)
+    read = {x.id for f in hold_tree.body if isinstance(f, ast.FunctionDef) for x in ast.walk(f) if isinstance(x, ast.Name)}
+    roots = read & (set(defs) | set(binds))
+    return roots
+
+
+def daemon_roots(rule, daemon_tree=None, hold_tree=None):
+    """The daemon file's roots of the clear closure (#940): the names the clear's own module reads (`moved_roots`, DERIVED from the running install's two files: the matrix holds no list of them) and `rating_roots`
+    (the code that WRITES and PARSES the independent rating the score is read from, #835): a change to a daemon definition reachable from either is refused to the delegated clear and held for the owner."""
+    here = Path(__file__).resolve().parent
+    daemon_tree = daemon_tree if daemon_tree is not None else _tree_of(here / rule.get("daemon_file", "bin/fleet-switchboard").split("/")[-1])
+    hold_tree = hold_tree if hold_tree is not None else _tree_of(here / "impact_hold.py")
+    return sorted(moved_roots(daemon_tree, hold_tree) | set(rule.get("rating_roots") or []))
 
 
 def refusals(rule, report, files, matches=None, closure=None, scored=None):
@@ -297,14 +323,32 @@ def closure(tree, roots, dynamic_actions=()):
     path, #835): the literal `"cmd_"` (the dispatcher builds `"cmd_" + action`) is an edge to `cmd_<action>` and the name `REGISTRAR_NAME_RE` (the parser collects every `add_<x>_parsers`) is an edge to
     `add_<action>_parsers`. Any OTHER dynamic edge (getattr, globals(), importlib, eval...) is a stated limit: a test lists the ones on the path from `main`."""
     defs, binds = _index(tree)
+    generated, generator = set(), set()   # the loaders the daemon WRITES into its globals by a module-level loop over a table: a read of one of them is a read of that statement
+    for n in tree.body:
+        if isinstance(n, ast.Assign) and any(getattr(x, "id", "") == "HELPER_MODULES" for x in n.targets):
+            try:
+                generated = set(ast.literal_eval(n.value))
+            except (ValueError, SyntaxError):
+                generated = set()
+        if isinstance(n, ast.For) and any(isinstance(x, ast.Call) and getattr(x.func, "id", "") == "globals" for x in ast.walk(n)):
+            generator |= {x.id for x in ast.walk(n) if isinstance(x, ast.Name)} & (set(defs) | set(binds))
     roots = list(defs) if "*" in roots else list(roots)   # `*`: every function of the module (a module the clear runs and no recording says which)
     seen, globals_, refs, members, todo = set(), set(), set(), {}, list(roots)
 
+    spelled_out, spelled_seen = [], [0]
+
     def walk(nodes):
         while nodes:
-            for x in ast.walk(nodes.pop()):
+            unit = nodes.pop()
+            for x in ast.walk(unit):
                 if isinstance(x, ast.Name):
                     refs.add(x.id)
+                    if x.id in generated:
+                        todo.extend(generator)   # the generated loader's table and its generator are read
+                        for g in generator:
+                            if g in binds and g not in globals_:
+                                globals_.add(g)
+                                nodes.extend(binds[g])
                     if x.id in defs:
                         todo.append(x.id)
                     if x.id in binds and x.id not in globals_:   # a name that is a def AND is rebound (`f = wrap(f)`): both are followed
@@ -312,6 +356,10 @@ def closure(tree, roots, dynamic_actions=()):
                         nodes.extend(binds[x.id])
                 elif isinstance(x, ast.Attribute):
                     refs.add(x.attr)
+                elif isinstance(x, ast.Call) and getattr(x.func, "id", "") in ("getattr", "setattr", "hasattr") and len(x.args) > 1 and isinstance(x.args[1], ast.Constant) and isinstance(x.args[1].value, str):
+                    refs.add(x.args[1].value)   # an attribute named by a literal: that name is a reference
+                elif isinstance(x, ast.Call) and getattr(x.func, "id", "") in ("getattr", "setattr", "hasattr") and not (len(x.args) > 1 and isinstance(x.args[1], ast.Constant)):
+                    spelled_out.extend(c.value for c in ast.walk(unit) if isinstance(c, ast.Constant) and isinstance(c.value, str) and c.value.isidentifier())   # an attribute named at run time: every name the function spells out as a string is a candidate (#940)
                 elif isinstance(x, ast.Constant) and x.value == "cmd_":
                     todo.extend("cmd_" + a.replace("-", "_") for a in dynamic_actions)
                 if isinstance(x, ast.Name) and x.id == "REGISTRAR_NAME_RE":
@@ -337,6 +385,10 @@ def closure(tree, roots, dynamic_actions=()):
                     members[name].add(method.name)
                     walk([method])
                     grew = True
+        if len(spelled_out) != spelled_seen[0]:   # a name built at run time can be any name that function spells out: each is a reference by that name (merged once per new spelling, so the walk always ends)
+            spelled_seen[0] = len(spelled_out)
+            refs |= set(spelled_out)
+            grew = True
         if not grew and not todo:
             return seen, globals_, refs, members
 
@@ -367,7 +419,7 @@ def changed_lines(patch):
     return old, new
 
 
-def closure_refusals(base_src, head_src, patch, roots, entry_points, module_level=False, dynamic_actions=()):
+def closure_refusals(base_src, head_src, patch, roots, entry_points, module_level=False, dynamic_actions=(), base_tree=None, head_tree=None):
     """[reasons] a change to the daemon file touches the clear closure. `base_src` and `head_src` are the file before and after, `patch` the diff of it, `roots` the clear command's entry points and
     `entry_points` the names a NEW caller of is refused. The closure is computed on BOTH files and united (a pull request that ADDS a call into it counts). The changed lines are mapped to the
     top-level definition they are in by the ast of the file they belong to (removed lines against the base, added lines against the head). Refused: a closure definition changed; a module-level
@@ -376,7 +428,7 @@ def closure_refusals(base_src, head_src, patch, roots, entry_points, module_leve
     if lines is None:
         return ["the patch of the daemon file cannot be read: refused"]
     try:
-        base, head = ast.parse(base_src), ast.parse(head_src)
+        base, head = base_tree if base_tree is not None else ast.parse(base_src), head_tree if head_tree is not None else ast.parse(head_src)
     except (SyntaxError, ValueError):
         return ["the daemon file does not parse before or after the change: refused"]
     base_closure, head_closure = closure(base, roots, dynamic_actions), closure(head, roots, dynamic_actions)

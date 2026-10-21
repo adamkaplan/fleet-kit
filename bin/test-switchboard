@@ -14,6 +14,7 @@ is non-zero on failure.
 """
 import argparse
 import ast
+import functools
 import traceback
 import base64
 import calendar
@@ -33769,7 +33770,7 @@ class TestImpactFloorPure(unittest.TestCase):
         keys = set(re.findall(r"`([a-z_]+)`", m))
         block = self.matrix["owner_hold"]["delegated_clear"]
         self.assertTrue({"never_path_classes", "top_tier_review_classes", "clear_code_paths", "new_file_globs", "closure_files",
-                         "module_roots", "closure_roots", "clear_entry_points", "score", "max_level"} <= keys)
+                         "module_roots", "clear_entry_points", "score", "max_level"} <= keys)
         for k in keys - {"max_level"}:                      # max_level is the owner's configuration key, not a matrix key
             self.assertIn(k, block, k)
         self.assertEqual((REPO / "docs/switchboard.md").read_text().count(m), 1)
@@ -36064,8 +36065,8 @@ class TestImpactHold(LedgerBase):
 
     def files_of_pr(self, *paths, patch="@@ -1 +1 @@\n-a\n+b", status="modified", mapped=None):
         self.mapped = [] if mapped is None else mapped
-        patcher = mock.patch.object(sb, "delegated_clear_map", lambda engine, runner, repo, item, base_sha, rule: (self.map_bases.append(base_sha), self.mapped)[1])
-        self.map_bases = []
+        patcher = mock.patch.object(sb, "delegated_clear_map", lambda engine, runner, repo, item, base_sha, rule: (self.map_bases.append(base_sha), self.map_rules.append(rule), self.mapped)[2])
+        self.map_bases, self.map_rules = [], []
         patcher.start()
         self.addCleanup(patcher.stop)
         listing = [{"filename": p, "patch": patch, "status": status, "sha": "e" * 40} for p in paths]
@@ -36091,6 +36092,395 @@ class TestImpactHold(LedgerBase):
         self.assertIn("may clear held pull requests", detail["order"])
         self.assertIn("nothing touches credentials", detail["reason"])
         self.assertNotEqual(detail["by"], "owner")
+
+    # ---- #940 slice 1: ONE closure, derived from the clear's real call graph, read by the refusal and the owner hold
+
+    def closure_sets(self):
+        import ast
+        dc = sb.load_module("delegated_clear")
+        rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
+        tree = ast.parse(self.real_source())
+        return dc, rule, tree, dc.closure(tree, dc.daemon_roots(rule), rule["dynamic_actions"])
+
+    SYNTHETIC = """
+HELPER = 1
+CONST = HELPER + 1
+def entry():
+    helper()
+    obj = Box()
+    obj.used()
+    return CONST
+def helper():
+    return 1
+class Box:
+    def __init__(self):
+        pass
+    def used(self):
+        return 1
+    def unused_one(self):
+        return 2
+    def unused_two(self):
+        return 3
+    def unused_three(self):
+        return 4
+def orphan():
+    return 5
+"""
+
+    def test_the_derivation_follows_what_is_added_to_what_the_clear_calls_and_not_what_it_never_calls(self):
+        import ast
+        dc = sb.load_module("delegated_clear")
+        defs, bound, refs, members = dc.closure(ast.parse(self.SYNTHETIC), ["entry"])
+        self.assertEqual((sorted(defs), sorted(bound), sorted(members["Box"])), (["Box", "entry", "helper"], ["CONST", "HELPER"], ["__init__", "used"]))
+        self.assertTrue({"orphan"}.isdisjoint(defs) and {"unused_one", "unused_two", "unused_three"}.isdisjoint(members["Box"]), "a function nothing calls and methods nothing calls are outside")
+        added = {"a function": ("    helper()\n", "    helper()\n    added_function()\n", "\ndef added_function():\n    return 6\n"),
+                 "a binding": ("    return CONST\n", "    return CONST + ADDED\n", "\nADDED = 7\n"),
+                 "an import-time statement": ("    return CONST\n", "    return CONST + os.sep\n", "\nimport os\n"),
+                 "a method": ("    obj.used()\n", "    obj.used()\n    obj.added_method()\n", "")}
+        for label, (old, new, extra) in added.items():
+            with self.subTest(label):
+                source = self.SYNTHETIC.replace(old, new, 1) + extra
+                if label == "a method":
+                    source = source.replace("    def used(self):", "    def added_method(self):\n        return 8\n    def used(self):", 1)
+                d, b, r, m = dc.closure(ast.parse(source), ["entry"])
+                found = {"a function": "added_function" in d, "a binding": "ADDED" in b, "an import-time statement": "os" in b, "a method": "added_method" in m["Box"]}[label]
+                self.assertTrue(found, "%s added to what the clear calls is in the closure with no second edit" % label)
+
+    UNRESOLVED = """
+def entry(cb):
+    one = make()
+    one.alpha()
+    cb()
+    names = ("beta", "gamma")
+    getattr(one, names[pick()])()
+    return 0
+def make():
+    return A() if B() else B()
+def pick():
+    return 1
+def passed():
+    return 1
+def run():
+    entry(passed)
+class A:
+    def alpha(self):
+        return 1
+    def beta(self):
+        return 2
+    def gamma(self):
+        return 3
+    def delta(self):
+        return 4
+class B:
+    def alpha(self):
+        return 5
+"""
+
+    def test_a_call_the_derivation_cannot_resolve_resolves_to_every_candidate_of_that_name(self):
+        import ast
+        dc = sb.load_module("delegated_clear")
+        defs, bound, refs, members = dc.closure(ast.parse(self.UNRESOLVED), ["entry", "run"])
+        self.assertEqual(sorted(members["A"]) + sorted(members["B"]), ["alpha", "beta", "gamma", "alpha"], "a method called on a receiver of unknown class: every class's method of that name; a getattr with a computed name: every name the function spells out")
+        self.assertIn("passed", defs, "a function passed as a callback to a parameter is a name the closure reads")
+        self.assertNotIn("delta", members["A"], "a name nothing spells out stays outside")
+
+    def test_the_spelled_out_names_of_a_computed_attribute_are_candidates_only_where_the_name_is_computed(self):
+        """The mutant the review named (#995): the merge of the spelled-out names into the references, and the trigger that makes it happen. A computed getattr, setattr or hasattr makes every identifier string of ITS OWN function a candidate method name; a literal name, or no such call, makes none."""
+        import ast
+        dc = sb.load_module("delegated_clear")
+        template = """
+def entry(n):
+    box = Box()
+    %s
+    return ("alpha", "beta")
+class Box:
+    def alpha(self):
+        return 1
+    def beta(self):
+        return 2
+    def gamma(self):
+        return 3
+"""
+        cases = {"a computed getattr": ("getattr(box, n)()", ["alpha", "beta"]), "a computed hasattr": ("hasattr(box, n)", ["alpha", "beta"]), "a computed setattr": ("setattr(box, n, 1)", ["alpha", "beta"]),
+                 "a literal name (no computed one)": ("getattr(box, 'gamma')()", ["gamma"]), "no attribute call at all": ("box.alpha()", ["alpha"])}
+        for label, (call, expected) in cases.items():
+            with self.subTest(label):
+                members = dc.closure(ast.parse(template % call), ["entry"])[3]["Box"]
+                self.assertEqual(sorted(m for m in members if m in ("alpha", "beta", "gamma")), expected, label)
+        with self.subTest("the mutant: no merge of the spelled-out names"):
+            source = open(BIN / "delegated_clear.py").read()
+            mutant_source = source.replace("        if len(spelled_out) != spelled_seen[0]:", "        if False and len(spelled_out) != spelled_seen[0]:", 1)
+            self.assertNotEqual(mutant_source, source)
+            namespace = {"__name__": "mutant_dc", "__file__": str(BIN / "delegated_clear.py")}
+            exec(compile(mutant_source, "mutant_delegated_clear", "exec"), namespace)
+            members = namespace["closure"](ast.parse(template % "getattr(box, n)()"), ["entry"])[3]["Box"]
+            self.assertNotIn("beta", members, "without the merge the computed attribute's candidates are lost: the test above fails on this build")
+
+    @unittest.skipIf(sys.version_info < (3, 11), "the trace names a method by co_qualname, new in Python 3.11")
+    def traced_definitions(self, run, source_path, handlers=()):
+        """The top-level definitions of `source_path` (and the methods of its classes) that executed while `run()` ran, by a profile hook: {(top-level name, method or None)}. With `handlers` (names of daemon
+        functions) the hook is on only while one of them runs: the clear's own code, not the parser the entry point built before it."""
+        import os
+        ran = set()
+        path = os.path.realpath(source_path)
+        def hook(frame, event, arg):
+            if event == "call" and os.path.realpath(frame.f_code.co_filename) == path and not frame.f_code.co_name.startswith("<"):
+                qualified = getattr(frame.f_code, "co_qualname", frame.f_code.co_name).split(".")
+                ran.add((qualified[0], qualified[1] if len(qualified) > 1 else None))
+        patchers = []
+        for name in handlers:
+            original = getattr(sb, name)
+            def wrapper(*a, __original=original, **k):
+                sys.setprofile(hook)
+                try:
+                    return __original(*a, **k)
+                finally:
+                    sys.setprofile(None)
+            functools.update_wrapper(wrapper, original)   # `call_command` reads the handler's signature
+            patchers.append(mock.patch.object(sb, name, wrapper))
+        for patcher in patchers:
+            patcher.start()
+        try:
+            if handlers:
+                run()
+            else:
+                sys.setprofile(hook)
+                try:
+                    run()
+                finally:
+                    sys.setprofile(None)
+        finally:
+            for patcher in patchers:
+                patcher.stop()
+        return ran
+
+    def outside_the_closure(self, ran, sets, callers=()):
+        defs, bound, refs, members = sets
+        out = []
+        for top, method in sorted(ran, key=str):
+            if top in callers:   # the dispatcher of a clear entry point: refused by the entry-point rule (a definition that refers to one), part of what the clear runs
+                continue
+            if top not in defs and top not in bound:
+                out.append(top)
+            elif method is not None and top in members and method not in members[top] and not (method.startswith("__") and method.endswith("__")):
+                out.append("%s.%s" % (top, method))
+        return out
+
+    def test_every_function_the_real_clear_and_record_run_is_in_the_derived_closure_normal_and_hostile_corpus_with_a_mutant_for_a_run_time_only_call(self):
+        """#940, the run-time check of the static derivation: trace the REAL `impact clear` and `review record` (the real `main`) over a normal and a hostile corpus; every daemon-file definition that executed must be in the derived closure."""
+        import ast
+        dc, rule, tree, sets = self.closure_sets()
+        daemon_path = BIN / "fleet-switchboard"
+        self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
+        runs = {"a normal clear": lambda: self.under(), "a clear refused (a repeated clear)": lambda: self.under(order=18)}
+        corpus = {}
+        for label, run in runs.items():
+            corpus[label] = self.traced_definitions(run, daemon_path, ("cmd_impact", "cmd_review"))
+        self.record_pr_setup()
+        corpus["a normal record"] = self.traced_definitions(lambda: self.record_run(self.EXPLICIT), daemon_path, ("cmd_impact", "cmd_review"))
+        corpus["a hostile record (a severity that is not in the matrix)"] = self.traced_definitions(lambda: self.record_run(("--impact-severity", "Huge", "--impact-probability", "Remote")), daemon_path, ("cmd_impact", "cmd_review"))
+        corpus["a record refused (no such reviewer)"] = self.traced_definitions(lambda: self.run_as("rev", "review", "record", self.PR, "--reviewer", "nobody", "--verdict", "approve"), daemon_path, ("cmd_impact", "cmd_review"))
+        entry_callers = {n.name for n in tree.body if isinstance(n, ast.FunctionDef) and set(rule["clear_entry_points"]) & {x.id for x in ast.walk(n) if isinstance(x, ast.Name)}}
+        self.assertIn("cmd_impact", entry_callers, "the dispatcher of `impact clear` refers to its entry point")
+        union = set().union(*corpus.values())
+        self.assertLess(len({u[0] for u in union}), len(sets[0]), "the clear really runs fewer definitions than the static closure holds (it fails toward inclusion)")
+        for label, ran in corpus.items():
+            with self.subTest(label):
+                self.assertTrue(ran, "the trace saw the real run execute daemon code")
+                self.assertEqual(self.outside_the_closure(ran, sets, entry_callers), [], "%s: a function that ran is outside the derived closure" % label)
+        # the mutant: a call whose target exists only at run time (a name built while running) is NOT in a static derivation; the trace check catches it
+        import ast
+        mutant_source = "def entry(n):\n    table = globals()\n    return table.get('hid' + n)()\ndef hidden():\n    return 1\n"
+        mutant_ns = {}
+        exec(compile(mutant_source, "/mutant/synthetic.py", "exec"), mutant_ns)
+        ran = self.traced_definitions(lambda: mutant_ns["entry"]("den"), "/mutant/synthetic.py")
+        static = dc.closure(ast.parse(mutant_source), ["entry"])
+        self.assertEqual(self.outside_the_closure(ran, static), ["hidden"], "the trace test sees the definition the static walk cannot")
+
+    def test_the_refusal_and_the_hold_read_the_one_derivation_and_no_list_of_daemon_names_is_left(self):
+        import ast
+        dc, rule, tree, sets = self.closure_sets()
+        self.assertNotIn("closure_roots", rule, "the matrix holds no list of the daemon names the clear runs")
+        for name in ("docs/review-laws/impact-matrix.json", "docs/switchboard.md"):
+            self.assertEqual((REPO / name).read_text().count("closure_roots"), 0, "%s names no list of closure roots: the closure is derived" % name)
+        self.assertIn("derived from the code", rule["meaning"])
+        self.assertEqual((REPO / "docs/switchboard.md").read_text().count(rule["meaning"]), 1, "the docs carry the matrix's own words about the one closure")
+        calls = {}
+        for path in sorted(BIN.glob("*.py")) + [BIN / "fleet-switchboard"]:
+            if path.name in ("delegated_clear.py",):
+                continue
+            for fn in [n for n in ast.walk(ast.parse(path.read_text())) if isinstance(n, ast.FunctionDef)]:
+                for x in ast.walk(fn):
+                    if isinstance(x, ast.Call) and getattr(x.func, "attr", getattr(x.func, "id", None)) in ("closure_refusals", "closure", "daemon_roots", "delegated_clear_map"):
+                        calls.setdefault(getattr(x.func, "attr", getattr(x.func, "id", None)), set()).add(fn.name)
+        self.assertEqual(calls.get("closure_refusals"), {"delegated_clear_map"}, "ONE reader of the walk")
+        self.assertEqual(calls.get("daemon_roots"), {"delegated_clear_map"}, "ONE reader of the roots")
+        self.assertEqual(calls.get("delegated_clear_map"), {"delegated_clear_pr_checks", "clear_closure_hold"}, "the refusal and the hold both call the one mapper")
+        self.assertNotIn("closure", calls, "no other code walks the daemon file by name")
+
+    def test_the_hold_and_the_refusal_call_the_same_mapper_with_the_same_input_and_the_hold_fails_toward_hold(self):
+        self.delegate(); self.floor_pr(path="bin/fleet-switchboard"); self.files_of_pr("bin/fleet-switchboard", mapped=["it changes cmd_review, part of the clear (head file)"])
+        self.world.engine.gh_runner, self.world.engine.config["gh"] = self.route, FAKE_GH
+        report = sb.pr_floor_report(self.world.engine, "acme/app", 9)
+        refused = sb.delegated_clear_pr_checks(self.world.engine, self.route, "acme/app", 9)
+        self.assertEqual(report["owner_decision"], "hold")
+        self.assertTrue([r for r in report["owner_reasons"] if "it changes cmd_review, part of the clear (head file)" in r], report["owner_reasons"])
+        self.assertIn("it changes cmd_review, part of the clear (head file)", refused[1])
+        self.assertEqual(len(self.map_bases), 3, "the one mapper is called by the hold (its own report, and the report the refusal reads) and by the refusal, each with the merge-base")
+        self.assertEqual(set(self.map_bases), {"m" * 40})
+        matrix_rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
+        self.assertEqual(len(self.map_rules), 3)
+        self.assertTrue(all(rule == matrix_rule for rule in self.map_rules), "the hold and the refusal give the mapper the SAME rule: the matrix's block, whole")
+        self.files_of_pr("bin/fleet-switchboard", mapped=None)   # nothing the clear touches in the change: neither refuses nor holds for this reason
+        report = sb.pr_floor_report(self.world.engine, "acme/app", 9)
+        self.assertFalse([r for r in report["owner_reasons"] if "clear's closure" in r], report["owner_reasons"])
+        with mock.patch.object(sb, "delegated_clear_map", lambda *a, **k: None):   # unreadable: the hold fails toward hold, with its own reason
+            report = sb.pr_floor_report(self.world.engine, "acme/app", 9)
+        self.assertEqual(report["owner_decision"], "hold")
+        self.assertTrue([r for r in report["owner_reasons"] if "cannot be read or mapped to the clear's closure" in r], report["owner_reasons"])
+
+    def test_a_hold_that_gives_the_mapper_any_other_rule_than_the_refusals_is_caught_one_mutant_for_each_field_the_closure_reads(self):
+        """rev-1 of #995: the hold and the refusal call one mapper, but each builds its arguments: change ANY rule field in the hold's call only and the comparison must fail. The fields are the ones the mapper and the derivation read."""
+        import ast, copy
+        fields = ("rating_roots", "clear_entry_points", "dynamic_actions", "daemon_file", "module_roots", "closure_files")
+        read = set()
+        for name in ("delegated_clear_map", "clear_closure_hold"):
+            fn = next(n for n in ast.parse((BIN / "impact_hold.py").read_text()).body if isinstance(n, ast.FunctionDef) and n.name == name)
+            for x in ast.walk(fn):
+                if isinstance(x, ast.Subscript) and isinstance(x.value, ast.Name) and x.value.id == "rule" and isinstance(x.slice, ast.Constant):
+                    read.add(x.slice.value)
+                if isinstance(x, ast.Call) and getattr(x.func, "attr", "") == "get" and isinstance(x.func.value, ast.Name) and x.func.value.id == "rule" and x.args and isinstance(x.args[0], ast.Constant):
+                    read.add(x.args[0].value)
+        self.assertTrue(read <= set(fields) | {"daemon_file"}, "a rule field the mapper reads that has no mutant below: %s" % sorted(read - set(fields)))
+        self.delegate(); self.floor_pr(path="bin/fleet-switchboard"); self.files_of_pr("bin/fleet-switchboard", mapped=[])
+        self.world.engine.gh_runner, self.world.engine.config["gh"] = self.route, FAKE_GH
+        real_hold = sb.clear_closure_hold
+        matrix = sb.impact_floor.load_matrix()
+        for field in fields:
+            with self.subTest(mutant=field):
+                mutated = copy.deepcopy(matrix)
+                block = mutated["owner_hold"]["delegated_clear"]
+                block[field] = [] if isinstance(block[field], list) else ({} if isinstance(block[field], dict) else "bin/elsewhere")
+                def hold_with_other_rule(*a, __matrix=mutated, **k):
+                    with mock.patch.object(sb.impact_floor, "load_matrix", lambda *x, **y: __matrix):
+                        return real_hold(*a, **k)
+                del self.map_rules[:]
+                with mock.patch.object(sb, "clear_closure_hold", hold_with_other_rule):
+                    sb.pr_floor_report(self.world.engine, "acme/app", 9)
+                    sb.delegated_clear_pr_checks(self.world.engine, self.route, "acme/app", 9)
+                same = len(self.map_rules) == 3 and all(rule == self.map_rules[-1] for rule in self.map_rules)   # the hold twice (its own report and the refusal's) and the refusal once, each with the one rule
+                self.assertFalse(same, "with the %s of the hold's rule changed, the mapper saw other rules or was not called by the hold: the comparison test fails on this mutant" % field)
+
+    def test_the_closure_hold_fails_toward_hold_on_every_unreadable_branch_and_is_silent_when_the_daemon_file_is_untouched(self):
+        dc = sb.load_module("delegated_clear")
+        engine = self.world.engine
+        engine.gh_runner = self.route
+        def hold(listing=None, pulls=None, raises=None, compare=None, mapped=("unset",)):
+            def get(engine_, runner, repo):
+                def call(path):
+                    if raises:
+                        raise raises
+                    if "/files" in path:
+                        return listing(path) if callable(listing) else listing
+                    if "/compare/" in path:
+                        return compare if compare is not None else {"merge_base_commit": {"sha": "m" * 40}}
+                    return pulls if pulls is not None else {"head": {"sha": "h" * 40}, "base": {"sha": "b" * 40}}
+                return call
+            patchers = [mock.patch.object(sb, "impact_carry_get", get)]
+            if mapped != ("unset",):
+                patchers.append(mock.patch.object(sb, "delegated_clear_map", lambda *a, **k: mapped))
+            for patcher in patchers:
+                patcher.start()
+            try:
+                return sb.clear_closure_hold(engine, "acme/app", 9, "h" * 40)
+            finally:
+                for patcher in patchers:
+                    patcher.stop()
+        daemon = "bin/fleet-switchboard"
+        modified = [{"filename": daemon, "status": "modified", "sha": "e" * 40, "patch": "@@ -1 +1 @@\n-a\n+b"}]
+        self.assertEqual(hold(listing=[{"filename": "docs/x.md", "status": "modified"}]), [], "the daemon file is untouched: no reason")
+        cases = {"a file list that is not a list": hold(listing={"message": "no"}), "more than 3000 files": hold(listing=lambda path: [{"filename": "f%d" % i, "status": "modified"} for i in range(100)]),
+                 "a daemon file that is added": hold(listing=[{"filename": daemon, "status": "added"}]), "a daemon file that is removed": hold(listing=[{"filename": daemon, "status": "removed"}]),
+                 "a daemon file that is renamed": hold(listing=[{"filename": "bin/elsewhere", "previous_filename": daemon, "status": "renamed"}]),
+                 "a head that moved": hold(listing=modified, pulls={"head": {"sha": "x" * 40}, "base": {"sha": "b" * 40}}), "no merge base": hold(listing=modified, compare={}),
+                 "a change that cannot be mapped": hold(listing=modified, mapped=None), "an exception": hold(listing=modified, raises=ValueError("boom"))}
+        expect = {"a file list that is not a list": "cannot be judged", "more than 3000 files": "more than 3000 files", "a daemon file that is added": "is added", "a daemon file that is removed": "is removed",
+                  "a daemon file that is renamed": "is renamed", "a head that moved": "moved", "no merge base": "cannot be read or mapped", "a change that cannot be mapped": "cannot be read or mapped", "an exception": "cannot be judged"}
+        for label, reasons in cases.items():
+            with self.subTest(label):
+                self.assertTrue(reasons and expect[label] in reasons[0], "%s: %r" % (label, reasons))
+        with self.subTest("the install's own files cannot be read"):
+            with mock.patch.object(dc, "_tree_of", side_effect=OSError("gone")):
+                reasons = hold(listing=modified)
+            self.assertTrue(reasons and "cannot be read or mapped" in reasons[0], reasons)
+        with self.subTest("a change that touches the closure is held with the mapper's reasons"):
+            self.assertEqual(hold(listing=modified, mapped=["it changes cmd_review, part of the clear (head file)"]), ["the change touches the clear's closure: it changes cmd_review, part of the clear (head file)"])
+
+    def test_the_clears_own_module_has_only_plain_top_level_functions_so_the_roots_scan_reads_all_of_it(self):
+        import ast
+        tree = ast.parse((BIN / "impact_hold.py").read_text())
+        self.assertEqual([type(n).__name__ for n in tree.body if isinstance(n, (ast.ClassDef, ast.AsyncFunctionDef))], [], "a class or an async function in bin/impact_hold.py would be missed by the roots scan (moved_roots reads plain functions): extend the scan first")
+
+    def test_a_changed_line_in_each_member_of_the_closure_is_refused_and_a_mutant_that_drops_any_member_is_caught_and_a_change_outside_is_not_refused(self):
+        import ast, difflib
+        dc, rule, tree, sets = self.closure_sets()
+        defs, bound, refs, members = sets
+        lines = self.real_source().split("\n")
+        index = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+        targets = {}   # label -> the line (1-based) to touch
+        for name in sorted(defs):
+            node = index[name]
+            if isinstance(node, ast.FunctionDef):
+                targets[name] = node.body[0].lineno
+            else:
+                for method in node.body:
+                    if isinstance(method, ast.FunctionDef) and method.name in members.get(name, ()):
+                        targets["%s.%s" % (name, method.name)] = method.body[0].lineno
+        self.assertGreater(len(targets), 300)
+        roots = dc.daemon_roots(rule)
+        source = self.real_source()
+        entries = set(rule["clear_entry_points"])
+        def judge(label, closure_of):   # one changed line in the member, as a one-hunk patch against the unchanged file (the closure is the given sets: the walk itself is checked once, above)
+            line = targets[label]
+            text = lines[line - 1]
+            patch = "@@ -%d,1 +%d,1 @@\n-%s\n+%s  # x" % (line, line, text, text)
+            with mock.patch.object(dc, "closure", closure_of):
+                return "\n".join(dc.closure_refusals(source, source, patch, roots, entries, False, rule["dynamic_actions"], base_tree=tree, head_tree=tree))
+        whole = lambda tree_, roots_, dynamic_=(): (set(sets[0]), set(sets[1]), set(sets[2]), {k: set(v) for k, v in sets[3].items()})
+        for label in targets:
+            with self.subTest(member=label):
+                self.assertIn("it changes %s, part of the clear" % label, judge(label, whole))
+        for label in [l for l in targets if l.partition(".")[0] not in set(roots)]:   # a mutant for each member (a class that is itself a root is refused whole): the closure without it does not refuse a change to it
+            with self.subTest(mutant=label):
+                top, _, method = label.partition(".")
+                def without(tree_, roots_, dynamic_=(), top=top, method=method):
+                    d, b, r, m = whole(tree_, roots_, dynamic_)
+                    if method:
+                        m[top].discard(method)
+                    else:
+                        d.discard(top)
+                    return d, b, r, m
+                self.assertNotIn("it changes %s, part of the clear" % label, judge(label, without))
+        outside = sorted(n for n in index if n not in defs and isinstance(index[n], ast.FunctionDef) and n not in bound)[:5]
+        self.assertTrue(outside, "the daemon file has definitions the clear never runs")
+        head2 = list(lines)
+        for name in sorted(outside, key=lambda n: -index[n].body[0].lineno):
+            ln = index[name].body[0].lineno
+            head2.insert(ln - 1, " " * (len(lines[ln - 1]) - len(lines[ln - 1].lstrip())) + "# x")
+        diff2 = "\n".join(list(difflib.unified_diff(lines, head2, lineterm="", n=0))[2:])
+        self.assertEqual(dc.closure_refusals(self.real_source(), "\n".join(head2), diff2, roots, set(rule["clear_entry_points"]), False, rule["dynamic_actions"], base_tree=tree), [], "a change outside the closure is not refused: %s" % outside)
+
+    def test_slice_1_refuses_nothing_less_than_the_independent_old_derivation_and_the_module_lists_remain(self):
+        import ast
+        dc, rule, tree, sets = self.closure_sets()
+        hold = ast.parse((BIN / "impact_hold.py").read_text())
+        defs, binds = dc._index(tree)
+        old_roots = ({x.id for f in hold.body if isinstance(f, ast.FunctionDef) for x in ast.walk(f) if isinstance(x, ast.Name)} & (set(defs) | set(binds))) | {"HELPER_MODULES", "_make_loader"} | set(rule["rating_roots"])
+        old = dc.closure(tree, sorted(old_roots), rule["dynamic_actions"])
+        new = sets
+        self.assertEqual((sorted(old[0] - new[0]), sorted(old[1] - new[1]), {k: sorted(v - new[3].get(k, set())) for k, v in old[3].items() if v - new[3].get(k, set())}), ([], [], {}), "every definition, binding and method the independent derivation reaches is in the closure")
+        for key in ("module_roots", "closure_files", "closure_exempt", "clear_code_paths"):
+            self.assertTrue(rule[key], "%s is still in the matrix in slice 1 and refuses what it refused" % key)
 
     def test_the_modules_the_clear_loads_or_runs_are_all_judged_and_the_list_is_derived_from_what_runs(self):
         import sys, os, ast
@@ -36133,8 +36523,10 @@ class TestImpactHold(LedgerBase):
             return found
         clear_functions = [n for n in hold.body if isinstance(n, ast.FunctionDef)]
         wanted_roots = sorted({x.id for f in clear_functions for x in ast.walk(f) if isinstance(x, ast.Name)} & set(sb.load_module("delegated_clear")._index(daemon)[0]) | {x.id for f in clear_functions for x in ast.walk(f) if isinstance(x, ast.Name)} & set(sb.load_module("delegated_clear")._index(daemon)[1]))
-        self.assertEqual(sorted(rule["closure_roots"]), sorted(set(wanted_roots) | {"HELPER_MODULES", "_make_loader"}), "closure_roots is every daemon name the moved clear code reads (bin/impact_hold.py), and the table that generates the daemon's loaders")
-        reach = sb.load_module("delegated_clear").closure(daemon, rule["closure_roots"])[0]
+        dc = sb.load_module("delegated_clear")
+        self.assertEqual(sorted(dc.moved_roots(daemon, hold)), sorted(wanted_roots), "the daemon roots are every daemon name the moved clear code reads, derived by the module and independently here")
+        reach, bound = dc.closure(daemon, sorted(dc.moved_roots(daemon, hold)))[:2]   # the clear's own roots (not the rating path: the modules list judges what the CLEAR loads)
+        self.assertTrue({"HELPER_MODULES", "_make_loader"} <= (reach | bound), "the table that generates the daemon's loaders is reached wherever a generated name is read")
         reached = set()
         for name in reach:
             reached |= modules_of(defs[name])
@@ -36174,13 +36566,13 @@ class TestImpactHold(LedgerBase):
         counts = collections.Counter(n.name for n in hold.body if isinstance(n, ast.FunctionDef))
         self.assertEqual([k for k, v in counts.items() if v > 1], [], "each function of the moved clear code is defined once (a later copy would silently replace the first)")
         for pinned in ("impact_carry_get", "fetch_orders", "read_pr_json", "HELPER_MODULES", "_make_loader"):
-            self.assertIn(pinned, rule["closure_roots"])
+            self.assertIn(pinned, set(sb.load_module("delegated_clear").daemon_roots(rule)) | set(sb.load_module("delegated_clear").closure(ast.parse((BIN / "fleet-switchboard").read_text()), sb.load_module("delegated_clear").daemon_roots(rule))[:2][0]) | set(sb.load_module("delegated_clear").closure(ast.parse((BIN / "fleet-switchboard").read_text()), sb.load_module("delegated_clear").daemon_roots(rule))[1]))
         table = (BIN / "fleet-switchboard").read_text().split("\n")
         k = next(i for i, l in enumerate(table) if l.strip().startswith('"load_agent_presence":'))
         mutated = list(table)
         mutated[k] = mutated[k].replace('"agent_presence"', '"lanes"')
         diff = "\n".join(list(difflib.unified_diff(table, mutated, lineterm="", n=1))[2:])
-        self.assertTrue(sb.load_module("delegated_clear").closure_refusals("\n".join(table), "\n".join(mutated), diff, rule["closure_roots"], set(rule["clear_entry_points"])), "a HELPER_MODULES value changed")
+        self.assertTrue(sb.load_module("delegated_clear").closure_refusals("\n".join(table), "\n".join(mutated), diff, sb.load_module("delegated_clear").daemon_roots(rule), set(rule["clear_entry_points"])), "a HELPER_MODULES value changed")
         self.assertTrue(rule["closure_files"] and "bin/lanes.py" not in rule["closure_files"], "lanes.py is not judged, so the same edit to it is not refused")
         # the way in a strict review found: the notice path runs agent_presence through a generated loader; a change to it is refused, and to a module the clear does not load it is not
         import difflib
@@ -36543,7 +36935,7 @@ class TestImpactHold(LedgerBase):
             answers["contents/bin/fleet-switchboard"] = [{"name": "x"}]
             self.assertIsNone(sb.delegated_clear_map(None, None, "acme-org/widget-api", item, "b" * 40, rule), "a directory, not a file")
             self.assertIsNone(sb.delegated_clear_map(None, None, "acme-org/widget-api", item, None, rule), "no merge-base: refused")
-            self.assertTrue(rule["closure_roots"], "the roots are named")
+            self.assertTrue(sb.load_module("delegated_clear").daemon_roots(rule), "the roots are derived")
 
     def test_a_repeated_order_number_makes_the_whole_feature_off(self):
         module = sb.load_module("delegated_clear")
@@ -37045,7 +37437,7 @@ class TestImpactHold(LedgerBase):
                 head = source.replace(old, new)
                 diff = "\n".join(list(difflib.unified_diff(source.split("\n"), head.split("\n"), lineterm="", n=3))[2:])
                 self.assertTrue(self.closure_check(head, diff), "refused: %s" % label)
-                self.assertEqual(module.closure_refusals(source, head, diff, sorted(rule["closure_roots"]), set(rule["clear_entry_points"])), [], "the mutant (the roots of round 2, no dynamic edge) lets %s through" % label)
+                self.assertEqual(module.closure_refusals(source, head, diff, sorted(set(sb.load_module("delegated_clear").daemon_roots(dict(rule, rating_roots=[])))), set(rule["clear_entry_points"])), [], "the mutant (the roots of round 2, no dynamic edge) lets %s through" % label)
 
     def test_one_definition_of_rated_at_this_head_the_clear_and_every_other_reader_use_it(self):
         import ast

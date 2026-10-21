@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""closure-load: how many merged pull requests the clear's closure rule would hold, per week, with the list (#940).
+
+Read-only. Run it from a checkout of the repository (it reads `git` and the real functions of this checkout: the same `daemon_roots` / `closure_refusals` the delegated clear's refusal and the owner hold call, with the
+matrix's `closure_files`, `module_roots` and `clear_code_paths` and the same `impact_floor.matches`).
+
+  tools/closure-load [--ref origin/main] [--since 2026-10-06] [--until 2026-10-20T23:59:59]
+  tools/closure-load --size [--ref origin/main]       the SIZE of the closure at the ref (definitions and definition lines of the daemon file), from the real derivation
+
+Definition. The pull requests are the FIRST-PARENT commits of --ref committed from --since to --until (a squash merge is one commit: its diff against its first parent is the pull request's change). A pull request is HELD BY THE
+CLOSURE RULE when (a) it changes the daemon file (`daemon_file`) on a line the clear's closure reaches (`closure_refusals` over the daemon file's text before and after, with `daemon_roots`), or (b) it changes a file of
+`closure_files` that is not in `clear_code_paths` on a line of the closure rule for that module (`closure_refusals` module mode over `module_roots`). A path of `clear_code_paths` is held by the path rule, not by this one, and is
+not counted. Weeks: the first is --since to the next Sunday; each week runs Monday to Sunday (UTC). The window is the dates given, not a count of pull requests.
+"""
+import argparse
+import ast
+import datetime
+import importlib.machinery
+import importlib.util
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    loader.exec_module(module)
+    return module
+
+
+def git(*args):
+    return subprocess.run(["git", *args], cwd=str(ROOT), capture_output=True, text=True, check=True).stdout
+
+
+def show(ref, name):
+    """The file's text at a commit, empty when the commit has no such file (an added or a deleted file)."""
+    done = subprocess.run(["git", "show", "%s:%s" % (ref, name)], cwd=str(ROOT), capture_output=True, text=True)
+    return done.stdout if done.returncode == 0 else ""
+
+
+def main():
+    parser = argparse.ArgumentParser(description="the weekly load of the clear's closure rule")
+    parser.add_argument("--ref", default="origin/main")
+    parser.add_argument("--since", default="2026-10-06")
+    parser.add_argument("--until", default="2026-10-20T23:59:59")
+    parser.add_argument("--list", action="store_true", help="print the held pull requests too")
+    parser.add_argument("--size", action="store_true", help="print the closure's size at the ref and stop")
+    args = parser.parse_args()
+    sys.path.insert(0, str(ROOT / "bin"))
+    clear = load("delegated_clear", ROOT / "bin" / "delegated_clear.py")
+    floor = load("impact_floor", ROOT / "bin" / "impact_floor.py")
+    rule = floor.load_matrix()["owner_hold"]["delegated_clear"]
+    roots = clear.daemon_roots(rule)
+    if args.size:
+        text = show(args.ref, rule["daemon_file"])
+        tree = ast.parse(text)
+        defs, bound, _, members = clear.closure(tree, roots, list(rule.get("dynamic_actions") or []))
+        body = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))]
+        def lines(node):
+            if isinstance(node, ast.ClassDef):
+                return sum(c.end_lineno - c.lineno + 1 for c in node.body if not isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef)) or c.name in members.get(node.name, ()))
+            return node.end_lineno - node.lineno + 1
+        inside = [n for n in body if n.name in defs]
+        print("closure at %s (roots derived from the checkout's own files): %d of %d top-level definitions, %d of %d definition lines, %d module-level bindings, %d methods" % (
+            args.ref, len(inside), len(body), sum(lines(n) for n in inside), sum(n.end_lineno - n.lineno + 1 for n in body), len(bound), sum(len(v) for v in members.values())))
+        return 0
+    log = [l for l in git("log", "--first-parent", "--since=" + args.since, "--until=" + args.until, "--format=%H|%cs|%s", args.ref).strip().split("\n") if l]
+    held, weeks = [], {}
+    for line in log:
+        sha, day, subject = line.split("|", 2)
+        files = git("diff", "--name-only", sha + "^", sha).split()
+        reasons = []
+        if rule["daemon_file"] in files:
+            base, head = show(sha + "^", rule["daemon_file"]), show(sha, rule["daemon_file"])
+            patch = "\n".join(git("diff", "-U3", sha + "^", sha, "--", rule["daemon_file"]).split("\n")[4:])
+            if clear.closure_refusals(base, head, patch, roots, set(rule["clear_entry_points"]), False, list(rule.get("dynamic_actions") or [])):
+                reasons.append("daemon file")
+        for name in files:
+            if name in rule["closure_files"] and name != rule["daemon_file"] and not floor.matches(name, rule["clear_code_paths"]):
+                base, head = show(sha + "^", name), show(sha, name)
+                patch = "\n".join(git("diff", "-U3", sha + "^", sha, "--", name).split("\n")[4:])
+                if clear.closure_refusals(base, head, patch, list((rule.get("module_roots") or {}).get(name) or []), set(), True):
+                    reasons.append("module " + name)
+        date = datetime.date.fromisoformat(day)
+        monday = date - datetime.timedelta(days=date.weekday())
+        week = weeks.setdefault(monday.isoformat(), [0, 0, 0])
+        week[0] += 1
+        if reasons:
+            week[1] += 1
+            week[2] += 1 if "daemon file" in reasons else 0
+            number = re.search(r"\(#(\d+)\)\s*$", subject)
+            held.append(("#" + number.group(1) if number else sha[:8], day, subject[:80], "; ".join(reasons)))
+    print("ref %s, first-parent commits from %s to %s: %d merged" % (args.ref, args.since, args.until, len(log)))
+    print("week (Monday) | merged | held by the closure rule | of which the daemon file")
+    for monday, (merged, hold, daemon) in sorted(weeks.items()):
+        print("%s | %d | %d | %d" % (monday, merged, hold, daemon))
+    print("total | %d | %d | %d" % (sum(w[0] for w in weeks.values()), sum(w[1] for w in weeks.values()), sum(w[2] for w in weeks.values())))
+    if args.list:
+        for item in held:
+            print("- %s %s %s [%s]" % item)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
