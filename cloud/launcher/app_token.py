@@ -3,11 +3,14 @@
 
 usage: app_token.py OWNER/REPO
 
-The App id, private key and installation id are read from the vault by commands (stdout of each, in memory only):
-  CW_APP_ID_CMD, CW_APP_KEY_CMD, CW_APP_INSTALLATION_CMD
+The App id and private key are read from the vault by commands (stdout of each, in memory only):
+  CW_APP_ID_CMD, CW_APP_KEY_CMD
   (a command, or the vault default; CW_VAULT_SUBSCRIPTION and CW_VAULT_NAME have no defaults)
   default: az keyvault secret show --subscription $CW_VAULT_SUBSCRIPTION --vault-name $CW_VAULT_NAME --name cw-app-id
-           | cw-app-key | cw-app-installation-id --query value -o tsv   (the subscription and vault come from the env)
+           | cw-app-key --query value -o tsv   (the subscription and vault come from the env)
+The installation is NOT read from the vault: GET /repos/OWNER/REPO/installation (with the App JWT) names the installation that
+covers the repository, and its account must be the repository owner. CW_APP_INSTALLATION_CMD and a stored installation id are obsolete:
+accepted, never run, ignored.
 The key goes to `openssl dgst -sha256 -sign /dev/fd/N` through a pipe: never a file, an argument or the environment.
 The 9-minute app JWT and the token are never printed except the token, once, on stdout. Errors go to stderr, never a value.
 Only https://api.github.com is used; CW_GITHUB_API_BASE may name a loopback http URL (tests).
@@ -132,13 +135,56 @@ def check_permissions(perms):
             die("refusing: the token has a different level for the permission: %s" % k)
 
 
+def github_json(method, path, jwt, body=None, not_found=None):
+    """One GitHub call with the App JWT; the parsed JSON answer, or exit through die(). A 404 says not_found when given."""
+    headers = {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json",
+               "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "cw-app-token"}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(api_base() + path, data=data, method=method, headers=headers)
+    try:
+        with open_url(req) as r:
+            raw = r.read(MAX_BYTES + 1)
+        if len(raw) > MAX_BYTES:
+            die("the GitHub answer is larger than %d bytes" % MAX_BYTES)
+        return json.loads(raw)
+    except urllib.error.HTTPError as e:
+        if e.code == 404 and not_found:
+            die(not_found)
+        if e.code == 422 and method == "POST":
+            die("the App's installation does not cover this repository: add it to the installation (HTTP 422)")
+        die(http_error_text(e.code))
+    except (OSError, ValueError):
+        die("the GitHub request failed or its answer was not JSON")
+
+
+def find_installation(target, jwt):
+    """The id of the App installation that covers target (OWNER/REPO), asked of GitHub with the App JWT. Checked, never trusted."""
+    owner = target.split("/", 1)[0]
+    ans = github_json("GET", "/repos/%s/installation" % target, jwt,
+                      not_found="the App is not installed on %s: install it on the account that owns the repository and add the repository" % target)
+    if not isinstance(ans, dict):
+        die("refusing: the installation lookup answered with something other than one installation")
+    inst = ans.get("id")
+    if isinstance(inst, bool) or not isinstance(inst, int) or inst <= 0:
+        die("refusing: the installation lookup carries no installation id")
+    account = ans.get("account")
+    login = account.get("login") if isinstance(account, dict) else None
+    if not isinstance(login, str) or login.lower() != owner.lower():
+        die("refusing: the installation found is not the account that owns %s" % target)
+    if ans.get("suspended_at"):
+        die("refusing: the App's installation on %s is suspended" % owner)
+    return inst
+
+
 def mint(target):
     """Return a token for target (OWNER/REPO), or exit through die(). Never prints."""
     repo = target.split("/", 1)[1]
     app_id = vault("CW_APP_ID_CMD", "cw-app-id").strip()
-    inst = vault("CW_APP_INSTALLATION_CMD", "cw-app-installation-id").strip()
-    if not app_id.isdigit() or not inst.isdigit():
-        die("the app id and the installation id must be numbers")
+    if not app_id.isdigit():
+        die("the app id must be a number")
     key = vault("CW_APP_KEY_CMD", "cw-app-key")
     now = int(dt.datetime.now(dt.timezone.utc).timestamp())
     head = b64(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
@@ -146,21 +192,8 @@ def mint(target):
     signing = "%s.%s" % (head, claims)
     jwt = signing + "." + b64(sign(key, signing.encode()))
     del key
-    req = urllib.request.Request("%s/app/installations/%s/access_tokens" % (api_base(), inst),
-                                 data=json.dumps({"repositories": [repo]}).encode(), method="POST",
-                                 headers={"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json",
-                                          "Content-Type": "application/json", "X-GitHub-Api-Version": "2022-11-28",
-                                          "User-Agent": "cw-app-token"})
-    try:
-        with open_url(req) as r:
-            raw = r.read(MAX_BYTES + 1)
-        if len(raw) > MAX_BYTES:
-            die("the GitHub answer is larger than %d bytes" % MAX_BYTES)
-        ans = json.loads(raw)
-    except urllib.error.HTTPError as e:
-        die(http_error_text(e.code))
-    except (OSError, ValueError):
-        die("the GitHub request failed or its answer was not JSON")
+    inst = find_installation(target, jwt)
+    ans = github_json("POST", "/app/installations/%d/access_tokens" % inst, jwt, {"repositories": [repo]})
     token = ans.get("token") if isinstance(ans, dict) else None
     repos = ans.get("repositories") if isinstance(ans, dict) else None
     if not isinstance(token, str) or not token:
