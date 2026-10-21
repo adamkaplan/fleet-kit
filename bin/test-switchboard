@@ -77367,17 +77367,24 @@ class TestGhShimMergeGate(Base):
         fake.chmod(0o755)
         self.calls = self.home / "mg-calls.log"
         self.sb = self.home / "fakesb"
+        self.ctl = self.home / "sb-control"   # what the fake switchboard is told to do goes in FILES: the shim runs it in a fixed environment, so a variable would never reach it
+        self.ctl.mkdir()
         self.sb.write_text("#!/bin/sh\n"
+                           "for n in FAKE_MG_JSON FAKE_MG_EXIT FAKE_MG_SLEEP FAKE_WHOAMI_JSON_FAIL; do [ -f %r/$n ] && eval \"$n=\\$(cat %r/$n)\"; done\n"
+                           "echo \"$1|$2|$3|pyp=$PYTHONPATH|pyh=$PYTHONHOME|ldp=$LD_PRELOAD|dyl=$DYLD_INSERT_LIBRARIES|xdg=$XDG_STATE_HOME|fsb=$FLEET_SWITCHBOARD_STATE|mad=$MADE_UP_VARIABLE|path=$PATH|home=$HOME\" >> %r\n"
+                           "if [ \"$1\" = whoami ] && [ \"$2\" = --json ] && [ -n \"$FAKE_WHOAMI_JSON_FAIL\" ]; then exit 2; fi\n"
+                           "if [ \"$1\" = whoami ] && [ -z \"$2\" ]; then echo worker; exit 0; fi\n"
                            "if [ \"$1\" = whoami ]; then\n  echo '{\"name\": \"worker\", \"repo\": \"acme/app\"}'; exit 0; fi\n"
+                           "if [ \"$1\" = gates-check ]; then echo '{\"verdict\": \"allow\", \"mode\": \"shadow\"}'; exit 0; fi\n"
                            "if [ \"$1\" = review ]; then exit 0; fi\n"
                            "if [ \"$1\" = merge-gate ]; then\n  echo \"$@ own=$FLEET_SWITCHBOARD_OWN_GH\" >> %r\n"
                            "  echo \"state=$XDG_STATE_HOME cfg=$XDG_CONFIG_HOME fsb=$FLEET_SWITCHBOARD_STATE bin=$FLEET_SWITCHBOARD_BIN home=$HOME\" >> %r\n"
                            "  [ -n \"$FAKE_MG_SLEEP\" ] && sleep $FAKE_MG_SLEEP\n  [ \"$3\" = --release ] && exit 0\n"
-                           "  echo \"$FAKE_MG_JSON\"; exit ${FAKE_MG_EXIT:-0}\nfi\nexit 2\n" % (str(self.calls), str(self.calls) + ".env"))
+                           "  echo \"$FAKE_MG_JSON\"; exit ${FAKE_MG_EXIT:-0}\nfi\nexit 2\n" % (str(self.ctl), str(self.ctl), str(self.calls) + ".all", str(self.calls), str(self.calls) + ".env"))
         self.sb.chmod(0o755)
         subprocess.run([str(self.sb), "whoami"], capture_output=True, timeout=60)
         (self.home / ".config" / "fleet-switchboard").mkdir(parents=True)
-        (self.home / ".config" / "fleet-switchboard" / "config.json").write_text(json.dumps({"merge_gate": {"repos": {"acme/app": {}}}}))
+        (self.home / ".config" / "fleet-switchboard" / "config.json").write_text(json.dumps({"merge_gate": {"repos": {"acme/app": {}}}, "plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}))
         self.state = self.home / "state"
         self.state.mkdir()
 
@@ -77391,6 +77398,11 @@ class TestGhShimMergeGate(Base):
         if binary:
             environ["FLEET_SWITCHBOARD_BIN"] = str(self.sb)
         environ.update(env or {})
+        for name in ("FAKE_MG_JSON", "FAKE_MG_EXIT", "FAKE_MG_SLEEP", "FAKE_WHOAMI_JSON_FAIL"):
+            if name in environ:
+                (self.ctl / name).write_text(environ[name])
+            elif (self.ctl / name).exists():
+                (self.ctl / name).unlink()
         if self.log.exists():
             self.log.unlink()
         runner = ("import importlib.util, importlib.machinery, sys\nloader = importlib.machinery.SourceFileLoader('gh', %r)\nspec = importlib.util.spec_from_loader('gh', loader)\n"
@@ -77576,9 +77588,11 @@ class TestGhShimMergeGate(Base):
                 self.assertTrue(self.refused_call(args), args)
 
     def shim_module(self):
-        loader = importlib.machinery.SourceFileLoader("gh_shim_one_parser", str(self.shim_path or SHIM))
-        module = importlib.util.module_from_spec(importlib.util.spec_from_loader("gh_shim_one_parser", loader))
-        loader.exec_module(module)
+        """The shim (or the mutated copy a test runs) loaded from its SOURCE TEXT: no bytecode cache, so two mutants of the same size written in the same second are never mixed up."""
+        path = self.shim_path or SHIM
+        module = types.ModuleType("gh_shim_one_parser")
+        module.__file__ = str(path)
+        exec(compile(Path(path).read_text(), str(path), "exec"), module.__dict__)
         return module
 
     DECIDERS = ["canonical_pr_merge", "explicit_repo", "gate_bind_merge", "gate_parse", "gate_probe", "merge_route", "review_probe", "take_over_review"]
@@ -77637,44 +77651,6 @@ class TestGhShimMergeGate(Base):
         self.assertFalse(all(self.refused_call(a) for a in self.call_shapes().values()))
         self.shim_path = None
 
-    HOSTILE = {"XDG_STATE_HOME": "/tmp/forged-state", "XDG_CONFIG_HOME": "/tmp/forged-config", "FLEET_SWITCHBOARD_STATE": "/tmp/forged-fsb",
-               "FLEET_SWITCHBOARD_BIN": "/tmp/forged-bin-unused", "HOME": "/tmp/forged-home"}
-
-    def env_seen(self, **more):
-        """What the switchboard the shim starts SEES of the hostile names, for one gated merge asked and one released: [{name: value}] per call."""
-        log = Path(str(self.calls) + ".env")
-        if log.exists():
-            log.unlink()
-        env = dict(self.allowed(), **self.HOSTILE)
-        env.update(more)
-        done, seen = self.run_shim(*self.MERGE, env=env)
-        self.assertEqual(done.returncode, 0, done.stderr)
-        rows = []
-        for line in log.read_text().splitlines():
-            rows.append(dict(part.split("=", 1) for part in line.split(" ")))
-        return rows
-
-    def test_the_switchboard_the_shim_starts_runs_in_a_fixed_environment_whatever_the_caller_sets(self):
-        rows = self.env_seen()
-        self.assertEqual(len(rows), 2, "the check and the release")
-        for row in rows:
-            self.assertEqual((row["state"], row["cfg"], row["fsb"], row["bin"]), ("", "", "", ""), row)
-            self.assertNotEqual(row["home"], self.HOSTILE["HOME"])
-            self.assertEqual(row["home"], str(self.home), "HOME is the account's, not the caller's")
-
-    def test_each_hostile_variable_has_a_mutant_that_lets_it_through_and_the_test_sees_it(self):
-        tail = '    if own:\n        env["FLEET_SWITCHBOARD_OWN_GH"] = "1"\n    return env'
-        for name in self.HOSTILE:
-            with self.subTest(variable=name):
-                self.mutated_shim(tail, '    env[%r] = os.environ[%r]\n' % (name, name) + tail)
-                try:
-                    rows = self.env_seen()
-                finally:
-                    self.shim_path = None
-                key = {"XDG_STATE_HOME": "state", "XDG_CONFIG_HOME": "cfg", "FLEET_SWITCHBOARD_STATE": "fsb", "FLEET_SWITCHBOARD_BIN": "bin", "HOME": "home"}[name]
-                leaked = self.HOSTILE[name]
-                self.assertTrue(any(row[key] == leaked for row in rows), "the mutant that passes %s on is seen" % name)
-
     def test_every_xdg_and_fleet_switchboard_name_the_switchboard_reads_is_dropped_from_its_environment_unless_listed(self):
         names = sorted(set(re.findall(r'"((?:XDG_|FLEET_SWITCHBOARD_)[A-Z_]+)"', (BIN / "fleet-switchboard").read_text())))
         self.assertGreater(len(names), 5)
@@ -77682,7 +77658,141 @@ class TestGhShimMergeGate(Base):
         with mock.patch.dict(os.environ, {n: "x" for n in names}):
             seen = shim.sb_env(own=True)
         kept = sorted(n for n in names if n in seen)
-        self.assertEqual(kept, sorted(set(shim.KEEP_FLEET_NAMES + ("FLEET_SWITCHBOARD_OWN_GH",)) & set(names)), "only the identity names and the own-call marker survive")
+        self.assertEqual(kept, sorted(set(shim.ENV_ALLOW + ("FLEET_SWITCHBOARD_OWN_GH",)) & set(names)), "only the identity names and the own-call marker survive")
+
+    FAMILIES = {"PYTHONPATH": "/tmp/evil-py", "PYTHONHOME": "/tmp/evil-home", "PYTHONUSERBASE": "/tmp/evil-user", "PYTHONSTARTUP": "/tmp/evil-start", "LD_PRELOAD": "/tmp/evil.so",
+                "LD_LIBRARY_PATH": "/tmp/evil-lib", "DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib", "DYLD_LIBRARY_PATH": "/tmp/evil-dy", "XDG_STATE_HOME": "/tmp/evil-state",
+                "FLEET_SWITCHBOARD_STATE": "/tmp/evil-fsb", "FLEET_SWITCHBOARD_BIN": "/tmp/evil-bin", "MADE_UP_VARIABLE": "1", "PATH": "/tmp/evil-path", "GH_TOKEN": "x"}
+    DENY_LIST = '    env = {k: v for k, v in os.environ.items() if not k.startswith(("XDG_", "FLEET_SWITCHBOARD_"))}'
+    ALLOW_LIST = '    env = {"PATH": ENV_PATH}\n    for name in ENV_ALLOW:\n        if name in os.environ:\n            env[name] = os.environ[name]'
+    TAIL = '    if own:\n        env["FLEET_SWITCHBOARD_OWN_GH"] = "1"\n    return env'
+
+    def family_problems(self):
+        """Which hostile families reach a switchboard through `sb_env`: the names, or the PATH when it is the caller's."""
+        shim = self.shim_module()
+        with mock.patch.dict(os.environ, self.FAMILIES):
+            env = shim.sb_env(own=True)
+        reached = sorted(n for n in self.FAMILIES if n != "PATH" and n in env)
+        return reached + (["PATH"] if env.get("PATH") == self.FAMILIES["PATH"] else [])
+
+    def test_no_hostile_family_reaches_a_switchboard_and_the_environment_is_an_allow_list(self):
+        self.assertEqual(self.family_problems(), [])
+        shim = self.shim_module()
+        with mock.patch.dict(os.environ, self.FAMILIES):
+            env = shim.sb_env()
+        self.assertLessEqual(set(env), set(shim.ENV_ALLOW) | {"PATH", "HOME"})
+        self.assertEqual(env["PATH"], shim.ENV_PATH)
+
+    def test_each_hostile_family_has_a_mutant_that_lets_it_through_and_the_family_test_sees_it(self):
+        for name in self.FAMILIES:
+            with self.subTest(variable=name):
+                self.mutated_shim(self.TAIL, '    env[%r] = os.environ[%r]\n' % (name, name) + self.TAIL)
+                problems = self.family_problems()
+                self.shim_path = None
+                self.assertIn(name, problems)
+
+    def test_a_deny_list_in_place_of_the_allow_list_is_seen_by_the_family_test(self):
+        self.mutated_shim(self.ALLOW_LIST, self.DENY_LIST)
+        problems = self.family_problems()
+        self.shim_path = None
+        for family in ("PYTHONPATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "MADE_UP_VARIABLE", "PATH"):
+            self.assertIn(family, problems)
+
+    def start_calls(self):
+        """The calls of shims/gh that start the switchboard, FOUND IN THE CODE: a call whose command is `sb_argv(binary, ...)`. Each: (the call node, its env keyword node)."""
+        import ast
+        out = []
+        for n in ast.walk(ast.parse(SHIM.read_text())):
+            if isinstance(n, ast.Call) and n.args and isinstance(n.args[0], ast.Call) and getattr(n.args[0].func, "id", "") == "sb_argv":
+                out.append((n, next((k.value for k in n.keywords if k.arg == "env"), None)))
+        return sorted(out, key=lambda item: item[0].lineno)
+
+    def test_every_switchboard_the_shim_starts_is_started_with_the_fixed_environment_and_isolated(self):
+        import ast
+        calls = self.start_calls()
+        self.assertEqual(len(calls), 6, "whoami --json, whoami, review blockers, gates-check, merge-gate check, merge-gate release")
+        for call, env in calls:
+            self.assertTrue(isinstance(env, ast.Call) and getattr(env.func, "id", "") == "sb_env")
+        shim = self.shim_module()
+        script = self.home / "pyscript"
+        script.write_text("#!/usr/bin/env python3\nprint(1)\n")
+        other = self.home / "shscript"
+        other.write_text("#!/bin/sh\nexit 0\n")
+        self.assertEqual(shim.sb_argv(str(script), "x")[1:], ["-I", str(script), "x"], "a Python program is started isolated, with the python of the FIXED path")
+        self.assertEqual(shim.sb_argv(str(other), "x"), [str(other), "x"])
+
+    SITES = ("whoami|--json", "whoami|", "review|blockers", "gates-check|acme/app#12", "merge-gate|acme/app#12|--check", "merge-gate|acme/app#12|--release")
+    HOSTILE_SITE = {"PYTHONPATH": "/tmp/evil-py", "PYTHONHOME": "/tmp/evil-home", "LD_PRELOAD": "/tmp/evil.so", "DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib",
+                    "XDG_STATE_HOME": "/tmp/evil-state", "FLEET_SWITCHBOARD_STATE": "/tmp/evil-fsb", "MADE_UP_VARIABLE": "1"}
+
+    def observe_sites(self):
+        """{site: the row the switchboard logged for it} for the six calls, with the hostile families set in the shim's environment (two runs: the second makes
+        `whoami --json` fail so the plain `whoami` is asked)."""
+        log = Path(str(self.calls) + ".all")
+        rows = {}
+        for json_fails in (False, True):
+            if log.exists():
+                log.unlink()
+            env = dict(self.allowed(), **self.HOSTILE_SITE)
+            if json_fails:
+                env["FAKE_WHOAMI_JSON_FAIL"] = "1"
+            self.run_shim(*self.MERGE, env=env)
+            for line in log.read_text().splitlines():
+                head, _, tail = line.partition("|pyp=")
+                rows.setdefault(head.rstrip("|"), "pyp=" + tail)
+        return rows
+
+    def leaks(self, row):
+        """The hostile names in one logged row."""
+        return [name for name, key in (("PYTHONPATH", "pyp"), ("PYTHONHOME", "pyh"), ("LD_PRELOAD", "ldp"), ("DYLD_INSERT_LIBRARIES", "dyl"), ("XDG_STATE_HOME", "xdg"),
+                                       ("FLEET_SWITCHBOARD_STATE", "fsb"), ("MADE_UP_VARIABLE", "mad")) if re.search(r"(^|\|)%s=[^|]" % key, row)]
+
+    def test_the_environment_of_each_of_the_six_switchboard_calls_is_observed_and_clean(self):
+        rows = self.observe_sites()
+        self.assertEqual(sorted(rows), sorted(self.SITES), "one row per call site: a seventh call must be added to SITES")
+        for site, row in rows.items():
+            with self.subTest(site=site):
+                self.assertEqual(self.leaks(row), [], row)
+                self.assertIn("path=%s|" % self.shim_module().ENV_PATH, row)
+
+    def test_a_call_site_that_passes_the_callers_environment_on_is_seen_by_its_own_row(self):
+        """One mutant per call site, DERIVED from the code: its `env=` replaced by the caller's environment; exactly that site's row must then show a hostile name."""
+        for index in range(len(self.start_calls())):
+            with self.subTest(call=index):
+                call, env = self.start_calls()[index]
+                lines = SHIM.read_text().splitlines(True)
+                line = lines[env.lineno - 1]
+                lines[env.lineno - 1] = line[:env.col_offset] + "dict(os.environ)" + line[env.end_col_offset:]
+                path = self.home / "gh-mutant"
+                path.write_text("".join(lines))
+                self.shim_path = path
+                try:
+                    rows = self.observe_sites()
+                finally:
+                    self.shim_path = None
+                self.assertEqual(sum(1 for row in rows.values() if self.leaks(row)), 1, "exactly the mutated site leaks")
+
+    def test_a_switchboard_python_script_cannot_be_given_a_library_through_the_environment(self):
+        """The probe: a switchboard that is a Python program and says `allowed` only when a `sitecustomize` from the caller's PYTHONPATH ran in it."""
+        evil = self.home / "evil-py"
+        evil.mkdir()
+        (evil / "sitecustomize.py").write_text("import builtins\nbuiltins.FORGED_BY_THE_CALLER = True\n")
+        probe = self.home / "pysb"
+        probe.write_text("#!%s\nimport builtins, json, sys\n"
+                         "if sys.argv[1] == 'whoami': print(json.dumps({'name': 'worker', 'repo': 'acme/app'})); sys.exit(0)\n"
+                         "if sys.argv[1] == 'merge-gate' and sys.argv[3] == '--check':\n"
+                         "    if hasattr(builtins, 'FORGED_BY_THE_CALLER'): print(json.dumps({'allowed': True, 'head': %r, 'locked': False})); sys.exit(0)\n"
+                         "    print(json.dumps({'allowed': False, 'reason': 'no gate pass recorded'})); sys.exit(10)\n" % (sys.executable, self.HEAD))
+        probe.chmod(0o755)
+        self.sb = probe
+        refused, seen = self.run_shim(*self.MERGE, env={"PYTHONPATH": str(evil)})
+        self.assertEqual((refused.returncode, seen), (10, None), refused.stderr)
+        self.mutated_shim([(self.ALLOW_LIST, self.DENY_LIST), ('[python, "-I", binary]', "[python, binary]")], None)   # the two defences removed together
+        try:
+            leaked, seen = self.run_shim(*self.MERGE, env={"PYTHONPATH": str(evil)})
+        finally:
+            self.shim_path = None
+        self.assertEqual(leaked.returncode, 0, "with neither the allow list nor -I the library reaches the switchboard and the real gh runs: the probe sees it")
 
     def test_the_net_under_the_merge_gate_probe_refuses_when_anything_unexpected_goes_wrong(self):
         for mutate in (False, True):

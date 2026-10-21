@@ -511,7 +511,7 @@ class Lookup:
         binary = switchboard_binary()
         if not binary:
             return self._ident
-        done = self.run([binary, "whoami", "--json"], env=sb_env())
+        done = self.run(sb_argv(binary, "whoami", "--json"), env=sb_env())
         try:
             data = json.loads(done.stdout) if done is not None and done.returncode == 0 else None
         except ValueError:
@@ -524,7 +524,7 @@ class Lookup:
                            "own": data.get("own") is not False,
                            "role": data.get("role") if isinstance(data.get("role"), str) else None}   # False: the repo is only the default (`intent_repo`), the caller has none of its own
             return self._ident
-        plain = self.run([binary, "whoami"], env=sb_env())   # an older switchboard: the name only
+        plain = self.run(sb_argv(binary, "whoami"), env=sb_env())   # an older switchboard: the name only
         if plain is not None and plain.returncode != 0:
             self.failed = True                 # neither form answered: a failure, not an old switchboard
         name = plain.stdout.strip() if plain is not None and plain.returncode == 0 else ""
@@ -1206,7 +1206,7 @@ def review_probe(args, found, reason, lookup, gh):
         blockers += [gate_clean(b) for b in tagged_blockers(data.get("reviews"), head)]
         binary = switchboard_binary()
         if binary and head:
-            done = lookup.run([binary, "review", "blockers", "%s#%d" % (repo, number), "--head", head], env=sb_env())
+            done = lookup.run(sb_argv(binary, "review", "blockers", "%s#%d" % (repo, number), "--head", head), env=sb_env())
             if done is not None and done.returncode == 0:
                 blockers += [gate_clean(line.strip()) for line in done.stdout.splitlines() if line.strip()][:5]
             else:
@@ -1271,7 +1271,7 @@ def gate_probe(args, lookup, gh=None):
             gate_spool("fail_open", repo, number, check, "no switchboard to ask")
             return None
         try:
-            done = subprocess.run([binary, "gates-check", "%s#%d" % (repo, number), "--for", check, "--json"],
+            done = subprocess.run(sb_argv(binary, "gates-check", "%s#%d" % (repo, number), "--for", check, "--json"),
                                   capture_output=True, text=True, timeout=gate_seconds(), stdin=subprocess.DEVNULL,
                                   env=sb_env(own=True))
         except subprocess.TimeoutExpired:
@@ -1368,20 +1368,38 @@ def mg_binary():
     return binary if os.path.isfile(binary) and os.access(binary, os.X_OK) else None
 
 
-KEEP_FLEET_NAMES = ("FLEET_SWITCHBOARD_ROLE", "FLEET_SWITCHBOARD_REPO")   # who the caller says it is: the switchboard checks that against the session, it does not trust it
+ENV_ALLOW = ("LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM", "HERDR_SOCKET_PATH",
+             "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "OPENCODE_SESSION_ID", "FLEET_SWITCHBOARD_ROLE", "FLEET_SWITCHBOARD_REPO")   # who the caller says it is: the switchboard verifies it against the session
+ENV_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"   # a fixed PATH: the caller's cannot choose the `python3` a switchboard script starts with
 
 
 def sb_env(own=False):
-    """The FIXED environment every switchboard the shim starts runs in: the caller's `XDG_*` and `FLEET_SWITCHBOARD_*` (the state, configuration and program the
-    switchboard would read) are dropped, except the two identity names it verifies against the session, and HOME is the account's real home. A worker that sets
-    `XDG_STATE_HOME` cannot hand the switchboard a forged pass, lock or ledger. `own` adds the switchboard's own-call marker."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("XDG_") and (not k.startswith("FLEET_SWITCHBOARD_") or k in KEEP_FLEET_NAMES)}
+    """The FIXED environment every switchboard the shim starts runs in, built from an ALLOW LIST and never by filtering the caller's: a fixed PATH, HOME as the
+    account's real home, the locale and temp names, and the identity names the switchboard verifies against the session. Everything else the caller set
+    (`PYTHON*`, `LD_*`, `DYLD_*`, `XDG_*`, `FLEET_SWITCHBOARD_*`, a made-up name) never reaches it, so a worker cannot hand the switchboard a library, a state
+    directory or a configuration of its own. `own` adds the switchboard's own-call marker."""
+    env = {"PATH": ENV_PATH}
+    for name in ENV_ALLOW:
+        if name in os.environ:
+            env[name] = os.environ[name]
     home = mg_home()
     if home:
         env["HOME"] = home
     if own:
         env["FLEET_SWITCHBOARD_OWN_GH"] = "1"
     return env
+
+
+def sb_argv(binary, *rest):
+    """The command that starts the switchboard: when the program is a Python script (its first line names python) it is started as `<fixed python> -I <program>`
+    (isolated: no `PYTHON*` variable and no user site are read), the python found on the FIXED path, never on the caller's; any other program is started as it is."""
+    try:
+        with open(binary, "rb") as handle:
+            first = handle.readline(200)
+        python = shutil.which("python3", path=ENV_PATH) if first.startswith(b"#!") and b"python" in first else None
+    except OSError:
+        python = None
+    return ([python, "-I", binary] if python else [binary]) + list(rest)
 
 
 def merge_gate_repos():
@@ -1577,7 +1595,7 @@ def merge_gate_probe(args, lookup, gh):
         if not binary:
             return mg_refuse("merge of %s refused: the merge gate cannot be asked (no switchboard)" % ref)
         try:
-            done = subprocess.run([binary, "merge-gate", ref, "--check", "--json"], capture_output=True, text=True, timeout=merge_gate_seconds(),
+            done = subprocess.run(sb_argv(binary, "merge-gate", ref, "--check", "--json"), capture_output=True, text=True, timeout=merge_gate_seconds(),
                                   stdin=subprocess.DEVNULL, env=sb_env(own=True))
         except (subprocess.SubprocessError, OSError):
             return mg_refuse("merge of %s refused: the merge gate did not answer in time; retry, or ask the chief of staff for a logged waiver" % ref)
@@ -1614,7 +1632,7 @@ def merge_gate_release(ref):
     try:
         binary = mg_binary()
         if binary:
-            subprocess.run([binary, "merge-gate", ref, "--release"], capture_output=True, text=True, timeout=merge_gate_seconds(),
+            subprocess.run(sb_argv(binary, "merge-gate", ref, "--release"), capture_output=True, text=True, timeout=merge_gate_seconds(),
                            stdin=subprocess.DEVNULL, env=sb_env(own=True))
     except Exception:
         pass
