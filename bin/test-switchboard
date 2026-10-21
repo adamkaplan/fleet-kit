@@ -75428,62 +75428,56 @@ class TestShimTopSpender(Base):
         self.run_shim("api", self.PATH.replace("5", "7"))
         self.assertEqual(len(self.notices()), 2, "an hour later it asks again")
 
-    def test_s2b_a_failing_or_slow_switchboard_costs_one_attempt_in_a_few_minutes_and_never_a_non_top_agents_call_a_write_or_a_cached_read(self):
-        """rev-4 (#993): when the message cannot be made, no other call class pays for it. Timed against the plain call (the switchboard slept FAKE_SB_SLEEP seconds)."""
-        bad = {"FAKE_SB_EXIT": "1", "FAKE_SB_SLEEP": "3"}
-        self.run_shim("api", self.PATH, env=bad)                      # the top spender's first read pays the one attempt (and the wait)
-        self.assertEqual(len(self.notices()), 1)
-        for n in (6, 7):
-            _done, took = self.timed("pr", "view", "3", env=bad, agent="other")
-            self.assertLess(took, 2.0, "a non-top agent's read is not held by the failed message (call %d)" % n)
-        _done, quick = self.timed("pr", "view", "3", agent="other")
-        for n in (1, 2):
-            _done, took = self.timed("pr", "view", "3", env=bad)      # the top spender again: the wait only, no new attempt within TRY_EVERY
-            self.assertLess(took, quick + 4.0, "the failed attempt is not made again per call (%d)" % n)
-        self.assertEqual(len(self.notices()), 1, "one attempt, not one per call")
-        asked = lambda: len((self.home / "sb.log.who").read_text().split()) if (self.home / "sb.log.who").exists() else 0
-        before = asked()
-        for _ in range(3):
-            self.run_shim("pr", "view", "3", env=bad, agent="other")
-        self.assertLessEqual(asked() - before, 3, "the identity answer is remembered: only the account lookup (one per call) asks, the block adds none")
-        _done, took = self.timed("issue", "edit", "5", "-t", "x", env=bad, agent="other")
-        self.assertLess(took, quick + 1.0, "a write never asks")
-        _done, took = self.timed("issue", "edit", "5", "-t", "x", env=bad)
-        self.assertLess(took, quick + 1.0, "a write by the top spender never asks")
-        self.assertEqual(len(self.notices()), 1)
-        old = time.time() - 400
-        for name in os.listdir(self.state / "gh-low-tried"):
-            os.utime(str(self.state / "gh-low-tried" / name), (old, old))
-        self.run_shim("api", self.PATH.replace("5", "8"), env=bad)
-        self.assertEqual(len(self.notices()), 2, "after TRY_EVERY it tries again")
-        who = [n for n in os.listdir(self.state / "gh-who")]
-        self.assertTrue(who, "the identity answer is remembered in the state directory")
-        self.assertLessEqual(self.shim_module().TRY_EVERY, 600)
-        self.assertLessEqual(self.shim_module().WHO_EVERY, 300)
+    def fake_world(self, who, notice_seconds, notice_rc=1):
+        """A fake clock the fake switchboard and sleep advance, and a fake runner: returns (module, clock list, runs list). No wall time is measured anywhere."""
+        module = self.shim_module()
+        module.FIXED_STATE[0], module.FIXED_PROGRAM[0] = str(self.state), str(self.sb)
+        clock, runs = [time.time()], []
 
-    def test_s2c_a_non_top_or_unknown_caller_never_waits_for_a_failing_or_slow_switchboard_in_any_call_position(self):
-        """rev-1 (#993): identity first. Callers {top, non-top, unknown} x call {first, second} x switchboard {failing, slow}."""
-        unknown = self.home / "unknown-sb"
-        unknown.write_text("#!/bin/sh\n[ \"$1\" = whoami ] && exit 1\necho \"$@\" >> \"$FAKE_SB_LOG\"\n[ -n \"$FAKE_SB_SLEEP\" ] && sleep \"$FAKE_SB_SLEEP\"\nexit 1\n")
-        unknown.chmod(0o755)
-        _d, plain = self.timed("pr", "view", "3", agent="other")
-        for kind, env in (("failing", {"FAKE_SB_EXIT": "1"}), ("slow", {"FAKE_SB_EXIT": "1", "FAKE_SB_SLEEP": "3"})):
-            for who in ("other", "unknown", "worker"):
-                for position in (1, 2):
-                    for d in ("gh-who", "gh-low-tried", "gh-low-told"):
-                        shutil.rmtree(str(self.state / d), ignore_errors=True) if position == 1 else None
-                    if who == "unknown":
-                        os.environ["_X"] = ""
-                        self.sb_backup = self.other.read_text()
-                        self.other.write_text(unknown.read_text())
-                    _d, took = self.timed("pr", "view", "3", env=env, agent="other" if who != "worker" else "worker")
-                    if who == "unknown":
-                        self.other.write_text(self.sb_backup)
-                    if who == "worker":
-                        self.assertLess(took, plain + 2.0 + 4.0 + 8.0 + 1.0, (kind, who, position))
-                    else:
-                        self.assertLess(took, plain + 1.5, (kind, who, position, "no wait for a caller that is not the top spender"))
-        self.assertEqual(self.notices() and set(n.split()[0] for n in self.notices()), {"budget-notice"})
+        def run(argv, **kw):
+            runs.append(argv[1])
+            if argv[1] == "whoami":
+                return subprocess.CompletedProcess(argv, 0 if who else 1, json.dumps({"name": who}) if who else "", "")
+            clock[0] += notice_seconds
+            return subprocess.CompletedProcess(argv, notice_rc, "", "")
+        return module, clock, runs, run
+
+    def call(self, module, clock, run, agent=None):
+        """One READ through the block: how many FAKE seconds it took."""
+        start = clock[0]
+        with mock.patch.object(time, "time", lambda: clock[0]), mock.patch.object(time, "sleep", lambda n: clock.__setitem__(0, clock[0] + n)), \
+                mock.patch.object(subprocess, "run", run):
+            module.low_budget_read(agent)
+        for d in ("gh-who", "gh-low-tried"):                              # files are stamped by the real filesystem: put their mtimes on the fake clock
+            for name in os.listdir(self.state / d) if (self.state / d).exists() else []:
+                os.utime(str(self.state / d / name), (clock[0], clock[0]))
+        return clock[0] - start
+
+    def test_s2b_rev4_in_fake_time_a_failing_or_slow_switchboard_costs_only_the_top_spender_one_attempt_per_try_every(self):
+        for notice_seconds in (0, 8):                                      # failing fast, and slow up to the 8 s deadline
+            for d in ("gh-who", "gh-low-tried", "gh-low-told"):
+                shutil.rmtree(str(self.state / d), ignore_errors=True)
+            module, clock, runs, run = self.fake_world("worker", notice_seconds)
+            first = self.call(module, clock, run)
+            self.assertEqual(first, notice_seconds + module.SLOW_SECONDS, "the top spender: the one attempt, then exactly the wait")
+            second = self.call(module, clock, run)
+            self.assertEqual(second, module.SLOW_SECONDS, "no new attempt within TRY_EVERY: the wait only")
+            self.assertEqual(runs.count("budget-notice"), 1)
+            self.assertEqual(runs.count("whoami"), 1, "the identity answer is remembered")
+            clock[0] += module.TRY_EVERY + 1
+            self.assertEqual(self.call(module, clock, run), notice_seconds + module.SLOW_SECONDS, "after TRY_EVERY it tries again")
+            self.assertEqual(runs.count("budget-notice"), 2)
+
+    def test_s2c_rev1_in_fake_time_a_non_top_or_unknown_caller_advances_no_time_and_runs_no_message_in_any_position(self):
+        for who in ("other", None):                                        # a non-top agent; an identity that cannot be told (fail open)
+            for notice_seconds in (0, 8):
+                for d in ("gh-who", "gh-low-tried", "gh-low-told"):
+                    shutil.rmtree(str(self.state / d), ignore_errors=True)
+                module, clock, runs, run = self.fake_world(who, notice_seconds)
+                for position in (1, 2, 3):
+                    self.assertEqual(self.call(module, clock, run), 0, (who, notice_seconds, position))
+                self.assertNotIn("budget-notice", runs, "only the top spender makes the attempt")
+                self.assertLessEqual(runs.count("whoami"), 1, "asked once, remembered (an unknown answer too)")
 
     def test_s3b_the_wait_is_exactly_slow_seconds_once_and_is_pinned_without_sleeping(self):
         module = self.shim_module()
