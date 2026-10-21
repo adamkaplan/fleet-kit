@@ -94,7 +94,7 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
 | Setting | Meaning |
 |---|---|
 | `CW_ALLOWED_REPOS` | the repositories (`OWNER/NAME`, separated by commas; matched exactly, ASCII case-insensitively; empty means none; ONE malformed entry refuses the whole list, as the launcher's own `create` does; a malformed `CW_TOOLING_REPO` also refuses; checked before anything is created; `CW_TOOLING_REPO` is refused even if listed |
-| `CW_CLOUD_SERVER` (`CW_CLOUD_CA_FILE`) | the cluster API address |
+| `CW_CLOUD_SERVER` (`CW_CLOUD_CA_FILE`) | the cluster: an https URL whose host is a DNS name (`https://NAME[:PORT]`) |
 | `CW_CLUSTER_TOKEN_CMD` | a command that prints a cluster token; when unset the default below is used |
 | `CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME` | the vault that holds the cluster administrator credential (secret `CW_CLUSTER_ADMIN_SECRET`, default `cw-cluster-admin-kubeconfig`; or a command in `CW_CLUSTER_ADMIN_CMD`) |
 | `CW_CLUSTER_TOKEN_DURATION` | the token's requested life, default `20m`, at most `60m` (kubectl's own floor is 10 minutes) |
