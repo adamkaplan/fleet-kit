@@ -625,50 +625,14 @@ def check_allowed(repo, env=None):
 
 def _capture(argv, env=None, feed=None, timeout=TOKEN_CMD_SECONDS, limit=1000000):
     """Run a short helper (a vault read, a mint). `feed` is a text handed over a pipe: the argument `{fd}` in argv names it, so it is never in an
-    argument, the environment or a file. Returns (exit code, stdout, stderr), or None when it could not run or was too slow."""
-    pass_fds, writer = (), None
-    if feed is not None:
-        read_end, write_end = os.pipe()
-        argv = [a.replace("{fd}", str(read_end)) for a in argv]
-        pass_fds = (read_end,)
-        writer = (read_end, write_end)
-    try:
-        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, pass_fds=pass_fds,
-                                 env=env, start_new_session=True)
-    except OSError:
-        if writer:
-            _close_quietly(*writer)
-        return None
-    if writer:
-        _close_quietly(writer[0])
-        threading.Thread(target=_feed, args=(writer[1], feed), daemon=True).start()
-    try:
-        out, err = child.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_group(child)
-        child.communicate()
-        return None
-    except BaseException:
-        _kill_group(child)
-        raise
-    return child.returncode, out[:limit + 1], err
+    argument, the environment or a file. Returns (exit code, stdout, stderr), or None when it could not run or was too slow. The one
+    implementation is the launcher's own (the reaper's refresh runs the same pipe)."""
+    return _lib().capture_command(argv, env=env, feed=feed, timeout=timeout, limit=limit)
 
 
 def _jwt_lifetime(token, now):
     """Seconds the token lives, read from its exp (and iat) claim when it is a JWT; None when it is not one (the requested duration is trusted)."""
-    parts = token.split(".")
-    if len(parts) != 3:
-        return None
-    try:
-        body = parts[1] + "=" * (-len(parts[1]) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(body.encode("ascii")))
-        exp = claims["exp"]
-        iat = claims.get("iat")
-    except (ValueError, KeyError, TypeError, AttributeError):
-        return None
-    if isinstance(exp, bool) or not isinstance(exp, (int, float)) or (iat is not None and (isinstance(iat, bool) or not isinstance(iat, (int, float)))):
-        return None
-    return exp - (iat if iat is not None else now)
+    return _lib().jwt_lifetime(token, now)
 
 
 def _duration(env):
@@ -684,10 +648,7 @@ def _duration(env):
 
 def firewall_refused(ran):
     """True when a vault read's result (exit code, stdout, stderr; None when it could not run) is the vault's FIREWALL refusing this machine."""
-    if ran is None or ran[0] == 0:
-        return False
-    text = (ran[2] or "").lower()
-    return any(marker in text for marker in FIREWALL_MARKERS)
+    return _lib().firewall_refused(ran)
 
 
 class VaultRecovery:
@@ -754,56 +715,31 @@ class VaultRecovery:
             os.close(fd)   # releases the lock
 
 
+def _token_refusal(err):
+    """The refusal of a cluster token that could not be made: the wording of the step that failed, never a value."""
+    if err.kind == "too-long":
+        return "the cluster token lives %d seconds, over the 60 minutes allowed (or already expired); refused, nothing was called" % err.lifetime
+    why = {"token-command-failed": "the token command failed",
+           "vault-settings-missing": "set CW_VAULT_SUBSCRIPTION and CW_VAULT_NAME",
+           "admin-unreadable": "the administrator credential could not be read from the vault" +
+           (" even after the vault access check; ask " + VAULT_OWNER if err.recovered else ""),
+           "mint-failed": "the token could not be minted",
+           "not-a-token": "the answer is not a token"}.get(err.kind, "the token could not be obtained")
+    return "the cluster token could not be obtained (%s): %s" % (why, VAULT_CHECK)
+
+
 def cluster_token(env=None, now=None, recovery=None):
     """A cluster token of at most one hour, minted NOW, in memory. CW_CLUSTER_TOKEN_CMD (a command that prints one), else the default: the cluster
     administrator kubeconfig is read from the vault (CW_CLUSTER_ADMIN_CMD, else `az keyvault secret show` with CW_VAULT_SUBSCRIPTION and
     CW_VAULT_NAME) and `kubectl create token cw-operator --duration=20m` is run with it on a pipe. Nothing is cached or kept. A failure is a
     Refusal that names the vault pre-check; no other credential or context is ever tried. With `recovery` (launch only), a vault read refused for
-    the firewall runs the vault access check once and reads once more."""
+    the firewall runs the vault access check once and reads once more. The route itself is the launcher's own function (the reaper's refresh
+    runs the same one): this is the thin caller that keeps the wording and the recovery."""
     env = dict(os.environ if env is None else env)
-    clock = time.time() if now is None else now
-
-    def fail(why):
-        raise Refusal("the cluster token could not be obtained (%s): %s" % (why, VAULT_CHECK)) from None
-    custom = (env.get("CW_CLUSTER_TOKEN_CMD") or "").strip()
-    if custom:
-        ran = _capture(["sh", "-c", custom], env=env)
-        if ran is None or ran[0] != 0:
-            fail("the token command failed")
-        token = ran[1].strip()
-    else:
-        admin = (env.get("CW_CLUSTER_ADMIN_CMD") or "").strip()
-        if admin:
-            argv = ["sh", "-c", admin]
-        else:
-            sub, vault = (env.get("CW_VAULT_SUBSCRIPTION") or "").strip(), (env.get("CW_VAULT_NAME") or "").strip()
-            if not sub or not vault:
-                fail("set CW_VAULT_SUBSCRIPTION and CW_VAULT_NAME")
-            argv = ["az", "keyvault", "secret", "show", "--subscription", sub, "--vault-name", vault,
-                    "--name", env.get("CW_CLUSTER_ADMIN_SECRET") or "cw-cluster-admin-kubeconfig", "--query", "value", "-o", "tsv"]
-        def read():
-            return _capture(argv, env=env)
-        ran = read()
-        recovered = False
-        if recovery is not None and not admin and firewall_refused(ran):   # only the default vault read, only a firewall refusal, once
-            ran = recovery(read, env)
-            recovered = True
-        if ran is None or ran[0] != 0 or not ran[1].strip() or len(ran[1]) > 1000000:
-            fail("the administrator credential could not be read from the vault" + (
-                " even after the vault access check; ask " + VAULT_OWNER if recovered else ""))
-        admin_config = ran[1]
-        minted = _capture([env.get("CW_KUBECTL", "kubectl"), "--kubeconfig", "/dev/fd/{fd}", "-n", env.get("CW_CLOUD_NAMESPACE", "cw"), "create",
-                           "token", "cw-operator", "--duration=" + _duration(env)], env=dict(env, KUBECONFIG=os.devnull), feed=admin_config)
-        del admin_config
-        if minted is None or minted[0] != 0:
-            fail("the token could not be minted")
-        token = minted[1].strip()
-    if not token or len(token) > 8192 or re.search(r"\s", token) or re.search(r"[\x00-\x1f\x7f]", token):
-        fail("the answer is not a token")
-    lifetime = _jwt_lifetime(token, clock)
-    if lifetime is not None and not 0 < lifetime <= MAX_TOKEN_SECONDS:
-        raise Refusal("the cluster token lives %d seconds, over the 60 minutes allowed (or already expired); refused, nothing was called" % lifetime)
-    return token
+    try:
+        return _lib().cluster_token(env, duration=_duration(env), capture=_capture, now=now, recovery=recovery)
+    except _lib().ClusterLogin as err:
+        raise Refusal(_token_refusal(err)) from None
 
 
 def private_root():
