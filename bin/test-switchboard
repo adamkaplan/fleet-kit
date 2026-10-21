@@ -77852,11 +77852,8 @@ class TestPaneExit(Base):
         self.run_pass(40)
         self.assertEqual([e["detail"]["note"].split(" was ")[-1][:7] for e in self.audit("fleetpane.exit_note")][1:], ["rotated"])
         self.assertEqual(len(self.audit("fleetpane.exit")), 2)
-        self.log.chmod(0)
-        try:
+        with mock.patch.object(sb, "pane_exit_read_log", return_value=("", None, None, "herdr log not read: Permission denied")):
             self.run_pass(50)
-        finally:
-            self.log.chmod(0o600)
         self.assertIn("not read", self.audit("fleetpane.exit_note")[-1]["detail"]["note"])
 
     def test_a_large_log_is_read_only_in_its_tail_and_is_never_changed(self):
@@ -77880,6 +77877,23 @@ class TestPaneExit(Base):
         self.assertTrue(all(n <= sb.PANE_EXIT_TAIL_BYTES for n in reads if isinstance(n, int)))
         self.assertEqual((self.log.stat().st_size, self.log.stat().st_mtime_ns), before)
         self.assertEqual([e["detail"]["pane"] for e in self.audit("fleetpane.exit")], ["61"])
+
+    def test_the_exits_seen_are_kept_in_the_state_file_so_a_restart_writes_nothing_twice(self):
+        self.three_kinds()
+        self.run_pass()
+        self.assertEqual(len(self.audit("fleetpane.exit")), 3)
+        self.assertEqual(len(sb._read_small(self.world.state, sb.PANE_EXIT_FILE)["seen"]), 3)
+        self.engine.__dict__.pop("pane_exit_seen", None)   # a restart: nothing in memory, only the file
+        self.run_pass(20)
+        self.assertEqual(len(self.audit("fleetpane.exit")), 3)
+
+    def test_a_state_file_that_cannot_be_written_does_not_make_the_next_pass_write_the_exits_again(self):
+        self.three_kinds()
+        with mock.patch.object(sb, "_write_small", side_effect=OSError(28, "No space left")):
+            self.run_pass()
+            self.run_pass(20)
+        self.assertEqual(len(self.audit("fleetpane.exit")), 3)
+        self.assertTrue(self.audit("fleetpane.error"))
 
     def test_an_exit_older_than_an_hour_at_the_first_look_is_not_written(self):
         self.write_log(self.exit_line(-7200, 71, 0))
