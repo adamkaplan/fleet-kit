@@ -22910,6 +22910,8 @@ def chat_clear_live_now(engine):
     shadow is simply the configured mode, else a short reason."""
     if not chat_clear_config(engine.config)["live"]:
         return False, None
+    if getattr(engine, "light", False):   # #977: under v2_light the chat clear is SHADOW even with `live: true` (the owner's key AND light off, as before the light read existed)
+        return False, "v2_light"
     if os.path.lexists(str(Path(engine.state_dir) / CHAT_CLEAR_OFF_FILE)):   # ANY entry, even a dangling symlink, is the panic stop
         return False, "kill file"
     try:
@@ -22950,6 +22952,32 @@ def chat_clear_pass(engine, decisions, now):
         engine._note("chat_clear.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
 
 
+CHAT_CLEAR_LIGHT_LIMIT = 10        # v2_light: the newest user messages of the Chief of Staff's session read in one pass (the page is one `session.message.list` call)
+CHAT_CLEAR_LIGHT_BYTES = 65536     # v2_light: a page bigger than this (as JSON) is read for nothing: the bound is ~7x the measured page (8940 bytes for 10 records)
+
+
+def chat_clear_prompts(engine, session_id, now):
+    """The owner's prompts the chat clear judges, newest first. Not under v2_light: as before (`newest_prompts`). UNDER v2_light this is the ONE allowed read of session
+    history besides the write-gate's: ONE `session.message.list` of the newest CHAT_CLEAR_LIGHT_LIMIT user messages of THIS session (the Chief of Staff's), no inbox, no
+    second page, no other session; fleet-sent records are dropped here and `persons_text` decides again. A page over CHAT_CLEAR_LIGHT_BYTES, or a read that fails, gives
+    None and an audit line saying why (once per change, not once per pass; the byte bound is applied AFTER the read, the call itself is capped by its limit): nothing is judged and nothing is marked seen. Never raises."""
+    if not getattr(engine, "light", False):
+        return newest_prompts(engine, session_id)
+    try:
+        page = engine.v2.message_list(session_id, limit=CHAT_CLEAR_LIGHT_LIMIT, type="user")
+    except Exception as err:
+        engine._note("chat_clear.read_refused", "chat_clear", {"why": "the read failed: %s" % _one_line(str(err), 160)})
+        return None
+    page = page if isinstance(page, list) else []
+    size = len(json.dumps(page, separators=(",", ":"), default=str))
+    if size > CHAT_CLEAR_LIGHT_BYTES:
+        engine._note("chat_clear.read_refused", "chat_clear", {"why": "the page was %d bytes, over the bound of %d: nothing is judged" % (size, CHAT_CLEAR_LIGHT_BYTES),
+                                                                                    "bytes": size, "bound": CHAT_CLEAR_LIGHT_BYTES})
+        return None
+    engine._note("chat_clear.read", "chat_clear", {"records": len(page), "bytes": size, "light": True})
+    return [m for m in page if isinstance(m, dict) and _fleet_meta(m) is None]
+
+
 def _chat_clear_pass(engine, decisions, now):
     cfg = chat_clear_config(engine.config)
     if not cfg["enabled"] or engine.actor != "daemon" or engine.state_dir is None or engine.audit is None or engine.jev is None:
@@ -22974,13 +23002,14 @@ def _chat_clear_pass(engine, decisions, now):
     offers = refreshed["offers"]
     if not offers:
         return   # nothing is held for the owner: no read of his messages, no Jev call
-    if getattr(engine, "light", False):
-        return   # v2_light: no background read of any session (the same rule as the classifier's reader)
     discovery = getattr(engine, "discovery", None)
     cos = next((o for o in (discovery.agents.values() if discovery is not None else []) if (o.fleet or {}).get("role") == "chief-of-staff" and not o.problem and o.session_id), None)
     if cos is None:
         return
-    messages = cc.person_messages(newest_prompts(engine, cos.session_id), cc.read_seen(engine.state_dir), now, _created)
+    prompts = chat_clear_prompts(engine, cos.session_id, now)
+    if prompts is None:
+        return   # refused (see `chat_clear.read_refused`): nothing was read, nothing is marked seen
+    messages = cc.person_messages(prompts, cc.read_seen(engine.state_dir), now, _created)
     current_heads = {h["pr"]: h["head"] for h in holds}
     bar = (engine.config.get("jev") or {}).get("min_confidence", cc.HIGH_CONFIDENCE)
     for message in messages[:CHAT_CLEAR_NEW_PER_PASS]:
@@ -22990,8 +23019,8 @@ def _chat_clear_pass(engine, decisions, now):
             engine.audit.append(engine.actor, "chat_clear.dropped", "chat_clear", {"message_id": message["id"], "why": "the offers went away before the message was judged"})
             return
         verdict = cc.decide(engine.jev, message["text"], offers, message["created"], now, bar)
-        live_now, _ = chat_clear_live_now(engine)   # AGAIN, right before acting: a kill file or a broken config that appears during this pass stops the very next message
-        _chat_clear_act(engine, cc, dict(cfg, live=live_now), message, verdict, offers, current_heads, now)
+        live_now, shadow_why = chat_clear_live_now(engine)   # AGAIN, right before acting: a kill file or a broken config that appears during this pass stops the very next message
+        _chat_clear_act(engine, cc, dict(cfg, live=live_now, shadow=shadow_why), message, verdict, offers, current_heads, now)
 
 
 def _chat_clear_act(engine, cc, cfg, message, verdict, offers, current_heads, now):
@@ -23004,7 +23033,7 @@ def _chat_clear_act(engine, cc, cfg, message, verdict, offers, current_heads, no
         verdict = dict(verdict, question=cc.question_text("head_changed", offers, [pr], current_heads), shown=[pr])
     detail = {"message_id": message["id"], "quote": quoted, "action": action, "why": why, "pr": pr, "live": live, "would_clear": action == "clear",
               "probabilities": judge.get("probabilities"), "jev_choice": judge.get("jev_choice"), "model": judge.get("model"), "reason": judge.get("reason"),
-              "screen": (verdict.get("screen") or {}).get("why")}
+              "screen": (verdict.get("screen") or {}).get("why"), "shadow": None if live else cfg.get("shadow")}
     engine.audit.append(engine.actor, "chat_clear.verdict", pr or "chat_clear", detail)
     if action == "none" or not live:
         return   # shadow: the verdict is logged and nothing else happens
