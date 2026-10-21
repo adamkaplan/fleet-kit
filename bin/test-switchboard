@@ -63833,6 +63833,51 @@ class TestWeeklyJobRewrite(Base):
         self.assertEqual(twice[0].read_text(), twice[1])
         self.assertIn("nothing was changed", out)
 
+    def test_958_each_part_of_the_exactness_rule_is_pinned_by_its_own_row(self):
+        """The rule has four parts: the program list's shape, the shell, the command's equality and the single occurrence. One row for each, and a plist plus
+        the old command in a second key for the count."""
+        prog = self.PROG
+        rows = {
+            "shell is zsh": ("/bin/zsh", "-c", self.OLD, None),
+            "shell is bash": ("/bin/bash", "-c", self.OLD, None),
+            "flag is -lc": ("/bin/sh", "-lc", self.OLD, None),
+            "flag is -e": ("/bin/sh", "-e", self.OLD, None),
+            "list has a fourth word": ("/bin/sh", "-c", self.OLD, "<string>extra</string>"),
+            "janitor flag differs": ("/bin/sh", "-c", self.OLD.replace("--apply", "--apply "), None),
+            "second program differs": ("/bin/sh", "-c", "%s disk prune; /elsewhere/fleet-switchboard disk janitor --apply --weekly" % prog, None),
+            "text after the command": ("/bin/sh", "-c", self.OLD + "; true", None),
+        }
+        for label, (shell, flag, command, more) in rows.items():
+            for old in self.agents.iterdir():
+                old.unlink()
+            path = self.agents / "job.plist"
+            path.write_text('<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n  <key>ProgramArguments</key>\n  <array><string>%s</string><string>%s</string>'
+                            '<string>%s</string>%s</array>\n</dict>\n</plist>\n' % (shell, flag, command, more or ""))
+            before = hashlib.sha256(path.read_bytes()).hexdigest()
+            out = self.step()
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before, label)
+            self.assertEqual(self.backups(), [], label)
+            self.assertIn("nothing was changed", out, label)
+        for old in self.agents.iterdir():
+            old.unlink()
+        path, text = self.plist(self.OLD, extra="  <key>Note</key><string>%s</string>\n" % self.OLD)   # the single occurrence
+        self.step()
+        self.assertEqual(path.read_text(), text)
+        self.assertEqual(self.backups(), [])
+
+    def test_958_a_symlinked_job_is_never_rewritten_through_the_link(self):
+        real = self.agents.parent / "real-job.plist"
+        real.write_text(self.plist(self.OLD, "tmp.plist")[1])
+        (self.agents / "tmp.plist").unlink()
+        os.symlink(str(real), str(self.agents / "job.plist"))
+        before = real.read_bytes()
+        try:
+            self.step()
+        except sb.InstallError:
+            pass   # the write check refuses the link: the install stops rather than writing through it
+        self.assertEqual(real.read_bytes(), before)
+        self.assertEqual([n for n in self.backups()], [])
+
     def test_958_s7_the_documentation_snippet_is_what_the_installer_produces(self):
         docs = (Path(sb.__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
         start = docs.index("<?xml version", docs.index("com.example.fleet-disk-prune.plist"))
