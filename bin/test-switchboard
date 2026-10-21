@@ -4385,6 +4385,53 @@ class TestLaunch(Base):
         self.engine.discover(self.world.clock.now())
         sb.pane_health_pass(self.engine, self.world.clock.now() + offset)
 
+    # -- #973: the daemon's own call of the migration (the pass), not the function alone
+
+    class LiveBells:
+        """A herdr client whose live lists carry tab ids and labels: delegates everything else to the real fake."""
+        def __init__(self, real, agents, tabs):
+            self.real, self.agents, self.tabs = real, agents, tabs
+
+        def __getattr__(self, name):
+            return getattr(self.real, name)
+
+        def agent_list(self):
+            return self.agents
+
+        def tab_list(self):
+            return self.tabs
+
+    def recorded_world(self, agents, tabs):
+        registry = sb.load_module("registry")
+        pane, sid = self.world.panes["platform"], self.world.sessions["platform"]
+        registry.upsert(self.world.state, "platform", {"pane": pane, "session": sid, "role": "worker"}, now=1)
+        self.engine.herdr = self.LiveBells(self.engine.herdr, [dict(a, pane_id=pane) for a in agents], tabs)
+        return registry, pane
+
+    def test_the_pass_runs_the_migration_a_belled_pane_gets_bell_true_and_the_marker_exists(self):
+        registry, pane = self.recorded_world([{"tab_id": "t1"}], [{"tab_id": "t1", "label": "\U0001f514 lead"}])
+        self.health()
+        self.assertIs(registry.read(self.world.state)["agents"]["platform"]["bell"], True)
+        self.assertTrue(registry.bell_migrated(self.world.state))
+
+    def test_the_mutant_that_drops_the_call_from_the_pass_fails_the_check_above(self):
+        registry, pane = self.recorded_world([{"tab_id": "t1"}], [{"tab_id": "t1", "label": "\U0001f514 lead"}])
+        with mock.patch.object(sb, "bell_migration", lambda *a, **k: None):
+            self.health()
+        self.assertIsNone(registry.read(self.world.state)["agents"]["platform"].get("bell"))   # the pass-level test would fail: no field, no marker
+        self.assertFalse(registry.bell_migrated(self.world.state))
+
+    def test_a_whole_but_empty_live_list_writes_no_marker_while_agents_are_recorded(self):
+        registry, pane = self.recorded_world([], [])
+        self.health()
+        self.assertFalse(registry.bell_migrated(self.world.state))
+        self.assertIsNone(registry.read(self.world.state)["agents"]["platform"].get("bell"))
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "fleetpane.error" and "pending" in json.dumps(e)])
+        self.engine.herdr = self.LiveBells(self.engine.herdr.real, [{"pane_id": pane, "tab_id": "t1"}], [{"tab_id": "t1", "label": "plain"}])
+        self.health()   # herdr answers again: it runs, and the agent is not belled
+        self.assertIs(registry.read(self.world.state)["agents"]["platform"]["bell"], False)
+        self.assertTrue(registry.bell_migrated(self.world.state))
+
     def state(self, name="platform"):
         obs = self.engine.discover(self.world.clock.now()).agents[name]
         return sb.pane_state(self.engine, name, obs.session_id, obs.pane, ["platform", "coder"], [])[0]

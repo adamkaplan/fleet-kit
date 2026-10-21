@@ -6998,6 +6998,11 @@ def bell_migration(engine, registry, now):
     except HerdrError as err:
         engine._note("fleetpane.error", None, {"error": "bell migration waits: %s" % _one_line(str(err), 100)})
         return
+    if not agents:   # a whole but EMPTY live list (herdr just restarted) is no evidence of anyone's label: with recorded agents to migrate it stays pending, no marker
+        recorded = [r for r in registry.read(engine.state_dir)["agents"].values() if isinstance(r, dict) and r.get("pane") and not isinstance(r.get("bell"), bool)]
+        if recorded:
+            engine._note("fleetpane.error", None, {"error": "bell migration pending: herdr listed no agents but the registry records %d" % len(recorded)})
+            return
     labels = {t.get("tab_id"): str(t.get("label") or "") for t in tabs if isinstance(t, dict)}
     belled = {a.get("pane_id") for a in agents if isinstance(a, dict) and BELL_GLYPH in labels.get(a.get("tab_id"), "")}
     got = registry.migrate_bell(engine.state_dir, belled, True, now=now)
