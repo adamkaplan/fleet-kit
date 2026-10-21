@@ -1443,7 +1443,8 @@ def _summary_line(snapshot, now):
     idle nodes."""
     pods = (snapshot or {}).get("pods") or []
     phases = _pods_by_phase(snapshot)
-    pod_text = ", ".join("%s %d" % (phase, phases[phase]) for phase in sorted(phases, key=lambda p: (-phases[p], p)))
+    order = ("Running", "Pending", "Succeeded", "Failed", "Unknown")   # the phases in the order the line shows them
+    pod_text = ", ".join("%s %d" % (phase, phases[phase]) for phase in sorted(phases, key=lambda p: (order.index(p) if p in order else len(order), p)))
     if (snapshot or {}).get("nodes_read"):
         groups = {}
         for node in (snapshot.get("nodes") or []):
