@@ -31364,8 +31364,9 @@ class Installer:
         if self.kind is None:
             return self.say("cloud reaper", "skipped (no service manager known for this platform)")
         self.step_reaper({}, table_from_file=True)
-        self.out.write("only the cloud reaper's own service was installed: the config, the profile pieces, the command "
-                       "link, the plugin link, the switchboard's own service and the daemon were left alone\n")
+        self.out.write("only the cloud reaper's own service %s: the config, the profile pieces, the command link, "
+                       "the plugin link, the switchboard's own service and the daemon were left alone\n"
+                       % ("would be installed" if self.dry else "was installed"))
 
     # -- the reverse of 3 to 5
     def uninstall(self, with_service=True, with_link=True):

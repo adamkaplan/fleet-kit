@@ -45184,10 +45184,22 @@ REAPER_ONLY_STEPS = {
     "step_ensure": "not called: the daemon is not started here",
     "step_reaper": "called: the reaper's own step, the one thing this path does",
 }
-# The module-level writers of the installer: each one writes a file, and the reaper-only path calls none of them but
-# the one that writes the reaper's own service file.
-INSTALLER_WRITERS = ("write_if_changed", "install_agents", "install_skills", "ensure_skills_path", "install_hooks_plugin",
-                     "install_decisions_plugin", "install_todolist_plugin", "install_cos_orders_template")
+# Every module-level function of bin/fleet-switchboard that the installer's steps call, and what it does. A function
+# the installer starts to call must be classified here: the completeness test fails when one has no row.
+INSTALLER_READERS = ("_one_line", "_read_json_object", "_xdg", "check_writable_target", "collect_status", "config_path",
+                     "cos_orders_path", "fault", "format_status", "herdr_integration_status", "home_link_is_ours",
+                     "home_link_path", "load_config", "plugin_report", "private_env", "reaper_file_path",
+                     "reaper_service_settings", "reaper_settings", "render_reaper", "render_service", "service_file_path",
+                     "service_kind", "service_path_dirs", "service_values", "set_file_mode", "state_dir_path",
+                     "v2_version_of", "validate_config", "weekly_job_scan")
+INSTALLER_WRITERS = ("ensure_home_link", "ensure_skills_path", "ensure_state_dir", "install_agents",
+                     "install_cos_orders_template", "install_decisions_plugin", "install_hooks_plugin", "install_skills",
+                     "install_todolist_plugin", "uninstall_agents", "uninstall_decisions_plugin", "uninstall_hooks_plugin",
+                     "uninstall_skills", "uninstall_skills_path", "uninstall_todolist_plugin", "write_if_changed")
+INSTALLER_STARTERS = ("ensure_daemon",)
+# The writers the reaper-only path may call: the reaper's own service file (through write_if_changed) and the state
+# directory it logs into. Every other writer, and the daemon, must stay untouched.
+REAPER_ONLY_WRITERS = ("ensure_state_dir", "write_if_changed")
 # The six things the reaper-only install leaves alone: the help and the quickstart must each name every one of them.
 REAPER_ONLY_LEAVE_ALONE = (r"\bconfig\b", r"profile pieces", r"command link", r"plugin link",
                             r"switchboard'?s (own )?service", r"\bdaemon\b")
@@ -45246,6 +45258,15 @@ class ReaperOnlyFakes:
         """The installer's step methods, from its own code: a new one must be classified."""
         return sorted(set(re.findall(r"def (step_\w+)\(", class_source("Installer"))))
 
+    def installer_functions(self):
+        """The module-level functions the installer's steps call, from the code: a new one must be classified."""
+        tree = ast.parse((REPO / "bin" / "fleet-switchboard").read_text())
+        module = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+        installer = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Installer")
+        called = {node.func.id for node in ast.walk(installer)
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+        return sorted(called & module)
+
     def reaper_path(self):
         if self.PLATFORM == "darwin":
             return self.home / "Library" / "LaunchAgents" / "com.fleet-kit.cloud-reaper.plist"
@@ -45303,11 +45324,17 @@ class TheReaperOnlyInstall(ReaperOnlyFakes):
                 return real[name](*args, **kwargs)
             return wrapper
 
-        with mock.patch.multiple(sb, **{name: spy(name) for name in INSTALLER_WRITERS}):
+        with mock.patch.multiple(sb, **{name: spy(name) for name in INSTALLER_WRITERS}), \
+                mock.patch.object(sb, "ensure_daemon", side_effect=AssertionError("the daemon must not start")):
             out, error = self.reaper_only()
         self.assertIsNone(error, error)
-        self.assertEqual(sorted(set(called)), ["write_if_changed"])
+        self.assertEqual(sorted(set(called)), sorted(REAPER_ONLY_WRITERS))
         self.assertEqual(written, [str(self.reaper_path())])
+
+    def test_every_function_the_installer_calls_is_classified(self):
+        called = set(self.installer_functions())
+        self.assertEqual(called - set(INSTALLER_READERS) - set(INSTALLER_WRITERS) - set(INSTALLER_STARTERS), set(),
+                         "a function the installer calls has no row: classify it as a reader, a writer or a starter")
 
     def test_no_step_of_the_full_install_is_reached(self):
         called = []
@@ -45342,6 +45369,16 @@ class TheReaperOnlyInstall(ReaperOnlyFakes):
                 self.assertIn(option, err)
                 self.assertEqual(tree_of(self.home), before)
                 self.assertEqual(self.machine.calls, [])
+
+    def test_every_option_of_the_install_parser_is_classified(self):
+        parser = sb.build_parser()
+        (action,) = [a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction"]
+        options = set()
+        for entry in action.choices["install"]._actions:
+            options.update(entry.option_strings)
+        allowed = {"--cloud-reaper-only", "--dry-run", "-h", "--help"}
+        self.assertEqual(options - set(sb.REAPER_ONLY_REFUSALS) - allowed, set(),
+                         "an option of the install parser has no row: refuse it with --cloud-reaper-only, or allow it")
 
     def test_the_parser_itself_refuses_the_combination(self):
         err = io.StringIO()
@@ -45409,6 +45446,44 @@ class TheReaperOnlyInstall(ReaperOnlyFakes):
         for name in sb.CLOUD_ENV_SETTING_NAMES:
             self.assertNotIn(name, text)
 
+    def test_the_settings_the_file_does_not_hold_are_still_carried(self):
+        settings = sb.cloud_settings_path()
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text("CW_CLOUD_NAMESPACE=acme-cw\n")
+        os.chmod(str(settings), 0o600)
+        with mock.patch.dict(os.environ, {"CW_CLOUD_NAMESPACE": "acme-cw", "CW_CLOUD_TOKEN_FILE": "/home/user/.cw/token"}):
+            out, error = self.reaper_only()
+        self.assertIsNone(error, error)
+        text = self.reaper_path().read_text()
+        self.assertNotIn("CW_CLOUD_NAMESPACE", text)
+        self.assertIn("CW_CLOUD_TOKEN_FILE", text)
+
+    def test_without_the_settings_file_the_service_carries_the_settings_as_before(self):
+        self.assertFalse(sb.cloud_settings_path().exists())
+        with mock.patch.dict(os.environ, {"CW_CLOUD_NAMESPACE": "acme-cw"}):
+            out, error = self.reaper_only()
+        self.assertIsNone(error, error)
+        text = self.reaper_path().read_text()
+        self.assertIn("CW_CLOUD_NAMESPACE", text)
+        self.assertIn("acme-cw", text)
+
+    def test_the_settings_table_of_the_launcher_is_the_one_the_installer_knows(self):
+        """The launcher owns the table (cloud/launcher/cloud_worker.py); the installer must know the same names."""
+        self.assertEqual(sorted(self.launcher_settings()), sorted(sb.CLOUD_ENV_SETTING_NAMES))
+
+    def test_the_settings_the_file_does_not_hold_are_the_ones_the_service_must_carry(self):
+        table = set(self.launcher_settings())
+        self.assertEqual(sorted(set(sb.REAPER_SETTING_NAMES) - table),
+                         ["CW_CLOUD_AUDIT", "CW_CLOUD_RECORD_DIR", "CW_CLOUD_TOKEN_FILE", "CW_KUBECONFIG", "CW_KUBE_CONTEXT"])
+
+    def launcher_settings(self):
+        """The names of the launcher's own settings table, from its code."""
+        tree = ast.parse((REPO / "cloud" / "launcher" / "cloud_worker.py").read_text())
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "SETTINGS" for t in node.targets):
+                return [row.elts[0].value for row in node.value.elts]
+        raise AssertionError("the launcher has no SETTINGS table")
+
     def test_a_pasted_token_is_refused_by_name_and_nothing_is_written(self):
         token = "".join(chr(97 + (i * 11) % 26) for i in range(48))   # built at run time: not a literal
         before = tree_of(self.home)
@@ -45468,6 +45543,42 @@ class TestTheReaperOnlyInstallOnMacOS(TheReaperOnlyInstall, InstallCase):
 
 class TestTheReaperOnlyInstallOnLinux(TheReaperOnlyInstall, InstallCase):
     PLATFORM = "linux"
+
+
+class TestTheReaperOnlyDryRunLive(Base):
+    """The real command, a throwaway home and a stub service manager on PATH: nothing real is loaded."""
+
+    def kit(self):
+        """A copy of the kit in a private directory: the reaper's own path walk refuses a checkout under a
+        world-writable directory, and the run must not touch the checkout it runs in."""
+        root = Path(os.path.realpath(str(self.home))) / "kit"
+        shutil.copytree(REPO / "bin", root / "bin", ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(REPO / "cloud", root / "cloud", ignore=shutil.ignore_patterns("__pycache__", "tests"))
+        shutil.copytree(REPO / "templates", root / "templates")
+        return root
+
+    def stub(self, name, body):
+        path = self.home / "stub" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+        os.chmod(str(path), 0o755)
+        return path
+
+    def test_the_real_command_prints_the_step_and_writes_nothing(self):
+        root = self.kit()
+        self.stub("launchctl", "#!/bin/sh\ncase \"$1\" in print) exit 113 ;; *) exit 1 ;; esac\n")
+        self.stub("systemctl", "#!/bin/sh\ncase \"$*\" in *is-enabled*) exit 1 ;; *) exit 1 ;; esac\n")
+        home = self.home / "throwaway"
+        home.mkdir()
+        env = {"HOME": str(home), "PATH": "%s:%s" % (self.home / "stub", os.environ.get("PATH", "")),
+               "XDG_CONFIG_HOME": str(home / ".config"), "XDG_STATE_HOME": str(home / ".local" / "state"),
+               "FLEET_SWITCHBOARD_UNDER_TEST": "1"}
+        done = subprocess.run([sys.executable, "-B", str(root / "bin" / "fleet-switchboard"), "install",
+                               "--cloud-reaper-only", "--dry-run"], capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("cloud reaper", done.stdout)
+        self.assertIn("would run", done.stdout)
+        self.assertEqual(sorted(str(p) for p in home.rglob("*")), [])
 
 
 class TestTheTrialSharesTheInstaller(Base):
