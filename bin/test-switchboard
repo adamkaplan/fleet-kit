@@ -35957,6 +35957,243 @@ class TestImpactHold(LedgerBase):
         self.assertIn("nothing touches credentials", detail["reason"])
         self.assertNotEqual(detail["by"], "owner")
 
+    # ---- #996 slice A: the private entry's configuration reader and context (built and tested, NOT wired)
+
+    CONFIG_SAMPLES = {"no file at all": None, "an empty object": {}, "every key of the table set": {"gh": "/usr/bin/gh", "call_timeout_seconds": 7, "intent_repo": "acme/intents", "awaiting_label": "me:wait", "awaiting_cos_label": "me:cos",
+                                                                                                        "herdr": "/opt/herdr", "opencode": "/opt/opencode", "opencode_env": {"A_B": "c"}, "v2_transport": "cli", "impact_hold": {"enabled": True}, "delegated_clear": {"orders": []}},
+                      "keys the entry does not read": {"poll_seconds": 5, "triage": {"enabled": False}}}
+    CONFIG_INVALID = {"gh": "", "call_timeout_seconds": 0, "intent_repo": "not a repo", "awaiting_label": "a,b", "awaiting_cos_label": "x\ny", "herdr": "", "opencode": "relative/path", "opencode_env": {"bad name": "x"}, "v2_transport": "pigeon", "excluded_repos": 5, "impact_floor": 5, "impact_hold": "no", "delegated_clear": 5}
+
+    def entry_config_file(self, content):
+        import tempfile
+        directory = Path(tempfile.mkdtemp(prefix="entry-config-"))
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = directory / "config.json"
+        if content is not None:
+            path.write_text(json.dumps(content))
+        return path
+
+    def test_the_entry_config_reads_only_its_keys_and_each_equals_what_the_whole_loader_gives_and_a_mutant_that_loads_the_whole_config_is_caught(self):
+        reads = []
+        class Recorder(dict):
+            def __contains__(self, key):
+                reads.append(key)
+                return dict.__contains__(self, key)
+            def __getitem__(self, key):
+                reads.append(key)
+                return dict.__getitem__(self, key)
+            def get(self, key, default=None):
+                reads.append(key)
+                return dict.get(self, key, default)
+        real_loads = json.loads
+        for label, content in self.CONFIG_SAMPLES.items():
+            with self.subTest(label):
+                path = self.entry_config_file(content)
+                del reads[:]
+                with mock.patch.object(json, "loads", lambda text, **k: Recorder(real_loads(text, **k))):
+                    config = sb.entry_config(path)
+                self.assertTrue(set(reads) <= set(sb.ENTRY_CONFIG_KEYS), "the entry read keys outside its table: %s" % sorted(set(reads) - set(sb.ENTRY_CONFIG_KEYS)))
+                whole = sb.load_config(path)
+                for key in sb.ENTRY_CONFIG_KEYS:
+                    self.assertEqual(config.get(key), whole.get(key), "%s: the entry's value equals the whole loader's" % key)
+                self.assertEqual(sorted(set(config) - set(sb.ENTRY_CONFIG_KEYS)), [], "nothing but the table's keys")
+        def outside_reads(fn, path):
+            del reads[:]
+            with mock.patch.object(json, "loads", lambda text, **k: Recorder(real_loads(text, **k))):
+                fn(path)
+            return sorted(set(reads) - set(sb.ENTRY_CONFIG_KEYS))
+        path = self.entry_config_file({})
+        self.assertEqual(outside_reads(sb.entry_config, path), [], "the real entry reads only its table")
+        def reads_an_extra_key(path):   # a real mutant of the entry: it also looks at a key the table does not name
+            config = sb.entry_config(path)
+            json.loads(Path(path).read_text()).get("poll_seconds")
+            return config
+        self.assertEqual(outside_reads(reads_an_extra_key, path), ["poll_seconds"], "the recorder sees a read outside the table")
+        self.assertGreater(len(sb.load_config(path)), 3 * len(sb.ENTRY_CONFIG_KEYS), "the whole loader hands over the daemon's other settings: the table's equality test fails for an entry built on it")
+
+    def test_a_bad_value_of_each_key_the_entry_reads_refuses_with_the_whole_loaders_own_words(self):
+        for key, bad in self.CONFIG_INVALID.items():
+            with self.subTest(key):
+                path = self.entry_config_file({key: bad})
+                with self.assertRaises(sb.ConfigError) as whole:
+                    sb.load_config(path)
+                with self.assertRaises(sb.ConfigError) as entry:
+                    sb.entry_config(path)
+                self.assertEqual(str(entry.exception), str(whole.exception))
+        with self.subTest("an unreadable path"):
+            directory = self.entry_config_file(None).parent
+            with self.assertRaises(sb.ConfigError) as whole:
+                sb.load_config(directory)
+            with self.assertRaises(sb.ConfigError) as entry:
+                sb.entry_config(directory)
+            self.assertEqual(str(entry.exception), str(whole.exception))
+        for label, text in (("not JSON", "{not json"), ("not an object", "[1]")):
+            with self.subTest(label):
+                path = self.entry_config_file(None)
+                path.write_text(text)
+                with self.assertRaises(sb.ConfigError):
+                    sb.entry_config(path)
+
+    @unittest.skipIf(sys.version_info < (3, 11), "the engine constructor is named by co_qualname, new in Python 3.11")
+    def test_the_context_has_what_the_clear_reads_and_builds_neither_the_engine_nor_the_whole_configuration(self):
+        import tempfile
+        state_home = Path(tempfile.mkdtemp(prefix="entry-state-"))
+        self.addCleanup(shutil.rmtree, state_home, True)
+        seen = set()
+        def hook(frame, event, arg):
+            if event == "call" and os.path.basename(frame.f_code.co_filename) == "fleet-switchboard" and (frame.f_code.co_name in ("build_engine", "load_config", "load_runnable_config", "validate_config") or getattr(frame.f_code, "co_qualname", "") == "Switchboard.__init__"):
+                seen.add("%s:%s" % (os.path.basename(frame.f_code.co_filename), frame.f_code.co_name))
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(state_home), "XDG_CONFIG_HOME": str(state_home)}):
+            sys.setprofile(hook)
+            try:
+                context, state, config = sb.clear_context(self.route, self.world.clock.now, "cli", writable=True)
+            finally:
+                sys.setprofile(None)
+        self.assertEqual(sorted(seen), [], "the context is built without the engine and without the whole configuration")
+        for member in ("accounts", "actor", "audit", "config", "gh_runner", "intents", "now", "state_dir", "_external", "_note"):
+            self.assertTrue(hasattr(context, member), member)
+        self.assertEqual((context.actor, context.state_dir, context.config), ("cli", state, config))
+        self.assertIsNotNone(context.audit)
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(state_home), "XDG_CONFIG_HOME": str(state_home)}):
+            read_only, _, _ = sb.clear_context(self.route, self.world.clock.now, "cli", writable=False)
+        self.assertIsNone(read_only.audit)
+        with self.assertRaises(RuntimeError):
+            read_only._external("e", "s", {})
+        context._note("e", "s", {"a": 1})
+        context._note("e", "s", {"a": 1})   # once per change
+        lines = [l for l in (state / "audit.jsonl").read_text().splitlines() if '"e"' in l]
+        self.assertEqual(len(lines), 1)
+
+    def test_slice_a_is_not_wired_nothing_in_the_clear_or_the_record_calls_the_entry_and_both_run_as_on_main(self):
+        """A TEMPORARY slice guard (#996): slice A builds the entry and does not wire it; slice B wires it and replaces this test with the trace and equality tests."""
+        import ast
+        names = ("entry_config", "clear_context", "entry_caller_kind", "identity_clients")
+        callers = {name: set() for name in names}
+        for path in sorted(BIN.glob("*.py")) + [BIN / "fleet-switchboard"]:
+            for fn in [n for n in ast.walk(ast.parse(path.read_text())) if isinstance(n, ast.FunctionDef)]:
+                for x in ast.walk(fn):
+                    if isinstance(x, ast.Call) and getattr(x.func, "id", getattr(x.func, "attr", None)) in names:
+                        callers[getattr(x.func, "id", getattr(x.func, "attr", None))].add(fn.name)
+        self.assertEqual({k: sorted(v) for k, v in callers.items()}, {"entry_config": ["clear_context", "entry_caller_kind"], "clear_context": [], "entry_caller_kind": [], "identity_clients": ["entry_caller_kind"]},
+                         "the entry is called only by its own functions in slice A: nothing in the clear, the record or any command calls clear_context or entry_caller_kind")
+        calls = []
+        for name in names:
+            original = getattr(sb, name)
+            patcher = mock.patch.object(sb, name, (lambda *a, __o=original, __n=name, **k: (calls.append(__n), __o(*a, **k))[1]))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
+        code, out, err = self.under()
+        self.assertEqual(code, 0, err)
+        self.record_pr_setup()
+        code, err, entry = self.record_run(self.EXPLICIT)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(calls, [], "the real clear and the real record never called the entry")
+
+    def test_the_entrys_owner_only_check_gives_the_same_answer_as_the_engines_for_each_kind_of_caller_and_builds_its_clients_from_the_entrys_keys(self):
+        built = []
+        class FakeV2:
+            def __init__(self, binary, env, runner, timeout, transport="auto"):
+                built.append(("v2", binary, dict(env), timeout, transport))
+        class FakeHerdr:
+            def __init__(self, binary, runner, socket_call=None):
+                built.append(("herdr", binary))
+        path = self.entry_config_file({"opencode": "/opt/opencode", "opencode_env": {"A": "b"}, "v2_transport": "cli", "herdr": "/opt/herdr", "call_timeout_seconds": 9})
+        callers = {"a person at a shell": (sb.CallerError("no agent"), None), "an agent": ({"name": "worker-1", "role": "coder"}, None), "an uncertain identity": (sb.IdentityUncertain("two panes"), None),
+                   "a registry that cannot be read": (sb.V2Error("down"), None), "a person whose terminal is not the owner's": (sb.CallerError("no agent"), "not a terminal")}
+        for label, (outcome, terminal_problem) in callers.items():
+            with self.subTest(label):
+                def caller_fleet(herdr, v2, environ, outcome=outcome):
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+                engine = types.SimpleNamespace(herdr=FakeHerdr("/opt/herdr", None), v2=FakeV2("/opt/opencode", {"A": "b"}, None, 9, "cli"))
+                del built[:]
+                with mock.patch.object(sb, "caller_fleet", caller_fleet), mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: terminal_problem), \
+                        mock.patch.object(sb, "build_engine", lambda *a, **k: (engine, None, None)), mock.patch.object(sb, "HerdrClient", FakeHerdr), mock.patch.object(sb, "V2Client", FakeV2), \
+                        mock.patch.object(sb, "config_path", lambda: path):
+                    old = sb.gates_caller_kind(self.route, self.world.clock.now)
+                    del built[:]
+                    new = sb.entry_caller_kind(self.route, self.world.clock.now)
+                self.assertEqual(new, old, "the same answer for %s" % label)
+                self.assertEqual(sorted(built), [("herdr", "/opt/herdr"), ("v2", "/opt/opencode", {"A": "b"}, 9, "cli")], "the clients are built once each, from the entry's own keys")
+
+    def test_the_owner_only_check_has_one_body_for_both_constructors_and_the_context_keeps_the_engines_two_audit_bodies(self):
+        import ast
+        tree = ast.parse((BIN / "fleet-switchboard").read_text())
+        defs = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+        calls = lambda name: {getattr(x.func, "id", None) for x in ast.walk(defs[name]) if isinstance(x, ast.Call)}
+        self.assertIn("caller_kind", calls("gates_caller_kind"))
+        self.assertIn("caller_kind", calls("entry_caller_kind"))
+        self.assertIn("caller_fleet", calls("caller_kind"))
+        self.assertNotIn("caller_fleet", calls("gates_caller_kind") | calls("entry_caller_kind"), "the identity rule is in the one body")
+        method = lambda cls, name: next(m for m in defs[cls].body if isinstance(m, ast.FunctionDef) and m.name == name)
+        for name in ("_external", "_note"):
+            self.assertEqual(ast.unparse(method("ClearContext", name).body), ast.unparse(method("Switchboard", name).body), "the context's %s is the engine's, word for word" % name)
+
+    # S1's exact list (#996): what the real clear and record READ from the engine and the configuration, recorded at run time through a proxy over the real corpus
+
+    # The exact list S1 states (#996): the members of the engine the clear's own code reads, recorded at run time over the real corpus (13) and read statically from bin/impact_hold.py (`engine.X` and
+    # `getattr(engine, "X", default)`: the members a path the corpus does not take reads, or reads with a default), and the configuration keys the code reads. `herdr`/`v2` are the identity clients.
+    ENGINE_MEMBERS_READ = ("__dict__", "_external", "_note", "accounts", "actor", "audit", "ci_record_state", "config", "discover", "gh_runner", "herdr", "intents", "now", "send", "state_dir", "v2", "watches")
+    CONFIG_KEYS_READ = ("awaiting_cos_label", "awaiting_label", "call_timeout_seconds", "delegated_clear", "excluded_repos", "gh", "impact_floor", "impact_hold", "intent_repo")
+    CLIENT_KEYS = ("herdr", "opencode", "opencode_env", "v2_transport")   # read by `build_engine` to build the two identity clients
+
+    def recorded_reads(self):
+        members, keys = set(), set()
+        class Keys(dict):
+            def __getitem__(self, key):
+                keys.add(key)
+                return dict.__getitem__(self, key)
+            def get(self, key, default=None):
+                keys.add(key)
+                return dict.get(self, key, default)
+            def __contains__(self, key):
+                keys.add(key)
+                return dict.__contains__(self, key)
+        class Engine:
+            def __init__(self, engine):
+                object.__setattr__(self, "_engine", engine)
+            def __getattr__(self, name):
+                members.add(name)
+                value = getattr(self._engine, name)
+                return Keys(value) if name == "config" and isinstance(value, dict) else value
+            def __setattr__(self, name, value):
+                members.add("set:" + name)
+                setattr(self._engine, name, value)
+        real = sb.build_engine
+        def recording(*a, **k):
+            engine, state, config = real(*a, **k)
+            return Engine(engine), state, Keys(config)
+        self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
+        with mock.patch.object(sb, "build_engine", recording):
+            self.under()                         # a normal clear
+            self.under(order=18)                 # a refused clear
+            self.run_as("cos", "impact", "clear", self.PR, "--revoke", "--reason", "taking it back for a test")   # a revoke, refused to an agent
+            self.record_pr_setup()
+            self.record_run(self.EXPLICIT)       # a normal record
+            self.record_run(("--impact-severity", "Huge", "--impact-probability", "Remote"))   # a hostile record
+            self.run_as("rev", "review", "record", self.PR, "--reviewer", "nobody", "--verdict", "approve")   # a refused record
+        return members, keys
+
+    def test_the_engine_members_and_configuration_keys_the_real_clear_and_record_read_are_exactly_the_pinned_ones(self):
+        import ast
+        members, keys = self.recorded_reads()
+        static = set()
+        for fn in [n for n in ast.parse((BIN / "impact_hold.py").read_text()).body if isinstance(n, ast.FunctionDef)]:
+            for x in ast.walk(fn):
+                if isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "engine":
+                    static.add(x.attr)
+                if isinstance(x, ast.Call) and getattr(x.func, "id", "") == "getattr" and len(x.args) > 1 and isinstance(x.args[0], ast.Name) and x.args[0].id == "engine" and isinstance(x.args[1], ast.Constant):
+                    static.add(x.args[1].value)
+        everything = members | static
+        if os.environ.get("FLEET_PRINT_READS") == "1":
+            print("ENGINE MEMBERS READ (recorded %d, static %d): %s" % (len(members), len(static), sorted(everything | {"herdr", "v2"})))
+            print("CONFIGURATION KEYS READ: %s" % sorted(keys))
+        self.assertEqual(sorted(everything | {"herdr", "v2"}), sorted(self.ENGINE_MEMBERS_READ), "a member the clear reads that is not pinned (or a pinned one it no longer reads): the entry must provide exactly these")
+        self.assertEqual(sorted(keys), sorted(self.CONFIG_KEYS_READ), "a configuration key the clear reads that is not pinned (or a pinned one it no longer reads)")
+        self.assertEqual(sorted(sb.ENTRY_CONFIG_KEYS), sorted(set(self.CONFIG_KEYS_READ) | set(self.CLIENT_KEYS)), "the entry's key table is the keys the clear reads and the keys of the two identity clients")
+
     # ---- #940 slice 1: ONE closure, derived from the clear's real call graph, read by the refusal and the owner hold
 
     def closure_sets(self):
