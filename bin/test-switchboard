@@ -70948,6 +70948,526 @@ class TestAuthorityModulesGuard(unittest.TestCase):
         self.assertTrue(words and all(isinstance(w, str) and re.fullmatch(r"[a-z]+", w) for w in words))
 
 
+class TestWhoCanClear(unittest.TestCase):
+    """#946: `who_can_clear`, the ONE answer to "who can clear this held pull request", over every outcome of the clear's own rule. Pure: plain dicts in, a plain dict out. Every set (the machinery globs, the
+    new-file globs, the closure files, the floor classes, the never-delegated classes) is read from the matrix file, never listed here; each member is a subTest, and each has a mutant (the member removed from the rule) that must change its row."""
+
+    H = "a" * 40
+    # the refusal strings of the clear for 9 rows, stored from the code as it was before #946 moved the rule into `refusal_items` (each row: [no max_level, a max_level whose score says High])
+    STORED_REFUSALS = json.loads("""{
+ "closure": [
+  [
+   "it changes build_parser, part of the clear (head file)"
+  ],
+  [
+   "it changes build_parser, part of the clear (head file)",
+   "the score is High: High is the owner's"
+  ]
+ ],
+ "floor-authority": [
+  [],
+  [
+   "the score is High: High is the owner's"
+  ]
+ ],
+ "floor-credentials": [
+  [
+   "it changes a credentials path (cloud/launcher/token_mint.py): that stays the owner's own clear"
+  ],
+  [
+   "the score is High: High is the owner's"
+  ]
+ ],
+ "floor-identity": [
+  [
+   "it changes a identity path (bin/switchboard-trial): that stays the owner's own clear"
+  ],
+  [
+   "the score is High: High is the owner's"
+  ]
+ ],
+ "machinery": [
+  [
+   "it changes a file that is the clear or hold machinery or that the daemon loads (bin/impact_hold.py): that stays the owner's own clear"
+  ],
+  [
+   "it changes a file that is the clear or hold machinery or that the daemon loads (bin/impact_hold.py): that stays the owner's own clear",
+   "the score is High: High is the owner's"
+  ]
+ ],
+ "new-file": [
+  [
+   "it adds, deletes or renames a file under a directory the daemon loads at start (bin/new_tool.py): that stays the owner's own clear"
+  ],
+  [
+   "it adds, deletes or renames a file under a directory the daemon loads at start (bin/new_tool.py): that stays the owner's own clear",
+   "the score is High: High is the owner's"
+  ]
+ ],
+ "no-hold": [
+  [],
+  [
+   "the score is High: High is the owner's"
+  ]
+ ],
+ "plain": [
+  [],
+  [
+   "the score is High: High is the owner's"
+  ]
+ ],
+ "unreadable": [
+  [
+   "the changed files cannot be read, so a change to the clear code cannot be ruled out"
+  ],
+  [
+   "the score is High: High is the owner's",
+   "the changed files cannot be read, so a change to the clear code cannot be ruled out"
+  ]
+ ]
+}""")
+
+    def setUp(self):
+        self.floor = sb.load_module("impact_floor")
+        self.module = sb.load_module("delegated_clear")
+        self.matrix = self.floor.load_matrix()
+        self.rule = self.matrix["owner_hold"]["delegated_clear"]
+        self.block = self.rule["score"]
+        self.on = {"threshold": "Serious"}
+
+    def report(self, decision="hold", hits=None, paths=()):
+        return {"pr": "acme/app#9", "head": self.H, "owner_decision": decision, "complete": True, "unknown": None, "renamed_no_source": [], "top_tier_hits": hits or {}, "changed_paths": list(paths),
+                "review_action": "none", "review_class": None}
+
+    @staticmethod
+    def file(name, status="modified", previous=None):
+        return dict({"filename": name, "status": status, "sha": "e" * 40, "patch": "@@ -1 +1 @@\n-a\n+b"}, **({"previous_filename": previous} if previous else {}))
+
+    @staticmethod
+    def concrete(glob):
+        return glob[:-3] + "/probe.py" if glob.endswith("/**") else glob.replace("**", "probe.py").replace("*", "probe")
+
+    def who(self, report, files, closure=None, delegation="on", rule=None, block="shipped"):
+        delegation = self.on if delegation == "on" else delegation
+        return self.module.who_can_clear(rule or self.rule, report, files, self.floor.matches, closure or {}, self.block if block == "shipped" else block, delegation, pr="acme/app#9")
+
+    def expect(self, **over):
+        base = {"pr": "acme/app#9", "head": self.H, "hold": True, "floor_ids": [], "owner_only": [], "min_rating": None, "must_name": [], "who": "owner or chief of staff", "unreadable": None,
+                "delegation": "on", "threshold": "Serious", "needs": []}
+        return dict(base, **over)
+
+    def rows(self):
+        """The 9 rows of S2: name, report, files, closure, expected."""
+        credentials = next(p for p in self.matrix["owner_hold"]["top_tier_paths"]["credentials"] if not self.floor.matches(p, self.rule["clear_code_paths"]) and "*" not in p)
+        identity = next(p for p in self.matrix["owner_hold"]["top_tier_paths"]["identity"] if not self.floor.matches(p, self.rule["clear_code_paths"]) and "*" not in p)
+        floor_rows = []
+        for cls, path in (("credentials", credentials), ("identity", identity), ("authority", "migrations/0002.sql")):
+            rid = next(r for r, c in self.block["floor"]["rules"].items() if c == cls)
+            floor_rows.append(("floor-" + cls, self.report(hits={cls: [path]}, paths=[path]), [self.file(path)], {},
+                               self.expect(floor_ids=[rid], must_name=[rid], min_rating=self.block["floor"]["lowest_level"], who="chief of staff with a rating")))
+        return [
+            ("closure", self.report(paths=["bin/fleet-switchboard"]), [self.file("bin/fleet-switchboard")], {"bin/fleet-switchboard": ["it changes build_parser, part of the clear (head file)"]},
+             self.expect(who="owner only", owner_only=[{"kind": "closure", "why": "changes a definition reachable from the clear (bin/fleet-switchboard)"}])),
+            ("new-file", self.report(paths=["bin/new_tool.py"]), [self.file("bin/new_tool.py", "added")], {},
+             self.expect(who="owner only", owner_only=[{"kind": "new-file", "why": "adds a file under a directory the daemon loads at start (bin/new_tool.py)"}])),
+            ("machinery", self.report(paths=["bin/impact_hold.py"]), [self.file("bin/impact_hold.py")], {},
+             self.expect(who="owner only", owner_only=[{"kind": "machinery", "why": "changes the clear or hold machinery (bin/impact_hold.py)"}])),
+        ] + floor_rows + [
+            ("no-hold", self.report(decision="none", paths=["docs/x.md"]), [self.file("docs/x.md")], {}, self.expect(hold=False, who="no hold")),
+            ("unreadable", self.report(paths=["src/app.py"]), None, {},
+             self.expect(who="unknown", unreadable=self.module.UNREAD, owner_only=[{"kind": "unreadable", "why": "the changed files cannot be read"}])),
+            ("plain", self.report(paths=["src/app.py"]), [self.file("src/app.py")], {}, self.expect()),
+        ]
+
+    def test_s2_the_table_has_9_rows_and_every_row_returns_its_exact_structure(self):
+        rows = self.rows()
+        self.assertEqual(len(rows), 9)
+        for name, report, files, closure, expected in rows:
+            with self.subTest(row=name):
+                self.assertEqual(self.who(report, files, closure), expected)
+        self.assertEqual([r[4]["floor_ids"] for r in rows if r[0].startswith("floor-")], [["floor-credentials"], ["floor-identity"], ["floor-authority"]])
+        self.assertEqual({k for r in rows for o in r[4]["owner_only"] for k in [o["kind"]]}, {"closure", "new-file", "machinery", "unreadable"})
+
+    def test_s2_a_build_that_answers_the_same_for_every_pull_request_fails_the_rows(self):
+        same = self.who(self.report(paths=["src/app.py"]), [self.file("src/app.py")])
+        failed = [name for name, report, files, closure, expected in self.rows() if same != expected]
+        self.assertEqual(sorted(failed), sorted(n for n, *_ in self.rows() if n != "plain"))
+
+    def test_every_who_value_is_reachable_and_the_values_are_one_table(self):
+        seen = {r[4]["who"] for r in self.rows()}
+        seen.add(self.who(self.report(paths=["src/app.py"]), [self.file("src/app.py")], delegation=None)["who"])
+        self.assertEqual(seen, set(self.module.WHO))
+        self.assertEqual(self.who(self.report(paths=["src/app.py"]), [self.file("src/app.py")], delegation=None)["delegation"], "off")
+
+    def test_every_kind_the_rule_can_refuse_for_is_in_the_one_table(self):
+        import ast
+        tree = ast.parse(Path(self.module.__file__).read_text())
+        kinds = {c.args[0].value for c in ast.walk(tree) if isinstance(c, ast.Call) and getattr(c.func, "id", "") == "_item" and c.args and isinstance(c.args[0], ast.Constant)}
+        self.assertEqual(kinds, set(self.module._OWNER_WORDS) | {"unreadable", "rating", "review"}, "a kind the rule can give that the line has no words for (or the reverse)")
+
+    def test_every_machinery_path_is_owner_only_with_its_own_reason_and_removing_it_from_the_rule_changes_the_row(self):
+        for glob in self.rule["clear_code_paths"]:
+            with self.subTest(glob=glob):
+                path = self.concrete(glob)
+                self.assertTrue(self.floor.matches(path, [glob]))
+                got = self.who(self.report(paths=[path]), [self.file(path)])
+                self.assertEqual((got["who"], [o["kind"] for o in got["owner_only"]]), ("owner only", ["machinery"]))
+                self.assertIn("machinery", got["owner_only"][0]["why"])
+                mutant = dict(self.rule, clear_code_paths=[g for g in self.rule["clear_code_paths"] if g != glob])
+                if not self.floor.matches(path, mutant["clear_code_paths"]) and not self.floor.matches(path, self.rule["new_file_globs"]):
+                    self.assertNotEqual(self.who(self.report(paths=[path]), [self.file(path)], rule=mutant)["who"], "owner only")
+
+    def test_every_new_file_glob_and_every_status_is_owner_only_and_a_plain_edit_is_not(self):
+        verbs = {"added": "adds a file", "removed": "deletes a file", "renamed": "renames a file"}
+        for glob in self.rule["new_file_globs"]:
+            path = self.concrete(glob)
+            for status, verb in verbs.items():
+                with self.subTest(glob=glob, status=status):
+                    got = self.who(self.report(paths=[path]), [self.file(path, status)])
+                    self.assertEqual([(o["kind"], verb in o["why"]) for o in got["owner_only"]], [("new-file", True)])
+                    mutant = dict(self.rule, new_file_globs=[g for g in self.rule["new_file_globs"] if g != glob])
+                    self.assertEqual(self.who(self.report(paths=[path]), [self.file(path, status)], rule=mutant)["owner_only"], [])
+            self.assertEqual(self.who(self.report(paths=[path]), [self.file(path, "modified")])["owner_only"], [], "an edit of an existing file is not a new file")
+
+    def test_every_closure_file_is_owner_only_for_a_mapped_change_unreadable_when_unmapped_and_free_when_nothing_is_reached(self):
+        for path in self.rule["closure_files"]:
+            if self.floor.matches(path, self.rule["clear_code_paths"]):
+                continue
+            with self.subTest(path=path):
+                report, files = self.report(paths=[path]), [self.file(path)]
+                self.assertEqual([o["kind"] for o in self.who(report, files, {path: ["it changes f, part of the clear (head file)"]})["owner_only"]], ["closure"])
+                self.assertEqual(self.who(report, files, {path: ["it changes f"]})["owner_only"][0]["why"], "changes a definition reachable from the clear (%s)" % path)
+                self.assertEqual(self.who(report, files, {path: None})["who"], "unknown")
+                self.assertEqual(self.who(report, files, {path: []})["who"], "owner or chief of staff")
+                mutant = dict(self.rule, closure_files=[g for g in self.rule["closure_files"] if g != path])
+                self.assertEqual(self.who(report, files, {path: None}, rule=mutant)["who"], "owner or chief of staff", "a path the rule does not judge is not mapped")
+
+    def test_every_floor_class_gives_its_rule_id_and_the_lowest_rating_and_the_never_delegated_ones_are_owner_only_without_a_max_level(self):
+        for rid, cls in self.block["floor"]["rules"].items():
+            with self.subTest(rule=rid):
+                report, files = self.report(hits={cls: ["x/p.py"]}, paths=["x/p.py"]), [self.file("x/p.py")]
+                got = self.who(report, files)
+                self.assertEqual((got["floor_ids"], got["must_name"], got["min_rating"], got["who"]), ([rid], [rid], self.block["floor"]["lowest_level"], "chief of staff with a rating"))
+                bare = self.who(report, files, delegation={"threshold": None})
+                if cls in self.rule["never_path_classes"]:
+                    self.assertEqual(([o["kind"] for o in bare["owner_only"]], bare["who"]), (["class"], "owner only"))
+                else:
+                    self.assertEqual((bare["owner_only"], bare["who"]), ([], "owner or chief of staff"))
+                self.assertEqual(self.who(report, files, delegation=None)["who"], "owner (delegation is off)" if cls not in self.rule["never_path_classes"] else "owner only")
+                mutant = {"floor": {"lowest_level": "High", "rules": {k: v for k, v in self.block["floor"]["rules"].items() if k != rid}}}
+                self.assertEqual(self.who(report, files, block=mutant)["floor_ids"], [], "the rule id comes from the matrix block")
+        for cls in self.rule["never_path_classes"]:
+            self.assertIn(cls, self.block["floor"]["rules"].values(), "every never-delegated class has a floor rule id")
+
+    def test_the_hold_decisions_and_unreadable_inputs(self):
+        for decision in ("none", "second-review"):
+            self.assertEqual(self.who(self.report(decision=decision), [self.file("a")])["who"], "no hold")
+        for bad in (None, {}, dict(self.report(), owner_decision="maybe")):
+            self.assertEqual(self.module.who_can_clear(self.rule, bad, [], self.floor.matches, {}, self.block, self.on)["who"], "unknown")
+        self.assertEqual(self.module.who_can_clear(None, None, None, None, None, self.block, self.on, pr="acme/app#9", unread="why")["unreadable"], self.module.UNREAD)
+        cut = dict(self.report(), complete=False)
+        self.assertEqual(self.who(cut, [self.file("a")])["who"], "unknown")
+        self.assertEqual(self.who(self.report(), [self.file("a")], block=None)["who"], "unknown", "no score rule: never a confident answer")
+
+    def test_u1_the_refusal_strings_of_the_nine_rows_are_byte_identical_to_the_stored_fixture(self):
+        for name, report, files, closure, _ in self.rows():
+            with self.subTest(row=name):
+                got = [self.module.refusals(self.rule, report, files, self.floor.matches, closure, None),
+                       self.module.refusals(self.rule, report, files, self.floor.matches, closure, {"level": "High", "reasons": ["the score is High: High is the owner's"]})]
+                self.assertEqual(got, self.STORED_REFUSALS[name])
+
+    def test_s4_the_line_names_the_level_the_matrix_gives(self):
+        row = [r for r in self.rows() if r[0] == "floor-authority"][0]
+        shipped = self.module.clear_line(self.who(row[1], row[2]))
+        self.assertIn("at least Serious", shipped)
+        medium = json.loads(json.dumps(self.block))
+        medium["floor"]["lowest_level"] = "Medium"
+        line = self.module.clear_line(self.who(row[1], row[2], block=medium))
+        self.assertIn("at least Medium", line)
+        self.assertNotIn("Serious", line.replace(" on an independent rating up to Serious", ""))
+        self.assertIn("floor-authority", line)
+
+    def test_s12_an_owner_only_line_starts_with_owner_only_and_gives_its_reason_in_words(self):
+        want = {"new-file": "adds a file", "machinery": "machinery", "closure": "reachable from the clear"}
+        for name, report, files, closure, _ in self.rows():
+            if name in want:
+                with self.subTest(row=name):
+                    line = self.module.clear_line(self.who(report, files, closure))
+                    self.assertTrue(line.startswith("Who can clear this: owner only: "), line)
+                    self.assertIn(want[name], line)
+
+    def test_s13_the_documented_samples_are_the_rendered_lines(self):
+        text = (BIN.parent / "docs" / "switchboard.md").read_text()
+        rows = {r[0]: r for r in self.rows()}
+        for name in ("new-file", "floor-authority"):
+            with self.subTest(sample=name):
+                _, report, files, closure, _ = rows[name]
+                line = self.module.clear_line(self.who(report, files, closure))
+                self.assertIn("\n" + line + "\n", text, "the documentation's sample is the line the code renders")
+
+    def test_s9_no_planted_token_and_no_home_path_reaches_the_line_and_a_reason_is_never_printed(self):
+        token = "gh" + "p_" + "A1b2C3d4" * 5
+        home = "/Users/" + "alex" + "/.config/fleet"
+        for planted in (token, home, "x/" + token + ".py", "../../" + home.lstrip("/"), "bin/" + home):
+            with self.subTest(path=planted[:12]):
+                paths = [".github/workflows/" + planted.lstrip("/")]
+                got = self.who(self.report(paths=paths), [self.file(paths[0])], {})
+                line = self.module.clear_line(got)
+                self.assertNotIn(token, json.dumps(got) + line)
+                self.assertNotIn("alex", json.dumps(got) + line)
+        closure = {"bin/fleet-switchboard": ["it changes %s at %s" % (token, home)]}
+        got = self.who(self.report(paths=["bin/fleet-switchboard"]), [self.file("bin/fleet-switchboard")], closure)
+        self.assertNotIn(token, json.dumps(got) + self.module.clear_line(got))
+        self.assertNotIn("alex", json.dumps(got) + self.module.clear_line(got))
+        self.assertEqual(self.module.safe_path("bin/ok_name.py"), "bin/ok_name.py")
+
+    def test_u4_every_token_of_the_line_over_the_rows_is_a_word_of_the_code_a_rule_id_a_level_or_a_changed_path(self):
+        import ast
+        tree = ast.parse(Path(self.module.__file__).read_text())
+        fixed = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in ("clear_line", "_why") or isinstance(node, ast.Assign) and any(getattr(t, "id", "") in ("_OWNER_WORDS", "UNREAD") for t in node.targets):
+                fixed |= {w for c in ast.walk(node) if isinstance(c, ast.Constant) and isinstance(c.value, str) for w in re.findall(r"[A-Za-z0-9_./-]+", c.value)}
+        allowed = fixed | set(self.block["floor"]["rules"]) | set(self.block["ladder"]) | set(self.matrix["owner_hold"]["top_tier_classes"]) | {w for r in self.rows() for p in r[1]["changed_paths"] for w in re.findall(r"[A-Za-z0-9_./-]+", p)}
+        def outside(line):
+            return sorted(set(re.findall(r"[A-Za-z0-9_./-]+", line)) - allowed)
+        seen = 0
+        for name, report, files, closure, _ in self.rows():
+            for delegation in ("on", {"threshold": None}, None):
+                line = self.module.clear_line(self.who(report, files, closure, delegation=delegation))
+                if line is not None:
+                    seen += 1
+                    self.assertEqual(outside(line), [], "%s: %s" % (name, line))
+        self.assertGreater(seen, 20)
+        self.assertTrue(outside(line + " /Users/x/.local/state/fleet/audit.log"), "the check sees a path that is not allowed")
+
+    def test_u5_who_can_clear_is_defined_once_and_the_daemons_line_calls_it_and_it_returns_plain_data(self):
+        import ast
+        count = 0
+        for path in sorted(BIN.parent.rglob("*")):
+            if path.is_file() and not path.name.startswith("test-") and path.suffix in ("", ".py") and ".git" not in path.parts and path.stat().st_size < 3_000_000:
+                try:
+                    count += len(re.findall(r"^\s*def who_can_clear\(", path.read_text(), re.M))
+                except UnicodeDecodeError:
+                    continue
+        self.assertEqual(count, 1)
+        self.assertTrue(callable(self.module.who_can_clear))
+        daemon, hold = ast.parse((BIN / "fleet-switchboard").read_text()), ast.parse((BIN / "impact_hold.py").read_text())
+        calls = lambda tree, fn: {getattr(c.func, "attr", getattr(c.func, "id", "")) for f in ast.walk(tree) if isinstance(f, ast.FunctionDef) and f.name == fn for c in ast.walk(f) if isinstance(c, ast.Call)}
+        self.assertIn("clear_who", calls(daemon, "clear_line_post"))
+        self.assertIn("who_can_clear", calls(hold, "clear_who"))
+        got = self.who(self.report(paths=["src/app.py"]), [self.file("src/app.py")])
+        self.assertEqual(json.loads(json.dumps(got)), got, "a plain structure: it survives a JSON round trip unchanged")
+
+    def test_the_delegation_is_read_from_the_configuration_the_clear_reads(self):
+        bound = lambda n, **extra: dict({"number": n, "sha256": "0" * 64}, **extra)
+        on = lambda *orders: {"delegated_clear": {"orders": list(orders), "charter": 40}}
+        self.assertIsNone(self.module.delegation_of({}, self.block))
+        self.assertIsNone(self.module.delegation_of({"delegated_clear": {"orders": [], "charter": 40}}, self.block))
+        self.assertEqual(self.module.delegation_of(on(bound(1)), self.block), {"threshold": None})
+        self.assertEqual(self.module.delegation_of(on(bound(1, max_level="Medium"), bound(2, max_level="Serious"), bound(3)), self.block), {"threshold": "Serious"})
+
+    def test_s1_the_documented_cause_paragraph_names_every_recorded_refusal_kind_with_its_count_and_says_the_sample_is_thin(self):
+        text = (BIN.parent / "docs" / "switchboard.md").read_text()
+        start = text.index("#### Why a clear was refused (#946)")
+        section = text[start:text.index("\n#", start + 10)]
+        recorded = [("closure rule", 3), ("new-file rule", 1), ("credentials path, rating Medium below the floor Serious", 1), ("did not name the floor rule id", 1),
+                    ("a hold label a person added", 2), ("not the Chief of Staff's own session", 1)]
+        found = [name for name, count in recorded if any(name in row and re.search(r"\|\s*%d\s*\|?\s*$" % count, row) for row in section.split("\n"))]
+        self.assertEqual(len(found), 6, "6 of 6 refusal kinds are named with their recorded count; found %s" % found)
+        self.assertIn("thin sample", section)
+
+
+class TestClearLine(TestImpactHold):
+    """#946: the daemon's hold pass posts ONE line on a held pull request at its first ready head: who can clear it, from the clear's own rule (`clear_who`). Once per head, again only when the content changes,
+    read back from a hidden marker on the pull request. A fake gh records every write; the reads (files, comments) are a fixture."""
+
+    def setUp(self):
+        super().setUp()
+        self.comments, self.gets, self.fail_on = [], [], None
+        self.mapped = []
+        self.set_files("migrations/0002.sql", "bin/impact_hold.py")
+        for target, value in (("impact_carry_get", self.api), ("delegated_clear_map", lambda engine, runner, repo, item, base_sha, rule: self.mapped)):
+            patcher = mock.patch.object(sb, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def set_files(self, *paths, head=LEDGER_HEAD, status="modified"):
+        self.paths = list(paths)
+        self.listing = [{"filename": p, "patch": "@@ -1 +1 @@\n-a\n+b", "status": status, "sha": "e" * 40} for p in paths]
+        self.pr.update({"headRefOid": head, "changedFiles": len(paths), "files": [{"path": p} for p in paths]})
+
+    def api(self, engine, runner, repo):
+        def get(path):
+            self.gets.append(path)
+            if self.fail_on and self.fail_on in path:
+                raise ValueError("the read failed")
+            if "/files" in path:
+                return self.listing if "page=1" in path else []
+            if "/comments" in path:
+                return list(self.comments) if "page=1" in path else []
+            return {"head": {"sha": self.pr["headRefOid"]}, "base": {"sha": "b" * 40}}
+        return get
+
+    def route(self, argv, **kwargs):
+        done = super().route(argv, **kwargs)
+        if argv[0] == FAKE_GH and "--method" in argv and argv[argv.index("--method") + 1] == "POST" and argv[2].endswith("/comments"):
+            self.comments.append({"body": json.loads(kwargs["input"])["body"]})
+        return done
+
+    def posts(self):
+        return [w for w in self.writes if w[0] == "POST" and w[1].endswith("/comments")]
+
+    def markers(self):
+        return [sb.CLEAR_LINE_MARKER.search(w[2]["body"]).groups() for w in self.posts()]
+
+    def delegation(self, level="Serious"):
+        self.extra_config["delegated_clear"] = {"orders": [dict(self.bound(17), max_level=level)], "charter": 40}
+        self.configure()
+        if hasattr(self, "engine_cached"):
+            del self.engine_cached
+
+    def test_s3_a_held_pull_request_gets_one_comment_with_the_line_and_a_draft_gets_none(self):
+        self.passes(records=[self.listed(draft=True)])
+        self.assertEqual(self.posts(), [], "a draft is never commented")
+        self.passes(records=[self.listed()], advance=400)
+        (post,) = self.posts()
+        self.assertEqual(post[1], "repos/acme/app/issues/9/comments")
+        self.assertIn("floor-authority", post[2]["body"])
+        self.assertIn("owner only", post[2]["body"])
+        self.assertIn("fleet-switchboard:from=switchboard", post[2]["body"], "signed, so it never comes back as an event")
+
+    def test_s5_the_same_content_at_the_same_head_is_posted_once(self):
+        for n in range(3):
+            self.passes(advance=n * 400)
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_s6_a_changed_content_at_the_same_head_posts_a_new_line_and_a_repeat_posts_nothing(self):
+        self.set_files("migrations/0002.sql")
+        self.passes()
+        self.delegation()
+        self.passes(advance=400)
+        self.passes(advance=800)
+        self.assertEqual(len(self.posts()), 2)
+        (a, b), (c, d) = self.markers()
+        self.assertEqual(a, c)
+        self.assertNotEqual(b, d)
+        self.assertIn("the owner (delegation is off here)", self.posts()[0][2]["body"])
+        self.assertIn("at least Serious", self.posts()[1][2]["body"])
+
+    def test_s7_a_new_head_with_the_same_content_gets_its_own_line(self):
+        self.passes()
+        self.set_files("migrations/0002.sql", "bin/impact_hold.py", head=LEDGER_NEW_HEAD)
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=2000)
+        self.assertEqual(len(self.posts()), 2)
+        (a, b), (c, d) = self.markers()
+        self.assertEqual((a, b == d, c), (LEDGER_HEAD[:12], True, LEDGER_NEW_HEAD[:12]))
+
+    def test_s8_a_restart_posts_nothing_a_failed_comment_read_posts_nothing_and_the_retry_posts_once(self):
+        self.passes()
+        del self.engine_cached   # a new engine with no memory
+        self.passes(advance=2000)
+        self.assertEqual(len(self.posts()), 1, "the line is read back from the pull request's own comments")
+        self.comments.clear()
+        self.writes.clear()
+        del self.engine_cached
+        self.fail_on = "/comments"
+        self.passes(advance=4000)
+        self.assertEqual(self.posts(), [])
+        self.assertEqual(len(self.events("clear_line.error")), 1)
+        self.fail_on = None
+        self.passes(advance=4000 + sb.IMPACT_RETRY_SECONDS + 1)
+        self.assertEqual(len(self.posts()), 1, "retried later, and only the one")
+        self.passes(advance=9000)
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_s8_a_line_another_author_wrote_with_a_marker_is_not_the_daemons_own(self):
+        self.comments.append({"body": sb.clear_line_marker(LEDGER_HEAD, "x") + "\nnot signed"})
+        self.passes()
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_s9_a_planted_token_and_home_path_in_a_file_name_or_a_reason_do_not_reach_the_posted_body(self):
+        token = "gh" + "p_" + "A1b2C3d4" * 5
+        home = "/Users/" + "alex" + "/.config/fleet"
+        self.mapped = ["it changes %s at %s" % (token, home)]
+        self.set_files("migrations/0002.sql", ".github/workflows/" + token + ".yml", "bin//Users/alex/.config/fleet", "bin/fleet-switchboard")
+        self.passes()
+        (post,) = self.posts()
+        self.assertNotIn(token, post[2]["body"])
+        self.assertNotIn(home, post[2]["body"])
+        self.assertNotIn("alex", post[2]["body"])
+
+    def test_s11_the_dry_run_calls_no_writer_and_the_pass_makes_exactly_one_comment_post_and_no_label_call(self):
+        import contextlib
+        self.hold_config = {"enabled": True, "dry_run": True}
+        self.reconfigure()
+        self.passes()
+        engine, methods, sent = self.engine_cached, [], []
+        real_write, real_gh = sb._gh_write, engine.gh_runner
+        engine.gh_runner = lambda argv, **kw: (methods.append(argv[argv.index("--method") + 1] if "--method" in argv else "?"), real_gh(argv, **kw))[1]
+        engine.send = lambda *a, **k: sent.append(a)
+        audit_before = len(self.world.audit())
+        with contextlib.ExitStack() as stack:
+            for target in ("change_issue_labels", "write_impact_state", "comment_as", "post_ask_comment", "_write_small", "ensure_labels"):
+                stack.enter_context(mock.patch.object(sb, target, side_effect=AssertionError("a writer was called: " + target)))
+            stack.enter_context(mock.patch.object(sb, "_gh_write", lambda engine, runner, repo, path, method, data=None, tolerate_missing=False: (methods.append(method), real_write(engine, runner, repo, path, method, data, tolerate_missing))[1]))
+            got = sb.clear_who(engine, engine.gh_runner, "acme/app", 9)
+        self.assertEqual((got["who"], got["hold"]), ("owner only", True))
+        self.assertTrue(methods and set(methods) <= {"GET", "?"}, "the dry run only read (`?` is a `gh pr view`): %s" % sorted(set(methods)))
+        self.assertEqual((sent, len(self.world.audit()) - audit_before, self.writes), ([], 0, []))
+        self.hold_config = {"enabled": True}
+        self.reconfigure()
+        self.writes.clear()
+        self.passes(records=[self.listed(labels=self.labelled())])
+        self.assertEqual((len(self.posts()), len(self.label_writes())), (1, 0))
+        self.assertEqual([w for w in self.writes if w not in self.posts()], [], "nothing else was written")
+
+    def test_the_line_and_the_clear_read_a_changed_daemon_file_once_and_a_mutant_that_reads_again_is_seen(self):
+        self.set_files("migrations/0002.sql", "bin/fleet-switchboard")
+        reads = []
+        counted = lambda engine, runner, repo, item, base_sha, rule: (reads.append(base_sha), ["it changes f, part of the clear (head file)"])[1]
+        with mock.patch.object(sb, "delegated_clear_map", counted):
+            self.passes()
+            engine = self.engine_cached
+            self.assertEqual(len(self.posts()), 1)
+            self.assertIn("reachable from the clear", self.posts()[0][2]["body"])
+            sb.delegated_clear_pr_checks(engine, engine.gh_runner, "acme/app", 9)
+            self.assertEqual(len(reads), 1, "the clear uses what the line read")
+            sb.delegated_clear_pr_checks(engine, engine.gh_runner, "acme/app", 9)
+            self.assertEqual(len(reads), 2, "handed over once: a later clear reads for itself")
+            sb.clear_who(engine, engine.gh_runner, "acme/app", 9)
+            sb.load_module("delegated_clear").MAP_CACHE.clear()   # the mutant: no shared cache
+            sb.delegated_clear_pr_checks(engine, engine.gh_runner, "acme/app", 9)
+            self.assertEqual(len(reads), 4, "without the hand-over the clear reads again")
+
+    def test_u2_a_pull_request_that_holds_nothing_gets_no_comment_and_the_labels_are_unchanged(self):
+        self.set_files("src/app.py")
+        self.passes()
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.events("clear_line.error"), [])
+
+    def test_u3_a_floor_or_file_list_that_cannot_be_read_posts_no_line_notes_once_and_still_holds(self):
+        self.fail_on = "/files"
+        self.passes()
+        self.passes(advance=sb.IMPACT_RETRY_SECONDS + 1)
+        self.assertEqual(self.posts(), [])
+        self.assertEqual(len(self.events("clear_line.error")), 1)
+        self.assertEqual(len(self.label_writes()), 1, "the hold is applied as before")
+        self.assertEqual(sorted(self.label_writes()[0][2]["labels"]), sorted(self.labelled()))
+
+    def test_the_owner_clear_at_this_head_stops_the_line_and_a_matrix_change_is_judged_again(self):
+        self.passes()
+        self.assertEqual(self.run_as(None, "impact", "clear", self.PR, "--reason", "a false hold: the file is a fixture")[0], 0)
+        self.comments.clear()
+        self.writes.clear()
+        self.passes(advance=4000)
+        self.assertEqual(self.posts(), [])
+
+
+for _name in [n for n in dir(TestImpactHold) if n.startswith("test")]:
+    setattr(TestClearLine, _name, None)   # the inherited fixture only: its own tests run in TestImpactHold
+
+
 class TestOwnerClearModule(unittest.TestCase):
     """Ask #532, slice 3: the code that decides who may clear, hold or release lives in bin/impact_hold.py (listed in the matrix), not in the daemon file. The names come from the
     module's own MOVED tuple and the paths from the matrix: this test has no list of its own."""
