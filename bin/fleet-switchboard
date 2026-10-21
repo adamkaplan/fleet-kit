@@ -25931,8 +25931,6 @@ def job_record_end(record, root, now, audit, boot=None):
     """The ONE audit line `job.dead` of a job that ended without finishing normally, with its reason and last-seen line; a marker file in the job's directory makes it once
     whoever looks first (the daemon or `job status`). True when this call wrote it. A sink that fails never raises."""
     paths = job_paths(record["name"], root)
-    if paths["marker"].exists():
-        return False
     detail = job_end_reason(record, root, now, boot)
     if detail is None:
         return False
