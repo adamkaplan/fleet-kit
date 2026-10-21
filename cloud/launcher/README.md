@@ -98,7 +98,7 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
 | `CW_CLUSTER_TOKEN_CMD` | a command that prints a cluster token; when unset the default below is used |
 | `CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME` | the vault that holds the cluster administrator credential (secret `CW_CLUSTER_ADMIN_SECRET`, default `cw-cluster-admin-kubeconfig`; or a command in `CW_CLUSTER_ADMIN_CMD`) |
 | `CW_CLUSTER_TOKEN_DURATION` | the token's requested life, default `20m`, at most `60m` (kubectl's own floor is 10 minutes) |
-| `CW_GIT_TOKEN_CMD` | prints the one-hour git token for the repository (default: `app_token.py OWNER/NAME`, same settings as `run_task.py`) |
+| `CW_GIT_TOKEN_CMD` | prints the one-hour git token for the repository (default: `app_token.py OWNER/NAME`, same settings as `run_task.py`); the managed reaper runs the same command to renew the token every 30 minutes |
 | `CW_MODEL_AUTH_FILE` | the OpenCode auth file; only its `github-copilot` entry is used |
 | `CW_PULL_SECRET` | optional: the image pull secret name passed to `create` |
 
@@ -160,6 +160,29 @@ hash for the pod name. Shape rates are placeholders (`S` 0.10, `M` 0.20 USD/hour
 **Not in this slice.** Automatic detection of a node drain notice: the end hook runs on `stop`, the idle stop and the hard limit; a drain is handled today by the operator running `stop --reason "node drain"`. The `cw-worker` service account's cloud identity and what it may do belong to the image/cluster setup (slice A and the platform), not here. `bin/test-cloud-launcher` is not yet wired into CI (the suite lists are CI's own).
 
 **Old names.** The launcher reads and writes only the neutral `cw` names (one table in `tests/test_cw_names.py`). No worker exists under an earlier name, and none is read: a pod or secret left under an old name is invisible to `status` and `reap` and must be removed by hand.
+
+## The git token and its renewal
+
+**The cause.** The token a worker pushes with is a one-hour GitHub App installation token (`app_token.py` refuses anything over 61 minutes),
+minted once at launch and stored as the `git-token` key of the per-run Secret `<worker>-run`. Nothing used to renew it, so a worker whose
+hard limit is one hour or more would lose push, and the end hook would lose its retire-time push, when that first hour ended.
+
+### How the git token is renewed
+
+The managed reaper's loop (`reap --loop`) does it, as one more step of each pass (`Launcher.renew_git_tokens`):
+
+- **When.** For each running pod, when the token is `GIT_TOKEN_RENEW_AFTER_SECONDS` (1800, so 30 minutes of its life are left) old. The age is the Secret's
+  `cw/git-token-minted` annotation, or the Secret's creation time when it has none. A pass that finds the token older than an hour (the machine slept) renews at once.
+- **How.** It mints through the SAME route as the launch (`run_git_token_cmd`: `CW_GIT_TOKEN_CMD`, else `app_token.py OWNER/NAME`), so one repository, the exact
+  permissions and the 61-minute cap hold by construction, and replaces only the `git-token` key by one merge patch whose body goes on standard input. The token is
+  never in an argument, an environment value, a file, an output, an audit line or a record. The pod needs no change: its credential helper and `gh` wrapper read the file at every
+  call, and the file is a whole-directory projected volume (no `subPath`) that the kubelet refreshes, usually within a minute or two.
+- **For which repository.** The pod's `CW_REPO` must equal the `repo` of the switchboard's worker record (read only, `CW_CLOUD_RECORD_DIR`, which the renewal therefore needs in the reaper's
+  environment) and be on `CW_ALLOWED_REPOS`. A missing or unreadable record, a mismatch, a pod that is not running or past its hard limit, or a Secret that is not this run's stops the renewal.
+- **The reaper's own needs.** It runs the mint, so it reads the vault settings (`CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME`, from the settings file as the launcher does) and needs a signed-in `az` session and a network path the vault accepts.
+  Without them every renewal fails closed (below) and workers behave as before: they lose push at one hour.
+- **When it fails** (the vault, the lookup, the mint or the patch): the old token stays, one audit line (`action: renew-git-token`, `ok: false`, the reason, never a value) is written, and the next pass tries again. The worker is
+  named in the pass's report as `git token not renewed: ...` with exit 1, so its lane can retire it before the token ends. A renewal writes one `ok: true` line and a `git token renewed` entry.
 
 ## Server-side guards: `app_token.py` and `preflight.py`
 

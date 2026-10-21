@@ -20,6 +20,7 @@ import os
 import re
 import math
 import secrets
+import shlex
 import shutil
 import signal
 import stat
@@ -36,6 +37,15 @@ NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")  # the switchboard's agent name
 SHAPES = {"S": {"cpu": "2", "memory": "4Gi", "usd_per_hour": 0.10},
           "M": {"cpu": "4", "memory": "8Gi", "usd_per_hour": 0.20}}  # list-price estimates, not billed figures
 MAX_TOKEN_SECONDS = 3600
+
+# The git token a worker pushes with is a one-hour installation token (app_token.py caps it at 61 minutes). The launcher mints it once and
+# stores it as the `git-token` key of the per-run Secret; the managed reaper renews it by the SAME mint route before it ends. All of the
+# renewal's numbers and names are here.
+GIT_TOKEN_KEY = "git-token"                      # the Secret key the pod's credential helper and gh wrapper read at every call
+GIT_TOKEN_RENEW_AFTER_SECONDS = 1800             # renew when the token is this old: 30 minutes of its life are left (a failed pass or two, a kubelet delay, a short sleep)
+GIT_TOKEN_MINTED = "cw/git-token-minted"         # the Secret annotation that says when the token was minted (the Secret's creation time stands in when it is absent)
+GIT_TOKEN_MINT_SECONDS = 60                      # the mint child's run limit
+GIT_TOKEN_MAX_CHARS = 4096                       # the most a token may be
 
 # The pod shape of a worker that runs a nested Docker stack (`create --stack`, opt-in; the default pod is unchanged).
 # Shape S (2 CPU, 4 GiB limits) is the smallest existing shape that holds the stack lane's measured peak (1.0-1.35 GiB,
@@ -176,6 +186,10 @@ class CloudError(Exception):
 
 class _FreshNodeRace(Exception):
     """The pod's sandbox failed on the handler-not-known message: the node's containerd was not yet configured."""
+
+
+class _NotRenewed(Exception):
+    """A git-token renewal that is refused or failed; the text is the reason (never a value)."""
 
 
 class _PodVanished(Exception):
@@ -326,6 +340,32 @@ def check_repo_allowed(repo, env):
     key = _repo_key(repo)
     if key is None or key not in allowed or key == tkey:
         raise CloudError("refused: %s is not on the cloud allow-list" % scrub(repo, (), 120), EXIT_USAGE)
+
+
+def git_token_cmd(repo, env):
+    """The command that mints the git token for ONE repository: CW_GIT_TOKEN_CMD, else app_token.py beside this file. The launch (run_task.py)
+    and the renewal run the same command; the renewal builds it here and the driver's own line in run_task.py is pinned equal by a test."""
+    raw = env.get("CW_GIT_TOKEN_CMD")
+    return shlex.split(raw) if raw else [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_token.py"), repo]
+
+
+def run_git_token_cmd(cmd, repo, env, register=None):
+    """THE mint call (the launch and the renewal both come here): run cmd for repo in env, return the token it printed. Never prints, never puts
+    the token in an argument or a file. register(text) hears the child's stdout before it is judged, so a caller's scrubber knows it.
+    Raises CloudError(EXIT_USAGE) with no value in the text."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=GIT_TOKEN_MINT_SECONDS, stdin=subprocess.DEVNULL, env=dict(env, GH_REPO=repo))
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        p = None
+    if p and register:
+        register(p.stdout.strip())
+    token = (p.stdout if p and p.returncode == 0 else "").strip()
+    if not token or len(token) > GIT_TOKEN_MAX_CHARS:
+        why = ""
+        if p and p.stderr.strip():
+            why = ": " + scrub(p.stderr.strip().splitlines()[-1], (), 200)
+        raise CloudError("the git token command gave no usable token%s" % why, EXIT_USAGE)
+    return token
 
 
 # The repository preflight (#665): the program beside this file, found by this file's realpath exactly as repo-approvals.json is found by
@@ -1468,7 +1508,7 @@ class Launcher:
 
     def reap(self):
         """One pass: stop every pod past its hard deadline or idle too long. Returns [(worker, reason, exit)]."""
-        out, now = [], self.clock()
+        out, now, live = [], self.clock(), []
         self.reap_results, self.last_hook = {}, None
         for pod in self.kube.list_pods():
             worker = ann(pod, "worker")
@@ -1481,6 +1521,7 @@ class Launcher:
             if now >= hard:
                 reason = "hard limit"
             else:
+                live.append(pod)   # before its hard limit and not stopped below: the git token renewal's candidates
                 act = self.activity(pod["metadata"]["name"])
                 if act is None:
                     # Fail mode, decided: an unreadable activity is not a reason to kill work, so the pod runs until
@@ -1491,6 +1532,8 @@ class Launcher:
                     reason = "idle"
             if reason:
                 self.last_hook = None
+                if pod in live:
+                    live.remove(pod)
                 try:
                     # by the run's own nonce where the pod carries one: a pod of another run under this name is left whole
                     res = self.stop(argparse.Namespace(worker=worker, reason=reason, run_id=ann(pod, "run-id") or None), reason)
@@ -1499,7 +1542,110 @@ class Launcher:
                 except CloudError as e:
                     self.reap_results[worker] = dict(self.last_hook or {})
                     out.append((worker, reason, e.code))
+        out.extend(self.renew_git_tokens(live, now))
         return out
+
+    # -- the git token's renewal (one more step of the reaper's pass) --
+    def renew_git_tokens(self, pods, now):
+        """For each running pod this launcher made, renew its git token when it is GIT_TOKEN_RENEW_AFTER_SECONDS old. Returns report entries:
+        (worker, "git token renewed", 0) or (worker, "git token not renewed: WHY", 1). A pod that needs nothing (no per-run Secret, not due)
+        adds nothing. One pod's trouble never stops the pass; the old token stays until a patch has landed."""
+        out = []
+        for pod in pods:
+            worker = ann(pod, "worker")
+            try:
+                done = self._renew_git_token(pod, now)
+            except _NotRenewed as e:
+                why = self.kube.scrub(str(e), 200)
+                self.audit(worker, "pod/" + pod["metadata"]["name"], "renew-git-token", self._cost_or_zero(pod), False, why)
+                out.append((worker, "git token not renewed: " + why, 1))
+                continue
+            except (CloudError, ValueError, TypeError, KeyError, AttributeError, OSError) as e:   # unexpected data from the cluster: still named, never silent
+                why = self.kube.scrub("unexpected: %s" % e, 200)
+                self.audit(worker, "pod/" + pod["metadata"]["name"], "renew-git-token", self._cost_or_zero(pod), False, why)
+                out.append((worker, "git token not renewed: " + why, 1))
+                continue
+            if done:
+                self.audit(worker, "pod/" + pod["metadata"]["name"], "renew-git-token", self._cost_or_zero(pod), True, "")
+                out.append((worker, "git token renewed", 0))
+        return out
+
+    def _cost_or_zero(self, pod):
+        try:
+            return self.cost(pod)
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return 0.0
+
+    def _worker_record_repo(self, worker):
+        """The repository the switchboard's worker record names (read only, CW_CLOUD_RECORD_DIR): the one source the renewal trusts for what
+        the worker was launched for. A missing or unreadable record stops the renewal."""
+        rd = self.env.get("CW_CLOUD_RECORD_DIR")
+        if not rd or not NAME_RE.match(worker or ""):
+            raise _NotRenewed("no worker record to read (CW_CLOUD_RECORD_DIR is not set)" if not rd else "bad worker name")
+        try:
+            with open(os.path.join(rd, worker + ".json")) as f:
+                repo = json.load(f).get("repo")
+        except (OSError, ValueError, AttributeError):
+            raise _NotRenewed("the worker record is missing or unreadable") from None
+        if not isinstance(repo, str) or not repo:
+            raise _NotRenewed("the worker record names no repository")
+        return repo
+
+    def _renew_git_token(self, pod, now):
+        """True: renewed. False: nothing to do (quietly). Raises _NotRenewed(reason): refused or failed, the old token untouched."""
+        name, worker = pod["metadata"]["name"], ann(pod, "worker")
+        if (pod.get("status") or {}).get("phase") != "Running":
+            return False
+        secret = self.kube.get_run_secret(name)
+        meta = (secret or {}).get("metadata") or {}
+        labels = meta.get("labels") or {}
+        if not secret or labels.get("cw/pod") != name or ((ann(pod, "run-id") or "") != (labels.get("cw/run-id") or "")):
+            return False   # no per-run Secret (the endpoint route), or one that is not this run's: left whole, as stop leaves it
+        old = (secret.get("data") or {}).get(GIT_TOKEN_KEY)
+        if not old:
+            return False
+        stamp = (meta.get("annotations") or {}).get(GIT_TOKEN_MINTED) or meta.get("creationTimestamp")
+        try:
+            age = (now - parse_iso(stamp)).total_seconds() if stamp else None
+        except (ValueError, TypeError, AttributeError):
+            age = None   # an age that cannot be read is renewed, never trusted
+        if age is not None and age < GIT_TOKEN_RENEW_AFTER_SECONDS:
+            return False
+        self.kube.add_secrets(self._b64_text(old))   # the old token is known to the scrubber before anything can echo it
+        repo = _pod_repo(pod)
+        if _repo_key(repo) is None or _repo_key(repo) != _repo_key(self._worker_record_repo(worker)):
+            raise _NotRenewed("repository mismatch: the worker record and the pod name different repositories")
+        try:
+            check_repo_allowed(repo, self.env)
+        except CloudError:
+            raise _NotRenewed("repository not on the allow-list") from None
+        try:
+            token = run_git_token_cmd(git_token_cmd(repo, self.env), repo, dict(os.environ, **self.env), register=self.kube.add_secrets)
+        except CloudError as e:
+            raise _NotRenewed("the mint failed: %s" % e) from None
+        self.kube.add_secrets(token)
+        if re.search(r"\s", token):
+            raise _NotRenewed("the mint gave a token with whitespace in it")
+        minted = iso(now)
+        body = json.dumps({"metadata": {"annotations": {GIT_TOKEN_MINTED: minted}},
+                           "data": {GIT_TOKEN_KEY: base64.b64encode(token.encode()).decode()}})
+        try:
+            self.kube.run(["patch", "secret", name + "-run", "--type=merge", "--patch-file=/dev/stdin"], stdin=body)   # the one place the token goes: stdin
+        except CloudError as e:
+            raise _NotRenewed("the Secret patch failed: %s" % e) from None
+        after = self.kube.get_run_secret(name)   # the cluster accepted it: the new data, the new stamp
+        ameta = (after or {}).get("metadata") or {}
+        if ((after or {}).get("data") or {}).get(GIT_TOKEN_KEY) != base64.b64encode(token.encode()).decode() \
+                or (ameta.get("annotations") or {}).get(GIT_TOKEN_MINTED) != minted:
+            raise _NotRenewed("the Secret patch was not confirmed on read-back")
+        return True
+
+    @staticmethod
+    def _b64_text(value):
+        try:
+            return base64.b64decode(value, validate=True).decode()
+        except (ValueError, UnicodeDecodeError):
+            return ""
 
 # ---------------------------------------------------------------- the settings file
 # ONE private file holds the operator's settings. `apply_settings` is the only reader: `launch --cloud` (bin/cloud_worker.py) and this driver's

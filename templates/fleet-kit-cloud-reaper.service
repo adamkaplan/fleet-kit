@@ -13,7 +13,8 @@
 # passes, never slower than the reaper's own floor of once a minute) and REAPER_ENV (the reaper's
 # NON-SECRET settings read from the installer's environment).
 #
-# There is nothing private in this file: the reaper reads the operator's token FILE by path. When the
+# There is nothing private in this file: the reaper reads the operator's token FILE by path. To renew workers' git tokens it runs the
+# launcher's mint, which reads the vault settings from the settings file. When the
 # cloud launcher's settings file lands, the reaper reads it as the launcher does.
 #
 # Read the log with: journalctl --user -u fleet-kit-cloud-reaper.service
