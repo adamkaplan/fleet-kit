@@ -22522,10 +22522,10 @@ def clear_line_marker(head, line):
     return "<!-- fleet-switchboard:clear-line head=%s hash=%s -->" % ((head or "")[:12], hashlib.sha256(line.encode("utf-8")).hexdigest()[:12])
 
 
-def clear_line_post(engine, runner, repo, number, head):
+def clear_line_post(engine, runner, repo, number, head, report=None):
     """One held ready head's line: "posted", "present" (the pull request already carries this head and content) or "none" (nothing to say). Raises on any read that failed (never a confident
     line from a failed read; the caller retries later). The only write is the one comment. #946."""
-    who = clear_who(engine, runner, repo, number)
+    who = clear_who(engine, runner, repo, number, report)
     if who["unreadable"]:
         raise ValueError("who can clear it cannot be read: %s" % who["unreadable"])
     if who["head"] != head:
@@ -22577,7 +22577,7 @@ def clear_line_pass(engine, now, rule, heads, reports):
                 break
             spent += 1
             try:
-                clear_line_post(engine, runner, repo, number, head)
+                clear_line_post(engine, runner, repo, number, head, report)
                 done[(repo, number)] = signature
                 noted.discard((repo, number))
             except Exception as err:

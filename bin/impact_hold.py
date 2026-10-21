@@ -1106,12 +1106,12 @@ def delegated_clear_score(engine, module, report, threshold):
     return scored
 
 
-def delegated_clear_inputs(engine, runner, repo, number, take=False):
+def delegated_clear_inputs(engine, runner, repo, number, take=False, report=None):
     """(inputs, None) or (None, why): everything the clear's rule needs about one pull request, READ ONLY (GETs): {"report" (the daemon's own `pr_floor_report`), "rule" (the matrix's
     `owner_hold.delegated_clear`), "files" (the changed files, None when they cannot be read in full), "closure" ({file: reasons or None})}. The file list and the decision must be of ONE head. Read by the
     clear (`delegated_clear_pr_checks`) and by the line the daemon posts (`clear_who`): one reading, no second copy. #661, #946."""
     try:
-        report = pr_floor_report(engine, repo, number)
+        report = report if isinstance(report, dict) else pr_floor_report(engine, repo, number)   # the line is given the report the pass just judged: one floor read per pull request per pass
         rule = (impact_floor.load_matrix().get("owner_hold") or {}).get("delegated_clear")
     except (impact_floor.MatrixError, NoticeError, ValueError) as err:
         return None, "the owner-hold decision or its rule cannot be read (%s): refused" % _one_line(str(err), 140)
@@ -1164,11 +1164,11 @@ def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info
     return report, None
 
 
-def clear_who(engine, runner, repo, number):
+def clear_who(engine, runner, repo, number, report=None):
     """`delegated_clear.who_can_clear` for one pull request, from the clear's own inputs (`delegated_clear_inputs`): who can clear it, as plain data (#946; the packet command reads the same). READ ONLY: GETs
     and nothing else (no label, no state file, no audit line, no send). Inputs that cannot be read give the `unknown` answer, never a confident one."""
     module, pr = load_module("delegated_clear"), "%s#%d" % (repo, number)
-    got, why = delegated_clear_inputs(engine, runner, repo, number)
+    got, why = delegated_clear_inputs(engine, runner, repo, number, False, report)
     block = module.score_block()
     delegation = module.delegation_of(engine.config, block)
     if why:
