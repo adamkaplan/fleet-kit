@@ -261,6 +261,8 @@ Decide toward the ask's Intent. Reach your principal only when the step:
 - is ready for your principal's eyes: a review, findings;
 - or you are stuck after trying.
 
+Durable work (a script, a note, anything you need tomorrow) goes in `FLEET_SCRATCH`: your own private directory, which no clean-up removes while you run. The temp directory is for throwaway output only.
+
 ## Messages from the switchboard
 
 A message starting `[switchboard]` is delivered by the fleet's switchboard, not typed by your

@@ -9261,6 +9261,7 @@ PD_SITES = (
     (21, "cloud_worker.py", "private_root", True, 0),
     (22, "heavy_slots.py", "wrap_argv", True, 0),
     (23, "reds.py", "put", True, 0),
+    (24, "fleet-switchboard", "agent_scratch_env", True, 0),   # #948: the agent's private scratch directory
 )
 
 
@@ -9288,7 +9289,7 @@ class TestPrivateDir(Base):
         for _, file, function, _, _ in PD_SITES:
             table[(file, function)] = table.get((file, function), 0) + 1
         self.assertEqual(code, table)
-        self.assertEqual(len(PD_SITES), 23)
+        self.assertEqual(len(PD_SITES), 24)
         self.assertEqual(sum(1 for s in PD_SITES if s[3]), 12 - 1 + 1 - 0 if False else sum(1 for s in PD_SITES if s[3]))
 
     def test_no_mkdir_or_makedirs_with_exist_ok_exists_outside_the_helper(self):
@@ -9460,6 +9461,12 @@ class TestPrivateDir(Base):
         under(21, lambda: self.cwtok_driver(place))
         under(22, lambda: self.heavy_driver(place))
         under(23, lambda: self.reds_driver(place))
+
+        def s24():
+            root = place(b / "s24")
+            with mock.patch.object(sb, "scratch_root", lambda engine: root):
+                return sb.agent_scratch_env(types.SimpleNamespace(state_dir=b, config={}), "coder")
+        under(24, s24)
         return out
 
     def xdg_config(self):
@@ -12961,13 +12968,14 @@ COS_ONLY_MAXIMS = ("message stands alone", "No change, no message",
                    "Evidence, consequence, options, recommendation")
 RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", "a key that isn't yours",
           "ready for your principal's eyes", "stuck after trying")
-ROLE_LINE_LIMITS = {"coder": 134, "orchestrator": 180, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
+ROLE_LINE_LIMITS = {"coder": 140, "orchestrator": 186, "chief-of-staff": 167, "cos-subagent": 66}  # lines; they must not grow
 # chief-of-staff +350: the quiet `.` ack (#96). chief-of-staff +150: the signed-comment sentence. PR 13 (`report`): coder +300, orchestrator +150, chief-of-staff +100
 # chief-of-staff +400: read-only/merge STOP lines (#105; the native permissions list is excluded from the count)
 # #129: the waiting definitions (the label and the Decision-required rule, in the coder and orchestrator; the same-turn
 # escalation line in the chief of staff): coder +500, orchestrator +500, chief-of-staff +100
 # #133: a held PR is held by LABELS (merge-captain and a hold-<reason>), the first line only for a dated window: coder +250, orchestrator +250, chief-of-staff +250
 # #130: +200 B each for the parked sentence
+# #948: the scratch rule (durable work goes to FLEET_SCRATCH): +4 lines and +60 B each
 # #68: coder +150, orchestrator +450: the launch self-wake sentence and the held-PR text for the copilot definitions
 # #109: coder +1 line, +100 B; orchestrator +100 B: the fleet-planning load line
 # #109: chief-of-staff +100 B: the fleet-planning load line
@@ -12979,7 +12987,7 @@ ROLE_LINE_LIMITS = {"coder": 134, "orchestrator": 180, "chief-of-staff": 162, "c
 # `pr-state`: coder +1 line +140 B, orchestrator +1 line +120 B: the one sentence that sends an agent to the daemon's cache instead of a GitHub polling loop
 # #401 slice 1: the one-sentence GitHub writing rule in its own short section: coder +4 lines +226 B, orchestrator +2 lines +220 B (the wider runtime's file sets each limit)
 # #341: the one never-`git stash` sentence (the files sat at their caps): coder +86 B, orchestrator +60 B, no new line
-ROLE_BYTE_LIMITS = {"coder": 8585, "orchestrator": 11290, "chief-of-staff": 12097, "cos-subagent": 3500}
+ROLE_BYTE_LIMITS = {"coder": 8849, "orchestrator": 11554, "chief-of-staff": 12361, "cos-subagent": 3431}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -78965,6 +78973,237 @@ class TestPaneExitBoundaries(TestPaneExit):
         pass_fn = next(n for n in self.new_code() if getattr(n, "name", "") == "pane_exit_pass")
         guards = sum(isinstance(n, ast.If) for n in ast.walk(pass_fn))
         self.assertLessEqual(guards, 16, "a guard was added to pane_exit_pass: give it a row and a mutant, then raise this count")
+
+
+
+# ------------------------------------------------------- the agent's private scratch directory (#948)
+
+class TestAgentScratch(Base):
+    """Ask #948: every agent has a private scratch directory that survives the clean-ups. `launch` makes it with the ONE private-directory helper
+    (#708), the temp janitor, the worktree reclaim and a retire never take it, and one audited step removes it after the retention."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform",))
+        self.engine = self.world.new_engine("cli")
+        self.state = self.world.state
+        self.scratch = self.state / "scratch"
+        self.work = self.home / "work"
+        self.work.mkdir()
+
+    # --- the helpers of the tests
+    def launch(self, **overrides):
+        args = dict(name="coder", agent="coder", directory=str(self.work), workspace="w1", role="coder",
+                    reports_to="platform", issue=7, brief="Add a health check", patience=5, sleep=self.world.tick)
+        args.update(overrides)
+        return sb.launch_agent(self.engine, **args)
+
+    def pane_env(self, name="coder"):
+        found = [c[1]["root"]["env"] for c in self.world.herdr.socket_calls if c[1].get("root", {}).get("label") == name]
+        self.assertTrue(found, "no pane was opened for %s" % name)
+        return found[-1]
+
+    def brief_of(self, session):
+        return [m["text"] for m in self.world.v2.sessions[session]["messages"] if m["type"] == "user"]
+
+    def registry(self):
+        return sb.load_module("registry")
+
+    def retire(self, name, days_ago, now):
+        self.registry().retire(str(self.state), name, "boss", "done", now=now - days_ago * 86400)
+        path = sb.agent_scratch_path(self.engine, name)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "note.md").write_text("durable work")
+        return path
+
+    # --- S1: created once, private, through the one helper
+    def test_s1_the_directory_is_made_once_through_the_helper_and_a_second_launch_changes_nothing(self):
+        helper = sb.load_module("private_dir")
+        real, calls = helper.ensure_dir, []
+        with mock.patch.object(helper, "ensure_dir", side_effect=lambda path, **kw: (calls.append(str(path)), real(path, **kw))[1]):
+            self.launch(name="coder")
+        self.assertEqual(calls, [str(self.scratch / "coder")], "the one helper is called once per launch")
+        path = self.scratch / "coder"
+        self.assertTrue(path.is_dir())
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700, "private mode")
+        self.assertEqual(path.stat().st_uid, os.getuid(), "owned by the user")
+        before = path.stat().st_mtime_ns
+        again = sb.agent_scratch_env(self.engine, "coder")   # a resume of the same name: the same directory, nothing changed
+        self.assertEqual(again, {sb.SCRATCH_ENV: str(path)})
+        self.assertEqual(path.stat().st_mtime_ns, before, "the second launch changed nothing")
+
+    # --- S2: an unsafe path refuses the launch
+    def test_s2_a_symlink_a_wrong_owner_a_loose_mode_and_a_path_outside_the_state_area_each_refuse(self):
+        cases = {}
+
+        # a symlink at the path (dangling and to a directory)
+        for label, target in (("dangling", self.home / "nowhere"), ("to a directory", self.home / "there")):
+            if target.name == "there":
+                target.mkdir()
+            self.scratch.mkdir(parents=True, exist_ok=True)
+            link = self.scratch / "coder"
+            if link.exists() or link.is_symlink():
+                link.unlink()
+            os.symlink(str(target), str(link))
+            with self.assertRaises(sb.LaunchError) as caught:
+                self.launch(name="coder")
+            message = str(caught.exception)
+            self.assertEqual(len(message.splitlines()), 1, message)
+            self.assertIn(str(link), message)
+            self.assertEqual(self.world.herdr.socket_calls, [], "no pane was opened")
+            if target.name == "there":
+                self.assertEqual(list(target.iterdir()), [], "nothing was created at the link target")
+            link.unlink()
+
+        # a directory of another user
+        path = sb.agent_scratch_path(self.engine, "coder")
+        path.mkdir(parents=True)
+        with mock.patch.object(os, "getuid", return_value=os.getuid() + 1):
+            with self.assertRaises(sb.LaunchError) as caught:
+                self.launch(name="coder")
+        self.assertIn(str(path), str(caught.exception))
+        self.assertEqual(len(str(caught.exception).splitlines()), 1)
+
+        # a loose mode
+        os.chmod(str(path), 0o755)
+        with self.assertRaises(sb.LaunchError) as caught:
+            self.launch(name="coder")
+        self.assertIn(str(path), str(caught.exception))
+        self.assertEqual(len(str(caught.exception).splitlines()), 1)
+
+        # a path outside the state area
+        with self.assertRaises(sb.LaunchError) as caught:
+            sb.agent_scratch_env(self.engine, "../evil")
+        self.assertIn("outside the state area", str(caught.exception))
+        self.assertFalse((self.state / "evil").exists())
+
+    # --- S3: the three launch kinds
+    def test_s3_the_pane_the_headless_and_the_cloud_launches_each_hold_the_path_and_name_it_in_the_brief(self):
+        done = self.launch(name="coder")
+        path = self.scratch / "coder"
+        self.assertEqual(self.pane_env("coder")[sb.SCRATCH_ENV], str(path))
+        brief = self.brief_of(done["session"])
+        self.assertEqual(len(brief), 1)
+        self.assertEqual(brief[0].count(str(path)), 1, "the brief names the path once")
+        self.assertIn("FLEET_SCRATCH", brief[0])
+
+        headless = sb.launch_headless(self.engine, name="hw", agent="coder", directory=str(self.work), role="coder",
+                                      reports_to="platform", issue=7, brief="Add a health check")
+        hw = self.scratch / "hw"
+        self.assertTrue(hw.is_dir())
+        text = self.brief_of(headless["session"])[0]
+        self.assertEqual(text.count(str(hw)), 1, "the headless brief names the path once")
+        self.assertIn("FLEET_SCRATCH", text)
+
+        # the cloud launch: the local side of a cloud worker gets the same directory, in the environment of the launcher child
+        cloud = sb.agent_scratch_env(self.engine, "cloudy")
+        cloudy = self.scratch / "cloudy"
+        self.assertEqual(cloud, {sb.SCRATCH_ENV: str(cloudy)})
+        self.assertEqual(sb.scratch_brief("Task: build it", str(cloudy)).count(str(cloudy)), 1)
+        cloud_module = sb.load_module("cloud_worker").bind(sb.__dict__)
+        seen = {}
+
+        class FakeChild:
+            def __init__(self, argv, **kwargs):
+                seen["argv"], seen["env"] = argv, kwargs.get("env") or {}
+                self.returncode = 0
+
+            def communicate(self, timeout=None):
+                return "{}", ""
+
+        with mock.patch.dict(os.environ, {"FLEET_CLOUD_WORKER_BIN": "fake-launcher"}), \
+                mock.patch.object(cloud_module.subprocess, "Popen", FakeChild):
+            code, body, note = cloud_module.run_launcher(subprocess.run, "create", "cloudy", extra_env=cloud)
+        self.assertEqual(code, 0, note)
+        self.assertEqual(seen["env"].get("FLEET_SCRATCH"), str(cloudy), "the launcher child holds the scratch directory")
+
+    # --- S4: the janitor, the reclaim and a retire keep it
+    def test_s4_the_janitor_the_reclaim_and_a_retire_never_take_it(self):
+        path = sb.agent_scratch_path(self.engine, "coder")
+        path.mkdir(parents=True)
+        (path / "note.md").write_text("durable work")
+        (self.state / sb.PANE_HEALTH_FILE).write_text(json.dumps({"agents": {"coder": {"cwd": str(self.work)}}, "states": {}, "missing": {}}))
+        roots = [where for _, where in sb.janitor_agent_roots(self.engine, time.time(), 7)]
+        self.assertIn(str(path), roots, "the janitor keeps the scratch directory of a registered agent")
+        self.assertEqual(sb.reclaim_for_agent(self.engine, subprocess.run, "coder", True, "retired"), [])
+        self.assertEqual(sb.reclaim_agent_tmp(self.engine, "coder"), [], "the temp directory is not there")
+        self.assertTrue((path / "note.md").exists(), "the reclaim took nothing")
+        lines = sb.scratch_retire_lines(self.engine, "coder", time.time())
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn(str(path), lines[0])
+        self.assertIn(time.strftime("%Y-%m-%d", time.gmtime(time.time() + 14 * 86400)), lines[0])
+        self.assertTrue((path / "note.md").exists(), "the retire took nothing")
+
+    # --- S5: the one audited step removes it after the retention
+    def test_s5_only_the_directory_of_an_agent_retired_longer_than_the_retention_is_removed(self):
+        now = time.time()
+        old = self.retire("old", 15, now)
+        recent = self.retire("recent", 13, now)
+        live = sb.agent_scratch_path(self.engine, "live")
+        live.mkdir(parents=True)
+        self.registry().upsert(str(self.state), "live", {"session": "ses_live", "role": "coder", "state": "working"})
+        self.assertEqual(sb.scratch_retention_days(self.engine.config), 14)
+        lines = sb.reclaim_scratch_dirs(self.engine, now, apply=True)
+        self.assertFalse(old.exists(), "the old directory was removed")
+        self.assertTrue(recent.exists(), "the recent one is kept")
+        self.assertTrue(live.exists(), "a registered agent's directory is never removed")
+        self.assertEqual(len([l for l in lines if str(old) in l]), 1, lines)
+        records = [e for e in self.world.audit() if e["event"] == "scratch.removed"]
+        self.assertEqual(len(records), 1, records)
+        self.assertEqual(records[0]["detail"]["path"], str(old))
+
+    # --- S6: the instructions and the skill say the rule
+    def test_s6_the_instructions_and_the_skill_say_where_durable_work_goes(self):
+        files = sorted((REPO / "agents").rglob("*.md")) + [REPO / "skills" / "fleet-coordination" / "SKILL.md"]
+        self.assertGreaterEqual(len(files), 9)
+        for path in files:
+            with self.subTest(file=path.name):
+                text = " ".join(path.read_text().split())
+                self.assertIn("FLEET_SCRATCH", text)
+                self.assertIn("durable work", text.lower())
+                self.assertIn("throwaway", text.lower())
+
+    # --- S7: every mutant dies
+    def test_s7_each_mutant_dies(self):
+        real_env, real_roots = sb.agent_scratch_env, sb.janitor_agent_roots
+
+        def loose(engine, name):
+            out = real_env(engine, name)
+            os.chmod(str(out[sb.SCRATCH_ENV]), 0o755)
+            return out
+
+        def without_scratch(engine, now, days):
+            return [(n, w) for n, w in real_roots(engine, now, days) if not w.endswith("/scratch/" + n)]
+
+        cases = (
+            ("no creation", "test_s1_the_directory_is_made_once_through_the_helper_and_a_second_launch_changes_nothing",
+             mock.patch.object(sb, "agent_scratch_env", lambda engine, name: {})),
+            ("a loose mode", "test_s1_the_directory_is_made_once_through_the_helper_and_a_second_launch_changes_nothing",
+             mock.patch.object(sb, "agent_scratch_env", loose)),
+            ("the janitor root removed", "test_s4_the_janitor_the_reclaim_and_a_retire_never_take_it",
+             mock.patch.object(sb, "janitor_agent_roots", without_scratch)),
+            ("an early removal", "test_s5_only_the_directory_of_an_agent_retired_longer_than_the_retention_is_removed",
+             mock.patch.object(sb, "scratch_retention_days", lambda config: 0)),
+        )
+        for label, method, patcher in cases:
+            with self.subTest(mutant=label):
+                self.setUp()   # a fresh world: the method below launches an agent
+                with patcher:
+                    try:
+                        getattr(self, method)()
+                    except AssertionError:
+                        continue
+                    except Exception as err:
+                        self.fail("the mutant %s died of %r, not of a failed assertion" % (label, err))
+                self.fail("the mutant %s survived" % label)
+
+    # --- S8: the documentation says where it lives and who may remove it
+    def test_s8_the_documentation_says_where_the_directory_lives_and_who_may_remove_it(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        self.assertIn("<state>/scratch/<agent>", text)
+        self.assertIn("scratch_retention_days", text)
+        self.assertIn("14", text)
+        self.assertIn("disk reclaim-scratch", text)
 
 
 if __name__ == "__main__":

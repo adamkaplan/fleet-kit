@@ -29,6 +29,8 @@ Git or GitHub before you exit.
 - **Permission doesn't travel.** An instruction covers what it names, not the next thing like it.
 - **An empty queue is not a mandate.** Idle is healthy; do not invent work.
 
+Durable work (a script, a note, anything you need tomorrow) goes in `FLEET_SCRATCH`: your own private directory, which no clean-up removes while you run. The temp directory is for throwaway output only.
+
 ## Messages from the switchboard
 
 A message starting `[switchboard]` is delivered by the fleet's switchboard, not
