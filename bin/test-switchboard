@@ -9298,6 +9298,46 @@ class TestPrivateDir(Base):
         helper = [c for c in _pd_calls_all(ast.parse((BIN / "private_dir.py").read_text()))]
         self.assertEqual(len(helper), 1)
 
+    # A hand-rolled directory call of any shape (with or without exist_ok, `Path.mkdir`, `os.mkdir`, `os.makedirs`) outside the helper fails, unless it is named here with its reason.
+    PD_OTHER_DIRECTORY_CALLS = {
+        ("fleet-switchboard", "agent_tmp_env"): "the per-agent directory under the helper-made root: an existing one is the same agent's, then checked with lstat and O_NOFOLLOW",
+        ("review_checkout.py", "_make_dirs"): "a review checkout: a bare os.mkdir that fails loudly on any existing entry (out of scope for #708)",
+        ("review_checkout.py", "checkout"): "a review checkout: the same, never swallows an existing entry",
+        ("private_dir.py", "ensure_dir"): "the helper itself",
+    }
+
+    def other_directory_calls(self, trees):
+        found = collections.Counter()
+        for name, tree in trees.items():
+            def walk(node, function):
+                for child in ast.iter_child_nodes(node):
+                    inner = child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else function
+                    if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute) and child.func.attr in ("mkdir", "makedirs"):
+                        found[(name, function)] += 1
+                    walk(child, inner)
+            walk(tree, "")
+        return found
+
+    def test_no_hand_rolled_directory_call_of_any_shape_exists_outside_the_named_ones(self):
+        trees = {p.name: ast.parse(p.read_text()) for p in _pd_files(BIN)}
+        found = self.other_directory_calls(trees)
+        self.assertEqual(sorted(set(found) - set(self.PD_OTHER_DIRECTORY_CALLS)), [], "a directory is made by hand: use ensure_dir")
+        self.assertEqual(sorted(set(self.PD_OTHER_DIRECTORY_CALLS) - set(found)), [], "an allowed call is gone: take it off the list")
+
+    def test_a_bare_directory_call_added_at_any_converted_site_is_caught_too(self):
+        trees = {p.name: ast.parse(p.read_text()) for p in _pd_files(BIN)}
+        baseline = self.other_directory_calls(trees)
+        for number, file, function, _, ordinal in PD_SITES:
+            with self.subTest(site=number, function=function):
+                node = [n for f, n in _pd_calls(trees[file], file) if f == function][ordinal]
+                saved = (node.func, node.args, node.keywords)
+                node.func = ast.Attribute(value=ast.Call(func=ast.Name(id="Path", ctx=ast.Load()), args=[node.args[0]], keywords=[]), attr="mkdir", ctx=ast.Load())
+                node.args, node.keywords = [], []
+                try:
+                    self.assertGreater(self.other_directory_calls(trees)[(file, function)], baseline[(file, function)])
+                finally:
+                    node.func, node.args, node.keywords = saved
+
     def test_the_scan_reads_the_modules_from_the_daemons_load_calls(self):
         names = {p.name for p in _pd_files(BIN)}
         for _, file, _, _, _ in PD_SITES:
@@ -9400,6 +9440,111 @@ class TestPrivateDir(Base):
         exec(compile(look_first, "look_first", "exec"), old_bug.__dict__)
         with self.interposed(old_bug), self.assertRaises(FileExistsError):
             old_bug.ensure_dir(self.base / "n")
+
+    # --- every branch of the helper: one test and one mutant each, the set derived from the code
+    def helper_module(self, mutation=None):
+        source = (BIN / "private_dir.py").read_text()
+        if mutation is not None:
+            old, new, index = mutation
+            parts = source.split(old)
+            self.assertGreater(len(parts), index + 1, "the mutation does not match the helper: %r" % old)
+            source = old.join(parts[:index + 1]) + new + old.join(parts[index + 1:])
+        module = types.ModuleType("private_dir_branch")
+        exec(compile(source, "private_dir_branch", "exec"), module.__dict__)
+        return module
+
+    def refused(self, module, kind, *args, **kwargs):
+        with self.assertRaises(module.PrivateDirError) as caught:
+            module.ensure_dir(*args, **kwargs)
+        self.assertEqual(caught.exception.kind, kind)
+
+    def branch_dangling_parent(self, m):
+        self.refused(m, "dangling", self.link(self.base / "bp") / "child")
+        self.refused(m, "dangling", self.link(self.base / "bl"))
+        self.assertFalse(os.path.lexists(str(self.gone)))
+
+    def branch_dangling_after_the_mkdir(self, m):
+        path = self.base / "race-link"
+
+        def other(target, *a):   # the other process leaves a link to nothing there, at the moment of the mkdir
+            os.symlink(str(self.gone / "t"), str(target))
+            raise FileExistsError(errno.EEXIST, "File exists", str(target))
+        with mock.patch.object(m.os, "mkdir", other):
+            self.refused(m, "dangling", path)
+
+    def branch_umask(self, m):
+        parent = self.real(self.base / "um")
+        old = os.umask(0o277)
+        try:
+            made = m.ensure_dir(parent / "d")
+        finally:
+            os.umask(old)
+        self.assertEqual(stat.S_IMODE(made.stat().st_mode), 0o700)
+
+    def branch_a_file_where_a_private_directory_goes(self, m):
+        path = self.base / "afile"
+        path.write_text("")
+        os.chmod(str(path), 0o600)
+        self.refused(m, "not-directory", path)
+
+    def branch_group_or_world_bits(self, m):
+        loose = self.real(self.base / "mode")
+        os.chmod(str(loose), 0o755)
+        self.refused(m, "loose", loose)
+
+    def branch_another_owner(self, m):
+        other = os.getuid() + 1
+        with mock.patch.object(m.os, "getuid", lambda: other):
+            self.refused(m, "loose", self.real(self.base / "owner"))
+
+    def branch_a_file_where_a_plain_directory_goes(self, m):
+        path = self.base / "plainfile"
+        path.write_text("")
+        self.refused(m, "not-directory", path, private=False)
+
+    def branch_a_plain_directory_is_never_mode_checked(self, m):
+        loose = self.real(self.base / "open")
+        os.chmod(str(loose), 0o777)
+        self.assertEqual(m.ensure_dir(loose, private=False), loose)
+
+    def branch_check_false_leaves_the_rule_to_the_caller(self, m):
+        loose = self.real(self.base / "mine")
+        os.chmod(str(loose), 0o755)
+        self.assertEqual(m.ensure_dir(loose, check=False), loose)
+
+    def branch_no_parents_when_not_asked(self, m):
+        with self.assertRaises(FileNotFoundError):
+            m.ensure_dir(self.base / "none" / "child", parents=False)
+
+    HELPER_BRANCHES = (
+        # (branch method, the mutation that removes it: text, replacement, which occurrence)
+        ("branch_dangling_parent", ("if gone is not None:", "if False:", 0)),
+        ("branch_dangling_after_the_mkdir", ("if gone is not None:", "if False:", 1)),
+        ("branch_umask", ("if created and private:", "if False:", 0)),
+        ("branch_a_file_where_a_private_directory_goes", ("if not os.path.isdir(str(path)):\n            raise", "if False:\n            raise", 0)),
+        ("branch_group_or_world_bits", ("info.st_mode & 0o077", "0", 0)),
+        ("branch_another_owner", ("info.st_uid != os.getuid()", "False", 0)),
+        ("branch_a_file_where_a_plain_directory_goes", ("elif not os.path.isdir(str(path)):", "elif False:", 0)),
+        ("branch_a_plain_directory_is_never_mode_checked", ("if private and check:", "if check:", 0)),
+        ("branch_check_false_leaves_the_rule_to_the_caller", ("if private and check:", "if private:", 0)),
+        ("branch_no_parents_when_not_asked", ("if parents and not path.parent.exists():", "if not path.parent.exists():", 0)),
+    )
+
+    def test_every_refusal_of_the_helper_has_a_test_and_a_mutant_that_it_kills(self):
+        tree = ast.parse((BIN / "private_dir.py").read_text())
+        raises = [n for n in ast.walk(tree) if isinstance(n, ast.Raise) and isinstance(n.exc, ast.Call) and getattr(n.exc.func, "id", "") == "PrivateDirError"]
+        self.assertEqual(len(raises), 5, "a refusal was added or removed: give it a branch test and a mutant below")
+        kinds = sorted(r.exc.args[1].value for r in raises)
+        self.assertEqual(kinds, ["dangling", "dangling", "loose", "not-directory", "not-directory"])
+        for name, mutation in self.HELPER_BRANCHES:
+            with self.subTest(branch=name):
+                shutil.rmtree(str(self.base), ignore_errors=True)
+                self.base.mkdir()
+                getattr(self, name)(self.helper_module())   # the helper passes it
+                shutil.rmtree(str(self.base), ignore_errors=True)
+                self.base.mkdir()
+                with self.assertRaises((AssertionError, OSError), msg="the mutant survived: %s" % name):
+                    getattr(self, name)(self.helper_module(mutation))
 
     def test_the_four_copies_of_the_module_loader_are_the_same_code(self):
         bodies = {}
