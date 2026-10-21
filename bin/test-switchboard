@@ -34727,6 +34727,263 @@ class TestBlockTable(LedgerBase):
         self.assertIn("notice withdraw takes only the PR", err)
 
 
+class TestAgentBlockCounts(TestBlockTable):
+    """#901: an impact rating counts by score only when it carries the verdict block the agent returned. Every shape is driven through the real `review record`, then scored by the real `judge`."""
+
+    SCORED = "impact-severity: Marginal\nimpact-probability: Remote\nimpact-reason: why\n"
+    # shape -> (record command arguments builder, recorded, counts by score)
+    SHAPES = {
+        "block present": ("block", True, True),
+        "block for another head": ("other-head", False, False),
+        "malformed block": ("malformed", False, False),
+        "flags only": ("flags", True, False),
+        "block disagreeing with the flags": ("disagree", True, False),
+        "block with no score lines": ("no-score", True, False),
+        "old record (no block keys)": ("old", True, False),
+    }
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(sb, "gates_caller_kind", return_value=("agent", "rev", "reviewer"))   # the recorded role of the session that records: the independent reviewer
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def make(self, shape):
+        base = ("review", "record", self.PR, "--reviewer", "impact")
+        if shape == "block":
+            return self.record(extra=self.SCORED)
+        if shape == "other-head":
+            path = self.world.state / "other.txt"
+            path.write_text("verdict: approve\nhead: %s\nimpact-action: none\n%sfindings:\n" % ("b" * 40, self.SCORED))
+            return self.run_as("coder", *base, "--block", str(path))
+        if shape == "malformed":
+            path = self.world.state / "bad.txt"
+            path.write_text("nothing like a verdict block\n")
+            return self.run_as("coder", *base, "--block", str(path))
+        if shape == "flags":
+            return self.run_as("coder", *base, "--verdict", "approve", "--impact-action", "none", "--impact-severity", "Marginal", "--impact-probability", "Remote")
+        if shape == "disagree":
+            return self.record("--impact-severity", "Critical", "--impact-probability", "Remote", extra=self.SCORED)
+        if shape == "no-score":
+            return self.record()
+        if shape == "old":
+            code = self.run_as("coder", *base, "--verdict", "approve", "--impact-action", "none", "--impact-severity", "Marginal", "--impact-probability", "Remote")
+            return code
+
+    def score(self, last=1):
+        mod = sb.load_module("delegated_clear")
+        entries = [e for e in self.ledger() if e["kind"] == "review_record"][-last:]
+        return mod.judge(mod.score_block(), sb.impact_floor.load_matrix()["cells"], entries, {"pr": self.PR, "head": LEDGER_HEAD}, "Serious")
+
+    def test_every_shape_records_as_the_table_says_and_counts_only_with_the_agents_block(self):
+        for name, (shape, recorded, counts) in self.SHAPES.items():
+            with self.subTest(shape=name):
+                before = len([e for e in self.ledger() if e["kind"] == "review_record"])
+                code, out, err = self.make(shape)
+                self.assertEqual(code == 0, recorded, err)
+                entries = [e for e in self.ledger() if e["kind"] == "review_record"]
+                self.assertEqual(len(entries), before + (1 if recorded else 0))
+                if not recorded:
+                    continue
+                if shape == "old":   # strip the block keys as an old record has none
+                    entry = dict(entries[-1])
+                    for key in [k for k in entry if k.startswith("block_")]:
+                        del entry[key]
+                    scored = sb.load_module("delegated_clear").judge(sb.load_module("delegated_clear").score_block(), sb.impact_floor.load_matrix()["cells"], [dict(entry, by_role="reviewer")], {"pr": self.PR, "head": LEDGER_HEAD}, "Serious")
+                else:
+                    scored = self.score()
+                if counts:
+                    self.assertEqual(scored["reasons"], [])
+                    self.assertEqual(scored["level"], sb.impact_floor.load_matrix()["cells"]["Marginal"]["Remote"]["level"])
+                else:
+                    self.assertIsNone(scored["level"])
+                    self.assertEqual(scored["reasons"], [sb.load_module("delegated_clear").NO_AGENT_BLOCK])
+
+    def test_the_shapes_table_covers_the_record_shapes_of_the_code(self):
+        self.assertEqual(sorted(shape for shape, _, _ in self.SHAPES.values()), sorted(["block", "other-head", "malformed", "flags", "disagree", "no-score", "old"]))
+        self.assertEqual(len(self.SHAPES), 7)
+
+    def test_the_record_keeps_the_blocks_hash_and_size_and_marks_a_flags_only_record(self):
+        path = self.world.state / "block.txt"
+        self.assertEqual(self.record(extra=self.SCORED)[0], 0)
+        entry = self.records()[-1]
+        raw = path.read_bytes()
+        self.assertEqual((entry["block_sha256"], entry["block_size"]), (hashlib.sha256(raw).hexdigest(), len(raw)))
+        self.assertEqual((entry["block_impact_severity"], entry["block_impact_probability"]), ("Marginal", "Remote"))
+        self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve")
+        self.assertEqual(self.records()[-1]["block_sha256"], "none")
+        self.assertNotIn("block_size", self.records()[-1])
+        self.run_as("coder", "review", "record", self.PR, "--reviewer", "code", "--verdict", "approve")
+        self.assertNotIn("block_sha256", self.records()[-1])
+
+    def test_a_malformed_hash_counts_for_nothing(self):
+        mod = sb.load_module("delegated_clear")
+        good = dict(kind="review_record", pr=self.PR, head=LEDGER_HEAD, reviewer="impact", by_role="reviewer", impact_severity="Marginal", impact_probability="Remote",
+                    block_impact_severity="Marginal", block_impact_probability="Remote")
+        self.assertTrue(mod.counts_by_block(dict(good, block_sha256="a" * 64)))
+        for bad in ("", "a" * 63, 12345, None, "A" * 64, "none"):
+            self.assertFalse(mod.counts_by_block(dict(good, block_sha256=bad)), bad)
+
+    def test_floor_gates_and_the_clear_name_the_missing_block_in_the_same_words(self):
+        line = sb.load_module("delegated_clear").NO_AGENT_BLOCK
+        self.make("flags")
+        code, out, err = self.run_as("coder", "impact", "floor", self.PR)
+        self.assertEqual(out.count(line), 1, out)
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        self.assertEqual(out.count(line), 1, out)
+        self.assertIn(line, self.score()["reasons"])
+        self.make("block")   # the newest record carries the agent's block: the line is gone
+        code, out, err = self.run_as("coder", "impact", "floor", self.PR)
+        self.assertNotIn("no agent block", out)
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        self.assertNotIn("no agent block", out)
+
+    VERDICT_BLOCKS = {"approve": "", "comment": "", "request-changes": "- R-CODE-1 | block | bin/x:1 | why | fix\n", "incomplete": ""}
+
+    def test_only_an_incomplete_verdict_fails_to_count_and_says_so_in_its_own_line(self):
+        mod = sb.load_module("delegated_clear")
+        for verdict, finding in self.VERDICT_BLOCKS.items():
+            with self.subTest(verdict=verdict):
+                path = self.world.state / "v.txt"
+                path.write_text("verdict: %s\nhead: %s\nimpact-action: none\n%sfindings:\n%s" % (verdict, LEDGER_HEAD, self.SCORED, finding))
+                code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))
+                self.assertEqual(code, 0, err)
+                scored = self.score()
+                if verdict == "incomplete":
+                    self.assertIsNone(scored["level"])
+                    self.assertEqual(scored["reasons"], [mod.INCOMPLETE_VERDICT])
+                    self.assertNotEqual(mod.INCOMPLETE_VERDICT, mod.NO_AGENT_BLOCK)
+                else:
+                    self.assertEqual(scored["reasons"], [])
+                    self.assertEqual(scored["level"], sb.impact_floor.load_matrix()["cells"]["Marginal"]["Remote"]["level"])
+        self.assertEqual(sorted(self.VERDICT_BLOCKS), sorted(sb.plan_ledger.REVIEW_VERDICTS))   # derived: a new verdict word must be added here
+
+    def test_floor_and_gates_say_the_incomplete_line_not_the_missing_block_line(self):
+        mod = sb.load_module("delegated_clear")
+        path = self.world.state / "v.txt"
+        path.write_text("verdict: incomplete\nhead: %s\nimpact-action: none\n%sfindings:\n" % (LEDGER_HEAD, self.SCORED))
+        self.assertEqual(self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))[0], 0)
+        for argv in (("impact", "floor", self.PR), ("gates", self.PR)):
+            out = self.run_as("coder", *argv)[1]
+            self.assertEqual(out.count(mod.INCOMPLETE_VERDICT), 1, argv)
+            self.assertEqual(out.count(mod.NO_AGENT_BLOCK), 0, argv)
+
+    def test_the_definition_says_read_every_hunk_return_incomplete_and_where_the_matrix_words_come_from(self):
+        text = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
+        for phrase in ("every hunk", "verdict: incomplete", "reads only the verdict word", "impact matrix --for-rater"):
+            self.assertIn(phrase, text.replace("EVERY", "every"))
+
+    def state_files(self):
+        return {str(p.relative_to(self.world.state)): p.read_bytes() for p in sorted(self.world.state.rglob("*")) if p.is_file()}
+
+    def test_impact_matrix_prints_the_files_words_cell_by_cell_and_writes_nothing(self):
+        before = self.state_files()
+        code, out, err = self.run_as("coder", "impact", "matrix", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.state_files(), before)
+        printed = json.loads(out)
+        file = json.loads((REPO / "docs" / "review-laws" / "impact-matrix.json").read_text())
+        for severity, row in file["cells"].items():
+            for probability, cell in row.items():
+                self.assertEqual(printed["cells"][severity][probability], cell, (severity, probability))
+        self.assertEqual(sum(len(r) for r in printed["cells"].values()), sum(len(r) for r in file["cells"].values()))
+        rules = file["owner_hold"]["delegated_clear"]["score"]["floor"]["rules"]
+        self.assertEqual(printed["floor_rules"], rules)
+        self.assertEqual((printed["severities"], printed["probabilities"]), (file["severities"], file["probabilities"]))
+        text = self.run_as("coder", "impact", "matrix")[1]
+        for severity, row in file["cells"].items():
+            for probability, cell in row.items():
+                self.assertIn("cell %s / %s: level %s, action %s" % (severity, probability, cell["level"], cell["action"]), text)
+        for rule_id, cls in rules.items():
+            self.assertIn("floor rule %s: class %s" % (rule_id, cls), text)
+
+    def test_impact_matrix_for_rater_prints_the_floor_reports_rule_ids_and_paths(self):
+        paths = ["shims/gh", "docs/a.md"]
+        self.pr = dict(self.pr, changedFiles=len(paths), files=[{"path": p, "additions": 1, "deletions": 0} for p in paths])
+        before = self.state_files()
+        code, out, err = self.run_as("coder", "impact", "matrix", "--for-rater", self.PR, "--json")
+        self.assertEqual(code, 0, err)
+        printed = json.loads(out)["for_rater"]
+        report = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
+        rules = json.loads((REPO / "docs" / "review-laws" / "impact-matrix.json").read_text())["owner_hold"]["delegated_clear"]["score"]["floor"]["rules"]
+        expected = {rule_id: sorted(report["top_tier_hits"][cls]) for rule_id, cls in rules.items() if report["top_tier_hits"].get(cls)}
+        self.assertTrue(expected, "the fixture changes a floor path")
+        self.assertEqual(printed["floor_hits"], expected)
+        self.assertEqual(self.state_files(), before)
+        text = self.run_as("coder", "impact", "matrix", "--for-rater", self.PR)[1]
+        for rule_id, paths in expected.items():
+            self.assertIn("floor hit %s: %s" % (rule_id, ", ".join(paths)), text)
+
+    def test_an_incomplete_record_beside_a_complete_block_does_not_stop_the_complete_one_counting(self):
+        mod = sb.load_module("delegated_clear")
+        for verdict in ("incomplete", "approve"):
+            path = self.world.state / "v.txt"
+            path.write_text("verdict: %s\nhead: %s\nimpact-action: none\n%sfindings:\n" % (verdict, LEDGER_HEAD, self.SCORED))
+            self.assertEqual(self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))[0], 0)
+        scored = self.score(last=2)
+        self.assertEqual(scored["reasons"], [])
+        self.assertEqual(scored["level"], sb.impact_floor.load_matrix()["cells"]["Marginal"]["Remote"]["level"])
+
+    def test_for_rater_with_no_floor_hit_says_none_and_an_unreadable_matrix_is_refused_in_a_line(self):
+        out = self.run_as("coder", "impact", "matrix", "--for-rater", self.PR)[1]
+        self.assertIn("floor hit: none", out)
+        with mock.patch.object(sb.impact_floor, "load_matrix", side_effect=sb.impact_floor.MatrixError("unreadable")):
+            code, out, err = self.run_as("coder", "impact", "matrix")
+        self.assertEqual(code, 2)
+        self.assertIn("impact matrix:", err)
+
+    def test_a_file_name_with_control_characters_is_printed_safely_and_capped(self):
+        self.assertEqual(sb._printable_path("shims/gh\x1b[2J\x07"), "shims/gh?[2J?")
+        self.assertEqual(len(sb._printable_path("a" * 1000)), sb.IMPACT_MATRIX_PATH_LEN)
+        paths = ["shims/gh"] + ["docs/%d.md" % n for n in range(3)]
+        self.pr = dict(self.pr, changedFiles=len(paths), files=[{"path": p, "additions": 1, "deletions": 0} for p in paths])
+        hits = json.loads(self.run_as("coder", "impact", "matrix", "--for-rater", self.PR, "--json")[1])["for_rater"]["floor_hits"]
+        self.assertTrue(all(len(v) <= sb.IMPACT_MATRIX_PATHS_MAX and all(p.isprintable() for p in v) for v in hits.values()))
+
+    def test_a_failure_to_make_the_rating_note_says_so(self):
+        with mock.patch.object(sb, "load_module", side_effect=RuntimeError("x")):
+            self.assertIn("no rating note", sb.rating_block_note([{"kind": "review_record"}], self.PR, LEDGER_HEAD))
+
+    def test_an_uncounted_rating_that_is_higher_than_the_counted_one_refuses_and_a_lower_one_is_ignored(self):
+        mod = sb.load_module("delegated_clear")
+        cells = sb.impact_floor.load_matrix()["cells"]
+        low = ("Negligible", "Improbable")
+        high = ("Critical", "Frequent")
+        base = dict(kind="review_record", pr=self.PR, head=LEDGER_HEAD, reviewer="impact", by_role="reviewer", verdict="approve")
+        counted = dict(base, impact_severity=low[0], impact_probability=low[1], block_sha256="a" * 64, block_impact_severity=low[0], block_impact_probability=low[1])
+        flags_high = dict(base, impact_severity=high[0], impact_probability=high[1], block_sha256="none")
+        flags_low = dict(base, impact_severity=low[0], impact_probability=low[1], block_sha256="none")
+        incomplete_high = dict(base, impact_severity=high[0], impact_probability=high[1], block_sha256="b" * 64, block_impact_severity=high[0], block_impact_probability=high[1], verdict="incomplete")
+        report = {"pr": self.PR, "head": LEDGER_HEAD}
+        judge = lambda entries: mod.judge(mod.score_block(), cells, entries, report, "Serious")
+        # a record whose BLOCK says high but whose typed flags say low (a flag wins over the block's line, so it does not count): the block's own higher score is what refuses
+        block_high_typed_low = dict(base, impact_severity=low[0], impact_probability=low[1], block_sha256="c" * 64, block_impact_severity=high[0], block_impact_probability=high[1])
+        shapes = {"flags only, higher": flags_high, "incomplete, higher": incomplete_high, "block high, typed low": block_high_typed_low}
+        self.assertEqual(sorted(shapes), sorted(["flags only, higher", "incomplete, higher", "block high, typed low"]))
+        self.assertEqual(judge([counted])["reasons"], [])
+        for label, others in ((l, [e]) for l, e in shapes.items()):
+            for order in (lambda e: [counted] + e, lambda e: e + [counted]):
+                with self.subTest(label=label):
+                    self.assertEqual(judge(order(others))["reasons"], [mod.HIGHER_UNCOUNTED])
+        self.assertEqual(judge([counted, flags_low])["reasons"], [])   # a lower or equal uncounted rating is ignored
+        self.assertEqual(judge([counted, dict(flags_high, impact_probability=None)])["reasons"], [])   # a record with no readable score is ignored
+
+    def test_the_rater_honesty_sentence_is_in_the_definition_and_in_the_docs(self):
+        sentence = "Never adjust a rating to fit the floor: a rating below the floor is reported as it is and goes to the owner."
+        for path in ("agents/reviewers/reviewer-impact.md", "docs/switchboard.md"):
+            self.assertEqual((REPO / path).read_text().count(sentence), 1, path)
+
+    def test_the_limit_is_said_in_the_docs_and_the_definition(self):
+        for path in ("docs/switchboard.md", "agents/reviewers/reviewer-impact.md"):
+            text = (REPO / path).read_text()
+            self.assertIn("not that the agent produced it", text, path)
+            self.assertIn("mistake-guard", text)
+
+    def test_only_the_scorer_reads_the_score_fields(self):
+        for name in ("impact_hold.py", "impact_floor.py", "plan_ledger.py"):   # the readers of a rating outside the scorer (the record's own warning is a writer)
+            text = (REPO / "bin" / name).read_text().replace("block_impact", "")
+            self.assertEqual(len(re.findall(r'get\("impact_(?:severity|probability)"\)', text)), 0, name)
+
 class TestImpactRejudge(LedgerBase):
     """#451 slice 3: the daemon's hold labels follow the OWNER-HOLD rule; a hold it applied that no longer holds is taken off (only the labels it added);
     the list is posted once for each version of the rule; an unreadable matrix file changes nothing and says so once. A fake gh records every write."""
@@ -36627,10 +36884,14 @@ class TestImpactHold(LedgerBase):
         for name in (sb.plan_ledger.LEDGER_FILE, sb.plan_ledger.HEAD_FILE):
             self.world.state.joinpath(name).unlink(missing_ok=True)
 
-    def rate(self, severity, probability, reason="", role="reviewer", head=LEDGER_HEAD, pr="acme/app#9", action="auto"):
+    def rate(self, severity, probability, reason="", role="reviewer", head=LEDGER_HEAD, pr="acme/app#9", action="auto", with_block=True):
         """Record a rating. `action` "auto" is the action of the cell (a helper that only emits VALID shapes: it hides a bad state, so every bad-shape test passes an explicit action or builds the raw record), None omits it."""
         entry = {"kind": "review_record", "pr": pr, "head": head, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": role,
                  "impact_severity": severity, "impact_probability": probability, "impact_reason": reason}
+        if with_block:   # #901: the rating carries the agent's block (its hash and its own rating lines), as `review record --block` keeps them
+            entry.update(block_sha256="a" * 64, block_size=200, block_impact_severity=severity, block_impact_probability=probability)
+        else:
+            entry["block_sha256"] = "none"
         cell = (sb.impact_floor.load_matrix()["cells"].get(severity) or {}).get(probability)
         if action == "auto" and cell:   # the action the reviewer would record for that cell (a record with no action rates nothing: #830's one reading)
             entry["impact_action"] = {"H": "hold", "2": "second-review", ".": "none"}[cell["action"]]
@@ -36731,7 +36992,8 @@ class TestImpactHold(LedgerBase):
             del block["floor"]["rules"][removed]
             cls = rules[removed]
             report = {"pr": "acme/app#9", "head": LEDGER_HEAD, "top_tier_hits": {cls: ["x"]}}
-            entries = [{"kind": "review_record", "pr": "acme/app#9", "head": LEDGER_HEAD, "reviewer": "impact", "by_role": "reviewer", "impact_severity": self.cell_of("Medium")[0], "impact_probability": self.cell_of("Medium")[1]}]
+            entries = [{"kind": "review_record", "pr": "acme/app#9", "head": LEDGER_HEAD, "reviewer": "impact", "by_role": "reviewer", "impact_severity": self.cell_of("Medium")[0], "impact_probability": self.cell_of("Medium")[1],
+                        "block_sha256": "a" * 64, "block_impact_severity": self.cell_of("Medium")[0], "block_impact_probability": self.cell_of("Medium")[1]}]
             mod = sb.load_module("delegated_clear")
             self.assertEqual(mod.judge(block, sb.impact_floor.load_matrix()["cells"], entries, report, "Serious")["reasons"], [], "the floor of %s lives in the data only" % cls)
             self.assertTrue(mod.judge(self.block(), sb.impact_floor.load_matrix()["cells"], entries, report, "Serious")["reasons"])
@@ -37092,7 +37354,8 @@ class TestImpactHold(LedgerBase):
             "good reason, unknown probability": ("bin/reassign.py", [dict(floor_good, prob="Sometimes")], True, "unknown"),
             "two records disagree: low then high": ("docs/notes.md", [good, dict(good, sev=high[0], prob=high[1])], True, "High"),
             "two records disagree: high then low": ("docs/notes.md", [dict(good, sev=high[0], prob=high[1]), good], True, "High"),
-            "a good record and an unreadable one at the same head": ("docs/notes.md", [good, dict(good, sev=None)], True, "unknown"),
+            "a good record and one with no score of the block's beside it: the second counts for nothing (#901) and the first clears": ("docs/notes.md", [good, dict(good, sev=None)], False, None),
+            "a good record beside one whose block carries a score the matrix does not know": ("docs/notes.md", [good, dict(good, sev="Huge")], True, "unknown"),
             "a record at another head only": ("docs/notes.md", [dict(good, head="d" * 40)], True, "no independent impact rating"),
             "a record for another pull request only": ("docs/notes.md", [dict(good, pr="acme/app#10")], True, "no independent impact rating"),
             "a record by the pull request's own author (a coder)": ("docs/notes.md", [dict(good, role="coder")], True, "no independent impact rating"),
@@ -37132,17 +37395,24 @@ class TestImpactHold(LedgerBase):
         """A ledger record built WITHOUT the helper: any shape, including those the record command refuses (an older record with an action and no severity or probability)."""
         entry = {"kind": "review_record", "pr": "acme/app#9", "head": LEDGER_HEAD, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": "reviewer"}
         entry.update(fields)
+        entry.setdefault("block_sha256", "a" * 64)   # #901: the record carries the agent's block, whose own lines equal the typed ones (a missing field stays missing)
+        for name in ("impact_severity", "impact_probability"):
+            if name in entry and entry[name] is not KEEP_OUT:
+                entry.setdefault("block_" + name, entry[name])
         return sb.plan_ledger.append_entry(self.world.state, {k: v for k, v in entry.items() if v is not KEEP_OUT}, self.world.clock.now())
 
     def test_raw_mixed_records_reach_the_real_judge_and_the_bad_one_refuses_in_either_order(self):
         low, high = self.cell_of("Low"), self.cell_of("High")
         valid = dict(impact_action="none", impact_severity=low[0], impact_probability=low[1])
         older = dict(impact_action="hold", impact_class="authority")   # every record made before this change: an action, no severity, no probability
-        shapes = {"an action and no severity or probability, after a valid Low": [valid, older], "the same, before it": [older, valid], "an action with an unknown severity": [valid, dict(valid, impact_severity="Huge")],
-                  "a good severity with no probability": [valid, dict(valid, impact_probability=KEEP_OUT)], "a good probability with no severity": [valid, dict(valid, impact_severity=KEEP_OUT)],
-                  "two records that disagree, low first": [valid, dict(valid, impact_severity=high[0], impact_probability=high[1], impact_action="hold")],
-                  "the author's record with an action": [dict(valid, by_role="coder")], "another head's record with an action": [dict(valid, head="d" * 40)]}
-        for label, records in shapes.items():
+        # shape: (records, refused). A record that carries no score of the agent's block is IGNORED by the score since #901 (it counts for nothing, as every record made before blocks were kept), so the valid record beside it still clears;
+        # a record whose block carries a score the matrix does not know, a higher disagreeing score, the author's and another head's record still refuse
+        shapes = {"an action and no severity or probability, after a valid Low": ([valid, older], False), "the same, before it": ([older, valid], False), "an action with an unknown severity": ([valid, dict(valid, impact_severity="Huge")], True),
+                  "a good severity with no probability": ([valid, dict(valid, impact_probability=KEEP_OUT)], False), "a good probability with no severity": ([valid, dict(valid, impact_severity=KEEP_OUT)], False),
+                  "two records that disagree, low first": ([valid, dict(valid, impact_severity=high[0], impact_probability=high[1], impact_action="hold")], True),
+                  "the older record alone (no score, no block score)": ([older], True),
+                  "the author's record with an action": ([dict(valid, by_role="coder")], True), "another head's record with an action": ([dict(valid, head="d" * 40)], True)}
+        for label, (records, refused) in shapes.items():
             with self.subTest(label):
                 self.writes.clear()
                 self.ledger_reset()
@@ -37151,9 +37421,10 @@ class TestImpactHold(LedgerBase):
                 for record in records:
                     self.raw_record(**record)
                 code, out, err = self.under()
-                self.assertEqual(code, 2, err)
-                self.assertEqual(self.deletes(), [])
-                self.assertTrue(any(t in err for t in ("no severity and probability", "High", "no independent impact rating")), err)
+                self.assertEqual(code == 2, refused, err)
+                if refused:
+                    self.assertEqual(self.deletes(), [])
+                    self.assertTrue(any(t in err for t in ("no severity and probability", "High", "no independent impact rating", "no agent block")), err)
         self.ledger_reset()   # the control: the valid record alone clears
         self.score_config("Serious")
         self.scored_pr()
@@ -66608,7 +66879,8 @@ class TestReviewerSubagents(LedgerBase):
         cells = sb.impact_floor.load_matrix()["cells"]
         severity, probability = next((s, p) for s in cells for p in cells[s] if cells[s][p]["level"] == level)
         entry = {"kind": "review_record", "pr": self.PR, "head": head, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": role,
-                 "impact_severity": severity, "impact_probability": probability, "impact_action": "none"}
+                 "impact_severity": severity, "impact_probability": probability, "impact_action": "none",
+                 "block_sha256": "a" * 64, "block_size": 200, "block_impact_severity": severity, "block_impact_probability": probability}   # #901: the rating carries the agent's block, so the block scores it
         sb.plan_ledger.append_entry(self.world.state, entry, self.world.clock.now())
 
     def rating_lines(self):
