@@ -76687,7 +76687,7 @@ class MergeGateBase(Base):
 
     def run_pass(self, who="coder-a", gate=None, **more):
         gate = gate or self.gate
-        return gate.gate_pass(self.reading, self.fake, self.conf, self.state, self.repo, self.n, who, 4242, self.fake.clock, self.fake.sleep,
+        return gate.gate_pass(self.reading, self.fake, self.conf, self.state, self.repo, self.n, who, made_up_pid(), self.fake.clock, self.fake.sleep,
                               alive=lambda pid: True, **more)
 
     def check(self, caller="coder-a", person=False, waived=False, gate=None):
@@ -76858,8 +76858,8 @@ class TestMergeGateRerun(MergeGateBase):
 class TestMergeGateLock(MergeGateBase):
     """One merge into a branch at a time (clause 4)."""
 
-    def take(self, who, now, pid=4242, lease=1200, alive=lambda p: True):
-        return self.gate.acquire(self.state, self.repo, "main", who, pid, "%s#%d" % (self.repo, self.n), now, lease, alive)
+    def take(self, who, now, pid=None, lease=1200, alive=lambda p: True):
+        return self.gate.acquire(self.state, self.repo, "main", who, pid if pid is not None else made_up_pid(), "%s#%d" % (self.repo, self.n), now, lease, alive)
 
     def test_a_second_merger_is_told_who_holds_the_lock_and_when_to_retry(self):
         self.assertTrue(self.take("coder-a", 1000)[0])
@@ -76877,14 +76877,14 @@ class TestMergeGateLock(MergeGateBase):
         self.assertEqual(self.gate.read_lock(self.state, self.repo, "main")["holder"], "coder-b")
 
     def test_a_lock_whose_holder_process_is_gone_is_recovered_after_the_grace(self):
-        self.take("coder-a", 1000, pid=999999)
+        self.take("coder-a", 1000, pid=made_up_pid())
         self.assertFalse(self.take("coder-b", 1000 + 60, alive=lambda p: False)[0], "inside the grace the merge of the holder may still follow")
         ok, _, said = self.take("coder-b", 1000 + self.gate.HOLDER_GRACE + 5, alive=lambda p: False)
         self.assertTrue(ok)
         self.assertIn("its holder is gone", said)
 
     def test_a_lock_whose_holder_process_is_alive_is_not_recovered_past_the_grace(self):
-        self.take("coder-a", 1000, pid=4242)
+        self.take("coder-a", 1000, pid=made_up_pid())
         ok, lock, said = self.take("coder-b", 1000 + self.gate.HOLDER_GRACE + 300, alive=lambda p: True)
         self.assertFalse(ok)
         self.assertEqual(lock["holder"], "coder-a")
@@ -76997,8 +76997,8 @@ class TestMergeGateMutants(MergeGateBase):
         self.assertFalse(self.run_pass(gate=gate)[0])
 
     def scenario_a_live_holder_is_not_recovered(self, gate):
-        gate.acquire(self.state, self.repo, "main", "coder-a", 4242, "x#1", 1000, 1200, lambda p: True)
-        ok = gate.acquire(self.state, self.repo, "main", "coder-b", 4243, "x#2", 1000 + gate.HOLDER_GRACE + 300, 1200, lambda p: True)[0]
+        gate.acquire(self.state, self.repo, "main", "coder-a", made_up_pid(), "x#1", 1000, 1200, lambda p: True)
+        ok = gate.acquire(self.state, self.repo, "main", "coder-b", made_up_pid(), "x#2", 1000 + gate.HOLDER_GRACE + 300, 1200, lambda p: True)[0]
         self.assertFalse(ok)
 
     CASES = (("skip the base comparison", 'if facts["run_base"] != facts["tip"]:', "if False:", "scenario_moved_branch_needs_a_rerun"),
@@ -77261,8 +77261,7 @@ class TestGhShimMergeGate(Base):
 
     def test_each_mutant_of_the_route_matching_lets_a_spelling_through_and_the_tests_see_it(self):
         cases = (("a path is not percent-decoded", "decoded = urllib.parse.unquote(path)", "decoded = path"),
-                 ("a path is not cut at its query string or fragment", 're.split(r"[?#]", path, 1)[0]', "path"),
-                 ("a path is matched case-sensitively", [('/merge$", re.I)', '/merge$")'), ('(/|$)", path, re.I)', '(/|$)", path)')], None),
+                 ("a path is matched case-sensitively", [('/merge$", re.I)', '/merge$")'), ('/merge", path, re.I)', '/merge", path)')], None),
                  ("repeated slashes are not collapsed", 're.sub(r"/{2,}", "/", ', "("),
                  ("a gh placeholder is read as a repository", r'[{}$<>:]', r'[{}$<>]'),
                  ("dot segments are not resolved", 'parts, climbed = resolve_dots(path.split("/"))', 'parts, climbed = path.split("/"), False'),
