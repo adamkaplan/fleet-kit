@@ -16,6 +16,7 @@ not understand, runs the real gh unchanged: this must never block a command.
 import importlib.util
 import json
 import os
+import posixpath
 import re
 import shutil
 import signal
@@ -23,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 
 MARK = "<!-- fleet-switchboard:from=%s -->"
 SIGNED_RE = re.compile(r"<!--\s*fleet-switchboard:from=[A-Za-z0-9_-]{1,64}\s*-->")
@@ -36,6 +38,8 @@ TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_EN
 
 
 COUNT_ACCOUNT = [None]
+COUNT_LANE = [None]   # the caller's fleet name (else its role), set when the identity lookup ran for the call: nothing is looked up for the counter
+LANE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 CALLS_SPOOL = "agent-calls.jsonl"
 CALLS_LIMIT = 262144
 CALLS_ON = "agent-calls-hours.json"   # the daemon makes this file: counting is on only while a daemon folds the spool
@@ -44,15 +48,70 @@ NO_NETWORK_GROUPS = ("auth", "config", "alias", "completion", "extension", "help
 APP_SKIP_GROUPS = ("config", "completion", "help", "version")   # only the groups that provably make no call skip the App path: `extension` and `alias` can run programs that call out, `auth` handles tokens
 
 
+# the endpoint class: an ALLOW-LIST, never a filter of what is there (#867). Only the words below can appear in it: a name (repository, owner, user,
+# team, branch, file) is not on any list, so it cannot be recorded. The same code is in shims/gh (`reduce_endpoint`) and bin/agent_calls.py: a test runs both.
+GROUPS = frozenset("api pr issue repo browse release run workflow gist search auth label ruleset status project cache codespace secret variable ssh-key "
+                   "gpg-key org extension alias config completion help version attestation agent-task copilot preview skill".split())
+VERBS = frozenset("view list create edit close reopen merge comment review checks diff status checkout ready delete download watch clone fork sync rerun "
+                  "cancel enable disable get set remove lock unlock transfer pin unpin develop archive unarchive rename upload verify trusted-root login logout "
+                  "refresh token setup-git switch import export".split())
+API_TOP = frozenset("orgs users user teams search gists notifications rate_limit graphql installation app repositories enterprises marketplace_listing "
+                    "emojis meta licenses gitignore codes_of_conduct events feeds octocat zen versions applications authorizations assignments classrooms".split())
+API_SUB = frozenset("issues pulls comments commits contents git refs trees blobs tags branches releases assets labels milestones events actions runs jobs "
+                    "workflows artifacts check-runs check-suites statuses status reviews files requested_reviewers timeline parent sub_issues reactions collaborators "
+                    "hooks deployments environments rulesets protection merge compare readme languages contributors forks stargazers subscribers pages dependabot "
+                    "code-scanning secret-scanning teams topics traffic license rate_limit logs attempts rerun cancel dispatches installation subscription "
+                    "assignees invitations keys comments pending_deployments approvals dependencies blocked_by blocking copilot".split())
+
+
+def reduce_endpoint(text):
+    """`api issues/#` for a call whatever its form (a URL with a host, a leading slash, a query, a repository path, a name anywhere): only allow-listed words
+    survive. `api <top word>` for orgs, users, teams, search and the like (the name after it is dropped); a repository path keeps its own words after
+    `repos/<owner>/<name>/`, numbers as `#`, and stops at the first word not on the list. A command that is not `api` keeps its first word and a second one only when
+    that is a known verb. Anything unknown is the first word alone, or `other`. Idempotent."""
+    words = str(text).split()
+    if not words:
+        return "other"
+    first = re.sub(r"[^a-z0-9_-]", "", words[0].lower())
+    if first not in GROUPS:
+        return "other"
+    if first != "api":
+        second = re.sub(r"[^a-z0-9_-]", "", words[1].lower()) if len(words) > 1 else ""
+        return first + (" " + second if second in VERBS else "")
+    if len(words) < 2:
+        return "api"
+    path = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*", "", words[1].split("?")[0].split("#")[0] if "://" in words[1] else words[1].split("?")[0])
+    segs = [s for s in path.split("/") if s]
+    if not segs:
+        return "api repo"
+    if segs[0] == "repos":
+        segs = segs[3:]
+    elif segs[0] in API_TOP:
+        return "api " + segs[0]
+    kept = []
+    for seg in segs[:12]:
+        if re.fullmatch(r"[0-9]+|#", seg):
+            kept.append("#")
+        elif seg in API_SUB:
+            kept.append(seg)
+        else:
+            break
+    return "api " + ("/".join(kept) or "repo")
+
+
 def call_endpoint(args):
-    """The class of a gh call for the counter: `api issues/#` (numbers as `#`, no repo, no query) or the first two words (`pr view`). Never a value."""
+    """The class of a gh call for the counter, reduced to allow-listed words only (`api issues/#`, `pr view`): never a value, a repository, an owner or a name."""
     words = command_words(args)
     if not words:
         return None
-    if words[0] == "api" and len(words) > 1:
-        bare = re.sub(r"^/?repos/[^/]+/[^/]+/?", "", words[1].split("?")[0])
-        return "api " + (re.sub(r"\d+", "#", bare) or "repo")[:60]
-    return " ".join(words[:2])[:40]
+    return reduce_endpoint(" ".join(words[:2]))
+
+
+def call_lane():
+    """The lane of this call: the fleet name (else the role) from the SAME identity answer the shim already fetched, else `unknown`. The caller's environment is never
+    read for it (a caller could name any lane). A name or a role only: never a value of an argument."""
+    candidate = COUNT_LANE[0]
+    return candidate if isinstance(candidate, str) and LANE_RE.match(candidate) else "unknown"
 
 
 def count_call(args):
@@ -69,12 +128,306 @@ def count_call(args):
             os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"), "fleet-switchboard")
         path = os.path.join(state, CALLS_SPOOL)
         if endpoint and os.path.exists(os.path.join(state, CALLS_ON)) and (not os.path.exists(path) or os.path.getsize(path) < CALLS_LIMIT):
-            line = json.dumps({"ts": int(time.time()), "account": COUNT_ACCOUNT[0] or "default", "endpoint": endpoint}, sort_keys=True)
+            line = json.dumps({"ts": int(time.time()), "account": COUNT_ACCOUNT[0] or "default", "endpoint": endpoint, "lane": call_lane()}, sort_keys=True)
             fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
             with os.fdopen(fd, "a") as out:
                 out.write(line + "\n")
     except Exception:
         pass
+
+
+# ---- the read cache and the low-budget warning (#867, clauses 3 and 4)
+# A repeated identical `gh api <path>` read of one agent on one account is answered from a short cache (at most CACHE_FRESH seconds), then revalidated with the
+# entity tag (a 304 does not count against GitHub's budget). The key is account + path + agent; any write by that agent drops its entries first. Every error in
+# here falls through to the real call. Only the exact shape `gh api <path>` (a GET with no flag) with stdout not a terminal is cached: anything else runs as before.
+CACHE_DIR = "gh-read-cache"
+CACHE_FRESH = 30          # seconds a cached answer is served without asking GitHub
+CACHE_STALE_MAX = 600     # seconds: the oldest answer served while the account is nearly out of budget, and the longest any entry is kept
+CACHE_BODY_MAX = 1048576
+CACHE_FILES_MAX = 200
+LOW_FRACTION = 0.15       # below this share of the hourly budget the shim says so, and serves a cached read instead of spending
+USAGE_FILE = "github-usage.json"   # the daemon's once-a-minute reading of the account's real usage (bin/agent_calls.py)
+USAGE_FRESH = 600
+WARN_EVERY = 60
+
+
+def state_directory():
+    return os.environ.get("FLEET_SWITCHBOARD_STATE") or os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"), "fleet-switchboard")
+
+
+NEVER_CACHED = frozenset("rate_limit user applications installation app notifications authorizations check-runs check-suites statuses status runs jobs".split())
+# paths whose answer is a STATE (the budget itself, the account, a build or check in progress) that a caller reads to see what is true now, not a fact that lasts:
+# never cached and never served from the cache. Checked on the normalised path, on every segment.
+
+
+def normal_api_path(path):
+    """The path as GitHub reads it: no scheme or host, no query or fragment, percent-decoding applied, lower case, no empty segment, no `api/v3` prefix of an enterprise host."""
+    import urllib.parse
+    text = path.split("#")[0].split("?")[0]
+    text = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*", "", text)
+    text = urllib.parse.unquote(urllib.parse.unquote(text)).lower()
+    segments = [seg for seg in text.split("/") if seg]
+    if segments[:2] == ["api", "v3"]:
+        segments = segments[2:]
+    return segments
+
+
+def never_cached(path):
+    """True for a path that reports a state (see NEVER_CACHED): its first word, or any word after `repos/<owner>/<name>/` (the owner and the name are a name, not a word)."""
+    try:
+        segments = normal_api_path(path)
+        if not segments or any(seg.startswith("..") for seg in segments):
+            return True
+        words = segments[3:] if segments[0] == "repos" else segments[:1]
+        return any(seg in NEVER_CACHED for seg in words)
+    except Exception:
+        return True
+
+
+def cacheable_read(args):
+    """The path of a call that is exactly `gh api <path>` (nothing else: no flag, no method, no field) and not one of the paths that report a state, else None."""
+    if len(args) == 2 and args[0] == "api" and args[1] and not args[1].startswith("-") and "\n" not in args[1] and len(args[1]) <= 2000 and not never_cached(args[1]):
+        return args[1]
+    return None
+
+
+def cache_directory(create=False):
+    """The cache directory (0700, owned by this user, not a link), or None. Only while a daemon has switched counting on (the fleet is in use)."""
+    state = state_directory()
+    if os.environ.get("FLEET_SHIM_CACHE") == "off" or not os.path.exists(os.path.join(state, CALLS_ON)):
+        return None
+    path = os.path.join(state, CACHE_DIR)
+    try:
+        if create and not os.path.lexists(path):
+            os.makedirs(path, mode=0o700, exist_ok=True)
+        info = os.lstat(path)
+    except OSError:
+        return None
+    import stat
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        return None
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            return None
+    return path
+
+
+def _digest(*parts):
+    import hashlib
+    return hashlib.sha256("\0".join(parts).encode("utf-8", "replace")).hexdigest()
+
+
+def cache_file(directory, agent, account, path):
+    return os.path.join(directory, "%s-%s.json" % (_digest(agent)[:16], _digest(account, agent, path)[:40]))
+
+
+def cache_load(file, now):
+    """(age, etag, body) of a stored answer, or None (missing, unreadable, malformed, or older than CACHE_STALE_MAX)."""
+    try:
+        with open(file) as handle:
+            entry = json.loads(handle.read(CACHE_BODY_MAX + 4096))
+        ts, etag, body = entry["ts"], entry.get("etag"), entry["body"]
+        if not isinstance(ts, (int, float)) or isinstance(ts, bool) or not isinstance(body, str) or not (etag is None or isinstance(etag, str)):
+            return None
+        age = now - ts
+        return (age, etag, body) if -5 <= age <= CACHE_STALE_MAX else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def cache_store(directory, file, etag, body, now):
+    """Write one entry (0600, a temp file renamed into place), then keep the directory bounded in count and age. Never raises."""
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
+        with os.fdopen(fd, "w") as out:
+            out.write(json.dumps({"ts": now, "etag": etag, "body": body}))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, file)
+        tmp = None
+        names = [n for n in os.listdir(directory) if n.endswith(".json")]
+        dated = []
+        for name in names:
+            try:
+                dated.append((os.stat(os.path.join(directory, name)).st_mtime, name))
+            except OSError:
+                pass
+        dated.sort()
+        for mtime, name in dated[:max(0, len(dated) - CACHE_FILES_MAX)] + [d for d in dated if now - d[0] > CACHE_STALE_MAX]:
+            try:
+                os.unlink(os.path.join(directory, name))
+            except OSError:
+                pass
+    except Exception:
+        pass
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+WRITE_GRACE = 10   # seconds after an agent's write began during which its reads neither use nor fill the cache (a write that is still running may not have taken effect yet)
+
+
+def _marker(directory, agent):
+    return os.path.join(directory, ".w-" + _digest(agent)[:16])
+
+
+def write_marker(directory, agent):
+    """(nonce, time) of the agent's last write mark, or None."""
+    try:
+        with open(_marker(directory, agent)) as handle:
+            row = json.loads(handle.read(500))
+        return (str(row["n"]), float(row["ts"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def cache_mark(agent):
+    """Note that `agent` has a write under way (or just ended): a new nonce and the time. A read that began before this does not store its answer. Never raises."""
+    try:
+        directory = cache_directory()
+        if directory is None or not agent:
+            return
+        tmp = _marker(directory, agent) + ".%d" % os.getpid()
+        with open(tmp, "w") as handle:
+            handle.write(json.dumps({"n": "%d-%s" % (os.getpid(), os.urandom(6).hex()), "ts": time.time()}))
+        os.replace(tmp, _marker(directory, agent))
+    except Exception:
+        pass
+
+
+def cache_drop(agent):
+    """A write by `agent`: mark it, then drop every cached answer of that agent (never another agent's). Never raises."""
+    try:
+        cache_mark(agent)
+        directory = cache_directory()
+        if directory is None or not agent:
+            return
+        prefix = _digest(agent)[:16] + "-"
+        for name in os.listdir(directory):
+            if name.startswith(prefix):
+                try:
+                    os.unlink(os.path.join(directory, name))
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+def budget_low(account):
+    """(remaining, limit) when the daemon's fresh reading says this account is below LOW_FRACTION of its budget, else None."""
+    try:
+        with open(os.path.join(state_directory(), USAGE_FILE)) as handle:
+            body = json.loads(handle.read(200001))
+        row = body["accounts"][account]
+        remaining, limit, at = row["remaining"], row["limit"], body["at"]
+        numbers = (remaining, limit, at)
+        if not all(isinstance(n, (int, float)) and not isinstance(n, bool) for n in numbers) or limit <= 0 or time.time() - at > USAGE_FRESH:
+            return None
+        return (int(remaining), int(limit)) if remaining < LOW_FRACTION * limit else None
+    except Exception:
+        return None
+
+
+def warn_low(account, low):
+    """One line on stderr before a call that would spend, at most once a minute per account. Never raises."""
+    try:
+        directory = os.path.join(state_directory(), "gh-low-warned")
+        stamp = os.path.join(directory, _digest(account)[:16])
+        try:
+            if time.time() - os.stat(stamp).st_mtime < WARN_EVERY:
+                return
+        except OSError:
+            pass
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        with open(stamp, "w"):
+            pass
+        sys.stderr.write("gh: warning: the GitHub account %s has %d of %d requests left this hour (under %d%%); repeated reads are answered from a short cache\n"
+                         % (account, low[0], low[1], int(LOW_FRACTION * 100)))
+    except Exception:
+        pass
+
+
+def split_response(raw):
+    """(status, headers, body bytes) of `gh api -i` output, or None when it is not that shape."""
+    cut = raw.find(b"\r\n\r\n")
+    sep = 4
+    if cut < 0:
+        cut, sep = raw.find(b"\n\n"), 2
+    if cut < 0:
+        return None
+    head = raw[:cut].decode("latin-1").splitlines()
+    first = head[0].split() if head else []
+    if len(first) < 2 or not first[0].startswith("HTTP/") or not first[1].isdigit():
+        return None
+    headers = {}
+    for line in head[1:]:
+        key, colon, value = line.partition(":")
+        if colon:
+            headers[key.strip().lower()] = value.strip()
+    return int(first[1]), headers, raw[cut + sep:]
+
+
+def cached_read(gh, env, args, agent, account, low):
+    """Serve `gh api <path>` from the cache or through one conditional request. Returns an exit status, or None when the normal call should run (nothing was spent)."""
+    path = cacheable_read(args)
+    if path and ("{" in path or os.environ.get("GH_HOST") or os.environ.get("GH_REPO")):
+        path = None   # gh fills `{owner}`, `{repo}` and `{branch}` from the working directory, and these variables change the target: the key could not tell
+    directory = cache_directory(create=True) if path and agent else None
+    if directory is None or sys.stdout.isatty():
+        return None
+    now = time.time()
+    marker = write_marker(directory, agent)
+    if marker is not None and abs(now - marker[1]) <= WRITE_GRACE:
+        return None   # this agent's write began a moment ago: nothing is served from the cache and nothing is stored; the plain call runs
+    file = cache_file(directory, agent, account, path)
+    entry = cache_load(file, now)
+    if entry is not None and (entry[0] <= CACHE_FRESH or low is not None):
+        sys.stdout.buffer.write(entry[2].encode("utf-8"))   # fresh, or the account is nearly out of budget: no request at all
+        sys.stdout.buffer.flush()
+        return 0
+    argv = [gh, "api", "-i"] + (["-H", "If-None-Match: " + entry[1]] if entry is not None and entry[1] else []) + [path]
+    done = subprocess.run(argv, capture_output=True, env=env)   # the one request (the real gh does not time out either)
+    # from here a request is SPENT: whatever happens below, this returns its status and never lets the caller run a second request
+    count_now = True
+    try:
+        parsed = split_response(done.stdout)
+        if parsed is None:   # not an answer this can interpret: say what gh said
+            sys.stdout.buffer.write(done.stdout)
+            sys.stderr.buffer.write(done.stderr)
+            return done.returncode
+        status, headers, body = parsed
+        raced = write_marker(directory, agent) != marker   # a write by this agent began or ended since the request began: this answer may be older than the write
+        if status == 304 and entry is not None:
+            count_now = False   # a 304 costs nothing, so it is not counted
+            if not raced:
+                cache_store(directory, file, entry[1], entry[2], now)
+            sys.stdout.buffer.write(entry[2].encode("utf-8"))
+            sys.stdout.buffer.flush()
+            return 0
+        if 200 <= status < 300 and len(body) <= CACHE_BODY_MAX and not raced:
+            try:
+                cache_store(directory, file, headers.get("etag"), body.decode("utf-8"), now)
+            except Exception:
+                pass
+        sys.stdout.buffer.write(body)
+        sys.stdout.buffer.flush()
+        sys.stderr.buffer.write(done.stderr)
+        return done.returncode
+    except Exception:
+        return done.returncode
+    finally:
+        try:
+            if count_now:
+                count_call(args)
+        except Exception:
+            pass
 
 
 def real_gh():
@@ -159,13 +512,14 @@ class Lookup:
         binary = switchboard_binary()
         if not binary:
             return self._ident
-        done = self.run([binary, "whoami", "--json"])
+        done = self.run(sb_argv(binary, "whoami", "--json"), env=sb_env())
         try:
             data = json.loads(done.stdout) if done is not None and done.returncode == 0 else None
         except ValueError:
             data = None
         if isinstance(data, dict):
             name, repo = data.get("name"), data.get("repo")
+            COUNT_LANE[0] = name if isinstance(name, str) and NAME_RE.match(name) else (data.get("role") if isinstance(data.get("role"), str) else None)
             self._ident = {"name": name if isinstance(name, str) and NAME_RE.match(name) else None,
                            "repo": repo if isinstance(repo, str) and REPO_RE.match(repo) else None,
                            "own": data.get("own") is not False,
@@ -174,11 +528,12 @@ class Lookup:
                 extra = data["read_repo"]
                 self._ident["read_repo"] = extra if isinstance(extra, str) and READ_REPO_RE.fullmatch(extra) else False
             return self._ident
-        plain = self.run([binary, "whoami"])   # an older switchboard: the name only
+        plain = self.run(sb_argv(binary, "whoami"), env=sb_env())   # an older switchboard: the name only
         if plain is not None and plain.returncode != 0:
             self.failed = True                 # neither form answered: a failure, not an old switchboard
         name = plain.stdout.strip() if plain is not None and plain.returncode == 0 else ""
         self._ident = {"name": name if NAME_RE.match(name) else None, "repo": None}
+        COUNT_LANE[0] = self._ident["name"]
         return self._ident
 
 
@@ -975,7 +1330,7 @@ def review_probe(args, found, reason, lookup, gh):
         blockers += [gate_clean(b) for b in tagged_blockers(data.get("reviews"), head)]
         binary = switchboard_binary()
         if binary and head:
-            done = lookup.run([binary, "review", "blockers", "%s#%d" % (repo, number), "--head", head])
+            done = lookup.run(sb_argv(binary, "review", "blockers", "%s#%d" % (repo, number), "--head", head), env=sb_env())
             if done is not None and done.returncode == 0:
                 blockers += [gate_clean(line.strip()) for line in done.stdout.splitlines() if line.strip()][:5]
             else:
@@ -1040,9 +1395,9 @@ def gate_probe(args, lookup, gh=None):
             gate_spool("fail_open", repo, number, check, "no switchboard to ask")
             return None
         try:
-            done = subprocess.run([binary, "gates-check", "%s#%d" % (repo, number), "--for", check, "--json"],
+            done = subprocess.run(sb_argv(binary, "gates-check", "%s#%d" % (repo, number), "--for", check, "--json"),
                                   capture_output=True, text=True, timeout=gate_seconds(), stdin=subprocess.DEVNULL,
-                                  env=dict(os.environ, FLEET_SWITCHBOARD_OWN_GH="1"))
+                                  env=sb_env(own=True))
         except subprocess.TimeoutExpired:
             gate_spool("fail_open", repo, number, check, "no answer within %gs" % gate_seconds())
             return None
@@ -1096,6 +1451,315 @@ def gate_bind_merge(args, parsed, repo, number, payload):
     for start, stop, _ in sorted(parsed["match"], reverse=True):
         del new[start:stop]
     return ("args", new + [MATCH_FLAG, head])
+
+
+# ---- the merge gate (#962): the fleet's own merge queue. Before `gh pr merge` into a GATED branch of a repository listed under `merge_gate.repos` in the
+# switchboard config, the shim asks `fleet-switchboard merge-gate <repo#N> --check --json`. That command decides everything (the owner's own terminal and a
+# logged waiver of the chief of staff pass; any other caller needs a gate pass for the exact head and branch tip and the merge lock) and exits 10 to refuse.
+# FAIL CLOSED for a listed repository: no switchboard, no answer in time or any exit but 0 and 10 refuses with one line. Nothing is asked for a repository that
+# is not listed. A merge that goes through is bound to the checked head (`--match-head-commit`), `--auto` is refused, and the lock is released when the merge returns.
+MERGE_GATE_SECONDS = 30.0
+MG_HOME = None     # a test hook: a module attribute, never read from the environment (a worker's environment must not move the gate)
+MG_BINARY = None   # the same, for the switchboard program asked
+
+
+def merge_gate_seconds():
+    try:
+        return min(120.0, max(1.0, float(os.environ.get("FLEET_SHIM_MERGE_GATE_SECONDS", MERGE_GATE_SECONDS))))
+    except ValueError:
+        return MERGE_GATE_SECONDS
+
+
+def mg_home():
+    """The account's real home (the password database), not $HOME or $XDG_CONFIG_HOME: a worker cannot point the gate at an empty configuration."""
+    if MG_HOME:
+        return MG_HOME
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except Exception:
+        return None
+
+
+def mg_binary():
+    """The switchboard program the install linked, under the real home: never FLEET_SWITCHBOARD_BIN or anything else from the environment."""
+    if MG_BINARY:
+        return MG_BINARY
+    home = mg_home()
+    if not home:
+        return None
+    binary = os.path.realpath(os.path.join(home, ".local", "bin", "fleet-switchboard"))
+    return binary if os.path.isfile(binary) and os.access(binary, os.X_OK) else None
+
+
+ENV_ALLOW = ("LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM", "HERDR_SOCKET_PATH",
+             "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "OPENCODE_SESSION_ID", "FLEET_SWITCHBOARD_ROLE", "FLEET_SWITCHBOARD_REPO")   # who the caller says it is: the switchboard verifies it against the session
+ENV_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"   # a fixed PATH: the caller's cannot choose the `python3` a switchboard script starts with
+
+
+def sb_env(own=False):
+    """The FIXED environment every switchboard the shim starts runs in, built from an ALLOW LIST and never by filtering the caller's: a fixed PATH, HOME as the
+    account's real home, the locale and temp names, and the identity names the switchboard verifies against the session. Everything else the caller set
+    (`PYTHON*`, `LD_*`, `DYLD_*`, `XDG_*`, `FLEET_SWITCHBOARD_*`, a made-up name) never reaches it, so a worker cannot hand the switchboard a library, a state
+    directory or a configuration of its own. `own` adds the switchboard's own-call marker."""
+    env = {"PATH": ENV_PATH}
+    for name in ENV_ALLOW:
+        if name in os.environ:
+            env[name] = os.environ[name]
+    home = mg_home()
+    if home:
+        env["HOME"] = home
+    if own:
+        env["FLEET_SWITCHBOARD_OWN_GH"] = "1"
+    return env
+
+
+def sb_argv(binary, *rest):
+    """The command that starts the switchboard: when the program is a Python script (its first line names python) it is started as `<fixed python> -I <program>`
+    (isolated: no `PYTHON*` variable and no user site are read), the python found on the FIXED path, never on the caller's; any other program is started as it is."""
+    try:
+        with open(binary, "rb") as handle:
+            first = handle.readline(200)
+        python = shutil.which("python3", path=ENV_PATH) if first.startswith(b"#!") and b"python" in first else None
+    except OSError:
+        python = None
+    return ([python, "-I", binary] if python else [binary]) + list(rest)
+
+
+def merge_gate_repos():
+    """The lower-cased repos listed under `merge_gate.repos` in the config of the account's real home; empty when none (then nothing is asked)."""
+    home = mg_home()
+    if not home:
+        return None   # no home: not known, the caller treats it as "cannot tell" and fails closed
+    try:
+        with open(os.path.join(home, ".config", "fleet-switchboard", "config.json")) as handle:
+            section = json.load(handle).get("merge_gate")
+    except FileNotFoundError:
+        return set()
+    except (OSError, ValueError, AttributeError):
+        return None
+    if section is None:
+        return set()
+    repos = section.get("repos", {}) if isinstance(section, dict) else None
+    return {str(name).lower() for name in repos} if isinstance(repos, dict) else None   # a section that is there and malformed is not "nothing listed"
+
+
+API_MERGE_RE = re.compile(r"^repos/([^/]+/[^/]+)/pulls/([0-9]+)/merge$", re.I)
+API_WRITE_FLAGS = ("-f", "-F", "--field", "--raw-field", "--input")
+GRAPHQL_MERGE_WORDS = ("mergePullRequest", "enablePullRequestAutoMerge")
+
+
+VALUE_FLAGS = {"-R", "--repo", "--hostname", "-b", "--body", "-F", "--body-file", "-t", "--title", "--subject", "-A", "--author-email", "--match-head-commit",
+               "-B", "--base", "-H", "--head", "--header", "--assignee", "--label", "--milestone", "--project", "--reviewer",
+               "-q", "--jq", "--json", "-X", "--method", "-f", "--field", "--raw-field", "--input", "--cache", "--preview", "--state", "-S", "--search",
+               "-L", "--limit", "--template"}
+PR_VERBS = {"checkout", "checks", "close", "comment", "create", "diff", "edit", "list", "lock", "ready", "reopen", "review", "status", "unlock",
+            "update-branch", "view", "revert", "merge", "help"}
+
+
+def command_word_positions(args):
+    """[(index, word)] of the command words: the arguments that are not flags and not the value of a flag that takes one. A flag may stand anywhere between the
+    words (gh accepts `-R repo` and `--repo=repo` before the group, between the group and the verb, or after), so the verb is not at a fixed position."""
+    out, i = [], 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            break
+        if arg.startswith("-") and len(arg) > 1:
+            i += 2 if arg in VALUE_FLAGS else 1
+            continue
+        out.append((i, arg))
+        i += 1
+    return out
+
+
+def canonical_pr_merge(args):
+    """`gh pr merge` written with a flag between its words (`pr -R repo merge N`, `-R repo pr merge N`) is the same call as `pr merge -R repo N`: it is
+    returned in that one canonical form, which every check reads. A `pr` command whose second word is not a known verb but which has `merge` among its words
+    (an unknown flag's value was taken for the verb) is also read as a merge: the shim would rather refuse than miss one. Anything else comes back unchanged."""
+    words = command_word_positions(args)
+    if len(words) < 2 or words[0][1] != "pr":
+        return args
+    merge = next((w for w in words[1:2] if w[1] == "merge"), None)
+    if merge is None and words[1][1] not in PR_VERBS:
+        merge = next((w for w in words[2:] if w[1] == "merge"), None)
+    if merge is None:
+        return args
+    return ["pr", "merge"] + [a for i, a in enumerate(args) if i not in (words[0][0], merge[0])]
+
+
+def resolve_dots(parts):
+    """(segments, climbed): `.` dropped and `..` taking the segment before it away, as GitHub resolves a path; `climbed` is True when a `..` would go above the first
+    segment (`repos`): such a path is never tied to a repository."""
+    out, climbed = [], False
+    for part in parts:
+        if part == ".":
+            continue
+        if part == "..":
+            if len(out) <= 1:
+                climbed = True
+            else:
+                out.pop()
+            continue
+        out.append(part)
+    return out, climbed
+
+
+def api_path_parts(arg):
+    """THE one normaliser of a `gh api` path, as GitHub reads it: percent-decoded (until stable), cut at a query string or fragment, repeated slashes collapsed, no leading
+    or trailing slash, `.` and `..` segments resolved. Returns (path, climbed). Case is folded by the matchers (re.I), never here, so a repository keeps its spelling."""
+    path = arg
+    for _ in range(3):
+        decoded = urllib.parse.unquote(path)
+        if decoded == path:
+            break
+        path = decoded
+    path = re.sub(r"/{2,}", "/", re.split(r"[?#]", path.replace("\\", "/"), 1)[0]).strip("/")
+    parts, climbed = resolve_dots(path.split("/"))
+    return "/".join(parts), climbed
+
+
+def api_path(arg):
+    return api_path_parts(arg)[0]
+
+
+def merge_route(args):
+    """Which merge route a command is, so the gate covers the class and not one spelling: ("pr", None) for `pr merge` (any shape), ("api", (repo, n)) for a
+    write to `repos/R/pulls/N/merge`, ("api-unknown", why) for a merge-looking `gh api` whose pull request cannot be told (a placeholder, a variable,
+    a query read from a file), ("graphql", None) for a GraphQL merge mutation, else None. Pure string analysis; nothing is run."""
+    args = canonical_pr_merge(args)
+    if len(args) >= 2 and args[0] == "pr" and args[1] == "merge":
+        return ("pr", None)
+    words = command_word_positions(args)
+    if not words or words[0][1] != "api":
+        return None
+    rest = [a for i, a in enumerate(args) if i != words[0][0]]
+    method, write, i = "GET", False, 0
+    while i < len(rest):
+        arg = rest[i]
+        name, eq, inline = arg.partition("=")
+        if arg in ("-X", "--method") or (eq and name == "--method"):
+            method = (inline if eq else (rest[i + 1] if i + 1 < len(rest) else "")).upper()
+        elif arg.startswith("-X") and len(arg) > 2:
+            method = arg[2:].upper()
+        elif name in API_WRITE_FLAGS or arg.startswith(("-f", "-F")):
+            write = True
+        i += 1
+    text = " ".join(rest)
+    if any(a == "graphql" for a in rest if not a.startswith("-")):
+        if any(word in text for word in GRAPHQL_MERGE_WORDS) or "--input" in rest or "@" in text:
+            return ("graphql", None)
+        return None
+    if method == "GET" and not write:
+        return None
+    for arg in rest:
+        if arg.startswith("-"):
+            continue
+        path, climbed = api_path_parts(arg)
+        if climbed and re.search(r"pulls/[^/]*/merge", urllib.parse.unquote(arg), re.I):
+            return ("api-unknown", "the path of that merge call climbs above its repository")
+        found = API_MERGE_RE.match(path)
+        if found and not re.search(r"[{}$<>:]", found.group(1)):
+            return ("api", (found.group(1), int(found.group(2))))
+        if found or re.search(r"(^|/)pulls/[^/]*/merge", path, re.I):
+            return ("api-unknown", "the pull request of that merge call cannot be told")
+    return None
+
+
+def mg_refuse(why):
+    return ("refuse", "gh: %s (the merge gate fails closed; the owner's own terminal or a logged waiver of the chief of staff goes around it)" % why)
+
+
+def merge_gate_probe(args, lookup, gh):
+    """None (run as given), ("refuse", one line) or ("go", args, release_ref): the merge may run with these args; `release_ref` is the pull request whose lock is
+    released when the merge returns (None when no lock was used). The marker FLEET_SWITCHBOARD_OWN_GH is NOT honoured here (a worker can set it): the
+    switchboard's own gh calls never merge through this shim. Routes covered: `pr merge` in any shape (one the shim cannot parse is refused), `gh api` writes to
+    `pulls/N/merge`, GraphQL merge mutations. Not covered, and said in the docs: an alias the shim cannot see, the web UI, a push to the branch."""
+    try:
+        args = canonical_pr_merge(args)
+        route = merge_route(args)
+        if route is None:
+            return None
+        listed = merge_gate_repos()
+        if listed is not None and not listed:
+            return None
+        if listed is None:
+            return mg_refuse("merge refused: the merge gate's configuration could not be read")
+        kind = route[0]
+        parsed, repo, number = None, None, None
+        if kind == "graphql":
+            return mg_refuse("a GraphQL merge mutation cannot be tied to a pull request while a repository is gated: use `gh pr merge`")
+        if kind == "api-unknown":
+            return mg_refuse("merge refused: %s" % route[1])
+        deadline = time.time() + merge_gate_seconds()
+        env = None
+        if gh is not None:
+            try:
+                env = account_env(gh, lookup)
+            except AppMintRefused as err:
+                return ("refuse", str(err))
+            except Exception:
+                env = None
+        if kind == "pr":
+            parsed = gate_parse(args)
+            if parsed is None:   # a shape the shim cannot parse: refused, unless it names a repository that is not gated
+                named = next((args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-R", "--repo") and REPO_RE.match(args[i + 1])), None)
+                if named and named.lower() not in listed:
+                    return None
+                return mg_refuse("merge refused: the shape of this `pr merge` command was not understood")
+            repo, number = gate_resolve(parsed, gh, env, deadline)
+            if repo is None:
+                return mg_refuse("merge refused: the pull request could not be resolved (%s)" % gate_clean(str(number)))
+        else:
+            repo, number = route[1]
+        if repo.lower() not in listed:
+            return None
+        ref = "%s#%d" % (repo, number)
+        binary = mg_binary()
+        if not binary:
+            return mg_refuse("merge of %s refused: the merge gate cannot be asked (no switchboard)" % ref)
+        try:
+            done = subprocess.run(sb_argv(binary, "merge-gate", ref, "--check", "--json"), capture_output=True, text=True, timeout=merge_gate_seconds(),
+                                  stdin=subprocess.DEVNULL, env=sb_env(own=True))
+        except (subprocess.SubprocessError, OSError):
+            return mg_refuse("merge of %s refused: the merge gate did not answer in time; retry, or ask the chief of staff for a logged waiver" % ref)
+        try:
+            payload = json.loads(done.stdout.strip().splitlines()[-1]) if done.stdout.strip() else {}
+        except ValueError:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        if done.returncode == 10:
+            reason = (payload.get("reason") or done.stderr or "").strip().splitlines()
+            line = gate_clean(reason[0] if reason else "")
+            if line and not line.startswith("merge of"):
+                line = "merge of %s refused: %s" % (ref, line)
+            return ("refuse", "gh: " + (line or "merge of %s refused by the merge gate" % ref)[:400])
+        if done.returncode != 0 or payload.get("allowed") is not True:
+            return mg_refuse("merge of %s refused: the merge gate could not decide (exit %d)" % (ref, done.returncode))
+        head = payload.get("head")
+        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+            return mg_refuse("merge of %s refused: the merge gate gave no head to bind the merge to" % ref)
+        release = ref if payload.get("locked") is True else None
+        if kind == "api":
+            return ("go", args, release)
+        bound = gate_bind_merge(args, parsed, repo, number, {"head": head})
+        if bound is None or bound[0] == "refuse":
+            return ("refuse", bound[1] if bound else "gh: merge of %s refused: the merge could not be bound to the checked head" % ref)
+        return ("go", bound[1], release)
+    except Exception:
+        return mg_refuse("merge refused: the merge gate hit an unexpected error")
+
+
+def merge_gate_release(ref):
+    """Release the merge lock of `ref` (best effort: a lock that is not released is recovered by its lease)."""
+    try:
+        binary = mg_binary()
+        if binary:
+            subprocess.run(sb_argv(binary, "merge-gate", ref, "--release"), capture_output=True, text=True, timeout=merge_gate_seconds(),
+                           stdin=subprocess.DEVNULL, env=sb_env(own=True))
+    except Exception:
+        pass
 
 
 HOLD_MODULE = [None, False]   # (module, tried): gh_hold.py beside this file, loaded by path (a plain `import` would need a package)
@@ -1170,6 +1834,53 @@ def refusal_text(err):
     return "gh: no GitHub account is mapped for %s: git cannot authenticate as a guess (add the repository or its owner to gh_users)\n" % _clean_reason(str(err))
 
 
+SHARED_TEMP_DIRS = ("/tmp", "/private/tmp")
+
+
+def shared_body_file(args, env=None):
+    """The --body-file / -F path (absolute) whose PARENT directory is a shared temp directory, else None. String analysis only: the path is
+    never opened, stat'ed or read, and '..' is folded lexically. The shared directories are /tmp, /private/tmp and the parent of this
+    agent's own TMPDIR (the profile's shared temp root, which the launch exports as FLEET_AGENT_TMPDIR). Fails open: any error is None."""
+    try:
+        env = os.environ if env is None else env
+        if not args or args[0] == "api":   # `gh api -F key=value` is a field, not a file
+            return None
+        shared = {posixpath.normpath(d) for d in SHARED_TEMP_DIRS}
+        own = env.get("FLEET_AGENT_TMPDIR") or ""
+        if own.startswith("/") and posixpath.normpath(own) != "/":
+            shared.add(posixpath.dirname(posixpath.normpath(own)))
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "--":
+                return None
+            value = None
+            if arg in ("--body-file", "-F"):
+                value = args[i + 1] if i + 1 < len(args) else None
+            elif arg.startswith("--body-file="):
+                value = arg[len("--body-file="):]
+            elif arg.startswith("-F") and not arg.startswith("--"):
+                value = arg[2:].lstrip("=") if arg[2:3] == "=" else arg[2:]
+            if value is not None and value.startswith("/"):
+                if posixpath.dirname(posixpath.normpath(value)) in shared:
+                    return value
+            i += 1
+    except Exception:
+        return None
+    return None
+
+
+def warn_shared_body_file(args):
+    """One stderr line when a body file sits directly in a shared temp directory (#767). Never refuses, never changes anything."""
+    try:
+        path = shared_body_file(args)
+        if path:
+            sys.stderr.write("gh: warning: %s is directly in a shared temp directory, where another agent can write the same name: put it under $TMPDIR "
+                             "(for example $TMPDIR/body.md, or a directory from `mktemp -d`)\n" % re.sub(r"[^\x20-\x7e]", "?", path)[:200])
+    except Exception:
+        pass
+
+
 def main(args):
     try:
         return run(args)
@@ -1183,6 +1894,8 @@ def run(args):
         sys.stderr.write("gh: not found on PATH (the fleet shim found no real gh behind it)\n")
         return 127
     plan = None
+    warn_shared_body_file(args)
+    args = canonical_pr_merge(args)   # THE one parse of the call shape: every probe below (hold, review, plan gate, merge gate) reads the same canonical `pr merge` (#962)
     args, over_found, over_reason = take_over_review(args)   # the shim's own flag never reaches gh or the signing
     write = is_write(args)
     lookup = Lookup(write=write)   # one identity lookup, one deadline, for the name and the account together
@@ -1212,6 +1925,14 @@ def run(args):
         return 10
     if verdict is not None:
         args = verdict[1]
+    merged = merge_gate_probe(args, lookup, gh)
+    release_ref = None
+    if merged is not None and merged[0] == "refuse":
+        sys.stderr.write(gate_clean(merged[1]) + "\n")
+        audit_write(args, lookup, "refused", write, hold_repo, hold_number)
+        return 10
+    if merged is not None:
+        args, release_ref = merged[1], merged[2]
     credential = is_git_credential(args)
     extra = {"credential": True} if credential else {}   # only the git credential route passes the keyword: every other call is exactly as it was
     if scope is not None:
@@ -1241,7 +1962,31 @@ def run(args):
             return 1
     audit_write(args, lookup, "passed", write, hold_repo, hold_number)
     warn_text(args)
+    served = None
+    try:
+        own = os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1"
+        words = command_words(args)
+        if not own and words and words[0] not in NO_NETWORK_GROUPS:
+            ident = lookup.identity() if (write or cacheable_read(args)) else {}
+            agent = ident.get("name")
+            if write:
+                cache_drop(agent)   # a write by this agent: its cached answers go before the write runs
+            account = COUNT_ACCOUNT[0] or "default"
+            low = budget_low(account)
+            if low is not None:
+                warn_low(account, low)
+            if not write and plan is None and not APP_DIRS:
+                served = cached_read(gh, env, args, agent, account, low)
+    except Exception:
+        served = None   # the cache never fails the command
+    if served is not None:
+        return served
     count_call(args)
+    if plan is None and release_ref:   # a merge under the lock: the lock is released when the merge returns, whatever it returned
+        try:
+            return subprocess.run([gh] + args, env=env).returncode
+        finally:
+            merge_gate_release(release_ref)
     if plan is None:
         if APP_DIRS:   # a token file has to be removed after the call: gh runs as a child, not in place of this process
             child = subprocess.Popen([gh] + args, env=env)
@@ -1253,6 +1998,8 @@ def run(args):
     argv, stdin_text, temp = plan
     try:
         done = subprocess.run([gh] + argv, input=stdin_text, text=True if stdin_text is not None else None, env=env)
+        if write:
+            cache_mark(lookup.identity().get("name"))   # the write has ended (an exec'd write cannot say so: the grace window covers it)
         return done.returncode
     finally:
         if temp:

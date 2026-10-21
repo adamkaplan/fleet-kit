@@ -205,11 +205,15 @@ class Recorder:
         hours = self.hours.get(session)
         return max(hours) if hours else (self.context.get(session) or {}).get("at", 0)
 
-    def body(self, tool_body=None, light=False, watched=()):
+    def body(self, tool_body=None, light=False, watched=(), retired_sessions=None):
         """The derived file's content. Bounded by hours kept, agents kept and FILE_CAP. `light`: v2_light is on, so no session history is read and
-        `usage` cannot be fed. `watched`: the repositories whose events the daemon receives (a running forwarder): one with no push reads 0."""
+        `usage` cannot be fed. `retired_sessions`: the sessions the registry lists as retired (the records are a view of it: they leave); `watched`: the repositories whose events the daemon receives (a running forwarder): one with no push reads 0."""
         with self.lock:
-            return self._body(tool_body, light, watched)
+            out = self._body(tool_body, light, watched)
+        if retired_sessions:   # a view of the registry: a retired agent's session leaves (None, or an empty set: nothing is dropped; the caller passes None when the registry was not read whole)
+            for table in ("tool_calls", "usage", "steps"):
+                out[table] = {s: v for s, v in out[table].items() if s not in retired_sessions}
+        return out
 
     def _body(self, tool_body=None, light=False, watched=()):
         now = self.clock()

@@ -1,0 +1,22 @@
+# THE TOKEN TABLE: what the worker's installation token (contents: write, pull requests: write, metadata: read) allows.
+# One row per action: action | token | decided by | status. Source: GitHub's "Permissions required for GitHub Apps" page.
+# token: allowed, refused or unknown. status: documented, or "to be probed live" (a tester step on the throwaway repository
+# after merge: nothing here was probed against a live token). cloud/README.md renders these rows between its table markers;
+# cloud/worker/tests/test_token_table.py pins every row. A row is changed here, in the README and in that test together.
+PR create, edit title/body/base, close, reopen | allowed | pull requests: write | documented
+PR comment, review comment, reply | allowed | pull requests: write | documented
+Issue comment on a PR, labels on a PR, assignees | allowed | pull requests: write (the shared endpoints accept issues or pull requests) | documented, labels to be probed live
+Request or remove reviewers | allowed | pull requests: write | documented
+Ready for review, convert to draft | allowed | pull requests: write (GraphQL, not in the REST table) | to be probed live
+Submit review, approve, request changes, dismiss | allowed | pull requests: write (GitHub refuses a self-approval; whether a bot approval counts is the ruleset's) | documented, counting to be probed live
+Update PR branch | allowed | pull requests: write | documented
+Merge a PR (REST) | allowed | contents: write (bounded only by the ruleset) | documented
+Enable or disable auto-merge | allowed | pull requests: write (GraphQL; only if the repository allows auto-merge) | to be probed live
+Merge queue enqueue and dequeue | unknown | not in the documented table | to be probed live
+Branch create, push, delete (non-default) | allowed | contents: write | documented
+Push or delete the default branch, force-push | allowed | contents: write (refused only by the ruleset) | documented
+Tag create and delete | allowed | contents: write | documented
+Releases and release assets | allowed | contents: write | documented
+Workflow file changes | refused | no workflows permission | documented
+Repository settings, rulesets, branch protection, webhooks, secrets | refused | administration, secrets and webhooks not granted | documented
+Issue create, edit, close | refused | issues not granted (comments, labels and assignees on a PR are the PR rows above) | documented, to be probed live

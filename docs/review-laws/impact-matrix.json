@@ -152,6 +152,7 @@
         "bin/plan_ledger.py",
         "bin/impact_floor.py",
         "bin/chat_clear.py",
+        "bin/merge_gate.py",
         "bin/clear_carry.py",
         "bin/reassign.py",
         "bin/item_verdicts.py",
@@ -195,6 +196,7 @@
           "bin/plan_ledger.py",
           "bin/impact_floor.py",
           "bin/chat_clear.py",
+          "bin/merge_gate.py",
           "bin/clear_carry.py",
           "bin/reassign.py",
           "bin/item_verdicts.py",
@@ -291,9 +293,36 @@
       ]
     },
     "note": "top_tier_outside_floor lists the top tier paths that are deliberately not in the floor globs (the floor excludes agent definitions, which are captain pull requests); a test checks that every other top tier path is inside the floor. bin/fleet-switchboard selects accounts and mints tokens but is not a top tier path (it would hold nearly every change): a change there to credentials or identity must be rated with that class by the independent review.",
+    "never_carried_paths": [
+      "bin/chat_clear.py",
+      "bin/merge_gate.py",
+      "bin/clear_carry.py",
+      "bin/delegated_clear.py",
+      "bin/impact_floor.py",
+      "bin/impact_hold.py",
+      "bin/plan_check.py",
+      "bin/plan_ledger.py",
+      "bin/repo_exclusion.py",
+      "docs/review-laws/impact-matrix.json"
+    ],
+    "never_carried_meaning": "The owner's clear is NEVER carried over a merge of main that resolved a conflict by hand (bin/clear_carry.py, bin/impact_hold.py: the carry reads this list through impact_floor.carry_never_paths and holds no path of its own) when that merge touches one of these paths or the pull request's own change does: the clear's own code and this matrix. Credential and identity paths are not here: they are carried like any other path (the owner's answer, ask #815). Every exact path of `delegated_clear.clear_code_paths` is here, because the ledger and the plan check decide who may confirm a carry; its directory globs (the plugin, the shims, the templates, the proof tools, the workflows) are not, and the shims are identity paths the owner chose to carry. A test checks both lists against each other and that every bin module named for the clear, the hold or the floor is here. The guard for what is not listed (the daemon file, the globs) is the independent reviewer's confirmation and the continuous tests, not a proof.",
     "delegated_clear": {
-      "meaning": "What the Chief of Staff's clear under the owner's standing order may NEVER lift (bin/delegated_clear.py reads this block and holds no path, class or function name of its own): a pull request whose top tier path hits include a class of `never_path_classes`; whose independent review's class is one of `top_tier_review_classes` (or none is recorded); that changes ANY file matching `clear_code_paths` (the clear and hold machinery by name, and the directories the daemon and the CLI load at start); that ADDS, DELETES or RENAMES a file matching `new_file_globs` (a new file under bin/ is loaded at config load); or that changes a file of `closure_files` (the daemon file and the bin modules the clear loads or runs (the daemon's imports at load, the config readers every module declares, and a recorded run of the clear: a test derives the list); for a module other than the daemon file ANY import-time statement, and the functions of `module_roots`) on a line that belongs to the CLEAR CLOSURE: the definitions reachable by name from `closure_roots`, the module-level bindings they read, any other top-level statement, or a definition that refers to a `clear_entry_points` name. Other changes under bin/ (an authority module edit that does not change who may do what) are allowed.",
-      "never_path_classes": [
+      "meaning": "What the Chief of Staff's clear under the owner's standing order may NEVER lift (bin/delegated_clear.py reads this block and holds no path, class or function name of its own). For an order WITHOUT a `max_level`, two refusals apply. The first refuses a pull request whose top tier path hits include a class of `never_path_classes`. The second refuses a pull request whose independent review's class is one of `top_tier_review_classes` (or none is recorded). For an order WITH a `max_level`, the score rule in `score` replaces those two refusals. The refusals below apply either way, with or without a `max_level`. A pull request that changes ANY file matching `clear_code_paths` (the clear and hold machinery by name, and the directories the daemon and the CLI load at start) is refused: never delegated also means ALWAYS HELD for the owner, because the floor holds a pull request that changes one of them (the code the clear merely loads, `closure_files`, is outside that hold until the closure ask #940 lands). A pull request that ADDS, DELETES or RENAMES a file matching `new_file_globs` (a new file under bin/ is loaded at config load) is refused. A pull request that changes a file of `closure_files` (the daemon file and the bin modules the clear loads or runs (the daemon's imports at load, the config readers every module declares, and a recorded run of the clear: a test derives the list); for a module other than the daemon file ANY import-time statement, and the functions of `module_roots`) on a line that belongs to the CLEAR CLOSURE is refused: the definitions reachable by name from `closure_roots`, the module-level bindings they read, any other top-level statement, or a definition that refers to a `clear_entry_points` name. Other changes under bin/ (an authority module edit that does not change who may do what) are allowed.",
+      "score": {
+      "meaning": "The score rule (#835), used for an order that sets max_level: the score is the highest LEVEL of the matrix's cells for the independent impact reviewer's records at the pull request's exact head, on the ladder below. A changed path of a top tier class (the rule ids below name the classes) makes `floor.lowest_level` the lowest score allowed: a rating below it on such a path is refused, and the rating's reason must name the rule id. Only a level of `delegable_levels` may be cleared: High is always the owner's. Only a record whose recorded role is in `rating_roles` counts. The clear code holds no level, rule id or role of its own.",
+      "ladder": ["Low", "Medium", "Serious", "High"],
+      "delegable_levels": ["Low", "Medium", "Serious"],
+      "rating_roles": ["reviewer"],
+      "floor": {
+        "lowest_level": "Serious",
+        "rules": {
+          "floor-credentials": "credentials",
+          "floor-identity": "identity",
+          "floor-authority": "authority"
+        }
+      }
+    },
+    "never_path_classes": [
         "credentials",
         "identity"
       ],
@@ -306,6 +335,7 @@
         "docs/review-laws/impact-matrix.json",
         "bin/delegated_clear.py",
         "bin/chat_clear.py",
+        "bin/merge_gate.py",
         "bin/clear_carry.py",
         "bin/impact_hold.py",
         "bin/impact_floor.py",
@@ -340,6 +370,7 @@
         "bin/queue_ejections.py",
         "bin/reassign.py",
         "bin/reds.py",
+        "bin/registry.py",
         "bin/report_fold.py",
         "bin/spotlight_guard.py",
         "bin/triage_digest.py",
@@ -383,6 +414,9 @@
         "bin/reassign.py": [
           "*"
         ],
+        "bin/registry.py": [
+          "*"
+        ],
         "bin/reds.py": [
           "settings"
         ],
@@ -394,10 +428,35 @@
           "validate"
         ]
       },
+      "dynamic_actions": [
+        "review"
+      ],
+      "rating_roots": [
+        "add_review_parsers",
+        "build_parser",
+        "call_command",
+        "cmd_review",
+        "command_registrars",
+        "dispatch",
+        "main",
+        "resolve_command",
+        "parse_review_block"
+      ],
       "closure_roots": [
+        "CLEAR_NOTICE_BACKOFF",
+        "CLEAR_NOTICE_CLAIM_SECONDS",
+        "CLEAR_NOTICE_KINDS",
+        "CLEAR_NOTICE_MAX_AGE_SECONDS",
+        "CLEAR_NOTICE_PASS_MAX",
         "CLEAR_NOTIFIED_FILE",
         "CLEAR_NOTIFIED_MAX",
+        "CLEAR_PENDING_BODY_MAX",
+        "CLEAR_PENDING_FILE",
+        "CLEAR_PENDING_MAX",
+        "CLEAR_REMINDED_FILE",
         "ConfigError",
+        "CosOrdersError",
+        "DEFAULTS",
         "EXIT_ERROR",
         "EXIT_OK",
         "EXIT_USAGE",
@@ -409,10 +468,13 @@
         "LABEL_SPECS",
         "NOTIFY_CLEAR_DEADLINE_SECONDS",
         "NoticeError",
+        "OWNER_HOLD_KEY",
         "PROG",
         "Path",
         "_PLAN_ISSUE_RE",
         "_PLAN_REF_SHORT",
+        "_audit_tail",
+        "_finite",
         "_gh_write",
         "_intent_reader",
         "_is_orchestrator",
@@ -425,24 +487,31 @@
         "build_engine",
         "change_issue_labels",
         "checked_plan",
+        "cos_orders_text_of",
         "ensure_labels",
+        "ensure_state_dir",
         "fetch_orders",
         "gates_caller_kind",
         "impact_carry_get",
+        "impact_carry_marks",
         "impact_floor",
+        "impact_rating_entries",
         "impact_records",
         "impact_review_record",
         "impact_state_lock",
         "json",
         "label_names",
+        "load_config",
         "load_module",
         "notice_senders",
         "os",
         "parse_pr_ref",
         "plan_ledger",
+        "pr_facts_from",
         "pr_floor_report",
         "pr_marker",
         "re",
+        "read_cos_orders",
         "read_open_items",
         "read_pr_json",
         "read_pr_notices",
@@ -450,7 +519,8 @@
         "subprocess",
         "sys",
         "threading",
-        "types"
+        "types",
+        "whole_skipped"
       ],
       "clear_entry_points": [
         "impact_clear_core",
@@ -474,6 +544,7 @@
         "bin/launch_testers.py": "loaded only by the tester launch command, not the clear",
         "bin/merged_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/orders_copy.py": "loaded only by `cmd_orders_copy`, not the clear",
+        "bin/pr_reading.py": "loaded only by `cmd_merge_gate`: the merge gate command, not the clear",
         "bin/resume_brief.py": "loaded only by `cmd_launch`, not the clear",
         "bin/review_checkout.py": "loaded only by `cmd_review_checkout`, the reviewer checkout command, not the clear",
         "bin/triage_ownerless.py": "loaded only by the triage passes, which the clear does not run",

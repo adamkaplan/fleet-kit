@@ -24,7 +24,7 @@ WAIT_LABEL = re.compile(r"await|hold|parked|block|wait", re.IGNORECASE)
 # what the command hands in, by name (the switchboard's helpers, classes and constants this module uses)
 NEEDS = ("PROG", "EXIT_OK", "EXIT_ERROR", "EXIT_USAGE", "IntentError", "MessageTooLong", "InterruptRefused", "ReminderError",
          "_CHARTER_BLOCK", "NO_INTENT", "_fleet_repo", "_is_issue_number", "_one_line", "boss_name", "issue_tag", "iso",
-         "read_reminders", "write_reminders", "reminders_lock", "_gh_write", "orchestrator_label", "load_module")
+         "read_reminders", "write_reminders", "reminders_lock", "_gh_write", "orchestrator_label", "load_module", "repoint_workers")
 
 
 class MoveRefused(Exception):
@@ -45,8 +45,8 @@ def block_orchestrator(body):
 
 def charter_orchestrators(sb, discovery, repo, charter, body=None):
     """The live orchestrator of `charter` in `repo` as a list of exactly one name, or [] when none or more than one can be told apart.
-    The orchestrator the charter body's top block names wins when it is a live orchestrator of THIS repo; the `charter` field of an
-    orchestrator's session metadata (in this repo) is the fallback."""
+    The orchestrator the charter body's top block names wins when it is a live orchestrator of THIS repo; the registry row's `charter` of an
+    orchestrator (in this repo) is the fallback (#969: never the session metadata)."""
     def mine(agent):
         fleet = agent.fleet or {}
         return fleet.get("role") == "orchestrator" and sb._fleet_repo(fleet, sb.engine.config) == repo
@@ -55,7 +55,12 @@ def charter_orchestrators(sb, discovery, repo, charter, body=None):
     agent = discovery.agents.get(named) if named else None
     if agent is not None and mine(agent):
         return [agent.name]
-    found = sorted(a.name for a in discovery.agents.values() if mine(a) and (a.fleet or {}).get("charter") == charter)
+    registry = sb.load_module("registry")   # #969: the registry row's charter is the one record; the live session's metadata is never a second owner
+    reg = registry.read(sb.engine.state_dir) if sb.engine.state_dir is not None else None
+    if reg is None or not reg["whole"]:
+        return []
+    charters = registry.orchestrator_charters(reg["agents"])
+    found = sorted(a.name for a in discovery.agents.values() if mine(a) and charters.get(a.name) == charter)
     return found if len(found) == 1 else []
 
 
@@ -272,7 +277,8 @@ def old_notice(plan, caller, new_owner, workers, reminder_text, tag):
     lines = ["Ask %s moved to charter #%d (%s) by %s: it is no longer yours." % (
         tag, plan["new"], new_owner or "no orchestrator running there", caller)]
     if workers:
-        lines.append("Workers still finishing under you (their boss is unchanged): %s." % ", ".join(name for name, _ in workers))
+        lines.append("Workers on it (%s): %s." % (("they now report to %s" % new_owner) if new_owner else "their boss is unchanged: no orchestrator runs the new charter",
+                                                   ", ".join(name for name, _ in workers)))
     else:
         lines.append("No workers were running on it.")
     lines.append(reminder_text)
@@ -349,6 +355,15 @@ def run_move(sb, repo, ask, to_charter, caller, role, out, err, watched=None):
             % (sb.PROG, "#%d" % now_parent if now_parent else "(none)", new, tag))
         return sb.EXIT_ERROR
     out("moved ask %s from charter #%d to charter #%d" % (tag, old, new))
+    # step 2b (#838): the workers of the moved ask follow the ask to the new charter's orchestrator, in the same step (audited per worker)
+    if new_owner is not None and old_owner is not None:
+        mine = [name for name, boss in workers if boss == old_owner]
+        if mine:
+            moved, problem = sb.repoint_workers(engine, mine, new_owner, "move", who)
+            for worker, heir in moved:
+                out("worker %s now reports to %s" % (worker, heir))
+            if problem:
+                failed.append("workers (%s)" % sb._one_line(problem, 120))
     # step 3, reminders.
     verb, held = "carried", []
     try:

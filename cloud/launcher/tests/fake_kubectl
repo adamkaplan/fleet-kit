@@ -67,8 +67,30 @@ if cmd == "apply" or (cmd == "create" and args[1:2] == ["-f"]):   # `create -f` 
             st.setdefault("secret_bodies", {})[obj["metadata"]["name"]] = {"password": obj["stringData"]["password"]}
         st.setdefault("secret_labels", {})[obj["metadata"]["name"]] = obj["metadata"].get("labels", {})
     else:
-        obj["status"] = {"phase": "Pending" if st.get("never_ready") else "Running",
-                         "conditions": [] if st.get("never_ready") else [{"type": "Ready", "status": "True"}]}
+        for k in st.pop("late_kills", []):   # the stop's Secret deletes land after the recreate was decided
+            st.get("secrets", {}).pop(k, None)
+        st["uid_counter"] = st.get("uid_counter", 0) + 1
+        obj["metadata"]["uid"] = "uid-%d" % st["uid_counter"]
+        plan = st.get("plan", [])   # per-create outcomes: "race" (event), "vanish" (Pending, gone at its second get), "race_vanish" (both), else ok
+        step = plan.pop(0) if plan else None
+        st["plan"] = plan
+        if step in ("vanish", "race_vanish") or (step or "").startswith("vanish:"):
+            obj["vanish_after_get"] = True
+            # "vanish:pw,run": an outside deletion (a stop, the reaper) takes these Secrets too, at the moment the pod goes
+            obj["vanish_kills"] = [k for k in (step.split(":", 1)[1].split(",") if ":" in step else []) if k]
+        event = None   # a sandbox failure the cluster records for THIS pod object (events outlive a deleted pod, as on a real cluster)
+        if step in ("race", "race_vanish"):
+            event = "RuntimeClass handler sysbox-runc does not support user namespaces: the handler sysbox-runc is not known"
+        elif st.get("race_creates", 0) > 0:   # the next N pod creates hit the fresh-node race
+            st["race_creates"] -= 1
+            event = "RuntimeClass handler sysbox-runc does not support user namespaces: the handler sysbox-runc is not known"
+        elif st.get("other_failure"):
+            event = st["other_failure"]
+        obj["status"] = {"phase": "Pending" if st.get("never_ready") or event or step == "never_ready_pod" or (step or "").startswith("vanish") and step != "race_vanish" else "Running",
+                         "conditions": [] if st.get("never_ready") or event or step == "never_ready_pod" or (step or "").startswith("vanish") and step != "race_vanish" else [{"type": "Ready", "status": "True"}]}
+        if event:
+            st.setdefault("events", []).append({"reason": "FailedCreatePodSandBox", "message": "Failed to create pod sandbox: " + event,
+                                                "involvedObject": {"kind": "Pod", "name": obj["metadata"]["name"], "uid": obj["metadata"]["uid"]}})
         st.setdefault("pods", {})[obj["metadata"]["name"]] = obj
     save()
 elif cmd == "create" and args[1:3] == ["secret", "generic"]:
@@ -95,31 +117,89 @@ elif cmd == "patch" and args[1] == "secret":
     with open(path + ".stdin", "a") as f:
         f.write(body + "\n")
     import base64
-    for k, v in json.loads(body)["data"].items():
-        st["secret_keys"][args[2]][k] = len(base64.b64decode(v))
+    patch = json.loads(body)
+    pm = patch.get("metadata", {})
+    if args[2] not in st.get("secrets", {}): missing('secrets "%s"' % args[2])
+    if "uid" in pm and pm["uid"] != st.get("secret_meta", {}).get(args[2], {}).get("uid"):
+        sys.stderr.write('Error from server (Conflict): Precondition failed: UID in precondition: %s, UID in object meta: other\n' % pm["uid"]); sys.exit(1)
+    if "resourceVersion" in pm and str(pm["resourceVersion"]) != str(st.get("secret_rv", {}).get(args[2], 1)):
+        sys.stderr.write('Error from server (Conflict): Operation cannot be fulfilled on secrets "%s": the object has been modified\n' % args[2]); sys.exit(1)
+    if st.get("patch_noop"):   # a patch the cluster answers and does not apply (the launcher must not believe it)
+        sys.exit(0)
+    for k, v in patch.get("data", {}).items():
+        st.setdefault("secret_keys", {}).setdefault(args[2], {})[k] = len(base64.b64decode(v))
         st.setdefault("secret_bodies", {}).setdefault(args[2], {})[k] = base64.b64decode(v).decode()
+    if patch.get("metadata", {}).get("annotations"):   # a merge patch of metadata.annotations
+        st.setdefault("secret_meta", {}).setdefault(args[2], {}).setdefault("annotations", {}).update(patch["metadata"]["annotations"])
+    st.setdefault("secret_rv", {})[args[2]] = st.get("secret_rv", {}).get(args[2], 1) + 1   # every write moves the resourceVersion
     save()
 elif cmd == "label" and args[1] == "secret":
     st.setdefault("secret_labels", {})[args[2]] = dict(kv.split("=", 1) for kv in args[3:])
+    if not st.get("label_keeps_rv"): st.setdefault("secret_rv", {})[args[2]] = st.get("secret_rv", {}).get(args[2], 1) + 1
     save()
 elif cmd == "port-forward":  # become the stub headless server on the local port, so the caller can end us
     os.execv(sys.executable, [sys.executable, os.path.join(HERE, "..", "..", "worker", "tests", "stub_server.py"), args[2].split(":")[0]])
 elif cmd == "get" and args[1] == "secret":
     if args[2] not in st.get("secrets", {}): missing('secrets "%s"' % args[2])
-    print(json.dumps({"metadata": {"name": args[2], "labels": st.get("secret_labels", {}).get(args[2], {})}}))
+    meta = {"name": args[2], "labels": st.get("secret_labels", {}).get(args[2], {}), "resourceVersion": str(st.get("secret_rv", {}).get(args[2], 1))}
+    meta.update(st.get("secret_meta", {}).get(args[2], {}))   # a test may give it a creationTimestamp; a patch adds annotations
+    import base64 as _b64
+    print(json.dumps({"metadata": meta, "data": {k: _b64.b64encode(v.encode()).decode() for k, v in st.get("secret_bodies", {}).get(args[2], {}).items()}}))
+elif cmd == "get" and args[1] == "events":
+    name = args[3].split("involvedObject.name=")[1]
+    print(json.dumps({"items": [e for e in st.get("events", []) if e["involvedObject"]["name"] == name]}))
 elif cmd == "get" and args[1] == "pod":
-    if args[2] not in st.get("pods", {}): missing('pods "%s"' % args[2])
-    print(json.dumps(st["pods"][args[2]]))
+    if args[2] not in st.get("pods", {}) or st.get("hide_pod"): missing('pods "%s"' % args[2])   # hide_pod: the pod was never visible to a get
+    pod = st["pods"][args[2]]
+    if pod.get("vanish_after_get"):   # the pod is seen once, then the object is gone (the runtime restart on a fresh node)
+        if pod.get("seen_once"):
+            del st["pods"][args[2]]
+            for k in pod.get("vanish_kills", []):
+                if k.startswith("swap-"):   # a Secret of the same name that carries another run's id
+                    st.setdefault("secret_labels", {})[args[2] + "-" + k[5:]] = {"cw/run-id": "ffffffffffffffff"}
+                elif k.startswith("late-"):   # a stop in flight: the Secrets go on the NEXT call after the pod's
+                    st.setdefault("late_kills", []).append(args[2] + "-" + k[5:])
+                elif k.startswith("ready-"):   # a stop in flight: the Secrets go on the first get that sees the next pod Running
+                    st.setdefault("ready_kills", []).append(args[2] + "-" + k[6:])
+                else:
+                    st.get("secrets", {}).pop(args[2] + "-" + k, None)
+            save(); missing('pods "%s"' % args[2])
+        pod["seen_once"] = True; save()
+    if pod.get("status", {}).get("phase") == "Running" and st.get("ready_kills"):
+        for k in st.pop("ready_kills"):
+            st.get("secrets", {}).pop(k, None)
+        save()
+    print(json.dumps(dict(pod, metadata=dict({"uid": "uid-%s" % args[2]}, **pod["metadata"]))))   # a planted pod has the uid a real one always has
+    if st.get("swap_after_get"):   # the pod is replaced right after the read (the millisecond between a read and a delete)
+        st["uid_counter"] = st.get("uid_counter", 0) + 1
+        st["pods"][args[2]] = {"metadata": {"name": args[2], "uid": "uid-new-%d" % st["uid_counter"], "annotations": {"cw/run-id": st.pop("swap_after_get"), "cw/started": "2026-01-01T00:00:00Z", "cw/shape": "S"}},
+                               "status": {"phase": "Running"}}
+        save()
 elif cmd == "get" and args[1] == "pods":
     items = list(st.get("pods", {}).values())
     if "-l" in args:  # honour a label selector `key=value`
         k, v = args[args.index("-l") + 1].split("=", 1)
         items = [p for p in items if p["metadata"].get("labels", {}).get(k) == v]
     print(json.dumps({"items": items}))
-elif cmd == "annotate":
-    pod = st["pods"][args[2]]
-    for kv in args[4:]:
-        k, v = kv.split("=", 1); pod["metadata"]["annotations"][k] = v
+elif cmd == "patch" and args[1] == "pod":
+    assert "--patch-file=/dev/stdin" in args, "a patch must come from stdin"
+    patch = json.loads(sys.stdin.read())
+    pod = st.get("pods", {}).get(args[2])
+    if pod is None: missing('pods "%s"' % args[2])
+    real_uid = pod["metadata"].get("uid") or "uid-%s" % args[2]
+    if "uid" in patch.get("metadata", {}) and patch["metadata"]["uid"] != real_uid:
+        sys.stderr.write('Error from server (Conflict): Precondition failed: UID in precondition: %s, UID in object meta: %s\n' % (patch["metadata"]["uid"], real_uid)); sys.exit(1)
+    pod["metadata"].setdefault("annotations", {}).update(patch["metadata"].get("annotations", {}))
+    save()
+elif cmd == "delete" and args[1] == "--raw":   # a delete bound to a uid (DeleteOptions preconditions)
+    name = args[2].rsplit("/", 1)[1]
+    opts = json.loads(sys.stdin.read())
+    pod = st.get("pods", {}).get(name)
+    if pod is None: missing('pods "%s"' % name)
+    real_uid = pod["metadata"].get("uid") or "uid-%s" % name
+    if opts.get("preconditions", {}).get("uid") not in (None, real_uid):
+        sys.stderr.write('Error from server (Conflict): Precondition failed: UID in precondition: %s, UID in object meta: %s\n' % (opts["preconditions"]["uid"], real_uid)); sys.exit(1)
+    del st["pods"][name]
     save()
 elif cmd == "delete":
     kind, name = args[1], args[2]
@@ -158,6 +238,18 @@ elif cmd == "exec":
     elif tool == "git":
         if st.get("head_sha"): print(st["head_sha"])
         else: sys.exit(1)
+    elif tool == "cw-end-hook" and st.get("swap_pod_during_hook"):   # the hook runs, and meanwhile the next run's pod takes the name
+        st["uid_counter"] = st.get("uid_counter", 0) + 1
+        st["pods"][name] = {"metadata": {"name": name, "uid": "uid-new-%d" % st["uid_counter"],
+                                         "annotations": {"cw/run-id": st["swap_pod_during_hook"], "cw/started": "2026-01-01T00:00:00Z", "cw/shape": "S"}},
+                            "status": {"phase": "Running"}}
+        if st.get("swap_secrets"):   # ... with its per-run Secrets
+            for suffix in ("-pw", "-run"):
+                st.setdefault("secrets", {})[name + suffix] = 1
+                st.setdefault("secret_labels", {})[name + suffix] = {"cw/run-id": st["swap_pod_during_hook"]}
+        save()
+        print(json.dumps(st.get("hook_result_after_swap", {"pushed": True, "wip_branch": "w/wip"})))
+        if st.get("hook_fails_after_swap"): sys.exit(1)
     elif tool == "cw-end-hook" and st.get("hook_result"):  # a canned end hook answer
         print(json.dumps(st["hook_result"]))
         if st["hook_result"].get("error"): sys.exit(1)

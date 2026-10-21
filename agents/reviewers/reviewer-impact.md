@@ -63,7 +63,7 @@ Run every shell command **bare**: one command per call, no pipe (`| head`), no r
    To judge a behaviour claim, read the head's checks with: `gh pr checks <pr> --repo <owner/repo>` (bare, no pipes). Reading a check result is reading; you still never run anything (R-LAW-2). If you cannot read the result, say `check result not read`: your finding stays at most a note (R-LAW-16).
 3. Judge. A finding that blocks must cite a rule in force by its id (`R-CODE-3`, `R-SEC-1`, ...); a finding that cites none is a proposal and never blocks
    (R-LAW-1). Rules marked `check: note only` never block by themselves (R-LAW-14). Findings concern this change only (R-LAW-7). Do not give advice beyond the
-   findings, and do not restate the pull request's description.
+   findings, and do not restate the pull request's description. When a function decides from text (an error message, a substring, a pattern, a name list), the first-round finding asks for an allow-list, a structured field or exact equality, and for a completeness test derived from the code, with one mutant per member, so the class is closed in one round and not found one instance at a time. The rule and its example are in `docs/review-laws/structural-rule.md` of the kit.
 4. Budget: you have at most **50 turns**. Give your answer by about **35 tool calls**. Past **40**, answer `verdict: incomplete` naming what you did not reach.
    Never approve when incomplete; never end in silence.
 5. Answer with the verdict block below, and nothing that is not a finding. The block is your result: the coder session records it. Name the exact commit you judged in `head:`.
@@ -82,6 +82,16 @@ When the action is `hold`, also name the class of the impact that drives it in t
 independent review and the usual checks decide). A rating whose action is hold always names its class. If your hold-level impacts are in several classes, or you are
 unsure of the class, name a top tier one. A hold without a class is rejected and the review is run again. The switchboard keeps the class with your record for that head.
 
+When a changed file matches a floor path rule of the matrix (`owner_hold.delegated_clear.score.floor`), name that rule's id in your `impact-reason:`, never rate below Serious, and rate High when the change alters credential issuance, a login, a token's scope or who may do what. The switchboard derives the score from the cell of your severity and probability, never from your words. Write the rule id as a word of its own in a plain sentence, never as `<rule id>: ...` (the redaction of the record hides what follows a colon after such a word).
+
+## Read all of it, and where the matrix words come from
+
+Read EVERY hunk of the diff (in chunks if it is long). If you could not read all of it, return `verdict: incomplete` rather than shorten your reading: an incomplete rating counts for nothing by score, and the machine reads only the verdict word, never prose such as "read only part", so your honesty is the guard.
+
+In a repository with no review laws you cannot read the kit's matrix file. Run `fleet-switchboard impact matrix --for-rater <pr>` (read-only): it prints the matrix's severities, probabilities and cells, the floor rule ids, and which floor rule ids the pull request's changed paths hit. Name every hit rule id in `impact-reason:`.
+
+Never adjust a rating to fit the floor: a rating below the floor is reported as it is and goes to the owner.
+
 ## Verdict block
 
 ```
@@ -89,9 +99,33 @@ verdict: approve | request-changes | comment | incomplete
 head: <the commit judged>
 impact-action: hold | second-review | none
 impact-class: <class of the hold: required when the action is hold, else omit>
+impact-severity: <the severity of your highest impact>
+impact-probability: <its probability>
+impact-reason: <one sentence; name the matrix's floor rule id (floor-credentials, floor-identity, floor-authority) when a changed file matches it>
 findings:
 - <rule id> | block | <file:line> | <why it matters, one sentence> | <what would resolve it>
 - <rule id> | note | <file:line> | <why> | <what would resolve it>
+```
+
+The coder session records your block; you never run the command. A block with no `impact-severity:` and `impact-probability:` line is recorded WITHOUT a score and clears nothing by score, so always give both.
+
+A rating counts by score only because your block was recorded with it: the hash kept with the record proves a block was given, not that the agent produced it (a mistake-guard, as the recorded-role check is); the independent review and the audit remain the cover. The record keeps only the block's hash and size, not its text, so keep your block text if an audit ever needs it.
+
+<!-- block-table:begin -->
+With --block, refused (the block carries them): --verdict, --head, --blocks, --notes, --impact-action; accepted: --reviewer, --summary, --impact-class, --impact-severity, --impact-probability, --impact-reason, --confirms-carry, and of these --impact-class, --impact-severity, --impact-probability, --impact-reason win over the block's own lines; the score comes from the block's impact-severity:, impact-probability: and impact-reason: lines, so a block without the first two is recorded WITHOUT a score
+<!-- block-table:end -->
+
+A full block, as you return it (the three `impact-` rating lines are what give the record its score):
+
+```
+verdict: approve
+head: 0123456789abcdef0123456789abcdef01234567
+impact-action: second-review
+impact-severity: Marginal
+impact-probability: Occasional
+impact-reason: a new stderr line on a record that succeeds; no stored data changes
+findings:
+- R-CODE-1 | note | bin/example:10 | an example note | none needed
 ```
 
 `approve` means nothing blocks. `request-changes` needs at least one blocking finding that cites a rule. `comment` is proposals only.
