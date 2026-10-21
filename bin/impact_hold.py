@@ -1112,7 +1112,11 @@ def delegated_clear_inputs(engine, runner, repo, number, take=False, report=None
     clear (`delegated_clear_pr_checks`) and by the line the daemon posts (`clear_who`): one reading, no second copy. #661, #946."""
     try:
         report = report if isinstance(report, dict) else pr_floor_report(engine, repo, number)   # the line is given the report the pass just judged: one floor read per pull request per pass
-        rule = (impact_floor.load_matrix().get("owner_hold") or {}).get("delegated_clear")
+        matrix = impact_floor.load_matrix()
+        rule = (matrix.get("owner_hold") or {}).get("delegated_clear")
+        listed, problem = impact_floor.clear_code_paths(matrix)   # the ONE reader of the list: the floor holds these paths, the clear refuses them
+        if isinstance(rule, dict) and listed is not None and problem is None:
+            rule = dict(rule, clear_code_paths=listed)
     except (impact_floor.MatrixError, NoticeError, ValueError) as err:
         return None, "the owner-hold decision or its rule cannot be read (%s): refused" % _one_line(str(err), 140)
     files, get = [], impact_carry_get(engine, runner, repo)
