@@ -62,8 +62,11 @@ Each setting's name, whether the file requires it, and its kind (name, https URL
 | `CW_CLUSTER_ADMIN_SECRET` | no | secret-name | the name of the vault secret that holds the cluster administrator kubeconfig (default `cw-cluster-admin-kubeconfig`): 1 to 127 letters, digits and hyphens; the name, never its content |
 | `CW_CLUSTER_TOKEN_DURATION` | no | duration | the cluster token's requested life: 1 to 3 digits and `m` or `h`, from `1m` to `60m` (default `20m`; `1h` is the same as `60m`) |
 | `CW_GIT_TOKEN_CMD` | no | command | a command that prints the one-hour git token; default is the GitHub App mint beside the launcher (`app_token.py`) |
-| `CW_APP_ID_CMD`, `CW_APP_INSTALLATION_CMD`, `CW_APP_KEY_CMD` | no | command | commands that print the GitHub App's id, installation id and key instead of the vault read (`app_token.py`) |
+| `CW_APP_ID_CMD`, `CW_APP_KEY_CMD` | no | command | commands that print the GitHub App's id and key instead of the vault read (`app_token.py`) |
+| `CW_APP_INSTALLATION_CMD` | no | command | obsolete: accepted and ignored, never run. The installation is looked up per repository (see the next paragraph); the vault no longer needs `cw-app-installation-id` |
 | `CW_VAULT_CHECK_DIR` | no (needed once the vault refuses this machine) | path | the checkout of the vault access check, an absolute path (see section 2b) |
+
+How the installation is found: the mint signs a short-lived App token and asks GitHub which installation covers the repository (`GET /repos/OWNER/REPO/installation`), then mints the one-repository token for that installation. The answer must be one installation whose account is the repository's owner. A repository the App is not installed on is refused before any pod is created, with a message that says so. To cover a new repository, install the App on the account that owns it (an App installed on two accounts serves both) and add the repository to the installation; nothing in the vault changes.
 
 Names the code reads that are deliberately not settings (set by the launcher itself, the other login kind, tuning knobs with safe defaults, test hooks) are listed, each with its reason, in `cloud/launcher/tests/test_cloud_settings.py` (`NOT_SETTINGS`); a test fails when the code reads a `CW_*` name that is neither a row here nor on that list.
 
@@ -104,7 +107,6 @@ CW_CLOUD_NAMESPACE=cw
 # CW_CLUSTER_TOKEN_DURATION=20m
 # CW_GIT_TOKEN_CMD=/home/user/bin/print-git-token
 # CW_APP_ID_CMD=/home/user/bin/print-app-id
-# CW_APP_INSTALLATION_CMD=/home/user/bin/print-app-installation
 # CW_APP_KEY_CMD=/home/user/bin/print-app-key
 # optional, but needed when the vault refuses this machine: the vault access check's checkout
 # CW_VAULT_CHECK_DIR=/home/user/vault-check
@@ -143,7 +145,7 @@ The child sees only:
 - a fixed `PATH` (`/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin`), never yours;
 - an empty private `HOME` and `TMPDIR`, removed when the check ends;
 - `AZURE_CONFIG_DIR`: yours when it is an absolute existing directory, else `~/.azure` of your account (read from the password database, not `$HOME`);
-- `LANG`/`LC_*` and the token route's settings (`CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME`, `CW_APP_ID_CMD`, `CW_APP_INSTALLATION_CMD`, `CW_APP_KEY_CMD`), and `CW_OPENSSL` only when it is an absolute executable file.
+- `LANG`/`LC_*` and the token route's settings (`CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME`, `CW_APP_ID_CMD`, `CW_APP_KEY_CMD`, and the obsolete `CW_APP_INSTALLATION_CMD`, which is passed through and ignored), and `CW_OPENSSL` only when it is an absolute executable file.
 
 `CW_GITHUB_API_BASE`, `CW_PREFLIGHT_TOKEN_CMD`, `CW_GIT_TOKEN_CMD`, proxy variables, `GH_`/`GITHUB_` token variables, `HOME` and `PATH` set in your shell are ignored by `launch --cloud` and `run-task`: nothing in the environment can point the check at another host, and your `HOME`, `PATH` and `PYTHON*` cannot run code inside it. The token route's own settings (`CW_APP_*_CMD`, `CW_OPENSSL`, `AZURE_CONFIG_DIR`) are trusted operator configuration: they are run or read as given.
 

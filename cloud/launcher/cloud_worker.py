@@ -345,8 +345,8 @@ PREFLIGHT_ENV_NAMES = (
     "LANG",                    # (LC_* too) text encoding
     "CW_VAULT_SUBSCRIPTION",   # the vault the GitHub App's id and key are read from (app_token.py)
     "CW_VAULT_NAME",           # the same
-    "CW_APP_ID_CMD",           # optional commands that print the App id, installation id and key instead of the vault (app_token.py)
-    "CW_APP_INSTALLATION_CMD",
+    "CW_APP_ID_CMD",           # optional commands that print the App id and key instead of the vault (app_token.py)
+    "CW_APP_INSTALLATION_CMD",   # obsolete: accepted and ignored (the installation is looked up), so an old config still validates
     "CW_APP_KEY_CMD",
 )
 # Never taken from the caller: PATH (a fixed one is built here), HOME and TMPDIR (a private empty directory), PYTHON* (the child runs `python -I`),

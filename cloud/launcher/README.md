@@ -169,7 +169,12 @@ These two programs are the server side of that. Neither writes a file; neither p
 **`app_token.py OWNER/REPO`** prints a one-hour GitHub App installation token for that one repository, and nothing
 else, on stdout. It refuses (exit 1, one line on stderr naming the key, never a value) to print a token unless:
 
-- the answer lists exactly the one repository and expires within 61 minutes, and
+- the installation is found, not stored: the mint asks GitHub (`GET /repos/OWNER/REPO/installation`, signed with the App's
+  own short-lived token) which installation covers the repository, and refuses unless that answer is one installation whose
+  account is the repository owner (case-insensitive) and which is not suspended. A repository the App is not installed on
+  is refused with a message that says so, before any pod exists. To cover a new repository, install the App on the account
+  that owns it and add the repository to that installation (an App installed on two accounts mints for each of them);
+- the answer lists exactly the one repository and expires within 61 minutes; and
 - its `permissions` equal exactly `contents: write`, `pull_requests: write`, `metadata: read`: no extra key, no higher
   level, none missing.
 
@@ -216,8 +221,8 @@ Residual: an agent that runs as the owner's operating-system user can edit any l
 program. The approvals file is no weaker than the code itself; the repository's review gate and the owner's clear are
 what protect both.
 
-Settings (environment): `CW_APP_ID_CMD`, `CW_APP_KEY_CMD`, `CW_APP_INSTALLATION_CMD` (each a command printing the
-value; otherwise read from the vault), `CW_VAULT_SUBSCRIPTION` and `CW_VAULT_NAME` (no defaults), `CW_OPENSSL`,
+Settings (environment): `CW_APP_ID_CMD`, `CW_APP_KEY_CMD` (each a command printing the
+value; otherwise read from the vault; `CW_APP_INSTALLATION_CMD` and the vault secret `cw-app-installation-id` are obsolete: accepted, never run), `CW_VAULT_SUBSCRIPTION` and `CW_VAULT_NAME` (no defaults), `CW_OPENSSL`,
 `CW_GITHUB_API_BASE` (tests), `CW_PREFLIGHT_TOKEN_CMD` (tests: replaces the mint in the preflight).
 
 **Repository allow-list.** `create` (and the driver, `run-task`, through the same function `check_repo_allowed`) launches only for a repository the owner listed. `CW_ALLOWED_REPOS` is a comma-separated list of `OWNER/NAME`, compared exactly and case-insensitively; no wildcard. Unset, empty, or any entry that is not `OWNER/NAME` shaped (a dot segment, a space, a `*`, an extra slash) refuses everything (fail closed). `CW_TOOLING_REPO` (`OWNER/NAME`) names the tooling's own repository, which is refused even when it is listed; unset adds no extra check, malformed refuses. A refused repository exits `2` with `refused: <repo> is not on the cloud allow-list` before any `kubectl` call, so nothing is created. Both settings are read from the environment of whoever runs the launcher or the driver, like the other `CW_` settings: the operator exports them in the shell (or the service unit) that starts it. An agent running as the same user could set them for a command it runs, so the list is a mistake-guard for the operator, not a boundary; the stops are the token's one-repository scope and the repository's own rules. The check compares spellings: a renamed or transferred repository is not matched by its old name, and an entry or tooling value ending in `.git` is malformed and refuses. The guard table is `docs/cloud-guard-parity.md`.
