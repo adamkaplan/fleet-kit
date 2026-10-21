@@ -77371,7 +77371,7 @@ class TestGhShimMergeGate(Base):
         self.ctl.mkdir()
         self.sb.write_text("#!/bin/sh\n"
                            "for n in FAKE_MG_JSON FAKE_MG_EXIT FAKE_MG_SLEEP FAKE_WHOAMI_JSON_FAIL; do [ -f %r/$n ] && eval \"$n=\\$(cat %r/$n)\"; done\n"
-                           "echo \"$1|$2|$3|pyp=$PYTHONPATH|pyh=$PYTHONHOME|ldp=$LD_PRELOAD|dyl=$DYLD_INSERT_LIBRARIES|xdg=$XDG_STATE_HOME|fsb=$FLEET_SWITCHBOARD_STATE|mad=$MADE_UP_VARIABLE|path=$PATH|home=$HOME\" >> %r\n"
+                           "echo \"$1|$2|$3|pyp=$PYTHONPATH|pyh=$PYTHONHOME|ldp=$LD_LIBRARY_PATH|dyl=$DYLD_LIBRARY_PATH|xdg=$XDG_STATE_HOME|fsb=$FLEET_SWITCHBOARD_STATE|mad=$MADE_UP_VARIABLE|path=$PATH|home=$HOME\" >> %r\n"
                            "if [ \"$1\" = whoami ] && [ \"$2\" = --json ] && [ -n \"$FAKE_WHOAMI_JSON_FAIL\" ]; then exit 2; fi\n"
                            "if [ \"$1\" = whoami ] && [ -z \"$2\" ]; then echo worker; exit 0; fi\n"
                            "if [ \"$1\" = whoami ]; then\n  echo '{\"name\": \"worker\", \"repo\": \"acme/app\"}'; exit 0; fi\n"
@@ -77721,8 +77721,8 @@ class TestGhShimMergeGate(Base):
         self.assertEqual(shim.sb_argv(str(script), "x")[1:], ["-I", str(script), "x"], "a Python program is started isolated, with the python of the FIXED path")
         self.assertEqual(shim.sb_argv(str(other), "x"), [str(other), "x"])
 
-    SITES = ("whoami|--json", "whoami|", "review|blockers", "gates-check|acme/app#12", "merge-gate|acme/app#12|--check", "merge-gate|acme/app#12|--release")
-    HOSTILE_SITE = {"PYTHONPATH": "/tmp/evil-py", "PYTHONHOME": "/tmp/evil-home", "LD_PRELOAD": "/tmp/evil.so", "DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib",
+    SITES = ("whoami|--json", "whoami", "review|blockers|acme/app#12", "gates-check|acme/app#12|--for", "merge-gate|acme/app#12|--check", "merge-gate|acme/app#12|--release")
+    HOSTILE_SITE = {"PYTHONPATH": "/tmp/evil-py", "LD_LIBRARY_PATH": "/tmp/evil-lib", "DYLD_LIBRARY_PATH": "/tmp/evil-dy",   # loader PATHS, not preloads: a bogus preload would stop the test's own shim process
                     "XDG_STATE_HOME": "/tmp/evil-state", "FLEET_SWITCHBOARD_STATE": "/tmp/evil-fsb", "MADE_UP_VARIABLE": "1"}
 
     def observe_sites(self):
@@ -77736,7 +77736,8 @@ class TestGhShimMergeGate(Base):
             env = dict(self.allowed(), **self.HOSTILE_SITE)
             if json_fails:
                 env["FAKE_WHOAMI_JSON_FAIL"] = "1"
-            self.run_shim(*self.MERGE, env=env)
+            done, _ = self.run_shim(*self.MERGE, env=env)
+            self.assertTrue(log.exists(), "the switchboard was never started: rc %s, %s" % (done.returncode, done.stderr[-300:]))
             for line in log.read_text().splitlines():
                 head, _, tail = line.partition("|pyp=")
                 rows.setdefault(head.rstrip("|"), "pyp=" + tail)
@@ -77744,7 +77745,7 @@ class TestGhShimMergeGate(Base):
 
     def leaks(self, row):
         """The hostile names in one logged row."""
-        return [name for name, key in (("PYTHONPATH", "pyp"), ("PYTHONHOME", "pyh"), ("LD_PRELOAD", "ldp"), ("DYLD_INSERT_LIBRARIES", "dyl"), ("XDG_STATE_HOME", "xdg"),
+        return [name for name, key in (("PYTHONPATH", "pyp"), ("LD_LIBRARY_PATH", "ldp"), ("DYLD_LIBRARY_PATH", "dyl"), ("XDG_STATE_HOME", "xdg"),
                                        ("FLEET_SWITCHBOARD_STATE", "fsb"), ("MADE_UP_VARIABLE", "mad")) if re.search(r"(^|\|)%s=[^|]" % key, row)]
 
     def test_the_environment_of_each_of_the_six_switchboard_calls_is_observed_and_clean(self):
