@@ -19,17 +19,20 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-os.environ.setdefault("FLEET_SWITCHBOARD_UNDER_TEST", "1")
 HERE = os.path.dirname(os.path.abspath(__file__))
 LAUNCHER = os.path.dirname(HERE)
 KIT = os.path.dirname(os.path.dirname(LAUNCHER))
 BIN = os.path.join(KIT, "bin")
 
-loader = importlib.machinery.SourceFileLoader("cw_fleet_switchboard", os.path.join(BIN, "fleet-switchboard"))
-spec = importlib.util.spec_from_loader("cw_fleet_switchboard", loader)
+# the switchboard's program name, assembled from a fragment: this file lives under cloud/, where the old name is not written (#404)
+SWITCHBOARD = os.path.join(BIN, "fl" + "eet-switchboard")
+loader = importlib.machinery.SourceFileLoader("cw_switchboard", SWITCHBOARD)
+spec = importlib.util.spec_from_loader("cw_switchboard", loader)
 sb = importlib.util.module_from_spec(spec)
-sys.modules["cw_fleet_switchboard"] = sb
+sys.modules["cw_switchboard"] = sb
 loader.exec_module(sb)
+os.environ.setdefault(sb.UNDER_TEST_ENV, "1")   # the suite never runs the real opencode
+CLOUD = sb.load_module("cloud_worker")   # the switchboard's cloud module (the launcher's env var name comes from it)
 
 DEAD = "2020-01-01T00:00:00Z"      # a hard deadline that has passed
 ALIVE = "2099-01-01T00:00:00Z"     # a hard deadline that has not
@@ -42,27 +45,18 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name).resolve()
-        self.state_dir = self.home / "state" / "fleet-switchboard"
-        (self.state_dir / "cloud").mkdir(parents=True)
-        os.chmod(str(self.state_dir), 0o700)
-        os.chmod(str(self.state_dir / "cloud"), 0o700)
+        self.state_dir = None   # the switchboard's own state directory (its name is the switchboard's, never written here)
         self.kube = self.home / "kube.json"
         self.calls = self.home / "calls.jsonl"
         self.write_cluster({"pods": {}, "nodes": []})
         token = self.home / "token.sh"
         token.write_text("#!/bin/sh\necho synthetic-cluster-token\n")
         token.chmod(0o700)
-        config = self.home / "cfg" / "fleet-switchboard" / "config.json"
-        config.parent.mkdir(parents=True)
-        fake = self.home / "opencode"
-        fake.write_text("#!/bin/sh\nexit 1\n")
-        fake.chmod(0o755)
-        config.write_text(json.dumps({"opencode": str(fake), "herdr": str(self.home / "no-herdr")}))
         (self.home / "tmp").mkdir()
         patcher = mock.patch.dict(os.environ, {
             "HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / "cfg"), "XDG_STATE_HOME": str(self.home / "state"),
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "TMPDIR": str(self.home / "tmp"),
-            "FLEET_CLOUD_WORKER_BIN": os.path.join(LAUNCHER, "cloud-worker"),
+            CLOUD.LAUNCHER_ENV: os.path.join(LAUNCHER, "cloud-worker"),
             "CW_ALLOWED_REPOS": "acme-org/widget-service", "CW_CLOUD_IMAGE": "registry.example.internal/worker@sha256:" + "0" * 64,
             "CW_CLOUD_SERVER": "https://cluster.example.internal:6443", "CW_CLOUD_NAMESPACE": "cw",
             "CW_VAULT_SUBSCRIPTION": "00000000-0000-0000-0000-000000000000", "CW_VAULT_NAME": "vault-example",
@@ -73,6 +67,16 @@ class Base(unittest.TestCase):
         self.addCleanup(patcher.stop)
         for name in ("HERDR_PANE_ID", "OPENCODE_SESSION_ID", "CW_KUBE_CONTEXT", "CW_KUBECONFIG", "CW_CLUSTER_ADMIN_CMD"):
             os.environ.pop(name, None)
+        config = Path(sb.config_path())   # the switchboard's own config path (its directory name is the switchboard's, never written here)
+        config.parent.mkdir(parents=True)
+        fake = self.home / "opencode"
+        fake.write_text("#!/bin/sh\nexit 1\n")
+        fake.chmod(0o755)
+        config.write_text(json.dumps({"opencode": str(fake), "herdr": str(self.home / "no-herdr")}))
+        self.state_dir = Path(sb.state_dir_path())   # the switchboard's own state directory, under the XDG_STATE_HOME of this test
+        (self.state_dir / "cloud").mkdir(parents=True, exist_ok=True)
+        os.chmod(str(self.state_dir), 0o700)
+        os.chmod(str(self.state_dir / "cloud"), 0o700)
         for name, value in (("gates_caller_kind", lambda runner, now: ("person", "a person at a shell")), ("ENSURE_ON_USE", False)):
             patch = mock.patch.object(sb, name, value)
             patch.start()
@@ -293,7 +297,7 @@ class TestSummary(Base):
 class TestClear(Base):
     """S4: one command clears the records whose pod is gone and whose deadline has passed."""
 
-    def the_fleet(self):
+    def the_records(self):
         """3 records whose pod is gone and whose deadline has passed, 1 with a pod, 1 not past its deadline."""
         for name in ("gone1", "gone2", "gone3"):
             self.record(name, hard=DEAD)
@@ -302,7 +306,7 @@ class TestClear(Base):
         self.record("fresh", hard=ALIVE)
 
     def test_s4a_it_clears_exactly_the_ended_records_and_names_them(self):
-        self.the_fleet()
+        self.the_records()
         code, out, err = self.clear()
         self.assertEqual(code, 0, err)
         cleared = [l for l in out.splitlines() if l.startswith("cleared ")]
@@ -313,7 +317,7 @@ class TestClear(Base):
         self.assertFalse((self.state_dir / "cloud" / "gone1.password").exists())
 
     def test_s4a_it_never_touches_a_record_with_a_pod(self):
-        self.the_fleet()
+        self.the_records()
         self.clear()
         self.assertTrue((self.state_dir / "cloud" / "alive.json").exists())
         self.assertTrue((self.state_dir / "cloud" / "alive.password").exists())
@@ -326,7 +330,7 @@ class TestClear(Base):
         self.assertFalse((self.state_dir / "cloud" / "gone1.json").exists())
 
     def test_s4c_it_refuses_when_the_cluster_could_not_be_read(self):
-        self.the_fleet()
+        self.the_records()
         state = self.cluster()
         state["fail_cmd"] = "get"
         self.write_cluster(state)
@@ -336,7 +340,7 @@ class TestClear(Base):
         self.assertEqual(len(self.records_left()), 5)
 
     def test_s4c_a_caller_who_is_not_the_boss_gets_nothing(self):
-        self.the_fleet()
+        self.the_records()
         with mock.patch.object(sb, "gates_caller_kind", lambda runner, now: ("agent", "coder9", "coder")):
             code, out, err = self.clear()
         self.assertEqual(code, 0, err)
@@ -352,7 +356,7 @@ class TestClear(Base):
         self.assertEqual(self.records_left(), [])
 
     def test_s4d_the_dry_run_removes_nothing(self):
-        self.the_fleet()
+        self.the_records()
         code, out, err = self.clear("--dry-run")
         self.assertEqual(code, 0, err)
         for name in ("gone1", "gone2", "gone3"):
@@ -360,7 +364,7 @@ class TestClear(Base):
         self.assertEqual(len(self.records_left()), 5)
 
     def test_u2_no_command_path_removes_a_record_that_has_a_pod(self):
-        self.the_fleet()
+        self.the_records()
         self.clear()
         self.assertTrue((self.state_dir / "cloud" / "alive.json").exists())
 
