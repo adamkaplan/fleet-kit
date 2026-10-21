@@ -32,6 +32,9 @@ class Stub(http.server.BaseHTTPRequestHandler):
     installs = {}  # the fake's installations: account login (lowercase) to id
     retry_after = None
     raw = None  # a raw lookup body
+    deletes = []  # the revocations: (path, Authorization)
+    delete_status = 204
+    delete_redirect = None
     lookup = None  # a (status, JSON body) for every lookup, instead of the account table
 
     def log_message(self, *a):
@@ -44,7 +47,7 @@ class Stub(http.server.BaseHTTPRequestHandler):
         else:
             parts = self.path.split("/")  # /repos/OWNER/REPO/installation
             inst = Stub.installs.get(parts[2].lower()) if len(parts) == 5 and parts[1] == "repos" else None
-            status, body = (200, {"id": inst, "account": {"login": parts[2]}, "repository_selection": "selected", "suspended_at": None}) if inst else (404, {"message": "Not Found"})
+            status, body = (200, {"id": inst, "account": {"id": 9, "login": parts[2]}, "repository_selection": "selected", "suspended_at": None}) if inst else (404, {"message": "Not Found"})
         out = Stub.raw if Stub.raw is not None else json.dumps(body).encode()
         self.send_response(status)
         if Stub.retry_after:
@@ -52,6 +55,14 @@ class Stub(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(out)))
         self.end_headers()
         self.wfile.write(out)
+
+    def do_DELETE(self):
+        Stub.deletes.append((self.path, self.headers.get("Authorization", "")))
+        self.send_response(307 if Stub.delete_redirect else Stub.delete_status)
+        if Stub.delete_redirect:
+            self.send_header("Location", Stub.delete_redirect)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
@@ -119,13 +130,16 @@ class Mint(unittest.TestCase):
     def setUp(self):
         Stub.seen = []
         Stub.gets = []
+        Stub.deletes = []
+        Stub.delete_status = 204
+        Stub.delete_redirect = None
         Stub.installs = {"acme-org": 678, "second-acct": 222}
         Stub.lookup = None
         Stub.raw = None
         Stub.pad_to = None
         Stub.redirect = None
         Other.seen = []
-        Stub.answer = {"token": TOKEN, "expires_at": iso(3500), "repositories": [{"name": "widget-service", "full_name": REAL}],
+        Stub.answer = {"token": TOKEN, "expires_at": iso(3500), "repositories": [{"name": "widget-service", "full_name": REAL, "owner": {"id": 9}}],
                        "permissions": dict(PERMS)}
         if os.path.exists(self.argv_log):
             os.remove(self.argv_log)
@@ -358,7 +372,7 @@ class Mint(unittest.TestCase):
         Stub.installs = {"acme-org": 111, "second-acct": 222}
         for repo, inst in ((REAL, 111), ("second-acct/other-service", 222)):
             Stub.seen = []
-            Stub.answer["repositories"] = [{"name": repo.split("/")[1], "full_name": repo}]
+            Stub.answer["repositories"] = [{"name": repo.split("/")[1], "full_name": repo, "owner": {"id": 9}}]
             p = self.run_mint(repo, CW_APP_INSTALLATION_CMD="echo 111")  # a stored id naming only one of them
             self.assertEqual((p.returncode, p.stdout), (0, TOKEN), p.stderr)
             self.assertEqual(self.posts(), ["/app/installations/%d/access_tokens" % inst])
@@ -416,17 +430,17 @@ class Mint(unittest.TestCase):
             self.assertEqual(self.posts(), ["/app/installations/222/access_tokens"])
 
     BAD_LOOKUPS = {
-        "another account": {"id": 5, "account": {"login": "evil-org"}},
-        "a list of two": [{"id": 5, "account": {"login": "acme-org"}}, {"id": 6, "account": {"login": "acme-org"}}],
-        "a list of one": [{"id": 5, "account": {"login": "acme-org"}}],
-        "an id that is not a number": {"id": "5", "account": {"login": "acme-org"}},
-        "an id that is a boolean": {"id": True, "account": {"login": "acme-org"}},
-        "an id of zero": {"id": 0, "account": {"login": "acme-org"}},
-        "no id": {"account": {"login": "acme-org"}},
+        "another account": {"id": 5, "account": {"id": 9, "login": "evil-org"}},
+        "a list of two": [{"id": 5, "account": {"id": 9, "login": "acme-org"}}, {"id": 6, "account": {"id": 9, "login": "acme-org"}}],
+        "a list of one": [{"id": 5, "account": {"id": 9, "login": "acme-org"}}],
+        "an id that is not a number": {"id": "5", "account": {"id": 9, "login": "acme-org"}},
+        "an id that is a boolean": {"id": True, "account": {"id": 9, "login": "acme-org"}},
+        "an id of zero": {"id": 0, "account": {"id": 9, "login": "acme-org"}},
+        "no id": {"account": {"id": 9, "login": "acme-org"}},
         "no account": {"id": 5},
         "an account that is not an object": {"id": 5, "account": "acme-org"},
-        "a login that is not text": {"id": 5, "account": {"login": 7}},
-        "a suspended installation": {"id": 5, "account": {"login": "acme-org"}, "suspended_at": "2026-01-01T00:00:00Z"},
+        "a login that is not text": {"id": 5, "account": {"id": 9, "login": 7}},
+        "a suspended installation": {"id": 5, "account": {"id": 9, "login": "acme-org"}, "suspended_at": "2026-01-01T00:00:00Z"},
         "a string": "installation",
     }
 
@@ -440,7 +454,7 @@ class Mint(unittest.TestCase):
                 self.assertNotIn(secret, p.stderr, name)
 
     def test_s6_the_owner_may_differ_only_in_case(self):
-        Stub.lookup = (200, {"id": 5, "account": {"login": "ACME-Org"}})
+        Stub.lookup = (200, {"id": 5, "account": {"id": 9, "login": "ACME-Org"}})
         p = self.run_mint()
         self.assertEqual((p.returncode, p.stdout), (0, TOKEN), p.stderr)
         self.assertEqual(self.posts(), ["/app/installations/5/access_tokens"])
@@ -482,7 +496,7 @@ class Mint(unittest.TestCase):
         ("always the first installation", "inst, owner_id = find_installation(target, jwt)", "inst, owner_id = 111, None", None),
         ("no owner check", "if not valid_owner(login) or login.lower() != owner.lower():", "if False:", "another account"),
         ("case-sensitive owner check", "login.lower() != owner.lower()", "login != owner", "case"),
-        ("no id check", "if isinstance(inst, bool) or not isinstance(inst, int) or inst <= 0:", "if False:", "an id of zero"),
+        ("no id check", "if not is_id(inst):", "if False:", "an id of zero"),
         ("no shape check", "if not isinstance(ans, dict):", "if False:", "a string"),
         ("no owner id check", 'owner.get("id") != owner_id', "False", "owner id"),
         ("no repository list check", "len(repos) != 1 or ", "", "second repo"),
@@ -518,7 +532,7 @@ class Mint(unittest.TestCase):
 
         def second_account_ok(text):
             Stub.installs, Stub.lookup, Stub.seen = dict(two), None, []
-            Stub.answer["repositories"] = [{"name": "other-service", "full_name": "second-acct/other-service"}]
+            Stub.answer["repositories"] = [{"name": "other-service", "full_name": "second-acct/other-service", "owner": {"id": 9}}]
             p = self.run_copy(text, "second-acct/other-service")
             return p.returncode == 0 and self.posts() == ["/app/installations/222/access_tokens"]
 
@@ -530,13 +544,13 @@ class Mint(unittest.TestCase):
                 p = self.run_copy(text)
                 return p.returncode == 1 and p.stderr.startswith("app-token: ") and "Traceback" not in p.stderr
             if answer == "kelvin":
-                Stub.lookup, Stub.seen = (200, {"id": 5, "account": {"login": "\u212a" + "ite-org"}}), []
+                Stub.lookup, Stub.seen = (200, {"id": 5, "account": {"id": 9, "login": "\u212a" + "ite-org"}}), []
                 p = self.run_copy(text, "kite-org/widget-service")
                 return p.returncode == 1 and p.stderr.startswith("app-token: ") and Stub.seen == []
             if answer in ("owner id", "second repo"):
                 return self.mint_refused_variant(text, answer)
-            Stub.lookup, Stub.seen = (200, self.BAD_LOOKUPS[answer]) if answer != "case" else (200, {"id": 5, "account": {"login": "ACME-Org"}}), []
-            Stub.answer["repositories"] = [{"name": "widget-service", "full_name": REAL}]
+            Stub.lookup, Stub.seen = (200, self.BAD_LOOKUPS[answer]) if answer != "case" else (200, {"id": 5, "account": {"id": 9, "login": "ACME-Org"}}), []
+            Stub.answer["repositories"] = [{"name": "widget-service", "full_name": REAL, "owner": {"id": 9}}]
             p = self.run_copy(text)
             return p.returncode == 1 and p.stderr.startswith("app-token: ") and "Traceback" not in p.stderr and Stub.seen == []
 
@@ -554,6 +568,219 @@ class Mint(unittest.TestCase):
             else:
                 self.assertTrue(refuses_cleanly(real, answer), name)
                 self.assertFalse(refuses_cleanly(mutant, answer), name)  # the real build refuses; the mutant does not
+
+    # --- the family: every hostile shape x every field the code validates, and a missing id refuses ---
+
+    @staticmethod
+    def call_sites(src):
+        """(validator, enclosing function, argument text) for every call of valid_owner or valid_target: the fields the code validates."""
+        import ast
+        sites = set()
+        for fn in ast.walk(ast.parse(src)):
+            if isinstance(fn, ast.FunctionDef):
+                for n in ast.walk(fn):
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("valid_owner", "valid_target"):
+                        sites.add((n.func.id, fn.name, ast.unparse(n.args[0])))
+        return sites
+
+    # field -> (the call site it is validated at, the text whose removal drops that validator)
+    FIELDS = {
+        "installation account.login": (("valid_owner", "find_installation", "login"), "not valid_owner(login) or "),
+        "token repository full_name": (("valid_target", "mint", "full"), "valid_target(full) and "),
+        "the target argument": (("valid_target", "main", "argv[0]"), " or not valid_target(argv[0])"),
+        "the owner part of any target": (("valid_owner", "valid_target", "owner"), "valid_owner(owner) and "),
+    }
+    # the shapes a removed validator MUST be caught by (the others are also stopped by the comparison behind it)
+    PINNED_BY = {"installation account.login": {"kelvin sign"}, "token repository full_name": {"kelvin sign"},
+                 "the target argument": {"kelvin sign", "fullwidth letters", "trailing dot", "newline"},
+                 "the owner part of any target": {"kelvin sign", "fullwidth letters", "trailing dot", "newline"}}
+    # shape -> (hostile text, the ASCII owner it imitates); the imitated owner is the target's
+    SHAPES = {
+        "kelvin sign": ("\u212ame-org", "kme-org"),
+        "dotless i": ("acme-or\u0131", "acme-orI"),
+        "turkish i": ("\u0130cme-org", "icme-org"),
+        "fullwidth letters": ("\uff41cme-org", "acme-org"),
+        "trailing dot": ("acme-org.", "acme-org"),
+        "double dot": ("acme..org", "acme-org"),
+        "percent-encoded slash": ("acme%2Forg", "acme-org"),
+        "newline": ("acme-org\n", "acme-org"),
+    }
+
+    def row_refuses(self, text, field, shape):
+        """True when the build refuses this hostile shape in this field the way the real mint does: no token, no token request."""
+        bad, ascii_owner = self.SHAPES[shape]
+        target = ascii_owner + "/widget-service"
+        Stub.raw, Stub.seen, Stub.installs = None, [], {ascii_owner.lower(): 5}
+        Stub.lookup = (200, {"id": 5, "account": {"id": 9, "login": ascii_owner}})
+        Stub.answer["repositories"] = [{"name": "widget-service", "full_name": target, "owner": {"id": 9}}]
+        if field == "installation account.login":
+            Stub.lookup = (200, {"id": 5, "account": {"id": 9, "login": bad}})
+        elif field == "token repository full_name":
+            Stub.answer["repositories"][0]["full_name"] = bad + "/widget-service"
+        elif field in ("the target argument", "the owner part of any target"):
+            target = bad + "/widget-service"
+        p = self.run_copy(text, target)
+        if field in ("the target argument", "the owner part of any target"):  # the owner part is reached through main's valid_target
+            return p.returncode == 2 and p.stdout == "" and Stub.seen == []
+        return p.returncode != 0 and p.stdout == "" and p.stderr.startswith("app-token: ") and "Traceback" not in p.stderr
+
+    def test_every_hostile_shape_in_every_validated_field_is_refused_and_each_validator_is_pinned(self):
+        with open(MINT) as f:
+            real = f.read()
+        self.assertEqual(self.call_sites(real), {site for site, _ in self.FIELDS.values()},
+                         "a validator call site has no row in FIELDS (or a row names a call that is gone)")
+        for field, (site, snippet) in self.FIELDS.items():
+            self.assertIn(snippet, real, field)
+            mutant = real.replace(snippet, "", 1)
+            for shape in self.SHAPES:
+                self.assertTrue(self.row_refuses(real, field, shape), (field, shape))
+            caught = {sh for sh in self.SHAPES if not self.row_refuses(mutant, field, sh)}
+            self.assertTrue(self.PINNED_BY[field] <= caught, "removing the validator at %s is not caught by %s" % (site, self.PINNED_BY[field] - caught))
+        unanchored = real.replace("OWNER_RE.fullmatch(o)", "OWNER_RE.match(o)", 1)  # a weakened validator body, not a removed call
+        self.assertNotEqual(unanchored, real)
+        for shape in ("trailing dot", "newline"):
+            self.assertFalse(self.row_refuses(unanchored, "the target argument", shape), shape)
+
+    ID_SHAPES = {  # (what GitHub's answers carry) -> the named refusal
+        "no account id": ("account", {"login": "acme-org"}, "no usable account id"),
+        "account id a string": ("account", {"id": "9", "login": "acme-org"}, "no usable account id"),
+        "account id a bool": ("account", {"id": True, "login": "acme-org"}, "no usable account id"),
+        "account id a float": ("account", {"id": 9.0, "login": "acme-org"}, "no usable account id"),
+        "account id zero": ("account", {"id": 0, "login": "acme-org"}, "no usable account id"),
+        "no owner": ("owner", None, "no usable owner id"),
+        "owner a list": ("owner", [{"id": 9}], "no usable owner id"),
+        "owner a string": ("owner", "acme-org", "no usable owner id"),
+        "no owner id": ("owner", {"login": "acme-org"}, "no usable owner id"),
+        "owner id a string": ("owner", {"id": "9"}, "no usable owner id"),
+        "owner id a bool": ("owner", {"id": True}, "no usable owner id"),
+        "owner id a float": ("owner", {"id": 9.0}, "no usable owner id"),
+        "owner id null": ("owner", {"id": None}, "no usable owner id"),
+    }
+
+    def id_row(self, text, where, value):
+        Stub.raw, Stub.seen = None, []
+        account = {"id": 9, "login": "acme-org"}
+        repo = {"name": "widget-service", "full_name": REAL, "owner": {"id": 9}}
+        if where == "account":
+            Stub.lookup = (200, {"id": 5, "account": value})
+        else:
+            Stub.lookup = (200, {"id": 5, "account": account})
+            if value is None:
+                del repo["owner"]
+            else:
+                repo["owner"] = value
+        Stub.answer["repositories"] = [repo]
+        return self.run_copy(text)
+
+    ID_MUTANTS = [  # skip-when-missing, brought back
+        ("skip a missing account id", "    if not is_id(owner_id):\n", "    if owner_id is not None and not is_id(owner_id):\n",
+         {"no account id"}),
+        ("skip a missing owner id", 'if not isinstance(owner, dict) or not is_id(owner.get("id")):',
+         'if isinstance(owner, dict) and owner.get("id") is not None and not is_id(owner.get("id")):',
+         {"no owner", "no owner id", "owner id null"}),
+    ]
+    IS_ID_MUTANTS = [  # one per clause of is_id, each caught by the shape that clause exists for
+        ("is_id lets a bool through", " and not isinstance(x, bool)", "", {"account id a bool", "owner id a bool"}),
+        ("is_id lets a float through", "isinstance(x, int) and ", "", {"account id a float", "owner id a float"}),
+        ("is_id lets zero through", " and x > 0", "", {"account id zero"}),
+    ]
+
+    def test_a_missing_or_mistyped_id_is_a_named_refusal_and_nothing_is_minted(self):
+        with open(MINT) as f:
+            real = f.read()
+        for name, (where, value, reason) in self.ID_SHAPES.items():
+            p = self.id_row(real, where, value)
+            self.assertEqual((p.returncode, p.stdout), (1, ""), name)
+            self.assertEqual(p.stderr.strip().count("\n"), 0, name)
+            self.assertIn(reason, p.stderr, name)
+            self.assertNotIn(TOKEN, p.stderr, name)
+        p = self.id_row(real, "owner", {"id": 9})
+        self.assertEqual((p.returncode, p.stdout), (0, TOKEN), p.stderr)  # the normal answer still mints
+        for name, old, new, want in self.ID_MUTANTS:
+            self.assertIn(old, real, name)
+            mutant = real.replace(old, new, 1)
+            held = {n for n, (w, v, r) in self.ID_SHAPES.items() if r not in self.id_row(mutant, w, v).stderr}
+            self.assertTrue(want <= held, "%s: rows %s did not notice" % (name, want - held))
+        for name, old, new, want in self.IS_ID_MUTANTS:
+            self.assertIn(old, real, name)
+            mutant = real.replace(old, new, 1)
+            held = {n for n, (w, v, r) in self.ID_SHAPES.items() if r not in self.id_row(mutant, w, v).stderr}
+            self.assertTrue(want <= held, "%s: rows %s did not notice" % (name, want - held))
+
+    # --- a refusal after the mint revokes the unprinted token ---
+
+    REFUSED_AFTER_MINT = {  # name -> how to break the token answer (each is a refusal that happens after GitHub minted)
+        "second repository": lambda a: a.update(repositories=a["repositories"] * 2),
+        "another repository": lambda a: a["repositories"][0].update(name="other-service"),
+        "full_name missing": lambda a: a["repositories"][0].pop("full_name"),
+        "full_name another owner": lambda a: a["repositories"][0].update(full_name="evil-org/widget-service"),
+        "owner id missing": lambda a: a["repositories"][0].pop("owner"),
+        "owner id another": lambda a: a["repositories"][0].update(owner={"id": 10}),
+        "long-lived": lambda a: a.update(expires_at=iso(86400)),
+        "extra permission": lambda a: a["permissions"].update(issues="read"),
+    }
+
+    def revoking_run(self, text, mutate, **stub):
+        Stub.deletes, Stub.seen = [], []
+        for k, v in stub.items():
+            setattr(Stub, k, v)
+        Stub.lookup = (200, {"id": 5, "account": {"id": 9, "login": "acme-org"}})
+        mutate(Stub.answer)
+        return self.run_copy(text)
+
+    def test_every_refusal_after_the_mint_revokes_the_token_and_never_shows_it(self):
+        with open(MINT) as f:
+            real = f.read()
+        for name, mutate in self.REFUSED_AFTER_MINT.items():
+            p = self.revoking_run(real, mutate)
+            self.assertEqual((p.returncode, p.stdout), (1, ""), name)
+            self.assertEqual(Stub.deletes, [("/installation/token", "Bearer " + TOKEN)], name)
+            self.assertEqual(p.stderr.strip().count("\n"), 0, name)
+            self.assertTrue(p.stderr.strip().endswith("The token was revoked."), (name, p.stderr))
+            self.assertNotIn(TOKEN, p.stderr + p.stdout, name)
+            self.setUp()
+
+    def test_a_failed_or_redirected_revocation_is_said_and_does_not_mask_the_refusal(self):
+        with open(MINT) as f:
+            real = f.read()
+        for how in ({"delete_status": 500}, {"delete_status": 404}, {"delete_status": 200}, {"delete_redirect": "http://127.0.0.1:%d/x" % self.other.server_port}):
+            self.setUp()
+            p = self.revoking_run(real, self.REFUSED_AFTER_MINT["second repository"], **how)
+            self.assertEqual((p.returncode, p.stdout), (1, ""), how)
+            self.assertIn("does not cover exactly the one target repository", p.stderr)  # the refusal itself still comes first
+            self.assertIn("Revocation failed: the token expires within an hour and was never printed.", p.stderr)
+            self.assertNotIn(TOKEN, p.stderr + p.stdout)
+            self.assertEqual(Other.seen, [], how)  # a redirect is not followed
+
+    def test_a_minted_token_that_passes_every_check_is_not_revoked_and_a_refusal_before_the_mint_has_nothing_to_revoke(self):
+        p = self.run_mint()
+        self.assertEqual((p.returncode, p.stdout, Stub.deletes), (0, TOKEN, []))
+        Stub.lookup = (200, {"id": 5, "account": {"login": "acme-org"}})
+        self.assertEqual((self.run_mint().returncode, Stub.deletes), (1, []))
+
+    REVOKE_MUTANTS = [  # name, text to replace, replacement
+        ("no revoke", "if MINTED:", "if False:"),
+        ("revoke only for the repository check", "    if MINTED:\n        token = MINTED.pop()", "    if MINTED and 'repository' in msg:\n        token = MINTED.pop()"),
+        ("the token in the message", 'msg += (" The token was revoked."', 'msg += (" The token was revoked. " + token'),
+        ("revoked said without asking", "return r.status == 204", "return True"),
+        ("never registered", "    MINTED.append(token)\n", ""),
+    ]
+
+    def test_each_revocation_mutant_fails_a_row(self):
+        with open(MINT) as f:
+            real = f.read()
+        for name, old, new in self.REVOKE_MUTANTS:
+            self.assertIn(old, real, name)
+            mutant = real.replace(old, new, 1)
+            broken = False
+            for row, mutate in self.REFUSED_AFTER_MINT.items():
+                self.setUp()
+                p = self.revoking_run(mutant, mutate, delete_status=200 if name == "revoked said without asking" else 204)
+                ok = (p.returncode == 1 and Stub.deletes == [("/installation/token", "Bearer " + TOKEN)] and TOKEN not in p.stderr
+                      and (p.stderr.strip().endswith("The token was revoked.") if name != "revoked said without asking" else "Revocation failed" in p.stderr))
+                broken = broken or not ok
+            self.assertTrue(broken, name)
+        self.setUp()
 
     def test_s9_the_documents_do_not_ask_for_the_installation_id(self):
         root = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))

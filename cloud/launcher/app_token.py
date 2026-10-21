@@ -74,7 +74,27 @@ def http_error_text(code, retry_after=None):
     return "GitHub refused the request (HTTP %d)" % code
 
 
+MINTED = []  # the one token minted and not yet printed: a refusal after the mint revokes it (never in a message)
+
+
+def revoke(token):
+    """Best effort: revoke an installation token (DELETE /installation/token, authorised by that token). True only on HTTP 204."""
+    try:
+        req = urllib.request.Request(api_base() + "/installation/token", method="DELETE",
+                                     headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
+                                              "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "cw-app-token"})
+        with open_url(req, 15) as r:
+            return r.status == 204
+    except BaseException:  # any failure (including a redirect or an exit) is "revocation failed", never a crash and never the token
+        return False
+
+
 def die(msg, code=1):
+    if MINTED:
+        token = MINTED.pop()
+        msg += (" The token was revoked." if revoke(token)
+                else " Revocation failed: the token expires within an hour and was never printed.")
+        del token
     print("app-token: " + msg, file=sys.stderr)
     sys.exit(code)
 
@@ -181,6 +201,11 @@ def github_json(method, path, jwt, body=None, not_found=None):
         die("the GitHub request failed or its answer was not usable JSON: the launch is refused and nothing was minted")
 
 
+def is_id(x):
+    """A GitHub numeric id: an exact integer above zero (a bool, string or float is not one)."""
+    return isinstance(x, int) and not isinstance(x, bool) and x > 0
+
+
 def find_installation(target, jwt):
     """The id of the App installation that covers target (OWNER/REPO), asked of GitHub with the App JWT. Checked, never trusted."""
     owner = target.split("/", 1)[0]
@@ -189,7 +214,7 @@ def find_installation(target, jwt):
     if not isinstance(ans, dict):
         die("refusing: the installation lookup answered with something other than one installation")
     inst = ans.get("id")
-    if isinstance(inst, bool) or not isinstance(inst, int) or inst <= 0:
+    if not is_id(inst):
         die("refusing: the installation lookup carries no installation id")
     account = ans.get("account")
     login = account.get("login") if isinstance(account, dict) else None
@@ -198,7 +223,9 @@ def find_installation(target, jwt):
     if ans.get("suspended_at"):
         die("refusing: the App's installation on %s is suspended" % owner)
     owner_id = account.get("id")
-    return inst, owner_id if isinstance(owner_id, int) and not isinstance(owner_id, bool) else None
+    if not is_id(owner_id):
+        die("refusing: the installation lookup carries no usable account id")
+    return inst, owner_id
 
 
 def mint(target):
@@ -220,13 +247,16 @@ def mint(target):
     repos = ans.get("repositories") if isinstance(ans, dict) else None
     if not isinstance(token, str) or not token:
         die("the answer has no token")
+    MINTED.append(token)
     if not isinstance(repos, list) or len(repos) != 1 or not isinstance(repos[0], dict) or repos[0].get("name") != repo:
         die("refusing: the token does not cover exactly the one target repository")
     full = repos[0].get("full_name")
-    if full is not None and not (isinstance(full, str) and valid_target(full) and full.lower() == target.lower()):
+    if not (isinstance(full, str) and valid_target(full) and full.lower() == target.lower()):
         die("refusing: the token does not cover exactly the one target repository")
-    owner = repos[0].get("owner")  # the account id is stable where the login is not: when both answers carry it, it must agree
-    if owner_id is not None and isinstance(owner, dict) and owner.get("id") is not None and owner.get("id") != owner_id:
+    owner = repos[0].get("owner")  # the account id is stable where the login is not: both answers must carry it, and it must agree
+    if not isinstance(owner, dict) or not is_id(owner.get("id")):
+        die("refusing: the token's repository carries no usable owner id")
+    if owner.get("id") != owner_id:
         die("refusing: the token's repository is not owned by the installation's account")
     try:
         exp = dt.datetime.strptime(ans["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp()
@@ -235,6 +265,7 @@ def mint(target):
     if exp - dt.datetime.now(dt.timezone.utc).timestamp() > MAX_TOKEN_SECONDS:
         die("refusing: the token lives longer than 61 minutes")
     check_permissions(ans.get("permissions"))
+    MINTED.clear()
     return token
 
 
