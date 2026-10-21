@@ -615,7 +615,7 @@ REGISTRAR_GRAMMAR = {
     "Add": "an operator of BinOp", "Mod": "an operator of BinOp", "Eq": "an operator of Compare", "Is": "an operator of Compare",
 }
 # the node classes whose presence says nothing by itself and that the grammar need not name: the module root and the operators and contexts of classes the grammar already allows or that it holds anyway
-GRAMMAR_NEUTRAL = {"Module", "Interactive", "Expression", "FunctionType", "Del", "Param", "AugLoad", "AugStore", "Sub", "Mult", "Div", "FloorDiv", "Pow", "LShift", "RShift", "BitOr", "BitXor", "BitAnd", "MatMult",
+GRAMMAR_NEUTRAL = {"FormattedValue", "Module", "Interactive", "Expression", "FunctionType", "Del", "Param", "AugLoad", "AugStore", "Sub", "Mult", "Div", "FloorDiv", "Pow", "LShift", "RShift", "BitOr", "BitXor", "BitAnd", "MatMult",
                    "And", "Or", "Not", "Invert", "UAdd", "USub", "NotEq", "Lt", "LtE", "Gt", "GtE", "IsNot", "In", "NotIn"}
 
 

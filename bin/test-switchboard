@@ -34150,17 +34150,17 @@ class TestRegistrarFloor(LedgerBase):
             "a loop over its own parsers": "a = sub.add_parser('a')\nb = sub.add_parser('b')\nfor p in (a, b):\n    p.add_argument('--x', default=1, help=%s)" % function,
             "its own parser's actions": "a = sub.add_parser('a')\nfor action in a._actions:\n    action.default = 1",
             "a constant read of a module": "t = sub.add_parser('x')\nt.add_argument('--a', default=argparse.SUPPRESS)",
-            "a flag with a computed help": "t = sub.add_parser('x')\nt.add_argument('--a', help='%d' % 1 + 'x'.join(['a']))",
+            "a flag with a computed help": "t = sub.add_parser('x')\nt.add_argument('--a', help=('%d' % 1) + 'x')",
             "a built parser's actions read and set to literals (the ledger registrar)": "v = sub.add_parser('v')\nfor action in v._actions:\n    action.nargs, action.default = '?', None",
             "a chain of its own parser's methods": "sub.add_parser('x').add_argument('--a')",
             "a table builtin and a string action": "t = sub.add_parser('x')\nt.add_argument('--a', type=int, default=1, action='store_true')",
             "set_defaults with a stored function": "t = sub.add_parser('x')\nt.set_defaults(func=%s)" % function,
-            "a type that is a lambda over table builtins": "t = sub.add_parser('x')\nt.add_argument('--a', type=lambda v: int(v))",
+            "a type that is a table builtin": "t = sub.add_parser('x')\nt.add_argument('--a', type=int)",
             "a local dict of safe values": "given = {'default': argparse.SUPPRESS} if sub else {}\nt = sub.add_parser('x')\nt.add_argument('--a', **given)",
             "set_defaults on a parser it built": "t = sub.add_parser('x')\nt.set_defaults(a=1)",
-            "a name that stays data": "s = ''\ns.join(['a'])",
+            "a name that stays data": "s = ''\ns.join(('a',))",
             "a literal stored on a parser it built": "t = sub.add_parser('x')\nt.usage = 'u'",
-            "a function it defines itself": "def inner(v):\n    return v\nsub.add_parser('x', help=inner('a'))",
+            "a function it defines itself": "def inner():\n    sub.add_parser('x')\ninner()",
         }
 
     def test_the_probe_a_registrar_rebinds_a_closure_name_in_the_process_and_the_floor_holds_the_same_edit(self):
@@ -34209,11 +34209,11 @@ class TestRegistrarFloor(LedgerBase):
         self.assertEqual(self.dc.registrar_findings(base, base, self.rule), ([], None), "untouched: not held")
         other_line = base.replace("def add_zzz_parsers(sub):\n", "def add_zzz_parsers(sub):\n    thing = sub.add_parser('zzz')\n    thing.add_argument('--x')\n")
         self.assertEqual(self.dc.registrar_findings(base, other_line, self.rule), ([], None), "a different line edited: not held")
-        removed = base.replace("    global %s\n    %s = None\n" % (self.pick()[1], self.pick()[1]), "    pass\n")
+        removed = base.replace("    global %s\n    %s = None\n" % (self.pick()[1], self.pick()[1]), "    sub.add_parser('zzz')\n")
         self.assertEqual(self.dc.registrar_findings(base, removed, self.rule), ([], None), "a removed hostile line: not held")
         added = self.dc.registrar_findings(self.base_src, base, self.rule)[0]
-        self.assertEqual(len(added), 1)
-        self.assertEqual(added[0][:2], ("add_zzz_parsers", "rebinds"))
+        self.assertEqual({r for r, _, _ in added}, {"add_zzz_parsers"})   # the named rebinding and the grammar's own finding (a Global statement is not in the grammar)
+        self.assertIn(("add_zzz_parsers", "rebinds", self.pick()[1]), added)
 
     def test_a_change_to_a_function_that_is_not_a_registrar_is_not_held(self):
         function, binding, module = self.pick()
@@ -34437,7 +34437,7 @@ class TestRegistrarFloor(LedgerBase):
         allow = self.rule["registrar_allow"]
         for builtin in allow["pure_builtins"]:
             with self.subTest(builtin):
-                text = fake + "def add_a_parsers(sub):\n    sub.add_parser('x', help=%s(['a']))\n" % builtin
+                text = fake + "def add_a_parsers(sub):\n    sub.add_parser('x', help=%s(('a',)))\n" % builtin
                 with_it = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": [builtin], "helpers": [], "parser_methods": VERBS, "free_keywords": FREE_KEYWORDS}}
                 without = dict(with_it, registrar_allow={"pure_builtins": [x for x in allow["pure_builtins"] if x != builtin], "helpers": [], "parser_methods": VERBS, "free_keywords": FREE_KEYWORDS})
                 self.assertEqual(self.dc.registrar_findings(fake, text, with_it)[0], [], builtin)
@@ -34526,7 +34526,7 @@ class TestRegistrarFloor(LedgerBase):
         for label, text in (("a decorator", "@eval\ndef add_a_parsers(sub):\n    pass\n"), ("a decorator on a class registrar", "@print\nclass add_a_parsers:\n    pass\n")):
             with self.subTest(label):
                 self.assertTrue(any(v == "calls" for _, v, _ in self.reg(text)[0]), label)
-        self.assertEqual(self.found_unit("t = sub.add_parser('x')\nfor a in t._actions:\n    pass\nfor f in ('a', 'b'):\n    pass"), [])
+        self.assertEqual(self.found_unit("t = sub.add_parser('x')\nfor a in t._actions:\n    sub.add_parser('x')\nfor f in ('a', 'b'):\n    sub.add_parser(f)"), [])
 
     MODULE_FORMS = {   # every statement form that can BIND a module-level name, with {N} the name and {V} the second value: one row each, in a plain position and (where the statement nests) under try*/match/if
         "assign": "{N} = {V}", "augmented assign": "{N} += {V}", "annotated assign": "{N}: object = {V}", "walrus statement": "({N} := {V})", "walrus in an assignment value": "zz_y = ({N} := {V})",
@@ -34545,20 +34545,24 @@ class TestRegistrarFloor(LedgerBase):
         wrapper, prefix = self.NESTINGS[nesting]
         return wrapper.replace("{S}", textwrap.indent(statement, prefix) if prefix else statement) + "\n"
 
+    def regfake(self, text):
+        """The registrar lint over the small fake daemon file below (its own closure and allow table): the module-level forms are one per call, so they run on a file that parses in microseconds, not on the real one."""
+        return self.dc.registrar_findings(self.FAKE, self.FAKE + text, self.FAKE_RULE)
+
     def test_every_module_level_binding_form_is_seen_for_a_registrar_name_a_table_builtin_and_a_helper_in_every_nesting(self):
         for form in self.MODULE_FORMS:
             for nesting in self.NESTINGS:
                 if form in ("a def", "a class", "a decorated def"):
                     continue   # a def or class is READ as a registrar (its body linted), not held as unreadable
                 with self.subTest(form=form, nesting=nesting, what="a registrar name"):
-                    got, why = self.reg(self.placed(form, nesting, "add_zz_parsers"))
+                    got, why = self.regfake(self.placed(form, nesting, "add_zz_parsers"))
                     self.assertIsNone(why, self.placed(form, nesting, "add_zz_parsers"))
                     self.assertTrue(any(r == "add_zz_parsers" for r, _, _ in got), (form, nesting, got))
                 if form in ("import as", "from import as", "match mapping rest", "a def", "a class", "a decorated def"):
                     continue
                 with self.subTest(form=form, nesting=nesting, what="a table builtin"):
                     text = self.placed(form, nesting, "int") + "def add_zz_parsers(sub):\n    sub.add_parser('x', help=int('1'))\n"
-                    got, why = self.reg(text)
+                    got, why = self.regfake(text)
                     self.assertIsNone(why, text)
                     self.assertTrue(any(g[1:] == ("calls", "int") or g[0] == "a name of the allow table" for g in got), (form, nesting, got))
 
@@ -34569,9 +34573,42 @@ class TestRegistrarFloor(LedgerBase):
             for nesting in self.NESTINGS:
                 with self.subTest(form=form, nesting=nesting):
                     text = "def zz_helper(v):\n    return v\n" + self.placed(form, nesting, "zz_helper") + "def add_zz_parsers(sub):\n    zz_helper(sub)\n"
-                    got, why = self.reg(text)
+                    got, why = self.regfake(text)
                     self.assertIsNone(why, text)
                     self.assertTrue(any(v == "calls" and "zz_helper" in n for _, v, n in got), (form, nesting, got))
+
+    GRAMMAR_REJECTS = {   # one snippet for every statement or expression class a registrar may NOT contain: each is held, named by its class
+        "Pass": "pass", "Return": "return 1", "Lambda": "f = lambda: 1", "With": "with sub as g:\n    sub.add_parser('x')", "Try": "try:\n    sub.add_parser('x')\nexcept Exception:\n    sub.add_parser('y')",
+        "Match": "match sub:\n    case _:\n        sub.add_parser('x')", "Global": "global zz\nzz = 1", "Nonlocal": "nonlocal zz", "Delete": "del sub", "AugAssign": "n = 1\nn += 1", "AnnAssign": "n: int = 1",
+        "NamedExpr": "(n := 1)", "ListComp": "[x for x in (1,)]", "SetComp": "{x for x in (1,)}", "DictComp": "{x: x for x in (1,)}", "GeneratorExp": "list(x for x in (1,))", "List": "x = [1]", "Set": "x = {1}",
+        "Starred": "x = (*sub,)", "Import": "import os", "ImportFrom": "from os import path", "While": "while sub:\n    sub.add_parser('x')", "Raise": "raise ValueError", "Assert": "assert sub",
+        "ClassDef": "class K:\n    sub.add_parser('x')", "AsyncFunctionDef": "async def f():\n    sub.add_parser('x')", "JoinedStr": "x = f'{sub}'", "BoolOp": "x = sub and sub", "UnaryOp": "x = not sub",
+        "Await": "async def f():\n    await sub", "Yield": "def f():\n    yield sub", "YieldFrom": "def f():\n    yield from sub", "Slice": "x = sub[1:2]", "Break": "for x in ('a',):\n    break", "Continue": "for x in ('a',):\n    continue",
+        "AsyncFor": "async def f():\n    async for x in sub:\n        sub.add_parser('x')", "AsyncWith": "async def f():\n    async with sub as g:\n        sub.add_parser('x')", "TryStar": "try:\n    sub.add_parser('x')\nexcept* Exception:\n    sub.add_parser('y')",
+    }
+
+    def test_the_grammar_is_measured_from_the_real_registrars_and_a_class_outside_it_is_held_by_name_and_a_future_class_is_not_silently_allowed(self):
+        import ast, re
+        grammar, neutral = self.dc.REGISTRAR_GRAMMAR, self.dc.GRAMMAR_NEUTRAL
+        pattern = self.dc.registrar_pattern(self.tree)
+        units = [n for n in self.tree.body if isinstance(n, ast.FunctionDef) and (pattern.fullmatch(n.name) or n.name == "add_decision_list_flags")]
+        self.assertGreaterEqual(len(units), 20)
+        used = {type(x).__name__ for u in units for x in ast.walk(u)}
+        self.assertEqual(used - set(grammar) - set(neutral), set(), "a real registrar uses a node class that is not in the grammar: add it WITH A STATED REASON, never silently")
+        for name, reason in grammar.items():
+            self.assertTrue(isinstance(reason, str) and len(reason) > 5, "every class of the grammar has a stated reason: %s" % name)
+        unused = set(grammar) - used
+        self.assertLessEqual(unused, {"Compare", "Is", "Eq", "Mod", "Add", "Subscript", "BinOp", "IfExp", "Dict", "If", "For", "Tuple"} | set(), "a class of the grammar that no real registrar uses: %s" % sorted(unused))
+        # completeness against the running Python: every statement and expression class is in the grammar, the neutral list or the rejects table, so a class of a future Python fails here instead of being allowed
+        for name, node in vars(ast).items():
+            if isinstance(node, type) and issubclass(node, (ast.stmt, ast.expr)) and node not in (ast.stmt, ast.expr) and not name.startswith("_"):
+                self.assertTrue(name in grammar or name in neutral or name in self.GRAMMAR_REJECTS or name in ("Constant", "Num", "Str", "Bytes", "NameConstant", "Ellipsis", "TypeAlias", "Name", "Expr", "Assign", "Call", "Attribute", "Tuple", "Subscript", "For", "If", "FunctionDef", "Starred"), "an ast statement or expression class in no table: %s" % name)
+        for name, body in self.GRAMMAR_REJECTS.items():
+            with self.subTest(name):
+                if name in grammar:
+                    continue
+                got = self.found_unit(body)
+                self.assertTrue(any(("form %s," % name) in n for _, v, n in got), (name, got))
 
     def test_a_name_bound_twice_and_then_called_is_held_for_every_binding_form_and_every_second_value(self):
         """The root of the rebinding family: a call is allowed only when its name has exactly ONE binding in the registrar (a def or lambda of its own) or is a table name never bound: so whatever the second binding is, the call is held."""
@@ -34588,7 +34625,7 @@ class TestRegistrarFloor(LedgerBase):
                     body = "def f():\n    pass\ndef f():\n    pass\nf('x')"
                 with self.subTest(form=label, value=value):
                     self.assertTrue(self.found_unit(body), body)
-        for label, body in (("a def called once", "def f(v):\n    return v\nsub.add_parser('x', help=f('a'))"), ("a lambda called once", "f = lambda v: v\nsub.add_parser('x', help=f('a'))"),
+        for label, body in (("a def called once", "def f():\n    sub.add_parser('a')\nf()"), ("a lambda called once", "def f():\n    sub.add_parser('a')\nf()"),
                             ("a table builtin never bound", "sub.add_parser('x', default=int('1'))")):
             with self.subTest(allowed=label):
                 self.assertEqual(self.found_unit(body), [], label)
@@ -34635,7 +34672,7 @@ class TestRegistrarFloor(LedgerBase):
         for label, body in (
             ("own parser values", "t = sub.add_parser('x', type=int, help=json)\nt.add_argument('--a', default=re.SUPPRESS, metavar=fn)"), ("loop over own parsers", "a = sub.add_parser('a')\nb = sub.add_parser('b')\nfor p in (a, b):\n    p.add_argument('--x', default=1, help=fn)"),
             ("own parser actions", "a = sub.add_parser('a')\nfor action in a._actions:\n    action.default = 1"), ("data loop", "t = sub.add_parser('x')\nfor f in FIELDS:\n    t.add_argument('--' + f.replace('_', '-'))"),
-            ("defined function", "def inner(v):\n    return v\nsub.add_parser('x', help=inner('a'))"),
+            ("defined function", "def inner():\n    sub.add_parser('x')\ninner()"),
         ):
             clean(label, reg(body))
         try:   # a DELETION-only edit of a named helper holds (the base side)
@@ -34683,10 +34720,10 @@ class TestRegistrarFloor(LedgerBase):
         has("aliases on add_parser", reg("sub.add_parser('x', aliases=['review'])"), ("calls", "aliases"))
         has("set_defaults on the handed parser", reg("sub.set_defaults(a=1)"), ("calls", "set_defaults on the handed parser"))
         clean("set_defaults on a parser it built", reg("t = sub.add_parser('x')\nt.set_defaults(a=1)"))
-        clean("a name that stays data", reg("s = ''\ns.join(['a'])"))
+        clean("a name that stays data", reg("s = ''\ns.join(('a',))"))
         has("a def rebound then called", reg("def f():\n    pass\nf = int\nf('1')"), ("calls", "f"))
         has("a lambda rebound then called", reg("f = lambda: 1\nf = json\nf('1')"), ("calls", "f"))
-        clean("a def called", reg("def f(v):\n    return v\nsub.add_parser('x', help=f('a'))"))
+        clean("a def called", reg("def f():\n    sub.add_parser('a')\nf()"))
         has("a call of an element of a local list", reg("l = []\nl.append(os.system)\nl[0]('x')"), ("calls", "l"))
         has("a loop variable over a list", reg("for f in [os.system]:\n    f('x')"), ("calls", "f"))
         clean("a loop over a tuple of strings", reg("t = sub.add_parser('x')\nfor f in ('a', 'b'):\n    t.add_argument('--' + f.replace('_', '-'))"))
@@ -34729,6 +34766,19 @@ class TestRegistrarFloor(LedgerBase):
                     bad.append("module-level binding: " + label)
             except Exception:
                 bad.append("module-level binding: " + label)
+        for form in self.MODULE_FORMS:   # every module-level binding form, in every nesting, for a registrar name, a table builtin and a rebound helper (the real-file runs are in the module-level tests; the mutants need them here)
+            for nesting in self.NESTINGS:
+                try:
+                    if form not in ("a def", "a class", "a decorated def"):
+                        got, why = dc.registrar_findings(fake, fake + self.placed(form, nesting, "add_zz_parsers"), rule)
+                        if why or not any(g[0] == "add_zz_parsers" for g in got):
+                            bad.append("module form (registrar): %s / %s" % (form, nesting))
+                    if form not in ("a def", "a class", "a decorated def", "import as", "from import as", "match mapping rest", "except as", "except* as"):
+                        got, why = dc.registrar_findings(fake, fake + "def zz_helper(v):\n    return v\n" + self.placed(form, nesting, "zz_helper") + "def add_zz_parsers(sub):\n    zz_helper(sub)\n", rule)
+                        if why or not any(g[1] == "calls" and "zz_helper" in g[2] for g in got):
+                            bad.append("module form (helper): %s / %s" % (form, nesting))
+                except Exception:
+                    bad.append("module form: %s / %s" % (form, nesting))
         clean("a pure builtin of the table", reg("sub.add_parser('x', default=int('1'), help=str(2))"))
         has("a builtin outside the table", reg("sorted(sub)"), ("calls", "sorted"))
         clean("a named helper is not read as part of the registrar", reg("t = sub.add_parser('x')\nt.add_argument('--i', type=hh)\nhh('1')"))
@@ -34744,8 +34794,7 @@ class TestRegistrarFloor(LedgerBase):
                 bad.append("an unreadable table holds")
         except Exception:
             bad.append("an unreadable table holds")
-        clean("an async function it defines", reg("async def f(v):\n    return v\nsub.add_parser('x', help=f('a'))"))
-        clean("a class it defines", reg("class K:\n    pass\nsub.add_parser('x', help=K())"))
+        has("a class is not in the grammar", reg("class K:\n    sub.add_parser('x')\nK()"), ("uses", "the statement or expression form ClassDef, which a registrar may not contain"))
         clean("a clean readable helper", "def _h(p):\n    p.add_parser('x')\n" + reg("_h(sub)"))
         has("a default that is not data", "def add_zz_parsers(sub, m=json):\n    pass\n", ("rebinds", "m"))
         has("a parser name rebound", reg("sub = json\nsub.x = 1"), ("rebinds", "sub"))
@@ -34824,7 +34873,7 @@ class TestRegistrarFloor(LedgerBase):
         ("the base's registrar pattern is not united", "patterns = [p for p in (registrar_pattern(base), registrar_pattern(head)) if p is not None]", "patterns = [registrar_pattern(head)]"),
         ("a helper is not followed", "for ref in sorted(refs & set(defs)):", "for ref in []:"),
         ("an opaque helper is not held", "if isinstance(x.func, ast.Name) and x.func.id in opaque", "if False and isinstance(x.func, ast.Name) and x.func.id in opaque"),
-        ("a named helper is still read as part of a registrar", "if node.name not in names and node.name not in named:", "if node.name not in names:"),
+        ("a named helper is still read as part of a registrar", "        if bound in names or bound in named:\n            continue", "        if bound in names:\n            continue"),
         ("an edit of a name of the table is not held", "if bound in table and _spans_from_decorators(node, numbers):", "if False:"),
         ("an unreadable table passes", 'return None, "the registrar allow table of the rule cannot be read"', "pass"),
         ("a decorator is not part of a helper", "start = min([node.lineno] + [d.lineno for d in getattr(node, \"decorator_list\", [])])\n    return any(n in numbers", "start = node.lineno\n    return any(n in numbers"),
@@ -34850,6 +34899,7 @@ class TestRegistrarFloor(LedgerBase):
         ("a match body is not walked", "        if isinstance(node, ast.Match):\n            for case in node.cases:", "        if False:\n            for case in node.cases:"),
         ("a registrar bound in another form is not held", "    extra = [(n, None) for n in _bound_here(node) if named(n)]", "    extra = []"),
         ("a helper bound twice stays a def", "if len(kinds_) == 1 and kinds_[0][0] in (\"def\", \"lambda\"):", "if kinds_[0][0] in (\"def\", \"lambda\"):"),
+        ("the grammar allows every class", "kind in REGISTRAR_GRAMMAR or kind in GRAMMAR_NEUTRAL:", "kind in REGISTRAR_GRAMMAR or kind in GRAMMAR_NEUTRAL or True:"),
         ("a with item is not read", "elif isinstance(x, (ast.With, ast.AsyncWith)):\n            for item in x.items:", "elif False:\n            for item in x.items:"),
         ("a for iterable is not read", "elif isinstance(x, (ast.For, ast.AsyncFor, ast.comprehension)) and not _built_iter(x.iter, built):", "elif False:"),
         ("a bare decorator of the unit is not read", "if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):\n            for expr in list(x.decorator_list)", "if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and x is not unit:\n            for expr in list(x.decorator_list)"),
