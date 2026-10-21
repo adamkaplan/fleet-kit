@@ -408,8 +408,8 @@ def remove_entry(path):
         os.unlink(path)
 
 
-def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monotonic, busy=None, weekly=False, outcome=None, recheck_busy=None):
-    """Returns (lines, removed, kept). `recheck_busy`, when given, is the in-use check for the judgement right before a removal (default: `busy`). `outcome`, when a list, receives one dict (name, age_days, bytes) for each entry that is removed (or, on a dry run, would be): the daemon's audit summary reads it; it changes nothing else. `audit(name, detail)` is called once for each removal that happened; if it raises, removing STOPS and the line says so.
+def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monotonic, busy=None, weekly=False, outcome=None, recheck_busy=None, only=None):
+    """Returns (lines, removed, kept). `recheck_busy`, when given, is the in-use check for the judgement right before a removal (default: `busy`). `outcome`, when a list, receives one dict (name, age_days, bytes) for each entry that is removed (or, on a dry run, would be): the daemon's audit summary reads it; it changes nothing else. `only`, when given, is the set of names a person reviewed: an entry that qualifies now but is not in it is kept and said so (the hand-run `--apply`). `audit(name, detail)` is called once for each removal that happened; if it raises, removing STOPS and the line says so.
     Right before each removal the entry is judged again from the records as they are then, and removed only if it is still eligible and is the same
     entry (device, inode and newest modification time)."""
     lines, removed, kept = [], 0, 0
@@ -426,6 +426,10 @@ def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monoto
         if removed >= REMOVE_MAX:
             lines.append("only %d entries handled per call: run it again for the rest" % REMOVE_MAX)
             break
+        if only is not None and row["name"] not in only:
+            lines.append("kept %s: it was not in the preview you reviewed" % row["name"])
+            kept += 1
+            continue
         if not apply:
             lines.append("would remove %s (%d day(s) old, %d bytes)" % (row["name"], row["age_days"], row["size"]))
             if outcome is not None:
