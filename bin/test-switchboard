@@ -34172,13 +34172,13 @@ class TestRegistrarFloor(LedgerBase):
         self.assertEqual(self.dc.registrar_findings(base, edited, self.rule), ([], None), "a different line of the registrar: the helper is not named")
         calls = base.replace("def add_a_parsers(sub):\n    pass\n", "def add_a_parsers(sub):\n    _zzz_helper()\n")
         self.assertIn(("add_a_parsers (through _zzz_helper)", "rebinds", binding), self.dc.registrar_findings(base, calls, self.rule)[0], "a changed line now calls the old hostile helper: all of it is read")
-        for label, text in {"a helper bound as a lambda": "h = lambda: %s()\ndef add_a_parsers(sub):\n    h()\n" % function,
-                            "a helper that is a class": "if True:\n    class H:\n        def __call__(self):\n            %s()\ndef add_a_parsers(sub):\n    H()\n" % function}.items():
+        for label, text in {"a helper bound as a lambda": "zz_h = lambda: %s()\ndef add_a_parsers(sub):\n    zz_h()\n" % function,
+                            "a helper that is a class": "if True:\n    class ZzH:\n        def __call__(self):\n            %s()\ndef add_a_parsers(sub):\n    ZzH()\n" % function}.items():
             with self.subTest(label):
                 self.assertTrue(any("through" in r for r, v, _ in self.reg(text)[0]), label)
-        for label, text in {"a helper that is a non-lambda binding": "h = make()\ndef add_a_parsers(sub):\n    h()\n", "a helper that is imported": "from somewhere import h\ndef add_a_parsers(sub):\n    h()\n",
-                            "a plain import alias": "import sys as hh\ndef add_a_parsers(sub):\n    hh()\n", "a for target": "for hh in ():\n    pass\ndef add_a_parsers(sub):\n    hh()\n",
-                            "an except name": "try:\n    pass\nexcept Exception as hh:\n    pass\ndef add_a_parsers(sub):\n    hh()\n"}.items():
+        for label, text in {"a helper that is a non-lambda binding": "zz_h = make()\ndef add_a_parsers(sub):\n    zz_h()\n", "a helper that is imported": "from somewhere import zz_h\ndef add_a_parsers(sub):\n    zz_h()\n",
+                            "a plain import alias": "import sys as zz_hh\ndef add_a_parsers(sub):\n    zz_hh()\n", "a for target": "for zz_hh in ():\n    pass\ndef add_a_parsers(sub):\n    zz_hh()\n",
+                            "an except name": "try:\n    pass\nexcept Exception as zz_hh:\n    pass\ndef add_a_parsers(sub):\n    zz_hh()\n"}.items():
             with self.subTest(label):
                 self.assertTrue(any(v == "calls" and "cannot be read" in n for _, v, n in self.reg(text)[0]), label)
 
