@@ -98,6 +98,23 @@ class Other(http.server.BaseHTTPRequestHandler):
     do_GET = do_POST
 
 
+# The recursion limit of json's C scanner differs by platform and Python build, so a deep answer may parse or raise.
+# This wrapper makes the raise certain: json.loads of a nested array raises the class named in $RAISE_CLASS.
+RAISE_ON_NESTING = ("import json, runpy, sys\n"
+                    "real = json.loads\n"
+                    "def loads(s, *a, **k):\n"
+                    "    head = s[:2] if isinstance(s, str) else bytes(s[:2]).decode('latin-1')\n"
+                    "    if head == '[[':\n"
+                    "        raise {'RecursionError': RecursionError('maximum recursion depth exceeded'), 'ValueError': ValueError('bad'),\n"
+                    "               'UnicodeDecodeError': UnicodeDecodeError('utf-8', b'x', 0, 1, 'bad'), 'MemoryError': MemoryError()}[__import__('os').environ['RAISE_CLASS']]\n"
+                    "    return real(s, *a, **k)\n"
+                    "json.loads = loads\n"
+                    "path = sys.argv[1]\n"
+                    "sys.path.insert(0, __import__('os').path.dirname(path))\n"
+                    "sys.argv = sys.argv[1:]\n"
+                    "runpy.run_path(path, run_name='__main__')\n")
+
+
 class Mint(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -144,11 +161,12 @@ class Mint(unittest.TestCase):
         if os.path.exists(self.argv_log):
             os.remove(self.argv_log)
 
-    def run_mint(self, repo=REAL, **env):
+    def run_mint(self, repo=REAL, runner=None, **env):
         e = dict(os.environ, CW_APP_ID_CMD="echo 12345", CW_APP_INSTALLATION_CMD="echo 678",
                  CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.wrap)
         e.update(env)
-        return subprocess.run([sys.executable, MINT, repo], env=e, capture_output=True, text=True, timeout=60)
+        argv = [sys.executable, "-c", runner, MINT, repo] if runner else [sys.executable, MINT, repo]
+        return subprocess.run(argv, env=e, capture_output=True, text=True, timeout=60)
 
     def test_prints_only_the_token_and_signs_a_valid_short_jwt(self):
         p = self.run_mint()
@@ -317,11 +335,30 @@ class Mint(unittest.TestCase):
             p = self.run_mint("kite-org/widget-service" if owner_ok_login.startswith("\u212a") else REAL)
             self.assertEqual((p.returncode, p.stdout, Stub.seen), (1, "", []), repr(owner_ok_login))
 
-    def test_a_hostile_deeply_nested_answer_is_a_named_refusal_with_no_mint(self):
+    def test_a_parse_that_raises_any_exception_class_is_a_named_refusal_with_no_mint(self):
+        # the raise is injected (see RAISE_ON_NESTING), so each class is exercised on every platform
+        for cls in ("RecursionError", "ValueError", "UnicodeDecodeError", "MemoryError"):
+            Stub.lookup, Stub.raw, Stub.seen = (200, None), b"[" * 10 + b"]" * 10, []
+            p = self.run_mint(runner=RAISE_ON_NESTING, RAISE_CLASS=cls)
+            self.assertEqual((p.returncode, p.stdout, Stub.seen), (1, "", []), cls)
+            self.assertIn("nothing was minted", p.stderr, cls)
+            self.assertIn("not usable JSON", p.stderr, cls)
+            self.assertNotIn("Traceback", p.stderr, cls)
+
+    def test_a_genuinely_hostile_deep_array_is_refused_with_no_mint(self):
+        """Whether 10000 levels raise RecursionError or parse depends on the platform and Python build, so both documented
+        refusals are accepted: the parse refusal ("not usable JSON") or the wrong-shape refusal. Never a crash, never a mint."""
         Stub.lookup, Stub.raw, Stub.seen = (200, None), b"[" * 10000 + b"]" * 10000, []
         p = self.run_mint()
         self.assertEqual((p.returncode, p.stdout, Stub.seen), (1, "", []))
-        self.assertIn("nothing was minted", p.stderr)
+        self.assertTrue("not usable JSON" in p.stderr or "something other than one installation" in p.stderr, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_a_nested_answer_that_parses_is_refused_as_the_wrong_shape(self):
+        Stub.lookup, Stub.raw, Stub.seen = (200, None), b"[" * 50 + b"]" * 50, []
+        p = self.run_mint()  # no wrapper: 50 levels parse on every platform
+        self.assertEqual((p.returncode, p.stdout, Stub.seen), (1, "", []))
+        self.assertIn("something other than one installation", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
     def test_a_request_that_times_out_is_a_named_refusal(self):
@@ -505,7 +542,7 @@ class Mint(unittest.TestCase):
         ("no suspended check", 'if ans.get("suspended_at"):', "if False:", "a suspended installation"),
     ]
 
-    def run_copy(self, src_text, repo=REAL):
+    def run_copy(self, src_text, repo=REAL, runner=None):
         d = tempfile.mkdtemp(dir=self.tmp.name)
         for n in ("token_mint.py",):
             with open(os.path.join(os.path.dirname(MINT), n)) as f, open(os.path.join(d, n), "w") as g:
@@ -513,8 +550,9 @@ class Mint(unittest.TestCase):
         path = os.path.join(d, "app_token.py")
         with open(path, "w") as f:
             f.write(src_text)
-        e = dict(os.environ, CW_APP_ID_CMD="echo 12345", CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.wrap)
-        return subprocess.run([sys.executable, path, repo], env=e, capture_output=True, text=True, timeout=60)
+        e = dict(os.environ, CW_APP_ID_CMD="echo 12345", CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.wrap, RAISE_CLASS="RecursionError")
+        argv = [sys.executable, "-c", runner, path, repo] if runner else [sys.executable, path, repo]
+        return subprocess.run(argv, env=e, capture_output=True, text=True, timeout=60)
 
     def mint_refused_variant(self, text, answer):
         """True when the build refuses a mint answer (a second repository, or an owner id that differs) with no token on stdout."""
@@ -541,7 +579,7 @@ class Mint(unittest.TestCase):
             Stub.raw = None
             if answer == "nested":
                 Stub.lookup, Stub.raw, Stub.seen = (200, None), b"[" * 10000 + b"]" * 10000, []
-                p = self.run_copy(text)
+                p = self.run_copy(text, runner=RAISE_ON_NESTING)
                 return p.returncode == 1 and p.stderr.startswith("app-token: ") and "Traceback" not in p.stderr
             if answer == "kelvin":
                 Stub.lookup, Stub.seen = (200, {"id": 5, "account": {"id": 9, "login": "\u212a" + "ite-org"}}), []
