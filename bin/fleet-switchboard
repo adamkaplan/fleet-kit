@@ -6325,6 +6325,16 @@ def reclaim_agent_tmp(engine, name, headless=False):
         return ["%s: kept (%s)" % (path, err.strerror or err)]
 
 
+def record_launch_charter(engine, name, session_id, fleet, pane=None):
+    """#969: a launch is the first sight of an orchestrator: its registry row takes the launch's `--charter` at once (the observation pass would only fill it later, after an adoption or a lane lookup may already
+    have looked). Only an orchestrator launched with a charter; a failure is left to the pass (never raises)."""
+    try:
+        if engine.state_dir is not None and (fleet or {}).get("role") == "orchestrator" and isinstance(fleet.get("charter"), int) and not isinstance(fleet.get("charter"), bool):
+            load_module("registry").upsert(engine.state_dir, name, {"session": session_id, "pane": pane, "role": "orchestrator", "charter": fleet["charter"], "repo": fleet.get("repo")}, now=engine.now())
+    except Exception:
+        pass
+
+
 def launch_agent(engine, name, agent, directory, workspace, role=None, reports_to=None, issue=None,
                  brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None, repo=None, launched_by=None):
     """Create a fleet agent: a v2 session, its own herdr tab, the brief.
@@ -6358,6 +6368,7 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
                                                       "fleet": fleet}) as result:
         session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet})["id"]
         result["session"] = session_id
+        record_launch_charter(engine, name, session_id, fleet)
     argv = [engine.config["opencode"], "-s", session_id]
     pane = None
     try:
@@ -6433,6 +6444,7 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
                 raise HeadlessRefused("the OpenCode service could not create the session (%s)" % _one_line(str(err), 120)) from err
             brief_started = False
             try:
+                record_launch_charter(engine, name, session_id, fleet)
                 ap.save_record(engine.state_dir, name, session_id, engine.v2.service_url(), now=engine.now())
                 info = engine.v2.session_get(session_id) or {}
                 if ((_fleet_meta(info) or {}).get("name")) != name:
@@ -6994,6 +7006,37 @@ def watch_terminal_closed(engine, name, session_id):
     return record is not None and record.get("session") == session_id
 
 
+def registry_charter(registered, name, session_charter):
+    """(the charter the registry row of `name` takes, the session's charter when it DISAGREES with a kept row, else None) (#969). The registry is the one record of an orchestrator's charter: a row that
+    exists keeps its charter (None included: that is a recorded answer), whatever the live session's metadata says; only an agent with NO row yet (first seen) takes the session's launch value.
+    The metadata is written once at launch and cannot be corrected, so it is never a second source."""
+    row = registered.get(name)
+    if not isinstance(row, dict):
+        return (session_charter if isinstance(session_charter, int) and not isinstance(session_charter, bool) else None), None
+    kept = row.get("charter")
+    differs = session_charter if (isinstance(session_charter, int) and not isinstance(session_charter, bool) and session_charter != kept) else None
+    return kept, differs
+
+
+CHARTER_DISAGREE_FILE = "charter-disagreements.json"   # {name: {session charter: 1}}: the disagreement is said ONCE per (agent, value)
+
+
+def charter_disagreement_once(engine, name, value):
+    """Audit `charter.disagree` the first time a live session's metadata charter disagrees with its registry row, then never again for that (agent, value). Never raises."""
+    try:
+        if engine.state_dir is None:
+            return
+        seen = _read_small(engine.state_dir, CHARTER_DISAGREE_FILE)   # {name: {"<value>": 1}} (a small file keeps only objects)
+        values = seen.get(name) if isinstance(seen.get(name), dict) else {}
+        if str(value) in values:
+            return
+        seen[name] = dict(list(values.items())[-4:], **{str(value): 1})
+        _write_small(engine.state_dir, CHARTER_DISAGREE_FILE, seen)
+        engine._note("charter.disagree", name, {"session_charter": value, "why": "the live session's metadata names a charter the registry row does not: the registry is the record, the session's value is ignored"})
+    except Exception:
+        pass
+
+
 BELL_GLYPH = "\U0001f514"   # the heartbeat's old opt-in glyph in a tab label: read ONCE by the migration below, never again
 
 
@@ -7044,7 +7087,6 @@ def pane_health_pass(engine, now):
     registered = {n: row for n, row in reg["agents"].items() if isinstance(row, dict)}
     retired = reg["retired"]
     retired_whole = True
-    forgotten = []
     names = list(discovery.agents)
     sessions = [o.session_id for o in discovery.agents.values()]
     budget = PANE_CHECKS_PER_PASS
@@ -7082,7 +7124,10 @@ def pane_health_pass(engine, now):
         elif name not in states:
             states[name] = {"state": PANE_UNKNOWN, "why": "not checked yet", "pane": obs.pane, "session": obs.session_id, "at": int(now)}
         known = states.get(name) or {}
-        agents[name] = {"session": obs.session_id, "pane": obs.pane, "role": (obs.fleet or {}).get("role"), "charter": (obs.fleet or {}).get("charter"),
+        charter, differs = registry_charter(registered, name, (obs.fleet or {}).get("charter"))
+        if differs:
+            charter_disagreement_once(engine, name, differs)
+        agents[name] = {"session": obs.session_id, "pane": obs.pane, "role": (obs.fleet or {}).get("role"), "charter": charter,
                         "repo": (obs.fleet or {}).get("repo"), "workspace": known.get("workspace") or (agents.get(name) or {}).get("workspace"),
                         "cwd": known.get("cwd") or (agents.get(name) or {}).get("cwd"), "seen": int(now)}
     for name in list(agents):
@@ -7091,7 +7136,6 @@ def pane_health_pass(engine, now):
         if (states.get(name) or {}).get("state") == PANE_DEAD and now - ((states.get(name) or {}).get("at") or now) > PANE_FORGET_SECONDS:
             for table in (agents, states, missing):   # nobody repaired it in days: it stops waking cos
                 table.pop(name, None)
-            forgotten.append(name)
             continue
         if name in retired and retired[name].get("session") in (None, agents[name].get("session")):   # the name AND its session, as in the live branch
             states.pop(name, None)
@@ -7144,11 +7188,7 @@ def pane_health_pass(engine, now):
         got = registry.upsert(engine.state_dir, name, new, now=now)
         if got["problem"] and not got["problem"].endswith("is retired for this session"):
             engine._note("fleetpane.error", name, {"error": "registry not updated: %s" % _one_line(got["problem"], 100)})
-    for name in forgotten:   # the registry itself checks the evidence (its recorded state is dead; no pane, no process): never the flag alone
-        # what this pass SAW: discovery did not list the agent (no pane, no process) for PANE_FORGET_SECONDS while its recorded state stayed dead; the registry checks it itself
-        got = registry.reconcile_remove(engine.state_dir, name, {"pane_listed": name in discovery.agents, "process_found": name in discovery.agents, "why": "dead for over %d days" % (PANE_FORGET_SECONDS // 86400)}, True)
-        if got["problem"]:
-            engine._note("fleetpane.error", name, {"error": "registry not updated: %s" % _one_line(got["problem"], 100)})
+    # No removal from the registry here: a dead agent leaves it only when a view reads it (reconcile_on_read, #919), never on a pass.
     try:
         write_pane_health(engine.state_dir, {"agents": agents, "states": states, "missing": missing, "at": int(now)})
     except OSError as err:
@@ -7579,7 +7619,9 @@ def pane_health_status_lines(state_dir, now=None):
     if not seen["whole"]:
         return ["      panes      the agent registry could not be read (%s): no pane state shown" % _one_line(str(seen["problem"]), 120)]
     retired = seen["retired"]
-    bad = [(n, v) for n, v in sorted(seen["agents"].items()) if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in retired]
+    # A dead agent is never drawn (#919, S10): the reconcile on read (run by `collect_status` first) removes the provably dead one, and one it could not remove is
+    # still not drawn as dead. The view reads only the registry: an agent it does not hold has no row, and a read that is not whole says so above.
+    bad = [(n, v) for n, v in sorted(seen["agents"].items()) if v.get("state") == PANE_DETACHED and n not in retired]
     clock = time.time() if now is None else now
     last = _read_small(state_dir, LAST_REPORT_FILE)
     gone = [n for n, v in sorted(retired.items()) if clock - (v.get("at") or 0) <= RETIRED_SHOW_DAYS * 86400]
@@ -7589,6 +7631,40 @@ def pane_health_status_lines(state_dir, now=None):
     return ["      panes      %d agent(s) need repair: %s" % (len(bad), "; ".join("%s %s (pane %s)" % (n, v["state"].upper(), v.get("pane")) for n, v in bad[:6]))
             ] + ["        run `%s reattach <name>`" % PROG] + [
         "        %s: %s" % (_one_line(n, 60), dead_hint.hint(n, last.get(n), clock)) for n, v in bad[:6] if v.get("state") == PANE_DEAD] + tail
+
+
+def herdr_live_check(herdr):
+    """A `live_check` for agent_reconcile: asks herdr right now. {"pane": bool|None, "process": bool|None}; None means herdr could not say.
+    Evidence of death is a SUCCESSFUL, WHOLE `pane list` that does not hold this pane id (exact equality on the parsed `pane_id` field). Error text
+    is never read: any error, timeout, bad JSON, missing binary or socket, or a list of an unexpected shape is None (no evidence)."""
+    def check(name, agent):
+        pane = agent.get("pane")
+        if not pane:
+            return {"pane": False, "process": False}
+        try:
+            panes = herdr.pane_list()
+        except Exception:
+            return {"pane": None, "process": None}
+        if not isinstance(panes, list) or not all(isinstance(p, dict) and isinstance(p.get("pane_id"), str) for p in panes):
+            return {"pane": None, "process": None}
+        if not any(p["pane_id"] == pane for p in panes):
+            return {"pane": False, "process": False}
+        try:
+            return {"pane": True, "process": bool(herdr.pane_process_info(pane))}
+        except Exception:
+            return {"pane": True, "process": None}
+    return check
+
+
+def reconcile_agents_on_read(state_dir, herdr):
+    """A view's reconcile on read (#919): read the registry, and remove through `registry.reconcile_remove` each agent herdr shows no pane and no
+    process for, right now. Only a whole read acts. No registry module or file: nothing to do. Returns the names removed; never raises."""
+    try:
+        reg = load_module("registry")
+        agent_reconcile = load_module("agent_reconcile")
+        return agent_reconcile.reconcile_on_read(state_dir, reg.read(state_dir), herdr_live_check(herdr), reg)
+    except Exception:
+        return []
 
 
 def charter_pane_update(engine, runner, fleet, new_pane):
@@ -7872,24 +7948,91 @@ def _heir_ok(discovery, retired, name, obs):
     return not obs.problem and not _retired_entry_applies(retired, name, obs)
 
 
-def worker_charter(discovery, worker):
-    """The charter a worker belongs to: its own `charter`, else the charter of the orchestrator it reported to (still discovered, even if retired), else None."""
+def registry_owners(engine):
+    """{orchestrator name: charter} from the agent REGISTRY, the one record of an orchestrator's charter (#969), or {} when the registry cannot be read whole (then nobody is taken for a charter's owner: never a guess).
+    The live session's metadata is never read for it."""
+    try:
+        registry = load_module("registry")
+        reg = registry.read(engine.state_dir) if engine.state_dir is not None else None
+        return registry.orchestrator_charters(reg["agents"]) if reg and reg["whole"] else {}
+    except Exception:
+        return {}
+
+
+def registry_retired_owners(engine):
+    """{orchestrator name: charter} the REGISTRY kept for a RETIRED orchestrator (its retirement record holds the row it had): a worker's boss's charter when the boss has just been retired (#969). {} when unreadable."""
+    try:
+        registry = load_module("registry")
+        reg = registry.read(engine.state_dir) if engine.state_dir is not None else None
+        out = {}
+        for name, entry in ((reg or {}).get("retired") or {}).items():
+            record = entry.get("record") if isinstance(entry, dict) and isinstance(entry.get("record"), dict) else {}
+            if reg["whole"] and record.get("role") == "orchestrator" and registry.is_charter(record.get("charter")):
+                out[name] = record["charter"]
+        return out
+    except Exception:
+        return {}
+
+
+def charter_or_first_seen(engine, name, fleet):
+    """The charter of the agent `name`: its REGISTRY row's (None included) when the registry has a row for it, else its launch value (an agent the pass has not yet seen: the first-seen fill the pass makes anyway) (#969)."""
+    try:
+        registry = load_module("registry")
+        reg = registry.read(engine.state_dir) if engine.state_dir is not None else None
+        row = reg["agents"].get(name) if reg and reg["whole"] else None
+    except Exception:
+        row = None
+    if isinstance(row, dict):
+        return row.get("charter") if registry.is_charter(row.get("charter")) else None
+    value = (fleet or {}).get("charter")
+    return value if _is_issue_number(value) else None
+
+
+def registry_charter_view(engine):
+    """{agent name: the registry row's charter or None} for every agent that HAS a registry row, or {} when the registry cannot be read whole (#969). Used where a function sees many agents: an orchestrator
+    with a row owns its row's charter only; one with no row yet owns its launch `charter` only. The metadata `issue` of an orchestrator (the ask it was launched for) is never a claim on a charter."""
+    try:
+        registry = load_module("registry")
+        reg = registry.read(engine.state_dir) if engine is not None and getattr(engine, "state_dir", None) is not None else None
+        return {n: (row.get("charter") if registry.is_charter(row.get("charter")) else None) for n, row in reg["agents"].items() if isinstance(row, dict)} if reg and reg["whole"] else {}
+    except Exception:
+        return {}
+
+
+def owned_numbers(name, fleet, view):
+    """The issue numbers the agent `name` (live metadata `fleet`) owns: an ORCHESTRATOR owns its charter (the registry row's when it has one, else its launch `charter`) and nothing else; any other role owns its own `issue`
+    and `charter` (its own assignment). #969."""
+    def number(value):
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lstrip("#").isdigit():
+            return int(value.strip().lstrip("#"))
+        return None
+    if fleet.get("role") == "orchestrator":
+        found = view[name] if name in view else number(fleet.get("charter"))
+        return {found} if found is not None else set()
+    return {n for n in (number(fleet.get("issue")), number(fleet.get("charter"))) if n is not None}
+
+
+def worker_charter(discovery, worker, owners=None):
+    """The charter a worker belongs to: its own `charter` (its own launch context), else the REGISTRY's charter of the orchestrator it reported to (`owners`, #969; still discovered, even if retired), else None."""
     fleet = worker.fleet or {}
     if _is_issue_number(fleet.get("charter")):
         return fleet["charter"], fleet
     old = discovery.agents.get(boss_name(discovery, worker) or "")
-    if old is not None and (old.fleet or {}).get("role") == "orchestrator" and _is_issue_number((old.fleet or {}).get("charter")):
-        return old.fleet["charter"], old.fleet
+    if old is not None and (old.fleet or {}).get("role") == "orchestrator" and _is_issue_number((owners or {}).get(old.name)):
+        return owners[old.name], old.fleet
     return None, fleet
 
 
 def adoption_heir(engine, discovery, retired, worker):
     """(heir, why) for an orphan: the ONE live orchestrator of the worker's charter, else the ONE live Chief of Staff, else (None, None)."""
-    charter, fleet = worker_charter(discovery, worker)
+    owners = registry_owners(engine)   # #969: the registry's charter, never the session metadata
+    charter, fleet = worker_charter(discovery, worker, dict(registry_retired_owners(engine), **owners))   # the old boss may have just been retired: its record keeps its charter
     if charter is not None:
         repo = _fleet_repo(fleet, engine.config)
         mine = sorted(n for n, o in discovery.agents.items()
-                      if (o.fleet or {}).get("role") == "orchestrator" and (o.fleet or {}).get("charter") == charter and n != worker.name
+                      if (o.fleet or {}).get("role") == "orchestrator" and owners.get(n) == charter and n != worker.name
                       and _fleet_repo(o.fleet, engine.config) == repo and _heir_ok(discovery, retired, n, o))
         if len(mine) == 1:
             return mine[0], "the charter's orchestrator"
@@ -10700,7 +10843,7 @@ def decisions_from_github(engine, now):
     for record in records:
         numbers = [record["number"]] + ([record["parent"]] if record.get("parent") else [])
         items.append({"kind": "issue", "title": record["title"] or "issue #%d" % record["number"],
-                      "ask": record["number"], "agent": pick_owner(agents, numbers, record["repo"]),
+                      "ask": record["number"], "agent": pick_owner(agents, numbers, record["repo"], view=registry_charter_view(engine)),
                       "since": record["since"], "seed": "issue:%s#%d" % (record["repo"], record["number"]),
                       "bare": True, "repo": record["repo"], "tier": record.get("tier") or "human",
                       "rows": record.get("rows") or [], "raised_by": record.get("raised_by"),
@@ -13282,7 +13425,8 @@ SWEEP_KINDS = {"S6a": "first-line marker without the merge-captain label (our PR
                "S5": "cos-tier decision aged (and not already in the owner's tier)",
                "S7": "decisions that wait for each other (a cycle): none of them can be done first",
                "S8": "a decision waits for an issue that is closed or missing",
-               "S9": "a merge or hold label left on a closed, unmerged PR"}
+               "S9": "a merge or hold label left on a closed, unmerged PR",
+               "S10": "a charter recorded by two orchestrators in the registry (the lane of its pull requests is unknown)"}
 SWEEP_WAIT_VERBS = ("held for", "hold for", "waiting on", "waits on", "awaiting", "blocked on", "pending", "needs")
 
 
@@ -13729,6 +13873,15 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
             if (target not in listed and picture is not None and not picture.get("error") and not picture.get("truncated")
                     and number.isdigit() and int(number) not in picture["items"]):
                 found.add(("S8", target))
+    try:   # S10 (#969): a charter number two orchestrators of one repo record in the REGISTRY (read from the registry rows, never from GitHub or session metadata): one finding on the charter's issue, naming both
+        registry = load_module("registry")
+        reg = registry.read(engine.state_dir) if engine.state_dir is not None else None
+        for (crepo, charter), names in sorted((registry.duplicate_charters(reg["agents"]) if reg and reg["whole"] else {}).items(), key=lambda kv: (str(kv[0][0]), kv[0][1])):
+            if crepo:
+                found.add(("S10", ref_text(crepo, charter)))
+                state.sources[("S10", ref_text(crepo, charter))] = {"source": "registry", "match": "recorded by %s" % ", ".join(names)}
+    except Exception:
+        pass   # an unreadable registry raises nothing: the lookup itself says "unknown"
     state.unattributed = unattributed
     return sorted(found)
 
@@ -13743,8 +13896,8 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
     """Re-check one finding against a fresh read of its issue or PR (and, when comments raised it, a fresh read of its
     last comments), so a cached copy cannot raise it. True: still holds. False: no longer (or never did). None: could not
     be checked now (no budget, a failed or truncated read): it is neither raised nor audited this pass."""
-    if kind in ("S5", "S7"):
-        return True  # about the decision list derived this very pass
+    if kind in ("S5", "S7", "S10"):
+        return True  # about the decision list, or the registry, derived this very pass
     hub = getattr(engine, "hub", None)
     repo, _, number = ref.rpartition("#")
     if hub is None or not number.isdigit():
@@ -14352,16 +14505,17 @@ def triage_context(engine, repo, items, discovery):
     """The charters, asks, work items and agent-owned numbers of one repo, from the agents list and the parent links the
     issue list carries (`parent_issue_url`): no read of their own."""
     owned, charters = set(), set()
+    view = registry_charter_view(engine)   # #969: an orchestrator's charter is the registry's; its metadata `issue` is an ask, never a charter
     for agent in (discovery.agents.values() if discovery else []):
         fleet = agent.fleet or {}
         if _fleet_repo(fleet, engine.config) != repo and fleet.get("repo") != repo:
             continue
-        for field in ("issue", "charter"):
-            value = fleet.get(field)
-            if isinstance(value, int) and not isinstance(value, bool):
-                owned.add(value)
-                if field == "charter":
-                    charters.add(value)
+        mine = owned_numbers(agent.name, fleet, view)
+        owned |= mine
+        if fleet.get("role") == "orchestrator":
+            charters |= mine
+        elif isinstance(fleet.get("charter"), int) and not isinstance(fleet.get("charter"), bool):
+            charters.add(fleet["charter"])
     charters |= {n for n, i in items.items() if any(str(l).endswith(":orchestrator") for l in i["labels"])}
     asks = {n for n, i in items.items() if i["parent"] in charters}
     below, unresolved = triage_charter_descendants(items, charters)
@@ -15248,7 +15402,7 @@ def plan_wake_consensus(engine):
     return {e.get("plan_hash") for e in entries if e.get("kind") == "consensus" and e.get("result") == "pass" and isinstance(e.get("plan_hash"), str)}
 
 
-def plan_wake_route(number, items, ctx, discovery, chiefs):
+def plan_wake_route(number, items, ctx, discovery, chiefs, owners=None):
     """(recipient names, "ask" or "work item") for the plan of issue `number`, from the held parent links alone (never from the plan's text):
     a sub-issue of a charter is an ask (the Chief of Staff); a sub-issue of such an ask is a work item (its charter's orchestrator). None otherwise."""
     parent = (items.get(number) or {}).get("parent")
@@ -15257,7 +15411,7 @@ def plan_wake_route(number, items, ctx, discovery, chiefs):
     if parent in ctx["asks"]:
         charter = (items.get(parent) or {}).get("parent")
         names = sorted(n for n, o in (discovery.agents.items() if discovery else [])
-                       if (o.fleet or {}).get("role") == "orchestrator" and (o.fleet or {}).get("charter") == charter)
+                       if (o.fleet or {}).get("role") == "orchestrator" and (owners or {}).get(n) == charter)   # #969: the registry's charter (`owners`), never the session metadata
         return names, "work item"
     return None
 
@@ -15291,7 +15445,7 @@ def plan_wake_pass(engine, state, repos, now, budget=None):
         for number, plan in sorted(module.latest_plans(comments_unit["data"], check_module.HEADING_RE, _url_number).items()):
             if number not in items:
                 continue
-            route = plan_wake_route(number, items, ctx, discovery, chiefs)
+            route = plan_wake_route(number, items, ctx, discovery, chiefs, registry_owners(engine))
             if route is None:
                 continue
             posted = parse_iso(plan.get("updated_at") or plan.get("created_at"))
@@ -16619,26 +16773,21 @@ def _is_orchestrator(observation):
     return (observation.fleet or {}).get("role") == "orchestrator"
 
 
-def pick_owner(agents, numbers, repo=None, default_repo=None):
+def pick_owner(agents, numbers, repo=None, default_repo=None, view=None):
     """The fleet agent that owns the first of `numbers`, or None. One recipient per item.
 
-    An agent owns the issues in its metadata.fleet `issue` and `charter`. An
+    An orchestrator owns its charter (the registry row's, `view`; #969), any other agent its metadata.fleet `issue` and `charter`. An
     orchestrator beats any other role; then the nearest issue in `numbers`
     wins, then the name.
     """
     best = None
+    view = view or {}
     for name in sorted(agents):
         fleet = agents[name].fleet or {}
         theirs = fleet.get("repo") if isinstance(fleet.get("repo"), str) else default_repo  # PR 15: with several repos
         if repo and theirs and theirs != repo:                                               # an agent has one
             continue
-        owned = set()
-        for field in ("issue", "charter"):
-            value = fleet.get(field)
-            if isinstance(value, int) and not isinstance(value, bool):
-                owned.add(value)
-            elif isinstance(value, str) and value.strip().lstrip("#").isdigit():
-                owned.add(int(value.strip().lstrip("#")))
+        owned = owned_numbers(name, fleet, view)
         ranks = [numbers.index(n) for n in owned if n in numbers]
         if ranks:
             rank = (0 if fleet.get("role") == "orchestrator" else 1, min(ranks))
@@ -17333,7 +17482,7 @@ class GitHubHub:
         done = set()
         while True:
             owner = pick_owner(agents, known, repo,
-                               self.config.get("intent_repo") if len(self.watches) > 1 else None)
+                               self.config.get("intent_repo") if len(self.watches) > 1 else None, view=registry_charter_view(self))
             if owner and _is_orchestrator(agents[owner]):
                 return owner
             if not pending:
@@ -18152,6 +18301,8 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["sweep"] = sweep_summary(state)  # #117
         report["triage"] = triage_summary(state)  # #130
         report["ci_record"] = ci_record_status_line(state, now())
+        if config_ok:
+            reconcile_agents_on_read(state, herdr)   # the view checks right now and removes a dead agent through the registry (#919)
         report["pane_lines"] = pane_health_status_lines(state, now()) + headless_route_status_lines(state)
         report["catching_up"] = catching_up_lines(state, now())
         report["v2_link"] = v2_link_status_line(state, now())
@@ -20313,18 +20464,19 @@ def asks_of_caller(engine, fleet, now):
 
     The rule: an ask is an open sub-issue of an orchestrator's charter. A
     Chief of Staff sees the asks under every orchestrator's charter, found
-    from fleet metadata (`role` orchestrator, `charter` an issue number); an
+    from the registry (`role` orchestrator, `charter` an issue number, #969); an
     orchestrator sees the asks under its own charter; any other role sees the
     ask of the issue it works on.
     """
     reader = engine.intents
     repo = fleet.get("repo") or reader.repo
+    owners = registry_owners(engine)   # #969: an orchestrator's charter is the registry row's, never the launch metadata (which a `charter set` correction cannot reach)
     if fleet.get("role") == "chief-of-staff":
-        charters = [(agent.name, (agent.fleet or {}).get("charter"), _fleet_repo(agent.fleet, engine.config) or repo)
+        charters = [(agent.name, owners.get(agent.name), _fleet_repo(agent.fleet, engine.config) or repo)
                     for agent in sorted(engine.discover(now).agents.values(), key=lambda a: a.name)
                     if (agent.fleet or {}).get("role") == "orchestrator"]
     elif fleet.get("role") == "orchestrator":
-        charters = [(fleet["name"], fleet.get("charter"), repo)]
+        charters = [(fleet["name"], owners.get(fleet["name"]), repo)]
     else:
         issue = fleet.get("issue")
         if not _is_issue_number(issue):
@@ -22132,8 +22284,7 @@ def register_item_tester(engine, state, args, repo, launched_by, done, now):
                 why = "%s is not open" % item
             else:
                 chain = item_chain(engine, repo, int(args.issue), issue["parent"])
-                charter = boss.get("charter")
-                charter = int(charter) if isinstance(charter, (int, str)) and not isinstance(charter, bool) and str(charter).isdigit() else None
+                charter = charter_or_first_seen(engine, launched_by, boss)   # #969: the launching orchestrator's charter is the registry's (its launch value only while it has no row)
                 if not iv.lane_ok(chain, charter):
                     why = "%s is not in the lane of %s: its parent chain %s does not reach the orchestrator's charter" % (item, launched_by, chain)
         pin = None
@@ -23256,6 +23407,102 @@ def cmd_gates_check(args, runner, now):
 cmd_gates_check.ledger = True   # state and GETs only; its own errors are usage errors
 
 
+# ---- #962: the fleet's own merge queue. `merge-gate` reads (and writes nothing); `--pass` runs the gate and takes the lock; `--check` is what the gh shim
+# asks before `gh pr merge`; `--release` frees the lock. The rules are in bin/merge_gate.py, the shared pull-request reading in bin/pr_reading.py.
+MERGE_GATE_SLEEP = time.sleep   # the wait between two reads of a re-run; a test replaces it
+
+
+def add_merge_gate_parsers(sub):
+    gate = sub.add_parser("merge-gate", help="The fleet's merge queue: may this pull request merge now? Read-only by default; `--pass` runs the gate and takes the "
+                                             "per-branch lock, `--release` frees it. The gh shim enforces it for a gated branch (the `merge_gate` configuration key)",
+                          description="Prints ONE block: the branch tip now, the branch tip the pull request's last CI run was computed on, equal or not, the run's "
+                                      "result at the current head, the latest completed run on the branch and whether a merge is allowed now and why. It writes "
+                                      "nothing. `--pass` re-runs that pull request's CI on the current merge ref when the branch moved (a close and reopen: head and "
+                                      "labels untouched; a held pull request only with `--rerun-held`), waits up to `merge_gate.wait_minutes` (default 45), and on "
+                                      "green records the pass and takes the lock of the repository and branch. `--check` (the shim) exits 0 to allow and 10 to refuse.")
+    gate.add_argument("pr", help="The pull request: owner/repo#N or its URL")
+    mode = gate.add_mutually_exclusive_group()
+    mode.add_argument("--pass", dest="gate_pass", action="store_true", help="Run the gate, re-run CI if the branch moved, take the lock and record the pass")
+    mode.add_argument("--check", action="store_true", help="What the gh shim asks: exit 0 allow, 10 refuse (one line on stderr)")
+    mode.add_argument("--release", action="store_true", help="Release the lock you hold on the pull request's branch")
+    gate.add_argument("--rerun-held", action="store_true", help="With --pass: close and reopen a HELD pull request to recompute its merge ref (its orchestrator agrees first)")
+    gate.add_argument("--json", action="store_true")
+
+
+def merge_gate_gh(config, runner, repo):
+    """`gh(argv) -> (code, stdout, stderr)` for `repo`'s account, never raising; every call names itself the switchboard's own, so the shim does not probe it."""
+    accounts = GhAccounts(config, runner, time.time)
+    try:
+        refuse_excluded(config, repo)
+        env = accounts.env_for(repo)
+    except AccountError as err:
+        raise LedgerCommandError(str(err)) from None
+    env = dict(env if env is not None else os.environ, **{OWN_GH_ENV: "1"})
+
+    def gh(argv):
+        try:
+            done = runner([config["gh"]] + argv, capture_output=True, text=True, timeout=config["call_timeout_seconds"], stdin=subprocess.DEVNULL, env=env)
+        except (OSError, subprocess.SubprocessError) as err:
+            return 1, "", accounts.scrub(_one_line(str(err), 120))
+        return done.returncode, done.stdout or "", accounts.scrub(done.stderr or "")
+    return gh
+
+
+def cmd_merge_gate(args, runner, now):
+    gate, reading = load_module("merge_gate"), load_module("pr_reading")
+    try:
+        repo, number = parse_pr_ref(args.pr)
+    except NoticeError as err:
+        raise LedgerCommandError(str(err)) from None
+    ref = "%s#%d" % (repo, number)
+    config = load_runnable_config()
+    conf = gate.settings(config)
+    gh = merge_gate_gh(config, runner, repo)
+    state = state_dir_path()
+    if not (args.gate_pass or args.check or args.release):
+        facts = gate.read_facts(reading, gh, repo, number, conf)
+        allowed, reason, _ = gate.decide(facts)
+        print(gate.block(facts, allowed, reason))
+        if args.json:
+            print(json.dumps({"allowed": allowed, "reason": reason, "tip": facts["tip"], "run_base": facts["run_base"], "head": facts["head"]}, sort_keys=True))
+        return EXIT_OK if allowed else EXIT_ERROR
+    engine, state, _ = build_engine(runner, now, "cli", writable=True)
+    kind = gates_caller_kind(runner, now)
+    if kind[0] == "unknown":
+        _gates_audit(engine, "merge_gate.refused", ref, {"why": "identity unknown"})
+        raise LedgerCommandError("refused: %s" % kind[1])
+    who = "owner-terminal" if kind[0] == "person" else kind[1]
+    if args.release:
+        facts = gate.read_facts(reading, gh, repo, number, conf)
+        if facts["problems"]:
+            raise LedgerCommandError("unreadable: %s" % facts["problems"][0])
+        done = gate.release(state, repo, facts["branch"], who)
+        _gates_audit(engine, "merge_gate.release", ref, {"by": who, "released": done})
+        print("released the merge lock on %s %s" % (repo, facts["branch"]) if done else "%s holds no merge lock on %s %s: nothing released" % (who, repo, facts["branch"]))
+        return EXIT_OK
+    if args.gate_pass:
+        ok, lines = gate.gate_pass(reading, gh, conf, state, repo, number, who, os.getppid() if kind[0] == "person" else None, now,   # an agent's shell exits before its merge: only a person's own terminal has a process to watch
+                                     MERGE_GATE_SLEEP, allow_held=args.rerun_held)
+        for line in lines:
+            print(line)
+        _gates_audit(engine, "merge_gate.pass" if ok else "merge_gate.blocked", ref, {"by": who, "result": _one_line(lines[-1] if lines else "", 300)})
+        return EXIT_OK if ok else EXIT_ERROR
+
+    def waived(head):
+        entries, problem = plan_ledger.read_ledger(state)
+        return not problem and gate.WAIVER_GATE in plan_ledger.valid_waivers(entries, ref, head, now())
+    allowed, why, head = gate.check_merge(reading, gh, conf, state, repo, number, who, kind[0] == "person", waived, now)
+    _gates_audit(engine, "merge_gate.allowed" if allowed else "merge_gate.refused", ref, {"by": who, "why": _one_line(why, 300)})
+    if args.json:
+        print(json.dumps({"allowed": allowed, "reason": why, "head": head, "locked": why.startswith(gate.GATE_PASSED)}, sort_keys=True))
+    elif not allowed:
+        sys.stderr.write("%s\n" % why)
+    return EXIT_OK if allowed else plan_ledger.EXIT_REFUSE
+
+
+cmd_merge_gate.ledger = True   # state and GETs only; its own errors are usage errors
+
+
 ANCESTOR_DEPTH = 25
 AGENT_PROCESS_NAMES = ("opencode", "fleet-opencode", "copilot")
 
@@ -23979,7 +24226,7 @@ def add_ledger_parsers(sub):
                                        "by a writer of the PR. A ledger entry and an audit line; it lasts 24 hours (the retroactive "
                                        "plan is due then) and a push needs a new one. `gates` shows the gate as waived, not passed.")
     waive.add_argument("pr", help="The pull request: owner/repo#N or its URL")
-    waive.add_argument("--gates", required=True, help="Comma-separated gates: G0a,G0b,G0c,G1,G2/G3,G4,G5")
+    waive.add_argument("--gates", required=True, help="Comma-separated gates: G0a,G0b,G0c,G1,G2/G3,G4,G5, or MG (the merge gate, #962)")
     waive.add_argument("--reason", required=True, help="Why (at least %d characters)" % plan_ledger.WAIVER_REASON_MIN)
     waive.add_argument("--head", help="The PR head sha (default: read from GitHub)")
     gates = sub.add_parser("gates", help="Read-only: the plan's gates G0a to G8 for a PR, what each needs and who decides it. "
@@ -26133,8 +26380,57 @@ def agents_problems(found, expected=None, root=None, unchecked=None):
     return problems
 
 
+def charters_report(sb_engine, registry_module, now):
+    """#969: per orchestrator, where its charter is recorded: the registry row's `charter`, and the live session metadata's `charter` and `issue` with the session's start time. Read-only.
+    `metadata_names_other_charter` lists the numbers its session metadata (`charter` or `issue`) names that the registry gives to ANOTHER orchestrator: before #969 the lane lookup counted such an orchestrator as a second owner; now the metadata is ignored and this line is the defect report.
+    Returns ([{"name", "session", "started", "repo", "registry_charter", "meta_charter", "meta_issue", "metadata_names_other_charter": [{"charter", "field", "owner"}]}], the registry's problem line or None)."""
+    discovery = sb_engine.discover(now)
+    reg = registry_module.read(sb_engine.state_dir)
+    rows = []
+    for name, obs in sorted(discovery.agents.items()):
+        fleet = obs.fleet or {}
+        if fleet.get("role") != "orchestrator":
+            continue
+        row = reg["agents"].get(name) if reg["whole"] else None
+        rows.append({"name": name, "session": obs.session_id, "started": iso(obs.created) if obs.created else None, "repo": fleet.get("repo"),
+                     "registry_charter": row.get("charter") if isinstance(row, dict) else None,
+                     "meta_charter": fleet.get("charter"), "meta_issue": fleet.get("issue"), "metadata_names_other_charter": []})
+    for row in rows:
+        for field in ("charter", "issue"):
+            value = row["meta_" + field]
+            for other in rows:
+                if other is not row and isinstance(value, int) and not isinstance(value, bool) and value == other["registry_charter"] and other["repo"] == row["repo"]:
+                    row["metadata_names_other_charter"].append({"charter": value, "field": field, "owner": other["name"]})
+    return rows, (None if reg["whole"] else reg["problem"] or "registry not read")
+
+
+def cmd_agents_charters(args, runner, now):
+    """`agents charters [--json]`: read-only. For every live orchestrator: its registry charter, and the live session metadata's `charter` and `issue` with the session's start time, so a charter number
+    recorded for the wrong orchestrator is seen with the record that carries it (#969)."""
+    engine, _, _ = build_engine(runner, now, "cli", writable=False)
+    registry = load_module("registry")
+    rows, problem = charters_report(engine, registry, now())
+    reg = registry.read(engine.state_dir)
+    duplicates = registry.duplicate_charters(reg["agents"]) if reg["whole"] else {}
+    if args.json:
+        print(json.dumps({"orchestrators": rows, "registry_problem": problem, "duplicates": [{"repo": r, "charter": n, "names": names} for (r, n), names in sorted(duplicates.items(), key=lambda kv: (str(kv[0][0]), kv[0][1]))]}, sort_keys=True))
+        return EXIT_OK
+    if problem:
+        print("registry: %s" % problem)
+    for r in rows:
+        print("%s (session %s, started %s, repo %s): registry charter %s; session metadata charter %s, issue %s" % (
+            r["name"], r["session"], r["started"] or "unknown", r["repo"], r["registry_charter"], r["meta_charter"], r["meta_issue"]))
+        for claim in r["metadata_names_other_charter"]:
+            print("  session metadata disagrees with the registry: its `%s` is %s, a charter the registry gives to %s (the lane lookup ignores the session metadata)" % (claim["field"], claim["charter"], claim["owner"]))
+    for (crepo, number), names in sorted(duplicates.items(), key=lambda kv: (str(kv[0][0]), kv[0][1])):
+        print("charter #%s of %s is recorded by %d orchestrators in the registry: %s" % (number, crepo, len(names), ", ".join(names)))
+    return EXIT_OK
+
+
 def cmd_agents(args, runner, now):
     """`agents verify`: read-only; exit 0 when every agent of ours is registered as written or the service is not running, 1 otherwise."""
+    if args.agents_action == "charters":
+        return cmd_agents_charters(args, runner, now)
     state, payload = agents_found(runner, args.opencode, args.timeout)
     if state == "down":
         print("agents: the OpenCode service is not running or not reachable, so nothing was checked (%s). Start it, then run this again." % payload)
@@ -26167,6 +26463,8 @@ def add_agents_parsers(sub):
                                    description="Reads `opencode api GET /api/agent` and fails (exit 1) when an agent of the kit is missing, has the wrong mode or "
                                                "lacks a rule its definition declares. A service that is not running is reported, not failed. Run it after installing the agents and "
                                                "restarting the service.")
+    charters = agents_sub.add_parser("charters", help="Read-only: per live orchestrator, its registry charter and its live session metadata's charter and issue (where a charter number is recorded)")
+    charters.add_argument("--json", action="store_true")
     verify.add_argument("--strict", action="store_true", help="Exit 1 when the service cannot be asked (default: say so and exit 0)")
     verify.add_argument("--installed-dir", default=None, help="The folder of installed agent files to compare bodies with (default: the private profile's agents folder)")
     verify.add_argument("--opencode", default="opencode", help="The opencode executable (default: opencode on PATH)")
@@ -29273,7 +29571,7 @@ def load_tick(engine, discovery):
             continue   # on the retired list (the same name and session rule as coder_finished): no load figures and no health row
         coders = [o for o in discovery.agents.values() if boss_name(discovery, o) == name and (o.fleet or {}).get("role") == "coder"
                   and not coder_finished(o, retired, last_reports)]   # a retired coder, or one that made its final report, is on the books but not a coder of this workspace
-        orchestrators[name] = {"charter": fleet.get("charter") if _is_issue_number(fleet.get("charter")) else None,   # a fallback: the charter is found by the yaml that names the agent
+        orchestrators[name] = {"charter": charter_or_first_seen(engine, name, fleet),   # a fallback: the charter is found by the yaml that names the agent; the registry's, never the launch metadata (#969)
                                "repo": _fleet_repo(fleet, engine.config) or (engine.intents.repo if engine.intents is not None else None),
                                "busy": sum(1 for c in coders if c.status == "working"), "idle": sum(1 for c in coders if c.status == "idle"),
                                "workers": [o.name for o in coders if getattr(o, "name", None)],
@@ -29463,6 +29761,56 @@ def add_reassign_parsers(sub):
     reassign.add_argument("--consent-from", dest="consent", help="The worker's CURRENT boss, whose consent is recorded with this command")
     reassign.add_argument("--undo", action="store_true", help="Remove the override: the worker reports to the boss it was launched with again")
     reassign.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
+
+
+def charter_set_refusal(caller, role):
+    """The refusal text, or None: only the Chief of Staff or the operator (a plain shell: `caller` None) writes a charter; an agent never writes its own or another's (#969)."""
+    if caller is None or role == "chief-of-staff":
+        return None
+    return "only the chief-of-staff or the operator sets a charter; %s is %s" % (caller, "a %s" % role if role and role != "unidentified" else "not identified as either")
+
+
+def cmd_charter(args, runner, now):
+    """`charter set <orchestrator> <issue number | none>`: write the orchestrator's registry `charter`, the one record of it (#969). Audited with who, the old and the new value. The live session's metadata
+    (written once at launch, never correctable) is not touched and is never read as a second owner."""
+    engine, _, _ = build_engine(runner, now, "cli")
+    caller, role = move_caller(engine, args, runner, now)
+    audit = lambda event, **detail: engine.audit.append(engine.actor, event, "agent:%s" % args.name, dict(detail, caller=caller or "operator", orchestrator=args.name))
+    refusal = charter_set_refusal(caller, role)
+    if refusal:
+        audit("charter.refused", why="caller", role=role)
+        sys.stderr.write("%s: charter: %s; nothing was changed\n" % (PROG, refusal))
+        return EXIT_ERROR
+    raw = (args.charter or "").strip().lower().lstrip("#")
+    value = None if raw == "none" else (int(raw) if raw.isdigit() and int(raw) > 0 else False)
+    if value is False:
+        audit("charter.refused", why="value", given=_one_line(args.charter or "", 40))
+        sys.stderr.write("%s: charter: give an issue number or `none`; nothing was changed\n" % PROG)
+        return EXIT_USAGE
+    registry = load_module("registry")
+    before = registry.read(engine.state_dir)["agents"].get(args.name)
+    got = registry.set_charter(engine.state_dir, args.name, value, caller or "operator", now=now())
+    if got["problem"]:
+        audit("charter.refused", why=_one_line(got["problem"], 120))
+        sys.stderr.write("%s: charter: %s; nothing was changed\n" % (PROG, got["problem"]))
+        return EXIT_USAGE
+    audit("charter.set", old=(before or {}).get("charter"), new=value, changed=got["changed"])
+    print("charter of %s: %s -> %s%s" % (args.name, (before or {}).get("charter"), value, "" if got["changed"] else " (unchanged)"))
+    return EXIT_OK
+
+
+cmd_charter.ensure_on_use = True
+
+
+def add_charter_parsers(sub):
+    charter = sub.add_parser("charter", help="Set an orchestrator's recorded charter (the Chief of Staff or the operator; audited)")
+    charter_sub = charter.add_subparsers(dest="charter_action", required=True)
+    setter = charter_sub.add_parser("set", help="Write the registry's charter of an orchestrator: an issue number, or none",
+                                    description="The registry row's `charter` is the one record of which charter an orchestrator owns; the lane lookup reads it. The live session's metadata is written once at launch and "
+                                                "cannot be corrected, so it is never read as a second owner. Run by the Chief of Staff or the operator; one audit line with the old and the new value.")
+    setter.add_argument("name", help="The orchestrator's fleet name")
+    setter.add_argument("charter", help="An issue number, or `none`")
+    setter.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
 
 
 def cmd_reassign(args, runner, now):

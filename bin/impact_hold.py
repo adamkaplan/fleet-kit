@@ -514,6 +514,11 @@ def _lane_of_issue(engine, repo, issue, orchestrators):
     except IntentError:
         pass   # the chain so far is all that can be told
     default_repo = engine.config.get("intent_repo") if len(getattr(engine, "watches", ()) or ()) > 1 else None
+    registry = load_module("registry")   # #969: an orchestrator's charter is the registry row's `charter`, the ONE record; the live session's metadata (written once at launch, never corrected) is never a second owner
+    reg = registry.read(engine.state_dir) if engine.state_dir is not None else None
+    if reg is None or not reg["whole"]:
+        return None   # an unreadable registry gives no lane: never a guess
+    charters = registry.orchestrator_charters(reg["agents"])
     for number in chain:
         owners = []
         for name, agent in sorted(orchestrators.items()):
@@ -521,14 +526,7 @@ def _lane_of_issue(engine, repo, issue, orchestrators):
             theirs = fleet.get("repo") if isinstance(fleet.get("repo"), str) else default_repo
             if repo and theirs and theirs != repo:
                 continue
-            owned = set()
-            for field in ("issue", "charter"):
-                value = fleet.get(field)
-                if isinstance(value, int) and not isinstance(value, bool):
-                    owned.add(value)
-                elif isinstance(value, str) and value.strip().lstrip("#").isdigit():
-                    owned.add(int(value.strip().lstrip("#")))
-            if number in owned:
+            if charters.get(name) == number:
                 owners.append(name)
         if len(owners) == 1:
             return ("one", owners[0])
