@@ -31367,6 +31367,9 @@ class Installer:
         self.out.write("only the cloud reaper's own service %s: the config, the profile pieces, the command link, "
                        "the plugin link, the switchboard's own service and the daemon were left alone\n"
                        % ("would be installed" if self.dry else "was installed"))
+        self.out.write("the reaper logs into the cluster by itself, from the settings the service carries (a token file "
+                       "by path, or a context) and from the settings file it reads at every start; without a login it "
+                       "writes `cluster login failed: ...` and the service restarts it every 30 seconds\n")
 
     # -- the reverse of 3 to 5
     def uninstall(self, with_service=True, with_link=True):
