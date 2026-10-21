@@ -65,10 +65,12 @@ class Base(unittest.TestCase):
         (self.bin / "gh").write_text(FAKE_GH)
         (self.bin / "gh").chmod(0o755)
         self.sb = self.home / "fakesb"
-        self.sb.write_text("#!/bin/sh\nif [ \"$1\" = whoami ]; then\n  if [ \"$2\" = --json ]; then echo \"{\\\"name\\\": \\\"$(cat NAMEFILE)\\\", \\\"repo\\\": \\\"acme/app\\\"}\"; "
+        self.sb.write_text("#!/bin/sh\nif [ \"$1\" = whoami ]; then\n  sleep $(cat SLEEPFILE 2>/dev/null || echo 0)\n  if [ \"$2\" = --json ]; then echo \"{\\\"name\\\": \\\"$(cat NAMEFILE)\\\", \\\"repo\\\": \\\"acme/app\\\"}\"; "
                            "else echo $(cat NAMEFILE); fi; exit 0; fi\nexit 2\n")
         self.namefile = self.home / "fakename"   # the shim hands the switchboard a fixed environment, so the fake's name comes from a file, not a variable
         self.sb.write_text(self.sb.read_text().replace("NAMEFILE", str(self.namefile)))
+        self.sleepfile = self.home / "fakesleep"
+        self.sb.write_text(self.sb.read_text().replace("SLEEPFILE", str(self.sleepfile)))
         self.sb.chmod(0o755)
         self.state = self.home / "state"
         self.state.mkdir()
@@ -87,6 +89,7 @@ class Base(unittest.TestCase):
                    "FLEET_REAL_GH": str(self.bin / "gh")}
         environ.update(env or {})
         self.namefile.write_text(environ.get("FAKE_NAME", "worker"))
+        self.sleepfile.write_text(environ.get("FAKE_WHOAMI_SLEEP", "0"))
         if self.calls.exists():
             self.calls.unlink()
         done = subprocess.run([sys.executable, str(shim), *args], capture_output=True, text=True, env=environ, timeout=60)
@@ -158,6 +161,12 @@ class TestRefusals(Base):
         self.refused("api", "-X", "PUT", "repos/%s/issues/7/labels" % CFG_REPO, "-f", "labels[]=bug")
         self.refused("api", "-X", "PATCH", "repos/%s/issues/7" % CFG_REPO, "-f", "labels[]=bug")
         self.passed("api", "-X", "PATCH", "repos/%s/issues/7" % CFG_REPO, "-f", "labels[]=bug", labels="bug")   # an unlabelled pull request: nothing held
+
+    def test_s4b_a_slow_identity_lookup_refuses_the_removal_and_the_merge(self):
+        slow = {"FAKE_NAME": "coordinator", "FAKE_WHOAMI_SLEEP": "5", "FLEET_SHIM_LOOKUP_SECONDS": "0.5"}   # a loaded machine: the lookup misses its deadline
+        self.refused("pr", "edit", "7", "--remove-label", LABEL, "-R", CFG_REPO, env=slow)
+        self.refused("label", "delete", LABEL, "--yes", "-R", CFG_REPO, env=slow)
+        self.refused("pr", "merge", "7", "-R", CFG_REPO, env=slow)
 
     def test_s5_a_failed_read_refuses_with_the_retry_message(self):
         for env in ({"FAKE_READ_FAIL": "1"}, {"FAKE_READ_RAW": "not json"}, {"FAKE_READ_RAW": "{}"}, {"FAKE_READ_RAW": "[]"},
