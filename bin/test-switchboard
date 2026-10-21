@@ -9263,6 +9263,34 @@ PD_SITES = (
     (23, "reds.py", "put", True, 0),
 )
 
+# The arguments every converted site passes the helper, derived from the code and pinned here: (id, file, function, ordinal, the arguments).
+# The arguments are the EFFECTIVE ones: what the helper does, not how the call spells it (a private site says nothing and gets the private default).
+PD_SITE_ARGS = (
+    (1, "fleet-switchboard", "ensure_state_dir", 0, {"private": True, "parents": True, "check": True}),
+    (2, "fleet-switchboard", "_write_private", 0, {"private": True, "parents": True, "check": False}),
+    (3, "fleet-switchboard", "agent_tmp_env", 0, {"private": True, "parents": True, "check": False}),
+    (4, "fleet-switchboard", "log_path", 0, {"private": True, "parents": False, "check": False}),
+    (5, "fleet-switchboard", "remember", 0, {"private": True, "parents": True, "check": False}),
+    (6, "fleet-switchboard", "_write_gates_config", 0, {"private": False, "parents": True, "check": True}),
+    (7, "fleet-switchboard", "cmd_preflight_pr", 0, {"private": False, "parents": True, "check": True}),
+    (8, "fleet-switchboard", "job_ensure_root", 0, {"private": True, "parents": True, "check": False}),
+    (9, "fleet-switchboard", "cmd_job", 0, {"private": True, "parents": True, "check": False}),
+    (10, "fleet-switchboard", "write_if_changed", 0, {"private": False, "parents": True, "check": True}),
+    (11, "fleet-switchboard", "_replace_skill_file", 0, {"private": False, "parents": True, "check": True}),
+    (12, "fleet-switchboard", "install_todolist_plugin", 0, {"private": False, "parents": True, "check": True}),
+    (13, "fleet-switchboard", "install_todolist_plugin", 1, {"private": False, "parents": True, "check": True}),
+    (14, "fleet-switchboard", "ensure_home_link", 0, {"private": False, "parents": True, "check": True}),
+    (15, "fleet-switchboard", "step_config", 0, {"private": False, "parents": True, "check": True}),
+    (16, "fleet-switchboard", "step_profile", 0, {"private": False, "parents": True, "check": True}),
+    (17, "fleet-switchboard", "step_cli_link", 0, {"private": False, "parents": True, "check": True}),
+    (18, "fleet-switchboard", "install_cos_orders_template", 0, {"private": False, "parents": True, "check": True}),
+    (19, "agent_presence.py", "record_dir", 0, {"private": True, "parents": True, "check": False}),
+    (20, "cloud_worker.py", "cloud_dir", 0, {"private": True, "parents": True, "check": False}),
+    (21, "cloud_worker.py", "private_root", 0, {"private": True, "parents": False, "check": False}),
+    (22, "heavy_slots.py", "wrap_argv", 0, {"private": True, "parents": True, "check": False}),
+    (23, "reds.py", "put", 0, {"private": True, "parents": True, "check": False}),
+)
+
 
 class TestPrivateDir(Base):
     """One helper (bin/private_dir.py) makes every directory: atomic against another process, a symlink to nothing refused, owner and mode checked (#708)."""
@@ -9492,6 +9520,39 @@ class TestPrivateDir(Base):
         os.chmod(str(loose), 0o755)
         self.refused(m, "loose", loose)
 
+    def branch_each_group_and_world_bit_is_refused(self, m):
+        for mode in (0o770, 0o750, 0o707):   # the group write, the group read, the world write: each one alone is refused
+            loose = self.real(self.base / ("bit%o" % mode))
+            os.chmod(str(loose), mode)
+            self.refused(m, "loose", loose)
+        private = self.real(self.base / "bit700")
+        os.chmod(str(private), 0o700)
+        self.assertEqual(m.ensure_dir(private), private, "0700 is private: it is not refused")
+
+    def branch_a_made_directory_is_never_loose(self, m):
+        made = m.ensure_dir(self.base / "made")
+        self.assertEqual(stat.S_IMODE(made.stat().st_mode), 0o700, "a directory the helper makes is private")
+
+    def branch_the_parent_made_by_another_process(self, m):
+        parent, path = self.base / "otherparent", self.base / "otherparent" / "d"
+        real, seen = os.mkdir, []
+
+        def other(target, *a):   # the other process makes the parent at the very moment of the mkdir
+            real(target, *a)
+            if not seen:
+                seen.append(target)
+                raise FileExistsError(errno.EEXIST, "File exists", target)
+        with mock.patch.object(m.os, "mkdir", other):
+            made = m.ensure_dir(path)
+        self.assertTrue(made.is_dir())
+        self.assertTrue(seen, "the parent was not made at the moment of the mkdir")
+
+    def branch_the_second_directory_check_is_not_skipped(self, m):
+        plain = self.base / "plainsecond"
+        plain.write_text("")
+        os.chmod(str(plain), 0o600)
+        self.refused(m, "not-directory", plain, private=False)
+
     def branch_another_owner(self, m):
         other = os.getuid() + 1
         with mock.patch.object(m.os, "getuid", lambda: other):
@@ -9528,6 +9589,10 @@ class TestPrivateDir(Base):
         ("branch_a_plain_directory_is_never_mode_checked", ("if private and check:", "if check:", 0)),
         ("branch_check_false_leaves_the_rule_to_the_caller", ("if private and check:", "if private:", 0)),
         ("branch_no_parents_when_not_asked", ("if parents and not path.parent.exists():", "if not path.parent.exists():", 0)),
+        ("branch_each_group_and_world_bit_is_refused", ("info.st_mode & 0o077", "0", 0)),
+        ("branch_a_made_directory_is_never_loose", ("os.chmod(str(path), 0o700)", "os.chmod(str(path), 0o755)", 0)),
+        ("branch_the_parent_made_by_another_process", ("path.parent.mkdir(parents=True, exist_ok=True)", "path.parent.mkdir(parents=True)", 0)),
+        ("branch_the_second_directory_check_is_not_skipped", ("elif not os.path.isdir(str(path)):", "elif os.path.islink(str(path)) and not os.path.isdir(str(path)):", 0)),
     )
 
     def test_every_refusal_of_the_helper_has_a_test_and_a_mutant_that_it_kills(self):
@@ -9786,6 +9851,43 @@ class TestPrivateDir(Base):
                 self.assertEqual(len(str(caught.exception).splitlines()), 1)
                 self.assertIn(str(path if where == "file" else target), str(caught.exception))
                 self.assertFalse(os.path.lexists(str(self.gone)))
+
+    # --- the arguments every converted site gives the helper (the table is derived from the code, so a new site fails the completeness test)
+    def converted_sites(self):
+        """[(file, function, ordinal)] for every helper call in the daemon and the modules it loads, derived from the code."""
+        found = []
+        for path in _pd_files(BIN):
+            counts = {}
+            for function, node in _pd_calls(ast.parse(path.read_text()), path.name):
+                ordinal = counts.get(function, 0)
+                counts[function] = ordinal + 1
+                found.append((path.name, function, ordinal))
+        return sorted(found)
+
+    def test_the_argument_table_covers_every_converted_site_and_no_other(self):
+        self.assertEqual(self.converted_sites(), sorted((f, fn, o) for _, f, fn, o, _ in PD_SITE_ARGS),
+                         "a converted site has no row of arguments (or a row names no site): derive the list and add the row")
+
+    def test_every_converted_site_calls_the_helper_with_its_intended_arguments(self):
+        for number, file, function, ordinal, expected in PD_SITE_ARGS:
+            with self.subTest(site=number, function=function):
+                shutil.rmtree(str(self.base), ignore_errors=True)
+                self.base.mkdir()
+                calls, real = [], self.helper.ensure_dir
+
+                def spy(path, **kwargs):
+                    calls.append((path, kwargs))
+                    return real(path, **kwargs)
+                with mock.patch.object(self.helper, "ensure_dir", spy):
+                    try:
+                        self.drivers(self.real)[number]()
+                    except (sb.ConfigError, sb.LaunchError, sb.InstallError, OSError, ValueError):
+                        pass   # what the site refuses is not what this test is about; the CALL is
+                self.assertTrue(calls, "the site did not call the helper")
+                for path, kwargs in calls:
+                    self.assertTrue(str(path).startswith(str(self.home)), "the site made a directory outside the test's own area: %s" % path)
+                    effective = {"private": kwargs.get("private", True), "parents": kwargs.get("parents", True), "check": kwargs.get("check", True)}
+                    self.assertEqual(effective, expected, "the site calls the helper with other arguments")
 
     def test_private_rows_keep_their_pinned_refusals_and_the_other_rows_never_get_a_mode_check(self):
         loose = self.real(self.base / "loose")
