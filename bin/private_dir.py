@@ -36,7 +36,7 @@ def ensure_dir(path, *, private=True, parents=True, check=True):
     a symlink that resolves to a directory is accepted. With `private` the directory the call makes gets mode 0700 whatever the umask, and
     (unless `check` is False, for a caller that checks and repairs by its own rule) an existing one must be a directory owned by the user with no
     group or world bits, or `PrivateDirError` (kind `not-directory` or `loose`) says so. Without `private` the mode is the user's (install and
-    config directories) and nothing about owner or mode is checked. Only the directory the call itself makes is forced to 0700; parents it has to make follow the umask. Any other OSError (no space, a file in the way of a parent) is raised as it is. It is not a defence against a hostile process of the same user swapping a link mid-call.
+    config directories) and nothing about owner or mode is checked. Only the directory the call itself makes is forced to 0700; parents it has to make follow the umask. A link swapped in between the mkdir and the mode being set is refused (the mode is set on a descriptor opened without following a link), so the link's target is never changed. Any other OSError (no space, a file in the way of a parent) is raised as it is.
     """
     path = Path(path)
     gone = _dangling(path)
@@ -51,7 +51,13 @@ def ensure_dir(path, *, private=True, parents=True, check=True):
     except FileExistsError:
         pass   # another process made it (or it was there): checked below like any existing one
     if created and private:
-        os.chmod(str(path), 0o700)   # mkdir's mode is filtered by the umask; only the process that made it sets it
+        # mkdir's mode is filtered by the umask; only the process that made it sets it. Through an fd opened with O_NOFOLLOW, so a link swapped in
+        # since the mkdir is refused (ELOOP) and never chmodded at its target.
+        fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fchmod(fd, 0o700)
+        finally:
+            os.close(fd)
     gone = _dangling(path)
     if gone is not None:
         raise PrivateDirError("%s is a symbolic link to nothing: not following it (remove it or point it at a directory)" % gone, "dangling")

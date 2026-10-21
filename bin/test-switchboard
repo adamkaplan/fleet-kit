@@ -9521,13 +9521,29 @@ class TestPrivateDir(Base):
         self.refused(m, "loose", loose)
 
     def branch_each_group_and_world_bit_is_refused(self, m):
-        for mode in (0o770, 0o750, 0o707):   # the group write, the group read, the world write: each one alone is refused
+        for mode in (0o700 | bit for bit in self.PERMISSION_BITS):   # each of the six group and world bits alone is refused
             loose = self.real(self.base / ("bit%o" % mode))
             os.chmod(str(loose), mode)
             self.refused(m, "loose", loose)
         private = self.real(self.base / "bit700")
         os.chmod(str(private), 0o700)
         self.assertEqual(m.ensure_dir(private), private, "0700 is private: it is not refused")
+
+    def branch_a_link_swapped_in_before_the_mode_is_set_is_not_followed(self, m):
+        target = self.real(self.base / "swaptarget")
+        os.chmod(str(target), 0o755)
+        path, real = self.base / "swapped", os.mkdir
+
+        def swap(where, *a):   # the same user puts a link in place of the new directory, between the mkdir and the mode
+            real(where, *a)
+            os.rmdir(where)
+            os.symlink(str(target), where)
+        with mock.patch.object(m.os, "mkdir", swap):
+            try:
+                m.ensure_dir(path)
+            except OSError:
+                pass   # refused: the helper never followed the link
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755, "the link's target was chmodded")
 
     def branch_a_made_directory_is_never_loose(self, m):
         made = m.ensure_dir(self.base / "made")
@@ -9577,6 +9593,8 @@ class TestPrivateDir(Base):
         with self.assertRaises(FileNotFoundError):
             m.ensure_dir(self.base / "none" / "child", parents=False)
 
+    PERMISSION_BITS = tuple(1 << n for n in range(9) if (1 << n) & 0o077)   # the six, derived from the mask the helper tests
+
     HELPER_BRANCHES = (
         # (branch method, the mutation that removes it: text, replacement, which occurrence)
         ("branch_dangling_parent", ("if gone is not None:", "if False:", 0)),
@@ -9589,11 +9607,58 @@ class TestPrivateDir(Base):
         ("branch_a_plain_directory_is_never_mode_checked", ("if private and check:", "if check:", 0)),
         ("branch_check_false_leaves_the_rule_to_the_caller", ("if private and check:", "if private:", 0)),
         ("branch_no_parents_when_not_asked", ("if parents and not path.parent.exists():", "if not path.parent.exists():", 0)),
-        ("branch_each_group_and_world_bit_is_refused", ("info.st_mode & 0o077", "0", 0)),
+        ("branch_a_link_swapped_in_before_the_mode_is_set_is_not_followed", ("fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n        try:\n            os.fchmod(fd, 0o700)\n        finally:\n            os.close(fd)", "os.chmod(str(path), 0o700)", 0)),
         ("branch_a_made_directory_is_never_loose", ("os.chmod(str(path), 0o700)", "os.chmod(str(path), 0o755)", 0)),
         ("branch_the_parent_made_by_another_process", ("path.parent.mkdir(parents=True, exist_ok=True)", "path.parent.mkdir(parents=True)", 0)),
         ("branch_the_second_directory_check_is_not_skipped", ("elif not os.path.isdir(str(path)):", "elif os.path.islink(str(path)) and not os.path.isdir(str(path)):", 0)),
     )
+
+    SWAP_SITES = (("agent_presence", "record_dir", "headless", "ValueError"), ("cloud_worker", "cloud_dir", "cloud", "CloudError"))
+
+    def swap_run(self, module_name, function, source_text=None):
+        module = sb.load_module(module_name)
+        state = Path(tempfile.mkdtemp(dir=str(self.base)))
+        target = self.real(Path(tempfile.mkdtemp(dir=str(self.base))) / "t")
+        os.chmod(str(target), 0o755)
+        real, swapped = os.lstat, []
+
+        def lstat(where, *a, **k):   # the same user swaps the directory for a link right after the owner check
+            found = real(where, *a, **k)
+            if not swapped and sys._getframe(1).f_code.co_name == function and stat.S_ISDIR(found.st_mode):
+                swapped.append(where)
+                os.rmdir(where)
+                os.symlink(str(target), where)
+            return found
+        with mock.patch.object(os, "lstat", lstat):
+            try:
+                getattr(module, function)(state)
+            except (OSError, ValueError, module.CloudError if hasattr(module, "CloudError") else OSError):
+                pass
+        self.assertTrue(swapped, "the swap did not happen")
+        return stat.S_IMODE(target.stat().st_mode)
+
+    def test_a_link_swapped_in_after_the_owner_check_is_never_chmodded_at_the_converted_sites(self):
+        for module_name, function, _, _ in self.SWAP_SITES:
+            with self.subTest(site=function):
+                self.assertEqual(self.swap_run(module_name, function), 0o755)
+                source = (BIN / (module_name + ".py")).read_text()
+                self.assertIn("os.O_NOFOLLOW", source)
+                mutant = source.replace("fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)", "fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)")
+                self.assertNotEqual(mutant, source)
+                with tempfile.TemporaryDirectory() as scratch:
+                    (Path(scratch) / "private_dir.py").write_text((BIN / "private_dir.py").read_text())
+                    (Path(scratch) / (module_name + ".py")).write_text(mutant)
+                    saved = sb.load_module
+                    spec = importlib.util.spec_from_file_location(module_name + "_mut", str(Path(scratch) / (module_name + ".py")))
+                    module = importlib.util.module_from_spec(spec)
+                    sys.modules["private_dir"] = self.helper
+                    spec.loader.exec_module(module)
+                    with mock.patch.object(sb, "load_module", lambda name, _s=saved, _m=module, _n=module_name: _m if name == _n else _s(name)):
+                        self.assertNotEqual(self.swap_run(module_name, function), 0o755, "the mutant survived: %s" % function)
+
+    def test_every_bit_mutant_is_derived_from_the_mask(self):
+        self.assertEqual(len(self.PERMISSION_BITS), 6)
+        self.assertEqual(sum(self.PERMISSION_BITS), 0o077)
 
     def test_every_refusal_of_the_helper_has_a_test_and_a_mutant_that_it_kills(self):
         tree = ast.parse((BIN / "private_dir.py").read_text())
@@ -9601,8 +9666,9 @@ class TestPrivateDir(Base):
         self.assertEqual(len(raises), 5, "a refusal was added or removed: give it a branch test and a mutant below")
         kinds = sorted(r.exc.args[1].value for r in raises)
         self.assertEqual(kinds, ["dangling", "dangling", "loose", "not-directory", "not-directory"])
-        for name, mutation in self.HELPER_BRANCHES:
-            with self.subTest(branch=name):
+        bit_rows = tuple(("branch_each_group_and_world_bit_is_refused", ("info.st_mode & 0o077", "info.st_mode & 0o%03o" % (0o077 & ~bit), 0)) for bit in self.PERMISSION_BITS)
+        for name, mutation in self.HELPER_BRANCHES + bit_rows:
+            with self.subTest(branch=name, mutation=mutation[1]):
                 shutil.rmtree(str(self.base), ignore_errors=True)
                 self.base.mkdir()
                 getattr(self, name)(self.helper_module())   # the helper passes it
