@@ -28,6 +28,16 @@ def _dangling(path):
     return None
 
 
+def chmod_private(path, mode=0o700):
+    """Set `mode` on the directory `path` without following a link: the mode goes on a descriptor opened with O_NOFOLLOW, so a link a same-user
+    process swapped in since the caller's mkdir or check is refused (OSError, ELOOP) and its target is never changed. Every site that sets a directory's mode calls this."""
+    fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
 def ensure_dir(path, *, private=True, parents=True, check=True):
     """Make the directory `path` (and its parents, when `parents`) and return it as a Path.
 
@@ -51,13 +61,7 @@ def ensure_dir(path, *, private=True, parents=True, check=True):
     except FileExistsError:
         pass   # another process made it (or it was there): checked below like any existing one
     if created and private:
-        # mkdir's mode is filtered by the umask; only the process that made it sets it. Through an fd opened with O_NOFOLLOW, so a link swapped in
-        # since the mkdir is refused (ELOOP) and never chmodded at its target.
-        fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            os.fchmod(fd, 0o700)
-        finally:
-            os.close(fd)
+        chmod_private(path)   # mkdir's mode is filtered by the umask; only the process that made it sets it
     gone = _dangling(path)
     if gone is not None:
         raise PrivateDirError("%s is a symbolic link to nothing: not following it (remove it or point it at a directory)" % gone, "dangling")

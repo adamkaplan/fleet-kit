@@ -6292,11 +6292,7 @@ def agent_tmp_env(engine, name):
         info = os.lstat(str(path))
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             raise OSError("exists and is not a directory of ours")
-        fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)   # no symlink swapped in after the check
-        try:
-            os.fchmod(fd, 0o700)
-        finally:
-            os.close(fd)
+        load_module("private_dir").chmod_private(path)
     except OSError as err:
         raise LaunchError("cannot make the private temp directory %s (%s): %s was not started (it never runs on the shared temp directory)" % (path, err.strerror or err, name)) from None
     return {AGENT_TMP_ENV: str(path)}
@@ -26338,10 +26334,11 @@ def cmd_job(args, runner, now, spawn=subprocess.Popen):
             return EXIT_ERROR
         try:
             load_module("private_dir").ensure_dir(paths["dir"], check=False)
+            if not os.path.islink(str(paths["dir"])):   # a link to a directory is accepted as it always was, and its target is not ours to chmod
+                load_module("private_dir").chmod_private(paths["dir"])   # never follows a link swapped in since the check
         except OSError as err:   # a symlink to nothing where the job's directory goes: one line, nothing created at its target
             sys.stderr.write("%s: job: %s\n" % (PROG, err.strerror or err))
             return EXIT_ERROR
-        os.chmod(str(paths["dir"]), 0o700)
         for stale in (paths["record"], paths["exit"], paths["collected"], Path(str(paths["exit"]) + ".tmp")):   # the old record goes FIRST: no window shows it uncollected
             try:
                 stale.unlink()
@@ -30867,7 +30864,7 @@ class Installer:
         if missing and not self.dry:
             for name in PROFILE_DIRS:
                 _make_dir(root / name, InstallError, private=False)
-            os.chmod(str(root / "state"), 0o700)
+            load_module("private_dir").chmod_private(root / "state")
         self.result("profile", bool(missing), "%s (private to v2; %s is not touched)" % (root, self.shared_dir()),
                     "%s (private to v2; %s is not touched)" % (root, self.shared_dir()))
 

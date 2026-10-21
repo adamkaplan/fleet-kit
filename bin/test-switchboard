@@ -9607,54 +9607,72 @@ class TestPrivateDir(Base):
         ("branch_a_plain_directory_is_never_mode_checked", ("if private and check:", "if check:", 0)),
         ("branch_check_false_leaves_the_rule_to_the_caller", ("if private and check:", "if private:", 0)),
         ("branch_no_parents_when_not_asked", ("if parents and not path.parent.exists():", "if not path.parent.exists():", 0)),
-        ("branch_a_link_swapped_in_before_the_mode_is_set_is_not_followed", ("fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n        try:\n            os.fchmod(fd, 0o700)\n        finally:\n            os.close(fd)", "os.chmod(str(path), 0o700)", 0)),
+        ("branch_a_link_swapped_in_before_the_mode_is_set_is_not_followed", ("fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n    try:\n        os.fchmod(fd, mode)\n    finally:\n        os.close(fd)", "os.chmod(str(path), mode)", 0)),
         ("branch_a_made_directory_is_never_loose", ("os.chmod(str(path), 0o700)", "os.chmod(str(path), 0o755)", 0)),
         ("branch_the_parent_made_by_another_process", ("path.parent.mkdir(parents=True, exist_ok=True)", "path.parent.mkdir(parents=True)", 0)),
         ("branch_the_second_directory_check_is_not_skipped", ("elif not os.path.isdir(str(path)):", "elif os.path.islink(str(path)) and not os.path.isdir(str(path)):", 0)),
     )
 
-    SWAP_SITES = (("agent_presence", "record_dir", "headless", "ValueError"), ("cloud_worker", "cloud_dir", "cloud", "CloudError"))
+    # every site that sets a directory's mode: (file, function) -> the driver id in `drivers` that runs the real function. Derived from the code below.
+    SWAP_SITES = {("agent_presence.py", "record_dir"): 19, ("cloud_worker.py", "cloud_dir"): 20, ("fleet-switchboard", "agent_tmp_env"): 3,
+                  ("fleet-switchboard", "cmd_job"): 9, ("fleet-switchboard", "step_profile"): 16}
 
-    def swap_run(self, module_name, function, source_text=None):
-        module = sb.load_module(module_name)
-        state = Path(tempfile.mkdtemp(dir=str(self.base)))
+    def mode_sites_in_code(self):
+        found = set()
+        for path in sorted(BIN.iterdir()):
+            if path.is_dir() or path.name.startswith("test-") or (path.suffix != ".py" and path.name != "fleet-switchboard") or path.name == "private_dir.py":
+                continue
+            tree = ast.parse(path.read_text())
+            for function in ast.walk(tree):
+                if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for node in ast.walk(function):
+                        if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "chmod_private":
+                            found.add((path.name, function.name))
+        return found
+
+    def test_every_site_that_sets_a_directory_mode_has_a_swap_row_and_none_follows_a_link(self):
+        self.assertEqual(self.mode_sites_in_code(), set(self.SWAP_SITES), "a mode-setting site has no swap row, or a row has no site")
+        for path in sorted(BIN.iterdir()):   # a hand-rolled following chmod of 0700 is the old form: only the restore of the review checkout keeps one
+            if path.is_dir() or path.name.startswith("test-") or (path.suffix != ".py" and path.name != "fleet-switchboard"):
+                continue
+            hits = [n.lineno for n in ast.walk(ast.parse(path.read_text())) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "chmod"
+                    and any(isinstance(a, ast.Constant) and a.value == 0o700 for a in n.args)]
+            if path.name != "review_checkout.py":
+                self.assertEqual(hits, [], "%s: a following chmod(0700) at line %s: use private_dir.chmod_private" % (path.name, hits))
+
+    def swap_site(self, number, following):
+        """Run the real site; the same user swaps the directory for a link to a 0755 directory at the moment it sets the mode. Returns the target's mode."""
+        shutil.rmtree(str(self.base), ignore_errors=True)   # each run starts from nothing: a site reached a second time finds its directory made
+        self.base.mkdir()
+        modules = {id(m): m for m in (sb.load_module("private_dir"), sys.modules.get("private_dir")) if m is not None}
         target = self.real(Path(tempfile.mkdtemp(dir=str(self.base))) / "t")
         os.chmod(str(target), 0o755)
-        real, swapped = os.lstat, []
+        swapped = []
+        originals = {k: m.chmod_private for k, m in modules.items()}
 
-        def lstat(where, *a, **k):   # the same user swaps the directory for a link right after the owner check
-            found = real(where, *a, **k)
-            if not swapped and sys._getframe(1).f_code.co_name == function and stat.S_ISDIR(found.st_mode):
-                swapped.append(where)
-                os.rmdir(where)
-                os.symlink(str(target), where)
-            return found
-        with mock.patch.object(os, "lstat", lstat):
+        def hook(path, mode=0o700):
+            if not swapped:
+                swapped.append(path)
+                shutil.rmtree(str(path))
+                os.symlink(str(target), str(path))
+            if following:
+                return os.chmod(str(path), mode)   # the old form
+            return originals[next(iter(originals))](path, mode)
+        with contextlib.ExitStack() as stack:
+            for m in modules.values():
+                stack.enter_context(mock.patch.object(m, "chmod_private", hook))
             try:
-                getattr(module, function)(state)
-            except (OSError, ValueError, module.CloudError if hasattr(module, "CloudError") else OSError):
-                pass
-        self.assertTrue(swapped, "the swap did not happen")
+                self.drivers(lambda p: p)[number]()
+            except Exception:
+                pass   # refused: the site never followed the link
+        self.assertTrue(swapped, "the site never set a mode: the driver does not reach it")
         return stat.S_IMODE(target.stat().st_mode)
 
-    def test_a_link_swapped_in_after_the_owner_check_is_never_chmodded_at_the_converted_sites(self):
-        for module_name, function, _, _ in self.SWAP_SITES:
+    def test_a_link_swapped_in_before_each_mode_is_set_is_never_followed_and_the_following_form_is_caught(self):
+        for (name, function), number in sorted(self.SWAP_SITES.items()):
             with self.subTest(site=function):
-                self.assertEqual(self.swap_run(module_name, function), 0o755)
-                source = (BIN / (module_name + ".py")).read_text()
-                self.assertIn("os.O_NOFOLLOW", source)
-                mutant = source.replace("fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)", "fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)")
-                self.assertNotEqual(mutant, source)
-                with tempfile.TemporaryDirectory() as scratch:
-                    (Path(scratch) / "private_dir.py").write_text((BIN / "private_dir.py").read_text())
-                    (Path(scratch) / (module_name + ".py")).write_text(mutant)
-                    saved = sb.load_module
-                    spec = importlib.util.spec_from_file_location(module_name + "_mut", str(Path(scratch) / (module_name + ".py")))
-                    module = importlib.util.module_from_spec(spec)
-                    sys.modules["private_dir"] = self.helper
-                    spec.loader.exec_module(module)
-                    with mock.patch.object(sb, "load_module", lambda name, _s=saved, _m=module, _n=module_name: _m if name == _n else _s(name)):
-                        self.assertNotEqual(self.swap_run(module_name, function), 0o755, "the mutant survived: %s" % function)
+                self.assertEqual(self.swap_site(number, following=False), 0o755, "the link's target was chmodded")
+                self.assertEqual(self.swap_site(number, following=True), 0o700, "the following form is not caught: the swap did not reach the target")
 
     def test_every_bit_mutant_is_derived_from_the_mask(self):
         self.assertEqual(len(self.PERMISSION_BITS), 6)

@@ -109,11 +109,7 @@ def cloud_dir(state):
     found = os.lstat(str(path))
     if stat.S_ISLNK(found.st_mode) or found.st_uid != os.getuid():
         raise CloudError("the cloud directory is not the user's own")
-    fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)   # a link swapped in since the check is refused, never chmodded at its target
-    try:
-        os.fchmod(fd, 0o700)
-    finally:
-        os.close(fd)
+    helper.chmod_private(path)
     return path
 
 
