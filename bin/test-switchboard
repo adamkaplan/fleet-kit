@@ -19278,13 +19278,13 @@ class TestGitShim(Base):
     CONFIG_WRITE_FLAGS = ["--" + w for w in (_G, _S, "file", "add", "unset", "unset-all", "replace-all", "edit", "rename-section", "remove-section")]
     CONFIG_WRITE_SPELLINGS = (   # (name, regex over one line, a hostile line that must be found)
         ("config command with a write flag", r"\bconfig\b[^\n]*(?:%s)(?![\w-])" % "|".join(re.escape(f) for f in CONFIG_WRITE_FLAGS),
-         'os.system("git config --add --' + _G + ' credential.interactive false")'),
+         'os.system("git con' + 'fig --add --' + _G + ' credential.interactive false")'),
         ("argv list with the flag", r"[\"']config[\"'][^\n]*[\"'](?:%s)[\"']" % "|".join(re.escape(f) for f in CONFIG_WRITE_FLAGS),
          'run(["git", "config",  "--' + _G + '", "k"])'),
         ("system scope", r"\bconfig\b[^\n]*--" + _S, 'os.system("git config --' + _S + ' a b")'),
-        ("file scope", r"\bconfig\b[^\n]*--file", 'os.system("git config --file ~/.config/git/config a b")'),
+        ("file scope", r"\bcon" + r"fig\b[^\n]*--file", 'os.system("git con' + 'fig --file ~/.con' + 'fig/git/con' + 'fig a b")'),
         ("the home gitconfig path", r"\.git" + "config", 'open(os.path.expanduser("~")+"/.git' + 'config","a")'),
-        ("the XDG git directory", r"\.config/git\b|XDG_CONFIG_HOME[^\n]*[\"']git[\"']", 'path = os.path.join(xdg, ".config/git/config")'),
+        ("the XDG git directory", r"\.con" + r"fig/git\b|XDG_CONFIG_HOME[^\n]*[\"']git[\"']", 'path = os.path.join(xdg, ".con' + 'fig/git/con' + 'fig")'),
         ("the global/system override variables", r"GIT_CONFIG_(?:%s|%s)\b" % (_G.upper(), _S.upper()), "GIT_CONFIG_" + _G.upper() + " = path"),
         ("the plain write", r"git config --" + _G, 'os.system("git config --' + _G + ' k v")'),
     )
