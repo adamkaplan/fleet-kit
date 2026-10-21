@@ -327,6 +327,12 @@ class Client(unittest.TestCase):
             self.assertEqual(p.returncode, 1, loc)
             self.assertEqual(Stub.other_seen, [], loc)
 
+    def test_a_stray_positional_argument_is_refused_with_no_request(self):
+        r = self.run_gh("pr", "create", "stray", "--title", "t", "--body", "b", "--head", "h")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("no positional argument", r.stderr)
+        self.assertEqual(Stub.seen, [])   # nothing was sent
+
     def test_the_removed_verbs_are_absent_from_the_client_table(self):
         for argv in REFUSED:
             self.assertNotIn((argv[0], argv[1] if len(argv) > 1 else ""), MOD.VERBS, argv)

@@ -58,6 +58,7 @@ NEED = (("pull_request|merge_queue", "a pull_request or merge_queue rule (direct
 # "WARN": one `preflight: WARN open action ...` line per open action, the launch continues. "BLOCK": the same action fails the
 # preflight (exit 1, a FAIL line naming it). They start as WARN; the owner flips a value here (after a week of clean WARN lines),
 # in a reviewed change: there is no flag and no environment setting. What blocks today (NEED above, the review count) is not here.
+MODES = ("WARN", "BLOCK")   # the allowed values of CHECK_MODES (the tests use this tuple); anything else blocks
 CHECK_MODES = {
     "bypass_actor": "WARN",            # an App is a bypass actor of an active ruleset that covers the branch
     "auto_merge": "WARN",              # the repository allows auto-merge (enable it with pull requests: write, then the checks decide)

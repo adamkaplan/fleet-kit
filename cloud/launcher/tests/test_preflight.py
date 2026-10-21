@@ -578,7 +578,7 @@ class OpenActions(Preflight):
         self.assertEqual(pf.CHECK_MODES, EXPECTED_MODES)   # a flip to BLOCK fails here: it is the owner's reviewed change
         self.assertEqual(set(OPENERS), set(pf.CHECK_MODES))
         self.assertEqual(set(pf.OPEN_ACTION_TEXT), set(pf.CHECK_MODES))
-        self.assertTrue(set(pf.CHECK_MODES.values()) <= {"WARN", "BLOCK"})
+        self.assertTrue(set(pf.CHECK_MODES.values()) <= set(pf.MODES))
 
     def test_nothing_open_prints_no_warning(self):
         p = self.run_pf()
@@ -608,12 +608,12 @@ class OpenActions(Preflight):
         p = self.run_pf()
         self.assertNotIn("WARN open action bypass_actor", p.stdout)
 
-    def run_blocked(self, key):
+    def run_blocked(self, key, mode="BLOCK"):
         """pf.main in-process with ONE key switched to BLOCK; returns (exit code, output)."""
         old, saved, out = dict(pf.CHECK_MODES), dict(os.environ), io.StringIO()
         os.environ.update(CW_GITHUB_API_BASE=self.base, CW_PREFLIGHT_TOKEN_CMD="echo " + TOKEN)
         try:
-            pf.CHECK_MODES[key] = "BLOCK"
+            pf.CHECK_MODES[key] = mode
             with contextlib.redirect_stdout(out):
                 rc = pf.main([REPO])
         finally:
@@ -633,6 +633,18 @@ class OpenActions(Preflight):
                 self.assertIn("FAIL on main: open action %s:" % key, text)
                 self.assertNotIn("preflight ok", text)
                 self.assertEqual(text.count("FAIL"), 1, text)   # only the flipped key blocks
+
+    def test_a_mode_that_is_not_an_allowed_value_fails_closed_for_every_key(self):
+        bad = ["WRN", "BLCK", "", "warn", "block", " WARN", None, 0, 1, ["WARN"], ("WARN",), True]
+        for key, opener in OPENERS.items():
+            for mode in bad:
+                with self.subTest(key=key, mode=mode):
+                    Stub.rules, Stub.bypass, Stub.auto_merge = list(CLEAN), [], False
+                    opener()
+                    rc, text = self.run_blocked(key, mode)
+                    self.assertEqual(rc, 1, text)
+                    self.assertIn("FAIL on main: open action %s:" % key, text)
+                    self.assertNotIn("preflight ok", text)
 
     def test_an_owner_approval_never_rescues_a_blocking_open_action(self):
         for key, opener in OPENERS.items():
