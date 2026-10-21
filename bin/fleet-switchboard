@@ -21431,14 +21431,42 @@ def _scenario_of(ctx, sid):
     return found
 
 
+HEAD_MIN = 7   # git's own floor for an unambiguous short sha; a shorter prefix is refused
+FULL_HEAD_RE = re.compile(r"[0-9a-f]{40}")   # the one pattern of a full commit sha
+
+
+def resolve_head(given, known, unreadable=None, read_only=False):
+    """THE one resolver of a head a caller names for a pull request (#994). `given` is the --head text (None: not given), `known` the
+    pull request's current full head (None: unreadable). Returns the FULL 40-character head, never the text as given, or raises
+    LedgerCommandError with one line. A prefix matches the current head only: a pull request has one, so it matches one commit or none;
+    the only ambiguous prefix is one too short for git to call unambiguous. `read_only` (a command that only LOOKS, never records) also
+    lets a FULL head that is not the current one through, to read an older head's records; a short head is still resolved or refused.
+    Fail mode, on purpose: when the pull request's head cannot be read, a FULL given head is used as given (as before this change; the
+    gates compare it exactly, so a wrong one binds to nothing) and a short one is refused."""
+    if given is None:
+        if not known or not FULL_HEAD_RE.fullmatch(known):
+            raise LedgerCommandError("the PR head is unknown (%s): pass --head <full 40-character sha>" % (unreadable or "not a sha"))
+        return known
+    text = given.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]+", text):
+        raise LedgerCommandError("--head %r is not a commit sha: give the full 40-character head, or none (nothing was recorded)" % given[:12])
+    if len(text) > 40:
+        raise LedgerCommandError("--head %s... is longer than a sha: give the full 40-character head, or none (nothing was recorded)" % text[:12])
+    if len(text) < HEAD_MIN:
+        raise LedgerCommandError("--head %s is too short to name one commit (at least %d characters, else ambiguous): give the full 40-character head, or none (nothing was recorded)" % (text, HEAD_MIN))
+    if read_only and FULL_HEAD_RE.fullmatch(text):
+        return text
+    if not known or not FULL_HEAD_RE.fullmatch(known):
+        if FULL_HEAD_RE.fullmatch(text):
+            return text
+        raise LedgerCommandError("cannot resolve --head %s: the PR head could not be read (%s): give the full 40-character head (nothing was recorded)" % (text, unreadable or "unknown"))
+    if not known.startswith(text):
+        raise LedgerCommandError("--head %s is not the PR's head (%s): a record belongs to the head it judged; nothing was recorded" % (text[:12], known[:12]))
+    return known
+
+
 def _head_of(ctx, args):
-    known = (ctx.facts or {}).get("head")
-    head = args.head or known
-    if known and args.head and not (known.startswith(args.head) or args.head.startswith(known)):
-        raise LedgerCommandError("--head %s is not the PR's head (%s): nothing was recorded" % (args.head[:12], known[:12]))
-    if not head or not re.fullmatch(r"[0-9a-f]{7,40}", head):
-        raise LedgerCommandError("the PR head is unknown (%s): pass --head <sha>" % (ctx.unreadable or "not a sha"))
-    return head
+    return resolve_head(args.head, (ctx.facts or {}).get("head"), ctx.unreadable)
 
 
 def _record(ctx, args, now, entry):
@@ -21622,7 +21650,11 @@ def cmd_waive(args, runner, now):
         _gates_audit(engine, "plan.item.refused", pr, {"item": pr, "why": why, "stage": "waive"})
         raise LedgerCommandError("refused: %s" % why)
     ctx = types.SimpleNamespace(facts=dict(facts or {}, body=body, notice_senders=senders), unreadable=unreadable)
-    head = _head_of(ctx, args)
+    try:
+        head = _head_of(ctx, args)
+    except LedgerCommandError as err:   # #994: a head that is short, wrong or unresolvable is refused before anything is written, and audited
+        _gates_audit(engine, "gate.waiver.refused", pr, {"by": who, "why": _one_line(str(err), 160)})
+        raise
     writers = plan_ledger.authors_of(entries, pr, senders, (facts or {}).get("author"))
     if who in writers:
         _gates_audit(engine, "gate.waiver.refused", pr, {"by": who, "why": "a writer of the PR"})
@@ -21921,6 +21953,8 @@ def cmd_item_prove(args, runner, now):
     pin = iv.pinned(ctx.entries, ctx.item)
     if not pin:
         raise LedgerCommandError("%s has no reference commit yet: its orchestrator launches a tester with --issue for it first (that registration pins the commit)" % ctx.item)
+    if args.head and args.head != pin:   # #994: a proof is stored at the pin; a head that is not the pin is refused, never ignored
+        raise LedgerCommandError("--head %s is not the reference commit (%s): a proof belongs to the commit it judged; nothing was recorded" % (args.head[:12], pin[:12]))
     refused = 0
     for sid in dict.fromkeys(args.scenario):
         try:
@@ -23981,7 +24015,7 @@ def add_ledger_parsers(sub):
     waive.add_argument("pr", help="The pull request: owner/repo#N or its URL")
     waive.add_argument("--gates", required=True, help="Comma-separated gates: G0a,G0b,G0c,G1,G2/G3,G4,G5")
     waive.add_argument("--reason", required=True, help="Why (at least %d characters)" % plan_ledger.WAIVER_REASON_MIN)
-    waive.add_argument("--head", help="The PR head sha (default: read from GitHub)")
+    waive.add_argument("--head", help="The PR head sha (default: read from GitHub); a short head (7 or more hex characters) is resolved to the full head, or refused")
     gates = sub.add_parser("gates", help="Read-only: the plan's gates G0a to G8 for a PR, what each needs and who decides it. "
                                          "Also `gates mode <repo> shadow|enforce|off`, `gates off|on` (the global kill file) and "
                                          "`gates preflight <repo>`. May add one `shares <file> with #N` line when another open PR changes the same files "
@@ -24265,7 +24299,10 @@ def cmd_review(args, runner, now):
             entries, problem = plan_ledger.read_ledger(state)
             if problem:
                 raise ReviewError("the ledger is not trustworthy: %s" % problem)
-            at = args.head or head
+            try:
+                at = resolve_head(args.head, head, read_only=True) if args.head is not None or head else None   # #994: a short head reads as the PR's full head
+            except LedgerCommandError as err:
+                raise ReviewError(str(err)) from None
             latest = {}
             for entry in entries:
                 if entry.get("kind") == "review_record" and entry.get("pr") == ref and entry.get("head") == at:
@@ -24350,11 +24387,12 @@ def cmd_review(args, runner, now):
             valid = rule[0] + rule[1]
             if impact_class not in valid:
                 raise ReviewError("an impact hold must name a class of the matrix (%s), got %r: run the review again (nothing was recorded)" % (", ".join(valid), impact_class))
-        if not head or not re.fullmatch(r"[0-9a-f]{40}", head):
+        if not head or not FULL_HEAD_RE.fullmatch(head):
             raise ReviewError("the PR head is unknown: nothing was recorded")
-        given = args.head or head
-        if not (head.startswith(given) or given.startswith(head)) or len(given) < 7:
-            raise ReviewError("--head %s is not the PR's head (%s): a record belongs to the head it judged, nothing was recorded" % (given[:12], head[:12]))
+        try:
+            resolve_head(args.head, head)   # the one resolver (#994); the record holds the PR's full head, read above
+        except LedgerCommandError as err:
+            raise ReviewError(str(err)) from None
         kind = gates_caller_kind(runner, now)
         if kind[0] == "unknown":
             raise ReviewError("refused: %s" % kind[1])

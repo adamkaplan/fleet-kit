@@ -4295,7 +4295,7 @@ controlling terminal with no agent process above it, so `env -u` on a pipe is re
 (one who recorded its proof or sent its notice, or its GitHub author) cannot waive its gates, and a ledger that does not verify takes no
 waiver and honours none. The waiver is a hash-chained ledger entry (`kind waiver`: who, why, PR, head, gates, expiry) and a `plan.waiver`
 audit line. It is bound to **the head it was recorded at** (a push needs a new one) and **expires after 24 hours**, the due date of the
-retroactive plan; a waiver for another head, another PR or after its expiry does nothing. `gates` and `gates-check` honour a valid waiver:
+retroactive plan; a waiver for another head, another PR or after its expiry does nothing. The ledger always holds the **full 40-character head** (#994): a `--head` in short form (7 or more hex characters, any case) that is a prefix of the pull request's current head is resolved to that full head before anything is recorded; a shorter, non-hex, over-long, empty or other-commit head, or a short head when the pull request's head cannot be read, is refused with one line and nothing is recorded (the refusal is audited). `prove`, `verdict`, `review record` and `review blockers` resolve `--head` the same way (one resolver, `resolve_head`); `verdict --item` and `review checkout` already refuse a short head. `gates` and `gates-check` honour a valid waiver:
 the gate reads `waived (by <who>, <reason>, due <time>)`, never `ok`, and the report lists `WAIVED (not passed)`. The cos permission corpus
 and allowed commands still have to be extended with `waive` (a permission change, held for the owner).
 
