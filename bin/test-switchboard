@@ -37591,7 +37591,8 @@ class TestImpactHold(LedgerBase):
         """A ledger record built WITHOUT the helper: any shape, including those the record command refuses (an older record with an action and no severity or probability)."""
         entry = {"kind": "review_record", "pr": "acme/app#9", "head": LEDGER_HEAD, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": "reviewer"}
         entry.update(fields)
-        entry.setdefault("block_sha256", "a" * 64)   # #901: the record carries the agent's block, whose own lines equal the typed ones (a missing field stays missing)
+        self.hash_count = getattr(self, "hash_count", 0) + 1
+        entry.setdefault("block_sha256", "%064x" % (self.hash_count + 10 ** 6))   # #972: a different hash per record. #901: the record carries the agent's block, whose own lines equal the typed ones (a missing field stays missing)
         for name in ("impact_severity", "impact_probability"):
             if name in entry and entry[name] is not KEEP_OUT:
                 entry.setdefault("block_" + name, entry[name])
