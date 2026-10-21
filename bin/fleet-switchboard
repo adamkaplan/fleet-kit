@@ -22661,6 +22661,9 @@ def cmd_impact_floor(args, runner, now):
 
 IMPACT_PASS_CALLS = 6        # `gh pr view` calls the daemon pass may spend per pass
 IMPACT_RETRY_SECONDS = 300   # a PR whose floor could not be read is retried after this
+CLEAR_LINE_PASS_MAX = 2      # held pull requests whose "who can clear this" line one pass reads and may post (#946)
+CLEAR_LINE_PAGES = 10        # pages of 100 comments read to find the line already posted
+CLEAR_LINE_MARKER = re.compile(r"<!-- fleet-switchboard:clear-line head=([0-9a-f]{12}) hash=([0-9a-f]{12}) -->")
 
 
 IMPACT_STATE_FILE = "impact-hold.json"   # {"clears": {pr: {head, reason, by, at[, fingerprint]}}, "applied": {pr: {head, merge_label_added}}, "carried": {pr: {head, from, fingerprint, at}}, "carry_void": {pr: {head, reason}}}
@@ -23096,6 +23099,78 @@ def chat_clear_apply(engine, cc, pr, offer, quoted, message_id, now):
     return lines
 
 
+def clear_line_marker(head, line):
+    """The hidden marker of the posted line: the head (12 hex) and a hash of the line's content (12 hex). The once-per-content rule is read back from it."""
+    return "<!-- fleet-switchboard:clear-line head=%s hash=%s -->" % ((head or "")[:12], hashlib.sha256(line.encode("utf-8")).hexdigest()[:12])
+
+
+def clear_line_post(engine, runner, repo, number, head, report=None):
+    """One held ready head's line: "posted", "present" (the pull request already carries this head and content) or "none" (nothing to say). Raises on any read that failed (never a confident
+    line from a failed read; the caller retries later). The only write is the one comment. #946."""
+    who = clear_who(engine, runner, repo, number, report)
+    if who["unreadable"]:
+        raise ValueError("who can clear it cannot be read: %s" % who["unreadable"])
+    if who["head"] != head:
+        raise ValueError("the pull request moved while the line was made (%s, then %s)" % (head[:8], str(who["head"])[:8]))
+    line = load_module("delegated_clear").clear_line(who) if who["hold"] else None
+    if line is None:
+        return "none"
+    marker = clear_line_marker(head, line)
+    get, last = impact_carry_get(engine, runner, repo), None
+    for page in range(1, CLEAR_LINE_PAGES + 1):
+        got = get("repos/%s/issues/%d/comments?per_page=100&page=%d" % (repo, number, page))
+        if not isinstance(got, list):
+            raise ValueError("the comments did not come back as a list")
+        for comment in got:
+            body = comment.get("body") if isinstance(comment, dict) else None
+            if isinstance(body, str) and fleet_mark("switchboard") in body and CLEAR_LINE_MARKER.search(body):
+                last = CLEAR_LINE_MARKER.findall(body)[-1]
+        if len(got) < 100:
+            break
+    else:
+        raise ValueError("the comments are more than %d pages: the line already posted cannot be found" % CLEAR_LINE_PAGES)
+    if last is not None and "<!-- fleet-switchboard:clear-line head=%s hash=%s -->" % last == marker:
+        return "present"
+    comment_as(engine, runner, repo, number, line + "\n\n" + marker, "switchboard")
+    return "posted"
+
+
+def clear_line_pass(engine, now, rule, heads, reports):
+    """(#946) At the first ready head of a pull request this daemon holds, post ONE comment line: who can clear it (`clear_who`, the clear's own rule), again only when its content changes or the head does.
+    Held and enforced only; a draft, a pull request that holds nothing and one the owner cleared at this head get nothing. A failed read posts nothing, is noted ONCE and retried later; it is never marked
+    done. What is done is remembered per (head, rule, delegation) and the line already posted is read back from the pull request's own comment marker, so a restart posts nothing twice. Never raises."""
+    done = engine.__dict__.setdefault("clear_line_done", {})
+    retry = engine.__dict__.setdefault("clear_line_retry", {})
+    noted = engine.__dict__.setdefault("clear_line_noted", set())
+    runner = getattr(engine, "gh_runner", None) or subprocess.run
+    delegation = json.dumps((engine.config or {}).get("delegated_clear"), sort_keys=True, default=str)
+    spent = 0
+    for (repo, number), head in sorted(heads.items()):
+        try:
+            report = reports.get((repo, number))
+            if impact_floor.hold_mode(engine.config, repo) != "enforce" or not isinstance(report, dict) or report.get("owner_decision") != "hold" or report.get("head") != head or report.get("rule") != rule:
+                continue
+            signature = (head, rule, delegation)
+            if done.get((repo, number)) == signature or now < retry.get((repo, number), 0):
+                continue
+            if (read_impact_state(engine.state_dir)[0].get("clears") or {}).get("%s#%d" % (repo, number), {}).get("head") == head:
+                continue   # the owner cleared this head: nothing is held
+            if spent >= CLEAR_LINE_PASS_MAX:
+                break
+            spent += 1
+            try:
+                clear_line_post(engine, runner, repo, number, head, report)
+                done[(repo, number)] = signature
+                noted.discard((repo, number))
+            except Exception as err:
+                retry[(repo, number)] = now + IMPACT_RETRY_SECONDS
+                if (repo, number) not in noted:
+                    noted.add((repo, number))
+                    engine._note("clear_line.error", "%s#%d" % (repo, number), {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+        except Exception as err:   # the pass is never stopped by this line
+            engine._note("clear_line.error", "%s#%d" % (repo, number), {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+
+
 def impact_would_hold_pass(engine, now):
     """The daemon hook (#179 L3, #451 slice 3): for the open PRs the ci recorder's list already holds (repos under `plan_gates`), decide the owner-hold
     rule once per (PR, head, version of the rule, impact review record), audit `gate.would_hold` when it holds, and, when `impact_hold` enforces, WRITE the hold
@@ -23121,7 +23196,7 @@ def impact_would_hold_pass(engine, now):
     budget = hold_cfg.get("calls_per_pass", cfg.get("calls_per_pass", IMPACT_PASS_CALLS))   # `impact_hold.calls_per_pass` wins when set
     records, records_problem = impact_records(engine.state_dir)
     marks = impact_carry_marks(engine.state_dir)[0]
-    unjudged, live = 0, set()
+    unjudged, live, heads = 0, set(), {}
     for key, (_, listed) in sorted(state.lists.items()):
         for record in listed:
             number = record.get("number") if isinstance(record, dict) else None
@@ -23130,6 +23205,7 @@ def impact_would_hold_pass(engine, now):
                 continue
             pr = "%s#%d" % (key, number)
             live.add((key, number))
+            heads[(key, number)] = head
             enforce = impact_floor.hold_mode(engine.config, key) == "enforce"
             earlier = reports.get((key, number))
             backoff = seen.get((key, number, "retry"))
@@ -23209,6 +23285,7 @@ def impact_would_hold_pass(engine, now):
                     continue
             seen[(key, number)] = (report["head"] or head, rule, "unreadable" if records_problem else records.get((pr, report["head"] or head))) + ((marks[(pr, report["head"] or head)],) if (pr, report["head"] or head) in marks else ())
             reports[(key, number)] = report
+    clear_line_pass(engine, now, rule, heads, reports)   # #946: one line per held ready head, who can clear it (reads, then at most one comment each)
     _impact_matrix_recovered(engine, now)   # the file and the floor of every repo were read this pass: a standing episode is over
     if not unjudged and not records_problem and any(impact_floor.hold_mode(engine.config, key) == "enforce" for key, _ in live):
         judged = [reports[k] for k in sorted(live) if k in reports and reports[k].get("rule") == rule]
