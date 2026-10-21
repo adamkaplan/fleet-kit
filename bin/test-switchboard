@@ -77706,6 +77706,123 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
                 self.assertIn(str(path.relative_to(BIN.parent)), DERIVED_VIEWS, "%s reads an old agent list: read the registry or list it as derived" % path)
 
 
+class TestBlockedReport(Base):
+    """A blocked agent with messages held for it is reported to its boss and the Chief of Staff (docs/switchboard.md, "A blocked agent is reported")."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={})
+        for name, fleet in (("cos", {"role": "chief-of-staff"}), ("platform", {"role": "orchestrator", "reports_to": "cos"}),
+                            ("coder", {"role": "coder", "reports_to": "platform"})):
+            self.world.add_agent(name, fleet=fleet)
+        self.pane = self.world.herdr.panes[self.world.panes["coder"]]
+
+    def block(self, senders=("platform", "cos"), kind=None):
+        self.pane["status"] = "blocked"
+        if kind == "permission":
+            self.world.v2.ask_permission(self.world.sessions["coder"])
+        for n, sender in enumerate(senders):
+            self.world.engine.send(sender, "coder", "message %d for the blocked coder" % n)
+        self.world.tick(90)
+        self.passes()
+
+    def passes(self):
+        self.world.engine.run_pass()
+        self.world.engine.run_pass()   # a reminder is made at the end of one pass and delivered by the next
+
+    def wait(self, minutes):
+        self.world.tick(minutes * 60)
+        self.passes()
+
+    def told(self, name):
+        return [t for t in self.world.admissions(name) if "Blocked agent" in t["text"]]
+
+    def audits(self, event="blocked.report"):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def test_under_the_threshold_nothing_is_reported(self):
+        self.block()
+        self.wait(10)
+        self.assertEqual((self.told("platform"), self.told("cos"), self.audits()), ([], [], []))
+
+    def test_over_the_threshold_with_held_messages_each_recipient_gets_one_line_naming_the_count_and_senders(self):
+        self.block()
+        self.wait(25)
+        self.wait(5)
+        for name in ("platform", "cos"):
+            (found,) = self.told(name)
+            for part in ("coder", "blocked for 25 minutes", "2 messages from cos, platform"):
+                self.assertIn(part, found["text"])
+        self.assertEqual(len(self.audits()), 1)
+
+    def test_over_the_threshold_with_nothing_held_is_not_reported(self):
+        self.block(senders=())
+        self.wait(30)
+        self.assertEqual((self.told("platform"), self.told("cos"), self.audits()), ([], [], []))
+
+    def test_the_report_repeats_at_most_hourly_and_the_end_is_one_final_line(self):
+        self.block()
+        self.wait(25)
+        self.assertEqual(len(self.told("cos")), 1)
+        self.wait(10)
+        self.assertEqual(len(self.told("cos")), 1, "not at every pass")
+        self.wait(60)
+        self.assertEqual(len(self.told("cos")), 2)
+        self.pane["status"] = "idle"
+        self.passes()
+        final = self.told("cos")[-1]["text"]
+        self.assertEqual(len(self.told("cos")), 3)
+        self.assertIn("has ended", final)
+        self.assertIn("delivered", final)
+        self.passes()
+        self.assertEqual(len(self.told("cos")), 3, "the final line is once")
+
+    def test_a_reminder_the_blocked_agent_set_that_falls_due_in_the_block_is_in_the_line(self):
+        self.block()
+        item = sb.add_reminder(self.world.state, "coder", self.world.clock.now() + 600, self.world.clock.now(), "check the build", sender="coder")
+        self.wait(25)
+        (found,) = self.told("cos")
+        self.assertIn(item["id"], found["text"])
+        self.assertIn(sb.iso(item["at"]), found["text"])
+
+    def test_a_boss_that_cannot_be_reached_leaves_the_chief_of_staff_alone_told(self):
+        self.world.herdr.panes[self.world.panes["platform"]]["status"] = "blocked"
+        self.block()
+        self.wait(25)
+        self.assertEqual((len(self.told("cos")), self.told("platform")), (1, []))
+
+    def test_the_line_names_the_kind_of_block(self):
+        self.block(kind="permission")
+        self.wait(25)
+        (found,) = self.told("cos")
+        self.assertIn("permission request", found["text"])
+        self.assertIn("owner", found["text"])
+        self.assertNotIn("poke", found["text"])
+
+    def test_an_ended_turn_with_nothing_open_says_the_chief_of_staff_may_poke_once(self):
+        self.block()
+        self.wait(25)
+        (found,) = self.told("cos")
+        self.assertIn("ended turn", found["text"])
+        self.assertIn("poke", found["text"])
+
+    def test_the_alert_can_be_set_or_turned_off(self):
+        self.assertEqual(sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "blocked_alert": {"minutes": 5}})["blocked_alert"],
+                         {"minutes": 5, "repeat_minutes": 60})
+        self.assertIsNone(sb.blocked_alert_section({"blocked_alert": False}))
+        self.assertEqual(sb.blocked_alert_section({}), {"minutes": 20, "repeat_minutes": 60})
+        for bad in ({"minutes": 0}, {"minutes": "x"}, [], "on"):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "blocked_alert": bad})
+
+    def test_a_pass_makes_no_gh_call(self):
+        with mock.patch.object(sb.subprocess, "run", side_effect=AssertionError("a pass ran a process")), \
+                mock.patch("subprocess.Popen", side_effect=AssertionError("a pass ran a process")):
+            self.block()
+            self.wait(25)
+        self.assertEqual(len(self.told("cos")), 1)
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
