@@ -85,8 +85,8 @@ def raise_sites(tree):
         for n in ast.walk(fn):
             if _is_not_renewed_raise(n):
                 arg = n.exc.args[0]
-                while isinstance(arg, ast.BinOp):   # "text %s" % value
-                    arg = arg.left
+                while not isinstance(arg, ast.Constant):   # "text %s" % value, or one text if a condition else another
+                    arg = arg.left if isinstance(arg, ast.BinOp) else arg.body
                 out.append(arg.value)
     return out
 
@@ -431,7 +431,7 @@ class Cases(Harness):
         tree = ast.parse(load_source())
         covered = [t for k, _, t in self.cases().values() if k != "quiet"]
         for site in raise_sites(tree):
-            self.assertTrue(any(c.startswith(site.split(":")[0][:18]) or site.startswith(c[:18]) for c in covered), "no case for: " + site)
+            self.assertTrue(any(c in site for c in covered), "no case for: " + site)
         self.assertEqual(len(quiet_sites(tree)), len([n for n in self.cases() if n.startswith("quiet")]) - 2)   # the Secret check has 3 return-False inputs
 
     def test_the_renewal_has_plain_guards_to_remove(self):
