@@ -2480,7 +2480,12 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None):
 
     The reaper's own login is the token file: it is made fresh at the start of every pass (before the cluster is reached), so an installed
     reaper keeps working for days without a person refreshing the file by hand. A login that is not ready (the file is missing and the
-    refresh failed) is not fatal in a loop: the pass names the failure and the next attempt follows the retry gap."""
+    refresh failed) is not fatal in a loop: the pass names the failure and the next attempt follows the retry gap.
+
+    The reaper's own login note (the refresh failed, or the login is not ready) is named in the pass's report and in the audit, but it never
+    fails the pass: the pass's exit code is the result of the pass's own work. The old token file still serves the login while it lasts, and a
+    login that is not ready is fatal by itself (the token file missing, empty or unreadable: `token unavailable`). A real failure still shows
+    up where it belongs: in the workers' own results."""
     old, why, lock = Launcher._catch_signals(), None, None
     clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
     try:
@@ -2499,13 +2504,14 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None):
                     L = Launcher(kube, env, clock, sleep)
                 except CloudError as e:
                     note = note or ("cluster login failed: %s" % scrub(e, (), 120))
-            res = L.reap() if L is not None else []
+            work = L.reap() if L is not None else []   # the pass's own work: the workers' results
+            res = work
             if note:
-                res = res + [("", note, 1)]
+                res = res + [("", note, 1)]   # the reaper's own login note: named in the report, never a worker's result
             print(json.dumps([dict({"worker": w, "reason": r, "exit": c}, **(L.reap_results.get(w, {}) if L is not None else {})) for w, r, c in res]))
             if not a.loop:
                 why = "end of its pass"
-                return EXIT_HOOK if any(c for _, _, c in res) else 0
+                return EXIT_HOOK if any(c for _, _, c in work) else 0
             sleep(min(a.loop, REAP_FLOOR_SECONDS))
     except (Interrupted, KeyboardInterrupt) as e:
         why = "stopped by %s" % (e if isinstance(e, Interrupted) else "interrupt")
