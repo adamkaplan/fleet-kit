@@ -21460,6 +21460,8 @@ def cmd_gates(args, runner, now):
         report["plan_changed"] = "the PR's plan is now %s; its entries were recorded against %s (they are void)" % (ctx.source, first)
     shares = overlap_shares_line(read_open_overlap(ctx.engine, ctx.repo, runner), ctx.number) if not ctx.unreadable else None   # #818: information only
     if args.json:
+        if isinstance(ctx.facts, dict) and rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head")):
+            report["rating_block"] = rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head"))
         if shares:
             report["shares"] = shares
         print(json.dumps(report, sort_keys=True))
@@ -21471,6 +21473,9 @@ def cmd_gates(args, runner, now):
             lines.append("PR not read: %s" % ctx.unreadable)
         if ctx.plan_problem:
             lines.append("plan not read: %s" % ctx.plan_problem)
+        note = rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head")) if isinstance(ctx.facts, dict) else None
+        if note:
+            lines.append("rating: %s" % note)
         if report.get("plan_changed"):
             lines.append("PLAN CHANGED: %s" % report["plan_changed"])
         print("\n".join(lines))
@@ -21903,6 +21908,19 @@ def impact_review_record(state_dir, pr, head):
     return ((latest.get("impact_action"), latest.get("impact_class")) if latest else None), None
 
 
+def rating_block_note(entries, pr, head):
+    """#901: the one line `no agent block` when the independent reviewer's records of `pr` at EXACTLY `head` exist and none carries the agent's block (it clears nothing by score), else None. The same
+    words as the clear's refusal (`delegated_clear.NO_AGENT_BLOCK`); display only, no decision reads it."""
+    try:
+        module = load_module("delegated_clear")
+        block = module.score_block()
+        roles = block["rating_roles"] if block else ["reviewer"]
+        mine = [e for e in entries if isinstance(e, dict) and e.get("kind") == "review_record" and e.get("reviewer") == "impact" and e.get("pr") == pr and e.get("head") == head and e.get("by_role") in roles]
+        return module.uncounted_line(mine)
+    except Exception as err:   # display only, but never silent: the line says the note could not be made
+        return "no rating note: the clear module or the matrix could not be read (%s)" % type(err).__name__
+
+
 def impact_rating_entries(state_dir, pr, head):
     """([ledger entries], problem): every impact reviewer record of EXACTLY this pull request and head (the delegated clear's score is the highest of those whose recorded role counts: `delegated_clear.judge` decides which).
     A ledger that cannot be read, or whose chain is broken, gives ([], why): the score is then unknown. #835."""
@@ -22027,7 +22045,8 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
             reasons = reasons + [IMPACT_REVIEW_REASON]
         if review:
             decision = "hold"
-    return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude,
+    rating_entries = impact_rating_entries(engine.state_dir, "%s#%d" % (repo, number), head)[0] if engine.state_dir is not None and isinstance(head, str) else []
+    return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude, "rating_block": rating_block_note(rating_entries, "%s#%d" % (repo, number), head),
             "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete,
             "top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "review_action": record[0] if record else None, "review_class": record[1] if record else None,   # #661: display data the delegated clear reads; no decision changes
             "changed_paths": [p for p in paths if isinstance(p, str)][:200], "unknown": unknown, "rated": [list(r) for r in rated],
@@ -22036,10 +22055,71 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
 
 def cmd_impact(args, runner, now):
     """`impact floor|hold|clear`."""
-    return {"floor": cmd_impact_floor, "hold": cmd_impact_hold, "clear": cmd_impact_clear, "delegated": cmd_impact_delegated}[args.impact_action](args, runner, now)
+    return {"floor": cmd_impact_floor, "hold": cmd_impact_hold, "clear": cmd_impact_clear, "delegated": cmd_impact_delegated, "matrix": cmd_impact_matrix}[args.impact_action](args, runner, now)
 
 
 cmd_impact.direct = True   # no error mapping, no daemon start
+
+
+IMPACT_MATRIX_PATHS_MAX = 50   # paths printed per floor rule by `impact matrix --for-rater`
+IMPACT_MATRIX_PATH_LEN = 200
+
+
+def _printable_path(path):
+    """A changed file's path as safe display text: control characters (an escape sequence in a file name) become `?`, and it is cut at IMPACT_MATRIX_PATH_LEN. The reader of `impact matrix --for-rater` is a rater agent or a person's terminal."""
+    text = "".join(c if c.isprintable() else "?" for c in str(path))
+    return text if len(text) <= IMPACT_MATRIX_PATH_LEN else text[:IMPACT_MATRIX_PATH_LEN - 1] + "\u2026"
+
+
+def impact_matrix_words(for_rater=None):
+    """{"severities", "probabilities", "cells": {severity: {probability: {"level", "action"}}}, "floor_rules": {rule id: class}, "for_rater": the pull request's floor hits or None}: the kit's matrix file's own words
+    (the same loader the clear reads), so a rater in a repository with no review laws gets them from the file and never retypes them. #901."""
+    matrix = impact_floor.load_matrix()
+    score = ((matrix.get("owner_hold") or {}).get("delegated_clear") or {}).get("score") or {}
+    return {"severities": list(matrix["severities"]), "probabilities": list(matrix["probabilities"]), "not_rated": list(matrix.get("not_rated") or []),
+            "cells": {s: {p: dict(c) for p, c in row.items()} for s, row in matrix["cells"].items()},
+            "floor_rules": dict((score.get("floor") or {}).get("rules") or {}), "lowest_floor_level": (score.get("floor") or {}).get("lowest_level"), "for_rater": for_rater}
+
+
+def cmd_impact_matrix(args, runner, now):
+    """`impact matrix [--for-rater <pr>] [--json]`: print the matrix file's severities, probabilities, cells (level and action) and floor rule ids; with `--for-rater` also that pull request's floor report
+    (each floor rule id the changed paths hit, and the paths): the SAME `pr_floor_report` `impact floor` prints. Read-only: no ledger, state or audit write. Works with no review laws in the repository."""
+    try:
+        for_rater = None
+        if args.for_rater:
+            engine, _, _ = build_engine(runner, now, "cli", writable=False)
+            repo, number = parse_pr_ref(args.for_rater)
+            report = pr_floor_report(engine, repo, number)
+            rules = impact_matrix_words()["floor_rules"]
+            hits = report.get("top_tier_hits") or {}
+            for_rater = {"pr": report["pr"], "head": report["head"], "complete": report.get("complete"),
+                         "floor_hits": {rule_id: [_printable_path(p) for p in sorted(hits.get(cls) or [])[:IMPACT_MATRIX_PATHS_MAX]] for rule_id, cls in sorted(rules.items()) if hits.get(cls)},
+                         "owner_decision": report.get("owner_decision")}
+        words = impact_matrix_words(for_rater)
+    except (impact_floor.MatrixError, NoticeError, ValueError) as err:
+        sys.stderr.write("%s: impact matrix: %s\n" % (PROG, _one_line(str(err), 300)))
+        return EXIT_USAGE
+    if args.json:
+        print(json.dumps(words, sort_keys=True))
+        return EXIT_OK
+    print("impact matrix (the kit's matrix file; read-only)")
+    print("severities: %s" % ", ".join(words["severities"]))
+    print("probabilities: %s" % ", ".join(words["probabilities"]))
+    for severity in words["severities"]:
+        for probability, cell in words["cells"][severity].items():
+            print("cell %s / %s: level %s, action %s" % (severity, probability, cell["level"], cell["action"]))
+    for rule_id, cls in sorted(words["floor_rules"].items()):
+        print("floor rule %s: class %s" % (rule_id, cls))
+    if for_rater is not None:
+        print("floor report for %s at %s: %s" % (for_rater["pr"], (for_rater["head"] or "unknown head")[:8], "complete" if for_rater["complete"] else "INCOMPLETE file list"))
+        for rule_id, paths in for_rater["floor_hits"].items():
+            print("floor hit %s: %s" % (rule_id, ", ".join(paths)))
+        if not for_rater["floor_hits"]:
+            print("floor hit: none")
+    return EXIT_OK
+
+
+cmd_impact_matrix.direct = True
 
 
 def cmd_impact_floor(args, runner, now):
@@ -22094,6 +22174,8 @@ def cmd_impact_floor(args, runner, now):
             print("impact floor for %s at %s: %s, %s %s" % (report["pr"], (report["head"] or "unknown head")[:8], words, counted, stamp))
         for reason in report.get("owner_reasons") or []:
             print("  %s: %s" % ("why" if owner == "hold" else "because", reason))
+        if report.get("rating_block"):
+            print("  rating: %s" % report["rating_block"])
         if owner == "none" and not report.get("owner_reasons") and not cut and not blind:
             print("  because: no changed path is a top tier path of the matrix, and no independent review or rating holds it")
         if cut and owner != "hold":
@@ -23910,13 +23992,17 @@ def cmd_review(args, runner, now):
         given = rating_inputs(getattr(args, "raw_argv", ()))   # #835: the rating's inputs come from the raw argv through a private parser, never from the shared namespace (a registrar's set_defaults, a replaced parser or a wrapper cannot reach them); a missing raw argv gives no rating
         action, klass = given.get("impact_action"), given.get("impact_class")
         rating_in = {name: given.get(name) for name in IMPACT_RATING_FIELDS}
+        block_digest, block_fields = None, {}
         if given.get("block") is not None:   # the reviewer's returned text: the coder session records it
             carried = {"verdict": verdict, "head": args.head, "blocks": args.blocks, "notes": args.notes, "impact_action": action}
             if any(carried[dest] for flag, dest, mode in BLOCK_FLAG_TABLE if mode == "refused"):
                 raise ReviewError(BLOCK_TABLE_TEXT)
-            fields, why = parse_review_block(_read_capped(given["block"], REVIEW_TABLE_MAX))
+            block_text = _read_capped(given["block"], REVIEW_TABLE_MAX)
+            fields, why = parse_review_block(block_text)
             if fields is None:
                 raise ReviewError("refused: %s" % why)
+            block_raw = block_text.encode("utf-8")
+            block_digest, block_fields = (hashlib.sha256(block_raw).hexdigest(), len(block_raw)), {name: fields[name] for name in IMPACT_RATING_FIELDS}
             verdict, args.head, args.blocks, args.notes, action = (fields["verdict"], fields["head"], fields["blocks"], fields["notes"], fields["impact_action"])
             klass = klass or fields["impact_class"]
             for name in IMPACT_RATING_FIELDS:   # the rating's severity and probability (the score is derived from the matrix's cell), and the reason that names a floor rule
@@ -23984,6 +24070,13 @@ def cmd_review(args, runner, now):
         for name in IMPACT_RATING_FIELDS:
             if rating[name]:
                 entry[name] = plan_ledger.clip(redact_command_text(rating[name]), 200)
+        if reviewer == "impact":   # #901: the block's own bytes and rating lines are kept, so only a record that carries the agent's block counts by score
+            entry["block_sha256"] = block_digest[0] if block_digest else "none"
+            if block_digest:
+                entry["block_size"] = block_digest[1]
+                for name, value in block_fields.items():
+                    if value:
+                        entry["block_" + name] = plan_ledger.clip(redact_command_text(value), 200)
         if impact_class:
             entry["impact_class"] = impact_class   # #451 slice 2: the class of the impact that drives the action; a missing one holds for the owner
         stored = plan_ledger.append_entry(state, entry, now())
@@ -24676,6 +24769,9 @@ def add_impact_parsers(sub):
     floor.add_argument("--rating", action="append", metavar="SEVERITY/PROBABILITY",
                        help="An independent rating's impact, e.g. Critical/Remote (repeatable; it can only add a hold; Eliminated is not rated)")
     floor.add_argument("--json", action="store_true")
+    matrix = impact_sub.add_parser("matrix", help="Read-only: print the kit's impact matrix words (severities, probabilities, cells, floor rule ids); with --for-rater also a pull request's floor hits (for a repository with no review laws)")
+    matrix.add_argument("--for-rater", dest="for_rater", metavar="PR", help="Also that pull request's floor report: owner/repo#N or its URL")
+    matrix.add_argument("--json", action="store_true")
     hold = impact_sub.add_parser("hold", help="What the daemon would label as held right now (read-only dry run; the daemon writes the labels)")
     hold.add_argument("--dry-run", action="store_true", dest="dry_run")
     hold.add_argument("--repo", help="One repo (OWNER/REPO); default: every repo under plan_gates")
