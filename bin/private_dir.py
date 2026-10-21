@@ -30,7 +30,7 @@ def _dangling(path):
 
 def chmod_private(path, mode=0o700):
     """Set `mode` on the directory `path` without following a link: the mode goes on a descriptor opened with O_NOFOLLOW, so a link a same-user
-    process swapped in since the caller's mkdir or check is refused (OSError, ELOOP) and its target is never changed. Every site that sets a directory's mode calls this."""
+    process swapped in since the caller's mkdir or check is refused (OSError, ELOOP) and its target is never changed. Used where a link is never legitimate there (the helper's own mkdir, `record_dir`, `cloud_dir`, `agent_tmp_env`). Two sites follow a link ON PURPOSE and keep the plain chmod: the job directory of `job start` and the profile's `state` directory may be links to directories, and their target is chmodded as it always was; a same-user swap there is an accepted risk (the same user owns both ends)."""
     fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         os.fchmod(fd, mode)

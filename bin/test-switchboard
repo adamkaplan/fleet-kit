@@ -9613,66 +9613,127 @@ class TestPrivateDir(Base):
         ("branch_the_second_directory_check_is_not_skipped", ("elif not os.path.isdir(str(path)):", "elif os.path.islink(str(path)) and not os.path.isdir(str(path)):", 0)),
     )
 
-    # every site that sets a directory's mode: (file, function) -> the driver id in `drivers` that runs the real function. Derived from the code below.
-    SWAP_SITES = {("agent_presence.py", "record_dir"): 19, ("cloud_worker.py", "cloud_dir"): 20, ("fleet-switchboard", "agent_tmp_env"): 3,
-                  ("fleet-switchboard", "cmd_job"): 9, ("fleet-switchboard", "step_profile"): 16}
+    # Every site that sets a directory's mode. NOFOLLOW sites: (file, function) -> driver id; the swap test drives the real function.
+    SWAP_SITES = {("agent_presence.py", "record_dir"): 19, ("cloud_worker.py", "cloud_dir"): 20, ("fleet-switchboard", "agent_tmp_env"): 3}
+    # Sites that FOLLOW a link on purpose (the directory may be a link to a directory): the old chmod, pinned by a test and a mutant.
+    FOLLOW_SITES = {("fleet-switchboard", "cmd_job"), ("fleet-switchboard", "step_profile")}
 
-    def mode_sites_in_code(self):
-        found = set()
+    def mode_calls_in_code(self):
+        """(nofollow sites, following sites) found by ast in every Python file of bin/ except the tests and the helper."""
+        nofollow, following = set(), set()
         for path in sorted(BIN.iterdir()):
             if path.is_dir() or path.name.startswith("test-") or (path.suffix != ".py" and path.name != "fleet-switchboard") or path.name == "private_dir.py":
                 continue
-            tree = ast.parse(path.read_text())
-            for function in ast.walk(tree):
-                if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for function in ast.walk(ast.parse(path.read_text())):
+                if isinstance(function, ast.FunctionDef):
                     for node in ast.walk(function):
                         if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "chmod_private":
-                            found.add((path.name, function.name))
-        return found
+                            nofollow.add((path.name, function.name))
+                        if isinstance(node, ast.Call) and ast.unparse(node.func) == "os.chmod" and len(node.args) == 2 and ast.unparse(node.args[0]).startswith("str(") \
+                                and isinstance(node.args[1], ast.Constant) and node.args[1].value == 0o700 and path.name != "review_checkout.py":
+                            following.add((path.name, function.name))
+        return nofollow, following
 
-    def test_every_site_that_sets_a_directory_mode_has_a_swap_row_and_none_follows_a_link(self):
-        self.assertEqual(self.mode_sites_in_code(), set(self.SWAP_SITES), "a mode-setting site has no swap row, or a row has no site")
-        for path in sorted(BIN.iterdir()):   # a hand-rolled following chmod of 0700 is the old form: only the restore of the review checkout keeps one
-            if path.is_dir() or path.name.startswith("test-") or (path.suffix != ".py" and path.name != "fleet-switchboard"):
-                continue
-            hits = [n.lineno for n in ast.walk(ast.parse(path.read_text())) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "chmod"
-                    and any(isinstance(a, ast.Constant) and a.value == 0o700 for a in n.args)]
-            if path.name != "review_checkout.py":
-                self.assertEqual(hits, [], "%s: a following chmod(0700) at line %s: use private_dir.chmod_private" % (path.name, hits))
+    def test_every_site_that_sets_a_directory_mode_has_a_row_and_a_mutant(self):
+        nofollow, following = self.mode_calls_in_code()
+        self.assertEqual(nofollow, set(self.SWAP_SITES), "a no-follow mode site has no swap row, or a row has no site")
+        self.assertEqual(following, self.FOLLOW_SITES, "a site that follows a link is not listed as following on purpose, or a listed one is gone")
 
-    def swap_site(self, number, following):
-        """Run the real site; the same user swaps the directory for a link to a 0755 directory at the moment it sets the mode. Returns the target's mode."""
-        shutil.rmtree(str(self.base), ignore_errors=True)   # each run starts from nothing: a site reached a second time finds its directory made
+    def mutated_site(self, name, function, to_following):
+        """The real site's own function with its mode call changed to the other form (in the site itself, from its source)."""
+        module = {"fleet-switchboard": sb}.get(name) or sb.load_module(name[:-3])
+        tree = ast.parse((BIN / name).read_text())
+        owner = None
+        for node in ast.walk(tree):
+            for child in (node.body if isinstance(getattr(node, "body", None), list) else []):
+                if isinstance(child, ast.FunctionDef) and child.name == function:
+                    owner = (node, child)
+        node, fn = owner
+        want = "os.chmod" if to_following else None
+
+        class Swap(ast.NodeTransformer):
+            def visit_Call(self, call):
+                self.generic_visit(call)
+                if to_following and getattr(call.func, "attr", "") == "chmod_private":
+                    return ast.parse("os.chmod(str(%s), 0o700)" % ast.unparse(call.args[0]), mode="eval").body
+                if not to_following and ast.unparse(call.func) == "os.chmod" and len(call.args) == 2 and ast.unparse(call.args[0]).startswith("str("):
+                    return ast.parse("load_module('private_dir').chmod_private(%s)" % ast.unparse(call.args[0].args[0]), mode="eval").body
+                return call
+        fn.decorator_list = []
+        changed = ast.fix_missing_locations(Swap().visit(copy.deepcopy(fn)))
+        self.assertNotEqual(ast.dump(changed), ast.dump(fn), "the mutation changed nothing in %s" % function)
+        scope, missing = module.__dict__, object()   # the module's own globals, so a patched helper is seen by the mutated site too
+        saved = scope.get(function, missing)
+        exec(compile(ast.Module([changed], []), name, "exec"), scope)
+        built = scope[function]
+        if saved is missing:
+            del scope[function]
+        else:
+            scope[function] = saved
+        holder = module if isinstance(node, ast.Module) else getattr(module, node.name)
+        return mock.patch.object(holder, function, built)
+
+    def swap_after_the_check(self, number, function, mutant=None):
+        """Run the real site; right after the site's own lstat the same user swaps the directory for a link to a 0755 directory. Returns the target's mode."""
+        shutil.rmtree(str(self.base), ignore_errors=True)
         self.base.mkdir()
-        modules = {id(m): m for m in (sb.load_module("private_dir"), sys.modules.get("private_dir")) if m is not None}
         target = self.real(Path(tempfile.mkdtemp(dir=str(self.base))) / "t")
         os.chmod(str(target), 0o755)
-        swapped = []
-        originals = {k: m.chmod_private for k, m in modules.items()}
+        real, swapped = os.lstat, []
 
-        def hook(path, mode=0o700):
-            if not swapped:
-                swapped.append(path)
-                shutil.rmtree(str(path))
-                os.symlink(str(target), str(path))
-            if following:
-                return os.chmod(str(path), mode)   # the old form
-            return originals[next(iter(originals))](path, mode)
+        def lstat(where, *a, **k):
+            found = real(where, *a, **k)
+            if not swapped and sys._getframe(1).f_code.co_name == function and stat.S_ISDIR(found.st_mode):
+                swapped.append(where)
+                os.rmdir(where)
+                os.symlink(str(target), where)
+            return found
         with contextlib.ExitStack() as stack:
-            for m in modules.values():
-                stack.enter_context(mock.patch.object(m, "chmod_private", hook))
+            if mutant is not None:
+                stack.enter_context(mutant)
+            stack.enter_context(mock.patch.object(os, "lstat", lstat))
             try:
                 self.drivers(lambda p: p)[number]()
             except Exception:
                 pass   # refused: the site never followed the link
-        self.assertTrue(swapped, "the site never set a mode: the driver does not reach it")
+        self.assertTrue(swapped, "the swap did not happen at the site %s" % function)
         return stat.S_IMODE(target.stat().st_mode)
 
-    def test_a_link_swapped_in_before_each_mode_is_set_is_never_followed_and_the_following_form_is_caught(self):
+    def test_a_link_swapped_in_after_each_sites_own_check_is_never_chmodded_and_the_following_form_in_the_site_is_caught(self):
         for (name, function), number in sorted(self.SWAP_SITES.items()):
             with self.subTest(site=function):
-                self.assertEqual(self.swap_site(number, following=False), 0o755, "the link's target was chmodded")
-                self.assertEqual(self.swap_site(number, following=True), 0o700, "the following form is not caught: the swap did not reach the target")
+                self.assertEqual(self.swap_after_the_check(number, function), 0o755, "the link's target was chmodded")
+                after = self.swap_after_the_check(number, function, self.mutated_site(name, function, True))
+                self.assertEqual(after, 0o700, "the mutant (the following chmod, in the site) survived")
+
+    def follow_run(self, which, mutant=None):
+        shutil.rmtree(str(self.base), ignore_errors=True)
+        self.base.mkdir()
+        target = self.real(Path(tempfile.mkdtemp(dir=str(self.base))) / "t")
+        os.chmod(str(target), 0o755)
+
+        def place(path):
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            if which == "step_profile":   # the profile's `state` is a link to a directory, another profile directory is missing
+                Path(path).mkdir(parents=True, exist_ok=True)
+                os.symlink(str(target), str(Path(path) / "state"))
+            else:
+                os.symlink(str(target), str(path))
+            return path
+        with contextlib.ExitStack() as stack:
+            if mutant is not None:
+                stack.enter_context(mutant)
+            try:
+                self.drivers(place)[{"cmd_job": 9, "step_profile": 16}[which]]()
+            except Exception:
+                pass
+        return stat.S_IMODE(target.stat().st_mode)
+
+    def test_the_sites_that_follow_a_link_on_purpose_still_do_and_a_no_follow_mutant_is_caught(self):
+        for name, function in sorted(self.FOLLOW_SITES):
+            with self.subTest(site=function):
+                self.assertEqual(self.follow_run(function), 0o700, "the site no longer follows a link to a directory")
+                self.assertNotEqual(self.follow_run(function, self.mutated_site(name, function, False)), 0o700, "the no-follow mutant survived")
 
     def test_every_bit_mutant_is_derived_from_the_mask(self):
         self.assertEqual(len(self.PERMISSION_BITS), 6)
