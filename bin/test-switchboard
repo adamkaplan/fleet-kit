@@ -78135,6 +78135,60 @@ class TestGhShimMergeGate(Base):
         for family in ("PYTHONPATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "MADE_UP_VARIABLE", "PATH"):
             self.assertIn(family, problems)
 
+    IDENTITY_ROWS = {"LANG": "en_US.UTF-8", "LC_ALL": "C", "LC_CTYPE": "C", "TMPDIR": "/tmp/x", "TERM": "xterm", "HERDR_SOCKET_PATH": "/tmp/h.sock", "HERDR_PANE_ID": "p_1",
+                     "HERDR_TAB_ID": "t_1", "HERDR_WORKSPACE_ID": "w_1", "OPENCODE_SESSION_ID": "ses_example", "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_REPO": "acme/app"}
+
+    def allowed_names(self):
+        """The names `sb_env` may pass, DERIVED from the code: the literal of `ENV_ALLOW` in the shim's source."""
+        import ast
+        for n in ast.parse(SHIM.read_text()).body:
+            if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "ENV_ALLOW" for t in n.targets):
+                return [e.value for e in n.value.elts]
+        self.fail("ENV_ALLOW not found")
+
+    def allow_problems(self):
+        """[problem] per allow-list name that does not pass with its value when the caller sets it, and for HOME and the python."""
+        shim = self.shim_module()
+        problems = []
+        for name, value in self.IDENTITY_ROWS.items():
+            with mock.patch.dict(os.environ, {name: value}):
+                if shim.sb_env().get(name) != value:
+                    problems.append(name)
+        with mock.patch.dict(os.environ, {"HOME": "/tmp/evil-home-dir"}):
+            if shim.sb_env().get("HOME") != shim.mg_home():
+                problems.append("HOME")
+        hostile = self.home / "hostile-bin"
+        hostile.mkdir(exist_ok=True)
+        fake = hostile / "python3"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o755)
+        script = self.home / "pyprog"
+        script.write_text("#!/usr/bin/env python3\nprint(1)\n")
+        with mock.patch.dict(os.environ, {"PATH": "%s:%s" % (hostile, os.environ.get("PATH", ""))}):
+            if shim.sb_argv(str(script), "x")[0] == str(fake):
+                problems.append("python3")
+        return problems
+
+    def test_every_allow_listed_name_passes_when_set_and_has_a_row_and_home_and_python_come_from_the_fixed_places(self):
+        self.assertEqual(sorted(self.allowed_names()), sorted(self.IDENTITY_ROWS), "a name added to ENV_ALLOW needs a row in IDENTITY_ROWS")
+        self.assertEqual(self.allow_problems(), [])
+
+    def test_a_mutant_of_each_allow_list_row_is_seen(self):
+        for name in self.allowed_names():
+            with self.subTest(name=name):
+                self.mutated_shim('"%s"' % name, '"UNLISTED_%s"' % name, count=SHIM.read_text().count('"%s"' % name))
+                problems = self.allow_problems()
+                self.shim_path = None
+                self.assertIn(name, problems)
+        cases = (("HOME", 'env["HOME"] = home', 'env["HOME"] = os.environ.get("HOME", home)'),
+                 ("python3", 'shutil.which("python3", path=ENV_PATH)', 'shutil.which("python3")'))
+        for name, old, new in cases:
+            with self.subTest(name=name):
+                self.mutated_shim(old, new)
+                problems = self.allow_problems()
+                self.shim_path = None
+                self.assertIn(name, problems)
+
     def start_calls(self):
         """The calls of shims/gh that start the switchboard, FOUND IN THE CODE: a call whose command is `sb_argv(binary, ...)`. Each: (the call node, its env keyword node)."""
         import ast
