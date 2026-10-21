@@ -77889,7 +77889,8 @@ class TestBlockedReport(Base):
         self.wait(25)
         self.assertEqual(len(self.told("cos")), 1)
         sb._write_small(self.world.state, sb.BLOCKED_HELD_SENDS, {"coder": {"rows": "nope"}})
-        self.passes()
+        self.world.engine.run_pass()
+        self.assertEqual(self.world.engine.run_pass()["errors"], [])
 
     def test_the_threshold_is_exact(self):
         self.block()
@@ -77910,12 +77911,13 @@ class TestBlockedReport(Base):
                         {"coder": sb.Plan("coder", "hold", "coder has status unknown in herdr", [])})
         self.assertTrue(any("still held: coder has status unknown" in e["detail"]["text"] for e in self.audits("blocked.end")))
 
-    def test_a_block_whose_agent_is_gone_says_nothing_and_a_new_session_restarts_the_clock(self):
+    def test_a_block_whose_agent_is_gone_says_nothing(self):
         self.block()
         self.wait(25)
         told = len(self.told("cos"))
         del self.world.herdr.panes[self.world.panes["coder"]]
-        self.passes()
+        self.world.engine.run_pass()
+        self.assertEqual(self.world.engine.run_pass()["errors"], [])
         self.assertEqual((len(self.told("cos")), self.audits("blocked.end")), (told, []))
         self.assertNotIn("coder", sb._read_small(self.world.state, sb.BLOCKED_ALERT_STATE))
 
@@ -77923,16 +77925,154 @@ class TestBlockedReport(Base):
         with mock.patch.object(sb, "blocked_tick", side_effect=RuntimeError("boom")):
             report = self.world.engine.run_pass()
         self.assertEqual([e["step"] for e in report["errors"]], ["blocked-alert"])
+        (audited,) = [e for e in self.world.audit() if e["event"] == "error" and e["subject"] == "blocked-alert"]
+        self.assertIn("boom", audited["detail"]["error"])
 
-    def test_no_chief_of_staff_and_a_boss_that_is_the_blocked_agent(self):
+    # ---- every branch of the new code, each with its effect
+
+    def reminders_to(self, name):
+        return [r for r in sb.read_reminders(self.world.state) if r["to"] == name]
+
+    def test_a_new_session_for_the_same_agent_restarts_the_clock(self):
+        self.block()
+        self.wait(25)
+        old = sb._read_small(self.world.state, sb.BLOCKED_ALERT_STATE)["coder"]
+        self.assertIn("reported", old)
+        fresh = self.world.v2.create_session({"fleet": {"name": "coder", "role": "coder", "reports_to": "platform"}})
+        self.pane["session"] = fresh
+        self.world.engine.send("cos", "coder", "again")
+        self.passes()
+        new = sb._read_small(self.world.state, sb.BLOCKED_ALERT_STATE)["coder"]
+        self.assertEqual((new["session"], "reported" in new), (fresh, False))
+        self.assertGreater(new["since"], old["since"])
+        self.assertEqual(len(self.audits()), 1, "the new session's block is not yet old enough")
+
+    def test_the_alert_turned_off_reports_nothing_and_keeps_no_state(self):
+        self.world = World(self, agents=(), config={"blocked_alert": False})
+        for name, fleet in (("cos", {"role": "chief-of-staff"}), ("coder", {"role": "coder", "reports_to": "cos"})):
+            self.world.add_agent(name, fleet=fleet)
+        self.pane = self.world.herdr.panes[self.world.panes["coder"]]
+        self.block()
+        self.wait(30)
+        self.assertEqual(self.world.engine.run_pass()["errors"], [], "off is not a failing step")
+        self.assertEqual((self.reminders_to("cos"), self.audits(), (self.world.state / sb.BLOCKED_ALERT_STATE).exists()), ([], [], False))
+
+    def test_a_chief_of_staff_that_is_blocked_is_not_told_about_itself_and_none_is_added_to_nobody(self):
+        world = World(self, agents=(), config={})
+        world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        world.herdr.panes[world.panes["cos"]]["status"] = "blocked"
+        self.world = world
+        world.engine.send("x", "cos", "hello")
+        world.engine.run_pass()
+        world.tick(1500)
+        world.engine.run_pass()
+        (report,) = self.audits()
+        self.assertEqual((report["subject"], report["detail"]["told"], self.reminders_to("cos")), ("cos", [], []))
+
+    def test_no_chief_of_staff_and_a_boss_that_is_itself_means_nobody_is_told_but_the_report_is_audited(self):
         world = World(self, agents=(), config={})
         world.add_agent("solo", fleet={"role": "coder", "reports_to": "solo"})
         world.herdr.panes[world.panes["solo"]]["status"] = "blocked"
+        self.world = world
         world.engine.send("x", "solo", "hello")
+        world.engine.run_pass()
         world.tick(1500)
         world.engine.run_pass()
-        self.assertEqual(sb.blocked_tick(world.engine, world.engine.discover(world.clock.now()), {}), [])
+        (report,) = self.audits()
+        self.assertEqual((report["detail"]["told"], sb.read_reminders(world.state)), ([], []))
 
+    def test_a_boss_that_is_also_the_chief_of_staff_is_told_once(self):
+        self.pane = self.world.herdr.panes[self.world.panes["platform"]]
+        self.pane["status"] = "blocked"
+        self.world.engine.send("coder", "platform", "hello")
+        self.world.tick(90)
+        self.passes()
+        self.wait(25)
+        self.assertEqual(len(self.told("cos")), 1)
+        self.assertEqual(self.audits()[0]["detail"]["told"], ["cos"])
+
+    def test_a_send_held_for_an_agent_that_is_not_blocked_is_not_remembered(self):
+        observation = self.world.engine.discover(self.world.clock.now()).agents["coder"]
+        sb.note_held_send(self.world.state, "coder", "cos", 1.0, observation)
+        sb.note_held_send(self.world.state, "coder", "cos", 1.0, None)
+        sb.note_held_send(None, "coder", "cos", 1.0, self.blocked_observation())
+        self.assertFalse((self.world.state / sb.BLOCKED_HELD_SENDS).exists())
+
+    def test_a_failed_write_of_a_held_send_never_reaches_the_sender(self):
+        observation = self.blocked_observation()
+        with mock.patch.object(sb, "blocked_update", side_effect=OSError("disk full")):
+            sb.note_held_send(self.world.state, "coder", "cos", 1.0, observation)
+
+    def test_held_sends_of_an_agent_no_longer_blocked_are_forgotten_and_a_blocked_agents_are_kept(self):
+        rows = {"rows": [{"from": "cos", "at": 1.0}]}
+        sb._write_small(self.world.state, sb.BLOCKED_HELD_SENDS, {"platform": rows, "coder": rows})
+        self.blocked_observation()
+        sb.blocked_tick(self.world.engine, self.world.engine.discover(self.world.clock.now()), {})
+        self.assertEqual(sorted(sb._read_small(self.world.state, sb.BLOCKED_HELD_SENDS)), ["coder"])
+
+    def test_the_kind_of_block_for_each_open_request_and_when_it_was_not_read(self):
+        observation = self.blocked_observation()
+        bare = mock.Mock(sources=[])
+        self.assertIn("(not read)", sb.blocked_kind(bare, observation))
+        source = sb.WorkerFacts()
+        engine = mock.Mock(sources=[source])
+        for found, words in ((["permission"], "an open permission request; it goes to the owner"), (["question"], "an open question; it goes to the owner"),
+                             (["permission", "question"], "an open permission request and an open question; it goes to the owner")):
+            source.requests = [(observation, kind, {"id": "x"}) for kind in found]
+            self.assertEqual(sb.blocked_kind(engine, observation), words)
+        source.requests = [(mock.Mock(session_id="other"), "permission", {"id": "x"})]
+        self.assertIn("ended turn", sb.blocked_kind(engine, observation), "another agent's request is not this one's")
+
+    def test_a_block_that_ends_before_it_was_reported_says_nothing(self):
+        self.block()
+        self.wait(10)
+        self.pane["status"] = "idle"
+        self.passes()
+        self.assertEqual((self.audits("blocked.end"), self.told("cos"), "coder" in sb._read_small(self.world.state, sb.BLOCKED_ALERT_STATE)), ([], [], False))
+
+    def test_the_repeat_is_exact_at_the_hour(self):
+        self.block()
+        self.wait(25)
+        self.world.tick(60 * 60 - 1 - 2 * 0)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.audits("blocked.repeat")), 0)
+        self.world.tick(1)
+        self.passes()
+        self.assertEqual(len(self.audits("blocked.repeat")), 1)
+
+    def test_a_pass_with_no_audit_log_still_reports_once(self):
+        self.world.engine = self.world.new_engine(writable=False)
+        self.block()
+        self.wait(25)
+        self.assertEqual([e for e in self.world.engine.run_pass()["errors"] if e["step"] == "blocked-alert"], [])   # the read-only engine cannot deliver: that is not this step
+        self.wait(5)
+        self.assertEqual(len([r for r in self.reminders_to("cos") if "Blocked agent" in r["text"]]), 1)
+
+    def test_only_the_blocked_agents_own_reminders_due_in_the_block_are_in_the_line(self):
+        observation = self.blocked_observation()
+        now = self.world.clock.now()
+        mine = sb.add_reminder(self.world.state, "coder", now - 5, now - 900, "mine", sender="coder")["id"]
+        others = sb.add_reminder(self.world.state, "coder", now - 5, now - 900, "boss's", sender="platform")["id"]
+        later = sb.add_reminder(self.world.state, "coder", now + 600, now - 900, "later", sender="coder")["id"]
+        before = sb.add_reminder(self.world.state, "coder", now - 5000, now - 9000, "before", sender="coder")["id"]
+        to_other = sb.add_reminder(self.world.state, "platform", now - 5, now - 900, "other", sender="coder")["id"]
+        line = sb.blocked_line(self.world.engine, observation, now - 1500, now, [], "x")
+        self.assertIn(mine, line)
+        for excluded in (others, later, before, to_other):
+            self.assertNotIn(excluded, line)
+        self.assertIn("from nobody", line)
+        self.assertEqual(line.count("reminders"), 1)
+        self.assertNotIn("reminders", sb.blocked_line(self.world.engine, observation, now - 1500, now - 1000, ["cos"], "x"))
+
+    def test_the_config_branches(self):
+        base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        for bad in ({"repeat_minutes": 0}, {"repeat_minutes": -1}, {"minutes": True}):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config(dict(base, blocked_alert=bad))
+        self.assertIsNone(sb.validate_config(dict(base, blocked_alert=None)).get("blocked_alert"))
+        self.assertEqual(sb.blocked_alert_section(sb.validate_config(dict(base, blocked_alert=None))), sb.BLOCKED_ALERT_DEFAULTS)
+        self.assertEqual(sb.validate_config(dict(base, blocked_alert={"repeat_minutes": 5}))["blocked_alert"], {"minutes": 20, "repeat_minutes": 5})
+        self.assertIs(sb.validate_config(dict(base, blocked_alert=False)).get("blocked_alert"), False)
 
     def test_a_pass_makes_no_gh_call(self):
         with mock.patch.object(sb.subprocess, "run", side_effect=AssertionError("a pass ran a process")), \
