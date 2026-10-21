@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""cw-gh: the small GitHub client of the cloud worker pod. It REPLACES the real `gh` binary, which the image no longer holds.
+
+usage: cw-gh <group> <verb> [args]        (the pod's `gh` wrapper runs the guard first, then this program)
+
+It is a convenience for the verbs a worker's task needs, NOT a boundary. The token's scope and the repository's own rules
+are the boundary: a worker who can read the token file can send any request the token allows with `curl` or `python3`.
+What this client does is narrow the accidents: it has no verb that merges, approves, writes an issue, a label or a setting.
+
+Verbs (the one table, VERBS below; docs and tests are derived from it):
+  pr create|view|list|comment|checks|diff|ready, repo view, issue view|list (read only), run view|list|logs (read only),
+  api (GET only).
+Everything else exits 2 with one line. The token is read from GH_TOKEN (set by the wrapper for this one call) and is never
+printed. Output differs from the real gh: `--json` prints the raw REST object, `--jq` and `--template` are not supported.
+Exit 0 ok, 1 failed (an HTTP error names its status), 2 not available or bad usage, 8 `pr checks` with checks pending.
+"""
+import http.client
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+
+API = "https://api.github.com"
+MAX_BYTES = 20 * 1024 * 1024
+MAX_LOG = 5 * 1024 * 1024  # of log text printed
+TIMEOUT = 60
+MAX_ENTRIES = 2000
+# Text from outside (titles, bodies, logs) never reaches the agent's terminal with control, escape or bidi characters in it.
+UNSAFE = re.compile("[\\x00-\\x08\\x0b-\\x1f\\x7f-\\x9f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069]")
+
+
+class Clean:
+    def __init__(self, real):
+        self.real = real
+
+    def write(self, text):
+        return self.real.write(UNSAFE.sub("?", text))
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+
+class Fail(Exception):
+    def __init__(self, msg, code=1):
+        super().__init__(str(msg).replace("\n", "?"))   # one line, always
+        self.code = code
+
+
+def api_base():
+    b = os.environ.get("CW_GH_API_BASE")
+    if not b:
+        return API
+    u = urllib.parse.urlsplit(b)
+    if u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost", "::1") and not u.username:
+        return b.rstrip("/")
+    raise Fail("CW_GH_API_BASE must be a loopback http URL (it exists for tests)", 2)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+OPENER = urllib.request.build_opener(NoRedirect)
+
+
+def token():
+    t = (os.environ.get("GH_TOKEN") or "").strip()
+    if not t:
+        raise Fail("no token: this client is run by the pod's gh wrapper, which supplies it")
+    return t
+
+
+def request(method, path, body=None, accept="application/vnd.github+json", want_location=False):
+    """One call. Returns the bytes of the answer (or the Location of a redirect with want_location)."""
+    data = None if body is None else json.dumps(body).encode()
+    h = {"Authorization": "Bearer " + token(), "Accept": accept, "X-GitHub-Api-Version": "2022-11-28",
+         "User-Agent": "cw-gh"}
+    if data is not None:
+        h["Content-Type"] = "application/json"
+    req = urllib.request.Request(api_base() + path, data=data, method=method, headers=h)
+    try:
+        with OPENER.open(req, timeout=TIMEOUT) as r:
+            raw = r.read(MAX_BYTES + 1)
+    except urllib.error.HTTPError as e:
+        if want_location and e.code in (301, 302, 307):
+            return e.headers.get("Location")
+        msg = ""
+        try:
+            msg = str(json.loads(e.read(4096)).get("message", ""))[:200]
+        except Exception:
+            pass
+        raise Fail("HTTP %d on %s %s%s" % (e.code, method, path.split("?")[0], (": " + msg) if msg else ""))
+    except (OSError, ValueError, http.client.HTTPException):
+        raise Fail("%s %s failed (network error)" % (method, path.split("?")[0]))
+    if len(raw) > MAX_BYTES:
+        raise Fail("the answer to %s %s is larger than %d bytes" % (method, path.split("?")[0], MAX_BYTES))
+    return raw
+
+
+def parse_json(raw):
+    try:
+        return json.loads(raw)
+    except ValueError:
+        raise Fail("the answer was not JSON")
+
+
+def get_json(path):
+    try:
+        return parse_json(request("GET", path))
+    except ValueError:
+        raise Fail("the answer to GET %s was not JSON" % path.split("?")[0])
+
+
+# ---- arguments ----
+
+def parse(args, flags):
+    """flags: {name: (key, takes_value)}; returns (options, positionals). An unknown flag is a usage error."""
+    opts, pos, i = {}, [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            pos += args[i + 1:]
+            break
+        if a.startswith("-") and a != "-":
+            name, eq, val = a.partition("=") if a.startswith("--") else (a, "", "")
+            if a.startswith("-") and not a.startswith("--") and len(a) > 2:
+                name, val, eq = a[:2], a[2:], "="
+            if name not in flags:
+                raise Fail("the option %s is not available in this client" % name[:40], 2)
+            key, takes = flags[name]
+            if takes:
+                if eq:
+                    opts[key] = val
+                else:
+                    i += 1
+                    if i >= len(args):
+                        raise Fail("the option %s needs a value" % name, 2)
+                    opts[key] = args[i]
+            else:
+                if eq:
+                    raise Fail("the option %s takes no value" % name[:40], 2)
+                opts[key] = True
+        else:
+            pos.append(a)
+        i += 1
+    return opts, pos
+
+
+def git(*a):
+    try:
+        p = subprocess.run(["git"] + list(a), capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def repo_of(opts):
+    r = opts.get("repo")
+    if not r:
+        url = git("remote", "get-url", "origin")
+        m = re.search(r"github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$", url)
+        r = m.group(1) if m else None
+    if not r or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", r) or any(x in (".", "..") for x in r.split("/")):
+        raise Fail("no repository: pass -R OWNER/NAME or run inside a checkout whose origin is on github.com", 2)
+    return r
+
+
+def number_of(repo, pos, opts=None):
+    """The pull request number: an argument (a number, or a branch name) or the current branch's."""
+    ref = pos[0] if pos else git("symbolic-ref", "--quiet", "--short", "HEAD")
+    if not ref:
+        raise Fail("name a pull request number or branch", 2)
+    ref = ref.lstrip("#")
+    if ref.isdigit():
+        return int(ref)
+    q = urllib.parse.urlencode({"head": repo.split("/")[0] + ":" + ref, "state": "all", "per_page": 1})
+    found = get_json("/repos/%s/pulls?%s" % (repo, q))
+    if not isinstance(found, list) or not found:
+        raise Fail("no pull request found for %s" % ref[:60])
+    return found[0]["number"]
+
+
+def limit_of(opts, default):
+    v = str(opts.get("limit", default))
+    return int(v) if v.isdigit() and int(v) > 0 else default
+
+
+def show(obj, opts):
+    print(json.dumps(obj, indent=2, sort_keys=True))
+
+
+COMMON = {"-R": ("repo", True), "--repo": ("repo", True), "--json": ("json", True)}
+
+
+def body_of(opts):
+    if "body" in opts and "body_file" in opts:
+        raise Fail("use --body or --body-file, not both", 2)
+    if "body_file" in opts:
+        try:
+            if opts["body_file"] == "-":
+                return sys.stdin.read(1 << 20)
+            with open(opts["body_file"], encoding="utf-8") as f:
+                return f.read(1 << 20)
+        except OSError:
+            raise Fail("the body file could not be read", 2)
+    return opts.get("body")
+
+
+# ---- verbs ----
+
+def pr_create(args):
+    opts, pos = parse(args, dict(COMMON, **{"--title": ("title", True), "-t": ("title", True), "--body": ("body", True),
+                                            "-b": ("body", True), "--body-file": ("body_file", True), "-F": ("body_file", True),
+                                            "--base": ("base", True), "-B": ("base", True), "--head": ("head", True),
+                                            "-H": ("head", True), "--draft": ("draft", False), "-d": ("draft", False)}))
+    if pos:
+        raise Fail("pr create takes no positional argument", 2)
+    repo = repo_of(opts)
+    body = body_of(opts)
+    head = opts.get("head") or git("symbolic-ref", "--quiet", "--short", "HEAD")
+    if not opts.get("title") or body is None or not head:
+        raise Fail("pr create needs --title, --body (or --body-file) and a head branch (this client never prompts)", 2)
+    base = opts.get("base")
+    if not base:
+        base = (get_json("/repos/" + repo) or {}).get("default_branch")
+    payload = {"title": opts["title"], "body": body, "head": head, "base": base, "draft": bool(opts.get("draft"))}
+    out = parse_json(request("POST", "/repos/%s/pulls" % repo, payload))
+    print(out.get("html_url", ""))
+
+
+def pr_view(args):
+    opts, pos = parse(args, COMMON)
+    repo = repo_of(opts)
+    pr = get_json("/repos/%s/pulls/%d" % (repo, number_of(repo, pos)))
+    if "json" in opts:
+        return show(pr, opts)
+    print("title:\t%s\nstate:\t%s%s\nauthor:\t%s\nurl:\t%s\nhead:\t%s\nbase:\t%s\n--\n%s" % (
+        pr.get("title"), pr.get("state"), " (merged)" if pr.get("merged") else "", (pr.get("user") or {}).get("login"),
+        pr.get("html_url"), (pr.get("head") or {}).get("ref"), (pr.get("base") or {}).get("ref"), pr.get("body") or ""))
+
+
+def pr_list(args):
+    opts, pos = parse(args, dict(COMMON, **{"--state": ("state", True), "-s": ("state", True), "--limit": ("limit", True),
+                                            "-L": ("limit", True), "--base": ("base", True), "-B": ("base", True),
+                                            "--head": ("head", True), "-H": ("head", True)}))
+    if pos:
+        raise Fail("pr list takes no positional argument", 2)
+    repo = repo_of(opts)
+    state = opts.get("state", "open")
+    if state not in ("open", "closed", "merged", "all"):
+        raise Fail("--state is open, closed, merged or all", 2)
+    limit = limit_of(opts, 30)
+    q = {"state": "closed" if state == "merged" else state, "per_page": 100 if state == "merged" else min(max(limit, 1), 100)}
+    if "base" in opts:
+        q["base"] = opts["base"]
+    if "head" in opts:
+        q["head"] = repo.split("/")[0] + ":" + opts["head"]
+    rows = get_json("/repos/%s/pulls?%s" % (repo, urllib.parse.urlencode(q)))
+    if state == "merged":
+        rows = [r for r in rows if r.get("merged_at")]
+    rows = rows[:limit]
+    if "json" in opts:
+        return show(rows, opts)
+    for r in rows:
+        print("%s\t%s\t%s\t%s" % (r["number"], r["title"], (r.get("head") or {}).get("ref"), r["state"]))
+
+
+def pr_comment(args):
+    opts, pos = parse(args, dict(COMMON, **{"--body": ("body", True), "-b": ("body", True), "--body-file": ("body_file", True),
+                                            "-F": ("body_file", True)}))
+    repo = repo_of(opts)
+    body = body_of(opts)
+    if not body:
+        raise Fail("pr comment needs --body or --body-file (this client never prompts)", 2)
+    out = parse_json(request("POST", "/repos/%s/issues/%d/comments" % (repo, number_of(repo, pos)), {"body": body}))
+    print(out.get("html_url", ""))
+
+
+def pr_checks(args):
+    opts, pos = parse(args, COMMON)
+    repo = repo_of(opts)
+    pr = get_json("/repos/%s/pulls/%d" % (repo, number_of(repo, pos)))
+    sha = ((pr.get("head") or {}).get("sha") or "")
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise Fail("the pull request answer has no head commit")
+    runs = (get_json("/repos/%s/commits/%s/check-runs?per_page=100" % (repo, sha)) or {}).get("check_runs", [])
+    stat = (get_json("/repos/%s/commits/%s/status" % (repo, sha)) or {}).get("statuses", [])
+    rows = [(r.get("name"), r.get("conclusion") or r.get("status")) for r in runs] + \
+           [(s.get("context"), s.get("state")) for s in stat]
+    if "json" in opts:
+        return show({"check_runs": runs, "statuses": stat}, opts)
+    for name, res in rows:
+        print("%s\t%s" % (name, res))
+    bad = [1 for _, r in rows if r in ("failure", "cancelled", "timed_out", "action_required", "error")]
+    pending = [1 for _, r in rows if r in ("queued", "in_progress", "pending", "waiting", None)]
+    if bad:
+        raise Fail("some checks failed", 1)
+    if pending:
+        raise Fail("some checks are pending", 8)
+
+
+def pr_diff(args):
+    opts, pos = parse(args, dict(COMMON, **{"--name-only": ("names", False)}))
+    repo = repo_of(opts)
+    n = number_of(repo, pos)
+    if opts.get("names"):
+        for f in get_json("/repos/%s/pulls/%d/files?per_page=100" % (repo, n)):
+            print(f["filename"])
+        return
+    sys.stdout.write(request("GET", "/repos/%s/pulls/%d" % (repo, n), accept="application/vnd.github.diff").decode("utf-8", "replace"))
+
+
+def pr_ready(args):
+    opts, pos = parse(args, COMMON)
+    repo = repo_of(opts)
+    pr = get_json("/repos/%s/pulls/%d" % (repo, number_of(repo, pos)))
+    node = pr.get("node_id")
+    if not isinstance(node, str) or not re.fullmatch(r"[A-Za-z0-9_=-]+", node):
+        raise Fail("the pull request answer has no node id")
+    q = "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { number isDraft } } }"
+    out = parse_json(request("POST", "/graphql", {"query": q, "variables": {"id": node}}))
+    if out.get("errors"):
+        raise Fail("GraphQL refused: %s" % str(out["errors"][0].get("message", ""))[:200])
+    print("pull request #%s is ready for review" % pr.get("number"))
+
+
+def repo_view(args):
+    opts, pos = parse(args, COMMON)
+    if pos:
+        opts["repo"] = pos[0]
+    repo = repo_of(opts)
+    r = get_json("/repos/" + repo)
+    if "json" in opts:
+        return show(r, opts)
+    print("name:\t%s\ndescription:\t%s\ndefault branch:\t%s\nurl:\t%s\nprivate:\t%s" % (
+        r.get("full_name"), r.get("description") or "", r.get("default_branch"), r.get("html_url"), r.get("private")))
+
+
+def issue_view(args):
+    opts, pos = parse(args, COMMON)
+    repo = repo_of(opts)
+    if len(pos) != 1 or not pos[0].lstrip("#").isdigit():
+        raise Fail("issue view needs an issue number", 2)
+    i = get_json("/repos/%s/issues/%d" % (repo, int(pos[0].lstrip("#"))))
+    if "json" in opts:
+        return show(i, opts)
+    print("title:\t%s\nstate:\t%s\nurl:\t%s\nlabels:\t%s\n--\n%s" % (
+        i.get("title"), i.get("state"), i.get("html_url"), ", ".join(x.get("name", "") for x in i.get("labels", [])), i.get("body") or ""))
+
+
+def issue_list(args):
+    opts, pos = parse(args, dict(COMMON, **{"--state": ("state", True), "-s": ("state", True), "--limit": ("limit", True),
+                                            "-L": ("limit", True), "--label": ("label", True), "-l": ("label", True)}))
+    if pos:
+        raise Fail("issue list takes no positional argument", 2)
+    repo = repo_of(opts)
+    state = opts.get("state", "open")
+    if state not in ("open", "closed", "all"):
+        raise Fail("--state is open, closed or all", 2)
+    limit = limit_of(opts, 30)
+    q = {"state": state, "per_page": 100}
+    if "label" in opts:
+        q["labels"] = opts["label"]
+    rows = [r for r in get_json("/repos/%s/issues?%s" % (repo, urllib.parse.urlencode(q))) if "pull_request" not in r][:limit]
+    if "json" in opts:
+        return show(rows, opts)
+    for r in rows:
+        print("%s\t%s\t%s" % (r["number"], r["title"], r["state"]))
+
+
+def run_list(args):
+    opts, pos = parse(args, dict(COMMON, **{"--limit": ("limit", True), "-L": ("limit", True), "--branch": ("branch", True),
+                                            "-b": ("branch", True), "--status": ("status", True), "-s": ("status", True)}))
+    if pos:
+        raise Fail("run list takes no positional argument", 2)
+    repo = repo_of(opts)
+    limit = limit_of(opts, 20)
+    q = {"per_page": min(max(limit, 1), 100)}
+    for k in ("branch", "status"):
+        if k in opts:
+            q[k] = opts[k]
+    rows = (get_json("/repos/%s/actions/runs?%s" % (repo, urllib.parse.urlencode(q))) or {}).get("workflow_runs", [])[:limit]
+    if "json" in opts:
+        return show(rows, opts)
+    for r in rows:
+        print("%s\t%s\t%s\t%s\t%s" % (r["id"], r.get("name"), r.get("status"), r.get("conclusion") or "", r.get("head_branch")))
+
+
+def run_id(pos):
+    if len(pos) != 1 or not pos[0].isdigit():
+        raise Fail("name a run id", 2)
+    return int(pos[0])
+
+
+def run_logs_text(repo, rid, only_jobs=None):
+    loc = request("GET", "/repos/%s/actions/runs/%d/logs" % (repo, rid), want_location=True)
+    if not isinstance(loc, str):
+        raise Fail("the logs answer had no download location (logs may have expired)")
+    u = urllib.parse.urlsplit(loc)
+    loopback_test = u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost", "::1") and bool(os.environ.get("CW_GH_API_BASE"))
+    if (u.scheme != "https" and not loopback_test) or not u.hostname:
+        raise Fail("the logs location is not an https URL")
+    try:  # the download host gets NO Authorization header
+        with OPENER.open(urllib.request.Request(loc, headers={"User-Agent": "cw-gh"}), timeout=TIMEOUT) as r:
+            raw = r.read(MAX_BYTES + 1)
+    except (OSError, ValueError, http.client.HTTPException):
+        raise Fail("the logs could not be downloaded")
+    if len(raw) > MAX_BYTES:
+        raise Fail("the logs are larger than %d bytes" % MAX_BYTES)
+    out, size = [], 0
+    try:
+        z = zipfile.ZipFile(io.BytesIO(raw))
+        infos = z.infolist()
+        if len(infos) > MAX_ENTRIES:
+            raise Fail("the logs archive has more than %d entries" % MAX_ENTRIES)
+        for info in sorted(infos, key=lambda x: x.filename):
+            if info.is_dir() or (only_jobs is not None and info.filename.split("/")[0] not in only_jobs):
+                continue
+            with z.open(info) as f:
+                text = f.read(MAX_LOG + 1).decode("utf-8", "replace")
+            size += len(text)
+            out.append("== %s ==\n%s" % (info.filename.replace("\n", " ")[:200], text))
+            if size > MAX_LOG:
+                out.append("== output cut at %d bytes ==" % MAX_LOG)
+                break
+    except zipfile.BadZipFile:
+        raise Fail("the logs download was not a zip archive")
+    return "\n".join(out)
+
+
+def run_view(args):
+    opts, pos = parse(args, dict(COMMON, **{"--log": ("log", False), "--log-failed": ("log_failed", False)}))
+    repo = repo_of(opts)
+    rid = run_id(pos)
+    if opts.get("log") or opts.get("log_failed"):
+        only = None
+        if opts.get("log_failed"):
+            jobs = (get_json("/repos/%s/actions/runs/%d/jobs?per_page=100" % (repo, rid)) or {}).get("jobs", [])
+            only = {j.get("name") for j in jobs if j.get("conclusion") in ("failure", "timed_out", "cancelled")}
+        sys.stdout.write(run_logs_text(repo, rid, only) + "\n")
+        return
+    r = get_json("/repos/%s/actions/runs/%d" % (repo, rid))
+    if "json" in opts:
+        return show(r, opts)
+    jobs = (get_json("/repos/%s/actions/runs/%d/jobs?per_page=100" % (repo, rid)) or {}).get("jobs", [])
+    print("run %s\t%s\t%s\t%s\t%s" % (r.get("id"), r.get("name"), r.get("status"), r.get("conclusion") or "", r.get("html_url")))
+    for j in jobs:
+        print("job\t%s\t%s\t%s" % (j.get("name"), j.get("status"), j.get("conclusion") or ""))
+
+
+def run_logs(args):
+    opts, pos = parse(args, COMMON)
+    sys.stdout.write(run_logs_text(repo_of(opts), run_id(pos)) + "\n")
+
+
+def api_get(args):
+    """Read-only: one endpoint path, GET. No body field, no input, no other method, no GraphQL, no host."""
+    opts, pos = parse(args, {"-X": ("method", True), "--method": ("method", True), "-R": ("repo", True)})
+    if len(pos) != 1:
+        raise Fail("api takes exactly one endpoint", 2)
+    if str(opts.get("method", "GET")).upper() != "GET":
+        raise Fail("api is read-only in this pod: GET only", 2)
+    p = pos[0]
+    if "://" in p or "%" in p or ".." in p or ":" in p or "#" in p:
+        raise Fail("an endpoint it cannot read: give a path such as repos/OWNER/NAME/pulls/1", 2)
+    path = "/" + p.lstrip("/")
+    if path.split("?")[0].rstrip("/").lower().endswith("graphql"):
+        raise Fail("GraphQL is not available in this pod", 2)
+    sys.stdout.write(request("GET", path).decode("utf-8", "replace"))
+    if not sys.stdout.isatty():
+        sys.stdout.write("\n")
+
+
+# THE VERB TABLE: the one place the verbs are listed. The README list, the worker prompt and the tests are derived from it.
+VERBS = {
+    ("pr", "create"): pr_create, ("pr", "view"): pr_view, ("pr", "list"): pr_list, ("pr", "comment"): pr_comment,
+    ("pr", "checks"): pr_checks, ("pr", "diff"): pr_diff, ("pr", "ready"): pr_ready,
+    ("repo", "view"): repo_view,
+    ("issue", "view"): issue_view, ("issue", "list"): issue_list,
+    ("run", "view"): run_view, ("run", "list"): run_list, ("run", "logs"): run_logs,
+    ("api", ""): api_get,
+}
+
+
+def main(argv):
+    args = list(argv)
+    group = args.pop(0) if args else ""
+    verb = ""
+    if group != "api":
+        # a leading -R/--repo before the verb is accepted and moved after it
+        pre = []
+        while args and args[0] in ("-R", "--repo") and len(args) > 1:
+            pre += args[:2]
+            args = args[2:]
+        verb = args.pop(0) if args and not args[0].startswith("-") else ""
+        args = pre + args
+    sys.stdout, sys.stderr = Clean(sys.stdout), Clean(sys.stderr)
+    fn = VERBS.get((group, verb))
+    if fn is None:
+        listing = ", ".join("%s %s" % (g, v) if v else g for g, v in sorted(VERBS))
+        print("cw-gh: '%s' is not available in this pod (the client covers: %s)" % (" ".join(x for x in (group, verb) if x)[:60], listing),
+              file=sys.stderr)
+        return 2
+    try:
+        fn(args)
+    except Fail as e:
+        print("cw-gh: %s" % e, file=sys.stderr)
+        return e.code
+    except BrokenPipeError:
+        return 0
+    except Exception as e:   # never a traceback: one line, the kind only
+        print("cw-gh: failed (%s)" % type(e).__name__, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
