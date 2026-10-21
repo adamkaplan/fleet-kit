@@ -18323,9 +18323,8 @@ def entry_config(path=None):
     validate_awaiting_label(config, source)
     validate_awaiting_cos_label(config, source)
     declared = config_declarations()
-    for key in ENTRY_CONFIG_KEYS:   # a key its module declares (excluded_repos, impact_floor, delegated_clear...): the module's default, then its validator
-        if key in declared:
-            apply_declared_key(config, raw, key, declared[key], source)
+    for key, name in sorted(((k, declared[k]) for k in ENTRY_CONFIG_KEYS if k in declared), key=lambda item: item[1]):   # a key its module declares (excluded_repos, impact_floor, delegated_clear...): the module's default, then its validator, in the whole loader's order (by module name)
+        apply_declared_key(config, raw, key, name, source)
     validate_impact_hold_key(config, source)
     return config
 
@@ -23124,7 +23123,7 @@ def gates_caller_kind(runner, now):
 
 def entry_caller_kind(runner, now):
     """The same check, over the private entry's own clients (#996, slice A: not called yet): one body, two constructors, so the answer is the same by construction."""
-    return caller_kind(lambda: identity_clients(entry_config(), runner))
+    return caller_kind(lambda: identity_clients(entry_config(), runner))   # a ConfigError from `entry_config` is not caught by `caller_kind`: an unreadable configuration refuses the caller (never read as "unknown" or "person"), as a failing `build_engine` did
 
 
 def gates_caller_may_switch(runner, now):
