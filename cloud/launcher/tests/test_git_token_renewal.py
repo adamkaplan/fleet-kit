@@ -434,6 +434,14 @@ class Cases(Harness):
             self.assertTrue(any(c in site for c in covered), "no case for: " + site)
         self.assertEqual(len(quiet_sites(tree)), len([n for n in self.cases() if n.startswith("quiet")]) - 2)   # the Secret check has 3 return-False inputs
 
+    def test_a_stamp_from_the_future_is_renewed_not_trusted(self):
+        st = self.st()
+        st["secret_meta"][self.name + "-run"]["annotations"] = {"cw/git-token-minted": cw.iso(T0 + dt.timedelta(hours=5))}
+        self.write_state(st)
+        self.at(minutes=5)
+        self.assertEqual(self.one_pass(), [(WORKER, "git token renewed", 0)])
+        self.assertEqual(self.secret()["token"], NEW)
+
     def test_the_renewal_has_plain_guards_to_remove(self):
         self.assertGreaterEqual(len(guard_nodes(ast.parse(load_source()))), 8)
 
