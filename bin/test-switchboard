@@ -66317,7 +66317,8 @@ class TestReviewerSubagents(LedgerBase):
         cells = sb.impact_floor.load_matrix()["cells"]
         severity, probability = next((s, p) for s in cells for p in cells[s] if cells[s][p]["level"] == level)
         entry = {"kind": "review_record", "pr": self.PR, "head": head, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": role,
-                 "impact_severity": severity, "impact_probability": probability, "impact_action": "none"}
+                 "impact_severity": severity, "impact_probability": probability, "impact_action": "none",
+                 "block_sha256": "a" * 64, "block_size": 200, "block_impact_severity": severity, "block_impact_probability": probability}   # #901: the rating carries the agent's block, so the block scores it
         sb.plan_ledger.append_entry(self.world.state, entry, self.world.clock.now())
 
     def rating_lines(self):
