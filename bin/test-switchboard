@@ -77785,21 +77785,45 @@ class TestPaneExit(Base):
         self.assertEqual((got["21"]["asked"], got["21"]["by"]), (True, "cos"))
         self.assertEqual((got["22"]["asked"], got["22"]["by"]), (False, None))
 
-    def test_the_line_lists_the_heavy_runs_and_jobs_active_at_that_second_with_their_ages_and_not_one_that_ended(self):
+    def make_job(self, name, started, ended=None):
+        (self.jobs / name).mkdir(mode=0o700)
+        (self.jobs / name / "job.json").write_text(json.dumps({"name": name, "pid": os.getpid(), "started": started}))
+        if ended is not None:
+            exit_file = self.jobs / name / "exit"
+            exit_file.write_text("0\n")
+            os.utime(str(exit_file), (ended, ended))
+
+    def test_the_line_lists_the_heavy_runs_and_jobs_active_at_the_exit_second_by_their_start_and_end(self):
         at = self.NOW - 5
         slots = sb.load_heavy_slots()
         held = [{"name": "suite", "since": at - 40}, {"name": "later", "since": at + 50}]
-        record = {"name": "build", "pid": os.getpid(), "started": at - 90}
-        (self.jobs / "build").mkdir(mode=0o700)
-        (self.jobs / "build" / "job.json").write_text(json.dumps(record))
-        (self.jobs / "done").mkdir(mode=0o700)
-        (self.jobs / "done" / "job.json").write_text(json.dumps({"name": "done", "pid": os.getpid(), "started": at - 90}))
-        (self.jobs / "done" / "exit").write_text("0\n")
+        self.make_job("alive", at - 90)                         # started before, still alive: active
+        self.make_job("ended-after", at - 60, at + 2)           # ended after the exit: active at it
+        self.make_job("ended-before", at - 90, at - 10)         # ended before the exit: not active
+        self.make_job("started-after", at + 3)                  # started after the exit: not active
         self.write_log(self.exit_line(-5, 31, 130))
         with mock.patch.object(slots, "_held_records", return_value=held):
             self.run_pass()
         active = self.audit("fleetpane.exit")[0]["detail"]["active"]
-        self.assertEqual(sorted((a["kind"], a["name"], a["age"]) for a in active), [("heavy", "suite", 40), ("job", "build", 90)])
+        self.assertEqual(sorted((a["kind"], a["name"], a["age"]) for a in active),
+                         [("heavy", "suite", 40), ("job", "alive", 90), ("job", "ended-after", 60)])
+        self.assertIn("still holding its slot", self.audit("fleetpane.exit")[0]["detail"]["active_basis"])
+
+    def test_a_burst_of_thirty_panes_writes_the_exit_lines_in_bounded_passes_and_one_summary_and_one_notice(self):
+        self.engine.discover(self.world.clock.now())
+        self.write_log(*[self.exit_line(-20 + (i // 10), 100 + i, 130) for i in range(30)])
+        self.run_pass()
+        self.assertEqual(len(self.audit("fleetpane.exit")), sb.PANE_EXIT_MAX_PER_PASS)
+        self.run_pass(20)
+        self.assertEqual(len(self.audit("fleetpane.exit")), 30)
+        self.assertEqual(len({e["detail"]["pane"] for e in self.audit("fleetpane.exit")}), 30)
+        self.run_pass(30)
+        self.assertEqual(len(self.audit("fleetpane.exit")), 30)
+        bursts = self.audit("fleetpane.exit_burst")
+        self.assertEqual((len(bursts), len(bursts[0]["detail"]["panes"])), (1, 30))
+        source = sb.PaneExitFacts()
+        source.bind(self.engine)
+        self.assertEqual(len(source()), 1)
 
     def test_three_panes_ending_within_two_seconds_make_one_summary_and_one_notice_and_two_far_apart_make_none(self):
         self.engine.discover(self.world.clock.now())

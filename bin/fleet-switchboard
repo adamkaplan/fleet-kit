@@ -7119,9 +7119,10 @@ PANE_EXIT_BURST_SECONDS = 5                # exits this close together are one e
 PANE_EXIT_BURST_MIN = 3                    # this many panes in one burst make the summary line
 PANE_EXIT_ASKED_BEFORE = 300               # a fleet close this long before the exit (or 30 s after it) is the cause
 PANE_EXIT_SEEN_KEEP = 86400                # a seen key is forgotten after this
+PANE_EXIT_MAX_PER_PASS = 20               # exit lines written per pass: 256 KiB of herdr log holds about 1100 exit lines at most (~230 bytes each); the rest are written by the next passes
 PANE_EXIT_NAMES = 12                       # active heavy runs and jobs listed at most
 HERDR_LOG_DEFAULT = "~/.config/herdr/herdr-server.log"
-_PANE_EXIT_LINE = re.compile(r'^(\S+Z)\s.*pane child exited event="pane\.exit".*?pane_id=(\d+) status="ExitStatus \{ code: (-?\d+), signal: (None|Some\((?:"?)([^")]*)(?:"?)\)) \}"')
+_PANE_EXIT_LINE = re.compile(r'^(\S+Z)\s.*pane child exited event="pane\.exit".*?pane_id=(\d+) status="ExitStatus \{ code: (-?\d+), signal: (None|Some\((?:"?)(\w*)(?:"?)\)) \}"')
 _PANE_TERMINATED_LINE = re.compile(r'^(\S+Z)\s.*pane session terminated pane=(\d+) .*?signal=(\w+)')
 
 
@@ -7178,50 +7179,77 @@ def _pane_matches(recorded, pane):
     return bool(recorded) and (recorded == pane or recorded.endswith(":p" + pane))
 
 
-def _pane_exit_asked(state_dir, event):
-    """(by, True) when a fleet command closed this pane near its exit (`fleetpane.closed` of `close-pane` or `retire`), else (None, False). A bounded read of the audit's end."""
+def pane_exit_audit_tail(state_dir):
+    """The parsed `fleetpane.closed` entries of the last PANE_EXIT_TAIL_BYTES of the audit, read ONCE per pass: [(epoch, pane, by)]. Never raises."""
     path = Path(state_dir) / "audit.jsonl"
     try:
         with open(str(path), "rb") as handle:
             size = handle.seek(0, os.SEEK_END)
             handle.seek(max(0, size - PANE_EXIT_TAIL_BYTES))
-            lines = handle.read().decode("utf-8", "replace").splitlines()[1 if size > PANE_EXIT_TAIL_BYTES else 0:]
+            lines = handle.read(PANE_EXIT_TAIL_BYTES).decode("utf-8", "replace").splitlines()[1 if size > PANE_EXIT_TAIL_BYTES else 0:]
     except OSError:
-        return None, False
-    for line in reversed(lines):
+        return []
+    out = []
+    for line in lines:
         try:
             entry = json.loads(line)
         except ValueError:
             continue
         detail = entry.get("detail") if isinstance(entry, dict) else None
-        if not isinstance(detail, dict) or entry.get("event") != "fleetpane.closed" or not _pane_matches(detail.get("pane"), event["pane"]):
-            continue
-        at = _audit_epoch(entry)
-        if at is not None and -30 <= event["at"] - at <= PANE_EXIT_ASKED_BEFORE:
-            return _one_line(str(detail.get("by") or "unknown"), 60), True
+        if isinstance(detail, dict) and entry.get("event") == "fleetpane.closed":
+            at = _audit_epoch(entry)
+            if at is not None:
+                out.append((at, detail.get("pane"), _one_line(str(detail.get("by") or "unknown"), 60)))
+    return out
+
+
+def _pane_exit_asked(closed, event):
+    """(by, True) when a fleet command closed this pane near its exit (`fleetpane.closed` of `close-pane` or `retire --close`), else (None, False). `closed` is `pane_exit_audit_tail`."""
+    for at, pane, by in reversed(closed):
+        if _pane_matches(pane, event["pane"]) and -30 <= event["at"] - at <= PANE_EXIT_ASKED_BEFORE:
+            return by, True
     return None, False
 
 
-def pane_exit_active(engine, at):
-    """The heavy runs and background jobs running at second `at`: [{"kind", "name", "age"}] with the age in seconds then. From the slot records and the job
-    records, read-only; a record that cannot be read is skipped."""
-    out = []
+def pane_exit_runs(engine):
+    """What can be told of the heavy runs and jobs, read ONCE per pass: ({"heavy": [(name, since)], "jobs": [(name, started, ended or None)], "problems": [..]}).
+    A slot record holds the run's start only (`since`) and exists only while the run holds the slot: a run that has ENDED left no end time. A job record holds
+    its start, and the mtime of its `exit` file is its end. Read-only; a record that cannot be read is skipped and said in `problems`."""
+    out = {"heavy": [], "jobs": [], "problems": []}
     try:
         for info in load_heavy_slots()._held_records(engine.state_dir):
             since = info.get("since")
-            if isinstance(since, (int, float)) and not isinstance(since, bool) and since <= at:
-                out.append({"kind": "heavy", "name": _one_line(str(info.get("name") or "?"), 60), "age": int(at - since)})
+            if isinstance(since, (int, float)) and not isinstance(since, bool):
+                out["heavy"].append((_one_line(str(info.get("name") or "?"), 60), since))
     except Exception:
-        pass
+        out["problems"].append("heavy slot records not read")
     try:
         root = jobs_dir()
         for entry in sorted(os.listdir(str(root)))[:200]:
             record = job_read(entry, root)
             started = record.get("started") if record else None
-            if isinstance(started, (int, float)) and not isinstance(started, bool) and started <= at and job_state(record, root)[0] == "alive":
-                out.append({"kind": "job", "name": _one_line(entry, 60), "age": int(at - started)})
+            if not isinstance(started, (int, float)) or isinstance(started, bool):
+                continue
+            state = job_state(record, root)[0]
+            ended = None
+            if state == "finished":
+                try:
+                    ended = os.stat(str(job_paths(entry, root)["exit"])).st_mtime
+                except OSError:
+                    ended = None
+            if state == "alive" or (state == "finished" and ended is not None):
+                out["jobs"].append((_one_line(entry, 60), started, ended))
     except OSError:
-        pass
+        out["problems"].append("job records not read")
+    return out
+
+
+def pane_exit_active(runs, at):
+    """The heavy runs and jobs active at second `at`, [{"kind", "name", "age"}] (age in seconds at `at`). A job is active when it started at or before `at` and had
+    not ended then (alive now, or its exit file is newer than `at`). A heavy run is listed when it started at or before `at` and still holds its slot when the line is
+    written: a run that held a slot at `at` and has ended since left no end time, so it cannot be listed (the doc says so)."""
+    out = [{"kind": "heavy", "name": name, "age": int(at - since)} for name, since in runs["heavy"] if since <= at]
+    out += [{"kind": "job", "name": name, "age": int(at - started)} for name, started, ended in runs["jobs"] if started <= at and (ended is None or ended > at)]
     return out[:PANE_EXIT_NAMES]
 
 
@@ -7251,18 +7279,26 @@ def pane_exit_pass(engine, now):
     except Exception:
         pass
     events = pane_exit_events(text)
+    closed, runs, written = pane_exit_audit_tail(engine.state_dir), pane_exit_runs(engine), 0
+    seen.update(engine.__dict__.get("pane_exit_seen", {}))   # what a failed write of pane-exit.json could not keep
     window = float(engine.config.get("pane_exit_burst_seconds", PANE_EXIT_BURST_SECONDS))
     for event in events:
         key = "%s:%s" % (event["time"], event["pane"])
         if key in seen:
             continue
-        seen[key] = event["at"]
         if now - event["at"] > PANE_EXIT_MAX_AGE:
+            seen[key] = event["at"]
             continue
-        by, asked = _pane_exit_asked(engine.state_dir, event)
+        if written >= PANE_EXIT_MAX_PER_PASS:
+            continue   # not marked seen: the next pass writes it
+        seen[key] = event["at"]
+        written += 1
+        by, asked = _pane_exit_asked(closed, event)
         name = next((n for p, n in names.items() if _pane_matches(p, event["pane"])), None)
         detail = {"pane": event["pane"], "agent": name, "code": event["code"], "signal": event["signal"], "herdr_time": event["time"], "asked": asked, "by": by,
-                  "active": pane_exit_active(engine, event["at"])}
+                  "active": pane_exit_active(runs, event["at"]), "active_basis": "heavy: still holding its slot when written; jobs: by start and end time"}
+        if runs["problems"]:
+            detail["active_problem"] = "; ".join(runs["problems"])
         engine.audit.append(engine.actor, "fleetpane.exit", name or "pane:%s" % event["pane"], detail)
     bursts, group = {}, []
     for event in events + [None]:
@@ -7279,6 +7315,7 @@ def pane_exit_pass(engine, now):
                 engine.audit.append(engine.actor, "fleetpane.exit_burst", "panes:%s" % ",".join(panes), {k: v for k, v in bursts[key].items() if k != "at"})
         group = [event] if event is not None else []
     engine.pane_exit_bursts = bursts
+    engine.pane_exit_seen = {k: v for k, v in seen.items() if now - v < PANE_EXIT_SEEN_KEEP}
     try:
         _write_small(engine.state_dir, PANE_EXIT_FILE, {"seen": seen, "log": {"size": size, "ino": inode}})
     except OSError as err:
