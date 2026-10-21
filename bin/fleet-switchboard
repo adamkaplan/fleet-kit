@@ -7276,11 +7276,12 @@ def pane_exit_pass(engine, now):
     text, size, inode, problem = pane_exit_read_log(path)
     stored = _read_small(engine.state_dir, PANE_EXIT_FILE)
     seen = {k: v for k, v in (stored.get("seen") or {}).items() if isinstance(v, (int, float)) and now - v < PANE_EXIT_SEEN_KEEP}
-    last = stored.get("log") or {}
+    last = engine.__dict__.get("pane_exit_log") or stored.get("log") or {}   # the size last read stays in memory: the file keeps it only when it matters
     if problem:
         engine._note("fleetpane.exit_note", None, {"note": problem})
         return
-    if (isinstance(last.get("size"), int) and size < last["size"]) or (last.get("ino") is not None and last.get("ino") != inode):
+    rotated = (isinstance(last.get("size"), int) and size < last["size"]) or (last.get("ino") is not None and last.get("ino") != inode)
+    if rotated:
         engine._note("fleetpane.exit_note", None, {"note": "herdr log was rotated or truncated: read again from its end"})
     else:
         engine._last.pop(("fleetpane.exit_note", None), None)
@@ -7293,7 +7294,8 @@ def pane_exit_pass(engine, now):
     events = pane_exit_events(text)
     closed, runs, written = None, None, 0   # the audit tail, the slot and job records and their `ps` are read only when an exit is to be written: a quiet pass costs the log tail and the seen set
     seen.update(engine.__dict__.get("pane_exit_seen", {}))   # what a failed write of pane-exit.json could not keep
-    log_state = {"size": last.get("size"), "ino": last.get("ino")}
+    stored_log = stored.get("log") or {}
+    log_state = {"size": stored_log.get("size"), "ino": stored_log.get("ino")}   # what the file holds: moved to the current log only on a rotation or with a real change of "seen"
     on_disk = [{"seen": stored.get("seen") or {}, "log": stored.get("log") or {}}]   # what the file holds now: an unchanged state is not written again
 
     def save():
@@ -7346,7 +7348,9 @@ def pane_exit_pass(engine, now):
                 save()
         group = [event] if event is not None else []
     engine.pane_exit_bursts = bursts
-    log_state.update(size=size, ino=inode)
+    engine.pane_exit_log = {"size": size, "ino": inode}
+    if rotated or not stored_log or {k: v for k, v in seen.items() if now - v < PANE_EXIT_SEEN_KEEP} != (stored.get("seen") or {}):
+        log_state.update(size=size, ino=inode)   # growth alone never rewrites the file: herdr's log grows on every event, not only exits
     save()   # the aged-out marks and the log as read
 
 

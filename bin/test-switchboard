@@ -77906,6 +77906,55 @@ class TestPaneExit(Base):
             handle.write(self.exit_line(-5, 14, 0))
         self.assertEqual(self.count_state_writes([60, 61, 62]), 2, "a new exit and the log growing are written once, not again")
 
+    def append(self, text):
+        with self.log.open("a") as handle:
+            handle.write(text)
+
+    def test_a_log_that_grows_by_other_events_does_not_rewrite_the_state_file_and_the_mutant_that_stores_the_size_every_pass_does(self):
+        self.three_kinds()
+        self.run_pass()
+        other = "%s  INFO herdr::agent: agent state changed pane=11 state=busy\n" % self.stamp(0)
+
+        def idle_writes(passes):
+            writes = 0
+            for offset in passes:
+                self.append(other)   # herdr's log grows on every event, not only exits
+                writes += self.count_state_writes([offset])
+            return writes
+        self.assertEqual(idle_writes(range(11, 41)), 0, "30 passes with a growing log and no exit: no write")
+        import inspect
+        source = inspect.getsource(sb.pane_exit_pass)
+        guard = "if rotated or not stored_log or"
+        self.assertIn(guard, source)
+        namespace = dict(sb.__dict__)
+        exec(source.replace(guard, "if True or"), namespace)   # the mutant: the size is stored at every pass
+        with mock.patch.object(sb, "pane_exit_pass", namespace["pane_exit_pass"]):
+            self.assertGreaterEqual(idle_writes(range(41, 51)), 10, "the mutant rewrites the file at each pass: the test sees it")
+
+    def test_each_field_of_the_saved_payload_changes_it_only_for_its_own_reason(self):
+        """The payload is {"seen": {key: epoch}, "log": {"size", "ino"}}. seen changes with a new exit or burst, or a key aging out (PANE_EXIT_SEEN_KEEP);
+        log.ino with a rotation; log.size with a shrink (rotation) or alongside a change of seen, and never by growth alone."""
+        self.three_kinds()
+        self.run_pass()
+        self.append(self.exit_line(-50, 14, 0))
+        self.assertEqual(self.count_state_writes([11]), 2, "seen: a new exit")
+        self.log.write_text(self.exit_line(-40, 16, 0))   # shrink
+        before = self.count_state_writes([12])
+        self.assertGreaterEqual(before, 1, "log.size shrank: a rotation, written")
+        self.assertEqual(self.count_state_writes([13, 14]), 0)
+        inode = self.log.stat().st_ino
+        self.log.unlink()
+        self.log.write_text(self.exit_line(-40, 16, 0))   # a new file of the same size: the inode changed
+        if self.log.stat().st_ino == inode:
+            self.skipTest("the file system reused the inode")
+        self.assertEqual(self.count_state_writes([15]), 1, "log.ino: a rotation")
+        self.assertEqual(self.count_state_writes([16]), 0)
+        stored = sb._read_small(self.world.state, sb.PANE_EXIT_FILE)
+        stored["seen"]["old:1"] = self.NOW - sb.PANE_EXIT_SEEN_KEEP - 10   # a key past its keep time
+        sb._write_small(self.world.state, sb.PANE_EXIT_FILE, stored)
+        self.assertEqual(self.count_state_writes([17]), 1, "seen: a key aged out")
+        self.assertEqual(self.count_state_writes([18]), 0)
+
     def test_the_exits_seen_are_kept_in_the_state_file_so_a_restart_writes_nothing_twice(self):
         self.three_kinds()
         self.run_pass()
