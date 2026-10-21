@@ -18,3 +18,5 @@ Nothing here reads, prints or writes a credential, and nothing writes the person
 : cleaning an existing entry is the person's own decision.
 
 A git call that relied on a prompt now fails at once with git's own error (`terminal prompts disabled`).
+
+The check that nothing writes a git configuration is behavioural first: the suite runs the launch environment, the service client, the heavy wrapper and the shim in front of a real git with `HOME` and the global and XDG variables pointing at a scratch home, and asserts that home is byte-identical afterwards with no new file. The text scan of the diff is only a cheap first line; it cannot see a spelling built from pieces.

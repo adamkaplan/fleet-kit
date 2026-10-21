@@ -19203,7 +19203,7 @@ class TestGitShim(Base):
         self.helper_path = helper   # handed to git through GIT_CONFIG_COUNT in `lsremote`: no git configuration file is written
         return starts
 
-    def lsremote(self, shim, env_drop=()):
+    def lsremote(self, shim, env_drop=(), extra_env=None):
         """git ls-remote to a closed local port through `shim` (a copy of the real one, or a mutant), with a private home and a helper that records its start."""
         starts = self.fake_helper()
         if starts.exists():
@@ -19227,6 +19227,7 @@ class TestGitShim(Base):
         real = shutil.which("git", path=SAFE_PATH) or shutil.which("git")
         env = {"PATH": "%s:%s" % (os.path.dirname(real), SAFE_PATH), "HOME": str(self.home / "private"), "GIT_CONFIG_NOSYSTEM": "1", "FLEET_REAL_GIT": real,
                "XDG_CONFIG_HOME": str(self.home / "xdg-none"), "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": str(self.helper_path)}
+        env.update(extra_env or {})   # (the sentinel test points the home variables at its scratch home)
         started = time.time()
         done = subprocess.run([sys.executable, str(shim), "ls-remote", "http://127.0.0.1:%d/x.git" % port], capture_output=True, text=True, env=env, timeout=30)
         took = time.time() - started
@@ -19273,20 +19274,19 @@ class TestGitShim(Base):
             self.assertEqual(len([r for r in rows if place in r]), 1, place)
         self.assertEqual(len(rows), 4)
 
-    # S7/U1: one table of every spelling of a write to git's configuration; the scan reads each ADDED line of this change (all files), and one mutant per spelling must fail it
+    # S7/U1, a cheap first line only: a text scan is a deny-list and cannot see a spelling built from pieces ("--glo"+"bal", a split-joined XDG path). The ROOT check is
+    # behavioural (test_s7_u2_...). Each row below has a hostile sample that ONLY that row finds, and a test that skips each row in turn and fails (one mutant per row).
     _G, _S = "glo" + "bal", "sys" + "tem"
-    CONFIG_WRITE_FLAGS = ["--" + w for w in (_G, _S, "file", "add", "unset", "unset-all", "replace-all", "edit", "rename-section", "remove-section")]
-    CONFIG_WRITE_SPELLINGS = (   # (name, regex over one line, a hostile line that must be found)
+    CONFIG_WRITE_FLAGS = ["--" + w for w in ("add", "unset", "unset-all", "replace-all", "edit", "rename-section", "remove-section")]
+    CONFIG_WRITE_SPELLINGS = (   # (name, regex over one line, a hostile line that only this row catches)
         ("config command with a write flag", r"\bconfig\b[^\n]*(?:%s)(?![\w-])" % "|".join(re.escape(f) for f in CONFIG_WRITE_FLAGS),
-         'os.system("git con' + 'fig --add --' + _G + ' credential.interactive false")'),
-        ("argv list with the flag", r"[\"']config[\"'][^\n]*[\"'](?:%s)[\"']" % "|".join(re.escape(f) for f in CONFIG_WRITE_FLAGS),
-         'run(["git", "config",  "--' + _G + '", "k"])'),
-        ("system scope", r"\bconfig\b[^\n]*--" + _S, 'os.system("git config --' + _S + ' a b")'),
-        ("file scope", r"\bcon" + r"fig\b[^\n]*--file", 'os.system("git con' + 'fig --file ~/.con' + 'fig/git/con' + 'fig a b")'),
+         'run(["git", "con' + 'fig", "--a' + 'dd", "k", "v"])'),
+        ("the short write flag", r"\bcon" + r"fig\b[^\n]*\s-e\b", "git con" + "fig -e"),
+        ("the global or system scope", r"\bconfig\b[^\n]*--(?:%s|%s)(?![\w-])" % (_G, _S), 'os.system("git config --' + _S + ' a b")'),
+        ("the file scope", r"\bcon" + r"fig\b[^\n]*(?:\s-f\b|--fi" + "le\\b)", "git con" + "fig -f out.cfg a b"),
         ("the home gitconfig path", r"\.git" + "config", 'open(os.path.expanduser("~")+"/.git' + 'config","a")'),
-        ("the XDG git directory", r"\.con" + r"fig/git\b|XDG_CONFIG_HOME[^\n]*[\"']git[\"']", 'path = os.path.join(xdg, ".con' + 'fig/git/con' + 'fig")'),
+        ("the XDG git directory", r"\.con" + r"fig/git\b|XDG_CONFIG" + r"_HOME[^\n]*/git\b|XDG_CONFIG" + r"_HOME[^\n]*[\"']git[\"']", 'echo x > "$XDG_CONFIG' + '_HOME/git/con' + 'fig"'),
         ("the global/system override variables", r"GIT_CONFIG_(?:%s|%s)\b" % (_G.upper(), _S.upper()), "GIT_CONFIG_" + _G.upper() + " = path"),
-        ("the plain write", r"git config --" + _G, 'os.system("git config --' + _G + ' k v")'),
     )
 
     @classmethod
@@ -19297,12 +19297,38 @@ class TestGitShim(Base):
     def added_lines(diff):
         return "\n".join(l[1:] for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++"))
 
-    def test_s7_u1_every_spelling_of_a_git_configuration_write_is_found_by_the_scan(self):
+    def test_s7_u1_every_row_of_the_scan_finds_its_sample_and_only_that_row_does(self):
         for name, rx, hostile in self.CONFIG_WRITE_SPELLINGS:
-            with self.subTest(name):   # one mutant per spelling: a scratch diff that adds the line must fail the scan
-                self.assertTrue(self.config_write_hits(self.added_lines("+++ b/x\n+" + hostile)), name)
+            with self.subTest(name):   # the mutant: skip this row; the sample must then go unfound by every other row, so the row cannot be dropped unseen
+                found = [n for n, other, _ in self.CONFIG_WRITE_SPELLINGS if re.search(other, hostile)]
+                self.assertEqual(found, [name])
+        for extra in ("git con" + "fig --fi" + "le=/x/y a b", "git con" + "fig -" + "f /x a b"):
+            self.assertTrue(self.config_write_hits(extra), extra)
         for clean in ('env = {"GIT_CONFIG_NO' + 'SYSTEM": "1"}', "git config credential.interactive", 'run(["git", "config", "--get", "a.b"])'):
             self.assertEqual(self.config_write_hits(clean), [], clean)
+
+    def test_s7_u2_the_focused_paths_leave_a_sentinel_home_byte_identical_and_add_no_file(self):
+        if not (shutil.which("git", path=SAFE_PATH) or shutil.which("git")):
+            self.skipTest("no real git")
+        scratch = self.home / "sentinel-home"
+        (scratch / (".con" + "fig") / "git").mkdir(parents=True)
+        (scratch / (".git" + "config")).write_text("[user]\n\tname = Sentinel\n")
+        (scratch / (".con" + "fig") / "git" / "con" "fig").write_text("[core]\n\tabbrev = 9\n")
+
+        def snapshot():
+            return {str(p.relative_to(scratch)): (p.read_bytes() if p.is_file() else None) for p in sorted(scratch.rglob("*"))}
+        before = snapshot()
+        pointed = {"HOME": str(scratch), "GIT_CONFIG_" + self._G.upper(): str(scratch / (".git" + "config")), "XDG_CONFIG" + "_HOME": str(scratch / (".con" + "fig"))}
+        with mock.patch.dict(os.environ, pointed):
+            sb.launch_base_env({"opencode_env": {}, "launch_env": {}})
+            sb.V2Client("/opt/lab/bin/opencode", {}, lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""), 7).server_info()
+            hs = sb.load_heavy_slots()
+            hs.run([sys.executable, "-c", "pass"], str(self.home / "heavy-sentinel"), environ=dict(os.environ, FLEET_HEAVY="off"), out=io.StringIO())
+            self.run_git("fetch", "--all")
+            self.run_git("config", "a.b")
+            done, took, starts = self.lsremote(GIT_SHIM, extra_env=pointed)   # the real shim in front of a real git, the sentinel as its home
+            self.assertEqual((done.returncode, starts), (128, 0), done.stderr)
+        self.assertEqual(snapshot(), before, "a focused path wrote, changed or added a file in the home it was pointed at")
 
     def test_s7_u1_no_file_of_this_change_writes_the_global_git_configuration(self):
         base = None
