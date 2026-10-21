@@ -79284,7 +79284,7 @@ class TestGhShimMergeGate(Base):
                     mock.patch.object(shim, "gate_probe", lambda a, *r, **k: seen.__setitem__("gate", list(a))), \
                     mock.patch.object(shim, "merge_gate_probe", lambda a, *r, **k: seen.__setitem__("merge", list(a))), \
                     mock.patch.object(shim, "account_env", lambda *a, **k: None), mock.patch.object(shim.os, "execv", lambda *a: (_ for _ in ()).throw(SystemExit(0))), \
-                    mock.patch.object(shim.os, "execve", lambda *a: (_ for _ in ()).throw(SystemExit(0))), mock.patch.object(shim, "Lookup", lambda **k: mock.Mock()):
+                    mock.patch.object(shim.os, "execve", lambda *a: (_ for _ in ()).throw(SystemExit(0))), mock.patch.object(shim, "Lookup", lambda **k: mock.Mock(identity=lambda: {})):
                 try:
                     shim.run(list(args))
                 except SystemExit:
