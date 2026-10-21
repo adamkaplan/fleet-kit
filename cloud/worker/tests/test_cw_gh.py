@@ -42,6 +42,7 @@ class Stub(http.server.BaseHTTPRequestHandler):
     logs_host = ""  # the base URL a logs redirect points at
     other_seen = []
     body_override = None
+    big_zip = False        # the download is a zip of 2001 entries
     nonjson = False        # answer 201 with a body that is not JSON
     redirect = None        # (code, location) answered for every API call
     logs_location = None   # a Location for the logs redirect, instead of the download path
@@ -64,6 +65,12 @@ class Stub(http.server.BaseHTTPRequestHandler):
         auth = self.headers.get("Authorization")
         if self.headers.get("X-Role") == "other" or self.path.startswith("/download"):
             Stub.other_seen.append((self.path, auth))
+            if Stub.big_zip:
+                b = io.BytesIO()
+                with zipfile.ZipFile(b, "w") as z:
+                    for i in range(2001):
+                        z.writestr("j/%d.txt" % i, "")
+                return self.answer(200, b.getvalue())
             return self.answer(200, zip_bytes())
         Stub.seen.append((self.command, self.path, json.loads(body) if body else None, auth))
         if Stub.redirect:
@@ -286,7 +293,13 @@ class Client(unittest.TestCase):
             self.assertEqual(len(p.stderr.strip().splitlines()), 1, p.stderr)
 
     def test_a_logs_archive_with_too_many_entries_is_refused(self):
-        self.assertEqual(MOD.MAX_ENTRIES, 2000)
+        Stub.big_zip = True
+        try:
+            p = self.run_gh("run", "logs", "5", "-R", REPO)
+        finally:
+            Stub.big_zip = False
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("more than 2000 entries", p.stderr)
 
     def test_the_only_writes_any_verb_makes_are_the_three_expected_ones(self):
         """Behaviour, not text: every verb is run against the stub; the writes it saw are exactly the PR create, the PR comment and the ready mutation."""
