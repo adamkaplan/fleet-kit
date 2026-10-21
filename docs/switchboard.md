@@ -5194,7 +5194,7 @@ Nobody removes it while the agent is registered: the temp janitor (its roots inc
 
 Every directory the switchboard makes goes through `ensure_dir(path, private=True, parents=True, check=True)` in `bin/private_dir.py` (the daemon's `_make_dir` wraps it and turns its refusal into the caller's own error type). It makes the directory atomically: another process making it at the same moment is "exists", never an error. A symlink to nothing at the path, or at a parent it would make, is refused with one line (`PrivateDirError`, an `OSError`) and nothing is made at the link's target; a symlink that resolves to a directory is accepted. With `private` the directory it makes is 0700 whatever the umask, and an existing one must be a directory owned by you with no group or world bits (`check=False` leaves that to a caller with its own rule); without `private` the mode is yours and nothing is checked. A per-agent scratch directory under the state area uses the same call.
 
-No `mkdir` or `makedirs` that passes `exist_ok` exists anywhere else in the daemon or the modules it loads: a test (`TestPrivateDir`) scans for it and fails on any other.
+No `mkdir` or `makedirs` that passes `exist_ok` exists anywhere else in the daemon or the modules it loads (the helper's own parent-creation line is the one allowed call): a test (`TestPrivateDir`) scans for it and fails on any other.
 
 ## Batching: the integration branch and the batch pull request (#834)
 

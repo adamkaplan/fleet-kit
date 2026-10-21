@@ -6321,7 +6321,7 @@ def agent_scratch_env(engine, name):
         found = os.lstat(str(root))     # the scratch root itself: a real directory of ours, never a symlink
     except FileNotFoundError:
         found = None
-    if found is not None and ((stat.S_ISLNK(found.st_mode) and os.path.exists(str(root))) or (not stat.S_ISLNK(found.st_mode) and not stat.S_ISDIR(found.st_mode)) or found.st_uid != os.getuid()):
+    if found is not None and not stat.S_ISLNK(found.st_mode) and (not stat.S_ISDIR(found.st_mode) or found.st_uid != os.getuid()):
         raise LaunchError("the scratch root %s is not a private directory of yours: no scratch directory was made" % root)
     try:
         helper.ensure_dir(path, private=True)   # the one way a directory is made (#708): atomic, a dangling link refused, the owner and the mode checked
