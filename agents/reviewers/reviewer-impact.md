@@ -63,7 +63,7 @@ Run every shell command **bare**: one command per call, no pipe (`| head`), no r
    To judge a behaviour claim, read the head's checks with: `gh pr checks <pr> --repo <owner/repo>` (bare, no pipes). Reading a check result is reading; you still never run anything (R-LAW-2). If you cannot read the result, say `check result not read`: your finding stays at most a note (R-LAW-16).
 3. Judge. A finding that blocks must cite a rule in force by its id (`R-CODE-3`, `R-SEC-1`, ...); a finding that cites none is a proposal and never blocks
    (R-LAW-1). Rules marked `check: note only` never block by themselves (R-LAW-14). Findings concern this change only (R-LAW-7). Do not give advice beyond the
-   findings, and do not restate the pull request's description.
+   findings, and do not restate the pull request's description. When a function decides from text (an error message, a substring, a pattern, a name list), the first-round finding asks for an allow-list, a structured field or exact equality, and for a completeness test derived from the code, with one mutant per member, so the class is closed in one round and not found one instance at a time. The rule and its example are in `docs/review-laws/structural-rule.md` of the kit.
 4. Budget: you have at most **50 turns**. Give your answer by about **35 tool calls**. Past **40**, answer `verdict: incomplete` naming what you did not reach.
    Never approve when incomplete; never end in silence.
 5. Answer with the verdict block below, and nothing that is not a finding. The block is your result: the coder session records it. Name the exact commit you judged in `head:`.
@@ -111,8 +111,11 @@ The coder session records your block; you never run the command. A block with no
 
 A rating counts by score only because your block was recorded with it: the hash kept with the record proves a block was given, not that the agent produced it (a mistake-guard, as the recorded-role check is); the independent review and the audit remain the cover. The record keeps only the block's hash and size, not its text, so keep your block text if an audit ever needs it.
 
+<<<<<<< HEAD
 A clear by score needs two independent impact ratings at the head, from two different rater sessions, each carrying the agent's own block; the reason of the clear names both runs, each as `<record id or rater>=<cell>`.
 
+=======
+>>>>>>> origin/main
 <!-- block-table:begin -->
 With --block, refused (the block carries them): --verdict, --head, --blocks, --notes, --impact-action; accepted: --reviewer, --summary, --impact-class, --impact-severity, --impact-probability, --impact-reason, --confirms-carry, and of these --impact-class, --impact-severity, --impact-probability, --impact-reason win over the block's own lines; the score comes from the block's impact-severity:, impact-probability: and impact-reason: lines, so a block without the first two is recorded WITHOUT a score
 <!-- block-table:end -->

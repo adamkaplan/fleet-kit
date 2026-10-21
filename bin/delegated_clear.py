@@ -157,12 +157,16 @@ def uncounted_line(entries):
     return INCOMPLETE_VERDICT if any(counts_by_block(e) and e.get("verdict") == "incomplete" for e in mine) else NO_AGENT_BLOCK
 
 
+<<<<<<< HEAD
 RUNS_REQUIRED = 2   # #972: a clear by score rests on this many counted ratings from different sessions at the head; the ONE place the number is written
 TWO_RUN_RULE = ("A clear by score needs two independent impact ratings at the head, from two different rater sessions, each carrying the agent's own block; "
                 "the reason of the clear names both runs, each as `<record id or rater>=<cell>`.")   # #972: stated once in the docs and once in each rater brief, byte for byte
 
 
 def judge(block, cells, entries, report, threshold, runs_required=1):
+=======
+def judge(block, cells, entries, report, threshold):
+>>>>>>> origin/main
     """{"level": the score or None, "reasons": [why refused]} (no reasons: the score is at or below `threshold`, so the clear may go on). `block` is the matrix's score block, `cells` its `cells` (severity ->
     probability -> {"level"}), `entries` the ledger's entries (the caller filtered nothing: this checks kind, reviewer, pr, EXACT head and the recorded role again), `report` the owner-hold report (`pr`, `head`,
     `top_tier_hits` {class: [paths]}). The score is the HIGHEST level of the counted records (a later, lower one never lowers it), taken from the matrix cell of the recorded severity and probability, never from
