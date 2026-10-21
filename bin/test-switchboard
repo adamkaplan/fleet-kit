@@ -389,7 +389,7 @@ class TestConfig(Base):
         self.assertFalse(self.config_file.exists())
         self.assertEqual(sb.load_config(), {
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
-            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "clear_remind_minutes": 15, "send_timeout_seconds": 60, "poll_seconds": 5,
+            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "scratch_retention_days": 14, "call_timeout_seconds": 20, "clear_remind_minutes": 15, "send_timeout_seconds": 60, "poll_seconds": 5,
             "herdr_log": "~/.config/herdr/herdr-server.log", "pane_exit_burst_seconds": 5, "pane_exit_burst_min": 3,  # #1030
             "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "launch_default": "headless",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
@@ -4213,8 +4213,9 @@ class TestLaunch(StandInPids, Base):
                                                      "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": ""})  # PR 18: who this pane is; the switchboard's own-gh marker is blanked
         self.assertEqual(done["pane"], "w1:p%d" % self.world.herdr._pane_n)
         brief = [m for m in session["messages"] if m["type"] == "user"]
-        self.assertEqual([(m["text"], m["metadata"]) for m in brief],
-                         [("Add a health check", {"fleet": {"from": "switchboard", "brief": True}})])
+        self.assertEqual([m["metadata"] for m in brief], [{"fleet": {"from": "switchboard", "brief": True}}])
+        self.assertTrue(brief[0]["text"].startswith("Add a health check"), brief[0]["text"])
+        # #948: this engine has no state directory, so there is no scratch directory to name (the real launch always has one)
         opened = self.order.index(("socket", ["layout.apply"]))
         prompt = self.order.index(("v2", ["session.prompt"]))
         between = self.order[opened:prompt]  # after the tab opens and before the brief: the checks
@@ -6614,7 +6615,8 @@ class TestLaunch(StandInPids, Base):
         self.assertEqual(sorted(done), ["name", "pane", "session", "tab"])
         session = self.world.v2.sessions[done["session"]]
         self.assertEqual(session["metadata"]["fleet"]["reports_to"], "platform")
-        self.assertEqual(session["messages"][0]["text"], "Do the thing\n")
+        self.assertTrue(session["messages"][0]["text"].startswith("Do the thing\n"), session["messages"][0]["text"])
+        self.assertIn("FLEET_SCRATCH", session["messages"][0]["text"])   # #948: the brief names the scratch directory
 
     def test_a_launch_records_who_ran_it_from_its_pane_and_nobody_from_a_plain_shell(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
@@ -17101,7 +17103,9 @@ class TestHeadlessPresence(Base):
         self.assertEqual(self.world.herdr.panes, panes_before, "no pane appeared")
         self.assertEqual(self.world.herdr.socket_calls, calls_before, "herdr was asked for no layout, tab or pane")
         brief = [m for m in session["messages"] if m["type"] == "user"]
-        self.assertEqual([(m["text"], m["metadata"]) for m in brief], [("Add a health check", {"fleet": {"from": "switchboard", "brief": True}})])
+        self.assertEqual([m["metadata"] for m in brief], [{"fleet": {"from": "switchboard", "brief": True}}])
+        self.assertTrue(brief[0]["text"].startswith("Add a health check"), brief[0]["text"])
+        self.assertIn("FLEET_SCRATCH", brief[0]["text"])   # #948: the brief names the agent's own scratch directory
         record = self.ap.load_record(self.world.state, "hw")
         self.assertEqual((record["worker"], record["session"], record["kind"]), ("hw", done["session"], "local"))
         found = self.discover().agents["hw"]
@@ -78236,6 +78240,7 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
         "known_session": ("test_known_session_and_watch_follow_the_registrys_retired_record", "known_session"),
         "janitor_agent_roots": ("test_s1_an_entry_a_live_or_recently_retired_agent_owns_is_kept", "janitor_agent_roots"),
         "cmd_retire": ("test_retire_frees_the_name_of_a_headless_worker_and_undo_restores_the_record_unless_the_name_was_taken", "undo"),
+        "reclaim_scratch_dirs": ("test_s5_only_the_directory_of_an_agent_retired_longer_than_the_retention_is_removed", "reclaim_scratch_dirs"),
     }
 
     def registry_callers(self):
