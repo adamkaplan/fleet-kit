@@ -23375,6 +23375,102 @@ def cmd_gates_check(args, runner, now):
 cmd_gates_check.ledger = True   # state and GETs only; its own errors are usage errors
 
 
+# ---- #962: the fleet's own merge queue. `merge-gate` reads (and writes nothing); `--pass` runs the gate and takes the lock; `--check` is what the gh shim
+# asks before `gh pr merge`; `--release` frees the lock. The rules are in bin/merge_gate.py, the shared pull-request reading in bin/pr_reading.py.
+MERGE_GATE_SLEEP = time.sleep   # the wait between two reads of a re-run; a test replaces it
+
+
+def add_merge_gate_parsers(sub):
+    gate = sub.add_parser("merge-gate", help="The fleet's merge queue: may this pull request merge now? Read-only by default; `--pass` runs the gate and takes the "
+                                             "per-branch lock, `--release` frees it. The gh shim enforces it for a gated branch (the `merge_gate` configuration key)",
+                          description="Prints ONE block: the branch tip now, the branch tip the pull request's last CI run was computed on, equal or not, the run's "
+                                      "result at the current head, the latest completed run on the branch and whether a merge is allowed now and why. It writes "
+                                      "nothing. `--pass` re-runs that pull request's CI on the current merge ref when the branch moved (a close and reopen: head and "
+                                      "labels untouched; a held pull request only with `--rerun-held`), waits up to `merge_gate.wait_minutes` (default 45), and on "
+                                      "green records the pass and takes the lock of the repository and branch. `--check` (the shim) exits 0 to allow and 10 to refuse.")
+    gate.add_argument("pr", help="The pull request: owner/repo#N or its URL")
+    mode = gate.add_mutually_exclusive_group()
+    mode.add_argument("--pass", dest="gate_pass", action="store_true", help="Run the gate, re-run CI if the branch moved, take the lock and record the pass")
+    mode.add_argument("--check", action="store_true", help="What the gh shim asks: exit 0 allow, 10 refuse (one line on stderr)")
+    mode.add_argument("--release", action="store_true", help="Release the lock you hold on the pull request's branch")
+    gate.add_argument("--rerun-held", action="store_true", help="With --pass: close and reopen a HELD pull request to recompute its merge ref (its orchestrator agrees first)")
+    gate.add_argument("--json", action="store_true")
+
+
+def merge_gate_gh(config, runner, repo):
+    """`gh(argv) -> (code, stdout, stderr)` for `repo`'s account, never raising; every call names itself the switchboard's own, so the shim does not probe it."""
+    accounts = GhAccounts(config, runner, time.time)
+    try:
+        refuse_excluded(config, repo)
+        env = accounts.env_for(repo)
+    except AccountError as err:
+        raise LedgerCommandError(str(err)) from None
+    env = dict(env if env is not None else os.environ, **{OWN_GH_ENV: "1"})
+
+    def gh(argv):
+        try:
+            done = runner([config["gh"]] + argv, capture_output=True, text=True, timeout=config["call_timeout_seconds"], stdin=subprocess.DEVNULL, env=env)
+        except (OSError, subprocess.SubprocessError) as err:
+            return 1, "", accounts.scrub(_one_line(str(err), 120))
+        return done.returncode, done.stdout or "", accounts.scrub(done.stderr or "")
+    return gh
+
+
+def cmd_merge_gate(args, runner, now):
+    gate, reading = load_module("merge_gate"), load_module("pr_reading")
+    try:
+        repo, number = parse_pr_ref(args.pr)
+    except NoticeError as err:
+        raise LedgerCommandError(str(err)) from None
+    ref = "%s#%d" % (repo, number)
+    config = load_runnable_config()
+    conf = gate.settings(config)
+    gh = merge_gate_gh(config, runner, repo)
+    state = state_dir_path()
+    if not (args.gate_pass or args.check or args.release):
+        facts = gate.read_facts(reading, gh, repo, number, conf)
+        allowed, reason, _ = gate.decide(facts)
+        print(gate.block(facts, allowed, reason))
+        if args.json:
+            print(json.dumps({"allowed": allowed, "reason": reason, "tip": facts["tip"], "run_base": facts["run_base"], "head": facts["head"]}, sort_keys=True))
+        return EXIT_OK if allowed else EXIT_ERROR
+    engine, state, _ = build_engine(runner, now, "cli", writable=True)
+    kind = gates_caller_kind(runner, now)
+    if kind[0] == "unknown":
+        _gates_audit(engine, "merge_gate.refused", ref, {"why": "identity unknown"})
+        raise LedgerCommandError("refused: %s" % kind[1])
+    who = "owner-terminal" if kind[0] == "person" else kind[1]
+    if args.release:
+        facts = gate.read_facts(reading, gh, repo, number, conf)
+        if facts["problems"]:
+            raise LedgerCommandError("unreadable: %s" % facts["problems"][0])
+        done = gate.release(state, repo, facts["branch"], who)
+        _gates_audit(engine, "merge_gate.release", ref, {"by": who, "released": done})
+        print("released the merge lock on %s %s" % (repo, facts["branch"]) if done else "%s holds no merge lock on %s %s: nothing released" % (who, repo, facts["branch"]))
+        return EXIT_OK
+    if args.gate_pass:
+        ok, lines = gate.gate_pass(reading, gh, conf, state, repo, number, who, os.getppid() if kind[0] == "person" else None, now,   # an agent's shell exits before its merge: only a person's own terminal has a process to watch
+                                     MERGE_GATE_SLEEP, allow_held=args.rerun_held)
+        for line in lines:
+            print(line)
+        _gates_audit(engine, "merge_gate.pass" if ok else "merge_gate.blocked", ref, {"by": who, "result": _one_line(lines[-1] if lines else "", 300)})
+        return EXIT_OK if ok else EXIT_ERROR
+
+    def waived(head):
+        entries, problem = plan_ledger.read_ledger(state)
+        return not problem and gate.WAIVER_GATE in plan_ledger.valid_waivers(entries, ref, head, now())
+    allowed, why, head = gate.check_merge(reading, gh, conf, state, repo, number, who, kind[0] == "person", waived, now)
+    _gates_audit(engine, "merge_gate.allowed" if allowed else "merge_gate.refused", ref, {"by": who, "why": _one_line(why, 300)})
+    if args.json:
+        print(json.dumps({"allowed": allowed, "reason": why, "head": head, "locked": why.startswith(gate.GATE_PASSED)}, sort_keys=True))
+    elif not allowed:
+        sys.stderr.write("%s\n" % why)
+    return EXIT_OK if allowed else plan_ledger.EXIT_REFUSE
+
+
+cmd_merge_gate.ledger = True   # state and GETs only; its own errors are usage errors
+
+
 ANCESTOR_DEPTH = 25
 AGENT_PROCESS_NAMES = ("opencode", "fleet-opencode", "copilot")
 
@@ -24098,7 +24194,7 @@ def add_ledger_parsers(sub):
                                        "by a writer of the PR. A ledger entry and an audit line; it lasts 24 hours (the retroactive "
                                        "plan is due then) and a push needs a new one. `gates` shows the gate as waived, not passed.")
     waive.add_argument("pr", help="The pull request: owner/repo#N or its URL")
-    waive.add_argument("--gates", required=True, help="Comma-separated gates: G0a,G0b,G0c,G1,G2/G3,G4,G5")
+    waive.add_argument("--gates", required=True, help="Comma-separated gates: G0a,G0b,G0c,G1,G2/G3,G4,G5, or MG (the merge gate, #962)")
     waive.add_argument("--reason", required=True, help="Why (at least %d characters)" % plan_ledger.WAIVER_REASON_MIN)
     waive.add_argument("--head", help="The PR head sha (default: read from GitHub)")
     gates = sub.add_parser("gates", help="Read-only: the plan's gates G0a to G8 for a PR, what each needs and who decides it. "

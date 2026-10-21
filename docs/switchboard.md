@@ -4290,7 +4290,7 @@ whose records are later slices; G7 and G8 are epic and deploy gates and show `n/
 `fleet-switchboard waive <repo#N> --gates G0a,G1,... --reason "<at least 20 characters>" [--head <sha>]` is the chief of staff's override
 for a hotfix, per `docs/plan-gate-engine-design.md`. Who: the chief of staff, or the owner at a terminal (the one shared check of `gates mode` and
 `verdict --as owner`, `gates_caller_kind`: an unknown session is refused, never read as a person, and a no-session caller must be on a
-controlling terminal with no agent process above it, so `env -u` on a pipe is refused; a strong mistake-guard, not a boundary). Which gates: G0a, G0b, G0c, G1, G2/G3, G4, G5.
+controlling terminal with no agent process above it, so `env -u` on a pipe is refused; a strong mistake-guard, not a boundary). Which gates: G0a, G0b, G0c, G1, G2/G3, G4, G5, and `MG` (the merge gate, below).
 **G6 (a held PR: the owner's hold), G7 and G8 are refused**, and a hand-written ledger entry naming them is ignored. A **writer of the PR**
 (one who recorded its proof or sent its notice, or its GitHub author) cannot waive its gates, and a ledger that does not verify takes no
 waiver and honours none. The waiver is a hash-chained ledger entry (`kind waiver`: who, why, PR, head, gates, expiry) and a `plan.waiver`
@@ -4298,6 +4298,67 @@ audit line. It is bound to **the head it was recorded at** (a push needs a new o
 retroactive plan; a waiver for another head, another PR or after its expiry does nothing. `gates` and `gates-check` honour a valid waiver:
 the gate reads `waived (by <who>, <reason>, due <time>)`, never `ok`, and the report lists `WAIVED (not passed)`. The cos permission corpus
 and allowed commands still have to be extended with `waive` (a permission change, held for the owner).
+
+## The merge gate and the merge lock: the fleet's own merge queue (#962)
+
+**It is the fleet's own merge queue.** Two pull requests that were each green against an older default branch can merge minutes apart and fail together (the
+recorded case: two pull requests merged 8 minutes apart, each green on CI that ran before the other landed, and a test failed on the default branch after the
+second). The gate makes a merge into a *gated branch* wait for proof that the pull request's last green run tested the branch **as it is now**, and lets one merge
+into that branch happen at a time. No head changes to make sure of it.
+
+**The configuration.** `merge_gate` in the switchboard config:
+
+```json
+{"merge_gate": {"repos": {"acme-org/widget-service": {}, "acme-org/widget-api": {"branches": ["main", "integration"]}},
+                "wait_minutes": 45, "lock_minutes": 20}}
+```
+
+A listed repository gates its **default branch**; `branches` names others. The integration branch is **not** gated unless a repository's `branches` lists it. A
+repository that is not listed is not enforced and nothing is asked of it (so removing the key is the rollback).
+
+**`fleet-switchboard merge-gate <repo#N>`** reads and writes nothing. It prints one block: the branch tip now; the branch tip the pull request's last CI run
+was computed on; whether they are equal; the run's result at the current head (a red run names its failing job); the latest completed run of each workflow on the
+branch itself; and whether a merge is allowed now and why. A run, a read or a state it does not know is never read as green. The tip a run was computed on is the
+branch tip GitHub recorded for the run (`pull_requests[].base.sha` of the workflow run); both reads come from one shared reader (`bin/pr_reading.py`), the same one
+the clear packet (#952) will call.
+
+**`merge-gate <repo#N> --pass`** is the merger's step. When the branch has moved, it runs that pull request's CI again **on the current merge ref**, without
+touching the head or any label, so no review, proof or clear is voided. The smallest safe way found is to **close the pull request and reopen it at once**: the
+`reopened` event starts CI on a merge ref GitHub computes fresh. A re-run of the old run reuses the old merge ref; a `workflow_dispatch` run tests the head alone;
+an `update-branch` or a push changes the head. This is the one sanctioned close and reopen: lanes never close and reopen a pull request to re-run CI (a plain re-run is the way, and merging the default branch in is one push), and the gate does it at most once per gate pass, only when the branch moved since that pull request's last run, because a re-run reuses the old merge ref. A pull request **held for the owner** is not closed by the gate: it blocks and names `--pass --rerun-held`, which its
+orchestrator uses once the owner's clear is known to survive (it is bound to the head, which does not change). The gate waits up to `wait_minutes` (default 45) and
+passes only on green; a red run blocks and names the failing job, a timeout blocks and says the limit. On green it records the pass for that exact head and branch tip
+and takes the lock.
+
+**Why close and reopen, and not the workflow's dispatch.** The workflow can be started by hand (`gh workflow run test.yml --ref <branch>`; see "Re-running a head's CI"), and that is the right tool for a head with no run. It does not answer this question: a dispatched run checks out the pull request's **head branch alone**, so it never tests the head combined with the branch tip, which is exactly what moved. Only a pull-request event runs CI on the merge ref, and a `reopened` event is the one that fires without a push or a label change.
+
+**The lock.** One file per repository and branch in the switchboard's state directory (`merge-gate/`): the holder's name, since when, the process and the pull
+request. It is held from the gate pass until the `gh pr merge` call returns (the shim releases it, whatever the merge returned; `merge-gate --release` frees it
+early). A lock whose holder has held it longer than `lock_minutes` (default 20) without merging, or, for the owner's own terminal only, whose holder process is gone (an agent's shell exits before its merge follows, so an agent's lock is recovered by the lease alone), is **recovered**; a second merger is told **who holds it, since when and when to retry**.
+
+**Enforcement is in the `gh` shim** (`shims/gh`, a credentials path). Before `gh pr merge` into a gated branch of a listed repository it asks `merge-gate --check`
+and **refuses in one line** unless a gate pass for this exact head and branch tip is recorded and the caller holds the lock; a merge that goes through is bound to
+the checked head and `--auto` is refused. While the latest completed run on the branch is red, no merge into it is allowed. It fails closed: no switchboard, no
+answer in time or an unreadable state refuses. **The only ways around it are the owner's own terminal** (the same rule as `waive` and `gates mode`) **and a logged
+waiver** of the chief of staff: `fleet-switchboard waive <repo#N> --gates MG --reason "..."`, a hash-chained ledger entry and an audit line, bound to the pull
+request's head and expiring after 24 hours. The waiver is also how the one merge that fixes a red branch goes in.
+
+**Which routes the shim covers, and which stay outside.** Covered, for a listed repository: `gh pr merge` in any shape (the command words are found structurally, so `-R`/`--repo` and other flags may stand before `pr`,
+between `pr` and `merge` or after, and every probe of the shim (hold, review, plan gate, merge gate) reads ONE canonical form, parsed once at the top; a shape the shim cannot parse is refused, never run), `gh api` with a write method (or `-f`, `-F`,
+`--input`) to `repos/<repo>/pulls/<N>/merge` (the path goes through ONE normaliser: percent-decoded, cut at `?` and `#`, repeated slashes collapsed, `.` and `..` segments resolved (a path that climbs above `repos` is refused), case folded; a path
+with a placeholder (`{owner}`, `:owner`), a variable, a URL form or any other `pulls/<x>/merge` that cannot be tied to a repository is refused), and a
+GraphQL `mergePullRequest` or `enablePullRequestAutoMerge` mutation (refused while any repository is gated, because the mutation names a node id, not a
+repository). A call to the real `gh` that is not run through the shim is **outside**: a `gh` alias (`gh m 12`: the shim sees the alias, not the command),
+the web UI, and a `git push` to the branch. Neither the owner's own terminal nor the waiver is a hole in that list: they are the two stated ways around.
+Every switchboard program the shim starts (the identity lookup, the review and plan-gate questions, the merge gate's check and release) runs in a **fixed environment built from an allow list** (never by filtering the caller's): a fixed `PATH`, `HOME` as the account's, the locale and temp names and the identity names the switchboard verifies against the session; `PYTHON*`, `LD_*`, `DYLD_*`, `XDG_*`, `FLEET_SWITCHBOARD_*` and every other name never reach it, and a switchboard that is a Python program is started as `<python on the fixed path> -I <program>` (isolated: no `PYTHON*` variable and no user site), so a library of the caller's is not loaded even by a name this list forgot (the identity names are passed on by design: the switchboard checks them against the session), so a worker cannot hand the switchboard a state directory or configuration of its own (a forged pass, lock or waiver). A `gh api` path is default-denied when it still looks like a merge after normalisation: a backslash is read as a slash, and any suffix after `merge` (`%00`, `%20`, `;x`) is refused as unknown. A `gh api` merge is gated but not bound to the checked head (the shim does not rewrite an API body); `merge-gate --pass --rerun-held` and the re-run can be run by any caller for any pull request: the held case is by design and both are audited.
+**The shim itself runs in the caller's environment**: the child hardening cannot stop a caller that changes the shim; the shim is a guard against mistakes and unattended callers, not a boundary against its caller's interpreter.
+The non-merge-gate call sites start `switchboard_binary()`, which honours `FLEET_SWITCHBOARD_BIN` and the caller's `PATH`; the merge gate uses the account's own copy: older gates, as documented.
+**Same-user environment is a mistake-guard, not a boundary**, as everywhere in this repository: the gate does not read `FLEET_SWITCHBOARD_OWN_GH`, `HOME`,
+`XDG_CONFIG_HOME` or `FLEET_SWITCHBOARD_BIN` (it reads the configuration under the account's real home from the password database, and the program that
+`install` linked there), and tests pin those four as hostile cases; a worker that can run its own copy of `gh` or edit the configuration is stopped by GitHub's
+branch protection, not by this gate. Known limits: a merge is bound to the head (`--match-head-commit`), not to the branch tip, so a merge by the owner's
+terminal or under a waiver can move the branch between the check and the merge (the next check refuses the now stale pass); a pass costs a full CI run and up to
+`wait_minutes` on a busy branch; and closing the pull request for the re-run fires its `closed` and `reopened` events, which other automation may react to.
 
 ## `gates-check`, the gate modes and the kill switches (#107, slice 3a)
 
