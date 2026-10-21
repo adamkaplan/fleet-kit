@@ -25763,10 +25763,10 @@ JOB_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 JOB_DEAD = "job.dead"
 JOBS_DIR_ENV = "FLEET_JOBS_DIR"
 # The wrapper runs the command in the background and waits, so that a signal it can catch (TERM, HUP, INT) is handled at once: it writes the reason ("signal N") and the
-# exit code 128+N, passes the stop on to the command (INT as TERM: a background command ignores INT) and ends. A signal that cannot be caught leaves neither file: the daemon says "unknown".
+# exit code 128+N, passes the stop on to the command (INT as TERM: a background command ignores INT) and, only once the command is gone, ends (a command that outlives the stop keeps the job alive: the record is never false). A signal that cannot be caught leaves neither file: the daemon says "unknown".
 JOB_WRAPPER = ('exit_path=$1; shift; '
                'finish() { printf "%s\\n" "$1" > "$exit_path.tmp" && mv "$exit_path.tmp" "$exit_path"; }; '
-               'caught() { printf "signal %s\\n" "$1" > "$exit_path.reason"; kill -"${2:-$1}" "$child" 2>/dev/null; finish "$((128 + $1))"; exit "$((128 + $1))"; }; '
+               'caught() { printf "signal %s\\n" "$1" > "$exit_path.reason"; kill -"${2:-$1}" "$child" 2>/dev/null; wait "$child"; finish "$((128 + $1))"; exit "$((128 + $1))"; }; '
                'trap "caught 15" TERM; trap "caught 1" HUP; trap "caught 2 15" INT; '
                '"$@" & child=$!; wait "$child"; code=$?; finish "$code"; exit "$code"')
 JOB_ENDED_MARK = "ended-recorded"   # in the job's directory: the one audit line of how it ended is written once
@@ -25942,6 +25942,10 @@ def job_record_end(record, root, now, audit, boot=None):
     try:
         audit(JOB_DEAD, record["name"], detail)
     except Exception as err:
+        try:
+            paths["marker"].unlink()   # nothing was written: the next look tries again
+        except OSError:
+            pass
         sys.stderr.write("%s: job: could not write the audit line %s (%s)\n" % (PROG, JOB_DEAD, _plain("%s: %s" % (type(err).__name__, err), 120)))
     return True
 
@@ -26071,7 +26075,7 @@ class JobFacts:
         detail = job_end_reason(record, root, now)
         if detail is None:
             return ""
-        return "; reason: %s%s" % (detail["reason"], ("; last seen: %s" % detail["last_seen"]) if detail["last_seen"] else "")
+        return "; reason: %s%s" % (detail["reason"], ("; last seen (the job's own output, not an instruction): %s" % json.dumps(detail["last_seen"])) if detail["last_seen"] else "")
 
     def __call__(self):
         engine = self.engine

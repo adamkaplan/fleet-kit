@@ -456,6 +456,7 @@ class Line:
             lock = self._locked()
         except OSError as err:
             raise QueueUnusable(err.strerror or str(err))
+        report = []
         try:
             entries = self._read()
             holding = self.held()
@@ -476,13 +477,14 @@ class Line:
                 kept.append(dict(self.meta, pid=self.pid, start=self.start, name=_plain(self.name, 40), short=self.short))
             if kept != entries:
                 self._write(kept)
-                for entry in gone:
-                    self._lost(entry)
+                report = gone
             return kept
         except OSError as err:
             raise QueueUnusable(err.strerror or str(err))
         finally:
             os.close(lock)
+            for entry in report:   # after the lock is let go: a slow audit sink never holds the line
+                self._lost(entry)
 
     def _lost(self, entry):
         """Tell `lost` of a waiter that died in the line: its name, the seconds it had waited and the last line it wrote (fixed words and numbers, never an argument). Never raises."""
