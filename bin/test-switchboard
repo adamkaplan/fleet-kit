@@ -390,6 +390,7 @@ class TestConfig(Base):
         self.assertEqual(sb.load_config(), {
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
             "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "clear_remind_minutes": 15, "send_timeout_seconds": 60, "poll_seconds": 5,
+            "herdr_log": "~/.config/herdr/herdr-server.log", "pane_exit_burst_seconds": 5, "pane_exit_burst_min": 3,  # #1030
             "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "launch_default": "headless",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
@@ -847,7 +848,7 @@ class TestHerdrClient(Base):
                         if not name.startswith("_"))
         self.assertEqual(public, ["agent_get", "agent_list", "notification_show", "open_tab_running",
                                   "pane_clear_token", "pane_close", "pane_get", "pane_list", "pane_process_info", "pane_read_visible",
-                                  "pane_report_metadata_token", "tab_close", "tab_get", "workspace_create", "workspace_list"])  # PR 16
+                                  "pane_report_metadata_token", "tab_close", "tab_get", "tab_list", "workspace_create", "workspace_list"])  # PR 16; #973: tab_list is the one-time bell migration's read
 
     def test_a_workspace_is_listed_and_created_focused_with_the_one_focus_flag(self):
         body = '{"result": {"workspaces": [{"workspace_id": "w1", "label": "A"}], "workspace": {"workspace_id": "w2"}, ' \
@@ -2065,7 +2066,7 @@ class FakeV2:
 
 HERDR_ALLOWED = (["agent", "list"], ["agent", "get"], ["pane", "report-metadata"], ["notification", "show"],
                  ["pane", "process-info"], ["pane", "close"], ["workspace", "list"], ["workspace", "create"],
-                 ["plugin", "list"], ["pane", "get"], ["pane", "read"], ["tab", "close"], ["tab", "get"])  # PR 16; the control plane reads a pane and closes a stale tab: `status` reads herdr's plugin list; `bootstrap` makes a workspace
+                 ["plugin", "list"], ["pane", "get"], ["pane", "read"], ["tab", "close"], ["tab", "get"], ["tab", "list"])  # PR 16; #973: the bell migration reads the tab labels once; the control plane reads a pane and closes a stale tab: `status` reads herdr's plugin list; `bootstrap` makes a workspace
 SOCKET_ALLOWED = ("layout.apply",)
 TYPING_VERBS = (["agent", "prompt"], ["agent", "send-keys"], ["agent", "start"], ["pane", "send-text"],
                 ["pane", "send-keys"], ["pane", "run"])
@@ -2157,7 +2158,7 @@ class FakeHerdr:
         # herdr 0.9's shape: the session is an object, not a string (S6).
         entry = self.panes[pane]
         body = {"pane_id": pane, "agent": "opencode", "agent_status": self.status(pane),
-                "workspace_id": pane.split(":")[0]}
+                "workspace_id": pane.split(":")[0], "tab_id": self.tab_of(pane)}
         if entry["session"] and not entry.get("undetected"):
             body["agent_session"] = {"agent": "opencode", "kind": "id", "source": "herdr:opencode",
                                      "value": entry["session"]}
@@ -2180,7 +2181,7 @@ class FakeHerdr:
                    ("notification", "show"): self._notification_show, ("pane", "process-info"): self._process_info,
                    ("pane", "close"): self._pane_close, ("workspace", "list"): self._workspace_list,
                    ("workspace", "create"): self._workspace_create, ("pane", "get"): self._pane_get, ("pane", "list"): self._pane_list,
-                   ("tab", "close"): self._tab_close, ("tab", "get"): self._tab_get}.get(tuple(args[:2]))
+                   ("tab", "close"): self._tab_close, ("tab", "get"): self._tab_get, ("tab", "list"): self._tab_list}.get(tuple(args[:2]))
         if tuple(args[:2]) == ("pane", "read"):
             positional, flags = parse_flags(args[2:], ("--source", "--lines", "--format"))
             if positional[0] not in self.panes:
@@ -2312,6 +2313,10 @@ class FakeHerdr:
                 "agent_status": self.status(pane), "terminal_title_stripped": title}
         return {"result": {"type": "pane_info", "pane": body}}
 
+    def _tab_list(self, rest):
+        parse_flags(rest, ())
+        return {"result": {"type": "tab_list", "tabs": [{"tab_id": self.tab_of(p), "workspace_id": p.split(":")[0], "label": self.panes[p].get("tab_label", "")} for p in sorted(self.panes)]}}
+
     def _tab_get(self, rest):
         positional, _ = parse_flags(rest, ())
         members = [p for p in self.panes if self.tab_of(p) == positional[0]]
@@ -2423,7 +2428,9 @@ class World:
         self.sessions, self.panes = {}, {}
         for name in agents:
             self.add_agent(name)
-        raw = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR,
+        empty_log = self.state / "herdr-server.log"   # #1030: the pane-exit pass reads herdr's log; a world must never read the real one, nor note a missing one
+        empty_log.write_text("")
+        raw = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "herdr_log": str(empty_log),
                "v2_cache_seconds": getattr(test, "V2_CACHE", 0)}   # the scenarios of old read the world afresh every pass; TestV2ReadVolume and the *WithTheMemoryOn classes turn it on
         raw.update(config or {})
         self.config = sb.validate_config(raw)
@@ -2627,7 +2634,12 @@ class TestFacts(Base):
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "job_facts", "pane_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
+
+    def test_every_fact_source_class_in_the_module_is_registered(self):   # #1030: derived, so a new source cannot be left out
+        registered = {type(s).__name__ for s in sb.fact_sources(self.home)}
+        classes = {n for n, v in vars(sb).items() if isinstance(v, type) and n.endswith("Facts") and v.__module__ == sb.__name__}
+        self.assertEqual(classes - registered, set(), "a *Facts class is not in fact_sources (list it, or rename it)")
 
 
 # ---------------------------------------------------------------- observing
@@ -4520,6 +4532,53 @@ class TestLaunch(StandInPids, Base):
         self.engine.state_dir = self.world.state
         self.engine.discover(self.world.clock.now())
         sb.pane_health_pass(self.engine, self.world.clock.now() + offset)
+
+    # -- #973: the daemon's own call of the migration (the pass), not the function alone
+
+    class LiveBells:
+        """A herdr client whose live lists carry tab ids and labels: delegates everything else to the real fake."""
+        def __init__(self, real, agents, tabs):
+            self.real, self.agents, self.tabs = real, agents, tabs
+
+        def __getattr__(self, name):
+            return getattr(self.real, name)
+
+        def agent_list(self):
+            return self.agents
+
+        def tab_list(self):
+            return self.tabs
+
+    def recorded_world(self, agents, tabs):
+        registry = sb.load_module("registry")
+        pane, sid = self.world.panes["platform"], self.world.sessions["platform"]
+        registry.upsert(self.world.state, "platform", {"pane": pane, "session": sid, "role": "worker"}, now=1)
+        self.engine.herdr = self.LiveBells(self.engine.herdr, [dict(a, pane_id=pane) for a in agents], tabs)
+        return registry, pane
+
+    def test_the_pass_runs_the_migration_a_belled_pane_gets_bell_true_and_the_marker_exists(self):
+        registry, pane = self.recorded_world([{"tab_id": "t1"}], [{"tab_id": "t1", "label": "\U0001f514 lead"}])
+        self.health()
+        self.assertIs(registry.read(self.world.state)["agents"]["platform"]["bell"], True)
+        self.assertTrue(registry.bell_migrated(self.world.state))
+
+    def test_the_mutant_that_drops_the_call_from_the_pass_fails_the_check_above(self):
+        registry, pane = self.recorded_world([{"tab_id": "t1"}], [{"tab_id": "t1", "label": "\U0001f514 lead"}])
+        with mock.patch.object(sb, "bell_migration", lambda *a, **k: None):
+            self.health()
+        self.assertIsNone(registry.read(self.world.state)["agents"]["platform"].get("bell"))   # the pass-level test would fail: no field, no marker
+        self.assertFalse(registry.bell_migrated(self.world.state))
+
+    def test_a_whole_but_empty_live_list_writes_no_marker_while_agents_are_recorded(self):
+        registry, pane = self.recorded_world([], [])
+        self.health()
+        self.assertFalse(registry.bell_migrated(self.world.state))
+        self.assertIsNone(registry.read(self.world.state)["agents"]["platform"].get("bell"))
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "fleetpane.error" and "pending" in json.dumps(e)])
+        self.engine.herdr = self.LiveBells(self.engine.herdr.real, [{"pane_id": pane, "tab_id": "t1"}], [{"tab_id": "t1", "label": "plain"}])
+        self.health()   # herdr answers again: it runs, and the agent is not belled
+        self.assertIs(registry.read(self.world.state)["agents"]["platform"]["bell"], False)
+        self.assertTrue(registry.bell_migrated(self.world.state))
 
     def state(self, name="platform"):
         obs = self.engine.discover(self.world.clock.now()).agents[name]
@@ -10481,7 +10540,7 @@ class TestFrictionWake(FrictionBase):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "job_facts", "pane_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
         self.make("off")
@@ -34727,6 +34786,263 @@ class TestBlockTable(LedgerBase):
         self.assertIn("notice withdraw takes only the PR", err)
 
 
+class TestAgentBlockCounts(TestBlockTable):
+    """#901: an impact rating counts by score only when it carries the verdict block the agent returned. Every shape is driven through the real `review record`, then scored by the real `judge`."""
+
+    SCORED = "impact-severity: Marginal\nimpact-probability: Remote\nimpact-reason: why\n"
+    # shape -> (record command arguments builder, recorded, counts by score)
+    SHAPES = {
+        "block present": ("block", True, True),
+        "block for another head": ("other-head", False, False),
+        "malformed block": ("malformed", False, False),
+        "flags only": ("flags", True, False),
+        "block disagreeing with the flags": ("disagree", True, False),
+        "block with no score lines": ("no-score", True, False),
+        "old record (no block keys)": ("old", True, False),
+    }
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(sb, "gates_caller_kind", return_value=("agent", "rev", "reviewer"))   # the recorded role of the session that records: the independent reviewer
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def make(self, shape):
+        base = ("review", "record", self.PR, "--reviewer", "impact")
+        if shape == "block":
+            return self.record(extra=self.SCORED)
+        if shape == "other-head":
+            path = self.world.state / "other.txt"
+            path.write_text("verdict: approve\nhead: %s\nimpact-action: none\n%sfindings:\n" % ("b" * 40, self.SCORED))
+            return self.run_as("coder", *base, "--block", str(path))
+        if shape == "malformed":
+            path = self.world.state / "bad.txt"
+            path.write_text("nothing like a verdict block\n")
+            return self.run_as("coder", *base, "--block", str(path))
+        if shape == "flags":
+            return self.run_as("coder", *base, "--verdict", "approve", "--impact-action", "none", "--impact-severity", "Marginal", "--impact-probability", "Remote")
+        if shape == "disagree":
+            return self.record("--impact-severity", "Critical", "--impact-probability", "Remote", extra=self.SCORED)
+        if shape == "no-score":
+            return self.record()
+        if shape == "old":
+            code = self.run_as("coder", *base, "--verdict", "approve", "--impact-action", "none", "--impact-severity", "Marginal", "--impact-probability", "Remote")
+            return code
+
+    def score(self, last=1):
+        mod = sb.load_module("delegated_clear")
+        entries = [e for e in self.ledger() if e["kind"] == "review_record"][-last:]
+        return mod.judge(mod.score_block(), sb.impact_floor.load_matrix()["cells"], entries, {"pr": self.PR, "head": LEDGER_HEAD}, "Serious")
+
+    def test_every_shape_records_as_the_table_says_and_counts_only_with_the_agents_block(self):
+        for name, (shape, recorded, counts) in self.SHAPES.items():
+            with self.subTest(shape=name):
+                before = len([e for e in self.ledger() if e["kind"] == "review_record"])
+                code, out, err = self.make(shape)
+                self.assertEqual(code == 0, recorded, err)
+                entries = [e for e in self.ledger() if e["kind"] == "review_record"]
+                self.assertEqual(len(entries), before + (1 if recorded else 0))
+                if not recorded:
+                    continue
+                if shape == "old":   # strip the block keys as an old record has none
+                    entry = dict(entries[-1])
+                    for key in [k for k in entry if k.startswith("block_")]:
+                        del entry[key]
+                    scored = sb.load_module("delegated_clear").judge(sb.load_module("delegated_clear").score_block(), sb.impact_floor.load_matrix()["cells"], [dict(entry, by_role="reviewer")], {"pr": self.PR, "head": LEDGER_HEAD}, "Serious")
+                else:
+                    scored = self.score()
+                if counts:
+                    self.assertEqual(scored["reasons"], [])
+                    self.assertEqual(scored["level"], sb.impact_floor.load_matrix()["cells"]["Marginal"]["Remote"]["level"])
+                else:
+                    self.assertIsNone(scored["level"])
+                    self.assertEqual(scored["reasons"], [sb.load_module("delegated_clear").NO_AGENT_BLOCK])
+
+    def test_the_shapes_table_covers_the_record_shapes_of_the_code(self):
+        self.assertEqual(sorted(shape for shape, _, _ in self.SHAPES.values()), sorted(["block", "other-head", "malformed", "flags", "disagree", "no-score", "old"]))
+        self.assertEqual(len(self.SHAPES), 7)
+
+    def test_the_record_keeps_the_blocks_hash_and_size_and_marks_a_flags_only_record(self):
+        path = self.world.state / "block.txt"
+        self.assertEqual(self.record(extra=self.SCORED)[0], 0)
+        entry = self.records()[-1]
+        raw = path.read_bytes()
+        self.assertEqual((entry["block_sha256"], entry["block_size"]), (hashlib.sha256(raw).hexdigest(), len(raw)))
+        self.assertEqual((entry["block_impact_severity"], entry["block_impact_probability"]), ("Marginal", "Remote"))
+        self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve")
+        self.assertEqual(self.records()[-1]["block_sha256"], "none")
+        self.assertNotIn("block_size", self.records()[-1])
+        self.run_as("coder", "review", "record", self.PR, "--reviewer", "code", "--verdict", "approve")
+        self.assertNotIn("block_sha256", self.records()[-1])
+
+    def test_a_malformed_hash_counts_for_nothing(self):
+        mod = sb.load_module("delegated_clear")
+        good = dict(kind="review_record", pr=self.PR, head=LEDGER_HEAD, reviewer="impact", by_role="reviewer", impact_severity="Marginal", impact_probability="Remote",
+                    block_impact_severity="Marginal", block_impact_probability="Remote")
+        self.assertTrue(mod.counts_by_block(dict(good, block_sha256="a" * 64)))
+        for bad in ("", "a" * 63, 12345, None, "A" * 64, "none"):
+            self.assertFalse(mod.counts_by_block(dict(good, block_sha256=bad)), bad)
+
+    def test_floor_gates_and_the_clear_name_the_missing_block_in_the_same_words(self):
+        line = sb.load_module("delegated_clear").NO_AGENT_BLOCK
+        self.make("flags")
+        code, out, err = self.run_as("coder", "impact", "floor", self.PR)
+        self.assertEqual(out.count(line), 1, out)
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        self.assertEqual(out.count(line), 1, out)
+        self.assertIn(line, self.score()["reasons"])
+        self.make("block")   # the newest record carries the agent's block: the line is gone
+        code, out, err = self.run_as("coder", "impact", "floor", self.PR)
+        self.assertNotIn("no agent block", out)
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        self.assertNotIn("no agent block", out)
+
+    VERDICT_BLOCKS = {"approve": "", "comment": "", "request-changes": "- R-CODE-1 | block | bin/x:1 | why | fix\n", "incomplete": ""}
+
+    def test_only_an_incomplete_verdict_fails_to_count_and_says_so_in_its_own_line(self):
+        mod = sb.load_module("delegated_clear")
+        for verdict, finding in self.VERDICT_BLOCKS.items():
+            with self.subTest(verdict=verdict):
+                path = self.world.state / "v.txt"
+                path.write_text("verdict: %s\nhead: %s\nimpact-action: none\n%sfindings:\n%s" % (verdict, LEDGER_HEAD, self.SCORED, finding))
+                code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))
+                self.assertEqual(code, 0, err)
+                scored = self.score()
+                if verdict == "incomplete":
+                    self.assertIsNone(scored["level"])
+                    self.assertEqual(scored["reasons"], [mod.INCOMPLETE_VERDICT])
+                    self.assertNotEqual(mod.INCOMPLETE_VERDICT, mod.NO_AGENT_BLOCK)
+                else:
+                    self.assertEqual(scored["reasons"], [])
+                    self.assertEqual(scored["level"], sb.impact_floor.load_matrix()["cells"]["Marginal"]["Remote"]["level"])
+        self.assertEqual(sorted(self.VERDICT_BLOCKS), sorted(sb.plan_ledger.REVIEW_VERDICTS))   # derived: a new verdict word must be added here
+
+    def test_floor_and_gates_say_the_incomplete_line_not_the_missing_block_line(self):
+        mod = sb.load_module("delegated_clear")
+        path = self.world.state / "v.txt"
+        path.write_text("verdict: incomplete\nhead: %s\nimpact-action: none\n%sfindings:\n" % (LEDGER_HEAD, self.SCORED))
+        self.assertEqual(self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))[0], 0)
+        for argv in (("impact", "floor", self.PR), ("gates", self.PR)):
+            out = self.run_as("coder", *argv)[1]
+            self.assertEqual(out.count(mod.INCOMPLETE_VERDICT), 1, argv)
+            self.assertEqual(out.count(mod.NO_AGENT_BLOCK), 0, argv)
+
+    def test_the_definition_says_read_every_hunk_return_incomplete_and_where_the_matrix_words_come_from(self):
+        text = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
+        for phrase in ("every hunk", "verdict: incomplete", "reads only the verdict word", "impact matrix --for-rater"):
+            self.assertIn(phrase, text.replace("EVERY", "every"))
+
+    def state_files(self):
+        return {str(p.relative_to(self.world.state)): p.read_bytes() for p in sorted(self.world.state.rglob("*")) if p.is_file()}
+
+    def test_impact_matrix_prints_the_files_words_cell_by_cell_and_writes_nothing(self):
+        before = self.state_files()
+        code, out, err = self.run_as("coder", "impact", "matrix", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.state_files(), before)
+        printed = json.loads(out)
+        file = json.loads((REPO / "docs" / "review-laws" / "impact-matrix.json").read_text())
+        for severity, row in file["cells"].items():
+            for probability, cell in row.items():
+                self.assertEqual(printed["cells"][severity][probability], cell, (severity, probability))
+        self.assertEqual(sum(len(r) for r in printed["cells"].values()), sum(len(r) for r in file["cells"].values()))
+        rules = file["owner_hold"]["delegated_clear"]["score"]["floor"]["rules"]
+        self.assertEqual(printed["floor_rules"], rules)
+        self.assertEqual((printed["severities"], printed["probabilities"]), (file["severities"], file["probabilities"]))
+        text = self.run_as("coder", "impact", "matrix")[1]
+        for severity, row in file["cells"].items():
+            for probability, cell in row.items():
+                self.assertIn("cell %s / %s: level %s, action %s" % (severity, probability, cell["level"], cell["action"]), text)
+        for rule_id, cls in rules.items():
+            self.assertIn("floor rule %s: class %s" % (rule_id, cls), text)
+
+    def test_impact_matrix_for_rater_prints_the_floor_reports_rule_ids_and_paths(self):
+        paths = ["shims/gh", "docs/a.md"]
+        self.pr = dict(self.pr, changedFiles=len(paths), files=[{"path": p, "additions": 1, "deletions": 0} for p in paths])
+        before = self.state_files()
+        code, out, err = self.run_as("coder", "impact", "matrix", "--for-rater", self.PR, "--json")
+        self.assertEqual(code, 0, err)
+        printed = json.loads(out)["for_rater"]
+        report = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
+        rules = json.loads((REPO / "docs" / "review-laws" / "impact-matrix.json").read_text())["owner_hold"]["delegated_clear"]["score"]["floor"]["rules"]
+        expected = {rule_id: sorted(report["top_tier_hits"][cls]) for rule_id, cls in rules.items() if report["top_tier_hits"].get(cls)}
+        self.assertTrue(expected, "the fixture changes a floor path")
+        self.assertEqual(printed["floor_hits"], expected)
+        self.assertEqual(self.state_files(), before)
+        text = self.run_as("coder", "impact", "matrix", "--for-rater", self.PR)[1]
+        for rule_id, paths in expected.items():
+            self.assertIn("floor hit %s: %s" % (rule_id, ", ".join(paths)), text)
+
+    def test_an_incomplete_record_beside_a_complete_block_does_not_stop_the_complete_one_counting(self):
+        mod = sb.load_module("delegated_clear")
+        for verdict in ("incomplete", "approve"):
+            path = self.world.state / "v.txt"
+            path.write_text("verdict: %s\nhead: %s\nimpact-action: none\n%sfindings:\n" % (verdict, LEDGER_HEAD, self.SCORED))
+            self.assertEqual(self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))[0], 0)
+        scored = self.score(last=2)
+        self.assertEqual(scored["reasons"], [])
+        self.assertEqual(scored["level"], sb.impact_floor.load_matrix()["cells"]["Marginal"]["Remote"]["level"])
+
+    def test_for_rater_with_no_floor_hit_says_none_and_an_unreadable_matrix_is_refused_in_a_line(self):
+        out = self.run_as("coder", "impact", "matrix", "--for-rater", self.PR)[1]
+        self.assertIn("floor hit: none", out)
+        with mock.patch.object(sb.impact_floor, "load_matrix", side_effect=sb.impact_floor.MatrixError("unreadable")):
+            code, out, err = self.run_as("coder", "impact", "matrix")
+        self.assertEqual(code, 2)
+        self.assertIn("impact matrix:", err)
+
+    def test_a_file_name_with_control_characters_is_printed_safely_and_capped(self):
+        self.assertEqual(sb._printable_path("shims/gh\x1b[2J\x07"), "shims/gh?[2J?")
+        self.assertEqual(len(sb._printable_path("a" * 1000)), sb.IMPACT_MATRIX_PATH_LEN)
+        paths = ["shims/gh"] + ["docs/%d.md" % n for n in range(3)]
+        self.pr = dict(self.pr, changedFiles=len(paths), files=[{"path": p, "additions": 1, "deletions": 0} for p in paths])
+        hits = json.loads(self.run_as("coder", "impact", "matrix", "--for-rater", self.PR, "--json")[1])["for_rater"]["floor_hits"]
+        self.assertTrue(all(len(v) <= sb.IMPACT_MATRIX_PATHS_MAX and all(p.isprintable() for p in v) for v in hits.values()))
+
+    def test_a_failure_to_make_the_rating_note_says_so(self):
+        with mock.patch.object(sb, "load_module", side_effect=RuntimeError("x")):
+            self.assertIn("no rating note", sb.rating_block_note([{"kind": "review_record"}], self.PR, LEDGER_HEAD))
+
+    def test_an_uncounted_rating_that_is_higher_than_the_counted_one_refuses_and_a_lower_one_is_ignored(self):
+        mod = sb.load_module("delegated_clear")
+        cells = sb.impact_floor.load_matrix()["cells"]
+        low = ("Negligible", "Improbable")
+        high = ("Critical", "Frequent")
+        base = dict(kind="review_record", pr=self.PR, head=LEDGER_HEAD, reviewer="impact", by_role="reviewer", verdict="approve")
+        counted = dict(base, impact_severity=low[0], impact_probability=low[1], block_sha256="a" * 64, block_impact_severity=low[0], block_impact_probability=low[1])
+        flags_high = dict(base, impact_severity=high[0], impact_probability=high[1], block_sha256="none")
+        flags_low = dict(base, impact_severity=low[0], impact_probability=low[1], block_sha256="none")
+        incomplete_high = dict(base, impact_severity=high[0], impact_probability=high[1], block_sha256="b" * 64, block_impact_severity=high[0], block_impact_probability=high[1], verdict="incomplete")
+        report = {"pr": self.PR, "head": LEDGER_HEAD}
+        judge = lambda entries: mod.judge(mod.score_block(), cells, entries, report, "Serious")
+        # a record whose BLOCK says high but whose typed flags say low (a flag wins over the block's line, so it does not count): the block's own higher score is what refuses
+        block_high_typed_low = dict(base, impact_severity=low[0], impact_probability=low[1], block_sha256="c" * 64, block_impact_severity=high[0], block_impact_probability=high[1])
+        shapes = {"flags only, higher": flags_high, "incomplete, higher": incomplete_high, "block high, typed low": block_high_typed_low}
+        self.assertEqual(sorted(shapes), sorted(["flags only, higher", "incomplete, higher", "block high, typed low"]))
+        self.assertEqual(judge([counted])["reasons"], [])
+        for label, others in ((l, [e]) for l, e in shapes.items()):
+            for order in (lambda e: [counted] + e, lambda e: e + [counted]):
+                with self.subTest(label=label):
+                    self.assertEqual(judge(order(others))["reasons"], [mod.HIGHER_UNCOUNTED])
+        self.assertEqual(judge([counted, flags_low])["reasons"], [])   # a lower or equal uncounted rating is ignored
+        self.assertEqual(judge([counted, dict(flags_high, impact_probability=None)])["reasons"], [])   # a record with no readable score is ignored
+
+    def test_the_rater_honesty_sentence_is_in_the_definition_and_in_the_docs(self):
+        sentence = "Never adjust a rating to fit the floor: a rating below the floor is reported as it is and goes to the owner."
+        for path in ("agents/reviewers/reviewer-impact.md", "docs/switchboard.md"):
+            self.assertEqual((REPO / path).read_text().count(sentence), 1, path)
+
+    def test_the_limit_is_said_in_the_docs_and_the_definition(self):
+        for path in ("docs/switchboard.md", "agents/reviewers/reviewer-impact.md"):
+            text = (REPO / path).read_text()
+            self.assertIn("not that the agent produced it", text, path)
+            self.assertIn("mistake-guard", text)
+
+    def test_only_the_scorer_reads_the_score_fields(self):
+        for name in ("impact_hold.py", "impact_floor.py", "plan_ledger.py"):   # the readers of a rating outside the scorer (the record's own warning is a writer)
+            text = (REPO / "bin" / name).read_text().replace("block_impact", "")
+            self.assertEqual(len(re.findall(r'get\("impact_(?:severity|probability)"\)', text)), 0, name)
+
 class TestImpactRejudge(LedgerBase):
     """#451 slice 3: the daemon's hold labels follow the OWNER-HOLD rule; a hold it applied that no longer holds is taken off (only the labels it added);
     the list is posted once for each version of the rule; an unreadable matrix file changes nothing and says so once. A fake gh records every write."""
@@ -36627,10 +36943,14 @@ class TestImpactHold(LedgerBase):
         for name in (sb.plan_ledger.LEDGER_FILE, sb.plan_ledger.HEAD_FILE):
             self.world.state.joinpath(name).unlink(missing_ok=True)
 
-    def rate(self, severity, probability, reason="", role="reviewer", head=LEDGER_HEAD, pr="acme/app#9", action="auto"):
+    def rate(self, severity, probability, reason="", role="reviewer", head=LEDGER_HEAD, pr="acme/app#9", action="auto", with_block=True):
         """Record a rating. `action` "auto" is the action of the cell (a helper that only emits VALID shapes: it hides a bad state, so every bad-shape test passes an explicit action or builds the raw record), None omits it."""
         entry = {"kind": "review_record", "pr": pr, "head": head, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": role,
                  "impact_severity": severity, "impact_probability": probability, "impact_reason": reason}
+        if with_block:   # #901: the rating carries the agent's block (its hash and its own rating lines), as `review record --block` keeps them
+            entry.update(block_sha256="a" * 64, block_size=200, block_impact_severity=severity, block_impact_probability=probability)
+        else:
+            entry["block_sha256"] = "none"
         cell = (sb.impact_floor.load_matrix()["cells"].get(severity) or {}).get(probability)
         if action == "auto" and cell:   # the action the reviewer would record for that cell (a record with no action rates nothing: #830's one reading)
             entry["impact_action"] = {"H": "hold", "2": "second-review", ".": "none"}[cell["action"]]
@@ -36731,7 +37051,8 @@ class TestImpactHold(LedgerBase):
             del block["floor"]["rules"][removed]
             cls = rules[removed]
             report = {"pr": "acme/app#9", "head": LEDGER_HEAD, "top_tier_hits": {cls: ["x"]}}
-            entries = [{"kind": "review_record", "pr": "acme/app#9", "head": LEDGER_HEAD, "reviewer": "impact", "by_role": "reviewer", "impact_severity": self.cell_of("Medium")[0], "impact_probability": self.cell_of("Medium")[1]}]
+            entries = [{"kind": "review_record", "pr": "acme/app#9", "head": LEDGER_HEAD, "reviewer": "impact", "by_role": "reviewer", "impact_severity": self.cell_of("Medium")[0], "impact_probability": self.cell_of("Medium")[1],
+                        "block_sha256": "a" * 64, "block_impact_severity": self.cell_of("Medium")[0], "block_impact_probability": self.cell_of("Medium")[1]}]
             mod = sb.load_module("delegated_clear")
             self.assertEqual(mod.judge(block, sb.impact_floor.load_matrix()["cells"], entries, report, "Serious")["reasons"], [], "the floor of %s lives in the data only" % cls)
             self.assertTrue(mod.judge(self.block(), sb.impact_floor.load_matrix()["cells"], entries, report, "Serious")["reasons"])
@@ -37092,7 +37413,8 @@ class TestImpactHold(LedgerBase):
             "good reason, unknown probability": ("bin/reassign.py", [dict(floor_good, prob="Sometimes")], True, "unknown"),
             "two records disagree: low then high": ("docs/notes.md", [good, dict(good, sev=high[0], prob=high[1])], True, "High"),
             "two records disagree: high then low": ("docs/notes.md", [dict(good, sev=high[0], prob=high[1]), good], True, "High"),
-            "a good record and an unreadable one at the same head": ("docs/notes.md", [good, dict(good, sev=None)], True, "unknown"),
+            "a good record and one with no score of the block's beside it: the second counts for nothing (#901) and the first clears": ("docs/notes.md", [good, dict(good, sev=None)], False, None),
+            "a good record beside one whose block carries a score the matrix does not know": ("docs/notes.md", [good, dict(good, sev="Huge")], True, "unknown"),
             "a record at another head only": ("docs/notes.md", [dict(good, head="d" * 40)], True, "no independent impact rating"),
             "a record for another pull request only": ("docs/notes.md", [dict(good, pr="acme/app#10")], True, "no independent impact rating"),
             "a record by the pull request's own author (a coder)": ("docs/notes.md", [dict(good, role="coder")], True, "no independent impact rating"),
@@ -37132,17 +37454,24 @@ class TestImpactHold(LedgerBase):
         """A ledger record built WITHOUT the helper: any shape, including those the record command refuses (an older record with an action and no severity or probability)."""
         entry = {"kind": "review_record", "pr": "acme/app#9", "head": LEDGER_HEAD, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": "reviewer"}
         entry.update(fields)
+        entry.setdefault("block_sha256", "a" * 64)   # #901: the record carries the agent's block, whose own lines equal the typed ones (a missing field stays missing)
+        for name in ("impact_severity", "impact_probability"):
+            if name in entry and entry[name] is not KEEP_OUT:
+                entry.setdefault("block_" + name, entry[name])
         return sb.plan_ledger.append_entry(self.world.state, {k: v for k, v in entry.items() if v is not KEEP_OUT}, self.world.clock.now())
 
     def test_raw_mixed_records_reach_the_real_judge_and_the_bad_one_refuses_in_either_order(self):
         low, high = self.cell_of("Low"), self.cell_of("High")
         valid = dict(impact_action="none", impact_severity=low[0], impact_probability=low[1])
         older = dict(impact_action="hold", impact_class="authority")   # every record made before this change: an action, no severity, no probability
-        shapes = {"an action and no severity or probability, after a valid Low": [valid, older], "the same, before it": [older, valid], "an action with an unknown severity": [valid, dict(valid, impact_severity="Huge")],
-                  "a good severity with no probability": [valid, dict(valid, impact_probability=KEEP_OUT)], "a good probability with no severity": [valid, dict(valid, impact_severity=KEEP_OUT)],
-                  "two records that disagree, low first": [valid, dict(valid, impact_severity=high[0], impact_probability=high[1], impact_action="hold")],
-                  "the author's record with an action": [dict(valid, by_role="coder")], "another head's record with an action": [dict(valid, head="d" * 40)]}
-        for label, records in shapes.items():
+        # shape: (records, refused). A record that carries no score of the agent's block is IGNORED by the score since #901 (it counts for nothing, as every record made before blocks were kept), so the valid record beside it still clears;
+        # a record whose block carries a score the matrix does not know, a higher disagreeing score, the author's and another head's record still refuse
+        shapes = {"an action and no severity or probability, after a valid Low": ([valid, older], False), "the same, before it": ([older, valid], False), "an action with an unknown severity": ([valid, dict(valid, impact_severity="Huge")], True),
+                  "a good severity with no probability": ([valid, dict(valid, impact_probability=KEEP_OUT)], False), "a good probability with no severity": ([valid, dict(valid, impact_severity=KEEP_OUT)], False),
+                  "two records that disagree, low first": ([valid, dict(valid, impact_severity=high[0], impact_probability=high[1], impact_action="hold")], True),
+                  "the older record alone (no score, no block score)": ([older], True),
+                  "the author's record with an action": ([dict(valid, by_role="coder")], True), "another head's record with an action": ([dict(valid, head="d" * 40)], True)}
+        for label, (records, refused) in shapes.items():
             with self.subTest(label):
                 self.writes.clear()
                 self.ledger_reset()
@@ -37151,9 +37480,10 @@ class TestImpactHold(LedgerBase):
                 for record in records:
                     self.raw_record(**record)
                 code, out, err = self.under()
-                self.assertEqual(code, 2, err)
-                self.assertEqual(self.deletes(), [])
-                self.assertTrue(any(t in err for t in ("no severity and probability", "High", "no independent impact rating")), err)
+                self.assertEqual(code == 2, refused, err)
+                if refused:
+                    self.assertEqual(self.deletes(), [])
+                    self.assertTrue(any(t in err for t in ("no severity and probability", "High", "no independent impact rating", "no agent block")), err)
         self.ledger_reset()   # the control: the valid record alone clears
         self.score_config("Serious")
         self.scored_pr()
@@ -59956,6 +60286,26 @@ class TestDiskReport(Base):
             self.assertIn(phrase, section.lower())
 
 
+def reviewed_janitor_argv(argv, run):
+    """`argv` for `disk janitor` with the reviewed fingerprint a person would copy from a dry run: `run(argv)` runs the command and returns its output text."""
+    argv = list(argv)
+    if "--apply" not in argv or "--i-reviewed" in argv:
+        return argv
+    dry = [a for a in argv if a != "--apply"]
+    text = run(dry)
+    found = re.findall(r"preview fingerprint: ([0-9a-f]{16})", text)
+    return argv + ["--i-reviewed", found[-1] if found else "0" * 16]
+
+
+def janitor_review(test, argv):
+    """The full `disk janitor` argv with the fingerprint of a dry run just made, as a person would copy it."""
+    def dry(args):
+        with captured() as (out, err):
+            sb.main(["disk", "janitor", *args], runner=test.routed, now=test.world.clock.now, socket_call=test.world.herdr.socket)
+        return out.getvalue()
+    return ["disk", "janitor", *reviewed_janitor_argv(argv, dry)]
+
+
 class TestTempJanitor(Base):
     """The temp-directory janitor (ask #321): old AND unnamed entries only, a dry run by default, links never followed, each removal audited."""
 
@@ -59999,10 +60349,17 @@ class TestTempJanitor(Base):
             os.utime(str(p), (stamp, stamp))
         return path
 
-    def run_cli(self, *argv):
+    def fingerprint_of(self, runner):
         with captured() as (out, err):
-            code = sb.main(["disk", "janitor", *argv], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
-        return code, out.getvalue(), err.getvalue()
+            sb.main(["disk", "janitor"], runner=runner, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return re.findall(r"preview fingerprint: ([0-9a-f]{16})", out.getvalue())[-1]
+
+    def run_cli(self, *argv):
+        def once(args):
+            with captured() as (out, err):
+                code = sb.main(["disk", "janitor", *args], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            return code, out.getvalue(), err.getvalue()
+        return once(reviewed_janitor_argv(argv, lambda a: once(a)[1]))
 
     def audits(self):
         return [e for e in self.world.audit() if e["event"] == "temp.removed"]
@@ -60087,6 +60444,111 @@ class TestTempJanitor(Base):
         self.assertEqual(code, 0, err)
         self.assertIn("would remove old-file.txt", out)
 
+    def raw_cli(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(["disk", "janitor", *argv], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_958_a_hand_run_apply_needs_the_reviewed_fingerprint_of_the_current_preview(self):
+        victim = self.old("old-unnamed.log")
+        code, out, err = self.raw_cli("--apply")
+        self.assertNotEqual(code, 0)
+        self.assertIn("--i-reviewed", err)
+        self.assertTrue(victim.exists(), "no flag: nothing removed")
+        code, out, err = self.raw_cli("--apply", "--i-reviewed", "0" * 16)   # a stale fingerprint
+        self.assertNotEqual(code, 0)
+        self.assertIn("is not this preview's fingerprint", err)
+        self.assertTrue(victim.exists(), "a stale fingerprint: nothing removed")
+        code, out, err = self.raw_cli("--i-reviewed", "0" * 16)   # the flag without --apply
+        self.assertNotEqual(code, 0)
+        code, dry, err = self.raw_cli()
+        self.assertEqual(code, 0, err)
+        fingerprint = re.findall(r"preview fingerprint: ([0-9a-f]{16})", dry)[-1]
+        self.assertTrue(victim.exists(), "a dry run removes nothing")
+        # the list changes after it was read: the fingerprint no longer matches
+        other = self.old("old-second.log")
+        code, out, err = self.raw_cli("--apply", "--i-reviewed", fingerprint)
+        self.assertNotEqual(code, 0)
+        self.assertTrue(victim.exists() and other.exists())
+        code, dry, err = self.raw_cli()
+        fingerprint = re.findall(r"preview fingerprint: ([0-9a-f]{16})", dry)[-1]
+        code, out, err = self.raw_cli("--apply", "--i-reviewed", fingerprint)
+        self.assertEqual(code, 0, err)
+        self.assertFalse(victim.exists() or other.exists())
+
+    def test_958_the_fingerprint_is_the_janitors_own_function_of_the_rule_and_the_listed_names(self):
+        self.old("old-a.log")
+        self.old("old-b.log")
+        code, dry, err = self.raw_cli()
+        cfg = self.jan.settings(sb.load_config().get("temp_janitor"))
+        expected = self.jan.preview_fingerprint(self.jan.rule_fingerprint(cfg), ["old-a.log", "old-b.log"])
+        self.assertIn("preview fingerprint: %s" % expected, dry)
+
+    def test_958_an_entry_that_qualifies_between_the_preview_and_the_apply_is_kept(self):
+        victim = self.old("old-reviewed.log")
+        real = self.jan.scan
+        calls = [0]
+
+        def scan_then_add(*a, **k):
+            calls[0] += 1
+            if calls[0] == 2:   # the command's own preview is the first scan, the apply's the second
+                self.old("old-new-arrival.log")
+            return real(*a, **k)
+        fingerprint = self.fingerprint()
+        calls[0] = 0
+        with mock.patch.object(self.jan, "scan", scan_then_add):
+            code, out, err = self.raw_cli("--apply", "--i-reviewed", fingerprint)
+        self.assertEqual(code, 0, err)
+        self.assertFalse(victim.exists())
+        self.assertTrue((self.temp / "old-new-arrival.log").exists())
+        self.assertIn("kept old-new-arrival.log: it was not in the preview you reviewed", out)
+
+    def fingerprint(self, *argv):
+        code, dry, err = self.raw_cli(*argv)
+        self.assertEqual(code, 0, err)
+        return re.findall(r"preview fingerprint: ([0-9a-f]{16})", dry)[-1]
+
+    def test_958_s8_a_scripted_run_with_no_terminal_is_refused_and_a_typed_current_fingerprint_applies(self):
+        victim = self.old("old-unnamed.log")
+        fingerprint = self.fingerprint()
+        person = os.environ.get("HERDR_PANE_ID")
+        os.environ["HERDR_PANE_ID"] = "p_unknown_pane"   # a script or an agent: not established as the owner's terminal
+        code, out, err = self.raw_cli("--apply", "--i-reviewed", fingerprint)
+        self.assertEqual(code, 1)
+        self.assertIn("only the operator or the Chief of Staff may --apply", err)
+        self.assertTrue(victim.exists())
+        if person is None:
+            os.environ.pop("HERDR_PANE_ID", None)
+        else:
+            os.environ["HERDR_PANE_ID"] = person
+        code, out, err = self.raw_cli("--apply", "--i-reviewed", fingerprint)
+        self.assertEqual(code, 0, err)
+        self.assertFalse(victim.exists())
+
+    def test_958_s10_five_kinds_of_wrong_fingerprint_are_each_refused(self):
+        victim = self.old("old-unnamed.log")
+        good = self.fingerprint()
+        cases = {"stale after a name change": None, "stale after a rule change": None, "empty": ("--i-reviewed", ""), "malformed": ("--i-reviewed", "not-a-hash"),
+                 "with --weekly": ("--apply", "--weekly", "--i-reviewed", good)}
+        refused = 0
+        for name in cases:
+            if name == "stale after a name change":
+                extra = self.old("old-extra.log")
+                argv = ("--apply", "--i-reviewed", good)
+            elif name == "stale after a rule change":
+                self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "temp_janitor": {"dir": str(self.temp), "days": 3}})
+                argv = ("--apply", "--i-reviewed", good)
+            elif name == "with --weekly":
+                argv = cases[name]
+            else:
+                argv = ("--apply",) + cases[name]
+            code, out, err = self.raw_cli(*argv)
+            self.assertNotEqual(code, 0, name)
+            self.assertTrue(victim.exists(), name)
+            refused += 1
+        self.assertEqual(refused, 5)
+        self.assertTrue(extra.exists())
+
     def test_the_cap_per_call_and_a_failed_removal_are_said_and_a_failed_removal_is_not_audited(self):
         for i in range(3):
             self.old("capped-%d.txt" % i)
@@ -60139,9 +60601,13 @@ class TestTempJanitor(Base):
         victim = self.old("touched-after-scan.txt")
         real = self.jan.scan
 
+        calls = [0]
+
         def scan_then_touch(*a, **k):
             rows = real(*a, **k)
-            os.utime(str(victim), (self.now, self.now))   # an agent writes to it between the scan and the removal
+            calls[0] += 1
+            if calls[0] == 3:   # the person's dry run, the command's own preview, then the apply's scan
+                os.utime(str(victim), (self.now, self.now))   # an agent writes to it between the scan and the removal
             return rows
         with mock.patch.object(self.jan, "scan", scan_then_touch):
             code, out, err = self.run_cli("--apply")
@@ -60217,7 +60683,7 @@ class TestTempJanitor(Base):
                     raise failure
                 return self.world.route(argv, **kwargs)
             with captured() as (out, err):
-                sb.main(["disk", "janitor", "--apply"], runner=boom, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+                sb.main(["disk", "janitor", "--apply", "--i-reviewed", self.fingerprint_of(boom)], runner=boom, now=self.world.clock.now, socket_call=self.world.herdr.socket)
             self.assertTrue(victim.exists())
             self.assertIn("lsof did not run", out.getvalue())
 
@@ -63282,7 +63748,7 @@ class TestJanitorLiveKeeps(Base):
 
     def apply(self):
         with captured() as (out, err):
-            code = sb.main(["disk", "janitor", "--apply"], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            code = sb.main(janitor_review(self, ["--apply"]), runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
         self.assertEqual(code, 0, err.getvalue())
         return out.getvalue()
 
@@ -63617,7 +64083,7 @@ class TestDaemonTempJanitor(Base):
             else:
                 os.environ["HERDR_PANE_ID"] = "p_unknown_pane"
             with captured() as (out, err):
-                code = sb.main(["disk", "janitor", "--apply"], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+                code = sb.main(janitor_review(self, ["--apply"]), runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
             self.assertEqual(code, 1)
             self.assertIn("only the operator or the Chief of Staff may --apply the temp janitor", err.getvalue())
             self.assertTrue(victim.exists())
@@ -63724,6 +64190,16 @@ class TestDaemonTempJanitor(Base):
         with captured() as (out, err):
             code = sb.main(["disk", "janitor-ack", preview], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
         return code, err.getvalue()
+
+    def test_958_the_commands_fingerprint_equals_the_daemons_preview_for_the_same_rule_and_names(self):
+        self.old("scratch-old-unnamed.log")
+        engine, source = self.daemon({"daemon_apply": True}, acked=False)
+        self.go(source)
+        preview = json.loads((self.world.state / sb.TEMP_JANITOR_GATE_FILE).read_text())["preview"]
+        os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+        with captured() as (out, err):
+            sb.main(["disk", "janitor", "--weekly"], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        self.assertIn("preview fingerprint: %s" % preview, out.getvalue())
 
     def test_s4_one_preview_then_nothing_is_applied_until_the_yes_to_that_exact_preview(self):
         victim = self.old("scratch-old-unnamed.log")
@@ -63999,10 +64475,172 @@ class TestDaemonTempJanitor(Base):
             self.assertNotIn(os.path.basename(argv[0]), ("gh", "curl", "git", "ssh"))
             self.assertNotIn("api", argv[:2] if os.path.basename(argv[0]) == "gh" else [])
 
-    def test_s11_the_docs_name_the_redundant_half_and_the_plist_example_is_unchanged(self):
+    def test_s11_the_docs_name_the_one_apply_path_and_the_plist_example_has_no_janitor(self):
         text = (Path(sb.__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
-        self.assertIn("the janitor half of the launchd job is redundant", text)
-        self.assertIn("disk prune; /home/user/.local/bin/fleet-switchboard disk janitor --apply --weekly</string>", text)
+        self.assertIn("There is one apply path (#958)", text)
+        self.assertIn("<string>/home/user/.local/bin/fleet-switchboard disk prune</string></array>", text)
+
+
+class TestWeeklyJobRewrite(Base):
+    """Ask #958: the installer drops the janitor from a weekly job installed from the old documentation snippet, and only from that."""
+    PROG = "/home/user/.local/bin/fleet-switchboard"
+    OLD = "%s disk prune; %s disk janitor --apply --weekly" % (PROG, PROG)
+
+    def setUp(self):
+        super().setUp()
+        self.agents = Path.home() / "Library" / "LaunchAgents"
+        self.agents.mkdir(parents=True, exist_ok=True)
+        self.assertTrue(str(self.agents).startswith(str(self.home)), "the test must never touch a real LaunchAgents")
+
+    def plist(self, command, name="com.example.fleet-disk-prune.plist", extra=""):
+        text = ('<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n  <key>Label</key><string>com.example.fleet-disk-prune</string>\n'
+                '  <key>ProgramArguments</key>\n  <array><string>/bin/sh</string><string>-c</string><string>%s</string></array>\n%s</dict>\n</plist>\n' % (command, extra))
+        (self.agents / name).write_text(text)
+        return self.agents / name, text
+
+    def step(self, platform="darwin", dry=False):
+        out = io.StringIO()
+        sb.Installer(subprocess.run, subprocess.Popen, lambda: 1700000000.0, platform, REPO, out=out, dry_run=dry).step_janitor_job()
+        return out.getvalue()
+
+    def backups(self):
+        return sorted(p.name for p in self.agents.iterdir() if ".bak-" in p.name)
+
+    def test_958_an_exact_match_is_backed_up_and_rewritten_and_the_prune_part_is_byte_identical(self):
+        path, text = self.plist(self.OLD)
+        out = self.step()
+        self.assertIn("done", out)
+        self.assertEqual(len(self.backups()), 1)
+        self.assertEqual((self.agents / self.backups()[0]).read_text(), text)
+        self.assertEqual(path.read_text(), text.replace(self.OLD, "%s disk prune" % self.PROG))
+        self.assertNotIn("disk janitor", path.read_text())
+        self.assertIn("%s disk prune" % self.PROG, path.read_text())   # the Docker prune command, unchanged
+        self.assertIn("already done", self.step())   # a second run changes nothing
+        self.assertEqual(len(self.backups()), 1)
+
+    def test_958_a_job_that_differs_by_one_character_is_reported_and_left_byte_identical(self):
+        for command in (self.OLD + " ", self.OLD.replace("--weekly", "--weekl"), self.OLD.replace("; ", ";  "),
+                        "%s disk prune; /other/fleet-switchboard disk janitor --apply --weekly" % self.PROG,
+                        self.OLD + "; echo hi"):
+            for old in self.agents.iterdir():
+                old.unlink()
+            path, text = self.plist(command)
+            before = hashlib.sha256(path.read_bytes()).hexdigest()
+            out = self.step()
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before, command)
+            self.assertEqual(self.backups(), [], command)
+            self.assertIn("nothing was changed", out)
+
+    def test_958_no_job_changes_nothing_and_a_dry_run_writes_nothing(self):
+        self.assertIn("already done", self.step())
+        self.assertEqual(list(self.agents.iterdir()), [])
+        path, text = self.plist(self.OLD)
+        self.assertIn("would be done", self.step(dry=True))
+        self.assertEqual(path.read_text(), text)
+        self.assertEqual(self.backups(), [])
+        self.assertIn("skipped", self.step(platform="linux"))
+
+    def test_958_s11_unreadable_symlink_none_and_a_second_run_change_nothing_and_the_first_backup_survives(self):
+        original = self.plist(self.OLD, "real.plist")[1]
+        os.symlink(str(self.agents / "real.plist"), str(self.agents / "link.plist"))
+        (self.agents / "real.plist").rename(self.agents / "real.txt")
+        before = {p.name: p.read_bytes() for p in self.agents.iterdir() if not p.is_symlink()}
+        locked, locked_text = self.plist(self.OLD, "locked.plist")
+        os.chmod(str(locked), 0)
+        try:
+            self.step()
+        finally:
+            os.chmod(str(locked), 0o644)
+        self.assertEqual(self.backups(), [])
+        self.assertEqual(locked.read_text(), locked_text, "an unreadable file is left as it is")
+        self.assertEqual({p.name: p.read_bytes() for p in self.agents.iterdir() if not p.is_symlink() and p.name != "locked.plist"}, before)
+        for p in list(self.agents.iterdir()):
+            p.unlink()
+        path, text = self.plist(self.OLD)
+        self.step()
+        first = (self.agents / self.backups()[0]).read_bytes()
+        self.step()
+        self.step()
+        self.assertEqual(len(self.backups()), 1)
+        self.assertEqual((self.agents / self.backups()[0]).read_bytes(), first)
+        self.assertEqual(first, text.encode())
+
+    def test_958_backup_collision_and_a_doubled_command_leave_the_file_alone(self):
+        path, text = self.plist(self.OLD)
+        taken = path.with_name(path.name + ".bak-1700000000")
+        taken.write_text("earlier backup")
+        out = self.step()
+        self.assertIn("exists", out)
+        self.assertEqual(path.read_text(), text)
+        self.assertEqual(taken.read_text(), "earlier backup")
+        taken.unlink()
+        twice = self.plist(self.OLD, "twice.plist", extra="  <key>Note</key><string>%s</string>\n" % self.OLD)
+        out = self.step()
+        self.assertEqual(twice[0].read_text(), twice[1])
+        self.assertIn("nothing was changed", out)
+
+    def test_958_each_part_of_the_exactness_rule_is_pinned_by_its_own_row(self):
+        """The rule has four parts: the program list's shape, the shell, the command's equality and the single occurrence. One row for each, and a plist plus
+        the old command in a second key for the count."""
+        prog = self.PROG
+        rows = {
+            "shell is zsh": ("/bin/zsh", "-c", self.OLD, None),
+            "shell is bash": ("/bin/bash", "-c", self.OLD, None),
+            "flag is -lc": ("/bin/sh", "-lc", self.OLD, None),
+            "flag is -e": ("/bin/sh", "-e", self.OLD, None),
+            "list has a fourth word": ("/bin/sh", "-c", self.OLD, "<string>extra</string>"),
+            "janitor flag differs": ("/bin/sh", "-c", self.OLD.replace("--apply", "--apply "), None),
+            "second program differs": ("/bin/sh", "-c", "%s disk prune; /elsewhere/fleet-switchboard disk janitor --apply --weekly" % prog, None),
+            "text after the command": ("/bin/sh", "-c", self.OLD + "; true", None),
+        }
+        for label, (shell, flag, command, more) in rows.items():
+            for old in self.agents.iterdir():
+                old.unlink()
+            path = self.agents / "job.plist"
+            path.write_text('<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n  <key>ProgramArguments</key>\n  <array><string>%s</string><string>%s</string>'
+                            '<string>%s</string>%s</array>\n</dict>\n</plist>\n' % (shell, flag, command, more or ""))
+            before = hashlib.sha256(path.read_bytes()).hexdigest()
+            out = self.step()
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before, label)
+            self.assertEqual(self.backups(), [], label)
+            self.assertIn("nothing was changed", out, label)
+        for old in self.agents.iterdir():
+            old.unlink()
+        path, text = self.plist(self.OLD, extra="  <key>Note</key><string>%s</string>\n" % self.OLD)   # the single occurrence
+        self.step()
+        self.assertEqual(path.read_text(), text)
+        self.assertEqual(self.backups(), [])
+
+    def test_958_a_symlinked_job_is_never_rewritten_through_the_link(self):
+        real = self.agents.parent / "real-job.plist"
+        real.write_text(self.plist(self.OLD, "tmp.plist")[1])
+        (self.agents / "tmp.plist").unlink()
+        os.symlink(str(real), str(self.agents / "job.plist"))
+        before = real.read_bytes()
+        try:
+            self.step()
+        except sb.InstallError:
+            pass   # the write check refuses the link: the install stops rather than writing through it
+        self.assertEqual(real.read_bytes(), before)
+        self.assertEqual([n for n in self.backups()], [])
+
+    def test_958_s7_the_documentation_snippet_is_what_the_installer_produces(self):
+        docs = (Path(sb.__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
+        start = docs.index("<?xml version", docs.index("com.example.fleet-disk-prune.plist"))
+        snippet = docs[start:docs.index("```", start)]
+        self.assertIn("%s disk prune</string>" % self.PROG, snippet)
+        old = snippet.replace("%s disk prune</string>" % self.PROG, "%s</string>" % self.OLD)
+        (self.agents / "x.plist").write_text(old)
+        self.step()
+        self.assertEqual((self.agents / "x.plist").read_text(), snippet)
+        self.assertIn("`--i-reviewed", docs)
+
+    def test_958_every_old_snippet_command_the_docs_ever_showed_has_no_janitor_apply_now(self):
+        docs = (Path(sb.__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
+        snippet = docs[docs.index("<key>Label</key><string>com.example.fleet-disk-prune</string>"):]
+        snippet = snippet[:snippet.index("</plist>")]
+        self.assertEqual(snippet.count("disk janitor --apply"), 0)
+        self.assertIn("--i-reviewed", docs)
 
 
 class TestComposeTrap(Base):
@@ -66608,7 +67246,8 @@ class TestReviewerSubagents(LedgerBase):
         cells = sb.impact_floor.load_matrix()["cells"]
         severity, probability = next((s, p) for s in cells for p in cells[s] if cells[s][p]["level"] == level)
         entry = {"kind": "review_record", "pr": self.PR, "head": head, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": role,
-                 "impact_severity": severity, "impact_probability": probability, "impact_action": "none"}
+                 "impact_severity": severity, "impact_probability": probability, "impact_action": "none",
+                 "block_sha256": "a" * 64, "block_size": 200, "block_impact_severity": severity, "block_impact_probability": probability}   # #901: the rating carries the agent's block, so the block scores it
         sb.plan_ledger.append_entry(self.world.state, entry, self.world.clock.now())
 
     def rating_lines(self):
@@ -71510,6 +72149,133 @@ class TestAuthorityModulesGuard(unittest.TestCase):
         self.assertTrue(words and all(isinstance(w, str) and re.fullmatch(r"[a-z]+", w) for w in words))
 
 
+class TestClearCodePathsAlwaysHeld(unittest.TestCase):
+    """Ask #939: a path of the matrix's `clear_code_paths` is never delegated, so the floor also HOLDS it for the owner. One table, derived from the matrix list;
+    the real floor and the real clear refusal are driven; the closure rule (modules and functions the clear merely loads) is NOT part of this (#940)."""
+
+    def setUp(self):
+        self.floor = sb.load_module("impact_floor")
+        self.clear = sb.load_module("delegated_clear")
+        self.matrix = self.floor.load_matrix()
+        self.rule = self.matrix["owner_hold"]["delegated_clear"]
+        self.listed = list(self.rule["clear_code_paths"])
+
+    def decide(self, paths, matrix=None):
+        matrix = matrix or self.matrix
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        return self.floor.owner_decide(matrix, paths, [], None, self.floor.floor_paths(paths, globs, exclude, force))
+
+    @staticmethod
+    def concrete(entry):
+        return entry.replace("**", "sub/x.txt").replace("*", "x")
+
+    def without(self, drop):
+        matrix = json.loads(json.dumps(self.matrix))
+        if drop is None:
+            del matrix["owner_hold"]["delegated_clear"]
+        else:
+            matrix["owner_hold"]["delegated_clear"]["clear_code_paths"] = [e for e in self.listed if e != drop] or ["nothing/at/all"]
+        return matrix
+
+    def rows(self):
+        return [(entry, self.concrete(entry)) for entry in self.listed]
+
+    def reason_of(self, path, matrix=None):
+        decision, reasons = self.decide([path], matrix)
+        return decision, [r for r in reasons if r.startswith("clear_code_paths")]
+
+    def test_s5_every_entry_of_the_list_is_held_with_the_reason_that_names_the_list(self):
+        rows = self.rows()
+        self.assertEqual(len(rows), len(self.listed))
+        self.assertGreaterEqual(len(rows), 14)
+        for entry, path in rows:
+            decision, why = self.reason_of(path)
+            self.assertEqual(decision, "hold", entry)
+            self.assertEqual(len(why), 1, "%s: the reason names the list and the path" % entry)
+            self.assertIn(path, why[0])
+
+    def test_s5_a_mutant_that_drops_the_list_or_one_entry_dies(self):
+        for entry, path in self.rows():
+            decision, why = self.reason_of(path, self.without(entry))
+            self.assertEqual(why, [], "dropping %s from the list must remove its reason" % entry)
+        for entry, path in self.rows():
+            with mock.patch.object(self.floor, "clear_code_paths", lambda matrix: (None, None)):
+                self.assertEqual(self.reason_of(path)[1], [], entry)
+
+    def test_s5_the_table_is_complete_for_a_new_entry(self):
+        matrix = json.loads(json.dumps(self.matrix))
+        matrix["owner_hold"]["delegated_clear"]["clear_code_paths"].append("brand/new/**")
+        self.assertEqual(self.reason_of("brand/new/a.py", matrix)[0], "hold")   # held with no code edit: the list is the only source
+        self.assertNotEqual(self.decide(["brand/new/a.py"])[0], "hold")
+        self.assertEqual(len(self.rows()), len(self.rule["clear_code_paths"]), "a row per entry, derived, never hand-listed")
+
+    def test_s2_a_rename_source_and_the_spellings_the_floor_normalises_are_held(self):
+        self.assertEqual(self.reason_of("bin/plan_check.py")[0], "hold")
+        for spelled in ("./bin/plan_check.py", "bin//plan_check.py", "BIN/PLAN_CHECK.PY"):
+            self.assertEqual(self.reason_of(spelled)[0], "hold", spelled)
+        self.assertEqual(self.decide(["bin/other_new_name.py", "bin/repo_exclusion.py"])[0], "hold", "a rename's old path is among the paths")
+
+    def test_s2b_a_closure_module_that_is_not_on_the_list_is_decided_as_before(self):
+        outside = [e for e in self.rule["closure_files"] if not self.floor.matches(e, self.listed)]
+        self.assertTrue(outside)
+        before = self.without(None)
+        for path in outside:
+            self.assertEqual(self.decide([path]), self.decide([path], before), path)
+            self.assertEqual(self.reason_of(path)[1], [], path)
+
+    def test_s3_a_pull_request_that_touches_no_listed_path_is_decided_as_before(self):
+        before = self.without(None)
+        for path in ("docs/notes.md", "README.md", "bin/fleet_health.py", "bin/decision_sync.py", "bin/triage_digest.py", "bin/fleet-switchboard", "cloud/launcher/app_token.py",
+                     "agents/x/y.md", "skills/a/SKILL.md", "bin/test-switchboard", "docs/switchboard.md"):
+            self.assertEqual(self.decide([path]), self.decide([path], before), path)
+
+    def test_the_three_entries_the_floor_did_not_hold_before_are_held_now(self):
+        before = self.without(None)
+        for path in ("bin/plan_check.py", "bin/repo_exclusion.py", "templates/com.example.plist"):
+            self.assertNotEqual(self.decide([path], before)[0], "hold", path)
+            self.assertEqual(self.decide([path])[0], "hold", path)
+
+    def test_a_malformed_list_holds_and_an_absent_block_does_not_widen_the_rule(self):
+        for bad in ("x", [], [1], [""]):
+            matrix = json.loads(json.dumps(self.matrix))
+            matrix["owner_hold"]["delegated_clear"]["clear_code_paths"] = bad
+            decision, reasons = self.decide(["docs/notes.md"], matrix)
+            self.assertEqual(decision, "hold", bad)
+            self.assertIn("clear_code_paths", reasons[0])
+
+    def test_s4_the_clear_still_refuses_every_entry_with_its_current_reason(self):
+        report = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": False, "top_tier_hits": {}, "review_action": "none", "review_class": None, "changed_paths": []}
+        for entry, path in self.rows():
+            files = [{"filename": path, "previous_filename": None, "status": "modified"}]
+            got = self.clear.refusals(self.rule, report, files, self.floor.matches, {}, {"reasons": [], "level": "Low"})
+            self.assertEqual(got, ["it changes a file that is the clear or hold machinery or that the daemon loads (%s): that stays the owner's own clear" % path], entry)
+
+    def test_s7_one_reader_serves_the_floor_and_the_clear_and_the_rule_names_no_path(self):
+        self.assertEqual(self.floor.clear_code_paths(self.matrix), (self.listed, None))
+        matrix = json.loads(json.dumps(self.matrix))
+        matrix["owner_hold"]["delegated_clear"]["clear_code_paths"].append("brand/new/**")   # one entry added to the matrix: the floor holds it AND the clear refuses it
+        self.assertEqual(self.reason_of("brand/new/a.py", matrix)[0], "hold")
+        listed, problem = self.floor.clear_code_paths(matrix)
+        self.assertIsNone(problem)
+        report = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": False, "top_tier_hits": {}, "review_action": "none", "review_class": None, "changed_paths": []}
+        refused = self.clear.refusals(dict(matrix["owner_hold"]["delegated_clear"], clear_code_paths=listed), report,
+                                      [{"filename": "brand/new/a.py", "previous_filename": None, "status": "modified"}], self.floor.matches, {}, {"reasons": [], "level": "Low"})
+        self.assertEqual(len(refused), 1, refused)
+        import ast
+        tree = ast.parse((BIN / "impact_floor.py").read_text())
+        constants = {n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+        self.assertEqual(sorted(constants & set(self.listed)), [], "a listed path is written in the floor's code")
+
+    def test_s6_the_docs_and_the_matrix_text_say_always_held_and_where_it_stops(self):
+        docs = (BIN.parent / "docs" / "switchboard.md").read_text()
+        meaning = self.rule["meaning"]
+        for text in (docs, meaning):
+            self.assertIn("always held", text.lower())
+            self.assertIn("clear_code_paths", text)
+            self.assertIn("closure", text)
+            self.assertIn("#940", text)
+
+
 class TestOwnerClearModule(unittest.TestCase):
     """Ask #532, slice 3: the code that decides who may clear, hold or release lives in bin/impact_hold.py (listed in the matrix), not in the daemon file. The names come from the
     module's own MOVED tuple and the paths from the matrix: this test has no list of its own."""
@@ -71699,13 +72465,14 @@ class TestOwnerHoldRule(unittest.TestCase):
             self.assertEqual(decision, "hold", path)
             self.assertTrue(any(path in reason for reason in reasons), (path, reasons))
 
-    def test_s3_the_launchd_template_the_cloud_image_and_a_docs_file_do_not_hold_for_the_owner(self):
-        paths = ["templates/com.fleet-kit.switchboard.plist", "cloud/launcher/Dockerfile", "docs/switchboard.md"]
+    def test_s3_the_cloud_image_and_a_docs_file_do_not_hold_for_the_owner_and_the_launchd_template_does_since_it_is_on_clear_code_paths(self):
+        paths = ["cloud/launcher/Dockerfile", "docs/switchboard.md"]
         decision, reasons = self.decide(paths)
-        self.assertEqual(decision, "second-review", reasons)
-        self.assertEqual(reasons, ["floor: 1 path(s) outside the top tier ask for a second independent review"])
+        self.assertEqual((decision, reasons), ("none", []))
         for path in paths:
             self.assertNotEqual(self.decide([path])[0], "hold", path)
+        decision, reasons = self.decide(["templates/com.fleet-kit.switchboard.plist"])   # #939: templates/** is on clear_code_paths, so it holds
+        self.assertEqual(decision, "hold", reasons)
 
     def test_s4_only_a_top_tier_or_unknown_class_at_a_hold_level_holds(self):
         self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "credentials")])[0], "hold")
@@ -73261,7 +74028,8 @@ class TestTempJanitorResume(Base):
         self.assertTrue(parser.parse_args(["disk", "janitor", "--apply", "--weekly"]).weekly)
         self.assertFalse(parser.parse_args(["disk", "janitor", "--apply"]).weekly)
         source = inspect.getsource(sb.cmd_disk_janitor)
-        self.assertIn('weekly=bool(getattr(args, "weekly", False))', source)
+        self.assertIn('weekly = bool(getattr(args, "weekly", False))', source)
+        self.assertIn("weekly=weekly, outcome=preview", source)
 
     def test_a_dry_run_reads_the_cursor_and_never_moves_it_and_the_file_is_private(self):
         self.twelve()
@@ -76622,9 +77390,8 @@ OLD_SOURCE_ALLOWED = {
     ("bin/fleet-switchboard", "janitor_agent_roots", "RETIRED_FILE"): "2026-12-20, last slice of #903 (the temp janitor, #936, owns it): only the name in its unreadable-record message, the read itself is read_retired_strict (the registry's)",
 }
 # Live observers: the call sites that ask herdr which panes exist right now (`"agent", "list"`), keyed by (file, function), each a NAMED entry with its reason,
-# never a silent skip. fleet-heartbeat is DATED (the Chief of Staff's choice: remove by 2026-11-03); the other two are the live source the registry is fed from.
+# never a silent skip. The heartbeat's dated entry (2026-11-03) ended with #973: its bell opt-in is the registry's `bell` field. The two left are the live source the registry is fed from.
 LIVE_OBSERVERS = {
-    ("bin/fleet-heartbeat", "tabs_with_agents"): "2026-11-03, remove by (cos): live-pane observation (bell filter); identity from the registry; the bell moves into the registry in #973",
     ("bin/fleet-switchboard", "agent_list"): "discovery's own herdr client: the live source the registry is fed from (herdr and the v2 service), not a record of who exists",
     ("bin/proof-switchboard", "pane_of_session"): "the proof harness finds the pane of one session in a lab; it keeps no list",
 }
@@ -76711,6 +77478,127 @@ def scanned(path):
     skip = (path == "bin/registry.py" or path.endswith((".md", ".json", ".txt", ".lock", ".png", ".svg"))
             or name.startswith("test") or ".test." in name or "/tests/" in path or "/fixtures/" in path or path.startswith(("docs/", ".github/")))
     return not skip
+
+
+class TestBellMigration(unittest.TestCase):
+    """#973: the heartbeat's bell opt-in is the registry's `bell` field; today's live tab labels are copied into it ONCE, on a whole read only."""
+
+    GLYPH = "\U0001f514"
+
+    class Herdr:
+        def __init__(self, agents, tabs, fail=False):
+            self.agents, self.tabs, self.fail, self.reads = agents, tabs, fail, 0
+
+        def agent_list(self):
+            self.reads += 1
+            if self.fail:
+                raise sb.HerdrError("exit", "no")
+            return self.agents
+
+        def tab_list(self):
+            self.reads += 1
+            return self.tabs
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.registry = sb.load_module("registry")
+        self.names = ["a", "b", "c", "d", "e"]
+        for n, name in enumerate(self.names):
+            self.registry.upsert(self.dir, name, {"pane": "w%d:p1" % n, "session": "ses_example%d" % n}, now=1)
+        # old records: strip the field the upsert now adds, as if recorded before this change
+        doc = json.loads((self.dir / "registry.json").read_text())
+        for row in doc["agents"].values():
+            row.pop("bell", None)
+        (self.dir / "registry.json").write_text(json.dumps(doc))
+        labels = ["%s x" % self.GLYPH, "plain", "Orchestrator", "y %s" % self.GLYPH, "\U0001f515 z"]
+        self.live = {"a": True, "b": False, "c": False, "d": True, "e": False}
+        self.tabs = [{"tab_id": "w%d:t1" % n, "label": label} for n, label in enumerate(labels)]
+        self.agents = [{"pane_id": "w%d:p1" % n, "tab_id": "w%d:t1" % n} for n in range(5)]
+        self.notes = []
+        self.audits = []
+        self.engine = types.SimpleNamespace(state_dir=str(self.dir), audit=None, actor="t", _note=lambda *a: self.notes.append(a))
+
+    def bells(self):
+        return {n: r.get("bell") for n, r in self.registry.read(self.dir)["agents"].items()}
+
+    def audit_lines(self):
+        path = self.dir / "registry-audit.jsonl"
+        return [json.loads(l) for l in path.read_text().splitlines() if '"bell_migrated"' in l] if path.exists() else []
+
+    def test_a_whole_read_writes_the_field_for_each_agent_equal_to_its_live_state_and_audits_each(self):
+        herdr = self.Herdr(self.agents, self.tabs)
+        self.engine.herdr = herdr
+        sb.bell_migration(self.engine, self.registry, 5)
+        self.assertEqual(self.bells(), self.live)
+        self.assertEqual(len(self.audit_lines()), 5)
+
+    def test_a_partial_or_failed_read_writes_nothing_and_is_tried_again(self):
+        self.engine.herdr = self.Herdr(self.agents, self.tabs, fail=True)
+        sb.bell_migration(self.engine, self.registry, 5)
+        self.assertEqual(self.bells(), {n: None for n in self.names})
+        self.assertEqual(self.audit_lines(), [])
+        self.assertFalse(self.registry.bell_migrated(self.dir))
+        self.assertEqual(self.registry.migrate_bell(self.dir, {"w0:p1"}, False)["changed"], 0)   # the registry's own refusal of a read that is not whole
+        self.assertEqual(self.bells(), {n: None for n in self.names})
+
+    def test_it_runs_once_the_live_state_is_not_read_again_and_a_new_agent_carries_the_field(self):
+        herdr = self.Herdr(self.agents, self.tabs)
+        self.engine.herdr = herdr
+        sb.bell_migration(self.engine, self.registry, 5)
+        reads = herdr.reads
+        herdr.tabs = [{"tab_id": "w1:t1", "label": self.GLYPH}]   # a label changed since: it must not be read
+        sb.bell_migration(self.engine, self.registry, 6)
+        sb.bell_migration(self.engine, self.registry, 7)
+        self.assertEqual(herdr.reads, reads)
+        self.assertEqual(self.bells(), self.live)
+        self.assertEqual(len(self.audit_lines()), 5)
+        self.registry.upsert(self.dir, "new", {"pane": "w9:p1", "session": "ses_examplenew"}, now=8)
+        self.assertIs(self.registry.read(self.dir)["agents"]["new"]["bell"], False)
+
+    def test_a_failed_migration_followed_by_a_state_pass_loses_no_opt_in(self):
+        self.engine.herdr = self.Herdr(self.agents, self.tabs, fail=True)
+        sb.bell_migration(self.engine, self.registry, 5)
+        for name in self.names:   # the pass's upsert of a changed state, before the migration has run
+            self.registry.upsert(self.dir, name, {"pane": self.registry.read(self.dir)["agents"][name]["pane"], "session": self.registry.read(self.dir)["agents"][name]["session"], "state": "working"}, now=6)
+        self.assertEqual(self.bells(), {n: None for n in self.names})
+        self.engine.herdr = self.Herdr(self.agents, self.tabs)
+        sb.bell_migration(self.engine, self.registry, 7)
+        self.assertEqual(self.bells(), self.live)
+
+    def test_a_failing_tab_list_and_a_failing_marker_write_are_safe(self):
+        herdr = self.Herdr(self.agents, self.tabs)
+        herdr.tab_list = lambda: (_ for _ in ()).throw(sb.HerdrError("exit", "no"))
+        self.engine.herdr = herdr
+        sb.bell_migration(self.engine, self.registry, 5)
+        self.assertEqual(self.bells(), {n: None for n in self.names})
+        with mock.patch.object(self.registry, "_write_atomic", side_effect=OSError(28, "full")):
+            got = self.registry.migrate_bell(self.dir, {"w0:p1"}, True)
+        self.assertTrue(got["problem"])
+        self.assertFalse(self.registry.bell_migrated(self.dir))
+        again = self.registry.migrate_bell(self.dir, {"w0:p1"}, True)   # safe to re-run: records that have the field are left alone
+        self.assertIsNone(again["problem"])
+
+    def test_the_pass_audits_the_migration_once_when_agents_changed_and_never_for_none(self):
+        self.engine.herdr = self.Herdr(self.agents, self.tabs)
+        audit = types.SimpleNamespace(lines=[], append=lambda actor, event, subject, detail: audit.lines.append((event, detail)))
+        self.engine.audit = audit
+        sb.bell_migration(self.engine, self.registry, 5)
+        self.assertEqual(audit.lines, [("registry.bell_migrated", {"agents": 5})])
+        empty = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(empty), True)
+        self.engine.state_dir, audit.lines[:] = str(empty), []
+        sb.bell_migration(self.engine, self.registry, 5)   # nothing recorded: the marker is written, no audit line
+        self.assertEqual(audit.lines, [])
+
+    def test_a_field_a_person_set_is_never_overwritten_and_the_default_is_opted_out(self):
+        self.registry.set_bell(self.dir, "b", True)
+        self.engine.herdr = self.Herdr(self.agents, self.tabs)
+        sb.bell_migration(self.engine, self.registry, 5)
+        self.assertIs(self.bells()["b"], True)
+        self.assertEqual(len(self.audit_lines()), 4)
+        self.assertIs(self.registry.bell_of({"pane": "w1:p1"}), False)
 
 
 class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
@@ -76976,8 +77864,9 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
         self.assertEqual(set(LIVE_OBSERVERS) - found, set(), "an entry of LIVE_OBSERVERS no longer reads the live list: remove it")
         for key, reason in LIVE_OBSERVERS.items():
             self.assertGreater(len(reason), 40, key)
+        self.assertEqual([k for k in LIVE_OBSERVERS if k[0] == "bin/fleet-heartbeat"], [], "the heartbeat reads the registry's bell field, never a live listing (#973)")
         dated = {k: r for k, r in LIVE_OBSERVERS.items() if re.match(r"\d{4}-\d{2}-\d{2}\b", r)}
-        self.assertEqual(set(dated), {("bin/fleet-heartbeat", "tabs_with_agents")}, "the heartbeat is a DATED entry, never a standing one")
+        self.assertEqual(set(dated), set(), "a dated entry is for a read that is about to be removed; none is left")
         for key, reason in dated.items():
             self.assertGreaterEqual(reason[:10], _dt.date.today().isoformat(), "%s is past its remove-by date" % (key,))
 
@@ -76995,6 +77884,620 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
         for path in sorted((BIN.parent / "plugins").rglob("*")):
             if path.is_file() and path.suffix in (".mjs", ".js", ".tsx") and not path.name.endswith(".test.mjs") and OLD_AGENT_SOURCES.search(path.read_text()):
                 self.assertIn(str(path.relative_to(BIN.parent)), DERIVED_VIEWS, "%s reads an old agent list: read the registry or list it as derived" % path)
+
+
+class TestPaneExit(Base):
+    """Why a pane ended (#1030): herdr's log is read read-only and bounded, and each exit becomes ONE `fleetpane.exit` audit line."""
+
+    NOW = 1_800_000_000.0
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform",))
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.engine = self.world.engine
+        self.engine.state_dir = self.world.state
+        self.engine.config = dict(self.engine.config, herdr_log=str(self.home / "herdr-server.log"))
+        self.log = self.home / "herdr-server.log"
+        self.jobs = self.home / "jobs"
+        self.jobs.mkdir(mode=0o700)
+        patcher = mock.patch.dict(os.environ, {sb.JOBS_DIR_ENV: str(self.jobs)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def stamp(offset):
+        return datetime.datetime.fromtimestamp(TestPaneExit.NOW + offset, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+
+    def exit_line(self, offset, pane, code, signal="None"):
+        return ('%s  INFO herdr::logging: pane child exited event="pane.exit" subsystem="pane" outcome="completed" pane_id=%s '
+                'status="ExitStatus { code: %d, signal: %s }"\n' % (self.stamp(offset), pane, code, signal))
+
+    def hangup_line(self, offset, pane):
+        return "%s  INFO herdr::pane: pane session terminated pane=%s pid=99 signal=Hangup\n" % (self.stamp(offset), pane)
+
+    def write_log(self, *lines):
+        self.log.write_text("".join(lines))
+
+    def run_pass(self, offset=10):
+        sb.pane_exit_pass(self.engine, self.NOW + offset)
+
+    def audit(self, event):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def three_kinds(self):
+        self.write_log(self.exit_line(-300, 11, 0), self.exit_line(-200, 12, 130), self.hangup_line(-199.9, 12), self.exit_line(-100, 13, 1), self.hangup_line(-99.5, 13))
+
+    def test_each_exit_is_one_line_with_pane_code_signal_and_herdr_time_once_over_two_passes(self):
+        self.three_kinds()
+        self.run_pass()
+        self.run_pass(20)
+        lines = self.audit("fleetpane.exit")
+        self.assertEqual(len(lines), 3)
+        by_pane = {e["detail"]["pane"]: e["detail"] for e in lines}
+        self.assertEqual((by_pane["11"]["code"], by_pane["11"]["signal"]), (0, None))
+        self.assertEqual((by_pane["12"]["code"], by_pane["12"]["signal"]), (130, "Hangup"))
+        self.assertEqual(by_pane["13"]["signal"], "Hangup")
+        self.assertEqual(by_pane["12"]["herdr_time"], self.stamp(-200))
+        self.assertEqual(self.audit("fleetpane.exit_burst"), [])
+
+    def test_a_signal_in_the_exit_status_is_kept(self):
+        self.write_log(self.exit_line(-5, 14, 0, 'Some("Terminated")'))
+        self.run_pass()
+        self.assertEqual(self.audit("fleetpane.exit")[0]["detail"]["signal"], "Terminated")
+
+    def test_the_agent_name_is_given_when_the_registry_knows_the_pane(self):
+        self.engine.discover(self.world.clock.now())
+        sb.pane_health_pass(self.engine, self.world.clock.now())
+        pane = self.world.panes["platform"]
+        number = pane.split(":p")[-1]
+        self.write_log(self.exit_line(-5, number, 130), self.exit_line(-4, "77777", 0))
+        self.run_pass()
+        agents = {e["detail"]["pane"]: e["detail"]["agent"] for e in self.audit("fleetpane.exit")}
+        self.assertEqual(agents, {number: "platform", "77777": None})
+
+    def test_a_pane_closed_by_a_fleet_command_is_marked_asked_with_who_asked_and_another_is_not(self):
+        entry = {"ts": self.stamp(-8), "actor": "cos", "event": "fleetpane.closed", "subject": "platform", "detail": {"pane": "w1:p21", "by": "cos"}}
+        self.world.audit_path.write_text(json.dumps(entry) + "\n")
+        self.write_log(self.exit_line(-5, 21, 0), self.exit_line(-4, 22, 0))
+        self.run_pass()
+        got = {e["detail"]["pane"]: e["detail"] for e in self.audit("fleetpane.exit")}
+        self.assertEqual((got["21"]["asked"], got["21"]["by"]), (True, "cos"))
+        self.assertEqual((got["22"]["asked"], got["22"]["by"]), (False, None))
+
+    def make_job(self, name, started, ended=None):
+        (self.jobs / name).mkdir(mode=0o700)
+        (self.jobs / name / "job.json").write_text(json.dumps({"name": name, "pid": os.getpid(), "started": started}))
+        if ended is not None:
+            exit_file = self.jobs / name / "exit"
+            exit_file.write_text("0\n")
+            os.utime(str(exit_file), (ended, ended))
+
+    def test_the_line_lists_the_heavy_runs_and_jobs_active_at_the_exit_second_by_their_start_and_end(self):
+        at = self.NOW - 5
+        slots = sb.load_heavy_slots()
+        held = [{"name": "suite", "since": at - 40}, {"name": "later", "since": at + 50}]
+        self.make_job("alive", at - 90)                         # started before, still alive: active
+        self.make_job("ended-after", at - 60, at + 2)           # ended after the exit: active at it
+        self.make_job("ended-before", at - 90, at - 10)         # ended before the exit: not active
+        self.make_job("started-after", at + 3)                  # started after the exit: not active
+        self.write_log(self.exit_line(-5, 31, 130))
+        with mock.patch.object(slots, "_held_records", return_value=held):
+            self.run_pass()
+        active = self.audit("fleetpane.exit")[0]["detail"]["active"]
+        self.assertEqual(sorted((a["kind"], a["name"], a["age"]) for a in active),
+                         [("heavy", "suite", 40), ("job", "alive", 90), ("job", "ended-after", 60)])
+        self.assertIn("still holding its slot", self.audit("fleetpane.exit")[0]["detail"]["active_basis"])
+
+    def test_a_burst_of_thirty_panes_writes_the_exit_lines_in_bounded_passes_and_one_summary_and_one_notice(self):
+        self.engine.discover(self.world.clock.now())
+        self.write_log(*[self.exit_line(-20 + (i // 10), 100 + i, 130) for i in range(30)])
+        self.run_pass()
+        self.assertEqual(len(self.audit("fleetpane.exit")), sb.PANE_EXIT_MAX_PER_PASS)
+        self.run_pass(20)
+        self.assertEqual(len(self.audit("fleetpane.exit")), 30)
+        self.assertEqual(len({e["detail"]["pane"] for e in self.audit("fleetpane.exit")}), 30)
+        self.run_pass(30)
+        self.assertEqual(len(self.audit("fleetpane.exit")), 30)
+        bursts = self.audit("fleetpane.exit_burst")
+        self.assertEqual((len(bursts), len(bursts[0]["detail"]["panes"])), (1, 30))
+        source = sb.PaneExitFacts()
+        source.bind(self.engine)
+        self.assertEqual(len(source()), 1)
+
+    def test_three_panes_ending_within_two_seconds_make_one_summary_and_one_notice_and_two_far_apart_make_none(self):
+        self.engine.discover(self.world.clock.now())
+        self.assertEqual(self.engine.discovery.problems, [])
+        self.write_log(self.exit_line(-20, 41, 130), self.exit_line(-19, 42, 130), self.exit_line(-18, 43, 130), self.exit_line(-300, 44, 0), self.exit_line(-240, 45, 0))
+        self.run_pass()
+        self.run_pass(30)
+        bursts = self.audit("fleetpane.exit_burst")
+        self.assertEqual(len(bursts), 1)
+        self.assertEqual(bursts[0]["detail"]["panes"], ["41", "42", "43"])
+        self.assertEqual(len(self.audit("fleetpane.exit")), 5)
+        source = sb.PaneExitFacts()
+        source.bind(self.engine)
+        facts = source()
+        self.assertEqual([(f.recipient, f.kind) for f in facts], [("cos", "pane")])
+        self.assertIn("3 panes ended", facts[0].summary)
+        self.assertEqual(len({f.key for f in source()}), 1)
+
+    def test_a_missing_or_rotated_or_unreadable_log_gives_one_note_and_the_pass_goes_on(self):
+        self.run_pass()
+        self.run_pass(20)
+        self.assertEqual(len(self.audit("fleetpane.exit_note")), 1)
+        self.write_log(self.exit_line(-5, 51, 0), "x" * 2000)
+        self.run_pass(30)
+        self.write_log(self.exit_line(-4, 52, 0))   # shorter than before: rotated
+        self.run_pass(40)
+        self.assertEqual([e["detail"]["note"].split(" was ")[-1][:7] for e in self.audit("fleetpane.exit_note")][1:], ["rotated"])
+        self.assertEqual(len(self.audit("fleetpane.exit")), 2)
+        with mock.patch.object(sb, "pane_exit_read_log", return_value=("", None, None, "herdr log not read: Permission denied")):
+            self.run_pass(50)
+        self.assertIn("not read", self.audit("fleetpane.exit_note")[-1]["detail"]["note"])
+
+    def test_a_large_log_is_read_only_in_its_tail_and_is_never_changed(self):
+        filler = ("%s  INFO herdr::logging: filler\n" % self.stamp(-9000)) * 100000
+        self.write_log(filler, self.exit_line(-5, 61, 130))
+        before = (self.log.stat().st_size, self.log.stat().st_mtime_ns)
+        self.assertGreater(before[0], 2 * sb.PANE_EXIT_TAIL_BYTES)
+        reads = []
+        real = open
+
+        def spy(path, mode="r", *a, **k):
+            handle = real(path, mode, *a, **k)
+            if str(path) == str(self.log):
+                reads.append(mode)
+                inner = handle.read
+                handle.read = lambda n=-1: (reads.append(n), inner(n))[1]
+            return handle
+        with mock.patch("builtins.open", spy):
+            self.run_pass()
+        self.assertEqual([m for m in reads if isinstance(m, str)], ["rb"])
+        self.assertTrue(all(n <= sb.PANE_EXIT_TAIL_BYTES for n in reads if isinstance(n, int)))
+        self.assertEqual((self.log.stat().st_size, self.log.stat().st_mtime_ns), before)
+        self.assertEqual([e["detail"]["pane"] for e in self.audit("fleetpane.exit")], ["61"])
+
+    def count_state_writes(self, passes):
+        """Run the real pass at each offset and count the renames onto pane-exit.json (the only per-pass file pane_exit_pass writes)."""
+        wrote, real = [0], os.rename
+
+        def counting(a, b):
+            wrote[0] += os.path.basename(str(b)) == sb.PANE_EXIT_FILE
+            return real(a, b)
+        with mock.patch.object(os, "rename", counting):
+            for offset in passes:
+                self.run_pass(offset)
+        return wrote[0]
+
+    def test_the_state_file_is_written_only_when_it_changed(self):
+        self.three_kinds()
+        self.assertEqual(self.count_state_writes([10]), 4, "three exits (one write each) and the log as read")
+        self.assertEqual(self.count_state_writes(range(11, 51)), 0, "40 idle passes: the same seen set and log, no write")
+        with self.log.open("a") as handle:
+            handle.write(self.exit_line(-5, 14, 0))
+        self.assertEqual(self.count_state_writes([60, 61, 62]), 2, "a new exit and the log growing are written once, not again")
+
+    def append(self, text):
+        with self.log.open("a") as handle:
+            handle.write(text)
+
+    def test_a_log_that_grows_by_other_events_does_not_rewrite_the_state_file_and_the_mutant_that_stores_the_size_every_pass_does(self):
+        self.three_kinds()
+        self.run_pass()
+        other = "%s  INFO herdr::agent: agent state changed pane=11 state=busy\n" % self.stamp(0)
+
+        def idle_writes(passes):
+            writes = 0
+            for offset in passes:
+                self.append(other)   # herdr's log grows on every event, not only exits
+                writes += self.count_state_writes([offset])
+            return writes
+        self.assertEqual(idle_writes(range(11, 41)), 0, "30 passes with a growing log and no exit: no write")
+        import inspect
+        source = inspect.getsource(sb.pane_exit_pass)
+        guard = "if rotated or not stored_log or"
+        self.assertIn(guard, source)
+        namespace = dict(sb.__dict__)
+        exec(source.replace(guard, "if True or"), namespace)   # the mutant: the size is stored at every pass
+        with mock.patch.object(sb, "pane_exit_pass", namespace["pane_exit_pass"]):
+            self.assertGreaterEqual(idle_writes(range(41, 51)), 10, "the mutant rewrites the file at each pass: the test sees it")
+
+    def test_the_log_size_is_pinned_in_memory_by_grow_then_truncate_and_a_mutant_each_for_a_stored_size_and_for_no_memory_fails(self):
+        """Grow by other events (no write), truncate to a size ABOVE the stored size but BELOW the in-memory size (a rotation seen only against memory:
+        one write, the new exit not missed), grow again (no write)."""
+        import inspect
+        self.three_kinds()
+        self.run_pass()
+        stored_size = self.log.stat().st_size
+        other = "%s  INFO herdr::agent: agent state changed pane=11 state=busy\n" % self.stamp(0)
+
+        def idle_writes(passes):
+            writes = 0
+            for offset in passes:
+                self.append(other)
+                writes += self.count_state_writes([offset])
+            return writes
+
+        def scenario():
+            self.assertEqual(idle_writes(range(11, 31)), 0, "growth by other events: no write")
+            grown = self.log.stat().st_size
+            new_exit = self.exit_line(-20, 15, 0)
+            padding = other * ((stored_size - len(new_exit)) // len(other) + 1)
+            self.log.write_text(padding + new_exit)
+            truncated = self.log.stat().st_size
+            self.assertTrue(stored_size < truncated < grown, "the truncated log is above the stored size and below the in-memory size")
+            writes = self.count_state_writes([31])
+            exits = [e["detail"]["pane"] for e in self.audit("fleetpane.exit")]
+            self.assertEqual(writes, 2, "the rotation: one write for the new exit's mark, one for the log")
+            self.assertIn("15", exits, "no exit missed across the truncation")
+            self.assertEqual(len([e for e in self.audit("fleetpane.exit_note") if "rotated" in e["detail"]["note"]]), 1, "the truncation is detected against the in-memory size")
+            self.assertEqual(idle_writes(range(32, 42)), 0, "growth again: no write")
+
+        source = inspect.getsource(sb.pane_exit_pass)
+        mutants = {
+            "stored size at every pass": ("if rotated or not stored_log or", "if True or"),
+            "no in-memory update": ("    engine.pane_exit_log = {\"size\": size, \"ino\": inode}\n", ""),
+        }
+        for name, (old, new) in mutants.items():
+            self.assertIn(old, source, name)
+        scenario()
+        for name, (old, new) in mutants.items():
+            with self.subTest(mutant=name):
+                self.setUp()
+                self.three_kinds()
+                namespace = dict(sb.__dict__)
+                exec(source.replace(old, new), namespace)
+                with mock.patch.object(sb, "pane_exit_pass", namespace["pane_exit_pass"]):
+                    self.run_pass()
+                    with self.assertRaises(AssertionError, msg="the mutant %s passed" % name):
+                        scenario()
+
+    def test_each_field_of_the_saved_payload_changes_it_only_for_its_own_reason(self):
+        """The payload is {"seen": {key: epoch}, "log": {"size", "ino"}}. seen changes with a new exit or burst, or a key aging out (PANE_EXIT_SEEN_KEEP);
+        log.ino with a rotation; log.size with a shrink (rotation) or alongside a change of seen, and never by growth alone."""
+        self.three_kinds()
+        self.run_pass()
+        self.append(self.exit_line(-50, 14, 0))
+        self.assertEqual(self.count_state_writes([11]), 2, "seen: a new exit")
+        self.log.write_text(self.exit_line(-40, 16, 0))   # shrink
+        before = self.count_state_writes([12])
+        self.assertGreaterEqual(before, 1, "log.size shrank: a rotation, written")
+        self.assertEqual(self.count_state_writes([13, 14]), 0)
+        inode = self.log.stat().st_ino
+        self.log.unlink()
+        self.log.write_text(self.exit_line(-40, 16, 0))   # a new file of the same size: the inode changed
+        if self.log.stat().st_ino == inode:
+            self.skipTest("the file system reused the inode")
+        self.assertEqual(self.count_state_writes([15]), 1, "log.ino: a rotation")
+        self.assertEqual(self.count_state_writes([16]), 0)
+        stored = sb._read_small(self.world.state, sb.PANE_EXIT_FILE)
+        stored["seen"]["old:1"] = self.NOW - sb.PANE_EXIT_SEEN_KEEP - 10   # a key past its keep time
+        sb._write_small(self.world.state, sb.PANE_EXIT_FILE, stored)
+        self.assertEqual(self.count_state_writes([17]), 1, "seen: a key aged out")
+        self.assertEqual(self.count_state_writes([18]), 0)
+
+    def test_the_exits_seen_are_kept_in_the_state_file_so_a_restart_writes_nothing_twice(self):
+        self.three_kinds()
+        self.run_pass()
+        self.assertEqual(len(self.audit("fleetpane.exit")), 3)
+        self.assertEqual(len(sb._read_small(self.world.state, sb.PANE_EXIT_FILE)["seen"]), 3)
+        self.engine.__dict__.pop("pane_exit_seen", None)   # a restart: nothing in memory, only the file
+        self.run_pass(20)
+        self.assertEqual(len(self.audit("fleetpane.exit")), 3)
+
+    def test_a_state_file_that_cannot_be_written_does_not_make_the_next_pass_write_the_exits_again(self):
+        self.three_kinds()
+        with mock.patch.object(sb, "_write_small", side_effect=OSError(28, "No space left")):
+            self.run_pass()
+            self.run_pass(20)
+        self.assertEqual(len(self.audit("fleetpane.exit")), 3)
+        self.assertTrue(self.audit("fleetpane.error"))
+
+    def test_an_exit_older_than_an_hour_at_the_first_look_is_not_written(self):
+        self.write_log(self.exit_line(-7200, 71, 0))
+        self.run_pass()
+        self.assertEqual(self.audit("fleetpane.exit"), [])
+
+    def test_the_documentation_names_the_cause_first_the_records_and_where_to_look(self):
+        text = (Path(SWITCHBOARD).resolve().parent.parent / "docs" / "switchboard.md").read_text()
+        start = text.index("### Why a pane ended")
+        section = text[start:text.index("\n### ", start + 5)]
+        self.assertLess(section.index("The cause, first"), section.index("Records that existed"))
+        self.assertLess(section.index("Records that existed"), section.index("Records that did not exist"))
+        existed, missing = section.split("Records that existed")[1].split("Records that did not exist")
+        self.assertIn("fleetpane.dead", existed + missing)
+        self.assertIn("05:26:07Z", existed)
+        self.assertIn("05:26:07Z", missing)
+        self.assertIn("fleetpane.exit", section)
+        self.assertIn("herdr-server.log", section)
+        self.assertIn("slot records", section)
+
+
+class TestPaneExitBoundaries(TestPaneExit):
+    """#1030 rev-2: every guard, boundary, recipient, name match and config read of the pane-exit code has a row here. The rows are derived from the code
+    (the completeness tests read it with ast); a mutant of each (a window widened or narrowed, a filter or guard removed) fails a row."""
+
+    def fresh(self):
+        """A clean slate inside one test: no audit, no state file, no memory of seen exits."""
+        self.world.audit_path.write_text("")
+        (self.world.state / sb.PANE_EXIT_FILE).unlink(missing_ok=True)
+        self.engine.__dict__.pop("pane_exit_seen", None)
+        self.engine.__dict__.pop("pane_exit_bursts", None)
+        self.engine._last.clear()
+
+    def signal_of(self, terminated_offset):
+        self.fresh()
+        self.write_log(self.exit_line(-30, 81, 0), self.hangup_line(-30 + terminated_offset, 81))
+        self.run_pass()
+        return self.audit("fleetpane.exit")[0]["detail"]["signal"]
+
+    def test_the_signal_line_counts_from_the_exit_to_ten_seconds_after_and_not_eleven_or_before(self):
+        for offset, expected in ((0, "Hangup"), (10, "Hangup"), (11, None), (-1, None)):
+            with self.subTest(offset=offset):
+                self.assertEqual(self.signal_of(offset), expected)
+
+    def burst_panes(self, gaps):
+        self.fresh()
+        self.engine.discover(self.world.clock.now())
+        at, lines = -100, []
+        for index, gap in enumerate([0] + list(gaps)):
+            at += gap
+            lines.append(self.exit_line(at, 200 + index, 130))
+        self.write_log(*lines)
+        self.run_pass()
+        return [b["detail"]["panes"] for b in self.audit("fleetpane.exit_burst")]
+
+    def test_a_burst_is_three_exits_each_at_most_five_seconds_after_the_one_before(self):
+        rows = ((("two exits", [4]), []), (("three at 4 s", [4, 4]), [["200", "201", "202"]]), (("three at 5 s", [5, 5]), [["200", "201", "202"]]),
+                (("three at 6 s", [6, 6]), []), (("three at 59 s", [59, 59]), []), (("a 6 s gap splits", [4, 6, 4]), []), (("four at 4 s", [4, 4, 4]), [["200", "201", "202", "203"]]))
+        for (label, gaps), expected in rows:
+            with self.subTest(label):
+                self.assertEqual(self.burst_panes(gaps), expected)
+
+    def asked_of(self, closed_offset, exit_offset=-5):
+        self.fresh()
+        entry = {"ts": self.stamp(closed_offset), "actor": "cos", "event": "fleetpane.closed", "subject": "x", "detail": {"pane": "w1:p91", "by": "cos"}}
+        self.world.audit_path.write_text(json.dumps(entry) + "\n")
+        self.write_log(self.exit_line(exit_offset, 91, 0))
+        self.run_pass()
+        return [e for e in self.audit("fleetpane.exit")][0]["detail"]["asked"]
+
+    def test_a_close_counts_from_five_minutes_before_the_exit_to_thirty_seconds_after_it(self):
+        for before, expected in ((299, True), (301, False), (-29, True), (-31, False)):
+            with self.subTest(close_seconds_before_exit=before):
+                self.assertEqual(self.asked_of(-5 - before), expected)
+
+    def test_an_exit_is_written_at_an_age_just_under_an_hour_and_not_just_over_it(self):
+        for age, written in ((3500, True), (3700, False)):
+            with self.subTest(age=age):
+                self.fresh()
+                self.write_log(self.exit_line(10 - age, 92, 0))
+                self.run_pass()
+                self.assertEqual(len(self.audit("fleetpane.exit")), 1 if written else 0)
+
+    def test_at_most_twelve_active_runs_are_listed(self):
+        for index in range(15):
+            self.make_job("job%02d" % index, self.NOW - 100)
+        self.write_log(self.exit_line(-5, 93, 0))
+        self.run_pass()
+        self.assertEqual(len(self.audit("fleetpane.exit")[0]["detail"]["active"]), sb.PANE_EXIT_NAMES)
+
+    def test_a_pass_without_an_audit_or_a_state_directory_writes_nothing_and_does_not_raise(self):
+        self.write_log(self.exit_line(-5, 94, 0))
+        for attr in ("audit", "state_dir"):
+            with self.subTest(attr=attr):
+                self.fresh()
+                saved = getattr(self.engine, attr)
+                setattr(self.engine, attr, None)
+                try:
+                    self.run_pass()
+                finally:
+                    setattr(self.engine, attr, saved)
+                self.assertEqual(self.audit("fleetpane.exit"), [])
+
+    def test_the_real_pass_and_real_fact_sources_give_one_exit_line_and_one_fact(self):
+        self.engine.discover(self.world.clock.now())
+        now = self.world.clock.now()
+        self.log.write_text("".join(self.exit_line(now - self.NOW - 20 + i, 300 + i, 130) for i in range(3)))
+        self.assertEqual(self.engine.config["herdr_log"], str(self.log))
+        sb.publish_decisions(self.engine)
+        self.assertEqual(len(self.audit("fleetpane.exit")), 3)
+        self.assertEqual(len(self.audit("fleetpane.exit_burst")), 1)
+        sources = [s for s in sb.fact_sources(self.world.state) if isinstance(s, sb.PaneExitFacts)]
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(len([s for s in self.engine.sources if isinstance(s, sb.PaneExitFacts)]), 1)
+        facts = [f for s in self.engine.sources if isinstance(s, sb.PaneExitFacts) for f in s()]
+        self.assertEqual(len(facts), 1)
+
+    def test_a_pass_with_no_new_exit_reads_no_audit_tail_no_job_records_and_no_ps_and_a_new_exit_reads_each_once(self):
+        self.make_job("alive", self.NOW - 50)
+        self.write_log(self.exit_line(-5, 95, 0))
+        self.run_pass()   # the exit is written and marked seen
+        counts = {"tail": 0, "runs": 0, "state": 0}
+        real = {"tail": sb.pane_exit_audit_tail, "runs": sb.pane_exit_runs, "state": sb.job_state}
+
+        def counting(name):
+            def inner(*a, **k):
+                counts[name] += 1
+                return real[name](*a, **k)
+            return inner
+        with mock.patch.object(sb, "pane_exit_audit_tail", counting("tail")), mock.patch.object(sb, "pane_exit_runs", counting("runs")), \
+                mock.patch.object(sb, "job_state", counting("state")):
+            for later in (20, 30, 40):
+                self.run_pass(later)
+            self.assertEqual(counts, {"tail": 0, "runs": 0, "state": 0})
+            self.log.write_text(self.log.read_text() + self.exit_line(-4, 96, 0) + self.exit_line(-3, 97, 0))
+            self.run_pass(50)
+            self.assertEqual(counts, {"tail": 1, "runs": 1, "state": 1})
+
+    def test_the_job_records_read_are_capped(self):
+        for index in range(sb.PANE_EXIT_MAX_JOBS + 5):
+            self.make_job("j%04d" % index, self.NOW - 100)
+        with mock.patch.object(sb, "job_read", wraps=sb.job_read) as reader:
+            sb.pane_exit_runs(self.engine)
+        self.assertEqual(reader.call_count, sb.PANE_EXIT_MAX_JOBS)
+
+    def failing_append(self, event, nth):
+        """An audit that raises on its nth line of `event` (once): the pass raises out, as a full disk would make it."""
+        real, count = self.engine.audit.append, {"n": 0}
+
+        def append(actor, name, subject, detail=None, *a, **k):
+            if name == event:
+                count["n"] += 1
+                if count["n"] == nth:
+                    raise OSError(28, "No space left")
+            return real(actor, name, subject, detail, *a, **k)
+        return mock.patch.object(self.engine.audit, "append", append)
+
+    def test_an_exit_line_that_fails_to_append_never_repeats_an_earlier_line_and_is_written_by_the_next_pass(self):
+        for nth in (1, 2, 3):   # the first, the middle and the last exit
+            with self.subTest(failing=nth):
+                self.fresh()
+                self.write_log(*[self.exit_line(-100 + 20 * i, 500 + i, 0) for i in range(3)])
+                with self.failing_append("fleetpane.exit", nth):
+                    with self.assertRaises(OSError):
+                        self.run_pass()
+                self.assertEqual(len(self.audit("fleetpane.exit")), nth - 1)
+                self.run_pass(20)
+                self.run_pass(30)
+                self.assertEqual(sorted(e["detail"]["pane"] for e in self.audit("fleetpane.exit")), ["500", "501", "502"])
+
+    def test_a_burst_line_that_fails_to_append_does_not_repeat_the_exit_lines_and_is_written_once_later(self):
+        self.engine.discover(self.world.clock.now())
+        self.write_log(*[self.exit_line(-20 + i, 520 + i, 130) for i in range(3)])
+        with self.failing_append("fleetpane.exit_burst", 1):
+            with self.assertRaises(OSError):
+                self.run_pass()
+        self.assertEqual((len(self.audit("fleetpane.exit")), len(self.audit("fleetpane.exit_burst"))), (3, 0))
+        self.run_pass(20)
+        self.run_pass(30)
+        self.assertEqual((len(self.audit("fleetpane.exit")), len(self.audit("fleetpane.exit_burst"))), (3, 1))
+
+    def test_a_second_burst_line_that_fails_does_not_repeat_the_first(self):
+        self.engine.discover(self.world.clock.now())
+        self.write_log(*[self.exit_line(base + i, 560 + n * 3 + i, 130) for n, base in enumerate((-100, -50)) for i in range(3)])
+        with self.failing_append("fleetpane.exit_burst", 2):
+            with self.assertRaises(OSError):
+                self.run_pass()
+        self.assertEqual(len(self.audit("fleetpane.exit_burst")), 1)
+        self.run_pass(20)
+        self.run_pass(30)
+        self.assertEqual(len(self.audit("fleetpane.exit_burst")), 2)
+
+    def test_the_state_file_is_written_after_each_exit_line(self):
+        self.write_log(*[self.exit_line(-100 + 20 * i, 540 + i, 0) for i in range(3)])
+        sizes = []
+        real = sb._write_small
+        with mock.patch.object(sb, "_write_small", lambda d, n, data: (sizes.append(len(data["seen"])), real(d, n, data))[1]):
+            self.run_pass()
+        self.assertEqual(sizes[:3], [1, 2, 3])
+
+    def burst_source(self):
+        self.engine.discover(self.world.clock.now())
+        self.write_log(*[self.exit_line(-20 + i, 400 + i, 130) for i in range(3)])
+        self.run_pass()
+        source = sb.PaneExitFacts()
+        source.bind(self.engine)
+        return source
+
+    def test_the_fact_goes_to_the_chief_of_staff_only_and_not_to_another_agent(self):
+        self.world.add_agent("other", fleet={"role": "orchestrator"})
+        source = self.burst_source()
+        self.assertEqual([f.recipient for f in source()], ["cos"])
+
+    def test_the_fact_is_not_built_while_discovery_has_problems(self):
+        source = self.burst_source()
+        self.assertEqual(len(source()), 1)
+        self.engine.discovery.problems = ["the service could not be read"]
+        self.assertEqual(source(), [])
+
+    def test_a_pane_number_names_an_agent_only_as_a_whole_number_or_the_p_of_a_pane_id(self):
+        for recorded, pane, expected in (("w1:p3", "3", True), ("w1:p13", "3", False), ("3", "3", True), ("13", "3", False), ("w1:p3", "13", False), ("", "3", False), (None, "3", False)):
+            with self.subTest(recorded=recorded, pane=pane):
+                self.assertEqual(sb._pane_matches(recorded, pane), expected)
+
+    def test_an_exit_of_pane_three_names_the_agent_of_w1_p3_and_not_the_one_of_w1_p13(self):
+        registry = sb.load_module("registry")
+        registry.upsert(self.world.state, "agent-p13", {"session": "ses_example13", "pane": "w1:p13"})
+        registry.upsert(self.world.state, "agent-p3", {"session": "ses_example3", "pane": "w1:p3"})
+        self.write_log(self.exit_line(-5, 3, 0), self.exit_line(-4, 55, 0))
+        self.run_pass()
+        lines = {e["detail"]["pane"]: e for e in self.audit("fleetpane.exit")}
+        self.assertEqual(lines["3"]["detail"]["agent"], "agent-p3")
+        self.assertEqual(lines["3"]["subject"], "agent-p3")
+        self.assertIsNone(lines["55"]["detail"]["agent"])
+        self.assertEqual(lines["55"]["subject"], "pane:55")
+
+    def test_each_config_key_is_declared_with_its_default_and_refuses_a_wrong_value(self):
+        self.assertEqual((sb.DEFAULTS["herdr_log"], sb.DEFAULTS["pane_exit_burst_seconds"], sb.DEFAULTS["pane_exit_burst_min"]),
+                         (sb.HERDR_LOG_DEFAULT, sb.PANE_EXIT_BURST_SECONDS, sb.PANE_EXIT_BURST_MIN))
+        for key, good, bad in (("herdr_log", ["/x/herdr.log"], [5, "", "  ", None, ["a"]]),
+                               ("pane_exit_burst_seconds", [1, 2.5, 3600], [0, -1, "5", True, 3601, float("nan"), None]),
+                               ("pane_exit_burst_min", [2, 3, 1000], [1, 0, 2.5, "3", True, 1001, None])):
+            for value in good:
+                with self.subTest(key=key, good=value):
+                    self.assertEqual(sb.validate_config({key: value})[key], value)
+            for value in bad:
+                with self.subTest(key=key, bad=value):
+                    with self.assertRaises(sb.ConfigError):
+                        sb.validate_config({key: value})
+
+    def test_the_declared_keys_are_not_warned_about_as_unknown(self):
+        sb.UNKNOWN_CONFIG.clear()
+        sb.validate_config({"herdr_log": "/x/h.log", "pane_exit_burst_seconds": 5, "pane_exit_burst_min": 3})
+        self.assertEqual([k for k in sb.UNKNOWN_CONFIG if k[1].startswith(("herdr_log", "pane_exit"))], [])
+
+    def test_the_burst_settings_are_the_ones_the_pass_uses(self):
+        self.engine.config = dict(self.engine.config, pane_exit_burst_min=2)
+        self.assertEqual(self.burst_panes([4]), [["200", "201"]])
+        self.engine.config = dict(self.engine.config, pane_exit_burst_min=3, pane_exit_burst_seconds=30)
+        self.assertEqual(self.burst_panes([20, 20]), [["200", "201", "202"]])
+
+    # ---- the rows are derived from the code
+    @staticmethod
+    def new_code():
+        import ast
+        tree = ast.parse(SWITCHBOARD.read_text())
+        wanted = {"pane_exit_events", "pane_exit_read_log", "_pane_matches", "pane_exit_audit_tail", "_pane_exit_asked", "pane_exit_runs", "pane_exit_active",
+                  "pane_exit_pass", "PaneExitFacts"}
+        return [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in wanted]
+
+    def test_every_config_key_the_new_code_reads_is_declared(self):
+        import ast
+        keys = set()
+        for node in self.new_code():
+            for sub in ast.walk(node):
+                if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute) and sub.func.attr == "get" and isinstance(sub.func.value, ast.Attribute)
+                        and sub.func.value.attr == "config" and sub.args and isinstance(sub.args[0], ast.Constant)):
+                    keys.add(sub.args[0].value)
+                if (isinstance(sub, ast.Subscript) and isinstance(sub.value, ast.Attribute) and sub.value.attr == "config" and isinstance(sub.slice, ast.Constant)):
+                    keys.add(sub.slice.value)
+        self.assertEqual(keys, {"herdr_log", "pane_exit_burst_seconds", "pane_exit_burst_min"})
+        for key in keys:
+            self.assertIn(key, sb.DEFAULTS)
+            self.assertIn(key, sb.config_known_keys())
+
+    COVERED = {"PANE_EXIT_TAIL_BYTES": "test_a_large_log_is_read_only_in_its_tail", "PANE_EXIT_MAX_AGE": "test_an_exit_is_written_at_an_age_just_under_an_hour",
+               "PANE_EXIT_BURST_SECONDS": "test_a_burst_is_three_exits", "PANE_EXIT_BURST_MIN": "test_a_burst_is_three_exits",
+               "PANE_EXIT_ASKED_BEFORE": "test_a_close_counts_from", "PANE_EXIT_ASKED_AFTER": "test_a_close_counts_from",
+               "PANE_EXIT_SIGNAL_SECONDS": "test_the_signal_line_counts", "PANE_EXIT_SEEN_KEEP": "test_the_exits_seen_are_kept_in_the_state_file",
+               "PANE_EXIT_MAX_PER_PASS": "test_a_burst_of_thirty_panes", "PANE_EXIT_MAX_JOBS": "test_the_job_records_read_are_capped", "PANE_EXIT_NAMES": "test_at_most_twelve_active_runs_are_listed",
+               "PANE_EXIT_FILE": "test_the_exits_seen_are_kept_in_the_state_file", "HERDR_LOG_DEFAULT": "test_each_config_key_is_declared"}
+
+    def test_every_constant_the_new_code_uses_has_a_row_that_names_an_existing_test(self):
+        import ast
+        used = {sub.id for node in self.new_code() for sub in ast.walk(node) if isinstance(sub, ast.Name) and sub.id.startswith(("PANE_EXIT_", "HERDR_LOG"))}
+        self.assertEqual(used - set(self.COVERED), set(), "a constant of the pane-exit code has no row")
+        names = [n for n in dir(TestPaneExitBoundaries)]
+        for constant, test in self.COVERED.items():
+            self.assertTrue(any(n.startswith(test) for n in names), "%s: no test starts %s" % (constant, test))
+
+    def test_every_guard_of_the_pass_is_one_of_the_rows(self):
+        import ast
+        pass_fn = next(n for n in self.new_code() if getattr(n, "name", "") == "pane_exit_pass")
+        guards = sum(isinstance(n, ast.If) for n in ast.walk(pass_fn))
+        self.assertLessEqual(guards, 16, "a guard was added to pane_exit_pass: give it a row and a mutant, then raise this count")
 
 
 if __name__ == "__main__":
