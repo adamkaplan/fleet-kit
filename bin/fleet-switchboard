@@ -30880,10 +30880,18 @@ def uninstall_decisions_plugin(config_dir, kit_root=KIT_ROOT):
 def render_service(kind, values, kit_root=KIT_ROOT):
     """The LaunchAgent or the systemd user unit, from its template in templates/, placeholders filled in."""
     name = SERVICE_LABEL + ".plist" if kind == "launchd" else SERVICE_UNIT
-    text = (Path(kit_root) / "templates" / name).read_text()
+    text = strip_service_env_entries((Path(kit_root) / "templates" / name).read_text())   # the template's own text only: a value filled in below is never judged
     for placeholder, value in values.items():
         text = text.replace(placeholder, xml_escape(value) if kind == "launchd" else value.replace("%", "%%"))
-    return "".join(line for line in text.splitlines(True) if not any(n + "=" in line or ("<key>%s</key>" % n) in line for n in SERVICE_STRIP_ENV))
+    return text
+
+
+def strip_service_env_entries(text):
+    """`text` without the environment ENTRIES named exactly by SERVICE_STRIP_ENV: a systemd `Environment="NAME=..."` line, or a launchd `<key>NAME</key>`
+    with its value element. Nothing else is touched: a line that merely mentions such a name (a PATH, a comment, UnsetEnvironment=) stays."""
+    names = "|".join(re.escape(n) for n in SERVICE_STRIP_ENV)
+    text = re.sub(r'(?m)^[ \t]*Environment=["\']?(?:%s)=[^\n]*\n' % names, "", text)
+    return re.sub(r"(?m)^[ \t]*<key>(?:%s)</key>[ \t]*\n[ \t]*<[a-z]+(?:/>|>[^\n]*</[a-z]+>)[ \t]*\n" % names, "", text)
 
 
 def reaper_file_path(kind):

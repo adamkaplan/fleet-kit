@@ -4004,11 +4004,183 @@ class TestServiceEnvironmentHoldsNoPane(Base):
         clean = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "opencode serve HOME=/h", "")
         self.assertEqual(sb.service_herdr_env(clean, {"XDG_STATE_HOME": str(state)}), [])
 
-    def test_the_installed_unit_names_no_herdr_variable_value(self):
-        for kind in ("launchd", "systemd"):
-            text = sb.render_service(kind, dict(sb.service_values(sb.KIT_ROOT, ["/bin"]), __PATH__="/bin:HERDR_PANE_ID=w1"))
-            self.assertNotIn("HERDR_PANE_ID=", text)
+    # -- R-CODE-1: only the six environment ENTRIES go out of a unit, never another line
 
+    def whole_line_filter(self, text):
+        """The mutant: the old filter, which dropped every line that merely held a HERDR_ name."""
+        return "".join(l for l in text.splitlines(True) if not any(n + "=" in l or ("<key>%s</key>" % n) in l for n in sb.SERVICE_STRIP_ENV)
+                       and not any(n in l for n in ("HERDR_",)))
+
+    def unit_with_entries(self, kind):
+        """A throwaway kit whose template of `kind` also holds the six entries (and a comment naming one)."""
+        kit = Path(tempfile.mkdtemp())
+        (kit / "templates").mkdir()
+        name = sb.SERVICE_LABEL + ".plist" if kind == "launchd" else sb.SERVICE_UNIT
+        real = (sb.KIT_ROOT / "templates" / name).read_text()
+        if kind == "launchd":
+            extra = "".join("\t\t<key>%s</key>\n\t\t<string>x</string>\n" % n for n in sb.SERVICE_STRIP_ENV)
+            text = real.replace("\t\t<key>PATH</key>", extra + "\t\t<key>PATH</key>", 1)
+        else:
+            extra = "".join('Environment="%s=x"\n' % n for n in sb.SERVICE_STRIP_ENV)
+            text = real.replace('Environment="PATH=__PATH__"', extra + 'Environment="PATH=__PATH__"', 1)
+        self.assertNotEqual(text, real)
+        (kit / "templates" / name).write_text(text)
+        return kit
+
+    def test_the_unit_keeps_its_path_line_even_when_the_path_holds_herdr_text_and_loses_only_the_six_entries(self):
+        for kind in ("launchd", "systemd"):
+            values = dict(sb.service_values(sb.KIT_ROOT, ["/bin"]), __PATH__="/bin:/opt/HERDR_PANE_ID=w1:/opt/HERDR_x")
+            for kit, label in ((sb.KIT_ROOT, "the shipped template"), (self.unit_with_entries(kind), "a template holding the six entries")):
+                with self.subTest(kind=kind, template=label):
+                    text = sb.render_service(kind, values, kit)
+                    self.assertIn("/bin:/opt/HERDR_PANE_ID=w1:/opt/HERDR_x", text)   # the PATH line survives
+                    for n in sb.SERVICE_STRIP_ENV:
+                        self.assertNotIn('Environment="%s=' % n, text)
+                        self.assertNotIn("<key>%s</key>" % n, text)
+        self.assertIn("UnsetEnvironment=HERDR_PANE_ID", sb.render_service("systemd", sb.service_values(sb.KIT_ROOT, ["/bin"])))   # a line that only names them stays
+
+    def test_every_one_of_the_six_names_is_stripped_alone_and_a_longer_name_is_not(self):
+        for n in sb.SERVICE_STRIP_ENV:
+            with self.subTest(name=n):
+                self.assertEqual(sb.strip_service_env_entries('a\nEnvironment="%s=1"\nb\n' % n), "a\nb\n")
+                self.assertEqual(sb.strip_service_env_entries("a\n<key>%s</key>\n<string>1</string>\nb\n" % n), "a\nb\n")
+                keep = 'a\nEnvironment="X%s=1"\nEnvironment="%s_MORE=1"\nb\n' % (n, n)
+                self.assertEqual(sb.strip_service_env_entries(keep), keep)
+
+    def test_a_mutant_that_goes_back_to_the_whole_line_filter_loses_the_path_line(self):
+        values = dict(sb.service_values(sb.KIT_ROOT, ["/bin"]), __PATH__="/bin:/opt/HERDR_PANE_ID=w1")
+        with mock.patch.object(sb, "strip_service_env_entries", lambda text: text):
+            text = self.whole_line_filter(sb.render_service("systemd", values))
+        self.assertNotIn("/opt/HERDR_PANE_ID=w1", text)   # the mutant drops the PATH line: the test above would fail on it
+
+    # -- R-TEST-1: the daemon's own run path
+
+    def run_daemon_env(self):
+        """cmd_run (not --once) with all six names set; the environment build_engine sees."""
+        seen = {}
+
+        def stop(*a, **k):
+            seen.update(os.environ)
+            raise RuntimeError("stop")
+        env = self.callers_env()
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(sb, "build_engine", side_effect=stop):
+                with self.assertRaises(RuntimeError):
+                    sb.cmd_run(types.SimpleNamespace(once=False, standby=False, json=False, poll=None), None, None, None)
+        return seen
+
+    def test_cmd_run_leaves_the_daemon_and_so_the_service_with_none_of_the_six_names(self):
+        seen = self.run_daemon_env()
+        self.assertEqual([n for n in sb.SERVICE_STRIP_ENV if n in seen], [])
+        self.assertEqual(seen.get(sb.KEPT_SOCKET_ENV), "/x/herdr.sock")   # the daemon still finds herdr
+
+    def test_a_mutant_cmd_run_that_passes_the_names_through_is_caught(self):
+        with mock.patch.object(sb, "SERVICE_STRIP_ENV", ()):
+            seen = self.run_daemon_env()
+        self.assertEqual([n for n in ("HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID") if n in seen], [])   # these are in CALLER_ENV_NAMES too
+        self.assertIn("HERDR_ENV", seen)   # the three only SERVICE_STRIP_ENV names carry would leak: the real test above catches it
+        self.assertIn("HERDR_BIN_PATH", seen)
+
+    # -- R-TEST-5: the status line and the error paths of service_herdr_env
+
+    def service_dir(self, content=None, raw=None):
+        state = Path(tempfile.mkdtemp())
+        (state / "opencode").mkdir()
+        if raw is not None:
+            (state / "opencode" / "service.json").write_text(raw)
+        elif content is not None:
+            (state / "opencode" / "service.json").write_text(json.dumps(content))
+        return {"XDG_STATE_HOME": str(state)}
+
+    def test_service_herdr_env_names_each_of_the_six_and_only_the_exact_name(self):
+        env = self.service_dir({"pid": 4242})
+        for n in sb.SERVICE_STRIP_ENV:
+            with self.subTest(name=n):
+                ran = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "opencode serve HOME=/h %s=v" % n, "")
+                self.assertEqual(sb.service_herdr_env(ran, env), [n])
+                other = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "opencode serve X%s=v %s_MORE=v" % (n, n), "")
+                self.assertEqual(sb.service_herdr_env(other, env), [])
+
+    def test_service_herdr_env_gives_nothing_on_every_error_path_and_never_a_guess(self):
+        clean = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "opencode serve HERDR_PANE_ID=w1:p2", "")
+        def raises(exc):
+            def run(argv, **kw):
+                raise exc
+            return run
+        cases = (("no service file", self.service_dir(), clean),
+                 ("a file that is not json", self.service_dir(raw="{torn"), clean),
+                 ("a file with no pid", self.service_dir({"url": "x"}), clean),
+                 ("a pid that is not a number", self.service_dir({"pid": "abc"}), clean),
+                 ("ps times out", self.service_dir({"pid": 4242}), raises(subprocess.TimeoutExpired("ps", 5))),
+                 ("ps cannot start", self.service_dir({"pid": 4242}), raises(OSError("no ps"))),
+                 ("the runner answers nothing", self.service_dir({"pid": 4242}), lambda *a, **k: None),
+                 ("ps prints nothing for a gone process", self.service_dir({"pid": 4242}), lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "")))
+        for label, env, runner in cases:
+            with self.subTest(case=label):
+                self.assertEqual(sb.service_herdr_env(runner, env), [])
+
+    def test_a_mutant_that_guesses_on_an_error_path_is_caught(self):
+        with mock.patch.object(sb, "SERVICE_STRIP_ENV", ()):
+            self.assertEqual(sb.service_herdr_env(lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "x HERDR_PANE_ID=1", ""), self.service_dir({"pid": 1})), [])
+        self.assertEqual(sb.service_herdr_env(lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "x HERDR_PANE_ID=1", ""), self.service_dir({"pid": 1})), ["HERDR_PANE_ID"])
+
+    def test_the_status_line_for_a_running_service_that_carries_one_names_it_and_the_one_clean_restart(self):
+        report = {"service": {"kind": "launchd", "installed": True, "path": "/p", "herdr_env": ["HERDR_PANE_ID", "HERDR_ENV"]}}
+        service = report["service"]
+        carrying = [l for l in self.install_lines(service) if "carries" in l]
+        self.assertEqual(len(carrying), 1)
+        self.assertIn("HERDR_PANE_ID, HERDR_ENV", carrying[0])
+        self.assertEqual(carrying[0].count("service restart"), 1)
+        self.assertIn(sb.service_clean_restart_command(), carrying[0])
+        for n in sb.SERVICE_STRIP_ENV:
+            self.assertIn("-u " + n, sb.service_clean_restart_command())
+        self.assertEqual([l for l in self.install_lines(dict(service, herdr_env=[])) if "carries" in l], [])   # clean: no line
+        self.assertEqual([l for l in self.install_lines({k: v for k, v in service.items() if k != "herdr_env"}) if "carries" in l], [])
+
+    def test_the_status_line_restarts_nothing(self):
+        ran = []
+        with mock.patch.object(subprocess, "run", side_effect=lambda *a, **k: ran.append(a)):
+            self.install_lines({"kind": "launchd", "installed": True, "path": "/p", "herdr_env": ["HERDR_ENV"]})
+        self.assertEqual(ran, [])
+
+    def install_lines(self, service):
+        daemon = {"running": False, "pid": None, "key_source": None}
+        return sb.format_install_lines({"daemon": daemon, "key": sb.key_report(None, daemon, service), "plugin": {"state": "unknown", "detail": ""}, "service": service})
+
+    def test_a_mutant_status_that_never_reads_the_service_environment_loses_the_line(self):
+        service = {"kind": "launchd", "installed": True, "path": "/p", "herdr_env": ["HERDR_ENV"]}
+        self.assertTrue([l for l in self.install_lines(service) if "carries" in l])
+        with mock.patch.object(sb, "service_herdr_env", lambda *a, **k: ["HERDR_ENV"]):
+            self.assertEqual(sb.collect_status(lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", ""), time.time)["service"]["herdr_env"], ["HERDR_ENV"])   # collect_status carries what it reads
+
+
+class TestEveryFunctionOf1066IsPinned(unittest.TestCase):
+    """The family of #1066: every function the change added or changed has a row naming the test that drives it; a row whose function or test is gone fails."""
+
+    ROWS = {
+        "Switchboard.pane_truth": ("TestPaneBoundByProcess", "test_S2_a_disagreeing_report_keeps_a_bound_and_alive_and_b_gets_no_pane"),
+        "Switchboard.discover": ("TestPaneBoundByProcess", "test_S4_a_live_pane_is_not_rebound_and_an_unreadable_process_list_binds_nothing_new"),
+        "pane_health_pass": ("TestPaneBoundByProcess", "test_S6_a_pane_whose_process_runs_the_session_is_never_dead_even_when_the_list_omits_it"),
+        "herdr_socket_path": ("TestServiceEnvironmentHoldsNoPane", "test_S9_ensure_starts_the_daemon_and_with_it_the_service_with_no_herdr_variable"),
+        "service_environment": ("TestServiceEnvironmentHoldsNoPane", "test_S9_every_name_is_stripped_not_only_the_pane_one"),
+        "daemon_environment": ("TestIdentityCheck", "test_a_daemon_started_from_an_agents_shell_carries_no_caller_identity"),
+        "spawn_daemon": ("TestServiceEnvironmentHoldsNoPane", "test_S9_ensure_starts_the_daemon_and_with_it_the_service_with_no_herdr_variable"),
+        "cmd_run": ("TestServiceEnvironmentHoldsNoPane", "test_cmd_run_leaves_the_daemon_and_so_the_service_with_none_of_the_six_names"),
+        "service_herdr_env": ("TestServiceEnvironmentHoldsNoPane", "test_service_herdr_env_gives_nothing_on_every_error_path_and_never_a_guess"),
+        "service_clean_restart_command": ("TestServiceEnvironmentHoldsNoPane", "test_the_status_line_for_a_running_service_that_carries_one_names_it_and_the_one_clean_restart"),
+        "format_install_lines": ("TestServiceEnvironmentHoldsNoPane", "test_the_status_line_for_a_running_service_that_carries_one_names_it_and_the_one_clean_restart"),
+        "collect_status": ("TestServiceEnvironmentHoldsNoPane", "test_a_mutant_status_that_never_reads_the_service_environment_loses_the_line"),
+        "render_service": ("TestServiceEnvironmentHoldsNoPane", "test_the_unit_keeps_its_path_line_even_when_the_path_holds_herdr_text_and_loses_only_the_six_entries"),
+        "strip_service_env_entries": ("TestServiceEnvironmentHoldsNoPane", "test_every_one_of_the_six_names_is_stripped_alone_and_a_longer_name_is_not"),
+        "registry.upsert": ("TestPaneBoundByProcess", "test_S3_a_cloud_worker_is_never_recorded_with_a_pane"),
+    }
+
+    def test_every_row_names_a_function_and_a_test_that_exist(self):
+        for fn, (cls, test) in self.ROWS.items():
+            with self.subTest(function=fn):
+                owner = sb.load_module("registry") if fn.startswith("registry.") else sb.Switchboard if fn.startswith("Switchboard.") else sb
+                self.assertTrue(callable(getattr(owner, fn.split(".")[-1], None)), fn)
+                self.assertTrue(callable(getattr(globals()[cls], test, None)), "%s.%s" % (cls, test))
 
 
 # --------------------------------------------------------- the restart hazard
@@ -4840,10 +5012,31 @@ class TestLaunch(StandInPids, Base):
         herdr.panes[pane]["program"] = "%s -s ses_someone_else" % FAKE_OPENCODE
         herdr.panes[pane]["title"] = "OC | platform"
         self.assertNotIn("platform", self.engine.discover(self.world.clock.now()).agents)
-        with captured() as (out, err):
-            code = sb.main(["reattach", "platform", "--session", session], runner=self.world.route, now=self.world.clock.now, socket_call=herdr.socket)
+        with captured() as (out, err):   # rewritten for #1066: the agent is bound to no pane now, so there is no stale binding to name --replace for; the session must be given
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(herdr.closed, [])
+        with captured() as (out, err):   # and a pane that is not the agent's is never closed, working or idle, with or without --replace
+            code = sb.main(["reattach", "platform", "--session", session, "--replace"], runner=self.world.route, now=self.world.clock.now, socket_call=herdr.socket)
         self.assertEqual(code, 0, err.getvalue())
-        self.assertEqual(herdr.closed, [])   # nothing is closed without --replace
+        self.assertEqual((herdr.closed, pane in herdr.panes), ([], True))
+        # the pane that IS bound (the report names the agent's session; its process names no other session) and is stale under --replace: the old rule holds
+        herdr.closed.clear()
+        herdr.panes[pane]["program"] = FAKE_OPENCODE
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--replace", err.getvalue())
+        herdr.panes[pane]["status"] = "working"                  # a working pane is never replaced
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform", "--replace"], runner=self.world.route, now=self.world.clock.now, socket_call=herdr.socket)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(herdr.closed, [])
+        herdr.panes[pane]["status"] = None
+        with captured() as (out, err):
+            code = sb.main(["reattach", "platform", "--replace"], runner=self.world.route, now=self.world.clock.now, socket_call=herdr.socket)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual(herdr.closed, [pane])
         herdr.closed.clear()
         with captured() as (out, err):
             code = sb.main(["reattach", "--all-detached"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
