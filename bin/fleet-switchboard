@@ -51,6 +51,7 @@ import ast
 import copy
 import errno
 import fcntl
+import functools
 import getpass
 import gzip
 import hashlib
@@ -21056,6 +21057,128 @@ class LedgerCommandError(Exception):
     """A `prove`, `verdict` or `gates` command that cannot go on (exit 2): a usage problem, said in one line."""
 
 
+# ---- #1049: what a recording command (`prove`, `verdict`, `review record`) always ends with. One final line: `recorded #<id> ...`, `already recorded #<id> ...`
+# or `not recorded: <reason>`; the exit status is non-zero unless it recorded (or found it already recorded). Every wait of the command is bounded by the ONE
+# constant `plan_ledger.RECORD_WAIT_SECONDS` (the ledger lock, each GitHub read, the agent registry): a command that is cut says what it waited for and the
+# read-only command that shows whether the record landed. The set of recording commands is the set of functions marked by `@recording(...)`.
+
+class RecordTimeout(BaseException):
+    """The recording command's own bound passed. A BaseException on purpose: no `except Exception` on the way (a best-effort read) can swallow it."""
+
+    def __init__(self, step):
+        super().__init__(step)
+        self.step = step
+
+
+RECORD_ERRORS_USAGE = (LedgerCommandError, PlanInputError, plan_ledger.LedgerError)   # exit 2, as `dispatch` maps a ledger command's own errors
+
+
+def record_errors_failed():
+    """Exit 1, as `dispatch` maps them (looked up when needed: some are defined further down the file)."""
+    return (V2Error, HerdrError, ConfigError, FaultError, FactError, CallerError, LockError, LaunchError, IntentError, InstallError)
+
+
+_record_step = ["starting"]
+
+
+def record_step(name):
+    """Say what the recording command waits for now (the alarm names it when it says it is still waiting, or gives up)."""
+    _record_step[0] = name
+
+
+def not_recorded_timeout(pr, step):
+    """The one line of a cut command: names the bound, what it waited for and the read-only command that shows whether it landed."""
+    return ("not recorded: timed out after %ds, check the ledger before retrying (it was waiting for %s): run `fleet-switchboard gates %s`"
+            % (load_plan_ledger().RECORD_WAIT_SECONDS, step, (str(pr) if re.fullmatch(r"[\w./:#@-]+", str(pr)) else shlex.quote(str(pr)))))
+
+
+def recorded_line(label, pr, head, outcomes):
+    """The final success line from [(stored entry, already)]: `recorded #3, #4 (...)`, `already recorded #3 (...)` or both."""
+    fresh = ["#%d" % e["seq"] for e, already in outcomes if not already]
+    older = ["#%d" % e["seq"] for e, already in outcomes if already]
+    said = "; ".join(x for x in ("recorded " + ", ".join(fresh) if fresh else "", "already recorded " + ", ".join(older) if older else "") if x)
+    return "%s (%s %s at %s)" % (said, label, pr, (head or "")[:8])
+
+
+def run_recording(fn, a, kw, args):
+    """Run the recording command `fn` under its bound. A refusal ends `not recorded: <reason>` (exit 2, or 1 for an environment error); the
+    bound ends `not recorded: timed out after Ns, check the ledger before retrying ...` (exit 1) and the alarm is held back while an entry is
+    written, so a command is never cut after its record landed."""
+    ledger = load_plan_ledger()   # the module itself: the lazy `plan_ledger` name would take an assignment onto itself
+    pr = getattr(args, "pr", None) or "<pr>"
+    wait, progress = ledger.RECORD_WAIT_SECONDS, ledger.RECORD_PROGRESS_SECONDS
+    armed = threading.current_thread() is threading.main_thread() and hasattr(signal, "setitimer")
+    said = [False]
+    before_hook, before_handler = ledger.step_hook, None
+
+    def on_alarm(signum, frame):
+        if ledger.IN_CRITICAL:
+            return
+        step = _record_step[0]
+        if not said[0] and wait > progress:
+            said[0] = True
+            if step != ledger.LOCK_STEP:   # the lock's own wait says it already
+                sys.stderr.write("%s: waiting for %s (giving up after %ds)\n" % (PROG, step, wait))
+                sys.stderr.flush()
+            signal.setitimer(signal.ITIMER_REAL, wait - progress)
+            return
+        raise RecordTimeout(step)
+
+    record_step("starting")
+    ledger.step_hook = record_step
+    try:
+        if armed:
+            before_handler = signal.signal(signal.SIGALRM, on_alarm)
+            signal.setitimer(signal.ITIMER_REAL, progress if wait > progress else wait)
+        try:
+            return fn(*a, **kw)
+        finally:
+            if armed:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+    except RecordTimeout as cut:
+        sys.stderr.write(not_recorded_timeout(pr, cut.step) + "\n")
+        return EXIT_ERROR
+    except ledger.LedgerLockTimeout:
+        sys.stderr.write(not_recorded_timeout(pr, ledger.LOCK_STEP) + "\n")
+        return EXIT_ERROR
+    except RECORD_ERRORS_USAGE as err:
+        sys.stderr.write("not recorded: %s\n" % _one_line(str(err), 400))
+        return EXIT_USAGE
+    except record_errors_failed() as err:
+        sys.stderr.write("not recorded: %s\n" % _one_line(str(err), 400))
+        return EXIT_ERROR
+    finally:
+        ledger.step_hook = before_hook
+        if armed and before_handler is not None:
+            signal.signal(signal.SIGALRM, before_handler)
+
+
+def recording(kind, applies=None):
+    """Mark a command function as a recording command of `kind` (`proof`, `verdict`, `review_record`), run under `run_recording`. `applies(args)`
+    says which of its forms record (`review` records only for `review record`). Marked functions are the ONE list: `RECORDING_COMMANDS` is read from them."""
+    def mark(fn):
+        @functools.wraps(fn)
+        def run(*a, **kw):
+            args = a[0] if a else kw.get("args")
+            if applies is not None and not applies(args):
+                return fn(*a, **kw)
+            return run_recording(fn, a, kw, args)
+        run.records = kind
+        return run
+    return mark
+
+
+def is_review_record(args):
+    """`review record` (the only form of `review` that writes)."""
+    return args.review_cmd == "record"
+
+
+def recording_commands():
+    """{command name: kind} of every function marked `@recording`, read from this module (never a list to edit)."""
+    return {name[4:].replace("_", "-"): fn.records for name, fn in sorted(globals().items())
+            if name.startswith("cmd_") and callable(fn) and isinstance(getattr(fn, "records", None), str)}
+
+
 def pr_picture(engine, repo, number, state):
     """(facts, body, notice senders) of a PR, best effort: ({}, "", []) with a reason string when it cannot be read."""
     try:
@@ -21119,6 +21242,7 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False):
     engine, state, config = parts if parts is not None else build_engine(runner, now, "cli", writable=writable)
     repo, number, pr = _ledger_pr(args)
     entries, problem = plan_ledger.read_ledger(state)
+    record_step("a GitHub read of %s" % pr)
     facts, body, senders, unreadable = pr_picture(engine, repo, number, state)
     if writable:   # #770: an item's entries are written only by the item commands
         why = item_entry_refusal(engine, repo, number, entries, unreadable)
@@ -21131,6 +21255,7 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False):
     source = plan_source_for(args.plan, entries, pr, body, config.get("intent_repo"))
     plan, plan_problem = None, None
     if source:
+        record_step("a GitHub read of the plan %s" % source)
         try:
             plan = checked_plan(config, source, args.ask, runner, now)
         except (PlanInputError, ValueError, ConfigError, IntentError) as err:
@@ -21169,12 +21294,13 @@ def _head_of(ctx, args):
 
 
 def _record(ctx, args, now, entry):
-    stored = plan_ledger.append_entry(ctx.state, entry, now())
-    if ctx.engine.audit is not None:
+    """(stored entry, already): the entry written, or the identical one already there (nothing written, no audit line: #1049)."""
+    (stored, already), = plan_ledger.append_once(ctx.state, [entry], now())
+    if not already and ctx.engine.audit is not None:
         ctx.engine.audit.append(ctx.engine.actor, "plan.%s" % entry["kind"], ctx.pr,
                                 {"scenario": entry["scenario"], "result": entry["result"], "seq": stored["seq"], "by": entry["by"],
                                  "chain": stored["hash"]})
-    return stored
+    return stored, already
 
 
 def _evidence(args):
@@ -21191,16 +21317,19 @@ def _already_proven(ctx, sid, plan_hash, head, result):
     return fresh[-1] if fresh and fresh[-1].get("result") == result else None
 
 
+@recording("proof")
 def cmd_prove(args, runner, now):
     """`prove <scenario>... --pr <repo#N> --evidence ...`: the calling agent records what it ran and saw for each named scenario of
     the PR's plan, at the PR's head, bound to the plan's hash. It records a PROOF; it never records a verdict. Each scenario gets one
     line: recorded (stdout), or already recorded at this head and plan hash (stdout, counts as recorded), or refused with its
-    reason (stderr). Exit 0 when every named scenario is recorded; EXIT_PARTIAL when any was refused. What applies to the whole
+    reason (stderr), then ONE final line (#1049): `recorded #<id> ...`, `already recorded #<id> ...` or, when any was refused, `not recorded: ...`.
+    Exit 0 when every named scenario is recorded; EXIT_PARTIAL when any was refused. What applies to the whole
     command (no plan, a failing plan check, no caller, no evidence, an unknown head) stays a usage error: nothing is recorded."""
     ctx = _ledger_context(args, runner, now, True)
+    record_step("the agent registry (who is calling)")
     caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
     _plan_usable(ctx)
-    refused, common = 0, None
+    refused, common, outcomes = 0, None, []
     for sid in dict.fromkeys(args.scenario):
         try:
             _scenario_of(ctx, sid)
@@ -21212,18 +21341,18 @@ def cmd_prove(args, runner, now):
             head = _head_of(ctx, args)
             common = (head, _evidence(args))
         head, evidence = common
-        found = _already_proven(ctx, sid, ctx.plan["plan_hash"], head, args.result)
-        if found:
-            print("already recorded proof #%d: %s %s at %s (%s), bound to plan %s" % (found["seq"], sid, args.result, head[:8], ctx.pr,
-                                                                                  ctx.plan["plan_hash"][:19]))
-            continue
         entry = {"kind": "proof", "pr": ctx.pr, "scenario": sid, "plan_ref": ctx.source,
                  "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
                  "evidence": evidence, "command": plan_ledger.clip(redact_command_text(args.command or "")),
                  "env": "%s %s" % (sys.platform, "python%d.%d" % sys.version_info[:2])}
-        stored = _record(ctx, args, now, entry)
-        print("recorded proof #%d: %s %s at %s (%s), bound to plan %s" % (stored["seq"], sid, args.result,
-                                                                          head[:8], ctx.pr, entry["plan_hash"][:19]))
+        stored, already = _record(ctx, args, now, entry)
+        outcomes.append((stored, already))
+        print("%s proof #%d: %s %s at %s (%s), bound to plan %s" % ("already recorded" if already else "recorded", stored["seq"], sid, args.result,
+                                                                    head[:8], ctx.pr, entry["plan_hash"][:19]))
+    if outcomes:
+        print(recorded_line("proof", ctx.pr, common[0], outcomes))
+    if refused:
+        print("not recorded: %d of %d scenarios refused (the reasons are above)" % (refused, len(set(args.scenario))), file=sys.stderr)
     return EXIT_PARTIAL if refused else EXIT_OK
 
 
@@ -21248,9 +21377,11 @@ def launched_testers_for(ctx):
     return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions, fleets
 
 
+@recording("verdict")
 def cmd_verdict(args, runner, now):
     """`verdict <scenario> --pr <repo#N> --as <evaluator> --result ...`: record the evaluator's verdict for a scenario. Only
-    the evaluator the scenario names, only by an agent registered for it (`plan_evaluators`), never by a writer of the PR."""
+    the evaluator the scenario names, only by an agent registered for it (`plan_evaluators`), never by a writer of the PR.
+    It ends with one line (#1049): `recorded #<id> ...`, `already recorded #<id> ...` (the same record again writes nothing) or `not recorded: <reason>`."""
     ctx = _ledger_context(args, runner, now, True)
     every = bool(getattr(args, "all_scenarios", False))
     if every:   # `--all`: every per-PR scenario this evaluator judges, in one command; never another evaluator's
@@ -21274,11 +21405,13 @@ def cmd_verdict(args, runner, now):
     if named == "owner":
         # The owner's verdict comes only from the owner's own terminal: a caller with NO agent session. An agent (even an
         # unregistered one, even the chief of staff) is refused; so is an uncertain identity.
+        record_step("the agent registry (who is calling)")
         got = gates_caller_kind(runner, now)
         caller, ok = "owner", got[0] == "person"
         why = None if ok else "only the owner, from the owner's own terminal (no agent session), may record `owner` verdicts; %s is %s" % (
             got[1], "an agent" if got[0] == "agent" else "not known")
     else:
+        record_step("the agent registry (who is calling)")
         caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
         if not plan_ledger.known_writers(ctx.entries, ctx.pr, senders):
             raise LedgerCommandError("refused: no writer of %s is known to the switchboard (nobody has recorded a proof or sent its "
@@ -21286,6 +21419,7 @@ def cmd_verdict(args, runner, now):
         allowed, launch, sessions, fleets = ctx.config.get("plan_evaluators"), {}, {}, {}
         authors = plan_ledger.authors_of(ctx.entries, ctx.pr, senders, ctx.facts.get("author"))
         if named == "tester":   # #372: the configured list UNION the testers the launch record names for this repo; any trouble reading it is the configured list alone
+            record_step("the agent registry (the launched testers)")
             launch, sessions, fleets = launched_testers_for(ctx)
             allowed = load_launch_testers().evaluators(allowed, launch)
         ok, why = plan_ledger.may_record_verdict(named, caller, allowed, authors)
@@ -21305,10 +21439,16 @@ def cmd_verdict(args, runner, now):
                 "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
                 "evaluator": named, "evidence": evidence} for target in targets]
     try:
-        stored = plan_ledger.append_many(ctx.state, entries, now())   # all of them or none
+        done = plan_ledger.append_once(ctx.state, entries, now())   # all of the new ones or none; one already there is not written again
+    except plan_ledger.LedgerLockTimeout:
+        raise
     except plan_ledger.LedgerError as err:
         raise LedgerCommandError("%s" % err) from None
-    for entry, one in zip(entries, stored):
+    for entry, (one, already) in zip(entries, done):
+        if already:
+            print("already recorded %s verdict #%d: %s %s at %s (%s), bound to plan %s" % (named, one["seq"], entry["scenario"], args.result,
+                                                                                         head[:8], ctx.pr, entry["plan_hash"][:19]))
+            continue
         if ctx.engine.audit is not None:
             detail = {"scenario": entry["scenario"], "result": entry["result"], "seq": one["seq"], "by": entry["by"], "chain": one["hash"]}
             if named == "tester" and caller in launch and load_launch_testers().source_of(caller, ctx.config.get("plan_evaluators"), launch) == "launch record":
@@ -21316,6 +21456,7 @@ def cmd_verdict(args, runner, now):
             ctx.engine.audit.append(ctx.engine.actor, "plan.verdict", ctx.pr, detail)
         print("recorded %s verdict #%d: %s %s at %s (%s), bound to plan %s" % (named, one["seq"], entry["scenario"], args.result,
                                                                              head[:8], ctx.pr, entry["plan_hash"][:19]))
+    print(recorded_line("%s verdict" % named, ctx.pr, head, done))
     return EXIT_OK
 
 
@@ -23977,15 +24118,18 @@ def record_inputs(raw_argv):
     return _private_parse(raw_argv, DECISION_INPUTS, CARRY_FLAG_INPUTS)
 
 
+@recording("review_record", applies=is_review_record)
 def cmd_review(args, runner, now):
     """`review laws <pr>` (print the laws and overlay from the PR's base commit) and `review record <pr> --reviewer X ...` (a reviewer writes
-    its result per head). Reads GitHub with GETs only; `record` writes the hash-chained ledger and the audit."""
+    its result per head). Reads GitHub with GETs only; `record` writes the hash-chained ledger and the audit, and ends with one line (#1049):
+    `recorded #<id> ...`, `already recorded #<id> ...` or `not recorded: <reason>`."""
     if args.review_cmd == "measure":
         return cmd_review_measure(args, runner, now)
     if args.review_cmd == "checkout":
         return cmd_review_checkout(args, runner, now)
     try:
         engine, state, config = build_engine(runner, now, "cli", writable=args.review_cmd == "record")
+        record_step("a GitHub read of the pull request")
         repo, number, ref, raw = _review_pr(args, engine)
         head = raw.get("headRefOid") if isinstance(raw.get("headRefOid"), str) else None
         if args.review_cmd == "blockers":
@@ -24082,6 +24226,7 @@ def cmd_review(args, runner, now):
         given = args.head or head
         if not (head.startswith(given) or given.startswith(head)) or len(given) < 7:
             raise ReviewError("--head %s is not the PR's head (%s): a record belongs to the head it judged, nothing was recorded" % (given[:12], head[:12]))
+        record_step("the agent registry (who is calling)")
         kind = gates_caller_kind(runner, now)
         if kind[0] == "unknown":
             raise ReviewError("refused: %s" % kind[1])
@@ -24107,20 +24252,27 @@ def cmd_review(args, runner, now):
                         entry["block_" + name] = plan_ledger.clip(redact_command_text(value), 200)
         if impact_class:
             entry["impact_class"] = impact_class   # #451 slice 2: the class of the impact that drives the action; a missing one holds for the owner
-        stored = plan_ledger.append_entry(state, entry, now())
-        if engine.audit is not None:
+        (stored, already), = plan_ledger.append_once(state, [entry], now())   # the same record again writes nothing (#1049)
+        if engine.audit is not None and not already:
             engine.audit.append(engine.actor, "review.record", ref, {"reviewer": reviewer, "verdict": verdict, "head": head[:12],
                                                                     "by": by, "seq": stored["seq"], "chain": stored["hash"]})
         entries, problem = plan_ledger.read_ledger(state)
         got = plan_ledger.review_records_at(entries, ref, head)
-        print("recorded %s review %s at %s (%s): %d of %d reviewers recorded at this head%s" % (
-            reviewer, verdict, head[:8], ref, len(got["recorded"]), len(got["expected"]),
+        print("%s %s review %s at %s (%s): %d of %d reviewers recorded at this head%s" % (
+            "already recorded" if already else "recorded", reviewer, verdict, head[:8], ref, len(got["recorded"]), len(got["expected"]),
             "; missing %s" % ", ".join(got["missing"]) if got["missing"] else ""))
         if reviewer == "impact" and not (entry.get("impact_severity") and entry.get("impact_probability")):
             sys.stderr.write("%s: review: %s\n" % (PROG, NO_SCORE_TEXT))
+        sys.stdout.flush()
+        print(recorded_line("%s review" % reviewer, ref, head, [(stored, already)]))
         return EXIT_OK
+    except plan_ledger.LedgerLockTimeout:
+        raise
     except (ReviewError, plan_ledger.LedgerError, ConfigError, IdentityUncertain, CallerError) as err:
-        sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 700)))
+        if args.review_cmd == "record":   # #1049: a record that did not happen says so, last
+            sys.stderr.write("not recorded: %s\n" % _one_line(str(err), 700))
+        else:
+            sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 700)))
         return EXIT_USAGE
 
 

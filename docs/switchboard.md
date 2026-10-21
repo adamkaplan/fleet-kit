@@ -4248,6 +4248,24 @@ them) and to the PR's **head** (a push voids them; the view shows them as void, 
 | `fleet-switchboard verdict <scenario> --pr <repo#N> --as ci\|tester\|reviewer\|owner --result pass\|fail` | a VERDICT, only as the evaluator the scenario names, only by an agent listed for it in the config key `plan_evaluators`, and never by a writer of the PR |
 | `fleet-switchboard gates <repo#N> [--json]` | nothing: it reads |
 
+#### What a recording command ends with (#1049)
+
+`prove`, `verdict` and `review record` write the ledger, and each ends with ONE final line, so a call that timed out is never mistaken for one that recorded:
+
+| Last line | Meaning | Exit |
+|---|---|---|
+| `recorded #<id> (...)` | the record was written; `<id>` is its row in the ledger (several rows: `recorded #3, #4`) | 0 |
+| `already recorded #<id> (...)` | the same record was already the newest of its kind: nothing was written. The same record is the same pull request, head, scenario, kind, evaluator or reviewer, recording agent and judgement (result and plan hash; for a review, the verdict and the rating). A pass after a fail at one head is a new record. | 0 |
+| `not recorded: <reason>` | a refusal (a head that is not the pull request's, a scenario that does not exist, an evaluator that may not record) or the bound below; nothing was written, the status is not 0 (2 for a refusal, 1 for a timeout) | not 0 |
+
+**The bound.** Every wait of these commands (the ledger lock, each GitHub read, the agent registry that says who is calling) is bounded by ONE constant, `RECORD_WAIT_SECONDS` in `bin/plan_ledger.py` (30 seconds). After `RECORD_PROGRESS_SECONDS` (3) a wait says what it waits for (`waiting for the ledger lock`, `waiting for a GitHub read of ...`). At the bound the command ends:
+
+```text
+not recorded: timed out after 30s, check the ledger before retrying (it was waiting for the ledger lock): run `fleet-switchboard gates acme/app#9`
+```
+
+**Before a retry after a timeout, run that read-only command** (`fleet-switchboard gates <repo#N>`, which lists the proofs, verdicts and reviews held for the pull request at its head): if the record is there, it landed. A retry of a record that did land prints `already recorded #<id>` and writes nothing, so retrying is safe either way. The alarm is held back while an entry is written, so a command is never cut after its record landed. Before this change the ledger lock was the one wait with no bound (a held lock made a call wait until the caller killed it, which printed nothing), while the GitHub reads (8 seconds each) and the daemon start (2 seconds) already ended on their own.
+
 **The plan is the PR's, not the writer's:** the `PLAN: <link>` line of the PR body, else the plan of the PR's first ledger entry. `--plan` may only repeat it (or name the first plan when there is none yet); a different one is refused. Change the plan by changing the PR body's `PLAN:` line, which voids the earlier entries (the view says `PLAN CHANGED`). The plan's hash is computed from the GitHub text at that link.
 
 **Who may be an evaluator is configuration, and the default is nobody.** `plan_evaluators` maps an evaluator to fleet agent
