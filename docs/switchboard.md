@@ -4051,6 +4051,14 @@ into individual model calls; forking sessions; changes to `fleet-heartbeat`.
   looks beside the config that process reads, while the daemon (which feeds the judge and the note) and `install`
   use the daemon's own. Read the file from a plain shell, or with `cos_orders_file` set to one absolute path.
 
+## The agent registry: reconcile on read, and what a view draws (#903)
+
+Every view (`status`, the sidebar) reads the one agent registry (`registry.json`). A view that finds an agent recorded `dead` asks herdr right then, and removes the agent through `registry.reconcile_remove` only when a whole `pane list` no longer holds its pane (`bin/agent_reconcile.py`). No scheduled pass removes an agent this way, and a read that is not whole removes nothing.
+
+**The rule: a view never draws a DEAD row.** It draws a live state or nothing, never `?` and never `dead`. A registry that is torn or cannot be read is not drawn as an empty fleet: the view says `could not be read`.
+
+**A known limit.** A dead agent the reconcile cannot remove (herdr is unreachable, so there is no evidence of death, while the pane is still listed in the registry) stays in the registry and is drawn nowhere in `status` or the sidebar. Only the daemon's wake for a dead pane names it. It leaves the registry at the next view that can reach herdr and show it gone.
+
 ## Forwarder status (#77)
 
 A forwarder's websocket drops are normal: the supervisor restarts it in 5 s and a catch-up read follows. `status`
