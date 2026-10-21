@@ -36890,12 +36890,13 @@ class TestImpactHold(LedgerBase):
         for name in (sb.plan_ledger.LEDGER_FILE, sb.plan_ledger.HEAD_FILE):
             self.world.state.joinpath(name).unlink(missing_ok=True)
 
-    def rate(self, severity, probability, reason="", role="reviewer", head=LEDGER_HEAD, pr="acme/app#9", action="auto", with_block=True, by="rev"):
+    def rate(self, severity, probability, reason="", role="reviewer", head=LEDGER_HEAD, pr="acme/app#9", action="auto", with_block=True, by="rev", digest=None):
         """Record a rating. `action` "auto" is the action of the cell (a helper that only emits VALID shapes: it hides a bad state, so every bad-shape test passes an explicit action or builds the raw record), None omits it."""
         entry = {"kind": "review_record", "pr": pr, "head": head, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": by, "by_role": role,
                  "impact_severity": severity, "impact_probability": probability, "impact_reason": reason}
         if with_block:   # #901: the rating carries the agent's block (its hash and its own rating lines), as `review record --block` keeps them
-            entry.update(block_sha256="a" * 64, block_size=200, block_impact_severity=severity, block_impact_probability=probability)
+            self.hash_count = getattr(self, "hash_count", 0) + 1
+            entry.update(block_sha256=digest or "%064x" % self.hash_count, block_size=200, block_impact_severity=severity, block_impact_probability=probability)
         else:
             entry["block_sha256"] = "none"
         cell = (sb.impact_floor.load_matrix()["cells"].get(severity) or {}).get(probability)
@@ -36905,7 +36906,8 @@ class TestImpactHold(LedgerBase):
             entry["impact_action"] = action
         stored = sb.plan_ledger.append_entry(self.world.state, entry, self.world.clock.now())
         if self.TWIN and with_block and by == "rev" and role == "reviewer" and head == LEDGER_HEAD:   # #972: a clear by score needs a second counted run from another session: the earlier fixtures get one beside the first, same cell (a test of the two-run rule itself sets TWIN False)
-            twin = sb.plan_ledger.append_entry(self.world.state, dict(entry, by="rev2"), self.world.clock.now())
+            self.hash_count += 1
+            twin = sb.plan_ledger.append_entry(self.world.state, dict(entry, by="rev2", block_sha256="%064x" % self.hash_count), self.world.clock.now())
             level = (sb.impact_floor.load_matrix()["cells"].get(severity) or {}).get(probability, {}).get("level")
             if level:
                 self.twin_runs = (self.twin_runs or []) + [(stored["seq"], "rev", level), (twin["seq"], "rev2", level)]
@@ -36989,10 +36991,10 @@ class TestImpactHold(LedgerBase):
 
     # ---- #972: a clear by score rests on two independent runs at the head
 
-    def two(self, a, b, by=("rev", "rev2"), blocks=(True, True), heads=(LEDGER_HEAD, LEDGER_HEAD)):
+    def two(self, a, b, by=("rev", "rev2"), blocks=(True, True), heads=(LEDGER_HEAD, LEDGER_HEAD), digests=(None, None)):
         """Two ratings (levels `a`, `b`); returns the reason naming both runs by ledger id and cell."""
         self.TWIN = False
-        ids = [self.rate(*self.cell_of(level), by=who, with_block=blk, head=h)["seq"] for level, who, blk, h in zip((a, b), by, blocks, heads)]
+        ids = [self.rate(*self.cell_of(level), by=who, with_block=blk, head=h, digest=d)["seq"] for level, who, blk, h, d in zip((a, b), by, blocks, heads, digests)]
         return "both runs agree on it: #%d=%s, #%d=%s" % (ids[0], a, ids[1], b)
 
     def refused(self, code, err, *words):
@@ -37016,6 +37018,51 @@ class TestImpactHold(LedgerBase):
         reason = self.two("Low", "Low", by=("rev", "rev"))
         code, out, err = self.under(reason=reason)
         self.refused(code, err, "1 session", "2 required")
+
+    def test_972_one_run_under_two_identities_is_refused_for_each_variant(self):
+        same = "c" * 64
+        for label, by, digests, words in (("same block hash, two names", ("rev", "rev2"), (same, same), "1 independent run"),
+                                          ("case variant of one name", ("rev", "REV"), (None, None), "1 session"),
+                                          ("space variant of one name", ("rev", " rev "), (None, None), "1 session"),
+                                          ("same name, same hash", ("rev", "rev"), (same, same), "1 session")):
+            with self.subTest(label):
+                self.writes.clear()
+                self.score_config("Serious")
+                self.scored_pr()
+                reason = self.two("Low", "Low", by=by, digests=digests)
+                code, out, err = self.under(reason=reason)
+                self.assertEqual((code, self.deletes()), (2, []), err)
+                self.assertIn(words, err)
+                self.ledger_reset()
+        self.writes.clear()
+        self.score_config("Serious")
+        self.scored_pr()
+        reason = self.two("Low", "Low", by=("rev", "other"), digests=("d" * 64, "e" * 64))
+        code, out, err = self.under(reason=reason)
+        self.assertEqual(code, 0, (reason, err))
+
+    def test_972_pick_runs_skips_a_second_record_of_the_same_session(self):
+        module = sb.load_module("delegated_clear")
+        def rec(seq, by, digest):
+            return {"seq": seq, "by": by, "block_sha256": digest * 64}
+        counted = [(3, "Serious", rec(1, "a", "1")), (3, "Serious", rec(2, "a", "2")), (2, "Medium", rec(3, "b", "3"))]
+        runs = module.pick_runs(counted)
+        self.assertEqual([(r["id"], r["by"], r["cell"]) for r in runs], [(1, "a", "Serious"), (3, "b", "Medium")])
+        self.assertEqual([r["id"] for r in module.pick_runs([(3, "S", rec(1, "a", "1")), (3, "S", rec(2, "A ", "2")), (2, "M", rec(3, "b", "1")), (1, "L", rec(4, "c", "4"))])], [1, 4])
+        self.assertEqual(module.pick_runs([(1, "L", {"by": "a", "block_sha256": "1" * 64}), (1, "L", rec(5, "b", "2"))])[0]["id"], 5, "a record with no ledger id is never named")
+
+    def test_972_reason_problems_refuses_unless_exactly_the_required_independent_runs_are_given(self):
+        module = sb.load_module("delegated_clear")
+        one = {"id": 1, "by": "a", "hash": "1" * 64, "cell": "Low"}
+        two = {"id": 2, "by": "b", "hash": "2" * 64, "cell": "Low"}
+        ok = "#1=Low, #2=Low"
+        self.assertEqual(module.reason_problems(ok, [one, two]), [])
+        for label, runs in (("none", []), ("not a list", None), ("one", [one]), ("three", [one, two, dict(two, id=3, by="c", hash="3" * 64)]),
+                            ("same hash", [one, dict(two, hash=one["hash"])]), ("name variant", [one, dict(two, by=" A ")]), ("no id", [one, dict(two, id=None)]), ("no hash", [one, dict(two, hash=None)])):
+            self.assertTrue(module.reason_problems(ok, runs), label)
+        self.assertEqual(module.reason_problems("anything", []) != [], True)
+        for contradiction in ("#1=Low, a=Medium, #2=Low", "a=Low, #1=Medium, #2=Low", "#1=Low, #2=Low, b=Serious"):
+            self.assertTrue(any("wrong cell" in p for p in module.reason_problems(contradiction, [one, two])), contradiction)
 
     def test_972_a_record_without_a_block_is_not_counted(self):
         self.score_config("Serious")
@@ -37106,7 +37153,7 @@ class TestImpactHold(LedgerBase):
             got = module.judge(block, cells, entries, report, "Serious", module.RUNS_REQUIRED)
             self.assertEqual(len([e for e in entries if module.counts_by_block(e)]), 1, label)
             self.assertTrue(any("1 counted" in r for r in got["reasons"]), (label, got))
-        two = module.judge(block, cells, [good, dict(good, seq=2, by="y")], report, "Serious", module.RUNS_REQUIRED)
+        two = module.judge(block, cells, [good, dict(good, seq=2, by="y", block_sha256="b" * 64)], report, "Serious", module.RUNS_REQUIRED)
         self.assertEqual((two["reasons"], len(two["runs"])), ([], 2))
         self.assertEqual(module.judge(block, cells, [good], report, "Serious")["reasons"], [], "the default asks one run: the pure judge's old contract")
 

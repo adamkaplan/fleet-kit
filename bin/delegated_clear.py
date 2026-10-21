@@ -221,41 +221,60 @@ def judge(block, cells, entries, report, threshold, runs_required=1):
         reasons.append("the score %s is above the threshold %s" % (level, threshold))
     runs = pick_runs(counted)
     if not reasons and runs_required > 1:   # #972: only a score the order would allow is asked for its corroboration; a score above the threshold is refused by score, not by count
-        sessions = {e.get("by") for _, _, e in counted if isinstance(e.get("by"), str) and e.get("by")}
+        head8 = str(report.get("head"))[:8]
+        sessions = {run_name(e.get("by")) for _, _, e in counted if run_name(e.get("by"))}
         if len(counted) < runs_required:
-            reasons.append("%d counted impact rating%s at %s, %d required: a clear by score needs a second independent run at this head with the agent's block" % (len(counted), "" if len(counted) == 1 else "s", str(report.get("head"))[:8], runs_required))
+            reasons.append("%d counted impact rating%s at %s, %d required: a clear by score needs a second independent run at this head with the agent's block" % (len(counted), "" if len(counted) == 1 else "s", head8, runs_required))
         elif len(sessions) < runs_required:
-            reasons.append("%d session found rating at %s (%d counted ratings), %d required: the runs must come from different rater sessions" % (len(sessions), str(report.get("head"))[:8], len(counted), runs_required))
+            reasons.append("%d session found rating at %s (%d counted ratings), %d required: the runs must come from different rater sessions (a name differing only by case or spaces is the same session)" % (len(sessions), head8, len(counted), runs_required))
+        elif len(runs) < runs_required:
+            reasons.append("%d independent run found at %s (%d counted ratings), %d required: two records with the same block hash are one run, and a record with no ledger id cannot be named" % (len(runs), head8, len(counted), runs_required))
     return {"level": level, "reasons": reasons, "runs": runs}
 
 
+def run_name(by):
+    """The rater's recorded name as a run identity: stripped and lower-cased; "" when it is not a name. #972."""
+    return by.strip().lower() if isinstance(by, str) else ""
+
+
+def run_identity(run):
+    """(name, block hash) of a run: the ONE place a run's identity is decided. Two runs are independent only when BOTH parts differ. #972."""
+    return run_name(run.get("by")), run.get("hash")
+
+
+def runs_independent(runs):
+    """True when `runs` are exactly RUNS_REQUIRED runs, each with a name, a ledger id and a block hash, whose names AND hashes are all distinct. #972."""
+    if not isinstance(runs, list) or len(runs) != RUNS_REQUIRED or not all(isinstance(r, dict) for r in runs):
+        return False
+    ids = [run_identity(r) for r in runs]
+    return (all(n and isinstance(h, str) and h for n, h in ids) and all(isinstance(r.get("id"), int) and not isinstance(r.get("id"), bool) for r in runs)
+            and len({n for n, _ in ids}) == len(ids) and len({h for _, h in ids}) == len(ids))
+
+
 def pick_runs(counted):
-    """[{"id": ledger seq, "by": the recorded session, "cell": the level}] of the two runs a clear names: the highest counted record, then the highest counted one from a DIFFERENT session. `counted` is sorted highest first. #972."""
+    """[{"id": ledger seq, "by": the recorded session, "hash": the block hash, "cell": the level}] of the runs a clear names: the highest counted record, then the highest counted one whose name AND block hash both differ from every run already picked (one draw recorded twice, or one session under two spellings, is one run). A record with no ledger id is skipped. `counted` is sorted highest first. #972."""
     runs = []
     for _, level, e in counted:
-        if any(r["by"] == e.get("by") for r in runs) or not isinstance(e.get("by"), str):
+        seq, name, digest = e.get("seq"), run_name(e.get("by")), e.get("block_sha256")
+        if not isinstance(seq, int) or isinstance(seq, bool) or not name or any(run_name(r["by"]) == name or r["hash"] == digest for r in runs):
             continue
-        runs.append({"id": e.get("seq"), "by": e.get("by"), "cell": level})
+        runs.append({"id": seq, "by": e.get("by"), "hash": digest, "cell": level})
         if len(runs) == RUNS_REQUIRED:
             break
     return runs
 
 
 def reason_problems(reason, runs):
-    """[problems] when `reason` does not name every run in `runs` as `#<id>=<cell>` or `<rater>=<cell>` with the record's own cell. #972."""
+    """[problems] unless `runs` are exactly RUNS_REQUIRED independent runs (`runs_independent`) and `reason` names each as `#<id>=<cell>` or `<rater>=<cell>`, every such `name=cell` for a run agreeing with the record's own cell. #972."""
+    if not runs_independent(runs):
+        return ["the reason cannot be checked: a clear by score needs exactly %d independent runs (distinct block hash and distinct rater name), %d given" % (RUNS_REQUIRED, len(runs) if isinstance(runs, list) else 0)]
     problems = []
     for r in runs:
-        names = ["#%s" % r["id"], r["by"]] if r.get("id") is not None else [r["by"]]
-        found = None
-        for n in names:
-            m = re.search(r"(?<![\w#-])%s\s*=\s*([A-Za-z]+)" % re.escape(n), reason or "")
-            if m:
-                found = m
-                break
+        found = [m.group(1) for n in ("#%s" % r["id"], r["by"]) for m in re.finditer(r"(?<![\w#-])%s\s*=\s*([A-Za-z]+)" % re.escape(n), reason or "")]
         if not found:
             problems.append("the reason does not name run #%s (%s) with its cell: write `#%s=%s`" % (r["id"], r["by"], r["id"], r["cell"]))
-        elif found.group(1).lower() != str(r["cell"]).lower():
-            problems.append("the reason names run #%s with the wrong cell %s (its cell is %s)" % (r["id"], found.group(1), r["cell"]))
+        elif any(c.lower() != str(r["cell"]).lower() for c in found):
+            problems.append("the reason names run #%s with the wrong cell %s (its cell is %s)" % (r["id"], next(c for c in found if c.lower() != str(r["cell"]).lower()), r["cell"]))
     return problems
 
 
