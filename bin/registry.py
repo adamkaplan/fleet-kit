@@ -31,6 +31,8 @@ STATES = ("working", "blocked", "idle", "detached", "dead")
 AGENT_FIELDS = ("session", "pane", "role", "charter", "repo", "workspace", "cwd")   # the seven fields the old readers use
 RECORD_FIELDS = ("pane", "role", "charter", "repo", "workspace", "cwd")             # what a retirement keeps of an agent row
 LOCK_SECONDS = 5
+BELL_MIGRATED = "bell-migrated.json"   # written once the one-time migration of the live bell state into the `bell` field has run
+BELL_DEFAULT = False   # a record with no `bell` field: the heartbeat's opt-in is OFF until `set_bell` (or `fleet-heartbeat bell NAME on`) turns it on; the ONE place the default lives
 
 
 def _version_line(found):
@@ -355,12 +357,65 @@ def upsert(state_dir, name, agent, now=None):
         old = doc["agents"].get(name)
         if covers(doc["retired"].get(name), (agent or {}).get("session")):
             return False, [], "%s is retired for this session" % name
-        new = _agent(dict(agent or {}), (old or {}).get("state") or "idle", (old or {}).get("since") or _stamp(now))
+        fields = dict(agent or {})
+        if "bell" not in fields:
+            fields["bell"] = old["bell"] if isinstance((old or {}).get("bell"), bool) else BELL_DEFAULT   # a pass that records state never forgets the opt-in a person set; a NEW agent gets the field
+        new = _agent(fields, (old or {}).get("state") or "idle", (old or {}).get("since") or _stamp(now))
         if old == new:
             return False, [], None
         doc["agents"][name] = new
         return True, [{"event": "update" if old else "add", "name": name}] if not old else [], None   # an audit line on add only: a change of state is no event
     return _mutate(state_dir, change, now)
+
+
+def bell_of(agent):
+    """The heartbeat's opt-in of an Agent: its `bell` field when it is a bool, else BELL_DEFAULT. Supervision POLICY: it says who is nudged, never who exists."""
+    value = agent.get("bell") if isinstance(agent, dict) else None
+    return value if isinstance(value, bool) else BELL_DEFAULT
+
+
+def set_bell(state_dir, name, on):
+    """Set the heartbeat's opt-in of a recorded agent. An agent that is not recorded is refused (it does not exist; nothing is added). NO CHURN."""
+    def change(doc):
+        row = doc["agents"].get(name)
+        if row is None:
+            return False, [], "%s is not a recorded agent" % name
+        if row.get("bell") is on:
+            return False, [], None
+        row["bell"] = bool(on)
+        return True, [{"event": "bell", "name": name, "bell": bool(on)}], None
+    return _mutate(state_dir, change)
+
+
+def bell_migrated(state_dir):
+    return (Path(state_dir) / BELL_MIGRATED).exists()
+
+
+def migrate_bell(state_dir, belled_panes, whole, now=None):
+    """The ONE-TIME migration (#973): write `bell` for every recorded agent that has none, true when its pane is in `belled_panes` (the live bell state the
+    caller read ONCE), else false; each write is audited (`bell_migrated`); then the marker file is written and it never runs again. Refuses unless `whole`
+    is True (the caller's live read was whole: nothing written, no marker, tried again next pass). Returns {"changed": n, "problem": ...}."""
+    if bell_migrated(state_dir):
+        return {"changed": 0, "problem": None, "ran": False}
+    if whole is not True:
+        return {"changed": 0, "problem": "the live read was not whole: nothing migrated", "ran": False}
+    count = [0]
+
+    def change(doc):
+        events = []
+        for name, row in sorted(doc["agents"].items()):
+            if isinstance(row, dict) and not isinstance(row.get("bell"), bool):
+                row["bell"] = row.get("pane") in belled_panes
+                events.append({"event": "bell_migrated", "name": name, "bell": row["bell"]})
+        count[0] = len(events)
+        return bool(events), events, None
+    got = _mutate(state_dir, change, now)
+    if got["problem"] is None:
+        try:
+            _write_atomic(Path(state_dir) / BELL_MIGRATED, json.dumps({"at": _stamp(now), "agents": count[0]}) + "\n")
+        except OSError as err:
+            return {"changed": count[0], "problem": "marker not written (%s)" % (getattr(err, "strerror", None) or type(err).__name__), "ran": True}
+    return {"changed": count[0], "problem": got["problem"], "ran": True}
 
 
 def reconcile_remove(state_dir, name, evidence, whole):
