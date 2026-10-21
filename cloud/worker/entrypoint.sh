@@ -81,12 +81,13 @@ H
     exit 1
   fi
   cat "$guard" > "$bin/cw-guard"; chmod 755 "$bin/cw-guard"
-  real_gh=$(command -v gh || true)
+  real_gh="${CW_GH_CLIENT:-/usr/local/bin/cw-gh}"   # the pod's own client: the real gh is not in the image
+  [ -x "$real_gh" ] || real_gh=""
   real_git=$(command -v git || true)
   if [ -n "$real_gh" ]; then
     cat > "$bin/gh" <<H
 #!/bin/sh
-# refuse the six (exit 3, one line), then run gh. The token is read for this one call and lives only in the environment of that gh process
+# refuse the six (exit 3, one line), then run the pod's GitHub client (cw-gh). The token is read for this one call and lives only in the environment of that process
 "$bin/cw-guard" gh "\$@" || exit \$?
 tok=\$({ tr -d '\\r\\n' < "$tokfile"; } 2>/dev/null) || tok=""
 if [ -z "\$tok" ]; then echo "worker: the git token file is unreadable or empty" >&2; exit 1; fi
