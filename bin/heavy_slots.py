@@ -56,6 +56,7 @@ QUEUE_FILE = "heavy-queue.json"          # the arrival order of the waiters
 QUEUE_LOCK = "heavy-queue.lock"
 QUEUE_MAX = 1000                        # entries read; more reads as a corrupt file
 QUEUE_BYTES = 262144
+LAST_SEEN_MAX = 120                     # characters of the last line a waiter wrote that a lost-waiter record keeps
 TEMPORARY_NAME = re.compile(r"heavy-queue\.json\.([0-9]{1,9})\.tmp", re.ASCII)   # a temporary file of the order, with the pid of the process that wrote it
 HARD_MAX_SECONDS = 14400                # the longest any run may hold a slot (4 h); a request above it, or 0, reads as this: a bound always exists
 ORPHAN_LOCK = "heavy-orphan.lock"       # held (not blocking) by whoever is stopping an orphan, so two checkers never stop and report the same one
@@ -345,7 +346,8 @@ class Line:
     An entry is {"pid", "start", "name", "short"}, in arrival order; an entry whose process is gone is dropped at the next look, so a dead waiter never blocks the
     ones behind it. The waiter at the head of the line is the only one that tries an ordinary slot: a slot that frees goes to the one that has waited longest."""
 
-    def __init__(self, state_dir, name, short=False, pid=None, alive=_alive, start_of=_process_start, lock_tries=50, lock_pause=0.02, slots=DEFAULT_SLOTS, held=None, note=None, meta=None):
+    def __init__(self, state_dir, name, short=False, pid=None, alive=_alive, start_of=_process_start, lock_tries=50, lock_pause=0.02, slots=DEFAULT_SLOTS, held=None, note=None, meta=None, lost=None, now=time.time):
+        self.lost, self.now = lost, now   # `lost(info)` is told of each waiter whose process died while it was queued (once: the entry is dropped)
         self.meta = dict(meta or {})   # what a refusal reads of an entry (kind, worktree, program, since); never what decides the order
         self.dir, self.name, self.short = str(state_dir), name, bool(short)
         if not os.path.isdir(self.dir):
@@ -457,7 +459,16 @@ class Line:
         try:
             entries = self._read()
             holding = self.held()
-            kept = [entry for entry in entries if self._mine(entry) or (entry["pid"] not in holding and self._still_there(entry))]
+            kept, gone = [], []
+            for entry in entries:
+                if self._mine(entry):
+                    kept.append(entry)
+                elif entry["pid"] in holding:
+                    continue   # it took a slot: its ticket is no place in the line (and it is not lost)
+                elif self._still_there(entry):
+                    kept.append(entry)
+                else:
+                    gone.append(entry)   # its process is gone and it never took a slot: a waiter that was killed
             if join and not any(self._mine(entry) for entry in kept):
                 reason = second_job_check([entry for entry in kept if not self._mine(entry)]) if second_job_check is not None else None
                 if reason:
@@ -465,9 +476,45 @@ class Line:
                 kept.append(dict(self.meta, pid=self.pid, start=self.start, name=_plain(self.name, 40), short=self.short))
             if kept != entries:
                 self._write(kept)
+                for entry in gone:
+                    self._lost(entry)
             return kept
         except OSError as err:
             raise QueueUnusable(err.strerror or str(err))
+        finally:
+            os.close(lock)
+
+    def _lost(self, entry):
+        """Tell `lost` of a waiter that died in the line: its name, the seconds it had waited and the last line it wrote (fixed words and numbers, never an argument). Never raises."""
+        if self.lost is None:
+            return
+        try:
+            now = self.now()
+            since, seen = entry.get("since"), entry.get("seen")
+            number = lambda value: isinstance(value, (int, float)) and not isinstance(value, bool)
+            self.lost({"name": _plain(entry.get("name", "?"), 40), "waited_seconds": max(0, int(now - since)) if number(since) else 0, "last_seen": _plain(entry.get("last", ""), LAST_SEEN_MAX),
+                       "last_seen_age_seconds": max(0, int(now - seen)) if number(seen) else None})
+        except Exception as err:
+            self.note("heavy: could not report a lost waiter (%s)\n" % type(err).__name__)
+
+    def heard(self, text):
+        """Keep the last line this waiter wrote (and when) in its ticket, so that when it dies in the line the record says what it last said. Never raises."""
+        if not self.joined:
+            return
+        try:
+            lock = self._locked()
+        except OSError:
+            return
+        try:
+            entries = self._read()
+            changed = False
+            for entry in entries:
+                if self._mine(entry):
+                    entry["last"], entry["seen"], changed = _plain(text, LAST_SEEN_MAX), int(self.now()), True
+            if changed:
+                self._write(entries)
+        except (OSError, QueueUnusable):
+            pass
         finally:
             os.close(lock)
 
@@ -873,6 +920,7 @@ def record_stop(info, holder, audit, note=None):
     """The audit line `heavy.stopped`, written BEFORE the stop (holder as the subject; detail: kind, ran_seconds, ceiling_seconds, pid, reason, source: fixed words and
     numbers, never the environment or an argument). A sink that fails never prevents the stop: the failure is said on `note` instead."""
     detail = {"kind": info["kind"], "ran_seconds": info["ran_seconds"], "ceiling_seconds": info["ceiling_seconds"], "pid": info["pid"], "reason": "time", "source": info["source"]}
+    detail.update({key: info[key] for key in ("slot", "waited_seconds") if key in info})   # a run that held a slot says which and how long it waited for it (the ceiling never counts that wait)
     try:
         audit("heavy.stopped", holder, detail)
     except Exception as err:
@@ -880,11 +928,23 @@ def record_stop(info, holder, audit, note=None):
             note("heavy: could not write the audit line heavy.stopped (%s): the run is stopped all the same\n" % _plain("%s: %s" % (type(err).__name__, err), 120))
 
 
+def record_lost(info, audit, note=None):
+    """The audit line `heavy.lost`: a wrapper that died while it waited in the line (its name as the subject; detail: waited_seconds, last_seen, last_seen_age_seconds,
+    reason, source). A sink that fails is said on `note` and never raises."""
+    detail = {"reason": "wrapper gone while queued", "waited_seconds": info["waited_seconds"], "last_seen": info["last_seen"], "last_seen_age_seconds": info["last_seen_age_seconds"], "source": "queue"}
+    try:
+        audit("heavy.lost", info["name"], detail)
+    except Exception as err:
+        if note is not None:
+            note("heavy: could not write the audit line heavy.lost (%s)\n" % _plain("%s: %s" % (type(err).__name__, err), 120))
+
+
 def tell_lane(info, holder, lane, send, audit, hard_max=HARD_MAX_SECONDS, note=None):
     """After the stop: tell the lane ONCE (`send(lane, text)` returns one of STOP_TOLD; an error reads as "failed") and write the audit line `heavy.lane_told` (pid and what
     the lane was told). Fixed words and numbers only. Neither can change the stop or the exit code. Returns what the lane was told."""
-    text = ("heavy: your %s run (pid %d) was stopped after %d s; its ceiling was %d s (FLEET_HEAVY_MAX_SECONDS or heavy --ceiling asks for more, up to %d)"
-            % (info["kind"], info["pid"], info["ran_seconds"], info["ceiling_seconds"], hard_max))
+    waited = " (waited %d s for the slot first; the ceiling counts only the run)" % info["waited_seconds"] if "waited_seconds" in info else ""
+    text = ("heavy: your %s run (pid %d) was stopped after %d s%s; its ceiling was %d s (FLEET_HEAVY_MAX_SECONDS or heavy --ceiling asks for more, up to %d)"
+            % (info["kind"], info["pid"], info["ran_seconds"], waited, info["ceiling_seconds"], hard_max))
     try:
         told = send(lane, text)
     except Exception:
@@ -943,7 +1003,9 @@ def check_orphans(state_dir, slots=DEFAULT_SLOTS, config=None, clock=time.time, 
         if ran <= ceiling:
             continue
         pid = info.get("pid") if _whole(info.get("pid"), 2, PID_MAX) else 0
-        report = {"kind": kind, "ran_seconds": int(ran), "ceiling_seconds": ceiling, "pid": pid, "source": "orphan"}
+        report = {"kind": kind, "ran_seconds": int(ran), "ceiling_seconds": ceiling, "pid": pid, "source": "orphan", "slot": index}
+        if _whole(info.get("waited"), 0, 10 ** 9):
+            report["waited_seconds"] = info["waited"]
         holder, lane = _plain(info.get("name", "?")), _plain(info.get("lane", info.get("name", "?")))
         first = not _reported(state_dir, index, info)
         hooked = []
@@ -1074,7 +1136,8 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
     try:
         if unslotted is None:
             try:
-                queue = Line(state_dir, name, short, **dict({"slots": slots, "note": out.write, "meta": {"kind": kind, "worktree": where, "program": program_of(command), "since": int(started)}}, **(line or {})))
+                lost = (lambda info: on_stop("lost", info, info["name"], info["name"])) if on_stop is not None else None
+                queue = Line(state_dir, name, short, **dict({"slots": slots, "note": out.write, "lost": lost, "meta": {"kind": kind, "worktree": where, "program": program_of(command), "since": int(started)}}, **(line or {})))
             except OSError:
                 queue = None
         while unslotted is None:
@@ -1119,10 +1182,14 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
                     pass
                 held = holders(state_dir, slots)
                 where = ", place %d in line (%d ahead)" % (place, place - 1) if place is not None else ""
-                out.write("heavy: waiting for a slot (%d of %d busy: %s)%s\n" % (len(held), slots, _describe(held), where))
+                said = "heavy: waiting for a slot (%d of %d busy: %s)%s\n" % (len(held), slots, _describe(held), where)
+                out.write(said)
+                if queue is not None:
+                    queue.heard(said.strip())
                 out.flush()
                 next_report = now + every
             sleep(POLL_SECONDS)
+        waited = max(0, int(clock() - started)) if fd is not None else 0   # the queue wait: never part of the ceiling (the watchdog starts with the command)
         if fd is not None and where:   # visible as a slot holder BEFORE it leaves the line, so a second full-suite job never finds it in neither (the full record follows)
             _record(fd, name, os.getpid(), command[0], clock(), {"kind": kind, "worktree": where, "program": program_of(command)})
         if queue is not None and not (queue.leave() or queue.leave()):   # it has its slot (or none will come): out of the line at once; one more try before it says so
@@ -1133,7 +1200,7 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
         if fd is not None and short and index == EXPRESS:   # the express slot's own time ceiling (an environment value may only make it shorter)
             max_seconds = min(max_seconds, EXPRESS_SECONDS)
         lane = holder_name(environ)
-        extra = {"kind": kind, "ceiling": max_seconds, "lane": lane, "wstart": _own_start() if fd is not None else "", "worktree": where, "program": program_of(command)}
+        extra = {"kind": kind, "ceiling": max_seconds, "lane": lane, "wstart": _own_start() if fd is not None else "", "waited": waited, "worktree": where, "program": program_of(command)}
         if fd is not None:
             _record(fd, name, os.getpid(), command[0], clock(), extra)   # at once, so a killed holder's old record is never shown for this one
             os.set_inheritable(fd, True)   # the command keeps the lock: the slot is busy while it runs, whatever happens to this wrapper
@@ -1153,7 +1220,10 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
                 pass
         lock = slot_path(state_dir, index) if fd is not None else None
         def stop_info():
-            return {"kind": kind, "ran_seconds": dog.ran, "ceiling_seconds": max_seconds, "pid": child["p"].pid, "source": "wrapper"}
+            info = {"kind": kind, "ran_seconds": dog.ran, "ceiling_seconds": max_seconds, "pid": child["p"].pid, "source": "wrapper"}
+            if fd is not None:
+                info.update(slot=index, waited_seconds=waited)
+            return info
 
         def decided():   # before the first signal: the audit line
             if on_stop is not None:

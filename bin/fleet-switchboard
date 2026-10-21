@@ -25282,6 +25282,8 @@ def heavy_stop_reporter(module, config, make_engine, actor):
     def on_stop(phase, info, holder, lane):
         if phase == "decided":
             module.record_stop(info, holder, audit, sys.stderr.write)
+        elif phase == "lost":   # a waiter died in the line: one audit line, no message (nobody is running)
+            module.record_lost(info, audit, sys.stderr.write)
         else:
             module.tell_lane(info, holder, lane, send, audit, module.ceiling_table(config)["max"], sys.stderr.write)
     return on_stop
@@ -25760,7 +25762,16 @@ def add_agents_parsers(sub):
 JOB_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 JOB_DEAD = "job.dead"
 JOBS_DIR_ENV = "FLEET_JOBS_DIR"
-JOB_WRAPPER = 'exit_path=$1; shift; "$@"; code=$?; printf "%s\\n" "$code" > "$exit_path.tmp" && mv "$exit_path.tmp" "$exit_path"'
+# The wrapper runs the command in the background and waits, so that a signal it can catch (TERM, HUP, INT) is handled at once: it writes the reason ("signal N") and the
+# exit code 128+N, passes the stop on to the command (INT as TERM: a background command ignores INT) and ends. A signal that cannot be caught leaves neither file: the daemon says "unknown".
+JOB_WRAPPER = ('exit_path=$1; shift; '
+               'finish() { printf "%s\\n" "$1" > "$exit_path.tmp" && mv "$exit_path.tmp" "$exit_path"; }; '
+               'caught() { printf "signal %s\\n" "$1" > "$exit_path.reason"; kill -"${2:-$1}" "$child" 2>/dev/null; finish "$((128 + $1))"; exit "$((128 + $1))"; }; '
+               'trap "caught 15" TERM; trap "caught 1" HUP; trap "caught 2 15" INT; '
+               '"$@" & child=$!; wait "$child"; code=$?; finish "$code"; exit "$code"')
+JOB_ENDED_MARK = "ended-recorded"   # in the job's directory: the one audit line of how it ended is written once
+JOB_LAST_SEEN_MAX = 160
+JOB_TAIL_BYTES = 4096
 
 
 JOB_SCAN_MAX = 200   # the most job directories one daemon pass looks at
@@ -25809,7 +25820,7 @@ def job_write_atomic(path, text):
 
 def job_paths(name, root=None):
     base = Path(root or jobs_dir()) / name
-    return {"dir": base, "record": base / "job.json", "log": base / "out.log", "exit": base / "exit", "collected": base / "collected"}
+    return {"dir": base, "record": base / "job.json", "log": base / "out.log", "exit": base / "exit", "collected": base / "collected", "reason": base / "exit.reason", "marker": base / JOB_ENDED_MARK}
 
 
 def job_process_token(pid):
@@ -25857,6 +25868,86 @@ def job_state(record, root=None):
     return "alive", None
 
 
+def boot_time():
+    """When the machine last started, in epoch seconds, or None when it cannot be read (Linux /proc/stat, else the BSD/macOS `sysctl kern.boottime`)."""
+    try:
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        done = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL)
+        found = re.search(r"sec\s*=\s*([0-9]+)", done.stdout or "")
+        return float(found.group(1)) if done.returncode == 0 and found else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def job_last_seen(record, root, now):
+    """(the last non-empty line the job printed, how many seconds ago) with control characters turned into spaces and the line bounded; ("", None) when it printed nothing
+    or the log cannot be read. A log line is untrusted text."""
+    path = job_paths(record["name"], root)["log"]
+    try:
+        with open(str(path), "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            handle.seek(max(0, size - JOB_TAIL_BYTES))
+            tail = handle.read(JOB_TAIL_BYTES).decode("utf-8", "replace")
+            age = max(0, int(now - os.fstat(handle.fileno()).st_mtime))
+    except OSError:
+        return "", None
+    lines = [line for line in re.split(r"[\r\n]+", tail) if line.strip()]
+    return (_plain(lines[-1], JOB_LAST_SEEN_MAX).strip() if lines else ""), (age if lines else None)
+
+
+def job_end_reason(record, root, now, boot=None):
+    """How a job that ended without finishing normally ended, as the audit line tells it, or None when it is alive, unknown or finished without a signal. The reason is
+    what can be told: "signal N" (the wrapper caught it and wrote it), "host rebooted" (the machine started after the job did), else "unknown" (an uncatchable signal;
+    its sender cannot be known). Never the command's arguments or environment."""
+    state, code = job_state(record, root)
+    paths = job_paths(record["name"], root)
+    started = float(record.get("started") or 0)
+    if state == "finished":
+        try:
+            said = _plain(paths["reason"].read_text().strip(), 40)
+        except OSError:
+            return None
+        if not re.fullmatch(r"signal [0-9]{1,3}", said):
+            return None
+        reason = said
+    elif state == "dead":
+        booted = (boot or boot_time)()
+        reason = "host rebooted" if booted is not None and started and booted > started else "unknown"
+    else:
+        return None
+    seen, age = job_last_seen(record, root, now)
+    detail = {"reason": reason, "age_seconds": max(0, int(now - started)), "last_seen": seen, "last_seen_age_seconds": age, "source": "job"}
+    if code is not None:
+        detail["exit_code"] = code
+    return detail
+
+
+def job_record_end(record, root, now, audit, boot=None):
+    """The ONE audit line `job.dead` of a job that ended without finishing normally, with its reason and last-seen line; a marker file in the job's directory makes it once
+    whoever looks first (the daemon or `job status`). True when this call wrote it. A sink that fails never raises."""
+    paths = job_paths(record["name"], root)
+    if paths["marker"].exists():
+        return False
+    detail = job_end_reason(record, root, now, boot)
+    if detail is None:
+        return False
+    try:
+        fd = os.open(str(paths["marker"]), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.close(fd)
+    except OSError:
+        return False   # another look wrote it, or the directory is not writable
+    try:
+        audit(JOB_DEAD, record["name"], detail)
+    except Exception as err:
+        sys.stderr.write("%s: job: could not write the audit line %s (%s)\n" % (PROG, JOB_DEAD, _plain("%s: %s" % (type(err).__name__, err), 120)))
+    return True
+
+
 def job_age(seconds):
     seconds = max(0, int(seconds))
     return "%ds" % seconds if seconds < 120 else "%dm" % (seconds // 60) if seconds < 7200 else "%dh" % (seconds // 3600)
@@ -25887,6 +25978,10 @@ def cmd_job(args, runner, now, spawn=subprocess.Popen):
             return EXIT_ERROR
         state, code = job_state(record, root)
         print(job_line(record, state, code, now(), root))
+        try:
+            job_record_end(record, root, now(), lambda event, subject, detail: AuditLog(ensure_state_dir() / "audit.jsonl").append("job", event, subject, detail))
+        except Exception:
+            pass   # `job status` never fails for the audit line's sake
         if state != "alive":   # whoever asked has now seen how it ended: it is collected, and nobody else is told
             try:
                 job_write_atomic(job_paths(args.name, root)["collected"], str(int(now())))
@@ -25912,7 +26007,7 @@ def cmd_job(args, runner, now, spawn=subprocess.Popen):
             return EXIT_ERROR
         paths["dir"].mkdir(parents=True, exist_ok=True)
         os.chmod(str(paths["dir"]), 0o700)
-        for stale in (paths["record"], paths["exit"], paths["collected"], Path(str(paths["exit"]) + ".tmp")):   # the old record goes FIRST: no window shows it uncollected
+        for stale in (paths["record"], paths["exit"], paths["collected"], paths["reason"], paths["marker"], Path(str(paths["exit"]) + ".tmp")):   # the old record goes FIRST: no window shows it uncollected
             try:
                 stale.unlink()
             except OSError:
@@ -25972,6 +26067,14 @@ class JobFacts:
     def bind(self, engine):
         self.engine = engine
 
+    @staticmethod
+    def said(record, root, now):
+        """" (reason: ..., last seen: ...)" for the message, or "" when no reason can be told."""
+        detail = job_end_reason(record, root, now)
+        if detail is None:
+            return ""
+        return "; reason: %s%s" % (detail["reason"], ("; last seen: %s" % detail["last_seen"]) if detail["last_seen"] else "")
+
     def __call__(self):
         engine = self.engine
         discovery = getattr(engine, "discovery", None)
@@ -25983,7 +26086,12 @@ class JobFacts:
             if not JOB_NAME_RE.match(entry.name) or not entry.is_dir():
                 continue
             record = job_read(entry.name, root)
-            if record is None or not record.get("session") or job_paths(entry.name, root)["collected"].exists():
+            if record is None:
+                continue
+            audit = getattr(engine, "audit", None)
+            if audit is not None and not job_paths(entry.name, root)["marker"].exists():
+                job_record_end(record, root, engine.now(), lambda event, subject, detail: audit.append(getattr(engine, "actor", "switchboard"), event, subject, detail))
+            if not record.get("session") or job_paths(entry.name, root)["collected"].exists():
                 continue
             if job_state(record, root)[0] != "dead":
                 continue
@@ -25995,7 +26103,8 @@ class JobFacts:
             started = float(record.get("started") or 0)
             facts.append(Fact("%s:%s:%d" % (JOB_DEAD, entry.name, int(started)), boss, JOB_DEAD,
                               "%s's job %s was killed before it finished (no exit code; started %s ago): `%s job status %s` on its machine says so; "
-                              "what it printed is in %s" % (worker.name, entry.name, job_age(engine.now() - started), PROG, entry.name, job_paths(entry.name, root)["log"]),
+                              "what it printed is in %s%s" % (worker.name, entry.name, job_age(engine.now() - started), PROG, entry.name, job_paths(entry.name, root)["log"],
+                                                                self.said(record, root, engine.now())),
                               started or engine.now(), batch=False, sender="switchboard"))
         return facts
 
