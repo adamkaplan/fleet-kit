@@ -40,10 +40,10 @@ When a function decides from text (an error message, a substring, a pattern, a n
 
 **You record what they returned**, one record per reviewer per head: put the returned block in a file (or pipe it) and run
 `fleet-switchboard review record <pr> --reviewer <role> --block <file or ->`. The verdict, the head and the counts are read from the block (a blocking finding that cites no rule counts as a note), and a block for any commit other
-than the PR's current head is refused. The record is made by your session, so `gates` labels it as not independent.
+than the PR's current head is refused. The record is made by your session, so it is a shadow record: `gates` shows it on the panel line and counts it for no gate.
 
 Then fix the blocking findings (each cites a rule; a finding that cites none is only a proposal), functional first and then the standards, push, and run the reviewers again on the new head:
-a push voids the earlier records. `fleet-switchboard gates <pr>` prints a `reviewers (shadow, not counted)` line with how many of the five recorded at the current head; it does not block you yet.
+a push voids the earlier records. `fleet-switchboard gates <pr>` prints a `reviewers (plan-review panel verdicts: shadow, not counted by any gate)` line with how many of the five recorded at the current head; it does not block you yet.
 
 Their result is feedback for you. It never replaces the independent review agent's verdict, and a hold is never decided by you or by a reviewer: the switchboard's matrix and path floor decide it.
 After an install, check that OpenCode registered each reviewer as written: `opencode api GET /api/agent` lists every agent with its `mode` and its rules (a reviewer must show mode `subagent` and the rules its definition declares; `fleet-switchboard agents verify` compares them). An agent whose front matter does not parse is silently registered as a default primary agent with a handful of rules and cannot be invoked as a subagent; quote any `description:` that contains a colon.
