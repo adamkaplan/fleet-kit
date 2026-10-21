@@ -30,6 +30,8 @@ class Stub(http.server.BaseHTTPRequestHandler):
     seen = []
     gets = []  # the lookups: (path, Authorization)
     installs = {}  # the fake's installations: account login (lowercase) to id
+    retry_after = None
+    raw = None  # a raw lookup body
     lookup = None  # a (status, JSON body) for every lookup, instead of the account table
 
     def log_message(self, *a):
@@ -43,8 +45,10 @@ class Stub(http.server.BaseHTTPRequestHandler):
             parts = self.path.split("/")  # /repos/OWNER/REPO/installation
             inst = Stub.installs.get(parts[2].lower()) if len(parts) == 5 and parts[1] == "repos" else None
             status, body = (200, {"id": inst, "account": {"login": parts[2]}, "repository_selection": "selected", "suspended_at": None}) if inst else (404, {"message": "Not Found"})
-        out = json.dumps(body).encode()
+        out = Stub.raw if Stub.raw is not None else json.dumps(body).encode()
         self.send_response(status)
+        if Stub.retry_after:
+            self.send_header("Retry-After", Stub.retry_after)
         self.send_header("Content-Length", str(len(out)))
         self.end_headers()
         self.wfile.write(out)
@@ -117,6 +121,7 @@ class Mint(unittest.TestCase):
         Stub.gets = []
         Stub.installs = {"acme-org": 678, "second-acct": 222}
         Stub.lookup = None
+        Stub.raw = None
         Stub.pad_to = None
         Stub.redirect = None
         Other.seen = []
@@ -260,6 +265,84 @@ class Mint(unittest.TestCase):
                 self.assertEqual(Other.seen, [])
                 self.assertEqual(len(Stub.seen), 1, "only the first request was made")
 
+    HOSTILE = ["acme-org/widget-service/", "acme-org/widget-service?x=1", "acme-org/widget-service#f", "acme-org/widget%2Fservice",
+               "acme%2Dorg/widget-service", "acme-org/widget service", "acme-org/widget-service\n", "acme-org\n/widget-service",
+               "acme-org/..", "acme-org/...", "acme-org/widget.git", "-acme/widget", "acme-/widget", "ac--me/widget", ".acme/widget",
+               "ac_me/widget", "ac.me/widget", "a" * 40 + "/widget", "acme/" + "r" * 101, "acme/\u00e9", "\u00e9cme/widget", "acme-org@evil/x",
+               "acme-org:80/x", "acme-org\\widget", "", "/", "acme-org//widget", "acme-org/widget/..", "acme-org/a;b", "acme-org/a b",
+               "acme-org/widget-service.", "acme-org./widget", "\u212aite/widget", "acme-org/widget-ser\u212aice", "\u0131nc/widget", "\uff41cme/widget",
+               "acme/\uff57idget", "\u0130nc/widget", "acme-org/wid\u0131get"]
+
+    def test_valid_target_refuses_each_hostile_shape_and_accepts_the_normal_ones(self):
+        sys.path.insert(0, os.path.dirname(MINT))
+        import app_token
+        for bad in self.HOSTILE:
+            self.assertFalse(app_token.valid_target(bad), repr(bad))
+        for good in ("acme-org/widget-service", "a/b", "a1-b2/.github", "a" * 39 + "/" + "r" * 100, "Acme/Widget_x.y-z"):
+            self.assertTrue(app_token.valid_target(good), good)
+        self.assertFalse(app_token.valid_target(None))
+
+    def test_a_hostile_target_is_refused_with_usage_and_no_request(self):
+        for bad in self.HOSTILE:
+            if bad and "\n" not in bad and bad.isascii():
+                self.assertEqual(self.run_mint(bad).returncode, 2, bad)
+        self.assertEqual((Stub.seen, Stub.gets), ([], []))
+
+    def test_owner_check_is_by_login_case_insensitive_and_a_renamed_owner_is_refused(self):
+        # the stub answers for the owner in the path; a lookup naming the account as it is now (renamed) is not the owner asked for
+        Stub.lookup = (200, {"id": 5, "account": {"id": 9, "login": "acme-org-renamed"}})
+        p = self.run_mint()
+        self.assertEqual((p.returncode, p.stdout, Stub.seen), (1, "", []))
+        Stub.lookup = (200, {"id": 5, "account": {"id": 9, "login": "ACME-ORG"}})
+        Stub.answer["repositories"][0]["owner"] = {"id": 9}
+        self.assertEqual(self.run_mint().stdout, TOKEN)
+
+    def test_a_non_ascii_login_that_folds_to_the_owner_is_refused(self):
+        for owner_ok_login in ("\u212a" + "ite-org", "acme-or\u0131", "\uff41cme-org", "acme-org."):
+            Stub.lookup, Stub.seen = (200, {"id": 5, "account": {"login": owner_ok_login}}), []
+            p = self.run_mint("kite-org/widget-service" if owner_ok_login.startswith("\u212a") else REAL)
+            self.assertEqual((p.returncode, p.stdout, Stub.seen), (1, "", []), repr(owner_ok_login))
+
+    def test_a_hostile_deeply_nested_answer_is_a_named_refusal_with_no_mint(self):
+        Stub.lookup, Stub.raw, Stub.seen = (200, None), b"[" * 10000 + b"]" * 10000, []
+        p = self.run_mint()
+        self.assertEqual((p.returncode, p.stdout, Stub.seen), (1, "", []))
+        self.assertIn("nothing was minted", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_a_request_that_times_out_is_a_named_refusal(self):
+        sys.path.insert(0, os.path.dirname(MINT))
+        import app_token
+        orig = app_token.open_url
+
+        def slow(req, timeout=30):
+            raise TimeoutError("timed out")
+        app_token.open_url = slow
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                app_token.github_json("GET", "/x", "jwt")
+        finally:
+            app_token.open_url = orig
+        self.assertEqual(cm.exception.code, 1)
+
+    def test_a_rate_limit_says_so_and_when_to_retry(self):
+        for hdr, want in (("30", "Retry after 30 seconds"), ("Wed, 21 Oct 2026 07:28:00 GMT", "Retry later"), (None, "Retry later")):
+            Stub.lookup, Stub.seen = (429, {"message": "rate limit"}), []
+            Stub.retry_after = hdr
+            p = self.run_mint()
+            Stub.retry_after = None
+            self.assertEqual((p.returncode, p.stdout, Stub.seen), (1, "", []))
+            for w in ("rate limit", "refused", "nothing was minted", want):
+                self.assertIn(w, p.stderr, (hdr, w))
+            self.assertNotIn("GMT", p.stderr)
+
+    def test_owner_id_of_the_token_repository_must_match_the_installation_account(self):
+        Stub.lookup = (200, {"id": 5, "account": {"id": 9, "login": "acme-org"}})
+        Stub.answer["repositories"][0]["owner"] = {"id": 10}
+        p = self.run_mint()
+        self.assertEqual((p.returncode, p.stdout), (1, ""))
+        self.assertIn("not owned by", p.stderr)
+
     def test_bad_usage(self):
         self.assertEqual(self.run_mint("no-slash").returncode, 2)
         for bad in ("a/..", "../b", ".", "a/b/c", "a/", "/b", "a/./b"):
@@ -396,11 +479,15 @@ class Mint(unittest.TestCase):
     # --- mutants: a copy of the mint with one check broken must fail the same tests (S8) ---
 
     MUTANTS = [  # (name, text to replace, replacement, the lookup answer the broken build wrongly accepts)
-        ("always the first installation", "inst = find_installation(target, jwt)", "inst = 111", None),
-        ("no owner check", "if not isinstance(login, str) or login.lower() != owner.lower():", "if False:", "another account"),
+        ("always the first installation", "inst, owner_id = find_installation(target, jwt)", "inst, owner_id = 111, None", None),
+        ("no owner check", "if not valid_owner(login) or login.lower() != owner.lower():", "if False:", "another account"),
         ("case-sensitive owner check", "login.lower() != owner.lower()", "login != owner", "case"),
         ("no id check", "if isinstance(inst, bool) or not isinstance(inst, int) or inst <= 0:", "if False:", "an id of zero"),
         ("no shape check", "if not isinstance(ans, dict):", "if False:", "a string"),
+        ("no owner id check", 'owner.get("id") != owner_id', "False", "owner id"),
+        ("no repository list check", "len(repos) != 1 or ", "", "second repo"),
+        ("plain lower on an unvalidated login", "not valid_owner(login) or ", "", "kelvin"),
+        ("catches only ValueError", "except Exception:", "except ValueError:", "nested"),
         ("no suspended check", 'if ans.get("suspended_at"):', "if False:", "a suspended installation"),
     ]
 
@@ -415,6 +502,15 @@ class Mint(unittest.TestCase):
         e = dict(os.environ, CW_APP_ID_CMD="echo 12345", CW_APP_KEY_CMD="cat '%s'" % self.keyfile, CW_GITHUB_API_BASE=self.base, CW_OPENSSL=self.wrap)
         return subprocess.run([sys.executable, path, repo], env=e, capture_output=True, text=True, timeout=60)
 
+    def mint_refused_variant(self, text, answer):
+        """True when the build refuses a mint answer (a second repository, or an owner id that differs) with no token on stdout."""
+        Stub.raw = None
+        Stub.lookup, Stub.seen = (200, {"id": 5, "account": {"id": 9, "login": "acme-org"}}), []
+        repo = {"name": "widget-service", "full_name": REAL, "owner": {"id": 10 if answer == "owner id" else 9}}
+        Stub.answer["repositories"] = [repo] if answer == "owner id" else [repo, {"name": "other-service", "full_name": "acme-org/other-service"}]
+        p = self.run_copy(text)
+        return p.returncode == 1 and p.stdout == "" and p.stderr.startswith("app-token: ") and "Traceback" not in p.stderr
+
     def test_s8_each_mutant_is_caught_and_the_real_mint_passes_the_same_checks(self):
         with open(MINT) as f:
             real = f.read()
@@ -428,6 +524,17 @@ class Mint(unittest.TestCase):
 
         def refuses_cleanly(text, answer):
             """True when the build refuses this lookup answer with its own one-line message and makes no token request."""
+            Stub.raw = None
+            if answer == "nested":
+                Stub.lookup, Stub.raw, Stub.seen = (200, None), b"[" * 10000 + b"]" * 10000, []
+                p = self.run_copy(text)
+                return p.returncode == 1 and p.stderr.startswith("app-token: ") and "Traceback" not in p.stderr
+            if answer == "kelvin":
+                Stub.lookup, Stub.seen = (200, {"id": 5, "account": {"login": "\u212a" + "ite-org"}}), []
+                p = self.run_copy(text, "kite-org/widget-service")
+                return p.returncode == 1 and p.stderr.startswith("app-token: ") and Stub.seen == []
+            if answer in ("owner id", "second repo"):
+                return self.mint_refused_variant(text, answer)
             Stub.lookup, Stub.seen = (200, self.BAD_LOOKUPS[answer]) if answer != "case" else (200, {"id": 5, "account": {"login": "ACME-Org"}}), []
             Stub.answer["repositories"] = [{"name": "widget-service", "full_name": REAL}]
             p = self.run_copy(text)

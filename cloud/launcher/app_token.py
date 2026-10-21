@@ -43,13 +43,32 @@ def open_url(req, timeout=30):
     return token_mint.open_no_redirect(req, timeout)
 
 
+OWNER_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?!-)){0,38}")  # GitHub login: <=39, no leading/trailing/double hyphen
+REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}")
+
+
+def valid_owner(o):
+    """A GitHub login: ASCII, 1 to 39, no leading, trailing or doubled hyphen."""
+    return isinstance(o, str) and bool(OWNER_RE.fullmatch(o)) and not o.endswith("-")
+
+
 def valid_target(t):
-    """OWNER/REPO: two segments of [A-Za-z0-9_.-], neither '.' nor '..'."""
+    """OWNER/REPO by GitHub's name grammar, the one check before a name goes into a URL (ASCII only, no other character)."""
+    if not isinstance(t, str):
+        return False
     parts = t.split("/")
-    return len(parts) == 2 and all(re.fullmatch(r"[A-Za-z0-9_.-]+", x) and x not in (".", "..") for x in parts)
+    if len(parts) != 2:
+        return False
+    owner, repo = parts
+    return bool(valid_owner(owner) and REPO_RE.fullmatch(repo)
+                and repo.strip(".") != "" and not repo.endswith(".") and not repo.lower().endswith(".git"))
 
 
-def http_error_text(code):
+def http_error_text(code, retry_after=None):
+    if code == 429:
+        when = " Retry after %s seconds." % retry_after if isinstance(retry_after, str) and retry_after.isdigit() and len(retry_after) <= 6 \
+            else " Retry later."
+        return "GitHub rate limit hit (HTTP 429): the launch is refused and nothing was minted." + when
     if 300 <= code < 400:
         return "refusing: GitHub answered with a redirect (HTTP %d); a redirect is never followed" % code
     return "GitHub refused the request (HTTP %d)" % code
@@ -155,9 +174,11 @@ def github_json(method, path, jwt, body=None, not_found=None):
             die(not_found)
         if e.code == 422 and method == "POST":
             die("the App's installation does not cover this repository: add it to the installation (HTTP 422)")
-        die(http_error_text(e.code))
-    except (OSError, ValueError):
-        die("the GitHub request failed or its answer was not JSON")
+        die(http_error_text(e.code, e.headers.get("Retry-After") if e.headers else None))
+    except TimeoutError:
+        die("the GitHub request timed out: the launch is refused and nothing was minted")
+    except Exception:  # OSError, ValueError, UnicodeDecodeError, RecursionError, MemoryError: any failure is a named refusal, never a crash
+        die("the GitHub request failed or its answer was not usable JSON: the launch is refused and nothing was minted")
 
 
 def find_installation(target, jwt):
@@ -172,11 +193,12 @@ def find_installation(target, jwt):
         die("refusing: the installation lookup carries no installation id")
     account = ans.get("account")
     login = account.get("login") if isinstance(account, dict) else None
-    if not isinstance(login, str) or login.lower() != owner.lower():
+    if not valid_owner(login) or login.lower() != owner.lower():  # ASCII only: lower() of raw non-ASCII folds Kelvin to k
         die("refusing: the installation found is not the account that owns %s" % target)
     if ans.get("suspended_at"):
         die("refusing: the App's installation on %s is suspended" % owner)
-    return inst
+    owner_id = account.get("id")
+    return inst, owner_id if isinstance(owner_id, int) and not isinstance(owner_id, bool) else None
 
 
 def mint(target):
@@ -192,7 +214,7 @@ def mint(target):
     signing = "%s.%s" % (head, claims)
     jwt = signing + "." + b64(sign(key, signing.encode()))
     del key
-    inst = find_installation(target, jwt)
+    inst, owner_id = find_installation(target, jwt)
     ans = github_json("POST", "/app/installations/%d/access_tokens" % inst, jwt, {"repositories": [repo]})
     token = ans.get("token") if isinstance(ans, dict) else None
     repos = ans.get("repositories") if isinstance(ans, dict) else None
@@ -201,8 +223,11 @@ def mint(target):
     if not isinstance(repos, list) or len(repos) != 1 or not isinstance(repos[0], dict) or repos[0].get("name") != repo:
         die("refusing: the token does not cover exactly the one target repository")
     full = repos[0].get("full_name")
-    if full is not None and full.lower() != target.lower():
+    if full is not None and not (isinstance(full, str) and valid_target(full) and full.lower() == target.lower()):
         die("refusing: the token does not cover exactly the one target repository")
+    owner = repos[0].get("owner")  # the account id is stable where the login is not: when both answers carry it, it must agree
+    if owner_id is not None and isinstance(owner, dict) and owner.get("id") is not None and owner.get("id") != owner_id:
+        die("refusing: the token's repository is not owned by the installation's account")
     try:
         exp = dt.datetime.strptime(ans["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp()
     except (KeyError, ValueError, TypeError):
