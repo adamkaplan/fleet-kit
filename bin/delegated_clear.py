@@ -604,6 +604,9 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), re
     for name, value, kind, _node in records:
         bindings.setdefault(name, []).append(value)
         kinds.setdefault(name, []).append(kind)
+    if isinstance(arguments, ast.arguments):   # the unit's OWN parameters are bindings too (a parameter named `len` is the handle, not the builtin)
+        for a in arguments.posonlyargs + arguments.args + arguments.kwonlyargs + [x for x in (arguments.vararg, arguments.kwarg) if x is not None]:
+            kinds.setdefault(a.arg, []).append("param")
     if isinstance(arguments, ast.arguments):
         for a, _unread in param_defaults:
             bindings.setdefault(a.arg, []).append(None)
@@ -810,20 +813,25 @@ def _spans_from_decorators(node, numbers):
 
 
 def _bound_here(node):
-    """The names a module-level statement binds: a def or class, an assignment of any form, an import, a loop or `with` target, an `except ... as`."""
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return [node.name]
-    if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-        return [y.id for t in (node.targets if isinstance(node, ast.Assign) else [node.target]) for y in ast.walk(t) if isinstance(y, ast.Name)]
-    if isinstance(node, (ast.Import, ast.ImportFrom)):
-        return [a.asname or a.name.split(".")[0] for a in node.names]
-    if isinstance(node, (ast.For, ast.AsyncFor)):
-        return [y.id for y in ast.walk(node.target) if isinstance(y, ast.Name)]
-    if isinstance(node, (ast.With, ast.AsyncWith)):
-        return [y.id for i in node.items if i.optional_vars is not None for y in ast.walk(i.optional_vars) if isinstance(y, ast.Name)]
-    if isinstance(node, ast.Try):
-        return [h.name for h in node.handlers if h.name]
-    return []
+    """The names a module-level statement binds, derived from the same forms as `_name_bindings` (every Name in a Store or Del context, and the nodes of STRING_BINDERS and the imports and `global` statements) and read
+    WITHOUT descending into the body of a def, a class or a lambda (their locals are their own): an assignment of any form, a walrus or a match capture anywhere in the statement's own expressions, a loop or `with` target,
+    an `except` or `except*` name, a def, a class, an import."""
+    out, todo = [], [node]
+    while todo:
+        x = todo.pop()
+        if isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del)):
+            out.append(x.id)
+        elif type(x).__name__ in STRING_BINDERS:
+            out.extend(STRING_BINDERS[type(x).__name__](x))
+        elif isinstance(x, (ast.Import, ast.ImportFrom)):
+            out.extend(a.asname or a.name.split(".")[0] for a in x.names)
+        elif isinstance(x, (ast.Global, ast.Nonlocal)):
+            out.extend(x.names)
+        if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            todo.extend(x.decorator_list if hasattr(x, "decorator_list") else [])   # a decorator runs in the enclosing scope; the body is the inner scope's
+            continue
+        todo.extend(ast.iter_child_nodes(x))
+    return out
 
 
 def _binds_registrar(node, patterns):

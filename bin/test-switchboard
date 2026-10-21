@@ -34487,7 +34487,17 @@ class TestRegistrarFloor(LedgerBase):
                     bad.append("rebinding: " + label)
             except Exception:
                 bad.append("rebinding: " + label)
+        has("a parameter named like a builtin is the handle", "def add_zz_parsers(sub, int):\n    int(None)\n", ("calls", "int"))
+        has("a parameter named like a helper is the handle", "def add_zz_parsers(sub, hh):\n    hh(None)\n", ("calls", "hh"))
         has("a table builtin rebound then called", reg("int = json\nsub.add_parser('x', help=int('1'))"), ("calls", "int"))
+        for label, text in (("a walrus", "(int := print)\n"), ("a match capture", "match 1:\n    case int:\n        pass\n"), ("an except* name", "try:\n    pass\nexcept* Exception as int:\n    pass\n"),
+                            ("a with target", "with open('x') as int:\n    pass\n"), ("a for target", "for int in ():\n    pass\n")):
+            try:   # a module-level binding of a builtin of the table by any form: it leaves the table, so a registrar's call of it is held
+                got, why = dc.registrar_findings(fake, fake + text + reg("sub.add_parser('x', help=int('1'))"), rule)
+                if why or not any(g[1:] == ("calls", "int") for g in got):
+                    bad.append("module-level binding: " + label)
+            except Exception:
+                bad.append("module-level binding: " + label)
         clean("a pure builtin of the table", reg("sub.add_parser('x', default=int('1'), help=str(2))"))
         has("a builtin outside the table", reg("sorted(sub)"), ("calls", "sorted"))
         clean("a named helper is not read as part of the registrar", reg("t = sub.add_parser('x')\nt.add_argument('--i', type=hh)\nhh('1')"))
@@ -34586,7 +34596,6 @@ class TestRegistrarFloor(LedgerBase):
         ("a named helper is still read as part of a registrar", "if node.name not in names and node.name not in named:", "if node.name not in names:"),
         ("an edit of a name of the table is not held", "if bound in table and _spans_from_decorators(node, numbers):", "if False:"),
         ("an unreadable table passes", 'return None, "the registrar allow table of the rule cannot be read"', "pass"),
-        ("a nested statement is not read for the table", "for node in _module_statements(tree.body):\n            for bound in _bound_here(node):", "for node in tree.body:\n            for bound in _bound_here(node):"),
         ("a decorator is not part of a helper", "start = min([node.lineno] + [d.lineno for d in getattr(node, \"decorator_list\", [])])\n    return any(n in numbers", "start = node.lineno\n    return any(n in numbers"),
         ("a rebound builtin stays allowed", "pure_builtins = pure_builtins - rebound", "pass"),
         ("a deletion in a named helper is not held", "for tree, numbers in ((head, set(lines[1])), (base, set(lines[0]))):", "for tree, numbers in ((head, set(lines[1])),):"),
@@ -34604,7 +34613,8 @@ class TestRegistrarFloor(LedgerBase):
         ("aliases by ** are not held", "(k.arg is None and names_aliases(k.value))", "False"),
         ("set_defaults on the handle is not held", "if fname == \"set_defaults\" and isinstance(x.func, ast.Attribute)", "if False and isinstance(x.func, ast.Attribute)"),
         ("a list is data", "    if isinstance(expr, ast.Tuple):\n        return all(_is_data(e, data) for e in expr.elts)", "    if isinstance(expr, (ast.Tuple, ast.List, ast.Set)):\n        return all(_is_data(e, data) for e in expr.elts)"),
-        ("a del is not a binding", "if isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del)):", "if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store):"),
+        ("a nested statement is not read for the table", "x = todo.pop()\n        if isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del)):\n            out.append(x.id)", "x = todo.pop()\n        if False:\n            out.append(x.id)"),
+        ("a parameter of the unit is not a binding", "kinds.setdefault(a.arg, []).append(\"param\")", "pass"),
         ("a decorator is not read", "for expr in list(x.decorator_list) + (list(x.bases) + [k.value for k in x.keywords] if isinstance(x, ast.ClassDef) else []):", "for expr in []:"),
         ("a parser name rebound in any form is not held", "        if not ok:\n            note(node, \"rebinds\", name)", "        if False:\n            note(node, \"rebinds\", name)"),
         ("the table's builtins are not read", "(x.func.id in (set(readable) | set(named_helpers) | set(builtins)) and x.func.id not in kinds)", "(x.func.id in (set(readable) | set(named_helpers)) and x.func.id not in kinds)"),
