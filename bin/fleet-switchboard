@@ -22573,7 +22573,7 @@ def impact_would_hold_pass(engine, now):
     records, records_problem = impact_records(engine.state_dir)
     basis = engine.__dict__.setdefault("impact_basis", {})   # what each pull request was last judged on (base, rule, record): it NAMES a release's reason, it never skips a judgement
     judged_at = engine.__dict__.setdefault("impact_judged_at", {})
-    ours_applied, state_problem = impact_ours(engine)   # the pull requests carrying labels this daemon added: judged afresh at every pass (#999), whatever the head-only memo says
+    ours_applied, state_problem = impact_ours(engine)   # the pull requests carrying labels this daemon added: judged even when the floor is now empty (#999)
     if state_problem or (records_problem and any(applied_for_repo(ours_applied, k) for k in state.lists)):
         _impact_not_checked(engine, "the impact review ledger" if records_problem else "the hold state file", records_problem or state_problem)
     else:
@@ -22592,9 +22592,11 @@ def impact_would_hold_pass(engine, now):
             live.add((key, number))
             enforce = impact_floor.hold_mode(engine.config, key) == "enforce"
             earlier = reports.get((key, number))
+            listed_base = record.get("base") if isinstance(record.get("base"), dict) else {}   # (#999) the list already carries the base (ref and sha): a retarget or a moved base re-judges with no extra call
+            list_base = (listed_base.get("ref"), listed_base.get("sha"))
             backoff = seen.get((key, number, "retry"))
             if earlier is not None and earlier["head"] == head and earlier.get("rule") == rule and earlier.get("owner_decision") != "hold" and enforce and not earlier.get("rehold") \
-                    and not (backoff and now < backoff) and not records_problem and (pr, head) in records and seen.get((key, number)) != (head, rule, records[(pr, head)]):
+                    and not (backoff and now < backoff) and not records_problem and (pr, head) in records and seen.get((key, number)) != (head, rule, records[(pr, head)], list_base):
                 # an impact review record that is new since this head was judged, on a pull request that holds nothing: no gh read (the paths are unchanged).
                 # A `hold` of a top tier, missing or unknown class can only ADD a hold; anything else changes nothing, so it is only noted as seen.
                 newest = records[(pr, head)]
@@ -22603,13 +22605,13 @@ def impact_would_hold_pass(engine, now):
                     try:
                         budget -= apply_impact_hold(engine, key, number, added, record)
                         reports[(key, number)] = added
-                        seen[(key, number)] = (head, rule, newest)
+                        seen[(key, number)] = (head, rule, newest, list_base)
                         engine.audit.append(engine.actor, "gate.would_hold", pr, {"head": head, "reasons": added["reasons"], "floor_paths": [], "advisory": False, "unknown": None})
                     except Exception as err:
                         seen[(key, number, "retry")] = now + IMPACT_RETRY_SECONDS
                         engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
                 else:
-                    seen[(key, number)] = (head, rule, newest)
+                    seen[(key, number)] = (head, rule, newest, list_base)
                 continue
             try:
                 globs = impact_floor.floor_for(key, engine.config)[0]
@@ -22618,10 +22620,10 @@ def impact_would_hold_pass(engine, now):
                 return
             if not globs and not ours:   # a pull request holding our labels is judged even when the floor is now empty: the release is the point
                 continue
-            signature = (head, rule, "unreadable" if records_problem else records.get((pr, head))) + ((marks[(pr, head)],) if (pr, head) in marks else ())   # (#815) a new confirmation re-judges
-            memo_hit = seen.get((key, number)) == signature
-            if memo_hit and not ours:
-                continue   # (#999) never for a pull request holding our labels: its base can change with the head, rule and record unchanged
+            signature = (head, rule, "unreadable" if records_problem else records.get((pr, head)), list_base) \
+                + ((marks[(pr, head)],) if (pr, head) in marks else ())   # (#815) a new confirmation re-judges
+            if seen.get((key, number)) == signature:
+                continue   # judged on exactly these inputs: held or not, it costs no call until one of them changes (head, rule, record, base)
             if budget <= 0:
                 unjudged += 1
                 continue
@@ -22640,10 +22642,6 @@ def impact_would_hold_pass(engine, now):
             report["rule"] = rule
             owner = report.get("owner_decision")
             judged_at[(key, number)] = now
-            if memo_hit and owner == "hold":   # held and nothing changed: kept, with no write and no audit line (it was judged afresh only to be sure)
-                basis[(key, number)] = (report.get("base"), rule, signature[2], report.get("head") or head)
-                reports[(key, number)] = report
-                continue
             if owner != "hold":
                 report["release_reason"] = _impact_release_reason(basis.get((key, number)), report.get("base"), rule, signature[2], head, report.get("head"))
             if owner == "hold":
@@ -22675,7 +22673,8 @@ def impact_would_hold_pass(engine, now):
                     engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
                     unjudged += 1
                     continue
-            seen[(key, number)] = (report["head"] or head, rule, "unreadable" if records_problem else records.get((pr, report["head"] or head))) + ((marks[(pr, report["head"] or head)],) if (pr, report["head"] or head) in marks else ())
+            judged_head = report["head"] or head
+            seen[(key, number)] = (judged_head, rule, "unreadable" if records_problem else records.get((pr, judged_head)), signature[3]) + ((marks[(pr, judged_head)],) if (pr, judged_head) in marks else ())
             basis[(key, number)] = (report.get("base"), rule, seen[(key, number)][2], report.get("head") or head)
             reports[(key, number)] = report
     for memo in (basis, judged_at):   # nothing is kept for a pull request that is no longer open

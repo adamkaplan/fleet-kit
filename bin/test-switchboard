@@ -35336,6 +35336,15 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
         entry = {"kind": "review_record", "pr": self.PRN, "head": self.HEAD, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "summary": "x"}
         sb.plan_ledger.append_entry(self.world.state, dict(entry, **fields), 1)
 
+    list_has_base = True   # a mutant turns it off: the list the pass reads then carries no base, as if the memo key had none
+
+    def listed(self, number, labels=(), head=LEDGER_HEAD, draft=False):
+        """The REST list entry, with the base the pull request has NOW (`base.ref`, `base.sha`): the one list the pass already reads."""
+        entry = super().listed(number, labels, head=head, draft=draft)
+        if self.list_has_base and number in self.prs:
+            entry["base"] = {"ref": "main", "sha": self.prs[number].get("baseRefOid")}
+        return entry
+
     def step(self, advance=1000):
         self.passes([self.listed(9, self.live_labels, head=self.HEAD)], advance=advance)
 
@@ -35378,8 +35387,10 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
             pass   # "none": the rule's answer and every input are as they were
 
     def run_row(self, kind, holds, mutant=None):
+        mutant = dict(mutant or {})
+        self.list_has_base = mutant.pop("list_has_base", True)
         with contextlib.ExitStack() as stack:
-            for target, replacement in (mutant or {}).items():
+            for target, replacement in mutant.items():
                 owner, _, name = target.rpartition(".")
                 stack.enter_context(mock.patch.object(getattr(sb, owner) if owner else sb, name, replacement))
             self.held_world(kind)
@@ -35443,19 +35454,19 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
     def test_row_none_still_held(self):
         self.check_row("none", True)
 
-    # The pre-fix daemon: the head-only memo (no pull request is "ours", so the memo skips), blind to one input each. Each releasing row must FAIL under its mutant.
-    NOT_OURS = {"impact_ours": lambda engine: (set(), None)}
+    # The pre-fix daemon: the head-only memo, blind to one input each. Each releasing row must FAIL under its mutant.
+    NO_BASE = {"list_has_base": False}   # the memo key without the base (the bug)
     NO_RECORDS = {"impact_records": lambda state_dir: ({}, None)}
     FROZEN_RULE = {"impact_floor.rule_fingerprint": lambda: "frozen"}
     MUTANTS = {
-        "base": dict(NOT_OURS),                                   # the memo as it was: head, rule and record, never the base (the bug)
-        "record": dict(NOT_OURS, **NO_RECORDS),                   # ... and blind to the record
-        "matrix": dict(NOT_OURS, **FROZEN_RULE),                  # ... and blind to the rule's version
-        "rating": dict(NOT_OURS, **NO_RECORDS),                   # ... and blind to the rating
+        "base": dict(NO_BASE),                                    # the memo as it was: head, rule and record, never the base (the bug)
+        "record": dict(NO_RECORDS),                               # ... blind to the record
+        "matrix": dict(FROZEN_RULE),                              # ... blind to the rule's version
+        "rating": dict(NO_RECORDS),                               # ... blind to the rating
         "head": {"_impact_release_reason": lambda *a: "rule no longer holds"},   # a release that cannot say what changed
     }
     REASON_BLIND = {"_impact_release_reason": lambda *a: "rule no longer holds"}
-    NEW_HEAD_ONLY = dict(NOT_OURS, **dict(NO_RECORDS, **FROZEN_RULE))   # releases only when the head changes
+    NEW_HEAD_ONLY = dict(NO_BASE, **dict(NO_RECORDS, **FROZEN_RULE))   # releases only when the head changes
 
     def mutant_fails(self, kind, mutant):
         with self.assertRaises(AssertionError):
@@ -35478,6 +35489,61 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
 
     def test_the_head_row_fails_under_a_release_that_never_names_the_head(self):
         self.mutant_fails("head", self.MUTANTS["head"])
+
+    # -- the cost: a held pull request costs nothing between changes (a RATE, not a per-pass count)
+    HELD, PASS_SECONDS, HOUR_PASSES = 30, 5, 720   # 30 held pull requests, a pass every 5 seconds (the default poll), for an hour
+    HOUR_CALLS = 1   # the stated bound: one `gh pr view` for the ONE retarget of the hour (plus its 2 label removals, counted apart); nothing for the 29 unchanged
+
+    def hour_of_passes(self, mutant=None):
+        """30 held pull requests, an hour of passes with the counting fake; one is retargeted half way and no longer holds. (view reads, writes after the hold settled)."""
+        mutant = dict(mutant or {})
+        self.list_has_base = mutant.pop("list_has_base", True)
+        numbers = list(range(100, 100 + self.HELD))
+        for n in numbers:
+            self.prs[n] = {"headRefOid": self.HEAD, "changedFiles": 1, "files": [{"path": "shims/gh"}], "baseRefOid": "1" * 40, "labels": []}
+        held = set()
+
+        def one(advance):
+            self.passes([self.listed(n, self.both() if n in held else [], head=self.HEAD) for n in numbers], advance=advance)
+        with contextlib.ExitStack() as stack:
+            for target, replacement in mutant.items():
+                owner, _, name = target.rpartition(".")
+                stack.enter_context(mock.patch.object(getattr(sb, owner) if owner else sb, name, replacement))
+            for _ in range(40):   # settle: each pass may spend its own call budget, so the labels go on over a few passes
+                one(self.PASS_SECONDS)
+                held |= {int(w[1].split("/issues/")[1].split("/")[0]) for w in self.posts()}
+            self.assertEqual(held, set(numbers), "all 30 are held")
+            one(1000)   # the list is re-read once: every label seen
+            self.view_reads.clear()
+            self.writes.clear()
+            for i in range(self.HOUR_PASSES):
+                if i == self.HOUR_PASSES // 2:   # retargeted: a new base, and the rule no longer holds it
+                    self.prs[100].update(baseRefOid="2" * 40, files=[{"path": "docs/a.md"}])
+                one(self.PASS_SECONDS)
+            return list(self.view_reads), list(self.writes)
+
+    def test_an_hour_of_passes_over_30_held_pull_requests_costs_one_read_for_the_one_that_changed(self):
+        reads, writes = self.hour_of_passes()
+        self.assertEqual(reads, [100], "one read, for the retargeted pull request: %d reads against %d passes x 30 held" % (len(reads), self.HOUR_PASSES))
+        self.assertLessEqual(len(reads), self.HOUR_CALLS)
+        self.assertEqual(sorted(w[1].rsplit("/", 1)[-1] for w in writes if w[0] == "DELETE"), sorted(urllib.parse.quote(n, safe="") for n in self.both()), "it was released")
+        self.assertEqual([w for w in writes if w[0] != "DELETE"], [], "nothing else was written")
+
+    def test_the_hour_fails_under_a_memo_with_no_base_and_under_a_daemon_that_judges_every_pass(self):
+        with self.assertRaises(AssertionError):   # no base in the key: the retarget is never seen, the release never comes
+            self.assert_hour(self.NO_BASE)
+        every = [0]
+
+        def fresh():
+            every[0] += 1
+            return "m%d" % every[0]
+        with self.assertRaises(AssertionError):   # the pre-memo daemon: every held pull request judged at every pass (a rule that is new at every pass)
+            self.assert_hour({"impact_floor.rule_fingerprint": fresh})
+
+    def assert_hour(self, mutant):
+        reads, writes = self.hour_of_passes(mutant)
+        self.assertEqual(reads, [100])
+        self.assertEqual(len([w for w in writes if w[0] == "DELETE"]), 2)
 
     def test_every_releasing_kind_has_a_mutant_test(self):
         for kind in self.RELEASING:
@@ -35510,7 +35576,8 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
             for _ in range(passes):
                 self.step(500)
         self.assertEqual(self.removals(9), [], "nothing released")
-        self.assertEqual(len([e for e in self.world.audit() if e["event"] in noted]), 1, "said once, not at every pass")
+        said = [e["event"] for e in self.world.audit() if e["event"] in noted]
+        self.assertTrue(said and len(said) == len(set(said)), "each said once, not at every pass: %s" % said)
 
     def test_an_unreadable_matrix_keeps_every_label_and_says_so_once(self):
         self.unreadable(mock.patch.object(sb.impact_floor, "rule_fingerprint", side_effect=sb.impact_floor.MatrixError("gone")), ("impact.error",))
@@ -35708,6 +35775,10 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
         self.step()
         self.assertEqual(len(self.removals(9)), 2)
 
+    def retarget(self, number, path):
+        """A new base and the diff of it: the head is unchanged, so only the base in the list tells the pass (#999)."""
+        self.prs[number] = dict(self.prs[number], files=[{"path": path}], baseRefOid="2" * 40)
+
     def test_fresh_judgement_stays_inside_the_pass_budget_and_the_oldest_judged_goes_first(self):
         self.extra_config = dict(self.extra_config, impact_hold={"enabled": True, "calls_per_pass": 3})
         self.configure()
@@ -35722,10 +35793,16 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
         self.passes([self.listed(n, self.both()) for n in range(9, 14)], advance=1000)
         self.assertLessEqual(len(self.view_reads) - before, 3)
         for n in range(9, 14):
-            self.files(n, "docs/a.md")
+            self.retarget(n, "docs/a.md")
         for _ in range(6):   # a release spends its read and its removals, so one a pass: every one of the five is reached
+            reads, deletes = len(self.view_reads), len(self.removals())
             self.passes([self.listed(n, self.both()) for n in range(9, 14)], advance=1000)
+            # THE BOUND: a release is allowed PAST the pass's budget (calls_per_pass 3), but only by its own 1 read and 2 removals, and no second one starts: so one
+            # judgement read and at most 2 DELETEs a pass, never more
+            self.assertLessEqual(len(self.view_reads) - reads, 1)
+            self.assertLessEqual(len(self.removals()) - deletes, 2)
         self.assertEqual(len({w[1].split("/")[4] for w in self.removals()}), 5)
+        self.assertEqual(len(self.removals()), 10, "two labels each, none twice")
 
 
     def test_a_due_release_not_reached_waits_and_the_one_judged_longest_ago_goes_first(self):
@@ -35740,13 +35817,104 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
             self.passes(forward(), advance=1000)
         self.assertEqual((self.posts(), self.removals()), ([], []))
         for n in (9, 10, 11):
-            self.files(n, "docs/a.md")
+            self.retarget(n, "docs/a.md")
         order = []
         for _ in range(3):   # all three are due; the list now comes back in the other order, and a release is one a pass
             before = len(self.removals())
             self.passes(backward(), advance=1000)
             order += sorted({w[1].split("/")[4] for w in self.removals()[before:]})
         self.assertEqual(order, ["9", "10", "11"], "one release a pass, the one judged longest ago first (not the list's order)")
+
+
+    # -- a release whose write FAILS part way (every step of the release): the record is kept, no `gate.hold_released` line, the next pass removes only what remains
+    fault = None   # (step, the failing call's ordinal among the DELETEs) set by a test
+
+    def route(self, argv, **kwargs):
+        step = self.fault
+        if step and argv[0] == FAKE_GH:
+            failed = subprocess.CompletedProcess(argv, 1, "", "HTTP 500: server error")
+            if step == "read" and argv[1:3] == ["pr", "view"] and "files" not in argv[-1] and int(argv[3]) == 9:
+                return failed   # the release's own read of the labels (the floor read asks for the files)
+            if "--method" in argv and argv[argv.index("--method") + 1] == "DELETE":
+                self.deletes_tried = getattr(self, "deletes_tried", 0) + 1
+                if (step, self.deletes_tried) in (("delete1", 1), ("delete2", 2)):
+                    return failed
+        return super().route(argv, **kwargs)
+
+    RELEASE_STEPS = ("read", "delete1", "delete2", "state")   # every step of `release_impact_hold` that can fail: the one table the rows and the mutants derive from
+
+    def failed_release(self, step, mutate=False, extra=None):
+        extra = dict(extra or {})
+        self.list_has_base = True
+        with contextlib.ExitStack() as stack:
+            self.held_world("base")
+            self.live_labels = self.both() + ["needs-docs"]   # a label of a person: never in the record, never touched
+            self.view("docs/a.md", base="2" * 40)
+            self.deletes_tried = 0
+            self.fault = step
+            if step == "state":
+                stack.enter_context(mock.patch.object(sb, "write_impact_state", mock.Mock(side_effect=OSError("disk full"))))
+            for target, replacement in dict(self.release_mutant(step) if mutate else {}, **extra).items():   # after the fault: a mutant wraps the failing call
+                stack.enter_context(mock.patch.object(sb, target, replacement))
+            self.step()
+            self.fault = None
+            kept = json.loads((self.world.state / "impact-hold.json").read_text())["applied"]
+            self.assertIn(self.PRN, kept, "%s failed: the record is KEPT" % step)
+            self.assertEqual(self.events("gate.hold_released"), [], "%s failed: nothing is audited as released" % step)
+            done = sorted(w[1].rsplit("/", 1)[-1] for w in self.removals(9))
+            gone = {"read": [], "delete1": [], "delete2": [urllib.parse.quote(self.names["hold-impact"], safe="")], "state": sorted(urllib.parse.quote(n, safe="") for n in self.both())}[step]
+            self.assertEqual(done, gone, "%s failed: only what was removed before it" % step)
+            self.writes.clear()
+            self.live_labels = [n for n in self.both() + ["needs-docs"] if urllib.parse.quote(n, safe="") not in gone]   # what is left on the pull request now
+            stack.close()   # the failure is over: no mutant, no patched write
+        self.view("docs/a.md", base="2" * 40)
+        self.step(1000)   # past the retry backoff
+        left = sorted(w[1].rsplit("/", 1)[-1] for w in self.removals(9))
+        self.assertEqual(left, sorted(urllib.parse.quote(n, safe="") for n in self.both() if urllib.parse.quote(n, safe="") not in gone), "the next pass removes only what REMAINS, and never the person's label")
+        (line,) = self.events("gate.hold_released")
+        self.assertEqual(self.PRN in json.loads((self.world.state / "impact-hold.json").read_text())["applied"], False, "now the record is gone")
+
+    def release_mutant(self, step):
+        """One mutant a step: the release that goes on as if the step had worked, so it drops the record and audits the release anyway."""
+        def swallow(real):
+            def wrapper(*args, **kwargs):
+                try:
+                    return real(*args, **kwargs)
+                except Exception:
+                    return None
+            return wrapper
+        if step == "read":
+            real = sb.read_pr_json
+
+            def read(engine, repo, number, extra_fields=""):
+                try:
+                    return real(engine, repo, number, extra_fields)
+                except Exception:   # a failed read taken as "both labels are still there, at the head judged"
+                    return {"headRefOid": self.HEAD, "labels": [{"name": n} for n in self.both()]}
+            return {"read_pr_json": read}
+        if step == "state":
+            return {"write_impact_state": swallow(sb.write_impact_state)}
+        return {"change_issue_labels": swallow(sb.change_issue_labels)}   # delete1 and delete2: the first or the second DELETE failed, and the release went on
+
+    def test_a_release_that_removes_a_label_outside_its_record_fails_the_failure_rows(self):
+        everything = {"_labels_ours": lambda names, state, pr: self.both() + ["needs-docs"]}
+        with self.assertRaises(AssertionError):
+            self.failed_release("state", extra=everything)   # every DELETE goes through here, so a label outside the record would show
+
+
+def _failed_release_rows():
+    for step in TestImpactReleaseEveryPass.RELEASE_STEPS:
+        def row(self, step=step):
+            self.failed_release(step)
+
+        def mutant(self, step=step):
+            with self.assertRaises(AssertionError):
+                self.failed_release(step, mutate=True)
+        setattr(TestImpactReleaseEveryPass, "test_a_release_that_fails_at_%s_keeps_the_record_and_the_next_pass_finishes_it" % step, row)
+        setattr(TestImpactReleaseEveryPass, "test_the_%s_failure_row_fails_when_the_release_goes_on_after_it" % step, mutant)
+
+
+_failed_release_rows()
 
 
 def _reason_mutant_test(kind):
