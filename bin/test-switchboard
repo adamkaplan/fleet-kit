@@ -34208,18 +34208,21 @@ class TestRegistrarFloor(LedgerBase):
         base = self.head_of(hostile)                                           # the hostile line is already in the base
         self.assertEqual(self.dc.registrar_findings(base, base, self.rule), ([], None), "untouched: not held")
         other_line = base.replace("def add_zzz_parsers(sub):\n", "def add_zzz_parsers(sub):\n    thing = sub.add_parser('zzz')\n    thing.add_argument('--x')\n")
-        self.assertEqual(self.dc.registrar_findings(base, other_line, self.rule), ([], None), "a different line edited: not held")
+        edited = self.dc.registrar_findings(base, other_line, self.rule)   # the NEW rule: any changed line of a function that writes a namespace is held wherever it is called (the old "a different line edited: not held" is dropped)
+        self.assertIsNone(edited[1])
+        self.assertIn(("a changed line of a function that writes a namespace", "calls", "a statement that may write the module's namespace"), edited[0])
         removed = base.replace("    global %s\n    %s = None\n" % (self.pick()[1], self.pick()[1]), "    sub.add_parser('zzz')\n")
         self.assertEqual(self.dc.registrar_findings(base, removed, self.rule), ([], None), "a removed hostile line: not held")
         added = self.dc.registrar_findings(self.base_src, base, self.rule)[0]
-        self.assertEqual({r for r, _, _ in added}, {"add_zzz_parsers"})   # the named rebinding and the grammar's own finding (a Global statement is not in the grammar)
+        self.assertEqual({r for r, _, _ in added} - {"a changed line of a function that writes a namespace"}, {"add_zzz_parsers"})   # (the new rule also names the writer function by its own finding)  # the named rebinding and the grammar's own finding (a Global statement is not in the grammar)
         self.assertIn(("add_zzz_parsers", "rebinds", self.pick()[1]), added)
 
-    def test_a_change_to_a_function_that_is_not_a_registrar_is_not_held(self):
-        function, binding, module = self.pick()
+    def test_a_changed_line_of_a_function_that_is_not_a_registrar_is_held_when_it_writes_a_namespace(self):
+        function, binding, module = self.pick()   # the NEW rule replaces "a function that is not a registrar is not held": the writer is held by what it does, not by its name
         for name in ("helper_zzz", "cmd_zzz", "add_zzz_parser"):
             with self.subTest(name):
-                self.assertEqual(self.found("global %s\n%s = None\nimport %s" % (binding, binding, module), name=name), [])
+                got = self.found("global %s\n%s = None\nimport %s" % (binding, binding, module), name=name)
+                self.assertIn(("a changed line of a function that writes a namespace", "calls", "a statement that may write the module's namespace"), got)
 
     def test_an_unreadable_diff_holds_and_says_so(self):
         good = self.base_src
@@ -34764,6 +34767,7 @@ class TestRegistrarFloor(LedgerBase):
         clean("a name that stays data", reg("s = ''\ns.join(('a',))"))
         has("a def rebound then called", reg("def f():\n    pass\nf = int\nf('1')"), ("calls", "f"))
         has("a lambda rebound then called", reg("f = lambda: 1\nf = json\nf('1')"), ("calls", "f"))
+        has("an async def rebinding a def then called", reg("def f():\n    pass\nasync def f():\n    pass\nf('1')"), ("calls", "f"))
         clean("a def called", reg("def f():\n    sub.add_parser('a')\nf()"))
         has("a call of an element of a local list", reg("l = []\nl.append(os.system)\nl[0]('x')"), ("calls", "l"))
         has("a loop variable over a list", reg("for f in [os.system]:\n    f('x')"), ("calls", "f"))
