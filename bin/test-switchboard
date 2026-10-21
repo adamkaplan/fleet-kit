@@ -35537,6 +35537,7 @@ class TestImpactRejudge(LedgerBase):
         table = {"fleet_labels": (True, "a remover: the merged cleanup never removes it"),
                  "run_pass": (True, "the merged cleanup audits that it merged against it"),
                  "_labels_ours": (True, "the record never lists it as ours"),
+                 "recorded": (True, "the closed pass drops it from the record's labels: never removed"),
                  "_apply_impact_hold_locked": (True, "the rule never writes, restores or adopts it"),
                  "authors_hold_labels": (False, "the owner's plain clear lifts every fleet hold label, it included"),
                  "impact_clear_core": (True, "the delegated clear refuses it; the plain clear lifts it"),
