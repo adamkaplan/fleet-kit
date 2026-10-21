@@ -8,8 +8,12 @@ The last line printed is `RESULT: PASS` or `RESULT: FAIL`.
 The workflow is read as data by a small tolerant parser (the runners are not guaranteed to have PyYAML, and no other test in bin/ reads YAML):
 it handles exactly the shapes this file uses (mappings, lists of mappings, inline `[a, b]` lists, `|` block scalars, comments, quoted scalars).
 Each test pins one scenario of the plan; `Mutants` makes a one-line edit to the text per scenario and requires the pins to fail."""
+import json
+import os
 import re
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -120,15 +124,20 @@ MOVED = [n for n, _, _ in NEW_JOB]
 OLD_CHECKS = ["test (ubuntu-latest)", "test (macos-latest)"]
 CONCURRENCY = {"group": "test-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}",
                "cancel-in-progress": "${{ github.event_name == 'pull_request' }}"}
-TRIGGERS = ["pull_request", "push", "workflow_dispatch"]
+TRIGGERS = ["pull_request", "push", "schedule", "workflow_dispatch"]
 MATRIX = ["ubuntu-latest", "macos-latest"]
 
 
 # The expected STRUCTURE (the shape, not pieces): a key that is not listed fails, whatever its value (ask #868, review Medium).
-JOB_KEYS = ["defaults", "runs-on", "steps", "strategy"]
-STRATEGY = {"fail-fast": "false", "matrix": {"os": MATRIX}}
+# Since ask #990 the two jobs take their runners from a `plan` job's matrix (the macOS entry is in or out of the MATRIX, never skipped by an `if`):
+# the INTENT of the split is unchanged (the check names, the parallel cloud job, no needs between test and test-cloud) and is pinned on the names
+# the real plan script RESOLVES to per event (`resolved`). The LITERAL job shape below changed on purpose.
+JOB_KEYS = ["defaults", "name", "needs", "runs-on", "steps", "strategy"]
+STRATEGY = {"fail-fast": "false", "matrix": {"include": "${{ fromJSON(needs.plan.outputs.matrix) }}"}}
+JOB_NAMES = {"test": "${{ matrix.name }}", "test-cloud": "${{ matrix.cloud }}"}
 DEFAULTS = {"run": {"shell": "bash"}}
-ON = {"pull_request": None, "push": {"branches": ["main"]}, "workflow_dispatch": None}
+ON = {"pull_request": {"types": ["opened", "synchronize", "reopened", "ready_for_review"]}, "push": {"branches": ["main"]},
+      "schedule": [{"cron": "0 5 * * *"}], "workflow_dispatch": None}
 PERMISSIONS = {"contents": "read"}
 WORKFLOW_KEYS = ["concurrency", "jobs", "name", "on", "permissions"]
 
@@ -136,7 +145,7 @@ WORKFLOW_KEYS = ["concurrency", "jobs", "name", "on", "permissions"]
 # The expected STEP LISTS, written out in full and in order: every step is compared as the whole parsed mapping (key set and values), so a step,
 # or a key of a step, that is not listed fails. Nothing here is derived from the workflow it pins.
 NOT_CANCELLED = "${{ !cancelled() }}"
-CHECKOUT = {"uses": "actions/checkout@v5", "with": {"fetch-depth": "0"}}
+CHECKOUT = {"uses": "actions/checkout@v5", "with": {"fetch-depth": "0", "ref": "${{ matrix.ref }}"}}
 PYTHON = {"run": "python3 --version"}
 
 
@@ -170,6 +179,24 @@ STEP_KEYS = {"id": "id: x", "name": "name: x", "if": "if: false", "uses": "uses:
              "timeout-minutes": "timeout-minutes: 5", "working-directory": "working-directory: /tmp"}
 
 
+def resolved(job, event, base="", draft=False, text=None):
+    """The check names a job shows for `event`: the real `plan` script is RUN (in an empty directory: a push, a dispatch and a pull request into main read no
+    history) and the job's name template is filled from each row of the matrix it writes."""
+    text = WORKFLOW.read_text() if text is None else text
+    start = text.index("          python3 - <<'PY'\n")
+    end = text.index("\n          PY\n", start)
+    run = "\n".join(l[10:] for l in text[start:end + len("\n          PY")].splitlines()) + "\n"
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "out.txt")
+        open(out, "w").close()
+        env = dict(os.environ, EVENT=event, BASE=base, DRAFT="true" if draft else "false", GITHUB_OUTPUT=out)
+        subprocess.run(["bash", "-c", run], cwd=tmp, env=env, check=True, capture_output=True)
+        line = [l for l in open(out).read().splitlines() if l.startswith("matrix=")][-1]
+    rows = json.loads(line[len("matrix="):])
+    key = job["name"].replace("${{ matrix.", "").replace(" }}", "")
+    return sorted(r[key] for r in rows)
+
+
 def only_suites(table):
     return [row for row in table if row[0] not in ("bin/check-public-names", "bin/fleet-scenario validate", "bin/fleet-scenario coverage")]
 
@@ -178,6 +205,7 @@ class Pins(unittest.TestCase):
     """The plan's scenarios, read from `self.wf` (the real file by default; `Mutants` swaps in an edited copy)."""
 
     wf = None
+    text = None   # the workflow text behind `wf` (a mutant sets both), for the pins that RUN the plan script
 
     def setUp(self):
         self.wf = self.wf or load()
@@ -187,10 +215,13 @@ class Pins(unittest.TestCase):
 
     def test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems(self):
         jobs = self.jobs()
-        self.assertEqual(sorted(jobs), ["test", "test-cloud"])
-        for jid, job in jobs.items():
-            self.assertEqual(job["strategy"]["matrix"]["os"], MATRIX, jid)
-            self.assertNotIn("needs", job, jid)
+        self.assertEqual(sorted(jobs), ["plan", "test", "test-cloud"])
+        for jid in ("test", "test-cloud"):
+            self.assertEqual(jobs[jid]["needs"], "plan", jid)   # both need only the plan: no needs between test and test-cloud
+            self.assertEqual(jobs[jid]["strategy"], STRATEGY, jid)
+        # on both systems: a pull request into main and a push resolve the cloud job to both operating systems
+        self.assertEqual(resolved(jobs["test-cloud"], "pull_request", "main", text=self.text), ["test-cloud (macos-latest)", "test-cloud (ubuntu-latest)"])
+        self.assertEqual(resolved(jobs["test-cloud"], "push", text=self.text), ["test-cloud (macos-latest)", "test-cloud (ubuntu-latest)"])
         self.assertEqual([c for c in commands(jobs["test-cloud"])], NEW_JOB)
         for name in MOVED:
             self.assertNotIn(name, [n for n, _, _ in commands(jobs["test"])])
@@ -199,12 +230,14 @@ class Pins(unittest.TestCase):
 
     def test_s7_the_old_job_keeps_its_id_and_check_names(self):
         job = self.jobs()["test"]
-        self.assertNotIn("name", job)
-        self.assertEqual(checks(job, "test"), OLD_CHECKS)
+        self.assertEqual(job["name"], JOB_NAMES["test"])   # the name now comes from the plan's matrix; what it RESOLVES to is the intent
+        for event, base in (("pull_request", "main"), ("push", ""), ("workflow_dispatch", "")):
+            self.assertEqual(resolved(job, event, base, text=self.text), sorted(OLD_CHECKS), event)
+        self.assertEqual(resolved(job, "pull_request", "main", draft=True, text=self.text), ["test (ubuntu-latest)"])   # a draft into main: ubuntu only (ask #990)
 
     def test_u3_the_old_job_keeps_its_matrix_runner_and_shell(self):
         job = self.jobs()["test"]
-        self.assertEqual(job["strategy"]["matrix"]["os"], MATRIX)
+        self.assertEqual(job["strategy"]["matrix"], STRATEGY["matrix"])   # the runner list comes from the plan; the plan's rows are pinned in test_s7
         self.assertEqual(job["runs-on"], "${{ matrix.os }}")
         self.assertEqual(job["defaults"]["run"]["shell"], "bash")
         self.assertEqual(self.jobs()["test-cloud"]["runs-on"], "${{ matrix.os }}")
@@ -229,7 +262,7 @@ class Pins(unittest.TestCase):
         self.assertEqual(sorted(self.wf["on"]), sorted(TRIGGERS))
         self.assertEqual(self.wf["on"]["push"], {"branches": ["main"]})
         for jid, job in self.jobs().items():
-            self.assertNotIn("if", job, jid)
+            self.assertNotIn("if", job, jid)   # a skipped job would leave a required name unreported (ask #990)
         image = [s for s in self.jobs()["test"]["steps"] if s.get("name") == "cloud/tests/test-cloud"]
         self.assertEqual([s.get("timeout-minutes") for s in image], ["5"])
 
@@ -240,8 +273,13 @@ class Pins(unittest.TestCase):
         self.assertEqual(self.wf["on"], ON)
         self.assertEqual(self.wf["permissions"], PERMISSIONS)
         self.assertEqual(self.wf["concurrency"], CONCURRENCY)
-        for jid, job in self.jobs().items():
+        self.assertEqual(sorted(self.jobs()), ["plan", "test", "test-cloud"])
+        self.assertEqual(sorted(self.jobs()["plan"]), ["defaults", "name", "outputs", "runs-on", "steps"])
+        for jid in ("test", "test-cloud"):
+            job = self.jobs()[jid]
             self.assertEqual(sorted(job), JOB_KEYS, jid)
+            self.assertEqual(job["name"], JOB_NAMES[jid], jid)
+            self.assertEqual(job["needs"], "plan", jid)
             self.assertEqual(job["strategy"], STRATEGY, jid)
             self.assertEqual(job["runs-on"], "${{ matrix.os }}", jid)
             self.assertEqual(job["defaults"], DEFAULTS, jid)
@@ -269,10 +307,12 @@ class Mutants(unittest.TestCase):
     """One mutant per scenario (and per member class of the check-name family): each edit must make the matching pin fail."""
 
     def fails(self, old, new, *tests):
-        wf = load(mutate(WORKFLOW.read_text(), old, new))
+        mutated = mutate(WORKFLOW.read_text(), old, new)
+        wf = load(mutated)
         for t in tests:
             case = Pins(t)
             case.wf = wf
+            case.text = mutated
             result = unittest.TestResult()
             case.run(result)
             self.assertTrue(result.failures or result.errors, "mutant %r -> %r passed %s" % (old, new, t))
@@ -283,26 +323,22 @@ class Mutants(unittest.TestCase):
         self.assertEqual((result.failures, result.errors), ([], []))
 
     def test_s1_needs_added(self):
-        self.fails("  test-cloud:\n", "  test-cloud:\n    needs: test\n", "test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems")
+        self.fails("    needs: plan\n    name: ${{ matrix.cloud }}\n", "    needs: [plan, test]\n    name: ${{ matrix.cloud }}\n", "test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems")
 
     def test_s1_macos_dropped_from_the_new_job(self):
-        text = WORKFLOW.read_text()
-        i = text.index("  test-cloud:")
-        wf = load(text[:i] + text[i:].replace("[ubuntu-latest, macos-latest]", "[ubuntu-latest]", 1))
-        case = Pins("test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems")
-        case.wf = wf
-        result = unittest.TestResult()
-        case.run(result)
-        self.assertTrue(result.failures or result.errors)
+        self.fails("          macos = True\n", "          macos = False\n", "test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems", "test_s7_the_old_job_keeps_its_id_and_check_names")
+
+    def test_s1_the_cloud_job_named_like_the_test_job(self):
+        self.fails("    name: ${{ matrix.cloud }}\n", "    name: ${{ matrix.name }}\n", "test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems")
 
     def test_s1_launcher_limit_changed(self):
         self.fails("timeout-minutes: 30", "timeout-minutes: 20", "test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
 
     def test_s7_old_job_given_a_name(self):
-        self.fails("  test:\n    strategy:", "  test:\n    name: unit\n    strategy:", "test_s7_the_old_job_keeps_its_id_and_check_names")
+        self.fails("    name: ${{ matrix.name }}\n", "    name: unit\n", "test_s7_the_old_job_keeps_its_id_and_check_names")
 
     def test_s7_old_job_renamed(self):
-        wf = load(mutate(WORKFLOW.read_text(), "  test:\n    strategy:", "  unit:\n    strategy:"))
+        wf = load(mutate(WORKFLOW.read_text(), "  test:\n    needs: plan", "  unit:\n    needs: plan"))
         case = Pins("test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems")
         case.wf = wf
         result = unittest.TestResult()
@@ -310,13 +346,7 @@ class Mutants(unittest.TestCase):
         self.assertTrue(result.failures or result.errors)
 
     def test_u3_old_matrix_loses_macos(self):
-        text = WORKFLOW.read_text()
-        wf = load(text.replace("[ubuntu-latest, macos-latest]", "[ubuntu-latest]", 1))
-        case = Pins("test_u3_the_old_job_keeps_its_matrix_runner_and_shell")
-        case.wf = wf
-        result = unittest.TestResult()
-        case.run(result)
-        self.assertTrue(result.failures or result.errors)
+        self.fails("        include: ${{ fromJSON(needs.plan.outputs.matrix) }}", "        os: [ubuntu-latest]", "test_u3_the_old_job_keeps_its_matrix_runner_and_shell")
 
     def test_u1_a_command_edited(self):
         self.fails("bin/test-heartbeat 2>&1", "bin/test-heartbeat -q 2>&1", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
@@ -435,7 +465,8 @@ class Mutants(unittest.TestCase):
 
     def test_steps_an_extra_step_at_the_start_or_end_of_the_old_job(self):
         text = WORKFLOW.read_text()
-        self.killed(mutate(text, "  test:\n", "  test:\n").replace("    steps:\n", "    steps:\n      - run: echo x\n", 1), self.STEPS)
+        i = text.index("\n  test:\n")
+        self.killed(text[:i] + text[i:].replace("    steps:\n", "    steps:\n      - run: echo x\n", 1), self.STEPS)
         self.killed(mutate(text, "\n  # The cloud suites run beside", "\n      - run: echo x\n\n  # The cloud suites run beside"), self.STEPS)
 
     def test_shape_job_permissions_write_all(self):
@@ -454,7 +485,7 @@ class Mutants(unittest.TestCase):
     def test_shape_a_matrix_include_or_a_third_os(self):
         text = WORKFLOW.read_text()
         i = text.index("  test-cloud:")
-        self.killed(text[:i] + text[i:].replace("[ubuntu-latest, macos-latest]", "[ubuntu-latest, macos-latest, windows-latest]", 1), self.SHAPE)
+        self.killed(text[:i] + text[i:].replace("include: ${{ fromJSON(needs.plan.outputs.matrix) }}", "os: [ubuntu-latest, macos-latest, windows-latest]", 1), self.SHAPE)
 
 
 if __name__ == "__main__":

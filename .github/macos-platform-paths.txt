@@ -1,0 +1,27 @@
+# The platform-specific paths. A pull request into `integration` waits for a macOS runner only when its diff touches one of
+# these (glob patterns, `*` also crosses a `/`; one per line; `# group: <name>` opens a group). This is the ONE list: the
+# `plan` job of .github/workflows/test.yml and the workflow test both read this file and nothing copies it.
+# `bin/fleet-switchboard` is left out on purpose: almost every change touches it, and the push to main and the nightly catch a
+# platform regression there.
+
+# group: shims
+shims/**
+
+# group: plugins
+plugins/**
+
+# group: install-and-service
+bin/fleet-doctor
+bin/fleet-heartbeat
+bin/heartbeat-ack
+INSTALL.md
+templates/**
+
+# group: heavy-slot
+bin/heavy_slots.py
+bin/cpu_guard.py
+bin/disk_janitor.py
+
+# group: workflow
+.github/workflows/**
+.github/macos-platform-paths.txt

@@ -9264,8 +9264,8 @@ class TestHygiene(unittest.TestCase):
         self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", top)
         self.assertNotIn("cancel-in-progress: true", workflow, "an unconditional cancel would cancel a push to main")
         self.assertNotIn("github.ref }}", top, "a push to main must not share a group: GitHub drops a PENDING run of a shared group even without cancel-in-progress")
-        entries = [e.strip() for line in jobs.splitlines() for m in [re.match(r"\s+os:\s*\[(.*?)\]\s*(?:#.*)?$", line)] if m for e in m.group(1).split(",")]
-        self.assertEqual(entries.count("macos-latest"), 2, "one macOS job per job of the run (the two jobs `test` and `test-cloud`, ask #868): a single matrix entry in each")
+        # ask #990: the matrix is no longer a literal os list: the `plan` job decides it (one macOS entry per job of the run, in or out), pinned by WorkflowPlanPins below
+        self.assertEqual(jobs.count("include: ${{ fromJSON(needs.plan.outputs.matrix) }}"), 2, "the two jobs `test` and `test-cloud` take the plan's matrix")
         on = top.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
         self.assertIn("\n  workflow_dispatch:\n", on, "a head can be re-run without a push")
         self.assertNotIn("inputs:", workflow, "a dispatch takes no inputs")
@@ -9273,9 +9273,266 @@ class TestHygiene(unittest.TestCase):
         self.assertEqual(top.count("permissions:"), 1)
         self.assertIn("permissions:\n  contents: read\n", top, "read-only permissions unchanged")
         self.assertIn("name: test\n", top)       # the workflow and job names give the check names `test (<os>)` for a dispatch as for a pull request
-        self.assertIn("\njobs:\n  test:\n", workflow)
+        self.assertIn("\n  test:\n    needs: plan\n", workflow)
         self.assertIn("github.event.pull_request.number || github.sha }}", top, "a dispatch groups by its commit sha: it never shares, and so never cancels, the pull request run's group")
-        self.assertIn("os: [ubuntu-latest, macos-latest]", jobs)
+
+
+class WorkflowPlanPins(unittest.TestCase):
+    """ask #990: the macOS leg runs where it protects. The workflow's `plan` job is RUN here (its real script, in a throwaway git
+    repository), and the structure around it is pinned by its words; every mutant is an edit of a copy of the text in memory."""
+
+    WORKFLOW = REPO / ".github" / "workflows" / "test.yml"
+    LIST = REPO / ".github" / "macos-platform-paths.txt"
+    REQUIRED = ("test (macos-latest)", "test (ubuntu-latest)")
+    GROUPS = ("shims", "plugins", "install-and-service", "heavy-slot", "workflow")
+
+    @staticmethod
+    def entries(listtext):
+        return [l.strip() for l in listtext.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+
+    @classmethod
+    def retypable(cls, listtext):
+        """The entries a second copy could duplicate: all but the list file's own name (the workflow must name its file)."""
+        return [e for e in cls.entries(listtext) if e != str(cls.LIST.relative_to(REPO))]
+
+    @staticmethod
+    def groups(listtext):
+        found, current = {}, None
+        for line in listtext.splitlines():
+            m = re.match(r"#\s*group:\s*(\S+)\s*$", line)
+            if m:
+                current = m.group(1)
+                found[current] = []
+            elif line.strip() and not line.lstrip().startswith("#") and current:
+                found[current].append(line.strip())
+        return found
+
+    @staticmethod
+    def touching(entry):
+        return entry.replace("**", "sub/file.txt") if "**" in entry else entry
+
+    def plan(self, text, listtext, event, base="", draft=False, files=("docs/other.md",), integration=True, moves=(), head_list=None, unrelated=False):
+        """Run the plan job's script from `text` and return the matrix rows it writes."""
+        start = text.index("          python3 - <<'PY'\n")
+        end = text.index("\n          PY\n", start)
+        script = "\n".join(l[10:] for l in text[start:end + len("\n          PY")].splitlines()) + "\n"
+        tmp = self.repo_for(listtext, tuple(files), integration, tuple(moves), head_list, unrelated)
+        out = Path(tmp) / "out.txt"
+        out.write_text("")
+        summary = Path(tmp) / "summary.txt"
+        summary.write_text("")
+        env = dict(os.environ, EVENT=event, BASE=base, DRAFT="true" if draft else "false", GITHUB_OUTPUT=str(out), GITHUB_STEP_SUMMARY=str(summary))
+        done = subprocess.run(["bash", "-c", script], cwd=tmp, env=env, capture_output=True, text=True)
+        if done.returncode:
+            raise AssertionError("the plan script failed: " + done.stderr[-400:])
+        self.log, self.summary = done.stdout, summary.read_text()
+        line = [l for l in out.read_text().splitlines() if l.startswith("matrix=")][-1]
+        return json.loads(line[len("matrix="):])
+
+    _repos = {}
+
+    @classmethod
+    def repo_for(cls, listtext, files, integration, moves=(), head_list=None, unrelated=False):
+        """A throwaway repository (made once per shape, the script only reads it): a base commit holding the list and, on top, a change that touches `files`."""
+        key = (listtext, files, integration, moves, head_list, unrelated)
+        if key not in cls._repos:
+            tmp = tempfile.mkdtemp(prefix="plan-pin-")
+            def git(*args):
+                subprocess.run(["git", "-C", tmp, "-c", "user.name=t", "-c", "user.email=t@example.com"] + list(args), check=True, capture_output=True)
+            git("init", "-q", "-b", "main")
+            (Path(tmp) / ".github").mkdir()
+            if listtext is not None:
+                (Path(tmp) / ".github" / "macos-platform-paths.txt").write_text(listtext)
+            (Path(tmp) / "keep").write_text("x\n")
+            git("add", "-A")
+            git("commit", "-q", "-m", "base")
+            for name in ("main", "integration") if integration else ("main",):
+                git("update-ref", "refs/remotes/origin/" + name, "HEAD")
+            for src, dst in moves:   # a file that exists on the base and is moved (same content) to another path
+                (Path(tmp) / src).parent.mkdir(parents=True, exist_ok=True)
+                (Path(tmp) / src).write_text("a moved file\n" * 20)
+            if moves:
+                git("add", "-A")
+                git("commit", "-q", "-m", "base2")
+                for name in ("main", "integration"):
+                    git("update-ref", "refs/remotes/origin/" + name, "HEAD")
+                for src, dst in moves:
+                    (Path(tmp) / dst).parent.mkdir(parents=True, exist_ok=True)
+                    git("mv", src, dst)
+            if unrelated:   # a head with no common history with the base: the three-dot diff fails while the base list reads fine
+                git("checkout", "-q", "--orphan", "pr")
+                git("rm", "-rq", "--cached", ".")
+                (Path(tmp) / "keep").write_text("y\n")
+            if head_list is not None:   # the pull request rewrites the list on its own side
+                (Path(tmp) / ".github" / "macos-platform-paths.txt").write_text(head_list)
+            for f in files:
+                path = Path(tmp) / f
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(path.read_text() + "# edit\n" if path.exists() else "x\n")
+            git("add", "-A")
+            git("commit", "-q", "--allow-empty", "-m", "change")
+            cls._repos[key] = tmp
+        return cls._repos[key]
+
+    @classmethod
+    def tearDownClass(cls):
+        for tmp in cls._repos.values():
+            shutil.rmtree(tmp, ignore_errors=True)
+        cls._repos.clear()
+
+    def names(self, rows, key="name"):
+        return sorted(r[key] for r in rows)
+
+    def pin(self, text, listtext):
+        """The whole pin: raises AssertionError at the first rule the text breaks."""
+        def check(ok, message):
+            if not ok:
+                raise AssertionError(message)
+        top, jobs = text.split("\njobs:\n", 1)
+        on = top.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        check(re.findall(r"^  ([a-z_]+):", on, re.M) == ["pull_request", "push", "schedule", "workflow_dispatch"], "exactly the 4 triggers")
+        check("    types: [opened, synchronize, reopened, ready_for_review]\n" in on, "ready_for_review is among the pull_request types, exactly 4")
+        check("    branches: [main]\n" in on, "a push to main")
+        check(re.search(r'^    - cron: "\d{1,2} \d{1,2} \* \* \*"$', on, re.M), "a daily schedule")
+        check(re.findall(r"uses: (\S+)", text) == ["actions/checkout@v5"] * 3, "the only action is actions/checkout@v5 (no third-party action)")
+        check("permissions:\n  contents: read\n\n" in top and top.count("permissions:") == 1, "contents: read only")
+        check("secrets." not in text.replace("secrets.PRIVATE_NAMES", ""), "no new secret")
+        check("cancel-in-progress: ${{ github.event_name == 'pull_request' }}" in top, "the concurrency rule is unchanged")
+        check(re.findall(r"^  ([a-z][a-z-]*):$", jobs, re.M) == ["plan", "test", "test-cloud"], "the jobs")
+        check("\n  test:\n    needs: plan\n    name: ${{ matrix.name }}\n" in text, "test is named by the plan's name")
+        check("\n  test-cloud:\n    needs: plan\n    name: ${{ matrix.cloud }}\n" in text, "test-cloud is named by the plan's cloud name")
+        check(jobs.count("include: ${{ fromJSON(needs.plan.outputs.matrix) }}") == 2, "both take the plan's matrix")
+        check(jobs.count("ref: ${{ matrix.ref }}") == 2, "the nightly leg checks out its own ref")
+        check("PATH_LIST" not in text and 'LIST = ".github/macos-platform-paths.txt"' in text and "origin/\" + base + \":\" + LIST" in text, "the plan reads the one list file, from the base")
+        groups = self.groups(listtext)
+        check(sorted(groups) == sorted(self.GROUPS) and all(groups.values()), "the list names all 5 groups")
+        for entry in self.retypable(listtext):
+            check(entry not in text, "an entry of the list is re-typed in the workflow: " + entry)
+        def run(*a, **k):
+            return self.plan(text, k.pop("listtext", listtext), *a, **k)
+        key = lambda rows: self.names(rows)
+        both = list(self.REQUIRED)
+        check(key(run("pull_request", "main")) == both, "a pull request into main ends with both required results")
+        check(key(run("pull_request", "main", files=("docs/other.md",))) == both, "a docs-only pull request into main still runs macOS")
+        check(key(run("pull_request", "main", draft=True)) == ["test (ubuntu-latest)"], "a draft into main skips macOS")
+        check(key(run("pull_request", "main", draft=False)) == both, "marked ready, macOS runs")
+        for event in ("push", "workflow_dispatch"):
+            check(key(run(event)) == both, event + " runs both")
+        check(key(run("pull_request", "integration")) == ["test (ubuntu-latest)"], "a docs-only pull request into integration skips macOS")
+        check(key(run("pull_request", "integration", files=("bin/fleet-switchboard",))) == ["test (ubuntu-latest)"], "the monolith is not on the list")
+        for entry in self.entries(listtext):
+            check(key(run("pull_request", "integration", files=(self.touching(entry),))) == both, "a pull request into integration touching " + entry + " runs macOS")
+        first = self.entries(listtext)[0] if self.entries(listtext) else None
+        if first:
+            src = self.touching(first)
+            check(key(run("pull_request", "integration", files=(), moves=((src, "docs/moved.txt"),))) == both, "a file moved OUT of a listed path runs macOS")
+        check(key(run("pull_request", "gone-branch")) == both, "a failed diff (no such base) runs macOS")
+        # Which list each probe reads: the BASE branch's (the throwaway repository's base commit holds `listtext`); `head_list` is what
+        # the pull request itself writes. A pull request must not be able to rewrite the list that gates it.
+        nothing = "# group: nothing\nnever/matches/**\n"
+        check(key(run("pull_request", "integration", files=("shims/x",), head_list=nothing)) == both, "a pull request that rewrites the list to match nothing AND touches a shim runs macOS")
+        check(key(run("pull_request", "integration", files=(), head_list=nothing)) == both, "a pull request that only rewrites the list runs macOS (the list file itself is a fixed path)")
+        check(key(run("pull_request", "integration", files=(".github/macos-platform-paths.txt",))) == both, "a list edit runs macOS")
+        check(key(run("pull_request", "integration", files=("docs/other.md",), head_list="# group: x\ndocs/**\n")) == both, "a pull request that adds a harmless entry runs macOS (the list file is touched)")
+        check(key(run("pull_request", "integration", files=("docs/other.md",))) == ["test (ubuntu-latest)"], "the base list decides: docs only stays Ubuntu only")
+        check(key(run("pull_request", "integration", files=("docs/other.md",), unrelated=True)) == both, "a diff that fails (no common history) runs macOS although the base list reads fine")
+        bare = "\n".join(l for l in listtext.splitlines() if l.strip() != ".github/macos-platform-paths.txt") + "\n"
+        check(key(run("pull_request", "integration", files=(".github/macos-platform-paths.txt",), listtext=bare)) == both, "the list file's own path is fixed in the script: a list edit runs macOS even if the base list does not name itself")
+        # The workflow directory is hard-coded too: another workflow file runs macOS even when the base list has no entry for the directory.
+        nowf = "\n".join(l for l in listtext.splitlines() if not l.strip().startswith(".github/workflows")) + "\n"
+        check(key(run("pull_request", "integration", files=(".github/workflows/other.yml",), listtext=nowf)) == both, "a change under the workflow directory runs macOS even if the base list has no workflow entry")
+        check("workflow file is changed" in self.summary, "the workflow-directory reason is in the step summary")
+        check(key(run("pull_request", "integration", files=(".github/workflows-not/x.yml",), listtext=nowf)) == ["test (ubuntu-latest)"], "only the workflow directory itself is hard-coded, not a lookalike")
+        for bad in ("", "# group: shims\n\n", None):
+            check(key(run("pull_request", "integration", listtext=bad)) == both, "a list that is empty, comment-only or missing runs macOS")
+            check("fail safe" in self.log and "fail safe" in self.summary, "the fail-safe line is in the step log AND the step summary")
+        check(key(run("pull_request", "integration", files=("docs/other.md",), unrelated=True)) == both and "fail safe" in self.summary and "fail safe" in self.log, "a failed diff says so in the log and the summary")
+        check(key(run("pull_request", "integration", files=(".github/macos-platform-paths.txt",), listtext=bare)) == both and "is edited" in self.summary, "the list-edit reason is in the step summary")
+        check("fetch-depth: 0" in jobs.split("\n  test:\n", 1)[0], "the plan checkout has the full history")
+        nightly = run("schedule")
+        check(len(nightly) == 4 and sorted({r["ref"] for r in nightly}) == ["integration", "main"], "the nightly: main and integration, two operating systems each")
+        check(all(r["name"].startswith("nightly ") and r["cloud"].startswith("nightly-cloud ") for r in nightly), "nightly names")
+        check(not set(key(nightly)) & set(self.REQUIRED) and not {r["cloud"] for r in nightly} & {"test-cloud (macos-latest)", "test-cloud (ubuntu-latest)"}, "no nightly name equals a required one")
+        check(sorted({r["ref"] for r in run("schedule", integration=False)}) == ["main"], "a missing integration branch drops that leg")
+        check("plan" not in self.REQUIRED, "the plan job's name is not a required name")
+
+    def test_the_real_workflow_and_list_pass_every_pin(self):
+        self.pin(self.WORKFLOW.read_text(), self.LIST.read_text())
+
+    def test_the_list_is_one_file_and_this_test_does_not_retype_it(self):
+        listtext = self.LIST.read_text()
+        entries = self.entries(listtext)
+        for group, members in self.groups(listtext).items():
+            self.assertTrue(members, group)
+        self.assertEqual(sorted(self.groups(listtext)), sorted(self.GROUPS))
+        source = inspect.getsource(WorkflowPlanPins)
+        for entry in self.retypable(listtext):
+            self.assertNotIn('"' + entry + '"', source, "the test re-types an entry: " + entry)
+        every = subprocess.run(["git", "-C", str(REPO), "ls-files"], capture_output=True, text=True).stdout.split("\n")
+        for entry in entries:
+            if any(c in entry for c in "*?["):
+                self.assertTrue([f for f in every if fnmatch.fnmatchcase(f, entry)], "a glob matches no tracked file: " + entry)
+            else:
+                self.assertIn(entry, every, "an entry is not a tracked file (typo?): " + entry)
+        tracked = subprocess.run(["git", "-C", str(REPO), "ls-files", ".github"], capture_output=True, text=True).stdout.split()
+        self.assertEqual([t for t in tracked if t.endswith(".txt")], [".github/macos-platform-paths.txt"])
+
+    def mutants(self):
+        """Each mutant: (name, workflow text, list text). Derived from the real files; one per member of each family."""
+        text, listtext = self.WORKFLOW.read_text(), self.LIST.read_text()
+        def swap(old, new):
+            self.assertIn(old, text, "the mutant's anchor moved: " + old)
+            return text.replace(old, new, 1)
+        out = [
+            ("macOS for every pull request", swap("macos = diff.returncode != 0 or LIST in files or any(", "macos = True or LIST in files or any("), listtext),
+            ("macOS dropped from every pull request into integration", swap("macos = diff.returncode != 0 or LIST in files or any(", "macos = False and any("), listtext),
+            ("the nightly trigger dropped", swap('  schedule:\n    - cron: "0 5 * * *"\n', ""), listtext),
+            ("the nightly legs dropped", swap('if event == "schedule":', 'if event == "never":'), listtext),
+            ("the nightly without integration", swap('["main"] + (["integration"]', '["main"] + ([]'), listtext),
+            ("a nightly leg named like a required one", swap('name="nightly %s (%s)" % (r, o)', 'name="test (%s)" % o'), listtext),
+            ("macOS skipped for a pull request into main", swap("macos = not draft", "macos = False"), listtext),
+            ("the draft rule dropped", swap("macos = not draft", "macos = True"), listtext),
+            ("ready_for_review dropped", swap("types: [opened, synchronize, reopened, ready_for_review]", "types: [opened, synchronize, reopened]"), listtext),
+            ("the path list not read", swap('LIST = ".github/macos-platform-paths.txt"', 'LIST = ".github/missing.txt"'), listtext),
+            ("the list read from the head, no self-touch rule", swap('shown = git("show", "origin/" + base + ":" + LIST)', 'shown = git("show", "HEAD:" + LIST)').replace("or LIST in files ", ""), listtext),
+            ("no self-touch rule", swap("or LIST in files ", ""), listtext),
+            ("the workflow directory not hard-coded", swap("or any(f.startswith(WORKFLOWS) for f in files) ", ""), listtext),
+            ("the workflow directory prefix widened", swap('WORKFLOWS = ".github/workflows/"', 'WORKFLOWS = ".github/workflows"'), listtext),
+            ("the fail-safe lines not in the summary", swap("summary.write(message", "summary.write(''"), listtext),
+            ("the summary written only for the log", swap('if os.environ.get("GITHUB_STEP_SUMMARY"):', "if False:"), listtext),
+            ("the path list emptied", text, "# group: shims\n"),
+            ("renames detected", swap('"diff", "--no-renames", "--name-only"', '"diff", "--name-only"'), listtext),
+            ("a failed diff skips macOS", swap("macos = diff.returncode != 0 or LIST in files or any(", "macos = diff.returncode == 0 and any("), listtext),
+            ("an empty list runs no macOS", swap("if not patterns:", "if False:"), listtext),
+            ("a missing list crashes", swap("if shown.returncode == 0 else []", "if shown.returncode == 0 else [][0]"), listtext),
+            ("the plan checkout shallow", swap("    steps:\n      - uses: actions/checkout@v5\n        with:\n          fetch-depth: 0\n", "    steps:\n      - uses: actions/checkout@v5\n"), listtext),
+            ("edited among the types", swap("types: [opened, synchronize, reopened, ready_for_review]", "types: [opened, synchronize, reopened, ready_for_review, edited]"), listtext),
+            ("the job renamed", swap("name: ${{ matrix.name }}", "name: macos-${{ matrix.os }}"), listtext),
+            ("a third-party action", swap("      - name: Decide the runners\n", "      - uses: dorny/paths-filter@v3\n      - name: Decide the runners\n"), listtext),
+            ("a wider permission", swap("permissions:\n  contents: read\n", "permissions:\n  contents: read\n  issues: write\n"), listtext),
+            ("an unconditional cancel", swap("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", "cancel-in-progress: true"), listtext),
+        ]
+        for group, members in self.groups(listtext).items():
+            out.append(("the group %s emptied from the list" % group, text, re.sub(r"(?m)^(?!#)(?:%s)\n" % "|".join(re.escape(m) for m in members), "", listtext)))
+        for entry in self.retypable(listtext):
+            out.append(("the entry %s re-typed in the workflow" % entry, text + "\n# " + entry + "\n", listtext))
+        return out
+
+    def test_every_mutant_fails_a_pin(self):
+        mutants = self.mutants()
+        self.assertGreaterEqual(len(mutants), 15 + len(self.GROUPS) + len(self.retypable(self.LIST.read_text())))
+        for name, text, listtext in mutants:
+            with self.subTest(mutant=name):
+                with self.assertRaises(AssertionError, msg="the mutant passed the pins: " + name):
+                    self.pin(text, listtext)
+
+    def test_the_docs_say_which_runs_happen_when_and_how_to_re_run(self):
+        docs = (REPO / "docs" / "switchboard.md").read_text()
+        section = docs.split("**Which runs happen when (the test workflow).**", 1)[1].split("\n\n**", 1)[0]
+        for needle in ("18 minutes", "64", "195", "198", "44 percent", "39 percent", "pull request into `main`", "pull request into `integration`",
+                       "push to `main`", "nightly", "manual dispatch", "draft", "ready_for_review", ".github/macos-platform-paths.txt", "--no-renames", "is not re-planned by the retarget itself", "runs macOS and says so on the plan step",
+                       "a pull request is re-run with a re-run, never by closing and reopening it"):
+            self.assertIn(needle, section, needle)
 
 
 # ======================================================================
