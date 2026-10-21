@@ -4523,6 +4523,29 @@ so the steps and minutes the gates cost can be reported.
 
 **Re-running a head's CI.** A head with no run, or a run that was cancelled, is re-run without a push or a close and reopen: `gh workflow run test.yml --ref <branch>` (the workflow has `workflow_dispatch`, no inputs; its checks are named like a pull request run's and count for the branch's head; its concurrency group is its commit sha, so it never cancels the pull request's own run). Then `gates ci-record <repo#N>`.
 
+**Which runs happen when (the test workflow).** The cause, measured the day it was found: the macOS queue wait had a mean of 18 minutes, a 90th percentile of 64 and a longest of 195, in a sample of 198 macOS jobs; 44 percent of them were cancelled by our own pushes and re-runs, and 39 percent were for pull requests into `integration`, which no ruleset requires. So the macOS leg of `.github/workflows/test.yml` runs where it protects something. A small `plan` job (a few seconds, on Ubuntu) puts the macOS entry in or out of the matrix, so the required names `test (macos-latest)` and `test (ubuntu-latest)` are unchanged and never skipped by accident:
+
+- a pull request into `main`: both legs, macOS unconditional; a **draft** into `main` runs only the Ubuntu leg until it is marked ready (`ready_for_review` is a trigger type, and marking it ready starts the macOS leg);
+- a pull request into `integration`: the Ubuntu leg always; macOS only when the diff (a plain `git diff --no-renames --name-only`, so a file moved out of a listed path counts; a list that cannot be read or holds no pattern, or a diff that fails, runs macOS and says so on the plan step and in its step summary) touches a path of the one list, `.github/macos-platform-paths.txt`, read from the BASE branch so the pull request cannot rewrite the list that gates it (a pull request that edits that file, or changes any file under `.github/workflows/`, runs macOS by a path fixed in the plan script, independent of the list) (the shims, the plugins, the install and service code, the heavy-slot code, the workflow files; `bin/fleet-switchboard` is left out on purpose);
+- a push to `main` and a manual dispatch: both legs;
+- the nightly (05:00 UTC, the default branch's workflow file): both legs for `main` and for `integration`, named `nightly <ref> (<os>)` so they cannot be mistaken for a required name; a missing `integration` branch drops that leg.
+
+Every path or condition the plan script decides from, and where it comes from:
+
+| Decision | Source |
+|---|---|
+| the event (pull request, push, dispatch, nightly) and the base branch (`main` or not) | hard-coded in the script |
+| a draft into `main` skips macOS | hard-coded in the script |
+| the list file's own path, `.github/macos-platform-paths.txt` (an edit of it runs macOS) | hard-coded in the script |
+| the workflow directory, `.github/workflows/` (a change under it runs macOS) | hard-coded in the script |
+| the nightly's refs (`main`, and `integration` when that branch exists) | hard-coded in the script |
+| a diff that fails, or a base list that cannot be read or holds no pattern: macOS runs (fail safe), and the reason goes to the step log and the step summary | hard-coded in the script |
+| every other platform path (the shims, the plugins, the install and service code, the heavy-slot code) | read from the list on the BASE branch |
+
+Each row is pinned through the real script, and each has a mutant that fails the pins.
+
+A pull request retargeted from `integration` to `main` is not re-planned by the retarget itself (`edited` is not a trigger type, so that a title or body edit never starts a run): push to it or re-run it, and the plan then sees base `main`. Only the macOS result of a draft into `main`, or of an `integration` pull request that touches no listed path, is absent. Telling the daemon of a failed nightly is a later slice of ask #990. In short, a pull request is re-run with a re-run, never by closing and reopening it (a close and reopen cancels its run and queues a new macOS job): `gh run rerun <id>`, or `gh workflow run test.yml --ref <branch>`.
+
 **The built-in `ci` recorder.** `fleet-switchboard gates ci-record <repo#N>` makes the switchboard itself record the `ci` verdict. It reads the PR's
 check runs at its **current head** through `gh` (the repo's account) and only when they are all complete and green records a passing `ci`
 verdict, by the reserved name `switchboard`, for each per-PR scenario that names `ci`, bound to that head and to the plan's current hash. For a
