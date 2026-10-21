@@ -174,7 +174,7 @@ The managed reaper's loop (`reap --loop`) does it, as one more step of each pass
 - **When.** For each running pod, when the token is `GIT_TOKEN_RENEW_AFTER_SECONDS` (1800, so 30 minutes of its life are left) old. The age is the Secret's
   `cw/git-token-minted` annotation, or the Secret's creation time when it has none. A pass that finds the token older than an hour (the machine slept) renews at once.
 - **How.** It mints through the SAME route as the launch (`run_git_token_cmd`: `CW_GIT_TOKEN_CMD`, else `app_token.py OWNER/NAME`), so one repository, the exact
-  permissions and the 61-minute cap hold by construction, and replaces only the `git-token` key by one merge patch whose body goes on standard input. The token is
+  permissions and the 61-minute cap hold by construction, and replaces only the `git-token` key by one merge patch whose body goes on standard input. The patch is bound to the exact Secret that was checked: its body carries that Secret's `metadata.uid` and `metadata.resourceVersion`, so the API server refuses it (Conflict) if the Secret changed or was made again while the mint ran (a relaunch of the same worker gets the same names); the labels are read again after the mint as a second guard. A refusal keeps the old state, writes one audit line (`the secret changed during the mint: not renewed`), names the worker in the report and is retried at the next pass. The token is
   never in an argument, an environment value, a file, an output, an audit line or a record. The pod needs no change: its credential helper and `gh` wrapper read the file at every
   call, and the file is a whole-directory projected volume (no `subPath`) that the kubelet refreshes, usually within a minute or two.
 - **For which repository.** The pod's `CW_REPO` must equal the `repo` of the switchboard's worker record (read only, `CW_CLOUD_RECORD_DIR`, which the renewal therefore needs in the reaper's
@@ -182,7 +182,22 @@ The managed reaper's loop (`reap --loop`) does it, as one more step of each pass
 - **The reaper's own needs.** It runs the mint, so it reads the vault settings (`CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME`, from the settings file as the launcher does) and needs a signed-in `az` session and a network path the vault accepts.
   Without them every renewal fails closed (below) and workers behave as before: they lose push at one hour.
 - **When it fails** (the vault, the lookup, the mint or the patch): the old token stays, one audit line (`action: renew-git-token`, `ok: false`, the reason, never a value) is written, and the next pass tries again. The worker is
-  named in the pass's report as `git token not renewed: ...` with exit 1, so its lane can retire it before the token ends. A renewal writes one `ok: true` line and a `git token renewed` entry.
+  named in the pass's report as `git token not renewed: ...` with exit 1, so its lane can retire it before the token ends. A failure that persists is audited once per CHANGE of reason, not every pass (the report still names the worker every pass); a renewal writes one `ok: true` line, which also marks a failure as cleared, and a `git token renewed` entry.
+- **Clock skew.** The age is judged by the reaper's clock against the stamp the reaper itself wrote (or the cluster's creation time): a skew of a few minutes between them shifts the renewal by that much, and a stamp from the future is not trusted (it is renewed at once). The 30-minute margin absorbs a skew of several minutes; a larger one is a clock to fix.
+
+#### Acting on an object later, by name
+
+A place that reads a Secret or pod and acts on it later by name either carries a precondition or says why not. Names come back: a stopped worker's pod and Secret names are
+the next run's names.
+
+| Place | Reads | Acts | Precondition, or why none |
+| --- | --- | --- | --- |
+| The git token renewal | the per-run Secret (labels, `uid`, `resourceVersion`) | one merge patch, by name, after a mint of up to a minute | Yes: the patch body carries the `uid` and `resourceVersion`; the labels are read again after the mint |
+| The launcher's cleanup of a failed create (`_cleanup`) | the object's run id (`_mine`) | deletes it by name | Accepted: the run id is read immediately before each delete (no mint, no hook, no wait between), and a create of that name is refused while the old object exists |
+| `stop` and the reaper's idle and hard-limit stops (`_remove`) | the pod at the start, then each object's run id again (`_mine`) | deletes by name, after the end hook (which can take minutes) | Accepted: the long gap is covered because the run id is read again right before each delete; only a read-to-delete of a few milliseconds remains, as in the cleanup |
+| `stop`: `annotate kept` and `annotate hook-ran` | the pod at the start | annotates the pod by name after the hook | Accepted: the pod was this run's when the hook ran in it, a replacement needs this run's pod deleted first (only a stop or `delete` does that), and the annotation carries no credential (at worst a pod lingers) |
+| `delete` (no run id given) | the pod | deletes the pod and both Secrets by name | Accepted: the operator's explicit command by name, with no run id to compare; `--force` is its own statement |
+| `extend` | the pod | annotates the deadline by name | Accepted: the operator's explicit command by name, one annotation, no credential |
 
 ## Server-side guards: `app_token.py` and `preflight.py`
 

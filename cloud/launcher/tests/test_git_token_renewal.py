@@ -45,7 +45,7 @@ def tok(label):
     return "t" + hashlib.sha256(label.encode()).hexdigest()[:36]
 
 
-OLD, NEW = tok("first"), tok("second")
+OLD, NEW, OTHER_TOKEN = tok("first"), tok("second"), tok("other run")
 
 
 def slices(value, n=8):
@@ -134,7 +134,17 @@ class Harness(base.Base):
                     "    sys.stderr.write('mint refused ' + %r + '\\n'); sys.exit(1)\n"
                     "if mode == 'fail':\n"
                     "    sys.stderr.write('vault says no\\n'); sys.exit(1)\n"
-                    "sys.stdout.write('two words' if mode == 'space' else %r)\n" % (self.mode_file, self.minted, OLD, NEW))
+                    "if mode in ('relabel', 'relabel_norv', 'touch', 'recreate', 'delete', 'relaunch'):\n"
+                    "    import json as j\n"
+                    "    p = os.environ['FAKE_KUBE_STATE']; st = j.load(open(p)); run = %r\n"
+                    "    if mode == 'relabel': st['secret_labels'][run] = {'cw/pod': %r, 'cw/run-id': 'f' * 16}; st['secret_rv'][run] = st['secret_rv'].get(run, 1) + 1\n"
+                    "    if mode == 'relabel_norv': st['secret_labels'][run] = {'cw/pod': %r, 'cw/run-id': 'f' * 16}\n"
+                    "    if mode == 'touch': st['secret_rv'][run] = st['secret_rv'].get(run, 1) + 1\n"
+                    "    if mode == 'recreate': st['secret_meta'][run] = dict(st['secret_meta'][run], uid='uid-new')\n"
+                    "    if mode == 'delete': del st['secrets'][run]\n"
+                    "    if mode == 'relaunch': st['secret_labels'][run] = {'cw/pod': %r, 'cw/run-id': 'f' * 16}; st['secret_rv'][run] = st['secret_rv'].get(run, 1) + 1; st['secret_meta'][run] = dict(st['secret_meta'][run], uid='uid-new'); st['secret_bodies'][run]['git-token'] = %r\n"
+                    "    j.dump(st, open(p, 'w'))\n"
+                    "sys.stdout.write('two words' if mode == 'space' else %r)\n" % (self.mode_file, self.minted, OLD, self.name + "-run", self.name, self.name, self.name, OTHER_TOKEN, NEW))
         self.set_mode("ok")
         self.env.update(CW_CLOUD_RECORD_DIR=self.records, CW_GIT_TOKEN_CMD="%s %s" % (sys.executable, script),
                         FAKE_KUBE_ECHO=OLD + " " + NEW, FAKE_KUBE_SEEN=os.path.join(d, "seen.jsonl"))
@@ -171,7 +181,7 @@ class Harness(base.Base):
             st["secrets"] = {run: 1, self.name + "-pw": 1}
             st["secret_labels"] = {run: labels if labels is not None else {"cw/pod": self.name, "cw/run-id": run_id}}
             st["secret_bodies"] = {run: {"git-token": OLD, "model-auth": "{}"}}
-            st["secret_meta"] = {run: {"creationTimestamp": cw.iso(T0)}}
+            st["secret_meta"] = {run: {"creationTimestamp": cw.iso(T0), "uid": "uid-1"}}
         st["fail_cmd"], st["patch_noop"] = None, None
         self.write_state(st)
         rec = os.path.join(self.records, WORKER + ".json")
@@ -237,15 +247,16 @@ class RealMint(Harness):
 
     def setUp(self):
         super().setUp()
-        ta.Stub.seen, ta.Stub.redirect, ta.Stub.pad_to = [], None, None
+        ta.Stub.seen, ta.Stub.redirect, ta.Stub.pad_to, ta.Stub.lookup = [], None, None, None
+        ta.Stub.gets, ta.Stub.installs = [], {"acme-org": 678}
         self.answer()
         del self.env["CW_GIT_TOKEN_CMD"]   # the default route: app_token.py OWNER/NAME
-        self.env.update(CW_APP_ID_CMD="echo 12345", CW_APP_INSTALLATION_CMD="echo 678", CW_APP_KEY_CMD="cat '%s'" % self.keyfile,
+        self.env.update(CW_APP_ID_CMD="echo 12345", CW_APP_KEY_CMD="cat '%s'" % self.keyfile,
                         CW_GITHUB_API_BASE="http://127.0.0.1:%d" % self.srv.server_port)
 
     def answer(self, repos=None, perms=None, life=3500):
         ta.Stub.answer = {"token": NEW, "expires_at": ta.iso(life), "permissions": dict(perms if perms is not None else ta.PERMS),
-                          "repositories": repos if repos is not None else [{"name": "widget-service", "full_name": REPO}]}
+                          "repositories": repos if repos is not None else [{"name": "widget-service", "full_name": REPO, "owner": {"id": 9}}]}
 
     def drive_fake_clock(self, minutes=63):
         """A pass every 60 seconds from T to T+63 minutes: (mints by T+59, the minute the token was swapped, the oldest token age seen)."""
@@ -292,8 +303,8 @@ class RealMint(Harness):
             self.check_s2()
 
     def test_s8_a_reply_with_more_or_other_repositories_or_permissions_or_a_longer_life_is_not_written(self):
-        two = [{"name": "widget-service", "full_name": REPO}, {"name": "other-service", "full_name": "acme-org/other-service"}]
-        other = [{"name": "widget-api", "full_name": OTHER}]
+        two = [{"name": "widget-service", "full_name": REPO, "owner": {"id": 9}}, {"name": "other-service", "full_name": "acme-org/other-service", "owner": {"id": 9}}]
+        other = [{"name": "widget-api", "full_name": OTHER, "owner": {"id": 9}}]
         for what, kw in (("two repositories", {"repos": two}), ("another repository", {"repos": other}),
                          ("an extra permission", {"perms": dict(ta.PERMS, administration="write")}), ("a life of over 61 minutes", {"life": 7300})):
             with self.subTest(what):
@@ -310,7 +321,7 @@ class RealMint(Harness):
     def test_s9_a_vault_lookup_mint_or_secret_failure_keeps_the_old_token_audits_names_the_worker_and_retries(self):
         faults = {
             "the vault read": (lambda: self.env.update(CW_APP_KEY_CMD="false"), lambda: self.env.update(CW_APP_KEY_CMD="cat '%s'" % self.keyfile)),
-            "the lookup": (lambda: self.env.update(CW_APP_INSTALLATION_CMD="false"), lambda: self.env.update(CW_APP_INSTALLATION_CMD="echo 678")),
+            "the installation lookup": (lambda: setattr(ta.Stub, "lookup", (404, {"message": "Not Found"})), lambda: setattr(ta.Stub, "lookup", None)),
             "the mint": (lambda: setattr(ta.Stub, "redirect", "http://127.0.0.1:9/x"), lambda: setattr(ta.Stub, "redirect", None)),
             "the Secret patch": (lambda: self.patch_state(fail_cmd="patch"), lambda: self.patch_state(fail_cmd=None)),
         }
@@ -333,6 +344,149 @@ class RealMint(Harness):
                 self.assertEqual(self.secret()["token"], NEW)
                 self.assertEqual(res, [(WORKER, "git token renewed", 0)])
                 self.assertTrue(self.audit()[-1]["ok"])
+
+
+def text_mutant(old, new):
+    """The real source with one piece of text replaced (a mutant the guard remover cannot make); the replaced text must be there."""
+    src = load_source()
+    assert src.count(old) == 1, "mutation site not found: %r" % old
+    mod = types.ModuleType("cloud_worker_text_mutant")
+    mod.__file__ = SOURCE_PATH
+    exec(compile(src.replace(old, new), SOURCE_PATH, "exec"), mod.__dict__)
+    return mod
+
+
+class DuringTheMint(Harness):
+    """A relaunch of the same worker during the mint (same pod name, so the same Secret name): the token minted for the old run
+    must never land in the new run's Secret. Each guard has a scenario only it catches (the others are blind to it)."""
+
+    def run_mode(self, mode, state=None):
+        self.install_worker()
+        if state:
+            self.patch_state(**state)
+        self.set_mode(mode)
+        self.at(minutes=31)
+        before = self.secret()
+        res = self.one_pass()
+        return before, res
+
+    def assert_refused(self, before, res):
+        self.assertEqual(self.secret()["token"], before["token"])   # (a refused patch may be attempted: it must not land)
+        self.assertEqual([(w, c) for w, _, c in res], [(WORKER, 1)])
+        self.assertIn("the secret changed during the mint: not renewed", res[0][1])
+        last = self.audit()
+        self.assertEqual(len(last), 1)
+        self.assertEqual((last[0]["ok"], last[0]["reason"]), (False, "the secret changed during the mint: not renewed"))
+
+    def test_a_relaunch_during_the_mint_leaves_the_new_runs_secret_whole_and_the_next_pass_retries_it(self):
+        before, res = self.run_mode("relaunch")
+        self.assertEqual(self.secret()["token"], OTHER_TOKEN)   # the other run's own token, untouched
+        self.assertEqual([(w, c) for w, _, c in res], [(WORKER, 1)])
+        self.assertEqual(len(self.audit()), 1)
+        self.assertNotIn(NEW, json.dumps(self.audit()) + json.dumps(res))
+        # the new run's Secret is now labelled for the other run and the pod is not: it is left whole, quietly, until the pod follows
+        self.set_mode("ok")
+        self.at(minutes=32)
+        self.assertEqual(self.one_pass(), [])
+        self.assertEqual(self.secret()["token"], OTHER_TOKEN)
+
+    def test_relabelled_during_the_mint(self):
+        self.assert_refused(*self.run_mode("relabel"))
+
+    def test_touched_during_the_mint(self):
+        self.assert_refused(*self.run_mode("touch"))
+
+    def test_deleted_and_made_again_during_the_mint(self):
+        self.assert_refused(*self.run_mode("recreate"))
+
+    def test_the_old_state_stays_and_the_next_pass_renews(self):
+        before, res = self.run_mode("touch")
+        self.set_mode("ok")
+        self.at(minutes=32)
+        self.assertEqual(self.one_pass(), [(WORKER, "git token renewed", 0)])
+        self.assertEqual(self.secret()["token"], NEW)
+
+    def test_the_patch_carries_the_uid_and_resourceversion_that_were_checked_and_the_token_only_on_stdin(self):
+        self.install_worker()
+        self.at(minutes=31)
+        rv = self.secret()["rv"]
+        self.assertEqual(self.one_pass(), [(WORKER, "git token renewed", 0)])
+        with open(self.state + ".stdin") as f:
+            body = json.loads(f.read().strip().splitlines()[-1])
+        self.assertEqual((body["metadata"]["uid"], body["metadata"]["resourceVersion"]), ("uid-1", str(rv)))
+        for call in self.patches():
+            self.assertNotIn(NEW, " ".join(call))
+
+    def killed(self, mod, mode):
+        """True when the mutant source writes into a Secret that changed during the mint (the real source never does)."""
+        self.cwm = mod
+        self.install_worker()
+        self.set_mode(mode)
+        self.at(minutes=31)
+        self.one_pass()
+        return self.secret()["token"] == NEW
+
+    def test_the_real_source_survives_none_of_the_three_scenarios(self):
+        for mode in ("touch", "recreate", "relabel_norv"):
+            with self.subTest(mode):
+                self.assertFalse(self.killed(cw, mode))
+
+    def test_mutant_without_the_resourceversion_is_caught(self):
+        mod = text_mutant(',\n                                        "resourceVersion": meta.get("resourceVersion")}', "}")
+        self.assertTrue(self.killed(mod, "touch"))
+
+    def test_mutant_without_the_uid_is_caught(self):
+        mod = text_mutant('"uid": meta.get("uid"),', "")
+        self.assertTrue(self.killed(mod, "recreate"))
+
+    def test_mutant_without_the_post_mint_label_recheck_is_caught(self):
+        mod = text_mutant('            raise _NotRenewed("the secret changed during the mint: not renewed")\n        minted', '            pass\n        minted')
+        self.assertTrue(self.killed(mod, "relabel_norv"))
+
+
+class PersistentFailure(Harness):
+    """One audit line per CHANGE of reason, and the success line when it clears; the report still names the worker every pass."""
+
+    def test_a_failure_that_persists_is_written_once_and_a_new_reason_and_the_clearing_are_written_again(self):
+        L = self.launcher()
+        self.set_mode("fail")
+        for minute in (31, 32, 33):
+            self.at(minutes=minute)
+            res = self.one_pass(L)
+            self.assertEqual([(w, c) for w, _, c in res], [(WORKER, 1)])   # reported every pass
+        self.assertEqual(len(self.audit()), 1)
+        self.set_mode("space")   # another reason
+        self.at(minutes=34)
+        self.one_pass(L)
+        self.assertEqual(len(self.audit()), 2)
+        self.at(minutes=35)
+        self.one_pass(self.launcher())   # a new process of the reaper reads the same audit file
+        self.assertEqual(len(self.audit()), 2)
+        self.set_mode("ok")
+        self.at(minutes=36)
+        self.assertEqual(self.one_pass(L), [(WORKER, "git token renewed", 0)])
+        self.assertEqual([a["ok"] for a in self.audit()], [False, False, True])
+
+    def test_the_same_failure_after_a_clearing_is_written_again(self):
+        self.set_mode("fail")
+        self.at(minutes=31)
+        self.one_pass()
+        self.set_mode("ok")
+        self.at(minutes=32)
+        self.one_pass()
+        self.set_mode("fail")
+        self.at(minutes=93)
+        self.one_pass()
+        self.assertEqual([a["ok"] for a in self.audit()], [False, True, False])
+
+    def test_a_mutant_that_writes_every_pass_is_caught(self):
+        mod = text_mutant('if self._last_renewal_audit(rid) == (False, self.kube.scrub(why, limit=1000)):', 'if False:')
+        self.cwm = mod
+        self.set_mode("fail")
+        for minute in (31, 32):
+            self.at(minutes=minute)
+            self.one_pass()
+        self.assertEqual(len(self.audit()), 2)   # the real source writes one
 
 
 class Cases(Harness):
@@ -365,6 +519,11 @@ class Cases(Harness):
             del st["secret_bodies"][self.name + "-run"]["git-token"]
             self.write_state(st)
 
+        def no_uid():
+            st = self.st()
+            del st["secret_meta"][self.name + "-run"]["uid"]
+            self.write_state(st)
+
         return {
             "quiet: the pod is not running": ("quiet", inst(phase="Pending"), ""),
             "quiet: no per-run Secret": ("quiet", inst(secret=False), ""),
@@ -382,6 +541,12 @@ class Cases(Harness):
             "failed: the mint fails": ("failed", mode("fail"), "the mint failed"),
             "failed: the mint echoes the old token": ("failed", mode("echo"), "the mint failed"),
             "failed: the mint gives a token with a space": ("failed", mode("space"), "whitespace"),
+            "refused: the Secret has no uid": ("refused", no_uid, "no uid or resourceVersion"),
+            "failed: the Secret changed during the mint (relabelled by a relaunch)": ("failed", mode("relabel"), "the secret changed during the mint"),
+            "failed: the Secret was touched during the mint": ("failed", mode("touch"), "the secret changed during the mint"),
+            "failed: the Secret was relabelled without a new resourceVersion": ("failed", mode("relabel_norv"), "the secret changed during the mint"),
+            "failed: the Secret was deleted and made again during the mint": ("failed", mode("recreate"), "the secret changed during the mint"),
+            "failed: the Secret was deleted during the mint": ("failed", mode("delete"), "the secret changed during the mint"),
             "failed: the Secret patch fails": ("failed", lambda: self.patch_state(fail_cmd="patch"), "the Secret patch failed"),
             "failed: the Secret patch is not confirmed": ("failed", lambda: self.patch_state(patch_noop=True), "not confirmed"),
         }

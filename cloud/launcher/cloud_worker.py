@@ -1557,18 +1557,43 @@ class Launcher:
                 done = self._renew_git_token(pod, now)
             except _NotRenewed as e:
                 why = self.kube.scrub(str(e), 200)
-                self.audit(worker, "pod/" + pod["metadata"]["name"], "renew-git-token", self._cost_or_zero(pod), False, why)
+                self._audit_renewal_failure(worker, pod, why)
                 out.append((worker, "git token not renewed: " + why, 1))
                 continue
             except (CloudError, ValueError, TypeError, KeyError, AttributeError, OSError) as e:   # unexpected data from the cluster: still named, never silent
                 why = self.kube.scrub("unexpected: %s" % e, 200)
-                self.audit(worker, "pod/" + pod["metadata"]["name"], "renew-git-token", self._cost_or_zero(pod), False, why)
+                self._audit_renewal_failure(worker, pod, why)
                 out.append((worker, "git token not renewed: " + why, 1))
                 continue
             if done:
                 self.audit(worker, "pod/" + pod["metadata"]["name"], "renew-git-token", self._cost_or_zero(pod), True, "")
                 out.append((worker, "git token renewed", 0))
         return out
+
+    def _last_renewal_audit(self, rid):
+        """(ok, reason) of the newest renew-git-token audit line of this pod, or None (reads the file's tail only)."""
+        try:
+            with open(self.audit_path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 262144))
+                lines = f.read().decode(errors="replace").splitlines()
+        except OSError:
+            return None
+        for raw in reversed(lines):
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if rec.get("action") == "renew-git-token" and rec.get("runtime_id") == rid:
+                return rec.get("ok"), rec.get("reason")
+        return None
+
+    def _audit_renewal_failure(self, worker, pod, why):
+        """One audit line per CHANGE of reason (a persistent failure is not written again every pass; the success line is the 'cleared' line)."""
+        rid = "pod/" + pod["metadata"]["name"]
+        if self._last_renewal_audit(rid) == (False, self.kube.scrub(why, limit=1000)):
+            return
+        self.audit(worker, rid, "renew-git-token", self._cost_or_zero(pod), False, why)
 
     def _cost_or_zero(self, pod):
         try:
@@ -1604,6 +1629,8 @@ class Launcher:
         old = (secret.get("data") or {}).get(GIT_TOKEN_KEY)
         if not old:
             return False
+        if not meta.get("uid") or not meta.get("resourceVersion"):
+            raise _NotRenewed("the Secret carries no uid or resourceVersion to bind the patch to")
         stamp = (meta.get("annotations") or {}).get(GIT_TOKEN_MINTED) or meta.get("creationTimestamp")
         try:
             age = (now - parse_iso(stamp)).total_seconds() if stamp else None
@@ -1628,12 +1655,23 @@ class Launcher:
         self.kube.add_secrets(token)
         if re.search(r"\s", token):
             raise _NotRenewed("the mint gave a token with whitespace in it")
+        # The mint took up to a minute: the Secret may have been replaced by a relaunch of the same worker (same name, new run). The patch is
+        # bound to the exact object that was checked (uid + resourceVersion in the patch body: the API server refuses it on a mismatch), and the
+        # labels are read again as a second guard.
+        now_secret = self.kube.get_run_secret(name)
+        nmeta = (now_secret or {}).get("metadata") or {}
+        if not now_secret or (nmeta.get("labels") or {}).get("cw/pod") != labels.get("cw/pod") \
+                or (nmeta.get("labels") or {}).get("cw/run-id") != labels.get("cw/run-id"):
+            raise _NotRenewed("the secret changed during the mint: not renewed")
         minted = iso(now)
-        body = json.dumps({"metadata": {"annotations": {GIT_TOKEN_MINTED: minted}},
+        body = json.dumps({"metadata": {"annotations": {GIT_TOKEN_MINTED: minted}, "uid": meta.get("uid"),
+                                        "resourceVersion": meta.get("resourceVersion")},
                            "data": {GIT_TOKEN_KEY: base64.b64encode(token.encode()).decode()}})
         try:
             self.kube.run(["patch", "secret", name + "-run", "--type=merge", "--patch-file=/dev/stdin"], stdin=body)   # the one place the token goes: stdin
         except CloudError as e:
+            if "Conflict" in str(e) or "NotFound" in str(e) or "precondition" in str(e).lower():
+                raise _NotRenewed("the secret changed during the mint: not renewed") from None
             raise _NotRenewed("the Secret patch failed: %s" % e) from None
         after = self.kube.get_run_secret(name)   # the cluster accepted it: the new data, the new stamp
         ameta = (after or {}).get("metadata") or {}

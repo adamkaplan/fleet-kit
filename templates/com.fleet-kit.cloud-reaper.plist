@@ -21,6 +21,9 @@
   no key itself; to renew workers' git tokens it runs the launcher's mint, which reads the vault settings from the settings file below. When the settings
   file of the cloud launcher lands, the reaper reads it as the launcher does.
 
+  Plainly: the reaper can now REACH THE VAULT. It holds no key itself, but through the mint it can obtain a git token for any pod, worker record and
+  allow-list entry that match, bounded only by the three checks (the pod's repository equals the worker record's, the repository is on the allow-list, the Secret is this run's).
+
   When the Mac sleeps the reaper pauses; the worker's own pod-side limit still ends it.
 
   There is exactly one copy of this file. Do not keep a second one for the installer.

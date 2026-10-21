@@ -118,6 +118,12 @@ elif cmd == "patch" and args[1] == "secret":
         f.write(body + "\n")
     import base64
     patch = json.loads(body)
+    pm = patch.get("metadata", {})
+    if args[2] not in st.get("secrets", {}): missing('secrets "%s"' % args[2])
+    if "uid" in pm and pm["uid"] != st.get("secret_meta", {}).get(args[2], {}).get("uid"):
+        sys.stderr.write('Error from server (Conflict): Precondition failed: UID in precondition: %s, UID in object meta: other\n' % pm["uid"]); sys.exit(1)
+    if "resourceVersion" in pm and str(pm["resourceVersion"]) != str(st.get("secret_rv", {}).get(args[2], 1)):
+        sys.stderr.write('Error from server (Conflict): Operation cannot be fulfilled on secrets "%s": the object has been modified\n' % args[2]); sys.exit(1)
     if st.get("patch_noop"):   # a patch the cluster answers and does not apply (the launcher must not believe it)
         sys.exit(0)
     for k, v in patch.get("data", {}).items():
@@ -129,6 +135,7 @@ elif cmd == "patch" and args[1] == "secret":
     save()
 elif cmd == "label" and args[1] == "secret":
     st.setdefault("secret_labels", {})[args[2]] = dict(kv.split("=", 1) for kv in args[3:])
+    if not st.get("label_keeps_rv"): st.setdefault("secret_rv", {})[args[2]] = st.get("secret_rv", {}).get(args[2], 1) + 1
     save()
 elif cmd == "port-forward":  # become the stub headless server on the local port, so the caller can end us
     os.execv(sys.executable, [sys.executable, os.path.join(HERE, "..", "..", "worker", "tests", "stub_server.py"), args[2].split(":")[0]])

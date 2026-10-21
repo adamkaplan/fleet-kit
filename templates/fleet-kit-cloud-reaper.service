@@ -17,6 +17,10 @@
 # launcher's mint, which reads the vault settings from the settings file. When the
 # cloud launcher's settings file lands, the reaper reads it as the launcher does.
 #
+# Plainly: the reaper can now REACH THE VAULT. It holds no key itself, but through the mint it can obtain a git token for any pod, worker
+# record and allow-list entry that match, bounded only by the three checks (the pod's repository equals the worker record's, the repository
+# is on the allow-list, the Secret is this run's).
+#
 # Read the log with: journalctl --user -u fleet-kit-cloud-reaper.service
 
 [Unit]
