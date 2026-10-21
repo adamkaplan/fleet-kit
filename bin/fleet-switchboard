@@ -9005,8 +9005,23 @@ def add_read_parsers(sub):
     read.add_argument("--limit", type=int, default=20, help="How many messages (default 20, at most 200)")
 
 
+def add_cloud_clear_parsers(sub):
+    """`cloud-clear`: the cloud worker records whose pod is gone and whose hard deadline has passed are removed, each one named. The operator, the
+    Chief of Staff or the worker's own boss may run it; a record with a pod is never touched; it refuses when the cluster could not be read."""
+    clear = sub.add_parser("cloud-clear", help="Remove the cloud worker records whose pod is gone and whose hard deadline has passed "
+                                               "(the operator, the Chief of Staff or the worker's own boss); `--dry-run` removes nothing")
+    clear.add_argument("--dry-run", action="store_true", help="Say what would be cleared; remove nothing")
+
+
 def cmd_read(args, runner, now):
     return run_cloud("cmd_read", args, runner, now)
+
+
+def cmd_cloud_clear(args, runner, now):
+    """`cloud-clear [--dry-run]`: every cloud worker record whose pod is gone AND whose hard deadline has passed is removed (the record and its
+    password file), and every one it removes is named. A record with a pod, or one not past its deadline, is never touched, and it refuses when
+    the cluster could not be read: it never removes a record it cannot prove is gone. The caller rule is `retire`'s."""
+    return run_cloud("cmd_cloud_clear", args, runner, now)
 
 
 def watch_problem(engine, state, name, discovery):

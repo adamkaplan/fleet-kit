@@ -158,6 +158,11 @@ DEFAULT_MAX_HARD = "8h"  # OPEN in the contract: value
 POD_DEADLINE_GRACE_SECONDS = 300
 DEFAULT_SPEND_CAP_USD = 25.0  # the prototype's cap; applies when CW_CLOUD_SPEND_CAP_USD is unset or empty
 LABEL = "cw-worker"
+# The node labels the summary reads: the POOL a node belongs to and its INSTANCE SIZE, in that order of preference. A label that is not there
+# reads "unknown" (never a guess). The size label is the Kubernetes one (`node.kubernetes.io/instance-type`); the pool label is the cloud's own
+# (Azure's `agentpool`, GKE's nodepool) or the kit's (`cw/pool`).
+NODE_POOL_LABELS = ("cw/pool", "agentpool", "kubernetes.azure.com/agentpool", "cloud.google.com/gke-nodepool", "nodepool")
+NODE_SIZE_LABELS = ("node.kubernetes.io/instance-type", "instance-type", "cw/size")
 REPORT_PATH = "/home/worker/report"  # the worker's final one-line report, written here inside the pod (the image's workdir)
 REPORT_MAX = 2000
 # the worker owns the file, and `head` follows a link: refuse anything but a regular file BEFORE reading ($1 the path, $2 the byte limit)
@@ -795,6 +800,15 @@ class Kube:
     def list_pods(self):
         return json.loads(self.run(["get", "pods", "-l", "app=" + LABEL, "-o", "json"]))["items"]
 
+    def list_pods_all(self):
+        """EVERY pod of the namespace (not only the worker's): the status summary counts them by phase. One call, one read."""
+        return json.loads(self.run(["get", "pods", "-o", "json"]))["items"]
+
+    def list_nodes(self):
+        """The cluster's nodes: their pool label, their instance size label and their creation time. Needs `list` on nodes (cluster-wide): a
+        login without that right is refused by the API server, and the caller falls back to the pod placement."""
+        return json.loads(self.run(["get", "nodes", "-o", "json"]))["items"]
+
     def annotate(self, name, uid, **kv):
         """Annotate the pod that was READ (its `uid`), never one of the same name that replaced it: a merge patch whose body carries
         metadata.uid, which the API server refuses on a mismatch. Raises PodChanged when the pod is not that one (or is gone)."""
@@ -897,6 +911,15 @@ def _pod_repo(pod):
 
 def ann(pod, key, default=None):
     return pod["metadata"].get("annotations", {}).get("cw/" + key, default)
+
+
+def _node_label(labels, keys):
+    """The first of `keys` the node carries, or "unknown" (never a guess, never a value of another label)."""
+    for key in keys:
+        value = (labels or {}).get(key)
+        if isinstance(value, str) and value:
+            return value
+    return "unknown"
 
 
 RUN_SECRET_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
@@ -1556,6 +1579,26 @@ class Launcher:
             raise CloudError("unknown worker %s" % a.worker, EXIT_USAGE)
         return [self.record(p) for p in pods]
 
+    def snapshot(self, a):
+        """ONE read-only look at the cluster: the pods of the namespace (name, worker, phase, node, hard deadline) and, when the login may
+        LIST the nodes, the nodes themselves (pool, size, creation time). The node list is optional: a login without `list` on nodes still
+        reads the pods, and the answer says so (`nodes_read` false) instead of failing the whole read. No write call is made here."""
+        pods = []
+        for pod in self.kube.list_pods_all():
+            meta = pod.get("metadata") or {}
+            pods.append({"name": meta.get("name"), "worker": ann(pod, "worker"), "phase": (pod.get("status") or {}).get("phase"),
+                         "node": (pod.get("spec") or {}).get("nodeName"), "hard_deadline": ann(pod, "hard-deadline")})
+        nodes, nodes_read, nodes_error = [], True, None
+        try:
+            for node in self.kube.list_nodes():
+                meta = node.get("metadata") or {}
+                labels = meta.get("labels") or {}
+                nodes.append({"name": meta.get("name"), "pool": _node_label(labels, NODE_POOL_LABELS), "size": _node_label(labels, NODE_SIZE_LABELS),
+                              "created": meta.get("creationTimestamp")})
+        except CloudError as e:
+            nodes, nodes_read, nodes_error = [], False, self.kube.scrub(e, 200)
+        return {"pods": pods, "nodes": nodes, "nodes_read": nodes_read, "nodes_error": nodes_error}
+
     def hard_deadline(self, pod):
         """The pod's copy, unless the switchboard record (read only, --record-dir) names a later or earlier one."""
         hard = parse_iso(ann(pod, "hard-deadline"))
@@ -2078,6 +2121,7 @@ def build_parser():
     d.add_argument("--force", action="store_true")
     d.add_argument("--reason", default="")
     cmd("status")
+    cmd("snapshot", worker=False)   # ONE read-only look at the cluster: the pods of the namespace and, when the login may list them, the nodes
     cmd("report")
     pr = cmd("prune-records", worker=False)
     pr.add_argument("--days", type=int, help="remove run records older than this many days (default: $CW_RECORD_KEEP_DAYS, else 30)")
