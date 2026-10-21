@@ -28,7 +28,12 @@ protected). It never turns an unreadable answer (exit 2), an unprotected branch,
 deletion rule into a pass.
 Exit 2: the answer could not be read (HTTP error, bad JSON). Silence never passes.
 
-What this CANNOT see: bypass actors (who may skip a rule), and whether a rule is in force for this token's own
+NEW CHECKS (#1031), each WARN or BLOCK by the one table CHECK_MODES (all WARN at first: one line per open action, the launch
+continues, and the final "preflight ok" line names them): an App is a bypass actor of an active ruleset covering the branch,
+the repository allows auto-merge, there is no required_status_checks rule, a merge_queue rule exists (who may dequeue cannot be
+read). What blocks today (the three NEED rules, the review count) stays a block.
+
+What this CANNOT see: which App a bypass actor is, who may dequeue from a merge queue, and whether a rule is in force for this token's own
 identity. The live refusal check (a real push, force-push and delete attempted on a disposable repository, S4) is the
 real proof; this is only the cheap guard before a worker is launched.
 """
@@ -48,6 +53,24 @@ import app_token  # noqa: E402
 NEED = (("pull_request|merge_queue", "a pull_request or merge_queue rule (direct pushes must be refused)"),
         ("non_fast_forward", "a non_fast_forward rule (force-push must be refused)"),
         ("deletion", "a deletion rule (branch deletion must be refused)"))
+
+# THE WARN-vs-BLOCK TABLE (the one place). Each key is an action a worker's token may still do although the rules above hold.
+# "WARN": one `preflight: WARN open action ...` line per open action, the launch continues. "BLOCK": the same action fails the
+# preflight (exit 1, a FAIL line naming it). They start as WARN; the owner flips a value here (after a week of clean WARN lines),
+# in a reviewed change: there is no flag and no environment setting. What blocks today (NEED above, the review count) is not here.
+MODES = ("WARN", "BLOCK")   # the allowed values of CHECK_MODES (the tests use this tuple); anything else blocks
+CHECK_MODES = {
+    "bypass_actor": "WARN",            # an App is a bypass actor of an active ruleset that covers the branch
+    "auto_merge": "WARN",              # the repository allows auto-merge (enable it with pull requests: write, then the checks decide)
+    "required_status_checks": "WARN",  # no required_status_checks rule: a merge needs no passing check
+    "merge_queue_change": "WARN",      # a merge_queue rule exists: who may dequeue a pull request cannot be read with this token
+}
+OPEN_ACTION_TEXT = {
+    "bypass_actor": "an App is a bypass actor of ruleset %s: the rules may not bind it (which App cannot be read; other bypass, and rulesets this token cannot read, are not seen)",
+    "auto_merge": "the repository allows auto-merge: a token with pull requests: write may enable it",
+    "required_status_checks": "no required_status_checks rule: a merge is bounded by no passing check",
+    "merge_queue_change": "a merge_queue rule exists: who may remove a pull request from the queue cannot be read with this token",
+}
 
 
 class Unreadable(Exception):
@@ -148,7 +171,7 @@ def covers(conditions, branch, default_branch):
     return (inc and not exc), odd
 
 
-def judge(rules, branch, default_branch, fetch, unreadable=None):
+def judge(rules, branch, default_branch, fetch, unreadable=None, bypass=None):
     """Keep only the rules of rulesets that are active and cover the branch. Returns (problems, kept rules), or
     (problems, None) when a ruleset cannot be read.
 
@@ -195,6 +218,8 @@ def judge(rules, branch, default_branch, fetch, unreadable=None):
                 problems.append("ruleset %d does not cover the branch%s" % (
                     rid, " (a pattern was not understood: %s)" % ", ".join(odd) if odd else ""))
             verdict[key] = enf == "active" and cov
+            if verdict[key] and bypass is not None and isinstance(rs.get("bypass_actors"), list):
+                bypass.extend((rid, a) for a in rs["bypass_actors"] if isinstance(a, dict))
         if verdict[key] is None:
             unreadable[rid].append(r)
         elif verdict[key]:
@@ -217,6 +242,14 @@ def evaluate(valid):
         missing.append(NEED[0][1])
     missing += [what for alts, what in NEED[1:] if not (types & set(alts.split("|")))]
     return missing, has_pr, types, problems
+
+
+def open_actions(repo, types, bypass):
+    """[(key, text)] for every action of OPEN_ACTION_TEXT that the answers show open, in table order."""
+    ids = sorted({str(rid) for rid, a in bypass if a.get("actor_type") == "Integration"})
+    shown = {"bypass_actor": ids, "auto_merge": isinstance(repo, dict) and repo.get("allow_auto_merge") is True,
+             "required_status_checks": "required_status_checks" not in types, "merge_queue_change": "merge_queue" in types}
+    return [(k, OPEN_ACTION_TEXT[k] % ", ".join(ids) if k == "bypass_actor" else OPEN_ACTION_TEXT[k]) for k in CHECK_MODES if shown[k]]
 
 
 def _field(v):
@@ -302,13 +335,23 @@ def main(argv):
         say("cannot read: 100 or more rules apply; the answer may be paginated and is not read in full")
         return 2
     unreadable = {}
-    problems, valid = judge(rules, branch, repo.get("default_branch"), lambda path: get(base, path, token), unreadable)
+    bypass = []
+    problems, valid = judge(rules, branch, repo.get("default_branch"), lambda path: get(base, path, token), unreadable, bypass)
     if valid is None:
         return 2
     missing, has_pr, types, review_problem = evaluate(valid)
     problems += review_problem
+    warned = []
+    for key, text in open_actions(repo, types, bypass):
+        if CHECK_MODES[key] != "WARN":   # anything but WARN blocks: a typo fails closed
+            problems.append("open action %s: %s" % (key, text))
+        else:
+            say("WARN open action %s: %s" % (key, text))
+            warned.append(key)
+    # the LAST line is the one the launcher shows: it carries the warnings, so a WARN is never lost behind "ok"
+    warn_tail = "; WARN open: " + ", ".join(warned) if warned else ""
     if not missing and not problems:
-        say("preflight ok: " + ", ".join(sorted(t for t in types if isinstance(t, str))))
+        say("preflight ok: " + ", ".join(sorted(t for t in types if isinstance(t, str))) + warn_tail)
         return 0
     if unreadable and not problems and missing:
         # Could the unreadable organization rulesets have supplied everything that is missing? Then (and only then)
@@ -322,7 +365,7 @@ def main(argv):
                 say("cannot read: %s" % e)
                 return 2
             if ok:
-                say("preflight ok: protection NOT VERIFIED (organization ruleset %s unreadable); owner-approved by %s on %s (pr #%s): %s" % ((ids,) + ok))
+                say("preflight ok: protection NOT VERIFIED (organization ruleset %s unreadable); owner-approved by %s on %s (pr #%s): %s%s" % ((ids,) + ok + (warn_tail,)))
                 return 0
             say("FAIL on %s: protection comes from an organization ruleset this token cannot read; an owner approval entry "
                 "is needed: see cloud/launcher/README.md (an entry in repo-approvals.json)" % branch)
