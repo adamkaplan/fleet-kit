@@ -359,6 +359,13 @@ def upsert(state_dir, name, agent, now=None):
         if covers(doc["retired"].get(name), (agent or {}).get("session")):
             return False, [], "%s is retired for this session" % name
         fields = dict(agent or {})
+        if (fields.get("kind") or (old or {}).get("kind") or "local") != "local" and fields.get("pane"):
+            return False, [], "%s is not a local agent: a cloud worker has no pane (refused pane %s)" % (name, fields["pane"])
+        if fields.get("pane"):
+            for other, row in doc["agents"].items():   # a pane bound to a LIVE agent is never rebound to another (#1066)
+                if other != name and isinstance(row, dict) and row.get("pane") == fields["pane"] and (row.get("kind") or "local") == "local" \
+                        and row.get("state") not in ("dead", "detached"):
+                    return False, [], "pane %s is bound to the live agent %s: refused to bind it to %s" % (fields["pane"], other, name)
         if "bell" not in fields:
             if isinstance((old or {}).get("bell"), bool):
                 fields["bell"] = old["bell"]   # a pass that records state never forgets the opt-in a person set

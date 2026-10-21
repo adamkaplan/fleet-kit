@@ -3707,7 +3707,7 @@ class TestEnsure(Base):
         self.assertIs(kwargs["start_new_session"], True)
         self.assertEqual(kwargs["cwd"], str(self.state))
         env = kwargs["env"]
-        self.assertEqual("HERDR_SOCKET_PATH" in env, True)
+        self.assertEqual("HERDR_SOCKET_PATH" in env, False)   # #1066: the service the daemon starts holds no herdr variable; the socket rides under another name
         for name in ("HERDR_PLUGIN_ID", "HERDR_PLUGIN_EVENT", "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID"):
             self.assertNotIn(name, env)
         self.assertEqual(stat.S_IMODE((self.state / "daemon.log").stat().st_mode), 0o600)
@@ -3746,7 +3746,7 @@ class TestEnsure(Base):
         env = sb.daemon_environment({"HERDR_PLUGIN_ROOT": "/p", "HERDR_PLUGIN_CONTEXT_JSON": "{}",
                                      "HERDR_PANE_ID": "w1:p1", "HERDR_TAB_ID": "t", "HERDR_WORKSPACE_ID": "w",
                                      "HERDR_SOCKET_PATH": "/s", "HERDR_BIN_PATH": "/b", "HOME": "/h"})
-        self.assertEqual(sorted(env), ["HERDR_BIN_PATH", "HERDR_SOCKET_PATH", "HOME"])
+        self.assertEqual(sorted(env), ["FLEET_SWITCHBOARD_HERDR_SOCKET", "HOME"])   # #1066: no herdr variable; the socket path is kept under its own name
 
     def test_a_real_ensure_returns_with_pipes_open_and_a_real_poke_wakes_the_real_daemon(self):
         log = self.home / "herdr-calls.log"
@@ -3868,6 +3868,146 @@ class TestPluginManifest(Base):
         planted = self.PATH.read_text().replace("../bin/fleet-switchboard", "../bin/nowhere", 1)
         root = self.PATH.parent
         self.assertFalse((root / parse_plugin_manifest(planted)["startup"][0]["command"][0]).exists())
+
+
+# --------------------------------------------------------- #1066: a pane is bound by its process, never by the report alone
+
+class TestPaneBoundByProcess(Base):
+    """The multiplexer's agent report names session B for a pane whose process runs session A: A keeps the pane."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("agent-a", "agent-b"))
+        self.engine = self.world.engine
+        self.engine.state_dir = self.world.state
+        self.a, self.b = self.world.sessions["agent-a"], self.world.sessions["agent-b"]
+        self.pane_a, self.pane_b = self.world.panes["agent-a"], self.world.panes["agent-b"]
+        self.registry = sb.load_module("registry")
+
+    def lines(self, event):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def lie(self):
+        """The report for A's pane names B's session; A's process still runs A. B's own pane is gone."""
+        self.world.herdr.panes[self.pane_a]["session"] = self.b
+        del self.world.herdr.panes[self.pane_b]
+
+    def run_pass(self):
+        found = self.engine.discover(self.world.clock.now())
+        sb.pane_health_pass(self.engine, self.world.clock.now())
+        return found
+
+    def test_S2_a_disagreeing_report_keeps_a_bound_and_alive_and_b_gets_no_pane(self):
+        self.lie()
+        found = self.run_pass()
+        self.assertEqual(found.agents["agent-a"].pane, self.pane_a)
+        self.assertNotIn("agent-b", found.agents)
+        rows = self.registry.read(self.world.state)["agents"]
+        self.assertEqual(rows["agent-a"]["pane"], self.pane_a)
+        self.assertNotEqual(rows["agent-a"]["state"], "dead")
+        self.assertFalse(rows.get("agent-b", {}).get("pane"))
+        self.run_pass()
+        lines = self.lines("pane.report_disagrees")
+        self.assertEqual(len(lines), 1)
+        self.assertIn(self.a, json.dumps(lines[0]))
+        self.assertIn(self.b, json.dumps(lines[0]))
+
+    def test_S4_a_live_pane_is_not_rebound_and_an_unreadable_process_list_binds_nothing_new(self):
+        self.run_pass()
+        got = self.registry.upsert(self.world.state, "agent-b", {"session": self.b, "pane": self.pane_a, "role": "coder"})
+        self.assertIn("agent-a", got["problem"])
+        self.assertIn("agent-b", got["problem"])
+        self.assertEqual(self.registry.read(self.world.state)["agents"]["agent-a"]["pane"], self.pane_a)
+        sb.record_launch_charter(self.engine, "agent-b", self.b, {"role": "orchestrator", "charter": 5}, pane=self.pane_a)
+        self.assertEqual(self.registry.read(self.world.state)["agents"]["agent-a"]["pane"], self.pane_a)
+        self.assertNotEqual(self.registry.read(self.world.state)["agents"].get("agent-b", {}).get("pane"), self.pane_a)
+        with mock.patch.object(sb.HerdrClient, "pane_process_info", side_effect=sb.HerdrError("down", "herdr is down")):
+            found = self.engine.discover(self.world.clock.now())
+        self.assertIn("cannot read", found.agents["agent-a"].problem)
+
+    def test_S3_a_cloud_worker_is_never_recorded_with_a_pane(self):
+        got = self.registry.upsert(self.world.state, "cloud-w", {"session": "ses_cloud", "kind": "cloud", "pane": self.pane_a})
+        self.assertIn("no pane", got["problem"])
+        self.assertNotIn("cloud-w", self.registry.read(self.world.state)["agents"])
+
+    def test_S5_the_wrong_records_of_the_case_are_put_right_by_the_pass(self):
+        self.run_pass()
+        self.registry.upsert(self.world.state, "agent-a", {"session": self.a, "pane": self.pane_a, "state": "dead"})
+        self.registry.upsert(self.world.state, "cloud-w", {"session": "ses_cloud", "pane": "w9:p9"})
+        cloud = self.world.state / "cloud"
+        cloud.mkdir(exist_ok=True)
+        (cloud / "cloud-w.json").write_text("{}")
+        self.world.clock.advance(sb.PANE_CHECK_SECONDS + 1) if hasattr(self.world.clock, "advance") else self.world.tick(sb.PANE_CHECK_SECONDS + 1)
+        self.run_pass()
+        rows = self.registry.read(self.world.state)["agents"]
+        self.assertNotEqual(rows["agent-a"]["state"], "dead")
+        self.assertEqual((rows["cloud-w"]["kind"], rows["cloud-w"]["pane"]), ("cloud", None))
+
+    def test_S6_a_pane_whose_process_runs_the_session_is_never_dead_even_when_the_list_omits_it(self):
+        self.run_pass()
+        del self.world.herdr.panes[self.pane_b]
+        self.world.herdr.panes[self.pane_a]["session"] = None
+        self.world.herdr.panes[self.pane_a]["undetected"] = True
+        for _ in range(sb.PANE_MISSING_PASSES + 2):
+            self.run_pass()
+        self.assertNotEqual(self.registry.read(self.world.state)["agents"]["agent-a"]["state"], "dead")
+
+
+
+class TestServiceEnvironmentHoldsNoPane(Base):
+    """#1066: the OpenCode service is started WITHOUT any herdr variable, whichever process starts it."""
+
+    def callers_env(self):
+        return {"PATH": "/usr/bin", "HERDR_PANE_ID": "w1:p2", "HERDR_TAB_ID": "w1:t1", "HERDR_WORKSPACE_ID": "w1", "HERDR_ENV": "1",
+                "HERDR_BIN_PATH": "/x/herdr", "HERDR_SOCKET_PATH": "/x/herdr.sock", "HOME": "/home/user"}
+
+    def test_S9_ensure_starts_the_daemon_and_with_it_the_service_with_no_herdr_variable(self):
+        seen = {}
+
+        def spawn(argv, **kw):
+            seen.update(kw["env"])
+            raise OSError("stop here")
+        with mock.patch.dict(os.environ, self.callers_env(), clear=True):
+            with self.assertRaises(OSError):
+                sb.spawn_daemon(Path(tempfile.mkdtemp()), spawn)
+        self.assertEqual([n for n in ("HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HERDR_ENV", "HERDR_BIN_PATH", "HERDR_SOCKET_PATH") if n in seen], [])
+        self.assertEqual(seen.get(sb.KEPT_SOCKET_ENV), "/x/herdr.sock")   # the daemon still finds herdr
+        self.assertEqual(sb.herdr_socket_path(seen), "/x/herdr.sock")
+
+    def test_S9_every_name_is_stripped_not_only_the_pane_one(self):
+        for name in sb.SERVICE_STRIP_ENV:
+            with self.subTest(name=name):
+                self.assertNotIn(name, sb.service_environment({name: "x", "PATH": "/bin"}))
+
+    def test_S10_status_names_a_service_that_carries_one_and_the_clean_restart_and_restarts_nothing(self):
+        state = Path(tempfile.mkdtemp())
+        (state / "opencode").mkdir()
+        (state / "opencode" / "service.json").write_text(json.dumps({"pid": 4242}))
+        calls = []
+
+        def runner(argv, **kw):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "opencode serve PATH=/bin HERDR_PANE_ID=w1:p2 HOME=/h", "")
+        found = sb.service_herdr_env(runner, {"XDG_STATE_HOME": str(state)})
+        self.assertEqual(found, ["HERDR_PANE_ID"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:2], ["ps", "eww"])
+        self.assertIn("service restart", sb.service_clean_restart_command())
+        self.assertIn("-u HERDR_PANE_ID", sb.service_clean_restart_command())
+
+    def test_S10_a_service_with_a_clean_environment_or_none_readable_reports_nothing(self):
+        state = Path(tempfile.mkdtemp())
+        self.assertEqual(sb.service_herdr_env(lambda *a, **k: None, {"XDG_STATE_HOME": str(state)}), [])
+        (state / "opencode").mkdir()
+        (state / "opencode" / "service.json").write_text(json.dumps({"pid": 1}))
+        clean = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "opencode serve HOME=/h", "")
+        self.assertEqual(sb.service_herdr_env(clean, {"XDG_STATE_HOME": str(state)}), [])
+
+    def test_the_installed_unit_names_no_herdr_variable_value(self):
+        for kind in ("launchd", "systemd"):
+            text = sb.render_service(kind, dict(sb.service_values(sb.KIT_ROOT, ["/bin"]), __PATH__="/bin:HERDR_PANE_ID=w1"))
+            self.assertNotIn("HERDR_PANE_ID=", text)
+
 
 
 # --------------------------------------------------------- the restart hazard
@@ -4695,23 +4835,14 @@ class TestLaunch(StandInPids, Base):
             code = sb.main(["reattach", "platform", "--replace"], runner=self.world.route, now=self.world.clock.now, socket_call=herdr.socket)
         self.assertNotEqual(code, 0)
         self.assertEqual(herdr.closed, [])
-        # an opencode on ANOTHER session (named by its title) is not this agent's: without --replace it still "runs the agent" by title, with --replace it goes
+        # #1066: an opencode on ANOTHER session is not this agent's pane, whatever the multiplexer reports or the title says: the agent is not bound to it
         herdr.panes[pane]["program"] = "%s -s ses_someone_else" % FAKE_OPENCODE
         herdr.panes[pane]["title"] = "OC | platform"
+        self.assertNotIn("platform", self.engine.discover(self.world.clock.now()).agents)
         with captured() as (out, err):
-            code = sb.main(["reattach", "platform"], runner=self.world.route, now=self.world.clock.now, socket_call=herdr.socket)
-        self.assertNotEqual(code, 0)
-        self.assertIn("--replace", err.getvalue())
-        self.world.herdr.panes[pane]["status"] = "working"                  # a working pane is never replaced
-        with captured() as (out, err):
-            code = sb.main(["reattach", "platform", "--replace"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
-        self.assertNotEqual(code, 0)
-        self.assertEqual(self.world.herdr.closed, [])
-        self.world.herdr.panes[pane]["status"] = None
-        with captured() as (out, err):
-            code = sb.main(["reattach", "platform", "--replace"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            code = sb.main(["reattach", "platform", "--session", session], runner=self.world.route, now=self.world.clock.now, socket_call=herdr.socket)
         self.assertEqual(code, 0, err.getvalue())
-        self.assertEqual(self.world.herdr.closed, [pane])
+        self.assertEqual(herdr.closed, [])   # nothing is closed without --replace
         herdr.closed.clear()
         with captured() as (out, err):
             code = sb.main(["reattach", "--all-detached"], runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
@@ -75658,7 +75789,7 @@ class TestAgentRegistry(unittest.TestCase):
 
     def test_retire_and_close_leave_agents_keep_the_record_and_audit(self):
         for name in ("a", "b"):
-            self.reg.upsert(self.state, name, {"session": "ses_" + name, "pane": "p", "workspace": "w1"})
+            self.reg.upsert(self.state, name, {"session": "ses_" + name, "pane": "p" + name, "workspace": "w1"})
         self.reg.retire(self.state, "a", "boss", "done", auto=True)
         self.reg.close(self.state, "b", "boss", "pane closed")
         got = self.reg.read(self.state)
