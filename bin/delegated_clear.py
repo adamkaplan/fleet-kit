@@ -494,6 +494,58 @@ def _own_scope(unit):
     return own, glob
 
 
+# ---- every way a name is bound, derived from the ast module's node classes (#964): ONE table, a test checks it against `ast` itself
+# A name is bound either by a `Name` node in a Store or Del context (an assignment of any form, an augmented or annotated one, a walrus, a `for` or `with` target, a comprehension variable, a star-unpack, a `del`, a class
+# body statement, a match capture of the form `case x`... all of them put a Name node there), or by a node that carries the name as a STRING: those are this table. Nothing else binds a name.
+STRING_BINDERS = {
+    "FunctionDef": lambda n: [n.name], "AsyncFunctionDef": lambda n: [n.name], "ClassDef": lambda n: [n.name],
+    "ExceptHandler": lambda n: [n.name] if n.name else [],
+    "MatchAs": lambda n: [n.name] if n.name else [], "MatchStar": lambda n: [n.name] if n.name else [], "MatchMapping": lambda n: [n.rest] if n.rest else [],
+}
+# the node classes whose fields carry a name as a string or an identifier and that are NOT read as a binder, with the reason (the completeness test reads `ast` and fails on a class in neither table)
+NOT_BINDERS = {
+    "Name": "a Name node binds only in a Store or Del context, which is read for every Name", "Attribute": "attr names a member, not a binding", "keyword": "arg names a parameter of the callee",
+    "alias": "read through its Import or ImportFrom", "arg": "a parameter: the unit's own are read from its arguments, a nested function's are its own scope", "MatchClass": "kwd_attrs name attributes of a class pattern",
+    "TypeAlias": "its name is a Name node in a Store context", "FormattedValue": "no name", "Module": "no name", "Interactive": "no name",
+    "Import": "an import is ALWAYS a finding of its own, whatever name it binds", "ImportFrom": "an import is ALWAYS a finding of its own, whatever name it binds",
+    "Global": "a global statement is ALWAYS a finding of its own", "Nonlocal": "a nonlocal statement is ALWAYS a finding of its own",
+    "TypeVar": "a type parameter is a typing object scoped to its def: calling it runs nothing", "ParamSpec": "a type parameter is a typing object scoped to its def: calling it runs nothing",
+    "TypeVarTuple": "a type parameter is a typing object scoped to its def: calling it runs nothing",
+}
+
+
+def _name_bindings(unit):
+    """[(name, value, kind, node)] every binding of a name anywhere in `unit` (the unit's own name and parameters excepted): `value` is the expression the name gets (None: not an expression we can read), `kind` is "def" (an
+    undecorated def or class), "lambda" (a name given a lambda) or "other". Every Name in a Store or Del context is one, so no statement form can be missed; the nodes of STRING_BINDERS are the rest."""
+    given = {}
+    for x in ast.walk(unit):
+        pairs = []
+        if isinstance(x, ast.Assign):
+            pairs = [(t, x.value) for t in x.targets]
+        elif isinstance(x, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)) and getattr(x, "value", None) is not None:
+            pairs = [(x.target, x.value)]
+        elif isinstance(x, (ast.For, ast.AsyncFor, ast.comprehension)):
+            pairs = [(x.target, x.iter)]
+        elif isinstance(x, (ast.With, ast.AsyncWith)):
+            pairs = [(i.optional_vars, i.context_expr) for i in x.items if i.optional_vars is not None]
+        for target, value in pairs:
+            for y in ast.walk(target):
+                if isinstance(y, ast.Name):
+                    given[id(y)] = (value, "lambda" if isinstance(value, ast.Lambda) and target is y else "other")
+    out = []
+    own_args = {id(a) for a in ast.walk(unit.args) if isinstance(a, ast.arg)} if isinstance(getattr(unit, "args", None), ast.arguments) else set()
+    for x in ast.walk(unit):
+        if isinstance(x, ast.arg) and id(x) not in own_args:   # the parameter of a function or lambda nested in the unit: whatever it is called with
+            out.append((x.arg, None, "param", x))
+        elif isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del)):
+            value, kind = given.get(id(x), (None, "other")) if isinstance(x.ctx, ast.Store) else (None, "other")
+            out.append((x.id, value, kind, x))
+        elif type(x).__name__ in STRING_BINDERS and x is not unit:
+            kind = "def" if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not x.decorator_list else "other"
+            out.extend((name, None, kind, x) for name in STRING_BINDERS[type(x).__name__](x))
+    return out
+
+
 def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), readable=(), builtins=(), named_helpers=(), verbs=(), free_keywords=()):
     """[(verb, name)] a registrar (a function, a class, or the lambda a registrar name is assigned) does that a registrar may not, counting only the nodes that touch a line in `added` (`None`: every line). It is
     DEFAULT-DENY: a registrar sets up its own parsers and nothing else, so in it is a finding (named by the closure name when it touches one, else by what it touches): an import; a call of anything that is not a method of its
@@ -548,35 +600,10 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), re
                 data.update(y.id for y in ast.walk(x.target) if isinstance(y, ast.Name))
         if len(data) + len(built) != before:
             grew = True
-    bindings = {}   # every binding of every name in the unit, with the value it gets (None: a value that is not data): a name is data only if EVERY binding of it is data (`s = ""; s = os` makes `s` a module)
-    kinds = {}   # how each name is bound: "def" (a def or class), "lambda", or "other": a name is a function the registrar DEFINES only if every binding of it is one of the first two
-    def bind(target, value):
-        for y in ast.walk(target):
-            if isinstance(y, ast.Name):
-                bindings.setdefault(y.id, []).append(value)
-                kinds.setdefault(y.id, []).append("lambda" if isinstance(value, ast.Lambda) and target is y else "other")
-    for x in ast.walk(unit):
-        if isinstance(x, ast.Assign):
-            for t in x.targets:
-                bind(t, x.value)
-        elif isinstance(x, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)) and getattr(x, "value", None) is not None:
-            bind(x.target, x.value)
-        elif isinstance(x, (ast.For, ast.AsyncFor, ast.comprehension)):
-            bind(x.target, x.iter)
-        elif isinstance(x, (ast.With, ast.AsyncWith)):
-            for i in x.items:
-                if i.optional_vars is not None:
-                    bind(i.optional_vars, i.context_expr)
-        elif isinstance(x, (ast.Import, ast.ImportFrom)):
-            for a in x.names:
-                bindings.setdefault(a.asname or a.name.split(".")[0], []).append(None)
-                kinds.setdefault(a.asname or a.name.split(".")[0], []).append("other")
-        elif isinstance(x, DEF_KINDS) and x is not unit:
-            bindings.setdefault(x.name, []).append(None)
-            kinds.setdefault(x.name, []).append("def")
-        elif isinstance(x, ast.ExceptHandler) and x.name:
-            bindings.setdefault(x.name, []).append(None)
-            kinds.setdefault(x.name, []).append("other")
+    bindings, kinds, records = {}, {}, _name_bindings(unit)   # every binding of every name in the unit, with the value it gets (None: a value that is not data) and how it is bound: a name is data only if EVERY binding of it is data, and a function the registrar DEFINES only if every binding of it is a def or a lambda
+    for name, value, kind, _node in records:
+        bindings.setdefault(name, []).append(value)
+        kinds.setdefault(name, []).append(kind)
     if isinstance(arguments, ast.arguments):
         for a, _unread in param_defaults:
             bindings.setdefault(a.arg, []).append(None)
@@ -591,7 +618,7 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), re
                 data.discard(n)
                 settled = False
     parser = handle | built
-    defined = {n for n, k in kinds.items() if k and all(v in ("def", "lambda") for v in k) and n not in handle and n not in built}   # a function the registrar defines itself (its body is read with it), and never rebinds to anything else
+    defined = {n for n, k in kinds.items() if len(k) == 1 and k[0] in ("def", "lambda") and n not in handle and n not in built}   # a function the registrar defines itself (its body is read with it), and never rebinds to anything else
     def names_aliases(expr, seen=()):
         """True when a `**` expansion may carry an `aliases` key: a dict with that key, a conditional of such, or a name bound to one (an expansion that is anything else cannot be read, and `unsafe` holds it)."""
         if isinstance(expr, ast.Dict):
@@ -623,13 +650,13 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), re
                         return None
                 finally:
                     resolving.discard(expr.id)
-            ok = expr.id in data or expr.id in literals or expr.id in parser or expr.id in named_helpers or expr.id in defined or expr.id in readable or (expr.id in builtins and expr.id not in own)
+            ok = expr.id in data or expr.id in literals or expr.id in parser or (expr.id in named_helpers and expr.id not in kinds) or expr.id in defined or (expr.id in readable and expr.id not in kinds) or (expr.id in builtins and expr.id not in kinds)
             return None if ok else expr.id
         if isinstance(expr, ast.Attribute):
             return None if (expr.attr.isupper() and isinstance(expr.value, ast.Name)) else (_chain_root(expr).id if isinstance(_chain_root(expr), ast.Name) else expr.attr)
         if isinstance(expr, ast.Call):
             callee = expr.func
-            if isinstance(callee, ast.Name) and (callee.id in builtins or callee.id in named_helpers) and callee.id not in own:
+            if isinstance(callee, ast.Name) and (callee.id in builtins or callee.id in named_helpers) and callee.id not in kinds:
                 return next((u for u in map(unsafe, list(expr.args) + [k.value for k in expr.keywords]) if u), None)
             if isinstance(callee, ast.Attribute) and isinstance(callee.value, ast.Name) and (callee.value.id in data or callee.value.id in literals) and callee.value.id not in own - data:   # a method of a string or tuple of data (`flag.replace("_", "-")`)
                 return next((u for u in map(unsafe, list(expr.args) + [k.value for k in expr.keywords]) if u), None)
@@ -649,22 +676,18 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), re
         return next((c for c in candidates if isinstance(c, str) and c), "a name that cannot be read")
     for a, default in param_defaults:   # `def register(parser, m=sys.modules["__main__"])`: a default that runs or reaches something is not the registrar's own
         note(a, "rebinds", a.arg)
-    for x in ast.walk(unit):   # a parser name rebound to anything that is not built from a parser (`parser = os`) is a finding, and the name is no longer its own
-        targets = []
-        if isinstance(x, ast.Assign) and not verb_chain(x.value) and not _is_data(x.value, data | set(literals)):
-            targets = x.targets
-        elif isinstance(x, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)) and getattr(x, "value", None) is not None and not verb_chain(x.value) and not _is_data(x.value, data | set(literals)):
-            targets = [x.target]
-        elif isinstance(x, (ast.With, ast.AsyncWith)):
-            targets = [i.optional_vars for i in x.items if i.optional_vars is not None]
-        elif isinstance(x, (ast.For, ast.AsyncFor, ast.comprehension)) and not _is_data(x.iter, data | set(literals)) \
-                and not ((isinstance(x.iter, (ast.Tuple, ast.List)) and x.iter.elts and all(isinstance(e, ast.Name) and e.id in built for e in x.iter.elts))
-                         or (isinstance(x.iter, ast.Attribute) and isinstance(x.iter.value, ast.Name) and x.iter.value.id in built)):
-            targets = [x.target]
-        for t in targets:
-            for y in ast.walk(t):
-                if isinstance(y, ast.Name) and y.id in parser:
-                    note(x, "rebinds", y.id)
+    for name, value, kind, node in records:   # a parser name bound in ANY form to anything that is not built from a parser (a `del`, an `except as`, an import, a `global`, a match capture, a `with` or `for` target...) is a finding
+        if name not in parser or kind == "param":   # (a nested function's parameter is that function's own name, not a rebinding of the registrar's)
+            continue
+        ok = value is not None and (verb_chain(value) or _is_data(value, data | set(literals)) or (isinstance(node, ast.Name) and _built_iter(value, built)))
+        if not ok:
+            note(node, "rebinds", name)
+    for x in ast.walk(unit):   # a decorator, a base class or a class keyword runs when the definition does: it must be a value that runs nothing of the closure
+        if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and x is not unit:
+            for expr in list(x.decorator_list) + (list(x.bases) + [k.value for k in x.keywords] if isinstance(x, ast.ClassDef) else []):
+                bad = unsafe(expr) if not isinstance(expr, ast.Call) else (unsafe(expr.func) or "a call")
+                if bad:
+                    note(x, "calls", label(bad))
     allowed, callee_roots = set(), set()
     for x in ast.walk(unit):
         if isinstance(x, ast.Call):
@@ -708,7 +731,7 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), re
                         note(x, "calls", label(bad))
             if fname in ("__import__", "import_module"):
                 note(x, "imports", label(callee))
-            elif verb_chain(x) or callee in data or (isinstance(x.func, ast.Name) and (x.func.id in defined or x.func.id in readable or x.func.id in named_helpers or (x.func.id in builtins and x.func.id not in own))) or (isinstance(x.func, ast.Attribute) and _root(x.func) is None and isinstance(x.func.value, ast.Constant)):
+            elif verb_chain(x) or callee in data or (isinstance(x.func, ast.Name) and (x.func.id in defined or (x.func.id in (set(readable) | set(named_helpers) | set(builtins)) and x.func.id not in kinds))) or (isinstance(x.func, ast.Attribute) and _root(x.func) is None and isinstance(x.func.value, ast.Constant)):
                 pass   # a method of its own parser, a function it defines, a method of a literal (`"..." .format`)
             else:
                 note(x, "calls", label(callee, fname))
@@ -725,6 +748,12 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), re
         if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id in live and x.id not in own and (id(x) not in allowed or id(x) in callee_roots):   # THE USE RULE
             note(x, "uses", x.id)
     return sorted(found)
+
+
+def _built_iter(expr, built):
+    """True for the iterable of a loop whose variable is one of the registrar's own parsers: a tuple of names of built parsers, or an attribute of one (`for action in built._actions`)."""
+    return (isinstance(expr, (ast.Tuple, ast.List)) and bool(expr.elts) and all(isinstance(e, ast.Name) and e.id in built for e in expr.elts)) \
+        or (isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name) and expr.value.id in built)
 
 
 def _is_data(expr, data):

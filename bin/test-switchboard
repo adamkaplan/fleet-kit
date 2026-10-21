@@ -34314,6 +34314,65 @@ class TestRegistrarFloor(LedgerBase):
                 self.assertEqual(self.dc.registrar_findings(fake.replace("def hlp(t):", "def %s(t):" % helper), text, with_it)[0], [], helper)
                 self.assertTrue(self.dc.registrar_findings(fake.replace("def hlp(t):", "def %s(t):" % helper), text, without)[0], "the mutant without %s is not held" % helper)
 
+    # ---- the family: every way a name is bound or reaches a call, one hostile row each (derived from the ast module's node classes below)
+    FAMILY = {
+        "assign": "def f():\n    pass\nf = os.system\nf('x')", "augmented assign": "def f():\n    pass\nf += os.system\nf('x')", "annotated assign": "def f():\n    pass\nf: object = os.system\nf('x')",
+        "for target": "def f():\n    pass\nfor f in (os.system,):\n    f('x')", "with target": "def f():\n    pass\nwith os as f:\n    f('x')",
+        "except as": "def f():\n    pass\ntry:\n    pass\nexcept Exception as f:\n    f('x')", "import as": "def f():\n    pass\nimport os as f\nf('x')",
+        "from import as": "def f():\n    pass\nfrom os import system as f\nf('x')", "global": "def f():\n    pass\nglobal f\nf('x')", "del": "def f():\n    pass\ndel f\nf('x')",
+        "walrus": "def f():\n    pass\n(f := os.system)\nf('x')", "comprehension variable": "def f():\n    pass\n[f('x') for f in (os.system,)]",
+        "star unpack": "def f():\n    pass\n*f, = (os.system,)\nf('x')", "tuple unpack": "def f():\n    pass\nf, g = os.system, 1\nf('x')",
+        "match capture": "def f():\n    pass\nmatch os.system:\n    case f:\n        f('x')", "match star": "def f():\n    pass\nmatch sub:\n    case [*f]:\n        f('x')",
+        "class base": "def f():\n    pass\nclass f(os.system):\n    pass", "decorator": "@os.system\ndef f():\n    pass\nf('x')", "decorator on a class": "@os.system\nclass f:\n    pass",
+        "lambda redefinition": "def f():\n    pass\nf = lambda: os.system('x')\nf()", "def redefinition": "def f():\n    pass\ndef f():\n    os.system('x')\nf()",
+        "match mapping rest": "def f():\n    pass\nmatch sub:\n    case {'a': 1, **f}:\n        f('x')", "match as": "def f():\n    pass\nmatch sub:\n    case f:\n        f('x')",
+        "a parser name deleted": "del sub\nsub.add_parser('x')", "a parser name imported": "import os as sub\nsub.system('x')", "a parser name in except as": "try:\n    pass\nexcept Exception as sub:\n    sub.system('x')",
+        "a parser name in a match": "match os:\n    case sub:\n        sub.system('x')", "a parser name global": "global sub\nsub.add_parser('x')",
+    }
+
+    def test_every_way_a_name_is_bound_is_held_one_row_each_and_the_binder_table_is_complete_against_the_ast_module(self):
+        import ast
+        for label, body in self.FAMILY.items():
+            with self.subTest(label):
+                self.assertTrue(self.found_unit(body), label)
+        # the table of string binders is checked against the ast module itself: every node class with a field that carries a name is in it, or in the table of classes that are not binders (with the reason)
+        fields = {"name", "names", "asname", "rest", "arg", "attr", "id", "kwd_attrs"}
+        seen = set()
+        for name, node in vars(ast).items():
+            if isinstance(node, type) and issubclass(node, ast.AST) and node is not ast.AST and fields & set(getattr(node, "_fields", ())):
+                seen.add(name)
+                self.assertTrue(name in self.dc.STRING_BINDERS or name in self.dc.NOT_BINDERS, "an ast node class that carries a name and is in neither table: %s" % name)
+        self.assertTrue({"FunctionDef", "ClassDef", "ExceptHandler", "Import", "Global", "MatchAs"} <= seen)
+        for name in self.dc.STRING_BINDERS:
+            self.assertTrue(not hasattr(ast, name) or name in seen, name)
+
+    REBINDINGS = {   # every form that binds a name a second time, with {V} as the second value; after each, `f('x')` is called
+        "assign": "f = {V}", "augmented assign": "f += {V}", "annotated assign": "f: object = {V}", "assign under an if": "if sub:\n    f = {V}", "for target": "for f in ({V},):\n    pass",
+        "with target": "with {V} as f:\n    pass", "walrus": "(f := {V})", "tuple unpack": "f, g = {V}, 1", "star unpack": "*f, = ({V},)", "class attribute": "class C:\n    f = {V}",
+        "match capture": "match {V}:\n    case f:\n        pass", "decorator": "@{V}\ndef f():\n    pass", "a nested parameter": "def g(f):\n    f('y')\ng({V})", "a second def": "def f():\n    pass",
+        "comprehension variable": "[0 for f in ({V},)]", "except as": "try:\n    pass\nexcept Exception as f:\n    pass", "del": "del f", "import as": "import {V} as f",
+    }
+
+    def test_a_name_bound_twice_and_then_called_is_held_for_every_binding_form_and_every_second_value(self):
+        """The root of the rebinding family: a call is allowed only when its name has exactly ONE binding in the registrar (a def or lambda of its own) or is a table name never bound: so whatever the second binding is, the call is held."""
+        function = self.pick()[0]
+        values = ("eval", "exec", "open", "(lambda x: x)", function, "os")
+        for label, template in self.REBINDINGS.items():
+            for value in values:
+                if label in ("except as", "del") and value != values[0]:
+                    continue   # these two bind no value
+                if label == "import as" and value in ("(lambda x: x)", function):
+                    continue   # an import takes a module name
+                body = "def f():\n    pass\n" + template.replace("{V}", value) + "\nf('x')"
+                if label == "a second def":
+                    body = "def f():\n    pass\ndef f():\n    pass\nf('x')"
+                with self.subTest(form=label, value=value):
+                    self.assertTrue(self.found_unit(body), body)
+        for label, body in (("a def called once", "def f(v):\n    return v\nsub.add_parser('x', help=f('a'))"), ("a lambda called once", "f = lambda v: v\nsub.add_parser('x', help=f('a'))"),
+                            ("a table builtin never bound", "sub.add_parser('x', default=int('1'))")):
+            with self.subTest(allowed=label):
+                self.assertEqual(self.found_unit(body), [], label)
+
     # ---- the mutants: a small daemon file with its own closure, the table run on the REAL lint and on a copy of it with ONE thing changed
     FAKE = ("import re\nimport json\nREGISTRAR_NAME_RE = re.compile(r'add_[a-z0-9_]+_parsers')\nFIELDS = ('a', 'b')\nHOOKS = []\n"
             "def fn():\n    return json.dumps(HOOKS)\ndef main():\n    fn()\n    return FIELDS, HOOKS, re, hh\n"
@@ -34411,6 +34470,24 @@ class TestRegistrarFloor(LedgerBase):
         has("a call of an element of a local list", reg("l = []\nl.append(os.system)\nl[0]('x')"), ("calls", "l"))
         has("a loop variable over a list", reg("for f in [os.system]:\n    f('x')"), ("calls", "f"))
         clean("a loop over a tuple of strings", reg("t = sub.add_parser('x')\nfor f in ('a', 'b'):\n    t.add_argument('--' + f.replace('_', '-'))"))
+        for label, body in self.FAMILY.items():   # the same rows on the fake closure: each must still be held
+            try:
+                got, why = dc.registrar_findings(fake, fake + ("def add_zz_parsers(sub):\n    " + body.replace("\n", "\n    ") + "\n"), rule)
+                if why or not got:
+                    bad.append("family: " + label)
+            except Exception:
+                bad.append("family: " + label)
+        for label, template in self.REBINDINGS.items():   # the family on the fake closure, second value `eval`
+            if label in ("import as",):
+                continue
+            body = "def f():\n    pass\n" + template.replace("{V}", "eval") + "\nf('x')" if label != "a second def" else "def f():\n    pass\ndef f():\n    pass\nf('x')"
+            try:
+                got, why = dc.registrar_findings(fake, fake + ("def add_zz_parsers(sub):\n    " + body.replace("\n", "\n    ") + "\n"), rule)
+                if why or not any(g[1] == "calls" for g in got):
+                    bad.append("rebinding: " + label)
+            except Exception:
+                bad.append("rebinding: " + label)
+        has("a table builtin rebound then called", reg("int = json\nsub.add_parser('x', help=int('1'))"), ("calls", "int"))
         clean("a pure builtin of the table", reg("sub.add_parser('x', default=int('1'), help=str(2))"))
         has("a builtin outside the table", reg("sorted(sub)"), ("calls", "sorted"))
         clean("a named helper is not read as part of the registrar", reg("t = sub.add_parser('x')\nt.add_argument('--i', type=hh)\nhh('1')"))
@@ -34426,6 +34503,8 @@ class TestRegistrarFloor(LedgerBase):
                 bad.append("an unreadable table holds")
         except Exception:
             bad.append("an unreadable table holds")
+        clean("an async function it defines", reg("async def f(v):\n    return v\nsub.add_parser('x', help=f('a'))"))
+        clean("a class it defines", reg("class K:\n    pass\nsub.add_parser('x', help=K())"))
         clean("a clean readable helper", "def _h(p):\n    p.add_parser('x')\n" + reg("_h(sub)"))
         has("a default that is not data", "def add_zz_parsers(sub, m=json):\n    pass\n", ("rebinds", "m"))
         has("a parser name rebound", reg("sub = json\nsub.x = 1"), ("rebinds", "sub"))
@@ -34499,14 +34578,11 @@ class TestRegistrarFloor(LedgerBase):
         ("an object built from the parser is not its own", "if isinstance(x, ast.Assign) and verb_chain(x.value):\n                sources = x.targets", "if False:\n                sources = x.targets"),
         ("a loop over the parser's objects is not its own", "elif isinstance(x, (ast.For, ast.comprehension)) and ((isinstance(x.iter, (ast.Tuple, ast.List))", "elif isinstance(x, (ast.For, ast.comprehension)) and ((False and isinstance(x.iter, (ast.Tuple, ast.List))"),
         ("a call on data is not allowed", "callee in data or", "False or"),
-        ("a readable helper is not allowed", "x.func.id in readable", "False"),
         ("the removed lines count as added", "added = set(lines[1])", "added = set(lines[0]) | set(lines[1])"),
         ("the base's closure is not united", "names |= reach[0] | reach[1]", "names |= (reach[0] | reach[1]) if tree is head else set()"),
         ("the base's registrar pattern is not united", "patterns = [p for p in (registrar_pattern(base), registrar_pattern(head)) if p is not None]", "patterns = [registrar_pattern(head)]"),
         ("a helper is not followed", "for ref in sorted(refs & set(defs)):", "for ref in []:"),
         ("an opaque helper is not held", "if isinstance(x.func, ast.Name) and x.func.id in opaque", "if False and isinstance(x.func, ast.Name) and x.func.id in opaque"),
-        ("the table's builtins are not read", "x.func.id in builtins and x.func.id not in own", "False"),
-        ("the table's helpers are not allowed callees", "or x.func.id in named_helpers or", "or"),
         ("a named helper is still read as part of a registrar", "if node.name not in names and node.name not in named:", "if node.name not in names:"),
         ("an edit of a name of the table is not held", "if bound in table and _spans_from_decorators(node, numbers):", "if False:"),
         ("an unreadable table passes", 'return None, "the registrar allow table of the rule cannot be read"', "pass"),
@@ -34514,11 +34590,6 @@ class TestRegistrarFloor(LedgerBase):
         ("a decorator is not part of a helper", "start = min([node.lineno] + [d.lineno for d in getattr(node, \"decorator_list\", [])])\n    return any(n in numbers", "start = node.lineno\n    return any(n in numbers"),
         ("a rebound builtin stays allowed", "pure_builtins = pure_builtins - rebound", "pass"),
         ("a deletion in a named helper is not held", "for tree, numbers in ((head, set(lines[1])), (base, set(lines[0]))):", "for tree, numbers in ((head, set(lines[1])),):"),
-        ("a with-as parser name is not held", "elif isinstance(x, (ast.With, ast.AsyncWith)):\n            targets = [i.optional_vars for i in x.items if i.optional_vars is not None]", "elif False:\n            targets = [i.optional_vars for i in x.items if i.optional_vars is not None]"),
-        ("a for parser name is not held", "elif isinstance(x, (ast.For, ast.AsyncFor, ast.comprehension)) and not _is_data(", "elif False and not _is_data("),
-        ("a walrus parser name is not held", "(ast.AugAssign, ast.AnnAssign, ast.NamedExpr)) and getattr(x, \"value\", None) is not None and not verb_chain(x.value)", "(ast.AugAssign, ast.AnnAssign)) and getattr(x, \"value\", None) is not None and not verb_chain(x.value)"),
-        ("an augmented parser name is not held", "(ast.AugAssign, ast.AnnAssign, ast.NamedExpr)) and getattr(x, \"value\", None) is not None and not verb_chain(x.value)", "(ast.AnnAssign, ast.NamedExpr)) and getattr(x, \"value\", None) is not None and not verb_chain(x.value)"),
-        ("an annotated parser name is not held", "(ast.AugAssign, ast.AnnAssign, ast.NamedExpr)) and getattr(x, \"value\", None) is not None and not verb_chain(x.value)", "(ast.AugAssign, ast.NamedExpr)) and getattr(x, \"value\", None) is not None and not verb_chain(x.value)"),
         ("a named helper counts as a closure use", "live = set(names) - set(literals) - set(named_helpers)", "live = set(names) - set(literals)"),
         ("an upper-case attribute read is always a constant", "isinstance(x.ctx, ast.Load) and x.attr.isupper() and isinstance(x.value, ast.Name):", "isinstance(x.ctx, ast.Load) and True and isinstance(x.value, ast.Name):"),
         ("any method of the handle is a verb", "if not (isinstance(func, ast.Attribute) and func.attr in verbs):", "if not isinstance(func, ast.Attribute):"),
@@ -34533,7 +34604,15 @@ class TestRegistrarFloor(LedgerBase):
         ("aliases by ** are not held", "(k.arg is None and names_aliases(k.value))", "False"),
         ("set_defaults on the handle is not held", "if fname == \"set_defaults\" and isinstance(x.func, ast.Attribute)", "if False and isinstance(x.func, ast.Attribute)"),
         ("a list is data", "    if isinstance(expr, ast.Tuple):\n        return all(_is_data(e, data) for e in expr.elts)", "    if isinstance(expr, (ast.Tuple, ast.List, ast.Set)):\n        return all(_is_data(e, data) for e in expr.elts)"),
-        ("a rebound def stays a function it defines", "defined = {n for n, k in kinds.items() if k and all(v in (\"def\", \"lambda\") for v in k)", "defined = {n for n, k in kinds.items() if k and any(v in (\"def\", \"lambda\") for v in k)"),
+        ("a del is not a binding", "if isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del)):", "if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store):"),
+        ("a decorator is not read", "for expr in list(x.decorator_list) + (list(x.bases) + [k.value for k in x.keywords] if isinstance(x, ast.ClassDef) else []):", "for expr in []:"),
+        ("a parser name rebound in any form is not held", "        if not ok:\n            note(node, \"rebinds\", name)", "        if False:\n            note(node, \"rebinds\", name)"),
+        ("the table's builtins are not read", "(x.func.id in (set(readable) | set(named_helpers) | set(builtins)) and x.func.id not in kinds)", "(x.func.id in (set(readable) | set(named_helpers)) and x.func.id not in kinds)"),
+        ("the table's helpers are not allowed callees", "(x.func.id in (set(readable) | set(named_helpers) | set(builtins)) and x.func.id not in kinds)", "(x.func.id in (set(readable) | set(builtins)) and x.func.id not in kinds)"),
+        ("a readable helper is not allowed", "(x.func.id in (set(readable) | set(named_helpers) | set(builtins)) and x.func.id not in kinds)", "(x.func.id in (set(named_helpers) | set(builtins)) and x.func.id not in kinds)"),
+        ("a nested parameter is not a binding", "if isinstance(x, ast.arg) and id(x) not in own_args:", "if False:"),
+        ("two defs are one function", "len(k) == 1 and k[0] in (\"def\", \"lambda\")", "k and all(v in (\"def\", \"lambda\") for v in k)"),
+        ("a rebound table builtin stays callable", "(x.func.id in (set(readable) | set(named_helpers) | set(builtins)) and x.func.id not in kinds)", "(x.func.id in (set(readable) | set(named_helpers) | set(builtins)))"),
         ("a keyword is always free", "if key in free_keywords:\n                        continue", "if True:\n                        continue"),
         ("action takes any value", "if key == \"action\" and not (isinstance(value, ast.Constant) and isinstance(value.value, str)):", "if False:"),
         ("a value argparse may run is not checked", "bad = unsafe(value)\n                    if bad:", "bad = None\n                    if bad:"),
@@ -34541,12 +34620,18 @@ class TestRegistrarFloor(LedgerBase):
         ("a computed module constant is not data", "if isinstance(expr, ast.BinOp):\n        return _is_const_expr(expr.left, data) and _is_const_expr(expr.right, data)", "if False:\n        return _is_const_expr(expr.left, data) and _is_const_expr(expr.right, data)"),
         ("a method of data is not safe", "if isinstance(callee, ast.Attribute) and isinstance(callee.value, ast.Name) and (callee.value.id in data", "if False and isinstance(callee, ast.Attribute) and isinstance(callee.value, ast.Name) and (callee.value.id in data"),
         ("a default that is not data is not held", "for a, default in param_defaults:", "for a, default in []:"),
-        ("a rebound parser name is not held", '                    note(x, "rebinds", y.id)', "                    pass"),
         ("a registrar bound under an if is not read", "for node in _module_statements(head.body):\n        for name, unit in _binds_registrar(node, patterns):", "for node in head.body:\n        for name, unit in _binds_registrar(node, patterns):"),
         ("a registrar bound as a lambda is not read", "isinstance(value, ast.Lambda) and isinstance(target, ast.Name) else None", "False else None"),
         ("a registrar bound in a form that cannot be read passes", 'found.append((name, "rebinds", "a registrar bound in a form that cannot be read"))', "pass"),
         ("the module-level namespace write passes", 'found.append(("a module-level write into globals()", "rebinds", "a registrar bound in a form that cannot be read"))', "pass"),
     )
+
+    def test_a_mutant_without_any_one_member_of_the_binder_table_fails_a_row(self):
+        for key in list(self.dc.STRING_BINDERS):
+            with self.subTest(key):
+                module = self.mutant_module("NOT_BINDERS = {", "NOT_BINDERS = {")
+                module.STRING_BINDERS = {k: v for k, v in module.STRING_BINDERS.items() if k != key}
+                self.assertTrue(self.table_failures(module), "a lint that does not read %s as a binder survives" % key)
 
     def test_the_table_holds_on_the_real_lint_and_every_mutant_of_it_fails_a_row(self):
         self.assertEqual(self.table_failures(self.dc), [], "the table holds on the real lint")
