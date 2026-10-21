@@ -34282,7 +34282,8 @@ class TestRegistrarFloor(LedgerBase):
         self.assertIsNone(why)
         # the one read the rule cannot clear: the loader loop at the top of the file writes `globals()[<variable>]`, a key the lint cannot read, so an edit of that line is held for the owner (it is the clear's own loader)
         got = [g for g in got if g[0] != "a name of the allow table"]   # (every line counted as added also counts the named helpers' lines: their edit-hold is tested on its own)
-        self.assertEqual(got, [("a module-level write into globals()", "rebinds", "a registrar bound in a form that cannot be read")])
+        module_kinds = {"a module-level write into globals()", "a module-level expression statement", "a module-level namespace reach"}
+        self.assertEqual({g[0] for g in got}, module_kinds, got)   # no REGISTRAR is held; what is held is the daemon file's own module-level statements (the loader, `DEFAULTS.update(...)`, `bind(globals())`, `sys.exit(main())`), and only when a pull request adds one
         self.assertIn("globals()[_function] = _make_loader(", self.base_src)
 
     def reg(self, text, base=None):
@@ -34610,6 +34611,25 @@ class TestRegistrarFloor(LedgerBase):
                 got = self.found_unit(body)
                 self.assertTrue(any(("form %s," % name) in n for _, v, n in got), (name, got))
 
+    MODULE_NAMESPACE_WRITES = {   # a module-level statement that binds a registrar (`command_registrars` collects them out of globals() by name) without a binding form: each is held when added
+        "globals().update": "globals().update({'add_zz_parsers': print})", "globals().setdefault": "globals().setdefault('add_zz_parsers', print)", "setattr on the module": "setattr(sys.modules[__name__], 'add_zz_parsers', print)",
+        "sys.modules __dict__ store": "sys.modules[__name__].__dict__['add_zz_parsers'] = print", "exec of a def": "exec('def add_zz_parsers(sub): pass')", "eval": "eval('1')", "vars().update": "vars().update(add_zz_parsers=print)",
+        "locals().update": "locals().update(add_zz_parsers=print)", "__import__": "__import__('os')", "importlib": "importlib.import_module('os')", "an assignment that exec's": "zz_x = exec('def add_zz_parsers(sub): pass')",
+        "a bare call": "zz_register(print)", "a bare attribute call": "zz_registry.update(zz_other)", "a conditional namespace write": "globals().update({'add_zz_parsers': print}) if True else None",
+    }
+
+    def test_a_module_level_statement_that_may_write_the_namespace_is_held_when_added_and_not_when_untouched(self):
+        for label, text in self.MODULE_NAMESPACE_WRITES.items():
+            with self.subTest(label):
+                got, why = self.regfake(text + "\n")
+                self.assertIsNone(why)
+                self.assertTrue(any(g[0].startswith("a module-level") for g in got), (label, got))
+        base = self.FAKE + "globals().setdefault('zz', 1)\n"                           # already there and untouched: not held
+        self.assertEqual(self.dc.registrar_findings(base, base, self.FAKE_RULE), ([], None))
+        self.assertEqual(self.regfake("ZZ_CONST = ('a', 'b')\n"), ([], None), "a literal assignment is not held")
+        self.assertEqual(self.regfake("'a docstring-like constant statement'\n"), ([], None))
+        self.assertEqual(self.regfake("ZZ_RE = re.compile('x')\n"), ([], None), "re.compile is an attribute named like the builtin and reaches no namespace")
+
     def test_a_name_bound_twice_and_then_called_is_held_for_every_binding_form_and_every_second_value(self):
         """The root of the rebinding family: a call is allowed only when its name has exactly ONE binding in the registrar (a def or lambda of its own) or is a table name never bound: so whatever the second binding is, the call is held."""
         function = self.pick()[0]
@@ -34779,6 +34799,23 @@ class TestRegistrarFloor(LedgerBase):
                             bad.append("module form (helper): %s / %s" % (form, nesting))
                 except Exception:
                     bad.append("module form: %s / %s" % (form, nesting))
+        for label, text in self.MODULE_NAMESPACE_WRITES.items():
+            try:
+                got, why = dc.registrar_findings(fake, fake + text + "\n", rule)
+                if why or not any(g[0].startswith("a module-level") for g in got):
+                    bad.append("module namespace write: " + label)
+            except Exception:
+                bad.append("module namespace write: " + label)
+        clean("re.compile is not a namespace reach", "ZZ_RE = re.compile('x')\n", base=None) if False else None
+        try:
+            got, why = dc.registrar_findings(fake, fake + "ZZ_RE = re.compile('x')\n", rule)
+            if why or got != []:
+                bad.append("re.compile at module level")
+            held = fake + "globals().setdefault('zz', 1)\n"   # already there and untouched
+            if dc.registrar_findings(held, held, rule) != ([], None):
+                bad.append("an untouched module statement")
+        except Exception:
+            bad.append("module statement rows")
         clean("a pure builtin of the table", reg("sub.add_parser('x', default=int('1'), help=str(2))"))
         has("a builtin outside the table", reg("sorted(sub)"), ("calls", "sorted"))
         clean("a named helper is not read as part of the registrar", reg("t = sub.add_parser('x')\nt.add_argument('--i', type=hh)\nhh('1')"))
@@ -34894,12 +34931,16 @@ class TestRegistrarFloor(LedgerBase):
         ("set_defaults on the handle is not held", "if fname == \"set_defaults\" and isinstance(x.func, ast.Attribute)", "if False and isinstance(x.func, ast.Attribute)"),
         ("a list is data", "    if isinstance(expr, ast.Tuple):\n        return all(_is_data(e, data) for e in expr.elts)", "    if isinstance(expr, (ast.Tuple, ast.List, ast.Set)):\n        return all(_is_data(e, data) for e in expr.elts)"),
         ("a nested statement is not read for the table", "x = todo.pop()\n        if isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del)):\n            out.append(x.id)", "x = todo.pop()\n        if False:\n            out.append(x.id)"),
-        ("a module walrus in a default is not seen", "header += list(arguments.defaults) + [d for d in arguments.kw_defaults if d is not None]", "header += []"),
-        ("a module class base is not seen", "header = list(getattr(x, \"decorator_list\", [])) + list(getattr(x, \"bases\", []))", "header = list(getattr(x, \"decorator_list\", []))"),
+        ("a module walrus in a default is not seen", "header += list(arguments.defaults) + [d for d in arguments.kw_defaults if d is not None]\n                header += [a.annotation", "header += []\n                header += [a.annotation"),
+        ("a module class base is not seen", "header = list(getattr(x, \"decorator_list\", [])) + list(getattr(x, \"bases\", [])) + [k.value for k in getattr(x, \"keywords\", [])]   # all of these", "header = list(getattr(x, \"decorator_list\", [])) + [k.value for k in getattr(x, \"keywords\", [])]   # all of these"),
         ("a match body is not walked", "        if isinstance(node, ast.Match):\n            for case in node.cases:", "        if False:\n            for case in node.cases:"),
         ("a registrar bound in another form is not held", "    extra = [(n, None) for n in _bound_here(node) if named(n)]", "    extra = []"),
         ("a helper bound twice stays a def", "if len(kinds_) == 1 and kinds_[0][0] in (\"def\", \"lambda\"):", "if kinds_[0][0] in (\"def\", \"lambda\"):"),
         ("the grammar allows every class", "kind in REGISTRAR_GRAMMAR or kind in GRAMMAR_NEUTRAL:", "kind in REGISTRAR_GRAMMAR or kind in GRAMMAR_NEUTRAL or True:"),
+        ("a module expression statement is not held", "if isinstance(node, ast.Expr) and not isinstance(node.value, ast.Constant):", "if False:"),
+        ("a module namespace reach is not held", "            if reach:\n                found.append((\"a module-level namespace reach\"", "            if False:\n                found.append((\"a module-level namespace reach\""),
+        ("re.compile is a namespace reach", "x.attr not in NAMESPACE_ATTRIBUTE_EXEMPT", "True"),
+        ("an untouched module statement is held", "        if not _spans(node, added):                # a bare expression statement", "        if False:                # a bare expression statement"),
         ("a with item is not read", "elif isinstance(x, (ast.With, ast.AsyncWith)):\n            for item in x.items:", "elif False:\n            for item in x.items:"),
         ("a for iterable is not read", "elif isinstance(x, (ast.For, ast.AsyncFor, ast.comprehension)) and not _built_iter(x.iter, built):", "elif False:"),
         ("a bare decorator of the unit is not read", "if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):\n            for expr in list(x.decorator_list)", "if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and x is not unit:\n            for expr in list(x.decorator_list)"),

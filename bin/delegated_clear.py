@@ -908,6 +908,29 @@ def _spans_from_decorators(node, numbers):
     return any(n in numbers for n in range(start, getattr(node, "end_lineno", node.lineno) + 1))
 
 
+# the names by which Python reaches a module's namespace from a statement; a module-level statement that names one is held (the bare-expression rule above is the default-deny, this covers the same reach inside an assignment)
+NAMESPACE_NAMES = {"globals", "vars", "locals", "setattr", "delattr", "exec", "eval", "compile", "__import__", "import_module", "__dict__", "modules", "__builtins__"}
+
+
+NAMESPACE_ATTRIBUTE_EXEMPT = {"compile"}   # `re.compile(...)` is an attribute named like the builtin and reaches no namespace; the BARE builtin `compile(...)` is still held
+
+
+def _shallow_nodes(node):
+    """The nodes of a statement that run when the statement runs: its own expressions, a def's or class's header (decorators, defaults, bases), and never the body of a def, a class or a lambda, nor a nested statement (those are yielded on their own)."""
+    todo = [node]
+    while todo:
+        x = todo.pop()
+        yield x
+        if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            header = list(getattr(x, "decorator_list", [])) + list(getattr(x, "bases", [])) + [k.value for k in getattr(x, "keywords", [])]
+            arguments = getattr(x, "args", None)
+            if isinstance(arguments, ast.arguments):
+                header += list(arguments.defaults) + [d for d in arguments.kw_defaults if d is not None]
+            todo.extend(header)
+            continue
+        todo.extend(c for c in ast.iter_child_nodes(x) if not isinstance(c, ast.stmt))
+
+
 def _bound_here(node):
     """The names a module-level statement binds BY ITSELF, derived from the same forms as `_name_bindings` (every Name in a Store or Del context, the nodes of STRING_BINDERS, imports and `global` statements): an assignment of any
     form, a walrus or a match capture anywhere in the statement's own expressions or patterns, a loop or `with` target, an `except` name, a def, a class. Statements nested in it are NOT read here (`_module_statements` yields them
@@ -1064,6 +1087,16 @@ def registrar_findings(base_src, head_src, rule):
                     if ref not in done or (full and done[ref] is not None):
                         done[ref] = None if full else added
                         todo.append((ref, defs[ref], done[ref]))
+    for node in _module_statements(head.body):   # MODULE-LEVEL DEFAULT-DENY: `command_registrars` collects registrars out of the module's globals by name, so any added module-level statement that may write the namespace is held:
+        if not _spans(node, added):                # a bare expression statement (`globals().update(...)`, `setattr(sys.modules[__name__], ...)`, `exec(...)`: a call is not a binding the other rules can read), and any statement that
+            continue                                # reaches the namespace by a call or an attribute (`globals`, `vars`, `locals`, `setattr`, `exec`, `eval`, `compile`, `__import__`, `__dict__`, `modules`)
+        if isinstance(node, ast.Expr) and not isinstance(node.value, ast.Constant):
+            found.append(("a module-level expression statement", "calls", "a statement that may write the module's namespace"))
+        for x in _shallow_nodes(node):
+            reach = (isinstance(x, ast.Name) and x.id in NAMESPACE_NAMES) or (isinstance(x, ast.Attribute) and x.attr in NAMESPACE_NAMES and x.attr not in NAMESPACE_ATTRIBUTE_EXEMPT)
+            if reach:
+                found.append(("a module-level namespace reach", "calls", "a statement that may write the module's namespace"))
+                break
     for node in ast.walk(head):   # a write into the namespace at module level that names a registrar (or a key that cannot be read)
         if isinstance(node, ast.Subscript) and _spans(node, added) and isinstance(node.ctx, (ast.Store, ast.Del)) and isinstance(node.value, ast.Call) \
                 and isinstance(node.value.func, ast.Name) and node.value.func.id in ("globals", "vars"):
