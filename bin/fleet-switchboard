@@ -25145,7 +25145,8 @@ def cmd_disk_janitor(args, runner, now):
             if reviewed != fingerprint:
                 raise LaunchError("refused: --i-reviewed %s is not this preview's fingerprint (%s): the rule or the list changed since you read it. Nothing was removed; "
                                   "run the dry run again and read it" % (_one_line(reviewed, 40), fingerprint))
-            lines, removed, kept = janitor.run(temp, state, now(), cfg, True, audit, busy=janitor_busy_function(engine, runner, janitor), weekly=False)
+            lines, removed, kept = janitor.run(temp, state, now(), cfg, True, audit, busy=janitor_busy_function(engine, runner, janitor), weekly=False,
+                                               only=set(o["name"] for o in preview))   # only what the fingerprint named: an entry that qualifies between the two scans is kept
     for line in lines:
         print(_plain(line, 300))
     print("%s: %d %s, %d kept (%s)" % (PROG, removed, "removed" if args.apply else "would be removed (a dry run: add --apply --i-reviewed %s)" % fingerprint, kept, _plain(temp, 160)))
