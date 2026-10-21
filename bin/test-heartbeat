@@ -11,6 +11,7 @@ anything.
 
 Exits non-zero if anything fails.
 """
+import ast
 import contextlib
 import importlib.machinery
 import importlib.util
@@ -402,6 +403,18 @@ def fake_runner(returncode=0, stdout="herdr 0.9.0\n", stderr="", raises=None):
     return run
 
 
+REAL_REGISTRY = hb.registry
+
+
+def first_target(herdr):
+    """The first tab of the fake with the bell glyph and an agent, as a target (what the retired live filter gave the tick tests)."""
+    by_tab = {a["tab_id"]: a for a in herdr.agents}
+    for tab in herdr.tabs:
+        if BELL in tab["label"] and tab["tab_id"] in by_tab:
+            return {"workspace_id": tab["workspace_id"], "tab_id": tab["tab_id"], "pane_id": by_tab[tab["tab_id"]]["pane_id"]}
+    raise AssertionError("no belled tab in the fake")
+
+
 class FakeRegistry:
     """The registry's read API (docs/agent-registry.md), in memory: stands in for bin/registry.py until it is installed."""
 
@@ -410,6 +423,8 @@ class FakeRegistry:
         self.whole = whole
         self.problem = problem
 
+    bell_of = staticmethod(REAL_REGISTRY.bell_of)
+
     def read(self, state_dir):
         if not self.whole:
             return {"whole": False, "version": 1, "agents": {}, "retired": {}, "problem": self.problem or "registry.json is not valid JSON: nothing read"}
@@ -417,7 +432,7 @@ class FakeRegistry:
 
 
 def registry_agents(*panes):
-    return {"role%d" % i: {"pane": pane, "workspace": pane.split(":")[0], "role": "worker"} for i, pane in enumerate(panes)}
+    return {"role%d" % i: {"pane": pane, "workspace": pane.split(":")[0], "role": "worker", "bell": True} for i, pane in enumerate(panes)}
 
 
 class Base(unittest.TestCase):
@@ -654,7 +669,7 @@ class TestBackoff(Base):
 
     def test_a_busy_pane_defers_and_then_lands(self):
         herdr = FakeHerdr(status="working")
-        target = herdr.discover()[0]
+        target = first_target(herdr)
 
         self.assertEqual(hb.tick_pane(self.state, herdr, target, now=1000.0), "busy_or_blocked_or_unknown")
         self.assertEqual(self.pane()["consecutive_defers"], 1)
@@ -681,7 +696,7 @@ class TestBackoff(Base):
 class TestSafeSend(Base):
     def gate(self, **kwargs):
         herdr = FakeHerdr(**kwargs)
-        target = herdr.discover()[0]
+        target = first_target(herdr)
         return herdr, hb.tick_pane(self.state, herdr, target, now=1000.0)
 
     def test_a_clean_idle_pane_is_the_only_thing_that_gets_a_wake(self):
@@ -759,7 +774,7 @@ class TestSafeSend(Base):
         agents = [{"pane_id": "w2:p2", "tab_id": "w2:t2", "agent": "claude",
                    "agent_status": "idle", "terminal_id": "term1"}]
         herdr = FakeHerdr(agents=agents)
-        target = herdr.discover()[0]
+        target = first_target(herdr)
         now = 1000.0
         for _ in range(3):
             self.assertEqual(hb.tick_pane(self.state, herdr, target, now=now), "wrong_agent_kind")
@@ -782,17 +797,17 @@ class TestSafeSend(Base):
                    "agent_status": "idle", "terminal_id": "term1"}]
         herdr = FakeHerdr(agents=agents)
         with mock.patch.object(hb.logging, "warning") as warning:
-            hb.tick_pane(self.state, herdr, herdr.discover()[0], now=1000.0)
+            hb.tick_pane(self.state, herdr, first_target(herdr), now=1000.0)
         self.assertEqual(warning.call_args_list, [])
 
     def test_status_labels_an_unwakeable_pane_not_wakeable(self):
         agents = [{"pane_id": "w2:p2", "tab_id": "w2:t2", "agent": "copilot",
                    "agent_status": "idle", "terminal_id": "term1"}]
         herdr = FakeHerdr(agents=agents)
-        hb.tick_pane(self.state, herdr, herdr.discover()[0], now=1000.0)
+        hb.tick_pane(self.state, herdr, first_target(herdr), now=1000.0)
         text = hb.format_status(hb.read_state(self.state), {"w2:p2"}, 1001.0)
         self.assertIn("  ^ not wakeable: agent_kind_not_wakeable:copilot "
-                      "(\U0001f514 has no effect on this agent)", text)
+                      "(the bell has no effect on this agent)", text)
         self.assertNotIn("chronic failure", text)
 
     def test_state_from_before_not_wakeable_reads_right_after_the_next_tick(self):
@@ -800,7 +815,7 @@ class TestSafeSend(Base):
         agents = [{"pane_id": "w2:p2", "tab_id": "w2:t2", "agent": "claude",
                    "agent_status": "idle", "terminal_id": "term1"}]
         herdr = FakeHerdr(agents=agents)
-        target = herdr.discover()[0]
+        target = first_target(herdr)
         state = hb.read_state(self.state)
         pane = hb.new_pane(target)
         pane.update(next_due=1000.0, chronic_failure=True,
@@ -823,7 +838,7 @@ class TestSafeSend(Base):
         agents = [{"pane_id": "w2:p2", "tab_id": "w2:t2", "agent": "codex",
                    "agent_status": "idle", "terminal_id": "term1"}]
         herdr = FakeHerdr(agents=agents)
-        target = herdr.discover()[0]
+        target = first_target(herdr)
         hb.tick_pane(self.state, herdr, target, now=1000.0)
         self.assertEqual(self.pane()["chronic_reason"], "agent_kind_not_wakeable:codex")
         herdr.agents[0]["agent"] = "opencode"
@@ -852,7 +867,7 @@ class TestSafeSend(Base):
         # herdr drops the agent within 0.5s and the pane is back to its shell.
         # Discovery saw an idle opencode; by inspection herdr says no agent.
         herdr = FakeHerdr()
-        target = herdr.discover()[0]
+        target = first_target(herdr)
         herdr.agents = [a for a in herdr.agents if a["pane_id"] != target["pane_id"]]
         herdr.process_name, herdr.process_argv = "bash", ["-bash"]
         status = hb.tick_pane(self.state, herdr, target, now=1000.0)
@@ -947,7 +962,7 @@ class TestKindFixtures(Base):
                 agents = [{"pane_id": "w2:p2", "tab_id": "w2:t2", "agent": kind,
                            "agent_status": "idle", "terminal_id": "term1"}]
                 herdr = FakeHerdr(agents=agents, screen=screen)
-                status = hb.tick_pane(self.state, herdr, herdr.discover()[0], now=1000.0)
+                status = hb.tick_pane(self.state, herdr, first_target(herdr), now=1000.0)
                 self.assertEqual(status, "draft_or_unknown", (kind, name))
                 self.assertEqual(herdr.sent, [])
                 self.setUp()
@@ -959,7 +974,7 @@ class TestKindFixtures(Base):
         agents = [{"pane_id": "w2:p2", "tab_id": "w2:t2", "agent": "pi",
                    "agent_status": "idle", "terminal_id": "term1"}]
         herdr = FakeHerdr(agents=agents, screen=PI_EMPTY)
-        status = hb.tick_pane(self.state, herdr, herdr.discover()[0], now=1000.0)
+        status = hb.tick_pane(self.state, herdr, first_target(herdr), now=1000.0)
         self.assertEqual(status, "wrong_agent_kind")
         self.assertEqual(herdr.sent, [])
         self.assertEqual(self.pane()["chronic_reason"], "agent_kind_not_wakeable:pi")
@@ -987,7 +1002,7 @@ class TestKindFixtures(Base):
             agents = [{"pane_id": "w2:p2", "tab_id": "w2:t2", "agent": kind,
                        "agent_status": "idle", "terminal_id": "term1"}]
             herdr = FakeHerdr(agents=agents, screen=screen)
-            status = hb.tick_pane(self.state, herdr, herdr.discover()[0], now=1000.0)
+            status = hb.tick_pane(self.state, herdr, first_target(herdr), now=1000.0)
             self.assertEqual(status, "wrong_agent_kind", kind)
             self.assertEqual(herdr.sent, [])
             self.setUp()
@@ -1004,33 +1019,162 @@ class TestDiscovery(Base):
                            "agent": "opencode", "agent_status": "idle"})
         return FakeHerdr(tabs=tabs, agents=agents)
 
-    def test_the_bell_is_the_only_rule(self):
-        herdr = self.tabs("%s Payments" % BELL, "Orchestrator", "orchestrator", "%s" % BELL,
-                          "Infra %s trailing" % BELL, "\U0001f515 Orchestrator", "plain")
-        supervised = {t["tab_id"] for t in herdr.discover()}
-        self.assertEqual(supervised, {"w0:t1", "w3:t1", "w4:t1"})
+    def test_the_registry_bell_field_is_the_only_rule(self):
+        hb.registry = FakeRegistry({
+            "on": {"pane": "w0:p1", "bell": True}, "off": {"pane": "w1:p1", "bell": False},
+            "none": {"pane": "w2:p1"}, "odd": {"pane": "w3:p1", "bell": "yes"}})
+        self.assertEqual([t["pane_id"] for t in hb.registry_targets()[0]], ["w0:p1"])
 
-    def test_no_word_in_the_label_grants_anything(self):
-        # Deliberate change from the original, which required both a magic word
-        # and the glyph: renaming a tab must not silently change supervision.
-        self.assertEqual(self.tabs("Orchestrator").discover(), [])
-        self.assertEqual(self.tabs("Chief of Staff").discover(), [])
+    def test_no_label_grants_anything(self):
+        # a bell glyph in a tab label has no effect: the registry's field decides
+        hb.registry = FakeRegistry({"a": {"pane": "w2:p2", "bell": False}})
+        herdr = FakeHerdr()
+        self.assertEqual(hb.registry_targets()[0], [])
+        self.assertEqual(herdr.calls, [])
 
-    def test_a_tab_without_an_agent_is_not_a_candidate(self):
-        herdr = FakeHerdr(tabs=[{"tab_id": "w1:t1", "workspace_id": "w1", "label": "%s empty" % BELL}],
-                          agents=[])
-        self.assertEqual(herdr.discover(), [])
+    def test_a_recorded_agent_whose_pane_is_gone_is_not_a_candidate(self):
+        hb.registry = FakeRegistry({"a": {"pane": "w1:p1", "bell": True, "state": "dead"}, "b": {"pane": "w2:p1", "bell": True, "state": "detached"},
+                                    "c": {"pane": "w3:p1", "bell": True, "state": "idle"}})
+        self.assertEqual([t["pane_id"] for t in hb.registry_targets()[0]], ["w3:p1"])
 
-    def test_list_shows_unsupervised_tabs_so_a_missing_bell_is_visible(self):
-        herdr = self.tabs("%s Payments" % BELL, "Web App")
-        rows = {t["tab_id"]: t["supervised"] for t in herdr.tabs_with_agents()}
-        self.assertEqual(rows, {"w0:t1": True, "w1:t1": False})
 
-    def test_list_shows_each_agent_kind_and_whether_it_can_be_woken(self):
-        herdr = self.tabs("%s Payments" % BELL, "%s Web App" % BELL)
-        herdr.agents[1]["agent"] = "claude"
-        rows = {t["tab_id"]: (t["agent_kind"], t["wakeable"]) for t in herdr.tabs_with_agents()}
-        self.assertEqual(rows, {"w0:t1": ("opencode", True), "w1:t1": ("claude", False)})
+class TestBellFromRegistry(Base):
+    """#973: the old filter (a bell glyph in the live tab label of a live agent) and the new one (the registry's field) pick the same agents."""
+
+    ROWS = {  # name: (registry record, label of its tab in the old world or None when herdr lists no agent for it)
+        "live": ({"pane": "w1:p1", "state": "idle", "bell": False}, "plain"),
+        "dead": ({"pane": "w2:p1", "state": "dead", "bell": True}, None),
+        "detached": ({"pane": "w3:p1", "state": "detached", "bell": True}, None),
+        "out": ({"pane": "w4:p1", "state": "working", "bell": False}, "Orchestrator"),
+        "in": ({"pane": "w5:p1", "state": "idle", "bell": True}, "%s Payments" % BELL),
+    }
+
+    @staticmethod
+    def old_filter(rows):
+        """The retired filter, written out: a tab is supervised only while herdr lists an agent in it and its label carries the glyph."""
+        return sorted(rec["pane"] for rec, label in rows.values() if label is not None and BELL in label)
+
+    def test_old_and_new_filter_pick_the_same_agents_on_every_row(self):
+        hb.registry = FakeRegistry({n: rec for n, (rec, _) in self.ROWS.items()})
+        new = sorted(t["pane_id"] for t in hb.registry_targets()[0])
+        self.assertEqual(new, self.old_filter(self.ROWS))
+        for name, (rec, label) in self.ROWS.items():
+            hb.registry = FakeRegistry({name: rec})
+            self.assertEqual([t["pane_id"] for t in hb.registry_targets()[0]], self.old_filter({name: (rec, label)}), name)
+
+    def test_a_record_with_no_bell_field_is_opted_out(self):
+        hb.registry = FakeRegistry({"a": {"pane": "w2:p2"}})
+        self.assertEqual(hb.registry_targets()[0], [])
+
+    def test_the_pass_makes_no_live_listing_for_the_bell(self):
+        hb.registry = FakeRegistry({"a": {"pane": "w2:p2", "bell": True}, "b": {"pane": "w3:p1", "bell": True}, "c": {"pane": "w9:p1"}})
+        herdr = FakeHerdr()
+        with quiet_stderr():
+            TestRegistryIdentity.loop(self, herdr)
+        listings = [c for c in herdr.calls if c[:2] in {("agent", "list"), ("tab", "list")}]
+        self.assertEqual(listings, [])
+        self.assertEqual(set(hb.read_state(self.state)["panes"]), {"w2:p2", "w3:p1"})
+
+    def test_the_heartbeat_source_names_no_live_listing(self):
+        # the mutant guard: a build that reads the live agent list again names it in a call
+        tree = ast.parse((BIN / "fleet-heartbeat").read_text())
+        for call in ast.walk(tree):
+            if isinstance(call, ast.Call):
+                parts = [a.value for a in call.args if isinstance(a, ast.Constant)]
+                self.assertFalse(any(parts[i:i + 2] == ["agent", "list"] for i in range(len(parts))), "a live agent listing is back")
+        self.assertNotIn("tabs_with_agents", (BIN / "fleet-heartbeat").read_text())
+
+    # -- S5: two mutants of the heartbeat source, each must fail a check
+
+    SOURCE = (BIN / "fleet-heartbeat").read_text()
+
+    @staticmethod
+    def names_live_listing(text):
+        for call in ast.walk(ast.parse(text)):
+            if isinstance(call, ast.Call):
+                parts = [a.value for a in call.args if isinstance(a, ast.Constant)]
+                if any(parts[i:i + 2] == ["agent", "list"] for i in range(len(parts))):
+                    return True
+        return "tabs_with_agents" in text
+
+    def load_source(self, text):
+        copy = self.home / "mutant"
+        copy.mkdir(exist_ok=True)
+        for sibling in ("heartbeat-ack", "registry.py"):
+            if (BIN / sibling).exists():
+                shutil.copy(str(BIN / sibling), str(copy / sibling))
+        (copy / "fleet-heartbeat").write_text(text)
+        loader = importlib.machinery.SourceFileLoader("t_mutant", str(copy / "fleet-heartbeat"))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader("t_mutant", loader))
+        loader.exec_module(module)
+        return module
+
+    def test_a_mutant_that_reads_the_live_listing_again_is_caught(self):
+        self.assertFalse(self.names_live_listing(self.SOURCE))
+        mutant = self.SOURCE.replace("    def inspect_pane(self, pane_id):", '    def tabs_with_agents(self):\n        return self.call("agent", "list")\n\n    def inspect_pane(self, pane_id):', 1)
+        self.assertNotEqual(mutant, self.SOURCE)
+        self.assertTrue(self.names_live_listing(mutant))
+
+    def test_a_mutant_that_ignores_the_field_is_caught(self):
+        mutant = self.SOURCE.replace("registry.bell_of(agent) and ", "", 1)
+        self.assertNotEqual(mutant, self.SOURCE)
+        module = self.load_source(mutant)
+        module.registry = FakeRegistry({n: rec for n, (rec, _) in self.ROWS.items()})
+        module.registry_state_dir = lambda: Path("/nonexistent")
+        got = sorted(t["pane_id"] for t in module.registry_targets()[0])
+        self.assertNotEqual(got, self.old_filter(self.ROWS))   # the opted-out row is nudged: the table test fails on it
+        module.registry = FakeRegistry({n: rec for n, (rec, _) in self.ROWS.items()})
+
+    def test_the_documentation_has_one_section_naming_the_field_and_the_command(self):
+        text = (BIN.parent / "INSTALL.md").read_text()
+        sections = [part for part in text.split("\n### ") if "`bell` field" in part and "fleet-heartbeat bell NAME on" in part]
+        self.assertEqual(len(sections), 1)
+
+
+    def test_the_bell_command_writes_the_field_and_refuses_an_unknown_agent(self):
+        d = self.home / "reg"
+        d.mkdir()
+        real = REAL_REGISTRY
+        self.assertEqual(real.migrate_bell(d, set(), True)["problem"], None)   # the one-time migration has run
+        real.upsert(d, "w", {"pane": "w2:p2", "session": "ses_example1"})
+        self.assertIs(real.read(d)["agents"]["w"]["bell"], False)   # a NEW agent is recorded with the field
+        self.assertEqual(real.set_bell(d, "w", True), {"changed": True, "problem": None})
+        self.assertEqual(real.set_bell(d, "w", True), {"changed": False, "problem": None})
+        real.upsert(d, "w", {"pane": "w2:p2", "session": "ses_example1", "state": "working"})
+        self.assertIs(real.read(d)["agents"]["w"]["bell"], True)   # a state pass never forgets it
+        self.assertTrue(real.set_bell(d, "nobody", True)["problem"])
+        self.assertNotIn("nobody", real.read(d)["agents"])
+
+    def run_cmd(self, fn, argv, reg_dir):
+        args = hb.build_parser().parse_args(["--state-dir", str(self.state)] + argv)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(hb, "registry", REAL_REGISTRY), mock.patch.object(hb, "registry_state_dir", lambda: reg_dir), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = fn(args)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_the_bell_and_list_commands_report_and_refuse(self):
+        d = self.home / "reg2"
+        d.mkdir()
+        REAL_REGISTRY.migrate_bell(d, set(), True)
+        REAL_REGISTRY.upsert(d, "w", {"pane": "w2:p2", "session": "ses_example1"})
+        self.assertEqual(self.run_cmd(hb.cmd_list, ["list"], d)[1].count("no (bell off)"), 1)
+        code, out, err = self.run_cmd(hb.cmd_bell, ["bell", "w", "on"], d)
+        self.assertEqual((code, "bell on" in out), (0, True))
+        self.assertEqual(self.run_cmd(hb.cmd_list, ["list"], d)[1].count("yes"), 1)
+        code, out, err = self.run_cmd(hb.cmd_bell, ["bell", "ghost", "on"], d)
+        self.assertEqual(code, hb.EXIT_FAULT)
+        self.assertIn("not a recorded agent", err)
+        (d / "registry.json").write_text("{not json")
+        self.assertEqual(self.run_cmd(hb.cmd_list, ["list"], d)[0], hb.EXIT_FAULT)
+
+    def test_status_says_the_migration_is_pending_until_the_marker_exists(self):
+        d = self.home / "reg3"
+        d.mkdir()
+        with mock.patch.object(hb, "registry", REAL_REGISTRY), mock.patch.object(hb, "registry_state_dir", lambda: d), \
+                mock.patch.object(hb, "load_config", side_effect=hb.ConfigError("x")), contextlib.redirect_stdout(io.StringIO()) as out:
+            hb.cmd_status(hb.build_parser().parse_args(["--state-dir", str(self.state), "status"]))
+        self.assertIn("bell migration pending", out.getvalue())
 
 
 # ------------------------------------------------- the daemon writes no tab titles
@@ -1038,7 +1182,7 @@ class TestDiscovery(Base):
 class TestReadOnlyTabs(Base):
     def test_no_rename_is_ever_attempted_even_through_chronic_failure(self):
         herdr = FakeHerdr(screen=composer("permanent draft"))
-        target = herdr.discover()[0]
+        target = first_target(herdr)
         now = 1000.0
         for _ in range(8):
             hb.tick_pane(self.state, herdr, target, now=now)
@@ -1103,7 +1247,7 @@ class TestChronicFailure(Base):
 
     def test_the_finding_is_recorded_in_state_for_fleet_doctor(self):
         herdr = FakeHerdr(screen=composer("permanent draft"))
-        target = herdr.discover()[0]
+        target = first_target(herdr)
         now = 1000.0
         for _ in range(6):
             hb.tick_pane(self.state, herdr, target, now=now)
@@ -1119,7 +1263,7 @@ class TestChronicFailure(Base):
 
     def test_an_accepted_wake_clears_the_finding(self):
         herdr = FakeHerdr(screen=composer("draft"))
-        target = herdr.discover()[0]
+        target = first_target(herdr)
         now = 1000.0
         for _ in range(6):
             hb.tick_pane(self.state, herdr, target, now=now)
@@ -1263,9 +1407,11 @@ class TestRegistryIdentity(Base):
         self.assertEqual(set(hb.read_state(self.state)["panes"]), {"w2:p2", "w3:p1", "w4:p1"})
 
     def test_a_registry_agent_without_the_bell_is_not_nudged(self):
-        hb.registry = FakeRegistry(registry_agents("w2:p2", "w3:p1"))
+        agents = registry_agents("w2:p2", "w3:p1")
+        agents["role1"]["bell"] = False   # a bell glyph in its label changes nothing: the registry field decides
+        hb.registry = FakeRegistry(agents)
         herdr = FakeHerdr(
-            tabs=[{"tab_id": "w2:t1", "workspace_id": "w2", "label": "%s x" % BELL}, {"tab_id": "w3:t1", "workspace_id": "w3", "label": "plain"}],
+            tabs=[{"tab_id": "w2:t1", "workspace_id": "w2", "label": "plain"}, {"tab_id": "w3:t1", "workspace_id": "w3", "label": "%s x" % BELL}],
             agents=[{"pane_id": "w2:p2", "tab_id": "w2:t1", "agent": "opencode", "agent_status": "idle"},
                     {"pane_id": "w3:p1", "tab_id": "w3:t1", "agent": "opencode", "agent_status": "idle"}])
         with quiet_stderr():
@@ -1297,7 +1443,7 @@ class TestRegistryIdentity(Base):
 
     def test_a_registry_agent_with_no_usable_pane_is_not_a_target(self):
         for pane in (None, "", "  ", 5, ["w2:p2"]):
-            hb.registry = FakeRegistry({"a": {"pane": pane}, "b": {"pane": "w2:p2"}, "c": "not a dict", "d": {"kind": "cloud", "pane": None, "session": "ses_example"}, "e": {"role": "worker"}})
+            hb.registry = FakeRegistry({"a": {"pane": pane, "bell": True}, "b": {"pane": "w2:p2", "bell": True}, "c": "not a dict", "d": {"kind": "cloud", "pane": None, "session": "ses_example"}, "e": {"role": "worker"}})
             self.assertEqual([t["pane_id"] for t in hb.registry_targets()[0]], ["w2:p2"], pane)
             self.assertIsNone(hb.registry_targets()[1])
 
@@ -1307,12 +1453,14 @@ class TestRegistryIdentity(Base):
                 raise RuntimeError("boom")
 
         class Returns:
+            bell_of = staticmethod(REAL_REGISTRY.bell_of)
+
             def __init__(self, value):
                 self.value = value
 
             def read(self, d):
                 return self.value
-        good = {"version": 1, "agents": {"a": {"pane": "w2:p2"}}, "retired": {}, "problem": None}
+        good = {"version": 1, "agents": {"a": {"pane": "w2:p2", "bell": True}}, "retired": {}, "problem": None}
         cases = [Raises(), Returns(None), Returns([]), Returns(dict(good, whole="false")), Returns(dict(good, whole=1)), Returns(dict(good, whole=None)),
                  Returns(dict(good, whole=True, agents=[])), Returns(dict(good, whole=True, agents=None))]
         for reg in cases:
@@ -1335,18 +1483,12 @@ class TestRegistryIdentity(Base):
         self.assertIn("read failed", hb.read_state(self.state)["service"]["last_error"])
 
     def test_two_registry_agents_on_one_pane_nudge_it_once(self):
-        hb.registry = FakeRegistry({"a": {"pane": "w2:p2"}, "b": {"pane": "w2:p2"}})
+        hb.registry = FakeRegistry({"a": {"pane": "w2:p2", "bell": True}, "b": {"pane": "w2:p2", "bell": True}})
         self.seed(next_due=1.0)
         herdr = FakeHerdr()
         with quiet_stderr():
             self.loop(herdr)
         self.assertEqual(len(herdr.sent), 1)
-
-    def test_the_target_carries_the_tab_from_herdr(self):
-        herdr = FakeHerdr()
-        with quiet_stderr():
-            self.loop(herdr)
-        self.assertEqual(self.pane()["tab_id"], "w2:t2")
 
     def test_no_registry_module_fails_closed(self):
         hb.registry = None
@@ -1463,7 +1605,7 @@ class TestWakeMessage(Base):
 
     def test_escalation_clears_after_a_real_ack(self):
         herdr = FakeHerdr()
-        target = herdr.discover()[0]
+        target = first_target(herdr)
         now = 1000.0
         for _ in range(4):
             hb.tick_pane(self.state, herdr, target, now=now)
