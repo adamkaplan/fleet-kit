@@ -27898,7 +27898,7 @@ class TestIdentityCheck(ReportBase):
                 done, seen = self.run_gh_shim("acme-ops/service", users, {}, args=args)     # the token lookup fails
                 self.assertNotEqual(done.returncode, 0)
                 self.assertIn("account lookup failed, retry", done.stderr)
-                self.assertTrue(seen is None or seen["argv"][:2] == ["repo", "view"], seen)
+                self.assertTrue(seen is None or seen["argv"][:2] == ["repo", "view"] or (args[0] == "pr" and "merge" in args and seen["argv"][:2] == ["pr", "view"]), seen)   # a merge shape is now read like any `pr merge`: the review probe's READ may run, the write never does
 
     def test_a_lookup_that_answers_leaves_writes_unchanged_and_the_retry_rescues_a_blip(self):
         users = {"acme-ops/service": "acct-ops"}
@@ -76268,6 +76268,50 @@ class TestGhShimMergeGate(Base):
         for name, args in shapes.items():
             with self.subTest(shape=name):
                 self.assertTrue(self.refused_call(args), args)
+
+    def shim_module(self):
+        loader = importlib.machinery.SourceFileLoader("gh_shim_one_parser", str(self.shim_path or SHIM))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader("gh_shim_one_parser", loader))
+        loader.exec_module(module)
+        return module
+
+    DECIDERS = ["canonical_pr_merge", "explicit_repo", "gate_bind_merge", "gate_parse", "gate_probe", "merge_route", "review_probe", "take_over_review"]
+
+    def one_parser_problems(self):
+        """[what went wrong] for each generated call shape: every probe of `run` must be handed the same canonical `pr merge`."""
+        shim = self.shim_module()
+        problems = []
+        for name, args in self.call_shapes().items():
+            seen = {}
+            with mock.patch.object(shim, "real_gh", lambda: "/bin/true"), mock.patch.object(shim, "hold_probe", lambda a, *r: (seen.__setitem__("hold", list(a)), (None, None, None))[1]), \
+                    mock.patch.object(shim, "review_probe", lambda a, *r, **k: seen.__setitem__("review", list(a))), \
+                    mock.patch.object(shim, "gate_probe", lambda a, *r, **k: seen.__setitem__("gate", list(a))), \
+                    mock.patch.object(shim, "merge_gate_probe", lambda a, *r, **k: seen.__setitem__("merge", list(a))), \
+                    mock.patch.object(shim, "account_env", lambda *a, **k: None), mock.patch.object(shim.os, "execv", lambda *a: (_ for _ in ()).throw(SystemExit(0))), \
+                    mock.patch.object(shim.os, "execve", lambda *a: (_ for _ in ()).throw(SystemExit(0))), mock.patch.object(shim, "Lookup", lambda **k: mock.Mock()):
+                try:
+                    shim.run(list(args))
+                except SystemExit:
+                    pass
+            if sorted(seen) != ["gate", "hold", "merge", "review"]:
+                problems.append("%s: only %s were asked" % (name, sorted(seen)))
+            problems += ["%s: %s was handed %s" % (name, label, got) for label, got in seen.items() if got[:2] != ["pr", "merge"]]
+        return problems
+
+    def test_the_functions_of_the_shim_that_decide_on_merge_are_counted_and_each_one_reads_the_one_canonical_form(self):
+        """Derived: the functions of shims/gh that name `merge` are exactly DECIDERS (a new one fails here until it is read and added), and every probe of `run`,
+        the hold check of gh_hold.py among them, is handed the SAME canonical `pr merge` for each generated call shape: the one parser runs once at the top of `run`."""
+        import ast
+        source = SHIM.read_text()
+        named = sorted(n.name for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and ('"merge"' in ast.get_source_segment(source, n) or "'merge'" in ast.get_source_segment(source, n)))
+        self.assertEqual(named, self.DECIDERS)
+        self.assertEqual(self.one_parser_problems(), [])
+
+    def test_a_shim_without_the_one_parser_at_the_top_of_run_fails_that_test(self):
+        self.mutated_shim("    args = canonical_pr_merge(args)   # THE one parse", "    pass   # THE one parse")
+        problems = self.one_parser_problems()
+        self.shim_path = None
+        self.assertTrue(problems, "the mutant that drops the one parser must be seen")
 
     def test_an_unknown_flag_before_the_verb_is_never_read_as_the_end_of_the_command(self):
         """The fallback of `canonical_pr_merge`: a word that is not a known verb, with `merge` after it, is read as a merge (an unknown flag's value was taken for the verb)."""

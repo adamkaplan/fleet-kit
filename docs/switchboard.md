@@ -4344,7 +4344,7 @@ waiver** of the chief of staff: `fleet-switchboard waive <repo#N> --gates MG --r
 request's head and expiring after 24 hours. The waiver is also how the one merge that fixes a red branch goes in.
 
 **Which routes the shim covers, and which stay outside.** Covered, for a listed repository: `gh pr merge` in any shape (the command words are found structurally, so `-R`/`--repo` and other flags may stand before `pr`,
-between `pr` and `merge` or after, and the merge gate reads one canonical form; a shape the shim cannot parse is refused, never run), `gh api` with a write method (or `-f`, `-F`,
+between `pr` and `merge` or after, and every probe of the shim (hold, review, plan gate, merge gate) reads ONE canonical form, parsed once at the top; a shape the shim cannot parse is refused, never run), `gh api` with a write method (or `-f`, `-F`,
 `--input`) to `repos/<repo>/pulls/<N>/merge` (the path goes through ONE normaliser: percent-decoded, cut at `?` and `#`, repeated slashes collapsed, `.` and `..` segments resolved (a path that climbs above `repos` is refused), case folded; a path
 with a placeholder (`{owner}`, `:owner`), a variable, a URL form or any other `pulls/<x>/merge` that cannot be tied to a repository is refused), and a
 GraphQL `mergePullRequest` or `enablePullRequestAutoMerge` mutation (refused while any repository is gated, because the mutation names a node id, not a
