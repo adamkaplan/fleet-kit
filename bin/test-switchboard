@@ -71207,7 +71207,7 @@ class TestWhoCanClear(unittest.TestCase):
 
     def test_s9_no_planted_token_and_no_home_path_reaches_the_line_and_a_reason_is_never_printed(self):
         token = "gh" + "p_" + "A1b2C3d4" * 5
-        home = "/Users/" + "alex" + "/.config/fleet"
+        home = "/".join(["", "Us" + "ers", "alex", ".config", "fleet"])
         for planted in (token, home, "x/" + token + ".py", "../../" + home.lstrip("/"), "bin/" + home):
             with self.subTest(path=planted[:12]):
                 paths = [".github/workflows/" + planted.lstrip("/")]
@@ -71388,9 +71388,9 @@ class TestClearLine(TestImpactHold):
 
     def test_s9_a_planted_token_and_home_path_in_a_file_name_or_a_reason_do_not_reach_the_posted_body(self):
         token = "gh" + "p_" + "A1b2C3d4" * 5
-        home = "/Users/" + "alex" + "/.config/fleet"
+        home = "/".join(["", "Us" + "ers", "alex", ".config", "fleet"])
         self.mapped = ["it changes %s at %s" % (token, home)]
-        self.set_files("migrations/0002.sql", ".github/workflows/" + token + ".yml", "bin//Users/alex/.config/fleet", "bin/fleet-switchboard")
+        self.set_files("migrations/0002.sql", ".github/workflows/" + token + ".yml", "bin/" + "/".join(["", "Us" + "ers", "alex", ".config", "fleet"]), "bin/fleet-switchboard")
         self.passes()
         (post,) = self.posts()
         self.assertNotIn(token, post[2]["body"])
