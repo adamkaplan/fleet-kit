@@ -199,6 +199,42 @@ the next run's names.
 | `delete` (no run id given) | the pod (its `uid`) | deletes the pod (bound to that `uid`) and both Secrets | The pod delete is bound; the two Secrets are deleted by name, by the operator's explicit command, with no run id to compare (`--force` is its own statement). Note: `delete` without `--force` trusts the `hook-ran` marker, which a stop now writes only onto the pod it read |
 | `extend` | the pod (its `uid`) | annotates the deadline, bound to that `uid` | Yes: a changed pod is not extended (run it again) |
 
+## The reaper's own cluster login (unattended)
+
+**The cause.** The reaper logs in to the cluster with the namespaced operator's token file (`CW_CLOUD_TOKEN_FILE`,
+with `CW_CLOUD_SERVER` and `CW_CLOUD_NAMESPACE`). A token of that account lives at most sixty minutes
+(`MAX_TOKEN_SECONDS`). Nothing in this repository used to create or refresh that file: the only minting,
+`cluster_token` in the launch wiring, runs in memory for a launch and never reached the reaper's driver. So an
+installed reaper stopped working within the hour: every pass failed the cluster call, the reaper exited with an
+`error:` line and the service restarted it every 30 seconds.
+
+**The fix.** The reaper keeps its own login fresh, without a person. At the start of every pass, when the token
+file is missing or has less than `CLUSTER_TOKEN_REFRESH_MARGIN_SECONDS` (1200, so 20 minutes) of life left, the
+reaper makes a fresh short-lived token for the namespaced operator account itself, by the same route the launch
+uses in memory: the cluster administrator kubeconfig is read from the vault (`CW_VAULT_SUBSCRIPTION` and
+`CW_VAULT_NAME` for the vault, `CW_CLUSTER_ADMIN_SECRET` for the name of the secret inside it) into memory and
+handed to the one `kubectl create token cw-operator` command over a pipe (`/dev/fd/N`: never a file, never an
+argument, never printed), and the administrator value is dropped when that command ends. The token is written to
+the token file with mode `0600`, by an atomic replace (a temp file in the same directory, then `os.replace`), so
+there is never a moment with another mode and the old file stays whole if anything fails. The token that lands in
+the file holds the operator account's own rights in the namespace and nothing more.
+
+**What it reads.** The token file (`CW_CLOUD_TOKEN_FILE`), the cluster (`CW_CLOUD_SERVER`), the namespace
+(`CW_CLOUD_NAMESPACE`), the vault (`CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME`) and the name of the secret inside it
+(`CW_CLUSTER_ADMIN_SECRET`). No new setting name is added: the margin and the requested life (60 minutes, the
+cap) are constants of the launcher. The reaper's service file and its environment still carry names and paths
+only; no token and no administrator value ever reaches them.
+
+**When it fails.** The old file stays as it is, one audit line names the reason (`refresh-cluster-token`, one line
+per change of reason), the pass report names the failure (`cluster token not refreshed: WHY`), and the next
+attempt follows the retry gap (`CLUSTER_TOKEN_RETRY_SECONDS`, 300): the vault is read at most once every five
+minutes, so a failing vault never spins. A vault that refuses this machine is named as such, and the reaper never
+runs the vault access check (that check belongs to the launch path alone). Another login is never touched:
+`CW_KUBE_CONTEXT` and `CW_KUBECONFIG` are left alone, and no other credential is ever tried.
+
+**The manual install comment on the installer ask is superseded**: it recorded that a person had to refresh the
+token file by hand. The reaper does that now, by itself, and runs unattended for days.
+
 ## Server-side guards: `app_token.py` and `preflight.py`
 
 A guard is enforced where the action takes effect (the repository's rules, the token's scope), not in a wrapper.
