@@ -9121,10 +9121,13 @@ class WorkflowPlanPins(unittest.TestCase):
         tmp = self.repo_for(listtext, tuple(files), integration, tuple(moves), head_list, unrelated)
         out = Path(tmp) / "out.txt"
         out.write_text("")
-        env = dict(os.environ, EVENT=event, BASE=base, DRAFT="true" if draft else "false", GITHUB_OUTPUT=str(out))
+        summary = Path(tmp) / "summary.txt"
+        summary.write_text("")
+        env = dict(os.environ, EVENT=event, BASE=base, DRAFT="true" if draft else "false", GITHUB_OUTPUT=str(out), GITHUB_STEP_SUMMARY=str(summary))
         done = subprocess.run(["bash", "-c", script], cwd=tmp, env=env, capture_output=True, text=True)
         if done.returncode:
             raise AssertionError("the plan script failed: " + done.stderr[-400:])
+        self.log, self.summary = done.stdout, summary.read_text()
         line = [l for l in out.read_text().splitlines() if l.startswith("matrix=")][-1]
         return json.loads(line[len("matrix="):])
 
@@ -9237,8 +9240,16 @@ class WorkflowPlanPins(unittest.TestCase):
         check(key(run("pull_request", "integration", files=("docs/other.md",), unrelated=True)) == both, "a diff that fails (no common history) runs macOS although the base list reads fine")
         bare = "\n".join(l for l in listtext.splitlines() if l.strip() != ".github/macos-platform-paths.txt") + "\n"
         check(key(run("pull_request", "integration", files=(".github/macos-platform-paths.txt",), listtext=bare)) == both, "the list file's own path is fixed in the script: a list edit runs macOS even if the base list does not name itself")
+        # The workflow directory is hard-coded too: another workflow file runs macOS even when the base list has no entry for the directory.
+        nowf = "\n".join(l for l in listtext.splitlines() if not l.strip().startswith(".github/workflows")) + "\n"
+        check(key(run("pull_request", "integration", files=(".github/workflows/other.yml",), listtext=nowf)) == both, "a change under the workflow directory runs macOS even if the base list has no workflow entry")
+        check("workflow file is changed" in self.summary, "the workflow-directory reason is in the step summary")
+        check(key(run("pull_request", "integration", files=(".github/workflows-not/x.yml",), listtext=nowf)) == ["test (ubuntu-latest)"], "only the workflow directory itself is hard-coded, not a lookalike")
         for bad in ("", "# group: shims\n\n", None):
             check(key(run("pull_request", "integration", listtext=bad)) == both, "a list that is empty, comment-only or missing runs macOS")
+            check("fail safe" in self.log and "fail safe" in self.summary, "the fail-safe line is in the step log AND the step summary")
+        check(key(run("pull_request", "integration", files=("docs/other.md",), unrelated=True)) == both and "fail safe" in self.summary and "fail safe" in self.log, "a failed diff says so in the log and the summary")
+        check(key(run("pull_request", "integration", files=(".github/macos-platform-paths.txt",), listtext=bare)) == both and "is edited" in self.summary, "the list-edit reason is in the step summary")
         check("fetch-depth: 0" in jobs.split("\n  test:\n", 1)[0], "the plan checkout has the full history")
         nightly = run("schedule")
         check(len(nightly) == 4 and sorted({r["ref"] for r in nightly}) == ["integration", "main"], "the nightly: main and integration, two operating systems each")
@@ -9287,6 +9298,10 @@ class WorkflowPlanPins(unittest.TestCase):
             ("the path list not read", swap('LIST = ".github/macos-platform-paths.txt"', 'LIST = ".github/missing.txt"'), listtext),
             ("the list read from the head, no self-touch rule", swap('shown = git("show", "origin/" + base + ":" + LIST)', 'shown = git("show", "HEAD:" + LIST)').replace("or LIST in files ", ""), listtext),
             ("no self-touch rule", swap("or LIST in files ", ""), listtext),
+            ("the workflow directory not hard-coded", swap("or any(f.startswith(WORKFLOWS) for f in files) ", ""), listtext),
+            ("the workflow directory prefix widened", swap('WORKFLOWS = ".github/workflows/"', 'WORKFLOWS = ".github/workflows"'), listtext),
+            ("the fail-safe lines not in the summary", swap("summary.write(message", "summary.write(''"), listtext),
+            ("the summary written only for the log", swap('if os.environ.get("GITHUB_STEP_SUMMARY"):', "if False:"), listtext),
             ("the path list emptied", text, "# group: shims\n"),
             ("renames detected", swap('"diff", "--no-renames", "--name-only"', '"diff", "--name-only"'), listtext),
             ("a failed diff skips macOS", swap("macos = diff.returncode != 0 or LIST in files or any(", "macos = diff.returncode == 0 and any("), listtext),

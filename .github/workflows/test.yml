@@ -29,7 +29,7 @@ jobs:
   # Decides the runners, in seconds. A job skipped by its own `if` would leave the required name `test (macos-latest)` unreported
   # (a skipped MATRIX job reports under its unexpanded name), so the macOS entry is in or out of the MATRIX instead:
   #   - a pull request into main: both legs, macOS unconditional (a draft into main skips macOS until ready_for_review);
-  #   - a pull request into any other branch (integration): macOS only when its diff touches a path of the ONE list file, read from the BASE branch (or edits that file);
+  #   - a pull request into any other branch (integration): macOS only when its diff touches a path of the ONE list file, read from the BASE branch, or edits that file, or changes a file under .github/workflows/ (those two are hard-coded in the script);
   #   - a push, a dispatch: both legs; the nightly: main and integration, each leg named `nightly <ref> (<os>)`.
   # No third-party action: a plain `git diff --no-renames --name-only`.
   plan:
@@ -57,27 +57,37 @@ jobs:
           event, base, draft = os.environ["EVENT"], os.environ.get("BASE", ""), os.environ.get("DRAFT") == "true"
           def git(*args):
               return subprocess.run(["git"] + list(args), capture_output=True, text=True)
+          # Hard-coded here, independent of the list: the list file itself and the workflow directory. Everything else comes from the BASE list.
           LIST = ".github/macos-platform-paths.txt"
+          WORKFLOWS = ".github/workflows/"
+          def note(message):
+              # The step log AND the step summary, so the run page shows why macOS ran.
+              print(message)
+              if os.environ.get("GITHUB_STEP_SUMMARY"):
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+                      summary.write(message + "\n\n")
           macos = True
           if event == "pull_request":
               if base == "main":
                   macos = not draft
               else:
                   # The list is read from the BASE, never from this pull request's own checkout: a pull request cannot rewrite the
-                  # list that gates it. A list edit itself always runs macOS (the path below is fixed here, not read from the list).
+                  # list that gates it. A list edit and a change under the workflow directory always run macOS (both paths are fixed here, not read from the list).
                   shown = git("show", "origin/" + base + ":" + LIST)
                   patterns = [l.strip() for l in shown.stdout.splitlines() if l.strip() and not l.lstrip().startswith("#")] if shown.returncode == 0 else []
                   if not patterns:
-                      print("the platform-path list on origin/%s cannot be read or holds no pattern: running macOS (fail safe)" % base)
+                      note("the platform-path list on origin/%s cannot be read or holds no pattern: running macOS (fail safe)" % base)
                   else:
                       # --no-renames: a file moved OUT of a listed path is seen under its old name too.
                       diff = git("diff", "--no-renames", "--name-only", "origin/" + base + "...HEAD")
                       if diff.returncode != 0:
-                          print("the diff against origin/%s failed: running macOS (fail safe)" % base)
+                          note("the diff against origin/%s failed: running macOS (fail safe)" % base)
                       files = diff.stdout.splitlines()
                       if LIST in files:
-                          print("the platform-path list is edited by this pull request: running macOS")
-                      macos = diff.returncode != 0 or LIST in files or any(fnmatch.fnmatchcase(f, p) for f in files for p in patterns)
+                          note("the platform-path list is edited by this pull request: running macOS")
+                      if any(f.startswith(WORKFLOWS) for f in files):
+                          note("a workflow file is changed by this pull request: running macOS")
+                      macos = diff.returncode != 0 or LIST in files or any(f.startswith(WORKFLOWS) for f in files) or any(fnmatch.fnmatchcase(f, p) for f in files for p in patterns)
           oses = ["ubuntu-latest"] + (["macos-latest"] if macos else [])
           rows = []
           if event == "schedule":
