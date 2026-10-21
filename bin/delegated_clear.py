@@ -209,11 +209,19 @@ def judge(block, cells, entries, report, threshold):
             reasons.append("it changes a %s path and the rating %s is below the floor %s: refused" % (cls, level, block["floor"]["lowest_level"]))
         elif not any(i == top and re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(rule_id), str(e.get("impact_reason") or "")) for i, _, e in counted):
             reasons.append("it changes a %s path and the rating's reason does not name the rule %s: the rule is not named, the rating does not count" % (cls, rule_id))
-    if level not in block["delegable_levels"]:
-        reasons.append("the score is %s: %s is the owner's" % (level, level))
-    elif ladder.index(level) > ladder.index(threshold):
-        reasons.append("the score %s is above the threshold %s" % (level, threshold))
+    over = level_refusal(block, level, threshold)
+    if over:
+        reasons.append(over)
     return {"level": level, "reasons": reasons}
+
+
+def level_refusal(block, level, threshold):
+    """The reason a score `level` is refused whatever the rating's other lines say (not a level a delegation may clear, or above `threshold`), or None. The ONE comparison: `judge` makes it on the score, `who_can_clear` on the floor's lowest level."""
+    if level not in block["delegable_levels"]:
+        return "the score is %s: %s is the owner's" % (level, level)
+    if block["ladder"].index(level) > block["ladder"].index(threshold):
+        return "the score %s is above the threshold %s" % (level, threshold)
+    return None
 
 
 def daemon_roots(rule):
@@ -391,6 +399,9 @@ def who_can_clear(rule, report, files, matches, closure, block, delegation, pr=N
     only = {(i["kind"], _why(i)) for i in items if i["kind"] in _OWNER_WORDS}
     out["owner_only"] = [{"kind": k, "why": w} for k, w in sorted(only)]
     out["needs"] = sorted({i["text"] for i in items if i["kind"] == "review"})
+    if out["floor_ids"] and out["threshold"] and not out["owner_only"] and level_refusal(block, out["min_rating"], out["threshold"]):   # no rating can pass the clear's own comparison: the floor needs more than any order allows
+        need = out["min_rating"]
+        out["owner_only"] = [{"kind": "score", "why": "the rating the floor needs (%s) is %s" % (need, "the owner's" if need not in block["delegable_levels"] else "above what any order allows (%s)" % out["threshold"])}]
     if out["owner_only"]:
         out["who"] = "owner only"
     elif delegation is None:
@@ -415,7 +426,7 @@ def clear_line(who):
     if who["floor_ids"] and who["threshold"]:
         return head + "the Chief of Staff or the owner, if the independent rating is at least %s and its reason names %s" % (who["min_rating"], " and ".join(who["floor_ids"]))
     if who["threshold"]:
-        return head + "the Chief of Staff or the owner, on an independent rating up to %s" % who["threshold"]
+        return head + "the Chief of Staff or the owner, on an independent rating of at most %s (the highest any order allows)" % who["threshold"]
     return head + "the Chief of Staff or the owner, if the independent review names no top tier class" + floor
 
 

@@ -72101,6 +72101,52 @@ class TestWhoCanClear(unittest.TestCase):
         self.assertEqual(self.module.delegation_of(on(bound(1)), self.block), {"threshold": None})
         self.assertEqual(self.module.delegation_of(on(bound(1, max_level="Medium"), bound(2, max_level="Serious"), bound(3)), self.block), {"threshold": "Serious"})
 
+    def floor_row(self, cls="credentials"):
+        path = next(p for p in self.matrix["owner_hold"]["top_tier_paths"][cls] if not self.floor.matches(p, self.rule["clear_code_paths"]) and "*" not in p)
+        return self.report(hits={cls: [path]}, paths=[path]), [self.file(path)]
+
+    def test_a_floor_above_every_order_is_owner_only_and_the_clear_refuses_every_rating_the_same_way(self):
+        report, files = self.floor_row()
+        floor = self.block["floor"]["lowest_level"]
+        ladder = self.block["ladder"]
+        for threshold in [l for l in self.block["delegable_levels"] if ladder.index(l) < ladder.index(floor)]:
+            with self.subTest(threshold=threshold):
+                got = self.who(report, files, delegation={"threshold": threshold})
+                self.assertEqual((got["who"], [o["kind"] for o in got["owner_only"]]), ("owner only", ["score"]))
+                line = self.module.clear_line(got)
+                self.assertIn("owner only: the rating the floor needs (%s) is above what any order allows (%s)" % (floor, threshold), line)
+                for level in ladder:   # the clear itself: no rating at the floor or above passes
+                    self.assertTrue(self.module.level_refusal(self.block, level, threshold) or ladder.index(level) <= ladder.index(threshold))
+                self.assertTrue(self.module.level_refusal(self.block, floor, threshold), "the same comparison the clear makes")
+        self.assertEqual(self.who(report, files, delegation={"threshold": floor})["who"], "chief of staff with a rating")
+
+    def test_a_mutant_that_leaves_the_floor_comparison_out_says_the_chief_of_staff_can(self):
+        report, files = self.floor_row()
+        source = Path(self.module.__file__).read_text()
+        old = 'and level_refusal(block, out["min_rating"], out["threshold"]):'
+        self.assertIn(old, source)
+        scope = {"__name__": "mutant_delegated_clear", "__file__": self.module.__file__}
+        exec(compile(source.replace(old, "and False:"), "mutant", "exec"), scope)
+        medium = {"threshold": "Medium"}
+        got = scope["who_can_clear"](self.rule, report, files, self.floor.matches, {}, self.block, medium, pr="acme/app#9")
+        self.assertEqual(got["who"], "chief of staff with a rating", "the mutant says what the clear would refuse for every rating")
+        self.assertEqual(self.who(report, files, delegation=medium)["who"], "owner only")
+
+    def test_every_refusal_of_judge_is_a_row_the_line_knows_and_a_new_one_fails_here(self):
+        import ast
+        tree = ast.parse(Path(self.module.__file__).read_text())
+        judge = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "judge")
+        sites = [n for n in ast.walk(judge) if (isinstance(n, ast.Return) and isinstance(n.value, ast.Dict) and any(isinstance(k, ast.Constant) and k.value == "reasons" for k in n.value.keys)
+                 and not (isinstance(n.value.values[-1], ast.List) and not n.value.values[-1].elts) and not (isinstance(n.value.values[-1], ast.Name)))
+                 or (isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "append" and getattr(n.func.value, "id", "") == "reasons")
+                 or (isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "reasons" for t in n.targets))
+]
+        # each refusal of judge and what the line says of it: "static" is known from the pull request and the orders alone (the line says owner only), "rating" depends on a rating not yet made (the line says what the rating must be)
+        known = {"the score rule or the rating is unknown": "unreadable (who: unknown)", "the threshold is unknown": "unreachable: the configuration refuses a max_level that is not delegable",
+                 "a rating has no severity and probability the matrix knows": "rating", "no agent block": "rating", "incomplete verdict": "rating", "no independent rating": "rating",
+                 "a higher uncounted rating": "rating", "floor below": "rating (the line says the least rating)", "rule not named": "rating (the line says which ids)", "append(over), the answer of level_refusal": "static (owner only, kind score)"}
+        self.assertEqual(len(sites), len(known), "judge has a refusal this table does not: give it a row (and a line) before it ships")
+
     def test_s1_the_documented_cause_paragraph_names_every_recorded_refusal_kind_with_its_count_and_says_the_sample_is_thin(self):
         text = (BIN.parent / "docs" / "switchboard.md").read_text()
         start = text.index("#### Why a clear was refused (#946)")
@@ -72140,7 +72186,8 @@ class TestClearLine(TestImpactHold):
             if "/files" in path:
                 return self.listing if "page=1" in path else []
             if "/comments" in path:
-                return list(self.comments) if "page=1" in path else []
+                number = re.search(r"/issues/(\d+)/", path).group(1)
+                return [c for c in self.comments if c.get("n", "9") == number] if "page=1" in path else []
             return {"head": {"sha": self.pr["headRefOid"]}, "base": {"sha": "b" * 40}}
         return get
 
@@ -72149,7 +72196,7 @@ class TestClearLine(TestImpactHold):
             self.floor_reads.append(int(argv[3]))
         done = super().route(argv, **kwargs)
         if argv[0] == FAKE_GH and "--method" in argv and argv[argv.index("--method") + 1] == "POST" and argv[2].endswith("/comments"):
-            self.comments.append({"body": json.loads(kwargs["input"])["body"]})
+            self.comments.append({"body": json.loads(kwargs["input"])["body"], "n": re.search(r"/issues/(\d+)/", argv[2]).group(1)})
         return done
 
     def posts(self):
@@ -72305,6 +72352,110 @@ class TestClearLine(TestImpactHold):
         self.passes(advance=4000)
         self.assertEqual(self.posts(), [])
 
+    def capture(self, records=None):
+        """The arguments the hold pass hands `clear_line_pass` (and nothing posted): the engine, now, rule, heads, reports."""
+        for attr in ("engine_cached",):
+            if hasattr(self, attr):
+                delattr(self, attr)
+        self.comments.clear(); self.writes.clear(); self.gets.clear()
+        got = []
+        with mock.patch.object(sb, "clear_line_pass", lambda *a: got.append(a)):
+            self.passes(records=records)
+        self.writes.clear(); self.gets.clear()
+        return got[-1]
+
+    @staticmethod
+    def mutated(edits):
+        """The daemon's functions with `edits` ([(function, old, new)]) applied: {name: function}. An edit whose `old` is not in the source fails the test (a stale mutant)."""
+        source, made = (BIN / "fleet-switchboard").read_text(), {}
+        for name in sorted({e[0] for e in edits}):
+            start = source.index("def %s(" % name)
+            body = source[start:source.index("\ndef ", start + 5)]
+            for fn, old, new in edits:
+                if fn == name:
+                    assert old in body, (name, old)
+                    body = body.replace(old, new, 1)
+            scope = dict(sb.__dict__)
+            exec(compile(body, "mutant-" + name, "exec"), scope)
+            made[name] = scope[name]
+        for one in made.values():
+            one.__globals__.update(made)   # the mutants call each other
+        return made
+
+    def run_pass(self, args, edits=()):
+        made = self.mutated(edits)
+        with contextlib.ExitStack() as stack:
+            for name, fn in made.items():
+                stack.enter_context(mock.patch.object(sb, name, fn))
+            (made.get("clear_line_pass") or sb.clear_line_pass)(*args)
+
+    # every guard of `clear_line_pass` that stops a read or a post: (what it stops, its source line, the edit that removes it). The completeness test derives the guards from the code.
+    GUARDS = {
+        "memo": ("clear_line_pass", "done.get((repo, number)) == signature or ", ""),
+        "budget": ("clear_line_pass", "            if spent >= CLEAR_LINE_PASS_MAX:\n                break\n", ""),
+        "cleared": ("clear_line_pass", '== head:\n                continue', '== head:\n                pass'),
+    }
+
+    def test_the_guards_of_the_pass_are_each_pinned_by_a_counting_test_and_a_mutant_each(self):
+        import ast
+        # 1. memo: three passes at an unchanged head read once (the first) and post once
+        for name, edits, want_ok in (("real", [], True), ("no memo", [self.GUARDS["memo"]], False)):
+            with self.subTest(guard="memo", build=name):
+                args = self.capture()
+                self.run_pass(args, edits)
+                after_first = len(self.gets)
+                self.run_pass(args, edits)
+                self.run_pass(args, edits)
+                held = (len(self.gets) == after_first and len(self.posts()) == 1)
+                self.assertEqual(held, want_ok, (len(self.gets), after_first, len(self.posts())))
+        # 2. budget: three held pull requests, two read and posted in the first pass
+        for name, edits, want_ok in (("real", [], True), ("no budget", [self.GUARDS["budget"]], False)):
+            with self.subTest(guard="budget", build=name):
+                args = list(self.capture())
+                one = next(iter(args[3].items()))
+                args[3] = {("acme/app", n): one[1] for n in (9, 10, 11)}
+                args[4] = {("acme/app", n): dict(next(iter(args[4].values())), pr="acme/app#%d" % n) for n in (9, 10, 11)}
+                self.run_pass(args, edits)
+                read = {m.group(1) for g in self.gets for m in [re.search(r"/(?:issues|pulls)/(\d+)/", g)] if m}
+                self.assertEqual(sb.CLEAR_LINE_PASS_MAX, 2, "the documented budget")
+                self.assertEqual((len(read) <= sb.CLEAR_LINE_PASS_MAX and len(self.posts()) == sb.CLEAR_LINE_PASS_MAX), want_ok, (read, len(self.posts())))
+        # 3. a head the head moved off between the report and the line posts nothing (either head check alone is an equivalent mutant: the other catches it)
+        both = [("clear_line_pass", 'or report.get("head") != head', ""), ("clear_line_post", 'if who["head"] != head:', "if False:")]
+        for name, edits, want_ok in (("real", [], True), ("only the pass check removed", both[:1], True), ("only the post check removed", both[1:], True), ("both removed", both, False)):
+            with self.subTest(guard="head moved", build=name):
+                args = list(self.capture())
+                args[3] = {k: LEDGER_NEW_HEAD for k in args[3]}
+                self.run_pass(args, edits)
+                self.assertEqual(self.posts() == [], want_ok, (self.posts(), self.events("clear_line.error")))
+        # 4. a head the owner cleared gets no line (the clear is run last: it stays)
+        for name, edits, want_ok in (("real", [], True), ("no cleared check", [self.GUARDS["cleared"]], False)):
+            with self.subTest(guard="cleared", build=name):
+                args = self.capture()
+                if not hasattr(self, "cleared_once"):
+                    self.assertEqual(self.run_as(None, "impact", "clear", self.PR, "--reason", "a false hold: the file is a fixture")[0], 0)
+                    self.cleared_once = True
+                self.run_pass(args, edits)
+                self.assertEqual(self.posts() == [], want_ok, self.posts())
+        # completeness: a new guard (continue, break or raise before the post) is a new row above
+        tree = ast.parse((BIN / "fleet-switchboard").read_text())
+        fn = lambda name: next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+        stops = [n for n in ast.walk(fn("clear_line_pass")) if isinstance(n, (ast.Continue, ast.Break))]
+        self.assertEqual(len(stops), 4, "continue/break guards of the pass: gate (hold, enforce, head, rule), memo/retry, cleared, budget: one row each above")
+        raises = [n for n in ast.walk(fn("clear_line_post")) if isinstance(n, ast.Raise)]
+        self.assertEqual(len(raises), 4, "raises of the post: unreadable, head moved (row above), comments not a list and too many pages (a failed read: test_s8, test_u3)")
+
+    def three_held(self):
+        return [self.listed(number=n) for n in (9, 10, 11)]
+
+    def test_the_line_for_a_pull_request_that_holds_nothing_is_none_and_the_guard_is_pinned(self):
+        module = sb.load_module("delegated_clear")
+        quiet = {"floor_ids": [], "threshold": None, "owner_only": [], "min_rating": None}
+        for who in ("no hold", "unknown", None):
+            self.assertIsNone(module.clear_line(dict(quiet, who=who)))
+        self.assertIsNone(module.clear_line(None))
+        self.assertIsNone(module.clear_line("owner only"))
+        self.assertIsNotNone(module.clear_line(dict(quiet, who="owner or chief of staff")))
+        self.assertIn("at most Serious", module.clear_line(dict(quiet, who="owner or chief of staff", threshold="Serious")), "several orders: the line says at most")
 
 for _name in [n for n in dir(TestImpactHold) if n.startswith("test")]:
     setattr(TestClearLine, _name, None)   # the inherited fixture only: its own tests run in TestImpactHold
