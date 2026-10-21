@@ -14865,6 +14865,27 @@ class TestOneCharter(Base):
         coder = types.SimpleNamespace(name="worker", fleet={"role": "coder", "issue": 40, "repo": self.REPO}, status="idle")
         self.assertEqual(sb.owned_numbers("worker", coder.fleet, view), {40}, "a coder owns its own issue")
 
+    RETIRED_FALLBACK_READERS = {"adoption_heir": "an orphan of a RETIRED boss finds the charter in the boss's retirement record"}   # one row per reader that falls back to registry_retired_owners
+
+    def test_the_readers_that_fall_back_to_a_retired_orchestrators_record_are_derived_from_the_code_and_each_has_its_row(self):
+        callers = set()
+        for node in ast.walk(ast.parse((REPO / "bin" / "fleet-switchboard").read_text())):
+            if isinstance(node, ast.FunctionDef) and node.name != "registry_retired_owners":
+                if any(isinstance(s, ast.Call) and isinstance(s.func, ast.Name) and s.func.id == "registry_retired_owners" for s in ast.walk(node)):
+                    callers.add(node.name)
+        self.assertEqual(callers, set(self.RETIRED_FALLBACK_READERS), "a reader that reads a retired orchestrator's kept charter needs a row and a test here")
+
+    def test_adoption_heir_finds_the_live_orchestrator_of_the_charter_a_retired_boss_kept(self):
+        self.orchestrator("orch-old", charter=1)
+        self.orchestrator("orch-new", charter=1)
+        self.world.add_agent("worker", fleet={"role": "coder", "reports_to": "orch-old", "repo": self.REPO})   # no charter of its own: its boss's
+        self.assertEqual(self.registry.retire(self.world.state, "orch-old", "test", "retired", session=self.world.sessions["orch-old"], now=self.world.clock.now())["problem"], None)
+        discovery = self.engine.discover(self.world.clock.now())
+        retired = self.registry.read(self.world.state)["retired"]
+        heir, why = sb.adoption_heir(self.engine, discovery, retired, discovery.agents["worker"])
+        self.assertEqual((heir, why), ("orch-new", "the charter's orchestrator"))
+        self.assertEqual(sb.registry_retired_owners(self.engine), {"orch-old": 1})
+
     def test_a_workers_charter_through_its_boss_is_the_registrys(self):
         self.orchestrator("orch-b", charter=1)
         self.set_registry("orch-b", 7)
