@@ -75461,6 +75461,30 @@ class TestShimTopSpender(Base):
         self.assertLessEqual(self.shim_module().TRY_EVERY, 600)
         self.assertLessEqual(self.shim_module().WHO_EVERY, 300)
 
+    def test_s2c_a_non_top_or_unknown_caller_never_waits_for_a_failing_or_slow_switchboard_in_any_call_position(self):
+        """rev-1 (#993): identity first. Callers {top, non-top, unknown} x call {first, second} x switchboard {failing, slow}."""
+        unknown = self.home / "unknown-sb"
+        unknown.write_text("#!/bin/sh\n[ \"$1\" = whoami ] && exit 1\necho \"$@\" >> \"$FAKE_SB_LOG\"\n[ -n \"$FAKE_SB_SLEEP\" ] && sleep \"$FAKE_SB_SLEEP\"\nexit 1\n")
+        unknown.chmod(0o755)
+        _d, plain = self.timed("pr", "view", "3", agent="other")
+        for kind, env in (("failing", {"FAKE_SB_EXIT": "1"}), ("slow", {"FAKE_SB_EXIT": "1", "FAKE_SB_SLEEP": "3"})):
+            for who in ("other", "unknown", "worker"):
+                for position in (1, 2):
+                    for d in ("gh-who", "gh-low-tried", "gh-low-told"):
+                        shutil.rmtree(str(self.state / d), ignore_errors=True) if position == 1 else None
+                    if who == "unknown":
+                        os.environ["_X"] = ""
+                        self.sb_backup = self.other.read_text()
+                        self.other.write_text(unknown.read_text())
+                    _d, took = self.timed("pr", "view", "3", env=env, agent="other" if who != "worker" else "worker")
+                    if who == "unknown":
+                        self.other.write_text(self.sb_backup)
+                    if who == "worker":
+                        self.assertLess(took, plain + 2.0 + 4.0 + 8.0 + 1.0, (kind, who, position))
+                    else:
+                        self.assertLess(took, plain + 1.5, (kind, who, position, "no wait for a caller that is not the top spender"))
+        self.assertEqual(self.notices() and set(n.split()[0] for n in self.notices()), {"budget-notice"})
+
     def test_s3b_the_wait_is_exactly_slow_seconds_once_and_is_pinned_without_sleeping(self):
         module = self.shim_module()
         module.FIXED_STATE[0], module.FIXED_PROGRAM[0] = str(self.state), str(self.sb)

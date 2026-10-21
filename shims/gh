@@ -526,11 +526,17 @@ def low_budget_read(agent=None):
                 tops[account] = top
         if not tops:
             return
-        for account in tops:
-            tell_top_spender(state, account)
+        # IDENTITY FIRST: only the top spender of a low account makes the message attempt (a subprocess) and waits; any other caller, and a caller whose identity
+        # cannot be told (remembered WHO_EVERY seconds as unknown: fail open), does a local ranking read and nothing more.
         name = agent if isinstance(agent, str) and NAME_RE.match(agent) else caller_name(state)
-        if name is not None and any(top[0] == name for top in tops.values()):
-            time.sleep(SLOW_SECONDS)
+        if name is None:
+            return
+        mine = [account for account, top in tops.items() if top[0] == name]
+        if not mine:
+            return
+        for account in mine:
+            tell_top_spender(state, account)
+        time.sleep(SLOW_SECONDS)
     except Exception:
         pass
 
