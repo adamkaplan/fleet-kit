@@ -4900,6 +4900,12 @@ Records that did not exist:
 
 At most 20 exit lines are written per pass (`PANE_EXIT_MAX_PER_PASS`: 256 KiB of herdr's log holds at most about 1100 exit lines, so a mass event is written over a few passes; an exit not yet written is not marked seen). An exit is written once: the keys seen are kept in `pane-exit.json`, and an exit older than an hour when first seen is marked seen and not written (a restart does not replay history). When 3 or more panes end within 5 seconds of each other (`pane_exit_burst_min`, `pane_exit_burst_seconds`), one `fleetpane.exit_burst` line names them all and every Chief of Staff is told once, not once per pane.
 
+A quiet pass is cheap: the audit tail, the slot and job records and the `ps` of each alive job (at most `PANE_EXIT_MAX_JOBS`, 200, records) are read only when the log holds an exit to write, and then once per pass, not once per exit.
+
+**Crash note.** The `fleetpane.exit` lines are written before `pane-exit.json` is. A daemon that dies between the two writes the same exits again on its next start (an exit line twice, never a lost one); a failed write of the file while the daemon lives is kept in memory and does not repeat a line.
+
+Three settings are read, each declared with its default and checked when the config loads: `herdr_log` (a non-empty path), `pane_exit_burst_seconds` (a number above 0, at most 3600; default 5) and `pane_exit_burst_min` (a whole number from 2 to 1000; default 3).
+
 A log that is missing, unreadable, rotated or truncated gives one `fleetpane.exit_note` line (never a crash) and the pass goes on. `fleetpane.dead`, `fleetpane.detached` and `fleetpane.recovered` are unchanged.
 
 To find why a pane ended: look for `fleetpane.exit` in the audit (`audit.jsonl`) for its code, signal and what was active, then herdr's log around `herdr_time`. Code 130 or a `SIGINT` means something interrupted the child.

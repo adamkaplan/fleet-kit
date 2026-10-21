@@ -390,6 +390,7 @@ class TestConfig(Base):
         self.assertEqual(sb.load_config(), {
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
             "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "clear_remind_minutes": 15, "send_timeout_seconds": 60, "poll_seconds": 5,
+            "herdr_log": "~/.config/herdr/herdr-server.log", "pane_exit_burst_seconds": 5, "pane_exit_burst_min": 3,  # #1030
             "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "launch_default": "headless",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
@@ -77913,6 +77914,237 @@ class TestPaneExit(Base):
         self.assertIn("fleetpane.exit", section)
         self.assertIn("herdr-server.log", section)
         self.assertIn("slot records", section)
+
+
+class TestPaneExitBoundaries(TestPaneExit):
+    """#1030 rev-2: every guard, boundary, recipient, name match and config read of the pane-exit code has a row here. The rows are derived from the code
+    (the completeness tests read it with ast); a mutant of each (a window widened or narrowed, a filter or guard removed) fails a row."""
+
+    def fresh(self):
+        """A clean slate inside one test: no audit, no state file, no memory of seen exits."""
+        self.world.audit_path.write_text("")
+        (self.world.state / sb.PANE_EXIT_FILE).unlink(missing_ok=True)
+        self.engine.__dict__.pop("pane_exit_seen", None)
+        self.engine.__dict__.pop("pane_exit_bursts", None)
+        self.engine._last.clear()
+
+    def signal_of(self, terminated_offset):
+        self.fresh()
+        self.write_log(self.exit_line(-30, 81, 0), self.hangup_line(-30 + terminated_offset, 81))
+        self.run_pass()
+        return self.audit("fleetpane.exit")[0]["detail"]["signal"]
+
+    def test_the_signal_line_counts_from_the_exit_to_ten_seconds_after_and_not_eleven_or_before(self):
+        for offset, expected in ((0, "Hangup"), (10, "Hangup"), (11, None), (-1, None)):
+            with self.subTest(offset=offset):
+                self.assertEqual(self.signal_of(offset), expected)
+
+    def burst_panes(self, gaps):
+        self.fresh()
+        self.engine.discover(self.world.clock.now())
+        at, lines = -100, []
+        for index, gap in enumerate([0] + list(gaps)):
+            at += gap
+            lines.append(self.exit_line(at, 200 + index, 130))
+        self.write_log(*lines)
+        self.run_pass()
+        return [b["detail"]["panes"] for b in self.audit("fleetpane.exit_burst")]
+
+    def test_a_burst_is_three_exits_each_at_most_five_seconds_after_the_one_before(self):
+        rows = ((("two exits", [4]), []), (("three at 4 s", [4, 4]), [["200", "201", "202"]]), (("three at 5 s", [5, 5]), [["200", "201", "202"]]),
+                (("three at 6 s", [6, 6]), []), (("three at 59 s", [59, 59]), []), (("a 6 s gap splits", [4, 6, 4]), []), (("four at 4 s", [4, 4, 4]), [["200", "201", "202", "203"]]))
+        for (label, gaps), expected in rows:
+            with self.subTest(label):
+                self.assertEqual(self.burst_panes(gaps), expected)
+
+    def asked_of(self, closed_offset, exit_offset=-5):
+        self.fresh()
+        entry = {"ts": self.stamp(closed_offset), "actor": "cos", "event": "fleetpane.closed", "subject": "x", "detail": {"pane": "w1:p91", "by": "cos"}}
+        self.world.audit_path.write_text(json.dumps(entry) + "\n")
+        self.write_log(self.exit_line(exit_offset, 91, 0))
+        self.run_pass()
+        return [e for e in self.audit("fleetpane.exit")][0]["detail"]["asked"]
+
+    def test_a_close_counts_from_five_minutes_before_the_exit_to_thirty_seconds_after_it(self):
+        for before, expected in ((299, True), (301, False), (-29, True), (-31, False)):
+            with self.subTest(close_seconds_before_exit=before):
+                self.assertEqual(self.asked_of(-5 - before), expected)
+
+    def test_an_exit_is_written_at_an_age_just_under_an_hour_and_not_just_over_it(self):
+        for age, written in ((3500, True), (3700, False)):
+            with self.subTest(age=age):
+                self.fresh()
+                self.write_log(self.exit_line(10 - age, 92, 0))
+                self.run_pass()
+                self.assertEqual(len(self.audit("fleetpane.exit")), 1 if written else 0)
+
+    def test_at_most_twelve_active_runs_are_listed(self):
+        for index in range(15):
+            self.make_job("job%02d" % index, self.NOW - 100)
+        self.write_log(self.exit_line(-5, 93, 0))
+        self.run_pass()
+        self.assertEqual(len(self.audit("fleetpane.exit")[0]["detail"]["active"]), sb.PANE_EXIT_NAMES)
+
+    def test_a_pass_without_an_audit_or_a_state_directory_writes_nothing_and_does_not_raise(self):
+        self.write_log(self.exit_line(-5, 94, 0))
+        for attr in ("audit", "state_dir"):
+            with self.subTest(attr=attr):
+                self.fresh()
+                saved = getattr(self.engine, attr)
+                setattr(self.engine, attr, None)
+                try:
+                    self.run_pass()
+                finally:
+                    setattr(self.engine, attr, saved)
+                self.assertEqual(self.audit("fleetpane.exit"), [])
+
+    def test_the_real_pass_and_real_fact_sources_give_one_exit_line_and_one_fact(self):
+        self.engine.discover(self.world.clock.now())
+        now = self.world.clock.now()
+        self.log.write_text("".join(self.exit_line(now - self.NOW - 20 + i, 300 + i, 130) for i in range(3)))
+        self.assertEqual(self.engine.config["herdr_log"], str(self.log))
+        sb.publish_decisions(self.engine)
+        self.assertEqual(len(self.audit("fleetpane.exit")), 3)
+        self.assertEqual(len(self.audit("fleetpane.exit_burst")), 1)
+        sources = [s for s in sb.fact_sources(self.world.state) if isinstance(s, sb.PaneExitFacts)]
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(len([s for s in self.engine.sources if isinstance(s, sb.PaneExitFacts)]), 1)
+        facts = [f for s in self.engine.sources if isinstance(s, sb.PaneExitFacts) for f in s()]
+        self.assertEqual(len(facts), 1)
+
+    def test_a_pass_with_no_new_exit_reads_no_audit_tail_no_job_records_and_no_ps_and_a_new_exit_reads_each_once(self):
+        self.make_job("alive", self.NOW - 50)
+        self.write_log(self.exit_line(-5, 95, 0))
+        self.run_pass()   # the exit is written and marked seen
+        counts = {"tail": 0, "runs": 0, "state": 0}
+        real = {"tail": sb.pane_exit_audit_tail, "runs": sb.pane_exit_runs, "state": sb.job_state}
+
+        def counting(name):
+            def inner(*a, **k):
+                counts[name] += 1
+                return real[name](*a, **k)
+            return inner
+        with mock.patch.object(sb, "pane_exit_audit_tail", counting("tail")), mock.patch.object(sb, "pane_exit_runs", counting("runs")), \
+                mock.patch.object(sb, "job_state", counting("state")):
+            for later in (20, 30, 40):
+                self.run_pass(later)
+            self.assertEqual(counts, {"tail": 0, "runs": 0, "state": 0})
+            self.log.write_text(self.log.read_text() + self.exit_line(-4, 96, 0) + self.exit_line(-3, 97, 0))
+            self.run_pass(50)
+            self.assertEqual(counts, {"tail": 1, "runs": 1, "state": 1})
+
+    def test_the_job_records_read_are_capped(self):
+        for index in range(sb.PANE_EXIT_MAX_JOBS + 5):
+            self.make_job("j%04d" % index, self.NOW - 100)
+        with mock.patch.object(sb, "job_read", wraps=sb.job_read) as reader:
+            sb.pane_exit_runs(self.engine)
+        self.assertEqual(reader.call_count, sb.PANE_EXIT_MAX_JOBS)
+
+    def burst_source(self):
+        self.engine.discover(self.world.clock.now())
+        self.write_log(*[self.exit_line(-20 + i, 400 + i, 130) for i in range(3)])
+        self.run_pass()
+        source = sb.PaneExitFacts()
+        source.bind(self.engine)
+        return source
+
+    def test_the_fact_goes_to_the_chief_of_staff_only_and_not_to_another_agent(self):
+        self.world.add_agent("other", fleet={"role": "orchestrator"})
+        source = self.burst_source()
+        self.assertEqual([f.recipient for f in source()], ["cos"])
+
+    def test_the_fact_is_not_built_while_discovery_has_problems(self):
+        source = self.burst_source()
+        self.assertEqual(len(source()), 1)
+        self.engine.discovery.problems = ["the service could not be read"]
+        self.assertEqual(source(), [])
+
+    def test_a_pane_number_names_an_agent_only_as_a_whole_number_or_the_p_of_a_pane_id(self):
+        for recorded, pane, expected in (("w1:p3", "3", True), ("w1:p13", "3", False), ("3", "3", True), ("13", "3", False), ("w1:p3", "13", False), ("", "3", False), (None, "3", False)):
+            with self.subTest(recorded=recorded, pane=pane):
+                self.assertEqual(sb._pane_matches(recorded, pane), expected)
+
+    def test_an_exit_of_pane_three_names_the_agent_of_w1_p3_and_not_the_one_of_w1_p13(self):
+        registry = sb.load_module("registry")
+        registry.upsert(self.world.state, "agent-p13", {"session": "ses_example13", "pane": "w1:p13"})
+        registry.upsert(self.world.state, "agent-p3", {"session": "ses_example3", "pane": "w1:p3"})
+        self.write_log(self.exit_line(-5, 3, 0), self.exit_line(-4, 55, 0))
+        self.run_pass()
+        lines = {e["detail"]["pane"]: e for e in self.audit("fleetpane.exit")}
+        self.assertEqual(lines["3"]["detail"]["agent"], "agent-p3")
+        self.assertEqual(lines["3"]["subject"], "agent-p3")
+        self.assertIsNone(lines["55"]["detail"]["agent"])
+        self.assertEqual(lines["55"]["subject"], "pane:55")
+
+    def test_each_config_key_is_declared_with_its_default_and_refuses_a_wrong_value(self):
+        self.assertEqual((sb.DEFAULTS["herdr_log"], sb.DEFAULTS["pane_exit_burst_seconds"], sb.DEFAULTS["pane_exit_burst_min"]),
+                         (sb.HERDR_LOG_DEFAULT, sb.PANE_EXIT_BURST_SECONDS, sb.PANE_EXIT_BURST_MIN))
+        for key, good, bad in (("herdr_log", ["/x/herdr.log"], [5, "", "  ", None, ["a"]]),
+                               ("pane_exit_burst_seconds", [1, 2.5, 3600], [0, -1, "5", True, 3601, float("nan"), None]),
+                               ("pane_exit_burst_min", [2, 3, 1000], [1, 0, 2.5, "3", True, 1001, None])):
+            for value in good:
+                with self.subTest(key=key, good=value):
+                    self.assertEqual(sb.validate_config({key: value})[key], value)
+            for value in bad:
+                with self.subTest(key=key, bad=value):
+                    with self.assertRaises(sb.ConfigError):
+                        sb.validate_config({key: value})
+
+    def test_the_declared_keys_are_not_warned_about_as_unknown(self):
+        sb.UNKNOWN_CONFIG.clear()
+        sb.validate_config({"herdr_log": "/x/h.log", "pane_exit_burst_seconds": 5, "pane_exit_burst_min": 3})
+        self.assertEqual([k for k in sb.UNKNOWN_CONFIG if k[1].startswith(("herdr_log", "pane_exit"))], [])
+
+    def test_the_burst_settings_are_the_ones_the_pass_uses(self):
+        self.engine.config = dict(self.engine.config, pane_exit_burst_min=2)
+        self.assertEqual(self.burst_panes([4]), [["200", "201"]])
+        self.engine.config = dict(self.engine.config, pane_exit_burst_min=3, pane_exit_burst_seconds=30)
+        self.assertEqual(self.burst_panes([20, 20]), [["200", "201", "202"]])
+
+    # ---- the rows are derived from the code
+    @staticmethod
+    def new_code():
+        import ast
+        tree = ast.parse(SWITCHBOARD.read_text())
+        wanted = {"pane_exit_events", "pane_exit_read_log", "_pane_matches", "pane_exit_audit_tail", "_pane_exit_asked", "pane_exit_runs", "pane_exit_active",
+                  "pane_exit_pass", "PaneExitFacts"}
+        return [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in wanted]
+
+    def test_every_config_key_the_new_code_reads_is_declared(self):
+        import ast
+        keys = set()
+        for node in self.new_code():
+            for sub in ast.walk(node):
+                if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute) and sub.func.attr == "get" and isinstance(sub.func.value, ast.Attribute)
+                        and sub.func.value.attr == "config" and sub.args and isinstance(sub.args[0], ast.Constant)):
+                    keys.add(sub.args[0].value)
+                if (isinstance(sub, ast.Subscript) and isinstance(sub.value, ast.Attribute) and sub.value.attr == "config" and isinstance(sub.slice, ast.Constant)):
+                    keys.add(sub.slice.value)
+        self.assertEqual(keys, {"herdr_log", "pane_exit_burst_seconds", "pane_exit_burst_min"})
+        for key in keys:
+            self.assertIn(key, sb.DEFAULTS)
+            self.assertIn(key, sb.config_known_keys())
+
+    COVERED = {"PANE_EXIT_TAIL_BYTES": "test_a_large_log_is_read_only_in_its_tail", "PANE_EXIT_MAX_AGE": "test_an_exit_is_written_at_an_age_just_under_an_hour",
+               "PANE_EXIT_BURST_SECONDS": "test_a_burst_is_three_exits", "PANE_EXIT_BURST_MIN": "test_a_burst_is_three_exits",
+               "PANE_EXIT_ASKED_BEFORE": "test_a_close_counts_from", "PANE_EXIT_ASKED_AFTER": "test_a_close_counts_from",
+               "PANE_EXIT_SIGNAL_SECONDS": "test_the_signal_line_counts", "PANE_EXIT_SEEN_KEEP": "test_the_exits_seen_are_kept_in_the_state_file",
+               "PANE_EXIT_MAX_PER_PASS": "test_a_burst_of_thirty_panes", "PANE_EXIT_MAX_JOBS": "test_the_job_records_read_are_capped", "PANE_EXIT_NAMES": "test_at_most_twelve_active_runs_are_listed",
+               "PANE_EXIT_FILE": "test_the_exits_seen_are_kept_in_the_state_file", "HERDR_LOG_DEFAULT": "test_each_config_key_is_declared"}
+
+    def test_every_constant_the_new_code_uses_has_a_row_that_names_an_existing_test(self):
+        import ast
+        used = {sub.id for node in self.new_code() for sub in ast.walk(node) if isinstance(sub, ast.Name) and sub.id.startswith(("PANE_EXIT_", "HERDR_LOG"))}
+        self.assertEqual(used - set(self.COVERED), set(), "a constant of the pane-exit code has no row")
+        names = [n for n in dir(TestPaneExitBoundaries)]
+        for constant, test in self.COVERED.items():
+            self.assertTrue(any(n.startswith(test) for n in names), "%s: no test starts %s" % (constant, test))
+
+    def test_every_guard_of_the_pass_is_one_of_the_rows(self):
+        import ast
+        pass_fn = next(n for n in self.new_code() if getattr(n, "name", "") == "pane_exit_pass")
+        guards = sum(isinstance(n, ast.If) for n in ast.walk(pass_fn))
+        self.assertLessEqual(guards, 16, "a guard was added to pane_exit_pass: give it a row and a mutant, then raise this count")
 
 
 if __name__ == "__main__":
