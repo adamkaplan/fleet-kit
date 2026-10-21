@@ -77208,6 +77208,384 @@ class TestBatchingDocs(unittest.TestCase):
             self.assertEqual(section.count(phrase), 1, phrase)
 
 
+def write_lane_hours(state, lanes, hour=None):
+    """The daemon's hourly record with `lanes` ({lane: {account: {endpoint class: n}}}) for the current hour (counting on, as the daemon makes it)."""
+    start = int(time.time()) // 3600 * 3600 if hour is None else hour
+    (Path(state) / "agent-calls-hours.json").write_text(json.dumps({"v": 1, "since": time.time() - 7200, "hours": {str(start): {"lanes": lanes}}}))
+
+
+NO_CAP_WORDS = re.compile(r"(cap|quota|ceiling|allowance)", re.I)
+AGENT_WORDS = re.compile(r"(agent|lane|caller|worker|spender)", re.I)
+
+
+def per_agent_limits(path, text):
+    """[name] of every identifier, attribute, dictionary key or constant string of the Python source `text` that names a limit per agent: a cap word together with an
+    agent word (`agent_cap`, `lane_quota`, `max_calls_per_agent`), or a per-agent word alone. Names of the form `NOT_AGENTS` (the lanes a message never names) are not limits."""
+    tree = ast.parse(text)
+    found = set()
+    for node in ast.walk(tree):
+        names = []
+        if isinstance(node, ast.Name):
+            names.append(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.append(node.attr)
+        elif isinstance(node, ast.arg):
+            names.append(node.arg)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and len(node.value) < 60:
+            names.append(node.value)
+        for name in names:
+            if re.search(r"max_?calls|calls_?per|per_?(agent|lane|caller)_?(cap|limit|quota|max|count|calls)", name, re.I) or (NO_CAP_WORDS.search(name) and AGENT_WORDS.search(name)):
+                found.add(name)
+    return sorted(found)
+
+
+class TestShimTopSpender(Base):
+    """#949: below the low-budget line the lane that spent most in the last hour is told once an hour (the switchboard builds and sends the message) and only that
+    agent's reads that are not answered from the cache wait a bounded time; no cap, count or quota exists anywhere."""
+
+    ACCOUNT = "acme-a"
+
+    users = TestAgentShellCalls.users
+    shim_module = TestAgentShellCalls.shim_module
+    shim = TestAgentShellCalls.shim
+    age = TestShimReadCache.age
+    usage = TestShimReadCache.usage
+    network = TestShimReadCache.network
+    PATH = "repos/acme/app/issues/5"
+
+    def setUp(self):
+        TestShimReadCache.setUp(self)
+        text = "#!/bin/sh\nif [ \"$1\" = whoami ]; then\n  [ \"$2\" = --json ] && echo x >> \"$FAKE_SB_LOG.who\"\n  if [ \"$2\" = --json ]; then echo '{\"name\": \"NAME\", \"repo\": \"acme/app\"}'; else echo NAME; fi; exit 0; fi\n" \
+               "echo \"$@\" >> \"$FAKE_SB_LOG\"\n[ -n \"$FAKE_SB_SLEEP\" ] && sleep \"$FAKE_SB_SLEEP\"\nexit ${FAKE_SB_EXIT:-0}\n"
+        self.sb.write_text(text.replace("NAME", "worker"))
+        self.other.write_text(text.replace("NAME", "other"))
+        self.sblog = self.home / "sb.log"
+        self.usage(500)
+        write_lane_hours(self.state, {"worker": {self.ACCOUNT: {"api issues/#": 90}}, "other": {self.ACCOUNT: {"api issues/#": 10}}})
+
+    WRAPPER = ("import importlib.machinery, importlib.util, sys\n"
+               "loader = importlib.machinery.SourceFileLoader('gh_shim_under_test', sys.argv[1])\n"
+               "module = importlib.util.module_from_spec(importlib.util.spec_from_loader('gh_shim_under_test', loader))\n"
+               "loader.exec_module(module)\n"
+               "module.FIXED_STATE[0], module.FIXED_PROGRAM[0] = sys.argv[2], sys.argv[3]\n"
+               "sys.exit(module.main(sys.argv[4:]))\n")
+
+    def run_shim(self, *args, env=None, agent="worker"):
+        """The shim as `agent` (the program that answers who-am-I, for the account lookup AND for the top-spender block, whose seams the wrapper sets in the same
+        process: the environment cannot)."""
+        program = str(self.sb if agent == "worker" else self.other)
+        environ = {"PATH": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home), "FLEET_SWITCHBOARD_STATE": str(self.state),
+                   "FLEET_SWITCHBOARD_BIN": program, "FLEET_SHIM_LOOKUP_SECONDS": SHIM_LOOKUP_SECONDS, "FAKE_LOG": str(self.log), "FAKE_SB_LOG": str(self.sblog)}
+        environ.update(env or {})
+        return subprocess.run([sys.executable, "-c", self.WRAPPER, str(SHIM), str(self.state), program, *args], capture_output=True, text=True, env=environ, timeout=60)
+
+    def notices(self):
+        return self.sblog.read_text().splitlines() if self.sblog.exists() else []
+
+    def timed(self, *args, env=None, agent="worker"):
+        start = time.monotonic()
+        done = self.run_shim(*args, env=env, agent=agent)
+        return done, time.monotonic() - start
+
+    def test_s2_below_the_line_the_switchboard_is_asked_once_to_tell_the_top_spenders_orchestrator_and_a_fresh_claim_stops_a_second_ask(self):
+        self.run_shim("api", self.PATH)
+        self.assertEqual(self.notices(), ["budget-notice --account acme-a"], "the only thing passed is the account's name")
+        sb.agent_calls.claim_notice(str(self.state), self.ACCOUNT, time.time())          # what the switchboard does when it sends
+        self.run_shim("api", self.PATH.replace("5", "6"))
+        self.assertEqual(len(self.notices()), 1, "no second ask within the hour")
+        stamp = self.state / "gh-low-told"
+        old = time.time() - 3700
+        for name in os.listdir(stamp):
+            os.utime(str(stamp / name), (old, old))
+        for name in os.listdir(self.state / "gh-low-tried"):
+            os.utime(str(self.state / "gh-low-tried" / name), (old, old))
+        self.run_shim("api", self.PATH.replace("5", "7"))
+        self.assertEqual(len(self.notices()), 2, "an hour later it asks again")
+
+    def fake_world(self, who, notice_seconds, notice_rc=1):
+        """A fake clock the fake switchboard and sleep advance, and a fake runner: returns (module, clock list, runs list). No wall time is measured anywhere."""
+        module = self.shim_module()
+        module.FIXED_STATE[0], module.FIXED_PROGRAM[0] = str(self.state), str(self.sb)
+        clock, runs = [time.time()], []
+
+        def run(argv, **kw):
+            runs.append(argv[1])
+            if argv[1] == "whoami":
+                return subprocess.CompletedProcess(argv, 0 if who else 1, json.dumps({"name": who}) if who else "", "")
+            clock[0] += notice_seconds
+            return subprocess.CompletedProcess(argv, notice_rc, "", "")
+        return module, clock, runs, run
+
+    def call(self, module, clock, run, agent=None):
+        """One READ through the block: how many FAKE seconds it took."""
+        start = clock[0]
+        with mock.patch.object(time, "time", lambda: clock[0]), mock.patch.object(time, "sleep", lambda n: clock.__setitem__(0, clock[0] + n)), \
+                mock.patch.object(subprocess, "run", run):
+            module.low_budget_read(agent)
+        for d in ("gh-who", "gh-low-tried"):                              # files are stamped by the real filesystem: put their mtimes on the fake clock
+            for name in os.listdir(self.state / d) if (self.state / d).exists() else []:
+                os.utime(str(self.state / d / name), (clock[0], clock[0]))
+        return clock[0] - start
+
+    def test_s2b_rev4_in_fake_time_a_failing_or_slow_switchboard_costs_only_the_top_spender_one_attempt_per_try_every(self):
+        for notice_seconds in (0, 8):                                      # failing fast, and slow up to the 8 s deadline
+            for d in ("gh-who", "gh-low-tried", "gh-low-told"):
+                shutil.rmtree(str(self.state / d), ignore_errors=True)
+            module, clock, runs, run = self.fake_world("worker", notice_seconds)
+            first = self.call(module, clock, run)
+            self.assertEqual(first, notice_seconds + module.SLOW_SECONDS, "the top spender: the one attempt, then exactly the wait")
+            second = self.call(module, clock, run)
+            self.assertEqual(second, module.SLOW_SECONDS, "no new attempt within TRY_EVERY: the wait only")
+            self.assertEqual(runs.count("budget-notice"), 1)
+            self.assertEqual(runs.count("whoami"), 1, "the identity answer is remembered")
+            clock[0] += module.TRY_EVERY + 1
+            self.assertEqual(self.call(module, clock, run), notice_seconds + module.SLOW_SECONDS, "after TRY_EVERY it tries again")
+            self.assertEqual(runs.count("budget-notice"), 2)
+
+    def test_s2c_rev1_in_fake_time_a_non_top_or_unknown_caller_advances_no_time_and_runs_no_message_in_any_position(self):
+        for who in ("other", None):                                        # a non-top agent; an identity that cannot be told (fail open)
+            for notice_seconds in (0, 8):
+                for d in ("gh-who", "gh-low-tried", "gh-low-told"):
+                    shutil.rmtree(str(self.state / d), ignore_errors=True)
+                module, clock, runs, run = self.fake_world(who, notice_seconds)
+                for position in (1, 2, 3):
+                    self.assertEqual(self.call(module, clock, run), 0, (who, notice_seconds, position))
+                self.assertNotIn("budget-notice", runs, "only the top spender makes the attempt")
+                self.assertLessEqual(runs.count("whoami"), 1, "asked once, remembered (an unknown answer too)")
+
+    def test_s3b_the_wait_is_exactly_slow_seconds_once_and_is_pinned_without_sleeping(self):
+        module = self.shim_module()
+        module.FIXED_STATE[0], module.FIXED_PROGRAM[0] = str(self.state), str(self.sb)
+        slept = []
+        with mock.patch.object(time, "sleep", lambda n: slept.append(n)), mock.patch.object(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, "", "")):
+            module.low_budget_read("worker")
+            module.low_budget_read("other")
+        self.assertEqual(slept, [module.SLOW_SECONDS], "once, SLOW_SECONDS, for the top spender only")
+
+    def test_s2_above_the_line_or_with_no_record_nobody_is_asked(self):
+        self.usage(3000)
+        self.run_shim("api", self.PATH)
+        (self.state / "agent-calls-hours.json").write_text(json.dumps({"v": 1, "since": time.time() - 7200, "hours": {}}))
+        self.usage(500)
+        self.run_shim("api", self.PATH.replace("5", "6"))
+        self.assertEqual(self.notices(), [])
+
+    def test_s3_only_the_top_spenders_uncached_reads_wait_a_bounded_time_and_nothing_is_refused(self):
+        slow, slow_took = self.timed("pr", "view", "3")                                   # an uncached read (not `gh api <path>`) by the top spender
+        quiet, quiet_took = self.timed("pr", "view", "3", agent="other")
+        self.assertEqual((slow.returncode, quiet.returncode, slow.stdout, quiet.stdout), (0, 0, quiet.stdout, quiet.stdout))
+        self.assertGreaterEqual(slow_took - quiet_took, 1.5, "the top spender waited")
+        self.assertLessEqual(slow_took - quiet_took, 4.5, "bounded: never more than SLOW_SECONDS plus the call")
+        write, write_took = self.timed("issue", "edit", "5", "-t", "x")
+        other_write, other_write_took = self.timed("issue", "edit", "5", "-t", "x", agent="other")
+        self.assertEqual((write.returncode, other_write.returncode), (0, 0))
+        self.assertLess(write_took - other_write_took, 1.0, "a write is never slowed")
+        self.run_shim("api", self.PATH)                                                   # the top spender's first read spends (and waits): it fills the cache
+        self.age(20)
+        cached, cached_took = self.timed("api", self.PATH)
+        self.assertEqual(cached.stdout, '{"n":1}')
+        self.assertLess(cached_took, 1.5, "a cached read is not slowed")
+
+    # Every environment name the shim reads, with a hostile value for it. DERIVED from the shim's own code (see `shim_environment_names`): a name the shim starts to read
+    # and this table does not list fails the test below, so a new switch cannot appear unseen. SWITCH_OFF lists the names that can still make the caller wait less.
+    HOSTILE = {"FLEET_REAL_GH": "/nonexistent/gh", "FLEET_SHIM_CACHE": "off", "FLEET_SHIM_GATE_SECONDS": "0.001", "FLEET_SHIM_LOOKUP_SECONDS": "0.001",
+               "FLEET_SWITCHBOARD_BIN": "OTHER", "FLEET_SWITCHBOARD_OWN_GH": "1", "FLEET_SWITCHBOARD_STATE": "EMPTY", "GH_HOST": "ghe.example", "GH_REPO": "other/repo",
+               "PATH": "SAME", "XDG_CONFIG_HOME": "EMPTY", "XDG_STATE_HOME": "EMPTY", "HOME": "EMPTY"}
+    SWITCH_OFF = frozenset()   # none: the block reads no variable; who the caller is comes from the switchboard's answer for its session (see the shim's comment)
+
+    @staticmethod
+    def shim_environment_names():
+        names = set()
+        for node in ast.walk(ast.parse(SHIM.read_text())):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("get", "pop") and isinstance(node.func.value, ast.Attribute) \
+                    and node.func.value.attr == "environ" and node.args and isinstance(node.args[0], ast.Constant):
+                names.add(node.args[0].value)
+            elif isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute) and node.value.attr == "environ" and isinstance(node.slice, ast.Constant):
+                names.add(node.slice.value)
+        return names | {"HOME"}   # `expanduser("~")` reads it
+
+    def test_s3_every_environment_name_the_shim_reads_is_classified_and_none_switches_the_wait_off_or_changes_whose_lane_it_is(self):
+        self.assertEqual(self.shim_environment_names() - set(self.HOSTILE), set(), "the shim reads a name this table does not classify: add it with a hostile value")
+        self.assertEqual(set(self.HOSTILE) - self.shim_environment_names(), set(), "this table names something the shim no longer reads")
+        _, baseline = self.timed("pr", "view", "3", agent="other")
+        empty = str(self.home / "empty-dir")
+        os.makedirs(empty, exist_ok=True)
+        hostile_dir = os.environ.get("PATH", "")
+        switched_off = set()
+        for name, value in sorted(self.HOSTILE.items()):
+            value = {"OTHER": str(self.other), "EMPTY": empty, "SAME": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH)}.get(value, value)
+            _, took = self.timed("pr", "view", "3", env={name: value})
+            if took - baseline < 1.5:
+                switched_off.add(name)
+        self.assertEqual(switched_off, set(self.SWITCH_OFF), "the names that switch the wait off are exactly the declared ones")
+
+    def test_s3_an_uncached_cacheable_read_waits_and_one_served_from_the_cache_does_not(self):
+        _, quiet = self.timed("api", self.PATH.replace("5", "9"), agent="other")                 # another agent's read, no entry: no wait
+        first, took = self.timed("api", self.PATH)                                               # the top spender's read with NO cache entry: it spends, so it waits
+        self.assertEqual(first.stdout, '{"n":1}')
+        self.assertGreaterEqual(took - quiet, 1.5, "an uncached `gh api <path>` read by the top spender waits (the wait inside the cache path)")
+        second, again = self.timed("api", self.PATH)                                             # now served from the cache: no request, no wait
+        self.assertEqual(second.stdout, '{"n":1}')
+        self.assertLess(again, 1.5, "a read served from the cache never waits")
+
+    def test_s3_the_wait_ends_when_the_account_recovers_and_never_starts_above_the_line(self):
+        self.usage(3000)
+        _, took = self.timed("pr", "view", "3")
+        _, baseline = self.timed("pr", "view", "3", agent="other")
+        self.assertLess(took - baseline, 1.0, "above the line nobody waits")
+        self.usage(500)
+        _, took = self.timed("pr", "view", "3")
+        self.assertGreaterEqual(took - baseline, 1.5)
+        self.usage(3000)
+        _, took = self.timed("pr", "view", "3")
+        self.assertLess(took - baseline, 1.0, "the wait ended with the low budget")
+
+    def test_s7_the_ranking_is_recomputed_and_follows_the_spending_and_nothing_per_agent_is_kept(self):
+        shim = self.shim_module()
+        now = time.time()
+        for lanes, want in (({"a": {self.ACCOUNT: {"api issues/#": 5}}, "b": {self.ACCOUNT: {"api issues/#": 9}}}, "b"),
+                            ({"a": {self.ACCOUNT: {"api issues/#": 9}}, "b": {self.ACCOUNT: {"api issues/#": 9}}}, "a"),          # a tie: the first name
+                            ({"daemon": {self.ACCOUNT: {"api issues/#": 900}}, "unknown": {self.ACCOUNT: {"api issues/#": 800}}, "c": {self.ACCOUNT: {"api issues/#": 1}}}, "c"),
+                            ({"a": {"acme-b": {"api issues/#": 50}}, "d": {self.ACCOUNT: {"api issues/#": 2}}}, "d")):                       # another account's spending does not count
+            with self.subTest(want=want):
+                write_lane_hours(self.state, lanes)
+                in_shim, in_module = shim.top_spender(self.ACCOUNT, str(self.state)), sb.agent_calls.top_spender(str(self.state), self.ACCOUNT, now)
+                self.assertEqual((in_shim[0], in_module[0]), (want, want))
+                self.assertEqual(in_shim, in_module, "the shim and the daemon's module rank the same")
+        write_lane_hours(self.state, {})
+        self.assertIsNone(sb.agent_calls.top_spender(str(self.state), self.ACCOUNT, now))
+        self.run_shim("pr", "view", "3")
+        kept = sorted(os.listdir(str(self.state / "gh-low-told"))) if (self.state / "gh-low-told").exists() else []
+        self.assertLessEqual(len(kept), 1, "at most one file per account, none per agent")
+
+    def test_u1_above_the_line_or_with_an_unreadable_record_every_call_is_the_plain_call_and_a_failing_switchboard_changes_nothing(self):
+        for label, arrange in (("above the line", lambda: self.usage(3000)),
+                               ("a corrupt hourly record", lambda: (self.usage(500), (self.state / "agent-calls-hours.json").write_text("{not json"))),
+                               ("a failing switchboard", lambda: (self.usage(500), write_lane_hours(self.state, {"worker": {self.ACCOUNT: {"api issues/#": 5}}})))):
+            arrange()
+            for args in (("api", self.PATH), ("issue", "edit", "5", "-t", "x"), ("pr", "view", "3")):
+                with self.subTest(label=label, args=args):
+                    plain = self.run_shim(*args, env={"FLEET_SHIM_CACHE": "off", "FLEET_SB_FAKE": "1", "FAKE_SB_EXIT": "9"})
+                    now = self.run_shim(*args, env={"FAKE_SB_EXIT": "9"})
+                    self.assertEqual((now.stdout, now.returncode), (plain.stdout, plain.returncode))
+
+    def test_s4_no_per_agent_cap_count_or_quota_exists_in_the_shim_its_configuration_or_the_daemons_budget_code(self):
+        sources = {"shims/gh": SHIM.read_text(), "bin/agent_calls.py": (BIN / "agent_calls.py").read_text()}
+        config = ast.parse((BIN / "fleet-switchboard").read_text())
+        defaults = next(n for n in config.body if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "DEFAULTS" for t in n.targets))
+        sources["DEFAULTS"] = ast.unparse(defaults.value)
+        for name, text in sorted(sources.items()):
+            with self.subTest(source=name):
+                self.assertEqual(per_agent_limits(name, text if name != "DEFAULTS" else "x = " + text), [], "%s names a limit per agent: the top spender is a ranking, never a cap" % name)
+        self.assertEqual(per_agent_limits("seed", "AGENT_CALL_CAP = 100\n"), ["AGENT_CALL_CAP"])                      # the mutants: a cap added anywhere is found
+        self.assertEqual(per_agent_limits("seed", "config = {'max_calls_per_agent': 5}\n"), ["max_calls_per_agent"])
+        self.assertEqual(per_agent_limits("seed", "lane_quota = {}\n"), ["lane_quota"])
+
+    def test_s5_status_shows_the_remaining_budget_of_each_account_and_marks_one_below_the_line(self):
+        now = time.time()
+        (self.state / "github-usage.json").write_text(json.dumps({"v": 1, "at": now, "accounts": {
+            "acme-a": {"used": 4500, "remaining": 500, "limit": 5000, "reset": now + 900}, "acme-b": {"used": 1000, "remaining": 4000, "limit": 5000, "reset": now + 900}}}))
+        lines = [l for l in sb.agent_calls.usage_lines(str(self.state), now)]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("real usage acme-a: used 4500, remaining 500", lines[0])
+        self.assertIn("below the low-budget line", lines[0])
+        self.assertIn("real usage acme-b: used 1000, remaining 4000", lines[1])
+        self.assertNotIn("below the low-budget line", lines[1])
+
+    def test_s1_s6_the_documentation_states_the_finding_first_and_describes_the_message_the_wait_and_the_absence_of_a_cap_in_the_words_the_code_uses(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        start = text.index("**Low budget: the top spender (#949).**")
+        section = text[start:text.index("\n\n", start)]
+        case, record, stop, how = (section.find(m) for m in ("*The finding.*", "What the record showed afterwards", "What would have stopped it", "*How it works.*"))
+        self.assertTrue(0 < case < record < stop < how, "the finding (the case, what the record showed, what would have stopped it) comes before the design")
+        message = sb.agent_calls.notice_text("<account>", 1, 2, "<agent>", 3, 4)
+        words = message.split(". ", 2)[2]                                                  # the sentence about the wait: fixed words, no figure
+        self.assertIn(words, section, "the documentation quotes the message's own words")
+        for phrase in ("nothing is refused", "no write and no other agent is slowed", "there is no cap", "the wait ends when the account recovers"):
+            self.assertIn(phrase, section)
+            self.assertIn(phrase, message)
+        self.assertIn("2 seconds", section)
+        self.assertEqual(sb.agent_calls.NOTICE_EVERY, 3600)
+        self.assertIn("at most once an hour per account", section)
+        self.assertEqual(self.shim_module().SLOW_SECONDS, 2.0)
+
+    def test_s4_the_shims_line_and_the_daemons_are_one_number(self):
+        shim = self.shim_module()
+        self.assertEqual((shim.LOW_FRACTION, shim.NOTICE_EVERY, shim.USAGE_FRESH), (sb.agent_calls.LOW_FRACTION, sb.agent_calls.NOTICE_EVERY, sb.agent_calls.USAGE_FRESH))
+        self.assertEqual(shim.NOT_AGENTS, sb.agent_calls.NOT_AGENTS)
+
+
+class TestBudgetNotice(BaselineWorld):
+    """#949: `budget-notice --account A` builds the one message itself (the budget, the ranking and the words come from the daemon's records) and sends it to the top
+    spender's orchestrator once an hour."""
+
+    ACCOUNT = "acme-a"
+
+    def low(self, remaining=500, limit=5000, at=None):
+        now = self.world.clock.now() if at is None else at
+        (self.world.state / "github-usage.json").write_text(json.dumps({"v": 1, "at": now, "accounts": {self.ACCOUNT: {"used": limit - remaining, "remaining": remaining, "limit": limit, "reset": now + 900}}}))
+
+    def hours(self, lanes):
+        write_lane_hours(self.world.state, lanes, int(self.world.clock.now()) // 3600 * 3600)
+
+    def told(self):
+        return [r for r in sb.read_reminders(str(self.world.state)) if "Low GitHub budget" in r["text"]]
+
+    def test_s2_the_top_spenders_orchestrator_gets_one_message_with_the_agent_and_the_numbers_and_a_second_call_sends_none(self):
+        self.add_worker("w-top")
+        self.add_worker("w-quiet")
+        self.low()
+        self.hours({"w-top": {self.ACCOUNT: {"api issues/#": 80}}, "w-quiet": {self.ACCOUNT: {"api issues/#": 20}}, "daemon": {self.ACCOUNT: {"api issues/#": 900}}})
+        first = self.cmd("you", "budget-notice", "--account", self.ACCOUNT)
+        self.assertEqual(first["code"], 0, first["err"])
+        self.assertIn("told", first["out"], first)
+        (item,) = self.told()
+        self.assertEqual(item["to"], "api-orch", "the orchestrator the top spender reports to")
+        for part in ("acme-a", "500 of 5000", "w-top (80 of 100 agent calls, 80%)", "nothing is refused", "there is no cap", "wait a few seconds"):
+            self.assertIn(part, item["text"])
+        self.assertNotIn("w-quiet", item["text"])
+        again = self.cmd("you", "budget-notice", "--account", self.ACCOUNT)
+        self.assertEqual((again["code"], len(self.told())), (0, 1), "one message an hour per account")
+        self.assertIn("already went", again["out"])
+
+    def test_s2_a_top_spender_with_no_orchestrator_tells_the_chief_of_staff_and_one_nobody_runs_tells_nobody(self):
+        self.low()
+        self.hours({"ghost": {self.ACCOUNT: {"api issues/#": 5}}})
+        done = self.cmd("you", "budget-notice", "--account", self.ACCOUNT)
+        self.assertEqual((done["code"], len(self.told())), (0, 1))
+        self.assertEqual(self.told()[0]["to"], "cos")
+
+    def test_s2_not_low_a_stale_reading_no_record_or_another_account_send_nothing_and_a_made_up_account_cannot_invent_one(self):
+        self.add_worker("w-top")
+        self.hours({"w-top": {self.ACCOUNT: {"api issues/#": 5}}})
+        self.low(remaining=3000)
+        self.assertEqual(self.cmd("you", "budget-notice", "--account", self.ACCOUNT)["code"], 0)
+        self.low(at=self.world.clock.now() - 3600)
+        self.assertEqual(self.cmd("you", "budget-notice", "--account", self.ACCOUNT)["code"], 0)
+        self.low()
+        self.assertEqual(self.cmd("you", "budget-notice", "--account", "some-other-account")["code"], 0)
+        self.hours({})
+        self.assertEqual(self.cmd("you", "budget-notice", "--account", self.ACCOUNT)["code"], 0)
+        self.assertEqual(self.told(), [])
+        self.assertFalse((self.world.state / "gh-low-told").exists() and os.listdir(str(self.world.state / "gh-low-told")), "nothing was claimed")
+
+    def test_s8_the_message_and_the_claim_carry_only_the_account_the_agent_and_numbers(self):
+        self.add_worker("w-top")
+        self.low()
+        self.hours({"w-top": {self.ACCOUNT: {"api issues/#": 7}}})
+        self.cmd("you", "budget-notice", "--account", self.ACCOUNT)
+        (item,) = self.told()
+        files = [(self.world.state / "gh-low-told" / n).read_text() for n in os.listdir(str(self.world.state / "gh-low-told"))]
+        blob = item["text"] + " " + " ".join(files)
+        for forbidden in (r"ghp_[A-Za-z0-9]{6,}", r"gho_[A-Za-z0-9]{6,}", r"github_pat_", r"acme/[a-z-]+#?\d*", r"--body", r"Bearer "):
+            self.assertIsNone(re.search(forbidden, blob), forbidden)
+        self.assertEqual(files, ["1"])
+
+    def test_s9_the_shim_change_is_held_for_the_owner_as_a_credentials_path(self):
+        paths = sb.impact_floor.load_matrix()["owner_hold"]["top_tier_paths"]
+        self.assertTrue(sb.impact_floor.matches("shims/gh", paths["credentials"]), "shims/gh is a top-tier credentials path: its pull request holds for the owner")
+
+
 OLD_AGENT_SOURCES = re.compile(r"read_pane_health|PANE_HEALTH_FILE|RETIRED_FILE|pane-health\.json|retired\.json")   # the old copies of the agent list (docs/agent-registry.md)
 # THE RULE: an old token appears ONLY in the registry module (bin/registry.py, which folds and derives them) and in this DATED list of (file, function, token).
 # Each entry names who removes it and by when; the test fails on an entry that no longer matches (shrink it) and on one past its date. The scan covers every
