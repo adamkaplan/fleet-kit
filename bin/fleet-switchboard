@@ -7655,6 +7655,32 @@ def charter_or_first_seen(engine, name, fleet):
     return value if _is_issue_number(value) else None
 
 
+def registry_charter_view(engine):
+    """{agent name: the registry row's charter or None} for every agent that HAS a registry row, or {} when the registry cannot be read whole (#969). Used where a function sees many agents: an orchestrator
+    with a row owns its row's charter only; one with no row yet owns its launch `charter` only. The metadata `issue` of an orchestrator (the ask it was launched for) is never a claim on a charter."""
+    try:
+        registry = load_module("registry")
+        reg = registry.read(engine.state_dir) if engine is not None and getattr(engine, "state_dir", None) is not None else None
+        return {n: (row.get("charter") if registry.is_charter(row.get("charter")) else None) for n, row in reg["agents"].items() if isinstance(row, dict)} if reg and reg["whole"] else {}
+    except Exception:
+        return {}
+
+
+def owned_numbers(name, fleet, view):
+    """The issue numbers the agent `name` (live metadata `fleet`) owns: an ORCHESTRATOR owns its charter (the registry row's when it has one, else its launch `charter`) and nothing else; any other role owns its own `issue`
+    and `charter` (its own assignment). #969."""
+    def number(value):
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lstrip("#").isdigit():
+            return int(value.strip().lstrip("#"))
+        return None
+    if fleet.get("role") == "orchestrator":
+        found = view[name] if name in view else number(fleet.get("charter"))
+        return {found} if found is not None else set()
+    return {n for n in (number(fleet.get("issue")), number(fleet.get("charter"))) if n is not None}
+
+
 def worker_charter(discovery, worker, owners=None):
     """The charter a worker belongs to: its own `charter` (its own launch context), else the REGISTRY's charter of the orchestrator it reported to (`owners`, #969; still discovered, even if retired), else None."""
     fleet = worker.fleet or {}
@@ -10484,7 +10510,7 @@ def decisions_from_github(engine, now):
     for record in records:
         numbers = [record["number"]] + ([record["parent"]] if record.get("parent") else [])
         items.append({"kind": "issue", "title": record["title"] or "issue #%d" % record["number"],
-                      "ask": record["number"], "agent": pick_owner(agents, numbers, record["repo"]),
+                      "ask": record["number"], "agent": pick_owner(agents, numbers, record["repo"], view=registry_charter_view(engine)),
                       "since": record["since"], "seed": "issue:%s#%d" % (record["repo"], record["number"]),
                       "bare": True, "repo": record["repo"], "tier": record.get("tier") or "human",
                       "rows": record.get("rows") or [], "raised_by": record.get("raised_by"),
@@ -14142,16 +14168,17 @@ def triage_context(engine, repo, items, discovery):
     """The charters, asks, work items and agent-owned numbers of one repo, from the agents list and the parent links the
     issue list carries (`parent_issue_url`): no read of their own."""
     owned, charters = set(), set()
+    view = registry_charter_view(engine)   # #969: an orchestrator's charter is the registry's; its metadata `issue` is an ask, never a charter
     for agent in (discovery.agents.values() if discovery else []):
         fleet = agent.fleet or {}
         if _fleet_repo(fleet, engine.config) != repo and fleet.get("repo") != repo:
             continue
-        for field in ("issue", "charter"):
-            value = fleet.get(field)
-            if isinstance(value, int) and not isinstance(value, bool):
-                owned.add(value)
-                if field == "charter":
-                    charters.add(value)
+        mine = owned_numbers(agent.name, fleet, view)
+        owned |= mine
+        if fleet.get("role") == "orchestrator":
+            charters |= mine
+        elif isinstance(fleet.get("charter"), int) and not isinstance(fleet.get("charter"), bool):
+            charters.add(fleet["charter"])
     charters |= {n for n, i in items.items() if any(str(l).endswith(":orchestrator") for l in i["labels"])}
     asks = {n for n, i in items.items() if i["parent"] in charters}
     below, unresolved = triage_charter_descendants(items, charters)
@@ -16409,26 +16436,21 @@ def _is_orchestrator(observation):
     return (observation.fleet or {}).get("role") == "orchestrator"
 
 
-def pick_owner(agents, numbers, repo=None, default_repo=None):
+def pick_owner(agents, numbers, repo=None, default_repo=None, view=None):
     """The fleet agent that owns the first of `numbers`, or None. One recipient per item.
 
-    An agent owns the issues in its metadata.fleet `issue` and `charter`. An
+    An orchestrator owns its charter (the registry row's, `view`; #969), any other agent its metadata.fleet `issue` and `charter`. An
     orchestrator beats any other role; then the nearest issue in `numbers`
     wins, then the name.
     """
     best = None
+    view = view or {}
     for name in sorted(agents):
         fleet = agents[name].fleet or {}
         theirs = fleet.get("repo") if isinstance(fleet.get("repo"), str) else default_repo  # PR 15: with several repos
         if repo and theirs and theirs != repo:                                               # an agent has one
             continue
-        owned = set()
-        for field in ("issue", "charter"):
-            value = fleet.get(field)
-            if isinstance(value, int) and not isinstance(value, bool):
-                owned.add(value)
-            elif isinstance(value, str) and value.strip().lstrip("#").isdigit():
-                owned.add(int(value.strip().lstrip("#")))
+        owned = owned_numbers(name, fleet, view)
         ranks = [numbers.index(n) for n in owned if n in numbers]
         if ranks:
             rank = (0 if fleet.get("role") == "orchestrator" else 1, min(ranks))
@@ -17123,7 +17145,7 @@ class GitHubHub:
         done = set()
         while True:
             owner = pick_owner(agents, known, repo,
-                               self.config.get("intent_repo") if len(self.watches) > 1 else None)
+                               self.config.get("intent_repo") if len(self.watches) > 1 else None, view=registry_charter_view(self))
             if owner and _is_orchestrator(agents[owner]):
                 return owner
             if not pending:

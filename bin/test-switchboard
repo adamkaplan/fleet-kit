@@ -14713,6 +14713,22 @@ class TestOneCharter(Base):
         sb.load_tick(engine, types.SimpleNamespace(agents={"orch-b": seen}))
         self.assertEqual(asked, [7], "the registry's corrected charter, never the stale launch value 1")
 
+    def test_the_notice_router_and_the_triage_context_never_take_an_orchestrators_issue_for_a_charter(self):
+        """The recorded shape: aaa-orch was launched with ANOTHER charter's number as its issue (charter 2, issue 1); zzz-orch holds charter 1 in the registry. Charter 1's owner is zzz-orch."""
+        self.orchestrator("aaa-orch", charter=2, issue=1)
+        self.orchestrator("zzz-orch", charter=1)
+        agents = self.engine.discover(self.world.clock.now()).agents
+        view = sb.registry_charter_view(self.engine)
+        self.assertEqual(sb.pick_owner({n: a for n, a in agents.items() if n.endswith("-orch")}, [1], self.REPO, view=view), "zzz-orch")
+        self.assertEqual(sb.pick_owner({n: a for n, a in agents.items() if n.endswith("-orch")}, [2], self.REPO, view=view), "aaa-orch")
+        self.set_registry("aaa-orch", 9)    # corrected: the launch charter 2 is no longer owned
+        view = sb.registry_charter_view(self.engine)
+        self.assertIsNone(sb.pick_owner({n: a for n, a in agents.items() if n.endswith("-orch")}, [2], self.REPO, view=view))
+        ctx = sb.triage_context(self.engine, self.REPO, {}, types.SimpleNamespace(agents={n: a for n, a in agents.items() if n.endswith("-orch")}))
+        self.assertEqual((ctx["charters"], ctx["owned"]), ({1, 9}, {1, 9}), "the metadata issue 1 of aaa-orch and its launch charter 2 are not owned")
+        coder = types.SimpleNamespace(name="worker", fleet={"role": "coder", "issue": 40, "repo": self.REPO}, status="idle")
+        self.assertEqual(sb.owned_numbers("worker", coder.fleet, view), {40}, "a coder owns its own issue")
+
     def test_a_workers_charter_through_its_boss_is_the_registrys(self):
         self.orchestrator("orch-b", charter=1)
         self.set_registry("orch-b", 7)
@@ -14812,6 +14828,8 @@ class TestOneCharter(Base):
                     elif isinstance(sub, ast.Subscript) and isinstance(sub.slice, ast.Constant):
                         key = sub.slice.value
                     reads = reads or key == "charter"
+                    if isinstance(sub, (ast.For, ast.comprehension)) and isinstance(sub.iter, ast.Tuple) and any(isinstance(e, ast.Constant) and e.value in ("charter",) for e in sub.iter.elts):
+                        reads = True   # a loop over a tuple of field names that holds "charter" (the key is read as the loop variable)
                     if isinstance(sub, (ast.For, ast.comprehension)) and "agents" in ast.unparse(sub.iter) and re.search(r"\.agents\b|agents\.values|discover\(|\.items\(\)|\.values\(\)", ast.unparse(sub.iter)):
                         enumerates = True
                 if reads:
@@ -14850,6 +14868,9 @@ class TestOneCharter(Base):
         ("bin/fleet-switchboard", "record_launch_charter"): "writer: a launch writes the registry row (first sight; a relaunch under the name is a new launch)",
         ("bin/impact_hold.py", "clear_lane"): "display: carries the lookup's `charter` into the notice line", ("bin/impact_hold.py", "_notify_clear_body"): "display: words the notice line",
         ("bin/fleet-switchboard", "seam_applies"): "set: is this issue number known as a charter",
+        ("bin/fleet-switchboard", "owned_numbers"): "registry: the numbers an agent owns (an orchestrator: its row's charter only; others: their own assignment)",
+        ("bin/fleet-switchboard", "registry_charter_view"): "registry: every row's charter", ("bin/fleet-switchboard", "triage_context"): "registry: charters via owned_numbers (an orchestrator's issue is never a charter)",
+        ("bin/fleet-switchboard", "identify"): "own: copies the caller's own launch fields into its context",
         ("bin/fleet-switchboard", "resume_agent"): "own: one agent's own repo lookup", ("bin/fleet-switchboard", "charter_pane_update"): "own: one agent's own charter for its pane",
         ("bin/fleet-switchboard", "_fleet_repo"): "own: one agent's own repo", ("bin/fleet-switchboard", "read_order_notices"): "own: the order notices' own records",
         ("bin/fleet-switchboard", "order_groups"): "own: groups order notices", ("bin/fleet-switchboard", "decisions_from_order_notices"): "own: words order notices",
