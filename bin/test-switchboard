@@ -35492,6 +35492,69 @@ class TestImpactHold(LedgerBase):
         for name in ("_external", "_note"):
             self.assertEqual(ast.unparse(method("ClearContext", name).body), ast.unparse(method("Switchboard", name).body), "the context's %s is the engine's, word for word" % name)
 
+    # S1's exact list (#996): what the real clear and record READ from the engine and the configuration, recorded at run time through a proxy over the real corpus
+
+    # The exact list S1 states (#996): the members of the engine the clear's own code reads, recorded at run time over the real corpus (13) and read statically from bin/impact_hold.py (`engine.X` and
+    # `getattr(engine, "X", default)`: the members a path the corpus does not take reads, or reads with a default), and the configuration keys the code reads. `herdr`/`v2` are the identity clients.
+    ENGINE_MEMBERS_READ = ("__dict__", "_external", "_note", "accounts", "actor", "audit", "ci_record_state", "config", "discover", "gh_runner", "herdr", "intents", "now", "send", "state_dir", "v2", "watches")
+    CONFIG_KEYS_READ = ("awaiting_cos_label", "awaiting_label", "call_timeout_seconds", "delegated_clear", "excluded_repos", "gh", "impact_floor", "impact_hold", "intent_repo")
+    CLIENT_KEYS = ("herdr", "opencode", "opencode_env", "v2_transport")   # read by `build_engine` to build the two identity clients
+
+    def recorded_reads(self):
+        members, keys = set(), set()
+        class Keys(dict):
+            def __getitem__(self, key):
+                keys.add(key)
+                return dict.__getitem__(self, key)
+            def get(self, key, default=None):
+                keys.add(key)
+                return dict.get(self, key, default)
+            def __contains__(self, key):
+                keys.add(key)
+                return dict.__contains__(self, key)
+        class Engine:
+            def __init__(self, engine):
+                object.__setattr__(self, "_engine", engine)
+            def __getattr__(self, name):
+                members.add(name)
+                value = getattr(self._engine, name)
+                return Keys(value) if name == "config" and isinstance(value, dict) else value
+            def __setattr__(self, name, value):
+                members.add("set:" + name)
+                setattr(self._engine, name, value)
+        real = sb.build_engine
+        def recording(*a, **k):
+            engine, state, config = real(*a, **k)
+            return Engine(engine), state, Keys(config)
+        self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
+        with mock.patch.object(sb, "build_engine", recording):
+            self.under()                         # a normal clear
+            self.under(order=18)                 # a refused clear
+            self.run_as("cos", "impact", "clear", self.PR, "--revoke", "--reason", "taking it back for a test")   # a revoke, refused to an agent
+            self.record_pr_setup()
+            self.record_run(self.EXPLICIT)       # a normal record
+            self.record_run(("--impact-severity", "Huge", "--impact-probability", "Remote"))   # a hostile record
+            self.run_as("rev", "review", "record", self.PR, "--reviewer", "nobody", "--verdict", "approve")   # a refused record
+        return members, keys
+
+    def test_the_engine_members_and_configuration_keys_the_real_clear_and_record_read_are_exactly_the_pinned_ones(self):
+        import ast
+        members, keys = self.recorded_reads()
+        static = set()
+        for fn in [n for n in ast.parse((BIN / "impact_hold.py").read_text()).body if isinstance(n, ast.FunctionDef)]:
+            for x in ast.walk(fn):
+                if isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "engine":
+                    static.add(x.attr)
+                if isinstance(x, ast.Call) and getattr(x.func, "id", "") == "getattr" and len(x.args) > 1 and isinstance(x.args[0], ast.Name) and x.args[0].id == "engine" and isinstance(x.args[1], ast.Constant):
+                    static.add(x.args[1].value)
+        everything = members | static
+        if os.environ.get("FLEET_PRINT_READS") == "1":
+            print("ENGINE MEMBERS READ (recorded %d, static %d): %s" % (len(members), len(static), sorted(everything | {"herdr", "v2"})))
+            print("CONFIGURATION KEYS READ: %s" % sorted(keys))
+        self.assertEqual(sorted(everything | {"herdr", "v2"}), sorted(self.ENGINE_MEMBERS_READ), "a member the clear reads that is not pinned (or a pinned one it no longer reads): the entry must provide exactly these")
+        self.assertEqual(sorted(keys), sorted(self.CONFIG_KEYS_READ), "a configuration key the clear reads that is not pinned (or a pinned one it no longer reads)")
+        self.assertEqual(sorted(sb.ENTRY_CONFIG_KEYS), sorted(set(self.CONFIG_KEYS_READ) | set(self.CLIENT_KEYS)), "the entry's key table is the keys the clear reads and the keys of the two identity clients")
+
     # ---- #940 slice 1: ONE closure, derived from the clear's real call graph, read by the refusal and the owner hold
 
     def closure_sets(self):

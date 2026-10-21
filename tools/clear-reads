@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""clear-reads: which members of the daemon's engine and which configuration keys the clear's own code reads (#996).
+
+Read-only. Run from a checkout. It walks the code the clear runs (the daemon file's closure from the clear's roots, by `delegated_clear.closure`, and every function of `bin/impact_hold.py`, the clear's own
+module) and prints, one per line, every `engine.<member>` it reads and every configuration key it reads (`config[...]`, `config.get(...)`, `engine.config[...]`, `engine.config.get(...)` with a literal key).
+It reads the CODE, so a member read only on a path a test never takes is still listed: it is the exact list the minimal entry must provide or the code must stop reading.
+
+  tools/clear-reads [--ref REF]     (default: the working tree)
+"""
+import argparse
+import ast
+import importlib.machinery
+import importlib.util
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    loader.exec_module(module)
+    return module
+
+
+def text_of(ref, name):
+    if ref is None:
+        return (ROOT / name).read_text()
+    return subprocess.run(["git", "show", "%s:%s" % (ref, name)], cwd=str(ROOT), capture_output=True, text=True, check=True).stdout
+
+
+def reads(node, members, keys):
+    for x in ast.walk(node):
+        if isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "engine":
+            members.add(x.attr)
+        if isinstance(x, ast.Subscript) and isinstance(x.slice, ast.Constant) and isinstance(x.slice.value, str):
+            base = x.value
+            if (isinstance(base, ast.Name) and base.id == "config") or (isinstance(base, ast.Attribute) and base.attr == "config"):
+                keys.add(x.slice.value)
+        if isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute) and x.func.attr == "get" and x.args and isinstance(x.args[0], ast.Constant) and isinstance(x.args[0].value, str):
+            base = x.func.value
+            if (isinstance(base, ast.Name) and base.id == "config") or (isinstance(base, ast.Attribute) and base.attr == "config"):
+                keys.add(x.args[0].value)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="the engine members and configuration keys the clear's own code reads")
+    parser.add_argument("--ref", default=None)
+    args = parser.parse_args()
+    sys.path.insert(0, str(ROOT / "bin"))
+    clear = load("delegated_clear", ROOT / "bin" / "delegated_clear.py")
+    floor = load("impact_floor", ROOT / "bin" / "impact_floor.py")
+    rule = floor.load_matrix()["owner_hold"]["delegated_clear"]
+    daemon, hold = ast.parse(text_of(args.ref, rule["daemon_file"])), ast.parse(text_of(args.ref, "bin/impact_hold.py"))
+    roots = clear.daemon_roots(rule, daemon, hold)
+    defs, _, _, members = clear.closure(daemon, roots, list(rule.get("dynamic_actions") or []))
+    index = {n.name: n for n in daemon.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+    found_members, found_keys = set(), set()
+    for name in defs:
+        node = index[name]
+        if isinstance(node, ast.ClassDef):
+            for method in node.body:
+                if isinstance(method, ast.FunctionDef) and method.name in members.get(name, ()):
+                    reads(method, found_members, found_keys)
+        else:
+            reads(node, found_members, found_keys)
+    for node in hold.body:
+        if isinstance(node, ast.FunctionDef):
+            reads(node, found_members, found_keys)
+    print("engine members read by the clear's code (%d):" % len(found_members))
+    for name in sorted(found_members):
+        print("  " + name)
+    print("configuration keys read by the clear's code (%d):" % len(found_keys))
+    for name in sorted(found_keys):
+        print("  " + name)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
