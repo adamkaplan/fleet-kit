@@ -25358,6 +25358,91 @@ PREFLIGHT_CLASSES = (
     ("public-names", 60, (("python3", "bin/check-public-names"),), None),
     ("cloud", 600, (("bin/test-cloud-worker",), ("bin/test-cloud-launcher",), ("cloud/tests/test-cloud",)), "cloud/"),
 )
+# The preflight sub-checks CI runs for the pull request itself (#942): (command, the name it is shown by). Each row is skipped, with a line that says so, when the
+# workflow at the base runs that command on `pull_request`; every other sub-check of PREFLIGHT_CLASSES always runs. Not being able to tell is a run.
+PREFLIGHT_CI_SKIPS = (("bin/test-cloud-launcher", "cloud launcher"),)
+PREFLIGHT_WORKFLOW = ".github/workflows/test.yml"
+PREFLIGHT_STEP_IF = ("${{ !cancelled() }}", "${{ always() }}", "${{ success() }}", "${{ success() || failure() }}", "always()", "success()")   # a step condition that still runs it
+
+
+PREFLIGHT_JOB_KEYS_HIDING = ("if", "continue-on-error")   # job-level keys after which a failure of the job cannot fail CI (or the job may not run): the job does not count
+PREFLIGHT_SWALLOW = r"\|\|\s*(true|:|exit 0)\b|\bset\s+\+e\b"   # a run line that swallows the command's failure
+
+
+def job_hides(line):
+    """True for a job-level key (four spaces) of PREFLIGHT_JOB_KEYS_HIDING that can hide the job's failure: any `if`, any `continue-on-error` other than false."""
+    key = re.match(r"    (%s)\s*:\s*(.*)$" % "|".join(re.escape(k) for k in PREFLIGHT_JOB_KEYS_HIDING), line)
+    return bool(key) and not (key.group(1) == "continue-on-error" and re.match(r"false\b", key.group(2).strip()))
+
+
+def workflow_job_running(text, command):
+    """The name of a job of the workflow `text` that runs `command` on `pull_request`, or None when it cannot be told: a text-only reading (no YAML library), the
+    safe side being None. The job needs no job-level `if`; the step that runs the command needs no `continue-on-error` and no condition but one of PREFLIGHT_STEP_IF."""
+    lines = text.splitlines()
+    try:
+        top = next(i for i, line in enumerate(lines) if re.match(r"on\s*:", line))
+        jobs = next(i for i, line in enumerate(lines) if line.rstrip() == "jobs:")
+    except StopIteration:
+        return None
+    head = lines[top]
+    block = [head] + [line for line in lines[top + 1:jobs] if line.startswith((" ", "\t")) or not line.strip()]
+    if not any(re.match(r"\s*(on\s*:\s*)?(\[.*\bpull_request\b.*\]|pull_request\s*:?)\s*(#.*)?$", line) or re.match(r"on\s*:.*\bpull_request\b", line) for line in block if not line.lstrip().startswith("#")):
+        return None
+    for number, line in enumerate(block):   # a filter under the trigger (paths, branches, types ...) or an inline mapping: CI may not run for this pull request
+        if re.match(r"\s+pull_request\s*:\s*(#.*)?$", line):
+            indent = len(line) - len(line.lstrip())
+            nested = [l for l in block[number + 1:] if l.strip() and not l.lstrip().startswith("#")][:1]
+            if nested and len(nested[0]) - len(nested[0].lstrip()) > indent:
+                return None
+        if re.match(r"on\s*:.*\{", line) or re.match(r"\s+pull_request\s*:\s*\S", line) and not re.match(r"\s+pull_request\s*:\s*(#.*)?$", line):
+            return None
+    name, found = None, []
+    for line in lines[jobs + 1:]:
+        if line and not line.startswith(" ") and not line.startswith("#"):
+            break
+        job = re.fullmatch(r"  ([A-Za-z0-9_-]+):\s*", line)
+        if job:
+            name = job.group(1)
+            found.append((name, []))
+        elif found:
+            found[-1][1].append(line)
+    for name, body in found:
+        if any(job_hides(line) for line in body):
+            continue
+        steps, current = [], None
+        for line in body:
+            if re.match(r"      - ", line):
+                current = [line]
+                steps.append(current)
+            elif current is not None:
+                current.append(line)
+        for step in steps:
+            live = [line for line in step if not line.lstrip().startswith("#") and not re.match(r"\s*(- )?name\s*:", line)]
+            runs = [re.sub(r"^\s*(- )?(run\s*:\s*(\|[-+]?\s*)?)?", "", line) for line in live]
+            starts = [line for line in runs if re.match(r"%s(\s|$)" % re.escape(command), line)]   # the command is the FIRST word of a line, not a mention
+            if not starts:
+                continue
+            conditions = [re.sub(r"^\s*(- )?if\s*:\s*", "", line).strip() for line in step if re.match(r"\s*(- )?if\s*:", line)]
+            hidden = any(re.match(r"\s*(- )?continue-on-error\s*:\s*(?!false\b)", line) for line in step) or any(c not in PREFLIGHT_STEP_IF for c in conditions)
+            if hidden or any(re.search(PREFLIGHT_SWALLOW, line) for line in runs):
+                continue
+            return name
+    return None
+
+
+def preflight_ci_runs(runner, root, command, changed):
+    """The job name when CI runs `command` for this pull request (the workflow file runs it on `pull_request`, and this branch does not change the workflow, so the file
+    in the work tree is the one at the base), else None. It reads a file and makes no git call."""
+    if changed is None or PREFLIGHT_WORKFLOW in changed:
+        return None
+    try:
+        with open(os.path.join(root, PREFLIGHT_WORKFLOW), encoding="utf-8") as handle:
+            text = handle.read(262144)
+    except (OSError, UnicodeDecodeError):
+        return None
+    return workflow_job_running(text, command)
+
+
 PREFLIGHT_CEILING_MAX = 3600   # the absolute maximum of any class's ceiling, in seconds: a hung class still ends
 
 
@@ -25407,6 +25492,12 @@ def cmd_preflight_pr(args, runner, now):
             ceiling = preflight_ceiling(base_ceiling, load1, cores)
             if under is not None and changed is not None and not any(path.startswith(under) for path in changed):
                 continue
+            commands = list(commands)
+            for skipped, shown in PREFLIGHT_CI_SKIPS:
+                job = preflight_ci_runs(runner, root, skipped, changed) if (skipped,) in commands else None
+                if job:
+                    commands.remove((skipped,))
+                    print("preflight-pr: %s: skipped, CI runs it for this pull request (job %s)" % (shown, job))
             env = dict(os.environ, FLEET_HEAVY_MAX_SECONDS=str(ceiling))   # the ceiling runs INSIDE the slot (heavy's watchdog starts when the slot is granted): a wait in the queue is never a timeout
             sys.stderr.write("preflight-pr: %s: waiting for a slot, then running (ceiling %ds once running)\n" % (name, ceiling))
             if under is not None:
@@ -25422,6 +25513,9 @@ def cmd_preflight_pr(args, runner, now):
                     break
                 if done.returncode == 124:
                     verdict, tail = "FAIL", "timed out after %ds running, its ceiling (load average %.1f on %d cores)" % (ceiling, load1, cores)
+                    break
+                if done.returncode == 64 and "heavy: refused: a full-suite job is already queued or running" in (done.stderr or ""):   # heavy's refusal (a test that itself exits 64 is a failure)
+                    verdict, tail = "FAIL", "refused: a full-suite job is already queued or running in this worktree (the tests did not run)"
                     break
                 if done.returncode == 75:
                     verdict, tail = "NOSLOT", "no heavy slot came in time (the tests did not run)"
@@ -25574,6 +25668,41 @@ def agents_found(runner, opencode, timeout):
         return "bad", "the service answered something that is not the agent list (%s)" % err
 
 
+def agent_body(text):
+    """The prose of an agent file: what follows its front matter (the model line, the permissions and the mode are in the front matter, so they are not compared)."""
+    return text.split("\n---\n", 1)[1] if "\n---\n" in text else text
+
+
+def default_installed_agents_dir():
+    """Where `install` writes the agent files of the private profile. Under the test suite there is none unless a test names one: the suite never reads the machine's own profile."""
+    if os.environ.get(UNDER_TEST_ENV):
+        return None
+    return _xdg("XDG_DATA_HOME", ".local/share") / PROG / "profile" / "config" / "opencode" / "agents"
+
+
+def stale_installed_agents(installed_dir, expected=None, root=None):
+    """[(name, path)] of the agents whose installed file has a body that is not the kit's (the model line is not compared). An agent with no installed file, or no kit file, is not listed; an installed file that is there but cannot be read is."""
+    out = []
+    if installed_dir is None:
+        return out
+    for name in sorted(expected or EXPECTED_AGENTS):
+        found = agent_definition(name, root)
+        if found is None:
+            continue
+        installed = Path(installed_dir) / (name + ".md")
+        try:
+            kit = agent_body(Path(found[2]).read_text())
+            current = agent_body(installed.read_text())
+        except FileNotFoundError:
+            continue   # nothing installed under that name: nothing to compare
+        except (OSError, ValueError):
+            out.append((name, str(installed)))   # present but unreadable: said as out of date, never passed over
+            continue
+        if kit != current:
+            out.append((name, str(installed)))
+    return out
+
+
 def agents_problems(found, expected=None, root=None, unchecked=None):
     """One line per agent of ours that is missing, in the wrong mode, short of a rule its definition declares, or whose definition has lines
     the check cannot read. `unchecked` (a list, when given) collects the agents whose rules were NOT compared (no definition found): only the mode was."""
@@ -25612,6 +25741,9 @@ def cmd_agents(args, runner, now):
         return EXIT_ERROR
     unchecked = []
     problems = agents_problems(payload, unchecked=unchecked)
+    installed_dir = Path(args.installed_dir) if args.installed_dir else default_installed_agents_dir()
+    for name, path in stale_installed_agents(installed_dir):
+        problems.append("%s: out of date (the installed copy %s has a different wording from the kit's); run `%s install`, then restart the service" % (name, path, PROG))
     if problems:
         for line in problems:
             print("FAIL  " + line)
@@ -25633,6 +25765,7 @@ def add_agents_parsers(sub):
                                                "lacks a rule its definition declares. A service that is not running is reported, not failed. Run it after installing the agents and "
                                                "restarting the service.")
     verify.add_argument("--strict", action="store_true", help="Exit 1 when the service cannot be asked (default: say so and exit 0)")
+    verify.add_argument("--installed-dir", default=None, help="The folder of installed agent files to compare bodies with (default: the private profile's agents folder)")
     verify.add_argument("--opencode", default="opencode", help="The opencode executable (default: opencode on PATH)")
     verify.add_argument("--timeout", type=int, default=AGENTS_VERIFY_TIMEOUT, help="Seconds to wait for the service (default %d)" % AGENTS_VERIFY_TIMEOUT)
 
