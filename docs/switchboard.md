@@ -4902,7 +4902,7 @@ At most 20 exit lines are written per pass (`PANE_EXIT_MAX_PER_PASS`: 256 KiB of
 
 A quiet pass is cheap: the audit tail, the slot and job records and the `ps` of each alive job (at most `PANE_EXIT_MAX_JOBS`, 200, records) are read only when the log holds an exit to write, and then once per pass, not once per exit.
 
-**Crash note.** The `fleetpane.exit` lines are written before `pane-exit.json` is. A daemon that dies between the two writes the same exits again on its next start (an exit line twice, never a lost one); a failed write of the file while the daemon lives is kept in memory and does not repeat a line.
+**Crash note.** Each audit line (`fleetpane.exit`, `fleetpane.exit_burst`) is written first, and `pane-exit.json` is saved right after it, once per line, not once per pass. The order is audit first because a line twice reads as two exits, while an exit whose append failed is simply written by the next pass (a gap that fills). An append that raises never repeats an earlier line. A daemon that dies between the two writes repeats at most that one line on its next start; a failed write of the file while the daemon lives is kept in memory and does not repeat a line.
 
 Three settings are read, each declared with its default and checked when the config loads: `herdr_log` (a non-empty path), `pane_exit_burst_seconds` (a number above 0, at most 3600; default 5) and `pane_exit_burst_min` (a whole number from 2 to 1000; default 3).
 

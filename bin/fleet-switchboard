@@ -7293,6 +7293,16 @@ def pane_exit_pass(engine, now):
     events = pane_exit_events(text)
     closed, runs, written = None, None, 0   # the audit tail, the slot and job records and their `ps` are read only when an exit is to be written: a quiet pass costs the log tail and the seen set
     seen.update(engine.__dict__.get("pane_exit_seen", {}))   # what a failed write of pane-exit.json could not keep
+    log_state = {"size": last.get("size"), "ino": last.get("ino")}
+
+    def save():
+        """Audit first, then this: called right after EACH audit line, so a later append that raises never makes an earlier line be written again (a line twice
+        reads as two exits, so a gap that the next pass fills is better than a duplicate; a crash between the two writes repeats at most that one line)."""
+        engine.pane_exit_seen = {k: v for k, v in seen.items() if now - v < PANE_EXIT_SEEN_KEEP}
+        try:
+            _write_small(engine.state_dir, PANE_EXIT_FILE, {"seen": seen, "log": log_state})
+        except OSError as err:
+            engine._note("fleetpane.error", None, {"error": "pane-exit.json not written: %s" % _one_line(str(err), 100)})
     window = float(engine.config.get("pane_exit_burst_seconds", PANE_EXIT_BURST_SECONDS))
     for event in events:
         key = "%s:%s" % (event["time"], event["pane"])
@@ -7303,8 +7313,6 @@ def pane_exit_pass(engine, now):
             continue
         if written >= PANE_EXIT_MAX_PER_PASS:
             continue   # not marked seen: the next pass writes it
-        seen[key] = event["at"]
-        written += 1
         if runs is None:
             closed, runs = pane_exit_audit_tail(engine.state_dir), pane_exit_runs(engine)
         by, asked = _pane_exit_asked(closed, event)
@@ -7314,6 +7322,9 @@ def pane_exit_pass(engine, now):
         if runs["problems"]:
             detail["active_problem"] = "; ".join(runs["problems"])
         engine.audit.append(engine.actor, "fleetpane.exit", name or "pane:%s" % event["pane"], detail)
+        seen[key] = event["at"]   # only after the line is written
+        written += 1
+        save()
     bursts, group = {}, []
     for event in events + [None]:
         if event is not None and (not group or event["at"] - group[-1]["at"] <= window):
@@ -7325,15 +7336,13 @@ def pane_exit_pass(engine, now):
             bursts[key] = {"panes": panes, "agents": [next((n for p, n in names.items() if _pane_matches(p, e["pane"])), None) for e in group], "from": group[0]["time"],
                            "to": group[-1]["time"], "codes": sorted({e["code"] for e in group}), "at": group[0]["at"]}
             if key not in seen:
-                seen[key] = group[0]["at"]
                 engine.audit.append(engine.actor, "fleetpane.exit_burst", "panes:%s" % ",".join(panes), {k: v for k, v in bursts[key].items() if k != "at"})
+                seen[key] = group[0]["at"]
+                save()
         group = [event] if event is not None else []
     engine.pane_exit_bursts = bursts
-    engine.pane_exit_seen = {k: v for k, v in seen.items() if now - v < PANE_EXIT_SEEN_KEEP}
-    try:
-        _write_small(engine.state_dir, PANE_EXIT_FILE, {"seen": seen, "log": {"size": size, "ino": inode}})
-    except OSError as err:
-        engine._note("fleetpane.error", None, {"error": "pane-exit.json not written: %s" % _one_line(str(err), 100)})
+    log_state.update(size=size, ino=inode)
+    save()   # the aged-out marks and the log as read
 
 
 class PaneExitFacts:

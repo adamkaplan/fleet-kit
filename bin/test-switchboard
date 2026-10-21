@@ -78040,6 +78040,61 @@ class TestPaneExitBoundaries(TestPaneExit):
             sb.pane_exit_runs(self.engine)
         self.assertEqual(reader.call_count, sb.PANE_EXIT_MAX_JOBS)
 
+    def failing_append(self, event, nth):
+        """An audit that raises on its nth line of `event` (once): the pass raises out, as a full disk would make it."""
+        real, count = self.engine.audit.append, {"n": 0}
+
+        def append(actor, name, subject, detail=None, *a, **k):
+            if name == event:
+                count["n"] += 1
+                if count["n"] == nth:
+                    raise OSError(28, "No space left")
+            return real(actor, name, subject, detail, *a, **k)
+        return mock.patch.object(self.engine.audit, "append", append)
+
+    def test_an_exit_line_that_fails_to_append_never_repeats_an_earlier_line_and_is_written_by_the_next_pass(self):
+        for nth in (1, 2, 3):   # the first, the middle and the last exit
+            with self.subTest(failing=nth):
+                self.fresh()
+                self.write_log(*[self.exit_line(-100 + 20 * i, 500 + i, 0) for i in range(3)])
+                with self.failing_append("fleetpane.exit", nth):
+                    with self.assertRaises(OSError):
+                        self.run_pass()
+                self.assertEqual(len(self.audit("fleetpane.exit")), nth - 1)
+                self.run_pass(20)
+                self.run_pass(30)
+                self.assertEqual(sorted(e["detail"]["pane"] for e in self.audit("fleetpane.exit")), ["500", "501", "502"])
+
+    def test_a_burst_line_that_fails_to_append_does_not_repeat_the_exit_lines_and_is_written_once_later(self):
+        self.engine.discover(self.world.clock.now())
+        self.write_log(*[self.exit_line(-20 + i, 520 + i, 130) for i in range(3)])
+        with self.failing_append("fleetpane.exit_burst", 1):
+            with self.assertRaises(OSError):
+                self.run_pass()
+        self.assertEqual((len(self.audit("fleetpane.exit")), len(self.audit("fleetpane.exit_burst"))), (3, 0))
+        self.run_pass(20)
+        self.run_pass(30)
+        self.assertEqual((len(self.audit("fleetpane.exit")), len(self.audit("fleetpane.exit_burst"))), (3, 1))
+
+    def test_a_second_burst_line_that_fails_does_not_repeat_the_first(self):
+        self.engine.discover(self.world.clock.now())
+        self.write_log(*[self.exit_line(base + i, 560 + n * 3 + i, 130) for n, base in enumerate((-100, -50)) for i in range(3)])
+        with self.failing_append("fleetpane.exit_burst", 2):
+            with self.assertRaises(OSError):
+                self.run_pass()
+        self.assertEqual(len(self.audit("fleetpane.exit_burst")), 1)
+        self.run_pass(20)
+        self.run_pass(30)
+        self.assertEqual(len(self.audit("fleetpane.exit_burst")), 2)
+
+    def test_the_state_file_is_written_after_each_exit_line(self):
+        self.write_log(*[self.exit_line(-100 + 20 * i, 540 + i, 0) for i in range(3)])
+        sizes = []
+        real = sb._write_small
+        with mock.patch.object(sb, "_write_small", lambda d, n, data: (sizes.append(len(data["seen"])), real(d, n, data))[1]):
+            self.run_pass()
+        self.assertEqual(sizes[:3], [1, 2, 3])
+
     def burst_source(self):
         self.engine.discover(self.world.clock.now())
         self.write_log(*[self.exit_line(-20 + i, 400 + i, 130) for i in range(3)])
