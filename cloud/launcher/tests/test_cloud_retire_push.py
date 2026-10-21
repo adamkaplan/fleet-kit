@@ -116,7 +116,8 @@ class RetirePush(base.Base):
         g("add", "-A", cwd=self.work)
         g("commit", "-m", "work", cwd=self.work)
         self.head = subprocess.run(["git", "-C", self.work, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-        self.patch_state(hook_env={"CW_WORKDIR": self.work, "CW_WORKER": "coder7", "CW_HOOK_GIT_HOST": "127.0.0.1:%d" % self.srv.server_address[1]})
+        self.patch_state(hook_env={"CW_WORKDIR": self.work, "CW_WORKER": "coder7", "CW_HOOK_GIT_BASE": "http://127.0.0.1:%d" % self.srv.server_address[1],
+                                    "CW_REPO": "repo"})
         self.env["CW_GIT_TOKEN_CMD"] = self.mint_cmd(FRESH)
         self.env["FAKE_KUBE_SEEN"] = os.path.join(d, "seen.jsonl")
 
@@ -215,14 +216,31 @@ class RetirePush(base.Base):
         os.chmod(hook, 0o755)
         g = lambda *a: subprocess.run(["git", "-C", self.work] + list(a), check=True, capture_output=True)
         g("config", "core.fsmonitor", "sh -c 'env > %s'" % loot)
-        g("remote", "set-url", "origin", "http://127.0.0.1:%d/repo.git" % other.server_address[1])   # the agent points origin elsewhere
+        g("remote", "set-url", "origin", "http://127.0.0.1:%d/repo.git" % other.server_address[1])   # the agent points origin at another host
         code, out, err = self.retire()
-        self.assertEqual(code, cw.EXIT_HOOK)   # the helper does not answer for that host: the push cannot succeed, the pod is kept
-        self.assertEqual([s for s in other.seen if s[2] is not None], [])
-        if os.path.exists(loot):   # the monitor may run on the hook's own untokened `git status`: it must never hold the token
-            self.assertNotIn(FRESH, open(loot).read())
-        self.assertNotIn("CW_PUSH_TOKEN", open(loot).read() if os.path.exists(loot) else "")
+        self.assertEqual(code, 0, err)   # origin is not trusted and not used: the push went to the fixed base
+        self.assertEqual(self.pushed_branch(), self.head)
+        self.assertEqual(other.seen, [])
         self.assertNotIn(FRESH, out + err)
+        if os.path.exists(loot):   # a monitor may run on the hook's own untokened `git status`: it must never hold the token
+            self.assertNotIn(FRESH, open(loot).read())
+
+    def test_s3_origin_as_a_local_path_with_a_receivepack_command_runs_nothing(self):
+        loot = os.path.join(self.tmp.name, "loot2.txt")
+        g = lambda *a: subprocess.run(["git", "-C", self.work] + list(a), check=True, capture_output=True)
+        g("remote", "set-url", "origin", self.bare)
+        g("config", "remote.origin.receivepack", "sh -c 'env > %s'" % loot)
+        g("config", "remote.origin.uploadpack", "sh -c 'env > %s'" % loot)
+        g("config", "url.file:///.insteadOf", "http://127.0.0.1:%d/" % self.srv.server_address[1])   # and rewrites the fixed URL to a local one
+        code, out, err = self.retire()
+        self.assertFalse(os.path.exists(loot), "a repository-named command ran")
+        self.assertNotIn(FRESH, out + err)
+
+    def test_a_token_without_a_recorded_repository_pushes_nowhere(self):
+        self.patch_state(hook_env={"CW_WORKDIR": self.work, "CW_WORKER": "coder7", "CW_HOOK_GIT_BASE": "http://127.0.0.1:%d" % self.srv.server_address[1]})
+        code, out, err = self.retire()
+        self.assert_kept(code, err, "push")
+        self.assertEqual(self.srv.seen, [])
 
     # -- the explicit-workdir rule, the odd mint outputs, the mint's scope, the flag's absence --
     def test_an_explicit_workdir_that_is_missing_is_an_error_not_no_checkout(self):
@@ -398,21 +416,20 @@ class RetirePush(base.Base):
         self.assertEqual(self.st()["secrets"], {})
 
     # -- U1 --
-    def test_u1_a_live_pod_with_a_remote_that_needs_no_token_behaves_as_before(self):
-        for configured in (False, True):
-            with self.subTest(mint_configured=configured):
-                self.setUp()
-                work, _ = make_repo(self.tmp.name, "r%d" % configured, dirty=True)
-                self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
-                if not configured:
-                    del self.env["CW_GIT_TOKEN_CMD"]
-                code, out, err = self.retire()
-                res = json.loads(out)
-                self.assertEqual((code, res["pushed"], res["wip_branch"], res["skipped"]), (0, True, "coder7/wip", [".env"]))
-                self.assertEqual(err.count("WARNING: not saved"), 1)
-                self.assertNotIn("pod kept", err)
+    def test_u1_a_launcher_with_no_mint_settings_behaves_exactly_as_before(self):
+        # the pod's own credential and its `origin` are used as before (a local bare origin here); with mint settings the push
+        # goes to the fixed base instead (S2), so this case is the one the old tests also pin
+        del self.env["CW_GIT_TOKEN_CMD"]
+        work, _ = make_repo(self.tmp.name, "r", dirty=True)
+        self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
+        code, out, err = self.retire()
+        res = json.loads(out)
+        self.assertEqual((code, res["pushed"], res["wip_branch"], res["skipped"]), (0, True, "coder7/wip", [".env"]))
+        self.assertEqual(err.count("WARNING: not saved"), 1)
+        self.assertNotIn("pod kept", err)
         # a pod whose work is already on a remote branch still prints pushed false and no note
         self.setUp()
+        del self.env["CW_GIT_TOKEN_CMD"]
         work, _ = make_repo(self.tmp.name, "clean", dirty=False)
         self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
         code, out, err = self.retire()
