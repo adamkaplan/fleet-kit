@@ -116,7 +116,7 @@ class RetirePush(base.Base):
         g("add", "-A", cwd=self.work)
         g("commit", "-m", "work", cwd=self.work)
         self.head = subprocess.run(["git", "-C", self.work, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-        self.patch_state(hook_env={"CW_WORKDIR": self.work, "CW_WORKER": "coder7"})
+        self.patch_state(hook_env={"CW_WORKDIR": self.work, "CW_WORKER": "coder7", "CW_HOOK_GIT_HOST": "127.0.0.1:%d" % self.srv.server_address[1]})
         self.env["CW_GIT_TOKEN_CMD"] = self.mint_cmd(FRESH)
         self.env["FAKE_KUBE_SEEN"] = os.path.join(d, "seen.jsonl")
 
@@ -200,6 +200,78 @@ class RetirePush(base.Base):
         self.assertEqual(len(execs), 1)
         self.assertIn("-i", execs[0])
         self.assertEqual(execs[0][execs[0].index("cw-end-hook"):], ["cw-end-hook", "--token-stdin"])
+
+    # -- S3b: the repository is the agent's; nothing in it may receive the token --
+    def test_s3_a_repository_that_names_another_host_or_runs_code_never_sees_the_token(self):
+        other = Server(("127.0.0.1", 0), _Remote)
+        other.seen, other.accept, other.root = [], FRESH, self.srv.root
+        threading.Thread(target=other.serve_forever, daemon=True).start()
+        self.addCleanup(other.server_close)
+        self.addCleanup(other.shutdown)
+        loot = os.path.join(self.tmp.name, "loot.txt")
+        hook = os.path.join(self.work, ".git", "hooks", "pre-push")
+        with open(hook, "w") as f:
+            f.write("#!/bin/sh\nenv > %s\n" % loot)
+        os.chmod(hook, 0o755)
+        g = lambda *a: subprocess.run(["git", "-C", self.work] + list(a), check=True, capture_output=True)
+        g("config", "core.fsmonitor", "sh -c 'env > %s'" % loot)
+        g("remote", "set-url", "origin", "http://127.0.0.1:%d/repo.git" % other.server_address[1])   # the agent points origin elsewhere
+        code, out, err = self.retire()
+        self.assertEqual(code, cw.EXIT_HOOK)   # the helper does not answer for that host: the push cannot succeed, the pod is kept
+        self.assertEqual([s for s in other.seen if s[2] is not None], [])
+        if os.path.exists(loot):   # the monitor may run on the hook's own untokened `git status`: it must never hold the token
+            self.assertNotIn(FRESH, open(loot).read())
+        self.assertNotIn("CW_PUSH_TOKEN", open(loot).read() if os.path.exists(loot) else "")
+        self.assertNotIn(FRESH, out + err)
+
+    # -- the explicit-workdir rule, the odd mint outputs, the mint's scope, the flag's absence --
+    def test_an_explicit_workdir_that_is_missing_is_an_error_not_no_checkout(self):
+        self.patch_state(hook_env={"CW_WORKDIR": os.path.join(self.tmp.name, "nowhere"), "CW_WORKER": "coder7"})
+        code, out, err = self.retire()
+        self.assert_kept(code, err, "push")
+
+    def test_odd_mint_outputs_keep_the_pod_with_step_mint(self):
+        odd = {"empty output, exit 0": "true", "two lines": "printf 'a\\nb'", "over long": "head -c 5000 /dev/zero | tr '\\0' x",
+               "exit 1 with a token": "sh -c 'printf %s x; exit 1'"}
+        for label, cmd in odd.items():
+            with self.subTest(output=label):
+                self.setUp()
+                self.env["CW_GIT_TOKEN_CMD"] = cmd
+                code, out, err = self.retire()
+                self.assert_kept(code, err, "mint")
+
+    def test_a_pod_that_records_no_repository_is_a_mint_failure(self):
+        self.create("coder7")
+        st = self.st()
+        for c in st["pods"][cw.pod_name("coder7")]["spec"]["containers"]:
+            c["env"] = [e for e in c.get("env", []) if e.get("name") != "CW_REPO"]
+        self.write_state(st)
+        code, out, err = self.run_cli("stop", "coder7")
+        self.assert_kept(code, err, "mint")
+
+    def test_the_mint_is_asked_for_the_repository_recorded_on_the_pod_only(self):
+        seen = os.path.join(self.tmp.name, "mint.args")
+        self.env["CW_GIT_TOKEN_CMD"] = "sh -c 'echo \"$0 $GH_REPO\" > %s; cat %s' %s" % (seen, self.mint_cmd(FRESH).split()[-1], "acme-org/widget-service")
+        self.assertEqual(self.retire()[0], 0)
+        self.assertEqual(open(seen).read().split()[-1], "acme-org/widget-service")
+
+    def test_read_token_takes_one_clean_line_only(self):
+        import io
+        self.assertIsNone(end_hook.read_token(io.StringIO("")))
+        self.assertIsNone(end_hook.read_token(io.StringIO("a\nb")))
+        self.assertIsNone(end_hook.read_token(io.StringIO("x" * (end_hook.MAX_TOKEN + 1))))
+        self.assertEqual(end_hook.read_token(io.StringIO(FRESH + "\n")), FRESH)
+
+    def test_an_image_whose_hook_predates_the_flag_behaves_as_before(self):
+        path = os.path.join(self.tmp.name, "old_hook.py")
+        src = open(os.path.join(os.path.dirname(HERE), "end_hook.py")).read()
+        old = src.replace('token = read_token(sys.stdin) if "--token-stdin" in sys.argv[1:] else None', 'token = None')
+        self.assertNotEqual(old, src)
+        with open(path, "w") as f:
+            f.write(old)
+        self.patch_state(hook_path=path)
+        code, out, err = self.retire()   # the pod's own credential is dead: refused as today, pod kept, route named
+        self.assert_kept(code, err, "push")
 
     # -- S4 --
     def assert_kept(self, code, err, step):

@@ -22,6 +22,9 @@ SECRET_GLOBS = [".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*",
 
 
 DEFAULT_WORKDIR = "/work/repo"
+GIT_HOST = "github.com"   # the only host the fresh token is offered to (CW_HOOK_GIT_HOST: the pod's own setting, for tests)
+HARDEN = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=", "-c", "core.askPass=", "-c", "core.sshCommand=false",
+          "-c", "http.proxy=", "-c", "credential.useHttpPath=false"]
 MAX_TOKEN = 4096
 # One-shot credential source: answers only for the host of origin, with the token from the environment of this child.
 HELPER = ('!f() { [ "$1" = get ] || exit 0; h=""; while IFS="=" read -r k v; do [ "$k" = host ] && h=$v; [ -z "$k" ] && break; done; '
@@ -36,17 +39,13 @@ def read_token(stream):
     return tok if tok and len(tok) <= MAX_TOKEN and "\n" not in tok else None
 
 
-def origin_host(workdir):
-    from urllib.parse import urlparse
-    p = subprocess.run(["git", "-C", workdir, "remote", "get-url", "origin"], capture_output=True, text=True)
-    return urlparse(p.stdout.strip()).netloc.rpartition("@")[2]   # host[:port], as git names it to a helper
-
-
 def git(workdir, *args, check=True, token=None):
     cmd, env = ["git", "-C", workdir], None
     if token:   # the helper text carries no token; the token is in this one child's environment only
-        cmd += ["-c", "credential.helper=", "-c", "credential.helper=" + HELPER]
-        env = dict(os.environ, CW_PUSH_TOKEN=token, CW_PUSH_HOST=origin_host(workdir), GIT_TERMINAL_PROMPT="0")
+        # The repository is the agent's and its config is not trusted: the helper answers for ONE fixed host (never the
+        # origin URL read from that config), and nothing the repository can name runs with the token in its environment.
+        cmd += ["-c", "credential.helper=", "-c", "credential.helper=" + HELPER] + HARDEN
+        env = dict(os.environ, CW_PUSH_TOKEN=token, CW_PUSH_HOST=os.environ.get("CW_HOOK_GIT_HOST") or GIT_HOST, GIT_TERMINAL_PROMPT="0")
     p = subprocess.run(cmd + list(args), capture_output=True, text=True, env=env)
     if check and p.returncode != 0:
         raise RuntimeError((p.stderr.strip().splitlines() or ["git %s failed" % args[0]])[-1])

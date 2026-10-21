@@ -1252,8 +1252,8 @@ class Launcher:
         """When this launcher can mint, a fresh token for the repository recorded on the pod (self.hook_repo, set by stop) goes to the hook on stdin."""
         repo = getattr(self, "hook_repo", None)
         self.hook_step = retire_token.STEP_PUSH
-        if repo and retire_token.configured(self.env):
-            token = retire_token.mint(self.env, repo)
+        if retire_token.configured(self.env):   # a pod that records no repository cannot be minted for: that is a mint failure, never the dead credential
+            token = retire_token.mint(self.env, repo) if repo else None
             if not token:
                 self.hook_step = retire_token.STEP_MINT
                 return {"pushed": False, "wip_branch": None, "error": "no fresh push token could be minted"}
