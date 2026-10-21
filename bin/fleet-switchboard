@@ -7294,13 +7294,18 @@ def pane_exit_pass(engine, now):
     closed, runs, written = None, None, 0   # the audit tail, the slot and job records and their `ps` are read only when an exit is to be written: a quiet pass costs the log tail and the seen set
     seen.update(engine.__dict__.get("pane_exit_seen", {}))   # what a failed write of pane-exit.json could not keep
     log_state = {"size": last.get("size"), "ino": last.get("ino")}
+    on_disk = [{"seen": stored.get("seen") or {}, "log": stored.get("log") or {}}]   # what the file holds now: an unchanged state is not written again
 
     def save():
         """Audit first, then this: called right after EACH audit line, so a later append that raises never makes an earlier line be written again (a line twice
         reads as two exits, so a gap that the next pass fills is better than a duplicate; a crash between the two writes repeats at most that one line)."""
         engine.pane_exit_seen = {k: v for k, v in seen.items() if now - v < PANE_EXIT_SEEN_KEEP}
+        payload = {"seen": dict(seen), "log": dict(log_state)}
+        if payload == on_disk[0]:
+            return
         try:
-            _write_small(engine.state_dir, PANE_EXIT_FILE, {"seen": seen, "log": log_state})
+            _write_small(engine.state_dir, PANE_EXIT_FILE, payload)
+            on_disk[0] = payload
         except OSError as err:
             engine._note("fleetpane.error", None, {"error": "pane-exit.json not written: %s" % _one_line(str(err), 100)})
     window = float(engine.config.get("pane_exit_burst_seconds", PANE_EXIT_BURST_SECONDS))

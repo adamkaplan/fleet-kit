@@ -77886,6 +77886,26 @@ class TestPaneExit(Base):
         self.assertEqual((self.log.stat().st_size, self.log.stat().st_mtime_ns), before)
         self.assertEqual([e["detail"]["pane"] for e in self.audit("fleetpane.exit")], ["61"])
 
+    def count_state_writes(self, passes):
+        """Run the real pass at each offset and count the renames onto pane-exit.json (the only per-pass file pane_exit_pass writes)."""
+        wrote, real = [0], os.rename
+
+        def counting(a, b):
+            wrote[0] += os.path.basename(str(b)) == sb.PANE_EXIT_FILE
+            return real(a, b)
+        with mock.patch.object(os, "rename", counting):
+            for offset in passes:
+                self.run_pass(offset)
+        return wrote[0]
+
+    def test_the_state_file_is_written_only_when_it_changed(self):
+        self.three_kinds()
+        self.assertEqual(self.count_state_writes([10]), 4, "three exits (one write each) and the log as read")
+        self.assertEqual(self.count_state_writes(range(11, 51)), 0, "40 idle passes: the same seen set and log, no write")
+        with self.log.open("a") as handle:
+            handle.write(self.exit_line(-5, 14, 0))
+        self.assertEqual(self.count_state_writes([60, 61, 62]), 2, "a new exit and the log growing are written once, not again")
+
     def test_the_exits_seen_are_kept_in_the_state_file_so_a_restart_writes_nothing_twice(self):
         self.three_kinds()
         self.run_pass()
