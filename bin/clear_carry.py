@@ -22,10 +22,8 @@ A THIRD route (ask #955) is for the batch pull request (base the default branch,
 
 The same function computes the fingerprint at the clear and at the carry (`own_change_fingerprint`). Python 3.9 standard library only.
 """
-import collections
 import hashlib
 import json
-import re
 
 PAGE = 100
 FILE_PAGES = 30                # the pull request files API stops at 3000 files
@@ -323,7 +321,14 @@ def decide(get, repo, number, cleared_head, cleared_fingerprint, new_head, lines
 # ---- the batch pull request (ask #955): the clears of its members carry when its diff is exactly their cleared diffs
 
 BATCH_BRANCH = "integration"
-_SQUASH_RE = re.compile(r"\(#([0-9]{1,9})\)\s*$")
+
+
+def _squash_number(message):
+    """N of a squash commit's title `... (#N)`, else None."""
+    title = message.split("\n", 1)[0].rstrip()
+    start = title.rfind("(#")
+    digits = title[start + 2:-1] if start >= 0 and title.endswith(")") else ""
+    return int(digits) if digits.isdigit() and len(digits) <= 9 else None
 
 
 def _file_row(item):
@@ -366,15 +371,18 @@ def _listing(get, repo, base, head):
 
 
 def _entries(files):
-    """Counter of the lines a set of files adds and removes, keyed by (path, line): context and line numbers are left out (a later member moves them). A pure move is one entry of its blob."""
-    found = collections.Counter()
+    """{(path, line): how many times} of the lines a set of files adds and removes: context and line numbers are left out (a later member moves them). A pure move is one entry of its blob."""
+    found = {}
     for f in files:
-        if f["patch"]:
-            for line in changed_lines(f["patch"]):
-                found[(f["path"], line)] += 1
-        else:
-            found[(f["path"], "~%s:%s:%s" % (f["status"], f["previous"], f["sha"]))] += 1
+        keys = [(f["path"], line) for line in changed_lines(f["patch"])] if f["patch"] else [(f["path"], "~%s:%s:%s" % (f["status"], f["previous"], f["sha"]))]
+        for key in keys:
+            found[key] = found.get(key, 0) + 1
     return found
+
+
+def _excess(seen, expected):
+    """{key: count} of what `seen` has more of than `expected`."""
+    return {k: n - expected.get(k, 0) for k, n in seen.items() if n > expected.get(k, 0)}
 
 
 def batch_members(get, repo, base, head, branch=BATCH_BRANCH):
@@ -393,10 +401,9 @@ def batch_members(get, repo, base, head, branch=BATCH_BRANCH):
             check_main_side(get, repo, base, {"sha": c["sha"], "parents": c["parents"]})
             merges.append({"sha": c["sha"], "parents": c["parents"]})
         elif len(c["parents"]) == 1:
-            match = _SQUASH_RE.search(c["message"].split("\n", 1)[0])
-            if match is None:
+            number = _squash_number(c["message"])
+            if number is None:
                 raise CarryVoid("commit %s is neither a merge of %s nor the squash of a pull request (no `(#N)` in its title)" % (c["sha"][:8], base))
-            number = int(match.group(1))
             if any(m["number"] == number for m in members):
                 raise CarryVoid("pull request #%d is in the batch twice" % number)
             pull = _object(get, "repos/%s/pulls/%d" % (repo, number), "member #%d" % number)
@@ -435,7 +442,7 @@ def batch_decide(get, repo, number, head, member_state, closure_of, protected, b
             raise CarryVoid("not a batch: its base is not the default branch")
         members, merges = batch_members(get, repo, base, head, branch)
         verdict["merges"] = len(merges)
-        table, expected, member_paths, problems = [], collections.Counter(), {}, []
+        table, expected, member_paths, problems = [], {}, {}, []
         for m in sorted(members, key=lambda m: m["number"]):
             own, own_head, _ = own_change(get, repo, m["number"])
             commit = _get_list(get, "repos/%s/commits/%s?per_page=%d" % (repo, m["sha"], PAGE), FILE_PAGES, "the files of member #%d" % m["number"], "files")
@@ -464,7 +471,8 @@ def batch_decide(get, repo, number, head, member_state, closure_of, protected, b
                 problems.append("#%d %s" % (m["number"], row["why"]))
             for f in squash:
                 member_paths.setdefault(f["path"], m["number"])
-            expected.update(_entries(squash))
+            for key, count in _entries(squash).items():
+                expected[key] = expected.get(key, 0) + count
             table.append(row)
         verdict["members"] = table
         for merge in merges:
@@ -477,7 +485,7 @@ def batch_decide(get, repo, number, head, member_state, closure_of, protected, b
             raise CarryVoid("the head moved while it was being read")
         seen = _entries(files)
         verdict["lines"] = sum(seen.values())
-        extra = seen - expected
+        extra = _excess(seen, expected)
         verdict["uncovered"] = ["%s %s" % (k[0][:60], k[1][:60]) for k in sorted(extra)][:20]
         if extra:
             problems.append("%d line(s) of the batch are in no member's change: %s" % (sum(extra.values()), "; ".join(verdict["uncovered"][:5])))

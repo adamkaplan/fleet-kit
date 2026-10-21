@@ -77273,7 +77273,7 @@ class TestBatchCarry(unittest.TestCase):
                         failed.append(label)
             return failed
         self.assertEqual(run(self.cc), [], "the real module passes all four")
-        for name, old, new, label in (("no line check", "extra = seen - expected", "extra = collections.Counter()", "extra line holds"),
+        for name, old, new, label in (("no line check", "extra = _excess(seen, expected)", "extra = {}", "extra line holds"),
                                       ("another member's head", "if held and cleared_head != own_head:", "if False:", "amended member holds"),
                                       ("no never-carried check", "if path and _norm(path) in tables:", "if False:", "table path holds")):
             self.assertEqual(source.count(old), 1, name)
@@ -77326,11 +77326,11 @@ class TestBatchCarryInTheDaemon(Base):
 
     def floor(self, engine, repo, number, rated_pairs=()):
         if number == 100:
-            return {"pr": self.PR, "head": self.head, "owner_decision": "hold", "owner_reasons": ["a top tier path"], "floor_paths": ["x"], "globs": ["x"], "reasons": ["a top tier path"], "complete": True, "unknown": None}
+            return {"pr": self.PR, "head": self.head, "head_ref": "integration", "owner_decision": "hold", "owner_reasons": ["a top tier path"], "floor_paths": ["x"], "globs": ["x"], "reasons": ["a top tier path"], "complete": True, "unknown": None}
         return {"pr": "%s#%d" % (repo, number), "head": self.api.rev("m%d" % number), "owner_decision": "hold" if number in self.held else "none", "owner_reasons": [], "complete": True, "unknown": None}
 
     def judge(self):
-        report = {"pr": self.PR, "head": self.head, "reasons": ["a top tier path"], "floor_paths": ["x"], "globs": ["x"], "owner_decision": "hold"}
+        report = {"pr": self.PR, "head": self.head, "head_ref": "integration", "reasons": ["a top tier path"], "floor_paths": ["x"], "globs": ["x"], "owner_decision": "hold"}
         return sb.apply_impact_hold(self.engine, self.REPO, 100, report, {"labels": []})
 
     def state(self):
@@ -77383,10 +77383,10 @@ class TestBatchCarryInTheDaemon(Base):
         self.assertEqual(state["batch_void"][self.PR]["head"], self.head)
 
     def test_u1_a_pull_request_whose_head_is_not_the_integration_branch_is_not_a_batch(self):
-        real = self.api.get
-        self.api.get = lambda path: dict(real(path), head=dict(real(path)["head"], ref="feature")) if path.startswith("repos/%s/pulls/100" % self.REPO) and "files" not in path else real(path)
-        report = dict(self.floor(self.engine, self.REPO, 100), rehold=None)
+        report = dict(self.floor(self.engine, self.REPO, 100), head_ref="feature", rehold=None)
+        gets = self.api.calls[:]
         self.assertIsNone(sb.impact_batch_decision(self.engine, self.REPO, 100, report))
+        self.assertEqual(self.api.calls, gets, "no read of GitHub for a pull request that is not from the integration branch")
         self.assertEqual((self.events("gate.batch_carried"), self.events("gate.batch_carry_held")), ([], []))
 
 

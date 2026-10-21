@@ -215,12 +215,10 @@ def impact_batch_decision(engine, repo, number, report):
         if (state["clears"].get(pr) or {}).get("head") == head:
             return None
         cc = load_module("clear_carry")
+        if report.get("head_ref") != cc.BATCH_BRANCH:
+            return None   # only a pull request from the integration branch is a batch (the floor's own read says so: no extra call): every other one is judged as before
         runner = getattr(engine, "gh_runner", None) or subprocess.run
         get = impact_carry_get(engine, runner, repo)
-        pull = get("repos/%s/pulls/%d" % (repo, number))
-        source = pull.get("head") if isinstance(pull, dict) and isinstance(pull.get("head"), dict) else {}
-        if source.get("ref") != cc.BATCH_BRANCH:
-            return None   # only a pull request from the integration branch is a batch: every other one is judged as before
 
         def member_state(member, member_head):
             mpr = "%s#%d" % (repo, member)
