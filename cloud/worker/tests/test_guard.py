@@ -394,6 +394,19 @@ class Guard(unittest.TestCase):
             self.assertRegex(text, r"(?i)not the guard|only a convenience", path)
 
 
+    def test_1019_a_read_of_an_issue_passes_and_a_write_of_the_same_issue_is_refused(self):
+        path = "repos/%s/issues/3" % REPO
+        for cmd in (["gh", "api", path], ["gh", "api", path + "/comments"], ["gh", "issue", "view", "3"]):
+            with self.subTest(read=" ".join(cmd)):
+                self.assertEqual(self.call(cmd).returncode, 0, cmd)
+        for cmd in (["gh", "api", "-X", "POST", path], ["gh", "api", "-X", "PATCH", path], ["gh", "api", "-X", "POST", path + "/comments"],
+                    ["gh", "issue", "comment", "3", "--body", "x"]):
+            with self.subTest(write=" ".join(cmd)):
+                r = self.call(cmd)
+                self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+                self.assertEqual(r.stderr, "refused: writing issues: %s\n" % TAIL)
+
+
 def cfg_table():
     """the git config table at the top of guard.sh: [(kind, name, args, why)]"""
     rows = []

@@ -94,7 +94,9 @@ def get_token(target):
     cmd = os.environ.get("CW_PREFLIGHT_TOKEN_CMD")
     if not cmd:
         try:
-            return app_token.mint(target)
+            token = app_token.mint(target)
+            say("token permissions: " + app_token.render_permissions())  # the mint refused anything else
+            return token
         except SystemExit:  # app_token already said why, on stderr; a mint that fails is an unreadable answer
             raise Unreadable("no token could be minted")
     try:

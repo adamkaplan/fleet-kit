@@ -11,7 +11,9 @@ The App id, private key and installation id are read from the vault by commands 
 The key goes to `openssl dgst -sha256 -sign /dev/fd/N` through a pipe: never a file, an argument or the environment.
 The 9-minute app JWT and the token are never printed except the token, once, on stdout. Errors go to stderr, never a value.
 Only https://api.github.com is used; CW_GITHUB_API_BASE may name a loopback http URL (tests).
-The answer must carry EXACTLY the permissions below (no extra key, no higher level, none missing), else no token is printed.
+The request asks for, and the answer must carry EXACTLY, the permissions of EXPECTED_PERMISSIONS below (no extra key, no
+higher level, none missing), else no token is printed. A missing key is the App not yet granted (or the installation not yet
+accepting) a permission: the refusal names it and the owner step.
 CW_OPENSSL names the openssl binary (default openssl).
 """
 import base64
@@ -32,7 +34,20 @@ import token_mint  # noqa: E402
 API = "https://api.github.com"
 MAX_TOKEN_SECONDS = 61 * 60
 MAX_BYTES = 1_000_000  # the most of any GitHub answer or vault command output that is read
-EXPECTED_PERMISSIONS = {"contents": "write", "pull_requests": "write", "metadata": "read"}
+# THE table of the cloud token's permissions: the request body, the exact check, the refusal text, the preflight's
+# "token permissions" line and the documents all derive from it. issues: read lets the worker read its ask and plan
+# (and their comments); nothing here is a write to an issue. shims/app_mint.py (the Mac shim) keeps its own, different set.
+EXPECTED_PERMISSIONS = {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"}
+
+
+def render_permissions(perms=None):
+    """The table as text: `contents: write, pull_requests: write, issues: read, metadata: read`."""
+    return ", ".join("%s: %s" % kv for kv in (EXPECTED_PERMISSIONS if perms is None else perms).items())
+
+
+def owner_step():
+    """The one place that says what the owner does when the App lacks a permission of the table."""
+    return "the owner adds %s to the App's permissions and accepts them on each installation" % render_permissions()
 
 
 def open_url(req, timeout=30):
@@ -127,7 +142,7 @@ def check_permissions(perms):
             die("refusing: the token carries an extra permission: %s" % str(k)[:40])
     for k, want in EXPECTED_PERMISSIONS.items():
         if k not in perms:
-            die("refusing: the token lacks the permission: %s" % k)
+            die("refusing: the token lacks the permission: %s (%s)" % (k, owner_step()))
         if perms[k] != want:
             die("refusing: the token has a different level for the permission: %s" % k)
 
@@ -147,7 +162,7 @@ def mint(target):
     jwt = signing + "." + b64(sign(key, signing.encode()))
     del key
     req = urllib.request.Request("%s/app/installations/%s/access_tokens" % (api_base(), inst),
-                                 data=json.dumps({"repositories": [repo]}).encode(), method="POST",
+                                 data=json.dumps({"repositories": [repo], "permissions": dict(EXPECTED_PERMISSIONS)}).encode(), method="POST",
                                  headers={"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json",
                                           "Content-Type": "application/json", "X-GitHub-Api-Version": "2022-11-28",
                                           "User-Agent": "cw-app-token"})
@@ -158,6 +173,8 @@ def mint(target):
             die("the GitHub answer is larger than %d bytes" % MAX_BYTES)
         ans = json.loads(raw)
     except urllib.error.HTTPError as e:
+        if e.code in (403, 422):  # the App may not hold, or the installation not yet accept, a requested permission
+            die("%s; if the App lacks a requested permission, %s" % (http_error_text(e.code), owner_step()))
         die(http_error_text(e.code))
     except (OSError, ValueError):
         die("the GitHub request failed or its answer was not JSON")
