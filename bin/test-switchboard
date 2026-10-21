@@ -45410,7 +45410,7 @@ class TheReaperOnlyInstall(ReaperOnlyFakes):
     def test_the_service_file_is_private_in_every_case(self):
         for path in ("full", "reaper"):
             for umask in (0o000, 0o022):
-                for state in ("missing", "identical", "different"):
+                for state in ("missing", "identical", "different", "private"):
                     with self.subTest(path=path, umask=oct(umask), state=state):
                         self.setUp()
                         if state != "missing":
@@ -45419,7 +45419,7 @@ class TheReaperOnlyInstall(ReaperOnlyFakes):
                                 os.chmod(str(self.reaper_path()), 0o644)
                             else:
                                 self.reaper_path().write_text("a file someone else wrote\n")
-                                os.chmod(str(self.reaper_path()), 0o644)
+                                os.chmod(str(self.reaper_path()), 0o644 if state == "different" else 0o600)
                         out, error = self.install_path(path, umask)
                         self.assertIsNone(error, error)
                         self.assertEqual(stat.S_IMODE(self.reaper_path().stat().st_mode), 0o600)
