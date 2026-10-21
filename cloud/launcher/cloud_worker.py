@@ -1166,6 +1166,7 @@ class Launcher:
         failure, are not retried."""
         began = self.clock()
         deadline = began + dt.timedelta(seconds=STACK_RACE_WINDOW_SECONDS)
+        self._slept = 0.0   # the seconds this launcher itself slept: a second bound, so a clock that does not advance still ends the loop
         attempt = 1
         while True:
             seen = []   # this attempt's pod: set once a get returned it
@@ -1178,7 +1179,7 @@ class Launcher:
                     self._raise_on_race(name, pod)
             try:
                 # a retry never waits past the window (the first attempt keeps the caller's --wait, as before)
-                self._wait_ready(name, seconds if attempt == 1 else max(0, min(seconds, int((deadline - self.clock()).total_seconds()))), watch)
+                self._wait_ready(name, seconds if attempt == 1 else max(0, min(seconds, int((deadline - self.clock()).total_seconds()), int(STACK_RACE_WINDOW_SECONDS - self._slept))), watch)
             except (_FreshNodeRace, _PodVanished) as race:
                 last = not self._retry_fits(deadline)
                 spent = int((self.clock() - began).total_seconds())
@@ -1194,7 +1195,7 @@ class Launcher:
                     self.foreign.append("pod/" + name)
                     raise CloudError("the pod %s is not this call's (its run id does not match); left whole" % name) from None
                 self._refuse_if_removed(name, made)   # a stop, the reaper or someone else removed this call's own objects: not the race
-                self.sleep(STACK_RACE_PAUSE_SECONDS)   # the pod is deleted and made again only after the pause, never in a tight loop
+                self._nap(STACK_RACE_PAUSE_SECONDS)   # the pod is deleted and made again only after the pause, never in a tight loop
                 self.kube.delete_pod_and_wait(name)
                 attempt += 1
                 self._make(made, "pod", self.kube.apply, spec)
@@ -1209,7 +1210,12 @@ class Launcher:
 
     def _retry_fits(self, deadline):
         """True when one more pause plus one poll fits in the window that is left."""
-        return (deadline - self.clock()).total_seconds() >= STACK_RACE_PAUSE_SECONDS + WAIT_POLL_SECONDS
+        need = STACK_RACE_PAUSE_SECONDS + WAIT_POLL_SECONDS
+        return (deadline - self.clock()).total_seconds() >= need and STACK_RACE_WINDOW_SECONDS - self._slept >= need
+
+    def _nap(self, seconds):
+        self.sleep(seconds)
+        self._slept = getattr(self, "_slept", 0.0) + seconds
 
     def _refuse_if_removed(self, name, made):
         gone = self._own_objects_gone(name, made)
@@ -1238,6 +1244,7 @@ class Launcher:
 
     def _wait_ready(self, name, seconds, on_pending=None):
         end = self.clock() + dt.timedelta(seconds=seconds)
+        waited = 0.0   # the second bound: the seconds slept here, for a clock that does not advance
         while True:
             pod = self.kube.get_pod(name)
             status = (pod or {}).get("status", {})
@@ -1247,9 +1254,10 @@ class Launcher:
                 return
             if on_pending:
                 on_pending(pod)
-            if self.clock() >= end:
+            if self.clock() >= end or waited >= seconds:
                 raise CloudError("timed out waiting for the worker", EXIT_TIMEOUT)
-            self.sleep(WAIT_POLL_SECONDS)
+            self._nap(WAIT_POLL_SECONDS)
+            waited += WAIT_POLL_SECONDS
 
     # -- end hook, stop, delete --
     def run_hook(self, name):

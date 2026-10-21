@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import unittest
+from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -72,9 +73,10 @@ class Slow(Wait):
     def test_a_runtime_ready_after_a_long_delay_succeeds_on_a_later_attempt(self):   # S2; kills: the attempt count restored (gives up at 3)
         for kind in KINDS:
             with self.subTest(kind=kind):
-                n = 14   # 14 rejections: ready on attempt 15, at least 200 s in
+                n = 4   # 4 rejections: ready on attempt 5; a longer pause (patched) keeps it at least 200 s in with few kubectl calls
                 self.fresh(kind, n)
-                code, out, err = self.run_stack()
+                with mock.patch.object(cw, "STACK_RACE_PAUSE_SECONDS", 60):
+                    code, out, err = self.run_stack()
                 self.assertEqual(code, 0, err)
                 a = self.attempts()
                 self.assertEqual(len(a), n + 1)
@@ -101,6 +103,50 @@ class Slow(Wait):
                 for i in deletes:   # the call just before each delete (the Secret checks aside) is the pause
                     before = [c for c in seq[:i] if not (c[:2] == ["get", "secret"] or c[:2] == ["get", "pod"] or c[:2] == ["get", "events"])]
                     self.assertEqual(before[-1], ["SLEEP", PAUSE])
+
+
+class Frozen(Wait):
+    """A clock that never advances (a fake clock, or a sleep that does not move it) must still end every waiting loop in the stack
+    create path: _start_stack_pod's retry loop and _wait_ready (the only two; the rest of the file never sleeps on the clock in create).
+    The second bound is the seconds the launcher itself slept. Mutant: that sum removed from a loop (the test aborts at the cap)."""
+    CAP = 2000
+
+    def frozen(self, kind, plan_steps):
+        self.fresh(kind, plan_steps)
+        sleeps = []
+
+        def sleep(s):
+            sleeps.append(s)
+            if len(sleeps) > self.CAP:
+                raise AssertionError("looped past %d sleeps: no end" % self.CAP)   # the clock is never advanced
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cw.main(["create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main", "--run-id", RUN_ID, "--stack"],
+                           self.env, self.clock, sleep)
+        return code, err.getvalue(), sleeps
+
+    def test_the_retry_loop_ends_with_one_refusal_on_a_frozen_clock(self):   # kills: the slept sum removed from the retry loop
+        for kind in KINDS:
+            with self.subTest(kind=kind):
+                code, err, sleeps = self.frozen(kind, 500)
+                self.assertEqual(code, cw.EXIT_CLOUD, err)
+                self.assertLessEqual(sum(sleeps), WINDOW + POLL)
+                self.assertEqual(len([l for l in err.splitlines() if "gave up" in l]), 1, err)
+
+    def test_wait_ready_ends_on_a_frozen_clock(self):   # kills: the slept sum removed from _wait_ready (pod never ready, no race)
+        self.setUp()
+        self.patch_state(never_ready=True)
+        sleeps = []
+
+        def sleep(s):
+            sleeps.append(s)
+            self.assertLessEqual(len(sleeps), self.CAP, "no end on a frozen clock")
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cw.main(["create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main", "--run-id", RUN_ID, "--stack", "--wait", "30"],
+                           self.env, self.clock, sleep)
+        self.assertEqual(code, cw.EXIT_TIMEOUT, err.getvalue())
+        self.assertLessEqual(sum(sleeps), 30 + POLL)
 
 
 class Never(Wait):
