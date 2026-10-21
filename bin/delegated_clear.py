@@ -1105,16 +1105,28 @@ def registrar_findings(base_src, head_src, rule):
                     if ref not in done or (full and done[ref] is not None):
                         done[ref] = None if full else added
                         todo.append((ref, defs[ref], done[ref]))
-    writers = {n.name for n in _module_statements(head.body) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-               and any(isinstance(y, (ast.Global, ast.Nonlocal)) or (isinstance(y, ast.Name) and y.id in NAMESPACE_NAMES) or (isinstance(y, ast.Attribute) and y.attr in NAMESPACE_NAMES and y.attr not in NAMESPACE_ATTRIBUTE_EXEMPT) for y in ast.walk(n))}   # a module function that binds a global or reaches a namespace: calling it (or naming it) at import time may write the module
+    def reaches(y):   # a node that writes or reaches a namespace: a global statement, a name or attribute of NAMESPACE_NAMES, a frame field or a dunder attribute
+        return isinstance(y, (ast.Global, ast.Nonlocal)) or (isinstance(y, ast.Name) and y.id in NAMESPACE_NAMES) \
+            or (isinstance(y, ast.Attribute) and ((y.attr in NAMESPACE_NAMES and y.attr not in NAMESPACE_ATTRIBUTE_EXEMPT) or y.attr.startswith("f_") or (y.attr.startswith("__") and y.attr.endswith("__"))))
+    writer_nodes = [n for n in ast.walk(head) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and any(reaches(y) for y in ast.walk(n))]   # ANY function, lambda or method anywhere in the file that writes or reaches a namespace
+    writers = {n.name for n in writer_nodes if hasattr(n, "name")}
+    for owner in ast.walk(head):   # a lambda assigned to a name, and a method of a class: the names they are called by
+        if isinstance(owner, ast.Assign) and isinstance(owner.value, ast.Lambda) and owner.value in writer_nodes:
+            writers.update(t.id for t in owner.targets if isinstance(t, ast.Name))
+    for node in writer_nodes:   # ANY changed line of a writer is held wherever the writer is called (a runtime function can run it before `command_registrars` collects)
+        if _spans(node, added):
+            found.append(("a changed line of a function that writes a namespace", "calls", "a statement that may write the module's namespace"))
+    for node in ast.walk(head):   # a star import binds names no pattern can see
+        if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names) and _spans(node, added):
+            found.append(("a star import", "imports", "a statement that may write the module's namespace"))
     for node in _import_time_statements(head.body):   # MODULE-LEVEL DEFAULT-DENY: `command_registrars` collects registrars out of the module's globals by name, so any added module-level statement that may write the namespace is held:
         if not _spans(node, added):                # a bare expression statement (`globals().update(...)`, `setattr(sys.modules[__name__], ...)`, `exec(...)`: a call is not a binding the other rules can read), and any statement that
             continue                                # reaches the namespace by a call or an attribute (`globals`, `vars`, `locals`, `setattr`, `exec`, `eval`, `compile`, `__import__`, `__dict__`, `modules`)
         if isinstance(node, ast.Expr) and not isinstance(node.value, ast.Constant):
             found.append(("a module-level expression statement", "calls", "a statement that may write the module's namespace"))
         for x in _shallow_nodes(node):
-            reach = (isinstance(x, ast.Name) and x.id in NAMESPACE_NAMES) or (isinstance(x, ast.Attribute) and x.attr in NAMESPACE_NAMES and x.attr not in NAMESPACE_ATTRIBUTE_EXEMPT)
-            reach = reach or (isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id in writers)
+            reach = reaches(x) and not isinstance(x, (ast.Global, ast.Nonlocal))
+            reach = reach or (isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id in writers) or (isinstance(x, ast.Attribute) and x.attr in writers)
             if reach:
                 found.append(("a module-level namespace reach", "calls", "a statement that may write the module's namespace"))
                 break
