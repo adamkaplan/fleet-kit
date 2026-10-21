@@ -7008,7 +7008,7 @@ def bell_migration(engine, registry, now):
     got = registry.migrate_bell(engine.state_dir, belled, True, now=now)
     if got["problem"]:
         engine._note("fleetpane.error", None, {"error": "bell migration: %s" % _one_line(got["problem"], 100)})
-    elif got["ran"] and engine.audit is not None:
+    elif got["ran"] and got["changed"] and engine.audit is not None:
         engine.audit.append(engine.actor, "registry.bell_migrated", None, {"agents": got["changed"]})
 
 

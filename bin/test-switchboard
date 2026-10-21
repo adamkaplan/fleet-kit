@@ -718,7 +718,7 @@ class TestHerdrClient(Base):
                         if not name.startswith("_"))
         self.assertEqual(public, ["agent_get", "agent_list", "notification_show", "open_tab_running",
                                   "pane_clear_token", "pane_close", "pane_get", "pane_list", "pane_process_info", "pane_read_visible",
-                                  "pane_report_metadata_token", "tab_close", "tab_get", "workspace_create", "workspace_list"])  # PR 16
+                                  "pane_report_metadata_token", "tab_close", "tab_get", "tab_list", "workspace_create", "workspace_list"])  # PR 16; #973: tab_list is the one-time bell migration's read
 
     def test_a_workspace_is_listed_and_created_focused_with_the_one_focus_flag(self):
         body = '{"result": {"workspaces": [{"workspace_id": "w1", "label": "A"}], "workspace": {"workspace_id": "w2"}, ' \
@@ -1936,7 +1936,7 @@ class FakeV2:
 
 HERDR_ALLOWED = (["agent", "list"], ["agent", "get"], ["pane", "report-metadata"], ["notification", "show"],
                  ["pane", "process-info"], ["pane", "close"], ["workspace", "list"], ["workspace", "create"],
-                 ["plugin", "list"], ["pane", "get"], ["pane", "read"], ["tab", "close"], ["tab", "get"])  # PR 16; the control plane reads a pane and closes a stale tab: `status` reads herdr's plugin list; `bootstrap` makes a workspace
+                 ["plugin", "list"], ["pane", "get"], ["pane", "read"], ["tab", "close"], ["tab", "get"], ["tab", "list"])  # PR 16; #973: the bell migration reads the tab labels once; the control plane reads a pane and closes a stale tab: `status` reads herdr's plugin list; `bootstrap` makes a workspace
 SOCKET_ALLOWED = ("layout.apply",)
 TYPING_VERBS = (["agent", "prompt"], ["agent", "send-keys"], ["agent", "start"], ["pane", "send-text"],
                 ["pane", "send-keys"], ["pane", "run"])
@@ -2028,7 +2028,7 @@ class FakeHerdr:
         # herdr 0.9's shape: the session is an object, not a string (S6).
         entry = self.panes[pane]
         body = {"pane_id": pane, "agent": "opencode", "agent_status": self.status(pane),
-                "workspace_id": pane.split(":")[0]}
+                "workspace_id": pane.split(":")[0], "tab_id": self.tab_of(pane)}
         if entry["session"] and not entry.get("undetected"):
             body["agent_session"] = {"agent": "opencode", "kind": "id", "source": "herdr:opencode",
                                      "value": entry["session"]}
@@ -2051,7 +2051,7 @@ class FakeHerdr:
                    ("notification", "show"): self._notification_show, ("pane", "process-info"): self._process_info,
                    ("pane", "close"): self._pane_close, ("workspace", "list"): self._workspace_list,
                    ("workspace", "create"): self._workspace_create, ("pane", "get"): self._pane_get, ("pane", "list"): self._pane_list,
-                   ("tab", "close"): self._tab_close, ("tab", "get"): self._tab_get}.get(tuple(args[:2]))
+                   ("tab", "close"): self._tab_close, ("tab", "get"): self._tab_get, ("tab", "list"): self._tab_list}.get(tuple(args[:2]))
         if tuple(args[:2]) == ("pane", "read"):
             positional, flags = parse_flags(args[2:], ("--source", "--lines", "--format"))
             if positional[0] not in self.panes:
@@ -2175,6 +2175,10 @@ class FakeHerdr:
         body = {"pane_id": pane, "workspace_id": pane.split(":")[0], "tab_id": self.tab_of(pane), "cwd": entry.get("cwd") or "/tmp",
                 "agent_status": self.status(pane), "terminal_title_stripped": title}
         return {"result": {"type": "pane_info", "pane": body}}
+
+    def _tab_list(self, rest):
+        parse_flags(rest, ())
+        return {"result": {"type": "tab_list", "tabs": [{"tab_id": self.tab_of(p), "workspace_id": p.split(":")[0], "label": self.panes[p].get("tab_label", "")} for p in sorted(self.panes)]}}
 
     def _tab_get(self, rest):
         positional, _ = parse_flags(rest, ())
@@ -75837,6 +75841,18 @@ class TestBellMigration(unittest.TestCase):
         self.assertFalse(self.registry.bell_migrated(self.dir))
         again = self.registry.migrate_bell(self.dir, {"w0:p1"}, True)   # safe to re-run: records that have the field are left alone
         self.assertIsNone(again["problem"])
+
+    def test_the_pass_audits_the_migration_once_when_agents_changed_and_never_for_none(self):
+        self.engine.herdr = self.Herdr(self.agents, self.tabs)
+        audit = types.SimpleNamespace(lines=[], append=lambda actor, event, subject, detail: audit.lines.append((event, detail)))
+        self.engine.audit = audit
+        sb.bell_migration(self.engine, self.registry, 5)
+        self.assertEqual(audit.lines, [("registry.bell_migrated", {"agents": 5})])
+        empty = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(empty), True)
+        self.engine.state_dir, audit.lines[:] = str(empty), []
+        sb.bell_migration(self.engine, self.registry, 5)   # nothing recorded: the marker is written, no audit line
+        self.assertEqual(audit.lines, [])
 
     def test_a_field_a_person_set_is_never_overwritten_and_the_default_is_opted_out(self):
         self.registry.set_bell(self.dir, "b", True)
