@@ -58821,6 +58821,55 @@ class TestJobEndRecord(StandInPids, unittest.TestCase):
                     self.assertEqual(detail["age_seconds"], 500)
                     self.assertIsInstance(detail["last_seen_age_seconds"], int)
 
+    # THE table of what the wrapper's own shell could write to the log or the exit code differently by shell/system:
+    # (case, the command, how it is stopped, the log must be exactly, the exit file holds or None).
+    SHELL_FAMILY = (
+        ("uncatchable kill: no shell job notice", ["sh", "-c", "echo out; echo err >&2; exec sleep 60"], "kill9", "out\nerr\n", None),
+        ("command not found: the code and message are the shell's, not a job notice", ["no-such-command-1008"], None, None, "127"),
+        ("not executable: 126", ["/dev/null"], None, None, "126"),
+        ("exits 3 with its own output", ["sh", "-c", "echo out; echo err >&2; exit 3"], None, "out\nerr\n", "3"),
+        ("killed by the catchable TERM from outside: the wrapper says so", ["sh", "-c", "echo out; echo err >&2; exec sleep 60"], "term", "out\nerr\n", "143"),
+    )
+
+    def test_s8_the_wrapper_writes_the_same_log_and_exit_on_every_shell_it_can_run_under(self):
+        shells = [path for path in ("/bin/sh", "/bin/bash", "/bin/zsh", "/bin/dash", "/usr/bin/dash", "/usr/bin/bash", "/usr/bin/zsh") if os.path.exists(path)]
+        self.assertTrue(shells)
+        for shell in shells:
+            for case, command, stop, log_is, exit_is in self.SHELL_FAMILY:
+                with self.subTest(shell=shell, case=case):
+                    directory = Path(tempfile.mkdtemp())
+                    self.addCleanup(shutil.rmtree, str(directory), True)
+                    exit_path, log_path = directory / "exit", directory / "log"
+                    with open(str(log_path), "wb") as log:
+                        proc = subprocess.Popen([shell, "-c", sb.JOB_WRAPPER, "fleet-job", str(exit_path)] + command, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                    self.addCleanup(lambda p=proc: (p.poll() is None) and os.killpg(p.pid, signal.SIGKILL))
+                    if stop:
+                        deadline = time.monotonic() + 30
+                        while "err" not in log_path.read_text() and time.monotonic() < deadline:
+                            time.sleep(0.05)
+                        os.killpg(proc.pid, signal.SIGKILL) if stop == "kill9" else os.kill(proc.pid, signal.SIGTERM)
+                    proc.wait(timeout=30)
+                    text = log_path.read_text()
+                    if log_is is not None:
+                        self.assertEqual(text, log_is)
+                    else:
+                        self.assertEqual(len(text.strip().splitlines()), 1, text)
+                        self.assertNotIn("fleet-job: line", text)
+                    self.assertEqual(exit_path.read_text().strip() if exit_path.exists() else None, exit_is)
+                    self.assertNotRegex(text, r"Killed|Terminated|Segmentation|\[[0-9]+\]")
+
+    def test_a_reason_file_that_is_not_a_signal_reason_makes_no_line(self):
+        for said in ("whatever the file says", "signal 9999", "signal \x1b[31m9", "signal 15 and more"):
+            with self.subTest(said=said):
+                self.audited.clear()
+                job = "badreason"
+                record = self.start(job, "sh", "-c", "echo bye")
+                self.procs[job].wait(timeout=30)
+                (self.root / job / "exit.reason").write_text(said + "\n")
+                self.assertEqual(sb.job_state(record, self.root)[0], "finished")
+                self.assertFalse(sb.job_record_end(record, self.root, record["started"] + 5, self.audit))
+                self.assertEqual(self.audited, [])
+
     def test_s8_the_daemon_pass_writes_the_line_once_however_many_passes_look(self):
         record = self.start("daemon-pass", "sh", "-c", "echo seen; exec sleep 60")
         self.printed("daemon-pass", "seen")
