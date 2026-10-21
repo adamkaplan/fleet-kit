@@ -886,19 +886,17 @@ def ensure_state_dir(path=None):
     than repaired: something changed it, and that deserves a person's look.
     """
     path = Path(path) if path else state_dir_path()
-    if not path.exists():
-        try:
-            path.mkdir(parents=True, mode=0o700)
-        except FileExistsError:
-            pass   # another process (three `heavy` wrappers started together) made it between the look and the mkdir: checked below like any existing one
-        else:
-            os.chmod(str(path), 0o700)  # mkdir's mode is filtered by the umask; only the process that made it sets it
-    info = path.stat()
-    if not path.is_dir():
-        raise ConfigError("state path is not a directory: %s" % path)
-    if info.st_uid != os.getuid() or info.st_mode & 0o077:
-        raise ConfigError("state directory must be private (mode 0700, owned by you): %s" % path)
-    return path
+    return _make_dir(path, ConfigError)
+
+
+def _make_dir(path, error, **options):
+    """Make a directory through the one helper (bin/private_dir.py, #708): atomic against another process, a dangling symlink refused, the
+    owner and mode checked for a private one. The helper's refusal becomes `error` (one line, same text); any other OSError passes as it is."""
+    module = load_module("private_dir")
+    try:
+        return module.ensure_dir(path, **options)
+    except module.PrivateDirError as err:
+        raise error(str(err)) from None
 
 
 # ------------------------------------------------------------------ the faults
@@ -6286,7 +6284,7 @@ def agent_tmp_env(engine, name):
         raise LaunchError("no private temp directory for %r: not a valid agent name" % (name,))
     path = root / name
     try:
-        root.mkdir(parents=True, exist_ok=True)
+        load_module("private_dir").ensure_dir(root, check=False)
         try:
             path.mkdir(mode=0o700)
         except FileExistsError:
@@ -17833,7 +17831,7 @@ class GitHubHub:
 
     def log_path(self, watch):
         directory = self.state_dir / "logs"
-        directory.mkdir(mode=0o700, exist_ok=True)
+        load_module("private_dir").ensure_dir(directory, parents=False, check=False)
         return directory / ("forward-%s.log" % watch.repo.replace("/", "-"))
 
     def _start(self, watch, now):
@@ -18664,7 +18662,7 @@ def launch_memory_check(args, engine, state, runner, now):
 
     def remember(*reads):
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            load_module("private_dir").ensure_dir(path.parent, check=False)
             tmp = path.with_name(path.name + ".%d.tmp" % os.getpid())
             tmp.write_text(json.dumps({"at": now(), "reads": [list(r) for r in reads][-2:]}))
             os.replace(tmp, path)
@@ -23375,7 +23373,7 @@ def _write_gates_config(raw_edit):
     section = dict(section, repos=dict(section.get("repos") or {}))   # every other key (ci_record) is kept
     raw["plan_gates"] = raw_edit(section)
     validate_config(raw, str(path))
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _make_dir(path.parent, ConfigError, private=False)
     temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
     mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
     fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
@@ -25904,7 +25902,12 @@ def cmd_preflight_pr(args, runner, now):
             sys.stderr.write("preflight-pr: %s: waiting for a slot, then running (ceiling %ds once running)\n" % (name, ceiling))
             if under is not None:
                 scratch = os.path.join(work, ("tok_" + "x" * PREFLIGHT_TOKEN_LENGTH)[:PREFLIGHT_TOKEN_LENGTH])
-                os.makedirs(scratch, exist_ok=True)
+                try:
+                    load_module("private_dir").ensure_dir(scratch, private=False)
+                except OSError as err:   # a symlink to nothing (or a file) in the way: this class fails with one line, the others still run
+                    failed += 1
+                    print("FAIL %s (0s): %s" % (name, _one_line(str(err), 200)))
+                    continue
                 env.update(TMPDIR=scratch, CLOUD_TEST_SKIP_DOCKER="1")
             started, verdict, tail = now(), "PASS", ""
             for command in commands:
@@ -26206,9 +26209,10 @@ def job_ensure_root(root):
     """Create the jobs dir private (0700). Raises OSError when it exists and is not private."""
     root = Path(root)
     try:
-        os.makedirs(str(root), mode=0o700, exist_ok=True)
-    except OSError:
-        pass
+        load_module("private_dir").ensure_dir(root, check=False)
+    except OSError as err:
+        if getattr(err, "kind", None) == "dangling":
+            raise   # one line naming the link, never "not a private directory" for a path that is not a directory at all
     if not job_private(root):
         raise OSError(errno.EPERM, "%s is not a private directory (owned by you, mode 0700)" % root)
 
@@ -26332,7 +26336,11 @@ def cmd_job(args, runner, now, spawn=subprocess.Popen):
         if earlier is not None and job_state(earlier, root)[0] == "alive":
             sys.stderr.write("%s: job: %s is still running (pid %s): `job status %s`; pick another name or wait\n" % (PROG, args.name, earlier.get("pid"), args.name))
             return EXIT_ERROR
-        paths["dir"].mkdir(parents=True, exist_ok=True)
+        try:
+            load_module("private_dir").ensure_dir(paths["dir"], check=False)
+        except OSError as err:   # a symlink to nothing where the job's directory goes: one line, nothing created at its target
+            sys.stderr.write("%s: job: %s\n" % (PROG, err.strerror or err))
+            return EXIT_ERROR
         os.chmod(str(paths["dir"]), 0o700)
         for stale in (paths["record"], paths["exit"], paths["collected"], Path(str(paths["exit"]) + ".tmp")):   # the old record goes FIRST: no window shows it uncollected
             try:
@@ -29842,8 +29850,9 @@ def format_install_lines(report):
 def _write_private(path, text):
     """Write `text` to `path` atomically with mode 0600: a temporary file in the same directory, then rename."""
     path = Path(path)
-    if not path.parent.exists():
-        path.parent.mkdir(parents=True, mode=0o700)
+    _make_dir(path.parent, ConfigError, check=False)   # atomic, a dangling parent refused (#708)
+    if os.path.islink(str(path)) and not os.path.exists(str(path)):
+        raise ConfigError("%s is a symbolic link to nothing: not writing through it" % path)
     handle, temp = tempfile.mkstemp(prefix=".%s." % path.name, dir=str(path.parent))
     try:
         with os.fdopen(handle, "w") as out:
@@ -30046,7 +30055,7 @@ def write_if_changed(path, content):
             return False
     except OSError:
         pass
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _make_dir(path.parent, InstallError, private=False)
     mask = os.umask(0)
     os.umask(mask)
     mode = (0o666 & ~mask) & ~0o022
@@ -30144,7 +30153,7 @@ def _replace_skill_file(path, text):
             n += 1
             backup = path.with_name("%s.bak-%s-%d" % (path.name, stamp, n))
         shutil.copy2(str(path), str(backup))
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _make_dir(path.parent, InstallError, private=False)
     handle, temp = tempfile.mkstemp(prefix=".%s." % path.name, dir=str(path.parent))
     try:
         with os.fdopen(handle, "w") as out:
@@ -30332,11 +30341,11 @@ def install_todolist_plugin(config_dir, kit_root=KIT_ROOT):
     changed = False
     for name, body in files.items():
         if not _same_bytes(target / name, body):
-            (target / name).parent.mkdir(parents=True, exist_ok=True)
+            _make_dir((target / name).parent, InstallError, private=False)
             (target / name).write_bytes(body)
             changed = True
     if not ours:
-        loader.parent.mkdir(parents=True, exist_ok=True)
+        _make_dir(loader.parent, InstallError, private=False)
         loader.write_bytes(loader_bytes)
         changed = True
     return changed
@@ -30621,7 +30630,7 @@ def ensure_home_link(profile_root, config_dir):
         return False
     if os.path.lexists(str(link)):
         raise InstallError("%s exists and is not the link to %s: not touching it" % (link, config_dir))
-    link.parent.mkdir(parents=True, exist_ok=True)
+    _make_dir(link.parent, InstallError, private=False)
     os.symlink(str(config_dir), str(link))
     return True
 
@@ -30811,7 +30820,7 @@ class Installer:
         merged.update(stale)
         validate_config(merged, str(path))
         if not self.dry:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            _make_dir(path.parent, InstallError, private=False)
             path.write_text(json.dumps(merged, indent=2) + "\n")
         changes = []
         if missing:
@@ -30857,7 +30866,7 @@ class Installer:
         missing = [name for name in PROFILE_DIRS if not (root / name).is_dir()]
         if missing and not self.dry:
             for name in PROFILE_DIRS:
-                (root / name).mkdir(parents=True, exist_ok=True)
+                _make_dir(root / name, InstallError, private=False)
             os.chmod(str(root / "state"), 0o700)
         self.result("profile", bool(missing), "%s (private to v2; %s is not touched)" % (root, self.shared_dir()),
                     "%s (private to v2; %s is not touched)" % (root, self.shared_dir()))
@@ -31031,7 +31040,7 @@ class Installer:
             return self.say("cli link", "skipped (%s exists and is not a link to this checkout's %s; left alone: "
                                         "agents' shells will not find `%s` until it is moved)" % (link, target, PROG))
         if not self.dry:
-            directory.mkdir(parents=True, exist_ok=True)
+            _make_dir(directory, InstallError, private=False)
             if state == "stale":
                 link.unlink()
             os.symlink(str(target), str(link))
@@ -32426,7 +32435,7 @@ def install_cos_orders_template(config, dry=False):
     if os.path.lexists(str(path)):
         return False
     if not dry:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        _make_dir(path.parent, InstallError, private=False)
         fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as handle:
             handle.write(COS_ORDERS_TEMPLATE)

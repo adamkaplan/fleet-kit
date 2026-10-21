@@ -82,12 +82,30 @@ def _one(text, limit=300):
     return H["_one_line"](text, limit)
 
 
+def _private_dir():
+    """The one directory helper (bin/private_dir.py, #708), loaded by path from beside this file, never imported by name."""
+    import importlib.util
+    import sys
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "private_dir.py")
+    held = sys.modules.get("private_dir")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("private_dir", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["private_dir"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 # ---------------------------------------------------------------- the endpoint record
 
 def cloud_dir(state):
     path = Path(state) / CLOUD_DIR
-    if not path.is_dir():
-        path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    helper = _private_dir()
+    try:
+        helper.ensure_dir(path, check=False)   # atomic, a dangling link refused; the owner and link check is below
+    except helper.PrivateDirError as err:
+        raise CloudError(str(err)) from None
     found = os.lstat(str(path))
     if stat.S_ISLNK(found.st_mode) or found.st_uid != os.getuid():
         raise CloudError("the cloud directory is not the user's own")
@@ -811,7 +829,7 @@ def private_root():
     owner, another mode or is a link is REFUSED, never repaired."""
     root = Path(tempfile.gettempdir()) / ("cwtok-%d" % os.getuid())
     try:
-        root.mkdir(mode=0o700, exist_ok=True)
+        _private_dir().ensure_dir(root, parents=False, check=False)
         found = os.lstat(str(root))
     except OSError as err:
         raise Refusal("the private directory for the cluster token cannot be made (%s); nothing was called" % (err.strerror or err)) from None

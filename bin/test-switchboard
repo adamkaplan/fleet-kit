@@ -9190,6 +9190,473 @@ def _stdlib_roots():
     return tuple(os.path.realpath(p) for p in paths)
 
 
+# ------------------------------------------------------- the one private-directory helper (#708)
+
+def _pd_calls(tree, name):
+    """[(function, call node)] for every call of the helper in a parsed file: `ensure_dir` or the daemon's `_make_dir`, never inside `_make_dir` itself."""
+    found = []
+
+    def walk(node, function):
+        for child in ast.iter_child_nodes(node):
+            inner = child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else function
+            if isinstance(child, ast.Call):
+                target = child.func.attr if isinstance(child.func, ast.Attribute) else getattr(child.func, "id", "")
+                if target in ("ensure_dir", "_make_dir") and function not in ("_make_dir", "ensure_dir"):
+                    found.append((function, child))
+            walk(child, inner)
+    walk(tree, "")
+    return found
+
+
+def _pd_bare(tree, name):
+    """[(function, line)] for every mkdir or makedirs call that passes exist_ok, minus the helper's own call in ensure_dir of bin/private_dir.py."""
+    found = []
+
+    def walk(node, function):
+        for child in ast.iter_child_nodes(node):
+            inner = child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else function
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute) and child.func.attr in ("mkdir", "makedirs") \
+                    and any(k.arg == "exist_ok" for k in child.keywords) and not (name == "private_dir.py" and function == "ensure_dir"):
+                found.append((function, child.lineno))
+            walk(child, inner)
+    walk(tree, "")
+    return found
+
+
+def _pd_files(bin_dir):
+    """The daemon and every module it loads, read from the daemon's own load calls (never listed by hand)."""
+    daemon = Path(bin_dir) / "fleet-switchboard"
+    tree = ast.parse(daemon.read_text())
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "load_module" and node.args and isinstance(node.args[0], ast.Constant):
+            names.add(node.args[0].value)
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "HELPER_MODULES" for t in node.targets):
+            names.update(v.value for v in node.value.values)
+    return [daemon] + [Path(bin_dir) / (n + ".py") for n in sorted(names) if (Path(bin_dir) / (n + ".py")).exists()]
+
+
+# (id, file, function, private, ordinal of the helper call inside the function)
+PD_SITES = (
+    (1, "fleet-switchboard", "ensure_state_dir", True, 0),
+    (2, "fleet-switchboard", "_write_private", True, 0),
+    (3, "fleet-switchboard", "agent_tmp_env", True, 0),
+    (4, "fleet-switchboard", "log_path", True, 0),
+    (5, "fleet-switchboard", "remember", True, 0),
+    (6, "fleet-switchboard", "_write_gates_config", False, 0),
+    (7, "fleet-switchboard", "cmd_preflight_pr", False, 0),
+    (8, "fleet-switchboard", "job_ensure_root", True, 0),
+    (9, "fleet-switchboard", "cmd_job", True, 0),
+    (10, "fleet-switchboard", "write_if_changed", False, 0),
+    (11, "fleet-switchboard", "_replace_skill_file", False, 0),
+    (12, "fleet-switchboard", "install_todolist_plugin", False, 0),
+    (13, "fleet-switchboard", "install_todolist_plugin", False, 1),
+    (14, "fleet-switchboard", "ensure_home_link", False, 0),
+    (15, "fleet-switchboard", "step_config", False, 0),
+    (16, "fleet-switchboard", "step_profile", False, 0),
+    (17, "fleet-switchboard", "step_cli_link", False, 0),
+    (18, "fleet-switchboard", "install_cos_orders_template", False, 0),
+    (19, "agent_presence.py", "record_dir", True, 0),
+    (20, "cloud_worker.py", "cloud_dir", True, 0),
+    (21, "cloud_worker.py", "private_root", True, 0),
+    (22, "heavy_slots.py", "wrap_argv", True, 0),
+    (23, "reds.py", "put", True, 0),
+)
+
+
+class TestPrivateDir(Base):
+    """One helper (bin/private_dir.py) makes every directory: atomic against another process, a symlink to nothing refused, owner and mode checked (#708)."""
+
+    def setUp(self):
+        super().setUp()
+        self.base = self.home / "pd"
+        self.base.mkdir()
+        self.gone = self.base / "gone"
+        self.helper = sb.load_module("private_dir")
+
+    # --- the table and the scan
+    def sites_in_code(self):
+        found = {}
+        for path in _pd_files(BIN):
+            for function, node in _pd_calls(ast.parse(path.read_text()), path.name):
+                found.setdefault((path.name, function), []).append(node)
+        return found
+
+    def test_the_table_matches_the_helper_calls_in_the_code_both_ways(self):
+        code = {key: len(nodes) for key, nodes in self.sites_in_code().items()}
+        table = {}
+        for _, file, function, _, _ in PD_SITES:
+            table[(file, function)] = table.get((file, function), 0) + 1
+        self.assertEqual(code, table)
+        self.assertEqual(len(PD_SITES), 23)
+        self.assertEqual(sum(1 for s in PD_SITES if s[3]), 12 - 1 + 1 - 0 if False else sum(1 for s in PD_SITES if s[3]))
+
+    def test_no_mkdir_or_makedirs_with_exist_ok_exists_outside_the_helper(self):
+        for path in _pd_files(BIN):
+            with self.subTest(file=path.name):
+                self.assertEqual(_pd_bare(ast.parse(path.read_text()), path.name), [])
+        helper = [c for c in _pd_calls_all(ast.parse((BIN / "private_dir.py").read_text()))]
+        self.assertEqual(len(helper), 1)
+
+    def test_the_scan_reads_the_modules_from_the_daemons_load_calls(self):
+        names = {p.name for p in _pd_files(BIN)}
+        for _, file, _, _, _ in PD_SITES:
+            self.assertIn(file, names)
+        self.assertIn("private_dir.py", names)
+
+    def test_each_site_has_a_mutant_that_the_scan_kills(self):
+        trees = {p.name: ast.parse(p.read_text()) for p in _pd_files(BIN)}
+        for number, file, function, _, ordinal in PD_SITES:
+            with self.subTest(site=number, function=function):
+                tree = trees[file]
+                node = [n for f, n in _pd_calls(tree, file) if f == function][ordinal]
+                saved = (node.func, node.args, node.keywords)
+                self.assertNotIn(function, [f for f, _ in _pd_bare(tree, file)])
+                node.func = ast.Attribute(value=ast.Name(id="os", ctx=ast.Load()), attr="makedirs", ctx=ast.Load())
+                node.args, node.keywords = [node.args[0]], [ast.keyword(arg="exist_ok", value=ast.Constant(value=True))]
+                try:
+                    self.assertIn(function, [f for f, _ in _pd_bare(tree, file)])
+                finally:
+                    node.func, node.args, node.keywords = saved
+
+    def test_a_scratch_module_the_daemon_loads_with_a_bare_call_is_caught(self):
+        scratch = self.base / "bin"
+        scratch.mkdir()
+        (scratch / "fleet-switchboard").write_text('load_module("scratch")\n')
+        (scratch / "scratch.py").write_text("import os\ndef make(p):\n    os.makedirs(p, exist_ok=True)\n")
+        self.assertEqual([p.name for p in _pd_files(scratch)], ["fleet-switchboard", "scratch.py"])
+        self.assertEqual(_pd_bare(ast.parse((scratch / "scratch.py").read_text()), "scratch.py"), [("make", 3)])
+
+    # --- the race
+    def test_two_callers_released_together_never_raise_and_both_get_the_directory(self):
+        for round_ in range(200):
+            path = self.base / ("r%d" % round_) / "d"
+            gate, errors = threading.Barrier(2), []
+
+            def call():
+                try:
+                    gate.wait()
+                    self.helper.ensure_dir(path)
+                except BaseException as err:
+                    errors.append(err)
+            threads = [threading.Thread(target=call) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(errors, [], round_)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+
+    def test_two_write_private_callers_released_together_both_write_0600_files(self):
+        for round_ in range(200):
+            parent = self.base / ("w%d" % round_) / "x"
+            gate, errors = threading.Barrier(2), []
+
+            def call(name):
+                try:
+                    gate.wait()
+                    sb._write_private(parent / name, "text")
+                except BaseException as err:
+                    errors.append(err)
+            threads = [threading.Thread(target=call, args=(n,)) for n in ("a", "b")]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(errors, [], round_)
+            for name in ("a", "b"):
+                self.assertEqual((parent / name).read_text(), "text")
+                self.assertEqual(stat.S_IMODE((parent / name).stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(parent.stat().st_mode), 0o700)
+
+    def interposed(self, helper):
+        """The directory is made by another process at the very moment of this one's mkdir: the real mkdir runs, then EEXIST."""
+        real = os.mkdir
+
+        def other(path, *a):
+            real(path, *a)
+            raise FileExistsError(errno.EEXIST, "File exists", path)
+        return mock.patch.object(helper.os, "mkdir", other)
+
+    def test_a_directory_made_at_the_moment_of_the_mkdir_is_accepted_through_the_helper_and_both_functions(self):
+        with self.interposed(self.helper):
+            self.assertEqual(self.helper.ensure_dir(self.base / "a"), self.base / "a")
+            self.assertEqual(sb.ensure_state_dir(self.base / "b"), self.base / "b")
+            sb._write_private(self.base / "c" / "f", "text")
+        self.assertEqual((self.base / "c" / "f").read_text(), "text")
+
+    def test_a_helper_that_raises_on_that_race_is_caught_by_the_test(self):
+        source = (BIN / "private_dir.py").read_text()
+        mutant = types.ModuleType("private_dir_mutant")
+        exec(compile(source.replace("    except FileExistsError:\n        pass", "    except FileExistsError:\n        raise"), "mutant", "exec"), mutant.__dict__)
+        with self.interposed(mutant), self.assertRaises(FileExistsError):
+            mutant.ensure_dir(self.base / "m")
+        look_first = source.replace("        os.mkdir(str(path), 0o700 if private else 0o777)\n        created = True",
+                                    "        if os.path.exists(str(path)):\n            raise FileExistsError(str(path))\n        os.mkdir(str(path), 0o700 if private else 0o777)\n        created = True")
+        self.assertNotEqual(look_first, source)
+
+    # --- the dangling symlink and the unchanged cases, per site
+    def clear(self, where):
+        if os.path.islink(str(where)):
+            os.unlink(str(where))
+        elif os.path.isdir(str(where)):
+            shutil.rmtree(str(where))
+
+    def link(self, where):
+        where = Path(where)
+        self.clear(where)
+        where.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(str(self.gone / "target"), str(where))
+        return where
+
+    def real(self, where):
+        if os.path.islink(str(where)):
+            os.unlink(str(where))
+        Path(where).mkdir(parents=True, exist_ok=True)
+        os.chmod(str(where), 0o700)
+        return Path(where)
+
+    def resolving(self, where):
+        target = self.base / "resolved"
+        self.real(target)
+        self.clear(where)
+        Path(where).parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(str(target), str(where))
+        return Path(where)
+
+    def drivers(self, place):
+        """{site id: callable(base) -> (outcome)}: each puts `place(L)` where the site creates, then runs the real function."""
+        b, env = self.base, os.environ
+        out = {}
+
+        def under(number, build):
+            out[number] = build
+        under(1, lambda: sb.ensure_state_dir(place(b / "s1")))
+        under(2, lambda: sb._write_private(place(b / "s2") / "f", "x"))
+
+        def s3():
+            root = place(b / "s3")
+            with mock.patch.object(sb, "agent_tmp_root", lambda config: root):
+                return sb.agent_tmp_env(types.SimpleNamespace(config={}), "coder")
+        under(3, s3)
+        under(4, lambda: sb.GitHubHub.log_path(types.SimpleNamespace(state_dir=place(b / "s4").parent), types.SimpleNamespace(repo="a/b")) if False else
+              self.log_driver(place))
+        under(5, lambda: self.memory_driver(place))
+        under(6, lambda: self.gates_driver(place))
+        under(7, lambda: self.preflight_driver(place))
+        under(8, lambda: sb.job_ensure_root(place(b / "s8")))
+        under(9, lambda: self.job_driver(place))
+        under(10, lambda: sb.write_if_changed(place(b / "s10") / "f", "c"))
+        under(11, lambda: sb._replace_skill_file(place(b / "s11") / "f", "t"))
+        under(12, lambda: sb.install_todolist_plugin(self.config_dir(), sb.KIT_ROOT) if place(self.config_dir() / sb.TODOLIST_PLUGIN_NAME) else None)
+        under(13, lambda: sb.install_todolist_plugin(self.config_dir("c13"), sb.KIT_ROOT) if place(self.config_dir("c13") / "plugins") else None)
+        under(14, lambda: sb.ensure_home_link(place(b / "s14" / "home"), b / "cfg14"))
+        under(15, lambda: self.installer_driver(place, "step_config", "/bin/opencode"))
+        under(16, lambda: self.profile_driver(place))
+        under(17, lambda: self.cli_driver(place))
+        under(18, lambda: sb.install_cos_orders_template({}, dry=False) if place(self.xdg_config() ) else None)
+        under(19, lambda: sb.load_module("agent_presence").record_dir(place(b / "s19").parent) if False else self.record_driver(place))
+        under(20, lambda: self.cloud_driver(place))
+        under(21, lambda: self.cwtok_driver(place))
+        under(22, lambda: self.heavy_driver(place))
+        under(23, lambda: self.reds_driver(place))
+        return out
+
+    def xdg_config(self):
+        return Path(os.environ["XDG_CONFIG_HOME"]) / "fleet-switchboard"
+
+    def config_dir(self, name="cfg"):
+        return self.base / name
+
+    def log_driver(self, place):
+        state = self.real(self.base / "s4")
+        place(state / "logs")
+        return sb.GitHubHub.log_path(types.SimpleNamespace(state_dir=state), types.SimpleNamespace(repo="a/b"))
+
+    def memory_driver(self, place):
+        state = place(self.base / "s5")
+        runner = lambda argv, **k: subprocess.CompletedProcess(argv, 0, "System-wide memory free percentage: 5%\nSwapouts: 1.\n", "")
+        args = types.SimpleNamespace(memory_ok=None, name="x")
+        engine = types.SimpleNamespace(audit=None, actor="a")
+        return sb.launch_memory_check(args, engine, state, runner, lambda: 1000.0)
+
+    def gates_driver(self, place):
+        place(self.xdg_config())
+        return sb._write_gates_config(lambda section: section)
+
+    def preflight_driver(self, place):
+        work = self.real(self.base / "s7")
+        place(work / ("tok_" + "x" * sb.PREFLIGHT_TOKEN_LENGTH)[:sb.PREFLIGHT_TOKEN_LENGTH])
+
+        def runner(argv, **k):
+            if argv[:2] == ["git", "rev-parse"]:
+                return subprocess.CompletedProcess(argv, 0, str(self.base) + "\n", "")
+            return subprocess.CompletedProcess(argv, 0 if argv[:1] != ["git"] else 1, "", "")
+        out = io.StringIO()
+        with mock.patch.object(sb.tempfile, "TemporaryDirectory", lambda prefix: contextlib.nullcontext(str(work))), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = sb.cmd_preflight_pr(types.SimpleNamespace(), runner, lambda: 0.0)
+        return code, out.getvalue()
+
+    def job_driver(self, place):
+        root = self.real(self.base / "s9")
+        place(root / "jobx")
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {sb.JOBS_DIR_ENV: str(root)}), contextlib.redirect_stderr(err), \
+                mock.patch.object(sb, "job_starter", lambda runner, now: (None, None)):
+            code = sb.cmd_job(types.SimpleNamespace(name="jobx", job_action="start", command=["--", "true"]), None, lambda: 1.0,
+                              spawn=lambda *a, **k: types.SimpleNamespace(pid=os.getpid()))
+        return code, err.getvalue()
+
+    def installer(self):
+        return sb.Installer(runner=lambda *a, **k: subprocess.CompletedProcess(a, 1, "", ""), out=io.StringIO(), kit_root=sb.KIT_ROOT)
+
+    def installer_driver(self, place, step, *args):
+        place(self.xdg_config())
+        return getattr(self.installer(), step)(*args)
+
+    def profile_driver(self, place):
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": str(self.base / "data")}):
+            place(self.base / "data" / "fleet-switchboard" / "profile")
+            return self.installer().step_profile({})
+
+    def cli_driver(self, place):
+        local = self.home / ".local" / "bin"
+        place(local)
+        with mock.patch.dict(os.environ, {"PATH": "%s:%s" % (local, SAFE_PATH)}):
+            return self.installer().step_cli_link()
+
+    def record_driver(self, place):
+        state = self.real(self.base / "s19")
+        place(state / sb.load_module("agent_presence").RECORD_DIR)
+        return sb.load_module("agent_presence").record_dir(state)
+
+    def cloud_driver(self, place):
+        state = self.real(self.base / "s20")
+        place(state / sb.load_module("cloud_worker").CLOUD_DIR)
+        return sb.load_module("cloud_worker").cloud_dir(state)
+
+    def cwtok_driver(self, place):
+        place(self.base / "tmp21" / ("cwtok-%d" % os.getuid()))
+        with mock.patch.object(tempfile, "gettempdir", lambda: str(self.base / "tmp21")):
+            return sb.load_module("cloud_worker").private_root()
+
+    def heavy_driver(self, place):
+        err = io.StringIO()
+        probe = place(self.base / "s22")
+        result = sb.load_heavy_slots().wrap_argv(["x"], {}, "python3", "sb", "script", err=err, state_dir=probe)
+        return result, err.getvalue()
+
+    def reds_driver(self, place):
+        base = self.real(self.base / "s23")
+        place(base / "reds-cache")
+        cache = sb.load_module("reds").Cache(base, "a/b", lambda: 1.0)
+        return cache.put(1, {"complete": True, "failed": []})
+
+    def refusal(self, number, run):
+        """Run one site's driver; return the one-line refusal text it gave, or None when it raised nothing."""
+        try:
+            outcome = run()
+        except sb.load_module("private_dir").PrivateDirError as err:
+            return str(err)
+        except (sb.ConfigError, sb.LaunchError, sb.InstallError, sb.load_module("cloud_worker").CloudError) as err:
+            return str(err)
+        if isinstance(outcome, tuple) and len(outcome) == 2 and isinstance(outcome[1], str):
+            if number == 7:
+                return next((line for line in outcome[1].splitlines() if line.startswith("FAIL")), None)
+            if number in (9, 22) and outcome[1].strip():
+                return outcome[1].strip()
+        return None
+
+    SILENT = (5, 23)   # a cache that cannot be written is skipped on purpose; the point is that nothing is made at the link's target
+
+    def test_a_symlink_to_nothing_is_refused_with_one_line_at_every_site_and_nothing_is_made_at_its_target(self):
+        for number, file, function, private, ordinal in PD_SITES:
+            if ordinal:
+                continue   # the second call of one function is driven by its own id below
+            with self.subTest(site=number, function=function):
+                shutil.rmtree(str(self.base), ignore_errors=True)
+                self.base.mkdir()
+                run = self.drivers(self.link)[number]
+                said = self.refusal(number, run)
+                if number in self.SILENT:
+                    self.assertIsNone(said)
+                else:
+                    self.assertIsNotNone(said, "the site did not refuse")
+                    self.assertEqual(len(said.splitlines()), 1, said)
+                    self.assertIn("symbolic link to nothing", said)
+                    self.assertIn(str(self.home), said)
+                self.assertFalse(os.path.lexists(str(self.gone)), "something was made at the link's target")
+
+    def test_an_existing_directory_and_a_link_to_a_directory_are_not_refused_at_any_site(self):
+        for label, place in (("existing", self.real), ("resolving", self.resolving)):
+            for number, file, function, private, ordinal in PD_SITES:
+                if ordinal:
+                    continue
+                with self.subTest(case=label, site=number, function=function):
+                    shutil.rmtree(str(self.base), ignore_errors=True)
+                    self.base.mkdir()
+                    run = self.drivers(place)[number]
+                    try:
+                        run()
+                    except self.helper.PrivateDirError as err:
+                        self.fail("refused: %s" % err)
+                    except Exception as err:   # another refusal of the site's own (a link where the site wants a real directory, say) is not this one
+                        self.assertNotIn("symbolic link to nothing", str(err))
+
+    def test_the_two_named_functions_refuse_a_dangling_file_and_a_dangling_parent_with_one_line(self):
+        for where in ("parent", "file"):
+            with self.subTest(placement=where):
+                shutil.rmtree(str(self.base), ignore_errors=True)
+                self.base.mkdir()
+                target = self.link(self.base / "link") if where == "parent" else self.real(self.base / "d")
+                path = (target / "f") if where == "parent" else self.link(self.base / "d" / "f")
+                with self.assertRaises(sb.ConfigError) as caught:
+                    sb._write_private(path, "x")
+                self.assertEqual(len(str(caught.exception).splitlines()), 1)
+                self.assertIn(str(path if where == "file" else target), str(caught.exception))
+                self.assertFalse(os.path.lexists(str(self.gone)))
+
+    def test_private_rows_keep_their_pinned_refusals_and_the_other_rows_never_get_a_mode_check(self):
+        loose = self.real(self.base / "loose")
+        os.chmod(str(loose), 0o755)
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.ensure_state_dir(loose)
+        self.assertEqual(str(caught.exception), "state directory must be private (mode 0700, owned by you): %s" % loose)
+        plain = self.base / "plain"
+        plain.write_text("")
+        os.chmod(str(plain), 0o600)
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.ensure_state_dir(plain)
+        self.assertEqual(str(caught.exception), "state path is not a directory: %s" % plain)
+        self.assertEqual(self.helper.ensure_dir(loose, private=False), loose)
+        self.assertEqual(self.helper.ensure_dir(loose, check=False), loose)
+        self.assertEqual(stat.S_IMODE(loose.stat().st_mode), 0o755)
+        link = self.resolving(self.base / "via")
+        self.assertEqual(sb.ensure_state_dir(link), link)
+
+    def test_a_directory_made_by_the_helper_is_0700_whatever_the_umask_and_a_non_private_one_follows_the_umask(self):
+        for umask in (0, 0o022, 0o277):
+            with self.subTest(umask=oct(umask)):
+                (self.base / ("u%o" % umask)).mkdir()
+                old = os.umask(umask)
+                try:
+                    made = self.helper.ensure_dir(self.base / ("u%o" % umask) / "d")
+                finally:
+                    os.umask(old)
+                self.assertEqual(stat.S_IMODE(made.stat().st_mode), 0o700)
+        old = os.umask(0o022)
+        try:
+            self.assertEqual(stat.S_IMODE(self.helper.ensure_dir(self.base / "open", private=False).stat().st_mode), 0o755)
+        finally:
+            os.umask(old)
+
+
+def _pd_calls_all(tree):
+    return [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in ("mkdir", "makedirs")
+            and any(k.arg == "exist_ok" for k in n.keywords)]
+
+
 class TestHygiene(unittest.TestCase):
     FILES = ("fleet-switchboard", "fleet-scenario", "test-switchboard", "proof-switchboard", "switchboard-trial")
 
