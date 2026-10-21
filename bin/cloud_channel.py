@@ -8,15 +8,20 @@ everything that touches the outside, so the rules here can be driven by fakes.
     reviewer  reviewer(token, audience) -> a TokenReview status dict: {"authenticated": bool, "audiences": [...],
               "user": {"username": "system:serviceaccount:<namespace>:<name>"}}. The real one posts a TokenReview to
               the cluster; a token that expired fails there (authenticated false).
-    inbox     inbox.has(recipient, key) -> bool;  inbox.put(recipient, item)
-    audit     audit(line): one string per refusal; it never holds a token.
+    inbox     inbox.put_if_absent(recipient, dedupe_key, item) -> bool: ONE atomic step that stores the item unless the
+              recipient already holds that dedupe key, and says whether it stored it. A has-then-put pair would let two
+              concurrent requests with one key both deliver, so the inbox (not this module) owns the atomicity.
+    audit     audit(line): one string per refusal or delivery; it never holds a token.
 
 Rules:
     - The sender is the agent the token proves (the ServiceAccount's name), never the name in the body. A body that
       names another sender is refused with 403 and one audit line.
     - A token that is missing, expired, not authenticated or not issued for this audience is refused with 401.
+    - The ServiceAccount must be in the pinned namespace (default `fleet-agents`); a same-named account elsewhere is
+      refused, and so is every call when the namespace is empty (fail closed).
     - A key already in the recipient's inbox is not delivered again (the same shape as the daemon's delivery dedupe:
-      a key found in the inbox is never delivered twice); the repeat answers 200 with "duplicate": true.
+      a key found in the inbox is never delivered twice); the repeat answers 200 with "duplicate": true. The key is
+      scoped to the verified sender, so one agent cannot suppress another's message by using its key.
     - A failing reviewer refuses (503): nothing is let through when the token cannot be checked.
 """
 import re
@@ -24,6 +29,8 @@ import re
 AUDIENCE = "fleet-switchboard"
 SERVICE_ACCOUNT_PREFIX = "system:serviceaccount:"
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+NAMESPACE = "fleet-agents"
+MAX_TOKEN = 4096
 MAX_KEY = 200
 MAX_TEXT = 20000
 BEARER = "Bearer "
@@ -44,7 +51,7 @@ def _clean(value):
     return re.sub(r"[^\w.:@/-]", "?", str(value))[:80]
 
 
-def agent_of(user, namespace=None):
+def agent_of(user, namespace):
     """The agent name a ServiceAccount username proves, or None."""
     if not isinstance(user, dict) or not isinstance(user.get("username"), str):
         return None
@@ -52,21 +59,23 @@ def agent_of(user, namespace=None):
     if not username.startswith(SERVICE_ACCOUNT_PREFIX):
         return None
     parts = username[len(SERVICE_ACCOUNT_PREFIX):].split(":")
-    if len(parts) != 2 or (namespace is not None and parts[0] != namespace) or not NAME.match(parts[1]):
+    if len(parts) != 2 or not namespace or parts[0] != namespace or not NAME.match(parts[1]):
         return None
     return parts[1]
 
 
-def handle(request, reviewer, inbox, audit, audience=AUDIENCE, namespace=None):
+def handle(request, reviewer, inbox, audit, audience=AUDIENCE, namespace=NAMESPACE):
     """Verify the token, hold the claimed sender to it, deliver the keyed message once. Returns {"status": N, ...}."""
     header = request.get("authorization") if isinstance(request, dict) else None
     token = header[len(BEARER):].strip() if isinstance(header, str) and header.startswith(BEARER) else ""
     if not token:
         return _refuse(audit, 401, "no token")
+    if len(token) > MAX_TOKEN:
+        return _refuse(audit, 401, "token too long")
     try:
         review = reviewer(token, audience)
-    except Exception:   # the cluster cannot be asked: closed, not open
-        return _refuse(audit, 503, "token review unavailable")
+    except Exception as err:   # the cluster cannot be asked: closed, not open
+        return _refuse(audit, 503, "token review unavailable", error=type(err).__name__)
     review = review if isinstance(review, dict) else {}
     if review.get("authenticated") is not True:
         return _refuse(audit, 401, "token not authenticated")
@@ -78,18 +87,19 @@ def handle(request, reviewer, inbox, audit, audience=AUDIENCE, namespace=None):
         return _refuse(audit, 401, "token is not an agent's")
     body = request.get("body")
     if not isinstance(body, dict):
-        return _reply(400, error="no body")
+        return _refuse(audit, 400, "no body")
     sender = body.get("sender")
     if sender != agent:
         return _refuse(audit, 403, "sender does not match token", token_agent=agent, claimed=sender)
     recipient, key, text = body.get("recipient"), body.get("key"), body.get("text")
     if not isinstance(recipient, str) or not NAME.match(recipient):
-        return _reply(400, error="bad recipient")
+        return _refuse(audit, 400, "bad recipient")
     if not isinstance(key, str) or not key or len(key) > MAX_KEY:
-        return _reply(400, error="bad key")
+        return _refuse(audit, 400, "bad key")
     if not isinstance(text, str) or len(text) > MAX_TEXT:
-        return _reply(400, error="bad text")
-    if inbox.has(recipient, key):
+        return _refuse(audit, 400, "bad text")
+    item = {"key": key, "sender": agent, "text": text}
+    if not inbox.put_if_absent(recipient, "%s/%s" % (agent, key), item):
         return _reply(200, delivered=False, duplicate=True)
-    inbox.put(recipient, {"key": key, "sender": agent, "text": text})
+    audit("delivered sender=%s recipient=%s key=%s" % (agent, recipient, _clean(key)))
     return _reply(200, delivered=True, duplicate=False)

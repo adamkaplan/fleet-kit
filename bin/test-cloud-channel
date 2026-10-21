@@ -30,11 +30,11 @@ class FakeInbox:
     def __init__(self):
         self.items = {}
 
-    def has(self, recipient, key):
-        return any(i["key"] == key for i in self.items.get(recipient, []))
-
-    def put(self, recipient, item):
-        self.items.setdefault(recipient, []).append(item)
+    def put_if_absent(self, recipient, dedupe_key, item):
+        if any(i["dedupe"] == dedupe_key for i in self.items.get(recipient, [])):
+            return False
+        self.items.setdefault(recipient, []).append(dict(item, dedupe=dedupe_key))
+        return True
 
     def count(self, recipient, key):
         return sum(1 for i in self.items.get(recipient, []) if i["key"] == key)
@@ -49,14 +49,18 @@ def reviewer_for(table):
 
 def ok(agent, audiences=("fleet-switchboard",)):
     return {"authenticated": True, "audiences": list(audiences),
-            "user": {"username": "system:serviceaccount:fleet:%s" % agent}}
+            "user": {"username": "system:serviceaccount:fleet-agents:%s" % agent}}
 
 
 TABLE = {
     "tok-a": ok("agent-a"),
     "tok-wrong-aud": ok("agent-a", ("https://kubernetes.default.svc",)),
-    "tok-no-aud": {"authenticated": True, "user": {"username": "system:serviceaccount:fleet:agent-a"}},
+    "tok-no-aud": {"authenticated": True, "user": {"username": "system:serviceaccount:fleet-agents:agent-a"}},
     "tok-user": {"authenticated": True, "audiences": ["fleet-switchboard"], "user": {"username": "alice"}},
+    "tok-c": ok("agent-c"),
+    "tok-foreign-ns": {"authenticated": True, "audiences": ["fleet-switchboard"], "user": {"username": "system:serviceaccount:other:agent-a"}},
+    "tok-extra-colon": {"authenticated": True, "audiences": ["fleet-switchboard"], "user": {"username": "system:serviceaccount:fleet-agents:agent-a:x"}},
+    "tok-str-true": {"authenticated": "true", "audiences": ["fleet-switchboard"], "user": {"username": "system:serviceaccount:fleet-agents:agent-a"}},
     # "tok-expired" is absent: the cluster answers authenticated false
 }
 
@@ -88,6 +92,46 @@ def check_one_item_for_a_repeated_key(module, test):
     test.assertEqual(inbox.count("agent-b", "k1"), 1)
 
 
+def check_namespace_is_pinned(module, test):
+    for token in ("tok-foreign-ns", "tok-extra-colon"):
+        answer, inbox, _ = run(module, request(token=token))
+        test.assertEqual(answer["status"], 401, token)
+        test.assertEqual(inbox.items, {}, token)
+    inbox = FakeInbox()
+    answer = module.handle(request(), reviewer_for(TABLE), inbox, lambda line: None, namespace=None)
+    test.assertEqual(answer["status"], 401)
+
+
+def check_authenticated_must_be_true(module, test):
+    answer, inbox, _ = run(module, request(token="tok-str-true"))
+    test.assertEqual(answer["status"], 401)
+    test.assertEqual(inbox.items, {})
+
+
+def check_fails_closed(module, test):
+    def broken(token, audience):
+        raise OSError("cluster down")
+    inbox, lines = FakeInbox(), []
+    answer = module.handle(request(), broken, inbox, lines.append)
+    test.assertEqual(answer["status"], 503)
+    test.assertEqual((inbox.items, len(lines)), ({}, 1))
+    test.assertIn("OSError", lines[0])
+
+
+def check_dedupe_is_per_sender(module, test):
+    inbox = FakeInbox()
+    for token, sender in (("tok-a", "agent-a"), ("tok-c", "agent-c")):
+        answer = module.handle(request(token=token, sender=sender), reviewer_for(TABLE), inbox, lambda line: None)
+        test.assertEqual(answer["delivered"], True, sender)
+    test.assertEqual(inbox.count("agent-b", "k1"), 2)
+
+
+def check_token_is_capped(module, test):
+    seen = []
+    answer = module.handle(request(token="t" * 5000), lambda t, a: seen.append(t) or ok("agent-a"), FakeInbox(), lambda line: None)
+    test.assertEqual((answer["status"], seen), (401, []))
+
+
 def check_audience_is_checked(module, test):
     for token in ("tok-wrong-aud", "tok-no-aud"):
         answer, inbox, lines = run(module, request(token=token))
@@ -105,6 +149,23 @@ class TestChannel(unittest.TestCase):
         self.assertIn("agent-c", lines[0])
         self.assertNotIn("tok-a", lines[0])
 
+    def test_a_same_name_account_in_another_namespace_and_an_empty_pin_are_refused(self):
+        check_namespace_is_pinned(load(), self)
+
+    def test_authenticated_must_be_exactly_true(self):
+        check_authenticated_must_be_true(load(), self)
+
+    def test_two_senders_using_one_key_are_both_delivered(self):
+        check_dedupe_is_per_sender(load(), self)
+
+    def test_an_oversized_token_never_reaches_the_reviewer(self):
+        check_token_is_capped(load(), self)
+
+    def test_a_non_dict_reviewer_answer_and_a_missing_body_are_refused(self):
+        inbox = FakeInbox()
+        self.assertEqual(load().handle(request(), lambda t, a: ["x"], inbox, lambda line: None)["status"], 401)
+        self.assertEqual(load().handle({"authorization": "Bearer tok-a"}, reviewer_for(TABLE), inbox, lambda line: None)["status"], 400)
+
     def test_the_same_keyed_message_twice_leaves_one_item(self):
         check_one_item_for_a_repeated_key(load(), self)
 
@@ -115,7 +176,8 @@ class TestChannel(unittest.TestCase):
         other = load().handle(request(key="k2"), reviewer_for(TABLE), inbox, lines.append)
         self.assertEqual((first["delivered"], again["delivered"], again["duplicate"], other["delivered"]), (True, False, True, True))
         self.assertEqual(inbox.items["agent-b"][0]["sender"], "agent-a")
-        self.assertEqual(lines, [])
+        self.assertEqual(len(lines), 2)   # one line per delivery, none for the duplicate
+        self.assertTrue(all(line.startswith("delivered") for line in lines))
 
     def test_an_expired_token_is_refused(self):
         answer, inbox, lines = run(load(), request(token="tok-expired"))
@@ -131,13 +193,8 @@ class TestChannel(unittest.TestCase):
             self.assertEqual(answer["status"], 401)
             self.assertEqual(inbox.items, {})
 
-    def test_a_reviewer_that_fails_lets_nothing_through(self):
-        def broken(token, audience):
-            raise OSError("cluster down")
-        inbox, lines = FakeInbox(), []
-        answer = load().handle(request(), broken, inbox, lines.append)
-        self.assertEqual(answer["status"], 503)
-        self.assertEqual(inbox.items, {})
+    def test_a_reviewer_that_fails_lets_nothing_through_and_is_audited(self):
+        check_fails_closed(load(), self)
 
     def test_the_audience_is_passed_to_the_reviewer(self):
         seen = []
@@ -145,10 +202,10 @@ class TestChannel(unittest.TestCase):
         self.assertEqual(seen, ["fleet-switchboard"])
 
     def test_a_malformed_body_is_a_400_after_the_identity_checks(self):
-        for bad in (request(recipient="Bad Name"), request(key=""), request(text=5)):
-            answer, inbox, _ = run(load(), bad)
+        for bad in (request(recipient="Bad Name"), request(key=""), request(key="k" * 201), request(text=5), request(text="x" * 20001)):
+            answer, inbox, lines = run(load(), bad)
             self.assertEqual(answer["status"], 400)
-            self.assertEqual(inbox.items, {})
+            self.assertEqual((inbox.items, len(lines)), ({}, 1))
 
     def test_the_module_is_standard_library_only(self):
         import ast
@@ -168,12 +225,32 @@ class TestMutants(unittest.TestCase):
         self.failing(check_sender_is_the_token, module)
 
     def test_a_handler_without_key_dedupe_fails_the_one_item_check(self):
-        module = mutant("    if inbox.has(recipient, key):", "    if False:")
+        module = mutant("    if not inbox.put_if_absent(recipient, \"%s/%s\" % (agent, key), item):", "    if False:")
         self.failing(check_one_item_for_a_repeated_key, module)
 
     def test_a_handler_without_the_audience_check_fails_the_audience_check(self):
         module = mutant("    if not isinstance(audiences, list) or audience not in audiences:", "    if False:")
         self.failing(check_audience_is_checked, module)
+
+    def test_a_handler_that_scopes_the_key_to_the_recipient_only_fails_the_per_sender_check(self):
+        module = mutant('"%s/%s" % (agent, key)', "key")
+        self.failing(check_dedupe_is_per_sender, module)
+
+    def test_a_handler_without_the_namespace_pin_fails_the_namespace_check(self):
+        module = mutant("or not namespace or parts[0] != namespace", "")
+        self.failing(check_namespace_is_pinned, module)
+
+    def test_a_handler_that_accepts_a_truthy_authenticated_fails_the_authenticated_check(self):
+        module = mutant('review.get("authenticated") is not True', 'not review.get("authenticated")')
+        self.failing(check_authenticated_must_be_true, module)
+
+    def test_a_handler_that_lets_a_reviewer_failure_through_fails_the_closed_check(self):
+        module = mutant('return _refuse(audit, 503, "token review unavailable", error=type(err).__name__)', "review = {}")
+        self.failing(check_fails_closed, module)
+
+    def test_a_handler_without_the_token_cap_fails_the_cap_check(self):
+        module = mutant("if len(token) > MAX_TOKEN:", "if False:")
+        self.failing(check_token_is_capped, module)
 
 
 if __name__ == "__main__":
