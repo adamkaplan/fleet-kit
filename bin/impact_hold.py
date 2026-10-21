@@ -268,6 +268,10 @@ def _batch_record(engine, repo, number, report, verdict):
         if (state["clears"].get(pr) or {}).get("head") == head:
             return False
         members = [{"pr": "%s#%d" % (repo, m["number"]), "head": m["head"], "held": m["held"], "cleared_by": m["by"]} for m in verdict["members"]]
+        if verdict["carried"]:   # the members' clears are read again under the lock: one revoked since the verdict was made is not carried
+            gone = [x["pr"] for x in members if x["held"] and (state["clears"].get(x["pr"]) or {}).get("head") != x["head"] and (state.get("carried", {}).get(x["pr"]) or {}).get("head") != x["head"]]
+            if gone:
+                verdict = dict(verdict, carried=False, reason="the clear of %s was taken back or changed while the batch was judged" % ", ".join(gone[:5]))
         if verdict["carried"]:
             state.setdefault("carried", {})[pr] = {"head": head, "route": "batch", "members": members, "at": int(engine.now())}
             state.setdefault("batch_void", {}).pop(pr, None)

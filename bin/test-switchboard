@@ -77218,7 +77218,9 @@ class TestBatchCarry(unittest.TestCase):
                 self.api.fail, self.api.changed_files_override = None, None
                 setup()
                 self.api.forget()
-                verdict = self.decide(held=(11, 12), head=(old if label == "a head that moved" and not self.api.git("commit", "--allow-empty", "-q", "-m", "moves") else None))
+                if label == "a head that moved":
+                    self.api.git("commit", "--allow-empty", "-q", "-m", "moves")
+                verdict = self.decide(held=(11, 12), head=(old if label == "a head that moved" else None))
                 self.assertFalse(verdict["carried"], label)
                 self.assertIsNotNone(verdict["reason"], label)
         with self.subTest("an omitted patch"):
@@ -77381,6 +77383,17 @@ class TestBatchCarryInTheDaemon(Base):
         (held,) = self.events("gate.batch_carry_held")
         self.assertEqual(held["detail"]["head"], self.head)
         self.assertEqual(state["batch_void"][self.PR]["head"], self.head)
+
+    def test_a_member_clear_taken_back_while_the_batch_was_judged_is_not_carried(self):
+        report = self.floor(self.engine, self.REPO, 100)
+        verdict = sb.impact_batch_decision(self.engine, self.REPO, 100, dict(report, rehold=None))
+        self.assertTrue(verdict["carried"])
+        state, _ = sb.read_impact_state(self.world.state)
+        del state["clears"]["%s#11" % self.REPO]   # the owner revokes a member's clear after the verdict
+        sb.write_impact_state(self.world.state, state)
+        self.assertFalse(sb._batch_record(self.engine, self.REPO, 100, report, verdict))
+        self.assertEqual(self.events("gate.batch_carried"), [])
+        self.assertIn("taken back", self.events("gate.batch_carry_held")[0]["detail"]["reason"])
 
     def test_u1_a_pull_request_whose_head_is_not_the_integration_branch_is_not_a_batch(self):
         report = dict(self.floor(self.engine, self.REPO, 100), head_ref="feature", rehold=None)
