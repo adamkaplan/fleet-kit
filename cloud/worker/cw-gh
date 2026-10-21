@@ -165,6 +165,11 @@ def number_of(repo, pos, opts=None):
     return found[0]["number"]
 
 
+def limit_of(opts, default):
+    v = str(opts.get("limit", default))
+    return int(v) if v.isdigit() and int(v) > 0 else default
+
+
 def show(obj, opts):
     print(json.dumps(obj, indent=2, sort_keys=True))
 
@@ -229,7 +234,7 @@ def pr_list(args):
     state = opts.get("state", "open")
     if state not in ("open", "closed", "merged", "all"):
         raise Fail("--state is open, closed, merged or all", 2)
-    limit = int(opts["limit"]) if str(opts.get("limit", "30")).isdigit() else 30
+    limit = limit_of(opts, 30)
     q = {"state": "closed" if state == "merged" else state, "per_page": min(max(limit, 1), 100)}
     if "base" in opts:
         q["base"] = opts["base"]
@@ -337,7 +342,7 @@ def issue_list(args):
     state = opts.get("state", "open")
     if state not in ("open", "closed", "all"):
         raise Fail("--state is open, closed or all", 2)
-    limit = int(opts["limit"]) if str(opts.get("limit", "30")).isdigit() else 30
+    limit = limit_of(opts, 30)
     q = {"state": state, "per_page": 100}
     if "label" in opts:
         q["labels"] = opts["label"]
@@ -354,7 +359,7 @@ def run_list(args):
     if pos:
         raise Fail("run list takes no positional argument", 2)
     repo = repo_of(opts)
-    limit = int(opts["limit"]) if str(opts.get("limit", "20")).isdigit() else 20
+    limit = limit_of(opts, 20)
     q = {"per_page": min(max(limit, 1), 100)}
     for k in ("branch", "status"):
         if k in opts:
