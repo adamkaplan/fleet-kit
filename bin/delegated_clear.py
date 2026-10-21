@@ -157,7 +157,12 @@ def uncounted_line(entries):
     return INCOMPLETE_VERDICT if any(counts_by_block(e) and e.get("verdict") == "incomplete" for e in mine) else NO_AGENT_BLOCK
 
 
-def judge(block, cells, entries, report, threshold):
+RUNS_REQUIRED = 2   # #972: a clear by score rests on this many counted ratings from different sessions at the head; the ONE place the number is written
+TWO_RUN_RULE = ("A clear by score needs two independent impact ratings at the head, from two different rater sessions, each carrying the agent's own block; "
+                "the reason of the clear names both runs, each as `<record id or rater>=<cell>`.")   # #972: stated once in the docs and once in each rater brief, byte for byte
+
+
+def judge(block, cells, entries, report, threshold, runs_required=1):
     """{"level": the score or None, "reasons": [why refused]} (no reasons: the score is at or below `threshold`, so the clear may go on). `block` is the matrix's score block, `cells` its `cells` (severity ->
     probability -> {"level"}), `entries` the ledger's entries (the caller filtered nothing: this checks kind, reviewer, pr, EXACT head and the recorded role again), `report` the owner-hold report (`pr`, `head`,
     `top_tier_hits` {class: [paths]}). The score is the HIGHEST level of the counted records (a later, lower one never lowers it), taken from the matrix cell of the recorded severity and probability, never from
@@ -190,6 +195,7 @@ def judge(block, cells, entries, report, threshold):
             bad += 1
         else:
             counted.append((ladder.index(level), level, entry))
+    counted.sort(key=lambda c: (-c[0], c[2].get("seq") if isinstance(c[2].get("seq"), int) else 0))
     if bad:
         return {"level": None, "reasons": ["a rating at this head has no severity and probability the matrix knows: the score is unknown, refused"]}
     if not counted and unblocked:
@@ -213,7 +219,44 @@ def judge(block, cells, entries, report, threshold):
         reasons.append("the score is %s: %s is the owner's" % (level, level))
     elif ladder.index(level) > ladder.index(threshold):
         reasons.append("the score %s is above the threshold %s" % (level, threshold))
-    return {"level": level, "reasons": reasons}
+    runs = pick_runs(counted)
+    if not reasons and runs_required > 1:   # #972: only a score the order would allow is asked for its corroboration; a score above the threshold is refused by score, not by count
+        sessions = {e.get("by") for _, _, e in counted if isinstance(e.get("by"), str) and e.get("by")}
+        if len(counted) < runs_required:
+            reasons.append("%d counted impact rating%s at %s, %d required: a clear by score needs a second independent run at this head with the agent's block" % (len(counted), "" if len(counted) == 1 else "s", str(report.get("head"))[:8], runs_required))
+        elif len(sessions) < runs_required:
+            reasons.append("%d session found rating at %s (%d counted ratings), %d required: the runs must come from different rater sessions" % (len(sessions), str(report.get("head"))[:8], len(counted), runs_required))
+    return {"level": level, "reasons": reasons, "runs": runs}
+
+
+def pick_runs(counted):
+    """[{"id": ledger seq, "by": the recorded session, "cell": the level}] of the two runs a clear names: the highest counted record, then the highest counted one from a DIFFERENT session. `counted` is sorted highest first. #972."""
+    runs = []
+    for _, level, e in counted:
+        if any(r["by"] == e.get("by") for r in runs) or not isinstance(e.get("by"), str):
+            continue
+        runs.append({"id": e.get("seq"), "by": e.get("by"), "cell": level})
+        if len(runs) == RUNS_REQUIRED:
+            break
+    return runs
+
+
+def reason_problems(reason, runs):
+    """[problems] when `reason` does not name every run in `runs` as `#<id>=<cell>` or `<rater>=<cell>` with the record's own cell. #972."""
+    problems = []
+    for r in runs:
+        names = ["#%s" % r["id"], r["by"]] if r.get("id") is not None else [r["by"]]
+        found = None
+        for n in names:
+            m = re.search(r"(?<![\w#-])%s\s*=\s*([A-Za-z]+)" % re.escape(n), reason or "")
+            if m:
+                found = m
+                break
+        if not found:
+            problems.append("the reason does not name run #%s (%s) with its cell: write `#%s=%s`" % (r["id"], r["by"], r["id"], r["cell"]))
+        elif found.group(1).lower() != str(r["cell"]).lower():
+            problems.append("the reason names run #%s with the wrong cell %s (its cell is %s)" % (r["id"], found.group(1), r["cell"]))
+    return problems
 
 
 def daemon_roots(rule):

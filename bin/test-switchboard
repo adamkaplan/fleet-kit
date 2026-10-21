@@ -36748,9 +36748,9 @@ class TestImpactHold(LedgerBase):
         for name in (sb.plan_ledger.LEDGER_FILE, sb.plan_ledger.HEAD_FILE):
             self.world.state.joinpath(name).unlink(missing_ok=True)
 
-    def rate(self, severity, probability, reason="", role="reviewer", head=LEDGER_HEAD, pr="acme/app#9", action="auto", with_block=True):
+    def rate(self, severity, probability, reason="", role="reviewer", head=LEDGER_HEAD, pr="acme/app#9", action="auto", with_block=True, by="rev"):
         """Record a rating. `action` "auto" is the action of the cell (a helper that only emits VALID shapes: it hides a bad state, so every bad-shape test passes an explicit action or builds the raw record), None omits it."""
-        entry = {"kind": "review_record", "pr": pr, "head": head, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": role,
+        entry = {"kind": "review_record", "pr": pr, "head": head, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": by, "by_role": role,
                  "impact_severity": severity, "impact_probability": probability, "impact_reason": reason}
         if with_block:   # #901: the rating carries the agent's block (its hash and its own rating lines), as `review record --block` keeps them
             entry.update(block_sha256="a" * 64, block_size=200, block_impact_severity=severity, block_impact_probability=probability)
@@ -36838,6 +36838,141 @@ class TestImpactHold(LedgerBase):
         code, out, err = self.under()
         self.assertEqual(code, 2)
         self.assertIn("above the threshold Medium", err)
+
+    # ---- #972: a clear by score rests on two independent runs at the head
+
+    def two(self, a, b, by=("rev", "rev2"), blocks=(True, True), heads=(LEDGER_HEAD, LEDGER_HEAD)):
+        """Two ratings (levels `a`, `b`); returns the reason naming both runs by ledger id and cell."""
+        ids = [self.rate(*self.cell_of(level), by=who, with_block=blk, head=h)["seq"] for level, who, blk, h in zip((a, b), by, blocks, heads)]
+        return "both runs agree on it: #%d=%s, #%d=%s" % (ids[0], a, ids[1], b)
+
+    def refused(self, code, err, *words):
+        self.assertEqual(code, 2, err)
+        self.assertEqual((self.deletes(), self.events("gate.hold_cleared")), ([], []))
+        self.assertEqual(len(self.events("gate.hold_clear_refused")), 1)
+        for w in words:
+            self.assertIn(w, err)
+
+    def test_972_one_counted_run_is_refused_naming_the_count(self):
+        self.score_config("Serious")
+        self.scored_pr()
+        self.rate(*self.cell_of("Low"))
+        code, out, err = self.under(reason="the one run says it is low: #1=Low")
+        self.refused(code, err, "1 counted", "2 required", LEDGER_HEAD[:8])
+
+    def test_972_two_runs_from_one_session_are_refused(self):
+        self.score_config("Serious")
+        self.scored_pr()
+        reason = self.two("Low", "Low", by=("rev", "rev"))
+        code, out, err = self.under(reason=reason)
+        self.refused(code, err, "1 session", "2 required")
+
+    def test_972_a_record_without_a_block_is_not_counted(self):
+        self.score_config("Serious")
+        self.scored_pr()
+        reason = self.two("Low", "Low", blocks=(True, False))
+        code, out, err = self.under(reason=reason)
+        self.refused(code, err, "1 counted")
+
+    def test_972_a_run_at_another_head_is_not_counted(self):
+        self.score_config("Serious")
+        self.scored_pr()
+        reason = self.two("Low", "Low", heads=(LEDGER_HEAD, LEDGER_NEW_HEAD))
+        code, out, err = self.under(reason=reason)
+        self.refused(code, err, "1 counted", LEDGER_HEAD[:8])
+
+    def test_972_the_higher_run_is_the_score_in_both_orders_and_the_lower_never_blocks(self):
+        module = sb.load_module("delegated_clear")
+        for order in (("Serious", "Medium"), ("Medium", "Serious")):
+            with self.subTest(order=order):
+                self.writes.clear()
+                self.score_config("Serious")
+                self.scored_pr()
+                reason = self.two(*order)
+                code, out, err = self.under(reason=reason)
+                self.assertEqual(code, 0, err)
+                cleared = self.events("gate.hold_cleared")[-1]
+                self.assertEqual((cleared["detail"]["score"], cleared["detail"]["threshold"]), ("Serious", "Serious"))
+                self.assertEqual(sorted(r["cell"] for r in cleared["detail"]["runs"]), sorted(order))
+                self.assertEqual(len(cleared["detail"]["runs"]), 2)
+                self.assertEqual(sorted(r["id"] for r in cleared["detail"]["runs"]), [int(x) for x in sorted(__import__("re").findall(r"#(\d+)=", reason))])
+                self.ledger_reset()
+
+    def test_972_two_runs_above_the_threshold_are_refused_by_score_not_by_count(self):
+        for levels, threshold, words in ((("High", "High"), "Serious", "the score is High"), (("High", "Low"), "Serious", "the score is High"), (("Medium", "Medium"), "Low", "above the threshold")):
+            with self.subTest(levels=levels):
+                self.writes.clear()
+                self.score_config(threshold)
+                self.scored_pr()
+                reason = self.two(*levels)
+                code, out, err = self.under(reason=reason)
+                self.assertEqual(code, 2, err)
+                self.assertIn(words, err)
+                self.assertNotIn("required", err)
+                self.assertEqual(self.deletes(), [])
+                self.ledger_reset()
+
+    def test_972_the_reason_must_name_both_runs_with_their_own_cells(self):
+        self.score_config("Serious")
+        self.scored_pr()
+        self.two("Medium", "Low")
+        for reason, words in (("only the first run is named: #1=Medium", "#2"), ("both named: #1=Medium, #2=Serious", "wrong cell"), ("names the runs but no cell: #1 and #2", "its cell"),
+                              ("by rater only: rev=Medium", "#2")):
+            code, out, err = self.under(reason=reason)
+            self.assertEqual(code, 2, err)
+            self.assertIn(words, err)
+            self.assertEqual(self.deletes(), [], reason)
+        code, out, err = self.under(reason="by rater names: rev=Medium, rev2=Low")
+        self.assertEqual(code, 0, err)
+
+    def test_972_the_owners_own_clear_needs_no_second_run_and_no_order_stays_refused(self):
+        self.score_config("Serious")
+        self.scored_pr()
+        self.rate(*self.cell_of("Low"))
+        code, out, err = self.run_as(None, "impact", "clear", self.PR, "--reason", "the owner judges the hold false")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("under_order", self.events("gate.hold_cleared")[0]["detail"])
+        code, out, err = self.run_as(None, "impact", "clear", self.PR, "--under-order", "17", "--reason", "the owner judges the hold false")
+        self.assertEqual(code, 2)
+        self.assertIn("--under-order is for the Chief of Staff", err)
+
+    def test_972_an_order_without_a_max_level_is_not_asked_for_two_runs(self):
+        self.delegate()
+        self.files_of_pr("migrations/0002.sql")
+        self.passes()
+        code, out, err = self.under()
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("counted", err)
+
+    def test_972_the_judge_counts_what_the_block_rule_counts(self):
+        module = sb.load_module("delegated_clear")
+        block, cells = self.block(), sb.impact_floor.load_matrix()["cells"]
+        s, p = self.cell_of("Low")
+        good = {"kind": "review_record", "pr": "acme/app#9", "head": LEDGER_HEAD, "reviewer": "impact", "by_role": "reviewer", "impact_severity": s, "impact_probability": p,
+                "block_sha256": "a" * 64, "block_impact_severity": s, "block_impact_probability": p, "seq": 1, "by": "x"}
+        report = {"pr": "acme/app#9", "head": LEDGER_HEAD}
+        for label, other in (("no block", dict(good, block_sha256="none")), ("a block that disagrees", dict(good, block_impact_probability="zzz"))):
+            entries = [good, dict(other, seq=2, by="y")]
+            got = module.judge(block, cells, entries, report, "Serious", module.RUNS_REQUIRED)
+            self.assertEqual(len([e for e in entries if module.counts_by_block(e)]), 1, label)
+            self.assertTrue(any("1 counted" in r for r in got["reasons"]), (label, got))
+        two = module.judge(block, cells, [good, dict(good, seq=2, by="y")], report, "Serious", module.RUNS_REQUIRED)
+        self.assertEqual((two["reasons"], len(two["runs"])), ([], 2))
+        self.assertEqual(module.judge(block, cells, [good], report, "Serious")["reasons"], [], "the default asks one run: the pure judge's old contract")
+
+    def test_972_the_rule_is_stated_once_in_the_docs_and_once_in_the_rater_brief_and_the_cause_comes_first(self):
+        module = sb.load_module("delegated_clear")
+        root = Path(sb.__file__).parent.parent
+        docs = (root / "docs" / "switchboard.md").read_text()
+        brief = (root / "agents" / "reviewers" / "reviewer-impact.md").read_text()
+        self.assertEqual((docs.count(module.TWO_RUN_RULE), brief.count(module.TWO_RUN_RULE)), (1, 1))
+        section = docs.split("#### Two independent runs for a clear by score (#972)", 1)[1].split("\n#### ", 1)[0]
+        cause, rule = section.split("##### The rule", 1)
+        self.assertEqual(cause.count("```text"), 2)
+        self.assertIn("cell: Medium", cause)
+        self.assertIn("cell: Serious", cause)
+        self.assertIn("depends on a draw", cause)
+        self.assertIn(module.TWO_RUN_RULE, rule)
 
     def test_s7_the_floor_is_data_the_clear_module_holds_none_and_the_brief_and_matrix_agree(self):
         matrix = sb.impact_floor.load_matrix()["owner_hold"]
