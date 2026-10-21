@@ -390,6 +390,7 @@ class TestConfig(Base):
         self.assertEqual(sb.load_config(), {
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
             "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "clear_remind_minutes": 15, "send_timeout_seconds": 60, "poll_seconds": 5,
+            "herdr_log": "~/.config/herdr/herdr-server.log", "pane_exit_burst_seconds": 5, "pane_exit_burst_min": 3,  # #1030
             "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "launch_default": "headless",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
@@ -2427,7 +2428,9 @@ class World:
         self.sessions, self.panes = {}, {}
         for name in agents:
             self.add_agent(name)
-        raw = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR,
+        empty_log = self.state / "herdr-server.log"   # #1030: the pane-exit pass reads herdr's log; a world must never read the real one, nor note a missing one
+        empty_log.write_text("")
+        raw = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "herdr_log": str(empty_log),
                "v2_cache_seconds": getattr(test, "V2_CACHE", 0)}   # the scenarios of old read the world afresh every pass; TestV2ReadVolume and the *WithTheMemoryOn classes turn it on
         raw.update(config or {})
         self.config = sb.validate_config(raw)
@@ -2440,6 +2443,8 @@ class World:
         pane = self.herdr.new_pane_id()
         self.herdr.add(pane, sid, status)
         self.sessions[name], self.panes[name] = sid, pane
+        if meta.get("role") == "orchestrator" and isinstance(meta.get("charter"), int):   # #969: the registry is the record of a charter; a first-seen agent takes its launch value (as the pass does)
+            sb.load_module("registry").upsert(self.state, name, {"session": sid, "pane": pane, "role": "orchestrator", "charter": meta["charter"], "repo": meta.get("repo")})
         return sid
 
     def new_engine(self, actor="daemon", writable=True):
@@ -2631,7 +2636,12 @@ class TestFacts(Base):
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "job_facts", "pane_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
+
+    def test_every_fact_source_class_in_the_module_is_registered(self):   # #1030: derived, so a new source cannot be left out
+        registered = {type(s).__name__ for s in sb.fact_sources(self.home)}
+        classes = {n for n, v in vars(sb).items() if isinstance(v, type) and n.endswith("Facts") and v.__module__ == sb.__name__}
+        self.assertEqual(classes - registered, set(), "a *Facts class is not in fact_sources (list it, or rename it)")
 
 
 # ---------------------------------------------------------------- observing
@@ -10532,7 +10542,7 @@ class TestFrictionWake(FrictionBase):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "job_facts", "pane_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
         self.make("off")
@@ -14714,6 +14724,378 @@ class TestClearMarker(Base):
             self.assertEqual(new.replace("MERGE: automatic", "MERGE: captain", 1), body)
         self.assertIsNone(sb.marker_edit(None))
         self.assertFalse(sb.pr_marker_state([], sb.marker_edit("MERGE: captain\n")[0], now=0)["captain"])
+
+
+class TestOneCharter(Base):
+    """#969: an orchestrator's charter is the registry row's `charter`, the one record; the lane lookup reads it and the live session's metadata (written once at launch) is never a second owner. Every test
+    drives the REAL lookups (`_lane_of_issue`, `lanes.charter_orchestrators`) over the REAL registry module and the real discovery of the fake service."""
+
+    REPO = "acme-org/widget-api"
+
+    def setUp(self):
+        super().setUp()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": self.REPO})
+        self.world = World(self, agents=(), config={"gh": FAKE_GH, "impact_hold": {"enabled": True}})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.engine = self.world.new_engine("daemon")
+        self.engine.state_dir = self.world.state
+        self.registry = sb.load_module("registry")
+        self.parents = {3: 1, 1: None}
+        self.engine.intents = types.SimpleNamespace(parent=lambda number, repo=None: self.parents.get(number), repo=self.REPO, header=lambda *a, **k: None)
+
+    def orchestrator(self, name, charter=None, issue=None, registry=True):
+        """A running orchestrator whose live SESSION metadata says `charter` and `issue`; its registry row (the first-seen fill the pass makes) holds the metadata charter unless `registry` is a value or False."""
+        fleet = {"role": "orchestrator", "repo": self.REPO}
+        if charter is not None:
+            fleet["charter"] = charter
+        if issue is not None:
+            fleet["issue"] = issue
+        sid = self.world.add_agent(name, fleet=fleet)   # (the harness fills the registry row from the metadata charter, as the pass does for a first-seen agent)
+        row = self.registry.read(self.world.state)["agents"].get(name)
+        if row is None:
+            self.registry.upsert(self.world.state, name, {"session": sid, "pane": self.world.panes[name], "role": "orchestrator", "charter": None, "repo": self.REPO})
+        if registry is not True:
+            self.set_registry(name, registry)
+
+    def set_registry(self, name, charter):
+        got = self.registry.set_charter(self.world.state, name, charter, "test")
+        self.assertIsNone(got["problem"], got)
+
+    def lane(self, number=1):
+        agents = self.engine.discover(self.world.clock.now()).agents
+        orchestrators = {n: a for n, a in agents.items() if (a.fleet or {}).get("role") == "orchestrator"}
+        return sb._lane_of_issue(self.engine, self.REPO, 3 if number == 1 else number, orchestrators)
+
+    # the shapes of a lookup: how the registry and the session metadata name charter 1, and what the lookup says. One table, driven row by row.
+    def shape_session_issue_only(self):
+        self.orchestrator("orch-a", charter=1)
+        self.orchestrator("orch-b", charter=2, issue=1, registry=None)   # the real case: its metadata `issue` is orch-a's charter; its registry row has no charter
+
+    def shape_session_charter_only(self):
+        self.orchestrator("orch-a", charter=1)
+        self.orchestrator("orch-b", charter=1, registry=None)   # its metadata charter says 1 too; the registry row has none
+
+    def shape_registry_two(self):
+        self.orchestrator("orch-a", charter=1)
+        self.orchestrator("orch-b", charter=1)
+
+    def shape_no_orchestrator(self):
+        self.orchestrator("orch-a", charter=2)
+
+    def shape_metadata_only_no_registry_owner(self):
+        self.orchestrator("orch-a", charter=1, registry=None)   # the session says 1, the registry gives it to nobody: the lookup is no more generous than the registry
+
+    def shape_one(self):
+        self.orchestrator("orch-a", charter=1)
+        self.orchestrator("orch-b", charter=2)
+
+    SHAPES = {   # shape name -> expected lookup result (a one-owner result, a many result with both names, or None)
+        "session_issue_only": ("one", "orch-a"),
+        "session_charter_only": ("one", "orch-a"),
+        "registry_two": ("many", ["orch-a", "orch-b"], 1),
+        "no_orchestrator": None,
+        "metadata_only_no_registry_owner": None,
+        "one": ("one", "orch-a"),
+    }
+
+    def test_every_shape_of_the_lookup_says_what_the_registry_says(self):
+        for name, expected in self.SHAPES.items():
+            with self.subTest(shape=name):
+                self.setUp()
+                getattr(self, "shape_" + name)()
+                found = self.lane()
+                self.assertEqual(found, expected)
+
+    def test_the_shapes_table_has_every_shape_method(self):
+        methods = {n[len("shape_"):] for n in dir(self) if n.startswith("shape_")}
+        self.assertEqual(methods, set(self.SHAPES))
+
+    def test_an_unreadable_registry_gives_no_lane(self):
+        self.shape_one()
+        (Path(self.world.state) / "registry.json").write_text("{not json")
+        self.assertIsNone(self.lane())
+
+    def test_the_metadata_of_a_session_is_not_read_for_a_lane_even_when_the_registry_has_no_row(self):
+        self.world.add_agent("orch-a", fleet={"role": "orchestrator", "charter": 1, "repo": self.REPO})
+        (Path(self.world.state) / "registry.json").unlink()   # no row at all: the metadata must not stand in for it
+        self.assertIsNone(self.lane())
+
+    def test_charter_orchestrators_of_move_reads_the_registry_too(self):
+        lanes = sb.load_module("lanes")
+        namespace = types.SimpleNamespace(engine=self.engine, **{n: getattr(sb, n) for n in lanes.NEEDS})
+        for name, expected in (("session_issue_only", ["orch-a"]), ("session_charter_only", ["orch-a"]), ("registry_two", []), ("no_orchestrator", []), ("one", ["orch-a"])):
+            with self.subTest(shape=name):
+                self.setUp()
+                getattr(self, "shape_" + name)()
+                namespace.engine = self.engine
+                discovery = self.engine.discover(self.world.clock.now())
+                self.assertEqual(lanes.charter_orchestrators(namespace, discovery, self.REPO, 1), expected)
+
+    # -- the pass: the registry keeps its charter, a first-seen agent takes the launch value, a disagreement is said once
+
+    def health(self):
+        self.engine.discover(self.world.clock.now())
+        sb.pane_health_pass(self.engine, self.world.clock.now())
+
+    def row(self, name):
+        return self.registry.read(self.world.state)["agents"][name]
+
+    def test_the_pass_keeps_a_corrected_charter_fills_a_first_seen_agent_and_says_a_disagreement_once(self):
+        self.orchestrator("orch-b", charter=1)           # first seen: the launch value is the row's
+        self.assertEqual(self.row("orch-b")["charter"], 1)
+        self.set_registry("orch-b", 7)                   # corrected through the command
+        for _ in range(3):
+            self.health()
+        self.assertEqual(self.row("orch-b")["charter"], 7, "the pass must not copy the session's metadata over the registry")
+        said = [e for e in self.world.audit() if e["event"] == "charter.disagree"]
+        self.assertEqual(len(said), 1)
+        self.assertEqual((said[0]["subject"], said[0]["detail"]["session_charter"]), ("orch-b", 1))
+        self.world.add_agent("orch-new", fleet={"role": "orchestrator", "charter": 9, "repo": self.REPO})
+        (Path(self.world.state) / "registry.json").write_text(json.dumps({"version": 1, "agents": {}, "retired": {}}))
+        self.health()
+        self.assertEqual(self.row("orch-new")["charter"], 9, "a first-seen agent takes its launch value")
+
+    def test_a_disagreement_is_said_once_per_agent_and_value_by_the_helper_itself(self):
+        notes = []
+        engine = types.SimpleNamespace(state_dir=self.world.state, _note=lambda event, subject, detail: notes.append((event, subject, detail["session_charter"])))
+        for value in (4, 4, 4, 5, 5, 4):
+            sb.charter_disagreement_once(engine, "orch-b", value)
+        self.assertEqual(notes, [("charter.disagree", "orch-b", 4), ("charter.disagree", "orch-b", 5)])
+
+    def test_adoption_and_the_plan_wake_route_name_the_registrys_owner_and_not_the_session_metadata(self):
+        self.shape_session_charter_only()     # orch-a owns charter 1 in the registry; orch-b's session metadata says 1 too
+        self.world.add_agent("worker", fleet={"role": "coder", "charter": 1, "repo": self.REPO, "issue": 40})
+        discovery = self.engine.discover(self.world.clock.now())
+        heir, why = sb.adoption_heir(self.engine, discovery, {}, discovery.agents["worker"])
+        self.assertEqual((heir, why), ("orch-a", "the charter's orchestrator"))
+        items = {5: {"parent": 4}, 4: {"parent": 1}}
+        ctx = {"charters": {1}, "asks": {4}}
+        route = sb.plan_wake_route(5, items, ctx, discovery, ["cos"], sb.registry_owners(self.engine))
+        self.assertEqual(route, (["orch-a"], "work item"))
+        self.assertEqual(sb.plan_wake_route(5, items, ctx, discovery, ["cos"]), ([], "work item"), "no registry owners given: nobody is guessed from the metadata")
+
+    def test_the_asks_of_the_chief_of_staff_and_of_an_orchestrator_follow_the_registrys_corrected_charter(self):
+        self.orchestrator("orch-b", charter=1)            # launched with charter 1 ...
+        self.set_registry("orch-b", 7)                    # ... and corrected through the command
+        self.engine.intents = types.SimpleNamespace(open_asks=lambda charter, repo=None: ["ask-under-%s" % charter], repo=self.REPO, header=lambda *a, **k: None)
+        now = self.world.clock.now()
+        cos = sb.asks_of_caller(self.engine, {"name": "cos", "role": "chief-of-staff", "repo": self.REPO}, now)
+        self.assertEqual(cos, [("orch-b", "ask-under-7")])
+        orch = sb.asks_of_caller(self.engine, {"name": "orch-b", "role": "orchestrator", "charter": 1, "repo": self.REPO}, now)
+        self.assertEqual(orch, [("orch-b", "ask-under-7")])
+        self.set_registry("orch-b", None)
+        self.assertEqual(sb.asks_of_caller(self.engine, {"name": "cos", "role": "chief-of-staff", "repo": self.REPO}, now), [], "no registry charter: no asks, never the launch value")
+
+    def test_the_load_figures_and_the_tester_gate_follow_a_registry_row_and_use_the_launch_value_only_without_one(self):
+        self.orchestrator("orch-b", charter=1)
+        self.set_registry("orch-b", 7)
+        fleet = {"role": "orchestrator", "charter": 1, "repo": self.REPO}
+        self.assertEqual(sb.charter_or_first_seen(self.engine, "orch-b", fleet), 7)               # the row wins over the stale launch value
+        self.set_registry("orch-b", None)
+        self.assertIsNone(sb.charter_or_first_seen(self.engine, "orch-b", fleet))                  # a row with no charter is an answer
+        self.assertEqual(sb.charter_or_first_seen(self.engine, "not-yet-seen", fleet), 1)          # no row yet: the launch value (the pass fills it at first sight)
+        self.assertIsNone(sb.charter_or_first_seen(self.engine, "not-yet-seen", {"role": "orchestrator", "charter": True}))
+
+    def test_the_load_tick_asks_the_registrys_charter_not_the_launch_value(self):
+        self.orchestrator("orch-b", charter=1)
+        self.set_registry("orch-b", 7)
+        asked = []
+        seen = types.SimpleNamespace(name="orch-b", fleet={"role": "orchestrator", "charter": 1, "repo": self.REPO}, status="idle")
+        intents = types.SimpleNamespace(repo=self.REPO, _api=lambda path, repo: ([{"name": "me:orchestrator"}] if "/labels" in path else []), open_asks=lambda charter, repo: asked.append(charter) or [])
+        state = self.world.state / "load-state"
+        state.mkdir(exist_ok=True, mode=0o700)
+        engine = types.SimpleNamespace(state_dir=str(self.world.state), now=lambda: 1_792_000_000, audit=None, actor="daemon", intents=intents, config={"load_alert": sb.load_fleet_health().validate({"enabled": True}, "x")})
+        sb.load_tick(engine, types.SimpleNamespace(agents={"orch-b": seen}))
+        self.assertEqual(asked, [7], "the registry's corrected charter, never the stale launch value 1")
+
+    def test_the_notice_router_and_the_triage_context_never_take_an_orchestrators_issue_for_a_charter(self):
+        """The recorded shape: aaa-orch was launched with ANOTHER charter's number as its issue (charter 2, issue 1); zzz-orch holds charter 1 in the registry. Charter 1's owner is zzz-orch."""
+        self.orchestrator("aaa-orch", charter=2, issue=1)
+        self.orchestrator("zzz-orch", charter=1)
+        agents = self.engine.discover(self.world.clock.now()).agents
+        view = sb.registry_charter_view(self.engine)
+        self.assertEqual(sb.pick_owner({n: a for n, a in agents.items() if n.endswith("-orch")}, [1], self.REPO, view=view), "zzz-orch")
+        self.assertEqual(sb.pick_owner({n: a for n, a in agents.items() if n.endswith("-orch")}, [2], self.REPO, view=view), "aaa-orch")
+        self.set_registry("aaa-orch", 9)    # corrected: the launch charter 2 is no longer owned
+        view = sb.registry_charter_view(self.engine)
+        self.assertIsNone(sb.pick_owner({n: a for n, a in agents.items() if n.endswith("-orch")}, [2], self.REPO, view=view))
+        ctx = sb.triage_context(self.engine, self.REPO, {}, types.SimpleNamespace(agents={n: a for n, a in agents.items() if n.endswith("-orch")}))
+        self.assertEqual((ctx["charters"], ctx["owned"]), ({1, 9}, {1, 9}), "the metadata issue 1 of aaa-orch and its launch charter 2 are not owned")
+        coder = types.SimpleNamespace(name="worker", fleet={"role": "coder", "issue": 40, "repo": self.REPO}, status="idle")
+        self.assertEqual(sb.owned_numbers("worker", coder.fleet, view), {40}, "a coder owns its own issue")
+
+    RETIRED_FALLBACK_READERS = {"adoption_heir": "an orphan of a RETIRED boss finds the charter in the boss's retirement record"}   # one row per reader that falls back to registry_retired_owners
+
+    def test_the_readers_that_fall_back_to_a_retired_orchestrators_record_are_derived_from_the_code_and_each_has_its_row(self):
+        callers = set()
+        for node in ast.walk(ast.parse((REPO / "bin" / "fleet-switchboard").read_text())):
+            if isinstance(node, ast.FunctionDef) and node.name != "registry_retired_owners":
+                if any(isinstance(s, ast.Call) and isinstance(s.func, ast.Name) and s.func.id == "registry_retired_owners" for s in ast.walk(node)):
+                    callers.add(node.name)
+        self.assertEqual(callers, set(self.RETIRED_FALLBACK_READERS), "a reader that reads a retired orchestrator's kept charter needs a row and a test here")
+
+    def test_adoption_heir_finds_the_live_orchestrator_of_the_charter_a_retired_boss_kept(self):
+        self.orchestrator("orch-old", charter=1)
+        self.orchestrator("orch-new", charter=1)
+        self.world.add_agent("worker", fleet={"role": "coder", "reports_to": "orch-old", "repo": self.REPO})   # no charter of its own: its boss's
+        self.assertEqual(self.registry.retire(self.world.state, "orch-old", "test", "retired", session=self.world.sessions["orch-old"], now=self.world.clock.now())["problem"], None)
+        discovery = self.engine.discover(self.world.clock.now())
+        retired = self.registry.read(self.world.state)["retired"]
+        heir, why = sb.adoption_heir(self.engine, discovery, retired, discovery.agents["worker"])
+        self.assertEqual((heir, why), ("orch-new", "the charter's orchestrator"))
+        self.assertEqual(sb.registry_retired_owners(self.engine), {"orch-old": 1})
+
+    def test_a_workers_charter_through_its_boss_is_the_registrys(self):
+        self.orchestrator("orch-b", charter=1)
+        self.set_registry("orch-b", 7)
+        self.world.add_agent("worker", fleet={"role": "coder", "reports_to": "orch-b", "repo": self.REPO})
+        discovery = self.engine.discover(self.world.clock.now())
+        owners = sb.registry_owners(self.engine)
+        self.assertEqual(sb.worker_charter(discovery, discovery.agents["worker"], owners)[0], 7)
+        self.assertIsNone(sb.worker_charter(discovery, discovery.agents["worker"])[0], "without the registry's owners a boss's launch value is never read")
+
+    def test_registry_charter_is_pure_and_total(self):
+        cases = (({}, "a", 3, (3, None)), ({"a": {"charter": 5}}, "a", 3, (5, 3)), ({"a": {"charter": 5}}, "a", 5, (5, None)), ({"a": {"charter": None}}, "a", 3, (None, 3)),
+                 ({"a": {"charter": 5}}, "a", None, (5, None)), ({"a": {"charter": 5}}, "a", True, (5, None)), ({}, "a", "3", (None, None)))
+        for registered, name, session, expected in cases:
+            with self.subTest(registered=registered, session=session):
+                self.assertEqual(sb.registry_charter(registered, name, session), expected)
+
+    # -- the command
+
+    def run_as(self, who, *argv):
+        if who is None:
+            os.environ.pop("HERDR_PANE_ID", None)
+        else:
+            os.environ["HERDR_PANE_ID"] = self.world.panes[who]
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_charter_set_is_audited_refused_for_an_agent_and_for_a_bad_value(self):
+        self.orchestrator("orch-b", charter=1)
+        self.world.add_agent("worker", fleet={"role": "coder", "reports_to": "orch-b", "repo": self.REPO})
+        before = self.row("orch-b")
+        code, out, err = self.run_as("worker", "charter", "set", "orch-b", "9")
+        self.assertEqual(code, 1, err)
+        self.assertEqual(self.row("orch-b"), before)
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "nine")
+        self.assertEqual(code, 2, err)
+        self.assertEqual(self.row("orch-b"), before)
+        code, out, err = self.run_as("cos", "charter", "set", "worker", "9")
+        self.assertEqual(code, 2, err)
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "9")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.row("orch-b")["charter"], 9)
+        done = [e for e in self.world.audit() if e["event"] == "charter.set"]
+        self.assertEqual([(e["detail"]["old"], e["detail"]["new"]) for e in done], [(1, 9)])
+        registry_audit = [json.loads(l) for l in (Path(self.world.state) / "registry-audit.jsonl").read_text().splitlines() if '"charter"' in l]
+        self.assertEqual([(e["old"], e["new"]) for e in registry_audit if e.get("event") == "charter"], [(1, 9)])
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "none")
+        self.assertEqual((code, self.row("orch-b")["charter"]), (0, None))
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "charter.refused"]), 3)
+
+    # -- the sweep and the report
+
+    def test_a_charter_two_orchestrators_record_is_a_sweep_finding_naming_both_and_the_report_prints_it(self):
+        self.shape_registry_two()
+        state = types.SimpleNamespace(repos={}, sources={}, unattributed=0)
+        found = sb.sweep_findings(self.engine, state, [], self.REPO, self.world.clock.now(), dict(sb.SWEEP_DEFAULTS), None)
+        self.assertIn(("S10", "%s#1" % self.REPO), found)
+        self.assertEqual(state.sources[("S10", "%s#1" % self.REPO)]["match"], "recorded by orch-a, orch-b")
+        code, out, err = self.run_as(None, "agents", "charters")
+        self.assertEqual(code, 0, err)
+        self.assertIn("charter #1 of %s is recorded by 2 orchestrators in the registry: orch-a, orch-b" % self.REPO, out)
+        self.setUp()
+        self.shape_one()
+        state = types.SimpleNamespace(repos={}, sources={}, unattributed=0)
+        self.assertEqual([f for f in sb.sweep_findings(self.engine, state, [], self.REPO, self.world.clock.now(), dict(sb.SWEEP_DEFAULTS), None) if f[0] == "S10"], [])
+
+    def test_the_report_shows_the_record_that_names_the_charter_for_the_orchestrator_that_does_not_own_it(self):
+        self.shape_session_issue_only()
+        code, out, err = self.run_as(None, "agents", "charters", "--json")
+        self.assertEqual(code, 0, err)
+        rows = {r["name"]: r for r in json.loads(out)["orchestrators"]}
+        self.assertEqual((rows["orch-b"]["registry_charter"], rows["orch-b"]["meta_charter"], rows["orch-b"]["meta_issue"]), (None, 2, 1))
+        self.assertEqual(rows["orch-b"]["metadata_names_other_charter"], [{"charter": 1, "field": "issue", "owner": "orch-a"}])
+        self.assertEqual(rows["orch-a"]["metadata_names_other_charter"], [])
+
+    def test_the_registry_writer_refuses_what_it_should(self):
+        self.shape_one()
+        self.assertIsNotNone(self.registry.set_charter(self.world.state, "ghost", 1, "t")["problem"])
+        self.assertIsNotNone(self.registry.set_charter(self.world.state, "orch-a", True, "t")["problem"])
+        self.assertIsNotNone(self.registry.set_charter(self.world.state, "orch-a", -2, "t")["problem"])
+        self.assertEqual(self.registry.set_charter(self.world.state, "orch-a", 1, "t"), {"changed": False, "problem": None})
+
+    @staticmethod
+    def functions_reading_charter():
+        """{(file, function): (the function's AST node, whether it enumerates the agents)} for every function that reads a fleet's `charter`, DERIVED from the code."""
+        found = {}
+        for rel in ("bin/fleet-switchboard", "bin/impact_hold.py", "bin/lanes.py", "bin/fleet_health.py", "bin/registry.py", "bin/reassign.py"):
+            tree = ast.parse((REPO / rel).read_text())
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                reads, enumerates = False, False
+                for sub in ast.walk(node):
+                    key = None
+                    if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute) and sub.func.attr == "get" and sub.args and isinstance(sub.args[0], ast.Constant):
+                        key = sub.args[0].value
+                    elif isinstance(sub, ast.Subscript) and isinstance(sub.slice, ast.Constant):
+                        key = sub.slice.value
+                    reads = reads or key == "charter"
+                    if isinstance(sub, (ast.For, ast.comprehension)) and isinstance(sub.iter, ast.Tuple) and any(isinstance(e, ast.Constant) and e.value in ("charter",) for e in sub.iter.elts):
+                        reads = True   # a loop over a tuple of field names that holds "charter" (the key is read as the loop variable)
+                    if isinstance(sub, (ast.For, ast.comprehension)) and "agents" in ast.unparse(sub.iter) and re.search(r"\.agents\b|agents\.values|discover\(|\.items\(\)|\.values\(\)", ast.unparse(sub.iter)):
+                        enumerates = True
+                if reads:
+                    found[(rel, node.name)] = (node, enumerates)
+        return found
+
+    def test_every_reader_of_an_agents_charter_is_in_the_table_and_its_claim_is_checked_against_the_code(self):
+        """The readers of a fleet's `charter` are DERIVED from the code and each must be classified; the classification is CHECKED, not trusted: an `own` reader may not enumerate other agents, a `registry` reader
+        must read the registry, a `set` reader is the only kind that may enumerate without naming an owner (listed by name)."""
+        found = self.functions_reading_charter()
+        self.assertEqual(sorted(set(found) - set(self.READERS)), [], "classify each new reader of a charter in READERS")
+        for key in sorted(set(self.READERS) - set(found)):   # a `registry` row names a function that now reads the registry instead of the key: it must really do so
+            self.assertEqual(self.READERS[key].split(":", 1)[0], "registry", key)
+        for key, (node, enumerates) in found.items():
+            kind = self.READERS[key].split(":", 1)[0]
+            self.assertIn(kind, ("registry", "writer", "display", "own", "set"), key)
+            source = ast.unparse(node)
+            if kind == "own":
+                self.assertFalse(enumerates, "%s is classified `own` but enumerates the agents" % (key,))
+            if kind == "registry":
+                self.assertTrue("registry" in source or "owners" in source or "orchestrator_charters" in source, "%s is classified `registry` but never reads the registry" % (key,))
+        self.assertEqual(sorted(k for k, (n, e) in found.items() if e and self.READERS[k].startswith("set:")), [("bin/fleet-switchboard", "seam_applies")])
+
+    READERS = {   # (file, function) -> "kind: reason". registry: decides who owns a charter and reads the registry's charter (#969); writer / display: writes or shows the registry row; own: reads ONE agent's own launch context and enumerates no other agent
+        # (CHECKED against the code below); set: asks only whether a number is a charter, never counts or names an owner
+        ("bin/impact_hold.py", "_lane_of_issue"): "registry: the lane lookup", ("bin/lanes.py", "charter_orchestrators"): "registry: move's lookup",
+        ("bin/fleet-switchboard", "adoption_heir"): "registry: the heir of an orphan", ("bin/fleet-switchboard", "plan_wake_route"): "registry: the orchestrator a plan wakes",
+        ("bin/fleet-switchboard", "asks_of_caller"): "registry: the asks an agent is accountable for", ("bin/fleet-switchboard", "register_item_tester"): "registry: the launching orchestrator's charter gates a registration",
+        ("bin/fleet-switchboard", "load_tick"): "registry: an orchestrator's charter in the load figures", ("bin/fleet-switchboard", "worker_charter"): "registry: a worker's boss's charter (the worker's own is its launch context)",
+        ("bin/fleet-switchboard", "charter_or_first_seen"): "registry: the row's charter, else the launch value of an agent with no row yet",
+        ("bin/fleet-switchboard", "registry_retired_owners"): "registry: the charter a retired orchestrator's record kept",
+        ("bin/registry.py", "orchestrator_charters"): "registry: the one reading", ("bin/registry.py", "duplicate_charters"): "registry: duplicates", ("bin/registry.py", "set_charter"): "writer: the audited setter",
+        ("bin/registry.py", "change"): "writer: the registry's own writer", ("bin/fleet-switchboard", "registry_charter"): "writer: the pass's rule over the registry row",
+        ("bin/fleet-switchboard", "pane_health_pass"): "writer: writes the registry row through registry_charter", ("bin/fleet-switchboard", "charters_report"): "display: both records, read-only",
+        ("bin/fleet-switchboard", "cmd_agents_charters"): "display: the report", ("bin/fleet-switchboard", "cmd_charter"): "writer: the audited command",
+        ("bin/fleet-switchboard", "record_launch_charter"): "writer: a launch writes the registry row (first sight; a relaunch under the name is a new launch)",
+        ("bin/impact_hold.py", "clear_lane"): "display: carries the lookup's `charter` into the notice line", ("bin/impact_hold.py", "_notify_clear_body"): "display: words the notice line",
+        ("bin/fleet-switchboard", "seam_applies"): "set: is this issue number known as a charter",
+        ("bin/fleet-switchboard", "owned_numbers"): "registry: the numbers an agent owns (an orchestrator: its row's charter only; others: their own assignment)",
+        ("bin/fleet-switchboard", "registry_charter_view"): "registry: every row's charter", ("bin/fleet-switchboard", "triage_context"): "registry: charters via owned_numbers (an orchestrator's issue is never a charter)",
+        ("bin/fleet-switchboard", "identify"): "own: copies the caller's own launch fields into its context",
+        ("bin/fleet-switchboard", "resume_agent"): "own: one agent's own repo lookup", ("bin/fleet-switchboard", "charter_pane_update"): "own: one agent's own charter for its pane",
+        ("bin/fleet-switchboard", "_fleet_repo"): "own: one agent's own repo", ("bin/fleet-switchboard", "read_order_notices"): "own: the order notices' own records",
+        ("bin/fleet-switchboard", "order_groups"): "own: groups order notices", ("bin/fleet-switchboard", "decisions_from_order_notices"): "own: words order notices",
+        ("bin/fleet-switchboard", "resolve_policy_context"): "own: one agent's own launch context", ("bin/fleet-switchboard", "_valid_context"): "own: a cached own context",
+        ("bin/fleet-switchboard", "charter_orders"): "own: an agent's own charter's orders", ("bin/fleet-switchboard", "charter_guard"): "own: an agent's own charters",
+        ("bin/fleet-switchboard", "ask_context_of"): "own: an agent's own ask context", ("bin/fleet-switchboard", "__call__"): "own: an orchestrator's own orders",
+        ("bin/fleet_health.py", "figures"): "own: the health figures of one agent from the registry-derived info", ("bin/fleet_health.py", "_resolve_charters"): "own: the registry-derived info",
+        ("bin/fleet_health.py", "_refresh_asks"): "own: the registry-derived info", ("bin/fleet-switchboard", "_import_fleet"): "own: the launch/import writer of the session's metadata",
+    }
 
 
 class TestClearNotice(Base):
@@ -43375,6 +43757,7 @@ USE_COMMANDS = {
     "remind": ["remind", "other", "1h", "later"], "decisions": ["decisions"], "intent": ["intent", "1"],
     "bootstrap": ["bootstrap"], "notice": ["notice", "pr", "acme/api#7", "--from", "coder"],
     "move": ["move", "1", "--to", "2", "--from", "coder"], "reassign": ["reassign", "coder", "--undo", "--from", "coder"],
+    "charter": ["charter", "set", "coder", "1", "--from", "coder"],
 }
 
 
@@ -72971,6 +73354,7 @@ class TestAdoption(LanesCase):
     def daemon_pass(self):
         engine = self.world.new_engine()
         engine.discover(self.world.clock.now())
+        sb.pane_health_pass(engine, self.world.clock.now())   # the daemon's own order (#969): the registry takes what the pass saw BEFORE the adoption pass reads it
         sb.adoption_pass(engine, self.world.clock.now())
 
     def rows(self, event="boss.adopted"):
@@ -73097,9 +73481,12 @@ class TestAdoption(LanesCase):
             for label, shape in self.DAMAGED.items():
                 with self.subTest(file=file, shape=label):
                     self.worker("w-%d" % len(self.world.panes), "gone", charter=1)
+                    (Path(self.world.state) / "registry.json").unlink(missing_ok=True)   # #969: the fake service's first-seen rows made a registry; this case is about the OLD records that have no registry yet, which fold from the damaged file
                     self.damage(file, shape)
                     before = {f: ((Path(self.world.state) / f).read_bytes() if (Path(self.world.state) / f).is_file() else None) for f in files}
-                    self.daemon_pass()
+                    engine = self.world.new_engine()   # the adoption pass alone: the observation pass would fold the old records and write the derived file this case is about
+                    engine.discover(self.world.clock.now())
+                    sb.adoption_pass(engine, self.world.clock.now())
                     self.assertEqual(self.rows(), [], "no boss written")
                     after = {f: ((Path(self.world.state) / f).read_bytes() if (Path(self.world.state) / f).is_file() else None) for f in files}
                     self.assertEqual(before, after)
@@ -73607,6 +73994,7 @@ class TestMoveAnAsk(LanesCase):
             fleet = self.world.v2.sessions[self.world.sessions[name]]["metadata"]["fleet"]
             del fleet["charter"]
             fleet["repo"] = FAKE_REPO
+            sb.load_module("registry").set_charter(self.world.state, name, None, "test")   # #969: nor does the registry row: the charter's own block names the orchestrator
         self.gh.bodies = {1: "```yaml\norchestrator: orch-a\nstatus: active\n```\n", 10: "```yaml\norchestrator: orch-b\nstatus: active\n```\n"}
 
     def notice_lines(self):
@@ -77876,6 +78264,620 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
         for path in sorted((BIN.parent / "plugins").rglob("*")):
             if path.is_file() and path.suffix in (".mjs", ".js", ".tsx") and not path.name.endswith(".test.mjs") and OLD_AGENT_SOURCES.search(path.read_text()):
                 self.assertIn(str(path.relative_to(BIN.parent)), DERIVED_VIEWS, "%s reads an old agent list: read the registry or list it as derived" % path)
+
+
+class TestPaneExit(Base):
+    """Why a pane ended (#1030): herdr's log is read read-only and bounded, and each exit becomes ONE `fleetpane.exit` audit line."""
+
+    NOW = 1_800_000_000.0
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform",))
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.engine = self.world.engine
+        self.engine.state_dir = self.world.state
+        self.engine.config = dict(self.engine.config, herdr_log=str(self.home / "herdr-server.log"))
+        self.log = self.home / "herdr-server.log"
+        self.jobs = self.home / "jobs"
+        self.jobs.mkdir(mode=0o700)
+        patcher = mock.patch.dict(os.environ, {sb.JOBS_DIR_ENV: str(self.jobs)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def stamp(offset):
+        return datetime.datetime.fromtimestamp(TestPaneExit.NOW + offset, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+
+    def exit_line(self, offset, pane, code, signal="None"):
+        return ('%s  INFO herdr::logging: pane child exited event="pane.exit" subsystem="pane" outcome="completed" pane_id=%s '
+                'status="ExitStatus { code: %d, signal: %s }"\n' % (self.stamp(offset), pane, code, signal))
+
+    def hangup_line(self, offset, pane):
+        return "%s  INFO herdr::pane: pane session terminated pane=%s pid=99 signal=Hangup\n" % (self.stamp(offset), pane)
+
+    def write_log(self, *lines):
+        self.log.write_text("".join(lines))
+
+    def run_pass(self, offset=10):
+        sb.pane_exit_pass(self.engine, self.NOW + offset)
+
+    def audit(self, event):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def three_kinds(self):
+        self.write_log(self.exit_line(-300, 11, 0), self.exit_line(-200, 12, 130), self.hangup_line(-199.9, 12), self.exit_line(-100, 13, 1), self.hangup_line(-99.5, 13))
+
+    def test_each_exit_is_one_line_with_pane_code_signal_and_herdr_time_once_over_two_passes(self):
+        self.three_kinds()
+        self.run_pass()
+        self.run_pass(20)
+        lines = self.audit("fleetpane.exit")
+        self.assertEqual(len(lines), 3)
+        by_pane = {e["detail"]["pane"]: e["detail"] for e in lines}
+        self.assertEqual((by_pane["11"]["code"], by_pane["11"]["signal"]), (0, None))
+        self.assertEqual((by_pane["12"]["code"], by_pane["12"]["signal"]), (130, "Hangup"))
+        self.assertEqual(by_pane["13"]["signal"], "Hangup")
+        self.assertEqual(by_pane["12"]["herdr_time"], self.stamp(-200))
+        self.assertEqual(self.audit("fleetpane.exit_burst"), [])
+
+    def test_a_signal_in_the_exit_status_is_kept(self):
+        self.write_log(self.exit_line(-5, 14, 0, 'Some("Terminated")'))
+        self.run_pass()
+        self.assertEqual(self.audit("fleetpane.exit")[0]["detail"]["signal"], "Terminated")
+
+    def test_the_agent_name_is_given_when_the_registry_knows_the_pane(self):
+        self.engine.discover(self.world.clock.now())
+        sb.pane_health_pass(self.engine, self.world.clock.now())
+        pane = self.world.panes["platform"]
+        number = pane.split(":p")[-1]
+        self.write_log(self.exit_line(-5, number, 130), self.exit_line(-4, "77777", 0))
+        self.run_pass()
+        agents = {e["detail"]["pane"]: e["detail"]["agent"] for e in self.audit("fleetpane.exit")}
+        self.assertEqual(agents, {number: "platform", "77777": None})
+
+    def test_a_pane_closed_by_a_fleet_command_is_marked_asked_with_who_asked_and_another_is_not(self):
+        entry = {"ts": self.stamp(-8), "actor": "cos", "event": "fleetpane.closed", "subject": "platform", "detail": {"pane": "w1:p21", "by": "cos"}}
+        self.world.audit_path.write_text(json.dumps(entry) + "\n")
+        self.write_log(self.exit_line(-5, 21, 0), self.exit_line(-4, 22, 0))
+        self.run_pass()
+        got = {e["detail"]["pane"]: e["detail"] for e in self.audit("fleetpane.exit")}
+        self.assertEqual((got["21"]["asked"], got["21"]["by"]), (True, "cos"))
+        self.assertEqual((got["22"]["asked"], got["22"]["by"]), (False, None))
+
+    def make_job(self, name, started, ended=None):
+        (self.jobs / name).mkdir(mode=0o700)
+        (self.jobs / name / "job.json").write_text(json.dumps({"name": name, "pid": os.getpid(), "started": started}))
+        if ended is not None:
+            exit_file = self.jobs / name / "exit"
+            exit_file.write_text("0\n")
+            os.utime(str(exit_file), (ended, ended))
+
+    def test_the_line_lists_the_heavy_runs_and_jobs_active_at_the_exit_second_by_their_start_and_end(self):
+        at = self.NOW - 5
+        slots = sb.load_heavy_slots()
+        held = [{"name": "suite", "since": at - 40}, {"name": "later", "since": at + 50}]
+        self.make_job("alive", at - 90)                         # started before, still alive: active
+        self.make_job("ended-after", at - 60, at + 2)           # ended after the exit: active at it
+        self.make_job("ended-before", at - 90, at - 10)         # ended before the exit: not active
+        self.make_job("started-after", at + 3)                  # started after the exit: not active
+        self.write_log(self.exit_line(-5, 31, 130))
+        with mock.patch.object(slots, "_held_records", return_value=held):
+            self.run_pass()
+        active = self.audit("fleetpane.exit")[0]["detail"]["active"]
+        self.assertEqual(sorted((a["kind"], a["name"], a["age"]) for a in active),
+                         [("heavy", "suite", 40), ("job", "alive", 90), ("job", "ended-after", 60)])
+        self.assertIn("still holding its slot", self.audit("fleetpane.exit")[0]["detail"]["active_basis"])
+
+    def test_a_burst_of_thirty_panes_writes_the_exit_lines_in_bounded_passes_and_one_summary_and_one_notice(self):
+        self.engine.discover(self.world.clock.now())
+        self.write_log(*[self.exit_line(-20 + (i // 10), 100 + i, 130) for i in range(30)])
+        self.run_pass()
+        self.assertEqual(len(self.audit("fleetpane.exit")), sb.PANE_EXIT_MAX_PER_PASS)
+        self.run_pass(20)
+        self.assertEqual(len(self.audit("fleetpane.exit")), 30)
+        self.assertEqual(len({e["detail"]["pane"] for e in self.audit("fleetpane.exit")}), 30)
+        self.run_pass(30)
+        self.assertEqual(len(self.audit("fleetpane.exit")), 30)
+        bursts = self.audit("fleetpane.exit_burst")
+        self.assertEqual((len(bursts), len(bursts[0]["detail"]["panes"])), (1, 30))
+        source = sb.PaneExitFacts()
+        source.bind(self.engine)
+        self.assertEqual(len(source()), 1)
+
+    def test_three_panes_ending_within_two_seconds_make_one_summary_and_one_notice_and_two_far_apart_make_none(self):
+        self.engine.discover(self.world.clock.now())
+        self.assertEqual(self.engine.discovery.problems, [])
+        self.write_log(self.exit_line(-20, 41, 130), self.exit_line(-19, 42, 130), self.exit_line(-18, 43, 130), self.exit_line(-300, 44, 0), self.exit_line(-240, 45, 0))
+        self.run_pass()
+        self.run_pass(30)
+        bursts = self.audit("fleetpane.exit_burst")
+        self.assertEqual(len(bursts), 1)
+        self.assertEqual(bursts[0]["detail"]["panes"], ["41", "42", "43"])
+        self.assertEqual(len(self.audit("fleetpane.exit")), 5)
+        source = sb.PaneExitFacts()
+        source.bind(self.engine)
+        facts = source()
+        self.assertEqual([(f.recipient, f.kind) for f in facts], [("cos", "pane")])
+        self.assertIn("3 panes ended", facts[0].summary)
+        self.assertEqual(len({f.key for f in source()}), 1)
+
+    def test_a_missing_or_rotated_or_unreadable_log_gives_one_note_and_the_pass_goes_on(self):
+        self.run_pass()
+        self.run_pass(20)
+        self.assertEqual(len(self.audit("fleetpane.exit_note")), 1)
+        self.write_log(self.exit_line(-5, 51, 0), "x" * 2000)
+        self.run_pass(30)
+        self.write_log(self.exit_line(-4, 52, 0))   # shorter than before: rotated
+        self.run_pass(40)
+        self.assertEqual([e["detail"]["note"].split(" was ")[-1][:7] for e in self.audit("fleetpane.exit_note")][1:], ["rotated"])
+        self.assertEqual(len(self.audit("fleetpane.exit")), 2)
+        with mock.patch.object(sb, "pane_exit_read_log", return_value=("", None, None, "herdr log not read: Permission denied")):
+            self.run_pass(50)
+        self.assertIn("not read", self.audit("fleetpane.exit_note")[-1]["detail"]["note"])
+
+    def test_a_large_log_is_read_only_in_its_tail_and_is_never_changed(self):
+        filler = ("%s  INFO herdr::logging: filler\n" % self.stamp(-9000)) * 100000
+        self.write_log(filler, self.exit_line(-5, 61, 130))
+        before = (self.log.stat().st_size, self.log.stat().st_mtime_ns)
+        self.assertGreater(before[0], 2 * sb.PANE_EXIT_TAIL_BYTES)
+        reads = []
+        real = open
+
+        def spy(path, mode="r", *a, **k):
+            handle = real(path, mode, *a, **k)
+            if str(path) == str(self.log):
+                reads.append(mode)
+                inner = handle.read
+                handle.read = lambda n=-1: (reads.append(n), inner(n))[1]
+            return handle
+        with mock.patch("builtins.open", spy):
+            self.run_pass()
+        self.assertEqual([m for m in reads if isinstance(m, str)], ["rb"])
+        self.assertTrue(all(n <= sb.PANE_EXIT_TAIL_BYTES for n in reads if isinstance(n, int)))
+        self.assertEqual((self.log.stat().st_size, self.log.stat().st_mtime_ns), before)
+        self.assertEqual([e["detail"]["pane"] for e in self.audit("fleetpane.exit")], ["61"])
+
+    def count_state_writes(self, passes):
+        """Run the real pass at each offset and count the renames onto pane-exit.json (the only per-pass file pane_exit_pass writes)."""
+        wrote, real = [0], os.rename
+
+        def counting(a, b):
+            wrote[0] += os.path.basename(str(b)) == sb.PANE_EXIT_FILE
+            return real(a, b)
+        with mock.patch.object(os, "rename", counting):
+            for offset in passes:
+                self.run_pass(offset)
+        return wrote[0]
+
+    def test_the_state_file_is_written_only_when_it_changed(self):
+        self.three_kinds()
+        self.assertEqual(self.count_state_writes([10]), 4, "three exits (one write each) and the log as read")
+        self.assertEqual(self.count_state_writes(range(11, 51)), 0, "40 idle passes: the same seen set and log, no write")
+        with self.log.open("a") as handle:
+            handle.write(self.exit_line(-5, 14, 0))
+        self.assertEqual(self.count_state_writes([60, 61, 62]), 2, "a new exit and the log growing are written once, not again")
+
+    def append(self, text):
+        with self.log.open("a") as handle:
+            handle.write(text)
+
+    def test_a_log_that_grows_by_other_events_does_not_rewrite_the_state_file_and_the_mutant_that_stores_the_size_every_pass_does(self):
+        self.three_kinds()
+        self.run_pass()
+        other = "%s  INFO herdr::agent: agent state changed pane=11 state=busy\n" % self.stamp(0)
+
+        def idle_writes(passes):
+            writes = 0
+            for offset in passes:
+                self.append(other)   # herdr's log grows on every event, not only exits
+                writes += self.count_state_writes([offset])
+            return writes
+        self.assertEqual(idle_writes(range(11, 41)), 0, "30 passes with a growing log and no exit: no write")
+        import inspect
+        source = inspect.getsource(sb.pane_exit_pass)
+        guard = "if rotated or not stored_log or"
+        self.assertIn(guard, source)
+        namespace = dict(sb.__dict__)
+        exec(source.replace(guard, "if True or"), namespace)   # the mutant: the size is stored at every pass
+        with mock.patch.object(sb, "pane_exit_pass", namespace["pane_exit_pass"]):
+            self.assertGreaterEqual(idle_writes(range(41, 51)), 10, "the mutant rewrites the file at each pass: the test sees it")
+
+    def test_the_log_size_is_pinned_in_memory_by_grow_then_truncate_and_a_mutant_each_for_a_stored_size_and_for_no_memory_fails(self):
+        """Grow by other events (no write), truncate to a size ABOVE the stored size but BELOW the in-memory size (a rotation seen only against memory:
+        one write, the new exit not missed), grow again (no write)."""
+        import inspect
+        self.three_kinds()
+        self.run_pass()
+        stored_size = self.log.stat().st_size
+        other = "%s  INFO herdr::agent: agent state changed pane=11 state=busy\n" % self.stamp(0)
+
+        def idle_writes(passes):
+            writes = 0
+            for offset in passes:
+                self.append(other)
+                writes += self.count_state_writes([offset])
+            return writes
+
+        def scenario():
+            self.assertEqual(idle_writes(range(11, 31)), 0, "growth by other events: no write")
+            grown = self.log.stat().st_size
+            new_exit = self.exit_line(-20, 15, 0)
+            padding = other * ((stored_size - len(new_exit)) // len(other) + 1)
+            self.log.write_text(padding + new_exit)
+            truncated = self.log.stat().st_size
+            self.assertTrue(stored_size < truncated < grown, "the truncated log is above the stored size and below the in-memory size")
+            writes = self.count_state_writes([31])
+            exits = [e["detail"]["pane"] for e in self.audit("fleetpane.exit")]
+            self.assertEqual(writes, 2, "the rotation: one write for the new exit's mark, one for the log")
+            self.assertIn("15", exits, "no exit missed across the truncation")
+            self.assertEqual(len([e for e in self.audit("fleetpane.exit_note") if "rotated" in e["detail"]["note"]]), 1, "the truncation is detected against the in-memory size")
+            self.assertEqual(idle_writes(range(32, 42)), 0, "growth again: no write")
+
+        source = inspect.getsource(sb.pane_exit_pass)
+        mutants = {
+            "stored size at every pass": ("if rotated or not stored_log or", "if True or"),
+            "no in-memory update": ("    engine.pane_exit_log = {\"size\": size, \"ino\": inode}\n", ""),
+        }
+        for name, (old, new) in mutants.items():
+            self.assertIn(old, source, name)
+        scenario()
+        for name, (old, new) in mutants.items():
+            with self.subTest(mutant=name):
+                self.setUp()
+                self.three_kinds()
+                namespace = dict(sb.__dict__)
+                exec(source.replace(old, new), namespace)
+                with mock.patch.object(sb, "pane_exit_pass", namespace["pane_exit_pass"]):
+                    self.run_pass()
+                    with self.assertRaises(AssertionError, msg="the mutant %s passed" % name):
+                        scenario()
+
+    def test_each_field_of_the_saved_payload_changes_it_only_for_its_own_reason(self):
+        """The payload is {"seen": {key: epoch}, "log": {"size", "ino"}}. seen changes with a new exit or burst, or a key aging out (PANE_EXIT_SEEN_KEEP);
+        log.ino with a rotation; log.size with a shrink (rotation) or alongside a change of seen, and never by growth alone."""
+        self.three_kinds()
+        self.run_pass()
+        self.append(self.exit_line(-50, 14, 0))
+        self.assertEqual(self.count_state_writes([11]), 2, "seen: a new exit")
+        self.log.write_text(self.exit_line(-40, 16, 0))   # shrink
+        before = self.count_state_writes([12])
+        self.assertGreaterEqual(before, 1, "log.size shrank: a rotation, written")
+        self.assertEqual(self.count_state_writes([13, 14]), 0)
+        inode = self.log.stat().st_ino
+        self.log.unlink()
+        self.log.write_text(self.exit_line(-40, 16, 0))   # a new file of the same size: the inode changed
+        if self.log.stat().st_ino == inode:
+            self.skipTest("the file system reused the inode")
+        self.assertEqual(self.count_state_writes([15]), 1, "log.ino: a rotation")
+        self.assertEqual(self.count_state_writes([16]), 0)
+        stored = sb._read_small(self.world.state, sb.PANE_EXIT_FILE)
+        stored["seen"]["old:1"] = self.NOW - sb.PANE_EXIT_SEEN_KEEP - 10   # a key past its keep time
+        sb._write_small(self.world.state, sb.PANE_EXIT_FILE, stored)
+        self.assertEqual(self.count_state_writes([17]), 1, "seen: a key aged out")
+        self.assertEqual(self.count_state_writes([18]), 0)
+
+    def test_the_exits_seen_are_kept_in_the_state_file_so_a_restart_writes_nothing_twice(self):
+        self.three_kinds()
+        self.run_pass()
+        self.assertEqual(len(self.audit("fleetpane.exit")), 3)
+        self.assertEqual(len(sb._read_small(self.world.state, sb.PANE_EXIT_FILE)["seen"]), 3)
+        self.engine.__dict__.pop("pane_exit_seen", None)   # a restart: nothing in memory, only the file
+        self.run_pass(20)
+        self.assertEqual(len(self.audit("fleetpane.exit")), 3)
+
+    def test_a_state_file_that_cannot_be_written_does_not_make_the_next_pass_write_the_exits_again(self):
+        self.three_kinds()
+        with mock.patch.object(sb, "_write_small", side_effect=OSError(28, "No space left")):
+            self.run_pass()
+            self.run_pass(20)
+        self.assertEqual(len(self.audit("fleetpane.exit")), 3)
+        self.assertTrue(self.audit("fleetpane.error"))
+
+    def test_an_exit_older_than_an_hour_at_the_first_look_is_not_written(self):
+        self.write_log(self.exit_line(-7200, 71, 0))
+        self.run_pass()
+        self.assertEqual(self.audit("fleetpane.exit"), [])
+
+    def test_the_documentation_names_the_cause_first_the_records_and_where_to_look(self):
+        text = (Path(SWITCHBOARD).resolve().parent.parent / "docs" / "switchboard.md").read_text()
+        start = text.index("### Why a pane ended")
+        section = text[start:text.index("\n### ", start + 5)]
+        self.assertLess(section.index("The cause, first"), section.index("Records that existed"))
+        self.assertLess(section.index("Records that existed"), section.index("Records that did not exist"))
+        existed, missing = section.split("Records that existed")[1].split("Records that did not exist")
+        self.assertIn("fleetpane.dead", existed + missing)
+        self.assertIn("05:26:07Z", existed)
+        self.assertIn("05:26:07Z", missing)
+        self.assertIn("fleetpane.exit", section)
+        self.assertIn("herdr-server.log", section)
+        self.assertIn("slot records", section)
+
+
+class TestPaneExitBoundaries(TestPaneExit):
+    """#1030 rev-2: every guard, boundary, recipient, name match and config read of the pane-exit code has a row here. The rows are derived from the code
+    (the completeness tests read it with ast); a mutant of each (a window widened or narrowed, a filter or guard removed) fails a row."""
+
+    def fresh(self):
+        """A clean slate inside one test: no audit, no state file, no memory of seen exits."""
+        self.world.audit_path.write_text("")
+        (self.world.state / sb.PANE_EXIT_FILE).unlink(missing_ok=True)
+        self.engine.__dict__.pop("pane_exit_seen", None)
+        self.engine.__dict__.pop("pane_exit_bursts", None)
+        self.engine._last.clear()
+
+    def signal_of(self, terminated_offset):
+        self.fresh()
+        self.write_log(self.exit_line(-30, 81, 0), self.hangup_line(-30 + terminated_offset, 81))
+        self.run_pass()
+        return self.audit("fleetpane.exit")[0]["detail"]["signal"]
+
+    def test_the_signal_line_counts_from_the_exit_to_ten_seconds_after_and_not_eleven_or_before(self):
+        for offset, expected in ((0, "Hangup"), (10, "Hangup"), (11, None), (-1, None)):
+            with self.subTest(offset=offset):
+                self.assertEqual(self.signal_of(offset), expected)
+
+    def burst_panes(self, gaps):
+        self.fresh()
+        self.engine.discover(self.world.clock.now())
+        at, lines = -100, []
+        for index, gap in enumerate([0] + list(gaps)):
+            at += gap
+            lines.append(self.exit_line(at, 200 + index, 130))
+        self.write_log(*lines)
+        self.run_pass()
+        return [b["detail"]["panes"] for b in self.audit("fleetpane.exit_burst")]
+
+    def test_a_burst_is_three_exits_each_at_most_five_seconds_after_the_one_before(self):
+        rows = ((("two exits", [4]), []), (("three at 4 s", [4, 4]), [["200", "201", "202"]]), (("three at 5 s", [5, 5]), [["200", "201", "202"]]),
+                (("three at 6 s", [6, 6]), []), (("three at 59 s", [59, 59]), []), (("a 6 s gap splits", [4, 6, 4]), []), (("four at 4 s", [4, 4, 4]), [["200", "201", "202", "203"]]))
+        for (label, gaps), expected in rows:
+            with self.subTest(label):
+                self.assertEqual(self.burst_panes(gaps), expected)
+
+    def asked_of(self, closed_offset, exit_offset=-5):
+        self.fresh()
+        entry = {"ts": self.stamp(closed_offset), "actor": "cos", "event": "fleetpane.closed", "subject": "x", "detail": {"pane": "w1:p91", "by": "cos"}}
+        self.world.audit_path.write_text(json.dumps(entry) + "\n")
+        self.write_log(self.exit_line(exit_offset, 91, 0))
+        self.run_pass()
+        return [e for e in self.audit("fleetpane.exit")][0]["detail"]["asked"]
+
+    def test_a_close_counts_from_five_minutes_before_the_exit_to_thirty_seconds_after_it(self):
+        for before, expected in ((299, True), (301, False), (-29, True), (-31, False)):
+            with self.subTest(close_seconds_before_exit=before):
+                self.assertEqual(self.asked_of(-5 - before), expected)
+
+    def test_an_exit_is_written_at_an_age_just_under_an_hour_and_not_just_over_it(self):
+        for age, written in ((3500, True), (3700, False)):
+            with self.subTest(age=age):
+                self.fresh()
+                self.write_log(self.exit_line(10 - age, 92, 0))
+                self.run_pass()
+                self.assertEqual(len(self.audit("fleetpane.exit")), 1 if written else 0)
+
+    def test_at_most_twelve_active_runs_are_listed(self):
+        for index in range(15):
+            self.make_job("job%02d" % index, self.NOW - 100)
+        self.write_log(self.exit_line(-5, 93, 0))
+        self.run_pass()
+        self.assertEqual(len(self.audit("fleetpane.exit")[0]["detail"]["active"]), sb.PANE_EXIT_NAMES)
+
+    def test_a_pass_without_an_audit_or_a_state_directory_writes_nothing_and_does_not_raise(self):
+        self.write_log(self.exit_line(-5, 94, 0))
+        for attr in ("audit", "state_dir"):
+            with self.subTest(attr=attr):
+                self.fresh()
+                saved = getattr(self.engine, attr)
+                setattr(self.engine, attr, None)
+                try:
+                    self.run_pass()
+                finally:
+                    setattr(self.engine, attr, saved)
+                self.assertEqual(self.audit("fleetpane.exit"), [])
+
+    def test_the_real_pass_and_real_fact_sources_give_one_exit_line_and_one_fact(self):
+        self.engine.discover(self.world.clock.now())
+        now = self.world.clock.now()
+        self.log.write_text("".join(self.exit_line(now - self.NOW - 20 + i, 300 + i, 130) for i in range(3)))
+        self.assertEqual(self.engine.config["herdr_log"], str(self.log))
+        sb.publish_decisions(self.engine)
+        self.assertEqual(len(self.audit("fleetpane.exit")), 3)
+        self.assertEqual(len(self.audit("fleetpane.exit_burst")), 1)
+        sources = [s for s in sb.fact_sources(self.world.state) if isinstance(s, sb.PaneExitFacts)]
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(len([s for s in self.engine.sources if isinstance(s, sb.PaneExitFacts)]), 1)
+        facts = [f for s in self.engine.sources if isinstance(s, sb.PaneExitFacts) for f in s()]
+        self.assertEqual(len(facts), 1)
+
+    def test_a_pass_with_no_new_exit_reads_no_audit_tail_no_job_records_and_no_ps_and_a_new_exit_reads_each_once(self):
+        self.make_job("alive", self.NOW - 50)
+        self.write_log(self.exit_line(-5, 95, 0))
+        self.run_pass()   # the exit is written and marked seen
+        counts = {"tail": 0, "runs": 0, "state": 0}
+        real = {"tail": sb.pane_exit_audit_tail, "runs": sb.pane_exit_runs, "state": sb.job_state}
+
+        def counting(name):
+            def inner(*a, **k):
+                counts[name] += 1
+                return real[name](*a, **k)
+            return inner
+        with mock.patch.object(sb, "pane_exit_audit_tail", counting("tail")), mock.patch.object(sb, "pane_exit_runs", counting("runs")), \
+                mock.patch.object(sb, "job_state", counting("state")):
+            for later in (20, 30, 40):
+                self.run_pass(later)
+            self.assertEqual(counts, {"tail": 0, "runs": 0, "state": 0})
+            self.log.write_text(self.log.read_text() + self.exit_line(-4, 96, 0) + self.exit_line(-3, 97, 0))
+            self.run_pass(50)
+            self.assertEqual(counts, {"tail": 1, "runs": 1, "state": 1})
+
+    def test_the_job_records_read_are_capped(self):
+        for index in range(sb.PANE_EXIT_MAX_JOBS + 5):
+            self.make_job("j%04d" % index, self.NOW - 100)
+        with mock.patch.object(sb, "job_read", wraps=sb.job_read) as reader:
+            sb.pane_exit_runs(self.engine)
+        self.assertEqual(reader.call_count, sb.PANE_EXIT_MAX_JOBS)
+
+    def failing_append(self, event, nth):
+        """An audit that raises on its nth line of `event` (once): the pass raises out, as a full disk would make it."""
+        real, count = self.engine.audit.append, {"n": 0}
+
+        def append(actor, name, subject, detail=None, *a, **k):
+            if name == event:
+                count["n"] += 1
+                if count["n"] == nth:
+                    raise OSError(28, "No space left")
+            return real(actor, name, subject, detail, *a, **k)
+        return mock.patch.object(self.engine.audit, "append", append)
+
+    def test_an_exit_line_that_fails_to_append_never_repeats_an_earlier_line_and_is_written_by_the_next_pass(self):
+        for nth in (1, 2, 3):   # the first, the middle and the last exit
+            with self.subTest(failing=nth):
+                self.fresh()
+                self.write_log(*[self.exit_line(-100 + 20 * i, 500 + i, 0) for i in range(3)])
+                with self.failing_append("fleetpane.exit", nth):
+                    with self.assertRaises(OSError):
+                        self.run_pass()
+                self.assertEqual(len(self.audit("fleetpane.exit")), nth - 1)
+                self.run_pass(20)
+                self.run_pass(30)
+                self.assertEqual(sorted(e["detail"]["pane"] for e in self.audit("fleetpane.exit")), ["500", "501", "502"])
+
+    def test_a_burst_line_that_fails_to_append_does_not_repeat_the_exit_lines_and_is_written_once_later(self):
+        self.engine.discover(self.world.clock.now())
+        self.write_log(*[self.exit_line(-20 + i, 520 + i, 130) for i in range(3)])
+        with self.failing_append("fleetpane.exit_burst", 1):
+            with self.assertRaises(OSError):
+                self.run_pass()
+        self.assertEqual((len(self.audit("fleetpane.exit")), len(self.audit("fleetpane.exit_burst"))), (3, 0))
+        self.run_pass(20)
+        self.run_pass(30)
+        self.assertEqual((len(self.audit("fleetpane.exit")), len(self.audit("fleetpane.exit_burst"))), (3, 1))
+
+    def test_a_second_burst_line_that_fails_does_not_repeat_the_first(self):
+        self.engine.discover(self.world.clock.now())
+        self.write_log(*[self.exit_line(base + i, 560 + n * 3 + i, 130) for n, base in enumerate((-100, -50)) for i in range(3)])
+        with self.failing_append("fleetpane.exit_burst", 2):
+            with self.assertRaises(OSError):
+                self.run_pass()
+        self.assertEqual(len(self.audit("fleetpane.exit_burst")), 1)
+        self.run_pass(20)
+        self.run_pass(30)
+        self.assertEqual(len(self.audit("fleetpane.exit_burst")), 2)
+
+    def test_the_state_file_is_written_after_each_exit_line(self):
+        self.write_log(*[self.exit_line(-100 + 20 * i, 540 + i, 0) for i in range(3)])
+        sizes = []
+        real = sb._write_small
+        with mock.patch.object(sb, "_write_small", lambda d, n, data: (sizes.append(len(data["seen"])), real(d, n, data))[1]):
+            self.run_pass()
+        self.assertEqual(sizes[:3], [1, 2, 3])
+
+    def burst_source(self):
+        self.engine.discover(self.world.clock.now())
+        self.write_log(*[self.exit_line(-20 + i, 400 + i, 130) for i in range(3)])
+        self.run_pass()
+        source = sb.PaneExitFacts()
+        source.bind(self.engine)
+        return source
+
+    def test_the_fact_goes_to_the_chief_of_staff_only_and_not_to_another_agent(self):
+        self.world.add_agent("other", fleet={"role": "orchestrator"})
+        source = self.burst_source()
+        self.assertEqual([f.recipient for f in source()], ["cos"])
+
+    def test_the_fact_is_not_built_while_discovery_has_problems(self):
+        source = self.burst_source()
+        self.assertEqual(len(source()), 1)
+        self.engine.discovery.problems = ["the service could not be read"]
+        self.assertEqual(source(), [])
+
+    def test_a_pane_number_names_an_agent_only_as_a_whole_number_or_the_p_of_a_pane_id(self):
+        for recorded, pane, expected in (("w1:p3", "3", True), ("w1:p13", "3", False), ("3", "3", True), ("13", "3", False), ("w1:p3", "13", False), ("", "3", False), (None, "3", False)):
+            with self.subTest(recorded=recorded, pane=pane):
+                self.assertEqual(sb._pane_matches(recorded, pane), expected)
+
+    def test_an_exit_of_pane_three_names_the_agent_of_w1_p3_and_not_the_one_of_w1_p13(self):
+        registry = sb.load_module("registry")
+        registry.upsert(self.world.state, "agent-p13", {"session": "ses_example13", "pane": "w1:p13"})
+        registry.upsert(self.world.state, "agent-p3", {"session": "ses_example3", "pane": "w1:p3"})
+        self.write_log(self.exit_line(-5, 3, 0), self.exit_line(-4, 55, 0))
+        self.run_pass()
+        lines = {e["detail"]["pane"]: e for e in self.audit("fleetpane.exit")}
+        self.assertEqual(lines["3"]["detail"]["agent"], "agent-p3")
+        self.assertEqual(lines["3"]["subject"], "agent-p3")
+        self.assertIsNone(lines["55"]["detail"]["agent"])
+        self.assertEqual(lines["55"]["subject"], "pane:55")
+
+    def test_each_config_key_is_declared_with_its_default_and_refuses_a_wrong_value(self):
+        self.assertEqual((sb.DEFAULTS["herdr_log"], sb.DEFAULTS["pane_exit_burst_seconds"], sb.DEFAULTS["pane_exit_burst_min"]),
+                         (sb.HERDR_LOG_DEFAULT, sb.PANE_EXIT_BURST_SECONDS, sb.PANE_EXIT_BURST_MIN))
+        for key, good, bad in (("herdr_log", ["/x/herdr.log"], [5, "", "  ", None, ["a"]]),
+                               ("pane_exit_burst_seconds", [1, 2.5, 3600], [0, -1, "5", True, 3601, float("nan"), None]),
+                               ("pane_exit_burst_min", [2, 3, 1000], [1, 0, 2.5, "3", True, 1001, None])):
+            for value in good:
+                with self.subTest(key=key, good=value):
+                    self.assertEqual(sb.validate_config({key: value})[key], value)
+            for value in bad:
+                with self.subTest(key=key, bad=value):
+                    with self.assertRaises(sb.ConfigError):
+                        sb.validate_config({key: value})
+
+    def test_the_declared_keys_are_not_warned_about_as_unknown(self):
+        sb.UNKNOWN_CONFIG.clear()
+        sb.validate_config({"herdr_log": "/x/h.log", "pane_exit_burst_seconds": 5, "pane_exit_burst_min": 3})
+        self.assertEqual([k for k in sb.UNKNOWN_CONFIG if k[1].startswith(("herdr_log", "pane_exit"))], [])
+
+    def test_the_burst_settings_are_the_ones_the_pass_uses(self):
+        self.engine.config = dict(self.engine.config, pane_exit_burst_min=2)
+        self.assertEqual(self.burst_panes([4]), [["200", "201"]])
+        self.engine.config = dict(self.engine.config, pane_exit_burst_min=3, pane_exit_burst_seconds=30)
+        self.assertEqual(self.burst_panes([20, 20]), [["200", "201", "202"]])
+
+    # ---- the rows are derived from the code
+    @staticmethod
+    def new_code():
+        import ast
+        tree = ast.parse(SWITCHBOARD.read_text())
+        wanted = {"pane_exit_events", "pane_exit_read_log", "_pane_matches", "pane_exit_audit_tail", "_pane_exit_asked", "pane_exit_runs", "pane_exit_active",
+                  "pane_exit_pass", "PaneExitFacts"}
+        return [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in wanted]
+
+    def test_every_config_key_the_new_code_reads_is_declared(self):
+        import ast
+        keys = set()
+        for node in self.new_code():
+            for sub in ast.walk(node):
+                if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute) and sub.func.attr == "get" and isinstance(sub.func.value, ast.Attribute)
+                        and sub.func.value.attr == "config" and sub.args and isinstance(sub.args[0], ast.Constant)):
+                    keys.add(sub.args[0].value)
+                if (isinstance(sub, ast.Subscript) and isinstance(sub.value, ast.Attribute) and sub.value.attr == "config" and isinstance(sub.slice, ast.Constant)):
+                    keys.add(sub.slice.value)
+        self.assertEqual(keys, {"herdr_log", "pane_exit_burst_seconds", "pane_exit_burst_min"})
+        for key in keys:
+            self.assertIn(key, sb.DEFAULTS)
+            self.assertIn(key, sb.config_known_keys())
+
+    COVERED = {"PANE_EXIT_TAIL_BYTES": "test_a_large_log_is_read_only_in_its_tail", "PANE_EXIT_MAX_AGE": "test_an_exit_is_written_at_an_age_just_under_an_hour",
+               "PANE_EXIT_BURST_SECONDS": "test_a_burst_is_three_exits", "PANE_EXIT_BURST_MIN": "test_a_burst_is_three_exits",
+               "PANE_EXIT_ASKED_BEFORE": "test_a_close_counts_from", "PANE_EXIT_ASKED_AFTER": "test_a_close_counts_from",
+               "PANE_EXIT_SIGNAL_SECONDS": "test_the_signal_line_counts", "PANE_EXIT_SEEN_KEEP": "test_the_exits_seen_are_kept_in_the_state_file",
+               "PANE_EXIT_MAX_PER_PASS": "test_a_burst_of_thirty_panes", "PANE_EXIT_MAX_JOBS": "test_the_job_records_read_are_capped", "PANE_EXIT_NAMES": "test_at_most_twelve_active_runs_are_listed",
+               "PANE_EXIT_FILE": "test_the_exits_seen_are_kept_in_the_state_file", "HERDR_LOG_DEFAULT": "test_each_config_key_is_declared"}
+
+    def test_every_constant_the_new_code_uses_has_a_row_that_names_an_existing_test(self):
+        import ast
+        used = {sub.id for node in self.new_code() for sub in ast.walk(node) if isinstance(sub, ast.Name) and sub.id.startswith(("PANE_EXIT_", "HERDR_LOG"))}
+        self.assertEqual(used - set(self.COVERED), set(), "a constant of the pane-exit code has no row")
+        names = [n for n in dir(TestPaneExitBoundaries)]
+        for constant, test in self.COVERED.items():
+            self.assertTrue(any(n.startswith(test) for n in names), "%s: no test starts %s" % (constant, test))
+
+    def test_every_guard_of_the_pass_is_one_of_the_rows(self):
+        import ast
+        pass_fn = next(n for n in self.new_code() if getattr(n, "name", "") == "pane_exit_pass")
+        guards = sum(isinstance(n, ast.If) for n in ast.walk(pass_fn))
+        self.assertLessEqual(guards, 16, "a guard was added to pane_exit_pass: give it a row and a mutant, then raise this count")
 
 
 if __name__ == "__main__":
