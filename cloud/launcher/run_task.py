@@ -108,16 +108,10 @@ class Driver:
     def git_token(self):
         raw = self.env.get("CW_GIT_TOKEN_CMD")
         cmd = shlex.split(raw) if raw else [sys.executable, os.path.join(HERE, "app_token.py"), self.a.repo]
-        try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL, env=dict(self.env, GH_REPO=self.a.repo))
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            p = None
-        token = (p.stdout if p and p.returncode == 0 else "").strip()
-        if not token or len(token) > 4096:
-            why = ""
-            if p and p.stderr.strip():
-                why = ": " + cw.scrub(p.stderr.strip().splitlines()[-1], (), 200)
-            raise cw.CloudError("the git token command gave no usable token%s; nothing was created" % why, cw.EXIT_USAGE)
+        try:   # THE mint call, shared with the reaper's renewal (cloud_worker.run_git_token_cmd)
+            token = cw.run_git_token_cmd(cmd, self.a.repo, self.env)
+        except cw.CloudError as e:
+            raise cw.CloudError("%s; nothing was created" % e, cw.EXIT_USAGE) from None
         return token
 
     # -- children --

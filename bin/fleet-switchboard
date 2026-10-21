@@ -345,6 +345,9 @@ DEFAULTS = {
     "clear_remind_minutes": 15,    # #827: a cleared, mergeable pull request with gates READY that the lane has not merged this long gets ONE reminder per head
     "send_timeout_seconds": 60,    # `send` as a whole (the sum of its v2 and herdr calls): past it, a clear failure line, never a silent minutes-long wait
     "poll_seconds": 5,
+    "herdr_log": "~/.config/herdr/herdr-server.log",   # #1030: herdr's server log, read-only and bounded, for `fleetpane.exit` (a non-empty path)
+    "pane_exit_burst_seconds": 5,  # #1030: panes that end this close together (seconds, above 0 up to 3600) are one burst
+    "pane_exit_burst_min": 3,      # #1030: this many panes in one burst make the `fleetpane.exit_burst` line and the Chief of Staff's fact (a whole number from 2 to 1000)
     "cpu_guard": None,             # load over cores and swap: None = defaults (high_ratio 3 for 5 minutes, swap_percent 90 for 5 minutes, each wakes the Chief of Staff once per episode); false = off; or {"high_ratio": n, "minutes": n, "swap_percent": n, "swap_minutes": n}
     "disk_guard": None,            # free space of the state directory's volume: None = defaults (min_free_gb 50, hard_free_gb 10); false = off; or {"min_free_gb": n, "hard_free_gb": n}
     "reds": None,                  # `reds` (#342): {"reference_events": {"owner/repo": ["merge_group", "schedule"]}, "workflow": {"owner/repo": "ci.yml"}}: the events whose runs on the default branch are "main's runs" (default: push), and an optional override of the workflow (default: the one that holds the pull request's artifact)
@@ -648,6 +651,12 @@ def validate_config(raw, source="config"):
                 "worker_lookback_hours", "stalled_working_hours", "review_window_minutes", "rider_max_age_seconds"):
         if not _is_number(config[key]) or config[key] <= 0:
             raise ConfigError("%s: %r must be a positive number, got %r" % (source, key, config[key]))
+    if not isinstance(config["herdr_log"], str) or not config["herdr_log"].strip():
+        raise ConfigError("%s: 'herdr_log' must be a non-empty path, got %r" % (source, config["herdr_log"]))
+    if not _is_number(config["pane_exit_burst_seconds"]) or not 0 < config["pane_exit_burst_seconds"] <= 3600:
+        raise ConfigError("%s: 'pane_exit_burst_seconds' must be a number above 0 and at most 3600, got %r" % (source, config["pane_exit_burst_seconds"]))
+    if not isinstance(config["pane_exit_burst_min"], int) or isinstance(config["pane_exit_burst_min"], bool) or not 2 <= config["pane_exit_burst_min"] <= 1000:
+        raise ConfigError("%s: 'pane_exit_burst_min' must be a whole number from 2 to 1000, got %r" % (source, config["pane_exit_burst_min"]))
     if not retire_idle_window_ok(config["retire_idle_minutes"]):
         raise ConfigError("%s: 'retire_idle_minutes' must be a finite number from %d to %d, got %r" % (source, RETIRE_IDLE_MIN, RETIRE_IDLE_MAX, config["retire_idle_minutes"]))
     validate_intent_config(config, source)
@@ -2165,6 +2174,9 @@ class HerdrClient:
     def agent_list(self):
         return self._result(self._call("agent", "list"), "agents", list)
 
+    def tab_list(self):
+        return self._result(self._call("tab", "list"), "tabs", list)
+
     def agent_get(self, target):
         return self._result(self._call("agent", "get", target), "agent", dict)
 
@@ -3231,7 +3243,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), PlanWakeFacts(), AlertWakeFacts(), JobFacts(), PaneFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts(), HeavyOrphanFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), PlanWakeFacts(), AlertWakeFacts(), JobFacts(), PaneFacts(), PaneExitFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts(), HeavyOrphanFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -6982,6 +6994,33 @@ def watch_terminal_closed(engine, name, session_id):
     return record is not None and record.get("session") == session_id
 
 
+BELL_GLYPH = "\U0001f514"   # the heartbeat's old opt-in glyph in a tab label: read ONCE by the migration below, never again
+
+
+def bell_migration(engine, registry, now):
+    """#973, once: write the heartbeat's `bell` field for every recorded agent from the live tab labels (the opt-in the heartbeat used to read each pass),
+    on a whole read only (agent list and tab list both answered); audited per agent; a marker file stops it from running, or reading herdr, again."""
+    if registry.bell_migrated(engine.state_dir):
+        return
+    try:
+        agents, tabs = engine.herdr.agent_list(), engine.herdr.tab_list()
+    except HerdrError as err:
+        engine._note("fleetpane.error", None, {"error": "bell migration waits: %s" % _one_line(str(err), 100)})
+        return
+    if not agents:   # a whole but EMPTY live list (herdr just restarted) is no evidence of anyone's label: with recorded agents to migrate it stays pending, no marker
+        recorded = [r for r in registry.read(engine.state_dir)["agents"].values() if isinstance(r, dict) and r.get("pane") and not isinstance(r.get("bell"), bool)]
+        if recorded:
+            engine._note("fleetpane.error", None, {"error": "bell migration pending: herdr listed no agents but the registry records %d" % len(recorded)})
+            return
+    labels = {t.get("tab_id"): str(t.get("label") or "") for t in tabs if isinstance(t, dict)}
+    belled = {a.get("pane_id") for a in agents if isinstance(a, dict) and BELL_GLYPH in labels.get(a.get("tab_id"), "")}
+    got = registry.migrate_bell(engine.state_dir, belled, True, now=now)
+    if got["problem"]:
+        engine._note("fleetpane.error", None, {"error": "bell migration: %s" % _one_line(got["problem"], 100)})
+    elif got["ran"] and got["changed"] and engine.audit is not None:
+        engine.audit.append(engine.actor, "registry.bell_migrated", None, {"agents": got["changed"]})
+
+
 def pane_health_pass(engine, now):
     """The daemon's look at every fleet agent's pane (after discovery). Records `pane-health.json` (what `status` shows and `reattach` reads),
     audits each change of state (`pane.detached`, `pane.dead`, `pane.recovered`) and leaves `engine.pane_alerts` for the cos fact. Reads only; bounded
@@ -6993,6 +7032,10 @@ def pane_health_pass(engine, now):
     reg = registry.read(engine.state_dir)
     if not reg["whole"]:   # a half-read registry acts on nothing (#805): no upsert, no retire, no removal
         engine._note("fleetpane.error", None, {"error": "pass skipped: %s" % _one_line(reg["problem"] or "registry not read", 100)})
+        return
+    bell_migration(engine, registry, now)
+    reg = registry.read(engine.state_dir)
+    if not reg["whole"]:
         return
     data = read_pane_health(engine.state_dir)
     states, missing = data["states"], data["missing"]
@@ -7110,6 +7153,266 @@ def pane_health_pass(engine, now):
         write_pane_health(engine.state_dir, {"agents": agents, "states": states, "missing": missing, "at": int(now)})
     except OSError as err:
         engine._note("fleetpane.error", None, {"error": "pane-health.json not written: %s" % _one_line(str(err), 100)})
+
+
+PANE_EXIT_FILE = "pane-exit.json"          # {"seen": {key: epoch}, "log": {"size", "ino"}}: the exits already written, and the log as last read
+PANE_EXIT_TAIL_BYTES = 262144              # herdr's log is read from its last 256 KiB only (about 10 minutes of a busy window): memory stays trivial
+PANE_EXIT_MAX_AGE = 3600                   # an exit older than this at the first look is marked seen and not written (a restart does not replay history)
+PANE_EXIT_BURST_SECONDS = 5                # exits this close together are one event
+PANE_EXIT_BURST_MIN = 3                    # this many panes in one burst make the summary line
+PANE_EXIT_ASKED_BEFORE = 300               # a fleet close this long before the exit is the cause...
+PANE_EXIT_ASKED_AFTER = 30                 # ...or this long after it (the audit line of a close can land just after herdr logs the exit)
+PANE_EXIT_SIGNAL_SECONDS = 10              # the `pane session terminated` line of the same pane within this long after an exit names its signal
+PANE_EXIT_SEEN_KEEP = 86400                # a seen key is forgotten after this
+PANE_EXIT_MAX_PER_PASS = 20               # exit lines written per pass: 256 KiB of herdr log holds about 1100 exit lines at most (~230 bytes each); the rest are written by the next passes
+PANE_EXIT_MAX_JOBS = 200                   # job records read at most per look (a `ps` for each ALIVE one): a real fleet holds a few dozen
+PANE_EXIT_NAMES = 12                       # active heavy runs and jobs listed at most
+HERDR_LOG_DEFAULT = "~/.config/herdr/herdr-server.log"
+_PANE_EXIT_LINE = re.compile(r'^(\S+Z)\s.*pane child exited event="pane\.exit".*?pane_id=(\d+) status="ExitStatus \{ code: (-?\d+), signal: (None|Some\((?:"?)(\w*)(?:"?)\)) \}"')
+_PANE_TERMINATED_LINE = re.compile(r'^(\S+Z)\s.*pane session terminated pane=(\d+) .*?signal=(\w+)')
+
+
+def _herdr_epoch(text):
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def pane_exit_events(text):
+    """The `pane.exit` lines of herdr's log, each with the signal herdr named: [{"pane", "code", "signal", "time", "at"}], oldest first. The signal is the one
+    in the exit status, else the one of the `pane session terminated` line of the same pane within 10 s after it. A line that does not parse is skipped."""
+    exits, ended = [], []
+    for line in text.splitlines():
+        found = _PANE_EXIT_LINE.match(line)
+        if found:
+            at = _herdr_epoch(found.group(1))
+            if at is not None:
+                exits.append({"pane": found.group(2), "code": int(found.group(3)), "signal": found.group(5) if found.group(4) != "None" and found.group(5) else None,
+                              "time": found.group(1), "at": at})
+            continue
+        found = _PANE_TERMINATED_LINE.match(line)
+        if found:
+            at = _herdr_epoch(found.group(1))
+            if at is not None:
+                ended.append((found.group(2), at, found.group(3)))
+    for event in exits:
+        if event["signal"] is None:
+            event["signal"] = next((sig for pane, at, sig in ended if pane == event["pane"] and 0 <= at - event["at"] <= PANE_EXIT_SIGNAL_SECONDS), None)
+    return sorted(exits, key=lambda e: e["at"])
+
+
+def pane_exit_read_log(path):
+    """(text, size, inode, problem): the last PANE_EXIT_TAIL_BYTES of herdr's log. Read-only (opened for reading, never written, truncated or locked); a
+    missing or unreadable log gives its problem and no text. Never raises."""
+    try:
+        with open(str(path), "rb") as handle:
+            info = os.fstat(handle.fileno())
+            start = max(0, info.st_size - PANE_EXIT_TAIL_BYTES)
+            handle.seek(start)
+            data = handle.read(PANE_EXIT_TAIL_BYTES)
+    except OSError as err:
+        return "", None, None, "herdr log not read: %s" % _one_line(err.strerror or str(err), 100)
+    text = data.decode("utf-8", "replace")
+    if start:
+        text = text.split("\n", 1)[1] if "\n" in text else ""   # the first line is cut in the middle
+    return text, info.st_size, info.st_ino, None
+
+
+def _pane_matches(recorded, pane):
+    """Does a pane id of the fleet's records (`w1:p3` or a plain number) name the number herdr's log calls `pane_id`?"""
+    recorded = str(recorded or "")
+    return bool(recorded) and (recorded == pane or recorded.endswith(":p" + pane))
+
+
+def pane_exit_audit_tail(state_dir):
+    """The parsed `fleetpane.closed` entries of the last PANE_EXIT_TAIL_BYTES of the audit, read ONCE per pass: [(epoch, pane, by)]. Never raises."""
+    path = Path(state_dir) / "audit.jsonl"
+    try:
+        with open(str(path), "rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, size - PANE_EXIT_TAIL_BYTES))
+            lines = handle.read(PANE_EXIT_TAIL_BYTES).decode("utf-8", "replace").splitlines()[1 if size > PANE_EXIT_TAIL_BYTES else 0:]
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        detail = entry.get("detail") if isinstance(entry, dict) else None
+        if isinstance(detail, dict) and entry.get("event") == "fleetpane.closed":
+            at = _audit_epoch(entry)
+            if at is not None:
+                out.append((at, detail.get("pane"), _one_line(str(detail.get("by") or "unknown"), 60)))
+    return out
+
+
+def _pane_exit_asked(closed, event):
+    """(by, True) when a fleet command closed this pane near its exit (`fleetpane.closed` of `close-pane` or `retire --close`), else (None, False). `closed` is `pane_exit_audit_tail`."""
+    for at, pane, by in reversed(closed):
+        if _pane_matches(pane, event["pane"]) and -PANE_EXIT_ASKED_AFTER <= event["at"] - at <= PANE_EXIT_ASKED_BEFORE:
+            return by, True
+    return None, False
+
+
+def pane_exit_runs(engine):
+    """What can be told of the heavy runs and jobs, read ONCE per pass: ({"heavy": [(name, since)], "jobs": [(name, started, ended or None)], "problems": [..]}).
+    A slot record holds the run's start only (`since`) and exists only while the run holds the slot: a run that has ENDED left no end time. A job record holds
+    its start, and the mtime of its `exit` file is its end. Read-only; a record that cannot be read is skipped and said in `problems`."""
+    out = {"heavy": [], "jobs": [], "problems": []}
+    try:
+        for info in load_heavy_slots()._held_records(engine.state_dir):
+            since = info.get("since")
+            if isinstance(since, (int, float)) and not isinstance(since, bool):
+                out["heavy"].append((_one_line(str(info.get("name") or "?"), 60), since))
+    except Exception:
+        out["problems"].append("heavy slot records not read")
+    try:
+        root = jobs_dir()
+        for entry in sorted(os.listdir(str(root)))[:PANE_EXIT_MAX_JOBS]:
+            record = job_read(entry, root)
+            started = record.get("started") if record else None
+            if not isinstance(started, (int, float)) or isinstance(started, bool):
+                continue
+            state = job_state(record, root)[0]
+            ended = None
+            if state == "finished":
+                try:
+                    ended = os.stat(str(job_paths(entry, root)["exit"])).st_mtime
+                except OSError:
+                    ended = None
+            if state == "alive" or (state == "finished" and ended is not None):
+                out["jobs"].append((_one_line(entry, 60), started, ended))
+    except OSError:
+        out["problems"].append("job records not read")
+    return out
+
+
+def pane_exit_active(runs, at):
+    """The heavy runs and jobs active at second `at`, [{"kind", "name", "age"}] (age in seconds at `at`). A job is active when it started at or before `at` and had
+    not ended then (alive now, or its exit file is newer than `at`). A heavy run is listed when it started at or before `at` and still holds its slot when the line is
+    written: a run that held a slot at `at` and has ended since left no end time, so it cannot be listed (the doc says so)."""
+    out = [{"kind": "heavy", "name": name, "age": int(at - since)} for name, since in runs["heavy"] if since <= at]
+    out += [{"kind": "job", "name": name, "age": int(at - started)} for name, started, ended in runs["jobs"] if started <= at and (ended is None or ended > at)]
+    return out[:PANE_EXIT_NAMES]
+
+
+def pane_exit_pass(engine, now):
+    """When herdr's log says a pane's child exited, write ONE `fleetpane.exit` audit line (pane, agent name when the registry knows it, code, signal, herdr's time,
+    whether a fleet command asked for it, and what heavy runs and jobs were active); three or more exits within a few seconds also write one `fleetpane.exit_burst`
+    line and leave it in `engine.pane_exit_bursts` for the Chief of Staff's fact. Reads herdr's log read-only and bounded; a log that is missing, unreadable or
+    rotated gives one `fleetpane.exit_note` and the pass goes on. Never raises."""
+    if engine.audit is None or engine.state_dir is None:
+        return
+    path = os.path.expanduser(str(engine.config.get("herdr_log") or HERDR_LOG_DEFAULT))
+    text, size, inode, problem = pane_exit_read_log(path)
+    stored = _read_small(engine.state_dir, PANE_EXIT_FILE)
+    seen = {k: v for k, v in (stored.get("seen") or {}).items() if isinstance(v, (int, float)) and now - v < PANE_EXIT_SEEN_KEEP}
+    last = engine.__dict__.get("pane_exit_log") or stored.get("log") or {}   # the size last read stays in memory: the file keeps it only when it matters
+    if problem:
+        engine._note("fleetpane.exit_note", None, {"note": problem})
+        return
+    rotated = (isinstance(last.get("size"), int) and size < last["size"]) or (last.get("ino") is not None and last.get("ino") != inode)
+    if rotated:
+        engine._note("fleetpane.exit_note", None, {"note": "herdr log was rotated or truncated: read again from its end"})
+    else:
+        engine._last.pop(("fleetpane.exit_note", None), None)
+    names = {}
+    try:
+        reg = load_module("registry").read(engine.state_dir)
+        names = {row.get("pane"): n for n, row in reg["agents"].items() if isinstance(row, dict) and row.get("pane")}
+    except Exception:
+        pass
+    events = pane_exit_events(text)
+    closed, runs, written = None, None, 0   # the audit tail, the slot and job records and their `ps` are read only when an exit is to be written: a quiet pass costs the log tail and the seen set
+    seen.update(engine.__dict__.get("pane_exit_seen", {}))   # what a failed write of pane-exit.json could not keep
+    stored_log = stored.get("log") or {}
+    log_state = {"size": stored_log.get("size"), "ino": stored_log.get("ino")}   # what the file holds: moved to the current log only on a rotation or with a real change of "seen"
+    on_disk = [{"seen": stored.get("seen") or {}, "log": stored.get("log") or {}}]   # what the file holds now: an unchanged state is not written again
+
+    def save():
+        """Audit first, then this: called right after EACH audit line, so a later append that raises never makes an earlier line be written again (a line twice
+        reads as two exits, so a gap that the next pass fills is better than a duplicate; a crash between the two writes repeats at most that one line)."""
+        engine.pane_exit_seen = {k: v for k, v in seen.items() if now - v < PANE_EXIT_SEEN_KEEP}
+        payload = {"seen": dict(seen), "log": dict(log_state)}
+        if payload == on_disk[0]:
+            return
+        try:
+            _write_small(engine.state_dir, PANE_EXIT_FILE, payload)
+            on_disk[0] = payload
+        except OSError as err:
+            engine._note("fleetpane.error", None, {"error": "pane-exit.json not written: %s" % _one_line(str(err), 100)})
+    window = float(engine.config.get("pane_exit_burst_seconds", PANE_EXIT_BURST_SECONDS))
+    for event in events:
+        key = "%s:%s" % (event["time"], event["pane"])
+        if key in seen:
+            continue
+        if now - event["at"] > PANE_EXIT_MAX_AGE:
+            seen[key] = event["at"]
+            continue
+        if written >= PANE_EXIT_MAX_PER_PASS:
+            continue   # not marked seen: the next pass writes it
+        if runs is None:
+            closed, runs = pane_exit_audit_tail(engine.state_dir), pane_exit_runs(engine)
+        by, asked = _pane_exit_asked(closed, event)
+        name = next((n for p, n in names.items() if _pane_matches(p, event["pane"])), None)
+        detail = {"pane": event["pane"], "agent": name, "code": event["code"], "signal": event["signal"], "herdr_time": event["time"], "asked": asked, "by": by,
+                  "active": pane_exit_active(runs, event["at"]), "active_basis": "heavy: still holding its slot when written; jobs: by start and end time"}
+        if runs["problems"]:
+            detail["active_problem"] = "; ".join(runs["problems"])
+        engine.audit.append(engine.actor, "fleetpane.exit", name or "pane:%s" % event["pane"], detail)
+        seen[key] = event["at"]   # only after the line is written
+        written += 1
+        save()
+    bursts, group = {}, []
+    for event in events + [None]:
+        if event is not None and (not group or event["at"] - group[-1]["at"] <= window):
+            group.append(event)
+            continue
+        if len(group) >= int(engine.config.get("pane_exit_burst_min", PANE_EXIT_BURST_MIN)) and now - group[0]["at"] <= PANE_EXIT_MAX_AGE:
+            key = "burst:%s:%s" % (group[0]["time"], group[0]["pane"])
+            panes = [e["pane"] for e in group]
+            bursts[key] = {"panes": panes, "agents": [next((n for p, n in names.items() if _pane_matches(p, e["pane"])), None) for e in group], "from": group[0]["time"],
+                           "to": group[-1]["time"], "codes": sorted({e["code"] for e in group}), "at": group[0]["at"]}
+            if key not in seen:
+                engine.audit.append(engine.actor, "fleetpane.exit_burst", "panes:%s" % ",".join(panes), {k: v for k, v in bursts[key].items() if k != "at"})
+                seen[key] = group[0]["at"]
+                save()
+        group = [event] if event is not None else []
+    engine.pane_exit_bursts = bursts
+    engine.pane_exit_log = {"size": size, "ino": inode}
+    if rotated or not stored_log or {k: v for k, v in seen.items() if now - v < PANE_EXIT_SEEN_KEEP} != (stored.get("seen") or {}):
+        log_state.update(size=size, ino=inode)   # growth alone never rewrites the file: herdr's log grows on every event, not only exits
+    save()   # the aged-out marks and the log as read
+
+
+class PaneExitFacts:
+    """The Chief of Staff is told ONCE when several panes ended within a few seconds (one fact per burst, keyed by its first exit), never once per pane."""
+
+    __name__ = "pane_exit_facts"
+
+    def __init__(self):
+        self.engine = None
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def __call__(self):
+        engine = self.engine
+        bursts = getattr(engine, "pane_exit_bursts", None) if engine else None
+        discovery = getattr(engine, "discovery", None) if engine else None
+        if not bursts or discovery is None or discovery.problems:
+            return []
+        chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff")
+        out = []
+        for key, burst in sorted(bursts.items()):
+            who = ", ".join(a or "pane %s" % p for a, p in zip(burst["agents"], burst["panes"]))
+            summary = ("%d panes ended within a few seconds (%s to %s, exit codes %s): %s. Why: `%s` in the audit and herdr's own log (docs/switchboard.md, \"Why a pane ended\")."
+                       % (len(burst["panes"]), burst["from"], burst["to"], ",".join(str(c) for c in burst["codes"]), who, "fleetpane.exit"))
+            out.extend(Fact(key, chief, "pane", summary, float(burst["at"]), sender="switchboard") for chief in chiefs)
+        return out
 
 
 class PaneFacts:
@@ -12522,6 +12825,10 @@ def publish_decisions(engine):
         engine._note("ci_record.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     try:
         pane_health_pass(engine, now)   # the control plane: detached or dead panes, reads only, wakes the Chief of Staff
+    except Exception as err:
+        engine._note("fleetpane.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
+        pane_exit_pass(engine, now)   # why a pane ended: herdr's log read-only and bounded, one `fleetpane.exit` line per exit
     except Exception as err:
         engine._note("fleetpane.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     try:
