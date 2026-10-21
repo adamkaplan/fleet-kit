@@ -36,7 +36,7 @@ def ensure_dir(path, *, private=True, parents=True, check=True):
     a symlink that resolves to a directory is accepted. With `private` the directory the call makes gets mode 0700 whatever the umask, and
     (unless `check` is False, for a caller that checks and repairs by its own rule) an existing one must be a directory owned by the user with no
     group or world bits, or `PrivateDirError` (kind `not-directory` or `loose`) says so. Without `private` the mode is the user's (install and
-    config directories) and nothing about owner or mode is checked. Any other OSError (no space, a file in the way of a parent) is raised as it is.
+    config directories) and nothing about owner or mode is checked. Only the directory the call itself makes is forced to 0700; parents it has to make follow the umask. Any other OSError (no space, a file in the way of a parent) is raised as it is. It is not a defence against a hostile process of the same user swapping a link mid-call.
     """
     path = Path(path)
     gone = _dangling(path)

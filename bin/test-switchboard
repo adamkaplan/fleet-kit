@@ -9289,7 +9289,7 @@ class TestPrivateDir(Base):
             table[(file, function)] = table.get((file, function), 0) + 1
         self.assertEqual(code, table)
         self.assertEqual(len(PD_SITES), 23)
-        self.assertEqual(sum(1 for s in PD_SITES if s[3]), 12 - 1 + 1 - 0 if False else sum(1 for s in PD_SITES if s[3]))
+        self.assertEqual([s[0] for s in PD_SITES if s[3]], [1, 2, 3, 4, 5, 8, 9, 19, 20, 21, 22, 23])   # the 12 private sites, 11 others
 
     def test_no_mkdir_or_makedirs_with_exist_ok_exists_outside_the_helper(self):
         for path in _pd_files(BIN):
@@ -9391,9 +9391,24 @@ class TestPrivateDir(Base):
         exec(compile(source.replace("    except FileExistsError:\n        pass", "    except FileExistsError:\n        raise"), "mutant", "exec"), mutant.__dict__)
         with self.interposed(mutant), self.assertRaises(FileExistsError):
             mutant.ensure_dir(self.base / "m")
-        look_first = source.replace("        os.mkdir(str(path), 0o700 if private else 0o777)\n        created = True",
-                                    "        if os.path.exists(str(path)):\n            raise FileExistsError(str(path))\n        os.mkdir(str(path), 0o700 if private else 0o777)\n        created = True")
+        try_block = ("    try:\n        os.mkdir(str(path), 0o700 if private else 0o777)\n        created = True\n"
+                     "    except FileExistsError:\n        pass   # another process made it (or it was there): checked below like any existing one\n")
+        self.assertIn(try_block, source)
+        look_first = source.replace(try_block, "    if not os.path.exists(str(path)):\n        os.mkdir(str(path), 0o700 if private else 0o777)\n        created = True\n")
         self.assertNotEqual(look_first, source)
+        old_bug = types.ModuleType("private_dir_look_first")
+        exec(compile(look_first, "look_first", "exec"), old_bug.__dict__)
+        with self.interposed(old_bug), self.assertRaises(FileExistsError):
+            old_bug.ensure_dir(self.base / "n")
+
+    def test_the_four_copies_of_the_module_loader_are_the_same_code(self):
+        bodies = {}
+        for name in ("agent_presence.py", "cloud_worker.py", "heavy_slots.py", "reds.py"):
+            tree = ast.parse((BIN / name).read_text())
+            found = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_private_dir"]
+            self.assertEqual(len(found), 1, name)
+            bodies[name] = ast.dump(found[0])
+        self.assertEqual(len(set(bodies.values())), 1, "the loader copies differ: %s" % sorted(bodies))
 
     # --- the dangling symlink and the unchanged cases, per site
     def clear(self, where):
@@ -9439,8 +9454,7 @@ class TestPrivateDir(Base):
             with mock.patch.object(sb, "agent_tmp_root", lambda config: root):
                 return sb.agent_tmp_env(types.SimpleNamespace(config={}), "coder")
         under(3, s3)
-        under(4, lambda: sb.GitHubHub.log_path(types.SimpleNamespace(state_dir=place(b / "s4").parent), types.SimpleNamespace(repo="a/b")) if False else
-              self.log_driver(place))
+        under(4, lambda: self.log_driver(place))
         under(5, lambda: self.memory_driver(place))
         under(6, lambda: self.gates_driver(place))
         under(7, lambda: self.preflight_driver(place))
@@ -9448,14 +9462,14 @@ class TestPrivateDir(Base):
         under(9, lambda: self.job_driver(place))
         under(10, lambda: sb.write_if_changed(place(b / "s10") / "f", "c"))
         under(11, lambda: sb._replace_skill_file(place(b / "s11") / "f", "t"))
-        under(12, lambda: sb.install_todolist_plugin(self.config_dir(), sb.KIT_ROOT) if place(self.config_dir() / sb.TODOLIST_PLUGIN_NAME) else None)
-        under(13, lambda: sb.install_todolist_plugin(self.config_dir("c13"), sb.KIT_ROOT) if place(self.config_dir("c13") / "plugins") else None)
+        under(12, lambda: self.todolist_driver(place, "c12", sb.TODOLIST_PLUGIN_NAME))
+        under(13, lambda: self.todolist_driver(place, "c13", "plugins"))
         under(14, lambda: sb.ensure_home_link(place(b / "s14" / "home"), b / "cfg14"))
         under(15, lambda: self.installer_driver(place, "step_config", "/bin/opencode"))
         under(16, lambda: self.profile_driver(place))
         under(17, lambda: self.cli_driver(place))
-        under(18, lambda: sb.install_cos_orders_template({}, dry=False) if place(self.xdg_config() ) else None)
-        under(19, lambda: sb.load_module("agent_presence").record_dir(place(b / "s19").parent) if False else self.record_driver(place))
+        under(18, lambda: self.cos_orders_driver(place))
+        under(19, lambda: self.record_driver(place))
         under(20, lambda: self.cloud_driver(place))
         under(21, lambda: self.cwtok_driver(place))
         under(22, lambda: self.heavy_driver(place))
@@ -9467,6 +9481,14 @@ class TestPrivateDir(Base):
 
     def config_dir(self, name="cfg"):
         return self.base / name
+
+    def todolist_driver(self, place, name, inside):
+        place(self.config_dir(name) / inside)
+        return sb.install_todolist_plugin(self.config_dir(name), sb.KIT_ROOT)
+
+    def cos_orders_driver(self, place):
+        place(self.xdg_config())
+        return sb.install_cos_orders_template({}, dry=False)
 
     def log_driver(self, place):
         state = self.real(self.base / "s4")
@@ -9581,6 +9603,7 @@ class TestPrivateDir(Base):
                 said = self.refusal(number, run)
                 if number in self.SILENT:
                     self.assertIsNone(said)
+                    self.assertEqual([p for p in self.base.rglob("*.json") if not p.is_symlink()], [], "a cache file was written through the link")
                 else:
                     self.assertIsNotNone(said, "the site did not refuse")
                     self.assertEqual(len(said.splitlines()), 1, said)
@@ -9601,7 +9624,9 @@ class TestPrivateDir(Base):
                         run()
                     except self.helper.PrivateDirError as err:
                         self.fail("refused: %s" % err)
-                    except Exception as err:   # another refusal of the site's own (a link where the site wants a real directory, say) is not this one
+                    except (ValueError, PermissionError, sb.load_module("cloud_worker").CloudError) as err:   # sites 8 and 19 to 21 refuse ANY symlink by their own rule, kept as it was
+                        self.assertIn(number, (8, 19, 20, 21))
+                        self.assertEqual(label, "resolving")
                         self.assertNotIn("symbolic link to nothing", str(err))
 
     def test_the_two_named_functions_refuse_a_dangling_file_and_a_dangling_parent_with_one_line(self):
