@@ -363,6 +363,7 @@
         "bin/item_verdicts.py",
         "bin/plan_review.py",
         "bin/pr_events.py",
+        "bin/private_dir.py",
         "bin/queue_ejections.py",
         "bin/reassign.py",
         "bin/reds.py",
@@ -403,6 +404,9 @@
         "bin/item_verdicts.py": [
           "registrations",
           "validate_item_checks"
+        ],
+        "bin/private_dir.py": [
+          "*"
         ],
         "bin/queue_ejections.py": [
           "validate"
