@@ -47,8 +47,13 @@ STACK_NODE_SELECTOR = {"sysbox-install": "yes"}   # the POOL label; never gate o
 # stop `sudo start-dockerd`); every capability stays dropped and none is added; never privileged. The pod-level seccomp profile
 # (RuntimeDefault) was not part of the probe either.
 STACK_SECURITY_CONTEXT = {"allowPrivilegeEscalation": True, "capabilities": {"drop": ["ALL"]}}
-STACK_RACE_WINDOW_SECONDS = 240   # a fresh node's containerd is configured ~30-60 s after the pod is scheduled; this bounds the retries
-STACK_ATTEMPTS = 3
+# The fresh-node race retry rule, in ONE place (#1023): there is no attempt count. After a race the launcher pauses
+# STACK_RACE_PAUSE_SECONDS, then recreates the pod; a recreate starts only if at least one pause plus one poll
+# (WAIT_POLL_SECONDS) fits in what is left of STACK_RACE_WINDOW_SECONDS. A fresh node took ~3-5 minutes to be ready end to end.
+# The window stays under the switchboard's own bound on the launcher call (LAUNCH_SECONDS, 900).
+STACK_RACE_WINDOW_SECONDS = 600
+STACK_RACE_PAUSE_SECONDS = 15
+WAIT_POLL_SECONDS = 2   # the pause between two reads of a pending pod
 STACK_RACE_RE = re.compile(r"RuntimeClass handler \S+ does not support user namespaces: the handler \S+ is not known")
 
 
@@ -1154,12 +1159,13 @@ class Launcher:
 
     def _start_stack_pod(self, worker, name, spec, made, seconds):
         """Wait for a stack pod; on the fresh-node race (the runtime handler is not yet known to the node's containerd) delete
-        THE POD ONLY and create it again with the same run id and nonce, at most STACK_ATTEMPTS times inside
-        STACK_RACE_WINDOW_SECONDS. The password Secret and the per-run Secret are made once, before the first attempt, and are
+        THE POD ONLY and create it again with the same run id and nonce, after a pause of STACK_RACE_PAUSE_SECONDS, for as long
+        as one more pause plus one poll fits in STACK_RACE_WINDOW_SECONDS (no attempt count). The password Secret and the per-run Secret are made once, before the first attempt, and are
         never touched here: the pod refers to them by name, so a second attempt reads the same objects. The same bounded retry also
         recreates a pod that VANISHES while pending (it was seen, then a get says not found); a pod never seen, and any other
         failure, are not retried."""
-        deadline = self.clock() + dt.timedelta(seconds=STACK_RACE_WINDOW_SECONDS)
+        began = self.clock()
+        deadline = began + dt.timedelta(seconds=STACK_RACE_WINDOW_SECONDS)
         attempt = 1
         while True:
             seen = []   # this attempt's pod: set once a get returned it
@@ -1171,32 +1177,39 @@ class Launcher:
                     seen.append(1)
                     self._raise_on_race(name, pod)
             try:
-                self._wait_ready(name, seconds, watch)
+                # a retry never waits past the window (the first attempt keeps the caller's --wait, as before)
+                self._wait_ready(name, seconds if attempt == 1 else max(0, min(seconds, int((deadline - self.clock()).total_seconds()))), watch)
             except (_FreshNodeRace, _PodVanished) as race:
-                last = attempt >= STACK_ATTEMPTS or self.clock() >= deadline
+                last = not self._retry_fits(deadline)
+                spent = int((self.clock() - began).total_seconds())
                 self.audit(worker, "pod/" + name, "create-attempt", 0.0, False,
-                           "attempt %d of %d: %s%s" % (attempt, STACK_ATTEMPTS, race, "; giving up" if last else "; recreating the pod"))
+                           "attempt %d: %s%s" % (attempt, race, "; giving up" if last else "; pausing %d s, then recreating the pod" % STACK_RACE_PAUSE_SECONDS))
                 if last:
                     if isinstance(race, _PodVanished):
                         raise CloudError("the worker pod could not start: the pod vanished while pending (the fresh-node race: the node's "
-                                         "runtime restarted); gave up after %d attempt(s)" % attempt) from None
+                                         "runtime restarted); gave up after %d attempt(s) in %d s" % (attempt, spent)) from None
                     raise CloudError("the worker pod could not start: the node's runtime handler %s was not ready (the fresh-node race: %s); "
-                                     "gave up after %d attempt(s)" % (STACK_RUNTIME_CLASS, race, attempt)) from None
+                                     "gave up after %d attempt(s) in %d s" % (STACK_RUNTIME_CLASS, race, attempt, spent)) from None
                 if self._mine("pod", name) is False:
                     self.foreign.append("pod/" + name)
                     raise CloudError("the pod %s is not this call's (its run id does not match); left whole" % name) from None
                 self._refuse_if_removed(name, made)   # a stop, the reaper or someone else removed this call's own objects: not the race
+                self.sleep(STACK_RACE_PAUSE_SECONDS)   # the pod is deleted and made again only after the pause, never in a tight loop
                 self.kube.delete_pod_and_wait(name)
                 attempt += 1
                 self._make(made, "pod", self.kube.apply, spec)
                 self._refuse_if_removed(name, made)   # a stop that deleted the pod, then its Secrets, may have landed between the check and here
                 continue
             except CloudError as e:
-                self.audit(worker, "pod/" + name, "create-attempt", 0.0, False, "attempt %d of %d: %s" % (attempt, STACK_ATTEMPTS, e))
+                self.audit(worker, "pod/" + name, "create-attempt", 0.0, False, "attempt %d: %s" % (attempt, e))
                 raise
             self._refuse_if_removed(name, made)   # the stop's Secret deletes may have come after the pod went: never report a pod whose Secrets are gone
-            self.audit(worker, "pod/" + name, "create-attempt", 0.0, True, "attempt %d of %d: ready" % (attempt, STACK_ATTEMPTS))
+            self.audit(worker, "pod/" + name, "create-attempt", 0.0, True, "attempt %d: ready" % attempt)
             return
+
+    def _retry_fits(self, deadline):
+        """True when one more pause plus one poll fits in the window that is left."""
+        return (deadline - self.clock()).total_seconds() >= STACK_RACE_PAUSE_SECONDS + WAIT_POLL_SECONDS
 
     def _refuse_if_removed(self, name, made):
         gone = self._own_objects_gone(name, made)
@@ -1236,7 +1249,7 @@ class Launcher:
                 on_pending(pod)
             if self.clock() >= end:
                 raise CloudError("timed out waiting for the worker", EXIT_TIMEOUT)
-            self.sleep(2)
+            self.sleep(WAIT_POLL_SECONDS)
 
     # -- end hook, stop, delete --
     def run_hook(self, name):
