@@ -37567,13 +37567,12 @@ class TestImpactHold(LedgerBase):
                 self.ledger_reset()
                 self.score_config("Serious")
                 self.scored_pr()
-                for record in records:
-                    self.raw_record(**record)
+                seqs = [self.raw_record(**record)["seq"] for record in records]
                 corroborated = next((r for r in records if isinstance(r.get("impact_severity"), str) and isinstance(r.get("impact_probability"), str)), None)
                 if corroborated is not None:
-                    self.raw_record(**dict(corroborated, by="rev2"))   # #972: a record that could count is corroborated by a second session, so the count is not what these shapes test
+                    seqs.append(self.raw_record(**dict(corroborated, by="rev2"))["seq"])   # #972: a record that could count is corroborated by a second session, so the count is not what these shapes test
                 low_run = lambda n: "#%d=Low" % n
-                code, out, err = self.under(reason="the shapes under test: " + ", ".join(low_run(n) for n in range(1, len(records) + 2)))
+                code, out, err = self.under(reason="the shapes under test: " + ", ".join(low_run(n) for n in seqs))
                 self.assertEqual(code == 2, refused, err)
                 if refused:
                     self.assertEqual(self.deletes(), [])
@@ -37581,10 +37580,10 @@ class TestImpactHold(LedgerBase):
         self.ledger_reset()   # the control: the valid record alone clears
         self.score_config("Serious")
         self.scored_pr()
-        self.raw_record(**valid)
+        one = self.raw_record(**valid)
         self.assertEqual(self.under(reason="the control, one run only")[0], 2, "one counted run is refused (#972)")
         two = self.raw_record(**dict(valid, by="rev2"))
-        self.assertEqual(self.under(reason="the control: #1=Low, #%d=Low" % two["seq"])[0], 0)
+        self.assertEqual(self.under(reason="the control: #%d=Low, #%d=Low" % (one["seq"], two["seq"]))[0], 0)
 
     # ---- #835 round 4: the rating's inputs are immune to the shared parser (a registrar's defaults, a replaced parser, a wrapper), at the point of use
 
