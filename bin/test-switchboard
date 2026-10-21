@@ -73273,7 +73273,7 @@ class TestClearCodePathsAlwaysHeld(unittest.TestCase):
             self.assertIn("clear_code_paths", reasons[0])
 
     def test_s4_the_clear_still_refuses_every_entry_with_its_current_reason(self):
-        report = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": False, "top_tier_hits": {}, "review_action": "none", "review_class": None, "changed_paths": []}
+        report = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": False, "top_tier_hits": {}, "review_action": "none", "review_class": None, "changed_paths": [], "registrar_reasons": []}
         for entry, path in self.rows():
             files = [{"filename": path, "previous_filename": None, "status": "modified"}]
             got = self.clear.refusals(self.rule, report, files, self.floor.matches, {}, {"reasons": [], "level": "Low"})
@@ -73286,7 +73286,7 @@ class TestClearCodePathsAlwaysHeld(unittest.TestCase):
         self.assertEqual(self.reason_of("brand/new/a.py", matrix)[0], "hold")
         listed, problem = self.floor.clear_code_paths(matrix)
         self.assertIsNone(problem)
-        report = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": False, "top_tier_hits": {}, "review_action": "none", "review_class": None, "changed_paths": []}
+        report = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": False, "top_tier_hits": {}, "review_action": "none", "review_class": None, "changed_paths": [], "registrar_reasons": []}
         refused = self.clear.refusals(dict(matrix["owner_hold"]["delegated_clear"], clear_code_paths=listed), report,
                                       [{"filename": "brand/new/a.py", "previous_filename": None, "status": "modified"}], self.floor.matches, {}, {"reasons": [], "level": "Low"})
         self.assertEqual(len(refused), 1, refused)
