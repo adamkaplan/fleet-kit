@@ -335,7 +335,7 @@ def closure(tree, roots, dynamic_actions=()):
     roots = list(defs) if "*" in roots else list(roots)   # `*`: every function of the module (a module the clear runs and no recording says which)
     seen, globals_, refs, members, todo = set(), set(), set(), {}, list(roots)
 
-    spelled_out = []
+    spelled_out, spelled_seen = [], [0]
 
     def walk(nodes):
         while nodes:
@@ -385,7 +385,8 @@ def closure(tree, roots, dynamic_actions=()):
                     members[name].add(method.name)
                     walk([method])
                     grew = True
-        if not set(spelled_out) <= refs:   # a name built at run time can be any name that function spells out: each is a reference by that name
+        if len(spelled_out) != spelled_seen[0]:   # a name built at run time can be any name that function spells out: each is a reference by that name (merged once per new spelling, so the walk always ends)
+            spelled_seen[0] = len(spelled_out)
             refs |= set(spelled_out)
             grew = True
         if not grew and not todo:
