@@ -1290,17 +1290,24 @@ def cmd_impact_clear(args, runner, now):
                     state.setdefault("batch_void", {})[pr] = {"head": carried.get("head"), "reason": "the owner revoked the carry"}
                 state.get("carry_void", {}).pop(pr, None)
                 state.get("carry_wait", {}).pop(pr, None)
+                voided = []
+                for batch_pr, record in sorted((state.get("carried") or {}).items()):   # (#955) a batch carried on THIS pull request's clear is no longer carried: its record is voided for its head
+                    if isinstance(record, dict) and record.get("route") == "batch" and any(isinstance(m, dict) and m.get("pr") == pr and m.get("held") for m in record.get("members") or []):
+                        state["carried"].pop(batch_pr)
+                        state.setdefault("batch_void", {})[batch_pr] = {"head": record.get("head"), "reason": "the clear of member %s was taken back" % pr}
+                        voided.append(batch_pr)
                 if had is not None:
                     _consume_record(state, pr, had)   # an older record of the daemon's labels is stale (a newer one, applied after the clear, is kept)
-                if had is not None or carried is not None:   # nothing to take back: nothing is written
+                if had is not None or carried is not None or voided:   # nothing to take back: nothing is written
                     write_impact_state(engine.state_dir, state)
                     engine.audit.append(engine.actor, "gate.clear_revoked", pr, dict({"by": kind[1], "reason": plan_ledger.clip(redact_command_text(reason), 300),
-                                                                                    "cleared_head": (had or {}).get("head"), "carried_head": (carried or {}).get("head")},
+                                                                                    "cleared_head": (had or {}).get("head"), "carried_head": (carried or {}).get("head")} if not voided else
+                                                                                    {"by": kind[1], "reason": plan_ledger.clip(redact_command_text(reason), 300), "cleared_head": (had or {}).get("head"), "carried_head": (carried or {}).get("head"), "voided_batches": voided},
                                                                                    **({"under_order": delegated["number"]} if delegated else {})))
         except (ImpactStateBusy, RuntimeError) as err:
             sys.stderr.write("%s: impact clear --revoke: %s; nothing was changed\n" % (PROG, _one_line(str(err), 200)))
             return EXIT_ERROR
-        print("revoked the owner's clear of %s%s: the daemon holds it again at its next pass, and nothing carries" % (pr, " (and its carry)" if carried else "") if (had or carried) else "%s has no clear to revoke" % pr)
+        print("revoked the owner's clear of %s%s: the daemon holds it again at its next pass, and nothing carries" % (pr, " (and its carry)" if carried else "") + ("; the carry of %s is void too" % ", ".join(voided) if voided else "") if (had or carried or voided) else "%s has no clear to revoke" % pr)
         return EXIT_OK
     try:
         extra = {}

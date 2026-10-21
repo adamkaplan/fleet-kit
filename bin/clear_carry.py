@@ -345,7 +345,7 @@ def _file_row(item):
 
 
 def _listing(get, repo, base, head):
-    """([{"sha", "parents", "message"}], base commit of the listing): the commits the batch has that the default branch has not, every one of them listed. Void unless the head is AHEAD of the base."""
+    """[{"sha", "parents", "message"}]: the commits the batch has that the default branch has not, every one of them listed. Void unless the head is AHEAD of the base."""
     path = "repos/%s/compare/%s...%s?per_page=%d" % (repo, base, head, PAGE)
     first = _object(get, "%s&page=1" % path, "the comparison of the batch with its base")
     if first.get("status") != "ahead":
@@ -442,6 +442,9 @@ def batch_decide(get, repo, number, head, member_state, closure_of, protected, b
             raise CarryVoid("not a batch: its base is not the default branch")
         members, merges = batch_members(get, repo, base, head, branch)
         verdict["merges"] = len(merges)
+        tables = {_norm(p) for p in protected or ()}
+        if not tables:
+            raise CarryVoid("no list of protected paths was given: the batch carry is refused")
         table, expected, member_paths, problems = [], {}, {}, []
         for m in sorted(members, key=lambda m: m["number"]):
             own, own_head, _ = own_change(get, repo, m["number"])
@@ -455,9 +458,6 @@ def batch_decide(get, repo, number, head, member_state, closure_of, protected, b
             why = []
             if held and cleared_head != own_head:
                 why.append("held by the floor and %s" % ("cleared at %s, not at the merged head %s (amended after its clear)" % (str(cleared_head)[:8], own_head[:8]) if cleared_head else "never cleared"))
-            tables = {_norm(p) for p in protected or ()}
-            if not tables:
-                raise CarryVoid("no list of protected paths was given: the batch carry is refused")
             for f in own:
                 for path in (f["path"], f["previous"]):
                     if path and _norm(path) in tables:

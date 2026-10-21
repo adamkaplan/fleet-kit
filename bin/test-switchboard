@@ -77186,6 +77186,20 @@ class TestBatchCarry(unittest.TestCase):
         self.assertFalse(verdict["carried"])
         self.assertIn("neither a merge of main nor the squash of a pull request", verdict["reason"])
 
+    def test_s4_a_squash_that_is_not_its_members_change_and_a_base_that_is_not_the_default_branch_hold(self):
+        self.standard()
+        self.member(15, "c2.txt", "n\n", extra=("README.md", "widget api\nrode along\n"))
+        verdict = self.decide(held=(11, 12))
+        self.assertFalse(verdict["carried"])
+        self.assertIn("is not the change of its pull request", verdict["reason"])
+        self.setUp()
+        self.standard()
+        real = self.api.get
+        self.api.get = lambda path: {"default_branch": "trunk"} if path == "repos/%s" % self.REPO else real(path)
+        verdict = self.decide(held=(11, 12))
+        self.assertFalse(verdict["carried"])
+        self.assertIn("base is not the default branch", verdict["reason"])
+
     def test_s5_a_member_that_touches_a_never_carried_path_or_the_clear_closure_needs_a_clear_of_its_own(self):
         for label, kwargs in (("a table path", {"path": "bin/impact_hold.py", "closure": None}),
                               ("a path of the matrix itself", {"path": "docs/review-laws/impact-matrix.json", "closure": None}),
@@ -77259,7 +77273,7 @@ class TestBatchCarry(unittest.TestCase):
             """The names of the checks that fail against this build of the module."""
             failed = []
             for label, build, expect in (("union carries", lambda w: None, True), ("extra line holds", lambda w: (w.main_moves("docs.md", "d1\nd2\nd3\nx\n", edit=("README.md", "widget api\nsneaked in\n"))), False),
-                                         ("amended member holds", lambda w: None, False), ("table path holds", lambda w: w.member(15, "bin/impact_hold.py", "x = 2\n"), False)):
+                                         ("amended member holds", lambda w: None, False), ("squash extra holds", lambda w: w.member(15, "c2.txt", "n\n", extra=("README.md", "widget api\nrode along\n")), False), ("table path holds", lambda w: w.member(15, "bin/impact_hold.py", "x = 2\n"), False)):
                 with tempfile.TemporaryDirectory() as tmp:
                     world = TestBatchCarry("test_s3_the_exact_union_of_cleared_members_and_unheld_members_with_clean_merges_of_main_carries")
                     world.cc = cc
@@ -77277,7 +77291,8 @@ class TestBatchCarry(unittest.TestCase):
         self.assertEqual(run(self.cc), [], "the real module passes all four")
         for name, old, new, label in (("no line check", "extra = _excess(seen, expected)", "extra = {}", "extra line holds"),
                                       ("another member's head", "if held and cleared_head != own_head:", "if False:", "amended member holds"),
-                                      ("no never-carried check", "if path and _norm(path) in tables:", "if False:", "table path holds")):
+                                      ("no never-carried check", "if path and _norm(path) in tables:", "if False:", "table path holds"),
+                                      ("no squash check", 'if fingerprint_of(squash, "", True) != fingerprint_of(own, "", True):', "if False:", "squash extra holds")):
             self.assertEqual(source.count(old), 1, name)
             mutant = types.ModuleType("clear_carry_mutant_%s" % name.replace(" ", "_"))
             exec(compile(source.replace(old, new), "clear_carry_mutant", "exec"), mutant.__dict__)
@@ -77394,6 +77409,25 @@ class TestBatchCarryInTheDaemon(Base):
         self.assertFalse(sb._batch_record(self.engine, self.REPO, 100, report, verdict))
         self.assertEqual(self.events("gate.batch_carried"), [])
         self.assertIn("taken back", self.events("gate.batch_carry_held")[0]["detail"]["reason"])
+
+    def test_a_rating_that_holds_the_batch_refuses_the_carry(self):
+        report = dict(self.floor(self.engine, self.REPO, 100), rehold=None, review_action="hold")
+        verdict = sb.impact_batch_decision(self.engine, self.REPO, 100, report)
+        self.assertFalse(verdict["carried"])
+        self.assertIn("needs a clear of its own", verdict["reason"])
+
+    def test_the_owner_taking_back_a_member_clear_after_the_carry_voids_the_batch_carry(self):
+        self.judge()
+        self.assertTrue(sb.batch_carried(self.engine, self.state(), self.REPO, self.PR, self.head))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "impact_hold": {"enabled": True, "carry_clear": True}})
+        args = types.SimpleNamespace(pr="%s#11" % self.REPO, reason="taking the member clear back, a fixture", revoke=True)
+        with mock.patch.object(sb, "gates_caller_kind", return_value=("person", "owner")):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(sb.cmd_impact_clear(args, self.route, self.world.clock.now), 0)
+        self.assertFalse(sb.batch_carried(self.engine, self.state(), self.REPO, self.PR, self.head))
+        self.assertEqual(self.state()["batch_void"][self.PR]["head"], self.head)
+        self.judge()
+        self.assertEqual(len(self.events("gate.batch_carried")), 1, "and it does not carry again at that head")
 
     def test_u1_a_pull_request_whose_head_is_not_the_integration_branch_is_not_a_batch(self):
         report = dict(self.floor(self.engine, self.REPO, 100), head_ref="feature", rehold=None)
