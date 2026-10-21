@@ -15566,16 +15566,16 @@ class TestClearCarryInTheDaemon(Base):
         self.clear()
         new = self.merge_main()
         report = {"pr": self.PR, "head": new, "reasons": [], "floor_paths": [], "globs": []}
-        self.assertTrue(sb._impact_rehold_now(self.engine, self.REPO, 7, self.PR, report, {"labels": []}))
+        self.assertEqual(sb.apply_impact_hold(self.engine, self.REPO, 7, dict(report, reasons=["x"], owner_decision="hold"), {"labels": []}), 0)   # the pass asks the rule first (#999): it holds, and the carry says no label
         self.assertEqual(self.adds(), [], "the pure merge carries: no hold written")
         state = sb.read_impact_state(self.world.state)[0]
         self.assertEqual(state["carried"][self.PR]["head"], new)
-        self.assertIsNone(sb.rehold_reason(self.engine, state, self.REPO, self.PR, new))
+        self.assertIsNone(sb.rehold_reason(self.engine, state, self.REPO, self.PR, new, True))
         self.build(carry=False)
         self.clear()
         new = self.merge_main("m2.txt")
         self.writes.clear()
-        self.assertTrue(sb._impact_rehold_now(self.engine, self.REPO, 7, self.PR, dict(report, head=new), {"labels": []}))
+        sb.apply_impact_hold(self.engine, self.REPO, 7, dict(report, head=new, reasons=["x"], owner_decision="hold"), {"labels": []})
         self.assertEqual(len(self.adds()), 1, "with the carry off every new head is held again")
 
     def test_s4_a_carried_clear_tells_the_chief_of_staff_once_with_both_heads(self):
@@ -15824,7 +15824,7 @@ class TestConflictCarryInTheDaemon(Base):
         for _ in range(3):
             self.assertEqual(self.hold(new), 0)
         self.assertEqual((len(self.events("gate.clear_carried")), self.api_gets), (1, gets), "a second pass writes and reads nothing")
-        self.assertEqual(sb.rehold_reason(self.engine, self.held_state(), self.REPO, self.PR, new), None, "#830's one reading of 'held again' agrees: carried")
+        self.assertEqual(sb.rehold_reason(self.engine, self.held_state(), self.REPO, self.PR, new, True), None, "#830's one reading of 'held again' agrees: carried")
 
     def test_s4_a_missing_stale_forged_or_self_made_confirmation_never_carries_and_the_pull_request_is_held_meanwhile(self):
         cleared = self.clear()
@@ -35205,7 +35205,7 @@ class TestImpactRejudge(LedgerBase):
         n = 10
         captain, impact = self.names["merge-captain"], self.names["hold-impact"]
         wanted_by_floor = label in (captain, impact)
-        if case in ("hand_floor_holds", "daemon_present", "absent", "cleared_this_head", "cleared_other_head_floor_holds"):
+        if case in ("hand_floor_holds", "daemon_present", "absent", "cleared_this_head", "cleared_other_head_floor_holds", "hand_rehold_wants_it"):
             self.files(n, "shims/gh")
         else:
             self.files(n, "docs/a.md")
@@ -35218,21 +35218,15 @@ class TestImpactRejudge(LedgerBase):
             self.adopt_state(clears={"acme/app#%d" % n: {"head": self.ADOPT_HEAD_OTHER, "reason": "x", "by": "own", "at": 1, "removed": [label]}})
         if case == "cleared_other_head_rated_here":
             self.rated_here(n)
-        if case == "hand_rehold_wants_it":
-            self.passes([])   # the engine
-            self.prs[n]["labels"] = [{"name": l} for l in on_pr]
-            report = sb.pr_floor_report(self.engine, "acme/app", n)
-            self.assertTrue(sb._impact_rehold_now(self.engine, "acme/app", n, "acme/app#%d" % n, report, {"labels": []}), "the re-hold path holds it again")
-        else:
-            self.passes([self.listed(n, on_pr)], live={n: on_pr})
+        self.passes([self.listed(n, on_pr)], live={n: on_pr})
         return wanted_by_floor
 
     def assert_adopt_cell(self, label, case):
         wanted_by_floor = self.run_adopt_case(label, case)
         got, record = self.adopted(), self.recorded()
-        if case in ("hand_floor_holds", "cleared_other_head_floor_holds"):
+        if case == "hand_floor_holds":
             expected = [label] if wanted_by_floor else []   # `hold-owner` is not a label the rule writes: never adopted
-        elif case == "hand_rehold_wants_it":
+        elif case in ("hand_rehold_wants_it", "cleared_other_head_floor_holds"):   # the rule holds it at the new head (#999: a re-hold is only ever of a pull request the rule holds), and it explains why the old clear no longer covers it
             expected = [] if label == self.names[sb.OWNER_HOLD_KEY] else [label]   # the owner's own hold is never the daemon's, a re-hold does not restore it
         else:
             expected = []
@@ -35241,12 +35235,12 @@ class TestImpactRejudge(LedgerBase):
         if expected:
             self.assertIn(label, record["added"], "an adopted label is in the record a daemon-added label is kept in")
             self.assertEqual(record["merge_label_added"], self.names["merge-captain"] in record["added"])
-            rehold = case == "hand_rehold_wants_it"   # (#815) the record carries `rehold: True` ONLY when the pass was a re-hold (the sweep reads it); an adoption of any other case does not
+            rehold = case in ("hand_rehold_wants_it", "cleared_other_head_floor_holds")   # (#815) the record carries `rehold: True` ONLY when the pass was a re-hold (the sweep reads it); an adoption of any other case does not
             self.assertEqual(sorted(record), ["added", "at", "head", "merge_label_added"] + (["rehold"] if rehold else []), "the record keeps its shape")
             self.assertEqual(record.get("rehold"), True if rehold else None, "the re-hold mark is written for a re-hold and for nothing else")
         elif case in ("not_holds_by_hand", "cleared_this_head", "cleared_other_head_rated_here"):
             self.assertIsNone(record if case != "cleared_this_head" else None, "nothing was written")
-        if case in ("hand_floor_holds", "cleared_other_head_floor_holds") and not wanted_by_floor:
+        if case == "hand_floor_holds" and not wanted_by_floor:
             self.assertNotIn(label, [l for w in self.posts(10) for l in w[2]["labels"]], "a class the rule does not write is never written by it")
 
     def test_a_pull_request_that_moved_since_it_was_judged_gets_nothing_adopted_added_or_restored(self):   # #891 M1: every write below the fresh read is for the judged head only
@@ -35497,7 +35491,7 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
             self.view("migrations/0002.sql")
         elif kind == "rating":
             self.view("docs/a.md")
-            (self.world.state / "impact-hold.json").write_text(json.dumps({"clears": {self.PRN: {"head": LEDGER_HEAD, "reason": "a false hold", "by": "own", "at": 1}}, "applied": {}}))
+            self.record(impact_action="hold", impact_class="authority")   # (#999) a hold RATING of a top-tier class: only a rating of the rule's own ends it; an old clear for another head never holds anything (see the test_999 tests)
         else:
             self.view("shims/gh")
         self.step(0)
@@ -35518,7 +35512,7 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
             self.fingerprint = "m2"
             self.migrations_top = holds
         elif kind == "rating":
-            self.record(impact_action="second-review") if not holds else self.record()   # a record with no action rates nothing: the hold stands
+            self.record(impact_action="second-review") if not holds else self.record(impact_action="hold", impact_class="authority")   # the newest rating: a hold of a top tier still holds; a second-review does not
         else:
             pass   # "none": the rule's answer and every input are as they were
 
@@ -36215,8 +36209,8 @@ class TestImpactHold(LedgerBase):
 
     # -- #830: a cleared pull request is held again at a new head
 
-    def cleared_at_a_then_pushed_to_b(self, path="src/app.py"):
-        """The owner clears the floor hold at head A; the pull request is then pushed to head B, which no floor path holds and no rating rates. Returns the clear state."""
+    def cleared_at_a_then_pushed_to_b(self, path="migrations/0002.sql"):
+        """The owner clears the floor hold at head A; the pull request is then pushed to head B, which the rule holds too (a floor path; pass `path="src/app.py"` for a B the rule does NOT hold, #999) and no rating rates. Returns the clear state."""
         self.passes()
         self.assertEqual(self.run_as(None, "impact", "clear", self.PR, "--reason", "a false hold: the file is a fixture")[0], 0)
         self.writes.clear()
@@ -36243,11 +36237,111 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(len(self.events("gate.hold_cleared")), 1)
         self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [], "nothing is released")
 
+    # -- #999: the RULE decides, and a clear recorded for another head never holds anything by itself (the recorded case: cleared Low at head A, head B a merge of the base, the rule gives no hold at B)
+
+    def reapplied_before_the_fix(self):
+        """The state the old daemon left at B: its re-hold wrote the hold labels and the record (`rehold: True`) for a head the rule does not hold."""
+        state = sb.read_impact_state(self.world.state)[0]
+        state["applied"][self.PR] = {"head": LEDGER_NEW_HEAD, "merge_label_added": True, "added": sorted(self.labelled()), "at": 2, "rehold": True}
+        sb.write_impact_state(self.world.state, state)
+        self.pr["labels"] = [{"name": n} for n in self.labelled()]
+        self.writes.clear()
+
+    def two_passes_at_b(self, labelled):
+        for n in (1, 2):
+            self.passes(records=[self.listed(head=LEDGER_NEW_HEAD, labels=labelled)], advance=2000 * n)
+
+    def deleted(self):
+        return sorted(w[1].rsplit("/", 1)[1].replace("%3A", ":") for w in self.writes if w[0] == "DELETE")
+
+    def check_a_to_b_released(self):
+        self.cleared_at_a_then_pushed_to_b(path="src/app.py")   # A cleared; B a merge of the base: the rule gives no hold at B
+        self.reapplied_before_the_fix()
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD, labels=self.labelled())], advance=2000)
+        self.assertEqual(self.deleted(), sorted(self.labelled()), "pass 1: the labels of ours come off")
+        (line,) = self.events("gate.hold_released")
+        self.assertEqual(sorted(line["detail"]["removed"]), sorted(self.labelled()))
+        self.assertEqual(self.events("gate.hold_reapplied"), [], "and nothing is held again")
+        self.assertNotIn(self.PR, sb.read_impact_state(self.world.state)[0]["applied"], "the record is gone")
+        self.writes.clear()
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=4000)
+        self.assertEqual((self.writes, len(self.events("gate.hold_released")), self.events("gate.hold_reapplied")), ([], 1, []), "pass 2: nothing more")
+
+    def test_999_cleared_at_a_then_a_head_b_the_rule_does_not_hold_is_released_at_the_next_pass_and_never_held_forever(self):   # PR #985
+        self.check_a_to_b_released()
+
+    def test_999_cleared_at_a_then_a_head_b_the_rule_does_not_hold_is_never_labelled_in_two_real_passes(self):
+        self.cleared_at_a_then_pushed_to_b(path="src/app.py")
+        self.two_passes_at_b([])
+        at_b = lambda name: [e for e in self.events(name) if e["detail"].get("head") == LEDGER_NEW_HEAD]   # the pass at head A (before the clear) is not what is measured
+        self.assertEqual((self.writes, at_b("gate.hold_reapplied"), at_b("gate.hold_applied"), at_b("gate.hold_released")), ([], [], [], []))
+
+    def test_999_cleared_at_a_then_a_head_b_the_rule_does_hold_is_still_reapplied_once(self):
+        self.cleared_at_a_then_pushed_to_b(path="migrations/0002.sql")
+        self.two_passes_at_b([])
+        (write,) = self.label_writes()
+        self.assertEqual(sorted(write[2]["labels"]), sorted(self.labelled()))
+        (event,) = self.events("gate.hold_reapplied")
+        self.assertEqual((event["detail"]["head"], event["detail"]["cleared_head"]), (LEDGER_NEW_HEAD, LEDGER_HEAD))
+        self.assertEqual(self.events("gate.hold_released"), [])
+
+    def test_999_the_paths_that_put_or_keep_a_label_are_derived_and_each_asks_the_rule_first(self):
+        import ast
+        writers = {"apply_impact_hold": [], "change_issue_labels": []}
+        for path in (BIN / "fleet-switchboard", BIN / "impact_hold.py"):
+            for node in ast.parse(path.read_text()).body:
+                if isinstance(node, ast.FunctionDef):
+                    for call in [x for x in ast.walk(node) if isinstance(x, ast.Call) and getattr(x.func, "id", "") in writers]:
+                        writers[call.func.id].append(node.name)
+        self.assertEqual(sorted(set(writers["apply_impact_hold"])), ["impact_would_hold_pass"], "the one caller of the apply is the pass, and it calls it for owner == hold only")
+        self.assertEqual(writers["apply_impact_hold"].count("impact_would_hold_pass"), 2, "its two calls: the hold, and the top-tier rating")
+        self.assertNotIn("_impact_rehold_now", (BIN / "fleet-switchboard").read_text(), "no second decision path")
+        source = (BIN / "fleet-switchboard").read_text()
+        pass_code = source[source.index("def impact_would_hold_pass"):source.index("def cmd_gates_stats")]
+        self.assertLess(pass_code.index('if owner == "hold":'), pass_code.index("rehold_reason("), "the rule is asked before the explanation")
+        self.assertLess(pass_code.index('if owner == "hold":'), pass_code.index("release_impact_hold("), "and before the release")
+
+    def old_rehold(self, engine, state, repo, pr, head, holds):
+        """The reading before #999: a clear for another head holds, whatever the rule says."""
+        return real_rehold_reason(engine, state, repo, pr, head, True)
+
+    def test_999_a_mutant_per_path_the_old_order_back_is_caught(self):
+        global real_rehold_reason
+        real_rehold_reason = sb.rehold_reason
+        real_release, real_plan = sb.release_impact_hold, sb.impact_plan
+        def old_release(engine, repo, number, report, record):
+            state = sb.read_impact_state(engine.state_dir)[0]
+            return 0 if real_rehold_reason(engine, state, repo, report["pr"], report["head"], True) else real_release(engine, repo, number, report, record)
+        def old_plan(engine, report, labels, state, records, problem):
+            if not problem and real_rehold_reason(engine, state, report["pr"].rpartition("#")[0], report["pr"], report.get("head"), True):
+                return sb._plan_hold(sb.label_names(engine.config), state, report["pr"], set(labels or ()))
+            return real_plan(engine, report, labels, state, records, problem)
+        mutants = {"the release (the rehold branch first)": {"release_impact_hold": old_release}, "the dry run": {"impact_plan": old_plan},
+                   "the gate fact and the reapply": {"rehold_reason": self.old_rehold}}
+        for name, patch in mutants.items():
+            with self.subTest(mutant=name):
+                self.setUp()
+                with contextlib.ExitStack() as stack:
+                    for target, replacement in patch.items():
+                        stack.enter_context(mock.patch.object(sb, target, replacement))
+                    caught = False
+                    try:
+                        self.check_a_to_b_released()
+                        engine = self.world.new_engine("daemon")
+                        engine.config, engine.state_dir, engine.gh_runner = sb.load_config(), self.world.state, self.route
+                        readers = self.readers(engine)
+                        self.setUp()
+                        self.cleared_at_a_then_pushed_to_b(path="src/app.py")
+                        self.assertEqual([n for n, r in readers.items() if r()], [], "no reader reads it held")
+                    except AssertionError:
+                        caught = True
+                    self.assertTrue(caught, "mutant not caught: %s" % name)
+
     def test_the_hold_labels_the_clear_took_off_are_put_back(self):
         self.passes(records=[self.listed(labels=[self.names["hold-credential"]])])
         self.assertEqual(self.run_as(None, "impact", "clear", self.PR, "--reason", "a false hold: the file is a fixture")[0], 0)
         self.writes.clear()
-        self.floor_pr(path="src/app.py", head=LEDGER_NEW_HEAD)
+        self.floor_pr(path="migrations/0002.sql", head=LEDGER_NEW_HEAD)
         self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=2000)
         (write,) = self.label_writes()
         self.assertEqual(sorted(write[2]["labels"]), sorted(self.labelled() + [self.names["hold-credential"]]))
@@ -36260,14 +36354,14 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(self.label_writes(), [], "a clear at this head")
         self.assertEqual(self.events("gate.hold_reapplied"), [])
 
-    def test_a_rating_at_the_new_head_recorded_as_not_held_ends_the_hold_again_and_releases_only_what_the_daemon_added(self):
+    def test_a_rating_at_the_new_head_does_not_release_a_hold_the_rule_gives(self):   # #999: a rating is not what ends a hold; the rule is (a floor path at B holds, rated or not)
         self.cleared_at_a_then_pushed_to_b()
         self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=2000)
         self.assertEqual(len(self.label_writes()), 1)
         sb.plan_ledger.append_entry(self.world.state, {"kind": "review_record", "pr": self.PR, "head": LEDGER_NEW_HEAD, "reviewer": "impact", "verdict": "approve",
                                                        "blocks": 0, "notes": 0, "by": "rev", "impact_action": "second-review", "summary": "x"}, 1)
         self.passes(records=[self.listed(head=LEDGER_NEW_HEAD, labels=self.labelled())], advance=4000)
-        self.assertEqual(sorted(w[1].rsplit("/", 1)[1] for w in self.writes if w[0] == "DELETE"), sorted(n.replace(":", "%3A") for n in self.labelled()))
+        self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [], "the rule still holds it at B")
 
     def test_a_pull_request_never_cleared_and_never_rated_is_unchanged(self):
         self.floor_pr(path="src/app.py")
@@ -36314,39 +36408,43 @@ class TestImpactHold(LedgerBase):
 
         state = lambda: sb.read_impact_state(self.world.state)[0]
         return {
-            "rehold_reason": lambda: bool(sb.rehold_reason(engine, state(), "acme/app", self.PR, LEDGER_NEW_HEAD)),
+            "rehold_reason": lambda: bool(sb.rehold_reason(engine, state(), "acme/app", self.PR, LEDGER_NEW_HEAD, sb.rule_holds(sb.pr_floor_report(engine, "acme/app", 9)))),
             "gate_floor_fact": lambda: bool(sb.gate_floor_fact(engine, self.world.state, "acme/app", 9, LEDGER_NEW_HEAD)["rehold"]),
             "impact_plan": lambda: sb.impact_plan(engine, sb.pr_floor_report(engine, "acme/app", 9), [], state(), {}, None)[0] in ("add", "held"),
             "release_impact_hold": release,
-            "_impact_rehold_now": label_pass,
+            "impact_would_hold_pass": label_pass,
             "G6": lambda: gate("G6")["status"] == "waiting",
             "G6b": lambda: gate("G6b")["status"] != "n/a",
         }
 
     def test_every_reader_of_is_it_held_agrees_for_every_rating_state_at_head_b(self):
-        for rating, held in (("none", True), ("no action", True), ("with action", False)):
-            with self.subTest(rating=rating):
-                self.setUp()
-                self.cleared_at_a_then_pushed_to_b()
-                self.rating_record(rating)
-                engine = self.world.new_engine("daemon")
-                engine.config, engine.state_dir, engine.gh_runner = sb.load_config(), self.world.state, self.route
-                before = sb.read_impact_state(self.world.state)[0]["clears"]
-                for name, reader in self.readers(engine).items():
-                    with self.subTest(reader=name):
-                        self.assertEqual(reader(), held, "%s reads %s for a rating state of %r" % (name, "held" if not held else "not held", rating))
-                self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"], before, "no reader records a clear")
+        """#999: ONE decision (the rule) says whether B is held; every reader follows it, whatever the rating. Only `rehold_reason` (and the gate fact that carries it) also read the rating, and only to EXPLAIN a hold the rule gives."""
+        for path, holds in (("src/app.py", False), ("migrations/0002.sql", True)):
+            for rating, rated in (("none", False), ("no action", False), ("with action", True)):
+                with self.subTest(path=path, rating=rating):
+                    self.setUp()
+                    self.cleared_at_a_then_pushed_to_b(path=path)
+                    self.rating_record(rating)
+                    engine = self.world.new_engine("daemon")
+                    engine.config, engine.state_dir, engine.gh_runner = sb.load_config(), self.world.state, self.route
+                    before = sb.read_impact_state(self.world.state)[0]["clears"]
+                    for name, reader in self.readers(engine).items():
+                        with self.subTest(reader=name):
+                            want = holds and not rated if name in ("rehold_reason", "gate_floor_fact") else holds   # the two that EXPLAIN a hold read the rating; the decisions do not
+                            self.assertEqual(reader(), want, "%s reads %s (path %s, rating %r)" % (name, "held" if not want else "not held", path, rating))
+                    self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"], before, "no reader records a clear")
 
     def test_the_reader_table_is_complete(self):
-        """The readers are DERIVED from the code: every function that calls `rehold_reason` (the one rule) is in the table, and the table holds nothing else but the two gate rows."""
+        """The readers are DERIVED from the code: every function that calls `rehold_reason` or `rule_holds` is in the table, and the table holds nothing else but `impact_plan` (it reads the report's decision itself) and the gate rows."""
         import ast
         callers = set()
         for path in (BIN / "fleet-switchboard", BIN / "impact_hold.py"):
             for node in ast.parse(path.read_text()).body:
-                if isinstance(node, ast.FunctionDef) and any(isinstance(x, ast.Call) and getattr(x.func, "id", "") == "rehold_reason" for x in ast.walk(node)):
+                if isinstance(node, ast.FunctionDef) and any(isinstance(x, ast.Call) and getattr(x.func, "id", "") in ("rehold_reason", "rule_holds") for x in ast.walk(node)):
                     callers.add(node.name)
         engine = self.world.new_engine("daemon")
-        self.assertEqual(callers, set(self.readers(engine)) - {"rehold_reason", "G6", "G6b"})
+        self.assertEqual(callers, set(self.readers(engine)) - {"rehold_reason", "rule_holds", "impact_plan", "G6", "G6b"})
+        self.assertIn('report.get("owner_decision") == "hold"', (BIN / "impact_hold.py").read_text().split("def impact_plan")[1].split("def cmd_impact_hold")[0], "impact_plan follows the rule's own decision")
         plan_code = (BIN / "plan_ledger.py").read_text()
         self.assertEqual(plan_code.count('floor.get("rehold")'), 2, "G6 and G6b each read the gate fact's re-hold")
 
@@ -36364,9 +36462,8 @@ class TestImpactHold(LedgerBase):
         engine = self.world.new_engine("daemon")
         engine.config, engine.state_dir, engine.gh_runner = sb.load_config(), self.world.state, self.route
         with mock.patch.object(sb.plan_ledger, "read_ledger", return_value=([], "the ledger is not valid JSON")):
-            self.assertFalse(sb._impact_rehold_now(engine, "acme/app", 9, self.PR, {"head": LEDGER_NEW_HEAD}, {}), "no change from the pass")
-            self.assertEqual(self.writes, [])
-            self.assertTrue(sb.rehold_reason(engine, sb.read_impact_state(self.world.state)[0], "acme/app", self.PR, LEDGER_NEW_HEAD), "an unknown rating holds")
+            self.assertTrue(sb.rehold_reason(engine, sb.read_impact_state(self.world.state)[0], "acme/app", self.PR, LEDGER_NEW_HEAD, True), "an unknown rating holds")
+            self.assertEqual(sb.rehold_reason(engine, sb.read_impact_state(self.world.state)[0], "acme/app", self.PR, LEDGER_NEW_HEAD, False), None, "and the rule not holding explains nothing")
 
     def test_only_the_fleets_own_hold_labels_the_clear_removed_are_put_back_and_a_failed_write_backs_off(self):
         self.cleared_at_a_then_pushed_to_b()
@@ -36378,7 +36475,7 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(sorted(write[2]["labels"]), sorted(self.labelled() + [self.names["hold-credential"]]), "a foreign label is never added")
         self.writes.clear()
         with mock.patch.object(sb, "change_issue_labels", side_effect=RuntimeError("gh: down")):
-            self.floor_pr(path="src/app.py", head="c" * 40)   # a third head: judged afresh
+            self.floor_pr(path="migrations/0002.sql", head="c" * 40)   # a third head: judged afresh
             self.passes(records=[self.listed(head="c" * 40)], advance=4000)
         self.assertTrue(self.events("impact.error"), "a failed write is said and retried, never marked done")
         self.writes.clear()
@@ -36392,11 +36489,11 @@ class TestImpactHold(LedgerBase):
         engine = self.world.new_engine("daemon")
         engine.config, engine.state_dir, engine.gh_runner = sb.load_config(), self.world.state, self.route
         state = sb.read_impact_state(self.world.state)[0]
-        self.assertTrue(sb.rehold_reason(engine, state, "acme/app", self.PR, None), "an unreadable head is held")
-        self.assertIsNone(sb.rehold_reason(engine, {"clears": {}, "applied": {}}, "acme/app", self.PR, None), "no recorded clear: this rule holds nothing")
-        (self.world.state / "impact-hold.json").write_text("{not json")   # a corrupt state: no change from the re-hold, never a clear
-        self.assertFalse(sb._impact_rehold_now(engine, "acme/app", 9, self.PR, {"head": LEDGER_NEW_HEAD}, {}))
-        self.assertEqual(self.writes, [])
+        self.assertTrue(sb.rehold_reason(engine, state, "acme/app", self.PR, None, True), "an unreadable head is held")
+        self.assertIsNone(sb.rehold_reason(engine, {"clears": {}, "applied": {}}, "acme/app", self.PR, None, True), "no recorded clear: this rule holds nothing")
+        (self.world.state / "impact-hold.json").write_text("{not json")   # a corrupt state: no change from the pass, never a clear
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=2000)
+        self.assertEqual([w for w in self.writes if w[0] in ("DELETE", "PUT")], [])
 
     def test_a_clear_also_takes_off_a_merge_captain_label_the_switchboard_did_not_add(self):   # #742: it was `..._keeps_...` (#179 L4: only the labels the switchboard added came off)
         self.passes(records=[self.listed(labels=[self.names["merge-captain"]])])
@@ -37564,7 +37661,7 @@ class TestImpactHold(LedgerBase):
         state = sb.read_impact_state(self.world.state)[0]
         self.assertEqual(state["clears"]["acme/app#9"]["head"], LEDGER_HEAD)
         later = "9" * 40
-        self.assertTrue(sb.rehold_reason(self.engine_cached, state, "acme/app", "acme/app#9", later), "held again at the new head")
+        self.assertTrue(sb.rehold_reason(self.engine_cached, state, "acme/app", "acme/app#9", later, True), "held again at the new head")
         self.assertFalse(sb.rating_at(self.engine_cached, "acme/app#9", later)[0], "the rating of the first head is not one at the second")
         self.pr["headRefOid"] = later   # a clear started on a pull request that has moved: the head of the rating is not the head now
         self.writes.clear()
@@ -37709,7 +37806,7 @@ class TestImpactHold(LedgerBase):
                 self.assertEqual(sb.rating_at(engine, "acme/app#9", LEDGER_HEAD)[0], rated)
                 scored = sb.delegated_clear_score(engine, module, report, "Serious")
                 self.assertEqual(any("no independent impact rating" in r for r in scored["reasons"]), not rated, "the clear reads the same answer as rating_at: %s" % scored)
-                self.assertEqual(bool(sb.rehold_reason(engine, {"clears": {"acme/app#9": {"head": "c" * 40}}, "carried": {}}, "acme/app", "acme/app#9", LEDGER_HEAD)), not rated, "the re-hold reads it too")
+                self.assertEqual(bool(sb.rehold_reason(engine, {"clears": {"acme/app#9": {"head": "c" * 40}}, "carried": {}}, "acme/app", "acme/app#9", LEDGER_HEAD, True)), not rated, "the re-hold reads it too")
 
     def test_a_half_valid_or_disagreeing_or_foreign_rating_record_refuses_the_clear_and_the_all_valid_one_clears(self):
         low, high, serious = self.cell_of("Low"), self.cell_of("High"), self.cell_of("Serious")
