@@ -1389,8 +1389,10 @@ def _cluster_snapshot(runner, cluster, timeout):
     """ONE read of the cluster: the launcher's read-only `snapshot` command (the pods of the namespace and, when the login may list them, the
     nodes). A failure is a CloudError with one line of reason: the caller says it, never hides it."""
     code, body, note = run_launcher(runner, "snapshot", "", (), timeout, cluster=cluster)
-    if code != 0 or not isinstance(body, dict):
+    if code != 0:
         raise CloudError("the cluster was not read (%s)" % _reason(code, note))
+    if not isinstance(body, dict):
+        raise CloudError("the cluster was not read (the launcher printed no snapshot)")
     return body
 
 
@@ -1502,7 +1504,7 @@ def status_lines(runner, state, timeout=STATUS_SECONDS):
                 elif pod is None:
                     row["launcher_status"] = "ended"
                     row["ended_at"] = record.get("hard_deadline")
-                    lines.append("      cloud %s: %s, ended at %s (no pod)"
+                    lines.append("      cloud %s: %s, ended at %s (no pod), past its hard deadline"
                                  % (record["worker"], record["runtime_id"], record.get("hard_deadline")))
                 else:
                     row["launcher_status"] = "past its hard deadline"
