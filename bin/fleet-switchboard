@@ -22532,11 +22532,11 @@ def _impact_release_reason(before, base, rule, record, head, new_head):
 
 
 def impact_ours(engine):
-    """(the set of pull requests whose `applied` record in the hold state lists labels this daemon added, the problem or None). A state that cannot be read lists none."""
+    """(the hold state's `applied` records, the problem or None). A state that cannot be read lists none. Which of them are ours for a repo: `applied_for_repo`."""
     state, problem = read_impact_state(engine.state_dir)
     if problem:
-        return set(), problem
-    return {pr for pr, entry in (state.get("applied") or {}).items() if isinstance(entry, dict)}, None
+        return {}, problem
+    return state.get("applied") or {}, None
 
 
 def _impact_not_checked(engine, what, why):
@@ -22573,14 +22573,15 @@ def impact_would_hold_pass(engine, now):
     records, records_problem = impact_records(engine.state_dir)
     basis = engine.__dict__.setdefault("impact_basis", {})   # what each pull request was last judged on (base, rule, record): it NAMES a release's reason, it never skips a judgement
     judged_at = engine.__dict__.setdefault("impact_judged_at", {})
-    ours_prs, state_problem = impact_ours(engine)   # the pull requests carrying labels this daemon added: judged afresh at every pass (#999), whatever the head-only memo says
-    if state_problem or (records_problem and ours_prs):
+    ours_applied, state_problem = impact_ours(engine)   # the pull requests carrying labels this daemon added: judged afresh at every pass (#999), whatever the head-only memo says
+    if state_problem or (records_problem and any(applied_for_repo(ours_applied, k) for k in state.lists)):
         _impact_not_checked(engine, "the impact review ledger" if records_problem else "the hold state file", records_problem or state_problem)
     else:
         engine.__dict__.pop("impact_not_checked", None)
     marks = impact_carry_marks(engine.state_dir)[0]
     unjudged, live = 0, set()
     for key, (_, listed) in sorted(state.lists.items()):
+        ours_prs = applied_for_repo(ours_applied, key)
         for record in sorted(listed, key=lambda r: judged_at.get((key, r.get("number")), 0) if isinstance(r, dict) else 0):   # the one judged longest ago first: a small budget never starves a pull request
             number = record.get("number") if isinstance(record, dict) else None
             head = ((record.get("head") or {}).get("sha")) if isinstance(record, dict) else None

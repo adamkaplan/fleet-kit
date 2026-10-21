@@ -13,6 +13,7 @@ daemon's globals and are not meant to be called from this module's own namespace
 import types
 
 MOVED = ('rating_at',
+         'applied_for_repo',
          '_plan_hold',
          'rehold_reason',
          'gate_floor_fact',
@@ -105,6 +106,12 @@ def gate_floor_fact(engine, state, repo, number, head):
                 "rehold": None if problem else rehold_reason(engine, clears, repo, report["pr"], head)}   # the OWNER-HOLD decision: the one the daemon's labels follow (#451)
     except Exception as err:   # an unreadable diff, a matrix error, a missing file: all the same answer
         return {"decision": None, "reasons": [], "cleared": False, "rehold": None, "unreadable": _one_line("%s: %s" % (type(err).__name__, err), 150)}
+
+
+def applied_for_repo(applied, repo):
+    """(#999) The pull requests of exactly `repo` whose `applied` record lists labels this daemon added: a key is `<repo>#<number>` (the `#` ends the name, so
+    `acme/web` never takes `acme/web2#1`), and a record that is not an object is no record of ours. The ONE match the daemon's pass and `impact hold --dry-run` share."""
+    return {pr for pr, entry in (applied or {}).items() if isinstance(pr, str) and pr.startswith(repo + "#") and isinstance(entry, dict)}
 
 
 def read_impact_state(state_dir):
@@ -1326,7 +1333,7 @@ def cmd_impact_hold(args, runner, now):
         except impact_floor.MatrixError as err:   # the matrix file cannot be read: say so and stop, never read it as "no floor"
             sys.stderr.write("%s: impact hold: %s\n" % (PROG, _one_line(str(err), 200)))
             return EXIT_ERROR
-        if not has_floor and not any(pr.startswith(repo + "#") and isinstance(entry, dict) for pr, entry in (read_impact_state(state)[0].get("applied") or {}).items()):   # a repo with no floor now is still judged while it holds labels of ours (#999)
+        if not has_floor and not applied_for_repo(read_impact_state(state)[0].get("applied"), repo):   # a repo with no floor now is still judged while it holds labels of ours (#999)
             continue
         try:
             items = read_open_items(engine, runner, repo)[0]

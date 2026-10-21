@@ -35620,15 +35620,56 @@ class TestImpactReleaseEveryPass(TestImpactRejudge):
         self.assertNotIn("acme/app#9", out)
         self.assertEqual(len(self.view_reads), before, "a repo with no floor and no record of ours is not read")
 
-    def test_the_dry_run_skips_a_record_of_another_repo_when_the_floor_is_empty(self):
+    # (#999) ONE match, `applied_for_repo`, read by the pass and the dry run: a floorless repo is judged only for a well-formed record of exactly its own pull requests
+    OWN_RECORD = {"head": "a" * 40, "merge_label_added": True, "added": [], "at": 1}
+    APPLIED_ROWS = (   # (what the record is keyed by, its value or None for the real one, whether the floorless repo is judged and released)
+        ("acme/app#9", None, True),
+        ("acme/app2#9", None, False),   # the `#` ends the name: a longer repo name sharing the prefix is not ours
+        ("other/app#9", None, False),
+        ("acme/app#9", "not an object", False),   # a malformed record counts as none
+        ("acme/app#9", ["a list"], False),
+        (None, None, False),   # no record at all
+    )
+
+    def test_applied_for_repo_is_the_one_match_and_every_row_of_it_is_pinned(self):
+        for key, value, judged in self.APPLIED_ROWS:
+            applied = {} if key is None else {key: dict(self.OWN_RECORD) if value is None else value}
+            self.assertEqual(bool(sb.applied_for_repo(applied, "acme/app")), judged, (key, value))
+        self.assertEqual(sb.applied_for_repo(None, "acme/app"), set())
+        self.assertEqual(sb.applied_for_repo({"acme/app#9": {}, "acme/app#10": {}, "acme/app2#1": {}}, "acme/app"), {"acme/app#9", "acme/app#10"})
+
+    def floorless_row(self, key, value):
+        """The held world with its record replaced by the row's, and the repo's floor empty."""
         self.held_world("base")
         self.view("docs/a.md", base="2" * 40)
         state = json.loads((self.world.state / "impact-hold.json").read_text())
-        state["applied"] = {"acme/app-other#9": v for v in state["applied"].values()}
+        real = next(iter(state["applied"].values()))
+        state["applied"] = {} if key is None else {key: real if value is None else value}
         (self.world.state / "impact-hold.json").write_text(json.dumps(state))
+
+    def dry_run_row(self, key, value, judged):
+        self.floorless_row(key, value)
+        before = len(self.view_reads)
         with mock.patch.object(sb.impact_floor, "floor_for", self.NO_FLOOR):
             code, out, err = self.run_as("coder", "impact", "hold", "--dry-run", "--repo", "acme/app")
-        self.assertNotIn("would remove", out)
+        self.assertEqual(code, 0, err)
+        self.assertEqual("acme/app#9  would remove" in out, judged, out)
+        if not judged:
+            self.assertEqual(len(self.view_reads), before, "a repo that is not judged is not read")
+
+    def pass_row(self, key, value, judged):
+        self.floorless_row(key, value)
+        before = len(self.view_reads)
+        with mock.patch.object(sb.impact_floor, "floor_for", self.NO_FLOOR):
+            self.step()
+        self.assertEqual(len(self.removals(9)), 2 if judged else 0)
+        self.assertEqual(len(self.view_reads) > before, judged, "a pull request of a repo that is not judged is not read")
+
+    # one test per row of APPLIED_ROWS (a held world is built once per test), through the dry run AND through the pass
+    for _i, _row in enumerate(APPLIED_ROWS):
+        locals()["test_the_dry_run_floorless_row_%d" % _i] = lambda self, _row=_row: self.dry_run_row(*_row)
+        locals()["test_the_pass_floorless_row_%d" % _i] = lambda self, _row=_row: self.pass_row(*_row)
+    del _i, _row
 
     def test_a_pull_request_no_longer_open_leaves_no_memo(self):
         self.held_world("base")
