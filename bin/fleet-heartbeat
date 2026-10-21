@@ -94,6 +94,8 @@ def registry_state_dir():
     return Path(base) / "fleet-switchboard"
 
 
+# Fail mode, decided: a record with no `bell` field is opted out. Until the switchboard daemon's one-time migration has run (`bell-migrated.json` absent) every
+# agent reads as opted out, so nobody is nudged (closed, never open); `status` says "bell migration pending" meanwhile.
 GONE_STATES = ("dead", "detached")   # a recorded agent whose pane is gone or unattached: never nudged
 
 
@@ -1076,6 +1078,9 @@ def cmd_status(args):
             live = {t["pane_id"] for t in registry_targets()[0]}   # the opted-in panes of the registry; no live listing
     except ConfigError as err:
         notes.append(str(err))
+
+    if registry is not None and not registry.bell_migrated(registry_state_dir()):
+        notes.append("bell migration pending: no agent is supervised until the switchboard daemon has copied the bell opt-in into the registry")
 
     service_manager = service_manager_state()
     if service_manager:

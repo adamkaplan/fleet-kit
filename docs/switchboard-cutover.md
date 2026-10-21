@@ -167,7 +167,7 @@ carry fleet metadata, so v1 panes are invisible to it. The plugin is not linked
 
 ## Keep `fleet-heartbeat` for v1 panes
 
-`fleet-heartbeat` is unchanged and keeps waking v1 panes. Leave it running until
+`fleet-heartbeat` keeps waking v1 panes (since #973 its opt-in is the registry's `bell` field). Leave it running until
 the last v1 pane has moved. A pane the switchboard manages is recorded with the
 heartbeat's bell off in the registry (#973), so the two never both wake one agent. When
 `fleet-heartbeat status --json` shows no pane left, stop it.

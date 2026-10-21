@@ -359,7 +359,10 @@ def upsert(state_dir, name, agent, now=None):
             return False, [], "%s is retired for this session" % name
         fields = dict(agent or {})
         if "bell" not in fields:
-            fields["bell"] = old["bell"] if isinstance((old or {}).get("bell"), bool) else BELL_DEFAULT   # a pass that records state never forgets the opt-in a person set; a NEW agent gets the field
+            if isinstance((old or {}).get("bell"), bool):
+                fields["bell"] = old["bell"]   # a pass that records state never forgets the opt-in a person set
+            elif old is None and bell_migrated(state_dir):
+                fields["bell"] = BELL_DEFAULT   # a NEW agent gets the field; before the one-time migration has run no record is given one, or the migration would skip it and lose its live opt-in
         new = _agent(fields, (old or {}).get("state") or "idle", (old or {}).get("since") or _stamp(now))
         if old == new:
             return False, [], None

@@ -75719,7 +75719,7 @@ class TestBellMigration(unittest.TestCase):
         # old records: strip the field the upsert now adds, as if recorded before this change
         doc = json.loads((self.dir / "registry.json").read_text())
         for row in doc["agents"].values():
-            row.pop("bell")
+            row.pop("bell", None)
         (self.dir / "registry.json").write_text(json.dumps(doc))
         labels = ["%s x" % self.GLYPH, "plain", "Orchestrator", "y %s" % self.GLYPH, "\U0001f515 z"]
         self.live = {"a": True, "b": False, "c": False, "d": True, "e": False}
@@ -75765,6 +75765,29 @@ class TestBellMigration(unittest.TestCase):
         self.assertEqual(len(self.audit_lines()), 5)
         self.registry.upsert(self.dir, "new", {"pane": "w9:p1", "session": "ses_examplenew"}, now=8)
         self.assertIs(self.registry.read(self.dir)["agents"]["new"]["bell"], False)
+
+    def test_a_failed_migration_followed_by_a_state_pass_loses_no_opt_in(self):
+        self.engine.herdr = self.Herdr(self.agents, self.tabs, fail=True)
+        sb.bell_migration(self.engine, self.registry, 5)
+        for name in self.names:   # the pass's upsert of a changed state, before the migration has run
+            self.registry.upsert(self.dir, name, {"pane": self.registry.read(self.dir)["agents"][name]["pane"], "session": self.registry.read(self.dir)["agents"][name]["session"], "state": "working"}, now=6)
+        self.assertEqual(self.bells(), {n: None for n in self.names})
+        self.engine.herdr = self.Herdr(self.agents, self.tabs)
+        sb.bell_migration(self.engine, self.registry, 7)
+        self.assertEqual(self.bells(), self.live)
+
+    def test_a_failing_tab_list_and_a_failing_marker_write_are_safe(self):
+        herdr = self.Herdr(self.agents, self.tabs)
+        herdr.tab_list = lambda: (_ for _ in ()).throw(sb.HerdrError("exit", "no"))
+        self.engine.herdr = herdr
+        sb.bell_migration(self.engine, self.registry, 5)
+        self.assertEqual(self.bells(), {n: None for n in self.names})
+        with mock.patch.object(self.registry, "_write_atomic", side_effect=OSError(28, "full")):
+            got = self.registry.migrate_bell(self.dir, {"w0:p1"}, True)
+        self.assertTrue(got["problem"])
+        self.assertFalse(self.registry.bell_migrated(self.dir))
+        again = self.registry.migrate_bell(self.dir, {"w0:p1"}, True)   # safe to re-run: records that have the field are left alone
+        self.assertIsNone(again["problem"])
 
     def test_a_field_a_person_set_is_never_overwritten_and_the_default_is_opted_out(self):
         self.registry.set_bell(self.dir, "b", True)

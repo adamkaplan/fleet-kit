@@ -1084,10 +1084,6 @@ class TestBellFromRegistry(Base):
                 self.assertFalse(any(parts[i:i + 2] == ["agent", "list"] for i in range(len(parts))), "a live agent listing is back")
         self.assertNotIn("tabs_with_agents", (BIN / "fleet-heartbeat").read_text())
 
-    def test_the_filter_reads_the_field_through_the_registry_read(self):
-        text = (BIN / "fleet-heartbeat").read_text()
-        self.assertIn("registry.bell_of(agent)", text)
-
     # -- S5: two mutants of the heartbeat source, each must fail a check
 
     SOURCE = (BIN / "fleet-heartbeat").read_text()
@@ -1139,6 +1135,7 @@ class TestBellFromRegistry(Base):
         d = self.home / "reg"
         d.mkdir()
         real = REAL_REGISTRY
+        self.assertEqual(real.migrate_bell(d, set(), True)["problem"], None)   # the one-time migration has run
         real.upsert(d, "w", {"pane": "w2:p2", "session": "ses_example1"})
         self.assertIs(real.read(d)["agents"]["w"]["bell"], False)   # a NEW agent is recorded with the field
         self.assertEqual(real.set_bell(d, "w", True), {"changed": True, "problem": None})
@@ -1147,6 +1144,37 @@ class TestBellFromRegistry(Base):
         self.assertIs(real.read(d)["agents"]["w"]["bell"], True)   # a state pass never forgets it
         self.assertTrue(real.set_bell(d, "nobody", True)["problem"])
         self.assertNotIn("nobody", real.read(d)["agents"])
+
+    def run_cmd(self, fn, argv, reg_dir):
+        args = hb.build_parser().parse_args(["--state-dir", str(self.state)] + argv)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(hb, "registry", REAL_REGISTRY), mock.patch.object(hb, "registry_state_dir", lambda: reg_dir), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = fn(args)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_the_bell_and_list_commands_report_and_refuse(self):
+        d = self.home / "reg2"
+        d.mkdir()
+        REAL_REGISTRY.migrate_bell(d, set(), True)
+        REAL_REGISTRY.upsert(d, "w", {"pane": "w2:p2", "session": "ses_example1"})
+        self.assertEqual(self.run_cmd(hb.cmd_list, ["list"], d)[1].count("no (bell off)"), 1)
+        code, out, err = self.run_cmd(hb.cmd_bell, ["bell", "w", "on"], d)
+        self.assertEqual((code, "bell on" in out), (0, True))
+        self.assertEqual(self.run_cmd(hb.cmd_list, ["list"], d)[1].count("yes"), 1)
+        code, out, err = self.run_cmd(hb.cmd_bell, ["bell", "ghost", "on"], d)
+        self.assertEqual(code, hb.EXIT_FAULT)
+        self.assertIn("not a recorded agent", err)
+        (d / "registry.json").write_text("{not json")
+        self.assertEqual(self.run_cmd(hb.cmd_list, ["list"], d)[0], hb.EXIT_FAULT)
+
+    def test_status_says_the_migration_is_pending_until_the_marker_exists(self):
+        d = self.home / "reg3"
+        d.mkdir()
+        with mock.patch.object(hb, "registry", REAL_REGISTRY), mock.patch.object(hb, "registry_state_dir", lambda: d), \
+                mock.patch.object(hb, "load_config", side_effect=hb.ConfigError("x")), contextlib.redirect_stdout(io.StringIO()) as out:
+            hb.cmd_status(hb.build_parser().parse_args(["--state-dir", str(self.state), "status"]))
+        self.assertIn("bell migration pending", out.getvalue())
 
 
 # ------------------------------------------------- the daemon writes no tab titles

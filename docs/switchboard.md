@@ -117,7 +117,7 @@ Evidence from real use:
 | Testing | Every promised behaviour is a scenario, run offline in CI against fakes and in the Lab against real v2 and herdr. Each scenario's control, with its safeguard switched off, must fail. See [Scenario testing](#scenario-testing). |
 | Harness boundary | One adapter contract with capability flags. OpenCode v2 is the only adapter built; a hook-based adapter is specified but not built. |
 | GitHub events | Webhooks relayed by `gh webhook forward`, supervised by the daemon. No timer-based polling; one bounded catch-up read of the gap after each forwarder start, from a read marker and forward only, because the forwarder does not replay (PR 5, and see "Reads move forward only"). |
-| Heartbeat | `fleet-heartbeat` is unchanged and keeps serving v1 panes. A pane the switchboard manages is recorded with `bell: false` (the heartbeat's opt-in is the registry's `bell` field, changed with `fleet-heartbeat bell NAME on`, #973). |
+| Heartbeat | `fleet-heartbeat` keeps serving v1 panes; since #973 it takes its opt-in from the registry, not from tab labels. A pane the switchboard manages is recorded with `bell: false` (the heartbeat's opt-in is the registry's `bell` field, changed with `fleet-heartbeat bell NAME on`, #973). |
 | Machine text | Always a v2 `synthetic` message tagged `[switchboard]`; never typed, never sent as a user message. The TUI does not show it (S3); the badge, `status` and the audit log do. |
 | Agent to agent | Agents message each other only with `fleet-switchboard send`, never by typing into a pane. |
 | Talking to orchestrators | You can talk to any orchestrator directly. Nothing extra is recorded; the issue already carries the intent. |
