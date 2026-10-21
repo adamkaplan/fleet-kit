@@ -62,7 +62,8 @@ class Entrypoint(unittest.TestCase):
 
     def env(self, **extra):
         return dict({"PATH": self.bin + ":/usr/bin:/bin", "HOME": self.home, "WORKER_DOCKER": "0", "CW_RUN_DIR": self.run_dir,
-                     "CW_TMP_DIR": self.tmpfs, "CW_SHARE_DIR": self.share, "GIT_CONFIG_NOSYSTEM": "1"}, **extra)
+                     "CW_TMP_DIR": self.tmpfs, "CW_SHARE_DIR": self.share, "GIT_CONFIG_NOSYSTEM": "1",
+                     "CW_GH_CLIENT": os.path.join(self.bin, "gh")}, **extra)
 
     def start(self, *cmd, **extra):
         return subprocess.run(["sh", ENTRYPOINT] + list(cmd or ["true"]), env=self.env(**extra), capture_output=True, text=True, timeout=60)
@@ -167,6 +168,13 @@ class Entrypoint(unittest.TestCase):
         self.assertIn("gh token length %d" % len(GIT), r.stdout)
         self.assertIn("left in the environment: nothing", r.stdout)
         self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.tmpfs, "bin")).st_mode), 0o700)
+
+    def test_1031_without_the_client_the_start_is_refused_and_the_real_gh_is_never_looked_up(self):
+        r = self.start("sh", "-c", "echo started", CW_GH_CLIENT=os.path.join(self.d, "absent"))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("refusing to start", r.stderr)
+        self.assertNotIn("started", r.stdout)
+        self.assertNotIn("command -v gh", read(ENTRYPOINT))
 
     def test_s4_a_token_file_that_vanishes_or_empties_makes_the_helper_and_the_wrapper_fail_with_one_line(self):
         self.assertEqual(self.start().returncode, 0)

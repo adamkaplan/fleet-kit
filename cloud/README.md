@@ -2,7 +2,7 @@
 
 Part of the cloud-worker prototype (plan scenarios S10 and S12). Two pieces:
 
-- `worker/`: the worker image (OpenCode headless, git, gh, Python, Docker for use under Sysbox, non-root)
+- `worker/`: the worker image (OpenCode headless, git, `cw-gh`, Python, Docker for use under Sysbox, non-root)
   and `scan-secrets.sh`, a build-failing scan for stored credentials.
 - `k8s/`: the RuntimeClass and a DaemonSet that repairs the containerd registration of Sysbox on a node, repeatably.
 
@@ -14,7 +14,7 @@ Cloud workers serve the organisation's repositories only; no task, test or demo 
 
 ## What is in the image
 
-Ubuntu 24.04, Python 3, git, `gh`, Docker Engine with the compose plugin, and `opencode` v2 (pinned,
+Ubuntu 24.04, Python 3, git, `cw-gh` (our own small GitHub client; the real `gh` is not installed: see "The client that replaces the real `gh`"), Docker Engine with the compose plugin, and `opencode` v2 (pinned,
 `OPENCODE_VERSION=2.0.28`, a standalone binary checked against its sha256 before it is unpacked; no node or npm). The
 launcher's end hook and token mint are copied in as `cw-end-hook` and `cw-token-mint`, and the activity reader as
 `cw-worker-activity` (it reads the v2 object shape of `GET /api/session/active`). It runs as user `worker` (uid 1000). `worker` may run one command as root (`start-dockerd`) through sudo;
@@ -28,7 +28,7 @@ The launcher mounts per-run files read-only under `/run/cw` (`CW_RUN_DIR`). The 
 
 - `server-password`: read into `OPENCODE_SERVER_PASSWORD` for the server it starts (OpenCode reads the password only from its environment).
 - `model-auth`: the model provider's access entry (JSON), copied with mode 600 to `<tmpfs>/data/opencode/auth.json` (`XDG_DATA_HOME`), so the server refreshes its short-lived token in the copy and never in the Secret. A model config naming `CW_MODEL` (default `github-copilot/claude-sonnet-5.5`) is written beside it (`XDG_CONFIG_HOME`); it holds no secret.
-- `git-token`: never copied. A git credential helper (`git config --global`, so every process of the worker user sees it, including a fresh-environment `kubectl exec` such as the end hook) and a `gh` wrapper read the file at call time. The helper answers only for `https://github.com`; the token is never in git config, argv or the environment. The directory is the path baked in when the files were generated (a caller's `CW_RUN_DIR` changes nothing), and at every call an unreadable or empty token file makes both fail with one line and a non-zero exit (never an empty password, never a `gh` with an empty token). The `gh` wrapper passes every subcommand: the guard is the token's own permissions (a per-run, one-repository App token), not the wrapper. The server password is in the server's environment, so every process the agent starts can read it; that is accepted by design.
+- `git-token`: never copied. A git credential helper (`git config --global`, so every process of the worker user sees it, including a fresh-environment `kubectl exec` such as the end hook) and a `gh` wrapper read the file at call time. The helper answers only for `https://github.com`; the token is never in git config, argv or the environment. The directory is the path baked in when the files were generated (a caller's `CW_RUN_DIR` changes nothing), and at every call an unreadable or empty token file makes both fail with one line and a non-zero exit (never an empty password, never a `gh` with an empty token). The `gh` wrapper runs the guard and then `cw-gh`, which has only the verbs listed under "The client that replaces the real `gh`"; the boundary is the token's own permissions (a per-run, one-repository App token) and the repository's rules, not the wrapper or the client. The server password is in the server's environment, so every process the agent starts can read it; that is accepted by design.
 - The `git-token` also carries `issues: read` (one table in `cloud/launcher/app_token.py`), so the worker can read its repository's issues and their comments. The wrapper still refuses every write to an issue, a label or a merge.
 
 A file that is absent is skipped (a pod started without per-run secrets). A file that is present but unreadable or empty
@@ -46,8 +46,8 @@ six with exit status 3 and one line, `refused: <what>: the repository's rules ar
 convenience`; the line names a fixed phrase and never an argument value. Everything else passes unchanged (the `gh` wrapper
 still reads the token file at call time).
 
-What this is NOT: the guard. Both layers are defence in depth and can be bypassed: calling the real binary by its path,
-another HTTP client or a script skips the wrapper, and a pattern is only text matching. The guard is the repository's own
+What this is NOT: the guard. Both layers are defence in depth and can be bypassed: the real `gh` is no longer in the image,
+but another HTTP client (`curl`, `python3`) or a script skips the wrapper, and a pattern is only text matching. The guard is the repository's own
 rules (branch protection or a ruleset that forbids merge by the worker, pushes to the default branch and force-pushes) and
 the token's scope (the preflight, #545). Known limits: the `permission.bash` block was checked to load and convert in a local OpenCode 2.0.28 server (it becomes `shell` deny rules), but that server did not list the `worker` agent in isolation, so the agent definition is not proven to register or to be the default (no `default_agent` is set); the global deny block applies to every agent either way. the config's patterns name `main` and `master` only (the wrapper
 also reads `CW_DEFAULT_BRANCH`, space or comma separated, and `origin/HEAD`), `git push` from a checkout of the default
@@ -64,12 +64,93 @@ Beyond the six, the wrapper (and, where a text pattern can say it, the OpenCode 
 - **Git's environment configuration is refused**: any `git` command when `GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`, any `GIT_CONFIG_KEY_*`, `GIT_CONFIG_GLOBAL` or `GIT_CONFIG_SYSTEM` is set and not empty, because they carry the `alias.*` and `push.default` overrides the `-c` refusals cover. The pod's own credential helper is written to `~/.gitconfig` (a file) and the entrypoint exports none of these, so the worker's own git is not affected. `GH_CONFIG_DIR` is not refused: a `gh` alias only expands for a first word `gh` does not know, and the wrapper refuses every such word. `gh config set` is refused.
 - **`git config` writes are refused** (the table of forms is at the top of `guard.sh`; this list names exactly its refused forms): `--rename-section`, `--remove-section`, `-e`, `--edit`, `--add`, `--unset`, `--unset-all`, `--replace-all`, `--file`, `-f`, `--blob`, `an unknown flag or abbreviation` (any flag not listed as a read or display flag; git takes a unique prefix, so --uns is --unset; this also refuses an abbreviated read flag, by design), `a value word after a read mode's key` and `an option after the get or list subcommand` (refused although git takes them as reads: --get K REGEX, --get-all K REGEX, --get-regexp P VALREGEX, config list --show-origin, config get --all K; the key count must match the mode and options come before the key), `a value that looks like an option` (git stops reading options at the first non-option word, so everything after the key is a value; a word after the key that starts with a dash is refused whatever it is, so a value cannot pose as a read modifier: for example core.pager with the value --default=x;touch), the subcommand forms `edit`, `set`, `unset`, `rename-section` and `remove-section`, the plain `KEY VALUE` form, and a key named `include.path` or `includeIf.<cond>.path` (a value that makes git read another file). The one exception is the plain form for exactly `user.name` or `user.email` (identity, needed to commit; `user.name.x` is not it). A write flag anywhere in the command makes it a write, whatever read mode or key it comes with (`--get --unset k` is refused). The wrapper reads the command like git does and denies by default: the options are only the words before the first non-option word, and a read passes only as exactly one read mode (`--get`, `--get-all`, `--get-regexp` take one key, `--list` and `-l` none, `--get-urlmatch`, `--get-color` and `--get-colorbool` one or two) or no mode and one key, with scope and display flags and `--type=`, `--default=` and the other read modifiers before the key. Any other shape is judged word by word and refused, so an `alias.*` or `push.default` keeps its own phrase. The deny globs in the OpenCode configuration and `worker.md` are belt and braces, not a second guard: a text pattern cannot read a command's shape. Like the rest of this wrapper it is a convenience, not the guard: the repository's rules and the token's scope are.
 - **`git push`**: a refspec with `*`, any `push.default` override (`-c`, `git config`), and the `--repo=`, `--receive-pack=` and `--exec=` forms are handled by name.
-- **Approving or dismissing a review is refused** (`gh pr review` in any form, and `gh api` writes under `repos/*/pulls/*/reviews`), because a bot approval can count toward a required-reviews rule on another pull request. `gh pr close`, `ready`, `reopen` and `comment` are NOT refused: they act on the worker's own pull request and grant nothing another one relies on; the repository's ruleset (who may approve, who may merge) is what stops an approval counting.
+- **Approving or dismissing a review is refused** (`gh pr review` in any form, and `gh api` writes under `repos/*/pulls/*/reviews`), because a bot approval can count toward a required-reviews rule on another pull request. `gh pr ready` and `comment` are NOT refused (and `gh pr close` and `reopen` are not refused by the wrapper, though the client has no such verb): they act on the worker's own pull request and grant nothing another one relies on; the repository's ruleset (who may approve, who may merge) is what stops an approval counting.
 - Also refused: `gh pr edit --add-assignee|--remove-assignee`, `gh workflow run|enable|disable`, `gh release create|edit|delete|upload`, `gh run rerun|cancel`, `gh api` writes to `repos/*/dispatches`, `.../git/refs` (any write), `.../releases` and `orgs/*`. `gh ruleset` is only reads (`list`, `view`, `check`), so it is no longer refused.
 - Known over-refusals: the config's patterns refuse a read of `.../reviews`, `.../dispatches`, `.../git/refs`, `.../releases` or `orgs/*` through `gh api` (the wrapper lets a GET through), and a branch such as `fix-main-menu` (a `main` pattern); an unknown first word of `gh` is refused (so a new `gh` command is refused too until the list in `guard.sh` is updated).
 - Known passes: when `origin/HEAD` cannot be read the default branch is only `main`, `master` and `CW_DEFAULT_BRANCH`; the config cannot say a literal `*` refspec, so that is the wrapper's only; an option the parser cannot read passes.
 
 The OpenCode config is written under the worker's own tmpfs, so the worker user can edit it, and a repository's own `opencode.json` is merged over it by OpenCode (not run here: whether a later file can lift a `deny` is unproven). The deny rules are a convenience. `"*": "allow"` followed by the denies is allow-by-default for the shell tool: it grants nothing the pod could not already do, and narrows nothing by itself. The guard is the repository's rules and the token's scope.
+
+## The root cause of the recorded case
+
+A cloud worker called the real `gh` binary by its path instead of the `gh` wrapper first on its PATH, and ran a GraphQL mutation that removes a pull request from a merge queue. The wrapper refuses merge-class commands and any GraphQL `mutation`, but it only runs when the caller goes through it: the real `gh` binary skipped it, and the token itself allowed the mutation. The wrapper worked as designed; it was never a boundary, and a wrapper, a removed binary or a file mode inside the pod can never be one, because the worker's unix user can read the token file, runs `curl` and `python3`, and is in the `docker` group.
+
+## Where the boundary is
+
+There are two real boundaries, and everything else in the pod is a convenience.
+
+- **Boundary 1, the token's scope.** The installation token has exactly contents write, pull requests write, issues read and metadata read (`app_token.py` refuses any other set). What those permissions allow is the table below.
+- **Boundary 2, the repository's rules.** Rulesets, the merge queue and review requirements decide what the permitted actions can reach: a merge, a push to the default branch, a force-push. The preflight reads them before a worker is launched (`cloud/launcher/preflight.py`).
+
+The wrappers and the client are conveniences, never a boundary: the `gh` and `git` wrappers (`guard.sh`), the OpenCode deny rules, the worker prompt, and `cw-gh` (the client that replaces the real `gh`). They catch accidents and make conduct rules visible. A worker that wants to act around them can, by design, with the routes listed under "What remains reachable by design".
+
+Owner decisions that remain (the plan names them; the answers are recorded on the pull request, not assumed):
+
+- Whether to accept, as allowed by design, the actions the table leaves open to the token: PR comments, labels on a PR, ready and draft, close and reopen, reviewer requests, tags, releases and branch deletes.
+- Whether the preflight's new checks (an App bypass actor, auto-merge, no required status check, a merge queue) block instead of warn. They warn first; one table, `CHECK_MODES` in `preflight.py`, is switched after a week of clean warnings.
+- Whether the live probes of the "to be probed live" rows pass on the throwaway repository (a tester step after merge).
+
+## What the token allows
+
+One row per action, derived from GitHub's own "Permissions required for GitHub Apps" page. The rows live in `cloud/token-table.txt`; this rendering is checked against it by `cloud/worker/tests/test_token_table.py` (regenerate with `python3 cloud/worker/tests/test_token_table.py --write`). A status of "to be probed live" means no live token was used to confirm it: the probes run on the throwaway repository after merge (`cloud/worker/probe-token.py`), never against a product repository.
+
+<!-- token-table:begin -->
+| Action | Token | Decided by | Status |
+|---|---|---|---|
+| PR create, edit title/body/base, close, reopen | allowed | pull requests: write | documented |
+| PR comment, review comment, reply | allowed | pull requests: write | documented |
+| Issue comment on a PR, labels on a PR, assignees | allowed | pull requests: write (the shared endpoints accept issues or pull requests) | documented, labels to be probed live |
+| Request or remove reviewers | allowed | pull requests: write | documented |
+| Ready for review, convert to draft | allowed | pull requests: write (GraphQL, not in the REST table) | to be probed live |
+| Submit review, approve, request changes, dismiss | allowed | pull requests: write (GitHub refuses a self-approval; whether a bot approval counts is the ruleset's) | documented, counting to be probed live |
+| Update PR branch | allowed | pull requests: write | documented |
+| Merge a PR (REST) | allowed | contents: write (bounded only by the ruleset) | documented |
+| Enable or disable auto-merge | allowed | pull requests: write (GraphQL; only if the repository allows auto-merge) | to be probed live |
+| Merge queue enqueue and dequeue | unknown | not in the documented table | to be probed live |
+| Branch create, push, delete (non-default) | allowed | contents: write | documented |
+| Push or delete the default branch, force-push | allowed | contents: write (refused only by the ruleset) | documented |
+| Tag create and delete | allowed | contents: write | documented |
+| Releases and release assets | allowed | contents: write | documented |
+| Workflow file changes | refused | no workflows permission | documented |
+| Repository settings, rulesets, branch protection, webhooks, secrets | refused | administration, secrets and webhooks not granted | documented |
+| Issue and issue-comment reads (view, list) | allowed | issues: read | documented, to be probed live |
+| Issue create, edit, close | refused | issues: write not granted, only read (comments, labels and assignees on a PR are the PR rows above) | documented, to be probed live |
+<!-- token-table:end -->
+
+### The client that replaces the real `gh`
+
+The image no longer installs `gh`. `cloud/worker/cw-gh` is a small client of our own (Python, standard library, no extra dependency) that the `gh` wrapper runs after the guard. It covers only the verbs a worker's task needs:
+
+- `gh pr create|view|list|comment|checks|diff|ready`
+- `gh repo view`
+- `gh issue view|list` (read only)
+- `gh run view|list|logs` (read only; `gh run view --log` and `--log-failed` print the CI logs)
+- `gh api` with GET only
+
+Its output differs from the real `gh`: `--json` prints the raw REST object and `--jq` and `--template` are not supported. The wrapper's refusals are unchanged and run first.
+
+### Verbs that no longer work
+
+Everything else exits 2 with `cw-gh: '<verb>' is not available in this pod`, and the wrapper refuses a subset of them first (exit 3) as before:
+
+- `gh issue create`, `gh issue edit`, `gh issue close`, `gh issue comment` and the rest of `gh issue` writes: the token has no issues permission (comments on a pull request are `gh pr comment`).
+- `gh pr merge`, `gh pr review`, `gh pr edit`, `gh pr close`, `gh pr reopen`, `gh pr update-branch`: not covered by the client (merge and review are also refused by the wrapper).
+- `gh label ...`, `gh release ...`, `gh workflow ...`, `gh run rerun` and `gh run cancel`.
+- `gh repo edit`, `gh repo clone`, `gh repo create` and every other `gh repo` verb except `view`; `gh secret ...`, `gh variable ...`, `gh ruleset ...`, `gh deploy-key ...`.
+- `gh extension ...`, `gh alias ...`, `gh config ...`, `gh auth ...`, `gh codespace ...`, `gh gist ...`, `gh search ...`, `gh project ...` and the rest of the real `gh`.
+- `gh api` with any method but GET, any body field, `--input`, GraphQL, or a full URL.
+
+A task that needs one of these is a task for a person or for the repository's own automation. Removing a verb narrows what a worker does by habit or accident; it does not stop a worker that sends the same request with `curl`.
+
+### What remains reachable by design
+
+`cloud/worker/probe-reach.sh` (installed as `cw-probe-reach`) shows it: the real `gh` at its absolute path exits 127, and exactly three routes remain.
+
+- `curl` with the token file: any HTTP call the token allows.
+- `python3` with the token file: any HTTP call the token allows.
+- The `git` credential helper: `git push` and `git fetch` to `github.com` as the token. Git needs the token, and the worker's user can read the file, so this cannot be removed.
+
+Through them, the actions of the table marked allowed remain possible: bounded by the repository's rules, not by the pod.
 
 ## The operator driver
 

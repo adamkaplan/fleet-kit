@@ -3,11 +3,14 @@
 
 usage: app_token.py OWNER/REPO
 
-The App id, private key and installation id are read from the vault by commands (stdout of each, in memory only):
-  CW_APP_ID_CMD, CW_APP_KEY_CMD, CW_APP_INSTALLATION_CMD
+The App id and private key are read from the vault by commands (stdout of each, in memory only):
+  CW_APP_ID_CMD, CW_APP_KEY_CMD
   (a command, or the vault default; CW_VAULT_SUBSCRIPTION and CW_VAULT_NAME have no defaults)
   default: az keyvault secret show --subscription $CW_VAULT_SUBSCRIPTION --vault-name $CW_VAULT_NAME --name cw-app-id
-           | cw-app-key | cw-app-installation-id --query value -o tsv   (the subscription and vault come from the env)
+           | cw-app-key --query value -o tsv   (the subscription and vault come from the env)
+The installation is NOT read from the vault: GET /repos/OWNER/REPO/installation (with the App JWT) names the installation that
+covers the repository, and its account must be the repository owner. CW_APP_INSTALLATION_CMD and a stored installation id are obsolete:
+accepted, never run, ignored.
 The key goes to `openssl dgst -sha256 -sign /dev/fd/N` through a pipe: never a file, an argument or the environment.
 The 9-minute app JWT and the token are never printed except the token, once, on stdout. Errors go to stderr, never a value.
 Only https://api.github.com is used; CW_GITHUB_API_BASE may name a loopback http URL (tests).
@@ -55,19 +58,58 @@ def open_url(req, timeout=30):
     return token_mint.open_no_redirect(req, timeout)
 
 
+OWNER_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?!-)){0,38}")  # GitHub login: <=39, no leading/trailing/double hyphen
+REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}")
+
+
+def valid_owner(o):
+    """A GitHub login: ASCII, 1 to 39, no leading, trailing or doubled hyphen."""
+    return isinstance(o, str) and bool(OWNER_RE.fullmatch(o)) and not o.endswith("-")
+
+
 def valid_target(t):
-    """OWNER/REPO: two segments of [A-Za-z0-9_.-], neither '.' nor '..'."""
+    """OWNER/REPO by GitHub's name grammar, the one check before a name goes into a URL (ASCII only, no other character)."""
+    if not isinstance(t, str):
+        return False
     parts = t.split("/")
-    return len(parts) == 2 and all(re.fullmatch(r"[A-Za-z0-9_.-]+", x) and x not in (".", "..") for x in parts)
+    if len(parts) != 2:
+        return False
+    owner, repo = parts
+    return bool(valid_owner(owner) and REPO_RE.fullmatch(repo)
+                and repo.strip(".") != "" and not repo.endswith(".") and not repo.lower().endswith(".git"))
 
 
-def http_error_text(code):
+def http_error_text(code, retry_after=None):
+    if code == 429:
+        when = " Retry after %s seconds." % retry_after if isinstance(retry_after, str) and retry_after.isdigit() and len(retry_after) <= 6 \
+            else " Retry later."
+        return "GitHub rate limit hit (HTTP 429): the launch is refused and nothing was minted." + when
     if 300 <= code < 400:
         return "refusing: GitHub answered with a redirect (HTTP %d); a redirect is never followed" % code
     return "GitHub refused the request (HTTP %d)" % code
 
 
+MINTED = []  # the one token minted and not yet printed: a refusal after the mint revokes it (never in a message)
+
+
+def revoke(token):
+    """Best effort: revoke an installation token (DELETE /installation/token, authorised by that token). True only on HTTP 204."""
+    try:
+        req = urllib.request.Request(api_base() + "/installation/token", method="DELETE",
+                                     headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
+                                              "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "cw-app-token"})
+        with open_url(req, 15) as r:
+            return r.status == 204
+    except BaseException:  # any failure (including a redirect or an exit) is "revocation failed", never a crash and never the token
+        return False
+
+
 def die(msg, code=1):
+    if MINTED:
+        token = MINTED.pop()
+        msg += (" The token was revoked." if revoke(token)
+                else " Revocation failed: the token expires within an hour and was never printed.")
+        del token
     print("app-token: " + msg, file=sys.stderr)
     sys.exit(code)
 
@@ -147,13 +189,69 @@ def check_permissions(perms):
             die("refusing: the token has a different level for the permission: %s" % k)
 
 
+def github_json(method, path, jwt, body=None, not_found=None):
+    """One GitHub call with the App JWT; the parsed JSON answer, or exit through die(). A 404 says not_found when given."""
+    headers = {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json",
+               "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "cw-app-token"}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(api_base() + path, data=data, method=method, headers=headers)
+    try:
+        with open_url(req) as r:
+            raw = r.read(MAX_BYTES + 1)
+        if len(raw) > MAX_BYTES:
+            die("the GitHub answer is larger than %d bytes" % MAX_BYTES)
+        return json.loads(raw)
+    except urllib.error.HTTPError as e:
+        if e.code == 404 and not_found:
+            die(not_found)
+        if e.code == 422 and method == "POST":
+            die("the App's installation does not cover this repository: add it to the installation (HTTP 422); "
+                "if the App lacks a requested permission, %s" % owner_step())
+        if e.code == 403 and method == "POST":  # the App may not hold, or the installation not yet accept, a requested permission
+            die("%s; if the App lacks a requested permission, %s" % (http_error_text(e.code, e.headers.get("Retry-After") if e.headers else None), owner_step()))
+        die(http_error_text(e.code, e.headers.get("Retry-After") if e.headers else None))
+    except TimeoutError:
+        die("the GitHub request timed out: the launch is refused and nothing was minted")
+    except Exception:  # OSError, ValueError, UnicodeDecodeError, RecursionError, MemoryError: any failure is a named refusal, never a crash
+        die("the GitHub request failed or its answer was not usable JSON: the launch is refused and nothing was minted")
+
+
+def is_id(x):
+    """A GitHub numeric id: an exact integer above zero (a bool, string or float is not one)."""
+    return isinstance(x, int) and not isinstance(x, bool) and x > 0
+
+
+def find_installation(target, jwt):
+    """The id of the App installation that covers target (OWNER/REPO), asked of GitHub with the App JWT. Checked, never trusted."""
+    owner = target.split("/", 1)[0]
+    ans = github_json("GET", "/repos/%s/installation" % target, jwt,
+                      not_found="the App is not installed on %s: install it on the account that owns the repository and add the repository" % target)
+    if not isinstance(ans, dict):
+        die("refusing: the installation lookup answered with something other than one installation")
+    inst = ans.get("id")
+    if not is_id(inst):
+        die("refusing: the installation lookup carries no installation id")
+    account = ans.get("account")
+    login = account.get("login") if isinstance(account, dict) else None
+    if not valid_owner(login) or login.lower() != owner.lower():  # ASCII only: lower() of raw non-ASCII folds Kelvin to k
+        die("refusing: the installation found is not the account that owns %s" % target)
+    if ans.get("suspended_at"):
+        die("refusing: the App's installation on %s is suspended" % owner)
+    owner_id = account.get("id")
+    if not is_id(owner_id):
+        die("refusing: the installation lookup carries no usable account id")
+    return inst, owner_id
+
+
 def mint(target):
     """Return a token for target (OWNER/REPO), or exit through die(). Never prints."""
     repo = target.split("/", 1)[1]
     app_id = vault("CW_APP_ID_CMD", "cw-app-id").strip()
-    inst = vault("CW_APP_INSTALLATION_CMD", "cw-app-installation-id").strip()
-    if not app_id.isdigit() or not inst.isdigit():
-        die("the app id and the installation id must be numbers")
+    if not app_id.isdigit():
+        die("the app id must be a number")
     key = vault("CW_APP_KEY_CMD", "cw-app-key")
     now = int(dt.datetime.now(dt.timezone.utc).timestamp())
     head = b64(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
@@ -161,32 +259,24 @@ def mint(target):
     signing = "%s.%s" % (head, claims)
     jwt = signing + "." + b64(sign(key, signing.encode()))
     del key
-    req = urllib.request.Request("%s/app/installations/%s/access_tokens" % (api_base(), inst),
-                                 data=json.dumps({"repositories": [repo], "permissions": dict(EXPECTED_PERMISSIONS)}).encode(), method="POST",
-                                 headers={"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json",
-                                          "Content-Type": "application/json", "X-GitHub-Api-Version": "2022-11-28",
-                                          "User-Agent": "cw-app-token"})
-    try:
-        with open_url(req) as r:
-            raw = r.read(MAX_BYTES + 1)
-        if len(raw) > MAX_BYTES:
-            die("the GitHub answer is larger than %d bytes" % MAX_BYTES)
-        ans = json.loads(raw)
-    except urllib.error.HTTPError as e:
-        if e.code in (403, 422):  # the App may not hold, or the installation not yet accept, a requested permission
-            die("%s; if the App lacks a requested permission, %s" % (http_error_text(e.code), owner_step()))
-        die(http_error_text(e.code))
-    except (OSError, ValueError):
-        die("the GitHub request failed or its answer was not JSON")
+    inst, owner_id = find_installation(target, jwt)
+    ans = github_json("POST", "/app/installations/%d/access_tokens" % inst, jwt,
+                      {"repositories": [repo], "permissions": dict(EXPECTED_PERMISSIONS)})
     token = ans.get("token") if isinstance(ans, dict) else None
     repos = ans.get("repositories") if isinstance(ans, dict) else None
     if not isinstance(token, str) or not token:
         die("the answer has no token")
+    MINTED.append(token)
     if not isinstance(repos, list) or len(repos) != 1 or not isinstance(repos[0], dict) or repos[0].get("name") != repo:
         die("refusing: the token does not cover exactly the one target repository")
     full = repos[0].get("full_name")
-    if full is not None and full.lower() != target.lower():
+    if not (isinstance(full, str) and valid_target(full) and full.lower() == target.lower()):
         die("refusing: the token does not cover exactly the one target repository")
+    owner = repos[0].get("owner")  # the account id is stable where the login is not: both answers must carry it, and it must agree
+    if not isinstance(owner, dict) or not is_id(owner.get("id")):
+        die("refusing: the token's repository carries no usable owner id")
+    if owner.get("id") != owner_id:
+        die("refusing: the token's repository is not owned by the installation's account")
     try:
         exp = dt.datetime.strptime(ans["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp()
     except (KeyError, ValueError, TypeError):
@@ -194,6 +284,7 @@ def mint(target):
     if exp - dt.datetime.now(dt.timezone.utc).timestamp() > MAX_TOKEN_SECONDS:
         die("refusing: the token lives longer than 61 minutes")
     check_permissions(ans.get("permissions"))
+    MINTED.clear()
     return token
 
 

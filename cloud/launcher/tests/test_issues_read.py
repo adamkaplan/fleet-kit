@@ -125,6 +125,7 @@ class Table(Fx):
                 with mock.patch.object(app_token, "open_url", side_effect=app_token.urllib.error.HTTPError("u", code, "x", {}, None)), \
                         mock.patch.object(app_token, "vault", side_effect=lambda e, s: "12345" if "ID" in e or "INST" in e else "k"), \
                         mock.patch.object(app_token, "sign", return_value=b"s"), \
+                        mock.patch.object(app_token, "find_installation", return_value=(678, 9)), \
                         mock.patch.object(sys, "stderr", io.StringIO()) as err:
                     with self.assertRaises(SystemExit):
                         app_token.mint(tam.REAL)
@@ -168,7 +169,7 @@ class OneRepoAndLifetimeUnchanged(Fx):
         for repos in ([{"name": "other-service"}], [{"name": "widget-service"}, {"name": "other-service"}]):
             tam.Stub.answer["repositories"] = repos
             self.assertEqual(self.run_mint().stdout, "")
-        tam.Stub.answer["repositories"] = [{"name": "widget-service", "full_name": tam.REAL}]
+        tam.Stub.answer["repositories"] = [{"name": "widget-service", "full_name": tam.REAL, "owner": {"id": 9}}]
         tam.Stub.answer["expires_at"] = tam.iso(62 * 60 + 30)
         self.assertEqual(self.run_mint().stdout, "")
         tam.Stub.answer["expires_at"] = tam.iso(3500)
@@ -255,8 +256,9 @@ class NoPod(td.Driver):
         self.srv_cls = tam.Mint
         tam.Mint.setUpClass.__func__(NoPod)
         self.addCleanup(tam.Mint.tearDownClass.__func__, NoPod)
-        tam.Stub.seen, tam.Stub.redirect, tam.Stub.pad_to = [], None, None
-        tam.Stub.answer = {"token": tam.TOKEN, "expires_at": tam.iso(3500), "repositories": [{"name": "widget-service", "full_name": td.REPO}],
+        tam.Stub.seen, tam.Stub.redirect, tam.Stub.pad_to, tam.Stub.lookup, tam.Stub.raw = [], None, None, None, None
+        tam.Stub.installs, tam.Stub.gets, tam.Stub.deletes = {"acme-org": 678}, [], []
+        tam.Stub.answer = {"token": tam.TOKEN, "expires_at": tam.iso(3500), "repositories": [{"name": "widget-service", "full_name": td.REPO, "owner": {"id": 9}}],
                            "permissions": {k: v for k, v in TABLE.items() if k != "issues"}}
         with open(self.gitcmd, "w") as f:
             f.write('#!/bin/sh\nCW_APP_ID_CMD="echo 12345" CW_APP_INSTALLATION_CMD="echo 678" CW_APP_KEY_CMD="cat \'%s\'" CW_GITHUB_API_BASE="%s" '

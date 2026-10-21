@@ -209,7 +209,8 @@ class Guard(unittest.TestCase):
                         'echo "real %s ran: $*"\nexit 0\n' % tool)
             os.chmod(os.path.join(cls.realbin, tool), 0o755)
         cls.env = {"PATH": cls.realbin + ":/usr/bin:/bin", "HOME": cls.home, "WORKER_DOCKER": "0", "CW_RUN_DIR": cls.run_dir,
-                   "CW_TMP_DIR": cls.tmpfs, "CW_SHARE_DIR": cls.share, "CW_DEFAULT_BRANCH": "trunk", "GIT_CONFIG_NOSYSTEM": "1"}
+                   "CW_TMP_DIR": cls.tmpfs, "CW_SHARE_DIR": cls.share, "CW_DEFAULT_BRANCH": "trunk", "GIT_CONFIG_NOSYSTEM": "1",
+                   "CW_GH_CLIENT": os.path.join(cls.realbin, "gh")}   # the image has no real gh: the stand-in is the client the wrapper runs
         r = subprocess.run(["sh", ENTRYPOINT, "true"], env=cls.env, capture_output=True, text=True, timeout=60)
         assert r.returncode == 0, r.stderr
         cls.bin = os.path.join(cls.tmpfs, "bin")
