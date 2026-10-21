@@ -686,11 +686,22 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), re
         if not ok:
             note(node, "rebinds", name)
     for x in ast.walk(unit):   # a decorator, a base class or a class keyword runs when the definition does: it must be a value that runs nothing of the closure
-        if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and x is not unit:
+        # IMPLICIT CALLS (Python calls something here with no Call node): a decorator is a callee applied to the object (the unit's own decorators included), a base class or class keyword is called when the class is made,
+        # a `with` item runs __enter__ and __exit__, a `for` iterable runs __iter__: each must be a value that runs nothing of the closure (a name of data, the table or a parser the registrar built), else it is held
+        if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             for expr in list(x.decorator_list) + (list(x.bases) + [k.value for k in x.keywords] if isinstance(x, ast.ClassDef) else []):
                 bad = unsafe(expr) if not isinstance(expr, ast.Call) else (unsafe(expr.func) or "a call")
                 if bad:
                     note(x, "calls", label(bad))
+        elif isinstance(x, (ast.With, ast.AsyncWith)):
+            for item in x.items:
+                bad = unsafe(item.context_expr) if not isinstance(item.context_expr, ast.Call) else None
+                if bad:
+                    note(x, "calls", label(bad))
+        elif isinstance(x, (ast.For, ast.AsyncFor, ast.comprehension)) and not _built_iter(x.iter, built):
+            bad = unsafe(x.iter) if not isinstance(x.iter, ast.Call) else None
+            if bad:
+                note(x.iter, "calls", label(bad))
     allowed, callee_roots = set(), set()
     for x in ast.walk(unit):
         if isinstance(x, ast.Call):

@@ -34337,6 +34337,8 @@ class TestRegistrarFloor(LedgerBase):
                 self.assertTrue(self.found_unit(body), label)
         # the table of string binders is checked against the ast module itself: every node class with a field that carries a name is in it, or in the table of classes that are not binders (with the reason)
         fields = {"name", "names", "asname", "rest", "arg", "attr", "id", "kwd_attrs"}
+        with_ctx = {n for n, c in vars(ast).items() if isinstance(c, type) and issubclass(c, ast.AST) and "ctx" in getattr(c, "_fields", ())}
+        self.assertEqual(with_ctx, {"Name", "Attribute", "Subscript", "Starred", "List", "Tuple"}, "a node class with a Store or Del context that the lint does not walk: classify it")
         seen = set()
         for name, node in vars(ast).items():
             if isinstance(node, type) and issubclass(node, ast.AST) and node is not ast.AST and fields & set(getattr(node, "_fields", ())):
@@ -34352,6 +34354,43 @@ class TestRegistrarFloor(LedgerBase):
         "match capture": "match {V}:\n    case f:\n        pass", "decorator": "@{V}\ndef f():\n    pass", "a nested parameter": "def g(f):\n    f('y')\ng({V})", "a second def": "def f():\n    pass",
         "comprehension variable": "[0 for f in ({V},)]", "except as": "try:\n    pass\nexcept Exception as f:\n    pass", "del": "del f", "import as": "import {V} as f",
     }
+
+    PARAMETER_KINDS = {   # every kind of parameter of ast.arguments (read from its fields below), named like a table builtin and called
+        "positional": "def add_zzz_parsers(sub, int):\n    int(sub)", "positional-only": "def add_zzz_parsers(sub, int, /):\n    int(sub)", "keyword-only": "def add_zzz_parsers(sub, *, int):\n    int(sub)",
+        "var-positional": "def add_zzz_parsers(sub, *int):\n    int(sub)", "var-keyword": "def add_zzz_parsers(sub, **int):\n    int(sub)",
+        "keyword-only with a non-literal default": "def add_zzz_parsers(sub, *, int=print):\n    int(sub)", "positional with a non-literal default": "def add_zzz_parsers(sub, int=print):\n    int(sub)",
+    }
+
+    def test_every_kind_of_parameter_is_a_binding_and_the_list_is_read_from_the_ast_arguments_node(self):
+        import ast
+        kinds = {"posonlyargs", "args", "vararg", "kwonlyargs", "kwarg"}
+        self.assertEqual(kinds, {f for f in ast.arguments._fields if f not in ("defaults", "kw_defaults")}, "a new kind of parameter in ast.arguments: add a row and read it in the lint")
+        for label, text in self.PARAMETER_KINDS.items():
+            with self.subTest(label):
+                unit = ast.parse(text).body[0]
+                got = self.dc._registrar_unit(unit, set(self.names), set(range(1, 100)), builtins=set(self.rule["registrar_allow"]["pure_builtins"]), named_helpers=set(), verbs=VERBS, free_keywords=FREE_KEYWORDS)
+                self.assertTrue(any(v == "calls" for v, _ in got), (label, got))
+
+    IMPLICIT_CALLS = {   # every position where Python CALLS something with no Call node, one row each (the fields are read from the ast classes in the test below)
+        "decorator_list of a nested def": "@eval\ndef f():\n    pass", "decorator_list of a nested class": "@eval\nclass C:\n    pass", "decorator_list of the registrar itself": None,
+        "bases": "class C(eval):\n    pass", "keywords (metaclass)": "class C(metaclass=eval):\n    pass", "With.items": "with eval as g:\n    pass", "For.iter": "for x in eval:\n    pass",
+        "comprehension.iter": "[0 for x in eval]", "defaults": "def g(a=eval()):\n    pass", "kw_defaults": "def g(*, a=eval()):\n    pass", "a lambda default": "h = lambda a=eval(): a",
+    }
+
+    def test_every_position_where_python_calls_something_without_a_call_node_is_held(self):
+        import ast
+        fields = {"decorator_list", "bases", "keywords", "items", "iter", "defaults", "kw_defaults"}
+        carried = {f for c in vars(ast).values() if isinstance(c, type) and issubclass(c, ast.AST) for f in getattr(c, "_fields", ()) if f in fields}
+        self.assertEqual(carried, fields, "an ast field that holds an implicit call is named in this test and in the lint")
+        for label, body in self.IMPLICIT_CALLS.items():
+            if body is None:
+                continue
+            with self.subTest(label):
+                self.assertTrue(self.found_unit(body), label)
+        for label, text in (("a decorator", "@eval\ndef add_a_parsers(sub):\n    pass\n"), ("a decorator on a class registrar", "@print\nclass add_a_parsers:\n    pass\n")):
+            with self.subTest(label):
+                self.assertTrue(any(v == "calls" for _, v, _ in self.reg(text)[0]), label)
+        self.assertEqual(self.found_unit("t = sub.add_parser('x')\nfor a in t._actions:\n    pass\nfor f in ('a', 'b'):\n    pass"), [])
 
     def test_a_name_bound_twice_and_then_called_is_held_for_every_binding_form_and_every_second_value(self):
         """The root of the rebinding family: a call is allowed only when its name has exactly ONE binding in the registrar (a def or lambda of its own) or is a table name never bound: so whatever the second binding is, the call is held."""
@@ -34487,6 +34526,17 @@ class TestRegistrarFloor(LedgerBase):
                     bad.append("rebinding: " + label)
             except Exception:
                 bad.append("rebinding: " + label)
+        for label, text in self.PARAMETER_KINDS.items():
+            try:
+                got, why = dc.registrar_findings(fake, fake + text.replace("add_zzz_parsers", "add_zz_parsers"), rule)
+                if why or not any(g[1] == "calls" for g in got):
+                    bad.append("parameter kind: " + label)
+            except Exception:
+                bad.append("parameter kind: " + label)
+        has("a bare decorator", "@eval\ndef add_a_parsers(sub):\n    pass\n", ("calls", "eval"))
+        has("a with item", reg("with eval as g:\n    pass"), ("calls", "eval"))
+        has("a for iterable", reg("for x in eval:\n    pass"), ("calls", "eval"))
+        has("a metaclass", reg("class C(metaclass=eval):\n    pass"), ("calls", "eval"))
         has("a parameter named like a builtin is the handle", "def add_zz_parsers(sub, int):\n    int(None)\n", ("calls", "int"))
         has("a parameter named like a helper is the handle", "def add_zz_parsers(sub, hh):\n    hh(None)\n", ("calls", "hh"))
         has("a table builtin rebound then called", reg("int = json\nsub.add_parser('x', help=int('1'))"), ("calls", "int"))
@@ -34614,6 +34664,11 @@ class TestRegistrarFloor(LedgerBase):
         ("set_defaults on the handle is not held", "if fname == \"set_defaults\" and isinstance(x.func, ast.Attribute)", "if False and isinstance(x.func, ast.Attribute)"),
         ("a list is data", "    if isinstance(expr, ast.Tuple):\n        return all(_is_data(e, data) for e in expr.elts)", "    if isinstance(expr, (ast.Tuple, ast.List, ast.Set)):\n        return all(_is_data(e, data) for e in expr.elts)"),
         ("a nested statement is not read for the table", "x = todo.pop()\n        if isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del)):\n            out.append(x.id)", "x = todo.pop()\n        if False:\n            out.append(x.id)"),
+        ("a with item is not read", "elif isinstance(x, (ast.With, ast.AsyncWith)):\n            for item in x.items:", "elif False:\n            for item in x.items:"),
+        ("a for iterable is not read", "elif isinstance(x, (ast.For, ast.AsyncFor, ast.comprehension)) and not _built_iter(x.iter, built):", "elif False:"),
+        ("a bare decorator of the unit is not read", "if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):\n            for expr in list(x.decorator_list)", "if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and x is not unit:\n            for expr in list(x.decorator_list)"),
+        ("a variable parameter is not a binding", "kwonlyargs + [x for x in (arguments.vararg, arguments.kwarg) if x is not None]:\n            kinds.setdefault", "kwonlyargs + []:\n            kinds.setdefault"),
+        ("a keyword-only parameter is not a binding", "arguments.args + arguments.kwonlyargs + [x for x in (arguments.vararg, arguments.kwarg) if x is not None]:\n            kinds.setdefault", "arguments.args + [x for x in (arguments.vararg, arguments.kwarg) if x is not None]:\n            kinds.setdefault"),
         ("a parameter of the unit is not a binding", "kinds.setdefault(a.arg, []).append(\"param\")", "pass"),
         ("a decorator is not read", "for expr in list(x.decorator_list) + (list(x.bases) + [k.value for k in x.keywords] if isinstance(x, ast.ClassDef) else []):", "for expr in []:"),
         ("a parser name rebound in any form is not held", "        if not ok:\n            note(node, \"rebinds\", name)", "        if False:\n            note(node, \"rebinds\", name)"),
