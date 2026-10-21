@@ -7626,23 +7626,52 @@ def registry_owners(engine):
         return {}
 
 
-def worker_charter(discovery, worker):
-    """The charter a worker belongs to: its own `charter`, else the charter of the orchestrator it reported to (still discovered, even if retired), else None."""
+def registry_retired_owners(engine):
+    """{orchestrator name: charter} the REGISTRY kept for a RETIRED orchestrator (its retirement record holds the row it had): a worker's boss's charter when the boss has just been retired (#969). {} when unreadable."""
+    try:
+        registry = load_module("registry")
+        reg = registry.read(engine.state_dir) if engine.state_dir is not None else None
+        out = {}
+        for name, entry in ((reg or {}).get("retired") or {}).items():
+            record = entry.get("record") if isinstance(entry, dict) and isinstance(entry.get("record"), dict) else {}
+            if reg["whole"] and record.get("role") == "orchestrator" and registry.is_charter(record.get("charter")):
+                out[name] = record["charter"]
+        return out
+    except Exception:
+        return {}
+
+
+def charter_or_first_seen(engine, name, fleet):
+    """The charter of the agent `name`: its REGISTRY row's (None included) when the registry has a row for it, else its launch value (an agent the pass has not yet seen: the first-seen fill the pass makes anyway) (#969)."""
+    try:
+        registry = load_module("registry")
+        reg = registry.read(engine.state_dir) if engine.state_dir is not None else None
+        row = reg["agents"].get(name) if reg and reg["whole"] else None
+    except Exception:
+        row = None
+    if isinstance(row, dict):
+        return row.get("charter") if registry.is_charter(row.get("charter")) else None
+    value = (fleet or {}).get("charter")
+    return value if _is_issue_number(value) else None
+
+
+def worker_charter(discovery, worker, owners=None):
+    """The charter a worker belongs to: its own `charter` (its own launch context), else the REGISTRY's charter of the orchestrator it reported to (`owners`, #969; still discovered, even if retired), else None."""
     fleet = worker.fleet or {}
     if _is_issue_number(fleet.get("charter")):
         return fleet["charter"], fleet
     old = discovery.agents.get(boss_name(discovery, worker) or "")
-    if old is not None and (old.fleet or {}).get("role") == "orchestrator" and _is_issue_number((old.fleet or {}).get("charter")):
-        return old.fleet["charter"], old.fleet
+    if old is not None and (old.fleet or {}).get("role") == "orchestrator" and _is_issue_number((owners or {}).get(old.name)):
+        return owners[old.name], old.fleet
     return None, fleet
 
 
 def adoption_heir(engine, discovery, retired, worker):
     """(heir, why) for an orphan: the ONE live orchestrator of the worker's charter, else the ONE live Chief of Staff, else (None, None)."""
-    charter, fleet = worker_charter(discovery, worker)
+    owners = registry_owners(engine)   # #969: the registry's charter, never the session metadata
+    charter, fleet = worker_charter(discovery, worker, dict(registry_retired_owners(engine), **owners))   # the old boss may have just been retired: its record keeps its charter
     if charter is not None:
         repo = _fleet_repo(fleet, engine.config)
-        owners = registry_owners(engine)   # #969: the registry's charter, never the session metadata
         mine = sorted(n for n, o in discovery.agents.items()
                       if (o.fleet or {}).get("role") == "orchestrator" and owners.get(n) == charter and n != worker.name
                       and _fleet_repo(o.fleet, engine.config) == repo and _heir_ok(discovery, retired, n, o))
@@ -20074,18 +20103,19 @@ def asks_of_caller(engine, fleet, now):
 
     The rule: an ask is an open sub-issue of an orchestrator's charter. A
     Chief of Staff sees the asks under every orchestrator's charter, found
-    from fleet metadata (`role` orchestrator, `charter` an issue number); an
+    from the registry (`role` orchestrator, `charter` an issue number, #969); an
     orchestrator sees the asks under its own charter; any other role sees the
     ask of the issue it works on.
     """
     reader = engine.intents
     repo = fleet.get("repo") or reader.repo
+    owners = registry_owners(engine)   # #969: an orchestrator's charter is the registry row's, never the launch metadata (which a `charter set` correction cannot reach)
     if fleet.get("role") == "chief-of-staff":
-        charters = [(agent.name, (agent.fleet or {}).get("charter"), _fleet_repo(agent.fleet, engine.config) or repo)
+        charters = [(agent.name, owners.get(agent.name), _fleet_repo(agent.fleet, engine.config) or repo)
                     for agent in sorted(engine.discover(now).agents.values(), key=lambda a: a.name)
                     if (agent.fleet or {}).get("role") == "orchestrator"]
     elif fleet.get("role") == "orchestrator":
-        charters = [(fleet["name"], fleet.get("charter"), repo)]
+        charters = [(fleet["name"], owners.get(fleet["name"]), repo)]
     else:
         issue = fleet.get("issue")
         if not _is_issue_number(issue):
@@ -21888,8 +21918,7 @@ def register_item_tester(engine, state, args, repo, launched_by, done, now):
                 why = "%s is not open" % item
             else:
                 chain = item_chain(engine, repo, int(args.issue), issue["parent"])
-                charter = boss.get("charter")
-                charter = int(charter) if isinstance(charter, (int, str)) and not isinstance(charter, bool) and str(charter).isdigit() else None
+                charter = charter_or_first_seen(engine, launched_by, boss)   # #969: the launching orchestrator's charter is the registry's (its launch value only while it has no row)
                 if not iv.lane_ok(chain, charter):
                     why = "%s is not in the lane of %s: its parent chain %s does not reach the orchestrator's charter" % (item, launched_by, chain)
         pin = None
@@ -28837,7 +28866,7 @@ def load_tick(engine, discovery):
             continue   # on the retired list (the same name and session rule as coder_finished): no load figures and no health row
         coders = [o for o in discovery.agents.values() if boss_name(discovery, o) == name and (o.fleet or {}).get("role") == "coder"
                   and not coder_finished(o, retired, last_reports)]   # a retired coder, or one that made its final report, is on the books but not a coder of this workspace
-        orchestrators[name] = {"charter": fleet.get("charter") if _is_issue_number(fleet.get("charter")) else None,   # a fallback: the charter is found by the yaml that names the agent
+        orchestrators[name] = {"charter": charter_or_first_seen(engine, name, fleet),   # a fallback: the charter is found by the yaml that names the agent; the registry's, never the launch metadata (#969)
                                "repo": _fleet_repo(fleet, engine.config) or (engine.intents.repo if engine.intents is not None else None),
                                "busy": sum(1 for c in coders if c.status == "working"), "idle": sum(1 for c in coders if c.status == "idle"),
                                "workers": [o.name for o in coders if getattr(o, "name", None)],

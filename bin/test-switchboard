@@ -14679,6 +14679,49 @@ class TestOneCharter(Base):
         self.assertEqual(route, (["orch-a"], "work item"))
         self.assertEqual(sb.plan_wake_route(5, items, ctx, discovery, ["cos"]), ([], "work item"), "no registry owners given: nobody is guessed from the metadata")
 
+    def test_the_asks_of_the_chief_of_staff_and_of_an_orchestrator_follow_the_registrys_corrected_charter(self):
+        self.orchestrator("orch-b", charter=1)            # launched with charter 1 ...
+        self.set_registry("orch-b", 7)                    # ... and corrected through the command
+        self.engine.intents = types.SimpleNamespace(open_asks=lambda charter, repo=None: ["ask-under-%s" % charter], repo=self.REPO, header=lambda *a, **k: None)
+        now = self.world.clock.now()
+        cos = sb.asks_of_caller(self.engine, {"name": "cos", "role": "chief-of-staff", "repo": self.REPO}, now)
+        self.assertEqual(cos, [("orch-b", "ask-under-7")])
+        orch = sb.asks_of_caller(self.engine, {"name": "orch-b", "role": "orchestrator", "charter": 1, "repo": self.REPO}, now)
+        self.assertEqual(orch, [("orch-b", "ask-under-7")])
+        self.set_registry("orch-b", None)
+        self.assertEqual(sb.asks_of_caller(self.engine, {"name": "cos", "role": "chief-of-staff", "repo": self.REPO}, now), [], "no registry charter: no asks, never the launch value")
+
+    def test_the_load_figures_and_the_tester_gate_follow_a_registry_row_and_use_the_launch_value_only_without_one(self):
+        self.orchestrator("orch-b", charter=1)
+        self.set_registry("orch-b", 7)
+        fleet = {"role": "orchestrator", "charter": 1, "repo": self.REPO}
+        self.assertEqual(sb.charter_or_first_seen(self.engine, "orch-b", fleet), 7)               # the row wins over the stale launch value
+        self.set_registry("orch-b", None)
+        self.assertIsNone(sb.charter_or_first_seen(self.engine, "orch-b", fleet))                  # a row with no charter is an answer
+        self.assertEqual(sb.charter_or_first_seen(self.engine, "not-yet-seen", fleet), 1)          # no row yet: the launch value (the pass fills it at first sight)
+        self.assertIsNone(sb.charter_or_first_seen(self.engine, "not-yet-seen", {"role": "orchestrator", "charter": True}))
+
+    def test_the_load_tick_asks_the_registrys_charter_not_the_launch_value(self):
+        self.orchestrator("orch-b", charter=1)
+        self.set_registry("orch-b", 7)
+        asked = []
+        seen = types.SimpleNamespace(name="orch-b", fleet={"role": "orchestrator", "charter": 1, "repo": self.REPO}, status="idle")
+        intents = types.SimpleNamespace(repo=self.REPO, _api=lambda path, repo: ([{"name": "me:orchestrator"}] if "/labels" in path else []), open_asks=lambda charter, repo: asked.append(charter) or [])
+        state = self.world.state / "load-state"
+        state.mkdir(exist_ok=True, mode=0o700)
+        engine = types.SimpleNamespace(state_dir=str(self.world.state), now=lambda: 1_792_000_000, audit=None, actor="daemon", intents=intents, config={"load_alert": sb.load_fleet_health().validate({"enabled": True}, "x")})
+        sb.load_tick(engine, types.SimpleNamespace(agents={"orch-b": seen}))
+        self.assertEqual(asked, [7], "the registry's corrected charter, never the stale launch value 1")
+
+    def test_a_workers_charter_through_its_boss_is_the_registrys(self):
+        self.orchestrator("orch-b", charter=1)
+        self.set_registry("orch-b", 7)
+        self.world.add_agent("worker", fleet={"role": "coder", "reports_to": "orch-b", "repo": self.REPO})
+        discovery = self.engine.discover(self.world.clock.now())
+        owners = sb.registry_owners(self.engine)
+        self.assertEqual(sb.worker_charter(discovery, discovery.agents["worker"], owners)[0], 7)
+        self.assertIsNone(sb.worker_charter(discovery, discovery.agents["worker"])[0], "without the registry's owners a boss's launch value is never read")
+
     def test_registry_charter_is_pure_and_total(self):
         cases = (({}, "a", 3, (3, None)), ({"a": {"charter": 5}}, "a", 3, (5, 3)), ({"a": {"charter": 5}}, "a", 5, (5, None)), ({"a": {"charter": None}}, "a", 3, (None, 3)),
                  ({"a": {"charter": 5}}, "a", None, (5, None)), ({"a": {"charter": 5}}, "a", True, (5, None)), ({}, "a", "3", (None, None)))
@@ -14752,44 +14795,69 @@ class TestOneCharter(Base):
         self.assertIsNotNone(self.registry.set_charter(self.world.state, "orch-a", -2, "t")["problem"])
         self.assertEqual(self.registry.set_charter(self.world.state, "orch-a", 1, "t"), {"changed": False, "problem": None})
 
-    def test_every_reader_of_an_agents_charter_is_in_the_table(self):
-        """The readers of a fleet's `charter` are DERIVED from the code (every function that reads the key with `.get("charter")` or `["charter"]`): each must be classified. A new reader fails this until it is listed."""
-        found = set()
+    @staticmethod
+    def functions_reading_charter():
+        """{(file, function): (the function's AST node, whether it enumerates the agents)} for every function that reads a fleet's `charter`, DERIVED from the code."""
+        found = {}
         for rel in ("bin/fleet-switchboard", "bin/impact_hold.py", "bin/lanes.py", "bin/fleet_health.py", "bin/registry.py", "bin/reassign.py"):
             tree = ast.parse((REPO / rel).read_text())
             for node in ast.walk(tree):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    for sub in ast.walk(node):
-                        key = None
-                        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute) and sub.func.attr == "get" and sub.args and isinstance(sub.args[0], ast.Constant):
-                            key = sub.args[0].value
-                        elif isinstance(sub, ast.Subscript) and isinstance(sub.slice, ast.Constant):
-                            key = sub.slice.value
-                        if key == "charter":
-                            found.add((rel, node.name))
-        unlisted = sorted(found - set(self.READERS))
-        self.assertEqual(unlisted, [], "classify each new reader of a charter in READERS (registry, or exempt with its reason)")
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                reads, enumerates = False, False
+                for sub in ast.walk(node):
+                    key = None
+                    if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute) and sub.func.attr == "get" and sub.args and isinstance(sub.args[0], ast.Constant):
+                        key = sub.args[0].value
+                    elif isinstance(sub, ast.Subscript) and isinstance(sub.slice, ast.Constant):
+                        key = sub.slice.value
+                    reads = reads or key == "charter"
+                    if isinstance(sub, (ast.For, ast.comprehension)) and "agents" in ast.unparse(sub.iter) and re.search(r"\.agents\b|agents\.values|discover\(|\.items\(\)|\.values\(\)", ast.unparse(sub.iter)):
+                        enumerates = True
+                if reads:
+                    found[(rel, node.name)] = (node, enumerates)
+        return found
 
-    READERS = {   # (file, function) -> "registry": decides WHO OWNS a charter and reads the registry's charter (#969); otherwise why it is exempt: it reads ONE agent's own launch context, or asks only whether a number is a charter, never counts owners
-        ("bin/impact_hold.py", "_lane_of_issue"): "registry", ("bin/lanes.py", "charter_orchestrators"): "registry",
-        ("bin/fleet-switchboard", "adoption_heir"): "registry", ("bin/fleet-switchboard", "plan_wake_route"): "registry",
-        ("bin/registry.py", "orchestrator_charters"): "registry", ("bin/registry.py", "duplicate_charters"): "registry", ("bin/registry.py", "set_charter"): "registry writer",
-        ("bin/registry.py", "change"): "the registry's own writer: it sets the row", ("bin/fleet-switchboard", "registry_charter"): "the pass's rule over the registry row",
-        ("bin/fleet-switchboard", "pane_health_pass"): "writes the registry row through registry_charter", ("bin/fleet-switchboard", "charters_report"): "display of both records, read-only",
-        ("bin/fleet-switchboard", "cmd_agents_charters"): "display", ("bin/fleet-switchboard", "cmd_charter"): "the audited writer",
-        ("bin/fleet-switchboard", "record_launch_charter"): "the launch writes the registry row (first sight)",
-        ("bin/impact_hold.py", "clear_lane"): "carries the lookup's `charter` into the notice line", ("bin/impact_hold.py", "_notify_clear_body"): "words the notice line",
-        ("bin/fleet-switchboard", "worker_charter"): "a worker's own charter (its launch context)", ("bin/fleet-switchboard", "resume_agent"): "one agent's own repo lookup",
-        ("bin/fleet-switchboard", "charter_pane_update"): "one agent's own charter for its pane", ("bin/fleet-switchboard", "_fleet_repo"): "one agent's own repo",
-        ("bin/fleet-switchboard", "seam_applies"): "asks whether an issue number is known as a charter (a set test), never counts owners",
-        ("bin/fleet-switchboard", "read_order_notices"): "reads the order notices' own records", ("bin/fleet-switchboard", "order_groups"): "groups order notices",
-        ("bin/fleet-switchboard", "decisions_from_order_notices"): "words order notices", ("bin/fleet-switchboard", "asks_of_caller"): "the calling agent's own charters",
-        ("bin/fleet-switchboard", "register_item_tester"): "a boss's own charter (launch context)", ("bin/fleet-switchboard", "resolve_policy_context"): "one agent's own launch context",
-        ("bin/fleet-switchboard", "_valid_context"): "a cached own context", ("bin/fleet-switchboard", "load_tick"): "an orchestrator's own charter as a fallback for its own yaml",
-        ("bin/fleet-switchboard", "charter_orders"): "an agent's own charter's orders", ("bin/fleet-switchboard", "charter_guard"): "an agent's own charters",
-        ("bin/fleet-switchboard", "ask_context_of"): "an agent's own ask context", ("bin/fleet-switchboard", "__call__"): "an orchestrator's own orders",
-        ("bin/fleet_health.py", "figures"): "the health figures of one agent from the registry-derived info", ("bin/fleet_health.py", "_resolve_charters"): "the registry-derived info",
-        ("bin/fleet_health.py", "_refresh_asks"): "the registry-derived info", ("bin/fleet-switchboard", "_import_fleet"): "the launch/import writer of the session's metadata",
+    def test_every_reader_of_an_agents_charter_is_in_the_table_and_its_claim_is_checked_against_the_code(self):
+        """The readers of a fleet's `charter` are DERIVED from the code and each must be classified; the classification is CHECKED, not trusted: an `own` reader may not enumerate other agents, a `registry` reader
+        must read the registry, a `set` reader is the only kind that may enumerate without naming an owner (listed by name)."""
+        found = self.functions_reading_charter()
+        self.assertEqual(sorted(set(found) - set(self.READERS)), [], "classify each new reader of a charter in READERS")
+        for key in sorted(set(self.READERS) - set(found)):   # a `registry` row names a function that now reads the registry instead of the key: it must really do so
+            self.assertEqual(self.READERS[key].split(":", 1)[0], "registry", key)
+        for key, (node, enumerates) in found.items():
+            kind = self.READERS[key].split(":", 1)[0]
+            self.assertIn(kind, ("registry", "writer", "display", "own", "set"), key)
+            source = ast.unparse(node)
+            if kind == "own":
+                self.assertFalse(enumerates, "%s is classified `own` but enumerates the agents" % (key,))
+            if kind == "registry":
+                self.assertTrue("registry" in source or "owners" in source or "orchestrator_charters" in source, "%s is classified `registry` but never reads the registry" % (key,))
+        self.assertEqual(sorted(k for k, (n, e) in found.items() if e and self.READERS[k].startswith("set:")), [("bin/fleet-switchboard", "seam_applies")])
+
+    READERS = {   # (file, function) -> "kind: reason". registry: decides who owns a charter and reads the registry's charter (#969); writer / display: writes or shows the registry row; own: reads ONE agent's own launch context and enumerates no other agent
+        # (CHECKED against the code below); set: asks only whether a number is a charter, never counts or names an owner
+        ("bin/impact_hold.py", "_lane_of_issue"): "registry: the lane lookup", ("bin/lanes.py", "charter_orchestrators"): "registry: move's lookup",
+        ("bin/fleet-switchboard", "adoption_heir"): "registry: the heir of an orphan", ("bin/fleet-switchboard", "plan_wake_route"): "registry: the orchestrator a plan wakes",
+        ("bin/fleet-switchboard", "asks_of_caller"): "registry: the asks an agent is accountable for", ("bin/fleet-switchboard", "register_item_tester"): "registry: the launching orchestrator's charter gates a registration",
+        ("bin/fleet-switchboard", "load_tick"): "registry: an orchestrator's charter in the load figures", ("bin/fleet-switchboard", "worker_charter"): "registry: a worker's boss's charter (the worker's own is its launch context)",
+        ("bin/fleet-switchboard", "charter_or_first_seen"): "registry: the row's charter, else the launch value of an agent with no row yet",
+        ("bin/fleet-switchboard", "registry_retired_owners"): "registry: the charter a retired orchestrator's record kept",
+        ("bin/registry.py", "orchestrator_charters"): "registry: the one reading", ("bin/registry.py", "duplicate_charters"): "registry: duplicates", ("bin/registry.py", "set_charter"): "writer: the audited setter",
+        ("bin/registry.py", "change"): "writer: the registry's own writer", ("bin/fleet-switchboard", "registry_charter"): "writer: the pass's rule over the registry row",
+        ("bin/fleet-switchboard", "pane_health_pass"): "writer: writes the registry row through registry_charter", ("bin/fleet-switchboard", "charters_report"): "display: both records, read-only",
+        ("bin/fleet-switchboard", "cmd_agents_charters"): "display: the report", ("bin/fleet-switchboard", "cmd_charter"): "writer: the audited command",
+        ("bin/fleet-switchboard", "record_launch_charter"): "writer: a launch writes the registry row (first sight; a relaunch under the name is a new launch)",
+        ("bin/impact_hold.py", "clear_lane"): "display: carries the lookup's `charter` into the notice line", ("bin/impact_hold.py", "_notify_clear_body"): "display: words the notice line",
+        ("bin/fleet-switchboard", "seam_applies"): "set: is this issue number known as a charter",
+        ("bin/fleet-switchboard", "resume_agent"): "own: one agent's own repo lookup", ("bin/fleet-switchboard", "charter_pane_update"): "own: one agent's own charter for its pane",
+        ("bin/fleet-switchboard", "_fleet_repo"): "own: one agent's own repo", ("bin/fleet-switchboard", "read_order_notices"): "own: the order notices' own records",
+        ("bin/fleet-switchboard", "order_groups"): "own: groups order notices", ("bin/fleet-switchboard", "decisions_from_order_notices"): "own: words order notices",
+        ("bin/fleet-switchboard", "resolve_policy_context"): "own: one agent's own launch context", ("bin/fleet-switchboard", "_valid_context"): "own: a cached own context",
+        ("bin/fleet-switchboard", "charter_orders"): "own: an agent's own charter's orders", ("bin/fleet-switchboard", "charter_guard"): "own: an agent's own charters",
+        ("bin/fleet-switchboard", "ask_context_of"): "own: an agent's own ask context", ("bin/fleet-switchboard", "__call__"): "own: an orchestrator's own orders",
+        ("bin/fleet_health.py", "figures"): "own: the health figures of one agent from the registry-derived info", ("bin/fleet_health.py", "_resolve_charters"): "own: the registry-derived info",
+        ("bin/fleet_health.py", "_refresh_asks"): "own: the registry-derived info", ("bin/fleet-switchboard", "_import_fleet"): "own: the launch/import writer of the session's metadata",
     }
 
 
