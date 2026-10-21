@@ -65,7 +65,7 @@ CHECK_MODES = {
     "merge_queue_change": "WARN",      # a merge_queue rule exists: who may dequeue a pull request cannot be read with this token
 }
 OPEN_ACTION_TEXT = {
-    "bypass_actor": "an App is a bypass actor of ruleset %s: the rules may not bind it (which App cannot be read)",
+    "bypass_actor": "an App is a bypass actor of ruleset %s: the rules may not bind it (which App cannot be read; other bypass, and rulesets this token cannot read, are not seen)",
     "auto_merge": "the repository allows auto-merge: a token with pull requests: write may enable it",
     "required_status_checks": "no required_status_checks rule: a merge is bounded by no passing check",
     "merge_queue_change": "a merge_queue rule exists: who may remove a pull request from the queue cannot be read with this token",
@@ -342,7 +342,7 @@ def main(argv):
     problems += review_problem
     warned = []
     for key, text in open_actions(repo, types, bypass):
-        if CHECK_MODES[key] == "BLOCK":
+        if CHECK_MODES[key] != "WARN":   # anything but WARN blocks: a typo fails closed
             problems.append("open action %s: %s" % (key, text))
         else:
             say("WARN open action %s: %s" % (key, text))

@@ -14,6 +14,7 @@ Everything else exits 2 with one line. The token is read from GH_TOKEN (set by t
 printed. Output differs from the real gh: `--json` prints the raw REST object, `--jq` and `--template` are not supported.
 Exit 0 ok, 1 failed (an HTTP error names its status), 2 not available or bad usage, 8 `pr checks` with checks pending.
 """
+import http.client
 import io
 import json
 import os
@@ -29,11 +30,25 @@ API = "https://api.github.com"
 MAX_BYTES = 20 * 1024 * 1024
 MAX_LOG = 5 * 1024 * 1024  # of log text printed
 TIMEOUT = 60
+MAX_ENTRIES = 2000
+# Text from outside (titles, bodies, logs) never reaches the agent's terminal with control, escape or bidi characters in it.
+UNSAFE = re.compile("[\\x00-\\x08\\x0b-\\x1f\\x7f-\\x9f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069]")
+
+
+class Clean:
+    def __init__(self, real):
+        self.real = real
+
+    def write(self, text):
+        return self.real.write(UNSAFE.sub("?", text))
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
 
 
 class Fail(Exception):
     def __init__(self, msg, code=1):
-        super().__init__(msg)
+        super().__init__(str(msg).replace("\n", "?"))   # one line, always
         self.code = code
 
 
@@ -82,16 +97,23 @@ def request(method, path, body=None, accept="application/vnd.github+json", want_
         except Exception:
             pass
         raise Fail("HTTP %d on %s %s%s" % (e.code, method, path.split("?")[0], (": " + msg) if msg else ""))
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException):
         raise Fail("%s %s failed (network error)" % (method, path.split("?")[0]))
     if len(raw) > MAX_BYTES:
         raise Fail("the answer to %s %s is larger than %d bytes" % (method, path.split("?")[0], MAX_BYTES))
     return raw
 
 
+def parse_json(raw):
+    try:
+        return json.loads(raw)
+    except ValueError:
+        raise Fail("the answer was not JSON")
+
+
 def get_json(path):
     try:
-        return json.loads(request("GET", path))
+        return parse_json(request("GET", path))
     except ValueError:
         raise Fail("the answer to GET %s was not JSON" % path.split("?")[0])
 
@@ -209,7 +231,7 @@ def pr_create(args):
     if not base:
         base = (get_json("/repos/" + repo) or {}).get("default_branch")
     payload = {"title": opts["title"], "body": body, "head": head, "base": base, "draft": bool(opts.get("draft"))}
-    out = json.loads(request("POST", "/repos/%s/pulls" % repo, payload))
+    out = parse_json(request("POST", "/repos/%s/pulls" % repo, payload))
     print(out.get("html_url", ""))
 
 
@@ -235,7 +257,7 @@ def pr_list(args):
     if state not in ("open", "closed", "merged", "all"):
         raise Fail("--state is open, closed, merged or all", 2)
     limit = limit_of(opts, 30)
-    q = {"state": "closed" if state == "merged" else state, "per_page": min(max(limit, 1), 100)}
+    q = {"state": "closed" if state == "merged" else state, "per_page": 100 if state == "merged" else min(max(limit, 1), 100)}
     if "base" in opts:
         q["base"] = opts["base"]
     if "head" in opts:
@@ -257,7 +279,7 @@ def pr_comment(args):
     body = body_of(opts)
     if not body:
         raise Fail("pr comment needs --body or --body-file (this client never prompts)", 2)
-    out = json.loads(request("POST", "/repos/%s/issues/%d/comments" % (repo, number_of(repo, pos)), {"body": body}))
+    out = parse_json(request("POST", "/repos/%s/issues/%d/comments" % (repo, number_of(repo, pos)), {"body": body}))
     print(out.get("html_url", ""))
 
 
@@ -303,7 +325,7 @@ def pr_ready(args):
     if not isinstance(node, str) or not re.fullmatch(r"[A-Za-z0-9_=-]+", node):
         raise Fail("the pull request answer has no node id")
     q = "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { number isDraft } } }"
-    out = json.loads(request("POST", "/graphql", {"query": q, "variables": {"id": node}}))
+    out = parse_json(request("POST", "/graphql", {"query": q, "variables": {"id": node}}))
     if out.get("errors"):
         raise Fail("GraphQL refused: %s" % str(out["errors"][0].get("message", ""))[:200])
     print("pull request #%s is ready for review" % pr.get("number"))
@@ -388,14 +410,17 @@ def run_logs_text(repo, rid, only_jobs=None):
     try:  # the download host gets NO Authorization header
         with OPENER.open(urllib.request.Request(loc, headers={"User-Agent": "cw-gh"}), timeout=TIMEOUT) as r:
             raw = r.read(MAX_BYTES + 1)
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException):
         raise Fail("the logs could not be downloaded")
     if len(raw) > MAX_BYTES:
         raise Fail("the logs are larger than %d bytes" % MAX_BYTES)
     out, size = [], 0
     try:
         z = zipfile.ZipFile(io.BytesIO(raw))
-        for info in sorted(z.infolist(), key=lambda x: x.filename):
+        infos = z.infolist()
+        if len(infos) > MAX_ENTRIES:
+            raise Fail("the logs archive has more than %d entries" % MAX_ENTRIES)
+        for info in sorted(infos, key=lambda x: x.filename):
             if info.is_dir() or (only_jobs is not None and info.filename.split("/")[0] not in only_jobs):
                 continue
             with z.open(info) as f:
@@ -476,6 +501,7 @@ def main(argv):
             args = args[2:]
         verb = args.pop(0) if args and not args[0].startswith("-") else ""
         args = pre + args
+    sys.stdout, sys.stderr = Clean(sys.stdout), Clean(sys.stderr)
     fn = VERBS.get((group, verb))
     if fn is None:
         listing = ", ".join("%s %s" % (g, v) if v else g for g, v in sorted(VERBS))
@@ -489,6 +515,9 @@ def main(argv):
         return e.code
     except BrokenPipeError:
         return 0
+    except Exception as e:   # never a traceback: one line, the kind only
+        print("cw-gh: failed (%s)" % type(e).__name__, file=sys.stderr)
+        return 1
     return 0
 
 

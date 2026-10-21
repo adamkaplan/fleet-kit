@@ -79,7 +79,9 @@ class ProbeTarget(unittest.TestCase):
         rows = [l for l in slurp(TABLE).splitlines() if l.strip() and not l.startswith("#") and "to be probed live" in l.split(" | ")[3]]
         p = self.run_pt("Acme-Org/Throwaway", throwaway="acme-org/throwaway")
         self.assertEqual(p.returncode, 0, p.stdout)
-        self.assertEqual(len([l for l in p.stdout.splitlines() if l.startswith("probe:")]), len(rows))
+        want = {l.split(" | ")[0] for l in rows}
+        got = {l[len("probe: "):].split(" | documented")[0] for l in p.stdout.splitlines() if l.startswith("probe:")}
+        self.assertEqual(got, want)
         src = slurp(PROBE_TOKEN)
         for needle in ("urllib", "http.client", "socket", "subprocess", "GH_TOKEN", "git-token"):
             self.assertNotIn(needle, src.split('"""', 2)[2], needle)   # no request and no credential read in this version

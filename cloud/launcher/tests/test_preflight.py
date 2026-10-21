@@ -608,29 +608,61 @@ class OpenActions(Preflight):
         p = self.run_pf()
         self.assertNotIn("WARN open action bypass_actor", p.stdout)
 
+    def run_blocked(self, key):
+        """pf.main in-process with ONE key switched to BLOCK; returns (exit code, output)."""
+        old, saved, out = dict(pf.CHECK_MODES), dict(os.environ), io.StringIO()
+        os.environ.update(CW_GITHUB_API_BASE=self.base, CW_PREFLIGHT_TOKEN_CMD="echo " + TOKEN)
+        try:
+            pf.CHECK_MODES[key] = "BLOCK"
+            with contextlib.redirect_stdout(out):
+                rc = pf.main([REPO])
+        finally:
+            pf.CHECK_MODES.clear()
+            pf.CHECK_MODES.update(old)
+            os.environ.clear()
+            os.environ.update(saved)
+        return rc, out.getvalue()
+
     def test_each_key_set_to_block_fails_naming_the_action_and_nothing_else_changes(self):
         for key, opener in OPENERS.items():
             with self.subTest(key=key):
                 Stub.rules, Stub.bypass, Stub.auto_merge = list(CLEAN), [], False
                 opener()
-                old = dict(pf.CHECK_MODES)
-                saved = dict(os.environ)
-                os.environ.update(CW_GITHUB_API_BASE=self.base, CW_PREFLIGHT_TOKEN_CMD="echo " + TOKEN)
-                out = io.StringIO()
+                rc, text = self.run_blocked(key)
+                self.assertEqual(rc, 1, text)
+                self.assertIn("FAIL on main: open action %s:" % key, text)
+                self.assertNotIn("preflight ok", text)
+                self.assertEqual(text.count("FAIL"), 1, text)   # only the flipped key blocks
+
+    def test_an_owner_approval_never_rescues_a_blocking_open_action(self):
+        for key, opener in OPENERS.items():
+            with self.subTest(key=key):
+                Stub.rules, Stub.bypass, Stub.auto_merge = list(CLEAN), [], False
+                Stub.org_types, Stub.org_code = list(FULL), 403
+                self.approvals({self.KEY: self.ENTRY})
+                opener()
+                if key == "required_status_checks":
+                    Stub.rules = list(FULL)
+                saved = pf.APPROVALS
+                pf.APPROVALS = os.path.join(self.copy, "repo-approvals.json")
                 try:
-                    pf.CHECK_MODES[key] = "BLOCK"
-                    with contextlib.redirect_stdout(out):
-                        rc = pf.main([REPO])
+                    rc, text = self.run_blocked(key)
                 finally:
-                    pf.CHECK_MODES.clear()
-                    pf.CHECK_MODES.update(old)
-                    os.environ.clear()
-                    os.environ.update(saved)
-                self.assertEqual(rc, 1, out.getvalue())
-                self.assertIn("FAIL on main: open action %s:" % key, out.getvalue())
-                self.assertNotIn("preflight ok", out.getvalue())
-                # the other three stay warnings: only the flipped key blocks
-                self.assertEqual(out.getvalue().count("FAIL"), 1, out.getvalue())
+                    pf.APPROVALS = saved
+                self.assertEqual(rc, 1, text)
+                self.assertNotIn("NOT VERIFIED", text)
+                self.assertIn("open action %s:" % key, text)
+
+    def test_a_bypass_actor_of_a_ruleset_that_is_not_enforced_is_not_counted_and_every_ruleset_id_is_named(self):
+        _open_bypass()
+        Stub.enforcement = "evaluate"
+        self.assertNotIn("WARN open action bypass_actor", self.run_pf().stdout)
+        Stub.enforcement = "active"
+        Stub.rule_ids = {"deletion": 8}
+        Stub.extra = {8: {"id": 8, "target": "branch", "enforcement": "active", "bypass_actors": [{"actor_type": "Integration", "actor_id": 2}],
+                          "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}}}}
+        text = self.run_pf().stdout
+        self.assertIn("bypass actor of ruleset 7, 8", text)
 
     def test_what_blocks_today_still_blocks_with_every_new_check_a_warning(self):
         Stub.rules = ["non_fast_forward", "deletion", "required_status_checks"]

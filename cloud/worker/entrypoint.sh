@@ -82,7 +82,12 @@ H
   fi
   cat "$guard" > "$bin/cw-guard"; chmod 755 "$bin/cw-guard"
   real_gh="${CW_GH_CLIENT:-/usr/local/bin/cw-gh}"   # the pod's own client: the real gh is not in the image
-  [ -x "$real_gh" ] || real_gh=""
+  # FAIL CLOSED: a pod with a token but without its client refuses to start (no worker holds the token with no wrapper in front of it).
+  # CW_GH_CLIENT names the client for tests only; the image never sets it.
+  if [ ! -x "$real_gh" ]; then
+    echo "worker: the gh client $real_gh is missing or not executable; refusing to start" >&2
+    exit 1
+  fi
   real_git=$(command -v git || true)
   if [ -n "$real_gh" ]; then
     cat > "$bin/gh" <<H

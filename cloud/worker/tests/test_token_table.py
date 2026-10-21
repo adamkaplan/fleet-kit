@@ -40,9 +40,9 @@ PINNED = [
 ]
 
 
-def rows():
+def rows(path=TABLE):
     out = []
-    with open(TABLE, encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             if line.strip() and not line.startswith("#"):
                 out.append(tuple(x.strip() for x in line.rstrip("\n").split(" | ")))
@@ -102,16 +102,24 @@ class TokenTable(unittest.TestCase):
         self.assertEqual(block(read(README), "README"), render_readme(rs))
         self.assertEqual(block(read(WORKER_MD), "worker.md"), render_prompt(rs))
 
-    def test_a_changed_cell_would_fail_its_row(self):   # the mutant is a copy in memory; the pin and the rendering both see it
-        rs = rows()
-        for i in range(len(rs)):
+    def test_a_changed_cell_in_the_file_fails_its_row_test_and_the_rendering_check(self):   # a REAL mutant: a changed copy of the file, parsed by rows()
+        import tempfile
+        original = read(TABLE).splitlines(True)
+        data = [i for i, l in enumerate(original) if l.strip() and not l.startswith("#")]
+        for n, line_no in enumerate(data):
             for j in range(4):
-                m = [list(r) for r in rs]
-                m[i][j] += " x"
-                m = [tuple(r) for r in m]
-                self.assertNotEqual(m[i], PINNED[i])
-                self.assertNotEqual(render_readme(m), block(read(README), "README"))
-                self.assertNotEqual(render_prompt(m), block(read(WORKER_MD), "worker.md"))
+                cells = original[line_no].rstrip("\n").split(" | ")
+                cells[j] += " x"
+                mutant = list(original)
+                mutant[line_no] = " | ".join(cells) + "\n"
+                with tempfile.TemporaryDirectory() as d:
+                    path = os.path.join(d, "t.txt")
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.writelines(mutant)
+                    got = rows(path)
+                self.assertNotEqual(got[n], PINNED[n], (n, j))
+                self.assertNotEqual(render_readme(got), block(read(README), "README"), (n, j))
+                self.assertNotEqual(render_prompt(got), block(read(WORKER_MD), "worker.md"), (n, j))
 
 
 def _row_test(i):

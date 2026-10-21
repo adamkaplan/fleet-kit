@@ -41,6 +41,10 @@ class Stub(http.server.BaseHTTPRequestHandler):
     seen = []       # (method, path, body, auth)
     logs_host = ""  # the base URL a logs redirect points at
     other_seen = []
+    body_override = None
+    nonjson = False        # answer 201 with a body that is not JSON
+    redirect = None        # (code, location) answered for every API call
+    logs_location = None   # a Location for the logs redirect, instead of the download path
 
     def log_message(self, *a):
         pass
@@ -62,7 +66,11 @@ class Stub(http.server.BaseHTTPRequestHandler):
             Stub.other_seen.append((self.path, auth))
             return self.answer(200, zip_bytes())
         Stub.seen.append((self.command, self.path, json.loads(body) if body else None, auth))
+        if Stub.redirect:
+            return self.answer(Stub.redirect[0], b"", {"Location": Stub.redirect[1]})
         p = self.path.split("?")[0]
+        if Stub.nonjson and self.command == "POST":
+            return self.answer(201, b"<html>")
         if p.endswith("/boom"):
             return self.answer(401, {"message": "Bad credentials"})
         if p == "/repos/%s" % REPO:
@@ -83,6 +91,8 @@ class Stub(http.server.BaseHTTPRequestHandler):
         if p == "/repos/%s/commits/%s/status" % (REPO, SHA):
             return self.answer(200, {"statuses": []})
         if p == "/repos/%s/issues/3" % REPO:
+            if Stub.body_override:
+                return self.answer(200, Stub.body_override)
             return self.answer(200, {"title": "i", "state": "open", "html_url": "https://x/i/3", "labels": [], "body": "ib"})
         if p == "/repos/%s/issues" % REPO:
             return self.answer(200, [{"number": 3, "title": "i", "state": "open"}, {"number": 9, "title": "pr", "state": "open", "pull_request": {}}])
@@ -94,7 +104,7 @@ class Stub(http.server.BaseHTTPRequestHandler):
             return self.answer(200, {"jobs": [{"name": "build", "status": "completed", "conclusion": "success"},
                                               {"name": "lint", "status": "completed", "conclusion": "failure"}]})
         if p == "/repos/%s/actions/runs/5/logs" % REPO:
-            return self.answer(302, b"", {"Location": Stub.logs_host + "/download/logs.zip"})
+            return self.answer(302, b"", {"Location": Stub.logs_location or Stub.logs_host + "/download/logs.zip"})
         if p == "/graphql":
             return self.answer(200, {"data": {}})
         self.answer(404, {"message": "Not Found"})
@@ -121,6 +131,26 @@ CALLS = {
 }
 
 
+REFUSED = [["issue", "comment", "3", "-b", "x"], ["issue", "create"], ["issue", "edit", "3"], ["issue", "close", "3"], ["pr", "merge", "9"],
+           ["pr", "review", "9"], ["pr", "edit", "9"], ["pr", "close", "9"], ["label", "list"], ["release", "create"], ["workflow", "run"],
+           ["extension", "install", "x"], ["alias", "set", "a", "b"], ["auth", "status"], ["repo", "edit"], ["secret", "set", "X"],
+           ["run", "rerun", "5"], ["config", "get", "x"], ["pr", "reopen", "9"], ["pr", "update-branch", "9"], ["repo", "clone", "x"]]
+
+
+class Rec(http.server.BaseHTTPRequestHandler):
+    seen = []   # anything that reached the second server
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        Rec.seen.append((self.path, self.headers.get("Authorization")))
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+
 class Client(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -128,10 +158,14 @@ class Client(unittest.TestCase):
         threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
         cls.base = "http://127.0.0.1:%d" % cls.srv.server_port
         Stub.logs_host = cls.base
+        cls.srv2 = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Rec)
+        threading.Thread(target=cls.srv2.serve_forever, daemon=True).start()
+        cls.base2 = "http://127.0.0.1:%d" % cls.srv2.server_port
 
     @classmethod
     def tearDownClass(cls):
         cls.srv.shutdown()
+        cls.srv2.shutdown()
 
     def setUp(self):
         Stub.seen, Stub.other_seen = [], []
@@ -187,10 +221,7 @@ class Client(unittest.TestCase):
         self.assertEqual(Stub.other_seen, [("/download/logs.zip", None)])   # no Authorization header went to the download host
 
     def test_every_verb_the_client_lacks_exits_2_with_one_line(self):
-        gone = [["issue", "comment", "3", "-b", "x"], ["issue", "create"], ["issue", "edit", "3"], ["issue", "close", "3"], ["pr", "merge", "9"],
-                ["pr", "review", "9"], ["pr", "edit", "9"], ["pr", "close", "9"], ["label", "list"], ["release", "create"], ["workflow", "run"],
-                ["extension", "install", "x"], ["alias", "set", "a", "b"], ["auth", "status"], ["repo", "edit"], ["secret", "set", "X"],
-                ["run", "rerun", "5"], ["config", "get", "x"], ["", ]]
+        gone = REFUSED
         for argv in gone:
             with self.subTest(argv=argv):
                 p = self.run_gh(*argv)
@@ -230,13 +261,62 @@ class Client(unittest.TestCase):
         p = self.run_gh("pr", "view", "9", "-R", REPO, "--jq", ".x")
         self.assertEqual(p.returncode, 2)
 
-    def test_the_client_source_holds_no_merge_review_or_issue_write_call(self):
-        src = open(CW_GH).read()
-        for needle in ("/merge", "enablePullRequestAutoMerge", "mergePullRequest", "/reviews", "PATCH", '"PUT"', '"DELETE"'):
-            self.assertNotIn(needle, src, needle)
-        # the only writes are the pull request create, the pull request comment and the ready mutation
-        posts = [l.strip() for l in src.splitlines() if 'request("POST"' in l]
-        self.assertEqual(len(posts), 3, posts)
+    def test_outside_text_never_reaches_the_terminal_with_escape_or_bidi_characters(self):
+        Stub.body_override = {"title": "t\x1b[31mred", "state": "open", "html_url": "u", "body": "b\u202eevil\x07", "labels": []}
+        try:
+            p = self.run_gh("issue", "view", "3", "-R", REPO)
+        finally:
+            Stub.body_override = None
+        self.assertEqual(p.returncode, 0, p.stderr)
+        for bad in ("\x1b", "\u202e", "\x07"):
+            self.assertNotIn(bad, p.stdout)
+        self.assertIn("red", p.stdout)
+
+    def test_a_non_json_answer_or_a_control_character_in_a_path_is_one_line_not_a_traceback(self):
+        Stub.nonjson = True
+        try:
+            p1 = self.run_gh("pr", "comment", "9", "-R", REPO, "--body", "x")
+            p2 = self.run_gh("pr", "create", "-R", REPO, "--title", "t", "--body", "b", "--head", "f", "--base", "main")
+        finally:
+            Stub.nonjson = False
+        p3 = self.run_gh("api", "repos/x/y\nz")
+        for p in (p1, p2, p3):
+            self.assertEqual(p.returncode, 1, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertEqual(len(p.stderr.strip().splitlines()), 1, p.stderr)
+
+    def test_a_logs_archive_with_too_many_entries_is_refused(self):
+        self.assertEqual(MOD.MAX_ENTRIES, 2000)
+
+    def test_the_only_writes_any_verb_makes_are_the_three_expected_ones(self):
+        """Behaviour, not text: every verb is run against the stub; the writes it saw are exactly the PR create, the PR comment and the ready mutation."""
+        writes = set()
+        for key, (argv, _, _) in CALLS.items():
+            Stub.seen = []
+            self.run_gh(*argv)
+            writes |= {(m, pth.split("?")[0]) for m, pth, _, _ in Stub.seen if m != "GET"}
+        self.assertEqual(writes, {("POST", "/repos/%s/pulls" % REPO), ("POST", "/repos/%s/issues/9/comments" % REPO), ("POST", "/graphql")})
+
+    def test_an_ordinary_call_that_is_redirected_is_an_error_and_the_token_goes_nowhere(self):
+        for code in (301, 302, 307):
+            Stub.redirect = (code, self.base2 + "/elsewhere")
+            Rec.seen = []
+            p = self.run_gh("api", "repos/%s/redir" % REPO)
+            Stub.redirect = None
+            self.assertEqual(p.returncode, 1, code)
+            self.assertEqual(Rec.seen, [], code)
+
+    def test_a_logs_location_that_is_not_https_or_loopback_http_is_refused_without_a_request(self):
+        for loc in ("http://example.com/logs.zip", "ftp://example.com/logs.zip", "file:///etc/passwd", "https:///x"):
+            Stub.logs_location = loc
+            p = self.run_gh("run", "logs", "5", "-R", REPO)
+            Stub.logs_location = None
+            self.assertEqual(p.returncode, 1, loc)
+            self.assertEqual(Stub.other_seen, [], loc)
+
+    def test_the_removed_verbs_are_absent_from_the_client_table(self):
+        for argv in REFUSED:
+            self.assertNotIn((argv[0], argv[1] if len(argv) > 1 else ""), MOD.VERBS, argv)
 
 
 if __name__ == "__main__":

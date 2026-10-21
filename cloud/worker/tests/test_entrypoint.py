@@ -169,11 +169,11 @@ class Entrypoint(unittest.TestCase):
         self.assertIn("left in the environment: nothing", r.stdout)
         self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.tmpfs, "bin")).st_mode), 0o700)
 
-    def test_1031_without_the_client_there_is_no_gh_wrapper_and_the_real_gh_is_never_looked_up(self):
+    def test_1031_without_the_client_the_start_is_refused_and_the_real_gh_is_never_looked_up(self):
         r = self.start("sh", "-c", "echo started", CW_GH_CLIENT=os.path.join(self.d, "absent"))
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertFalse(os.path.exists(os.path.join(self.tmpfs, "bin", "gh")))
-        # a gh on the PATH (as the old image had) is not wrapped either: the wrapper runs the pod's client only
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("refusing to start", r.stderr)
+        self.assertNotIn("started", r.stdout)
         self.assertNotIn("command -v gh", read(ENTRYPOINT))
 
     def test_s4_a_token_file_that_vanishes_or_empties_makes_the_helper_and_the_wrapper_fail_with_one_line(self):
