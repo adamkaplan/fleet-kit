@@ -81,12 +81,18 @@ H
     exit 1
   fi
   cat "$guard" > "$bin/cw-guard"; chmod 755 "$bin/cw-guard"
-  real_gh=$(command -v gh || true)
+  real_gh="${CW_GH_CLIENT:-/usr/local/bin/cw-gh}"   # the pod's own client: the real gh is not in the image
+  # FAIL CLOSED: a pod with a token but without its client refuses to start (no worker holds the token with no wrapper in front of it).
+  # CW_GH_CLIENT names the client for tests only; the image never sets it.
+  if [ ! -x "$real_gh" ]; then
+    echo "worker: the gh client $real_gh is missing or not executable; refusing to start" >&2
+    exit 1
+  fi
   real_git=$(command -v git || true)
   if [ -n "$real_gh" ]; then
     cat > "$bin/gh" <<H
 #!/bin/sh
-# refuse the six (exit 3, one line), then run gh. The token is read for this one call and lives only in the environment of that gh process
+# refuse the six (exit 3, one line), then run the pod's GitHub client (cw-gh). The token is read for this one call and lives only in the environment of that process
 "$bin/cw-guard" gh "\$@" || exit \$?
 tok=\$({ tr -d '\\r\\n' < "$tokfile"; } 2>/dev/null) || tok=""
 if [ -z "\$tok" ]; then echo "worker: the git token file is unreadable or empty" >&2; exit 1; fi
