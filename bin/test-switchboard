@@ -77931,6 +77931,56 @@ class TestPaneExit(Base):
         with mock.patch.object(sb, "pane_exit_pass", namespace["pane_exit_pass"]):
             self.assertGreaterEqual(idle_writes(range(41, 51)), 10, "the mutant rewrites the file at each pass: the test sees it")
 
+    def test_the_log_size_is_pinned_in_memory_by_grow_then_truncate_and_a_mutant_each_for_a_stored_size_and_for_no_memory_fails(self):
+        """Grow by other events (no write), truncate to a size ABOVE the stored size but BELOW the in-memory size (a rotation seen only against memory:
+        one write, the new exit not missed), grow again (no write)."""
+        import inspect
+        self.three_kinds()
+        self.run_pass()
+        stored_size = self.log.stat().st_size
+        other = "%s  INFO herdr::agent: agent state changed pane=11 state=busy\n" % self.stamp(0)
+
+        def idle_writes(passes):
+            writes = 0
+            for offset in passes:
+                self.append(other)
+                writes += self.count_state_writes([offset])
+            return writes
+
+        def scenario():
+            self.assertEqual(idle_writes(range(11, 31)), 0, "growth by other events: no write")
+            grown = self.log.stat().st_size
+            new_exit = self.exit_line(-20, 15, 0)
+            padding = other * ((stored_size - len(new_exit)) // len(other) + 1)
+            self.log.write_text(padding + new_exit)
+            truncated = self.log.stat().st_size
+            self.assertTrue(stored_size < truncated < grown, "the truncated log is above the stored size and below the in-memory size")
+            writes = self.count_state_writes([31])
+            exits = [e["detail"]["pane"] for e in self.audit("fleetpane.exit")]
+            self.assertEqual(writes, 2, "the rotation: one write for the new exit's mark, one for the log")
+            self.assertIn("15", exits, "no exit missed across the truncation")
+            self.assertEqual(len([e for e in self.audit("fleetpane.exit_note") if "rotated" in e["detail"]["note"]]), 1, "the truncation is detected against the in-memory size")
+            self.assertEqual(idle_writes(range(32, 42)), 0, "growth again: no write")
+
+        source = inspect.getsource(sb.pane_exit_pass)
+        mutants = {
+            "stored size at every pass": ("if rotated or not stored_log or", "if True or"),
+            "no in-memory update": ("    engine.pane_exit_log = {\"size\": size, \"ino\": inode}\n", ""),
+        }
+        for name, (old, new) in mutants.items():
+            self.assertIn(old, source, name)
+        scenario()
+        for name, (old, new) in mutants.items():
+            with self.subTest(mutant=name):
+                self.setUp()
+                self.three_kinds()
+                namespace = dict(sb.__dict__)
+                exec(source.replace(old, new), namespace)
+                with mock.patch.object(sb, "pane_exit_pass", namespace["pane_exit_pass"]):
+                    self.run_pass()
+                    with self.assertRaises(AssertionError, msg="the mutant %s passed" % name):
+                        scenario()
+
     def test_each_field_of_the_saved_payload_changes_it_only_for_its_own_reason(self):
         """The payload is {"seen": {key: epoch}, "log": {"size", "ino"}}. seen changes with a new exit or burst, or a key aging out (PANE_EXIT_SEEN_KEEP);
         log.ino with a rotation; log.size with a shrink (rotation) or alongside a change of seen, and never by growth alone."""
