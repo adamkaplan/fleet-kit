@@ -299,6 +299,7 @@
       "bin/impact_hold.py",
       "bin/plan_check.py",
       "bin/plan_ledger.py",
+      "bin/private_dir.py",
       "bin/repo_exclusion.py",
       "docs/review-laws/impact-matrix.json"
     ],
@@ -337,6 +338,7 @@
         "bin/impact_floor.py",
         "bin/plan_check.py",
         "bin/plan_ledger.py",
+        "bin/private_dir.py",
         "bin/repo_exclusion.py",
         "plugins/fleet-hooks/**",
         "shims/**",
@@ -363,7 +365,6 @@
         "bin/item_verdicts.py",
         "bin/plan_review.py",
         "bin/pr_events.py",
-        "bin/private_dir.py",
         "bin/queue_ejections.py",
         "bin/reassign.py",
         "bin/reds.py",
@@ -404,9 +405,6 @@
         "bin/item_verdicts.py": [
           "registrations",
           "validate_item_checks"
-        ],
-        "bin/private_dir.py": [
-          "*"
         ],
         "bin/queue_ejections.py": [
           "validate"
