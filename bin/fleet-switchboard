@@ -2165,6 +2165,9 @@ class HerdrClient:
     def agent_list(self):
         return self._result(self._call("agent", "list"), "agents", list)
 
+    def tab_list(self):
+        return self._result(self._call("tab", "list"), "tabs", list)
+
     def agent_get(self, target):
         return self._result(self._call("agent", "get", target), "agent", dict)
 
@@ -6982,6 +6985,33 @@ def watch_terminal_closed(engine, name, session_id):
     return record is not None and record.get("session") == session_id
 
 
+BELL_GLYPH = "\U0001f514"   # the heartbeat's old opt-in glyph in a tab label: read ONCE by the migration below, never again
+
+
+def bell_migration(engine, registry, now):
+    """#973, once: write the heartbeat's `bell` field for every recorded agent from the live tab labels (the opt-in the heartbeat used to read each pass),
+    on a whole read only (agent list and tab list both answered); audited per agent; a marker file stops it from running, or reading herdr, again."""
+    if registry.bell_migrated(engine.state_dir):
+        return
+    try:
+        agents, tabs = engine.herdr.agent_list(), engine.herdr.tab_list()
+    except HerdrError as err:
+        engine._note("fleetpane.error", None, {"error": "bell migration waits: %s" % _one_line(str(err), 100)})
+        return
+    if not agents:   # a whole but EMPTY live list (herdr just restarted) is no evidence of anyone's label: with recorded agents to migrate it stays pending, no marker
+        recorded = [r for r in registry.read(engine.state_dir)["agents"].values() if isinstance(r, dict) and r.get("pane") and not isinstance(r.get("bell"), bool)]
+        if recorded:
+            engine._note("fleetpane.error", None, {"error": "bell migration pending: herdr listed no agents but the registry records %d" % len(recorded)})
+            return
+    labels = {t.get("tab_id"): str(t.get("label") or "") for t in tabs if isinstance(t, dict)}
+    belled = {a.get("pane_id") for a in agents if isinstance(a, dict) and BELL_GLYPH in labels.get(a.get("tab_id"), "")}
+    got = registry.migrate_bell(engine.state_dir, belled, True, now=now)
+    if got["problem"]:
+        engine._note("fleetpane.error", None, {"error": "bell migration: %s" % _one_line(got["problem"], 100)})
+    elif got["ran"] and got["changed"] and engine.audit is not None:
+        engine.audit.append(engine.actor, "registry.bell_migrated", None, {"agents": got["changed"]})
+
+
 def pane_health_pass(engine, now):
     """The daemon's look at every fleet agent's pane (after discovery). Records `pane-health.json` (what `status` shows and `reattach` reads),
     audits each change of state (`pane.detached`, `pane.dead`, `pane.recovered`) and leaves `engine.pane_alerts` for the cos fact. Reads only; bounded
@@ -6993,6 +7023,10 @@ def pane_health_pass(engine, now):
     reg = registry.read(engine.state_dir)
     if not reg["whole"]:   # a half-read registry acts on nothing (#805): no upsert, no retire, no removal
         engine._note("fleetpane.error", None, {"error": "pass skipped: %s" % _one_line(reg["problem"] or "registry not read", 100)})
+        return
+    bell_migration(engine, registry, now)
+    reg = registry.read(engine.state_dir)
+    if not reg["whole"]:
         return
     data = read_pane_health(engine.state_dir)
     states, missing = data["states"], data["missing"]

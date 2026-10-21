@@ -847,7 +847,7 @@ class TestHerdrClient(Base):
                         if not name.startswith("_"))
         self.assertEqual(public, ["agent_get", "agent_list", "notification_show", "open_tab_running",
                                   "pane_clear_token", "pane_close", "pane_get", "pane_list", "pane_process_info", "pane_read_visible",
-                                  "pane_report_metadata_token", "tab_close", "tab_get", "workspace_create", "workspace_list"])  # PR 16
+                                  "pane_report_metadata_token", "tab_close", "tab_get", "tab_list", "workspace_create", "workspace_list"])  # PR 16; #973: tab_list is the one-time bell migration's read
 
     def test_a_workspace_is_listed_and_created_focused_with_the_one_focus_flag(self):
         body = '{"result": {"workspaces": [{"workspace_id": "w1", "label": "A"}], "workspace": {"workspace_id": "w2"}, ' \
@@ -2065,7 +2065,7 @@ class FakeV2:
 
 HERDR_ALLOWED = (["agent", "list"], ["agent", "get"], ["pane", "report-metadata"], ["notification", "show"],
                  ["pane", "process-info"], ["pane", "close"], ["workspace", "list"], ["workspace", "create"],
-                 ["plugin", "list"], ["pane", "get"], ["pane", "read"], ["tab", "close"], ["tab", "get"])  # PR 16; the control plane reads a pane and closes a stale tab: `status` reads herdr's plugin list; `bootstrap` makes a workspace
+                 ["plugin", "list"], ["pane", "get"], ["pane", "read"], ["tab", "close"], ["tab", "get"], ["tab", "list"])  # PR 16; #973: the bell migration reads the tab labels once; the control plane reads a pane and closes a stale tab: `status` reads herdr's plugin list; `bootstrap` makes a workspace
 SOCKET_ALLOWED = ("layout.apply",)
 TYPING_VERBS = (["agent", "prompt"], ["agent", "send-keys"], ["agent", "start"], ["pane", "send-text"],
                 ["pane", "send-keys"], ["pane", "run"])
@@ -2157,7 +2157,7 @@ class FakeHerdr:
         # herdr 0.9's shape: the session is an object, not a string (S6).
         entry = self.panes[pane]
         body = {"pane_id": pane, "agent": "opencode", "agent_status": self.status(pane),
-                "workspace_id": pane.split(":")[0]}
+                "workspace_id": pane.split(":")[0], "tab_id": self.tab_of(pane)}
         if entry["session"] and not entry.get("undetected"):
             body["agent_session"] = {"agent": "opencode", "kind": "id", "source": "herdr:opencode",
                                      "value": entry["session"]}
@@ -2180,7 +2180,7 @@ class FakeHerdr:
                    ("notification", "show"): self._notification_show, ("pane", "process-info"): self._process_info,
                    ("pane", "close"): self._pane_close, ("workspace", "list"): self._workspace_list,
                    ("workspace", "create"): self._workspace_create, ("pane", "get"): self._pane_get, ("pane", "list"): self._pane_list,
-                   ("tab", "close"): self._tab_close, ("tab", "get"): self._tab_get}.get(tuple(args[:2]))
+                   ("tab", "close"): self._tab_close, ("tab", "get"): self._tab_get, ("tab", "list"): self._tab_list}.get(tuple(args[:2]))
         if tuple(args[:2]) == ("pane", "read"):
             positional, flags = parse_flags(args[2:], ("--source", "--lines", "--format"))
             if positional[0] not in self.panes:
@@ -2311,6 +2311,10 @@ class FakeHerdr:
         body = {"pane_id": pane, "workspace_id": pane.split(":")[0], "tab_id": self.tab_of(pane), "cwd": entry.get("cwd") or "/tmp",
                 "agent_status": self.status(pane), "terminal_title_stripped": title}
         return {"result": {"type": "pane_info", "pane": body}}
+
+    def _tab_list(self, rest):
+        parse_flags(rest, ())
+        return {"result": {"type": "tab_list", "tabs": [{"tab_id": self.tab_of(p), "workspace_id": p.split(":")[0], "label": self.panes[p].get("tab_label", "")} for p in sorted(self.panes)]}}
 
     def _tab_get(self, rest):
         positional, _ = parse_flags(rest, ())
@@ -4520,6 +4524,53 @@ class TestLaunch(StandInPids, Base):
         self.engine.state_dir = self.world.state
         self.engine.discover(self.world.clock.now())
         sb.pane_health_pass(self.engine, self.world.clock.now() + offset)
+
+    # -- #973: the daemon's own call of the migration (the pass), not the function alone
+
+    class LiveBells:
+        """A herdr client whose live lists carry tab ids and labels: delegates everything else to the real fake."""
+        def __init__(self, real, agents, tabs):
+            self.real, self.agents, self.tabs = real, agents, tabs
+
+        def __getattr__(self, name):
+            return getattr(self.real, name)
+
+        def agent_list(self):
+            return self.agents
+
+        def tab_list(self):
+            return self.tabs
+
+    def recorded_world(self, agents, tabs):
+        registry = sb.load_module("registry")
+        pane, sid = self.world.panes["platform"], self.world.sessions["platform"]
+        registry.upsert(self.world.state, "platform", {"pane": pane, "session": sid, "role": "worker"}, now=1)
+        self.engine.herdr = self.LiveBells(self.engine.herdr, [dict(a, pane_id=pane) for a in agents], tabs)
+        return registry, pane
+
+    def test_the_pass_runs_the_migration_a_belled_pane_gets_bell_true_and_the_marker_exists(self):
+        registry, pane = self.recorded_world([{"tab_id": "t1"}], [{"tab_id": "t1", "label": "\U0001f514 lead"}])
+        self.health()
+        self.assertIs(registry.read(self.world.state)["agents"]["platform"]["bell"], True)
+        self.assertTrue(registry.bell_migrated(self.world.state))
+
+    def test_the_mutant_that_drops_the_call_from_the_pass_fails_the_check_above(self):
+        registry, pane = self.recorded_world([{"tab_id": "t1"}], [{"tab_id": "t1", "label": "\U0001f514 lead"}])
+        with mock.patch.object(sb, "bell_migration", lambda *a, **k: None):
+            self.health()
+        self.assertIsNone(registry.read(self.world.state)["agents"]["platform"].get("bell"))   # the pass-level test would fail: no field, no marker
+        self.assertFalse(registry.bell_migrated(self.world.state))
+
+    def test_a_whole_but_empty_live_list_writes_no_marker_while_agents_are_recorded(self):
+        registry, pane = self.recorded_world([], [])
+        self.health()
+        self.assertFalse(registry.bell_migrated(self.world.state))
+        self.assertIsNone(registry.read(self.world.state)["agents"]["platform"].get("bell"))
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "fleetpane.error" and "pending" in json.dumps(e)])
+        self.engine.herdr = self.LiveBells(self.engine.herdr.real, [{"pane_id": pane, "tab_id": "t1"}], [{"tab_id": "t1", "label": "plain"}])
+        self.health()   # herdr answers again: it runs, and the agent is not belled
+        self.assertIs(registry.read(self.world.state)["agents"]["platform"]["bell"], False)
+        self.assertTrue(registry.bell_migrated(self.world.state))
 
     def state(self, name="platform"):
         obs = self.engine.discover(self.world.clock.now()).agents[name]
@@ -77533,9 +77584,8 @@ OLD_SOURCE_ALLOWED = {
     ("bin/fleet-switchboard", "janitor_agent_roots", "RETIRED_FILE"): "2026-12-20, last slice of #903 (the temp janitor, #936, owns it): only the name in its unreadable-record message, the read itself is read_retired_strict (the registry's)",
 }
 # Live observers: the call sites that ask herdr which panes exist right now (`"agent", "list"`), keyed by (file, function), each a NAMED entry with its reason,
-# never a silent skip. fleet-heartbeat is DATED (the Chief of Staff's choice: remove by 2026-11-03); the other two are the live source the registry is fed from.
+# never a silent skip. The heartbeat's dated entry (2026-11-03) ended with #973: its bell opt-in is the registry's `bell` field. The two left are the live source the registry is fed from.
 LIVE_OBSERVERS = {
-    ("bin/fleet-heartbeat", "tabs_with_agents"): "2026-11-03, remove by (cos): live-pane observation (bell filter); identity from the registry; the bell moves into the registry in #973",
     ("bin/fleet-switchboard", "agent_list"): "discovery's own herdr client: the live source the registry is fed from (herdr and the v2 service), not a record of who exists",
     ("bin/proof-switchboard", "pane_of_session"): "the proof harness finds the pane of one session in a lab; it keeps no list",
 }
@@ -77622,6 +77672,127 @@ def scanned(path):
     skip = (path == "bin/registry.py" or path.endswith((".md", ".json", ".txt", ".lock", ".png", ".svg"))
             or name.startswith("test") or ".test." in name or "/tests/" in path or "/fixtures/" in path or path.startswith(("docs/", ".github/")))
     return not skip
+
+
+class TestBellMigration(unittest.TestCase):
+    """#973: the heartbeat's bell opt-in is the registry's `bell` field; today's live tab labels are copied into it ONCE, on a whole read only."""
+
+    GLYPH = "\U0001f514"
+
+    class Herdr:
+        def __init__(self, agents, tabs, fail=False):
+            self.agents, self.tabs, self.fail, self.reads = agents, tabs, fail, 0
+
+        def agent_list(self):
+            self.reads += 1
+            if self.fail:
+                raise sb.HerdrError("exit", "no")
+            return self.agents
+
+        def tab_list(self):
+            self.reads += 1
+            return self.tabs
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.registry = sb.load_module("registry")
+        self.names = ["a", "b", "c", "d", "e"]
+        for n, name in enumerate(self.names):
+            self.registry.upsert(self.dir, name, {"pane": "w%d:p1" % n, "session": "ses_example%d" % n}, now=1)
+        # old records: strip the field the upsert now adds, as if recorded before this change
+        doc = json.loads((self.dir / "registry.json").read_text())
+        for row in doc["agents"].values():
+            row.pop("bell", None)
+        (self.dir / "registry.json").write_text(json.dumps(doc))
+        labels = ["%s x" % self.GLYPH, "plain", "Orchestrator", "y %s" % self.GLYPH, "\U0001f515 z"]
+        self.live = {"a": True, "b": False, "c": False, "d": True, "e": False}
+        self.tabs = [{"tab_id": "w%d:t1" % n, "label": label} for n, label in enumerate(labels)]
+        self.agents = [{"pane_id": "w%d:p1" % n, "tab_id": "w%d:t1" % n} for n in range(5)]
+        self.notes = []
+        self.audits = []
+        self.engine = types.SimpleNamespace(state_dir=str(self.dir), audit=None, actor="t", _note=lambda *a: self.notes.append(a))
+
+    def bells(self):
+        return {n: r.get("bell") for n, r in self.registry.read(self.dir)["agents"].items()}
+
+    def audit_lines(self):
+        path = self.dir / "registry-audit.jsonl"
+        return [json.loads(l) for l in path.read_text().splitlines() if '"bell_migrated"' in l] if path.exists() else []
+
+    def test_a_whole_read_writes_the_field_for_each_agent_equal_to_its_live_state_and_audits_each(self):
+        herdr = self.Herdr(self.agents, self.tabs)
+        self.engine.herdr = herdr
+        sb.bell_migration(self.engine, self.registry, 5)
+        self.assertEqual(self.bells(), self.live)
+        self.assertEqual(len(self.audit_lines()), 5)
+
+    def test_a_partial_or_failed_read_writes_nothing_and_is_tried_again(self):
+        self.engine.herdr = self.Herdr(self.agents, self.tabs, fail=True)
+        sb.bell_migration(self.engine, self.registry, 5)
+        self.assertEqual(self.bells(), {n: None for n in self.names})
+        self.assertEqual(self.audit_lines(), [])
+        self.assertFalse(self.registry.bell_migrated(self.dir))
+        self.assertEqual(self.registry.migrate_bell(self.dir, {"w0:p1"}, False)["changed"], 0)   # the registry's own refusal of a read that is not whole
+        self.assertEqual(self.bells(), {n: None for n in self.names})
+
+    def test_it_runs_once_the_live_state_is_not_read_again_and_a_new_agent_carries_the_field(self):
+        herdr = self.Herdr(self.agents, self.tabs)
+        self.engine.herdr = herdr
+        sb.bell_migration(self.engine, self.registry, 5)
+        reads = herdr.reads
+        herdr.tabs = [{"tab_id": "w1:t1", "label": self.GLYPH}]   # a label changed since: it must not be read
+        sb.bell_migration(self.engine, self.registry, 6)
+        sb.bell_migration(self.engine, self.registry, 7)
+        self.assertEqual(herdr.reads, reads)
+        self.assertEqual(self.bells(), self.live)
+        self.assertEqual(len(self.audit_lines()), 5)
+        self.registry.upsert(self.dir, "new", {"pane": "w9:p1", "session": "ses_examplenew"}, now=8)
+        self.assertIs(self.registry.read(self.dir)["agents"]["new"]["bell"], False)
+
+    def test_a_failed_migration_followed_by_a_state_pass_loses_no_opt_in(self):
+        self.engine.herdr = self.Herdr(self.agents, self.tabs, fail=True)
+        sb.bell_migration(self.engine, self.registry, 5)
+        for name in self.names:   # the pass's upsert of a changed state, before the migration has run
+            self.registry.upsert(self.dir, name, {"pane": self.registry.read(self.dir)["agents"][name]["pane"], "session": self.registry.read(self.dir)["agents"][name]["session"], "state": "working"}, now=6)
+        self.assertEqual(self.bells(), {n: None for n in self.names})
+        self.engine.herdr = self.Herdr(self.agents, self.tabs)
+        sb.bell_migration(self.engine, self.registry, 7)
+        self.assertEqual(self.bells(), self.live)
+
+    def test_a_failing_tab_list_and_a_failing_marker_write_are_safe(self):
+        herdr = self.Herdr(self.agents, self.tabs)
+        herdr.tab_list = lambda: (_ for _ in ()).throw(sb.HerdrError("exit", "no"))
+        self.engine.herdr = herdr
+        sb.bell_migration(self.engine, self.registry, 5)
+        self.assertEqual(self.bells(), {n: None for n in self.names})
+        with mock.patch.object(self.registry, "_write_atomic", side_effect=OSError(28, "full")):
+            got = self.registry.migrate_bell(self.dir, {"w0:p1"}, True)
+        self.assertTrue(got["problem"])
+        self.assertFalse(self.registry.bell_migrated(self.dir))
+        again = self.registry.migrate_bell(self.dir, {"w0:p1"}, True)   # safe to re-run: records that have the field are left alone
+        self.assertIsNone(again["problem"])
+
+    def test_the_pass_audits_the_migration_once_when_agents_changed_and_never_for_none(self):
+        self.engine.herdr = self.Herdr(self.agents, self.tabs)
+        audit = types.SimpleNamespace(lines=[], append=lambda actor, event, subject, detail: audit.lines.append((event, detail)))
+        self.engine.audit = audit
+        sb.bell_migration(self.engine, self.registry, 5)
+        self.assertEqual(audit.lines, [("registry.bell_migrated", {"agents": 5})])
+        empty = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(empty), True)
+        self.engine.state_dir, audit.lines[:] = str(empty), []
+        sb.bell_migration(self.engine, self.registry, 5)   # nothing recorded: the marker is written, no audit line
+        self.assertEqual(audit.lines, [])
+
+    def test_a_field_a_person_set_is_never_overwritten_and_the_default_is_opted_out(self):
+        self.registry.set_bell(self.dir, "b", True)
+        self.engine.herdr = self.Herdr(self.agents, self.tabs)
+        sb.bell_migration(self.engine, self.registry, 5)
+        self.assertIs(self.bells()["b"], True)
+        self.assertEqual(len(self.audit_lines()), 4)
+        self.assertIs(self.registry.bell_of({"pane": "w1:p1"}), False)
 
 
 class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
@@ -77887,8 +78058,9 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
         self.assertEqual(set(LIVE_OBSERVERS) - found, set(), "an entry of LIVE_OBSERVERS no longer reads the live list: remove it")
         for key, reason in LIVE_OBSERVERS.items():
             self.assertGreater(len(reason), 40, key)
+        self.assertEqual([k for k in LIVE_OBSERVERS if k[0] == "bin/fleet-heartbeat"], [], "the heartbeat reads the registry's bell field, never a live listing (#973)")
         dated = {k: r for k, r in LIVE_OBSERVERS.items() if re.match(r"\d{4}-\d{2}-\d{2}\b", r)}
-        self.assertEqual(set(dated), {("bin/fleet-heartbeat", "tabs_with_agents")}, "the heartbeat is a DATED entry, never a standing one")
+        self.assertEqual(set(dated), set(), "a dated entry is for a read that is about to be removed; none is left")
         for key, reason in dated.items():
             self.assertGreaterEqual(reason[:10], _dt.date.today().isoformat(), "%s is past its remove-by date" % (key,))
 
