@@ -19309,6 +19309,17 @@ class TestGitStashGuard(Base):
                 self.assertRegex(text, re.compile(r"never `git stash`.{0,600}scratch branch", re.I))
 
 
+def write_fake_env(home, environ):
+    """The shim starts the switchboard with an ALLOW-LISTED environment, so a `FAKE_*` the test sets never reaches a fake switchboard: hand them over the way the
+    account's own program would find them, in a file under TMPDIR (a name the shim does pass). The fake sources it when it is there."""
+    lines = ["%s=%s; export %s" % (k, shlex.quote(v), k) for k, v in sorted(environ.items()) if k.startswith("FAKE_")]
+    (home / "fake-sb.env").write_text("\n".join(lines) + "\n")
+    environ["TMPDIR"] = str(home)
+
+
+FAKE_SB_SOURCE = '[ -f "$TMPDIR/fake-sb.env" ] && . "$TMPDIR/fake-sb.env"\n'
+
+
 class TestGhShimGateProbe(Base):
     """The shim asks `gates-check` before `pr ready` and `pr merge`: a refusal (exit 10, only in an enforcing repo) stops the command."""
 
@@ -19329,7 +19340,7 @@ class TestGhShimGateProbe(Base):
         fake.chmod(0o755)
         self.calls_log = self.home / "gates-calls.log"
         self.sb = self.home / "fakesb"
-        self.sb.write_text("#!/bin/sh\n"
+        self.sb.write_text("#!/bin/sh\n" + FAKE_SB_SOURCE +
                            "if [ \"$1\" = whoami ]; then\n  if [ \"$2\" = --json ]; then echo '{\"name\": \"worker\", \"repo\": \"acme/app\"}'; else echo worker; fi; exit 0; fi\n"
                            "if [ \"$1\" = review ] && [ \"$2\" = blockers ]; then\n  echo \"$@\" >> %r\n  [ -n \"$FAKE_BLOCKERS_EXIT\" ] && exit $FAKE_BLOCKERS_EXIT\n  [ -n \"$FAKE_BLOCKERS\" ] && echo \"$FAKE_BLOCKERS\"; exit 0; fi\n"
                            "if [ \"$1\" = gates-check ]; then\n  echo \"$@ own=$FLEET_SWITCHBOARD_OWN_GH\" >> %r\n"
@@ -19352,6 +19363,7 @@ class TestGhShimGateProbe(Base):
         if binary:
             environ["FLEET_SWITCHBOARD_BIN"] = str(self.sb)
         environ.update(env or {})
+        write_fake_env(self.home, environ)
         if self.log.exists():
             self.log.unlink()
         started = time.time()
@@ -19786,7 +19798,7 @@ class TestGhShim(Base):
         self.who = self.home / "whoami"
         # One process start answers: `whoami --json` gets the JSON a current switchboard gives; only FAKE_WHO_OLD=1 makes it an old
         # one (plain text, so the shim asks again with a second start: the fallback, and only its test wants that).
-        self.who.write_text("#!/bin/sh\n[ -n \"$FAKE_WHO_SLEEP\" ] && sleep \"$FAKE_WHO_SLEEP\"\n[ \"$1\" = whoami ] || exit 2\n"
+        self.who.write_text("#!/bin/sh\n" + FAKE_SB_SOURCE + "[ -n \"$FAKE_WHO_SLEEP\" ] && sleep \"$FAKE_WHO_SLEEP\"\n[ \"$1\" = whoami ] || exit 2\n"
                             "[ \"$FAKE_WHO_EXIT\" ] && exit $FAKE_WHO_EXIT\n"
                             "if [ \"$2\" = --json ] && [ -z \"$FAKE_WHO_OLD\" ]; then echo \"{\\\"name\\\": \\\"${FAKE_WHO:-platform}\\\"}\"; exit 0; fi\n"
                             "echo \"${FAKE_WHO:-platform}\"\n")
@@ -19799,6 +19811,7 @@ class TestGhShim(Base):
         if who:
             environ["FLEET_SWITCHBOARD_BIN"] = str(self.who)
         environ.update(env or {})
+        write_fake_env(self.home, environ)
         if self.log.exists():
             self.log.unlink()
         done = subprocess.run([sys.executable, str(SHIM)] + list(args), input=stdin, capture_output=True, text=True,
