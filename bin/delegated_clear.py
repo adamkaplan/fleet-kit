@@ -909,10 +909,26 @@ def _spans_from_decorators(node, numbers):
 
 
 # the names by which Python reaches a module's namespace from a statement; a module-level statement that names one is held (the bare-expression rule above is the default-deny, this covers the same reach inside an assignment)
-NAMESPACE_NAMES = {"globals", "vars", "locals", "setattr", "delattr", "exec", "eval", "compile", "__import__", "import_module", "__dict__", "modules", "__builtins__"}
+NAMESPACE_NAMES = {"globals", "vars", "locals", "setattr", "delattr", "getattr", "exec", "eval", "compile", "__import__", "import_module", "__dict__", "modules", "__builtins__", "builtins"}
 
 
 NAMESPACE_ATTRIBUTE_EXEMPT = {"compile"}   # `re.compile(...)` is an attribute named like the builtin and reaches no namespace; the BARE builtin `compile(...)` is still held
+
+
+def _import_time_statements(body):
+    """Every statement that RUNS when the module is imported: the module's own statements, those under an `if`, `try`, `with`, `for`, `while` or `match`, and the statements of a CLASS BODY (a class body runs at import time, and so does a class nested in it). Never the body of a def."""
+    for node in body:
+        yield node
+        if isinstance(node, ast.ClassDef):
+            yield from _import_time_statements(node.body)
+        elif isinstance(node, ast.Match):
+            for case in node.cases:
+                yield from _import_time_statements(case.body)
+        elif isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try, getattr(ast, "TryStar", ast.Try))):
+            for field in ("body", "orelse", "finalbody"):
+                yield from _import_time_statements(getattr(node, field, []))
+            for handler in getattr(node, "handlers", []):
+                yield from _import_time_statements(handler.body)
 
 
 def _shallow_nodes(node):
@@ -956,7 +972,7 @@ def _bound_here(node):
                 header.append(x.returns)
             todo.extend(header)
             continue
-        todo.extend(c for c in ast.iter_child_nodes(x) if x is node and not isinstance(c, ast.stmt) or x is not node and not isinstance(c, ast.stmt))
+        todo.extend(c for c in ast.iter_child_nodes(x) if not isinstance(c, ast.stmt))
     return out
 
 
@@ -1039,7 +1055,9 @@ def registrar_findings(base_src, head_src, rule):
         if len(kinds_) == 1 and kinds_[0][0] in ("def", "lambda"):
             unit = kinds_[0][1]
             if kinds_[0][0] == "lambda":
-                owner = next(n for n in _module_statements(head.body) if isinstance(n, ast.Assign) and n.value is unit)
+                owner = next((n for n in _module_statements(head.body) if isinstance(n, ast.Assign) and n.value is unit), None)
+                if owner is None:
+                    return None, "a function bound to a module name cannot be traced to its assignment"
                 unit.lineno, unit.end_lineno = owner.lineno, owner.end_lineno
             defs[bound] = unit
         else:
@@ -1087,13 +1105,16 @@ def registrar_findings(base_src, head_src, rule):
                     if ref not in done or (full and done[ref] is not None):
                         done[ref] = None if full else added
                         todo.append((ref, defs[ref], done[ref]))
-    for node in _module_statements(head.body):   # MODULE-LEVEL DEFAULT-DENY: `command_registrars` collects registrars out of the module's globals by name, so any added module-level statement that may write the namespace is held:
+    writers = {n.name for n in _module_statements(head.body) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and any(isinstance(y, (ast.Global, ast.Nonlocal)) or (isinstance(y, ast.Name) and y.id in NAMESPACE_NAMES) or (isinstance(y, ast.Attribute) and y.attr in NAMESPACE_NAMES and y.attr not in NAMESPACE_ATTRIBUTE_EXEMPT) for y in ast.walk(n))}   # a module function that binds a global or reaches a namespace: calling it (or naming it) at import time may write the module
+    for node in _import_time_statements(head.body):   # MODULE-LEVEL DEFAULT-DENY: `command_registrars` collects registrars out of the module's globals by name, so any added module-level statement that may write the namespace is held:
         if not _spans(node, added):                # a bare expression statement (`globals().update(...)`, `setattr(sys.modules[__name__], ...)`, `exec(...)`: a call is not a binding the other rules can read), and any statement that
             continue                                # reaches the namespace by a call or an attribute (`globals`, `vars`, `locals`, `setattr`, `exec`, `eval`, `compile`, `__import__`, `__dict__`, `modules`)
         if isinstance(node, ast.Expr) and not isinstance(node.value, ast.Constant):
             found.append(("a module-level expression statement", "calls", "a statement that may write the module's namespace"))
         for x in _shallow_nodes(node):
             reach = (isinstance(x, ast.Name) and x.id in NAMESPACE_NAMES) or (isinstance(x, ast.Attribute) and x.attr in NAMESPACE_NAMES and x.attr not in NAMESPACE_ATTRIBUTE_EXEMPT)
+            reach = reach or (isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id in writers)
             if reach:
                 found.append(("a module-level namespace reach", "calls", "a statement that may write the module's namespace"))
                 break

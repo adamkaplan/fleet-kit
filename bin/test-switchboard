@@ -34615,6 +34615,9 @@ class TestRegistrarFloor(LedgerBase):
         "globals().update": "globals().update({'add_zz_parsers': print})", "globals().setdefault": "globals().setdefault('add_zz_parsers', print)", "setattr on the module": "setattr(sys.modules[__name__], 'add_zz_parsers', print)",
         "sys.modules __dict__ store": "sys.modules[__name__].__dict__['add_zz_parsers'] = print", "exec of a def": "exec('def add_zz_parsers(sub): pass')", "eval": "eval('1')", "vars().update": "vars().update(add_zz_parsers=print)",
         "locals().update": "locals().update(add_zz_parsers=print)", "__import__": "__import__('os')", "importlib": "importlib.import_module('os')", "an assignment that exec's": "zz_x = exec('def add_zz_parsers(sub): pass')",
+        "delattr": "delattr(sys.modules[__name__], 'add_zz_parsers')", "a bare compile": "zz_c = compile('1', 'x', 'eval')", "__builtins__": "zz_b = __builtins__", "__dict__": "zz_d = zz_m.__dict__", "modules": "zz_s = sys.modules",
+        "a class body globals().update": "class ZzC:\n    globals().update(add_zz_parsers=print)", "a class body setattr": "class ZzC:\n    setattr(sys.modules[__name__], 'add_zz_parsers', print)", "a class body exec": "class ZzC:\n    exec('1')",
+        "a nested class body exec": "class ZzC:\n    class ZzD:\n        exec('1')", "a function that binds a global, called at import": "def zz_f():\n    global add_zz_parsers\n    add_zz_parsers = print\nzz_r = zz_f()", "getattr of builtins": "zz_g = getattr(builtins, 'glo' + 'bals')",
         "a bare call": "zz_register(print)", "a bare attribute call": "zz_registry.update(zz_other)", "a conditional namespace write": "globals().update({'add_zz_parsers': print}) if True else None",
     }
 
@@ -34629,6 +34632,18 @@ class TestRegistrarFloor(LedgerBase):
         self.assertEqual(self.regfake("ZZ_CONST = ('a', 'b')\n"), ([], None), "a literal assignment is not held")
         self.assertEqual(self.regfake("'a docstring-like constant statement'\n"), ([], None))
         self.assertEqual(self.regfake("ZZ_RE = re.compile('x')\n"), ([], None), "re.compile is an attribute named like the builtin and reaches no namespace")
+
+    def test_a_mutant_without_any_one_member_of_the_namespace_names_does_not_hold_the_statement_that_names_it(self):
+        for name in sorted(self.dc.NAMESPACE_NAMES):
+            statement = "zz_x = zz_m.%s\n" % name if name in ("__dict__", "modules") else "zz_x = %s\n" % name
+            with self.subTest(name):
+                got, why = self.dc.registrar_findings(self.FAKE, self.FAKE + statement, self.FAKE_RULE)
+                self.assertTrue(any(g[0] == "a module-level namespace reach" for g in got), (name, got))
+                module = self.mutant_module("NAMESPACE_NAMES = {", "NAMESPACE_NAMES = {")
+                module.NAMESPACE_NAMES = set(module.NAMESPACE_NAMES) - {name}
+                got, why = module.registrar_findings(self.FAKE, self.FAKE + statement, self.FAKE_RULE)
+                self.assertFalse(any(g[0] == "a module-level namespace reach" for g in got), "the mutant without %s still holds it" % name)
+        self.assertEqual(self.regfake("zz_c = re.compile('x')\n"), ([], None), "re.compile is not the builtin compile")
 
     def test_a_name_bound_twice_and_then_called_is_held_for_every_binding_form_and_every_second_value(self):
         """The root of the rebinding family: a call is allowed only when its name has exactly ONE binding in the registrar (a def or lambda of its own) or is a table name never bound: so whatever the second binding is, the call is held."""
@@ -34806,7 +34821,6 @@ class TestRegistrarFloor(LedgerBase):
                     bad.append("module namespace write: " + label)
             except Exception:
                 bad.append("module namespace write: " + label)
-        clean("re.compile is not a namespace reach", "ZZ_RE = re.compile('x')\n", base=None) if False else None
         try:
             got, why = dc.registrar_findings(fake, fake + "ZZ_RE = re.compile('x')\n", rule)
             if why or got != []:
@@ -34937,6 +34951,8 @@ class TestRegistrarFloor(LedgerBase):
         ("a registrar bound in another form is not held", "    extra = [(n, None) for n in _bound_here(node) if named(n)]", "    extra = []"),
         ("a helper bound twice stays a def", "if len(kinds_) == 1 and kinds_[0][0] in (\"def\", \"lambda\"):", "if kinds_[0][0] in (\"def\", \"lambda\"):"),
         ("the grammar allows every class", "kind in REGISTRAR_GRAMMAR or kind in GRAMMAR_NEUTRAL:", "kind in REGISTRAR_GRAMMAR or kind in GRAMMAR_NEUTRAL or True:"),
+        ("a class body is not an import-time statement", "        if isinstance(node, ast.ClassDef):\n            yield from _import_time_statements(node.body)", "        if False:\n            yield from _import_time_statements(node.body)"),
+        ("a function that binds a global is not tracked", "reach = reach or (isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id in writers)", "reach = reach"),
         ("a module expression statement is not held", "if isinstance(node, ast.Expr) and not isinstance(node.value, ast.Constant):", "if False:"),
         ("a module namespace reach is not held", "            if reach:\n                found.append((\"a module-level namespace reach\"", "            if False:\n                found.append((\"a module-level namespace reach\""),
         ("re.compile is a namespace reach", "x.attr not in NAMESPACE_ATTRIBUTE_EXEMPT", "True"),
