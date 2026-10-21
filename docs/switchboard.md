@@ -544,6 +544,7 @@ fleet metadata), so `--from` is never typed.
 | `fleet-switchboard orders remove --charter <n or owner/repo#n> <number>` | Chief of Staff only (PR 17) | Removes the order with that number in `orders list`; the last one takes the section with it. The legacy `Standing authority:` line is numbered but lies outside the section, so it is refused (edit it on GitHub) |
 | `fleet-switchboard orders copy --source <charter> --charter <charter>` | Chief of Staff only (#347); anyone else is refused, audited | Copies every order bullet of the source charter's `## Standing orders` section to the target, word for word with its original `(ordered by ..., date)` (nothing re-dated), one order at a time through the same writer, with the same read-back. Orders the target already holds are skipped, so a second run copies only what is missing. It ALWAYS prints a result: one line per order, one line per failure and one summary line; a failed order is named, the rest are still copied, and any failure exits 1. The 20-order limit applies (the overflow is reported as failures). The legacy `Standing authority:` line is not a bullet and is not copied (the output says so). Each copied order gets the owner's heads-up as an added one does, and one comment on the target charter. The source is never changed. Code: `bin/orders_copy.py` |
 | `fleet-switchboard pending <name>` | Anyone | What is pending for an agent, and why anything is held |
+| `fleet-switchboard cloud-clear [--dry-run]` | The operator, the Chief of Staff, or the worker's own boss (the same rule as `retire`); anyone else is refused and the refusal audited | Removes every cloud worker record whose pod is gone AND whose hard deadline has passed, and names each one it removes (`cleared <name> (pod gone, deadline <time>)`). It never touches a record whose pod still stands, nor one that is not past its deadline, and it refuses (exit 1) when the cluster could not be read: it never removes a record it cannot prove is gone. `--dry-run` lists what it would clear (`would clear <name>`) and removes nothing. It makes no `stop` call: there is no pod. Code: `bin/cloud_worker.py` |
 
 Each agent definition gains one paragraph: what a `[switchboard]` message is,
 that agents message each other with `send` and never by typing into a pane,
@@ -559,6 +560,72 @@ Agents the switchboard manages do not use `heartbeat-ack`.
 | `fleet-switchboard status` | Every fleet agent: session, pane, status, pending and held items with reasons; GitHub watches |
 | `fleet-switchboard audit` | The decision history for one agent or one issue |
 | `fleet-switchboard intents` | Every open ask, one line each with its Done-when (PR 6) |
+
+#### The cloud workers in `status` (#1056)
+
+`status` reads the cluster ONCE per run and prints ONE summary line under the
+cloud section, whatever the number of cloud workers:
+
+```
+cloud: nodes 3 (pool pool-a 2 x size-1, oldest 5d3h; pool pool-b 1 x size-2, oldest 40m); pods 7 (Running 5, Pending 1, Failed 1)
+```
+
+The nodes are by pool (the node's pool label) and size (its instance-type
+label), with the age of the oldest node of the pool; a label that is not there
+reads `unknown`. The pods are every pod of the workers' namespace, by phase.
+The read is bounded: the whole summary, the login included, is given 30 s; the
+launcher run is killed as a group at that bound. The line is never omitted and
+the command never hangs: when the cluster could not be read, the summary is
+replaced by the reason
+
+```
+cloud: cluster not read (<one line of reason>) after <n> s; nodes and pods unknown
+```
+
+**When the login may not list the nodes.** The narrow `cw-operator` role of
+today is namespaced: it reads pods, logs, exec, port-forward and secrets in
+the workers' namespace, and nothing cluster-wide, so it cannot list the nodes.
+Reading the nodes needs ONE more rule, cluster-wide: `list` on `nodes` (the
+core API group), and a `ClusterRoleBinding` of it to the `cw-operator` service
+account; a namespaced Role cannot grant it. That is a **separate owner step**
+(the manifest is a held pull request of its own), so the code works with or
+without it. Until it is applied, the node count comes from the **pod
+placement** (the distinct node names of the pods) and the line says so:
+
+```
+cloud: nodes at least 2 carry workers (from pod placement; pool, size and age need list on nodes; idle nodes are not visible); pods 7 (Running 5, Pending 1, Failed 1)
+```
+
+That count cannot see the idle nodes, and the line says that too.
+
+**A record whose pod is gone.** A cloud worker record (the local endpoint
+record) is written at launch and removed in exactly two places: the launch's
+own failure paths and `retire`. When a pod ends by itself (the reaper at its
+hard deadline, or idle), nothing removed the record, so the records piled up.
+`status` judged a record past its hard deadline by the clock alone: it read no
+cluster for it and printed `past its hard deadline <time> (not queried)`, so
+it could not say whether a pod still stood, and the person asking had to read
+the cluster by hand to count the machines. Now the ONE read answers it:
+
+- the hard deadline has passed and no pod of the read matches the record (by
+  the record's pod name and by the worker annotation): the record is **ended**,
+  and the line says `cloud <name>: <pod>, ended at <hard deadline> (no pod)`.
+  The JSON row carries `launcher_status: ended` and `ended_at`. The deadline is
+  the time it ended: the pod's real stop time is in the launcher's audit, not
+  in the record.
+- the hard deadline has passed and the pod still stands: the line says
+  `pod still present past its hard deadline <time> (phase <p>)`.
+- the cluster could not be read: the record is **never** called ended. It is
+  printed as before, `not queried`.
+
+**`cloud-clear`.** One command removes every record whose pod is gone and whose
+deadline has passed: its own boss, the Chief of Staff or the operator may run
+it (the same rule as `retire`, factored once). It reads the cluster once,
+refuses (exit 1, with the reason) when the cluster could not be read, never
+touches a record with a pod, names every record it removes, writes the audit
+line and the registry note that `retire` writes, and makes no `stop` call
+(there is no pod). `retire` of such a record ends it cleanly, as it always
+did.
 
 ### Intent lines (PR 6)
 
