@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""test-cloud-channel: offline tests for bin/cloud_channel.py (slice 2 of the plan on #1059, scenarios S7 and S8).
+
+The real handler is driven with a fake reviewer and a fake inbox. Each rule has one mutant: the module's source is changed in
+one place, and the same check must then fail (a check that passes on the mutant proves nothing).
+
+    bin/test-cloud-channel
+"""
+import sys
+import types
+import unittest
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+SOURCE = (BIN / "cloud_channel.py").read_text()
+
+
+def load(source=SOURCE):
+    module = types.ModuleType("cloud_channel_under_test")
+    exec(compile(source, "cloud_channel.py", "exec"), module.__dict__)
+    return module
+
+
+def mutant(old, new):
+    assert SOURCE.count(old) == 1, old
+    return load(SOURCE.replace(old, new))
+
+
+class FakeInbox:
+    def __init__(self):
+        self.items = {}
+
+    def has(self, recipient, key):
+        return any(i["key"] == key for i in self.items.get(recipient, []))
+
+    def put(self, recipient, item):
+        self.items.setdefault(recipient, []).append(item)
+
+    def count(self, recipient, key):
+        return sum(1 for i in self.items.get(recipient, []) if i["key"] == key)
+
+
+def reviewer_for(table):
+    """A fake TokenReview: token -> status dict; an unknown or expired token is not authenticated."""
+    def review(token, audience):
+        return table.get(token, {"authenticated": False})
+    return review
+
+
+def ok(agent, audiences=("fleet-switchboard",)):
+    return {"authenticated": True, "audiences": list(audiences),
+            "user": {"username": "system:serviceaccount:fleet:%s" % agent}}
+
+
+TABLE = {
+    "tok-a": ok("agent-a"),
+    "tok-wrong-aud": ok("agent-a", ("https://kubernetes.default.svc",)),
+    "tok-no-aud": {"authenticated": True, "user": {"username": "system:serviceaccount:fleet:agent-a"}},
+    "tok-user": {"authenticated": True, "audiences": ["fleet-switchboard"], "user": {"username": "alice"}},
+    # "tok-expired" is absent: the cluster answers authenticated false
+}
+
+
+def request(token="tok-a", sender="agent-a", key="k1", recipient="agent-b", text="hello", **body):
+    b = {"sender": sender, "recipient": recipient, "key": key, "text": text}
+    b.update(body)
+    return {"authorization": "Bearer " + token if token is not None else None, "body": b}
+
+
+def run(module, req):
+    inbox, lines = FakeInbox(), []
+    answer = module.handle(req, reviewer_for(TABLE), inbox, lines.append)
+    return answer, inbox, lines
+
+
+def check_sender_is_the_token(module, test):
+    answer, inbox, lines = run(module, request(sender="agent-c"))
+    test.assertEqual(answer["status"], 403)
+    test.assertEqual(len(lines), 1)
+    test.assertEqual(inbox.items, {})
+
+
+def check_one_item_for_a_repeated_key(module, test):
+    inbox, lines = FakeInbox(), []
+    for _ in range(2):
+        answer = module.handle(request(), reviewer_for(TABLE), inbox, lines.append)
+        test.assertEqual(answer["status"], 200)
+    test.assertEqual(inbox.count("agent-b", "k1"), 1)
+
+
+def check_audience_is_checked(module, test):
+    for token in ("tok-wrong-aud", "tok-no-aud"):
+        answer, inbox, lines = run(module, request(token=token))
+        test.assertEqual(answer["status"], 401, token)
+        test.assertEqual(inbox.items, {}, token)
+
+
+class TestChannel(unittest.TestCase):
+    def test_a_valid_token_for_another_sender_name_is_refused_and_audited_once(self):
+        check_sender_is_the_token(load(), self)
+
+    def test_the_audit_line_names_the_agents_and_never_the_token(self):
+        _, _, lines = run(load(), request(sender="agent-c"))
+        self.assertIn("agent-a", lines[0])
+        self.assertIn("agent-c", lines[0])
+        self.assertNotIn("tok-a", lines[0])
+
+    def test_the_same_keyed_message_twice_leaves_one_item(self):
+        check_one_item_for_a_repeated_key(load(), self)
+
+    def test_the_repeat_says_it_is_a_duplicate_and_a_new_key_is_delivered(self):
+        inbox, lines = FakeInbox(), []
+        first = load().handle(request(), reviewer_for(TABLE), inbox, lines.append)
+        again = load().handle(request(), reviewer_for(TABLE), inbox, lines.append)
+        other = load().handle(request(key="k2"), reviewer_for(TABLE), inbox, lines.append)
+        self.assertEqual((first["delivered"], again["delivered"], again["duplicate"], other["delivered"]), (True, False, True, True))
+        self.assertEqual(inbox.items["agent-b"][0]["sender"], "agent-a")
+        self.assertEqual(lines, [])
+
+    def test_an_expired_token_is_refused(self):
+        answer, inbox, lines = run(load(), request(token="tok-expired"))
+        self.assertEqual(answer["status"], 401)
+        self.assertEqual((inbox.items, len(lines)), ({}, 1))
+
+    def test_a_wrong_audience_token_is_refused(self):
+        check_audience_is_checked(load(), self)
+
+    def test_no_token_and_a_non_agent_identity_are_refused(self):
+        for req in (request(token=None), request(token="tok-user", sender="alice")):
+            answer, inbox, _ = run(load(), req)
+            self.assertEqual(answer["status"], 401)
+            self.assertEqual(inbox.items, {})
+
+    def test_a_reviewer_that_fails_lets_nothing_through(self):
+        def broken(token, audience):
+            raise OSError("cluster down")
+        inbox, lines = FakeInbox(), []
+        answer = load().handle(request(), broken, inbox, lines.append)
+        self.assertEqual(answer["status"], 503)
+        self.assertEqual(inbox.items, {})
+
+    def test_the_audience_is_passed_to_the_reviewer(self):
+        seen = []
+        load().handle(request(), lambda t, a: seen.append(a) or ok("agent-a"), FakeInbox(), lambda line: None)
+        self.assertEqual(seen, ["fleet-switchboard"])
+
+    def test_a_malformed_body_is_a_400_after_the_identity_checks(self):
+        for bad in (request(recipient="Bad Name"), request(key=""), request(text=5)):
+            answer, inbox, _ = run(load(), bad)
+            self.assertEqual(answer["status"], 400)
+            self.assertEqual(inbox.items, {})
+
+    def test_the_module_is_standard_library_only(self):
+        import ast
+        mods = {a.name.split(".")[0] for n in ast.walk(ast.parse(SOURCE)) if isinstance(n, ast.Import) for a in n.names}
+        self.assertEqual(mods - {"re"}, set())
+
+
+class TestMutants(unittest.TestCase):
+    """Each mutant breaks one rule; the matching check must fail on it."""
+
+    def failing(self, check, module):
+        with self.assertRaises(AssertionError):
+            check(module, self)
+
+    def test_a_handler_that_trusts_the_body_sender_fails_the_sender_check(self):
+        module = mutant("    if sender != agent:", "    if False:")
+        self.failing(check_sender_is_the_token, module)
+
+    def test_a_handler_without_key_dedupe_fails_the_one_item_check(self):
+        module = mutant("    if inbox.has(recipient, key):", "    if False:")
+        self.failing(check_one_item_for_a_repeated_key, module)
+
+    def test_a_handler_without_the_audience_check_fails_the_audience_check(self):
+        module = mutant("    if not isinstance(audiences, list) or audience not in audiences:", "    if False:")
+        self.failing(check_audience_is_checked, module)
+
+
+if __name__ == "__main__":
+    result = unittest.main(exit=False, verbosity=1).result
+    ok_ = result.wasSuccessful()
+    print("RESULT: %s" % ("PASS" if ok_ else "FAIL"))
+    sys.exit(0 if ok_ else 1)
