@@ -30,6 +30,7 @@ import time
 import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import retire_token  # noqa: E402  (the fresh push token of a retire)
 import run_record  # noqa: E402  (the run record: one module, one function the stop calls)
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")  # the switchboard's agent name rule
@@ -812,6 +813,14 @@ class Kube:
     def exec(self, name, *cmd, keep_stdout=False, timeout=120):
         return self.run(["exec", name, "--"] + list(cmd), keep_stdout=keep_stdout, timeout=timeout)
 
+    def exec_stdin(self, name, stdin, *cmd, keep_stdout=False, timeout=120):
+        """exec with a value on the command's standard input (`-i`): never an argument. The value is known to scrub() meanwhile."""
+        self.known.add(stdin)
+        try:
+            return self.run(["exec", "-i", name, "--"] + list(cmd), stdin=stdin, keep_stdout=keep_stdout, timeout=timeout)
+        finally:
+            self.known.discard(stdin)
+
 
 def _pod_repo(pod):
     try:
@@ -1240,7 +1249,18 @@ class Launcher:
 
     # -- end hook, stop, delete --
     def run_hook(self, name):
-        out = self.kube.exec(name, "cw-end-hook", keep_stdout=True)
+        """When this launcher can mint, a fresh token for the repository recorded on the pod (self.hook_repo, set by stop) goes to the hook on stdin."""
+        repo = getattr(self, "hook_repo", None)
+        self.hook_step = retire_token.STEP_PUSH
+        if repo and retire_token.configured(self.env):
+            token = retire_token.mint(self.env, repo)
+            if not token:
+                self.hook_step = retire_token.STEP_MINT
+                return {"pushed": False, "wip_branch": None, "error": "no fresh push token could be minted"}
+            out = self.kube.exec_stdin(name, token, "cw-end-hook", "--token-stdin", keep_stdout=True)
+            token = None
+        else:
+            out = self.kube.exec(name, "cw-end-hook", keep_stdout=True)
         try:
             res = json.loads(out.strip().splitlines()[-1])
         except (ValueError, IndexError):
@@ -1284,6 +1304,7 @@ class Launcher:
                 return {"worker": worker, "runtime_id": "pod/" + name, "pushed": False, "wip_branch": None,
                         "skipped": [], "note": "pod was %s; end hook not run" % phase, "record": info.get("record", "")}
             try:
+                self.hook_repo = _pod_repo(pod)
                 res = self.run_hook(name)
             except CloudError as e:
                 res = {"pushed": False, "wip_branch": None, "error": str(e)}
@@ -1292,7 +1313,8 @@ class Launcher:
             self._hook_record(info, dict(view, ran=True))
             if view["error"]:
                 self.kube.annotate(name, kept="true")  # the pod is kept: the commit is not safe yet
-                raise CloudError("end hook could not push, pod kept: %s" % view["error"], EXIT_HOOK)
+                raise CloudError("end hook could not push, pod kept (step: %s): %s; %s" % (
+                    getattr(self, "hook_step", retire_token.STEP_PUSH), view["error"], retire_token.RECOVERY), EXIT_HOOK)
             try:
                 self.kube.annotate(name, hook_ran="true")
             finally:
