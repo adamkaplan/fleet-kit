@@ -549,10 +549,12 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), re
         if len(data) + len(built) != before:
             grew = True
     bindings = {}   # every binding of every name in the unit, with the value it gets (None: a value that is not data): a name is data only if EVERY binding of it is data (`s = ""; s = os` makes `s` a module)
+    kinds = {}   # how each name is bound: "def" (a def or class), "lambda", or "other": a name is a function the registrar DEFINES only if every binding of it is one of the first two
     def bind(target, value):
         for y in ast.walk(target):
             if isinstance(y, ast.Name):
                 bindings.setdefault(y.id, []).append(value)
+                kinds.setdefault(y.id, []).append("lambda" if isinstance(value, ast.Lambda) and target is y else "other")
     for x in ast.walk(unit):
         if isinstance(x, ast.Assign):
             for t in x.targets:
@@ -568,10 +570,13 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), re
         elif isinstance(x, (ast.Import, ast.ImportFrom)):
             for a in x.names:
                 bindings.setdefault(a.asname or a.name.split(".")[0], []).append(None)
+                kinds.setdefault(a.asname or a.name.split(".")[0], []).append("other")
         elif isinstance(x, DEF_KINDS) and x is not unit:
             bindings.setdefault(x.name, []).append(None)
+            kinds.setdefault(x.name, []).append("def")
         elif isinstance(x, ast.ExceptHandler) and x.name:
             bindings.setdefault(x.name, []).append(None)
+            kinds.setdefault(x.name, []).append("other")
     if isinstance(arguments, ast.arguments):
         for a, _unread in param_defaults:
             bindings.setdefault(a.arg, []).append(None)
@@ -586,8 +591,16 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), re
                 data.discard(n)
                 settled = False
     parser = handle | built
-    defined = {x.name for x in ast.walk(unit) if isinstance(x, DEF_KINDS) and x is not unit}   # a function the registrar defines itself (its body is read with it)
-    defined |= {t.id for x in ast.walk(unit) if isinstance(x, ast.Assign) and isinstance(x.value, ast.Lambda) for t in x.targets if isinstance(t, ast.Name)}
+    defined = {n for n, k in kinds.items() if k and all(v in ("def", "lambda") for v in k) and n not in handle and n not in built}   # a function the registrar defines itself (its body is read with it), and never rebinds to anything else
+    def names_aliases(expr, seen=()):
+        """True when a `**` expansion may carry an `aliases` key: a dict with that key, a conditional of such, or a name bound to one (an expansion that is anything else cannot be read, and `unsafe` holds it)."""
+        if isinstance(expr, ast.Dict):
+            return any(isinstance(k, ast.Constant) and k.value == "aliases" for k in expr.keys) or any(k is None for k in expr.keys)
+        if isinstance(expr, ast.IfExp):
+            return names_aliases(expr.body, seen) or names_aliases(expr.orelse, seen)
+        if isinstance(expr, ast.Name) and expr.id not in seen:
+            return any(v is not None and names_aliases(v, seen + (expr.id,)) for v in bindings.get(expr.id, []))
+        return False
     resolving = set()
     def unsafe(expr):
         """None when `expr` is a value argparse may hold and, at parse time, run or apply without running anything of the closure: a literal, a container of them, a name that holds data, a builtin or helper of the allow table,
@@ -679,8 +692,8 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), re
         elif isinstance(x, ast.Call):
             callee = _root(x.func)
             fname = x.func.id if isinstance(x.func, ast.Name) else (x.func.attr if isinstance(x.func, ast.Attribute) else None)
-            if any(k.arg == "aliases" for k in x.keywords):
-                note(x, "calls", "aliases")   # `add_parser(..., aliases=[...])` names another command
+            if any(k.arg == "aliases" or (k.arg is None and names_aliases(k.value)) for k in x.keywords):
+                note(x, "calls", "aliases")   # `add_parser(..., aliases=[...])` or `**{"aliases": [...]}` names another command
             if fname == "set_defaults" and isinstance(x.func, ast.Attribute) and isinstance(x.func.value, ast.Name) and x.func.value.id in handle:
                 note(x, "calls", "set_defaults on the handed parser")   # it sets defaults every command shares
             if verb_chain(x):   # what argparse may RUN at parse time (`type=`, `action=`, a default it converts, `choices=`, ...): only values that run nothing of the closure; the free keywords hold text or a stored function

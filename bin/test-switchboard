@@ -33976,6 +33976,8 @@ class TestRegistrarFloor(LedgerBase):
             "a data name rebound to a non-closure module": ("s = ''\ns = os\ns.system('x')", ("calls", "s")),
             "aliases on add_parser": ("sub.add_parser('x', aliases=['review'])", ("calls", "aliases")),
             "set_defaults on the handed parser": ("sub.set_defaults(a=1)", ("calls", "set_defaults on the handed parser")),
+            "aliases by a ** expansion": ("sub.add_parser('x', **{'aliases': ['review']})", ("calls", "aliases")),
+            "aliases by a ** of a local dict": ("kw = {'aliases': ['review']}\nsub.add_parser('x', **kw)", ("calls", "aliases")),
             "type=eval with a default string": ("p = sub.add_parser('z')\np.add_argument('--x', default=\"__import__('os').getcwd()\", type=eval)", ("calls", "eval")),
             "type=exec": ("p = sub.add_parser('z')\np.add_argument('--x', default='1', type=exec)", ("calls", "exec")),
             "type=compile": ("p = sub.add_parser('z')\np.add_argument('--x', type=compile)", ("calls", "compile")),
@@ -33996,6 +33998,8 @@ class TestRegistrarFloor(LedgerBase):
             "a lambda handed a callable": ("(lambda g: g('x'))(os.system)", ("calls", "g")),
             "a callable as a default argument": ("def inner(g=os.system):\n    g('x')\ninner()", ("calls", "g")),
             "a function defined in the registrar that reaches a module": ("def inner():\n    os.system('x')\ninner()", ("calls", "os")),
+            "a def rebound to a dangerous callable then called": ("def f():\n    pass\nf = setattr\nf(sub, 'x', 1)", ("calls", "f")),
+            "a lambda rebound to a dangerous callable then called": ("f = lambda: 1\nf = os.system\nf('x')", ("calls", "f")),
             "a bare read": ("%s" % function, ("uses", function)),
             "a loop source": ("for f in [%s]:\n    pass" % function, ("uses", function)),
             "a closure name handed to a foreign call": ("print(%s)" % function, ("uses", function)),
@@ -34396,10 +34400,14 @@ class TestRegistrarFloor(LedgerBase):
         clean("choices of a computed module constant", reg("sub.add_parser('x').add_argument('--a', choices=STATES)"))
         clean("a local dict of safe values", reg("given = {'default': re.SUPPRESS} if sub else {}\nt = sub.add_parser('x')\nt.add_argument('--a', **given)"))
         has("a data name rebound to a module", reg("s = ''\ns = json\ns.dumps(1)"), ("calls", "s"))
+        has("aliases by **", reg("sub.add_parser('x', **{'aliases': ['review']})"), ("calls", "aliases"))
         has("aliases on add_parser", reg("sub.add_parser('x', aliases=['review'])"), ("calls", "aliases"))
         has("set_defaults on the handed parser", reg("sub.set_defaults(a=1)"), ("calls", "set_defaults on the handed parser"))
         clean("set_defaults on a parser it built", reg("t = sub.add_parser('x')\nt.set_defaults(a=1)"))
         clean("a name that stays data", reg("s = ''\ns.join(['a'])"))
+        has("a def rebound then called", reg("def f():\n    pass\nf = int\nf('1')"), ("calls", "f"))
+        has("a lambda rebound then called", reg("f = lambda: 1\nf = json\nf('1')"), ("calls", "f"))
+        clean("a def called", reg("def f(v):\n    return v\nsub.add_parser('x', help=f('a'))"))
         has("a call of an element of a local list", reg("l = []\nl.append(os.system)\nl[0]('x')"), ("calls", "l"))
         has("a loop variable over a list", reg("for f in [os.system]:\n    f('x')"), ("calls", "f"))
         clean("a loop over a tuple of strings", reg("t = sub.add_parser('x')\nfor f in ('a', 'b'):\n    t.add_argument('--' + f.replace('_', '-'))"))
@@ -34521,9 +34529,11 @@ class TestRegistrarFloor(LedgerBase):
         ("a built parser's actions are not its own", "or (isinstance(x.iter, ast.Attribute) and isinstance(x.iter.value, ast.Name) and x.iter.value.id in built)):\n                sources = [x.target]   # `for p in", "or False):\n                sources = [x.target]   # `for p in"),
         ("a chain of verbs is only one call long", "or verb_chain(inner)", "or False"),
         ("a rebound data name stays data", "if any(v is None or not _is_data(v, (data - {n}) | set(literals)) for v in bindings.get(n, [])):", "if False:"),
-        ("aliases are not held", "if any(k.arg == \"aliases\" for k in x.keywords):", "if False:"),
+        ("aliases are not held", "if any(k.arg == \"aliases\" or (k.arg is None and names_aliases(k.value)) for k in x.keywords):", "if False:"),
+        ("aliases by ** are not held", "(k.arg is None and names_aliases(k.value))", "False"),
         ("set_defaults on the handle is not held", "if fname == \"set_defaults\" and isinstance(x.func, ast.Attribute)", "if False and isinstance(x.func, ast.Attribute)"),
         ("a list is data", "    if isinstance(expr, ast.Tuple):\n        return all(_is_data(e, data) for e in expr.elts)", "    if isinstance(expr, (ast.Tuple, ast.List, ast.Set)):\n        return all(_is_data(e, data) for e in expr.elts)"),
+        ("a rebound def stays a function it defines", "defined = {n for n, k in kinds.items() if k and all(v in (\"def\", \"lambda\") for v in k)", "defined = {n for n, k in kinds.items() if k and any(v in (\"def\", \"lambda\") for v in k)"),
         ("a keyword is always free", "if key in free_keywords:\n                        continue", "if True:\n                        continue"),
         ("action takes any value", "if key == \"action\" and not (isinstance(value, ast.Constant) and isinstance(value.value, str)):", "if False:"),
         ("a value argparse may run is not checked", "bad = unsafe(value)\n                    if bad:", "bad = None\n                    if bad:"),
