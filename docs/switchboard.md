@@ -117,7 +117,7 @@ Evidence from real use:
 | Testing | Every promised behaviour is a scenario, run offline in CI against fakes and in the Lab against real v2 and herdr. Each scenario's control, with its safeguard switched off, must fail. See [Scenario testing](#scenario-testing). |
 | Harness boundary | One adapter contract with capability flags. OpenCode v2 is the only adapter built; a hook-based adapter is specified but not built. |
 | GitHub events | Webhooks relayed by `gh webhook forward`, supervised by the daemon. No timer-based polling; one bounded catch-up read of the gap after each forwarder start, from a read marker and forward only, because the forwarder does not replay (PR 5, and see "Reads move forward only"). |
-| Heartbeat | `fleet-heartbeat` is unchanged and keeps serving v1 panes. A pane the switchboard manages never carries the heartbeat's opt-in bell glyph. |
+| Heartbeat | `fleet-heartbeat` keeps serving v1 panes; since #973 it takes its opt-in from the registry, not from tab labels. A pane the switchboard manages is recorded with `bell: false` (the heartbeat's opt-in is the registry's `bell` field, changed with `fleet-heartbeat bell NAME on`, #973). |
 | Machine text | Always a v2 `synthetic` message tagged `[switchboard]`; never typed, never sent as a user message. The TUI does not show it (S3); the badge, `status` and the audit log do. |
 | Agent to agent | Agents message each other only with `fleet-switchboard send`, never by typing into a pane. |
 | Talking to orchestrators | You can talk to any orchestrator directly. Nothing extra is recorded; the issue already carries the intent. |
@@ -4892,6 +4892,39 @@ longer exists (then `relaunch` is the next step). It updates the `pane:` line of
 **`close-pane <pane-id>`** closes a pane no record names (an empty shell left behind). The Chief of Staff ALONE (its role, from the fleet identity). Every guard of one table (`BARE_PANE_GUARDS`) must pass, and each DENIES by default on a missing, empty or unreadable input (an unreadable herdr list, agent list, process list, pane-health record or a pane with no revision or no working directory is a refusal), each read fresh, and all of them (and the caller's role) judged again under one lock just before the close (only the instant between that last look and herdr's close remains): it is not your own pane; herdr lists it; no agent (herdr's agent list, the discovery, the pane-health record) names it; its foreground is only a shell (at least one process, and every one a shell: a pane that reports none is refused); its working directory (and its foreground's) is INSIDE a REGISTERED fleet worktree (not merely below an agent's own working directory, which is often the repository root the owner works in), so it does not close the owner's own shells (a guardrail, not a boundary: a shell the owner opened inside a registered worktree passes it); and it has been idle for `retire_idle_minutes` (default 10): herdr gives no activity time, so idle means herdr's revision of the pane stayed the same: the first run notes the revision (`bare-panes.json`) and refuses, a later run after the window passes. Every attempt is one audit row (`fleetpane.closed`, `fleetpane.close_refused` or `fleetpane.close_failed`: who, the pane, its cwd, why; never a command line).
 
 **Fail modes, written down:** a screen that cannot be read is `unknown`, never `detached` (the verdict that leads to a close needs positive evidence: a title that does not name the agent AND a screen that was read and does not either); names match as whole words or by session id. The close is refused unless the pane is not working, its tab holds ONLY that pane (`herdr tab get`), and the pane is judged again just before the close. A dead agent nobody repaired for 3 days is forgotten. **The permission `fleet-switchboard reattach *` therefore includes that guarded tab close** and nothing else: no raw herdr pane or key command; `--session` must belong to the named agent's fleet metadata (else refused).
+
+### Why a pane ended: `fleetpane.exit` and herdr's log
+
+**The cause, first.** On 21 October three orchestrator panes ended within about a second at 05:04Z. Herdr's own log showed two of the panes' children exit with code 130 (an interrupt), each followed by `pane session terminated ... signal=Hangup`, and the panes of other agents changed from OpenCode to none a second later. That is herdr's record of the panes' children being interrupted; **what sent the interrupt is not in any record**, so the cause of that event cannot be proven from the records. The switchboard's audit showed nothing until `fleetpane.dead` at 05:26:07Z, when the daemon noticed the dead panes 22 minutes later.
+
+Records that existed:
+
+- herdr's server log (`~/.config/herdr/herdr-server.log`): `pane child exited event="pane.exit" pane_id=378 status="ExitStatus { code: 130, signal: None }"` at 05:04:34Z and the same for pane 377 at 05:04:36Z, the `pane session terminated ... signal=Hangup` lines and the `agent changed ... agent=None` lines around them;
+- the audit's `fleetpane.dead` line at 05:26:07Z, which says a pane is gone and not why.
+
+Records that did not exist:
+
+- any audit line before `fleetpane.dead` at 05:26:07Z: nothing read herdr's log, so the exit code, the signal and the moment were not in the audit;
+- what heavy runs and background jobs were running at 05:04Z, and whether a fleet command (`close-pane`, `retire`) had asked for the close.
+
+**Now the daemon writes it down.** Each pass (`pane_exit_pass`) reads the last 262144 bytes of herdr's log (`herdr_log` in the config; the default is `~/.config/herdr/herdr-server.log`). It opens the file for reading only: it never writes, truncates or locks it. For each `pane.exit` line not yet seen it writes ONE audit line `fleetpane.exit` with:
+
+- `pane`: the number herdr's log calls `pane_id`, and `agent`: the registry's agent name when a recorded pane id is that number or ends `:p<number>`, else null;
+- `code`, `signal` (the signal of the exit status, else of the `pane session terminated` line of the same pane), and `herdr_time`;
+- `asked` and `by`: `asked` is true, with the requester in `by`, when a `fleetpane.closed` audit line (`close-pane` or `retire --close`) names the pane from 5 minutes before the exit to 30 seconds after it (a pane number is matched on its own or as the `p<number>` of a pane id, so it assumes herdr numbers panes uniquely);
+- `active`: the heavy runs and background jobs active at that second (from the slot records and the job records), each with its kind, name and age in seconds at that second, so a stray signal can be matched with what was running. A **job** is active when its record's start is at or before the exit and it had not ended then (alive now, or its `exit` file is newer than the exit). A **heavy run** is listed when it started at or before the exit and still holds its slot when the line is written: a slot record keeps only the start, so a run that held a slot at the exit and ended before the pass is **not** listed (`active_basis` says so on the line; `active_problem` appears when a record set could not be read).
+
+At most 20 exit lines are written per pass (`PANE_EXIT_MAX_PER_PASS`: 256 KiB of herdr's log holds at most about 1100 exit lines, so a mass event is written over a few passes; an exit not yet written is not marked seen). An exit is written once: the keys seen are kept in `pane-exit.json`, and an exit older than an hour when first seen is marked seen and not written (a restart does not replay history). When 3 or more panes end within 5 seconds of each other (`pane_exit_burst_min`, `pane_exit_burst_seconds`), one `fleetpane.exit_burst` line names them all and every Chief of Staff is told once, not once per pane.
+
+A quiet pass is cheap: the audit tail, the slot and job records and the `ps` of each alive job (at most `PANE_EXIT_MAX_JOBS`, 200, records) are read only when the log holds an exit to write, and then once per pass, not once per exit.
+
+**Crash note.** Each audit line (`fleetpane.exit`, `fleetpane.exit_burst`) is written first, and `pane-exit.json` is saved right after it, once per line, not once per pass. The order is audit first because a line twice reads as two exits, while an exit whose append failed is simply written by the next pass (a gap that fills). An append that raises never repeats an earlier line. A daemon that dies between the two writes repeats at most that one line on its next start; a failed write of the file while the daemon lives is kept in memory and does not repeat a line.
+
+Three settings are read, each declared with its default and checked when the config loads: `herdr_log` (a non-empty path), `pane_exit_burst_seconds` (a number above 0, at most 3600; default 5) and `pane_exit_burst_min` (a whole number from 2 to 1000; default 3).
+
+A log that is missing, unreadable, rotated or truncated gives one `fleetpane.exit_note` line (never a crash) and the pass goes on. `fleetpane.dead`, `fleetpane.detached` and `fleetpane.recovered` are unchanged.
+
+To find why a pane ended: look for `fleetpane.exit` in the audit (`audit.jsonl`) for its code, signal and what was active, then herdr's log around `herdr_time`. Code 130 or a `SIGINT` means something interrupted the child.
 
 ### Preflight and the Chief of Staff's definition (#191 follow-up)
 
