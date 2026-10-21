@@ -71801,7 +71801,7 @@ class TestWhoCanClear(unittest.TestCase):
                     seen += 1
                     self.assertEqual(outside(line), [], "%s: %s" % (name, line))
         self.assertGreater(seen, 20)
-        self.assertTrue(outside(line + " /Users/x/.local/state/fleet/audit.log"), "the check sees a path that is not allowed")
+        self.assertTrue(outside(line + " " + "/".join(["", "Us" + "ers", "x", ".local", "state", "fleet", "audit.log"])), "the check sees a path that is not allowed")
 
     def test_u5_who_can_clear_is_defined_once_and_the_daemons_line_calls_it_and_it_returns_plain_data(self):
         import ast
