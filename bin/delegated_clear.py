@@ -810,7 +810,10 @@ def _module_statements(body):
     """Every statement the module runs by itself: the body, and the bodies of an `if`, `try`, `with`, `for` or `while` in it; never the inside of a def or a class."""
     for node in body:
         yield node
-        if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try)):
+        if isinstance(node, ast.Match):
+            for case in node.cases:
+                yield from _module_statements(case.body)
+        if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try, getattr(ast, "TryStar", ast.Try))):
             for field in ("body", "orelse", "finalbody"):
                 yield from _module_statements(getattr(node, field, []))
             for handler in getattr(node, "handlers", []):
@@ -824,9 +827,9 @@ def _spans_from_decorators(node, numbers):
 
 
 def _bound_here(node):
-    """The names a module-level statement binds, derived from the same forms as `_name_bindings` (every Name in a Store or Del context, and the nodes of STRING_BINDERS and the imports and `global` statements) and read
-    WITHOUT descending into the body of a def, a class or a lambda (their locals are their own): an assignment of any form, a walrus or a match capture anywhere in the statement's own expressions, a loop or `with` target,
-    an `except` or `except*` name, a def, a class, an import."""
+    """The names a module-level statement binds BY ITSELF, derived from the same forms as `_name_bindings` (every Name in a Store or Del context, the nodes of STRING_BINDERS, imports and `global` statements): an assignment of any
+    form, a walrus or a match capture anywhere in the statement's own expressions or patterns, a loop or `with` target, an `except` name, a def, a class. Statements nested in it are NOT read here (`_module_statements` yields them
+    on their own), and nothing inside a def, a class or a lambda is (their locals are their own)."""
     out, todo = [], [node]
     while todo:
         x = todo.pop()
@@ -839,9 +842,16 @@ def _bound_here(node):
         elif isinstance(x, (ast.Global, ast.Nonlocal)):
             out.extend(x.names)
         if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            todo.extend(x.decorator_list if hasattr(x, "decorator_list") else [])   # a decorator runs in the enclosing scope; the body is the inner scope's
+            header = list(getattr(x, "decorator_list", [])) + list(getattr(x, "bases", [])) + [k.value for k in getattr(x, "keywords", [])]   # all of these run in the ENCLOSING scope (a walrus in one binds a module name)
+            arguments = getattr(x, "args", None)
+            if isinstance(arguments, ast.arguments):
+                header += list(arguments.defaults) + [d for d in arguments.kw_defaults if d is not None]
+                header += [a.annotation for a in arguments.posonlyargs + arguments.args + arguments.kwonlyargs + [v for v in (arguments.vararg, arguments.kwarg) if v is not None] if a.annotation is not None]
+            if getattr(x, "returns", None) is not None:
+                header.append(x.returns)
+            todo.extend(header)
             continue
-        todo.extend(ast.iter_child_nodes(x))
+        todo.extend(c for c in ast.iter_child_nodes(x) if x is node and not isinstance(c, ast.stmt) or x is not node and not isinstance(c, ast.stmt))
     return out
 
 
@@ -850,8 +860,9 @@ def _binds_registrar(node, patterns):
     (then the unit is None: it cannot be read), an import under a registrar name. Whatever `command_registrars` could pick up by name out of the module's globals."""
     def named(name):
         return isinstance(name, str) and any(p.fullmatch(name) for p in patterns)
+    extra = [(n, None) for n in _bound_here(node) if named(n)]   # every OTHER way a registrar name can be bound (a walrus, a loop or with target, an except name, a match capture): not readable, so held
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return [(node.name, node)] if named(node.name) else []
+        return ([(node.name, node)] if named(node.name) else []) + [e for e in extra if e[0] != node.name]
     if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
         targets = node.targets if isinstance(node, ast.Assign) else [node.target]
         out = []
@@ -860,10 +871,10 @@ def _binds_registrar(node, patterns):
                 if isinstance(y, ast.Name) and named(y.id):
                     value = getattr(node, "value", None)
                     out.append((y.id, value if isinstance(value, ast.Lambda) and isinstance(target, ast.Name) else None))
-        return out
+        return out + [e for e in extra if e[0] not in {o[0] for o in out}]
     if isinstance(node, (ast.Import, ast.ImportFrom)):
         return [(a.asname or a.name.split(".")[0], None) for a in node.names if named(a.asname or a.name.split(".")[0])]
-    return []
+    return extra
 
 
 class Findings(list):
@@ -905,37 +916,42 @@ def registrar_findings(base_src, head_src, rule):
     rebound = {b for node in _module_statements(head.body) for b in _bound_here(node)} & pure_builtins
     if rebound:   # the module rebinds a builtin of the table: it is no longer that builtin, so the table does not allow it (a registrar's call of it is held)
         pure_builtins = pure_builtins - rebound
-    found, defs, opaque = [], {}, set()   # the helpers: what the module binds, by any form, that is not the closure; `opaque` are the bindings that cannot be read
+    found, defs, opaque = [], {}, set()   # the helpers: what the module binds that is not the closure; `opaque` are the names that cannot be read as ONE def or lambda
+    head_bindings = {}   # every module-level binding of every name in the head file, from the one derivation (`_bound_here`), with how it binds: a def, a lambda, or other
     for node in _module_statements(head.body):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node.name not in names and node.name not in named:
-                defs[node.name] = node
-        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
-            for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
-                for y in ast.walk(target):
-                    if isinstance(y, ast.Name) and y.id not in names:
-                        if isinstance(getattr(node, "value", None), ast.Lambda) and isinstance(target, ast.Name):
-                            defs[y.id] = node.value
-                            node.value.lineno, node.value.end_lineno = node.lineno, node.end_lineno
-                        else:
-                            opaque.add(y.id)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            opaque.update((a.asname or a.name.split(".")[0]) for a in node.names if (a.asname or a.name.split(".")[0]) not in names)
-        elif isinstance(node, (ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try)):   # names these bind at module level (`for f in ...`, `with x as f`, `except E as f`)
-            targets = [node.target] if isinstance(node, (ast.For, ast.AsyncFor)) else [i.optional_vars for i in getattr(node, "items", []) if i.optional_vars is not None]
-            opaque.update(y.id for t in targets for y in ast.walk(t) if isinstance(y, ast.Name) and y.id not in names)
-            opaque.update(h.name for h in getattr(node, "handlers", []) if h.name and h.name not in names)
+        simple = {}
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not node.decorator_list:
+            simple[node.name] = ("def", node)
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and isinstance(node.value, ast.Lambda):
+            simple[node.targets[0].id] = ("lambda", node.value)
+        for bound in _bound_here(node):
+            head_bindings.setdefault(bound, []).append(simple.get(bound, ("other", None)))
+            if bound in simple:
+                simple.pop(bound)
+    for bound, kinds_ in head_bindings.items():
+        if bound in names or bound in named:
+            continue
+        if len(kinds_) == 1 and kinds_[0][0] in ("def", "lambda"):
+            unit = kinds_[0][1]
+            if kinds_[0][0] == "lambda":
+                owner = next(n for n in _module_statements(head.body) if isinstance(n, ast.Assign) and n.value is unit)
+                unit.lineno, unit.end_lineno = owner.lineno, owner.end_lineno
+            defs[bound] = unit
+        else:
+            opaque.add(bound)   # bound twice, decorated, imported, a loop or with target, a walrus, an augmented assignment, a match capture...: it cannot be read as one function
     module_values = {}   # every module-level binding of every name, with its value (None: not an expression we can read as data)
     for tree in (base, head):
         for node in _module_statements(tree.body):
+            valued = set()
             if isinstance(node, (ast.Assign, ast.AnnAssign)) and getattr(node, "value", None) is not None:
                 for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
                     for y in ast.walk(target):
                         if isinstance(y, ast.Name):
                             module_values.setdefault(y.id, []).append(node.value if isinstance(target, ast.Name) else None)
-            else:
-                for bound in _bound_here(node):
-                    module_values.setdefault(bound, []).append(None)   # a def, an import, a loop or with target, an augmented assignment: not data
+                            valued.add(y.id)
+            for bound in _bound_here(node):   # everything else the statement binds (a walrus in its value, a def, an import, a loop or with target, an augmented assignment...): not data
+                if bound not in valued:
+                    module_values.setdefault(bound, []).append(None)
     literals = set(module_values)   # data: every module-level name whose bindings are ALL immutable constant expressions (a literal, a tuple, `A + B` of data, a module's upper-case constant)
     settled = False
     while not settled:

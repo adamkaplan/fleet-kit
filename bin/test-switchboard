@@ -34528,6 +34528,49 @@ class TestRegistrarFloor(LedgerBase):
                 self.assertTrue(any(v == "calls" for _, v, _ in self.reg(text)[0]), label)
         self.assertEqual(self.found_unit("t = sub.add_parser('x')\nfor a in t._actions:\n    pass\nfor f in ('a', 'b'):\n    pass"), [])
 
+    MODULE_FORMS = {   # every statement form that can BIND a module-level name, with {N} the name and {V} the second value: one row each, in a plain position and (where the statement nests) under try*/match/if
+        "assign": "{N} = {V}", "augmented assign": "{N} += {V}", "annotated assign": "{N}: object = {V}", "walrus statement": "({N} := {V})", "walrus in an assignment value": "zz_y = ({N} := {V})",
+        "for target": "for {N} in ({V},):\n    pass", "with target": "with {V} as {N}:\n    pass", "except as": "try:\n    pass\nexcept Exception as {N}:\n    pass", "except* as": "try:\n    pass\nexcept* Exception as {N}:\n    pass",
+        "match capture": "match {V}:\n    case {N}:\n        pass", "match star": "match [{V}]:\n    case [*{N}]:\n        pass", "match mapping rest": "match {{}}:\n    case {{**{N}}}:\n        pass", "import as": "import os as {N}",
+        "from import as": "from os import path as {N}", "a def": "def {N}(*a):\n    pass", "a decorated def": "@print\ndef {N}(*a):\n    pass", "a class": "class {N}:\n    pass", "a walrus in a default": "def zz_f(a=({N} := {V})):\n    pass",
+        "a walrus in a base class": "class ZzC(({N} := {V})):\n    pass", "a walrus in an annotation": "def zz_f(a: ({N} := {V})):\n    pass", "a walrus in a return annotation": "def zz_f() -> ({N} := {V}):\n    pass",
+        "a walrus in a decorator": "@({N} := {V})\ndef zz_f():\n    pass", "a walrus in a lambda default": "zz_l = lambda a=({N} := {V}): a",
+    }
+    NESTINGS = {"plain": "{S}", "under an if": "if True:\n    {S}", "under try*": "try:\n    pass\nexcept* ValueError:\n    {S}", "under a match case": "match 1:\n    case _:\n        {S}", "under a with": "with zz_cm:\n    {S}"}
+
+    def test_every_module_level_binding_form_is_seen_for_a_registrar_name_a_table_builtin_and_a_helper_in_every_nesting(self):
+        for form, template in self.MODULE_FORMS.items():
+            for nesting, wrapper in self.NESTINGS.items():
+                if nesting != "plain" and form in ("a walrus in a default", "a walrus in a base class", "a walrus in an annotation", "a walrus in a return annotation", "a walrus in a decorator", "a walrus in a lambda default", "from import as", "import as"):
+                    continue
+                def place(name, value="print"):
+                    statement = template.replace("{N}", name).replace("{V}", value)
+                    return wrapper.replace("{S}", statement.replace("\n", "\n" + ("    " if nesting == "under an if" else "        " if nesting in ("under try*", "under a match case") else "    ") if nesting != "plain" else "\n"))
+                with self.subTest(form=form, nesting=nesting, what="a registrar name"):
+                    if form in ("a def", "a decorated def", "a class") and nesting != "plain":
+                        continue   # a def or class under a statement is READ as a registrar (its body linted), not held as unreadable: covered by the forms test above
+                    if form in ("a def", "a class"):
+                        continue
+                    got, why = self.reg(place("add_zz_parsers"))
+                    self.assertIsNone(why)
+                    self.assertTrue(any(r == "add_zz_parsers" for r, _, _ in got), (form, nesting, got))
+                if form in ("a def", "a decorated def", "a class", "import as", "from import as", "match mapping rest"):
+                    continue
+                with self.subTest(form=form, nesting=nesting, what="a table builtin"):
+                    got, why = self.reg(place("int") + "\ndef add_zz_parsers(sub):\n    sub.add_parser('x', help=int('1'))\n")
+                    self.assertIsNone(why)
+                    self.assertTrue(any(g[1:] == ("calls", "int") for g in got), (form, nesting, got))
+
+    def test_a_module_function_rebound_in_any_form_is_not_read_as_the_old_def(self):
+        for form, template in self.MODULE_FORMS.items():
+            if form in ("a def", "a decorated def", "a class", "import as", "from import as", "match mapping rest", "except as", "except* as"):
+                continue
+            with self.subTest(form=form):
+                text = "def zz_helper(v):\n    return v\n" + template.replace("{N}", "zz_helper").replace("{V}", "print") + "\ndef add_zz_parsers(sub):\n    zz_helper(sub)\n"
+                got, why = self.reg(text)
+                self.assertIsNone(why)
+                self.assertTrue(any(v == "calls" and "zz_helper" in n for _, v, n in got), (form, got))
+
     def test_a_name_bound_twice_and_then_called_is_held_for_every_binding_form_and_every_second_value(self):
         """The root of the rebinding family: a call is allowed only when its name has exactly ONE binding in the registrar (a def or lambda of its own) or is a table name never bound: so whatever the second binding is, the call is held."""
         function = self.pick()[0]
@@ -34800,6 +34843,11 @@ class TestRegistrarFloor(LedgerBase):
         ("set_defaults on the handle is not held", "if fname == \"set_defaults\" and isinstance(x.func, ast.Attribute)", "if False and isinstance(x.func, ast.Attribute)"),
         ("a list is data", "    if isinstance(expr, ast.Tuple):\n        return all(_is_data(e, data) for e in expr.elts)", "    if isinstance(expr, (ast.Tuple, ast.List, ast.Set)):\n        return all(_is_data(e, data) for e in expr.elts)"),
         ("a nested statement is not read for the table", "x = todo.pop()\n        if isinstance(x, ast.Name) and isinstance(x.ctx, (ast.Store, ast.Del)):\n            out.append(x.id)", "x = todo.pop()\n        if False:\n            out.append(x.id)"),
+        ("a module walrus in a default is not seen", "header += list(arguments.defaults) + [d for d in arguments.kw_defaults if d is not None]", "header += []"),
+        ("a module class base is not seen", "header = list(getattr(x, \"decorator_list\", [])) + list(getattr(x, \"bases\", []))", "header = list(getattr(x, \"decorator_list\", []))"),
+        ("a match body is not walked", "        if isinstance(node, ast.Match):\n            for case in node.cases:", "        if False:\n            for case in node.cases:"),
+        ("a registrar bound in another form is not held", "    extra = [(n, None) for n in _bound_here(node) if named(n)]", "    extra = []"),
+        ("a helper bound twice stays a def", "if len(kinds_) == 1 and kinds_[0][0] in (\"def\", \"lambda\"):", "if kinds_[0][0] in (\"def\", \"lambda\"):"),
         ("a with item is not read", "elif isinstance(x, (ast.With, ast.AsyncWith)):\n            for item in x.items:", "elif False:\n            for item in x.items:"),
         ("a for iterable is not read", "elif isinstance(x, (ast.For, ast.AsyncFor, ast.comprehension)) and not _built_iter(x.iter, built):", "elif False:"),
         ("a bare decorator of the unit is not read", "if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):\n            for expr in list(x.decorator_list)", "if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and x is not unit:\n            for expr in list(x.decorator_list)"),
