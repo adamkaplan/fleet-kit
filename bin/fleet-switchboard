@@ -30050,8 +30050,8 @@ def check_writable_target(path):
 
 
 def set_file_mode(path, mode):
-    """The file's mode, set when it is not the one asked for. True when it changed it. Never a mode that opens the
-    file up: the mode asked for is the one to set."""
+    """The file's mode, set when it is not the one asked for. True when it changed it. The mode asked for is the
+    one to set: a private file never gets a wider one."""
     try:
         info = os.lstat(str(path))
     except OSError:

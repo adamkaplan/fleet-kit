@@ -222,6 +222,12 @@ user unit (Linux), loads it, and starts it at login. Nothing secret is written: 
 
 Turn it off: `fleet-switchboard install --uninstall` unloads and removes it (with the switchboard's own service); `--uninstall --no-service` removes the reaper too and leaves the switchboard's own service. A file at that path that the installer did not write is named and left alone. Only one reaper runs at a time: a hand-started `cloud-worker reap --loop` beside the service exits with `not started: another reaper holds the lock`. Path settings (`CW_CLOUD_TOKEN_FILE` and the others) must be absolute paths of plain characters; a pasted token is refused by name.
 
+Its log: `cloud-reaper-stderr.log` in the switchboard state directory (journalctl on Linux). Each time it ends it writes one line
+`<UTC time> reaper exiting: WHY`, and the service then restarts it.
+
+When the Mac sleeps, the reaper pauses. Workers keep their pod-side floor (the pod's own limit, the cap plus 300 s, PR #880 once it
+merges), so a sleeping Mac delays a stop but cannot leave a worker running past that floor.
+
 ### The reaper alone (nothing else on the machine)
 
 `fleet-switchboard install --cloud-reaper-only` installs and loads the reaper's own service and nothing else. It writes the reaper's service file (mode `0600`) and the state directory (the reaper's log), and loads the service; it leaves alone the config, the profile pieces, the command link, the plugin link, the switchboard's own service and the daemon. Use it on a machine that runs the reaper and not the switchboard: a dry run (`--dry-run`) prints what it would do and writes nothing.
@@ -229,12 +235,6 @@ Turn it off: `fleet-switchboard install --uninstall` unloads and removes it (wit
 The way back is the existing removal: `fleet-switchboard install --uninstall --no-service` unloads the reaper's job and removes its file, and leaves the switchboard's own service alone. The full `install --uninstall` removes more than the reaper (it also unlinks the herdr plugin and removes the profile pieces), so on a machine with a full install it removes the whole kit.
 
 The settings of the service: when your own settings file (`~/.config/fleet-switchboard/cloud.env`) exists, the service carries none of the keys that file holds — the file is then the only source of them, and a key set differently in the file and in the service makes every start of the reaper refuse. Without that file the service copies the non-secret `CW_*` settings of the shell that runs the install, as `--with-cloud-reaper` always did.
-
-Its log: `cloud-reaper-stderr.log` in the switchboard state directory (journalctl on Linux). Each time it ends it writes one line
-`<UTC time> reaper exiting: WHY`, and the service then restarts it.
-
-When the Mac sleeps, the reaper pauses. Workers keep their pod-side floor (the pod's own limit, the cap plus 300 s, PR #880 once it
-merges), so a sleeping Mac delays a stop but cannot leave a worker running past that floor.
 
 ## 5. Known gaps
 
