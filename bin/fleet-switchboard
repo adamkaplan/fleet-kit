@@ -15478,34 +15478,74 @@ def blocked_kind(engine, observation):
             "the Chief of Staff may resume it with one `poke`, which is audited")
 
 
-BLOCKED_HELD_SENDS = "blocked-held-sends.json"   # {agent: [{"from", "at"}]}: sends refused while it was blocked (a `send` stores nothing, so the report counts them here)
-BLOCKED_HELD_KEEP = 100
+BLOCKED_HELD_SENDS = "blocked-held-sends.json"   # {agent: {"rows": [{"from", "at"}]}}: sends refused while it was blocked (a `send` stores nothing, so the report counts them here)
+BLOCKED_LOCK = "blocked-alert.lock"
+BLOCKED_HELD_KEEP = 100      # rows kept per agent: the recorded case held 11 messages in 2.5 hours, so this is about nine times that
+BLOCKED_HELD_AGENTS = 64     # agents kept in the file: the number blocked at once in a fleet is a handful; 64 is far above any real fleet
+BLOCKED_SENDER_CHARS = 80    # a sender is a fleet agent name (NAME_RE), so a longer string is not a name
+BLOCKED_LINE_SENDERS = 10    # senders named in a line, then "and N more"
+BLOCKED_LINE_REMINDERS = 5   # reminders named in a line, then "and N more"
+BLOCKED_LINE_CHARS = 1200    # the whole line
+
+
+@contextmanager
+def blocked_lock(state_dir):
+    """Serialises the `send` command and the daemon around every read-modify-write of blocked-alert.json and blocked-held-sends.json."""
+    fd = os.open(str(Path(state_dir) / BLOCKED_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def blocked_update(state_dir, name, change):
+    """The one write path of the two state files: read, `change(state)` and write, under `blocked_lock`, through the atomic `_write_small`.
+    `change` returns the new state, or None to write nothing. Returns the state as it was written (or read)."""
+    with blocked_lock(state_dir):
+        state = _read_small(state_dir, name)
+        new = change(state)
+        if new is None:
+            return state
+        _write_small(state_dir, name, new)
+        return new
 
 
 def note_held_send(state_dir, recipient, sender, now, observation):
-    """A `send` held for a blocked agent is remembered (who, when) so a long block can name it. Never raises: the delivery path is not its business."""
+    """A `send` held for a blocked agent is remembered (who, when) so a long block can name it. Never raises: the delivery path is not its
+    business, and the hold itself is audited (`hold`), so a row lost to a full disk costs the count, not the message's record."""
     if state_dir is None or observation is None or observation.status != "blocked" or hold_reason(observation) is None:
         return
+
+    def add(state):
+        entry = state.get(recipient)
+        rows = [r for r in (entry.get("rows") if isinstance(entry, dict) else None) or [] if isinstance(r, dict)]
+        state[recipient] = {"rows": (rows + [{"from": _one_line(sender or "unknown", BLOCKED_SENDER_CHARS), "at": now}])[-BLOCKED_HELD_KEEP:]}
+        if len(state) > BLOCKED_HELD_AGENTS:   # the oldest agents' rows go first
+            newest = sorted(state, key=lambda n: max([r.get("at", 0) for r in state[n].get("rows", []) if _is_number(r.get("at"))] or [0]), reverse=True)
+            state = {n: state[n] for n in newest[:BLOCKED_HELD_AGENTS]}
+        return state
     try:
-        state = _read_small(state_dir, BLOCKED_HELD_SENDS)
-        rows = [r for r in state.get(recipient, {}).get("rows", []) if isinstance(r, dict)]
-        state[recipient] = {"rows": (rows + [{"from": sender or "unknown", "at": now}])[-BLOCKED_HELD_KEEP:]}
-        _write_small(state_dir, BLOCKED_HELD_SENDS, state)
+        blocked_update(state_dir, BLOCKED_HELD_SENDS, add)
     except OSError:
         pass
+
+
+def _named(items, limit):
+    shown = list(items)[:limit]
+    return ", ".join(shown) + (" and %d more" % (len(items) - limit) if len(items) > limit else "")
 
 
 def blocked_line(engine, observation, since, now, held, kind):
     minutes = int((now - since) // 60)
     reminders = [r for r in read_reminders(engine.state_dir) if r.get("to") == observation.name and r.get("from") == observation.name
                  and isinstance(r.get("at"), (int, float)) and since <= r["at"] <= now]
-    pending = held   # the senders of what is held, one per message
-    senders = sorted(set(pending))
+    senders = sorted({_one_line(str(who), BLOCKED_SENDER_CHARS) for who in held})   # `held` is one sender per message
     text = "%s has been blocked for %d minutes (since %s) on %s." % (observation.name, minutes, iso(since), kind)
-    text += " Held for it: %d message%s from %s." % (len(pending), "" if len(pending) == 1 else "s", ", ".join(senders) or "nobody")
+    text += " Held for it: %d message%s from %s." % (len(held), "" if len(held) == 1 else "s", _named(senders, BLOCKED_LINE_SENDERS) or "nobody")
     if reminders:
-        text += " Its own reminders due during the block: %s." % ", ".join("%s due %s" % (r["id"], iso(r["at"])) for r in reminders)
-    return text
+        text += " Its own reminders due during the block: %s." % _named(["%s due %s" % (r["id"], iso(r["at"])) for r in reminders], BLOCKED_LINE_REMINDERS)
+    return _one_line(text, BLOCKED_LINE_CHARS)
 
 
 def blocked_tick(engine, discovery, held):
@@ -15514,12 +15554,10 @@ def blocked_tick(engine, discovery, held):
     section = blocked_alert_section(engine.config)
     if section is None or discovery is None or engine.state_dir is None:
         return []
-    now, state, done = engine.now(), _read_small(engine.state_dir, BLOCKED_ALERT_STATE), []
-    refused = _read_small(engine.state_dir, BLOCKED_HELD_SENDS)
+    now, state, done = engine.now(), blocked_update(engine.state_dir, BLOCKED_ALERT_STATE, lambda _: None), []
     waiting = {n for n, o in discovery.agents.items() if o.status == "blocked"}
-    if set(refused) - waiting:   # a send held for an agent that is no longer blocked is forgotten
-        refused = {n: v for n, v in refused.items() if n in waiting}
-        _write_small(engine.state_dir, BLOCKED_HELD_SENDS, refused)
+    refused = blocked_update(engine.state_dir, BLOCKED_HELD_SENDS,
+                             lambda found: {n: v for n, v in found.items() if n in waiting} if set(found) - waiting else None)   # a send held for an agent that is no longer blocked is forgotten
     cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None)
 
     def tell(observation, text, event, detail):
@@ -15546,7 +15584,8 @@ def blocked_tick(engine, discovery, held):
             changed = True
         plan = held.get(name)
         messages = [fact.sender or "unknown" for fact in (plan.pending if plan is not None else [])]
-        messages += [str(r.get("from") or "unknown") for r in (refused.get(name) or {}).get("rows", []) if isinstance(r, dict)]
+        rows = (refused.get(name) or {}).get("rows")
+        messages += [str(r.get("from") or "unknown") for r in (rows if isinstance(rows, list) else []) if isinstance(r, dict)]
         if not messages:
             continue
         last = entry.get("reported")
@@ -15559,7 +15598,7 @@ def blocked_tick(engine, discovery, held):
         kind = blocked_kind(engine, seen)
         tell(seen, blocked_line(engine, seen, entry["since"], now, messages, kind), event, {"since": iso(entry["since"]), "held": len(messages)})
         entry["reported"] = now
-        _write_small(engine.state_dir, BLOCKED_ALERT_STATE, state)   # after each one: a crash repeats at most one
+        blocked_update(engine.state_dir, BLOCKED_ALERT_STATE, lambda _: state)   # after each one: a crash repeats at most one
         done.append((name, event.split(".")[1]))
     for name in sorted(set(state) - waiting):
         entry = state.pop(name)   # the block ended, or the agent is gone
@@ -15572,11 +15611,11 @@ def blocked_tick(engine, discovery, held):
         delivered = name not in held
         text = "%s was blocked from %s to %s (%d minutes); the block has ended and %s." % (
             name, iso(entry["since"]), iso(now), int((now - entry["since"]) // 60),
-            "the held messages were delivered" if delivered else "its messages are still held: %s" % held[name].reason)
+            "the held messages were delivered" if delivered else "its messages are still held: %s" % _one_line(held[name].reason, 200))
         tell(seen, text, "blocked.end", {"since": iso(entry["since"]), "delivered": delivered})
         done.append((name, "end"))
     if changed or done:
-        _write_small(engine.state_dir, BLOCKED_ALERT_STATE, state)
+        blocked_update(engine.state_dir, BLOCKED_ALERT_STATE, lambda _: state)
     return done
 
 

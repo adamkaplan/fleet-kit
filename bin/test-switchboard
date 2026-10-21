@@ -77815,6 +77815,125 @@ class TestBlockedReport(Base):
             with self.assertRaises(sb.ConfigError):
                 sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "blocked_alert": bad})
 
+    # ---- the state files: one lock, bounded lists (R-CODE-4, R-CODE-6)
+
+    def blocked_observation(self):
+        self.pane["status"] = "blocked"
+        return self.world.engine.discover(self.world.clock.now()).agents["coder"]
+
+    def assert_waits_for_the_lock(self, call):
+        """`call` runs in a thread while the test holds the lock: it must not finish until the lock is let go."""
+        import threading
+        done = threading.Event()
+        worker = threading.Thread(target=lambda: (call(), done.set()), daemon=True)
+        with sb.blocked_lock(self.world.state):
+            worker.start()
+            self.assertFalse(done.wait(0.4), "it wrote without the lock")
+        self.assertTrue(done.wait(5), "it did not finish once the lock was free")
+
+    def test_every_write_site_takes_the_one_lock_and_goes_through_the_helper(self):
+        observation = self.blocked_observation()
+        self.assert_waits_for_the_lock(lambda: sb.note_held_send(self.world.state, "coder", "cos", 1.0, observation))
+        discovery = self.world.engine.discover(self.world.clock.now())
+        self.assert_waits_for_the_lock(lambda: sb.blocked_tick(self.world.engine, discovery, {}))
+        self.assert_waits_for_the_lock(lambda: sb.blocked_update(self.world.state, sb.BLOCKED_ALERT_STATE, lambda s: None))
+        text = (BIN / "fleet-switchboard").read_text()
+        body = text.split("def blocked_update(", 1)[1].split("\ndef ", 1)[0]
+        outside = text.replace(body, "")
+        for name in ("BLOCKED_HELD_SENDS", "BLOCKED_ALERT_STATE"):
+            for line in outside.splitlines():
+                if "_write_small(" in line and name in line:
+                    self.fail("a write of %s bypasses blocked_update: %s" % (name, line.strip()))
+
+    def test_two_interleaved_senders_lose_no_row(self):
+        import threading
+        observation = self.blocked_observation()
+        workers = [threading.Thread(target=lambda n=n: sb.note_held_send(self.world.state, "coder", "s%d" % n, float(n), observation)) for n in range(12)]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join(10)
+        self.assertEqual(len(sb._read_small(self.world.state, sb.BLOCKED_HELD_SENDS)["coder"]["rows"]), 12)
+
+    def test_the_lists_are_bounded_and_the_next_over_is_cut(self):
+        observation = self.blocked_observation()
+        for n in range(sb.BLOCKED_HELD_KEEP + 1):
+            sb.note_held_send(self.world.state, "coder", "s%d" % n, float(n), observation)
+        rows = sb._read_small(self.world.state, sb.BLOCKED_HELD_SENDS)["coder"]["rows"]
+        self.assertEqual((len(rows), rows[0]["from"]), (sb.BLOCKED_HELD_KEEP, "s1"))
+        sb.note_held_send(self.world.state, "coder", "x" * 500, 1.0, observation)
+        self.assertEqual(len(sb._read_small(self.world.state, sb.BLOCKED_HELD_SENDS)["coder"]["rows"][-1]["from"]), sb.BLOCKED_SENDER_CHARS)
+        state = {"agent%d" % n: {"rows": [{"from": "a", "at": float(n)}]} for n in range(sb.BLOCKED_HELD_AGENTS)}
+        sb._write_small(self.world.state, sb.BLOCKED_HELD_SENDS, state)
+        sb.note_held_send(self.world.state, "coder", "cos", 10000.0, observation)
+        kept = sb._read_small(self.world.state, sb.BLOCKED_HELD_SENDS)
+        self.assertEqual(len(kept), sb.BLOCKED_HELD_AGENTS)
+        self.assertIn("coder", kept)
+        self.assertNotIn("agent0", kept, "the oldest agent goes first")
+
+    def test_the_line_names_at_most_so_many_senders_and_reminders_and_is_cut(self):
+        observation = self.blocked_observation()
+        now = self.world.clock.now()
+        ids = [sb.add_reminder(self.world.state, "coder", now - 10 + n, now - 600, "t", sender="coder")["id"] for n in range(sb.BLOCKED_LINE_REMINDERS + 1)]
+        senders = ["sender%02d" % n for n in range(sb.BLOCKED_LINE_SENDERS + 2)]
+        line = sb.blocked_line(self.world.engine, observation, now - 1500, now, senders, "x")
+        self.assertIn("and 2 more", line)
+        self.assertIn("and 1 more", line)
+        self.assertEqual(sum(1 for i in ids if i in line), sb.BLOCKED_LINE_REMINDERS)
+        self.assertLessEqual(len(sb.blocked_line(self.world.engine, observation, now - 1500, now, ["y" * 5000] * 3, "k" * 5000)), sb.BLOCKED_LINE_CHARS)
+
+    def test_a_corrupt_state_file_is_read_as_empty(self):
+        for name in (sb.BLOCKED_ALERT_STATE, sb.BLOCKED_HELD_SENDS):
+            (self.world.state / name).write_text("[1, 2")
+        self.block()
+        self.wait(25)
+        self.assertEqual(len(self.told("cos")), 1)
+        sb._write_small(self.world.state, sb.BLOCKED_HELD_SENDS, {"coder": {"rows": "nope"}})
+        self.passes()
+
+    def test_the_threshold_is_exact(self):
+        self.block()
+        self.world.tick(20 * 60 - 1)   # the block was first seen at the last pass of block(): 1199 s ago
+        self.passes()
+        self.assertEqual(self.told("cos"), [])
+        self.world.tick(1)
+        self.passes()
+        self.assertEqual(len(self.told("cos")), 1)
+
+    def test_a_block_that_ends_with_messages_still_held_says_so(self):
+        self.block()
+        self.wait(25)
+        self.pane["status"] = "idle"
+        self.world.v2.sessions[self.world.sessions["coder"]]["turn"] = None
+        self.world.herdr.panes[self.world.panes["coder"]]["status"] = "idle"
+        sb.blocked_tick(self.world.engine, self.world.engine.discover(self.world.clock.now()),
+                        {"coder": sb.Plan("coder", "hold", "coder has status unknown in herdr", [])})
+        self.assertTrue(any("still held: coder has status unknown" in e["detail"]["text"] for e in self.audits("blocked.end")))
+
+    def test_a_block_whose_agent_is_gone_says_nothing_and_a_new_session_restarts_the_clock(self):
+        self.block()
+        self.wait(25)
+        told = len(self.told("cos"))
+        del self.world.herdr.panes[self.world.panes["coder"]]
+        self.passes()
+        self.assertEqual((len(self.told("cos")), self.audits("blocked.end")), (told, []))
+        self.assertNotIn("coder", sb._read_small(self.world.state, sb.BLOCKED_ALERT_STATE))
+
+    def test_a_failure_in_the_tick_is_audited_and_never_stops_the_pass(self):
+        with mock.patch.object(sb, "blocked_tick", side_effect=RuntimeError("boom")):
+            report = self.world.engine.run_pass()
+        self.assertEqual([e["step"] for e in report["errors"]], ["blocked-alert"])
+
+    def test_no_chief_of_staff_and_a_boss_that_is_the_blocked_agent(self):
+        world = World(self, agents=(), config={})
+        world.add_agent("solo", fleet={"role": "coder", "reports_to": "solo"})
+        world.herdr.panes[world.panes["solo"]]["status"] = "blocked"
+        world.engine.send("x", "solo", "hello")
+        world.tick(1500)
+        world.engine.run_pass()
+        self.assertEqual(sb.blocked_tick(world.engine, world.engine.discover(world.clock.now()), {}), [])
+
+
     def test_a_pass_makes_no_gh_call(self):
         with mock.patch.object(sb.subprocess, "run", side_effect=AssertionError("a pass ran a process")), \
                 mock.patch("subprocess.Popen", side_effect=AssertionError("a pass ran a process")):
