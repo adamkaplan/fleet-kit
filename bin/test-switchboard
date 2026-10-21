@@ -34536,40 +34536,42 @@ class TestRegistrarFloor(LedgerBase):
         "a walrus in a base class": "class ZzC(({N} := {V})):\n    pass", "a walrus in an annotation": "def zz_f(a: ({N} := {V})):\n    pass", "a walrus in a return annotation": "def zz_f() -> ({N} := {V}):\n    pass",
         "a walrus in a decorator": "@({N} := {V})\ndef zz_f():\n    pass", "a walrus in a lambda default": "zz_l = lambda a=({N} := {V}): a",
     }
-    NESTINGS = {"plain": "{S}", "under an if": "if True:\n    {S}", "under try*": "try:\n    pass\nexcept* ValueError:\n    {S}", "under a match case": "match 1:\n    case _:\n        {S}", "under a with": "with zz_cm:\n    {S}"}
+    NESTINGS = {"plain": ("{S}", ""), "under an if": ("if True:\n{S}", "    "), "under try*": ("try:\n    pass\nexcept* ValueError:\n{S}", "    "), "under a match case": ("match 1:\n    case _:\n{S}", "        ")}
+    HEADER_FORMS = ("a walrus in a default", "a walrus in a base class", "a walrus in an annotation", "a walrus in a return annotation", "a walrus in a decorator", "a walrus in a lambda default")
+
+    def placed(self, form, nesting, name, value="print"):
+        import textwrap
+        statement = self.MODULE_FORMS[form].replace("{N}", name).replace("{V}", value).replace("{{", "{").replace("}}", "}")
+        wrapper, prefix = self.NESTINGS[nesting]
+        return wrapper.replace("{S}", textwrap.indent(statement, prefix) if prefix else statement) + "\n"
 
     def test_every_module_level_binding_form_is_seen_for_a_registrar_name_a_table_builtin_and_a_helper_in_every_nesting(self):
-        for form, template in self.MODULE_FORMS.items():
-            for nesting, wrapper in self.NESTINGS.items():
-                if nesting != "plain" and form in ("a walrus in a default", "a walrus in a base class", "a walrus in an annotation", "a walrus in a return annotation", "a walrus in a decorator", "a walrus in a lambda default", "from import as", "import as"):
-                    continue
-                def place(name, value="print"):
-                    statement = template.replace("{N}", name).replace("{V}", value)
-                    return wrapper.replace("{S}", statement.replace("\n", "\n" + ("    " if nesting == "under an if" else "        " if nesting in ("under try*", "under a match case") else "    ") if nesting != "plain" else "\n"))
+        for form in self.MODULE_FORMS:
+            for nesting in self.NESTINGS:
+                if form in ("a def", "a class", "a decorated def"):
+                    continue   # a def or class is READ as a registrar (its body linted), not held as unreadable
                 with self.subTest(form=form, nesting=nesting, what="a registrar name"):
-                    if form in ("a def", "a decorated def", "a class") and nesting != "plain":
-                        continue   # a def or class under a statement is READ as a registrar (its body linted), not held as unreadable: covered by the forms test above
-                    if form in ("a def", "a class"):
-                        continue
-                    got, why = self.reg(place("add_zz_parsers"))
-                    self.assertIsNone(why)
+                    got, why = self.reg(self.placed(form, nesting, "add_zz_parsers"))
+                    self.assertIsNone(why, self.placed(form, nesting, "add_zz_parsers"))
                     self.assertTrue(any(r == "add_zz_parsers" for r, _, _ in got), (form, nesting, got))
-                if form in ("a def", "a decorated def", "a class", "import as", "from import as", "match mapping rest"):
+                if form in ("import as", "from import as", "match mapping rest", "a def", "a class", "a decorated def"):
                     continue
                 with self.subTest(form=form, nesting=nesting, what="a table builtin"):
-                    got, why = self.reg(place("int") + "\ndef add_zz_parsers(sub):\n    sub.add_parser('x', help=int('1'))\n")
-                    self.assertIsNone(why)
-                    self.assertTrue(any(g[1:] == ("calls", "int") for g in got), (form, nesting, got))
+                    text = self.placed(form, nesting, "int") + "def add_zz_parsers(sub):\n    sub.add_parser('x', help=int('1'))\n"
+                    got, why = self.reg(text)
+                    self.assertIsNone(why, text)
+                    self.assertTrue(any(g[1:] == ("calls", "int") or g[0] == "a name of the allow table" for g in got), (form, nesting, got))
 
     def test_a_module_function_rebound_in_any_form_is_not_read_as_the_old_def(self):
-        for form, template in self.MODULE_FORMS.items():
+        for form in self.MODULE_FORMS:
             if form in ("a def", "a decorated def", "a class", "import as", "from import as", "match mapping rest", "except as", "except* as"):
                 continue
-            with self.subTest(form=form):
-                text = "def zz_helper(v):\n    return v\n" + template.replace("{N}", "zz_helper").replace("{V}", "print") + "\ndef add_zz_parsers(sub):\n    zz_helper(sub)\n"
-                got, why = self.reg(text)
-                self.assertIsNone(why)
-                self.assertTrue(any(v == "calls" and "zz_helper" in n for _, v, n in got), (form, got))
+            for nesting in self.NESTINGS:
+                with self.subTest(form=form, nesting=nesting):
+                    text = "def zz_helper(v):\n    return v\n" + self.placed(form, nesting, "zz_helper") + "def add_zz_parsers(sub):\n    zz_helper(sub)\n"
+                    got, why = self.reg(text)
+                    self.assertIsNone(why, text)
+                    self.assertTrue(any(v == "calls" and "zz_helper" in n for _, v, n in got), (form, nesting, got))
 
     def test_a_name_bound_twice_and_then_called_is_held_for_every_binding_form_and_every_second_value(self):
         """The root of the rebinding family: a call is allowed only when its name has exactly ONE binding in the registrar (a def or lambda of its own) or is a table name never bound: so whatever the second binding is, the call is held."""

@@ -546,6 +546,29 @@ def _name_bindings(unit):
     return out
 
 
+# ---- the registrar GRAMMAR (#964, the lint is default-deny BY GRAMMAR): the only ast node classes a registrar (and a helper it is read with) may contain. The table is MEASURED from the real registrars (every `add_<x>_parsers` of the
+# daemon file and of the registrar split, and the helper they call) by a test, which fails when the real code uses a class that is not here and when a class here is used by no real code and has no reason; a class that is not in the
+# table is held BY NAME, and so is a node class of a future Python (a test fails on an `ast` class that is in none of GRAMMAR, GRAMMAR_REASONS and the classes the grammar does not need to name).
+REGISTRAR_GRAMMAR = {
+    # statements
+    "FunctionDef": "a function the registrar defines itself (`def common(p, ...)`): its body is read with it",
+    "Assign": "`thing = sub.add_parser(...)`, `x, y = a, b`: every target and value is read by the binding rules",
+    "Expr": "`thing.add_argument(...)`: a call as a statement",
+    "For": "`for p in (a, b):`, `for action in parser._actions:`: a fresh target over an own parser or a literal (the binding rules hold anything else)",
+    "If": "`if x:` around flags: its test is read like any expression",
+    # expressions
+    "Call": "a call is read by the call rule (a method of an own parser, a defined function, a table name bound once)", "Attribute": "`thing.add_argument`, `argparse.SUPPRESS`: read by the use and store rules",
+    "Name": "read by the use, binding and call rules", "Constant": "a literal", "Tuple": "a tuple of values", "Dict": "a dict of keyword values (`**given`): its values are read like any argument",
+    "BinOp": "`'--' + flag`, `'%d' % n`", "IfExp": "`a if c else b`", "Compare": "`p is a`, `x == y`", "Subscript": "a load (`names[0]`): a store through one is held by the store rule", "keyword": "`type=int`: read by the argument rule",
+    # the structure of a function and of the contexts and operators the classes above carry
+    "arguments": "the parameters of a function", "arg": "a parameter: read as a binding", "Load": "an expression context", "Store": "a target context",
+    "Add": "an operator of BinOp", "Mod": "an operator of BinOp", "Eq": "an operator of Compare", "Is": "an operator of Compare",
+}
+# the node classes whose presence says nothing by itself and that the grammar need not name: the module root and the operators and contexts of classes the grammar already allows or that it holds anyway
+GRAMMAR_NEUTRAL = {"Module", "Interactive", "Expression", "FunctionType", "Del", "Param", "AugLoad", "AugStore", "Sub", "Mult", "Div", "FloorDiv", "Pow", "LShift", "RShift", "BitOr", "BitXor", "BitAnd", "MatMult",
+                   "And", "Or", "Not", "Invert", "UAdd", "USub", "NotEq", "Lt", "LtE", "Gt", "GtE", "IsNot", "In", "NotIn"}
+
+
 def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), readable=(), builtins=(), named_helpers=(), verbs=(), free_keywords=()):
     """[(verb, name)] a registrar (a function, a class, or the lambda a registrar name is assigned) does that a registrar may not, counting only the nodes that touch a line in `added` (`None`: every line). It is
     DEFAULT-DENY: a registrar sets up its own parsers and nothing else, so in it is a finding (named by the closure name when it touches one, else by what it touches): an import; a call of anything that is not a method of its
@@ -761,6 +784,15 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), re
             note(x, "rebinds", label(x.id))
         if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id in live and x.id not in own and (id(x) not in allowed or id(x) in callee_roots):   # THE USE RULE
             note(x, "uses", x.id)
+    parents = {id(c): n for n in ast.walk(unit) for c in ast.iter_child_nodes(n)}   # THE GRAMMAR: any node class outside the table is held by name (a node with no line is reported at its nearest ancestor that has one)
+    for x in ast.walk(unit):
+        kind = type(x).__name__
+        if x is unit and isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) or kind in REGISTRAR_GRAMMAR or kind in GRAMMAR_NEUTRAL:
+            continue
+        where = x
+        while not hasattr(where, "lineno") and id(where) in parents:
+            where = parents[id(where)]
+        note(where, "uses", "the statement or expression form %s, which a registrar may not contain" % kind)
     return sorted(found)
 
 
