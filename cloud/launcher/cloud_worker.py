@@ -184,6 +184,10 @@ class CloudError(Exception):
         self.code = code
 
 
+class PodChanged(Exception):
+    """The pod holding the name is not the one that was read (another uid, or gone): nothing was changed."""
+
+
 class _FreshNodeRace(Exception):
     """The pod's sandbox failed on the handler-not-known message: the node's containerd was not yet configured."""
 
@@ -791,11 +795,32 @@ class Kube:
     def list_pods(self):
         return json.loads(self.run(["get", "pods", "-l", "app=" + LABEL, "-o", "json"]))["items"]
 
-    def annotate(self, name, **kv):
-        self.run(["annotate", "pod", name, "--overwrite"] + ["cw/%s=%s" % (k.replace("_", "-"), v) for k, v in kv.items()])
+    def annotate(self, name, uid, **kv):
+        """Annotate the pod that was READ (its `uid`), never one of the same name that replaced it: a merge patch whose body carries
+        metadata.uid, which the API server refuses on a mismatch. Raises PodChanged when the pod is not that one (or is gone)."""
+        if not uid:
+            raise PodChanged("the pod carries no uid to bind to")
+        body = json.dumps({"metadata": {"uid": uid, "annotations": {"cw/%s" % k.replace("_", "-"): str(v) for k, v in kv.items()}}})
+        try:
+            self.run(["patch", "pod", name, "--type=merge", "--patch-file=/dev/stdin"], stdin=body)
+        except CloudError as e:
+            if any(w in str(e) for w in ("Conflict", "NotFound", "precondition", "Precondition", "immutable", "Invalid")):
+                raise PodChanged("the pod changed or is gone") from None
+            raise
 
-    def delete_pod(self, name):
-        self.run(["delete", "pod", name, "--ignore-not-found", "--wait=false"])
+    def delete_pod(self, name, uid=None):
+        """With a uid the delete is bound to that pod (DeleteOptions preconditions.uid): PodChanged when another pod holds the name now."""
+        if not uid:
+            return self.run(["delete", "pod", name, "--ignore-not-found", "--wait=false"])
+        body = json.dumps({"kind": "DeleteOptions", "apiVersion": "v1", "preconditions": {"uid": uid}})
+        try:
+            self.run(["delete", "--raw", "/api/v1/namespaces/%s/pods/%s" % (self.ns, name), "-f", "-"], stdin=body)
+        except CloudError as e:
+            if "NotFound" in str(e):
+                return None
+            if any(w in str(e) for w in ("Conflict", "recondition")):
+                raise PodChanged("the pod changed since it was read") from None
+            raise
 
     def delete_pod_and_wait(self, name):
         """Delete the pod and return only when it is gone (a recreate under the same name would find it terminating)."""
@@ -811,10 +836,16 @@ class Kube:
     def delete_run_secret(self, name):
         self.run(["delete", "secret", name + "-run", "--ignore-not-found"])
 
-    def delete(self, name):
-        """Delete the pod and both Secrets, each attempted even if another fails; names what REMAINS and how to delete it."""
+    def delete(self, name, uid=None):
+        """Delete the pod and both Secrets, each attempted even if another fails; names what REMAINS and how to delete it.
+        With a uid the pod delete is bound to the pod that was read; a pod that changed leaves all three whole (PodChanged)."""
         left = []
-        for kind, obj, fn in (("pod", name, self.delete_pod), ("secret", name + "-pw", self.delete_secret),
+        if uid:
+            self.delete_pod(name, uid)   # PodChanged here: nothing at all is deleted
+            pod_fn = lambda n: None
+        else:
+            pod_fn = self.delete_pod
+        for kind, obj, fn in (("pod", name, pod_fn), ("secret", name + "-pw", self.delete_secret),
                               ("secret", name + "-run", self.delete_run_secret)):
             try:
                 fn(name)
@@ -1299,6 +1330,7 @@ class Launcher:
 
         def go(info):
             pod = self._need(worker)
+            uid = ((pod or {}).get("metadata") or {}).get("uid")
             if nonce and pod:
                 info["rid"] = "pod/" + name
                 if ann(pod, "run-id") != nonce:   # another run's (or an unlabelled) worker of this name: nothing is changed
@@ -1318,7 +1350,7 @@ class Launcher:
             if phase in ("Failed", "Succeeded") and ann(pod, "kept") != "true":  # a pod kept for unpushed work is never deleted here
                 # No container is running, so no hook can run and a kept pod would only linger: delete it and its
                 # Secrets, and say so.
-                self._remove(name, nonce)
+                self._remove(name, nonce, uid)
                 print("cloud-worker: pod was %s; end hook not run; deleted" % phase, file=sys.stderr)
                 self._hook_record(info, {"ran": False, "pushed": False, "wip_branch": None, "skipped": [], "note": "pod was %s; end hook not run" % phase})
                 return {"worker": worker, "runtime_id": "pod/" + name, "pushed": False, "wip_branch": None,
@@ -1331,12 +1363,15 @@ class Launcher:
             self.last_hook = {k: view[k] for k in ("pushed", "wip_branch", "error")}
             self._hook_record(info, dict(view, ran=True))
             if view["error"]:
-                self.kube.annotate(name, kept="true")  # the pod is kept: the commit is not safe yet
-                raise CloudError("end hook could not push, pod kept: %s" % view["error"], EXIT_HOOK)
+                note = self._mark(name, uid, kept="true")  # the pod is kept: the commit is not safe yet
+                raise CloudError("end hook could not push, pod kept: %s%s" % (view["error"], "; " + note if note else ""), EXIT_HOOK)
+            note = ""
             try:
-                self.kube.annotate(name, hook_ran="true")
+                note = self._mark(name, uid, hook_ran="true")
             finally:
-                self._remove(name, nonce)  # the hook succeeded: whatever happens next, the pod and its Secrets go
+                self._remove(name, nonce, uid)  # the hook succeeded: whatever happens next, the pod and its Secrets go (that pod only)
+            if note:
+                raise CloudError(note, EXIT_REFUSED)
             skipped, note = [], ""
             try:
                 raw = res.get("skipped")
@@ -1352,24 +1387,45 @@ class Launcher:
                     "wip_branch": view["wip_branch"], "skipped": skipped, "record": info.get("record", "")}
         return self._audited(worker, "stop", go, audit_reason)
 
-    def _remove(self, name, nonce):
-        """Delete the pod and both Secrets (as `delete` does); with a nonce, only those that carry it (the pod, when there, matched already)."""
+    def _remove(self, name, nonce, uid=None):
+        """Delete the pod and both Secrets (as `delete` does); with a nonce, only those that carry it (the pod, when there, matched already).
+        With a uid the pod delete carries it as a precondition: a pod that changed since it was read is left whole, with a refusal."""
+        try:
+            return self._remove_bound(name, nonce, uid)
+        except PodChanged:
+            raise CloudError("pod/%s changed since it was read (another pod holds the name now); left whole" % name, EXIT_REFUSED)
+
+    def _remove_bound(self, name, nonce, uid):
         if not nonce:
-            return self.kube.delete(name)
+            return self.kube.delete(name, uid)
         self.run_id = nonce
         left = []
-        for kind, label, fn in (("pod", "pod/" + name, self.kube.delete_pod), ("secret", "secret/%s-pw" % name, self.kube.delete_secret),
+        changed = False
+        for kind, label, fn in (("pod", "pod/" + name, lambda n: self.kube.delete_pod(n, uid)), ("secret", "secret/%s-pw" % name, self.kube.delete_secret),
                                 ("run", "secret/%s-run" % name, self.kube.delete_run_secret)):
             try:
                 mine = self._mine(kind, name)
                 if mine:
-                    fn(name)
+                    try:
+                        fn(name)
+                    except PodChanged:
+                        changed = True
                 elif mine is False:
                     print("cloud-worker: %s is not this run's (its run id does not match); left whole" % label, file=sys.stderr)
             except CloudError:
                 left.append(label)
         if left:
             raise CloudError("delete incomplete; REMAINS: %s; delete each with: %s" % (", ".join(left), "; ".join(self._delete_cmd(l) for l in left)))
+        if changed:
+            raise PodChanged("pod changed")
+
+    def _mark(self, name, uid, **kv):
+        """Mark the pod that was read; a pod that changed is not marked (for hook-ran that leaves `delete` refusing: the safe side)."""
+        try:
+            self.kube.annotate(name, uid, **kv)
+            return ""
+        except PodChanged:
+            return "pod/%s changed since it was read (another pod holds the name now); not marked %s" % (name, ", ".join(k.replace("_", "-") for k in kv))
 
     def _hook_view(self, res):
         """The end hook's answer as it may be shown or kept: pushed a bool, wip_branch a scrubbed string or None, the
@@ -1437,7 +1493,10 @@ class Launcher:
             info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
             if ann(pod, "hook-ran") != "true" and not a.force:
                 raise CloudError("end hook has not run; use --force to delete anyway", EXIT_REFUSED)
-            self.kube.delete(name)
+            try:
+                self.kube.delete(name, (pod.get("metadata") or {}).get("uid"))
+            except PodChanged:
+                raise CloudError("pod/%s changed since it was read; left whole (run delete again)" % name, EXIT_REFUSED)
             return {"worker": worker, "runtime_id": "pod/" + name, "deleted": True}
         return self._audited(worker, "delete", go, a.reason or ("force" if a.force else ""))
 
@@ -1456,7 +1515,10 @@ class Launcher:
             if hard > parse_iso(ann(pod, "max-hard")):
                 raise CloudError("extension is past --max-hard", EXIT_REFUSED)
             idle = parse_duration(a.idle) if a.idle else int(ann(pod, "idle-seconds"))
-            self.kube.annotate(name, hard_deadline=iso(hard), idle_seconds=idle)
+            try:
+                self.kube.annotate(name, (pod.get("metadata") or {}).get("uid"), hard_deadline=iso(hard), idle_seconds=idle)
+            except PodChanged:
+                raise CloudError("pod/%s changed since it was read; not extended (run extend again)" % name, EXIT_REFUSED)
             return {"worker": worker, "runtime_id": "pod/" + name, "hard_deadline": iso(hard), "idle_seconds": idle}
         return self._audited(worker, "extend", go, a.reason or "")
 
