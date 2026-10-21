@@ -19200,7 +19200,7 @@ class TestGitShim(Base):
         helper.write_text("#!/bin/sh\n[ \"$GCM_INTERACTIVE\" = never ] && [ \"$GIT_TERMINAL_PROMPT\" = 0 ] && [ \"$(git config credential.interactive)\" = false ] || echo started >> %s\n" % starts)
         helper.chmod(0o755)
         (self.home / "private").mkdir(exist_ok=True)
-        (self.home / "private" / ".gitconfig").write_text("[credential]\n\thelper = %s\n" % helper)
+        self.helper_path = helper   # handed to git through GIT_CONFIG_COUNT in `lsremote`: no git configuration file is written
         return starts
 
     def lsremote(self, shim, env_drop=()):
@@ -19226,7 +19226,7 @@ class TestGitShim(Base):
         thread.start()
         real = shutil.which("git", path=SAFE_PATH) or shutil.which("git")
         env = {"PATH": "%s:%s" % (os.path.dirname(real), SAFE_PATH), "HOME": str(self.home / "private"), "GIT_CONFIG_NOSYSTEM": "1", "FLEET_REAL_GIT": real,
-               "XDG_CONFIG_HOME": str(self.home / "xdg-none")}
+               "XDG_CONFIG_HOME": str(self.home / "xdg-none"), "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": str(self.helper_path)}
         started = time.time()
         done = subprocess.run([sys.executable, str(shim), "ls-remote", "http://127.0.0.1:%d/x.git" % port], capture_output=True, text=True, env=env, timeout=30)
         took = time.time() - started
@@ -19273,16 +19273,48 @@ class TestGitShim(Base):
             self.assertEqual(len([r for r in rows if place in r]), 1, place)
         self.assertEqual(len(rows), 4)
 
-    def test_s7_u1_nothing_here_writes_the_global_git_configuration(self):
-        word = "glo" + "bal"
-        patterns = ("git config --" + word, '"config", "--' + word, "'config', '--" + word, "GIT_CONFIG_" + word.upper() + "=", "~/.git" + "config")
-        text = Path(__file__).read_text()
-        start = text.index("    # ---- #1050 (in TestGitShim")
-        block = text[start:text.index("\nclass ", start + 10)]
-        # the scanned code: this block, the shim, the heavy wrapper and the new document; the pod entrypoint's own `git config` is for the pod's HOME and predates this change
-        for name, body in (("tests", block), ("shim", GIT_SHIM.read_text()), ("heavy", (BIN / "heavy_slots.py").read_text())):
-            for pattern in patterns:
-                self.assertEqual(body.count(pattern), 0, (name, pattern))
+    # S7/U1: one table of every spelling of a write to git's configuration; the scan reads each ADDED line of this change (all files), and one mutant per spelling must fail it
+    _G, _S = "glo" + "bal", "sys" + "tem"
+    CONFIG_WRITE_FLAGS = ["--" + w for w in (_G, _S, "file", "add", "unset", "unset-all", "replace-all", "edit", "rename-section", "remove-section")]
+    CONFIG_WRITE_SPELLINGS = (   # (name, regex over one line, a hostile line that must be found)
+        ("config command with a write flag", r"\bconfig\b[^\n]*(?:%s)(?![\w-])" % "|".join(re.escape(f) for f in CONFIG_WRITE_FLAGS),
+         'os.system("git config --add --' + _G + ' credential.interactive false")'),
+        ("argv list with the flag", r"[\"']config[\"'][^\n]*[\"'](?:%s)[\"']" % "|".join(re.escape(f) for f in CONFIG_WRITE_FLAGS),
+         'run(["git", "config",  "--' + _G + '", "k"])'),
+        ("system scope", r"\bconfig\b[^\n]*--" + _S, 'os.system("git config --' + _S + ' a b")'),
+        ("file scope", r"\bconfig\b[^\n]*--file", 'os.system("git config --file ~/.config/git/config a b")'),
+        ("the home gitconfig path", r"\.git" + "config", 'open(os.path.expanduser("~")+"/.git' + 'config","a")'),
+        ("the XDG git directory", r"\.config/git\b|XDG_CONFIG_HOME[^\n]*[\"']git[\"']", 'path = os.path.join(xdg, ".config/git/config")'),
+        ("the global/system override variables", r"GIT_CONFIG_(?:%s|%s)\b" % (_G.upper(), _S.upper()), "GIT_CONFIG_" + _G.upper() + " = path"),
+        ("the plain write", r"git config --" + _G, 'os.system("git config --' + _G + ' k v")'),
+    )
+
+    @classmethod
+    def config_write_hits(cls, text):
+        return [(n, line) for line in text.splitlines() for n, rx, _ in cls.CONFIG_WRITE_SPELLINGS if re.search(rx, line)]
+
+    @staticmethod
+    def added_lines(diff):
+        return "\n".join(l[1:] for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++"))
+
+    def test_s7_u1_every_spelling_of_a_git_configuration_write_is_found_by_the_scan(self):
+        for name, rx, hostile in self.CONFIG_WRITE_SPELLINGS:
+            with self.subTest(name):   # one mutant per spelling: a scratch diff that adds the line must fail the scan
+                self.assertTrue(self.config_write_hits(self.added_lines("+++ b/x\n+" + hostile)), name)
+        for clean in ('env = {"GIT_CONFIG_NO' + 'SYSTEM": "1"}', "git config credential.interactive", 'run(["git", "config", "--get", "a.b"])'):
+            self.assertEqual(self.config_write_hits(clean), [], clean)
+
+    def test_s7_u1_no_file_of_this_change_writes_the_global_git_configuration(self):
+        base = None
+        for ref in ("origin/main", "main"):
+            probe = subprocess.run(["git", "-C", str(REPO), "merge-base", ref, "HEAD"], capture_output=True, text=True)
+            if probe.returncode == 0 and probe.stdout.strip():
+                base = probe.stdout.strip()
+                break
+        if base is None:
+            self.skipTest("no main to diff against (a shallow checkout)")
+        diff = subprocess.run(["git", "-C", str(REPO), "diff", base, "-U0", "--no-color"], capture_output=True, text=True, timeout=60).stdout
+        self.assertEqual(self.config_write_hits(self.added_lines(diff)), [])
 
 
 class TestGitStashGuard(Base):
