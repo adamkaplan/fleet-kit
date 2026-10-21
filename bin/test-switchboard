@@ -33985,6 +33985,8 @@ class TestRegistrarFloor(LedgerBase):
             "type= a closure function": ("p = sub.add_parser('z')\np.add_argument('--x', type=%s)" % function, ("calls", function)),
             "action= a closure function": ("p = sub.add_parser('z')\np.add_argument('--x', action=%s)" % function, ("calls", function)),
             "action=eval": ("p = sub.add_parser('z')\np.add_argument('--x', action=eval)", ("calls", "eval")),
+            "a call of an element of a local list": ("l = []\nl.append(os.system)\nl[0]('x')", ("calls", "l")),
+            "a call of a loop variable over a list": ("for f in [os.system]:\n    f('x')", ("calls", "f")),
             "a bare read": ("%s" % function, ("uses", function)),
             "a loop source": ("for f in [%s]:\n    pass" % function, ("uses", function)),
             "a closure name handed to a foreign call": ("print(%s)" % function, ("uses", function)),
@@ -34389,6 +34391,9 @@ class TestRegistrarFloor(LedgerBase):
         has("set_defaults on the handed parser", reg("sub.set_defaults(a=1)"), ("calls", "set_defaults on the handed parser"))
         clean("set_defaults on a parser it built", reg("t = sub.add_parser('x')\nt.set_defaults(a=1)"))
         clean("a name that stays data", reg("s = ''\ns.join(['a'])"))
+        has("a call of an element of a local list", reg("l = []\nl.append(os.system)\nl[0]('x')"), ("calls", "l"))
+        has("a loop variable over a list", reg("for f in [os.system]:\n    f('x')"), ("calls", "f"))
+        clean("a loop over a tuple of strings", reg("t = sub.add_parser('x')\nfor f in ('a', 'b'):\n    t.add_argument('--' + f.replace('_', '-'))"))
         clean("a pure builtin of the table", reg("sub.add_parser('x', default=int('1'), help=str(2))"))
         has("a builtin outside the table", reg("sorted(sub)"), ("calls", "sorted"))
         clean("a named helper is not read as part of the registrar", reg("t = sub.add_parser('x')\nt.add_argument('--i', type=hh)\nhh('1')"))
@@ -34509,6 +34514,7 @@ class TestRegistrarFloor(LedgerBase):
         ("a rebound data name stays data", "if any(v is None or not _is_data(v, (data - {n}) | set(literals)) for v in bindings.get(n, [])):", "if False:"),
         ("aliases are not held", "if any(k.arg == \"aliases\" for k in x.keywords):", "if False:"),
         ("set_defaults on the handle is not held", "if fname == \"set_defaults\" and isinstance(x.func, ast.Attribute)", "if False and isinstance(x.func, ast.Attribute)"),
+        ("a list is data", "    if isinstance(expr, ast.Tuple):\n        return all(_is_data(e, data) for e in expr.elts)", "    if isinstance(expr, (ast.Tuple, ast.List, ast.Set)):\n        return all(_is_data(e, data) for e in expr.elts)"),
         ("a keyword is always free", "if key in free_keywords:\n                        continue", "if True:\n                        continue"),
         ("action takes any value", "if key == \"action\" and not (isinstance(value, ast.Constant) and isinstance(value.value, str)):", "if False:"),
         ("a value argparse may run is not checked", "bad = unsafe(value)\n                    if bad:", "bad = None\n                    if bad:"),

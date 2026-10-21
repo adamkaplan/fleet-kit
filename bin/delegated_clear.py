@@ -715,12 +715,13 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), re
 
 
 def _is_data(expr, data):
-    """True for an expression that is a literal or built only from literals and names that hold them: a string, a number, a tuple of them, `"a" + b`."""
+    """True for an expression that is an IMMUTABLE literal or built only from them and names that hold them: a string, a number, a tuple of them, `"a" + b`. A list, a set or a dict is not data: it can be appended to
+    and then holds whatever was put in it."""
     if isinstance(expr, ast.Constant):
         return True
     if isinstance(expr, ast.Name):
         return expr.id in data
-    if isinstance(expr, (ast.Tuple, ast.List, ast.Set)):
+    if isinstance(expr, ast.Tuple):
         return all(_is_data(e, data) for e in expr.elts)
     if isinstance(expr, ast.BinOp):
         return _is_data(expr.left, data) and _is_data(expr.right, data)
