@@ -3424,6 +3424,7 @@ class TestApprovalCheck(Base):
         code, err = self.send("Approved at %s" % self.current(), issues=gh_issues)
         self.assertEqual(len(self.approved()), 1, err)
         self.world.audit_path.unlink()
+        self.world.v2.admissions = lambda sid, _o=self.world.v2.admissions: _o(sid)[1:]
         gh_issues[6] = {"done_when": "(1) first clause is stated here (2) changed", "parent": 5}
         self.refused("Approved at %s" % self.current(), issues=gh_issues)
 
@@ -3443,9 +3444,9 @@ class TestApprovalCheck(Base):
         for text in ("hello", "I Approved at %s" % self.current(), "not Approved at sha256:%s" % ("a" * 64)):
             code, err = self.send(text)
             self.assertEqual(code, 0, err)
-            self.assertEqual(err, "%s: send delivered to platform\n" % sb.PROG if "delivered" in err and err.count("\n") == 1 else err)
+            self.assertEqual(err.count("\n"), 1, err)
             self.assertNotIn("approval", err)
-            self.assertEqual(self.gh.calls, [], text)
+            self.assertEqual([c for c in self.gh.calls if "comments" in c[2]], [], text)   # the message path's own intent reads stay; the check adds none
         self.assertEqual(self.approved(), [])
 
     def test_the_documentation_shows_the_check_and_every_answer(self):
