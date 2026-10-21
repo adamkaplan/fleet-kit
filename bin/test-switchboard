@@ -36330,7 +36330,12 @@ class TestImpactHold(LedgerBase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    TWIN = True
+    twin_runs = None
+
     def under(self, who="cos", order=17, reason="the review confirms nothing touches credentials nor identity"):
+        if self.twin_runs and reason in ("the review confirms nothing touches credentials nor identity", "the review is clean and the change is a note"):   # #972: the judgement names the runs of the fixture
+            reason += ": %s" % ", ".join("#%d=%s" % (seq, level) for seq, _, level in self.twin_runs)
         return self.run_as(who, "impact", "clear", self.PR, "--under-order", str(order), "--reason", reason)
 
     def test_s1_the_chief_of_staff_clears_under_a_listed_order_and_it_is_recorded_as_her_act_under_that_order(self):
@@ -36881,6 +36886,7 @@ class TestImpactHold(LedgerBase):
         self.delegate(config=False)
 
     def ledger_reset(self):
+        self.twin_runs = None
         for name in (sb.plan_ledger.LEDGER_FILE, sb.plan_ledger.HEAD_FILE):
             self.world.state.joinpath(name).unlink(missing_ok=True)
 
@@ -36897,7 +36903,13 @@ class TestImpactHold(LedgerBase):
             entry["impact_action"] = {"H": "hold", "2": "second-review", ".": "none"}[cell["action"]]
         elif action != "auto" and action is not None:
             entry["impact_action"] = action
-        return sb.plan_ledger.append_entry(self.world.state, entry, self.world.clock.now())
+        stored = sb.plan_ledger.append_entry(self.world.state, entry, self.world.clock.now())
+        if self.TWIN and with_block and by == "rev" and role == "reviewer" and head == LEDGER_HEAD:   # #972: a clear by score needs a second counted run from another session: the earlier fixtures get one beside the first, same cell (a test of the two-run rule itself sets TWIN False)
+            twin = sb.plan_ledger.append_entry(self.world.state, dict(entry, by="rev2"), self.world.clock.now())
+            level = (sb.impact_floor.load_matrix()["cells"].get(severity) or {}).get(probability, {}).get("level")
+            if level:
+                self.twin_runs = (self.twin_runs or []) + [(stored["seq"], "rev", level), (twin["seq"], "rev2", level)]
+        return stored
 
     def cell_of(self, level):
         cells = sb.impact_floor.load_matrix()["cells"]
@@ -36979,6 +36991,7 @@ class TestImpactHold(LedgerBase):
 
     def two(self, a, b, by=("rev", "rev2"), blocks=(True, True), heads=(LEDGER_HEAD, LEDGER_HEAD)):
         """Two ratings (levels `a`, `b`); returns the reason naming both runs by ledger id and cell."""
+        self.TWIN = False
         ids = [self.rate(*self.cell_of(level), by=who, with_block=blk, head=h)["seq"] for level, who, blk, h in zip((a, b), by, blocks, heads)]
         return "both runs agree on it: #%d=%s, #%d=%s" % (ids[0], a, ids[1], b)
 
@@ -36992,6 +37005,7 @@ class TestImpactHold(LedgerBase):
     def test_972_one_counted_run_is_refused_naming_the_count(self):
         self.score_config("Serious")
         self.scored_pr()
+        self.TWIN = False
         self.rate(*self.cell_of("Low"))
         code, out, err = self.under(reason="the one run says it is low: #1=Low")
         self.refused(code, err, "1 counted", "2 required", LEDGER_HEAD[:8])
@@ -37051,9 +37065,9 @@ class TestImpactHold(LedgerBase):
     def test_972_the_reason_must_name_both_runs_with_their_own_cells(self):
         self.score_config("Serious")
         self.scored_pr()
-        self.two("Medium", "Low")
-        for reason, words in (("only the first run is named: #1=Medium", "#2"), ("both named: #1=Medium, #2=Serious", "wrong cell"), ("names the runs but no cell: #1 and #2", "its cell"),
-                              ("by rater only: rev=Medium", "#2")):
+        first, second = [int(x) for x in __import__("re").findall(r"#(\d+)=", self.two("Medium", "Low"))]
+        for reason, words in (("only the first run is named: #%d=Medium" % first, "#%d" % second), ("both named: #%d=Medium, #%d=Serious" % (first, second), "wrong cell"),
+                              ("names the runs but no cell: #%d and #%d" % (first, second), "its cell"), ("by rater only: rev=Medium", "#%d" % second)):
             code, out, err = self.under(reason=reason)
             self.assertEqual(code, 2, err)
             self.assertIn(words, err)
@@ -37555,7 +37569,11 @@ class TestImpactHold(LedgerBase):
                 self.scored_pr()
                 for record in records:
                     self.raw_record(**record)
-                code, out, err = self.under()
+                corroborated = next((r for r in records if isinstance(r.get("impact_severity"), str) and isinstance(r.get("impact_probability"), str)), None)
+                if corroborated is not None:
+                    self.raw_record(**dict(corroborated, by="rev2"))   # #972: a record that could count is corroborated by a second session, so the count is not what these shapes test
+                low_run = lambda n: "#%d=Low" % n
+                code, out, err = self.under(reason="the shapes under test: " + ", ".join(low_run(n) for n in range(1, len(records) + 2)))
                 self.assertEqual(code == 2, refused, err)
                 if refused:
                     self.assertEqual(self.deletes(), [])
@@ -37564,7 +37582,9 @@ class TestImpactHold(LedgerBase):
         self.score_config("Serious")
         self.scored_pr()
         self.raw_record(**valid)
-        self.assertEqual(self.under()[0], 0)
+        self.assertEqual(self.under(reason="the control, one run only")[0], 2, "one counted run is refused (#972)")
+        two = self.raw_record(**dict(valid, by="rev2"))
+        self.assertEqual(self.under(reason="the control: #1=Low, #%d=Low" % two["seq"])[0], 0)
 
     # ---- #835 round 4: the rating's inputs are immune to the shared parser (a registrar's defaults, a replaced parser, a wrapper), at the point of use
 
