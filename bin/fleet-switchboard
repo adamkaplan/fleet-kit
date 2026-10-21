@@ -25768,6 +25768,9 @@ JOB_WRAPPER = ('exit_path=$1; shift; '
                'finish() { printf "%s\\n" "$1" > "$exit_path.tmp" && mv "$exit_path.tmp" "$exit_path"; }; '
                'caught() { printf "signal %s\\n" "$1" > "$exit_path.reason"; kill -"${2:-$1}" "$child" 2>/dev/null; wait "$child"; finish "$((128 + $1))"; exit "$((128 + $1))"; }; '
                'trap "caught 15" TERM; trap "caught 1" HUP; trap "caught 2 15" INT; '
+               'missing() { printf "fleet-job: %s: %s\\n" "$1" "$2" >&2; finish "$3"; exit "$3"; }; '
+               'case "$1" in */*) [ -e "$1" ] || missing "$1" "No such file or directory" 127; { [ -x "$1" ] && [ ! -d "$1" ]; } || missing "$1" "Permission denied" 126;; '
+               '*) command -v "$1" >/dev/null 2>&1 || missing "$1" "command not found" 127;; esac; '
                'exec 3>&2 2>/dev/null; "$@" 2>&3 3>&- & child=$!; wait "$child"; code=$?; finish "$code"; exit "$code"')
 JOB_ENDED_MARK = "ended-recorded"   # in the job's directory: the one audit line of how it ended is written once
 JOB_LAST_SEEN_MAX = 160

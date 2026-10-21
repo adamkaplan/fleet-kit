@@ -58826,6 +58826,7 @@ class TestJobEndRecord(StandInPids, unittest.TestCase):
     SHELL_FAMILY = (
         ("uncatchable kill: no shell job notice", ["sh", "-c", "echo out; echo err >&2; exec sleep 60"], "kill9", "out\nerr\n", None),
         ("command not found: the code and message are the shell's, not a job notice", ["no-such-command-1008"], None, None, "127"),
+        ("absent path: 127", ["/no/such/dir-1008/cmd"], None, None, "127"),
         ("not executable: 126", ["/dev/null"], None, None, "126"),
         ("exits 3 with its own output", ["sh", "-c", "echo out; echo err >&2; exit 3"], None, "out\nerr\n", "3"),
         ("killed by the catchable TERM from outside: the wrapper says so", ["sh", "-c", "echo out; echo err >&2; exec sleep 60"], "term", "out\nerr\n", "143"),
@@ -58854,8 +58855,9 @@ class TestJobEndRecord(StandInPids, unittest.TestCase):
                         self.assertEqual(text, log_is)
                     else:
                         self.assertEqual(len(text.strip().splitlines()), 1, text)
-                        self.assertNotIn("fleet-job: line", text)
-                        self.assertIn(command[0].split("/")[-1] if command[0] != "/dev/null" else "/dev/null", text)
+                        # The wrapper itself says why the command could not start, in ONE fixed line, so no shell's own diagnostic
+                        # ("fleet-job: line 1:", "zsh:1:", "sh: 1:") reaches the log; the code is the wrapper's too.
+                        self.assertEqual(text, "fleet-job: %s: %s\n" % (command[0], "No such file or directory" if "/" in command[0] and exit_is == "127" else {"127": "command not found", "126": "Permission denied"}[exit_is]))
                     self.assertEqual(exit_path.read_text().strip() if exit_path.exists() else None, exit_is)
                     self.assertNotRegex(text, r"Killed|Terminated|Segmentation|\[[0-9]+\]")
 
