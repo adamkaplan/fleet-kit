@@ -34641,6 +34641,7 @@ class TestRegistrarFloor(LedgerBase):
         "ClassDef": "class K:\n    sub.add_parser('x')", "AsyncFunctionDef": "async def f():\n    sub.add_parser('x')", "JoinedStr": "x = f'{sub}'", "BoolOp": "x = sub and sub", "UnaryOp": "x = not sub",
         "Await": "async def f():\n    await sub", "Yield": "def f():\n    yield sub", "YieldFrom": "def f():\n    yield from sub", "Slice": "x = sub[1:2]", "Break": "for x in ('a',):\n    break", "Continue": "for x in ('a',):\n    continue",
         "AsyncFor": "async def f():\n    async for x in sub:\n        sub.add_parser('x')", "AsyncWith": "async def f():\n    async with sub as g:\n        sub.add_parser('x')", "TryStar": "try:\n    sub.add_parser('x')\nexcept* Exception:\n    sub.add_parser('y')",
+        "TypeAlias": "type ZzAlias = int", "TemplateStr": "x = t'{sub}'", "Interpolation": "x = t'{sub}'",   # the last three parse only on the Python that has them (3.12, 3.14): the loop below skips a class the running Python lacks
     }
 
     def test_the_grammar_is_measured_from_the_real_registrars_and_a_class_outside_it_is_held_by_name_and_a_future_class_is_not_silently_allowed(self):
@@ -34658,10 +34659,10 @@ class TestRegistrarFloor(LedgerBase):
         # completeness against the running Python: every statement and expression class is in the grammar, the neutral list or the rejects table, so a class of a future Python fails here instead of being allowed
         for name, node in vars(ast).items():
             if isinstance(node, type) and issubclass(node, (ast.stmt, ast.expr)) and node not in (ast.stmt, ast.expr) and not name.startswith("_"):
-                self.assertTrue(name in grammar or name in neutral or name in self.GRAMMAR_REJECTS or name in ("Constant", "Num", "Str", "Bytes", "NameConstant", "Ellipsis", "TypeAlias", "Name", "Expr", "Assign", "Call", "Attribute", "Tuple", "Subscript", "For", "If", "FunctionDef", "Starred"), "an ast statement or expression class in no table: %s" % name)
+                self.assertTrue(name in grammar or name in neutral or name in self.GRAMMAR_REJECTS or name in ("Constant", "Num", "Str", "Bytes", "NameConstant", "Ellipsis", "Name", "Expr", "Assign", "Call", "Attribute", "Tuple", "Subscript", "For", "If", "FunctionDef", "Starred"), "an ast statement or expression class in no table: %s" % name)
         for name, body in self.GRAMMAR_REJECTS.items():
             with self.subTest(name):
-                if name in grammar:
+                if name in grammar or not hasattr(ast, name):
                     continue
                 got = self.found_unit(body)
                 self.assertTrue(any(("form %s," % name) in n for _, v, n in got), (name, got))
