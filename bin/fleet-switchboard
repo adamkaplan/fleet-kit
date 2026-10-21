@@ -2904,6 +2904,37 @@ class DockerReapFacts:
 TEMP_JANITOR_FILE = "temp-janitor-daemon.json"
 TEMP_JANITOR_INTERVAL = 6 * 86400   # the weekly gate: never twice within 6 days
 TEMP_JANITOR_NAMES = 200            # names carried by one audit line (the count says the rest)
+TEMP_JANITOR_GATE_FILE = "temp-janitor-gate.json"   # {"rule", "preview", "sent", "count"}: the rule the last preview was made under (hashes and a count, never a name)
+TEMP_JANITOR_ACK_FILE = "temp-janitor-ack.json"     # {"rule", "preview", "by", "at"}: the recorded yes, written by `disk janitor-ack <preview>` only
+TEMP_JANITOR_PREVIEW_NAMES = 25     # names listed in the preview message (the count says the rest)
+
+
+def read_janitor_record(state_dir, name):
+    """(ok, dict): a missing file is (True, {}); one that cannot be read in full or is not an object of text and numbers is (False, {}): the doubt applies nothing."""
+    try:
+        with open(str(Path(state_dir) / name), "rb") as handle:
+            raw = json.loads(handle.read(4097).decode("utf-8"))
+    except FileNotFoundError:
+        return True, {}
+    except (OSError, ValueError, UnicodeError):
+        return False, {}
+    if not isinstance(raw, dict) or not all(isinstance(v, (str, int, float, bool)) for v in raw.values()):
+        return False, {}
+    return True, raw
+
+
+def janitor_apply_allowed(state_dir, rule):
+    """(allowed, state): True only when the last preview was SENT under THIS rule and a yes is recorded for that very preview. state is one of
+    `acked`, `no_preview` (none sent under this rule), `awaiting_ack` or `unreadable`. Every doubt is False."""
+    gate_ok, gate = read_janitor_record(state_dir, TEMP_JANITOR_GATE_FILE)
+    ack_ok, ack = read_janitor_record(state_dir, TEMP_JANITOR_ACK_FILE)
+    if not gate_ok or not ack_ok:
+        return False, "unreadable"
+    if gate.get("rule") != rule or gate.get("sent") is not True or not gate.get("preview"):
+        return False, "no_preview"
+    if ack.get("rule") == rule and ack.get("preview") == gate["preview"] and gate.get("nonce") and ack.get("nonce") == gate["nonce"]:   # the nonce is new for every preview: a yes given to an earlier one (the rule may have come back) never counts
+        return True, "acked"
+    return False, "awaiting_ack"
 
 
 class TempJanitorFacts:
@@ -2918,9 +2949,32 @@ class TempJanitorFacts:
 
     def __init__(self):
         self.engine, self.thread, self.noted = None, None, False
+        self.outbox = None   # (preview fingerprint, text) made by the thread, handed to the Chief of Staff by the next main-thread pass
 
     def bind(self, engine):
         self.engine = engine
+
+    def _hand_over(self, engine):
+        """The preview the thread made: ONE message to each Chief of Staff, keyed by the preview (so a repeat is never a second message); the gate is marked
+        `sent` only now, once there is someone to tell. With no Chief of Staff running it waits for the next pass."""
+        box = self.outbox
+        discovery = getattr(engine, "discovery", None)
+        chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff") if discovery is not None and not discovery.problems else []
+        if box is None or not chiefs:
+            return []
+        preview, rule, text = box
+        ok, gate = read_janitor_record(engine.state_dir, TEMP_JANITOR_GATE_FILE)
+        if not ok or gate.get("preview") != preview:
+            self.outbox = None   # the gate moved on or cannot be read: nothing is marked, and the next run makes a new preview
+            return []
+        try:
+            _write_small(engine.state_dir, TEMP_JANITOR_GATE_FILE, dict(gate, sent=True))
+        except OSError:
+            return []   # not marked sent: the next pass tries again (the same key is never delivered twice)
+        self.outbox = None
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "janitor.preview", "temp", {"rule": rule, "preview": preview, "count": gate.get("count"), "to": chiefs})
+        return [Fact("janitor.preview:%s" % preview, name, "janitor", text, engine.now(), sender="switchboard") for name in chiefs]
 
     def _last(self, state_dir):
         """(ok, time or None): a missing file is (True, None); a file that cannot be read in full is (False, None): the doubt keeps everything."""
@@ -2946,6 +3000,9 @@ class TempJanitorFacts:
             return []
         if self.thread is not None and self.thread.is_alive():
             return []
+        handed = self._hand_over(engine) if self.outbox is not None else []
+        if handed:
+            return handed
         ok, last = self._last(engine.state_dir)
         if not ok:
             if not self.noted:
@@ -2977,7 +3034,9 @@ class TempJanitorFacts:
         try:
             janitor = load_disk_janitor()
             cfg = janitor.settings(engine.config.get("temp_janitor"))
-            apply = cfg["daemon_apply"] is True
+            rule = janitor.rule_fingerprint(cfg)
+            allowed, gate_state = janitor_apply_allowed(engine.state_dir, rule)   # a changed rule, a missing yes or a record in doubt: nothing is applied
+            apply = cfg["daemon_apply"] is True and allowed
             temp = Path(cfg["dir"]) if cfg.get("dir") else janitor.default_dir()
             outcome = []
             started = time.monotonic()
@@ -2994,9 +3053,32 @@ class TempJanitorFacts:
             notes = [_plain(l, 200) for l in lines if not l.startswith(("removed ", "would remove "))][:20]
             detail = {"count": len(outcome), "bytes": sum(o["bytes"] for o in outcome), "names": [_plain(o["name"], 120) for o in outcome[:TEMP_JANITOR_NAMES]],
                       "budget_seconds": cfg["weekly_scan_seconds"], "used_seconds": used, "kept": kept, "notes": notes}
+            if not apply:
+                detail["gate"] = gate_state if cfg["daemon_apply"] is True else "dry_run"
             engine.audit.append(engine.actor, "janitor.summary" if apply else "janitor.would_remove", "temp", detail)
+            if not apply and gate_state == "no_preview":
+                self._make_preview(engine, janitor, rule, outcome, cfg)
         except Exception as err:   # a janitor never stops the daemon
             engine._note("janitor.error", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
+
+    def _make_preview(self, engine, janitor, rule, outcome, cfg):
+        """The selection rule changed (or was never previewed): record the preview's fingerprint in the gate, and queue ONE message to the Chief of Staff. The
+        names go in that message only (and in the private `janitor.would_remove` audit line above); the gate file and the `janitor.preview` audit line hold hashes and a count."""
+        names = [o["name"] for o in outcome]
+        preview = janitor.preview_fingerprint(rule, names)
+        try:   # a new preview ends every earlier yes
+            os.unlink(str(Path(engine.state_dir) / TEMP_JANITOR_ACK_FILE))
+        except FileNotFoundError:
+            pass
+        _write_small(engine.state_dir, TEMP_JANITOR_GATE_FILE, {"rule": rule, "preview": preview, "sent": False, "count": len(names), "nonce": uuid.uuid4().hex})
+        shown = ", ".join(_plain(n, 60) for n in names[:TEMP_JANITOR_PREVIEW_NAMES])
+        text = ("temp janitor: its selection rule changed, so nothing is applied until you say yes to this preview. It WOULD remove %d entr%s (%d bytes): %s%s. "
+                "To say yes to this preview: `%s disk janitor-ack %s`. The yes covers the RULE this preview was made under: later weekly runs under the same rule remove "
+                "whatever qualifies then, not only the names listed; a change of the rule makes a new preview and needs a new yes. The daemon removes anything only while "
+                "`temp_janitor.daemon_apply` is true. If this message is lost no apply happens until the rule changes again." % (
+                    len(names), "y" if len(names) == 1 else "ies", sum(o["bytes"] for o in outcome), shown or "nothing",
+                    " and %d more" % (len(names) - TEMP_JANITOR_PREVIEW_NAMES) if len(names) > TEMP_JANITOR_PREVIEW_NAMES else "", PROG, preview))
+        self.outbox = (preview, rule, text)
 
 
 HEAVY_ORPHAN_INTERVAL = 60   # seconds between the daemon's looks for a run whose wrapper is gone
@@ -3564,7 +3646,7 @@ def collapse_riders(facts, now, max_age):
 
 
 DESCRIBED_AS = {"send": "message", "report": "report", "worker.idle": "finished", "worker.stopped": "stopped",
-                "worker.blocked": "blocked", "nudge": "nudge", "sweep": "sweep", "triage": "triage", "plan": "plan posted", "alert": "alert issue", "disk": "disk guard"}
+                "worker.blocked": "blocked", "nudge": "nudge", "sweep": "sweep", "triage": "triage", "plan": "plan posted", "alert": "alert issue", "disk": "disk guard", "janitor": "janitor preview"}
 
 
 def _line_of(text, limit):
@@ -13287,7 +13369,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
                         item.get("created"), now, SWEEP_S6A_GRACE) and sweep_ours(
                         engine, repo, number, item.get("author", ""), item.get("assignees"), notices):
                     found.add(("S6a", ref_text(repo, number)))   # only OUR PR: another team's author may carry the line
-                if "disagree" in item["captain_findings"] and not sweep_clear_agrees(engine, repo, number, item["labels"], item.get("marker")):
+                if "disagree" in item["captain_findings"] and not impact_rehold_open(engine.state_dir, repo, number) and not sweep_clear_agrees(engine, repo, number, item["labels"], item.get("marker")):   # (#815) a re-hold at this head is not a disagreement
                     found.add(("S6b", ref_text(repo, number)))
     for repo, picture in state.repos.items():
         if repo in defer or "*" in defer:
@@ -13400,6 +13482,8 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
             return False
         if kind == "S6a" and sweep_within(parse_iso(data.get("created_at")), now, SWEEP_S6A_GRACE):
             return False   # opened a moment ago: the label is applied after it opens
+        if kind == "S6b" and impact_rehold_open(engine.state_dir, repo, number):
+            return False   # (#815) held again at this head: the line and the label are being reconciled
         return is_pr and want in pr_marker_state(names, body)["findings"] and not (kind == "S6b" and sweep_clear_agrees(engine, repo, number, names, pr_marker(body)))
     if kind in ("S1a", "S1b"):
         if is_pr:
@@ -21361,6 +21445,7 @@ def cmd_gates(args, runner, now):
                                         now=now())
     report["plan_problem"] = ctx.plan_problem
     report["pr_unreadable"] = ctx.unreadable
+    report["impact_rating"] = gate_impact_rating(ctx.state, ctx.pr, ctx.facts.get("head"))   # #892: output text only; no gate reads it
     gates_carried_note(report, ctx)
     plan_ledger.enforced_view(report, enforced_gates_of(ctx))
     first = next((e.get("plan_ref") for e in ctx.entries if e.get("pr") == ctx.pr and e.get("plan_ref")), None)
@@ -21369,6 +21454,8 @@ def cmd_gates(args, runner, now):
         report["plan_changed"] = "the PR's plan is now %s; its entries were recorded against %s (they are void)" % (ctx.source, first)
     shares = overlap_shares_line(read_open_overlap(ctx.engine, ctx.repo, runner), ctx.number) if not ctx.unreadable else None   # #818: information only
     if args.json:
+        if isinstance(ctx.facts, dict) and rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head")):
+            report["rating_block"] = rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head"))
         if shares:
             report["shares"] = shares
         print(json.dumps(report, sort_keys=True))
@@ -21380,6 +21467,9 @@ def cmd_gates(args, runner, now):
             lines.append("PR not read: %s" % ctx.unreadable)
         if ctx.plan_problem:
             lines.append("plan not read: %s" % ctx.plan_problem)
+        note = rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head")) if isinstance(ctx.facts, dict) else None
+        if note:
+            lines.append("rating: %s" % note)
         if report.get("plan_changed"):
             lines.append("PLAN CHANGED: %s" % report["plan_changed"])
         print("\n".join(lines))
@@ -21812,6 +21902,19 @@ def impact_review_record(state_dir, pr, head):
     return ((latest.get("impact_action"), latest.get("impact_class")) if latest else None), None
 
 
+def rating_block_note(entries, pr, head):
+    """#901: the one line `no agent block` when the independent reviewer's records of `pr` at EXACTLY `head` exist and none carries the agent's block (it clears nothing by score), else None. The same
+    words as the clear's refusal (`delegated_clear.NO_AGENT_BLOCK`); display only, no decision reads it."""
+    try:
+        module = load_module("delegated_clear")
+        block = module.score_block()
+        roles = block["rating_roles"] if block else ["reviewer"]
+        mine = [e for e in entries if isinstance(e, dict) and e.get("kind") == "review_record" and e.get("reviewer") == "impact" and e.get("pr") == pr and e.get("head") == head and e.get("by_role") in roles]
+        return module.uncounted_line(mine)
+    except Exception as err:   # display only, but never silent: the line says the note could not be made
+        return "no rating note: the clear module or the matrix could not be read (%s)" % type(err).__name__
+
+
 def impact_rating_entries(state_dir, pr, head):
     """([ledger entries], problem): every impact reviewer record of EXACTLY this pull request and head (the delegated clear's score is the highest of those whose recorded role counts: `delegated_clear.judge` decides which).
     A ledger that cannot be read, or whose chain is broken, gives ([], why): the score is then unknown. #835."""
@@ -21822,6 +21925,27 @@ def impact_rating_entries(state_dir, pr, head):
     if problem:
         return [], _one_line(str(problem), 120)
     return [e for e in entries if e.get("kind") == "review_record" and e.get("reviewer") == "impact" and e.get("pr") == pr and e.get("head") == head], None
+
+
+def gate_impact_rating(state_dir, pr, head):
+    """What the `gates` impact-rating line says (#892), from the engine's own records and rule and nothing computed here: `impact_rating_entries` (the one filter of the independent
+    reviewer's records at EXACTLY this head) and `delegated_clear.judge` (the level of the highest record whose recorded role counts, from the matrix cell: the SAME function the delegated
+    clear scores with). `plan_ledger.impact_rating_fact` shapes the answer. None when there is no head. A ledger it cannot read is said, never guessed."""
+    if not head or state_dir is None:
+        return None
+    entries, problem = impact_rating_entries(state_dir, pr, head)
+    if problem:
+        return {"problem": problem}
+    try:   # never an exception out of `gates`: what cannot be read is said as unknown
+        module = load_module("delegated_clear")
+        block = module.score_block()
+        cells = impact_floor._matrix_cached()["cells"]
+        if not block or not cells:
+            return {"problem": "the score rule or the matrix could not be read"}
+        level = module.judge(block, cells, entries, {"pr": pr, "head": head, "top_tier_hits": {}}, block["delegable_levels"][0]).get("level") if entries else None
+        return plan_ledger.impact_rating_fact(entries, level, block["rating_roles"])
+    except Exception as err:
+        return {"problem": _one_line("%s: %s" % (type(err).__name__, err), 100)}
 
 
 def _file_text_at(engine, repo, path, ref):
@@ -21938,7 +22062,8 @@ def pr_floor_report(engine, repo, number, rated_pairs=(), paged=None):
             reasons = reasons + [IMPACT_REVIEW_REASON]
         if review:
             decision = "hold"
-    return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude,
+    rating_entries = impact_rating_entries(engine.state_dir, "%s#%d" % (repo, number), head)[0] if engine.state_dir is not None and isinstance(head, str) else []
+    return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude, "rating_block": rating_block_note(rating_entries, "%s#%d" % (repo, number), head),
             "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete, "list_problem": list_problem,
             "top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "review_action": record[0] if record else None, "review_class": record[1] if record else None,   # #661: display data the delegated clear reads; no decision changes
             "changed_paths": [p for p in paths if isinstance(p, str)][:200], "unknown": unknown, "rated": [list(r) for r in rated],
@@ -21947,10 +22072,71 @@ def pr_floor_report(engine, repo, number, rated_pairs=(), paged=None):
 
 def cmd_impact(args, runner, now):
     """`impact floor|hold|clear`."""
-    return {"floor": cmd_impact_floor, "hold": cmd_impact_hold, "clear": cmd_impact_clear, "delegated": cmd_impact_delegated}[args.impact_action](args, runner, now)
+    return {"floor": cmd_impact_floor, "hold": cmd_impact_hold, "clear": cmd_impact_clear, "delegated": cmd_impact_delegated, "matrix": cmd_impact_matrix}[args.impact_action](args, runner, now)
 
 
 cmd_impact.direct = True   # no error mapping, no daemon start
+
+
+IMPACT_MATRIX_PATHS_MAX = 50   # paths printed per floor rule by `impact matrix --for-rater`
+IMPACT_MATRIX_PATH_LEN = 200
+
+
+def _printable_path(path):
+    """A changed file's path as safe display text: control characters (an escape sequence in a file name) become `?`, and it is cut at IMPACT_MATRIX_PATH_LEN. The reader of `impact matrix --for-rater` is a rater agent or a person's terminal."""
+    text = "".join(c if c.isprintable() else "?" for c in str(path))
+    return text if len(text) <= IMPACT_MATRIX_PATH_LEN else text[:IMPACT_MATRIX_PATH_LEN - 1] + "\u2026"
+
+
+def impact_matrix_words(for_rater=None):
+    """{"severities", "probabilities", "cells": {severity: {probability: {"level", "action"}}}, "floor_rules": {rule id: class}, "for_rater": the pull request's floor hits or None}: the kit's matrix file's own words
+    (the same loader the clear reads), so a rater in a repository with no review laws gets them from the file and never retypes them. #901."""
+    matrix = impact_floor.load_matrix()
+    score = ((matrix.get("owner_hold") or {}).get("delegated_clear") or {}).get("score") or {}
+    return {"severities": list(matrix["severities"]), "probabilities": list(matrix["probabilities"]), "not_rated": list(matrix.get("not_rated") or []),
+            "cells": {s: {p: dict(c) for p, c in row.items()} for s, row in matrix["cells"].items()},
+            "floor_rules": dict((score.get("floor") or {}).get("rules") or {}), "lowest_floor_level": (score.get("floor") or {}).get("lowest_level"), "for_rater": for_rater}
+
+
+def cmd_impact_matrix(args, runner, now):
+    """`impact matrix [--for-rater <pr>] [--json]`: print the matrix file's severities, probabilities, cells (level and action) and floor rule ids; with `--for-rater` also that pull request's floor report
+    (each floor rule id the changed paths hit, and the paths): the SAME `pr_floor_report` `impact floor` prints. Read-only: no ledger, state or audit write. Works with no review laws in the repository."""
+    try:
+        for_rater = None
+        if args.for_rater:
+            engine, _, _ = build_engine(runner, now, "cli", writable=False)
+            repo, number = parse_pr_ref(args.for_rater)
+            report = pr_floor_report(engine, repo, number)
+            rules = impact_matrix_words()["floor_rules"]
+            hits = report.get("top_tier_hits") or {}
+            for_rater = {"pr": report["pr"], "head": report["head"], "complete": report.get("complete"),
+                         "floor_hits": {rule_id: [_printable_path(p) for p in sorted(hits.get(cls) or [])[:IMPACT_MATRIX_PATHS_MAX]] for rule_id, cls in sorted(rules.items()) if hits.get(cls)},
+                         "owner_decision": report.get("owner_decision")}
+        words = impact_matrix_words(for_rater)
+    except (impact_floor.MatrixError, NoticeError, ValueError) as err:
+        sys.stderr.write("%s: impact matrix: %s\n" % (PROG, _one_line(str(err), 300)))
+        return EXIT_USAGE
+    if args.json:
+        print(json.dumps(words, sort_keys=True))
+        return EXIT_OK
+    print("impact matrix (the kit's matrix file; read-only)")
+    print("severities: %s" % ", ".join(words["severities"]))
+    print("probabilities: %s" % ", ".join(words["probabilities"]))
+    for severity in words["severities"]:
+        for probability, cell in words["cells"][severity].items():
+            print("cell %s / %s: level %s, action %s" % (severity, probability, cell["level"], cell["action"]))
+    for rule_id, cls in sorted(words["floor_rules"].items()):
+        print("floor rule %s: class %s" % (rule_id, cls))
+    if for_rater is not None:
+        print("floor report for %s at %s: %s" % (for_rater["pr"], (for_rater["head"] or "unknown head")[:8], "complete" if for_rater["complete"] else "INCOMPLETE file list"))
+        for rule_id, paths in for_rater["floor_hits"].items():
+            print("floor hit %s: %s" % (rule_id, ", ".join(paths)))
+        if not for_rater["floor_hits"]:
+            print("floor hit: none")
+    return EXIT_OK
+
+
+cmd_impact_matrix.direct = True
 
 
 def cmd_impact_floor(args, runner, now):
@@ -22005,6 +22191,8 @@ def cmd_impact_floor(args, runner, now):
             print("impact floor for %s at %s: %s, %s %s" % (report["pr"], (report["head"] or "unknown head")[:8], words, counted, stamp))
         for reason in report.get("owner_reasons") or []:
             print("  %s: %s" % ("why" if owner == "hold" else "because", reason))
+        if report.get("rating_block"):
+            print("  rating: %s" % report["rating_block"])
         if owner == "none" and not report.get("owner_reasons") and not cut and not blind:
             print("  because: no changed path is a top tier path of the matrix, and no independent review or rating holds it")
         if cut and owner != "hold":
@@ -22130,6 +22318,22 @@ def impact_records(state_dir):
     for entry in entries:
         if entry.get("kind") == "review_record" and entry.get("reviewer") == "impact":
             found[(entry.get("pr"), entry.get("head"))] = (entry.get("impact_action"), entry.get("impact_class"))
+    return found, None
+
+
+def impact_carry_marks(state_dir):
+    """({(pr, head): n}, problem): how many reviewer records at each pull request and head carry a confirmation for a conflict-resolving carry (#815). Read with the ledger, whole or not at
+    all; it only decides when the carry is tried again, never whether it holds (the carry reads the ledger itself)."""
+    try:
+        entries, problem = plan_ledger.read_ledger(state_dir)
+    except Exception as err:
+        return {}, "%s: %s" % (type(err).__name__, _one_line(str(err), 100))
+    if problem:
+        return {}, _one_line(str(problem), 120)
+    found = {}
+    for entry in entries:
+        if entry.get("kind") == "review_record" and entry.get("carry_confirmed") is True:
+            found[(entry.get("pr"), entry.get("head"))] = found.get((entry.get("pr"), entry.get("head")), 0) + 1
     return found, None
 
 
@@ -22439,6 +22643,7 @@ def impact_would_hold_pass(engine, now):
     hold_cfg = (engine.config.get("impact_hold") or {}) if isinstance(engine.config, dict) else {}
     budget = hold_cfg.get("calls_per_pass", cfg.get("calls_per_pass", IMPACT_PASS_CALLS))   # `impact_hold.calls_per_pass` wins when set
     records, records_problem = impact_records(engine.state_dir)
+    marks = impact_carry_marks(engine.state_dir)[0]
     unjudged, live = 0, set()
     for key, (_, listed) in sorted(state.lists.items()):
         for record in listed:
@@ -22476,7 +22681,7 @@ def impact_would_hold_pass(engine, now):
                 return
             if not globs:
                 continue
-            signature = (head, rule, "unreadable" if records_problem else records.get((pr, head)))
+            signature = (head, rule, "unreadable" if records_problem else records.get((pr, head))) + ((marks[(pr, head)],) if (pr, head) in marks else ())   # (#815) a new confirmation re-judges
             if seen.get((key, number)) == signature:
                 continue
             if budget <= 0:
@@ -22525,7 +22730,7 @@ def impact_would_hold_pass(engine, now):
                     engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
                     unjudged += 1
                     continue
-            seen[(key, number)] = (report["head"] or head, rule, "unreadable" if records_problem else records.get((pr, report["head"] or head)))
+            seen[(key, number)] = (report["head"] or head, rule, "unreadable" if records_problem else records.get((pr, report["head"] or head))) + ((marks[(pr, report["head"] or head)],) if (pr, report["head"] or head) in marks else ())
             reports[(key, number)] = report
     _impact_matrix_recovered(engine, now)   # the file and the floor of every repo were read this pass: a standing episode is over
     if not unjudged and not records_problem and any(impact_floor.hold_mode(engine.config, key) == "enforce" for key, _ in live):
@@ -23702,6 +23907,7 @@ BLOCK_FLAG_TABLE = (   # (flag, dest, mode): `refused` (the block carries it: gi
     ("--reviewer", "reviewer", "accepted"), ("--summary", "summary", "accepted"),
     ("--verdict", "verdict", "refused"), ("--head", "head", "refused"), ("--blocks", "blocks", "refused"), ("--notes", "notes", "refused"), ("--impact-action", "impact_action", "refused"),
     ("--impact-class", "impact_class", "wins"), ("--impact-severity", "impact_severity", "wins"), ("--impact-probability", "impact_probability", "wins"), ("--impact-reason", "impact_reason", "wins"),
+    ("--confirms-carry", "confirms_carry", "accepted"),   # (#815) a flag with no value: the reviewer's own confirmation, never a line of the block
 )
 
 
@@ -23718,20 +23924,46 @@ NO_SCORE_TEXT = ("recorded WITHOUT a score (no impact severity and probability):
 RATING_INPUTS = IMPACT_RATING_FIELDS + ("impact_action", "impact_class", "block")   # every input of `review record` that decides the rating: read ONLY by `rating_inputs`, from the raw argv
 
 
-def rating_inputs(raw_argv):
-    """{dest: value} of the rating inputs GIVEN in `raw_argv` (a tuple of strings: the command line `main` captured before it built the shared parser), parsed by a PRIVATE minimal parser: the six flags of
-    RATING_INPUTS only, no abbreviation, no default (an absent flag is absent), nothing shared with `build_parser`. A registrar's `set_defaults`, a replaced or re-parsed subparser, a same-dest argument or a
-    wrapper on the namespace cannot change what this returns. A raw argv that is not a tuple or list of strings gives nothing (no rating). #835."""
+CARRY_FLAG_INPUTS = ("confirms_carry",)   # (#815) a flag with no value: whether a record confirms a carry
+DECISION_INPUTS = ("reviewer", "verdict")   # (#815) what the carry and the score read from a record besides the rating: the reviewer role it is for, and its verdict (a confirmation is an approve)
+PRIVATE_INPUTS = RATING_INPUTS + DECISION_INPUTS + CARRY_FLAG_INPUTS   # every input of `review record` that can change what the clear, the carry or the score reads: read ONLY from the raw argv
+REVIEW_RECORD_PUBLIC_INPUTS = {   # the inputs of `review record` read from the shared namespace, each with the reason it cannot change what the clear, the carry or the score reads
+    "review_cmd": "selects the subcommand; the record branch is the one that writes",
+    "pr": "required positional: the record binds to the pull request GitHub resolves from it (`ref` in the audit line); argparse refuses its absence and no value of it reaches a rating, a verdict or a confirmation",
+    "head": "only checked against the pull request's head (a different one is refused); the head recorded is GitHub's, never this value",
+    "blocks": "a count that can only refuse (an approve with blocking findings); neither the carry nor the score reads it",
+    "notes": "a count; neither the carry nor the score reads it",
+    "summary": "free text, redacted and clipped; neither the carry nor the score reads it",
+}
+
+
+def _private_parse(raw_argv, values, flags):
+    """{dest: value} of the inputs of `values` (each takes a value) and `flags` (each takes none: True) GIVEN in `raw_argv` (a tuple of strings: the command line `main` captured before it built the shared
+    parser), parsed by a PRIVATE minimal parser: no abbreviation, no default (an absent input is absent), nothing shared with `build_parser`. A registrar's `set_defaults`, a replaced or re-parsed subparser, a
+    same-dest argument or a wrapper on the namespace cannot change what this returns. A raw argv that is not a tuple or list of strings gives nothing."""
     if not isinstance(raw_argv, (tuple, list)) or not all(isinstance(x, str) for x in raw_argv):
         return {}
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False, argument_default=argparse.SUPPRESS, exit_on_error=False)
-    for name in RATING_INPUTS:
+    for name in values:
         parser.add_argument("--" + name.replace("_", "-"), dest=name)
+    for name in flags:
+        parser.add_argument("--" + name.replace("_", "-"), dest=name, action="store_true", default=argparse.SUPPRESS)
     try:
         parsed, _ = parser.parse_known_args(list(raw_argv))
     except (argparse.ArgumentError, SystemExit):
         return {}
     return dict(vars(parsed))
+
+
+def rating_inputs(raw_argv):
+    """{dest: value} of the rating inputs GIVEN in `raw_argv`: the six flags of RATING_INPUTS, through `_private_parse`. A raw argv that is not a tuple or list of strings gives nothing (no rating). #835."""
+    return _private_parse(raw_argv, RATING_INPUTS, ())
+
+
+def record_inputs(raw_argv):
+    """{dest: value} of DECISION_INPUTS and CARRY_FLAG_INPUTS GIVEN in `raw_argv`, through `_private_parse` (#815): the reviewer and the verdict of a record, and whether it confirms a carry. Nothing given
+    (or a raw argv that is missing) gives nothing: no reviewer, no verdict, no confirmation."""
+    return _private_parse(raw_argv, DECISION_INPUTS, CARRY_FLAG_INPUTS)
 
 
 def cmd_review(args, runner, now):
@@ -23770,39 +24002,47 @@ def cmd_review(args, runner, now):
             if missing:
                 sys.stderr.write("%s: review laws: not at the base commit: %s\n" % (PROG, ", ".join(missing)))
             return EXIT_OK
-        if args.reviewer not in plan_ledger.REVIEWERS:
+        chosen = record_inputs(getattr(args, "raw_argv", ()))   # (#815) the reviewer, the verdict and the confirmation come from the raw argv too (same reason as the rating's inputs)
+        reviewer, verdict, confirms = chosen.get("reviewer"), chosen.get("verdict"), chosen.get("confirms_carry") is True
+        if reviewer not in plan_ledger.REVIEWERS:
             raise ReviewError("--reviewer must be one of %s" % ", ".join(plan_ledger.REVIEWERS))
         given = rating_inputs(getattr(args, "raw_argv", ()))   # #835: the rating's inputs come from the raw argv through a private parser, never from the shared namespace (a registrar's set_defaults, a replaced parser or a wrapper cannot reach them); a missing raw argv gives no rating
         action, klass = given.get("impact_action"), given.get("impact_class")
         rating_in = {name: given.get(name) for name in IMPACT_RATING_FIELDS}
+        block_digest, block_fields = None, {}
         if given.get("block") is not None:   # the reviewer's returned text: the coder session records it
-            carried = {"verdict": args.verdict, "head": args.head, "blocks": args.blocks, "notes": args.notes, "impact_action": action}
+            carried = {"verdict": verdict, "head": args.head, "blocks": args.blocks, "notes": args.notes, "impact_action": action}
             if any(carried[dest] for flag, dest, mode in BLOCK_FLAG_TABLE if mode == "refused"):
                 raise ReviewError(BLOCK_TABLE_TEXT)
-            fields, why = parse_review_block(_read_capped(given["block"], REVIEW_TABLE_MAX))
+            block_text = _read_capped(given["block"], REVIEW_TABLE_MAX)
+            fields, why = parse_review_block(block_text)
             if fields is None:
                 raise ReviewError("refused: %s" % why)
-            args.verdict, args.head, args.blocks, args.notes, action = (fields["verdict"], fields["head"], fields["blocks"], fields["notes"], fields["impact_action"])
+            block_raw = block_text.encode("utf-8")
+            block_digest, block_fields = (hashlib.sha256(block_raw).hexdigest(), len(block_raw)), {name: fields[name] for name in IMPACT_RATING_FIELDS}
+            verdict, args.head, args.blocks, args.notes, action = (fields["verdict"], fields["head"], fields["blocks"], fields["notes"], fields["impact_action"])
             klass = klass or fields["impact_class"]
             for name in IMPACT_RATING_FIELDS:   # the rating's severity and probability (the score is derived from the matrix's cell), and the reason that names a floor rule
                 if rating_in[name] is None:
                     rating_in[name] = fields[name]
-        if args.verdict not in plan_ledger.REVIEW_VERDICTS:
+        if verdict not in plan_ledger.REVIEW_VERDICTS:
             raise ReviewError("--verdict must be one of %s (or give --block with the reviewer's returned text)" % ", ".join(plan_ledger.REVIEW_VERDICTS))
         for name, count in (("blocks", args.blocks), ("notes", args.notes)):
             if count < 0 or count > 200:
                 raise ReviewError("--%s must be a number from 0 to 200" % name)
-        if args.verdict == "approve" and args.blocks:
+        if verdict == "approve" and args.blocks:
             raise ReviewError("an approve cannot carry blocking findings (%d given)" % args.blocks)
-        if args.verdict == "request-changes" and not args.blocks:
+        if verdict == "request-changes" and not args.blocks:
             raise ReviewError("request-changes needs at least 1 blocking finding (a finding that cites no rule never blocks)")
-        if action and args.reviewer != "impact":
+        if confirms and verdict != "approve":
+            raise ReviewError("--confirms-carry belongs to an approve: a reviewer who found a change to the pull request's own lines does not confirm it")
+        if action and reviewer != "impact":
             raise ReviewError("--impact-action belongs to the impact reviewer")
         impact_class = (klass or "").strip().lower() or None
-        if impact_class is not None and args.reviewer != "impact":
+        if impact_class is not None and reviewer != "impact":
             raise ReviewError("--impact-class belongs to the impact reviewer")
         rating = {name: (rating_in[name] or "").strip() or None for name in IMPACT_RATING_FIELDS}
-        if any(rating.values()) and args.reviewer != "impact":
+        if any(rating.values()) and reviewer != "impact":
             raise ReviewError("--impact-severity, --impact-probability and --impact-reason belong to the impact reviewer")
         if rating["impact_severity"] or rating["impact_probability"]:
             try:
@@ -23835,28 +24075,37 @@ def cmd_review(args, runner, now):
         if kind[0] == "unknown":
             raise ReviewError("refused: %s" % kind[1])
         by = kind[1] if kind[0] == "agent" else "person"
-        entry = {"kind": "review_record", "pr": ref, "head": head, "reviewer": args.reviewer, "verdict": args.verdict,
+        entry = {"kind": "review_record", "pr": ref, "head": head, "reviewer": reviewer, "verdict": verdict,
                  "blocks": args.blocks, "notes": args.notes, "by": by,
                  "summary": plan_ledger.clip(redact_command_text(args.summary or ""), 200)}
+        if confirms:
+            entry["carry_confirmed"] = True   # (#815) read by `impact_hold.carry_confirmer`: only a reviewer's own record at the head it judged
         if action:
             entry["impact_action"] = action
-        if args.reviewer == "impact":
+        if reviewer == "impact" or confirms:   # (#815) a carry confirmation is read by the same recorded role as a rating
             entry["by_role"] = kind[2] if kind[0] == "agent" and len(kind) > 2 and isinstance(kind[2], str) else None   # #835: the RECORDED role of the session that made the record (never a flag or a text): only the independent reviewer's rating counts
         for name in IMPACT_RATING_FIELDS:
             if rating[name]:
                 entry[name] = plan_ledger.clip(redact_command_text(rating[name]), 200)
+        if reviewer == "impact":   # #901: the block's own bytes and rating lines are kept, so only a record that carries the agent's block counts by score
+            entry["block_sha256"] = block_digest[0] if block_digest else "none"
+            if block_digest:
+                entry["block_size"] = block_digest[1]
+                for name, value in block_fields.items():
+                    if value:
+                        entry["block_" + name] = plan_ledger.clip(redact_command_text(value), 200)
         if impact_class:
             entry["impact_class"] = impact_class   # #451 slice 2: the class of the impact that drives the action; a missing one holds for the owner
         stored = plan_ledger.append_entry(state, entry, now())
         if engine.audit is not None:
-            engine.audit.append(engine.actor, "review.record", ref, {"reviewer": args.reviewer, "verdict": args.verdict, "head": head[:12],
+            engine.audit.append(engine.actor, "review.record", ref, {"reviewer": reviewer, "verdict": verdict, "head": head[:12],
                                                                     "by": by, "seq": stored["seq"], "chain": stored["hash"]})
         entries, problem = plan_ledger.read_ledger(state)
         got = plan_ledger.review_records_at(entries, ref, head)
         print("recorded %s review %s at %s (%s): %d of %d reviewers recorded at this head%s" % (
-            args.reviewer, args.verdict, head[:8], ref, len(got["recorded"]), len(got["expected"]),
+            reviewer, verdict, head[:8], ref, len(got["recorded"]), len(got["expected"]),
             "; missing %s" % ", ".join(got["missing"]) if got["missing"] else ""))
-        if args.reviewer == "impact" and not (entry.get("impact_severity") and entry.get("impact_probability")):
+        if reviewer == "impact" and not (entry.get("impact_severity") and entry.get("impact_probability")):
             sys.stderr.write("%s: review: %s\n" % (PROG, NO_SCORE_TEXT))
         return EXIT_OK
     except (ReviewError, plan_ledger.LedgerError, ConfigError, IdentityUncertain, CallerError) as err:
@@ -24076,6 +24325,8 @@ def add_review_parsers(sub):
     for flag in IMPACT_RATING_FIELDS:
         record.add_argument("--" + flag.replace("_", "-"), dest=flag, help="#835: the impact reviewer's rating (%s): the severity and the probability name a cell of the matrix, the reason names the floor rule it applied" % flag.split("_", 1)[1])
     record.add_argument("--impact-class", dest="impact_class", help="The class of the impact that drives the action (a class of the matrix file's owner_hold block)")
+    record.add_argument("--confirms-carry", dest="confirms_carry", action="store_true",
+                        help="(#815) With an approve: the resolution of a conflict in a merge of main touched no line this pull request adds or removes, so the owner's clear may carry to this head")
     record.add_argument("--summary", help="One line (at most 200 characters)")
     checkout = rsub.add_parser("checkout", help="Write the PR's exact head tree, its diff and the base copies of the touched files into .review/<head sha> here, read-only, and print the path; --remove <dir> removes one")
     checkout.add_argument("pr", nargs="?", help="owner/repo#N or the PR's URL")
@@ -24535,6 +24786,9 @@ def add_impact_parsers(sub):
     floor.add_argument("--rating", action="append", metavar="SEVERITY/PROBABILITY",
                        help="An independent rating's impact, e.g. Critical/Remote (repeatable; it can only add a hold; Eliminated is not rated)")
     floor.add_argument("--json", action="store_true")
+    matrix = impact_sub.add_parser("matrix", help="Read-only: print the kit's impact matrix words (severities, probabilities, cells, floor rule ids); with --for-rater also a pull request's floor hits (for a repository with no review laws)")
+    matrix.add_argument("--for-rater", dest="for_rater", metavar="PR", help="Also that pull request's floor report: owner/repo#N or its URL")
+    matrix.add_argument("--json", action="store_true")
     hold = impact_sub.add_parser("hold", help="What the daemon would label as held right now (read-only dry run; the daemon writes the labels)")
     hold.add_argument("--dry-run", action="store_true", dest="dry_run")
     hold.add_argument("--repo", help="One repo (OWNER/REPO); default: every repo under plan_gates")
@@ -24863,11 +25117,83 @@ def cmd_disk_report(args, runner, now):
     return EXIT_OK
 
 
+JANITOR_OPEN_SECONDS = 30   # the open-file check's own time limit: past it the entries are kept, never waited for
+
+
+def janitor_agent_roots(engine, now, days):
+    """[(agent name, directory)]: the working directory and the private temp directory of every agent the registry holds NOW, live, or retired within `days`.
+    THE ONE FUNCTION that reads the agent list for the janitor: when the one registry (#929) lands, only its body changes. Raises janitor.Unknown when a
+    record exists and cannot be read (the janitor then keeps every entry); a missing record is an empty one."""
+    if engine.state_dir is None:
+        raise janitor_unknown("there is no state directory")
+    live, retired_at = {}, {}
+    try:
+        with open(str(Path(engine.state_dir) / PANE_HEALTH_FILE), "rb") as handle:
+            raw = json.loads(handle.read(1000001).decode("utf-8"))
+        if not isinstance(raw, dict) or not isinstance(raw.get("agents", {}), dict):
+            raise ValueError("not a map of agents")
+    except FileNotFoundError:
+        raw = {}
+    except (OSError, ValueError, UnicodeError) as err:
+        raise janitor_unknown("%s cannot be read (%s)" % (PANE_HEALTH_FILE, _one_line(str(err), 60)))
+    for name, info in (raw.get("agents") or {}).items():
+        live[name] = info.get("cwd") if isinstance(info, dict) else None
+    for name in (getattr(getattr(engine, "discovery", None), "agents", None) or {}):
+        live.setdefault(name, None)
+    try:
+        retired = read_retired_strict(engine.state_dir)
+    except RetiredUnreadable as err:
+        raise janitor_unknown("%s cannot be read (%s)" % (RETIRED_FILE, _one_line(str(err), 60)))
+    cutoff = now - days * 86400
+    for name, entry in retired.items():
+        at = entry.get("at")
+        if not isinstance(at, (int, float)) or isinstance(at, bool) or at >= cutoff:   # a time that cannot be read counts as recent: the doubt keeps
+            record = entry.get("record") if isinstance(entry.get("record"), dict) else {}
+            retired_at[name] = record.get("cwd")
+    roots = []
+    for name, cwd in sorted(dict(retired_at, **live).items()):
+        if isinstance(cwd, str) and os.path.isabs(cwd):
+            roots.append((name, cwd))
+        if NAME_RE.fullmatch(name or "") and not agent_tmp_shared_name(name):   # the shared directory is the janitor's own: it is no one agent's
+            for base in (agent_tmp_root(engine.config), headless_tmp_root()):
+                if base is not None:
+                    roots.append((name, str(base / name)))
+    return roots
+
+
+def janitor_unknown(message):
+    return load_disk_janitor().Unknown(message)
+
+
 def janitor_busy_function(engine, runner, janitor):
     """`busy(path)` for the temp janitor: why an entry is in use, else None; raises janitor.Unknown when something cannot be read (the entry is then kept).
     In use = a herdr pane (an agent's or a plain terminal) works in it, a non-retired agent's session runs in it (both from `worktree_in_use`), or ANY live
     process has it as its working directory (one `lsof -a -d cwd -Fn` per run, bounded by a timeout)."""
     held = {}
+    days = (engine.config.get("temp_janitor") or {}).get("days", 7)
+    if isinstance(days, bool) or not isinstance(days, int):
+        days = 7
+
+    def open_paths():
+        """The paths of every file a live process holds open (one `lsof -Fn` per run, bounded by a timeout). A timeout, an error or a list too long raises Unknown."""
+        if "open" not in held:
+            try:
+                done = runner(["lsof", "-n", "-P", "-Fn"], capture_output=True, text=True, timeout=JANITOR_OPEN_SECONDS, stdin=subprocess.DEVNULL)
+            except (OSError, subprocess.SubprocessError) as err:   # includes a timeout
+                raise janitor.Unknown("the open-file check did not finish: %s" % _one_line(str(err), 80))
+            if done.returncode not in (0, 1) or (done.returncode == 1 and not (done.stdout or "").strip()):
+                raise janitor.Unknown("the open-file check failed (exit %s)" % done.returncode)
+            lines = (done.stdout or "").splitlines()
+            if len(lines) > 2000000:
+                raise janitor.Unknown("the open-file check listed more than 2000000 lines: a file past the limit would not protect its entry")
+            limit, resolved = time.monotonic() + JANITOR_OPEN_SECONDS, []
+            for l in lines:
+                if l.startswith("n/"):
+                    if time.monotonic() > limit:
+                        raise janitor.Unknown("resolving the open-file list took longer than %d s" % JANITOR_OPEN_SECONDS)
+                    resolved.append(os.path.realpath(l[1:]))
+            held["open"] = resolved
+        return held["open"]
 
     def process_directories():
         if "dirs" not in held:
@@ -24888,9 +25214,22 @@ def janitor_busy_function(engine, runner, janitor):
         if why:
             return why
         root = os.path.realpath(path).rstrip("/") + "/"
+        try:
+            roots = janitor_agent_roots(engine, engine.now(), days)
+        except janitor.Unknown:
+            raise
+        except Exception as err:   # a registry that cannot be read keeps the entry
+            raise janitor.Unknown("the agent registry cannot be read (%s)" % _one_line("%s: %s" % (type(err).__name__, err), 80))
+        for name, where in roots:
+            here = os.path.realpath(where).rstrip("/") + "/"
+            if here.casefold().startswith(root.casefold()) or root.casefold().startswith(here.casefold()):   # case-folded: a case-insensitive volume may spell it otherwise (over-keeping is the safe side)   # it is, contains or sits inside the agent's directory
+                return "it is, holds or sits inside the temp or working directory of agent %s" % _plain(name, 60)
         for where in process_directories():
-            if (where.rstrip("/") + "/").startswith(root):
+            if (where.rstrip("/") + "/").casefold().startswith(root.casefold()):
                 return "a live process has it as its working directory (%s)" % _plain(where, 100)
+        for where in open_paths():
+            if (where.rstrip("/") + "/").casefold().startswith(root.casefold()):
+                return "a live process has a file of it open"
         return None
     return busy
 
@@ -24917,10 +25256,26 @@ def cmd_disk_janitor(args, runner, now):
     return EXIT_OK
 
 
+def cmd_disk_janitor_ack(args, runner, now):
+    """`disk janitor-ack <preview>`: record the yes to the temp janitor's would-remove preview the daemon sent. Only the operator or the Chief of Staff; the
+    fingerprint must be the pending preview's (a yes to an older one is refused, and the daemon compares it again before it applies anything)."""
+    kind = gates_caller_kind(runner, now)
+    if not (kind[0] == "person" or (kind[0] == "agent" and len(kind) > 2 and kind[2] == "chief-of-staff")):
+        raise LaunchError("refused: only the operator or the Chief of Staff may record the yes to a temp janitor preview (%s is %s)" % (kind[1], "an agent" if kind[0] == "agent" else "not known"))
+    engine, state, _ = build_engine(runner, now, "cli", writable=True)
+    ok, gate = read_janitor_record(state, TEMP_JANITOR_GATE_FILE)
+    if not ok or gate.get("sent") is not True or gate.get("preview") != args.preview:
+        raise LaunchError("no pending temp janitor preview has the fingerprint %s (it may be an older one: the newest is in the Chief of Staff's message): nothing recorded" % _one_line(args.preview, 40))
+    _write_small(state, TEMP_JANITOR_ACK_FILE, {"rule": gate["rule"], "preview": gate["preview"], "nonce": gate.get("nonce", ""), "by": kind[1], "at": now()})
+    engine.audit.append(engine.actor, "janitor.ack", "temp", {"rule": gate["rule"], "preview": gate["preview"], "by": kind[1]})
+    print("%s: recorded the yes to temp janitor preview %s (rule %s): the daemon may apply while temp_janitor.daemon_apply is true" % (PROG, gate["preview"], gate["rule"]))
+    return EXIT_OK
+
+
 def cmd_disk(args, runner, now):
     """The `disk` group: `prune` (the disk guard, #319), `reap-docker` (#326) and `reclaim-worktrees` / `register-worktree` (the worktree lifecycle, #321)."""
     try:   # `direct` skips dispatch's error mapping, so refusals are mapped here for every subcommand
-        return {"report": cmd_disk_report, None: cmd_disk_report, "prune": cmd_disk_prune, "reap-docker": cmd_disk_reap_docker, "janitor": cmd_disk_janitor, "reap-orphans": cmd_disk_reap_orphans, "reclaim-worktrees": cmd_disk_reclaim_worktrees, "register-worktree": cmd_disk_register_worktree}[args.disk_action](args, runner, now)
+        return {"report": cmd_disk_report, None: cmd_disk_report, "prune": cmd_disk_prune, "reap-docker": cmd_disk_reap_docker, "janitor": cmd_disk_janitor, "janitor-ack": cmd_disk_janitor_ack, "reap-orphans": cmd_disk_reap_orphans, "reclaim-worktrees": cmd_disk_reclaim_worktrees, "register-worktree": cmd_disk_register_worktree}[args.disk_action](args, runner, now)
     except (LaunchError, ConfigError, CallerError, LockError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err))))
         return EXIT_ERROR
@@ -25103,6 +25458,91 @@ PREFLIGHT_CLASSES = (
     ("public-names", 60, (("python3", "bin/check-public-names"),), None),
     ("cloud", 600, (("bin/test-cloud-worker",), ("bin/test-cloud-launcher",), ("cloud/tests/test-cloud",)), "cloud/"),
 )
+# The preflight sub-checks CI runs for the pull request itself (#942): (command, the name it is shown by). Each row is skipped, with a line that says so, when the
+# workflow at the base runs that command on `pull_request`; every other sub-check of PREFLIGHT_CLASSES always runs. Not being able to tell is a run.
+PREFLIGHT_CI_SKIPS = (("bin/test-cloud-launcher", "cloud launcher"),)
+PREFLIGHT_WORKFLOW = ".github/workflows/test.yml"
+PREFLIGHT_STEP_IF = ("${{ !cancelled() }}", "${{ always() }}", "${{ success() }}", "${{ success() || failure() }}", "always()", "success()")   # a step condition that still runs it
+
+
+PREFLIGHT_JOB_KEYS_HIDING = ("if", "continue-on-error")   # job-level keys after which a failure of the job cannot fail CI (or the job may not run): the job does not count
+PREFLIGHT_SWALLOW = r"\|\|\s*(true|:|exit 0)\b|\bset\s+\+e\b"   # a run line that swallows the command's failure
+
+
+def job_hides(line):
+    """True for a job-level key (four spaces) of PREFLIGHT_JOB_KEYS_HIDING that can hide the job's failure: any `if`, any `continue-on-error` other than false."""
+    key = re.match(r"    (%s)\s*:\s*(.*)$" % "|".join(re.escape(k) for k in PREFLIGHT_JOB_KEYS_HIDING), line)
+    return bool(key) and not (key.group(1) == "continue-on-error" and re.match(r"false\b", key.group(2).strip()))
+
+
+def workflow_job_running(text, command):
+    """The name of a job of the workflow `text` that runs `command` on `pull_request`, or None when it cannot be told: a text-only reading (no YAML library), the
+    safe side being None. The job needs no job-level `if`; the step that runs the command needs no `continue-on-error` and no condition but one of PREFLIGHT_STEP_IF."""
+    lines = text.splitlines()
+    try:
+        top = next(i for i, line in enumerate(lines) if re.match(r"on\s*:", line))
+        jobs = next(i for i, line in enumerate(lines) if line.rstrip() == "jobs:")
+    except StopIteration:
+        return None
+    head = lines[top]
+    block = [head] + [line for line in lines[top + 1:jobs] if line.startswith((" ", "\t")) or not line.strip()]
+    if not any(re.match(r"\s*(on\s*:\s*)?(\[.*\bpull_request\b.*\]|pull_request\s*:?)\s*(#.*)?$", line) or re.match(r"on\s*:.*\bpull_request\b", line) for line in block if not line.lstrip().startswith("#")):
+        return None
+    for number, line in enumerate(block):   # a filter under the trigger (paths, branches, types ...) or an inline mapping: CI may not run for this pull request
+        if re.match(r"\s+pull_request\s*:\s*(#.*)?$", line):
+            indent = len(line) - len(line.lstrip())
+            nested = [l for l in block[number + 1:] if l.strip() and not l.lstrip().startswith("#")][:1]
+            if nested and len(nested[0]) - len(nested[0].lstrip()) > indent:
+                return None
+        if re.match(r"on\s*:.*\{", line) or re.match(r"\s+pull_request\s*:\s*\S", line) and not re.match(r"\s+pull_request\s*:\s*(#.*)?$", line):
+            return None
+    name, found = None, []
+    for line in lines[jobs + 1:]:
+        if line and not line.startswith(" ") and not line.startswith("#"):
+            break
+        job = re.fullmatch(r"  ([A-Za-z0-9_-]+):\s*", line)
+        if job:
+            name = job.group(1)
+            found.append((name, []))
+        elif found:
+            found[-1][1].append(line)
+    for name, body in found:
+        if any(job_hides(line) for line in body):
+            continue
+        steps, current = [], None
+        for line in body:
+            if re.match(r"      - ", line):
+                current = [line]
+                steps.append(current)
+            elif current is not None:
+                current.append(line)
+        for step in steps:
+            live = [line for line in step if not line.lstrip().startswith("#") and not re.match(r"\s*(- )?name\s*:", line)]
+            runs = [re.sub(r"^\s*(- )?(run\s*:\s*(\|[-+]?\s*)?)?", "", line) for line in live]
+            starts = [line for line in runs if re.match(r"%s(\s|$)" % re.escape(command), line)]   # the command is the FIRST word of a line, not a mention
+            if not starts:
+                continue
+            conditions = [re.sub(r"^\s*(- )?if\s*:\s*", "", line).strip() for line in step if re.match(r"\s*(- )?if\s*:", line)]
+            hidden = any(re.match(r"\s*(- )?continue-on-error\s*:\s*(?!false\b)", line) for line in step) or any(c not in PREFLIGHT_STEP_IF for c in conditions)
+            if hidden or any(re.search(PREFLIGHT_SWALLOW, line) for line in runs):
+                continue
+            return name
+    return None
+
+
+def preflight_ci_runs(runner, root, command, changed):
+    """The job name when CI runs `command` for this pull request (the workflow file runs it on `pull_request`, and this branch does not change the workflow, so the file
+    in the work tree is the one at the base), else None. It reads a file and makes no git call."""
+    if changed is None or PREFLIGHT_WORKFLOW in changed:
+        return None
+    try:
+        with open(os.path.join(root, PREFLIGHT_WORKFLOW), encoding="utf-8") as handle:
+            text = handle.read(262144)
+    except (OSError, UnicodeDecodeError):
+        return None
+    return workflow_job_running(text, command)
+
+
 PREFLIGHT_CEILING_MAX = 3600   # the absolute maximum of any class's ceiling, in seconds: a hung class still ends
 
 
@@ -25152,6 +25592,12 @@ def cmd_preflight_pr(args, runner, now):
             ceiling = preflight_ceiling(base_ceiling, load1, cores)
             if under is not None and changed is not None and not any(path.startswith(under) for path in changed):
                 continue
+            commands = list(commands)
+            for skipped, shown in PREFLIGHT_CI_SKIPS:
+                job = preflight_ci_runs(runner, root, skipped, changed) if (skipped,) in commands else None
+                if job:
+                    commands.remove((skipped,))
+                    print("preflight-pr: %s: skipped, CI runs it for this pull request (job %s)" % (shown, job))
             env = dict(os.environ, FLEET_HEAVY_MAX_SECONDS=str(ceiling))   # the ceiling runs INSIDE the slot (heavy's watchdog starts when the slot is granted): a wait in the queue is never a timeout
             sys.stderr.write("preflight-pr: %s: waiting for a slot, then running (ceiling %ds once running)\n" % (name, ceiling))
             if under is not None:
@@ -25167,6 +25613,9 @@ def cmd_preflight_pr(args, runner, now):
                     break
                 if done.returncode == 124:
                     verdict, tail = "FAIL", "timed out after %ds running, its ceiling (load average %.1f on %d cores)" % (ceiling, load1, cores)
+                    break
+                if done.returncode == 64 and "heavy: refused: a full-suite job is already queued or running" in (done.stderr or ""):   # heavy's refusal (a test that itself exits 64 is a failure)
+                    verdict, tail = "FAIL", "refused: a full-suite job is already queued or running in this worktree (the tests did not run)"
                     break
                 if done.returncode == 75:
                     verdict, tail = "NOSLOT", "no heavy slot came in time (the tests did not run)"
@@ -25217,6 +25666,10 @@ def add_disk_parsers(sub):
                                               "protects. Never follows a link, never touches another user's entry. Each removal is one temp.removed audit line.")
     janitor.add_argument("--apply", action="store_true", help="Remove them (the default only lists)")
     janitor.add_argument("--weekly", action="store_true", help="The weekly job: scan under the longer budget temp_janitor.weekly_scan_seconds (default 600 s) instead of scan_seconds (60 s)")
+    ack = disk_sub.add_parser("janitor-ack", allow_abbrev=False, help="record the yes to the temp janitor's would-remove preview (the Chief of Staff's or the operator's)",
+                              description="The daemon sends the Chief of Staff one would-remove preview after any change of the janitor's selection rule and applies nothing until "
+                                          "the yes to that exact preview is recorded here. A changed rule makes a new preview and needs a new yes.")
+    ack.add_argument("preview", help="the preview's fingerprint, as the message gives it")
     orphans = disk_sub.add_parser("reap-orphans", allow_abbrev=False, help="Signal (SIGTERM, then SIGKILL) orphaned test helpers past the grace: parent launchd, an exact allow-list; a dry run unless --apply")
     orphans.add_argument("--apply", action="store_true", help="Do it (default: a dry run)")
     reclaim = disk_sub.add_parser("reclaim-worktrees", allow_abbrev=False, help="Remove the registered worktrees of retired agents when clean and pushed; else keep and say why (a dry run unless --apply)")
@@ -25315,6 +25768,41 @@ def agents_found(runner, opencode, timeout):
         return "bad", "the service answered something that is not the agent list (%s)" % err
 
 
+def agent_body(text):
+    """The prose of an agent file: what follows its front matter (the model line, the permissions and the mode are in the front matter, so they are not compared)."""
+    return text.split("\n---\n", 1)[1] if "\n---\n" in text else text
+
+
+def default_installed_agents_dir():
+    """Where `install` writes the agent files of the private profile. Under the test suite there is none unless a test names one: the suite never reads the machine's own profile."""
+    if os.environ.get(UNDER_TEST_ENV):
+        return None
+    return _xdg("XDG_DATA_HOME", ".local/share") / PROG / "profile" / "config" / "opencode" / "agents"
+
+
+def stale_installed_agents(installed_dir, expected=None, root=None):
+    """[(name, path)] of the agents whose installed file has a body that is not the kit's (the model line is not compared). An agent with no installed file, or no kit file, is not listed; an installed file that is there but cannot be read is."""
+    out = []
+    if installed_dir is None:
+        return out
+    for name in sorted(expected or EXPECTED_AGENTS):
+        found = agent_definition(name, root)
+        if found is None:
+            continue
+        installed = Path(installed_dir) / (name + ".md")
+        try:
+            kit = agent_body(Path(found[2]).read_text())
+            current = agent_body(installed.read_text())
+        except FileNotFoundError:
+            continue   # nothing installed under that name: nothing to compare
+        except (OSError, ValueError):
+            out.append((name, str(installed)))   # present but unreadable: said as out of date, never passed over
+            continue
+        if kit != current:
+            out.append((name, str(installed)))
+    return out
+
+
 def agents_problems(found, expected=None, root=None, unchecked=None):
     """One line per agent of ours that is missing, in the wrong mode, short of a rule its definition declares, or whose definition has lines
     the check cannot read. `unchecked` (a list, when given) collects the agents whose rules were NOT compared (no definition found): only the mode was."""
@@ -25353,6 +25841,9 @@ def cmd_agents(args, runner, now):
         return EXIT_ERROR
     unchecked = []
     problems = agents_problems(payload, unchecked=unchecked)
+    installed_dir = Path(args.installed_dir) if args.installed_dir else default_installed_agents_dir()
+    for name, path in stale_installed_agents(installed_dir):
+        problems.append("%s: out of date (the installed copy %s has a different wording from the kit's); run `%s install`, then restart the service" % (name, path, PROG))
     if problems:
         for line in problems:
             print("FAIL  " + line)
@@ -25374,6 +25865,7 @@ def add_agents_parsers(sub):
                                                "lacks a rule its definition declares. A service that is not running is reported, not failed. Run it after installing the agents and "
                                                "restarting the service.")
     verify.add_argument("--strict", action="store_true", help="Exit 1 when the service cannot be asked (default: say so and exit 0)")
+    verify.add_argument("--installed-dir", default=None, help="The folder of installed agent files to compare bodies with (default: the private profile's agents folder)")
     verify.add_argument("--opencode", default="opencode", help="The opencode executable (default: opencode on PATH)")
     verify.add_argument("--timeout", type=int, default=AGENTS_VERIFY_TIMEOUT, help="Seconds to wait for the service (default %d)" % AGENTS_VERIFY_TIMEOUT)
 
