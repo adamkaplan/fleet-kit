@@ -12544,6 +12544,12 @@ def publish_decisions(engine):
     except Exception as err:
         engine._note("merged_labels.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     try:
+        closed_pr_labels = load_module("closed_pr_labels")   # #963: a pull request closed unmerged is released like a merged one (the daemon's own record only)
+        closed_pr_labels.run_pass(types.SimpleNamespace(**{n: globals()[n] for n in closed_pr_labels.NEEDS}), engine, now,
+                                  ((engine.config.get("impact_hold") or {}).get("calls_per_pass") or IMPACT_PASS_CALLS))
+    except Exception as err:
+        engine._note("closed_pr_labels.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
         closed_labels = load_module("closed_labels")   # #570: a closed issue's awaiting labels come off (fresh read, fleet prefix only, one line to the Chief of Staff)
         closed_labels.run_pass(types.SimpleNamespace(**{n: globals()[n] for n in closed_labels.NEEDS}), engine, now,
                                ((engine.config.get("impact_hold") or {}).get("calls_per_pass") or IMPACT_PASS_CALLS))
