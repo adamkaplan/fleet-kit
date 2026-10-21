@@ -85,7 +85,7 @@ def run_pass(sb, engine, now, calls):
             with sb.impact_state_lock(engine.state_dir):   # the record is read again under the lock: the removal and its consumption are one step
                 state, problem = sb.read_impact_state(engine.state_dir)
                 if problem:
-                    continue
+                    raise ValueError(problem)   # the record changed under us: nothing is removed, tried again after the back-off
                 names = sb.label_names(engine.config)
                 listed = [l for l in sb._labels_ours(names, state, ref, wide=True) if l != names[sb.OWNER_HOLD_KEY]]
                 remove = [l for l in listed if l in present]

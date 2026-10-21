@@ -74220,6 +74220,48 @@ class TestClosedPrLabels(Base):
         self.go({self.PR: self.entry()}, gh)
         self.assertEqual((len(gh.removed), len(gh.reads), len(self.audit("closed.labels_removed"))), (2, 1, 1))
 
+    def test_a_failed_label_write_keeps_the_record_and_is_tried_again_after_the_back_off(self):
+        self.record(*self.mine)
+        gh = FakeMergedGh({7: self.view(labels=self.mine)})
+        real = sb.change_issue_labels
+        with mock.patch.object(sb, "change_issue_labels", side_effect=RuntimeError("boom")):
+            self.go({self.PR: self.entry()}, gh)
+        self.assertEqual((gh.removed, self.audit("closed.labels_removed")), ([], []))
+        self.assertIn(self.PR, sb.read_impact_state(self.world.state)[0]["applied"], "the record is kept")
+        self.go({self.PR: self.entry()}, gh)
+        self.assertEqual(len(gh.reads), 1, "inside the back-off: no second read")
+        self.world.tick(sb.load_module("closed_pr_labels").RETRY_SECONDS + 1)
+        self.go({self.PR: self.entry()}, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.mine))
+
+    def test_a_failed_read_is_said_once_and_tried_again_after_the_back_off(self):
+        self.record(*self.mine)
+        gh = FakeMergedGh({7: (1, "", "gh: HTTP 502")})
+        self.go({self.PR: self.entry()}, gh)
+        self.go({self.PR: self.entry()}, gh)
+        self.assertEqual((len(gh.reads), len(self.audit("closed.labels_read_failed"))), (1, 1))
+        self.world.tick(sb.load_module("closed_pr_labels").RETRY_SECONDS + 1)
+        gh.answers[7] = self.view(labels=self.mine)
+        self.go({self.PR: self.entry()}, gh)
+        self.assertEqual((sorted(gh.removed), len(self.audit("closed.labels_read_failed"))), (sorted(self.mine), 1))
+
+    def test_an_excluded_repo_is_never_read_and_a_corrupt_record_is_said_once(self):
+        self.record(*self.mine, pr="acme/secret#7")
+        gh = FakeMergedGh({7: self.view(labels=self.mine)})
+        self.go({"acme/secret#7": self.entry(), "other/repo#7": self.entry()}, gh)
+        self.assertEqual((gh.reads, gh.removed), ([], []))
+        (Path(self.world.state) / sb.IMPACT_STATE_FILE).write_text("{not json")
+        self.go({self.PR: self.entry()}, gh)
+        self.go({self.PR: self.entry()}, gh)
+        self.assertEqual((gh.reads, len(self.audit("closed.labels_record_unreadable"))), ([], 1))
+
+    def test_label_removals_count_against_the_cap(self):
+        for n in (10, 11):
+            self.record(*self.mine, pr="acme/api#%d" % n)
+        gh = FakeMergedGh({10: self.view(labels=self.mine), 11: self.view(labels=self.mine)})
+        spent = self.go({"acme/api#10": self.entry(), "acme/api#11": self.entry()}, gh, calls=3)
+        self.assertEqual((spent, len(gh.reads)), (3, 1), "1 read and 2 writes spend the cap of 3: the second pull request waits")
+
     def test_u2_the_reads_stay_within_the_cap(self):
         entries = {}
         answers = {}

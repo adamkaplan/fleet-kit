@@ -162,7 +162,6 @@
         "bin/orders_copy.py",
         "bin/charter_check.py",
         "bin/cloud_worker.py",
-        "bin/closed_pr_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/external_adapter.py",
         "bin/delegated_clear.py",
         "bin/impact_hold.py",
@@ -534,6 +533,7 @@
       ],
       "closure_exempt": {
         "bin/closed_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
+        "bin/closed_pr_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/cloud_worker.py": "loaded only by `run_cloud` and `cmd_status`: the cloud commands, not the clear",
         "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
         "bin/health_records.py": "loaded only by the health and pane pass, which the clear does not run",
