@@ -363,9 +363,10 @@ def warn_low(account, low):
 # less, never another agent wait more or the message stop. A test derives every environment name this file reads and lists the ones that switch the wait off.
 SLOW_SECONDS = 2.0            # the longest any one uncached read of the top spender waits
 NOTICE_EVERY = 3600           # at most one message per account in this many seconds
+TRY_EVERY = 300               # at most one ATTEMPT to send per account in this many seconds, whether or not it made a message (a failing or slow switchboard costs one call in this many, not every call)
+WHO_EVERY = 60                # the identity answer is remembered this long (a stamp in the state directory), so a read does not start a process to ask again
 WHO_SECONDS = 3.0             # the identity question's own deadline
 NOT_AGENTS = frozenset(("daemon", "unknown", "other"))   # lanes that are not an agent a message can name
-SLOW = [False]                # set for THIS call when its caller is the top spender of a low account and the call is a read
 FIXED_STATE = [None]          # test seams, set by a test's own wrapper in the same process, never from the environment
 FIXED_PROGRAM = [None]
 
@@ -453,27 +454,67 @@ def tell_top_spender(state, account):
                 return
         except OSError:
             pass
+        if not fresh_stamp(os.path.join(state, "gh-low-tried", _digest(account)[:16]), TRY_EVERY):
+            return   # an attempt was made a few minutes ago (it may have failed): not again per call
         subprocess.run([binary, "budget-notice", "--account", str(account)], capture_output=True, timeout=8, env=dict(os.environ, FLEET_SWITCHBOARD_OWN_GH="1"))
     except Exception:
         pass
 
 
-def caller_name():
-    """The caller's fleet name from the fixed switchboard's identity answer (its session, never an environment variable of this file's), or None."""
+def fresh_stamp(path, every):
+    """True when `path` is older than `every` seconds or missing, and then touches it (the attempt is claimed BEFORE it is made). False when it is fresh. Never raises."""
+    try:
+        try:
+            if 0 <= time.time() - os.stat(path).st_mtime < every:
+                return False
+        except OSError:
+            pass
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write("1")
+        return True
+    except Exception:
+        return False   # cannot stamp: do not try, the plain call is the answer
+
+
+def caller_name(state=None):
+    """The caller's fleet name from the fixed switchboard's identity answer (its session, never an environment variable of this file's), or None. The answer is
+    remembered WHO_EVERY seconds per parent process in the state directory, a failed question too (None), so it is asked once and not per call."""
     try:
         binary = fixed_switchboard()
         if not binary:
             return None
-        done = subprocess.run([binary, "whoami", "--json"], capture_output=True, text=True, timeout=WHO_SECONDS)
-        name = json.loads(done.stdout).get("name") if done.returncode == 0 else None
-        return name if isinstance(name, str) and NAME_RE.match(name) else None
+        memo = os.path.join(state, "gh-who", _digest("%s:%s:%s" % (os.getuid(), os.getppid(), binary))[:16]) if state else None
+        if memo:
+            try:
+                if 0 <= time.time() - os.stat(memo).st_mtime < WHO_EVERY:
+                    with open(memo) as handle:
+                        said = handle.read(100)
+                    return said if NAME_RE.match(said) else None
+            except OSError:
+                pass
+        name = None
+        try:
+            done = subprocess.run([binary, "whoami", "--json"], capture_output=True, text=True, timeout=WHO_SECONDS)
+            name = json.loads(done.stdout).get("name") if done.returncode == 0 else None
+            name = name if isinstance(name, str) and NAME_RE.match(name) else None
+        finally:
+            if memo:
+                try:
+                    os.makedirs(os.path.dirname(memo), mode=0o700, exist_ok=True)
+                    with open(memo, "w") as handle:
+                        handle.write(name or "")
+                except OSError:
+                    pass
+        return name
     except Exception:
         return None
 
 
-def low_budget_caller(write):
-    """Below the line, for every low account: tell its top spender's orchestrator (once an hour) and mark THIS call to wait when its caller is a top spender and the
-    call is a read. Reads nothing from the environment (see above). Never raises."""
+def low_budget_read(agent=None):
+    """For a READ that will reach GitHub (the cache did not answer it; a write or a cached read never gets here): below the line, for every low account, tell its top
+    spender's orchestrator (the attempt is bounded: once an hour when it worked, once per TRY_EVERY when it did not) and wait SLOW_SECONDS when this caller is a top
+    spender. `agent` is the identity the call already knows, else it is asked (and remembered). Reads nothing from the environment (see above). Never raises, never refuses."""
     try:
         state = fixed_state_directory()
         if not state:
@@ -483,21 +524,15 @@ def low_budget_caller(write):
             top = top_spender(account, state)
             if top is not None:
                 tops[account] = top
-                tell_top_spender(state, account)
-        if tops and not write:
-            name = caller_name()
-            if name is not None and any(top[0] == name for top in tops.values()):
-                SLOW[0] = True
+        if not tops:
+            return
+        for account in tops:
+            tell_top_spender(state, account)
+        name = agent if isinstance(agent, str) and NAME_RE.match(agent) else caller_name(state)
+        if name is not None and any(top[0] == name for top in tops.values()):
+            time.sleep(SLOW_SECONDS)
     except Exception:
         pass
-
-
-def slow_if_top_spender():
-    """The bounded wait of an UNCACHED read by a top spender while its account is low (a cached read never reaches here, a write and every other agent never
-    set it). Once per call; never a refusal."""
-    if SLOW[0]:
-        SLOW[0] = False
-        time.sleep(SLOW_SECONDS)
 
 
 def split_response(raw):
@@ -539,7 +574,7 @@ def cached_read(gh, env, args, agent, account, low):
         sys.stdout.buffer.flush()
         return 0
     argv = [gh, "api", "-i"] + (["-H", "If-None-Match: " + entry[1]] if entry is not None and entry[1] else []) + [path]
-    slow_if_top_spender()   # an uncached read by the top spender of a low account waits a bounded time (a cached answer returned above, with no wait)
+    low_budget_read(agent)   # an uncached read reaches GitHub here: the top spender's message attempt and bounded wait (a cached answer returned above, with none)
     done = subprocess.run(argv, capture_output=True, env=env)   # the one request (the real gh does not time out either)
     # from here a request is SPENT: whatever happens below, this returns its status and never lets the caller run a second request
     count_now = True
@@ -1661,9 +1696,8 @@ def run(args):
             return 1
     audit_write(args, lookup, "passed", write, hold_repo, hold_number)
     warn_text(args)
-    if command_words(args) and command_words(args)[0] not in NO_NETWORK_GROUPS:
-        low_budget_caller(write)   # the top spender's message and wait: reads nothing from the environment, and the switchboard's own marker does not skip it
     served = None
+    agent = None
     try:
         own = os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1"
         words = command_words(args)
@@ -1682,7 +1716,8 @@ def run(args):
         served = None   # the cache never fails the command
     if served is not None:
         return served
-    slow_if_top_spender()   # a read that spends (it was not served from the cache) waits when its caller is the top spender of a low account
+    if not write and command_words(args) and command_words(args)[0] not in NO_NETWORK_GROUPS:
+        low_budget_read(agent)   # only a READ that reaches GitHub (not a write, not a cached answer): the top spender's message, and its bounded wait
     count_call(args)
     if plan is None:
         if APP_DIRS:   # a token file has to be removed after the call: gh runs as a child, not in place of this process
