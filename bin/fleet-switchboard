@@ -7270,9 +7270,9 @@ def pane_health_status_lines(state_dir, now=None):
     if not seen["whole"]:
         return ["      panes      the agent registry could not be read (%s): no pane state shown" % _one_line(str(seen["problem"]), 120)]
     retired = seen["retired"]
-    # A pure view of the registry (#919): a dead agent the registry still holds is drawn. `collect_status` runs the reconcile on read first, so a dead
-    # agent herdr proves gone is already removed from the registry and never reaches here; one it could not prove gone stays, and is shown.
-    bad = [(n, v) for n, v in sorted(seen["agents"].items()) if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in retired]
+    # A dead agent is never drawn (#919, S10): the reconcile on read (run by `collect_status` first) removes the provably dead one, and one it could not remove is
+    # still not drawn as dead. The view reads only the registry: an agent it does not hold has no row, and a read that is not whole says so above.
+    bad = [(n, v) for n, v in sorted(seen["agents"].items()) if v.get("state") == PANE_DETACHED and n not in retired]
     clock = time.time() if now is None else now
     last = _read_small(state_dir, LAST_REPORT_FILE)
     gone = [n for n, v in sorted(retired.items()) if clock - (v.get("at") or 0) <= RETIRED_SHOW_DAYS * 86400]

@@ -4774,13 +4774,13 @@ class TestLaunch(Base):
         now = self.world.clock.now()
         self.dead_worker({"state": "working", "at": now - 3 * 3600})
         lines = "\n".join(sb.pane_health_status_lines(self.world.state, now))
-        self.assertIn("worker DEAD", lines)   # the registry holds it dead and nothing has removed it: the view draws it (collect_status reconciles first, #919)
+        self.assertNotIn("DEAD", lines)   # the registry holds it dead: a view never draws a dead agent (S10); collect_status reconciles first and removes the provably dead one (#919)
         text = sb.dead_hint.hint("worker", {"state": "working", "at": now - 3 * 3600}, now)
         self.assertIn("last report: working 3h ago", text)   # a final done would have retired it already
         self.assertIn("fleet-switchboard retire worker", text)
         self.assertIn("fleet-switchboard reattach worker", text)
 
-    def test_dead_hint_s1b_the_view_draws_only_what_the_registry_holds_dead(self):
+    def test_dead_hint_s1b_the_view_never_draws_a_dead_agent_and_says_when_the_registry_is_unreadable(self):
         now = self.world.clock.now()
         self.dead_worker({"state": "working", "at": now - 3 * 3600})
         path = self.world.state / "registry.json"
@@ -4790,9 +4790,7 @@ class TestLaunch(Base):
         doc = json.loads(path.read_text())
         doc["agents"]["worker"]["state"] = "dead"
         path.write_text(json.dumps(doc))
-        self.assertIn("worker DEAD", "\n".join(sb.pane_health_status_lines(self.world.state, now)))   # held dead and not removed: drawn
-        reg.reconcile_remove(self.world.state, "worker", {"pane_listed": False, "process_found": False, "why": "test"}, True)
-        self.assertNotIn("worker", "\n".join(sb.pane_health_status_lines(self.world.state, now)))   # removed through the registry: gone from the view
+        self.assertNotIn("worker", "\n".join(sb.pane_health_status_lines(self.world.state, now)))   # held dead: not drawn
         for label, text, want in (("empty registry", json.dumps({"version": 1, "agents": {}, "retired": {}}), None),
                                   ("torn file", "{torn", "could not be read"),
                                   ("only another agent", json.dumps({"version": 1, "agents": {"other": {"state": "idle", "session": "ses_x"}}, "retired": {}}), None),
@@ -4800,7 +4798,7 @@ class TestLaunch(Base):
             with self.subTest(registry=label):
                 path.write_text(text)
                 lines = "\n".join(sb.pane_health_status_lines(self.world.state, now))
-                self.assertNotIn("worker DEAD", lines)   # the registry is the only record: no pane-health copy brings the row back
+                self.assertNotIn("DEAD", lines)   # the registry is the only record: an agent it does not hold has no row, and no copy brings one back
                 if want:
                     self.assertIn(want, lines)
 
