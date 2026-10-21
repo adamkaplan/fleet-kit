@@ -77751,7 +77751,7 @@ class TestBlockedReport(Base):
         self.wait(5)
         for name in ("platform", "cos"):
             (found,) = self.told(name)
-            for part in ("coder", "blocked for 25 minutes", "2 messages from cos, platform"):
+            for part in ("coder", "blocked for 25 minutes", "2 refused sends the senders must repeat"):
                 self.assertIn(part, found["text"])
         self.assertEqual(len(self.audits()), 1)
 
@@ -77876,11 +77876,11 @@ class TestBlockedReport(Base):
         now = self.world.clock.now()
         ids = [sb.add_reminder(self.world.state, "coder", now - 10 + n, now - 600, "t", sender="coder")["id"] for n in range(sb.BLOCKED_LINE_REMINDERS + 1)]
         senders = ["sender%02d" % n for n in range(sb.BLOCKED_LINE_SENDERS + 2)]
-        line = sb.blocked_line(self.world.engine, observation, now - 1500, now, senders, "x")
+        line = sb.blocked_line(self.world.engine, observation, now - 1500, now, senders, [], "x")
         self.assertIn("and 2 more", line)
         self.assertIn("and 1 more", line)
         self.assertEqual(sum(1 for i in ids if i in line), sb.BLOCKED_LINE_REMINDERS)
-        self.assertLessEqual(len(sb.blocked_line(self.world.engine, observation, now - 1500, now, ["y" * 5000] * 3, "k" * 5000)), sb.BLOCKED_LINE_CHARS)
+        self.assertLessEqual(len(sb.blocked_line(self.world.engine, observation, now - 1500, now, ["y" * 5000] * 3, ["z" * 5000] * 3, "k" * 5000)), sb.BLOCKED_LINE_CHARS)
 
     def test_a_corrupt_state_file_is_read_as_empty(self):
         for name in (sb.BLOCKED_ALERT_STATE, sb.BLOCKED_HELD_SENDS):
@@ -77910,6 +77910,62 @@ class TestBlockedReport(Base):
         sb.blocked_tick(self.world.engine, self.world.engine.discover(self.world.clock.now()),
                         {"coder": sb.Plan("coder", "hold", "coder has status unknown in herdr", [])})
         self.assertTrue(any("still held: coder has status unknown" in e["detail"]["text"] for e in self.audits("blocked.end")))
+
+    def end_block(self, refused=()):
+        for sender in refused:   # a refused send stores nothing: only its row remains
+            sb.note_held_send(self.world.state, "coder", sender, self.world.clock.now(), self.blocked_observation())
+        self.wait(25)
+        self.pane["status"] = "idle"
+        self.world.v2.sessions[self.world.sessions["coder"]]["turn"] = None
+        self.passes()
+        return [e["detail"] for e in self.audits("blocked.end")]
+
+    def test_the_end_line_of_a_block_with_only_refused_sends_does_not_say_delivered(self):
+        self.block(senders=())
+        (end,) = self.end_block(refused=("cos", "platform"))
+        self.assertFalse(end["delivered"])
+        for text in (end["text"], *(t["text"] for t in self.told("cos"))):
+            self.assertNotIn("were delivered", text)
+        self.assertIn("2 refused sends never stored and NOT delivered: ask cos, platform to send again", end["text"])
+        self.assertIn("2 refused sends the senders must repeat (not stored; ask cos, platform)", self.told("cos")[0]["text"])
+
+    def hold_in_the_daemon(self):
+        """The daemon's own pending facts for the blocked agent (the harness's `send` refuses instead): one tick with a plan holding two."""
+        facts = [sb.Fact("lab.fact:%d" % n, "coder", "lab.fact", "s", 1, sender="platform") for n in range(2)]
+        sb.blocked_tick(self.world.engine, self.world.engine.discover(self.world.clock.now()), {"coder": sb.Plan("coder", "hold", "blocked", facts)})
+
+    def test_the_end_line_of_a_mix_says_the_held_were_delivered_and_the_refused_were_not(self):
+        self.block(senders=())
+        self.wait(25)
+        sb.note_held_send(self.world.state, "coder", "cos", self.world.clock.now(), self.blocked_observation())
+        self.hold_in_the_daemon()
+        self.world.engine.run_pass()
+        self.assertIn("Held for it: 2 messages from platform. 1 refused send the senders must repeat (not stored; ask cos)", self.told("cos")[0]["text"])
+        self.pane["status"] = "idle"
+        self.world.v2.sessions[self.world.sessions["coder"]]["turn"] = None
+        self.passes()
+        (end,) = [e["detail"] for e in self.audits("blocked.end")]
+        self.assertTrue(end["delivered"])
+        self.assertIn("the held messages were delivered; 1 refused send never stored and NOT delivered: ask cos to send again", end["text"])
+
+    def test_the_end_line_of_only_daemon_held_messages_says_delivered_and_names_no_refusal(self):
+        self.block(senders=())
+        self.wait(25)
+        self.hold_in_the_daemon()
+        self.pane["status"] = "idle"
+        self.world.v2.sessions[self.world.sessions["coder"]]["turn"] = None
+        self.passes()
+        (end,) = [e["detail"] for e in self.audits("blocked.end")]
+        self.assertTrue(end["delivered"])
+        self.assertIn("the held messages were delivered", end["text"])
+        self.assertNotIn("refused", end["text"])
+
+    def test_the_line_says_first_seen_and_never_since(self):
+        self.block()
+        self.wait(25)
+        (found,) = self.told("cos")
+        self.assertIn("first seen blocked at", found["text"])
+        self.assertNotIn("(since", found["text"])
 
     def test_a_block_whose_agent_is_gone_says_nothing(self):
         self.block()
@@ -78056,13 +78112,13 @@ class TestBlockedReport(Base):
         later = sb.add_reminder(self.world.state, "coder", now + 600, now - 900, "later", sender="coder")["id"]
         before = sb.add_reminder(self.world.state, "coder", now - 5000, now - 9000, "before", sender="coder")["id"]
         to_other = sb.add_reminder(self.world.state, "platform", now - 5, now - 900, "other", sender="coder")["id"]
-        line = sb.blocked_line(self.world.engine, observation, now - 1500, now, [], "x")
+        line = sb.blocked_line(self.world.engine, observation, now - 1500, now, [], [], "x")
         self.assertIn(mine, line)
         for excluded in (others, later, before, to_other):
             self.assertNotIn(excluded, line)
         self.assertIn("from nobody", line)
         self.assertEqual(line.count("reminders"), 1)
-        self.assertNotIn("reminders", sb.blocked_line(self.world.engine, observation, now - 1500, now - 1000, ["cos"], "x"))
+        self.assertNotIn("reminders", sb.blocked_line(self.world.engine, observation, now - 1500, now - 1000, ["cos"], [], "x"))
 
     def test_the_config_branches(self):
         base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}

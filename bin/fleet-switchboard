@@ -15536,16 +15536,29 @@ def _named(items, limit):
     return ", ".join(shown) + (" and %d more" % (len(items) - limit) if len(items) > limit else "")
 
 
-def blocked_line(engine, observation, since, now, held, kind):
+def _sender_names(who):
+    return sorted({_one_line(str(w), BLOCKED_SENDER_CHARS) for w in who})
+
+
+def blocked_line(engine, observation, since, now, held, refused, kind):
+    """`held` is one sender per message the daemon holds (delivered when the block ends); `refused` one sender per send that was refused
+    and stored nowhere (the sender must send again). The two are said apart."""
     minutes = int((now - since) // 60)
     reminders = [r for r in read_reminders(engine.state_dir) if r.get("to") == observation.name and r.get("from") == observation.name
                  and isinstance(r.get("at"), (int, float)) and since <= r["at"] <= now]
-    senders = sorted({_one_line(str(who), BLOCKED_SENDER_CHARS) for who in held})   # `held` is one sender per message
-    text = "%s has been blocked for %d minutes (since %s) on %s." % (observation.name, minutes, iso(since), kind)
-    text += " Held for it: %d message%s from %s." % (len(held), "" if len(held) == 1 else "s", _named(senders, BLOCKED_LINE_SENDERS) or "nobody")
+    text = "%s has been blocked for %d minutes (first seen blocked at %s) on %s." % (observation.name, minutes, iso(since), kind)
+    if held or not refused:
+        text += " Held for it: %d message%s from %s." % (len(held), "" if len(held) == 1 else "s", _named(_sender_names(held), BLOCKED_LINE_SENDERS) or "nobody")
+    if refused:
+        text += " %d refused send%s the senders must repeat (not stored; ask %s)." % (len(refused), "" if len(refused) == 1 else "s", _named(_sender_names(refused), BLOCKED_LINE_SENDERS))
     if reminders:
         text += " Its own reminders due during the block: %s." % _named(["%s due %s" % (r["id"], iso(r["at"])) for r in reminders], BLOCKED_LINE_REMINDERS)
     return _one_line(text, BLOCKED_LINE_CHARS)
+
+
+def _refused_senders(entry):
+    rows = entry.get("rows") if isinstance(entry, dict) else None
+    return [str(r.get("from") or "unknown") for r in (rows if isinstance(rows, list) else []) if isinstance(r, dict)]
 
 
 def blocked_tick(engine, discovery, held):
@@ -15556,8 +15569,14 @@ def blocked_tick(engine, discovery, held):
         return []
     now, state, done = engine.now(), blocked_update(engine.state_dir, BLOCKED_ALERT_STATE, lambda _: None), []
     waiting = {n for n, o in discovery.agents.items() if o.status == "blocked"}
-    refused = blocked_update(engine.state_dir, BLOCKED_HELD_SENDS,
-                             lambda found: {n: v for n, v in found.items() if n in waiting} if set(found) - waiting else None)   # a send held for an agent that is no longer blocked is forgotten
+    ended_refused = {}
+
+    def forget(found):   # a send refused for an agent that is no longer blocked is forgotten, after the end line has named its senders
+        if set(found) - waiting:
+            ended_refused.update({n: v for n, v in found.items() if n not in waiting})
+            return {n: v for n, v in found.items() if n in waiting}
+        return None
+    refused = blocked_update(engine.state_dir, BLOCKED_HELD_SENDS, forget)
     cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None)
 
     def tell(observation, text, event, detail):
@@ -15584,9 +15603,9 @@ def blocked_tick(engine, discovery, held):
             changed = True
         plan = held.get(name)
         messages = [fact.sender or "unknown" for fact in (plan.pending if plan is not None else [])]
-        rows = (refused.get(name) or {}).get("rows")
-        messages += [str(r.get("from") or "unknown") for r in (rows if isinstance(rows, list) else []) if isinstance(r, dict)]
-        if not messages:
+        refusals = _refused_senders(refused.get(name))
+        entry["held"], entry["refused"] = len(messages), len(refusals)   # what the end line may say: the daemon's messages arrive, the refused ones never do
+        if not messages and not refusals:
             continue
         last = entry.get("reported")
         if last is None and now - entry["since"] >= section["minutes"] * 60:
@@ -15596,7 +15615,8 @@ def blocked_tick(engine, discovery, held):
         else:
             continue
         kind = blocked_kind(engine, seen)
-        tell(seen, blocked_line(engine, seen, entry["since"], now, messages, kind), event, {"since": iso(entry["since"]), "held": len(messages)})
+        tell(seen, blocked_line(engine, seen, entry["since"], now, messages, refusals, kind),
+             event, {"since": iso(entry["since"]), "held": len(messages), "refused": len(refusals)})
         entry["reported"] = now
         blocked_update(engine.state_dir, BLOCKED_ALERT_STATE, lambda _: state)   # after each one: a crash repeats at most one
         done.append((name, event.split(".")[1]))
@@ -15608,11 +15628,20 @@ def blocked_tick(engine, discovery, held):
         seen = discovery.agents.get(name)
         if seen is None:
             continue   # gone from the fleet: nobody to say it about
-        delivered = name not in held
-        text = "%s was blocked from %s to %s (%d minutes); the block has ended and %s." % (
-            name, iso(entry["since"]), iso(now), int((now - entry["since"]) // 60),
-            "the held messages were delivered" if delivered else "its messages are still held: %s" % _one_line(held[name].reason, 200))
-        tell(seen, text, "blocked.end", {"since": iso(entry["since"]), "delivered": delivered})
+        refusals = _refused_senders(ended_refused.get(name))
+        had_held = bool(entry.get("held")) or name in held
+        delivered = had_held and name not in held   # only the daemon's own held messages are ever delivered
+        parts = []
+        if name in held:
+            parts.append("its messages are still held: %s" % _one_line(held[name].reason, 200))
+        elif had_held:
+            parts.append("the held messages were delivered")
+        if refusals:
+            parts.append("%d refused send%s never stored and NOT delivered: ask %s to send again" % (
+                len(refusals), "" if len(refusals) == 1 else "s", _named(_sender_names(refusals), BLOCKED_LINE_SENDERS)))
+        text = "%s was blocked from %s to %s (%d minutes); the block has ended%s." % (
+            name, iso(entry["since"]), iso(now), int((now - entry["since"]) // 60), (" and " + "; ".join(parts)) if parts else "")
+        tell(seen, text, "blocked.end", {"since": iso(entry["since"]), "delivered": delivered, "refused": len(refusals)})
         done.append((name, "end"))
     if changed or done:
         blocked_update(engine.state_dir, BLOCKED_ALERT_STATE, lambda _: state)
