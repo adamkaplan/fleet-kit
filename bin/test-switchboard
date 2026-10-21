@@ -58855,14 +58855,15 @@ class TestJobEndRecord(StandInPids, unittest.TestCase):
                     else:
                         self.assertEqual(len(text.strip().splitlines()), 1, text)
                         self.assertNotIn("fleet-job: line", text)
+                        self.assertIn(command[0].split("/")[-1] if command[0] != "/dev/null" else "/dev/null", text)
                     self.assertEqual(exit_path.read_text().strip() if exit_path.exists() else None, exit_is)
                     self.assertNotRegex(text, r"Killed|Terminated|Segmentation|\[[0-9]+\]")
 
     def test_a_reason_file_that_is_not_a_signal_reason_makes_no_line(self):
-        for said in ("whatever the file says", "signal 9999", "signal \x1b[31m9", "signal 15 and more"):
+        for number, said in enumerate(("whatever the file says", "signal 9999", "signal \x1b[31m9", "signal 15 and more")):
             with self.subTest(said=said):
                 self.audited.clear()
-                job = "badreason"
+                job = "badreason%d" % number
                 record = self.start(job, "sh", "-c", "echo bye")
                 self.procs[job].wait(timeout=30)
                 (self.root / job / "exit.reason").write_text(said + "\n")
