@@ -1475,18 +1475,18 @@ def status_lines(runner, state, timeout=STATUS_SECONDS):
     lines, rows = [], []
     cluster, snapshot, reason = None, None, None
     started = time.monotonic()
-    if records:   # the summary needs the cluster: ONE login for the whole run
-        try:
-            cluster = Cluster(timeout=SNAPSHOT_SECONDS).__enter__()
-            snapshot = _cluster_snapshot(runner, cluster, max(1, int(SNAPSHOT_SECONDS - (time.monotonic() - started))))
-        except CloudError as err:
-            reason = _one(str(err), 300)
-        if snapshot is None:
-            lines.append("      cloud: cluster not read (%s) after %d s; nodes and pods unknown"
-                         % (reason or "the launcher read nothing", int(time.monotonic() - started)))
-        else:
-            lines.append("      " + _summary_line(snapshot, time.time()))
     try:
+        if records:   # the summary needs the cluster: ONE login for the whole run
+            try:
+                cluster = Cluster(timeout=SNAPSHOT_SECONDS).__enter__()
+                snapshot = _cluster_snapshot(runner, cluster, max(1, int(SNAPSHOT_SECONDS - (time.monotonic() - started))))
+            except CloudError as err:
+                reason = _one(str(err), 300)
+            if snapshot is None:
+                lines.append("      cloud: cluster not read (%s) after %d s; nodes and pods unknown"
+                             % (reason or "the launcher read nothing", int(time.monotonic() - started)))
+            else:
+                lines.append("      " + _summary_line(snapshot, time.time()))
         for record in records:
             row = {"worker": record["worker"]}
             if "problem" in record:
