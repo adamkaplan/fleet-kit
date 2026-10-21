@@ -24,7 +24,7 @@ SECRET_GLOBS = [".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*",
 
 
 DEFAULT_WORKDIR = "/work/repo"
-GIT_BASE = "https://github.com"   # the only place the fresh token is offered to (CW_HOOK_GIT_BASE: the pod's own setting, for tests)
+GIT_BASE = "https://github.com"   # the only place the fresh token is offered to: fixed in code, not read from any environment
 REPO_RE = re.compile(r"^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)?$")
 HARDEN = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=", "-c", "core.askPass=", "-c", "core.sshCommand=false",
           "-c", "http.proxy=", "-c", "credential.useHttpPath=false"]
@@ -43,7 +43,7 @@ def read_token(stream):
 
 
 def git_base():
-    return (os.environ.get("CW_HOOK_GIT_BASE") or GIT_BASE).rstrip("/")
+    return GIT_BASE
 
 
 def remote_url():

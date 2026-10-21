@@ -116,12 +116,22 @@ class RetirePush(base.Base):
         g("add", "-A", cwd=self.work)
         g("commit", "-m", "work", cwd=self.work)
         self.head = subprocess.run(["git", "-C", self.work, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-        self.patch_state(hook_env={"CW_WORKDIR": self.work, "CW_WORKER": "coder7", "CW_HOOK_GIT_BASE": "http://127.0.0.1:%d" % self.srv.server_address[1],
-                                    "CW_REPO": "repo"})
+        self.patch_state(hook_env={"CW_WORKDIR": self.work, "CW_WORKER": "coder7", "CW_REPO": "repo"},
+                         hook_path=self.local_hook())
         self.env["CW_GIT_TOKEN_CMD"] = self.mint_cmd(FRESH)
         self.env["FAKE_KUBE_SEEN"] = os.path.join(d, "seen.jsonl")
 
     # -- helpers --
+    def local_hook(self):
+        """A copy of the hook whose fixed base is the local test server (the shipped hook has no setting for it)."""
+        src = open(os.path.join(os.path.dirname(HERE), "end_hook.py")).read()
+        line = 'GIT_BASE = "https://github.com"'
+        self.assertIn(line, src)
+        path = os.path.join(self.tmp.name, "local_hook.py")
+        with open(path, "w") as f:
+            f.write(src.replace(line, 'GIT_BASE = "http://127.0.0.1:%d"' % self.srv.server_address[1], 1))
+        return path
+
     def mint_cmd(self, tok):
         """A mint command that reads the token from a file kept out of every scan: the command line itself never holds it."""
         path = os.path.join(self.tmp.name, "mint.tok")
@@ -249,7 +259,8 @@ class RetirePush(base.Base):
         self.assertNotIn(FRESH, out + err)
 
     def test_a_token_without_a_recorded_repository_pushes_nowhere(self):
-        self.patch_state(hook_env={"CW_WORKDIR": self.work, "CW_WORKER": "coder7", "CW_HOOK_GIT_BASE": "http://127.0.0.1:%d" % self.srv.server_address[1]})
+        self.patch_state(hook_env={"CW_WORKDIR": self.work, "CW_WORKER": "coder7"},
+                         hook_path=self.local_hook())
         code, out, err = self.retire()
         self.assert_kept(code, err, "push")
         self.assertEqual(self.srv.seen, [])
