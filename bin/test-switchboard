@@ -76773,7 +76773,7 @@ class TestMergeGateDecision(MergeGateBase):
     def test_the_integration_branch_is_allowed_without_a_gate_pass_when_the_key_does_not_list_it(self):
         self.fake.base = "integration"
         self.moved()
-        self.assertEqual(self.check()[:2], (True, "branch integration is not gated"))
+        self.assertEqual(self.check(), (True, "branch integration is not gated", MG_HEAD), "the head is returned: the shim binds the merge to it")
 
     def test_the_configuration_key_is_validated(self):
         gate = self.gate
@@ -76883,6 +76883,12 @@ class TestMergeGateLock(MergeGateBase):
         self.assertTrue(ok)
         self.assertIn("its holder is gone", said)
 
+    def test_a_lock_whose_holder_process_is_alive_is_not_recovered_past_the_grace(self):
+        self.take("coder-a", 1000, pid=4242)
+        ok, lock, said = self.take("coder-b", 1000 + self.gate.HOLDER_GRACE + 300, alive=lambda p: True)
+        self.assertFalse(ok)
+        self.assertEqual(lock["holder"], "coder-a")
+
     def test_only_the_holder_releases_and_the_same_holder_may_take_it_again(self):
         self.take("coder-a", 1000)
         self.assertFalse(self.gate.release(self.state, self.repo, "main", "coder-b"))
@@ -76990,10 +76996,16 @@ class TestMergeGateMutants(MergeGateBase):
         gate.acquire = acquire_then_move
         self.assertFalse(self.run_pass(gate=gate)[0])
 
+    def scenario_a_live_holder_is_not_recovered(self, gate):
+        gate.acquire(self.state, self.repo, "main", "coder-a", 4242, "x#1", 1000, 1200, lambda p: True)
+        ok = gate.acquire(self.state, self.repo, "main", "coder-b", 4243, "x#2", 1000 + gate.HOLDER_GRACE + 300, 1200, lambda p: True)[0]
+        self.assertFalse(ok)
+
     CASES = (("skip the base comparison", 'if facts["run_base"] != facts["tip"]:', "if False:", "scenario_moved_branch_needs_a_rerun"),
              ("skip the lock", 'if lock is None or stale or lock.get("holder") != caller:', "if False:", "scenario_no_lock_no_merge"),
              ("accept a stale gate pass", 'if got.get("head") != facts["head"] or got.get("branch") != facts["branch"] or got.get("tip") != facts["tip"]:',
               "if False:", "scenario_stale_pass_is_refused"),
+             ("recover a lock whose holder is alive", "and now - since > HOLDER_GRACE and not alive(pid)", "and now - since > HOLDER_GRACE", "scenario_a_live_holder_is_not_recovered"),
              ("skip the re-read under the lock", 'if tip != facts["tip"] or head != facts["head"] or tip != facts["run_base"]:', "if False:",
               "scenario_the_branch_moving_under_the_lock_blocks_the_pass"))
 
@@ -77087,8 +77099,9 @@ class TestGhShimMergeGate(Base):
                            "if [ \"$1\" = whoami ]; then\n  echo '{\"name\": \"worker\", \"repo\": \"acme/app\"}'; exit 0; fi\n"
                            "if [ \"$1\" = review ]; then exit 0; fi\n"
                            "if [ \"$1\" = merge-gate ]; then\n  echo \"$@ own=$FLEET_SWITCHBOARD_OWN_GH\" >> %r\n"
+                           "  echo \"state=$XDG_STATE_HOME cfg=$XDG_CONFIG_HOME fsb=$FLEET_SWITCHBOARD_STATE bin=$FLEET_SWITCHBOARD_BIN home=$HOME\" >> %r\n"
                            "  [ -n \"$FAKE_MG_SLEEP\" ] && sleep $FAKE_MG_SLEEP\n  [ \"$3\" = --release ] && exit 0\n"
-                           "  echo \"$FAKE_MG_JSON\"; exit ${FAKE_MG_EXIT:-0}\nfi\nexit 2\n" % str(self.calls))
+                           "  echo \"$FAKE_MG_JSON\"; exit ${FAKE_MG_EXIT:-0}\nfi\nexit 2\n" % (str(self.calls), str(self.calls) + ".env"))
         self.sb.chmod(0o755)
         subprocess.run([str(self.sb), "whoami"], capture_output=True, timeout=60)
         (self.home / ".config" / "fleet-switchboard").mkdir(parents=True)
@@ -77214,6 +77227,8 @@ class TestGhShimMergeGate(Base):
             if base[i] == "/":
                 out["double slash %d" % i] = base[:i] + "//" + base[i + 1:]
         out["double encoded"] = base.replace("/", "%252f")
+        out.update({"nul": base + "%00", "space": base + "%20", "semicolon": base + ";x", "backslashes": base.replace("/", "\\"), "encoded backslashes": base.replace("/", "%5c"),
+                    "tab": base + "%09", "suffix": base + "able"})
         out.update({"dot segment": "repos/acme/app/pulls/12/../12/merge", "dot once": "repos/acme/app/pulls/./12/merge", "dot at the end": base + "/.",
                     "dot-dot elsewhere": "repos/x/../acme/app/pulls/12/merge", "encoded dots": "repos/acme/app/pulls/12/%2e%2e/12/merge",
                     "encoded dot": "repos/acme/app/pulls/%2e/12/merge", "double-encoded dots": "repos/acme/app/pulls/12/%252e%252e/12/merge",
@@ -77251,7 +77266,7 @@ class TestGhShimMergeGate(Base):
                  ("repeated slashes are not collapsed", 're.sub(r"/{2,}", "/", ', "("),
                  ("a gh placeholder is read as a repository", r'[{}$<>:]', r'[{}$<>]'),
                  ("dot segments are not resolved", 'parts, climbed = resolve_dots(path.split("/"))', 'parts, climbed = path.split("/"), False'),
-                 ("a merge path is only seen at the end of the argument", '(^|/)pulls/[^/]*/merge(/|$)', '(^|/)pulls/[^/]*/merge$'))
+                 ("a merge path is only seen at the end of the argument", '(^|/)pulls/[^/]*/merge", path, re.I)', '(^|/)pulls/[^/]*/merge$", path, re.I)'))
         for label, old, new, *count in cases:
             with self.subTest(mutant=label):
                 self.mutated_shim(old, new, *(count or [1]))
@@ -77350,6 +77365,66 @@ class TestGhShimMergeGate(Base):
         self.mutated_shim("    words = command_word_positions(args)\n    if len(words) < 2 or words[0][1] != \"pr\":", "    return args\n    words = command_word_positions(args)\n    if len(words) < 2 or words[0][1] != \"pr\":")
         self.assertFalse(all(self.refused_call(a) for a in self.call_shapes().values()))
         self.shim_path = None
+
+    HOSTILE = {"XDG_STATE_HOME": "/tmp/forged-state", "XDG_CONFIG_HOME": "/tmp/forged-config", "FLEET_SWITCHBOARD_STATE": "/tmp/forged-fsb",
+               "FLEET_SWITCHBOARD_BIN": "/tmp/forged-bin-unused", "HOME": "/tmp/forged-home"}
+
+    def env_seen(self, **more):
+        """What the switchboard the shim starts SEES of the hostile names, for one gated merge asked and one released: [{name: value}] per call."""
+        log = Path(str(self.calls) + ".env")
+        if log.exists():
+            log.unlink()
+        env = dict(self.allowed(), **self.HOSTILE)
+        env.update(more)
+        done, seen = self.run_shim(*self.MERGE, env=env)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        rows = []
+        for line in log.read_text().splitlines():
+            rows.append(dict(part.split("=", 1) for part in line.split(" ")))
+        return rows
+
+    def test_the_switchboard_the_shim_starts_runs_in_a_fixed_environment_whatever_the_caller_sets(self):
+        rows = self.env_seen()
+        self.assertEqual(len(rows), 2, "the check and the release")
+        for row in rows:
+            self.assertEqual((row["state"], row["cfg"], row["fsb"], row["bin"]), ("", "", "", ""), row)
+            self.assertNotEqual(row["home"], self.HOSTILE["HOME"])
+            self.assertEqual(row["home"], str(self.home), "HOME is the account's, not the caller's")
+
+    def test_each_hostile_variable_has_a_mutant_that_lets_it_through_and_the_test_sees_it(self):
+        tail = '    if own:\n        env["FLEET_SWITCHBOARD_OWN_GH"] = "1"\n    return env'
+        for name in self.HOSTILE:
+            with self.subTest(variable=name):
+                self.mutated_shim(tail, '    env[%r] = os.environ[%r]\n' % (name, name) + tail)
+                try:
+                    rows = self.env_seen()
+                finally:
+                    self.shim_path = None
+                key = {"XDG_STATE_HOME": "state", "XDG_CONFIG_HOME": "cfg", "FLEET_SWITCHBOARD_STATE": "fsb", "FLEET_SWITCHBOARD_BIN": "bin", "HOME": "home"}[name]
+                leaked = self.HOSTILE[name]
+                self.assertTrue(any(row[key] == leaked for row in rows), "the mutant that passes %s on is seen" % name)
+
+    def test_every_xdg_and_fleet_switchboard_name_the_switchboard_reads_is_dropped_from_its_environment_unless_listed(self):
+        names = sorted(set(re.findall(r'"((?:XDG_|FLEET_SWITCHBOARD_)[A-Z_]+)"', (BIN / "fleet-switchboard").read_text())))
+        self.assertGreater(len(names), 5)
+        shim = self.shim_module()
+        with mock.patch.dict(os.environ, {n: "x" for n in names}):
+            seen = shim.sb_env(own=True)
+        kept = sorted(n for n in names if n in seen)
+        self.assertEqual(kept, sorted(set(shim.KEEP_FLEET_NAMES + ("FLEET_SWITCHBOARD_OWN_GH",)) & set(names)), "only the identity names and the own-call marker survive")
+
+    def test_the_net_under_the_merge_gate_probe_refuses_when_anything_unexpected_goes_wrong(self):
+        for mutate in (False, True):
+            if mutate:
+                self.mutated_shim('        return mg_refuse("merge refused: the merge gate hit an unexpected error")', "        return None")
+            shim = self.shim_module()
+            self.shim_path = None
+            with mock.patch.object(shim, "merge_gate_repos", lambda: {"acme/app"}), mock.patch.object(shim, "mg_binary", lambda: (_ for _ in ()).throw(RuntimeError("hostile"))):
+                got = shim.merge_gate_probe(["pr", "merge", "12", "-R", "acme/app"], mock.Mock(), "/bin/true")
+            if mutate:
+                self.assertIsNone(got, "the mutant allows by default: the test above would have caught it")
+            else:
+                self.assertEqual(got[0], "refuse")
 
     def test_the_program_comes_from_the_account_home_and_never_from_the_environment_even_when_nothing_is_injected(self):
         liar = self.home / "liar"

@@ -374,7 +374,7 @@ def check_merge(reading, gh, conf, state, repo, number, caller, person, waived_h
     if facts["problems"]:
         return False, "merge of %s#%d refused: %s (the gate fails closed)" % (repo, number, facts["problems"][0]), None
     if not facts["gated"]:
-        return True, "branch %s is not gated" % facts["branch"], None
+        return True, "branch %s is not gated" % facts["branch"], facts["head"]
     if person:
         return True, "the owner's own terminal", facts["head"]
     if waived_head(facts["head"]):
