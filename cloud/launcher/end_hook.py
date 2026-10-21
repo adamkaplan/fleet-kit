@@ -56,19 +56,48 @@ def remote_url():
     return "%s/%s.git" % (git_base(), repo)
 
 
-def git(workdir, *args, check=True, token=None):
-    cmd, env = ["git", "-C", workdir], None
-    if token:   # the helper text carries no token; the token is in this one child's environment only
-        # The repository is the agent's and its config is not trusted: the helper answers for ONE fixed host (never the
-        # origin URL read from that config), and nothing the repository can name runs with the token in its environment.
-        cmd += ["-c", "credential.helper=", "-c", "credential.helper=" + HELPER] + HARDEN
-        u = urlparse(git_base())
-        env = dict(os.environ, CW_PUSH_TOKEN=token, CW_PUSH_HOST=u.netloc, CW_PUSH_SCHEME=u.scheme, GIT_ALLOW_PROTOCOL=u.scheme,
-                   GIT_TERMINAL_PROMPT="0")
+def git(workdir, *args, check=True):
+    p = subprocess.run(["git", "-C", workdir] + list(args), capture_output=True, text=True)
+    if check and p.returncode != 0:
+        raise RuntimeError((p.stderr.strip().splitlines() or ["git %s failed" % args[0]])[-1])
+    return p
+
+
+def token_git(gitdir, token, *args, check=True):
+    """git against a scratch repository that has NO configuration of the agent's: not its repo config (URL-scoped proxy, TLS or
+    resolve keys, remotes, hooks), not a global or system file. The token is in this one child's environment, offered by a
+    helper that answers for one fixed host and scheme; only that scheme is allowed; nothing the repository names can run."""
+    u = urlparse(git_base())
+    env = dict(os.environ, CW_PUSH_TOKEN=token, CW_PUSH_HOST=u.netloc, CW_PUSH_SCHEME=u.scheme, GIT_ALLOW_PROTOCOL=u.scheme,
+               GIT_TERMINAL_PROMPT="0", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    cmd = ["git", "--git-dir", gitdir, "-c", "credential.helper=", "-c", "credential.helper=" + HELPER] + HARDEN
     p = subprocess.run(cmd + list(args), capture_output=True, text=True, env=env)
     if check and p.returncode != 0:
         raise RuntimeError((p.stderr.strip().splitlines() or ["git %s failed" % args[0]])[-1])
     return p
+
+
+def push_with_token(workdir, worker, token, skipped):
+    """Fetch and push from a scratch repository that borrows the work's objects (alternates), so the agent's own repository
+    configuration is never read by a git process that holds the token."""
+    import tempfile
+    sha = git(workdir, "rev-parse", "--verify", "HEAD").stdout.strip()
+    objects = os.path.join(os.path.realpath(git(workdir, "rev-parse", "--absolute-git-dir").stdout.strip()), "objects")
+    target = remote_url()
+    with tempfile.TemporaryDirectory(prefix="cw-push-") as scratch:
+        env0 = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+        if subprocess.run(["git", "init", "-q", "--bare", scratch], capture_output=True, env=env0).returncode != 0:
+            raise RuntimeError("git init failed")
+        os.makedirs(os.path.join(scratch, "objects", "info"), exist_ok=True)
+        with open(os.path.join(scratch, "objects", "info", "alternates"), "w") as f:
+            f.write(objects + "\n")
+        token_git(scratch, token, "fetch", "--prune", target, "+refs/heads/*:refs/remotes/origin/*")   # refs must be current
+        if token_git(scratch, token, "branch", "-r", "--contains", sha).stdout.strip():
+            return {"pushed": False, "wip_branch": None, "skipped": skipped}
+        branch = "%s/wip" % worker
+        seen = token_git(scratch, token, "rev-parse", "-q", "--verify", "refs/remotes/origin/" + branch, check=False).stdout.strip()
+        token_git(scratch, token, "push", "--force-with-lease=refs/heads/%s:%s" % (branch, seen), target, "%s:refs/heads/%s" % (sha, branch))
+        return {"pushed": True, "wip_branch": branch, "skipped": skipped}
 
 
 def is_secret(path):
@@ -89,21 +118,14 @@ def run(workdir, worker, token=None):
             if git(workdir, "diff", "--cached", "--quiet", check=False).returncode != 0:
                 git(workdir, "-c", "user.name=cw-worker", "-c", "user.email=cw-worker@invalid",
                     "commit", "-m", "WIP: work in progress saved by %s at the end of the worker" % worker)
-    target = remote_url() if token else "origin"
-    # refs must be current: a stale one could call unpushed work safe
     if token:
-        git(workdir, "fetch", "--prune", target, "+refs/heads/*:refs/remotes/origin/*", token=token)
-    else:
-        git(workdir, "fetch", "--prune", "origin")
+        return push_with_token(workdir, worker, token, skipped)
+    git(workdir, "fetch", "--prune", "origin")  # refs must be current: a stale one could call unpushed work safe
     contained = git(workdir, "branch", "-r", "--contains", "HEAD").stdout.strip()
     if contained:
         return {"pushed": False, "wip_branch": None, "skipped": skipped}
     branch = "%s/wip" % worker
-    if token:   # an explicit URL has no tracking branch: the lease names what the fetch just saw (or that the branch is absent)
-        seen = git(workdir, "rev-parse", "-q", "--verify", "refs/remotes/origin/" + branch, check=False).stdout.strip()
-        git(workdir, "push", "--force-with-lease=refs/heads/%s:%s" % (branch, seen), target, "HEAD:refs/heads/" + branch, token=token)
-    else:
-        git(workdir, "push", "--force-with-lease", "origin", "HEAD:refs/heads/" + branch)
+    git(workdir, "push", "--force-with-lease", "origin", "HEAD:refs/heads/" + branch)
     return {"pushed": True, "wip_branch": branch, "skipped": skipped}
 
 

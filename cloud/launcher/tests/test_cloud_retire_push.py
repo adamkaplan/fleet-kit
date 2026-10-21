@@ -225,6 +225,18 @@ class RetirePush(base.Base):
         if os.path.exists(loot):   # a monitor may run on the hook's own untokened `git status`: it must never hold the token
             self.assertNotIn(FRESH, open(loot).read())
 
+    def test_s3_repository_scoped_proxy_tls_and_resolve_keys_are_never_read(self):
+        # URL-scoped keys of the agent's own config would divert or weaken the connection that carries the token
+        g = lambda *a: subprocess.run(["git", "-C", self.work] + list(a), check=True, capture_output=True)
+        base = "http://127.0.0.1:%d/" % self.srv.server_address[1]
+        for key, val in (("http.proxy", "http://127.0.0.1:1"), ("http." + base + ".proxy", "http://127.0.0.1:1"),
+                         ("http." + base + ".sslVerify", "false"), ("http.curloptResolve", "127.0.0.1:%d:127.0.0.1" % 1),
+                         ("http.extraHeader", "X-Leak: 1")):
+            g("config", key, val)
+        code, out, err = self.retire()
+        self.assertEqual(code, 0, err)   # the push reached the real (fixed) base despite the diverting keys
+        self.assertEqual(self.pushed_branch(), self.head)
+
     def test_s3_origin_as_a_local_path_with_a_receivepack_command_runs_nothing(self):
         loot = os.path.join(self.tmp.name, "loot2.txt")
         g = lambda *a: subprocess.run(["git", "-C", self.work] + list(a), check=True, capture_output=True)
