@@ -377,7 +377,8 @@ def run_logs_text(repo, rid, only_jobs=None):
     if not isinstance(loc, str):
         raise Fail("the logs answer had no download location (logs may have expired)")
     u = urllib.parse.urlsplit(loc)
-    if u.scheme != "https" or not u.hostname:
+    loopback_test = u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost", "::1") and bool(os.environ.get("CW_GH_API_BASE"))
+    if (u.scheme != "https" and not loopback_test) or not u.hostname:
         raise Fail("the logs location is not an https URL")
     try:  # the download host gets NO Authorization header
         with OPENER.open(urllib.request.Request(loc, headers={"User-Agent": "cw-gh"}), timeout=TIMEOUT) as r:
