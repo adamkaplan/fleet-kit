@@ -182,6 +182,8 @@ CHANNEL_SECRET_KEY = "channel-secret"                       # the one new key of
 CHANNEL_TOKEN_FILE = "/run/cw-tmp/fleet-switchboard"        # inside the memory-backed directory; the entrypoint installs the key there
 DEFAULT_CHANNEL_URL = "http://cloud-hub.cw.svc:8443"
 DEFAULT_REGISTRY_SECRET = "cloud-hub-registry"
+HUB_PW_SECRET = "cloud-hub-pw"                  # one key per agent: the pod's server password, mounted by the hub at /etc/hub/pw
+HUB_PW_DIR = "/etc/hub/pw"
 
 
 class ReaperLocked(Exception):
@@ -920,6 +922,13 @@ class Kube:
                     raise
         raise CloudError("the hub registry Secret %s kept changing; not written" % secret)
 
+    def hub_pw_set(self, secret, key, value):
+        """Set (or, with None, remove) ONE key of the hub's password Secret by a merge patch on stdin; the value is never in an argument."""
+        body = {"data": {key: None if value is None else base64.b64encode(value.encode()).decode()}}
+        if not self.get_secret(secret):
+            raise CloudError("the hub password Secret %s is not found" % secret)
+        self.run(["patch", "secret", secret, "--type=merge", "--patch-file=/dev/stdin"], stdin=json.dumps(body))
+
     def exec(self, name, *cmd, keep_stdout=False, timeout=120):
         return self.run(["exec", name, "--"] + list(cmd), keep_stdout=keep_stdout, timeout=timeout)
 
@@ -1164,7 +1173,7 @@ class Launcher:
                     self._make(made, "run", self.kube.create_run_secret, name, name, run_values, *([a.run_id] if getattr(a, "run_id", None) else []))
                 if agent == "orchestrator":
                     made["reg"] = (self._registry_secret(), worker)   # set before the call: a half write is undone by the cleanup
-                    self._register(worker, run_values[CHANNEL_SECRET_KEY], spec, self.env.get("CW_CLOUD_DOMAIN", "example.internal"))
+                    self._register(worker, run_values[CHANNEL_SECRET_KEY], spec, self.env.get("CW_CLOUD_DOMAIN", "example.internal"), password)
                 self._make(made, "pod", self.kube.apply, spec)
                 if getattr(a, "stack", False):
                     self._start_stack_pod(worker, name, spec, made, a.wait)
@@ -1222,15 +1231,16 @@ class Launcher:
     def _registry_secret(self):
         return self.env.get("CW_HUB_REGISTRY_SECRET") or DEFAULT_REGISTRY_SECRET
 
-    def _register(self, agent, channel_secret, spec, domain):
+    def _register(self, agent, channel_secret, spec, domain, password):
         """The hub's registry: {agent: sha256 hex of the channel secret} and {agent: {url, session, password_file}}. Only the hash is stored."""
         digest = hashlib.sha256(channel_secret.encode()).hexdigest()
         name = spec["metadata"]["name"]
-        entry = {"url": "https://worker-%s.%s:4096" % (name, domain), "session": "", "password_file": "/run/cw-hub/%s.password" % agent}
+        entry = {"url": "https://worker-%s.%s:4096" % (name, domain), "session": "", "password_file": "%s/%s" % (HUB_PW_DIR, agent)}
 
         def change(sec, agents):
             sec[agent], agents[agent] = digest, entry
         self.kube.registry_update(self._registry_secret(), change)
+        self.kube.hub_pw_set(HUB_PW_SECRET, agent, password)   # the pod's server password: the hub reads it from the file
 
     def _unregister(self, agent):
         """Remove both entries of the agent (a no-op when absent). A failure is said on stderr and never raised: the stop goes on."""
@@ -1239,6 +1249,7 @@ class Launcher:
             agents.pop(agent, None)
         try:
             self.kube.registry_update(self._registry_secret(), change)
+            self.kube.hub_pw_set(HUB_PW_SECRET, agent, None)
             return True
         except CloudError as e:
             print("cloud-worker: the hub registry entry of %s could not be removed: %s" % (agent, e), file=sys.stderr)

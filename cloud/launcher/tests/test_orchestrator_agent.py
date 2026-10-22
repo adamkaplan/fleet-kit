@@ -29,7 +29,7 @@ OTHER = {"other-agent": "f" * 64}
 class Orchestrator(Base):
     def setUp(self):
         super().setUp()
-        self.patch_state(secrets={REGISTRY: 1}, secret_bodies={REGISTRY: {"secrets.json": json.dumps(OTHER), "agents.json": json.dumps({"other-agent": {"url": "u"}})}},
+        self.patch_state(secrets={REGISTRY: 1, "cloud-hub-pw": 1}, secret_bodies={"cloud-hub-pw": {"keep": "kept-pw"}, REGISTRY: {"secrets.json": json.dumps(OTHER), "agents.json": json.dumps({"other-agent": {"url": "u"}})}},
                          hook_result={"pushed": False, "wip_branch": None})
 
     def launch(self, worker="orch1", *extra, expect=0):
@@ -127,6 +127,7 @@ class Orchestrator(Base):
         cw.secrets.token_hex = lambda n=32: fixed if n == 32 else old(n)
         self.addCleanup(setattr, cw.secrets, "token_hex", old)
         _, out, err = self.orch()
+        pwd = self.st()["secret_bodies"][cw.pod_name("orch1") + "-pw"]["password"]
         _, sout, serr = self.run_cli("stop", "orch1", "--no-record")
         _, fout, ferr = self.run_cli("create", "orch1", "--repo", "acme-org/widget-service", "--branch", "main", "--agent", "orchestrator", "--boss", "boss1")
         self.patch_state(fail_apply=True)
@@ -135,6 +136,7 @@ class Orchestrator(Base):
             audit = f.read()
         for where in (out, err, sout, serr, fout, ferr, fout2, ferr2, self.calls(), audit, json.dumps(self.registry())):
             self.assertNotIn(fixed, where)
+            self.assertNotIn(pwd, where)
         self.assertEqual(self.st()["secret_bodies"][cw.pod_name("orch1") + "-run"]["channel-secret"], fixed)
 
     # S12, S13, S14
@@ -145,6 +147,10 @@ class Orchestrator(Base):
         self.assertEqual(len(sec["orch1"]), 64)
         self.assertEqual(set(agents["orch1"]), {"url", "session", "password_file"})
         self.assertEqual(agents["other-agent"], {"url": "u"})
+        self.assertEqual(agents["orch1"]["password_file"], "/etc/hub/pw/orch1")
+        pw = self.st()["secret_bodies"]["cloud-hub-pw"]
+        self.assertEqual(set(pw), {"keep", "orch1"})
+        self.assertEqual(pw["orch1"], self.st()["secret_bodies"][cw.pod_name("orch1") + "-pw"]["password"])
 
     def test_s13_a_stop_removes_both_entries_and_leaves_the_others(self):
         self.orch()
@@ -152,6 +158,7 @@ class Orchestrator(Base):
         self.assertEqual(code, 0, err)
         sec, agents = self.registry()
         self.assertEqual((sec, agents), (OTHER, {"other-agent": {"url": "u"}}))
+        self.assertEqual(self.st()["secret_bodies"]["cloud-hub-pw"], {"keep": "kept-pw"})
 
     def test_s14_a_refused_registration_refuses_the_launch_and_removes_what_it_made(self):
         self.patch_state(secrets={}, secret_bodies={})   # no registry Secret: the write is refused

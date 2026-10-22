@@ -126,7 +126,9 @@ elif cmd == "patch" and args[1] == "secret":
         sys.stderr.write('Error from server (Conflict): Operation cannot be fulfilled on secrets "%s": the object has been modified\n' % args[2]); sys.exit(1)
     if st.get("patch_noop"):   # a patch the cluster answers and does not apply (the launcher must not believe it)
         sys.exit(0)
-    for k, v in patch.get("data", {}).items():
+    for k, v in list(patch.get("data", {}).items()):
+        if v is None:   # a merge patch with null removes the key
+            st.get("secret_bodies", {}).get(args[2], {}).pop(k, None); st.get("secret_keys", {}).get(args[2], {}).pop(k, None); patch["data"].pop(k); continue
         st.setdefault("secret_keys", {}).setdefault(args[2], {})[k] = len(base64.b64decode(v))
         st.setdefault("secret_bodies", {}).setdefault(args[2], {})[k] = base64.b64decode(v).decode()
     if patch.get("metadata", {}).get("annotations"):   # a merge patch of metadata.annotations
