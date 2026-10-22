@@ -82974,6 +82974,33 @@ class TestAssembler(unittest.TestCase):
         self.assertIn("part file not found", done.stderr)
         self.assertIn("part_missing.py", done.stderr)
 
+    def test_an_unreadable_manifest_fails_at_start_with_one_line(self):
+        root = self._copy(["fleet-switchboard"])
+        manifest = root / "fleet-switchboard.parts"
+        manifest.unlink()
+        manifest.mkdir()   # exists, cannot be read as a file
+        done = subprocess.run([sys.executable, str(root / "fleet-switchboard"), "status", "--help"], capture_output=True, text=True)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(len(done.stderr.strip().splitlines()), 1)
+        self.assertIn("cannot read the parts manifest", done.stderr)
+
+    def test_a_missing_manifest_runs_the_entry_alone(self):
+        root = self._copy(["fleet-switchboard"])
+        (root / "fleet-switchboard.parts").unlink()
+        self.assertTrue(callable(_load("t_no_manifest", root / "fleet-switchboard").main))
+
+    def test_a_manifest_that_does_not_name_the_entry_runs_every_part_before_it(self):
+        root = self._copy(["part_a.py"])
+        (root / "part_a.py").write_text('A_SAW_MAIN = "main" in globals()\n')
+        module = _load("t_unnamed_entry", root / "fleet-switchboard")
+        self.assertFalse(module.A_SAW_MAIN)
+        self.assertTrue(callable(module.main))
+
+    def test_comments_and_blank_lines_in_a_manifest_are_ignored(self):
+        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard"])
+        (root / "part_a.py").write_text("FROM_A = 1\n")
+        self.assertEqual(_load("t_commented", root / "fleet-switchboard").FROM_A, 1)
+
     def test_a_symlinked_run_and_the_help_line_still_work(self):
         link = Path(tempfile.mkdtemp()) / "fsb"
         self.addCleanup(shutil.rmtree, str(link.parent), True)
