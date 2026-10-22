@@ -34301,7 +34301,7 @@ derive_action_groups()
 
 
 _fleet_parts(after=True)
-del _fleet_parts
+globals().pop("_fleet_parts")
 
 
 if __name__ == "__main__":
