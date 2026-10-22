@@ -18227,6 +18227,67 @@ class TestNoMultiplexer(Base):
         with self.assertRaises(sb.ConfigError):
             sb.validate_config({"no_multiplexer": "yes"})
 
+    def _owed_toast(self):
+        found = self.discover()
+        return found, mock.patch.object(sb.Switchboard, "toast_candidates", lambda *a: [("hw", "blocked", "hw is blocked", "waiting")])
+
+    def test_s3_a_toast_owed_to_a_pane_less_agent_makes_no_multiplexer_call_and_no_failure_with_the_switch_on(self):
+        self.engine.config = dict(self.engine.config, no_multiplexer=True)
+        found, patch = self._owed_toast()
+        report = {"toasts": [], "errors": []}
+        with patch:
+            self.engine.render_toast(found, {}, 0, report)
+        self.assertEqual((self.fake.calls, report["toasts"], report["errors"]), ([], [], []))
+
+    def test_s3_every_pane_call_site_is_guarded_or_unreachable_with_the_switch_on(self):
+        """One row per pane-assuming path: badge and toast (guarded by the switch), check_program and observe (only fed by herdr entries, which the switch
+        never lists), reread (no pane -> a stated refusal before any call), the pane sweep (skips an agent with no pane), close and release (need a listed pane)."""
+        self.engine.config = dict(self.engine.config, no_multiplexer=True)
+        found = self.discover()
+        obs = found.agents["hw"]
+        self.assertFalse(obs.pane)
+        self.assertEqual(found.entries, [])
+        self.engine.render_badges(found, set(), {"badges": [], "errors": []})
+        self.assertEqual(self.fake.calls, [])
+        obs.pane = "p1"   # an agent WITH a pane while the switch is on (a stale record): still no badge write, no toast
+        report = {"badges": [], "errors": [], "toasts": []}
+        self.engine.render_badges(found, set(), report)
+        self.assertEqual((self.fake.calls, report["badges"], report["errors"]), ([], [], []))
+        with mock.patch.object(sb.Switchboard, "toast_candidates", lambda *a: [("hw", "blocked", "t", "b")]):
+            self.engine.render_toast(found, {}, 0, report)
+        self.assertEqual((self.fake.calls, report["toasts"]), ([], []))
+
+    def test_the_mutants_one_per_scenario_are_each_killed(self):
+        real = sb.Switchboard._discover
+        self.engine.config = dict(self.engine.config, no_multiplexer=True)
+        found, patch = self._owed_toast()
+        src = sb.Switchboard.render_toast
+        def unguarded(engine, discovery, held, now, report):   # S3 mutant: the toast guard removed
+            engine.config = dict(engine.config, no_multiplexer=False)
+            try:
+                return src(engine, discovery, held, now, report)
+            finally:
+                engine.config = dict(engine.config, no_multiplexer=True)
+        report = {"toasts": [], "errors": []}
+        with patch:
+            try:
+                unguarded(self.engine, found, {}, 0, report)
+            except Exception:
+                pass
+        self.assertEqual(self.fake.calls, ["notification_show"], "S3 mutant is killed: the pane-call count is not 0")
+        self.fake.calls.clear()
+        self.engine.config = dict(self.engine.config, no_multiplexer=False)
+        def off_skips(engine, now, entries=None):   # U1/S4/U2 mutant: the switch off behaves as on
+            engine.config = dict(engine.config, no_multiplexer=True)
+            try:
+                return real(engine, now, entries)
+            finally:
+                engine.config = dict(engine.config, no_multiplexer=False)
+        with mock.patch.object(sb.Switchboard, "_discover", off_skips):
+            found = self.discover()
+        self.assertEqual(self.fake.calls.count("agent_list"), 0)
+        self.assertFalse(any(p.startswith("herdr unreachable: ") for p in found.problems), "U1 mutant is killed: the real build keeps the problem")
+
 
 class TestSelfRegisteringCli(unittest.TestCase):
     """The front door (#179 follow-up): commands register and dispatch BY NAME, so a new command edits no shared list. What must not change: the set of
