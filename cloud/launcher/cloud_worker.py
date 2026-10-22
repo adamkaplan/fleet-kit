@@ -1635,7 +1635,13 @@ class Launcher:
         def go(info):
             pod = self._need(worker)
             if not pod:   # no pod (node loss, eviction): its StatefulSet and Secrets may remain, and are removed
-                self._remove_gone(worker, name, None)
+                try:
+                    found = self.kube.get_workload(name)
+                except CloudError as e:   # the old answer stands when the lookup itself fails; said, not hidden
+                    found = None
+                    print("cloud-worker: could not look up statefulset/%s (%s); nothing found to remove" % (name, e), file=sys.stderr)
+                if found:   # nothing found: the old idempotent answer, byte for byte
+                    self._remove_gone(worker, name, None)
                 return {"worker": worker, "runtime_id": "", "deleted": True}
             info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
             if ann(pod, "hook-ran") != "true" and not a.force:
