@@ -311,8 +311,14 @@ def pr_diff(args):
     repo = repo_of(opts)
     n = number_of(repo, pos)
     if opts.get("names"):
-        for f in get_json("/repos/%s/pulls/%d/files?per_page=100" % (repo, n)):
-            print(f["filename"])
+        page = 1   # the pod's client cannot import bin/pr_files.py: it follows the pages to GitHub's maximum of 3000 files (#1098)
+        while page <= 30:
+            batch = get_json("/repos/%s/pulls/%d/files?per_page=100&page=%d" % (repo, n, page))
+            for f in batch:
+                print(f["filename"])
+            if len(batch) < 100:
+                break
+            page += 1
         return
     sys.stdout.write(request("GET", "/repos/%s/pulls/%d" % (repo, n), accept="application/vnd.github.diff").decode("utf-8", "replace"))
 

@@ -4716,6 +4716,14 @@ What the requests for a delegated clear were refused for, counted from the `gate
 | a hold label a person added, not the daemon's: the owner's to clear | 2 |
 | the caller was not the Chief of Staff's own session | 1 |
 
+### Every changed file of a pull request is read (#1098)
+
+The impact floor, the delegated clear, the clear's carry and the who-can-clear line read a pull request's changed files through ONE function, `bin/pr_files.py` `read`. It follows the
+pages of `pulls/<n>/files` (100 to a page) to the last, up to the platform's stated maximum of 3000 files. A pull request of 100 files or fewer costs one request. Only when GitHub itself
+reports more files than it will list (the stated maximum) is the answer unknown and the pull request held for the owner, with the reason naming the maximum; a page that cannot be read is
+unknown too, never "no more files". A test derives the readers from the code and fails on any request for `pulls/<n>/files` outside that function (the pod's `cw-gh pr diff --name-only` is the one
+standalone client and pages the same way).
+
 ### The delegated clear by impact score (#835)
 
 The Chief of Staff may clear a held pull request on her own judgement when its independent impact rating, at the head as it is now, is at or below a level the owner sets. It works in any watched repository. The owner is asked only for the changes that rate above it.

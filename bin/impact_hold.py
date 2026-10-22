@@ -1117,17 +1117,14 @@ def delegated_clear_inputs(engine, runner, repo, number, take=False, report=None
             rule = dict(rule, clear_code_paths=listed)
     except (impact_floor.MatrixError, NoticeError, ValueError) as err:
         return None, "the owner-hold decision or its rule cannot be read (%s): refused" % _one_line(str(err), 140)
-    files, get = [], impact_carry_get(engine, runner, repo)
+    get = impact_carry_get(engine, runner, repo)
+    files = None
     try:
-        for page in range(1, 31):
-            got = get("repos/%s/pulls/%d/files?per_page=100&page=%d" % (repo, number, page))
-            if not isinstance(got, list):
-                raise ValueError("not a list")
-            files.extend(f for f in got if isinstance(f, dict))
-            if len(got) < 100:
-                break
-        else:
-            files = None   # more than 3000 files: not read in full
+        total = None
+        pull_now = get("repos/%s/pulls/%d" % (repo, number))
+        if isinstance(pull_now, dict) and isinstance(pull_now.get("changed_files"), int):
+            total = pull_now["changed_files"]
+        files, _why = load_module("pr_files").read(get, repo, number, total)   # the ONE reader of the list (#1098); None: not read in full
     except Exception:
         files = None
     base_sha, closure = None, {}
