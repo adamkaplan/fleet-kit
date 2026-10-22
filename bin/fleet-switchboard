@@ -22233,6 +22233,24 @@ def read_open_overlap(engine, repo, runner):
     return cache[repo]
 
 
+def gates_suites_finding(runner, ctx):
+    """#1045: the gates FINDING (information, never a block, never changes the verdict): the pull request changes a path and names none of the suites that exercise it.
+    Read only; the suites are derived from the checkout this command runs in, and any trouble reading gives no finding."""
+    try:
+        ps = load_module("path_suites")
+        top = runner(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+        done = runner(["gh", "pr", "diff", str(ctx.number), "--repo", ctx.repo, "--name-only"], capture_output=True, text=True)
+        if top.returncode != 0 or done.returncode != 0:
+            return None
+        root, changed = top.stdout.strip(), [p for p in done.stdout.split("\n") if p.strip()][:200]
+        files = ps.tracked(root, runner)
+        texts = {}
+        by = {p: ps.suites_for(root, p, files, texts, runner) for p in changed if p in files and not ps.is_suite(p)}
+        return ps.gate_finding(changed, by, str((ctx.facts or {}).get("body") or ""))
+    except Exception:
+        return None
+
+
 def cmd_gates(args, runner, now):
     """`gates <repo#N>`: read-only. One line per gate G0a to G8: status, who decides it, what is missing. Exit 0 when every
     tracked gate that applies to a PR is satisfied, 1 when something is missing, 2 when it cannot be read. Enforces nothing."""
@@ -22264,7 +22282,10 @@ def cmd_gates(args, runner, now):
     if first and ctx.source and not _same_plan(first, ctx.source, ctx.config.get("intent_repo")):
         report["plan_changed"] = "the PR's plan is now %s; its entries were recorded against %s (they are void)" % (ctx.source, first)
     shares = overlap_shares_line(read_open_overlap(ctx.engine, ctx.repo, runner), ctx.number) if not ctx.unreadable else None   # #818: information only
+    suites_finding = gates_suites_finding(runner, ctx) if not ctx.unreadable else None   # #1045: information only: the verdict below does not read it
     if args.json:
+        if suites_finding:
+            report["suites_finding"] = suites_finding
         if isinstance(ctx.facts, dict) and rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head")):
             report["rating_block"] = rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head"))
         if shares:
@@ -22274,6 +22295,8 @@ def cmd_gates(args, runner, now):
         lines = plan_ledger.render_gates(report, ctx.pr)
         if shares:
             lines.append(shares)
+        if suites_finding:
+            lines.append(suites_finding)
         if ctx.unreadable:
             lines.append("PR not read: %s" % ctx.unreadable)
         if ctx.plan_problem:
@@ -26415,6 +26438,8 @@ def heavy_stop_reporter(module, config, make_engine, actor):
 
 def cmd_heavy(args, runner=subprocess.run, now=time.time):
     """`heavy [--slots N] [--wait-max S] [--ceiling S] -- <command...>`: run the command in a CPU slot (ask #34); its exit status is ours."""
+    if getattr(args, "changed", False) or getattr(args, "list", False):
+        return cmd_heavy_changed(args, runner, now)
     module = load_heavy_slots()
     command = list(args.command)
     if command[:1] == ["--"]:
@@ -26437,11 +26462,89 @@ def cmd_heavy(args, runner=subprocess.run, now=time.time):
         sys.stderr.write("heavy: no slot (%s): running without one\n" % _one_line(str(err), 160))
         state = None
     reporter = heavy_stop_reporter(module, heavy_config, lambda: build_engine(runner, now, "cli")[0], "heavy") if state is not None else None
+    if getattr(args, "changed_slot", False):   # #1045 clause 7: a command of a --changed run, in a reserved slot, a bounded wait and a named refusal (exit 3)
+        if state is None:
+            sys.stderr.write("heavy: refused: no state directory for a reserved slot\n")
+            return module.EXIT_USAGE
+        return module.run_changed(command, state, args.wait_max, args.name, on_stop=reporter, ceiling=getattr(args, "ceiling", None))
+    if getattr(args, "quick", False):   # #1045: ONE focused file or class, in a quick slot of its own; a full-suite run is refused
+        if state is None:
+            sys.stderr.write("heavy: refused: no state directory for a quick slot\n")
+            return module.EXIT_USAGE
+        return module.run_quick(command, state, 300 if args.wait_max is None else args.wait_max, args.name, on_stop=reporter, short=bool(getattr(args, "short", False)))
     return module.run(command, state, args.slots or configured, module.DEFAULT_WAIT_MAX if args.wait_max is None else args.wait_max, args.name,
                       short=bool(getattr(args, "short", False)), ceiling=getattr(args, "ceiling", None), ceiling_config=heavy_config, on_stop=reporter)
 
 
 cmd_heavy.direct = True   # the wrapper of someone else's command: no daemon start, no error mapping
+
+
+def _changed_plan(args, runner):
+    """(root, base, paths, rows, none) for `heavy --changed`: read only."""
+    ps = load_module("path_suites")
+    top = runner(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    if top.returncode != 0:
+        raise ps.PathSuitesError("not inside a git work tree")
+    root = top.stdout.strip()
+    base = args.base or ps.default_base(root, runner)
+    if not base:
+        raise ps.PathSuitesError("no base branch found: give --base")
+    paths = None
+    if args.pr:
+        done = runner(["gh", "pr", "diff", str(args.pr).split("#")[-1], "--name-only"], cwd=root, capture_output=True, text=True)
+        if done.returncode == 0 and done.stdout.strip():
+            paths = sorted(p for p in done.stdout.split("\n") if p.strip())
+    if paths is None:
+        paths = ps.changed_paths(root, base, runner)
+    rows, none = ps.plan(root, paths, runner=runner, added=ps.added_paths(root, base, runner))
+    return ps, root, base, paths, rows, none
+
+
+def cmd_heavy_changed(args, runner=subprocess.run, now=time.time):
+    """`heavy --changed [--list]` (#1045): the suites and classes that exercise the changed paths, run through the heavy slots on a LOCAL MERGE of the base into the head
+    (a temporary detached worktree, removed afterwards; the branch and the checkout are never touched). `--list` runs nothing."""
+    try:
+        ps, root, base, paths, rows, none = _changed_plan(args, runner)
+    except Exception as err:
+        sys.stderr.write("%s: heavy --changed: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    if not paths:
+        print("heavy --changed: no changed paths against %s" % base)
+        return EXIT_OK
+    print(ps.render(rows, none))
+    if args.list:
+        print("(--list: nothing was run; --changed runs these on a merge of %s into the head)" % base)
+        return EXIT_OK
+    if not rows:
+        print("heavy --changed: no suite exercises the changed paths: nothing to run")
+        return EXIT_OK
+    failed, refused = [], []
+    with ps.Merged(root, base, runner) as merged:
+        if merged.problem:
+            print("FAIL: %s" % merged.problem)
+            return EXIT_ERROR
+        guards = {tuple(ps.guard_command(g)): g for g in ps.NEW_BIN_GUARDS}
+        for suite, classes, command, why in rows:
+            gone = ps.guard_missing(merged.path, guards[tuple(command)]) if tuple(command) in guards and why and all(w.startswith("bin/") for w in why) else ""
+            if gone:
+                failed.append(suite)
+                print("CANNOT RUN %s: %s (%s): %s" % (suite, " ".join(command), "new-bin-file guard", gone))
+                continue
+            argv = [sys.executable, os.path.abspath(__file__), "heavy", "--changed-slot", "--wait-max", str(args.wait_max if args.wait_max is not None else 120)]
+            argv += (["--ceiling", str(args.ceiling)] if args.ceiling else []) + ["--"] + command
+            done = runner(argv, cwd=merged.path, capture_output=True, text=True)
+            if done.returncode in (75, 64, 3) and ("refused" in (done.stderr or "") or done.returncode in (75, 3)):
+                refused.append(suite)
+                print("NOSLOT %s: not run (%s)" % (suite, "no focused slot free: every reserved --changed slot was taken" if done.returncode == 3 else "no heavy slot came in time" if done.returncode == 75 else _one_line((done.stderr or "").strip(), 100)))
+            elif done.returncode != 0:
+                failed.append(suite)
+                print("FAIL %s: exit %d after the merge of %s into the head" % (suite, done.returncode, base))
+                sys.stderr.write("".join("%s: %s\n" % (suite, line) for line in ((done.stdout or "") + (done.stderr or "")).splitlines()[-15:]))
+            else:
+                print("PASS %s (on the merge of %s into the head)" % (suite, base))
+    if refused:
+        print("refused: no slot for %d suite%s, which did not run: %s" % (len(refused), "" if len(refused) == 1 else "s", ", ".join(refused)))
+    return EXIT_ERROR if failed else (3 if refused else EXIT_OK)   # 3: no focused slot free (clause 7)
 
 
 def add_heavy_parsers(sub):
@@ -26454,6 +26557,13 @@ def add_heavy_parsers(sub):
     heavy.add_argument("--short", action="store_true", help="The command is short: when the ordinary slots are busy it may use the one express slot, and the wrapper stops it after 120 seconds (exit 124)")
     heavy.add_argument("--ceiling", help="Ask for a longer (or shorter) time ceiling in seconds than the kind of command's default, up to the hard maximum (14400); 0 reads as the maximum, an unreadable value as the default")
     heavy.add_argument("--name", help="Who the slot is held for (default: FLEET_HEAVY_NAME, the OpenCode session id, the user)")
+    heavy.add_argument("--changed-slot", action="store_true", dest="changed_slot", help="A command of a --changed run: take one of the reserved slots (never queued behind full-suite runs); waits at most 120 s, then exits 3 with `no focused slot free`")
+    heavy.add_argument("--quick", action="store_true", help="ONE focused test file or class: take a quick slot of its own (cap 4, ceiling 10 min), never queued behind a full-suite run; a full-suite run is refused")
+    heavy.add_argument("--changed", action="store_true", help="Derive the suites and classes that exercise the changed paths and run them on a local merge of the base into the head (see --list, --base, --pr)")
+    heavy.add_argument("--list", action="store_true", help="With --changed: print the suites and the exact commands and run nothing; says when a path is exercised by no suite")
+    heavy.add_argument("--base", help="With --changed: the base branch to merge (default: origin's default branch)")
+    heavy.add_argument("--pr", help="With --changed: the pull request whose changed paths are read (its branch must be the checked-out head)")
+    heavy.add_argument("--brief", action="store_true", help="With --list: print only the list for a brief or a review request")
     heavy.add_argument("command", nargs=argparse.REMAINDER, help="-- <command...>")
 
 
@@ -26591,6 +26701,53 @@ def cmd_preflight_pr(args, runner, now):
         sys.stderr.write("%s: preflight-pr: not inside a git work tree\n" % PROG)
         return EXIT_USAGE
     root = top.stdout.strip()
+    if getattr(args, "merged", False):   # #1045: the same classes on a local merge of the base into the head (a temporary worktree, removed afterwards)
+        ps = load_module("path_suites")
+        base = ps.default_base(root, runner)
+        if not base:
+            sys.stderr.write("%s: preflight-pr --merged: no base branch found\n" % PROG)
+            return EXIT_USAGE
+        try:
+            added = ps.added_paths(root, base, runner)
+        except ps.PathSuitesError:
+            added = []
+        with ps.Merged(root, base, runner) as merged:
+            if merged.problem:
+                print("FAIL: %s" % merged.problem)
+                return EXIT_ERROR
+            args.merged = False
+            code = cmd_preflight_pr_in(args, runner, now, merged.path)
+            return EXIT_ERROR if run_new_bin_guards(ps, runner, merged.path, added, now) and code == EXIT_OK else code
+    return cmd_preflight_pr_in(args, runner, now, root)
+
+
+def run_new_bin_guards(ps, runner, root, added, now):
+    """#1045: a change that ADDS a file under bin/ must pass the four guards of path_suites.NEW_BIN_GUARDS: each runs under `heavy` in `root`, one PASS or FAIL line each;
+    a guard that is not in the tree is said plainly (CANNOT RUN) and counts as a failure. Returns the number that did not pass."""
+    rows = ps.guard_rows(added)
+    if not rows:
+        return 0
+    print("preflight-pr: new file under bin/ (%s): the %d guards every new bin file must pass" % (", ".join(added), len(rows)))
+    guards, failed = {tuple(ps.guard_command(g)): g for g in ps.NEW_BIN_GUARDS}, 0
+    for _suite, _classes, command, _why in rows:
+        guard = guards[tuple(command)]
+        gone = ps.guard_missing(root, guard)
+        if gone:
+            failed += 1
+            print("CANNOT RUN %s: %s: %s" % (guard[0], " ".join(command), gone))
+            continue
+        started = now()
+        sys.stderr.write("preflight-pr: %s: waiting for a slot, then running\n" % guard[0])
+        done = runner([sys.executable, os.path.abspath(__file__), "heavy", "--"] + list(command), cwd=root, capture_output=True, text=True)
+        verdict = "PASS" if done.returncode == 0 else ("NOSLOT" if done.returncode == 75 else "FAIL")
+        if done.returncode != 0:
+            sys.stderr.write("".join(("%s: %s\n" % (guard[0], line)) for line in ((done.stdout or "") + (done.stderr or "")).splitlines()[-15:]))
+        failed += verdict != "PASS"
+        print("%s %s (%ds): %s" % (verdict, guard[0], max(0, int(now() - started)), " ".join(command)))
+    return failed
+
+
+def cmd_preflight_pr_in(args, runner, now, root):
     changed = preflight_changed(runner, root)
     failed = 0
     with tempfile.TemporaryDirectory(prefix="preflight-") as work:
@@ -26640,10 +26797,12 @@ cmd_preflight_pr.direct = True   # only runs tests: no daemon start, no GitHub, 
 
 
 def add_preflight_pr_parsers(sub):
-    sub.add_parser("preflight-pr", help="Run the CI-critical focused test classes coders skip, under `heavy`: one PASS or FAIL line each, exit 1 when any fails",
+    pre = sub.add_parser("preflight-pr", help="Run the CI-critical focused test classes coders skip, under `heavy`: one PASS or FAIL line each, exit 1 when any fails",
                    description="Runs, each under the `heavy` wrapper and a time ceiling: the command-surface snapshot class, the hygiene and role-file classes, "
                                "bin/check-public-names and, when files under cloud/ changed against the base, the cloud suites with TMPDIR a 49-character "
-                               "token-shaped directory name. Only runs tests: it never pushes, labels or records a verdict.")
+                               "token-shaped directory name. Only runs tests: it never pushes, labels or records a verdict. "
+                               "With --merged the same classes run on a local merge of the base into the head (a temporary worktree, removed afterwards).")
+    pre.add_argument("--merged", action="store_true", help="Run on a local merge of the current base into the head, so a change green alone and red against the moved base is found before the push")
 
 
 def add_disk_parsers(sub):

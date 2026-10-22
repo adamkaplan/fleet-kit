@@ -63041,6 +63041,7 @@ class TestHeavyCeilings(StandInPids, unittest.TestCase):
         ("other", ["ls"], 3600),
     )
     RUNNABLE = {"full": ["python3", "/nowhere/test-fake"], "focused": ["python3", "/nowhere/test-fake", "-k", "x"], "e2e": ["sh", "-c", "true", "e2e"], "other": ["sh", "-c", "true"]}   # commands that exist, for run()
+    NAMED = {"quick": 600}   # kinds classify() never returns: run_quick takes the row by name (#1045); the quick slot's own 10 min ceiling is why it is below the 1800 floor of FAMILY
     CLASSIFY = (
         (["bin/test-switchboard"], "full"), (["bin/test-switchboard", "-k", "x"], "focused"), (["tests/test_a.py"], "focused"),
         (["python3", "-m", "unittest", "a.b"], "focused"), (["playwright", "test"], "e2e"), (["bin/run-e2e.sh"], "e2e"),
@@ -63096,8 +63097,12 @@ class TestHeavyCeilings(StandInPids, unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(self.hs.classify(command), kind)
         self.assertEqual(self.hs.classify(["bin/test-switchboard"], short=True), "focused", "--short declares a short run")
-        self.assertEqual({row[0] for row in self.FAMILY}, {kind for kind, _s, _m in self.hs.KINDS}, "a kind with no row here, or a row with no kind")
-        self.assertEqual({kind for _c, kind in self.CLASSIFY}, {kind for kind, _s, _m in self.hs.KINDS}, "a kind no command above reads as")
+        every = {kind for kind, _s, _m in self.hs.KINDS}
+        self.assertEqual({row[0] for row in self.FAMILY} | set(self.NAMED), every, "a kind with no row here, or a row with no kind")
+        self.assertEqual({kind for _c, kind in self.CLASSIFY} | set(self.NAMED), every, "a kind no command above reads as (or takes by name)")
+        for kind, seconds in self.NAMED.items():
+            self.assertEqual(self.hs.KIND_DEFAULTS[kind], seconds, "the named kind's ceiling")
+            self.assertNotIn(kind, {self.hs.classify(command) for command, _k in self.CLASSIFY}, "a named kind is never read from a command")
         for kind, command, _default in self.FAMILY:
             self.assertEqual(self.hs.classify(command), kind)
             self.assertEqual(self.hs.classify(self.RUNNABLE[kind]), kind)
@@ -79081,7 +79086,7 @@ class TestFocusedLocalRuns(unittest.TestCase):
                         self.assertEqual(code, 0)
 
     def test_the_table_covers_every_kind_of_the_one_classifier(self):
-        kinds = {kind for kind, _s, _m in self.hs.KINDS}
+        kinds = {kind for kind, _s, _m in self.hs.KINDS} - {"quick"}   # "quick" is a ceiling row taken by name (run_quick); the classifier never returns it
         probes = {"full": [], "focused": ["-k", "x"], "e2e": ["playwright", "test"], "other": ["ls"]}
         self.assertEqual(set(probes), kinds, "a kind with no probe")
         for kind, rest in probes.items():
@@ -79165,7 +79170,7 @@ class TestFocusedLocalRuns(unittest.TestCase):
         self.assertNotIn("refused", text)
 
     def test_s7_the_only_ceilings_are_the_per_kind_table(self):
-        self.assertEqual(self.hs.KIND_DEFAULTS, {"e2e": 3600, "focused": 1800, "full": 5400, "other": 3600})
+        self.assertEqual(self.hs.KIND_DEFAULTS, {"e2e": 3600, "focused": 1800, "full": 5400, "quick": 600, "other": 3600})
         names = sorted(name for name in vars(self.hs) if re.search(r"(CEIL|SECONDS|MAX_SECONDS|HARD_MAX)", name) and name.isupper())
         self.assertEqual(names, ["DEFAULT_MAX_SECONDS", "EXPRESS_SECONDS", "HARD_MAX_SECONDS", "KILL_GRACE_SECONDS", "POLL_SECONDS", "SWEEP_SECONDS", "WAIT_REPORT_SECONDS", "WATCH_SECONDS"])
 

@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""test-path-suites: offline tests for the path-to-suites map, `heavy --changed`, the quick slot and the gates finding (ask #1045). Fixture repositories are synthetic.
+
+    bin/test-path-suites
+
+The last line printed is `RESULT: PASS` or `RESULT: FAIL`."""
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "bin"))
+import heavy_slots  # noqa: E402
+import path_suites as ps  # noqa: E402
+
+SWITCHBOARD = REPO / "bin" / "fleet-switchboard"
+
+
+def sh(cwd, *cmd, **kw):
+    return subprocess.run(list(cmd), cwd=str(cwd), capture_output=True, text=True, **kw)
+
+
+def git(cwd, *args):
+    done = sh(cwd, "git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", *args)
+    assert done.returncode == 0, done.stderr
+    return done
+
+
+def write(root, rel, text, mode=None):
+    path = Path(root) / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    if mode:
+        path.chmod(mode)
+
+
+def fixture():
+    """A repository with one module `lib/calc.py` that two suites run: one by import, one by its command name `calc-cli`."""
+    root = tempfile.mkdtemp(prefix="ps-fixture-")
+    git(root, "init", "-q", "-b", "main")
+    write(root, "lib/calc.py", "VERSION = 1\ndef add(a, b):\n    return a + b\n")
+    write(root, "bin/calc-cli", "#!/usr/bin/env python3\nimport sys; sys.path.insert(0, 'lib')\nimport calc\nprint(calc.add(1, 2))\n", 0o755)
+    write(root, "bin/test-by-import", "#!/usr/bin/env python3\nimport sys, unittest\nsys.path.insert(0, 'lib')\nimport calc\n\nclass TestAdd(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(calc.add(1, 1), 2)\n\nclass TestOther(unittest.TestCase):\n    def test_other(self):\n        self.assertTrue(True)\n\nif __name__ == '__main__':\n    unittest.main()\n", 0o755)
+    write(root, "bin/test-by-command", "#!/usr/bin/env python3\nimport subprocess, sys\nout = subprocess.run(['bin/calc-cli'], capture_output=True, text=True).stdout\nsys.exit(0 if out.strip() == '3' else 1)\n", 0o755)
+    write(root, "docs/notes.md", "nothing\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "base")
+    return root
+
+
+def run_switchboard(cwd, *args, env=None):
+    home = tempfile.mkdtemp(prefix="ps-home-")
+    e = dict(os.environ, HOME=home, XDG_STATE_HOME=home, XDG_CONFIG_HOME=home, FLEET_HEAVY="off", FLEET_SWITCHBOARD_NO_DAEMON="1")
+    e.update(env or {})
+    return subprocess.run([sys.executable, str(SWITCHBOARD)] + list(args), cwd=str(cwd), capture_output=True, text=True, env=e, timeout=120)
+
+
+def derivation_test(case, derive):
+    """The one clause of the derivation: two suites run one file; `derive` is the function under test."""
+    root = fixture()
+    found = derive(root, "lib/calc.py")
+    case.assertEqual(sorted(found), ["bin/test-by-command", "bin/test-by-import"])
+
+
+class TestDerivation(unittest.TestCase):
+    def test_two_suites_that_run_one_file_give_both(self):
+        derivation_test(self, ps.suites_for)
+
+    def test_classes_are_named_and_the_command_is_exact(self):
+        root = fixture()
+        rows, none = ps.plan(root, ["lib/calc.py"])
+        by = {r[0]: r for r in rows}
+        self.assertEqual(by["bin/test-by-import"][1], ["TestAdd"])
+        self.assertEqual(by["bin/test-by-import"][2], ["bin/test-by-import", "-k", "TestAdd"])
+        self.assertEqual(none, [])
+
+    def test_a_path_with_no_suite_is_said_so(self):
+        root = fixture()
+        rows, none = ps.plan(root, ["docs/notes.md"])
+        self.assertEqual(rows, [])
+        self.assertIn("no suite exercises this path", ps.render(rows, none))
+
+    def test_the_mutant_that_returns_only_the_suite_named_in_the_diff_fails(self):
+        def mutant(root, path):
+            return {s: c for s, c in ps.suites_for(root, path).items() if s == "bin/test-by-import"}   # only the suite the diff names
+        with self.assertRaises(AssertionError):
+            derivation_test(self, mutant)
+        derivation_test(self, ps.suites_for)   # the real derivation passes
+
+    def test_an_import_only_derivation_fails(self):
+        def imports_only(root, path):
+            return {s: c for s, c in ps.suites_for(root, path).items() if "import calc" in Path(root, s).read_text()}
+        with self.assertRaises(AssertionError):
+            derivation_test(self, imports_only)
+
+
+class TestHandKept(unittest.TestCase):
+    def rows(self, rows):
+        root = fixture()
+        write(root, ps.MANUAL, json.dumps({"rows": rows}))
+        return root
+
+    def test_a_row_naming_a_missing_suite_fails(self):
+        root = self.rows([{"glob": "lib/calc.py", "suites": ["bin/test-by-import", "bin/test-by-command", "bin/test-gone"], "reason": "x"}])
+        done = sh(root, sys.executable, str(REPO / "bin" / "path_suites.py"), "--check")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("does not exist", done.stdout)
+
+    def test_a_row_missing_a_derived_suite_fails(self):
+        root = self.rows([{"glob": "lib/calc.py", "suites": ["bin/test-by-import"], "reason": "x"}])
+        done = sh(root, sys.executable, str(REPO / "bin" / "path_suites.py"), "--check")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("misses bin/test-by-command", done.stdout)
+
+    def test_a_row_with_no_reason_fails_and_a_good_row_passes(self):
+        self.assertTrue(ps.check_manual(self.rows([{"glob": "lib/calc.py", "suites": ["bin/test-by-import", "bin/test-by-command"]}])))
+        self.assertEqual(ps.check_manual(self.rows([{"glob": "lib/calc.py", "suites": ["bin/test-by-import", "bin/test-by-command"], "reason": "stated"}])), [])
+
+    def test_the_rows_of_this_repository_agree_with_the_derivation(self):
+        self.assertEqual(ps.check_manual(str(REPO)), [])
+
+
+def merged_fixture():
+    """`feature` changes lib/calc.py (green alone); `main` then moves: a suite now checks VERSION == 1 (red only after the merge)."""
+    root = fixture()
+    git(root, "checkout", "-q", "-b", "feature")
+    write(root, "lib/calc.py", "VERSION = 2\ndef add(a, b):\n    return a + b\n")
+    git(root, "commit", "-qam", "bump")
+    git(root, "checkout", "-q", "main")
+    write(root, "bin/test-by-import", Path(root, "bin/test-by-import").read_text().replace("self.assertEqual(calc.add(1, 1), 2)", "self.assertEqual(calc.VERSION, 1)"), 0o755)
+    git(root, "commit", "-qam", "base moves")
+    git(root, "checkout", "-q", "feature")
+    return root
+
+
+def leftovers(root):
+    return (len([l for l in git(root, "worktree", "list").stdout.splitlines() if l.strip()]) - 1, sorted(git(root, "branch", "--format=%(refname:short)").stdout.split()))
+
+
+class TestMergedRun(unittest.TestCase):
+    def test_a_failure_only_after_the_merge_is_reported_and_nothing_is_left(self):
+        root = merged_fixture()
+        before = leftovers(root)
+        head = git(root, "rev-parse", "HEAD").stdout
+        alone = sh(root, "bin/test-by-import")
+        self.assertEqual(alone.returncode, 0, "green alone")
+        done = run_switchboard(root, "heavy", "--changed", "--base", "main")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("after the merge", done.stdout)
+        self.assertEqual(leftovers(root), before)
+        self.assertEqual(before[0], 0)
+        self.assertEqual(git(root, "rev-parse", "HEAD").stdout, head)
+
+    def test_a_conflict_after_the_merge_is_reported(self):
+        root = merged_fixture()
+        git(root, "checkout", "-q", "main")
+        write(root, "lib/calc.py", "VERSION = 3\ndef add(a, b):\n    return a + b\n")
+        git(root, "commit", "-qam", "conflicting")
+        git(root, "checkout", "-q", "feature")
+        done = run_switchboard(root, "heavy", "--changed", "--base", "main")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("conflict after the merge", done.stdout)
+        self.assertEqual(leftovers(root)[0], 0)
+
+    def test_a_green_merge_passes(self):
+        root = fixture()
+        git(root, "checkout", "-q", "-b", "feature")
+        write(root, "lib/calc.py", "VERSION = 1\ndef add(a, b):\n    return a + b + 0\n")
+        git(root, "commit", "-qam", "tweak")
+        done = run_switchboard(root, "heavy", "--changed", "--base", "main")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("PASS bin/test-by-command", done.stdout)
+
+
+def new_bin_fixture(add=True):
+    """`feature` ADDS bin/newtool (listed in none of the tables: no suite names it) or, with add=False, only edits lib/calc.py."""
+    root = fixture()
+    git(root, "checkout", "-q", "-b", "feature")
+    if add:
+        write(root, "bin/newtool", "#!/usr/bin/env python3\nprint('new')\n", 0o755)
+    else:
+        write(root, "lib/calc.py", "VERSION = 1\ndef add(a, b):\n    return a + b + 0\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "change")
+    return root
+
+
+def guard_count(text):
+    """How many of the four guards of a new bin file the text names with their exact command."""
+    return sum(1 for g in ps.NEW_BIN_GUARDS if " ".join(ps.guard_command(g)) in text)
+
+
+def plan_of_own_suite_only(root, base):
+    """The MUTANT: a map that names only the suites touching the file's own functions (no guards for an added file)."""
+    paths = ps.changed_paths(root, base)
+    rows, none = ps.plan(root, paths)
+    return ps.render(rows, none)
+
+
+class TestNewBinFileGuards(unittest.TestCase):
+    """S10 (clause 2): a change that ADDS a file under bin/ always names the four guards, with their exact commands, and preflight-pr --merged runs them or says it could not."""
+
+    def test_s10_a_new_bin_file_names_the_four_guards_with_their_commands(self):
+        root = new_bin_fixture()
+        done = run_switchboard(root, "heavy", "--changed", "--list", "--base", "main")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(guard_count(done.stdout), 4, done.stdout)
+        self.assertEqual(len(ps.NEW_BIN_GUARDS), 4)
+        for name in ("TestAuthorityModulesGuard", "TestAgentRegistryInventory", "TestImpactHold", "bin/check-public-names"):
+            self.assertIn(name, done.stdout)
+        rows, _none = ps.plan(root, ["bin/newtool"], added=ps.added_paths(root, "main"))
+        self.assertEqual(len(rows), 4)
+
+    def test_s10_the_mutant_that_names_only_the_files_own_suite_shows_zero_of_the_four(self):
+        root = new_bin_fixture()
+        self.assertEqual(guard_count(plan_of_own_suite_only(root, "main")), 0)
+        self.assertEqual(guard_count(ps.render(*ps.plan(root, ["bin/newtool"], added=ps.added_paths(root, "main")))), 4)
+
+    def test_s10_a_change_that_adds_no_bin_file_names_none_of_the_guards(self):
+        root = new_bin_fixture(add=False)
+        done = run_switchboard(root, "heavy", "--changed", "--list", "--base", "main")
+        self.assertEqual(guard_count(done.stdout), 0, done.stdout)
+
+    def test_s10_preflight_pr_merged_exits_1_for_a_new_bin_file_in_none_of_the_tables_and_says_which_guards_it_could_not_run(self):
+        root = new_bin_fixture()
+        done = run_switchboard(root, "preflight-pr", "--merged")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertEqual(done.stdout.count("CANNOT RUN"), 4, done.stdout)
+        self.assertEqual(guard_count(done.stdout), 4)
+
+    def test_s10_heavy_changed_run_says_plainly_the_guards_it_could_not_run(self):
+        root = new_bin_fixture()
+        done = run_switchboard(root, "heavy", "--changed", "--base", "main")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertEqual(done.stdout.count("CANNOT RUN"), 4, done.stdout)
+
+
+class TestListAndRefusal(unittest.TestCase):
+    def test_list_runs_nothing_and_says_no_suite(self):
+        root = fixture()
+        git(root, "checkout", "-q", "-b", "feature")
+        write(root, "docs/notes.md", "changed\n")
+        write(root, "bin/test-by-command", Path(root, "bin/test-by-command").read_text() + "# marker\n", 0o755)
+        git(root, "commit", "-qam", "x")
+        marker = Path(root, "ran")
+        write(root, "bin/test-by-command", "#!/bin/sh\ntouch ran\n", 0o755)   # a suite that would leave a trace if --list ran it
+        done = run_switchboard(root, "heavy", "--changed", "--list", "--base", "main")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("docs/notes.md: no suite exercises this path", done.stdout)
+        self.assertIn("nothing was run", done.stdout)
+        self.assertFalse(marker.exists())
+        self.assertIn("suites that exercise your change", done.stdout)
+
+    def test_a_refused_slot_names_the_suites_that_did_not_run(self):
+        root, e, state = held_state_fixture(ordinary=3, changed=2)
+        done = subprocess.run([sys.executable, str(SWITCHBOARD), "heavy", "--changed", "--base", "main", "--wait-max", "1"], cwd=root, capture_output=True, text=True, env=e, timeout=120)
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertRegex(done.stdout, r"refused: no slot for 2 suites?, which did not run: bin/test-by-command")
+
+
+def held_state_fixture(ordinary, changed):
+    """A feature branch that changes lib/calc.py (two suites run it) and a state directory whose first `ordinary` full slots and first `changed` reserved slots are locked."""
+    import fcntl
+    root = fixture()
+    git(root, "checkout", "-q", "-b", "feature")
+    write(root, "lib/calc.py", "VERSION = 1\ndef add(a, b):\n    return b + a\n")
+    git(root, "commit", "-qam", "x")
+    state = tempfile.mkdtemp(prefix="ps-state-")
+    fleet = os.path.join(state, "fleet-switchboard")
+    os.makedirs(os.path.join(fleet, "changed"), mode=0o700, exist_ok=True)
+    for d in (state, fleet, os.path.join(fleet, "changed")):
+        os.chmod(d, 0o700)
+    for folder, count in ((fleet, ordinary), (os.path.join(fleet, "changed"), changed)):
+        for k in range(count):
+            fd = os.open(os.path.join(folder, "heavy-slot-%d.lock" % k), os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            HELD.append(fd)   # kept open (locked) until the process ends
+    e = dict(os.environ, HOME=state, XDG_STATE_HOME=state, FLEET_SWITCHBOARD_NO_DAEMON="1")
+    e.pop("FLEET_HEAVY", None)
+    e.pop("CI", None)
+    return root, e, state
+
+
+HELD = []
+
+
+class TestChangedRunHasAReservedSlot(unittest.TestCase):
+    """S11 (clause 7): a --changed run is never queued behind full-suite runs, and when the reserved slots are all taken it is refused by name within a bound, never a silent timeout."""
+
+    def test_s11_it_starts_within_5_seconds_with_every_ordinary_slot_taken(self):
+        root, e, _state = held_state_fixture(ordinary=3, changed=0)
+        started = time.time()
+        done = subprocess.run([sys.executable, str(SWITCHBOARD), "heavy", "--changed", "--base", "main"], cwd=root, capture_output=True, text=True, env=e, timeout=120)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("PASS bin/test-by-command", done.stdout)
+        self.assertIn("PASS bin/test-by-import", done.stdout)
+        self.assertLess(time.time() - started, 5 + 10, "start-to-finish, with the interpreter's own start")
+
+    def test_s11_the_mutant_queued_behind_the_full_suite_runs_gets_no_slot(self):
+        root, e, _state = held_state_fixture(ordinary=3, changed=0)
+        mutant = subprocess.run([sys.executable, str(SWITCHBOARD), "heavy", "--wait-max", "2", "--", "bin/test-by-command"], cwd=root, capture_output=True, text=True, env=e, timeout=120)
+        self.assertEqual(mutant.returncode, 75, "an ordinary run queued behind the full slots is not started: " + mutant.stderr)
+        self.assertIn("the command was not run", mutant.stderr)
+
+    def test_s11_every_reserved_slot_taken_is_a_named_refusal_with_exit_3(self):
+        root, e, _state = held_state_fixture(ordinary=3, changed=2)
+        done = subprocess.run([sys.executable, str(SWITCHBOARD), "heavy", "--changed-slot", "--wait-max", "1", "--", "bin/test-by-command"], cwd=root, capture_output=True, text=True, env=e, timeout=120)
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("no focused slot free", done.stderr)
+
+    def test_s11_the_wait_is_bounded_at_120_seconds_whatever_wait_max_says(self):
+        import io
+        root, e, state = held_state_fixture(ordinary=0, changed=2)
+        module = heavy_slots
+        self.assertEqual(module.CHANGED_WAIT_MAX, 120)
+        clock = {"now": 1000.0}
+        out = io.StringIO()
+        code = module.run_changed(["/bin/true"], os.path.join(state, "fleet-switchboard"), wait_max=99999, environ=dict(e), out=out,
+                                  clock=lambda: clock["now"], sleep=lambda s: clock.__setitem__("now", clock["now"] + max(s, 1)))
+        self.assertEqual(code, 3)
+        self.assertLessEqual(clock["now"] - 1000.0, 125)
+        self.assertIn("no focused slot free", out.getvalue())
+
+
+class TestQuickSlot(unittest.TestCase):
+    def setUp(self):
+        self.state = tempfile.mkdtemp(prefix="ps-quick-")
+        self.script = Path(self.state, "test_one.py")
+        self.script.write_text("#!/usr/bin/env python3\n")
+        self.script.chmod(0o755)
+
+    def hold_full_slots(self):
+        import fcntl
+        self.fds = []
+        for i in range(heavy_slots.DEFAULT_SLOTS):
+            fd = os.open(heavy_slots.slot_path(self.state, i), os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            self.fds.append(fd)
+        self.addCleanup(lambda: [os.close(fd) for fd in self.fds])
+
+    def test_a_focused_run_takes_a_quick_slot_at_once_while_every_full_slot_is_held(self):
+        self.hold_full_slots()
+        err = __import__("io").StringIO()
+        began = time.time()
+        status = heavy_slots.run_quick([str(self.script)], self.state, wait_max=5, out=err, environ={"HOME": self.state})
+        self.assertEqual(status, 0, err.getvalue())
+        self.assertLess(time.time() - began, 5)
+        self.assertIn("quick slots", err.getvalue())
+        self.assertIn("/4 (ceiling 10 min)", err.getvalue())
+
+    def test_a_full_suite_run_asking_for_a_quick_slot_is_refused(self):
+        err = __import__("io").StringIO()
+        status = heavy_slots.run_quick(["bin/test-switchboard"], self.state, out=err)
+        self.assertEqual(status, 64)
+        self.assertIn("refused", err.getvalue())
+
+    def test_the_cap_and_the_ceiling_are_stated(self):
+        self.assertEqual((heavy_slots.QUICK_SLOTS, heavy_slots.KIND_DEFAULTS["quick"]), (4, 600))
+        self.assertEqual(heavy_slots.quick_status(self.state), "quick slots 0/4 (ceiling 10 min)")
+
+    def test_is_quick_is_one_file_or_one_class_only(self):
+        self.assertTrue(ps.is_quick(["bin/test-x", "-k", "TestA"]))
+        self.assertFalse(ps.is_quick(["bin/test-x"]))
+        self.assertFalse(ps.is_quick(["bin/test-x", "-k", "A", "-k", "B"]))
+
+
+class TestGatesFinding(unittest.TestCase):
+    def test_a_finding_names_the_missing_suites_and_the_verdict_code_does_not_read_it(self):
+        line = ps.gate_finding(["lib/calc.py"], {"lib/calc.py": {"bin/test-by-import": [], "bin/test-by-command": []}}, "ran bin/test-by-import")
+        self.assertIsNone(line)   # one of the listed suites is named
+        line = ps.gate_finding(["lib/calc.py"], {"lib/calc.py": {"bin/test-by-import": [], "bin/test-by-command": []}}, "ran nothing")
+        self.assertEqual(line.count("finding:"), 1)
+        self.assertIn("bin/test-by-command", line)
+        self.assertIn("not a block", line)
+        text = SWITCHBOARD.read_text()
+        verdict = re.search(r"    ok = report\[\"ready\"\] if getattr\(args, \"all_gates\".*", text)
+        self.assertTrue(verdict and "suites_finding" not in verdict.group(0))
+
+
+class TestSkillsAndDocs(unittest.TestCase):
+    def test_both_skills_say_to_run_the_list(self):
+        count = 0
+        for skill in ("fleet-coordination", "fleet-review"):
+            text = (REPO / "skills" / skill / "SKILL.md").read_text()
+            count += "heavy --changed" in text and "suites that exercise your change" in text
+        self.assertEqual(count, 2)
+
+    def test_the_generated_list_has_the_header(self):
+        self.assertIn("suites that exercise your change", ps.render([], ["x"]))
+
+    def test_the_documentation_states_the_four_usages(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        section = text[text.index("### `heavy --changed`"):text.index("### `heavy`: CPU slots")]
+        entries = [l for l in section.splitlines() if l.startswith("- `fleet-switchboard") and ("heavy --changed" in l or "heavy --quick" in l or "preflight-pr --merged" in l)]
+        self.assertEqual(len(entries), 4)
+        for word in ("--list", "--merged", "cap 4", "10 min"):
+            self.assertIn(word, section)
+
+
+def tree_digest(root):
+    h = hashlib.sha256()
+    for p in sorted(Path(root).rglob("*")):
+        if ".git" in p.parts or not p.is_file():
+            continue
+        h.update(str(p.relative_to(root)).encode() + p.read_bytes())
+    return h.hexdigest() + git(root, "status", "--porcelain").stdout
+
+
+class TestReadOnly(unittest.TestCase):
+    def test_the_checkout_is_untouched_and_another_process_survives(self):
+        root = merged_fixture()
+        write(root, "lib/calc.py", "VERSION = 2\ndef add(a, b):\n    return a + b  # dirty\n")
+        other = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(other.kill)
+        before = tree_digest(root)
+        ps.plan(root, ["lib/calc.py"])
+        run_switchboard(root, "heavy", "--changed", "--list", "--base", "main")
+        run_switchboard(root, "heavy", "--changed", "--base", "main")
+        self.assertEqual(tree_digest(root), before)
+        self.assertIsNone(other.poll())
+
+
+if __name__ == "__main__":
+    result = unittest.main(exit=False, verbosity=1).result
+    ok = result.wasSuccessful()
+    print("RESULT: PASS" if ok else "RESULT: FAIL")
+    sys.exit(0 if ok else 1)

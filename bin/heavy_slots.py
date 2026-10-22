@@ -157,6 +157,7 @@ KINDS = (
     ("e2e", 3600, _is_e2e),
     ("focused", 1800, _is_focused),
     ("full", 5400, _is_full),
+    ("quick", 600, lambda program, rest, short: False),   # the quick slot's ceiling (#1045): a row of THIS table; classify never returns it, run_quick takes it by name
     ("other", 3600, lambda program, rest, short: True),
 )
 KIND_DEFAULTS = {kind: seconds for kind, seconds, _match in KINDS}
@@ -1202,3 +1203,71 @@ def wrap_argv(argv, environ, python, switchboard, script, err=None, state_dir=No
         err.write("heavy: no slot machinery here (%s): running without a slot\n" % (error.strerror or error))
         return None
     return [python, switchboard, "heavy", "--name", os.path.basename(script), "--", python, script] + list(argv)
+
+
+# ---- the quick slots (#1045): a small separate allowance for ONE focused test file or class, so a one-file check never waits behind a full-suite run.
+QUICK_SLOTS = 4          # the cap: at most this many quick runs at once, on their own locks and their own line (a directory of their own in the state directory)
+QUICK_DIR = "quick"
+
+
+def quick_dir(state_dir):
+    path = os.path.join(str(state_dir), QUICK_DIR)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
+def quick_status(state_dir):
+    """`quick slots 1/4 (ceiling 10 min)`: read only (a missing directory reads as none held)."""
+    path = os.path.join(str(state_dir), QUICK_DIR)
+    held = len(holders(path, QUICK_SLOTS)) if os.path.isdir(path) else 0
+    return "quick slots %d/%d (ceiling %d min)" % (held, QUICK_SLOTS, KIND_DEFAULTS["quick"] // 60)
+
+
+def run_quick(command, state_dir, wait_max=DEFAULT_WAIT_MAX, name=None, environ=None, out=None, **keywords):
+    """Run ONE focused command in a quick slot. A command that is not focused (a whole suite, an e2e run) is refused with 64 and never takes a quick slot. The quick slots
+    have their own locks and their own waiting line, so a run holding every ordinary slot (or queued for one) never delays it; at most QUICK_SLOTS run at once and each is
+    stopped after the "quick" row of KIND_DEFAULTS (10 min)."""
+    out = sys.stderr if out is None else out
+    kind = classify(command)
+    if kind != "focused":
+        out.write("heavy: refused: a quick slot is for ONE focused test file or class; this run is %s (use an ordinary slot: no --quick)\n" % kind)
+        return EXIT_USAGE
+    environ = dict(os.environ if environ is None else environ)
+    environ[TIME_ENV] = str(KIND_DEFAULTS["quick"])
+    try:
+        out.write("heavy: quick slot: %s\n" % quick_status(state_dir))
+    except OSError:
+        pass
+    return run(command, quick_dir(state_dir), QUICK_SLOTS, wait_max, name, environ=environ, out=out, ceiling=KIND_DEFAULTS["quick"],
+               ceiling_config={"slots": QUICK_SLOTS, "ceilings": {"max": KIND_DEFAULTS["quick"]}}, **keywords)
+
+
+# ---- the reserved slots of a `heavy --changed` run (#1045, clause 7): the diff-derived focused run (several classes, several suites) is never queued behind full-suite runs.
+CHANGED_SLOTS = 2        # reserved: on their own locks and their own waiting line (a directory of their own in the state directory), so a queue of full-suite runs never delays it
+CHANGED_DIR = "changed"
+CHANGED_WAIT_MAX = 120   # the bound of the wait for a reserved slot, in seconds; a longer --wait-max is cut to it
+EXIT_NO_FOCUSED_SLOT = 3
+NO_FOCUSED_SLOT = "no focused slot free"
+
+
+def changed_dir(state_dir):
+    path = os.path.join(str(state_dir), CHANGED_DIR)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
+def run_changed(command, state_dir, wait_max=CHANGED_WAIT_MAX, name=None, environ=None, out=None, **keywords):
+    """Run one command of a `heavy --changed` run in a reserved slot. At most CHANGED_SLOTS run at once; the wait is at most CHANGED_WAIT_MAX seconds, and when every reserved
+    slot is still taken the run is NOT started: the line `heavy: no focused slot free ...` names it and the status is 3 (never a silent timeout)."""
+    out = sys.stderr if out is None else out
+    environ = dict(os.environ if environ is None else environ)
+    wait = min(CHANGED_WAIT_MAX if wait_max is None else wait_max, CHANGED_WAIT_MAX)
+    ceiling = keywords.pop("ceiling", None) or KIND_DEFAULTS["focused"]   # the focused row of the per-kind table: no ceiling of its own
+    environ[TIME_ENV] = str(ceiling)
+    code = run(command, changed_dir(state_dir), CHANGED_SLOTS, wait, name, environ=environ, out=out, ceiling=ceiling,
+               ceiling_config={"slots": CHANGED_SLOTS, "ceilings": {"max": ceiling}}, **keywords)
+    if code == EXIT_TEMPFAIL:
+        out.write("heavy: %s: all %d reserved --changed slots are taken after %d s: the command was not run (exit %d)\n" % (NO_FOCUSED_SLOT, CHANGED_SLOTS, wait, EXIT_NO_FOCUSED_SLOT))
+        out.flush()
+        return EXIT_NO_FOCUSED_SLOT
+    return code
