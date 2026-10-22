@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""test-cloud-way-back: offline tests for bin/cloud_way_back_check.py (slice 6a of the plan on #1059, scenario S6).
+
+The real check is driven with fixture directories. Each rule has one mutant: the module's source is changed in one place and
+the same case must then fail (a case that passes on the mutant proves nothing).
+
+    bin/test-cloud-way-back
+"""
+import hashlib
+import io
+import json
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+SOURCE = (BIN / "cloud_way_back_check.py").read_text()
+
+
+def load(source=SOURCE):
+    module = types.ModuleType("cloud_way_back_check_under_test")
+    exec(compile(source, "cloud_way_back_check.py", "exec"), module.__dict__)
+    return module
+
+
+def mutant(old, new):
+    assert SOURCE.count(old) == 1, old
+    return load(SOURCE.replace(old, new))
+
+
+def fixture(root, **change):
+    (root / "snap.tar").write_bytes(b"state")
+    (root / "orch.json").write_text("{}")
+    state = {"phase": "done", "cloud_daemon": {"running": False}, "local_daemon": {"running": True},
+             "snapshot": {"file": "snap.tar", "sha256": hashlib.sha256(b"state").hexdigest()},
+             "cloud_agents": ["a", "b"], "local_agents": ["a", "b", "c"],
+             "orchestrators": [{"name": "o", "export": "orch.json"}],
+             "import": {"dir": "/tmp/wayback-import", "agent_dirs": ["/work/x"], "copies_remaining": []}}
+    state.update(change)
+    (root / "way-back.json").write_text(json.dumps(state))
+    return root
+
+
+def run(module, **change):
+    with tempfile.TemporaryDirectory() as tmp:
+        root = fixture(Path(tmp), **change)
+        out = io.StringIO()
+        code = module.main([str(root)], out)
+        before = sorted((p.name, p.read_bytes()) for p in root.iterdir())
+        return code, out.getvalue(), before
+
+
+REAL = load()
+BAD = {
+    "cloud_daemon_stopped": dict(cloud_daemon={"running": True}),
+    "only_the_local_daemon": dict(local_daemon={"running": False}),
+    "snapshot_matches": dict(snapshot={"file": "snap.tar", "sha256": "0" * 64}),
+    "agents_restored": dict(local_agents=["a"]),
+    "orchestrator_exports": dict(orchestrators=[{"name": "o", "export": "nope.json"}]),
+    "import_dir_dedicated": dict(**{"import": {"dir": "/work/x", "agent_dirs": ["/work/x/sub"], "copies_remaining": []}}),
+    "import_copy_deleted": dict(**{"import": {"dir": "/tmp/d", "agent_dirs": [], "copies_remaining": ["ses_1"]}}),
+}
+
+
+class TestWayBack(unittest.TestCase):
+    def failing_case(self, module, name):
+        code, text, _ = run(module, **BAD[name])
+        return code == 1 and ("MISSING %s" % name) in text
+
+    def test_a_complete_fixture_passes_and_the_check_writes_nothing(self):
+        code, text, files = run(REAL)
+        self.assertEqual(code, 0, text)
+        self.assertIn("WAY BACK READY", text)
+        self.assertEqual(len(files), 3)
+
+    def test_each_missing_thing_is_named_and_exits_1(self):
+        for name in BAD:
+            self.assertTrue(self.failing_case(REAL, name), name)
+
+    def test_before_start_allows_no_local_daemon_yet(self):
+        code, text, _ = run(REAL, phase="before-start", local_daemon={"running": False})
+        self.assertEqual(code, 0, text)
+        code, _, _ = run(REAL, phase="before-start", local_daemon={"running": True}, cloud_daemon={"running": True})
+        self.assertEqual(code, 1)
+
+    def test_an_unreadable_fixture_exits_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(REAL.main([tmp], io.StringIO()), 2)
+
+    def test_an_export_path_that_escapes_the_fixture_is_missing(self):
+        code, text, _ = run(REAL, orchestrators=[{"name": "o", "export": "../../etc/hostname"}])
+        self.assertEqual(code, 1)
+
+    # one mutant per rule: the case that catches the rule must fail on it
+    def test_mutant_running_cloud_daemon_accepted(self):
+        self.assertFalse(self.failing_case(mutant("add(\"cloud_daemon_stopped\", cloud is False,", "add(\"cloud_daemon_stopped\", True,"), "cloud_daemon_stopped"))
+
+    def test_mutant_two_daemons_accepted(self):
+        self.assertFalse(self.failing_case(mutant("local is True and cloud is False", "True"), "only_the_local_daemon"))
+
+    def test_mutant_checksum_ignored(self):
+        self.assertFalse(self.failing_case(mutant('digest == snap.get("sha256"), "checksum', 'True, "checksum'), "snapshot_matches"))
+
+    def test_mutant_lost_agents_ignored(self):
+        self.assertFalse(self.failing_case(mutant("bool(cloud_agents) and not lost", "True"), "agents_restored"))
+
+    def test_mutant_missing_export_ignored(self):
+        self.assertFalse(self.failing_case(mutant("add(\"orchestrator_exports\", not absent,", "add(\"orchestrator_exports\", True,"), "orchestrator_exports"))
+
+    def test_mutant_shared_import_dir_accepted(self):
+        self.assertFalse(self.failing_case(mutant("bool(directory) and not shared", "bool(directory)"), "import_dir_dedicated"))
+
+    def test_mutant_remaining_copy_accepted(self):
+        self.assertFalse(self.failing_case(mutant('add("import_copy_deleted", not left,', 'add("import_copy_deleted", True,'), "import_copy_deleted"))
+
+    def test_mutant_exit_code_always_0(self):
+        self.assertFalse(self.failing_case(mutant("return 1 if missing else 0", "return 0"), "cloud_daemon_stopped"))
+
+
+if __name__ == "__main__":
+    result = unittest.main(exit=False, verbosity=1).result
+    ok_ = result.wasSuccessful()
+    print("RESULT: %s" % ("PASS" if ok_ else "FAIL"))
+    sys.exit(0 if ok_ else 1)
