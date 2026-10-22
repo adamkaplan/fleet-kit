@@ -35480,6 +35480,29 @@ class TestImpactFloorOwnerDecision(LedgerBase):
     def cut(self, *paths, total=3000):
         self.pr.update({"changedFiles": total, "files": [{"path": p, "additions": 1, "deletions": 0} for p in paths]})
 
+    def test_139_files_with_the_top_tier_path_only_among_the_last_39_are_judged_by_the_floor_on_all_139(self):
+        """#1098 end to end: `gh pr view` lists the first 100; the floor follows the pages through the shared reader and holds for the top tier path at file 121."""
+        paths = ["docs/f%03d.md" % n for n in range(139)]
+        paths[120] = "shims/gh"
+        self.pr.update({"changedFiles": 139, "files": [{"path": p, "additions": 1, "deletions": 0} for p in paths[:100]]})
+        requests = []
+
+        def get(path):
+            requests.append(path)
+            page = int(path.rsplit("page=", 1)[1])
+            return [{"filename": p, "status": "modified"} for p in paths[(page - 1) * 100:page * 100]]
+        with mock.patch.object(sb, "impact_carry_get", lambda engine, runner, repo: get), mock.patch.object(sb, "agent_block_states", return_value={}):
+            shown = json.loads(self.floor("--json"))
+            out = self.floor()
+            self.assertEqual((shown["owner_decision"], shown["complete"], shown["files_read"], shown["files_total"]), ("hold", True, 139, 139))
+            self.assertIn("HOLD for the owner", out)
+            self.assertIn("shims/gh", out)
+            self.assertEqual(sorted(set(requests)), ["repos/acme/app/pulls/9/files?per_page=100&page=1", "repos/acme/app/pulls/9/files?per_page=100&page=2"])
+            # the mutant: the first page only (the old reading) misses the path
+            with mock.patch.object(sb.load_module("pr_files"), "read", lambda g, r, n, total=None: (g("repos/%s/pulls/%d/files?per_page=100&page=1" % (r, n)), None)):
+                mutant = json.loads(self.floor("--json"))
+            self.assertNotEqual(mutant["owner_decision"], "hold", "a first-page-only reader misses the top tier path: this test sees it")
+
     def test_a_complete_list_says_how_many_files_were_read_in_the_headline(self):
         self.files("docs/switchboard.md", "docs/plan-template.md")
         out = self.floor()
@@ -35506,7 +35529,9 @@ class TestImpactFloorOwnerDecision(LedgerBase):
 
     def test_a_cut_list_in_a_repo_with_floor_globs_is_held_on_purpose_as_the_daemon_holds_it(self):
         self.cut(*["docs/f%d.md" % n for n in range(100)])   # the repo of this class has floor globs
-        out = self.floor()
+        pages = lambda engine, runner, repo: (lambda path: [{"filename": "docs/f%d.md" % n} for n in range(100)] if path.endswith("page=1") else [])   # GitHub lists 100 and then no more
+        with mock.patch.object(sb, "impact_carry_get", pages):
+            out = self.floor()
         self.assertIn("HOLD for the owner, 100 files read", out.split("\n")[0])
         self.assertIn("floor unknown: GitHub listed 100 of 3000", out)
 
@@ -74621,11 +74646,12 @@ class TestClearLine(TestImpactHold):
             if self.fail_on and self.fail_on in path:
                 raise ValueError("the read failed")
             if "/files" in path:
-                return self.listing if "page=1" in path else []
+                page = int(path.rsplit("page=", 1)[1])
+                return self.listing[(page - 1) * 100:page * 100]
             if "/comments" in path:
                 number = re.search(r"/issues/(\d+)/", path).group(1)
                 return [c for c in self.comments if c.get("n", "9") == number] if "page=1" in path else []
-            return {"head": {"sha": self.pr["headRefOid"]}, "base": {"sha": "b" * 40}}
+            return {"head": {"sha": self.pr["headRefOid"]}, "base": {"sha": "b" * 40}, "changed_files": len(self.listing)}
         return get
 
     def route(self, argv, **kwargs):
@@ -74765,6 +74791,42 @@ class TestClearLine(TestImpactHold):
             sb.load_module("delegated_clear").MAP_CACHE.clear()   # the mutant: no shared cache
             sb.delegated_clear_pr_checks(engine, engine.gh_runner, "acme/app", 9)
             self.assertEqual(len(reads), 4, "without the hand-over the clear reads again")
+
+    def big_pr(self, special, status, count=139, at=120):
+        """`count` changed files, `special` the one at index `at` (past the first page of 100): the floor read the first 100 only, the clear's inputs follow every page (#1098)."""
+        paths = ["migrations/0002.sql"] + ["docs/f%03d.md" % n for n in range(count - 1)]
+        paths[at] = special
+        self.set_files(*paths)
+        self.listing[at]["status"] = status
+        self.pr["files"] = [{"path": p} for p in paths[:100]]   # `gh pr view` lists the first 100 only
+        self.pr["changedFiles"] = count
+
+    def test_s3_139_files_the_new_file_past_page_one_is_refused_by_the_clear_and_named_in_the_who_line(self):
+        self.delegation()
+        self.big_pr("bin/new_tool.py", "added")
+        engine = self.world.new_engine("daemon")
+        engine.gh_runner, engine.config, engine.state_dir = self.route, sb.load_config(), self.world.state
+        got = sb.clear_who(engine, engine.gh_runner, "acme/app", 9)
+        self.assertEqual(got["who"], "owner only")
+        self.assertIn("new-file", [o["kind"] for o in got["owner_only"]], got)
+        report, why = sb.delegated_clear_pr_checks(engine, engine.gh_runner, "acme/app", 9)
+        self.assertIsNone(report)
+        self.assertIn("bin/new_tool.py", why)
+        self.assertTrue(any("page=2" in p for p in self.gets if "/files" in p), "the second page was read")
+
+    def test_s3_139_files_a_changed_daemon_file_past_page_one_is_refused_by_the_closure_rule(self):
+        self.delegation()
+        self.mapped = ["it changes f, part of the clear (head file)"]
+        self.big_pr("bin/fleet-switchboard", "modified")
+        engine = self.world.new_engine("daemon")
+        engine.gh_runner, engine.config, engine.state_dir = self.route, sb.load_config(), self.world.state
+        with mock.patch.object(sb, "delegated_clear_map", lambda *a: self.mapped):
+            got = sb.clear_who(engine, engine.gh_runner, "acme/app", 9)
+            report, why = sb.delegated_clear_pr_checks(engine, engine.gh_runner, "acme/app", 9)
+        self.assertEqual(got["who"], "owner only")
+        self.assertIn("closure", [o["kind"] for o in got["owner_only"]], got)
+        self.assertIsNone(report)
+        self.assertIn("part of the clear", why)
 
     def test_u2_a_pull_request_that_holds_nothing_gets_no_comment_and_the_labels_are_unchanged(self):
         self.set_files("src/app.py")
