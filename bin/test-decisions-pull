@@ -6,8 +6,11 @@ source is changed in one place and the same check must then fail.
 
     bin/test-decisions-pull
 """
+import io
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -43,6 +46,10 @@ def down(module):
     return fetch
 
 
+def pull_quiet(module, state, fetch, now=NOW, err=None):
+    return module.pull(state, fetch, now, err=err or io.StringIO())
+
+
 def fresh_file(state, text="OLD\n", age=5):
     path = Path(state) / "decisions.json"
     path.write_text(text)
@@ -53,7 +60,7 @@ def fresh_file(state, text="OLD\n", age=5):
 # ---- the checks: each takes a module and raises AssertionError when the rule is broken
 def check_shape_is_the_daemons(module):
     with tempfile.TemporaryDirectory() as state:
-        assert module.pull(state, good(), NOW) == "wrote"
+        assert pull_quiet(module, state, good(), NOW) == "wrote"
         path = Path(state) / "decisions.json"
         expected = json.dumps(BODY, indent=1, sort_keys=True) + "\n"
         assert path.read_text() == expected, path.read_text()
@@ -63,7 +70,7 @@ def check_shape_is_the_daemons(module):
 
 def check_unknown_keys_are_dropped(module):
     with tempfile.TemporaryDirectory() as state:
-        module.pull(state, good(dict(BODY, secret="x")), NOW)
+        pull_quiet(module, state, good(dict(BODY, secret="x")), NOW)
         assert "secret" not in json.loads((Path(state) / "decisions.json").read_text())
 
 
@@ -74,7 +81,7 @@ def check_write_is_atomic(module):
         real = os.replace
         module.os.replace = lambda a, b: (seen.append((Path(b).read_text(), Path(a).read_text() != "")), real(a, b))
         try:
-            module.pull(state, good(), NOW)
+            pull_quiet(module, state, good(), NOW)
         finally:
             module.os.replace = real
         assert seen == [("OLD\n", True)], seen  # the old file was whole until the rename
@@ -90,7 +97,7 @@ def check_failed_write_leaves_old_file(module):
         module.os.replace = boom
         try:
             try:
-                module.pull(state, good(), NOW)
+                pull_quiet(module, state, good(), NOW)
                 raise AssertionError("no error")
             except OSError:
                 pass
@@ -103,7 +110,7 @@ def check_failed_write_leaves_old_file(module):
 def check_unreachable_marks_stale(module):
     with tempfile.TemporaryDirectory() as state:
         path = fresh_file(state)
-        assert module.pull(state, down(module), NOW) == "marked-stale"
+        assert pull_quiet(module, state, down(module), NOW) == "marked-stale"
         assert path.read_text() == "OLD\n"
         assert NOW - path.stat().st_mtime > 180
 
@@ -111,13 +118,13 @@ def check_unreachable_marks_stale(module):
 def check_stale_never_made_fresher(module):
     with tempfile.TemporaryDirectory() as state:
         path = fresh_file(state, age=9999)
-        module.pull(state, down(module), NOW)
+        pull_quiet(module, state, down(module), NOW)
         assert path.stat().st_mtime == NOW - 9999
 
 
 def check_unreachable_without_file_creates_none(module):
     with tempfile.TemporaryDirectory() as state:
-        assert module.pull(state, down(module), NOW) == "untouched"
+        assert pull_quiet(module, state, down(module), NOW) == "untouched"
         assert list(Path(state).iterdir()) == []
 
 
@@ -126,30 +133,197 @@ def check_garbage_leaves_file_untouched(module):
         with tempfile.TemporaryDirectory() as state:
             path = fresh_file(state)
             before = (path.read_bytes(), path.stat().st_mtime)
-            assert module.pull(state, lambda: raw, NOW) == "untouched", raw[:20]
+            assert pull_quiet(module, state, lambda: raw, NOW) == "untouched", raw[:20]
             assert (path.read_bytes(), path.stat().st_mtime) == before, raw[:20]
             assert [p.name for p in Path(state).iterdir()] == ["decisions.json"]
 
 
+class FakeProc:
+    """A Popen stand-in: stdout is a pipe-like stream; kill is recorded."""
+    def __init__(self, data, code=0, hang=False):
+        self.stdout = io.BytesIO(data)
+        self.asked = []
+        read = self.stdout.read
+        self.stdout.read = lambda n=-1: (self.asked.append(n), read(n))[1]
+        self.code, self.killed, self.hang = code, False, hang
+    def kill(self):
+        self.killed = True
+    def poll(self):
+        return None if (self.hang and not self.killed) else self.code
+    def wait(self):
+        return -9 if self.killed else self.code
+
+
 def check_command_failure_is_unreachable(module):
-    run = lambda argv, **kw: types.SimpleNamespace(returncode=1, stdout=b'{"decisions": [], "errors": []}')
     try:
-        module.command_fetch(["x"], run=run)
+        module.command_fetch(["x"], popen=lambda argv, **kw: FakeProc(b'{"decisions": [], "errors": []}', 1))
         raise AssertionError("a failed command was believed")
     except module.Unreachable:
         pass
-    def timeout(argv, **kw):
-        raise subprocess.TimeoutExpired(argv, 1)
+    def cannot_start(argv, **kw):
+        raise FileNotFoundError(argv[0])
     try:
-        module.command_fetch(["x"], run=timeout)
-        raise AssertionError("a timeout was believed")
+        module.command_fetch(["x"], popen=cannot_start)
+        raise AssertionError("a missing command was believed")
     except module.Unreachable:
         pass
+
+
+def check_real_timeout_is_unreachable(module):
+    try:
+        module.command_fetch([sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.5)
+        raise AssertionError("a timeout was believed")
+    except module.Unreachable as why:
+        assert "timed out" in str(why), str(why)
+
+
+def check_output_is_bounded_and_process_killed(module):
+    procs = []
+    def popen(argv, **kw):
+        procs.append(FakeProc(b"x" * (module.MAX_BYTES + 500), hang=True))
+        return procs[0]
+    data = module.command_fetch(["x"], popen=popen)
+    assert len(data) == module.MAX_BYTES + 1, len(data)  # read no more than the cap and one byte
+    assert procs[0].killed
+    assert procs[0].asked == [module.MAX_BYTES + 1], procs[0].asked
+    with tempfile.TemporaryDirectory() as state:
+        path = fresh_file(state)
+        assert pull_quiet(module, state, lambda: data) == "untouched"
+        assert path.read_text() == "OLD\n"
+
+
+def check_real_source_that_prints_more_is_cut(module):
+    code = "import sys; sys.stdout.write('x' * %d); sys.stdout.flush()" % (module.MAX_BYTES * 2)
+    data = module.command_fetch([sys.executable, "-c", code])
+    assert len(data) == module.MAX_BYTES + 1, len(data)
+
+
+def check_nan_and_infinity_are_garbage(module):
+    for text in (b'{"decisions": [{"id": "a", "title": "t", "n": NaN}], "errors": []}', b'{"decisions": [], "errors": [], "x": Infinity}',
+                 b'{"decisions": [], "errors": [-Infinity]}'):
+        with tempfile.TemporaryDirectory() as state:
+            path = fresh_file(state)
+            assert pull_quiet(module, state, lambda: text) == "untouched", text
+            assert path.read_text() == "OLD\n"
+
+
+def check_items_must_have_the_plugins_types(module):
+    bad = [{"decisions": ["x"], "errors": []}, {"decisions": [1], "errors": []}, {"decisions": [None], "errors": []},
+           {"decisions": [], "errors": [1]}, {"decisions": [], "errors": [None]}, {"decisions": [], "errors": [["a"]]}]
+    for body in bad:
+        with tempfile.TemporaryDirectory() as state:
+            path = fresh_file(state)
+            assert pull_quiet(module, state, good(body)) == "untouched", body
+            assert path.read_text() == "OLD\n"
+    with tempfile.TemporaryDirectory() as state:   # strings and objects in errors are fine
+        assert pull_quiet(module, state, good({"decisions": [], "errors": ["a", {"m": 1}]})) == "wrote"
+
+
+def check_item_count_is_capped(module):
+    n = module.MAX_ITEMS
+    for body in ({"decisions": [{}] * (n + 1), "errors": []}, {"decisions": [], "errors": ["e"] * (n + 1)}):
+        with tempfile.TemporaryDirectory() as state:
+            assert pull_quiet(module, state, good(body)) == "untouched"
+    with tempfile.TemporaryDirectory() as state:
+        assert pull_quiet(module, state, good({"decisions": [{}] * n, "errors": ["e"] * n})) == "wrote"
+
+
+def check_control_characters_are_stripped(module):
+    esc = "\x1b]0;pwned\x07\x1b[31mred\x9b"
+    body = dict(BODY, decisions=[{"id": "gh:1", "title": "Pick" + esc + "\none", "nested": {"k" + esc: ["a" + esc]}}], errors=["e" + esc])
+    with tempfile.TemporaryDirectory() as state:
+        pull_quiet(module, state, good(body))
+        text = (Path(state) / "decisions.json").read_text()
+        assert not re.search("[\\x00-\\x09\\x0b-\\x1f\\x7f-\\x9f]", text), repr(text)
+        written = json.loads(text)
+        assert written["decisions"][0]["title"] == "Pick]0;pwned[31mredone"
+        assert written["decisions"][0]["id"] == "gh:1"
+
+
+def check_reasons_are_said_on_stderr(module):
+    secret = "SECRET-BODY-TEXT"
+    with tempfile.TemporaryDirectory() as state:
+        err = io.StringIO()
+        fresh_file(state)
+        module.pull(state, lambda: ('{"x": "%s"}' % secret).encode(), NOW, err=err)
+        lines = err.getvalue().splitlines()
+        assert len(lines) == 1 and "not the daemon's decisions list" in lines[0] and "untouched" in lines[0], lines
+        assert secret not in err.getvalue()
+        err = io.StringIO()
+        def fetch():
+            raise module.Unreachable("exit 7")
+        module.pull(state, fetch, NOW, err=err)
+        lines = err.getvalue().splitlines()
+        assert len(lines) == 1 and "unreachable (exit 7)" in lines[0] and "marked" in lines[0], lines
+    with tempfile.TemporaryDirectory() as state:
+        err = io.StringIO()
+        module.pull(state, fetch, NOW, err=err)
+        lines = err.getvalue().splitlines()
+        assert len(lines) == 1 and "unreachable (exit 7)" in lines[0] and "no decisions.json to mark stale" in lines[0], lines
+    with tempfile.TemporaryDirectory() as state:
+        err = io.StringIO()
+        module.pull(state, good(), NOW, err=err)
+        assert err.getvalue() == "", err.getvalue()
+
+
+def check_stale_ages_the_descriptor_not_the_path(module):
+    """A write_atomic that renames in between the open and the utime must not be aged: the aging goes through the open descriptor."""
+    with tempfile.TemporaryDirectory() as state:
+        path = fresh_file(state)
+        real = os.utime
+        def racing(target, times):
+            # a puller renames a new file in, then our utime arrives
+            new = Path(state) / "new.tmp"
+            new.write_text("NEW\n")
+            real(str(new), (NOW, NOW))
+            os.replace(str(new), str(path))
+            return real(target, times)
+        module.os.utime = racing
+        try:
+            assert module.mark_stale(path, NOW) is True
+        finally:
+            module.os.utime = real
+        assert path.read_text() == "NEW\n"
+        assert path.stat().st_mtime == NOW, "the new file was aged"
+
+
+def check_directory_is_fsynced_after_rename(module):
+    with tempfile.TemporaryDirectory() as state:
+        events = []
+        real_fsync, real_replace = os.fsync, os.replace
+        module.os.fsync = lambda fd: (events.append(("fsync", os.path.isdir("/proc/self/fd/%d" % fd))), real_fsync(fd))
+        module.os.replace = lambda a, b: (events.append(("replace", False)), real_replace(a, b))
+        try:
+            pull_quiet(module, state, good())
+        finally:
+            module.os.fsync, module.os.replace = real_fsync, real_replace
+        assert events == [("fsync", False), ("replace", False), ("fsync", True)], events
+
+
+def daemon_keys():
+    """The keys the daemon's DecisionStore.publish writes into decisions.json, read from its source."""
+    text = (BIN / "fleet-switchboard").read_text()
+    start = text.index("    def publish(self, decisions, errors, now, provisional=False):")
+    block = text[start:text.index("temp = path.with_name", start)]
+    keys = set(re.findall(r'body = \{(.*?)\}', block, re.S)[0].replace("\n", " ").split('"')[1::2])
+    keys = {k for k in keys if re.fullmatch(r"[a-z_]+", k) and ('"%s":' % k) in block}
+    keys |= set(re.findall(r'body\["([a-z_]+)"\] = ', block))
+    return keys
+
+
+def check_kept_keys_are_the_daemons(module):
+    keys = daemon_keys()
+    assert {"generation", "written_at", "daemon_pid", "decisions", "errors", "provisional"} <= keys, keys
+    assert set(module.KEPT_KEYS) == keys, (set(module.KEPT_KEYS) ^ keys)
 
 
 ALL = [check_shape_is_the_daemons, check_unknown_keys_are_dropped, check_write_is_atomic, check_failed_write_leaves_old_file,
        check_unreachable_marks_stale, check_stale_never_made_fresher, check_unreachable_without_file_creates_none,
-       check_garbage_leaves_file_untouched, check_command_failure_is_unreachable]
+       check_garbage_leaves_file_untouched, check_command_failure_is_unreachable, check_real_timeout_is_unreachable,
+       check_output_is_bounded_and_process_killed, check_real_source_that_prints_more_is_cut, check_nan_and_infinity_are_garbage,
+       check_items_must_have_the_plugins_types, check_item_count_is_capped, check_control_characters_are_stripped,
+       check_reasons_are_said_on_stderr, check_stale_ages_the_descriptor_not_the_path, check_directory_is_fsynced_after_rename,
+       check_kept_keys_are_the_daemons]
 
 
 class RealCode(unittest.TestCase):
@@ -159,20 +333,21 @@ class RealCode(unittest.TestCase):
                 check(load())
 
     def test_the_plugin_reads_what_is_written(self):
-        node = subprocess.run(["which", "node"], stdout=subprocess.PIPE).stdout.strip()
-        if not node:
-            self.skipTest("no node")
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "node is required: the round trip through the real plugin must not be skipped")
+        script = ("import {loadSnapshot} from '%s'; const s = loadSnapshot(process.argv[1], Number(process.argv[2])); "
+                  "console.log(JSON.stringify([s.status, s.decisions.length, s.decisions.map((d) => d.title)]))" % (BIN.parent / "plugins/fleet-decisions-tui/decisions.mjs"))
+
+        def plugin(state, at):
+            out = subprocess.run([node, "--input-type=module", "-e", script, state, str(int(at * 1000))], stdout=subprocess.PIPE, check=True).stdout
+            return json.loads(out)
+        body = dict(BODY, decisions=[dict(BODY["decisions"][0], title="Pick\x1b[31m one")])
         with tempfile.TemporaryDirectory() as state:
-            import time
             module = load()
-            module.pull(state, good(), time.time())
-            script = ("import {loadSnapshot} from '%s'; const s = loadSnapshot(process.argv[1], Date.now()); "
-                      "console.log(JSON.stringify([s.status, s.decisions.length]))" % (BIN.parent / "plugins/fleet-decisions-tui/decisions.mjs"))
-            out = subprocess.run([node.decode(), "--input-type=module", "-e", script, state], stdout=subprocess.PIPE, check=True).stdout
-            self.assertEqual(json.loads(out), ["ok", 1])
-            module.pull(state, down(module), time.time())
-            out = subprocess.run([node.decode(), "--input-type=module", "-e", script, state], stdout=subprocess.PIPE, check=True).stdout
-            self.assertEqual(json.loads(out), ["stale", 1])
+            pull_quiet(module, state, good(body), NOW)
+            self.assertEqual(plugin(state, NOW + 5), ["ok", 1, ["Pick[31m one"]])   # no escape reaches the plugin's output
+            pull_quiet(module, state, down(module), NOW + 10)
+            self.assertEqual(plugin(state, NOW + 10)[:2], ["stale", 1])
 
 
 class Mutants(unittest.TestCase):
@@ -190,7 +365,7 @@ class Mutants(unittest.TestCase):
         self.failing(check_shape_is_the_daemons, mutant("os.utime(str(temp), (now, now))", "pass"))
 
     def test_unknown_keys_kept(self):
-        self.failing(check_unknown_keys_are_dropped, mutant("body = {k: body[k] for k in KEPT_KEYS if k in body}", "pass"))
+        self.failing(check_unknown_keys_are_dropped, mutant("body = clean({k: body[k] for k in KEPT_KEYS if k in body})", "body = clean(body)"))
 
     def test_write_in_place(self):
         self.failing(check_write_is_atomic, mutant("os.replace(str(temp), str(path))", "open(str(path), 'w').write(open(str(temp)).read())"))
@@ -199,32 +374,94 @@ class Mutants(unittest.TestCase):
         self.failing(check_failed_write_leaves_old_file, mutant("        try:\n            os.unlink(str(temp))\n        except OSError:\n            pass\n        raise", "        raise"))
 
     def test_unreachable_not_marked(self):
-        self.failing(check_unreachable_marks_stale, mutant("return STALED if mark_stale(path, now) else UNTOUCHED", "return UNTOUCHED"))
+        self.failing(check_unreachable_marks_stale, mutant("        if mark_stale(path, now):", "        if False:"))
 
     def test_stale_margin_removed(self):
         self.failing(check_unreachable_marks_stale, mutant("now - STALE_SECONDS - 1", "now - STALE_SECONDS + 5"))
 
     def test_stale_refreshes_old_file(self):
-        self.failing(check_stale_never_made_fresher, mutant("min(info.st_mtime, now - STALE_SECONDS - 1)", "now - STALE_SECONDS - 1"))
+        self.failing(check_stale_never_made_fresher, mutant("min(os.fstat(fd).st_mtime, now - STALE_SECONDS - 1)", "now - STALE_SECONDS - 1"))
 
     def test_unreachable_creates_file(self):
-        self.failing(check_unreachable_without_file_creates_none, mutant("    try:\n        info = os.stat(str(path))\n    except OSError:\n        return False",
-                                                                          "    try:\n        info = os.stat(str(path))\n    except OSError:\n        path.write_text('{}')\n        return False"))
+        self.failing(check_unreachable_without_file_creates_none, mutant("    except OSError:\n        return False", "    except OSError:\n        path.write_text('{}')\n        return False"))
 
     def test_garbage_overwrites(self):
-        self.failing(check_garbage_leaves_file_untouched, mutant("    if body is None:\n        return UNTOUCHED", "    if body is None:\n        body = {'decisions': [], 'errors': []}"))
+        self.failing(check_garbage_leaves_file_untouched, mutant("        return UNTOUCHED\n    write_atomic(path, body, now)", "        body = {'decisions': [], 'errors': []}\n    write_atomic(path, body, now)"))
 
     def test_shape_not_checked(self):
-        self.failing(check_garbage_leaves_file_untouched, mutant('isinstance(body.get("decisions"), list) and ', ""))
+        self.failing(check_garbage_leaves_file_untouched, mutant("isinstance(body.get(\"decisions\"), list) and ", ""))
 
     def test_size_not_capped(self):
-        self.failing(check_garbage_leaves_file_untouched, mutant("or len(raw) > MAX_BYTES", ""))
+        self.failing(check_garbage_leaves_file_untouched, mutant("    if len(raw) > MAX_BYTES:", "    if False:"))
 
     def test_failed_command_believed(self):
-        self.failing(check_command_failure_is_unreachable, mutant("if done.returncode != 0:", "if False:"))
+        self.failing(check_command_failure_is_unreachable, mutant("    if code != 0:", "    if False:"))
 
-    def test_timeout_escapes(self):
-        self.failing(check_command_failure_is_unreachable, mutant("except (OSError, subprocess.SubprocessError) as err:", "except OSError as err:"))
+    def test_missing_command_escapes(self):
+        self.failing(check_command_failure_is_unreachable, mutant("except (OSError, subprocess.SubprocessError) as err:", "except subprocess.SubprocessError as err:"))
+
+    def test_nan_accepted(self):
+        self.failing(check_nan_and_infinity_are_garbage, mutant(", parse_constant=_no_constant", ""))
+
+    def test_decision_items_not_checked(self):
+        self.failing(check_items_must_have_the_plugins_types, mutant('    if not all(isinstance(d, dict) for d in body["decisions"]):', "    if False:"))
+
+    def test_error_items_not_checked(self):
+        self.failing(check_items_must_have_the_plugins_types, mutant("isinstance(e, (str, dict))", "True"))
+
+    def test_error_items_too_strict(self):
+        self.failing(check_items_must_have_the_plugins_types, mutant("isinstance(e, (str, dict))", "isinstance(e, str)"))
+
+    def test_item_count_not_capped(self):
+        self.failing(check_item_count_is_capped, mutant("    if len(body[\"decisions\"]) > MAX_ITEMS or len(body[\"errors\"]) > MAX_ITEMS:", "    if False:"))
+
+    def test_item_cap_off_by_one(self):
+        self.failing(check_item_count_is_capped, mutant("> MAX_ITEMS or", ">= MAX_ITEMS or"))
+
+    def test_controls_kept(self):
+        self.failing(check_control_characters_are_stripped, mutant("body = clean({k: body[k] for k in KEPT_KEYS if k in body})", "body = {k: body[k] for k in KEPT_KEYS if k in body}"))
+
+    def test_controls_kept_in_nested_values(self):
+        self.failing(check_control_characters_are_stripped, mutant("return [clean(v) for v in value]", "return value"))
+
+    def test_c1_controls_kept(self):
+        self.failing(check_control_characters_are_stripped, mutant("\\x7f-\\x9f", "\\x7f"))
+
+    def test_garbage_reason_not_said(self):
+        self.failing(check_reasons_are_said_on_stderr, mutant('        say(err, "source answered something', '        pass  # say(err, "source answered something'))
+
+    def test_unreachable_reason_not_said(self):
+        self.failing(check_reasons_are_said_on_stderr, mutant('            say(err, "source unreachable (%s); marked', '            pass  # say(err, "source unreachable (%s); marked'))
+
+    def test_no_file_reason_not_said(self):
+        self.failing(check_reasons_are_said_on_stderr, mutant('        say(err, "source unreachable (%s); no', '        pass  # say(err, "source unreachable (%s); no'))
+
+    def test_reason_prints_the_body(self):
+        self.failing(check_reasons_are_said_on_stderr, mutant('(%s); %s untouched" % (why, DECISIONS_FILE))', '(%s); %s untouched" % (raw, DECISIONS_FILE))'))
+
+    def test_exit_code_not_in_reason(self):
+        self.failing(check_reasons_are_said_on_stderr, mutant('"source unreachable (%s); marked %s stale" % (why, DECISIONS_FILE)', '"source unreachable; marked %s stale" % DECISIONS_FILE'))
+
+    def test_stale_by_path_not_descriptor(self):
+        self.failing(check_stale_ages_the_descriptor_not_the_path, mutant("os.utime(fd, (older, older))", "os.utime(str(path), (older, older))"))
+
+    def test_output_not_bounded(self):
+        self.failing(check_output_is_bounded_and_process_killed, mutant("proc.stdout.read(MAX_BYTES + 1)", "proc.stdout.read()"))
+
+    def test_process_not_killed_on_overflow(self):
+        self.failing(check_output_is_bounded_and_process_killed, load(SOURCE.replace("            proc.kill()\n            proc.wait()\n            return data", "            proc.wait()\n            return data").replace("        if proc.poll() is None:\n            proc.kill()\n", "")))
+
+    def test_real_timeout_not_enforced(self):
+        self.failing(check_real_timeout_is_unreachable, mutant("timer = threading.Timer(timeout, proc.kill)", "timer = threading.Timer(timeout + 60, proc.kill)"))
+
+    def test_dir_not_fsynced(self):
+        self.failing(check_directory_is_fsynced_after_rename, mutant("            os.fsync(dir_fd)", "            pass"))
+
+    def test_kept_key_dropped(self):
+        self.failing(check_kept_keys_are_the_daemons, mutant('"daemon_pid", ', ""))
+
+    def test_kept_key_invented(self):
+        self.failing(check_kept_keys_are_the_daemons, mutant('"provisional")', '"provisional", "extra")'))
 
 
 if __name__ == "__main__":

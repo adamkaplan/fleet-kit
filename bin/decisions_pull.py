@@ -18,8 +18,10 @@ import argparse
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -27,6 +29,7 @@ DECISIONS_FILE = "decisions.json"
 STALE_SECONDS = 180                  # the plugin's STALE_MS / 1000
 FETCH_TIMEOUT = 30
 MAX_BYTES = 8 * 1024 * 1024          # a larger body is garbage, not a decisions list
+MAX_ITEMS = 10000                    # decisions or errors beyond this: garbage
 KEPT_KEYS = ("generation", "written_at", "daemon_pid", "decisions", "errors", "provisional")
 
 WROTE, STALED, UNTOUCHED = "wrote", "marked-stale", "untouched"
@@ -36,30 +39,75 @@ class Unreachable(Exception):
     """The source could not be read (down, timed out, non-zero exit)."""
 
 
-def command_fetch(argv, timeout=FETCH_TIMEOUT, run=subprocess.run):
-    """The source text of a command's standard output. Anything but a clean exit is Unreachable."""
+class Garbage(Exception):
+    """The source answered, but not with the daemon's decisions list."""
+
+
+def command_fetch(argv, timeout=FETCH_TIMEOUT, popen=subprocess.Popen):
+    """The source text of a command's standard output, at most MAX_BYTES+1 bytes (the process is killed past that: the extra byte makes
+    parse() call it garbage). A start failure, a timeout or a non-zero exit is Unreachable."""
     try:
-        done = run(list(argv), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout, stdin=subprocess.DEVNULL)
+        proc = popen(list(argv), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError) as err:
         raise Unreachable(type(err).__name__)
-    if done.returncode != 0:
-        raise Unreachable("exit %s" % done.returncode)
-    return done.stdout
+    timer = threading.Timer(timeout, proc.kill)
+    timer.start()
+    try:
+        data = proc.stdout.read(MAX_BYTES + 1)
+        if len(data) > MAX_BYTES:
+            proc.kill()
+            proc.wait()
+            return data
+        code = proc.wait()
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            proc.kill()
+        proc.stdout.close()
+    if code != 0:
+        raise Unreachable("timed out" if timer.finished.is_set() else "exit %s" % code)
+    return data
+
+
+def _no_constant(name):
+    raise ValueError("not JSON: %s" % name)
 
 
 def parse(raw):
-    """The daemon's file as a dict, or None for garbage."""
+    """The daemon's file as a dict; Garbage (with the reason, never the body) for anything else."""
     if isinstance(raw, str):
         raw = raw.encode("utf-8", "replace")
-    if not isinstance(raw, (bytes, bytearray)) or len(raw) > MAX_BYTES:
-        return None
+    if not isinstance(raw, (bytes, bytearray)):
+        raise Garbage("not bytes")
+    if len(raw) > MAX_BYTES:
+        raise Garbage("larger than %d bytes" % MAX_BYTES)
     try:
-        body = json.loads(bytes(raw).decode("utf-8"))
+        body = json.loads(bytes(raw).decode("utf-8"), parse_constant=_no_constant)
     except (ValueError, UnicodeDecodeError, RecursionError):
-        return None
+        raise Garbage("not JSON")
     if not (isinstance(body, dict) and isinstance(body.get("decisions"), list) and isinstance(body.get("errors"), list)):
-        return None
+        raise Garbage("not an object with decisions and errors lists")
+    if len(body["decisions"]) > MAX_ITEMS or len(body["errors"]) > MAX_ITEMS:
+        raise Garbage("more than %d items" % MAX_ITEMS)
+    if not all(isinstance(d, dict) for d in body["decisions"]):
+        raise Garbage("a decision is not an object")
+    if not all(isinstance(e, (str, dict)) for e in body["errors"]):
+        raise Garbage("an error is not a string or an object")
     return body
+
+
+_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f]")
+
+
+def clean(value):
+    """Every string in `value` (keys too) without control characters (escape sequences reach the terminal otherwise)."""
+    if isinstance(value, str):
+        return _CONTROL.sub("", value)
+    if isinstance(value, list):
+        return [clean(v) for v in value]
+    if isinstance(value, dict):
+        return {clean(k): clean(v) for k, v in value.items()}
+    return value
 
 
 def _iso(now):
@@ -67,7 +115,7 @@ def _iso(now):
 
 
 def write_atomic(path, body, now):
-    body = {k: body[k] for k in KEPT_KEYS if k in body}
+    body = clean({k: body[k] for k in KEPT_KEYS if k in body})
     body.setdefault("written_at", _iso(now))
     temp = path.with_name("%s.%d.pull.tmp" % (DECISIONS_FILE, os.getpid()))
     fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -79,6 +127,11 @@ def write_atomic(path, body, now):
             os.fsync(handle.fileno())
         os.utime(str(temp), (now, now))
         os.replace(str(temp), str(path))
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)   # the rename itself must survive a crash
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     except BaseException:
         try:
             os.unlink(str(temp))
@@ -88,26 +141,42 @@ def write_atomic(path, body, now):
 
 
 def mark_stale(path, now):
-    """Age the file past the plugin's limit (never younger than it is); a missing file stays missing."""
+    """Age the file past the plugin's limit (never younger than it is); a missing file stays missing. Stat and utime go through one open
+    descriptor, so a write_atomic that renames a new file in meanwhile is not aged: only the old inode is."""
     try:
-        info = os.stat(str(path))
+        fd = os.open(str(path), os.O_RDONLY)
     except OSError:
         return False
-    older = min(info.st_mtime, now - STALE_SECONDS - 1)
-    os.utime(str(path), (older, older))
+    try:
+        older = min(os.fstat(fd).st_mtime, now - STALE_SECONDS - 1)
+        os.utime(fd, (older, older))
+    finally:
+        os.close(fd)
     return True
 
 
-def pull(state_dir, fetch, now=None):
-    """One pull. `fetch()` returns the source's bytes or raises Unreachable. Returns WROTE, STALED or UNTOUCHED."""
+def say(err, text):
+    """One line on `err`: the reason, never the source's body."""
+    print("decisions_pull: %s" % text, file=err)
+
+
+def pull(state_dir, fetch, now=None, err=None):
+    """One pull. `fetch()` returns the source's bytes or raises Unreachable. Returns WROTE, STALED or UNTOUCHED; says why on `err` otherwise."""
     now = time.time() if now is None else now
+    err = sys.stderr if err is None else err
     path = Path(state_dir) / DECISIONS_FILE
     try:
         raw = fetch()
-    except Unreachable:
-        return STALED if mark_stale(path, now) else UNTOUCHED
-    body = parse(raw)
-    if body is None:
+    except Unreachable as why:
+        if mark_stale(path, now):
+            say(err, "source unreachable (%s); marked %s stale" % (why, DECISIONS_FILE))
+            return STALED
+        say(err, "source unreachable (%s); no %s to mark stale" % (why, DECISIONS_FILE))
+        return UNTOUCHED
+    try:
+        body = parse(raw)
+    except Garbage as why:
+        say(err, "source answered something that is not the daemon's decisions list (%s); %s untouched" % (why, DECISIONS_FILE))
         return UNTOUCHED
     write_atomic(path, body, now)
     return WROTE
