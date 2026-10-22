@@ -41,7 +41,11 @@ def make_post(url):
             with OPENER.open(req, timeout=TIMEOUT) as answer:
                 status, raw = answer.status, answer.read(65536)
         except urllib.error.HTTPError as err:
-            status, raw = err.code, err.read(65536)
+            status = err.code
+            try:
+                raw = err.read(65536)
+            except Exception:
+                raw = b""
         except Exception as err:
             return {"status": 0, "error": type(err).__name__}
         try:
@@ -73,7 +77,10 @@ def main(argv, env=None, post=None):
     if not sender:
         return _usage("cloud_cli: FLEET_AGENT_NAME is not set")
     url = env.get("FLEET_CLOUD_CHANNEL_URL", "").strip()
-    parts = urllib.parse.urlparse(url)
+    try:
+        parts = urllib.parse.urlparse(url)
+    except ValueError:
+        return _usage("cloud_cli: FLEET_CLOUD_CHANNEL_URL must be set to an http or https URL")
     if parts.scheme not in ("http", "https") or not parts.netloc:
         return _usage("cloud_cli: FLEET_CLOUD_CHANNEL_URL must be set to an http or https URL")
     if "@" in parts.netloc:

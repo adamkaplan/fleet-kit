@@ -27,6 +27,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(code)
         if 300 <= code < 400:
             self.send_header("Location", self.server.location)
+        if getattr(self.server, "truncate", False):
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.write(b"zz\r\n" + data)
+            self.wfile.flush()
+            self.close_connection = True
+            return
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -58,7 +65,7 @@ class Base(unittest.TestCase):
     def run_cli(self, args, source=None, **env_over):
         script = Path(self.tmp.name) / "cloud_cli.py"
         script.write_text(source or SOURCE)
-        (Path(self.tmp.name) / "cloud_client.py").write_text((BIN / "cloud_client.py").read_text())
+        (Path(self.tmp.name) / "cloud_client.py").write_text(getattr(self, "client_source", None) or (BIN / "cloud_client.py").read_text())
         env = {"PATH": os.environ.get("PATH", ""), "FLEET_AGENT_NAME": "worker-a", "FLEET_BOSS": "boss-a",
                "FLEET_CLOUD_CHANNEL_URL": self.url, "FLEET_CLOUD_TOKEN_FILE": str(self.tok)}
         env.update(env_over)
@@ -171,10 +178,50 @@ class TestRefusals(Base):
         self.assertEqual(len(self.srv.seen), 0)
 
     def test_default_token_path_unset(self):
+        (Path(self.tmp.name) / "missing").write_text("")
+        (Path(self.tmp.name) / "missing").unlink()
+        client = (BIN / "cloud_client.py").read_text()
+        self.assertEqual(client.count("TOKEN_PATH ="), 1)
+        import re
+        patched = re.sub(r"^TOKEN_PATH = .*$", "TOKEN_PATH = %r" % str(Path(self.tmp.name) / "missing"), client, flags=re.M)
+        self.assertNotEqual(patched, client)
+        self.client_source = patched
         self.one_line_exit_1(FLEET_CLOUD_TOKEN_FILE=None)
+
+    def test_malformed_url_is_usage_error(self):
+        code, out, err = self.run_cli(["send", "p", "x"], FLEET_CLOUD_CHANNEL_URL="http://[")
+        self.assertEqual((code, len(out.splitlines())), (2, 1))
+        self.assertNotIn("http://[", out + err)
+        self.assertNotIn("Traceback", err)
+
+    def test_error_body_cut_mid_read(self):
+        self.srv.code = 500
+        self.srv.truncate = True
+        self.one_line_exit_1()
+        self.assertIn("500", self.run_cli(["send", "p", "x"])[1])
 
 
 class TestMutants(Base):
+    def test_mutant_urlparse_unguarded(self):
+        src = self.mutate('''    try:
+        parts = urllib.parse.urlparse(url)
+    except ValueError:
+        return _usage("cloud_cli: FLEET_CLOUD_CHANNEL_URL must be set to an http or https URL")
+''', '    parts = urllib.parse.urlparse(url)\n')
+        code, _, err = self.run_cli(["send", "p", "x"], source=src, FLEET_CLOUD_CHANNEL_URL="http://[")
+        self.assertIn("Traceback", err)
+
+    def test_mutant_error_read_unguarded(self):
+        src = self.mutate('''            try:
+                raw = err.read(65536)
+            except Exception:
+                raw = b""
+''', '            raw = err.read(65536)\n')
+        self.srv.code = 500
+        self.srv.truncate = True
+        _, out, _ = self.run_cli(["send", "p", "x"], source=src)
+        self.assertNotIn("500", out)
+
     def test_mutant_follows_redirects(self):
         other = http.server.HTTPServer(("127.0.0.1", 0), Handler)
         other.seen, other.code = [], 200
