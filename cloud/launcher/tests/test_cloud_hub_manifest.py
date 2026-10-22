@@ -60,6 +60,7 @@ class T(unittest.TestCase):
         self.assertIn("memory", c["resources"]["requests"])
         self.assertIn("memory", c["resources"]["limits"])
         self.assertEqual(c["image"], "IMAGE_DIGEST")
+        self.assertEqual(c["command"], ["python3", "/usr/local/bin/cloud_hub.py"])
         self.assertNotRegex(self.text, r"sha256:[0-9a-f]{64}")
         env = {e["name"]: e["value"] for e in c["env"]}
         self.assertEqual(set(env), {"FLEET_CLOUD_CHANNEL_LISTEN", "FLEET_CLOUD_HUB_AGENTS", "FLEET_CLOUD_HUB_SECRETS", "FLEET_CLOUD_HUB_DECISIONS"})

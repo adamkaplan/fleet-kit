@@ -132,7 +132,7 @@
             "image": "IMAGE_DIGEST",
             "command": [
               "python3",
-              "/usr/local/share/cw/hub/cloud_hub.py"
+              "/usr/local/bin/cloud_hub.py"
             ],
             "env": [
               {
