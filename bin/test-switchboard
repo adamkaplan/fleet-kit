@@ -41,6 +41,7 @@ import re
 from urllib.parse import unquote
 import shlex
 import shutil
+import textwrap
 import zipfile
 import signal
 import socket
@@ -60,6 +61,8 @@ from unittest import mock
 
 BIN = Path(__file__).resolve().parent
 REPO = BIN.parent
+os.environ["GIT_TERMINAL_PROMPT"] = "0"   # #1050: a test's git never opens a credential dialog
+os.environ["GCM_INTERACTIVE"] = "never"
 
 
 def with_http_head(serve, argv, kwargs, counters=None):
@@ -85,6 +88,12 @@ def with_http_head(serve, argv, kwargs, counters=None):
 
 
 SWITCHBOARD = BIN / "fleet-switchboard"
+SWITCHBOARD_SOURCE_FILES = (SWITCHBOARD,)   # every file that holds the daemon's code: a split adds its parts here, so no part escapes the scans that read this list
+
+
+def switchboard_source():
+    """The daemon's code as every scan reads it: the files of SWITCHBOARD_SOURCE_FILES, in order, as one text."""
+    return "\n".join(path.read_text() for path in SWITCHBOARD_SOURCE_FILES)
 SCENARIO = BIN / "fleet-scenario"
 
 
@@ -394,7 +403,7 @@ class TestConfig(Base):
             "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "launch_default": "headless",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
-            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "docker_reaper": True,
+            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "no_multiplexer": False, "docker_reaper": True,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_live_days": 14, "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
@@ -936,7 +945,7 @@ class TestHerdrClient(Base):
             self.assertFalse(any("focus" in part and not part.startswith("--no-") for part in argv), argv)
 
     def test_source_never_names_a_typing_or_focus_command(self):
-        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [])
+        self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
     def test_the_source_scan_catches_a_planted_violation(self):
         # A gate never seen failing is decoration.
@@ -4212,7 +4221,7 @@ class TestLaunch(StandInPids, Base):
         self.assertEqual(params["workspace_id"], "w1")
         self.assertEqual(params["root"]["command"], [FAKE_OPENCODE, "-s", done["session"]])
         self.assertEqual(params["root"]["env"], {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1",
-                                                     "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": ""})  # PR 18: who this pane is; the switchboard's own-gh marker is blanked
+                                                     "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": "", **sb.NO_CREDENTIAL_DIALOG_ENV})  # PR 18: who this pane is; the switchboard's own-gh marker is blanked
         self.assertEqual(done["pane"], "w1:p%d" % self.world.herdr._pane_n)
         brief = [m for m in session["messages"] if m["type"] == "user"]
         self.assertEqual([(m["text"], m["metadata"]) for m in brief],
@@ -4285,7 +4294,7 @@ class TestLaunch(StandInPids, Base):
         self.launch()
         env = dict(self.world.herdr.socket_calls[0][1]["root"]["env"])
         del env["FLEET_AGENT_TMPDIR"]
-        self.assertEqual(env, {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1", "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": ""})
+        self.assertEqual(env, {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1", "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": "", **sb.NO_CREDENTIAL_DIALOG_ENV})
 
     def test_retire_removes_an_empty_private_directory_and_keeps_one_with_files(self):
         root = self.wrapper_world()
@@ -4436,7 +4445,7 @@ class TestLaunch(StandInPids, Base):
                                    ("v2.session.prompt", "intent"), ("v2.session.prompt", "result")])
         layout = [e for e in self.world.audit() if e["event"] == "herdr.layout.apply"]
         self.assertEqual(layout[0]["detail"]["env_names"],
-                         ["FLEET_SWITCHBOARD_LAB_PANE", "FLEET_SWITCHBOARD_ROLE", "XDG_CONFIG_HOME"])
+                         ["FLEET_SWITCHBOARD_LAB_PANE", "FLEET_SWITCHBOARD_ROLE"] + sorted(sb.NO_CREDENTIAL_DIALOG_ENV) + ["XDG_CONFIG_HOME"])
         self.assertNotIn("/lab/config", json.dumps(layout))  # names, never values
         self.assertEqual(layout[1]["detail"]["pane"], self.world.herdr.panes and layout[1]["detail"]["pane"])
 
@@ -6479,7 +6488,7 @@ class TestLaunch(StandInPids, Base):
         self.assertEqual((method, params["root"]["command"], params["root"]["cwd"]),
                          ("layout.apply", [FAKE_OPENCODE, "-s", session], self.world.v2.sessions[session]["directory"]))
         self.assertEqual(params["root"]["env"], {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1",
-                                                 "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": ""})
+                                                 "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": "", **sb.NO_CREDENTIAL_DIALOG_ENV})
         found = self.engine.discover(self.world.clock.now()).agents["platform"]
         self.assertEqual((found.session_id, found.pane), (session, done["pane"]))
         self.assertEqual(self.world.herdr.typing_attempts, [])
@@ -9265,7 +9274,7 @@ class TestGithubDaemon(Base):
         spawn.assert_not_called()
 
     def test_the_engine_never_types_into_a_pane_for_github_either(self):
-        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [])
+        self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
 
 class TestGithubScenarios(Base):
@@ -18281,6 +18290,150 @@ class TestHeadlessPresence(Base):
         self.assertFalse(self.ap.remove_record(self.world.state, "../x"))
 
 
+class TestNoMultiplexer(Base):
+    """#1072: `no_multiplexer` on: discovery reads the records only. A multiplexer that RAISES on any call proves none is made."""
+
+    class Raising:
+        def __init__(self):
+            self.calls = []
+        def __getattr__(self, name):
+            if name.startswith("__"):
+                raise AttributeError(name)
+            def call(*args, **kwargs):
+                self.calls.append(name)
+                raise sb.HerdrError("no multiplexer here: %s" % name)
+            return call
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("boss",))
+        self.ap = sb.load_agent_presence()
+        self.engine = self.world.new_engine("cli")
+        self.url = "http://127.0.0.1:49374"
+        self.headless = lambda: TestHeadlessPresence.headless(self)
+        self.discover = lambda: TestHeadlessPresence.discover(self)
+        self.sid = self.headless()
+        self.fake = self.Raising()
+        self.engine.herdr = self.fake
+
+    def test_s2_the_switch_on_never_calls_agent_list_and_leaves_no_problem_and_the_agents_input_whole(self):
+        self.engine.config = dict(self.engine.config, no_multiplexer=True)
+        found = self.discover()
+        self.assertEqual(self.fake.calls.count("agent_list"), 0)
+        self.assertEqual([p for p in found.problems if "herdr unreachable" in p], [])
+        self.assertEqual(found.problems, [])
+        self.assertTrue(sb.whole(self.engine, "agents")[0])
+        self.assertIn("hw", found.agents)
+
+    def test_s3_pane_less_agents_get_no_badge_and_no_pane_call_and_no_error(self):
+        self.engine.config = dict(self.engine.config, no_multiplexer=True)
+        found = self.discover()
+        report = {"badges": [], "errors": []}
+        self.engine.render_badges(found, set(), report)
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual((report["badges"], report["errors"]), ([], []))
+
+    def test_s2_a_whole_pass_with_the_switch_on_makes_no_multiplexer_call(self):
+        self.engine.config = dict(self.engine.config, no_multiplexer=True)
+        self.engine.audit = self.engine.audit
+        self.engine.run_pass()
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(self.engine.discovery.problems, [])
+
+    def test_u1_the_switch_off_still_reports_herdr_unreachable_and_the_input_not_whole(self):
+        self.assertFalse(self.engine.config["no_multiplexer"])
+        found = self.discover()
+        self.assertEqual(self.fake.calls, ["agent_list"])
+        self.assertTrue(any(p.startswith("herdr unreachable: ") for p in found.problems))
+        self.assertFalse(sb.whole(self.engine, "agents")[0])
+
+    def test_the_key_must_be_a_boolean(self):
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"no_multiplexer": "yes"})
+
+    def _owed_toast(self):
+        found = self.discover()
+        return found, mock.patch.object(sb.Switchboard, "toast_candidates", lambda *a: [("hw", "blocked", "hw is blocked", "waiting")])
+
+    def test_s3_a_toast_owed_to_a_pane_less_agent_makes_no_multiplexer_call_and_no_failure_with_the_switch_on(self):
+        self.engine.config = dict(self.engine.config, no_multiplexer=True)
+        found, patch = self._owed_toast()
+        report = {"toasts": [], "errors": []}
+        with patch:
+            self.engine.render_toast(found, {}, 0, report)
+        self.assertEqual((self.fake.calls, report["toasts"], report["errors"]), ([], [], []))
+
+    def test_s3_every_pane_call_site_is_guarded_or_unreachable_with_the_switch_on(self):
+        """One row per pane-assuming path: badge and toast (guarded by the switch), check_program and observe (only fed by herdr entries, which the switch
+        never lists), reread (no pane -> a stated refusal before any call), the pane sweep (skips an agent with no pane), close and release (need a listed pane)."""
+        self.engine.config = dict(self.engine.config, no_multiplexer=True)
+        found = self.discover()
+        obs = found.agents["hw"]
+        self.assertFalse(obs.pane)
+        self.assertEqual(found.entries, [])
+        self.engine.render_badges(found, set(), {"badges": [], "errors": []})
+        self.assertEqual(self.fake.calls, [])
+        obs.pane = "p1"   # an agent WITH a pane while the switch is on (a stale record): still no badge write, no toast
+        report = {"badges": [], "errors": [], "toasts": []}
+        self.engine.render_badges(found, set(), report)
+        self.assertEqual((self.fake.calls, report["badges"], report["errors"]), ([], [], []))
+        with mock.patch.object(sb.Switchboard, "toast_candidates", lambda *a: [("hw", "blocked", "t", "b")]):
+            self.engine.render_toast(found, {}, 0, report)
+        self.assertEqual((self.fake.calls, report["toasts"]), ([], []))
+
+    def test_u1_the_switch_off_renders_badges_and_toasts_through_the_multiplexer_as_before(self):
+        found = self.discover()
+        found.agents["hw"].pane = "p1"
+        report = {"badges": [], "errors": [], "toasts": []}
+        with mock.patch.object(sb.Switchboard, "unread_count", lambda *a: 3):
+            self.engine.render_badges(found, set(), report)
+        self.assertTrue([c for c in self.fake.calls if c != "agent_list"], "the badge path reached the multiplexer with the switch off")
+        self.fake.calls.clear()
+        with mock.patch.object(sb.Switchboard, "toast_candidates", lambda *a: [("hw", "blocked", "t", "b")]):
+            try:
+                self.engine.render_toast(found, {}, 0, report)
+            except sb.HerdrError:
+                pass   # the double refuses the call; the call is what is counted
+        self.assertEqual(self.fake.calls, ["notification_show"])
+
+    # -- #1072 R-TEST-4: each mutant removes ONE guard from the REAL function (its source, with the guard's condition replaced), never wraps the double
+
+    GUARD = '(getattr(self, "config", None) or {}).get("no_multiplexer") is True'
+
+    @staticmethod
+    def without_guard(owner, name, old, new="False"):
+        """The REAL function `owner.name`, recompiled from its own source with the one guard condition `old` replaced by `new`."""
+        source = textwrap.dedent(inspect.getsource(getattr(owner, name)))
+        assert source.count(old) == 1, "the guard moved: %s.%s" % (owner.__name__, name)
+        scratch = {}
+        exec(compile(source.replace(old, new), "<mutant %s>" % name, "exec"), vars(sb), scratch)
+        return scratch[name]
+
+    def test_each_guard_removed_from_the_real_function_fails_the_test_that_names_it(self):
+        engine_guard = self.GUARD
+        rows = (
+            ("discovery switch", sb.Switchboard, "_discover", engine_guard, "test_s2_the_switch_on_never_calls_agent_list_and_leaves_no_problem_and_the_agents_input_whole"),
+            ("badge guard", sb.Switchboard, "render_badges", engine_guard, "test_s3_every_pane_call_site_is_guarded_or_unreachable_with_the_switch_on"),
+            ("toast guard", sb.Switchboard, "render_toast", engine_guard, "test_s3_a_toast_owed_to_a_pane_less_agent_makes_no_multiplexer_call_and_no_failure_with_the_switch_on"),
+        )
+        for label, owner, name, old, named in rows:
+            with self.subTest(mutant=label):
+                self.setUp()   # a fresh world for each: the real function first, then the mutant
+                getattr(self, named)()   # the real function: the named test holds
+                self.setUp()
+                with mock.patch.object(owner, name, self.without_guard(owner, name, old)):
+                    with self.assertRaises((AssertionError, sb.HerdrError), msg="the %s removed from the real function passed %s" % (label, named)):
+                        getattr(self, named)()
+
+    def test_the_discovery_switch_always_on_fails_the_u1_test_that_names_it(self):
+        """U1: the guard that holds whatever the switch says (the switch off behaves as on) fails the switch-off test."""
+        self.test_u1_the_switch_off_still_reports_herdr_unreachable_and_the_input_not_whole()
+        self.setUp()
+        with mock.patch.object(sb.Switchboard, "_discover", self.without_guard(sb.Switchboard, "_discover", self.GUARD, "True")):
+            with self.assertRaises(AssertionError):
+                self.test_u1_the_switch_off_still_reports_herdr_unreachable_and_the_input_not_whole()
+
+
 class TestSelfRegisteringCli(unittest.TestCase):
     """The front door (#179 follow-up): commands register and dispatch BY NAME, so a new command edits no shared list. What must not change: the set of
     subcommands and each one's help, the function each runs and what it is given, the daemon start, the error mapping; and a hostile name never runs
@@ -19644,7 +19797,7 @@ class TestShadowClassifier(Base):
 
 class TestPR7Source(unittest.TestCase):
     def test_the_engine_still_never_types(self):
-        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [])
+        self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
     def test_the_decision_model_section_is_one_clearly_marked_block(self):
         source = SWITCHBOARD.read_text()
@@ -20147,7 +20300,7 @@ class TestGitShim(Base):
         fake = self.bin / "git"
         fake.write_text("#!/usr/bin/env python3\nimport json,os,sys\n"
                         "open(%r,'a').write('x')\n"
-                        "json.dump({'argv': sys.argv[1:], 'stdin': None if sys.stdin.isatty() else sys.stdin.read(), 'token_env': os.environ.get('GH_TOKEN')}, open(%r,'w'))\n"
+                        "json.dump({'argv': sys.argv[1:], 'stdin': None if sys.stdin.isatty() else sys.stdin.read(), 'token_env': os.environ.get('GH_TOKEN'), 'env': {k: os.environ.get(k) for k in ('GIT_TERMINAL_PROMPT', 'GCM_INTERACTIVE')}}, open(%r,'w'))\n"
                         "print('real git out'); sys.exit(int(os.environ.get('FAKE_GIT_EXIT','0')))\n" % (str(self.starts), str(self.log)))
         fake.chmod(0o755)
         self.write_users({"acme/*": "acct-acme"})
@@ -20165,6 +20318,12 @@ class TestGitShim(Base):
                 p.unlink()
         done = subprocess.run([sys.executable, str(GIT_SHIM)] + list(args), input=stdin, capture_output=True, text=True, env=environ, timeout=60)
         seen = json.loads(self.log.read_text()) if self.log.exists() else None
+        if seen is not None:   # #1050: every call carries the no-dialog pair; the older tests below read the arguments without it (the new tests read `no_dialog_env` and check the pair)
+            argv = seen["argv"]
+            pair = [i for i in range(len(argv) - 1) if argv[i] == "-c" and argv[i + 1] == "credential.interactive=false"]
+            self.assertTrue(pair, "no -c credential.interactive=false in %r" % (argv,))
+            seen["argv_with_pair"] = list(argv)
+            del argv[pair[0]:pair[0] + 2]
         return done, seen
 
     def routed(self, *globals_, verb, rest=()):
@@ -20304,6 +20463,220 @@ class TestGitShim(Base):
         pattern = re.compile("|".join(["jan" + "us", "sp" + "ire", "adk" + "aplan", "/Us" + "ers/"]), re.IGNORECASE)
         for number, line in enumerate(text.splitlines(), 1):
             self.assertIsNone(pattern.search(line), "%d: %s" % (number, line))
+
+
+    # ---- #1050 (in TestGitShim, which owns the fake real git and run_git)
+    """#1050: no git call of the fleet may open a credential dialog. S2 (the shim's environment and argument on every verb and host), S3 (launch environments), S4 (heavy and
+    test setup), S5 (a real git, a recording fake helper, three mutants of the shim), S6 (docs), S7 (nothing writes the global git configuration)."""
+
+    NO = "credential.interactive=false"
+    VERBS = (("push", ["origin", "b"]), ("fetch", ["--all"]), ("pull", ["--ff-only"]), ("clone", ["URL", "x"]), ("ls-remote", ["URL"]), ("remote", ["update"]),
+             ("status", ["-sb"]), ("log", ["-1"]), ("commit", ["-m", "x"]), ("config", ["a.b"]))
+    HOSTS = ("https://github.com/acme/api.git", "https://git.example.test/acme/api.git")
+
+    def test_s2_every_verb_for_the_code_host_and_another_host_carries_all_three_settings(self):
+        count = 0
+        for host in self.HOSTS:
+            for verb, rest in self.VERBS:
+                with self.subTest(host=host, verb=verb):
+                    done, seen = self.run_git(verb, *[host if a == "URL" else a for a in rest])
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                    self.assertEqual(seen["env"], {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"})
+                    self.assertEqual(seen["argv_with_pair"].count(self.NO), 1)
+                    self.assertLess(seen["argv_with_pair"].index(self.NO), seen["argv_with_pair"].index(verb), "the setting is a global option, before the verb")
+                    count += 1
+        self.assertEqual(count, len(self.HOSTS) * len(self.VERBS))
+
+    def test_s2_a_callers_interactive_true_is_overridden_and_another_credential_setting_stays(self):
+        done, seen = self.run_git("-c", "credential.interactive=true", "-c", "credential.helper=store", "-c", "GCM_INTERACTIVE=always", "fetch")
+        argv = seen["argv_with_pair"]
+        self.assertGreater(argv.index(self.NO), argv.index("credential.interactive=true"), "ours comes last, so it wins")
+        self.assertIn("credential.helper=store", argv)
+        done, seen = self.run_git("-c", "credential.interactive=true", "status", env={"GIT_TERMINAL_PROMPT": "1", "GCM_INTERACTIVE": "always"})
+        self.assertEqual(seen["env"], {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}, "a caller's environment cannot turn them back on")
+
+    def test_s3_the_launch_environments_hold_both_variables(self):
+        both = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
+        env = sb.launch_base_env({"opencode_env": {"GIT_TERMINAL_PROMPT": "1", "X": "1"}, "launch_env": {"GCM_INTERACTIVE": "always"}})   # a terminal launch and a reattach
+        self.assertEqual({k: env[k] for k in both}, both)
+        self.assertEqual(env["X"], "1")
+        seen = {}
+
+        def runner(argv, **kwargs):
+            seen["env"] = kwargs["env"]
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        sb.V2Client("/opt/lab/bin/opencode", {"GIT_TERMINAL_PROMPT": "1"}, runner, 7).server_info()   # the service client (a headless worker's tools)
+        self.assertEqual({k: seen["env"][k] for k in both}, both)
+        entry = (REPO / "cloud" / "worker" / "entrypoint.sh").read_text()
+        self.assertRegex(entry, r"(?m)^GIT_TERMINAL_PROMPT=0; export GIT_TERMINAL_PROMPT$")   # the pod's entrypoint, before it runs the command
+        self.assertRegex(entry, r"(?m)^GCM_INTERACTIVE=never; export GCM_INTERACTIVE$")
+        self.assertLess(entry.index("export GCM_INTERACTIVE"), entry.index('exec "$@"'))
+
+    def test_s4_the_heavy_wrapper_and_the_test_setup_set_both_variables(self):
+        out = self.home / "heavy-env"
+        hs = sb.load_heavy_slots()
+        code = hs.run([sys.executable, "-c", "import os,sys;open(sys.argv[1],'w').write(os.environ.get('GIT_TERMINAL_PROMPT','')+' '+os.environ.get('GCM_INTERACTIVE',''))", str(out)],
+                      str(self.home / "heavy-state"), environ={"PATH": os.environ["PATH"], "FLEET_HEAVY": "off", "GIT_TERMINAL_PROMPT": "1"}, out=io.StringIO())
+        self.assertEqual((code, out.read_text()), (0, "0 never"))
+        self.assertEqual((os.environ["GIT_TERMINAL_PROMPT"], os.environ["GCM_INTERACTIVE"]), ("0", "never"), "this suite's own setup")
+
+    def test_s4_no_test_runs_real_git_against_a_local_server_without_a_private_home(self):
+        offenders = []
+        for path in sorted(BIN.glob("test-*")) + sorted((REPO / "cloud").rglob("test*.py")):
+            text = path.read_text(errors="replace")
+            local = re.search(r"git[^\n]{0,80}(?:ls-remote|clone|fetch|push)[^\n]{0,120}http://(?:127\.0\.0\.1|localhost)", text)
+            if local and "GIT_CONFIG_NOSYSTEM" not in text:
+                offenders.append(str(path))
+        self.assertEqual(offenders, [])
+
+    def fake_helper(self):
+        starts = self.home / "helper-starts"
+        helper = self.home / "helper"
+        # a stand-in for a helper that opens a dialog unless told not to (as Git Credential Manager does: GCM_INTERACTIVE and its `credential.interactive` setting; git's own prompt is GIT_TERMINAL_PROMPT)
+        helper.write_text("#!/bin/sh\n[ \"$GCM_INTERACTIVE\" = never ] && [ \"$GIT_TERMINAL_PROMPT\" = 0 ] && [ \"$(git config credential.interactive)\" = false ] || echo started >> %s\n" % starts)
+        helper.chmod(0o755)
+        (self.home / "private").mkdir(exist_ok=True)
+        self.helper_path = helper   # handed to git through GIT_CONFIG_COUNT in `lsremote`: no git configuration file is written
+        return starts
+
+    def lsremote(self, shim, env_drop=(), extra_env=None):
+        """git ls-remote to a closed local port through `shim` (a copy of the real one, or a mutant), with a private home and a helper that records its start."""
+        starts = self.fake_helper()
+        if starts.exists():
+            starts.unlink()
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        got = []
+
+        def serve():   # a server that answers 401 once: this is what makes git ask its credential helper
+            try:
+                conn, _ = server.accept()
+                conn.recv(65536)
+                conn.sendall(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                conn.close()
+            except OSError:
+                pass
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        real = shutil.which("git", path=SAFE_PATH) or shutil.which("git")
+        env = {"PATH": "%s:%s" % (os.path.dirname(real), SAFE_PATH), "HOME": str(self.home / "private"), "GIT_CONFIG_NOSYSTEM": "1", "FLEET_REAL_GIT": real,
+               "XDG_CONFIG_HOME": str(self.home / "xdg-none"), "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": str(self.helper_path)}
+        env.update(extra_env or {})   # (the sentinel test points the home variables at its scratch home)
+        started = time.time()
+        done = subprocess.run([sys.executable, str(shim), "ls-remote", "http://127.0.0.1:%d/x.git" % port], capture_output=True, text=True, env=env, timeout=30)
+        took = time.time() - started
+        server.close()
+        thread.join(5)
+        return done, took, starts.exists() and starts.read_text().count("started")
+
+    def mutant(self, name, old, new):
+        text = GIT_SHIM.read_text()
+        self.assertIn(old, text, "the mutant %s no longer applies" % name)
+        path = self.home / ("mutant-" + name)
+        path.mkdir()
+        (path / "stash_guard.py").write_text((GIT_SHIM.parent / "stash_guard.py").read_text())
+        (path / "git").write_text(text.replace(old, new, 1))
+        (path / "git").chmod(0o755)
+        return path / "git"
+
+    def test_s5_a_local_port_url_fails_at_once_and_the_helper_never_starts(self):
+        if not (shutil.which("git", path=SAFE_PATH) or shutil.which("git")):
+            self.skipTest("no real git")
+        done, took, starts = self.lsremote(GIT_SHIM)
+        self.assertEqual((done.returncode, starts), (128, 0), done.stderr)
+        self.assertLess(took, 5)
+        self.assertNotIn("started", done.stdout + done.stderr)
+
+    def test_s5_three_mutants_of_the_shim_start_the_helper_or_do_not_fail(self):
+        if not (shutil.which("git", path=SAFE_PATH) or shutil.which("git")):
+            self.skipTest("no real git")
+        mutants = {
+            "drop-terminal-prompt": ('{"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}', '{"GCM_INTERACTIVE": "never"}'),
+            "drop-gcm-interactive": ('{"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}', '{"GIT_TERMINAL_PROMPT": "0"}'),
+            "interactive-back-on": ('NO_DIALOG_CONFIG = "credential.interactive=false"', 'NO_DIALOG_CONFIG = "credential.interactive=true"'),
+            "code-host-only": ("    return no_dialog(route_credentials(args))", "    return no_dialog(route_credentials(args)) if any('github.com' in a for a in args) else route_credentials(args)"),
+        }
+        for name, (old, new) in mutants.items():
+            with self.subTest(name):
+                done, took, starts = self.lsremote(self.mutant(name, old, new))
+                self.assertTrue(starts >= 1 or done.returncode != 128, "the mutant %s was not caught: exit %s, %s helper starts" % (name, done.returncode, starts))
+
+    def test_s6_the_documentation_names_each_place_next_to_both_variables(self):
+        text = (REPO / "docs" / "no-credential-dialog.md").read_text()
+        rows = [line for line in text.splitlines() if line.startswith("| ") and "GIT_TERMINAL_PROMPT" in line and "GCM_INTERACTIVE" in line]
+        for place in ("shims/git", "bin/fleet-switchboard", "entrypoint.sh", "bin/heavy_slots.py"):
+            self.assertEqual(len([r for r in rows if place in r]), 1, place)
+        self.assertEqual(len(rows), 4)
+
+    # S7/U1, a cheap first line only: a text scan is a deny-list and cannot see a spelling built from pieces ("--glo"+"bal", a split-joined XDG path). The ROOT check is
+    # behavioural (test_s7_u2_...). Each row below has a hostile sample that ONLY that row finds, and a test that skips each row in turn and fails (one mutant per row).
+    _G, _S = "glo" + "bal", "sys" + "tem"
+    CONFIG_WRITE_FLAGS = ["--" + w for w in ("add", "unset", "unset-all", "replace-all", "edit", "rename-section", "remove-section")]
+    CONFIG_WRITE_SPELLINGS = (   # (name, regex over one line, a hostile line that only this row catches)
+        ("config command with a write flag", r"\bconfig\b[^\n]*(?:%s)(?![\w-])" % "|".join(re.escape(f) for f in CONFIG_WRITE_FLAGS),
+         'run(["git", "con' + 'fig", "--a' + 'dd", "k", "v"])'),
+        ("the short write flag", r"\bcon" + r"fig\b[^\n]*\s-e\b", "git con" + "fig -e"),
+        ("the global or system scope", r"\bconfig\b[^\n]*--(?:%s|%s)(?![\w-])" % (_G, _S), 'os.system("git config --' + _S + ' a b")'),
+        ("the file scope", r"\bcon" + r"fig\b[^\n]*(?:\s-f\b|--fi" + "le\\b)", "git con" + "fig -f out.cfg a b"),
+        ("the home gitconfig path", r"\.git" + "config", 'open(os.path.expanduser("~")+"/.git' + 'config","a")'),
+        ("the XDG git directory", r"\.con" + r"fig/git\b|XDG_CONFIG" + r"_HOME[^\n]*/git\b|XDG_CONFIG" + r"_HOME[^\n]*[\"']git[\"']", 'echo x > "$XDG_CONFIG' + '_HOME/git/con' + 'fig"'),
+        ("the global/system override variables", r"GIT_CONFIG_(?:%s|%s)\b" % (_G.upper(), _S.upper()), "GIT_CONFIG_" + _G.upper() + " = path"),
+    )
+
+    @classmethod
+    def config_write_hits(cls, text):
+        return [(n, line) for line in text.splitlines() for n, rx, _ in cls.CONFIG_WRITE_SPELLINGS if re.search(rx, line)]
+
+    @staticmethod
+    def added_lines(diff):
+        return "\n".join(l[1:] for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++"))
+
+    def test_s7_u1_every_row_of_the_scan_finds_its_sample_and_only_that_row_does(self):
+        for name, rx, hostile in self.CONFIG_WRITE_SPELLINGS:
+            with self.subTest(name):   # the mutant: skip this row; the sample must then go unfound by every other row, so the row cannot be dropped unseen
+                found = [n for n, other, _ in self.CONFIG_WRITE_SPELLINGS if re.search(other, hostile)]
+                self.assertEqual(found, [name])
+        for extra in ("git con" + "fig --fi" + "le=/x/y a b", "git con" + "fig -" + "f /x a b"):
+            self.assertTrue(self.config_write_hits(extra), extra)
+        for clean in ('env = {"GIT_CONFIG_NO' + 'SYSTEM": "1"}', "git config credential.interactive", 'run(["git", "config", "--get", "a.b"])'):
+            self.assertEqual(self.config_write_hits(clean), [], clean)
+
+    def test_s7_u2_the_focused_paths_leave_a_sentinel_home_byte_identical_and_add_no_file(self):
+        if not (shutil.which("git", path=SAFE_PATH) or shutil.which("git")):
+            self.skipTest("no real git")
+        scratch = self.home / "sentinel-home"
+        (scratch / (".con" + "fig") / "git").mkdir(parents=True)
+        (scratch / (".git" + "config")).write_text("[user]\n\tname = Sentinel\n")
+        (scratch / (".con" + "fig") / "git" / "con" "fig").write_text("[core]\n\tabbrev = 9\n")
+
+        def snapshot():
+            return {str(p.relative_to(scratch)): (p.read_bytes() if p.is_file() else None) for p in sorted(scratch.rglob("*"))}
+        before = snapshot()
+        pointed = {"HOME": str(scratch), "GIT_CONFIG_" + self._G.upper(): str(scratch / (".git" + "config")), "XDG_CONFIG" + "_HOME": str(scratch / (".con" + "fig"))}
+        with mock.patch.dict(os.environ, pointed):
+            sb.launch_base_env({"opencode_env": {}, "launch_env": {}})
+            sb.V2Client("/opt/lab/bin/opencode", {}, lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""), 7).server_info()
+            hs = sb.load_heavy_slots()
+            hs.run([sys.executable, "-c", "pass"], str(self.home / "heavy-sentinel"), environ=dict(os.environ, FLEET_HEAVY="off"), out=io.StringIO())
+            self.run_git("fetch", "--all")
+            self.run_git("config", "a.b")
+            done, took, starts = self.lsremote(GIT_SHIM, extra_env=pointed)   # the real shim in front of a real git, the sentinel as its home
+            self.assertEqual((done.returncode, starts), (128, 0), done.stderr)
+        self.assertEqual(snapshot(), before, "a focused path wrote, changed or added a file in the home it was pointed at")
+
+    def test_s7_u1_no_file_of_this_change_writes_the_global_git_configuration(self):
+        base = None
+        for ref in ("origin/main", "main"):
+            probe = subprocess.run(["git", "-C", str(REPO), "merge-base", ref, "HEAD"], capture_output=True, text=True)
+            if probe.returncode == 0 and probe.stdout.strip():
+                base = probe.stdout.strip()
+                break
+        if base is None:
+            self.skipTest("no main to diff against (a shallow checkout)")
+        diff = subprocess.run(["git", "-C", str(REPO), "diff", base, "-U0", "--no-color"], capture_output=True, text=True, timeout=60).stdout
+        self.assertEqual(self.config_write_hits(self.added_lines(diff)), [])
 
 
 class TestGitStashGuard(Base):
@@ -21715,7 +22088,7 @@ class TestPR8Source(unittest.TestCase):
         self.assertEqual(source.count("\n# PR 8: foreground and background"), 1)
 
     def test_the_engine_still_never_types(self):
-        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [])
+        self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
     def test_no_top_level_name_is_defined_twice_in_the_big_files(self):
         for name in ("fleet-switchboard", "test-switchboard", "fleet-scenario", "proof-switchboard"):
@@ -23297,7 +23670,7 @@ class TestJudgeToolWritesNothingElsewhere(unittest.TestCase):
         calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                  and n.func.attr == "_api"]
         self.assertEqual(len(calls), 1)
-        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [], "the engine still never types")
+        self.assertEqual(herdr_typing_violations(switchboard_source()), [], "the engine still never types")
 
     def test_the_section_is_one_clearly_marked_block(self):
         self.assertEqual(SWITCHBOARD.read_text().count("\n# PR 9: the tool-call policy judge"), 1)
@@ -24838,7 +25211,7 @@ class TestPR10Source(unittest.TestCase):
         self.assertEqual(SWITCHBOARD.read_text().count(self.SECTION), 1)
 
     def test_the_engine_still_never_types(self):
-        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [])
+        self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
     def test_the_import_command_runs_only_the_clients_it_is_given(self):
         source = SWITCHBOARD.read_text()
@@ -37886,7 +38259,12 @@ class TestImpactHold(LedgerBase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    TWIN = True
+    twin_runs = None
+
     def under(self, who="cos", order=17, reason="the review confirms nothing touches credentials nor identity"):
+        if self.twin_runs and reason in ("the review confirms nothing touches credentials nor identity", "the review is clean and the change is a note"):   # #972: the judgement names the runs of the fixture
+            reason += ": %s" % ", ".join("#%d=%s" % (seq, level) for seq, _, level in self.twin_runs)
         return self.run_as(who, "impact", "clear", self.PR, "--under-order", str(order), "--reason", reason)
 
     def test_s1_the_chief_of_staff_clears_under_a_listed_order_and_it_is_recorded_as_her_act_under_that_order(self):
@@ -38437,15 +38815,17 @@ class TestImpactHold(LedgerBase):
         self.delegate(config=False)
 
     def ledger_reset(self):
+        self.twin_runs = None
         for name in (sb.plan_ledger.LEDGER_FILE, sb.plan_ledger.HEAD_FILE):
             self.world.state.joinpath(name).unlink(missing_ok=True)
 
-    def rate(self, severity, probability, reason="", role="reviewer", head=LEDGER_HEAD, pr="acme/app#9", action="auto", with_block=True):
+    def rate(self, severity, probability, reason="", role="reviewer", head=LEDGER_HEAD, pr="acme/app#9", action="auto", with_block=True, by="rev", digest=None):
         """Record a rating. `action` "auto" is the action of the cell (a helper that only emits VALID shapes: it hides a bad state, so every bad-shape test passes an explicit action or builds the raw record), None omits it."""
-        entry = {"kind": "review_record", "pr": pr, "head": head, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": role,
+        entry = {"kind": "review_record", "pr": pr, "head": head, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": by, "by_role": role,
                  "impact_severity": severity, "impact_probability": probability, "impact_reason": reason}
         if with_block:   # #901: the rating carries the agent's block (its hash and its own rating lines), as `review record --block` keeps them
-            entry.update(block_sha256="a" * 64, block_size=200, block_impact_severity=severity, block_impact_probability=probability)
+            self.hash_count = getattr(self, "hash_count", 0) + 1
+            entry.update(block_sha256=digest or "%064x" % self.hash_count, block_size=200, block_impact_severity=severity, block_impact_probability=probability)
         else:
             entry["block_sha256"] = "none"
         cell = (sb.impact_floor.load_matrix()["cells"].get(severity) or {}).get(probability)
@@ -38453,7 +38833,14 @@ class TestImpactHold(LedgerBase):
             entry["impact_action"] = {"H": "hold", "2": "second-review", ".": "none"}[cell["action"]]
         elif action != "auto" and action is not None:
             entry["impact_action"] = action
-        return sb.plan_ledger.append_entry(self.world.state, entry, self.world.clock.now())
+        stored = sb.plan_ledger.append_entry(self.world.state, entry, self.world.clock.now())
+        if self.TWIN and with_block and by == "rev" and role == "reviewer" and head == LEDGER_HEAD:   # #972: a clear by score needs a second counted run from another session: the earlier fixtures get one beside the first, same cell (a test of the two-run rule itself sets TWIN False)
+            self.hash_count += 1
+            twin = sb.plan_ledger.append_entry(self.world.state, dict(entry, by="rev2", block_sha256="%064x" % self.hash_count), self.world.clock.now())
+            level = (sb.impact_floor.load_matrix()["cells"].get(severity) or {}).get(probability, {}).get("level")
+            if level:
+                self.twin_runs = (self.twin_runs or []) + [(stored["seq"], "rev", level), (twin["seq"], "rev2", level)]
+        return stored
 
     def cell_of(self, level):
         cells = sb.impact_floor.load_matrix()["cells"]
@@ -38530,6 +38917,188 @@ class TestImpactHold(LedgerBase):
         code, out, err = self.under()
         self.assertEqual(code, 2)
         self.assertIn("above the threshold Medium", err)
+
+    # ---- #972: a clear by score rests on two independent runs at the head
+
+    def two(self, a, b, by=("rev", "rev2"), blocks=(True, True), heads=(LEDGER_HEAD, LEDGER_HEAD), digests=(None, None)):
+        """Two ratings (levels `a`, `b`); returns the reason naming both runs by ledger id and cell."""
+        self.TWIN = False
+        ids = [self.rate(*self.cell_of(level), by=who, with_block=blk, head=h, digest=d)["seq"] for level, who, blk, h, d in zip((a, b), by, blocks, heads, digests)]
+        return "both runs agree on it: #%d=%s, #%d=%s" % (ids[0], a, ids[1], b)
+
+    def refused(self, code, err, *words):
+        self.assertEqual(code, 2, err)
+        self.assertEqual((self.deletes(), self.events("gate.hold_cleared")), ([], []))
+        self.assertEqual(len(self.events("gate.hold_clear_refused")), 1)
+        for w in words:
+            self.assertIn(w, err)
+
+    def test_972_one_counted_run_is_refused_naming_the_count(self):
+        self.score_config("Serious")
+        self.scored_pr()
+        self.TWIN = False
+        self.rate(*self.cell_of("Low"))
+        code, out, err = self.under(reason="the one run says it is low: #1=Low")
+        self.refused(code, err, "1 counted", "2 required", LEDGER_HEAD[:8])
+
+    def test_972_two_runs_from_one_session_are_refused(self):
+        self.score_config("Serious")
+        self.scored_pr()
+        reason = self.two("Low", "Low", by=("rev", "rev"))
+        code, out, err = self.under(reason=reason)
+        self.refused(code, err, "1 session", "2 required")
+
+    def test_972_one_run_under_two_identities_is_refused_for_each_variant(self):
+        same = "c" * 64
+        for label, by, digests, words in (("same block hash, two names", ("rev", "rev2"), (same, same), "1 independent run"),
+                                          ("case variant of one name", ("rev", "REV"), (None, None), "1 session"),
+                                          ("space variant of one name", ("rev", " rev "), (None, None), "1 session"),
+                                          ("same name, same hash", ("rev", "rev"), (same, same), "1 session")):
+            with self.subTest(label):
+                self.writes.clear()
+                self.score_config("Serious")
+                self.scored_pr()
+                reason = self.two("Low", "Low", by=by, digests=digests)
+                code, out, err = self.under(reason=reason)
+                self.assertEqual((code, self.deletes()), (2, []), err)
+                self.assertIn(words, err)
+                self.ledger_reset()
+        self.writes.clear()
+        self.score_config("Serious")
+        self.scored_pr()
+        reason = self.two("Low", "Low", by=("rev", "other"), digests=("d" * 64, "e" * 64))
+        code, out, err = self.under(reason=reason)
+        self.assertEqual(code, 0, (reason, err))
+
+    def test_972_pick_runs_skips_a_second_record_of_the_same_session(self):
+        module = sb.load_module("delegated_clear")
+        def rec(seq, by, digest):
+            return {"seq": seq, "by": by, "block_sha256": digest * 64}
+        counted = [(3, "Serious", rec(1, "a", "1")), (3, "Serious", rec(2, "a", "2")), (2, "Medium", rec(3, "b", "3"))]
+        runs = module.pick_runs(counted)
+        self.assertEqual([(r["id"], r["by"], r["cell"]) for r in runs], [(1, "a", "Serious"), (3, "b", "Medium")])
+        self.assertEqual([r["id"] for r in module.pick_runs([(3, "S", rec(1, "a", "1")), (3, "S", rec(2, "A ", "2")), (2, "M", rec(3, "b", "1")), (1, "L", rec(4, "c", "4"))])], [1, 4])
+        self.assertEqual(module.pick_runs([(1, "L", {"by": "a", "block_sha256": "1" * 64}), (1, "L", rec(5, "b", "2"))])[0]["id"], 5, "a record with no ledger id is never named")
+
+    def test_972_reason_problems_refuses_unless_exactly_the_required_independent_runs_are_given(self):
+        module = sb.load_module("delegated_clear")
+        one = {"id": 1, "by": "a", "hash": "1" * 64, "cell": "Low"}
+        two = {"id": 2, "by": "b", "hash": "2" * 64, "cell": "Low"}
+        ok = "#1=Low, #2=Low"
+        self.assertEqual(module.reason_problems(ok, [one, two]), [])
+        for label, runs in (("none", []), ("not a list", None), ("one", [one]), ("three", [one, two, dict(two, id=3, by="c", hash="3" * 64)]),
+                            ("same hash", [one, dict(two, hash=one["hash"])]), ("name variant", [one, dict(two, by=" A ")]), ("no id", [one, dict(two, id=None)]), ("no hash", [one, dict(two, hash=None)])):
+            self.assertTrue(module.reason_problems(ok, runs), label)
+        self.assertEqual(module.reason_problems("anything", []) != [], True)
+        for contradiction in ("#1=Low, a=Medium, #2=Low", "a=Low, #1=Medium, #2=Low", "#1=Low, #2=Low, b=Serious"):
+            self.assertTrue(any("wrong cell" in p for p in module.reason_problems(contradiction, [one, two])), contradiction)
+
+    def test_972_a_record_without_a_block_is_not_counted(self):
+        self.score_config("Serious")
+        self.scored_pr()
+        reason = self.two("Low", "Low", blocks=(True, False))
+        code, out, err = self.under(reason=reason)
+        self.refused(code, err, "1 counted")
+
+    def test_972_a_run_at_another_head_is_not_counted(self):
+        self.score_config("Serious")
+        self.scored_pr()
+        reason = self.two("Low", "Low", heads=(LEDGER_HEAD, LEDGER_NEW_HEAD))
+        code, out, err = self.under(reason=reason)
+        self.refused(code, err, "1 counted", LEDGER_HEAD[:8])
+
+    def test_972_the_higher_run_is_the_score_in_both_orders_and_the_lower_never_blocks(self):
+        module = sb.load_module("delegated_clear")
+        for order in (("Serious", "Medium"), ("Medium", "Serious")):
+            with self.subTest(order=order):
+                self.writes.clear()
+                self.score_config("Serious")
+                self.scored_pr()
+                reason = self.two(*order)
+                code, out, err = self.under(reason=reason)
+                self.assertEqual(code, 0, err)
+                cleared = self.events("gate.hold_cleared")[-1]
+                self.assertEqual((cleared["detail"]["score"], cleared["detail"]["threshold"]), ("Serious", "Serious"))
+                self.assertEqual(sorted(r["cell"] for r in cleared["detail"]["runs"]), sorted(order))
+                self.assertEqual(len(cleared["detail"]["runs"]), 2)
+                self.assertEqual(sorted(r["id"] for r in cleared["detail"]["runs"]), [int(x) for x in sorted(__import__("re").findall(r"#(\d+)=", reason))])
+                self.ledger_reset()
+
+    def test_972_two_runs_above_the_threshold_are_refused_by_score_not_by_count(self):
+        for levels, threshold, words in ((("High", "High"), "Serious", "the score is High"), (("High", "Low"), "Serious", "the score is High"), (("Medium", "Medium"), "Low", "above the threshold")):
+            with self.subTest(levels=levels):
+                self.writes.clear()
+                self.score_config(threshold)
+                self.scored_pr()
+                reason = self.two(*levels)
+                code, out, err = self.under(reason=reason)
+                self.assertEqual(code, 2, err)
+                self.assertIn(words, err)
+                self.assertNotIn("required", err)
+                self.assertEqual(self.deletes(), [])
+                self.ledger_reset()
+
+    def test_972_the_reason_must_name_both_runs_with_their_own_cells(self):
+        self.score_config("Serious")
+        self.scored_pr()
+        first, second = [int(x) for x in __import__("re").findall(r"#(\d+)=", self.two("Medium", "Low"))]
+        for reason, words in (("only the first run is named: #%d=Medium" % first, "#%d" % second), ("both named: #%d=Medium, #%d=Serious" % (first, second), "wrong cell"),
+                              ("names the runs but no cell: #%d and #%d" % (first, second), "its cell"), ("by rater only: rev=Medium", "#%d" % second)):
+            code, out, err = self.under(reason=reason)
+            self.assertEqual(code, 2, err)
+            self.assertIn(words, err)
+            self.assertEqual(self.deletes(), [], reason)
+        code, out, err = self.under(reason="by rater names: rev=Medium, rev2=Low")
+        self.assertEqual(code, 0, err)
+
+    def test_972_the_owners_own_clear_needs_no_second_run_and_no_order_stays_refused(self):
+        self.score_config("Serious")
+        self.scored_pr()
+        self.rate(*self.cell_of("Low"))
+        code, out, err = self.run_as(None, "impact", "clear", self.PR, "--reason", "the owner judges the hold false")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("under_order", self.events("gate.hold_cleared")[0]["detail"])
+        code, out, err = self.run_as(None, "impact", "clear", self.PR, "--under-order", "17", "--reason", "the owner judges the hold false")
+        self.assertEqual(code, 2)
+        self.assertIn("--under-order is for the Chief of Staff", err)
+
+    def test_972_an_order_without_a_max_level_is_not_asked_for_two_runs(self):
+        self.delegate()
+        self.files_of_pr("migrations/0002.sql")
+        self.passes()
+        code, out, err = self.under()
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("counted", err)
+
+    def test_972_the_judge_counts_what_the_block_rule_counts(self):
+        module = sb.load_module("delegated_clear")
+        block, cells = self.block(), sb.impact_floor.load_matrix()["cells"]
+        s, p = self.cell_of("Low")
+        good = {"kind": "review_record", "pr": "acme/app#9", "head": LEDGER_HEAD, "reviewer": "impact", "by_role": "reviewer", "impact_severity": s, "impact_probability": p,
+                "block_sha256": "a" * 64, "block_impact_severity": s, "block_impact_probability": p, "seq": 1, "by": "x"}
+        report = {"pr": "acme/app#9", "head": LEDGER_HEAD}
+        for label, other in (("no block", dict(good, block_sha256="none")), ("a block that disagrees", dict(good, block_impact_probability="zzz"))):
+            entries = [good, dict(other, seq=2, by="y")]
+            got = module.judge(block, cells, entries, report, "Serious", module.RUNS_REQUIRED)
+            self.assertEqual(len([e for e in entries if module.counts_by_block(e)]), 1, label)
+            self.assertTrue(any("1 counted" in r for r in got["reasons"]), (label, got))
+        two = module.judge(block, cells, [good, dict(good, seq=2, by="y", block_sha256="b" * 64)], report, "Serious", module.RUNS_REQUIRED)
+        self.assertEqual((two["reasons"], len(two["runs"])), ([], 2))
+        self.assertEqual(module.judge(block, cells, [good], report, "Serious")["reasons"], [], "the default asks one run: the pure judge's old contract")
+
+    def test_972_the_rule_is_stated_once_in_the_docs_and_once_in_the_rater_brief_and_the_cause_comes_first(self):
+        module = sb.load_module("delegated_clear")
+        root = Path(sb.__file__).parent.parent
+        docs = (root / "docs" / "switchboard.md").read_text()
+        brief = (root / "agents" / "reviewers" / "reviewer-impact.md").read_text()
+        self.assertEqual((docs.count(module.TWO_RUN_RULE), brief.count(module.TWO_RUN_RULE)), (1, 1))
+        section = docs.split("#### Two independent runs for a clear by score (#972)", 1)[1].split("\n#### ", 1)[0]
+        cause, rule = section.split("##### The rule", 1)
+        self.assertEqual(cause.count("```text"), 2)
+        self.assertIn("cell: Medium", cause)
+        self.assertIn("cell: Serious", cause)
+        self.assertIn("depends on a draw", cause)
+        self.assertIn(module.TWO_RUN_RULE, rule)
 
     def test_s7_the_floor_is_data_the_clear_module_holds_none_and_the_brief_and_matrix_agree(self):
         matrix = sb.impact_floor.load_matrix()["owner_hold"]
@@ -38951,7 +39520,8 @@ class TestImpactHold(LedgerBase):
         """A ledger record built WITHOUT the helper: any shape, including those the record command refuses (an older record with an action and no severity or probability)."""
         entry = {"kind": "review_record", "pr": "acme/app#9", "head": LEDGER_HEAD, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": "reviewer"}
         entry.update(fields)
-        entry.setdefault("block_sha256", "a" * 64)   # #901: the record carries the agent's block, whose own lines equal the typed ones (a missing field stays missing)
+        self.hash_count = getattr(self, "hash_count", 0) + 1
+        entry.setdefault("block_sha256", "%064x" % (self.hash_count + 10 ** 6))   # #972: a different hash per record. #901: the record carries the agent's block, whose own lines equal the typed ones (a missing field stays missing)
         for name in ("impact_severity", "impact_probability"):
             if name in entry and entry[name] is not KEEP_OUT:
                 entry.setdefault("block_" + name, entry[name])
@@ -38974,9 +39544,12 @@ class TestImpactHold(LedgerBase):
                 self.ledger_reset()
                 self.score_config("Serious")
                 self.scored_pr()
-                for record in records:
-                    self.raw_record(**record)
-                code, out, err = self.under()
+                seqs = [self.raw_record(**record)["seq"] for record in records]
+                corroborated = next((r for r in records if isinstance(r.get("impact_severity"), str) and isinstance(r.get("impact_probability"), str)), None)
+                if corroborated is not None:
+                    seqs.append(self.raw_record(**dict(corroborated, by="rev2"))["seq"])   # #972: a record that could count is corroborated by a second session, so the count is not what these shapes test
+                low_run = lambda n: "#%d=Low" % n
+                code, out, err = self.under(reason="the shapes under test: " + ", ".join(low_run(n) for n in seqs))
                 self.assertEqual(code == 2, refused, err)
                 if refused:
                     self.assertEqual(self.deletes(), [])
@@ -38984,8 +39557,10 @@ class TestImpactHold(LedgerBase):
         self.ledger_reset()   # the control: the valid record alone clears
         self.score_config("Serious")
         self.scored_pr()
-        self.raw_record(**valid)
-        self.assertEqual(self.under()[0], 0)
+        one = self.raw_record(**valid)
+        self.assertEqual(self.under(reason="the control, one run only")[0], 2, "one counted run is refused (#972)")
+        two = self.raw_record(**dict(valid, by="rev2"))
+        self.assertEqual(self.under(reason="the control: #%d=Low, #%d=Low" % (one["seq"], two["seq"]))[0], 0)
 
     # ---- #835 round 4: the rating's inputs are immune to the shared parser (a registrar's defaults, a replaced parser, a wrapper), at the point of use
 
@@ -73894,6 +74469,144 @@ class TestCoderBooks(Base):
         self.assertFalse(finished("nobody"))
 
 
+class TestRegistryEndpoint(unittest.TestCase):
+    """#1074 (slice 3 of #1059): an agent without a pane has an endpoint, a liveness rule and a route function (not yet used by send); the row projections come from one tuple."""
+
+    LOCAL = {"session": "ses_l", "pane": "p_1", "role": "coder", "repo": "o/r", "workspace": "w", "cwd": "/x"}
+    CLOUD = {"session": "ses_c", "role": "orchestrator", "kind": "orchestrator", "endpoint": "https://pod.example/agent"}
+
+    def setUp(self):
+        self.reg = sb.load_module("registry")
+        self.mod = sb.load_module("agent_reconcile")
+        self.dir = Path(tempfile.mkdtemp(prefix="ep"))
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def audit(self):
+        path = self.dir / "registry-audit.jsonl"
+        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+    def both(self):
+        self.reg.upsert(self.dir, "local", self.LOCAL)
+        self.reg.upsert(self.dir, "pod", self.CLOUD)
+
+    def test_s2_a_registry_with_both_reads_whole(self):
+        self.both()
+        read = self.reg.read(self.dir)
+        self.assertEqual((read["whole"], read["version"], sorted(read["agents"])), (True, 1, ["local", "pod"]))
+        self.assertEqual(read["agents"]["pod"]["endpoint"], self.CLOUD["endpoint"])
+
+    def test_s3_the_endpoint_reaches_every_projection_and_survives_retire_and_undo(self):
+        self.both()
+        row = self.reg.read(self.dir)["agents"]["pod"]
+        self.assertIn("endpoint", self.reg.AGENT_FIELDS)
+        self.assertIn("endpoint", self.reg.CHANGE_FIELDS)
+        changed = dict(row, endpoint="https://pod2.example/agent")
+        self.assertTrue(self.reg.upsert(self.dir, "pod", changed)["changed"])   # written when only the endpoint changes
+        self.reg.retire(self.dir, "pod", "boss", "done")
+        self.assertEqual(self.reg.read(self.dir)["retired"]["pod"]["record"]["endpoint"], "https://pod2.example/agent")
+        self.reg.unretire(self.dir, "pod")
+        self.assertEqual(self.reg.read(self.dir)["agents"]["pod"]["endpoint"], "https://pod2.example/agent")
+
+    def test_s4_every_row_field_is_in_all_three_projections_or_exempt(self):
+        names = {"discovery": self.reg.AGENT_FIELDS, "change": self.reg.CHANGE_FIELDS, "record": self.reg.RECORD_FIELDS}
+        for field in self.reg.ROW_FIELDS:
+            for projection, fields in names.items():
+                self.assertTrue((field in fields) != ((field, projection) in self.reg.EXEMPT), "%s / %s" % (field, projection))
+        for (field, projection), why in self.reg.EXEMPT.items():
+            self.assertIn(field, self.reg.ROW_FIELDS)
+            self.assertIn(projection, self.reg.PROJECTIONS)
+            self.assertTrue(why)
+        self.assertEqual(set(sb.RETIRED_RECORD_FIELDS), set(self.reg.RECORD_FIELDS) - set(self.reg.OPTIONAL_FIELDS))
+        saved = self.reg.ROW_FIELDS
+        self.addCleanup(setattr, self.reg, "ROW_FIELDS", saved)
+        self.reg.ROW_FIELDS = saved + ("added",)   # a field added to the row and to no table is in all three (derivation) unless exempt: derive again
+        self.assertIn("added", self.reg.fields_of("record"))
+
+    def test_s5_u5_a_no_pane_row_is_removed_only_on_a_dead_verdict_of_a_whole_read(self):
+        self.both()
+        def run(check, whole=True):
+            read = self.reg.read(self.dir)
+            read["whole"] = whole
+            return self.mod.reconcile_on_read(self.dir, read, lambda n, a: {"pane": True, "process": True}, self.reg, check)
+        self.assertEqual(run(None), [])                                   # default: unknown
+        self.assertEqual(run(lambda n, a: "unknown"), [])
+        self.assertEqual(run(lambda n, a: "unreachable"), [])
+        self.assertEqual(run(lambda n, a: 1 / 0), [])                     # a failed check
+        self.assertEqual(run(lambda n, a: "dead", whole=False), [])       # a partial read
+        self.assertEqual([l for l in self.audit() if l.get("event") == "reconcile_remove"], [])
+        self.assertEqual(run(lambda n, a: "dead"), ["pod"])
+        self.assertEqual(len([l for l in self.audit() if l.get("event") == "reconcile_remove"]), 1)
+        self.assertEqual(sorted(self.reg.read(self.dir)["agents"]), ["local"])
+
+    def test_s6_route_function(self):
+        self.both()
+        agents = self.reg.read(self.dir)["agents"]
+        self.assertEqual(self.reg.route_for(agents["pod"]), {"via": "endpoint", "to": self.CLOUD["endpoint"]})
+        self.assertEqual(self.reg.route_for(agents["local"]), {"via": "pane", "to": "p_1"})
+
+    def test_s6_registry_route_function_and_local_baseline(self):
+        self.both()
+        self.assertEqual(sb.registry_route(self.dir, "pod"), {"via": "endpoint", "to": self.CLOUD["endpoint"]})
+        self.assertEqual(sb.registry_route(self.dir, "local"), {"via": "pane", "to": self.LOCAL["pane"]})   # the stored baseline: byte for byte
+        self.assertEqual(json.dumps(sb.registry_route(self.dir, "local"), sort_keys=True), '{"to": "%s", "via": "pane"}' % self.LOCAL["pane"])
+        self.assertIsNone(sb.registry_route(self.dir, "nobody"))
+
+    def test_u1_local_agents_only_keep_the_baseline(self):
+        self.reg.upsert(self.dir, "local", self.LOCAL)
+        row = self.reg.read(self.dir)["agents"]["local"]
+        self.assertFalse(self.reg.upsert(self.dir, "local", row)["changed"])   # change detection: no churn
+        self.reg.retire(self.dir, "local", "boss", "done")
+        record = self.reg.read(self.dir)["retired"]["local"]["record"]
+        self.assertNotIn("endpoint", record)
+        self.reg.unretire(self.dir, "local")
+        back = self.reg.read(self.dir)["agents"]["local"]
+        self.assertNotIn("endpoint", back)
+        self.assertEqual(sb.registry_route(self.dir, "local"), {"via": "pane", "to": self.LOCAL["pane"]})
+
+    def _gaps(self, change_fields):
+        """The (field, projection) pairs where a field is neither in the projection nor exempt (the completeness rule)."""
+        names = {"discovery": self.reg.AGENT_FIELDS, "change": change_fields, "record": self.reg.RECORD_FIELDS}
+        return [(f, p) for f in self.reg.ROW_FIELDS for p, fs in names.items() if f not in fs and (f, p) not in self.reg.EXEMPT]
+
+    def test_s7_mutants_each_fail(self):
+        import unittest.mock as mock
+        self.both()
+        self.assertEqual(self._gaps(self.reg.CHANGE_FIELDS), [])
+        # mutant 1: a projection (the change test) left out of the tuple's derivation drops the endpoint
+        left_out = tuple(f for f in self.reg.CHANGE_FIELDS if f != "endpoint")
+        self.assertEqual(self._gaps(left_out), [("endpoint", "change")])
+        # mutant 2: a no-pane row read as dead is removed with no evidence: the real code keeps it
+        self.assertEqual(self.mod.reconcile_on_read(self.dir, self.reg.read(self.dir), lambda n, a: {"pane": True, "process": True}, self.reg, None), [])
+        # mutant 3: a route ignoring the endpoint returns None for the endpoint row: the route test names the endpoint
+        with mock.patch.object(self.reg, "route_for", lambda row: {"via": "pane", "to": row.get("pane")} if row.get("pane") else None):
+            self.assertNotEqual(sb.registry_route(self.dir, "pod"), {"via": "endpoint", "to": self.CLOUD["endpoint"]})
+        with mock.patch.object(self.mod, "unknown_endpoint_check", lambda n, a: "dead"):   # the mutant removes the row the real default keeps
+            self.assertEqual(self.mod.reconcile_on_read(self.dir, self.reg.read(self.dir), lambda n, a: {"pane": True, "process": True}, self.reg, None), ["pod"])
+
+    def test_s8_the_docs_state_the_endpoint_the_liveness_rule_and_the_route_rule(self):
+        text = (Path(__file__).resolve().parent.parent / "docs" / "agent-registry.md").read_text()
+        self.assertEqual(text.count("## Additive note (#1074)"), 1)
+        for item in ("**Endpoint field.**", "**Liveness rule.**", "**Route rule.**"):
+            self.assertIn(item, text)
+
+    def test_u2_a_credential_shaped_endpoint_is_refused(self):
+        for bad in ("https://user:pw@pod.example/a", "https://pod.example/a?token=abc"):
+            got = self.reg.upsert(self.dir, "pod", dict(self.CLOUD, endpoint=bad))
+            self.assertTrue(got["problem"], bad)
+        self.assertEqual(self.reg.read(self.dir)["agents"], {})
+
+    def test_u3_a_row_without_an_endpoint_gains_no_key(self):
+        self.reg.upsert(self.dir, "local", self.LOCAL)
+        self.assertNotIn("endpoint", self.reg.read(self.dir)["agents"]["local"])
+        self.assertEqual(self.reg.read(self.dir)["version"], 1)
+
+    def test_u7_no_pane_is_bound_to_an_endpoint_row(self):
+        self.both()
+        got = self.reg.upsert(self.dir, "pod", dict(self.CLOUD, pane="p_9"))
+        self.assertTrue(got["problem"])
+        self.assertIsNone(self.reg.read(self.dir)["agents"]["pod"]["pane"])
+
+
 class TestReconcileOnRead(unittest.TestCase):
     """Slice 4 of #903 (#919): reconcile on read, never a question mark, dead never drawn."""
 
@@ -74902,7 +75615,8 @@ class TestWhoCanClear(unittest.TestCase):
         # each refusal of judge and what the line says of it: "static" is known from the pull request and the orders alone (the line says owner only), "rating" depends on a rating not yet made (the line says what the rating must be)
         known = {"the score rule or the rating is unknown": "unreadable (who: unknown)", "the threshold is unknown": "unreachable: the configuration refuses a max_level that is not delegable",
                  "a rating has no severity and probability the matrix knows": "rating", "no agent block": "rating", "incomplete verdict": "rating", "no independent rating": "rating",
-                 "a higher uncounted rating": "rating", "floor below": "rating (the line says the least rating)", "rule not named": "rating (the line says which ids)", "append(over), the answer of level_refusal": "static (owner only, kind score)"}
+                 "a higher uncounted rating": "rating", "floor below": "rating (the line says the least rating)", "rule not named": "rating (the line says which ids)", "append(over), the answer of level_refusal": "static (owner only, kind score)",
+                 "#972 too few counted ratings": "rating", "#972 too few rater sessions": "rating", "#972 too few independent runs": "rating"}
         self.assertEqual(len(sites), len(known), "judge has a refusal this table does not: give it a row (and a line) before it ships")
 
     def test_s1_the_documented_cause_paragraph_names_every_recorded_refusal_kind_with_its_count_and_says_the_sample_is_thin(self):
@@ -82061,6 +82775,34 @@ class TestBellMigration(unittest.TestCase):
         self.assertEqual(self.bells(), self.live)
         self.assertEqual(len(self.audit_lines()), 5)
 
+    def test_r_test_1_the_switch_on_skips_the_real_migration_no_read_no_marker_no_field(self):
+        herdr = self.Herdr(self.agents, self.tabs)
+        self.engine.herdr, self.engine.config = herdr, {"no_multiplexer": True}
+        sb.bell_migration(self.engine, self.registry, 5)
+        self.assertEqual(herdr.reads, 0)
+        self.assertFalse(self.registry.bell_migrated(self.dir))
+        self.assertEqual(self.bells(), {n: None for n in self.names})
+        self.assertEqual(self.notes, [])
+
+    def test_r_test_1_the_switch_off_runs_the_real_migration_as_before(self):
+        herdr = self.Herdr(self.agents, self.tabs)
+        self.engine.herdr, self.engine.config = herdr, {"no_multiplexer": False}
+        sb.bell_migration(self.engine, self.registry, 5)
+        self.assertGreater(herdr.reads, 0)
+        self.assertTrue(self.registry.bell_migrated(self.dir))
+        self.assertEqual(self.bells(), self.live)
+
+    def test_r_test_1_the_bell_guard_removed_from_the_real_function_fails_the_switch_on_test(self):
+        mutant = TestNoMultiplexer.without_guard(sb, "bell_migration", '(getattr(engine, "config", None) or {}).get("no_multiplexer") is True')
+        with mock.patch.object(sb, "bell_migration", mutant):
+            with self.assertRaises(AssertionError):
+                self.test_r_test_1_the_switch_on_skips_the_real_migration_no_read_no_marker_no_field()
+        self.setUp()
+        always = TestNoMultiplexer.without_guard(sb, "bell_migration", '(getattr(engine, "config", None) or {}).get("no_multiplexer") is True', "True")
+        with mock.patch.object(sb, "bell_migration", always):
+            with self.assertRaises(AssertionError):
+                self.test_r_test_1_the_switch_off_runs_the_real_migration_as_before()
+
     def test_a_partial_or_failed_read_writes_nothing_and_is_tried_again(self):
         self.engine.herdr = self.Herdr(self.agents, self.tabs, fail=True)
         sb.bell_migration(self.engine, self.registry, 5)
@@ -83679,6 +84421,328 @@ class TestPaneExitBoundaries(TestPaneExit):
         pass_fn = next(n for n in self.new_code() if getattr(n, "name", "") == "pane_exit_pass")
         guards = sum(isinstance(n, ast.If) for n in ast.walk(pass_fn))
         self.assertLessEqual(guards, 16, "a guard was added to pane_exit_pass: give it a row and a mutant, then raise this count")
+
+
+class TestArchitectureSafetyNet(unittest.TestCase):
+    """The tools that prove a move of switchboard code is text only (plan #1092, slice S0)."""
+    TOOLS = REPO / "tools"
+    BEFORE = "A = 1\n\n\ndef one():\n    return 1\n\n\ndef two():\n    return 2\n"
+
+    def load(self, name):
+        loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(self.TOOLS / name))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+        return module
+
+    def split_check(self, before, after):
+        work = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, work, True)
+        sides = []
+        for label, parts in (("before", before), ("after", after)):
+            paths = []
+            for index, text in enumerate(parts):
+                path = work / ("%s%d.py" % (label, index))
+                path.write_text(text)
+                paths.append(str(path))
+            sides.append(paths)
+        proc = subprocess.run([sys.executable, str(self.TOOLS / "arch-split-check"), "--before"] + sides[0] + ["--after"] + sides[1],
+                              capture_output=True, text=True)
+        return proc.returncode, proc.stdout
+
+    def test_a_move_across_files_and_a_reorder_pass(self):
+        code, out = self.split_check([self.BEFORE], ["def two():\n    return 2\n", "A = 1\n\n\ndef one():\n    return 1\n"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("RESULT: PASS", out)
+
+    def test_one_edited_line_fails_and_names_the_statement(self):
+        code, out = self.split_check([self.BEFORE], [self.BEFORE.replace("return 2", "return 3")])
+        self.assertEqual(code, 1, out)
+        self.assertIn("FunctionDef two", out)
+        self.assertIn("RESULT: FAIL", out)
+
+    def test_a_dropped_statement_fails_and_names_the_statement_and_the_name(self):
+        code, out = self.split_check([self.BEFORE], [self.BEFORE.split("\n\n\ndef two")[0] + "\n"])
+        self.assertEqual(code, 1, out)
+        self.assertIn("FunctionDef two", out)
+        self.assertIn("name only before: two", out)
+
+    def test_a_duplicated_statement_fails(self):
+        code, out = self.split_check([self.BEFORE], [self.BEFORE + "\n\ndef two():\n    return 2\n"])
+        self.assertEqual(code, 1, out)
+        self.assertIn("statement added", out)
+
+    def test_the_overlap_tool_maps_changed_lines_to_symbols_classes_and_sections(self):
+        tool = self.load("arch-overlap")
+        source = "# ---------- the first\nX = 1\n\n\ndef f():\n    return 1\n\n\n# ---------- the second\ndef g():\n    return 2\n"
+        table = tool.symbols(source)
+        marks = tool.markers(source)
+        lines = tool.changed_old_lines("@@ -6,1 +6,1 @@ def f\n-    return 1\n+    return 9\n@@ -10,0 +11,2 @@\n+x\n")
+        self.assertEqual(lines, {6, 10})
+        self.assertEqual(tool.touched(lines, table), ["f", "g"])
+        self.assertEqual([tool.section_of(n, marks) for n in (2, 6, 10)], ["the first", "the first", "the second"])
+        self.assertEqual(tool.touched({7}, table), [])
+        self.assertEqual([n for _, _, n in tool.classes("class A:\n    pass\n\n\ndef f():\n    pass\n")], ["A"])
+
+    def golden(self):
+        return self.load("golden-cli")
+
+    def test_the_command_list_covers_every_verb_and_the_recording_is_deterministic(self):
+        golden = self.golden()
+        work = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, work, True)
+        root = os.path.realpath(str(work))
+        env = golden.world(root)
+        entry = str(SWITCHBOARD)
+        first = golden.record_all(entry, root, env)
+        self.assertGreaterEqual(len(first), 120)
+        verbs = golden.choices(golden.run(entry, ["--help"], root, env)["stdout"])
+        self.assertGreater(len(verbs), 40)
+        for verb in verbs:
+            self.assertIn((verb, "--help"), first, "the command list has no --help of the verb %s" % verb)
+        self.assertEqual(golden.differences(first, golden.record_all(entry, root, env)), [], "two recordings of one entry differ")
+
+    def fake_repo(self, text):
+        """A git repository whose bin/fleet-switchboard prints bin/out.txt: a stand-in for the daemon."""
+        repo = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, repo, True)
+        (repo / "bin").mkdir()
+        (repo / "bin" / "fleet-switchboard").write_text(
+            "import os\nprint(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'out.txt')).read(), end='')\n")
+        (repo / "bin" / "out.txt").write_text(text)
+        git = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"] + list(a), check=True, capture_output=True)
+        git("init", "-q")
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        return repo
+
+    def compare(self, repo):
+        return subprocess.run([sys.executable, str(self.TOOLS / "golden-cli"), "compare", "--base", "HEAD", "--repo", str(repo)],
+                              capture_output=True, text=True)
+
+    def test_compare_passes_an_unchanged_tree_and_names_a_changed_output(self):
+        repo = self.fake_repo("usage: tool\n")
+        done = self.compare(repo)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("RESULT: PASS", done.stdout)
+        (repo / "bin" / "out.txt").write_text("usage: tool [-x]\n")
+        done = self.compare(repo)
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("DIFF --help: stdout differs", done.stdout)
+        self.assertIn("RESULT: FAIL", done.stdout)
+
+    def test_compare_names_a_command_the_working_tree_lost(self):
+        golden = self.golden()
+        base = {("--help",): {"status": 0, "stdout": "a", "stderr": ""}, ("send", "--help"): {"status": 0, "stdout": "b", "stderr": ""}}
+        work = {("--help",): {"status": 2, "stdout": "a", "stderr": ""}, ("plan", "--help"): {"status": 0, "stdout": "c", "stderr": ""}}
+        self.assertEqual(golden.differences(base, work), ["DIFF --help: status differs", "DIFF plan --help: the command is new in the working tree",
+                                                          "DIFF send --help: the command is gone from the working tree"])
+
+    def test_the_recorder_writes_grouped_files(self):
+        repo = self.fake_repo("usage: tool\n")
+        out = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, out, True)
+        done = subprocess.run([sys.executable, str(self.TOOLS / "golden-cli"), "record", "--repo", str(repo), "--dir", str(out)], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(json.loads((out / "root.json").read_text())[0]["argv"], ["--help"])
+        self.assertLessEqual(len(list(out.glob("*.json"))), 7)
+
+    def test_the_surface_snapshot_is_a_sorted_list_of_names(self):
+        names = (REPO / "tests" / "golden" / "surface-dir-sb.txt").read_text().split()
+        self.assertEqual(names, sorted(names))
+        for name in ("main", "cmd_status", "HerdrClient"):
+            self.assertIn(name, names)
+
+    def test_the_surface_modes_write_check_and_name_a_changed_name(self):
+        work = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, work, True)
+        code = work / "m.py"
+        code.write_text(self.BEFORE)
+        snap = work / "snap.txt"
+        tool = str(self.TOOLS / "arch-split-check")
+        run = lambda *a: subprocess.run([sys.executable, tool] + list(a), capture_output=True, text=True)
+        self.assertEqual(run("--write-surface", str(snap), "--after", str(code)).returncode, 0)
+        self.assertIn("one", snap.read_text().split())
+        done = run("--check-surface", str(snap), "--after", str(code))
+        self.assertEqual((done.returncode, "RESULT: PASS" in done.stdout), (0, True), done.stdout)
+        snap.write_text(snap.read_text() + "extra\n")
+        done = run("--check-surface", str(snap), "--after", str(code))
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("name only in the snapshot: extra", done.stdout)
+        code.write_text(self.BEFORE + "\n\ndef three():\n    return 3\n")
+        snap.write_text("\n".join(n for n in snap.read_text().split() if n != "extra") + "\n")
+        done = run("--check-surface", str(snap), "--after", str(code))
+        self.assertIn("name only in the code: three", done.stdout)
+
+    def split_run(self, *args):
+        return subprocess.run([sys.executable, str(self.TOOLS / "arch-split-check")] + list(args), capture_output=True, text=True)
+
+    def test_split_check_no_surface_runs_nothing_and_a_missing_before_is_a_usage_error(self):
+        work = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, work, True)
+        bomb = work / "bomb.py"
+        bomb.write_text("raise RuntimeError('loaded')\n")
+        done = self.split_run("--before", str(bomb), "--after", str(bomb), "--no-surface")
+        self.assertEqual((done.returncode, "RESULT: PASS" in done.stdout), (0, True), done.stdout + done.stderr)
+        self.assertNotEqual(self.split_run("--before", str(bomb), "--after", str(bomb)).returncode, 0)   # loading it fails: the surface check runs it
+        self.assertEqual(self.split_run("--after", str(bomb)).returncode, 2)
+
+    def test_split_check_takes_a_multi_part_before_and_a_reorder_inside_one_side(self):
+        code, out = self.split_check(["A = 1\n", "def one():\n    return 1\n"], ["def one():\n    return 1\n\n\nA = 1\n"])
+        self.assertEqual(code, 0, out)
+
+    def test_compare_fails_on_an_unknown_revision_and_names_a_lost_command(self):
+        repo = self.fake_repo("usage: tool {a} ...\n\npositional arguments:\n  {a}\n")
+        entry = repo / "bin" / "fleet-switchboard"   # only the top help lists a subcommand: the walk ends
+        entry.write_text(entry.read_text().replace("print(", "print('usage: sub') if sys.argv[1:] != ['--help'] else print(", 1).replace("import os", "import os, sys"))
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-am", "entry"], check=True, capture_output=True)
+        done = subprocess.run([sys.executable, str(self.TOOLS / "golden-cli"), "compare", "--base", "no-such-rev", "--repo", str(repo)],
+                              capture_output=True, text=True)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("cannot read no-such-rev", done.stdout + done.stderr)
+        (repo / "bin" / "out.txt").write_text("usage: tool\n")
+        done = self.compare(repo)
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("DIFF a --help: the command is gone from the working tree", done.stdout)
+
+    def overlap_repo(self):
+        """A clone-like repository: main, and a pull request head at refs/pull/1/head that edits one function and one test class."""
+        repo = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, repo, True)
+        git = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"] + list(a), check=True, capture_output=True)
+        git("init", "-q", "-b", "main")
+        (repo / "bin").mkdir()
+        (repo / "bin" / "fleet-switchboard").write_text("# ------ the first\nX = 1\n\n\ndef f():\n    return 1\n\n\ndef g():\n    return 2\n")
+        (repo / "bin" / "test-switchboard").write_text("class A:\n    x = 1\n\n\nclass B:\n    y = 2\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        git("remote", "add", "origin", str(repo))
+        git("checkout", "-q", "-b", "pr")
+        (repo / "bin" / "fleet-switchboard").write_text("# ------ the first\nX = 1\n\n\ndef f():\n    return 9\n\n\ndef g():\n    return 2\n")
+        (repo / "bin" / "test-switchboard").write_text("class A:\n    x = 1\n\n\nclass B:\n    y = 3\n")
+        git("commit", "-q", "-am", "pr")
+        git("update-ref", "refs/pull/1/head", "HEAD")
+        git("checkout", "-q", "main")
+        return repo
+
+    def run_overlap(self, repo, listing, *args, gh_exit=0):
+        bindir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, bindir, True)
+        gh = bindir / "gh"
+        gh.write_text("#!/bin/sh\ncat <<'EOF'\n%s\nEOF\nexit %d\n" % (json.dumps(listing), gh_exit))
+        gh.chmod(0o755)
+        env = dict(os.environ, PATH="%s:%s" % (bindir, os.environ["PATH"]))
+        return subprocess.run([sys.executable, str(self.TOOLS / "arch-overlap"), "--base", "main"] + list(args), cwd=repo, env=env, capture_output=True, text=True)
+
+    def test_overlap_names_symbols_classes_and_sections_of_a_pull_request_head(self):
+        repo = self.overlap_repo()
+        files = [{"path": "bin/fleet-switchboard"}, {"path": "bin/test-switchboard"}]
+        done = self.run_overlap(repo, [{"number": 1, "title": "edit f", "files": files}, {"number": 2, "title": "no head", "files": files},
+                                       {"number": 3, "title": "other", "files": [{"path": "README.md"}]}])
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("symbols: f", done.stdout)
+        self.assertNotIn("symbols: f, g", done.stdout)
+        self.assertIn("test classes: B", done.stdout)
+        self.assertIn("the first: #1", done.stdout)
+        self.assertIn("cannot fetch the pull request head", done.stdout)   # #2 has no head ref
+        self.assertNotIn("#3", done.stdout)   # touches neither file
+        self.assertIn("2 open pull requests touch", done.stdout)
+
+    def test_overlap_names_an_insertion_between_statements_and_refuses_bad_input(self):
+        repo = self.overlap_repo()
+        git = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"] + list(a), check=True, capture_output=True)
+        git("checkout", "-q", "-b", "gap")
+        path = repo / "bin" / "fleet-switchboard"
+        path.write_text("NEW = 3\n" + path.read_text())   # a line above every statement
+        git("commit", "-q", "-am", "gap")
+        git("update-ref", "refs/pull/1/head", "HEAD")
+        git("checkout", "-q", "main")
+        done = self.run_overlap(repo, [{"number": 1, "title": "gap", "files": [{"path": "bin/fleet-switchboard"}]}])
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("between statements near line", done.stdout)
+        failed = self.run_overlap(repo, [], gh_exit=1)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("gh pr list failed", failed.stderr)
+        refused = self.run_overlap(repo, [], "--daemon", "-x")
+        self.assertEqual(refused.returncode, 2)
+        long_list = self.run_overlap(repo, [{"number": 1000 + n, "title": "t", "files": []} for n in range(200)])
+        self.assertIn("200 open pull requests listed", long_list.stderr)
+
+    def test_the_hygiene_scan_reads_one_list_of_daemon_files(self):
+        self.assertIn(SWITCHBOARD, SWITCHBOARD_SOURCE_FILES)
+        self.assertEqual(switchboard_source(), "\n".join(p.read_text() for p in SWITCHBOARD_SOURCE_FILES))
+
+
+class TestAssembler(unittest.TestCase):
+    """The entry builds its one namespace from the manifest bin/fleet-switchboard.parts (docs/switchboard.md, "The assembler")."""
+
+    def _copy(self, lines):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        for sibling in BIN.glob("*.py"):   # the entry loads its sibling modules from its own directory
+            shutil.copy(str(sibling), str(root / sibling.name))
+        shutil.copy(str(SWITCHBOARD), str(root / "fleet-switchboard"))
+        (root / "fleet-switchboard.parts").write_text("\n".join(lines) + "\n")
+        return root
+
+    def test_the_shipped_manifest_names_the_entry_itself(self):
+        lines = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.startswith("#")]
+        self.assertEqual(lines, ["fleet-switchboard"])
+
+    def test_a_second_part_puts_its_names_into_sb_in_the_order_given(self):
+        root = self._copy(["part_a.py", "fleet-switchboard", "part_b.py"])
+        (root / "part_a.py").write_text('ORDER = ["a"]\nA_SAW_MAIN = "main" in globals()\nA_FILE = __file__\n')
+        (root / "part_b.py").write_text('ORDER.append("b")\nB_SAW_MAIN = "main" in globals()\n')
+        module = _load("t_assembled", root / "fleet-switchboard")
+        self.assertEqual(module.ORDER, ["a", "b"])
+        self.assertFalse(module.A_SAW_MAIN)
+        self.assertTrue(module.B_SAW_MAIN)
+        self.assertEqual(module.A_FILE, str(root / "fleet-switchboard"))
+        self.assertTrue(callable(module.main))
+        self.assertFalse(hasattr(module, "_fleet_parts"))
+
+    def test_a_missing_part_fails_at_start_with_one_line(self):
+        root = self._copy(["part_missing.py", "fleet-switchboard"])
+        done = subprocess.run([sys.executable, str(root / "fleet-switchboard"), "status", "--help"], capture_output=True, text=True)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(done.stdout, "")
+        self.assertEqual(len(done.stderr.strip().splitlines()), 1)
+        self.assertIn("part file not found", done.stderr)
+        self.assertIn("part_missing.py", done.stderr)
+
+    def test_an_unreadable_manifest_fails_at_start_with_one_line(self):
+        root = self._copy(["fleet-switchboard"])
+        manifest = root / "fleet-switchboard.parts"
+        manifest.unlink()
+        manifest.mkdir()   # exists, cannot be read as a file
+        done = subprocess.run([sys.executable, str(root / "fleet-switchboard"), "status", "--help"], capture_output=True, text=True)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(len(done.stderr.strip().splitlines()), 1)
+        self.assertIn("cannot read the parts manifest", done.stderr)
+
+    def test_a_missing_manifest_runs_the_entry_alone(self):
+        root = self._copy(["fleet-switchboard"])
+        (root / "fleet-switchboard.parts").unlink()
+        self.assertTrue(callable(_load("t_no_manifest", root / "fleet-switchboard").main))
+
+    def test_a_manifest_that_does_not_name_the_entry_runs_every_part_before_it(self):
+        root = self._copy(["part_a.py"])
+        (root / "part_a.py").write_text('A_SAW_MAIN = "main" in globals()\n')
+        module = _load("t_unnamed_entry", root / "fleet-switchboard")
+        self.assertFalse(module.A_SAW_MAIN)
+        self.assertTrue(callable(module.main))
+
+    def test_comments_and_blank_lines_in_a_manifest_are_ignored(self):
+        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard"])
+        (root / "part_a.py").write_text("FROM_A = 1\n")
+        self.assertEqual(_load("t_commented", root / "fleet-switchboard").FROM_A, 1)
+
+    def test_a_symlinked_run_and_the_help_line_still_work(self):
+        link = Path(tempfile.mkdtemp()) / "fsb"
+        self.addCleanup(shutil.rmtree, str(link.parent), True)
+        link.symlink_to(SWITCHBOARD)
+        done = subprocess.run([sys.executable, "-B", str(link), "status", "--help"], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("usage: fleet-switchboard status", done.stdout)
 
 
 if __name__ == "__main__":

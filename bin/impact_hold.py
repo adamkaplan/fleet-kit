@@ -1017,6 +1017,7 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
             detail["order"] = plan_ledger.clip(under_order["text"], 300)
             if under_order.get("threshold"):   # #835: a clear by score shows the score and the threshold it was made under
                 detail["score"], detail["threshold"] = under_order.get("score"), under_order["threshold"]
+                detail["runs"] = under_order.get("runs") or []   # #972: the two runs the clear rests on (record id, rater, cell)
         if fingerprint is not None:
             detail["fingerprint"] = fingerprint
         engine.audit.append(engine.actor, "gate.hold_cleared", pr, detail)   # inside the lock
@@ -1096,7 +1097,7 @@ def delegated_clear_score(engine, module, report, threshold):
         if not rated and not problem:
             problem = "no independent impact rating at this head"
         block = module.score_block()
-        scored = module.judge(block, impact_floor.load_matrix().get("cells"), entries, report, threshold) if not problem and block is not None else None
+        scored = module.judge(block, impact_floor.load_matrix().get("cells"), entries, report, threshold, module.RUNS_REQUIRED) if not problem and block is not None else None
     except Exception as err:
         scored, problem = None, "%s: %s" % (type(err).__name__, _one_line(str(err), 80))
     if scored is None:
@@ -1160,6 +1161,7 @@ def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info
     scored = delegated_clear_score(engine, module, report, threshold) if threshold is not None else None
     if scored is not None and info is not None:
         info["score"] = scored["level"]
+        info["runs"] = scored.get("runs") or []
     reasons = module.refusals(got["rule"], report, got["files"], impact_floor.matches, got["closure"], scored)
     if reasons:
         return None, "; ".join(reasons)
@@ -1242,7 +1244,15 @@ def cmd_impact_clear(args, runner, now):
                     engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), dict({"by": kind[1], "under_order": delegated["number"], "why": _one_line(why, 300)}, **({"score": info.get("score"), "threshold": delegated["threshold"]} if delegated.get("threshold") else {})))
                 sys.stderr.write("%s: impact clear: refused: %s\n" % (PROG, _one_line(why, 600)))
                 return EXIT_USAGE
-            extra = {"head": report["head"], "via": "order:%d" % delegated["number"], "under_order": dict(delegated, score=info.get("score"))}
+            if delegated.get("threshold"):   # #972: a clear by score names both runs it rests on
+                problems = load_module("delegated_clear").reason_problems(reason, info.get("runs") or [])
+                if problems:
+                    why = "; ".join(problems)
+                    if engine.audit is not None:
+                        engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), {"by": kind[1], "under_order": delegated["number"], "why": _one_line(why, 300), "score": info.get("score"), "threshold": delegated["threshold"]})
+                    sys.stderr.write("%s: impact clear: refused: %s\n" % (PROG, _one_line(why, 600)))
+                    return EXIT_USAGE
+            extra = {"head": report["head"], "via": "order:%d" % delegated["number"], "under_order": dict(delegated, score=info.get("score"), runs=info.get("runs"))}
         for line in impact_clear_core(engine, runner, repo, number, kind[1], plan_ledger.clip(redact_command_text(reason), 300), **extra):
             print(line)
     except (NoticeError, IntentError) as err:

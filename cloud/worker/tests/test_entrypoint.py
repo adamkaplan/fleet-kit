@@ -16,6 +16,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CLOUD = os.path.join(HERE, "..", "..")
 ENTRYPOINT = os.path.join(CLOUD, "worker", "entrypoint.sh")
 STUB = os.path.join(HERE, "stub_server.py")
+FAKE_OPENCODE = os.path.join(HERE, "fake_opencode.sh")
 sys.path.insert(0, os.path.join(CLOUD, "launcher"))
 import cloud_worker as cw  # noqa: E402  (secret_forms: the encodings a value can be printed in)
 
@@ -44,6 +45,12 @@ class Entrypoint(unittest.TestCase):
         os.mkdir(self.share)
         for src, name in (("guard.sh", "guard.sh"), ("opencode-worker.json", "opencode-worker.json"), ("agents/worker.md", "worker.md")):
             shutil.copy(os.path.join(CLOUD, "worker", src), os.path.join(self.share, name))
+        rec = tempfile.TemporaryDirectory(dir=os.environ.get("CW_TMPDIR"))   # what the stand-in opencode records (its calls and the stdin it was given): outside the tree the tests scan
+        self.addCleanup(rec.cleanup)
+        self.rec = os.path.realpath(rec.name)
+        oc = os.path.join(self.bin, "opencode")   # a stand-in opencode: records `auth import`, writes a marker into ITS store (the data dir)
+        shutil.copy(FAKE_OPENCODE, oc)
+        os.chmod(oc, 0o755)
         self.put("model-auth", MODEL)
         self.put("git-token", GIT)
         self.put("server-password", PASSWORD)
@@ -63,7 +70,7 @@ class Entrypoint(unittest.TestCase):
     def env(self, **extra):
         return dict({"PATH": self.bin + ":/usr/bin:/bin", "HOME": self.home, "WORKER_DOCKER": "0", "CW_RUN_DIR": self.run_dir,
                      "CW_TMP_DIR": self.tmpfs, "CW_SHARE_DIR": self.share, "GIT_CONFIG_NOSYSTEM": "1",
-                     "CW_GH_CLIENT": os.path.join(self.bin, "gh")}, **extra)
+                     "CW_GH_CLIENT": os.path.join(self.bin, "gh"), "FAKE_OC_REC": self.rec}, **extra)
 
     def start(self, *cmd, **extra):
         return subprocess.run(["sh", ENTRYPOINT] + list(cmd or ["true"]), env=self.env(**extra), capture_output=True, text=True, timeout=60)
@@ -111,17 +118,13 @@ class Entrypoint(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assert_not_printed(r.stdout + r.stderr, "entrypoint output")
         self.assertNotIn(PASSWORD, r.stdout + r.stderr)
-        auth = os.path.join(self.tmpfs, "data", "opencode", "auth.json")
-        self.assertEqual(stat.S_IMODE(os.stat(auth).st_mode), 0o600)
-        self.assertEqual(read(auth), MODEL)
+        self.assertEqual(read(os.path.join(self.rec, "stdin")), MODEL)   # the server's store got the credential by the import, not by a copy
+        self.assertFalse(os.path.exists(os.path.join(self.tmpfs, "data", "opencode", "auth.json")))
 
-    def test_s4_the_model_entry_is_copied_to_tmpfs_the_data_dir_is_exported_and_the_mounted_file_is_untouched(self):
+    def test_s4_the_model_entry_is_imported_the_data_dir_is_exported_and_the_mounted_file_is_untouched(self):
         r = self.start("sh", "-c", 'echo "$XDG_DATA_HOME|$XDG_CONFIG_HOME"')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), "%s|%s" % (os.path.join(self.tmpfs, "data"), os.path.join(self.tmpfs, "config")))
-        auth = os.path.join(self.tmpfs, "data", "opencode", "auth.json")
-        with open(auth, "a") as f:   # the server refreshes its token in the copy
-            f.write(" ")
         self.assertEqual(read(os.path.join(self.run_dir, "model-auth")), MODEL)
         self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.tmpfs, "data", "opencode")).st_mode), 0o700)
 

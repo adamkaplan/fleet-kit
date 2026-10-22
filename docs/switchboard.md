@@ -4773,6 +4773,32 @@ A rating counts by score only with the agent's block (#901). `review record --bl
 
 The rating's inputs are immune to the shared parser: `main` captures the raw command line before any registrar runs, and `review record` reads its six rating inputs (`--impact-severity`, `--impact-probability`, `--impact-reason`, `--impact-action`, `--impact-class`, `--block`) only through `rating_inputs`, a private parser over that raw line (no abbreviation, no default, nothing shared). `main` also checks that the functions of the rating path (`RATING_PATH_FUNCTIONS`) are the same objects after the registrars ran, and refuses to record if not. A registrar's `set_defaults`, a replaced subparser, a same-dest argument or a wrapper on the namespace changes nothing in the recorded rating. The honest limit: no shape makes the rating immune to arbitrary Python that runs while the parser is built (a registrar that patches `argparse` or the ledger module); the closure is a mechanical backstop for ordinary edits, not a sandbox, and the independent reviewer rates a change that touches the rating path.
 
+#### Two independent runs for a clear by score (#972)
+
+##### The cause
+
+The reviewer-impact agent rated the same change at two heads of one pull request, with only tests added between them, and the two ratings fell in different cells (synthetic shapes, same lengths):
+
+```text
+head: 1111111aaaa
+impact-severity: Moderate
+impact-probability: Possible
+cell: Medium
+```
+
+```text
+head: 2222222bbbb
+impact-severity: Major
+impact-probability: Likely
+cell: Serious
+```
+
+The rater's cell is a sample, not a measurement: a clear that rests on one run depends on a draw, and which draw came decided whether the pull request cleared or went to the owner.
+
+##### The rule
+
+A clear by score needs two independent impact ratings at the head, from two different rater sessions, each carrying the agent's own block; the reason of the clear names both runs, each as `<record id or rater>=<cell>`. The score stays the highest counted record at the head: the lower run corroborates and never lowers or blocks it. "Counted" is the block rule above and nothing new; "different sessions" is two different recorded identities (`by`), never a typed name. A run is one draw, so two runs are independent only when BOTH their block hashes differ AND their recorded names differ once stripped of spaces and lower-cased (`rev`, `REV` and ` rev ` are one session, and one block recorded under two names is one run); a record with no ledger id is not counted as a run. The reason check refuses unless it is given exactly two such runs, and when the reason names a run twice every `name=cell` for it must carry the record's cell. A refusal says in one line how many counted ratings or sessions were found and what is missing, and changes nothing. The run is named by its ledger id or its rater name, for example `#41=Serious, rater-b=Medium`; a wrong cell is refused. The audit line of the clear (`gate.hold_cleared`) carries both runs as `runs` (id, rater, cell). It applies only to an order with a `max_level`; the owner's own clear needs no second run. A push voids both runs (they are per head), so a pull request that moves needs two new runs: slower, intended.
+
 #### Where it lives
 
 - `bin/delegated_clear.py` holds the judgement: the score block (`score_block`), the order-line hash and file match (`line_hash`, `file_order_line`, `entry_of`), the decision (`judge`) and the validation and refusals. It holds no path, class or rule name of its own.
@@ -5413,3 +5439,20 @@ Each decision was walked against the matrix (its owner-hold meaning and its rati
 - **D2**: enforce the freeze with a ruleset on `integration`. Recommendation: yes if the owner is willing; otherwise the lanes' rule stays the control.
 - **D3**: batch size against the review checkout's limits. Recommendation: cap a batch at what the checkout accepts, and split a larger one.
 - **Follow-up asks** (each its own ask): a script that renders the batch table; the daemon's treatment of an ask whose change is in a non-default branch (T12) and of reference runs for `integration` (and a `push` run of CI on `integration`; pull requests into it already run CI, as the workflow has no branch filter); a report of merges into `integration` while a batch is ready.
+
+## The assembler (#1092, slice S1)
+
+`bin/fleet-switchboard` builds the daemon's one module namespace from the manifest `bin/fleet-switchboard.parts`: one part path per line, relative to the entry's real path (symlinks resolved), `#` for comments.
+
+- Parts run in the order given, each executed into the same namespace, so `__file__` stays the entry's and every path computed from it is unchanged.
+- The line naming the entry itself is where the entry's own code runs. Parts above it run first; parts below it run at the end of the file, before `main`.
+- A missing part stops the start with one line on stderr. A missing manifest means the entry alone; a manifest that exists but cannot be read stops the start with one line. A manifest that does not name the entry runs every part before the entry's code. The manifest and its parts run with the daemon's authority: they have the entry's trust and file permissions.
+- Today the manifest names only the entry, so nothing moved and behaviour is identical. A later slice moves code into parts and adds their lines.
+
+## Running with no terminal multiplexer (#1072)
+
+Cause: `Engine._discover` calls `agent_list` on every pass. With no herdr that call fails, so each pass records a standing "herdr unreachable" problem and `read_mark` marks the agents input not whole, which skips the destructive steps that need a whole input.
+
+The config key `no_multiplexer` (default `false`, so nothing changes) turns that off. With `"no_multiplexer": true` discovery reads the registry and the headless and cloud records only: `agent_list` is never called, no "herdr unreachable" problem is recorded, and the agents input is whole when those records were read without error. The one-time bell migration stays pending. Agents with no pane get no badge, no pane read and no pane delivery, and that is no error. With the key off, discovery, problems, audit lines and call counts are as before (test `TestNoMultiplexer`, scenarios U1 and S2). The tests use a fake multiplexer that raises on any call, and one test is a mutant that keeps calling `agent_list` with the switch on; the count of zero calls catches it. Other commands that call `agent_list` directly (close-pane guards, doctor) are unchanged and still need herdr.
+
+With the key on, the toast step and the badge writes are skipped too (a toast is a multiplexer call; a badge needs a pane), with no error. The tests (`TestNoMultiplexer`) carry one mutant per scenario that names one: the S2 mutant keeps calling `agent_list`, the S3 mutant drops the toast guard, the U1 mutant makes the switch-off path behave as on; each is killed by its own check.
