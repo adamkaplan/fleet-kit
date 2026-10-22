@@ -63,6 +63,10 @@ class _Remote(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         path, _, query = self.path.partition("?")
+        hook = getattr(self.server, "on_push_advert", None)
+        if hook and "service=git-receive-pack" in query:   # a concurrent writer: the branch moves after the launcher's fetch, before its push
+            self.server.on_push_advert = None
+            hook()
         env = dict(os.environ, GIT_PROJECT_ROOT=self.server.root, GIT_HTTP_EXPORT_ALL="1", REQUEST_METHOD=self.command,
                    PATH_INFO=path, QUERY_STRING=query, CONTENT_TYPE=self.headers.get("Content-Type", ""),
                    CONTENT_LENGTH=str(len(body)), REMOTE_USER="x", REMOTE_ADDR="127.0.0.1")
@@ -388,6 +392,63 @@ class RetirePush(base.Base):
         code, out, err = self.retire()
         self.assert_kept(code, err, "push")
 
+    # -- the overwrite guard: a WIP branch that moved under the push is never overwritten, and the default branch never moves --
+    def bare_git(self, *a):
+        return subprocess.run(["git", "-C", self.bare] + list(a), check=True, capture_output=True, text=True).stdout.strip()
+
+    def commit_on_remote(self, msg, parent=None):
+        """An unrelated commit (an empty tree) made inside the remote itself; returns its sha."""
+        tree = subprocess.run(["git", "-C", self.bare, "mktree"], input="", check=True, capture_output=True, text=True).stdout.strip()
+        args = ["commit-tree", tree, "-m", msg] + (["-p", parent] if parent else [])
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@invalid", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@invalid")
+        return subprocess.run(["git", "-C", self.bare] + args, check=True, capture_output=True, text=True, env=env).stdout.strip()
+
+    def seed_remote(self):
+        """The remote holds main and <worker>/wip at tip A, neither containing the work. Returns (main, A)."""
+        main = self.commit_on_remote("main")
+        tip_a = self.commit_on_remote("a", main)
+        self.bare_git("update-ref", "refs/heads/main", main)
+        self.bare_git("update-ref", "refs/heads/coder7/wip", tip_a)
+        return main, tip_a
+
+    def moved_branch_outcome(self):
+        """A concurrent writer moves <worker>/wip to B after the launcher's fetch and before its push. Returns what stands afterwards."""
+        main, tip_a = self.seed_remote()
+        tip_b = self.commit_on_remote("b", tip_a)
+        self.srv.on_push_advert = lambda: self.bare_git("update-ref", "refs/heads/coder7/wip", tip_b)
+        code, out, err = self.retire()
+        return code, err, main, tip_b
+
+    def test_a_wip_branch_that_moved_under_the_push_is_not_overwritten_and_the_pod_is_kept(self):
+        code, err, main, tip_b = self.moved_branch_outcome()
+        self.assert_kept(code, err, "push")
+        self.assertEqual(self.pushed_branch(), tip_b)   # the other writer's tip stands
+        self.assertEqual(self.bare_git("rev-parse", "refs/heads/main"), main)
+
+    def test_the_default_branch_and_other_branches_are_unchanged_after_a_push(self):
+        main, tip_a = self.seed_remote()
+        self.bare_git("update-ref", "refs/heads/feature", main)
+        code, out, err = self.retire()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.pushed_branch(), self.head)   # an existing WIP branch that did not move is advanced (the lease held)
+        self.assertEqual(self.bare_git("rev-parse", "refs/heads/main"), main)
+        self.assertEqual(self.bare_git("rev-parse", "refs/heads/feature"), main)
+        self.assertEqual(self.bare_git("for-each-ref", "--format=%(refname)", "refs/heads").split(), ["refs/heads/coder7/wip", "refs/heads/feature", "refs/heads/main"])
+
+    def test_the_overwrite_guard_test_fails_for_the_mutant_that_forces(self):
+        src = open(self.env_hook_path()).read()
+        old = '"--force-with-lease=refs/heads/%s:%s" % (branch, seen)'
+        self.assertIn(old, src)
+        path = os.path.join(self.tmp.name, "force_hook.py")
+        with open(path, "w") as f:
+            f.write(src.replace(old, '"--force"'))
+        self.patch_state(hook_path=path)
+        code, err, main, tip_b = self.moved_branch_outcome()
+        self.assertEqual(self.pushed_branch(), self.head)   # the forced push took the other writer's branch: the guard test above fails on this build
+
+    def env_hook_path(self):
+        return os.path.join(self.tmp.name, "local_hook.py")
+
     # -- S8: three mutants, each must break S2 --
     def mutant(self, name, old, new, launcher=None):
         src = open(os.path.join(os.path.dirname(HERE), "end_hook.py")).read()
@@ -416,9 +477,9 @@ class RetirePush(base.Base):
         self.assertFalse(self.s2_outcome())
 
     def test_s8_mutant_the_mint_is_skipped(self):
-        orig = cw.retire_token.mint
-        cw.retire_token.mint = lambda env, repo: None
-        self.addCleanup(setattr, cw.retire_token, "mint", orig)
+        orig = cw.run_git_token_cmd
+        cw.run_git_token_cmd = lambda cmd, repo, env, register=None: (_ for _ in ()).throw(cw.CloudError("no token", cw.EXIT_USAGE))
+        self.addCleanup(setattr, cw, "run_git_token_cmd", orig)
         self.assertFalse(self.s2_outcome())
 
     def test_s8_mutant_the_mint_is_skipped_by_not_configuring(self):   # a launcher that quietly never sends the token

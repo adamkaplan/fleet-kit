@@ -68,7 +68,7 @@ def token_git(gitdir, token, *args, check=True):
     resolve keys, remotes, hooks), not a global or system file. The token is in this one child's environment, offered by a
     helper that answers for one fixed host and scheme; only that scheme is allowed; nothing the repository names can run."""
     u = urlparse(git_base())
-    env = dict(os.environ, CW_PUSH_TOKEN=token, CW_PUSH_HOST=u.netloc, CW_PUSH_SCHEME=u.scheme, GIT_ALLOW_PROTOCOL=u.scheme,
+    env = dict(os.environ, **{"CW_PUSH_TOKEN": token, "CW_PUSH_HOST": u.netloc, "CW_PUSH_SCHEME": u.scheme}, GIT_ALLOW_PROTOCOL=u.scheme,
                GIT_TERMINAL_PROMPT="0", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull, GIT_CONFIG_NOSYSTEM="1")
     cmd = ["git", "--git-dir", gitdir, "-c", "credential.helper=", "-c", "credential.helper=" + HELPER] + HARDEN
     p = subprocess.run(cmd + list(args), capture_output=True, text=True, env=env)

@@ -1340,12 +1340,22 @@ class Launcher:
             waited += WAIT_POLL_SECONDS
 
     # -- end hook, stop, delete --
+    def _retire_mint(self, repo):
+        """The fresh push token through THE mint call (run_git_token_cmd), registered with the scrubber; None on any failure (the reason is never kept)."""
+        if not repo:
+            return None
+        try:
+            token = run_git_token_cmd(git_token_cmd(repo, self.env), repo, dict(os.environ, **self.env), register=self.kube.add_secrets)
+        except CloudError:
+            return None
+        return token if "\n" not in token else None   # the hook takes one line only
+
     def run_hook(self, name):
         """When this launcher can mint, a fresh token for the repository recorded on the pod (self.hook_repo, set by stop) goes to the hook on stdin."""
         repo = getattr(self, "hook_repo", None)
         self.hook_step = retire_token.STEP_PUSH
         if retire_token.configured(self.env):   # a pod that records no repository cannot be minted for: that is a mint failure, never the dead credential
-            token = retire_token.mint(self.env, repo) if repo else None
+            token = self._retire_mint(repo)
             if not token:
                 self.hook_step = retire_token.STEP_MINT
                 return {"pushed": False, "wip_branch": None, "error": "no fresh push token could be minted"}
