@@ -27,7 +27,8 @@ built in: `OPENCODE_SERVER_PASSWORD`, `GH_TOKEN` and any cloud identity are supp
 The launcher mounts per-run files read-only under `/run/cw` (`CW_RUN_DIR`). The entrypoint, which never prints a value:
 
 - `server-password`: read into `OPENCODE_SERVER_PASSWORD` for the server it starts (OpenCode reads the password only from its environment).
-- `model-auth`: the model provider's access entry (JSON), copied with mode 600 to `<tmpfs>/data/opencode/auth.json` (`XDG_DATA_HOME`), so the server refreshes its short-lived token in the copy and never in the Secret. A model config naming `CW_MODEL` (default `github-copilot/claude-sonnet-5.5`) is written beside it (`XDG_CONFIG_HOME`); it holds no secret.
+- `model-auth`: the model provider's access entry (JSON), the one-entry array `opencode auth export` prints, IMPORTED with `opencode auth import --standalone` (read from the mounted file on stdin) into OpenCode's own store under `<tmpfs>/data` (`XDG_DATA_HOME`) BEFORE the server starts, because the server reads only that store and ignores an `auth.json`. A failed import refuses the start with `worker: the model credential import failed; refusing to start`; the Secret file is never written. A model config naming `CW_MODEL` (default `github-copilot/claude-sonnet-5.5`) is written beside it (`XDG_CONFIG_HOME`); it holds no secret.
+  A worker can read this credential (the one-entry array, refresh token included, and the store under `XDG_DATA_HOME`) for the life of its pod; the shell deny rules do not guard it. The pod holds a launch-time snapshot: a revoked or rotated credential ends that pod's turns, and the operator's rotated token is not pushed to a running pod. A stale `CW_MODEL_AUTH_FILE` (retired) is refused as an unknown setting in a settings file and silently ignored in the process environment. An old image with the new launcher answers on the free model; the old launcher with the new image refuses at the import.
 - `git-token`: never copied. A git credential helper (`git config --global`, so every process of the worker user sees it, including a fresh-environment `kubectl exec` such as the end hook) and a `gh` wrapper read the file at call time. The helper answers only for `https://github.com`; the token is never in git config, argv or the environment. The directory is the path baked in when the files were generated (a caller's `CW_RUN_DIR` changes nothing), and at every call an unreadable or empty token file makes both fail with one line and a non-zero exit (never an empty password, never a `gh` with an empty token). The `gh` wrapper runs the guard and then `cw-gh`, which has only the verbs listed under "The client that replaces the real `gh`"; the boundary is the token's own permissions (a per-run, one-repository App token) and the repository's rules, not the wrapper or the client. The managed reaper replaces the Secret's token about every 30 minutes (see `launcher/README.md`, "The git token and its renewal"); the kubelet refreshes the whole-directory mount, so the next call reads the new token. The server password is in the server's environment, so every process the agent starts can read it; that is accepted by design.
 - The `git-token` also carries `issues: read` (one table in `cloud/launcher/app_token.py`), so the worker can read its repository's issues and their comments. The wrapper still refuses every write to an issue, a label or a merge.
 
@@ -159,8 +160,8 @@ export CW_KUBE_CONTEXT=<context>      # or CW_CLOUD_SERVER + CW_CLOUD_TOKEN_FILE
 cloud/launcher/run_task.py WORKER OWNER/NAME BRANCH BRIEF_FILE [--pull-secret NAME] [--image IMAGE]
 ```
 
-The target repository is an argument and has no default. The driver reads the model entry (the `github-copilot` entry of
-`CW_MODEL_AUTH_FILE`, default `~/.local/share/opencode/auth.json`) and a git token (the output of `CW_GIT_TOKEN_CMD`;
+The target repository is an argument and has no default. The driver reads the model entry (the one `github-copilot` entry of OpenCode's own
+credential store, read with `opencode auth export` in a scrubbed environment through a pipe, in memory; `CW_OPENCODE_BIN` names the program) and a git token (the output of `CW_GIT_TOKEN_CMD`;
 default `app_token.py OWNER/NAME` beside the driver, the one-hour GitHub App token) in memory, creates the pod through
 the launcher with both handed over inherited pipes (`--run-secret-fd`), port-forwards, opens a session, sends the brief,
 waits for idle, then stops the worker (the end hook pushes the work; the pod and its Secrets are deleted).
@@ -172,7 +173,7 @@ waits for idle, then stops the worker (the end hook pushes the work; the pod and
 - Every line it prints passes through the launcher's one `scrub()`. No secret is in an argument, an environment
   variable of a child, a log or a file; the only file is a private temporary directory (`CW_TMPDIR`) holding the
   port-forward's own log, removed at exit. The server password comes back on a pipe and stays in memory.
-- A missing or unreadable input (auth file, entry, token command, brief) refuses before anything is created. A second run
+- A missing or unreadable input (the export command, its entry, token command, brief) refuses before anything is created. A second run
   with a worker name that exists refuses and changes nothing. So does a run that LOSES a race for the name (another run made
   the worker while this one minted its token): the launcher exits with its own code (7, "already exists") and the driver
   returns without an end hook and without deleting anything. The driver acts on a worker only when it can prove it is
