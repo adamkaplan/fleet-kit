@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""test-cloud-cli: tests for bin/cloud_cli.py against a fake HTTP server on 127.0.0.1; one mutant per rule.
+
+    bin/test-cloud-cli
+"""
+import http.server
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+SOURCE = (BIN / "cloud_cli.py").read_text()
+SECRET = "tok-SECRET.abc123"
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        self.server.seen.append({"auth": self.headers.get("Authorization"), "body": json.loads(self.rfile.read(n))})
+        code = self.server.code
+        data = json.dumps({"error": "nope" if code != 200 else ""}).encode()
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *a):
+        pass
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.srv.seen, self.srv.code = [], 200
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.addCleanup(self.srv.server_close)
+        self.addCleanup(self.srv.shutdown)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tok = Path(self.tmp.name) / "token"
+        self.tok.write_text(SECRET + "\n")
+        self.url = "http://127.0.0.1:%d/send" % self.srv.server_address[1]
+
+    def run_cli(self, args, source=None, **env_over):
+        script = Path(self.tmp.name) / "cloud_cli.py"
+        script.write_text(source or SOURCE)
+        (Path(self.tmp.name) / "cloud_client.py").write_text((BIN / "cloud_client.py").read_text())
+        env = {"PATH": os.environ.get("PATH", ""), "FLEET_AGENT_NAME": "worker-a", "FLEET_BOSS": "boss-a",
+               "FLEET_CLOUD_CHANNEL_URL": self.url, "FLEET_CLOUD_TOKEN_FILE": str(self.tok)}
+        env.update(env_over)
+        env = {k: v for k, v in env.items() if v is not None}
+        p = subprocess.run([sys.executable, str(script)] + args, env=env, capture_output=True, text=True, timeout=60)
+        return p.returncode, p.stdout, p.stderr
+
+    def mutate(self, old, new):
+        assert SOURCE.count(old) == 1, old
+        return SOURCE.replace(old, new)
+
+
+class TestCli(Base):
+    def test_send_delivers(self):
+        code, out, err = self.run_cli(["send", "peer-b", "hello", "there"])
+        self.assertEqual((code, out, err), (0, "sent to peer-b\n", ""))
+        s = self.srv.seen[0]
+        self.assertEqual(s["auth"], "Bearer " + SECRET)
+        self.assertEqual(s["body"]["sender"], "worker-a")
+        self.assertEqual(s["body"]["recipient"], "peer-b")
+        self.assertEqual(s["body"]["text"], "hello there")
+
+    def test_report_goes_to_boss(self):
+        code, out, _ = self.run_cli(["report", "done", "all", "green"])
+        self.assertEqual((code, out), (0, "reported done to boss-a\n"))
+        self.assertEqual(self.srv.seen[0]["body"]["recipient"], "boss-a")
+        self.assertEqual(self.srv.seen[0]["body"]["text"], "report: done: all green")
+
+    def test_refusal_exits_1_without_token(self):
+        self.srv.code = 403
+        code, out, err = self.run_cli(["send", "peer-b", "x"])
+        self.assertEqual(code, 1)
+        self.assertEqual(len(out.splitlines()), 1)
+        self.assertNotIn(SECRET, out + err)
+        self.assertNotIn("Traceback", err)
+
+    def test_bad_usage_and_environment_exit_2(self):
+        cases = [(["send", "peer-b"], {}), (["bogus", "a", "b"], {}), ([], {}),
+                 (["report", "weird", "x"], {}), (["report", "done", "x" * 301], {}),
+                 (["send", "p", "x"], {"FLEET_AGENT_NAME": None}),
+                 (["report", "done", "x"], {"FLEET_BOSS": None}),
+                 (["send", "p", "x"], {"FLEET_CLOUD_CHANNEL_URL": None}),
+                 (["send", "p", "x"], {"FLEET_CLOUD_CHANNEL_URL": "ftp://x"})]
+        for args, env in cases:
+            code, out, err = self.run_cli(args, **env)
+            self.assertEqual(code, 2, (args, env, out, err))
+            self.assertEqual(len(out.splitlines()), 1)
+            self.assertNotIn("Traceback", err)
+        self.assertEqual(self.srv.seen, [])
+
+    def test_report_limit_is_300_and_kinds(self):
+        self.assertEqual(self.run_cli(["report", "done", "x" * 300])[0], 0)
+        for kind in ("failed", "blocked", "question", "working", "paused", "withdrawn"):
+            self.assertEqual(self.run_cli(["report", kind, "ok"])[0], 0, kind)
+
+    def test_missing_token_is_one_line(self):
+        code, out, err = self.run_cli(["send", "p", "x"], FLEET_CLOUD_TOKEN_FILE="/nonexistent/t")
+        self.assertEqual(code, 1)
+        self.assertEqual(len(out.splitlines()), 1)
+        self.assertNotIn("Traceback", err)
+
+
+class TestMutants(Base):
+    def test_mutant_prints_token(self):
+        src = self.mutate('        print(done)\n', '        print(done, open(token_path).read())\n')
+        _, out, _ = self.run_cli(["send", "p", "x"], source=src)
+        self.assertIn(SECRET, out)
+
+    def test_mutant_exit_0_on_refusal(self):
+        self.srv.code = 403
+        src = self.mutate('    return 1\n', '    return 0\n')
+        self.assertEqual(self.run_cli(["send", "p", "x"], source=src)[0], 0)
+
+    def test_mutant_ignores_environment_url(self):
+        other = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        other.seen, other.code = [], 200
+        threading.Thread(target=other.serve_forever, daemon=True).start()
+        self.addCleanup(other.server_close)
+        self.addCleanup(other.shutdown)
+        src = self.mutate('post or make_post(url)', 'post or make_post("http://127.0.0.1:%d/send")' % other.server_address[1])
+        self.run_cli(["send", "p", "x"], source=src)
+        self.assertEqual(self.srv.seen, [])
+        self.assertEqual(len(other.seen), 1)
+
+    def test_mutant_sender_from_command_line(self):
+        src = self.mutate('cmd, first, text = args[0], args[1], " ".join(args[2:]).strip()',
+                          'cmd, first, text = args[0], args[1], " ".join(args[2:]).strip()\n    env = dict(env, FLEET_AGENT_NAME=first)')
+        self.run_cli(["send", "imposter", "x"], source=src)
+        self.assertEqual(self.srv.seen[0]["body"]["sender"], "imposter")
+        self.assertNotEqual(self.srv.seen[0]["body"]["sender"], "worker-a")
+
+
+if __name__ == "__main__":
+    unittest.main()
