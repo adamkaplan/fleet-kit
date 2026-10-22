@@ -20166,7 +20166,7 @@ class TestGitShim(Base):
 
     def test_the_shim_reads_no_token_and_prints_nothing_of_its_own(self):
         done, seen = self.run_git("push", env={"GH_TOKEN": "tok-secret"})
-        self.assertNotIn("tok-secret", " ".join(seen["argv"]) + done.stdout)
+        self.assertNotIn("tok-secret", " ".join(seen["argv"]) + done.stdout + done.stderr)
         self.assertEqual(done.stderr, "")
 
     def test_s5_the_fleet_coordination_skill_says_git_push_needs_no_manual_credential_route(self):
@@ -20312,8 +20312,8 @@ class TestGitStashGuard(Base):
                        "cd . && git stash", "git -C . stash push", "FOO=1 git stash", "exec git stash push", "bash -c 'git stash save'"):
             with self.subTest(script=script):
                 done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=self.env, cwd=self.repo, timeout=60)
-                self.assertNotEqual(done.returncode, 0, done.stdout)
-                self.assertIn("scratch branch", done.stdout)
+                self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertIn("scratch branch", done.stdout + done.stderr)
         self.assertEqual(self.stashed(), "")
 
     def test_autocorrect_and_a_moved_exec_path_cannot_turn_an_unknown_verb_into_stash(self):
@@ -23131,7 +23131,7 @@ class TestJudgeSocket(PolicyCase):
             if path.is_file():
                 everything += path.read_text(errors="replace")
         self.assertNotIn(CANARY, everything.replace("echo " + CANARY, ""), "only the command the caller itself sent may contain it")
-        self.assertNotIn(CANARY, done.stdout)
+        self.assertNotIn(CANARY, done.stdout + done.stderr)
 
     def test_the_cli_run_starts_the_socket_only_when_the_judge_is_enabled(self):
         self.server.stop()
@@ -29276,7 +29276,7 @@ class TestIdentityCheck(ReportBase):
         done, seen = self.run_gh_shim("acme-ops/service", users, {"acct-ops": "tok-ops", "acct-personal": "tok-personal"})
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(seen["token"], "tok-ops")                                  # the personal token inherited is NOT used
-        self.assertNotIn("tok-ops", done.stdout)                      # never printed
+        self.assertNotIn("tok-ops", done.stdout + done.stderr)                      # never printed
         self.assertNotIn("tok-ops", " ".join(seen["argv"]))                         # never in argv
         done, seen = self.run_gh_shim("acme/api", users, {"acct-ops": "tok-ops", "acct-personal": "tok-personal"})
         self.assertEqual(seen["token"], "tok-personal")                             # and the other direction: personal repo
@@ -29342,7 +29342,7 @@ class TestIdentityCheck(ReportBase):
         done, seen = self.run_gh_shim("acme-ops/service", users, {"acct-ops": "tok-ops"}, args=("auth", "git-credential", "get"))
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(seen["token"], "tok-ops", "the mapped account's token, not the inherited one")
-        self.assertNotIn("tok-ops", " ".join(seen["argv"]) + done.stdout)
+        self.assertNotIn("tok-ops", " ".join(seen["argv"]) + done.stdout + done.stderr)
         for label, tokens, extra in (("the token lookup fails", {}, {}), ("the identity lookup times out", {"acct-ops": "tok-ops"}, dict(wedge=True, seconds=0.3))):
             with self.subTest(label):
                 done, seen = self.run_gh_shim("acme-ops/service", users, tokens, args=("auth", "git-credential", "get"), **extra)
@@ -29368,7 +29368,7 @@ class TestIdentityCheck(ReportBase):
                 self.assertIn("--repo", done.stderr)
                 self.assertIn("never used", done.stderr)
                 self.assertIsNone(seen, "the real gh never ran: no credential was given to anything")
-                self.assertNotIn("tok-ops", done.stdout)
+                self.assertNotIn("tok-ops", done.stdout + done.stderr)
         done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=("auth", "git-credential", "get"), own=True)
         self.assertEqual((done.returncode, seen["token"]), (0, "tok-ops"), "a caller whose repo IS its own is served as before")
         done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=("auth", "git-credential", "get"))
@@ -29439,7 +29439,7 @@ class TestIdentityCheck(ReportBase):
                 self.assertIn("no GitHub account is mapped for", done.stderr)
                 self.assertIn("git cannot authenticate as a guess", done.stderr)
                 self.assertIsNone(seen, "the real gh (and so the inherited token) never ran")
-                self.assertNotIn("inherited-personal-token", done.stdout)
+                self.assertNotIn("inherited-personal-token", done.stdout + done.stderr)
         done, seen = self.run_gh_shim("acme-other/thing", users, {}, args=cred, extra_env={"FLEET_SWITCHBOARD_BIN": ""})
         self.assertEqual(done.returncode, 1, "no switchboard to name the repository")
         self.assertIn("no GitHub account is mapped for this shell (no switchboard", done.stderr)
@@ -68196,7 +68196,7 @@ class TestReviewLawsStarterSet(Base):
         script = REPO / "bin" / "check-public-names"
         done = subprocess.run([sys.executable, str(script), "--root", str(self.DIR)] + (["--names-file", names] if names else []),
                               capture_output=True, text=True)
-        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
     def test_install_copies_exactly_the_four_files_each_opening_with_the_extends_line_and_says_what_to_edit(self):
         target = self.home / "acme-widget"
