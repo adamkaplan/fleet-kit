@@ -1,0 +1,164 @@
+# The cloud hub (ask #1161): Deployment, Service and an empty registry Secret, all in the workers namespace, nothing cluster-wide.
+# Every object carries app.kubernetes.io/part-of=cloud-hub: remove all with
+#   kubectl -n cw delete deployment,service,secret -l app.kubernetes.io/part-of=cloud-hub
+# IMAGE_DIGEST is a placeholder: the operator replaces it with the settings' CW_CLOUD_IMAGE (name@sha256:...). No real digest is held here.
+# (JSON is valid YAML: the file is written as JSON documents so the offline test needs no YAML library.)
+---
+{
+  "apiVersion": "v1",
+  "kind": "Secret",
+  "metadata": {
+    "name": "cloud-hub-registry",
+    "namespace": "cw",
+    "labels": {
+      "app.kubernetes.io/part-of": "cloud-hub"
+    }
+  },
+  "type": "Opaque",
+  "stringData": {
+    "secrets.json": "{}",
+    "agents.json": "{}"
+  }
+}
+---
+{
+  "apiVersion": "v1",
+  "kind": "Service",
+  "metadata": {
+    "name": "cloud-hub",
+    "namespace": "cw",
+    "labels": {
+      "app.kubernetes.io/part-of": "cloud-hub"
+    }
+  },
+  "spec": {
+    "type": "ClusterIP",
+    "selector": {
+      "app": "cloud-hub"
+    },
+    "ports": [
+      {
+        "name": "https",
+        "port": 8443,
+        "targetPort": 8443
+      }
+    ]
+  }
+}
+---
+{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {
+    "name": "cloud-hub",
+    "namespace": "cw",
+    "labels": {
+      "app.kubernetes.io/part-of": "cloud-hub"
+    }
+  },
+  "spec": {
+    "replicas": 1,
+    "selector": {
+      "matchLabels": {
+        "app": "cloud-hub"
+      }
+    },
+    "template": {
+      "metadata": {
+        "labels": {
+          "app": "cloud-hub",
+          "app.kubernetes.io/part-of": "cloud-hub"
+        }
+      },
+      "spec": {
+        "automountServiceAccountToken": false,
+        "securityContext": {
+          "runAsNonRoot": true,
+          "runAsUser": 1000
+        },
+        "containers": [
+          {
+            "name": "hub",
+            "image": "IMAGE_DIGEST",
+            "command": [
+              "python3",
+              "/usr/local/share/cw/hub/cloud_hub.py"
+            ],
+            "env": [
+              {
+                "name": "FLEET_CLOUD_CHANNEL_LISTEN",
+                "value": "0.0.0.0:8443"
+              },
+              {
+                "name": "FLEET_CLOUD_CHANNEL_AUDIENCE",
+                "value": "cloud-hub"
+              },
+              {
+                "name": "FLEET_CLOUD_HUB_AGENTS",
+                "value": "/etc/hub/agents.json"
+              },
+              {
+                "name": "FLEET_CLOUD_HUB_SECRETS",
+                "value": "/etc/hub/secrets.json"
+              },
+              {
+                "name": "FLEET_CLOUD_HUB_DECISIONS",
+                "value": "/var/hub/decisions.json"
+              }
+            ],
+            "ports": [
+              {
+                "containerPort": 8443
+              }
+            ],
+            "readinessProbe": {
+              "tcpSocket": {
+                "port": 8443
+              },
+              "periodSeconds": 10
+            },
+            "resources": {
+              "requests": {
+                "memory": "128Mi"
+              },
+              "limits": {
+                "memory": "256Mi"
+              }
+            },
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ]
+              }
+            },
+            "volumeMounts": [
+              {
+                "name": "registry",
+                "mountPath": "/etc/hub",
+                "readOnly": true
+              },
+              {
+                "name": "state",
+                "mountPath": "/var/hub"
+              }
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "registry",
+            "secret": {
+              "secretName": "cloud-hub-registry"
+            }
+          },
+          {
+            "name": "state",
+            "emptyDir": {}
+          }
+        ]
+      }
+    }
+  }
+}

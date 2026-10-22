@@ -228,6 +228,19 @@ Its log: `cloud-reaper-stderr.log` in the switchboard state directory (journalct
 When the Mac sleeps, the reaper pauses. Workers keep their pod-side floor (the pod's own limit, the cap plus 300 s, PR #880 once it
 merges), so a sleeping Mac delays a stop but cannot leave a worker running past that floor.
 
+## 4c. The cloud hub (cloud/k8s/cloud-hub.yaml)
+
+Cause: the hub (the channel server) exists as code, but nothing started it in the cluster, and the launcher's per-pod registration writes to a registry Secret that did not exist. One file now defines, in the `cw` namespace only: Deployment `cloud-hub` (one replica), Service `cloud-hub` (ClusterIP, 8443) and Secret `cloud-hub-registry` (keys `secrets.json` and `agents.json`, each `{}`, mounted read-only at `/etc/hub`). Every object carries the label `app.kubernetes.io/part-of=cloud-hub`. The names live in `cloud/launcher/hub_registry.py` and a test compares them with the manifest.
+
+Before you apply: replace the placeholder `IMAGE_DIGEST` with the settings' `CW_CLOUD_IMAGE` (a `name@sha256:...` reference; the file holds no real digest). The hub files are not in the worker image yet, so the start command path in the Deployment is provisional and the pod may not run until an image that holds them is built; the manifest is what is reviewed and dry-run.
+
+- Check: `kubectl -n cw apply --dry-run=server -f cloud/k8s/cloud-hub.yaml`
+- Apply: `kubectl -n cw apply -f cloud/k8s/cloud-hub.yaml`
+- Smoke check: the hub has no unauthenticated health path (`GET /decisions` needs a token), so readiness is a TCP check on 8443. From a pod in `cw`, `nc -z cloud-hub 8443` must succeed.
+- Remove (and rollback): `kubectl -n cw delete deployment,service,secret -l app.kubernetes.io/part-of=cloud-hub`
+
+State: the decisions file is on an emptyDir at `/var/hub`; it is lost when the pod restarts. Applying again resets the registry Secret to empty objects. Tests (offline, no cluster): `python3 cloud/launcher/tests/test_cloud_hub_manifest.py`.
+
 ## 5. Known gaps
 
 - Stopping a worker by name alone: #682.

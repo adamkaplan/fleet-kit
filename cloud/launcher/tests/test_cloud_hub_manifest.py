@@ -1,0 +1,74 @@
+"""cloud/k8s/cloud-hub.yaml (ask #1161): offline parse, kind list, label on every object, empty Secret, shared names."""
+import json, os, sys, unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+import hub_registry as hr  # noqa: E402
+
+PATH = os.path.join(HERE, "..", "..", "k8s", "cloud-hub.yaml")
+KINDS = {"Deployment", "Service", "Secret"}
+
+
+def parse(text):
+    body = "\n".join(l for l in text.splitlines() if not l.startswith("#"))
+    return [json.loads(p) for p in body.split("---") if p.strip()]
+
+
+def kinds_bad(docs):
+    return [d.get("kind") for d in docs if d.get("kind") not in KINDS]
+
+
+class T(unittest.TestCase):
+    def setUp(self):
+        self.text = open(PATH).read()
+        self.docs = parse(self.text)
+
+    def test_kinds(self):
+        self.assertEqual(sorted(d["kind"] for d in self.docs), ["Deployment", "Secret", "Service"])
+        self.assertEqual(kinds_bad(self.docs), [])
+
+    def test_mutant_clusterrole_fails(self):
+        self.assertEqual(kinds_bad(self.docs + [{"kind": "ClusterRole"}]), ["ClusterRole"])
+
+    def test_label_and_namespace(self):
+        k, v = hr.HUB_LABEL
+        for d in self.docs:
+            self.assertEqual(d["metadata"]["labels"][k], v)
+            self.assertEqual(d["metadata"]["namespace"], "cw")
+
+    def test_secret_only_empty_objects(self):
+        s = [d for d in self.docs if d["kind"] == "Secret"][0]
+        self.assertEqual(s["metadata"]["name"], hr.HUB_REGISTRY_SECRET)
+        self.assertEqual(set(s["stringData"]), {hr.HUB_SECRETS_KEY, hr.HUB_AGENTS_KEY})
+        for v in s["stringData"].values():
+            self.assertEqual(json.loads(v), {})
+        self.assertNotIn("data", s)
+
+    def test_deployment_shape(self):
+        d = [x for x in self.docs if x["kind"] == "Deployment"][0]
+        sp = d["spec"]["template"]["spec"]
+        c = sp["containers"][0]
+        self.assertEqual(d["spec"]["replicas"], 1)
+        self.assertIs(sp["automountServiceAccountToken"], False)
+        self.assertTrue(sp["securityContext"]["runAsNonRoot"])
+        self.assertEqual(c["securityContext"]["capabilities"], {"drop": ["ALL"]})
+        self.assertIn("memory", c["resources"]["requests"])
+        self.assertIn("memory", c["resources"]["limits"])
+        self.assertEqual(c["image"], "IMAGE_DIGEST")
+        self.assertNotRegex(self.text, r"sha256:[0-9a-f]{64}")
+        env = {e["name"]: e["value"] for e in c["env"]}
+        self.assertEqual(env["FLEET_CLOUD_CHANNEL_LISTEN"], "0.0.0.0:8443")
+        self.assertEqual(env["FLEET_CLOUD_CHANNEL_AUDIENCE"], "cloud-hub")
+        self.assertEqual(env["FLEET_CLOUD_HUB_SECRETS"], "/etc/hub/" + hr.HUB_SECRETS_KEY)
+        self.assertEqual(env["FLEET_CLOUD_HUB_AGENTS"], "/etc/hub/" + hr.HUB_AGENTS_KEY)
+        self.assertTrue([m for m in c["volumeMounts"] if m["mountPath"] == "/etc/hub"][0]["readOnly"])
+        self.assertEqual(sp["volumes"][0]["secret"]["secretName"], hr.HUB_REGISTRY_SECRET)
+
+    def test_service(self):
+        s = [d for d in self.docs if d["kind"] == "Service"][0]
+        self.assertEqual(s["spec"]["type"], "ClusterIP")
+        self.assertEqual(s["spec"]["ports"][0]["port"], 8443)
+
+
+if __name__ == "__main__":
+    unittest.main()
