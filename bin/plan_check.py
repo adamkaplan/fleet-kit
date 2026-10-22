@@ -964,6 +964,8 @@ EXPLAIN = {
     "bad-size": ("a size starts with S, M, L or XL", "write for example `size: S (one file, tests)`"),
     "size-in-days": ("size is a T-shirt in AGENT time, never days of human work", "drop the days; say what makes it that size"),
     "declared-clauses-mismatch": ("a `clauses:` block must reproduce the ask's Done-when, never merge or drop clauses", "copy the clauses from the ask, in order; the message shows the first one that differs"),
+    "second-plan-comment": ("a plan is ONE canonical comment on the issue, edited in place", "move the revision into the canonical comment and add a receipt"),
+    "bad-receipt": ("a receipt is the marker line, `plan hash: sha256:<hash>` and two to four lines of reason, and carries no plan text", "cut the plan text; say what changed and why"),
     "done-when-differs": ("a plan that states its own Done-when must state the ask's", "copy the Done-when from the ask"),
     "evaluator-alias": ("`adam` is an old spelling of `owner`", "write `owner`"),
     "discriminates-overlap": ("`discriminates` reuses most words of `pass`: it should name a wrong build", "name what the wrong build does"),
