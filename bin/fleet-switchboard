@@ -352,6 +352,7 @@ DEFAULTS = {
     "disk_guard": None,            # free space of the state directory's volume: None = defaults (min_free_gb 50, hard_free_gb 10); false = off; or {"min_free_gb": n, "hard_free_gb": n}
     "reds": None,                  # `reds` (#342): {"reference_events": {"owner/repo": ["merge_group", "schedule"]}, "workflow": {"owner/repo": "ci.yml"}}: the events whose runs on the default branch are "main's runs" (default: push), and an optional override of the workflow (default: the one that holds the pull request's artifact)
     "heavy": None,                 # CPU slots for `heavy -- <command>` (full suites, e2e runs): None = 3 slots; or {"slots": n, "ceilings": {"full": s, "focused": s, "e2e": s, "other": s, "max": s}}
+    "no_multiplexer": False,       # true: discovery reads the registry and the headless and cloud records only; `agent_list` is never called and a missing herdr is no problem (off: unchanged)
     "docker_reaper": True,         # the daily removal of EXPIRED labelled docker containers, networks and volumes (`disk reap-docker`): false is the kill switch
     "v2_events": "auto",           # the daemon's news of sessions: "auto" (the service's event stream, where the HTTP route exists; reads only what an event did not say) or "off" (the old reads)
     "v2_plugin_events": "auto",    # the in-service plugin's pushed facts (#290 slice 6): "auto" (the daemon listens on its socket and marks the named session for one bounded read) or "off" (the session.list gate is the only signal)
@@ -632,6 +633,8 @@ def validate_config(raw, source="config"):
             raise ConfigError(str(err)) from None
         except Exception as err:   # a validator that fails any other way is a broken module, not a bad value: still the whole configuration, naming the file
             raise ConfigError("config module %s.py: its validator failed (%s: %s): no configuration is loaded" % (name, type(err).__name__, _one_line(str(err), 160))) from None
+    if not isinstance(config["no_multiplexer"], bool):
+        raise ConfigError("%s: 'no_multiplexer' must be true or false, got %r" % (source, config["no_multiplexer"]))
     if not isinstance(config["docker_reaper"], bool):
         raise ConfigError("%s: 'docker_reaper' must be true or false, got %r" % (source, config["docker_reaper"]))
     if config["v2_events"] not in ("auto", "off"):
@@ -4516,6 +4519,9 @@ class Switchboard:
     def _discover(self, now, entries=None):
         found = Discovery()
         self.discovery = found
+        if entries is None and (getattr(self, "config", None) or {}).get("no_multiplexer") is True:   # records only: no terminal multiplexer is asked, so its absence is no standing problem
+            self._discover_headless(found, now)
+            return found
         if entries is None:
             try:
                 entries = self.herdr.agent_list()
@@ -5052,7 +5058,7 @@ class Switchboard:
         """Write `unread` where it differs from what herdr's agent list shows."""
         shown = {entry.get("pane_id"): (entry.get("tokens") or {}).get("unread") for entry in discovery.entries}
         for name, observation in sorted(discovery.agents.items()):
-            if not observation.pane:
+            if not observation.pane or (getattr(self, "config", None) or {}).get("no_multiplexer") is True:   # no pane, or no multiplexer to write to: no badge, no error
                 continue
             try:
                 count = self.unread_count(observation, held)
@@ -5096,6 +5102,8 @@ class Switchboard:
         """At most one toast per pass (herdr allows one a second, and queues none),
         for the first agent whose reason has not been toasted yet. A reason
         that has cleared is forgotten, so it toasts again if it comes back."""
+        if (getattr(self, "config", None) or {}).get("no_multiplexer") is True:   # a toast is a multiplexer call and goes to no pane here: none is tried, none fails
+            return
         candidates = self.toast_candidates(discovery, held, now)
         self.toasted = {name: reason for name, reason in self.toasted.items()
                         if any(c[0] == name and c[1] == reason for c in candidates)}
@@ -7050,6 +7058,8 @@ def bell_migration(engine, registry, now):
     """#973, once: write the heartbeat's `bell` field for every recorded agent from the live tab labels (the opt-in the heartbeat used to read each pass),
     on a whole read only (agent list and tab list both answered); audited per agent; a marker file stops it from running, or reading herdr, again."""
     if registry.bell_migrated(engine.state_dir):
+        return
+    if (getattr(engine, "config", None) or {}).get("no_multiplexer") is True:   # no terminal multiplexer is asked: the migration stays pending
         return
     try:
         agents, tabs = engine.herdr.agent_list(), engine.herdr.tab_list()
