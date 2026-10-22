@@ -80622,7 +80622,7 @@ class TestShimTopSpender(Base):
     # Every environment name the shim reads, with a hostile value for it. DERIVED from the shim's own code (see `shim_environment_names`): a name the shim starts to read
     # and this table does not list fails the test below, so a new switch cannot appear unseen. SWITCH_OFF lists the names that can still make the caller wait less.
     HOSTILE = {"FLEET_REAL_GH": "/nonexistent/gh", "FLEET_SHIM_CACHE": "off", "FLEET_SHIM_GATE_SECONDS": "0.001", "FLEET_SHIM_LOOKUP_SECONDS": "0.001",
-               "FLEET_SWITCHBOARD_BIN": "OTHER", "FLEET_SWITCHBOARD_OWN_GH": "1", "FLEET_SWITCHBOARD_STATE": "EMPTY", "GH_HOST": "ghe.example", "GH_REPO": "other/repo",
+               "FLEET_SHIM_MERGE_GATE_SECONDS": "0.001", "FLEET_SWITCHBOARD_BIN": "OTHER", "FLEET_SWITCHBOARD_OWN_GH": "1", "FLEET_SWITCHBOARD_STATE": "EMPTY", "GH_HOST": "ghe.example", "GH_REPO": "other/repo",
                "PATH": "SAME", "XDG_CONFIG_HOME": "EMPTY", "XDG_STATE_HOME": "EMPTY", "HOME": "EMPTY"}
     SWITCH_OFF = frozenset()   # none: the block reads no variable; who the caller is comes from the switchboard's answer for its session (see the shim's comment)
 
@@ -81403,6 +81403,17 @@ class TestGhShimMergeGate(Base):
         done, seen = self.run_shim(*self.MERGE, env=dict(self.allowed(), FAKE_MG_SLEEP="5", FLEET_SHIM_MERGE_GATE_SECONDS="1"))
         self.assertEqual((done.returncode, seen), (10, None))
         self.assertIn("did not answer in time", done.stderr)
+
+    def test_the_merge_gate_wait_variable_never_makes_a_merge_allowed_whatever_it_is_set_to(self):
+        for value in ("0", "-5", "0.001", "nan", "garbage", "", "1e9", "inf"):
+            with self.subTest(value=value, gate="refuses"):   # a gate that refuses refuses, however long or short the wait
+                done, seen = self.run_shim(*self.MERGE, env={"FAKE_MG_EXIT": "10", "FAKE_MG_JSON": '{"allowed": false, "reason": "no gate pass"}', "FLEET_SHIM_MERGE_GATE_SECONDS": value})
+                self.assertEqual((done.returncode, seen), (10, None))
+        for value in ("0", "-5", "0.001", "nan"):
+            with self.subTest(value=value, gate="slow"):   # a wait that clamps to the one-second floor expires before a slow gate answers: refused, the real gh never runs
+                done, seen = self.run_shim(*self.MERGE, env=dict(self.allowed(), FAKE_MG_SLEEP="4", FLEET_SHIM_MERGE_GATE_SECONDS=value))
+                self.assertEqual((done.returncode, seen), (10, None))
+                self.assertIn("did not answer in time", done.stderr)
 
     def test_a_repository_that_is_not_listed_and_a_command_that_is_not_a_merge_are_not_asked(self):
         done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/other", "--squash")
