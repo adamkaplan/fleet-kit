@@ -3341,6 +3341,34 @@ class TestSteerToWorking(Base):
         self.assertIn("only partly read", err)
         self.assertEqual(self.posts, [])
 
+    def known_endpoint_half_send(self):
+        registry = sb.load_module("registry")
+        real = registry.read
+        # a real torn registry.json reads whole False with no agents; this synthetic half read still carries the recipient's endpoint row
+        with mock.patch.object(registry, "read", lambda d: dict(real(d), whole=False)):
+            return self.cli_send("ping", to="cloudy")
+
+    def test_a_known_endpoint_row_on_a_half_read_is_refused_with_a_named_reason_and_nothing_is_sent(self):
+        self.endpoint_world()
+        code, _, err = self.known_endpoint_half_send()
+        self.assertEqual(code, sb.EXIT_HELD)
+        self.assertIn("not sent", err)
+        self.assertIn("only partly read", err)
+        self.assertEqual(self.posts, [])
+        self.assertEqual(self.world.admissions("platform"), [])
+
+    def test_the_mutant_that_always_falls_through_on_a_half_read_fails_the_known_endpoint_test(self):
+        self.endpoint_world()
+        es = sb.load_module("endpoint_send")
+        real_route = es.route
+
+        def mutant(registry, state_dir, name):
+            found = real_route(registry, state_dir, name)
+            return found[:2] + (False,) if found[0] == "half" else found
+        with mock.patch.object(es, "route", mutant):
+            code, _, err = self.known_endpoint_half_send()
+        self.assertNotEqual((code, "only partly read" in err), (sb.EXIT_HELD, True))   # the mutant no longer refuses: the test above would fail on it
+
     def test_a_redirect_is_refused_and_the_second_port_gets_no_request(self):
         import threading, http.server
         es, client = sb.load_module("endpoint_send"), sb.load_module("cloud_client")
