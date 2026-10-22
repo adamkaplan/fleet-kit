@@ -10,7 +10,8 @@ One document to set up, run and take down the cloud hub and the pod-side command
   - `POST /message`: JSON body `{"sender", "recipient", "key", "text"}` with `Authorization: Bearer <token>`.
   - `GET /decisions`: serves the JSON object from the file named by `FLEET_CLOUD_HUB_DECISIONS`
     (`{"decisions": [], "errors": []}` if the file is absent), behind the same token check.
-  - Any other path is 404; other methods on `/message` are 405.
+  - POST to a path other than /message and GET to a path other than /decisions answer 404. PUT, DELETE and PATCH answer 405 on
+    any path. GET /message answers 404. HEAD and OPTIONS are not handled (501).
 - **The pod command** (`bin/cloud_cli.py`) runs in an agent pod and sends through the channel (via `bin/cloud_client.py`):
   - `cloud_cli.py send RECIPIENT TEXT...`
   - `cloud_cli.py report KIND TEXT...`, where KIND is one of `done failed blocked question working paused withdrawn`.
@@ -38,9 +39,8 @@ Audit lines go to stdout as JSON lines `{"ts", "line"}`; no token is logged.
 
 Default (no `FLEET_CLOUD_HUB_SECRETS`): the hub posts the bearer token to the in-cluster TokenReview API
 (`https://kubernetes.default.svc/apis/authentication.k8s.io/v1/tokenreviews`) using its own service account token and CA from
-`/var/run/secrets/kubernetes.io/serviceaccount`. The token must be authenticated, carry the channel audience
-(`fleet-switchboard`) and belong to a ServiceAccount in the namespace `fleet-agents`; the ServiceAccount name is the agent name
-(lowercase letters, digits, `-`, at most 63 characters). If the cluster cannot be asked the answer is 503: nothing is let through.
+`/var/run/secrets/kubernetes.io/serviceaccount`. The token must be authenticated and belong to a ServiceAccount in the namespace `fleet-agents`; the ServiceAccount name is the agent name
+(lowercase letters, digits, `-`, at most 63 characters). The token must carry the channel audience. By default that is `fleet-switchboard`. If `FLEET_CLOUD_CHANNEL_AUDIENCE` is set, the hub asks the cluster for that audience instead. If the cluster cannot be asked the answer is 503: nothing is let through.
 
 Reserved names (`captain`, `switchboard`, `fleet-switchboard`, `hub`, `admin`) are refused as sender or recipient (403), and a
 token that proves a reserved name is refused. Service accounts in the agents' namespace are trusted as agents, so keep reserved
@@ -121,8 +121,7 @@ It prints one line (`sent to <recipient>` or `reported <kind> to <boss>`, or the
 | 1 | Refused or unavailable: the channel answered an error, or no token file, or retries ran out. |
 | 2 | Bad usage or missing environment: wrong arguments, empty text, text over the limit, bad KIND, `FLEET_AGENT_NAME`, `FLEET_BOSS` or `FLEET_CLOUD_CHANNEL_URL` missing or invalid. |
 
-The command makes one key per message and reuses it on up to 3 tries (at most 5 are possible by the client's cap), retrying only on
-a transport failure or a 5xx, with backoff of 0.5 s doubling. Each request has a 10 second timeout. A 4xx is returned at once.
+The command makes up to 3 tries with one key. It retries only on a transport failure or a 5xx, with a backoff of 0.5 s doubling, and a 4xx is returned at once. Each request has a 10 second timeout.
 
 ## Delivery framing and dedupe limits
 
@@ -134,19 +133,22 @@ a transport failure or a 5xx, with backoff of 0.5 s doubling. Each request has a
   with no reply body).
 - Dedupe: the key is scoped to the verified sender and recipient. A repeat answers 200 with `"duplicate": true` and is not
   delivered again. If delivery fails, the key is forgotten so a retry delivers.
-- The remembered keys are held in memory only, at most 10000 pairs, the oldest forgotten first. A hub restart forgets all of them, so
+- The remembered keys are held in memory only, at most 10000 pairs, the least recently seen key is forgotten first (a repeat refreshes a key). A hub restart forgets all of them, so
   a duplicate is possible after a restart (and after a key ages out of the 10000).
 
 ## Network boundary
 
-The hub speaks plain http; there is no TLS in the listener. The boundary is the cluster network: run the hub and the agent pods
-in one namespace and admit only agent pods to the hub's port (the code names a NetworkPolicy as the intended control; it does
-not create one). The bearer token and message text cross that network unencrypted. The hub does not check the source of a
-request beyond the token.
+The hub speaks plain http; there is no TLS in the listener. The intended deployment is the hub and the agent pods in one
+namespace, with a NetworkPolicy admitting only agent pods to the hub port. The code does not require or enforce this. The bearer
+token and message text cross that network unencrypted. The hub does not check the source of a request beyond the token.
+
+What the code does accept as an agent (`bin/cloud_channel.py`): a token whose username is `system:serviceaccount:<namespace>:<name>`
+(prefix `system:serviceaccount:`) with the namespace exactly `fleet-agents` (the `NAMESPACE` constant) and a name that is a valid
+agent name. Any ServiceAccount in that namespace is accepted, wherever the request comes from; any other namespace is refused.
 
 ## Take down
 
 The code has no shutdown command or signal handler. Stop the hub by stopping its process (for example the pod or container
-running it); it holds no state on disk, so the remembered dedupe keys are lost (see above). The pod command is one-shot and
+running it); it holds no state on disk, so the remembered dedupe keys are lost (see above; the least recently seen key is forgotten first, a repeat refreshes a key). The pod command is one-shot and
 needs nothing to take down. To stop one agent receiving, remove its entry from `agents.json` (read at each message: new
 messages get 404). To cut one agent off in secrets mode, remove its entry from `secrets.json` (read at each request).
