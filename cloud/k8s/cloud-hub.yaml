@@ -115,7 +115,11 @@
         "automountServiceAccountToken": false,
         "securityContext": {
           "runAsNonRoot": true,
-          "runAsUser": 1000
+          "runAsUser": 1000,
+          "fsGroup": 1000,
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
         },
         "containers": [
           {
@@ -156,9 +160,11 @@
             },
             "resources": {
               "requests": {
+                "cpu": "100m",
                 "memory": "128Mi"
               },
               "limits": {
+                "cpu": "500m",
                 "memory": "256Mi"
               }
             },
@@ -197,13 +203,15 @@
           {
             "name": "registry",
             "secret": {
-              "secretName": "cloud-hub-registry"
+              "secretName": "cloud-hub-registry",
+              "defaultMode": 288
             }
           },
           {
             "name": "pw",
             "secret": {
-              "secretName": "cloud-hub-pw"
+              "secretName": "cloud-hub-pw",
+              "defaultMode": 288
             }
           },
           {

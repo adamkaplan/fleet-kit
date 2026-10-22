@@ -66,6 +66,15 @@ class T(unittest.TestCase):
         self.assertIs(c["securityContext"]["readOnlyRootFilesystem"], True)
         self.assertIs(c["securityContext"]["allowPrivilegeEscalation"], False)
         self.assertIsInstance(sp["securityContext"]["runAsUser"], int)
+        self.assertEqual(sp["securityContext"]["seccompProfile"]["type"], "RuntimeDefault")
+        self.assertIn("cpu", c["resources"]["requests"])
+        self.assertIn("cpu", c["resources"]["limits"])
+        self.assertEqual(sp["securityContext"]["fsGroup"], sp["securityContext"]["runAsUser"])
+        for v in sp["volumes"]:
+            if "secret" in v:
+                m = v["secret"]["defaultMode"]
+                self.assertEqual(m & 0o007, 0)
+                self.assertTrue(m & 0o040)
         self.assertEqual(c["readinessProbe"]["tcpSocket"]["port"], 8443)
         mounts = {m["mountPath"]: m for m in c["volumeMounts"]}
         self.assertTrue(mounts["/etc/hub/pw"]["readOnly"])
