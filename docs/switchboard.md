@@ -4773,6 +4773,32 @@ A rating counts by score only with the agent's block (#901). `review record --bl
 
 The rating's inputs are immune to the shared parser: `main` captures the raw command line before any registrar runs, and `review record` reads its six rating inputs (`--impact-severity`, `--impact-probability`, `--impact-reason`, `--impact-action`, `--impact-class`, `--block`) only through `rating_inputs`, a private parser over that raw line (no abbreviation, no default, nothing shared). `main` also checks that the functions of the rating path (`RATING_PATH_FUNCTIONS`) are the same objects after the registrars ran, and refuses to record if not. A registrar's `set_defaults`, a replaced subparser, a same-dest argument or a wrapper on the namespace changes nothing in the recorded rating. The honest limit: no shape makes the rating immune to arbitrary Python that runs while the parser is built (a registrar that patches `argparse` or the ledger module); the closure is a mechanical backstop for ordinary edits, not a sandbox, and the independent reviewer rates a change that touches the rating path.
 
+#### Two independent runs for a clear by score (#972)
+
+##### The cause
+
+The reviewer-impact agent rated the same change at two heads of one pull request, with only tests added between them, and the two ratings fell in different cells (synthetic shapes, same lengths):
+
+```text
+head: 1111111aaaa
+impact-severity: Moderate
+impact-probability: Possible
+cell: Medium
+```
+
+```text
+head: 2222222bbbb
+impact-severity: Major
+impact-probability: Likely
+cell: Serious
+```
+
+The rater's cell is a sample, not a measurement: a clear that rests on one run depends on a draw, and which draw came decided whether the pull request cleared or went to the owner.
+
+##### The rule
+
+A clear by score needs two independent impact ratings at the head, from two different rater sessions, each carrying the agent's own block; the reason of the clear names both runs, each as `<record id or rater>=<cell>`. The score stays the highest counted record at the head: the lower run corroborates and never lowers or blocks it. "Counted" is the block rule above and nothing new; "different sessions" is two different recorded identities (`by`), never a typed name. A run is one draw, so two runs are independent only when BOTH their block hashes differ AND their recorded names differ once stripped of spaces and lower-cased (`rev`, `REV` and ` rev ` are one session, and one block recorded under two names is one run); a record with no ledger id is not counted as a run. The reason check refuses unless it is given exactly two such runs, and when the reason names a run twice every `name=cell` for it must carry the record's cell. A refusal says in one line how many counted ratings or sessions were found and what is missing, and changes nothing. The run is named by its ledger id or its rater name, for example `#41=Serious, rater-b=Medium`; a wrong cell is refused. The audit line of the clear (`gate.hold_cleared`) carries both runs as `runs` (id, rater, cell). It applies only to an order with a `max_level`; the owner's own clear needs no second run. A push voids both runs (they are per head), so a pull request that moves needs two new runs: slower, intended.
+
 #### Where it lives
 
 - `bin/delegated_clear.py` holds the judgement: the score block (`score_block`), the order-line hash and file match (`line_hash`, `file_order_line`, `entry_of`), the decision (`judge`) and the validation and refusals. It holds no path, class or rule name of its own.
