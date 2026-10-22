@@ -36703,6 +36703,35 @@ class TestAgentBlockCounts(TestBlockTable):
             with self.assertRaises(AssertionError):
                 self.check_refusals()
 
+    def verdict_lines(self, out):
+        return [l for l in out.splitlines() if "rating considered:" not in l]
+
+    def test_u1_agreeing_ratings_keep_the_floor_verdict(self):
+        # the verdict part of the output is the same for a block-file record and for the same rating recorded with --block (the older, unchanged path)
+        self.assertEqual(self.record_file()[0], 0)
+        code, out1, err = self.run_as("coder", "impact", "floor", self.PR)
+        self.assertEqual(code, 0, err)
+        self.assertIn("agrees", "".join(l for l in out1.splitlines() if "rating considered:" in l))
+        self.assertEqual(self.verdict_lines(out1), self.verdict_lines(self.run_as("coder", "impact", "floor", self.PR)[1]))
+        self.assertEqual([l for l in self.verdict_lines(out1) if "differs first" in l], [])
+
+    def test_u2_the_old_form_still_records(self):
+        before = len(self.records())
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-action", "none",
+                                     "--impact-severity", "Marginal", "--impact-probability", "Remote")
+        self.assertEqual(code, 0, err)
+        entry = self.records()[-1]
+        self.assertEqual(len(self.records()), before + 1)
+        self.assertEqual([entry[k] for k in ("impact_severity", "impact_probability", "impact_action")], ["Marginal", "Remote", "none"])
+        self.assertEqual(entry["block_sha256"], "none")
+
+    def test_u3_a_refusal_writes_no_row_and_no_audit_line(self):
+        before = self.ledger()
+        for name, argv in self.refusals():
+            code, out, err = self.run_as("coder", *argv)
+            self.assertNotEqual(code, 0, name)
+        self.assertEqual(self.ledger(), before)
+
     def test_the_shapes_table_covers_the_record_shapes_of_the_code(self):
         self.assertEqual(sorted(shape for shape, _, _ in self.SHAPES.values()), sorted(["block", "other-head", "malformed", "flags", "disagree", "no-score", "old"]))
         self.assertEqual(len(self.SHAPES), 7)
