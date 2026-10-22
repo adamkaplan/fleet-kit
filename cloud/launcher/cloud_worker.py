@@ -34,8 +34,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run_record  # noqa: E402  (the run record: one module, one function the stop calls)
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")  # the switchboard's agent name rule
-SHAPES = {"S": {"cpu": "2", "memory": "4Gi", "usd_per_hour": 0.10},
-          "M": {"cpu": "4", "memory": "8Gi", "usd_per_hour": 0.20}}  # list-price estimates, not billed figures
+SHAPES = {"XS": {"cpu": "1", "memory": "2Gi", "usd_per_hour": 0.05, "stack": False},   # the light shape: no nested Docker (the default of a non-stack worker)
+          "S": {"cpu": "2", "memory": "4Gi", "usd_per_hour": 0.10, "stack": True},
+          "M": {"cpu": "4", "memory": "8Gi", "usd_per_hour": 0.20, "stack": True}}  # list-price estimates, not billed figures
+DEFAULT_SHAPE = "XS"        # a create that names no shape and is not a stack launch (S, M by name only)
+DEFAULT_STACK_SHAPE = "S"   # a stack launch that names no shape (its row must carry stack: true)
 MAX_TOKEN_SECONDS = 3600
 
 # The git token a worker pushes with is a one-hour installation token (app_token.py caps it at 61 minutes). The launcher mints it once and
@@ -944,6 +947,16 @@ def pod_deadline_floor(max_hard):
     return parse_duration(max_hard or DEFAULT_MAX_HARD) + POD_DEADLINE_GRACE_SECONDS
 
 
+def check_shape(a):
+    """Set a.shape when it names none (XS, or S for a stack launch) and refuse an unknown name, or a row that cannot run a stack, with --stack."""
+    if getattr(a, "shape", None) is None:
+        a.shape = DEFAULT_STACK_SHAPE if getattr(a, "stack", False) else DEFAULT_SHAPE
+    if a.shape not in SHAPES:
+        raise CloudError("shape must be one of %s" % ", ".join(SHAPES), EXIT_USAGE)
+    if getattr(a, "stack", False) and not SHAPES[a.shape]["stack"]:
+        raise CloudError("--stack needs a shape that can run a nested Docker stack (%s), not %s" % (", ".join(k for k, v in SHAPES.items() if v["stack"]), a.shape), EXIT_USAGE)
+
+
 def render_pod(a, worker, name, now, hard, env, run_names=()):
     image = a.image or env.get("CW_CLOUD_IMAGE")
     if not image:
@@ -1076,8 +1089,7 @@ class Launcher:
             check_repo_allowed(a.repo, self.env)  # before anything is read or made
             if not NAME_RE.match(worker):
                 raise CloudError("bad worker name %r" % worker, EXIT_USAGE)
-            if a.shape not in SHAPES:
-                raise CloudError("shape must be S or M", EXIT_USAGE)
+            check_shape(a)   # resolves an unnamed shape; before any cluster, vault or token call
             now = self.clock()
             hard = now + dt.timedelta(seconds=parse_duration(a.hard))
             max_hard = now + dt.timedelta(seconds=parse_duration(a.max_hard))
@@ -2053,7 +2065,7 @@ def build_parser():
     c.add_argument("--idle", default="10m")
     c.add_argument("--hard", default="2h")
     c.add_argument("--max-hard", default=DEFAULT_MAX_HARD)
-    c.add_argument("--shape", default="S")
+    c.add_argument("--shape", default=None, help="the pod shape, one of %s; unset: %s (%s with --stack)" % (", ".join(SHAPES), DEFAULT_SHAPE, DEFAULT_STACK_SHAPE))
     c.add_argument("--image")
     c.add_argument("--stack", action="store_true",
                    help="a pod for a worker that runs a nested Docker stack: the Sysbox runtime class, its own user namespace, the pool's node label; off by default (the default pod is unchanged)")

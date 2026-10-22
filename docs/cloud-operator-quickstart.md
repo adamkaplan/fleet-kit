@@ -191,9 +191,17 @@ fleet-switchboard retire coder7
 
 `retire` stops the worker: the end hook pushes its work and the pod and its Secrets are deleted.
 
+### The light shape (`XS`) and the other shapes
+
+A worker started with no `--shape` and no `--stack` gets `XS`, the light shape and the default: 1 CPU and 2 GiB (requests equal limits, no nested Docker). Seven of them are meant to fit on one 8-CPU node (a live check reads the node's requested CPU back; if the system pods ask for more, the number is six and this section says so). `S` (2 CPU, 4 GiB), `M` (4 CPU, 8 GiB) are chosen only by name: `--shape S`.
+
+- Belongs in `XS`: a reader (code reading and review), a planner, a tester running short tests, a small edit and commit.
+- Does not belong in `XS`: a nested Docker stack (`--stack` refuses `XS`), an image build, a long full test suite or a build with a large memory peak: name `--shape S` or `M` for those.
+- A pod killed for memory is fixed afterwards: raise the shape for that work with `--shape S`.
+
 ### A worker with a nested Docker stack
 
-Add `--stack` (and, if you want, `--shape S|M`) to the same command for a worker that runs a Docker Compose stack inside its pod:
+Add `--stack` (and, if you want, `--shape S|M`; XS cannot run a stack) to the same command for a worker that runs a Docker Compose stack inside its pod:
 
 ```text
 fleet-switchboard launch coder7 --cloud --stack --agent coder --repo acme-org/widget-service --branch main \
@@ -202,9 +210,9 @@ fleet-switchboard launch coder7 --cloud --stack --agent coder --repo acme-org/wi
 
 - `--stack` is handed to the launcher's `create` and only then: a launch without it builds exactly the pod it always did.
 - The pod runs on the Sysbox runtime class (`sysbox-runc`) in its own user namespace, as a non-root user. No capability is added, it is never privileged, and it has no host path, Docker socket or service-account token.
-- `--shape` is `S` (2 CPU, 4 GiB) or `M` (4 CPU, 8 GiB). Leave it out for the launcher's own default, `S` (4 GiB): the measured stack lane peaked at 0.8 to 1.35 GiB. The memory limit stays; the pod is never unlimited.
+- With `--stack`, `--shape` is `S` (2 CPU, 4 GiB) or `M` (4 CPU, 8 GiB). Leave it out for `S` (4 GiB): the measured stack lane peaked at 0.8 to 1.35 GiB. The memory limit stays; the pod is never unlimited.
 - The first pod on a fresh node may wait for the node's runtime to be ready (a short delay, a few minutes at most); the launcher notices that case and creates the pod again, up to 3 attempts. You do not retry it.
-- `--stack` needs `--cloud`, and an unknown `--shape` is refused with `--stack`. `--stack` without `--cloud` is refused first of all; an unknown shape is refused right after the allow-list check (step 1 of section 2). Both exit 2 before any token is minted or any cluster call is made, and the order of section 2 is unchanged. `--shape` without `--stack` is passed to the launcher as before.
+- `--stack` needs `--cloud`, and an unknown `--shape`, and `XS`, are refused with `--stack`. `--stack` without `--cloud` is refused first of all; an unknown shape is refused right after the allow-list check (step 1 of section 2). Both exit 2 before any token is minted or any cluster call is made, and the order of section 2 is unchanged. `--shape` without `--stack` is passed to the launcher as before.
 
 ## 4. What a worker can and cannot do
 
