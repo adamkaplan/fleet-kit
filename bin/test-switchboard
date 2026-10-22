@@ -61,6 +61,8 @@ from unittest import mock
 
 BIN = Path(__file__).resolve().parent
 REPO = BIN.parent
+os.environ["GIT_TERMINAL_PROMPT"] = "0"   # #1050: a test's git never opens a credential dialog
+os.environ["GCM_INTERACTIVE"] = "never"
 
 
 def with_http_head(serve, argv, kwargs, counters=None):
@@ -4219,7 +4221,7 @@ class TestLaunch(StandInPids, Base):
         self.assertEqual(params["workspace_id"], "w1")
         self.assertEqual(params["root"]["command"], [FAKE_OPENCODE, "-s", done["session"]])
         self.assertEqual(params["root"]["env"], {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1",
-                                                     "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": ""})  # PR 18: who this pane is; the switchboard's own-gh marker is blanked
+                                                     "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": "", **sb.NO_CREDENTIAL_DIALOG_ENV})  # PR 18: who this pane is; the switchboard's own-gh marker is blanked
         self.assertEqual(done["pane"], "w1:p%d" % self.world.herdr._pane_n)
         brief = [m for m in session["messages"] if m["type"] == "user"]
         self.assertEqual([(m["text"], m["metadata"]) for m in brief],
@@ -4292,7 +4294,7 @@ class TestLaunch(StandInPids, Base):
         self.launch()
         env = dict(self.world.herdr.socket_calls[0][1]["root"]["env"])
         del env["FLEET_AGENT_TMPDIR"]
-        self.assertEqual(env, {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1", "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": ""})
+        self.assertEqual(env, {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1", "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": "", **sb.NO_CREDENTIAL_DIALOG_ENV})
 
     def test_retire_removes_an_empty_private_directory_and_keeps_one_with_files(self):
         root = self.wrapper_world()
@@ -4443,7 +4445,7 @@ class TestLaunch(StandInPids, Base):
                                    ("v2.session.prompt", "intent"), ("v2.session.prompt", "result")])
         layout = [e for e in self.world.audit() if e["event"] == "herdr.layout.apply"]
         self.assertEqual(layout[0]["detail"]["env_names"],
-                         ["FLEET_SWITCHBOARD_LAB_PANE", "FLEET_SWITCHBOARD_ROLE", "XDG_CONFIG_HOME"])
+                         ["FLEET_SWITCHBOARD_LAB_PANE", "FLEET_SWITCHBOARD_ROLE"] + sorted(sb.NO_CREDENTIAL_DIALOG_ENV) + ["XDG_CONFIG_HOME"])
         self.assertNotIn("/lab/config", json.dumps(layout))  # names, never values
         self.assertEqual(layout[1]["detail"]["pane"], self.world.herdr.panes and layout[1]["detail"]["pane"])
 
@@ -6486,7 +6488,7 @@ class TestLaunch(StandInPids, Base):
         self.assertEqual((method, params["root"]["command"], params["root"]["cwd"]),
                          ("layout.apply", [FAKE_OPENCODE, "-s", session], self.world.v2.sessions[session]["directory"]))
         self.assertEqual(params["root"]["env"], {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1",
-                                                 "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": ""})
+                                                 "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": "", **sb.NO_CREDENTIAL_DIALOG_ENV})
         found = self.engine.discover(self.world.clock.now()).agents["platform"]
         self.assertEqual((found.session_id, found.pane), (session, done["pane"]))
         self.assertEqual(self.world.herdr.typing_attempts, [])
@@ -20170,7 +20172,7 @@ class TestGitShim(Base):
         fake = self.bin / "git"
         fake.write_text("#!/usr/bin/env python3\nimport json,os,sys\n"
                         "open(%r,'a').write('x')\n"
-                        "json.dump({'argv': sys.argv[1:], 'stdin': None if sys.stdin.isatty() else sys.stdin.read(), 'token_env': os.environ.get('GH_TOKEN')}, open(%r,'w'))\n"
+                        "json.dump({'argv': sys.argv[1:], 'stdin': None if sys.stdin.isatty() else sys.stdin.read(), 'token_env': os.environ.get('GH_TOKEN'), 'env': {k: os.environ.get(k) for k in ('GIT_TERMINAL_PROMPT', 'GCM_INTERACTIVE')}}, open(%r,'w'))\n"
                         "print('real git out'); sys.exit(int(os.environ.get('FAKE_GIT_EXIT','0')))\n" % (str(self.starts), str(self.log)))
         fake.chmod(0o755)
         self.write_users({"acme/*": "acct-acme"})
@@ -20188,6 +20190,12 @@ class TestGitShim(Base):
                 p.unlink()
         done = subprocess.run([sys.executable, str(GIT_SHIM)] + list(args), input=stdin, capture_output=True, text=True, env=environ, timeout=60)
         seen = json.loads(self.log.read_text()) if self.log.exists() else None
+        if seen is not None:   # #1050: every call carries the no-dialog pair; the older tests below read the arguments without it (the new tests read `no_dialog_env` and check the pair)
+            argv = seen["argv"]
+            pair = [i for i in range(len(argv) - 1) if argv[i] == "-c" and argv[i + 1] == "credential.interactive=false"]
+            self.assertTrue(pair, "no -c credential.interactive=false in %r" % (argv,))
+            seen["argv_with_pair"] = list(argv)
+            del argv[pair[0]:pair[0] + 2]
         return done, seen
 
     def routed(self, *globals_, verb, rest=()):
@@ -20327,6 +20335,220 @@ class TestGitShim(Base):
         pattern = re.compile("|".join(["jan" + "us", "sp" + "ire", "adk" + "aplan", "/Us" + "ers/"]), re.IGNORECASE)
         for number, line in enumerate(text.splitlines(), 1):
             self.assertIsNone(pattern.search(line), "%d: %s" % (number, line))
+
+
+    # ---- #1050 (in TestGitShim, which owns the fake real git and run_git)
+    """#1050: no git call of the fleet may open a credential dialog. S2 (the shim's environment and argument on every verb and host), S3 (launch environments), S4 (heavy and
+    test setup), S5 (a real git, a recording fake helper, three mutants of the shim), S6 (docs), S7 (nothing writes the global git configuration)."""
+
+    NO = "credential.interactive=false"
+    VERBS = (("push", ["origin", "b"]), ("fetch", ["--all"]), ("pull", ["--ff-only"]), ("clone", ["URL", "x"]), ("ls-remote", ["URL"]), ("remote", ["update"]),
+             ("status", ["-sb"]), ("log", ["-1"]), ("commit", ["-m", "x"]), ("config", ["a.b"]))
+    HOSTS = ("https://github.com/acme/api.git", "https://git.example.test/acme/api.git")
+
+    def test_s2_every_verb_for_the_code_host_and_another_host_carries_all_three_settings(self):
+        count = 0
+        for host in self.HOSTS:
+            for verb, rest in self.VERBS:
+                with self.subTest(host=host, verb=verb):
+                    done, seen = self.run_git(verb, *[host if a == "URL" else a for a in rest])
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                    self.assertEqual(seen["env"], {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"})
+                    self.assertEqual(seen["argv_with_pair"].count(self.NO), 1)
+                    self.assertLess(seen["argv_with_pair"].index(self.NO), seen["argv_with_pair"].index(verb), "the setting is a global option, before the verb")
+                    count += 1
+        self.assertEqual(count, len(self.HOSTS) * len(self.VERBS))
+
+    def test_s2_a_callers_interactive_true_is_overridden_and_another_credential_setting_stays(self):
+        done, seen = self.run_git("-c", "credential.interactive=true", "-c", "credential.helper=store", "-c", "GCM_INTERACTIVE=always", "fetch")
+        argv = seen["argv_with_pair"]
+        self.assertGreater(argv.index(self.NO), argv.index("credential.interactive=true"), "ours comes last, so it wins")
+        self.assertIn("credential.helper=store", argv)
+        done, seen = self.run_git("-c", "credential.interactive=true", "status", env={"GIT_TERMINAL_PROMPT": "1", "GCM_INTERACTIVE": "always"})
+        self.assertEqual(seen["env"], {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}, "a caller's environment cannot turn them back on")
+
+    def test_s3_the_launch_environments_hold_both_variables(self):
+        both = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
+        env = sb.launch_base_env({"opencode_env": {"GIT_TERMINAL_PROMPT": "1", "X": "1"}, "launch_env": {"GCM_INTERACTIVE": "always"}})   # a terminal launch and a reattach
+        self.assertEqual({k: env[k] for k in both}, both)
+        self.assertEqual(env["X"], "1")
+        seen = {}
+
+        def runner(argv, **kwargs):
+            seen["env"] = kwargs["env"]
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        sb.V2Client("/opt/lab/bin/opencode", {"GIT_TERMINAL_PROMPT": "1"}, runner, 7).server_info()   # the service client (a headless worker's tools)
+        self.assertEqual({k: seen["env"][k] for k in both}, both)
+        entry = (REPO / "cloud" / "worker" / "entrypoint.sh").read_text()
+        self.assertRegex(entry, r"(?m)^GIT_TERMINAL_PROMPT=0; export GIT_TERMINAL_PROMPT$")   # the pod's entrypoint, before it runs the command
+        self.assertRegex(entry, r"(?m)^GCM_INTERACTIVE=never; export GCM_INTERACTIVE$")
+        self.assertLess(entry.index("export GCM_INTERACTIVE"), entry.index('exec "$@"'))
+
+    def test_s4_the_heavy_wrapper_and_the_test_setup_set_both_variables(self):
+        out = self.home / "heavy-env"
+        hs = sb.load_heavy_slots()
+        code = hs.run([sys.executable, "-c", "import os,sys;open(sys.argv[1],'w').write(os.environ.get('GIT_TERMINAL_PROMPT','')+' '+os.environ.get('GCM_INTERACTIVE',''))", str(out)],
+                      str(self.home / "heavy-state"), environ={"PATH": os.environ["PATH"], "FLEET_HEAVY": "off", "GIT_TERMINAL_PROMPT": "1"}, out=io.StringIO())
+        self.assertEqual((code, out.read_text()), (0, "0 never"))
+        self.assertEqual((os.environ["GIT_TERMINAL_PROMPT"], os.environ["GCM_INTERACTIVE"]), ("0", "never"), "this suite's own setup")
+
+    def test_s4_no_test_runs_real_git_against_a_local_server_without_a_private_home(self):
+        offenders = []
+        for path in sorted(BIN.glob("test-*")) + sorted((REPO / "cloud").rglob("test*.py")):
+            text = path.read_text(errors="replace")
+            local = re.search(r"git[^\n]{0,80}(?:ls-remote|clone|fetch|push)[^\n]{0,120}http://(?:127\.0\.0\.1|localhost)", text)
+            if local and "GIT_CONFIG_NOSYSTEM" not in text:
+                offenders.append(str(path))
+        self.assertEqual(offenders, [])
+
+    def fake_helper(self):
+        starts = self.home / "helper-starts"
+        helper = self.home / "helper"
+        # a stand-in for a helper that opens a dialog unless told not to (as Git Credential Manager does: GCM_INTERACTIVE and its `credential.interactive` setting; git's own prompt is GIT_TERMINAL_PROMPT)
+        helper.write_text("#!/bin/sh\n[ \"$GCM_INTERACTIVE\" = never ] && [ \"$GIT_TERMINAL_PROMPT\" = 0 ] && [ \"$(git config credential.interactive)\" = false ] || echo started >> %s\n" % starts)
+        helper.chmod(0o755)
+        (self.home / "private").mkdir(exist_ok=True)
+        self.helper_path = helper   # handed to git through GIT_CONFIG_COUNT in `lsremote`: no git configuration file is written
+        return starts
+
+    def lsremote(self, shim, env_drop=(), extra_env=None):
+        """git ls-remote to a closed local port through `shim` (a copy of the real one, or a mutant), with a private home and a helper that records its start."""
+        starts = self.fake_helper()
+        if starts.exists():
+            starts.unlink()
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        got = []
+
+        def serve():   # a server that answers 401 once: this is what makes git ask its credential helper
+            try:
+                conn, _ = server.accept()
+                conn.recv(65536)
+                conn.sendall(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                conn.close()
+            except OSError:
+                pass
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        real = shutil.which("git", path=SAFE_PATH) or shutil.which("git")
+        env = {"PATH": "%s:%s" % (os.path.dirname(real), SAFE_PATH), "HOME": str(self.home / "private"), "GIT_CONFIG_NOSYSTEM": "1", "FLEET_REAL_GIT": real,
+               "XDG_CONFIG_HOME": str(self.home / "xdg-none"), "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": str(self.helper_path)}
+        env.update(extra_env or {})   # (the sentinel test points the home variables at its scratch home)
+        started = time.time()
+        done = subprocess.run([sys.executable, str(shim), "ls-remote", "http://127.0.0.1:%d/x.git" % port], capture_output=True, text=True, env=env, timeout=30)
+        took = time.time() - started
+        server.close()
+        thread.join(5)
+        return done, took, starts.exists() and starts.read_text().count("started")
+
+    def mutant(self, name, old, new):
+        text = GIT_SHIM.read_text()
+        self.assertIn(old, text, "the mutant %s no longer applies" % name)
+        path = self.home / ("mutant-" + name)
+        path.mkdir()
+        (path / "stash_guard.py").write_text((GIT_SHIM.parent / "stash_guard.py").read_text())
+        (path / "git").write_text(text.replace(old, new, 1))
+        (path / "git").chmod(0o755)
+        return path / "git"
+
+    def test_s5_a_local_port_url_fails_at_once_and_the_helper_never_starts(self):
+        if not (shutil.which("git", path=SAFE_PATH) or shutil.which("git")):
+            self.skipTest("no real git")
+        done, took, starts = self.lsremote(GIT_SHIM)
+        self.assertEqual((done.returncode, starts), (128, 0), done.stderr)
+        self.assertLess(took, 5)
+        self.assertNotIn("started", done.stdout + done.stderr)
+
+    def test_s5_three_mutants_of_the_shim_start_the_helper_or_do_not_fail(self):
+        if not (shutil.which("git", path=SAFE_PATH) or shutil.which("git")):
+            self.skipTest("no real git")
+        mutants = {
+            "drop-terminal-prompt": ('{"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}', '{"GCM_INTERACTIVE": "never"}'),
+            "drop-gcm-interactive": ('{"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}', '{"GIT_TERMINAL_PROMPT": "0"}'),
+            "interactive-back-on": ('NO_DIALOG_CONFIG = "credential.interactive=false"', 'NO_DIALOG_CONFIG = "credential.interactive=true"'),
+            "code-host-only": ("    return no_dialog(route_credentials(args))", "    return no_dialog(route_credentials(args)) if any('github.com' in a for a in args) else route_credentials(args)"),
+        }
+        for name, (old, new) in mutants.items():
+            with self.subTest(name):
+                done, took, starts = self.lsremote(self.mutant(name, old, new))
+                self.assertTrue(starts >= 1 or done.returncode != 128, "the mutant %s was not caught: exit %s, %s helper starts" % (name, done.returncode, starts))
+
+    def test_s6_the_documentation_names_each_place_next_to_both_variables(self):
+        text = (REPO / "docs" / "no-credential-dialog.md").read_text()
+        rows = [line for line in text.splitlines() if line.startswith("| ") and "GIT_TERMINAL_PROMPT" in line and "GCM_INTERACTIVE" in line]
+        for place in ("shims/git", "bin/fleet-switchboard", "entrypoint.sh", "bin/heavy_slots.py"):
+            self.assertEqual(len([r for r in rows if place in r]), 1, place)
+        self.assertEqual(len(rows), 4)
+
+    # S7/U1, a cheap first line only: a text scan is a deny-list and cannot see a spelling built from pieces ("--glo"+"bal", a split-joined XDG path). The ROOT check is
+    # behavioural (test_s7_u2_...). Each row below has a hostile sample that ONLY that row finds, and a test that skips each row in turn and fails (one mutant per row).
+    _G, _S = "glo" + "bal", "sys" + "tem"
+    CONFIG_WRITE_FLAGS = ["--" + w for w in ("add", "unset", "unset-all", "replace-all", "edit", "rename-section", "remove-section")]
+    CONFIG_WRITE_SPELLINGS = (   # (name, regex over one line, a hostile line that only this row catches)
+        ("config command with a write flag", r"\bconfig\b[^\n]*(?:%s)(?![\w-])" % "|".join(re.escape(f) for f in CONFIG_WRITE_FLAGS),
+         'run(["git", "con' + 'fig", "--a' + 'dd", "k", "v"])'),
+        ("the short write flag", r"\bcon" + r"fig\b[^\n]*\s-e\b", "git con" + "fig -e"),
+        ("the global or system scope", r"\bconfig\b[^\n]*--(?:%s|%s)(?![\w-])" % (_G, _S), 'os.system("git config --' + _S + ' a b")'),
+        ("the file scope", r"\bcon" + r"fig\b[^\n]*(?:\s-f\b|--fi" + "le\\b)", "git con" + "fig -f out.cfg a b"),
+        ("the home gitconfig path", r"\.git" + "config", 'open(os.path.expanduser("~")+"/.git' + 'config","a")'),
+        ("the XDG git directory", r"\.con" + r"fig/git\b|XDG_CONFIG" + r"_HOME[^\n]*/git\b|XDG_CONFIG" + r"_HOME[^\n]*[\"']git[\"']", 'echo x > "$XDG_CONFIG' + '_HOME/git/con' + 'fig"'),
+        ("the global/system override variables", r"GIT_CONFIG_(?:%s|%s)\b" % (_G.upper(), _S.upper()), "GIT_CONFIG_" + _G.upper() + " = path"),
+    )
+
+    @classmethod
+    def config_write_hits(cls, text):
+        return [(n, line) for line in text.splitlines() for n, rx, _ in cls.CONFIG_WRITE_SPELLINGS if re.search(rx, line)]
+
+    @staticmethod
+    def added_lines(diff):
+        return "\n".join(l[1:] for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++"))
+
+    def test_s7_u1_every_row_of_the_scan_finds_its_sample_and_only_that_row_does(self):
+        for name, rx, hostile in self.CONFIG_WRITE_SPELLINGS:
+            with self.subTest(name):   # the mutant: skip this row; the sample must then go unfound by every other row, so the row cannot be dropped unseen
+                found = [n for n, other, _ in self.CONFIG_WRITE_SPELLINGS if re.search(other, hostile)]
+                self.assertEqual(found, [name])
+        for extra in ("git con" + "fig --fi" + "le=/x/y a b", "git con" + "fig -" + "f /x a b"):
+            self.assertTrue(self.config_write_hits(extra), extra)
+        for clean in ('env = {"GIT_CONFIG_NO' + 'SYSTEM": "1"}', "git config credential.interactive", 'run(["git", "config", "--get", "a.b"])'):
+            self.assertEqual(self.config_write_hits(clean), [], clean)
+
+    def test_s7_u2_the_focused_paths_leave_a_sentinel_home_byte_identical_and_add_no_file(self):
+        if not (shutil.which("git", path=SAFE_PATH) or shutil.which("git")):
+            self.skipTest("no real git")
+        scratch = self.home / "sentinel-home"
+        (scratch / (".con" + "fig") / "git").mkdir(parents=True)
+        (scratch / (".git" + "config")).write_text("[user]\n\tname = Sentinel\n")
+        (scratch / (".con" + "fig") / "git" / "con" "fig").write_text("[core]\n\tabbrev = 9\n")
+
+        def snapshot():
+            return {str(p.relative_to(scratch)): (p.read_bytes() if p.is_file() else None) for p in sorted(scratch.rglob("*"))}
+        before = snapshot()
+        pointed = {"HOME": str(scratch), "GIT_CONFIG_" + self._G.upper(): str(scratch / (".git" + "config")), "XDG_CONFIG" + "_HOME": str(scratch / (".con" + "fig"))}
+        with mock.patch.dict(os.environ, pointed):
+            sb.launch_base_env({"opencode_env": {}, "launch_env": {}})
+            sb.V2Client("/opt/lab/bin/opencode", {}, lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""), 7).server_info()
+            hs = sb.load_heavy_slots()
+            hs.run([sys.executable, "-c", "pass"], str(self.home / "heavy-sentinel"), environ=dict(os.environ, FLEET_HEAVY="off"), out=io.StringIO())
+            self.run_git("fetch", "--all")
+            self.run_git("config", "a.b")
+            done, took, starts = self.lsremote(GIT_SHIM, extra_env=pointed)   # the real shim in front of a real git, the sentinel as its home
+            self.assertEqual((done.returncode, starts), (128, 0), done.stderr)
+        self.assertEqual(snapshot(), before, "a focused path wrote, changed or added a file in the home it was pointed at")
+
+    def test_s7_u1_no_file_of_this_change_writes_the_global_git_configuration(self):
+        base = None
+        for ref in ("origin/main", "main"):
+            probe = subprocess.run(["git", "-C", str(REPO), "merge-base", ref, "HEAD"], capture_output=True, text=True)
+            if probe.returncode == 0 and probe.stdout.strip():
+                base = probe.stdout.strip()
+                break
+        if base is None:
+            self.skipTest("no main to diff against (a shallow checkout)")
+        diff = subprocess.run(["git", "-C", str(REPO), "diff", base, "-U0", "--no-color"], capture_output=True, text=True, timeout=60).stdout
+        self.assertEqual(self.config_write_hits(self.added_lines(diff)), [])
 
 
 class TestGitStashGuard(Base):

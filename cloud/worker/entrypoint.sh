@@ -27,6 +27,10 @@ if [ "${WORKER_DOCKER:-1}" = "1" ]; then
   sudo /usr/local/bin/start-dockerd || echo "worker: nested Docker unavailable (see /var/log/dockerd.log)" >&2
 fi
 
+# #1050: no git call in the pod may open a credential dialog or prompt (the helper answers only for github.com)
+GIT_TERMINAL_PROMPT=0; export GIT_TERMINAL_PROMPT
+GCM_INTERACTIVE=never; export GCM_INTERACTIVE
+
 if usable server-password; then
   OPENCODE_SERVER_PASSWORD=$(cat "$RUN/server-password"); export OPENCODE_SERVER_PASSWORD
 fi
