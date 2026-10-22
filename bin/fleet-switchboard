@@ -23895,6 +23895,8 @@ def add_merge_gate_parsers(sub):
     mode.add_argument("--pass", dest="gate_pass", action="store_true", help="Run the gate, re-run CI if the branch moved, take the lock and record the pass")
     mode.add_argument("--check", action="store_true", help="What the gh shim asks: exit 0 allow, 10 refuse (one line on stderr)")
     mode.add_argument("--release", action="store_true", help="Release the lock you hold on the pull request's branch")
+    gate.add_argument("--merge", action="store_true", help="With --pass: after the pass, in the same process, re-read the head, labels and gates and squash-merge with "
+                                                          "--match-head-commit on that head; any mismatch merges nothing and releases the lock. Not for a held pull request")
     gate.add_argument("--rerun-held", action="store_true", help="With --pass: close and reopen a HELD pull request to recompute its merge ref (its orchestrator agrees first)")
     gate.add_argument("--json", action="store_true")
 
@@ -23950,6 +23952,15 @@ def cmd_merge_gate(args, runner, now):
         _gates_audit(engine, "merge_gate.release", ref, {"by": who, "released": done})
         print("released the merge lock on %s %s" % (repo, facts["branch"]) if done else "%s holds no merge lock on %s %s: nothing released" % (who, repo, facts["branch"]))
         return EXIT_OK
+    if args.merge and not args.gate_pass:
+        raise LedgerCommandError("--merge goes with --pass")
+    if args.gate_pass and args.merge:
+        code, lines, record = gate.pass_and_merge(reading, gh, conf, state, repo, number, who, os.getppid() if kind[0] == "person" else None, now, MERGE_GATE_SLEEP,
+                                                  allow_held=args.rerun_held)
+        for line in lines:
+            print(line)
+        _gates_audit(engine, "merge_gate.pass_merge", ref, dict(record, by=who))
+        return code
     if args.gate_pass:
         ok, lines = gate.gate_pass(reading, gh, conf, state, repo, number, who, os.getppid() if kind[0] == "person" else None, now,   # an agent's shell exits before its merge: only a person's own terminal has a process to watch
                                      MERGE_GATE_SLEEP, allow_held=args.rerun_held)
