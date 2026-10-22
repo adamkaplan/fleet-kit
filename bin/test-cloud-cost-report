@@ -42,7 +42,7 @@ def write(tmp, name, lines, raw=None):
     return str(path)
 
 
-def run(module, path, day=DAY, extra=("--node-price", "0.5", "--node-count", "2", "--node-hours", "10")):
+def run(module, path, day=DAY, extra=("--node-price", "0.5", "--node-vcpu", "4", "--node-hours", "20")):
     out = io.StringIO()
     code = module.main([day, path, *extra], out)
     return code, out.getvalue()
@@ -62,23 +62,24 @@ class TestReport(unittest.TestCase):
     def test_a_stopped_pod_costs_its_stop_line_plus_nodes(self):
         code, text = self.check(REAL, STOPPED)
         self.assertEqual(code, 0)
-        self.assertIn("USD 10.25 per day", text)
+        self.assertIn("USD 10.00 per day", text)
+        self.assertIn("launcher estimate 0.25; vCPU share of node price (shape S) 0.50", text)
         self.assertIn("pods: 1, pod-hours 2.00", text)
         self.assertIn("node-hours 20.00", text)
 
     def test_a_pod_without_stop_is_costed_to_the_end_of_the_day_and_says_so(self):
         code, text = self.check(REAL, [line("2026-10-14T20:00:00Z", "pod/cb-example-2", "create", 0)],
-                                extra=("--node-price", "0", "--node-count", "0", "--node-hours", "0", "--pod-rate", "0.1"))
+                                extra=("--node-price", "0", "--node-vcpu", "4", "--node-hours", "0", "--pod-rate", "0.1"))
         self.assertEqual(code, 0)
         self.assertIn("costed to the end of the day", text)
-        self.assertIn("USD 0.40 per day", text)
+        self.assertIn("launcher estimate 0.40", text)
 
     def test_ok_false_lines_are_listed_not_costed(self):
         bad = line("2026-10-14T04:00:00Z", "pod/cb-example-3", "stop", 9.0, ok=False)
         code, text = self.check(REAL, STOPPED + [bad])
         self.assertEqual(code, 0)
         self.assertIn("not costed (ok false) line 3", text)
-        self.assertIn("USD 10.25 per day", text)
+        self.assertIn("launcher estimate 0.25", text)
 
     def test_a_day_with_no_lines_prints_0_with_the_reason(self):
         code, text = self.check(REAL, STOPPED, day="2026-10-15")
@@ -88,7 +89,7 @@ class TestReport(unittest.TestCase):
     def test_a_stop_twice_for_one_pod_counts_once(self):
         code, text = self.check(REAL, STOPPED + [line("2026-10-14T05:00:00Z", "pod/cb-example-1", "stop", 0.5)])
         self.assertIn("pods: 1,", text)
-        self.assertIn("USD 10.50 per day", text)
+        self.assertIn("launcher estimate 0.50", text)
 
     def test_malformed_input_exits_2_in_one_line(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -98,17 +99,107 @@ class TestReport(unittest.TestCase):
                 err = io.StringIO()
                 old, sys.stderr = sys.stderr, err
                 try:
-                    code = REAL.main([DAY, write(tmp, "bad.jsonl", None, raw), "--node-price", "1", "--node-count", "1", "--node-hours", "1"], out)
+                    code = REAL.main([DAY, write(tmp, "bad.jsonl", None, raw), "--node-price", "1", "--node-vcpu", "4", "--node-hours", "1"], out)
                 finally:
                     sys.stderr = old
                 self.assertEqual(code, 2, raw)
                 self.assertEqual(len(err.getvalue().splitlines()), 1)
                 self.assertNotIn("Traceback", err.getvalue())
-            self.assertEqual(REAL.main([DAY, str(Path(tmp) / "missing"), "--node-price", "1", "--node-count", "1", "--node-hours", "1"], io.StringIO()), 2)
+            self.assertEqual(REAL.main([DAY, str(Path(tmp) / "missing"), "--node-price", "1", "--node-vcpu", "4", "--node-hours", "1"], io.StringIO()), 2)
             self.assertEqual(REAL.main(["14-10-2026", "x"], io.StringIO()), 2)
 
 
+def real_audit():
+    """A small real-shaped audit: the writer's keys (with actor and reason) and the action names of a real day."""
+    def rec(ts, rid, action, cost, ok=True, reason="", worker="widget-service"):
+        return dict(line(ts, rid, action, cost, ok, worker), actor="cb-example", reason=reason)
+    return [
+        rec("2026-10-14T01:00:00Z", "pod/cb-example-1", "create-attempt", 0.0, True, "attempt 1: ready"),
+        rec("2026-10-14T01:00:01Z", "pod/cb-example-1", "create", 0.0),
+        rec("2026-10-14T02:00:00Z", "pod/cb-example-2", "create-attempt", 0.0, False, "attempt 1: no capacity"),
+        rec("2026-10-14T02:00:30Z", "pod/cb-example-2", "create.interrupted", 0.0, False, "interrupted"),
+        rec("2026-10-14T02:30:00Z", "pod/cb-example-1", "renew-git-token", 0.05, True),
+        rec("2026-10-14T03:00:01Z", "pod/cb-example-1", "stop", 0.2, True, "done"),
+        rec("2026-10-14T04:00:00Z", "pod/cb-example-3", "stop", 9.0, False, "gone"),
+        rec("2026-10-14T05:00:00Z", "pod/cb-example-1", "delete", 0.0, True),
+    ]
+
+
+class TestRealAudit(unittest.TestCase):
+    def go(self, module, lines=None, extra=None, day=DAY):
+        with tempfile.TemporaryDirectory() as tmp:
+            return run(module, write(tmp, "audit.jsonl", lines or real_audit()), day=day, **({"extra": extra} if extra else {}))
+
+    def test_the_real_action_names_are_read_and_the_skipped_are_counted(self):
+        code, text = self.go(REAL)
+        self.assertEqual(code, 0, text)
+        self.assertIn("skipped lines: 4", text)
+        self.assertIn("pods: 1,", text)
+
+    def test_an_unknown_action_still_fails(self):
+        bad = real_audit() + [line("2026-10-14T06:00:00Z", "pod/cb-example-4", "reboot", 0)]
+        self.assertEqual(self.go(REAL, bad)[0], 2)
+
+    def test_the_vcpu_share_is_priced_next_to_the_launcher_estimate(self):
+        # M = 4 of 8 vCPU: half of 0.6 USD/h for about 2 h
+        code, text = self.go(REAL, extra=("--node-price", "0.6", "--node-vcpu", "8", "--node-hours", "5", "--shape", "M"))
+        self.assertIn("launcher estimate 0.20; vCPU share of node price (shape M) 0.60", text)
+        self.assertIn("USD 3.00 per day", text)
+
+    def test_the_node_hours_file_gives_the_node_hours(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hours = Path(tmp) / "hours"
+            hours.write_text("2026-10-14T01 2\n2026-10-14T02:00:00Z 3\n")
+            code, text = run(REAL, write(tmp, "a.jsonl", real_audit()),
+                             extra=("--node-price", "2", "--node-vcpu", "4", "--node-hours-file", str(hours)))
+            self.assertEqual(code, 0, text)
+            self.assertIn("node-hours 5.00", text)
+            self.assertIn("USD 10.00 per day", text)
+            hours.write_text("2026-10-15T01 2\n")
+            code, _ = run(REAL, write(tmp, "b.jsonl", real_audit()),
+                          extra=("--node-price", "2", "--node-vcpu", "4", "--node-hours-file", str(hours)))
+            self.assertEqual(code, 2)
+
+    def test_an_empty_day_prints_0_with_the_reason(self):
+        code, text = self.go(REAL, day="2026-10-20")
+        self.assertIn("USD 0 (no audit lines on this day)", text)
+
+
 class TestMutants(unittest.TestCase):
+    def real_case(self, module):
+        code, text = TestRealAudit().go(module)
+        assert code == 0 and "skipped lines: 4" in text, (code, text)
+
+    def test_failing_on_a_skipped_action_is_caught(self):
+        src = mutant('and line["action"] not in SKIPPED:', ':')
+        self.assertTrue(self.fails(src, self.real_case))
+
+    def test_not_failing_on_an_unknown_action_is_caught(self):
+        src = mutant('if line["action"] not in ACTIONS and line["action"] not in SKIPPED:', 'if False:')
+        def case(module):
+            bad = real_audit() + [line("2026-10-14T06:00:00Z", "pod/cb-example-4", "reboot", 0)]
+            code, _ = TestRealAudit().go(module, bad)
+            assert code == 2
+        self.assertTrue(self.fails(src, case))
+
+    def test_ignoring_the_vcpu_share_is_caught(self):
+        src = mutant("SHAPE_VCPU[shape] / node_vcpu", "1 / node_vcpu")
+        def case(module):
+            code, text = TestRealAudit().go(module, extra=("--node-price", "0.6", "--node-vcpu", "8", "--node-hours", "5", "--shape", "M"))
+            assert "(shape M) 0.60" in text, text
+        self.assertTrue(self.fails(src, case))
+
+    def test_node_usd_from_anything_but_node_hours_is_caught(self):
+        src = mutant("node_usd = node_price * node_hours", "node_usd = node_price * pod_hours")
+        self.assertTrue(self.fails(src, self.stopped_case))
+
+    def test_an_empty_day_costing_nodes_is_caught(self):
+        src = mutant('if r["n"] == 0:', 'if False:')
+        def case(module):
+            code, text = TestRealAudit().go(module, day="2026-10-20")
+            assert "USD 0 (no audit lines on this day)" in text, text
+        self.assertTrue(self.fails(src, case))
+
     def fails(self, source, case):
         try:
             case(load(source))
@@ -119,7 +210,7 @@ class TestMutants(unittest.TestCase):
     def stopped_case(self, module):
         with tempfile.TemporaryDirectory() as tmp:
             code, text = run(module, write(tmp, "a.jsonl", STOPPED))
-        assert "USD 10.25 per day" in text, text
+        assert "launcher estimate 0.25;" in text and "USD 10.00 per day" in text, text
 
     def test_ignoring_stop_lines_is_caught(self):
         self.assertTrue(self.fails(mutant('if l["action"] == "stop":', 'if False:'), self.stopped_case))
@@ -128,7 +219,7 @@ class TestMutants(unittest.TestCase):
         src = mutant('if l["action"] == "create" and l["runtime_id"] not in stopped:', 'if l["action"] == "create":')
         def case(module):
             with tempfile.TemporaryDirectory() as tmp:
-                code, text = run(module, write(tmp, "a.jsonl", STOPPED), extra=("--node-price", "0", "--node-count", "0", "--node-hours", "0", "--pod-rate", "1"))
+                code, text = run(module, write(tmp, "a.jsonl", STOPPED), extra=("--node-price", "0", "--node-vcpu", "4", "--node-hours", "0", "--pod-rate", "1"))
             assert "pods: 1," in text, text
         self.assertTrue(self.fails(src, case))
 
@@ -138,17 +229,17 @@ class TestMutants(unittest.TestCase):
             bad = line("2026-10-14T04:00:00Z", "pod/cb-example-3", "stop", 9.0, ok=False)
             with tempfile.TemporaryDirectory() as tmp:
                 code, text = run(module, write(tmp, "a.jsonl", STOPPED + [bad]))
-            assert "USD 10.25 per day" in text, text
+            assert "launcher estimate 0.25;" in text, text
         self.assertTrue(self.fails(src, case))
 
     def test_reading_another_file_is_caught(self):
-        src = mutant("open(path, encoding=\"utf-8\")", "open(path + '.other', encoding=\"utf-8\")")
+        src = mutant("def read_lines(path):\n    try:\n        with open(path,", "def read_lines(path):\n    try:\n        with open(path + '.other',")
         def case(module):
             with tempfile.TemporaryDirectory() as tmp:
                 path = write(tmp, "a.jsonl", STOPPED)
                 write(tmp, "a.jsonl.other", [line("2026-10-14T03:00:00Z", "pod/cb-example-9", "stop", 7.0)])
                 code, text = run(module, path)
-            assert code == 0 and "USD 10.25 per day" in text, text
+            assert code == 0 and "launcher estimate 0.25;" in text, text
         self.assertTrue(self.fails(src, case))
 
 
