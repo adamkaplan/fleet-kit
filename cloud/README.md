@@ -204,6 +204,14 @@ handled. `tests/fixtures/containerd-aks-installer-form.toml` is a copy of such a
 `k8s/runtimeclass.yaml` has no scheduling block: an autoscaler's template node cannot carry a label that is set only
 after install, so a worker pod selects the pool label `sysbox-install=yes` itself. Evidence for the cause: issue #365, probe comment.
 
+## Saving unpushed work when the pod ends
+
+A pod ended by its deadline or by a retire lost its unpushed work unless a fresh token was minted and the work pushed from outside, and that adds a token-issuance path; the pod's own token is renewed about every 30 minutes while the reaper runs (`GIT_TOKEN_RENEW_AFTER_SECONDS`), so the pod can push with it before it ends. Every worker container therefore has a `preStop` hook, `cw-prestop 45`, and the pod's `terminationGracePeriodSeconds` is 60 (`POD_TERMINATION_GRACE_SECONDS`; the hook budget is `PRESTOP_BUDGET_SECONDS`, kept below the grace).
+
+- **What is saved:** uncommitted files (secret-looking names left out) are committed, and when the commit is on no remote branch it is pushed to `<worker>/wip` with a plain push (never forced) through the same credential helper the worker uses. A clean tree, a tree already on a remote branch, or no repository: nothing happens and nothing is printed. Success prints `cw-prestop: saved work to <worker>/wip` to the pod's output.
+- **When it fails:** an expired token, no network, a branch that has moved on (non-fast-forward) or a push that hangs past the budget. The hook then exits 0 within the grace, leaves the work in `/work/repo` and writes one line, `cw-prestop: not pushed (<reason>); work left in /work/repo`. A pod whose token expired loses its unpushed work unless the reaper kept the token renewed. The launcher's `stop` refusal text names the read-only recovery route (`kubectl exec <pod> -- git -C /work/repo log --oneline origin/HEAD..HEAD`, and `kubectl cp` of the work tree).
+- **Limits:** the agent keeps running while the hook runs, so a file written mid-push can be left out. The hook mints and reads no new token or file. The worker image changes (`cw-prestop`, the `--prestop` mode of `cw-end-hook`): rebuild the image first, then the launcher. Whether the kubelet runs the hook at `activeDeadlineSeconds` is decided by a live check after merge.
+
 ## Tests (no cluster, no Azure)
 
 ```sh

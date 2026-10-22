@@ -38,12 +38,13 @@ COPY worker/start-dockerd.sh /usr/local/bin/start-dockerd
 COPY worker/entrypoint.sh /usr/local/bin/worker-entrypoint
 COPY worker/guard.sh worker/opencode-worker.json worker/agents/worker.md /usr/local/share/cw/
 COPY launcher/end_hook.py /usr/local/bin/cw-end-hook
+COPY worker/cw-prestop /usr/local/bin/cw-prestop
 COPY launcher/token_mint.py /usr/local/bin/cw-token-mint
 COPY worker/activity.py /usr/local/bin/cw-worker-activity
 COPY worker/cw-gh /usr/local/bin/cw-gh
 COPY worker/probe-reach.sh /usr/local/bin/cw-probe-reach
 RUN chmod 0755 /usr/local/bin/start-dockerd /usr/local/bin/worker-entrypoint \
-      /usr/local/bin/cw-end-hook /usr/local/bin/cw-token-mint /usr/local/bin/cw-worker-activity \
+      /usr/local/bin/cw-end-hook /usr/local/bin/cw-prestop /usr/local/bin/cw-token-mint /usr/local/bin/cw-worker-activity \
       /usr/local/bin/cw-gh /usr/local/bin/cw-probe-reach \
  && chmod 0755 /usr/local/share/cw/guard.sh && chmod 0644 /usr/local/share/cw/opencode-worker.json /usr/local/share/cw/worker.md
 

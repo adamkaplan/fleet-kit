@@ -8,6 +8,7 @@ A push failure prints `error` and exits 1, so the launcher keeps the pod.
 import fnmatch
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -27,7 +28,7 @@ def is_secret(path):
     return any(fnmatch.fnmatch(base.lower(), g) for g in SECRET_GLOBS)
 
 
-def run(workdir, worker):
+def run(workdir, worker, prestop=False):
     status = git(workdir, "status", "--porcelain", "-z", "--untracked-files=all").stdout
     paths = [e[3:] for e in status.split("\0") if len(e) > 3]
     skipped = sorted(p for p in paths if is_secret(p))
@@ -43,11 +44,31 @@ def run(workdir, worker):
     if contained:
         return {"pushed": False, "wip_branch": None, "skipped": skipped}
     branch = "%s/wip" % worker
-    git(workdir, "push", "--force-with-lease", "origin", "HEAD:refs/heads/" + branch)
+    # prestop: a plain push, never forced and no lease: a non-fast-forward answer is a failure, not an overwrite
+    git(workdir, "push", *([] if prestop else ["--force-with-lease"]), "origin", "HEAD:refs/heads/" + branch)
     return {"pushed": True, "wip_branch": branch, "skipped": skipped}
 
 
+def prestop_main():
+    """--prestop: silent when there is nothing to do; one JSON line on success or failure is replaced by plain text for cw-prestop."""
+    workdir, worker = os.environ.get("CW_WORKDIR", "/work/repo"), os.environ.get("CW_WORKER", "")
+    if not worker or not os.path.isdir(os.path.join(workdir, ".git")):
+        return 0
+    try:
+        res = run(workdir, worker, prestop=True)
+        if res["pushed"]:
+            print("cw-prestop: saved work to %s" % res["wip_branch"])
+        return 0
+    except (RuntimeError, OSError) as e:
+        msg = " ".join(str(e).split())
+        msg = re.sub(r"https?://\S+", "<url>", msg)[:80]
+        print("cw-prestop: not pushed (%s); work left in %s" % (msg, workdir))
+        return 0
+
+
 def main():
+    if "--prestop" in sys.argv[1:]:
+        return prestop_main()
     workdir, worker = os.environ.get("CW_WORKDIR", "/work/repo"), os.environ.get("CW_WORKER", "")
     if not worker:
         print(json.dumps({"pushed": False, "wip_branch": None, "error": "CW_WORKER is not set"}))
