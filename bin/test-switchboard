@@ -394,7 +394,7 @@ class TestConfig(Base):
             "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "launch_default": "headless",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
-            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "docker_reaper": True,
+            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "no_multiplexer": False, "docker_reaper": True,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_live_days": 14, "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
@@ -18151,6 +18151,81 @@ class TestHeadlessPresence(Base):
         self.assertFalse(path.exists())
         self.assertFalse(self.ap.remove_record(self.world.state, "hw"))
         self.assertFalse(self.ap.remove_record(self.world.state, "../x"))
+
+
+class TestNoMultiplexer(Base):
+    """#1072: `no_multiplexer` on: discovery reads the records only. A multiplexer that RAISES on any call proves none is made."""
+
+    class Raising:
+        def __init__(self):
+            self.calls = []
+        def __getattr__(self, name):
+            if name.startswith("__"):
+                raise AttributeError(name)
+            def call(*args, **kwargs):
+                self.calls.append(name)
+                raise sb.HerdrError("no multiplexer here: %s" % name)
+            return call
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("boss",))
+        self.ap = sb.load_agent_presence()
+        self.engine = self.world.new_engine("cli")
+        self.url = "http://127.0.0.1:49374"
+        self.headless = lambda: TestHeadlessPresence.headless(self)
+        self.discover = lambda: TestHeadlessPresence.discover(self)
+        self.sid = self.headless()
+        self.fake = self.Raising()
+        self.engine.herdr = self.fake
+
+    def test_s2_the_switch_on_never_calls_agent_list_and_leaves_no_problem_and_the_agents_input_whole(self):
+        self.engine.config = dict(self.engine.config, no_multiplexer=True)
+        found = self.discover()
+        self.assertEqual(self.fake.calls.count("agent_list"), 0)
+        self.assertEqual([p for p in found.problems if "herdr unreachable" in p], [])
+        self.assertEqual(found.problems, [])
+        self.assertTrue(sb.whole(self.engine, "agents")[0])
+        self.assertIn("hw", found.agents)
+
+    def test_s3_pane_less_agents_get_no_badge_and_no_pane_call_and_no_error(self):
+        self.engine.config = dict(self.engine.config, no_multiplexer=True)
+        found = self.discover()
+        report = {"badges": [], "errors": []}
+        self.engine.render_badges(found, set(), report)
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual((report["badges"], report["errors"]), ([], []))
+
+    def test_s2_a_whole_pass_with_the_switch_on_makes_no_multiplexer_call(self):
+        self.engine.config = dict(self.engine.config, no_multiplexer=True)
+        self.engine.audit = self.engine.audit
+        self.engine.run_pass()
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(self.engine.discovery.problems, [])
+
+    def test_s5_a_mutant_that_keeps_calling_agent_list_with_the_switch_on_fails_the_s2_checks(self):
+        real = sb.Switchboard._discover
+        def mutant(engine, now, entries=None):
+            try:
+                engine.herdr.agent_list()   # the mutant: the call is made whatever the switch says
+            except sb.HerdrError:
+                pass
+            return real(engine, now, entries)
+        self.engine.config = dict(self.engine.config, no_multiplexer=True)
+        with mock.patch.object(sb.Switchboard, "_discover", mutant):
+            self.discover()
+        self.assertEqual(self.fake.calls.count("agent_list"), 1, "the S2 count of zero catches it")
+
+    def test_u1_the_switch_off_still_reports_herdr_unreachable_and_the_input_not_whole(self):
+        self.assertFalse(self.engine.config["no_multiplexer"])
+        found = self.discover()
+        self.assertEqual(self.fake.calls, ["agent_list"])
+        self.assertTrue(any(p.startswith("herdr unreachable: ") for p in found.problems))
+        self.assertFalse(sb.whole(self.engine, "agents")[0])
+
+    def test_the_key_must_be_a_boolean(self):
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"no_multiplexer": "yes"})
 
 
 class TestSelfRegisteringCli(unittest.TestCase):
