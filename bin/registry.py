@@ -462,9 +462,10 @@ def duplicate_charters(agents, repos=None):
     return {key: sorted(names) for key, names in found.items() if len(names) > 1}
 
 
-def set_charter(state_dir, name, charter, by, now=None):
+def set_charter(state_dir, name, charter, by, now=None, check=None):
     """Write an orchestrator's registry charter (an issue number, or None to clear it): the ONLY command-side writer of the field. One audit event with the old and the new value and who ran it.
     Refused (nothing written, a problem line) for an agent not in the registry, one retired, or one that is not an orchestrator, and for a value that is not an issue number or None."""
+    refused = []
     def change(doc):
         row = doc["agents"].get(name)
         if not isinstance(row, dict) or name in doc["retired"]:
@@ -473,12 +474,20 @@ def set_charter(state_dir, name, charter, by, now=None):
             return False, [], "%s is not an orchestrator" % name
         if charter is not None and not is_charter(charter):
             return False, [], "a charter is an issue number or none"
+        if check is not None:
+            verdict = check(doc, row)   # #1143: the caller's guard, judged on THIS locked read, so check and write are one step
+            if verdict:
+                refused.append(verdict)
+                return False, [], verdict[1]
         old = row.get("charter")
         if old == charter:
             return False, [], None
         row["charter"] = charter
         return True, [{"event": "charter", "name": name, "old": old, "new": charter, "by": by}], None
-    return _mutate(state_dir, change, now)
+    got = _mutate(state_dir, change, now)
+    if refused:
+        got = dict(got, why=refused[0][0])
+    return got
 
 
 def bell_of(agent):

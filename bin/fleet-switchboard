@@ -30243,55 +30243,68 @@ def charter_set_refusal(caller, role):
     return "only the chief-of-staff or the operator sets a charter; %s is %s" % (caller, "a %s" % role if role and role != "unidentified" else "not identified as either")
 
 
+def charter_safe(text, sink):
+    """A given value escaped for one sink ("audit", "stderr", "stdout" or "registry"): at most 40 characters of letters, digits and _ . # - (anything else, a newline or markup included, becomes ?)."""
+    return re.sub(r"[^A-Za-z0-9_.#-]", "?", str(text)[:40])
+
+
 def cmd_charter(args, runner, now):
     """`charter set <orchestrator> <issue number | none>`: write the orchestrator's registry `charter`, the one record of it (#969). Audited with who, the old and the new value. The live session's metadata
     (written once at launch, never correctable) is not touched and is never read as a second owner."""
     engine, _, _ = build_engine(runner, now, "cli")
     caller, role = move_caller(engine, args, runner, now)
-    audit = lambda event, **detail: engine.audit.append(engine.actor, event, "agent:%s" % args.name, dict(detail, caller=caller or "operator", orchestrator=args.name))
+    audit = lambda event, **detail: engine.audit.append(engine.actor, event, "agent:%s" % charter_safe(args.name, "audit"), dict(detail, caller=charter_safe(caller or "operator", "audit"), orchestrator=charter_safe(args.name, "audit")))
     refusal = charter_set_refusal(caller, role)
     if refusal:
         audit("charter.refused", why="caller", role=role)
         sys.stderr.write("%s: charter: %s; nothing was changed\n" % (PROG, refusal))
         return EXIT_ERROR
+    safe = lambda text, sink: charter_safe(text, sink)   # every given value is escaped before any sink (audit, stderr, stdout, registry)
+    if not NAME_RE.match(args.name or ""):
+        audit("charter.refused", why="lane", given=safe(args.name, "audit"))
+        sys.stderr.write("%s: charter: the lane %r is not a valid agent name; nothing was changed\n" % (PROG, safe(args.name, "stderr")))
+        return EXIT_USAGE
     raw = (args.charter or "").strip().lower().lstrip("#")
-    value = None if raw == "none" else (int(raw) if raw.isdigit() and int(raw) > 0 else False)
+    value = None if raw == "none" else (int(raw) if re.fullmatch(r"[0-9]{1,9}", raw) and int(raw) > 0 else False)
     if value is False:
-        audit("charter.refused", why="value", given=_one_line(args.charter or "", 40))
-        sys.stderr.write("%s: charter: give an issue number or `none`; nothing was changed\n" % PROG)
+        audit("charter.refused", why="value", given=safe(args.charter or "", "audit"))
+        sys.stderr.write("%s: charter: give a positive issue number or `none`, not %r; nothing was changed\n" % (PROG, safe(args.charter or "", "stderr")))
         return EXIT_USAGE
     registry = load_module("registry")
-    agents = registry.read(engine.state_dir)["agents"]
-    before = agents.get(args.name)
-    refuse = lambda why, text, code=EXIT_USAGE: (audit("charter.refused", why=why, old=(before or {}).get("charter"), new=value),
-                                                 sys.stderr.write("%s: charter: %s; nothing was changed\n" % (PROG, text)), code)[2]
-    if not isinstance(before, dict) or args.name in registry.read(engine.state_dir)["retired"] or before.get("role") != "orchestrator":
-        return refuse("not an orchestrator", "%s is not an orchestrator" % args.name)
-    old = before.get("charter")
-    replace = (getattr(args, "replace", None) or "").strip()
-    if old is not None and old != value and not replace:
-        return refuse("--replace", "%s already has charter #%s; changing it needs --replace \"<reason>\"" % (args.name, old))
-    if value is not None and old != value:
-        repo = before.get("repo") or (engine.config.get("intent_repo") if engine.config else None)
-        holders = sorted(n for n, row in agents.items() if n != args.name and row.get("role") == "orchestrator" and row.get("charter") == value and (row.get("repo") or repo) == repo)
-        if holders:
-            return refuse("already held by", "charter #%d is already held by %s" % (value, ", ".join(holders)))
-        try:
-            parent = engine.intents.parent(value, repo)
-            root = engine.intents.parent(parent, repo) if parent is not None else None
-        except Exception as err:
-            return refuse("unverified", "cannot read #%d's parent (%s)" % (value, _one_line(str(err), 80)))
-        if parent is None or root is not None:
-            return refuse("not a sub-issue", "#%d is not a sub-issue of the repository's root issue" % value)
-    got = registry.set_charter(engine.state_dir, args.name, value, caller or "operator", now=now())
+    replace = bool(getattr(args, "replace", False))
+    caller_name = safe(caller or "operator", "registry")
+    decided = {}
+
+    def guard(doc, row):
+        """The whole check, run by the registry INSIDE its one lock with the write that follows (no check-then-act gap)."""
+        old = row.get("charter")
+        decided["old"] = old
+        if old is not None and old != value and not replace:
+            return ("--replace", "%s already has charter #%s; changing it needs --replace" % (args.name, old))
+        if value is not None and old != value:
+            repo = row.get("repo") or (engine.config.get("intent_repo") if engine.config else None)
+            holders = sorted(n for n, other in doc["agents"].items() if n != args.name and n not in doc["retired"] and other.get("role") == "orchestrator" and other.get("charter") == value and (other.get("repo") or repo) == repo)
+            if holders:
+                return ("already held by", "charter #%d is already held by %s" % (value, ", ".join(holders)))
+            try:
+                parent = engine.intents.parent(value, repo)
+                root = engine.intents.parent(parent, repo) if parent is not None else None
+            except Exception as err:
+                return ("unverified", "cannot read #%d's parent (%s)" % (value, safe(_one_line(str(err), 80), "stderr")))
+            if parent is None or root is not None:
+                return ("not a sub-issue", "#%d is not a sub-issue of the repository's root issue" % value)
+        return None
+    got = registry.set_charter(engine.state_dir, args.name, value, caller_name, now=now(), check=guard)
+    old = decided.get("old")
     if got["problem"]:
-        audit("charter.refused", why=_one_line(got["problem"], 120))
-        sys.stderr.write("%s: charter: %s; nothing was changed\n" % (PROG, got["problem"]))
+        why = got.get("why") or ("not an orchestrator" if got["problem"].endswith("is not an orchestrator") else _one_line(got["problem"], 120))
+        audit("charter.refused", why=why, old=old, new=value)
+        sys.stderr.write("%s: charter: %s; nothing was changed\n" % (PROG, _one_line(got["problem"], 200)))
         return EXIT_USAGE
-    audit("charter.set", old=(before or {}).get("charter"), new=value, changed=got["changed"], replace=replace or None)
-    print("charter of %s: %s -> %s%s" % (args.name, (before or {}).get("charter"), value, "" if got["changed"] else " (unchanged)"))
+    audit("charter.set", old=old, new=value, changed=got["changed"], replace=replace)
+    print("charter of %s: %s -> %s%s" % (args.name, old, value, "" if got["changed"] else " (unchanged)"))
     row = registry.read(engine.state_dir)["agents"].get(args.name) or {}
-    print("registry row: %s role=%s charter=%s repo=%s" % (args.name, row.get("role"), ("#%s" % row["charter"]) if row.get("charter") is not None else "none", row.get("repo")))
+    print("registry row: %s role=%s charter=%s repo=%s" % (args.name, row.get("role"), ("#%s" % row["charter"]) if row.get("charter") is not None else "none", safe(row.get("repo"), "stdout")))
     return EXIT_OK
 
 
@@ -30306,7 +30319,7 @@ def add_charter_parsers(sub):
                                                 "cannot be corrected, so it is never read as a second owner. Run by the Chief of Staff or the operator; one audit line with the old and the new value.")
     setter.add_argument("name", help="The orchestrator's fleet name")
     setter.add_argument("charter", help="An issue number, or `none`")
-    setter.add_argument("--replace", metavar="REASON", help="The reason, required to change a charter that is already set")
+    setter.add_argument("--replace", action="store_true", help="Required to change a charter that is already set (a flag: it takes no value)")
     setter.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
 
 
