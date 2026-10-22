@@ -20,7 +20,16 @@ import cloud_client  # noqa: E402
 
 KINDS = ("done", "failed", "blocked", "question", "working", "paused", "withdrawn")
 MAX_REPORT = 300
+MAX_SEND = 2000
 TIMEOUT = 10
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # refuse every redirect: the token goes to the configured host only
+
+
+OPENER = urllib.request.build_opener(_NoRedirect)
 
 
 def make_post(url):
@@ -29,7 +38,7 @@ def make_post(url):
         req = urllib.request.Request(url, data=data, method="POST", headers={
             "Authorization": request["authorization"], "Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=TIMEOUT) as answer:
+            with OPENER.open(req, timeout=TIMEOUT) as answer:
                 status, raw = answer.status, answer.read(65536)
         except urllib.error.HTTPError as err:
             status, raw = err.code, err.read(65536)
@@ -64,8 +73,13 @@ def main(argv, env=None, post=None):
     if not sender:
         return _usage("cloud_cli: FLEET_AGENT_NAME is not set")
     url = env.get("FLEET_CLOUD_CHANNEL_URL", "").strip()
-    if urllib.parse.urlparse(url).scheme not in ("http", "https") or not urllib.parse.urlparse(url).netloc:
-        return _usage("cloud_cli: FLEET_CLOUD_CHANNEL_URL is not set to an http URL")
+    parts = urllib.parse.urlparse(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return _usage("cloud_cli: FLEET_CLOUD_CHANNEL_URL must be set to an http or https URL")
+    if "@" in parts.netloc:
+        return _usage("cloud_cli: FLEET_CLOUD_CHANNEL_URL must not contain user information")
+    if cmd == "send" and len(text) > MAX_SEND:
+        return _usage("cloud_cli: text over %d characters" % MAX_SEND)
     token_path = env.get("FLEET_CLOUD_TOKEN_FILE") or cloud_client.TOKEN_PATH
     post = post or make_post(url)
     if cmd == "send":

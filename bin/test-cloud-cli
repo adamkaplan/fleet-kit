@@ -23,11 +23,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0))
         self.server.seen.append({"auth": self.headers.get("Authorization"), "body": json.loads(self.rfile.read(n))})
         code = self.server.code
-        data = json.dumps({"error": "nope" if code != 200 else ""}).encode()
+        data = getattr(self.server, "raw", None) or json.dumps({"error": "nope" if code != 200 else ""}).encode()
         self.send_response(code)
+        if 300 <= code < 400:
+            self.send_header("Location", self.server.location)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def do_GET(self):
+        self.server.seen.append({"auth": self.headers.get("Authorization"), "body": None})
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
 
     def log_message(self, *a):
         pass
@@ -112,7 +121,72 @@ class TestCli(Base):
         self.assertNotIn("Traceback", err)
 
 
+class TestRefusals(Base):
+    def one_line_exit_1(self, args=("send", "p", "x"), **env):
+        code, out, err = self.run_cli(list(args), **env)
+        self.assertEqual(code, 1, (out, err))
+        self.assertEqual(len(out.splitlines()), 1)
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn(SECRET, out + err)
+
+    def test_redirect_is_refused(self):
+        other = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        other.seen, other.code = [], 200
+        threading.Thread(target=other.serve_forever, daemon=True).start()
+        self.addCleanup(other.server_close)
+        self.addCleanup(other.shutdown)
+        self.srv.code = 302
+        self.srv.location = "http://127.0.0.1:%d/steal" % other.server_address[1]
+        self.one_line_exit_1()
+        self.assertEqual(other.seen, [])
+
+    def test_500_is_one_line(self):
+        self.srv.code = 500
+        self.one_line_exit_1()
+
+    def test_closed_port(self):
+        s = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        port = s.server_address[1]
+        s.server_close()
+        self.one_line_exit_1(FLEET_CLOUD_CHANNEL_URL="http://127.0.0.1:%d/send" % port)
+
+    def test_non_json_reply(self):
+        self.srv.raw = b"<html>oops"
+        self.srv.code = 400
+        self.one_line_exit_1()
+
+    def test_userinfo_url_is_usage_error(self):
+        code, out, _ = self.run_cli(["send", "p", "x"], FLEET_CLOUD_CHANNEL_URL="http://u:p@127.0.0.1:1/send")
+        self.assertEqual((code, len(out.splitlines())), (2, 1))
+        self.assertEqual(self.srv.seen, [])
+
+    def test_send_text_cap_and_whitespace(self):
+        self.assertEqual(self.run_cli(["send", "p", "x" * 2001])[0], 2)
+        self.assertEqual(self.run_cli(["send", "p", "x" * 2000])[0], 0)
+        self.assertEqual(self.run_cli(["send", "p", "  ", "\t"])[0], 2)
+        self.assertEqual(self.run_cli(["report", "done", "   "])[0], 2)
+
+    def test_empty_boss(self):
+        self.assertEqual(self.run_cli(["report", "done", "x"], FLEET_BOSS="")[0], 2)
+        self.assertEqual(len(self.srv.seen), 0)
+
+    def test_default_token_path_unset(self):
+        self.one_line_exit_1(FLEET_CLOUD_TOKEN_FILE=None)
+
+
 class TestMutants(Base):
+    def test_mutant_follows_redirects(self):
+        other = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        other.seen, other.code = [], 200
+        threading.Thread(target=other.serve_forever, daemon=True).start()
+        self.addCleanup(other.server_close)
+        self.addCleanup(other.shutdown)
+        self.srv.code = 302
+        self.srv.location = "http://127.0.0.1:%d/steal" % other.server_address[1]
+        src = self.mutate("        return None  # refuse", "        return super().redirect_request(req, fp, code, msg, headers, newurl)  # refuse")
+        self.run_cli(["send", "p", "x"], source=src)
+        self.assertEqual(len(other.seen), 1)
+
     def test_mutant_prints_token(self):
         src = self.mutate('        print(done)\n', '        print(done, open(token_path).read())\n')
         _, out, _ = self.run_cli(["send", "p", "x"], source=src)
