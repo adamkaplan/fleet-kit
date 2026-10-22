@@ -56,6 +56,8 @@ rebuilt from another record.
 
 Limit of the scan: it matches the record names and the functions that read them in the text of every tracked source under `bin/`, `plugins/` and `cloud/`. A path built from parts, a listing of the state directory or a name held in a variable is not found; the scan can only fail on a name written out. Slice 3's runtime test covers the rest.
 
+`bin/fleet-heartbeat` has no rows: it no longer keeps a live agent listing (`tabs_with_agents`, `discover()`). `registry_targets` (line 102) reads the registry through `registry.read` for identity (who exists, pane, workspace, state) and the `bell` field through `registry.bell_of` (line 121); a read that is not whole nudges nobody. What stays its own is bookkeeping: its nudge state and per-pane health in its own `state.json`, reported by `fleet-heartbeat status --json`.
+
 Not an agent list, so not rows: the cloud log read keeps no list of its own (it reads `pane-health.json` and `retired.json` for one
 session, above); sweeps and the hooks plugin appear above only where they read or write one of these records.
 
