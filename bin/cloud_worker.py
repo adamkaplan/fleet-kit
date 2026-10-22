@@ -207,6 +207,36 @@ def list_records(state):
     return found
 
 
+WATCH_MAX_RECORDS = 50      # the most records one pass reads
+WATCH_MAX_BYTES = 65536     # the most bytes read from one record
+
+
+def read_records_bounded(state, max_records=WATCH_MAX_RECORDS, max_bytes=WATCH_MAX_BYTES):
+    """The cloud record directory read for the per-pass watch: {"records": [...], "skipped": n, "capped": bool}. Read-only; never raises on a bad file."""
+    base = Path(state) / CLOUD_DIR
+    out = {"records": [], "skipped": 0, "capped": False}
+    if not base.is_dir():
+        return out
+    for path in sorted(base.glob("*.json")):
+        if len(out["records"]) >= max_records:
+            out["capped"] = True
+            break
+        try:
+            if not valid_name(path.name[:-5]):
+                continue
+            with open(str(path), "rb") as handle:
+                raw = handle.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise ValueError("oversize")
+            record = json.loads(raw.decode("utf-8"))
+            if not isinstance(record, dict):
+                raise ValueError("not an object")
+            out["records"].append(record)
+        except Exception:
+            out["skipped"] += 1
+    return out
+
+
 def _reserved(name):
     """True when another live command is launching `name` right now: its `NAME.launching` file is flock-ed. A leftover file nobody holds (a command
     that was killed: the kernel released its lock) means nothing."""

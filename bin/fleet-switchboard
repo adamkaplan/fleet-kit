@@ -13377,6 +13377,21 @@ def catching_up_lines(state_dir, now):
         return []
 
 
+def cloud_watch_tick(engine, discovery):
+    """#1073: cloud workers are outside discovery (no pane, no local session), so this one per-pass tick reads their records, bounded.
+    Read-only; the result is kept on `engine.cloud_watch` for the report relay (#1020). No directory means nothing to do."""
+    cloud = load_module("cloud_worker").bind(globals())
+    result = cloud.read_records_bounded(state_dir_path())
+    engine.cloud_watch = result
+    if result["capped"] and not getattr(engine, "_cloud_cap_audited", False):
+        engine._cloud_cap_audited = True
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "cloud-watch.capped", "cloud-watch", {"cap": cloud.WATCH_MAX_RECORDS})
+    elif not result["capped"]:
+        engine._cloud_cap_audited = False
+    return result
+
+
 def finish_pass(engine, discovery, report):
     """The end of a pass: reminders that reached their recipient are pruned. A failure is
     audited and never stops the pass."""
@@ -13396,6 +13411,10 @@ def finish_pass(engine, discovery, report):
         prune_report_riders(engine, discovery)
     except Exception as err:
         engine._failed("report-riders", "report-riders", err, report)
+    try:
+        cloud_watch_tick(engine, discovery)
+    except Exception as err:
+        engine._failed("cloud-watch", "cloud-watch", err, report)
     try:
         publish_decisions(engine)
     except Exception as err:

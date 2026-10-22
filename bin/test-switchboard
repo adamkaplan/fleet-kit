@@ -83681,6 +83681,78 @@ class TestPaneExitBoundaries(TestPaneExit):
         self.assertLessEqual(guards, 16, "a guard was added to pane_exit_pass: give it a row and a mutant, then raise this count")
 
 
+class TestCloudWatchTick(unittest.TestCase):
+    """#1073: one cloud_watch_tick per pass in finish_pass, under try/except, with bounded reads."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        patcher = mock.patch.dict(os.environ, {"XDG_STATE_HOME": self.tmp})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.dir = sb.state_dir_path() / "cloud"
+        self.audit = []
+        audit = types.SimpleNamespace(append=lambda *a: self.audit.append(a))
+        self.engine = types.SimpleNamespace(audit=audit, actor="daemon", now=time.time)
+        self.engine._failed = lambda subject, step, err, report: self.audit.append(("error", step, str(err)))
+
+    def records(self, n):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        for i in range(n):
+            (self.dir / ("w%d.json" % i)).write_text(json.dumps({"worker": "w%d" % i}))
+
+    def finish(self, tick=None):
+        calls = {"tick": 0, "health": 0}
+        real = sb.cloud_watch_tick
+        def counted(engine, discovery):
+            calls["tick"] += 1
+            return (tick or real)(engine, discovery)
+        def health(*a):
+            calls["health"] += 1
+        quiet = lambda *a, **k: None
+        with mock.patch.multiple(sb, cloud_watch_tick=counted, health_write=health, prune_delivered_reminders=quiet, friction_tick=quiet,
+                                 load_tick=quiet, prune_report_riders=quiet, publish_decisions=quiet, write_catching_up=quiet, schedule_judge_warm=quiet):
+            sb.finish_pass(self.engine, None, {"errors": []})
+        return calls
+
+    def test_S2_runs_once_and_reads_both_records(self):
+        self.records(2)
+        calls = self.finish()
+        self.assertEqual(calls["tick"], 1)
+        self.assertEqual(len(self.engine.cloud_watch["records"]), 2)
+
+    def test_S3_a_raising_tick_is_audited_and_later_ticks_run(self):
+        def boom(engine, discovery):
+            raise RuntimeError("boom")
+        calls = self.finish(boom)
+        self.assertIn("cloud-watch", [a[1] for a in self.audit if a[0] == "error"])
+        self.assertEqual(calls["health"], 1)
+
+    def test_S4_reads_at_most_the_cap_skips_bad_files_and_audits_once(self):
+        cloud = sb.load_module("cloud_worker")
+        self.records(cloud.WATCH_MAX_RECORDS + 5)
+        (self.dir / "big.json").write_text("{\"x\": \"" + "a" * (cloud.WATCH_MAX_BYTES + 10) + "\"}")
+        (self.dir / "bad.json").write_text("{not json")
+        sb.cloud_watch_tick(self.engine, None)
+        sb.cloud_watch_tick(self.engine, None)
+        self.assertEqual(len(self.engine.cloud_watch["records"]), cloud.WATCH_MAX_RECORDS)
+        self.assertEqual(len([a for a in self.audit if a[1] == "cloud-watch.capped"]), 1)
+
+    def test_S4_bad_files_are_skipped_and_counted(self):
+        self.records(1)
+        (self.dir / "big.json").write_text("x" * 70000)
+        (self.dir / "bad.json").write_text("{not json")
+        sb.cloud_watch_tick(self.engine, None)
+        self.assertEqual(len(self.engine.cloud_watch["records"]), 1)
+        self.assertEqual(self.engine.cloud_watch["skipped"], 2)
+
+    def test_U2_no_directory_no_error_no_directory_created(self):
+        calls = self.finish()
+        self.assertEqual(calls["tick"], 1)
+        self.assertEqual(self.audit, [])
+        self.assertFalse(self.dir.exists())
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.

@@ -5413,3 +5413,9 @@ Each decision was walked against the matrix (its owner-hold meaning and its rati
 - **D2**: enforce the freeze with a ruleset on `integration`. Recommendation: yes if the owner is willing; otherwise the lanes' rule stays the control.
 - **D3**: batch size against the review checkout's limits. Recommendation: cap a batch at what the checkout accepts, and split a larger one.
 - **Follow-up asks** (each its own ask): a script that renders the batch table; the daemon's treatment of an ask whose change is in a non-default branch (T12) and of reference runs for `integration` (and a `push` run of CI on `integration`; pull requests into it already run CI, as the workflow has no branch filter); a report of merges into `integration` while a batch is ready.
+
+## Cloud watch
+
+Cloud workers are outside discovery: `Engine.discover` builds observations only from the multiplexer's agent entries, and a cloud worker has no pane and no local session. Its records live in the cloud record directory, which only `status` and the reaper read. One `cloud_watch_tick` in `finish_pass` (the daemon's existing per-pass step, no new process or thread) reads those records each pass, under try/except like its sibling ticks (a failure is audited with step `cloud-watch`).
+
+Reads are bounded: at most 50 records per pass and 64 KiB per record; an oversize or corrupt file is skipped and counted, and reaching the record cap is audited once (not an error). The tick is read-only and leaves its result on `engine.cloud_watch`. Relaying a cloud worker's report to its lane (#1020) shares this tick instead of adding a second read.
