@@ -19,6 +19,8 @@ Staff; an epic or workspace plan, the Chief of Staff, then the owner.
 ## The method, in order
 
 1. **Done-when**: copy the ask's clauses, numbered `(1) ... (2) ...`. They are the authority; never reword them.
+   A work item with no Done-when of its own takes the Done-when of its parent ask (its native sub-issue parent): `plan check` and the structure gate (G0a) read it there, and a Done-when the work item carries itself must still match exactly.
+   A pull request that proves only some of a plan's scenarios puts `CLAIMS: S3 S4 S5` directly under its `PLAN:` line: the proof gate (G1) counts only those, the others stay claimed by the epic, and a claim naming an undeclared scenario is refused. Note that every per-pull-request scenario must be claimed by some pull request: the last merge of an ask is refused while one stays unclaimed (only a logged `CU` waiver passes).
 2. **Clauses to scenarios**: every clause needs at least one behaviour scenario (`S`); behaviour that must NOT change is a
    `U` scenario. Each scenario has `covers` (`DW-n` or `PC-n`), `text` (Given/when/then), `proof` (`test | live | measure |
    screenshot`), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the specific wrong
@@ -39,7 +41,7 @@ Staff; an epic or workspace plan, the Chief of Staff, then the owner.
 
 `fleet-switchboard plan check <owner/repo#N> [--ask <owner/repo#N>] [--json]` prints `PASS` or `FAIL`, one defect per line,
 and the plan hash (editing anything changes it). Before you send a draft, run `plan check --file <plan> --done-when <the
-issue's Done-when>` (the issue body needs `## Intent` before `Done when:`; format 2 needs a `clauses:` and a `scenarios:` yaml block) and fix every defect.
+issue's Done-when>` (the issue body needs `## Intent` before `Done when:`; format 2 needs `clauses:` and `scenarios:` yaml blocks) and fix every defect.
 
 ## The form
 
@@ -51,7 +53,7 @@ detail) plus **one detail comment** whose first line is a heading containing `Pl
 
 When available: a `plan review` command launches independent read-only reviewers and records their verdicts (not built yet:
 until then ask the Chief of Staff for a hand-run review). The tier is computed from the ask or epic the plan serves, not
-chosen per item. Expect up to three rounds; an objection still standing after round three goes to the Chief of Staff, then the owner.
+chosen per item. Expect up to three rounds; then a standing objection goes to the Chief of Staff, then the owner.
 
 ## What the reviewers attack
 
@@ -86,7 +88,7 @@ scenarios:
     evaluator: ci
 ```
 
-Bad: `pass: works`, `discriminates: a wrong build would fail this`, or "add a `commission()` method" (how, not what).
+Bad: `pass: works`, a vague `discriminates`, or "add a `commission()` method" (how, not what).
 
 ## Wordings `plan check` accepts
 
@@ -100,6 +102,5 @@ Bad: `pass: works`, `discriminates: a wrong build would fail this`, or "add a `c
 
 Link it in every brief (`PLAN: <link>`). The worker proves each scenario with `fleet-switchboard prove S1 --pr <pr>
 --evidence <link-or-what-you-ran>`, an evaluator records `verdict`, and `fleet-switchboard gates <pr>` shows what is still
-open. The order does not matter (a `ci` verdict recorded before your `prove` counts once the proof exists at the same head, and
-the daemon records `ci` verdicts itself within minutes of green checks): a coder's only extra step is `prove`. A push voids every proof and
-verdict. A hotfix may be waived by the Chief of Staff, logged; the plan is then due retroactively within a day.
+open. The order does not matter: a coder's only extra step is `prove`. A push voids every proof and
+verdict. A logged Chief of Staff waiver may cover a hotfix; the plan is then due within a day.
