@@ -81,13 +81,13 @@ say which pod or secret REMAINS, and the exit is non-zero (130 for a signal).
 
 ## The stack create and the fresh-node race
 
-`create --stack` watches a Pending pod for a bounded window (4 minutes, at most 3 attempts) and recreates it, with the same
+`create --stack` watches a Pending pod for a bounded window (`STACK_RACE_WINDOW_SECONDS`, 600 seconds, with a pause of `STACK_RACE_PAUSE_SECONDS`, 15 seconds, before each recreate; there is no attempt count) and recreates it, with the same
 run id and nonce and without touching the per-run secrets, in two cases. First, the node's runtime handler is not yet
 known (the exact `FailedCreatePodSandBox` message): the node's runtime is configured by the installer about 30 to 60
 seconds after scheduling. Second, the pending pod vanishes: a get that saw the pod then says not found, which live run B
-saw when that runtime restart took the Pending pod object with it. Each attempt writes one audit line (`attempt N of 3`,
-and `pod vanished` for the second case). Before a recreate the launcher checks that this call's own Secrets are still there: a missing one means an outside deletion (a stop, the reaper), which fails the create without recreating (the check also runs after a recreate and before ready; it narrows the race with a stop in flight and cannot close it, as the pod and Secret deletes are not one step: a stop deletes the pod first and the Secrets later, so the creator can recreate and the Secret deletes land after the last check; if that pod never starts, the create's own wait ends and its cleanup deletes it; if it started and was reported ready, the stop has finished and the only later catch is the reaper at `--hard` (or idle)). A pod that was never seen, and every other failure, is not retried. The window is checked after each attempt ends, so it bounds the count of attempts, not the wall time (worst case 3 times the `--wait` plus 150 s of delete wait). After the
-attempts or the window the create fails and the message names the race or the vanish. See `docs/cloud-worker-interface.md`.
+saw when that runtime restart took the Pending pod object with it. Each attempt writes one audit line (`attempt N`,
+and `pod vanished` for the second case). Before a recreate the launcher checks that this call's own Secrets are still there: a missing one means an outside deletion (a stop, the reaper), which fails the create without recreating (the check also runs after a recreate and before ready; it narrows the race with a stop in flight and cannot close it, as the pod and Secret deletes are not one step: a stop deletes the pod first and the Secrets later, so the creator can recreate and the Secret deletes land after the last check; if that pod never starts, the create's own wait ends and its cleanup deletes it; if it started and was reported ready, the stop has finished and the only later catch is the reaper at `--hard` (or idle)). A pod that was never seen, and every other failure, is not retried. A recreate starts only if one more pause plus one poll (2 seconds, `WAIT_POLL_SECONDS`) fits in what is left of the window, and a retry's wait is cut to the time left, so the window bounds the wall time (the delete wait of up to 150 s per recreate aside). After the
+window the create fails with one message that names the race or the vanish, the attempts made and the seconds spent. See `docs/cloud-worker-interface.md`.
 
 ## Driving a cloud worker from the switchboard (`launch --cloud`, `send`, `read`, `status`, `retire`)
 
@@ -101,7 +101,7 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
 | `CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME` | the vault that holds the cluster administrator credential (secret `CW_CLUSTER_ADMIN_SECRET`, default `cw-cluster-admin-kubeconfig`; or a command in `CW_CLUSTER_ADMIN_CMD`) |
 | `CW_CLUSTER_TOKEN_DURATION` | the token's requested life, default `20m`, at most `60m` (kubectl's own floor is 10 minutes) |
 | `CW_GIT_TOKEN_CMD` | prints the one-hour git token for the repository (default: `app_token.py OWNER/NAME`, same settings as `run_task.py`); the managed reaper runs the same command to renew the token every 30 minutes |
-| `CW_MODEL_AUTH_FILE` | the OpenCode auth file; only its `github-copilot` entry is used |
+| `CW_OPENCODE_BIN` | the `opencode` program (default `opencode` on `PATH`); the launcher runs `opencode auth export` (fixed arguments, scrubbed environment, output through a pipe, in memory) and keeps only the one `github-copilot` entry, as a one-entry array. Refused by name: command missing or failing, no entry, two entries, an inactive entry, an entry that is not `oauth`; nothing is created |
 | `CW_PULL_SECRET` | optional: the image pull secret name passed to `create` |
 
 - **A cluster token per use.** Every command that needs the cluster mints its own token at that moment: the administrator
@@ -215,8 +215,15 @@ else, on stdout. It refuses (exit 1, one line on stderr naming the key, never a 
   is refused with a message that says so, before any pod exists. To cover a new repository, install the App on the account
   that owns it and add the repository to that installation (an App installed on two accounts mints for each of them);
 - the answer lists exactly the one repository and expires within 61 minutes; and
-- its `permissions` equal exactly `contents: write`, `pull_requests: write`, `metadata: read`: no extra key, no higher
-  level, none missing.
+- its `permissions` equal exactly `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read` (the one table, `EXPECTED_PERMISSIONS`; the request asks for the same four
+  and the answer is checked again): no extra key, no higher level, none missing.
+
+The worker can now read issues and their comments of its own repository (its ask and plan), through `issues: read`.
+It cannot write issues, labels, merges or settings; `issues: read` opens no write path, and the worker's `gh` wrapper
+still refuses every such write (a second line behind GitHub's own permission). The one owner step, in this order: merge the
+change, then add `issues: read` to the App's permissions and accept it on each installation. Until then a launch is refused
+before any pod exists, with one line that names `issues` and the owner step (the mint fails closed rather than also
+accepting the old set). The exact refusal GitHub gives for a permission granted but not yet accepted is not verified live.
 
 The private key travels only through a pipe to `openssl`; only `https://api.github.com` is used (`CW_GITHUB_API_BASE`
 may name a loopback `http` address, for tests).
