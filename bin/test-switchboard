@@ -3273,6 +3273,93 @@ class TestSteerToWorking(Base):
                            wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
         return code, out.getvalue(), err.getvalue()
 
+    # ---- #1131: the send path asks the registry's route (baseline of the pane route, endpoint route, mutants)
+    BASELINE = REPO / "bin" / "send-route-baseline.json"
+
+    def local_send_outcome(self):
+        self.work()
+        code, out, err = self.cli_send("hello", "there")
+        return {"code": code, "stdout": re.sub(r"\S+", "<id>", out.strip()), "stderr": err, "admitted": self.admission()["text"]}
+
+    def test_a_local_agent_with_a_pane_is_routed_exactly_as_before_a_stored_baseline(self):
+        got = self.local_send_outcome()
+        if os.environ.get("WRITE_SEND_BASELINE"):
+            self.BASELINE.write_text(json.dumps(got, indent=1, sort_keys=True) + "\n")
+        self.assertEqual(got, json.loads(self.BASELINE.read_text()))
+
+    def endpoint_world(self, state="idle", endpoint="https://pod.example.invalid/channel"):
+        self.work()
+        self.registry = sb.load_module("registry")
+        row = {"session": None, "kind": "orchestrator", "role": "orchestrator", "endpoint": endpoint}
+        if state:
+            row["state"] = state
+        self.registry.upsert(self.world.state, "cloudy", row, now=1)
+        self.posts = []
+
+        def fake_deliver(client, url, sender, name, text, post=None, **kw):
+            self.posts.append((url, sender, name, text))
+            return True, ""
+        patch = mock.patch.object(sb.load_module("endpoint_send"), "deliver", fake_deliver)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_an_agent_with_an_endpoint_and_no_pane_is_sent_to_its_registry_endpoint(self):
+        self.endpoint_world()
+        code, out, err = self.cli_send("ping", to="cloudy")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.posts, [("https://pod.example.invalid/channel", "cos", "cloudy", "ping")])   # a send that ignores the endpoint (the old path) never posts
+        self.assertEqual(self.world.admissions("platform"), [])
+
+    def test_the_endpoint_route_holds_while_blocked_and_keeps_the_sender_identity(self):
+        self.endpoint_world(state="blocked")
+        code, _, err = self.cli_send("ping", to="cloudy")
+        self.assertEqual(code, sb.EXIT_HELD)
+        self.assertIn("blocked on a permission request", err)
+        self.assertEqual(self.posts, [])
+        self.registry.upsert(self.world.state, "cloudy", {"session": None, "kind": "orchestrator", "role": "orchestrator",
+                                                          "endpoint": "https://pod.example.invalid/channel", "state": "idle"}, now=2)
+        code, _, err = self.cli_send("ping", to="cloudy")
+        self.assertEqual(self.posts[-1][1], "cos")   # the sender is the caller's identity, as on the pane route
+        with captured() as (out, err2):
+            os.environ.pop(sb.LAB_ENV, None)
+            code = sb.main(["send", "--from", "someone", "cloudy", "x"], runner=self.world.route, now=self.world.clock.now,
+                           wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        self.assertEqual(code, sb.EXIT_USAGE)   # --from outside the Lab is refused here as on the pane route
+
+    def test_an_unknown_agent_and_a_half_read_send_nothing_and_say_why(self):
+        self.endpoint_world()
+        code, _, err = self.cli_send("ping", to="nobody")
+        self.assertNotEqual(code, 0)
+        self.assertIn("not found", err)
+        self.assertEqual(self.posts, [])
+        registry = sb.load_module("registry")
+        real = registry.read
+        half = lambda d: dict(real(d), whole=False)
+        with mock.patch.object(registry, "read", half):
+            code, _, err = self.cli_send("ping", to="cloudy")
+        self.assertEqual(code, sb.EXIT_HELD)
+        self.assertIn("only partly read", err)
+        self.assertEqual(self.posts, [])
+
+    def test_the_endpoint_is_an_address_only_and_the_bearer_comes_from_the_clients_token_file(self):
+        es, client = sb.load_module("endpoint_send"), sb.load_module("cloud_client")
+        token = self.home / "agent-token"
+        token.write_text("tok.en-1")
+        seen = []
+        post = lambda request: seen.append(request) or {"status": 200}
+        ok, line = es.deliver(client, "http://cloud-hub.cw.svc:8443", "cos", "cloudy", "ping", post=post, token_path=str(token))
+        self.assertTrue(ok, line)
+        self.assertEqual(seen[0]["authorization"], "Bearer tok.en-1")
+        self.assertEqual({k: seen[0]["body"][k] for k in ("sender", "recipient", "text")}, {"sender": "cos", "recipient": "cloudy", "text": "ping"})
+        self.assertNotIn("tok.en-1", "http://cloud-hub.cw.svc:8443")
+        ok, line = es.deliver(client, "file:///etc/passwd", "cos", "cloudy", "ping", post=post)
+        self.assertFalse(ok)
+
+    def test_the_docs_say_the_send_path_uses_the_route_function(self):
+        text = (REPO / "docs" / "agent-registry.md").read_text()
+        self.assertIn("The send path uses it", text)
+        self.assertNotIn("not yet used by send", text)
+
     def test_a_send_that_hangs_ends_with_a_clear_line_not_a_silent_wait(self):
         import threading
         self.work()
