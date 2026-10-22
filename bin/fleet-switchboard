@@ -23674,10 +23674,56 @@ def cmd_gates_stats(args, runner, now):
     return EXIT_OK
 
 
+def plan_peers(ctx, runner, now):
+    """[(state, body)] of the OTHER pull requests of the same plan, `open` or `merged` (a pull request closed without a merge proves nothing). GETs only; raises when the list cannot be read."""
+    repo = ctx.pr.rsplit("#", 1)[0]
+    reader = IntentReader(ctx.config["gh"], repo, runner, now, ctx.config["call_timeout_seconds"], accounts=GhAccounts(ctx.config, runner, now))
+    listed = reader._api("repos/%s/pulls?state=all&sort=updated&direction=desc&per_page=100" % repo, repo)
+    if not isinstance(listed, list):
+        raise ValueError("the pull request list did not come back as a list")
+    peers = []
+    for other in listed:
+        if not isinstance(other, dict) or other.get("number") == ctx.number:
+            continue
+        if other.get("state") != "open" and not other.get("merged_at"):
+            continue
+        link = plan_ledger.PLAN_LINK_RE.search(plan_ledger.visible_body(other.get("body")))
+        if not link or not _same_plan(link.group(1).strip("<>.,"), ctx.source, ctx.config.get("intent_repo")):
+            continue
+        peers.append(("open" if other.get("state") == "open" else "merged", other.get("body")))
+    return peers
+
+
+def claim_union_refusal(args, runner, now):
+    """#976: the refusal line for the LAST merge of an ask whose claims leave a per-pull-request scenario uncovered, else None. A plan nobody narrows, a merge that is not the
+    ask's last, a pull request with no readable plan and a logged `CU` waiver at the head all give None. A list that cannot be read refuses only a pull request that itself has a claim line."""
+    try:
+        ctx = _ledger_context(types.SimpleNamespace(pr=args.pr, plan=None, ask=None), runner, now, False)
+    except Exception:
+        return None
+    if ctx.plan is None or ctx.plan.get("result") != "pass":
+        return None
+    body = (ctx.facts or {}).get("body")
+    scenarios = ctx.plan["scenarios_parsed"]
+    try:
+        peers = plan_peers(ctx, runner, now)
+    except Exception as err:
+        if plan_ledger.pr_claim(body, scenarios)[0] is None:
+            return None
+        return "merge of %s refused: the claim union could not be read (%s); the gate fails closed for a pull request with a claim line" % (ctx.pr, _one_line(str(err), 100))
+    applies, uncovered, last = plan_ledger.claim_union(scenarios, body, peers)
+    if not (applies and last and uncovered):
+        return None
+    head = (ctx.facts or {}).get("head")
+    if not ctx.problem and head and "CU" in plan_ledger.valid_waivers(ctx.entries, ctx.pr, head, now()):
+        return None
+    return plan_ledger.union_refusal(ctx.pr, uncovered)
+
+
 def claim_union_note(report, ctx, runner, now):
     """A pull request whose `CLAIMS:` line leaves scenarios to the epic's other pull requests: `gates` LISTS the ones no other OPEN or MERGED pull request under the same plan claims yet
     (a pull request with no claim line claims every per-PR scenario). Reads GitHub with GETs only, CLI only; a failed read is said, never silent. It enforces nothing: the union gate at the
-    ask's last merge is a follow-up."""
+    ask's last merge is `claim_union_refusal` (#976)."""
     try:
         if ctx.plan is None or ctx.plan.get("result") != "pass":
             return
@@ -23686,26 +23732,15 @@ def claim_union_note(report, ctx, runner, now):
         row = next((r for r in report["gates"] if r["gate"] == "G1"), None)
         if error or not left or row is None:
             return
-        repo = ctx.pr.rsplit("#", 1)[0]
-        reader = IntentReader(ctx.config["gh"], repo, runner, now, ctx.config["call_timeout_seconds"], accounts=GhAccounts(ctx.config, runner, now))
-        listed = reader._api("repos/%s/pulls?state=all&sort=updated&direction=desc&per_page=100" % repo, repo)
-        if not isinstance(listed, list):
-            raise ValueError("the pull request list did not come back as a list")
         covered = set()
-        for other in listed:
-            if not isinstance(other, dict) or other.get("number") == ctx.number:
-                continue
-            if other.get("state") != "open" and not other.get("merged_at"):
-                continue   # closed without a merge: it proves nothing
-            link = plan_ledger.PLAN_LINK_RE.search(plan_ledger.visible_body(other.get("body")))
-            if not link or not _same_plan(link.group(1).strip("<>.,"), ctx.source, ctx.config.get("intent_repo")):
-                continue
-            claimed, _, other_error = plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], other.get("body"))
+        for _, other_body in plan_peers(ctx, runner, now):
+            claimed, _, other_error = plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], other_body)
             if not other_error:
                 covered.update(x["id"] for x in claimed)
         missing = [x["id"] for x in left if x["id"] not in covered]
         report["unclaimed"] = missing
-        row["detail"] = (row.get("detail") or "") + "; claimed by no other open or merged pull request of this plan yet: %s" % (", ".join(missing) if missing else "none")
+        report["claim_union"] = sorted(covered | {x["id"] for x in plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], mine)[0]})   # the union of the open and merged claims of this ask (#976)
+        row["detail"] = (row.get("detail") or "") + "; claimed by no other pull request (open or merged, same plan) yet: %s" % (", ".join(missing) if missing else "none")
     except Exception as err:   # said, never silent
         report["unclaimed_error"] = _one_line("%s: %s" % (type(err).__name__, err), 160)
 
@@ -23991,6 +24026,14 @@ def cmd_merge_gate(args, runner, now):
     def waived(head):
         entries, problem = plan_ledger.read_ledger(state)
         return not problem and gate.WAIVER_GATE in plan_ledger.valid_waivers(entries, ref, head, now())
+    union = claim_union_refusal(args, runner, now)   # #976: before everything else, the owner's own terminal included; only a logged `CU` waiver passes
+    if union:
+        _gates_audit(engine, "merge_gate.refused", ref, {"by": who, "why": _one_line(union, 300)})
+        if args.json:
+            print(json.dumps({"allowed": False, "reason": union, "head": None, "locked": False}, sort_keys=True))
+        else:
+            sys.stderr.write("%s\n" % union)
+        return plan_ledger.EXIT_REFUSE
     allowed, why, head = gate.check_merge(reading, gh, conf, state, repo, number, who, kind[0] == "person", waived, now)
     _gates_audit(engine, "merge_gate.allowed" if allowed else "merge_gate.refused", ref, {"by": who, "why": _one_line(why, 300)})
     if args.json:
@@ -24729,7 +24772,7 @@ def add_ledger_parsers(sub):
                                        "by a writer of the PR. A ledger entry and an audit line; it lasts 24 hours (the retroactive "
                                        "plan is due then) and a push needs a new one. `gates` shows the gate as waived, not passed.")
     waive.add_argument("pr", help="The pull request: owner/repo#N or its URL")
-    waive.add_argument("--gates", required=True, help="Comma-separated gates: G0a,G0b,G0c,G1,G2/G3,G4,G5, or MG (the merge gate, #962)")
+    waive.add_argument("--gates", required=True, help="Comma-separated gates: G0a,G0b,G0c,G1,G2/G3,G4,G5, MG (the merge gate, #962) or CU (the claim union at an ask's last merge, #976)")
     waive.add_argument("--reason", required=True, help="Why (at least %d characters)" % plan_ledger.WAIVER_REASON_MIN)
     waive.add_argument("--head", help="The PR head sha (default: read from GitHub)")
     gates = sub.add_parser("gates", help="Read-only: the plan's gates G0a to G8 for a PR, what each needs and who decides it. "

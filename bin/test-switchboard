@@ -80068,7 +80068,7 @@ class TestPrClaimLine(LedgerBase):
         self.route = lambda argv, **kw: (subprocess.CompletedProcess(argv, 0, json.dumps(others), "") if "/pulls?state=all" in " ".join(argv) else route(argv, **kw))
         code, report, err = self.gates()
         self.assertEqual(sorted(report["unclaimed"]), ["S3", "U1"])
-        self.assertIn("claimed by no other open or merged pull request of this plan yet: S3, U1", self.row(report, "G1")["detail"])
+        self.assertIn("claimed by no other pull request (open or merged, same plan) yet: S3, U1", self.row(report, "G1")["detail"])
         others[0]["body"] = "PLAN: acme/app#7\nCLAIMS: S3 U1"            # another PR now claims the rest: nothing is unclaimed
         self.assertEqual(self.gates()[1]["unclaimed"], [])
 
