@@ -50,21 +50,26 @@ def _clean(value):
 
 def _inside(root, relative):
     """The file `relative` under `root`, or None when it escapes the fixture directory."""
-    path = (root / str(relative)).resolve()
     try:
+        path = (root / str(relative)).resolve()
         path.relative_to(root.resolve())
-    except ValueError:
+    except (ValueError, OSError):
         return None
     return path
 
 
 def _norm(path):
-    return Path(os.path.normcase(str(Path(path).resolve())))
+    try:
+        return Path(os.path.normcase(str(Path(path).resolve())))
+    except (ValueError, OSError):
+        return None
 
 
 def _overlap(import_dir, agent_dir):
-    """Which way an agent's working directory meets the import directory: 'same', 'agent_inside', 'import_inside' or None."""
+    """Which way an agent's working directory meets the import directory: 'same', 'agent_inside', 'import_inside', 'unresolvable' (counts as shared) or None."""
     d, a = _norm(import_dir), _norm(agent_dir)
+    if d is None or a is None:
+        return "unresolvable"
     if a == d:
         return "same"
     if d in a.parents:
@@ -83,8 +88,22 @@ def _strings(value, field):
     _need(isinstance(value, list) and all(isinstance(v, str) for v in value), field)
 
 
+def _no_nul(value, field="(fixture)"):
+    """Raise FixtureError when any string in the fixture, key or value, holds a NUL byte (it breaks path resolution)."""
+    if isinstance(value, str):
+        _need("\0" not in value, field + " (NUL byte)")
+    elif isinstance(value, list):
+        for item in value:
+            _no_nul(item, field)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _no_nul(key, field)
+            _no_nul(item, field)
+
+
 def validate(state):
-    """Raise FixtureError unless every field the check reads has its documented type."""
+    """Raise FixtureError unless every field the check reads has its documented type and no string holds a NUL byte."""
+    _no_nul(state)
     _need(isinstance(state, dict), "(root)")
     _need(state.get("phase") is None or isinstance(state.get("phase"), str), "phase")
     for key in ("cloud_daemon", "local_daemon", "snapshot", "import"):
@@ -141,8 +160,10 @@ def check(state, root):
             add("snapshot_matches", digest == snap.get("sha256"), "checksum %s" % ("equal" if digest == snap.get("sha256") else "differs"))
     else:
         exports = [_inside(root, i["export"]) for i in orchestrators if i.get("export")]
+        escaped = (bool(snap.get("file")) and path is None) or any(p is None for p in exports)
         present = [p for p in [path] + exports if p is not None and p.exists()]
-        add("snapshot_removed", snap.get("removed") is True and not present, "snapshot and exports deleted" if snap.get("removed") is True and not present else "snapshot or exports not deleted")
+        done = snap.get("removed") is True and not present and not escaped
+        add("snapshot_removed", done, "snapshot and exports deleted" if done else "a path escapes the fixture directory" if escaped else "snapshot or exports not deleted")
 
     cloud_agents = set(state.get("cloud_agents") or [])
     lost = sorted(cloud_agents - set(state.get("local_agents") or []))

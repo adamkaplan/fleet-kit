@@ -39,7 +39,10 @@ def write_fixture(root, **change):
     """A complete fixture. Phase after-start by default; in phase done the tarball and the export are deleted (unless keep=True)."""
     keep = change.pop("keep", False)
     phase = change.get("phase", "after-start")
-    if phase != "done" or keep:
+    only_export = change.pop("_only_export", False)
+    if only_export:
+        (root / "orch.json").write_text("{}")
+    elif phase != "done" or keep:
         (root / "snap.tar").write_bytes(b"state")
         (root / "orch.json").write_text("{}")
     state = {"phase": phase, "cloud_daemon": {"running": False}, "local_daemon": {"running": True},
@@ -120,7 +123,7 @@ CASES = {
     "export_missing": ("MISSING orchestrator_exports: exports missing for: o", dict(orchestrators=[{"name": "o", "export": "nope.json"}]),
                        [('add("orchestrator_exports", not absent,', 'add("orchestrator_exports", True,')]),
     "export_escapes_to_a_real_file": ("MISSING orchestrator_exports: exports missing for: o", dict(orchestrators=[{"name": "o", "export": "../outside.json"}]),
-                                      [("    try:\n        path.relative_to(root.resolve())\n    except ValueError:\n        return None\n", "")]),
+                                      [("    try:\n        path = (root / str(relative)).resolve()\n        path.relative_to(root.resolve())\n    except (ValueError, OSError):\n        return None\n", "    path = (root / str(relative)).resolve()\n")]),
     "fallback_value_unknown": ("MISSING orchestrator_exports: exports missing for: o", dict(orchestrators=[{"name": "o", "export_fallback": "other"}]),
                                [('item.get("export_fallback") != "resume_brief"', 'item.get("export_fallback") is None')]),
     "import_same_dir": (SAME[0], IMPORT(dir="/work/x"),
@@ -136,10 +139,22 @@ CASES = {
     "copy_remains": ("MISSING import_copy_deleted: 1 imported copies remain", dict(phase="done", **IMPORT(copies_remaining=["ses_1"])),
                      [('add("import_copy_deleted", not left,', 'add("import_copy_deleted", True,')]),
     "snapshot_not_marked_removed": ("MISSING snapshot_removed", dict(phase="done", snapshot={"file": "snap.tar", "sha256": "0", "removed": False}),
-                                    [('add("snapshot_removed", snap.get("removed") is True and not present,', 'add("snapshot_removed", True,')]),
+                                    [('add("snapshot_removed", done,', 'add("snapshot_removed", True,')]),
     "snapshot_still_on_disk": ("MISSING snapshot_removed", dict(phase="done", keep=True),
-                               [('add("snapshot_removed", snap.get("removed") is True and not present,', 'add("snapshot_removed", snap.get("removed") is True,')]),
+                               [('add("snapshot_removed", done,', 'add("snapshot_removed", snap.get("removed") is True,')]),
+    "export_still_on_disk_when_done": ("MISSING snapshot_removed: snapshot or exports not deleted", dict(phase="done", _only_export=True),
+                                       [("p for p in [path] + exports if", "p for p in [path] if")]),
+    "snapshot_escapes_when_done": ("MISSING snapshot_removed: a path escapes", dict(phase="done", snapshot={"file": "../outside.json", "removed": True}),
+                                   [("(bool(snap.get(\"file\")) and path is None) or ", "")]),
+    "export_escapes_when_done": ("MISSING snapshot_removed: a path escapes", dict(phase="done", orchestrators=[{"name": "o", "export": "../outside.json"}]),
+                                 [(" or any(p is None for p in exports)", "")]),
 }
+
+
+# What a mutant that drops a validate check must do instead of exiting 2: by default finish with exit 0 or 1; the listed
+# fixtures reach code that cannot take the bad value, and must fail with exactly that exception type.
+EXPECTED_MUTANT_RESULT = {"invalid json": ("JSONDecodeError",), "deeply nested json": ("RecursionError",),
+                          "root is a list": ("AttributeError",), "orchestrator entry is a string": ("AttributeError",)}
 
 
 class TestWayBack(unittest.TestCase):
@@ -209,6 +224,19 @@ class TestWayBack(unittest.TestCase):
     def test_malformed_fixtures_exit_2_with_one_line(self):
         bad = {
             "invalid json": ("{not json", ("except (OSError, ValueError, RecursionError)", "except OSError")),
+            "deeply nested json": ("[" * 200000, ("except (OSError, ValueError, RecursionError)", "except (OSError, ValueError)")),
+            "phase is a number": (json.dumps({"phase": 5}), ('_need(state.get("phase") is None or isinstance(state.get("phase"), str), "phase")', '_need(True, "phase")')),
+            "snapshot.file is a number": (json.dumps({"snapshot": {"file": 5}}), ('for key in ("file", "sha256"):', 'for key in ("sha256",):')),
+            "snapshot.removed is a string": (json.dumps({"snapshot": {"removed": "yes"}}), ('_need(snap.get("removed") is None or isinstance(snap.get("removed"), bool), "snapshot.removed")', '_need(True, "snapshot.removed")')),
+            "orchestrator name is a number": (json.dumps({"orchestrators": [{"name": 1}]}), ('for key in ("name", "export", "export_fallback"):', "for key in ():")),
+            "orchestrator export is a number": (json.dumps({"orchestrators": [{"export": 1}]}), ('for key in ("name", "export", "export_fallback"):', "for key in ():")),
+            "orchestrator fallback is a list": (json.dumps({"orchestrators": [{"export_fallback": []}]}), ('for key in ("name", "export", "export_fallback"):', "for key in ():")),
+            "import.dir is a number": (json.dumps({"import": {"dir": 5}}), ('_need(imp.get("dir") is None or isinstance(imp.get("dir"), str), "import.dir")', '_need(True, "import.dir")')),
+            "agent_dirs holds a number": (json.dumps({"import": {"agent_dirs": [1]}}), ('for key in ("agent_dirs", "copies_remaining"):', 'for key in ("copies_remaining",):')),
+            "copies_remaining is a string": (json.dumps({"import": {"copies_remaining": "x"}}), ('for key in ("agent_dirs", "copies_remaining"):', 'for key in ("agent_dirs",):')),
+            "NUL in snapshot.file": (json.dumps({"snapshot": {"file": "a\0b"}}), ("    _no_nul(state)\n", "")),
+            "NUL in an export": (json.dumps({"orchestrators": [{"name": "o", "export": "a\0b"}]}), ("    _no_nul(state)\n", "")),
+            "NUL in an agent_dirs entry": (json.dumps({"import": {"dir": "/tmp/i", "agent_dirs": ["/w/a\0b"]}}), ("    _no_nul(state)\n", "")),
             "root is a list": ("[]", ('_need(isinstance(state, dict), "(root)")', '_need(True, "(root)")')),
             "orchestrator entry is a string": (json.dumps({"orchestrators": ["x"]}), ('_need(isinstance(item, dict), "orchestrators[]")', '_need(True, "orchestrators[]")')),
             "agents is a string": (json.dumps({"cloud_agents": "ab"}), ("_need(isinstance(value, list) and all(isinstance(v, str) for v in value), field)", "_need(True, field)")),
@@ -222,10 +250,22 @@ class TestWayBack(unittest.TestCase):
             self.assertTrue(text.startswith("cannot read way-back.json"), name)
             self.assertNotIn("Traceback", text)
             try:
-                code, _, _ = run(mutant(old, new), raw=raw)
-            except Exception:
-                code = None
-            self.assertNotEqual(code, 2, "%s survives %r" % (name, old))
+                code, text, _ = run(mutant(old, new), raw=raw)
+                result = code if code != 2 else "still exit 2"
+            except Exception as err:
+                result = type(err).__name__
+            self.assertIn(result, EXPECTED_MUTANT_RESULT.get(name, (0, 1)), "%s survives %r: %r" % (name, old, result))
+
+    def test_unresolvable_paths_count_as_not_ok(self):
+        self.assertIsNone(REAL._inside(Path("/tmp"), "a\0b"))
+        self.assertIsNone(REAL._norm("a\0b"))
+        self.assertEqual(REAL._overlap("/tmp/x", "a\0b"), "unresolvable")
+        self.assertIsNone(REAL._inside(Path("/tmp"), "a\0b"))
+        self.assertRaises(ValueError, mutant("    try:\n        path = (root / str(relative)).resolve()\n        path.relative_to(root.resolve())\n    except (ValueError, OSError):\n        return None\n", "    path = (root / str(relative)).resolve()\n    path.relative_to(root.resolve())\n")._inside, Path("/tmp"), "a\0b")
+        self.assertRaises(ValueError, mutant("    try:\n        return Path(os.path.normcase(str(Path(path).resolve())))\n    except (ValueError, OSError):\n        return None\n", "    return Path(os.path.normcase(str(Path(path).resolve())))\n")._norm, "a\0b")
+        shared = dict(import_dir="/tmp/x")
+        self.assertEqual(REAL._overlap("a\0b", "/tmp/x"), "unresolvable")
+        self.assertIsNone(mutant('    if d is None or a is None:\n        return "unresolvable"\n', "").__dict__["_overlap"]("/tmp/x", "/tmp/y"))
 
     def test_an_unreadable_fixture_and_a_bad_command_line_exit_2(self):
         with tempfile.TemporaryDirectory() as tmp:
