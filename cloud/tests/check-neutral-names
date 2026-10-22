@@ -127,6 +127,11 @@ def prefix_misses(pod):
 # Environment variables the cloud code and the image entrypoint READ or SET: ours carry the cw prefix. Standard ones of
 # the platform, of git, gh and OpenCode are not ours; WORKER_DOCKER pre-dates the prefix rule and is named in the image docs.
 STANDARD_ENV = re.compile(r"^(HOME|PATH|TMPDIR|USER|PWD|XDG_[A-Z_]+|KUBECONFIG|GIT_[A-Z_]+|GH_(TOKEN|REPO)|OPENCODE_SERVER_PASSWORD|WORKER_DOCKER)$")
+# A CLOSED list of names that are git's or Git Credential Manager's own (not ours, not GIT_-prefixed), each with its reason.
+# Adding one needs a reason here and a row in bin/test-cloud-neutral-names; a name is never exempted by pattern.
+GIT_STANDARD_ENV = {
+    "GCM_INTERACTIVE": "Git Credential Manager's own switch; the entrypoint only exports the constant never; a caller's value is not read (#1050)",
+}
 SOURCE_ENV_FILES = ("launcher/run_task.py", "worker/entrypoint.sh")
 ENV_READS = (re.compile(r"(?:env|environ|os\.environ)(?:\.get\(|\[)\s*[\"']([A-Z][A-Z0-9_]*)[\"']"),   # python
              re.compile(r"\$\{([A-Z][A-Z0-9_]*):?[-=?+]"), re.compile(r"(?:^|[\s;])export\s+([A-Z][A-Z0-9_]*)"))   # shell
@@ -143,7 +148,7 @@ def source_misses(files):
             continue
         for pat in ENV_READS:
             for name in sorted({m.group(1) for m in pat.finditer(text)}):
-                if not name.startswith("CW_") and not STANDARD_ENV.match(name):
+                if not name.startswith("CW_") and not STANDARD_ENV.match(name) and name not in GIT_STANDARD_ENV:
                     miss.append("env %s read in %s" % (name, os.path.basename(f)))
     return sorted(set(miss))
 

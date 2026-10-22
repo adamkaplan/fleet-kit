@@ -40,6 +40,31 @@ Rules this file keeps from the start:
 
 Python 3.9+, standard library only.
 """
+
+
+def _fleet_parts(after=False):
+    """The assembler: parts named in bin/fleet-switchboard.parts run in order in this one namespace (docs/switchboard.md, "The assembler"). The line naming the entry is where its own code runs: parts before it run now, parts after it at the end of the file."""
+    import os, sys
+    here = os.path.realpath(__file__)
+    try:
+        with open(here + ".parts") as handle:
+            names = [n.strip() for n in handle.read().splitlines() if n.strip() and not n.lstrip().startswith("#")]
+    except FileNotFoundError:
+        return   # no manifest: the entry alone
+    except OSError as err:
+        sys.exit("fleet-switchboard: cannot read the parts manifest %s.parts: %s" % (here, err.strerror or err))
+    paths = [os.path.realpath(os.path.join(os.path.dirname(here), n)) for n in names]
+    cut = paths.index(here) if here in paths else len(paths)
+    for path in (paths[cut + 1:] if after else paths[:cut]):
+        try:
+            with open(path) as handle:
+                code = compile(handle.read(), path, "exec")
+        except OSError:
+            sys.exit("fleet-switchboard: part file not found: %s" % path)
+        exec(code, globals())
+
+
+_fleet_parts()
 import argparse
 import base64
 import http.client
@@ -352,6 +377,7 @@ DEFAULTS = {
     "disk_guard": None,            # free space of the state directory's volume: None = defaults (min_free_gb 50, hard_free_gb 10); false = off; or {"min_free_gb": n, "hard_free_gb": n}
     "reds": None,                  # `reds` (#342): {"reference_events": {"owner/repo": ["merge_group", "schedule"]}, "workflow": {"owner/repo": "ci.yml"}}: the events whose runs on the default branch are "main's runs" (default: push), and an optional override of the workflow (default: the one that holds the pull request's artifact)
     "heavy": None,                 # CPU slots for `heavy -- <command>` (full suites, e2e runs): None = 3 slots; or {"slots": n, "ceilings": {"full": s, "focused": s, "e2e": s, "other": s, "max": s}}
+    "no_multiplexer": False,       # true: discovery reads the registry and the headless and cloud records only; `agent_list` is never called and a missing herdr is no problem (off: unchanged)
     "docker_reaper": True,         # the daily removal of EXPIRED labelled docker containers, networks and volumes (`disk reap-docker`): false is the kill switch
     "v2_events": "auto",           # the daemon's news of sessions: "auto" (the service's event stream, where the HTTP route exists; reads only what an event did not say) or "off" (the old reads)
     "v2_plugin_events": "auto",    # the in-service plugin's pushed facts (#290 slice 6): "auto" (the daemon listens on its socket and marks the named session for one bounded read) or "off" (the session.list gate is the only signal)
@@ -632,6 +658,8 @@ def validate_config(raw, source="config"):
             raise ConfigError(str(err)) from None
         except Exception as err:   # a validator that fails any other way is a broken module, not a bad value: still the whole configuration, naming the file
             raise ConfigError("config module %s.py: its validator failed (%s: %s): no configuration is loaded" % (name, type(err).__name__, _one_line(str(err), 160))) from None
+    if not isinstance(config["no_multiplexer"], bool):
+        raise ConfigError("%s: 'no_multiplexer' must be true or false, got %r" % (source, config["no_multiplexer"]))
     if not isinstance(config["docker_reaper"], bool):
         raise ConfigError("%s: 'docker_reaper' must be true or false, got %r" % (source, config["docker_reaper"]))
     if config["v2_events"] not in ("auto", "off"):
@@ -1868,6 +1896,7 @@ class V2Client:
             argv += ["-d", json.dumps(data, separators=(",", ":"), sort_keys=True)]
         env = dict(os.environ)
         env.update(self.env)
+        env.update(NO_CREDENTIAL_DIALOG_ENV)   # #1050: the service and a headless worker's tools never open a credential dialog
         # OpenCode v2's `api` command loses the end of a large reply when it writes to a pipe and exits
         # (a real 500 KB transcript arrived cut at 293 KB, inside a string, and every read failed with
         # bad_json). Into a file the reply is whole, so the reply goes to a file and is read back.
@@ -4516,6 +4545,9 @@ class Switchboard:
     def _discover(self, now, entries=None):
         found = Discovery()
         self.discovery = found
+        if entries is None and (getattr(self, "config", None) or {}).get("no_multiplexer") is True:   # records only: no terminal multiplexer is asked, so its absence is no standing problem
+            self._discover_headless(found, now)
+            return found
         if entries is None:
             try:
                 entries = self.herdr.agent_list()
@@ -5052,7 +5084,7 @@ class Switchboard:
         """Write `unread` where it differs from what herdr's agent list shows."""
         shown = {entry.get("pane_id"): (entry.get("tokens") or {}).get("unread") for entry in discovery.entries}
         for name, observation in sorted(discovery.agents.items()):
-            if not observation.pane:
+            if not observation.pane or (getattr(self, "config", None) or {}).get("no_multiplexer") is True:   # no pane, or no multiplexer to write to: no badge, no error
                 continue
             try:
                 count = self.unread_count(observation, held)
@@ -5096,6 +5128,8 @@ class Switchboard:
         """At most one toast per pass (herdr allows one a second, and queues none),
         for the first agent whose reason has not been toasted yet. A reason
         that has cleared is forgotten, so it toasts again if it comes back."""
+        if (getattr(self, "config", None) or {}).get("no_multiplexer") is True:   # a toast is a multiplexer call and goes to no pane here: none is tried, none fails
+            return
         candidates = self.toast_candidates(discovery, held, now)
         self.toasted = {name: reason for name, reason in self.toasted.items()
                         if any(c[0] == name and c[1] == reason for c in candidates)}
@@ -6245,6 +6279,17 @@ VIEW_ROLE_ENV = "FLEET_SWITCHBOARD_ROLE"  # PR 18: what the pane's TUI reads to 
 VIEW_REPO_ENV = "FLEET_SWITCHBOARD_REPO"
 
 
+NO_CREDENTIAL_DIALOG_ENV = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}   # #1050: no git call of the fleet may open a credential dialog (shims/git sets them too)
+
+
+def launch_base_env(config):
+    """The environment of a terminal launch or reattach: the configured opencode_env and launch_env, plus the two variables that stop a credential dialog (#1050). They go last: a config cannot turn them off."""
+    env = dict(config["opencode_env"])
+    env.update(config["launch_env"])
+    env.update(NO_CREDENTIAL_DIALOG_ENV)
+    return env
+
+
 def view_env(role, repo):
     """The pane's environment that tells its TUI who it is (not secrets): the Decisions panel shows every tier and
     repo to the Chief of Staff, one repo to a pane that names it, the human tier to any other."""
@@ -6358,7 +6403,7 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
     if taken is not None:
         raise LaunchError("a fleet agent named %s already runs in pane %s" % (name, taken.pane))
     fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by, read_repo)
-    env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
+    env = launch_base_env(engine.config)
     env.update(view_env(role, repo or (engine.config.get("intent_repo") if charter else None)))  # PR 18
     env.update(agent_tmp_env(engine, name))   # #767: before the session exists, so a failure leaves nothing started
     accounts = getattr(engine, "accounts", None)
@@ -6620,7 +6665,7 @@ def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, 
                           % (session_id, fleet.get("name"), name))
     if not directory or not os.path.isabs(directory):
         raise LaunchError("session %s has no working directory to open the tab in" % session_id)
-    env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
+    env = launch_base_env(engine.config)
     # Everything about who the agent is comes from the session's STORED fleet metadata, never from the caller: a reattached agent keeps its
     # repo, role, charter and gh account (a caller-given --repo that differs was refused by the command).
     repo = fleet.get("repo") or (engine.config.get("intent_repo") if fleet.get("charter") else None)
@@ -6837,7 +6882,15 @@ def retired_agent(retired, name, session):
     return isinstance(entry, dict) and entry.get("session") is not None and entry.get("session") == session   # no session on the record: it covers nothing
 
 
-RETIRED_RECORD_FIELDS = ("pane", "role", "charter", "repo", "workspace", "cwd")   # what the pane record holds besides the session (and `seen`, which nothing reads)
+def registry_route(state_dir, name):
+    """Where a message to `name` would go by the registry (#1074; a function only, send does not call it yet): its pane when it has one (as before), else its registry endpoint; None on a half read or an unknown agent."""
+    registry = load_module("registry")
+    reg = registry.read(state_dir)
+    row = reg["agents"].get(name) if reg["whole"] else None
+    return registry.route_for(row)
+
+
+RETIRED_RECORD_FIELDS = tuple(f for f in load_module("registry").RECORD_FIELDS if f not in load_module("registry").OPTIONAL_FIELDS)   # derived from the registry's one tuple; an endpoint is never in a pane record (no pane is bound to an endpoint row). What the pane record holds besides the session (and `seen`, which nothing reads)
 
 
 def pane_record_of(row):
@@ -7051,6 +7104,8 @@ def bell_migration(engine, registry, now):
     on a whole read only (agent list and tab list both answered); audited per agent; a marker file stops it from running, or reading herdr, again."""
     if registry.bell_migrated(engine.state_dir):
         return
+    if (getattr(engine, "config", None) or {}).get("no_multiplexer") is True:   # no terminal multiplexer is asked: the migration stays pending
+        return
     try:
         agents, tabs = engine.herdr.agent_list(), engine.herdr.tab_list()
     except HerdrError as err:
@@ -7189,7 +7244,7 @@ def pane_health_pass(engine, now):
         live = state_now if state_now in (PANE_DETACHED, PANE_DEAD) else ((obs.status if obs is not None and obs.status in registry.STATES else None) or "idle")
         new = dict(row, state=live)
         old = registered.get(name)
-        if old is not None and all(old.get(k) == new.get(k) for k in registry.AGENT_FIELDS + ("state",)):
+        if old is not None and all(old.get(k) == new.get(k) for k in registry.CHANGE_FIELDS):
             continue
         got = registry.upsert(engine.state_dir, name, new, now=now)
         if got["problem"] and not got["problem"].endswith("is retired for this session"):
@@ -26634,7 +26689,7 @@ def cmd_preflight_pr(args, runner, now):
                 if job:
                     commands.remove((skipped,))
                     print("preflight-pr: %s: skipped, CI runs it for this pull request (job %s)" % (shown, job))
-            env = dict(os.environ, FLEET_HEAVY_MAX_SECONDS=str(ceiling))   # the ceiling runs INSIDE the slot (heavy's watchdog starts when the slot is granted): a wait in the queue is never a timeout
+            env = dict(os.environ, FLEET_HEAVY_MAX_SECONDS=str(ceiling), **NO_CREDENTIAL_DIALOG_ENV)   # the ceiling runs INSIDE the slot (heavy's watchdog starts when the slot is granted): a wait in the queue is never a timeout
             sys.stderr.write("preflight-pr: %s: waiting for a slot, then running (ceiling %ds once running)\n" % (name, ceiling))
             if under is not None:
                 scratch = os.path.join(work, ("tok_" + "x" * PREFLIGHT_TOKEN_LENGTH)[:PREFLIGHT_TOKEN_LENGTH])
@@ -34457,6 +34512,10 @@ def derive_action_groups():
 
 
 derive_action_groups()
+
+
+_fleet_parts(after=True)
+globals().pop("_fleet_parts")
 
 
 if __name__ == "__main__":
