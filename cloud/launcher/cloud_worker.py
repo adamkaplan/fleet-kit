@@ -1453,7 +1453,7 @@ class Launcher:
                     raise CloudError("worker %s does not match run id %s; nothing was stopped or deleted" % (worker, nonce), EXIT_REFUSED)
             if not pod:
                 if nonce:   # no pod: this run's own Secrets (carrying the nonce) may remain from a cut-off create; another's are left whole
-                    self._remove(name, nonce)
+                    self._remove_gone(worker, name, nonce)
                 return {"worker": worker, "runtime_id": "", "pushed": False, "wip_branch": None}
             info["rid"], info["cost"] = "pod/" + pn, self.cost(pod)
             if not getattr(a, "no_record", False):   # BEFORE the hook and the delete; never raises, never holds the stop back
@@ -1511,6 +1511,27 @@ class Launcher:
         except PodChanged:
             pass   # the workload is gone: a pod the controller replaced meanwhile is gone with it
         self._remove(name, nonce)
+
+    def _remove_gone(self, worker, name, nonce):
+        """The pod NAME-0 is absent. If a StatefulSet of that name exists it is deleted FIRST (else its controller recreates a pod that
+        sits Pending on the Secrets), then the Secrets. With a nonce a StatefulSet of another run is left whole. Raises naming what REMAINS."""
+        try:
+            wl = self.kube.get_workload(name)
+        except CloudError as e:
+            raise CloudError("could not look up statefulset/%s; REMAINS unknown: %s" % (name, e))
+        if wl and nonce and (((wl.get("spec") or {}).get("template") or {}).get("metadata") or {}).get("annotations", {}).get("cw/run-id") != nonce:
+            print("cloud-worker: statefulset/%s is not this run's (its run id does not match); left whole" % name, file=sys.stderr)
+            return
+        if wl:
+            try:
+                self._remove_persistent(name, name + "-0", nonce)
+            except CloudError as e:
+                if "REMAINS" in str(e):
+                    raise
+                raise CloudError("delete incomplete; REMAINS: statefulset/%s (and its Secrets); delete with: %s; cause: %s" % (
+                    name, self.kube.delete_command("statefulset", name), e))
+        else:
+            self._remove(name, nonce)
 
     def _remove(self, name, nonce, uid=None):
         """Delete the pod and both Secrets (as `delete` does); with a nonce, only those that carry it (the pod, when there, matched already).
@@ -1613,7 +1634,8 @@ class Launcher:
 
         def go(info):
             pod = self._need(worker)
-            if not pod:
+            if not pod:   # no pod (node loss, eviction): its StatefulSet and Secrets may remain, and are removed
+                self._remove_gone(worker, name, None)
                 return {"worker": worker, "runtime_id": "", "deleted": True}
             info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
             if ann(pod, "hook-ran") != "true" and not a.force:

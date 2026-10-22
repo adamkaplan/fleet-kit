@@ -181,6 +181,10 @@ The managed reaper's loop (`reap --loop`) does it, as one more step of each pass
   call, and the file is a whole-directory projected volume (no `subPath`) that the kubelet refreshes, usually within a minute or two.
 - **For which repository.** The pod's `CW_REPO` must equal the `repo` of the switchboard's worker record (read only, `CW_CLOUD_RECORD_DIR`, which the renewal therefore needs in the reaper's
   environment) and be on `CW_ALLOWED_REPOS`. A missing or unreadable record, a mismatch, a pod that is not running or past its hard limit, or a Secret that is not this run's stops the renewal.
+- **The reaper MUST have `CW_CLOUD_RECORD_DIR` set.** The role (worker or orchestrator) comes from the switchboard's worker record only. With the variable unset, or the record missing or
+  unreadable, the role reads as `worker`: an orchestrator is then treated as a worker, skipped by the renewal pass without a message, and its token dies at one hour.
+- **A pod that is gone.** `stop` and `delete` of a persistent role whose pod `<name>-0` is absent (node loss, eviction, the gap before the controller recreates it) but whose
+  StatefulSet remains delete the StatefulSet first, then the Secrets; a StatefulSet of another run id is left whole, and a failed delete names `statefulset/<name>` as REMAINING.
 - **The reaper's own needs.** It runs the mint, so it reads the vault settings (`CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME`, from the settings file as the launcher does) and needs a signed-in `az` session and a network path the vault accepts.
   Without them every renewal fails closed (below) and workers behave as before: they lose push at one hour.
 - **When it fails** (the vault, the lookup, the mint or the patch): the old token stays, one audit line (`action: renew-git-token`, `ok: false`, the reason, never a value) is written, and the next pass tries again. The worker is

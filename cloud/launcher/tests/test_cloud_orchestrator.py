@@ -66,6 +66,10 @@ class FakeKube:
     def __init__(self):
         self.pods, self.sets, self.secrets, self.run_secrets, self.uid = {}, {}, {}, {}, 0
         self.created = []
+        self.hold = False   # True: the controller has not yet recreated a missing pod (node loss, eviction)
+
+    def delete_command(self, kind, name):
+        return "kubectl delete %s %s" % (kind, name)
 
     def scrub(self, text, limit=300):
         return str(text)[:limit]
@@ -74,6 +78,8 @@ class FakeKube:
         pass
 
     def reconcile(self):
+        if self.hold:
+            return
         for name, ss in list(self.sets.items()):
             if name + "-0" not in self.pods:
                 self.uid += 1
@@ -455,6 +461,81 @@ class Mutants(Fx):   # DW-6 (S10): the same checks, run on a mutated copy of the
         m.Launcher(self.kube, self.env, self.clock).delete(argparse.Namespace(worker=WORKER, force=True, reason="x"))
         self.kube.reconcile()
         self.assertNotEqual((self.kube.pods, self.kube.sets), ({}, {}))   # the real delete leaves nothing
+
+
+class PodGone(Fx):   # M1: the pod NAME-0 is absent but its StatefulSet (and Secrets) exist
+    def gone(self):
+        self.launch()
+        self.kube.pods.clear()
+        self.kube.hold = True
+        self.assertEqual((len(self.kube.sets), len(self.kube.secrets) + len(self.kube.run_secrets) > 0), (1, True))
+
+    def left(self, kube=None):
+        k = kube or self.kube
+        return (sorted(k.pods), sorted(k.sets), sorted(k.secrets), sorted(k.run_secrets))
+
+    def test_stop_with_no_pod_removes_the_statefulset_and_the_secrets(self):
+        self.gone()
+        self.stop()
+        self.assertEqual(self.left(), ([], [], [], []))
+
+    def test_delete_force_with_no_pod_removes_the_statefulset_and_the_secrets(self):
+        self.gone()
+        out = self.L.delete(argparse.Namespace(worker=WORKER, force=True, reason="x"))
+        self.assertTrue(out["deleted"])
+        self.assertEqual(self.left(), ([], [], [], []))
+
+    def test_stop_with_another_runs_nonce_leaves_the_statefulset_whole(self):
+        self.gone()
+        self.L.stop(argparse.Namespace(worker=WORKER, reason="x", run_id="f" * 16, no_record=True, record_dir=None))
+        self.assertEqual(list(self.kube.sets), [cw.pod_name(WORKER)])
+
+    def test_mutant_stop_ignoring_the_workload_when_the_pod_is_absent_fails(self):
+        m = load_module("cloud_worker.py", "self._remove_gone(worker, name, nonce)", "self._remove(name, nonce)")
+        self.gone()
+        m.Launcher(self.kube, self.env, self.clock).stop(argparse.Namespace(worker=WORKER, reason="x", run_id=RUN, no_record=True, record_dir=None))
+        self.assertNotEqual(self.left(), ([], [], [], []))
+
+    def test_mutant_delete_ignoring_the_workload_when_the_pod_is_absent_fails(self):
+        m = load_module("cloud_worker.py", "self._remove_gone(worker, name, None)", "None")
+        self.gone()
+        m.Launcher(self.kube, self.env, self.clock).delete(argparse.Namespace(worker=WORKER, force=True, reason="x"))
+        self.assertNotEqual(self.left(), ([], [], [], []))
+
+    def test_a_failed_workload_delete_says_so_by_name_and_is_never_deleted_true(self):
+        self.gone()
+        def boom(name):
+            raise cw.CloudError("api down")
+        self.kube.delete_workload = boom
+        with self.assertRaises(cw.CloudError) as c:
+            self.L.delete(argparse.Namespace(worker=WORKER, force=True, reason="x"))
+        self.assertIn("statefulset/" + cw.pod_name(WORKER), str(c.exception))
+        self.assertEqual(list(self.kube.sets), [cw.pod_name(WORKER)])
+
+    def test_a_failed_create_cleans_up_the_workload_and_the_secrets(self):
+        real = self.kube.apply
+        def apply(obj):
+            real(obj)
+            if obj["kind"] == "StatefulSet":
+                raise cw.CloudError("apply failed")
+        self.kube.apply = apply
+        with self.assertRaises(cw.CloudError):
+            self.L.create(self.args())
+        self.assertEqual(self.left(), ([], [], [], []))
+
+    def test_a_failed_create_whose_workload_delete_fails_names_the_statefulset(self):
+        real = self.kube.apply
+        def apply(obj):
+            real(obj)
+            if obj["kind"] == "StatefulSet":
+                raise cw.CloudError("apply failed")
+        self.kube.apply = apply
+        def boom(name):
+            raise cw.CloudError("api down")
+        self.kube.delete_workload = boom
+        with self.assertRaises(cw.CloudError) as c:
+            self.L.create(self.args())
+        self.assertIn("statefulset/" + cw.pod_name(WORKER), str(c.exception))
 
 
 class OperatorRole(unittest.TestCase):
