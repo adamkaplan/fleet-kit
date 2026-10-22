@@ -82748,31 +82748,68 @@ class TestArchitectureSafetyNet(unittest.TestCase):
         self.assertEqual(tool.touched({7}, table), [])
         self.assertEqual([n for _, _, n in tool.classes("class A:\n    pass\n\n\ndef f():\n    pass\n")], ["A"])
 
-    def test_the_golden_outputs_of_the_cli_are_unchanged(self):
-        golden = REPO / "tests" / "golden" / "cli"
-        recorded = [item for p in golden.glob("*.json") if p.name != "META.json" for item in json.loads(p.read_text())]
-        self.assertGreaterEqual(len(recorded), 120)
-        self.assertEqual(len(recorded), json.loads((golden / "META.json").read_text())["outputs"])
-        self.assertLessEqual(len(list(golden.glob("*.json"))), 10, "the outputs are kept in a few files")
-        proc = subprocess.run([sys.executable, str(self.TOOLS / "golden-cli"), "check", "--entry", str(SWITCHBOARD)], capture_output=True, text=True)
-        self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-1000:])
-        self.assertIn("RESULT: PASS", proc.stdout)
+    def golden(self):
+        return self.load("golden-cli")
 
-    def test_the_golden_check_names_a_changed_output(self):
+    def test_the_command_list_covers_every_verb_and_the_recording_is_deterministic(self):
+        golden = self.golden()
         work = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, work, True)
-        golden = work / "cli"
-        shutil.copytree(REPO / "tests" / "golden" / "cli", golden)
-        target = next(p for p in golden.glob("*.json") if p.name != "META.json" and any(i["argv"] == ["version"] for i in json.loads(p.read_text())))
-        docs = json.loads(target.read_text())
-        for doc in docs:
-            if doc["argv"] == ["version"]:
-                doc["stdout"] = doc["stdout"].replace("fleet-switchboard", "fleet-switchboardX")
-        target.write_text(json.dumps(docs))
-        proc = subprocess.run([sys.executable, str(self.TOOLS / "golden-cli"), "check", "--entry", str(SWITCHBOARD), "--dir", str(golden)],
+        root = os.path.realpath(str(work))
+        env = golden.world(root)
+        entry = str(SWITCHBOARD)
+        first = golden.record_all(entry, root, env)
+        self.assertGreaterEqual(len(first), 120)
+        verbs = golden.choices(golden.run(entry, ["--help"], root, env)["stdout"])
+        self.assertGreater(len(verbs), 40)
+        for verb in verbs:
+            self.assertIn((verb, "--help"), first, "the command list has no --help of the verb %s" % verb)
+        self.assertEqual(golden.differences(first, golden.record_all(entry, root, env)), [], "two recordings of one entry differ")
+
+    def fake_repo(self, text):
+        """A git repository whose bin/fleet-switchboard prints bin/out.txt: a stand-in for the daemon."""
+        repo = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, repo, True)
+        (repo / "bin").mkdir()
+        (repo / "bin" / "fleet-switchboard").write_text(
+            "import os\nprint(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'out.txt')).read(), end='')\n")
+        (repo / "bin" / "out.txt").write_text(text)
+        git = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"] + list(a), check=True, capture_output=True)
+        git("init", "-q")
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        return repo
+
+    def compare(self, repo):
+        return subprocess.run([sys.executable, str(self.TOOLS / "golden-cli"), "compare", "--base", "HEAD", "--repo", str(repo)],
                               capture_output=True, text=True)
-        self.assertEqual(proc.returncode, 1, proc.stdout)
-        self.assertIn("DIFF %s: stdout differs (command: version)" % target.name, proc.stdout)
+
+    def test_compare_passes_an_unchanged_tree_and_names_a_changed_output(self):
+        repo = self.fake_repo("usage: tool\n")
+        done = self.compare(repo)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("RESULT: PASS", done.stdout)
+        (repo / "bin" / "out.txt").write_text("usage: tool [-x]\n")
+        done = self.compare(repo)
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("DIFF --help: stdout differs", done.stdout)
+        self.assertIn("RESULT: FAIL", done.stdout)
+
+    def test_compare_names_a_command_the_working_tree_lost(self):
+        golden = self.golden()
+        base = {("--help",): {"status": 0, "stdout": "a", "stderr": ""}, ("send", "--help"): {"status": 0, "stdout": "b", "stderr": ""}}
+        work = {("--help",): {"status": 2, "stdout": "a", "stderr": ""}, ("plan", "--help"): {"status": 0, "stdout": "c", "stderr": ""}}
+        self.assertEqual(golden.differences(base, work), ["DIFF --help: status differs", "DIFF plan --help: the command is new in the working tree",
+                                                          "DIFF send --help: the command is gone from the working tree"])
+
+    def test_the_recorder_writes_grouped_files(self):
+        repo = self.fake_repo("usage: tool\n")
+        out = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, out, True)
+        done = subprocess.run([sys.executable, str(self.TOOLS / "golden-cli"), "record", "--repo", str(repo), "--dir", str(out)], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(json.loads((out / "root.json").read_text())[0]["argv"], ["--help"])
+        self.assertLessEqual(len(list(out.glob("*.json"))), 7)
 
     def test_the_surface_snapshot_is_a_sorted_list_of_names(self):
         names = (REPO / "tests" / "golden" / "surface-dir-sb.txt").read_text().split()
@@ -82800,35 +82837,6 @@ class TestArchitectureSafetyNet(unittest.TestCase):
         snap.write_text("\n".join(n for n in snap.read_text().split() if n != "extra") + "\n")
         done = run("--check-surface", str(snap), "--after", str(code))
         self.assertIn("name only in the code: three", done.stdout)
-
-    def test_the_golden_recorder_round_trips_words_on_another_python_and_names_a_missing_file(self):
-        work = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, work, True)
-        entry = work / "entry"
-        entry.write_text("import sys\nprint('usage:  tool')\nsys.exit(3)\n")
-        golden = work / "golden"
-        tool = str(self.TOOLS / "golden-cli")
-        run = lambda *a: subprocess.run([sys.executable, tool] + list(a) + ["--entry", str(entry), "--dir", str(golden)], capture_output=True, text=True)
-        self.assertEqual(run("record").returncode, 0)
-        self.assertEqual(run("check").returncode, 0)
-        meta = json.loads((golden / "META.json").read_text())
-        meta["python"] = "2.0"
-        (golden / "META.json").write_text(json.dumps(meta))
-        target = golden / "root.json"
-        docs = json.loads(target.read_text())
-        doc = docs[0]
-        doc["stdout"] = doc["stdout"].replace("usage: ", "usage:\n   ")   # only the whitespace differs
-        target.write_text(json.dumps(docs))
-        done = run("check")
-        self.assertEqual(done.returncode, 0, done.stdout)
-        self.assertIn("words", done.stdout)
-        doc["stdout"] = "something else\n"
-        target.write_text(json.dumps(docs))
-        self.assertEqual(run("check").returncode, 1)
-        target.write_text(json.dumps(docs[1:]))
-        done = run("check")   # an output missing from the directory is a difference
-        self.assertEqual(done.returncode, 1)
-        self.assertIn("recorded outputs", done.stdout)
 
     def test_the_hygiene_scan_reads_one_list_of_daemon_files(self):
         self.assertIn(SWITCHBOARD, SWITCHBOARD_SOURCE_FILES)
