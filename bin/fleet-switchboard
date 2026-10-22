@@ -15964,7 +15964,7 @@ def friction_status_line(config, state_dir, now=None):
 
 
 # ---- the audited resume (docs/switchboard.md, "A blocked agent is reported"). ONE function resumes an agent whose turn has ended: the
-# `resume` command and the blocked-report pass both call `resume_agent`, so the refusals, the rate limit and the audit line are the same.
+# `resume` command and the blocked-report pass both call `resume_ended_turn`, so the refusals, the rate limit and the audit line are the same.
 
 RESUME_STATE = "resumes.json"   # {agent: {"at": epoch}}: the last resume of each agent (the rate limit; an ordinary state row)
 RESUME_SECONDS = 600            # one resume per agent per 10 minutes
@@ -15988,7 +15988,7 @@ def last_turn_error(engine, session_id):
     return _one_line(json.dumps(error) if not isinstance(error, str) else error, 300) if error else ""
 
 
-def resume_agent(engine, caller, name, reason, discovery=None):
+def resume_ended_turn(engine, caller, name, reason, discovery=None):
     """Send the resume text to `name`'s session, only when its turn has ended and nothing is open. Raises ResumeRefused (nothing sent, nothing
     audited) for a missing or unreadable agent, a working session, an open permission request or question (that goes to the owner), and an agent
     resumed less than RESUME_SECONDS ago. Otherwise one `resume` audit line (who, whom, why) and the send; returns the message id."""
@@ -16042,13 +16042,13 @@ def resume_agent(engine, caller, name, reason, discovery=None):
 
 def resume_first_recovery(engine, discovery, seen, reported):
     """The automatic first recovery of the blocked report: a stop whose turn error holds HTTP 499, ECONNRESET or a timeout is resumed once,
-    through `resume_agent` (the same refusals, rate limit and audit line), before it is reported. True when it was resumed; never raises."""
+    through `resume_ended_turn` (the same refusals, rate limit and audit line), before it is reported. True when it was resumed; never raises."""
     try:
         error = last_turn_error(engine, seen.session_id) if reported is None else ""
         found = PROVIDER_ERROR.search(error)
         if not found:
             return False
-        resume_agent(engine, "switchboard", seen.name, "the blocked report found a provider error (%s) after an ended turn" % found.group(0), discovery)
+        resume_ended_turn(engine, "switchboard", seen.name, "the blocked report found a provider error (%s) after an ended turn" % found.group(0), discovery)
         return True
     except Exception:
         return False
@@ -19185,7 +19185,7 @@ def cmd_ensure(args, spawn=subprocess.Popen):
 
 
 def cmd_resume(args, runner, now):
-    """`resume AGENT [--reason TEXT]`: the audited resume of an agent whose turn has ended (the same `resume_agent` the blocked report uses).
+    """`resume AGENT [--reason TEXT]`: the audited resume of an agent whose turn has ended (the same `resume_ended_turn` the blocked report uses).
     Refused (exit 3, nothing sent) for a working session, an open permission request or question, and an agent resumed in the last 10 minutes."""
     engine, _, _ = build_engine(runner, now, "cli")
     if args.sender is not None:
@@ -19196,7 +19196,7 @@ def cmd_resume(args, runner, now):
     else:
         caller = identify_caller(engine.herdr, engine.v2, os.environ)
     try:
-        message_id = resume_agent(engine, caller, args.name, args.reason)
+        message_id = resume_ended_turn(engine, caller, args.name, args.reason)
     except ResumeRefused as err:
         sys.stderr.write("%s: not resumed: %s\n" % (PROG, _one_line(str(err), 300)))
         return EXIT_HELD

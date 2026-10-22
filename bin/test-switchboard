@@ -82157,7 +82157,7 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
 
 
 class TestResume(Base):
-    """#1110: ONE audited `resume AGENT` command and ONE shared function (`resume_agent`) that the blocked-report pass also calls."""
+    """#1110: ONE audited `resume AGENT` command and ONE shared function (`resume_ended_turn`) that the blocked-report pass also calls."""
     COMMAND = "fleet-switchboard resume coder"
 
     def setUp(self):
@@ -82340,7 +82340,7 @@ class TestResume(Base):
         "skips the open request check": ('if kinds:\n        raise ResumeRefused', 'if False:\n        raise ResumeRefused', "test_an_open_permission_request_is_refused_and_goes_to_the_owner"),
         "skips the audit": ('if engine.audit is not None:\n        engine.audit.append(engine.actor, "resume"', 'if False:\n        engine.audit.append(engine.actor, "resume"', "test_an_agent_with_an_ended_turn_is_sent_the_resume_text_once_with_one_audit_line"),
         "ignores the rate limit": ('if _is_number(last) and now - last < RESUME_SECONDS:', 'if False:', "test_a_second_resume_inside_ten_minutes_is_refused_and_one_after_it_is_sent"),
-        "resumes twice": ('        resume_agent(engine, "switchboard", seen.name,', '        resume_agent(engine, "switchboard", seen.name, "x", discovery)\n        resume_agent(engine, "switchboard", seen.name,', "test_a_provider_error_is_resumed_once_before_the_report_and_the_report_says_so"),
+        "resumes twice": ('        resume_ended_turn(engine, "switchboard", seen.name,', '        resume_ended_turn(engine, "switchboard", seen.name, "x", discovery)\n        resume_ended_turn(engine, "switchboard", seen.name,', "test_a_provider_error_is_resumed_once_before_the_report_and_the_report_says_so"),
         "resumes a non-provider error": ('found = PROVIDER_ERROR.search(error)', 'found = re.search("", error)', "test_each_provider_error_form_is_recognised_and_another_error_is_not_resumed"),
     }
 
