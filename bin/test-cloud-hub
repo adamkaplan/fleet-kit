@@ -288,6 +288,110 @@ class TestHub(unittest.TestCase):
             self.assertEqual(hub.call("GET", "/decisions")[0], 200)
 
 
+SECRET_A, SECRET_B = "pod-secret-a-xyz", "pod-secret-b-xyz"
+
+
+class SecretsHub(Hub):
+    def __init__(self, module, table="default", **kw):
+        super().__init__(module, **kw)
+        import hashlib
+        self.secrets = Path(self.tmp.name) / "secrets.json"
+        if table == "default":
+            table = {n: hashlib.sha256(v.encode()).hexdigest() for n, v in (("agent-a", SECRET_A), ("agent-b", SECRET_B))}
+        if table is not None:
+            self.secrets.write_text(table if isinstance(table, str) else json.dumps(table))
+        self.server.shutdown()
+        self.server.server_close()
+        self.server = module.make_hub(("127.0.0.1", 0), module.make_secrets_reviewer(str(self.secrets)), self.inbox,
+                                      self.lines.append, str(self.decisions))
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+
+class TestSecretsMode(unittest.TestCase):
+    def test_right_secret_delivers_as_its_agent(self):
+        with SecretsHub(load()) as hub:
+            self.assertEqual(hub.send(token=SECRET_A)[1]["delivered"], True)
+            self.assertIn("from agent agent-a", hub.api.got[0][2]["text"])
+            self.assertEqual(hub.call("GET", "/decisions", token=SECRET_A)[0], 200)
+            self.assertEqual(hub.calls, [])      # no TokenReview call
+
+    def test_wrong_secret_is_401(self):
+        with SecretsHub(load()) as hub:
+            self.assertEqual(hub.send(token="nope")[0], 401)
+            self.assertEqual(hub.call("GET", "/decisions", token="nope")[0], 401)
+            self.assertEqual(hub.api.got, [])
+
+    def test_a_secret_cannot_send_as_another_agent(self):
+        with SecretsHub(load()) as hub:
+            self.assertEqual(hub.send(sender="agent-b", token=SECRET_A)[0], 403)
+            self.assertEqual(hub.api.got, [])
+
+    def test_missing_empty_or_bad_file_refuses_everything(self):
+        for table in (None, {}, "", "not json", "[1]"):
+            with SecretsHub(load(), table=table) as hub:
+                self.assertIn(hub.send(token=SECRET_A)[0], (401, 503))
+                self.assertIn(hub.call("GET", "/decisions", token=SECRET_A)[0], (401, 503))
+                self.assertEqual(hub.api.got, [])
+
+    def test_secret_never_in_audit_or_responses(self):
+        with SecretsHub(load()) as hub:
+            seen = [hub.send(token=SECRET_A), hub.send(token=SECRET_A), hub.send(sender="agent-b", token=SECRET_A),
+                    hub.send(token="wrong-secret-q"), hub.call("GET", "/decisions", token=SECRET_A)]
+            text = "\n".join(hub.lines) + json.dumps(seen)
+            for secret in (SECRET_A, SECRET_B, "wrong-secret-q"):
+                self.assertNotIn(secret, text)
+
+    def test_mode_choice(self):
+        module = load()
+        used = []
+        module.make_secrets_reviewer = lambda path: used.append(("secrets", path)) or (lambda *a: {})
+        module.make_reviewer = lambda **k: used.append(("kube",)) or (lambda *a: {})
+        module.make_hub = lambda *a, **k: types.SimpleNamespace(serve_forever=lambda: None)
+        env = {"FLEET_CLOUD_CHANNEL_LISTEN": "127.0.0.1:8080"}
+        module.serve(dict(env, FLEET_CLOUD_HUB_SECRETS="/s"), inbox=object(), audit=print)
+        module.serve(env, inbox=object(), audit=print)
+        self.assertEqual(used, [("secrets", "/s"), ("kube",)])
+
+    def calls_for(self, module):
+        import hashlib
+        count = []
+        module.hmac = types.SimpleNamespace(compare_digest=lambda a, b: count.append(1) or a == b)
+        path = Path(tempfile.mkdtemp()) / "s.json"
+        path.write_text(json.dumps({n: hashlib.sha256(v.encode()).hexdigest() for n, v in (("agent-a", SECRET_A), ("agent-b", SECRET_B))}))
+        module.make_secrets_reviewer(str(path))(SECRET_A, "fleet-switchboard")   # matches the FIRST entry
+        return len(count)
+
+    def test_compares_with_compare_digest_against_every_entry(self):
+        self.assertEqual(self.calls_for(load()), 2)
+
+    def test_mutant_non_constant_time_compare(self):
+        module = mutant("hmac.compare_digest(digest, wanted.strip().lower().encode(\"utf-8\", \"replace\"))",
+                        "digest == wanted.strip().lower().encode()")
+        self.assertNotEqual(self.calls_for(module), 2)
+
+    def test_mutant_short_circuit(self):
+        module = mutant("                found = name\n", "                found = name\n                break\n")
+        self.assertNotEqual(self.calls_for(module), 2)
+
+    def test_mutant_accepts_any_secret(self):
+        module = mutant("        if found is None:\n            return {\"authenticated\": False}", "        found = found or 'agent-a'")
+        try:
+            with SecretsHub(module) as hub:
+                self.assertEqual(hub.send(token="nope")[0], 401)
+        except AssertionError:
+            return
+        self.fail("mutant survived")
+
+    def test_mutant_name_from_the_wrong_entry(self):
+        module = mutant("                found = name\n", "                found = 'agent-b'\n")
+        try:
+            with SecretsHub(module) as hub:
+                self.assertEqual(hub.send(sender="agent-b", token=SECRET_A)[0], 403)
+        except AssertionError:
+            return
+        self.fail("mutant survived")
+
+
 class TestMutants(unittest.TestCase):
     def fails(self, module, check):
         try:

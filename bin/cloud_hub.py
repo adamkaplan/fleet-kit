@@ -16,11 +16,17 @@ restart forgets them all, so a duplicate is possible after a restart. Agent URLs
 host (.svc, .svc.cluster.local, or a bare single-label host); anything else must be https. Service accounts in the agents'
 namespace are trusted as agents (names reserved for a captain or switchboard must not live there; cloud_channel.agent_of
 does not refuse them and that file is not edited here).
+Secrets mode: when FLEET_CLOUD_HUB_SECRETS names a JSON file {agent: sha256 hex of that pod's secret} (read at each request,
+bounded), the bearer token is hashed and compared (hmac.compare_digest, against every entry, no early exit) and the identity is
+returned in the TokenReview shape (authenticated, audiences, user system:serviceaccount:<namespace>:<agent>), so
+cloud_channel.handle and agent_of work unchanged. A missing, empty or malformed file refuses everything (401 or 503).
 The listener starts only when FLEET_CLOUD_CHANNEL_LISTEN is set. Audit lines go to stdout as JSON lines; no token is logged.
 The HTTP call to the cluster is an injected function http(url, headers, data, timeout) -> dict, so tests use a fake.
 """
 import base64
 import collections
+import hmac
+import hashlib
 import http.client
 import ipaddress
 import json
@@ -38,6 +44,7 @@ import cloud_channel_server
 
 AGENTS_ENV = "FLEET_CLOUD_HUB_AGENTS"
 DECISIONS_ENV = "FLEET_CLOUD_HUB_DECISIONS"
+SECRETS_ENV = "FLEET_CLOUD_HUB_SECRETS"
 AUDIENCE_ENV = "FLEET_CLOUD_CHANNEL_AUDIENCE"
 API = "https://kubernetes.default.svc/apis/authentication.k8s.io/v1/tokenreviews"
 SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
@@ -78,6 +85,24 @@ def make_reviewer(http=kube_http, audience=None, sa_dir=SA_DIR, api=API, timeout
         if isinstance(audiences, list) and wanted in audiences:
             status["audiences"] = list(audiences) + [handle_audience]
         return status
+    return reviewer
+
+
+def make_secrets_reviewer(secrets_path, namespace=cloud_channel.NAMESPACE):
+    """reviewer(token, audience) judging the bearer token against the sha256 digests in the secrets file."""
+    def reviewer(token, handle_audience):
+        table = _read_json(secrets_path, {})
+        if not isinstance(table, dict):
+            raise ValueError("secrets file is not an object")
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest().encode()
+        found = None
+        for name, wanted in table.items():
+            if isinstance(wanted, str) and hmac.compare_digest(digest, wanted.strip().lower().encode("utf-8", "replace")):
+                found = name
+        if found is None:
+            return {"authenticated": False}
+        return {"authenticated": True, "audiences": [handle_audience],
+                "user": {"username": "%s%s:%s" % (cloud_channel.SERVICE_ACCOUNT_PREFIX, namespace, found)}}
     return reviewer
 
 
@@ -245,7 +270,11 @@ def serve(environ, reviewer=None, inbox=None, audit=None):
     address = cloud_channel_server.listen_address(environ)
     if address is None:
         return False
-    reviewer = reviewer or make_reviewer(audience=environ.get(AUDIENCE_ENV) or None)
+    if reviewer is None:
+        if environ.get(SECRETS_ENV):
+            reviewer = make_secrets_reviewer(environ[SECRETS_ENV])
+        else:
+            reviewer = make_reviewer(audience=environ.get(AUDIENCE_ENV) or None)
     inbox = inbox or Inbox(environ.get(AGENTS_ENV))
     make_hub(address, reviewer, inbox, audit or json_audit(), environ.get(DECISIONS_ENV)).serve_forever()
     return True
