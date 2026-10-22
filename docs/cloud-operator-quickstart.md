@@ -230,12 +230,14 @@ merges), so a sleeping Mac delays a stop but cannot leave a worker running past 
 
 ## 4c. The cloud hub (cloud/k8s/cloud-hub.yaml)
 
-Cause: the hub (the channel server) exists as code, but nothing started it in the cluster, and the launcher's per-pod registration writes to a registry Secret that did not exist. One file now defines, in the `cw` namespace only: Deployment `cloud-hub` (one replica), Service `cloud-hub` (ClusterIP, 8443) and Secret `cloud-hub-registry` (keys `secrets.json` and `agents.json`, each `{}`, mounted read-only at `/etc/hub`). Every object carries the label `app.kubernetes.io/part-of=cloud-hub`. The names live in `cloud/launcher/hub_registry.py` and a test compares them with the manifest.
+Cause: the hub (the channel server) exists as code, but nothing started it in the cluster, and the launcher's per-pod registration writes to a registry Secret that did not exist. One file now defines, in the `cw` namespace only: Deployment `cloud-hub` (one replica), Service `cloud-hub` (ClusterIP, 8443) and Secrets `cloud-hub-registry` (keys `secrets.json` and `agents.json`, each `{}`, mounted read-only at `/etc/hub`) and `cloud-hub-pw` (empty: the launcher adds one key per agent name later; mounted read-only at `/etc/hub/pw`, so an agent's `password_file` is `/etc/hub/pw/<name>`; if the runtime cannot nest that mount, mount it at `/etc/hub-pw` instead and use `/etc/hub-pw/<name>`). The environment is exactly `FLEET_CLOUD_CHANNEL_LISTEN`, `FLEET_CLOUD_HUB_AGENTS`, `FLEET_CLOUD_HUB_SECRETS` (its presence selects the secrets mode) and `FLEET_CLOUD_HUB_DECISIONS`. The container runs non-root with a read-only root filesystem; only `/var/hub` and `/tmp` (emptyDirs) are writable. Every object carries the label `app.kubernetes.io/part-of=cloud-hub`. The names live in `cloud/launcher/hub_registry.py` and a test compares them with the manifest.
 
 Before you apply: replace the placeholder `IMAGE_DIGEST` with the settings' `CW_CLOUD_IMAGE` (a `name@sha256:...` reference; the file holds no real digest). The hub files are not in the worker image yet, so the start command path in the Deployment is provisional and the pod may not run until an image that holds them is built; the manifest is what is reviewed and dry-run.
 
-- Check: `kubectl -n cw apply --dry-run=server -f cloud/k8s/cloud-hub.yaml`
+- Apply order: Secrets, then Service, then Deployment (the file lists them in that order).
+- Check (server dry run): `kubectl -n cw apply --dry-run=server -f cloud/k8s/cloud-hub.yaml`
 - Apply: `kubectl -n cw apply -f cloud/k8s/cloud-hub.yaml`
+- Delay: kubelet refreshes mounted Secret contents within about a minute, so a newly launched agent can need up to ~60 s before it can message through the hub.
 - Smoke check: the hub has no unauthenticated health path (`GET /decisions` needs a token), so readiness is a TCP check on 8443. From a pod in `cw`, `nc -z cloud-hub 8443` must succeed.
 - Remove (and rollback): `kubectl -n cw delete deployment,service,secret -l app.kubernetes.io/part-of=cloud-hub`
 

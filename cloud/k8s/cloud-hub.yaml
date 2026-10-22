@@ -1,4 +1,4 @@
-# The cloud hub (ask #1161): Deployment, Service and an empty registry Secret, all in the workers namespace, nothing cluster-wide.
+# The cloud hub (ask #1161): Deployment, Service and two Secrets (registry, and an empty password Secret), all in the workers namespace, nothing cluster-wide.
 # Every object carries app.kubernetes.io/part-of=cloud-hub: remove all with
 #   kubectl -n cw delete deployment,service,secret -l app.kubernetes.io/part-of=cloud-hub
 # IMAGE_DIGEST is a placeholder: the operator replaces it with the settings' CW_CLOUD_IMAGE (name@sha256:...). No real digest is held here.
@@ -23,6 +23,20 @@
 ---
 {
   "apiVersion": "v1",
+  "kind": "Secret",
+  "metadata": {
+    "name": "cloud-hub-pw",
+    "namespace": "cw",
+    "labels": {
+      "app.kubernetes.io/part-of": "cloud-hub"
+    }
+  },
+  "type": "Opaque",
+  "stringData": {}
+}
+---
+{
+  "apiVersion": "v1",
   "kind": "Service",
   "metadata": {
     "name": "cloud-hub",
@@ -38,7 +52,7 @@
     },
     "ports": [
       {
-        "name": "https",
+        "name": "http",
         "port": 8443,
         "targetPort": 8443
       }
@@ -90,10 +104,6 @@
                 "value": "0.0.0.0:8443"
               },
               {
-                "name": "FLEET_CLOUD_CHANNEL_AUDIENCE",
-                "value": "cloud-hub"
-              },
-              {
                 "name": "FLEET_CLOUD_HUB_AGENTS",
                 "value": "/etc/hub/agents.json"
               },
@@ -127,6 +137,7 @@
             },
             "securityContext": {
               "allowPrivilegeEscalation": false,
+              "readOnlyRootFilesystem": true,
               "capabilities": {
                 "drop": [
                   "ALL"
@@ -140,8 +151,17 @@
                 "readOnly": true
               },
               {
+                "name": "pw",
+                "mountPath": "/etc/hub/pw",
+                "readOnly": true
+              },
+              {
                 "name": "state",
                 "mountPath": "/var/hub"
+              },
+              {
+                "name": "tmp",
+                "mountPath": "/tmp"
               }
             ]
           }
@@ -154,7 +174,17 @@
             }
           },
           {
+            "name": "pw",
+            "secret": {
+              "secretName": "cloud-hub-pw"
+            }
+          },
+          {
             "name": "state",
+            "emptyDir": {}
+          },
+          {
+            "name": "tmp",
             "emptyDir": {}
           }
         ]

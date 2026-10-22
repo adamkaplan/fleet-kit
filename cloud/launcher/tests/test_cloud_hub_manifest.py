@@ -24,7 +24,8 @@ class T(unittest.TestCase):
         self.docs = parse(self.text)
 
     def test_kinds(self):
-        self.assertEqual(sorted(d["kind"] for d in self.docs), ["Deployment", "Secret", "Service"])
+        self.assertEqual(sorted(d["kind"] for d in self.docs), ["Deployment", "Secret", "Secret", "Service"])
+        self.assertEqual(sorted(d["metadata"]["name"] for d in self.docs if d["kind"] == "Secret"), ["cloud-hub-pw", "cloud-hub-registry"])
         self.assertEqual(kinds_bad(self.docs), [])
 
     def test_mutant_clusterrole_fails(self):
@@ -37,7 +38,9 @@ class T(unittest.TestCase):
             self.assertEqual(d["metadata"]["namespace"], "cw")
 
     def test_secret_only_empty_objects(self):
-        s = [d for d in self.docs if d["kind"] == "Secret"][0]
+        s = [d for d in self.docs if d["kind"] == "Secret" and d["metadata"]["name"] == hr.HUB_REGISTRY_SECRET][0]
+        pw = [d for d in self.docs if d["kind"] == "Secret" and d["metadata"]["name"] == "cloud-hub-pw"][0]
+        self.assertFalse(pw.get("stringData")); self.assertFalse(pw.get("data"))
         self.assertEqual(s["metadata"]["name"], hr.HUB_REGISTRY_SECRET)
         self.assertEqual(set(s["stringData"]), {hr.HUB_SECRETS_KEY, hr.HUB_AGENTS_KEY})
         for v in s["stringData"].values():
@@ -57,8 +60,18 @@ class T(unittest.TestCase):
         self.assertEqual(c["image"], "IMAGE_DIGEST")
         self.assertNotRegex(self.text, r"sha256:[0-9a-f]{64}")
         env = {e["name"]: e["value"] for e in c["env"]}
+        self.assertEqual(set(env), {"FLEET_CLOUD_CHANNEL_LISTEN", "FLEET_CLOUD_HUB_AGENTS", "FLEET_CLOUD_HUB_SECRETS", "FLEET_CLOUD_HUB_DECISIONS"})
+        self.assertEqual(env["FLEET_CLOUD_HUB_DECISIONS"], "/var/hub/decisions.json")
+        self.assertIs(c["securityContext"]["readOnlyRootFilesystem"], True)
+        self.assertIs(c["securityContext"]["allowPrivilegeEscalation"], False)
+        self.assertIsInstance(sp["securityContext"]["runAsUser"], int)
+        self.assertEqual(c["readinessProbe"]["tcpSocket"]["port"], 8443)
+        mounts = {m["mountPath"]: m for m in c["volumeMounts"]}
+        self.assertTrue(mounts["/etc/hub/pw"]["readOnly"])
+        vols = {v["name"]: v for v in sp["volumes"]}
+        self.assertEqual(vols[mounts["/etc/hub/pw"]["name"]]["secret"]["secretName"], "cloud-hub-pw")
+        self.assertIn("emptyDir", vols[mounts["/var/hub"]["name"]])
         self.assertEqual(env["FLEET_CLOUD_CHANNEL_LISTEN"], "0.0.0.0:8443")
-        self.assertEqual(env["FLEET_CLOUD_CHANNEL_AUDIENCE"], "cloud-hub")
         self.assertEqual(env["FLEET_CLOUD_HUB_SECRETS"], "/etc/hub/" + hr.HUB_SECRETS_KEY)
         self.assertEqual(env["FLEET_CLOUD_HUB_AGENTS"], "/etc/hub/" + hr.HUB_AGENTS_KEY)
         self.assertTrue([m for m in c["volumeMounts"] if m["mountPath"] == "/etc/hub"][0]["readOnly"])
@@ -68,6 +81,7 @@ class T(unittest.TestCase):
         s = [d for d in self.docs if d["kind"] == "Service"][0]
         self.assertEqual(s["spec"]["type"], "ClusterIP")
         self.assertEqual(s["spec"]["ports"][0]["port"], 8443)
+        self.assertEqual(s["spec"]["ports"][0]["name"], "http")
 
 
 if __name__ == "__main__":
