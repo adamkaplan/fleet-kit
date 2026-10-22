@@ -26815,8 +26815,10 @@ class FakeSweepHub:
         return data
 
 
-def sweep_issue(number, body="", labels=(), pr=False, author=None, created=None, updated=None):
+def sweep_issue(number, body="", labels=(), pr=False, author=None, created=None, updated=None, draft=None):
     record = {"number": number, "body": body, "labels": [{"name": n} for n in labels]}
+    if draft is not None:
+        record["draft"] = draft
     if created:
         record["created_at"] = created
     if updated:
@@ -27414,6 +27416,54 @@ class TestSweep(Base):
     def test_s8_a_waited_for_issue_in_a_repo_that_is_not_watched_is_not_judged(self):
         self.sweep([dict(self.human(10), waits_for=["other/repo#5"])])
         self.assertEqual([f for f in self.found() if f[0] == "S8"], [])
+
+    PARKED = "osuser:parked"
+
+    def s5_case(self, issues, aged=("d1",)):
+        self.hub.open = dict(issues)
+        old = sb.iso(self.world.clock.now() - 3 * 3600)
+        decisions = [{"id": "pr:acme/api#%s" % n, "kind": "captain", "tier": "cos", "repo": "acme/api", "number": int(n),
+                      "since": old, "title": "t"} for n in aged]
+        self.sweep(decisions)
+        return [f for f in self.found() if f[0] == "S5"], dict(sb.sweep_state(self.engine).current["s5_skipped"])
+
+    def future(self, days=5):
+        return time.strftime("%Y-%m-%d", time.gmtime(self.world.clock.now() + days * 86400))
+
+    def test_s5_skips_a_draft_pull_request_and_counts_it(self):
+        found, skipped = self.s5_case({5: sweep_issue(5, "x", pr=True, draft=True)}, aged=(5,))
+        self.assertEqual(found, [])
+        self.assertEqual(skipped, {"draft": 1, "parked": 0})
+        self.assertIn("1 draft", "\n".join(sb.sweep_status_lines(sb.sweep_state(self.engine).current)))
+
+    def test_s5_skips_a_ready_pull_request_of_a_parked_ask_and_counts_it(self):
+        issues = {7: sweep_issue(7, "Parked until: %s\n" % self.future(), [self.PARKED]),
+                  8: sweep_issue(8, "Closes #7\n", pr=True, draft=False)}
+        found, skipped = self.s5_case(issues, aged=(8,))
+        self.assertEqual(found, [])
+        self.assertEqual(skipped, {"draft": 0, "parked": 1})
+
+    def test_s5_flags_as_before_an_expired_or_unreadable_date_a_missing_label_and_a_ready_pull_request(self):
+        past = time.strftime("%Y-%m-%d", time.gmtime(self.world.clock.now() - 3 * 86400))
+        issues = {1: sweep_issue(1, "Parked until: %s\n" % past, [self.PARKED]), 2: sweep_issue(2, "Closes #1\n", pr=True, draft=False),
+                  3: sweep_issue(3, "Parked until: soon\n", [self.PARKED]), 4: sweep_issue(4, "Closes #3\n", pr=True),
+                  5: sweep_issue(5, "Parked until: %s\n" % self.future()), 6: sweep_issue(6, "Closes #5\n", pr=True),
+                  9: sweep_issue(9, "plain", pr=True, draft=False)}
+        found, skipped = self.s5_case(issues, aged=(2, 4, 6, 9))
+        self.assertEqual(len(found), 4)
+        self.assertEqual(skipped, {"draft": 0, "parked": 0})
+
+    def test_s5_makes_no_read_beyond_the_baseline_for_draft_and_parked_cases(self):
+        issues = {7: sweep_issue(7, "Parked until: %s\n" % self.future(), [self.PARKED]),
+                  8: sweep_issue(8, "Closes #7\n", pr=True), 9: sweep_issue(9, "x", pr=True, draft=True)}
+        self.s5_case(issues, aged=(8, 9))
+        self.assertEqual(len(self.hub.reads), 3, "the repo's list reads only: open, closed, comments")
+        self.assertLessEqual(len(self.hub.single), 2, "at most the one withdrawal check per distinct decision; S5 adds none")
+        self.assertEqual({p for _, p in self.hub.single} - {"issues/8", "issues/9"}, set())
+
+    def test_s5_has_one_parked_date_reader(self):
+        src = open(sb.__file__ if hasattr(sb, "__file__") else "bin/fleet-switchboard").read()
+        self.assertEqual(src.count("PARKED_UNTIL_RE.findall"), 1)
 
     def test_s5_a_cos_decision_older_than_the_limit(self):
         old = dict(self.human(40), tier="cos", since=sb.iso(self.world.clock.now() - 3 * 3600))

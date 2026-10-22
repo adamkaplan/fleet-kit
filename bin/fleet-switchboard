@@ -13711,6 +13711,9 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
                          "author": (pr_login(record.get("user")) or "").lower(),
                          "created": parse_iso(record.get("created_at")), "updated": parse_iso(record.get("updated_at")),
                          "assignees": [(pr_login(a) or "").lower() for a in record.get("assignees") or [] if isinstance(a, dict)],
+                         "draft": _is_pr(record) and record.get("draft") is True,   # S5: a draft is a paused change
+                         "parked_until": parked_until(body, names),   # S5: the one reader of the parked date
+                         "closes": [r for r in pr_body_refs(body) if r[0] in (None, repo)] if _is_pr(record) else [],
                          "body_waits": sweep_says_waiting(regex, body), "comments": [], "comment_ids": [],
                          "latest_strong": False, "latest_refs": [], "latest_source": None}
     closed_holds = {}   # S9: the most recent closed (or merged) PRs that still carry a merge or hold label
@@ -13896,6 +13899,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
     for d in decisions:   # everything the owner's tier already holds, however its ref is spelled
         if d.get("tier", "human") == "human" and d.get("kind") != "notice":
             human_keys |= sweep_ref_keys(d, home, repos_known)
+    skipped = {"draft": 0, "parked": 0}   # S5 decisions left out, by reason
     for d in decisions:
         ref = sweep_ref_of(d, home)
         # a report is about the refs its sentence names, never assumed to be about its own ask
@@ -13912,6 +13916,10 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
         if (decisions_whole and d.get("tier") == "cos" and d.get("kind") != "notice" and since is not None
                 and now - since >= cfg["aged_cos_hours"] * 3600
                 and not (sweep_ref_keys(d, home, repos_known) & human_keys)):   # already the owner's: not stale for cos
+            skip = sweep_s5_skip(state, ref, d, now)
+            if skip:
+                skipped[skip] += 1
+                continue
             found.add(("S5", d.get("id") or ref_text(*(ref or ("?", 0)))))
     for repo, picture in state.repos.items():   # S9: a merge or hold label left on a closed, unmerged PR (read-only: nothing is removed; a merged one is the daemon's to clean, #559)
         for number in sorted(picture.get("closed_holds") or {}):
@@ -13936,7 +13944,23 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
     except Exception:
         pass   # an unreadable registry raises nothing: the lookup itself says "unknown"
     state.unattributed = unattributed
+    state.s5_skipped = skipped
     return sorted(found)
+
+
+def sweep_s5_skip(state, ref, decision, now):
+    """"draft" or "parked" when the decision's pull request is a draft, or closes or belongs to an ask parked now (the one reader
+    `parked_until`, judged by `triage_parked_now`); else None. Reads only the picture the sweep holds: an item not in it leaves S5 raised."""
+    picture = (state.repos.get(ref[0]) or {}).get("items", {}) if ref and ref[0] else {}
+    item = picture.get(ref[1]) if ref else None
+    if item is None or not item.get("pr"):
+        return None
+    if item.get("draft"):
+        return "draft"
+    asks = [item] + [picture.get(n) for _, n in item.get("closes", [])]
+    if isinstance(decision.get("ask"), int) and not isinstance(decision.get("ask"), bool):
+        asks.append(picture.get(decision["ask"]))
+    return "parked" if any(a and triage_parked_now(a, now) for a in asks) else None
 
 
 def _issue_pr_merged(record):
@@ -14141,7 +14165,7 @@ def sweep_decisions(engine, decisions, now, errors=()):
                      "truncated": sorted(r for r, p in state.repos.items() if p.get("truncated")),
                      "unreadable": sorted(r for r, p in state.repos.items() if p.get("error")), "at": iso(now),
                      "deferred": deferred, "unchecked": unchecked,
-                     "unattributed": getattr(state, "unattributed", 0)}
+                     "unattributed": getattr(state, "unattributed", 0), "s5_skipped": dict(getattr(state, "s5_skipped", {}))}
     sweep_write(engine, state)
     return kept if cfg["enabled"] else decisions
 
@@ -18758,6 +18782,9 @@ def sweep_status_lines(sweep):
     if sweep.get("unattributed"):
         lines.append("      sweep      %d comment(s) say it waits but name only refs outside the watched repos: not "
                      "attributed to their own item" % sweep["unattributed"])
+    skipped = sweep.get("s5_skipped") or {}
+    if skipped.get("draft") or skipped.get("parked"):
+        lines.append("      sweep      S5 skipped: %d draft, %d parked" % (skipped.get("draft", 0), skipped.get("parked", 0)))
     if sweep.get("unchecked"):
         lines.append("      sweep      %d finding(s) not checked this pass (call budget or a failed read): neither "
                      "raised nor audited" % sweep["unchecked"])
