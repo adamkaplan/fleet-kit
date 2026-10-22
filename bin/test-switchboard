@@ -82838,6 +82838,100 @@ class TestArchitectureSafetyNet(unittest.TestCase):
         done = run("--check-surface", str(snap), "--after", str(code))
         self.assertIn("name only in the code: three", done.stdout)
 
+    def split_run(self, *args):
+        return subprocess.run([sys.executable, str(self.TOOLS / "arch-split-check")] + list(args), capture_output=True, text=True)
+
+    def test_split_check_no_surface_runs_nothing_and_a_missing_before_is_a_usage_error(self):
+        work = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, work, True)
+        bomb = work / "bomb.py"
+        bomb.write_text("raise RuntimeError('loaded')\n")
+        done = self.split_run("--before", str(bomb), "--after", str(bomb), "--no-surface")
+        self.assertEqual((done.returncode, "RESULT: PASS" in done.stdout), (0, True), done.stdout + done.stderr)
+        self.assertNotEqual(self.split_run("--before", str(bomb), "--after", str(bomb)).returncode, 0)   # loading it fails: the surface check runs it
+        self.assertEqual(self.split_run("--after", str(bomb)).returncode, 2)
+
+    def test_split_check_takes_a_multi_part_before_and_a_reorder_inside_one_side(self):
+        code, out = self.split_check(["A = 1\n", "def one():\n    return 1\n"], ["def one():\n    return 1\n\n\nA = 1\n"])
+        self.assertEqual(code, 0, out)
+
+    def test_compare_fails_on_an_unknown_revision_and_names_a_lost_command(self):
+        repo = self.fake_repo("usage: tool {a} ...\n\npositional arguments:\n  {a}\n")
+        entry = repo / "bin" / "fleet-switchboard"   # only the top help lists a subcommand: the walk ends
+        entry.write_text(entry.read_text().replace("print(", "print('usage: sub') if sys.argv[1:] != ['--help'] else print(", 1).replace("import os", "import os, sys"))
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-am", "entry"], check=True, capture_output=True)
+        done = subprocess.run([sys.executable, str(self.TOOLS / "golden-cli"), "compare", "--base", "no-such-rev", "--repo", str(repo)],
+                              capture_output=True, text=True)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("cannot read no-such-rev", done.stdout + done.stderr)
+        (repo / "bin" / "out.txt").write_text("usage: tool\n")
+        done = self.compare(repo)
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("DIFF a --help: the command is gone from the working tree", done.stdout)
+
+    def overlap_repo(self):
+        """A clone-like repository: main, and a pull request head at refs/pull/1/head that edits one function and one test class."""
+        repo = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, repo, True)
+        git = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"] + list(a), check=True, capture_output=True)
+        git("init", "-q", "-b", "main")
+        (repo / "bin").mkdir()
+        (repo / "bin" / "fleet-switchboard").write_text("# ------ the first\nX = 1\n\n\ndef f():\n    return 1\n\n\ndef g():\n    return 2\n")
+        (repo / "bin" / "test-switchboard").write_text("class A:\n    x = 1\n\n\nclass B:\n    y = 2\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        git("remote", "add", "origin", str(repo))
+        git("checkout", "-q", "-b", "pr")
+        (repo / "bin" / "fleet-switchboard").write_text("# ------ the first\nX = 1\n\n\ndef f():\n    return 9\n\n\ndef g():\n    return 2\n")
+        (repo / "bin" / "test-switchboard").write_text("class A:\n    x = 1\n\n\nclass B:\n    y = 3\n")
+        git("commit", "-q", "-am", "pr")
+        git("update-ref", "refs/pull/1/head", "HEAD")
+        git("checkout", "-q", "main")
+        return repo
+
+    def run_overlap(self, repo, listing, *args, gh_exit=0):
+        bindir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, bindir, True)
+        gh = bindir / "gh"
+        gh.write_text("#!/bin/sh\ncat <<'EOF'\n%s\nEOF\nexit %d\n" % (json.dumps(listing), gh_exit))
+        gh.chmod(0o755)
+        env = dict(os.environ, PATH="%s:%s" % (bindir, os.environ["PATH"]))
+        return subprocess.run([sys.executable, str(self.TOOLS / "arch-overlap"), "--base", "main"] + list(args), cwd=repo, env=env, capture_output=True, text=True)
+
+    def test_overlap_names_symbols_classes_and_sections_of_a_pull_request_head(self):
+        repo = self.overlap_repo()
+        files = [{"path": "bin/fleet-switchboard"}, {"path": "bin/test-switchboard"}]
+        done = self.run_overlap(repo, [{"number": 1, "title": "edit f", "files": files}, {"number": 2, "title": "no head", "files": files},
+                                       {"number": 3, "title": "other", "files": [{"path": "README.md"}]}])
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("symbols: f", done.stdout)
+        self.assertNotIn("symbols: f, g", done.stdout)
+        self.assertIn("test classes: B", done.stdout)
+        self.assertIn("the first: #1", done.stdout)
+        self.assertIn("cannot fetch the pull request head", done.stdout)   # #2 has no head ref
+        self.assertNotIn("#3", done.stdout)   # touches neither file
+        self.assertIn("2 open pull requests touch", done.stdout)
+
+    def test_overlap_names_an_insertion_between_statements_and_refuses_bad_input(self):
+        repo = self.overlap_repo()
+        git = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"] + list(a), check=True, capture_output=True)
+        git("checkout", "-q", "-b", "gap")
+        path = repo / "bin" / "fleet-switchboard"
+        path.write_text("NEW = 3\n" + path.read_text())   # a line above every statement
+        git("commit", "-q", "-am", "gap")
+        git("update-ref", "refs/pull/1/head", "HEAD")
+        git("checkout", "-q", "main")
+        done = self.run_overlap(repo, [{"number": 1, "title": "gap", "files": [{"path": "bin/fleet-switchboard"}]}])
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("between statements near line", done.stdout)
+        failed = self.run_overlap(repo, [], gh_exit=1)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("gh pr list failed", failed.stderr)
+        refused = self.run_overlap(repo, [], "--daemon", "-x")
+        self.assertEqual(refused.returncode, 2)
+        long_list = self.run_overlap(repo, [{"number": 1000 + n, "title": "t", "files": []} for n in range(200)])
+        self.assertIn("200 open pull requests listed", long_list.stderr)
+
     def test_the_hygiene_scan_reads_one_list_of_daemon_files(self):
         self.assertIn(SWITCHBOARD, SWITCHBOARD_SOURCE_FILES)
         self.assertEqual(switchboard_source(), "\n".join(p.read_text() for p in SWITCHBOARD_SOURCE_FILES))

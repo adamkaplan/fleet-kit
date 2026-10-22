@@ -85,8 +85,11 @@ def world(root):
 
 
 def run(entry, argv, root, env):
-    proc = subprocess.run([sys.executable, "-c", RUNNER, entry] + argv, cwd=os.path.join(root, "home"), env=env,
-                          capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+    try:
+        proc = subprocess.run([sys.executable, "-c", RUNNER, entry] + argv, cwd=os.path.join(root, "home"), env=env,
+                              capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+    except subprocess.TimeoutExpired:
+        return {"argv": argv, "status": 124, "stdout": "", "stderr": "golden-cli: timed out after 60 s\n"}
     clean = lambda raw: raw.decode("utf-8", "replace").replace(os.path.realpath(root), "<ROOT>").replace(root, "<ROOT>")
     return {"argv": argv, "status": proc.returncode, "stdout": clean(proc.stdout), "stderr": clean(proc.stderr)}
 
