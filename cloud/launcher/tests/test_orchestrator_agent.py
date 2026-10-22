@@ -359,18 +359,18 @@ class HubForEveryLaunch(Orchestrator):
         self.orch("orch1")
         _, agents = self.registry()
         for w in ("wk1", "orch1"):
-            self.assertEqual(agents[w]["url"], "http://%s.cw-agents.cw.svc:4096" % cw.pod_name(w))
+            self.assertEqual(agents[w]["url"], "http://%s.cw-agents.cw.svc.cluster.local:4096" % cw.pod_name(w))
             self.assertTrue(self.hub_accepts(w), w)
             spec = self.pod(w)["spec"]
             self.assertEqual((spec["hostname"], spec["subdomain"]), (cw.pod_name(w), "cw-agents"))
 
     def test_s19_the_namespace_comes_from_the_setting(self):
-        self.assertEqual(cw.hub_agent_url("p1", "acme"), "http://p1.cw-agents.acme.svc:4096")
+        self.assertEqual(cw.hub_agent_url("p1", "acme"), "http://p1.cw-agents.acme.svc.cluster.local:4096")
 
     def test_s19_the_hub_refuses_the_old_forms(self):   # kills: a mutant that registers the pod IP's form, or a dotted name that is not .svc
         orig = cw.hub_agent_url
         try:
-            for url in ("http://10.1.2.3:4096", "http://worker-x.example.internal:4096", "http://p1.cw-agents.cw.example.com:4096"):
+            for url in ("http://10.1.2.3:4096", "http://worker-x.example.internal:4096", "http://p1.cw-agents.cw.example.com:4096", "http://p1.cw-agents.cw.svc.cluster.example:4096"):
                 with self.subTest(url=url):
                     w = "wk%d" % (9 + len(url) % 7)
                     cw.hub_agent_url = lambda n, ns, u=url: u
@@ -402,7 +402,7 @@ class HubForEveryLaunch(Orchestrator):
         code, out, err = self.run_cli("hub-session", "wk1", "--session", "ses_abc123", "--json")
         self.assertEqual(code, 0, err)
         self.assertEqual(self.registry()[1]["wk1"]["session"], "ses_abc123")
-        self.assertEqual(self.registry()[1]["wk1"]["url"], "http://%s.cw-agents.cw.svc:4096" % cw.pod_name("wk1"))
+        self.assertEqual(self.registry()[1]["wk1"]["url"], "http://%s.cw-agents.cw.svc.cluster.local:4096" % cw.pod_name("wk1"))
         self.assertEqual(self.registry()[1]["other-agent"], {"url": "u"})
 
     def test_s21_stop_removes_both_entries_of_a_worker(self):

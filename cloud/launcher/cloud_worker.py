@@ -186,11 +186,12 @@ DEFAULT_CHANNEL_URL = "http://cloud-hub.cw.svc:8443/message"
 DEFAULT_REGISTRY_SECRET = "cloud-hub-registry"
 HUB_PW_SECRET = "cloud-hub-pw"                  # one key per agent: the pod's server password, mounted by the hub at /etc/hub/pw
 HUB_PW_DIR = "/etc/hub/pw"
-HUB_SUBDOMAIN = "cw-agents"   # the headless Service (made by the hub manifests) that gives a hub pod the DNS name <pod>.cw-agents.<namespace>.svc
+CLUSTER_DOMAIN = "cluster.local"   # the one place the cluster domain is named
+HUB_SUBDOMAIN = "cw-agents"   # the headless Service (made by the hub manifests) that gives a hub pod the DNS name <pod>.cw-agents.<namespace>.svc.cluster.local
 
 
 def hub_agent_url(pod_name, namespace):
-    return "http://%s.%s.%s.svc:4096" % (pod_name, HUB_SUBDOMAIN, namespace)
+    return "http://%s.%s.%s.svc.%s:4096" % (pod_name, HUB_SUBDOMAIN, namespace, CLUSTER_DOMAIN)
 
 
 class ReaperLocked(Exception):
