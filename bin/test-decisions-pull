@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -241,6 +242,72 @@ def check_control_characters_are_stripped(module):
         assert written["decisions"][0]["id"] == "gh:1"
 
 
+def check_temp_file_is_exclusive_private_and_random(module):
+    with tempfile.TemporaryDirectory() as state:
+        names = []
+        real_open = os.open
+        def spy(path, flags, mode=0o777, **kw):
+            if str(path).endswith(".pull.tmp"):
+                names.append((Path(path).name, flags, mode))
+            return real_open(path, flags, mode, **kw)
+        os.open = spy
+        try:
+            pull_quiet(module, state, good())
+            pull_quiet(module, state, good())
+        finally:
+            os.open = real_open
+        assert len(names) == 2 and names[0][0] != names[1][0], names   # a random part, not only the pid
+        assert str(os.getpid()) in names[0][0]
+        for _, flags, mode in names:
+            for flag in (os.O_EXCL, os.O_NOFOLLOW, os.O_CREAT):
+                assert flags & flag, flags
+            assert mode == 0o600
+        # a planted symlink at the temp name is replaced, not followed
+        victim = Path(state) / "victim"
+        victim.write_text("KEEP")
+        module._token = lambda: "fixed"
+        link = Path(state) / ("decisions.json.%d.fixed.pull.tmp" % os.getpid())
+        os.symlink(str(victim), str(link))
+        assert pull_quiet(module, state, good()) == "wrote"
+        assert victim.read_text() == "KEEP"
+        assert not link.exists() and not link.is_symlink()
+        # a plain file in the way is also cleared
+        link.write_text("junk")
+        assert pull_quiet(module, state, good()) == "wrote"
+        assert json.loads((Path(state) / "decisions.json").read_text())["generation"] == 7
+
+
+def check_group_is_killed_when_a_grandchild_holds_the_pipe(module):
+    code = ("import subprocess, sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)']); "
+            "sys.stdout.write('{}'); sys.stdout.flush()")
+    start = time.time()
+    try:
+        module.command_fetch([sys.executable, "-c", code], timeout=1)
+        raise AssertionError("a source held open by a grandchild was believed")
+    except module.Unreachable as why:
+        assert "timed out" in str(why), str(why)
+    assert time.time() - start < 10, "blocked past the deadline"
+
+
+def check_deep_nesting_and_key_collisions_are_garbage(module):
+    deep = "[" * 200 + "]" * 200
+    collide = '{"decisions": [{"a\\u0001": 1, "a": 2}], "errors": []}'
+    for text in ('{"decisions": [{"x": %s}], "errors": []}' % deep, collide):
+        with tempfile.TemporaryDirectory() as state:
+            path = fresh_file(state)
+            err = io.StringIO()
+            assert pull_quiet(module, state, lambda: text.encode(), err=err) == "untouched"
+            assert path.read_text() == "OLD\n"
+            assert "untouched" in err.getvalue() and len(err.getvalue().splitlines()) == 1, err.getvalue()
+    # with the depth cap out of the way the recursion limit is hit: still Garbage, not a crash
+    module.MAX_DEPTH = 10 ** 6
+    text = '{"decisions": [{"x": %s}], "errors": []}' % ("[" * 1200 + "]" * 1200)
+    with tempfile.TemporaryDirectory() as state:
+        path = fresh_file(state)
+        assert pull_quiet(module, state, lambda: text.encode()) == "untouched"
+        assert path.read_text() == "OLD\n"
+
+
 def check_reasons_are_said_on_stderr(module):
     secret = "SECRET-BODY-TEXT"
     with tempfile.TemporaryDirectory() as state:
@@ -324,7 +391,8 @@ ALL = [check_shape_is_the_daemons, check_unknown_keys_are_dropped, check_write_i
        check_output_is_bounded_and_process_killed, check_real_source_that_prints_more_is_cut, check_nan_and_infinity_are_garbage,
        check_items_must_have_the_plugins_types, check_item_count_is_capped, check_control_characters_are_stripped,
        check_reasons_are_said_on_stderr, check_stale_ages_the_descriptor_not_the_path, check_directory_is_fsynced_after_rename,
-       check_kept_keys_are_the_daemons]
+       check_kept_keys_are_the_daemons, check_temp_file_is_exclusive_private_and_random,
+       check_group_is_killed_when_a_grandchild_holds_the_pipe, check_deep_nesting_and_key_collisions_are_garbage]
 
 
 class RealCode(unittest.TestCase):
@@ -360,13 +428,13 @@ class Mutants(unittest.TestCase):
         self.failing(check_shape_is_the_daemons, mutant("json.dump(body, handle, indent=1, sort_keys=True)", "json.dump(body, handle)"))
 
     def test_mode_widened(self):
-        self.failing(check_shape_is_the_daemons, mutant("0o600)\n    try:\n        with os.fdopen", "0o644)\n    try:\n        with os.fdopen"))
+        self.failing(check_shape_is_the_daemons, load(SOURCE.replace("flags, 0o600)", "flags, 0o644)")))
 
     def test_mtime_not_set(self):
         self.failing(check_shape_is_the_daemons, mutant("os.utime(str(temp), (now, now))", "pass"))
 
     def test_unknown_keys_kept(self):
-        self.failing(check_unknown_keys_are_dropped, mutant("body = clean({k: body[k] for k in KEPT_KEYS if k in body})", "body = clean(body)"))
+        self.failing(check_unknown_keys_are_dropped, mutant("body = {k: body[k] for k in KEPT_KEYS if k in body}", "body = dict(body)"))
 
     def test_write_in_place(self):
         self.failing(check_write_is_atomic, mutant("os.replace(str(temp), str(path))", "open(str(path), 'w').write(open(str(temp)).read())"))
@@ -420,10 +488,10 @@ class Mutants(unittest.TestCase):
         self.failing(check_item_count_is_capped, mutant("> MAX_ITEMS or", ">= MAX_ITEMS or"))
 
     def test_controls_kept(self):
-        self.failing(check_control_characters_are_stripped, mutant("body = clean({k: body[k] for k in KEPT_KEYS if k in body})", "body = {k: body[k] for k in KEPT_KEYS if k in body}"))
+        self.failing(check_control_characters_are_stripped, mutant("        return clean(body)", "        return body"))
 
     def test_controls_kept_in_nested_values(self):
-        self.failing(check_control_characters_are_stripped, mutant("return [clean(v) for v in value]", "return value"))
+        self.failing(check_control_characters_are_stripped, mutant("return [clean(v, depth + 1) for v in value]", "return value"))
 
     def test_c1_controls_kept(self):
         self.failing(check_control_characters_are_stripped, mutant("\\x7f-\\x9f", "\\x7f"))
@@ -450,10 +518,10 @@ class Mutants(unittest.TestCase):
         self.failing(check_output_is_bounded_and_process_killed, mutant("proc.stdout.read(MAX_BYTES + 1)", "proc.stdout.read()"))
 
     def test_process_not_killed_on_overflow(self):
-        self.failing(check_output_is_bounded_and_process_killed, load(SOURCE.replace("            proc.kill()\n            proc.wait()\n            return data", "            proc.wait()\n            return data").replace("        if proc.poll() is None:\n            proc.kill()\n", "")))
+        self.failing(check_output_is_bounded_and_process_killed, load(SOURCE.replace("            kill_group(proc)\n            proc.wait()\n            return data", "            proc.wait()\n            return data").replace("        if proc.poll() is None:\n            kill_group(proc)\n", "")))
 
     def test_real_timeout_not_enforced(self):
-        self.failing(check_real_timeout_is_unreachable, mutant("timer = threading.Timer(timeout, proc.kill)", "timer = threading.Timer(timeout + 60, proc.kill)"))
+        self.failing(check_real_timeout_is_unreachable, mutant("timer = threading.Timer(timeout, expire)", "timer = threading.Timer(timeout + 60, expire)"))
 
     def test_dir_not_fsynced(self):
         self.failing(check_directory_is_fsynced_after_rename, mutant("            os.fsync(dir_fd)", "            pass"))
@@ -463,6 +531,33 @@ class Mutants(unittest.TestCase):
 
     def test_kept_key_invented(self):
         self.failing(check_kept_keys_are_the_daemons, mutant('"provisional")', '"provisional", "extra")'))
+
+    def test_temp_not_exclusive(self):
+        self.failing(check_temp_file_is_exclusive_private_and_random, mutant("os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW", "os.O_CREAT | os.O_TRUNC"))
+
+    def test_temp_follows_symlinks(self):
+        self.failing(check_temp_file_is_exclusive_private_and_random, mutant("os.O_EXCL | os.O_NOFOLLOW", "os.O_EXCL"))
+
+    def test_temp_name_not_random(self):
+        self.failing(check_temp_file_is_exclusive_private_and_random, mutant("return secrets.token_hex(8)", "return ''"))
+
+    def test_temp_clash_not_retried(self):
+        self.failing(check_temp_file_is_exclusive_private_and_random, mutant("    except FileExistsError:\n        os.unlink(str(temp))\n        return os.open(str(temp), flags, 0o600)", "    except FileExistsError:\n        raise"))
+
+    def test_child_not_in_own_session(self):
+        self.failing(check_group_is_killed_when_a_grandchild_holds_the_pipe, mutant(",\n                     start_new_session=True)", ")"))
+
+    def test_only_child_killed(self):
+        self.failing(check_group_is_killed_when_a_grandchild_holds_the_pipe, mutant("os.killpg(proc.pid, signal.SIGKILL)", "proc.kill()"))
+
+    def test_depth_not_capped(self):
+        self.failing(check_deep_nesting_and_key_collisions_are_garbage, mutant("depth >= MAX_DEPTH", "depth >= 10 ** 6"))
+
+    def test_recursion_error_escapes(self):
+        self.failing(check_deep_nesting_and_key_collisions_are_garbage, mutant("    except RecursionError:\n        raise Garbage(\"nested too deeply\")", "    except ZeroDivisionError:\n        raise Garbage(\"nested too deeply\")"))
+
+    def test_key_collision_accepted(self):
+        self.failing(check_deep_nesting_and_key_collisions_are_garbage, mutant("        if len(out) != len(value):", "        if False:"))
 
 
 if __name__ == "__main__":

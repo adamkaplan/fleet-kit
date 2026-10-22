@@ -19,6 +19,8 @@ import datetime
 import json
 import os
 import re
+import secrets
+import signal
 import subprocess
 import sys
 import threading
@@ -29,6 +31,7 @@ DECISIONS_FILE = "decisions.json"
 STALE_SECONDS = 180                  # the plugin's STALE_MS / 1000
 FETCH_TIMEOUT = 30
 MAX_BYTES = 8 * 1024 * 1024          # a larger body is garbage, not a decisions list
+MAX_DEPTH = 32                       # nesting deeper than this is garbage (the daemon's list is a few levels)
 MAX_ITEMS = 10000                    # decisions or errors beyond this: garbage
 KEPT_KEYS = ("generation", "written_at", "daemon_pid", "decisions", "errors", "provisional")
 
@@ -43,29 +46,45 @@ class Garbage(Exception):
     """The source answered, but not with the daemon's decisions list."""
 
 
+def kill_group(proc):
+    """Kill the child's whole process group (it leads its own session), so a grandchild holding the pipe cannot outlive the deadline."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, AttributeError, TypeError):
+        proc.kill()
+
+
 def command_fetch(argv, timeout=FETCH_TIMEOUT, popen=subprocess.Popen):
     """The source text of a command's standard output, at most MAX_BYTES+1 bytes (the process is killed past that: the extra byte makes
     parse() call it garbage). A start failure, a timeout or a non-zero exit is Unreachable."""
     try:
-        proc = popen(list(argv), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        proc = popen(list(argv), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                     start_new_session=True)
     except (OSError, subprocess.SubprocessError) as err:
         raise Unreachable(type(err).__name__)
-    timer = threading.Timer(timeout, proc.kill)
+    expired = threading.Event()
+
+    def expire():
+        expired.set()
+        kill_group(proc)
+    timer = threading.Timer(timeout, expire)
     timer.start()
     try:
         data = proc.stdout.read(MAX_BYTES + 1)
         if len(data) > MAX_BYTES:
-            proc.kill()
+            kill_group(proc)
             proc.wait()
             return data
         code = proc.wait()
     finally:
         timer.cancel()
         if proc.poll() is None:
-            proc.kill()
+            kill_group(proc)
         proc.stdout.close()
+    if expired.is_set():
+        raise Unreachable("timed out")
     if code != 0:
-        raise Unreachable("timed out" if timer.finished.is_set() else "exit %s" % code)
+        raise Unreachable("exit %s" % code)
     return data
 
 
@@ -93,20 +112,29 @@ def parse(raw):
         raise Garbage("a decision is not an object")
     if not all(isinstance(e, (str, dict)) for e in body["errors"]):
         raise Garbage("an error is not a string or an object")
-    return body
+    try:
+        return clean(body)
+    except RecursionError:
+        raise Garbage("nested too deeply")
 
 
 _CONTROL = re.compile("[\x00-\x1f\x7f-\x9f]")
 
 
-def clean(value):
-    """Every string in `value` (keys too) without control characters (escape sequences reach the terminal otherwise)."""
+def clean(value, depth=0):
+    """Every string in `value` (keys too) without control characters (escape sequences reach the terminal otherwise). Garbage when nested
+    deeper than MAX_DEPTH or when two keys become one after stripping."""
     if isinstance(value, str):
         return _CONTROL.sub("", value)
+    if isinstance(value, (list, dict)) and depth >= MAX_DEPTH:
+        raise Garbage("nested deeper than %d" % MAX_DEPTH)
     if isinstance(value, list):
-        return [clean(v) for v in value]
+        return [clean(v, depth + 1) for v in value]
     if isinstance(value, dict):
-        return {clean(k): clean(v) for k, v in value.items()}
+        out = {clean(k): clean(v, depth + 1) for k, v in value.items()}
+        if len(out) != len(value):
+            raise Garbage("two keys are the same after cleaning")
+        return out
     return value
 
 
@@ -114,11 +142,25 @@ def _iso(now):
     return datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _token():
+    return secrets.token_hex(8)
+
+
+def _open_new(temp):
+    """Create `temp` exclusively (never through a symlink, mode 0600); on a name clash unlink what is there and retry once."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    try:
+        return os.open(str(temp), flags, 0o600)
+    except FileExistsError:
+        os.unlink(str(temp))
+        return os.open(str(temp), flags, 0o600)
+
+
 def write_atomic(path, body, now):
-    body = clean({k: body[k] for k in KEPT_KEYS if k in body})
+    body = {k: body[k] for k in KEPT_KEYS if k in body}
     body.setdefault("written_at", _iso(now))
-    temp = path.with_name("%s.%d.pull.tmp" % (DECISIONS_FILE, os.getpid()))
-    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    temp = path.with_name("%s.%d.%s.pull.tmp" % (DECISIONS_FILE, os.getpid(), _token()))
+    fd = _open_new(temp)
     try:
         with os.fdopen(fd, "w") as handle:
             json.dump(body, handle, indent=1, sort_keys=True)
