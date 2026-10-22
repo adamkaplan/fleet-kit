@@ -26,6 +26,9 @@ MODEL_VALUES = ["ab12CD34e", "modelvalue-Qx7Lm2Qx7Lm2Qx7Lm2", "m" * 7 + "-" + "Z
 OTHER = "othervalue-Zk9Wp3Zk9Wp3Zk9Wp3Zk9Wp3"   # another provider in the same auth file: never read out
 GIT = "gitvalue-Rt4Vb8Rt4Vb8Rt4Vb8Rt4Vb8"
 ENTRY = {"type": "oauth", "refresh": MODEL_VALUES[0], "access": MODEL_VALUES[1], "extra": MODEL_VALUES[2]}
+ROW = {"id": "id-copilot", "integrationID": "github-copilot", "label": "lbl-x7q2", "active": True, "value": ENTRY}   # one entry of `opencode auth export`
+OTHER_ROW = {"id": "id-other", "integrationID": "other-provider", "label": "lbl-o3k9", "active": True, "value": {"type": "api", "key": OTHER}}
+FAKE_EXPORT = os.path.join(HERE, "fake_opencode_export.sh")
 BRIEF = "Add a file named hello.txt."
 RUN = r"per-run secret %s-run (cleaned|REMAINS)"
 
@@ -41,9 +44,9 @@ class Driver(base.Base):
         self.scratch = os.path.join(d, "scratch")
         os.mkdir(self.scratch)
         self.stub_log = os.path.join(d, "stub.log")
-        self.auth = os.path.join(d, "auth.json")
-        with open(self.auth, "w") as f:
-            json.dump({"github-copilot": ENTRY, "other-provider": {"key": OTHER}}, f)
+        self.export = os.path.join(d, "export.json")   # what the stand-in `opencode auth export` prints (it reads $HOME/export.json)
+        with open(self.export, "w") as f:
+            json.dump([OTHER_ROW, ROW], f)
         self.gitcmd, self.git_ran = os.path.join(d, "git-token-cmd"), os.path.join(d, "git-ran")
         with open(self.gitcmd, "w") as f:
             f.write('#!/bin/sh\ntouch "%s"\n[ "$GH_REPO" = %s ] || exit 1\nprintf "%%s" "%s"\n' % (self.git_ran, REPO, GIT))
@@ -55,9 +58,9 @@ class Driver(base.Base):
         self.mark = os.path.join(d, "hang.mark")
         self.name = cw.pod_name("coder7")
         self.patch_state(hook_result={"pushed": True, "wip_branch": "coder7/wip"})
-        self.denv = dict({"PATH": os.environ["PATH"], "HOME": d}, **self.env, TMPDIR=self.scratch, CW_TMPDIR=self.scratch, CW_MODEL_AUTH_FILE=self.auth,
+        self.denv = dict({"PATH": os.environ["PATH"], "HOME": d}, **self.env, TMPDIR=self.scratch, CW_TMPDIR=self.scratch, CW_OPENCODE_BIN=FAKE_EXPORT,
                          CW_GIT_TOKEN_CMD=self.gitcmd, FAKE_SCAN_DIR=self.scratch, FAKE_KUBE_SEEN=self.seen,
-                         FAKE_SCAN_VALUES=",".join(MODEL_VALUES + [GIT, OTHER, json.dumps({"github-copilot": ENTRY})]),
+                         FAKE_SCAN_VALUES=",".join(MODEL_VALUES + [GIT, OTHER, json.dumps([ROW])]),
                          STUB_LOG=self.stub_log, CW_POLL_SECONDS="0.2", CW_HEALTH_TIMEOUT="3", CW_RUN_TIMEOUT="60", CW_CREATE_TIMEOUT="60")
 
     def args(self, worker="coder7", repo=REPO, brief=None):
@@ -82,7 +85,7 @@ class Driver(base.Base):
                           self.read(self.env["CW_CLOUD_AUDIT"])])
 
     def assert_no_secret(self, text, what="output"):
-        for v in MODEL_VALUES + [GIT, OTHER, json.dumps({"github-copilot": ENTRY})]:
+        for v in MODEL_VALUES + [GIT, OTHER, json.dumps([ROW])]:
             for form in forms(v):
                 self.assertNotIn(form, text, what)
 
@@ -109,7 +112,7 @@ class Driver(base.Base):
         self.assertIn("stopped; result", out)
         self.assert_clean(out)
         sent = self.read(self.state + ".stdin")   # the values did reach kubectl, by stdin; the other provider's did not
-        self.assertIn(base64.b64encode(json.dumps({"github-copilot": ENTRY}).encode()).decode(), sent)
+        self.assertIn(base64.b64encode(json.dumps([ROW]).encode()).decode(), sent)
         self.assertIn(GIT, sent)
         self.assertNotIn(OTHER, sent)
         self.assertNotIn(base64.b64encode(OTHER.encode()).decode(), sent)
@@ -221,13 +224,9 @@ class Driver(base.Base):
 
     # -- inputs and replay --
     def test_a_missing_or_unreadable_input_refuses_and_creates_nothing(self):
-        broken = os.path.join(self.tmp.name, "broken.json")
-        with open(broken, "w") as f:
-            f.write(json.dumps({"other-provider": {"key": OTHER}}))
         empty = os.path.join(self.tmp.name, "empty.txt")
         open(empty, "w").close()
-        cases = {"auth file missing": {"CW_MODEL_AUTH_FILE": os.path.join(self.tmp.name, "missing.json")},
-                 "no github-copilot entry": {"CW_MODEL_AUTH_FILE": broken},
+        cases = {"export command missing": {"CW_OPENCODE_BIN": "/nonexistent/opencode"},
                  "token command fails": {"CW_GIT_TOKEN_CMD": "false"},
                  "token command prints nothing": {"CW_GIT_TOKEN_CMD": "true"},
                  "token command missing": {"CW_GIT_TOKEN_CMD": "/nonexistent/cmd"}}
@@ -245,6 +244,39 @@ class Driver(base.Base):
                 p = subprocess.run(self.args(brief=brief), env=self.denv, capture_output=True, text=True)
                 self.assertEqual(p.returncode, cw.EXIT_USAGE, p.stderr)
                 self.assertEqual((self.st().get("secrets", {}), self.st()["pods"]), ({}, {}))
+
+    def test_every_export_refusal_exits_2_by_name_creates_nothing_and_never_prints_the_credential(self):
+        """#1088 S3, U3, S8 through the real driver, one subtest per member of the refusal table of test_model_credential."""
+        import test_model_credential as tmc
+        canary_forms = [f for v in (tmc.CANARY, tmc.CANARY + "-r") for f in forms(v)]
+        for case, (text, code, word) in tmc.REFUSALS.items():
+            with self.subTest(case):
+                with open(self.export, "w") as f:
+                    f.write(text)
+                exit_file = os.path.join(self.tmp.name, "export.exit")
+                if code:
+                    open(exit_file, "w").write(str(code))
+                try:
+                    p, out = self.run_driver()
+                finally:
+                    if os.path.exists(exit_file):
+                        os.remove(exit_file)
+                self.assertEqual(p.returncode, cw.EXIT_USAGE, out)
+                self.assertIn("github-copilot", out)
+                self.assertIn(word, out)
+                self.assertEqual((self.st().get("secrets", {}), self.st()["pods"]), ({}, {}))
+                self.assertNotIn('"create"', self.read(self.env["FAKE_KUBE_CALLS"]))
+                self.assertEqual(os.listdir(self.scratch), [])
+                for form in canary_forms:
+                    self.assertNotIn(form, out)
+
+    def test_the_export_command_runs_with_the_fixed_argv_and_no_cluster_or_token_variable(self):
+        p, out = self.run_driver(CW_CLUSTER_TOKEN_CMD="true", GH_TOKEN="g", GITHUB_TOKEN="h")
+        self.assertEqual(p.returncode, 0, out)
+        d = self.tmp.name
+        self.assertEqual(self.read(os.path.join(d, "oc-argv")).strip(), "auth export")
+        names = {l.split("=", 1)[0] for l in self.read(os.path.join(d, "oc-env")).splitlines() if "=" in l} - {"PWD", "SHLVL", "_", "OLDPWD"}
+        self.assertEqual({n for n in names if not (n in ("PATH", "HOME", "LANG") or n.startswith("XDG_"))}, set())
 
     def test_the_default_git_token_command_is_the_app_token_mint_for_the_repository(self):
         with open(DRIVER) as f:

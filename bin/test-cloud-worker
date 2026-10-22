@@ -213,7 +213,9 @@ def make_jwt(lifetime, issued=None):
 
 CLUSTER_TOKEN = make_jwt(1200)
 ADMIN_KUBECONFIG = "apiVersion: v1\nclusters: []\nusers:\n- name: admin\n  user: {token: ADMINSECRET-q8w7e6r5t4y3}\n"
+FAKE_EXPORT = str(Path(__file__).resolve().parent.parent / "cloud" / "launcher" / "tests" / "fake_opencode_export.sh")
 MODEL_ENTRY = {"type": "oauth", "refresh": "ghu_ModelRefreshSecret0123456789", "access": "gho_ModelAccessSecret9876543210", "expires": 0}
+MODEL_ROW = {"id": "id-model", "integrationID": "github-copilot", "label": "acme", "active": True, "value": MODEL_ENTRY}
 GIT_TOKEN = "ghs_GitInstallationTokenAbCdEf0123456789"
 
 
@@ -241,7 +243,8 @@ class Base(unittest.TestCase):
         (self.stub_dir / "mint_token").write_text(CLUSTER_TOKEN)
         (self.stub_dir / "admin_kubeconfig").write_text(ADMIN_KUBECONFIG)
         (self.stub_dir / "git_token").write_text(GIT_TOKEN + "\n")
-        (self.home / "auth.json").write_text(json.dumps({"github-copilot": MODEL_ENTRY, "other": {"key": "must-not-travel"}}))
+        (self.home / "export.json").write_text(json.dumps([MODEL_ROW, {"id": "id-other", "integrationID": "other", "label": "x", "active": True,
+                                                                          "value": {"type": "api", "key": "must-not-travel"}}]))   # what the stand-in `opencode auth export` prints
         (self.home / "tmp").mkdir()
         self.root = self.home / "tmp" / ("cwtok-%d" % os.getuid())
         tmpdir = mock.patch.object(tempfile, "tempdir", str(self.home / "tmp"))
@@ -253,7 +256,7 @@ class Base(unittest.TestCase):
             "STUB_PASSWORD": PASSWORD, "STUB_URL": self.remote.url, "STUB_STOP_EXIT": "0",
             "CW_ALLOWED_REPOS": "acme-org/widget-service", "CW_CLOUD_SERVER": "https://cluster.example.internal:6443",
             "CW_KUBECTL": str(self.stub_dir / "kubectl"), "CW_VAULT_SUBSCRIPTION": "00000000-0000-0000-0000-000000000000", "CW_VAULT_NAME": "vault-example",
-            "CW_GIT_TOKEN_CMD": "cat %s" % (self.stub_dir / "git_token"), "CW_MODEL_AUTH_FILE": str(self.home / "auth.json"),
+            "CW_GIT_TOKEN_CMD": "cat %s" % (self.stub_dir / "git_token"), "CW_OPENCODE_BIN": FAKE_EXPORT,
             "STUB_TOKEN_SHA": hashlib.sha256(CLUSTER_TOKEN.encode()).hexdigest(),
             "STUB_ADMIN_SHA": hashlib.sha256(ADMIN_KUBECONFIG.encode()).hexdigest(), "TMPDIR": str(self.home / "tmp"),
             "CW_TUNNEL_TIMEOUT": "10"})
@@ -565,7 +568,7 @@ class TestWiring(Base):
     def test_s1_launch_passes_both_secrets_by_descriptor_and_nowhere_else(self):
         code, out, err = self.launch()
         self.assertEqual(code, 0, err)
-        self.assertEqual(json.loads((self.stub_dir / "received-model-auth").read_text()), {"github-copilot": MODEL_ENTRY})   # only that entry travels
+        self.assertEqual(json.loads((self.stub_dir / "received-model-auth").read_text()), [MODEL_ROW])   # only that entry travels, as a one-entry array
         self.assertEqual((self.stub_dir / "received-git-token").read_text().strip(), GIT_TOKEN)
         for entry in self.jsonl("login.log"):
             self.assertTrue(entry["token_ok"], entry["command"])
@@ -1310,7 +1313,7 @@ class TestSettingsFile(Base):
         self.values = {"CW_ALLOWED_REPOS": "acme-org/widget-service", "CW_CLOUD_IMAGE": self.DIGEST, "CW_CLOUD_SERVER": "https://cluster.example.internal:6443",
                        "CW_VAULT_SUBSCRIPTION": "00000000-0000-0000-0000-000000000000", "CW_VAULT_NAME": "vault-example", "CW_CLOUD_NAMESPACE": "cw",
                        "CW_KUBECTL": str(self.stub_dir / "kubectl"), "CW_GIT_TOKEN_CMD": "cat %s" % (self.stub_dir / "git_token"),
-                       "CW_MODEL_AUTH_FILE": str(self.home / "auth.json")}
+                       "CW_OPENCODE_BIN": FAKE_EXPORT}
 
     @property
     def lib(self):
@@ -1350,7 +1353,7 @@ class TestSettingsFile(Base):
     def test_u1_no_file_launches_as_before_and_says_environment_once(self):
         os.environ.update({"CW_ALLOWED_REPOS": "acme-org/widget-service", "CW_CLOUD_SERVER": "https://cluster.example.internal:6443",
                            "CW_KUBECTL": str(self.stub_dir / "kubectl"), "CW_VAULT_SUBSCRIPTION": "00000000-0000-0000-0000-000000000000", "CW_VAULT_NAME": "vault-example",
-                           "CW_GIT_TOKEN_CMD": "cat %s" % (self.stub_dir / "git_token"), "CW_MODEL_AUTH_FILE": str(self.home / "auth.json")})
+                           "CW_GIT_TOKEN_CMD": "cat %s" % (self.stub_dir / "git_token"), "CW_OPENCODE_BIN": FAKE_EXPORT})
         self.assertFalse(self.file.exists())
         code, out, err = self.launch()
         self.assertEqual(code, 0, err)
@@ -1365,7 +1368,7 @@ class TestSettingsFile(Base):
             self.assertNotIn(key, os.environ)   # the environment route never required the image or the namespace for launch
         os.environ.update({"CW_ALLOWED_REPOS": "acme-org/widget-service", "CW_CLOUD_SERVER": "https://cluster.example.internal:6443",
                            "CW_KUBECTL": str(self.stub_dir / "kubectl"), "CW_VAULT_SUBSCRIPTION": "00000000-0000-0000-0000-000000000000", "CW_VAULT_NAME": "vault-example",
-                           "CW_GIT_TOKEN_CMD": "cat %s" % (self.stub_dir / "git_token"), "CW_MODEL_AUTH_FILE": str(self.home / "auth.json")})
+                           "CW_GIT_TOKEN_CMD": "cat %s" % (self.stub_dir / "git_token"), "CW_OPENCODE_BIN": FAKE_EXPORT})
         self.assertEqual(self.launch()[0], 0)
 
     def test_the_test_hook_is_not_an_environment_variable(self):
