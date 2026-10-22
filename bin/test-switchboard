@@ -3341,6 +3341,111 @@ class TestSteerToWorking(Base):
         self.assertIn("only partly read", err)
         self.assertEqual(self.posts, [])
 
+    def known_endpoint_half_send(self):
+        registry = sb.load_module("registry")
+        real = registry.read
+        # a real torn registry.json reads whole False with no agents; this synthetic half read still carries the recipient's endpoint row
+        with mock.patch.object(registry, "read", lambda d: dict(real(d), whole=False)):
+            return self.cli_send("ping", to="cloudy")
+
+    def test_a_known_endpoint_row_on_a_half_read_is_refused_with_a_named_reason_and_nothing_is_sent(self):
+        self.endpoint_world()
+        code, _, err = self.known_endpoint_half_send()
+        self.assertEqual(code, sb.EXIT_HELD)
+        self.assertIn("not sent", err)
+        self.assertIn("only partly read", err)
+        self.assertEqual(self.posts, [])
+        self.assertEqual(self.world.admissions("platform"), [])
+
+    def test_the_mutant_that_always_falls_through_on_a_half_read_fails_the_known_endpoint_test(self):
+        self.endpoint_world()
+        es = sb.load_module("endpoint_send")
+        real_route = es.route
+
+        def mutant(registry, state_dir, name):
+            found = real_route(registry, state_dir, name)
+            return found[:2] + (False,) if found[0] == "half" else found
+        with mock.patch.object(es, "route", mutant):
+            code, _, err = self.known_endpoint_half_send()
+        self.assertNotEqual((code, "only partly read" in err), (sb.EXIT_HELD, True))   # the mutant no longer refuses: the test above would fail on it
+
+    def test_a_redirect_is_refused_and_the_second_port_gets_no_request(self):
+        import threading, http.server
+        es, client = sb.load_module("endpoint_send"), sb.load_module("cloud_client")
+        hits = {"a": 0, "b": 0}
+
+        class B(http.server.BaseHTTPRequestHandler):
+            def do_POST(h):
+                hits["b"] += 1
+                h.send_response(200); h.end_headers()
+            do_GET = do_POST
+            def log_message(h, *a): pass
+        srv_b = http.server.HTTPServer(("127.0.0.1", 0), B)
+
+        class A(B):
+            def do_POST(h):
+                hits["a"] += 1
+                h.send_response(302)
+                h.send_header("Location", "http://127.0.0.1:%d/x" % srv_b.server_address[1])
+                h.end_headers()
+        srv_a = http.server.HTTPServer(("127.0.0.1", 0), A)
+        for srv in (srv_a, srv_b):
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            self.addCleanup(srv.server_close)
+            self.addCleanup(srv.shutdown)
+        token = self.home / "agent-token"
+        token.write_text("tok.en-1")
+        post = es.http_post("http://127.0.0.1:%d/" % srv_a.server_address[1])
+        ok, line = client.send("cos", "cloudy", "ping", post, token_path=str(token), retries=1)
+        self.assertFalse(ok)
+        self.assertIn("the endpoint answered with a redirect", line)
+        self.assertEqual(hits, {"a": 1, "b": 0})
+
+    def test_a_half_read_still_delivers_to_a_pane_agent_by_the_old_path(self):
+        self.work()
+        registry = sb.load_module("registry")
+        with mock.patch.object(registry, "read", side_effect=OSError("unreadable")):
+            code, out, err = self.cli_send("hello", "there")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.world.admissions("platform")), 1)
+        real = registry.read
+        with mock.patch.object(registry, "read", lambda d: dict(real(d), whole=False)):
+            code, out, err = self.cli_send("hello", "again")
+        self.assertEqual(code, 0, err)
+
+    def test_the_endpoint_scheme_and_size_rules(self):
+        es, client = sb.load_module("endpoint_send"), sb.load_module("cloud_client")
+        for url, want in (("https://x.example.com/c", True), ("http://x.example.com/c", False), ("http://hub.cw.svc:80", True),
+                          ("http://hub.cw.svc.cluster.local/", True), ("http://hub:8443", True), ("ftp://hub", False), ("http://", False)):
+            self.assertEqual(es.endpoint_ok(url), want, url)
+        token = self.home / "agent-token"
+        token.write_text("tok.en-1")
+        seen = []
+        post = lambda request: seen.append(request) or {"status": 200}
+        ok, line = es.deliver(client, "https://x.example.com", "cos", "c", "x" * (16 * 1024 + 1), post=post, token_path=str(token))
+        self.assertFalse(ok)
+        self.assertIn("over 16384 bytes", line)
+        self.assertEqual(seen, [])
+        ok, _ = es.deliver(client, "https://x.example.com", "cos", "c", "x" * 16 * 1024, post=post, token_path=str(token))
+        self.assertTrue(ok)
+
+    def test_mutants_that_follow_redirects_or_refuse_the_half_case_are_caught(self):
+        import urllib.request
+        es = sb.load_module("endpoint_send")
+        # a default-redirect handler would follow: the real handler must refuse
+        h = es._NoRedirect()
+        req = urllib.request.Request("https://a.example.com", data=b"{}", headers={"Authorization": "Bearer t"})
+        self.assertIsNone(h.redirect_request(req, None, 302, "Found", {}, "https://b.example.com"))
+        self.assertIs(es._NoRedirect.redirect_request is urllib.request.HTTPRedirectHandler.redirect_request, False)
+        # the half case for a pane agent must not be refused by the real route
+        self.work()
+        registry = sb.load_module("registry")
+        real = registry.read
+        with mock.patch.object(registry, "read", lambda d: dict(real(d), whole=False)):
+            found = es.route(registry, self.world.state, "platform")
+        self.assertEqual(found[0], "half")
+        self.assertFalse(found[2])
+
     def test_the_endpoint_is_an_address_only_and_the_bearer_comes_from_the_clients_token_file(self):
         es, client = sb.load_module("endpoint_send"), sb.load_module("cloud_client")
         token = self.home / "agent-token"
