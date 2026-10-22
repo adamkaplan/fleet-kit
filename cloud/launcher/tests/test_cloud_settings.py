@@ -657,6 +657,7 @@ NOT_SETTINGS = {
     "CW_WORKER": "set by the launcher into the pod's environment (the worker's own name); end_hook reads it inside the pod",
     "CW_REPO": "set by the launcher into the pod's environment from --repo; read back from the pod spec",
     "CW_BRANCH": "set by the launcher into the pod's environment from --branch",
+    "CW_GIT_TOKEN_ROLE": "set by the launcher into the git-token mint child's environment from the role it mints for (omitted for the worker role): not an operator choice",
     "CW_IDLE_SECONDS": "set by the launcher into the pod's environment from --idle",
     "CW_HARD_DEADLINE": "set by the launcher into the pod's environment from the hard limit",
     "CW_AUDIT_RUNTIME_ID": "set by the launcher into the pod's environment (pod/NAME): an identifier, not a choice",
