@@ -1,0 +1,4 @@
+{
+ "command": "charter",
+ "help": "usage: fleet-switchboard charter [-h] {set} ... positional arguments: {set} set Write the registry's charter of an orchestrator: an issue number, or none options: -h, --help show this help message and exit"
+}

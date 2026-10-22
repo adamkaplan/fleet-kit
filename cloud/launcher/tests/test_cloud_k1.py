@@ -497,7 +497,7 @@ class M1Scrub(TokenBase):
         self.assert_clean([out])
 
     def test_stop_delete_exec_annotate_status_reap_failure_paths(self):
-        for cmd in ("exec", "annotate", "delete", "get"):
+        for cmd in ("exec", "patch", "delete", "get"):
             self.write_state({"pods": {}})
             if os.path.exists(self.env["CW_CLOUD_AUDIT"]):
                 os.unlink(self.env["CW_CLOUD_AUDIT"])
@@ -625,7 +625,7 @@ class M3TokenEncodedForms(TokenBase):
                 f.write(tok)
             self.env["FAKE_KUBE_ECHO"] = M3EncodedForms.encoded_echo(None, [tok])
             pieces = encoded_pieces(tok)
-            for cmd in ("exec", "get", "delete", "annotate"):
+            for cmd in ("exec", "get", "delete", "patch"):
                 self.write_state({"pods": {}})
                 if os.path.exists(self.env["CW_CLOUD_AUDIT"]):
                     os.unlink(self.env["CW_CLOUD_AUDIT"])

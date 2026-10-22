@@ -249,7 +249,7 @@ def may_record_verdict(evaluator, caller, allowed, authors):
 
 # ----------------------------------------------------------------------------------- waivers
 
-WAIVABLE = ("G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5")   # G0 to G5: what the chief of staff may waive for a hotfix
+WAIVABLE = ("G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5", "MG")   # G0 to G5: what the chief of staff may waive for a hotfix; MG: the merge gate (#962), at the PR's head
 NEVER_WAIVABLE = {"G6": "the owner's hold on a held PR", "G7": "the epic integration", "G8": "production"}
 WAIVER_REASON_MIN = 20
 WAIVER_SECONDS = 24 * 3600   # a waiver is valid this long (the retroactive-plan due date), and only at the head it names
@@ -261,7 +261,7 @@ def parse_waiver_gates(text):
     for raw in (text or "").replace(" ", "").split(","):
         if not raw:
             continue
-        gate = {"G2": "G2/G3", "G3": "G2/G3", "g2/g3": "G2/G3"}.get(raw, raw[:1].upper() + raw[1:])
+        gate = {"G2": "G2/G3", "G3": "G2/G3", "g2/g3": "G2/G3", "mg": "MG"}.get(raw, raw[:1].upper() + raw[1:])
         if gate in NEVER_WAIVABLE:
             return [], "%s is never waived (%s): refused, nothing was recorded" % (gate, NEVER_WAIVABLE[gate])
         if gate not in WAIVABLE:

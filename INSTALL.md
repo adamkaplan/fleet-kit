@@ -338,21 +338,25 @@ Make sure `~/.local/bin` is on PATH, or the agents will be told to run an ack
 command they cannot reach.
 
 ```
-HUMAN:   yes, one step. An orchestrator opts in by having 🔔 in its tab label.
-         Nothing is supervised until you add it.
+HUMAN:   yes, one step. Turn the bell on for an orchestrator: fleet-heartbeat bell NAME on
+         Nothing is supervised until you do.
 ```
 
-That is the whole opt-in mechanism: one glyph, one rule. `./bin/fleet-heartbeat
-list` shows every tab holding an agent, its kind, whether it opts in and whether
-the heartbeat can wake it, so if something is not being woken, that command
-answers why.
+### Where the heartbeat's bell opt-in lives
+
+The opt-in is the `bell` field of the agent's record in the agent registry (`registry.json`, the one record of who exists). The heartbeat reads it
+through the registry's read seam and lists no live panes for it. A record with no `bell` field is opted out, and a new agent is recorded with
+`bell: false`. Change it with `fleet-heartbeat bell NAME on` (or `off`); an agent the registry does not record is refused. A glyph in a tab label
+no longer does anything. On its first pass after an upgrade the switchboard daemon copies today's tab-label state into the field once (each write
+is an audit line, `bell_migrated`, and a marker file `bell-migrated.json` stops it running again), so nobody who was supervised before is dropped.
+`./bin/fleet-heartbeat list` shows each registry agent with a pane, its state and whether it opts in, so if something is not being woken, that
+command answers why. An agent whose recorded state is `dead` or `detached` is never woken.
 
 **The heartbeat wakes a pane only when it can positively recognise that agent's
 empty input box** — the same check that stops it typing over a half-written
 draft or into a dialog. Today that is **opencode** only. Any other
-herdr-detected agent (Copilot CLI, Claude Code, Codex, pi, …) with 🔔 in its tab is
-never sent anything; `./bin/fleet-heartbeat list` shows it as not wakeable
-(`WAKEABLE no`), and `status` names the reason
+herdr-detected agent (Copilot CLI, Claude Code, Codex, pi, …) with its bell on is
+never sent anything, and `./bin/fleet-heartbeat status` names the reason
 (`agent_kind_not_wakeable:<kind>`). If the person runs orchestrators in one of
 those, tell them this step will not supervise those panes. Supporting another
 agent means adding its input-box check with captured fixtures for an empty box,
