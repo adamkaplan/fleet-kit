@@ -997,6 +997,11 @@ def pod_deadline_floor(max_hard):
     return parse_duration(max_hard or DEFAULT_MAX_HARD) + POD_DEADLINE_GRACE_SECONDS
 
 
+def hub_on(env):
+    """The hub setting: the channel address or the registry Secret name is set. Unset, a worker launch is exactly what it was."""
+    return bool((env.get("CW_HUB_CHANNEL_URL") or "").strip() or (env.get("CW_HUB_REGISTRY_SECRET") or "").strip())
+
+
 def render_pod(a, worker, name, now, hard, env, run_names=()):
     image = a.image or env.get("CW_CLOUD_IMAGE")
     if not image:
@@ -1014,13 +1019,13 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
     agent = getattr(a, "agent", None) or "worker"
     if agent not in AGENTS:
         raise CloudError("--agent must be one of %s, got %r; nothing was created" % (" or ".join(AGENTS), str(agent)[:40]), EXIT_USAGE)
-    if agent == "orchestrator":   # a worker pod gets none of these: its spec is exactly what it was
+    if agent == "orchestrator" or hub_on(env):   # with the hub setting unset a worker pod gets none of these: its spec is exactly what it was
         boss = getattr(a, "boss", None)
-        if not boss or not NAME_RE.match(boss):
+        if (agent == "orchestrator" and not boss) or (boss and not NAME_RE.match(boss)):
             raise CloudError("--agent orchestrator needs --boss NAME", EXIT_USAGE)
         if CHANNEL_SECRET_KEY not in run_names:
-            raise CloudError("an orchestrator pod needs its channel secret", EXIT_USAGE)
-        e.update({"CW_AGENT": agent, "FLEET_AGENT_NAME": worker, "FLEET_BOSS": boss,
+            raise CloudError("a hub pod needs its channel secret", EXIT_USAGE)
+        e.update({"CW_AGENT": agent, "FLEET_AGENT_NAME": worker, **({"FLEET_BOSS": boss} if boss else {}),
                   "FLEET_CLOUD_CHANNEL_URL": env.get("CW_HUB_CHANNEL_URL") or DEFAULT_CHANNEL_URL, "FLEET_CLOUD_TOKEN_FILE": CHANNEL_TOKEN_FILE})
     pw_volume = {"name": "pw", "secret": {"secretName": name + "-pw", "defaultMode": 0o600,
                                           "items": [{"key": "password", "path": "server-password"}]}}
@@ -1151,7 +1156,8 @@ class Launcher:
             agent = getattr(a, "agent", None) or "worker"
             if agent not in AGENTS:   # before any cluster call
                 raise CloudError("--agent must be one of %s, got %r; nothing was created" % (" or ".join(AGENTS), str(agent)[:40]), EXIT_USAGE)
-            if agent == "orchestrator":   # the per-pod channel secret: random, only its sha256 leaves the pod's Secret, never printed
+            hub = agent == "orchestrator" or hub_on(self.env)
+            if hub:   # the per-pod channel secret: random, only its sha256 leaves the pod's Secret, never printed
                 if CHANNEL_SECRET_KEY in run_values:
                     raise CloudError("%s is the launcher's own key" % CHANNEL_SECRET_KEY, EXIT_USAGE)
                 run_values[CHANNEL_SECRET_KEY] = secrets.token_hex(32)
@@ -1171,7 +1177,7 @@ class Launcher:
                                  "type": "Opaque", "stringData": {"password": password}})
                 if run_values:
                     self._make(made, "run", self.kube.create_run_secret, name, name, run_values, *([a.run_id] if getattr(a, "run_id", None) else []))
-                if agent == "orchestrator":
+                if hub:
                     made["reg"] = (self._registry_secret(), worker)   # set before the call: a half write is undone by the cleanup
                     self._register(worker, run_values[CHANNEL_SECRET_KEY], spec, self.env.get("CW_CLOUD_DOMAIN", "example.internal"), password)
                 self._make(made, "pod", self.kube.apply, spec)
@@ -1179,6 +1185,8 @@ class Launcher:
                     self._start_stack_pod(worker, name, spec, made, a.wait)
                 else:
                     self._wait_ready(name, a.wait)
+                if hub:   # the tunnel name does not resolve inside the cluster: the hub is given the pod's own address
+                    self._set_hub_url(worker, name)
                 if a.password_fd is not None:
                     with os.fdopen(os.dup(a.password_fd), "w") as f:
                         f.write(password)
@@ -1241,6 +1249,30 @@ class Launcher:
             sec[agent], agents[agent] = digest, entry
         self.kube.registry_update(self._registry_secret(), change)
         self.kube.hub_pw_set(HUB_PW_SECRET, agent, password)   # the pod's server password: the hub reads it from the file
+
+    def _set_hub_url(self, agent, name):
+        ip = ((self.kube.get_pod(name) or {}).get("status") or {}).get("podIP")
+        if not ip or not re.fullmatch(r"[0-9a-fA-F.:]{3,45}", ip):
+            raise CloudError("the pod has no address to register with the hub")
+        host = "[%s]" % ip if ":" in ip else ip
+
+        def change(sec, agents):
+            if agent in agents:
+                agents[agent]["url"] = "http://%s:4096" % host
+        self.kube.registry_update(self._registry_secret(), change)
+
+    def hub_session(self, a):
+        """Write the session id into the agent's hub entry (a no-op when it has none). Called by the switchboard once the session exists."""
+        if not NAME_RE.match(a.worker or "") or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", a.session or ""):
+            raise CloudError("bad worker name or session id", EXIT_USAGE)
+        found = []
+
+        def change(sec, agents):
+            if a.worker in agents:
+                agents[a.worker]["session"] = a.session
+                found.append(1)
+        self.kube.registry_update(self._registry_secret(), change)
+        return {"worker": a.worker, "registered": bool(found)}
 
     def _unregister(self, agent):
         """Remove both entries of the agent (a no-op when absent). A failure is said on stderr and never raised: the stop goes on."""
@@ -1450,7 +1482,7 @@ class Launcher:
         def go(info):
             pod = self._need(worker)
             uid = ((pod or {}).get("metadata") or {}).get("uid")
-            self._orchestrator = _pod_env(pod, "FLEET_AGENT_NAME") if pod and _pod_env(pod, "CW_AGENT") == "orchestrator" else None
+            self._orchestrator = _pod_env(pod, "FLEET_AGENT_NAME") if pod and _pod_env(pod, "FLEET_CLOUD_TOKEN_FILE") else None   # a hub pod, orchestrator or worker
             if nonce and pod:
                 info["rid"] = "pod/" + name
                 if ann(pod, "run-id") != nonce:   # another run's (or an unlabelled) worker of this name: nothing is changed
@@ -2193,6 +2225,8 @@ def build_parser():
     c.add_argument("--run-id", type=_run_id,
                    help="a caller's nonce (lowercase hex), recorded on the pod and Secrets it creates so the caller can prove they are its own")
     c.add_argument("--password-fd", type=int, help="a file descriptor the caller holds; the password is written there once")
+    h = cmd("hub-session")
+    h.add_argument("--session", required=True)
     s = cmd("stop")
     s.add_argument("--reason", default="")
     s.add_argument("--run-id", type=_run_id,

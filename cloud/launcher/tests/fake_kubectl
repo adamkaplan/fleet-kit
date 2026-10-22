@@ -87,7 +87,7 @@ if cmd == "apply" or (cmd == "create" and args[1:2] == ["-f"]):   # `create -f` 
         elif st.get("other_failure"):
             event = st["other_failure"]
         obj["status"] = {"phase": "Pending" if st.get("never_ready") or event or step == "never_ready_pod" or (step or "").startswith("vanish") and step != "race_vanish" else "Running",
-                         "conditions": [] if st.get("never_ready") or event or step == "never_ready_pod" or (step or "").startswith("vanish") and step != "race_vanish" else [{"type": "Ready", "status": "True"}]}
+                         "conditions": [] if st.get("never_ready") or event or step == "never_ready_pod" or (step or "").startswith("vanish") and step != "race_vanish" else [{"type": "Ready", "status": "True"}], "podIP": "10.1.2.3"}
         if event:
             st.setdefault("events", []).append({"reason": "FailedCreatePodSandBox", "message": "Failed to create pod sandbox: " + event,
                                                 "involvedObject": {"kind": "Pod", "name": obj["metadata"]["name"], "uid": obj["metadata"]["uid"]}})

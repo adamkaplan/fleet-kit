@@ -244,7 +244,6 @@ class Entrypoint(unittest.TestCase):
     def test_s2_unset_writes_the_worker_definition(self):
         p, files, ran, tmpdir = self.run_entry(None)
         self.assertEqual((p.returncode, files, ran), (0, ["worker.md"], True), p.stderr)
-        self.assertFalse(os.path.exists(os.path.join(tmpdir, "channel-token")))
 
     def test_s2_orchestrator_writes_its_definition_and_installs_the_secret(self):
         p, files, ran, tmpdir = self.run_entry("orchestrator")
@@ -255,9 +254,9 @@ class Entrypoint(unittest.TestCase):
         self.assertFalse(os.path.islink(path))
         self.assertNotIn("c" * 64, p.stdout + p.stderr)
 
-    def test_s2_the_worker_does_not_install_the_channel_secret(self):
+    def test_s2_a_hub_worker_installs_the_channel_secret_when_the_launcher_wrote_it(self):
         _, _, _, tmpdir = self.run_entry("worker")
-        self.assertFalse(os.path.exists(os.path.join(tmpdir, "channel-token")))
+        self.assertEqual(open(os.path.join(tmpdir, "channel-token")).read(), "c" * 64)
 
     def test_s2_any_other_value_refuses_before_the_server(self):
         for bad in ("boss", "Orchestrator", "worker;x", " "):
@@ -302,6 +301,89 @@ class Drift(unittest.TestCase):
         for needle in ("worker/agents/orchestrator.md", "worker/bin/cloud_cli.py /usr/local/bin/cw-cloud", "worker/bin/cloud_client.py",
                        "worker/bin/cloud_hub.py", "worker/bin/cloud_channel.py", "worker/bin/cloud_channel_server.py"):
             self.assertIn(needle, text)
+
+
+class HubForEveryLaunch(Orchestrator):
+    """#1157 clause 8: with the hub setting set, a worker and an orchestrator are both registered."""
+    def setUp(self):
+        super().setUp()
+        self.env["CW_HUB_CHANNEL_URL"] = "http://hub.example.internal:9000"
+
+    for _n in [n for n in dir(Orchestrator) if n.startswith("test_")]:
+        locals()[_n] = None   # only this class's own tests run here
+
+    def worker(self, name="wk1", *extra):
+        return self.launch(name, *extra)
+
+    def test_s18_worker_and_orchestrator_both_registered(self):
+        self.worker("wk1", "--boss", "boss1")
+        self.orch("orch1")
+        sec, agents = self.registry()
+        self.assertEqual(set(agents) - set(OTHER), {"wk1", "orch1"})
+        self.assertEqual(len(set(sec) - set(OTHER)), 2)
+        for w in ("wk1", "orch1"):
+            self.assertIn("channel-secret", self.st()["secret_bodies"][cw.pod_name(w) + "-run"])
+            env = self.env_of(w)
+            self.assertEqual({n for n in env if n.startswith("FL" + "EET_")}, {"FLEET_AGENT_NAME", "FLEET_BOSS", "FLEET_CLOUD_CHANNEL_URL", "FLEET_CLOUD_TOKEN_FILE"})
+        self.assertEqual(self.env_of("wk1")["CW_AGENT"], "worker")
+        self.assertEqual(self.env_of("orch1")["CW_AGENT"], "orchestrator")
+        self.assertEqual(sec["wk1"], hashlib.sha256(self.channel_secret("wk1").encode()).hexdigest())
+
+    def test_s19_the_url_is_the_pod_ip_form(self):
+        self.worker("wk1", "--boss", "boss1")
+        self.orch("orch1")
+        _, agents = self.registry()
+        for w in ("wk1", "orch1"):
+            self.assertEqual(agents[w]["url"], "http://10.1.2.3:4096")
+
+    def test_s20_the_session_verb_writes_the_id(self):
+        self.worker("wk1", "--boss", "boss1")
+        self.assertEqual(self.registry()[1]["wk1"]["session"], "")
+        code, out, err = self.run_cli("hub-session", "wk1", "--session", "ses_abc123", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.registry()[1]["wk1"]["session"], "ses_abc123")
+        self.assertEqual(self.registry()[1]["wk1"]["url"], "http://10.1.2.3:4096")
+        self.assertEqual(self.registry()[1]["other-agent"], {"url": "u"})
+
+    def test_s21_stop_removes_both_entries_of_a_worker(self):
+        self.worker("wk1", "--boss", "boss1")
+        code, _, err = self.run_cli("stop", "wk1")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.registry(), (OTHER, {"other-agent": {"url": "u"}}))
+        self.assertNotIn("wk1", self.st()["secret_bodies"]["cloud-hub-pw"])
+
+    def test_s21_a_failed_launch_removes_the_entries(self):
+        self.patch_state(never_ready=True)
+        code, _, err = self.run_cli("create", "wk1", "--repo", "acme-org/widget-service", "--branch", "main", "--boss", "boss1", "--wait", "1")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.registry(), (OTHER, {"other-agent": {"url": "u"}}))
+        self.assertIsNone(self.pod("wk1"))
+
+    def test_s22_nothing_cluster_wide_is_written(self):
+        self.worker("wk1", "--boss", "boss1")
+        self.assertFalse(re.search(r"clusterrole|namespace[^s]|configmap|serviceaccount", self.calls(), re.I), self.calls())
+
+    def test_u3_unset_is_the_worker_default(self):
+        del self.env["CW_HUB_CHANNEL_URL"]
+        self.launch("coder7")
+        spec = self.pod("coder7")["spec"]
+        self.assertEqual({e["name"] for e in spec["containers"][0]["env"]}, WORKER_ENV)
+        self.assertEqual([v["name"] for v in spec["volumes"]], WORKER_VOLUMES)
+        self.assertEqual(self.registry(), (OTHER, {"other-agent": {"url": "u"}}))
+        self.assertNotIn(cw.pod_name("coder7") + "-run", self.st().get("secrets", {}))
+
+    def test_mutants_fail(self):
+        orig_on, orig_set = cw.hub_on, cw.Launcher._set_hub_url
+        try:
+            cw.hub_on = lambda env: False   # mutant: only the orchestrator is registered
+            self.worker("wk1", "--boss", "boss1")
+            self.assertNotIn("wk1", self.registry()[1])
+            cw.hub_on = orig_on
+            cw.Launcher._set_hub_url = lambda self, agent, name: None   # mutant: the tunnel url stays
+            self.worker("wk2", "--boss", "boss1")
+            self.assertNotEqual(self.registry()[1]["wk2"]["url"], "http://10.1.2.3:4096")
+        finally:
+            cw.hub_on, cw.Launcher._set_hub_url = orig_on, orig_set
 
 
 class Docs(unittest.TestCase):
