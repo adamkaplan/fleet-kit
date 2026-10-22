@@ -152,6 +152,7 @@
         "bin/plan_ledger.py",
         "bin/impact_floor.py",
         "bin/chat_clear.py",
+        "bin/merge_gate.py",
         "bin/clear_carry.py",
         "bin/reassign.py",
         "bin/item_verdicts.py",
@@ -195,6 +196,7 @@
           "bin/plan_ledger.py",
           "bin/impact_floor.py",
           "bin/chat_clear.py",
+          "bin/merge_gate.py",
           "bin/clear_carry.py",
           "bin/reassign.py",
           "bin/item_verdicts.py",
@@ -293,6 +295,7 @@
     "note": "top_tier_outside_floor lists the top tier paths that are deliberately not in the floor globs (the floor excludes agent definitions, which are captain pull requests); a test checks that every other top tier path is inside the floor. bin/fleet-switchboard selects accounts and mints tokens but is not a top tier path (it would hold nearly every change): a change there to credentials or identity must be rated with that class by the independent review.",
     "never_carried_paths": [
       "bin/chat_clear.py",
+      "bin/merge_gate.py",
       "bin/clear_carry.py",
       "bin/delegated_clear.py",
       "bin/impact_floor.py",
@@ -332,6 +335,7 @@
         "docs/review-laws/impact-matrix.json",
         "bin/delegated_clear.py",
         "bin/chat_clear.py",
+        "bin/merge_gate.py",
         "bin/clear_carry.py",
         "bin/impact_hold.py",
         "bin/impact_floor.py",
@@ -532,6 +536,7 @@
         "gates_caller_kind"
       ],
       "closure_exempt": {
+        "bin/agent_reconcile.py": "loaded only by `reconcile_agents_on_read`, called by `cmd_status`'s view reconcile, which the clear never calls",
         "bin/closed_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/cloud_worker.py": "loaded only by `run_cloud` and `cmd_status`: the cloud commands, not the clear",
         "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
@@ -540,6 +545,7 @@
         "bin/launch_testers.py": "loaded only by the tester launch command, not the clear",
         "bin/merged_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/orders_copy.py": "loaded only by `cmd_orders_copy`, not the clear",
+        "bin/pr_reading.py": "loaded only by `cmd_merge_gate`: the merge gate command, not the clear",
         "bin/resume_brief.py": "loaded only by `cmd_launch`, not the clear",
         "bin/review_checkout.py": "loaded only by `cmd_review_checkout`, the reviewer checkout command, not the clear",
         "bin/triage_ownerless.py": "loaded only by the triage passes, which the clear does not run",

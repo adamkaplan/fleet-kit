@@ -203,7 +203,7 @@ fleet-switchboard launch coder7 --cloud --stack --agent coder --repo acme-org/wi
 - `--stack` is handed to the launcher's `create` and only then: a launch without it builds exactly the pod it always did.
 - The pod runs on the Sysbox runtime class (`sysbox-runc`) in its own user namespace, as a non-root user. No capability is added, it is never privileged, and it has no host path, Docker socket or service-account token.
 - `--shape` is `S` (2 CPU, 4 GiB) or `M` (4 CPU, 8 GiB). Leave it out for the launcher's own default, `S` (4 GiB): the measured stack lane peaked at 0.8 to 1.35 GiB. The memory limit stays; the pod is never unlimited.
-- The first pod on a fresh node may wait for the node's runtime to be ready (a short delay, a few minutes at most); the launcher notices that case and creates the pod again, up to 3 attempts. You do not retry it.
+- The first pod on a fresh node may wait for the node's runtime to be ready (a short delay, a few minutes at most); the launcher notices that case and creates the pod again after a pause of 15 seconds (`STACK_RACE_PAUSE_SECONDS`), for as long as a retry fits in a window of 600 seconds (`STACK_RACE_WINDOW_SECONDS`); a fresh node can take 3 to 5 minutes. If the window ends, the launcher says so once (the attempts and the seconds spent) and leaves no pod. You do not retry it.
 - `--stack` needs `--cloud`, and an unknown `--shape` is refused with `--stack`. `--stack` without `--cloud` is refused first of all; an unknown shape is refused right after the allow-list check (step 1 of section 2). Both exit 2 before any token is minted or any cluster call is made, and the order of section 2 is unchanged. `--shape` without `--stack` is passed to the launcher as before.
 
 ## 4. What a worker can and cannot do
@@ -232,3 +232,9 @@ merges), so a sleeping Mac delays a stop but cannot leave a worker running past 
 
 - Stopping a worker by name alone: #682.
 - A layer scan of the worker image: #691.
+
+## The GitHub App's permissions
+
+The token the launcher mints asks for, and accepts, exactly `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read`. The worker can read issues and their comments of its own repository and cannot write issues, labels, merges or settings.
+
+The owner step, done only after the change that adds `issues: read` is merged: add `issues: read` to the App's permissions, then accept it on each installation. Until both are done a launch is refused before any pod exists, with a line that names `issues` and this step. See `docs/agent-credentials.md`.
