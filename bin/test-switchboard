@@ -73359,6 +73359,51 @@ class TestRegistryEndpoint(unittest.TestCase):
         self.assertEqual(self.reg.route_for(agents["pod"]), {"via": "endpoint", "to": self.CLOUD["endpoint"]})
         self.assertEqual(self.reg.route_for(agents["local"]), {"via": "pane", "to": "p_1"})
 
+    def test_s6_registry_route_wiring_and_local_baseline(self):
+        self.both()
+        self.assertEqual(sb.registry_route(self.dir, "pod"), {"via": "endpoint", "to": self.CLOUD["endpoint"]})
+        self.assertEqual(sb.registry_route(self.dir, "local"), {"via": "pane", "to": self.LOCAL["pane"]})   # the stored baseline: byte for byte
+        self.assertEqual(json.dumps(sb.registry_route(self.dir, "local"), sort_keys=True), '{"to": "%s", "via": "pane"}' % self.LOCAL["pane"])
+        self.assertIsNone(sb.registry_route(self.dir, "nobody"))
+
+    def test_u1_local_agents_only_keep_the_baseline(self):
+        self.reg.upsert(self.dir, "local", self.LOCAL)
+        row = self.reg.read(self.dir)["agents"]["local"]
+        self.assertFalse(self.reg.upsert(self.dir, "local", row)["changed"])   # change detection: no churn
+        self.reg.retire(self.dir, "local", "boss", "done")
+        record = self.reg.read(self.dir)["retired"]["local"]["record"]
+        self.assertNotIn("endpoint", record)
+        self.reg.unretire(self.dir, "local")
+        back = self.reg.read(self.dir)["agents"]["local"]
+        self.assertNotIn("endpoint", back)
+        self.assertEqual(sb.registry_route(self.dir, "local"), {"via": "pane", "to": self.LOCAL["pane"]})
+
+    def _gaps(self, change_fields):
+        """The (field, projection) pairs where a field is neither in the projection nor exempt (the completeness rule)."""
+        names = {"discovery": self.reg.AGENT_FIELDS, "change": change_fields, "record": self.reg.RECORD_FIELDS}
+        return [(f, p) for f in self.reg.ROW_FIELDS for p, fs in names.items() if f not in fs and (f, p) not in self.reg.EXEMPT]
+
+    def test_s7_mutants_each_fail(self):
+        import unittest.mock as mock
+        self.both()
+        self.assertEqual(self._gaps(self.reg.CHANGE_FIELDS), [])
+        # mutant 1: a projection (the change test) left out of the tuple's derivation drops the endpoint
+        left_out = tuple(f for f in self.reg.CHANGE_FIELDS if f != "endpoint")
+        self.assertEqual(self._gaps(left_out), [("endpoint", "change")])
+        # mutant 2: a no-pane row read as dead is removed with no evidence: the real code keeps it
+        self.assertEqual(self.mod.reconcile_on_read(self.dir, self.reg.read(self.dir), lambda n, a: {"pane": True, "process": True}, self.reg, None), [])
+        # mutant 3: a route ignoring the endpoint returns None for the endpoint row: the route test names the endpoint
+        with mock.patch.object(self.reg, "route_for", lambda row: {"via": "pane", "to": row.get("pane")} if row.get("pane") else None):
+            self.assertNotEqual(sb.registry_route(self.dir, "pod"), {"via": "endpoint", "to": self.CLOUD["endpoint"]})
+        with mock.patch.object(self.mod, "unknown_endpoint_check", lambda n, a: "dead"):   # the mutant removes the row the real default keeps
+            self.assertEqual(self.mod.reconcile_on_read(self.dir, self.reg.read(self.dir), lambda n, a: {"pane": True, "process": True}, self.reg, None), ["pod"])
+
+    def test_s8_the_docs_state_the_endpoint_the_liveness_rule_and_the_route_rule(self):
+        text = (Path(__file__).resolve().parent.parent / "docs" / "agent-registry.md").read_text()
+        self.assertEqual(text.count("## Additive note (#1074)"), 1)
+        for item in ("**Endpoint field.**", "**Liveness rule.**", "**Route rule.**"):
+            self.assertIn(item, text)
+
     def test_u2_a_credential_shaped_endpoint_is_refused(self):
         for bad in ("https://user:pw@pod.example/a", "https://pod.example/a?token=abc"):
             got = self.reg.upsert(self.dir, "pod", dict(self.CLOUD, endpoint=bad))
