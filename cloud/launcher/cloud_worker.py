@@ -180,7 +180,7 @@ AGENTS = ("worker", "orchestrator")
 ORCHESTRATOR_ENV_NAMES = ("CW_AGENT", "FLEET_AGENT_NAME", "FLEET_BOSS", "FLEET_CLOUD_CHANNEL_URL", "FLEET_CLOUD_TOKEN_FILE")
 CHANNEL_SECRET_KEY = "channel-secret"                       # the one new key of the per-run Secret
 CHANNEL_TOKEN_FILE = "/run/cw-tmp/channel-token"        # inside the memory-backed directory; the entrypoint installs the key there
-DEFAULT_CHANNEL_URL = "http://cloud-hub.cw.svc:8443"
+DEFAULT_CHANNEL_URL = "http://cloud-hub.cw.svc:8443/message"
 DEFAULT_REGISTRY_SECRET = "cloud-hub-registry"
 HUB_PW_SECRET = "cloud-hub-pw"                  # one key per agent: the pod's server password, mounted by the hub at /etc/hub/pw
 HUB_PW_DIR = "/etc/hub/pw"
@@ -1936,7 +1936,7 @@ SETTINGS = (
     ("CW_APP_KEY_CMD", False, "command"),
     ("CW_CLUSTER_ADMIN_SECRET", False, "secret-name"),   # the NAME of the vault secret that holds the cluster administrator route (default cw-cluster-admin-kubeconfig), never its content
     ("CW_CLUSTER_TOKEN_DURATION", False, "duration"),    # the cluster token's requested life (default 20m)
-    ("CW_HUB_CHANNEL_URL", False, "name"),         # the channel's address an orchestrator pod is told (default http://cloud-hub.cw.svc:8443); not a secret
+    ("CW_HUB_CHANNEL_URL", False, "name"),         # the channel's address an orchestrator pod is told (default http://cloud-hub.cw.svc:8443/message); not a secret
     ("CW_HUB_REGISTRY_SECRET", False, "name"),     # the NAME of the hub's registry Secret in the cloud namespace (default cloud-hub-registry), never its content
     ("CW_VAULT_CHECK_DIR", False, "path"),         # the checkout the vault access check runs from; needed only after a vault firewall refusal (see vault_check_dir_problem)
 )

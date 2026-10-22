@@ -75,6 +75,8 @@ class Orchestrator(Base):
         self.assertEqual(env["CW_AGENT"], "orchestrator")
         self.assertEqual((env["FLEET_AGENT_NAME"], env["FLEET_BOSS"]), ("orch1", "boss1"))
         self.assertEqual(env["FLEET_CLOUD_CHANNEL_URL"], cw.DEFAULT_CHANNEL_URL)
+        self.assertEqual(env["FLEET_CLOUD_CHANNEL_URL"], "http://cloud-hub.cw.svc:8443/message")
+        self.assertTrue(env["FLEET_CLOUD_CHANNEL_URL"].endswith("/message"))
         self.assertEqual(env["FLEET_CLOUD_TOKEN_FILE"], "/run/cw-tmp/channel-token")
 
     def test_the_channel_address_is_the_settings_row(self):
@@ -371,6 +373,15 @@ class HubForEveryLaunch(Orchestrator):
         self.assertEqual([v["name"] for v in spec["volumes"]], WORKER_VOLUMES)
         self.assertEqual(self.registry(), (OTHER, {"other-agent": {"url": "u"}}))
         self.assertNotIn(cw.pod_name("coder7") + "-run", self.st().get("secrets", {}))
+
+    def test_mutant_dropping_the_message_path_fails(self):
+        orig = cw.DEFAULT_CHANNEL_URL
+        try:
+            cw.DEFAULT_CHANNEL_URL = "http://cloud-hub.cw.svc:8443"   # mutant: the bare service address
+            self.orch("orch1")
+            self.assertFalse(self.env_of()["FLEET_CLOUD_CHANNEL_URL"].endswith("/message"))
+        finally:
+            cw.DEFAULT_CHANNEL_URL = orig
 
     def test_mutants_fail(self):
         orig_on, orig_set = cw.hub_on, cw.Launcher._set_hub_url
