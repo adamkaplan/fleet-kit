@@ -107,9 +107,9 @@ class Shapes(base.Base):
         failed = []
         with mutate():
             for c in checks:
-                try:
-                    c()
-                except (AssertionError, KeyError):
+                result = unittest.TestResult()   # a fresh instance and result: subTest failures count, and none leaks into this test
+                type(self)(c.__name__).run(result)
+                if result.failures or result.errors:
                     failed.append(c.__name__)
         return failed
 
@@ -211,7 +211,7 @@ class Parity(unittest.TestCase):
     def test_s7_the_light_shape_section(self):
         text = read("docs/cloud-operator-quickstart.md")
         section = text.split("### The light shape", 1)[1].split("###", 1)[0]
-        self.assertRegex(section, r"`XS`.*1 CPU and 2 GiB")
+        self.assertRegex(section, r"`XS`.*1 CPU, 2 GiB")
         self.assertIn("default", section)
         belongs, not_belongs = re.search(r"Belongs in `XS`: ([^\n]*)", section).group(1), re.search(r"Does not belong in `XS`: ([^\n]*)", section).group(1)
         for kind in ("reader", "planner", "tester"):
