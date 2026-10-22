@@ -422,7 +422,7 @@ def run_launcher(runner, command, worker, options=(), timeout=LAUNCH_SECONDS, pa
     directory, never a value in an argument or the environment. `secrets` [(name, value)] go to the launcher as per-run secrets through
     inherited pipes (`--run-secret-fd NAME=N`): a value is never in an argument, the environment or a file. `runner` is kept for the callers'
     signature; the launcher is started here so that an interrupt reaches IT (it cleans up what it made) before the interrupt goes on."""
-    argv = launcher_argv() + [command, worker] + list(options) + ["--json"]
+    argv = launcher_argv() + [command] + ([worker] if worker else []) + list(options) + ["--json"]
     pass_fds, feeds = [], []
     try:
         if password_fd is not None:
@@ -754,12 +754,12 @@ class VaultRecovery:
             os.close(fd)   # releases the lock
 
 
-def cluster_token(env=None, now=None, recovery=None):
+def cluster_token(env=None, now=None, recovery=None, timeout=TOKEN_CMD_SECONDS):
     """A cluster token of at most one hour, minted NOW, in memory. CW_CLUSTER_TOKEN_CMD (a command that prints one), else the default: the cluster
     administrator kubeconfig is read from the vault (CW_CLUSTER_ADMIN_CMD, else `az keyvault secret show` with CW_VAULT_SUBSCRIPTION and
     CW_VAULT_NAME) and `kubectl create token cw-operator --duration=20m` is run with it on a pipe. Nothing is cached or kept. A failure is a
     Refusal that names the vault pre-check; no other credential or context is ever tried. With `recovery` (launch only), a vault read refused for
-    the firewall runs the vault access check once and reads once more."""
+    the firewall runs the vault access check once and reads once more. `timeout` bounds the whole mint (the status summary's bound)."""
     env = dict(os.environ if env is None else env)
     clock = time.time() if now is None else now
 
@@ -767,7 +767,7 @@ def cluster_token(env=None, now=None, recovery=None):
         raise Refusal("the cluster token could not be obtained (%s): %s" % (why, VAULT_CHECK)) from None
     custom = (env.get("CW_CLUSTER_TOKEN_CMD") or "").strip()
     if custom:
-        ran = _capture(["sh", "-c", custom], env=env)
+        ran = _capture(["sh", "-c", custom], env=env, timeout=timeout)
         if ran is None or ran[0] != 0:
             fail("the token command failed")
         token = ran[1].strip()
@@ -782,7 +782,7 @@ def cluster_token(env=None, now=None, recovery=None):
             argv = ["az", "keyvault", "secret", "show", "--subscription", sub, "--vault-name", vault,
                     "--name", env.get("CW_CLUSTER_ADMIN_SECRET") or "cw-cluster-admin-kubeconfig", "--query", "value", "-o", "tsv"]
         def read():
-            return _capture(argv, env=env)
+            return _capture(argv, env=env, timeout=timeout)
         ran = read()
         recovered = False
         if recovery is not None and not admin and firewall_refused(ran):   # only the default vault read, only a firewall refusal, once
@@ -793,7 +793,8 @@ def cluster_token(env=None, now=None, recovery=None):
                 " even after the vault access check; ask " + VAULT_OWNER if recovered else ""))
         admin_config = ran[1]
         minted = _capture([env.get("CW_KUBECTL", "kubectl"), "--kubeconfig", "/dev/fd/{fd}", "-n", env.get("CW_CLOUD_NAMESPACE", "cw"), "create",
-                           "token", "cw-operator", "--duration=" + _duration(env)], env=dict(env, KUBECONFIG=os.devnull), feed=admin_config)
+                           "token", "cw-operator", "--duration=" + _duration(env)], env=dict(env, KUBECONFIG=os.devnull), feed=admin_config,
+                          timeout=timeout)
         del admin_config
         if minted is None or minted[0] != 0:
             fail("the token could not be minted")
@@ -899,8 +900,9 @@ class Cluster:
     place it touches disk: the launcher's tokenFile mechanism needs a file), and removes the directory on every way out: normal end, failure,
     SIGINT, SIGTERM, SIGHUP and SIGQUIT. A stale directory of a killed command is swept at the start of every command. No token is kept between commands."""
 
-    def __init__(self, recovery=None):
+    def __init__(self, recovery=None, timeout=TOKEN_CMD_SECONDS):
         self.recovery = recovery
+        self.timeout = timeout
         self.known = set()
         self.dir = None
         self.kubeconfig = None
@@ -921,7 +923,7 @@ class Cluster:
                 raise Refusal("CW_CLOUD_SERVER is not set: no cluster to reach; nothing was changed")
             root = private_root()
             sweep_stale(root)
-            token = cluster_token(recovery=self.recovery)
+            token = cluster_token(recovery=self.recovery, timeout=self.timeout)
             self.add(token)
             self.dir = tempfile.mkdtemp(prefix="cmd-%d-" % os.getpid(), dir=str(root))
             self.server = server
@@ -1380,19 +1382,113 @@ def _ended(record, clock=None):
     return when.timestamp() < (time.time() if clock is None else clock)
 
 
+# ---------------------------------------------------------------- the one cluster read (the status summary)
+
+SNAPSHOT_SECONDS = 30   # the bound of the WHOLE cloud summary read: the login, the launcher run and its two list calls
+
+
+def _cluster_snapshot(runner, cluster, timeout):
+    """ONE read of the cluster: the launcher's read-only `snapshot` command (the pods of the namespace and, when the login may list them, the
+    nodes). A failure is a CloudError with one line of reason: the caller says it, never hides it."""
+    code, body, note = run_launcher(runner, "snapshot", "", (), timeout, cluster=cluster)
+    if code != 0:
+        raise CloudError("the cluster was not read (%s)" % _reason(code, note))
+    if not isinstance(body, dict):
+        raise CloudError("the cluster was not read (the launcher printed no snapshot)")
+    return body
+
+
+def _pod_of(record, snapshot):
+    """The pod of the snapshot that belongs to the record (by the record's pod name and by the worker annotation), or None when there is none."""
+    runtime = (record.get("runtime_id") or "").strip()
+    name = runtime.rsplit("/", 1)[-1] if "/" in runtime else runtime
+    worker = record.get("worker")
+    for pod in ((snapshot or {}).get("pods") or []):
+        if not isinstance(pod, dict):
+            continue
+        if (pod.get("name") and pod.get("name") == name) or (pod.get("worker") and worker and pod.get("worker") == worker):
+            return pod
+    return None
+
+
+def _age(seconds):
+    """A span of time as one short word: 5d3h, 3h12m, 40m."""
+    seconds = max(0, int(seconds))
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    if days:
+        return "%dd%dh" % (days, hours)
+    if hours:
+        return "%dh%dm" % (hours, rest // 60)
+    return "%dm" % (rest // 60)
+
+
+def _node_age(node, now):
+    """The node's age in seconds, or None when its creation time is not readable."""
+    try:
+        when = datetime.datetime.strptime(str(node.get("created")), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+    return max(0, int(now - when.timestamp()))
+
+
+def _pods_by_phase(snapshot):
+    """The pods of the snapshot by phase."""
+    phases = {}
+    for pod in ((snapshot or {}).get("pods") or []):
+        phase = (pod.get("phase") or "Unknown") if isinstance(pod, dict) else "Unknown"
+        phases[phase] = phases.get(phase, 0) + 1
+    return phases
+
+
+def _summary_line(snapshot, now):
+    """The ONE cloud summary line: the nodes by pool and size with their ages, and the pods of the namespace by phase. When the login may not
+    LIST the nodes, the node count comes from the POD PLACEMENT (the distinct node names of the pods) and the line says so: it cannot see the
+    idle nodes."""
+    pods = (snapshot or {}).get("pods") or []
+    phases = _pods_by_phase(snapshot)
+    order = ("Running", "Pending", "Succeeded", "Failed", "Unknown")   # the phases in the order the line shows them
+    pod_text = ", ".join("%s %d" % (phase, phases[phase]) for phase in sorted(phases, key=lambda p: (order.index(p) if p in order else len(order), p)))
+    if (snapshot or {}).get("nodes_read"):
+        groups = {}
+        for node in (snapshot.get("nodes") or []):
+            groups.setdefault(node.get("pool") or "unknown", {}).setdefault(node.get("size") or "unknown", []).append(node)
+        parts = []
+        for pool in sorted(groups):
+            sizes = groups[pool]
+            total = sum(len(v) for v in sizes.values())
+            ages = [a for a in (_node_age(node, now) for node in [n for v in sizes.values() for n in v]) if a is not None]
+            oldest = _age(max(ages)) if ages else "unknown"
+            parts.append("%s %d x %s, oldest %s" % (pool, total, ", ".join("%d x %s" % (len(sizes[s]), s) for s in sorted(sizes)), oldest))
+        nodes_text = "nodes %d (%s)" % (len(snapshot.get("nodes") or []), "; ".join(parts)) if parts else "nodes 0"
+    else:
+        names = {pod.get("node") for pod in pods if isinstance(pod, dict) and pod.get("node")}
+        nodes_text = ("nodes at least %d carry workers (from pod placement; pool, size and age need list on nodes; idle nodes are not visible)"
+                      % len(names))
+    return "cloud: %s; pods %d (%s)" % (nodes_text, len(pods), pod_text)
+
+
 def status_lines(runner, state, timeout=STATUS_SECONDS):
-    """(lines, rows) for `status`: per cloud worker its record and, from the launcher's read-only `status`, phase and cost, and whether the worker
-    answers through a tunnel that exists only for that probe. One cluster token serves the whole command. A trouble is said on the line, never raised."""
+    """(lines, rows) for `status`: ONE cloud summary line from ONE cluster read, then per cloud worker its record and, from the launcher's
+    read-only `status`, phase and cost, and whether the worker answers through a tunnel that exists only for that probe. A record whose hard
+    deadline has passed and whose pod is gone is ENDED (the deadline is the time it ended); a record whose pod still stands says so. A trouble is
+    said on the line, never raised."""
     records = list_records(state)
     lines, rows = [], []
-    cluster = None
+    cluster, snapshot, reason = None, None, None
+    started = time.monotonic()
     try:
-        # one mint per `status` command, and none when no record needs a probe (a broken record, or a worker past its hard deadline)
-        if any("problem" not in r and not _ended(r) for r in records):
+        if records:   # the summary needs the cluster: ONE login for the whole run
             try:
-                cluster = Cluster().__enter__()
+                cluster = Cluster(timeout=SNAPSHOT_SECONDS).__enter__()
+                snapshot = _cluster_snapshot(runner, cluster, max(1, int(SNAPSHOT_SECONDS - (time.monotonic() - started))))
             except CloudError as err:
-                cluster, lines = None, ["      cloud workers: no cluster reached (%s)" % _one(str(err), 300)]
+                reason = _one(str(err), 300)
+            if snapshot is None:
+                lines.append("      cloud: cluster not read (%s) after %d s; nodes and pods unknown"
+                             % (reason or "the launcher read nothing", int(time.monotonic() - started)))
+            else:
+                lines.append("      " + _summary_line(snapshot, time.time()))
         for record in records:
             row = {"worker": record["worker"]}
             if "problem" in record:
@@ -1402,9 +1498,22 @@ def status_lines(runner, state, timeout=STATUS_SECONDS):
                 continue
             row.update({key: record.get(key) for key in ("runtime_id", "idle_deadline", "hard_deadline", "session")})
             if _ended(record):
-                row["launcher_status"] = "ended"
+                pod = _pod_of(record, snapshot) if snapshot is not None else None
+                if snapshot is None:   # the cluster was not read: such a record is NEVER called ended
+                    row["launcher_status"] = "no cluster reached"
+                    lines.append("      cloud %s: %s, past its hard deadline %s (not queried; no cluster reached)"
+                                 % (record["worker"], record["runtime_id"], record.get("hard_deadline")))
+                elif pod is None:
+                    row["launcher_status"] = "ended"
+                    row["ended_at"] = record.get("hard_deadline")
+                    lines.append("      cloud %s: %s, ended at %s (no pod), past its hard deadline"
+                                 % (record["worker"], record["runtime_id"], record.get("hard_deadline")))
+                else:
+                    row["launcher_status"] = "past its hard deadline"
+                    row["phase"] = pod.get("phase")
+                    lines.append("      cloud %s: %s, pod still present past its hard deadline %s (phase %s)"
+                                 % (record["worker"], record["runtime_id"], record.get("hard_deadline"), pod.get("phase") or "?"))
                 rows.append(row)
-                lines.append("      cloud %s: %s, past its hard deadline %s (not queried)" % (record["worker"], record["runtime_id"], record.get("hard_deadline")))
                 continue
             if cluster is None:
                 row["launcher_status"] = "no cluster reached"
@@ -1424,7 +1533,7 @@ def status_lines(runner, state, timeout=STATUS_SECONDS):
             row["answers"] = _answers(state, cluster, record, timeout)
             rows.append(row)
             lines.append("      cloud %s: %s, %s; %s; stops at %s" % (record["worker"], record["runtime_id"], extra,
-                                                                 "answers" if row["answers"] else "does not answer", record.get("hard_deadline") or "?"))
+                                                                     "answers" if row["answers"] else "does not answer", record.get("hard_deadline") or "?"))
     finally:
         if cluster is not None:
             cluster.close()
@@ -1454,6 +1563,12 @@ def status_extra(runner):
 
 # ---------------------------------------------------------------- retire
 
+def _may_retire(kind, record):
+    """THE caller rule of a cloud worker's removal, factored ONCE: the operator (a person at a shell), the Chief of Staff, or the worker's own
+    boss. `retire` and `cloud-clear` both use this one function; neither keeps a copy of it."""
+    return kind[0] == "person" or (kind[0] == "agent" and ((len(kind) > 2 and kind[2] == "chief-of-staff") or kind[1] == record.get("reports_to")))
+
+
 @refusals
 def cmd_retire(args, runner, now, record):
     """`retire NAME` for a cloud worker: `stop` (the end hook runs, the pod and its scratch volume go), then the record goes. A stop that exits 1
@@ -1461,8 +1576,7 @@ def cmd_retire(args, runner, now, record):
     LaunchError = H["LaunchError"]
     engine, state, _ = H["build_engine"](runner, now, "cli")
     kind = H["gates_caller_kind"](runner, now)
-    allowed = kind[0] == "person" or (kind[0] == "agent" and ((len(kind) > 2 and kind[2] == "chief-of-staff") or kind[1] == record.get("reports_to")))
-    if not allowed:
+    if not _may_retire(kind, record):
         _audit(engine, "cloud.retire_refused", args.name, {"why": _one(str(kind[1]), 120)})
         raise LaunchError("refused: only the operator, the Chief of Staff or %s's own boss may retire it" % args.name)
     if args.undo:
@@ -1492,4 +1606,47 @@ def cmd_retire(args, runner, now, record):
     wip, pushed = (body or {}).get("wip_branch"), (body or {}).get("pushed")
     print("%s is retired: its pod and scratch volume are deleted%s" % (
         args.name, "; work was pushed to branch %s" % wip if pushed and wip else "; nothing needed pushing" if pushed is False else ""))
+    return H["EXIT_OK"]
+
+
+# ---------------------------------------------------------------- cloud-clear: the records whose pod is gone
+
+@refusals
+def cmd_cloud_clear(args, runner, now):
+    """`cloud-clear [--dry-run]`: every cloud worker record whose pod is gone AND whose hard deadline has passed is removed (the record and its
+    password file), and every one it removes is named. A record with a pod, or one not past its deadline, is never touched. It refuses when the
+    cluster could not be read: it never removes a record it cannot prove is gone. The caller rule is `retire`'s (the operator, the Chief of Staff
+    or the worker's own boss)."""
+    engine, state, _ = H["build_engine"](runner, now, "cli")
+    kind = H["gates_caller_kind"](runner, now)
+    records = [r for r in list_records(state) if "problem" not in r]
+    if not records:
+        print("no cloud worker records")
+        return H["EXIT_OK"]
+    try:
+        with Cluster(timeout=SNAPSHOT_SECONDS) as cluster:
+            snapshot = _cluster_snapshot(runner, cluster, SNAPSHOT_SECONDS)
+    except CloudError as err:
+        raise H["LaunchError"]("the cluster could not be read (%s); nothing was cleared" % _one(str(err), 200)) from None
+    dry_run = bool(getattr(args, "dry_run", False))
+    cleared = 0
+    for record in records:
+        name = record["worker"]
+        if not _ended(record):   # not past its hard deadline: it may still be working
+            continue
+        if _pod_of(record, snapshot) is not None:   # its pod still stands: the record stays
+            continue
+        if not _may_retire(kind, record):
+            print("skipped %s (not your worker)" % name)
+            continue
+        if dry_run:
+            print("would clear %s (pod gone, deadline %s)" % (name, record.get("hard_deadline")))
+            continue
+        remove_record(state, name)
+        _audit(engine, "cloud.cleared", name, {"runtime_id": record.get("runtime_id"), "hard_deadline": record.get("hard_deadline")})
+        _registry_note(engine, "retire", state, name, "cleared: the pod is gone and the hard deadline has passed")
+        print("cleared %s (pod gone, deadline %s)" % (name, record.get("hard_deadline")))
+        cleared += 1
+    if not cleared and not dry_run:
+        print("nothing to clear")
     return H["EXIT_OK"]
