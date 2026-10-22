@@ -83248,6 +83248,79 @@ class TestArchitectureSafetyNet(unittest.TestCase):
         self.assertEqual(switchboard_source(), "\n".join(p.read_text() for p in SWITCHBOARD_SOURCE_FILES))
 
 
+class TestAssembler(unittest.TestCase):
+    """The entry builds its one namespace from the manifest bin/fleet-switchboard.parts (docs/switchboard.md, "The assembler")."""
+
+    def _copy(self, lines):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        for sibling in BIN.glob("*.py"):   # the entry loads its sibling modules from its own directory
+            shutil.copy(str(sibling), str(root / sibling.name))
+        shutil.copy(str(SWITCHBOARD), str(root / "fleet-switchboard"))
+        (root / "fleet-switchboard.parts").write_text("\n".join(lines) + "\n")
+        return root
+
+    def test_the_shipped_manifest_names_the_entry_itself(self):
+        lines = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.startswith("#")]
+        self.assertEqual(lines, ["fleet-switchboard"])
+
+    def test_a_second_part_puts_its_names_into_sb_in_the_order_given(self):
+        root = self._copy(["part_a.py", "fleet-switchboard", "part_b.py"])
+        (root / "part_a.py").write_text('ORDER = ["a"]\nA_SAW_MAIN = "main" in globals()\nA_FILE = __file__\n')
+        (root / "part_b.py").write_text('ORDER.append("b")\nB_SAW_MAIN = "main" in globals()\n')
+        module = _load("t_assembled", root / "fleet-switchboard")
+        self.assertEqual(module.ORDER, ["a", "b"])
+        self.assertFalse(module.A_SAW_MAIN)
+        self.assertTrue(module.B_SAW_MAIN)
+        self.assertEqual(module.A_FILE, str(root / "fleet-switchboard"))
+        self.assertTrue(callable(module.main))
+        self.assertFalse(hasattr(module, "_fleet_parts"))
+
+    def test_a_missing_part_fails_at_start_with_one_line(self):
+        root = self._copy(["part_missing.py", "fleet-switchboard"])
+        done = subprocess.run([sys.executable, str(root / "fleet-switchboard"), "status", "--help"], capture_output=True, text=True)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(done.stdout, "")
+        self.assertEqual(len(done.stderr.strip().splitlines()), 1)
+        self.assertIn("part file not found", done.stderr)
+        self.assertIn("part_missing.py", done.stderr)
+
+    def test_an_unreadable_manifest_fails_at_start_with_one_line(self):
+        root = self._copy(["fleet-switchboard"])
+        manifest = root / "fleet-switchboard.parts"
+        manifest.unlink()
+        manifest.mkdir()   # exists, cannot be read as a file
+        done = subprocess.run([sys.executable, str(root / "fleet-switchboard"), "status", "--help"], capture_output=True, text=True)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(len(done.stderr.strip().splitlines()), 1)
+        self.assertIn("cannot read the parts manifest", done.stderr)
+
+    def test_a_missing_manifest_runs_the_entry_alone(self):
+        root = self._copy(["fleet-switchboard"])
+        (root / "fleet-switchboard.parts").unlink()
+        self.assertTrue(callable(_load("t_no_manifest", root / "fleet-switchboard").main))
+
+    def test_a_manifest_that_does_not_name_the_entry_runs_every_part_before_it(self):
+        root = self._copy(["part_a.py"])
+        (root / "part_a.py").write_text('A_SAW_MAIN = "main" in globals()\n')
+        module = _load("t_unnamed_entry", root / "fleet-switchboard")
+        self.assertFalse(module.A_SAW_MAIN)
+        self.assertTrue(callable(module.main))
+
+    def test_comments_and_blank_lines_in_a_manifest_are_ignored(self):
+        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard"])
+        (root / "part_a.py").write_text("FROM_A = 1\n")
+        self.assertEqual(_load("t_commented", root / "fleet-switchboard").FROM_A, 1)
+
+    def test_a_symlinked_run_and_the_help_line_still_work(self):
+        link = Path(tempfile.mkdtemp()) / "fsb"
+        self.addCleanup(shutil.rmtree, str(link.parent), True)
+        link.symlink_to(SWITCHBOARD)
+        done = subprocess.run([sys.executable, "-B", str(link), "status", "--help"], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("usage: fleet-switchboard status", done.stdout)
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.

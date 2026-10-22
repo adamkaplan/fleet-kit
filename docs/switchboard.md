@@ -5409,6 +5409,15 @@ Each decision was walked against the matrix (its owner-hold meaning and its rati
 - **D3**: batch size against the review checkout's limits. Recommendation: cap a batch at what the checkout accepts, and split a larger one.
 - **Follow-up asks** (each its own ask): a script that renders the batch table; the daemon's treatment of an ask whose change is in a non-default branch (T12) and of reference runs for `integration` (and a `push` run of CI on `integration`; pull requests into it already run CI, as the workflow has no branch filter); a report of merges into `integration` while a batch is ready.
 
+## The assembler (#1092, slice S1)
+
+`bin/fleet-switchboard` builds the daemon's one module namespace from the manifest `bin/fleet-switchboard.parts`: one part path per line, relative to the entry's real path (symlinks resolved), `#` for comments.
+
+- Parts run in the order given, each executed into the same namespace, so `__file__` stays the entry's and every path computed from it is unchanged.
+- The line naming the entry itself is where the entry's own code runs. Parts above it run first; parts below it run at the end of the file, before `main`.
+- A missing part stops the start with one line on stderr. A missing manifest means the entry alone; a manifest that exists but cannot be read stops the start with one line. A manifest that does not name the entry runs every part before the entry's code. The manifest and its parts run with the daemon's authority: they have the entry's trust and file permissions.
+- Today the manifest names only the entry, so nothing moved and behaviour is identical. A later slice moves code into parts and adds their lines.
+
 ## Running with no terminal multiplexer (#1072)
 
 Cause: `Engine._discover` calls `agent_list` on every pass. With no herdr that call fails, so each pass records a standing "herdr unreachable" problem and `read_mark` marks the agents input not whole, which skips the destructive steps that need a whole input.

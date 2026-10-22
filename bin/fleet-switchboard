@@ -40,6 +40,31 @@ Rules this file keeps from the start:
 
 Python 3.9+, standard library only.
 """
+
+
+def _fleet_parts(after=False):
+    """The assembler: parts named in bin/fleet-switchboard.parts run in order in this one namespace (docs/switchboard.md, "The assembler"). The line naming the entry is where its own code runs: parts before it run now, parts after it at the end of the file."""
+    import os, sys
+    here = os.path.realpath(__file__)
+    try:
+        with open(here + ".parts") as handle:
+            names = [n.strip() for n in handle.read().splitlines() if n.strip() and not n.lstrip().startswith("#")]
+    except FileNotFoundError:
+        return   # no manifest: the entry alone
+    except OSError as err:
+        sys.exit("fleet-switchboard: cannot read the parts manifest %s.parts: %s" % (here, err.strerror or err))
+    paths = [os.path.realpath(os.path.join(os.path.dirname(here), n)) for n in names]
+    cut = paths.index(here) if here in paths else len(paths)
+    for path in (paths[cut + 1:] if after else paths[:cut]):
+        try:
+            with open(path) as handle:
+                code = compile(handle.read(), path, "exec")
+        except OSError:
+            sys.exit("fleet-switchboard: part file not found: %s" % path)
+        exec(code, globals())
+
+
+_fleet_parts()
 import argparse
 import base64
 import http.client
@@ -34291,6 +34316,10 @@ def derive_action_groups():
 
 
 derive_action_groups()
+
+
+_fleet_parts(after=True)
+globals().pop("_fleet_parts")
 
 
 if __name__ == "__main__":
