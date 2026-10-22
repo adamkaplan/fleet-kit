@@ -30248,10 +30248,22 @@ def charter_safe(text):
     return re.sub(r"[^A-Za-z0-9_.#-]", "?", str(text)[:40])
 
 
+def charter_from_refusal(args):
+    """The refusal text, or None: `charter set` never takes `--from` (a named caller), in the Lab or out of it: the caller is always the pane's own agent (#1143)."""
+    if getattr(args, "sender", None) is not None:
+        return "--from is not accepted by charter set; the caller is identified by its pane"
+    return None
+
+
 def cmd_charter(args, runner, now):
     """`charter set <orchestrator> <issue number | none>`: write the orchestrator's registry `charter`, the one record of it (#969). Audited with who, the old and the new value. The live session's metadata
     (written once at launch, never correctable) is not touched and is never read as a second owner."""
     engine, _, _ = build_engine(runner, now, "cli")
+    from_refusal = charter_from_refusal(args)
+    if from_refusal:
+        engine.audit.append(engine.actor, "charter.refused", "agent:%s" % charter_safe(args.name), {"why": "from", "orchestrator": charter_safe(args.name), "caller": "unknown"})
+        sys.stderr.write("%s: charter: %s; nothing was changed\n" % (PROG, from_refusal))
+        return EXIT_USAGE
     caller, role = move_caller(engine, args, runner, now)
     audit = lambda event, **detail: engine.audit.append(engine.actor, event, "agent:%s" % charter_safe(args.name), dict(detail, caller=charter_safe(caller or "operator"), orchestrator=charter_safe(args.name)))
     refusal = charter_set_refusal(caller, role)

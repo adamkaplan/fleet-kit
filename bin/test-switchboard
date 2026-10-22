@@ -15943,22 +15943,26 @@ class TestCharterSetGuard(CharterRig, Base):
                 self.setUp() if code != "absent" else None
                 self.assertNotEqual(self.observed_whys(mutant), {k: k for k in self.WHYS})
 
-    def test_from_is_not_honoured_outside_the_lab(self):
+    def test_from_is_refused_outright_in_and_out_of_the_lab(self):
         self.orchestrator("orch-b", registry=None)
         self.world.add_agent("worker", fleet={"role": "coder", "reports_to": "orch-b", "repo": self.REPO})
-        with mock.patch.dict(os.environ):
-            os.environ.pop(sb.LAB_ENV, None)
-            for who in ("cos", "worker", None):
-                code, out, err = self.run_as(who, "charter", "set", "orch-b", "3", "--from", "cos")
-                self.assertNotEqual(code, 0, who)
-                self.assertIn("only for the Lab", err)
+        for lab in (False, True):
+            with mock.patch.dict(os.environ):
+                os.environ.pop(sb.LAB_ENV, None)
+                if lab:
+                    os.environ[sb.LAB_ENV] = "1"
+                for who in ("cos", "worker", None):
+                    code, out, err = self.run_as(who, "charter", "set", "orch-b", "3", "--from", "cos")
+                    self.assertEqual(code, 2, (lab, who, err))
+                    self.assertIn("--from is not accepted", err)
         self.assertIsNone(self.row("orch-b")["charter"])
+        self.assertEqual([e["detail"]["why"] for e in self.audit_lines()], ["from"] * 6)
 
-    def test_mutant_from_honoured_outside_the_lab_writes(self):
+    def test_mutant_from_is_honoured_and_writes(self):
         self.orchestrator("orch-b", registry=None)
-        with mock.patch.object(sb, "move_caller", lambda engine, args, runner, now: ("cos", "chief-of-staff") if args.sender else (None, None)):
+        with mock.patch.dict(os.environ, {sb.LAB_ENV: "1"}), mock.patch.object(sb, "charter_from_refusal", lambda args: None):
             code, out, err = self.run_as(None, "charter", "set", "orch-b", "3", "--from", "cos")
-        self.assertEqual(self.row("orch-b")["charter"], 3)   # what test_from_is_not_honoured_outside_the_lab forbids
+        self.assertEqual(self.row("orch-b")["charter"], 3)   # what test_from_is_refused_outright... forbids
 
     def test_the_definition_adds_exactly_one_charter_permission_and_nothing_wider(self):
         text = (Path(sb.__file__).resolve().parent.parent / "agents/opencode/chief-of-staff.md").read_text()
