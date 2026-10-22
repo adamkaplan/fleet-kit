@@ -85,6 +85,12 @@ def with_http_head(serve, argv, kwargs, counters=None):
 
 
 SWITCHBOARD = BIN / "fleet-switchboard"
+SWITCHBOARD_SOURCE_FILES = (SWITCHBOARD,)   # every file that holds the daemon's code: a split adds its parts here, so no part escapes the scans that read this list
+
+
+def switchboard_source():
+    """The daemon's code as every scan reads it: the files of SWITCHBOARD_SOURCE_FILES, in order, as one text."""
+    return "\n".join(path.read_text() for path in SWITCHBOARD_SOURCE_FILES)
 SCENARIO = BIN / "fleet-scenario"
 
 
@@ -936,7 +942,7 @@ class TestHerdrClient(Base):
             self.assertFalse(any("focus" in part and not part.startswith("--no-") for part in argv), argv)
 
     def test_source_never_names_a_typing_or_focus_command(self):
-        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [])
+        self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
     def test_the_source_scan_catches_a_planted_violation(self):
         # A gate never seen failing is decoration.
@@ -9265,7 +9271,7 @@ class TestGithubDaemon(Base):
         spawn.assert_not_called()
 
     def test_the_engine_never_types_into_a_pane_for_github_either(self):
-        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [])
+        self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
 
 class TestGithubScenarios(Base):
@@ -19516,7 +19522,7 @@ class TestShadowClassifier(Base):
 
 class TestPR7Source(unittest.TestCase):
     def test_the_engine_still_never_types(self):
-        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [])
+        self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
     def test_the_decision_model_section_is_one_clearly_marked_block(self):
         source = SWITCHBOARD.read_text()
@@ -21587,7 +21593,7 @@ class TestPR8Source(unittest.TestCase):
         self.assertEqual(source.count("\n# PR 8: foreground and background"), 1)
 
     def test_the_engine_still_never_types(self):
-        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [])
+        self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
     def test_no_top_level_name_is_defined_twice_in_the_big_files(self):
         for name in ("fleet-switchboard", "test-switchboard", "fleet-scenario", "proof-switchboard"):
@@ -23169,7 +23175,7 @@ class TestJudgeToolWritesNothingElsewhere(unittest.TestCase):
         calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                  and n.func.attr == "_api"]
         self.assertEqual(len(calls), 1)
-        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [], "the engine still never types")
+        self.assertEqual(herdr_typing_violations(switchboard_source()), [], "the engine still never types")
 
     def test_the_section_is_one_clearly_marked_block(self):
         self.assertEqual(SWITCHBOARD.read_text().count("\n# PR 9: the tool-call policy judge"), 1)
@@ -24710,7 +24716,7 @@ class TestPR10Source(unittest.TestCase):
         self.assertEqual(SWITCHBOARD.read_text().count(self.SECTION), 1)
 
     def test_the_engine_still_never_types(self):
-        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [])
+        self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
     def test_the_import_command_runs_only_the_clients_it_is_given(self):
         source = SWITCHBOARD.read_text()
@@ -82680,6 +82686,255 @@ class TestPaneExitBoundaries(TestPaneExit):
         pass_fn = next(n for n in self.new_code() if getattr(n, "name", "") == "pane_exit_pass")
         guards = sum(isinstance(n, ast.If) for n in ast.walk(pass_fn))
         self.assertLessEqual(guards, 16, "a guard was added to pane_exit_pass: give it a row and a mutant, then raise this count")
+
+
+class TestArchitectureSafetyNet(unittest.TestCase):
+    """The tools that prove a move of switchboard code is text only (plan #1092, slice S0)."""
+    TOOLS = REPO / "tools"
+    BEFORE = "A = 1\n\n\ndef one():\n    return 1\n\n\ndef two():\n    return 2\n"
+
+    def load(self, name):
+        loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(self.TOOLS / name))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+        return module
+
+    def split_check(self, before, after):
+        work = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, work, True)
+        sides = []
+        for label, parts in (("before", before), ("after", after)):
+            paths = []
+            for index, text in enumerate(parts):
+                path = work / ("%s%d.py" % (label, index))
+                path.write_text(text)
+                paths.append(str(path))
+            sides.append(paths)
+        proc = subprocess.run([sys.executable, str(self.TOOLS / "arch-split-check"), "--before"] + sides[0] + ["--after"] + sides[1],
+                              capture_output=True, text=True)
+        return proc.returncode, proc.stdout
+
+    def test_a_move_across_files_and_a_reorder_pass(self):
+        code, out = self.split_check([self.BEFORE], ["def two():\n    return 2\n", "A = 1\n\n\ndef one():\n    return 1\n"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("RESULT: PASS", out)
+
+    def test_one_edited_line_fails_and_names_the_statement(self):
+        code, out = self.split_check([self.BEFORE], [self.BEFORE.replace("return 2", "return 3")])
+        self.assertEqual(code, 1, out)
+        self.assertIn("FunctionDef two", out)
+        self.assertIn("RESULT: FAIL", out)
+
+    def test_a_dropped_statement_fails_and_names_the_statement_and_the_name(self):
+        code, out = self.split_check([self.BEFORE], [self.BEFORE.split("\n\n\ndef two")[0] + "\n"])
+        self.assertEqual(code, 1, out)
+        self.assertIn("FunctionDef two", out)
+        self.assertIn("name only before: two", out)
+
+    def test_a_duplicated_statement_fails(self):
+        code, out = self.split_check([self.BEFORE], [self.BEFORE + "\n\ndef two():\n    return 2\n"])
+        self.assertEqual(code, 1, out)
+        self.assertIn("statement added", out)
+
+    def test_the_overlap_tool_maps_changed_lines_to_symbols_classes_and_sections(self):
+        tool = self.load("arch-overlap")
+        source = "# ---------- the first\nX = 1\n\n\ndef f():\n    return 1\n\n\n# ---------- the second\ndef g():\n    return 2\n"
+        table = tool.symbols(source)
+        marks = tool.markers(source)
+        lines = tool.changed_old_lines("@@ -6,1 +6,1 @@ def f\n-    return 1\n+    return 9\n@@ -10,0 +11,2 @@\n+x\n")
+        self.assertEqual(lines, {6, 10})
+        self.assertEqual(tool.touched(lines, table), ["f", "g"])
+        self.assertEqual([tool.section_of(n, marks) for n in (2, 6, 10)], ["the first", "the first", "the second"])
+        self.assertEqual(tool.touched({7}, table), [])
+        self.assertEqual([n for _, _, n in tool.classes("class A:\n    pass\n\n\ndef f():\n    pass\n")], ["A"])
+
+    def golden(self):
+        return self.load("golden-cli")
+
+    def test_the_command_list_covers_every_verb_and_the_recording_is_deterministic(self):
+        golden = self.golden()
+        work = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, work, True)
+        root = os.path.realpath(str(work))
+        env = golden.world(root)
+        entry = str(SWITCHBOARD)
+        first = golden.record_all(entry, root, env)
+        self.assertGreaterEqual(len(first), 120)
+        verbs = golden.choices(golden.run(entry, ["--help"], root, env)["stdout"])
+        self.assertGreater(len(verbs), 40)
+        for verb in verbs:
+            self.assertIn((verb, "--help"), first, "the command list has no --help of the verb %s" % verb)
+        self.assertEqual(golden.differences(first, golden.record_all(entry, root, env)), [], "two recordings of one entry differ")
+
+    def fake_repo(self, text):
+        """A git repository whose bin/fleet-switchboard prints bin/out.txt: a stand-in for the daemon."""
+        repo = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, repo, True)
+        (repo / "bin").mkdir()
+        (repo / "bin" / "fleet-switchboard").write_text(
+            "import os\nprint(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'out.txt')).read(), end='')\n")
+        (repo / "bin" / "out.txt").write_text(text)
+        git = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"] + list(a), check=True, capture_output=True)
+        git("init", "-q")
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        return repo
+
+    def compare(self, repo):
+        return subprocess.run([sys.executable, str(self.TOOLS / "golden-cli"), "compare", "--base", "HEAD", "--repo", str(repo)],
+                              capture_output=True, text=True)
+
+    def test_compare_passes_an_unchanged_tree_and_names_a_changed_output(self):
+        repo = self.fake_repo("usage: tool\n")
+        done = self.compare(repo)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("RESULT: PASS", done.stdout)
+        (repo / "bin" / "out.txt").write_text("usage: tool [-x]\n")
+        done = self.compare(repo)
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("DIFF --help: stdout differs", done.stdout)
+        self.assertIn("RESULT: FAIL", done.stdout)
+
+    def test_compare_names_a_command_the_working_tree_lost(self):
+        golden = self.golden()
+        base = {("--help",): {"status": 0, "stdout": "a", "stderr": ""}, ("send", "--help"): {"status": 0, "stdout": "b", "stderr": ""}}
+        work = {("--help",): {"status": 2, "stdout": "a", "stderr": ""}, ("plan", "--help"): {"status": 0, "stdout": "c", "stderr": ""}}
+        self.assertEqual(golden.differences(base, work), ["DIFF --help: status differs", "DIFF plan --help: the command is new in the working tree",
+                                                          "DIFF send --help: the command is gone from the working tree"])
+
+    def test_the_recorder_writes_grouped_files(self):
+        repo = self.fake_repo("usage: tool\n")
+        out = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, out, True)
+        done = subprocess.run([sys.executable, str(self.TOOLS / "golden-cli"), "record", "--repo", str(repo), "--dir", str(out)], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(json.loads((out / "root.json").read_text())[0]["argv"], ["--help"])
+        self.assertLessEqual(len(list(out.glob("*.json"))), 7)
+
+    def test_the_surface_snapshot_is_a_sorted_list_of_names(self):
+        names = (REPO / "tests" / "golden" / "surface-dir-sb.txt").read_text().split()
+        self.assertEqual(names, sorted(names))
+        for name in ("main", "cmd_status", "HerdrClient"):
+            self.assertIn(name, names)
+
+    def test_the_surface_modes_write_check_and_name_a_changed_name(self):
+        work = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, work, True)
+        code = work / "m.py"
+        code.write_text(self.BEFORE)
+        snap = work / "snap.txt"
+        tool = str(self.TOOLS / "arch-split-check")
+        run = lambda *a: subprocess.run([sys.executable, tool] + list(a), capture_output=True, text=True)
+        self.assertEqual(run("--write-surface", str(snap), "--after", str(code)).returncode, 0)
+        self.assertIn("one", snap.read_text().split())
+        done = run("--check-surface", str(snap), "--after", str(code))
+        self.assertEqual((done.returncode, "RESULT: PASS" in done.stdout), (0, True), done.stdout)
+        snap.write_text(snap.read_text() + "extra\n")
+        done = run("--check-surface", str(snap), "--after", str(code))
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("name only in the snapshot: extra", done.stdout)
+        code.write_text(self.BEFORE + "\n\ndef three():\n    return 3\n")
+        snap.write_text("\n".join(n for n in snap.read_text().split() if n != "extra") + "\n")
+        done = run("--check-surface", str(snap), "--after", str(code))
+        self.assertIn("name only in the code: three", done.stdout)
+
+    def split_run(self, *args):
+        return subprocess.run([sys.executable, str(self.TOOLS / "arch-split-check")] + list(args), capture_output=True, text=True)
+
+    def test_split_check_no_surface_runs_nothing_and_a_missing_before_is_a_usage_error(self):
+        work = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, work, True)
+        bomb = work / "bomb.py"
+        bomb.write_text("raise RuntimeError('loaded')\n")
+        done = self.split_run("--before", str(bomb), "--after", str(bomb), "--no-surface")
+        self.assertEqual((done.returncode, "RESULT: PASS" in done.stdout), (0, True), done.stdout + done.stderr)
+        self.assertNotEqual(self.split_run("--before", str(bomb), "--after", str(bomb)).returncode, 0)   # loading it fails: the surface check runs it
+        self.assertEqual(self.split_run("--after", str(bomb)).returncode, 2)
+
+    def test_split_check_takes_a_multi_part_before_and_a_reorder_inside_one_side(self):
+        code, out = self.split_check(["A = 1\n", "def one():\n    return 1\n"], ["def one():\n    return 1\n\n\nA = 1\n"])
+        self.assertEqual(code, 0, out)
+
+    def test_compare_fails_on_an_unknown_revision_and_names_a_lost_command(self):
+        repo = self.fake_repo("usage: tool {a} ...\n\npositional arguments:\n  {a}\n")
+        entry = repo / "bin" / "fleet-switchboard"   # only the top help lists a subcommand: the walk ends
+        entry.write_text(entry.read_text().replace("print(", "print('usage: sub') if sys.argv[1:] != ['--help'] else print(", 1).replace("import os", "import os, sys"))
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-am", "entry"], check=True, capture_output=True)
+        done = subprocess.run([sys.executable, str(self.TOOLS / "golden-cli"), "compare", "--base", "no-such-rev", "--repo", str(repo)],
+                              capture_output=True, text=True)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("cannot read no-such-rev", done.stdout + done.stderr)
+        (repo / "bin" / "out.txt").write_text("usage: tool\n")
+        done = self.compare(repo)
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("DIFF a --help: the command is gone from the working tree", done.stdout)
+
+    def overlap_repo(self):
+        """A clone-like repository: main, and a pull request head at refs/pull/1/head that edits one function and one test class."""
+        repo = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, repo, True)
+        git = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"] + list(a), check=True, capture_output=True)
+        git("init", "-q", "-b", "main")
+        (repo / "bin").mkdir()
+        (repo / "bin" / "fleet-switchboard").write_text("# ------ the first\nX = 1\n\n\ndef f():\n    return 1\n\n\ndef g():\n    return 2\n")
+        (repo / "bin" / "test-switchboard").write_text("class A:\n    x = 1\n\n\nclass B:\n    y = 2\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        git("remote", "add", "origin", str(repo))
+        git("checkout", "-q", "-b", "pr")
+        (repo / "bin" / "fleet-switchboard").write_text("# ------ the first\nX = 1\n\n\ndef f():\n    return 9\n\n\ndef g():\n    return 2\n")
+        (repo / "bin" / "test-switchboard").write_text("class A:\n    x = 1\n\n\nclass B:\n    y = 3\n")
+        git("commit", "-q", "-am", "pr")
+        git("update-ref", "refs/pull/1/head", "HEAD")
+        git("checkout", "-q", "main")
+        return repo
+
+    def run_overlap(self, repo, listing, *args, gh_exit=0):
+        bindir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, bindir, True)
+        gh = bindir / "gh"
+        gh.write_text("#!/bin/sh\ncat <<'EOF'\n%s\nEOF\nexit %d\n" % (json.dumps(listing), gh_exit))
+        gh.chmod(0o755)
+        env = dict(os.environ, PATH="%s:%s" % (bindir, os.environ["PATH"]))
+        return subprocess.run([sys.executable, str(self.TOOLS / "arch-overlap"), "--base", "main"] + list(args), cwd=repo, env=env, capture_output=True, text=True)
+
+    def test_overlap_names_symbols_classes_and_sections_of_a_pull_request_head(self):
+        repo = self.overlap_repo()
+        files = [{"path": "bin/fleet-switchboard"}, {"path": "bin/test-switchboard"}]
+        done = self.run_overlap(repo, [{"number": 1, "title": "edit f", "files": files}, {"number": 2, "title": "no head", "files": files},
+                                       {"number": 3, "title": "other", "files": [{"path": "README.md"}]}])
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("symbols: f", done.stdout)
+        self.assertNotIn("symbols: f, g", done.stdout)
+        self.assertIn("test classes: B", done.stdout)
+        self.assertIn("the first: #1", done.stdout)
+        self.assertIn("cannot fetch the pull request head", done.stdout)   # #2 has no head ref
+        self.assertNotIn("#3", done.stdout)   # touches neither file
+        self.assertIn("2 open pull requests touch", done.stdout)
+
+    def test_overlap_names_an_insertion_between_statements_and_refuses_bad_input(self):
+        repo = self.overlap_repo()
+        git = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"] + list(a), check=True, capture_output=True)
+        git("checkout", "-q", "-b", "gap")
+        path = repo / "bin" / "fleet-switchboard"
+        path.write_text("NEW = 3\n" + path.read_text())   # a line above every statement
+        git("commit", "-q", "-am", "gap")
+        git("update-ref", "refs/pull/1/head", "HEAD")
+        git("checkout", "-q", "main")
+        done = self.run_overlap(repo, [{"number": 1, "title": "gap", "files": [{"path": "bin/fleet-switchboard"}]}])
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("between statements near line", done.stdout)
+        failed = self.run_overlap(repo, [], gh_exit=1)
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("gh pr list failed", failed.stderr)
+        refused = self.run_overlap(repo, [], "--daemon", "-x")
+        self.assertEqual(refused.returncode, 2)
+        long_list = self.run_overlap(repo, [{"number": 1000 + n, "title": "t", "files": []} for n in range(200)])
+        self.assertIn("200 open pull requests listed", long_list.stderr)
+
+    def test_the_hygiene_scan_reads_one_list_of_daemon_files(self):
+        self.assertIn(SWITCHBOARD, SWITCHBOARD_SOURCE_FILES)
+        self.assertEqual(switchboard_source(), "\n".join(p.read_text() for p in SWITCHBOARD_SOURCE_FILES))
 
 
 if __name__ == "__main__":
