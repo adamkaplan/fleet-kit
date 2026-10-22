@@ -24439,7 +24439,7 @@ def pr_state_line(view):
     if view.get("reviews") is None:
         parts.append("reviews unknown (ledger unreadable: %s)" % _plain(view.get("reviews_problem") or "?", 100))
     else:
-        parts.append("reviews %s" % (", ".join("%s %s%s" % (_plain(r["reviewer"], 20), _plain(r["verdict"], 20), " (names no rule)" if r.get("uncited") else "") for r in view["reviews"]) or "none recorded at this head"))
+        parts.append("reviews %s" % (", ".join("%s %s%s" % (_plain(r["reviewer"], 20), _plain(r["verdict"], 20), " (names no rule, does not block)" if r.get("uncited") else "") for r in view["reviews"]) or "none recorded at this head"))
     parts.append("labels %s" % (", ".join(_plain(l, 60) for l in view["labels"]) or "none"))
     parts.append("list read %ds ago" % view["age_seconds"])
     if view.get("why"):
@@ -24952,8 +24952,10 @@ def cmd_review(args, runner, now):
                 if entry.get("kind") == "review_record" and entry.get("pr") == ref and entry.get("head") == at:
                     latest[entry.get("reviewer")] = entry
             for reviewer, entry in sorted(latest.items()):
-                if entry.get("verdict") == "request-changes":
-                    print("%s recorded request-changes (%s blocking finding(s)%s) at %s" % (reviewer, entry.get("blocks"), "; it names no rule" if entry.get("uncited") else "", (at or "")[:8]))
+                if plan_ledger.review_blocks(entry):
+                    print("%s recorded request-changes (%s blocking finding(s)) at %s" % (reviewer, entry.get("blocks"), (at or "")[:8]))
+                elif entry.get("verdict") == "request-changes":
+                    print("%s recorded request-changes at %s: it names no rule and does not block (not a blocker)" % (reviewer, (at or "")[:8]))
             return EXIT_OK
         if args.review_cmd == "laws":
             base = raw.get("baseRefOid")
@@ -25086,6 +25088,8 @@ def cmd_review(args, runner, now):
         print("recorded %s review %s at %s (%s): %d of %d reviewers recorded at this head%s" % (
             reviewer, verdict, head[:8], ref, len(got["recorded"]), len(got["expected"]),
             "; missing %s" % ", ".join(got["missing"]) if got["missing"] else ""))
+        if entry.get("uncited"):
+            print("note: this request-changes names no rule: it is recorded as given, marked uncited, and does not block")
         if reviewer == "impact" and not (entry.get("impact_severity") and entry.get("impact_probability")):
             sys.stderr.write("%s: review: %s\n" % (PROG, NO_SCORE_TEXT))
         return EXIT_OK

@@ -36263,7 +36263,7 @@ class TestWholeRead(LedgerBase):
         self.assertEqual(sb.plan_ledger.review_records_at(self.ledger(), self.PR, LEDGER_HEAD)["uncited"], ["code"])
         view = {"pr": self.PR, "known": True, "state": "OPEN", "head": LEDGER_HEAD, "reviews": [{"reviewer": "code", "verdict": "request-changes", "uncited": True}], "checks": None,
                 "gates": None, "labels": [], "age_seconds": 1, "examined_head": None, "examined_age_seconds": None}
-        self.assertIn("code request-changes (names no rule)", sb.pr_state_line(view))
+        self.assertIn("code request-changes (names no rule, does not block)", sb.pr_state_line(view))
         self.assertEqual(self.record(self.WHOLE, verdict="approve", reviewer="code")[0], 0)
         self.assertEqual(sb.plan_ledger.review_records_at(self.ledger(), self.PR, LEDGER_HEAD)["uncited"], [])
 
@@ -36277,7 +36277,7 @@ class TestWholeRead(LedgerBase):
         self.assertEqual(self.record(self.WHOLE, head=LEDGER_HEAD[:12])[0], 0)
         self.assertEqual(self.records()[-1]["head"], LEDGER_HEAD)
 
-    def test_s13_u2_u5_a_verdict_is_recorded_as_given_and_an_uncited_request_changes_is_marked_and_blocks(self):
+    def test_s13_u2_u5_a_verdict_is_recorded_as_given_and_an_uncited_request_changes_is_marked_and_does_not_block(self):
         cited = "- R-CODE-3 | block | src/a.py:4 | torn write | temp file\n"
         uncited = "- no rule here | block | src/a.py:4 | vague | fix it\n"
         for verdict, findings, mark in (("request-changes", cited, None), ("request-changes", uncited, True), ("approve", "", None), ("comment", uncited, None), ("incomplete", "", None)):
@@ -36288,10 +36288,53 @@ class TestWholeRead(LedgerBase):
                 self.assertEqual((last["verdict"], last.get("uncited")), (verdict, mark))
         self.assertEqual(self.record(self.WHOLE, verdict="request-changes", findings=uncited, reviewer="code")[0], 0)
         code, out, err = self.run_as("coder", "gates", self.PR)
-        self.assertIn("code request-changes (names no rule)", out)
-        self.assertIn("1 blocking review(s)", out)
+        self.assertIn("code request-changes (names no rule, does not block)", out)
+        self.assertNotIn("blocking review(s)", out)
         code, out, err = self.run_as("coder", "review", "blockers", self.PR)
-        self.assertIn("names no rule", out)
+        self.assertIn("names no rule and does not block", out)
+
+    def test_1047_the_blocking_decision_is_one_function_and_each_place_follows_it(self):
+        cited = "- R-CODE-3 | block | src/a.py:4 | torn write | temp file\n"
+        uncited = "- no rule here | block | src/a.py:4 | vague | fix it\n"
+        plan_ledger = sb.plan_ledger
+        with self.subTest("record says it does not block"):
+            code, out, err = self.record(self.WHOLE, verdict="request-changes", findings=uncited, reviewer="code")
+            self.assertEqual(code, 0, err)
+            self.assertIn("does not block", out)
+        with self.subTest("review_records_at"):
+            got = plan_ledger.review_records_at(self.ledger(), self.PR, LEDGER_HEAD)
+            self.assertEqual((got["uncited"], got["blocking"]), (["code"], []))
+        with self.subTest("gates"):
+            out = self.run_as("coder", "gates", self.PR)[1]
+            self.assertIn("1 request-changes names no rule and does not block", out)
+            self.assertNotIn("blocking review(s)", out)
+        with self.subTest("review blockers lists it as not a blocker"):
+            out = self.run_as("coder", "review", "blockers", self.PR)[1]
+            self.assertIn("does not block (not a blocker)", out)
+            self.assertNotIn("blocking finding(s)", out)
+        with self.subTest("pr-state line"):
+            view = {"pr": self.PR, "known": True, "state": "OPEN", "head": LEDGER_HEAD, "reviews": [{"reviewer": "code", "verdict": "request-changes", "uncited": True}], "checks": None,
+                    "gates": None, "labels": [], "age_seconds": 1, "examined_head": None, "examined_age_seconds": None}
+            self.assertIn("(names no rule, does not block)", sb.pr_state_line(view))
+        with self.subTest("a cited request-changes still blocks everywhere"):
+            self.assertEqual(self.record(self.WHOLE, verdict="request-changes", findings=cited, reviewer="code")[0], 0)
+            got = plan_ledger.review_records_at(self.ledger(), self.PR, LEDGER_HEAD)
+            self.assertEqual((got["uncited"], got["blocking"]), ([], ["code"]))
+            self.assertIn("1 blocking review(s)", self.run_as("coder", "gates", self.PR)[1])
+            self.assertIn("1 blocking finding(s)", self.run_as("coder", "review", "blockers", self.PR)[1])
+
+    def test_1047_every_function_that_reads_the_uncited_mark_is_in_the_table(self):
+        import ast
+        found = set()
+        for name in ("plan_ledger.py", "fleet-switchboard"):
+            text = (REPO / "bin" / name).read_text()
+            for node in ast.walk(ast.parse(text)):
+                if isinstance(node, ast.FunctionDef):
+                    inner = [n for n in ast.walk(node) if isinstance(n, ast.FunctionDef) and n is not node]
+                    own = ast.get_source_segment(text, node)
+                    if "uncited" in own and not any("uncited" in (ast.get_source_segment(text, n) or "") for n in inner):
+                        found.add((name, node.name))
+        self.assertEqual(found, set(sb.plan_ledger.UNCITED_CONSUMERS), "a reader of the uncited mark is not in plan_ledger.UNCITED_CONSUMERS (or one in it no longer reads it)")
 
     def test_s14_each_mutant_of_the_uncited_rule_fails_the_check(self):
         def check():
@@ -36300,6 +36343,8 @@ class TestWholeRead(LedgerBase):
             self.assertEqual(len(self.records()), count + 1, "recorded, not refused")
             last = self.records()[-1]
             self.assertEqual((last["verdict"], last.get("uncited")), ("request-changes", True))
+            self.assertNotIn("blocking review(s)", self.run_as("coder", "gates", self.PR)[1], "an uncited request-changes does not block")
+            self.assertNotIn("blocking finding(s)", self.run_as("coder", "review", "blockers", self.PR)[1])
         check()
         real = sb.parse_review_block
         def softened(text):
@@ -36315,6 +36360,9 @@ class TestWholeRead(LedgerBase):
             with self.subTest(name), mock.patch.object(sb, "parse_review_block", mutant):
                 with self.assertRaises(AssertionError):
                     check()
+        with self.subTest("gates it as blocking"), mock.patch.object(sb.plan_ledger, "review_blocks", lambda entry: entry.get("verdict") == "request-changes"):
+            with self.assertRaises(AssertionError):
+                check()
         with self.subTest("drops the mark"), mock.patch.object(sb.plan_ledger, "append_entry", lambda state, entry, now: real_append(state, {k: v for k, v in entry.items() if k != "uncited"}, now)):
             with self.assertRaises(AssertionError):
                 check()

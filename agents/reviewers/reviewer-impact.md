@@ -139,7 +139,7 @@ findings:
 - R-CODE-1 | note | bin/example:10 | an example note | none needed
 ```
 
-`approve` means nothing blocks. `request-changes` should cite a rule in a blocking finding; the record keeps your verdict exactly as given and marks one that cites none `uncited`. `comment` is proposals only.
+`approve` means nothing blocks. `request-changes` should cite a rule in a blocking finding; the record keeps your verdict exactly as given and marks one that cites none `uncited` (visible, but it does not block). `comment` is proposals only.
 
 ## Never
 
