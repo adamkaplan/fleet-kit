@@ -5442,7 +5442,8 @@ Each decision was walked against the matrix (its owner-hold meaning and its rati
 - Parts run in the order given, each executed into the same namespace, so `__file__` stays the entry's and every path computed from it is unchanged.
 - The line naming the entry itself is where the entry's own code runs. Parts above it run first; parts below it run at the end of the file, before `main`.
 - A missing part stops the start with one line on stderr. A missing manifest means the entry alone; a manifest that exists but cannot be read stops the start with one line. A manifest that does not name the entry runs every part before the entry's code. The manifest and its parts run with the daemon's authority: they have the entry's trust and file permissions.
-- Today the manifest names only the entry, so nothing moved and behaviour is identical. A later slice moves code into parts and adds their lines.
+- The parts listed after the entry run just before the command groups are derived from the `cmd_*` functions (`derive_action_groups()`), because that step builds the parser and needs every part's registrar.
+- Slice S3 moved the v1 import converter (the `import-v1` section: the converter, the v2 shape checker and the command) to `switchboard/import_v1.py`, text unchanged, listed after the entry. Statements of that section stay in the entry, in place: `V1_MOVE_DEFAULTS` with the `DEFAULTS.update(V1_MOVE_DEFAULTS)` line (import time reads it, and the key order of `DEFAULTS` is as it was), `V1_LIST_PAGE`, `validate_v1_move_config`, `_v2_session_import` and `_v2_session_list_page` (the clear's closure reads them; they move with the clear batch, S13). No statement outside the section reads a moved name at import time (an ast check, run when the part was cut).
 
 ## Running with no terminal multiplexer (#1072)
 
