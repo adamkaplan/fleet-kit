@@ -109,7 +109,7 @@ findings:
 
 The coder session records your block; you never run the command. A block with no `impact-severity:` and `impact-probability:` line is recorded WITHOUT a score and clears nothing by score, so always give both.
 
-The coder records it verbatim with `review record <pr> --reviewer impact --block-file FILE`: severity, probability, action and class come from your block, and no restating flag is accepted.
+The coder records it verbatim with the block-file form of the recording command (`--block-file FILE`): severity, probability, action and class come from your block, and no restating flag is accepted.
 
 A rating counts by score only because your block was recorded with it: the hash kept with the record proves a block was given, not that the agent produced it (a mistake-guard, as the recorded-role check is); the independent review and the audit remain the cover. The record keeps only the block's hash and size, not its text, so keep your block text if an audit ever needs it.
 
