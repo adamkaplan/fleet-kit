@@ -16273,6 +16273,10 @@ def remove_reminders(state_dir, ids):
     return gone
 
 
+def found_reason(why):
+    return "merged" if why.endswith(" is merged") else "closed"
+
+
 class ReminderFacts:
     """`reminder:<id>` facts for reminders that are due. A reminder not yet due is no fact.
 
@@ -16370,6 +16374,20 @@ class ReminderFacts:
             return "%s reported to %s since the launch" % (worker, item["to"])
         return "deliver"
 
+    def notify_drop(self, item, why):
+        """#1132: a reminder dropped because its issue closed or its pull request merged tells its setter ONCE. Called only by the caller
+        that removed the reminder from the file (`gone` was non-empty), so a second sweep finds nothing to drop and sends nothing."""
+        sender = item.get("from")
+        match = re.search(r" is (closed|merged)$", why)
+        if match is None or not isinstance(sender, str) or not sender.strip() or self.engine is None:
+            return
+        reason = "the pull request merged" if match.group(1) == "merged" else "the issue closed"
+        text = "Reminder %s for %s was dropped, unsent: %s (%s). Its text: %s. Set it with --keep-if-closed to keep it." % (
+            item["id"], item["to"], reason, why, item["text"])
+        add_reminder(self.state_dir, sender, self.engine.now(), self.engine.now(), text)
+        if self.engine.audit is not None:
+            self.engine.audit.append(self.engine.actor, "reminder.drop_notice", sender, {"id": item["id"], "why": found_reason(why)})
+
     def __call__(self):
         facts = []
         for item in self.due():
@@ -16382,6 +16400,8 @@ class ReminderFacts:
                     if gone and self.engine is not None and self.engine.audit is not None:
                         self.engine.audit.append(self.engine.actor, "reminder.drop", item["to"],
                                                  {"id": item["id"], "why": found})
+                    if gone:
+                        self.notify_drop(item, found)
                     continue
             text = self.overdue_text(item) if isinstance(item.get("condition"), dict) and isinstance(item["condition"].get("unless_report_from"), str) and self.engine else item["text"]
             facts.append(Fact("reminder:" + item["id"], item["to"], "reminder", text, item["at"],
@@ -16600,12 +16620,26 @@ def cmd_remind(args, runner, now):
             condition[key] = flag
     if number is not None and repo and not condition and not args.keep_if_closed:
         condition["until_closed"] = "%s#%d" % (repo, number)   # a reminder about an issue is moot once it is closed: dropped unsent (`--keep-if-closed` opts out)
+    warning = None
+    if number is not None and repo and not args.keep_if_closed:
+        try:
+            ref_state = read_ref_state(engine, repo, number, "issue")
+        except Exception:   # the warning never fails a command
+            ref_state = "open"   # unreadable: warned as open, never refused
+        if ref_state in ("closed", "merged"):
+            sys.stderr.write("%s: %s#%d is already closed; a reminder about a closed issue is dropped when it is due. "
+                             "Use --keep-if-closed to keep it\n" % (PROG, repo, number))
+            return EXIT_USAGE
+        warning = ("%s: reminder is dropped if it closes (%s#%d closes or its pull request merges), with one notice to you; "
+                   "use --keep-if-closed to keep it\n" % (PROG, repo, number))
     item = add_reminder(state, args.name, parse_when(args.when, moment), moment,
                         " ".join(args.text).strip(), number, sender, repo, condition=condition or None)
     engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),
                                                           "from": sender, "issue": number, "repo": repo})
     print(item["id"])
     sys.stderr.write("%s: reminder for %s %s (now %s)\n" % (PROG, args.name, _print_when(item["at"], moment), _print_when_now(moment)))
+    if warning:
+        sys.stderr.write(warning)
     return EXIT_OK
 
 

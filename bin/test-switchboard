@@ -10512,6 +10512,34 @@ class TestRemindCLI(PR4Base):
         self.assertNotIn("condition", by["even so"])
         self.assertNotIn("condition", by["no issue"])
 
+    def test_remind_issue_warns_at_creation_that_it_is_dropped_if_it_closes(self):
+        with unittest.mock.patch.object(sb, "read_ref_state", return_value="open"):
+            code, out, err = self.main("remind", "platform", "1h", "--issue", "acme/api#41", "--from", "coder", "about it")
+        self.assertEqual(code, 0, err)
+        self.assertIn("dropped if it closes", err)
+        self.assertIn("--keep-if-closed", err)
+
+    def test_remind_issue_with_the_option_does_not_warn(self):
+        with unittest.mock.patch.object(sb, "read_ref_state", return_value="open"):
+            code, out, err = self.main("remind", "platform", "1h", "--issue", "acme/api#41", "--keep-if-closed", "--from", "coder", "x")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("dropped if it closes", err)
+
+    def test_remind_without_issue_is_unchanged(self):
+        code, out, err = self.main("remind", "platform", "1h", "--from", "coder", "plain")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("dropped if it closes", err)
+
+    def test_an_already_closed_issue_is_refused_unless_kept(self):
+        with unittest.mock.patch.object(sb, "read_ref_state", return_value="closed"):
+            code, _, err = self.main("remind", "platform", "1h", "--issue", "acme/api#41", "--from", "coder", "x")
+            self.assertEqual(code, 2)
+            self.assertIn("already closed", err)
+            self.assertIn("--keep-if-closed", err)
+            self.assertEqual(sb.read_reminders(self.world.state), [])
+            code, _, err = self.main("remind", "platform", "1h", "--issue", "acme/api#41", "--keep-if-closed", "--from", "coder", "x")
+            self.assertEqual(code, 0, err)
+
     def test_list_is_capped_says_how_many_more_and_says_so_when_there_are_none(self):
         code, out, err = self.main("remind", "--list", "--from", "coder")
         self.assertEqual((code, out), (0, ""))
@@ -10708,9 +10736,45 @@ class TestReminderCancelConditions(SelfWakeBase):
         self.remind(until_closed="acme/api#41")
         self.wait(120)
         self.assertEqual(self.texts("platform"), [])
-        self.assertEqual(sb.read_reminders(self.world.state), [])
+        self.assertEqual([r["to"] for r in sb.read_reminders(self.world.state)], ["coder"])   # only the notice to the setter
         (drop,) = self.events("reminder.drop")
         self.assertIn("acme/api#41 is closed", drop["detail"]["why"])
+
+    def test_a_drop_sends_the_setter_one_notice_naming_text_and_reason_audited_once(self):
+        self.states[41] = "CLOSED"
+        self.remind(until_closed="acme/api#41")
+        self.wait(120)
+        self.wait(120)   # a second sweep: no second notice
+        notices = [t for t in self.texts("coder") if "look at the PR" in t]
+        self.assertEqual(len(notices), 1, notices)
+        self.assertIn("the issue closed", notices[0])
+        self.assertIn("dropped", notices[0])
+        self.assertEqual(len(self.events("reminder.drop_notice")), 1)
+        self.assertEqual(len(self.events("reminder.drop")), 1)
+
+    def test_a_merged_pull_request_notice_gives_the_merge_as_the_reason(self):
+        self.states[43] = "MERGED"
+        self.remind(until_merged="acme/api#43")
+        self.wait(120)
+        self.wait(120)
+        notices = [t for t in self.texts("coder") if "look at the PR" in t]
+        self.assertEqual(len(notices), 1, notices)
+        self.assertIn("the pull request merged", notices[0])
+
+    def test_a_kept_reminder_fires_after_the_close_and_sends_no_notice(self):
+        self.states[41] = "CLOSED"
+        self.remind()   # --keep-if-closed stores no condition
+        self.wait(120)
+        self.assertEqual(len([t for t in self.texts("platform") if "look at the PR" in t]), 1)
+        self.assertEqual(self.events("reminder.drop_notice"), [])
+
+    def test_a_reminder_without_a_drop_sends_no_notice(self):
+        self.states[42] = "OPEN"
+        self.remind(until_closed="acme/api#42")
+        self.wait(120)
+        self.assertEqual(len(self.texts("platform")), 1)
+        self.assertEqual(self.events("reminder.drop_notice"), [])
+
 
     def test_a_merged_pr_drops_until_merged_but_a_merely_open_one_delivers(self):
         self.states[42] = "OPEN"
