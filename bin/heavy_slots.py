@@ -1202,3 +1202,41 @@ def wrap_argv(argv, environ, python, switchboard, script, err=None, state_dir=No
         err.write("heavy: no slot machinery here (%s): running without a slot\n" % (error.strerror or error))
         return None
     return [python, switchboard, "heavy", "--name", os.path.basename(script), "--", python, script] + list(argv)
+
+
+# ---- the quick slots (#1045): a small separate allowance for ONE focused test file or class, so a one-file check never waits behind a full-suite run.
+QUICK_SLOTS = 4          # the cap: at most this many quick runs at once, on their own locks and their own line (a directory of their own in the state directory)
+QUICK_SECONDS = 600      # the time ceiling of one quick run (10 min); the watchdog stops it past this
+QUICK_DIR = "quick"
+
+
+def quick_dir(state_dir):
+    path = os.path.join(str(state_dir), QUICK_DIR)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
+def quick_status(state_dir):
+    """`quick slots 1/4 (ceiling 10 min)`: read only (a missing directory reads as none held)."""
+    path = os.path.join(str(state_dir), QUICK_DIR)
+    held = len(holders(path, QUICK_SLOTS)) if os.path.isdir(path) else 0
+    return "quick slots %d/%d (ceiling %d min)" % (held, QUICK_SLOTS, QUICK_SECONDS // 60)
+
+
+def run_quick(command, state_dir, wait_max=DEFAULT_WAIT_MAX, name=None, environ=None, out=None, **keywords):
+    """Run ONE focused command in a quick slot. A command that is not focused (a whole suite, an e2e run) is refused with 64 and never takes a quick slot. The quick slots
+    have their own locks and their own waiting line, so a run holding every ordinary slot (or queued for one) never delays it; at most QUICK_SLOTS run at once and each is
+    stopped after QUICK_SECONDS."""
+    out = sys.stderr if out is None else out
+    kind = classify(command)
+    if kind != "focused":
+        out.write("heavy: refused: a quick slot is for ONE focused test file or class; this run is %s (use an ordinary slot: no --quick)\n" % kind)
+        return EXIT_USAGE
+    environ = dict(os.environ if environ is None else environ)
+    environ[TIME_ENV] = str(QUICK_SECONDS)
+    try:
+        out.write("heavy: quick slot: %s\n" % quick_status(state_dir))
+    except OSError:
+        pass
+    return run(command, quick_dir(state_dir), QUICK_SLOTS, wait_max, name, environ=environ, out=out, ceiling=QUICK_SECONDS,
+               ceiling_config={"slots": QUICK_SLOTS, "ceilings": {"max": QUICK_SECONDS}}, **keywords)
