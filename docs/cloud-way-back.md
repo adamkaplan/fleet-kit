@@ -1,4 +1,4 @@
-# The way back from FleetKit Cloud to local
+# The way back from the cloud to local
 
 Plan: <https://github.com/adamkaplan/fleet-kit/issues/1059#issuecomment-6320367025> (section 3, "The way back"; scenario S6; slice 6a, issue #1079).
 

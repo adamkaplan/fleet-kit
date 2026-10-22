@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cloud_way_back_check: a READ-ONLY check of the way back from FleetKit Cloud to local (slice 6a of the plan on #1059, scenario S6).
+"""cloud_way_back_check: a READ-ONLY check of the way back from the cloud to local (slice 6a of the plan on #1059, scenario S6).
 
     bin/cloud_way_back_check.py FIXTURE_DIR
 
