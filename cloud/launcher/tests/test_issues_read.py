@@ -158,7 +158,7 @@ class Table(Fx):
                 self.assertTrue(all(refused(p) for n, p in bad_answers()))                # and the real code refuses every case
 
     def test_s8_a_mutant_that_forgets_the_extra_key_or_the_missing_key_is_caught(self):
-        extra = mutant_module("if k not in EXPECTED_PERMISSIONS:", "if False:")
+        extra = mutant_module("if k not in expected:", "if False:")
         self.assertFalse(all(refused(p, extra) for n, p in bad_answers()))
         missing = mutant_module("if k not in perms:", "if k not in perms:\n            continue\n        if False:")
         self.assertFalse(all(refused(p, missing) for n, p in bad_answers() if n.startswith("missing")))

@@ -12,7 +12,7 @@ cw = base.cw
 
 # One row per way a pod gets built: a shape (derived from SHAPES) with a variant of the optional parts.
 VARIANTS = {"plain": [], "pull-secret": ["--pull-secret", "cw-pull"]}
-BUILDERS = [(shape, var) for shape in sorted(cw.SHAPES) for var in sorted(VARIANTS)]
+BUILDERS = [(shape, var) for shape in sorted(cw.SHAPE_CHOICES) for var in sorted(VARIANTS)]
 CAPS = {"default": ([], 8 * 3600), "1h cap": (["--hard", "30m", "--max-hard", "1h"], 3600), "30m cap": (["--hard", "10m", "--max-hard", "30m"], 1800)}
 
 
