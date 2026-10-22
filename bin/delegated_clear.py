@@ -215,10 +215,9 @@ def judge(block, cells, entries, report, threshold, runs_required=1):
             reasons.append("it changes a %s path and the rating %s is below the floor %s: refused" % (cls, level, block["floor"]["lowest_level"]))
         elif not any(i == top and re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(rule_id), str(e.get("impact_reason") or "")) for i, _, e in counted):
             reasons.append("it changes a %s path and the rating's reason does not name the rule %s: the rule is not named, the rating does not count" % (cls, rule_id))
-    if level not in block["delegable_levels"]:
-        reasons.append("the score is %s: %s is the owner's" % (level, level))
-    elif ladder.index(level) > ladder.index(threshold):
-        reasons.append("the score %s is above the threshold %s" % (level, threshold))
+    over = level_refusal(block, level, threshold)
+    if over:
+        reasons.append(over)
     runs = pick_runs(counted)
     if not reasons and runs_required > 1:   # #972: only a score the order would allow is asked for its corroboration; a score above the threshold is refused by score, not by count
         head8 = str(report.get("head"))[:8]
@@ -278,9 +277,78 @@ def reason_problems(reason, runs):
     return problems
 
 
+def level_refusal(block, level, threshold):
+    """The reason a score `level` is refused whatever the rating's other lines say (not a level a delegation may clear, or above `threshold`), or None. The ONE comparison: `judge` makes it on the score, `who_can_clear` on the floor's lowest level."""
+    if level not in block["delegable_levels"]:
+        return "the score is %s: %s is the owner's" % (level, level)
+    if block["ladder"].index(level) > block["ladder"].index(threshold):
+        return "the score %s is above the threshold %s" % (level, threshold)
+    return None
+
+
 def daemon_roots(rule):
     """The daemon file's roots of the clear closure: `closure_roots` (what the clear command runs) and `rating_roots` (the code that WRITES and PARSES the independent rating the score is read from, #835): a change to a definition reachable from any of them is the owner's own clear."""
     return sorted(set(rule["closure_roots"]) | set(rule.get("rating_roots") or []))
+
+
+def _item(kind, text, paths=(), **extra):
+    return dict({"kind": kind, "text": text, "paths": list(paths)}, **extra)
+
+
+def refusal_items(rule, report, files, matches=None, closure=None, scored=None):
+    """([item], tidy): every refusal of `refusals` as {"kind", "text", "paths", ...} in the order it is found; the ONE place the rules are written. `tidy` is False where the clear has always
+    returned the reasons as found (an early stop on something unreadable), True where it returns them sorted and once each. The kinds: `unreadable` (a read or the rule itself failed), `rating` (the score rule),
+    `class` (a path class never delegated), `review` (the independent review at this head), `machinery`, `new-file`, `closure`."""
+    if not isinstance(rule, dict) or not isinstance(report, dict) or matches is None:
+        return [_item("unreadable", "the delegated-clear rule or the owner-hold decision cannot be read", why="the rule or the decision cannot be read")], False
+    for key in ("never_path_classes", "top_tier_review_classes", "clear_code_paths", "new_file_globs", "closure_files"):
+        if not isinstance(rule.get(key), list) or not all(isinstance(x, str) for x in rule[key]):
+            return [_item("unreadable", "the delegated-clear rule is malformed (%s)" % key, why="the clear rule is malformed")], False
+    if report.get("owner_decision") not in ("hold", "second-review", "none"):
+        return [_item("unreadable", "the owner-hold decision cannot be read", why="the owner-hold decision cannot be read")], False
+    if report.get("complete") is not True or report.get("unknown") or report.get("renamed_no_source"):
+        return [_item("unreadable", "the pull request's changes cannot be read in full (%s)" % (report.get("unknown") or "the file list is cut"), why="the pull request's changes cannot be read in full")], False
+    items = [_item("rating", r) for r in (scored["reasons"] if isinstance(scored, dict) else [])]
+    hits = report.get("top_tier_hits") or {}
+    for cls in sorted(hits) if scored is None else ():
+        if cls.lower() in {c.lower() for c in rule["never_path_classes"]}:
+            items.append(_item("class", "it changes a %s path (%s): that stays the owner's own clear" % (cls, ", ".join(hits[cls][:3])), hits[cls][:3], cls=cls))
+    if report.get("review_action") is None and scored is None:
+        items.append(_item("review", "no independent review is recorded at this head: unknown is refused"))
+    review = report.get("review_class")
+    if review is None and report.get("review_action") == "hold" and scored is None:
+        items.append(_item("review", "the independent review holds it with no class named: unknown is refused"))
+    if isinstance(review, str) and review.lower() in {c.lower() for c in rule["top_tier_review_classes"]} and scored is None:
+        items.append(_item("review", "the independent review's class is %s, a top tier class: that stays the owner's own clear" % review))
+    if files is None:
+        items.append(_item("unreadable", "the changed files cannot be read, so a change to the clear code cannot be ruled out", why="the changed files cannot be read"))
+        return items, False
+    named = set(report.get("changed_paths") or [])
+    for item in files:
+        if not isinstance(item, dict) or not isinstance(item.get("filename"), str):
+            items.append(_item("unreadable", "a changed file cannot be read: refused", why="a changed file cannot be read"))
+            continue
+        both = [x for x in (item.get("filename"), item.get("previous_filename")) if x is not None]
+        if any(not isinstance(x, str) or "\x00" in x for x in both):
+            items.append(_item("unreadable", "a changed path cannot be read (%r): refused" % str(both)[:60], why="a changed path cannot be read"))
+            continue
+        for path in both:
+            if matches(path, rule["clear_code_paths"]):
+                items.append(_item("machinery", "it changes a file that is the clear or hold machinery or that the daemon loads (%s): that stays the owner's own clear" % path[:80], [path]))
+        if any(matches(path, rule["new_file_globs"]) for path in both) and (item.get("status") in ("added", "removed", "renamed", "copied") or item.get("previous_filename")):
+            items.append(_item("new-file", "it adds, deletes or renames a file under a directory the daemon loads at start (%s): that stays the owner's own clear" % item["filename"][:80], [item["filename"]],
+                               verb={"removed": "deletes a file", "renamed": "renames a file"}.get(item.get("status") if not item.get("previous_filename") else "renamed", "adds a file")))
+        for path in both:
+            if matches(path, rule["closure_files"]):
+                mapped = (closure or {}).get(item["filename"])
+                if mapped is None:
+                    items.append(_item("unreadable", "the change to %s cannot be mapped to its definitions: refused" % path[:60], why="a change cannot be mapped to its definitions"))
+                else:
+                    items.extend(_item("closure", reason, [item["filename"]]) for reason in mapped)
+    for path in sorted(p for p in named if isinstance(p, str)):
+        if matches(path, rule["clear_code_paths"]):
+            items.append(_item("machinery", "it changes a file that is the clear or hold machinery or that the daemon loads (%s): that stays the owner's own clear" % path[:80], [path]))
+    return items, True
 
 
 def refusals(rule, report, files, matches=None, closure=None, scored=None):
@@ -289,56 +357,139 @@ def refusals(rule, report, files, matches=None, closure=None, scored=None):
     changed files ([{"filename", "previous_filename", "status"}]) or None when they could not be read. `matches(path, globs)` is the owner-hold floor's OWN path matcher (case-,
     normalisation- and spelling-insensitive: `./bin/x`, `bin//x`, `BIN/X`, a `..`, a rename's source all read as the file they name): the caller passes it, this module holds no second one.
     `closure` is {file name: [reasons] or None}: what `closure_refusals` said for each changed file of `closure_files` (None: it could not be mapped). `scored` is `judge`'s answer for an order with a
-    max_level: then the score is the only rule about the pull request's classes (the path-class and review-class refusals below are not made), and the machinery refusals stay."""
-    if not isinstance(rule, dict) or not isinstance(report, dict) or matches is None:
-        return ["the delegated-clear rule or the owner-hold decision cannot be read"]
-    for key in ("never_path_classes", "top_tier_review_classes", "clear_code_paths", "new_file_globs", "closure_files"):
-        if not isinstance(rule.get(key), list) or not all(isinstance(x, str) for x in rule[key]):
-            return ["the delegated-clear rule is malformed (%s)" % key]
-    if report.get("owner_decision") not in ("hold", "second-review", "none"):
-        return ["the owner-hold decision cannot be read"]
-    if report.get("complete") is not True or report.get("unknown") or report.get("renamed_no_source"):
-        return ["the pull request's changes cannot be read in full (%s)" % (report.get("unknown") or "the file list is cut")]
-    reasons = list(scored["reasons"]) if isinstance(scored, dict) else []
+    max_level: then the score is the only rule about the pull request's classes (the path-class and review-class refusals below are not made), and the machinery refusals stay. The rules are written once, in `refusal_items`."""
+    items, tidy = refusal_items(rule, report, files, matches, closure, scored)
+    reasons = [i["text"] for i in items]
+    return sorted(set(reasons)) if tidy else reasons
+
+
+# ---- one read of a changed daemon file's blobs (#946): the clear and the line the daemon posts read through the SAME cache
+
+MAP_CACHE = {}
+MAP_CACHE_MAX = 64
+
+
+def cached_map(key, compute, take):
+    """`compute()` ([reasons] or None) for one changed file, handed from the line to the clear ONCE. The line's dry run (`take` False) reads and keeps a mapped answer; the clear (`take` True) uses a kept answer for
+    the same key and removes it, else reads itself and keeps nothing. The key is content-addressed (the head's blob id, the merge-base commit, a hash of the patch, a hash of the rule) and scoped to the state
+    directory, so a kept answer cannot be stale; bounded; a failed read is never kept. The line and the clear read a file's blobs once between them, never twice."""
+    if take:
+        kept = MAP_CACHE.pop(key, None)
+        return list(kept) if kept is not None else compute()
+    got = compute()
+    if got is not None:
+        if len(MAP_CACHE) >= MAP_CACHE_MAX:
+            MAP_CACHE.pop(next(iter(MAP_CACHE)))
+        MAP_CACHE[key] = list(got)
+    return got
+
+
+def map_key(state_dir, repo, item, base_sha, rule):
+    """The key of `cached_map` for one changed file."""
+    digest = lambda x: hashlib.sha256(json.dumps(x, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+    return (str(state_dir), repo, item.get("filename"), item.get("sha"), base_sha, digest(item.get("patch")), digest(rule))
+
+
+# ---- who can clear (#946): the ONE answer, a plain structure, read by the daemon's comment line and by the packet command
+
+WHO = ("no hold", "owner only", "owner (delegation is off)", "chief of staff with a rating", "owner or chief of staff", "unknown")   # the values of `who`
+UNREAD = "the pull request's changes or the clear rule could not be read"
+
+
+def delegation_of(config, block):
+    """None when the delegated clear is off in this configuration, else {"threshold": the highest `max_level` of the listed orders or None when none sets one}. Read from the same configuration the clear reads."""
+    if settings(config) is None:
+        return None
+    ladder = (block or {}).get("ladder") or []
+    levels = [e.get("max_level") for e in config[CONFIG_KEY]["orders"] if e.get("max_level") in ladder]
+    return {"threshold": max(levels, key=ladder.index) if levels else None}
+
+
+def safe_path(path):
+    """A changed path as it may appear in a public line: the repository-relative name already public on the pull request, or a fixed phrase when it is absolute, a home path or token shaped."""
+    if not isinstance(path, str) or not re.fullmatch(r"[A-Za-z0-9._@+/-]{1,80}", path) or path.startswith(("/", "~")) or ".." in path.split("/") \
+            or re.search(r"(^|/)(Users|home)/", path) or re.search(r"[A-Za-z0-9]{24,}", path) or re.search(r"(?i)(^|[^a-z])(ghp|gho|ghu|ghs|ghr|github_pat|sk|xox[a-z])[_-]", path):
+        return "a path that is not shown"
+    return path
+
+
+_OWNER_WORDS = {"closure": "changes a definition reachable from the clear", "machinery": "changes the clear or hold machinery", "new-file": "adds a file under a directory the daemon loads at start",
+                "class": "changes a path of a class that is never delegated without a rating"}
+
+
+def _why(item):
+    paths = ", ".join(safe_path(p) for p in sorted(set(item["paths"]))[:3])
+    if item["kind"] == "unreadable":
+        return item["why"]
+    words = _OWNER_WORDS[item["kind"]]
+    if item["kind"] == "new-file":
+        words = words.replace("adds a file", item.get("verb") or "adds a file")
+    if item["kind"] == "class":
+        words = "changes a %s path that is never delegated without a rating" % item.get("cls", "protected")
+    return "%s (%s)" % (words, paths) if paths else words
+
+
+def who_can_clear(rule, report, files, matches, closure, block, delegation, pr=None, head=None, unread=None):
+    """Who can clear this held pull request, as plain data (no text layout): {"pr", "head", "hold" (bool), "floor_ids" (the rule ids of the top tier classes it changes, sorted), "owner_only" (a list of {"kind":
+    closure|new-file|machinery|class|unreadable, "why"} in words: empty means the clear does not refuse it for what it changes), "min_rating" (the matrix's lowest level for a floor hit, else None), "must_name" (the
+    rule ids the rating's reason must name), "who" (one of `WHO`), "unreadable" (None or one fixed line), "delegation" ("on" or "off"), "threshold" (the highest `max_level`, or None), "needs" (what the rating or review
+    at this head must still say)}. It is `refusal_items`, the clear's own rule, on the same inputs the clear reads: no second copy. Pure: it reads nothing and writes nothing. `delegation` is `delegation_of`'s answer;
+    `unread` is set by a caller whose inputs could not be read at all."""
+    out = {"pr": pr, "head": head, "hold": False, "floor_ids": [], "owner_only": [], "min_rating": None, "must_name": [], "who": "unknown", "unreadable": None,
+           "delegation": "on" if delegation is not None else "off", "threshold": (delegation or {}).get("threshold"), "needs": []}
+    if unread is not None or not isinstance(report, dict) or report.get("owner_decision") not in ("hold", "second-review", "none"):
+        out["unreadable"] = UNREAD
+        out["owner_only"] = [{"kind": "unreadable", "why": UNREAD}]
+        return out
+    out["pr"], out["head"] = report.get("pr", pr), report.get("head", head)
+    if report["owner_decision"] != "hold":
+        out["who"] = "no hold"
+        return out
+    out["hold"] = True
+    scored = {"level": None, "reasons": []} if out["threshold"] else None   # with a max_level the score replaces the class refusals, as the clear does
+    items, _ = refusal_items(rule, report, files, matches, closure, scored)
+    unreadable = [i for i in items if i["kind"] == "unreadable"]
+    ids = block["floor"]["rules"] if isinstance(block, dict) and isinstance((block.get("floor") or {}).get("rules"), dict) else None
+    if unreadable or ids is None:
+        out["unreadable"] = UNREAD
+        out["owner_only"] = sorted(({"kind": "unreadable", "why": _why(i)} for i in unreadable), key=lambda d: d["why"]) or [{"kind": "unreadable", "why": "the score rule cannot be read"}]
+        return out
     hits = report.get("top_tier_hits") or {}
-    for cls in sorted(hits) if scored is None else ():
-        if cls.lower() in {c.lower() for c in rule["never_path_classes"]}:
-            reasons.append("it changes a %s path (%s): that stays the owner's own clear" % (cls, ", ".join(hits[cls][:3])))
-    if report.get("review_action") is None and scored is None:
-        reasons.append("no independent review is recorded at this head: unknown is refused")
-    review = report.get("review_class")
-    if review is None and report.get("review_action") == "hold" and scored is None:
-        reasons.append("the independent review holds it with no class named: unknown is refused")
-    if isinstance(review, str) and review.lower() in {c.lower() for c in rule["top_tier_review_classes"]} and scored is None:
-        reasons.append("the independent review's class is %s, a top tier class: that stays the owner's own clear" % review)
-    if files is None:
-        reasons.append("the changed files cannot be read, so a change to the clear code cannot be ruled out")
-        return reasons
-    named = set(report.get("changed_paths") or [])
-    for item in files:
-        if not isinstance(item, dict) or not isinstance(item.get("filename"), str):
-            reasons.append("a changed file cannot be read: refused")
-            continue
-        both = [x for x in (item.get("filename"), item.get("previous_filename")) if x is not None]
-        if any(not isinstance(x, str) or "\x00" in x for x in both):
-            reasons.append("a changed path cannot be read (%r): refused" % str(both)[:60])
-            continue
-        for path in both:
-            if matches(path, rule["clear_code_paths"]):
-                reasons.append("it changes a file that is the clear or hold machinery or that the daemon loads (%s): that stays the owner's own clear" % path[:80])
-        if any(matches(path, rule["new_file_globs"]) for path in both) and (item.get("status") in ("added", "removed", "renamed", "copied") or item.get("previous_filename")):
-            reasons.append("it adds, deletes or renames a file under a directory the daemon loads at start (%s): that stays the owner's own clear" % item["filename"][:80])
-        for path in both:
-            if matches(path, rule["closure_files"]):
-                mapped = (closure or {}).get(item["filename"])
-                if mapped is None:
-                    reasons.append("the change to %s cannot be mapped to its definitions: refused" % path[:60])
-                else:
-                    reasons.extend(mapped)
-    for path in sorted(p for p in named if isinstance(p, str)):
-        if matches(path, rule["clear_code_paths"]):
-            reasons.append("it changes a file that is the clear or hold machinery or that the daemon loads (%s): that stays the owner's own clear" % path[:80])
-    return sorted(set(reasons))
+    out["floor_ids"] = sorted(rid for rid, cls in ids.items() if hits.get(cls))
+    out["must_name"] = list(out["floor_ids"])
+    out["min_rating"] = block["floor"]["lowest_level"] if out["floor_ids"] else None
+    only = {(i["kind"], _why(i)) for i in items if i["kind"] in _OWNER_WORDS}
+    out["owner_only"] = [{"kind": k, "why": w} for k, w in sorted(only)]
+    out["needs"] = sorted({i["text"] for i in items if i["kind"] == "review"})
+    if out["floor_ids"] and out["threshold"] and not out["owner_only"] and level_refusal(block, out["min_rating"], out["threshold"]):   # no rating can pass the clear's own comparison: the floor needs more than any order allows
+        need = out["min_rating"]
+        out["owner_only"] = [{"kind": "score", "why": "the rating the floor needs (%s) is %s" % (need, "the owner's" if need not in block["delegable_levels"] else "above what any order allows (%s)" % out["threshold"])}]
+    if out["owner_only"]:
+        out["who"] = "owner only"
+    elif delegation is None:
+        out["who"] = "owner (delegation is off)"
+    else:
+        out["who"] = "chief of staff with a rating" if out["floor_ids"] and out["threshold"] else "owner or chief of staff"
+    return out
+
+
+def clear_line(who):
+    """The ONE line the daemon posts for `who_can_clear`'s answer, or None when there is nothing to say (no hold, or unread: a read that failed never produces a confident line). It names the floor rule ids
+    that hit and the lowest rating the matrix allows for them, whoever may clear."""
+    if not isinstance(who, dict) or who.get("who") in (None, "no hold", "unknown"):
+        return None
+    head, floor = "Who can clear this: ", ""
+    if who["floor_ids"]:
+        floor = "; floor rules hit: %s (a rating must be at least %s and its reason must name them)" % (", ".join(who["floor_ids"]), who["min_rating"])
+    if who["who"] == "owner only":
+        return head + "owner only: " + "; ".join(o["why"] for o in who["owner_only"]) + floor
+    if who["who"] == "owner (delegation is off)":
+        return head + "the owner (delegation is off here)" + floor
+    if who["floor_ids"] and who["threshold"]:
+        return head + "the Chief of Staff or the owner, if the independent rating is at least %s and its reason names %s" % (who["min_rating"], " and ".join(who["floor_ids"]))
+    if who["threshold"]:
+        return head + "the Chief of Staff or the owner, on an independent rating of at most %s (the highest any order allows)" % who["threshold"]
+    return head + "the Chief of Staff or the owner, if the independent review names no top tier class" + floor
 
 
 # ---- the daemon file: which top-level definitions a changed line is in (ast, never hunk headers), and whether any of them is in the clear closure
