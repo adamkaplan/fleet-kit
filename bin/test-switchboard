@@ -70671,7 +70671,7 @@ class TestV2Http(StandInPids, V2TransportBase):
                 sb.validate_config(dict(base, v2_transport=bad))
 
     def test_every_real_client_construction_passes_the_kill_switch(self):
-        sources = [(REPO / "bin" / "fleet-switchboard").read_text(), (REPO / "bin" / "judge-eval").read_text()]
+        sources = [switchboard_source(), (REPO / "bin" / "judge-eval").read_text()]
         sites = [line for text in sources for line in text.splitlines() if re.search(r"\bV2Client\(", line) and "class V2Client" not in line]
         self.assertGreaterEqual(len(sites), 5)
         for line in sites:
