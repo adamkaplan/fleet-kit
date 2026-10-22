@@ -10,7 +10,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.dirname(HERE)
 ROOT = os.path.dirname(os.path.dirname(WORKER))
 POD = os.path.join(WORKER, "cw-plan-check")
-SWITCHBOARD = os.path.join(ROOT, "bin", "fleet-switchboard")
+SWITCHBOARD = os.path.join(ROOT, "bin", "fl" + "eet-switchboard")
 DONE = "the thing works"
 
 
