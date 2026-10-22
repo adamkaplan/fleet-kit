@@ -25,6 +25,16 @@ SKIP_DIRS = ("node_modules/", ".git/", "scenarios/", "__pycache__/")
 SUITE_PATTERNS = ("bin/test-*", "bin/test_*.py", "cloud/tests/test-*", "*.test.mjs", "*/test_*.py", "test_*.py")
 
 
+# The guards every NEW file under bin/ must pass, whatever suite touches the file's own functions (ask #1045, clause 2). One table: (name, file, class, test selector or None,
+# what it guards). A class guard runs `-k <class>`; a guard with a selector runs `-k <selector>` (the test inside the class); a script has no class and runs itself.
+NEW_BIN_GUARDS = (
+    ("TestAuthorityModulesGuard", "bin/test-switchboard", "TestAuthorityModulesGuard", None, "a module that decides who may clear, hold or merge is listed or exempted by name"),
+    ("TestAgentRegistryInventory", "bin/test-switchboard", "TestAgentRegistryInventory", None, "every module that reads or writes an agent record is in the registry inventory"),
+    ("TestImpactHold module-name guard", "bin/test-switchboard", "TestImpactHold", "test_the_modules_the_clear_loads_or_runs_are_all_judged_and_the_list_is_derived_from_what_runs", "every module the clear runs is judged by name"),
+    ("bin/check-public-names", "bin/check-public-names", None, None, "no private name in a tracked file"),
+)
+
+
 class PathSuitesError(Exception):
     pass
 
@@ -184,8 +194,47 @@ def command_for(root, suite, classes):
     return cmd
 
 
-def plan(root, paths, files=None, runner=subprocess.run):
-    """([(suite, classes, command, [paths that bring it])], [paths no suite exercises])."""
+def guard_command(guard):
+    name, path, cls, test, _why = guard
+    if cls is None:
+        return [path]
+    return [path, "-k", test or cls]
+
+
+def guard_missing(root, guard):
+    """"" when the guard can run in `root`; else the plain sentence of why it cannot (the file, the class or the test is not there)."""
+    _name, path, cls, test, _why = guard
+    if not os.path.isfile(os.path.join(root, path)):
+        return "%s is not in this tree" % path
+    if cls is not None:
+        body = _read(root, path)
+        if not re.search(r"(?m)^class %s\b" % re.escape(cls), body):
+            return "class %s is not defined in %s" % (cls, path)
+        if test and not re.search(r"def %s\b" % re.escape(test), body):
+            return "test %s is not defined in %s" % (test, path)
+    return ""
+
+
+def added_paths(root, base, runner=subprocess.run):
+    """The files under bin/ the head ADDS against the merge-base with `base` (committed, uncommitted or untracked)."""
+    mb = _git(root, "merge-base", "HEAD", base, runner=runner)
+    if mb.returncode != 0 or not mb.stdout.strip():
+        raise PathSuitesError("no common ancestor of HEAD and %s" % base)
+    diff = _git(root, "diff", "--name-only", "--no-renames", "--diff-filter=A", mb.stdout.strip(), runner=runner, check=True)
+    other = _git(root, "ls-files", "--others", "--exclude-standard", runner=runner)
+    return sorted(p for p in set(diff.stdout.split("\n")) | set(other.stdout.split("\n")) if p.startswith("bin/") and "__pycache__" not in p and not p.endswith(".pyc"))
+
+
+def guard_rows(added):
+    """The rows (suite, classes, command, why) of the four guards, when `added` holds a new file under bin/; [] otherwise. Same shape as the rows of `plan`."""
+    new = [p for p in added or [] if p.startswith("bin/")]
+    if not new:
+        return []
+    return [(g[1], [g[2]] if g[2] else [], guard_command(g), new) for g in NEW_BIN_GUARDS]
+
+
+def plan(root, paths, files=None, runner=subprocess.run, added=None):
+    """([(suite, classes, command, [paths that bring it])], [paths no suite exercises]). `added` (the new files of the diff): a new file under bin/ always brings the four guards of NEW_BIN_GUARDS."""
     files = tracked(root, runner) if files is None else files
     texts, by, none = {}, {}, []
     for p in paths:
@@ -203,6 +252,7 @@ def plan(root, paths, files=None, runner=subprocess.run):
     for s in sorted(by):
         classes = sorted(by[s][0])
         rows.append((s, classes, command_for(root, s, classes), by[s][1]))
+    rows += guard_rows(added)
     return rows, none
 
 
@@ -210,6 +260,8 @@ def render(rows, none, paths=None):
     lines = [HEADER + ":"]
     for s, classes, cmd, why in rows:
         lines.append("  %s%s\n    run: %s\n    because: %s" % (s, " (%s)" % ", ".join(classes) if classes else " (the whole suite)", " ".join(cmd), ", ".join(why)))
+        if why and cmd in [guard_command(g) for g in NEW_BIN_GUARDS] and all(w.startswith("bin/") for w in why):
+            lines[-1] += " (new file under bin/: every new bin file must pass this guard)"
     for p in none:
         lines.append("  %s: no suite exercises this path (nothing to run; say so in the pull request)" % p)
     if not rows and not none:

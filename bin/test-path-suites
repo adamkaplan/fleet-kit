@@ -180,6 +180,69 @@ class TestMergedRun(unittest.TestCase):
         self.assertIn("PASS bin/test-by-command", done.stdout)
 
 
+def new_bin_fixture(add=True):
+    """`feature` ADDS bin/newtool (listed in none of the tables: no suite names it) or, with add=False, only edits lib/calc.py."""
+    root = fixture()
+    git(root, "checkout", "-q", "-b", "feature")
+    if add:
+        write(root, "bin/newtool", "#!/usr/bin/env python3\nprint('new')\n", 0o755)
+    else:
+        write(root, "lib/calc.py", "VERSION = 1\ndef add(a, b):\n    return a + b + 0\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "change")
+    return root
+
+
+def guard_count(text):
+    """How many of the four guards of a new bin file the text names with their exact command."""
+    return sum(1 for g in ps.NEW_BIN_GUARDS if " ".join(ps.guard_command(g)) in text)
+
+
+def plan_of_own_suite_only(root, base):
+    """The MUTANT: a map that names only the suites touching the file's own functions (no guards for an added file)."""
+    paths = ps.changed_paths(root, base)
+    rows, none = ps.plan(root, paths)
+    return ps.render(rows, none)
+
+
+class TestNewBinFileGuards(unittest.TestCase):
+    """S10 (clause 2): a change that ADDS a file under bin/ always names the four guards, with their exact commands, and preflight-pr --merged runs them or says it could not."""
+
+    def test_s10_a_new_bin_file_names_the_four_guards_with_their_commands(self):
+        root = new_bin_fixture()
+        done = run_switchboard(root, "heavy", "--changed", "--list", "--base", "main")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(guard_count(done.stdout), 4, done.stdout)
+        self.assertEqual(len(ps.NEW_BIN_GUARDS), 4)
+        for name in ("TestAuthorityModulesGuard", "TestAgentRegistryInventory", "TestImpactHold", "bin/check-public-names"):
+            self.assertIn(name, done.stdout)
+        rows, _none = ps.plan(root, ["bin/newtool"], added=ps.added_paths(root, "main"))
+        self.assertEqual(len(rows), 4)
+
+    def test_s10_the_mutant_that_names_only_the_files_own_suite_shows_zero_of_the_four(self):
+        root = new_bin_fixture()
+        self.assertEqual(guard_count(plan_of_own_suite_only(root, "main")), 0)
+        self.assertEqual(guard_count(ps.render(*ps.plan(root, ["bin/newtool"], added=ps.added_paths(root, "main")))), 4)
+
+    def test_s10_a_change_that_adds_no_bin_file_names_none_of_the_guards(self):
+        root = new_bin_fixture(add=False)
+        done = run_switchboard(root, "heavy", "--changed", "--list", "--base", "main")
+        self.assertEqual(guard_count(done.stdout), 0, done.stdout)
+
+    def test_s10_preflight_pr_merged_exits_1_for_a_new_bin_file_in_none_of_the_tables_and_says_which_guards_it_could_not_run(self):
+        root = new_bin_fixture()
+        done = run_switchboard(root, "preflight-pr", "--merged")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertEqual(done.stdout.count("CANNOT RUN"), 4, done.stdout)
+        self.assertEqual(guard_count(done.stdout), 4)
+
+    def test_s10_heavy_changed_run_says_plainly_the_guards_it_could_not_run(self):
+        root = new_bin_fixture()
+        done = run_switchboard(root, "heavy", "--changed", "--base", "main")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertEqual(done.stdout.count("CANNOT RUN"), 4, done.stdout)
+
+
 class TestListAndRefusal(unittest.TestCase):
     def test_list_runs_nothing_and_says_no_suite(self):
         root = fixture()

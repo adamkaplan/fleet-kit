@@ -26448,7 +26448,7 @@ def _changed_plan(args, runner):
             paths = sorted(p for p in done.stdout.split("\n") if p.strip())
     if paths is None:
         paths = ps.changed_paths(root, base, runner)
-    rows, none = ps.plan(root, paths, runner=runner)
+    rows, none = ps.plan(root, paths, runner=runner, added=ps.added_paths(root, base, runner))
     return ps, root, base, paths, rows, none
 
 
@@ -26475,7 +26475,13 @@ def cmd_heavy_changed(args, runner=subprocess.run, now=time.time):
         if merged.problem:
             print("FAIL: %s" % merged.problem)
             return EXIT_ERROR
+        guards = {tuple(ps.guard_command(g)): g for g in ps.NEW_BIN_GUARDS}
         for suite, classes, command, why in rows:
+            gone = ps.guard_missing(merged.path, guards[tuple(command)]) if tuple(command) in guards and why and all(w.startswith("bin/") for w in why) else ""
+            if gone:
+                failed.append(suite)
+                print("CANNOT RUN %s: %s (%s): %s" % (suite, " ".join(command), "new-bin-file guard", gone))
+                continue
             quick = ps.is_quick(command)
             argv = [sys.executable, os.path.abspath(__file__), "heavy", "--wait-max", str(args.wait_max if args.wait_max is not None else 600)]
             argv += (["--quick"] if quick else ["--ceiling", str(args.ceiling)] if args.ceiling else []) + ["--"] + command
@@ -26653,13 +26659,44 @@ def cmd_preflight_pr(args, runner, now):
         if not base:
             sys.stderr.write("%s: preflight-pr --merged: no base branch found\n" % PROG)
             return EXIT_USAGE
+        try:
+            added = ps.added_paths(root, base, runner)
+        except ps.PathSuitesError:
+            added = []
         with ps.Merged(root, base, runner) as merged:
             if merged.problem:
                 print("FAIL: %s" % merged.problem)
                 return EXIT_ERROR
             args.merged = False
-            return cmd_preflight_pr_in(args, runner, now, merged.path)
+            code = cmd_preflight_pr_in(args, runner, now, merged.path)
+            return EXIT_ERROR if run_new_bin_guards(ps, runner, merged.path, added, now) and code == EXIT_OK else code
     return cmd_preflight_pr_in(args, runner, now, root)
+
+
+def run_new_bin_guards(ps, runner, root, added, now):
+    """#1045: a change that ADDS a file under bin/ must pass the four guards of path_suites.NEW_BIN_GUARDS: each runs under `heavy` in `root`, one PASS or FAIL line each;
+    a guard that is not in the tree is said plainly (CANNOT RUN) and counts as a failure. Returns the number that did not pass."""
+    rows = ps.guard_rows(added)
+    if not rows:
+        return 0
+    print("preflight-pr: new file under bin/ (%s): the %d guards every new bin file must pass" % (", ".join(added), len(rows)))
+    guards, failed = {tuple(ps.guard_command(g)): g for g in ps.NEW_BIN_GUARDS}, 0
+    for _suite, _classes, command, _why in rows:
+        guard = guards[tuple(command)]
+        gone = ps.guard_missing(root, guard)
+        if gone:
+            failed += 1
+            print("CANNOT RUN %s: %s: %s" % (guard[0], " ".join(command), gone))
+            continue
+        started = now()
+        sys.stderr.write("preflight-pr: %s: waiting for a slot, then running\n" % guard[0])
+        done = runner([sys.executable, os.path.abspath(__file__), "heavy", "--"] + list(command), cwd=root, capture_output=True, text=True)
+        verdict = "PASS" if done.returncode == 0 else ("NOSLOT" if done.returncode == 75 else "FAIL")
+        if done.returncode != 0:
+            sys.stderr.write("".join(("%s: %s\n" % (guard[0], line)) for line in ((done.stdout or "") + (done.stderr or "")).splitlines()[-15:]))
+        failed += verdict != "PASS"
+        print("%s %s (%ds): %s" % (verdict, guard[0], max(0, int(now() - started)), " ".join(command)))
+    return failed
 
 
 def cmd_preflight_pr_in(args, runner, now, root):
