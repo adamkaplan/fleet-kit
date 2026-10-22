@@ -36168,6 +36168,28 @@ class TestWholeRead(LedgerBase):
         self.assertEqual((entry["verdict"], entry["files_read"], entry["files_total"]), ("incomplete", 1, 3))
         self.assertEqual(sb.plan_ledger.review_records_at(self.ledger(), self.PR, LEDGER_HEAD)["recorded"]["impact"], "incomplete")
 
+    def test_1047_a_malformed_or_duplicate_files_read_row(self):
+        path = self.world.state / "block.txt"
+        for verdict, expect in (("approve", 2), ("incomplete", 0)):
+            path.write_text("verdict: %s\nhead: %s\nimpact-action: none\nfiles-read:\n- src/a.py | many | 30\nfindings:\n" % (verdict, LEDGER_HEAD))
+            code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))
+            self.assertEqual(code, expect, err)
+            if expect == 2:
+                self.assertIn("is not `- <path>", err)
+        self.assertIsNone(sb.whole_read_problem([("a", 5, 5), ("a", 3, 5)], ["a"]))   # the fuller of two rows for one path counts
+        self.assertIn("line 4", sb.whole_read_problem([("a", 3, 5), ("a", 3, 5)], ["a"]))
+
+    def test_1047_an_uncited_mark_is_replaced_by_a_later_record_and_shown_in_the_state_line(self):
+        uncited = "- no rule here | block | src/a.py:4 | vague | fix it\n"
+        self.assertEqual(self.record(self.WHOLE, verdict="request-changes", findings=uncited, reviewer="code")[0], 0)
+        self.assertEqual(self.record(self.WHOLE, verdict="request-changes", findings=uncited, reviewer="code")[0], 0)
+        self.assertEqual(sb.plan_ledger.review_records_at(self.ledger(), self.PR, LEDGER_HEAD)["uncited"], ["code"])
+        view = {"pr": self.PR, "known": True, "state": "OPEN", "head": LEDGER_HEAD, "reviews": [{"reviewer": "code", "verdict": "request-changes", "uncited": True}], "checks": None,
+                "gates": None, "labels": [], "age_seconds": 1, "examined_head": None, "examined_age_seconds": None}
+        self.assertIn("code request-changes (names no rule)", sb.pr_state_line(view))
+        self.assertEqual(self.record(self.WHOLE, verdict="approve", reviewer="code")[0], 0)
+        self.assertEqual(sb.plan_ledger.review_records_at(self.ledger(), self.PR, LEDGER_HEAD)["uncited"], [])
+
     def test_s12_a_head_that_is_not_the_pull_requests_is_refused_naming_both_full_heads(self):
         for given in (self.HEAD2, LEDGER_HEAD[:7] + "f" * 33):
             code, out, err = self.record(self.WHOLE, head=given)
@@ -36249,7 +36271,7 @@ class TestWholeRead(LedgerBase):
         for path in (REPO / "docs" / "switchboard.md", REPO / "skills" / "fleet-review" / "SKILL.md"):
             self.assertEqual(path.read_text().count("is recorded exactly as given"), 1, path.name)
 
-    def test_s11_the_checkout_writes_the_matrix_words_and_one_diff_per_file(self):
+    def test_s11_the_matrix_words_name_every_floor_rule_and_the_checkout_writes_them(self):
         words = "\n".join(sb.impact_matrix_lines(sb.impact_matrix_words()))
         self.assertEqual(sum(1 for line in words.splitlines() if line.startswith("floor rule ")), 3)
         for rule in ("floor-credentials", "floor-identity", "floor-authority"):
@@ -68862,6 +68884,20 @@ class TestReviewCheckout(LedgerBase):
         self.assertIn("-one\n+one changed", diff)
         self.assertIn("+++ b/new.txt", diff)
         self.assertNotIn("same.txt", diff)
+
+    def test_1047_the_directory_holds_one_diff_per_changed_file_and_the_matrix_words(self):
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        self.assertEqual(self.files(root / "diffs"), ["a.txt.diff", "new.txt.diff"])
+        self.assertIn("-one\n+one changed", (root / "diffs" / "a.txt.diff").read_text())
+        self.assertEqual((root / "impact-matrix.txt").read_text(), "\n".join(sb.impact_matrix_lines(sb.impact_matrix_words())) + "\n")
+
+    def test_1047_an_unreadable_matrix_leaves_the_checkout_without_the_matrix_file(self):
+        with mock.patch.object(sb, "impact_matrix_words", side_effect=sb.impact_floor.MatrixError("unreadable")):
+            code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        self.assertFalse((Path(out.strip()) / "impact-matrix.txt").exists())
 
     @unittest.skipIf(os.geteuid() == 0, "root can write anything")
     def test_s2_every_file_and_directory_is_read_only(self):

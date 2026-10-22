@@ -371,7 +371,8 @@ def review_records_at(entries, pr, head, expected=REVIEWERS_NOW):
         if entry.get("kind") == "review_record" and entry.get("pr") == pr and entry.get("head") == head and entry.get("reviewer") in expected:
             recorded[entry["reviewer"]] = entry.get("verdict")
             if entry.get("uncited") is True and entry.get("verdict") == "request-changes":
-                uncited.append(entry["reviewer"])
+                if entry["reviewer"] not in uncited:
+                    uncited.append(entry["reviewer"])
             elif entry["reviewer"] in uncited:
                 uncited.remove(entry["reviewer"])
     return {"expected": list(expected), "recorded": recorded, "uncited": uncited, "missing": [r for r in expected if r not in recorded]}
