@@ -75,9 +75,14 @@ class Case(unittest.TestCase):
 
     def check_report(self, module):
         post = Post({"status": 200})
-        ok, _ = module.report("w1", "done", post, token_path=str(self.path))
+        ok, _ = module.report("w1", "o1", "done", post, token_path=str(self.path))
         b = post.requests[0]["body"]
-        return ok and b["recipient"] == "captain" and b["text"] == "report: done" and b["sender"] == "w1"
+        return ok and b["recipient"] == "o1" and b["text"] == "report: done" and b["sender"] == "w1"
+
+    def check_report_boss(self, module):
+        post = Post({"status": 200})
+        module.report("w1", "o7", "done", post, token_path=str(self.path))
+        return post.requests[0]["body"]["recipient"] == "o7"
 
     CHECKS = [
         ("check_token_at_call_time", "token = _read_token(token_path)", "token = _CACHE.setdefault('t', _read_token(token_path))"),
@@ -85,6 +90,7 @@ class Case(unittest.TestCase):
         ("check_auth_line", "if status in (401, 403):", "if status in (999,):"),
         ("check_no_token_in_errors", 'return False, "cloud channel: no token file"', 'return False, "cloud channel: no token file"'),
         ("check_report", '"report: " + text', "text"),
+        ("check_report_boss", "return send(sender, boss,", 'return send(sender, "captain",'),
     ]
 
 

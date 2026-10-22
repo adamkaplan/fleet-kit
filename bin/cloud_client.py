@@ -10,14 +10,13 @@ Rules:
       never printed, never in an error line.
     - A key is made once per message (or given) and reused on every retry, so the channel delivers it once.
     - 401 and 403 are one-line errors that name the status and the channel's reason, with no token.
-    - A report is a message to the recipient "captain" with the text prefixed "report: ".
+    - A report is a message to the boss the caller names, with the text prefixed "report: ".
 """
 import re
 import uuid
 
 TOKEN_PATH = "/var/run/secrets/tokens/fleet-switchboard"
 RETRIES = 3
-REPORT_TO = "captain"
 
 
 def _read_token(path):
@@ -61,6 +60,6 @@ def send(sender, recipient, text, post, key=None, token_path=TOKEN_PATH, retries
     return False, "cloud channel unavailable (status %s: %s) after %d tries" % (_clean(status), _clean(reason), max(1, retries))
 
 
-def report(sender, text, post, key=None, token_path=TOKEN_PATH, retries=RETRIES):
-    """Report to the captain through the same channel."""
-    return send(sender, REPORT_TO, "report: " + text, post, key, token_path, retries)
+def report(sender, boss, text, post, key=None, token_path=TOKEN_PATH, retries=RETRIES):
+    """Report to `boss`, the one the sender reports to (named by the caller, no default), through the same channel."""
+    return send(sender, boss, "report: " + text, post, key, token_path, retries)
