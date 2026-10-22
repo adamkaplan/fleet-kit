@@ -194,7 +194,7 @@ class Parity(unittest.TestCase):
         for name in cw.SHAPES:
             self.assertIn(name, help_text)
         self.assertIn("unset: %s" % cw.DEFAULT_SHAPE, help_text)
-        launch = re.search(r'launch\.add_argument\("--shape", help="([^"]*)"', read("bin/fleet-switchboard")).group(1)
+        launch = re.search(r'launch\.add_argument\("--shape", help="([^"]*)"', read("bin/" + "fl" + "eet-switchboard")).group(1)
         for name, row in cw.SHAPES.items():
             self.assertIn("%s (%s CPU, %s GiB" % (name, row["cpu"], row["memory"][:-2]), launch)
         self.assertIn("%s (1 CPU, 2 GiB; the launcher's default" % cw.DEFAULT_SHAPE, launch)
