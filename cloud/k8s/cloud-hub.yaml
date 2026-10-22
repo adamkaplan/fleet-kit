@@ -121,6 +121,11 @@
             "type": "RuntimeDefault"
           }
         },
+        "imagePullSecrets": [
+          {
+            "name": "cw-pull"
+          }
+        ],
         "containers": [
           {
             "name": "hub",

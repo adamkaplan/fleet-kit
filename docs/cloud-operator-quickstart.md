@@ -236,6 +236,7 @@ Before you apply: replace the placeholder `IMAGE_DIGEST` with the settings' `CW_
 
 - Apply order: Secrets, then Service, then Deployment (the file lists them in that order).
 - Check (server dry run): `kubectl -n cw apply --dry-run=server -f cloud/k8s/cloud-hub.yaml`
+- Pull secret: the Deployment pulls its image with the secret `cw-pull`, which must exist in the namespace (the launcher's `CW_PULL_SECRET`).
 - Apply: `kubectl -n cw apply -f cloud/k8s/cloud-hub.yaml` (order in the file: Secrets, Services, Deployment)
 - Delay: kubelet refreshes mounted Secret contents within about a minute, so a newly launched agent can need up to ~60 s before it can message through the hub.
 - Smoke check: the hub has no unauthenticated health path (`GET /decisions` needs a token), so readiness is a TCP check on 8443. From a pod in `cw`, `nc -z cloud-hub 8443` must succeed.

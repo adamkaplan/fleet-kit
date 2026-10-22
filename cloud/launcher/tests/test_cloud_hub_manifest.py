@@ -53,6 +53,7 @@ class T(unittest.TestCase):
         sp = d["spec"]["template"]["spec"]
         c = sp["containers"][0]
         self.assertEqual(d["spec"]["replicas"], 1)
+        self.assertEqual(sp["imagePullSecrets"], [{"name": "cw-pull"}])
         self.assertIs(sp["automountServiceAccountToken"], False)
         self.assertTrue(sp["securityContext"]["runAsNonRoot"])
         self.assertEqual(c["securityContext"]["capabilities"], {"drop": ["ALL"]})
