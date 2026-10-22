@@ -19622,6 +19622,8 @@ def _send_by_registry(args, runner, now):
     if found[0] in ("pane", "none"):
         return None
     if found[0] == "half":
+        if not found[2]:
+            return None   # the recipient is not known to be an endpoint row: the old path serves a pane agent, or finds nothing
         sys.stderr.write("%s: not sent: %s\n" % (PROG, found[1]))
         return EXIT_HELD
     engine, _, config = build_engine(runner, now, "cli")
