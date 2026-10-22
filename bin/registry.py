@@ -408,7 +408,7 @@ def endpoint_problem(fields):
 
 
 def route_for(row):
-    """Where a message to this agent goes: its pane when it has one (as before), else its registry endpoint; None when neither."""
+    """Where a message to this agent WOULD go (a function only: send does not call it yet): its pane when it has one (as before), else its registry endpoint; None when neither."""
     if not isinstance(row, dict):
         return None
     if row.get("pane") is not None:

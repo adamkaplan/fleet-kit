@@ -6838,7 +6838,7 @@ def retired_agent(retired, name, session):
 
 
 def registry_route(state_dir, name):
-    """Where a message to `name` goes by the registry (#1074): its pane when it has one (as before), else its registry endpoint; None on a half read or an unknown agent."""
+    """Where a message to `name` would go by the registry (#1074; a function only, send does not call it yet): its pane when it has one (as before), else its registry endpoint; None on a half read or an unknown agent."""
     registry = load_module("registry")
     reg = registry.read(state_dir)
     row = reg["agents"].get(name) if reg["whole"] else None

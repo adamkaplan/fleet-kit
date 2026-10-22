@@ -73285,7 +73285,7 @@ class TestCoderBooks(Base):
 
 
 class TestRegistryEndpoint(unittest.TestCase):
-    """#1074 (slice 3 of #1059): an agent without a pane has an endpoint, a liveness rule and a route; the row projections come from one tuple."""
+    """#1074 (slice 3 of #1059): an agent without a pane has an endpoint, a liveness rule and a route function (not yet used by send); the row projections come from one tuple."""
 
     LOCAL = {"session": "ses_l", "pane": "p_1", "role": "coder", "repo": "o/r", "workspace": "w", "cwd": "/x"}
     CLOUD = {"session": "ses_c", "role": "orchestrator", "kind": "orchestrator", "endpoint": "https://pod.example/agent"}
@@ -73353,13 +73353,13 @@ class TestRegistryEndpoint(unittest.TestCase):
         self.assertEqual(len([l for l in self.audit() if l.get("event") == "reconcile_remove"]), 1)
         self.assertEqual(sorted(self.reg.read(self.dir)["agents"]), ["local"])
 
-    def test_s6_routes(self):
+    def test_s6_route_function(self):
         self.both()
         agents = self.reg.read(self.dir)["agents"]
         self.assertEqual(self.reg.route_for(agents["pod"]), {"via": "endpoint", "to": self.CLOUD["endpoint"]})
         self.assertEqual(self.reg.route_for(agents["local"]), {"via": "pane", "to": "p_1"})
 
-    def test_s6_registry_route_wiring_and_local_baseline(self):
+    def test_s6_registry_route_function_and_local_baseline(self):
         self.both()
         self.assertEqual(sb.registry_route(self.dir, "pod"), {"via": "endpoint", "to": self.CLOUD["endpoint"]})
         self.assertEqual(sb.registry_route(self.dir, "local"), {"via": "pane", "to": self.LOCAL["pane"]})   # the stored baseline: byte for byte
