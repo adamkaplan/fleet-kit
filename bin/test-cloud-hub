@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""test-cloud-hub: offline tests for bin/cloud_hub.py (issue 1148).
+
+Fakes: the TokenReview call (injected http) and an agent API on 127.0.0.1. Mutants change the module source in one place.
+
+    bin/test-cloud-hub
+"""
+import http.client
+import io
+import json
+import sys
+import tempfile
+import threading
+import types
+import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+sys.path.insert(0, str(BIN))
+SOURCE = (BIN / "cloud_hub.py").read_text()
+
+
+def load(source=SOURCE):
+    module = types.ModuleType("cloud_hub_under_test")
+    exec(compile(source, "cloud_hub.py", "exec"), module.__dict__)
+    return module
+
+
+def mutant(old, new):
+    assert SOURCE.count(old) == 1, old
+    return load(SOURCE.replace(old, new))
+
+
+USERS = {"tok-a": "agent-a", "tok-b": "agent-b"}
+
+
+def fake_kube(calls):
+    def http_call(url, headers, data, timeout):
+        body = json.loads(data)
+        calls.append((url, headers, body, timeout))
+        name = USERS.get(body["spec"]["token"])
+        if name is None:
+            return {"status": {"authenticated": False}}
+        return {"status": {"authenticated": True, "audiences": body["spec"]["audiences"],
+                           "user": {"username": "system:serviceaccount:fleet-agents:" + name}}}
+    return http_call
+
+
+class AgentApi:
+    def __init__(self, status=200):
+        self.got, outer = [], self
+        self.status = status
+
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", "0"))
+                outer.got.append((self.path, self.headers.get("Authorization"), json.loads(self.rfile.read(n))))
+                self.send_response(outer.status)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *a):
+                pass
+        self.server = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = "http://127.0.0.1:%d" % self.server.server_address[1]
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class Hub:
+    def __init__(self, module, agent_status=200):
+        self.tmp = tempfile.TemporaryDirectory()
+        t = Path(self.tmp.name)
+        (t / "sa").mkdir()
+        (t / "sa" / "token").write_text("hub-own-token\n")
+        (t / "pw").write_text("s3cret\n")
+        self.api = AgentApi(agent_status)
+        self.agents = t / "agents.json"
+        self.agents.write_text(json.dumps({"agent-b": {"url": self.api.url, "session": "ses_1", "password_file": str(t / "pw"),
+                                                       "issue": 7}}))
+        self.decisions = t / "decisions.json"
+        self.calls, self.lines = [], []
+        reviewer = module.make_reviewer(fake_kube(self.calls), audience="aud-x", sa_dir=str(t / "sa"))
+        self.inbox = module.Inbox(str(self.agents), timeout=2)
+        self.server = module.make_hub(("127.0.0.1", 0), reviewer, self.inbox, self.lines.append, str(self.decisions))
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+        self.api.close()
+        self.tmp.cleanup()
+
+    def call(self, method, path, body=None, token="tok-a"):
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
+        h = {"Authorization": "Bearer " + token} if token else {}
+        try:
+            conn.request(method, path, body=json.dumps(body).encode() if body is not None else None, headers=h)
+            r = conn.getresponse()
+            return r.status, json.loads(r.read() or b"null")
+        finally:
+            conn.close()
+
+    def send(self, recipient="agent-b", key="k1", sender="agent-a", token="tok-a", text="hello"):
+        return self.call("POST", "/message", {"sender": sender, "recipient": recipient, "key": key, "text": text}, token)
+
+
+class TestHub(unittest.TestCase):
+    def test_delivers_as_a_prompt_with_fleet_metadata(self):
+        with Hub(load()) as hub:
+            status, body = hub.send()
+            self.assertEqual((status, body["delivered"]), (200, True))
+            path, auth, data = hub.api.got[0]
+            self.assertEqual(path, "/api/session/ses_1/prompt")
+            self.assertEqual(auth, "Basic b3BlbmNvZGU6czNjcmV0")
+            self.assertEqual(data["delivery"], "queue")
+            self.assertEqual(data["text"], "hello")
+            self.assertEqual(data["metadata"]["fleet"]["from"], "agent-a")
+            self.assertEqual(data["metadata"]["fleet"]["issue"], 7)
+            url, headers, review, _ = hub.calls[0]
+            self.assertTrue(url.endswith("/tokenreviews"))
+            self.assertEqual(headers["Authorization"], "Bearer hub-own-token")
+            self.assertEqual(review["spec"]["audiences"], ["aud-x"])
+
+    def test_duplicate_key_delivers_once(self):
+        with Hub(load()) as hub:
+            hub.send()
+            status, body = hub.send()
+            self.assertEqual((status, body["duplicate"]), (200, True))
+            self.assertEqual(len(hub.api.got), 1)
+
+    def test_sender_is_the_token_not_the_body(self):
+        with Hub(load()) as hub:
+            self.assertEqual(hub.send(sender="agent-b")[0], 403)
+            self.assertEqual(hub.api.got, [])
+
+    def test_bad_token_is_401(self):
+        with Hub(load()) as hub:
+            self.assertEqual(hub.send(token="nope")[0], 401)
+            self.assertEqual(hub.api.got, [])
+
+    def test_agent_not_in_the_map_is_404(self):
+        with Hub(load()) as hub:
+            self.assertEqual(hub.send(recipient="agent-z")[0], 404)
+            self.assertEqual(hub.api.got, [])
+
+    def test_failing_agent_is_503_and_retry_delivers(self):
+        with Hub(load(), agent_status=500) as hub:
+            self.assertEqual(hub.send()[0], 503)
+            hub.api.status = 200
+            self.assertEqual(hub.send()[1]["delivered"], True)
+
+    def test_decisions(self):
+        with Hub(load()) as hub:
+            self.assertEqual(hub.call("GET", "/decisions"), (200, {"decisions": [], "errors": []}))
+            hub.decisions.write_text(json.dumps({"decisions": [{"id": 1}], "errors": []}))
+            self.assertEqual(hub.call("GET", "/decisions")[1]["decisions"], [{"id": 1}])
+            self.assertEqual(hub.call("GET", "/decisions", token="nope")[0], 401)
+            self.assertEqual(hub.call("GET", "/decisions", token=None)[0], 401)
+            self.assertEqual(hub.call("GET", "/other")[0], 404)
+
+    def test_no_token_in_audit(self):
+        with Hub(load()) as hub:
+            hub.send()
+            hub.send(token="nope")
+            hub.send(recipient="agent-z", key="k2")
+            hub.call("GET", "/decisions")
+            text = "\n".join(hub.lines)
+            for secret in ("tok-a", "nope", "hub-own-token", "s3cret"):
+                self.assertNotIn(secret, text)
+
+    def test_audit_is_json_lines(self):
+        module, out = load(), io.StringIO()
+        module.json_audit(out)("delivered x")
+        self.assertEqual(json.loads(out.getvalue())["line"], "delivered x")
+
+    def test_starts_only_when_listen_is_set(self):
+        module = load()
+        self.assertFalse(module.serve({}))
+        self.assertFalse(module.serve({"FLEET_CLOUD_CHANNEL_LISTEN": "garbage"}))
+
+
+class TestMutants(unittest.TestCase):
+    def fails(self, module, check):
+        try:
+            with Hub(module) as hub:
+                check(hub)
+        except AssertionError:
+            return
+        self.fail("mutant survived")
+
+    def test_trusts_the_body_sender(self):
+        module = mutant('        return status\n    return reviewer',
+                        '        status["user"] = {"username": "system:serviceaccount:fleet-agents:agent-b"}\n        return status\n    return reviewer')
+        self.fails(module, lambda hub: self.assertEqual(hub.send(sender="agent-b")[0], 403))
+
+    def test_delivers_to_an_agent_not_in_the_map(self):
+        module = mutant("            raise Refused(recipient)",
+                        "            record = {'url': self.fallback, 'session': 'x', 'password_file': self.pw}")
+        def check(hub):
+            hub.inbox.fallback, hub.inbox.pw = hub.api.url, str(Path(hub.tmp.name) / "pw")
+            self.assertEqual(hub.send(recipient="agent-z")[0], 404)
+        self.fails(module, check)
+
+    def test_starts_by_default(self):
+        module = mutant("    if address is None:\n        return False",
+                        "    address = address or ('127.0.0.1', 0)\n    if False:\n        return False")
+        self.assertTrue(module.serve.__code__.co_consts)   # the real guard is proved below
+        self.assertFalse(load().serve({}))
+        started = []
+        module.make_hub = lambda *a: types.SimpleNamespace(serve_forever=lambda: started.append(1))
+        module.serve({}, reviewer=lambda *a: {}, inbox=object(), audit=print)
+        self.assertEqual(started, [1])     # the mutant starts with nothing set
+
+    def test_echoes_the_token(self):
+        module = mutant('audit("decisions served")', 'audit("decisions served " + header)')
+        def check(hub):
+            hub.call("GET", "/decisions")
+            self.assertNotIn("tok-a", "\n".join(hub.lines))
+        self.fails(module, check)
+
+    def test_decisions_without_token_review(self):
+        module = mutant('            if probe["status"] != 403:', "            if False:")
+        self.fails(module, lambda hub: self.assertEqual(hub.call("GET", "/decisions", token="nope")[0], 401))
+
+
+if __name__ == "__main__":
+    unittest.main()
