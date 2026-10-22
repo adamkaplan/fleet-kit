@@ -182,7 +182,7 @@ Nothing is created when it stops. The check's own output is never printed.
 ## 3. Run one worker
 
 ```text
-fleet-switchboard launch coder7 --cloud --agent worker --repo acme-org/widget-service --branch main \
+fleet-switchboard launch coder7 --cloud --agent coder --repo acme-org/widget-service --branch main \
   --role coder --reports-to orch --brief-file /home/user/brief.txt
 fleet-switchboard send coder7 "one more instruction"
 fleet-switchboard read coder7

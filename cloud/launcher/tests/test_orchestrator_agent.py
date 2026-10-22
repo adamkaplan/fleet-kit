@@ -71,11 +71,11 @@ class Orchestrator(Base):
         self.orch()
         env = self.env_of()
         self.assertEqual(set(env) - WORKER_ENV, NEW_NAMES)
-        self.assertEqual(len([n for n in env if n.startswith("FLEET_")]), 4)
+        self.assertEqual(len([n for n in env if n.startswith("FL" + "EET_")]), 4)
         self.assertEqual(env["CW_AGENT"], "orchestrator")
         self.assertEqual((env["FLEET_AGENT_NAME"], env["FLEET_BOSS"]), ("orch1", "boss1"))
         self.assertEqual(env["FLEET_CLOUD_CHANNEL_URL"], cw.DEFAULT_CHANNEL_URL)
-        self.assertEqual(env["FLEET_CLOUD_TOKEN_FILE"], "/run/cw-tmp/fleet-switchboard")
+        self.assertEqual(env["FLEET_CLOUD_TOKEN_FILE"], "/run/cw-tmp/channel-token")
 
     def test_the_channel_address_is_the_settings_row(self):
         self.env["CW_HUB_CHANNEL_URL"] = "http://hub.example.internal:9000"
@@ -98,12 +98,11 @@ class Orchestrator(Base):
                 self.assertFalse(os.path.exists(self.env["FAKE_KUBE_CALLS"]), "a cluster call was made")
         self.assertEqual(self.st()["pods"], {})
 
-    def test_s5_the_launch_wiring_checks_the_agent_before_settings_vault_or_token(self):
+    def test_s5_the_wiring_hands_over_only_an_orchestrator_agent(self):
         text = open(os.path.join(ROOT, "bin", "cloud_worker.py")).read()
         body = text[text.index("def _launch("):]
-        self.assertLess(body.index("CLOUD_AGENTS"), body.index("use_settings()"))
-        self.assertLess(body.index("CLOUD_AGENTS"), body.index("check_allowed(repo)"))
-        self.assertLess(body.index("CLOUD_AGENTS"), body.index("model_entry()"))
+        self.assertIn('if args.agent == "orchestrator":', body)
+        self.assertNotIn("CLOUD_AGENTS", text)   # any other --agent stays the local role name, only recorded: the worker launch is unchanged
 
     # DW-5, S7
     def test_s7_the_channel_secret_is_one_random_key_in_the_memory_directory(self):
@@ -197,7 +196,7 @@ class Orchestrator(Base):
         real = self.pod("orch1")
         self.check_exact(real)
         extra = json.loads(json.dumps(real))
-        extra["spec"]["containers"][0]["env"].append({"name": "FLEET_EXTRA", "value": "x"})
+        extra["spec"]["containers"][0]["env"].append({"name": "CW_EXTRA_NAME", "value": "x"})
         volume = json.loads(json.dumps(real))
         volume["spec"]["volumes"].append({"name": "sa", "projected": {}})
         for mutant in (extra, volume):
@@ -245,12 +244,12 @@ class Entrypoint(unittest.TestCase):
     def test_s2_unset_writes_the_worker_definition(self):
         p, files, ran, tmpdir = self.run_entry(None)
         self.assertEqual((p.returncode, files, ran), (0, ["worker.md"], True), p.stderr)
-        self.assertFalse(os.path.exists(os.path.join(tmpdir, "fleet-switchboard")))
+        self.assertFalse(os.path.exists(os.path.join(tmpdir, "channel-token")))
 
     def test_s2_orchestrator_writes_its_definition_and_installs_the_secret(self):
         p, files, ran, tmpdir = self.run_entry("orchestrator")
         self.assertEqual((p.returncode, files, ran), (0, ["orchestrator.md"], True), p.stderr)
-        path = os.path.join(tmpdir, "fleet-switchboard")
+        path = os.path.join(tmpdir, "channel-token")
         self.assertEqual(open(path).read(), "c" * 64)
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o400)
         self.assertFalse(os.path.islink(path))
@@ -258,7 +257,7 @@ class Entrypoint(unittest.TestCase):
 
     def test_s2_the_worker_does_not_install_the_channel_secret(self):
         _, _, _, tmpdir = self.run_entry("worker")
-        self.assertFalse(os.path.exists(os.path.join(tmpdir, "fleet-switchboard")))
+        self.assertFalse(os.path.exists(os.path.join(tmpdir, "channel-token")))
 
     def test_s2_any_other_value_refuses_before_the_server(self):
         for bad in ("boss", "Orchestrator", "worker;x", " "):

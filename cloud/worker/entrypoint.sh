@@ -69,7 +69,7 @@ XDG_CONFIG_HOME="$cfgdir"; export XDG_CONFIG_HOME
 
 # an orchestrator only: the per-pod channel secret goes from the per-run Secret to the memory-backed file the cloud command reads (a copy, 0400, never printed)
 if [ "$AGENT" = orchestrator ] && usable channel-secret; then
-  install -m 0400 "$RUN/channel-secret" "$TMP/fleet-switchboard"
+  install -m 0400 "$RUN/channel-secret" "$TMP/channel-token"
 fi
 
 if usable git-token; then
