@@ -1618,8 +1618,14 @@ class Launcher:
             info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
             if ann(pod, "hook-ran") != "true" and not a.force:
                 raise CloudError("end hook has not run; use --force to delete anyway", EXIT_REFUSED)
+            uid = (pod.get("metadata") or {}).get("uid")
             try:
-                self.kube.delete(name, (pod.get("metadata") or {}).get("uid"))
+                if ann(pod, "workload"):   # a persistent role: the workload FIRST, then its pod, then the Secrets
+                    pn = (pod.get("metadata") or {}).get("name") or name + "-0"
+                    self._remove_persistent(ann(pod, "workload"), pn, None, uid)
+                    name_ = "pod/" + pn
+                    return {"worker": worker, "runtime_id": name_, "deleted": True}
+                self.kube.delete(name, uid)
             except PodChanged:
                 raise CloudError("pod/%s changed since it was read; left whole (run delete again)" % name, EXIT_REFUSED)
             return {"worker": worker, "runtime_id": "pod/" + name, "deleted": True}

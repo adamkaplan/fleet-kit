@@ -34,7 +34,7 @@ used, because it moves when you work in other clusters.
 
 ## Service-account login, per-run secrets, image pull secret
 With `CW_CLOUD_SERVER` and `CW_CLOUD_TOKEN_FILE` set (and optionally `CW_CLOUD_CA_FILE`) the launcher logs in as the
-`cw-operator` account of `cloud/k8s/operator-rbac.yaml` (one namespaced Role: pods, logs, exec, port-forward, secrets; no
+`cw-operator` account of `cloud/k8s/operator-rbac.yaml` (one namespaced Role: pods, logs, exec, port-forward, secrets, and statefulsets with get, list, watch, create, delete for a persistent role; no
 wildcard, nothing cluster-wide). Every `kubectl` call carries a generated `--kubeconfig` (mode 0600, private temp dir, removed at
 exit) whose only credential is the token file's path. It never uses `--token` or an administrator kubeconfig, and refuses
 if `CW_KUBECONFIG` or `CW_KUBE_CONTEXT` is also set. A missing or unreadable token file exits 3 (`token unavailable`) with no call.
@@ -42,6 +42,8 @@ if `CW_KUBECONFIG` or `CW_KUBE_CONTEXT` is also set. A missing or unreadable tok
 `create --pull-secret NAME` sets `imagePullSecrets`. `create --run-secret-fd NAME=N` (repeatable) reads each value once from
 descriptor `N`, pipes it to `kubectl` on stdin into one Secret `<pod>-run`, and mounts it read-only at `/run/cw/NAME` (0400).
 The Secret goes with the pod at `stop`, `delete` and a failed or interrupted `create`; a pod kept because the end hook failed keeps it.
+
+After this change merges, an operator must apply the manifest (`kubectl apply -f cloud/k8s/operator-rbac.yaml`) on the owner's word; until then `launch --role orchestrator` is forbidden on the real cluster.
 
 Accepted scope of the role: `cw-operator` can get and list every secret in the workers namespace (a Role cannot limit `list` by label), so the namespace must hold only worker pods and their per-pod secrets; that is enforced in the deployment repository, not here.
 

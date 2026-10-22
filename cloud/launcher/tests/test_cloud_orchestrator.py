@@ -442,6 +442,56 @@ class Mutants(Fx):   # DW-6 (S10): the same checks, run on a mutated copy of the
         self.kube.reconcile()
         self.assertNotEqual(self.kube.pods, {})   # the controller recreated it: the real stop does not do this (S5)
 
+    def test_delete_force_removes_the_workload_then_everything_and_reconcile_brings_nothing_back(self):
+        self.launch()
+        out = self.L.delete(argparse.Namespace(worker=WORKER, force=True, reason="x"))
+        self.assertTrue(out["deleted"])
+        self.kube.reconcile()
+        self.assertEqual((self.kube.pods, self.kube.sets, self.kube.secrets, self.kube.run_secrets), ({}, {}, {}, {}))
+
+    def test_mutant_a_delete_that_ignores_the_workload_leaves_it_running(self):
+        m = load_module("cloud_worker.py", "                if ann(pod, \"workload\"):   # a persistent role: the workload FIRST", "                if False:   # a persistent role: the workload FIRST")
+        self.launch()
+        m.Launcher(self.kube, self.env, self.clock).delete(argparse.Namespace(worker=WORKER, force=True, reason="x"))
+        self.kube.reconcile()
+        self.assertNotEqual((self.kube.pods, self.kube.sets), ({}, {}))   # the real delete leaves nothing
+
+
+class OperatorRole(unittest.TestCase):
+    """The cw-operator Role must grant every verb the launcher uses on a StatefulSet, and stay namespaced."""
+    RBAC = os.path.join(ROOT, "cloud", "k8s", "operator-rbac.yaml")
+
+    @staticmethod
+    def launcher_verbs(src):
+        verbs = set(re.findall(r'self\.run\(\["(\w+)", "statefulset"', src))
+        verbs.add("create")   # apply(): `kubectl create -f -` of the StatefulSet
+        if re.search(r'"delete", "statefulset"[^\n]*--wait=true', src):
+            verbs |= {"list", "watch"}   # kubectl's delete wait lists and watches the object
+        return {"delete" if v == "delete" else v for v in verbs}
+
+    @staticmethod
+    def granted(text):
+        out = set()
+        for rule in re.split(r"\n  - apiGroups:", text):
+            if re.match(r'\s*\["apps"\]', rule) and 'resources: ["statefulsets"]' in rule:
+                out |= set(re.findall(r'"(\w+)"', re.search(r"verbs: \[(.*?)\]", rule).group(1)))
+        return out
+
+    def test_every_launcher_verb_on_a_statefulset_is_granted(self):
+        need = self.launcher_verbs(open(os.path.join(LAUNCHER, "cloud_worker.py")).read())
+        self.assertTrue({"get", "create", "delete"} <= need)
+        self.assertEqual(need - self.granted(open(self.RBAC).read()), set())
+
+    def test_the_role_stays_namespaced(self):
+        text = open(self.RBAC).read()
+        self.assertNotIn("ClusterRole", text)
+        self.assertIn("kind: Role\n", text)
+
+    def test_mutant_a_dropped_verb_is_caught(self):
+        text = open(self.RBAC).read().replace('verbs: ["get", "list", "watch", "create", "delete"]', 'verbs: ["get", "list", "watch", "create"]')
+        need = self.launcher_verbs(open(os.path.join(LAUNCHER, "cloud_worker.py")).read())
+        self.assertNotEqual(need - self.granted(text), set())
+
 
 class Docs(unittest.TestCase):   # DW-7 (S11)
     FILES = ("cloud/README.md", "cloud/launcher/README.md", "docs/cloud-operator-quickstart.md")
