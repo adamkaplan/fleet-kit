@@ -23179,8 +23179,8 @@ def _impact_unpathed_judge(engine, now, repo, number, head, rule, enforce, recor
     is written by the same `apply_impact_hold` the floor uses, once per (pull request, head, rating), audited `gate.would_hold`. A pull request with no such rating costs no gh read, unless the
     daemon holds it or an owner's clear of an earlier head is on record: then the existing re-hold and release rules decide (only labels the daemon added, only on a whole read). No path rule
     applies. Returns (gh calls spent, 1 when the pull request could not be judged this pass else 0). Never raises."""
-    if not enforce or records_problem:
-        return 0, 0   # a release is a LOOSENING and an advisory repo writes nothing: nothing is added or removed on a failed read
+    if records_problem:
+        return 0, 0   # a release is a LOOSENING: nothing is added or removed on a failed read
     pr = "%s#%d" % (repo, number)
     rating = records.get((pr, head))
     signature = (head, rule, rating)
@@ -23188,6 +23188,11 @@ def _impact_unpathed_judge(engine, now, repo, number, head, rule, enforce, recor
         return 0, 0
     try:
         holds = bool(rating and rating[0] == "hold" and impact_floor.class_is_top_tier(impact_floor._matrix_cached(), rating[1]))
+        if not enforce:   # advisory (`dry_run`): the same audit as the floor's, advisory, and nothing is read or written
+            if holds:
+                engine.audit.append(engine.actor, "gate.would_hold", pr, {"head": head, "reasons": [IMPACT_UNPATHED_REASON], "floor_paths": [], "advisory": True, "unknown": None})
+            seen[(repo, number)] = signature
+            return 0, 0
         state, problem = read_impact_state(engine.state_dir)
         if not holds and (problem or (pr not in state["applied"] and pr not in state["clears"])):
             return 0, 0   # nothing of ours on it, no rating: not read, not written
@@ -23199,8 +23204,8 @@ def _impact_unpathed_judge(engine, now, repo, number, head, rule, enforce, recor
         spent = 0
         try:
             if holds:
+                engine.audit.append(engine.actor, "gate.would_hold", pr, {"head": head, "reasons": report["reasons"], "floor_paths": [], "advisory": False, "unknown": None})   # before the write, as the floor's
                 spent = apply_impact_hold(engine, repo, number, report, record)
-                engine.audit.append(engine.actor, "gate.would_hold", pr, {"head": head, "reasons": report["reasons"], "floor_paths": [], "advisory": False, "unknown": None})
                 reports[(repo, number)] = report
             else:
                 rehold = _impact_rehold_try(engine, repo, number, pr, report, record, now, seen)
