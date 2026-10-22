@@ -4519,7 +4519,7 @@ class Switchboard:
     def _discover(self, now, entries=None):
         found = Discovery()
         self.discovery = found
-        if entries is None and self.config.get("no_multiplexer") is True:   # records only: no terminal multiplexer is asked, so its absence is no standing problem
+        if entries is None and (getattr(self, "config", None) or {}).get("no_multiplexer") is True:   # records only: no terminal multiplexer is asked, so its absence is no standing problem
             self._discover_headless(found, now)
             return found
         if entries is None:
@@ -5058,7 +5058,7 @@ class Switchboard:
         """Write `unread` where it differs from what herdr's agent list shows."""
         shown = {entry.get("pane_id"): (entry.get("tokens") or {}).get("unread") for entry in discovery.entries}
         for name, observation in sorted(discovery.agents.items()):
-            if not observation.pane or self.config.get("no_multiplexer") is True:   # no pane, or no multiplexer to write to: no badge, no error
+            if not observation.pane or (getattr(self, "config", None) or {}).get("no_multiplexer") is True:   # no pane, or no multiplexer to write to: no badge, no error
                 continue
             try:
                 count = self.unread_count(observation, held)
@@ -5102,7 +5102,7 @@ class Switchboard:
         """At most one toast per pass (herdr allows one a second, and queues none),
         for the first agent whose reason has not been toasted yet. A reason
         that has cleared is forgotten, so it toasts again if it comes back."""
-        if self.config.get("no_multiplexer") is True:   # a toast is a multiplexer call and goes to no pane here: none is tried, none fails
+        if (getattr(self, "config", None) or {}).get("no_multiplexer") is True:   # a toast is a multiplexer call and goes to no pane here: none is tried, none fails
             return
         candidates = self.toast_candidates(discovery, held, now)
         self.toasted = {name: reason for name, reason in self.toasted.items()
@@ -7059,7 +7059,7 @@ def bell_migration(engine, registry, now):
     on a whole read only (agent list and tab list both answered); audited per agent; a marker file stops it from running, or reading herdr, again."""
     if registry.bell_migrated(engine.state_dir):
         return
-    if engine.config.get("no_multiplexer") is True:   # no terminal multiplexer is asked: the migration stays pending
+    if (getattr(engine, "config", None) or {}).get("no_multiplexer") is True:   # no terminal multiplexer is asked: the migration stays pending
         return
     try:
         agents, tabs = engine.herdr.agent_list(), engine.herdr.tab_list()
