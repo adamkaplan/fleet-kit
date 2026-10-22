@@ -73284,6 +73284,99 @@ class TestCoderBooks(Base):
         self.assertFalse(finished("nobody"))
 
 
+class TestRegistryEndpoint(unittest.TestCase):
+    """#1074 (slice 3 of #1059): an agent without a pane has an endpoint, a liveness rule and a route; the row projections come from one tuple."""
+
+    LOCAL = {"session": "ses_l", "pane": "p_1", "role": "coder", "repo": "o/r", "workspace": "w", "cwd": "/x"}
+    CLOUD = {"session": "ses_c", "role": "orchestrator", "kind": "orchestrator", "endpoint": "https://pod.example/agent"}
+
+    def setUp(self):
+        self.reg = sb.load_module("registry")
+        self.mod = sb.load_module("agent_reconcile")
+        self.dir = Path(tempfile.mkdtemp(prefix="ep"))
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def audit(self):
+        path = self.dir / "registry-audit.jsonl"
+        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+    def both(self):
+        self.reg.upsert(self.dir, "local", self.LOCAL)
+        self.reg.upsert(self.dir, "pod", self.CLOUD)
+
+    def test_s2_a_registry_with_both_reads_whole(self):
+        self.both()
+        read = self.reg.read(self.dir)
+        self.assertEqual((read["whole"], read["version"], sorted(read["agents"])), (True, 1, ["local", "pod"]))
+        self.assertEqual(read["agents"]["pod"]["endpoint"], self.CLOUD["endpoint"])
+
+    def test_s3_the_endpoint_reaches_every_projection_and_survives_retire_and_undo(self):
+        self.both()
+        row = self.reg.read(self.dir)["agents"]["pod"]
+        self.assertIn("endpoint", self.reg.AGENT_FIELDS)
+        self.assertIn("endpoint", self.reg.CHANGE_FIELDS)
+        changed = dict(row, endpoint="https://pod2.example/agent")
+        self.assertTrue(self.reg.upsert(self.dir, "pod", changed)["changed"])   # written when only the endpoint changes
+        self.reg.retire(self.dir, "pod", "boss", "done")
+        self.assertEqual(self.reg.read(self.dir)["retired"]["pod"]["record"]["endpoint"], "https://pod2.example/agent")
+        self.reg.unretire(self.dir, "pod")
+        self.assertEqual(self.reg.read(self.dir)["agents"]["pod"]["endpoint"], "https://pod2.example/agent")
+
+    def test_s4_every_row_field_is_in_all_three_projections_or_exempt(self):
+        names = {"discovery": self.reg.AGENT_FIELDS, "change": self.reg.CHANGE_FIELDS, "record": self.reg.RECORD_FIELDS}
+        for field in self.reg.ROW_FIELDS:
+            for projection, fields in names.items():
+                self.assertTrue((field in fields) != ((field, projection) in self.reg.EXEMPT), "%s / %s" % (field, projection))
+        for (field, projection), why in self.reg.EXEMPT.items():
+            self.assertIn(field, self.reg.ROW_FIELDS)
+            self.assertIn(projection, self.reg.PROJECTIONS)
+            self.assertTrue(why)
+        self.assertEqual(set(sb.RETIRED_RECORD_FIELDS), set(self.reg.RECORD_FIELDS) - set(self.reg.OPTIONAL_FIELDS))
+        saved = self.reg.ROW_FIELDS
+        self.addCleanup(setattr, self.reg, "ROW_FIELDS", saved)
+        self.reg.ROW_FIELDS = saved + ("added",)   # a field added to the row and to no table is in all three (derivation) unless exempt: derive again
+        self.assertIn("added", self.reg.fields_of("record"))
+
+    def test_s5_u5_a_no_pane_row_is_removed_only_on_a_dead_verdict_of_a_whole_read(self):
+        self.both()
+        def run(check, whole=True):
+            read = self.reg.read(self.dir)
+            read["whole"] = whole
+            return self.mod.reconcile_on_read(self.dir, read, lambda n, a: {"pane": True, "process": True}, self.reg, check)
+        self.assertEqual(run(None), [])                                   # default: unknown
+        self.assertEqual(run(lambda n, a: "unknown"), [])
+        self.assertEqual(run(lambda n, a: "unreachable"), [])
+        self.assertEqual(run(lambda n, a: 1 / 0), [])                     # a failed check
+        self.assertEqual(run(lambda n, a: "dead", whole=False), [])       # a partial read
+        self.assertEqual([l for l in self.audit() if l.get("event") == "reconcile_remove"], [])
+        self.assertEqual(run(lambda n, a: "dead"), ["pod"])
+        self.assertEqual(len([l for l in self.audit() if l.get("event") == "reconcile_remove"]), 1)
+        self.assertEqual(sorted(self.reg.read(self.dir)["agents"]), ["local"])
+
+    def test_s6_routes(self):
+        self.both()
+        agents = self.reg.read(self.dir)["agents"]
+        self.assertEqual(self.reg.route_for(agents["pod"]), {"via": "endpoint", "to": self.CLOUD["endpoint"]})
+        self.assertEqual(self.reg.route_for(agents["local"]), {"via": "pane", "to": "p_1"})
+
+    def test_u2_a_credential_shaped_endpoint_is_refused(self):
+        for bad in ("https://user:pw@pod.example/a", "https://pod.example/a?token=abc"):
+            got = self.reg.upsert(self.dir, "pod", dict(self.CLOUD, endpoint=bad))
+            self.assertTrue(got["problem"], bad)
+        self.assertEqual(self.reg.read(self.dir)["agents"], {})
+
+    def test_u3_a_row_without_an_endpoint_gains_no_key(self):
+        self.reg.upsert(self.dir, "local", self.LOCAL)
+        self.assertNotIn("endpoint", self.reg.read(self.dir)["agents"]["local"])
+        self.assertEqual(self.reg.read(self.dir)["version"], 1)
+
+    def test_u7_no_pane_is_bound_to_an_endpoint_row(self):
+        self.both()
+        got = self.reg.upsert(self.dir, "pod", dict(self.CLOUD, pane="p_9"))
+        self.assertTrue(got["problem"])
+        self.assertIsNone(self.reg.read(self.dir)["agents"]["pod"]["pane"])
+
+
 class TestReconcileOnRead(unittest.TestCase):
     """Slice 4 of #903 (#919): reconcile on read, never a question mark, dead never drawn."""
 

@@ -6837,7 +6837,7 @@ def retired_agent(retired, name, session):
     return isinstance(entry, dict) and entry.get("session") is not None and entry.get("session") == session   # no session on the record: it covers nothing
 
 
-RETIRED_RECORD_FIELDS = ("pane", "role", "charter", "repo", "workspace", "cwd")   # what the pane record holds besides the session (and `seen`, which nothing reads)
+RETIRED_RECORD_FIELDS = tuple(f for f in load_module("registry").RECORD_FIELDS if f not in load_module("registry").OPTIONAL_FIELDS)   # derived from the registry's one tuple; an endpoint is never in a pane record (no pane is bound to an endpoint row). What the pane record holds besides the session (and `seen`, which nothing reads)
 
 
 def pane_record_of(row):
@@ -7189,7 +7189,7 @@ def pane_health_pass(engine, now):
         live = state_now if state_now in (PANE_DETACHED, PANE_DEAD) else ((obs.status if obs is not None and obs.status in registry.STATES else None) or "idle")
         new = dict(row, state=live)
         old = registered.get(name)
-        if old is not None and all(old.get(k) == new.get(k) for k in registry.AGENT_FIELDS + ("state",)):
+        if old is not None and all(old.get(k) == new.get(k) for k in registry.CHANGE_FIELDS):
             continue
         got = registry.upsert(engine.state_dir, name, new, now=now)
         if got["problem"] and not got["problem"].endswith("is retired for this session"):
