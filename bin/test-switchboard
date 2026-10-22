@@ -74904,6 +74904,9 @@ class TestReconcileOnRead(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
+            def no_pane_to_judge(self, row):
+                return sb.load_module("registry").no_pane_to_judge(row)
+
             def reconcile_remove(self, state_dir, name, evidence, whole):
                 self.calls.append((name, evidence, whole))
                 return {"changed": True, "problem": None}
