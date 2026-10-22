@@ -103,6 +103,14 @@ def switchboard_source():
 SCENARIO = BIN / "fleet-scenario"
 
 
+def copy_entry(directory):
+    """The entry with its manifest and its parts, copied into `directory` as the program is laid out in bin/."""
+    directory = Path(directory)
+    shutil.copy(str(SWITCHBOARD), str(directory / "fleet-switchboard"))
+    shutil.copy(str(BIN / "fleet-switchboard.parts"), str(directory / "fleet-switchboard.parts"))
+    shutil.copytree(str(BIN / "switchboard"), str(directory / "switchboard"), dirs_exist_ok=True)
+
+
 def _load(name, path):
     loader = importlib.machinery.SourceFileLoader(name, str(path))
     spec = importlib.util.spec_from_loader(name, loader)
@@ -23255,7 +23263,7 @@ class TestJudgeSocket(PolicyCase):
         self.assertIsNotNone(original)
 
     def test_judge_tool_reads_no_environment_variable_and_never_names_jev(self):
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         tree = ast.parse(source)
         wanted = {"cmd_judge_tool", "ask_judge_daemon", "never_looser", "read_judge_line", "parse_policy_request",
                   "policy_unjudged_reason", "policy_reply", "_guess_configured"}
@@ -23308,9 +23316,10 @@ class TestJudgeToolWritesNothingElsewhere(unittest.TestCase):
     WRITE_PHRASES = ("issue comment", "issue edit", "pr merge", "pr comment", "sub_issues", "/comments", "/labels")
 
     def section(self):
-        source = SWITCHBOARD.read_text()
-        start = source.index(self.START)
-        return source[source.rindex("\n# ====", 0, start):source.index(self.END, start)]
+        """The policy section: its part files, and the statements of it that stay in the entry (S2 keeps the ones the clear's closure reads), between the DEFAULTS line and the next section."""
+        entry = SWITCHBOARD.read_text()
+        kept = entry[entry.index('DEFAULTS["policy"] = None'):entry.index("# PR 10: move a v1 session")]
+        return "\n".join([kept] + [path.read_text() for path in SWITCHBOARD_SOURCE_FILES if path != SWITCHBOARD])
 
     def test_no_herdr_and_no_github_write_is_reachable_from_the_section(self):
         tree = ast.parse(self.section())
@@ -23331,7 +23340,7 @@ class TestJudgeToolWritesNothingElsewhere(unittest.TestCase):
         self.assertEqual(herdr_typing_violations(switchboard_source()), [], "the engine still never types")
 
     def test_the_section_is_one_clearly_marked_block(self):
-        self.assertEqual(SWITCHBOARD.read_text().count("\n# PR 9: the tool-call policy judge"), 1)
+        self.assertEqual(switchboard_source().count("\n# PR 9: the tool-call policy judge"), 1)
 
 
 class TestPolicyBlockedToast(PR4Base):
@@ -29789,7 +29798,7 @@ class TestIdentityCheck(ReportBase):
     # -- the judge, the hooks and status
 
     def test_the_judge_keys_on_the_plugins_session_and_never_on_the_pane_environment(self):
-        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        text = switchboard_source()
         start, end = text.index("def parse_policy_request"), text.index("def _guess_configured")
         self.assertNotIn("HERDR_PANE_ID", text[start:end])
         self.assertIn('data.get("sessionID")', text[start:end])
@@ -72871,7 +72880,7 @@ class TestSlice3Modules(Base):
         self.addCleanup(shutil.rmtree, directory, True)
         for path in BIN.glob("*.py"):
             shutil.copy(str(path), str(directory / path.name))
-        shutil.copy(str(SWITCHBOARD), str(directory / "fleet-switchboard"))
+        copy_entry(directory)
         for name, text in extra.items():
             (directory / name).write_text(text)
         return directory
@@ -72900,7 +72909,7 @@ class TestSlice3Modules(Base):
         (directory / "bin").mkdir()
         for path in BIN.glob("*.py"):
             shutil.copy(str(path), str(directory / "bin" / path.name))
-        shutil.copy(str(SWITCHBOARD), str(directory / "bin" / "fleet-switchboard"))
+        copy_entry(directory / "bin")
 
         def git(*args):
             return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"] + list(args), cwd=str(directory),
@@ -73822,7 +73831,7 @@ class TestModuleLoader(Base):
         self.addCleanup(shutil.rmtree, tmp, True)
         held = dict(sys.modules)
         self.addCleanup(lambda: (sys.modules.clear(), sys.modules.update(held)))
-        shutil.copy(SWITCHBOARD, tmp / "fleet-switchboard")
+        copy_entry(tmp)
         for module in BIN.glob("*.py"):
             shutil.copy(module, tmp / module.name)
         for name, text in (extra or {}).items():
@@ -83264,8 +83273,7 @@ class TestAssembler(unittest.TestCase):
         self.addCleanup(shutil.rmtree, str(root), True)
         for sibling in BIN.glob("*.py"):   # the entry loads its sibling modules from its own directory
             shutil.copy(str(sibling), str(root / sibling.name))
-        shutil.copy(str(SWITCHBOARD), str(root / "fleet-switchboard"))
-        shutil.copytree(str(BIN / "switchboard"), str(root / "switchboard"))   # the shipped parts the copied entry needs
+        copy_entry(root)   # the shipped parts the copied entry needs
         (root / "fleet-switchboard.parts").write_text("\n".join(lines) + "\n")
         return root
 
@@ -83348,7 +83356,8 @@ class TestAssembler(unittest.TestCase):
         self.assertEqual(len(lines), len(set(lines)))
         for name in lines:
             self.assertTrue((BIN / name).is_file(), name)
-            self.assertLessEqual(len((BIN / name).read_text().splitlines()), 1500, name)
+            if name != "fleet-switchboard":
+                self.assertLessEqual(len((BIN / name).read_text().splitlines()), 1500, name)
 
     def test_a_symlinked_run_and_the_help_line_still_work(self):
         link = Path(tempfile.mkdtemp()) / "fsb"

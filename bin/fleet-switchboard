@@ -27251,7 +27251,286 @@ def add_plan_parsers(sub):
     tick.add_argument("--json", action="store_true")
 
 
+POLICY_DEFAULTS = {
+    "enabled": False,       # off until the plugin is installed and a `jev` object is configured
+    "budget_ms": 1500,      # the whole judgement; no answer in time keeps the configured outcome. Jev alone ran to ~1 s in the trial
+    "thresholds": POLICY_DEFAULT_THRESHOLDS,  # question id -> probability at which it fires; a configured entry wins per question
+    "cache_seconds": 300,   # how long a verdict or a resolved ask is reused; 0 turns both caches off
+    "cache_entries": 200,   # entries kept in each cache file
+    "routine_filter": True, # issue 87: a read or a local reversible step needs no model (routine_local); false asks the model about every call
+    "shadow": False,        # record what the judge would do (audit policy.judge, `shadow`/`verdict`), enforce nothing
+}
+
+
 DEFAULTS["policy"] = None   # None means POLICY_DEFAULTS
+
+
+POLICY_CACHE_BYTES = 1 << 20
+
+
+POLICY_CONTEXT_FILE = "policy-context.json"   # resolved asks and sessions: a disposable copy of what GitHub and v2 say
+
+
+def validate_policy_config(config, source):
+    """Check and complete `policy`: unknown subkeys are refused, every value is checked."""
+    raw = config.get("policy")
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError("%s: 'policy' must be an object, got %r" % (source, type(raw).__name__))
+    unknown = sorted(set(raw) - set(POLICY_DEFAULTS))
+    if unknown:
+        warn_unknown_config("%s: 'policy' contains key(s) this tool does not read: %s (known: %s)"
+                          % (source, ", ".join(unknown), ", ".join(POLICY_DEFAULTS)), 'policy', unknown, list(POLICY_DEFAULTS))
+    settings = dict(POLICY_DEFAULTS, **raw)
+    if not isinstance(settings["enabled"], bool):
+        raise ConfigError("%s: 'policy.enabled' must be true or false, got %r" % (source, settings["enabled"]))
+    for name in ("budget_ms", "cache_seconds"):
+        value = settings[name]
+        if not _is_number(value) or value < 0 or (name == "budget_ms" and value <= 0):
+            raise ConfigError("%s: 'policy.%s' must be a %s number, got %r"
+                              % (source, name, "positive" if name == "budget_ms" else "non-negative", value))
+    if not isinstance(settings["shadow"], bool):
+        raise ConfigError("%s: 'policy.shadow' must be true or false, got %r" % (source, settings["shadow"]))
+    entries = settings["cache_entries"]
+    if not (isinstance(entries, int) and not isinstance(entries, bool) and 1 <= entries <= 5000):
+        raise ConfigError("%s: 'policy.cache_entries' must be an integer from 1 to 5000, got %r" % (source, entries))
+    if not isinstance(settings["routine_filter"], bool):
+        raise ConfigError("%s: 'policy.routine_filter' must be true or false, got %r" % (source, settings["routine_filter"]))
+    settings["thresholds"] = dict(POLICY_DEFAULT_THRESHOLDS, **_checked_policy_thresholds(settings["thresholds"], source))
+    if settings["enabled"] and not config.get("jev"):
+        raise ConfigError("%s: 'policy.enabled' needs a 'jev' object: there is no decision model to ask" % source)
+    config["policy"] = settings
+
+
+def _checked_policy_thresholds(thresholds, source):
+    if not isinstance(thresholds, dict):
+        raise ConfigError("%s: 'policy.thresholds' must be an object of question id -> probability" % source)
+    for name, value in thresholds.items():
+        if name not in POLICY_QUESTIONS:
+            raise ConfigError("%s: 'policy.thresholds' names no question %r (known: %s)"
+                              % (source, name, ", ".join(POLICY_QUESTIONS)))
+        if not _is_number(value) or not 0 < value <= 1:
+            raise ConfigError("%s: 'policy.thresholds.%s' must be a number above 0 and at most 1, got %r"
+                              % (source, name, value))
+    return dict(thresholds)
+
+
+_SECRET_PATTERNS = (
+    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{6,}"), r"\1 [redacted]"),
+    (re.compile(r"(?i)\b([A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|api[_-]?key|credential|auth)[A-Za-z0-9_.-]*)"
+                r"(\s*[=:]\s*|\s+)(\"[^\"]*\"|'[^']*'|\S+)"), r"\1\2[redacted]"),
+    (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}"
+                r"|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]{8,})"), "[redacted]"),
+    (re.compile(r"(://[^/\s:@]+:)[^@\s/]+@"), r"\1[redacted]@"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]*"), "[redacted]"),   # a JWT (#773)
+)
+
+
+def redact_command_text(text, extra=()):
+    """`text` with credential-shaped parts replaced, and any value in `extra` (a known key) removed.
+
+    A tool's arguments go to a third-party model and to the audit log; neither
+    may see a credential. This is a net, not a promise: it catches the usual shapes.
+    """
+    text = "" if text is None else str(text)
+    for secret in extra:
+        if secret:
+            text = text.replace(secret, "[redacted]")
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+# ------------------------------------------------------- standing authority
+
+_STANDING_AUTHORITY = re.compile(r"^(?:[-*]\s+)?\**standing authority\**\s*:\s*\**\s*(.*?)\**\s*$", re.IGNORECASE)
+
+
+_ORDERS_HEADING = re.compile(r"^#{1,6}\s+standing orders\s*$", re.IGNORECASE)
+
+
+_ANY_HEADING = re.compile(r"^#{1,6}\s")
+
+
+_ORDER_BULLET = re.compile(r"^[-*]\s+(\S.*?)\s*$")
+
+
+def _legacy_authority(body):
+    """The charter's one-line `Standing authority:` text, or None when it states none.
+
+    It lives in the charter issue's prose, below the yaml block; fenced code is
+    ignored, the first such line wins, and "none" counts as none stated.
+    """
+    fenced = False
+    for line in (body or "").splitlines():
+        if line.lstrip().startswith(("```", "~~~")):
+            fenced = not fenced
+            continue
+        match = None if fenced else _STANDING_AUTHORITY.match(line.strip())
+        if match:
+            text = match.group(1).strip()
+            return None if not text or text.lower().rstrip(".") in ("none", "none stated", "n/a") else text
+    return None
+
+
+def _orders_section(body):
+    """The first `## Standing orders` section outside a fenced block: None, or a dict with the character
+    offsets `start` (its heading), `head_end`, `end` (the next heading, or the end of the body) and
+    `bullets`, a list of (start, end, text), one per order, in the body's own bytes."""
+    body = body or ""
+    fenced, offset, found = False, 0, None
+    for line in body.splitlines(keepends=True):
+        start, offset = offset, offset + len(line)
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        if found is None:
+            if _ORDERS_HEADING.match(stripped):
+                found = {"start": start, "head_end": offset, "end": len(body), "bullets": []}
+            continue
+        if _ANY_HEADING.match(stripped):
+            found["end"] = start
+            break
+        match = _ORDER_BULLET.match(stripped)
+        if match:
+            found["bullets"].append((start, offset, match.group(1)))
+    return found
+
+
+def section_orders(body):
+    """The orders of the `## Standing orders` section alone, in order."""
+    found = _orders_section(body)
+    return [text for _, _, text in found["bullets"]] if found else []
+
+
+def parse_orders(body):
+    """Every standing order the charter body states: the section's bullets in order, then the legacy
+    `Standing authority:` line when there is one. [] when there are none."""
+    legacy = _legacy_authority(body)
+    return section_orders(body) + ([legacy] if legacy else [])
+
+
+def fetch_charter_body(reader, charter, repo):
+    """The charter issue's body (or None) through the reader's GET-only `gh api`: the one read of it."""
+    data = reader._api("repos/%s/issues/%d" % (repo, charter), repo)
+    return data.get("body") if isinstance(data, dict) and isinstance(data.get("body"), str) else None
+
+
+def fetch_orders(reader, charter, repo):
+    """The charter issue's standing orders (a list) through the reader's GET-only `gh api`."""
+    return parse_orders(fetch_charter_body(reader, charter, repo))
+
+
+# ------------------------------------------------------------------ the caches
+
+class BoundedFileCache:
+    """A small JSON file of {key: {at, value}}: bounded, expiring, private, replaceable.
+
+    It is a cache and nothing else: deleting it loses only speed (invariant 8).
+    Written atomically (a temp file, mode 0600, then rename); a missing,
+    oversized or corrupt file reads as empty; a write that fails is not an error.
+    A ttl of 0 turns it off.
+    """
+
+    def __init__(self, path, now, ttl, limit):
+        self.path, self.now, self.ttl, self.limit = Path(path), now, ttl, limit
+
+    def _fresh(self):
+        if not self.ttl:
+            return {}
+        try:
+            if self.path.stat().st_size > POLICY_CACHE_BYTES:
+                return {}
+            data = json.loads(self.path.read_text())
+        except (OSError, ValueError):
+            return {}
+        entries = data.get("entries") if isinstance(data, dict) else None
+        if not isinstance(entries, dict):
+            return {}
+        return {key: entry for key, entry in entries.items()
+                if isinstance(entry, dict) and _is_number(entry.get("at")) and self.now() - entry["at"] < self.ttl
+                and self.now() >= entry["at"]}
+
+    def get(self, key):
+        entry = self._fresh().get(key)
+        return entry["value"] if entry else None
+
+    def put(self, key, value):
+        """Store one entry, dropping the oldest beyond the limit. True when it was written."""
+        if not self.ttl:
+            return False
+        entries = self._fresh()
+        held = entries.get(key)
+        if held is not None and held.get("value") == value and self.now() - held["at"] < self.ttl / 2:
+            return True   # the same answer, still young: rewriting the whole file to move its time would only touch the disk
+        entries[key] = {"at": self.now(), "value": value}
+        for old in sorted(entries, key=lambda k: entries[k]["at"])[:max(0, len(entries) - self.limit)]:
+            del entries[old]
+        temp = self.path.with_name("%s.%d.tmp" % (self.path.name, os.getpid()))
+        try:
+            fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(json.dumps({"entries": entries}, sort_keys=True))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(str(temp), str(self.path))
+            return True
+        except OSError:
+            try:
+                os.unlink(str(temp))
+            except OSError:
+                pass
+            return False
+
+
+def _valid_context(value):
+    keys = ("issue", "intent", "done_when", "authority")
+    ok = isinstance(value, dict) and all(k in value for k in keys) \
+        and all(value[k] is None or isinstance(value[k], str) for k in keys[1:]) \
+        and (value["issue"] is None or _is_issue_number(value["issue"]))
+    if not ok:
+        return None
+    context = {k: value[k] for k in keys}
+    # PR 17: the charter and its orders ride along (an older cache entry has neither: they read as none)
+    orders = value.get("orders")
+    context["charter"] = value.get("charter") if _is_issue_number(value.get("charter")) else None
+    context["charter_repo"] = value["charter_repo"] if isinstance(value.get("charter_repo"), str) \
+        and REPO_RE.match(value["charter_repo"]) else None
+    context["orders"] = [t for t in orders if isinstance(t, str)] if isinstance(orders, list) else []
+    return context
+
+
+POLICY_AUDIT_TAIL = 8 << 20         # bytes of the audit log's end that a report reads
+
+
+def _audit_tail(state_dir):
+    """The parsed entries in the last POLICY_AUDIT_TAIL bytes of audit.jsonl (a torn first line is dropped)."""
+    path = Path(state_dir) / "audit.jsonl"
+    try:
+        with open(path, "rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, size - POLICY_AUDIT_TAIL))
+            data = handle.read()
+            torn = size > POLICY_AUDIT_TAIL
+    except OSError:
+        return []
+    lines = data.decode("utf-8", "replace").splitlines()
+    out = []
+    for number, line in enumerate(lines):
+        if number == 0 and torn:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            out.append(entry)
+    return out
+
 
 
 

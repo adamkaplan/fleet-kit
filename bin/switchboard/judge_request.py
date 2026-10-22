@@ -23,75 +23,39 @@
 # herdr and never writes to GitHub.
 # ============================================================================
 POLICY_TOOLS = ("shell", "edit", "webfetch", "subagent", "read", "glob", "grep", "skill", "other")
+
+
 POLICY_PASS_THROUGH = ("read", "glob", "grep", "skill")  # never judged, never sent to Jev
+
+
 POLICY_REQUEST_OUTCOMES = ("allow", "ask", "deny")       # what the plugin can configure and be told
-POLICY_DEFAULTS = {
-    "enabled": False,       # off until the plugin is installed and a `jev` object is configured
-    "budget_ms": 1500,      # the whole judgement; no answer in time keeps the configured outcome. Jev alone ran to ~1 s in the trial
-    "thresholds": POLICY_DEFAULT_THRESHOLDS,  # question id -> probability at which it fires; a configured entry wins per question
-    "cache_seconds": 300,   # how long a verdict or a resolved ask is reused; 0 turns both caches off
-    "cache_entries": 200,   # entries kept in each cache file
-    "routine_filter": True, # issue 87: a read or a local reversible step needs no model (routine_local); false asks the model about every call
-    "shadow": False,        # record what the judge would do (audit policy.judge, `shadow`/`verdict`), enforce nothing
-}
+
+
 POLICY_STDIN_LIMIT = 65536  # bytes of request read from stdin
+
+
 POLICY_ARG_LIMIT = 4000     # characters of a tool's arguments kept
+
+
 POLICY_WARM_SECONDS = 8     # after replying, how long a late lookup may go on filling the caches
-POLICY_CACHE_BYTES = 1 << 20
+
+
 POLICY_VERDICT_FILE = "policy-verdicts.json"  # hashes and probabilities only
-POLICY_CONTEXT_FILE = "policy-context.json"   # resolved asks and sessions: a disposable copy of what GitHub and v2 say
+
+
 POLICY_SESSION_RE = re.compile(r"^ses_[A-Za-z0-9]{1,80}$")
+
+
 NO_STANDING_AUTHORITY = ("none stated: nothing is pre-authorised, so treat any merge, deploy, publish, "
                          "message to others or spend as not covered")
+
+
 POLICY_FIRED_TEXT = {"hard_to_reverse": "hard to reverse",
                      "speaks_for_you": "speaks for you, which the standing authority does not cover",
                      "outside_scope": "outside this agent's assignment"}
+
+
 POLICY_ACTOR = "judge-tool"
-
-
-def validate_policy_config(config, source):
-    """Check and complete `policy`: unknown subkeys are refused, every value is checked."""
-    raw = config.get("policy")
-    if raw is None:
-        raw = {}
-    if not isinstance(raw, dict):
-        raise ConfigError("%s: 'policy' must be an object, got %r" % (source, type(raw).__name__))
-    unknown = sorted(set(raw) - set(POLICY_DEFAULTS))
-    if unknown:
-        warn_unknown_config("%s: 'policy' contains key(s) this tool does not read: %s (known: %s)"
-                          % (source, ", ".join(unknown), ", ".join(POLICY_DEFAULTS)), 'policy', unknown, list(POLICY_DEFAULTS))
-    settings = dict(POLICY_DEFAULTS, **raw)
-    if not isinstance(settings["enabled"], bool):
-        raise ConfigError("%s: 'policy.enabled' must be true or false, got %r" % (source, settings["enabled"]))
-    for name in ("budget_ms", "cache_seconds"):
-        value = settings[name]
-        if not _is_number(value) or value < 0 or (name == "budget_ms" and value <= 0):
-            raise ConfigError("%s: 'policy.%s' must be a %s number, got %r"
-                              % (source, name, "positive" if name == "budget_ms" else "non-negative", value))
-    if not isinstance(settings["shadow"], bool):
-        raise ConfigError("%s: 'policy.shadow' must be true or false, got %r" % (source, settings["shadow"]))
-    entries = settings["cache_entries"]
-    if not (isinstance(entries, int) and not isinstance(entries, bool) and 1 <= entries <= 5000):
-        raise ConfigError("%s: 'policy.cache_entries' must be an integer from 1 to 5000, got %r" % (source, entries))
-    if not isinstance(settings["routine_filter"], bool):
-        raise ConfigError("%s: 'policy.routine_filter' must be true or false, got %r" % (source, settings["routine_filter"]))
-    settings["thresholds"] = dict(POLICY_DEFAULT_THRESHOLDS, **_checked_policy_thresholds(settings["thresholds"], source))
-    if settings["enabled"] and not config.get("jev"):
-        raise ConfigError("%s: 'policy.enabled' needs a 'jev' object: there is no decision model to ask" % source)
-    config["policy"] = settings
-
-
-def _checked_policy_thresholds(thresholds, source):
-    if not isinstance(thresholds, dict):
-        raise ConfigError("%s: 'policy.thresholds' must be an object of question id -> probability" % source)
-    for name, value in thresholds.items():
-        if name not in POLICY_QUESTIONS:
-            raise ConfigError("%s: 'policy.thresholds' names no question %r (known: %s)"
-                              % (source, name, ", ".join(POLICY_QUESTIONS)))
-        if not _is_number(value) or not 0 < value <= 1:
-            raise ConfigError("%s: 'policy.thresholds.%s' must be a number above 0 and at most 1, got %r"
-                              % (source, name, value))
-    return dict(thresholds)
 
 
 # ------------------------------------------------------------- the request
@@ -131,17 +95,6 @@ def _guess_configured(text):
     except (TypeError, ValueError, AttributeError):
         return "allow"
     return outcome if outcome in POLICY_REQUEST_OUTCOMES else "allow"
-
-
-_SECRET_PATTERNS = (
-    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{6,}"), r"\1 [redacted]"),
-    (re.compile(r"(?i)\b([A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|api[_-]?key|credential|auth)[A-Za-z0-9_.-]*)"
-                r"(\s*[=:]\s*|\s+)(\"[^\"]*\"|'[^']*'|\S+)"), r"\1\2[redacted]"),
-    (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}"
-                r"|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]{8,})"), "[redacted]"),
-    (re.compile(r"(://[^/\s:@]+:)[^@\s/]+@"), r"\1[redacted]@"),
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]*"), "[redacted]"),   # a JWT (#773)
-)
 
 
 # The sanctioned channel between agents. What a message *says* is not an action: the trial judged
@@ -200,7 +153,11 @@ def _plain_words(text):
 # A symlink inside the worktree that points outside it cannot be seen from the text: the model still judges what such a link
 # is for only when a path is unusual; this is a known limit, not a proof.
 _ROUTINE_NAME = re.compile(r"^[A-Za-z0-9._/@^+=-]{1,200}$")
+
+
 _ROUTINE_SECRETISH = re.compile(r"(?i)(secret|credential|token|passw|\.pem$|\.key$|\.p12$|id_rsa|id_ed25519|netrc|npmrc|pypirc|keystore|private)")
+
+
 _ROUTINE_NUMBER = re.compile(r"^[0-9]{1,6}$")
 
 
@@ -218,6 +175,8 @@ def _routine_path(word):
 
 # command -> (flags without a value, flags with a value that is a number, flags with a free text value, minimum paths, kind of positionals)
 F = lambda text: set(text.split())  # the flags of a command, one string each: the allowlist is data
+
+
 _ROUTINE_SPEC = {
     ("ls",): (F("-l -a -1 -h -t -la -al -lh -lah -lt -ltr -lR -R -d"), set(), set(), 0, "paths"),
     ("cat",): (F("-n"), set(), set(), 1, "paths"),
@@ -234,10 +193,20 @@ _ROUTINE_SPEC = {
     ("git", "add"): (F("-A --all -u --update --"), set(), set(), 0, "paths"),
     ("git", "commit"): (F("-a --amend --no-edit --allow-empty -q"), set(), F("-m"), 0, "none"),
 }
+
+
 _ROUTINE_NUMERIC_FLAG = re.compile(r"^-[0-9]{1,4}$")  # git log -5, head -5, tail -5
+
+
 _ROUTINE_ISSUE_REF = re.compile(r"^(?:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#?[1-9][0-9]{0,8}$")
+
+
 _ROUTINE_PR_REF = re.compile(r"^(?:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[1-9][0-9]{0,8}|https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[1-9][0-9]{0,8})$")
+
+
 _ROUTINE_NAME_WORD = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$")
+
+
 _ROUTINE_WHEN = re.compile(r"^(?:[0-9]{1,5}[smhd]|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]{5,12}(?:Z|[+-][0-9]{2}:[0-9]{2}))$")
 
 
@@ -292,11 +261,17 @@ def _routine_fleet(rest):
 # gh READS only: a pr or issue view/list/checks/diff and a GET of a repo's issues, pulls or comments. Never merge, review, close,
 # edit, create, comment, `gh repo`, `gh auth`, `gh api` with any flag that writes, or anything that opens a browser.
 _ROUTINE_GH_READ = {"pr": ("view", "list", "checks", "diff"), "issue": ("view", "list")}
+
+
 _ROUTINE_GH_FLAG_VALUE = {"--repo": re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$"), "-R": re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$"),
                           "--json": re.compile(r"^[A-Za-z][A-Za-z,]{0,300}$"), "--state": re.compile(r"^(?:open|closed|merged|all)$"),
                           "--limit": _ROUTINE_NUMBER, "-L": _ROUTINE_NUMBER,
                           "--label": re.compile(r"^[A-Za-z0-9._:-]{1,60}$"), "--author": re.compile(r"^(?:@me|[A-Za-z0-9-]{1,39})$")}
+
+
 _ROUTINE_GH_BARE_FLAGS = frozenset("--comments --name-only --patch --stat".split())
+
+
 _ROUTINE_GH_API_PATH = re.compile(r"^repos/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/(?:issues(?:/comment[s]|/[1-9][0-9]{0,8}(?:/comment[s])?)?|pulls(?:/comment[s]|/[1-9][0-9]{0,8}(?:/(?:comment[s]|reviews|files|commits))?)?|comment[s])(?:\?[A-Za-z0-9_=&.%+:-]{0,200})?$")
 
 
@@ -323,6 +298,8 @@ def _routine_gh(rest):
 
 
 _ROUTINE_NO_ARG = {("pwd",), ("uptime",), ("true",)}
+
+
 _ROUTINE_REPORT_STATES = ("done", "failed", "blocked", "question", "working", "paused", "withdrawn")
 
 
@@ -461,95 +438,17 @@ def decision_gloss(state_dir, command):
     return ""
 
 
-def redact_command_text(text, extra=()):
-    """`text` with credential-shaped parts replaced, and any value in `extra` (a known key) removed.
-
-    A tool's arguments go to a third-party model and to the audit log; neither
-    may see a credential. This is a net, not a promise: it catches the usual shapes.
-    """
-    text = "" if text is None else str(text)
-    for secret in extra:
-        if secret:
-            text = text.replace(secret, "[redacted]")
-    for pattern, replacement in _SECRET_PATTERNS:
-        text = pattern.sub(replacement, text)
-    return text
-
-
-# ------------------------------------------------------- standing authority
-
-_STANDING_AUTHORITY = re.compile(r"^(?:[-*]\s+)?\**standing authority\**\s*:\s*\**\s*(.*?)\**\s*$", re.IGNORECASE)
-
 # PR 17: standing orders. The charter issue's `## Standing orders` section, one order per bullet,
 # `- <text> (ordered by <name>, <YYYY-MM-DD>)`; the one-line `Standing authority:` stays valid and
 # counts as one more order. `parse_orders` is the one parser.
 ORDERS_HEADING = "## Standing orders"
+
+
 ORDER_MAX_CHARS = 300    # characters of one order's text
-_ORDERS_HEADING = re.compile(r"^#{1,6}\s+standing orders\s*$", re.IGNORECASE)
-_ANY_HEADING = re.compile(r"^#{1,6}\s")
-_ORDER_BULLET = re.compile(r"^[-*]\s+(\S.*?)\s*$")
 
 
 class OrdersError(Exception):
     """An order that cannot be recorded or removed, and why."""
-
-
-def _legacy_authority(body):
-    """The charter's one-line `Standing authority:` text, or None when it states none.
-
-    It lives in the charter issue's prose, below the yaml block; fenced code is
-    ignored, the first such line wins, and "none" counts as none stated.
-    """
-    fenced = False
-    for line in (body or "").splitlines():
-        if line.lstrip().startswith(("```", "~~~")):
-            fenced = not fenced
-            continue
-        match = None if fenced else _STANDING_AUTHORITY.match(line.strip())
-        if match:
-            text = match.group(1).strip()
-            return None if not text or text.lower().rstrip(".") in ("none", "none stated", "n/a") else text
-    return None
-
-
-def _orders_section(body):
-    """The first `## Standing orders` section outside a fenced block: None, or a dict with the character
-    offsets `start` (its heading), `head_end`, `end` (the next heading, or the end of the body) and
-    `bullets`, a list of (start, end, text), one per order, in the body's own bytes."""
-    body = body or ""
-    fenced, offset, found = False, 0, None
-    for line in body.splitlines(keepends=True):
-        start, offset = offset, offset + len(line)
-        stripped = line.strip()
-        if stripped.startswith(("```", "~~~")):
-            fenced = not fenced
-            continue
-        if fenced:
-            continue
-        if found is None:
-            if _ORDERS_HEADING.match(stripped):
-                found = {"start": start, "head_end": offset, "end": len(body), "bullets": []}
-            continue
-        if _ANY_HEADING.match(stripped):
-            found["end"] = start
-            break
-        match = _ORDER_BULLET.match(stripped)
-        if match:
-            found["bullets"].append((start, offset, match.group(1)))
-    return found
-
-
-def section_orders(body):
-    """The orders of the `## Standing orders` section alone, in order."""
-    found = _orders_section(body)
-    return [text for _, _, text in found["bullets"]] if found else []
-
-
-def parse_orders(body):
-    """Every standing order the charter body states: the section's bullets in order, then the legacy
-    `Standing authority:` line when there is one. [] when there are none."""
-    legacy = _legacy_authority(body)
-    return section_orders(body) + ([legacy] if legacy else [])
 
 
 def parse_standing_authority(body):
@@ -634,17 +533,6 @@ def os_user():
         return "unknown"
 
 
-def fetch_charter_body(reader, charter, repo):
-    """The charter issue's body (or None) through the reader's GET-only `gh api`: the one read of it."""
-    data = reader._api("repos/%s/issues/%d" % (repo, charter), repo)
-    return data.get("body") if isinstance(data, dict) and isinstance(data.get("body"), str) else None
-
-
-def fetch_orders(reader, charter, repo):
-    """The charter issue's standing orders (a list) through the reader's GET-only `gh api`."""
-    return parse_orders(fetch_charter_body(reader, charter, repo))
-
-
 def fetch_standing_authority(reader, charter, repo):
     """The orders joined into one line, or None (kept for the callers that want a single string)."""
     orders = fetch_orders(reader, charter, repo)
@@ -687,11 +575,23 @@ def resolve_policy_context(reader, fleet):
 # out of pieces this text never shows (a variable, a script, an alias, another tool), and the rule sees only
 # the agent's own charter. It reads the command's words, as the redaction does.
 _GH_ISSUE_EDIT = re.compile(r"\bgh(?:\s+(?:-R|--repo)[ =]\S+)?\s+issue\s+edit\b([^;&|\n]*)", re.IGNORECASE)
+
+
 _GH_API = re.compile(r"\bgh(?:\s+(?:-R|--repo)[ =]\S+)?\s+api\b([^;&|\n]*)", re.IGNORECASE)
+
+
 _GH_REPO_FLAG = re.compile(r"\bgh\s+(?:-R|--repo)[ =]['\"]?([\w.-]+/[\w.-]+)", re.IGNORECASE)
+
+
 _REPO_FLAG = re.compile(r"(?:^|\s)(?:-R|--repo)(?:\s+|=)['\"]?([\w.-]+/[\w.-]+)", re.IGNORECASE)
+
+
 _API_WRITE_METHOD = re.compile(r"(?:-X|--method)(?:\s+|=)?['\"]?(?:PATCH|PUT|DELETE)\b", re.IGNORECASE)
+
+
 _API_ISSUE_PATH = re.compile(r"repos/([\w.-]+/[\w.-]+)/issues/(\d+)(?![\w/])")
+
+
 _ISSUE_WORD = re.compile(r"^['\"]?(?:(?:([\w.-]+/[\w.-]+)#|#)(\d+)|(\d+)|\S*?(?:([\w.-]+/[\w.-]+)/issues/)(\d+))['\"]?$")
 
 
@@ -726,68 +626,6 @@ def charter_edit_target(command, charters):
         if path and _API_WRITE_METHOD.search(rest) and owns(path.group(1), int(path.group(2))):
             return int(path.group(2))
     return None
-
-
-# ------------------------------------------------------------------ the caches
-
-class BoundedFileCache:
-    """A small JSON file of {key: {at, value}}: bounded, expiring, private, replaceable.
-
-    It is a cache and nothing else: deleting it loses only speed (invariant 8).
-    Written atomically (a temp file, mode 0600, then rename); a missing,
-    oversized or corrupt file reads as empty; a write that fails is not an error.
-    A ttl of 0 turns it off.
-    """
-
-    def __init__(self, path, now, ttl, limit):
-        self.path, self.now, self.ttl, self.limit = Path(path), now, ttl, limit
-
-    def _fresh(self):
-        if not self.ttl:
-            return {}
-        try:
-            if self.path.stat().st_size > POLICY_CACHE_BYTES:
-                return {}
-            data = json.loads(self.path.read_text())
-        except (OSError, ValueError):
-            return {}
-        entries = data.get("entries") if isinstance(data, dict) else None
-        if not isinstance(entries, dict):
-            return {}
-        return {key: entry for key, entry in entries.items()
-                if isinstance(entry, dict) and _is_number(entry.get("at")) and self.now() - entry["at"] < self.ttl
-                and self.now() >= entry["at"]}
-
-    def get(self, key):
-        entry = self._fresh().get(key)
-        return entry["value"] if entry else None
-
-    def put(self, key, value):
-        """Store one entry, dropping the oldest beyond the limit. True when it was written."""
-        if not self.ttl:
-            return False
-        entries = self._fresh()
-        held = entries.get(key)
-        if held is not None and held.get("value") == value and self.now() - held["at"] < self.ttl / 2:
-            return True   # the same answer, still young: rewriting the whole file to move its time would only touch the disk
-        entries[key] = {"at": self.now(), "value": value}
-        for old in sorted(entries, key=lambda k: entries[k]["at"])[:max(0, len(entries) - self.limit)]:
-            del entries[old]
-        temp = self.path.with_name("%s.%d.tmp" % (self.path.name, os.getpid()))
-        try:
-            fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w") as handle:
-                handle.write(json.dumps({"entries": entries}, sort_keys=True))
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(str(temp), str(self.path))
-            return True
-        except OSError:
-            try:
-                os.unlink(str(temp))
-            except OSError:
-                pass
-            return False
 
 
 # ------------------------------------------------------------------- the reply
@@ -856,18 +694,256 @@ def _valid_session_fleet(value):
     return fleet if isinstance(fleet, dict) and isinstance(fleet.get("name"), str) else None
 
 
-def _valid_context(value):
-    keys = ("issue", "intent", "done_when", "authority")
-    ok = isinstance(value, dict) and all(k in value for k in keys) \
-        and all(value[k] is None or isinstance(value[k], str) for k in keys[1:]) \
-        and (value["issue"] is None or _is_issue_number(value["issue"]))
-    if not ok:
-        return None
-    context = {k: value[k] for k in keys}
-    # PR 17: the charter and its orders ride along (an older cache entry has neither: they read as none)
-    orders = value.get("orders")
-    context["charter"] = value.get("charter") if _is_issue_number(value.get("charter")) else None
-    context["charter_repo"] = value["charter_repo"] if isinstance(value.get("charter_repo"), str) \
-        and REPO_RE.match(value["charter_repo"]) else None
-    context["orders"] = [t for t in orders if isinstance(t, str)] if isinstance(orders, list) else []
-    return context
+# ------------------------------------------------------------------ the judge
+
+class PolicyJudge:
+    """Judges one tool call: who the agent is, what its ask is, what Jev says, what the code allows.
+
+    Every collaborator is injected, so a test never reaches a real binary. The
+    whole judgement runs in one worker thread against `budget_ms`: when it has
+    not finished in time the configured outcome is the reply, and the worker
+    is left to finish filling the caches, so the next call is fast.
+    """
+
+    def __init__(self, config, v2, reader, jev, audit, state, now=time.time, monotonic=time.monotonic, environ=None):
+        self.config, self.settings = config, config["policy"]
+        self.v2, self.reader, self.jev, self.audit = v2, reader, jev, audit
+        self.now, self.monotonic = now, monotonic
+        self.environ = os.environ if environ is None else environ
+        ttl, limit = self.settings["cache_seconds"], self.settings["cache_entries"]
+        self.verdicts = BoundedFileCache(Path(state) / POLICY_VERDICT_FILE, now, ttl, limit)
+        self.contexts = BoundedFileCache(Path(state) / POLICY_CONTEXT_FILE, now, ttl, limit)
+        self._worker = None
+
+    # -- the whole judgement, against the budget
+
+    def decide(self, request):
+        started = self.monotonic()
+        box = {"stage": "identifying the agent", "detail": {}}
+        worker = threading.Thread(target=self._work, args=(request, box), daemon=True)
+        worker.start()
+        worker.join(self.settings["budget_ms"] / 1000.0)
+        elapsed = int((self.monotonic() - started) * 1000)
+        if worker.is_alive():
+            self._worker = worker
+            reply = policy_reply(request["configured"], "no answer within %d ms (still %s): the configured "
+                                 "outcome stands" % (self.settings["budget_ms"], box["stage"]), False, False, elapsed)
+        else:
+            reply = box.get("reply") or policy_reply(request["configured"], "the judge failed: the configured "
+                                                     "outcome stands", False, False, elapsed)
+            reply["latency_ms"] = elapsed
+        reply, shadow = self.shadowed(request, reply)
+        self._audit(request, reply, box, shadow)
+        return reply
+
+    def shadowed(self, request, reply):
+        """policy.shadow: the judge's verdict is recorded and never enforced. Returns (reply, verdict-or-None); with
+        shadow on, a tightened reply becomes the configured outcome again, so nothing is ever stricter than the
+        rules alone. Only a stricter outcome is a would-ask or would-deny."""
+        if not self.settings.get("shadow"):
+            return reply, None
+        order = POLICY_REQUEST_OUTCOMES
+        would, configured = reply["outcome"], request["configured"]
+        if would in order and configured in order and order.index(would) > order.index(configured):
+            return dict(reply, outcome=configured, shadow=True, reason=_one_line(
+                "shadow: the judge would %s (%s); not enforced" % (would, reply["reason"]), 600)), "would-%s" % would
+        return dict(reply, shadow=True), ("unchanged" if reply["judged"] else None)
+
+    def finish_late(self, seconds=POLICY_WARM_SECONDS):
+        """Wait for a judgement that missed its budget to finish and fill the caches (tests use it)."""
+        if self._worker is not None:
+            self._worker.join(seconds)
+
+    def _work(self, request, box):
+        try:
+            box["reply"] = self._judge(request, box)
+        except Exception as err:  # a worker thread must never leak a traceback or die without a reply
+            box["detail"]["error"] = _one_line("%s: %s" % (type(err).__name__, err), 200)
+            box["reply"] = policy_reply(request["configured"], "could not judge while %s (%s): the configured "
+                                        "outcome stands" % (box["stage"], _one_line(str(err), 120)))
+
+    def _judge(self, request, box):
+        fleet = self.identify(request["session"])
+        if fleet is None:
+            return policy_reply(request["configured"], "not a fleet agent (no metadata.fleet): not judged")
+        if request["tool"] == "shell" and plain_switchboard_message(request["arguments"]):
+            return policy_reply(request["configured"], "a plain %s message is the agents' own channel: not judged" % PROG)
+        rule = None if fault("repo-create-allowed") or request["tool"] != "shell" \
+            else repo_commissioning_rule(request["arguments"])
+        if rule:  # PR 15: no model and no GitHub read stands between this call and an ask
+            return self.rule_reply(request, fleet, rule, box)
+        if not fault("anyone-edits-cos-orders") and writes_cos_orders(request["tool"], request["arguments"], self.config):
+            return self.orders_guard_reply(request, fleet, box)  # PR 18: no model, no GitHub read
+        box["stage"] = "resolving the ask"
+        context = self.context_of(fleet)
+        box["detail"].update(agent=fleet["name"], role=fleet.get("role"), ask=context["issue"])
+        request = dict(request, arguments=self.redacted(request["arguments"]))  # from here on, nothing sees a credential
+        routine = (request["tool"] == "shell" and self.settings["routine_filter"]
+                   and routine_local(request["arguments"]))
+        if request["tool"] == "shell":  # PR 18: the judge's question sees what `decisions answer|resolve` acts on
+            request["arguments"] += decision_gloss(self.verdicts.path.parent, request["arguments"])
+        key = policy_verdict_key(request, fleet["name"], context, fleet.get("role"))
+        thresholds = dict(self.settings["thresholds"])
+        if context["issue"] is None:
+            # With no ask there is nothing to be outside of: neither intent nor scope can fire. The
+            # trial found the Chief of Staff, which has no ask by design, asked about every routine
+            # `gh` and `ls`. The two consequential questions (hard to reverse, speaks for you) still do.
+            thresholds["outside_intent"] = thresholds["outside_scope"] = 2.0
+        guarded = self.charter_guard(request, fleet, context)
+        if guarded is not None:  # PR 17: no model needed, and the cache is not asked
+            answers = dict.fromkeys(POLICY_QUESTIONS)
+            answers.update(hard_to_reverse=1.0, speaks_for_you=1.0)
+            combined = combine_policy(answers, thresholds, request["configured"])
+            combined.update(answers=answers, latency_ms=0, usage={}, model=None)
+            box["detail"].update(combined=combined, cached=False, thresholds=thresholds, guard="charter-edit")
+            reply = self.reply_of(combined, False, fleet, context, request)
+            if combined["outcome"] != "allow":
+                reply["reason"] = _one_line(
+                    "Needs your yes: this edits charter #%d, the one this agent works under, and an agent must "
+                    "not grant itself authority. Standing orders are the owner's, recorded by the Chief of Staff "
+                    "(%s)." % (guarded, _what_text(request)), 600)
+            return reply
+        if routine:  # issue 87: a read or a local reversible step: no model, "nothing at its threshold"
+            answers = dict.fromkeys(POLICY_QUESTIONS, 0.0)
+            combined = combine_policy(answers, thresholds, request["configured"])
+            combined.update(answers=answers, latency_ms=0, usage={}, model=None)
+            box["detail"].update(combined=combined, cached=False, thresholds=thresholds, guard="routine-local")
+            return self.reply_of(combined, False, fleet, context, request)
+        cached = _valid_answers(self.verdicts.get(key))
+        if cached is not None:
+            combined = combine_policy(cached, thresholds, request["configured"])
+            combined.update(answers=cached, latency_ms=0, usage={}, model=None)
+        else:
+            box["stage"] = "asking the decision model"
+            state = self.state_of(request, fleet, context)
+            box["detail"]["state"] = state
+            combined = judge_tool_call(self.jev, request["configured"], state, thresholds)
+            if "answers" in combined:
+                self.verdicts.put(key, {"answers": combined["answers"]})
+        box["detail"].update(combined=combined, cached=cached is not None, thresholds=thresholds)
+        return self.reply_of(combined, cached is not None, fleet, context, request)
+
+    def rule_reply(self, request, fleet, rule, box):
+        """`hard_to_reverse`, decided by the code: the commissioning rule (repo_commissioning_rule). Never looser
+        than configured, like every judgement."""
+        answers = {"hard_to_reverse": 1.0}
+        thresholds = {"hard_to_reverse": 0.0}
+        combined = combine_policy(answers, thresholds, request["configured"])
+        combined.update(answers=answers, latency_ms=0, usage={}, model=None, rule=rule)
+        box["detail"].update(agent=fleet["name"], role=fleet.get("role"), ask=None, combined=combined, cached=False,
+                             thresholds=thresholds, rule=rule)
+        reply = self.reply_of(combined, False, fleet, {"issue": None}, dict(request, arguments=self.redacted(request["arguments"])))
+        reply["reason"] = _one_line("%s [rule: %s is hard to reverse whatever the thresholds say]" % (reply["reason"], rule), 600)
+        return reply
+
+    def orders_guard_reply(self, request, fleet, box):
+        """PR 18: a shell command that writes the Chief of Staff's orders file is `speaks_for_you` and
+        `hard_to_reverse`, decided by the code: an agent must not grant itself authority. Never looser than
+        configured, like every judgement."""
+        thresholds = dict(self.settings["thresholds"])
+        answers = dict.fromkeys(POLICY_QUESTIONS)
+        answers.update(hard_to_reverse=1.0, speaks_for_you=1.0)
+        combined = combine_policy(answers, thresholds, request["configured"])
+        combined.update(answers=answers, latency_ms=0, usage={}, model=None)
+        box["detail"].update(agent=fleet["name"], role=fleet.get("role"), ask=None, combined=combined, cached=False,
+                             thresholds=thresholds, guard="cos-orders-edit")
+        shown = dict(request, arguments=self.redacted(request["arguments"]))
+        reply = self.reply_of(combined, False, fleet, {"issue": None}, shown)
+        if combined["outcome"] != "allow":
+            reply["reason"] = _one_line(
+                "Needs your yes: this writes the Chief of Staff's standing orders, which are the owner's alone, and "
+                "an agent must not grant itself authority. The owner edits that file in an editor (%s)."
+                % _what_text(shown), 600)
+        return reply
+
+    # -- the pieces
+
+    @staticmethod
+    def charter_guard(request, fleet, context):
+        """PR 17: the charter number when a shell call by an agent other than the Chief of Staff edits the
+        charter it works under, else None."""
+        if request["tool"] != "shell" or fleet.get("role") == "chief-of-staff":
+            return None
+        own = fleet.get("repo") if isinstance(fleet.get("repo"), str) else None
+        charters = {(context.get("charter_repo") if n == context.get("charter") else own, n)
+                    for n in (context.get("charter"), fleet.get("charter")) if _is_issue_number(n)}
+        return charter_edit_target(request["arguments"], charters) if charters else None
+
+    def identify(self, session, refresh=False):
+        known = None if refresh else _valid_session_fleet(self.contexts.get("session:" + session))
+        if known is not None:
+            return known
+        fleet = _fleet_meta(self.v2.session_get(session))
+        if fleet is None or not isinstance(fleet.get("name"), str):
+            return None
+        kept = {k: fleet[k] for k in ("name", "role", "reports_to", "issue", "charter", "repo") if k in fleet}
+        self.contexts.put("session:" + session, {"fleet": kept})
+        return kept
+
+    def warm(self, session):
+        """Refresh one agent's identity and ask context ahead of its next tool call. Each lookup is a
+        `gh` round trip (about half a second here), and an orchestrator needs several: cold, the first
+        calls ran out of budget and went through unjudged."""
+        fleet = self.identify(session, refresh=True)
+        if fleet is not None:
+            self.context_of(fleet, refresh=True)
+        return fleet
+
+    def context_of(self, fleet, refresh=False):
+        context = self.ask_context_of(fleet, refresh)
+        if fleet.get("role") != "chief-of-staff" or fault("cos-orders-unfed"):
+            return context
+        # PR 18: the Chief of Staff has no charter; what it may decide for the owner is its own orders file. One
+        # `stat` per call; the file is read again only when its mtime or size changes, and the verdict key
+        # holds the text, so an edit is seen at the next call.
+        try:
+            text = read_cos_orders(self.config)["text"]
+        except CosOrdersError:
+            text = None  # a file that cannot be used is no authority at all
+        return dict(context, authority=text) if text else context
+
+    def ask_context_of(self, fleet, refresh=False):
+        if self.reader is None:
+            return {"issue": None, "intent": None, "done_when": None, "authority": None, "charter": None,
+                    "charter_repo": None, "orders": []}
+        key = "ask:%s:%s:%s" % (fleet.get("repo") or self.reader.repo, fleet.get("issue"), fleet.get("charter"))
+        known = None if refresh else _valid_context(self.contexts.get(key))
+        if known is not None:
+            return known
+        context = resolve_policy_context(self.reader, fleet)
+        self.contexts.put(key, context)
+        return context
+
+    def redacted(self, text):
+        return redact_command_text(text, jev_secrets(self.config, self.environ))
+
+    def state_of(self, request, fleet, context):
+        return policy_state(fleet.get("role") or "unknown", context["intent"] or "not stated: no ask is recorded",
+                            context["done_when"] or "not stated", context["authority"] or NO_STANDING_AUTHORITY,
+                            request["tool"], request["arguments"])
+
+    def reply_of(self, combined, cached, fleet, context, request):
+        outcome = combined["outcome"]
+        judged = "answers" in combined
+        reason = tightened_reason(combined, fleet, context["issue"], request) if judged else combined["reason"]
+        return policy_reply("deny" if outcome == "hard-deny" else outcome, reason, judged, cached,
+                            combined.get("latency_ms") or 0)
+
+    def _audit(self, request, reply, box, shadow=None):
+        detail, combined = box["detail"], box["detail"].get("combined") or {}
+        state = dict(detail.get("state") or {})
+        entry = {"agent": detail.get("agent"), "role": detail.get("role"), "session": request["session"],
+                 "tool": request["tool"], "configured": request["configured"], "outcome": reply["outcome"],
+                 "judged": reply["judged"], "cached": reply["cached"], "reason": reply["reason"],
+                 "latency_ms": reply["latency_ms"], "ask": detail.get("ask"), "fired": combined.get("fired"),
+                 "answers": combined.get("answers"), "thresholds": detail.get("thresholds"),
+                 # the question's full state (the tool's arguments and the context the judge was shown, ~2 KB a call) is not kept: ids, outcome and
+                 # latency are what the reports read; the tool and a short clip of its arguments say what was judged
+                 "question": {"ids": list(POLICY_QUESTIONS), "arguments": _plain(state.get("arguments"), 100), "intent": _plain(state.get("intent"), 160)} if state else None,
+                 "model": combined.get("model"), "usage": combined.get("usage"), "error": detail.get("error")}
+        if shadow is not None:
+            entry.update(shadow=True, verdict=shadow)
+        try:
+            self.audit.append(POLICY_ACTOR, "policy.judge", "tool:%s:%s" % (request["session"], request["tool"]), entry)
+        except OSError:
+            pass  # the audit is best effort here: a full disk must not stop a tool call
