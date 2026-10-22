@@ -302,6 +302,7 @@
       "bin/impact_hold.py",
       "bin/plan_check.py",
       "bin/plan_ledger.py",
+      "bin/private_dir.py",
       "bin/repo_exclusion.py",
       "docs/review-laws/impact-matrix.json"
     ],
@@ -341,6 +342,7 @@
         "bin/impact_floor.py",
         "bin/plan_check.py",
         "bin/plan_ledger.py",
+        "bin/private_dir.py",
         "bin/repo_exclusion.py",
         "plugins/fleet-hooks/**",
         "shims/**",

@@ -151,7 +151,7 @@ class Cache:
         if self.dir is None:
             return
         try:
-            os.makedirs(self.dir, mode=0o700, exist_ok=True)
+            _private_dir().ensure_dir(self.dir, check=False)
             temp = "%s.%d.tmp" % (self._path(run_id), os.getpid())
             fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, "w") as handle:
@@ -162,6 +162,21 @@ class Cache:
                 os.unlink(os.path.join(self.dir, old))
         except OSError:
             pass   # a cache that cannot be written only costs calls
+
+
+def _private_dir():
+    """The one directory helper (bin/private_dir.py, #708), loaded by path from beside this file, never imported by name."""
+    import importlib.util
+    import sys
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "private_dir.py")
+    held = sys.modules.get("private_dir")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("private_dir", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["private_dir"] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def leaf_of(name):
