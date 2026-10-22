@@ -47,7 +47,6 @@ OFFLINE = [
     ["reds"],
     ["pending"],
     ["intent"],
-    ["no-such-verb"],
     ["send"],
     ["report"],
 ]

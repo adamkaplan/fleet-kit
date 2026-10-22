@@ -1,8 +1,0 @@
-{
- "argv": [
-  "no-such-verb"
- ],
- "status": 2,
- "stderr": "usage: fleet-switchboard [-h]\n                         {status,run,send,report,notice,ensure,poke,launch,pending,remind,agents,charter,close-pane,daemon,decisions,labels,disk,whoami,comment,handoff,heavy,impact,install,key,restart,bootstrap,intent,intents,job,prove,verdict,item-prove,item-verdict,waive,gates,gates-check,load-replay,merge-gate,move,orders,plan,policy-report,judge-tool,pr-explain,pr-state,preflight-pr,read,reassign,reattach,reds,retire,review-laws,review,skills,triage,import-v1,watch,version} ...\nfleet-switchboard: error: argument action: invalid choice: 'no-such-verb' (choose from status, run, send, report, notice, ensure, poke, launch, pending, remind, agents, charter, close-pane, daemon, decisions, labels, disk, whoami, comment, handoff, heavy, impact, install, key, restart, bootstrap, intent, intents, job, prove, verdict, item-prove, item-verdict, waive, gates, gates-check, load-replay, merge-gate, move, orders, plan, policy-report, judge-tool, pr-explain, pr-state, preflight-pr, read, reassign, reattach, reds, retire, review-laws, review, skills, triage, import-v1, watch, version)\n",
- "stdout": ""
-}
