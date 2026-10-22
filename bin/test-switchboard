@@ -15704,7 +15704,7 @@ class TestOneCharter(Base):
     def functions_reading_charter():
         """{(file, function): (the function's AST node, whether it enumerates the agents)} for every function that reads a fleet's `charter`, DERIVED from the code."""
         found = {}
-        for rel in ("bin/fleet-switchboard", "bin/impact_hold.py", "bin/lanes.py", "bin/fleet_health.py", "bin/registry.py", "bin/reassign.py"):
+        for rel in ["bin/fleet-switchboard", "bin/impact_hold.py", "bin/lanes.py", "bin/fleet_health.py", "bin/registry.py", "bin/reassign.py"] + ["bin/" + str(f.relative_to(BIN)) for f in SWITCHBOARD_SOURCE_FILES if f != SWITCHBOARD]:
             tree = ast.parse((REPO / rel).read_text())
             for node in ast.walk(tree):
                 if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -15759,13 +15759,13 @@ class TestOneCharter(Base):
         ("bin/fleet-switchboard", "seam_applies"): "set: is this issue number known as a charter",
         ("bin/fleet-switchboard", "owned_numbers"): "registry: the numbers an agent owns (an orchestrator: its row's charter only; others: their own assignment)",
         ("bin/fleet-switchboard", "registry_charter_view"): "registry: every row's charter", ("bin/fleet-switchboard", "triage_context"): "registry: charters via owned_numbers (an orchestrator's issue is never a charter)",
-        ("bin/fleet-switchboard", "identify"): "own: copies the caller's own launch fields into its context",
+        ("bin/switchboard/judge_request.py", "identify"): "own: copies the caller's own launch fields into its context",
         ("bin/fleet-switchboard", "resume_agent"): "own: one agent's own repo lookup", ("bin/fleet-switchboard", "charter_pane_update"): "own: one agent's own charter for its pane",
         ("bin/fleet-switchboard", "_fleet_repo"): "own: one agent's own repo", ("bin/fleet-switchboard", "read_order_notices"): "own: the order notices' own records",
         ("bin/fleet-switchboard", "order_groups"): "own: groups order notices", ("bin/fleet-switchboard", "decisions_from_order_notices"): "own: words order notices",
-        ("bin/fleet-switchboard", "resolve_policy_context"): "own: one agent's own launch context", ("bin/fleet-switchboard", "_valid_context"): "own: a cached own context",
-        ("bin/fleet-switchboard", "charter_orders"): "own: an agent's own charter's orders", ("bin/fleet-switchboard", "charter_guard"): "own: an agent's own charters",
-        ("bin/fleet-switchboard", "ask_context_of"): "own: an agent's own ask context", ("bin/fleet-switchboard", "__call__"): "own: an orchestrator's own orders",
+        ("bin/switchboard/judge_request.py", "resolve_policy_context"): "own: one agent's own launch context", ("bin/fleet-switchboard", "_valid_context"): "own: a cached own context",
+        ("bin/fleet-switchboard", "charter_orders"): "own: an agent's own charter's orders", ("bin/switchboard/judge_request.py", "charter_guard"): "own: an agent's own charters",
+        ("bin/switchboard/judge_request.py", "ask_context_of"): "own: an agent's own ask context", ("bin/fleet-switchboard", "__call__"): "own: an orchestrator's own orders",
         ("bin/fleet_health.py", "figures"): "own: the health figures of one agent from the registry-derived info", ("bin/fleet_health.py", "_resolve_charters"): "own: the registry-derived info",
         ("bin/fleet_health.py", "_refresh_asks"): "own: the registry-derived info", ("bin/fleet-switchboard", "_import_fleet"): "own: the launch/import writer of the session's metadata",
     }
