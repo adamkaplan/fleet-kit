@@ -81143,6 +81143,40 @@ class TestMergeGateCommand(LedgerBase):
         self.assertEqual(self.run_as("coder", "merge-gate", self.PR, "--release")[0], 0)
         self.assertEqual(self.run_as("coder", "merge-gate", self.PR, "--check", "--json")[0], 10)
 
+    def audit_lines(self, event):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def test_pass_merge_does_the_pass_the_reread_and_one_squash_merge_in_this_process(self):
+        code, out, err = self.run_as("coder", "merge-gate", self.PR, "--pass", "--merge")
+        self.assertEqual(code, 0, err + out)
+        self.assertEqual(self.fake.merges, [["pr", "merge", "9", "-R", "acme/app", "--squash", "--match-head-commit", MG_HEAD]])
+        (line,) = self.audit_lines("merge_gate.pass_merge")
+        self.assertEqual((line["subject"], line["detail"]["head"], line["detail"]["outcome"], line["detail"]["pass"]), (self.PR, MG_HEAD, "merged", "ok"))
+        self.assertEqual(sorted(line["detail"]["reread"]), ["branch", "gates", "head", "labels"])
+        self.assertEqual(self.audit_lines("merge_gate.pass"), [])
+        self.assertEqual(self.run_as("coder", "merge-gate", self.PR, "--check", "--json")[0], 10, "the lock is released")
+
+    def test_a_blocking_review_refuses_the_merge_exit_10_releases_the_lock_and_audits_once(self):
+        self.fake.blocking_review = True
+        code, out, err = self.run_as("coder", "merge-gate", self.PR, "--pass", "--merge")
+        self.assertEqual(code, 10, err + out)
+        self.assertEqual(len(self.fake.merges), 1)
+        self.assertNotIn("--admin", " ".join(self.fake.merges[0]))
+        (line,) = self.audit_lines("merge_gate.pass_merge")
+        self.assertEqual(line["detail"]["outcome"], "refused: merge exit 10")
+        self.assertEqual(self.run_as("other", "merge-gate", self.PR, "--pass")[0], 0, "nobody holds the lock any more")
+
+    def test_pass_without_merge_never_merges_and_audits_as_before(self):
+        code, out, err = self.run_as("coder", "merge-gate", self.PR, "--pass")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.fake.merges, [])
+        self.assertEqual((len(self.audit_lines("merge_gate.pass")), self.audit_lines("merge_gate.pass_merge")), (1, []))
+        self.assertIn("gate passed for", out)
+
+    def test_merge_without_pass_is_a_usage_error(self):
+        self.assertNotEqual(self.run_as("coder", "merge-gate", self.PR, "--check", "--merge")[0], 0)
+        self.assertEqual(self.fake.merges, [])
+
     def test_a_waiver_for_the_merge_gate_is_a_gate_the_waive_command_knows_and_gates_other_than_it_still_work(self):
         self.assertEqual(self.run_as("cos", "waive", self.PR, "--gates", "mg,G1", "--reason", "the merge that fixes the red branch on main")[0], 0)
         (entry,) = self.ledger()
@@ -81724,6 +81758,10 @@ class TestMergeGateDocs(unittest.TestCase):
         self.assertIn("**It is the fleet's own merge queue.**", section)
         for statement in ("`fleet-switchboard merge-gate <repo#N>`** reads and writes nothing", "**The lock.**", "--gates MG"):
             self.assertEqual(section.count(statement), 1, statement)
+
+    def test_the_section_states_pass_merge_and_why_a_held_pull_request_keeps_the_two_step_form(self):
+        paragraphs = [p for p in self.section().split("\n\n") if "--pass --merge" in p and "held" in p.lower() and "two-step" in p]
+        self.assertEqual(len(paragraphs), 1)
 
     def test_the_configuration_example_uses_neutral_names(self):
         section = self.section()
