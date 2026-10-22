@@ -1,5 +1,7 @@
 """Offline tests for cloud/launcher/preflight.py (S1, U2): a loopback stub for the GitHub API; no network."""
+import contextlib
 import hashlib
+import io
 import http.server
 import shutil
 import json
@@ -41,6 +43,8 @@ class Stub(http.server.BaseHTTPRequestHandler):
     org_code = None  # status (or "drop") answered for any /orgs/ GET
     org_extra = []  # extra organization-sourced rules (ruleset 9) on top of the repository's own
     org_types = []  # rule types sourced from unreadable-able organization ruleset 9
+    bypass = []  # bypass_actors answered on ruleset 7
+    auto_merge = False  # allow_auto_merge answered on the repository
 
     def log_message(self, *a):
         pass
@@ -85,7 +89,7 @@ class Stub(http.server.BaseHTTPRequestHandler):
         if Stub.fail and path.endswith(Stub.fail):
             return self.reply(Stub.fail_code, {})
         if path == "/repos/" + REPO:
-            return self.reply(200, {"default_branch": Stub.default})
+            return self.reply(200, {"default_branch": Stub.default, "allow_auto_merge": Stub.auto_merge})
         if path.startswith("/repos/%s/rules/branches/" % REPO):
             out = []
             for x in Stub.rules:
@@ -104,7 +108,8 @@ class Stub(http.server.BaseHTTPRequestHandler):
             return self.reply(200, out)
         if path in ("/repos/%s/rulesets/7" % REPO, "/orgs/acme-org/rulesets/7"):
             cond = {"ref_name": {"include": Stub.include, "exclude": Stub.exclude}} if Stub.conditions == "ok" else None
-            return self.reply(200, {"id": 7, "target": Stub.target, "enforcement": Stub.enforcement, "conditions": cond})
+            return self.reply(200, {"id": 7, "target": Stub.target, "enforcement": Stub.enforcement, "conditions": cond,
+                                    "bypass_actors": Stub.bypass})
         for rid, body in Stub.extra.items():
             if path == "/repos/%s/rulesets/%d" % (REPO, rid):
                 return self.reply(200, body)
@@ -152,6 +157,7 @@ class Preflight(unittest.TestCase):
         Stub.review_count, Stub.enforcement, Stub.include, Stub.conditions = 1, "active", ["~DEFAULT_BRANCH"], "ok"
         Stub.exclude, Stub.target, Stub.default, Stub.rule_ids, Stub.extra, Stub.org, Stub.no_id = [], "branch", "main", {}, {}, False, False
         Stub.org_code, Stub.org_types, Stub.fail_code, Stub.org_extra, Stub.org_hint = None, [], 500, [], None
+        Stub.bypass, Stub.auto_merge = [], False
         Other.seen = []
         self.dir = tempfile.mkdtemp()
         # a private copy of the program: its repo-approvals.json is the only approvals file there is
@@ -532,6 +538,154 @@ class Preflight(unittest.TestCase):
                 self.assertNotIn(planted, p.stdout + p.stderr)
                 self.assertNotIn(TOKEN, p.stdout + p.stderr)
             self.assertEqual(os.listdir(d), [])
+
+
+# ---- #1031: the new checks and the one WARN-vs-BLOCK table ----
+sys.path.insert(0, os.path.dirname(PREFLIGHT))
+import preflight as pf  # noqa: E402
+
+CLEAN = FULL + ["required_status_checks"]   # no open action
+
+
+def _open_bypass():
+    Stub.bypass = [{"actor_id": 1, "actor_type": "Integration", "bypass_mode": "always"}]
+
+
+def _open_auto_merge():
+    Stub.auto_merge = True
+
+
+def _open_no_status_checks():
+    Stub.rules = list(FULL)
+
+
+def _open_queue():
+    Stub.rules = CLEAN + ["merge_queue"]
+
+
+# DATA: one row per key of preflight.CHECK_MODES: how to make that one action open on the stub (a completeness test checks the keys)
+OPENERS = {"bypass_actor": _open_bypass, "auto_merge": _open_auto_merge, "required_status_checks": _open_no_status_checks,
+           "merge_queue_change": _open_queue}
+EXPECTED_MODES = {"bypass_actor": "WARN", "auto_merge": "WARN", "required_status_checks": "WARN", "merge_queue_change": "WARN"}
+
+
+class OpenActions(Preflight):
+    def setUp(self):
+        super().setUp()
+        Stub.rules = list(CLEAN)
+
+    def test_the_mode_table_is_pinned_and_complete(self):
+        self.assertEqual(pf.CHECK_MODES, EXPECTED_MODES)   # a flip to BLOCK fails here: it is the owner's reviewed change
+        self.assertEqual(set(OPENERS), set(pf.CHECK_MODES))
+        self.assertEqual(set(pf.OPEN_ACTION_TEXT), set(pf.CHECK_MODES))
+        self.assertTrue(set(pf.CHECK_MODES.values()) <= set(pf.MODES))
+
+    def test_nothing_open_prints_no_warning(self):
+        p = self.run_pf()
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertNotIn("WARN", p.stdout)
+
+    def test_each_open_action_warns_once_names_itself_and_the_launch_continues(self):
+        for key, opener in OPENERS.items():
+            with self.subTest(key=key):
+                Stub.rules, Stub.bypass, Stub.auto_merge = list(CLEAN), [], False
+                opener()
+                p = self.run_pf()
+                self.assertEqual(p.returncode, 0, p.stdout)
+                lines = p.stdout.splitlines()
+                self.assertEqual([l for l in lines if "WARN open action" in l and (" %s:" % key) in l].__len__(), 1, p.stdout)
+                self.assertEqual(sum("WARN open action" in l for l in lines), 1, p.stdout)
+                self.assertTrue(lines[-1].startswith("preflight: preflight ok") and ("WARN open: " + key) in lines[-1], lines[-1])
+
+    def test_an_app_bypass_actor_is_the_only_bypass_that_warns(self):
+        Stub.bypass = [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]
+        p = self.run_pf()
+        self.assertNotIn("WARN", p.stdout)
+
+    def test_a_bypass_actor_of_a_ruleset_that_does_not_cover_the_branch_is_not_counted(self):
+        _open_bypass()
+        Stub.include = ["refs/heads/other"]
+        p = self.run_pf()
+        self.assertNotIn("WARN open action bypass_actor", p.stdout)
+
+    def run_blocked(self, key, mode="BLOCK"):
+        """pf.main in-process with ONE key switched to BLOCK; returns (exit code, output)."""
+        old, saved, out = dict(pf.CHECK_MODES), dict(os.environ), io.StringIO()
+        os.environ.update(CW_GITHUB_API_BASE=self.base, CW_PREFLIGHT_TOKEN_CMD="echo " + TOKEN)
+        try:
+            pf.CHECK_MODES[key] = mode
+            with contextlib.redirect_stdout(out):
+                rc = pf.main([REPO])
+        finally:
+            pf.CHECK_MODES.clear()
+            pf.CHECK_MODES.update(old)
+            os.environ.clear()
+            os.environ.update(saved)
+        return rc, out.getvalue()
+
+    def test_each_key_set_to_block_fails_naming_the_action_and_nothing_else_changes(self):
+        for key, opener in OPENERS.items():
+            with self.subTest(key=key):
+                Stub.rules, Stub.bypass, Stub.auto_merge = list(CLEAN), [], False
+                opener()
+                rc, text = self.run_blocked(key)
+                self.assertEqual(rc, 1, text)
+                self.assertIn("FAIL on main: open action %s:" % key, text)
+                self.assertNotIn("preflight ok", text)
+                self.assertEqual(text.count("FAIL"), 1, text)   # only the flipped key blocks
+
+    def test_a_mode_that_is_not_an_allowed_value_fails_closed_for_every_key(self):
+        bad = ["WRN", "BLCK", "", "warn", "block", " WARN", None, 0, 1, ["WARN"], ("WARN",), True]
+        for key, opener in OPENERS.items():
+            for mode in bad:
+                with self.subTest(key=key, mode=mode):
+                    Stub.rules, Stub.bypass, Stub.auto_merge = list(CLEAN), [], False
+                    opener()
+                    rc, text = self.run_blocked(key, mode)
+                    self.assertEqual(rc, 1, text)
+                    self.assertIn("FAIL on main: open action %s:" % key, text)
+                    self.assertNotIn("preflight ok", text)
+
+    def test_an_owner_approval_never_rescues_a_blocking_open_action(self):
+        for key, opener in OPENERS.items():
+            with self.subTest(key=key):
+                Stub.rules, Stub.bypass, Stub.auto_merge = list(CLEAN), [], False
+                Stub.org_types, Stub.org_code = list(FULL), 403
+                self.approvals({self.KEY: self.ENTRY})
+                opener()
+                if key == "required_status_checks":
+                    Stub.rules = list(FULL)
+                saved = pf.APPROVALS
+                pf.APPROVALS = os.path.join(self.copy, "repo-approvals.json")
+                try:
+                    rc, text = self.run_blocked(key)
+                finally:
+                    pf.APPROVALS = saved
+                self.assertEqual(rc, 1, text)
+                self.assertNotIn("NOT VERIFIED", text)
+                self.assertIn("open action %s:" % key, text)
+
+    def test_a_bypass_actor_of_a_ruleset_that_is_not_enforced_is_not_counted_and_every_ruleset_id_is_named(self):
+        _open_bypass()
+        Stub.enforcement = "evaluate"
+        self.assertNotIn("WARN open action bypass_actor", self.run_pf().stdout)
+        Stub.enforcement = "active"
+        Stub.rule_ids = {"deletion": 8}
+        Stub.extra = {8: {"id": 8, "target": "branch", "enforcement": "active", "bypass_actors": [{"actor_type": "Integration", "actor_id": 2}],
+                          "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}}}}
+        text = self.run_pf().stdout
+        self.assertIn("bypass actor of ruleset 7, 8", text)
+
+    def test_what_blocks_today_still_blocks_with_every_new_check_a_warning(self):
+        Stub.rules = ["non_fast_forward", "deletion", "required_status_checks"]
+        p = self.run_pf()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("missing a pull_request or merge_queue", p.stdout)
+
+
+for _n in dir(Preflight):   # reuse the fixture only: the inherited tests already run in Preflight
+    if _n.startswith("test_") and _n not in OpenActions.__dict__:
+        setattr(OpenActions, _n, None)
 
 
 if __name__ == "__main__":

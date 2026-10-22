@@ -79,13 +79,13 @@ say which pod or secret REMAINS, and the exit is non-zero (130 for a signal).
 
 ## The stack create and the fresh-node race
 
-`create --stack` watches a Pending pod for a bounded window (4 minutes, at most 3 attempts) and recreates it, with the same
+`create --stack` watches a Pending pod for a bounded window (`STACK_RACE_WINDOW_SECONDS`, 600 seconds, with a pause of `STACK_RACE_PAUSE_SECONDS`, 15 seconds, before each recreate; there is no attempt count) and recreates it, with the same
 run id and nonce and without touching the per-run secrets, in two cases. First, the node's runtime handler is not yet
 known (the exact `FailedCreatePodSandBox` message): the node's runtime is configured by the installer about 30 to 60
 seconds after scheduling. Second, the pending pod vanishes: a get that saw the pod then says not found, which live run B
-saw when that runtime restart took the Pending pod object with it. Each attempt writes one audit line (`attempt N of 3`,
-and `pod vanished` for the second case). Before a recreate the launcher checks that this call's own Secrets are still there: a missing one means an outside deletion (a stop, the reaper), which fails the create without recreating (the check also runs after a recreate and before ready; it narrows the race with a stop in flight and cannot close it, as the pod and Secret deletes are not one step: a stop deletes the pod first and the Secrets later, so the creator can recreate and the Secret deletes land after the last check; if that pod never starts, the create's own wait ends and its cleanup deletes it; if it started and was reported ready, the stop has finished and the only later catch is the reaper at `--hard` (or idle)). A pod that was never seen, and every other failure, is not retried. The window is checked after each attempt ends, so it bounds the count of attempts, not the wall time (worst case 3 times the `--wait` plus 150 s of delete wait). After the
-attempts or the window the create fails and the message names the race or the vanish. See `docs/cloud-worker-interface.md`.
+saw when that runtime restart took the Pending pod object with it. Each attempt writes one audit line (`attempt N`,
+and `pod vanished` for the second case). Before a recreate the launcher checks that this call's own Secrets are still there: a missing one means an outside deletion (a stop, the reaper), which fails the create without recreating (the check also runs after a recreate and before ready; it narrows the race with a stop in flight and cannot close it, as the pod and Secret deletes are not one step: a stop deletes the pod first and the Secrets later, so the creator can recreate and the Secret deletes land after the last check; if that pod never starts, the create's own wait ends and its cleanup deletes it; if it started and was reported ready, the stop has finished and the only later catch is the reaper at `--hard` (or idle)). A pod that was never seen, and every other failure, is not retried. A recreate starts only if one more pause plus one poll (2 seconds, `WAIT_POLL_SECONDS`) fits in what is left of the window, and a retry's wait is cut to the time left, so the window bounds the wall time (the delete wait of up to 150 s per recreate aside). After the
+window the create fails with one message that names the race or the vanish, the attempts made and the seconds spent. See `docs/cloud-worker-interface.md`.
 
 ## Driving a cloud worker from the switchboard (`launch --cloud`, `send`, `read`, `status`, `retire`)
 
@@ -94,12 +94,12 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
 | Setting | Meaning |
 |---|---|
 | `CW_ALLOWED_REPOS` | the repositories (`OWNER/NAME`, separated by commas; matched exactly, ASCII case-insensitively; empty means none; ONE malformed entry refuses the whole list, as the launcher's own `create` does; a malformed `CW_TOOLING_REPO` also refuses; checked before anything is created; `CW_TOOLING_REPO` is refused even if listed |
-| `CW_CLOUD_SERVER` (`CW_CLOUD_CA_FILE`) | the cluster API address |
+| `CW_CLOUD_SERVER` (`CW_CLOUD_CA_FILE`) | the cluster: an https URL whose host is a DNS name (`https://NAME[:PORT]`) |
 | `CW_CLUSTER_TOKEN_CMD` | a command that prints a cluster token; when unset the default below is used |
 | `CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME` | the vault that holds the cluster administrator credential (secret `CW_CLUSTER_ADMIN_SECRET`, default `cw-cluster-admin-kubeconfig`; or a command in `CW_CLUSTER_ADMIN_CMD`) |
 | `CW_CLUSTER_TOKEN_DURATION` | the token's requested life, default `20m`, at most `60m` (kubectl's own floor is 10 minutes) |
-| `CW_GIT_TOKEN_CMD` | prints the one-hour git token for the repository (default: `app_token.py OWNER/NAME`, same settings as `run_task.py`) |
-| `CW_MODEL_AUTH_FILE` | the OpenCode auth file; only its `github-copilot` entry is used |
+| `CW_GIT_TOKEN_CMD` | prints the one-hour git token for the repository (default: `app_token.py OWNER/NAME`, same settings as `run_task.py`); the managed reaper runs the same command to renew the token every 30 minutes |
+| `CW_OPENCODE_BIN` | the `opencode` program (default `opencode` on `PATH`); the launcher runs `opencode auth export` (fixed arguments, scrubbed environment, output through a pipe, in memory) and keeps only the one `github-copilot` entry, as a one-entry array. Refused by name: command missing or failing, no entry, two entries, an inactive entry, an entry that is not `oauth`; nothing is created |
 | `CW_PULL_SECRET` | optional: the image pull secret name passed to `create` |
 
 - **A cluster token per use.** Every command that needs the cluster mints its own token at that moment: the administrator
@@ -161,6 +161,44 @@ hash for the pod name. Shape rates are placeholders (`S` 0.10, `M` 0.20 USD/hour
 
 **Old names.** The launcher reads and writes only the neutral `cw` names (one table in `tests/test_cw_names.py`). No worker exists under an earlier name, and none is read: a pod or secret left under an old name is invisible to `status` and `reap` and must be removed by hand.
 
+## The git token and its renewal
+
+**The cause.** The token a worker pushes with is a one-hour GitHub App installation token (`app_token.py` refuses anything over 61 minutes),
+minted once at launch and stored as the `git-token` key of the per-run Secret `<worker>-run`. Nothing used to renew it, so a worker whose
+hard limit is one hour or more would lose push, and the end hook would lose its retire-time push, when that first hour ended.
+
+### How the git token is renewed
+
+The managed reaper's loop (`reap --loop`) does it, as one more step of each pass (`Launcher.renew_git_tokens`):
+
+- **When.** For each running pod, when the token is `GIT_TOKEN_RENEW_AFTER_SECONDS` (1800, so 30 minutes of its life are left) old. The age is the Secret's
+  `cw/git-token-minted` annotation, or the Secret's creation time when it has none. A pass that finds the token older than an hour (the machine slept) renews at once.
+- **How.** It mints through the SAME route as the launch (`run_git_token_cmd`: `CW_GIT_TOKEN_CMD`, else `app_token.py OWNER/NAME`), so one repository, the exact
+  permissions and the 61-minute cap hold by construction, and replaces only the `git-token` key by one merge patch whose body goes on standard input. The patch is bound to the exact Secret that was checked: its body carries that Secret's `metadata.uid` and `metadata.resourceVersion`, so the API server refuses it (Conflict) if the Secret changed or was made again while the mint ran (a relaunch of the same worker gets the same names); the labels are read again after the mint as a second guard. A refusal keeps the old state, writes one audit line (`the secret changed during the mint: not renewed`), names the worker in the report and is retried at the next pass. The token is
+  never in an argument, an environment value, a file, an output, an audit line or a record. The pod needs no change: its credential helper and `gh` wrapper read the file at every
+  call, and the file is a whole-directory projected volume (no `subPath`) that the kubelet refreshes, usually within a minute or two.
+- **For which repository.** The pod's `CW_REPO` must equal the `repo` of the switchboard's worker record (read only, `CW_CLOUD_RECORD_DIR`, which the renewal therefore needs in the reaper's
+  environment) and be on `CW_ALLOWED_REPOS`. A missing or unreadable record, a mismatch, a pod that is not running or past its hard limit, or a Secret that is not this run's stops the renewal.
+- **The reaper's own needs.** It runs the mint, so it reads the vault settings (`CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME`, from the settings file as the launcher does) and needs a signed-in `az` session and a network path the vault accepts.
+  Without them every renewal fails closed (below) and workers behave as before: they lose push at one hour.
+- **When it fails** (the vault, the lookup, the mint or the patch): the old token stays, one audit line (`action: renew-git-token`, `ok: false`, the reason, never a value) is written, and the next pass tries again. The worker is
+  named in the pass's report as `git token not renewed: ...` with exit 1, so its lane can retire it before the token ends. A failure that persists is audited once per CHANGE of reason, not every pass (the report still names the worker every pass); a renewal writes one `ok: true` line, which also marks a failure as cleared, and a `git token renewed` entry.
+- **Clock skew.** The age is judged by the reaper's clock against the stamp the reaper itself wrote (or the cluster's creation time): a skew of a few minutes between them shifts the renewal by that much, and a stamp from the future is not trusted (it is renewed at once). The 30-minute margin absorbs a skew of several minutes; a larger one is a clock to fix.
+
+#### Acting on an object later, by name
+
+A place that reads a Secret or pod and acts on it later by name either carries a precondition or says why not. Names come back: a stopped worker's pod and Secret names are
+the next run's names.
+
+| Place | Reads | Acts | Precondition, or why none |
+| --- | --- | --- | --- |
+| The git token renewal | the per-run Secret (labels, `uid`, `resourceVersion`) | one merge patch, by name, after a mint of up to a minute | Yes: the patch body carries the `uid` and `resourceVersion`; the labels are read again after the mint |
+| The launcher's cleanup of a failed create (`_cleanup`) | the object's run id (`_mine`) | deletes it by name | Accepted: the run id is read immediately before each delete (no mint, no hook, no wait between), and a create of that name is refused while the old object exists |
+| `stop` and the reaper's idle and hard-limit stops (`_remove`) | the pod (its `uid`) at the start, then each object's run id again (`_mine`) | deletes by name, after the end hook (which can take minutes) | Yes for the pod: the delete carries the `uid` read at the start as a precondition (`DeleteOptions.preconditions.uid`), so a pod that took the name meanwhile (the old one was removed by a node loss, an eviction, a preemption, a manual delete, or another stop) is left whole with one refused audit line, with or without a run id. The Secrets are matched by run id just before each delete (a few milliseconds); a stop with NO run id has no id to compare, so a Secret of the same name made in that gap is deleted by name |
+| `stop`: `annotate kept` and `annotate hook-ran` | the pod (its `uid`) at the start | one merge patch by name after the hook | Yes: the patch body carries the `uid` (the API server refuses a mismatch). A changed pod is not marked, with one audit line: for `hook-ran` that leaves `delete` refusing (the safe side), for `kept` the failed hook's error is reported with it |
+| `delete` (no run id given) | the pod (its `uid`) | deletes the pod (bound to that `uid`) and both Secrets | The pod delete is bound; the two Secrets are deleted by name, by the operator's explicit command, with no run id to compare (`--force` is its own statement). Note: `delete` without `--force` trusts the `hook-ran` marker, which a stop now writes only onto the pod it read |
+| `extend` | the pod (its `uid`) | annotates the deadline, bound to that `uid` | Yes: a changed pod is not extended (run it again) |
+
 ## Server-side guards: `app_token.py` and `preflight.py`
 
 A guard is enforced where the action takes effect (the repository's rules, the token's scope), not in a wrapper.
@@ -169,16 +207,28 @@ These two programs are the server side of that. Neither writes a file; neither p
 **`app_token.py OWNER/REPO`** prints a one-hour GitHub App installation token for that one repository, and nothing
 else, on stdout. It refuses (exit 1, one line on stderr naming the key, never a value) to print a token unless:
 
-- the answer lists exactly the one repository and expires within 61 minutes, and
-- its `permissions` equal exactly `contents: write`, `pull_requests: write`, `metadata: read`: no extra key, no higher
-  level, none missing.
+- the installation is found, not stored: the mint asks GitHub (`GET /repos/OWNER/REPO/installation`, signed with the App's
+  own short-lived token) which installation covers the repository, and refuses unless that answer is one installation whose
+  account is the repository owner (case-insensitive) and which is not suspended. A repository the App is not installed on
+  is refused with a message that says so, before any pod exists. To cover a new repository, install the App on the account
+  that owns it and add the repository to that installation (an App installed on two accounts mints for each of them);
+- the answer lists exactly the one repository and expires within 61 minutes; and
+- its `permissions` equal exactly `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read` (the one table, `EXPECTED_PERMISSIONS`; the request asks for the same four
+  and the answer is checked again): no extra key, no higher level, none missing.
+
+The worker can now read issues and their comments of its own repository (its ask and plan), through `issues: read`.
+It cannot write issues, labels, merges or settings; `issues: read` opens no write path, and the worker's `gh` wrapper
+still refuses every such write (a second line behind GitHub's own permission). The one owner step, in this order: merge the
+change, then add `issues: read` to the App's permissions and accept it on each installation. Until then a launch is refused
+before any pod exists, with one line that names `issues` and the owner step (the mint fails closed rather than also
+accepting the old set). The exact refusal GitHub gives for a permission granted but not yet accepted is not verified live.
 
 The private key travels only through a pipe to `openssl`; only `https://api.github.com` is used (`CW_GITHUB_API_BASE`
 may name a loopback `http` address, for tests).
 
 **`preflight.py OWNER/REPO [--branch NAME] [--accept-classic]`** reads, with GET only, whether the default branch
 refuses direct pushes (a `pull_request` rule that requires at least one approving review, or a `merge_queue` rule, in an active ruleset that covers the branch; `evaluate` and `disabled` rulesets and rulesets not covering the branch are refused by name; ref patterns follow GitHub: `*` stops at `/`, `**` crosses it, and a pattern the program does not understand, such as a character class, covers nothing), force-pushes (`non_fast_forward`) and deletion
-(`deletion`). Exit 0 prints `preflight ok: <rules>`; exit 1 names each missing rule; exit 2 means the answer could not
+(`deletion`). Exit 0 prints `preflight ok: <rules>` (with `; WARN open: <actions>` when a new check is open: an App bypass actor, auto-merge, no required status check, a merge queue; each also has its own `preflight: WARN open action <name>: ...` line, and the launch continues; the one table `CHECK_MODES` in `preflight.py` decides WARN or BLOCK, and a flip to BLOCK is a reviewed change); exit 1 names each missing rule; exit 2 means the answer could not
 be read. A branch protected only by classic branch protection fails closed (a read-only token cannot see its review
 requirement); `--accept-classic` is the explicit, owner-approved override and prints a warning. It overrides only that one failure (the review requirement on a branch GitHub reports as protected), never an unreadable answer, an unprotected branch, or a missing `non_fast_forward` or `deletion` rule. Redirects are never followed, and `OWNER/REPO` may not contain a `.` or `..` segment. It cannot see bypass
 actors: the live refusal check on a disposable repository is the real proof.
@@ -216,8 +266,8 @@ Residual: an agent that runs as the owner's operating-system user can edit any l
 program. The approvals file is no weaker than the code itself; the repository's review gate and the owner's clear are
 what protect both.
 
-Settings (environment): `CW_APP_ID_CMD`, `CW_APP_KEY_CMD`, `CW_APP_INSTALLATION_CMD` (each a command printing the
-value; otherwise read from the vault), `CW_VAULT_SUBSCRIPTION` and `CW_VAULT_NAME` (no defaults), `CW_OPENSSL`,
+Settings (environment): `CW_APP_ID_CMD`, `CW_APP_KEY_CMD` (each a command printing the
+value; otherwise read from the vault; `CW_APP_INSTALLATION_CMD` and the vault secret `cw-app-installation-id` are obsolete: accepted, never run), `CW_VAULT_SUBSCRIPTION` and `CW_VAULT_NAME` (no defaults), `CW_OPENSSL`,
 `CW_GITHUB_API_BASE` (tests), `CW_PREFLIGHT_TOKEN_CMD` (tests: replaces the mint in the preflight).
 
 **Repository allow-list.** `create` (and the driver, `run-task`, through the same function `check_repo_allowed`) launches only for a repository the owner listed. `CW_ALLOWED_REPOS` is a comma-separated list of `OWNER/NAME`, compared exactly and case-insensitively; no wildcard. Unset, empty, or any entry that is not `OWNER/NAME` shaped (a dot segment, a space, a `*`, an extra slash) refuses everything (fail closed). `CW_TOOLING_REPO` (`OWNER/NAME`) names the tooling's own repository, which is refused even when it is listed; unset adds no extra check, malformed refuses. A refused repository exits `2` with `refused: <repo> is not on the cloud allow-list` before any `kubectl` call, so nothing is created. Both settings are read from the environment of whoever runs the launcher or the driver, like the other `CW_` settings: the operator exports them in the shell (or the service unit) that starts it. An agent running as the same user could set them for a command it runs, so the list is a mistake-guard for the operator, not a boundary; the stops are the token's one-repository scope and the repository's own rules. The check compares spellings: a renamed or transferred repository is not matched by its old name, and an entry or tooling value ending in `.git` is malformed and refuses. The guard table is `docs/cloud-guard-parity.md`.

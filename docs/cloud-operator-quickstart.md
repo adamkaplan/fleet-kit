@@ -40,13 +40,13 @@ ${EDITOR:-vi} ~/.config/fleet-switchboard/cloud.env
 ls -l ~/.config/fleet-switchboard/cloud.env   # -rw-------
 ```
 
-Each setting's name, whether the file requires it, and its kind (name, path, command, digest-ref, number, secret-name, duration):
+Each setting's name, whether the file requires it, and its kind (name, https URL, path, command, digest-ref, number, secret-name, duration):
 
 | Setting | Required | Kind | What it is |
 |---|---|---|---|
 | `CW_ALLOWED_REPOS` | yes | name | comma-separated `OWNER/NAME` the launcher may use, e.g. `acme-org/widget-service`; no wildcard. Unset or empty refuses everything. |
 | `CW_CLOUD_IMAGE` | yes | digest-ref | the worker image, by digest: `name@sha256:<64 hex>`; a tag refuses. (`--image` on the command line stays as it was.) |
-| `CW_CLOUD_SERVER` | yes | name | the cluster API address: `https://NAME[:PORT]`, where NAME is a DNS name with at least two labels (an IP address of any form, including `[::1]`, `127.1` and `0x7f000001`, is refused: a cluster reached by IP needs a DNS name), a last label that has a letter and is not all digits or `0x`, and a port from 1 to 65535; no user, query, fragment, path, `file:` or `http:` |
+| `CW_CLOUD_SERVER` | yes | https URL | an https URL whose host is a DNS name (`https://NAME[:PORT]`), where NAME is a DNS name with at least two labels (an IP address of any form, including `[::1]`, `127.1` and `0x7f000001`, is refused: a cluster reached by IP needs a DNS name), a last label that has a letter and is not all digits or `0x`, and a port from 1 to 65535; no user, query, fragment, path, `file:` or `http:` |
 | `CW_VAULT_SUBSCRIPTION` | yes | name | the vault's subscription, a GUID |
 | `CW_VAULT_NAME` | yes | name | the vault's name: 3 to 24 letters, digits and hyphens, starting with a letter |
 | `CW_CLOUD_NAMESPACE` | yes | name | the namespace the workers live in: a DNS label; `default` and `kube-*` are refused |
@@ -54,7 +54,7 @@ Each setting's name, whether the file requires it, and its kind (name, path, com
 | `CW_CLOUD_CA_FILE` | no | path | absolute path to the cluster's CA certificate |
 | `CW_PULL_SECRET` | no | name | name of the image pull secret in the namespace (the name, never its content) |
 | `CW_KUBECTL` | no | path | the `kubectl` program (default: `kubectl` on `PATH`) |
-| `CW_MODEL_AUTH_FILE` | no | path | the OpenCode auth file; only its `github-copilot` entry travels to the worker |
+| `CW_OPENCODE_BIN` | no | path | the `opencode` program the launcher runs as `opencode auth export` (default: `opencode` on `PATH`); only the `github-copilot` entry of its output travels to the worker. The old `CW_MODEL_AUTH_FILE` is retired: a settings file that still has it is refused as an unknown setting |
 | `CW_RUN_RECORD_DIR` | no | path | where the run record is written when a worker stops (default: `runs/` beside the audit file) |
 | `CW_CLOUD_SPEND_CAP_USD` | no | number | spend cap in USD for one create (default 25; an invalid value refuses) |
 | `CW_CLUSTER_TOKEN_CMD` | no | command | a command that prints a short-lived cluster token (instead of the vault route) |
@@ -62,8 +62,11 @@ Each setting's name, whether the file requires it, and its kind (name, path, com
 | `CW_CLUSTER_ADMIN_SECRET` | no | secret-name | the name of the vault secret that holds the cluster administrator kubeconfig (default `cw-cluster-admin-kubeconfig`): 1 to 127 letters, digits and hyphens; the name, never its content |
 | `CW_CLUSTER_TOKEN_DURATION` | no | duration | the cluster token's requested life: 1 to 3 digits and `m` or `h`, from `1m` to `60m` (default `20m`; `1h` is the same as `60m`) |
 | `CW_GIT_TOKEN_CMD` | no | command | a command that prints the one-hour git token; default is the GitHub App mint beside the launcher (`app_token.py`) |
-| `CW_APP_ID_CMD`, `CW_APP_INSTALLATION_CMD`, `CW_APP_KEY_CMD` | no | command | commands that print the GitHub App's id, installation id and key instead of the vault read (`app_token.py`) |
+| `CW_APP_ID_CMD`, `CW_APP_KEY_CMD` | no | command | commands that print the GitHub App's id and key instead of the vault read (`app_token.py`) |
+| `CW_APP_INSTALLATION_CMD` | no | command | obsolete: accepted and ignored, never run. The installation is looked up per repository (see the next paragraph); the vault no longer needs `cw-app-installation-id` |
 | `CW_VAULT_CHECK_DIR` | no (needed once the vault refuses this machine) | path | the checkout of the vault access check, an absolute path (see section 2b) |
+
+How the installation is found: the mint signs a short-lived App token and asks GitHub which installation covers the repository (`GET /repos/OWNER/REPO/installation`), then mints the one-repository token for that installation. The answer must be one installation whose account is the repository's owner. A repository the App is not installed on is refused before any pod is created, with a message that says so. To cover a new repository, install the App on the account that owns it (an App installed on two accounts serves both) and add the repository to the installation; nothing in the vault changes.
 
 Names the code reads that are deliberately not settings (set by the launcher itself, the other login kind, tuning knobs with safe defaults, test hooks) are listed, each with its reason, in `cloud/launcher/tests/test_cloud_settings.py` (`NOT_SETTINGS`); a test fails when the code reads a `CW_*` name that is neither a row here nor on that list.
 
@@ -75,7 +78,7 @@ The template (neutral placeholders; copy, edit, keep only what you need, and set
 CW_ALLOWED_REPOS=acme-org/widget-service
 # the worker image, by digest
 CW_CLOUD_IMAGE=registry.example.internal/acme/worker@sha256:0000000000000000000000000000000000000000000000000000000000000000
-# the cluster API address
+# the cluster: an https URL whose host is a DNS name (https://NAME[:PORT])
 CW_CLOUD_SERVER=https://cluster.example.internal:6443
 # the vault that holds the cluster login
 CW_VAULT_SUBSCRIPTION=00000000-0000-0000-0000-000000000000
@@ -90,8 +93,8 @@ CW_CLOUD_NAMESPACE=cw
 # CW_PULL_SECRET=acme-pull
 # optional: the kubectl program
 # CW_KUBECTL=/usr/local/bin/kubectl
-# optional: the OpenCode auth file
-# CW_MODEL_AUTH_FILE=/home/user/.local/share/opencode/auth.json
+# optional: the opencode program (default: opencode on PATH)
+# CW_OPENCODE_BIN=/usr/local/bin/opencode
 # optional: where run records are written
 # CW_RUN_RECORD_DIR=/home/user/cloud-runs
 # optional: the spend cap in USD for one create
@@ -104,7 +107,6 @@ CW_CLOUD_NAMESPACE=cw
 # CW_CLUSTER_TOKEN_DURATION=20m
 # CW_GIT_TOKEN_CMD=/home/user/bin/print-git-token
 # CW_APP_ID_CMD=/home/user/bin/print-app-id
-# CW_APP_INSTALLATION_CMD=/home/user/bin/print-app-installation
 # CW_APP_KEY_CMD=/home/user/bin/print-app-key
 # optional, but needed when the vault refuses this machine: the vault access check's checkout
 # CW_VAULT_CHECK_DIR=/home/user/vault-check
@@ -122,6 +124,8 @@ Nothing needs to be on your `PATH`. `launch --cloud` (and `send`, `read`, `retir
    "Own checkout" means the checkout that holds the running `bin/cloud_worker.py`, never the working directory. A lane that runs the switchboard from a worktree of a branch under review therefore uses THAT branch's launcher: it is the same checkout as the running script, so the trust root is unchanged.
 3. `cloud-worker` on the `PATH`, as before.
 4. Otherwise `launch` refuses (exit status 2, before any vault, cluster or launcher call), naming `FLEET_CLOUD_WORKER_BIN` and the checkout path it looked in.
+
+Limit: the checks judge the launcher file once, just before it runs. A process running as the same user can still replace the file in that window, or edit the switchboard itself: the checks guard against OTHER users, not against yourself.
 
 ## 2. Order of checks
 
@@ -141,7 +145,7 @@ The child sees only:
 - a fixed `PATH` (`/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin`), never yours;
 - an empty private `HOME` and `TMPDIR`, removed when the check ends;
 - `AZURE_CONFIG_DIR`: yours when it is an absolute existing directory, else `~/.azure` of your account (read from the password database, not `$HOME`);
-- `LANG`/`LC_*` and the token route's settings (`CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME`, `CW_APP_ID_CMD`, `CW_APP_INSTALLATION_CMD`, `CW_APP_KEY_CMD`), and `CW_OPENSSL` only when it is an absolute executable file.
+- `LANG`/`LC_*` and the token route's settings (`CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME`, `CW_APP_ID_CMD`, `CW_APP_KEY_CMD`, and the obsolete `CW_APP_INSTALLATION_CMD`, which is passed through and ignored), and `CW_OPENSSL` only when it is an absolute executable file.
 
 `CW_GITHUB_API_BASE`, `CW_PREFLIGHT_TOKEN_CMD`, `CW_GIT_TOKEN_CMD`, proxy variables, `GH_`/`GITHUB_` token variables, `HOME` and `PATH` set in your shell are ignored by `launch --cloud` and `run-task`: nothing in the environment can point the check at another host, and your `HOME`, `PATH` and `PYTHON*` cannot run code inside it. The token route's own settings (`CW_APP_*_CMD`, `CW_OPENSSL`, `AZURE_CONFIG_DIR`) are trusted operator configuration: they are run or read as given.
 
@@ -199,7 +203,7 @@ fleet-switchboard launch coder7 --cloud --stack --agent coder --repo acme-org/wi
 - `--stack` is handed to the launcher's `create` and only then: a launch without it builds exactly the pod it always did.
 - The pod runs on the Sysbox runtime class (`sysbox-runc`) in its own user namespace, as a non-root user. No capability is added, it is never privileged, and it has no host path, Docker socket or service-account token.
 - `--shape` is `S` (2 CPU, 4 GiB) or `M` (4 CPU, 8 GiB). Leave it out for the launcher's own default, `S` (4 GiB): the measured stack lane peaked at 0.8 to 1.35 GiB. The memory limit stays; the pod is never unlimited.
-- The first pod on a fresh node may wait for the node's runtime to be ready (a short delay, a few minutes at most); the launcher notices that case and creates the pod again, up to 3 attempts. You do not retry it.
+- The first pod on a fresh node may wait for the node's runtime to be ready (a short delay, a few minutes at most); the launcher notices that case and creates the pod again after a pause of 15 seconds (`STACK_RACE_PAUSE_SECONDS`), for as long as a retry fits in a window of 600 seconds (`STACK_RACE_WINDOW_SECONDS`); a fresh node can take 3 to 5 minutes. If the window ends, the launcher says so once (the attempts and the seconds spent) and leaves no pod. You do not retry it.
 - `--stack` needs `--cloud`, and an unknown `--shape` is refused with `--stack`. `--stack` without `--cloud` is refused first of all; an unknown shape is refused right after the allow-list check (step 1 of section 2). Both exit 2 before any token is minted or any cluster call is made, and the order of section 2 is unchanged. `--shape` without `--stack` is passed to the launcher as before.
 
 ## 4. What a worker can and cannot do
@@ -228,3 +232,27 @@ merges), so a sleeping Mac delays a stop but cannot leave a worker running past 
 
 - Stopping a worker by name alone: #682.
 - A layer scan of the worker image: #691.
+
+## The GitHub App's permissions
+
+The token the launcher mints asks for, and accepts, exactly `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read`. The worker can read issues and their comments of its own repository and cannot write issues, labels, merges or settings.
+
+The owner step, done only after the change that adds `issues: read` is merged: add `issues: read` to the App's permissions, then accept it on each installation. Until both are done a launch is refused before any pod exists, with a line that names `issues` and this step. See `docs/agent-credentials.md`.
+
+## The model credential
+
+The launcher reads the live model credential from OpenCode's own store with `opencode auth export` (in memory, never a file, never printed) and copies only the one `github-copilot` entry into the per-run Secret. The pod imports it with `opencode auth import --standalone` before its server starts. The legacy `auth.json` is not read: the server ignores it.
+
+What to know before you run it:
+
+- **A worker can read the credential.** For the life of its pod, the worker can read the one-entry array (the access entry and its refresh token) at `/run/cw/model-auth` and the store under `XDG_DATA_HOME`. The worker's shell deny rules are not a guard against that. Whether it could send the value out depends on the pod's network egress, which this change does not restrict.
+- **The pod holds a snapshot taken at launch.** Nothing re-reads your store. A credential that is revoked or rotated ends that pod's turns; a refresh token you rotate afterwards is not pushed to a running pod. Launch a new run to pick it up.
+- **A stale `CW_MODEL_AUTH_FILE` is retired, and what happens depends on where it is.** In a settings file it is refused as an unknown setting. In the process environment it is silently ignored (the launcher drops it), so the credential that is active in your store is used with no message.
+- **Image and launcher must match.** An old image with the new launcher answers on the free model (it never imports the credential). The old launcher with the new image refuses at the import (`worker: the model credential import failed; refusing to start`).
+
+To verify it:
+
+- On the launcher's machine, `opencode auth list` shows the `github-copilot` entry as active.
+- On a worker, its server's `/api/provider` lists `github-copilot` (a pod that lists only the built-in `opencode` provider answers on the free fallback model and is rate limited).
+
+The worker image carries `cloud/worker/entrypoint.sh`, so the order is: merge, an operator rebuilds the image and switches the digest in the settings file, then run the check above on one no-op worker.
