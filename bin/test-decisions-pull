@@ -685,7 +685,7 @@ class RealDaemon(unittest.TestCase):
                 module = load()
                 pull_quiet(module, state, good(), NOW, age=age)
                 if age > 180:
-                    fresh_file(state, age=age)
+                    fresh_file(state, text=json.dumps(BODY, indent=1, sort_keys=True) + "\n", age=age)
                     pull_quiet(module, state, good(), NOW, age=age)
                 out = subprocess.run([node, "--input-type=module", "-e", script, state, str(int(NOW * 1000))], stdout=subprocess.PIPE, check=True).stdout
                 self.assertEqual(out.decode().strip(), want)
