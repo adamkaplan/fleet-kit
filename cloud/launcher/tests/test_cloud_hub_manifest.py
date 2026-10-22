@@ -24,7 +24,8 @@ class T(unittest.TestCase):
         self.docs = parse(self.text)
 
     def test_kinds(self):
-        self.assertEqual(sorted(d["kind"] for d in self.docs), ["Deployment", "Secret", "Secret", "Service"])
+        self.assertEqual(sorted(d["kind"] for d in self.docs), ["Deployment", "Secret", "Secret", "Service", "Service"])
+        self.assertEqual(sorted(d["metadata"]["name"] for d in self.docs if d["kind"] == "Service"), ["cloud-hub", "cw-agents"])
         self.assertEqual(sorted(d["metadata"]["name"] for d in self.docs if d["kind"] == "Secret"), ["cloud-hub-pw", "cloud-hub-registry"])
         self.assertEqual(kinds_bad(self.docs), [])
 
@@ -78,10 +79,19 @@ class T(unittest.TestCase):
         self.assertEqual(sp["volumes"][0]["secret"]["secretName"], hr.HUB_REGISTRY_SECRET)
 
     def test_service(self):
-        s = [d for d in self.docs if d["kind"] == "Service"][0]
+        s = [d for d in self.docs if d["kind"] == "Service" and d["metadata"]["name"] == "cloud-hub"][0]
         self.assertEqual(s["spec"]["type"], "ClusterIP")
         self.assertEqual(s["spec"]["ports"][0]["port"], 8443)
         self.assertEqual(s["spec"]["ports"][0]["name"], "http")
+
+    def test_agents_headless_service(self):
+        s = [d for d in self.docs if d["kind"] == "Service" and d["metadata"]["name"] == "cw-agents"][0]
+        self.assertEqual(s["spec"]["clusterIP"], "None")
+        self.assertEqual(s["spec"]["selector"], {"app": "cw-worker"})
+        self.assertIs(s["spec"]["publishNotReadyAddresses"], True)
+        self.assertEqual(len(s["spec"]["ports"]), 1)
+        p = s["spec"]["ports"][0]
+        self.assertEqual((p["port"], p["name"], p["protocol"]), (4096, "agent", "TCP"))
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-# The cloud hub (ask #1161): Deployment, Service and two Secrets (registry, and an empty password Secret), all in the workers namespace, nothing cluster-wide.
+# The cloud hub (ask #1161): Deployment, two Services (cloud-hub, and the headless cw-agents) and two Secrets (registry, and an empty password Secret), all in the workers namespace, nothing cluster-wide.
 # Every object carries app.kubernetes.io/part-of=cloud-hub: remove all with
 #   kubectl -n cw delete deployment,service,secret -l app.kubernetes.io/part-of=cloud-hub
 # IMAGE_DIGEST is a placeholder: the operator replaces it with the settings' CW_CLOUD_IMAGE (name@sha256:...). No real digest is held here.
@@ -55,6 +55,33 @@
         "name": "http",
         "port": 8443,
         "targetPort": 8443
+      }
+    ]
+  }
+}
+---
+{
+  "apiVersion": "v1",
+  "kind": "Service",
+  "metadata": {
+    "name": "cw-agents",
+    "namespace": "cw",
+    "labels": {
+      "app.kubernetes.io/part-of": "cloud-hub"
+    }
+  },
+  "spec": {
+    "clusterIP": "None",
+    "publishNotReadyAddresses": true,
+    "selector": {
+      "app": "cw-worker"
+    },
+    "ports": [
+      {
+        "name": "agent",
+        "port": 4096,
+        "targetPort": 4096,
+        "protocol": "TCP"
       }
     ]
   }
