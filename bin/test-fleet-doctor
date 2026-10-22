@@ -336,5 +336,68 @@ class DelegatedOrderCheck(DoctorCase):
                 run.run()
                 self.assertTrue(self.only(run, "delegated-order").startswith("FAIL "), run.output)
 
+class CloudCharter(DoctorCase):
+    """#1181: a charter whose pane line is `cloud:<agent name>` is live when its row's endpoint answers, unknown when not, never a dead pane."""
+
+    def charter_run(self, answer):
+        import http.server, json, socket, threading
+        tmp = tempfile.mkdtemp(prefix="test-fleet-doctor.")
+        self.addCleanup(shutil.rmtree, tmp, True)
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b'[{"id": "msg_example"}]'
+                self.send_response(200 if answer else 503)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        state = Path(tmp) / "state"
+        state.mkdir()
+        sys.path.insert(0, str(BIN))
+        import registry
+        registry.upsert(state, "orch-cloud", {"session": "ses_example1", "pane": None, "role": "orchestrator", "kind": "orchestrator",
+                                              "endpoint": "http://127.0.0.1:%d" % server.server_address[1], "workspace": None, "cwd": None})
+        token = Path(tmp) / "token"
+        token.write_text("example-channel-token\n")
+        body = "```yaml\nstatus: active\npane: cloud:orch-cloud\n```"
+        stubs = {
+            "herdr": "  echo '{\"result\": {\"panes\": []}}'",
+            "gh": "  true",
+        }
+        run = DoctorRun(tmp, stubs)
+        (run.path_dir / "herdr").write_text("#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo 'herdr 1.0.0' && exit 0\necho '{\"result\": {\"panes\": []}}'\n")
+        (run.path_dir / "gh").write_text("#!/bin/sh\ncase \"$*\" in\n  *'issue list'*'--label'*) cat \"%s\";;\n  *'api repos'*) echo true;;\n  *) echo 1;;\nesac\nexit 0\n" % (Path(tmp) / "issues.json"))
+        (Path(tmp) / "issues.json").write_text(json.dumps([{"number": 7, "title": "charter", "body": body}]))
+        sock = Path(tmp) / "h.sock"
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(sock))
+        self.addCleanup(listener.close)
+        run.extra_env.update({"HERDR_SOCKET_PATH": str(sock), "FLEET_REPO": "acme-org/widget-service", "FLEET_REGISTRY_DIR": str(state),
+                              "FLEET_CLOUD_TOKEN_FILE": str(token)})
+        run.run()
+        return run
+
+    def test_an_answering_endpoint_is_live(self):
+        run = self.charter_run(True)
+        text = "\n".join(run.lines("charters"))
+        self.assertIn("cloud charter(s) live", text, run.output)
+        self.assertNotIn("dead pane", text)
+        self.assertNotIn("unknown", text)
+
+    def test_a_failing_endpoint_is_unknown_never_a_dead_pane(self):
+        run = self.charter_run(False)
+        text = "\n".join(run.lines("charters"))
+        self.assertIn("unknown (the endpoint did not answer", text, run.output)
+        self.assertNotIn("name a dead pane", text)
+        self.assertNotIn("live", text)
+
+
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
