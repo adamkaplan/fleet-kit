@@ -441,7 +441,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "blocked_alert", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base"}
 
 
 CONFIG_DECLARATION_TEXT = re.compile(rb'^[ \t]*CONFIG_KEY[ \t]*(?::[^=\n]*)?=[ \t]*[\'"]([^\'"\n]*)[\'"]', re.M)   # only the fallback for a file that does not parse
@@ -670,6 +670,7 @@ def validate_config(raw, source="config"):
     validate_decisions_config(config, source)  # PR 14
     validate_external_config(config, source)
     validate_friction_config(config, source)
+    validate_blocked_alert_config(config, source)
     validate_load_alert_config(config, source)
     validate_source_budgets(config, source)   # #494
     validate_worktree_config(config, source)
@@ -5019,6 +5020,10 @@ class Switchboard:
             except Exception as err:
                 self._failed(recipient, "deliver", err, report)
         self.render(discovery, held, now, report)
+        try:
+            blocked_tick(self, discovery, held)
+        except Exception as err:
+            self._failed("blocked-alert", "blocked-alert", err, report)
         finish_pass(self, discovery, report)
         if self.reads.deferred:   # the budget kept what was remembered for this many reads this pass: said, once per change of the count
             self._note("v2_reads.deferred", None, {"reads": self.reads.deferred})
@@ -5162,6 +5167,7 @@ class Switchboard:
         if plan.action == "hold":
             if self.audit is not None:
                 self.audit.append(self.actor, "hold", recipient, {"reason": plan.reason, "keys": [fact.key]})
+            note_held_send(self.state_dir, recipient, fact.sender, now, plan.observation)
             return {"sent": False, "action": "hold", "reason": plan.reason}
         return self.deliver(plan, interrupt=interrupt)
 
@@ -6165,9 +6171,9 @@ def launch_problems(name, agent, directory, workspace, issue, charter=None, head
     return problems
 
 
-def fleet_record(name, role, reports_to, issue, charter=None, repo=None, launched_by=None):
+def fleet_record(name, role, reports_to, issue, charter=None, repo=None, launched_by=None, read_repo=None):
     fleet = {"name": name, "role": role, "reports_to": reports_to, "issue": None if issue is None else int(issue),
-             "charter": charter, "repo": repo, "launched_by": launched_by}   # launched_by (#372): the agent that ran `launch`, as its pane identified it; None from a plain shell
+             "charter": charter, "repo": repo, "launched_by": launched_by, "read_repo": read_repo}   # launched_by (#372): the agent that ran `launch`, as its pane identified it; None from a plain shell
     return {key: value for key, value in fleet.items() if value is not None}
 
 
@@ -6336,7 +6342,7 @@ def record_launch_charter(engine, name, session_id, fleet, pane=None):
 
 
 def launch_agent(engine, name, agent, directory, workspace, role=None, reports_to=None, issue=None,
-                 brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None, repo=None, launched_by=None):
+                 brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None, repo=None, launched_by=None, read_repo=None):
     """Create a fleet agent: a v2 session, its own herdr tab, the brief.
 
     Nothing is typed. The tab's program is started by argv through herdr's
@@ -6351,7 +6357,7 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
     taken = engine.discover(engine.now()).agents.get(name)
     if taken is not None:
         raise LaunchError("a fleet agent named %s already runs in pane %s" % (name, taken.pane))
-    fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by)
+    fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by, read_repo)
     env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
     env.update(view_env(role, repo or (engine.config.get("intent_repo") if charter else None)))  # PR 18
     env.update(agent_tmp_env(engine, name))   # #767: before the session exists, so a failure leaves nothing started
@@ -9652,7 +9658,11 @@ def cmd_whoami(args, runner, now):
         own = repo or _fleet_repo(fleet, config)
         # `own` is false when the repo is only the config's `intent_repo` default: an agent with no repo of its own (the Chief of Staff) has no account of
         # its own to keep, so the gh shim may use the account of the repo a command names
-        print(json.dumps({"name": fleet["name"], "repo": own or config.get("intent_repo") or None, "own": bool(own), "role": fleet.get("role") if isinstance(fleet.get("role"), str) else None}, sort_keys=True))   # the RECORDED role: the gh shim gives only the Chief of Staff the named repository's App token
+        who = {"name": fleet["name"], "repo": own or config.get("intent_repo") or None, "own": bool(own), "role": fleet.get("role") if isinstance(fleet.get("role"), str) else None}   # the RECORDED role: the gh shim gives only the Chief of Staff the named repository's App token
+        if "read_repo" in fleet:   # #618: only a worker launched with --read-repo has the key, so every other answer is as it was; one that cannot be read says so (the shim refuses)
+            who["read_repo"] = fleet["read_repo"] if isinstance(fleet["read_repo"], str) and GhAccounts.normal_repo(fleet["read_repo"]) == fleet["read_repo"] \
+                and re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", fleet["read_repo"]) else False
+        print(json.dumps(who, sort_keys=True))
         return EXIT_OK
     if getattr(args, "repo", False):
         fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
@@ -15898,6 +15908,230 @@ def friction_status_line(config, state_dir, now=None):
         "%02d:00" % hour if hour is not None else "every 24 h", section["to"], section["cos_to"], last)
 
 
+# ---- a long block is reported (docs/switchboard.md, "A blocked agent is reported"). `hold_reason` holds a message for an agent
+# the terminal shows as blocked: nothing is typed into a prompt, and that is right. The missing part was the report. Once per
+# block (repeated at most every `repeat_minutes`, closed with one final line) its boss and the Chief of Staff are told. It reads
+# only what the pass already has (the observations, the held plans, the requests WorkerFacts read, reminders.json): no `gh` call.
+
+BLOCKED_ALERT_DEFAULTS = {"minutes": 20, "repeat_minutes": 60}
+BLOCKED_ALERT_STATE = "blocked-alert.json"
+
+
+def validate_blocked_alert_config(config, source):
+    """`blocked_alert`: absent or null is the defaults (on); false is off; else {"minutes", "repeat_minutes"}, numbers above 0."""
+    if "blocked_alert" not in config or config["blocked_alert"] is None:
+        return
+    raw = config["blocked_alert"]
+    if raw is False:
+        return
+    if not isinstance(raw, dict):
+        raise ConfigError("%s: 'blocked_alert' must be false, null or an object, got %r" % (source, type(raw).__name__))
+    unknown = sorted(set(raw) - set(BLOCKED_ALERT_DEFAULTS))
+    if unknown:
+        warn_unknown_config("%s: 'blocked_alert' has key(s) this tool does not read: %s" % (source, ", ".join(unknown)), 'blocked_alert', unknown, list(BLOCKED_ALERT_DEFAULTS))
+    section = dict(BLOCKED_ALERT_DEFAULTS, **raw)
+    for key in BLOCKED_ALERT_DEFAULTS:
+        if not _is_number(section[key]) or section[key] <= 0:
+            raise ConfigError("%s: 'blocked_alert.%s' must be a number of minutes above 0, got %r" % (source, key, section[key]))
+    config["blocked_alert"] = section
+
+
+def blocked_alert_section(config):
+    """The settings, or None when the alert is off."""
+    raw = (config or {}).get("blocked_alert", {})
+    if raw is False:
+        return None
+    return dict(BLOCKED_ALERT_DEFAULTS, **(raw or {}))
+
+
+def blocked_kind(engine, observation):
+    """What a blocked agent waits on, in words, as the pass read it: an open permission request or question, or (nothing open) an ended turn."""
+    source = next((s for s in engine.sources if isinstance(s, WorkerFacts)), None)
+    if source is None:
+        return "a permission request or a question (not read)"
+    kinds = sorted({kind for who, kind, _ in source.requests if who.session_id == observation.session_id})
+    if kinds:
+        return "an open %s; it goes to the owner" % " and an open ".join("%s request" % k if k == "permission" else k for k in kinds)
+    return ("an ended turn with nothing open (the terminal shows it blocked, often after a provider error; not a real question): "
+            "the Chief of Staff may resume it with one `poke`, which is audited")
+
+
+BLOCKED_HELD_SENDS = "blocked-held-sends.json"   # {agent: {"rows": [{"from", "at"}]}}: sends refused while it was blocked (a `send` stores nothing, so the report counts them here)
+BLOCKED_LOCK = "blocked-alert.lock"
+BLOCKED_HELD_KEEP = 100      # rows kept per agent: the recorded case held 11 messages in 2.5 hours, so this is about nine times that
+BLOCKED_HELD_AGENTS = 64     # agents kept in the file: the number blocked at once in a fleet is a handful; 64 is far above any real fleet
+BLOCKED_LINE_SENDERS = 10    # senders named in a line, then "and N more"
+BLOCKED_LINE_REMINDERS = 5   # reminders named in a line, then "and N more"
+BLOCKED_LINE_CHARS = 1200    # the whole line
+
+
+@contextmanager
+def blocked_lock(state_dir):
+    """Serialises the `send` command and the daemon around every read-modify-write of blocked-alert.json and blocked-held-sends.json."""
+    fd = os.open(str(Path(state_dir) / BLOCKED_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def blocked_update(state_dir, name, change):
+    """The one write path of the two state files: read, `change(state)` and write, under `blocked_lock`, through the atomic `_write_small`.
+    `change` returns the new state, or None to write nothing. Returns the state as it was written (or read)."""
+    with blocked_lock(state_dir):
+        state = _read_small(state_dir, name)
+        new = change(state)
+        if new is None:
+            return state
+        _write_small(state_dir, name, new)
+        return new
+
+
+def note_held_send(state_dir, recipient, sender, now, observation):
+    """A `send` held for a blocked agent is remembered (who, when) so a long block can name it. Never raises: the delivery path is not its
+    business, and the hold itself is audited (`hold`), so a row lost to a full disk costs the count, not the message's record."""
+    if state_dir is None or observation is None or observation.status != "blocked" or hold_reason(observation) is None:
+        return
+
+    def add(state):
+        entry = state.get(recipient)
+        rows = [r for r in (entry.get("rows") if isinstance(entry, dict) else None) or [] if isinstance(r, dict)]
+        state[recipient] = {"rows": (rows + [{"from": blocked_sender(sender), "at": now}])[-BLOCKED_HELD_KEEP:]}
+        if len(state) > BLOCKED_HELD_AGENTS:   # the oldest agents' rows go first
+            newest = sorted(state, key=lambda n: max([r.get("at", 0) for r in state[n].get("rows", []) if _is_number(r.get("at"))] or [0]), reverse=True)
+            state = {n: state[n] for n in newest[:BLOCKED_HELD_AGENTS]}
+        return state
+    try:
+        blocked_update(state_dir, BLOCKED_HELD_SENDS, add)
+    except OSError:
+        pass
+
+
+def _named(items, limit):
+    shown = list(items)[:limit]
+    return ", ".join(shown) + (" and %d more" % (len(items) - limit) if len(items) > limit else "")
+
+
+def blocked_sender(who):
+    """The one gate for a sender name that a caller claimed: the daemon's own agent-name pattern (NAME_RE, full match, so a trailing newline fails), else "unknown".
+    Every name in the report line, the end line, the reminder, the audit and the state file passes through it."""
+    return who if isinstance(who, str) and NAME_RE.fullmatch(who) else "unknown"
+
+
+def _sender_names(who):
+    return sorted({blocked_sender(w) for w in who})
+
+
+def blocked_line(engine, observation, since, now, held, refused, kind):
+    """`held` is one sender per message the daemon holds (delivered when the block ends); `refused` one sender per send that was refused
+    and stored nowhere (the sender must send again). The two are said apart."""
+    minutes = int((now - since) // 60)
+    reminders = [r for r in read_reminders(engine.state_dir) if r.get("to") == observation.name and r.get("from") == observation.name
+                 and isinstance(r.get("at"), (int, float)) and since <= r["at"] <= now]
+    text = "%s has been blocked for %d minutes (first seen blocked at %s) on %s." % (observation.name, minutes, iso(since), kind)
+    if held or not refused:
+        text += " Held for it: %d message%s from %s." % (len(held), "" if len(held) == 1 else "s", _named(_sender_names(held), BLOCKED_LINE_SENDERS) or "nobody")
+    if refused:
+        text += " %d refused send%s the senders must repeat (not stored; ask %s)." % (len(refused), "" if len(refused) == 1 else "s", _named(_sender_names(refused), BLOCKED_LINE_SENDERS))
+    if reminders:
+        text += " Its own reminders due during the block: %s." % _named(["%s due %s" % (r["id"], iso(r["at"])) for r in reminders], BLOCKED_LINE_REMINDERS)
+    return _one_line(text, BLOCKED_LINE_CHARS)
+
+
+def _refused_senders(entry):
+    rows = entry.get("rows") if isinstance(entry, dict) else None
+    return [blocked_sender(r.get("from")) for r in (rows if isinstance(rows, list) else [])[-BLOCKED_HELD_KEEP:] if isinstance(r, dict)]
+
+
+def blocked_tick(engine, discovery, held):
+    """The end of a pass, after delivery: report a block that has lasted `minutes` with a message held for the agent, once, then at most
+    every `repeat_minutes`; one final line when it ends. Returns [(agent, "report" | "repeat" | "end")]."""
+    section = blocked_alert_section(engine.config)
+    if section is None or discovery is None or engine.state_dir is None:
+        return []
+    now, state, done = engine.now(), blocked_update(engine.state_dir, BLOCKED_ALERT_STATE, lambda _: None), []
+    waiting = {n for n, o in discovery.agents.items() if o.status == "blocked"}
+    ended_refused = {}
+
+    def forget(found):   # a send refused for an agent that is no longer blocked is forgotten, after the end line has named its senders
+        if set(found) - waiting:
+            ended_refused.update({n: v for n, v in found.items() if n not in waiting})
+            return {n: v for n, v in found.items() if n in waiting}
+        return None
+    refused = blocked_update(engine.state_dir, BLOCKED_HELD_SENDS, forget)
+    cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None)
+
+    def tell(observation, text, event, detail):
+        boss = boss_name(discovery, observation)
+        boss_seen = discovery.agents.get(boss) if boss else None
+        recipients = []
+        if boss and boss_seen is not None and not hold_reason(boss_seen):
+            recipients.append(boss)   # a boss that is itself blocked or gone is not told: the Chief of Staff alone is
+        if cos and cos not in recipients:
+            recipients.append(cos)
+        recipients = [r for r in recipients if r != observation.name]
+        for who in recipients:
+            add_reminder(engine.state_dir, who, now, now, "Blocked agent: " + text)
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, event, observation.name, dict(detail, told=recipients, text=_one_line(text, 400)))
+
+    changed = False
+    for name, seen in sorted(discovery.agents.items()):
+        entry = state.get(name)
+        if seen.status != "blocked":
+            continue
+        if not isinstance(entry, dict) or entry.get("session") != seen.session_id or not _is_number(entry.get("since")):
+            entry = state[name] = {"session": seen.session_id, "since": now}
+            changed = True
+        plan = held.get(name)
+        messages = [blocked_sender(fact.sender) for fact in (plan.pending if plan is not None else [])]
+        refusals = _refused_senders(refused.get(name))
+        entry["held"], entry["refused"] = len(messages), len(refusals)   # what the end line may say: the daemon's messages arrive, the refused ones never do
+        if not messages and not refusals:
+            continue
+        last = entry.get("reported")
+        if last is None and now - entry["since"] >= section["minutes"] * 60:
+            event = "blocked.report"
+        elif last is not None and now - last >= section["repeat_minutes"] * 60:
+            event = "blocked.repeat"
+        else:
+            continue
+        kind = blocked_kind(engine, seen)
+        tell(seen, blocked_line(engine, seen, entry["since"], now, messages, refusals, kind),
+             event, {"since": iso(entry["since"]), "held": len(messages), "refused": len(refusals)})
+        entry["reported"] = now
+        blocked_update(engine.state_dir, BLOCKED_ALERT_STATE, lambda _: state)   # after each one: a crash repeats at most one
+        done.append((name, event.split(".")[1]))
+    for name in sorted(set(state) - waiting):
+        entry = state.pop(name)   # the block ended, or the agent is gone
+        changed = True
+        if not isinstance(entry, dict) or entry.get("reported") is None:
+            continue
+        seen = discovery.agents.get(name)
+        if seen is None:
+            continue   # gone from the fleet: nobody to say it about
+        refusals = _refused_senders(ended_refused.get(name))
+        had_held = bool(entry.get("held")) or (name in held and bool(held[name].pending))
+        still = name in held and bool(held[name].pending)
+        released = had_held and not still   # what is known is only that the daemon holds them no longer: not that a delivery happened
+        parts = []
+        if still:
+            parts.append("its messages are still held: %s" % _one_line(held[name].reason, 200))
+        elif had_held:
+            parts.append("the messages the daemon held for it are no longer held")
+        if refusals:
+            parts.append("%d refused send%s never stored and NOT delivered: ask %s to send again" % (
+                len(refusals), "" if len(refusals) == 1 else "s", _named(_sender_names(refusals), BLOCKED_LINE_SENDERS)))
+        text = "%s was blocked from %s to %s (%d minutes); the block has ended%s." % (
+            name, iso(entry["since"]), iso(now), int((now - entry["since"]) // 60), (" and " + "; ".join(parts)) if parts else "")
+        tell(seen, text, "blocked.end", {"since": iso(entry["since"]), "no_longer_held": released, "refused": len(refusals)})
+        done.append((name, "end"))
+    if changed or done:
+        blocked_update(engine.state_dir, BLOCKED_ALERT_STATE, lambda _: state)
+    return done
+
+
 # ---- reminders
 
 def parse_when(text, now):
@@ -16146,6 +16380,37 @@ CHECKPOINT_MAX_SECONDS = 30 * 86400  # a checkpoint or overdue further out than 
 CHECKPOINT_MAX_DIGITS = 6
 
 
+def how_long(seconds):
+    """A length of time as words, exact to the second: `15 min`, `1 min 30 s`, `2 h 5 min`, `1 d 2 h`. Never rounds: the line a lane reads must be the stored time."""
+    seconds = int(round(abs(seconds)))
+    parts = []
+    for unit, size in (("d", 86400), ("h", 3600), ("min", 60), ("s", 1)):
+        count, seconds = divmod(seconds, size)
+        if count:
+            parts.append("%d %s" % (count, unit))
+    return " ".join(parts) if parts else "0 s"
+
+
+def reminder_when(at, now):
+    """The words the three routes print for one reminder, built from the STORED time and the same `now`: `in 15 min, at 2030-01-02T15:05:05Z` (or `15 min ago`)."""
+    return ("in %s" % how_long(at - now) if at >= now else "%s ago" % how_long(now - at)) + ", at %s" % iso(at)
+
+
+def _print_when_now(now):
+    try:
+        return iso(now)
+    except Exception:
+        return str(now)
+
+
+def _print_when(at, now):
+    """`reminder_when`, but the printing never fails a command: a reminder that was made still exits 0 (the plain clock time is the fallback)."""
+    try:
+        return reminder_when(at, now)
+    except Exception:
+        return "at %s" % at
+
+
 def _cp_when(text, moment):
     """parse_when for a checkpoint flag, bounded: too many digits or further than CHECKPOINT_MAX_SECONDS is refused."""
     if re.search(r"[0-9]{%d}" % (CHECKPOINT_MAX_DIGITS + 1), text):
@@ -16219,8 +16484,8 @@ def set_checkpoint_reminders(engine, state, name, boss, issue, repo, brief, chec
             engine.audit.append("cli", "reminder.add", item["to"], {"id": item["id"], "at": iso(item["at"]),
                                                                    "from": item.get("from"), "issue": issue,
                                                                    "repo": repo, "for": "checkpoint-" + which})
-        notes[:0] = ["%s reminder at %s" % (which, iso(item["at"])) for which, item in made]
-        return "checkpoint reminders: " + "; ".join(notes) if notes else None
+        notes[:0] = ["%s reminder %s" % (which, _print_when(item["at"], moment)) for which, item in made]
+        return "checkpoint reminders (now %s): " % _print_when_now(moment) + "; ".join(notes) if notes else None
     except (ReminderError, OSError, ValueError, OverflowError) as err:
         return "no checkpoint reminders: %s" % _one_line(str(err), 200)
 
@@ -16297,7 +16562,7 @@ def cmd_remind(args, runner, now):
     engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),
                                                           "from": sender, "issue": number, "repo": repo})
     print(item["id"])
-    sys.stderr.write("%s: reminder for %s at %s\n" % (PROG, args.name, iso(item["at"])))
+    sys.stderr.write("%s: reminder for %s %s (now %s)\n" % (PROG, args.name, _print_when(item["at"], moment), _print_when_now(moment)))
     return EXIT_OK
 
 
@@ -18875,6 +19140,8 @@ def launch_memory_check(args, engine, state, runner, now):
 
 
 def cmd_launch(args, runner, now, socket_call=None):
+    if getattr(args, "read_repo", None) is not None and (getattr(args, "cloud", False) or args.resume):
+        raise LaunchError("--read-repo needs a terminal launch of a new worker (not --headless, --cloud or --resume)")
     if getattr(args, "stack", False) and not getattr(args, "cloud", False):   # before anything is read or called: the option is the cloud launcher's
         sys.stderr.write("%s: --stack needs --cloud: the nested Docker stack is a cloud worker's pod; nothing was created\n" % PROG)
         return EXIT_USAGE
@@ -18940,6 +19207,7 @@ def cmd_launch(args, runner, now, socket_call=None):
                 engine.audit.append(engine.actor, "launch.repo_from_origin", args.name, {"repo": repo})
         else:
             sys.stderr.write("%s: no repository recorded (%s): pushes will be refused; pass --repo\n" % (PROG, why))
+    read_repo = launch_read_repo(args, repo, getattr(engine, "accounts", None), engine.config, use_headless)
     problem = launch_agent_problem(engine.config, runner, args.agent)
     if problem:
         raise LaunchError(problem)
@@ -18991,7 +19259,7 @@ def cmd_launch(args, runner, now, socket_call=None):
         if done is None:
             done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
                                 None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo,
-                                launched_by=launched_by)
+                                launched_by=launched_by, read_repo=read_repo)
     except LaunchError as err:
         if created:
             raise LaunchError("%s (workspace %s was created and is left for you to close)" % (err, created)) from err
@@ -18999,6 +19267,10 @@ def cmd_launch(args, runner, now, socket_call=None):
     print(json.dumps(done, sort_keys=True))
     if done.get("identity"):
         sys.stderr.write("%s: %s\n" % (PROG, done["identity"]))
+    if read_repo:   # the one line that says the grant (#618); it is also in the worker's record (metadata.fleet.read_repo)
+        sys.stderr.write("%s: %s can read %s, read only (a shim guard: writes there are refused)\n" % (PROG, args.name, read_repo))
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "launch.read_repo", args.name, {"read_repo": read_repo})
     if args.role == "orchestrator":   # #838: a relaunched or replacement orchestrator inherits the workers its predecessor left, in the same step
         launched_charter = int(re.search(r"(\d+)\s*$", str(args.charter)).group(1)) if args.charter and re.search(r"(\d+)\s*$", str(args.charter)) else None
         for path, bosses in (("relaunch", {args.name}), ("replace", None)):
@@ -19098,6 +19370,30 @@ def launch_gate_probe(engine, state, config, args, brief, runner, now):
                          {"for": "launch", "reason": "%s: %s" % (type(err).__name__, _one_line(str(err), 200)), "first_today": first})
         except BaseException:
             pass
+
+
+def launch_read_repo(args, repo, accounts, config, use_headless=False):
+    """The ONE extra repository a worker may READ (`--read-repo`, #618), as the exact lower-case `owner/name` the shims will match, or None when none was
+    asked for. Refused (LaunchError) when it is not written exactly that way (no case, whitespace, `.git`, `/`, `owner/*`, URL or path spelling: the
+    same rules as the launch guard's `normal_repo`, which must leave it unchanged), is the worker's own repository, has no `gh_users` account (a read
+    would run as the wrong account), or is combined with --headless, --cloud or --resume (no shim pins those workers). The grant is a shim guard, not a
+    GitHub guard: the account behind it may still be able to write."""
+    given = getattr(args, "read_repo", None)
+    if given is None:
+        return None
+    if getattr(args, "headless", False) or getattr(args, "cloud", False) or args.resume:
+        raise LaunchError("--read-repo needs a terminal launch of a new worker (not --headless, --cloud or --resume)")
+    if use_headless:   # #433: a plain launch is headless by default, and no shim pins a headless worker: the grant would be unguarded, so it asks for the terminal by name
+        raise LaunchError("--read-repo needs a terminal launch: add --terminal (a plain launch is headless by default, and no shim pins a headless worker)")
+    exact = isinstance(given, str) and given.isascii() and re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", given) is not None \
+        and not given.endswith(".git") and ".." not in given.split("/") and "." not in given.split("/") and GhAccounts.normal_repo(given) == given
+    if not exact:
+        raise LaunchError("--read-repo must be exactly OWNER/NAME in lower case (no whitespace, .git, URL, path or wildcard), got %r" % _one_line(str(given), 60))
+    if repo and GhAccounts.normal_repo(repo) == given:
+        raise LaunchError("--read-repo %s is the worker's own repository: nothing to add" % given)
+    if accounts is None or not config.get("gh_users") or not accounts.account_for(given):
+        raise LaunchError("--read-repo %s has no gh account: add \"%s\" or \"%s/*\" to gh_users in %s" % (given, given, given.split("/")[0], config_path()))
+    return given
 
 
 def launch_repo(args):
@@ -29547,6 +29843,9 @@ def build_parser():
     launch.add_argument("--issue", type=issue_arg, help="metadata.fleet.issue (owner/repo#N also sets --repo)")
     launch.add_argument("--repo", help="metadata.fleet.repo, OWNER/REPO: the project the agent works in. Its gh "
                                        "account (config gh_users) is the agent's GH_TOKEN")
+    launch.add_argument("--read-repo", dest="read_repo", metavar="OWNER/NAME",
+                        help="ONE extra repository the worker may READ (issue view, pr view, api GET...) as that repository's gh_users account; every write "
+                             "there, every command that names another repository and `gh search|gist|status|...` are refused by the gh and git shims. Exact lower-case owner/name. A shim guard, not a GitHub guard")
     launch.add_argument("--new-workspace", dest="new_workspace", metavar="LABEL",
                         help="Create a herdr workspace with this label in --dir (never focused), and launch "
                              "into it. A --charter whose `workspace:` line differs is refused")
