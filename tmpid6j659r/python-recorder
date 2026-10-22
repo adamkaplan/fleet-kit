@@ -1,3 +1,0 @@
-#!/bin/sh
-printf "%s\n" "$@" > "/work/repo/tmpid6j659r/stub/python-args"
-exec "/usr/bin/python3" "$@"

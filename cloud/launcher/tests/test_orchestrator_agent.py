@@ -406,5 +406,20 @@ class Docs(unittest.TestCase):
         self.assertIn("CW_AGENT", open(os.path.join(ROOT, "cloud", "worker", "agents", "worker.md")).read())
 
 
+class RepoRootClean(unittest.TestCase):
+    def test_s13_the_fixtures_leave_no_scratch_in_the_repository(self):
+        def status():
+            return subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=ROOT, capture_output=True, text=True).stdout
+        before = status()
+        suite = unittest.TestSuite()
+        loader = unittest.defaultTestLoader
+        for cls in (Orchestrator, Entrypoint):
+            suite.addTests(loader.loadTestsFromTestCase(cls))
+        with open(os.devnull, "w") as null:
+            unittest.TextTestRunner(stream=null).run(suite)
+        self.assertEqual(status(), before, "scratch left in the repository root")
+        self.assertNotIn("??", status(), "an untracked entry in the repository root")
+
+
 if __name__ == "__main__":
     unittest.main()
