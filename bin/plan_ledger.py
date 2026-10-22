@@ -366,11 +366,15 @@ def review_records_at(entries, pr, head, expected=REVIEWERS_NOW):
     """The reviewer records of PR `pr` AT `head` (the latest per reviewer wins): {"expected", "recorded": {reviewer: verdict}, "missing"}.
     A record at another head does not count: a push voids it. SHADOW: this is shown by `gates`, never counted towards ready, and a record
     names the session that wrote it, which while agents share one account is a mistake guard and not a boundary."""
-    recorded = {}
+    recorded, uncited = {}, []
     for entry in entries:
         if entry.get("kind") == "review_record" and entry.get("pr") == pr and entry.get("head") == head and entry.get("reviewer") in expected:
             recorded[entry["reviewer"]] = entry.get("verdict")
-    return {"expected": list(expected), "recorded": recorded, "missing": [r for r in expected if r not in recorded]}
+            if entry.get("uncited") is True and entry.get("verdict") == "request-changes":
+                uncited.append(entry["reviewer"])
+            elif entry["reviewer"] in uncited:
+                uncited.remove(entry["reviewer"])
+    return {"expected": list(expected), "recorded": recorded, "uncited": uncited, "missing": [r for r in expected if r not in recorded]}
 
 
 def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
@@ -558,7 +562,8 @@ def render_gates(report, pr):
     if reviews:
         lines.append("  reviewers (plan-review panel verdicts: shadow, not counted by any gate): %d of %d recorded at %s%s" % (
             len(reviews["recorded"]), len(reviews["expected"]), (report.get("head") or "?")[:8],
-            ": " + ", ".join("%s %s" % kv for kv in sorted(reviews["recorded"].items())) if reviews["recorded"] else "")
+            ": " + ", ".join("%s %s%s" % (kv + (" (names no rule)" if kv[0] in (reviews.get("uncited") or []) else "",)) for kv in sorted(reviews["recorded"].items())) if reviews["recorded"] else "")
+            + ("; %d blocking review(s): request-changes blocks even when it names no rule" % sum(1 for v in reviews["recorded"].values() if v == "request-changes") if "request-changes" in reviews["recorded"].values() else "")
             + ("; missing %s" % ", ".join(reviews["missing"]) if reviews["missing"] else ""))
     if report["untracked"]:
         lines.append("not tracked yet (not counted): %s" % ", ".join(report["untracked"]))

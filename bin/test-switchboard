@@ -35703,7 +35703,7 @@ class TestBlockTable(LedgerBase):
 
     def block(self, extra="", action="impact-action: none\n"):
         path = self.world.state / "block.txt"
-        path.write_text("verdict: approve\nhead: %s\n%s%sfindings:\n" % (LEDGER_HEAD, action, extra))
+        path.write_text("verdict: approve\nhead: %s\n%s%sfiles-read:\n- docs/a.md | 5 | 5\nfindings:\n" % (LEDGER_HEAD, action, extra))
         return str(path)
 
     def records(self):
@@ -35757,7 +35757,7 @@ class TestBlockTable(LedgerBase):
             with self.subTest(flag=flag):
                 action = "impact-action: hold\n"   # a hold needs a class; the block's own class line is "data"
                 path = self.world.state / "block.txt"
-                path.write_text("verdict: approve\nhead: %s\n%s%sfindings:\n" % (LEDGER_HEAD, action, block_lines))
+                path.write_text("verdict: approve\nhead: %s\n%s%sfiles-read:\n- docs/a.md | 5 | 5\nfindings:\n" % (LEDGER_HEAD, action, block_lines))
                 code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path), flag, flag_value)
                 self.assertEqual(code, 0, err)
                 entry = self.records()[-1]
@@ -35780,7 +35780,7 @@ class TestBlockTable(LedgerBase):
     def test_the_definitions_example_block_parses_to_a_record_with_a_score(self):
         definition = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
         example = definition.split("A full block, as you return it", 1)[1].split("```\n", 2)[1]
-        example = example.replace("0123456789abcdef0123456789abcdef01234567", LEDGER_HEAD)
+        example = example.replace("0123456789abcdef0123456789abcdef01234567", LEDGER_HEAD).replace("src/example.py", "docs/a.md")
         path = self.world.state / "example.txt"
         path.write_text(example)
         code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))
@@ -35860,7 +35860,7 @@ class TestAgentBlockCounts(TestBlockTable):
             return self.record(extra=self.SCORED)
         if shape == "other-head":
             path = self.world.state / "other.txt"
-            path.write_text("verdict: approve\nhead: %s\nimpact-action: none\n%sfindings:\n" % ("b" * 40, self.SCORED))
+            path.write_text("verdict: approve\nhead: %s\nimpact-action: none\n%sfiles-read:\n- docs/a.md | 5 | 5\nfindings:\n" % ("b" * 40, self.SCORED))
             return self.run_as("coder", *base, "--block", str(path))
         if shape == "malformed":
             path = self.world.state / "bad.txt"
@@ -35951,7 +35951,7 @@ class TestAgentBlockCounts(TestBlockTable):
         for verdict, finding in self.VERDICT_BLOCKS.items():
             with self.subTest(verdict=verdict):
                 path = self.world.state / "v.txt"
-                path.write_text("verdict: %s\nhead: %s\nimpact-action: none\n%sfindings:\n%s" % (verdict, LEDGER_HEAD, self.SCORED, finding))
+                path.write_text("verdict: %s\nhead: %s\nimpact-action: none\n%sfiles-read:\n- docs/a.md | 5 | 5\nfindings:\n%s" % (verdict, LEDGER_HEAD, self.SCORED, finding))
                 code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))
                 self.assertEqual(code, 0, err)
                 scored = self.score()
@@ -35976,7 +35976,7 @@ class TestAgentBlockCounts(TestBlockTable):
 
     def test_the_definition_says_read_every_hunk_return_incomplete_and_where_the_matrix_words_come_from(self):
         text = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
-        for phrase in ("every hunk", "verdict: incomplete", "reads only the verdict word", "impact matrix --for-rater"):
+        for phrase in ("every line of the diff", "verdict: incomplete", "never prose", "impact matrix --for-rater"):
             self.assertIn(phrase, text.replace("EVERY", "every"))
 
     def state_files(self):
@@ -36024,7 +36024,7 @@ class TestAgentBlockCounts(TestBlockTable):
         mod = sb.load_module("delegated_clear")
         for verdict in ("incomplete", "approve"):
             path = self.world.state / "v.txt"
-            path.write_text("verdict: %s\nhead: %s\nimpact-action: none\n%sfindings:\n" % (verdict, LEDGER_HEAD, self.SCORED))
+            path.write_text("verdict: %s\nhead: %s\nimpact-action: none\n%sfiles-read:\n- docs/a.md | 5 | 5\nfindings:\n" % (verdict, LEDGER_HEAD, self.SCORED))
             self.assertEqual(self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))[0], 0)
         scored = self.score(last=2)
         self.assertEqual(scored["reasons"], [])
@@ -36089,6 +36089,174 @@ class TestAgentBlockCounts(TestBlockTable):
         for name in ("impact_hold.py", "impact_floor.py", "plan_ledger.py"):   # the readers of a rating outside the scorer (the record's own warning is a writer)
             text = (REPO / "bin" / name).read_text().replace("block_impact", "")
             self.assertEqual(len(re.findall(r'get\("impact_(?:severity|probability)"\)', text)), 0, name)
+
+class TestWholeRead(LedgerBase):
+    """#1047: a rating is recorded only from a whole read of the pull request's changed files (read from GitHub), and a verdict is recorded exactly as given."""
+
+    FILES = ("src/a.py", "docs/long.md", "docs/b.md")
+    HEAD2 = "e" * 40
+
+    def setUp(self):
+        super().setUp()
+        self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}})
+        self.configure()
+        self.pr = dict(self.pr, baseRefOid="c" * 40, changedFiles=3, files=[{"path": p, "additions": 1, "deletions": 0} for p in self.FILES])
+
+    def records(self):
+        return [e for e in self.ledger() if e["kind"] == "review_record"]
+
+    def block(self, rows, verdict="approve", findings="", head=None, reviewer="impact"):
+        path = self.world.state / "block.txt"
+        head_line = "head: %s\n" % (head or LEDGER_HEAD)
+        scored = "impact-action: none\nimpact-severity: Marginal\nimpact-probability: Remote\nimpact-reason: a reason\n" if reviewer == "impact" else ""
+        path.write_text("verdict: %s\n%s%sfiles-read:\n%s\nfindings:\n%s" % (verdict, head_line, scored, "\n".join("- %s | %d | %d" % r for r in rows), findings))
+        return str(path)
+
+    def record(self, rows, reviewer="impact", **kw):
+        return self.run_as("coder", "review", "record", self.PR, "--reviewer", reviewer, "--block", self.block(rows, reviewer=reviewer, **kw))
+
+    WHOLE = (("src/a.py", 30, 30), ("docs/long.md", 900, 900), ("docs/b.md", 12, 12))
+
+    def check_behaviour(self):
+        """Every claim about the whole-read rule, as assertions over the real command (a mutant of the rule must fail at least one)."""
+        before = len(self.records())
+        code, out, err = self.record(self.WHOLE)
+        self.assertEqual((code, len(self.records()) - before), (0, 1), err)
+        self.assertEqual((self.records()[-1]["files_read"], self.records()[-1]["files_total"]), (3, 3))
+        before = len(self.records())
+        code, out, err = self.record((("src/a.py", 30, 30), ("docs/long.md", 280, 900), ("docs/b.md", 12, 12)))
+        self.assertEqual((code, len(self.records()) - before), (2, 0))
+        self.assertIn("docs/long.md", err)
+        self.assertIn("line 281", err)
+        code, out, err = self.record(self.WHOLE[:2])   # omits one changed file
+        self.assertEqual((code, len(self.records()) - before), (2, 0))
+        self.assertIn("docs/b.md", err)
+        code, out, err = self.record(self.WHOLE[:2] + (("docs/other.md", 12, 12),))   # the right length, one wrong name
+        self.assertEqual((code, len(self.records()) - before), (2, 0))
+        self.assertIn("docs/b.md", err)
+        self.pr = dict(self.pr, changedFiles=4, files=self.pr["files"] + [{"path": "src/only-github.py"}])   # GitHub lists a file the block omits
+        code, out, err = self.record(self.WHOLE)
+        self.assertEqual((code, len(self.records()) - before), (2, 0))
+        self.assertIn("src/only-github.py", err)
+        self.pr = dict(self.pr, changedFiles=9)   # GitHub's own list is cut
+        code, out, err = self.record(self.WHOLE)
+        self.assertEqual((code, len(self.records()) - before), (2, 0))
+        self.assertIn("GitHub listed 4 of 9", err)
+
+    def test_s3_s5_s7_s8_s9_the_whole_read_is_recorded_and_a_short_one_refused_naming_the_file_and_the_line(self):
+        self.check_behaviour()
+
+    def test_s10_each_mutant_of_the_rule_fails_the_behaviour_check(self):
+        real_problem, real_paths = sb.whole_read_problem, sb.pr_changed_paths
+        def accepts_short(rows, listed):
+            return None
+        def count_only(rows, listed):
+            return None if len(rows) >= len(listed) else real_problem(rows, listed)
+        def trusts_block(rows, listed):
+            return real_problem(rows, [r[0] for r in rows])
+        for name, mutant in (("accepts a short list", accepts_short), ("compares only the count", count_only), ("trusts the block's own list", trusts_block)):
+            with self.subTest(name), mock.patch.object(sb, "whole_read_problem", mutant):
+                with self.assertRaises(AssertionError):
+                    self.check_behaviour()
+        self.assertEqual(sb.whole_read_problem, real_problem)
+        self.assertEqual(sb.pr_changed_paths, real_paths)
+
+    def test_s4_an_incomplete_block_is_recorded_with_a_short_list_and_counts_for_nothing(self):
+        code, out, err = self.record(self.WHOLE[:1], verdict="incomplete")
+        self.assertEqual(code, 0, err)
+        (entry,) = self.records()
+        self.assertEqual((entry["verdict"], entry["files_read"], entry["files_total"]), ("incomplete", 1, 3))
+        self.assertEqual(sb.plan_ledger.review_records_at(self.ledger(), self.PR, LEDGER_HEAD)["recorded"]["impact"], "incomplete")
+
+    def test_s12_a_head_that_is_not_the_pull_requests_is_refused_naming_both_full_heads(self):
+        for given in (self.HEAD2, LEDGER_HEAD[:7] + "f" * 33):
+            code, out, err = self.record(self.WHOLE, head=given)
+            self.assertEqual(code, 2)
+            self.assertIn(given, err)
+            self.assertIn(LEDGER_HEAD, err)
+        self.assertEqual(self.records(), [])
+        self.assertEqual(self.record(self.WHOLE, head=LEDGER_HEAD[:12])[0], 0)
+        self.assertEqual(self.records()[-1]["head"], LEDGER_HEAD)
+
+    def test_s13_u2_u5_a_verdict_is_recorded_as_given_and_an_uncited_request_changes_is_marked_and_blocks(self):
+        cited = "- R-CODE-3 | block | src/a.py:4 | torn write | temp file\n"
+        uncited = "- no rule here | block | src/a.py:4 | vague | fix it\n"
+        for verdict, findings, mark in (("request-changes", cited, None), ("request-changes", uncited, True), ("approve", "", None), ("comment", uncited, None), ("incomplete", "", None)):
+            with self.subTest(verdict=verdict, mark=mark):
+                code, out, err = self.record(self.WHOLE, verdict=verdict, findings=findings, reviewer="code")
+                self.assertEqual(code, 0, err)
+                last = self.records()[-1]
+                self.assertEqual((last["verdict"], last.get("uncited")), (verdict, mark))
+        self.assertEqual(self.record(self.WHOLE, verdict="request-changes", findings=uncited, reviewer="code")[0], 0)
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        self.assertIn("code request-changes (names no rule)", out)
+        self.assertIn("1 blocking review(s)", out)
+        code, out, err = self.run_as("coder", "review", "blockers", self.PR)
+        self.assertIn("names no rule", out)
+
+    def test_s14_each_mutant_of_the_uncited_rule_fails_the_check(self):
+        def check():
+            count = len(self.records())
+            self.run_as("coder", "review", "record", self.PR, "--reviewer", "code", "--block", self.block((), verdict="request-changes", findings="- no rule | block | a:1 | x | y\n", reviewer="code"))
+            self.assertEqual(len(self.records()), count + 1, "recorded, not refused")
+            last = self.records()[-1]
+            self.assertEqual((last["verdict"], last.get("uncited")), ("request-changes", True))
+        check()
+        real = sb.parse_review_block
+        def softened(text):
+            fields, why = real(text)
+            if fields and fields["verdict"] == "request-changes" and not fields["blocks"]:
+                fields["verdict"] = "comment"
+            return fields, why
+        real_append = sb.plan_ledger.append_entry
+        def refused(text):
+            fields, why = real(text)
+            return (None, "refused: needs a rule") if fields and fields["verdict"] == "request-changes" and not fields["blocks"] else (fields, why)
+        for name, mutant in (("records it as a comment", softened), ("refuses it", refused)):
+            with self.subTest(name), mock.patch.object(sb, "parse_review_block", mutant):
+                with self.assertRaises(AssertionError):
+                    check()
+        with self.subTest("drops the mark"), mock.patch.object(sb.plan_ledger, "append_entry", lambda state, entry, now: real_append(state, {k: v for k, v in entry.items() if k != "uncited"}, now)):
+            with self.assertRaises(AssertionError):
+                check()
+
+    def test_u1_u3_a_refusal_writes_nothing_and_an_old_record_keeps_its_meaning(self):
+        old = {"kind": "review_record", "pr": self.PR, "head": LEDGER_HEAD, "reviewer": "code", "verdict": "request-changes", "blocks": 1, "notes": 0, "by": "coder", "summary": ""}
+        plan_ledger = sb.plan_ledger
+        plan_ledger.append_entry(self.world.state, old, 1700000000)
+        before = (self.world.state / "plan-ledger.jsonl").read_bytes() if (self.world.state / "plan-ledger.jsonl").exists() else None
+        floor = self.run_as("coder", "impact", "floor", self.PR, "--json")[1]
+        self.assertEqual(self.record(self.WHOLE[:1])[0], 2)
+        self.assertEqual(self.run_as("coder", "impact", "floor", self.PR, "--json")[1], floor)
+        if before is not None:
+            self.assertEqual((self.world.state / "plan-ledger.jsonl").read_bytes(), before)
+        self.assertIsNone(plan_ledger.read_ledger(self.world.state)[1])
+        self.assertEqual(len(self.records()), 1)
+        self.assertNotIn("uncited", self.records()[0])
+        self.assertEqual(plan_ledger.review_records_at(self.ledger(), self.PR, LEDGER_HEAD)["uncited"], [])
+
+    def test_s2_u4_the_chunk_size_is_one_constant_said_once_in_the_definition(self):
+        text = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
+        region = text.split("<!-- chunk:begin -->", 1)[1].split("<!-- chunk:end -->", 1)[0]
+        self.assertEqual(region, "RATER_CHUNK_LINES = %d" % sb.RATER_CHUNK_LINES)
+        self.assertEqual(text.count("RATER_CHUNK_LINES"), 1)
+        self.assertEqual(text.count(str(sb.RATER_CHUNK_LINES)), 1)
+        self.assertEqual((REPO / "bin" / "fleet-switchboard").read_text().count("RATER_CHUNK_LINES = "), 1)
+        self.assertIn("one changed file at a time", text)
+        self.assertIn("in the changed-file order", text.replace("one each, in the changed-file order", "in the changed-file order"))
+
+    def test_s15_the_rule_is_documented_in_the_docs_and_the_skill(self):
+        for path in (REPO / "docs" / "switchboard.md", REPO / "skills" / "fleet-review" / "SKILL.md"):
+            self.assertEqual(path.read_text().count("is recorded exactly as given"), 1, path.name)
+
+    def test_s11_the_checkout_writes_the_matrix_words_and_one_diff_per_file(self):
+        words = "\n".join(sb.impact_matrix_lines(sb.impact_matrix_words()))
+        self.assertEqual(sum(1 for line in words.splitlines() if line.startswith("floor rule ")), 3)
+        for rule in ("floor-credentials", "floor-identity", "floor-authority"):
+            self.assertIn("floor rule %s:" % rule, words)
+        self.assertEqual(sb.impact_matrix_lines(sb.impact_matrix_words())[1].count(","), 3)
+        self.assertEqual(sb.impact_matrix_lines(sb.impact_matrix_words())[2].count(","), 4)
+
 
 class TestImpactRejudge(LedgerBase):
     """#451 slice 3: the daemon's hold labels follow the OWNER-HOLD rule; a hold it applied that no longer holds is taken off (only the labels it added);
@@ -67951,7 +68119,7 @@ class TestReviewerSubagents(LedgerBase):
 
     def setUp(self):
         super().setUp()
-        self.pr = dict(self.pr, baseRefOid=self.BASE, baseRefName="main")
+        self.pr = dict(self.pr, baseRefOid=self.BASE, baseRefName="main", files=[], changedFiles=0)   # (#1047) a change with no files: an empty files-read list is whole
         self.contents_calls = []
         self.list_calls = []
         self.merged_prs = []
@@ -68338,7 +68506,6 @@ class TestReviewerSubagents(LedgerBase):
                  ("tester", "approve", (), "--reviewer must be one of"),
                  ("code", "yes", (), "--verdict must be one of"),
                  ("code", "approve", ("--blocks", "1"), "cannot carry blocking findings"),
-                 ("code", "request-changes", (), "needs at least 1 blocking finding"),
                  ("code", "approve", ("--impact-action", "hold"), "belongs to the impact reviewer"),
                  ("code", "approve", ("--blocks", "999"), "from 0 to 200"))
         for reviewer, verdict, more, needle in cases:
@@ -68423,13 +68590,14 @@ class TestReviewerSubagents(LedgerBase):
         self.assertEqual((entry["reviewer"], entry["verdict"], entry["blocks"], entry["notes"], entry["head"], entry["by"]),
                          ("code", "request-changes", 1, 1, LEDGER_HEAD, "coder"))
 
-    def test_a_blocking_finding_that_cites_no_rule_counts_as_a_note_and_cannot_make_a_request_for_changes(self):
+    def test_a_blocking_finding_that_cites_no_rule_counts_as_a_note_and_the_verdict_is_recorded_as_given_marked_uncited(self):
         code, out, err = self.record_block("coder", "code", self.block_text("request-changes", findings=("no rule here | block | a.py:1 | vague | fix it",)))
-        self.assertEqual(code, 2, "request-changes with no cited blocking finding is refused")
-        self.assertIn("needs at least 1 blocking finding", err)
+        self.assertEqual(code, 0, err)
+        (entry,) = [e for e in self.ledger() if e["kind"] == "review_record"]
+        self.assertEqual((entry["verdict"], entry["blocks"], entry.get("uncited")), ("request-changes", 0, True))
         code, out, err = self.record_block("coder", "code", self.block_text("comment", findings=("no rule here | block | a.py:1 | vague | fix it",)))
         self.assertEqual(code, 0, err)
-        self.assertEqual([(e["blocks"], e["notes"]) for e in self.ledger() if e["kind"] == "review_record"], [(0, 1)])
+        self.assertEqual([(e["blocks"], e["notes"]) for e in self.ledger() if e["kind"] == "review_record"], [(0, 1), (0, 1)])
 
     def test_the_impact_block_carries_its_action_and_a_block_for_another_head_or_a_malformed_one_is_refused(self):
         code, out, err = self.record_block("coder", "impact", self.block_text("comment", extra="impact-action: hold\n", findings=()))

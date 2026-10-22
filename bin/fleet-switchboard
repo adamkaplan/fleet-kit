@@ -22546,6 +22546,24 @@ def impact_matrix_words(for_rater=None):
             "floor_rules": dict((score.get("floor") or {}).get("rules") or {}), "lowest_floor_level": (score.get("floor") or {}).get("lowest_level"), "for_rater": for_rater}
 
 
+def impact_matrix_lines(words):
+    """The text `impact matrix` prints, as lines (also written into a review checkout, #1047, so a reviewer subagent in its own worktree can read the matrix without a command)."""
+    for_rater = words.get("for_rater")
+    out = ["impact matrix (the kit's matrix file; read-only)", "severities: %s" % ", ".join(words["severities"]), "probabilities: %s" % ", ".join(words["probabilities"])]
+    for severity in words["severities"]:
+        for probability, cell in words["cells"][severity].items():
+            out.append("cell %s / %s: level %s, action %s" % (severity, probability, cell["level"], cell["action"]))
+    for rule_id, cls in sorted(words["floor_rules"].items()):
+        out.append("floor rule %s: class %s" % (rule_id, cls))
+    if for_rater is not None:
+        out.append("floor report for %s at %s: %s" % (for_rater["pr"], (for_rater["head"] or "unknown head")[:8], "complete" if for_rater["complete"] else "INCOMPLETE file list"))
+        for rule_id, paths in for_rater["floor_hits"].items():
+            out.append("floor hit %s: %s" % (rule_id, ", ".join(paths)))
+        if not for_rater["floor_hits"]:
+            out.append("floor hit: none")
+    return out
+
+
 def cmd_impact_matrix(args, runner, now):
     """`impact matrix [--for-rater <pr>] [--json]`: print the matrix file's severities, probabilities, cells (level and action) and floor rule ids; with `--for-rater` also that pull request's floor report
     (each floor rule id the changed paths hit, and the paths): the SAME `pr_floor_report` `impact floor` prints. Read-only: no ledger, state or audit write. Works with no review laws in the repository."""
@@ -22567,20 +22585,7 @@ def cmd_impact_matrix(args, runner, now):
     if args.json:
         print(json.dumps(words, sort_keys=True))
         return EXIT_OK
-    print("impact matrix (the kit's matrix file; read-only)")
-    print("severities: %s" % ", ".join(words["severities"]))
-    print("probabilities: %s" % ", ".join(words["probabilities"]))
-    for severity in words["severities"]:
-        for probability, cell in words["cells"][severity].items():
-            print("cell %s / %s: level %s, action %s" % (severity, probability, cell["level"], cell["action"]))
-    for rule_id, cls in sorted(words["floor_rules"].items()):
-        print("floor rule %s: class %s" % (rule_id, cls))
-    if for_rater is not None:
-        print("floor report for %s at %s: %s" % (for_rater["pr"], (for_rater["head"] or "unknown head")[:8], "complete" if for_rater["complete"] else "INCOMPLETE file list"))
-        for rule_id, paths in for_rater["floor_hits"].items():
-            print("floor hit %s: %s" % (rule_id, ", ".join(paths)))
-        if not for_rater["floor_hits"]:
-            print("floor hit: none")
+    print("\n".join(impact_matrix_lines(words)))
     return EXIT_OK
 
 
@@ -24119,7 +24124,7 @@ def pr_state_view(ref, body, entries, now, ledger_ref=None, ledger_problem=None)
         for reviewer in plan_ledger.REVIEWERS_NOW:
             found = [e for e in entries if e.get("kind") == "review_record" and e.get("pr") == (ledger_ref or ref) and e.get("head") == entry.get("head") and e.get("reviewer") == reviewer]
             if found:
-                reviews.append({"reviewer": reviewer, "verdict": _text(found[-1].get("verdict"), 20), "head": head})
+                reviews.append(dict({"reviewer": reviewer, "verdict": _text(found[-1].get("verdict"), 20), "head": head}, **({"uncited": True} if found[-1].get("uncited") is True else {})))
     stale_head = bool(examined and head and examined != head)   # what was examined belongs to another head: it is not shown as this head's
     checks = None
     if isinstance(entry.get("checks"), list) and not stale_head:
@@ -24173,7 +24178,7 @@ def pr_state_line(view):
     if view.get("reviews") is None:
         parts.append("reviews unknown (ledger unreadable: %s)" % _plain(view.get("reviews_problem") or "?", 100))
     else:
-        parts.append("reviews %s" % (", ".join("%s %s" % (_plain(r["reviewer"], 20), _plain(r["verdict"], 20)) for r in view["reviews"]) or "none recorded at this head"))
+        parts.append("reviews %s" % (", ".join("%s %s%s" % (_plain(r["reviewer"], 20), _plain(r["verdict"], 20), " (names no rule)" if r.get("uncited") else "") for r in view["reviews"]) or "none recorded at this head"))
     parts.append("labels %s" % (", ".join(_plain(l, 60) for l in view["labels"]) or "none"))
     parts.append("list read %ds ago" % view["age_seconds"])
     if view.get("why"):
@@ -24454,7 +24459,7 @@ def _review_pr(args, engine):
     except NoticeError as err:
         raise ReviewError(str(err)) from None
     try:
-        raw = read_pr_json(engine, repo, number, "baseRefOid,baseRefName")
+        raw = read_pr_json(engine, repo, number, "baseRefOid,baseRefName,files")
     except NoticeError as err:
         raise ReviewError(str(err)) from None
     return repo, number, "%s#%d" % (repo, number), raw
@@ -24509,8 +24514,8 @@ def parse_review_block(text):
     if not isinstance(text, str) or not text.strip():
         return None, "no verdict block"
     lines = [l.strip() for l in text.splitlines()]
-    fields = {"verdict": None, "head": None, "impact_action": None, "impact_class": None, "impact_severity": None, "impact_probability": None, "impact_reason": None, "blocks": 0, "notes": 0, "findings": 0}
-    started = False
+    fields = {"verdict": None, "head": None, "impact_action": None, "impact_class": None, "impact_severity": None, "impact_probability": None, "impact_reason": None, "blocks": 0, "notes": 0, "findings": 0, "files_read": [], "files_problem": None}
+    started, section = False, "findings"
     for line in lines:
         if line.startswith("verdict:") and not started:
             fields["verdict"], started = line.split(":", 1)[1].strip(), True
@@ -24526,13 +24531,23 @@ def parse_review_block(text):
             fields["impact_probability"] = line.split(":", 1)[1].strip()
         elif started and line.startswith("impact-reason:"):
             fields["impact_reason"] = line.split(":", 1)[1].strip()
+        elif started and line.startswith("files-read:"):
+            section = "files"
+        elif started and line.startswith("findings:"):
+            section = "findings"
+        elif started and section == "files" and line.startswith("- "):
+            row = parse_files_read_row(line[2:])
+            if row is None:
+                fields["files_problem"] = fields["files_problem"] or "a `files-read:` row is not `- <path> | <lines read> | <lines in its diff>` (numbers): %r" % line[:80]
+            else:
+                fields["files_read"].append(row)
         elif started and line.startswith("- "):
             parts = [p.strip() for p in line[2:].split("|")]
             if len(parts) >= 2 and parts[1] in ("block", "note"):
                 fields["findings"] += 1
                 if parts[1] == "block":
                     if not re.fullmatch(r"R-[A-Z]+-[0-9]+", parts[0]) and not re.fullmatch(r"[A-Za-z0-9_.-]+-[0-9]+", parts[0]):
-                        fields["notes"] += 1   # a blocking finding that cites no rule is a proposal: it never blocks (R-LAW-1)
+                        fields["notes"] += 1   # a blocking finding that cites no rule is counted as a note; the verdict itself is recorded as given and marked uncited (#1047)
                     else:
                         fields["blocks"] += 1
                 else:
@@ -24548,6 +24563,44 @@ def parse_review_block(text):
     if fields["impact_class"] is not None and not IMPACT_CLASS_RE.fullmatch(fields["impact_class"]):
         return None, "`impact-class:` must be one lower-case word naming the class of the impact (see the matrix file's classes)"
     return fields, None
+
+
+def pr_changed_paths(raw):
+    """(paths, None) of the pull request's changed files from GitHub's own list, or (None, why) when that list is not whole: the same test `pr_floor_report` makes (`changedFiles` against the files listed)."""
+    files = raw.get("files")
+    if not isinstance(files, list):
+        return None, "GitHub's list of changed files could not be read"
+    paths = [f.get("path") for f in files if isinstance(f, dict) and isinstance(f.get("path"), str)]
+    total = raw.get("changedFiles") if isinstance(raw.get("changedFiles"), int) else len(paths)
+    if len(paths) < total or raw.get("truncated"):
+        return None, "GitHub listed %d of %d changed files" % (len(paths), total)
+    return paths, None
+
+
+def parse_files_read_row(text):
+    """(path, lines read, lines in its diff) from `<path> | <lines read> | <lines in its diff>`, or None when it is not that shape."""
+    parts = [p.strip() for p in text.rsplit("|", 2)]
+    if len(parts) != 3 or not parts[0] or not parts[1].isdigit() or not parts[2].isdigit() or len(parts[1]) > 9 or len(parts[2]) > 9:
+        return None
+    return parts[0], int(parts[1]), int(parts[2])
+
+
+RATER_CHUNK_LINES = 200   # #1047: the ONE chunk size (diff lines) a rater reads at a time, under the ~280 lines where recorded reads were cut; the agent definition and the refusal text render it from here
+
+
+def whole_read_problem(files_read, listed):
+    """Why a rater's files-read rows are not a whole read of the pull request's changed files `listed` (GitHub's list: paths), or None. Names the missing files and the first unread line."""
+    rows = {}
+    for path, read, total in files_read:
+        rows[path] = (max(read, rows[path][0]) if path in rows else read, max(total, rows[path][1]) if path in rows else total)
+    missing = [p for p in listed if p not in rows]
+    if missing:
+        return "the files-read list is shorter than the pull request's changed files: not read: %s (first unread line: 1 of each)" % ", ".join(_printable_path(p) for p in missing[:10])
+    for path in listed:
+        read, total = rows[path]
+        if read < total:
+            return "%s was read to line %d of %d: the first unread line is line %d (chunks of %d lines; read every file to its last line)" % (_printable_path(path), read, total, read + 1, RATER_CHUNK_LINES)
+    return None
 
 
 IMPACT_CLASS_RE = re.compile(r"[a-z][a-z-]{0,31}")
@@ -24638,7 +24691,7 @@ def cmd_review(args, runner, now):
                     latest[entry.get("reviewer")] = entry
             for reviewer, entry in sorted(latest.items()):
                 if entry.get("verdict") == "request-changes":
-                    print("%s recorded request-changes (%s blocking finding(s)) at %s" % (reviewer, entry.get("blocks"), (at or "")[:8]))
+                    print("%s recorded request-changes (%s blocking finding(s)%s) at %s" % (reviewer, entry.get("blocks"), "; it names no rule" if entry.get("uncited") else "", (at or "")[:8]))
             return EXIT_OK
         if args.review_cmd == "laws":
             base = raw.get("baseRefOid")
@@ -24659,7 +24712,7 @@ def cmd_review(args, runner, now):
         given = rating_inputs(getattr(args, "raw_argv", ()))   # #835: the rating's inputs come from the raw argv through a private parser, never from the shared namespace (a registrar's set_defaults, a replaced parser or a wrapper cannot reach them); a missing raw argv gives no rating
         action, klass = given.get("impact_action"), given.get("impact_class")
         rating_in = {name: given.get(name) for name in IMPACT_RATING_FIELDS}
-        block_digest, block_fields = None, {}
+        block_digest, block_fields, block_rows, block_problem = None, {}, None, None
         if given.get("block") is not None:   # the reviewer's returned text: the coder session records it
             carried = {"verdict": verdict, "head": args.head, "blocks": args.blocks, "notes": args.notes, "impact_action": action}
             if any(carried[dest] for flag, dest, mode in BLOCK_FLAG_TABLE if mode == "refused"):
@@ -24671,6 +24724,7 @@ def cmd_review(args, runner, now):
             block_raw = block_text.encode("utf-8")
             block_digest, block_fields = (hashlib.sha256(block_raw).hexdigest(), len(block_raw)), {name: fields[name] for name in IMPACT_RATING_FIELDS}
             verdict, args.head, args.blocks, args.notes, action = (fields["verdict"], fields["head"], fields["blocks"], fields["notes"], fields["impact_action"])
+            block_rows, block_problem = fields["files_read"], fields["files_problem"]
             klass = klass or fields["impact_class"]
             for name in IMPACT_RATING_FIELDS:   # the rating's severity and probability (the score is derived from the matrix's cell), and the reason that names a floor rule
                 if rating_in[name] is None:
@@ -24682,8 +24736,7 @@ def cmd_review(args, runner, now):
                 raise ReviewError("--%s must be a number from 0 to 200" % name)
         if verdict == "approve" and args.blocks:
             raise ReviewError("an approve cannot carry blocking findings (%d given)" % args.blocks)
-        if verdict == "request-changes" and not args.blocks:
-            raise ReviewError("request-changes needs at least 1 blocking finding (a finding that cites no rule never blocks)")
+        uncited = verdict == "request-changes" and not args.blocks   # #1047: a verdict is recorded exactly as given; one that cites no rule is MARKED, never refused or softened
         if confirms and verdict != "approve":
             raise ReviewError("--confirms-carry belongs to an approve: a reviewer who found a change to the pull request's own lines does not confirm it")
         if action and reviewer != "impact":
@@ -24720,7 +24773,19 @@ def cmd_review(args, runner, now):
             raise ReviewError("the PR head is unknown: nothing was recorded")
         given = args.head or head
         if not (head.startswith(given) or given.startswith(head)) or len(given) < 7:
-            raise ReviewError("--head %s is not the PR's head (%s): a record belongs to the head it judged, nothing was recorded" % (given[:12], head[:12]))
+            raise ReviewError("the head given (%s) is not the PR's head (%s): a record belongs to the head it judged, nothing was recorded" % (given[:40], head))
+        files_count = None
+        if reviewer == "impact" and block_digest:   # #1047: a rating is recorded only from a whole read, checked against GitHub's own list of changed files (never the block's)
+            if block_problem and verdict != "incomplete":
+                raise ReviewError("refused: %s (nothing was recorded)" % block_problem)
+            listed, listed_problem = pr_changed_paths(raw)
+            if verdict != "incomplete":
+                if listed is None:
+                    raise ReviewError("refused: %s, so the read cannot be checked (nothing was recorded)" % listed_problem)
+                why_short = whole_read_problem(block_rows, listed)
+                if why_short:
+                    raise ReviewError("refused: %s (nothing was recorded; record `verdict: incomplete` if you could not read it all)" % why_short)
+            files_count = (len({r[0] for r in block_rows}), len(listed) if listed is not None else None)
         kind = gates_caller_kind(runner, now)
         if kind[0] == "unknown":
             raise ReviewError("refused: %s" % kind[1])
@@ -24728,6 +24793,10 @@ def cmd_review(args, runner, now):
         entry = {"kind": "review_record", "pr": ref, "head": head, "reviewer": reviewer, "verdict": verdict,
                  "blocks": args.blocks, "notes": args.notes, "by": by,
                  "summary": plan_ledger.clip(redact_command_text(args.summary or ""), 200)}
+        if uncited:
+            entry["uncited"] = True   # #1047: the verdict word is the reviewer's own; this only says no finding named a rule
+        if files_count is not None:
+            entry["files_read"], entry["files_total"] = files_count
         if confirms:
             entry["carry_confirmed"] = True   # (#815) read by `impact_hold.carry_confirmer`: only a reviewer's own record at the head it judged
         if action:
@@ -24803,7 +24872,11 @@ def cmd_review_checkout(args, runner, now):
                 raise rc.Problem("tarball: %s" % _one_line(str(err), 160)) from None
 
         try:
-            path = rc.checkout(api, repo, number, head, base, os.getcwd(), archive=archive, notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
+            try:
+                matrix_text = "\n".join(impact_matrix_lines(impact_matrix_words())) + "\n"   # #1047: the matrix's words, from the file the clear reads, written beside the diff
+            except impact_floor.MatrixError:
+                matrix_text = None
+            path = rc.checkout(api, repo, number, head, base, os.getcwd(), extra_files=({rc.MATRIX_FILE: matrix_text} if matrix_text else None), archive=archive, notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
         except rc.OverBound as err:
             sys.stderr.write("%s: review checkout: refused, nothing left behind: %s\n" % (PROG, _one_line(str(err), 400)))
             return EXIT_USAGE
