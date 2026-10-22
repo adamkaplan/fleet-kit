@@ -39449,7 +39449,7 @@ class TestImpactHold(LedgerBase):
             self.assertEqual(calls(checks) & {"impact_rating_entries", "impact_review_record", "impact_records", "read_ledger"}, set(), "the clear reads the ledger only through rating_at")
         readers = sorted(n.name for tree in (hold, daemon) for n in tree.body if isinstance(n, ast.FunctionDef) and n.name != "rating_at" and "read_ledger" in {getattr(x.func, "attr", None) for x in ast.walk(n) if isinstance(x, ast.Call)}
                          and any(isinstance(x, ast.Constant) and x.value == "impact" for x in ast.walk(n)))
-        self.assertEqual(readers, sorted(["cmd_review", "impact_rating_entries", "impact_records"]), "the only readers of the impact records: the one filter, the bulk map of the dry run, and the record command's own count")
+        self.assertEqual(readers, sorted(["cmd_review", "impact_rating_entries", "impact_records", "rating_mismatch_lines"]), "the only readers of the impact records: the one filter, the bulk map of the dry run, and the record command's own count")
 
     def test_the_clear_reads_rated_at_this_head_like_every_other_reader_for_every_rating_state(self):
         self.score_config()
@@ -39758,7 +39758,7 @@ class TestImpactHold(LedgerBase):
 
     def test_the_rating_input_table_the_drift_guard_and_the_scan_of_the_shared_namespace(self):
         import ast
-        self.assertEqual(sb.RATING_INPUTS, sb.IMPACT_RATING_FIELDS + ("impact_action", "impact_class", "block"))
+        self.assertEqual(sb.RATING_INPUTS, sb.IMPACT_RATING_FIELDS + ("impact_action", "impact_class", "block", "block_file"))
         parser = sb.build_parser()
         (top,) = [a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction"]
         record = top.choices["review"]._subparsers._group_actions[0].choices["record"]
