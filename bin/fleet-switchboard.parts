@@ -1,0 +1,2 @@
+# The parts of the daemon, in the order they run, relative to this file. The line naming the entry is the entry's own code.
+fleet-switchboard
