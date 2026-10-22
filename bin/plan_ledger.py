@@ -435,9 +435,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             row.update(status="ok" if ok else "missing", detail=detail, missing=[] if ok else [detail])
         elif gid == "G6":
             floor = (facts or {}).get("floor")   # the impact floor read fresh for this head (#488); absent = not read, the label alone
-            if (facts or {}).get("captain"):
-                row.update(status="waiting", missing=["held for the owner (MERGE: captain): the owner decides, through cos"])
-            elif isinstance(floor, dict) and (floor.get("unreadable") or floor.get("decision") is None):
+            if isinstance(floor, dict) and (floor.get("unreadable") or floor.get("decision") is None):
                 row.update(status="waiting", missing=["the impact floor could not be read for this head (%s): the owner decides, through cos"
                                                       % (floor.get("unreadable") or "no decision")])
             elif isinstance(floor, dict) and floor.get("rehold"):   # (#830) a clear was recorded for ANOTHER head, none for this one, no rating here: held again, whatever the labels say
@@ -446,6 +444,11 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             elif isinstance(floor, dict) and floor.get("decision") == "hold" and not floor.get("cleared"):
                 row.update(status="waiting", missing=["held for the owner (impact floor, read at this head): %s; the owner clears it for this head"
                                                       % ("; ".join(floor.get("reasons") or []) or "hold")])
+            elif (facts or {}).get("captain") and "marker-without-label" in ((facts or {}).get("captain_findings") or ()) \
+                    and isinstance(floor, dict) and not (facts or {}).get("holds"):   # the floor read above says not held
+                row.update(status="ok", detail="a marker without a hold: set MERGE: automatic", missing=[])
+            elif (facts or {}).get("captain"):
+                row.update(status="waiting", missing=["held for the owner (MERGE: captain): the owner decides, through cos"])
             else:
                 row.update(status="ok", detail="not a held PR")
         elif gid == "G6b":
