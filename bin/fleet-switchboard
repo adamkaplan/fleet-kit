@@ -6171,9 +6171,9 @@ def launch_problems(name, agent, directory, workspace, issue, charter=None, head
     return problems
 
 
-def fleet_record(name, role, reports_to, issue, charter=None, repo=None, launched_by=None):
+def fleet_record(name, role, reports_to, issue, charter=None, repo=None, launched_by=None, read_repo=None):
     fleet = {"name": name, "role": role, "reports_to": reports_to, "issue": None if issue is None else int(issue),
-             "charter": charter, "repo": repo, "launched_by": launched_by}   # launched_by (#372): the agent that ran `launch`, as its pane identified it; None from a plain shell
+             "charter": charter, "repo": repo, "launched_by": launched_by, "read_repo": read_repo}   # launched_by (#372): the agent that ran `launch`, as its pane identified it; None from a plain shell
     return {key: value for key, value in fleet.items() if value is not None}
 
 
@@ -6342,7 +6342,7 @@ def record_launch_charter(engine, name, session_id, fleet, pane=None):
 
 
 def launch_agent(engine, name, agent, directory, workspace, role=None, reports_to=None, issue=None,
-                 brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None, repo=None, launched_by=None):
+                 brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None, repo=None, launched_by=None, read_repo=None):
     """Create a fleet agent: a v2 session, its own herdr tab, the brief.
 
     Nothing is typed. The tab's program is started by argv through herdr's
@@ -6357,7 +6357,7 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
     taken = engine.discover(engine.now()).agents.get(name)
     if taken is not None:
         raise LaunchError("a fleet agent named %s already runs in pane %s" % (name, taken.pane))
-    fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by)
+    fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by, read_repo)
     env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
     env.update(view_env(role, repo or (engine.config.get("intent_repo") if charter else None)))  # PR 18
     env.update(agent_tmp_env(engine, name))   # #767: before the session exists, so a failure leaves nothing started
@@ -9658,7 +9658,11 @@ def cmd_whoami(args, runner, now):
         own = repo or _fleet_repo(fleet, config)
         # `own` is false when the repo is only the config's `intent_repo` default: an agent with no repo of its own (the Chief of Staff) has no account of
         # its own to keep, so the gh shim may use the account of the repo a command names
-        print(json.dumps({"name": fleet["name"], "repo": own or config.get("intent_repo") or None, "own": bool(own), "role": fleet.get("role") if isinstance(fleet.get("role"), str) else None}, sort_keys=True))   # the RECORDED role: the gh shim gives only the Chief of Staff the named repository's App token
+        who = {"name": fleet["name"], "repo": own or config.get("intent_repo") or None, "own": bool(own), "role": fleet.get("role") if isinstance(fleet.get("role"), str) else None}   # the RECORDED role: the gh shim gives only the Chief of Staff the named repository's App token
+        if "read_repo" in fleet:   # #618: only a worker launched with --read-repo has the key, so every other answer is as it was; one that cannot be read says so (the shim refuses)
+            who["read_repo"] = fleet["read_repo"] if isinstance(fleet["read_repo"], str) and GhAccounts.normal_repo(fleet["read_repo"]) == fleet["read_repo"] \
+                and re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", fleet["read_repo"]) else False
+        print(json.dumps(who, sort_keys=True))
         return EXIT_OK
     if getattr(args, "repo", False):
         fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
@@ -19136,6 +19140,8 @@ def launch_memory_check(args, engine, state, runner, now):
 
 
 def cmd_launch(args, runner, now, socket_call=None):
+    if getattr(args, "read_repo", None) is not None and (getattr(args, "cloud", False) or args.resume):
+        raise LaunchError("--read-repo needs a terminal launch of a new worker (not --headless, --cloud or --resume)")
     if getattr(args, "stack", False) and not getattr(args, "cloud", False):   # before anything is read or called: the option is the cloud launcher's
         sys.stderr.write("%s: --stack needs --cloud: the nested Docker stack is a cloud worker's pod; nothing was created\n" % PROG)
         return EXIT_USAGE
@@ -19201,6 +19207,7 @@ def cmd_launch(args, runner, now, socket_call=None):
                 engine.audit.append(engine.actor, "launch.repo_from_origin", args.name, {"repo": repo})
         else:
             sys.stderr.write("%s: no repository recorded (%s): pushes will be refused; pass --repo\n" % (PROG, why))
+    read_repo = launch_read_repo(args, repo, getattr(engine, "accounts", None), engine.config, use_headless)
     problem = launch_agent_problem(engine.config, runner, args.agent)
     if problem:
         raise LaunchError(problem)
@@ -19252,7 +19259,7 @@ def cmd_launch(args, runner, now, socket_call=None):
         if done is None:
             done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
                                 None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo,
-                                launched_by=launched_by)
+                                launched_by=launched_by, read_repo=read_repo)
     except LaunchError as err:
         if created:
             raise LaunchError("%s (workspace %s was created and is left for you to close)" % (err, created)) from err
@@ -19260,6 +19267,10 @@ def cmd_launch(args, runner, now, socket_call=None):
     print(json.dumps(done, sort_keys=True))
     if done.get("identity"):
         sys.stderr.write("%s: %s\n" % (PROG, done["identity"]))
+    if read_repo:   # the one line that says the grant (#618); it is also in the worker's record (metadata.fleet.read_repo)
+        sys.stderr.write("%s: %s can read %s, read only (a shim guard: writes there are refused)\n" % (PROG, args.name, read_repo))
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "launch.read_repo", args.name, {"read_repo": read_repo})
     if args.role == "orchestrator":   # #838: a relaunched or replacement orchestrator inherits the workers its predecessor left, in the same step
         launched_charter = int(re.search(r"(\d+)\s*$", str(args.charter)).group(1)) if args.charter and re.search(r"(\d+)\s*$", str(args.charter)) else None
         for path, bosses in (("relaunch", {args.name}), ("replace", None)):
@@ -19359,6 +19370,30 @@ def launch_gate_probe(engine, state, config, args, brief, runner, now):
                          {"for": "launch", "reason": "%s: %s" % (type(err).__name__, _one_line(str(err), 200)), "first_today": first})
         except BaseException:
             pass
+
+
+def launch_read_repo(args, repo, accounts, config, use_headless=False):
+    """The ONE extra repository a worker may READ (`--read-repo`, #618), as the exact lower-case `owner/name` the shims will match, or None when none was
+    asked for. Refused (LaunchError) when it is not written exactly that way (no case, whitespace, `.git`, `/`, `owner/*`, URL or path spelling: the
+    same rules as the launch guard's `normal_repo`, which must leave it unchanged), is the worker's own repository, has no `gh_users` account (a read
+    would run as the wrong account), or is combined with --headless, --cloud or --resume (no shim pins those workers). The grant is a shim guard, not a
+    GitHub guard: the account behind it may still be able to write."""
+    given = getattr(args, "read_repo", None)
+    if given is None:
+        return None
+    if getattr(args, "headless", False) or getattr(args, "cloud", False) or args.resume:
+        raise LaunchError("--read-repo needs a terminal launch of a new worker (not --headless, --cloud or --resume)")
+    if use_headless:   # #433: a plain launch is headless by default, and no shim pins a headless worker: the grant would be unguarded, so it asks for the terminal by name
+        raise LaunchError("--read-repo needs a terminal launch: add --terminal (a plain launch is headless by default, and no shim pins a headless worker)")
+    exact = isinstance(given, str) and given.isascii() and re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", given) is not None \
+        and not given.endswith(".git") and ".." not in given.split("/") and "." not in given.split("/") and GhAccounts.normal_repo(given) == given
+    if not exact:
+        raise LaunchError("--read-repo must be exactly OWNER/NAME in lower case (no whitespace, .git, URL, path or wildcard), got %r" % _one_line(str(given), 60))
+    if repo and GhAccounts.normal_repo(repo) == given:
+        raise LaunchError("--read-repo %s is the worker's own repository: nothing to add" % given)
+    if accounts is None or not config.get("gh_users") or not accounts.account_for(given):
+        raise LaunchError("--read-repo %s has no gh account: add \"%s\" or \"%s/*\" to gh_users in %s" % (given, given, given.split("/")[0], config_path()))
+    return given
 
 
 def launch_repo(args):
@@ -29887,6 +29922,9 @@ def build_parser():
     launch.add_argument("--issue", type=issue_arg, help="metadata.fleet.issue (owner/repo#N also sets --repo)")
     launch.add_argument("--repo", help="metadata.fleet.repo, OWNER/REPO: the project the agent works in. Its gh "
                                        "account (config gh_users) is the agent's GH_TOKEN")
+    launch.add_argument("--read-repo", dest="read_repo", metavar="OWNER/NAME",
+                        help="ONE extra repository the worker may READ (issue view, pr view, api GET...) as that repository's gh_users account; every write "
+                             "there, every command that names another repository and `gh search|gist|status|...` are refused by the gh and git shims. Exact lower-case owner/name. A shim guard, not a GitHub guard")
     launch.add_argument("--new-workspace", dest="new_workspace", metavar="LABEL",
                         help="Create a herdr workspace with this label in --dir (never focused), and launch "
                              "into it. A --charter whose `workspace:` line differs is refused")
