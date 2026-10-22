@@ -15704,7 +15704,7 @@ class TestOneCharter(Base):
     def functions_reading_charter():
         """{(file, function): (the function's AST node, whether it enumerates the agents)} for every function that reads a fleet's `charter`, DERIVED from the code."""
         found = {}
-        for rel in ("bin/fleet-switchboard", "bin/impact_hold.py", "bin/lanes.py", "bin/fleet_health.py", "bin/registry.py", "bin/reassign.py"):
+        for rel in ["bin/fleet-switchboard", "bin/impact_hold.py", "bin/lanes.py", "bin/fleet_health.py", "bin/registry.py", "bin/reassign.py"] + ["bin/" + str(f.relative_to(BIN)) for f in SWITCHBOARD_SOURCE_FILES if f != SWITCHBOARD]:
             tree = ast.parse((REPO / rel).read_text())
             for node in ast.walk(tree):
                 if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -15767,7 +15767,7 @@ class TestOneCharter(Base):
         ("bin/fleet-switchboard", "charter_orders"): "own: an agent's own charter's orders", ("bin/fleet-switchboard", "charter_guard"): "own: an agent's own charters",
         ("bin/fleet-switchboard", "ask_context_of"): "own: an agent's own ask context", ("bin/fleet-switchboard", "__call__"): "own: an orchestrator's own orders",
         ("bin/fleet_health.py", "figures"): "own: the health figures of one agent from the registry-derived info", ("bin/fleet_health.py", "_resolve_charters"): "own: the registry-derived info",
-        ("bin/fleet_health.py", "_refresh_asks"): "own: the registry-derived info", ("bin/fleet-switchboard", "_import_fleet"): "own: the launch/import writer of the session's metadata",
+        ("bin/fleet_health.py", "_refresh_asks"): "own: the registry-derived info", ("bin/switchboard/import_v1.py", "_import_fleet"): "own: the launch/import writer of the session's metadata",
     }
 
 
