@@ -45330,6 +45330,7 @@ USE_COMMANDS = {
     "bootstrap": ["bootstrap"], "notice": ["notice", "pr", "acme/api#7", "--from", "coder"],
     "move": ["move", "1", "--to", "2", "--from", "coder"], "reassign": ["reassign", "coder", "--undo", "--from", "coder"],
     "charter": ["charter", "set", "coder", "1", "--from", "coder"],
+    "resume": ["resume", "other"],
 }
 
 
