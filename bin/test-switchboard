@@ -36471,14 +36471,60 @@ class TestWholeRead(LedgerBase):
     def test_s3_s5_s7_s8_s9_the_whole_read_is_recorded_and_a_short_one_refused_naming_the_file_and_the_line(self):
         self.check_behaviour()
 
+    def bound_rows(self, a, b):
+        return (("src/a.py", a, b), ("docs/long.md", 900, 900), ("docs/b.md", 12, 12))
+
+    def set_counts(self, counts):
+        self.pr = dict(self.pr, files=[{"path": p, "additions": counts.get(p, 1), "deletions": 0} for p in self.FILES])
+
+    def check_bound(self):
+        """The bound: a row below GitHub's additions + deletions is refused (total and lines read both), met exactly is recorded, 0 | 0 only where the bound is 0."""
+        self.set_counts({"src/a.py": 280})
+        before = len(self.records())
+        for rows in ((("src/a.py", 279, 279),) + self.WHOLE[1:], (("src/a.py", 0, 0),) + self.WHOLE[1:], (("src/a.py", 100, 100),) + self.WHOLE[1:], (("src/a.py", 100, 280),) + self.WHOLE[1:]):
+            code, out, err = self.record(rows)
+            self.assertEqual((code, len(self.records()) - before), (2, 0), rows)
+            self.assertIn("src/a.py", err)
+            self.assertIn("280", err)
+        code, out, err = self.record((("src/a.py", 280, 279),) + self.WHOLE[1:])   # read below the bound while claiming a lower total
+        self.assertEqual(code, 2)
+        code, out, err = self.record(self.bound_rows(280, 280))   # met exactly
+        self.assertEqual((code, len(self.records()) - before), (0, 1), err)
+        self.set_counts({"src/a.py": 0})   # binary or renamed: 0 | 0 is honest
+        code, out, err = self.record(self.bound_rows(0, 0))
+        self.assertEqual(code, 0, err)
+        self.set_counts({"src/a.py": 3})   # additions and deletions both count
+        self.pr["files"][0]["deletions"] = 4
+        code, out, err = self.record(self.bound_rows(6, 6))
+        self.assertEqual(code, 2)
+        code, out, err = self.record(self.bound_rows(7, 7))
+        self.assertEqual(code, 0, err)
+
+    def test_the_bound_refuses_a_total_below_githubs_count_and_accepts_it_met_exactly(self):
+        self.check_bound()
+
+    def test_a_mutant_that_trusts_the_blocks_total_fails_the_bound_check(self):
+        real = sb.whole_read_problem
+        def trusts_total(rows, listed, bounds=None):
+            return real(rows, listed, None)
+        def ignores_read(rows, listed, bounds=None):   # checks the total only
+            return real([(p, t, t) for p, r, t in rows], listed, bounds)
+        def ignores_total(rows, listed, bounds=None):   # checks the lines read only
+            return real([(p, r, r) for p, r, t in rows], listed, bounds)
+        for name, mutant in (("trusts the block's total", trusts_total), ("ignores the lines read", ignores_read), ("ignores the total", ignores_total)):
+            with self.subTest(name), mock.patch.object(sb, "whole_read_problem", mutant):
+                with self.assertRaises(AssertionError):
+                    self.check_bound()
+        self.assertEqual(sb.whole_read_problem, real)
+
     def test_s10_each_mutant_of_the_rule_fails_the_behaviour_check(self):
         real_problem, real_paths = sb.whole_read_problem, sb.pr_changed_paths
-        def accepts_short(rows, listed):
+        def accepts_short(rows, listed, bounds=None):
             return None
-        def count_only(rows, listed):
-            return None if len(rows) >= len(listed) else real_problem(rows, listed)
-        def trusts_block(rows, listed):
-            return real_problem(rows, [r[0] for r in rows])
+        def count_only(rows, listed, bounds=None):
+            return None if len(rows) >= len(listed) else real_problem(rows, listed, bounds)
+        def trusts_block(rows, listed, bounds=None):
+            return real_problem(rows, [r[0] for r in rows], bounds)
         for name, mutant in (("accepts a short list", accepts_short), ("compares only the count", count_only), ("trusts the block's own list", trusts_block)):
             with self.subTest(name), mock.patch.object(sb, "whole_read_problem", mutant):
                 with self.assertRaises(AssertionError):

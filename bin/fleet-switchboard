@@ -24885,8 +24885,18 @@ FILES_READ_ROWS_MAX = 5000   # the most `files-read:` rows a block may list (the
 RATER_CHUNK_LINES = 200   # #1047: the ONE chunk size (diff lines) a rater reads at a time, under the ~280 lines where recorded reads were cut; the agent definition and the refusal text render it from here
 
 
-def whole_read_problem(files_read, listed):
-    """Why a rater's files-read rows are not a whole read of the pull request's changed files `listed` (GitHub's list: paths), or None. Names the missing files and the first unread line."""
+def pr_changed_bounds(raw):
+    """{path: additions + deletions} from GitHub's own per-file list: a diff has at least that many lines, so no honest count of one is lower (a file with no counts, or none given, is 0)."""
+    out = {}
+    for f in raw.get("files") or []:
+        if isinstance(f, dict) and isinstance(f.get("path"), str):
+            out[f["path"]] = sum(f[k] for k in ("additions", "deletions") if isinstance(f.get(k), int) and not isinstance(f.get(k), bool) and f[k] > 0)
+    return out
+
+
+def whole_read_problem(files_read, listed, bounds=None):
+    """Why a rater's files-read rows are not a whole read of the pull request's changed files `listed` (GitHub's list: paths), or None. Names the missing files and the first unread line.
+    `bounds` ({path: additions + deletions} from GitHub's list) is the least a diff can hold: a row whose total or lines read is below it is refused, whatever the rater's own total says."""
     rows = {}
     for path, read, total in files_read:
         rows[path] = (max(read, rows[path][0]) if path in rows else read, max(total, rows[path][1]) if path in rows else total)
@@ -24895,6 +24905,9 @@ def whole_read_problem(files_read, listed):
         return "the files-read list is shorter than the pull request's changed files: not read: %s (first unread line: 1 of each)" % ", ".join(_printable_path(p) for p in missing[:10])
     for path in listed:
         read, total = rows[path]
+        bound = (bounds or {}).get(path, 0)
+        if total < bound or read < bound:
+            return "%s: the row says %d lines read of %d in its diff, but GitHub counts %d added and deleted lines, so its diff has at least %d (the bound): read it again to its last line and count them" % (_printable_path(path), read, total, bound, bound)
         if read < total:
             return "%s was read to line %d of %d: the first unread line is line %d (chunks of %d lines; read every file to its last line)" % (_printable_path(path), read, total, read + 1, RATER_CHUNK_LINES)
     return None
@@ -25081,7 +25094,7 @@ def cmd_review(args, runner, now):
             if verdict != "incomplete":   # fails toward refusal: a list GitHub did not give whole is never replaced by the block's own
                 if listed is None:
                     raise ReviewError("refused: %s, so the read cannot be checked (nothing was recorded)" % listed_problem)
-                why_short = whole_read_problem(block_rows, listed)
+                why_short = whole_read_problem(block_rows, listed, pr_changed_bounds(raw))
                 if why_short:
                     raise ReviewError("refused: %s (nothing was recorded; record `verdict: incomplete` if you could not read it all)" % why_short)
             files_count = (len({r[0] for r in block_rows}), len(listed) if listed is not None else None)
