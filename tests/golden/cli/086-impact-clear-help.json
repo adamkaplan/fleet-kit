@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "impact",
+  "clear",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard impact clear [-h] [--under-order N] --reason REASON\n                                      [--revoke]\n                                      pr\n\npositional arguments:\n  pr               The pull request: owner/repo#N or its URL\n\noptions:\n  -h, --help       show this help message and exit\n  --under-order N  The Chief of Staff only: clear under the owner's standing\n                   order N (it must be listed under delegated_clear in the\n                   configuration); recorded as her act under that order\n  --reason REASON  Why the hold is false (at least 10 characters), logged\n  --revoke         Take the clear back (and any carry of it): the PR is held\n                   again at the daemon's next pass\n"
+}

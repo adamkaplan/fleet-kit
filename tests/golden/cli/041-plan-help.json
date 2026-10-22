@@ -1,0 +1,9 @@
+{
+ "argv": [
+  "plan",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard plan [-h] {check,template,review} ...\n\npositional arguments:\n  {check,template,review}\n    check               Check a plan: scenarios well-formed, every Done-when\n                        clause covered; prints PASS or FAIL, one line per\n                        defect, and the plan's content hash\n    template            Print a prefilled plan for an ask: its Done-when\n                        clauses and one scenario stub per clause (read-only)\n    review              The plan review engine (off unless\n                        plan_review.enabled): adversarial lanes, at most 3\n                        rounds\n\noptions:\n  -h, --help            show this help message and exit\n"
+}

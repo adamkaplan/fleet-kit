@@ -1,0 +1,9 @@
+{
+ "argv": [
+  "bootstrap",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard bootstrap [-h] [--workspace LABEL] [--dir DIR]\n                                   [--no-focus]\n\noptions:\n  -h, --help         show this help message and exit\n  --workspace LABEL  The workspace's label (default: Chief of Staff)\n  --dir DIR          The Chief of Staff's working directory (default: here)\n  --no-focus         Open the workspace without taking focus (for scripts and\n                     trials)\n"
+}

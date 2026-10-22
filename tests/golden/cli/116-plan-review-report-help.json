@@ -1,0 +1,11 @@
+{
+ "argv": [
+  "plan",
+  "review",
+  "report",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard plan review report [-h] [--json] review\n\npositional arguments:\n  review\n\noptions:\n  -h, --help  show this help message and exit\n  --json\n"
+}

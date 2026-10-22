@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "triage",
+  "seen-leave",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard triage seen-leave [-h] OWNER/REPO#N\n\npositional arguments:\n  OWNER/REPO#N\n\noptions:\n  -h, --help    show this help message and exit\n"
+}

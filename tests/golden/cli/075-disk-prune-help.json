@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "disk",
+  "prune",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard disk prune [-h] [--dry-run] [--docker DOCKER]\n\nRuns exactly `docker builder prune -f --filter until=168h` and `docker image\nprune -a -f --filter until=168h` and prints what was reclaimed, then (only\nwhen the docker server is 23.0 or newer, where it removes ANONYMOUS volumes no\ncontainer references and nothing named) `docker volume prune -f`, never `-a`.\nNever a running container, never `system prune`. Refuses without docker. NOTE:\n`until=168h` is the image's age, not its last use: a locally built image with\nno registry copy is removed too if no container uses it.\n\noptions:\n  -h, --help       show this help message and exit\n  --dry-run        Print the commands and the candidate anonymous volumes and\n                   run none of them\n  --docker DOCKER  The docker executable (default: docker on PATH)\n"
+}

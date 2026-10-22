@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""arch-overlap: which open pull request touches which part of the switchboard.
+
+    arch-overlap [--repo OWNER/REPO] [--base REF] [--daemon bin/fleet-switchboard] [--tests bin/test-switchboard]
+                 [--json]
+
+For each open pull request (read with `gh`) it prints the top-level symbols of the daemon
+file and the classes of the test file it changes, then the reverse: for each section marker
+of the daemon file (a `# ---- name` comment line), the pull requests that touch it. The
+lines a pull request changes are read from `git diff` between its merge base with BASE and
+its head, and mapped onto the symbols of the file as it was at that merge base. A pure
+insertion belongs to the symbol that holds the line it follows, or to the marker's section.
+The tool only reads: `git fetch` of the pull request refs, `gh pr list`, `git diff`.
+"""
+import argparse
+import ast
+import bisect
+import json
+import re
+import subprocess
+import sys
+
+MARKER = re.compile(r"^# -{5,}\s*(.*?)\s*$")
+
+
+def symbols(source):
+    """[(first_line, last_line, name)] for every top-level statement that has a name."""
+    out = []
+    for node in ast.parse(source).body:
+        name = getattr(node, "name", None)
+        if name is None and isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name = node.targets[0].id
+        if name is None:
+            continue
+        first = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+        out.append((first, node.end_lineno, name))
+    return out
+
+
+def classes(source):
+    return [(first, last, name) for first, last, name in symbols_of(source, ast.ClassDef)]
+
+
+def symbols_of(source, kind):
+    for node in ast.parse(source).body:
+        if isinstance(node, kind):
+            yield node.lineno, node.end_lineno, node.name
+
+
+def markers(source):
+    """[(line, title)] of the section markers, in order."""
+    return [(n, m.group(1)) for n, line in enumerate(source.splitlines(), 1) for m in [MARKER.match(line)] if m]
+
+
+def section_of(line, marks):
+    """The title of the section a line falls in ('(before the first marker)' above the first)."""
+    index = bisect.bisect_right([n for n, _ in marks], line) - 1
+    return marks[index][1] if index >= 0 else "(before the first marker)"
+
+
+def changed_old_lines(diff):
+    """The old-file lines a `git diff -U0` text changes; an insertion counts as the line it follows."""
+    lines = set()
+    for match in re.finditer(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@", diff, re.M):
+        start, count = int(match.group(1)), int(match.group(2) if match.group(2) is not None else 1)
+        lines.update(range(start, start + count) if count else [start])
+    return lines
+
+
+def touched(lines, table):
+    """The names in `table` [(first, last, name)] that hold any of `lines`."""
+    return sorted({name for first, last, name in table for line in lines if first <= line <= last})
+
+
+def touched_in_gaps(lines, table):
+    return sorted({"<between statements near line %d>" % line for line in lines if not any(f <= line <= l for f, l, _ in table)})
+
+
+def git(*args):
+    return subprocess.run(("git",) + args, capture_output=True, text=True, check=False)
+
+
+def analyse(pr, base, daemon, tests):
+    """{"symbols": [...], "classes": [...], "sections": [...]} of one pull request."""
+    ref = "refs/arch-overlap/%d" % pr["number"]
+    if git("fetch", "-q", "origin", "+pull/%d/head:%s" % (pr["number"], ref)).returncode != 0:
+        return {"error": "cannot fetch the pull request head"}
+    merge_base = git("merge-base", base, ref).stdout.strip()
+    result = {"symbols": [], "classes": [], "sections": []}
+    for path, key in ((daemon, "daemon"), (tests, "tests")):
+        diff = git("diff", "-U0", merge_base, ref, "--", path).stdout
+        if not diff:
+            continue
+        old = git("show", "%s:%s" % (merge_base, path)).stdout
+        lines = changed_old_lines(diff)
+        if key == "daemon":
+            table = symbols(old)
+            result["symbols"] = touched(lines, table) + touched_in_gaps(lines, table)
+            marks = markers(old)
+            result["sections"] = sorted({section_of(line, marks) for line in lines})
+        else:
+            table = classes(old)
+            result["classes"] = touched(lines, table) + touched_in_gaps(lines, table)
+    return result
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="arch-overlap", description=__doc__.split("\n\n")[0])
+    parser.add_argument("--repo")
+    parser.add_argument("--base", default="origin/main")
+    parser.add_argument("--daemon", default="bin/fleet-switchboard")
+    parser.add_argument("--tests", default="bin/test-switchboard")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    cmd = ["gh", "pr", "list", "--state", "open", "--limit", "200", "--json", "number,title,files"]
+    if args.repo:
+        cmd += ["--repo", args.repo]
+    listing = subprocess.run(cmd, capture_output=True, text=True)
+    if listing.returncode != 0:
+        sys.stderr.write("arch-overlap: gh pr list failed: %s\n" % listing.stderr.strip())
+        return 2
+    report = {}
+    for pr in json.loads(listing.stdout):
+        names = {f["path"] for f in pr["files"]}
+        if args.daemon in names or args.tests in names:
+            report[pr["number"]] = dict(analyse(pr, args.base, args.daemon, args.tests), title=pr["title"])
+    by_section = {}
+    for number, info in report.items():
+        for section in info.get("sections", []):
+            by_section.setdefault(section, []).append(number)
+    if args.json:
+        print(json.dumps({"pull_requests": report, "by_section": by_section}, indent=1, sort_keys=True))
+        return 0
+    for number, info in sorted(report.items()):
+        print("#%d %s" % (number, info["title"]))
+        for label, key in (("symbols", "symbols"), ("test classes", "classes")):
+            if info.get(key):
+                print("    %s: %s" % (label, ", ".join(info[key])))
+        if info.get("error"):
+            print("    %s" % info["error"])
+    print("\nBy section marker of %s:" % args.daemon)
+    for section, numbers in sorted(by_section.items()):
+        print("  %s: %s" % (section, " ".join("#%d" % n for n in sorted(numbers))))
+    print("\n%d open pull requests touch the daemon or its tests" % len(report))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

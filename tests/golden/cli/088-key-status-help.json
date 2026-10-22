@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "key",
+  "status",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard key status [-h]\n\noptions:\n  -h, --help  show this help message and exit\n"
+}

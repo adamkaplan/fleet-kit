@@ -1,0 +1,9 @@
+{
+ "argv": [
+  "comment",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard comment [-h] --issue ISSUE --body-file BODY_FILE\n\noptions:\n  -h, --help            show this help message and exit\n  --issue ISSUE         The issue to comment on\n  --body-file BODY_FILE\n                        The comment: a file, or - for stdin\n"
+}

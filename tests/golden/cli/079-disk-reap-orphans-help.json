@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "disk",
+  "reap-orphans",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard disk reap-orphans [-h] [--apply]\n\noptions:\n  -h, --help  show this help message and exit\n  --apply     Do it (default: a dry run)\n"
+}

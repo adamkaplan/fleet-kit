@@ -1,0 +1,8 @@
+{
+ "argv": [
+  "agents"
+ ],
+ "status": 2,
+ "stderr": "usage: fleet-switchboard agents [-h] {verify,charters} ...\nfleet-switchboard agents: error: the following arguments are required: agents_action\n",
+ "stdout": ""
+}

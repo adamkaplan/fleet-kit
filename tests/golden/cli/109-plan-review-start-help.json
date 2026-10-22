@@ -1,0 +1,11 @@
+{
+ "argv": [
+  "plan",
+  "review",
+  "start",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard plan review start [-h] --ask ASK\n                                           [--tier {light,normal,full}]\n                                           [--json]\n                                           source\n\npositional arguments:\n  source                owner/repo#N of the plan\n\noptions:\n  -h, --help            show this help message and exit\n  --ask ASK             owner/repo#N of the ask (or work item) the plan\n                        serves: the count belongs to it\n  --tier {light,normal,full}\n                        Ask for more review than the computed tier (never\n                        less)\n  --json\n"
+}

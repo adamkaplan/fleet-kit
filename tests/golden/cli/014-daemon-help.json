@@ -1,0 +1,9 @@
+{
+ "argv": [
+  "daemon",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard daemon [-h] {status,start,stop,restart} ...\n\nOne command for the daemon. `status` says whether it runs, how it was started,\nits pid, since when and whether it is healthy. `stop` ends it (SIGTERM, only\nto a pid the daemon record and run.lock agree on whose command is this\nprogram's `run`; `launchctl bootout` under a loaded launchd job). `start`\nbegins it (launchd when its job exists, else the `ensure` path) and waits up\nto 120 seconds for it to be healthy. `restart` is stop then start. No state\nfile is touched.\n\npositional arguments:\n  {status,start,stop,restart}\n    status              running or not, how it was started, pid, since when,\n                        healthy or not (exit 1 when not running or unhealthy)\n    start               start the daemon and wait until it is healthy\n    stop                stop the daemon and wait for run.lock to clear\n    restart             stop then start; prints what it did and the seconds\n                        taken\n\noptions:\n  -h, --help            show this help message and exit\n"
+}

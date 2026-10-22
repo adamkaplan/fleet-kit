@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "decisions",
+  "resolve",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard decisions resolve [-h] [--note NOTE] [--from SENDER]\n                                           id\n\npositional arguments:\n  id             The decision's id\n\noptions:\n  -h, --help     show this help message and exit\n  --note NOTE    One line, posted as a comment on the issue, signed as you\n  --from SENDER  Lab only: the caller's fleet name\n"
+}

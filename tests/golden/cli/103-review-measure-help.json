@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "review",
+  "measure",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard review measure [-h] [--count COUNT] [--scan SCAN]\n                                        [--split SPLIT] [--json]\n                                        repo\n\npositional arguments:\n  repo           owner/repo\n\noptions:\n  -h, --help     show this help message and exit\n  --count COUNT  PRs per group (default 10)\n  --scan SCAN    Merged PRs read (default 40; the escape check looks among\n                 them)\n  --split SPLIT  A merged PR number: the baseline is the --count merged before\n                 it, the after is --count from it on\n  --json         Machine-readable rows\n"
+}

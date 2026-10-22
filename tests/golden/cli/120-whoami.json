@@ -1,0 +1,8 @@
+{
+ "argv": [
+  "whoami"
+ ],
+ "status": 1,
+ "stderr": "fleet-switchboard: 'opencode' is not configured in <ROOT>/config/fleet-switchboard/config.json: set it to the absolute path of the OpenCode v2 binary\n",
+ "stdout": ""
+}

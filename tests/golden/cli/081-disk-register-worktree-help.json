@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "disk",
+  "register-worktree",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard disk register-worktree [-h] --agent AGENT\n                                                [--repo REPO]\n                                                path\n\npositional arguments:\n  path           The worktree's directory\n\noptions:\n  -h, --help     show this help message and exit\n  --agent AGENT  The agent it belongs to\n  --repo REPO    OWNER/REPO (optional)\n"
+}

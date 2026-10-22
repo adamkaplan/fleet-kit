@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "plan",
+  "review",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard plan review [-h]\n                                     {start,verdict,respond,status,abandon,decide,close,report,tick} ...\n\npositional arguments:\n  {start,verdict,respond,status,abandon,decide,close,report,tick}\n    start               Open a review of a plan for its ask and launch the\n                        lanes\n    verdict             (fallback) a lane records its verdict block for its\n                        own lane\n    respond             The planner answers a finished round: response table\n                        and the new revision\n    status              Rounds, lanes, open objections and the tally\n    abandon             Clear a stalled open review (the round count\n                        continues)\n    decide              Resolve an escalated objection: accept it, or override\n                        it with a reason\n    close               The closing round: every lane confirms the final\n                        revision, then the consensus is recorded\n    report              What the review cost and what the reviewers caught\n    tick                Housekeeping: relaunch a stuck lane once, then\n                        escalate it; remind an undecided escalation\n\noptions:\n  -h, --help            show this help message and exit\n"
+}

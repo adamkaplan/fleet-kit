@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "impact",
+  "floor",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard impact floor [-h] [--rating SEVERITY/PROBABILITY]\n                                      [--json]\n                                      pr\n\npositional arguments:\n  pr                    The pull request: owner/repo#N or its URL\n\noptions:\n  -h, --help            show this help message and exit\n  --rating SEVERITY/PROBABILITY\n                        An independent rating's impact, e.g. Critical/Remote\n                        (repeatable; it can only add a hold; Eliminated is not\n                        rated)\n  --json\n"
+}

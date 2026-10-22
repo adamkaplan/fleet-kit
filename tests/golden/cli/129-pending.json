@@ -1,0 +1,8 @@
+{
+ "argv": [
+  "pending"
+ ],
+ "status": 2,
+ "stderr": "usage: fleet-switchboard pending [-h] [--json] name\nfleet-switchboard pending: error: the following arguments are required: name\n",
+ "stdout": ""
+}

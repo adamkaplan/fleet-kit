@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "orders",
+  "add",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard orders add [-h] --charter CHARTER [--by BY]\n                                    [--from SENDER]\n                                    text\n\npositional arguments:\n  text               The order, in the owner's words (1 to 300 characters, one\n                     line)\n\noptions:\n  -h, --help         show this help message and exit\n  --charter CHARTER  The charter issue: N (in your own repo) or owner/repo#N\n  --by BY            Who ordered it (default: the operating-system user)\n  --from SENDER      Lab only: the caller's fleet name\n"
+}

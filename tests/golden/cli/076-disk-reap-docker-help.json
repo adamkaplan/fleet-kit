@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "disk",
+  "reap-docker",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard disk reap-docker [-h] [--apply] [--docker DOCKER]\n\nLists (the default) or, with --apply, removes docker containers (`rm -f`),\nnetworks and volumes that carry BOTH labels `fleet.owner=<agent>` and\n`fleet.expires=<epoch seconds>` and whose expiry has passed. Never an\nunlabelled object, a live one, or a volume a running container mounts; no\n`system prune`, no sudo. The daemon applies this daily unless the config key\n`docker_reaper` is false. Each removal is one `docker.reaped` audit line.\n\noptions:\n  -h, --help       show this help message and exit\n  --apply          Remove them (the default only lists)\n  --docker DOCKER  The docker executable (default: docker on PATH)\n"
+}

@@ -1,0 +1,8 @@
+{
+ "argv": [
+  "orders"
+ ],
+ "status": 2,
+ "stderr": "fleet-switchboard: orders needs list, add or remove (a charter's orders), or --cos (the Chief of Staff's own)\n",
+ "stdout": ""
+}

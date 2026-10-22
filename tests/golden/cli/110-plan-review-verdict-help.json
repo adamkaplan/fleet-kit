@@ -1,0 +1,11 @@
+{
+ "argv": [
+  "plan",
+  "review",
+  "verdict",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard plan review verdict [-h] --lane LANE [--file FILE]\n                                             [--json]\n                                             review\n\npositional arguments:\n  review\n\noptions:\n  -h, --help   show this help message and exit\n  --lane LANE\n  --file FILE  The verdict block file (default stdin)\n  --json\n"
+}

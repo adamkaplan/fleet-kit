@@ -1,0 +1,8 @@
+{
+ "argv": [
+  "skills"
+ ],
+ "status": 2,
+ "stderr": "usage: fleet-switchboard skills [-h] {check,sync} ...\nfleet-switchboard skills: error: the following arguments are required: skills_action\n",
+ "stdout": ""
+}

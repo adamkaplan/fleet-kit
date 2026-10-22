@@ -1,0 +1,8 @@
+{
+ "argv": [
+  "plan"
+ ],
+ "status": 2,
+ "stderr": "usage: fleet-switchboard plan [-h] {check,template,review} ...\nfleet-switchboard plan: error: the following arguments are required: plan_action\n",
+ "stdout": ""
+}

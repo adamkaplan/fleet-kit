@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "impact",
+  "matrix",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard impact matrix [-h] [--for-rater PR] [--json]\n\noptions:\n  -h, --help      show this help message and exit\n  --for-rater PR  Also that pull request's floor report: owner/repo#N or its\n                  URL\n  --json\n"
+}

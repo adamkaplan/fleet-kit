@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "charter",
+  "set",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard charter set [-h] [--from SENDER] name charter\n\nThe registry row's `charter` is the one record of which charter an\norchestrator owns; the lane lookup reads it. The live session's metadata is\nwritten once at launch and cannot be corrected, so it is never read as a\nsecond owner. Run by the Chief of Staff or the operator; one audit line with\nthe old and the new value.\n\npositional arguments:\n  name           The orchestrator's fleet name\n  charter        An issue number, or `none`\n\noptions:\n  -h, --help     show this help message and exit\n  --from SENDER  Lab only: the caller's fleet name\n"
+}

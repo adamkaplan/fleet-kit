@@ -1,0 +1,11 @@
+{
+ "argv": [
+  "plan",
+  "review",
+  "respond",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard plan review respond [-h] --plan-ref PLAN_REF\n                                             --table TABLE [--json]\n                                             review\n\npositional arguments:\n  review\n\noptions:\n  -h, --help           show this help message and exit\n  --plan-ref PLAN_REF  owner/repo#N of the revised plan\n  --table TABLE        File: `<lane>/<id>: accept|reject, why` for each open\n                       blocking objection\n  --json\n"
+}

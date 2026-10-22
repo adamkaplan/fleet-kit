@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "agents",
+  "verify",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard agents verify [-h] [--strict]\n                                       [--installed-dir INSTALLED_DIR]\n                                       [--opencode OPENCODE]\n                                       [--timeout TIMEOUT]\n\nReads `opencode api GET /api/agent` and fails (exit 1) when an agent of the\nkit is missing, has the wrong mode or lacks a rule its definition declares. A\nservice that is not running is reported, not failed. Run it after installing\nthe agents and restarting the service.\n\noptions:\n  -h, --help            show this help message and exit\n  --strict              Exit 1 when the service cannot be asked (default: say\n                        so and exit 0)\n  --installed-dir INSTALLED_DIR\n                        The folder of installed agent files to compare bodies\n                        with (default: the private profile's agents folder)\n  --opencode OPENCODE   The opencode executable (default: opencode on PATH)\n  --timeout TIMEOUT     Seconds to wait for the service (default 20)\n"
+}

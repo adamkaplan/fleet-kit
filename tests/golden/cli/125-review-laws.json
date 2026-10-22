@@ -1,0 +1,8 @@
+{
+ "argv": [
+  "review-laws"
+ ],
+ "status": 2,
+ "stderr": "usage: fleet-switchboard review-laws [-h] {install} ...\nfleet-switchboard review-laws: error: the following arguments are required: laws_action\n",
+ "stdout": ""
+}

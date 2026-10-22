@@ -1,0 +1,9 @@
+{
+ "argv": [
+  "send",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard send [-h] [--issue ISSUE] [--interrupt]\n                              [--from SENDER]\n                              name text [text ...]\n\npositional arguments:\n  name           The recipient's fleet name\n  text           The message\n\noptions:\n  -h, --help     show this help message and exit\n  --issue ISSUE  The issue the message is about\n  --interrupt    Stop and hold orders only: abort the recipient's running turn\n                 (its in-flight tool call is cut), then deliver the message as\n                 a wake. Only a boss to its own worker.\n  --from SENDER  Lab only: the sender's fleet name\n"
+}

@@ -1,0 +1,9 @@
+{
+ "argv": [
+  "review",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard review [-h]\n                                {laws,blockers,record,checkout,measure} ...\n\npositional arguments:\n  {laws,blockers,record,checkout,measure}\n    laws                Print the repository's review laws and overlay as they\n                        stand at the PR's BASE commit\n    blockers            Read-only: the reviewers whose LATEST recorded result\n                        at the PR's head is request-changes (one line each)\n    record              Record a reviewer's result for the PR's current head\n                        (the coder session records what the reviewer returned)\n    checkout            Write the PR's exact head tree, its diff and the base\n                        copies of the touched files into .review/<head sha>\n                        here, read-only, and print the path; --remove <dir>\n                        removes one\n    measure             Read-only: per merged PR, time to green CI, review\n                        rounds, findings, escaped defects; baseline and after\n                        medians\n\noptions:\n  -h, --help            show this help message and exit\n"
+}

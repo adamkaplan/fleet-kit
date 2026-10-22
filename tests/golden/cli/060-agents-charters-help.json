@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "agents",
+  "charters",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard agents charters [-h] [--json]\n\noptions:\n  -h, --help  show this help message and exit\n  --json\n"
+}

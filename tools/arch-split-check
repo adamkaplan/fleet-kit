@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""arch-split-check: prove that a move of switchboard code is text only.
+
+    arch-split-check --before FILE... --after FILE... [--no-surface]
+    arch-split-check --write-surface SNAPSHOT --after FILE...
+    arch-split-check --check-surface SNAPSHOT --after FILE...
+
+The files of a side are taken in the order given and are one program (the parts of a
+split, or the one file before it). Two things must hold:
+
+  1. the multiset of top-level statements (their `ast.dump`, positions left out) is the
+     same before and after: a statement moved to another file or another place passes, a
+     statement edited, added or dropped fails and is named;
+  2. `dir()` of the module loaded from each side is equal: no name added or removed.
+
+Exit 0 when both hold, 1 when not (every difference is printed), 2 for a usage error.
+The snapshot modes write or compare `dir()` of the module, one name per line, so a change
+to the surface of the daemon module is a reviewable difference.
+"""
+import argparse
+import ast
+import collections
+import importlib.machinery
+import importlib.util
+import os
+import sys
+import tempfile
+
+
+def statements(paths):
+    """A Counter of the dump of every top-level statement, and a label for each dump."""
+    counts = collections.Counter()
+    labels = {}
+    for path in paths:
+        with open(path, encoding="utf-8") as handle:
+            source = handle.read()
+        tree = ast.parse(source, filename=path)
+        for node in tree.body:
+            dump = ast.dump(node, include_attributes=False)
+            counts[dump] += 1
+            labels.setdefault(dump, describe(node, path))
+    return counts, labels
+
+
+def describe(node, path):
+    name = getattr(node, "name", None)
+    if name is None and isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        name = ", ".join(ast.unparse(t) for t in targets)
+    if name is None:
+        name = ast.unparse(node).splitlines()[0][:60]
+    return "%s:%d %s %s" % (os.path.basename(path), node.lineno, type(node).__name__, name)
+
+
+def statement_differences(before, after):
+    b_counts, b_labels = statements(before)
+    a_counts, a_labels = statements(after)
+    out = []
+    for dump in sorted(set(b_counts) | set(a_counts), key=lambda d: (b_labels.get(d) or a_labels.get(d))):
+        delta = a_counts[dump] - b_counts[dump]
+        if delta < 0:
+            out.append("statement removed or changed (before): %s%s" % (b_labels[dump], "" if delta == -1 else " x%d" % -delta))
+        elif delta > 0:
+            out.append("statement added or changed (after): %s%s" % (a_labels[dump], "" if delta == 1 else " x%d" % delta))
+    return out
+
+
+def load_names(paths):
+    """dir() of the program the files make: the files, in order, run as one module."""
+    if len(paths) == 1:
+        path = paths[0]
+        cleanup = None
+    else:
+        handle = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8")
+        for part in paths:
+            with open(part, encoding="utf-8") as src:
+                handle.write(src.read().rstrip("\n") + "\n\n")
+        handle.close()
+        path = cleanup = handle.name
+    try:
+        loader = importlib.machinery.SourceFileLoader("arch_split_subject", path)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        return sorted(dir(module))
+    finally:
+        if cleanup:
+            os.unlink(cleanup)
+
+
+def name_differences(before, after, left="before", right="after"):
+    return (["name only %s: %s" % (left, n) for n in sorted(set(before) - set(after))]
+            + ["name only %s: %s" % (right, n) for n in sorted(set(after) - set(before))])
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="arch-split-check", description=__doc__.split("\n\n")[0])
+    parser.add_argument("--before", nargs="+", metavar="FILE")
+    parser.add_argument("--after", nargs="+", metavar="FILE", required=True)
+    parser.add_argument("--no-surface", action="store_true", help="compare statements only, never load the code")
+    parser.add_argument("--write-surface", metavar="SNAPSHOT")
+    parser.add_argument("--check-surface", metavar="SNAPSHOT")
+    args = parser.parse_args(argv)
+    if args.write_surface:
+        names = load_names(args.after)
+        with open(args.write_surface, "w", encoding="utf-8") as handle:
+            handle.write("".join(n + "\n" for n in names))
+        print("wrote %d names to %s" % (len(names), args.write_surface))
+        return 0
+    if args.check_surface:
+        with open(args.check_surface, encoding="utf-8") as handle:
+            recorded = handle.read().split()
+        diffs = name_differences(recorded, load_names(args.after), "in the snapshot", "in the code")
+        for line in diffs:
+            print(line)
+        print("RESULT: %s (%d names in the snapshot)" % ("FAIL" if diffs else "PASS", len(recorded)))
+        return 1 if diffs else 0
+    if not args.before:
+        parser.error("--before is needed to compare")
+    diffs = statement_differences(args.before, args.after)
+    if not args.no_surface:
+        diffs += name_differences(load_names(args.before), load_names(args.after))
+    for line in diffs:
+        print(line)
+    total = sum(statements(args.before)[0].values())
+    print("RESULT: %s (%d top-level statements compared, %d differences)" % ("FAIL" if diffs else "PASS", total, len(diffs)))
+    return 1 if diffs else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

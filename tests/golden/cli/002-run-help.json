@@ -1,0 +1,9 @@
+{
+ "argv": [
+  "run",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard run [-h] [--once] [--poll POLL] [--json] [--standby]\n\noptions:\n  -h, --help   show this help message and exit\n  --once       One pass, then exit\n  --poll POLL  Seconds between passes (default: config poll_seconds)\n  --json       With --once: print the pass report as JSON\n  --standby    If another daemon holds the lock, wait for it to go instead of\n               exiting (the service uses this)\n"
+}

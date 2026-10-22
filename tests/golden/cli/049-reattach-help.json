@@ -1,0 +1,9 @@
+{
+ "argv": [
+  "reattach",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard reattach [-h] [--all-detached] [--replace]\n                                  [--session SESSION] [--workspace WORKSPACE]\n                                  [--repo REPO]\n                                  [name]\n\npositional arguments:\n  name                  The agent's fleet name\n\noptions:\n  -h, --help            show this help message and exit\n  --all-detached        Every agent the daemon found detached or dead\n  --replace             Also replace a pane that runs the agent but with the\n                        wrong account or repo (same guards: not working, alone\n                        in its tab)\n  --session SESSION     Its OpenCode session id (default: the one the\n                        switchboard last saw)\n  --workspace WORKSPACE\n                        The herdr workspace for the new tab (default: where it\n                        last ran)\n  --repo REPO           Refused when it differs from the session's stored repo\n                        (a reattach keeps the stored identity)\n"
+}

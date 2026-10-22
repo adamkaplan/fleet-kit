@@ -1,0 +1,9 @@
+{
+ "argv": [
+  "policy-report",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard policy-report [-h] [--minutes MINUTES] [--json]\n                                       [--check]\n\noptions:\n  -h, --help         show this help message and exit\n  --minutes MINUTES  The window to sample (default 60)\n  --json\n  --check            Liveness: exit 1 when agents are working and nothing was\n                     judged for 30 minutes\n"
+}

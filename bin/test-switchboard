@@ -85,6 +85,12 @@ def with_http_head(serve, argv, kwargs, counters=None):
 
 
 SWITCHBOARD = BIN / "fleet-switchboard"
+SWITCHBOARD_SOURCE_FILES = (SWITCHBOARD,)   # every file that holds the daemon's code: a split adds its parts here, so no part escapes the scans that read this list
+
+
+def switchboard_source():
+    """The daemon's code as every scan reads it: the files of SWITCHBOARD_SOURCE_FILES, in order, as one text."""
+    return "\n".join(path.read_text() for path in SWITCHBOARD_SOURCE_FILES)
 SCENARIO = BIN / "fleet-scenario"
 
 
@@ -936,7 +942,7 @@ class TestHerdrClient(Base):
             self.assertFalse(any("focus" in part and not part.startswith("--no-") for part in argv), argv)
 
     def test_source_never_names_a_typing_or_focus_command(self):
-        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [])
+        self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
     def test_the_source_scan_catches_a_planted_violation(self):
         # A gate never seen failing is decoration.
@@ -9215,7 +9221,7 @@ class TestGithubDaemon(Base):
         spawn.assert_not_called()
 
     def test_the_engine_never_types_into_a_pane_for_github_either(self):
-        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [])
+        self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
 
 class TestGithubScenarios(Base):
@@ -19392,7 +19398,7 @@ class TestShadowClassifier(Base):
 
 class TestPR7Source(unittest.TestCase):
     def test_the_engine_still_never_types(self):
-        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [])
+        self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
     def test_the_decision_model_section_is_one_clearly_marked_block(self):
         source = SWITCHBOARD.read_text()
@@ -21428,7 +21434,7 @@ class TestPR8Source(unittest.TestCase):
         self.assertEqual(source.count("\n# PR 8: foreground and background"), 1)
 
     def test_the_engine_still_never_types(self):
-        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [])
+        self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
     def test_no_top_level_name_is_defined_twice_in_the_big_files(self):
         for name in ("fleet-switchboard", "test-switchboard", "fleet-scenario", "proof-switchboard"):
@@ -23010,7 +23016,7 @@ class TestJudgeToolWritesNothingElsewhere(unittest.TestCase):
         calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                  and n.func.attr == "_api"]
         self.assertEqual(len(calls), 1)
-        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [], "the engine still never types")
+        self.assertEqual(herdr_typing_violations(switchboard_source()), [], "the engine still never types")
 
     def test_the_section_is_one_clearly_marked_block(self):
         self.assertEqual(SWITCHBOARD.read_text().count("\n# PR 9: the tool-call policy judge"), 1)
@@ -24551,7 +24557,7 @@ class TestPR10Source(unittest.TestCase):
         self.assertEqual(SWITCHBOARD.read_text().count(self.SECTION), 1)
 
     def test_the_engine_still_never_types(self):
-        self.assertEqual(herdr_typing_violations(SWITCHBOARD.read_text()), [])
+        self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
     def test_the_import_command_runs_only_the_clients_it_is_given(self):
         source = SWITCHBOARD.read_text()
@@ -82356,6 +82362,98 @@ class TestPaneExitBoundaries(TestPaneExit):
         pass_fn = next(n for n in self.new_code() if getattr(n, "name", "") == "pane_exit_pass")
         guards = sum(isinstance(n, ast.If) for n in ast.walk(pass_fn))
         self.assertLessEqual(guards, 16, "a guard was added to pane_exit_pass: give it a row and a mutant, then raise this count")
+
+
+class TestArchitectureSafetyNet(unittest.TestCase):
+    """The tools that prove a move of switchboard code is text only (plan #1092, slice S0)."""
+    TOOLS = REPO / "tools"
+    BEFORE = "A = 1\n\n\ndef one():\n    return 1\n\n\ndef two():\n    return 2\n"
+
+    def load(self, name):
+        loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(self.TOOLS / name))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+        return module
+
+    def split_check(self, before, after):
+        work = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, work, True)
+        sides = []
+        for label, parts in (("before", before), ("after", after)):
+            paths = []
+            for index, text in enumerate(parts):
+                path = work / ("%s%d.py" % (label, index))
+                path.write_text(text)
+                paths.append(str(path))
+            sides.append(paths)
+        proc = subprocess.run([sys.executable, str(self.TOOLS / "arch-split-check"), "--before"] + sides[0] + ["--after"] + sides[1],
+                              capture_output=True, text=True)
+        return proc.returncode, proc.stdout
+
+    def test_a_move_across_files_and_a_reorder_pass(self):
+        code, out = self.split_check([self.BEFORE], ["def two():\n    return 2\n", "A = 1\n\n\ndef one():\n    return 1\n"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("RESULT: PASS", out)
+
+    def test_one_edited_line_fails_and_names_the_statement(self):
+        code, out = self.split_check([self.BEFORE], [self.BEFORE.replace("return 2", "return 3")])
+        self.assertEqual(code, 1, out)
+        self.assertIn("FunctionDef two", out)
+        self.assertIn("RESULT: FAIL", out)
+
+    def test_a_dropped_statement_fails_and_names_the_statement_and_the_name(self):
+        code, out = self.split_check([self.BEFORE], [self.BEFORE.split("\n\n\ndef two")[0] + "\n"])
+        self.assertEqual(code, 1, out)
+        self.assertIn("FunctionDef two", out)
+        self.assertIn("name only before: two", out)
+
+    def test_a_duplicated_statement_fails(self):
+        code, out = self.split_check([self.BEFORE], [self.BEFORE + "\n\ndef two():\n    return 2\n"])
+        self.assertEqual(code, 1, out)
+        self.assertIn("statement added", out)
+
+    def test_the_overlap_tool_maps_changed_lines_to_symbols_classes_and_sections(self):
+        tool = self.load("arch-overlap")
+        source = "# ---------- the first\nX = 1\n\n\ndef f():\n    return 1\n\n\n# ---------- the second\ndef g():\n    return 2\n"
+        table = tool.symbols(source)
+        marks = tool.markers(source)
+        lines = tool.changed_old_lines("@@ -6,1 +6,1 @@ def f\n-    return 1\n+    return 9\n@@ -10,0 +11,2 @@\n+x\n")
+        self.assertEqual(lines, {6, 10})
+        self.assertEqual(tool.touched(lines, table), ["f", "g"])
+        self.assertEqual([tool.section_of(n, marks) for n in (2, 6, 10)], ["the first", "the first", "the second"])
+        self.assertEqual(tool.touched({7}, table), [])
+        self.assertEqual([n for _, _, n in tool.classes("class A:\n    pass\n\n\ndef f():\n    pass\n")], ["A"])
+
+    def test_the_golden_outputs_of_the_cli_are_unchanged(self):
+        recorded = [p for p in (REPO / "tests" / "golden" / "cli").glob("*.json") if p.name != "META.json"]
+        self.assertGreaterEqual(len(recorded), 120)
+        proc = subprocess.run([sys.executable, str(self.TOOLS / "golden-cli"), "check", "--entry", str(SWITCHBOARD)], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-1000:])
+        self.assertIn("RESULT: PASS", proc.stdout)
+
+    def test_the_golden_check_names_a_changed_output(self):
+        work = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, work, True)
+        golden = work / "cli"
+        shutil.copytree(REPO / "tests" / "golden" / "cli", golden)
+        target = next(golden.glob("*-version.json"))
+        doc = json.loads(target.read_text())
+        doc["stdout"] = doc["stdout"].replace("fleet-switchboard", "fleet-switchboardX")
+        target.write_text(json.dumps(doc))
+        proc = subprocess.run([sys.executable, str(self.TOOLS / "golden-cli"), "check", "--entry", str(SWITCHBOARD), "--dir", str(golden)],
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("DIFF %s: stdout differs (command: version)" % target.name, proc.stdout)
+
+    def test_the_surface_snapshot_is_a_sorted_list_of_names(self):
+        names = (REPO / "tests" / "golden" / "surface-dir-sb.txt").read_text().split()
+        self.assertEqual(names, sorted(names))
+        for name in ("main", "cmd_status", "HerdrClient"):
+            self.assertIn(name, names)
+
+    def test_the_hygiene_scan_reads_one_list_of_daemon_files(self):
+        self.assertIn(SWITCHBOARD, SWITCHBOARD_SOURCE_FILES)
+        self.assertEqual(switchboard_source(), "\n".join(p.read_text() for p in SWITCHBOARD_SOURCE_FILES))
 
 
 if __name__ == "__main__":

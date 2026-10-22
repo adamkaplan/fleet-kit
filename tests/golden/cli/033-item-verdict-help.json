@@ -1,0 +1,9 @@
+{
+ "argv": [
+  "item-verdict",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard item-verdict [-h] --item ITEM [--plan PLAN]\n                                      [--ask ASK] [--head HEAD]\n                                      --evidence EVIDENCE [--all]\n                                      [--as {tester}] --result {pass,fail}\n                                      [scenario]\n\npositional arguments:\n  scenario              The scenario id in the item's plan (S1, U2, ...)\n\noptions:\n  -h, --help            show this help message and exit\n  --item ITEM           The work item: owner/repo#N of an ISSUE (a pull\n                        request is refused: use prove/verdict --pr)\n  --plan PLAN           Only repeats the plan the issue body links with\n                        `PLAN:`\n  --ask ASK             The ask whose Done-when the plan must cover\n  --head HEAD           The item's reference commit (default: the one pinned\n                        at registration)\n  --evidence EVIDENCE   A link, or what you ran and saw\n  --all                 Every scenario of the plan this item may claim and the\n                        tester judges\n  --as {tester}         Only tester verdicts: `ci` is recorded by `gates item-\n                        ci-record`\n  --result {pass,fail}\n"
+}

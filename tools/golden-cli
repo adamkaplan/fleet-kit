@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""golden-cli: record and check what the switchboard CLI prints.
+
+    golden-cli record [--entry bin/fleet-switchboard] [--dir tests/golden/cli]
+    golden-cli check  [--entry bin/fleet-switchboard] [--dir tests/golden/cli]
+
+`record` runs every command of the list in a synthetic world (an empty state, config and
+home directory under one temporary root, no `gh`, no `herdr`, a clock fixed at one instant,
+a fixed terminal width) and writes each command's stdout, stderr and exit status. The list
+is every verb's `--help`, every nested subcommand's `--help` (found by walking the help
+text) and the offline read-only commands in OFFLINE below. `check` runs the same list and
+exits 1, naming the command, when one output differs. A move of code must leave every
+output byte-identical. After a change that is meant to alter an output (a new verb, a new
+flag), run `record` and commit the files it rewrites.
+
+The output files are `<dir>/NNN-<slug>.json`: {"argv", "status", "stdout", "stderr"}.
+Paths of the temporary root print as `<ROOT>`. The recorded Python version is kept in
+`<dir>/META.json`: argparse words its help differently between versions, so on another
+version `check` compares the words, not the bytes, and says so.
+"""
+import argparse
+import concurrent.futures
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+FIXED_NOW = 1700000000.0
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+
+# Offline, read-only commands: no network, no daemon, no write outside the synthetic state.
+# `status` is left out on purpose: it prints the machine's own disk, load and memory.
+OFFLINE = [
+    ["version"],
+    ["policy-report"],
+    ["whoami"],
+    ["orders"],
+    ["agents"],
+    ["plan"],
+    ["plan", "template"],
+    ["review-laws"],
+    ["skills"],
+    ["impact"],
+    ["reds"],
+    ["pending"],
+    ["intent"],
+    ["no-such-verb"],
+    ["send"],
+    ["report"],
+]
+
+RUNNER = r"""
+import os, runpy, sys, time
+_now = float(os.environ["GOLDEN_NOW"])
+time.time = lambda: _now
+entry = sys.argv[1]
+sys.argv = [entry] + sys.argv[2:]
+runpy.run_path(entry, run_name="__main__")
+"""
+
+
+def world(root):
+    for name in ("home", "state", "config", "cache"):
+        os.makedirs(os.path.join(root, name), exist_ok=True)
+    return {
+        "PATH": "/usr/bin:/bin",
+        "HOME": os.path.join(root, "home"),
+        "XDG_STATE_HOME": os.path.join(root, "state"),
+        "XDG_CONFIG_HOME": os.path.join(root, "config"),
+        "XDG_CACHE_HOME": os.path.join(root, "cache"),
+        "TMPDIR": os.path.join(root, "home"),
+        "COLUMNS": "80", "LINES": "24", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TZ": "UTC",
+        "PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1", "NO_COLOR": "1",
+        "GOLDEN_NOW": repr(FIXED_NOW),
+        "FLEET_SWITCHBOARD_UNDER_TEST": "1",
+    }
+
+
+def run(entry, argv, root, env):
+    proc = subprocess.run([sys.executable, "-c", RUNNER, entry] + argv, cwd=os.path.join(root, "home"), env=env,
+                          capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+    clean = lambda raw: raw.decode("utf-8", "replace").replace(os.path.realpath(root), "<ROOT>").replace(root, "<ROOT>")
+    return {"argv": argv, "status": proc.returncode, "stdout": clean(proc.stdout), "stderr": clean(proc.stderr)}
+
+
+def choices(text):
+    """The subcommand names of a help text: the `{a,b,c} ...` of its usage line (a value list has no `...`)."""
+    match = re.search(r"\{([^}\s]+)\} \.\.\.", " ".join(text.split("positional arguments:")[0].split()))
+    return match.group(1).split(",") if match else []
+
+
+def pool_map(fn, items):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        return list(pool.map(fn, items))
+
+
+def command_list(entry, root, env):
+    """Every `--help` of the tree, then the offline commands."""
+    out = []
+    top = run(entry, ["--help"], root, env)
+    out.append(["--help"])
+    level = [[name] for name in choices(top["stdout"])]
+    while level:
+        out.extend(argv + ["--help"] for argv in level)
+        helps = pool_map(lambda argv: run(entry, argv + ["--help"], root, env), level)
+        level = [argv + [name] for argv, text in zip(level, helps) for name in choices(text["stdout"])]
+    return out + OFFLINE
+
+
+def slug(argv):
+    return re.sub(r"[^a-z0-9]+", "-", " ".join(argv).lower()).strip("-") or "root"
+
+
+def normalise(text):
+    return " ".join(text.split())
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="golden-cli", description=__doc__.split("\n\n")[0])
+    parser.add_argument("mode", choices=("record", "check"))
+    parser.add_argument("--entry", default=os.path.join(ROOT, "bin", "fleet-switchboard"))
+    parser.add_argument("--dir", default=os.path.join(ROOT, "tests", "golden", "cli"))
+    args = parser.parse_args(argv)
+    entry = os.path.abspath(args.entry)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.realpath(tmp)
+        env = world(root)
+        if args.mode == "record":
+            commands = command_list(entry, root, env)
+            os.makedirs(args.dir, exist_ok=True)
+            for old in os.listdir(args.dir):
+                if old.endswith(".json"):
+                    os.unlink(os.path.join(args.dir, old))
+            results = pool_map(lambda command: run(entry, command, root, env), commands)
+            for index, (command, result) in enumerate(zip(commands, results)):
+                name = "%03d-%s.json" % (index, slug(command))
+                with open(os.path.join(args.dir, name), "w", encoding="utf-8") as handle:
+                    json.dump(result, handle, indent=1, sort_keys=True)
+                    handle.write("\n")
+            with open(os.path.join(args.dir, "META.json"), "w", encoding="utf-8") as handle:
+                json.dump({"python": "%d.%d" % sys.version_info[:2], "outputs": len(commands)}, handle, indent=1)
+                handle.write("\n")
+            print("recorded %d outputs in %s" % (len(commands), args.dir))
+            return 0
+        meta = json.load(open(os.path.join(args.dir, "META.json"), encoding="utf-8"))
+        exact = meta["python"] == "%d.%d" % sys.version_info[:2]
+        recorded = sorted(n for n in os.listdir(args.dir) if n.endswith(".json") and n != "META.json")
+        bad = 0
+        wants = [json.load(open(os.path.join(args.dir, name), encoding="utf-8")) for name in recorded]
+        gots = pool_map(lambda want: run(entry, want["argv"], root, env), wants)
+        for name, want, got in zip(recorded, wants, gots):
+            for field in ("status", "stdout", "stderr"):
+                a, b = want[field], got[field]
+                if not exact and field != "status":
+                    a, b = normalise(a), normalise(b)
+                if a != b:
+                    bad += 1
+                    print("DIFF %s: %s differs (command: %s)" % (name, field, " ".join(want["argv"])))
+        print("compared %d outputs (%s): %d differences" % (len(recorded), "bytes" if exact else "words, Python %s recorded" % meta["python"], bad))
+        print("RESULT: %s" % ("FAIL" if bad else "PASS"))
+        return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

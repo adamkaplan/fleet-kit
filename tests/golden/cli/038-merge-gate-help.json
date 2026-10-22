@@ -1,0 +1,9 @@
+{
+ "argv": [
+  "merge-gate",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard merge-gate [-h] [--pass | --check | --release]\n                                    [--rerun-held] [--json]\n                                    pr\n\nPrints ONE block: the branch tip now, the branch tip the pull request's last\nCI run was computed on, equal or not, the run's result at the current head,\nthe latest completed run on the branch and whether a merge is allowed now and\nwhy. It writes nothing. `--pass` re-runs that pull request's CI on the current\nmerge ref when the branch moved (a close and reopen: head and labels\nuntouched; a held pull request only with `--rerun-held`), waits up to\n`merge_gate.wait_minutes` (default 45), and on green records the pass and\ntakes the lock of the repository and branch. `--check` (the shim) exits 0 to\nallow and 10 to refuse.\n\npositional arguments:\n  pr            The pull request: owner/repo#N or its URL\n\noptions:\n  -h, --help    show this help message and exit\n  --pass        Run the gate, re-run CI if the branch moved, take the lock and\n                record the pass\n  --check       What the gh shim asks: exit 0 allow, 10 refuse (one line on\n                stderr)\n  --release     Release the lock you hold on the pull request's branch\n  --rerun-held  With --pass: close and reopen a HELD pull request to recompute\n                its merge ref (its orchestrator agrees first)\n  --json\n"
+}

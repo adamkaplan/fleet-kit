@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "daemon",
+  "stop",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard daemon stop [-h]\n\noptions:\n  -h, --help  show this help message and exit\n"
+}

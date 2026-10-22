@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "disk",
+  "report",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard disk report [-h] [--docker DOCKER]\n\noptions:\n  -h, --help       show this help message and exit\n  --docker DOCKER  The docker executable (default: docker on PATH)\n"
+}

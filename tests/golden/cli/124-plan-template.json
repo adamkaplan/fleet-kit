@@ -1,0 +1,9 @@
+{
+ "argv": [
+  "plan",
+  "template"
+ ],
+ "status": 2,
+ "stderr": "fleet-switchboard: plan template: give the ask (owner/repo#N) or --done-when TEXT\n",
+ "stdout": ""
+}

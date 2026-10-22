@@ -1,0 +1,11 @@
+{
+ "argv": [
+  "plan",
+  "review",
+  "close",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard plan review close [-h] --plan-ref PLAN_REF [--json]\n                                           review\n\npositional arguments:\n  review\n\noptions:\n  -h, --help           show this help message and exit\n  --plan-ref PLAN_REF  owner/repo#N of the final revision (with a `##\n                       Decisions` section)\n  --json\n"
+}

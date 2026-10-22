@@ -1,0 +1,9 @@
+{
+ "argv": [
+  "close-pane",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard close-pane [-h] pane\n\npositional arguments:\n  pane        The herdr pane id\n\noptions:\n  -h, --help  show this help message and exit\n"
+}

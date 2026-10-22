@@ -1,0 +1,8 @@
+{
+ "argv": [
+  "send"
+ ],
+ "status": 2,
+ "stderr": "usage: fleet-switchboard send [-h] [--issue ISSUE] [--interrupt]\n                              [--from SENDER]\n                              name text [text ...]\nfleet-switchboard send: error: the following arguments are required: name, text\n",
+ "stdout": ""
+}

@@ -1,0 +1,9 @@
+{
+ "argv": [
+  "version",
+  "--help"
+ ],
+ "status": 0,
+ "stderr": "",
+ "stdout": "usage: fleet-switchboard version [-h]\n\noptions:\n  -h, --help  show this help message and exit\n"
+}
