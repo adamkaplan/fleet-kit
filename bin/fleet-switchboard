@@ -19050,6 +19050,7 @@ def cmd_run(args, runner, now, wait):
     judge_server = start_judge_server(config, state, runner, now, engine)  # PR 9: the daemon holds the key, not v2
     if judge_server is not None and config["policy"]["enabled"]:
         engine.judge_warm = make_judge_warmer(config, runner, now)
+    channel = start_cloud_channel(engine, state, os.environ)   # #1149: only when FLEET_CLOUD_CHANNEL_LISTEN is set
     watch = ConfigWatch(config_path(), config, now, engine.audit, engine.actor,
                         lambda **fields: update_daemon_record(state, **fields), signature)
     argv = [sys.executable, os.path.realpath(__file__), "run"] + (["--poll", "%g" % args.poll] if args.poll else [])
@@ -19067,7 +19068,30 @@ def cmd_run(args, runner, now, wait):
             hub.stop()
         if judge_server is not None:
             judge_server.stop()
+        if channel is not None:
+            channel.shutdown()
     return EXIT_OK
+
+
+def start_cloud_channel(engine, state, environ, review=None, server=None):
+    """#1149: the cloud channel listener, started only when FLEET_CLOUD_CHANNEL_LISTEN is set. Its reviewer is the Kubernetes TokenReview, its
+    inbox hands to `engine.send` (the one delivery path), its audit is the engine's, and GET /decisions serves decisions.json. A failure is
+    audited once and never stops the passes. Returns the server or None."""
+    try:
+        load_module("cloud_channel")   # the listener module imports it by name
+        server = server or load_module("cloud_channel_server")
+        address = server.listen_address(environ)
+        if address is None:
+            return None
+        review = review or load_module("cloud_review")
+        decisions = lambda: (Path(state) / DECISIONS_FILE).read_bytes()
+        audit = lambda line: engine.audit.append(engine.actor, "cloud_channel", None, {"line": line})
+        listener = server.make_server(address, review.make_reviewer(), review.Inbox(engine.send), audit, decisions=decisions)
+        threading.Thread(target=listener.serve_forever, daemon=True).start()
+        return listener
+    except Exception as err:
+        engine._note("cloud_channel.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+        return None
 
 
 STANDBY_SECONDS = 10  # how often `run --standby` looks again for a free lock

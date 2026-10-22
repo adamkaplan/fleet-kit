@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""test-cloud-daemon: the daemon's start of the cloud channel listener (#1149), with a fake TokenReview and a fake engine.
+
+    env -u HERDR_PANE_ID bin/test-cloud-daemon
+"""
+import http.client
+import importlib.machinery
+import importlib.util
+import json
+import sys
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+sys.path.insert(0, str(BIN))
+import cloud_review  # noqa: E402
+import decisions_pull  # noqa: E402
+
+
+def load_daemon(source=None):
+    path = str(BIN / "fleet-switchboard")
+    loader = importlib.machinery.SourceFileLoader("fsw_under_test", path)
+    if source is not None:
+        loader.get_data = lambda p: source.encode()
+    spec = importlib.util.spec_from_loader("fsw_under_test", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def listen_env():
+    import socket
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return {"FLEET_CLOUD_CHANNEL_LISTEN": "127.0.0.1:%d" % sock.getsockname()[1]}
+
+
+class FakeAudit:
+    def __init__(self):
+        self.lines = []
+
+    def append(self, actor, event, subject, detail):
+        self.lines.append((event, subject, detail))
+
+
+class FakeEngine:
+    actor = "daemon"
+
+    def __init__(self):
+        self.audit, self.sent, self._last = FakeAudit(), [], {}
+
+    def send(self, sender, recipient, text, **kw):
+        self.sent.append((sender, recipient, text))
+        return {"sent": True}
+
+    def _note(self, event, subject, detail):
+        self.audit.append(self.actor, event, subject, detail)
+
+
+def fake_review(tokens):
+    class R:
+        @staticmethod
+        def make_reviewer():
+            def reviewer(token, audience):
+                if token in tokens:
+                    return {"authenticated": True, "audiences": [audience],
+                            "user": {"username": "system:serviceaccount:fleet-agents:" + tokens[token]}}
+                return {"authenticated": False}
+            return reviewer
+        Inbox = cloud_review.Inbox
+    return R
+
+
+class Case(unittest.TestCase):
+    def setUp(self):
+        self.daemon = load_daemon()
+        self.engine = FakeEngine()
+        self.state = tempfile.mkdtemp()
+        (Path(self.state) / "decisions.json").write_text(json.dumps({"decisions": [{"id": "d1"}], "errors": []}))
+        self.started = []
+
+    def start(self, env, daemon=None):
+        daemon = daemon or self.daemon
+        real = daemon.load_module("cloud_channel_server")
+        started = self.started
+        orig = real.make_server
+
+        def make(*a, **k):
+            started.append(a)
+            return orig(*a, **k)
+        fake = type("S", (), {"listen_address": staticmethod(real.listen_address), "make_server": staticmethod(make)})
+        return daemon.start_cloud_channel(self.engine, self.state, env, review=fake_review({"tok-a": "agent-a"}), server=fake)
+
+    def call(self, server, method, path, body=None, token="tok-a"):
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        h = {"Authorization": "Bearer " + token} if token else {}
+        conn.request(method, path, body=json.dumps(body).encode() if body is not None else None, headers=h)
+        r = conn.getresponse()
+        return r.status, r.read()
+
+
+class TestListener(Case):
+    def test_unset_starts_nothing(self):
+        self.assertIsNone(self.start({}))
+        self.assertEqual(self.started, [])
+
+    def test_set_starts_one_with_engine_audit(self):
+        server = self.start(listen_env())
+        try:
+            self.assertEqual(len(self.started), 1)
+            status, _ = self.call(server, "POST", "/message", {"sender": "agent-a", "recipient": "boss", "key": "k1", "text": "hi"})
+            self.assertEqual(status, 200)
+            self.assertEqual(self.engine.sent, [("agent-a", "boss", "hi")])
+            self.assertTrue(any(e == "cloud_channel" for e, _, _ in self.engine.audit.lines))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_sender_is_the_verified_identity(self):
+        server = self.start(listen_env())
+        try:
+            status, _ = self.call(server, "POST", "/message", {"sender": "agent-b", "recipient": "boss", "key": "k", "text": "x"})
+            self.assertEqual(status, 403)
+            self.assertEqual([s for s in self.engine.sent if s[0] == "agent-b"], [])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_repeated_key_delivered_once(self):
+        server = self.start(listen_env())
+        try:
+            for _ in range(2):
+                self.call(server, "POST", "/message", {"sender": "agent-a", "recipient": "boss", "key": "k", "text": "x"})
+            self.assertEqual(len(self.engine.sent), 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_decisions_route(self):
+        server = self.start(listen_env())
+        try:
+            status, raw = self.call(server, "GET", "/decisions")
+            self.assertEqual(status, 200)
+            decisions_pull.parse(raw)
+            self.assertEqual(self.call(server, "GET", "/decisions", token=None)[0], 401)
+            self.assertIn(self.call(server, "GET", "/decisions", token="bad")[0], (401, 403))
+            self.assertEqual(self.call(server, "PUT", "/decisions", {})[0], 405)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_token_never_logged(self):
+        server = self.start(listen_env())
+        try:
+            self.call(server, "POST", "/message", {"sender": "agent-a", "recipient": "boss", "key": "k", "text": "x"})
+            self.call(server, "GET", "/decisions", token="bad-token-text")
+            self.assertNotIn("tok-a", repr(self.engine.audit.lines))
+            self.assertNotIn("bad-token-text", repr(self.engine.audit.lines))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_failure_is_audited_and_returns_none(self):
+        class Boom:
+            listen_address = staticmethod(lambda env: ("127.0.0.1", 1))
+
+            @staticmethod
+            def make_server(*a, **k):
+                raise OSError("bind")
+        out = self.daemon.start_cloud_channel(self.engine, self.state, {"FLEET_CLOUD_CHANNEL_LISTEN": "x"}, review=fake_review({}), server=Boom)
+        self.assertIsNone(out)
+        self.assertEqual([e for e, _, _ in self.engine.audit.lines], ["cloud_channel.error"])
+
+
+class TestReviewer(unittest.TestCase):
+    def test_review_request_has_audience_and_failure_raises(self):
+        seen = []
+        d = tempfile.mkdtemp()
+        (Path(d) / "token").write_text("own")
+
+        class Reply:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b'{"status": {"authenticated": true}}'
+
+        def opener(req):
+            seen.append((req.data, req.get_header("Authorization")))
+            return Reply()
+        status = cloud_review.make_reviewer(sa_dir=d, opener=opener)("caller-tok", "fleet-switchboard")
+        self.assertTrue(status["authenticated"])
+        spec = json.loads(seen[0][1 - 1])["spec"]
+        self.assertEqual(spec["audiences"], ["fleet-switchboard"])
+        self.assertEqual(spec["token"], "caller-tok")
+
+        def bad(req):
+            raise OSError("down")
+        with self.assertRaises(OSError):
+            cloud_review.make_reviewer(sa_dir=d, opener=bad)("t", "a")
+
+
+class TestMutants(Case):
+    def test_default_start_mutant_fails(self):
+        src = (BIN / "cloud_channel_server.py").read_text()
+        self.assertIn("if address is None:\n            return None", (BIN / "fleet-switchboard").read_text())
+        mutated = (BIN / "fleet-switchboard").read_text().replace(
+            'address = server.listen_address(environ)\n        if address is None:\n            return None',
+            'address = server.listen_address(environ) or ("127.0.0.1", 0)', 1)
+        server = self.start({"FLEET_CLOUD_CHANNEL_LISTEN": "bad"}, daemon=load_daemon(mutated))
+        try:
+            self.assertEqual(len(self.started), 1)   # the mutant listens though the setting is unset/malformed: test_unset_starts_nothing fails on it
+        finally:
+            if server:
+                server.shutdown()
+                server.server_close()
+
+    def test_trust_body_sender_mutant_fails(self):
+        src = (BIN / "cloud_channel.py").read_text()
+        self.assertEqual(src.count('item = {"key": key, "sender": agent, "text": text}'), 1)
+        self.assertIn('sender != agent', src)
+
+
+if __name__ == "__main__":
+    unittest.main()

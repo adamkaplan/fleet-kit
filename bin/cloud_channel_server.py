@@ -2,6 +2,7 @@
 
 Only the listener lives here; the reviewer and the inbox are passed in, and nothing is wired into the daemon.
 
+    GET /decisions  (read-only, same bearer review; the daemon's decisions.json, as decisions_pull.parse reads it)
     POST /message   JSON body {"sender", "recipient", "key", "text"}, header `Authorization: Bearer <token>`.
 
 Transport stance: plain HTTP, no TLS here. The real boundary is the cluster network (a NetworkPolicy admitting only agent
@@ -79,7 +80,7 @@ def listen_address(environ):
     return match.group(1), int(match.group(2))
 
 
-def make_server(address, reviewer, inbox, audit, max_handlers=None):
+def make_server(address, reviewer, inbox, audit, max_handlers=None, decisions=None):
     """A server bound to address (not started). Raises ValueError when address is None: not configured, no listener."""
     if address is None:
         raise ValueError("cloud channel listener is not configured (%s)" % LISTEN_ENV)
@@ -124,8 +125,35 @@ def make_server(address, reviewer, inbox, audit, max_handlers=None):
 
         def do_GET(self):
             self.close_connection = True
+            if self.path != "/decisions" or decisions is None:
+                return self._send(405, {"status": 405, "error": "method not allowed"})
+            header = self.headers.get("Authorization") or ""
+            if not header[len(BEARER):].strip() or not header.startswith(BEARER):
+                audit("refused status=401 reason=no bearer on decisions")
+                return self._send(401, {"status": 401, "error": "no token"})
+            # the same bearer review as a message: handle() with an empty body answers 403 for a verified agent, 401/503 otherwise
+            seen = []
+            probe = cloud_channel.handle({"authorization": header, "body": {}}, reviewer, inbox, seen.append)
+            if probe["status"] != 403:
+                for line in seen:
+                    audit(line)
+                return self._send(probe["status"], probe)
+            try:
+                raw = decisions()
+            except Exception as err:
+                audit("refused status=503 reason=decisions unavailable error=%s" % type(err).__name__)
+                return self._send(503, {"status": 503, "error": "decisions unavailable"})
+            data = raw if isinstance(raw, bytes) else json.dumps(raw).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _no_write(self):
+            self.close_connection = True
             self._send(405, {"status": 405, "error": "method not allowed"})
-        do_PUT = do_DELETE = do_PATCH = do_GET
+        do_PUT = do_DELETE = do_PATCH = _no_write
 
         def do_POST(self):
             if self.path != "/message":
@@ -178,10 +206,10 @@ def make_server(address, reviewer, inbox, audit, max_handlers=None):
     return _Server(address, Handler, max_handlers or MAX_HANDLERS, audit)
 
 
-def serve(environ, reviewer, inbox, audit):
+def serve(environ, reviewer, inbox, audit, decisions=None):
     """Start listening when configured (blocks); returns False without binding anything when it is not."""
     address = listen_address(environ)
     if address is None:
         return False
-    make_server(address, reviewer, inbox, audit).serve_forever()
+    make_server(address, reviewer, inbox, audit, decisions=decisions).serve_forever()
     return True
