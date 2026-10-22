@@ -1701,7 +1701,7 @@ Opens the Chief of Staff for the first time, or again. Everything is derived fro
 
 1. A fleet agent named `cos` that has a herdr pane: refused, naming its pane and session. There is one.
 2. Else a v2 session whose fleet name is `cos` (the newest, from `session.list`): it is resumed with the
-   existing `resume_ended_turn` in the workspace labelled `LABEL` (default `Chief of Staff`), or in a new one
+   existing `resume_agent` in the workspace labelled `LABEL` (default `Chief of Staff`), or in a new one
    when that workspace is gone.
 3. Else a herdr workspace is made (`herdr workspace create --cwd DIR --label LABEL --focus`: the person
    wants to see it; `--no-focus` for scripts) and `cos` (agent `chief-of-staff`, no `reports_to`) is
@@ -1719,7 +1719,7 @@ metadata carries `fleet.brief` (the metadata the brief is always sent with, by t
 session holds none, `bootstrap` sends it once after the pane is verified; if it holds one, it sends nothing,
 so a third run never repeats it. A transcript too long to read to its end is taken to hold one. A failed
 send closes the pane that resume opened (as a failed launch does) and the next run tries again. The output
-gains `brief`: `sent` or `kept`. Only `bootstrap` does this: `resume_ended_turn` itself, used by `launch --resume`,
+gains `brief`: `sent` or `kept`. Only `bootstrap` does this: `resume_agent` itself, used by `launch --resume`,
 has no brief to send (it does not know one), so a second code path there would be a different feature.
 
 #### CLI reference (PR 16)
