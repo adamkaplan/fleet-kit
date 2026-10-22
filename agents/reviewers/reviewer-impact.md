@@ -113,6 +113,8 @@ The coder records it verbatim with `review record <pr> --reviewer impact --block
 
 A rating counts by score only because your block was recorded with it: the hash kept with the record proves a block was given, not that the agent produced it (a mistake-guard, as the recorded-role check is); the independent review and the audit remain the cover. The record keeps only the block's hash and size, not its text, so keep your block text if an audit ever needs it.
 
+A clear by score needs two independent impact ratings at the head, from two different rater sessions, each carrying the agent's own block; the reason of the clear names both runs, each as `<record id or rater>=<cell>`.
+
 <!-- block-table:begin -->
 With --block, refused (the block carries them): --verdict, --head, --blocks, --notes, --impact-action; accepted: --reviewer, --summary, --impact-class, --impact-severity, --impact-probability, --impact-reason, --confirms-carry, and of these --impact-class, --impact-severity, --impact-probability, --impact-reason win over the block's own lines; the score comes from the block's impact-severity:, impact-probability: and impact-reason: lines, so a block without the first two is recorded WITHOUT a score
 <!-- block-table:end -->
