@@ -148,6 +148,11 @@ elif cmd == "get" and args[1] == "secret":
 elif cmd == "get" and args[1] == "events":
     name = args[3].split("involvedObject.name=")[1]
     print(json.dumps({"items": [e for e in st.get("events", []) if e["involvedObject"]["name"] == name]}))
+elif cmd == "get" and args[1] == "statefulset":   # a StatefulSet: NotFound unless the state holds it; a planted lookup failure otherwise
+    if st.get("fail_get_statefulset"):
+        print("Error from server (Forbidden): statefulsets is forbidden", file=sys.stderr); sys.exit(1)
+    if args[2] not in st.get("statefulsets", {}): missing('statefulsets.apps "%s"' % args[2])
+    print(json.dumps(st["statefulsets"][args[2]]))
 elif cmd == "get" and args[1] == "pod":
     if args[2] not in st.get("pods", {}) or st.get("hide_pod"): missing('pods "%s"' % args[2])   # hide_pod: the pod was never visible to a get
     pod = st["pods"][args[2]]
@@ -203,7 +208,7 @@ elif cmd == "delete" and args[1] == "--raw":   # a delete bound to a uid (Delete
     save()
 elif cmd == "delete":
     kind, name = args[1], args[2]
-    (st.get("pods" if kind == "pod" else "secrets", {})).pop(name, None)
+    (st.get({"pod": "pods", "statefulset": "statefulsets"}.get(kind, "secrets"), {})).pop(name, None)
     if kind == "secret": st.get("secret_labels", {}).pop(name, None)
     save()
 elif cmd == "exec":

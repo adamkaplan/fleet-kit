@@ -360,6 +360,17 @@ class S4Audit(Base):
         self.assertEqual(self.run_cli("stop", "nobody")[0], 0)
         self.assertEqual(self.run_cli("delete", "nobody")[0], 0)
 
+    def test_delete_of_gone_worker_whose_statefulset_lookup_fails_is_not_deleted(self):
+        self.patch_state(fail_get_statefulset=True)
+        code, out, err = self.run_cli("delete", "nobody")
+        self.assertNotEqual(code, 0)
+        self.assertNotIn('"deleted": true', out)
+        self.assertIn("statefulset/", err + out)
+
+    def test_delete_of_gone_worker_with_a_statefulset_not_found_is_deleted(self):
+        code, out, _ = self.run_cli("delete", "nobody")
+        self.assertEqual((code, json.loads(out)["deleted"]), (0, True))
+
     def test_bad_name_usage(self):
         self.assertEqual(self.run_cli("stop", "Bad Name")[0], 2)
         self.assertEqual(self.run_cli("bogus")[0], 2)

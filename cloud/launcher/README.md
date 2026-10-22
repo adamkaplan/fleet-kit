@@ -42,6 +42,7 @@ if `CW_KUBECONFIG` or `CW_KUBE_CONTEXT` is also set. A missing or unreadable tok
 `create --pull-secret NAME` sets `imagePullSecrets`. `create --run-secret-fd NAME=N` (repeatable) reads each value once from
 descriptor `N`, pipes it to `kubectl` on stdin into one Secret `<pod>-run`, and mounts it read-only at `/run/cw/NAME` (0400).
 The Secret goes with the pod at `stop`, `delete` and a failed or interrupted `create`; a pod kept because the end hook failed keeps it.
+A `stop` by name only (no run id) or a `delete` of a worker whose pod is absent removes its StatefulSet first, then its Secrets: the caller named the worker, so it owns it (a run id exists only to protect another run's objects, and a different run id leaves everything whole). A `delete` whose StatefulSet lookup fails for any reason but NotFound exits non-zero and never answers `deleted`.
 
 After this change merges, an operator must apply the manifest (`kubectl apply -f cloud/k8s/operator-rbac.yaml`) on the owner's word; until then `launch --role orchestrator` is forbidden on the real cluster.
 

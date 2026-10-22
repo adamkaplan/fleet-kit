@@ -491,7 +491,7 @@ class PodGone(Fx):   # M1: the pod NAME-0 is absent but its StatefulSet (and Sec
         self.assertEqual(list(self.kube.sets), [cw.pod_name(WORKER)])
 
     def test_mutant_stop_ignoring_the_workload_when_the_pod_is_absent_fails(self):
-        m = load_module("cloud_worker.py", "self._remove_gone(worker, name, nonce)", "self._remove(name, nonce)")
+        m = load_module("cloud_worker.py", "self._remove_gone(worker, name, nonce or None)", "self._remove(name, nonce)")
         self.gone()
         m.Launcher(self.kube, self.env, self.clock).stop(argparse.Namespace(worker=WORKER, reason="x", run_id=RUN, no_record=True, record_dir=None))
         self.assertNotEqual(self.left(), ([], [], [], []))
@@ -536,6 +536,99 @@ class PodGone(Fx):   # M1: the pod NAME-0 is absent but its StatefulSet (and Sec
         with self.assertRaises(cw.CloudError) as c:
             self.L.create(self.args())
         self.assertIn("statefulset/" + cw.pod_name(WORKER), str(c.exception))
+
+
+class GoneMatrix(Fx):   # the reproducer matrix: callers x states, each cell's leftovers and answer
+    WHOLE = ([cw.pod_name(WORKER) + "-0"], [cw.pod_name(WORKER)], [cw.pod_name(WORKER) + "-pw"], [cw.pod_name(WORKER) + "-run"])
+    EMPTY = ([], [], [], [])
+
+    def left(self):
+        k = self.kube
+        return (sorted(k.pods), sorted(k.sets), sorted(k.secrets), sorted(k.run_secrets))
+
+    def gone(self):
+        self.state("absent")
+
+    def state(self, which):
+        self.launch()
+        if which == "absent":
+            self.kube.pods.clear()
+            self.kube.hold = True
+        elif which == "none":
+            for d in (self.kube.pods, self.kube.sets, self.kube.secrets, self.kube.run_secrets):
+                d.clear()
+            self.kube.hold = True
+
+    def call(self, caller):
+        """Returns (kind, answer-or-error): 'ok' with the answer, or 'refused'/'error' with the exit code."""
+        try:
+            if caller.startswith("stop"):
+                nonce = {"stop-match": RUN, "stop-other": "f" * 16, "stop-none": None}[caller]
+                return "ok", self.L.stop(argparse.Namespace(worker=WORKER, reason="x", run_id=nonce, no_record=True, record_dir=None))
+            return "ok", self.L.delete(argparse.Namespace(worker=WORKER, force=caller == "delete-force", reason="x"))
+        except cw.CloudError as e:
+            return "error", e.code
+
+    CELLS = {
+        ("stop-match", "present"): ("ok", "EMPTY"), ("stop-other", "present"): ("error", "WHOLE"), ("stop-none", "present"): ("ok", "EMPTY"),
+        ("delete-force", "present"): ("ok", "EMPTY"), ("delete", "present"): ("error", "WHOLE"),
+        ("stop-match", "absent"): ("ok", "EMPTY"), ("stop-other", "absent"): ("ok", "WHOLE_NOPOD"), ("stop-none", "absent"): ("ok", "EMPTY"),
+        ("delete-force", "absent"): ("ok", "EMPTY"), ("delete", "absent"): ("ok", "EMPTY"),
+        ("stop-match", "none"): ("ok", "EMPTY"), ("stop-other", "none"): ("ok", "EMPTY"), ("stop-none", "none"): ("ok", "EMPTY"),
+        ("delete-force", "none"): ("ok", "EMPTY"), ("delete", "none"): ("ok", "EMPTY"),
+    }
+
+    def test_matrix(self):
+        bad = []
+        for (caller, st), (kind, left) in sorted(self.CELLS.items()):
+            self.setUp()
+            self.state(st)
+            got_kind, ans = self.call(caller)
+            want = self.EMPTY[1:] if left == "EMPTY" else self.WHOLE[1:]
+            got = self.left()[1:]
+            if got_kind != kind or got != want:
+                bad.append("%s x %s: got %s %s, want %s %s" % (caller, st, got_kind, got, kind, want))
+            if kind == "ok" and caller.startswith("delete") and ans.get("deleted") is not True:
+                bad.append("%s x %s: answer %s" % (caller, st, ans))
+        self.assertEqual(bad, [])
+
+    def test_stop_by_name_only_with_no_pod_removes_the_statefulset_then_the_secrets(self):
+        self.gone()
+        order = []
+        real = self.kube.delete_workload
+        self.kube.delete_workload = lambda n: (order.append("workload"), real(n))
+        rs = self.kube.delete
+        self.kube.delete = lambda n, uid=None: (order.append("secrets"), rs(n, uid))
+        out = self.L.stop(argparse.Namespace(worker=WORKER, reason="x", run_id=None, no_record=True, record_dir=None))
+        self.assertEqual((out["pushed"], self.left(), order), (False, ([], [], [], []), ["workload", "secrets"]))
+
+    def test_mutant_no_nonce_skip_fails(self):
+        m = load_module("cloud_worker.py", "self._remove_gone(worker, name, nonce or None)", "(self._remove_gone(worker, name, nonce) if nonce else None)")
+        self.gone()
+        m.Launcher(self.kube, self.env, self.clock).stop(argparse.Namespace(worker=WORKER, reason="x", run_id=None, no_record=True, record_dir=None))
+        self.assertNotEqual(self.left(), ([], [], [], []))
+
+    def test_a_lookup_error_on_delete_is_never_answered_deleted(self):
+        self.gone()
+        def boom(name):
+            raise cw.CloudError("forbidden")
+        self.kube.get_workload = boom
+        with self.assertRaises(cw.CloudError) as c:
+            self.L.delete(argparse.Namespace(worker=WORKER, force=True, reason="x"))
+        self.assertIn("statefulset/" + cw.pod_name(WORKER), str(c.exception))
+        self.assertNotEqual(c.exception.code, 0)
+        self.assertEqual(list(self.kube.sets), [cw.pod_name(WORKER)])
+
+    def test_mutant_swallowed_lookup_error_fails(self):
+        m = load_module("cloud_worker.py", "                except CloudError as e:   # NotFound is an empty answer (below); any OTHER lookup error is never answered \"deleted\"\n                    raise CloudError(\"could not look up statefulset/%s; REMAINS unknown: %s\" % (name, e))",
+                        "                except CloudError as e:\n                    found = None")
+        self.gone()
+        def boom(name):
+            raise m.CloudError("forbidden")
+        self.kube.get_workload = boom
+        out = m.Launcher(self.kube, self.env, self.clock).delete(argparse.Namespace(worker=WORKER, force=True, reason="x"))
+        self.assertTrue(out["deleted"])   # the mutant answers deleted: the real code raises (the test above), so that test fails on it
+        self.assertEqual(list(self.kube.sets), [cw.pod_name(WORKER)])
 
 
 class OperatorRole(unittest.TestCase):

@@ -1452,8 +1452,10 @@ class Launcher:
                 if ann(pod, "run-id") != nonce:   # another run's (or an unlabelled) worker of this name: nothing is changed
                     raise CloudError("worker %s does not match run id %s; nothing was stopped or deleted" % (worker, nonce), EXIT_REFUSED)
             if not pod:
-                if nonce:   # no pod: this run's own Secrets (carrying the nonce) may remain from a cut-off create; another's are left whole
-                    self._remove_gone(worker, name, nonce)
+                # no pod: with a nonce, this run's own objects (carrying it) may remain from a cut-off create; another run's are left whole.
+                # With NO nonce the caller names the worker itself, so it owns it: the StatefulSet (FIRST) and that name's Secrets go.
+                # (The nonce rule exists only to protect ANOTHER run's objects.)
+                self._remove_gone(worker, name, nonce or None)
                 return {"worker": worker, "runtime_id": "", "pushed": False, "wip_branch": None}
             info["rid"], info["cost"] = "pod/" + pn, self.cost(pod)
             if not getattr(a, "no_record", False):   # BEFORE the hook and the delete; never raises, never holds the stop back
@@ -1637,9 +1639,8 @@ class Launcher:
             if not pod:   # no pod (node loss, eviction): its StatefulSet and Secrets may remain, and are removed
                 try:
                     found = self.kube.get_workload(name)
-                except CloudError as e:   # the old answer stands when the lookup itself fails; said, not hidden
-                    found = None
-                    print("cloud-worker: could not look up statefulset/%s (%s); nothing found to remove" % (name, e), file=sys.stderr)
+                except CloudError as e:   # NotFound is an empty answer (below); any OTHER lookup error is never answered "deleted"
+                    raise CloudError("could not look up statefulset/%s; REMAINS unknown: %s" % (name, e))
                 if found:   # nothing found: the old idempotent answer, byte for byte
                     self._remove_gone(worker, name, None)
                 return {"worker": worker, "runtime_id": "", "deleted": True}
