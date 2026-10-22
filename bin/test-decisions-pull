@@ -23,7 +23,7 @@ from pathlib import Path
 BIN = Path(__file__).resolve().parent
 SOURCE = (BIN / "decisions_pull.py").read_text()
 NOW = 1_800_000_000.0
-BODY = {"generation": 7, "written_at": "2026-10-22T10:00:00Z", "daemon_pid": 42, "errors": [],
+BODY = {"generation": 7, "written_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW - 10)), "daemon_pid": 42, "errors": [],
         "decisions": [{"id": "gh:1", "title": "Pick one", "tier": "human", "repo": "a/b", "ask": 1}]}
 
 
@@ -36,6 +36,16 @@ def load(source=SOURCE):
 def mutant(old, new):
     assert SOURCE.count(old) == 1, old
     return load(SOURCE.replace(old, new))
+
+
+FRESH = {"generation": BODY["generation"], "written_at": BODY["written_at"]}
+
+
+def fr(raw):
+    """A raw source text with fresh generation and written_at added, so that they do not mask the rule a check is about."""
+    text = raw.decode("latin-1") if isinstance(raw, bytes) else raw
+    out = text.replace('{"decisions"', '{"generation": 7, "written_at": "%s", "decisions"' % BODY["written_at"], 1)
+    return out.encode("latin-1") if isinstance(raw, bytes) else out
 
 
 def good(body=BODY):
@@ -131,7 +141,7 @@ def check_unreachable_without_file_creates_none(module):
 
 
 def check_garbage_leaves_file_untouched(module):
-    for raw in (b"not json", b"[]", b"{}", b'{"decisions": {}, "errors": []}', b'{"decisions": []}', b"\xff\xfe", b'{"decisions": [], "errors": []}' + b" " * (9 * 1024 * 1024)):
+    for raw in map(fr, (b"not json", b"[]", b"{}", b'{"decisions": {}, "errors": []}', b'{"decisions": []}', b"\xff\xfe", b'{"decisions": [], "errors": []}' + b" " * (9 * 1024 * 1024))):
         with tempfile.TemporaryDirectory() as state:
             path = fresh_file(state)
             before = (path.read_bytes(), path.stat().st_mtime)
@@ -201,8 +211,8 @@ def check_real_source_that_prints_more_is_cut(module):
 
 
 def check_nan_and_infinity_are_garbage(module):
-    for text in (b'{"decisions": [{"id": "a", "title": "t", "n": NaN}], "errors": []}', b'{"decisions": [], "errors": [], "x": Infinity}',
-                 b'{"decisions": [], "errors": [-Infinity]}'):
+    for text in map(fr, (b'{"decisions": [{"id": "a", "title": "t", "n": NaN}], "errors": []}', b'{"decisions": [], "errors": [], "x": Infinity}',
+                 b'{"decisions": [], "errors": [-Infinity]}')):
         with tempfile.TemporaryDirectory() as state:
             path = fresh_file(state)
             assert pull_quiet(module, state, lambda: text) == "untouched", text
@@ -215,19 +225,19 @@ def check_items_must_have_the_plugins_types(module):
     for body in bad:
         with tempfile.TemporaryDirectory() as state:
             path = fresh_file(state)
-            assert pull_quiet(module, state, good(body)) == "untouched", body
+            assert pull_quiet(module, state, good(dict(FRESH, **body))) == "untouched", body
             assert path.read_text() == "OLD\n"
     with tempfile.TemporaryDirectory() as state:   # strings and objects in errors are fine
-        assert pull_quiet(module, state, good({"decisions": [], "errors": ["a", {"m": 1}]})) == "wrote"
+        assert pull_quiet(module, state, good(dict(FRESH, decisions=[], errors=["a", {"m": 1}]))) == "wrote"
 
 
 def check_item_count_is_capped(module):
     n = module.MAX_ITEMS
-    for body in ({"decisions": [{}] * (n + 1), "errors": []}, {"decisions": [], "errors": ["e"] * (n + 1)}):
+    for body in (dict(FRESH, decisions=[{}] * (n + 1), errors=[]), dict(FRESH, decisions=[], errors=["e"] * (n + 1))):
         with tempfile.TemporaryDirectory() as state:
-            assert pull_quiet(module, state, good(body)) == "untouched"
+            assert pull_quiet(module, state, good(dict(FRESH, **body))) == "untouched"
     with tempfile.TemporaryDirectory() as state:
-        assert pull_quiet(module, state, good({"decisions": [{}] * n, "errors": ["e"] * n})) == "wrote"
+        assert pull_quiet(module, state, good(dict(FRESH, decisions=[{}] * n, errors=["e"] * n))) == "wrote"
 
 
 def check_control_characters_are_stripped(module):
@@ -296,7 +306,7 @@ def check_deep_nesting_and_key_collisions_are_garbage(module):
         with tempfile.TemporaryDirectory() as state:
             path = fresh_file(state)
             err = io.StringIO()
-            assert pull_quiet(module, state, lambda: text.encode(), err=err) == "untouched"
+            assert pull_quiet(module, state, lambda: fr(text).encode(), err=err) == "untouched"
             assert path.read_text() == "OLD\n"
             assert "untouched" in err.getvalue() and len(err.getvalue().splitlines()) == 1, err.getvalue()
     # with the depth cap out of the way the recursion limit is hit: still Garbage, not a crash
@@ -304,7 +314,7 @@ def check_deep_nesting_and_key_collisions_are_garbage(module):
     text = '{"decisions": [{"x": %s}], "errors": []}' % ("[" * 1200 + "]" * 1200)
     with tempfile.TemporaryDirectory() as state:
         path = fresh_file(state)
-        assert pull_quiet(module, state, lambda: text.encode()) == "untouched"
+        assert pull_quiet(module, state, lambda: fr(text).encode()) == "untouched"
         assert path.read_text() == "OLD\n"
 
 
@@ -423,7 +433,67 @@ def check_kept_keys_are_the_daemons(module):
     assert set(module.KEPT_KEYS) == keys, (set(module.KEPT_KEYS) ^ keys)
 
 
-ALL = [check_shape_is_the_daemons, check_unknown_keys_are_dropped, check_write_is_atomic, check_failed_write_leaves_old_file,
+def held_body(state, generation, age=5):
+    path = Path(state) / "decisions.json"
+    path.write_text(json.dumps(dict(BODY, generation=generation, decisions=[], errors=["HELD"])) + "\n")
+    os.utime(path, (NOW - age, NOW - age))
+    return path
+
+
+def iso(at):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+
+
+def check_old_written_at_is_not_written(module):
+    for age, expected in ((module.STALE_SECONDS + 1, "marked-stale"), (module.STALE_SECONDS, "wrote")):
+        with tempfile.TemporaryDirectory() as state:
+            path = held_body(state, 1)
+            err = io.StringIO()
+            body = dict(BODY, generation=2, written_at=iso(NOW - age), decisions=[{"id": "BODYTEXT"}])
+            assert pull_quiet(module, state, good(body), NOW, err=err) == expected, (age, err.getvalue())
+            if expected == "marked-stale":
+                assert "HELD" in path.read_text() and "BODYTEXT" not in path.read_text()
+                assert NOW - path.stat().st_mtime > module.STALE_SECONDS
+                assert len(err.getvalue().strip().splitlines()) == 1 and "BODYTEXT" not in err.getvalue(), err.getvalue()
+            else:
+                assert "BODYTEXT" in path.read_text()
+
+
+def check_lower_generation_is_not_written(module):
+    with tempfile.TemporaryDirectory() as state:
+        path = held_body(state, 5)
+        err = io.StringIO()
+        assert pull_quiet(module, state, good(dict(BODY, generation=4)), NOW, err=err) == "marked-stale"
+        assert "HELD" in path.read_text() and NOW - path.stat().st_mtime > module.STALE_SECONDS
+        assert len(err.getvalue().strip().splitlines()) == 1 and "generation" in err.getvalue(), err.getvalue()
+    for generation in (5, 6):
+        with tempfile.TemporaryDirectory() as state:
+            path = held_body(state, 5)
+            assert pull_quiet(module, state, good(dict(BODY, generation=generation)), NOW) == "wrote"
+            assert "HELD" not in path.read_text()
+
+
+MISSING = object()
+
+
+def check_missing_or_mistyped_freshness_is_garbage(module):
+    bad = [{"generation": MISSING}, {"written_at": MISSING}, {"generation": "7"}, {"generation": 7.5}, {"generation": True},
+           {"written_at": 123}, {"written_at": None}, {"written_at": "yesterday"}]
+    for change in bad:
+        body = {k: v for k, v in BODY.items() if k not in change and k not in ("generation", "written_at")}
+        body.update(FRESH)
+        body.update(change)
+        body = {k: v for k, v in body.items() if v is not MISSING}
+        with tempfile.TemporaryDirectory() as state:
+            path = held_body(state, 1)
+            before = (path.read_text(), path.stat().st_mtime)
+            err = io.StringIO()
+            assert pull_quiet(module, state, good(body), NOW, err=err) == "untouched", change
+            assert (path.read_text(), path.stat().st_mtime) == before and err.getvalue().count("\n") == 1, change
+
+
+ALL = [check_old_written_at_is_not_written, check_lower_generation_is_not_written,
+       check_missing_or_mistyped_freshness_is_garbage, check_shape_is_the_daemons, check_unknown_keys_are_dropped, check_write_is_atomic, check_failed_write_leaves_old_file,
        check_unreachable_marks_stale, check_stale_never_made_fresher, check_unreachable_without_file_creates_none,
        check_garbage_leaves_file_untouched, check_command_failure_is_unreachable, check_real_timeout_is_unreachable,
        check_output_is_bounded_and_process_killed, check_real_source_that_prints_more_is_cut, check_nan_and_infinity_are_garbage,
@@ -494,7 +564,7 @@ class Mutants(unittest.TestCase):
         self.failing(check_unreachable_without_file_creates_none, mutant("    except OSError:\n        return False", "    except OSError:\n        path.write_text('{}')\n        return False"))
 
     def test_garbage_overwrites(self):
-        self.failing(check_garbage_leaves_file_untouched, mutant("        return UNTOUCHED\n    write_atomic(path, body, now)", "        body = {'decisions': [], 'errors': []}\n    write_atomic(path, body, now)"))
+        self.failing(check_garbage_leaves_file_untouched, mutant("        return UNTOUCHED\n    try:\n        written", "        body = {'generation': 7, 'written_at': _iso(now), 'decisions': [], 'errors': []}\n    try:\n        written"))
 
     def test_shape_not_checked(self):
         self.failing(check_garbage_leaves_file_untouched, mutant("isinstance(body.get(\"decisions\"), list) and ", ""))
@@ -545,7 +615,7 @@ class Mutants(unittest.TestCase):
         self.failing(check_reasons_are_said_on_stderr, mutant('        say(err, "source unreachable (%s); no', '        pass  # say(err, "source unreachable (%s); no'))
 
     def test_reason_prints_the_body(self):
-        self.failing(check_reasons_are_said_on_stderr, mutant('(%s); %s untouched" % (why, DECISIONS_FILE))', '(%s); %s untouched" % (raw, DECISIONS_FILE))'))
+        self.failing(check_reasons_are_said_on_stderr, mutant('decisions list (%s); %s untouched" % (why, DECISIONS_FILE))', 'decisions list (%s); %s untouched" % (raw, DECISIONS_FILE))'))
 
     def test_exit_code_not_in_reason(self):
         self.failing(check_reasons_are_said_on_stderr, mutant('"source unreachable (%s); marked %s stale" % (why, DECISIONS_FILE)', '"source unreachable; marked %s stale" % DECISIONS_FILE'))
@@ -603,6 +673,27 @@ class Mutants(unittest.TestCase):
 
     def test_key_collision_accepted(self):
         self.failing(check_deep_nesting_and_key_collisions_are_garbage, mutant("        if len(out) != len(value):", "        if False:"))
+
+    def test_old_written_at_accepted(self):
+        self.failing(check_old_written_at_is_not_written, mutant("    if age > STALE_SECONDS:", "    if False:"))
+
+    def test_written_at_boundary_off_by_one(self):
+        self.failing(check_old_written_at_is_not_written, mutant("    if age > STALE_SECONDS:", "    if age >= STALE_SECONDS:"))
+
+    def test_lower_generation_accepted(self):
+        self.failing(check_lower_generation_is_not_written, mutant('    if held is not None and body["generation"] < held:', "    if False:"))
+
+    def test_equal_generation_refused(self):
+        self.failing(check_lower_generation_is_not_written, mutant('body["generation"] < held', 'body["generation"] <= held'))
+
+    def test_generation_type_not_checked(self):
+        self.failing(check_missing_or_mistyped_freshness_is_garbage, mutant("    if isinstance(gen, bool) or not isinstance(gen, int):", "    if False:"))
+
+    def test_written_at_type_not_checked(self):
+        self.failing(check_missing_or_mistyped_freshness_is_garbage, mutant("    if not isinstance(text, str):", "    if False:"))
+
+    def test_written_at_format_not_checked(self):
+        self.failing(check_missing_or_mistyped_freshness_is_garbage, mutant("    except ValueError:\n        raise Garbage(\"written_at is not", "    except ZeroDivisionError:\n        raise Garbage(\"written_at is not"))
 
 
 if __name__ == "__main__":
