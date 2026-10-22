@@ -1066,16 +1066,18 @@ def refusals(function):
 
 
 def model_entry():
-    """The github-copilot entry of the OpenCode auth file (the driver's rule), as one JSON text; nothing else of the file."""
-    path = os.environ.get("CW_MODEL_AUTH_FILE") or os.path.expanduser("~/.local/share/opencode/auth.json")
+    """The live model credential: the ONE provider entry of OpenCode's own store (`opencode auth export`, in memory), as a one-element JSON array."""
+    path = Path(__file__).resolve().parent.parent / "cloud" / "launcher" / "model_credential.py"
+    spec = importlib.util.spec_from_file_location("cw_model_credential", str(path))
+    module = importlib.util.module_from_spec(spec)
     try:
-        with open(path) as handle:
-            entry = json.loads(handle.read(1000001)[:1000000]).get(MODEL_PROVIDER)
-    except (OSError, ValueError, AttributeError):
-        entry = None
-    if not entry or not isinstance(entry, dict):
-        raise Refusal("the model auth file is missing, unreadable or has no %s entry; nothing was created" % MODEL_PROVIDER)
-    return json.dumps({MODEL_PROVIDER: entry})
+        spec.loader.exec_module(module)
+    except (OSError, SyntaxError) as err:
+        raise CloudError("the model credential reader is not found beside this program (%s)" % _one(str(err), 80)) from None
+    try:
+        return module.read_provider_entry(MODEL_PROVIDER)
+    except module.ModelCredentialError as err:
+        raise Refusal(str(err)) from None
 
 
 def git_token(repo, cluster):
