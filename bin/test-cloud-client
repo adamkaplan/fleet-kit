@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""test-cloud-client: offline tests for bin/cloud_client.py. Real code, fake transport and token file; one mutant per rule.
+
+    bin/test-cloud-client
+"""
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+SOURCE = (BIN / "cloud_client.py").read_text()
+
+
+def load(source=SOURCE):
+    module = types.ModuleType("cloud_client_under_test")
+    exec(compile(source, "cloud_client.py", "exec"), module.__dict__)
+    return module
+
+
+def mutant(old, new):
+    assert SOURCE.count(old) == 1, old
+    return load(SOURCE.replace(old, new))
+
+
+class Post:
+    def __init__(self, *answers):
+        self.answers, self.requests = list(answers), []
+
+    def __call__(self, request):
+        self.requests.append(request)
+        answer = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+class Case(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = Path(self.dir.name) / "token"
+        self.path.write_text("tok-one\n")
+
+    def send(self, module, post, **kw):
+        return module.send("w1", "o1", "hi", post, token_path=str(self.path), **kw)
+
+    def check_token_at_call_time(self, module):
+        post = Post({"status": 200})
+        self.send(module, post)
+        self.path.write_text("tok-two")
+        self.send(module, post)
+        return [r["authorization"] for r in post.requests] == ["Bearer tok-one", "Bearer tok-two"]
+
+    def check_key_reused(self, module):
+        post = Post({"status": 503}, {"status": 503}, {"status": 200})
+        ok, _ = self.send(module, post)
+        keys = {r["body"]["key"] for r in post.requests}
+        return ok and len(post.requests) == 3 and len(keys) == 1
+
+    def check_auth_line(self, module):
+        for status in (401, 403):
+            post = Post({"status": status, "error": "wrong audience"})
+            ok, line = self.send(module, post)
+            if ok or "\n" in line or str(status) not in line or "wrong audience" not in line or "tok-one" in line:
+                return False
+            if len(post.requests) != 1:
+                return False
+        return True
+
+    def check_no_token_in_errors(self, module):
+        ok, line = self.send(module, Post(RuntimeError("tok-one")))
+        return not ok and "tok-one" not in line
+
+    def check_report(self, module):
+        post = Post({"status": 200})
+        ok, _ = module.report("w1", "done", post, token_path=str(self.path))
+        b = post.requests[0]["body"]
+        return ok and b["recipient"] == "captain" and b["text"] == "report: done" and b["sender"] == "w1"
+
+    CHECKS = [
+        ("check_token_at_call_time", "token = _read_token(token_path)", "token = _CACHE.setdefault('t', _read_token(token_path))"),
+        ("check_key_reused", "key = key or uuid.uuid4().hex", "key = key or uuid.uuid4().hex\n    _k = key"),
+        ("check_auth_line", "if status in (401, 403):", "if status in (999,):"),
+        ("check_no_token_in_errors", 'return False, "cloud channel: no token file"', 'return False, "cloud channel: no token file"'),
+        ("check_report", '"report: " + text', "text"),
+    ]
+
+
+def add(name, check, old, new):
+    def real(self):
+        self.assertTrue(getattr(self, check)(load()))
+
+    def dead(self):
+        module = mutant(old, new)
+        module.__dict__["_CACHE"] = {}
+        self.assertFalse(getattr(self, check)(module))
+    setattr(Case, "test_" + name, real)
+    setattr(Case, "test_mutant_" + name, dead)
+
+
+# The key mutant regenerates the key on every try; the leak mutant puts the token in the transport error line.
+Case.CHECKS[1] = ("check_key_reused", "    for _ in range(max(1, retries)):\n", "    for _ in range(max(1, retries)):\n        key = uuid.uuid4().hex\n")
+Case.CHECKS[3] = ("check_no_token_in_errors", "answer = {\"status\": 0, \"error\": type(err).__name__}", "answer = {\"status\": 0, \"error\": str(err)}")
+_orig_unavailable = None
+for n, (c, o, nw) in enumerate(Case.CHECKS):
+    add(c[6:], c, o, nw)
+
+if __name__ == "__main__":
+    unittest.main(argv=[sys.argv[0]] + sys.argv[1:])
