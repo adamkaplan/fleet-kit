@@ -14866,7 +14866,11 @@ class TestClearCarry(unittest.TestCase):
         self.api.changed_files_override = 5
         verdict = self.decide(new)
         self.assertFalse(verdict["carried"])
-        self.assertIn("cut: GitHub lists 2 of 5 files", verdict["reason"])
+        self.assertIn("cut: GitHub listed 2 of 5 changed files", verdict["reason"])   # every page was read and the list is still short of the count: void
+        self.api.changed_files_override = 3001
+        verdict = self.decide(new)
+        self.assertFalse(verdict["carried"])
+        self.assertIn("at most 3000", verdict["reason"])   # more than the platform maximum: void
         self.api.changed_files_override = None
         self.api.fail = "/compare/"
         verdict = self.decide(new)
@@ -14993,7 +14997,10 @@ class TestClearCarry(unittest.TestCase):
         calls = [n for n in ast.walk(ast.parse(main)) if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "own_change_fingerprint"]
         self.assertEqual(len(calls), 1, "the clear's wrapper is the only caller in the switchboard; the carry's decide calls the same function inside the module")
         imports = sorted(a.name for n in ast.walk(ast.parse(text)) if isinstance(n, ast.Import) for a in n.names)
-        self.assertEqual(imports, ["hashlib", "json"], "the carry imports no floor, glob or class code: it decides from GitHub's answers alone")
+        self.assertEqual(imports, ["hashlib", "importlib.util", "json", "os", "sys"], "the carry imports no floor, glob or class code: it decides from GitHub's answers alone (importlib, os and sys only load the shared page reader, bin/pr_files.py)")
+        self.assertFalse([n for n in ast.walk(ast.parse(text)) if isinstance(n, ast.ImportFrom)], "no from-import of floor or class code")
+        self.assertNotIn("impact_floor", text)
+        self.assertEqual(text.count('"pr_files.py"'), 1, "the one shared page reader is loaded by name, once")
 
 
 class TestConflictCarry(unittest.TestCase):
@@ -35876,10 +35883,10 @@ class TestImpactFloorCommandAndPass(LedgerBase):
         self.assertEqual((got["decision"], len(got["rated"])), ("hold", 1))
 
     def test_a_huge_diff_with_a_truncated_file_list_holds_as_unknown_and_the_daemon_records_it(self):
-        self.pr.update({"changedFiles": 3000, "files": [{"path": "src/f%d.py" % n} for n in range(100)]})
+        self.pr.update({"changedFiles": 3001, "files": [{"path": "src/f%d.py" % n} for n in range(100)]})   # more than GitHub will list (#1098)
         report = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
         self.assertEqual((report["decision"], report["complete"], report["floor_paths"]), ("hold", False, []))
-        self.assertIn("GitHub listed 100 of 3000", report["unknown"])
+        self.assertIn("GitHub lists at most 3000 of the 3001", report["unknown"])
         self.assertIn("unknown floor, held on purpose", self.run_as("coder", "impact", "floor", self.PR)[1])
         hub = FakeHub({"acme/app": [{"number": 9, "head": {"sha": LEDGER_HEAD}, "body": "PLAN: acme/app#7", "draft": False}]})
         engine = self.world.new_engine("daemon")
@@ -35888,7 +35895,7 @@ class TestImpactFloorCommandAndPass(LedgerBase):
         sb.ci_record_pass(engine, 100000.0)
         sb.impact_would_hold_pass(engine, 100000.0)
         (event,) = [e for e in self.world.audit() if e["event"] == "gate.would_hold"]
-        self.assertIn("GitHub listed 100 of 3000", event["detail"]["unknown"])
+        self.assertIn("GitHub lists at most 3000 of the 3001", event["detail"]["unknown"])
 
     def test_a_rename_out_of_a_floor_path_still_holds_with_or_without_the_old_path(self):
         self.pr.update({"changedFiles": 1, "files": [{"path": "elsewhere/0002.sql", "previous_filename": "migrations/0002.sql", "changeType": "RENAMED"}]})
