@@ -5417,3 +5417,11 @@ Each decision was walked against the matrix (its owner-hold meaning and its rati
 - The line naming the entry itself is where the entry's own code runs. Parts above it run first; parts below it run at the end of the file, before `main`.
 - A missing part stops the start with one line on stderr. A missing manifest means the entry alone; a manifest that exists but cannot be read stops the start with one line. A manifest that does not name the entry runs every part before the entry's code. The manifest and its parts run with the daemon's authority: they have the entry's trust and file permissions.
 - Today the manifest names only the entry, so nothing moved and behaviour is identical. A later slice moves code into parts and adds their lines.
+
+## Running with no terminal multiplexer (#1072)
+
+Cause: `Engine._discover` calls `agent_list` on every pass. With no herdr that call fails, so each pass records a standing "herdr unreachable" problem and `read_mark` marks the agents input not whole, which skips the destructive steps that need a whole input.
+
+The config key `no_multiplexer` (default `false`, so nothing changes) turns that off. With `"no_multiplexer": true` discovery reads the registry and the headless and cloud records only: `agent_list` is never called, no "herdr unreachable" problem is recorded, and the agents input is whole when those records were read without error. The one-time bell migration stays pending. Agents with no pane get no badge, no pane read and no pane delivery, and that is no error. With the key off, discovery, problems, audit lines and call counts are as before (test `TestNoMultiplexer`, scenarios U1 and S2). The tests use a fake multiplexer that raises on any call, and one test is a mutant that keeps calling `agent_list` with the switch on; the count of zero calls catches it. Other commands that call `agent_list` directly (close-pane guards, doctor) are unchanged and still need herdr.
+
+With the key on, the toast step and the badge writes are skipped too (a toast is a multiplexer call; a badge needs a pane), with no error. The tests (`TestNoMultiplexer`) carry one mutant per scenario that names one: the S2 mutant keeps calling `agent_list`, the S3 mutant drops the toast guard, the U1 mutant makes the switch-off path behave as on; each is killed by its own check.

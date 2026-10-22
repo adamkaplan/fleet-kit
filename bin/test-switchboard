@@ -41,6 +41,7 @@ import re
 from urllib.parse import unquote
 import shlex
 import shutil
+import textwrap
 import zipfile
 import signal
 import socket
@@ -400,7 +401,7 @@ class TestConfig(Base):
             "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "launch_default": "headless",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
-            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "docker_reaper": True,
+            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "no_multiplexer": False, "docker_reaper": True,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_live_days": 14, "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
@@ -18157,6 +18158,150 @@ class TestHeadlessPresence(Base):
         self.assertFalse(path.exists())
         self.assertFalse(self.ap.remove_record(self.world.state, "hw"))
         self.assertFalse(self.ap.remove_record(self.world.state, "../x"))
+
+
+class TestNoMultiplexer(Base):
+    """#1072: `no_multiplexer` on: discovery reads the records only. A multiplexer that RAISES on any call proves none is made."""
+
+    class Raising:
+        def __init__(self):
+            self.calls = []
+        def __getattr__(self, name):
+            if name.startswith("__"):
+                raise AttributeError(name)
+            def call(*args, **kwargs):
+                self.calls.append(name)
+                raise sb.HerdrError("no multiplexer here: %s" % name)
+            return call
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("boss",))
+        self.ap = sb.load_agent_presence()
+        self.engine = self.world.new_engine("cli")
+        self.url = "http://127.0.0.1:49374"
+        self.headless = lambda: TestHeadlessPresence.headless(self)
+        self.discover = lambda: TestHeadlessPresence.discover(self)
+        self.sid = self.headless()
+        self.fake = self.Raising()
+        self.engine.herdr = self.fake
+
+    def test_s2_the_switch_on_never_calls_agent_list_and_leaves_no_problem_and_the_agents_input_whole(self):
+        self.engine.config = dict(self.engine.config, no_multiplexer=True)
+        found = self.discover()
+        self.assertEqual(self.fake.calls.count("agent_list"), 0)
+        self.assertEqual([p for p in found.problems if "herdr unreachable" in p], [])
+        self.assertEqual(found.problems, [])
+        self.assertTrue(sb.whole(self.engine, "agents")[0])
+        self.assertIn("hw", found.agents)
+
+    def test_s3_pane_less_agents_get_no_badge_and_no_pane_call_and_no_error(self):
+        self.engine.config = dict(self.engine.config, no_multiplexer=True)
+        found = self.discover()
+        report = {"badges": [], "errors": []}
+        self.engine.render_badges(found, set(), report)
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual((report["badges"], report["errors"]), ([], []))
+
+    def test_s2_a_whole_pass_with_the_switch_on_makes_no_multiplexer_call(self):
+        self.engine.config = dict(self.engine.config, no_multiplexer=True)
+        self.engine.audit = self.engine.audit
+        self.engine.run_pass()
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(self.engine.discovery.problems, [])
+
+    def test_u1_the_switch_off_still_reports_herdr_unreachable_and_the_input_not_whole(self):
+        self.assertFalse(self.engine.config["no_multiplexer"])
+        found = self.discover()
+        self.assertEqual(self.fake.calls, ["agent_list"])
+        self.assertTrue(any(p.startswith("herdr unreachable: ") for p in found.problems))
+        self.assertFalse(sb.whole(self.engine, "agents")[0])
+
+    def test_the_key_must_be_a_boolean(self):
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"no_multiplexer": "yes"})
+
+    def _owed_toast(self):
+        found = self.discover()
+        return found, mock.patch.object(sb.Switchboard, "toast_candidates", lambda *a: [("hw", "blocked", "hw is blocked", "waiting")])
+
+    def test_s3_a_toast_owed_to_a_pane_less_agent_makes_no_multiplexer_call_and_no_failure_with_the_switch_on(self):
+        self.engine.config = dict(self.engine.config, no_multiplexer=True)
+        found, patch = self._owed_toast()
+        report = {"toasts": [], "errors": []}
+        with patch:
+            self.engine.render_toast(found, {}, 0, report)
+        self.assertEqual((self.fake.calls, report["toasts"], report["errors"]), ([], [], []))
+
+    def test_s3_every_pane_call_site_is_guarded_or_unreachable_with_the_switch_on(self):
+        """One row per pane-assuming path: badge and toast (guarded by the switch), check_program and observe (only fed by herdr entries, which the switch
+        never lists), reread (no pane -> a stated refusal before any call), the pane sweep (skips an agent with no pane), close and release (need a listed pane)."""
+        self.engine.config = dict(self.engine.config, no_multiplexer=True)
+        found = self.discover()
+        obs = found.agents["hw"]
+        self.assertFalse(obs.pane)
+        self.assertEqual(found.entries, [])
+        self.engine.render_badges(found, set(), {"badges": [], "errors": []})
+        self.assertEqual(self.fake.calls, [])
+        obs.pane = "p1"   # an agent WITH a pane while the switch is on (a stale record): still no badge write, no toast
+        report = {"badges": [], "errors": [], "toasts": []}
+        self.engine.render_badges(found, set(), report)
+        self.assertEqual((self.fake.calls, report["badges"], report["errors"]), ([], [], []))
+        with mock.patch.object(sb.Switchboard, "toast_candidates", lambda *a: [("hw", "blocked", "t", "b")]):
+            self.engine.render_toast(found, {}, 0, report)
+        self.assertEqual((self.fake.calls, report["toasts"]), ([], []))
+
+    def test_u1_the_switch_off_renders_badges_and_toasts_through_the_multiplexer_as_before(self):
+        found = self.discover()
+        found.agents["hw"].pane = "p1"
+        report = {"badges": [], "errors": [], "toasts": []}
+        with mock.patch.object(sb.Switchboard, "unread_count", lambda *a: 3):
+            self.engine.render_badges(found, set(), report)
+        self.assertTrue([c for c in self.fake.calls if c != "agent_list"], "the badge path reached the multiplexer with the switch off")
+        self.fake.calls.clear()
+        with mock.patch.object(sb.Switchboard, "toast_candidates", lambda *a: [("hw", "blocked", "t", "b")]):
+            try:
+                self.engine.render_toast(found, {}, 0, report)
+            except sb.HerdrError:
+                pass   # the double refuses the call; the call is what is counted
+        self.assertEqual(self.fake.calls, ["notification_show"])
+
+    # -- #1072 R-TEST-4: each mutant removes ONE guard from the REAL function (its source, with the guard's condition replaced), never wraps the double
+
+    GUARD = '(getattr(self, "config", None) or {}).get("no_multiplexer") is True'
+
+    @staticmethod
+    def without_guard(owner, name, old, new="False"):
+        """The REAL function `owner.name`, recompiled from its own source with the one guard condition `old` replaced by `new`."""
+        source = textwrap.dedent(inspect.getsource(getattr(owner, name)))
+        assert source.count(old) == 1, "the guard moved: %s.%s" % (owner.__name__, name)
+        scratch = {}
+        exec(compile(source.replace(old, new), "<mutant %s>" % name, "exec"), vars(sb), scratch)
+        return scratch[name]
+
+    def test_each_guard_removed_from_the_real_function_fails_the_test_that_names_it(self):
+        engine_guard = self.GUARD
+        rows = (
+            ("discovery switch", sb.Switchboard, "_discover", engine_guard, "test_s2_the_switch_on_never_calls_agent_list_and_leaves_no_problem_and_the_agents_input_whole"),
+            ("badge guard", sb.Switchboard, "render_badges", engine_guard, "test_s3_every_pane_call_site_is_guarded_or_unreachable_with_the_switch_on"),
+            ("toast guard", sb.Switchboard, "render_toast", engine_guard, "test_s3_a_toast_owed_to_a_pane_less_agent_makes_no_multiplexer_call_and_no_failure_with_the_switch_on"),
+        )
+        for label, owner, name, old, named in rows:
+            with self.subTest(mutant=label):
+                self.setUp()   # a fresh world for each: the real function first, then the mutant
+                getattr(self, named)()   # the real function: the named test holds
+                self.setUp()
+                with mock.patch.object(owner, name, self.without_guard(owner, name, old)):
+                    with self.assertRaises((AssertionError, sb.HerdrError), msg="the %s removed from the real function passed %s" % (label, named)):
+                        getattr(self, named)()
+
+    def test_the_discovery_switch_always_on_fails_the_u1_test_that_names_it(self):
+        """U1: the guard that holds whatever the switch says (the switch off behaves as on) fails the switch-off test."""
+        self.test_u1_the_switch_off_still_reports_herdr_unreachable_and_the_input_not_whole()
+        self.setUp()
+        with mock.patch.object(sb.Switchboard, "_discover", self.without_guard(sb.Switchboard, "_discover", self.GUARD, "True")):
+            with self.assertRaises(AssertionError):
+                self.test_u1_the_switch_off_still_reports_herdr_unreachable_and_the_input_not_whole()
 
 
 class TestSelfRegisteringCli(unittest.TestCase):
@@ -81067,6 +81212,34 @@ class TestBellMigration(unittest.TestCase):
         sb.bell_migration(self.engine, self.registry, 5)
         self.assertEqual(self.bells(), self.live)
         self.assertEqual(len(self.audit_lines()), 5)
+
+    def test_r_test_1_the_switch_on_skips_the_real_migration_no_read_no_marker_no_field(self):
+        herdr = self.Herdr(self.agents, self.tabs)
+        self.engine.herdr, self.engine.config = herdr, {"no_multiplexer": True}
+        sb.bell_migration(self.engine, self.registry, 5)
+        self.assertEqual(herdr.reads, 0)
+        self.assertFalse(self.registry.bell_migrated(self.dir))
+        self.assertEqual(self.bells(), {n: None for n in self.names})
+        self.assertEqual(self.notes, [])
+
+    def test_r_test_1_the_switch_off_runs_the_real_migration_as_before(self):
+        herdr = self.Herdr(self.agents, self.tabs)
+        self.engine.herdr, self.engine.config = herdr, {"no_multiplexer": False}
+        sb.bell_migration(self.engine, self.registry, 5)
+        self.assertGreater(herdr.reads, 0)
+        self.assertTrue(self.registry.bell_migrated(self.dir))
+        self.assertEqual(self.bells(), self.live)
+
+    def test_r_test_1_the_bell_guard_removed_from_the_real_function_fails_the_switch_on_test(self):
+        mutant = TestNoMultiplexer.without_guard(sb, "bell_migration", '(getattr(engine, "config", None) or {}).get("no_multiplexer") is True')
+        with mock.patch.object(sb, "bell_migration", mutant):
+            with self.assertRaises(AssertionError):
+                self.test_r_test_1_the_switch_on_skips_the_real_migration_no_read_no_marker_no_field()
+        self.setUp()
+        always = TestNoMultiplexer.without_guard(sb, "bell_migration", '(getattr(engine, "config", None) or {}).get("no_multiplexer") is True', "True")
+        with mock.patch.object(sb, "bell_migration", always):
+            with self.assertRaises(AssertionError):
+                self.test_r_test_1_the_switch_off_runs_the_real_migration_as_before()
 
     def test_a_partial_or_failed_read_writes_nothing_and_is_tried_again(self):
         self.engine.herdr = self.Herdr(self.agents, self.tabs, fail=True)
