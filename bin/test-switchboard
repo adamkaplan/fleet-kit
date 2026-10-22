@@ -3341,6 +3341,20 @@ class TestSteerToWorking(Base):
         self.assertIn("only partly read", err)
         self.assertEqual(self.posts, [])
 
+    def test_the_endpoint_is_an_address_only_and_the_bearer_comes_from_the_clients_token_file(self):
+        es, client = sb.load_module("endpoint_send"), sb.load_module("cloud_client")
+        token = self.home / "agent-token"
+        token.write_text("tok.en-1")
+        seen = []
+        post = lambda request: seen.append(request) or {"status": 200}
+        ok, line = es.deliver(client, "http://cloud-hub.cw.svc:8443", "cos", "cloudy", "ping", post=post, token_path=str(token))
+        self.assertTrue(ok, line)
+        self.assertEqual(seen[0]["authorization"], "Bearer tok.en-1")
+        self.assertEqual({k: seen[0]["body"][k] for k in ("sender", "recipient", "text")}, {"sender": "cos", "recipient": "cloudy", "text": "ping"})
+        self.assertNotIn("tok.en-1", "http://cloud-hub.cw.svc:8443")
+        ok, line = es.deliver(client, "file:///etc/passwd", "cos", "cloudy", "ping", post=post)
+        self.assertFalse(ok)
+
     def test_the_docs_say_the_send_path_uses_the_route_function(self):
         text = (REPO / "docs" / "agent-registry.md").read_text()
         self.assertIn("The send path uses it", text)
