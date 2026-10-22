@@ -1896,6 +1896,7 @@ class V2Client:
             argv += ["-d", json.dumps(data, separators=(",", ":"), sort_keys=True)]
         env = dict(os.environ)
         env.update(self.env)
+        env.update(NO_CREDENTIAL_DIALOG_ENV)   # #1050: the service and a headless worker's tools never open a credential dialog
         # OpenCode v2's `api` command loses the end of a large reply when it writes to a pipe and exits
         # (a real 500 KB transcript arrived cut at 293 KB, inside a string, and every read failed with
         # bad_json). Into a file the reply is whole, so the reply goes to a file and is read back.
@@ -6278,6 +6279,17 @@ VIEW_ROLE_ENV = "FLEET_SWITCHBOARD_ROLE"  # PR 18: what the pane's TUI reads to 
 VIEW_REPO_ENV = "FLEET_SWITCHBOARD_REPO"
 
 
+NO_CREDENTIAL_DIALOG_ENV = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}   # #1050: no git call of the fleet may open a credential dialog (shims/git sets them too)
+
+
+def launch_base_env(config):
+    """The environment of a terminal launch or reattach: the configured opencode_env and launch_env, plus the two variables that stop a credential dialog (#1050). They go last: a config cannot turn them off."""
+    env = dict(config["opencode_env"])
+    env.update(config["launch_env"])
+    env.update(NO_CREDENTIAL_DIALOG_ENV)
+    return env
+
+
 def view_env(role, repo):
     """The pane's environment that tells its TUI who it is (not secrets): the Decisions panel shows every tier and
     repo to the Chief of Staff, one repo to a pane that names it, the human tier to any other."""
@@ -6391,7 +6403,7 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
     if taken is not None:
         raise LaunchError("a fleet agent named %s already runs in pane %s" % (name, taken.pane))
     fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by, read_repo)
-    env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
+    env = launch_base_env(engine.config)
     env.update(view_env(role, repo or (engine.config.get("intent_repo") if charter else None)))  # PR 18
     env.update(agent_tmp_env(engine, name))   # #767: before the session exists, so a failure leaves nothing started
     accounts = getattr(engine, "accounts", None)
@@ -6653,7 +6665,7 @@ def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, 
                           % (session_id, fleet.get("name"), name))
     if not directory or not os.path.isabs(directory):
         raise LaunchError("session %s has no working directory to open the tab in" % session_id)
-    env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
+    env = launch_base_env(engine.config)
     # Everything about who the agent is comes from the session's STORED fleet metadata, never from the caller: a reattached agent keeps its
     # repo, role, charter and gh account (a caller-given --repo that differs was refused by the command).
     repo = fleet.get("repo") or (engine.config.get("intent_repo") if fleet.get("charter") else None)
@@ -26620,7 +26632,7 @@ def cmd_preflight_pr(args, runner, now):
                 if job:
                     commands.remove((skipped,))
                     print("preflight-pr: %s: skipped, CI runs it for this pull request (job %s)" % (shown, job))
-            env = dict(os.environ, FLEET_HEAVY_MAX_SECONDS=str(ceiling))   # the ceiling runs INSIDE the slot (heavy's watchdog starts when the slot is granted): a wait in the queue is never a timeout
+            env = dict(os.environ, FLEET_HEAVY_MAX_SECONDS=str(ceiling), **NO_CREDENTIAL_DIALOG_ENV)   # the ceiling runs INSIDE the slot (heavy's watchdog starts when the slot is granted): a wait in the queue is never a timeout
             sys.stderr.write("preflight-pr: %s: waiting for a slot, then running (ceiling %ds once running)\n" % (name, ceiling))
             if under is not None:
                 scratch = os.path.join(work, ("tok_" + "x" * PREFLIGHT_TOKEN_LENGTH)[:PREFLIGHT_TOKEN_LENGTH])
