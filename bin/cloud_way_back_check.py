@@ -101,7 +101,7 @@ def _no_nul(value, field="(fixture)"):
             _no_nul(item, field)
 
 
-def validate(state):
+def check_fixture_shape(state):
     """Raise FixtureError unless every field the check reads has its documented type and no string holds a NUL byte."""
     _no_nul(state)
     _need(isinstance(state, dict), "(root)")
@@ -153,10 +153,15 @@ def check(state, root):
     path = _inside(root, snap.get("file", "")) if snap.get("file") else None
     orchestrators = state.get("orchestrators") or []
     if phase != "done":
-        if path is None or not path.is_file():
-            add("snapshot_matches", False, "snapshot file missing")
+        digest = None
+        try:
+            if path is not None and path.is_file():
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            digest = None
+        if digest is None:
+            add("snapshot_matches", False, "snapshot file missing or unreadable")
         else:
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
             add("snapshot_matches", digest == snap.get("sha256"), "checksum %s" % ("equal" if digest == snap.get("sha256") else "differs"))
     else:
         exports = [_inside(root, i["export"]) for i in orchestrators if i.get("export")]
@@ -194,7 +199,7 @@ def main(argv, out=sys.stdout):
     root = Path(argv[0])
     try:
         state = json.loads((root / "way-back.json").read_text())
-        validate(state)
+        check_fixture_shape(state)
     except FixtureError as err:
         out.write("cannot read way-back.json: %s\n" % _clean(err))
         return 2

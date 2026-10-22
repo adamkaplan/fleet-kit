@@ -112,8 +112,8 @@ CASES = {
     "local_alive_before_start": ("MISSING no_daemon_alive: cloud False, local True", dict(phase="before-start"),
                                  [("local is False and cloud is False", "not (cloud and local)")]),
     "phase_unknown": ("MISSING phase_known: phase unknown", dict(phase="bogus"), [('phase in PHASES, "phase', 'True, "phase')]),
-    "snapshot_file_missing": ("MISSING snapshot_matches: snapshot file missing", dict(snapshot={"file": "nope.tar", "sha256": "0" * 64}),
-                              [("if path is None or not path.is_file():", "if False:")]),
+    "snapshot_file_missing": ("MISSING snapshot_matches: snapshot file missing or unreadable", dict(snapshot={"file": "nope.tar", "sha256": "0" * 64}),
+                              [("if digest is None:", "if False:")]),
     "snapshot_wrong_checksum": ("MISSING snapshot_matches: checksum differs", dict(snapshot={"file": "snap.tar", "sha256": "0" * 64}),
                                 [('digest == snap.get("sha256"), "checksum', 'True, "checksum')]),
     "agents_lost": ("MISSING agents_restored: 1 of 2 agents missing locally: b", dict(local_agents=["a"]),
@@ -151,7 +151,7 @@ CASES = {
 }
 
 
-# What a mutant that drops a validate check must do instead of exiting 2: by default finish with exit 0 or 1; the listed
+# What a mutant that drops a check_fixture_shape check must do instead of exiting 2: by default finish with exit 0 or 1; the listed
 # fixtures reach code that cannot take the bad value, and must fail with exactly that exception type.
 EXPECTED_MUTANT_RESULT = {"invalid json": ("JSONDecodeError",), "deeply nested json": ("RecursionError",),
                           "root is a list": ("AttributeError",), "orchestrator entry is a string": ("AttributeError",)}
@@ -234,6 +234,7 @@ class TestWayBack(unittest.TestCase):
             "import.dir is a number": (json.dumps({"import": {"dir": 5}}), ('_need(imp.get("dir") is None or isinstance(imp.get("dir"), str), "import.dir")', '_need(True, "import.dir")')),
             "agent_dirs holds a number": (json.dumps({"import": {"agent_dirs": [1]}}), ('for key in ("agent_dirs", "copies_remaining"):', 'for key in ("copies_remaining",):')),
             "copies_remaining is a string": (json.dumps({"import": {"copies_remaining": "x"}}), ('for key in ("agent_dirs", "copies_remaining"):', 'for key in ("agent_dirs",):')),
+            "snapshot.sha256 is a number": (json.dumps({"snapshot": {"file": "snap.tar", "sha256": 5}}), ('for key in ("file", "sha256"):', 'for key in ("file",):')),
             "NUL in snapshot.file": (json.dumps({"snapshot": {"file": "a\0b"}}), ("    _no_nul(state)\n", "")),
             "NUL in an export": (json.dumps({"orchestrators": [{"name": "o", "export": "a\0b"}]}), ("    _no_nul(state)\n", "")),
             "NUL in an agent_dirs entry": (json.dumps({"import": {"dir": "/tmp/i", "agent_dirs": ["/w/a\0b"]}}), ("    _no_nul(state)\n", "")),
@@ -260,12 +261,29 @@ class TestWayBack(unittest.TestCase):
         self.assertIsNone(REAL._inside(Path("/tmp"), "a\0b"))
         self.assertIsNone(REAL._norm("a\0b"))
         self.assertEqual(REAL._overlap("/tmp/x", "a\0b"), "unresolvable")
-        self.assertIsNone(REAL._inside(Path("/tmp"), "a\0b"))
         self.assertRaises(ValueError, mutant("    try:\n        path = (root / str(relative)).resolve()\n        path.relative_to(root.resolve())\n    except (ValueError, OSError):\n        return None\n", "    path = (root / str(relative)).resolve()\n    path.relative_to(root.resolve())\n")._inside, Path("/tmp"), "a\0b")
         self.assertRaises(ValueError, mutant("    try:\n        return Path(os.path.normcase(str(Path(path).resolve())))\n    except (ValueError, OSError):\n        return None\n", "    return Path(os.path.normcase(str(Path(path).resolve())))\n")._norm, "a\0b")
-        shared = dict(import_dir="/tmp/x")
         self.assertEqual(REAL._overlap("a\0b", "/tmp/x"), "unresolvable")
         self.assertIsNone(mutant('    if d is None or a is None:\n        return "unresolvable"\n', "").__dict__["_overlap"]("/tmp/x", "/tmp/y"))
+
+    def test_an_unreadable_snapshot_is_reported_missing_never_a_traceback(self):
+        def unreadable(module):
+            real = Path.read_bytes
+            def deny(self):
+                if self.name == "snap.tar" and sys._getframe(1).f_code.co_name == "check":
+                    raise PermissionError(13, "denied")
+                return real(self)
+            Path.read_bytes = deny
+            try:
+                return verdict(module)
+            finally:
+                Path.read_bytes = real
+        code, text = unreadable(REAL)
+        self.assertEqual(code, 1)
+        self.assertIn("MISSING snapshot_matches: snapshot file missing or unreadable", text.splitlines())
+        self.assertNotIn("Traceback", text)
+        code, text = unreadable(mutant("        except OSError:\n            digest = None\n", "        except ZeroDivisionError:\n            digest = None\n"))
+        self.assertIsNone(code)
 
     def test_an_unreadable_fixture_and_a_bad_command_line_exit_2(self):
         with tempfile.TemporaryDirectory() as tmp:
