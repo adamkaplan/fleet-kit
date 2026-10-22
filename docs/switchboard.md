@@ -5416,7 +5416,9 @@ Each decision was walked against the matrix (its owner-hold meaning and its rati
 - Parts run in the order given, each executed into the same namespace, so `__file__` stays the entry's and every path computed from it is unchanged.
 - The line naming the entry itself is where the entry's own code runs. Parts above it run first; parts below it run at the end of the file, before `main`.
 - A missing part stops the start with one line on stderr. A missing manifest means the entry alone; a manifest that exists but cannot be read stops the start with one line. A manifest that does not name the entry runs every part before the entry's code. The manifest and its parts run with the daemon's authority: they have the entry's trust and file permissions.
-- Today the manifest names only the entry, so nothing moved and behaviour is identical. A later slice moves code into parts and adds their lines.
+- A part path must be relative and stay inside the entry's directory (no `..`, not absolute), and no part is listed twice (by real path): either stops the start with one line.
+- The parts listed after the entry run just before the command groups are derived from the `cmd_*` functions (`derive_action_groups()`), so a command's `.direct` marks are seen.
+- Today the manifest names the entry and the policy judge's two parts (slice S2): `switchboard/judge_request.py` (the request, the routine pre-filter, standing authority, the caches and the reply) and `switchboard/judge.py` (the judge, the judge socket and the plugin push). They are the text of the old region of the entry, unchanged, and run after the entry. `DEFAULTS["policy"] = None` stays in the entry at the region's old place, so the key order of `DEFAULTS` is as it was. Tests that scan the daemon's source read every file of the manifest.
 
 ## Running with no terminal multiplexer (#1072)
 
