@@ -18651,7 +18651,7 @@ class TestPlanningSkill(unittest.TestCase):
     def test_it_is_a_short_skill_with_the_frontmatter_the_others_have(self):
         text = self.SKILL.read_text()
         self.assertTrue(text.startswith("---\nname: fleet-planning\ndescription: "))
-        self.assertLessEqual(len(text.split()), 1100, "the skill must be cheap to load")
+        self.assertLessEqual(len(text.split()), 1200, "the skill must be cheap to load")
         for phrase in ("PLAN: <link>", "fleet-switchboard plan check", "plan review", "docs/plan-template.md", "discriminates", "What the reviewers attack"):
             self.assertIn(phrase, text)
         self.assertIn("not built yet", text)  # the review engine is part 2: said plainly
@@ -40494,6 +40494,102 @@ class TestPlanCheckSelection(unittest.TestCase):
         self.assertEqual(pick(None, None), ("", "issue body"))
 
 
+class TestPlanReceipts(unittest.TestCase):
+    """#978: one canonical plan comment edited in place, a short receipt per revision, a repost reported, the three documents pinned."""
+    H = "sha256:" + "a" * 64
+    PLAN = "## Plan (scenarios)\nplan-format: 2\n"
+
+    def receipt(self, cid, extra="", day=5):
+        return {"id": cid, "created_at": "2026-01-0%dT00:00:00Z" % day, "body": "<!-- plan-receipt -->\nplan hash: %s\nwhy it changed\nand what%s" % (self.H, extra)}
+
+    def plan(self, cid, day=1):
+        return {"id": cid, "created_at": "2026-01-0%dT00:00:00Z" % day, "body": self.PLAN}
+
+    def test_one_canonical_comment_with_two_receipts_passes_and_is_the_one_used(self):
+        comments = [self.plan(10), self.receipt(11, day=2), self.receipt(12, day=3)]
+        self.assertEqual(sb.plan_check.plan_comment_defects(comments), [])
+        self.assertEqual(sb.plan_check.select_plan_text("b", comments)[1], "comment 10")
+
+    def test_a_receipt_that_quotes_the_plan_heading_is_not_a_plan(self):
+        quoting = {"id": 13, "created_at": "2026-01-09T00:00:00Z", "body": "<!-- plan-receipt -->\nplan hash: %s\n## Plan (scenarios)\nx" % self.H}
+        self.assertEqual(sb.plan_check.select_plan_text("b", [self.plan(10), quoting])[1], "comment 10")
+
+    def test_a_reposted_plan_is_reported_naming_both_comments(self):
+        defects = sb.plan_check.plan_comment_defects([self.plan(10), self.plan(20, day=4)])
+        self.assertEqual([d["code"] for d in defects], ["second-plan-comment"])
+        self.assertIn("20", defects[0]["message"])
+        self.assertIn("10", defects[0]["message"])
+
+    def test_a_receipt_that_carries_plan_text_is_reported(self):
+        for extra in ("\n## Plan (scenarios)", "\nplan-format: 2", "\nscenarios:\n  - id: S1", "\n```yaml\nx\n```"):
+            with self.subTest(extra=extra):
+                defects = sb.plan_check.plan_comment_defects([self.plan(10), self.receipt(11, extra)])
+                self.assertEqual([d["code"] for d in defects], ["bad-receipt"])
+                self.assertIn("receipt carries plan text", defects[0]["message"])
+
+    def test_a_malformed_receipt_is_reported(self):
+        bad = {"id": 14, "created_at": "2026-01-09T00:00:00Z", "body": "<!-- plan-receipt -->\nno hash here\nreason"}
+        self.assertEqual([d["code"] for d in sb.plan_check.plan_comment_defects([bad])], ["bad-receipt"])
+
+    def test_no_receipts_and_one_plan_is_as_before(self):
+        self.assertEqual(sb.plan_check.plan_comment_defects([self.plan(10)]), [])
+        self.assertEqual(sb.plan_check.plan_comment_defects([]), [])
+
+    def test_the_defects_reach_the_result_of_load_plan(self):
+        class Reader:
+            def __init__(inner, comments):
+                inner.comments = comments
+
+            def _api(inner, path, repo):
+                return inner.comments if path.split("?")[0].endswith("/comments") else {"body": ""}
+        for comments, ok in (([self.plan(10), self.receipt(11)], True), ([self.plan(10), self.plan(20, day=4)], False)):
+            sb.fetch_plan(Reader(comments), "o/r", 1)
+            self.assertEqual(not sb.PLAN_COMMENT_DEFECTS, ok)
+
+    def documents(self):
+        texts = {"skill": (REPO / "skills" / "fleet-planning" / "SKILL.md").read_text(), "template": (REPO / "docs" / "plan-template.md").read_text()}
+        texts["brief"] = sb.load_plan_review().lane_brief("L1", "ref", "h", "plan", "intent", "dw")
+        return texts
+
+    def pinned(self, texts):
+        return all(sb.plan_check.PLAN_RULE in t for t in texts.values())
+
+    def test_the_three_documents_say_the_rule_once_in_the_same_words(self):
+        texts = self.documents()
+        self.assertTrue(self.pinned(texts))
+        for name, text in texts.items():
+            self.assertEqual(text.count(sb.plan_check.PLAN_RULE), 1, name)
+        self.assertEqual(sb.load_plan_review().PLAN_RULE, sb.plan_check.PLAN_RULE)
+
+    def test_the_pin_fails_when_the_sentence_is_removed_from_any_one_document(self):
+        for name in ("skill", "template", "brief"):
+            with self.subTest(removed=name):
+                texts = self.documents()
+                texts[name] = texts[name].replace(sb.plan_check.PLAN_RULE, "")
+                self.assertFalse(self.pinned(texts))
+
+    def test_a_mutant_that_treats_a_receipt_as_a_plan_is_caught(self):
+        quoting = {"id": 13, "created_at": "2026-01-09T00:00:00Z", "body": "<!-- plan-receipt -->\nplan hash: %s\n## Plan (scenarios)\nx" % self.H}
+        comments = [self.plan(10), quoting]
+        original = sb.load_plan_check().is_receipt
+        sb.load_plan_check().is_receipt = lambda comment: False
+        try:
+            self.assertNotEqual(sb.plan_check.select_plan_text("b", comments)[1], "comment 10")   # the mutant picks the receipt
+        finally:
+            sb.load_plan_check().is_receipt = original
+        self.assertEqual(sb.plan_check.select_plan_text("b", comments)[1], "comment 10")
+
+    def test_a_mutant_that_ignores_a_second_plan_comment_is_caught(self):
+        comments = [self.plan(10), self.plan(20, day=4)]
+        original = sb.load_plan_check()._is_plan_comment
+        sb.load_plan_check()._is_plan_comment = lambda comment: comment.get("id") == 10
+        try:
+            self.assertEqual(sb.plan_check.plan_comment_defects(comments), [])   # the mutant sees no repost
+        finally:
+            sb.load_plan_check()._is_plan_comment = original
+        self.assertEqual(len(sb.plan_check.plan_comment_defects(comments)), 1)
+
+
 class TestPlanCheckCommand(Base):
     """#135: the command: exit codes, the issue reader (injected), --file, --json. GETs only."""
 
@@ -40553,8 +40649,24 @@ class TestPlanCheckCommand(Base):
                          {"id": 12, "created_at": "2026-01-02T00:00:00Z", "body": "## Plan (scenarios) rev 2\n\n" + GOOD_PLAN[GOOD_PLAN.index("```yaml"):],
                           "user": {"login": "planner"}}]
         code, out, err = self.run_cmd("https://github.com/acme/app/issues/7")
-        self.assertEqual(code, 0, out + err)
+        self.assertEqual(code, 1, out + err)   # #978: a repost is a defect naming both comments; the latest is still the one read
         self.assertIn("source: comment 12 by planner of acme/app#7", out)
+        self.assertIn("comment 12 looks like a plan but comment 11 is already the plan", out)
+
+    def test_one_canonical_comment_with_two_receipts_passes_and_names_the_canonical_one(self):
+        h = "sha256:" + "b" * 64
+        receipt = "<!-- plan-receipt -->\nplan hash: %s\nwhat changed\nwhy" % h
+        self.issue["body"] = "## Intent\nx\nDone when: %s\n" % GOOD_DONE_WHEN
+        self.comments = [{"id": 11, "created_at": "2026-01-01T00:00:00Z", "body": "## Plan (scenarios)\n\n" + GOOD_PLAN[GOOD_PLAN.index("```yaml"):]},
+                         {"id": 12, "created_at": "2026-01-02T00:00:00Z", "body": receipt},
+                         {"id": 13, "created_at": "2026-01-03T00:00:00Z", "body": receipt}]
+        code, out, err = self.run_cmd("https://github.com/acme/app/issues/7")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("source: comment 11", out)
+        self.comments[2]["body"] += "\n## Plan (scenarios)"
+        code, out, err = self.run_cmd("https://github.com/acme/app/issues/7")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("receipt carries plan text", out)
 
     def test_an_issue_comment_url_picks_that_comment(self):
         self.comments = [{"id": 11, "created_at": "2026-01-01T00:00:00Z", "body": "## Plan (scenarios)\n\n" + GOOD_PLAN[GOOD_PLAN.index("```yaml"):]}]
