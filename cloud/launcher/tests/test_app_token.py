@@ -14,7 +14,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MINT = os.path.join(os.path.dirname(HERE), "app_token.py")
 TOKEN = "ghs_synthetic" + "Ab3Xy9" * 6
 REAL = "acme-org/widget-service"
-PERMS = {"contents": "write", "pull_requests": "write", "metadata": "read"}
+PERMS = {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"}
 PLANTED = "planted-secret-value-7Qz"
 
 
@@ -172,7 +172,7 @@ class Mint(unittest.TestCase):
         p = self.run_mint()
         self.assertEqual((p.returncode, p.stdout), (0, TOKEN), p.stderr)
         path, auth, body = Stub.seen[0]
-        self.assertEqual((path, body), ("/app/installations/678/access_tokens", {"repositories": ["widget-service"]}))
+        self.assertEqual((path, body), ("/app/installations/678/access_tokens", {"repositories": ["widget-service"], "permissions": PERMS}))
         head, claims, sig = auth.split()[1].split(".")
         pad = lambda s: base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
         c = json.loads(pad(claims))
@@ -220,7 +220,7 @@ class Mint(unittest.TestCase):
             self.assertNotIn(TOKEN, p.stderr)
 
     def test_refuses_extra_higher_or_missing_permissions(self):
-        cases = [dict(PERMS, issues="read"), dict(PERMS, administration="write"), dict(PERMS, contents="admin"),
+        cases = [dict(PERMS, issues="write"), dict(PERMS, administration="write"), dict(PERMS, contents="admin"),
                  dict(PERMS, metadata="write"), {"contents": "write", "metadata": "read"},
                  {"contents": "write", "pull_requests": "write"}, {}, None, ["contents"]]
         for perms in cases:
@@ -233,7 +233,7 @@ class Mint(unittest.TestCase):
             self.assertEqual(p.stdout, "")
             self.assertNotIn(TOKEN, p.stderr)
             self.assertEqual(len(p.stderr.strip().splitlines()), 1)
-        Stub.answer["permissions"] = dict(PERMS, issues="read")
+        Stub.answer["permissions"] = dict(PERMS, issues="write")
         self.assertIn("issues", self.run_mint().stderr)
 
     def test_a_planted_secret_in_the_commands_env_appears_nowhere(self):
@@ -421,7 +421,7 @@ class Mint(unittest.TestCase):
         auth = Stub.gets[0][1].split()
         self.assertEqual((auth[0], len(auth[1].split("."))), ("Bearer", 3))
         self.assertEqual(Stub.seen[0][1], Stub.gets[0][1])
-        self.assertEqual(Stub.seen[0][2], {"repositories": ["widget-service"]})
+        self.assertEqual(Stub.seen[0][2], {"repositories": ["widget-service"], "permissions": PERMS})
         self.assertEqual(len(Stub.seen), 1)
 
     def test_s3_a_repository_without_an_installation_is_refused_saying_so_with_no_token_request(self):
@@ -755,7 +755,7 @@ class Mint(unittest.TestCase):
         "owner id missing": lambda a: a["repositories"][0].pop("owner"),
         "owner id another": lambda a: a["repositories"][0].update(owner={"id": 10}),
         "long-lived": lambda a: a.update(expires_at=iso(86400)),
-        "extra permission": lambda a: a["permissions"].update(issues="read"),
+        "extra permission": lambda a: a["permissions"].update(issues="write"),
     }
 
     def revoking_run(self, text, mutate, **stub):
