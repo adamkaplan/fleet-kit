@@ -11258,6 +11258,9 @@ class TestLabHerdrShim(Base):
 import datetime  # noqa: E402  (this section's only import)
 
 FAKE_GH = "/fake/bin/gh"
+def is_floor_view(argv):
+    """A floor read of a pull request: a `pr view` of its files that is not `review record`'s own read (which also asks for the base name, #1047), so a test counting floor reads leaves the record out."""
+    return "files" in argv[-1] and "baseRefName" not in argv[-1]
 FAKE_REPO = "acme/fleet"
 # The judge tests were written for a judge that fires at 0.5 on every call; the defaults of issue 87 (the routine pre-filter, 0.9 for
 # three questions) are tested in TestJudgeAccuracy. These fixtures keep the earlier behaviour so those tests still say what they said.
@@ -36298,8 +36301,8 @@ class TestImpactRejudge(LedgerBase):
     def route(self, argv, **kwargs):
         if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
             number = int(argv[3])
-            if "files" in argv[-1]:
-                self.view_reads.append(number)   # the floor's own read (the ci recorder reads the pull request too: not counted)
+            if is_floor_view(argv):
+                self.view_reads.append(number)   # the floor's own read (the ci recorder and `review record`, which reads the files for a whole-read check #1047, are not counted)
             return subprocess.CompletedProcess(argv, 0, json.dumps(dict(self.pr, **self.prs.get(number, {}))), "")
         if argv[0] == FAKE_GH and "--method" in argv:
             method = argv[argv.index("--method") + 1]
@@ -74221,7 +74224,7 @@ class TestClearLine(TestImpactHold):
         return get
 
     def route(self, argv, **kwargs):
-        if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"] and "files" in argv[-1]:
+        if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"] and is_floor_view(argv):
             self.floor_reads.append(int(argv[3]))
         done = super().route(argv, **kwargs)
         if argv[0] == FAKE_GH and "--method" in argv and argv[argv.index("--method") + 1] == "POST" and argv[2].endswith("/comments"):
