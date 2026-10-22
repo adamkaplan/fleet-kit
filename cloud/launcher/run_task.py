@@ -6,7 +6,7 @@ usage: run-task WORKER OWNER/NAME BRANCH BRIEF_FILE [--pull-secret NAME] [--imag
 The target repository is an argument and has no default. The driver
   1. refuses at once on a missing or unreadable input, or when a worker of that name already exists (a replayed run
      changes nothing);
-  2. reads the model access entry (only the github-copilot entry of the OpenCode auth file) and a git token (the output of
+  2. reads the model access entry (only the github-copilot entry of OpenCode's own store, `opencode auth export`) and a git token (the output of
      CW_GIT_TOKEN_CMD, default: app_token.py OWNER/NAME beside this file, the one-hour GitHub App token), each in memory;
   3. creates the pod through the launcher, handing both values over inherited pipes (--run-secret-fd) so they travel to
      kubectl's stdin only; the server password comes back on a pipe too;
@@ -19,8 +19,8 @@ No secret is ever in an argument, an environment variable of a child, a file or 
 passes through the launcher's ONE scrub function. The only files are a 0700 temporary directory holding the
 port-forward's own log; the cluster login file is the launcher's (a path, never a token).
 
-Environment: CW_KUBE_CONTEXT or CW_CLOUD_SERVER + CW_CLOUD_TOKEN_FILE (as the launcher), CW_MODEL_AUTH_FILE (default
-~/.local/share/opencode/auth.json), CW_GIT_TOKEN_CMD, CW_WORKDIR (default /home/worker), CW_TMPDIR, CW_RUN_TIMEOUT
+Environment: CW_KUBE_CONTEXT or CW_CLOUD_SERVER + CW_CLOUD_TOKEN_FILE (as the launcher), CW_OPENCODE_BIN (default
+`opencode` on PATH), CW_GIT_TOKEN_CMD, CW_WORKDIR (default /home/worker), CW_TMPDIR, CW_RUN_TIMEOUT
 (1800 s), CW_HEALTH_TIMEOUT (180 s), CW_POLL_SECONDS (3), CW_PROGRESS_SECONDS (30), CW_LAUNCHER, CW_CREATE_TIMEOUT (900 s).
 
 The run record is written by the launcher's `stop` (cloud/launcher/run_record.py), which this driver calls on every end:
@@ -45,6 +45,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import model_credential  # noqa: E402
 import cloud_worker as cw  # noqa: E402  (the launcher's scrub and Kube: one place for each)
 
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
@@ -95,15 +96,10 @@ class Driver:
 
     # -- inputs --
     def model_entry(self):
-        path = self.env.get("CW_MODEL_AUTH_FILE") or os.path.expanduser("~/.local/share/opencode/auth.json")
         try:
-            with open(path) as f:
-                entry = json.load(f).get(MODEL_PROVIDER)
-        except (OSError, ValueError, AttributeError):
-            entry = None
-        if not entry or not isinstance(entry, dict):
-            raise cw.CloudError("the model auth file is missing, unreadable or has no %s entry; nothing was created" % MODEL_PROVIDER, cw.EXIT_USAGE)
-        return json.dumps({MODEL_PROVIDER: entry})
+            return model_credential.read_provider_entry(MODEL_PROVIDER, self.env)
+        except model_credential.ModelCredentialError as e:
+            raise cw.CloudError(str(e), cw.EXIT_USAGE) from None
 
     def git_token(self):
         raw = self.env.get("CW_GIT_TOKEN_CMD")
