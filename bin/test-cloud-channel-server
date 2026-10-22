@@ -54,8 +54,9 @@ def reviewer(token, audience):
 
 
 class Running:
-    def __init__(self, module, timeout=0.5, max_handlers=None, host="127.0.0.1"):
+    def __init__(self, module, timeout=0.5, max_handlers=None, host="127.0.0.1", deadline=None):
         module.REQUEST_TIMEOUT = timeout
+        module.TOTAL_DEADLINE = deadline if deadline is not None else 10.0
         self.inbox, self.lines = FakeInbox(), []
         self.host = host
         self.server = module.make_server((host, 0), reviewer, self.inbox, self.lines.append, max_handlers)
@@ -152,11 +153,12 @@ def check_auth_before_body(module, test):
 
 def check_big_body_413(module, test):
     with Running(module) as s:
-        status, raw = s.post(dict(GOOD, text="x" * (module.MAX_BODY + 10)), token="tok-a")
-        test.assertIn(status, (413,))
+        # headers only (the body is never sent), so the reply is read before any close or reset: exactly 413
+        status, _ = s.raw(request_bytes("tok-a", module.MAX_BODY + 10), wait=2.0)
+        test.assertEqual(status, 413)
         test.assertEqual(s.inbox.items, {})
-        status, _ = s.raw(request_bytes("tok-a", module.MAX_BODY + 1, b"x" * 100), wait=2.0)
-        test.assertIn(status, (413, None))
+        status, _ = s.raw(request_bytes("tok-a", module.MAX_BODY + 1), wait=2.0)
+        test.assertEqual(status, 413)
         test.assertEqual(s.inbox.items, {})
         test.assertTrue(any("status=413" in line for line in s.lines))
 
@@ -173,7 +175,7 @@ def check_boundaries(module, test):
         test.assertEqual(len(exact), module.MAX_BODY)
         test.assertEqual(s.post(exact)[0], 200)
         over = padded(module.MAX_BODY + 1)
-        test.assertEqual(s.raw(request_bytes("tok-a", len(over), over), wait=2.0)[0] or 413, 413)
+        test.assertEqual(s.raw(request_bytes("tok-a", len(over)), wait=2.0)[0], 413)
         test.assertEqual(s.raw(request_bytes("tok-a", -5), wait=2.0)[0], 400)
         test.assertEqual(s.raw(request_bytes("tok-a", "abc"), wait=2.0)[0], 400)
         test.assertEqual(s.raw(request_bytes("tok-a", "1_0"), wait=2.0)[0], 400)
@@ -195,9 +197,12 @@ def check_cap_503(module, test):
         held = [socket.create_connection(("127.0.0.1", s.port())) for _ in range(2)]
         try:
             time.sleep(0.3)
+            t0 = time.time()
             status, buf = s.raw(request_bytes("tok-a", 2, b"{}"), wait=1.0)
-            test.assertEqual(status, 503)
-            test.assertIn(b"cap of 2", buf)
+            # closed at once with no reply body: the accept thread does not wait on the client
+            test.assertIsNone(status)
+            test.assertLess(time.time() - t0, 0.9)
+            test.assertTrue(any("status=503" in l and "cap of 2" in l for l in s.lines), s.lines)
         finally:
             for c in held:
                 c.close()
@@ -233,6 +238,59 @@ def check_reserved_403(module, test):
         test.assertEqual(status, 403)
         status, _ = s.post(dict(GOOD, sender="CAPTAIN"), token="tok-captain")
         test.assertEqual(status, 403)
+        test.assertEqual(s.inbox.items, {})
+
+
+def check_unauthenticated_names_401(module, test):
+    with Running(module) as s:
+        for body in (dict(GOOD, sender="captain"), dict(GOOD, recipient="switchboard"), dict(GOOD, sender=["x"]),
+                     dict(GOOD, recipient={"a": 1})):
+            for token in ("tok-bad", "tok-secret-zz"):
+                status, raw = s.post(body, token=token)
+                test.assertEqual(status, 401, body)
+                test.assertNotIn(token, s.everything(raw))
+        test.assertFalse(any("reserved" in l or "not a string" in l or "status=403" in l or "status=400" in l
+                             for l in s.lines), s.lines)
+        test.assertEqual(s.inbox.items, {})
+
+
+def check_token_not_in_audit(module, test):
+    with Running(module) as s:
+        s.post(GOOD, token="tok-a")
+        s.post(dict(GOOD, sender="captain"), token="tok-a")
+        s.post(dict(GOOD, sender=["x"]), token="tok-a")
+        s.raw(request_bytes("tok-a", module.MAX_BODY + 5), wait=2.0)
+        s.raw(request_bytes("tok-a", 3, b"{}x", b"Transfer-Encoding: chunked\r\n"), wait=2.0)
+        s.raw(request_bytes("tok-a", "abc"), wait=2.0)
+        s.raw(request_bytes("tok-a", 100, b"{"), wait=2.0)
+        s.post(GOOD, token="tok-bad")
+        test.assertGreaterEqual(len(s.lines), 6)
+        test.assertFalse([l for l in s.lines if "tok-a" in l or "tok-bad" in l or "Bearer" in l], s.lines)
+
+
+def check_total_deadline(module, test):
+    with Running(module, timeout=2.0, deadline=0.6) as s:
+        sock = socket.create_connection(("127.0.0.1", s.port()), timeout=5)
+        try:
+            sock.sendall(request_bytes("tok-a", 50))
+            t0, buf = time.time(), b""
+            try:
+                while time.time() - t0 < 4 and b"\r\n\r\n" not in buf:
+                    sock.sendall(b"{")   # one byte per read: never trips the per-read timeout
+                    sock.settimeout(0.2)
+                    try:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            break
+                        buf += chunk
+                    except socket.timeout:
+                        pass
+            except OSError:
+                pass
+        finally:
+            sock.close()
+        test.assertTrue(buf.split(b"\r\n")[0].endswith(b"408 Request Timeout"), buf)
+        test.assertLess(time.time() - t0, 2.0)
         test.assertEqual(s.inbox.items, {})
 
 
@@ -317,8 +375,13 @@ CHECKS = [
     ("non_string_names", check_non_string_names, "if not all(isinstance(n, str) for n in names):", "if False:"),
     ("reserved_403", check_reserved_403, "if any(n.strip().casefold() in RESERVED for n in names):", "if False:"),
     ("reserved_normalised", check_reserved_403, "n.strip().casefold() in RESERVED", "n in RESERVED"),
-    ("delivers", check_delivers, "cloud_channel.handle({", "dict({"),
-    ("bad_json_400", check_bad_json_400, "if not isinstance(body, dict):", "if False:"),
+    ("unauth_names_401", check_unauthenticated_names_401, "                if probe[\"status\"] in (401, 503):", "                if False:"),
+    ("audit_token", check_token_not_in_audit, "audit(\"refused status=%d reason=%s\" % (status, reason))", "audit(\"refused status=%d reason=%s %s\" % (status, reason, self.headers.get(\"Authorization\")))"),
+    ("audit_token_names", check_token_not_in_audit, "audit(\"refused status=%d reason=%s\" % (refusal[0], refusal[2]))", "audit(\"refused status=%d reason=%s %s\" % (refusal[0], refusal[2], header))"),
+    ("total_deadline", check_total_deadline, "            timer = threading.Timer(self.deadline, self._expire)\n            timer.daemon = True\n            timer.start()", "            timer = threading.Timer(10 ** 6, self._expire)\n            timer.daemon = True\n            timer.start()"),
+    ("cap_503_audit", check_cap_503, "self.audit(\"refused status=503", "(lambda line: None)(\"refused status=503"),
+    ("delivers", check_delivers, "result = cloud_channel.handle({", "result = dict({"),
+    ("bad_json_400", check_bad_json_400, "            if isinstance(body, dict):\n                names", "            if True:\n                names"),
     ("only_message_post", check_only_message_post, "if self.path != \"/message\":", "if False:"),
     ("bind", check_bind, "_Server(address, Handler,", "_Server((\"0.0.0.0\", address[1]), Handler,"),
     ("configured_only", check_configured_only, "if address is None:\n        raise", "if False:\n        raise"),

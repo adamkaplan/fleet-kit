@@ -17,12 +17,15 @@ What is read, in order, and what is refused at each step (every refusal made bef
     3. Any Transfer-Encoding header: 400 (only a Content-Length body is accepted). A Content-Length that is not plain digits: 400.
        A declared length over MAX_BODY: 413. Neither is read.
     4. Exactly Content-Length bytes (at most MAX_BODY) are read; a missing Content-Length means an empty body, which is a 400.
-       A body that stalls or is short for longer than REQUEST_TIMEOUT seconds: 408.
+       A body that stalls or is short for longer than REQUEST_TIMEOUT seconds on one read, or whose connection has lived
+       longer than TOTAL_DEADLINE seconds in all (headers and body, so a trickling client cannot hold a slot): 408.
+       (A deadline that falls while headers are still arriving drops the connection without a reply.)
     5. A body that is not a JSON object: 400. A sender or recipient that is not a string: 400. A sender or recipient that is
-       reserved (RESERVED, compared stripped and case-folded): 403. This check runs after the body is read, before the token
-       is judged, so an unauthenticated-but-bearer request may see 403.
+       reserved (RESERVED, compared stripped and case-folded): 403. The token is judged first: the request is run through
+       cloud_channel.handle with an empty body, and a 401 or 503 from that is the answer, so an unauthenticated caller never
+       sees a 400 or 403 for names and writes no such audit line.
     6. cloud_channel.handle decides the rest (token, identity, delivery).
-Concurrency: at most MAX_HANDLERS requests are handled at once; one more gets 503 naming the cap. Handler threads are daemons.
+Concurrency: at most MAX_HANDLERS requests are handled at once; one more is audited and closed (503, no reply body, so the accept thread never waits on a client). Handler threads are daemons.
 The listener starts only when configured: `listen_address(environ)` gives None for unset or malformed, and `serve` then
 refuses to start. No token or key is stored here and none is ever echoed or logged.
 """
@@ -37,7 +40,8 @@ import cloud_channel
 MAX_BODY = 32768
 RESERVED = frozenset({"captain", "switchboard", "fleet-switchboard", "hub", "admin"})
 LISTEN_ENV = "FLEET_CLOUD_CHANNEL_LISTEN"
-REQUEST_TIMEOUT = 5.0
+REQUEST_TIMEOUT = 5.0   # per socket read
+TOTAL_DEADLINE = 10.0   # wall clock for one whole connection, headers and body together
 MAX_HANDLERS = 32
 BEARER = cloud_channel.BEARER
 
@@ -45,20 +49,16 @@ BEARER = cloud_channel.BEARER
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, handler, max_handlers):
+    def __init__(self, address, handler, max_handlers, audit=lambda line: None):
         super().__init__(address, handler)
+        self.audit = audit
         self.max_handlers = max_handlers
         self._slots = threading.Semaphore(max_handlers)
 
     def process_request(self, request, client_address):
         if not self._slots.acquire(blocking=False):
-            data = json.dumps({"status": 503, "error": "busy: at the cap of %d concurrent requests" % self.max_handlers}).encode()
-            try:
-                request.settimeout(1)
-                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n"
-                                b"Connection: close\r\nContent-Length: " + str(len(data)).encode() + b"\r\n\r\n" + data)
-            except OSError:
-                pass
+            # no reply on the accept thread (a slow client must not stall accepting): audit, then close without a body
+            self.audit("refused status=503 reason=busy: at the cap of %d concurrent requests" % self.max_handlers)
             self.shutdown_request(request)
             return
         super().process_request(request, client_address)
@@ -86,6 +86,25 @@ def make_server(address, reviewer, inbox, audit, max_handlers=None):
 
     class Handler(BaseHTTPRequestHandler):
         timeout = REQUEST_TIMEOUT
+        deadline = TOTAL_DEADLINE
+        expired = False
+
+        def _expire(self):
+            self.expired = True
+            self.close_connection = True
+            try:   # wakes a blocked read (it then sees end of input); the write side stays open for the 408
+                self.connection.shutdown(socket.SHUT_RD)
+            except OSError:
+                pass
+
+        def handle(self):
+            timer = threading.Timer(self.deadline, self._expire)
+            timer.daemon = True
+            timer.start()
+            try:
+                super().handle()
+            finally:
+                timer.cancel()
 
         def log_message(self, *args):   # the default line could carry request data
             pass
@@ -125,6 +144,8 @@ def make_server(address, reviewer, inbox, audit, max_handlers=None):
                 return self._refuse_early(413, "body too large", "body too large")
             try:
                 raw = self.rfile.read(declared)
+                if len(raw) < declared and self.expired:
+                    raise TimeoutError("deadline")
                 if len(raw) < declared:
                     raise TimeoutError("short body")
             except (TimeoutError, socket.timeout):
@@ -133,20 +154,28 @@ def make_server(address, reviewer, inbox, audit, max_handlers=None):
                 body = json.loads(raw.decode("utf-8"))
             except ValueError:
                 body = None
-            if not isinstance(body, dict):
-                audit("refused status=400 reason=body is not a JSON object")
-                return self._send(400, {"status": 400, "error": "no body"})
-            names = (body.get("sender"), body.get("recipient"))
-            if not all(isinstance(n, str) for n in names):
-                audit("refused status=400 reason=sender or recipient is not a string")
-                return self._send(400, {"status": 400, "error": "sender and recipient must be strings"})
-            if any(n.strip().casefold() in RESERVED for n in names):
-                audit("refused status=403 reason=reserved name")
-                return self._send(403, {"status": 403, "error": "reserved name"})
+            refusal = None
+            if isinstance(body, dict):
+                names = (body.get("sender"), body.get("recipient"))
+                if not all(isinstance(n, str) for n in names):
+                    refusal = (400, "sender and recipient must be strings", "sender or recipient is not a string")
+                elif any(n.strip().casefold() in RESERVED for n in names):
+                    refusal = (403, "reserved name", "reserved name")
+            if refusal:
+                # judge the token first: handle() with an empty body stops right after authentication (403 for a good
+                # token, 401/503 otherwise); only an unauthenticated verdict is returned, with its own audit line
+                seen = []
+                probe = cloud_channel.handle({"authorization": header, "body": {}}, reviewer, inbox, seen.append)
+                if probe["status"] in (401, 503):
+                    for line in seen:
+                        audit(line)
+                    return self._send(probe["status"], probe)
+                audit("refused status=%d reason=%s" % (refusal[0], refusal[2]))
+                return self._send(refusal[0], {"status": refusal[0], "error": refusal[1]})
             result = cloud_channel.handle({"authorization": header, "body": body}, reviewer, inbox, audit)
             self._send(result["status"], result)
 
-    return _Server(address, Handler, max_handlers or MAX_HANDLERS)
+    return _Server(address, Handler, max_handlers or MAX_HANDLERS, audit)
 
 
 def serve(environ, reviewer, inbox, audit):
