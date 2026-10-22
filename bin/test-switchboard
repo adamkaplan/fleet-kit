@@ -15770,6 +15770,7 @@ class TestCharterSetGuard(TestOneCharter):  # (re-runs the parent class's tests:
 
     def test_non_orchestrator_is_refused_and_audited(self):
         self.world.add_agent("worker", fleet={"role": "coder", "reports_to": "orch-b", "repo": self.REPO})
+        self.registry.upsert(self.world.state, "worker", {"session": "s-w", "pane": self.world.panes["worker"], "role": "coder", "charter": None, "repo": self.REPO})
         code, out, err = self.run_as("cos", "charter", "set", "worker", "3")
         self.assertIn(code, (1, 2))
         self.assertIn("not an orchestrator", err)
