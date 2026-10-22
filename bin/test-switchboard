@@ -18549,7 +18549,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
         registers. This is what each command says beside itself: the expected sets are DERIVED from it, never kept as a list in a test."""
         declared = {"direct": set(), "ledger": set(), "ensure_on_use": set()}
         registered = TestSelfRegisteringCli.commands()[0].commands
-        tree = ast.parse(SWITCHBOARD.read_text())
+        tree = ast.parse(switchboard_source())
         plain = {id(node) for node in tree.body}
         for node in ast.walk(tree):    # a declaration written any other way would be invisible to the scan AND to the views: refuse it
             if isinstance(node, ast.Assign) and any(isinstance(x, ast.Attribute) and x.attr in declared and isinstance(x.value, ast.Name)
