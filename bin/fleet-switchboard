@@ -170,6 +170,7 @@ HELPER_MODULES = {   # the old `load_<module>()` names: each returns `load_modul
     "load_agent_calls": "agent_calls",
     "load_triage_digest": "triage_digest",
     "load_dead_hint": "dead_hint",
+    "load_endpoint_liveness": "endpoint_liveness",
     "load_fleet_health": "fleet_health",
 }
 
@@ -7144,7 +7145,7 @@ def pane_health_pass(engine, now):
     data = read_pane_health(engine.state_dir)
     states, missing = data["states"], data["missing"]
     agents = {n: {k: v for k, v in row.items() if k in registry.AGENT_FIELDS} for n, row in reg["agents"].items()
-              if isinstance(row, dict) and (row.get("kind") or "local") == "local"}   # the agent list is the registry's; a cloud worker has no pane to judge
+              if isinstance(row, dict) and (row.get("kind") or "local") == "local" and not registry.no_pane_to_judge(row)}   # the agent list is the registry's; a row with no pane to judge (#1181) is never in it
     registered = {n: row for n, row in reg["agents"].items() if isinstance(row, dict)}
     retired = reg["retired"]
     retired_whole = True
@@ -7152,6 +7153,8 @@ def pane_health_pass(engine, now):
     sessions = [o.session_id for o in discovery.agents.values()]
     budget = PANE_CHECKS_PER_PASS
     for name, obs in sorted(discovery.agents.items()):
+        if registry.no_pane_to_judge(registered.get(name)):   # #1181: a row with no pane to judge is not judged by a pane (a discovered cloud agent included)
+            continue
         if obs.headless:   # no terminal now (#433): a pane verdict it was given while a `watch` terminal was open is stale, and is dropped with its alert (also while the service is unreadable: `unknown` carries no pane verdict)
             for table in (agents, states, missing):
                 table.pop(name, None)
@@ -7233,7 +7236,14 @@ def pane_health_pass(engine, now):
     for table in (states, missing):   # a state or a missing count for a name the registry does not list (retired, retired-and-removed) and discovery does not show is an orphan: it goes
         for name in [n for n in table if n not in agents and n not in discovery.agents]:
             table.pop(name, None)
-    engine.pane_alerts = {n: v for n, v in states.items() if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n in agents and n not in retired}
+    engine.pane_alerts = {n: v for n, v in states.items() if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n in agents and n not in retired
+                          and not registry.no_pane_to_judge(registered.get(n))}
+    judged_by_endpoint = {n: row for n, row in registered.items() if registry.no_pane_to_judge(row) and row.get("endpoint") is not None and n not in retired}
+    try:   # #1181: alive with the time, or unknown; one bounded request per row per pass; never a verdict that removes or alerts
+        engine.row_liveness = load_endpoint_liveness().check_all(judged_by_endpoint, get=getattr(engine, "liveness_get", None),
+                                                                 token_path=getattr(engine, "liveness_token_path", None)) if judged_by_endpoint else {}
+    except Exception:
+        engine.row_liveness = {}
     if retired_whole:   # a retired agent (name AND session) leaves the record the pane draws from; its session stays in retired.json for reattach and --undo
         for name in [n for n in agents if retired_agent(retired, n, agents[n].get("session"))]:
             for table in (agents, states, missing):
@@ -7536,7 +7546,11 @@ class PaneFacts:
             return []
         chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff")
         out = []
+        registry = load_module("registry")
+        registered = registry.read(engine.state_dir)["agents"] if engine.state_dir is not None else {}
         for name, info in sorted(alerts.items()):
+            if registry.no_pane_to_judge(registered.get(name)):   # #1181: no pane to judge: never an alert
+                continue
             word = "DETACHED" if info["state"] == PANE_DETACHED else "DEAD"
             summary = ("%s is %s: pane %s, session %s (%s). Repair it with `%s reattach %s`; if the session is gone, `relaunch` is the next step."
                        % (name, word, info.get("pane"), info.get("session"), _one_line(info.get("why"), 120), PROG, name))
@@ -7682,7 +7696,7 @@ def pane_health_status_lines(state_dir, now=None):
     retired = seen["retired"]
     # A dead agent is never drawn (#919, S10): the reconcile on read (run by `collect_status` first) removes the provably dead one, and one it could not remove is
     # still not drawn as dead. The view reads only the registry: an agent it does not hold has no row, and a read that is not whole says so above.
-    bad = [(n, v) for n, v in sorted(seen["agents"].items()) if v.get("state") == PANE_DETACHED and n not in retired]
+    bad = [(n, v) for n, v in sorted(seen["agents"].items()) if v.get("state") == PANE_DETACHED and n not in retired and not load_module("registry").no_pane_to_judge(v)]
     clock = time.time() if now is None else now
     last = _read_small(state_dir, LAST_REPORT_FILE)
     gone = [n for n, v in sorted(retired.items()) if clock - (v.get("at") or 0) <= RETIRED_SHOW_DAYS * 86400]
@@ -7889,7 +7903,8 @@ def cmd_reattach_all(args, runner, now, socket_call=None):
     if not listed["whole"]:
         sys.stderr.write("%s: the agent registry could not be read (%s): nothing reattached\n" % (PROG, _one_line(str(listed["problem"]), 120)))
         return EXIT_ERROR
-    names = sorted(n for n, v in listed["agents"].items() if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in listed["retired"])
+    names = sorted(n for n, v in listed["agents"].items() if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in listed["retired"]
+                   and not load_module("registry").no_pane_to_judge(v))
     if not names:
         print("no agent is detached or dead")
         return EXIT_OK
