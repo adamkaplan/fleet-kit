@@ -51,6 +51,8 @@ request, records what you returned and fixes what you find; an independent revie
 
 For a change that handles credentials, permissions or a privileged script, report in ONE message every defect you find across the whole diff, each as a normal finding with its rule id, found by asking of each new branch, function or call what happens when it fails, is killed, is slow, gets odd or encoded data, runs twice, or cannot read its input (the checklist questions, through your own lens; where the repository has docs/adversarial-checklist.md, read it at the base commit, otherwise judge by these questions); if the budget below runs out first, answer `incomplete` naming the part you did not reach.
 
+Durable work (a script, a note, anything you need tomorrow) goes in `FLEET_SCRATCH`: your own private directory, which no clean-up removes while you run. The temp directory is for throwaway output only.
+
 ## How
 
 Run every shell command **bare**: one command per call, no pipe (`| head`), no redirect (`2>&1`, `>`), no `cd X &&` chain. The permissions match the command exactly as written and refuse anything compound; `fleet-switchboard review laws <pr>` and `gh pr diff <pr>` already print what you need.

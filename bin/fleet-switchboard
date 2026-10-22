@@ -341,6 +341,7 @@ DEFAULTS = {
     "send_to_working": "steer",     # a boss's `send` to a working agent: "steer" (its next safe point) or "queue" (after its turn)
     "engaged_minutes": 10,
     "retire_idle_minutes": 10,     # `retire --close`: a pane herdr reads as working is closed without --force only when its session has had no turn and no activity this long
+    "scratch_retention_days": 14,  # #948: how long a retired agent's private scratch directory is kept before `disk reclaim-scratch --apply` removes it
     "call_timeout_seconds": 20,
     "clear_remind_minutes": 15,    # #827: a cleared, mergeable pull request with gates READY that the lane has not merged this long gets ONE reminder per head
     "send_timeout_seconds": 60,    # `send` as a whole (the sum of its v2 and herdr calls): past it, a clear failure line, never a silent minutes-long wait
@@ -591,6 +592,9 @@ def validate_config(raw, source="config"):
     if config["send_to_working"] not in ("steer", "queue"):
         raise ConfigError("%s: 'send_to_working' must be \"steer\" or \"queue\", got %r"
                           % (source, config["send_to_working"]))
+    days = config["scratch_retention_days"]
+    if isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 3650:
+        raise ConfigError("%s: 'scratch_retention_days' must be a whole number of days (0 to 3650), got %r" % (source, days))
     if config["launch_default"] not in ("headless", "terminal"):
         raise ConfigError("%s: 'launch_default' must be \"headless\" or \"terminal\", got %r" % (source, config["launch_default"]))
     executable = config["opencode_executable"]
@@ -887,19 +891,17 @@ def ensure_state_dir(path=None):
     than repaired: something changed it, and that deserves a person's look.
     """
     path = Path(path) if path else state_dir_path()
-    if not path.exists():
-        try:
-            path.mkdir(parents=True, mode=0o700)
-        except FileExistsError:
-            pass   # another process (three `heavy` wrappers started together) made it between the look and the mkdir: checked below like any existing one
-        else:
-            os.chmod(str(path), 0o700)  # mkdir's mode is filtered by the umask; only the process that made it sets it
-    info = path.stat()
-    if not path.is_dir():
-        raise ConfigError("state path is not a directory: %s" % path)
-    if info.st_uid != os.getuid() or info.st_mode & 0o077:
-        raise ConfigError("state directory must be private (mode 0700, owned by you): %s" % path)
-    return path
+    return _make_dir(path, ConfigError)
+
+
+def _make_dir(path, error, **options):
+    """Make a directory through the one helper (bin/private_dir.py, #708): atomic against another process, a dangling symlink refused, the
+    owner and mode checked for a private one. The helper's refusal becomes `error` (one line, same text); any other OSError passes as it is."""
+    module = load_module("private_dir")
+    try:
+        return module.ensure_dir(path, **options)
+    except module.PrivateDirError as err:
+        raise error(str(err)) from None
 
 
 # ------------------------------------------------------------------ the faults
@@ -6282,6 +6284,78 @@ def agent_tmp_shared_name(name):
     return name == "cos" or (name or "").startswith(LANE_NAME_PREFIX)
 
 
+SCRATCH_ENV = "FLEET_SCRATCH"   # the agent's private scratch directory (#948): durable work goes there, the temp directory is for throwaway output
+SCRATCH_DIR = "scratch"         # under the user's own state area: <state>/scratch/<agent>
+SCRATCH_RETENTION_DAYS = 14     # how long a retired agent's scratch directory is kept before the audited step removes it
+
+
+def scratch_root(engine):
+    """The user's own state area: <state>/scratch. None when there is no state directory (a caller that has none)."""
+    if getattr(engine, "state_dir", None) is None:
+        return None
+    return Path(engine.state_dir) / SCRATCH_DIR
+
+
+def agent_scratch_path(engine, name):
+    """The agent's private scratch directory: <state>/scratch/<name>. None when there is no state directory or the name is not an agent name."""
+    root = scratch_root(engine)
+    if root is None or not NAME_RE.fullmatch(name or ""):
+        return None
+    return root / name
+
+
+def agent_scratch_env(engine, name):
+    """{FLEET_SCRATCH: dir}: the agent's own scratch directory (0700, owned by the user, never through a symlink), made now with the one
+    private-directory helper (#708). A path that is not safe refuses the launch (LaunchError, one line naming the path): a symlink at the path or at
+    the scratch root, a directory of another user, a loose mode, or a name that is not an agent name. {} when there is no state directory."""
+    root = scratch_root(engine)
+    if root is None:
+        return {}
+    path = root / name
+    if not NAME_RE.fullmatch(name or ""):
+        raise LaunchError("the scratch path %s is outside the state area: not a valid agent name (%r)" % (path, name))
+    helper = load_module("private_dir")
+    try:
+        link = os.lstat(str(path))
+    except FileNotFoundError:
+        link = None
+    if link is not None and stat.S_ISLNK(link.st_mode) and os.path.exists(str(path)):
+        raise LaunchError("the scratch path %s is a symbolic link: not following it (remove it or point it at a directory)" % path)
+    if link is not None and link.st_uid != os.getuid():
+        raise LaunchError("the scratch path %s belongs to another user: it is not used" % path)
+    try:
+        found = os.lstat(str(root))     # the scratch root itself: a real directory of ours, never a symlink
+    except FileNotFoundError:
+        found = None
+    if found is not None and not stat.S_ISLNK(found.st_mode) and (not stat.S_ISDIR(found.st_mode) or found.st_uid != os.getuid()):
+        raise LaunchError("the scratch root %s is not a private directory of yours: no scratch directory was made" % root)
+    try:
+        helper.ensure_dir(path, private=True)   # the one way a directory is made (#708): atomic, a dangling link refused, the owner and the mode checked
+    except helper.PrivateDirError as err:
+        raise LaunchError("the private scratch directory %s cannot be used (%s): %s was not started" % (path, _one_line(str(err), 160), name)) from None
+    except OSError as err:
+        raise LaunchError("the private scratch directory %s cannot be made (%s): %s was not started" % (path, err.strerror or err, name)) from None
+    return {SCRATCH_ENV: str(path)}
+
+
+def scratch_brief(brief, path):
+    """The brief the agent receives, with one line naming its private scratch directory: durable work goes there, the temp directory is for throwaway output."""
+    if not path:
+        return brief
+    line = "SCRATCH:  %s=%s -- durable work goes in this directory; the temp directory is for throwaway output only." % (SCRATCH_ENV, path)
+    if not brief:
+        return line
+    return brief.rstrip("\n") + "\n\n" + line + "\n"
+
+
+def scratch_retention_days(config):
+    """How many days a retired agent's scratch directory is kept before the audited step removes it. The config value, or the default."""
+    days = (config or {}).get("scratch_retention_days")
+    if isinstance(days, bool) or not isinstance(days, int) or days < 0:
+        return SCRATCH_RETENTION_DAYS
+    return days
+
+
 def agent_tmp_env(engine, name):
     """{FLEET_AGENT_TMPDIR: dir} for a pane: a private directory (0700) named from the agent, made now under the profile's temp root. {} when panes
     have no wrapper. A directory that cannot be made fails the launch (LaunchError): the agent is never started on the shared directory."""
@@ -6292,7 +6366,7 @@ def agent_tmp_env(engine, name):
         raise LaunchError("no private temp directory for %r: not a valid agent name" % (name,))
     path = root / name
     try:
-        root.mkdir(parents=True, exist_ok=True)
+        load_module("private_dir").ensure_dir(root, check=False)
         try:
             path.mkdir(mode=0o700)
         except FileExistsError:
@@ -6361,6 +6435,8 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
     env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
     env.update(view_env(role, repo or (engine.config.get("intent_repo") if charter else None)))  # PR 18
     env.update(agent_tmp_env(engine, name))   # #767: before the session exists, so a failure leaves nothing started
+    scratch = agent_scratch_env(engine, name)   # #948: the agent's own scratch directory, made before the session exists
+    env.update(scratch)
     accounts = getattr(engine, "accounts", None)
     if repo and accounts is not None:  # PR 15: the agent works as its repo's gh account, and as nobody else
         problem = launch_account_problem(engine.config, accounts, repo)
@@ -6386,7 +6462,7 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
             result["tab"] = opened["tab_id"]
         wait_until_verified(engine, pane, session_id, patience, sleep)
         if brief:
-            send_brief(engine, name, session_id, brief)
+            send_brief(engine, name, session_id, scratch_brief(brief, scratch.get(SCRATCH_ENV)))
     except Exception as err:
         left = close_own_pane(engine, name, pane, "launch failed: %s" % _one_line(str(err), 120)) if pane \
             else "no pane was opened"
@@ -6428,6 +6504,8 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
         raise LaunchError("; ".join(problems))
     if engine.state_dir is None:
         raise LaunchError("no state directory: a headless worker needs its record")
+    scratch = agent_scratch_env(engine, name)   # #948: the agent's own scratch directory, made before the session exists
+    brief = scratch_brief(brief, scratch.get(SCRATCH_ENV))
     try:
         with agent_lock(engine.state_dir, name):   # the name check, the session create and the record write are ONE step: two launches of one name cannot both pass
             taken = engine.discover(engine.now()).agents.get(name)
@@ -6626,6 +6704,7 @@ def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, 
     repo = fleet.get("repo") or (engine.config.get("intent_repo") if fleet.get("charter") else None)
     env.update(view_env(fleet.get("role"), repo))  # PR 18
     env.update(agent_tmp_env(engine, name))   # #767
+    env.update(agent_scratch_env(engine, name))   # #948: the agent's own scratch directory, made before the pane opens
     accounts = getattr(engine, "accounts", None)
     if fleet.get("repo") and accounts is not None:
         try:
@@ -8453,6 +8532,11 @@ def cmd_retire(args, runner, now):
     except Exception as err:   # the retirement above is already written: a reclaim problem is said, never a traceback
         sys.stderr.write("%s: worktree reclaim failed (%s): the agent is retired; run `%s disk reclaim-worktrees --apply` to retry\n" % (PROG, _one_line(str(err), 100), PROG))
     try:
+        for line in scratch_retire_lines(engine, name, now()):   # its scratch directory (#948): kept, never removed here, and the day it will be removed is said
+            print("scratch: " + line)
+    except Exception as err:   # the retirement is already written: said, never a traceback
+        sys.stderr.write("%s: the scratch directory was not named (%s): the agent is retired; its scratch directory is kept, never removed by the retire\n" % (PROG, _one_line(str(err), 100)))
+    try:
         for line in reclaim_agent_tmp(engine, name, headless=headless_kept is not None):   # its private TMPDIR (#767): removed when empty, else kept with the reason
             print("tmpdir: " + line)
     except Exception as err:   # the retirement is already written: said, never a traceback
@@ -8474,6 +8558,96 @@ WORKTREE_RECLAIM_MAX = 20     # worktrees looked at per call: a pass or a comman
 # Ignored files that are regenerable build output: deleting them with the worktree loses nothing. ANY OTHER ignored file (.env, local config, data)
 # is unrecoverable local state, so its worktree is kept.
 IGNORED_SAFE = ("node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist", "build", ".venv", "venv", ".DS_Store", ".tox")
+
+
+def scratch_retire_lines(engine, name, now=None):
+    """At retire: the agent's scratch directory is KEPT (never removed here, never loosened); the line says where it is and the day the audited
+    step will remove it."""
+    path = agent_scratch_path(engine, name)
+    if path is None:
+        return []
+    days = scratch_retention_days(getattr(engine, "config", None))
+    when = (time.time() if now is None else now) + days * 86400
+    return ["%s: kept (durable work lives here; `disk reclaim-scratch --apply` removes it after %d day(s), on %s)"
+            % (path, days, time.strftime("%Y-%m-%d", time.gmtime(when)))]
+
+
+def _remove_scratch_tree(path):
+    """Remove the directory and what is in it, never following a symlink: a link is removed, its target is not touched."""
+    for entry in sorted(os.listdir(str(path))):
+        child = Path(path) / entry
+        if os.path.islink(str(child)):
+            os.unlink(str(child))
+        elif os.path.isdir(str(child)):
+            _remove_scratch_tree(child)
+        else:
+            os.unlink(str(child))
+    os.rmdir(str(path))
+
+
+def reclaim_scratch_dirs(engine, now=None, apply=False):
+    """The ONE audited step that removes a retired agent's scratch directory (#948): only when the agent was retired longer than the retention
+    (scratch_retention_days, default 14), never for a registered agent, never through a symlink. Returns one line per directory (removed, or
+    would be removed)."""
+    root = scratch_root(engine)
+    state = getattr(engine, "state_dir", None)
+    if root is None or state is None or not os.path.isdir(str(root)):
+        return []
+    days = scratch_retention_days(getattr(engine, "config", None))
+    cutoff = (time.time() if now is None else now) - days * 86400
+    try:
+        got = registry_read(state)
+    except Exception as err:
+        raise LaunchError("the agent registry cannot be read (%s): no scratch directory was removed" % _one_line(str(err), 100)) from None
+    live = set((got.get("agents") or {}).keys())
+    retired = got.get("retired") or {}
+    lines = []
+    for name in sorted(os.listdir(str(root))):
+        if name in live:
+            continue    # a registered agent: its scratch directory is never removed
+        entry = retired.get(name) if isinstance(retired.get(name), dict) else {}
+        at = entry.get("at")
+        if isinstance(at, bool) or not isinstance(at, (int, float)):
+            continue    # a retirement time that cannot be read counts as recent: the doubt keeps
+        if at > cutoff:
+            continue    # not due yet
+        path = root / name
+        try:
+            found = os.lstat(str(path))
+        except OSError:
+            continue
+        if stat.S_ISLNK(found.st_mode):
+            lines.append("%s: kept (it is a symbolic link: not following it)" % path)
+            continue
+        if not stat.S_ISDIR(found.st_mode):
+            lines.append("%s: kept (it is not a directory)" % path)
+            continue
+        if apply:
+            try:
+                _remove_scratch_tree(path)
+            except OSError as err:
+                lines.append("%s: kept (%s)" % (path, err.strerror or err))
+                continue
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "scratch.removed", name, {"path": str(path), "retired_at": int(at), "days": days})
+            lines.append("%s: removed (retired %d day(s) ago; the retention is %d day(s))" % (path, int((time.time() if now is None else now) - at) // 86400, days))
+        else:
+            lines.append("%s: would be removed (retired %d day(s) ago; the retention is %d day(s))" % (path, int((time.time() if now is None else now) - at) // 86400, days))
+    return lines
+
+
+def cmd_disk_reclaim_scratch(args, runner, now):
+    """`disk reclaim-scratch [--apply]`: the scratch directories of the agents retired longer than the retention (scratch_retention_days, default 14).
+    A dry run by default; `--apply` is the operator's or the Chief of Staff's. Never a registered agent's, never through a symlink. Each removal is
+    one `scratch.removed` audit line."""
+    engine, state, config = build_engine(runner, now, "cli", writable=bool(args.apply))
+    if args.apply:
+        kind = gates_caller_kind(runner, now)
+        if not (kind[0] == "person" or (kind[0] == "agent" and len(kind) > 2 and kind[2] == "chief-of-staff")):
+            raise LaunchError("refused: only the operator or the Chief of Staff may --apply the scratch reclaim (%s is %s)" % (kind[1], "an agent" if kind[0] == "agent" else "not known"))
+    for line in reclaim_scratch_dirs(engine, now(), bool(args.apply)):
+        print(line)
+    return EXIT_OK
 
 
 def worktree_config(config):
@@ -18260,7 +18434,7 @@ class GitHubHub:
 
     def log_path(self, watch):
         directory = self.state_dir / "logs"
-        directory.mkdir(mode=0o700, exist_ok=True)
+        load_module("private_dir").ensure_dir(directory, parents=False, check=False)
         return directory / ("forward-%s.log" % watch.repo.replace("/", "-"))
 
     def _start(self, watch, now):
@@ -19093,7 +19267,7 @@ def launch_memory_check(args, engine, state, runner, now):
 
     def remember(*reads):
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            load_module("private_dir").ensure_dir(path.parent, check=False)
             tmp = path.with_name(path.name + ".%d.tmp" % os.getpid())
             tmp.write_text(json.dumps({"at": now(), "reads": [list(r) for r in reads][-2:]}))
             os.replace(tmp, path)
@@ -24037,7 +24211,7 @@ def _write_gates_config(raw_edit):
     section = dict(section, repos=dict(section.get("repos") or {}))   # every other key (ci_record) is kept
     raw["plan_gates"] = raw_edit(section)
     validate_config(raw, str(path))
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _make_dir(path.parent, ConfigError, private=False)
     temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
     mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
     fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
@@ -26104,6 +26278,9 @@ def janitor_agent_roots(engine, now, days):
             for base in (agent_tmp_root(engine.config), headless_tmp_root()):
                 if base is not None:
                     roots.append((name, str(base / name)))
+        scratch = agent_scratch_path(engine, name)   # #948: the scratch directory is kept while the agent is registered: the janitor never takes it
+        if scratch is not None:
+            roots.append((name, str(scratch)))
     return roots
 
 
@@ -26239,7 +26416,7 @@ def cmd_disk_janitor_ack(args, runner, now):
 def cmd_disk(args, runner, now):
     """The `disk` group: `prune` (the disk guard, #319), `reap-docker` (#326) and `reclaim-worktrees` / `register-worktree` (the worktree lifecycle, #321)."""
     try:   # `direct` skips dispatch's error mapping, so refusals are mapped here for every subcommand
-        return {"report": cmd_disk_report, None: cmd_disk_report, "prune": cmd_disk_prune, "reap-docker": cmd_disk_reap_docker, "janitor": cmd_disk_janitor, "janitor-ack": cmd_disk_janitor_ack, "reap-orphans": cmd_disk_reap_orphans, "reclaim-worktrees": cmd_disk_reclaim_worktrees, "register-worktree": cmd_disk_register_worktree}[args.disk_action](args, runner, now)
+        return {"report": cmd_disk_report, None: cmd_disk_report, "prune": cmd_disk_prune, "reap-docker": cmd_disk_reap_docker, "janitor": cmd_disk_janitor, "janitor-ack": cmd_disk_janitor_ack, "reap-orphans": cmd_disk_reap_orphans, "reclaim-worktrees": cmd_disk_reclaim_worktrees, "register-worktree": cmd_disk_register_worktree, "reclaim-scratch": cmd_disk_reclaim_scratch}[args.disk_action](args, runner, now)
     except (LaunchError, ConfigError, CallerError, LockError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err))))
         return EXIT_ERROR
@@ -26566,7 +26743,12 @@ def cmd_preflight_pr(args, runner, now):
             sys.stderr.write("preflight-pr: %s: waiting for a slot, then running (ceiling %ds once running)\n" % (name, ceiling))
             if under is not None:
                 scratch = os.path.join(work, ("tok_" + "x" * PREFLIGHT_TOKEN_LENGTH)[:PREFLIGHT_TOKEN_LENGTH])
-                os.makedirs(scratch, exist_ok=True)
+                try:
+                    load_module("private_dir").ensure_dir(scratch, private=False)
+                except OSError as err:   # a symlink to nothing (or a file) in the way: this class fails with one line, the others still run
+                    failed += 1
+                    print("FAIL %s (0s): %s" % (name, _one_line(str(err), 200)))
+                    continue
                 env.update(TMPDIR=scratch, CLOUD_TEST_SKIP_DOCKER="1")
             started, verdict, tail = now(), "PASS", ""
             for command in commands:
@@ -26639,6 +26821,8 @@ def add_disk_parsers(sub):
     orphans.add_argument("--apply", action="store_true", help="Do it (default: a dry run)")
     reclaim = disk_sub.add_parser("reclaim-worktrees", allow_abbrev=False, help="Remove the registered worktrees of retired agents when clean and pushed; else keep and say why (a dry run unless --apply)")
     reclaim.add_argument("--apply", action="store_true", help="Do it (default: a dry run)")
+    scratch = disk_sub.add_parser("reclaim-scratch", allow_abbrev=False, help="Remove the scratch directories of the agents retired longer than the retention (scratch_retention_days, default 14); never a registered agent's (a dry run unless --apply)")
+    scratch.add_argument("--apply", action="store_true", help="Do it (default: a dry run)")
     register = disk_sub.add_parser("register-worktree", allow_abbrev=False, help="Record a linked worktree for an agent (launch records its own)")
     register.add_argument("path", help="The worktree's directory")
     register.add_argument("--agent", required=True, help="The agent it belongs to")
@@ -26919,9 +27103,10 @@ def job_ensure_root(root):
     """Create the jobs dir private (0700). Raises OSError when it exists and is not private."""
     root = Path(root)
     try:
-        os.makedirs(str(root), mode=0o700, exist_ok=True)
-    except OSError:
-        pass
+        load_module("private_dir").ensure_dir(root, check=False)
+    except OSError as err:
+        if getattr(err, "kind", None) == "dangling":
+            raise   # one line naming the link, never "not a private directory" for a path that is not a directory at all
     if not job_private(root):
         raise OSError(errno.EPERM, "%s is not a private directory (owned by you, mode 0700)" % root)
 
@@ -27045,7 +27230,11 @@ def cmd_job(args, runner, now, spawn=subprocess.Popen):
         if earlier is not None and job_state(earlier, root)[0] == "alive":
             sys.stderr.write("%s: job: %s is still running (pid %s): `job status %s`; pick another name or wait\n" % (PROG, args.name, earlier.get("pid"), args.name))
             return EXIT_ERROR
-        paths["dir"].mkdir(parents=True, exist_ok=True)
+        try:
+            load_module("private_dir").ensure_dir(paths["dir"], check=False)
+        except OSError as err:   # a symlink to nothing where the job's directory goes: one line, nothing created at its target
+            sys.stderr.write("%s: job: %s\n" % (PROG, err.strerror or err))
+            return EXIT_ERROR
         os.chmod(str(paths["dir"]), 0o700)
         for stale in (paths["record"], paths["exit"], paths["collected"], Path(str(paths["exit"]) + ".tmp")):   # the old record goes FIRST: no window shows it uncollected
             try:
@@ -30608,8 +30797,9 @@ def format_install_lines(report):
 def _write_private(path, text):
     """Write `text` to `path` atomically with mode 0600: a temporary file in the same directory, then rename."""
     path = Path(path)
-    if not path.parent.exists():
-        path.parent.mkdir(parents=True, mode=0o700)
+    _make_dir(path.parent, ConfigError, check=False)   # atomic, a dangling parent refused (#708)
+    if os.path.islink(str(path)) and not os.path.exists(str(path)):
+        raise ConfigError("%s is a symbolic link to nothing: not writing through it" % path)
     handle, temp = tempfile.mkstemp(prefix=".%s." % path.name, dir=str(path.parent))
     try:
         with os.fdopen(handle, "w") as out:
@@ -30812,7 +31002,7 @@ def write_if_changed(path, content):
             return False
     except OSError:
         pass
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _make_dir(path.parent, InstallError, private=False)
     mask = os.umask(0)
     os.umask(mask)
     mode = (0o666 & ~mask) & ~0o022
@@ -30910,7 +31100,7 @@ def _replace_skill_file(path, text):
             n += 1
             backup = path.with_name("%s.bak-%s-%d" % (path.name, stamp, n))
         shutil.copy2(str(path), str(backup))
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _make_dir(path.parent, InstallError, private=False)
     handle, temp = tempfile.mkstemp(prefix=".%s." % path.name, dir=str(path.parent))
     try:
         with os.fdopen(handle, "w") as out:
@@ -31098,11 +31288,11 @@ def install_todolist_plugin(config_dir, kit_root=KIT_ROOT):
     changed = False
     for name, body in files.items():
         if not _same_bytes(target / name, body):
-            (target / name).parent.mkdir(parents=True, exist_ok=True)
+            _make_dir((target / name).parent, InstallError, private=False)
             (target / name).write_bytes(body)
             changed = True
     if not ours:
-        loader.parent.mkdir(parents=True, exist_ok=True)
+        _make_dir(loader.parent, InstallError, private=False)
         loader.write_bytes(loader_bytes)
         changed = True
     return changed
@@ -31387,7 +31577,7 @@ def ensure_home_link(profile_root, config_dir):
         return False
     if os.path.lexists(str(link)):
         raise InstallError("%s exists and is not the link to %s: not touching it" % (link, config_dir))
-    link.parent.mkdir(parents=True, exist_ok=True)
+    _make_dir(link.parent, InstallError, private=False)
     os.symlink(str(config_dir), str(link))
     return True
 
@@ -31577,7 +31767,7 @@ class Installer:
         merged.update(stale)
         validate_config(merged, str(path))
         if not self.dry:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            _make_dir(path.parent, InstallError, private=False)
             path.write_text(json.dumps(merged, indent=2) + "\n")
         changes = []
         if missing:
@@ -31623,7 +31813,7 @@ class Installer:
         missing = [name for name in PROFILE_DIRS if not (root / name).is_dir()]
         if missing and not self.dry:
             for name in PROFILE_DIRS:
-                (root / name).mkdir(parents=True, exist_ok=True)
+                _make_dir(root / name, InstallError, private=False)
             os.chmod(str(root / "state"), 0o700)
         self.result("profile", bool(missing), "%s (private to v2; %s is not touched)" % (root, self.shared_dir()),
                     "%s (private to v2; %s is not touched)" % (root, self.shared_dir()))
@@ -31797,7 +31987,7 @@ class Installer:
             return self.say("cli link", "skipped (%s exists and is not a link to this checkout's %s; left alone: "
                                         "agents' shells will not find `%s` until it is moved)" % (link, target, PROG))
         if not self.dry:
-            directory.mkdir(parents=True, exist_ok=True)
+            _make_dir(directory, InstallError, private=False)
             if state == "stale":
                 link.unlink()
             os.symlink(str(target), str(link))
@@ -33192,7 +33382,7 @@ def install_cos_orders_template(config, dry=False):
     if os.path.lexists(str(path)):
         return False
     if not dry:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        _make_dir(path.parent, InstallError, private=False)
         fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as handle:
             handle.write(COS_ORDERS_TEMPLATE)

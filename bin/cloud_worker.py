@@ -82,12 +82,30 @@ def _one(text, limit=300):
     return H["_one_line"](text, limit)
 
 
+def _private_dir():
+    """The one directory helper (bin/private_dir.py, #708), loaded by path from beside this file, never imported by name."""
+    import importlib.util
+    import sys
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "private_dir.py")
+    held = sys.modules.get("private_dir")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("private_dir", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["private_dir"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 # ---------------------------------------------------------------- the endpoint record
 
 def cloud_dir(state):
     path = Path(state) / CLOUD_DIR
-    if not path.is_dir():
-        path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    helper = _private_dir()
+    try:
+        helper.ensure_dir(path, check=False)   # atomic, a dangling link refused; the owner and link check is below
+    except helper.PrivateDirError as err:
+        raise CloudError(str(err)) from None
     found = os.lstat(str(path))
     if stat.S_ISLNK(found.st_mode) or found.st_uid != os.getuid():
         raise CloudError("the cloud directory is not the user's own")
@@ -416,7 +434,7 @@ def launcher_argv():
                   "or put `%s` on the PATH; nothing was called" % (LAUNCHER_ENV, own, _checkout_launcher_problem(str(own)), DEFAULT_LAUNCHER))
 
 
-def run_launcher(runner, command, worker, options=(), timeout=LAUNCH_SECONDS, password_fd=None, cluster=None, secrets=()):
+def run_launcher(runner, command, worker, options=(), timeout=LAUNCH_SECONDS, password_fd=None, cluster=None, secrets=(), extra_env=None):
     """Run `cloud-worker <command> <worker> <options> --json`. Returns (exit code, parsed JSON or None, one-line stderr). A launcher that is missing
     or too slow is a CloudError with a plain reason. `cluster` (a Cluster) gives the launcher its login: a token FILE in the cluster's private
     directory, never a value in an argument or the environment. `secrets` [(name, value)] go to the launcher as per-run secrets through
@@ -434,6 +452,9 @@ def run_launcher(runner, command, worker, options=(), timeout=LAUNCH_SECONDS, pa
             pass_fds.append(read_end)
             feeds.append((read_end, write_end, value))
         env = cluster.env() if cluster is not None else None
+        if extra_env:   # #948: the local side of the cloud worker: its own private scratch directory, in the environment of the local launcher child
+            env = dict(env if env is not None else os.environ)
+            env.update(extra_env)
         try:
             child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                      pass_fds=tuple(pass_fds), env=env, start_new_session=True)
@@ -811,7 +832,7 @@ def private_root():
     owner, another mode or is a link is REFUSED, never repaired."""
     root = Path(tempfile.gettempdir()) / ("cwtok-%d" % os.getuid())
     try:
-        root.mkdir(mode=0o700, exist_ok=True)
+        _private_dir().ensure_dir(root, parents=False, check=False)
         found = os.lstat(str(root))
     except OSError as err:
         raise Refusal("the private directory for the cluster token cannot be made (%s); nothing was called" % (err.strerror or err)) from None
@@ -1140,6 +1161,7 @@ def _launch(args, runner, now, reserve):
     except _lib().CloudError as err:
         raise Refusal(str(err)) from None
     engine, state, _ = H["build_engine"](runner, now, "cli")
+    scratch = H["agent_scratch_env"](engine, name)   # #948: the local side of the cloud worker gets its own private scratch directory, made before anything is created
     reserve(state)
     local = engine.discover(engine.now()).agents.get(name)
     if local is not None:   # `route` prefers a cloud record: every later send/read/retire for the local agent would go INTO the pod
@@ -1148,6 +1170,7 @@ def _launch(args, runner, now, reserve):
     if load_record(state, name) is not None:
         raise LaunchError("a cloud worker named %s already exists (`%s retire %s` ends it)" % (name, H["PROG"], name))
     brief = H["read_brief"](args.brief_file, sys.stdin)
+    brief = H["scratch_brief"](brief, scratch.get(H["SCRATCH_ENV"]))   # #948: the brief names the scratch directory
     run_id = secrets_module.token_hex(16)   # this command's nonce: recorded on what `create` makes, so a later stop can say it is ours
     options = [CREATE_OPTION["repo"], repo, CREATE_OPTION["branch"], branch, CREATE_OPTION["run_id"], run_id]
     for key, value in (("idle", args.idle), ("hard", args.hard), ("shape", args.shape)):
@@ -1168,7 +1191,7 @@ def _launch(args, runner, now, reserve):
         try:
             try:
                 code, body, note = run_launcher(runner, "create", name, options, LAUNCH_SECONDS, password_fd=write_fd, cluster=cluster,
-                                                secrets=[("model-auth", model), ("git-token", token)])
+                                                secrets=[("model-auth", model), ("git-token", token)], extra_env=scratch)
             except CloudError as err:
                 _stop_after_failure(engine, runner, name, run_id, "launch: the launcher did not finish", cluster)   # a pod made just before the cut is stopped too
                 raise LaunchError(str(err)) from None

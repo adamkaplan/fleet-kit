@@ -63,12 +63,26 @@ def read_state(v2, session_id, active=None, last_message=None):
         return UNKNOWN, "the service did not answer (%s)" % str(err)[:80]
 
 
+def _private_dir():
+    """The one directory helper (bin/private_dir.py, #708), loaded by path from beside this file, never imported by name."""
+    import importlib.util
+    import sys
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "private_dir.py")
+    held = sys.modules.get("private_dir")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("private_dir", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["private_dir"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 # ---------------------------------------------------------------- the record of a headless worker
 
 def record_dir(state):
     path = Path(state) / RECORD_DIR
-    if not path.is_dir():
-        path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    _private_dir().ensure_dir(path, check=False)   # atomic, a dangling link refused; the owner and link check is below
     found = os.lstat(str(path))
     if stat.S_ISLNK(found.st_mode) or found.st_uid != os.getuid():
         raise ValueError("the headless directory is not the user's own")

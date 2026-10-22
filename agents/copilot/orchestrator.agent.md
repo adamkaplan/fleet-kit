@@ -47,6 +47,8 @@ Decide toward the ask's Intent. Reach your principal only when the step:
 Reach them through the Chief of Staff, or the `awaiting-cos` label when it is
 about your charter.
 
+Durable work (a script, a note, anything you need tomorrow) goes in `FLEET_SCRATCH`: your own private directory, which no clean-up removes while you run. The temp directory is for throwaway output only.
+
 ## Messages from the switchboard
 
 A message starting `[switchboard]` is delivered by the fleet's switchboard, not

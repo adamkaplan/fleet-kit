@@ -72,6 +72,21 @@ SELECTORS = ("-k", "--filter", "-run", "-c", "-e", "-m")   # options whose NEXT 
 E2E_WORDS = ("playwright", "chromium", "chrome", "cypress", "puppeteer", "webdriver", "e2e", "--browser", "--headed")   # a WHOLE word of the command, or a part of the program's own name
 
 
+def _private_dir():
+    """The one directory helper (bin/private_dir.py, #708), loaded by path from beside this file, never imported by name."""
+    import importlib.util
+    import sys
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "private_dir.py")
+    held = sys.modules.get("private_dir")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("private_dir", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["private_dir"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _split(command):
     """(program, rest): the program's basename and the words after it, once the wrappers that only start it are skipped (an interpreter given a script or `-m module`,
     `timeout N`, `env VAR=x`, `taskpolicy -b`, `nice -n N`, `npx`). The kind is read from these and never from a substring of an argument."""
@@ -1195,7 +1210,7 @@ def wrap_argv(argv, environ, python, switchboard, script, err=None, state_dir=No
         return None
     try:
         probe = str(state_dir) if state_dir is not None else os.path.join(environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"), "fleet-switchboard")
-        os.makedirs(probe, mode=0o700, exist_ok=True)
+        _private_dir().ensure_dir(probe, check=False)
         if not os.access(probe, os.W_OK):
             raise OSError("not writable")
     except OSError as error:
