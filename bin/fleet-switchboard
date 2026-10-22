@@ -24536,7 +24536,7 @@ def parse_review_block(text):
         elif started and line.startswith("findings:"):
             section = "findings"
         elif started and section == "files" and line.startswith("- "):
-            row = parse_files_read_row(line[2:])
+            row = parse_files_read_row(line[2:]) if len(fields["files_read"]) < FILES_READ_ROWS_MAX else None
             if row is None:
                 fields["files_problem"] = fields["files_problem"] or "a `files-read:` row is not `- <path> | <lines read> | <lines in its diff>` (numbers): %r" % line[:80]
             else:
@@ -24585,6 +24585,7 @@ def parse_files_read_row(text):
     return parts[0], int(parts[1]), int(parts[2])
 
 
+FILES_READ_ROWS_MAX = 5000   # the most `files-read:` rows a block may list (the checkout's own file limit)
 RATER_CHUNK_LINES = 200   # #1047: the ONE chunk size (diff lines) a rater reads at a time, under the ~280 lines where recorded reads were cut; the agent definition and the refusal text render it from here
 
 
@@ -24779,7 +24780,7 @@ def cmd_review(args, runner, now):
             if block_problem and verdict != "incomplete":
                 raise ReviewError("refused: %s (nothing was recorded)" % block_problem)
             listed, listed_problem = pr_changed_paths(raw)
-            if verdict != "incomplete":
+            if verdict != "incomplete":   # fails toward refusal: a list GitHub did not give whole is never replaced by the block's own
                 if listed is None:
                     raise ReviewError("refused: %s, so the read cannot be checked (nothing was recorded)" % listed_problem)
                 why_short = whole_read_problem(block_rows, listed)
@@ -24874,8 +24875,9 @@ def cmd_review_checkout(args, runner, now):
         try:
             try:
                 matrix_text = "\n".join(impact_matrix_lines(impact_matrix_words())) + "\n"   # #1047: the matrix's words, from the file the clear reads, written beside the diff
-            except impact_floor.MatrixError:
+            except impact_floor.MatrixError as err:
                 matrix_text = None
+                sys.stderr.write("%s: review checkout: the impact matrix cannot be read, so impact-matrix.txt is not written to the checkout: %s\n" % (PROG, _one_line(str(err), 160)))
             path = rc.checkout(api, repo, number, head, base, os.getcwd(), extra_files=({rc.MATRIX_FILE: matrix_text} if matrix_text else None), archive=archive, notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
         except rc.OverBound as err:
             sys.stderr.write("%s: review checkout: refused, nothing left behind: %s\n" % (PROG, _one_line(str(err), 400)))

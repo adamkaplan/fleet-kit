@@ -68898,6 +68898,7 @@ class TestReviewCheckout(LedgerBase):
             code, out, err = self.checkout()
         self.assertEqual(code, 0, err)
         self.assertFalse((Path(out.strip()) / "impact-matrix.txt").exists())
+        self.assertIn("impact matrix cannot be read", err)
 
     @unittest.skipIf(os.geteuid() == 0, "root can write anything")
     def test_s2_every_file_and_directory_is_read_only(self):
