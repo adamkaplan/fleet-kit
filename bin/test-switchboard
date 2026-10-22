@@ -15397,8 +15397,11 @@ class TestOneCharter(Base):
         self.engine = self.world.new_engine("daemon")
         self.engine.state_dir = self.world.state
         self.registry = sb.load_module("registry")
-        self.parents = {3: 1, 1: None}
+        self.parents = {3: 1, 4: 1, 5: 4, 9: 1, 1: None}
         self.engine.intents = types.SimpleNamespace(parent=lambda number, repo=None: self.parents.get(number), repo=self.REPO, header=lambda *a, **k: None)
+        patcher = mock.patch.object(sb.IntentReader, "parent", lambda reader, number, repo=None: self.parents[number])   # #1143: the command's guard reads the same parents
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def orchestrator(self, name, charter=None, issue=None, registry=True):
         """A running orchestrator whose live SESSION metadata says `charter` and `issue`; its registry row (the first-seen fill the pass makes) holds the metadata charter unless `registry` is a value or False."""
@@ -15641,14 +15644,14 @@ class TestOneCharter(Base):
         self.assertEqual(self.row("orch-b"), before)
         code, out, err = self.run_as("cos", "charter", "set", "worker", "9")
         self.assertEqual(code, 2, err)
-        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "9")
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "9", "--replace", "split")
         self.assertEqual(code, 0, err)
         self.assertEqual(self.row("orch-b")["charter"], 9)
         done = [e for e in self.world.audit() if e["event"] == "charter.set"]
         self.assertEqual([(e["detail"]["old"], e["detail"]["new"]) for e in done], [(1, 9)])
         registry_audit = [json.loads(l) for l in (Path(self.world.state) / "registry-audit.jsonl").read_text().splitlines() if '"charter"' in l]
         self.assertEqual([(e["old"], e["new"]) for e in registry_audit if e.get("event") == "charter"], [(1, 9)])
-        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "none")
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "none", "--replace", "retired lane")
         self.assertEqual((code, self.row("orch-b")["charter"]), (0, None))
         self.assertEqual(len([e for e in self.world.audit() if e["event"] == "charter.refused"]), 3)
 
@@ -15754,6 +15757,62 @@ class TestOneCharter(Base):
         ("bin/fleet_health.py", "_refresh_asks"): "own: the registry-derived info", ("bin/fleet-switchboard", "_import_fleet"): "own: the launch/import writer of the session's metadata",
     }
 
+
+
+class TestCharterSetGuard(TestOneCharter):  # (re-runs the parent class's tests: cheap)
+    """#1143: the Chief of Staff's `charter set` guard, its audit and its read-back; the permission diff of the definition."""
+
+    def setUp(self):
+        super().setUp()
+
+    def audit_lines(self):
+        return [e for e in self.world.audit() if e["event"].startswith("charter.") and e["event"] != "charter.disagree"]
+
+    def test_non_orchestrator_is_refused_and_audited(self):
+        self.world.add_agent("worker", fleet={"role": "coder", "reports_to": "orch-b", "repo": self.REPO})
+        code, out, err = self.run_as("cos", "charter", "set", "worker", "3")
+        self.assertIn(code, (1, 2))
+        self.assertIn("not an orchestrator", err)
+        self.assertEqual(len(self.audit_lines()), 1)
+
+    def test_held_by_another_and_not_a_sub_issue_are_refused(self):
+        self.orchestrator("orch-a", registry=3)
+        self.orchestrator("orch-b", registry=None)
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertIn("already held by orch-a", err)
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "5")
+        self.assertIn("not a sub-issue", err)
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "1")
+        self.assertIn("not a sub-issue", err)
+        self.assertIsNone(self.row("orch-b")["charter"])
+        self.assertEqual([e["event"] for e in self.audit_lines()], ["charter.refused"] * 3)
+
+    def test_changing_a_set_charter_needs_replace(self):
+        self.orchestrator("orch-b", registry=3)
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "4")
+        self.assertIn("--replace", err)
+        self.assertEqual(self.row("orch-b")["charter"], 3)
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "4", "--replace", "split")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.row("orch-b")["charter"], 4)
+
+    def test_success_is_audited_once_and_reads_the_row_back(self):
+        self.orchestrator("orch-b", registry=None)
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertEqual(code, 0, err)
+        self.assertIn("orch-b", out)
+        self.assertIn("charter=#3", out)
+        lines = self.audit_lines()
+        self.assertEqual(len(lines), 1)
+        detail = lines[0]["detail"]
+        self.assertEqual((detail["caller"], detail["orchestrator"], detail["old"], detail["new"]), ("cos", "orch-b", None, 3))
+
+    def test_the_definition_adds_exactly_one_charter_permission_and_nothing_wider(self):
+        text = (Path(sb.__file__).resolve().parent.parent / "agents/opencode/chief-of-staff.md").read_text()
+        allows = [l for l in text.splitlines() if l.lstrip().startswith("- {action: shell") and "charter" in l]
+        self.assertEqual(len(allows), 1)
+        self.assertIn('resource: "fleet-switchboard charter set *"', allows[0])
+        self.assertNotIn("charter *", text)
 
 class TestClearNotice(Base):
     """#541: the owner's clear tells the Chief of Staff and the orchestrator whose lane merges it, once, after the clear is recorded, through ONE function."""

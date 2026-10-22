@@ -30261,14 +30261,37 @@ def cmd_charter(args, runner, now):
         sys.stderr.write("%s: charter: give an issue number or `none`; nothing was changed\n" % PROG)
         return EXIT_USAGE
     registry = load_module("registry")
-    before = registry.read(engine.state_dir)["agents"].get(args.name)
+    agents = registry.read(engine.state_dir)["agents"]
+    before = agents.get(args.name)
+    refuse = lambda why, text, code=EXIT_USAGE: (audit("charter.refused", why=why, old=(before or {}).get("charter"), new=value),
+                                                 sys.stderr.write("%s: charter: %s; nothing was changed\n" % (PROG, text)), code)[2]
+    if not isinstance(before, dict) or args.name in registry.read(engine.state_dir)["retired"] or before.get("role") != "orchestrator":
+        return refuse("not an orchestrator", "%s is not an orchestrator" % args.name)
+    old = before.get("charter")
+    replace = (getattr(args, "replace", None) or "").strip()
+    if old is not None and old != value and not replace:
+        return refuse("--replace", "%s already has charter #%s; changing it needs --replace \"<reason>\"" % (args.name, old))
+    if value is not None and old != value:
+        repo = before.get("repo") or (engine.config.get("intent_repo") if engine.config else None)
+        holders = sorted(n for n, row in agents.items() if n != args.name and row.get("role") == "orchestrator" and row.get("charter") == value and (row.get("repo") or repo) == repo)
+        if holders:
+            return refuse("already held by", "charter #%d is already held by %s" % (value, ", ".join(holders)))
+        try:
+            parent = engine.intents.parent(value, repo)
+            root = engine.intents.parent(parent, repo) if parent is not None else None
+        except Exception as err:
+            return refuse("unverified", "cannot read #%d's parent (%s)" % (value, _one_line(str(err), 80)))
+        if parent is None or root is not None:
+            return refuse("not a sub-issue", "#%d is not a sub-issue of the repository's root issue" % value)
     got = registry.set_charter(engine.state_dir, args.name, value, caller or "operator", now=now())
     if got["problem"]:
         audit("charter.refused", why=_one_line(got["problem"], 120))
         sys.stderr.write("%s: charter: %s; nothing was changed\n" % (PROG, got["problem"]))
         return EXIT_USAGE
-    audit("charter.set", old=(before or {}).get("charter"), new=value, changed=got["changed"])
+    audit("charter.set", old=(before or {}).get("charter"), new=value, changed=got["changed"], replace=replace or None)
     print("charter of %s: %s -> %s%s" % (args.name, (before or {}).get("charter"), value, "" if got["changed"] else " (unchanged)"))
+    row = registry.read(engine.state_dir)["agents"].get(args.name) or {}
+    print("registry row: %s role=%s charter=%s repo=%s" % (args.name, row.get("role"), ("#%s" % row["charter"]) if row.get("charter") is not None else "none", row.get("repo")))
     return EXIT_OK
 
 
@@ -30283,6 +30306,7 @@ def add_charter_parsers(sub):
                                                 "cannot be corrected, so it is never read as a second owner. Run by the Chief of Staff or the operator; one audit line with the old and the new value.")
     setter.add_argument("name", help="The orchestrator's fleet name")
     setter.add_argument("charter", help="An issue number, or `none`")
+    setter.add_argument("--replace", metavar="REASON", help="The reason, required to change a charter that is already set")
     setter.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
 
 
