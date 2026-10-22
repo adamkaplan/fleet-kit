@@ -21,6 +21,7 @@ permissions:
   - {action: external_directory, resource: "/Users/*/.local/state/fleet-switchboard*", effect: allow}
   - {action: external_directory, resource: "/Users/*/.config/opencode*", effect: allow}
   - {action: shell, resource: "fleet-switchboard send *", effect: allow}
+  - {action: shell, resource: "fleet-switchboard resume *", effect: allow}
   - {action: shell, resource: "fleet-switchboard report *", effect: allow}
   - {action: shell, resource: "fleet-switchboard remind *", effect: allow}
   - {action: shell, resource: "fleet-switchboard intent *", effect: allow}
