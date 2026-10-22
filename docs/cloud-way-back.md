@@ -15,7 +15,7 @@ bin/cloud_way_back_check.py FIXTURE_DIR
 
 `FIXTURE_DIR/way-back.json` is the captured state (the field list is in the check's docstring): the phase (`before-start`, `after-start`, `done`),
 whether each daemon runs, the snapshot file with its checksum and `removed` flag, the cloud and the restored local agent names, each orchestrator's
-session export (or `"export_fallback": "resume_brief"`), and the import directory with the working directories of live agents. The check writes
+session export (or `"export_fallback": "resume_brief"`, meaning a fresh orchestrator started from a hand-written brief), and the import directory with the working directories of live agents. The check writes
 nothing, runs nothing and uses no network. It prints one `OK` or `MISSING` line per requirement and the verdict. Exit 0: nothing missing. Exit 1:
 something is missing. Exit 2: the fixture cannot be read or is malformed (one line, no traceback). Names from the fixture are stripped of control
 characters and cut to 60 characters before they are printed. The fixture holds names, paths, flags and a checksum, never a key or token.
@@ -43,8 +43,13 @@ The state tarball and the session exports hold session data and may hold credent
 3. **Restore the state directory** on the Mac from the tarball into `$XDG_STATE_HOME/fleet-switchboard` (default `~/.local/state/fleet-switchboard`), while the
    local daemon is not running. The restored registry must list every agent the cloud registry held (`fleet-switchboard status`).
 4. **Export each cloud orchestrator's session** from its pod with OpenCode's session export (`opencode session export ... --server ...`; the exact calls
-   worked in slice 1 and are on issue #1061). If an export cannot be made, name the fallback in the fixture: `"export_fallback": "resume_brief"`
-   for that orchestrator, and resume it from GitHub with the resume brief (`bin/resume_brief.py`; `fleet-switchboard launch --resume SESSION --brief-file FILE`).
+   worked in slice 1 and are on issue #1061). If an export cannot be made, there is no session to resume, so `launch --resume SESSION` does not apply. Name the fallback in the fixture
+   (`"export_fallback": "resume_brief"`; the value is only a label for "a hand-written brief") for that orchestrator, and start a FRESH orchestrator:
+   `fleet-switchboard launch NAME --agent orchestrator --role orchestrator --brief-file FILE ...` (other flags as `launch --help` lists them, for example
+   `--dir`, `--issue`, `--charter`). The operator writes FILE by hand from the GitHub state: the charter issue link, the open asks each with its
+   Done when, the plan comment's hash, what was in flight (agents, branches, pull requests), and the state of this way back (the step reached and the
+   snapshot checksum). No command generates this brief yet; `bin/resume_brief.py` does not make it (it only delivers a brief file given to
+   `launch --resume`).
 5. **Run the check with phase `before-start`**: it must exit 0 (no daemon alive: cloud and local both stopped, snapshot matches the recorded checksum,
    agents restored, an export or the fallback for each orchestrator, import directory dedicated).
 6. **Import each export** into the dedicated directory (the matching `opencode session import`), then **start the local daemon**
