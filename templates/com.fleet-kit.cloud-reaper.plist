@@ -17,9 +17,12 @@
   the reaper's own floor of once a minute) and REAPER_ENV (the reaper's NON-SECRET settings read from
   the installer's environment: names of a cluster, a namespace, paths of files).
 
-  There is nothing private in this file. The reaper holds no credential: it reads the namespaced
-  operator's token FILE by path and builds its own private kubeconfig at each start. When the settings
+  There is nothing private in this file. The reaper logs in with the namespaced operator's token FILE by path (its own private kubeconfig at each start) and holds
+  no key itself; to renew workers' git tokens it runs the launcher's mint, which reads the vault settings from the settings file below. When the settings
   file of the cloud launcher lands, the reaper reads it as the launcher does.
+
+  Plainly: the reaper can now REACH THE VAULT. It holds no key itself, but through the mint it can obtain a git token for any pod, worker record and
+  allow-list entry that match, bounded only by the three checks (the pod's repository equals the worker record's, the repository is on the allow-list, the Secret is this run's).
 
   When the Mac sleeps the reaper pauses; the worker's own pod-side limit still ends it.
 

@@ -28,9 +28,12 @@ MAX_BYTES = 4000000
 AUDIT_MAX_BYTES = 512000
 RETIRED_KEEP_SECONDS = 4 * 7 * 86400   # a retirement long past the status window is dropped (the bound the old retired.json had)
 STATES = ("working", "blocked", "idle", "detached", "dead")
+ORCHESTRATOR = "orchestrator"   # the role of an agent that owns a charter (a name, not a comparison: this module decides nothing about who may act)
 AGENT_FIELDS = ("session", "pane", "role", "charter", "repo", "workspace", "cwd")   # the seven fields the old readers use
 RECORD_FIELDS = ("pane", "role", "charter", "repo", "workspace", "cwd")             # what a retirement keeps of an agent row
 LOCK_SECONDS = 5
+BELL_MIGRATED = "bell-migrated.json"   # written once the one-time migration of the live bell state into the `bell` field has run
+BELL_DEFAULT = False   # a record with no `bell` field: the heartbeat's opt-in is OFF until `set_bell` (or `fleet-heartbeat bell NAME on`) turns it on; the ONE place the default lives
 
 
 def _version_line(found):
@@ -355,12 +358,108 @@ def upsert(state_dir, name, agent, now=None):
         old = doc["agents"].get(name)
         if covers(doc["retired"].get(name), (agent or {}).get("session")):
             return False, [], "%s is retired for this session" % name
-        new = _agent(dict(agent or {}), (old or {}).get("state") or "idle", (old or {}).get("since") or _stamp(now))
+        fields = dict(agent or {})
+        if "bell" not in fields:
+            if isinstance((old or {}).get("bell"), bool):
+                fields["bell"] = old["bell"]   # a pass that records state never forgets the opt-in a person set
+            elif old is None and bell_migrated(state_dir):
+                fields["bell"] = BELL_DEFAULT   # a NEW agent gets the field; before the one-time migration has run no record is given one, or the migration would skip it and lose its live opt-in
+        new = _agent(fields, (old or {}).get("state") or "idle", (old or {}).get("since") or _stamp(now))
         if old == new:
             return False, [], None
         doc["agents"][name] = new
         return True, [{"event": "update" if old else "add", "name": name}] if not old else [], None   # an audit line on add only: a change of state is no event
     return _mutate(state_dir, change, now)
+
+
+def is_charter(value):
+    """True for an issue number a charter can be (a positive int, never a bool)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def orchestrator_charters(agents):
+    """{name: charter number} of the orchestrators of a registry's `agents` that record a charter (rows with none are left out). The ONE reading of "whose charter is this" (#969)."""
+    return {name: row["charter"] for name, row in (agents or {}).items()
+            if isinstance(row, dict) and row.get("role") == ORCHESTRATOR and is_charter(row.get("charter"))}
+
+
+def duplicate_charters(agents, repos=None):
+    """{(repo, charter): [names]} of a charter number recorded by two or more orchestrators of the same repo (sorted names). `repos` maps an agent name to its repo when the row has none."""
+    found = {}
+    for name, number in orchestrator_charters(agents).items():
+        row = agents[name]
+        repo = row.get("repo") or (repos or {}).get(name)
+        found.setdefault((repo, number), []).append(name)
+    return {key: sorted(names) for key, names in found.items() if len(names) > 1}
+
+
+def set_charter(state_dir, name, charter, by, now=None):
+    """Write an orchestrator's registry charter (an issue number, or None to clear it): the ONLY command-side writer of the field. One audit event with the old and the new value and who ran it.
+    Refused (nothing written, a problem line) for an agent not in the registry, one retired, or one that is not an orchestrator, and for a value that is not an issue number or None."""
+    def change(doc):
+        row = doc["agents"].get(name)
+        if not isinstance(row, dict) or name in doc["retired"]:
+            return False, [], "%s is not a registered agent" % name
+        if row.get("role") != ORCHESTRATOR:
+            return False, [], "%s is not an orchestrator" % name
+        if charter is not None and not is_charter(charter):
+            return False, [], "a charter is an issue number or none"
+        old = row.get("charter")
+        if old == charter:
+            return False, [], None
+        row["charter"] = charter
+        return True, [{"event": "charter", "name": name, "old": old, "new": charter, "by": by}], None
+    return _mutate(state_dir, change, now)
+
+
+def bell_of(agent):
+    """The heartbeat's opt-in of an Agent: its `bell` field when it is a bool, else BELL_DEFAULT. Supervision POLICY: it says who is nudged, never who exists."""
+    value = agent.get("bell") if isinstance(agent, dict) else None
+    return value if isinstance(value, bool) else BELL_DEFAULT
+
+
+def set_bell(state_dir, name, on):
+    """Set the heartbeat's opt-in of a recorded agent. An agent that is not recorded is refused (it does not exist; nothing is added). NO CHURN."""
+    def change(doc):
+        row = doc["agents"].get(name)
+        if row is None:
+            return False, [], "%s is not a recorded agent" % name
+        if row.get("bell") is on:
+            return False, [], None
+        row["bell"] = bool(on)
+        return True, [{"event": "bell", "name": name, "bell": bool(on)}], None
+    return _mutate(state_dir, change)
+
+
+def bell_migrated(state_dir):
+    return (Path(state_dir) / BELL_MIGRATED).exists()
+
+
+def migrate_bell(state_dir, belled_panes, whole, now=None):
+    """The ONE-TIME migration (#973): write `bell` for every recorded agent that has none, true when its pane is in `belled_panes` (the live bell state the
+    caller read ONCE), else false; each write is audited (`bell_migrated`); then the marker file is written and it never runs again. Refuses unless `whole`
+    is True (the caller's live read was whole: nothing written, no marker, tried again next pass). Returns {"changed": n, "problem": ...}."""
+    if bell_migrated(state_dir):
+        return {"changed": 0, "problem": None, "ran": False}
+    if whole is not True:
+        return {"changed": 0, "problem": "the live read was not whole: nothing migrated", "ran": False}
+    count = [0]
+
+    def change(doc):
+        events = []
+        for name, row in sorted(doc["agents"].items()):
+            if isinstance(row, dict) and not isinstance(row.get("bell"), bool):
+                row["bell"] = row.get("pane") in belled_panes
+                events.append({"event": "bell_migrated", "name": name, "bell": row["bell"]})
+        count[0] = len(events)
+        return bool(events), events, None
+    got = _mutate(state_dir, change, now)
+    if got["problem"] is None:
+        try:
+            _write_atomic(Path(state_dir) / BELL_MIGRATED, json.dumps({"at": _stamp(now), "agents": count[0]}) + "\n")
+        except OSError as err:
+            return {"changed": count[0], "problem": "marker not written (%s)" % (getattr(err, "strerror", None) or type(err).__name__), "ran": True}
+    return {"changed": count[0], "problem": got["problem"], "ran": True}
 
 
 def reconcile_remove(state_dir, name, evidence, whole):
