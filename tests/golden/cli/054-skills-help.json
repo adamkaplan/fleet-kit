@@ -1,9 +1,0 @@
-{
- "argv": [
-  "skills",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard skills [-h] {check,sync} ...\n\npositional arguments:\n  {check,sync}\n    check       Say whether the installed skills equal the kit's; exit 1\n                naming each that differs or is missing\n    sync        Copy exactly the kit's skills into the installed folders,\n                keeping a backup of each file replaced\n\noptions:\n  -h, --help    show this help message and exit\n"
-}

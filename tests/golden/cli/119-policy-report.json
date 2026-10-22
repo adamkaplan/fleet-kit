@@ -1,8 +1,0 @@
-{
- "argv": [
-  "policy-report"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "policy judge, last 60 min (enforcing)\n  calls judged   0 (0 reached the model or a rule)\n  would-ask      0    would-deny  0   (shadow verdicts)\n  enforced       0 ask, 0 deny\n  latency        p50 - ms, p95 - ms\n"
-}

@@ -1,9 +1,0 @@
-{
- "argv": [
-  "retire",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard retire [-h] [--reason REASON] [--undo] [--close]\n                                [--force]\n                                name\n\npositional arguments:\n  name             The agent's fleet name\n\noptions:\n  -h, --help       show this help message and exit\n  --reason REASON  Why (one line)\n  --undo           Watch it again\n  --close          Also close the agent's terminal pane (frees its memory):\n                   only its boss, the Chief of Staff for a direct report, or\n                   the operator; the pane is read again and must still hold\n                   the agent's own session; never your own pane\n  --force          With --close: close a pane that is still working (refused\n                   for a worker with unpushed or uncommitted work in a\n                   registered worktree)\n"
-}

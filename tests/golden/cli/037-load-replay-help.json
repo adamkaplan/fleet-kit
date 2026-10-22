@@ -1,9 +1,0 @@
-{
- "argv": [
-  "load-replay",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard load-replay [-h] [--day DAY]\n                                     [--stalled-asks STALLED_ASKS]\n                                     [--stalled-hours STALLED_HOURS]\n                                     [--backlog-hours BACKLOG_HOURS]\n                                     [--from-audit] [--json]\n\noptions:\n  -h, --help            show this help message and exit\n  --day DAY             A UTC date, YYYY-MM-DD (default: the newest recorded\n                        day; the last few days are kept)\n  --stalled-asks STALLED_ASKS\n                        Try another threshold: asks stalled\n  --stalled-hours STALLED_HOURS\n                        Try another threshold: hours without movement\n  --backlog-hours BACKLOG_HOURS\n                        Try another threshold: hours of moved asks in the\n                        backlog test\n  --from-audit          Rebuild the day from the audit log and its archives\n                        even when the series holds it (a past day is rebuilt\n                        this way when the series does not)\n  --json\n"
-}

@@ -1,9 +1,0 @@
-{
- "argv": [
-  "handoff",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard handoff [-h] --issue ISSUE --brief-file BRIEF_FILE\n                                 [--name NAME] [--dir DIR]\n                                 [--workspace WORKSPACE]\n\noptions:\n  -h, --help            show this help message and exit\n  --issue ISSUE         The ask being handed off\n  --brief-file BRIEF_FILE\n                        The brief (Done so far, Next steps, Watch out for): a\n                        file, or - for stdin\n  --name NAME           The subagent's fleet name (default: cos-<issue>)\n  --dir DIR             The subagent's working directory (default: here)\n  --workspace WORKSPACE\n                        The herdr workspace for its tab (default: the\n                        workspace of this session, else $HERDR_WORKSPACE_ID)\n"
-}

@@ -1,0 +1,248 @@
+[
+ {
+  "argv": [
+   "status",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard status [-h] [--json]\n\noptions:\n  -h, --help  show this help message and exit\n  --json      Emit machine-readable JSON instead\n"
+ },
+ {
+  "argv": [
+   "run",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard run [-h] [--once] [--poll POLL] [--json] [--standby]\n\noptions:\n  -h, --help   show this help message and exit\n  --once       One pass, then exit\n  --poll POLL  Seconds between passes (default: config poll_seconds)\n  --json       With --once: print the pass report as JSON\n  --standby    If another daemon holds the lock, wait for it to go instead of\n               exiting (the service uses this)\n"
+ },
+ {
+  "argv": [
+   "send",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard send [-h] [--issue ISSUE] [--interrupt]\n                              [--from SENDER]\n                              name text [text ...]\n\npositional arguments:\n  name           The recipient's fleet name\n  text           The message\n\noptions:\n  -h, --help     show this help message and exit\n  --issue ISSUE  The issue the message is about\n  --interrupt    Stop and hold orders only: abort the recipient's running turn\n                 (its in-flight tool call is cut), then deliver the message as\n                 a wake. Only a boss to its own worker.\n  --from SENDER  Lab only: the sender's fleet name\n"
+ },
+ {
+  "argv": [
+   "report",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard report [-h] [--issue ISSUE] [--all] [--from SENDER]\n                                {done,failed,blocked,question,working,paused,withdrawn}\n                                text [text ...]\n\nTell the agent you report to what happened, in one line (at most 300\ncharacters; detail goes on GitHub). `done`, `failed`, `blocked` and `question`\nare attention reports: delivered now, by the rule `send` uses. `working`,\n`paused` and `withdrawn` are progress reports: they ride in the next message\nto your boss and never wake it by themselves. `withdrawn` takes back your open\nquestion or blocked report on the ask (--all: on every ask) because it no\nlonger stands.\n\npositional arguments:\n  {done,failed,blocked,question,working,paused,withdrawn}\n                        What happened\n  text                  One line: what happened (at most 300 characters)\n\noptions:\n  -h, --help            show this help message and exit\n  --issue ISSUE         The issue the report is about (default: your own)\n  --all                 With `withdrawn`: withdraw every open question or\n                        blocked report of yours, on any ask\n  --from SENDER         Lab only: the sender's fleet name\n"
+ },
+ {
+  "argv": [
+   "remind",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard remind [-h] [--list] [--cancel ID] [--keep-if-closed]\n                                [--issue ISSUE] [--from SENDER]\n                                [--until-closed OWNER/REPO#N]\n                                [--until-merged OWNER/REPO#N]\n                                [name] [when] [text ...]\n\npositional arguments:\n  name                  The recipient's fleet name\n  when                  A delay (30m, 2h, 1d) or an ISO time with a zone\n  text                  The reminder\n\noptions:\n  -h, --help            show this help message and exit\n  --list                Show your own pending reminders (id, time, recipient,\n                        issue, text)\n  --cancel ID           Cancel one of your pending reminders by its id (see\n                        --list)\n  --keep-if-closed      With --issue: deliver even if that issue has been\n                        closed (by default a reminder about an issue is\n                        dropped, unsent, once the issue is closed)\n  --issue ISSUE         The issue the reminder is about\n  --from SENDER         Lab only: the sender's fleet name\n  --until-closed OWNER/REPO#N\n                        Drop the reminder, unsent, once this issue (or pull\n                        request) is closed or merged\n  --until-merged OWNER/REPO#N\n                        Drop the reminder, unsent, once this pull request is\n                        merged\n"
+ },
+ {
+  "argv": [
+   "restart",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard restart [-h]\n\noptions:\n  -h, --help  show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "read",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard read [-h] [--limit LIMIT] name\n\npositional arguments:\n  name           The agent's fleet name\n\noptions:\n  -h, --help     show this help message and exit\n  --limit LIMIT  How many messages (default 20, at most 200)\n"
+ },
+ {
+  "argv": [
+   "reassign",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard reassign [-h] [--to TO_BOSS] [--consent-from CONSENT]\n                                  [--undo] [--from SENDER]\n                                  worker\n\npositional arguments:\n  worker                The worker's fleet name\n\noptions:\n  -h, --help            show this help message and exit\n  --to TO_BOSS          The orchestrator that becomes its boss\n  --consent-from CONSENT\n                        The worker's CURRENT boss, whose consent is recorded\n                        with this command\n  --undo                Remove the override: the worker reports to the boss it\n                        was launched with again\n  --from SENDER         Lab only: the caller's fleet name\n"
+ },
+ {
+  "argv": [
+   "reattach",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard reattach [-h] [--all-detached] [--replace]\n                                  [--session SESSION] [--workspace WORKSPACE]\n                                  [--repo REPO]\n                                  [name]\n\npositional arguments:\n  name                  The agent's fleet name\n\noptions:\n  -h, --help            show this help message and exit\n  --all-detached        Every agent the daemon found detached or dead\n  --replace             Also replace a pane that runs the agent but with the\n                        wrong account or repo (same guards: not working, alone\n                        in its tab)\n  --session SESSION     Its OpenCode session id (default: the one the\n                        switchboard last saw)\n  --workspace WORKSPACE\n                        The herdr workspace for the new tab (default: where it\n                        last ran)\n  --repo REPO           Refused when it differs from the session's stored repo\n                        (a reattach keeps the stored identity)\n"
+ },
+ {
+  "argv": [
+   "reds",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard reds [-h] pr\n\n`reds OWNER/REPO#N` reads the `failing-tests` artifact (failing-tests.json v1)\nof the pull request's run and of main's last runs and prints which failing\nnames also fail on main's latest run, which are flaky there (2 or more of its\nlast 5 usable runs) and which are new. Main's runs are the runs of the repo's\nreference events on the default branch (config reds.reference_events, default\npush; a merge_group reference is read by its gh-readonly-queue ref). Main is\njudged ONLY by main's own runs: the pull request's list and its `complete`\nflag are its own claim. A run with no artifact, an expired one or\ncomplete=false is UNKNOWN, never passing. Names match in full, else by a\nUNIQUE leaf (marked 'matched by name only'). Bounded calls, cached by run id;\nit writes nothing to GitHub.\n\npositional arguments:\n  pr          OWNER/REPO#N\n\noptions:\n  -h, --help  show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "retire",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard retire [-h] [--reason REASON] [--undo] [--close]\n                                [--force]\n                                name\n\npositional arguments:\n  name             The agent's fleet name\n\noptions:\n  -h, --help       show this help message and exit\n  --reason REASON  Why (one line)\n  --undo           Watch it again\n  --close          Also close the agent's terminal pane (frees its memory):\n                   only its boss, the Chief of Staff for a direct report, or\n                   the operator; the pane is read again and must still hold\n                   the agent's own session; never your own pane\n  --force          With --close: close a pane that is still working (refused\n                   for a worker with unpushed or uncommitted work in a\n                   registered worktree)\n"
+ },
+ {
+  "argv": [
+   "review-laws",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard review-laws [-h] {install} ...\n\npositional arguments:\n  {install}\n    install   Copy the generic review laws and standards into a repository and\n              say what to edit\n\noptions:\n  -h, --help  show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "review",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard review [-h]\n                                {laws,blockers,record,checkout,measure} ...\n\npositional arguments:\n  {laws,blockers,record,checkout,measure}\n    laws                Print the repository's review laws and overlay as they\n                        stand at the PR's BASE commit\n    blockers            Read-only: the reviewers whose LATEST recorded result\n                        at the PR's head is request-changes (one line each)\n    record              Record a reviewer's result for the PR's current head\n                        (the coder session records what the reviewer returned)\n    checkout            Write the PR's exact head tree, its diff and the base\n                        copies of the touched files into .review/<head sha>\n                        here, read-only, and print the path; --remove <dir>\n                        removes one\n    measure             Read-only: per merged PR, time to green CI, review\n                        rounds, findings, escaped defects; baseline and after\n                        medians\n\noptions:\n  -h, --help            show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "skills",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard skills [-h] {check,sync} ...\n\npositional arguments:\n  {check,sync}\n    check       Say whether the installed skills equal the kit's; exit 1\n                naming each that differs or is missing\n    sync        Copy exactly the kit's skills into the installed folders,\n                keeping a backup of each file replaced\n\noptions:\n  -h, --help    show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "review-laws",
+   "install",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard review-laws install [-h] [--force] repo\n\npositional arguments:\n  repo        Path of the repository (its root)\n\noptions:\n  -h, --help  show this help message and exit\n  --force     Replace copies the repository already has\n"
+ },
+ {
+  "argv": [
+   "review",
+   "laws",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard review laws [-h] pr\n\npositional arguments:\n  pr          owner/repo#N or the PR's URL\n\noptions:\n  -h, --help  show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "review",
+   "blockers",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard review blockers [-h] [--head HEAD] pr\n\npositional arguments:\n  pr           owner/repo#N or the PR's URL\n\noptions:\n  -h, --help   show this help message and exit\n  --head HEAD  The commit to look at (default: the PR's head)\n"
+ },
+ {
+  "argv": [
+   "review",
+   "record",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard review record [-h] --reviewer REVIEWER [--head HEAD]\n                                       [--verdict VERDICT] [--block BLOCK]\n                                       [--blocks BLOCKS] [--notes NOTES]\n                                       [--impact-action {hold,second-review,none}]\n                                       [--impact-severity IMPACT_SEVERITY]\n                                       [--impact-probability IMPACT_PROBABILITY]\n                                       [--impact-reason IMPACT_REASON]\n                                       [--impact-class IMPACT_CLASS]\n                                       [--confirms-carry] [--summary SUMMARY]\n                                       pr\n\npositional arguments:\n  pr                    owner/repo#N or the PR's URL\n\noptions:\n  -h, --help            show this help message and exit\n  --reviewer REVIEWER   code | architecture | security | impact | test\n  --head HEAD           The commit judged (default: the PR's head; a different\n                        one is refused)\n  --verdict VERDICT     approve | request-changes | comment | incomplete\n  --block BLOCK         File (or - for stdin) holding the verdict block a\n                        reviewer returned: verdict, head, counts and impact\n                        action are read from it. With --block, refused (the\n                        block carries them): --verdict, --head, --blocks,\n                        --notes, --impact-action; accepted: --reviewer,\n                        --summary, --impact-class, --impact-severity,\n                        --impact-probability, --impact-reason, --confirms-\n                        carry, and of these --impact-class, --impact-severity,\n                        --impact-probability, --impact-reason win over the\n                        block's own lines; the score comes from the block's\n                        impact-severity:, impact-probability: and impact-\n                        reason: lines, so a block without the first two is\n                        recorded WITHOUT a score\n  --blocks BLOCKS       Blocking findings (each cites a rule)\n  --notes NOTES         Notes and proposals\n  --impact-action {hold,second-review,none}\n                        The impact reviewer's action from the matrix\n  --impact-severity IMPACT_SEVERITY\n                        #835: the impact reviewer's rating (severity): the\n                        severity and the probability name a cell of the\n                        matrix, the reason names the floor rule it applied\n  --impact-probability IMPACT_PROBABILITY\n                        #835: the impact reviewer's rating (probability): the\n                        severity and the probability name a cell of the\n                        matrix, the reason names the floor rule it applied\n  --impact-reason IMPACT_REASON\n                        #835: the impact reviewer's rating (reason): the\n                        severity and the probability name a cell of the\n                        matrix, the reason names the floor rule it applied\n  --impact-class IMPACT_CLASS\n                        The class of the impact that drives the action (a\n                        class of the matrix file's owner_hold block)\n  --confirms-carry      (#815) With an approve: the resolution of a conflict\n                        in a merge of main touched no line this pull request\n                        adds or removes, so the owner's clear may carry to\n                        this head\n  --summary SUMMARY     One line (at most 200 characters)\n"
+ },
+ {
+  "argv": [
+   "review",
+   "checkout",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard review checkout [-h] [--head HEAD] [--remove DIR]\n                                         [pr]\n\npositional arguments:\n  pr            owner/repo#N or the PR's URL\n\noptions:\n  -h, --help    show this help message and exit\n  --head HEAD   The commit to materialise (default: the PR's head, read once\n                at the start)\n  --remove DIR  Remove a directory this command made (restores the permissions\n                it set; anything else is refused)\n"
+ },
+ {
+  "argv": [
+   "review",
+   "measure",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard review measure [-h] [--count COUNT] [--scan SCAN]\n                                        [--split SPLIT] [--json]\n                                        repo\n\npositional arguments:\n  repo           owner/repo\n\noptions:\n  -h, --help     show this help message and exit\n  --count COUNT  PRs per group (default 10)\n  --scan SCAN    Merged PRs read (default 40; the escape check looks among\n                 them)\n  --split SPLIT  A merged PR number: the baseline is the --count merged before\n                 it, the after is --count from it on\n  --json         Machine-readable rows\n"
+ },
+ {
+  "argv": [
+   "skills",
+   "check",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard skills check [-h]\n\noptions:\n  -h, --help  show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "skills",
+   "sync",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard skills sync [-h]\n\noptions:\n  -h, --help  show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "review-laws"
+  ],
+  "status": 2,
+  "stderr": "usage: fleet-switchboard review-laws [-h] {install} ...\nfleet-switchboard review-laws: error: the following arguments are required: laws_action\n",
+  "stdout": ""
+ },
+ {
+  "argv": [
+   "skills"
+  ],
+  "status": 2,
+  "stderr": "usage: fleet-switchboard skills [-h] {check,sync} ...\nfleet-switchboard skills: error: the following arguments are required: skills_action\n",
+  "stdout": ""
+ },
+ {
+  "argv": [
+   "reds"
+  ],
+  "status": 2,
+  "stderr": "usage: fleet-switchboard reds [-h] pr\nfleet-switchboard reds: error: the following arguments are required: pr\n",
+  "stdout": ""
+ },
+ {
+  "argv": [
+   "send"
+  ],
+  "status": 2,
+  "stderr": "usage: fleet-switchboard send [-h] [--issue ISSUE] [--interrupt]\n                              [--from SENDER]\n                              name text [text ...]\nfleet-switchboard send: error: the following arguments are required: name, text\n",
+  "stdout": ""
+ },
+ {
+  "argv": [
+   "report"
+  ],
+  "status": 2,
+  "stderr": "usage: fleet-switchboard report [-h] [--issue ISSUE] [--all] [--from SENDER]\n                                {done,failed,blocked,question,working,paused,withdrawn}\n                                text [text ...]\nfleet-switchboard report: error: the following arguments are required: state, text\n",
+  "stdout": ""
+ }
+]

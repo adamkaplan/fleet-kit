@@ -1,9 +1,0 @@
-{
- "argv": [
-  "whoami",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard whoami [-h] [--json] [--repo]\n\noptions:\n  -h, --help  show this help message and exit\n  --json      Print {\"name\", \"repo\"} on one line: the gh shim's single lookup\n              (name for the signature, repo for the account)\n  --repo      Print the repo of your resolved identity (for the gh shim, which\n              picks the account from it); empty when it has none\n"
-}

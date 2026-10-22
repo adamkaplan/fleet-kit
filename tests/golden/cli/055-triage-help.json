@@ -1,9 +1,0 @@
-{
- "argv": [
-  "triage",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard triage [-h] {seen-leave,unmute,muted} ...\n\n`triage seen-leave OWNER/REPO#N` keeps the item out of the Chief of Staff's\nstale digest until it changes (a comment, a label, a state or a push). `triage\nunmute OWNER/REPO#N` undoes it; `triage muted` lists them.\n\npositional arguments:\n  {seen-leave,unmute,muted}\n\noptions:\n  -h, --help            show this help message and exit\n"
-}

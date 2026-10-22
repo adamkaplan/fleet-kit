@@ -13,7 +13,9 @@ exits 1, naming the command, when one output differs. A move of code must leave 
 output byte-identical. After a change that is meant to alter an output (a new verb, a new
 flag), run `record` and commit the files it rewrites.
 
-The output files are `<dir>/NNN-<slug>.json`: {"argv", "status", "stdout", "stderr"}.
+The outputs are kept in a few files, one per group of verbs by first letter (`<dir>/<group>.json`, a list of
+{"argv", "status", "stdout", "stderr"} in command order), so a pull request that re-records changes a handful of
+files, not one per command.
 Paths of the temporary root print as `<ROOT>`. The recorded Python version is kept in
 `<dir>/META.json`: argparse words its help differently between versions, so on another
 version `check` compares the words, not the bytes, and says so.
@@ -114,8 +116,19 @@ def command_list(entry, root, env):
     return out + OFFLINE
 
 
-def slug(argv):
-    return re.sub(r"[^a-z0-9]+", "-", " ".join(argv).lower()).strip("-") or "root"
+GROUPS = ("a-c", "d-g", "h-l", "m-p", "q-s", "t-z")
+
+
+def group_of(argv):
+    """The file a command's output is kept in: by the first letter of its verb (`--help` alone is `root`)."""
+    words = [w for w in argv if not w.startswith("-")]
+    if not words:
+        return "root"
+    letter = words[0][0].lower()
+    for group in GROUPS:
+        if group[0] <= letter <= group[2]:
+            return group
+    return "t-z"
 
 
 def normalise(text):
@@ -139,10 +152,12 @@ def main(argv=None):
                 if old.endswith(".json"):
                     os.unlink(os.path.join(args.dir, old))
             results = pool_map(lambda command: run(entry, command, root, env), commands)
-            for index, (command, result) in enumerate(zip(commands, results)):
-                name = "%03d-%s.json" % (index, slug(command))
-                with open(os.path.join(args.dir, name), "w", encoding="utf-8") as handle:
-                    json.dump(result, handle, indent=1, sort_keys=True)
+            groups = {}
+            for command, result in zip(commands, results):
+                groups.setdefault(group_of(command), []).append(result)
+            for group, items in groups.items():
+                with open(os.path.join(args.dir, group + ".json"), "w", encoding="utf-8") as handle:
+                    json.dump(items, handle, indent=1, sort_keys=True)
                     handle.write("\n")
             with open(os.path.join(args.dir, "META.json"), "w", encoding="utf-8") as handle:
                 json.dump({"python": "%d.%d" % sys.version_info[:2], "outputs": len(commands)}, handle, indent=1)
@@ -151,14 +166,14 @@ def main(argv=None):
             return 0
         meta = load_json(os.path.join(args.dir, "META.json"))
         exact = meta["python"] == "%d.%d" % sys.version_info[:2]
-        recorded = sorted(n for n in os.listdir(args.dir) if n.endswith(".json") and n != "META.json")
+        files = sorted(n for n in os.listdir(args.dir) if n.endswith(".json") and n != "META.json")
         bad = 0
-        if len(recorded) != meta["outputs"]:
+        wants = [(name, item) for name in files for item in load_json(os.path.join(args.dir, name))]
+        if len(wants) != meta["outputs"]:
             bad += 1
-            print("DIFF: %d output files in %s, META.json says %d" % (len(recorded), args.dir, meta["outputs"]))
-        wants = [load_json(os.path.join(args.dir, name)) for name in recorded]
-        gots = pool_map(lambda want: run(entry, want["argv"], root, env), wants)
-        for name, want, got in zip(recorded, wants, gots):
+            print("DIFF: %d recorded outputs in %s, META.json says %d" % (len(wants), args.dir, meta["outputs"]))
+        gots = pool_map(lambda pair: run(entry, pair[1]["argv"], root, env), wants)
+        for (name, want), got in zip(wants, gots):
             for field in ("status", "stdout", "stderr"):
                 a, b = want[field], got[field]
                 if not exact and field != "status":
@@ -166,7 +181,7 @@ def main(argv=None):
                 if a != b:
                     bad += 1
                     print("DIFF %s: %s differs (command: %s)" % (name, field, " ".join(want["argv"])))
-        print("compared %d outputs (%s): %d differences" % (len(recorded), "bytes" if exact else "words, Python %s recorded" % meta["python"], bad))
+        print("compared %d outputs (%s): %d differences" % (len(wants), "bytes" if exact else "words, Python %s recorded" % meta["python"], bad))
         print("RESULT: %s" % ("FAIL" if bad else "PASS"))
         return 1 if bad else 0
 

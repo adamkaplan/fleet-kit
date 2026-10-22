@@ -1,9 +1,0 @@
-{
- "argv": [
-  "prove",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard prove [-h] --pr PR [--plan PLAN] [--ask ASK]\n                               [--head HEAD] --evidence EVIDENCE\n                               [--result {pass,fail}] [--command COMMAND]\n                               scenario [scenario ...]\n\npositional arguments:\n  scenario              The scenario id in the plan (S1, U2, ...)\n\noptions:\n  -h, --help            show this help message and exit\n  --pr PR               The pull request: owner/repo#N or its URL\n  --plan PLAN           The plan: owner/repo#N or an issue URL (default: the\n                        one the PR's ledger entries name, else the `PLAN:`\n                        line of the PR body)\n  --ask ASK             The ask whose Done-when the plan must cover (as `plan\n                        check --ask`)\n  --head HEAD           The PR head sha (default: read from GitHub)\n  --evidence EVIDENCE   A link, or what you ran and saw\n  --result {pass,fail}\n  --command COMMAND     The command you ran, if any\n"
-}

@@ -1,9 +1,0 @@
-{
- "argv": [
-  "heavy",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard heavy [-h] [--slots SLOTS] [--wait-max WAIT_MAX]\n                               [--short] [--ceiling CEILING] [--name NAME]\n                               ...\n\n`heavy [--slots N] [--wait-max SECONDS] [--short] [--name WHO] --\n<command...>`: waits for a free slot in arrival order (default 3, config\n`heavy.slots`; one line every 30 s says your place and who holds them), then\nruns the command as `taskpolicy -b <command>` (else `nice -n 10`) with its\nstdin, stdout, exit status and signals passed through. After --wait-max\nseconds (default 1800) it exits 75 and does not run the command.\n\npositional arguments:\n  command              -- <command...>\n\noptions:\n  -h, --help           show this help message and exit\n  --slots SLOTS        How many commands may run at once (default: config\n                       heavy.slots, else 3)\n  --wait-max WAIT_MAX  Give up after this many seconds without a slot: exit 75\n                       (default 1800)\n  --short              The command is short: when the ordinary slots are busy\n                       it may use the one express slot, and the wrapper stops\n                       it after 120 seconds (exit 124)\n  --ceiling CEILING    Ask for a longer (or shorter) time ceiling in seconds\n                       than the kind of command's default, up to the hard\n                       maximum (14400); 0 reads as the maximum, an unreadable\n                       value as the default\n  --name NAME          Who the slot is held for (default: FLEET_HEAVY_NAME,\n                       the OpenCode session id, the user)\n"
-}

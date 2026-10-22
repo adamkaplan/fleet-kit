@@ -1,9 +1,0 @@
-{
- "argv": [
-  "notice",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard notice [-h] [--from SENDER]\n                                {pr,withdraw,ack} pr [note ...]\n\n`notice pr` records a heads-up about a PR for the person's Decisions panel:\ninformation, not a decision. It sends no message and wakes nobody. Send it as\nsoon as you OPEN the PR, so it is seen while CI and review run. It stays until\nthe PR is merged or closed; sending it again refreshes the note. A number that\nis not an OPEN pull request is refused when you send it (an unreadable lookup\nnever blocks). `notice withdraw <pr>` removes a notice (the agent that sent\nit, or its boss); a notice whose PR cannot be read for an hour is dropped.\n\npositional arguments:\n  {pr,withdraw,ack}  `pr` records a notice; `withdraw` removes the one for a\n                     PR (its sender or its boss); `ack` (you, in a plain\n                     shell) drops an order heads-up by its id\n  pr                 The pull request: owner/repo#N or its URL (an issue, a\n                     number that is not an open PR, is refused)\n  note               Optional: one line of why, or what you intend (at most\n                     300 characters)\n\noptions:\n  -h, --help         show this help message and exit\n  --from SENDER      Lab only: the sender's fleet name\n"
-}

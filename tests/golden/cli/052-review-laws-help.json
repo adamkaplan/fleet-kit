@@ -1,9 +1,0 @@
-{
- "argv": [
-  "review-laws",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard review-laws [-h] {install} ...\n\npositional arguments:\n  {install}\n    install   Copy the generic review laws and standards into a repository and\n              say what to edit\n\noptions:\n  -h, --help  show this help message and exit\n"
-}

@@ -1,8 +1,0 @@
-{
- "argv": [
-  "report"
- ],
- "status": 2,
- "stderr": "usage: fleet-switchboard report [-h] [--issue ISSUE] [--all] [--from SENDER]\n                                {done,failed,blocked,question,working,paused,withdrawn}\n                                text [text ...]\nfleet-switchboard report: error: the following arguments are required: state, text\n",
- "stdout": ""
-}

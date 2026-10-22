@@ -1,9 +1,0 @@
-{
- "argv": [
-  "report",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard report [-h] [--issue ISSUE] [--all] [--from SENDER]\n                                {done,failed,blocked,question,working,paused,withdrawn}\n                                text [text ...]\n\nTell the agent you report to what happened, in one line (at most 300\ncharacters; detail goes on GitHub). `done`, `failed`, `blocked` and `question`\nare attention reports: delivered now, by the rule `send` uses. `working`,\n`paused` and `withdrawn` are progress reports: they ride in the next message\nto your boss and never wake it by themselves. `withdrawn` takes back your open\nquestion or blocked report on the ask (--all: on every ask) because it no\nlonger stands.\n\npositional arguments:\n  {done,failed,blocked,question,working,paused,withdrawn}\n                        What happened\n  text                  One line: what happened (at most 300 characters)\n\noptions:\n  -h, --help            show this help message and exit\n  --issue ISSUE         The issue the report is about (default: your own)\n  --all                 With `withdrawn`: withdraw every open question or\n                        blocked report of yours, on any ask\n  --from SENDER         Lab only: the sender's fleet name\n"
-}

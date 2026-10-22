@@ -1,9 +1,0 @@
-{
- "argv": [
-  "read",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard read [-h] [--limit LIMIT] name\n\npositional arguments:\n  name           The agent's fleet name\n\noptions:\n  -h, --help     show this help message and exit\n  --limit LIMIT  How many messages (default 20, at most 200)\n"
-}

@@ -1,9 +1,0 @@
-{
- "argv": [
-  "remind",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard remind [-h] [--list] [--cancel ID] [--keep-if-closed]\n                                [--issue ISSUE] [--from SENDER]\n                                [--until-closed OWNER/REPO#N]\n                                [--until-merged OWNER/REPO#N]\n                                [name] [when] [text ...]\n\npositional arguments:\n  name                  The recipient's fleet name\n  when                  A delay (30m, 2h, 1d) or an ISO time with a zone\n  text                  The reminder\n\noptions:\n  -h, --help            show this help message and exit\n  --list                Show your own pending reminders (id, time, recipient,\n                        issue, text)\n  --cancel ID           Cancel one of your pending reminders by its id (see\n                        --list)\n  --keep-if-closed      With --issue: deliver even if that issue has been\n                        closed (by default a reminder about an issue is\n                        dropped, unsent, once the issue is closed)\n  --issue ISSUE         The issue the reminder is about\n  --from SENDER         Lab only: the sender's fleet name\n  --until-closed OWNER/REPO#N\n                        Drop the reminder, unsent, once this issue (or pull\n                        request) is closed or merged\n  --until-merged OWNER/REPO#N\n                        Drop the reminder, unsent, once this pull request is\n                        merged\n"
-}

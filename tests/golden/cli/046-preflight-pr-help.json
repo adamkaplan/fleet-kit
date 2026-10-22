@@ -1,9 +1,0 @@
-{
- "argv": [
-  "preflight-pr",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard preflight-pr [-h]\n\nRuns, each under the `heavy` wrapper and a time ceiling: the command-surface\nsnapshot class, the hygiene and role-file classes, bin/check-public-names and,\nwhen files under cloud/ changed against the base, the cloud suites with TMPDIR\na 49-character token-shaped directory name. Only runs tests: it never pushes,\nlabels or records a verdict.\n\noptions:\n  -h, --help  show this help message and exit\n"
-}

@@ -1,8 +1,0 @@
-{
- "argv": [
-  "intent"
- ],
- "status": 2,
- "stderr": "usage: fleet-switchboard intent [-h] issue\nfleet-switchboard intent: error: the following arguments are required: issue\n",
- "stdout": ""
-}

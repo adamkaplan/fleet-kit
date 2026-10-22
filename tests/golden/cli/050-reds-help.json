@@ -1,9 +1,0 @@
-{
- "argv": [
-  "reds",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard reds [-h] pr\n\n`reds OWNER/REPO#N` reads the `failing-tests` artifact (failing-tests.json v1)\nof the pull request's run and of main's last runs and prints which failing\nnames also fail on main's latest run, which are flaky there (2 or more of its\nlast 5 usable runs) and which are new. Main's runs are the runs of the repo's\nreference events on the default branch (config reds.reference_events, default\npush; a merge_group reference is read by its gh-readonly-queue ref). Main is\njudged ONLY by main's own runs: the pull request's list and its `complete`\nflag are its own claim. A run with no artifact, an expired one or\ncomplete=false is UNKNOWN, never passing. Names match in full, else by a\nUNIQUE leaf (marked 'matched by name only'). Bounded calls, cached by run id;\nit writes nothing to GitHub.\n\npositional arguments:\n  pr          OWNER/REPO#N\n\noptions:\n  -h, --help  show this help message and exit\n"
-}

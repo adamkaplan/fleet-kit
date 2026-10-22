@@ -1,9 +1,0 @@
-{
- "argv": [
-  "job",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard job [-h] {start,status} ...\n\nA restart can kill a background run silently. `job start NAME -- COMMAND...`\nruns it detached in its own session and records it under the shared temp dir\n(or $FLEET_JOBS_DIR); `job status NAME` prints one line: alive, finished (with\nits exit code and the result file) or dead (killed, no exit code). A job found\ndead that nobody asked about is reported once to its starter's boss.\n\npositional arguments:\n  {start,status}\n    start         Start a command detached and record it\n    status        One line: alive, finished (exit code, result file) or dead\n                  (killed, no exit code)\n\noptions:\n  -h, --help      show this help message and exit\n"
-}

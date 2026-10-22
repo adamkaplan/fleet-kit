@@ -1,9 +1,0 @@
-{
- "argv": [
-  "import-v1",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard import-v1 [-h] (--session SESSION | --file FILE)\n                                   --name NAME [--role ROLE]\n                                   [--reports-to REPORTS_TO] [--issue ISSUE]\n                                   [--charter CHARTER]\n                                   [--tool-output-limit TOOL_OUTPUT_LIMIT]\n                                   [--dir DIR] [--dry-run] [--json]\n\noptions:\n  -h, --help            show this help message and exit\n  --session SESSION     The v1 session id (read with the configured v1\n                        binary's `export`)\n  --file FILE           A file holding what v1's `opencode export` printed\n  --name NAME           The agent's fleet name (lower case, digits, - and _)\n  --role ROLE           metadata.fleet.role\n  --reports-to REPORTS_TO\n                        metadata.fleet.reports_to\n  --issue ISSUE         metadata.fleet.issue\n  --charter CHARTER     metadata.fleet.charter (an orchestrator's charter\n                        issue)\n  --tool-output-limit TOOL_OUTPUT_LIMIT\n                        Cut each tool output to this many characters (listed\n                        as filled in)\n  --dir DIR             The session's working directory in v2 (absolute);\n                        default: the one v1 recorded\n  --dry-run             Convert and check; print what would be imported; write\n                        nothing\n  --json                Print the report as JSON\n"
-}

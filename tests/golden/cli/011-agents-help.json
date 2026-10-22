@@ -1,9 +1,0 @@
-{
- "argv": [
-  "agents",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard agents [-h] {verify,charters} ...\n\npositional arguments:\n  {verify,charters}\n    verify           Ask the running OpenCode service for its agents and\n                     compare each of ours with its expected mode and the rules\n                     its definition declares\n    charters         Read-only: per live orchestrator, its registry charter\n                     and its live session metadata's charter and issue (where\n                     a charter number is recorded)\n\noptions:\n  -h, --help         show this help message and exit\n"
-}

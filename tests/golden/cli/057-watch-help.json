@@ -1,9 +1,0 @@
-{
- "argv": [
-  "watch",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard watch [-h] [--workspace WORKSPACE] name\n\npositional arguments:\n  name                  The headless worker's fleet name\n\noptions:\n  -h, --help            show this help message and exit\n  --workspace WORKSPACE\n                        The herdr workspace for the new tab (default: this\n                        pane's)\n"
-}

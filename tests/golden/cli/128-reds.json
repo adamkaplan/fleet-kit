@@ -1,8 +1,0 @@
-{
- "argv": [
-  "reds"
- ],
- "status": 2,
- "stderr": "usage: fleet-switchboard reds [-h] pr\nfleet-switchboard reds: error: the following arguments are required: pr\n",
- "stdout": ""
-}

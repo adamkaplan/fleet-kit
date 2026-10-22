@@ -1,9 +1,0 @@
-{
- "argv": [
-  "orders",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard orders [-h] [--cos] {list,add,copy,remove} ...\n\nThe owner's standing orders live in the charter issue's `## Standing orders`\nsection on GitHub, one per bullet: `- <text> (ordered by <name>, <YYYY-MM-\nDD>)`. The switchboard re-supplies them to every agent of the charter at its\nstart, after each compaction and when they change, and the policy judge reads\nthem at every tool call. `list` is open to anyone. `add` and `remove` are for\nthe chief-of-staff only (you are identified by your pane); they edit only that\nsection of the issue body. `--cos` prints the Chief of Staff's OWN standing\norders: one local markdown file the owner edits (nothing here writes it).\n\npositional arguments:\n  {list,add,copy,remove}\n    list                The charter's standing orders, numbered\n    add                 Chief of Staff only: record one standing order the\n                        owner gave\n    copy                Chief of Staff only: copy every order of a sibling\n                        charter to this one, wording and dates unchanged\n    remove              Chief of Staff only: remove one order the owner\n                        revoked\n\noptions:\n  -h, --help            show this help message and exit\n  --cos                 PR 18: print the Chief of Staff's own standing orders\n                        file and its path (read-only: the owner edits that\n                        file in an editor; there is no write command)\n"
-}

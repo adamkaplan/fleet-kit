@@ -82501,8 +82501,11 @@ class TestArchitectureSafetyNet(unittest.TestCase):
         self.assertEqual([n for _, _, n in tool.classes("class A:\n    pass\n\n\ndef f():\n    pass\n")], ["A"])
 
     def test_the_golden_outputs_of_the_cli_are_unchanged(self):
-        recorded = [p for p in (REPO / "tests" / "golden" / "cli").glob("*.json") if p.name != "META.json"]
+        golden = REPO / "tests" / "golden" / "cli"
+        recorded = [item for p in golden.glob("*.json") if p.name != "META.json" for item in json.loads(p.read_text())]
         self.assertGreaterEqual(len(recorded), 120)
+        self.assertEqual(len(recorded), json.loads((golden / "META.json").read_text())["outputs"])
+        self.assertLessEqual(len(list(golden.glob("*.json"))), 10, "the outputs are kept in a few files")
         proc = subprocess.run([sys.executable, str(self.TOOLS / "golden-cli"), "check", "--entry", str(SWITCHBOARD)], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-1000:])
         self.assertIn("RESULT: PASS", proc.stdout)
@@ -82512,10 +82515,12 @@ class TestArchitectureSafetyNet(unittest.TestCase):
         self.addCleanup(shutil.rmtree, work, True)
         golden = work / "cli"
         shutil.copytree(REPO / "tests" / "golden" / "cli", golden)
-        target = next(golden.glob("*-version.json"))
-        doc = json.loads(target.read_text())
-        doc["stdout"] = doc["stdout"].replace("fleet-switchboard", "fleet-switchboardX")
-        target.write_text(json.dumps(doc))
+        target = next(p for p in golden.glob("*.json") if p.name != "META.json" and any(i["argv"] == ["version"] for i in json.loads(p.read_text())))
+        docs = json.loads(target.read_text())
+        for doc in docs:
+            if doc["argv"] == ["version"]:
+                doc["stdout"] = doc["stdout"].replace("fleet-switchboard", "fleet-switchboardX")
+        target.write_text(json.dumps(docs))
         proc = subprocess.run([sys.executable, str(self.TOOLS / "golden-cli"), "check", "--entry", str(SWITCHBOARD), "--dir", str(golden)],
                               capture_output=True, text=True)
         self.assertEqual(proc.returncode, 1, proc.stdout)
@@ -82561,20 +82566,21 @@ class TestArchitectureSafetyNet(unittest.TestCase):
         meta = json.loads((golden / "META.json").read_text())
         meta["python"] = "2.0"
         (golden / "META.json").write_text(json.dumps(meta))
-        target = next(golden.glob("000-*.json"))
-        doc = json.loads(target.read_text())
+        target = golden / "root.json"
+        docs = json.loads(target.read_text())
+        doc = docs[0]
         doc["stdout"] = doc["stdout"].replace("usage: ", "usage:\n   ")   # only the whitespace differs
-        target.write_text(json.dumps(doc))
+        target.write_text(json.dumps(docs))
         done = run("check")
         self.assertEqual(done.returncode, 0, done.stdout)
         self.assertIn("words", done.stdout)
         doc["stdout"] = "something else\n"
-        target.write_text(json.dumps(doc))
+        target.write_text(json.dumps(docs))
         self.assertEqual(run("check").returncode, 1)
-        target.unlink()
-        done = run("check")   # a file missing from the directory is a difference
+        target.write_text(json.dumps(docs[1:]))
+        done = run("check")   # an output missing from the directory is a difference
         self.assertEqual(done.returncode, 1)
-        self.assertIn("output files", done.stdout)
+        self.assertIn("recorded outputs", done.stdout)
 
     def test_the_hygiene_scan_reads_one_list_of_daemon_files(self):
         self.assertIn(SWITCHBOARD, SWITCHBOARD_SOURCE_FILES)

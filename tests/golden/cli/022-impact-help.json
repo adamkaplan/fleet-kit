@@ -1,9 +1,0 @@
-{
- "argv": [
-  "impact",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard impact [-h] {floor,matrix,hold,delegated,clear} ...\n\npositional arguments:\n  {floor,matrix,hold,delegated,clear}\n    floor               What the path-glob floor (and an optional independent\n                        rating) would decide for a PR\n    matrix              Read-only: print the kit's impact matrix words\n                        (severities, probabilities, cells, floor rule ids);\n                        with --for-rater also a pull request's floor hits (for\n                        a repository with no review laws)\n    hold                What the daemon would label as held right now (read-\n                        only dry run; the daemon writes the labels)\n    delegated           List every clear the Chief of Staff made under an\n                        order of the owner's: the pull request, head, score,\n                        threshold and her judgement (read-only)\n    clear               The owner's own terminal: clear a false impact hold\n                        for this head, with a reason (the Chief of Staff only\n                        under a standing order of the owner's, with --under-\n                        order)\n\noptions:\n  -h, --help            show this help message and exit\n"
-}

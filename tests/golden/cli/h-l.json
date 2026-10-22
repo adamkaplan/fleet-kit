@@ -1,0 +1,263 @@
+[
+ {
+  "argv": [
+   "launch",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard launch [-h] [--agent AGENT] [--dir DIR]\n                                [--resume SESSION] [--headless] [--terminal]\n                                [--workspace WORKSPACE] [--role ROLE]\n                                [--reports-to REPORTS_TO] [--issue ISSUE]\n                                [--repo REPO] [--new-workspace LABEL]\n                                [--charter CHARTER] [--checkpoint WHEN]\n                                [--overdue WHEN] [--brief-file BRIEF_FILE]\n                                [--memory-ok REASON] [--cloud]\n                                [--branch BRANCH] [--idle IDLE] [--hard HARD]\n                                [--shape SHAPE] [--stack]\n                                name\n\nStart a fleet agent (headless by default, or in a new herdr tab with\n--terminal), without typing. A NEW launch (not a resume or --cloud) first runs\nthe memory test: this is the lanes' safety check, not the owner's rule (there\nare no caps on coders), and `--memory-ok <reason>` overrides it. A refusal\nexits 5.\n\npositional arguments:\n  name                  The agent's fleet name (lower case, digits, - and _)\n\noptions:\n  -h, --help            show this help message and exit\n  --agent AGENT         The OpenCode agent definition, such as coder\n  --dir DIR             The agent's working directory (absolute)\n  --resume SESSION      Open a tab on this existing session of NAME instead of\n                        creating one (a restart that keeps the conversation)\n  --headless            Start the worker with NO terminal: a session in the\n                        OpenCode service, the brief sent through the API\n                        (about 2 MB instead of a terminal's 200 to 400 MB).\n                        Its tools run in the service's environment. The\n                        default of a plain launch (see --terminal); unlike the\n                        default, an explicit --headless never falls back to a\n                        terminal\n  --terminal            Open a herdr tab for the worker (a plain launch is\n                        headless unless the configuration key launch_default\n                        is terminal). Cannot be combined with --headless;\n                        --workspace and --new-workspace imply it\n  --workspace WORKSPACE\n                        The herdr workspace for the new tab (default: the\n                        workspace of this session, else $HERDR_WORKSPACE_ID)\n  --role ROLE           metadata.fleet.role\n  --reports-to REPORTS_TO\n                        metadata.fleet.reports_to\n  --issue ISSUE         metadata.fleet.issue (owner/repo#N also sets --repo)\n  --repo REPO           metadata.fleet.repo, OWNER/REPO: the project the agent\n                        works in. Its gh account (config gh_users) is the\n                        agent's GH_TOKEN\n  --new-workspace LABEL\n                        Create a herdr workspace with this label in --dir\n                        (never focused), and launch into it. A --charter whose\n                        `workspace:` line differs is refused\n  --charter CHARTER     metadata.fleet.charter: an orchestrator's charter\n                        issue\n  --checkpoint WHEN     Remind the worker to report at this time (30m, or an\n                        ISO time with a zone). Default: read from the brief's\n                        CHECKPOINT line, if it can be\n  --overdue WHEN        Wake --reports-to at this time if the worker has not\n                        reported since the launch (60m, or an ISO time with a\n                        zone)\n  --brief-file BRIEF_FILE\n                        The first prompt: a file, or - for stdin\n  --memory-ok REASON    Skip the memory test of a new launch (audited with the\n                        reason)\n  --cloud               Run the worker in the cloud (needs --repo and\n                        --branch; --dir is its path in the pod, default /work;\n                        the pod always runs its own 'worker' agent: --agent is\n                        only recorded)\n  --branch BRANCH       With --cloud: the branch the worker starts on\n  --idle IDLE           With --cloud: stop after this long idle (default 10m)\n  --hard HARD           With --cloud: stop after this long whatever it does\n                        (default 2h)\n  --shape SHAPE         With --cloud: the pod shape, S (2 CPU, 4 GiB; the\n                        launcher's default) or M (4 CPU, 8 GiB)\n  --stack               With --cloud: a pod that can run a nested Docker stack\n                        (the Sysbox runtime class, its own user namespace, no\n                        capability added, no privileged mode). Off by default;\n                        the launch without it is unchanged. The first pod on a\n                        fresh node may wait for the node's runtime: the\n                        launcher retries\n"
+ },
+ {
+  "argv": [
+   "labels",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard labels [-h] {ensure,apply-from-markers} ...\n\n`labels ensure` creates the labels the fleet uses, each with the repo's own gh\naccount, unless they exist: <user>:orchestrator, <user>:awaiting-cos and\n<user>:awaiting-user. Idempotent. Run it when a repo joins.\n\npositional arguments:\n  {ensure,apply-from-markers}\n    ensure              Create the missing labels (every watched repo by\n                        default)\n    apply-from-markers  Label the open PRs and issues whose first body line\n                        says MERGE: captain|automatic (a person's command; a\n                        dry run unless --apply)\n\noptions:\n  -h, --help            show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "handoff",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard handoff [-h] --issue ISSUE --brief-file BRIEF_FILE\n                                 [--name NAME] [--dir DIR]\n                                 [--workspace WORKSPACE]\n\noptions:\n  -h, --help            show this help message and exit\n  --issue ISSUE         The ask being handed off\n  --brief-file BRIEF_FILE\n                        The brief (Done so far, Next steps, Watch out for): a\n                        file, or - for stdin\n  --name NAME           The subagent's fleet name (default: cos-<issue>)\n  --dir DIR             The subagent's working directory (default: here)\n  --workspace WORKSPACE\n                        The herdr workspace for its tab (default: the\n                        workspace of this session, else $HERDR_WORKSPACE_ID)\n"
+ },
+ {
+  "argv": [
+   "heavy",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard heavy [-h] [--slots SLOTS] [--wait-max WAIT_MAX]\n                               [--short] [--ceiling CEILING] [--name NAME]\n                               ...\n\n`heavy [--slots N] [--wait-max SECONDS] [--short] [--name WHO] --\n<command...>`: waits for a free slot in arrival order (default 3, config\n`heavy.slots`; one line every 30 s says your place and who holds them), then\nruns the command as `taskpolicy -b <command>` (else `nice -n 10`) with its\nstdin, stdout, exit status and signals passed through. After --wait-max\nseconds (default 1800) it exits 75 and does not run the command.\n\npositional arguments:\n  command              -- <command...>\n\noptions:\n  -h, --help           show this help message and exit\n  --slots SLOTS        How many commands may run at once (default: config\n                       heavy.slots, else 3)\n  --wait-max WAIT_MAX  Give up after this many seconds without a slot: exit 75\n                       (default 1800)\n  --short              The command is short: when the ordinary slots are busy\n                       it may use the one express slot, and the wrapper stops\n                       it after 120 seconds (exit 124)\n  --ceiling CEILING    Ask for a longer (or shorter) time ceiling in seconds\n                       than the kind of command's default, up to the hard\n                       maximum (14400); 0 reads as the maximum, an unreadable\n                       value as the default\n  --name NAME          Who the slot is held for (default: FLEET_HEAVY_NAME,\n                       the OpenCode session id, the user)\n"
+ },
+ {
+  "argv": [
+   "impact",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard impact [-h] {floor,matrix,hold,delegated,clear} ...\n\npositional arguments:\n  {floor,matrix,hold,delegated,clear}\n    floor               What the path-glob floor (and an optional independent\n                        rating) would decide for a PR\n    matrix              Read-only: print the kit's impact matrix words\n                        (severities, probabilities, cells, floor rule ids);\n                        with --for-rater also a pull request's floor hits (for\n                        a repository with no review laws)\n    hold                What the daemon would label as held right now (read-\n                        only dry run; the daemon writes the labels)\n    delegated           List every clear the Chief of Staff made under an\n                        order of the owner's: the pull request, head, score,\n                        threshold and her judgement (read-only)\n    clear               The owner's own terminal: clear a false impact hold\n                        for this head, with a reason (the Chief of Staff only\n                        under a standing order of the owner's, with --under-\n                        order)\n\noptions:\n  -h, --help            show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "install",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard install [-h] [--opencode OPENCODE] [--no-service]\n                                 [--with-cloud-reaper] [--no-herdr-link]\n                                 [--shared-profile] [--profile DIR]\n                                 [--gh-user NAME] [--dry-run] [--uninstall]\n\nIdempotent. Each step says done, already done, or skipped (why). Finds an\nOpenCode v2 binary (never assumes `opencode` is v2), writes the config keys\nthat are missing, puts the kit's agents, skills and plugins into a private v2\nprofile (never the directory your ordinary OpenCode reads, unless --shared-\nprofile), links the herdr plugin, installs a service that keeps the daemon\nalive, then starts the daemon and prints `status`. No secret is written\nanywhere.\n\noptions:\n  -h, --help           show this help message and exit\n  --opencode OPENCODE  The OpenCode v2 binary (absolute path); default: the\n                       configured one, then the known places\n  --no-service         Do not install the service\n  --with-cloud-reaper  Also install and load the cloud worker reaper as a\n                       service (opt-in: it needs a cluster login; its non-\n                       secret CW_* settings are copied from this environment)\n  --no-herdr-link      Do not link herdr's plugin (it starts the daemon\n                       whenever herdr starts)\n  --shared-profile     Put v2's pieces in the directory your ordinary OpenCode\n                       reads too (~/.config/opencode), which can break a v1\n                       OpenCode that reads them. Default: a private profile\n  --profile DIR        The private profile's directory (absolute); default:\n                       $XDG_DATA_HOME/fleet-switchboard/profile\n  --gh-user NAME       The gh account the agents' token comes from (default:\n                       gh's active one)\n  --dry-run            Print every step; write nothing\n  --uninstall          Reverse the profile pieces, the herdr link and the\n                       service; config, state and sessions stay\n"
+ },
+ {
+  "argv": [
+   "key",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard key [-h] {set,status} ...\n\npositional arguments:\n  {set,status}\n    set         Read the key from standard input (hidden at a terminal) into a\n                private file\n    status      Say where the key comes from: file, environment or none\n\noptions:\n  -h, --help    show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "intent",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard intent [-h] issue\n\npositional arguments:\n  issue       The issue number\n\noptions:\n  -h, --help  show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "intents",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard intents [-h]\n\noptions:\n  -h, --help  show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "job",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard job [-h] {start,status} ...\n\nA restart can kill a background run silently. `job start NAME -- COMMAND...`\nruns it detached in its own session and records it under the shared temp dir\n(or $FLEET_JOBS_DIR); `job status NAME` prints one line: alive, finished (with\nits exit code and the result file) or dead (killed, no exit code). A job found\ndead that nobody asked about is reported once to its starter's boss.\n\npositional arguments:\n  {start,status}\n    start         Start a command detached and record it\n    status        One line: alive, finished (exit code, result file) or dead\n                  (killed, no exit code)\n\noptions:\n  -h, --help      show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "item-prove",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard item-prove [-h] --item ITEM [--plan PLAN] [--ask ASK]\n                                    [--head HEAD] --evidence EVIDENCE\n                                    [--result {pass,fail}] [--command COMMAND]\n                                    scenario [scenario ...]\n\npositional arguments:\n  scenario              The scenario id in the item's plan (S1, U2, ...)\n\noptions:\n  -h, --help            show this help message and exit\n  --item ITEM           The work item: owner/repo#N of an ISSUE (a pull\n                        request is refused: use prove/verdict --pr)\n  --plan PLAN           Only repeats the plan the issue body links with\n                        `PLAN:`\n  --ask ASK             The ask whose Done-when the plan must cover\n  --head HEAD           The item's reference commit (default: the one pinned\n                        at registration)\n  --evidence EVIDENCE   A link, or what you ran and saw\n  --result {pass,fail}\n  --command COMMAND     The command you ran, if any\n"
+ },
+ {
+  "argv": [
+   "item-verdict",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard item-verdict [-h] --item ITEM [--plan PLAN]\n                                      [--ask ASK] [--head HEAD]\n                                      --evidence EVIDENCE [--all]\n                                      [--as {tester}] --result {pass,fail}\n                                      [scenario]\n\npositional arguments:\n  scenario              The scenario id in the item's plan (S1, U2, ...)\n\noptions:\n  -h, --help            show this help message and exit\n  --item ITEM           The work item: owner/repo#N of an ISSUE (a pull\n                        request is refused: use prove/verdict --pr)\n  --plan PLAN           Only repeats the plan the issue body links with\n                        `PLAN:`\n  --ask ASK             The ask whose Done-when the plan must cover\n  --head HEAD           The item's reference commit (default: the one pinned\n                        at registration)\n  --evidence EVIDENCE   A link, or what you ran and saw\n  --all                 Every scenario of the plan this item may claim and the\n                        tester judges\n  --as {tester}         Only tester verdicts: `ci` is recorded by `gates item-\n                        ci-record`\n  --result {pass,fail}\n"
+ },
+ {
+  "argv": [
+   "load-replay",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard load-replay [-h] [--day DAY]\n                                     [--stalled-asks STALLED_ASKS]\n                                     [--stalled-hours STALLED_HOURS]\n                                     [--backlog-hours BACKLOG_HOURS]\n                                     [--from-audit] [--json]\n\noptions:\n  -h, --help            show this help message and exit\n  --day DAY             A UTC date, YYYY-MM-DD (default: the newest recorded\n                        day; the last few days are kept)\n  --stalled-asks STALLED_ASKS\n                        Try another threshold: asks stalled\n  --stalled-hours STALLED_HOURS\n                        Try another threshold: hours without movement\n  --backlog-hours BACKLOG_HOURS\n                        Try another threshold: hours of moved asks in the\n                        backlog test\n  --from-audit          Rebuild the day from the audit log and its archives\n                        even when the series holds it (a past day is rebuilt\n                        this way when the series does not)\n  --json\n"
+ },
+ {
+  "argv": [
+   "judge-tool",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard judge-tool [-h]\n\noptions:\n  -h, --help  show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "import-v1",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard import-v1 [-h] (--session SESSION | --file FILE)\n                                   --name NAME [--role ROLE]\n                                   [--reports-to REPORTS_TO] [--issue ISSUE]\n                                   [--charter CHARTER]\n                                   [--tool-output-limit TOOL_OUTPUT_LIMIT]\n                                   [--dir DIR] [--dry-run] [--json]\n\noptions:\n  -h, --help            show this help message and exit\n  --session SESSION     The v1 session id (read with the configured v1\n                        binary's `export`)\n  --file FILE           A file holding what v1's `opencode export` printed\n  --name NAME           The agent's fleet name (lower case, digits, - and _)\n  --role ROLE           metadata.fleet.role\n  --reports-to REPORTS_TO\n                        metadata.fleet.reports_to\n  --issue ISSUE         metadata.fleet.issue\n  --charter CHARTER     metadata.fleet.charter (an orchestrator's charter\n                        issue)\n  --tool-output-limit TOOL_OUTPUT_LIMIT\n                        Cut each tool output to this many characters (listed\n                        as filled in)\n  --dir DIR             The session's working directory in v2 (absolute);\n                        default: the one v1 recorded\n  --dry-run             Convert and check; print what would be imported; write\n                        nothing\n  --json                Print the report as JSON\n"
+ },
+ {
+  "argv": [
+   "labels",
+   "ensure",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard labels ensure [-h] [--repo OWNER/REPO]\n\noptions:\n  -h, --help         show this help message and exit\n  --repo OWNER/REPO  Only this repo\n"
+ },
+ {
+  "argv": [
+   "labels",
+   "apply-from-markers",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard labels apply-from-markers [-h] [--repo OWNER/REPO]\n                                                   [--dry-run | --apply]\n\nLists the open PRs and issues of the watched repos (or --repo) whose first\nnon-empty body line says `MERGE: captain` or `MERGE: automatic` and which\ncarry NO merge label, and prints what would change. Without --apply nothing is\nwritten (the default, same as --dry-run). With --apply it ensures the labels\nexist and adds `<user>:merge-captain` / `<user>:merge-automatic` with the\nrepo's own gh account, audited. It is a person's command: the daemon never\nruns it, and the sweep and triage still write nothing.\n\noptions:\n  -h, --help         show this help message and exit\n  --repo OWNER/REPO  Only this repo\n  --dry-run          Print what would change and write nothing (the default)\n  --apply            Add the labels\n"
+ },
+ {
+  "argv": [
+   "impact",
+   "floor",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard impact floor [-h] [--rating SEVERITY/PROBABILITY]\n                                      [--json]\n                                      pr\n\npositional arguments:\n  pr                    The pull request: owner/repo#N or its URL\n\noptions:\n  -h, --help            show this help message and exit\n  --rating SEVERITY/PROBABILITY\n                        An independent rating's impact, e.g. Critical/Remote\n                        (repeatable; it can only add a hold; Eliminated is not\n                        rated)\n  --json\n"
+ },
+ {
+  "argv": [
+   "impact",
+   "matrix",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard impact matrix [-h] [--for-rater PR] [--json]\n\noptions:\n  -h, --help      show this help message and exit\n  --for-rater PR  Also that pull request's floor report: owner/repo#N or its\n                  URL\n  --json\n"
+ },
+ {
+  "argv": [
+   "impact",
+   "hold",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard impact hold [-h] [--dry-run] [--repo REPO]\n\noptions:\n  -h, --help   show this help message and exit\n  --dry-run\n  --repo REPO  One repo (OWNER/REPO); default: every repo under plan_gates\n"
+ },
+ {
+  "argv": [
+   "impact",
+   "delegated",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard impact delegated [-h] [--json] [--check]\n\noptions:\n  -h, --help  show this help message and exit\n  --json\n  --check     The fleet doctor's check: fail when a configured owner-file\n              order no longer matches exactly one line of the owner's\n              standing-orders file\n"
+ },
+ {
+  "argv": [
+   "impact",
+   "clear",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard impact clear [-h] [--under-order N] --reason REASON\n                                      [--revoke]\n                                      pr\n\npositional arguments:\n  pr               The pull request: owner/repo#N or its URL\n\noptions:\n  -h, --help       show this help message and exit\n  --under-order N  The Chief of Staff only: clear under the owner's standing\n                   order N (it must be listed under delegated_clear in the\n                   configuration); recorded as her act under that order\n  --reason REASON  Why the hold is false (at least 10 characters), logged\n  --revoke         Take the clear back (and any carry of it): the PR is held\n                   again at the daemon's next pass\n"
+ },
+ {
+  "argv": [
+   "key",
+   "set",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard key set [-h]\n\noptions:\n  -h, --help  show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "key",
+   "status",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard key status [-h]\n\noptions:\n  -h, --help  show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "job",
+   "start",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard job start [-h] name ...\n\npositional arguments:\n  name        Lower case letters, digits, - and _ (at most 40)\n  command     The command, after --\n\noptions:\n  -h, --help  show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "job",
+   "status",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard job status [-h] name\n\npositional arguments:\n  name\n\noptions:\n  -h, --help  show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "impact"
+  ],
+  "status": 2,
+  "stderr": "usage: fleet-switchboard impact [-h] {floor,matrix,hold,delegated,clear} ...\nfleet-switchboard impact: error: the following arguments are required: impact_action\n",
+  "stdout": ""
+ },
+ {
+  "argv": [
+   "intent"
+  ],
+  "status": 2,
+  "stderr": "usage: fleet-switchboard intent [-h] issue\nfleet-switchboard intent: error: the following arguments are required: issue\n",
+  "stdout": ""
+ }
+]

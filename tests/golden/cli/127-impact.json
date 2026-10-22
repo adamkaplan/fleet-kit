@@ -1,8 +1,0 @@
-{
- "argv": [
-  "impact"
- ],
- "status": 2,
- "stderr": "usage: fleet-switchboard impact [-h] {floor,matrix,hold,delegated,clear} ...\nfleet-switchboard impact: error: the following arguments are required: impact_action\n",
- "stdout": ""
-}

@@ -1,0 +1,85 @@
+[
+ {
+  "argv": [
+   "agents",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard agents [-h] {verify,charters} ...\n\npositional arguments:\n  {verify,charters}\n    verify           Ask the running OpenCode service for its agents and\n                     compare each of ours with its expected mode and the rules\n                     its definition declares\n    charters         Read-only: per live orchestrator, its registry charter\n                     and its live session metadata's charter and issue (where\n                     a charter number is recorded)\n\noptions:\n  -h, --help         show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "charter",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard charter [-h] {set} ...\n\npositional arguments:\n  {set}\n    set       Write the registry's charter of an orchestrator: an issue\n              number, or none\n\noptions:\n  -h, --help  show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "close-pane",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard close-pane [-h] pane\n\npositional arguments:\n  pane        The herdr pane id\n\noptions:\n  -h, --help  show this help message and exit\n"
+ },
+ {
+  "argv": [
+   "comment",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard comment [-h] --issue ISSUE --body-file BODY_FILE\n\noptions:\n  -h, --help            show this help message and exit\n  --issue ISSUE         The issue to comment on\n  --body-file BODY_FILE\n                        The comment: a file, or - for stdin\n"
+ },
+ {
+  "argv": [
+   "bootstrap",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard bootstrap [-h] [--workspace LABEL] [--dir DIR]\n                                   [--no-focus]\n\noptions:\n  -h, --help         show this help message and exit\n  --workspace LABEL  The workspace's label (default: Chief of Staff)\n  --dir DIR          The Chief of Staff's working directory (default: here)\n  --no-focus         Open the workspace without taking focus (for scripts and\n                     trials)\n"
+ },
+ {
+  "argv": [
+   "agents",
+   "verify",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard agents verify [-h] [--strict]\n                                       [--installed-dir INSTALLED_DIR]\n                                       [--opencode OPENCODE]\n                                       [--timeout TIMEOUT]\n\nReads `opencode api GET /api/agent` and fails (exit 1) when an agent of the\nkit is missing, has the wrong mode or lacks a rule its definition declares. A\nservice that is not running is reported, not failed. Run it after installing\nthe agents and restarting the service.\n\noptions:\n  -h, --help            show this help message and exit\n  --strict              Exit 1 when the service cannot be asked (default: say\n                        so and exit 0)\n  --installed-dir INSTALLED_DIR\n                        The folder of installed agent files to compare bodies\n                        with (default: the private profile's agents folder)\n  --opencode OPENCODE   The opencode executable (default: opencode on PATH)\n  --timeout TIMEOUT     Seconds to wait for the service (default 20)\n"
+ },
+ {
+  "argv": [
+   "agents",
+   "charters",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard agents charters [-h] [--json]\n\noptions:\n  -h, --help  show this help message and exit\n  --json\n"
+ },
+ {
+  "argv": [
+   "charter",
+   "set",
+   "--help"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "usage: fleet-switchboard charter set [-h] [--from SENDER] name charter\n\nThe registry row's `charter` is the one record of which charter an\norchestrator owns; the lane lookup reads it. The live session's metadata is\nwritten once at launch and cannot be corrected, so it is never read as a\nsecond owner. Run by the Chief of Staff or the operator; one audit line with\nthe old and the new value.\n\npositional arguments:\n  name           The orchestrator's fleet name\n  charter        An issue number, or `none`\n\noptions:\n  -h, --help     show this help message and exit\n  --from SENDER  Lab only: the caller's fleet name\n"
+ },
+ {
+  "argv": [
+   "agents"
+  ],
+  "status": 2,
+  "stderr": "usage: fleet-switchboard agents [-h] {verify,charters} ...\nfleet-switchboard agents: error: the following arguments are required: agents_action\n",
+  "stdout": ""
+ }
+]

@@ -1,9 +1,0 @@
-{
- "argv": [
-  "pr-state",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard pr-state [-h] [--json] pr\n\nReads the daemon's cached picture of the PR (pr-state.json) and the local\nledger, and prints one line. It never calls GitHub: a PR the daemon has not\ncached is 'unknown'. Use it instead of polling GitHub in a shell loop; wait\nwith `remind`.\n\npositional arguments:\n  pr          The pull request: owner/repo#N or its URL\n\noptions:\n  -h, --help  show this help message and exit\n  --json      The same, as one JSON object\n"
-}

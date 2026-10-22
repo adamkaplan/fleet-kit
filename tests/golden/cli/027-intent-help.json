@@ -1,9 +1,0 @@
-{
- "argv": [
-  "intent",
-  "--help"
- ],
- "status": 0,
- "stderr": "",
- "stdout": "usage: fleet-switchboard intent [-h] issue\n\npositional arguments:\n  issue       The issue number\n\noptions:\n  -h, --help  show this help message and exit\n"
-}
