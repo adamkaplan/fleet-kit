@@ -91,6 +91,11 @@ def choices(text):
     return match.group(1).split(",") if match else []
 
 
+def load_json(path):
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 def pool_map(fn, items):
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         return list(pool.map(fn, items))
@@ -144,11 +149,14 @@ def main(argv=None):
                 handle.write("\n")
             print("recorded %d outputs in %s" % (len(commands), args.dir))
             return 0
-        meta = json.load(open(os.path.join(args.dir, "META.json"), encoding="utf-8"))
+        meta = load_json(os.path.join(args.dir, "META.json"))
         exact = meta["python"] == "%d.%d" % sys.version_info[:2]
         recorded = sorted(n for n in os.listdir(args.dir) if n.endswith(".json") and n != "META.json")
         bad = 0
-        wants = [json.load(open(os.path.join(args.dir, name), encoding="utf-8")) for name in recorded]
+        if len(recorded) != meta["outputs"]:
+            bad += 1
+            print("DIFF: %d output files in %s, META.json says %d" % (len(recorded), args.dir, meta["outputs"]))
+        wants = [load_json(os.path.join(args.dir, name)) for name in recorded]
         gots = pool_map(lambda want: run(entry, want["argv"], root, env), wants)
         for name, want, got in zip(recorded, wants, gots):
             for field in ("status", "stdout", "stderr"):
