@@ -2603,7 +2603,7 @@ The times come from `--checkpoint 30m --overdue 60m` (a delay or an ISO time wit
 neither flag is given, from a best-effort parse of the brief's `CHECKPOINT:` line: `Report at 30 minutes ... overdue
 at 60` (also `in 20m, overdue 45m`; a bare overdue number takes the checkpoint's unit; the overdue must be later). A
 line that cannot be read, or a time more than 30 days out (or a number over 6 digits), makes no reminder and adds one line to the launch's stderr; it is never an error. A launch
-with no brief and no flag is silent.
+with no brief and no flag is silent. Each route says at once how long from now each reminder is and at what clock time, built from the stored time and the clock it used as now (`launch --checkpoint`, the brief's CHECKPOINT line and `remind` use the same words): `in 15 min, at 2030-01-02T15:05:05Z`, or `<length> ago, at <time>` for a time already past, with the length exact to the second. `launch` prints it as `checkpoint reminders (now <time>): worker reminder <line>; overdue reminder <line>` and `remind` as `reminder for <name> <line> (now <time>)`.
 
 A reminder may carry an optional `condition`, checked only once it is due: `{"unless_report_from": <worker>, "since":
 <launch time>}` and `{"while_running": <worker>}`. The check is one read of the boss's transcript and inbox (what the
