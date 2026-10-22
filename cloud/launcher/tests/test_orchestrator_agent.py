@@ -63,6 +63,7 @@ class Orchestrator(Base):
                 spec = self.pod("coder7")["spec"]
                 self.assertEqual({e["name"] for e in spec["containers"][0]["env"]}, WORKER_ENV)
                 self.assertEqual([v["name"] for v in spec["volumes"]], WORKER_VOLUMES)
+                self.assertFalse({"hostname", "subdomain"} & set(spec))
                 self.assertNotIn(cw.pod_name("coder7") + "-run", self.st().get("secrets", {}))
                 self.assertNotIn(REGISTRY, self.calls().replace('"get", "secret"', ""))
 
@@ -331,12 +332,69 @@ class HubForEveryLaunch(Orchestrator):
         self.assertEqual(self.env_of("orch1")["CW_AGENT"], "orchestrator")
         self.assertEqual(sec["wk1"], hashlib.sha256(self.channel_secret("wk1").encode()).hexdigest())
 
-    def test_s19_the_url_is_the_pod_ip_form(self):
+    def hub_accepts(self, worker):
+        """Feed the registered record to the hub's OWN validator (the copy under cloud/worker/bin): True when it would deliver."""
+        sys.path.insert(0, os.path.join(ROOT, "cloud", "worker", "bin"))
+        try:
+            import cloud_hub
+        finally:
+            sys.path.pop(0)
+        got = []
+
+        class Probe(cloud_hub.Inbox):
+            def _post(self, parts, session, record, item):
+                got.append(parts.hostname)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "agents.json")
+            record = dict(self.registry()[1][worker], session="ses_abc123")
+            with open(path, "w") as f:
+                json.dump({worker: record}, f)
+            try:
+                return Probe(path).put_if_absent(worker, "k", {"sender": "s", "key": "k", "text": "t"}) and bool(got)
+            except ValueError:
+                return False
+
+    def test_s19_the_url_is_the_in_cluster_name_the_hub_accepts(self):
         self.worker("wk1", "--boss", "boss1")
         self.orch("orch1")
         _, agents = self.registry()
         for w in ("wk1", "orch1"):
-            self.assertEqual(agents[w]["url"], "http://10.1.2.3:4096")
+            self.assertEqual(agents[w]["url"], "http://%s.cw-agents.cw.svc:4096" % cw.pod_name(w))
+            self.assertTrue(self.hub_accepts(w), w)
+            spec = self.pod(w)["spec"]
+            self.assertEqual((spec["hostname"], spec["subdomain"]), (cw.pod_name(w), "cw-agents"))
+
+    def test_s19_the_namespace_comes_from_the_setting(self):
+        self.assertEqual(cw.hub_agent_url("p1", "acme"), "http://p1.cw-agents.acme.svc:4096")
+
+    def test_s19_the_hub_refuses_the_old_forms(self):   # kills: a mutant that registers the pod IP's form, or a dotted name that is not .svc
+        orig = cw.hub_agent_url
+        try:
+            for url in ("http://10.1.2.3:4096", "http://worker-x.example.internal:4096", "http://p1.cw-agents.cw.example.com:4096"):
+                with self.subTest(url=url):
+                    w = "wk%d" % (9 + len(url) % 7)
+                    cw.hub_agent_url = lambda n, ns, u=url: u
+                    self.worker(w, "--boss", "boss1")
+                    self.assertEqual(self.registry()[1][w]["url"], url)
+                    self.assertFalse(self.hub_accepts(w))
+        finally:
+            cw.hub_agent_url = orig
+
+    def test_s19_the_stack_allow_list_admits_exactly_the_two_keys(self):
+        import test_cloud_stack as ts
+        pod = ts.build(ts._args(stack=True))
+        self.assertFalse(cw._stack_rest_differs(pod))
+        name = pod["metadata"]["name"]
+        pod["spec"].update(hostname=name, subdomain="cw-agents")
+        self.assertFalse(cw._stack_rest_differs(pod))
+        for h, sd in ((name, "other"), ("h", "cw-agents")):
+            bad = json.loads(json.dumps(pod))
+            bad["spec"].update(hostname=h, subdomain=sd)
+            self.assertTrue(cw._stack_rest_differs(bad), (h, sd))
+        bad = json.loads(json.dumps(pod))
+        del bad["spec"]["hostname"]
+        self.assertTrue(cw._stack_rest_differs(bad))
+        self.assertEqual(cw.STACK_SPEC_KEYS & {"hostname", "subdomain"}, {"hostname", "subdomain"})
 
     def test_s20_the_session_verb_writes_the_id(self):
         self.worker("wk1", "--boss", "boss1")
@@ -344,7 +402,7 @@ class HubForEveryLaunch(Orchestrator):
         code, out, err = self.run_cli("hub-session", "wk1", "--session", "ses_abc123", "--json")
         self.assertEqual(code, 0, err)
         self.assertEqual(self.registry()[1]["wk1"]["session"], "ses_abc123")
-        self.assertEqual(self.registry()[1]["wk1"]["url"], "http://10.1.2.3:4096")
+        self.assertEqual(self.registry()[1]["wk1"]["url"], "http://%s.cw-agents.cw.svc:4096" % cw.pod_name("wk1"))
         self.assertEqual(self.registry()[1]["other-agent"], {"url": "u"})
 
     def test_s21_stop_removes_both_entries_of_a_worker(self):
@@ -384,17 +442,14 @@ class HubForEveryLaunch(Orchestrator):
             cw.DEFAULT_CHANNEL_URL = orig
 
     def test_mutants_fail(self):
-        orig_on, orig_set = cw.hub_on, cw.Launcher._set_hub_url
+        orig_on = cw.hub_on
         try:
             cw.hub_on = lambda env: False   # mutant: only the orchestrator is registered
             self.worker("wk1", "--boss", "boss1")
             self.assertNotIn("wk1", self.registry()[1])
             cw.hub_on = orig_on
-            cw.Launcher._set_hub_url = lambda self, agent, name: None   # mutant: the tunnel url stays
-            self.worker("wk2", "--boss", "boss1")
-            self.assertNotEqual(self.registry()[1]["wk2"]["url"], "http://10.1.2.3:4096")
         finally:
-            cw.hub_on, cw.Launcher._set_hub_url = orig_on, orig_set
+            cw.hub_on = orig_on
 
 
 class Docs(unittest.TestCase):

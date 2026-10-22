@@ -106,7 +106,7 @@ def _stack_shape_differs(pod):
 # here (and to the frozen fixture tests/fixtures/stack_pod.json) allows them.
 STACK_METADATA_KEYS = {"name", "labels", "annotations"}
 STACK_SPEC_KEYS = {"restartPolicy", "activeDeadlineSeconds", "serviceAccountName", "automountServiceAccountToken", "securityContext", "containers", "volumes",
-                   "imagePullSecrets", "runtimeClassName", "hostUsers", "nodeSelector"}
+                   "imagePullSecrets", "runtimeClassName", "hostUsers", "nodeSelector", "hostname", "subdomain"}
 STACK_CONTAINER_KEYS = {"name", "image", "securityContext", "env", "resources", "readinessProbe", "volumeMounts"}
 STACK_VOLUMES = {"tokens": {"name": "tokens", "emptyDir": {"medium": "Memory"}}, "scratch": {"name": "scratch", "emptyDir": {}}}
 STACK_MOUNT_PATHS = {"pw": "/run/cw", "tokens": "/run/cw-tmp", "scratch": "/work"}
@@ -121,6 +121,8 @@ def _stack_rest_differs(pod):
     return (
         not set(pod.get("metadata", {})) <= STACK_METADATA_KEYS
         or not set(spec) <= STACK_SPEC_KEYS
+        or (("hostname" in spec or "subdomain" in spec)   # exactly these two keys, together: the pod's own name and the one subdomain
+            and (spec.get("subdomain") != HUB_SUBDOMAIN or spec.get("hostname") != pod.get("metadata", {}).get("name")))
         or spec.get("restartPolicy") != "Never" or not isinstance(spec.get("serviceAccountName"), str) or not spec.get("serviceAccountName")
         or len(ks) != 1 or [k.get("name") for k in ks] != ["worker"]   # one container, named worker: no sidecar, even one with the stack context
         or any(not set(k) <= STACK_CONTAINER_KEYS or not isinstance(k.get("image"), str) or not k.get("image") for k in ks)
@@ -184,6 +186,11 @@ DEFAULT_CHANNEL_URL = "http://cloud-hub.cw.svc:8443/message"
 DEFAULT_REGISTRY_SECRET = "cloud-hub-registry"
 HUB_PW_SECRET = "cloud-hub-pw"                  # one key per agent: the pod's server password, mounted by the hub at /etc/hub/pw
 HUB_PW_DIR = "/etc/hub/pw"
+HUB_SUBDOMAIN = "cw-agents"   # the headless Service (made by the hub manifests) that gives a hub pod the DNS name <pod>.cw-agents.<namespace>.svc
+
+
+def hub_agent_url(pod_name, namespace):
+    return "http://%s.%s.%s.svc:4096" % (pod_name, HUB_SUBDOMAIN, namespace)
 
 
 class ReaperLocked(Exception):
@@ -1053,6 +1060,8 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
                  "volumes": [pw_volume,
                              {"name": "tokens", "emptyDir": {"medium": "Memory"}},
                              {"name": "scratch", "emptyDir": {}}]}}
+    if "CW_AGENT" in e:   # a hub pod: a stable in-cluster name (the headless Service cw-agents) instead of the pod address
+        pod["spec"]["hostname"], pod["spec"]["subdomain"] = name, HUB_SUBDOMAIN
     pull = getattr(a, "pull_secret", None)
     if pull:
         pod["spec"]["imagePullSecrets"] = [{"name": pull}]
@@ -1185,8 +1194,6 @@ class Launcher:
                     self._start_stack_pod(worker, name, spec, made, a.wait)
                 else:
                     self._wait_ready(name, a.wait)
-                if hub:   # the tunnel name does not resolve inside the cluster: the hub is given the pod's own address
-                    self._set_hub_url(worker, name)
                 if a.password_fd is not None:
                     with os.fdopen(os.dup(a.password_fd), "w") as f:
                         f.write(password)
@@ -1243,23 +1250,12 @@ class Launcher:
         """The hub's registry: {agent: sha256 hex of the channel secret} and {agent: {url, session, password_file}}. Only the hash is stored."""
         digest = hashlib.sha256(channel_secret.encode()).hexdigest()
         name = spec["metadata"]["name"]
-        entry = {"url": "https://worker-%s.%s:4096" % (name, domain), "session": "", "password_file": "%s/%s" % (HUB_PW_DIR, agent)}
+        entry = {"url": hub_agent_url(name, self.env.get("CW_CLOUD_NAMESPACE", "cw")), "session": "", "password_file": "%s/%s" % (HUB_PW_DIR, agent)}
 
         def change(sec, agents):
             sec[agent], agents[agent] = digest, entry
         self.kube.registry_update(self._registry_secret(), change)
         self.kube.hub_pw_set(HUB_PW_SECRET, agent, password)   # the pod's server password: the hub reads it from the file
-
-    def _set_hub_url(self, agent, name):
-        ip = ((self.kube.get_pod(name) or {}).get("status") or {}).get("podIP")
-        if not ip or not re.fullmatch(r"[0-9a-fA-F.:]{3,45}", ip):
-            raise CloudError("the pod has no address to register with the hub")
-        host = "[%s]" % ip if ":" in ip else ip
-
-        def change(sec, agents):
-            if agent in agents:
-                agents[agent]["url"] = "http://%s:4096" % host
-        self.kube.registry_update(self._registry_secret(), change)
 
     def hub_session(self, a):
         """Write the session id into the agent's hub entry (a no-op when it has none). Called by the switchboard once the session exists."""
