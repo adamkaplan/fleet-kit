@@ -1,0 +1,153 @@
+import ast
+import hashlib
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+WORKER = os.path.dirname(HERE)
+ROOT = os.path.dirname(os.path.dirname(WORKER))
+POD = os.path.join(WORKER, "cw-plan-check")
+SWITCHBOARD = os.path.join(ROOT, "bin", "fleet-switchboard")
+DONE = "the thing works"
+
+
+def plan(pass_rule="exit status is 0 and stdout has 3 lines", size="size: M (two slices, agent time)", cover="DW-1", discr="a stub that prints nothing fails the 3 line check"):
+    return """## Plan (scenarios)
+
+plan-format: 2
+%s
+unchanged: none because the unchanged behaviours are covered elsewhere here
+
+```yaml
+clauses:
+  DW-1: the thing works
+```
+
+```yaml
+scenarios:
+  - id: S1
+    covers: %s
+    text: Given a file, when it runs, then it prints
+    proof: test
+    pass: %s
+    discriminates: %s
+    evaluator: ci
+```
+""" % (size, cover, pass_rule, discr)
+
+
+def read(p):
+    with open(p, "rb") as f:
+        return f.read()
+
+
+class PlanCheckInPod(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def write(self, text):
+        p = os.path.join(self.tmp.name, "plan.md")
+        with open(p, "w") as f:
+            f.write(text)
+        return p
+
+    def pod(self, path, extra=()):
+        return subprocess.run([sys.executable, POD, "--file", path, "--done-when", DONE] + list(extra), capture_output=True, text=True)
+
+    def local(self, path):
+        return subprocess.run([sys.executable, SWITCHBOARD, "plan", "check", "--file", path, "--done-when", DONE], capture_output=True, text=True)
+
+    def test_s1_docs_section(self):
+        text = read(os.path.join(ROOT, "docs", "cloud-worker-interface.md")).decode()
+        head = "## Why a cloud worker's plan check and name were stuck"
+        self.assertEqual(text.count(head), 1)
+        sec = text.split(head)[1].split("\n## ")[0]
+        self.assertIn("no switchboard command in the pod", sec)
+        self.assertIn("name record kept after an operator delete", sec)
+
+    def test_s2_vague_pass_rule_refused_with_local_line(self):
+        p = self.write(plan(pass_rule="works"))
+        pod, loc = self.pod(p), self.local(p)
+        self.assertEqual(pod.returncode, 1)
+        self.assertTrue(pod.stdout.split("\n")[0].endswith("FAIL"), pod.stdout)
+        self.assertEqual(pod.stdout, loc.stdout)
+        self.assertEqual(pod.returncode, loc.returncode)
+
+    def test_s3_sound_plan_passes_like_local(self):
+        p = self.write(plan())
+        pod, loc = self.pod(p), self.local(p)
+        self.assertEqual(pod.returncode, 0, pod.stdout)
+        self.assertTrue(pod.stdout.split("\n")[0].endswith("PASS"))
+        self.assertEqual(pod.stdout, loc.stdout)
+
+    def test_s4_fixtures_agree_and_copy_is_identical(self):
+        self.assertEqual(read(os.path.join(WORKER, "plan_check.py")), read(os.path.join(ROOT, "bin", "plan_check.py")))
+        fixtures = [
+            plan(), plan(pass_rule="works"), plan(pass_rule="it is good"), plan(pass_rule="ok"),
+            plan(discr="it fails"), plan(discr=""), plan(size=""), plan(size="size: M (3 days)"),
+            plan(size="size: S (2 weeks)"), plan(cover="DW-9"), plan(cover=""), plan(pass_rule=""),
+            "no plan here", "```yaml\nclauses: [\n```\n", plan().replace("DW-1: the thing works", "DW-1: other"),
+        ]
+        self.assertGreaterEqual(len(fixtures), 12)
+        for i, fx in enumerate(fixtures):
+            p = self.write(fx)
+            pod, loc = self.pod(p), self.local(p)
+            self.assertEqual((pod.stdout, pod.returncode), (loc.stdout, loc.returncode), i)
+
+    def test_unknown_argument_and_unreadable(self):
+        p = self.write(plan())
+        r = self.pod(p, ["--ask", "x"])
+        self.assertEqual(r.returncode, 2)
+        r = self.pod(os.path.join(self.tmp.name, "missing"))
+        self.assertEqual(r.returncode, 2)
+        r = subprocess.run([sys.executable, POD, "--file", p], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+
+    def test_s6_pure_read(self):
+        p = self.write(plan())
+        before = sorted(os.listdir(self.tmp.name)), read(p)
+        tree = ast.parse(read(POD).decode())
+        mods = set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):
+                mods |= {a.name for a in n.names}
+        self.assertEqual(mods - {"json"}, {"sys", "os", "argparse", "plan_check"})
+        guard = ("import socket,sys,runpy\n"
+                 "def boom(*a, **k): raise RuntimeError('network')\n"
+                 "socket.socket.connect = boom; socket.create_connection = boom; socket.getaddrinfo = boom\n"
+                 "sys.argv = ['cw-plan-check', '--file', %r, '--done-when', %r]\n"
+                 "runpy.run_path(%r, run_name='__main__')\n" % (p, DONE, POD))
+        os.chmod(self.tmp.name, 0o555)
+        self.addCleanup(os.chmod, self.tmp.name, 0o755)
+        r = subprocess.run([sys.executable, "-c", guard], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual((sorted(os.listdir(self.tmp.name)), read(p)), before)
+
+    def test_u1_guard_and_permissions_untouched(self):
+        # Pinned hashes of the files at the time of this change (they must not change for the plan check).
+        for name, digest in PINNED.items():
+            self.assertEqual(hashlib.sha256(read(os.path.join(WORKER, name))).hexdigest(), digest, name)
+        self.assertNotIn(b"cw-plan-check", read(os.path.join(WORKER, "guard.sh")))
+        self.assertNotIn(b"cw-plan-check", read(os.path.join(WORKER, "opencode-worker.json")))
+
+    def test_s11_docs_and_readme(self):
+        for rel in ("cloud/README.md", "docs/cloud-worker-interface.md"):
+            t = read(os.path.join(ROOT, rel)).decode()
+            self.assertIn("cw-plan-check", t, rel)
+            self.assertIn("a retire of a worker whose pod is already gone", t, rel)
+        readme = read(os.path.join(ROOT, "cloud", "README.md")).decode()
+        self.assertIn("`plan_check.py`", readme)
+
+    def test_dockerfile_installs_both(self):
+        d = read(os.path.join(WORKER, "Dockerfile")).decode()
+        self.assertIn("COPY worker/cw-plan-check worker/plan_check.py /usr/local/bin/", d)
+
+
+PINNED = {'guard.sh': '9bff815feddd3424f2f853c8e002333474845ab7d8091f562bbd9256852a9321', 'opencode-worker.json': '55e257df63d010c9d9cfbda0c219f56005b4c346a84ff00f1d7cee8f05bb69ec'}
+
+if __name__ == "__main__":
+    unittest.main()

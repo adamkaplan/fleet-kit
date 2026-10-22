@@ -130,3 +130,9 @@ administrator credential in the vault at the moment of use (`CW_CLUSTER_TOKEN_CM
 is a refusal (exit 2) that names the vault pre-check. Only repositories on `CW_ALLOWED_REPOS` can be launched.
 
 **What the pod is told.** The session is created in `/work` (the scratch volume; `--dir` overrides) with the image's own agent, `worker` (`cloud/worker/agents/worker.md`), whatever `--agent` says: for `launch --cloud`, `--agent` is the local role name and is only recorded in the endpoint record. The brief is sent after a standard setup preamble: clone the repository into `/work/repo`, switch to the task branch, work only there (the end hook pushes from `/work/repo`). `retire` of a worker whose end hook cannot push keeps the pod and the record; `cloud-worker delete NAME --force` is the explicit last resort and discards the pod's work.
+
+## Why a cloud worker's plan check and name were stuck
+
+Two recorded causes. (1) There was no switchboard command in the pod, so a plan a cloud worker wrote came back with a vague pass rule that only a local `plan check` found. The pod now carries `cw-plan-check --file PLAN --done-when TEXT` (`cloud/worker/cw-plan-check` with `cloud/worker/plan_check.py`, a byte-identical copy of `bin/plan_check.py`; a CI test fails on any difference). It reads only the given file and text, writes nothing, needs no secret, and prints PASS or the same one-line defects as the local command (exit 0 pass, 1 fail, 2 unreadable or a usage error). Pods started from an older image do not have it.
+
+(2) A name record kept after an operator delete: a worker whose pod an operator deleted kept `cloud/NAME.json`, so a launch under that name was refused as "already exists". Fixing this is a separate change: a retire of a worker whose pod is already gone (it is not yet part of this change) is meant to clear the record, audited, and never touch a worker whose pod still exists.
