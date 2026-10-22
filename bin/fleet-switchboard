@@ -26419,6 +26419,11 @@ def cmd_heavy(args, runner=subprocess.run, now=time.time):
         sys.stderr.write("heavy: no slot (%s): running without one\n" % _one_line(str(err), 160))
         state = None
     reporter = heavy_stop_reporter(module, heavy_config, lambda: build_engine(runner, now, "cli")[0], "heavy") if state is not None else None
+    if getattr(args, "changed_slot", False):   # #1045 clause 7: a command of a --changed run, in a reserved slot, a bounded wait and a named refusal (exit 3)
+        if state is None:
+            sys.stderr.write("heavy: refused: no state directory for a reserved slot\n")
+            return module.EXIT_USAGE
+        return module.run_changed(command, state, args.wait_max, args.name, on_stop=reporter, ceiling=getattr(args, "ceiling", None))
     if getattr(args, "quick", False):   # #1045: ONE focused file or class, in a quick slot of its own; a full-suite run is refused
         if state is None:
             sys.stderr.write("heavy: refused: no state directory for a quick slot\n")
@@ -26482,13 +26487,12 @@ def cmd_heavy_changed(args, runner=subprocess.run, now=time.time):
                 failed.append(suite)
                 print("CANNOT RUN %s: %s (%s): %s" % (suite, " ".join(command), "new-bin-file guard", gone))
                 continue
-            quick = ps.is_quick(command)
-            argv = [sys.executable, os.path.abspath(__file__), "heavy", "--wait-max", str(args.wait_max if args.wait_max is not None else 600)]
-            argv += (["--quick"] if quick else ["--ceiling", str(args.ceiling)] if args.ceiling else []) + ["--"] + command
+            argv = [sys.executable, os.path.abspath(__file__), "heavy", "--changed-slot", "--wait-max", str(args.wait_max if args.wait_max is not None else 120)]
+            argv += (["--ceiling", str(args.ceiling)] if args.ceiling else []) + ["--"] + command
             done = runner(argv, cwd=merged.path, capture_output=True, text=True)
-            if done.returncode in (75, 64) and ("refused" in (done.stderr or "") or done.returncode == 75):
+            if done.returncode in (75, 64, 3) and ("refused" in (done.stderr or "") or done.returncode in (75, 3)):
                 refused.append(suite)
-                print("NOSLOT %s: not run (%s)" % (suite, "no heavy slot came in time" if done.returncode == 75 else _one_line((done.stderr or "").strip(), 100)))
+                print("NOSLOT %s: not run (%s)" % (suite, "no focused slot free: every reserved --changed slot was taken" if done.returncode == 3 else "no heavy slot came in time" if done.returncode == 75 else _one_line((done.stderr or "").strip(), 100)))
             elif done.returncode != 0:
                 failed.append(suite)
                 print("FAIL %s: exit %d after the merge of %s into the head" % (suite, done.returncode, base))
@@ -26497,7 +26501,7 @@ def cmd_heavy_changed(args, runner=subprocess.run, now=time.time):
                 print("PASS %s (on the merge of %s into the head)" % (suite, base))
     if refused:
         print("refused: no slot for %d suite%s, which did not run: %s" % (len(refused), "" if len(refused) == 1 else "s", ", ".join(refused)))
-    return EXIT_ERROR if failed else (75 if refused else EXIT_OK)
+    return EXIT_ERROR if failed else (3 if refused else EXIT_OK)   # 3: no focused slot free (clause 7)
 
 
 def add_heavy_parsers(sub):
@@ -26510,6 +26514,7 @@ def add_heavy_parsers(sub):
     heavy.add_argument("--short", action="store_true", help="The command is short: when the ordinary slots are busy it may use the one express slot, and the wrapper stops it after 120 seconds (exit 124)")
     heavy.add_argument("--ceiling", help="Ask for a longer (or shorter) time ceiling in seconds than the kind of command's default, up to the hard maximum (14400); 0 reads as the maximum, an unreadable value as the default")
     heavy.add_argument("--name", help="Who the slot is held for (default: FLEET_HEAVY_NAME, the OpenCode session id, the user)")
+    heavy.add_argument("--changed-slot", action="store_true", dest="changed_slot", help="A command of a --changed run: take one of the reserved slots (never queued behind full-suite runs); waits at most 120 s, then exits 3 with `no focused slot free`")
     heavy.add_argument("--quick", action="store_true", help="ONE focused test file or class: take a quick slot of its own (cap 4, ceiling 10 min), never queued behind a full-suite run; a full-suite run is refused")
     heavy.add_argument("--changed", action="store_true", help="Derive the suites and classes that exercise the changed paths and run them on a local merge of the base into the head (see --list, --base, --pr)")
     heavy.add_argument("--list", action="store_true", help="With --changed: print the suites and the exact commands and run nothing; says when a path is exercised by no suite")

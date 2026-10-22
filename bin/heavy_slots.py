@@ -1240,3 +1240,34 @@ def run_quick(command, state_dir, wait_max=DEFAULT_WAIT_MAX, name=None, environ=
         pass
     return run(command, quick_dir(state_dir), QUICK_SLOTS, wait_max, name, environ=environ, out=out, ceiling=KIND_DEFAULTS["quick"],
                ceiling_config={"slots": QUICK_SLOTS, "ceilings": {"max": KIND_DEFAULTS["quick"]}}, **keywords)
+
+
+# ---- the reserved slots of a `heavy --changed` run (#1045, clause 7): the diff-derived focused run (several classes, several suites) is never queued behind full-suite runs.
+CHANGED_SLOTS = 2        # reserved: on their own locks and their own waiting line (a directory of their own in the state directory), so a queue of full-suite runs never delays it
+CHANGED_DIR = "changed"
+CHANGED_WAIT_MAX = 120   # the bound of the wait for a reserved slot, in seconds; a longer --wait-max is cut to it
+EXIT_NO_FOCUSED_SLOT = 3
+NO_FOCUSED_SLOT = "no focused slot free"
+
+
+def changed_dir(state_dir):
+    path = os.path.join(str(state_dir), CHANGED_DIR)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
+def run_changed(command, state_dir, wait_max=CHANGED_WAIT_MAX, name=None, environ=None, out=None, **keywords):
+    """Run one command of a `heavy --changed` run in a reserved slot. At most CHANGED_SLOTS run at once; the wait is at most CHANGED_WAIT_MAX seconds, and when every reserved
+    slot is still taken the run is NOT started: the line `heavy: no focused slot free ...` names it and the status is 3 (never a silent timeout)."""
+    out = sys.stderr if out is None else out
+    environ = dict(os.environ if environ is None else environ)
+    wait = min(CHANGED_WAIT_MAX if wait_max is None else wait_max, CHANGED_WAIT_MAX)
+    ceiling = keywords.pop("ceiling", None) or KIND_DEFAULTS["focused"]   # the focused row of the per-kind table: no ceiling of its own
+    environ[TIME_ENV] = str(ceiling)
+    code = run(command, changed_dir(state_dir), CHANGED_SLOTS, wait, name, environ=environ, out=out, ceiling=ceiling,
+               ceiling_config={"slots": CHANGED_SLOTS, "ceilings": {"max": ceiling}}, **keywords)
+    if code == EXIT_TEMPFAIL:
+        out.write("heavy: %s: all %d reserved --changed slots are taken after %d s: the command was not run (exit %d)\n" % (NO_FOCUSED_SLOT, CHANGED_SLOTS, wait, EXIT_NO_FOCUSED_SLOT))
+        out.flush()
+        return EXIT_NO_FOCUSED_SLOT
+    return code

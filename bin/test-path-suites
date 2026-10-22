@@ -260,31 +260,74 @@ class TestListAndRefusal(unittest.TestCase):
         self.assertIn("suites that exercise your change", done.stdout)
 
     def test_a_refused_slot_names_the_suites_that_did_not_run(self):
-        root = fixture()
-        git(root, "checkout", "-q", "-b", "feature")
-        write(root, "lib/calc.py", "VERSION = 1\ndef add(a, b):\n    return b + a\n")
-        git(root, "commit", "-qam", "x")
-        # every ordinary slot busy and a wait of 0: the whole suite is refused (75), the one-class run takes a quick slot
-        state = tempfile.mkdtemp(prefix="ps-state-")
-        import fcntl
-        fds = []
-        env = {"FLEET_HEAVY": "", "XDG_STATE_HOME": state, "HOME": state}
-        fleet = os.path.join(state, "fleet-switchboard")
-        os.makedirs(fleet, mode=0o700, exist_ok=True)
-        os.chmod(fleet, 0o700)
-        os.chmod(state, 0o700)
-        for i in range(3):
-            fd = os.open(os.path.join(fleet, "heavy-slot-%d.lock" % i), os.O_RDWR | os.O_CREAT, 0o600)
+        root, e, state = held_state_fixture(ordinary=3, changed=2)
+        done = subprocess.run([sys.executable, str(SWITCHBOARD), "heavy", "--changed", "--base", "main", "--wait-max", "1"], cwd=root, capture_output=True, text=True, env=e, timeout=120)
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertRegex(done.stdout, r"refused: no slot for 2 suites?, which did not run: bin/test-by-command")
+
+
+def held_state_fixture(ordinary, changed):
+    """A feature branch that changes lib/calc.py (two suites run it) and a state directory whose first `ordinary` full slots and first `changed` reserved slots are locked."""
+    import fcntl
+    root = fixture()
+    git(root, "checkout", "-q", "-b", "feature")
+    write(root, "lib/calc.py", "VERSION = 1\ndef add(a, b):\n    return b + a\n")
+    git(root, "commit", "-qam", "x")
+    state = tempfile.mkdtemp(prefix="ps-state-")
+    fleet = os.path.join(state, "fleet-switchboard")
+    os.makedirs(os.path.join(fleet, "changed"), mode=0o700, exist_ok=True)
+    for d in (state, fleet, os.path.join(fleet, "changed")):
+        os.chmod(d, 0o700)
+    for folder, count in ((fleet, ordinary), (os.path.join(fleet, "changed"), changed)):
+        for k in range(count):
+            fd = os.open(os.path.join(folder, "heavy-slot-%d.lock" % k), os.O_RDWR | os.O_CREAT, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX)
-            fds.append(fd)
-        os.environ.pop("CI", None)
-        e = dict(os.environ, **env)
-        e.pop("FLEET_HEAVY")
-        e.pop("CI", None)
-        done = subprocess.run([sys.executable, str(SWITCHBOARD), "heavy", "--changed", "--base", "main", "--wait-max", "0"], cwd=root, capture_output=True, text=True, env=e, timeout=120)
-        self.assertEqual(done.returncode, 75, done.stdout + done.stderr)
-        self.assertRegex(done.stdout, r"refused: no slot for 1 suite, which did not run: bin/test-by-command")
-        self.assertIn("PASS bin/test-by-import", done.stdout)   # one class: a quick slot, not behind the held full slots
+            HELD.append(fd)   # kept open (locked) until the process ends
+    e = dict(os.environ, HOME=state, XDG_STATE_HOME=state, FLEET_SWITCHBOARD_NO_DAEMON="1")
+    e.pop("FLEET_HEAVY", None)
+    e.pop("CI", None)
+    return root, e, state
+
+
+HELD = []
+
+
+class TestChangedRunHasAReservedSlot(unittest.TestCase):
+    """S11 (clause 7): a --changed run is never queued behind full-suite runs, and when the reserved slots are all taken it is refused by name within a bound, never a silent timeout."""
+
+    def test_s11_it_starts_within_5_seconds_with_every_ordinary_slot_taken(self):
+        root, e, _state = held_state_fixture(ordinary=3, changed=0)
+        started = time.time()
+        done = subprocess.run([sys.executable, str(SWITCHBOARD), "heavy", "--changed", "--base", "main"], cwd=root, capture_output=True, text=True, env=e, timeout=120)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("PASS bin/test-by-command", done.stdout)
+        self.assertIn("PASS bin/test-by-import", done.stdout)
+        self.assertLess(time.time() - started, 5 + 10, "start-to-finish, with the interpreter's own start")
+
+    def test_s11_the_mutant_queued_behind_the_full_suite_runs_gets_no_slot(self):
+        root, e, _state = held_state_fixture(ordinary=3, changed=0)
+        mutant = subprocess.run([sys.executable, str(SWITCHBOARD), "heavy", "--wait-max", "2", "--", "bin/test-by-command"], cwd=root, capture_output=True, text=True, env=e, timeout=120)
+        self.assertEqual(mutant.returncode, 75, "an ordinary run queued behind the full slots is not started: " + mutant.stderr)
+        self.assertIn("the command was not run", mutant.stderr)
+
+    def test_s11_every_reserved_slot_taken_is_a_named_refusal_with_exit_3(self):
+        root, e, _state = held_state_fixture(ordinary=3, changed=2)
+        done = subprocess.run([sys.executable, str(SWITCHBOARD), "heavy", "--changed-slot", "--wait-max", "1", "--", "bin/test-by-command"], cwd=root, capture_output=True, text=True, env=e, timeout=120)
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertIn("no focused slot free", done.stderr)
+
+    def test_s11_the_wait_is_bounded_at_120_seconds_whatever_wait_max_says(self):
+        import io
+        root, e, state = held_state_fixture(ordinary=0, changed=2)
+        module = heavy_slots
+        self.assertEqual(module.CHANGED_WAIT_MAX, 120)
+        clock = {"now": 1000.0}
+        out = io.StringIO()
+        code = module.run_changed(["/bin/true"], os.path.join(state, "fleet-switchboard"), wait_max=99999, environ=dict(e), out=out,
+                                  clock=lambda: clock["now"], sleep=lambda s: clock.__setitem__("now", clock["now"] + max(s, 1)))
+        self.assertEqual(code, 3)
+        self.assertLessEqual(clock["now"] - 1000.0, 125)
+        self.assertIn("no focused slot free", out.getvalue())
 
 
 class TestQuickSlot(unittest.TestCase):
