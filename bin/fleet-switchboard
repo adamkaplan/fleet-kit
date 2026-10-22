@@ -23728,7 +23728,7 @@ def claim_union_note(report, ctx, runner, now):
         if ctx.plan is None or ctx.plan.get("result") != "pass":
             return
         mine = (ctx.facts or {}).get("body")
-        _, left, error = plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], mine)
+        claimed_mine, left, error = plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], mine)
         row = next((r for r in report["gates"] if r["gate"] == "G1"), None)
         if error or not left or row is None:
             return
@@ -23739,7 +23739,7 @@ def claim_union_note(report, ctx, runner, now):
                 covered.update(x["id"] for x in claimed)
         missing = [x["id"] for x in left if x["id"] not in covered]
         report["unclaimed"] = missing
-        report["claim_union"] = sorted(covered | {x["id"] for x in plan_ledger.pr_scenarios(ctx.plan["scenarios_parsed"], mine)[0]})   # the union of the open and merged claims of this ask (#976)
+        report["claim_union"] = sorted(covered | {x["id"] for x in claimed_mine})   # the union of the open and merged claims of this ask (#976)
         row["detail"] = (row.get("detail") or "") + "; claimed by no other pull request (open or merged, same plan) yet: %s" % (", ".join(missing) if missing else "none")
     except Exception as err:   # said, never silent
         report["unclaimed_error"] = _one_line("%s: %s" % (type(err).__name__, err), 160)

@@ -80077,8 +80077,92 @@ class TestPrClaimLine(LedgerBase):
         the item commands have no pull request body and read `slice:` instead."""
         text = (BIN / "fleet-switchboard").read_text()
         self.assertEqual(text.count("plan_ledger.pr_scenarios("), 5)   # prove/verdict S, verdict --all, the ci recorder, and the two reads of the union note
-        self.assertEqual((BIN / "plan_ledger.py").read_text().count("pr_scenarios("), 2)   # its definition and the G1 call
+        self.assertEqual((BIN / "plan_ledger.py").read_text().count("pr_scenarios("), 3)   # its definition, the G1 call and the claim union
 
+
+
+class TestClaimUnionAtLastMerge(LedgerBase):
+    """#976: the last merge of an ask is refused while the merged claims leave a per-PR scenario of the plan uncovered. Neutral plan: LEDGER_PLAN (per PR: S1, S2, S3, U1)."""
+
+    THREE = [{"id": "S1", "proof": "test", "evaluator": "ci"}, {"id": "S2", "proof": "test", "evaluator": "ci"}, {"id": "S3", "proof": "test", "evaluator": "ci"}]
+
+    def setUp(self):
+        super().setUp()
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.configure(evaluators={"reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]})
+        self.peers = []
+
+    def waive(self, who="cos", gates="CU"):
+        return self.run_as(who, "waive", self.PR, "--gates", gates, "--reason", "the owner decided to ship without the third pull request")
+
+    def body(self, claims):
+        self.pr["body"] = "PLAN: acme/app#7\n%scanon: updated the docs" % ("CLAIMS: %s\n" % claims if claims is not None else "")
+
+    def refusal(self, peers=None):
+        listed = [dict(number=100 + n, state=state, merged_at="2026-01-01T00:00:00Z" if state == "merged" else None, body="PLAN: acme/app#7\n" + (("CLAIMS: %s" % c) if c else ""))
+                  for n, (state, c) in enumerate(self.peers if peers is None else peers)]
+        for one in listed:
+            one["state"] = "closed" if one["state"] == "merged" else one["state"]
+        route = self.route
+        route2 = lambda argv, **kw: (subprocess.CompletedProcess(argv, 0, json.dumps(listed), "") if "/pulls?state=all" in " ".join(argv) else route(argv, **kw))
+        args = types.SimpleNamespace(pr=self.PR)
+        saved, self.route = self.route, route2
+        try:
+            return sb.claim_union_refusal(args, route2, self.world.clock.now)
+        finally:
+            self.route = saved
+
+    def test_s2_two_prs_claiming_s1_and_s2_of_three_leave_s3_and_the_union_is_pure(self):
+        applies, uncovered, last = sb.plan_ledger.claim_union(self.THREE, "PLAN: x#1\nCLAIMS: S2", [("merged", "PLAN: x#1\nCLAIMS: S1")])
+        self.assertEqual((applies, uncovered, last), (True, ["S3"], True))
+
+    def test_s3_the_last_merge_is_refused_naming_the_uncovered_scenario_and_a_third_claiming_it_allows(self):
+        self.body("S1")
+        why = self.refusal([("merged", "S2 U1")])
+        self.assertIsNotNone(why)
+        self.assertIn("S3", why)
+        self.assertNotIn("S2", why.split("do not cover")[1].split(";")[0])
+        self.assertIsNone(self.refusal([("merged", "S2 U1"), ("merged", "S3")]))       # a third claims S3: allowed
+
+    def test_a_merge_that_is_not_the_asks_last_is_not_refused(self):
+        self.body("S1")
+        self.assertIsNone(self.refusal([("merged", "S2 U1"), ("open", "S3")]))
+
+    def test_s4_a_logged_cu_waiver_passes_the_last_merge(self):
+        self.body("S1")
+        self.assertIsNotNone(self.refusal([("merged", "S2 U1")]))
+        self.assertEqual(self.waive("cos", "CU")[0], 0)
+        self.assertIsNone(self.refusal([("merged", "S2 U1")]))
+
+    def test_s4_a_plan_with_no_claim_lines_is_unchanged(self):
+        self.body(None)
+        self.assertIsNone(self.refusal([("merged", None), ("open", None)]))
+        self.assertIsNone(self.refusal([]))
+        self.assertEqual(sb.plan_ledger.claim_union(self.THREE, "PLAN: x#1", []), (False, [], True))
+
+    def test_u1_a_plan_without_claim_lines_and_a_non_last_merge_give_no_refusal(self):
+        self.body(None)
+        self.assertIsNone(self.refusal([("open", None)]))
+        self.body("S1")
+        self.assertIsNone(self.refusal([("open", "S2 S3 U1")]))
+
+    def test_s5_a_mutant_that_ignores_the_union_fails_the_clause_tests(self):
+        ledger = sb.load_plan_ledger()
+        real = ledger.claim_union
+        def clause():
+            self.test_s3_the_last_merge_is_refused_naming_the_uncovered_scenario_and_a_third_claiming_it_allows()
+            self.test_s2_two_prs_claiming_s1_and_s2_of_three_leave_s3_and_the_union_is_pure()
+        clause()
+        mutant = lambda scenarios, this_body, others: (True, [], True)
+        with mock.patch.object(ledger, "claim_union", mutant):
+            with self.assertRaises(AssertionError):
+                clause()
+        self.assertIs(ledger.claim_union, real)
+
+    def test_s6_the_planning_skill_and_the_plan_template_say_every_scenario_must_be_claimed(self):
+        sentence = "every per-pull-request scenario must be claimed by some pull request"
+        docs = [REPO / "skills" / "fleet-planning" / "SKILL.md", REPO / "docs" / "plan-template.md"]
+        self.assertEqual(sum(sentence in " ".join(d.read_text().split()) for d in docs), 2)
 
 class TestPlanRulesWordedAlike(unittest.TestCase):
     """#943: the template and the planning skill carry both rules in the same words; the finding states its two recorded cases with neutral numbers."""
