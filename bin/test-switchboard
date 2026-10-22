@@ -15383,9 +15383,8 @@ class TestClearMarker(Base):
         self.assertFalse(sb.pr_marker_state([], sb.marker_edit("MERGE: captain\n")[0], now=0)["captain"])
 
 
-class TestOneCharter(Base):
-    """#969: an orchestrator's charter is the registry row's `charter`, the one record; the lane lookup reads it and the live session's metadata (written once at launch) is never a second owner. Every test
-    drives the REAL lookups (`_lane_of_issue`, `lanes.charter_orchestrators`) over the REAL registry module and the real discovery of the fake service."""
+class CharterRig:
+    """The shared setUp and helpers of the charter classes (a mixin, so a class that only needs the rig does not re-run another class's tests)."""
 
     REPO = "acme-org/widget-api"
 
@@ -15402,6 +15401,7 @@ class TestOneCharter(Base):
         patcher = mock.patch.object(sb.IntentReader, "parent", lambda reader, number, repo=None: self.parents[number])   # #1143: the command's guard reads the same parents
         patcher.start()
         self.addCleanup(patcher.stop)
+
 
     def orchestrator(self, name, charter=None, issue=None, registry=True):
         """A running orchestrator whose live SESSION metadata says `charter` and `issue`; its registry row (the first-seen fill the pass makes) holds the metadata charter unless `registry` is a value or False."""
@@ -15425,6 +15425,24 @@ class TestOneCharter(Base):
         agents = self.engine.discover(self.world.clock.now()).agents
         orchestrators = {n: a for n, a in agents.items() if (a.fleet or {}).get("role") == "orchestrator"}
         return sb._lane_of_issue(self.engine, self.REPO, 3 if number == 1 else number, orchestrators)
+
+    def run_as(self, who, *argv):
+        if who is None:
+            os.environ.pop("HERDR_PANE_ID", None)
+        else:
+            os.environ["HERDR_PANE_ID"] = self.world.panes[who]
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+
+    def row(self, name):
+        return self.registry.read(self.world.state)["agents"][name]
+
+
+class TestOneCharter(CharterRig, Base):
+    """#969: an orchestrator's charter is the registry row's `charter`, the one record; the lane lookup reads it and the live session's metadata (written once at launch) is never a second owner. Every test
+    drives the REAL lookups (`_lane_of_issue`, `lanes.charter_orchestrators`) over the REAL registry module and the real discovery of the fake service."""
 
     # the shapes of a lookup: how the registry and the session metadata name charter 1, and what the lookup says. One table, driven row by row.
     def shape_session_issue_only(self):
@@ -15496,9 +15514,6 @@ class TestOneCharter(Base):
     def health(self):
         self.engine.discover(self.world.clock.now())
         sb.pane_health_pass(self.engine, self.world.clock.now())
-
-    def row(self, name):
-        return self.registry.read(self.world.state)["agents"][name]
 
     def test_the_pass_keeps_a_corrected_charter_fills_a_first_seen_agent_and_says_a_disagreement_once(self):
         self.orchestrator("orch-b", charter=1)           # first seen: the launch value is the row's
@@ -15622,15 +15637,6 @@ class TestOneCharter(Base):
                 self.assertEqual(sb.registry_charter(registered, name, session), expected)
 
     # -- the command
-
-    def run_as(self, who, *argv):
-        if who is None:
-            os.environ.pop("HERDR_PANE_ID", None)
-        else:
-            os.environ["HERDR_PANE_ID"] = self.world.panes[who]
-        with captured() as (out, err):
-            code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
-        return code, out.getvalue(), err.getvalue()
 
     def test_charter_set_is_audited_refused_for_an_agent_and_for_a_bad_value(self):
         self.orchestrator("orch-b", charter=1)
@@ -15760,7 +15766,7 @@ class TestOneCharter(Base):
 
 
 
-class TestCharterSetGuard(TestOneCharter):  # (re-runs the parent class's tests: cheap)
+class TestCharterSetGuard(CharterRig, Base):
     """#1143: the Chief of Staff's `charter set` guard, its audit and its read-back; the permission diff of the definition."""
 
     def setUp(self):
@@ -15810,6 +15816,150 @@ class TestCharterSetGuard(TestOneCharter):  # (re-runs the parent class's tests:
         detail = lines[0]["detail"]
         self.assertEqual((detail["caller"], detail["orchestrator"], detail["old"], detail["new"]), ("cos", "orch-b", None, 3))
 
+    def without(self, why):
+        """A mutant registry writer: a guard verdict with this `why` is ignored (the branch is skipped)."""
+        real = self.registry.set_charter
+
+        def mutant(state_dir, name, charter, by, now=None, check=None):
+            return real(state_dir, name, charter, by, now=now, check=lambda doc, row: (lambda v: None if v and v[0] == why else v)(check(doc, row)))
+        return mock.patch.object(self.registry, "set_charter", mutant)
+
+    def retire(self, name):
+        self.registry._mutate(self.world.state, lambda doc: (doc["retired"].__setitem__(name, {"at": "2026-01-01T00:00:00Z"}) or True, [], None))
+
+    def unreadable(self, reader, number, repo=None):
+        raise RuntimeError("HTTP 502")
+
+    def test_an_unreadable_parent_is_refused_unverified_and_nothing_is_written(self):
+        self.orchestrator("orch-b", registry=None)
+        before = (Path(self.world.state) / "registry.json").read_text()
+        with mock.patch.object(sb.IntentReader, "parent", self.unreadable):
+            code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertIn(code, (1, 2))
+        self.assertIn("cannot read #3's parent", err)
+        self.assertEqual((Path(self.world.state) / "registry.json").read_text(), before)
+        self.assertEqual([e["detail"]["why"] for e in self.audit_lines()], ["unverified"])
+
+    def test_mutant_an_unreadable_parent_passes(self):
+        self.orchestrator("orch-b", registry=None)
+        with mock.patch.object(sb.IntentReader, "parent", self.unreadable), self.without("unverified"):
+            code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertEqual(self.row("orch-b")["charter"], 3)   # the write the real guard refuses: test_an_unreadable_parent... fails for this mutant
+
+    def test_a_retired_holder_does_not_hold_the_issue(self):
+        self.orchestrator("orch-a", registry=3)
+        self.orchestrator("orch-b", registry=None)
+        self.retire("orch-a")
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.row("orch-b")["charter"], 3)
+
+    def test_mutant_a_retired_holder_still_holds(self):
+        self.orchestrator("orch-a", registry=3)
+        self.orchestrator("orch-b", registry=None)
+        self.retire("orch-a")
+        real = self.registry.set_charter
+        mutant = lambda state_dir, name, charter, by, now=None, check=None: real(state_dir, name, charter, by, now=now, check=lambda doc, row: (
+            ("already held by", "held by a retired holder") if any(o.get("charter") == charter for n, o in doc["agents"].items() if n != name) else check(doc, row)))
+        with mock.patch.object(self.registry, "set_charter", mutant):
+            code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertIsNone(self.row("orch-b")["charter"])   # the refusal test_a_retired_holder_does_not_hold_the_issue forbids
+
+    def test_a_holder_in_another_repo_does_not_count(self):
+        self.orchestrator("orch-a", registry=3)
+        self.registry.upsert(self.world.state, "orch-a", {"session": "s-a", "pane": self.world.panes["orch-a"], "role": "orchestrator", "charter": 3, "repo": "other-org/elsewhere"})
+        self.orchestrator("orch-b", registry=None)
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.row("orch-b")["charter"], 3)
+
+    def test_mutant_a_holder_in_another_repo_counts(self):
+        self.orchestrator("orch-a", registry=3)
+        self.registry.upsert(self.world.state, "orch-a", {"session": "s-a", "pane": self.world.panes["orch-a"], "role": "orchestrator", "charter": 3, "repo": "other-org/elsewhere"})
+        self.orchestrator("orch-b", registry=None)
+        real = self.registry.set_charter
+        mutant = lambda state_dir, name, charter, by, now=None, check=None: real(state_dir, name, charter, by, now=now, check=lambda doc, row: (
+            ("already held by", "held elsewhere") if any(o.get("charter") == charter for n, o in doc["agents"].items() if n != name) else check(doc, row)))
+        with mock.patch.object(self.registry, "set_charter", mutant):
+            self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertIsNone(self.row("orch-b")["charter"])
+
+    def test_setting_the_same_value_needs_no_replace_and_says_unchanged(self):
+        self.orchestrator("orch-b", registry=3)
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertEqual(code, 0, err)
+        self.assertIn("(unchanged)", out)
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3", "--replace")   # --replace on a lane that already holds the same value: the same, no error
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.row("orch-b")["charter"], 3)
+        self.assertEqual([e["detail"]["changed"] for e in self.audit_lines()], [False, False])
+
+    def test_mutant_the_same_value_needs_replace(self):
+        self.orchestrator("orch-b", registry=3)
+        real = self.registry.set_charter
+        mutant = lambda state_dir, name, charter, by, now=None, check=None: real(state_dir, name, charter, by, now=now, check=lambda doc, row: (
+            ("--replace", "needs --replace") if row.get("charter") is not None else check(doc, row)))
+        with mock.patch.object(self.registry, "set_charter", mutant):
+            code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertNotEqual(code, 0)   # test_setting_the_same_value_needs_no_replace... asserts 0
+
+    def refused_caller_audit(self):
+        self.orchestrator("orch-b", registry=None)
+        with mock.patch.object(sb, "move_caller", lambda *a, **k: ("evil\n<b>x</b>", "coder")):
+            code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        return code, err, self.audit_lines()
+
+    def test_a_refused_caller_is_audited_through_charter_safe(self):
+        code, err, lines = self.refused_caller_audit()
+        self.assertEqual(code, 1, err)
+        self.assertIsNone(self.row("orch-b")["charter"])
+        (line,) = lines
+        self.assertEqual((line["event"], line["detail"]["why"], line["detail"]["role"]), ("charter.refused", "caller", "coder"))
+        self.assertEqual(line["detail"]["caller"], "evil??b?x??b?")
+        self.assertNotIn("<", err)
+
+    def test_mutant_a_refused_caller_is_audited_raw(self):
+        with mock.patch.object(sb, "charter_safe", lambda text: str(text)):
+            code, err, lines = self.refused_caller_audit()
+        self.assertIn("\n", lines[0]["detail"]["caller"])   # the raw caller: test_a_refused_caller_is_audited_through_charter_safe fails for it
+
+    WHYS = {"absent": "ghost", "retired": "orch-r", "not an orchestrator": "worker", "value": "orch-b"}
+
+    def observed_whys(self, writer):
+        self.orchestrator("orch-r", registry=None)
+        self.retire("orch-r")
+        self.registry.upsert(self.world.state, "worker", {"session": "s-w", "pane": "p-w", "role": "coder", "charter": None, "repo": self.REPO})
+        self.orchestrator("orch-b", registry=None)
+        return {why: writer(self.world.state, name, "x" if why == "value" else 3, "test").get("why") for why, name in self.WHYS.items()}
+
+    def test_every_registry_refusal_carries_a_why_code(self):
+        self.assertEqual(self.observed_whys(self.registry.set_charter), {k: k for k in self.WHYS})
+
+    def test_mutant_each_why_code_is_pinned(self):
+        for code in self.WHYS:
+            real = self.registry.set_charter
+            mutant = lambda *a, _code=code, **k: {key: val for key, val in real(*a, **k).items() if not (key == "why" and val == _code)}
+            with self.subTest(code=code):
+                self.setUp() if code != "absent" else None
+                self.assertNotEqual(self.observed_whys(mutant), {k: k for k in self.WHYS})
+
+    def test_from_is_not_honoured_outside_the_lab(self):
+        self.orchestrator("orch-b", registry=None)
+        self.world.add_agent("worker", fleet={"role": "coder", "reports_to": "orch-b", "repo": self.REPO})
+        with mock.patch.dict(os.environ):
+            os.environ.pop(sb.LAB_ENV, None)
+            for who in ("cos", "worker", None):
+                code, out, err = self.run_as(who, "charter", "set", "orch-b", "3", "--from", "cos")
+                self.assertNotEqual(code, 0, who)
+                self.assertIn("only for the Lab", err)
+        self.assertIsNone(self.row("orch-b")["charter"])
+
+    def test_mutant_from_honoured_outside_the_lab_writes(self):
+        self.orchestrator("orch-b", registry=None)
+        with mock.patch.object(sb, "move_caller", lambda engine, args, runner, now: ("cos", "chief-of-staff") if args.sender else (None, None)):
+            code, out, err = self.run_as(None, "charter", "set", "orch-b", "3", "--from", "cos")
+        self.assertEqual(self.row("orch-b")["charter"], 3)   # what test_from_is_not_honoured_outside_the_lab forbids
+
     def test_the_definition_adds_exactly_one_charter_permission_and_nothing_wider(self):
         text = (Path(sb.__file__).resolve().parent.parent / "agents/opencode/chief-of-staff.md").read_text()
         allows = [l for l in text.splitlines() if l.lstrip().startswith("- {action: shell") and "charter" in l]
@@ -15817,7 +15967,7 @@ class TestCharterSetGuard(TestOneCharter):  # (re-runs the parent class's tests:
         self.assertIn('resource: "fleet-switchboard charter set *"', allows[0])
         self.assertNotIn("charter *", text)
 
-class TestCharterSetRaceAndSanitising(TestOneCharter):
+class TestCharterSetRaceAndSanitising(CharterRig, Base):
     """#1143 (panel): the guard's checks and the write are ONE registry lock; the lane, issue and --replace arguments are validated and escaped in every sink."""
 
     HOSTILE = ("a\nfake.line", "x" * 300, "<b>&bold;`rm`</b>", "9\n9", "-1", "0", "12345678901234")
@@ -15825,23 +15975,43 @@ class TestCharterSetRaceAndSanitising(TestOneCharter):
     def audit_lines(self):
         return [e for e in self.world.audit() if e["event"].startswith("charter.") and e["event"] != "charter.disagree"]
 
-    def run_two(self):
-        """Two interleaved callers (threads, one barrier) set DIFFERENT orchestrators to the SAME issue; the issue lookup is slow so the callers overlap."""
+    def run_two(self, outside_the_lock=False):
+        """Two callers set DIFFERENT orchestrators to the SAME issue, driven by events, never by sleeps. The hook sits in the registry's critical section (the guard): caller A, once inside it, signals and then waits
+        until B has STARTED its call and (for a bounded wait that only the broken code needs to end early) until B's own check has run. B starts only after A is provably inside. With the one lock B's check cannot
+        run until A has left, so A's wait ends by its bound and the outcome is the same on any machine; with the check outside the lock B's check runs at once. The parents are read before the lock (nothing slow in it)."""
         import threading
         self.orchestrator("orch-a", registry=None)
         self.orchestrator("orch-b", registry=None)
-        os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
-        barrier, codes = threading.Barrier(2), {}
+        os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]   # set once, here, before any thread: the callers share one identity
+        a_in, b_started, b_checked, codes = threading.Event(), threading.Event(), threading.Event(), {}
+        real = self.registry.set_charter
 
-        def slow(reader, number, repo=None):
-            time.sleep(0.4)
-            return self.parents[number]
+        def spy_of(name, check):
+            def spy(doc, row):
+                verdict = check(doc, row)
+                if name == "orch-a":
+                    a_in.set()
+                    b_started.wait(10)
+                    b_checked.wait(1.0)
+                else:
+                    b_checked.set()
+                return verdict
+            return spy
+
+        def hooked(state_dir, name, charter, by, now=None, check=None):
+            if name == "orch-b":
+                a_in.wait(10)       # B tries only once A is inside its critical section
+                b_started.set()
+            if outside_the_lock:    # the mutant: the check on an earlier read, then the write (the old order)
+                doc = self.registry.read(state_dir)
+                verdict = spy_of(name, check)(doc, doc["agents"][name])
+                return {"changed": False, "problem": verdict[1], "why": verdict[0]} if verdict else real(state_dir, name, charter, by, now=now)
+            return real(state_dir, name, charter, by, now=now, check=spy_of(name, check))
 
         def one(name):
-            barrier.wait(5)
             codes[name] = sb.main(["charter", "set", name, "3"], runner=self.world.route, now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
 
-        with captured() as (out, err), mock.patch.object(sb.IntentReader, "parent", slow):
+        with captured() as (out, err), mock.patch.object(self.registry, "set_charter", hooked):   # ONE capture in this thread: no thread swaps the process's stderr
             threads = [threading.Thread(target=one, args=(n,)) for n in ("orch-a", "orch-b")]
             [t.start() for t in threads]
             [t.join(30) for t in threads]
@@ -15854,15 +16024,24 @@ class TestCharterSetRaceAndSanitising(TestOneCharter):
         self.assertEqual(sorted(codes[0].values()), [0, 2])
 
     def test_mutant_checks_outside_the_lock_lets_both_pass(self):
+        codes, held = self.run_two(outside_the_lock=True)
+        self.assertEqual(len(held), 2, (codes, held))   # the race the single lock closes: this mutant makes test_two_concurrent_sets_of_one_issue_cannot_both_pass fail, every time
+
+    def test_the_parents_are_read_before_the_lock_and_never_inside_it(self):
+        self.orchestrator("orch-b", registry=None)
+        seen = []
+        real_parent = lambda reader, number, repo=None: (seen.append(("parent", number)), self.parents[number])[1]
         real = self.registry.set_charter
 
-        def outside(state_dir, name, charter, by, now=None, check=None):
-            doc = self.registry.read(state_dir)
-            verdict = check(doc, doc["agents"][name]) if check else None   # the check on an earlier read, then the write: the old order
-            return {"changed": False, "problem": verdict[1]} if verdict else real(state_dir, name, charter, by, now=now)
-        with mock.patch.object(self.registry, "set_charter", outside):
-            codes, held = self.run_two()
-        self.assertEqual(len(held), 2, (codes, held))   # the race the single lock closes: this mutant must fail test_two_concurrent_sets_of_one_issue_cannot_both_pass
+        def spy(state_dir, name, charter, by, now=None, check=None):
+            def inner(doc, row):
+                seen.append(("lock",))
+                return check(doc, row)
+            return real(state_dir, name, charter, by, now=now, check=inner)
+        with mock.patch.object(sb.IntentReader, "parent", real_parent), mock.patch.object(self.registry, "set_charter", spy):
+            code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(seen, [("parent", 3), ("parent", 1), ("lock",)])   # the GitHub reads, then the registry's critical section; none inside it
 
     def test_hostile_values_are_refused_and_escaped_in_every_sink(self):
         self.orchestrator("orch-b", registry=None)
@@ -15899,18 +16078,15 @@ class TestCharterSetRaceAndSanitising(TestOneCharter):
         self.assertNotIn("<", out)
         self.assertEqual(out.count("\n"), 2, out)
 
-    def test_a_mutant_per_sink_shows_the_hostile_text(self):
-        """Each sink's escape is what keeps the text out: with that sink's escape removed the hostile value shows (so the tests above fail for it)."""
+    def test_a_mutant_without_the_escape_shows_the_hostile_text(self):
+        """One escape for every sink: with it removed the hostile value shows in the audit and on stderr (so the tests above fail for it)."""
         self.orchestrator("orch-b", registry=None)
-        for sink, where in (("audit", "audit"), ("stderr", "stderr")):
-            raw = lambda text, s, _sink=sink: str(text) if s == _sink else sb.re.sub(r"[^A-Za-z0-9_.#-]", "?", str(text)[:40])
-            with mock.patch.object(sb, "charter_safe", raw):
-                code, out, err = self.run_as("cos", "charter", "set", "orch-b", "<b>x\ny")
-            shown = err if where == "stderr" else json.dumps([e["detail"] for e in self.audit_lines()])
-            self.assertTrue("<b>" in shown, (sink, shown))
-        raw = lambda text, s: str(text) if s == "stdout" else sb.re.sub(r"[^A-Za-z0-9_.#-]", "?", str(text)[:40])
+        with mock.patch.object(sb, "charter_safe", lambda text: str(text)):
+            code, out, err = self.run_as("cos", "charter", "set", "orch-b", "<b>x\ny")
+        self.assertIn("<b>", err)
+        self.assertIn("<b>", json.dumps([e["detail"] for e in self.audit_lines()]))
         self.registry.upsert(self.world.state, "orch-b", {"session": "s-x", "pane": self.world.panes["orch-b"], "role": "orchestrator", "charter": None, "repo": "acme<b>"})
-        with mock.patch.object(sb, "charter_safe", raw):
+        with mock.patch.object(sb, "charter_safe", lambda text: str(text)):
             code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
         self.assertIn("<b>", out)
 

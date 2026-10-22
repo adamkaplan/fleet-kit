@@ -466,19 +466,23 @@ def set_charter(state_dir, name, charter, by, now=None, check=None):
     """Write an orchestrator's registry charter (an issue number, or None to clear it): the ONLY command-side writer of the field. One audit event with the old and the new value and who ran it.
     Refused (nothing written, a problem line) for an agent not in the registry, one retired, or one that is not an orchestrator, and for a value that is not an issue number or None."""
     refused = []
+    def refuse(why, text):
+        refused.append((why, text))
+        return False, [], text
     def change(doc):
         row = doc["agents"].get(name)
-        if not isinstance(row, dict) or name in doc["retired"]:
-            return False, [], "%s is not a registered agent" % name
+        if not isinstance(row, dict):
+            return refuse("absent", "%s is not a registered agent" % name)
+        if name in doc["retired"]:
+            return refuse("retired", "%s is retired" % name)
         if row.get("role") != ORCHESTRATOR:
-            return False, [], "%s is not an orchestrator" % name
+            return refuse("not an orchestrator", "%s is not an orchestrator" % name)
         if charter is not None and not is_charter(charter):
-            return False, [], "a charter is an issue number or none"
+            return refuse("value", "a charter is an issue number or none")
         if check is not None:
             verdict = check(doc, row)   # #1143: the caller's guard, judged on THIS locked read, so check and write are one step
             if verdict:
-                refused.append(verdict)
-                return False, [], verdict[1]
+                return refuse(*verdict)
         old = row.get("charter")
         if old == charter:
             return False, [], None
