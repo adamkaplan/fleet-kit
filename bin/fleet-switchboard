@@ -14490,6 +14490,7 @@ class TriageState:
     """Memory only: rebuilt from GitHub and the decision list."""
 
     def __init__(self):
+        self.wanted = 0          # #1140: units a pass wants read (repositories x units), for the skip line
         self.units = {}          # (repo, unit) -> {"at", "data", "truncated", "error"}
         self.unreadable = {}     # repo -> reason, audited once
         self.confirmed, self.attempted, self.alarmed = {}, {}, {}
@@ -14716,7 +14717,9 @@ def triage_refresh(engine, state, repos, units, now, budget, reserve=1, seconds=
             held = state.units.get((repo, unit))
             if held is None or now - held["at"] >= TRIAGE_TTL:
                 todo.append(((held or {"at": 0})["at"], repo, unit))
-    for _, repo, unit in sorted(todo):
+    alerts = set(((engine.config.get("triage") or {}).get("alert_labels") or {}) if isinstance(engine.config.get("triage"), dict) else ())
+    # #1140: the not-yet-read `issues` unit of an alert repository goes first (one list per such repository), then the old order
+    for _, repo, unit in sorted(todo, key=lambda t: (not (t[2] == "issues" and t[1] in alerts),) + t):
         if budget[0] - reserve < 1 or engine.now() - state.started >= seconds:
             break
         try:
@@ -15102,6 +15105,9 @@ def whole_skipped(engine, consumer, name):
     said = engine.__dict__.setdefault("read_whole_said", {})
     if said.get((consumer, name)) != at:
         said[(consumer, name)] = at
+        state = getattr(engine, "triage", None)
+        if name.startswith("issues:") and state is not None and getattr(state, "wanted", 0):
+            why = "%s (%d of %d units read)" % (why, len(state.units), state.wanted)   # #1140: how far the cold start has got
         engine._note("whole.skipped", None, {"consumer": consumer, "input": name, "why": why})
     return True
 
@@ -15166,6 +15172,7 @@ def triage_pass(engine, decisions, now, errors=()):
     budget = [cfg.get("calls_per_pass", TRIAGE_CALLS_PER_PASS)]
     seconds = cfg.get("pass_seconds", TRIAGE_PASS_SECONDS)
     units = ["issues", "comments", "merged"] + ["closed:" + l for l in sorted(triage_awaiting_labels(engine))]
+    state.wanted = len(repos) * len(units)
     triage_refresh(engine, state, repos, units, now, budget, max(1, budget[0] // 3), seconds)  # a third kept for fresh checks
     triage_read_live(engine, state, repos, now, budget, max(1, cfg.get("calls_per_pass", TRIAGE_CALLS_PER_PASS) // 3), seconds)
     triage_refresh_ownerless(engine, state, cfg, now, budget, seconds)   # #605: the team repositories' whole lists, after the shared units

@@ -31393,6 +31393,61 @@ class TestCaptainTriage(TestTriage):
         self.assertEqual(self.only("T7"), [])                                    # held by its label: T6's, not T7's
 
 
+class TestAlertColdStart(Base):
+    """#1140: after a start the alert repositories' `issues` lists are read before every other unit; six repositories, one alert, four reads a pass."""
+    REPOS = ["acme-org/r%d" % i for i in range(1, 7)]
+    ALERT = "acme-org/r6"   # the last by name: the old order reads it last
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={"github_repos": list(self.REPOS)})
+        self.world.add_agent("orch", fleet={"role": "orchestrator", "charter": 1, "repo": self.ALERT})
+        self.hub = FakeTriageHub()
+        self.engine = self.world.engine
+        self.engine.hub = self.hub
+        self.engine.config["triage"] = dict(sb.TRIAGE_DEFAULTS, repos=list(self.REPOS), our_logins=["bot"], calls_per_pass=6,
+                                            alert_labels={self.ALERT: ["ops-alert"]})
+        self.engine.discover(self.world.clock.now())
+        for repo in self.REPOS:
+            self.hub.open[repo] = {}
+        self.hub.open[self.ALERT][7] = tri_issue(self.world.clock.now(), 7, labels=["ops-alert"], title="Nightly job failed", repo=self.ALERT)
+
+    def passes(self, n=1):
+        self.hub.calls.clear()
+        for _ in range(n):
+            self.world.tick(1)
+            sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+
+    def sent(self):
+        return [e for e in self.world.audit() if e["event"] == "alert_wake.sent"]
+
+    def test_the_first_pass_reads_the_alert_issues_and_the_wake_sends(self):
+        self.passes()
+        self.assertEqual(len([c for c in self.hub.calls if "per_page" in c]), 4)   # the budget holds: four reads, never five
+        self.assertTrue(sb.whole(self.engine, "issues:" + self.ALERT)[0])
+        self.assertEqual(len(self.sent()), 1)
+
+    def test_with_no_alert_labels_the_old_order_is_kept(self):
+        self.engine.config["triage"]["alert_labels"] = {}
+        self.passes()
+        self.assertFalse(sb.whole(self.engine, "issues:" + self.ALERT)[0])
+        self.assertEqual(self.sent(), [])
+
+    def test_the_skip_line_says_how_far_the_start_has_got(self):
+        self.engine.config["triage"]["alert_labels"] = {}
+        self.passes()
+        self.engine.config["triage"]["alert_labels"] = {self.ALERT: ["ops-alert"]}
+        self.engine.triage.units.clear()
+        self.engine.triage.units[(self.REPOS[0], "issues")] = {"at": 0, "data": [], "truncated": False, "error": None}
+        self.engine.triage.units[(self.REPOS[0], "merged")] = {"at": 0, "data": [], "truncated": False, "error": None}
+        self.engine.triage.wanted = 30
+        self.engine.read_whole_said = {}
+        sb.read_mark(self.engine, "issues:" + self.ALERT, False, "issues not read yet", self.world.clock.now())
+        sb.whole_skipped(self.engine, "alert_wake", "issues:" + self.ALERT)
+        lines = [e["detail"]["why"] for e in self.world.audit() if e["event"] == "whole.skipped" and e["detail"]["input"] == "issues:" + self.ALERT]
+        self.assertTrue(any("2 of 30 units read" in l for l in lines), lines)
+
+
 class TestAlertWake(Base):
     """#851: an open issue carrying a configured alert label wakes that repository's orchestrator once per issue and label. Real triage pass, real fact
     source, fakes and temp dirs only."""
