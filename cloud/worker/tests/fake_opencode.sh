@@ -5,6 +5,8 @@ rec="${FAKE_OC_REC:?}"
 echo "$*" >> "$rec/calls"
 [ "${1:-} ${2:-}" = "auth import" ] || exit 9
 cat > "$rec/stdin"
+# FAKE_OC_ECHO makes it print what it was given on stdout AND stderr (what a leaky import would show), on success and on failure.
+if [ -n "${FAKE_OC_ECHO:-}" ]; then cat "$rec/stdin"; cat "$rec/stdin" >&2; fi
 [ -z "${FAKE_OC_FAIL:-}" ] || exit 1
 echo imported > "${XDG_DATA_HOME:?}/opencode/store"
 echo import >> "$rec/order"

@@ -55,6 +55,15 @@ class Import(te.Entrypoint):
             r = self.start("true", **extra)
             self.assert_not_printed(r.stdout + r.stderr, "entrypoint output %r" % extra)
 
+    def test_s8_what_the_import_echoes_on_stdout_and_stderr_never_reaches_the_entrypoint_output(self):
+        for extra in ({}, {"FAKE_OC_FAIL": "1"}):
+            r = self.start("true", FAKE_OC_ECHO="1", **extra)
+            self.assertEqual(read(os.path.join(self.rec, "stdin")), MODEL)   # the stand-in did receive (and echo) it
+            for value in (MODEL, te.MODEL_VALUES[1]):
+                self.assertNotIn(value, r.stdout + r.stderr, "entrypoint output %r" % extra)
+            self.assertEqual(r.stdout, "")
+            self.assertIn(r.stderr.strip(), ("", REFUSAL))
+
 
 if __name__ == "__main__":
     unittest.main()

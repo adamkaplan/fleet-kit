@@ -243,6 +243,13 @@ The owner step, done only after the change that adds `issues: read` is merged: a
 
 The launcher reads the live model credential from OpenCode's own store with `opencode auth export` (in memory, never a file, never printed) and copies only the one `github-copilot` entry into the per-run Secret. The pod imports it with `opencode auth import --standalone` before its server starts. The legacy `auth.json` is not read: the server ignores it.
 
+What to know before you run it:
+
+- **A worker can read the credential.** For the life of its pod, the worker can read the one-entry array (the access entry and its refresh token) at `/run/cw/model-auth` and the store under `XDG_DATA_HOME`. The worker's shell deny rules are not a guard against that. Whether it could send the value out depends on the pod's network egress, which this change does not restrict.
+- **The pod holds a snapshot taken at launch.** Nothing re-reads your store. A credential that is revoked or rotated ends that pod's turns; a refresh token you rotate afterwards is not pushed to a running pod. Launch a new run to pick it up.
+- **A stale `CW_MODEL_AUTH_FILE` is retired, and what happens depends on where it is.** In a settings file it is refused as an unknown setting. In the process environment it is silently ignored (the launcher drops it), so the credential that is active in your store is used with no message.
+- **Image and launcher must match.** An old image with the new launcher answers on the free model (it never imports the credential). The old launcher with the new image refuses at the import (`worker: the model credential import failed; refusing to start`).
+
 To verify it:
 
 - On the launcher's machine, `opencode auth list` shows the `github-copilot` entry as active.

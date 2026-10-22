@@ -125,6 +125,14 @@ class Reader(unittest.TestCase):
             if name not in ("export.json",):
                 self.assertNotIn(CANARY, open(os.path.join(self.home, name), errors="replace").read(), name)
 
+    def test_s4_the_export_child_inherits_no_stdin(self):
+        self.export(json.dumps([MINE]))
+        open(os.path.join(self.home, "export.stdin"), "w").close()
+        code = "import sys; sys.path.insert(0, %r); import model_credential as mc; mc.read_provider_entry(%r, %r)" % (LAUNCHER, PROVIDER, self.env)
+        r = subprocess.run([sys.executable, "-c", code], input=CANARY.encode(), capture_output=True, timeout=60)   # the parent's stdin holds the canary
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(open(os.path.join(self.home, "oc-stdin")).read(), "")
+
     def test_the_scrub_function_redacts_the_canary_when_it_is_fed_in(self):
         import cloud_worker as cw
         self.assertNotIn(CANARY, cw.scrub("line " + CANARY, (CANARY,), 500))
