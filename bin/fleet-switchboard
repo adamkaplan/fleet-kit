@@ -47,14 +47,16 @@ def _fleet_parts(after=False):
     import os, sys
     here = os.path.realpath(__file__)
     try:
-        names = [n.strip() for n in open(here + ".parts").read().splitlines() if n.strip() and not n.lstrip().startswith("#")]
+        with open(here + ".parts") as handle:
+            names = [n.strip() for n in handle.read().splitlines() if n.strip() and not n.lstrip().startswith("#")]
     except OSError:
         return
     paths = [os.path.realpath(os.path.join(os.path.dirname(here), n)) for n in names]
     cut = paths.index(here) if here in paths else len(paths)
     for path in (paths[cut + 1:] if after else paths[:cut]):
         try:
-            code = compile(open(path).read(), path, "exec")
+            with open(path) as handle:
+                code = compile(handle.read(), path, "exec")
         except OSError:
             sys.exit("fleet-switchboard: part file not found: %s" % path)
         exec(code, globals())
