@@ -340,32 +340,17 @@ class CloudCharter(DoctorCase):
     """#1181: a charter whose pane line is `cloud:<agent name>` is live when its row's endpoint answers, unknown when not, never a dead pane."""
 
     def charter_run(self, answer):
-        import http.server, json, socket, threading
+        import json, socket
         tmp = tempfile.mkdtemp(prefix="test-fleet-doctor.")
         self.addCleanup(shutil.rmtree, tmp, True)
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                body = b'[{"id": "msg_example"}]'
-                self.send_response(200 if answer else 503)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, *args):
-                pass
-        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        self.addCleanup(server.server_close)
-        self.addCleanup(server.shutdown)
+        stub = Path(tmp) / "read-stub"   # THE REUSED CALL (`fleet-switchboard read NAME --limit 1`) stubbed: it answers or fails
+        stub.write_text("import sys\nsys.exit(%d)\n" % (0 if answer else 1))
         state = Path(tmp) / "state"
         state.mkdir()
         sys.path.insert(0, str(BIN))
         import registry
         registry.upsert(state, "orch-cloud", {"session": "ses_example1", "pane": None, "role": "orchestrator", "kind": "orchestrator",
-                                              "endpoint": "http://127.0.0.1:%d" % server.server_address[1], "workspace": None, "cwd": None})
-        token = Path(tmp) / "token"
-        token.write_text("example-channel-token\n")
+                                              "endpoint": "http://orch.acme.svc", "workspace": None, "cwd": None})
         body = "```yaml\nstatus: active\npane: cloud:orch-cloud\n```"
         stubs = {
             "herdr": "  echo '{\"result\": {\"panes\": []}}'",
@@ -380,7 +365,7 @@ class CloudCharter(DoctorCase):
         listener.bind(str(sock))
         self.addCleanup(listener.close)
         run.extra_env.update({"HERDR_SOCKET_PATH": str(sock), "FLEET_REPO": "acme-org/widget-service", "FLEET_REGISTRY_DIR": str(state),
-                              "FLEET_CLOUD_TOKEN_FILE": str(token)})
+                              "FLEET_SWITCHBOARD_BIN": str(stub)})
         run.run()
         return run
 

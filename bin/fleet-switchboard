@@ -7239,8 +7239,7 @@ def pane_health_pass(engine, now):
                           and not registry.no_pane_to_judge(registered.get(n))}
     judged_by_endpoint = {n: row for n, row in registered.items() if registry.no_pane_to_judge(row) and row.get("endpoint") is not None and n not in retired}
     try:   # #1181: alive with the time, or unknown; one bounded request per row per pass; never a verdict that removes or alerts
-        engine.row_liveness = load_module("endpoint_liveness").check_all(judged_by_endpoint, get=getattr(engine, "liveness_get", None),
-                                                                 token_path=getattr(engine, "liveness_token_path", None)) if judged_by_endpoint else {}
+        engine.row_liveness = load_module("endpoint_liveness").check_all(judged_by_endpoint, read=getattr(engine, "liveness_read", None)) if judged_by_endpoint else {}
     except Exception:
         engine.row_liveness = {}
     if retired_whole:   # a retired agent (name AND session) leaves the record the pane draws from; its session stays in retired.json for reattach and --undo

@@ -84952,15 +84952,12 @@ class TestNoPaneToJudge(StandInPids, Base):
         self.reg = sb.load_module("registry")
         self.live = sb.load_module("endpoint_liveness")
         self.requests = []
-        self.engine.liveness_get = self.get_ok
-        self.token = Path(tempfile.mkdtemp()) / "token"
-        self.addCleanup(shutil.rmtree, str(self.token.parent), True)
-        self.token.write_text("example-channel-token\n")
-        self.engine.liveness_token_path = str(self.token)
+        self.engine.liveness_read = self.read_ok
 
-    def get_ok(self, url, authorization, timeout):
-        self.requests.append((url, authorization, timeout))
-        return 200, self.ALIVE_BODY
+    def read_ok(self, name, limit):
+        """The stub of THE REUSED CALL (the cloud read of `fleet-switchboard read NAME`): answers."""
+        self.requests.append((name, limit))
+        return True
 
     def rows(self):
         self.reg.upsert(self.world.state, "orch-cloud", {"session": "ses_example1", "pane": None, "role": "orchestrator", "kind": "orchestrator",
@@ -85073,16 +85070,20 @@ class TestNoPaneToJudge(StandInPids, Base):
         def failing(url, authorization, timeout):
             raise OSError("refused")
 
-        def partial(url, authorization, timeout):
-            return 200, b'[{"id": '
+        def failing(name, limit):
+            raise OSError("no tunnel")
 
-        def slow(url, authorization, timeout):
+        def partial(name, limit):
+            return False   # the read exited non-zero part way
+
+        def slow(name, limit):
             threading.Event().wait(2)
-            return 200, self.ALIVE_BODY
-        out = {"alive": self.live.check("x", row, 0.3, str(self.token), self.get_ok, clock=lambda: 1234)}
+            return True
+        out = {"alive": self.live.check("x", row, 0.3, self.read_ok, clock=lambda: 1234)}
+        out["absent"] = self.live.check("x", None, 0.3, self.read_ok)
         for label, fn in (("failed", failing), ("partial", partial), ("slow", slow)):
             started = time.monotonic()
-            out[label] = self.live.check_all({"x": row}, 0.3, str(self.token), fn)["x"]
+            out[label] = self.live.check_all({"x": row}, 0.3, fn)["x"]
             out[label + "_elapsed"] = time.monotonic() - started
         return out
 
@@ -85091,7 +85092,7 @@ class TestNoPaneToJudge(StandInPids, Base):
         problems = []
         if got["alive"] != {"verdict": "alive", "at": 1234}:
             problems.append("alive")
-        problems += [k for k in ("failed", "partial", "slow") if got[k].get("verdict") != "unknown"]
+        problems += [k for k in ("failed", "partial", "slow", "absent") if got[k].get("verdict") != "unknown"]
         return problems
 
     def test_the_check_is_alive_with_a_time_or_unknown_never_dead(self):
@@ -85104,22 +85105,27 @@ class TestNoPaneToJudge(StandInPids, Base):
         self.rows()
         self.one_pass()
         by_row = [r[0] for r in self.requests]
+        self.assertEqual(sorted(by_row), ["bare", "orch-cloud"])
+        self.assertTrue(all(r[1] <= self.live.LIVENESS_SECONDS for r in self.requests))
         self.assertEqual(len(by_row), 2)   # orch-cloud and bare have an endpoint; pilot has none: no request
         self.assertEqual(len(set(by_row)), 2)
 
-    def test_the_request_carries_the_channels_credential_and_the_row_holds_an_address_only(self):
+    def test_the_row_holds_an_address_only_and_the_module_handles_no_credential(self):
         self.rows()
         self.one_pass()
-        self.assertTrue(self.requests and all(r[1] == "Bearer example-channel-token" for r in self.requests))
+        self.assertTrue(self.requests)
         raw = (self.world.state / "registry.json").read_text()
-        self.assertNotIn("example-channel-token", raw)
-        self.assertNotIn("Bearer", raw)
+        for word in ("Bearer", "password", "token", "Basic"):
+            self.assertNotIn(word, raw)
+        source = (BIN / "endpoint_liveness.py").read_text()
+        for word in ("Authorization", "_read_token", ".password", "urllib"):
+            self.assertNotIn(word, source)
         self.assertEqual(self.engine.row_liveness["orch-cloud"]["verdict"], "alive")
 
     def test_a_failed_slow_or_partial_answer_removes_nothing(self):
         self.rows()
-        for get in (lambda *a: (_ for _ in ()).throw(OSError("x")), lambda *a: (200, b"["), lambda *a: (503, b"")):
-            self.engine.liveness_get = get
+        for read in (lambda *a: (_ for _ in ()).throw(OSError("x")), lambda *a: False, lambda *a: None):
+            self.engine.liveness_read = read
             self.one_pass()
             self.assertEqual({v["verdict"] for v in self.engine.row_liveness.values()}, {"unknown"})
             self.assertTrue({"orch-cloud", "pilot", "bare"} <= set(self.reg.read(self.world.state)["agents"]))
