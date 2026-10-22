@@ -79,13 +79,13 @@ say which pod or secret REMAINS, and the exit is non-zero (130 for a signal).
 
 ## The stack create and the fresh-node race
 
-`create --stack` watches a Pending pod for a bounded window (4 minutes, at most 3 attempts) and recreates it, with the same
+`create --stack` watches a Pending pod for a bounded window (`STACK_RACE_WINDOW_SECONDS`, 600 seconds, with a pause of `STACK_RACE_PAUSE_SECONDS`, 15 seconds, before each recreate; there is no attempt count) and recreates it, with the same
 run id and nonce and without touching the per-run secrets, in two cases. First, the node's runtime handler is not yet
 known (the exact `FailedCreatePodSandBox` message): the node's runtime is configured by the installer about 30 to 60
 seconds after scheduling. Second, the pending pod vanishes: a get that saw the pod then says not found, which live run B
-saw when that runtime restart took the Pending pod object with it. Each attempt writes one audit line (`attempt N of 3`,
-and `pod vanished` for the second case). Before a recreate the launcher checks that this call's own Secrets are still there: a missing one means an outside deletion (a stop, the reaper), which fails the create without recreating (the check also runs after a recreate and before ready; it narrows the race with a stop in flight and cannot close it, as the pod and Secret deletes are not one step: a stop deletes the pod first and the Secrets later, so the creator can recreate and the Secret deletes land after the last check; if that pod never starts, the create's own wait ends and its cleanup deletes it; if it started and was reported ready, the stop has finished and the only later catch is the reaper at `--hard` (or idle)). A pod that was never seen, and every other failure, is not retried. The window is checked after each attempt ends, so it bounds the count of attempts, not the wall time (worst case 3 times the `--wait` plus 150 s of delete wait). After the
-attempts or the window the create fails and the message names the race or the vanish. See `docs/cloud-worker-interface.md`.
+saw when that runtime restart took the Pending pod object with it. Each attempt writes one audit line (`attempt N`,
+and `pod vanished` for the second case). Before a recreate the launcher checks that this call's own Secrets are still there: a missing one means an outside deletion (a stop, the reaper), which fails the create without recreating (the check also runs after a recreate and before ready; it narrows the race with a stop in flight and cannot close it, as the pod and Secret deletes are not one step: a stop deletes the pod first and the Secrets later, so the creator can recreate and the Secret deletes land after the last check; if that pod never starts, the create's own wait ends and its cleanup deletes it; if it started and was reported ready, the stop has finished and the only later catch is the reaper at `--hard` (or idle)). A pod that was never seen, and every other failure, is not retried. A recreate starts only if one more pause plus one poll (2 seconds, `WAIT_POLL_SECONDS`) fits in what is left of the window, and a retry's wait is cut to the time left, so the window bounds the wall time (the delete wait of up to 150 s per recreate aside). After the
+window the create fails with one message that names the race or the vanish, the attempts made and the seconds spent. See `docs/cloud-worker-interface.md`.
 
 ## Driving a cloud worker from the switchboard (`launch --cloud`, `send`, `read`, `status`, `retire`)
 

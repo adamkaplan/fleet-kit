@@ -10532,6 +10532,80 @@ class TestParseCheckpoint(unittest.TestCase):
                 self.assertIsNone(sb.parse_checkpoint(brief))
 
 
+DOC_EXAMPLE_LINE = "in 15 min, at 2030-01-02T15:05:05Z"   # the one line docs/switchboard.md shows for a reminder (ask #968)
+
+
+class TestReminderOutputShowsHowLong(PR4Base):
+    """Ask #968: `remind`, `launch --checkpoint` and the brief's CHECKPOINT line each print the time they used as now and, for each reminder, how long from
+    now it is and at what clock time, in the same words, built from the stored time. Fake clock (EPOCH) only."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+
+    def remind(self, when):
+        with captured() as (out, err):
+            code = sb.main(["remind", "platform", when, "--from", "coder", "later"], self.world.route, self.world.clock.now, lambda s: None)
+        return code, err.getvalue()
+
+    def checkpoint(self, checkpoint="15m", overdue="40m", brief=None):
+        now = self.world.clock.now()
+        return sb.set_checkpoint_reminders(self.world.engine, self.world.state, "coder", "platform", 2, None, brief, checkpoint, overdue, now, now)
+
+    def lengths(self, text):
+        return re.findall(r"in [0-9a-z ]+?, at [0-9T:Z-]+", text)
+
+    def test_the_three_routes_print_the_same_words_for_a_duration(self):
+        want = "in 15 min, at %s" % sb.iso(EPOCH + 900)
+        code, err = self.remind("15m")
+        self.assertEqual(code, 0, err)
+        self.assertIn("(now %s)" % sb.iso(EPOCH), err)
+        self.assertEqual(self.lengths(err), [want])
+        flags = self.checkpoint("15m", "40m")
+        self.assertIn("(now %s)" % sb.iso(EPOCH), flags)
+        self.assertEqual(self.lengths(flags), [want, "in 40 min, at %s" % sb.iso(EPOCH + 2400)])
+        brief = self.checkpoint(None, None, "ISSUE: x\nCHECKPOINT: Report at 15 minutes (kind working, one line); overdue at 40.\n")
+        self.assertEqual(self.lengths(brief), self.lengths(flags), "the exact CHECKPOINT line of the report reads as a duration and prints the same")
+        self.assertEqual(len({l for l in self.lengths(err + flags + brief) if l == want}), 1, "one wording across the routes")
+
+    def test_a_clock_time_with_a_zone_prints_the_same_way_and_the_stored_time_is_unchanged(self):
+        code, err = self.remind(sb.iso(EPOCH + 900))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.lengths(err), ["in 15 min, at %s" % sb.iso(EPOCH + 900)])
+        self.assertEqual(sb.read_reminders(self.world.state)[0]["at"], EPOCH + 900)
+        note = self.checkpoint(sb.iso(EPOCH + 900), sb.iso(EPOCH + 2400))
+        self.assertEqual(self.lengths(note)[0], "in 15 min, at %s" % sb.iso(EPOCH + 900))
+
+    def test_a_time_beyond_thirty_days_is_still_refused_and_makes_no_reminder(self):
+        before = len(sb.read_reminders(self.world.state))
+        note = self.checkpoint("31d", "32d")
+        self.assertIn("no checkpoint reminders", note)
+        self.assertIn("too far out", note)
+        self.assertEqual(len(sb.read_reminders(self.world.state)), before)
+
+    def test_the_relative_duration_is_exactly_the_stored_time(self):
+        for seconds, words in ((900, "15 min"), (90, "1 min 30 s"), (3725, "1 h 2 min 5 s"), (86400 + 7200, "1 d 2 h"), (45, "45 s")):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(sb.reminder_when(EPOCH + seconds, EPOCH), "in %s, at %s" % (words, sb.iso(EPOCH + seconds)))
+        self.assertEqual(sb.reminder_when(EPOCH - 60, EPOCH), "1 min ago, at %s" % sb.iso(EPOCH - 60))
+        code, err = self.remind("90s")
+        self.assertIn("in 1 min 30 s, at %s" % sb.iso(EPOCH + 90), err)
+        self.assertEqual(sb.read_reminders(self.world.state)[0]["at"] - EPOCH, 90)
+
+    def test_a_failure_while_building_the_line_never_fails_the_command(self):
+        with mock.patch.object(sb, "reminder_when", side_effect=RuntimeError("boom")):
+            code, err = self.remind("15m")
+            note = self.checkpoint("15m", "40m")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(sb.read_reminders(self.world.state)), 3)
+        self.assertIn("checkpoint reminders", note)
+
+    def test_the_documentation_shows_the_line_once_and_it_is_the_printed_form(self):
+        self.assertEqual(sb.reminder_when(1893596705.0, 1893596705.0 - 900), DOC_EXAMPLE_LINE)
+        docs = (Path(__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
+        self.assertEqual(docs.count(DOC_EXAMPLE_LINE), 1)
+
+
 class SelfWakeBase(PR4Base):
     def set_reminders(self, checkpoint="30m", overdue="60m", brief=None, name="coder", boss="platform"):
         engine = self.world.engine
@@ -43479,6 +43553,8 @@ class TestLaunchSetsCheckpointReminders(TwoRepoCase):
                          (3600, ACME_WEB, 2))
         self.assertEqual(json.loads(out)["name"], "web-new")  # the launch output is what it was
         self.assertIn("checkpoint reminders", err)
+        self.assertIn("worker reminder in 30 min, at %s" % sb.iso(EPOCH + 1800), err)
+        self.assertIn("overdue reminder in 1 h, at %s" % sb.iso(EPOCH + 3600), err)
 
     def test_the_brief_is_the_fallback(self):
         code, _, err = self.launch(brief=BRIEF_30_60)

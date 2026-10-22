@@ -191,8 +191,8 @@ class FreshNodeRace(Base):
         self.stack("--stack")
         a = self.attempts()
         self.assertEqual(len(a), 2)
-        self.assertIn("attempt 1 of 3", a[0]["reason"]); self.assertFalse(a[0]["ok"])
-        self.assertIn("attempt 2 of 3", a[1]["reason"]); self.assertTrue(a[1]["ok"])
+        self.assertIn("attempt 1:", a[0]["reason"]); self.assertFalse(a[0]["ok"])
+        self.assertIn("attempt 2:", a[1]["reason"]); self.assertTrue(a[1]["ok"])
         pods = [o for o in self.st()["applied"] if o["kind"] == "Pod"]
         self.assertEqual(len(pods), 2)
         self.assertEqual([p["metadata"]["annotations"]["cw/run-id"] for p in pods], [self.RUN_ID] * 2)
@@ -215,11 +215,15 @@ class FreshNodeRace(Base):
         self.assertEqual(len([o for o in self.st()["applied"] if o["kind"] == "Pod"]), 1)
 
     def test_the_message_three_times_fails_and_leaves_nothing(self):
-        self.patch_state(race_creates=3)
-        out, err = self.stack("--stack", code=cw.EXIT_CLOUD)
+        self.patch_state(race_creates=30)
+        old, cw.STACK_RACE_WINDOW_SECONDS = cw.STACK_RACE_WINDOW_SECONDS, 40   # a 40 s window allows exactly three attempts (no count any more)
+        try:
+            out, err = self.stack("--stack", code=cw.EXIT_CLOUD)
+        finally:
+            cw.STACK_RACE_WINDOW_SECONDS = old
         self.assertIn("fresh-node race", err)
         self.assertEqual(len(self.attempts()), 3)
-        self.assertEqual([("attempt %d of 3" % i) in l["reason"] for i, l in enumerate(self.attempts(), 1)], [True] * 3)
+        self.assertEqual([("attempt %d:" % i) in l["reason"] for i, l in enumerate(self.attempts(), 1)], [True] * 3)
         self.assertEqual(len([o for o in self.st()["applied"] if o["kind"] == "Pod"]), 3)
         self.assertEqual(self.secrets_made(), [cw.pod_name("coder7") + "-pw"])   # made once, never duplicated
         self.assertEqual(self.st()["pods"], {})
@@ -312,12 +316,16 @@ class FreshNodeRace(Base):
         self.stack("--stack")
         self.assertEqual(len(self.pod_creates()), 3)
         self.assertEqual(len(self.attempts()), 3)
-        self.assertEqual([("attempt %d of 3" % i) in r for i, r in enumerate(self.reasons(), 1)], [True] * 3)
+        self.assertEqual([("attempt %d:" % i) in r for i, r in enumerate(self.reasons(), 1)], [True] * 3)
         self.assertEqual(self.secrets_made(), [cw.pod_name("coder7") + "-pw"])   # kills: secrets recreated per attempt
 
     def test_vanish_three_times_fails_names_it_and_leaves_nothing(self):   # kills: the attempt cap ignored
         self.patch_state(plan=["vanish"] * 5)
-        out, err = self.stack("--stack", code=cw.EXIT_CLOUD)
+        old, cw.STACK_RACE_WINDOW_SECONDS = cw.STACK_RACE_WINDOW_SECONDS, 40   # a 40 s window allows exactly three attempts
+        try:
+            out, err = self.stack("--stack", code=cw.EXIT_CLOUD)
+        finally:
+            cw.STACK_RACE_WINDOW_SECONDS = old
         self.assertIn("vanished", err)
         self.assertEqual(len(self.pod_creates()), 3)
         self.assertEqual(len(self.attempts()), 3)
@@ -451,8 +459,12 @@ class FreshNodeRace(Base):
             with self.subTest(outcome=outcome):
                 self.setUp()
                 self.patch_state(plan=plan, **state)
-                c, out, err = self.run_cli("create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main", "--run-id", self.RUN_ID,
-                                           "--stack", "--wait", "10")
+                old, cw.STACK_RACE_WINDOW_SECONDS = cw.STACK_RACE_WINDOW_SECONDS, (40 if outcome == "cap" else cw.STACK_RACE_WINDOW_SECONDS)   # 40 s: three attempts
+                try:
+                    c, out, err = self.run_cli("create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main", "--run-id", self.RUN_ID,
+                                               "--stack", "--wait", "10")
+                finally:
+                    cw.STACK_RACE_WINDOW_SECONDS = old
                 self.assertEqual(c, code, err)
                 self.assertEqual(len(self.pod_creates()), creates)
                 self.assertIn(word, err + " ".join(self.reasons()))

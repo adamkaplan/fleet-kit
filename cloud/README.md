@@ -345,7 +345,8 @@ path, Docker socket or service-account token. Without `--stack` the pod is byte-
 pins it). The container's security context (`STACK_SECURITY_CONTEXT` in `cloud/launcher/cloud_worker.py`) was live-probed
 with the cluster default only: the smallest set that lets the daemon start is decided by the next live run, one variation
 at a time. A create that lands on a fresh node can hit the "handler sysbox-runc is not known" race; the launcher recreates the
-pod (not the Secrets) up to 3 times.
+pod (not the Secrets) after a pause of 15 seconds (`STACK_RACE_PAUSE_SECONDS`), for as long as one more pause fits in a
+window of 600 seconds (`STACK_RACE_WINDOW_SECONDS`); there is no attempt count.
 
 The stack pod is pinned whole, like the default pod: `cloud/launcher/tests/fixtures/stack_pod.json` is the pod the stack create
 builds, and `stack_create_objects.json` is every other object the create makes (the password Secret, the run Secret and its
