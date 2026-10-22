@@ -28,7 +28,7 @@ Staff; an epic or workspace plan, the Chief of Staff, then the owner.
    `claim: epic` for what only an integrated head can prove (name the integration branch in the plan).
    **Owner evaluators are rare**: only where the owner's own eyes are the test, proved once with `claim: epic`; never for a routine PR.
 
-   **Own measurement:** launch a headless tester of your lane (`--role tester --repo <the pull request's repo> --reports-to <you>`) to record; never record as yourself.
+   **Own measurement:** launch a tester of your lane (`--role tester --repo <the pull request's repo> --reports-to <you>`, headless) to re-measure and record; never record as yourself.
 3. **Constraints** (`PC-n`): what must hold and why (a shared contract, a security rule, a held path). Nothing else is a
    constraint.
 4. **Out of scope**, **areas touched** (and whether any is held-PR), **risks and rollback**, **open questions**, **size and
