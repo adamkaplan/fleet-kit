@@ -1080,12 +1080,15 @@ def model_entry():
         raise Refusal(str(err)) from None
 
 
-def git_token(repo, cluster):
+CLOUD_ORCHESTRATOR = "orchestrator"   # the one --role value the cloud launcher gives its own pod and token role (its ROLES table)
+
+
+def git_token(repo, cluster, role="worker"):
     """The one-hour git token for ONE repository: CW_GIT_TOKEN_CMD, else the mint (cloud/launcher/app_token.py REPO), as the driver does."""
     raw = os.environ.get("CW_GIT_TOKEN_CMD")
-    argv = shlex.split(raw) if raw else [sys.executable, str(Path(__file__).resolve().parent.parent / "cloud" / "launcher" / "app_token.py"), repo]
+    argv = shlex.split(raw) if raw else [sys.executable, str(Path(__file__).resolve().parent.parent / "cloud" / "launcher" / "app_token.py"), repo] + ([role] if role != "worker" else [])
     env = {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}
-    ran = _capture(argv, env=dict(env, GH_REPO=repo))
+    ran = _capture(argv, env=dict(env, GH_REPO=repo, **({"CW_GIT_TOKEN_ROLE": role} if role != "worker" else {})))
     token = (ran[1] if ran and ran[0] == 0 else "").strip()
     if not token or len(token) > 4096:
         why = ""
@@ -1135,6 +1138,8 @@ def _launch(args, runner, now, reserve):
     source = use_settings()   # before any setting is read: the allow-list, the preflight and the launcher all read this one source
     print("%s: cloud settings from %s" % (H["PROG"], source), file=sys.stderr)
     check_allowed(repo)   # before anything is read, minted or created
+    if getattr(args, "role", None) == CLOUD_ORCHESTRATOR and getattr(args, "stack", False):
+        raise Refusal("an orchestrator runs no nested Docker stack (--stack); nothing was created")
     if getattr(args, "stack", False) and args.shape and args.shape not in LAUNCHER_SHAPES:   # exact membership in a tuple; after the allow-list, before the preflight, any token or call
         raise Refusal("--shape %r is not a pod shape (%s); nothing was created" % (str(args.shape)[:40], " or ".join(LAUNCHER_SHAPES)))
     try:   # the repository preflight, before any token is minted; FAIL CLOSED: a missing, killed or silent program refuses (stdout stays the one JSON line)
@@ -1152,9 +1157,12 @@ def _launch(args, runner, now, reserve):
     brief = H["read_brief"](args.brief_file, sys.stdin)
     run_id = secrets_module.token_hex(16)   # this command's nonce: recorded on what `create` makes, so a later stop can say it is ours
     options = [CREATE_OPTION["repo"], repo, CREATE_OPTION["branch"], branch, CREATE_OPTION["run_id"], run_id]
+    cloud_role = CLOUD_ORCHESTRATOR if args.role == CLOUD_ORCHESTRATOR else "worker"   # the role names the launcher's role table row; any other role is a worker
     for key, value in (("idle", args.idle), ("hard", args.hard), ("shape", args.shape)):
-        if value:
+        if value and not (cloud_role != "worker" and key != "idle"):   # an orchestrator: the role chooses the shape and there is no deadline
             options += [CREATE_OPTION[key], str(value)]
+    if cloud_role != "worker":
+        options += ["--role", cloud_role]
     if getattr(args, "stack", False):   # only on request: a launch without --stack hands the launcher exactly what it always did
         options.append(CREATE_OPTION["stack"])
     if os.environ.get("CW_PULL_SECRET"):
@@ -1164,7 +1172,7 @@ def _launch(args, runner, now, reserve):
     with Cluster(recovery) as cluster:
         model = model_entry()
         cluster.add(model)
-        token = git_token(repo, cluster)
+        token = git_token(repo, cluster, cloud_role)
         cluster.add(token)
         read_fd, write_fd = os.pipe()
         try:
@@ -1199,6 +1207,8 @@ def _launch(args, runner, now, reserve):
             _write_private(password_path(state, name), password + "\n")
             record["auth_ref"] = "file:" + str(password_path(state, name))   # the switchboard's own copy: its path never comes from the launcher
             record["repo"], record["branch"] = repo, branch
+            if cloud_role != "worker":
+                record["role"] = cloud_role   # the reaper reads the token role and the mode from the record, never from the pod
             record["agent"] = args.agent   # the local role name, for the operator: the pod runs CLOUD_WORKER_AGENT
             if args.reports_to:
                 record["reports_to"] = args.reports_to

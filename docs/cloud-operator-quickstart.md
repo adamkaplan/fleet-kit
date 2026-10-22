@@ -256,3 +256,16 @@ To verify it:
 - On a worker, its server's `/api/provider` lists `github-copilot` (a pod that lists only the built-in `opencode` provider answers on the free fallback model and is rate limited).
 
 The worker image carries `cloud/worker/entrypoint.sh`, so the order is: merge, an operator rebuilds the image and switches the digest in the settings file, then run the check above on one no-op worker.
+
+## Roles: worker and orchestrator
+
+A cloud pod has a role. An idle orchestrator-like session measured about 365 MB resident (a container peak of 456 MiB at boot) and about 1% of a core; the `orchestrator` role is sized from that and is one small always-on pod. Generated from the launcher's tables (`render_roles_doc`); a test pins it.
+
+<!-- roles:begin -->
+| Role | Mode | Pod size (requests = limits for a persistent role) | Token set | List-price estimate |
+|---|---|---|---|---|
+| `worker` | worker: restart Never, hard deadline, idle limit | 2 CPU, 4Gi | contents: write, pull_requests: write, issues: read, metadata: read | USD 0.10 per hour (shape S) |
+| `orchestrator` | persistent: one-replica StatefulSet, restart Always, no deadline, no idle limit, ends only on an explicit stop | 250m CPU, 768Mi | issues: write, pull_requests: read, checks: read, metadata: read | USD 0.02 per hour, USD 0.48 per day always on |
+
+The role is chosen by `--role` (a key of the role table; default `worker`); the orchestrator's size is chosen only by the role, never by `--shape`. The orchestrator holds no contents write and never the App key: the launcher and the reaper mint its token. Owner step for its set: the owner adds issues: write, pull_requests: read, checks: read, metadata: read to the App's permissions and accepts them on each installation.
+<!-- roles:end -->

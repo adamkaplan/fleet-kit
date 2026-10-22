@@ -271,3 +271,16 @@ value; otherwise read from the vault; `CW_APP_INSTALLATION_CMD` and the vault se
 `CW_GITHUB_API_BASE` (tests), `CW_PREFLIGHT_TOKEN_CMD` (tests: replaces the mint in the preflight).
 
 **Repository allow-list.** `create` (and the driver, `run-task`, through the same function `check_repo_allowed`) launches only for a repository the owner listed. `CW_ALLOWED_REPOS` is a comma-separated list of `OWNER/NAME`, compared exactly and case-insensitively; no wildcard. Unset, empty, or any entry that is not `OWNER/NAME` shaped (a dot segment, a space, a `*`, an extra slash) refuses everything (fail closed). `CW_TOOLING_REPO` (`OWNER/NAME`) names the tooling's own repository, which is refused even when it is listed; unset adds no extra check, malformed refuses. A refused repository exits `2` with `refused: <repo> is not on the cloud allow-list` before any `kubectl` call, so nothing is created. Both settings are read from the environment of whoever runs the launcher or the driver, like the other `CW_` settings: the operator exports them in the shell (or the service unit) that starts it. An agent running as the same user could set them for a command it runs, so the list is a mistake-guard for the operator, not a boundary; the stops are the token's one-repository scope and the repository's own rules. The check compares spellings: a renamed or transferred repository is not matched by its old name, and an entry or tooling value ending in `.git` is malformed and refuses. The guard table is `docs/cloud-guard-parity.md`.
+
+## Roles: worker and orchestrator
+
+A cloud pod has a role. An idle orchestrator-like session measured about 365 MB resident (a container peak of 456 MiB at boot) and about 1% of a core; the `orchestrator` role is sized from that and is one small always-on pod. Generated from the launcher's tables (`render_roles_doc`); a test pins it.
+
+<!-- roles:begin -->
+| Role | Mode | Pod size (requests = limits for a persistent role) | Token set | List-price estimate |
+|---|---|---|---|---|
+| `worker` | worker: restart Never, hard deadline, idle limit | 2 CPU, 4Gi | contents: write, pull_requests: write, issues: read, metadata: read | USD 0.10 per hour (shape S) |
+| `orchestrator` | persistent: one-replica StatefulSet, restart Always, no deadline, no idle limit, ends only on an explicit stop | 250m CPU, 768Mi | issues: write, pull_requests: read, checks: read, metadata: read | USD 0.02 per hour, USD 0.48 per day always on |
+
+The role is chosen by `--role` (a key of the role table; default `worker`); the orchestrator's size is chosen only by the role, never by `--shape`. The orchestrator holds no contents write and never the App key: the launcher and the reaper mint its token. Owner step for its set: the owner adds issues: write, pull_requests: read, checks: read, metadata: read to the App's permissions and accepts them on each installation.
+<!-- roles:end -->
