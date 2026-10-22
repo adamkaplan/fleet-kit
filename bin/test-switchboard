@@ -78792,7 +78792,7 @@ class TestFocusedLocalRuns(unittest.TestCase):
                         self.assertEqual(code, 0)
 
     def test_the_table_covers_every_kind_of_the_one_classifier(self):
-        kinds = {kind for kind, _s, _m in self.hs.KINDS}
+        kinds = {kind for kind, _s, _m in self.hs.KINDS} - {"quick"}   # "quick" is a ceiling row taken by name (run_quick); the classifier never returns it
         probes = {"full": [], "focused": ["-k", "x"], "e2e": ["playwright", "test"], "other": ["ls"]}
         self.assertEqual(set(probes), kinds, "a kind with no probe")
         for kind, rest in probes.items():
@@ -78876,7 +78876,7 @@ class TestFocusedLocalRuns(unittest.TestCase):
         self.assertNotIn("refused", text)
 
     def test_s7_the_only_ceilings_are_the_per_kind_table(self):
-        self.assertEqual(self.hs.KIND_DEFAULTS, {"e2e": 3600, "focused": 1800, "full": 5400, "other": 3600})
+        self.assertEqual(self.hs.KIND_DEFAULTS, {"e2e": 3600, "focused": 1800, "full": 5400, "quick": 600, "other": 3600})
         names = sorted(name for name in vars(self.hs) if re.search(r"(CEIL|SECONDS|MAX_SECONDS|HARD_MAX)", name) and name.isupper())
         self.assertEqual(names, ["DEFAULT_MAX_SECONDS", "EXPRESS_SECONDS", "HARD_MAX_SECONDS", "KILL_GRACE_SECONDS", "POLL_SECONDS", "SWEEP_SECONDS", "WAIT_REPORT_SECONDS", "WATCH_SECONDS"])
 

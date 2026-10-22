@@ -257,7 +257,7 @@ class TestQuickSlot(unittest.TestCase):
         self.assertIn("refused", err.getvalue())
 
     def test_the_cap_and_the_ceiling_are_stated(self):
-        self.assertEqual((heavy_slots.QUICK_SLOTS, heavy_slots.QUICK_SECONDS), (4, 600))
+        self.assertEqual((heavy_slots.QUICK_SLOTS, heavy_slots.KIND_DEFAULTS["quick"]), (4, 600))
         self.assertEqual(heavy_slots.quick_status(self.state), "quick slots 0/4 (ceiling 10 min)")
 
     def test_is_quick_is_one_file_or_one_class_only(self):

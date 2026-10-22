@@ -157,6 +157,7 @@ KINDS = (
     ("e2e", 3600, _is_e2e),
     ("focused", 1800, _is_focused),
     ("full", 5400, _is_full),
+    ("quick", 600, lambda program, rest, short: False),   # the quick slot's ceiling (#1045): a row of THIS table; classify never returns it, run_quick takes it by name
     ("other", 3600, lambda program, rest, short: True),
 )
 KIND_DEFAULTS = {kind: seconds for kind, seconds, _match in KINDS}
@@ -1206,7 +1207,6 @@ def wrap_argv(argv, environ, python, switchboard, script, err=None, state_dir=No
 
 # ---- the quick slots (#1045): a small separate allowance for ONE focused test file or class, so a one-file check never waits behind a full-suite run.
 QUICK_SLOTS = 4          # the cap: at most this many quick runs at once, on their own locks and their own line (a directory of their own in the state directory)
-QUICK_SECONDS = 600      # the time ceiling of one quick run (10 min); the watchdog stops it past this
 QUICK_DIR = "quick"
 
 
@@ -1220,23 +1220,23 @@ def quick_status(state_dir):
     """`quick slots 1/4 (ceiling 10 min)`: read only (a missing directory reads as none held)."""
     path = os.path.join(str(state_dir), QUICK_DIR)
     held = len(holders(path, QUICK_SLOTS)) if os.path.isdir(path) else 0
-    return "quick slots %d/%d (ceiling %d min)" % (held, QUICK_SLOTS, QUICK_SECONDS // 60)
+    return "quick slots %d/%d (ceiling %d min)" % (held, QUICK_SLOTS, KIND_DEFAULTS["quick"] // 60)
 
 
 def run_quick(command, state_dir, wait_max=DEFAULT_WAIT_MAX, name=None, environ=None, out=None, **keywords):
     """Run ONE focused command in a quick slot. A command that is not focused (a whole suite, an e2e run) is refused with 64 and never takes a quick slot. The quick slots
     have their own locks and their own waiting line, so a run holding every ordinary slot (or queued for one) never delays it; at most QUICK_SLOTS run at once and each is
-    stopped after QUICK_SECONDS."""
+    stopped after the "quick" row of KIND_DEFAULTS (10 min)."""
     out = sys.stderr if out is None else out
     kind = classify(command)
     if kind != "focused":
         out.write("heavy: refused: a quick slot is for ONE focused test file or class; this run is %s (use an ordinary slot: no --quick)\n" % kind)
         return EXIT_USAGE
     environ = dict(os.environ if environ is None else environ)
-    environ[TIME_ENV] = str(QUICK_SECONDS)
+    environ[TIME_ENV] = str(KIND_DEFAULTS["quick"])
     try:
         out.write("heavy: quick slot: %s\n" % quick_status(state_dir))
     except OSError:
         pass
-    return run(command, quick_dir(state_dir), QUICK_SLOTS, wait_max, name, environ=environ, out=out, ceiling=QUICK_SECONDS,
-               ceiling_config={"slots": QUICK_SLOTS, "ceilings": {"max": QUICK_SECONDS}}, **keywords)
+    return run(command, quick_dir(state_dir), QUICK_SLOTS, wait_max, name, environ=environ, out=out, ceiling=KIND_DEFAULTS["quick"],
+               ceiling_config={"slots": QUICK_SLOTS, "ceilings": {"max": KIND_DEFAULTS["quick"]}}, **keywords)
