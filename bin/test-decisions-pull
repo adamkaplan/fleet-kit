@@ -308,6 +308,44 @@ def check_deep_nesting_and_key_collisions_are_garbage(module):
         assert path.read_text() == "OLD\n"
 
 
+def check_clean_itself_overflowing_is_garbage(module):
+    """clean() (not json.loads) hits the recursion limit: the structure is pre-built, json.loads is replaced by one returning it, the depth cap is
+    lifted and the limit lowered only around pull(). Independent of how many frames a comprehension costs in this Python."""
+    deep = []
+    for _ in range(400):
+        deep = [deep]
+    body = dict(BODY, decisions=[{"id": "gh:1", "x": deep}])
+    module.json = types.SimpleNamespace(loads=lambda text, **kw: body, dump=json.dump)
+    module.MAX_DEPTH = 10 ** 6
+    with tempfile.TemporaryDirectory() as state:
+        path = fresh_file(state)
+        err = io.StringIO()
+        frames, frame = 0, sys._getframe()
+        while frame:
+            frames, frame = frames + 1, frame.f_back
+        old = sys.getrecursionlimit()
+        sys.setrecursionlimit(frames + 150)
+        try:
+            result = module.pull(state, lambda: b"{}", NOW, err=err)
+        finally:
+            sys.setrecursionlimit(old)
+        assert result == "untouched", result
+        assert path.read_text() == "OLD\n"
+        assert "nested too deeply" in err.getvalue(), err.getvalue()
+
+
+def check_depth_boundary(module):
+    def levels(n):  # n containers in all: the body, the decisions list, the decision, then lists
+        inner = []
+        for _ in range(n - 4):
+            inner = [inner]
+        return json.dumps(dict(BODY, decisions=[{"id": "gh:1", "x": inner}])).encode()
+    for n, expected in ((module.MAX_DEPTH, module.WROTE), (module.MAX_DEPTH + 1, module.UNTOUCHED)):
+        with tempfile.TemporaryDirectory() as state:
+            fresh_file(state)
+            assert pull_quiet(module, state, lambda: levels(n)) == expected, n
+
+
 def check_reasons_are_said_on_stderr(module):
     secret = "SECRET-BODY-TEXT"
     with tempfile.TemporaryDirectory() as state:
@@ -392,7 +430,8 @@ ALL = [check_shape_is_the_daemons, check_unknown_keys_are_dropped, check_write_i
        check_items_must_have_the_plugins_types, check_item_count_is_capped, check_control_characters_are_stripped,
        check_reasons_are_said_on_stderr, check_stale_ages_the_descriptor_not_the_path, check_directory_is_fsynced_after_rename,
        check_kept_keys_are_the_daemons, check_temp_file_is_exclusive_private_and_random,
-       check_group_is_killed_when_a_grandchild_holds_the_pipe, check_deep_nesting_and_key_collisions_are_garbage]
+       check_group_is_killed_when_a_grandchild_holds_the_pipe, check_deep_nesting_and_key_collisions_are_garbage,
+       check_clean_itself_overflowing_is_garbage, check_depth_boundary]
 
 
 class RealCode(unittest.TestCase):
@@ -552,6 +591,12 @@ class Mutants(unittest.TestCase):
 
     def test_depth_not_capped(self):
         self.failing(check_deep_nesting_and_key_collisions_are_garbage, mutant("depth >= MAX_DEPTH", "depth >= 10 ** 6"))
+
+    def test_clean_recursion_handler_removed(self):
+        self.failing(check_clean_itself_overflowing_is_garbage, mutant("    except RecursionError:\n        raise Garbage(\"nested too deeply\")", "    except ZeroDivisionError:\n        raise Garbage(\"nested too deeply\")"))
+
+    def test_depth_boundary_off_by_one(self):
+        self.failing(check_depth_boundary, mutant("depth >= MAX_DEPTH", "depth > MAX_DEPTH"))
 
     def test_recursion_error_escapes(self):
         self.failing(check_deep_nesting_and_key_collisions_are_garbage, mutant("    except RecursionError:\n        raise Garbage(\"nested too deeply\")", "    except ZeroDivisionError:\n        raise Garbage(\"nested too deeply\")"))
