@@ -16022,9 +16022,10 @@ def resume_ended_turn(engine, caller, name, reason, discovery=None):
         if _is_number(last) and now - last < RESUME_SECONDS:
             return None
         state[name] = {"at": now}
+        taken["ok"] = True
         return state
-    state = blocked_update(engine.state_dir, RESUME_STATE, take)
-    if state.get(name, {}).get("at") != now:
+    blocked_update(engine.state_dir, RESUME_STATE, take)
+    if not taken.get("ok"):
         raise ResumeRefused("%s was resumed %d minutes ago: one resume per agent per %d minutes" % (name, int((now - taken["last"]) // 60), RESUME_SECONDS // 60))
     keys = ["resume:%d" % now]
     message_id = derive_message_id(seen.session_id, keys)
