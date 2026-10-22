@@ -6883,7 +6883,7 @@ def retired_agent(retired, name, session):
 
 
 def registry_route(state_dir, name):
-    """Where a message to `name` would go by the registry (#1074; a function only, send does not call it yet): its pane when it has one (as before), else its registry endpoint; None on a half read or an unknown agent."""
+    """Where a message to `name` would go by the registry (#1074; used by send, #1131): its pane when it has one (as before), else its registry endpoint; None on a half read or an unknown agent."""
     registry = load_module("registry")
     reg = registry.read(state_dir)
     row = reg["agents"].get(name) if reg["whole"] else None
@@ -19615,7 +19615,50 @@ def cmd_send(args, runner, now):
 cmd_send.ensure_on_use = True   # the daemon is alive when it runs
 
 
+def _send_by_registry(args, runner, now):
+    """#1131: an agent with no pane goes to its registry endpoint (cloud channel); None means the old path serves it (a pane, or a name the registry does not hold)."""
+    es = load_module("endpoint_send")
+    found = es.route(load_module("registry"), state_dir_path(), args.name)
+    if found[0] in ("pane", "none"):
+        return None
+    if found[0] == "half":
+        sys.stderr.write("%s: not sent: %s\n" % (PROG, found[1]))
+        return EXIT_HELD
+    engine, _, config = build_engine(runner, now, "cli")
+    refusal = intent_refusal(config, args.issue)
+    if refusal:
+        sys.stderr.write("%s: %s\n" % (PROG, refusal))
+        return EXIT_USAGE
+    if args.interrupt:
+        sys.stderr.write("%s: --interrupt is not supported on an endpoint route: nothing sent\n" % PROG)
+        return EXIT_USAGE
+    if args.sender is not None:
+        if os.environ.get(LAB_ENV) != "1":
+            sys.stderr.write("%s: --from is only for the Lab (%s=1); an agent is identified by its pane\n" % (PROG, LAB_ENV))
+            return EXIT_USAGE
+        sender = args.sender
+    else:
+        sender = identify_caller(engine.herdr, engine.v2, os.environ)
+    text = " ".join(args.text).strip()
+    if not text:
+        sys.stderr.write("%s: nothing to send\n" % PROG)
+        return EXIT_USAGE
+    held = es.blocked_reason(args.name, found[2], hold_reason)
+    if held:
+        sys.stderr.write("%s: not sent to %s: hold (%s)\n" % (PROG, args.name, held))
+        return EXIT_HELD
+    ok, line = es.deliver(load_module("cloud_client"), found[1], sender, args.name, text)
+    if not ok:
+        sys.stderr.write("%s: not sent to %s: %s\n" % (PROG, args.name, line))
+        return EXIT_HELD
+    sys.stderr.write("%s: delivered to %s\n" % (PROG, args.name))
+    return EXIT_OK
+
+
 def _cmd_send(args, runner, now):
+    routed = _send_by_registry(args, runner, now)
+    if routed is not None:
+        return routed
     remote = run_cloud("route", args.name)   # a cloud worker has an endpoint record (#371)
     if remote is not None:
         return run_cloud("cmd_send", args, runner, now, remote)
