@@ -10,7 +10,9 @@ of the daemon file (a `# ---- name` comment line), the pull requests that touch 
 lines a pull request changes are read from `git diff` between its merge base with BASE and
 its head, and mapped onto the symbols of the file as it was at that merge base. A pure
 insertion belongs to the symbol that holds the line it follows, or to the marker's section.
-The tool only reads: `git fetch` of the pull request refs, `gh pr list`, `git diff`.
+The tool changes nothing but local refs: it reads with `gh pr list`, `git diff` and `git show`, and its `git fetch` writes
+the pull request heads to `refs/arch-overlap/<number>` in this clone. It lists at most 200 open pull requests and says so
+when the list is that long. Run it only in a clone you trust.
 """
 import argparse
 import ast
@@ -85,13 +87,19 @@ def analyse(pr, base, daemon, tests):
     ref = "refs/arch-overlap/%d" % pr["number"]
     if git("fetch", "-q", "origin", "+pull/%d/head:%s" % (pr["number"], ref)).returncode != 0:
         return {"error": "cannot fetch the pull request head"}
-    merge_base = git("merge-base", base, ref).stdout.strip()
+    found = git("merge-base", base, ref)
+    merge_base = found.stdout.strip()
+    if found.returncode != 0 or not merge_base:
+        return {"error": "no merge base of %s and the pull request head" % base}
     result = {"symbols": [], "classes": [], "sections": []}
     for path, key in ((daemon, "daemon"), (tests, "tests")):
         diff = git("diff", "-U0", merge_base, ref, "--", path).stdout
         if not diff:
             continue
-        old = git("show", "%s:%s" % (merge_base, path)).stdout
+        shown = git("show", "%s:%s" % (merge_base, path))
+        if shown.returncode != 0:
+            return {"error": "cannot read %s at the merge base" % path}
+        old = shown.stdout
         lines = changed_old_lines(diff)
         if key == "daemon":
             table = symbols(old)
@@ -112,6 +120,9 @@ def main(argv=None):
     parser.add_argument("--tests", default="bin/test-switchboard")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
+    for value in (args.base, args.daemon, args.tests):
+        if value.startswith("-"):
+            parser.error("%r looks like an option, not a ref or a path" % value)
     cmd = ["gh", "pr", "list", "--state", "open", "--limit", "200", "--json", "number,title,files"]
     if args.repo:
         cmd += ["--repo", args.repo]
@@ -120,7 +131,10 @@ def main(argv=None):
         sys.stderr.write("arch-overlap: gh pr list failed: %s\n" % listing.stderr.strip())
         return 2
     report = {}
-    for pr in json.loads(listing.stdout):
+    prs = json.loads(listing.stdout)
+    if len(prs) >= 200:
+        sys.stderr.write("arch-overlap: 200 open pull requests listed: the list may be cut short\n")
+    for pr in prs:
         names = {f["path"] for f in pr["files"]}
         if args.daemon in names or args.tests in names:
             report[pr["number"]] = dict(analyse(pr, args.base, args.daemon, args.tests), title=pr["title"])

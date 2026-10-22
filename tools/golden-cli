@@ -12,6 +12,9 @@ stderr or exit status that is not byte-identical, and for a command one side lac
 when there is none, 1 when there is one. Nothing is committed: both recordings are made now,
 on the same Python, in the same synthetic world.
 
+`compare` and `record` run the repository's own code (the base revision's and the working tree's):
+use them only on trees you trust.
+
 `record` writes the outputs of one entry to a directory (a local baseline to look at).
 
 The list is every verb's `--help`, every nested subcommand's `--help` (found by walking the

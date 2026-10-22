@@ -1122,6 +1122,8 @@ _pr_item
 _pr_numbers
 _pr_refs
 _pr_state
+_print_when
+_print_when_now
 _printable_path
 _private_parse
 _prune_last_reports
@@ -1665,6 +1667,7 @@ hmac
 hold_reason
 home_link_is_ours
 home_link_path
+how_long
 http
 human_prompts
 identify_caller
@@ -1756,6 +1759,7 @@ launch_gate_probe
 launch_headless
 launch_memory_check
 launch_problems
+launch_read_repo
 launch_repo
 launchd_job
 launched_testers_for
@@ -2021,6 +2025,7 @@ release_impact_hold
 release_stale_binding
 reload_in_place
 remind_manage
+reminder_when
 reminders_lock
 remove_if_same
 remove_order_from_body

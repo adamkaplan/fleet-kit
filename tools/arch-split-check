@@ -13,6 +13,11 @@ split, or the one file before it). Two things must hold:
      statement edited, added or dropped fails and is named;
   2. `dir()` of the module loaded from each side is equal: no name added or removed.
 
+The parts of a side are joined into ONE module to read `dir()`, so a part that lacks an import it needs still passes: that
+is proved by the suites, and once a split makes real modules, by loading each part. The `dir(sb)` snapshot
+(`tests/golden/surface-dir-sb.txt`) is refreshed by hand, with `--write-surface`, in a move PR; CI does not compare it,
+so a PR that adds a function does not fail.
+Loading the modules runs their code: use `--no-surface` (statements only, nothing runs) on files you do not trust.
 Exit 0 when both hold, 1 when not (every difference is printed), 2 for a usage error.
 The snapshot modes write or compare `dir()` of the module, one name per line, so a change
 to the surface of the daemon module is a reviewable difference.
