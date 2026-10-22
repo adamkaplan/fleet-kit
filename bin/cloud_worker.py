@@ -1072,7 +1072,7 @@ def model_entry():
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-    except (OSError, SyntaxError) as err:
+    except Exception as err:
         raise CloudError("the model credential reader is not found beside this program (%s)" % _one(str(err), 80)) from None
     try:
         return module.read_provider_entry(MODEL_PROVIDER)

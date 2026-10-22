@@ -35,6 +35,7 @@ REFUSALS = {
     "two entries for the provider": (json.dumps([MINE, row(PROVIDER, ident="id-second")]), 0, "2 entries"),
     "a failing command": (json.dumps([MINE]), 3, "failed"),
     "output that is not JSON": ("not json at all", 0, "not a JSON array"),
+    "output over the size limit": (" " * (mc.OUTPUT_LIMIT + 1), 0, "over"),
     "output that is not an array": (json.dumps({PROVIDER: MINE}), 0, "not a JSON array"),
 }
 
@@ -47,6 +48,9 @@ class Reader(unittest.TestCase):
         self.env = {"PATH": os.environ["PATH"], "HOME": self.home, "CW_OPENCODE_BIN": FAKE}
 
     def export(self, text, code=0):
+        exit_file = os.path.join(self.home, "export.exit")
+        if os.path.exists(exit_file):
+            os.remove(exit_file)
         with open(os.path.join(self.home, "export.json"), "w") as f:
             f.write(text)
         if code:
@@ -75,7 +79,13 @@ class Reader(unittest.TestCase):
                 self.assertNotIn(CANARY, msg)   # S8
                 for needle in OTHER_BYTES:
                     self.assertNotIn(needle, msg)
-                os.path.exists(os.path.join(self.home, "export.exit")) and os.remove(os.path.join(self.home, "export.exit"))
+
+    def test_s3_output_that_is_not_utf8_is_refused(self):
+        with open(os.path.join(self.home, "export.json"), "wb") as f:
+            f.write(b"[\xff\xfe]")
+        with self.assertRaises(mc.ModelCredentialError) as caught:
+            mc.read_provider_entry(PROVIDER, self.env)
+        self.assertIn("not a JSON array", str(caught.exception))
 
     def test_s3_a_missing_command_is_refused_by_name(self):
         for binary in ("/nonexistent/opencode", "opencode-not-installed"):
