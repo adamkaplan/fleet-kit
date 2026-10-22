@@ -36415,7 +36415,7 @@ class TestBlockTable(LedgerBase):
         parser = sb.build_parser()
         sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction)).choices["review"]
         record = next(a for a in sub._actions if isinstance(a, argparse._SubParsersAction)).choices["record"]
-        flags = {o for a in record._actions for o in a.option_strings if o.startswith("--") and o not in ("--help", "--block")}
+        flags = {o for a in record._actions for o in a.option_strings if o.startswith("--") and o not in ("--help", "--block", "--block-file")}
         listed = [flag for flag, _, _ in sb.BLOCK_FLAG_TABLE]
         self.assertEqual(sorted(listed), sorted(set(listed)))
         self.assertEqual(set(listed), flags)
@@ -36599,6 +36599,109 @@ class TestAgentBlockCounts(TestBlockTable):
                 else:
                     self.assertIsNone(scored["level"])
                     self.assertEqual(scored["reasons"], [sb.load_module("delegated_clear").NO_AGENT_BLOCK])
+
+    # ---- #1126: the floor prints the exact mismatch; a rating is recorded from the verbatim block
+    def block_file(self, sev="Marginal", prob="Remote", action="none", klass=""):
+        path = self.world.state / "verbatim.txt"
+        path.write_text("verdict: approve\nhead: %s\nimpact-action: %s\n%simpact-severity: %s\nimpact-probability: %s\nimpact-reason: why\nfindings:\n" % (
+            LEDGER_HEAD, action, ("impact-class: %s\n" % klass) if klass else "", sev, prob))
+        return str(path)
+
+    def record_file(self, **kw):
+        return self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block-file", self.block_file(**kw))
+
+    def floor_out(self):
+        code, out, err = self.run_as("coder", "impact", "floor", self.PR)
+        self.assertEqual(code, 0, err)
+        return [l.strip() for l in out.splitlines() if "rating considered:" in l], out
+
+    def test_the_block_file_records_the_blocks_four_values(self):
+        code, out, err = self.record_file(sev="Critical", prob="Remote", action="hold", klass="data")
+        self.assertEqual(code, 0, err)
+        entry = self.records()[-1]
+        self.assertEqual([entry[k] for k in ("impact_severity", "impact_probability", "impact_action", "impact_class")], ["Critical", "Remote", "hold", "data"])
+        self.assertEqual(entry["record_form"], "block-file")
+        lines, out = self.floor_out()
+        self.assertEqual(len(lines), 1, out)
+        self.assertIn("agrees", lines[0])
+        self.assertNotIn("retyped-field", out)
+
+    def refusals(self):
+        good = self.block_file()
+        bad = self.world.state / "bad1126.txt"
+        bad.write_text("nothing like a verdict block\n")
+        base = ("review", "record", self.PR, "--reviewer", "impact")
+        return [("restated flag", base + ("--block-file", good, "--impact-severity", "Marginal")),
+                ("unparseable", base + ("--block-file", str(bad))),
+                ("file and flags", base + ("--block-file", good, "--verdict", "approve", "--impact-action", "none")),
+                ("file and block", base + ("--block-file", good, "--block", good))]
+
+    def check_refusals(self):
+        for name, argv in self.refusals():
+            before = self.ledger()
+            code, out, err = self.run_as("coder", *argv)
+            self.assertNotEqual(code, 0, name)
+            self.assertEqual(self.ledger(), before, name)
+
+    def test_each_refusal_records_nothing(self):
+        self.check_refusals()
+
+    ROW = dict(kind="review_record", reviewer="impact", pr="acme/app#7", head="a" * 40, impact_severity="Marginal", impact_probability="Remote", impact_action="none",
+               block_sha256="f" * 64, block_impact_severity="Marginal", block_impact_probability="Remote", block_impact_action="none")
+
+    def lines_for(self, row, head="a" * 40, func=None):
+        with mock.patch.object(sb.plan_ledger, "read_ledger", return_value=([row], None)):
+            return (func or sb.rating_mismatch_lines)("/nowhere", "acme/app#7", head)
+
+    def check_mismatches(self, func=None):
+        self.assertIn("agrees", self.lines_for(dict(self.ROW), func=func)[0])
+        for field, change, head in (("severity", {"impact_severity": "Critical"}, "a" * 40), ("probability", {"impact_probability": "Frequent"}, "a" * 40),
+                                    ("action", {"impact_action": "hold"}, "a" * 40), ("head", {}, "b" * 40)):
+            (line,) = self.lines_for(dict(self.ROW, **change), head, func)   # no subTest: a mutant's failure must raise
+            self.assertIn("differs first at %s" % field, line)
+            self.assertNotIn("agrees", line)
+            if field == "head":
+                self.assertIn("is not the current head", line)
+            else:
+                self.assertIn("block Marginal", line)
+        (line,) = self.lines_for({k: v for k, v in self.ROW.items() if not k.startswith("block_")}, func=func)
+        self.assertIn(sb.RETYPED_FORM_TEXT, line)
+        self.assertNotIn(sb.RETYPED_FORM_TEXT, self.lines_for(dict(self.ROW), func=func)[0])
+
+    def test_the_floor_names_the_first_differing_field_and_the_old_form(self):
+        self.check_mismatches()
+
+    def test_the_old_form_is_said_in_the_floor_output_and_a_block_file_record_is_not(self):
+        self.assertEqual(self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-action", "none",
+                                     "--impact-severity", "Marginal", "--impact-probability", "Remote")[0], 0)
+        lines, out = self.floor_out()
+        self.assertEqual(out.count("retyped-field form"), 1, out)
+        self.assertEqual(self.record_file()[0], 0)
+        lines, out = self.floor_out()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(out.count("retyped-field form"), 1, out)
+
+    def test_the_definition_the_skill_and_the_docs_name_the_block_file_form_and_the_mismatch_line(self):
+        for path in ("agents/reviewers/reviewer-impact.md", "skills/fleet-review/SKILL.md"):
+            self.assertIn("--block-file", (REPO / path).read_text(), path)
+        docs = (REPO / "docs" / "switchboard.md").read_text()
+        self.assertEqual(docs.count("rating considered: impact 1a2b3c4d: recorded Critical/Remote/hold; block Marginal/Remote/none; differs first at severity"), 1)
+
+    def test_mutants_are_caught(self):
+        real = sb.rating_mismatch_lines
+        agrees_always = lambda *a: [l.split("; differs")[0] + "; agrees" if "differs" in l else l for l in real(*a)]
+        ignores_head = lambda state, pr, head: real(state, pr, None)
+        for name, mutant in (("agrees with a differing field", agrees_always), ("ignores the head", ignores_head)):
+            with self.subTest(mutant=name):
+                with self.assertRaises(AssertionError):
+                    self.check_mismatches(mutant)
+        original = sb.rating_inputs
+        def drops_flags(argv):
+            got = original(argv)
+            return {"block_file": got["block_file"]} if "block_file" in got else got
+        with mock.patch.object(sb, "rating_inputs", drops_flags):
+            with self.assertRaises(AssertionError):
+                self.check_refusals()
 
     def test_the_shapes_table_covers_the_record_shapes_of_the_code(self):
         self.assertEqual(sorted(shape for shape, _, _ in self.SHAPES.values()), sorted(["block", "other-head", "malformed", "flags", "disagree", "no-score", "old"]))
