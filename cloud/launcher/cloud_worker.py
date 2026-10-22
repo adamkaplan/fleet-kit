@@ -174,7 +174,14 @@ CREDENTIAL_PATTERNS = [re.compile(p) for p in (
     r"gh[pousr]_[A-Za-z0-9]{20,}", r"github_pat_[A-Za-z0-9_]{20,}", r"sk-[A-Za-z0-9]{20,}", r"AKIA[0-9A-Z]{16}",
     r"-----BEGIN [A-Z ]*PRIVATE KEY", r"Bearer [A-Za-z0-9._-]{20,}", r"(?i)(client_secret|api[_-]?key)\"\s*:\s*\"[^\"]+")]
 SECRET_ENV_NAME = re.compile(r"(?i)(TOKEN|SECRET|PASSWORD|API_?KEY|CREDENTIAL|^PAT$|_PAT$)")
-ALLOWED_ENV_NAMES = {"CW_TOKEN_ENDPOINT"}  # a URL, not a token
+ALLOWED_ENV_NAMES = {"CW_TOKEN_ENDPOINT", "FLEET_CLOUD_TOKEN_FILE"}  # a URL; and the PATH of the channel secret's file, not the secret
+# #1157: the agent a pod runs. ONE value, two accepted; the five names an orchestrator pod adds to the worker's, and no others.
+AGENTS = ("worker", "orchestrator")
+ORCHESTRATOR_ENV_NAMES = ("CW_AGENT", "FLEET_AGENT_NAME", "FLEET_BOSS", "FLEET_CLOUD_CHANNEL_URL", "FLEET_CLOUD_TOKEN_FILE")
+CHANNEL_SECRET_KEY = "channel-secret"                       # the one new key of the per-run Secret
+CHANNEL_TOKEN_FILE = "/run/cw-tmp/fleet-switchboard"        # inside the memory-backed directory; the entrypoint installs the key there
+DEFAULT_CHANNEL_URL = "http://cloud-hub.cw.svc:8443"
+DEFAULT_REGISTRY_SECRET = "cloud-hub-registry"
 
 
 class ReaperLocked(Exception):
@@ -688,6 +695,9 @@ def scan_credentials(spec):
     return hits
 
 
+REGISTRY_KEYS = ("secrets.json", "agents.json")
+
+
 class Kube:
     """The only door to the cloud: one kubectl call per method. Never puts a secret on a command line."""
 
@@ -885,19 +895,48 @@ class Kube:
                 pass   # the launcher's cleanup finds it unlabelled and says it REMAINS
             raise
 
+    def registry_update(self, secret, change):
+        """Read-modify-write of the hub's registry Secret (keys secrets.json and agents.json, each one JSON object): `change(secrets, agents)`
+        edits both; the patch carries the resourceVersion that was read, so a concurrent write is a Conflict and the pass is repeated."""
+        for _ in range(5):
+            obj = self.get_secret(secret)
+            if not obj:
+                raise CloudError("the hub registry Secret %s is not found" % secret)
+            data = obj.get("data") or {}
+            try:
+                maps = [json.loads(base64.b64decode(data[k]).decode()) if data.get(k) else {} for k in REGISTRY_KEYS]
+                if not all(isinstance(m, dict) for m in maps):
+                    raise ValueError
+            except (ValueError, UnicodeDecodeError):
+                raise CloudError("the hub registry Secret %s is not two JSON objects" % secret) from None
+            change(*maps)
+            body = {"metadata": {"resourceVersion": (obj.get("metadata") or {}).get("resourceVersion")},
+                    "data": {k: base64.b64encode(json.dumps(m, sort_keys=True).encode()).decode() for k, m in zip(REGISTRY_KEYS, maps)}}
+            try:
+                self.run(["patch", "secret", secret, "--type=merge", "--patch-file=/dev/stdin"], stdin=json.dumps(body))
+                return
+            except CloudError as e:
+                if "Conflict" not in str(e) and "modified" not in str(e):
+                    raise
+        raise CloudError("the hub registry Secret %s kept changing; not written" % secret)
+
     def exec(self, name, *cmd, keep_stdout=False, timeout=120):
         return self.run(["exec", name, "--"] + list(cmd), keep_stdout=keep_stdout, timeout=timeout)
 
 
-def _pod_repo(pod):
+def _pod_env(pod, key):
     try:
         for c in pod["spec"]["containers"]:
             for e in c.get("env") or []:
-                if e.get("name") == "CW_REPO" and isinstance(e.get("value"), str):
+                if e.get("name") == key and isinstance(e.get("value"), str):
                     return e["value"][:200]
     except (KeyError, TypeError, AttributeError):
         pass
     return ""
+
+
+def _pod_repo(pod):
+    return _pod_env(pod, "CW_REPO")
 
 
 def ann(pod, key, default=None):
@@ -963,6 +1002,17 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
          "CW_AUDIT_RUNTIME_ID": "pod/" + name}
     if endpoint:
         e["CW_TOKEN_ENDPOINT"] = endpoint
+    agent = getattr(a, "agent", None) or "worker"
+    if agent not in AGENTS:
+        raise CloudError("--agent must be one of %s, got %r; nothing was created" % (" or ".join(AGENTS), str(agent)[:40]), EXIT_USAGE)
+    if agent == "orchestrator":   # a worker pod gets none of these: its spec is exactly what it was
+        boss = getattr(a, "boss", None)
+        if not boss or not NAME_RE.match(boss):
+            raise CloudError("--agent orchestrator needs --boss NAME", EXIT_USAGE)
+        if CHANNEL_SECRET_KEY not in run_names:
+            raise CloudError("an orchestrator pod needs its channel secret", EXIT_USAGE)
+        e.update({"CW_AGENT": agent, "FLEET_AGENT_NAME": worker, "FLEET_BOSS": boss,
+                  "FLEET_CLOUD_CHANNEL_URL": env.get("CW_HUB_CHANNEL_URL") or DEFAULT_CHANNEL_URL, "FLEET_CLOUD_TOKEN_FILE": CHANNEL_TOKEN_FILE})
     pw_volume = {"name": "pw", "secret": {"secretName": name + "-pw", "defaultMode": 0o600,
                                           "items": [{"key": "password", "path": "server-password"}]}}
     if run_names:  # one read-only mount at /run/cw holding the password file and each run secret (0400)
@@ -1074,7 +1124,7 @@ class Launcher:
     def create(self, a):
         worker, name = a.worker, pod_name(a.worker)
         self.run_id, self.foreign = getattr(a, "run_id", None), []   # what this call proved is another's is never deleted
-        made = {"secret": False, "run": False, "pod": False}  # set before the call that may create it: an interrupt may land after
+        made = {"secret": False, "run": False, "pod": False, "reg": None}  # set before the call that may create it: an interrupt may land after
 
         def go(info):
             info["rid"] = "pod/" + name
@@ -1089,6 +1139,13 @@ class Launcher:
             if hard > max_hard:
                 raise CloudError("--hard is past --max-hard", EXIT_REFUSED)
             run_values = read_run_secret_values(parse_run_secret_fds(a.run_secret_fd))  # before anything is made
+            agent = getattr(a, "agent", None) or "worker"
+            if agent not in AGENTS:   # before any cluster call
+                raise CloudError("--agent must be one of %s, got %r; nothing was created" % (" or ".join(AGENTS), str(agent)[:40]), EXIT_USAGE)
+            if agent == "orchestrator":   # the per-pod channel secret: random, only its sha256 leaves the pod's Secret, never printed
+                if CHANNEL_SECRET_KEY in run_values:
+                    raise CloudError("%s is the launcher's own key" % CHANNEL_SECRET_KEY, EXIT_USAGE)
+                run_values[CHANNEL_SECRET_KEY] = secrets.token_hex(32)
             self.kube.add_secrets(*run_values.values())  # known to scrub before the first kubectl call
             self.check_cap(a.shape, int((hard - now).total_seconds()))
             spec = render_pod(a, worker, name, now, hard, self.env, sorted(run_values))
@@ -1105,6 +1162,9 @@ class Launcher:
                                  "type": "Opaque", "stringData": {"password": password}})
                 if run_values:
                     self._make(made, "run", self.kube.create_run_secret, name, name, run_values, *([a.run_id] if getattr(a, "run_id", None) else []))
+                if agent == "orchestrator":
+                    made["reg"] = (self._registry_secret(), worker)   # set before the call: a half write is undone by the cleanup
+                    self._register(worker, run_values[CHANNEL_SECRET_KEY], spec, self.env.get("CW_CLOUD_DOMAIN", "example.internal"))
                 self._make(made, "pod", self.kube.apply, spec)
                 if getattr(a, "stack", False):
                     self._start_stack_pod(worker, name, spec, made, a.wait)
@@ -1159,6 +1219,31 @@ class Launcher:
                 made[kind] = False
             raise
 
+    def _registry_secret(self):
+        return self.env.get("CW_HUB_REGISTRY_SECRET") or DEFAULT_REGISTRY_SECRET
+
+    def _register(self, agent, channel_secret, spec, domain):
+        """The hub's registry: {agent: sha256 hex of the channel secret} and {agent: {url, session, password_file}}. Only the hash is stored."""
+        digest = hashlib.sha256(channel_secret.encode()).hexdigest()
+        name = spec["metadata"]["name"]
+        entry = {"url": "https://worker-%s.%s:4096" % (name, domain), "session": "", "password_file": "/run/cw-hub/%s.password" % agent}
+
+        def change(sec, agents):
+            sec[agent], agents[agent] = digest, entry
+        self.kube.registry_update(self._registry_secret(), change)
+
+    def _unregister(self, agent):
+        """Remove both entries of the agent (a no-op when absent). A failure is said on stderr and never raised: the stop goes on."""
+        def change(sec, agents):
+            sec.pop(agent, None)
+            agents.pop(agent, None)
+        try:
+            self.kube.registry_update(self._registry_secret(), change)
+            return True
+        except CloudError as e:
+            print("cloud-worker: the hub registry entry of %s could not be removed: %s" % (agent, e), file=sys.stderr)
+            return False
+
     def _mine(self, kind, name):
         """True: carries this call's run id; False: another's (leave whole); None: not there; raises CloudError: unreadable."""
         if not self.run_id:
@@ -1179,6 +1264,8 @@ class Launcher:
         except ValueError:
             pass
         left = []
+        if made.get("reg"):
+            self._unregister(made["reg"][1])
         try:
             for kind, fn, label in (("pod", self.kube.delete_pod, "pod/" + name), ("secret", self.kube.delete_secret, "secret/%s-pw" % name),
                                   ("run", self.kube.delete_run_secret, "secret/%s-run" % name)):
@@ -1352,6 +1439,7 @@ class Launcher:
         def go(info):
             pod = self._need(worker)
             uid = ((pod or {}).get("metadata") or {}).get("uid")
+            self._orchestrator = _pod_env(pod, "FLEET_AGENT_NAME") if pod and _pod_env(pod, "CW_AGENT") == "orchestrator" else None
             if nonce and pod:
                 info["rid"] = "pod/" + name
                 if ann(pod, "run-id") != nonce:   # another run's (or an unlabelled) worker of this name: nothing is changed
@@ -1412,7 +1500,10 @@ class Launcher:
         """Delete the pod and both Secrets (as `delete` does); with a nonce, only those that carry it (the pod, when there, matched already).
         With a uid the pod delete carries it as a precondition: a pod that changed since it was read is left whole, with a refusal."""
         try:
-            return self._remove_bound(name, nonce, uid)
+            got = self._remove_bound(name, nonce, uid)
+            if getattr(self, "_orchestrator", None):   # the pod and its Secrets are gone: so are its hub entries
+                self._unregister(self._orchestrator)
+            return got
         except PodChanged:
             raise CloudError("pod/%s changed since it was read (another pod holds the name now); left whole" % name, EXIT_REFUSED)
 
@@ -1802,6 +1893,8 @@ SETTINGS = (
     ("CW_APP_KEY_CMD", False, "command"),
     ("CW_CLUSTER_ADMIN_SECRET", False, "secret-name"),   # the NAME of the vault secret that holds the cluster administrator route (default cw-cluster-admin-kubeconfig), never its content
     ("CW_CLUSTER_TOKEN_DURATION", False, "duration"),    # the cluster token's requested life (default 20m)
+    ("CW_HUB_CHANNEL_URL", False, "name"),         # the fleet channel's address an orchestrator pod is told (default http://cloud-hub.cw.svc:8443); not a secret
+    ("CW_HUB_REGISTRY_SECRET", False, "name"),     # the NAME of the hub's registry Secret in the cloud namespace (default cloud-hub-registry), never its content
     ("CW_VAULT_CHECK_DIR", False, "path"),         # the checkout the vault access check runs from; needed only after a vault firewall refusal (see vault_check_dir_problem)
 )
 SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
@@ -1933,6 +2026,8 @@ VALIDATORS = {
     "CW_APP_KEY_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
     "CW_CLUSTER_ADMIN_SECRET": ("a vault secret name: 1 to 127 letters, digits and hyphens, starting with a letter or digit", lambda v: bool(_VAULT_SECRET_NAME.fullmatch(v))),
     "CW_CLUSTER_TOKEN_DURATION": ("a duration of 1 to 3 digits and m or h, from 1m to 60m (for example 20m or 1h)", _duration_ok),
+    "CW_HUB_CHANNEL_URL": ("an http or https URL: a host, an optional port, no user, query or fragment", lambda v: bool(re.fullmatch(r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?/?", v))),
+    "CW_HUB_REGISTRY_SECRET": ("a Kubernetes name (lowercase letters, digits, - and .)", lambda v: bool(_SECRET_NAME.fullmatch(v))),
     "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
 }
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
@@ -2078,6 +2173,8 @@ def build_parser():
     c.add_argument("--image")
     c.add_argument("--stack", action="store_true",
                    help="a pod for a worker that runs a nested Docker stack: the Sysbox runtime class, its own user namespace, the pool's node label; off by default (the default pod is unchanged)")
+    c.add_argument("--agent", help="worker (default) or orchestrator: the agent the pod runs (CW_AGENT); any other value is refused before anything is made")
+    c.add_argument("--boss", help="with --agent orchestrator: the name of its boss (FLEET_BOSS)")
     c.add_argument("--wait", type=int, default=300)
     c.add_argument("--pull-secret", help="name of an existing image-pull Secret (pull-only) for imagePullSecrets")
     c.add_argument("--run-secret-fd", action="append", default=[], metavar="NAME=N",

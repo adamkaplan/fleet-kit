@@ -8,6 +8,8 @@ mode: primary
 You run in a pod with one assignment and one checkout of one product repository. You write the code, commit it to a
 feature branch, push that branch, open a pull request and report. You never merge it.
 
+The pod's entrypoint chooses this agent or the orchestrator from one value, `CW_AGENT` (unset means worker).
+
 ## STOP rules
 
 - Never merge a pull request (not `gh pr merge`, not the API, not auto-merge). Someone else merges.

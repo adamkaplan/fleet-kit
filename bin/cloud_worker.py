@@ -44,7 +44,8 @@ DEFAULT_DIRECTORY = "/work"   # the session's directory in the pod: the scratch 
 CLOUD_WORKER_AGENT = "worker"   # the agent the image defines (cloud/worker/agents/worker.md): a cloud session always runs it; the local --agent name is only recorded
 # The options of the launcher's `create` that `launch --cloud` hands over: ONE table. Taken from the launcher on main (commit fb4b9f2,
 # cloud/launcher/cloud_worker.py `create`: --shape S|M, --stack); a name here that the launcher does not know makes its create fail (exit 2).
-CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack"}
+CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss"}
+CLOUD_AGENTS = ("worker", "orchestrator")   # #1157: the agents a cloud pod may run (the launcher's AGENTS); anything else is refused before any call
 LAUNCHER_SHAPES = ("S", "M")   # the launcher's SHAPES keys; the launcher's own default (S) applies when --shape is not given
 POD_DIR_ROOTS = ("/work", "/home/worker")   # the only roots a cloud session directory may be under (a local path does not exist in the pod)
 WORK_REPO = "/work/repo"      # where the worker clones the repository: the launcher's end hook (CW_WORKDIR default) pushes from here
@@ -1121,6 +1122,10 @@ def _launch(args, runner, now, reserve):
         raise LaunchError("--cloud and --headless do not combine: a cloud worker has its own endpoint, a headless one runs in the local service")
     if not args.agent:
         raise LaunchError("--agent is required")
+    if args.agent not in CLOUD_AGENTS:   # pure check: before settings, vault, cluster or token
+        raise Refusal("--agent %r is not an agent a cloud pod runs (%s); nothing was created" % (_one(str(args.agent), 40), " or ".join(CLOUD_AGENTS)))
+    if args.agent == "orchestrator" and not args.reports_to:
+        raise Refusal("--agent orchestrator needs --reports-to BOSS (the pod's FLEET_BOSS); nothing was created")
     if args.dir:
         given = str(args.dir)   # a normal absolute path (no `..`, no doubled or trailing slash) under a pod root
         if given != os.path.normpath(given) or not any(given == root or given.startswith(root + "/") for root in POD_DIR_ROOTS):
@@ -1155,6 +1160,8 @@ def _launch(args, runner, now, reserve):
     for key, value in (("idle", args.idle), ("hard", args.hard), ("shape", args.shape)):
         if value:
             options += [CREATE_OPTION[key], str(value)]
+    if args.agent == "orchestrator":   # only on request: a worker launch hands the launcher exactly what it always did
+        options += [CREATE_OPTION["agent"], args.agent, CREATE_OPTION["boss"], args.reports_to]
     if getattr(args, "stack", False):   # only on request: a launch without --stack hands the launcher exactly what it always did
         options.append(CREATE_OPTION["stack"])
     if os.environ.get("CW_PULL_SECRET"):
@@ -1224,7 +1231,7 @@ def _launch(args, runner, now, reserve):
         try:
             with tunnel(cluster, record) as live:
                 v2 = remote_v2(state, live, engine.config["call_timeout_seconds"])
-                session = v2.session_create(CLOUD_WORKER_AGENT, name, args.dir or DEFAULT_DIRECTORY,
+                session = v2.session_create(args.agent if args.agent == "orchestrator" else CLOUD_WORKER_AGENT, name, args.dir or DEFAULT_DIRECTORY,
                                             {"fleet": fleet, "cloud": {"runtime_id": record["runtime_id"], "agent": CLOUD_WORKER_AGENT}})["id"]
                 record["session"] = session
                 save_record(state, record)

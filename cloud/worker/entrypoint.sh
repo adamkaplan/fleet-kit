@@ -47,7 +47,13 @@ if usable model-auth; then
   fi
 fi
 
-# the default model and the worker agent: the pod has no OpenCode config, so write one (no secret in it) on tmpfs and point the server at it
+# #1157: the agent this pod runs, from ONE value with two accepted (unset means worker); anything else refuses the start, before the server
+case "${CW_AGENT:-worker}" in
+  worker|orchestrator) AGENT="${CW_AGENT:-worker}" ;;
+  *) echo "worker: CW_AGENT must be worker or orchestrator; refusing to start" >&2; exit 1 ;;
+esac
+
+# the default model and the agent: the pod has no OpenCode config, so write one (no secret in it) on tmpfs and point the server at it
 case "${CW_MODEL:-}" in
   *[!A-Za-z0-9._/:-]*) echo "worker: CW_MODEL has a character outside [A-Za-z0-9._/:-]; refusing to start" >&2; exit 1 ;;
 esac
@@ -57,9 +63,14 @@ cfgdir="$TMP/config"
   # the worker agent (default) and the shell tool's deny rules: the template's first line is its opening brace
   tail -n +2 "${CW_SHARE_DIR:-/usr/local/share/cw}/opencode-worker.json" >> "$cfgdir/opencode/opencode.json"
   mkdir -p "$cfgdir/opencode/agents"
-  cat "${CW_SHARE_DIR:-/usr/local/share/cw}/worker.md" > "$cfgdir/opencode/agents/worker.md" )
+  cat "${CW_SHARE_DIR:-/usr/local/share/cw}/$AGENT.md" > "$cfgdir/opencode/agents/$AGENT.md" )
 chmod 600 "$cfgdir/opencode/opencode.json"
 XDG_CONFIG_HOME="$cfgdir"; export XDG_CONFIG_HOME
+
+# an orchestrator only: the per-pod channel secret goes from the per-run Secret to the memory-backed file the cloud command reads (a copy, 0400, never printed)
+if [ "$AGENT" = orchestrator ] && usable channel-secret; then
+  install -m 0400 "$RUN/channel-secret" "$TMP/fleet-switchboard"
+fi
 
 if usable git-token; then
   bin="$TMP/bin"
