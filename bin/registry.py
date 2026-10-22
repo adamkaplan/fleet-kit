@@ -28,6 +28,7 @@ MAX_BYTES = 4000000
 AUDIT_MAX_BYTES = 512000
 RETIRED_KEEP_SECONDS = 4 * 7 * 86400   # a retirement long past the status window is dropped (the bound the old retired.json had)
 STATES = ("working", "blocked", "idle", "detached", "dead")
+ORCHESTRATOR = "orchestrator"   # the role of an agent that owns a charter (a name, not a comparison: this module decides nothing about who may act)
 AGENT_FIELDS = ("session", "pane", "role", "charter", "repo", "workspace", "cwd")   # the seven fields the old readers use
 RECORD_FIELDS = ("pane", "role", "charter", "repo", "workspace", "cwd")             # what a retirement keeps of an agent row
 LOCK_SECONDS = 5
@@ -368,6 +369,46 @@ def upsert(state_dir, name, agent, now=None):
             return False, [], None
         doc["agents"][name] = new
         return True, [{"event": "update" if old else "add", "name": name}] if not old else [], None   # an audit line on add only: a change of state is no event
+    return _mutate(state_dir, change, now)
+
+
+def is_charter(value):
+    """True for an issue number a charter can be (a positive int, never a bool)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def orchestrator_charters(agents):
+    """{name: charter number} of the orchestrators of a registry's `agents` that record a charter (rows with none are left out). The ONE reading of "whose charter is this" (#969)."""
+    return {name: row["charter"] for name, row in (agents or {}).items()
+            if isinstance(row, dict) and row.get("role") == ORCHESTRATOR and is_charter(row.get("charter"))}
+
+
+def duplicate_charters(agents, repos=None):
+    """{(repo, charter): [names]} of a charter number recorded by two or more orchestrators of the same repo (sorted names). `repos` maps an agent name to its repo when the row has none."""
+    found = {}
+    for name, number in orchestrator_charters(agents).items():
+        row = agents[name]
+        repo = row.get("repo") or (repos or {}).get(name)
+        found.setdefault((repo, number), []).append(name)
+    return {key: sorted(names) for key, names in found.items() if len(names) > 1}
+
+
+def set_charter(state_dir, name, charter, by, now=None):
+    """Write an orchestrator's registry charter (an issue number, or None to clear it): the ONLY command-side writer of the field. One audit event with the old and the new value and who ran it.
+    Refused (nothing written, a problem line) for an agent not in the registry, one retired, or one that is not an orchestrator, and for a value that is not an issue number or None."""
+    def change(doc):
+        row = doc["agents"].get(name)
+        if not isinstance(row, dict) or name in doc["retired"]:
+            return False, [], "%s is not a registered agent" % name
+        if row.get("role") != ORCHESTRATOR:
+            return False, [], "%s is not an orchestrator" % name
+        if charter is not None and not is_charter(charter):
+            return False, [], "a charter is an issue number or none"
+        old = row.get("charter")
+        if old == charter:
+            return False, [], None
+        row["charter"] = charter
+        return True, [{"event": "charter", "name": name, "old": old, "new": charter, "by": by}], None
     return _mutate(state_dir, change, now)
 
 
