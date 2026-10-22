@@ -15774,6 +15774,7 @@ class TestCharterSetGuard(TestOneCharter):  # (re-runs the parent class's tests:
         self.assertIn(code, (1, 2))
         self.assertIn("not an orchestrator", err)
         self.assertEqual(len(self.audit_lines()), 1)
+        self.assertEqual(self.audit_lines()[0]["detail"]["why"], "not an orchestrator")   # the command's own guard, before the registry writer
 
     def test_held_by_another_and_not_a_sub_issue_are_refused(self):
         self.orchestrator("orch-a", registry=3)
