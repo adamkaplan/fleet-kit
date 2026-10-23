@@ -9766,7 +9766,7 @@ class WorkflowPlanPins(unittest.TestCase):
     def touching(entry):
         return entry.replace("**", "sub/file.txt") if "**" in entry else entry
 
-    def plan(self, text, listtext, event, base="", draft=False, files=("docs/other.md",), integration=True, moves=(), head_list=None, unrelated=False):
+    def plan(self, text, listtext, event, base="", draft=False, files=("docs/other.md",), integration=True, moves=(), head_list=None, unrelated=False, action="", labels=""):
         """Run the plan job's script from `text` and return the matrix rows it writes."""
         start = text.index("          python3 - <<'PY'\n")
         end = text.index("\n          PY\n", start)
@@ -9776,7 +9776,7 @@ class WorkflowPlanPins(unittest.TestCase):
         out.write_text("")
         summary = Path(tmp) / "summary.txt"
         summary.write_text("")
-        env = dict(os.environ, EVENT=event, BASE=base, DRAFT="true" if draft else "false", GITHUB_OUTPUT=str(out), GITHUB_STEP_SUMMARY=str(summary))
+        env = dict(os.environ, EVENT=event, BASE=base, DRAFT="true" if draft else "false", ACTION=action, LABELS=labels, RUNNER_TEMP=tmp, GITHUB_OUTPUT=str(out), GITHUB_STEP_SUMMARY=str(summary))
         done = subprocess.run(["bash", "-c", script], cwd=tmp, env=env, capture_output=True, text=True)
         if done.returncode:
             raise AssertionError("the plan script failed: " + done.stderr[-400:])
@@ -9799,6 +9799,8 @@ class WorkflowPlanPins(unittest.TestCase):
             if listtext is not None:
                 (Path(tmp) / ".github" / "macos-platform-paths.txt").write_text(listtext)
             (Path(tmp) / "keep").write_text("x\n")
+            (Path(tmp) / "bin").mkdir()   # ask #1235: the plan step reads bin/macos_plan.py from the base
+            (Path(tmp) / "bin" / "macos_plan.py").write_text((BIN / "macos_plan.py").read_text())
             git("add", "-A")
             git("commit", "-q", "-m", "base")
             for name in ("main", "integration") if integration else ("main",):
@@ -9857,6 +9859,7 @@ class WorkflowPlanPins(unittest.TestCase):
         check("\n  test:\n    needs: plan\n    name: ${{ matrix.name }}\n" in text, "test is named by the plan's name")
         check("\n  test-cloud:\n    needs: plan\n    name: ${{ matrix.cloud }}\n" in text, "test-cloud is named by the plan's cloud name")
         check(jobs.count("include: ${{ fromJSON(needs.plan.outputs.matrix) }}") == 2, "both take the plan's matrix")
+        check('"origin/" + base + ":bin/macos_plan.py"' in text and text.count('"diff", "--no-renames", "--name-only"') == 2, "the plan reads bin/macos_plan.py from the base and both diffs ignore renames")
         check(jobs.count("ref: ${{ matrix.ref }}") == 2, "the nightly leg checks out its own ref")
         check("PATH_LIST" not in text and 'LIST = ".github/macos-platform-paths.txt"' in text and "origin/\" + base + \":\" + LIST" in text, "the plan reads the one list file, from the base")
         groups = self.groups(listtext)
@@ -9867,10 +9870,15 @@ class WorkflowPlanPins(unittest.TestCase):
             return self.plan(text, k.pop("listtext", listtext), *a, **k)
         key = lambda rows: self.names(rows)
         both = list(self.REQUIRED)
-        check(key(run("pull_request", "main")) == both, "a pull request into main ends with both required results")
-        check(key(run("pull_request", "main", files=("docs/other.md",))) == both, "a docs-only pull request into main still runs macOS")
+        check(key(run("pull_request", "main", files=("shims/x",))) == both, "a pull request into main ends with both required results")
+        check(key(run("pull_request", "main")) == ["test (ubuntu-latest)"], "ask #1235: a docs-only pull request into main runs the ubuntu legs only")
+        check(key(run("pull_request", "main", files=("shims/x",))) == both, "a pull request into main touching a platform path runs macOS")
+        check(key(run("pull_request", "main", labels="needs-mac")) == both, "the label needs-mac runs macOS")
+        check(key(run("pull_request", "main", action="reopened")) == both, "a reopened run (the gate pass's) runs every leg")
+        check(key(run("pull_request", "main", draft=True, action="reopened")) == both, "a reopened run runs every leg even for a draft")
+        check("github.event.action == 'reopened' && '-reopened'" in top, "the concurrency group names the reopened run")
         check(key(run("pull_request", "main", draft=True)) == ["test (ubuntu-latest)"], "a draft into main skips macOS")
-        check(key(run("pull_request", "main", draft=False)) == both, "marked ready, macOS runs")
+        check(key(run("pull_request", "main", draft=False, files=("shims/x",))) == both, "marked ready, macOS runs for a platform path")
         for event in ("push", "workflow_dispatch"):
             check(key(run(event)) == both, event + " runs both")
         check(key(run("pull_request", "integration")) == ["test (ubuntu-latest)"], "a docs-only pull request into integration skips macOS")
@@ -9945,8 +9953,10 @@ class WorkflowPlanPins(unittest.TestCase):
             ("the nightly legs dropped", swap('if event == "schedule":', 'if event == "never":'), listtext),
             ("the nightly without integration", swap('["main"] + (["integration"]', '["main"] + ([]'), listtext),
             ("a nightly leg named like a required one", swap('name="nightly %s (%s)" % (r, o)', 'name="test (%s)" % o'), listtext),
-            ("macOS skipped for a pull request into main", swap("macos = not draft", "macos = False"), listtext),
-            ("the draft rule dropped", swap("macos = not draft", "macos = True"), listtext),
+            ("macOS skipped for a pull request into main", swap('macos = decision["macos"]', "macos = False"), listtext),
+            ("macOS for every pull request into main", swap('macos = decision["macos"]', "macos = True"), listtext),
+            ("the plan read from the head, not the base", swap('git("show", "origin/" + base + ":bin/macos_plan.py")', 'git("show", "HEAD:bin/macos_plan.py")'), listtext),
+            ("the reopened group dropped", swap("${{ github.event.action == 'reopened' && '-reopened' || '' }}", ""), listtext),
             ("ready_for_review dropped", swap("types: [opened, synchronize, reopened, ready_for_review]", "types: [opened, synchronize, reopened]"), listtext),
             ("the path list not read", swap('LIST = ".github/macos-platform-paths.txt"', 'LIST = ".github/missing.txt"'), listtext),
             ("the list read from the head, no self-touch rule", swap('shown = git("show", "origin/" + base + ":" + LIST)', 'shown = git("show", "HEAD:" + LIST)').replace("or LIST in files ", ""), listtext),
@@ -9956,7 +9966,7 @@ class WorkflowPlanPins(unittest.TestCase):
             ("the fail-safe lines not in the summary", swap("summary.write(message", "summary.write(''"), listtext),
             ("the summary written only for the log", swap('if os.environ.get("GITHUB_STEP_SUMMARY"):', "if False:"), listtext),
             ("the path list emptied", text, "# group: shims\n"),
-            ("renames detected", swap('"diff", "--no-renames", "--name-only"', '"diff", "--name-only"'), listtext),
+            ("renames detected", text.replace('"diff", "--no-renames", "--name-only"', '"diff", "--name-only"'), listtext),
             ("a failed diff skips macOS", swap("macos = diff.returncode != 0 or LIST in files or any(", "macos = diff.returncode == 0 and any("), listtext),
             ("an empty list runs no macOS", swap("if not patterns:", "if False:"), listtext),
             ("a missing list crashes", swap("if shown.returncode == 0 else []", "if shown.returncode == 0 else [][0]"), listtext),
@@ -87262,13 +87272,13 @@ class TestMacosLegs(unittest.TestCase):
             self.assertIn("macos-latest", said)
             self.assertIn(name, said)
 
-    def test_the_workflow_patch_applies_and_pins_the_planning_decisions(self):
+    def test_the_workflow_patch_is_applied_to_the_workflow_and_pins_the_planning_decisions(self):
         patch = self.PATCH.read_text()
         workflow = (REPO / ".github" / "workflows" / "test.yml").read_text()
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / ".github" / "workflows").mkdir(parents=True)
             (Path(tmp) / ".github" / "workflows" / "test.yml").write_text(workflow)
-            done = subprocess.run(["git", "apply", "--check", str(self.PATCH)], cwd=tmp, capture_output=True, text=True)
+            done = subprocess.run(["git", "apply", "--check", "--reverse", str(self.PATCH)], cwd=tmp, capture_output=True, text=True)
             self.assertEqual(done.returncode, 0, done.stderr)
         added = "\n".join(l[1:] for l in patch.splitlines() if l.startswith("+") and not l.startswith("+++"))
         self.assertNotIn(".github/workflows/", "\n".join(l for l in patch.splitlines() if l.startswith("diff --git")).replace(".github/workflows/test.yml", ""))
