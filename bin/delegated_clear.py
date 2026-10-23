@@ -688,3 +688,46 @@ def decode_blob(answer):
         return base64.b64decode("".join(answer["content"].split()), validate=True).decode("utf-8")
     except (ValueError, UnicodeError):
         return None
+
+
+# ---- #1215 slice B: the decider follows the SUBSTANCE of the impact brief (a dict of the contract of bin/impact_brief.py), never the rating label or the path class alone
+NOT_SHOWN = "not shown"
+OWNER, CHIEF = "owner", "chief_of_staff"
+
+
+def substance_rule(matrix):
+    """The matrix's `owner_hold.substance_decider` block, or None when it is missing or malformed (then every decision is the owner's)."""
+    block = ((matrix or {}).get("owner_hold") or {}).get("substance_decider") if isinstance(matrix, dict) else None
+    if not isinstance(block, dict):
+        return None
+    for key in ("owner_only", "chief_of_staff", "material_risks"):
+        if not isinstance(block.get(key), list) or not all(isinstance(x, str) for x in block[key]):
+            return None
+    return block
+
+
+def decide_on_substance(brief, classes, rule):
+    """(decider, why): "owner" or "chief_of_staff", ONE sentence why. `brief` is the brief dict (`material`, `loosening`, `pieces`), `classes` the path classes of the changed paths, `rule` `substance_rule`.
+    Owner when: the brief or the rule cannot be read, a risk is material, an accept path is loosened, any piece is `not shown`, or any class is owner-only or unknown. Else chief_of_staff.
+    The rating label is not an input: two changes with the same label and class differ by their brief."""
+    if not isinstance(rule, dict) or not isinstance(brief, dict):
+        return OWNER, "the brief or the decider rule cannot be read, so it is the owner's."
+    material, loosening, pieces = brief.get("material"), brief.get("loosening"), brief.get("pieces")
+    if not isinstance(material, list) or not isinstance(loosening, list) or not isinstance(pieces, dict) or not isinstance(classes, (list, tuple, set, dict)):
+        return OWNER, "the brief is malformed, so it is the owner's."
+    if material or any(m not in rule["material_risks"] for m in material):
+        return OWNER, "the brief names a material risk (%s): escalate to the owner." % ", ".join(sorted(str(m) for m in material))
+    if loosening:
+        return OWNER, "the brief names an accept path it loosens: escalate to the owner."
+    missing = sorted(k for k, v in pieces.items() if v == NOT_SHOWN or v is None)
+    if missing or not pieces:
+        return OWNER, "a piece of the brief is %s (%s): escalate to the owner." % (NOT_SHOWN, ", ".join(missing) or "all")
+    names = sorted({str(c) for c in classes}) if not isinstance(classes, dict) else sorted({str(c) for c in classes.values()})
+    if not names:
+        return OWNER, "no path class is known for the change: escalate to the owner."
+    for c in names:
+        if c in rule["owner_only"]:
+            return OWNER, "it changes a %s path, which is the owner's own decision: escalate to the owner." % c
+        if c not in rule["chief_of_staff"]:
+            return OWNER, "the class %s is not named in any rule, so it is unknown: escalate to the owner." % c
+    return CHIEF, "the brief names no material risk, no loosening and no piece it could not show, so the Chief of Staff decides."
