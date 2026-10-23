@@ -185,12 +185,11 @@ class StopNonce(base.Base):
         self.assertFalse(os.path.exists(rec))
 
     # U1 (the no-pod case)
-    def test_u1_a_stop_without_a_nonce_and_without_a_pod_deletes_nothing_and_exits_0(self):
-        self.plant(A, ("secret", "run"))
-        before = self.st()
+    def test_u1_a_stop_without_a_nonce_and_without_a_pod_removes_only_the_leftover_secrets_and_exits_0(self):
+        self.plant(A, ("secret", "run"))   # (#1068) a by-name stop of a gone worker removes the Secrets that exist
         code, out, err = self.stop()
         self.assertEqual(code, 0, err)
-        self.assertEqual(self.st(), before)
+        self.assertEqual(self.objects(), [])
 
     # U1
     def test_u1_a_stop_without_a_nonce_acts_by_name_as_before(self):

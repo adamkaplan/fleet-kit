@@ -583,7 +583,13 @@ class GoneMatrix(Fx):   # the reproducer matrix: callers x states, each cell's l
         for (caller, st), (kind, left) in sorted(self.CELLS.items()):
             self.setUp()
             self.state(st)
+            dels = []
+            for meth in ("delete_pod", "delete_secret", "delete_run_secret", "delete_workload", "delete"):
+                real = getattr(self.kube, meth)
+                setattr(self.kube, meth, lambda *a, _r=real, _m=meth, **k: (dels.append(_m), _r(*a, **k))[1])
             got_kind, ans = self.call(caller)
+            if st == "none" and caller == "stop-none" and dels:   # pod AND workload AND Secrets absent: no delete call at all
+                bad.append("%s x %s: delete calls %s" % (caller, st, dels))
             want = self.EMPTY[1:] if left == "EMPTY" else self.WHOLE[1:]
             got = self.left()[1:]
             if got_kind != kind or got != want:

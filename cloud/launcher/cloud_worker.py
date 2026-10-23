@@ -1532,8 +1532,23 @@ class Launcher:
                     raise
                 raise CloudError("delete incomplete; REMAINS: statefulset/%s (and its Secrets); delete with: %s; cause: %s" % (
                     name, self.kube.delete_command("statefulset", name), e))
-        else:
+        elif nonce:
             self._remove(name, nonce)
+        else:
+            self._remove_existing_secrets(name)
+
+    def _remove_existing_secrets(self, name):
+        """No pod, no workload, no nonce: delete only the Secrets that EXIST (nothing there: no delete call at all). Names what REMAINS."""
+        left = []
+        for obj, getter, fn in (("secret/%s-pw" % name, lambda: self.kube.get_secret(name + "-pw"), self.kube.delete_secret),
+                                ("secret/%s-run" % name, lambda: self.kube.get_run_secret(name), self.kube.delete_run_secret)):
+            try:
+                if getter():
+                    fn(name)
+            except CloudError:
+                left.append(obj)
+        if left:
+            raise CloudError("delete incomplete; REMAINS: %s; delete each with: %s" % (", ".join(left), "; ".join(self._delete_cmd(l) for l in left)))
 
     def _remove(self, name, nonce, uid=None):
         """Delete the pod and both Secrets (as `delete` does); with a nonce, only those that carry it (the pod, when there, matched already).
