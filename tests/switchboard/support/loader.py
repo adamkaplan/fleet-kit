@@ -108,17 +108,6 @@ def _load(name, path):
 sb = _load("t_fleet_switchboard", SWITCHBOARD)
 
 
-def set_retired(state, retired):
-    """A test sets the retired map: in the registry when it exists (the record), and in retired.json (its derived copy), as the registry itself would."""
-    state = Path(state)
-    (state / "retired.json").write_text(json.dumps(retired))
-    path = state / "registry.json"
-    if path.exists():
-        doc = json.loads(path.read_text())
-        doc["retired"] = retired
-        path.write_text(json.dumps(doc))
-
-
 sc = _load("t_fleet_scenario", SCENARIO)
 
 
