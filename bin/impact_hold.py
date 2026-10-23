@@ -13,6 +13,7 @@ daemon's globals and are not meant to be called from this module's own namespace
 import types
 
 MOVED = ('rating_at',
+         'applied_for_repo',
          '_plan_hold',
          'rehold_reason',
          'gate_floor_fact',
@@ -107,6 +108,12 @@ def gate_floor_fact(engine, state, repo, number, head):
                 "rehold": None if problem else rehold_reason(engine, clears, repo, report["pr"], head)}   # the OWNER-HOLD decision: the one the daemon's labels follow (#451)
     except Exception as err:   # an unreadable diff, a matrix error, a missing file: all the same answer
         return {"decision": None, "reasons": [], "cleared": False, "rehold": None, "unreadable": _one_line("%s: %s" % (type(err).__name__, err), 150)}
+
+
+def applied_for_repo(applied, repo):
+    """(#999) The pull requests of exactly `repo` whose `applied` record lists labels this daemon added: a key is `<repo>#<number>` (the `#` ends the name, so
+    `acme/web` never takes `acme/web2#1`), and a record that is not an object is no record of ours. The ONE match the daemon's pass and `impact hold --dry-run` share."""
+    return {pr for pr, entry in (applied or {}).items() if isinstance(pr, str) and pr.startswith(repo + "#") and isinstance(entry, dict)}
 
 
 def read_impact_state(state_dir):
@@ -1017,6 +1024,7 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
             detail["order"] = plan_ledger.clip(under_order["text"], 300)
             if under_order.get("threshold"):   # #835: a clear by score shows the score and the threshold it was made under
                 detail["score"], detail["threshold"] = under_order.get("score"), under_order["threshold"]
+                detail["runs"] = under_order.get("runs") or []   # #972: the two runs the clear rests on (record id, rater, cell)
         if fingerprint is not None:
             detail["fingerprint"] = fingerprint
         engine.audit.append(engine.actor, "gate.hold_cleared", pr, detail)   # inside the lock
@@ -1096,7 +1104,7 @@ def delegated_clear_score(engine, module, report, threshold):
         if not rated and not problem:
             problem = "no independent impact rating at this head"
         block = module.score_block()
-        scored = module.judge(block, impact_floor.load_matrix().get("cells"), entries, report, threshold) if not problem and block is not None else None
+        scored = module.judge(block, impact_floor.load_matrix().get("cells"), entries, report, threshold, module.RUNS_REQUIRED) if not problem and block is not None else None
     except Exception as err:
         scored, problem = None, "%s: %s" % (type(err).__name__, _one_line(str(err), 80))
     if scored is None:
@@ -1160,6 +1168,7 @@ def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info
     scored = delegated_clear_score(engine, module, report, threshold) if threshold is not None else None
     if scored is not None and info is not None:
         info["score"] = scored["level"]
+        info["runs"] = scored.get("runs") or []
     reasons = module.refusals(got["rule"], report, got["files"], impact_floor.matches, got["closure"], scored)
     if reasons:
         return None, "; ".join(reasons)
@@ -1242,7 +1251,15 @@ def cmd_impact_clear(args, runner, now):
                     engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), dict({"by": kind[1], "under_order": delegated["number"], "why": _one_line(why, 300)}, **({"score": info.get("score"), "threshold": delegated["threshold"]} if delegated.get("threshold") else {})))
                 sys.stderr.write("%s: impact clear: refused: %s\n" % (PROG, _one_line(why, 600)))
                 return EXIT_USAGE
-            extra = {"head": report["head"], "via": "order:%d" % delegated["number"], "under_order": dict(delegated, score=info.get("score"))}
+            if delegated.get("threshold"):   # #972: a clear by score names both runs it rests on
+                problems = load_module("delegated_clear").reason_problems(reason, info.get("runs") or [])
+                if problems:
+                    why = "; ".join(problems)
+                    if engine.audit is not None:
+                        engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), {"by": kind[1], "under_order": delegated["number"], "why": _one_line(why, 300), "score": info.get("score"), "threshold": delegated["threshold"]})
+                    sys.stderr.write("%s: impact clear: refused: %s\n" % (PROG, _one_line(why, 600)))
+                    return EXIT_USAGE
+            extra = {"head": report["head"], "via": "order:%d" % delegated["number"], "under_order": dict(delegated, score=info.get("score"), runs=info.get("runs"))}
         for line in impact_clear_core(engine, runner, repo, number, kind[1], plan_ledger.clip(redact_command_text(reason), 300), **extra):
             print(line)
     except (NoticeError, IntentError) as err:
@@ -1323,8 +1340,8 @@ def impact_plan(engine, report, labels, state, records, records_problem):
     names = label_names(engine.config)
     have = set(labels or ())
     pr = report["pr"]
-    if report.get("draft"):
-        return "none", []   # the daemon judges no draft pull request
+    if report.get("draft") and report.get("owner_decision") == "hold":
+        return "none", []   # the daemon adds no hold to a draft pull request (it still releases one the rule no longer holds, #999)
     if report.get("owner_decision") == "hold":
         carried = (state.get("carried", {}).get(pr) or {}).get("head") == report["head"] and impact_floor.carry_enabled(engine.config, report["pr"].rpartition("#")[0])
         if (state["clears"].get(pr) or {}).get("head") == report["head"] or carried:   # the owner's clear, or a clear carried over a pure merge of main (#510)
@@ -1354,7 +1371,7 @@ def cmd_impact_hold(args, runner, now):
         except impact_floor.MatrixError as err:   # the matrix file cannot be read: say so and stop, never read it as "no floor"
             sys.stderr.write("%s: impact hold: %s\n" % (PROG, _one_line(str(err), 200)))
             return EXIT_ERROR
-        if not has_floor:
+        if not has_floor and not applied_for_repo(read_impact_state(state)[0].get("applied"), repo):   # a repo with no floor now is still judged while it holds labels of ours (#999)
             continue
         try:
             items = read_open_items(engine, runner, repo)[0]
@@ -1417,7 +1434,7 @@ def release_impact_hold(engine, repo, number, report, record):
         del state["applied"][pr]
         write_impact_state(engine.state_dir, state)
         engine.audit.append(engine.actor, "gate.hold_released", pr, {"head": report["head"], "removed": remove, "reasons": report.get("owner_reasons", [])[:5],
-                                                                      "rule": engine.__dict__.get("impact_rule")})
+                                                                      "reason": report.get("release_reason") or "rule no longer holds", "rule": engine.__dict__.get("impact_rule")})
         return len(remove)
 
 

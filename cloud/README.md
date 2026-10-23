@@ -17,7 +17,7 @@ Cloud workers serve the organisation's repositories only; no task, test or demo 
 Ubuntu 24.04, Python 3, git, `cw-gh` (our own small GitHub client; the real `gh` is not installed: see "The client that replaces the real `gh`"), Docker Engine with the compose plugin, and `opencode` v2 (pinned,
 `OPENCODE_VERSION=2.0.28`, a standalone binary checked against its sha256 before it is unpacked; no node or npm). The
 launcher's end hook and token mint are copied in as `cw-end-hook` and `cw-token-mint`, and the activity reader as
-`cw-worker-activity` (it reads the v2 object shape of `GET /api/session/active`). It runs as user `worker` (uid 1000). `worker` may run one command as root (`start-dockerd`) through sudo;
+`cw-worker-activity` (it reads the v2 object shape of `GET /api/session/active`). `cw-plan-check` and `plan_check.py` (a byte-identical copy of `bin/plan_check.py`, pinned by a CI test) let a worker check its own plan with `cw-plan-check --file PLAN --done-when TEXT`: a pure local read, same output and exit codes (0 pass, 1 fail, 2 unreadable) as `plan check --file`; if the plan has an `## Intent` section with its own `Done when:` line, the pod compares it with `--done-when` exactly as the local check does. Slice B (a retire of a worker whose pod is already gone) is described in `docs/cloud-worker-interface.md`; the image must be rebuilt and published by an operator before pods have the command. It runs as user `worker` (uid 1000). `worker` may run one command as root (`start-dockerd`) through sudo;
 the entrypoint uses it to start the nested `dockerd` and then execs the command. Default command:
 `opencode serve --hostname 0.0.0.0 --port 4096`. Set `WORKER_DOCKER=0` to skip the Docker daemon. No credential is
 built in: `OPENCODE_SERVER_PASSWORD`, `GH_TOKEN` and any cloud identity are supplied by the launcher at run time.
@@ -153,6 +153,24 @@ A task that needs one of these is a task for a person or for the repository's ow
 
 Through them, the actions of the table marked allowed remain possible: bounded by the repository's rules, not by the pod.
 
+## The orchestrator agent (#1157)
+
+**Cause.** Before this change the pod's agent was fixed: `entrypoint.sh` wrote only `worker.md`, and `cmd_launch` only recorded `--agent`, so no pod could run an orchestrator.
+
+The entrypoint now picks the agent from ONE value, `CW_AGENT`: `worker` (also when unset) or `orchestrator`; any other value exits 1 with a message naming `CW_AGENT` before the server starts. `launch --cloud --agent orchestrator --reports-to BOSS` sets it (a worker launch sets nothing new and renders the same pod as before; any other `--agent` on `launch --cloud` stays the local role name, only recorded; the launcher's own `create --agent` refuses any value but `worker` or `orchestrator` with exit 2 before any cluster call).
+
+An orchestrator pod gets exactly five more environment names, all non-secret: `CW_AGENT`, `FLEET_AGENT_NAME` (the launch's name), `FLEET_BOSS` (`--reports-to`), `FLEET_CLOUD_CHANNEL_URL` (settings row `CW_HUB_CHANNEL_URL`, default `http://cloud-hub.cw.svc:8443/message`) and `FLEET_CLOUD_TOKEN_FILE` (`/run/cw-tmp/channel-token`, the path of the channel secret). The volume list and the token set are the worker's; there is no new token role.
+
+**The hub's address for a pod.** A hub pod (an orchestrator, or any launch while the hub setting is on) gets exactly two more spec keys, `spec.hostname` (the pod's name) and `spec.subdomain` (`cw-agents`); the stack-pod allow-list admits exactly these two, together, with that subdomain. The launcher registers `http://<pod name>.cw-agents.<namespace>.svc.cluster.local:4096` (the cluster domain is the constant `CLUSTER_DOMAIN`) (namespace from `CW_CLOUD_NAMESPACE`, default `cw`), a name the hub accepts over http; no pod address is read. A launch with the hub setting needs the headless Service `cw-agents` (clusterIP None, selector `app=cw-worker`, port 4096) in that namespace; the hub manifests create it, the launcher does not.
+
+**The hub settings (launcher side).** `CW_HUB_CHANNEL_URL`: the channel address a hub pod is told, not a secret, default `http://cloud-hub.cw.svc:8443/message`. `CW_HUB_REGISTRY_SECRET`: the name of the hub's registry Secret in the cloud namespace, default `cloud-hub-registry`. Either one set means the hub setting is on: every launch registers, and each launch needs the headless Service `cw-agents`; both unset, a worker launch is exactly what it was. `CW_AGENT` is not a setting: the launch's `--agent` (`worker` default, or `orchestrator` with `--boss`) chooses it. Both rows are in the launcher's settings table (`cloud/launcher/README.md`) and in the code's one table, which `test_cloud_settings.py` checks.
+
+**Channel credential (tightening-only).** The launcher draws a random 32-byte secret per pod and adds it to the pod's per-run Secret as ONE new key, `channel-secret`; the entrypoint copies it (mode 0400) into the memory-backed directory `/run/cw-tmp`. It expires with the pod and is never printed. The launcher registers the pod in the hub's registry Secret (`CW_HUB_REGISTRY_SECRET`, default `cloud-hub-registry`; keys `secrets.json` and `agents.json`): only the sha256 of the secret is stored; the pod's server password goes to a key named for the agent in the Secret `cloud-hub-pw` (mounted by the hub at `/etc/hub/pw`); `stop` removes all three entries. A failed registration refuses the launch and removes what it made. The registry is the launcher's only new cluster write.
+
+**The image changes: an operator rebuild after merge.** The image now carries `orchestrator.md` beside `worker.md` and the cloud command and hub files (`cloud/worker/bin/`, byte-identical copies of `bin/` files, checked by `cloud/launcher/tests/test_orchestrator_agent.py`). Rebuild and publish it once after merge (see "Build and scan the image").
+
+**Branch names.** The pod's shell guard refuses a push (or any git command line) that contains the words `main` or `master` anywhere in it, so a branch name that contains them (for example `impact/sync-main`) is refused: name branches without those words.
+
 ## The operator driver
 
 ```sh
@@ -217,6 +235,8 @@ A pod ended by its deadline or by a retire lost its unpushed work unless a fresh
 ```sh
 cloud/tests/test-cloud          # prints RESULT: PASS
 ```
+
+**The rule for every test of the cloud tree (#956):** a test that starts a server or another long-lived child process starts it through `cloud/worker/tests/stub_support.py` (`start` registers the cleanup first; the cleanup kills the child's whole process group, waits, and asserts the port is free), or registers its own cleanup for that very process. The stub server also ends by itself (on SIGTERM, when its parent is gone, and after an idle cap), because a SIGKILLed runner runs no cleanup. `cloud/launcher/tests/test_stub_cleanup.py` scans the cloud tests by syntax tree and fails any start site that does neither, with a case and a mutant per site. The scan reads direct calls and the usual import aliases; it does not follow an alias of a callable (`P = subprocess.Popen`), `functools.partial`, or `__import__`/`importlib.import_module`, so review such a start by hand. The port check counts only a refused connect as free; the stub names its parent through `STUB_PARENT_PID` (set by `stub_support`), so a parent that dies during startup still ends it.
 
 It runs `kubectl apply --dry-run=client` on each manifest (an offline parse when no API server answers), runs the
 manifest's own `sed` on a legacy-keyed config twice (second pass changes nothing), and checks the scan: 0 hits on a clean
