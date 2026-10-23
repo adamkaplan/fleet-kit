@@ -44,6 +44,8 @@ descriptor `N`, pipes it to `kubectl` on stdin into one Secret `<pod>-run`, and 
 The Secret goes with the pod at `stop`, `delete` and a failed or interrupted `create`; a pod kept because the end hook failed keeps it.
 A `stop` by name only (no run id) or a `delete` of a worker whose pod is absent removes its StatefulSet first, then its Secrets: the caller named the worker, so it owns it (a run id exists only to protect another run's objects, and a different run id leaves everything whole). A `delete` whose StatefulSet lookup fails for any reason but NotFound exits non-zero and never answers `deleted`.
 
+Do NOT remove the `statefulsets` rights from the Role while orchestrators run: a StatefulSet created while the right existed would become unlookable, the plain-worker cleanup would treat the lookup as `statefulset lookup forbidden: not checked`, and it would remove that worker's Secrets while the set lives. Only a status that starts `Error from server (Forbidden):` counts as forbidden; any other error (a 5xx that merely says the word included) leaves it `REMAINS unknown`.
+
 After this change merges, an operator must apply the manifest (`kubectl apply -f cloud/k8s/operator-rbac.yaml`) on the owner's word; until then `launch --role orchestrator` is forbidden on the real cluster.
 
 Accepted scope of the role: `cw-operator` can get and list every secret in the workers namespace (a Role cannot limit `list` by label), so the namespace must hold only worker pods and their per-pod secrets; that is enforced in the deployment repository, not here.

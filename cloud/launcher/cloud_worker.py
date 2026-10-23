@@ -778,7 +778,7 @@ class Kube:
         if p.returncode != 0:
             if keep_stdout and p.stdout.strip():
                 return p.stdout  # the caller reads the failure from the tool's own JSON
-            if ok_missing and "NotFound" in p.stderr:
+            if ok_missing and (p.stderr.strip().splitlines() or [""])[-1].startswith("Error from server (NotFound):"):   # kubectl's own status form, nothing looser
                 return None
             last = (self.scrub(p.stderr, limit=SCRUB_OUTPUT_MAX).strip().splitlines() or ["failed"])[-1]
             raise CloudError("kubectl %s: %s" % (args[0], self.scrub(last)))
@@ -1521,7 +1521,7 @@ class Launcher:
         try:
             return self.kube.get_workload(name)
         except CloudError as e:
-            if "forbidden" in str(e).lower():
+            if str(e).startswith("kubectl get: Error from server (Forbidden):"):   # strict prefix: a 5xx that merely says the word is NOT this
                 print("cloud-worker: statefulset lookup forbidden: not checked", file=sys.stderr)
                 return None
             raise CloudError("could not look up statefulset/%s; REMAINS unknown: %s" % (name, e))

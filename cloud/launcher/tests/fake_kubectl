@@ -152,6 +152,13 @@ elif cmd == "get" and args[1] == "statefulset":   # a StatefulSet: NotFound unle
     fail = st.get("fail_get_statefulset")   # True or "500": an internal error; "forbidden": the RBAC answer (no apps/statefulsets grant)
     if fail == "forbidden":
         print('Error from server (Forbidden): statefulsets.apps "%s" is forbidden: User "system:serviceaccount:acme:launcher" cannot get resource "statefulsets" in API group "apps"' % args[2], file=sys.stderr); sys.exit(1)
+    odd = {"webhook": 'Error from server (InternalError): Internal error occurred: failed calling webhook "x.acme.io": the request was forbidden by policy',
+           "timeout": "Error from server (Timeout): the request was forbidden to complete in time",
+           "upper": "Error from server (InternalError): Internal error occurred: FORBIDDEN",
+           "resname": 'Error from server (InternalError): Internal error occurred: statefulsets.apps "forbidden-x" broke',
+           "etcdnotfound": "Error from server (InternalError): etcdserver: key not found"}
+    if fail in odd:
+        print(odd[fail], file=sys.stderr); sys.exit(1)
     if fail:
         print("Error from server (InternalError): Internal error occurred: etcd leader changed", file=sys.stderr); sys.exit(1)
     if args[2] not in st.get("statefulsets", {}): missing('statefulsets.apps "%s"' % args[2])
