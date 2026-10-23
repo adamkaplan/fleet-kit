@@ -22249,8 +22249,9 @@ def cmd_verdict(args, runner, now):
         raise LedgerCommandError("--all needs --head <sha> (the head you judged): a batch is never stamped with whatever the head is now")
     head, evidence = _head_of(ctx, args), _evidence(args)
     for target in targets:   # a `review` proof counts only with a quote of the text read or a link to it
-        if plan_ledger.proof_of(target) == "review" and plan_ledger.review_evidence_problem(evidence):
-            raise LedgerCommandError("refused: %s: %s; nothing was recorded" % (target["id"], plan_ledger.review_evidence_problem(evidence)))
+        problem = plan_ledger.review_evidence_problem(evidence, target) if plan_ledger.proof_of(target) == "review" else None
+        if problem:
+            raise LedgerCommandError("refused: %s: %s; nothing was recorded" % (target["id"], problem))
     entries = [{"kind": "verdict", "pr": ctx.pr, "scenario": target["id"], "plan_ref": ctx.source,
                 "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
                 "evaluator": named, "evidence": evidence} for target in targets]
