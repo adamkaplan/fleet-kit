@@ -12482,7 +12482,6 @@ class TestAgentShellCalls(Base):
         self.shim("api", "repos/acme/app/issues/5")
         self.assertFalse((self.state / "agent-calls.jsonl").exists())
         sb.agent_calls.fold(str(self.state), time.time())
-        self.shim("api", "repos/acme/app/issues/5", env={"FLEET_SWITCHBOARD_OWN_GH": "1"})
         self.shim("auth", "status")
         self.assertFalse((self.state / "agent-calls.jsonl").exists())
 
@@ -21811,12 +21810,18 @@ class TestGhShimGateProbe(Base):
         self.assertNotIn("\x1b", logged)
         self.assertIn("with escapes", logged)
 
-    def test_only_merge_is_checked_and_the_daemons_own_calls_are_not(self):
+    def test_only_merge_is_checked_and_the_marker_buys_nothing(self):
         block = [self.review("CHANGES_REQUESTED", "reviewer-a")]
         done, seen = self.merge(reviews=block, args=("pr", "ready", "12", "-R", "acme/app"))
         self.assertEqual(done.returncode, 7)
-        done, seen = self.merge(reviews=block, env={"FLEET_SWITCHBOARD_OWN_GH": "1"})
-        self.assertEqual(done.returncode, 7)
+
+    def test_a_blocking_review_refuses_a_merge_with_the_marker_set_and_unset(self):   # #1216 S2: the review probe does not honour the marker
+        block = [self.review("CHANGES_REQUESTED", "reviewer-a")]
+        for env in ({"FLEET_SWITCHBOARD_OWN_GH": "1"}, {}):
+            with self.subTest(env=env):
+                done, seen = self.merge(reviews=block, env=env)
+                self.assertEqual((done.returncode, seen), (10, None), done.stderr)
+                self.assertIn("blocking review", done.stderr)
 
     HEAD = "a" * 40
     REFUSAL = ("fleet-switchboard: merge of acme/app#12 refused: missing G1: no passing CI record at this head. Way out: ask the chief of "
@@ -21990,10 +21995,12 @@ class TestGhShimGateProbe(Base):
         self.run_shim("pr", "merge", "https://github.com/someone/app/pull/9")
         self.assertEqual(self.gate_calls(), [], "a fork's PR is another repo: not listed, not probed")
 
-    def test_the_switchboards_own_gh_calls_are_not_probed(self):
-        done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/app", env={"FLEET_SWITCHBOARD_OWN_GH": "1"})
-        self.assertEqual(seen["argv"], ["pr", "merge", "12", "-R", "acme/app"])
-        self.assertEqual(self.gate_calls(), [])
+    def test_the_marker_does_not_skip_the_gate_probe(self):   # #1216 S3: the gate probe does not honour the marker
+        self.write_gates({"acme/app": {"mode": "enforce"}})
+        done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/app", env={"FLEET_SWITCHBOARD_OWN_GH": "1", "FAKE_GATE_EXIT": "10",
+            "FAKE_GATE_JSON": json.dumps({"verdict": "refuse", "mode": "enforce", "message": self.REFUSAL})})
+        self.assertEqual((done.returncode, seen), (1, None), done.stderr)
+        self.assertEqual(len(self.gate_calls()), 1)
 
     def test_the_spool_is_private_clipped_and_bounded(self):
         self.run_shim("pr", "merge", "12", "-R", "acme/app", env={"FAKE_GATE_EXIT": "3"})

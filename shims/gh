@@ -118,8 +118,6 @@ def count_call(args):
     """Best effort, never fails or delays the command: one line (time, account name, endpoint class) for the daemon's hourly count. The switchboard's
     own calls are counted by the daemon, not here. Nothing else is recorded: no token, no argument, no body, no repo."""
     try:
-        if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
-            return
         words = command_words(args)
         if not words or words[0] in NO_NETWORK_GROUPS:
             return
@@ -359,7 +357,7 @@ def warn_low(account, low):
 # call, never a limit and never remembered. The wait is bounded and ends the moment no account the caller tops is low; nothing is refused.
 #
 # WHAT A CALLER CAN SET. This block reads NO environment variable of its own: the state directory is the account's home from the password database (never HOME,
-# XDG_STATE_HOME or FLEET_SWITCHBOARD_STATE), the switchboard program is the one beside this shim (never FLEET_SWITCHBOARD_BIN), the marker FLEET_SWITCHBOARD_OWN_GH
+# XDG_STATE_HOME or FLEET_SWITCHBOARD_STATE), the switchboard program is the one beside this shim (never FLEET_SWITCHBOARD_BIN), the own-call marker
 # is not honoured here, the timeouts are constants, and it looks at EVERY low account (never the one a configuration variable maps this call to). The one thing it
 # cannot defend is the identity itself: "who is this caller" is the switchboard's answer from the caller's own session and pane. A caller can only make ITSELF wait
 # less, never another agent wait more or the message stop. A test derives every environment name this file reads and lists the ones that switch the wait off.
@@ -458,7 +456,7 @@ def tell_top_spender(state, account):
             pass
         if not fresh_stamp(os.path.join(state, "gh-low-tried", _digest(account)[:16]), TRY_EVERY):
             return   # an attempt was made a few minutes ago (it may have failed): not again per call
-        subprocess.run([binary, "budget-notice", "--account", str(account)], capture_output=True, timeout=8, env=dict(os.environ, FLEET_SWITCHBOARD_OWN_GH="1"))
+        subprocess.run([binary, "budget-notice", "--account", str(account)], capture_output=True, timeout=8)
     except Exception:
         pass
 
@@ -925,8 +923,6 @@ def read_scope(args, lookup, write):
     repository's account when it only reads, and is refused when it writes. A record that cannot be read (`read_repo` false) refuses every command that
     reaches GitHub. Fails closed on its own trouble. A worker without the key is never touched; a lookup that failed says nothing about the record."""
     try:
-        if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
-            return None
         ident = lookup.identity()
         if "read_repo" not in ident:
             return None
@@ -966,8 +962,6 @@ def read_scope(args, lookup, write):
 def read_account_env(gh, lookup, extra):
     """The environment for a READ of the extra repository: GH_TOKEN of the account `gh_users` maps it to, nothing else. A missing map, mapping or token refuses
     (NoAccountMapped / AccountLookupFailed): a read of the extra repository never runs as the inherited or the worker's own account."""
-    if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
-        return None
     users = config_users()
     matcher = load_matcher()
     account = matcher.account_for(users, extra) if matcher is not None and users else None
@@ -1080,8 +1074,6 @@ def account_env(gh, lookup=None, strict=False, credential=False, args=None, read
     try:
         if read_repo:
             return read_account_env(gh, lookup, read_repo)
-        if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
-            return None   # the switchboard's own call (the daemon's, or a command's): it named its account; never re-identified
         users = config_users()
         words = command_words(args or [])
         app = app_config() if (credential or not words or words[0] not in APP_SKIP_GROUPS) and not (args and not words) else None   # `gh --version` makes no call
@@ -1489,7 +1481,7 @@ def review_probe(args, found, reason, lookup, gh):
     the boundary is GitHub's branch protection / required reviews. The check reads the PR's head and the merge then runs unbound, so a push in
     between can land an unchecked head (a short, documented window; the enforcing gates bind `--match-head-commit` themselves). Returns the refusal text, or None."""
     try:
-        if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1" or len(args) < 2 or args[0] != "pr" or args[1] != "merge":
+        if len(args) < 2 or args[0] != "pr" or args[1] != "merge":
             return None
         parsed = gate_parse(args)
         if parsed is None:
@@ -1553,8 +1545,6 @@ def gate_probe(args, lookup, gh=None):
     fail-open, recorded in the spool when the shim could not tell which PR it was. `gates-check` exits 10 only for a refusal that
     applies in the repo's mode, and the shim also requires the reply to say `enforce`, so a shadow repo never refuses here."""
     try:
-        if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
-            return None
         if len(args) < 2 or args[0] != "pr" or args[1] not in ("ready", "merge"):
             return None
         listed = gate_repos()
@@ -1587,7 +1577,7 @@ def gate_probe(args, lookup, gh=None):
         try:
             done = subprocess.run(sb_argv(binary, "gates-check", "%s#%d" % (repo, number), "--for", check, "--json"),
                                   capture_output=True, text=True, timeout=gate_seconds(), stdin=subprocess.DEVNULL,
-                                  env=sb_env(own=True))
+                                  env=sb_env())
         except subprocess.TimeoutExpired:
             gate_spool("fail_open", repo, number, check, "no answer within %gs" % gate_seconds())
             return None
@@ -1687,11 +1677,11 @@ ENV_ALLOW = ("LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM", "HERDR_SOCKET_PATH"
 ENV_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"   # a fixed PATH: the caller's cannot choose the `python3` a switchboard script starts with
 
 
-def sb_env(own=False):
+def sb_env():
     """The FIXED environment every switchboard the shim starts runs in, built from an ALLOW LIST and never by filtering the caller's: a fixed PATH, HOME as the
     account's real home, the locale and temp names, and the identity names the switchboard verifies against the session. Everything else the caller set
     (`PYTHON*`, `LD_*`, `DYLD_*`, `XDG_*`, `FLEET_SWITCHBOARD_*`, a made-up name) never reaches it, so a worker cannot hand the switchboard a library, a state
-    directory or a configuration of its own. `own` adds the switchboard's own-call marker."""
+    directory or a configuration of its own. No marker is ever added (#1216)."""
     env = {"PATH": ENV_PATH}
     for name in ENV_ALLOW:
         if name in os.environ:
@@ -1699,8 +1689,6 @@ def sb_env(own=False):
     home = mg_home()
     if home:
         env["HOME"] = home
-    if own:
-        env["FLEET_SWITCHBOARD_OWN_GH"] = "1"
     return env
 
 
@@ -1910,7 +1898,7 @@ def merge_gate_probe(args, lookup, gh):
             return mg_refuse("merge of %s refused: the merge gate cannot be asked (no switchboard)" % ref)
         try:
             done = subprocess.run(sb_argv(binary, "merge-gate", ref, "--check", "--json"), capture_output=True, text=True, timeout=merge_gate_seconds(),
-                                  stdin=subprocess.DEVNULL, env=sb_env(own=True))
+                                  stdin=subprocess.DEVNULL, env=sb_env())
         except (subprocess.SubprocessError, OSError):
             return mg_refuse("merge of %s refused: the merge gate did not answer in time; retry, or ask the chief of staff for a logged waiver" % ref)
         try:
@@ -1947,7 +1935,7 @@ def merge_gate_release(ref):
         binary = mg_binary()
         if binary:
             subprocess.run(sb_argv(binary, "merge-gate", ref, "--release"), capture_output=True, text=True, timeout=merge_gate_seconds(),
-                           stdin=subprocess.DEVNULL, env=sb_env(own=True))
+                           stdin=subprocess.DEVNULL, env=sb_env())
     except Exception:
         pass
 
@@ -2007,7 +1995,7 @@ def hold_probe(args, lookup, gh, write):
 def audit_write(args, lookup, outcome, write, repo=None, number=None):
     """One audit line for a gh write (never a command line); best effort, never changes the command."""
     try:
-        if not write or os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1" or is_git_credential(args):
+        if not write or is_git_credential(args):
             return
         module = load_hold()
         if module is not None:
@@ -2155,9 +2143,8 @@ def run(args):
     served = None
     agent = None
     try:
-        own = os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1"
         words = command_words(args)
-        if not own and words and words[0] not in NO_NETWORK_GROUPS:
+        if words and words[0] not in NO_NETWORK_GROUPS:
             ident = lookup.identity() if (write or cacheable_read(args)) else {}
             agent = ident.get("name")
             if write:

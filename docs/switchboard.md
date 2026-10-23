@@ -2478,7 +2478,7 @@ not bypass it: an agent can set it.
 names a repository, the next `gh` call is checked. On a labelled pull request run `gh pr merge <n> -R <owner/repo>`: it exits 1 with the
 configured message and nothing is merged; on an unlabelled one it behaves as before. Removing the config entry switches it off.
 
-**Audit of every `gh` write** (a guardrail: an agent that sets `FLEET_SWITCHBOARD_OWN_GH=1` skips its own audit line). Each write the shim passes on, and each it refuses, leaves one JSON line (`ts`, `verb`, `repo`, `number`,
+**Audit of every `gh` write** (a guardrail: setting `FLEET_SWITCHBOARD_OWN_GH=1` no longer skips the audit line, #1216). Each write the shim passes on, and each it refuses, leaves one JSON line (`ts`, `verb`, `repo`, `number`,
 `caller`, `outcome` = `passed` or `refused`) in `gh-writes.jsonl` in the directory beside the state directory with `-audit` added
 (`~/.local/state/fleet-switchboard-audit/` by default), so "who merged this pull request" has an answer. A command line, a body, a token or a
 query value is never copied; `repo` and `number` are `null` when the command names neither (a number of the current branch); `passed` means
@@ -4458,7 +4458,7 @@ Shapes it probes: `pr ready <n>` and `pr merge <n>` with a number, `-R/--repo ow
 Shapes it does **not** probe, and passes through: no PR argument (the current branch), a branch name, more than one positional, an
 unknown flag, `ready --undo`, `--`, and `pr create` (a new PR has no number before the command runs, so it is checked after
 creation in a later slice). A PR URL of a fork is another repo: not listed, not probed. The switchboard's own `gh` calls
-(`FLEET_SWITCHBOARD_OWN_GH=1`) are never probed, so the check cannot recurse into itself. Signing and the account environment are
+reach the real `gh` by its resolved path and never meet the shim, so the check cannot recurse into itself (the variable is not read). Signing and the account environment are
 unchanged.
 
 ## `launch` checks the plan: shadow only (#107, slice 3c)
@@ -5479,3 +5479,12 @@ Cause: `Engine._discover` calls `agent_list` on every pass. With no herdr that c
 The config key `no_multiplexer` (default `false`, so nothing changes) turns that off. With `"no_multiplexer": true` discovery reads the registry and the headless and cloud records only: `agent_list` is never called, no "herdr unreachable" problem is recorded, and the agents input is whole when those records were read without error. The one-time bell migration stays pending. Agents with no pane get no badge, no pane read and no pane delivery, and that is no error. With the key off, discovery, problems, audit lines and call counts are as before (test `TestNoMultiplexer`, scenarios U1 and S2). The tests use a fake multiplexer that raises on any call, and one test is a mutant that keeps calling `agent_list` with the switch on; the count of zero calls catches it. Other commands that call `agent_list` directly (close-pane guards, doctor) are unchanged and still need herdr.
 
 With the key on, the toast step and the badge writes are skipped too (a toast is a multiplexer call; a badge needs a pane), with no error. The tests (`TestNoMultiplexer`) carry one mutant per scenario that names one: the S2 mutant keeps calling `agent_list`, the S3 mutant drops the toast guard, the U1 mutant makes the switch-off path behave as on; each is killed by its own check.
+
+## The `FLEET_SWITCHBOARD_OWN_GH` marker in the shim (#1216)
+
+**What the marker still does:** nothing in `shims/gh`. It is still *cleared* for an agent's pane children and for the shim's budget-notice child, and
+the switchboard drops an inherited one at start. **What it no longer does:** the shim no longer reads it anywhere: `review_probe`, `gate_probe`
+(and the held-pass probe), `read_scope`, `audit_write`, `count_call`, `read_account_env`, `account_env` and the cache and budget block all run for a caller that sets it, exactly as without it.
+A merge with a blocking review and the marker set is refused (exit 10). The switchboard's own calls (the account choice, the budget notice, the daemon's
+reads, the merge gate's non-merge reads) reach the real gh by its resolved path (`FLEET_REAL_GH`, else the next `gh` on PATH that is not the shim), with no marker in
+their environment, so there is nothing to skip. The own gate-and-merge `merge` call goes through the shim with no marker. The account and budget logic stays reachable only by that own-call path.
