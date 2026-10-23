@@ -31,7 +31,6 @@ SIX = [
     ("issue-write", "writing issues", ["gh", "issue", "create", "--title", "t"]),
     ("issue-write", "writing issues", ["gh", "issue", "edit", "3", "--add-label", "bug"]),
     ("issue-write", "writing issues", ["gh", "issue", "close", "3"]),
-    ("issue-write", "writing issues", ["gh", "issue", "comment", "3", "--body", "x"]),
     ("label-write", "writing labels", ["gh", "label", "create", "bug"]),
     ("label-write", "writing labels", ["gh", "label", "edit", "bug"]),
     ("label-write", "writing labels", ["gh", "label", "delete", "bug"]),
@@ -326,7 +325,7 @@ class Guard(unittest.TestCase):
         self.assertFalse(os.path.exists(self.tmpfs + "-3"))
 
     def test_u1_the_refusal_line_never_contains_an_argument_value(self):
-        for cmd in (["gh", "issue", "comment", "3", "--body", SECRET], ["git", "push", "--force", "origin", SECRET],
+        for cmd in (["gh", "issue", "edit", "3", "--body", SECRET], ["git", "push", "--force", "origin", SECRET],
                     ["gh", "api", "-X", "PATCH", "repos/%s" % REPO, "-f", "token=" + SECRET], ["git", "push", "origin", "+" + SECRET]):
             r = self.call(cmd)
             self.assertEqual(r.returncode, 3)
@@ -400,8 +399,7 @@ class Guard(unittest.TestCase):
         for cmd in (["gh", "api", path], ["gh", "api", path + "/comments"], ["gh", "issue", "view", "3"]):
             with self.subTest(read=" ".join(cmd)):
                 self.assertEqual(self.call(cmd).returncode, 0, cmd)
-        for cmd in (["gh", "api", "-X", "POST", path], ["gh", "api", "-X", "PATCH", path], ["gh", "api", "-X", "POST", path + "/comments"],
-                    ["gh", "issue", "comment", "3", "--body", "x"]):
+        for cmd in (["gh", "api", "-X", "POST", path], ["gh", "api", "-X", "PATCH", path], ["gh", "api", "-X", "DELETE", path + "/comments"]):
             with self.subTest(write=" ".join(cmd)):
                 r = self.call(cmd)
                 self.assertEqual(r.returncode, 3, r.stdout + r.stderr)

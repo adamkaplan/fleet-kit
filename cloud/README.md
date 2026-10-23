@@ -30,7 +30,7 @@ The launcher mounts per-run files read-only under `/run/cw` (`CW_RUN_DIR`). The 
 - `model-auth`: the model provider's access entry (JSON), the one-entry array `opencode auth export` prints, IMPORTED with `opencode auth import --standalone` (read from the mounted file on stdin) into OpenCode's own store under `<tmpfs>/data` (`XDG_DATA_HOME`) BEFORE the server starts, because the server reads only that store and ignores an `auth.json`. A failed import refuses the start with `worker: the model credential import failed; refusing to start`; the Secret file is never written. A model config naming `CW_MODEL` (default `github-copilot/claude-sonnet-5.5`) is written beside it (`XDG_CONFIG_HOME`); it holds no secret.
   A worker can read this credential (the one-entry array, refresh token included, and the store under `XDG_DATA_HOME`) for the life of its pod; the shell deny rules do not guard it. The pod holds a launch-time snapshot: a revoked or rotated credential ends that pod's turns, and the operator's rotated token is not pushed to a running pod. A stale `CW_MODEL_AUTH_FILE` (retired) is refused as an unknown setting in a settings file and silently ignored in the process environment. An old image with the new launcher answers on the free model; the old launcher with the new image refuses at the import.
 - `git-token`: never copied. A git credential helper (`git config --global`, so every process of the worker user sees it, including a fresh-environment `kubectl exec` such as the end hook) and a `gh` wrapper read the file at call time. The helper answers only for `https://github.com`; the token is never in git config, argv or the environment. The directory is the path baked in when the files were generated (a caller's `CW_RUN_DIR` changes nothing), and at every call an unreadable or empty token file makes both fail with one line and a non-zero exit (never an empty password, never a `gh` with an empty token). The `gh` wrapper runs the guard and then `cw-gh`, which has only the verbs listed under "The client that replaces the real `gh`"; the boundary is the token's own permissions (a per-run, one-repository App token) and the repository's rules, not the wrapper or the client. The managed reaper replaces the Secret's token about every 30 minutes (see `launcher/README.md`, "The git token and its renewal"); the kubelet refreshes the whole-directory mount, so the next call reads the new token. The server password is in the server's environment, so every process the agent starts can read it; that is accepted by design.
-- The `git-token` also carries `issues: read` (one table in `cloud/launcher/app_token.py`), so the worker can read its repository's issues and their comments. The wrapper still refuses every write to an issue, a label or a merge.
+- The `git-token` also carries `issues: write` (one table in `cloud/launcher/app_token.py`), so the worker can read its repository's issues and their comments. The wrapper and the client allow one issue write, a new comment, and still refuse every other write to an issue, a label or a merge (`cloud/worker/guard-table.tsv`).
 
 A file that is absent is skipped (a pod started without per-run secrets). A file that is present but unreadable or empty
 refuses the start with one line naming it; there is no fallback to another source. The tmpfs is `CW_TMP_DIR` (default `/run/cw-tmp`).
@@ -80,7 +80,7 @@ A cloud worker called the real `gh` binary by its path instead of the `gh` wrapp
 
 There are two real boundaries, and everything else in the pod is a convenience.
 
-- **Boundary 1, the token's scope.** The installation token has exactly contents write, pull requests write, issues read and metadata read (`app_token.py` refuses any other set). What those permissions allow is the table below.
+- **Boundary 1, the token's scope.** The installation token has exactly contents write, pull requests write, issues write and metadata read (`app_token.py` refuses any other set). What those permissions allow is the table below.
 - **Boundary 2, the repository's rules.** Rulesets, the merge queue and review requirements decide what the permitted actions can reach: a merge, a push to the default branch, a force-push. The preflight reads them before a worker is launched (`cloud/launcher/preflight.py`).
 
 The wrappers and the client are conveniences, never a boundary: the `gh` and `git` wrappers (`guard.sh`), the OpenCode deny rules, the worker prompt, and `cw-gh` (the client that replaces the real `gh`). They catch accidents and make conduct rules visible. A worker that wants to act around them can, by design, with the routes listed under "What remains reachable by design".
@@ -114,8 +114,8 @@ One row per action, derived from GitHub's own "Permissions required for GitHub A
 | Releases and release assets | allowed | contents: write | documented |
 | Workflow file changes | refused | no workflows permission | documented |
 | Repository settings, rulesets, branch protection, webhooks, secrets | refused | administration, secrets and webhooks not granted | documented |
-| Issue and issue-comment reads (view, list) | allowed | issues: read | documented, to be probed live |
-| Issue create, edit, close | refused | issues: write not granted, only read (comments, labels and assignees on a PR are the PR rows above) | documented, to be probed live |
+| Issue and issue-comment reads (view, list), and the comment (create) | allowed | issues: write (the owner's App step; the one permission covers reads and the comment) | documented, to be probed live |
+| Issue edit, create, close, reopen, lock, delete, transfer, labels, assignees, comment edit and delete | refused | the pod's tool policy, not the token: issues: write would allow them, so the guard table denies each (the token cannot split the comment from the rest) | documented, to be probed live |
 <!-- token-table:end -->
 
 ### The client that replaces the real `gh`
@@ -124,7 +124,7 @@ The image no longer installs `gh`. `cloud/worker/cw-gh` is a small client of our
 
 - `gh pr create|view|list|comment|checks|diff|ready`
 - `gh repo view`
-- `gh issue view|list` (read only)
+- `gh issue view|list` (read only), `gh issue comment` (the one issue write: a new comment)
 - `gh run view|list|logs` (read only; `gh run view --log` and `--log-failed` print the CI logs)
 - `gh api` with GET only
 

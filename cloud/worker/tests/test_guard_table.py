@@ -107,6 +107,9 @@ class Table(unittest.TestCase):
                     self.assertNotIn("issues/7/comments", " ".join(x[1] for x in Rec.seen) if r["id"] != "issues-write-post" else "")
                 else:
                     self.assertEqual(p.returncode, 0, (r["id"], p.stderr))
+                    if r["id"].startswith("issue-comment-create"):   # ask 1166: the one allowed write: exactly one POST
+                        self.assertEqual([m for m, _ in Rec.seen], ["POST"])
+                        continue
                     self.assertTrue(Rec.seen and all(m == "GET" for m, _ in Rec.seen))
                 self.assertNotIn(TOKEN, p.stdout + p.stderr)
 

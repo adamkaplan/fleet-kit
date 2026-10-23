@@ -18,7 +18,7 @@ Before you hand a plan file back, run `cw-plan-check --file <plan> --done-when <
 - Never push to the repository's default branch (`main`, `master` or whatever the repository's default is), and never
   push by a refspec that lands there (`HEAD:main`).
 - Never force-push (`--force`, `-f`, `--force-with-lease`, a `+ref`).
-- Never write issues, labels or repository settings: no `gh issue create/edit/close/comment`, no `gh label ...`, no
+- Never write issues, labels or repository settings (the one exception: `gh issue comment` writes a comment, to report): no `gh issue create/edit/close/reopen/lock`, no `gh label ...`, no
   `gh repo edit/delete/archive`, no branch protection, ruleset, webhook or secret changes. Read issues with `gh issue view` and `gh issue list`; the shell rules may also refuse a read made through `gh api`.
 - Never approve or dismiss a pull request review (`gh pr review`, the reviews API), define an alias (`gh alias`, `git config alias.*`), change `push.default`, write any other git configuration (`git config --add|--unset|--edit|--rename-section|--remove-section|--file`, the `edit`, `set` and `unset` subcommands, a key with a value, `include.path`; only `user.name` and `user.email` may be set), or start workflows or releases.
 - Never print, log, commit or paste a secret, a token or a credential file's content, in any form.
@@ -29,7 +29,7 @@ Before you hand a plan file back, run `cw-plan-check --file <plan> --done-when <
 
 The shell tool's permission rules in this pod's configuration deny these commands, and the `gh` and `git` wrappers on the
 pod's PATH refuse them with exit status 3. The real `gh` is not in this image: `gh` is a small client of our own that
-covers only `gh pr create|view|list|comment|checks|diff|ready`, `gh repo view`, `gh issue view|list`, `gh run view|list|logs`
+covers only `gh pr create|view|list|comment|checks|diff|ready`, `gh repo view`, `gh issue view|list|comment`, `gh run view|list|logs`
 and a GET-only `gh api`. Any other verb answers that it is not available.
 
 The wrappers, the deny rules, this prompt and that client are a convenience, never a boundary. A worker can still reach
@@ -57,6 +57,6 @@ bounded only by the repository's rules; your STOP rules above are conduct rules 
 - Releases and release assets: allowed (contents: write; documented)
 - Workflow file changes: refused (no workflows permission; documented)
 - Repository settings, rulesets, branch protection, webhooks, secrets: refused (administration, secrets and webhooks not granted; documented)
-- Issue and issue-comment reads (view, list): allowed (issues: read; documented, to be probed live)
-- Issue create, edit, close: refused (issues: write not granted, only read (comments, labels and assignees on a PR are the PR rows above); documented, to be probed live)
+- Issue and issue-comment reads (view, list), and the comment (create): allowed (issues: write (the owner's App step; the one permission covers reads and the comment); documented, to be probed live)
+- Issue edit, create, close, reopen, lock, delete, transfer, labels, assignees, comment edit and delete: refused (the pod's tool policy, not the token: issues: write would allow them, so the guard table denies each (the token cannot split the comment from the rest); documented, to be probed live)
 <!-- token-table:end -->

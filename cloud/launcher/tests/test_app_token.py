@@ -14,7 +14,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MINT = os.path.join(os.path.dirname(HERE), "app_token.py")
 TOKEN = "ghs_synthetic" + "Ab3Xy9" * 6
 REAL = "acme-org/widget-service"
-PERMS = {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"}
+PERMS = {"contents": "write", "pull_requests": "write", "issues": "write", "metadata": "read"}
 PLANTED = "planted-secret-value-7Qz"
 
 
@@ -220,7 +220,7 @@ class Mint(unittest.TestCase):
             self.assertNotIn(TOKEN, p.stderr)
 
     def test_refuses_extra_higher_or_missing_permissions(self):
-        cases = [dict(PERMS, issues="write"), dict(PERMS, administration="write"), dict(PERMS, contents="admin"),
+        cases = [dict(PERMS, issues="admin"), dict(PERMS, administration="write"), dict(PERMS, contents="admin"),
                  dict(PERMS, metadata="write"), {"contents": "write", "metadata": "read"},
                  {"contents": "write", "pull_requests": "write"}, {}, None, ["contents"]]
         for perms in cases:
@@ -233,7 +233,7 @@ class Mint(unittest.TestCase):
             self.assertEqual(p.stdout, "")
             self.assertNotIn(TOKEN, p.stderr)
             self.assertEqual(len(p.stderr.strip().splitlines()), 1)
-        Stub.answer["permissions"] = dict(PERMS, issues="write")
+        Stub.answer["permissions"] = dict(PERMS, issues="read")
         self.assertIn("issues", self.run_mint().stderr)
 
     def test_a_planted_secret_in_the_commands_env_appears_nowhere(self):
@@ -755,7 +755,7 @@ class Mint(unittest.TestCase):
         "owner id missing": lambda a: a["repositories"][0].pop("owner"),
         "owner id another": lambda a: a["repositories"][0].update(owner={"id": 10}),
         "long-lived": lambda a: a.update(expires_at=iso(86400)),
-        "extra permission": lambda a: a["permissions"].update(issues="write"),
+        "extra permission": lambda a: a["permissions"].update(issues="admin"),
     }
 
     def revoking_run(self, text, mutate, **stub):

@@ -1,4 +1,4 @@
-"""#1019: the cloud token's one permission table includes `issues: read`, so the worker can read its ask and plan.
+"""#1019: the cloud token's one permission table includes `issues: write`, so the worker can read its ask and plan.
 Offline: a loopback stub of the GitHub API, a throwaway RSA key, the real mint and preflight, the fake kubectl.
 
 Every set here is derived from `app_token.EXPECTED_PERMISSIONS` (one table); each check has a mutant that must be caught.
@@ -23,12 +23,12 @@ import test_driver as td  # noqa: E402
 import test_preflight as tp  # noqa: E402
 
 TABLE = app_token.EXPECTED_PERMISSIONS
-TEXT = "contents: write, pull_requests: write, issues: read, metadata: read"
+TEXT = "contents: write, pull_requests: write, issues: write, metadata: read"
 PLACES = ["cloud/launcher/README.md", "docs/agent-credentials.md", "docs/cloud-guard-parity.md", "docs/cloud-operator-quickstart.md"]
 PHRASE_FILES = ["cloud/launcher/README.md", "docs/agent-credentials.md"]
 PHRASES = {"read": re.compile(r"read issues and their comments"),
-           "not-write": re.compile(r"cannot write issues, labels, merges or settings"),
-           "owner step": re.compile(r"add(s)? `issues: read` to the App's permissions.*accept")}
+           "not-write": re.compile(r"can write one comment on an issue and cannot do any other issue write, nor change labels, merges or settings"),
+           "owner step": re.compile(r"add(s)? `issues: write` to the App's permissions.*accept")}
 
 
 def read(rel):
@@ -85,7 +85,7 @@ class Fx(unittest.TestCase):
 
 class Table(Fx):
     def test_the_table_is_exactly_the_four_and_the_rendered_text_is_derived_from_it(self):
-        self.assertEqual(TABLE, {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"})
+        self.assertEqual(TABLE, {"contents": "write", "pull_requests": "write", "issues": "write", "metadata": "read"})
         self.assertEqual(app_token.render_permissions(), TEXT)
         self.assertEqual(list(tam.PERMS.items()), list(TABLE.items()))   # the older suite's fixture is the same table
 

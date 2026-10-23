@@ -96,7 +96,7 @@ class Comments(unittest.TestCase):
         m = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(m)
         self.assertEqual(sorted(m.VERBS), sorted([("pr", v) for v in ("create", "view", "list", "comment", "checks", "diff", "ready")] + [
-            ("repo", "view"), ("issue", "view"), ("issue", "list"), ("run", "view"), ("run", "list"), ("run", "logs"), ("api", "")]))
+            ("repo", "view"), ("issue", "view"), ("issue", "list"), ("issue", "comment"), ("run", "view"), ("run", "list"), ("run", "logs"), ("api", "")]))
 
     def test_s5_an_issue_without_comments_prints_the_body_and_no_comments(self):
         p = self.run_gh([])

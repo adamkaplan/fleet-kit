@@ -36,8 +36,8 @@ PINNED = [
     ("Releases and release assets", "allowed", "contents: write", "documented"),
     ("Workflow file changes", "refused", "no workflows permission", "documented"),
     ("Repository settings, rulesets, branch protection, webhooks, secrets", "refused", "administration, secrets and webhooks not granted", "documented"),
-    ("Issue and issue-comment reads (view, list)", "allowed", "issues: read", "documented, to be probed live"),
-    ("Issue create, edit, close", "refused", "issues: write not granted, only read (comments, labels and assignees on a PR are the PR rows above)", "documented, to be probed live"),
+    ("Issue and issue-comment reads (view, list), and the comment (create)", "allowed", "issues: write (the owner's App step; the one permission covers reads and the comment)", "documented, to be probed live"),
+    ("Issue edit, create, close, reopen, lock, delete, transfer, labels, assignees, comment edit and delete", "refused", "the pod's tool policy, not the token: issues: write would allow them, so the guard table denies each (the token cannot split the comment from the rest)", "documented, to be probed live"),
 ]
 
 

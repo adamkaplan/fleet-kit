@@ -243,8 +243,8 @@ def intent_differs():
     return "## Intent\n\nMake it work.\nDone when: something else\n\n" + plan()
 
 
-PINNED = {'guard.sh': '9bff815feddd3424f2f853c8e002333474845ab7d8091f562bbd9256852a9321'}
-PINNED_JSON_WITHOUT_ADDED_ROWS = "c14522cff99b9223d881b9f80a3d3397f55ae15a5d6f12a2380b89c9de6fd4be"
+PINNED = {'guard.sh': '6a0b465561524c5b28cbfe8d79e9b682a53b04346db3bad8dd2e852c8024e184'}
+PINNED_JSON_WITHOUT_ADDED_ROWS = "98b3723a02edf83a5f74c177e3f8769267f9606026ed4ac461bd3688d504a5ad"
 # Rows added to opencode-worker.json, in file order. A pin changes only in the ask whose approved plan names the rows:
 # asks 1166 and 1200 add their rows to THIS list.
 ADDED_ROWS = [   # ask 1083: DW-6 (read an issue's comments and the two pull request read paths, GET only; write methods and flags stay denied)
@@ -265,6 +265,11 @@ ADDED_ROWS = [   # ask 1083: DW-6 (read an issue's comments and the two pull req
     ('gh api*--input*', 'deny'),
     ('gh api*graphql*', 'deny'),
     ('gh api*mutation*', 'deny'),
+    # ask 1166 (DW-3): the comment alone: `issue comment` (create) and a POST of a comment to issues/N/comments; every other issue write stays denied above
+    ('gh issue comment*', 'allow'),
+    ('gh * issue comment*', 'allow'),
+    ('gh api -X POST repos/*/issues/*/comments', 'allow'),
+    ('gh api --method POST repos/*/issues/*/comments', 'allow'),
 ]
 
 if __name__ == "__main__":
