@@ -9981,6 +9981,20 @@ class WorkflowPlanPins(unittest.TestCase):
                 with self.assertRaises(AssertionError, msg="the mutant passed the pins: " + name):
                     self.pin(text, listtext)
 
+    def test_the_docs_tell_how_to_hold_only_identity_credential_authority_and_execution_paths(self):
+        docs = (REPO / "docs" / "switchboard.md").read_text()
+        head = "### Holding only identity, credential, authority and execution paths in another repository"
+        section = docs.split(head, 1)[1].split("\n### ", 1)[0]
+        for needle in ("impact_floor.repos", "config.json", "Database, schema and container changes are left to the independent impact rating"):
+            self.assertIn(needle, section, needle)
+        for needle in ("**Identity**", "**Credentials**", "**Authority**", "**Execution authority**"):
+            self.assertIn(needle, section, needle)
+        self.assertIn('"acme-org/widget-api": {', section)
+        self.assertIn('"globs"', section)
+        # no owner/repo but the neutral one: the only slash-joined names allowed are the config path and the placeholder
+        found = set(re.findall(r"(?<![\w./*<-])[A-Za-z0-9][\w-]*/[A-Za-z0-9][\w.-]*", section))
+        self.assertEqual(found - {"acme-org/widget-api", "fleet-switchboard/config.json", "XDG_CONFIG_HOME/fleet-switchboard"}, set())
+
     def test_the_docs_say_which_runs_happen_when_and_how_to_re_run(self):
         docs = (REPO / "docs" / "switchboard.md").read_text()
         section = docs.split("**Which runs happen when (the test workflow).**", 1)[1].split("\n\n**", 1)[0]

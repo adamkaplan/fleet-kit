@@ -4623,6 +4623,41 @@ nothing in the process can tell it from the owner's shell. (2) **A harness that 
 and `copilot`; an agent harness under another name is not seen, and a renamed copy of one is not either. Both are the same limit as the session variables: an agent
 that is determined to pass as the owner can, and only something it cannot reach (a separate account, a hardware confirmation, a GitHub required check) would stop it.
 
+### Holding only identity, credential, authority and execution paths in another repository
+
+For a repository the built-in floor does not cover, an operator can hold by path only four classes: **identity**, **credentials**, **authority** and **execution authority**. Everything else is left to the independent impact rating.
+
+**Where.** The key is `impact_floor.repos."<owner>/<repo>"` in the private `config.json` beside the switchboard (`$XDG_CONFIG_HOME/fleet-switchboard/config.json`). The file is read when the daemon starts, so restart the daemon after an edit. The public repository never lists a real repository or path; the entries live only in that private file.
+
+**Keys (as `validate` reads them).** The entry is an object with `globs` (required, at least one glob), and optionally `exclude` and `force`. Each is a list of non-empty strings; a string where a list belongs, an empty list of `globs` or any other key is a configuration error. `floor_for` matches the repository name case-insensitively, and a configured entry replaces the built-in one for that repository. A pull request that adds, changes or deletes a file matching a `globs` entry holds for the owner, unless `exclude` matches it (`force` keeps a path held even when `exclude` matches). Matching is case-insensitive.
+
+```json
+{
+  "impact_floor": {
+    "repos": {
+      "acme-org/widget-api": {
+        "globs": [
+          "**/auth/**", "**/identity/**",
+          "**/*credential*", "**/*secret*", "**/*.pem",
+          "**/permissions*", "**/policy/**", "**/roles/**",
+          "**/runner/**", "**/deploy/**", "**/scripts/release*"
+        ],
+        "exclude": ["**/*.md"]
+      }
+    }
+  }
+}
+```
+
+**What a glob looks like for each class** (examples for `acme-org/widget-api`; replace them with the real paths of your repository):
+
+- **Identity** (who may act as whom): `**/auth/**`, `**/identity/**`.
+- **Credentials**: `**/*credential*`, `**/*secret*`, `**/*.pem`.
+- **Authority** (who may do what): `**/permissions*`, `**/policy/**`, `**/roles/**`.
+- **Execution authority** (code that runs with the repository's power): `**/runner/**`, `**/deploy/**`, `**/scripts/release*`. These are examples an operator replaces with the real execution paths.
+
+**What is left out on purpose.** Database, schema and container changes are left to the independent impact rating: no path glob holds them, and the rating holds them when it rates them risky. Keep such globs out of the list.
+
 ### An owner's clear carries over a pure merge of main (#510)
 
 An owner clear is bound to one head. When main moves, a pull request that conflicts or must be current merges main into its branch: a new head, and the clear no longer applied, though the pull request's OWN change was exactly what the owner cleared. With `"impact_hold": {"enabled": true, "carry_clear": true}` (**off by default**; anything but a real `true` is off) the clear now carries to that head, and to nothing else.
