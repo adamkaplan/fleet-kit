@@ -366,7 +366,7 @@ def may_record_verdict(evaluator, caller, allowed, authors):
 
 # ----------------------------------------------------------------------------------- waivers
 
-WAIVABLE = ("G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5")   # G0 to G5: what the chief of staff may waive for a hotfix
+WAIVABLE = ("G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5", "MG")   # G0 to G5: what the chief of staff may waive for a hotfix; MG: the merge gate (#962), at the PR's head
 NEVER_WAIVABLE = {"G6": "the owner's hold on a held PR", "G7": "the epic integration", "G8": "production"}
 WAIVER_REASON_MIN = 20
 WAIVER_SECONDS = 24 * 3600   # a waiver is valid this long (the retroactive-plan due date), and only at the head it names
@@ -378,7 +378,7 @@ def parse_waiver_gates(text):
     for raw in (text or "").replace(" ", "").split(","):
         if not raw:
             continue
-        gate = {"G2": "G2/G3", "G3": "G2/G3", "g2/g3": "G2/G3"}.get(raw, raw[:1].upper() + raw[1:])
+        gate = {"G2": "G2/G3", "G3": "G2/G3", "g2/g3": "G2/G3", "mg": "MG"}.get(raw, raw[:1].upper() + raw[1:])
         if gate in NEVER_WAIVABLE:
             return [], "%s is never waived (%s): refused, nothing was recorded" % (gate, NEVER_WAIVABLE[gate])
         if gate not in WAIVABLE:
@@ -479,15 +479,36 @@ REVIEWERS_NOW = ("code", "architecture", "security", "impact", "test")   # the r
 REVIEW_VERDICTS = ("approve", "request-changes", "comment", "incomplete")
 
 
+# #1047: every function that reads the `uncited` mark, as (file, function): the one table; a completeness test derives the set from the source and fails when one is missing.
+UNCITED_CONSUMERS = (("plan_ledger.py", "review_blocks"), ("plan_ledger.py", "review_records_at"), ("plan_ledger.py", "render_gates"),
+                     ("fleet-switchboard", "pr_state_view"), ("fleet-switchboard", "pr_state_line"), ("fleet-switchboard", "parse_review_block"), ("fleet-switchboard", "cmd_review"))
+
+
+def review_blocks(entry):
+    """The ONE blocking decision for a review record: only a request-changes that names a rule blocks. An uncited request-changes is recorded and
+    shown ("names no rule") but, as the review laws say (R-LAW-1, R-LAW-8), a finding that cites no rule does not block."""
+    return entry.get("verdict") == "request-changes" and entry.get("uncited") is not True
+
+
 def review_records_at(entries, pr, head, expected=REVIEWERS_NOW):
     """The reviewer records of PR `pr` AT `head` (the latest per reviewer wins): {"expected", "recorded": {reviewer: verdict}, "missing"}.
     A record at another head does not count: a push voids it. SHADOW: this is shown by `gates`, never counted towards ready, and a record
     names the session that wrote it, which while agents share one account is a mistake guard and not a boundary."""
-    recorded = {}
+    recorded, uncited, blocking = {}, [], []
     for entry in entries:
         if entry.get("kind") == "review_record" and entry.get("pr") == pr and entry.get("head") == head and entry.get("reviewer") in expected:
             recorded[entry["reviewer"]] = entry.get("verdict")
-    return {"expected": list(expected), "recorded": recorded, "missing": [r for r in expected if r not in recorded]}
+            if review_blocks(entry):
+                if entry["reviewer"] not in blocking:
+                    blocking.append(entry["reviewer"])
+            elif entry["reviewer"] in blocking:
+                blocking.remove(entry["reviewer"])
+            if entry.get("uncited") is True and entry.get("verdict") == "request-changes":
+                if entry["reviewer"] not in uncited:
+                    uncited.append(entry["reviewer"])
+            elif entry["reviewer"] in uncited:
+                uncited.remove(entry["reviewer"])
+    return {"expected": list(expected), "recorded": recorded, "uncited": uncited, "blocking": blocking, "missing": [r for r in expected if r not in recorded]}
 
 
 def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
@@ -675,7 +696,9 @@ def render_gates(report, pr):
     if reviews:
         lines.append("  reviewers (plan-review panel verdicts: shadow, not counted by any gate): %d of %d recorded at %s%s" % (
             len(reviews["recorded"]), len(reviews["expected"]), (report.get("head") or "?")[:8],
-            ": " + ", ".join("%s %s" % kv for kv in sorted(reviews["recorded"].items())) if reviews["recorded"] else "")
+            ": " + ", ".join("%s %s%s" % (kv + (" (names no rule, does not block)" if kv[0] in (reviews.get("uncited") or []) else "",)) for kv in sorted(reviews["recorded"].items())) if reviews["recorded"] else "")
+            + ("; %d blocking review(s)" % len(reviews.get("blocking") or []) if reviews.get("blocking") else "")
+            + ("; %d request-changes names no rule and does not block" % len(reviews["uncited"]) if reviews.get("uncited") else "")
             + ("; missing %s" % ", ".join(reviews["missing"]) if reviews["missing"] else ""))
     if report["untracked"]:
         lines.append("not tracked yet (not counted): %s" % ", ".join(report["untracked"]))

@@ -54,7 +54,7 @@ Each setting's name, whether the file requires it, and its kind (name, https URL
 | `CW_CLOUD_CA_FILE` | no | path | absolute path to the cluster's CA certificate |
 | `CW_PULL_SECRET` | no | name | name of the image pull secret in the namespace (the name, never its content) |
 | `CW_KUBECTL` | no | path | the `kubectl` program (default: `kubectl` on `PATH`) |
-| `CW_MODEL_AUTH_FILE` | no | path | the OpenCode auth file; only its `github-copilot` entry travels to the worker |
+| `CW_OPENCODE_BIN` | no | path | the `opencode` program the launcher runs as `opencode auth export` (default: `opencode` on `PATH`); only the `github-copilot` entry of its output travels to the worker. The old `CW_MODEL_AUTH_FILE` is retired: a settings file that still has it is refused as an unknown setting |
 | `CW_RUN_RECORD_DIR` | no | path | where the run record is written when a worker stops (default: `runs/` beside the audit file) |
 | `CW_CLOUD_SPEND_CAP_USD` | no | number | spend cap in USD for one create (default 25; an invalid value refuses) |
 | `CW_CLUSTER_TOKEN_CMD` | no | command | a command that prints a short-lived cluster token (instead of the vault route) |
@@ -93,8 +93,8 @@ CW_CLOUD_NAMESPACE=cw
 # CW_PULL_SECRET=acme-pull
 # optional: the kubectl program
 # CW_KUBECTL=/usr/local/bin/kubectl
-# optional: the OpenCode auth file
-# CW_MODEL_AUTH_FILE=/home/user/.local/share/opencode/auth.json
+# optional: the opencode program (default: opencode on PATH)
+# CW_OPENCODE_BIN=/usr/local/bin/opencode
 # optional: where run records are written
 # CW_RUN_RECORD_DIR=/home/user/cloud-runs
 # optional: the spend cap in USD for one create
@@ -203,7 +203,7 @@ fleet-switchboard launch coder7 --cloud --stack --agent coder --repo acme-org/wi
 - `--stack` is handed to the launcher's `create` and only then: a launch without it builds exactly the pod it always did.
 - The pod runs on the Sysbox runtime class (`sysbox-runc`) in its own user namespace, as a non-root user. No capability is added, it is never privileged, and it has no host path, Docker socket or service-account token.
 - `--shape` is `S` (2 CPU, 4 GiB) or `M` (4 CPU, 8 GiB). Leave it out for the launcher's own default, `S` (4 GiB): the measured stack lane peaked at 0.8 to 1.35 GiB. The memory limit stays; the pod is never unlimited.
-- The first pod on a fresh node may wait for the node's runtime to be ready (a short delay, a few minutes at most); the launcher notices that case and creates the pod again, up to 3 attempts. You do not retry it.
+- The first pod on a fresh node may wait for the node's runtime to be ready (a short delay, a few minutes at most); the launcher notices that case and creates the pod again after a pause of 15 seconds (`STACK_RACE_PAUSE_SECONDS`), for as long as a retry fits in a window of 600 seconds (`STACK_RACE_WINDOW_SECONDS`); a fresh node can take 3 to 5 minutes. If the window ends, the launcher says so once (the attempts and the seconds spent) and leaves no pod. You do not retry it.
 - `--stack` needs `--cloud`, and an unknown `--shape` is refused with `--stack`. `--stack` without `--cloud` is refused first of all; an unknown shape is refused right after the allow-list check (step 1 of section 2). Both exit 2 before any token is minted or any cluster call is made, and the order of section 2 is unchanged. `--shape` without `--stack` is passed to the launcher as before.
 
 ## 4. What a worker can and cannot do
@@ -232,3 +232,27 @@ merges), so a sleeping Mac delays a stop but cannot leave a worker running past 
 
 - Stopping a worker by name alone: #682.
 - A layer scan of the worker image: #691.
+
+## The GitHub App's permissions
+
+The token the launcher mints asks for, and accepts, exactly `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read`. The worker can read issues and their comments of its own repository and cannot write issues, labels, merges or settings.
+
+The owner step, done only after the change that adds `issues: read` is merged: add `issues: read` to the App's permissions, then accept it on each installation. Until both are done a launch is refused before any pod exists, with a line that names `issues` and this step. See `docs/agent-credentials.md`.
+
+## The model credential
+
+The launcher reads the live model credential from OpenCode's own store with `opencode auth export` (in memory, never a file, never printed) and copies only the one `github-copilot` entry into the per-run Secret. The pod imports it with `opencode auth import --standalone` before its server starts. The legacy `auth.json` is not read: the server ignores it.
+
+What to know before you run it:
+
+- **A worker can read the credential.** For the life of its pod, the worker can read the one-entry array (the access entry and its refresh token) at `/run/cw/model-auth` and the store under `XDG_DATA_HOME`. The worker's shell deny rules are not a guard against that. Whether it could send the value out depends on the pod's network egress, which this change does not restrict.
+- **The pod holds a snapshot taken at launch.** Nothing re-reads your store. A credential that is revoked or rotated ends that pod's turns; a refresh token you rotate afterwards is not pushed to a running pod. Launch a new run to pick it up.
+- **A stale `CW_MODEL_AUTH_FILE` is retired, and what happens depends on where it is.** In a settings file it is refused as an unknown setting. In the process environment it is silently ignored (the launcher drops it), so the credential that is active in your store is used with no message.
+- **Image and launcher must match.** An old image with the new launcher answers on the free model (it never imports the credential). The old launcher with the new image refuses at the import (`worker: the model credential import failed; refusing to start`).
+
+To verify it:
+
+- On the launcher's machine, `opencode auth list` shows the `github-copilot` entry as active.
+- On a worker, its server's `/api/provider` lists `github-copilot` (a pod that lists only the built-in `opencode` provider answers on the free fallback model and is rate limited).
+
+The worker image carries `cloud/worker/entrypoint.sh`, so the order is: merge, an operator rebuilds the image and switches the digest in the settings file, then run the check above on one no-op worker.

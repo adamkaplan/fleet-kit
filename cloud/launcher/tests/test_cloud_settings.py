@@ -15,7 +15,7 @@ DIGEST = "registry.example.internal/acme/worker@sha256:" + "ab12" * 16
 GOOD = {"CW_ALLOWED_REPOS": "acme-org/widget-service", "CW_CLOUD_IMAGE": DIGEST, "CW_CLOUD_SERVER": "https://cluster.example.internal:6443",
         "CW_VAULT_SUBSCRIPTION": "00000000-0000-0000-0000-000000000000", "CW_VAULT_NAME": "vault-example", "CW_CLOUD_NAMESPACE": "cw"}
 OPTIONAL_SAMPLES = {"CW_TOOLING_REPO": "acme-org/tooling", "CW_CLOUD_CA_FILE": "/home/user/ca.pem", "CW_PULL_SECRET": "pull-example",
-                    "CW_KUBECTL": "kubectl", "CW_MODEL_AUTH_FILE": "/home/user/auth.json", "CW_RUN_RECORD_DIR": "/home/user/runs",
+                    "CW_KUBECTL": "kubectl", "CW_OPENCODE_BIN": "/usr/local/bin/opencode", "CW_RUN_RECORD_DIR": "/home/user/runs",
                     "CW_CLOUD_SPEND_CAP_USD": "25", "CW_CLUSTER_TOKEN_CMD": "cat /home/user/token", "CW_CLUSTER_ADMIN_CMD": "cat /home/user/kc",
                     "CW_GIT_TOKEN_CMD": "cat /home/user/git", "CW_APP_ID_CMD": "cat /home/user/id", "CW_APP_INSTALLATION_CMD": "cat /home/user/inst",
                     "CW_APP_KEY_CMD": "cat /home/user/key", "CW_VAULT_CHECK_DIR": "/home/user/check",
@@ -57,7 +57,7 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
     "CW_VAULT_NAME": ["$(touch SENT)", "a;touch SENT", "ab", "a" * 25, "1abc", "a b", "a_b", "abc-"[:-1] + "/"],
     "CW_CLOUD_NAMESPACE": ["a/b;c", "kube-system", "kube-public", "default", "A", "-a", "a-", "a b", "a" * 64, "$(x)"],
     "CW_KUBECTL": ["../kubectl", "/x/../y", "-x", "a b", "$(x)", "a/b"],
-    "CW_MODEL_AUTH_FILE": ["auth.json", "/a/../b", "-x"],
+    "CW_OPENCODE_BIN": ["../opencode", "/a/../b", "-x", "a b", "$(x)", "a/b"],
     "CW_RUN_RECORD_DIR": ["runs", "/a/../b", "-x"],
     "CW_CLOUD_SPEND_CAP_USD": ["0", "-1", "1e3", "100001", "1.2.3", "abc", "0.0"],
     "CW_CLUSTER_TOKEN_CMD": ["-x"], "CW_CLUSTER_ADMIN_CMD": ["--x"], "CW_GIT_TOKEN_CMD": ["-x"], "CW_APP_ID_CMD": ["-x"],
