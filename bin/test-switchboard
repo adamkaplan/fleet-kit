@@ -22038,6 +22038,28 @@ class TestGhShimGateProbe(Base):
         done, seen = run()
         return done.returncode
 
+    def test_table_bad_inputs_behave_the_same_with_the_marker_set_and_unset(self):   # #1216: the marker changes nothing for any bad input
+        block = [self.review("CHANGES_REQUESTED", "reviewer-a")]
+        self.write_gates({"acme/app": {"mode": "enforce"}})
+        table = (("no switchboard", dict(binary=False), {}),
+                 ("reviews not json", {}, {"FAKE_REVIEWS": "not json"}),
+                 ("reviews call error", {}, {"FAKE_REVIEWS_EXIT": "3"}),
+                 ("blockers call error", {}, {"FAKE_BLOCKERS_EXIT": "5"}),
+                 ("gate call error", {}, {"FAKE_GATE_EXIT": "9"}),
+                 ("gate wrong type", {}, {"FAKE_GATE_JSON": "[1]"}),
+                 ("gate not json", {}, {"FAKE_GATE_JSON": "nope", "FAKE_GATE_EXIT": "10"}),
+                 ("gate refuses", {}, {"FAKE_GATE_EXIT": "10", "FAKE_GATE_JSON": json.dumps({"verdict": "refuse", "mode": "enforce", "message": "no"})}))
+        for name, kw, env in table:
+            with self.subTest(case=name):
+                got = []
+                for extra in ({}, {"FLEET_SWITCHBOARD_OWN_GH": "1"}):
+                    done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/app", env=dict(env, **extra), **kw)
+                    got.append((done.returncode, seen is None))
+                self.assertEqual(got[0], got[1], "the marker changes nothing")
+        for extra in ({}, {"FLEET_SWITCHBOARD_OWN_GH": "1"}):   # a blocking review is refused either way
+            done, seen = self.merge(reviews=block, env=extra)
+            self.assertEqual((done.returncode, seen), (10, None))
+
     def test_the_marker_does_not_skip_the_gate_probe(self):   # #1216 S3: the gate probe does not honour the marker
         self.write_gates({"acme/app": {"mode": "enforce"}})
         done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/app", env={"FLEET_SWITCHBOARD_OWN_GH": "1", "FAKE_GATE_EXIT": "10",
