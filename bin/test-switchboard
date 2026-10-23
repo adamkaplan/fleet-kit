@@ -16158,8 +16158,8 @@ class TestOneCharter(CharterRig, Base):
         ("bin/fleet-switchboard", "registry_charter_view"): "registry: every row's charter", ("bin/fleet-switchboard", "triage_context"): "registry: charters via owned_numbers (an orchestrator's issue is never a charter)",
         ("bin/switchboard/judge_request.py", "identify"): "own: copies the caller's own launch fields into its context",
         ("bin/fleet-switchboard", "resume_agent"): "own: one agent's own repo lookup", ("bin/fleet-switchboard", "charter_pane_update"): "own: one agent's own charter for its pane",
-        ("bin/fleet-switchboard", "_fleet_repo"): "own: one agent's own repo", ("bin/fleet-switchboard", "read_order_notices"): "own: the order notices' own records",
-        ("bin/fleet-switchboard", "order_groups"): "own: groups order notices", ("bin/fleet-switchboard", "decisions_from_order_notices"): "own: words order notices",
+        ("bin/fleet-switchboard", "_fleet_repo"): "own: one agent's own repo", ("bin/switchboard/decisions_b.py", "read_order_notices"): "own: the order notices' own records",
+        ("bin/switchboard/decisions_b.py", "order_groups"): "own: groups order notices", ("bin/switchboard/decisions_b.py", "decisions_from_order_notices"): "own: words order notices",
         ("bin/switchboard/judge_request.py", "resolve_policy_context"): "own: one agent's own launch context", ("bin/fleet-switchboard", "_valid_context"): "own: a cached own context",
         ("bin/fleet-switchboard", "charter_orders"): "own: an agent's own charter's orders", ("bin/switchboard/judge_request.py", "charter_guard"): "own: an agent's own charters",
         ("bin/switchboard/judge_request.py", "ask_context_of"): "own: an agent's own ask context", ("bin/fleet-switchboard", "__call__"): "own: an orchestrator's own orders",
@@ -39667,7 +39667,7 @@ class TestImpactHold(LedgerBase):
 
     def test_an_unrelated_edit_in_the_daemon_file_is_allowed_and_a_new_call_into_the_clear_is_refused(self):
         source = self.real_source()
-        for name in ("cmd_triage", "format_decisions_status", "decisions_from_notices", "triage_pass"):
+        for name in ("cmd_triage", "format_decisions_status", "sweep_summary", "triage_pass"):
             self.assertIn("def %s(" % name, source)
             head, diff = self.edit_one_line_under(source, name)
             self.assertEqual(self.closure_check(head, diff), [], name)
