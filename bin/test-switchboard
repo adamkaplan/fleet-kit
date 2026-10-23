@@ -55131,7 +55131,7 @@ class TestCaptainDecisionFromLabels(TestCaptainPrs):
 class TestHeldTop(DecisionsBase):
     """#604: a PR held for the owner opens with why, what changes (a Before | After table), an example and its questions; one check (held_defects)
     serves pr-explain --check and gate G6b. A Mermaid block in the top part fails; below it, nothing is judged."""
-    OPEN = "MERGE: captain\nPLAN: https://example.test/acme/api/issues/9\n\n"
+    OPEN = "MERGE: captain\nPLAN: https://example.test/acme/api/issues/9\nRationale: The order of 23 October says the owner decides only what might matter.\n\n"
     WHY = "## Why this needs you\n\nIt changes a credential path. The owner decides if it ships.\n\n"
     TABLE = ("## What changes for you\n\n| Before | After |\n|---|---|\n| You get two cards. | You get one card. |\n"
              "| You open a list. | The list opens itself. |\n| You retry by hand. | It retries once. |\n\n")

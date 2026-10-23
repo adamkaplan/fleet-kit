@@ -1342,6 +1342,9 @@ def impact_plan(engine, report, labels, state, records, records_problem):
     pr = report["pr"]
     if report.get("draft") and report.get("owner_decision") == "hold":
         return "none", []   # the daemon adds no hold to a draft pull request (it still releases one the rule no longer holds, #999)
+    brief = report.get("brief")   # slice D (#1215): a brief that says chief_of_staff with no material risk is advisory: no owner-hold label
+    if report.get("owner_decision") == "hold" and isinstance(brief, dict) and brief.get("decider") == "chief_of_staff" and brief.get("material") == []:
+        return "none", []
     if report.get("owner_decision") == "hold":
         carried = (state.get("carried", {}).get(pr) or {}).get("head") == report["head"] and impact_floor.carry_enabled(engine.config, report["pr"].rpartition("#")[0])
         if (state["clears"].get(pr) or {}).get("head") == report["head"] or carried:   # the owner's clear, or a clear carried over a pure merge of main (#510)
