@@ -32053,6 +32053,151 @@ class TestCaptainTriage(TestTriage):
         self.assertEqual(self.only("T7"), [])                                    # held by its label: T6's, not T7's
 
 
+class TestAlertColdStart(Base):
+    """#1140: after a start the alert repositories' `issues` lists are read before every other unit; six repositories, one alert, four reads a pass."""
+    REPOS = ["acme-org/r%d" % i for i in range(1, 7)]
+    ALERT = "acme-org/r6"   # the last by name: the old order reads it last
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={"github_repos": list(self.REPOS)})
+        self.world.add_agent("orch", fleet={"role": "orchestrator", "charter": 1, "repo": self.ALERT})
+        self.hub = FakeTriageHub()
+        self.engine = self.world.engine
+        self.engine.hub = self.hub
+        self.engine.config["triage"] = dict(sb.TRIAGE_DEFAULTS, repos=list(self.REPOS), our_logins=["bot"], calls_per_pass=6,
+                                            alert_labels={self.ALERT: ["ops-alert"]})
+        self.engine.discover(self.world.clock.now())
+        for repo in self.REPOS:
+            self.hub.open[repo] = {}
+        self.hub.open[self.ALERT][7] = tri_issue(self.world.clock.now(), 7, labels=["ops-alert"], title="Nightly job failed", repo=self.ALERT)
+
+    def passes(self, n=1):
+        self.hub.calls.clear()
+        for _ in range(n):
+            self.world.tick(1)
+            sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+
+    def sent(self):
+        return [e for e in self.world.audit() if e["event"] == "alert_wake.sent"]
+
+    def test_the_first_pass_reads_the_alert_issues_and_the_wake_sends(self):
+        self.passes()
+        self.assertEqual(len([c for c in self.hub.calls if "per_page" in c]), 4)   # the budget holds: four reads, never five
+        self.assertTrue(sb.whole(self.engine, "issues:" + self.ALERT)[0])
+        self.assertEqual(len(self.sent()), 1)
+
+    def test_with_no_alert_labels_the_old_order_is_kept(self):
+        self.engine.config["triage"]["alert_labels"] = {}
+        self.passes()
+        self.assertFalse(sb.whole(self.engine, "issues:" + self.ALERT)[0])
+        self.assertEqual(self.sent(), [])
+
+    def test_the_skip_line_says_how_far_the_start_has_got(self):
+        """The counts come from a real pass: the alert repository is unreadable, so its issues input stays unread and the wake says so."""
+        self.hub.unreadable.add(self.ALERT)
+        self.passes()
+        read = len([c for c in self.hub.calls if self.ALERT not in c and "per_page" in c])   # the successful reads, counted from the hub
+        wanted = len(self.REPOS) * (3 + len(sb.triage_awaiting_labels(self.engine)))
+        self.assertGreater(read, 0)
+        lines = [e["detail"]["why"] for e in self.world.audit() if e["event"] == "whole.skipped" and e["detail"]["input"] == "issues:" + self.ALERT]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].endswith("(%d of %d units read)" % (read, wanted)), (lines, read, wanted))
+
+    def test_a_failed_refresh_does_not_count_as_read(self):
+        self.engine.triage = sb.TriageState()
+        self.engine.triage.wanted = 30
+        self.engine.triage.units[(self.REPOS[0], "issues")] = {"at": 0, "data": [], "truncated": False, "error": None}
+        self.engine.triage.units[(self.REPOS[1], "issues")] = {"at": 0, "data": [], "truncated": False, "error": "HTTP 502"}
+        sb.read_mark(self.engine, "issues:" + self.ALERT, False, "issues not read yet", self.world.clock.now())
+        sb.whole_skipped(self.engine, "alert_wake", "issues:" + self.ALERT)
+        lines = [e["detail"]["why"] for e in self.world.audit() if e["event"] == "whole.skipped"]
+        self.assertTrue(any(l.endswith("(1 of 30 units read)") for l in lines), lines)
+
+    def test_a_name_that_is_not_an_issues_input_and_no_wanted_keep_the_plain_line(self):
+        self.engine.triage = sb.TriageState()
+        self.engine.triage.units[(self.REPOS[0], "issues")] = {"at": 0, "data": [], "truncated": False, "error": None}
+        sb.read_mark(self.engine, "agents", False, "agents not read yet", self.world.clock.now())
+        self.engine.triage.wanted = 30
+        sb.whole_skipped(self.engine, "x", "agents")
+        sb.read_mark(self.engine, "issues:" + self.ALERT, False, "issues not read yet", self.world.clock.now())
+        self.engine.triage.wanted = 0
+        sb.whole_skipped(self.engine, "y", "issues:" + self.ALERT)
+        lines = sorted(e["detail"]["why"] for e in self.world.audit() if e["event"] == "whole.skipped")
+        self.assertEqual(lines, ["agents not read yet", "issues not read yet"])
+
+
+class TestAlertRefreshOrder(Base):
+    """#1140: the order in which `triage_refresh` reads, driven for real against the fake hub. Units here: issues, comments, merged."""
+    REPOS = ["acme-org/r%d" % i for i in range(1, 7)]
+    UNITS = ["issues", "comments", "merged"]
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={"github_repos": list(self.REPOS)})
+        self.engine = self.world.engine
+        self.hub = FakeTriageHub()
+        self.engine.hub = self.hub
+        self.state = sb.TriageState()
+        self.state.started = self.engine.now()
+        for repo in self.REPOS:
+            self.hub.open[repo] = {}
+
+    def refresh(self, alerts, budget=100, now=None):
+        self.engine.config["triage"] = {"alert_labels": {r: ["ops-alert"] for r in alerts}}
+        self.hub.calls.clear()
+        sb.triage_refresh(self.engine, self.state, self.REPOS, self.UNITS, now or self.world.clock.now(), [budget], 1)
+        return [self.read_of(c) for c in self.hub.calls]
+
+    @staticmethod
+    def read_of(path):
+        repo = re.search(r"repos/([^/]+/[^/]+)/", path).group(1)
+        unit = "merged" if "/pulls" in path else "comments" if "/issues/comments" in path else "issues"
+        return repo, unit
+
+    def old_order(self, skip=()):
+        return sorted(((r, u) for r in self.REPOS for u in self.UNITS if (r, u) not in skip), key=lambda t: (0,) + t)
+
+    def test_two_alert_repositories_are_read_first_and_the_rest_keep_the_old_order(self):
+        order = self.refresh(["acme-org/r5", "acme-org/r6"])
+        first = [("acme-org/r5", "issues"), ("acme-org/r6", "issues")]
+        self.assertEqual(order[:2], first)
+        self.assertEqual(order[2:], self.old_order(skip=first))   # no other unit waits for more than those two lists, none is dropped
+
+    def test_no_alert_labels_reads_in_the_old_order(self):
+        self.assertEqual(self.refresh([]), self.old_order())
+
+    def test_fresh_alert_units_change_nothing(self):
+        now = self.world.clock.now()
+        for r in ("acme-org/r5", "acme-org/r6"):
+            self.state.units[(r, "issues")] = {"at": now, "data": [], "truncated": False, "error": None}
+        fresh = [("acme-org/r5", "issues"), ("acme-org/r6", "issues")]
+        self.assertEqual(self.refresh(["acme-org/r5", "acme-org/r6"]), self.old_order(skip=fresh))
+
+    def test_a_stale_but_read_alert_unit_keeps_its_place_in_the_old_order(self):
+        now = self.world.clock.now()
+        self.state.units[("acme-org/r6", "issues")] = {"at": now - 10000, "data": [], "truncated": False, "error": None}
+        order = self.refresh(["acme-org/r6"])
+        self.assertNotEqual(order[0], ("acme-org/r6", "issues"))   # a read-but-stale unit is not "not read yet"
+        self.assertEqual(order[-1], ("acme-org/r6", "issues"))   # it has at > 0, so the unread units sort before it
+
+    def test_an_unreadable_alert_repository_does_not_stop_the_others(self):
+        self.hub.unreadable.add("acme-org/r6")
+        order = self.refresh(["acme-org/r6"])
+        self.assertEqual(order[0], ("acme-org/r6", "issues"))
+        self.assertIn("acme-org/r6", self.state.unreadable)
+        for repo in self.REPOS[:5]:
+            for unit in self.UNITS:
+                self.assertIn((repo, unit), self.state.units)
+
+    def test_a_budget_smaller_than_the_alert_lists_reads_only_alert_lists_in_order(self):
+        order = self.refresh(["acme-org/r5", "acme-org/r6"], budget=2)   # one kept in reserve: one read
+        self.assertEqual(order, [("acme-org/r5", "issues")])
+        self.state.units.clear()
+        order = self.refresh(["acme-org/r5", "acme-org/r6"], budget=3)
+        self.assertEqual(order, [("acme-org/r5", "issues"), ("acme-org/r6", "issues")])
+
+
 class TestAlertWake(Base):
     """#851: an open issue carrying a configured alert label wakes that repository's orchestrator once per issue and label. Real triage pass, real fact
     source, fakes and temp dirs only."""
