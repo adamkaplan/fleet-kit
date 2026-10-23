@@ -83945,14 +83945,106 @@ class TestGhShimMergeGate(Base):
         self.lone_shim()
         done, seen = self.run_shim(*self.MERGE)
         self.assertEqual((done.returncode, seen), (10, None))
-        self.assertEqual(done.stderr.strip(), "gh: review rule unreadable: review_rule.py: merge refused")
+        self.assertEqual(done.stderr.strip(), "gh: review rule unreadable: review_rule.py: missing: merge refused")
         done, seen = self.run_shim(*self.MERGE, "--over-review", "a reason that is long enough")
         self.assertEqual((done.returncode, seen), (10, None))
 
     def test_the_mutant_that_swallows_the_rule_load_failure_is_caught(self):
-        self.lone_shim(("raise ReviewRuleUnreadable(path)", "raise RuntimeError(path)"))
+        self.lone_shim(("raise ReviewRuleUnreadable(path, \"missing\")", "raise RuntimeError(path)"))
         done, seen = self.run_shim(*self.MERGE)
-        self.assertNotEqual((done.returncode, done.stderr.strip()), (10, "gh: review rule unreadable: review_rule.py: merge refused"))   # the test above fails on it
+        self.assertNotEqual((done.returncode, done.stderr.strip()), (10, "gh: review rule unreadable: review_rule.py: missing: merge refused"))   # the test above fails on it
+
+    CHANGES_GH = ("#!/usr/bin/env python3\nimport json,os,sys\n"
+                  "a = sys.argv[1:]\n"
+                  "if a[:2] == ['repo', 'view']:\n    print(os.environ.get('FAKE_REPO') or ''); sys.exit(0)\n"
+                  "if a[:2] == ['pr', 'view']:\n"
+                  "    if os.environ.get('FAKE_VIEW_FAIL') == 'all' or (os.environ.get('FAKE_VIEW_FAIL') == 'reviews' and 'reviews,headRefOid,reviewDecision' in a):\n        sys.exit(1)\n"
+                  "    if 'url' in a:\n        print('https://github.com/acme/app/pull/12'); sys.exit(0)\n"
+                  "    print(json.dumps({'reviews': [{'state': 'CHANGES_REQUESTED', 'author': {'login': 'rev'}, 'commit': {'oid': 'a'*40}, 'submittedAt': '2026-01-01T00:00:00Z'}], 'headRefOid': 'a'*40, 'reviewDecision': 'CHANGES_REQUESTED'})); sys.exit(0)\n"
+                  "json.dump({'argv': a}, open(%r,'w'))\nsys.exit(0)\n")
+
+    BAD_RULES = [   # (kind, rule file text or None for missing, the cause the refusal line names)
+        ("missing", None, "missing"),
+        ("syntax error", "def review_blockers(:\n", "syntax error"),
+        ("ImportError", "import no_such_module_xyz\n", "import error"),
+        ("no function", "X = 1\n", "no function review_blockers"),
+        ("raises", "def review_blockers(r, h='', d=''):\n    raise ValueError('boom')\n", "raised in review_blockers (ValueError)"),
+        ("returns None", "def review_blockers(r, h='', d=''):\n    return None\n", "wrong return type from review_blockers"),
+        ("returns 5", "def review_blockers(r, h='', d=''):\n    return 5\n", "wrong return type from review_blockers"),
+        ("returns ''", "def review_blockers(r, h='', d=''):\n    return ''\n", "wrong return type from review_blockers"),
+        ("list of non-str", "def review_blockers(r, h='', d=''):\n    return [1, None]\n", "wrong return type from review_blockers"),
+        ("sys.exit(0) at import", "import sys\nsys.exit(0)\n", "exit at import"),
+        ("BaseException subclass", "class Odd(BaseException):\n    pass\ndef review_blockers(r, h='', d=''):\n    raise Odd()\n", "raised in review_blockers (Odd)"),
+        ("SystemExit in the call", "def review_blockers(r, h='', d=''):\n    raise SystemExit(0)\n", "exit in review_blockers"),
+        ("BaseException at import", "class Odd(BaseException):\n    pass\nraise Odd()\n", "load error (Odd)"),
+    ]
+
+    def bad_rule_shim(self, rule, mutate=()):
+        (self.home / "lone" / "review_rule.py").unlink(missing_ok=True)
+        self.lone_shim()
+        text = (self.home / "lone" / "gh").read_text()
+        for old, new in mutate:
+            self.assertIn(old, text)
+            text = text.replace(old, new)
+        (self.home / "lone" / "gh").write_text(text)
+        if rule is not None:
+            (self.home / "lone" / "review_rule.py").write_text(rule)
+        fake = self.bin / "gh"
+        fake.write_text(self.CHANGES_GH % str(self.log))
+        fake.chmod(0o755)
+
+    def bad_rule_rows(self, mutate=()):
+        """[(kind, why)] of the rows that do NOT end in exit 10 + the cause line + no merge run."""
+        failed = []
+        for kind, rule, cause in self.BAD_RULES:
+            self.bad_rule_shim(rule, mutate)
+            done, seen = self.run_shim(*self.MERGE, env=self.allowed())
+            want = "gh: review rule unreadable: review_rule.py: %s: merge refused" % cause
+            if (done.returncode, seen) != (10, None) or want not in done.stderr.splitlines():
+                failed.append((kind, done.returncode, done.stderr.strip()[-200:]))
+        return failed
+
+    def test_every_bad_review_rule_refuses_the_merge_with_its_own_cause_line(self):
+        self.assertEqual(self.bad_rule_rows(), [])
+
+    def test_the_bad_rule_mutants_each_fail_a_row(self):
+        guard = 'raise ReviewRuleUnreadable(path, "raised in review_blockers (%s)" % type(err).__name__)'
+        for name, mutate in (
+                ("the call outside the guard", [(guard, 'raise RuntimeError("x")')]),
+                ("SystemExit uncaught", [('except SystemExit:\n            raise ReviewRuleUnreadable(path, "exit at import")', "except ZeroDivisionError:\n            raise ReviewRuleUnreadable(path, \"exit at import\")"),
+                                         ("        except BaseException as err:\n            raise ReviewRuleUnreadable(path, \"load", "        except Exception as err:\n            raise ReviewRuleUnreadable(path, \"load")]),
+                ("the load after the first skip", [("        review_rule_load()   # FIRST", "        pass   # FIRST")])):
+            if name == "the load after the first skip":
+                self.bad_rule_shim(None, mutate)
+                done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/app", "--bogus", env=dict(self.allowed(), FAKE_VIEW_FAIL="reviews"))
+                self.assertNotIn("review rule unreadable: review_rule.py: missing", done.stderr, name)
+            else:
+                self.assertNotEqual(self.bad_rule_rows(mutate), [], name)
+
+    def test_a_missing_rule_refuses_a_merge_whatever_else_goes_wrong_first(self):
+        for label, args, fail in (("unparsed shape", ("pr", "merge", "12", "-R", "acme/app", "--bogus"), None),
+                                  ("unresolved PR", ("pr", "merge"), "all"),
+                                  ("failed reviews read", self.MERGE, "reviews")):
+            self.bad_rule_shim(None)
+            env = dict(self.allowed(), FAKE_REPO="")
+            if fail:
+                env["FAKE_VIEW_FAIL"] = fail
+            done, seen = self.run_shim(*args, env=env)
+            self.assertEqual((done.returncode, seen), (10, None), label)
+            self.assertIn("gh: review rule unreadable: review_rule.py: missing: merge refused", done.stderr.splitlines(), label)
+
+    def test_a_non_merge_gh_call_does_not_load_the_review_rule(self):
+        self.bad_rule_shim(None)
+        for args in (("pr", "view", "12"), ("pr", "list"), ("issue", "list")):
+            done, seen = self.run_shim(*args)
+            self.assertEqual(done.returncode, 0, args)
+            self.assertNotIn("review rule unreadable", done.stderr)
+
+    def test_the_own_gh_marker_skips_the_review_check_entirely_a_known_limit(self):
+        """KNOWN limit (pre-existing, not changed here): FLEET_SWITCHBOARD_OWN_GH=1 skips review_probe, so even a bad rule does not refuse."""
+        self.bad_rule_shim(None)
+        done, seen = self.run_shim(*self.MERGE, env=dict(self.allowed(), FLEET_SWITCHBOARD_OWN_GH="1"))
+        self.assertNotIn("review rule unreadable", done.stderr)
 
     def test_every_sibling_module_the_shim_loads_ships_beside_it(self):
         shipped = {p.name for p in SHIM.parent.iterdir() if p.suffix == ".py" or p.name in ("gh", "git")}

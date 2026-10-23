@@ -1463,21 +1463,47 @@ REVIEW_RULE_MODULE = [None]
 
 
 class ReviewRuleUnreadable(Exception):
-    """shims/review_rule.py could not be loaded: the merge is REFUSED (never skipped), or a copy of this shim without its sibling would lose the guardrail."""
+    """shims/review_rule.py could not be loaded or used: the merge is REFUSED (never skipped), or a copy of this shim without its sibling would lose the guardrail.
+    args = (path, cause)."""
 
 
-def review_blockers(reviews, head="", decision=""):
-    """The ONE rule lives in review_rule.py beside this file (shared with `fleet-switchboard gates`); an unloadable module raises ReviewRuleUnreadable, which `review_probe` turns into a REFUSAL."""
+def review_rule_load():
+    """The rule module, loaded once. ANY failure (missing file, syntax error, import error, a SystemExit or other BaseException at import, no `review_blockers`) raises ReviewRuleUnreadable(path, cause)."""
     if REVIEW_RULE_MODULE[0] is None:
         path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "review_rule.py")
+        if not os.path.isfile(path):
+            raise ReviewRuleUnreadable(path, "missing")
         try:
             spec = importlib.util.spec_from_file_location("review_rule", path)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
-        except Exception:
-            raise ReviewRuleUnreadable(path)
+        except SyntaxError:
+            raise ReviewRuleUnreadable(path, "syntax error")
+        except ImportError:
+            raise ReviewRuleUnreadable(path, "import error")
+        except SystemExit:
+            raise ReviewRuleUnreadable(path, "exit at import")
+        except BaseException as err:
+            raise ReviewRuleUnreadable(path, "load error (%s)" % type(err).__name__)
+        if not callable(getattr(module, "review_blockers", None)):
+            raise ReviewRuleUnreadable(path, "no function review_blockers")
         REVIEW_RULE_MODULE[0] = module
-    return REVIEW_RULE_MODULE[0].review_blockers(reviews, head, decision)
+    return REVIEW_RULE_MODULE[0]
+
+
+def review_blockers(reviews, head="", decision=""):
+    """The ONE rule lives in review_rule.py beside this file (shared with `fleet-switchboard gates`). The load AND the call are guarded: any failure or a result that is not a list of str raises ReviewRuleUnreadable, which `review_probe` turns into a REFUSAL."""
+    module = review_rule_load()
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "review_rule.py")
+    try:
+        got = module.review_blockers(reviews, head, decision)
+    except SystemExit:
+        raise ReviewRuleUnreadable(path, "exit in review_blockers")
+    except BaseException as err:
+        raise ReviewRuleUnreadable(path, "raised in review_blockers (%s)" % type(err).__name__)
+    if not isinstance(got, list) or not all(isinstance(x, str) for x in got):
+        raise ReviewRuleUnreadable(path, "wrong return type from review_blockers")
+    return got
 
 
 def review_probe(args, found, reason, lookup, gh):
@@ -1491,6 +1517,7 @@ def review_probe(args, found, reason, lookup, gh):
     try:
         if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1" or len(args) < 2 or args[0] != "pr" or args[1] != "merge":
             return None
+        review_rule_load()   # FIRST, before any skip path: an unloadable rule refuses a merge whatever else happens
         parsed = gate_parse(args)
         if parsed is None:
             sys.stderr.write("gh: review check skipped (the merge command shape was not understood)\n")
@@ -1543,7 +1570,8 @@ def review_probe(args, found, reason, lookup, gh):
                "resolve them, or pass --over-review '<reason of at least 10 characters>' (it is logged)")
         return "gh: merge of %s#%d refused: blocking review(s): %s. %s" % (repo, number, names, why)
     except ReviewRuleUnreadable as err:
-        return "gh: review rule unreadable: %s: merge refused" % gate_clean(os.path.basename(str(err)))
+        path, cause = (list(err.args) + ["unknown"])[:2]
+        return "gh: review rule unreadable: %s: %s: merge refused" % (gate_clean(os.path.basename(str(path))), gate_clean(cause))
     except Exception:
         sys.stderr.write("gh: review check skipped (an unexpected error): not checked\n")
         return None
