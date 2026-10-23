@@ -54,6 +54,16 @@ def run_one(root, rel, timeout):
 
 
 def main():
+    expect = []
+    args = sys.argv[1:]
+    while args:
+        a = args.pop(0)
+        if a == "--expect" and args:
+            expect.append(args.pop(0))
+        elif a.startswith("--expect="):
+            expect.append(a.split("=", 1)[1])
+        else:
+            print("usage: cloud-pr-preflight [--expect PATH-PREFIX]..."); return 2
     rc, root = git("rev-parse", "--show-toplevel")
     if rc:
         print("cloud-pr-preflight: not in a git repository"); return 2
@@ -145,6 +155,23 @@ def main():
         if not changed:
             print("none")
         failed |= bool(changed)
+        rc, out = git("diff", "--name-only", "--diff-filter=A", "--no-renames", mb, cwd=root)
+        added = [x for x in out.splitlines() if x]
+        rc, out = git("ls-files", "--others", "--exclude-standard", cwd=root)
+        added += [x for x in out.splitlines() if x]
+        print("\nadded files:")
+        for x in added:
+            print("  " + x)
+        if not added:
+            print("  none")
+        if expect:
+            stray = [x for x in added if not any(x.startswith(e) for e in expect)]
+            print("unexpected additions (outside %s):" % ", ".join(expect))
+            for x in stray:
+                print("  " + x)
+            if not stray:
+                print("  none")
+            failed |= bool(stray)
         print("\nRESULT: " + ("FAIL" if failed else "PASS"))
         return 1 if failed else 0
     finally:

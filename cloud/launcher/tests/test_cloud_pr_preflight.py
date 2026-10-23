@@ -38,10 +38,10 @@ class Repo:
         sh(self.d, "git", "add", "-A")
         sh(self.d, "git", "commit", "-q", "-m", m)
 
-    def run(self, script=SCRIPT, **env):
+    def run(self, script=SCRIPT, args=(), **env):
         e = dict(os.environ, CLOUD_PREFLIGHT_TIMEOUT="5", CLOUD_PREFLIGHT_BASE="main")
         e.update(env)
-        p = subprocess.run([sys.executable, script], cwd=self.d, env=e, capture_output=True, text=True)
+        p = subprocess.run([sys.executable, script, *args], cwd=self.d, env=e, capture_output=True, text=True)
         return p.returncode, p.stdout
 
     def status(self):
@@ -116,6 +116,29 @@ class T(unittest.TestCase):
         self.r.put("bin/test-cloud-launcher", CHAIN + "# tests/test_c.py\n"); self.r.commit("c")
         rc, out = self.r.run()
         self.assertEqual(rc, 0, out)
+
+    def test_expect_flags_stray_addition(self):
+        self.r.put("cloud/launcher/tests/test_c.py", PASS)
+        self.r.put("bin/test-cloud-launcher", CHAIN + "# tests/test_c.py\n")
+        self.r.put("scratch.txt", "x"); self.r.commit("c")
+        rc, out = self.r.run(args=["--expect", "cloud/", "--expect", "bin/"])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("unexpected additions", out)
+        self.assertIn("  scratch.txt", out.split("unexpected additions")[1])
+        rc, out = self.r.run()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("  scratch.txt", out)
+
+    def test_expect_inside_prefix_passes(self):
+        self.r.put("cloud/launcher/tests/test_c.py", PASS)
+        self.r.put("bin/test-cloud-launcher", CHAIN + "# tests/test_c.py\n"); self.r.commit("c")
+        self.assertEqual(self.r.run(args=["--expect", "cloud/", "--expect", "bin/"])[0], 0)
+
+    def test_mutant_stray_root_file_missed(self):
+        self.r.put("scratch.txt", "x"); self.r.commit("s")
+        m = mutant("failed |= bool(stray)", "pass"); self.addCleanup(os.remove, m)
+        self.assertEqual(self.r.run(script=m, args=["--expect", "cloud/"])[0], 0)
+        self.assertNotEqual(self.r.run(args=["--expect", "cloud/"])[0], 0)
 
     # mutants: each makes a check pass wrongly; the tests above must then fail
     def test_mutant_scan_ignores_unchained(self):
