@@ -418,7 +418,7 @@ class TestConfig(Base):
             "herdr_log": "~/.config/herdr/herdr-server.log", "pane_exit_burst_seconds": 5, "pane_exit_burst_min": 3,  # #1030
             "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "launch_default": "headless",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
-            "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
+            "github_repos": [], "gh": sb.own_gh_path("gh"), "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],   # #1216: the RESOLVED gh (a machine with a gh on PATH names it by path)
             "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "no_multiplexer": False, "docker_reaper": True,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
@@ -7885,7 +7885,7 @@ class TestGithubConfig(Base):
     def test_defaults_watch_nothing_and_name_the_documented_events(self):
         config = self.cfg()
         self.assertEqual((config["github_repos"], config["gh"], config["github_lookback_hours"],
-                          config["github_port"]), ([], "gh", 24, None))
+                          config["github_port"]), ([], sb.own_gh_path("gh"), 24, None))   # the RESOLVED gh: environment-independent
         self.assertEqual(config["github_events"], ["issues", "issue_comment", "sub_issues", "pull_request",
                                                    "pull_request_review", "check_suite", "workflow_run"])
 
@@ -12776,6 +12776,44 @@ class TestShimReadCache(Base):
         self.assertEqual(len(self.network()), 2)
         self.assertIn("If-None-Match: \"v1\"", self.network()[1])
         self.assertEqual(len((self.state / "agent-calls.jsonl").read_text().splitlines()), 1, "the 304 is not counted as a call")
+
+    def marker_mutant(self, func):
+        """#1216: a copy of the shim directory in which `func` honours the retired marker again (returns at once)."""
+        source = SHIM.read_text()
+        start = source.index("def %s(" % func)
+        head = source[start:]
+        at = head.index(":\n", head.index(")")) + 2
+        if head[at:].lstrip().startswith('"""'):
+            at = head.index('"""', head.index('"""', at) + 3) + 4
+        guard = '    if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":\n        return None\n'
+        target = self.home / ("mutant-" + func)
+        shutil.copytree(str(SHIM.parent), str(target))
+        (target / "gh").write_text(source[:start] + head[:at] + guard + head[at:])
+        return target / "gh"
+
+    def test_mutants_honouring_the_marker_in_count_call_and_the_cache_fail_these_cases(self):   # #1216
+        global SHIM
+        marker = {"FLEET_SWITCHBOARD_OWN_GH": "1"}
+        saved = SHIM
+        for func in ("count_call", "cached_read"):
+            with self.subTest(func=func):
+                (self.state / "agent-calls.jsonl").unlink() if (self.state / "agent-calls.jsonl").exists() else None
+                shutil.rmtree(str(self.state / "gh-read-cache"), True)
+                self.log.write_text("")
+                self.run_shim("api", self.PATH, env=marker); self.run_shim("api", self.PATH, env=marker)
+                spooled = (self.state / "agent-calls.jsonl").read_text().splitlines() if (self.state / "agent-calls.jsonl").exists() else []
+                real = (len(spooled), len(self.network()))
+                self.assertEqual(real, (1, 1), "the real shim, marker set: one call counted, the repeat served from the cache")
+                (self.state / "agent-calls.jsonl").unlink()
+                shutil.rmtree(str(self.state / "gh-read-cache"), True)
+                self.log.write_text("")
+                SHIM = self.marker_mutant(func)
+                try:
+                    self.run_shim("api", self.PATH, env=marker); self.run_shim("api", self.PATH, env=marker)
+                finally:
+                    SHIM = saved
+                spooled = (self.state / "agent-calls.jsonl").read_text().splitlines() if (self.state / "agent-calls.jsonl").exists() else []
+                self.assertNotEqual((len(spooled), len(self.network())), real, "the mutant differs: the case above fails it")
 
     def test_s8_a_write_by_the_same_agent_drops_its_entries_and_another_agents_write_does_not(self):
         self.run_shim("api", self.PATH)
@@ -55655,7 +55693,7 @@ class TestPrNotices(DecisionsBase):
         self.notices()
         self.assertEqual(len(self.gh.calls), 2)
         argv = self.gh.calls[0][0]
-        self.assertEqual(argv, ["gh", "pr", "view", "7", "--repo", "acme/api", "--json", sb.PR_VIEW_FIELDS])
+        self.assertEqual(argv, [sb.own_gh_path("gh"), "pr", "view", "7", "--repo", "acme/api", "--json", sb.PR_VIEW_FIELDS])
         for _ in range(5):  # passes every few seconds
             self.world.tick(5)
             self.notices()
@@ -86360,6 +86398,44 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertEqual(log.read_text().splitlines(), ["real api rate_limit token=tok-daemon"], "the fake real gh ran, with the daemon's own token, unswapped")
             self.assertFalse(Path(tmp, "agent-calls.jsonl").exists(), "the shim never saw it: nothing counted")
+
+    def test_the_validated_config_keeps_the_resolved_real_gh_and_a_daemon_call_never_runs_the_shim(self):
+        """#1216 wiring: _validate_github must STORE the resolved path (a bare own_gh_path(...) that discards it leaves 'gh' and the daemon back behind the shim)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            shimdir, realdir = self.layout(tmp)
+            log = Path(tmp, "calls.log")
+            path = os.pathsep.join([str(shimdir), str(realdir)])
+            base = {"github_repos": [], "github_events": ["issue_comment"], "gh": "gh", "github_lookback_hours": 1, "github_port": None, "github_ignore_authors": []}
+            with mock.patch.dict(os.environ, {"PATH": path, "FAKE_LOG": str(log), "GH_TOKEN": "tok-daemon", "HOME": tmp, "FLEET_SWITCHBOARD_STATE": tmp}):
+                os.environ.pop("FLEET_REAL_GH", None)
+                config = sb.validate_config({"gh": "gh"})
+                self.assertEqual(config["gh"], str(realdir / "gh"), "the config holds the RESOLVED real gh, not the bare name")
+                done = subprocess.run([config["gh"], "api", "rate_limit"], capture_output=True, text=True, timeout=60)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(log.read_text().splitlines(), ["real api rate_limit token=tok-daemon"])
+                self.assertFalse(Path(tmp, "agent-calls.jsonl").exists())
+                full = sb.validate_config({"gh": "gh"})
+                self.assertEqual(full["gh"], str(realdir / "gh"))
+            source = switchboard_source()
+            line = 'config["gh"] = own_gh_path(config["gh"])'
+            self.assertIn(line, source)
+            mutant = source.replace(line, 'own_gh_path(config["gh"])', 1)   # validate, then DISCARD
+            scope = {"__name__": "mutant_discard", "__file__": str(SWITCHBOARD)}
+            exec(compile(mutant, "mutant", "exec"), scope)
+            with mock.patch.dict(os.environ, {"PATH": path}):
+                kept = scope["validate_config"]({"gh": "gh"})
+            self.assertEqual(kept["gh"], "gh", "the discarding mutant leaves the bare name: the assertion above fails it")
+
+    def test_a_relative_configured_gh_that_is_the_shim_is_refused_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shimdir, realdir = self.layout(tmp, real=False)
+            cwd = os.getcwd()
+            os.chdir(str(shimdir))
+            try:
+                with self.assertRaisesRegex(sb.ConfigError, "no real gh behind the shim"):
+                    sb.own_gh_path("./gh", {"PATH": str(shimdir)})
+            finally:
+                os.chdir(cwd)
 
     def test_the_shim_is_recognised_by_its_real_file_and_editing_the_docstring_fails_here(self):
         self.assertTrue(sb.is_shim_file(str(SHIM)), "own_gh_path must know the REAL shims/gh by its signature: update SHIM_HEAD together with the docstring")

@@ -5491,6 +5491,8 @@ PATH that is not the shim. A resolved gh that would be the shim (a configured ab
 makes the daemon **refuse to start** with `no real gh behind the shim`: with no marker, every own call through the shim would be re-identified (its token swapped), counted,
 gate-probed and audited as an agent's. The shim is told from a real gh by its docstring signature (`SHIM_HEAD`, the first 400 bytes of `shims/gh`); a test pins it against the real file.
 
+**Limits (#1216).** A *relative* configured `gh` (`./gh`) is resolved against the daemon's working directory and checked against the shim the same way as an absolute one. A `gh` found by a bare name other than `gh` is used as given and not checked. **A shim linked into one of the fixed directories the shim's own `whoami` runs with** (`/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin`, `ENV_PATH`), with the real gh outside them: the shim's identity lookup then finds the shim, not the real gh, and the configuration is **refused**, so an agent's writes **fail closed** (`account lookup failed`) rather than run with the wrong token. Put the real gh in one of those directories, or set `FLEET_REAL_GH`.
+
 **What the #949 budget numbers miss.** The shim's per-account call file (`agent-calls.jsonl`, the agent-shell column of the hourly record and of the top-spender ranking) never
 sees the daemon's own reads any more, since they do not reach the shim. They are counted only by the daemon's own counter (`GhAccounts.calls`, shown by `status`) and show in the
 real usage the daemon reads (`used`, `remaining`). So the agent-shell numbers are agent calls only, as before, and "recorded N, outside the shim and the daemon about M" is unchanged in meaning;

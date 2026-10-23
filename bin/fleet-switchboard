@@ -6109,7 +6109,7 @@ def own_gh_path(name, environ=None):
     when PATH holds only the shim, ConfigError (every own call would be re-identified, counted and audited as an agent's). No gh on PATH at all: `name` as it is."""
     environ = os.environ if environ is None else environ
     if name != "gh":
-        if os.path.isabs(name) and os.path.isfile(name) and is_shim_file(name):
+        if os.sep in name and os.path.isfile(name) and is_shim_file(os.path.abspath(name)):   # absolute or relative (./gh)
             raise ConfigError("no real gh behind the shim: the configured gh %s is the fleet shim" % name)
         return name
     override = environ.get("FLEET_REAL_GH")
@@ -20311,7 +20311,7 @@ class GhAccounts:
     def read_usage(self):
         """{account: (used, remaining, limit, reset)} from `gh api rate_limit` for each account this fleet reads with (the `gh_users` accounts, and the default
         token when one is set). That endpoint does not count against the budget, and it is NOT counted here either (it does not go through `read`, and the
-        child carries the switchboard's own marker). Bounded: at most 8 accounts, one call each, each with the call timeout. Never raises; an account that
+        child runs the real gh by path, so the shim never sees it). Bounded: at most 8 accounts, one call each, each with the call timeout. Never raises; an account that
         cannot be read is left out."""
         found = {}
         names = sorted({a for a in (self.config.get("gh_users") or {}).values() if isinstance(a, str) and a})[:agent_calls.USAGE_ACCOUNTS]
@@ -24152,7 +24152,7 @@ def add_merge_gate_parsers(sub):
 
 
 def merge_gate_gh(config, runner, repo):
-    """`gh(argv) -> (code, stdout, stderr)` for `repo`'s account, never raising; every call names itself the switchboard's own, so the shim does not probe it."""
+    """`gh(argv) -> (code, stdout, stderr)` for `repo`'s account, never raising; every call runs the real gh by its resolved path (own_gh_path, config['gh']), so it never reaches the shim."""
     accounts = GhAccounts(config, runner, time.time)
     try:
         refuse_excluded(config, repo)
