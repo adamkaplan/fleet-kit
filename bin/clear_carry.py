@@ -18,6 +18,8 @@ A SECOND route (ask #815) carries the clear over a merge whose conflict was reso
 identical, no merge and no part of the pull request's own change touches a protected path (the clear's own code and the impact matrix: the caller's table), and an independent reviewer's
 confirmation is recorded for exactly the new head (the caller's `confirm`). See `decide`.
 
+A THIRD route (ask #955) is for the batch pull request (base the default branch, head `integration`): it has no clear of its own, but its members were cleared on theirs. See `batch_decide`.
+
 The same function computes the fingerprint at the clear and at the carry (`own_change_fingerprint`). Python 3.9 standard library only.
 """
 import hashlib
@@ -33,6 +35,10 @@ class CarryVoid(Exception):
     """The clear does not carry. `str(err)` is the reason, in words: what could not be read, or what changed."""
 
 
+class CarryUnread(CarryVoid):
+    """(#955) The clear does not carry NOW because a read failed (or the head moved while it was read): not a verdict on the batch, so a batch judged again later may carry."""
+
+
 def _get_list(get, path, pages, what, key=None):
     """Every item of a paginated answer, or CarryVoid. `key` names the list inside an object answer. A list that is still full after `pages` pages is cut: void."""
     items = []
@@ -42,7 +48,7 @@ def _get_list(get, path, pages, what, key=None):
         except CarryVoid:
             raise
         except Exception as err:
-            raise CarryVoid("%s could not be read (%s)" % (what, str(err)[:80])) from None
+            raise CarryUnread("%s could not be read (%s)" % (what, str(err)[:80])) from None
         batch = answer.get(key) if key and isinstance(answer, dict) else answer
         if not isinstance(batch, list):
             raise CarryVoid("%s was not a list" % what)
@@ -56,7 +62,7 @@ def _object(get, path, what):
     try:
         answer = get(path)
     except Exception as err:
-        raise CarryVoid("%s could not be read (%s)" % (what, str(err)[:80])) from None
+        raise CarryUnread("%s could not be read (%s)" % (what, str(err)[:80])) from None
     if not isinstance(answer, dict):
         raise CarryVoid("%s was not an object" % what)
     return answer
@@ -313,4 +319,202 @@ def decide(get, repo, number, cleared_head, cleared_fingerprint, new_head, lines
         verdict["reason"] = str(err)
     except Exception as err:   # any other trouble is a void clear, never a carried one
         verdict["reason"] = "the carry could not be decided (%s)" % type(err).__name__
+    return verdict
+
+
+# ---- the batch pull request (ask #955): the clears of its members carry when its diff is exactly their cleared diffs
+
+BATCH_BRANCH = "integration"
+
+
+def _squash_number(message):
+    """N of a squash commit's title `... (#N)`, else None."""
+    title = message.split("\n", 1)[0].rstrip()
+    start = title.rfind("(#")
+    digits = title[start + 2:-1] if start >= 0 and title.endswith(")") else ""
+    return int(digits) if digits.isdigit() and len(digits) <= 9 else None
+
+
+def _file_row(item):
+    """The row `own_change` makes of one changed file, or CarryVoid (the same refusals: no blob id, or an omitted patch that is not a pure move)."""
+    if not isinstance(item, dict) or not isinstance(item.get("filename"), str):
+        raise CarryVoid("a changed file could not be read")
+    status, patch, sha = item.get("status"), item.get("patch"), _sha(item.get("sha"))
+    if sha is None:
+        raise CarryVoid("the blob of %s could not be read" % item["filename"][:80])
+    if patch is None and not (status in ("renamed", "copied") and not item.get("changes")):
+        raise CarryVoid("the patch of %s is omitted by GitHub (a binary file or too large to read in full)" % item["filename"][:80])
+    previous = item.get("previous_filename") if isinstance(item.get("previous_filename"), str) else None
+    return {"path": item["filename"], "status": str(status), "previous": previous, "sha": sha, "patch": patch if isinstance(patch, str) else ""}
+
+
+def _listing(get, repo, base, head):
+    """[{"sha", "parents", "message"}]: the commits the batch has that the default branch has not, every one of them listed. Void unless the head is AHEAD of the base."""
+    path = "repos/%s/compare/%s...%s?per_page=%d" % (repo, base, head, PAGE)
+    first = _object(get, "%s&page=1" % path, "the comparison of the batch with its base")
+    if first.get("status") != "ahead":
+        raise CarryVoid("the batch is not ahead of %s (GitHub says %s): a stale or diverged batch is judged as it is" % (base, first.get("status") if isinstance(first.get("status"), str) else "nothing"))
+    total = first.get("total_commits")
+    if not isinstance(total, int) or isinstance(total, bool):
+        raise CarryVoid("the number of commits of the batch could not be read")
+    items, page = list(first.get("commits") or []), 1
+    while len(items) < total and page < COMMIT_PAGES:
+        page += 1
+        items.extend(_object(get, "%s&page=%d" % (path, page), "the commits of the batch").get("commits") or [])
+    if len(items) != total:
+        raise CarryUnread("GitHub lists %d of %d commits of the batch" % (len(items), total))
+    out = []
+    for item in items:
+        sha = _sha(item.get("sha")) if isinstance(item, dict) else None
+        parents = [_sha(p.get("sha")) for p in (item.get("parents") or []) if isinstance(p, dict)] if isinstance(item, dict) else []
+        message = ((item.get("commit") or {}).get("message") if isinstance(item, dict) and isinstance(item.get("commit"), dict) else None)
+        if sha is None or not parents or any(p is None for p in parents) or not isinstance(message, str):
+            raise CarryVoid("a commit of the batch could not be read")
+        out.append({"sha": sha, "parents": parents, "message": message})
+    return out
+
+
+def _entries(files):
+    """{(path, line): how many times} of the lines a set of files adds and removes: context and line numbers are left out (a later member moves them). A pure move is one entry of its blob."""
+    found = {}
+    for f in files:
+        keys = [(f["path"], line) for line in changed_lines(f["patch"])] if f["patch"] else [(f["path"], "~%s:%s:%s" % (f["status"], f["previous"], f["sha"]))]
+        for key in keys:
+            found[key] = found.get(key, 0) + 1
+    return found
+
+
+def _excess(seen, expected):
+    """{key: count} of what `seen` has more of than `expected`."""
+    return {k: n - expected.get(k, 0) for k, n in seen.items() if n > expected.get(k, 0)}
+
+
+def batch_members(get, repo, base, head, branch=BATCH_BRANCH):
+    """([{"number", "sha"}] oldest last as walked, [merge commits]): the batch's commits along first parents from `head`. Each is a merge of the base branch (second parent on it) or the squash of ONE
+    member pull request (`title (#N)`, and GitHub says that pull request merged into `branch` with exactly this commit). Anything else, a commit that is neither, a member twice, or a commit
+    the walk does not reach, is CarryVoid."""
+    commits = _listing(get, repo, base, head)
+    by_sha = {c["sha"]: c for c in commits}
+    members, merges, seen, current = [], [], set(), head
+    while current in by_sha:
+        c = by_sha[current]
+        if current in seen:
+            raise CarryVoid("the history of the batch loops")
+        seen.add(current)
+        if len(c["parents"]) == 2:
+            check_main_side(get, repo, base, {"sha": c["sha"], "parents": c["parents"]})
+            merges.append({"sha": c["sha"], "parents": c["parents"]})
+        elif len(c["parents"]) == 1:
+            number = _squash_number(c["message"])
+            if number is None:
+                raise CarryVoid("commit %s is neither a merge of %s nor the squash of a pull request (no `(#N)` in its title)" % (c["sha"][:8], base))
+            if any(m["number"] == number for m in members):
+                raise CarryVoid("pull request #%d is in the batch twice" % number)
+            pull = _object(get, "repos/%s/pulls/%d" % (repo, number), "member #%d" % number)
+            if pull.get("merged") is not True or pull.get("merge_commit_sha") != c["sha"] or base_ref_of(pull) != branch:
+                raise CarryVoid("commit %s is not the merge of pull request #%d into %s" % (c["sha"][:8], number, branch))
+            members.append({"number": number, "sha": c["sha"]})
+        else:
+            raise CarryVoid("commit %s has %d parents: an octopus merge is never carried" % (c["sha"][:8], len(c["parents"])))
+        current = c["parents"][0]
+    if len(seen) != len(commits):
+        raise CarryVoid("%d commit(s) of the batch are not on its first-parent line (a side branch): never carried" % (len(commits) - len(seen)))
+    return members, merges
+
+
+def batch_decide(get, repo, number, head, member_state, closure_of, protected, branch=BATCH_BRANCH):
+    """{"carried", "reason", "head", "members": [...], "merges", "uncovered": [...], "lines", "summary"}: do the clears of the batch's members carry to the batch pull request at `head`? Never raises.
+
+    The batch (base: the default branch, head: `branch`) carries ONLY when ALL hold, each read in full (anything unreadable voids it: fail closed):
+
+    * every commit is a merge of the base branch or the squash of one member pull request, and each squash has exactly the lines of the member's own change at the head that was merged;
+    * every member either was cleared at exactly that merged head (`member_state(number, head)` -> {"held", "cleared_head", "by"}) or the floor never held it;
+    * no member changes a `protected` path (the clear's own code and the matrix) or a line `closure_of(number, files, head)` says is in the clear closure: such a batch needs a clear of its own;
+    * no merge of the base branch changed a file (against both its parents) that a member changed;
+    * no line the batch adds or removes is outside the union of the members' changes (a batch that is a strict subset of it still carries)."""
+    verdict = {"carried": False, "reason": None, "head": head, "members": [], "merges": 0, "uncovered": [], "lines": 0, "summary": None, "soft": None}
+    # "soft" says how final a refusal is: "read" (a read failed or the head moved: judged again, a few times), "uncleared" (only members not cleared at their merged head yet: judged again when a clear is
+    # recorded), None (a definite refusal, kept for the head). "uncleared" is set only once every fact has been read in full.
+    try:
+        now_head, pull = pull_head(get, repo, number)
+        if now_head != head:
+            raise CarryUnread("the head moved while it was being read")
+        base = base_ref_of(pull)
+        source = pull.get("head") if isinstance(pull.get("head"), dict) else {}
+        if source.get("ref") != branch or (source.get("repo") or {}).get("full_name") != repo:
+            raise CarryVoid("not a batch: its head is not %s of this repository" % branch)
+        default = _object(get, "repos/%s" % repo, "the repository").get("default_branch")
+        if default != base:
+            raise CarryVoid("not a batch: its base is not the default branch")
+        members, merges = batch_members(get, repo, base, head, branch)
+        verdict["merges"] = len(merges)
+        tables = {_norm(p) for p in protected or ()}
+        if not tables:
+            raise CarryVoid("no list of protected paths was given: the batch carry is refused")
+        table, expected, member_paths, problems, hard = [], {}, {}, [], []
+        for m in sorted(members, key=lambda m: m["number"]):
+            own, own_head, _ = own_change(get, repo, m["number"])
+            commit = _get_list(get, "repos/%s/commits/%s?per_page=%d" % (repo, m["sha"], PAGE), FILE_PAGES, "the files of member #%d" % m["number"], "files")
+            squash = sorted((_file_row(i) for i in commit), key=lambda f: (f["path"], f["status"]))
+            if fingerprint_of(squash, "", True) != fingerprint_of(own, "", True):
+                raise CarryVoid("the squash of #%d is not the change of its pull request at head %s" % (m["number"], own_head[:8]))
+            state = member_state(m["number"], own_head)
+            held, cleared_head, by = bool(state.get("held")), state.get("cleared_head"), state.get("by")
+            row = {"number": m["number"], "head": own_head, "held": held, "cleared_head": cleared_head if held else None, "by": by if held else None, "covered": True, "why": None}
+            why, firm = [], []
+            if held and cleared_head != own_head:
+                why.append("held by the floor and %s" % ("cleared at %s, not at the merged head %s (amended after its clear)" % (str(cleared_head)[:8], own_head[:8]) if cleared_head else "never cleared"))
+            for f in own:
+                for path in (f["path"], f["previous"]):
+                    if path and _norm(path) in tables:
+                        why.append("it changes %s, the clear's own code or the impact matrix: the batch needs a clear of its own" % path[:80])
+                        firm.append(1)
+            closure = closure_of(m["number"], own, own_head)
+            if closure is None:
+                raise CarryVoid("the changes of #%d to the clear's code could not be mapped" % m["number"])
+            why.extend("%s: the batch needs a clear of its own" % r for r in closure)
+            firm.extend(closure)
+            if why:
+                row["covered"], row["why"] = False, "; ".join(sorted(set(why)))
+                problems.append("#%d %s" % (m["number"], row["why"]))
+                if firm:
+                    hard.append(m["number"])
+            for f in squash:
+                member_paths.setdefault(f["path"], m["number"])
+            for key, count in _entries(squash).items():
+                expected[key] = expected.get(key, 0) + count
+            table.append(row)
+        verdict["members"] = table
+        for merge in merges:
+            vs_first, vs_second = merge_files(get, repo, merge)
+            for path in sorted(set(vs_first) & set(vs_second)):
+                if path in member_paths:
+                    hard.append(merge["sha"])
+                    problems.append("merge %s of %s changed %s relative to both parents, and member #%d changed it" % (merge["sha"][:8], base, path[:80], member_paths[path]))
+        files, files_head, _ = own_change(get, repo, number)
+        if files_head != head:
+            raise CarryUnread("the head moved while it was being read")
+        seen = _entries(files)
+        verdict["lines"] = sum(seen.values())
+        extra = _excess(seen, expected)
+        verdict["uncovered"] = ["%s %s" % (k[0][:60], k[1][:60]) for k in sorted(extra)][:20]
+        if extra:
+            hard.append("lines")
+            problems.append("%d line(s) of the batch are in no member's change: %s" % (sum(extra.values()), "; ".join(verdict["uncovered"][:5])))
+        held_rows = [r for r in table if r["held"]]
+        free_rows = [r for r in table if not r["held"]]
+        verdict["summary"] = "held members (%d): %s; never held (%d): %s; merges of %s: %d" % (
+            len(held_rows), ", ".join("#%d %s" % (r["number"], "cleared by %s at %s" % (r["by"] or "someone", str(r["cleared_head"])[:8]) if r["cleared_head"] else "not cleared") for r in held_rows) or "none",
+            len(free_rows), ", ".join("#%d" % r["number"] for r in free_rows) or "none", base, len(merges))
+        verdict["soft"] = None if hard else "uncleared"
+        if problems:
+            raise CarryVoid("; ".join(problems)[:1500] + " (" + verdict["summary"] + ")")
+        verdict["carried"], verdict["soft"] = True, None
+    except CarryUnread as err:
+        verdict["reason"], verdict["soft"] = str(err), "read"
+    except CarryVoid as err:
+        verdict["reason"] = str(err)
+    except Exception as err:   # any other trouble holds the batch as it is held today (and is judged again: a read failure is not a verdict)
+        verdict["reason"] = "the batch carry could not be decided (%s)" % type(err).__name__
+        verdict["soft"] = "read"
     return verdict
