@@ -32,6 +32,8 @@ import zlib
 MARKER = ".fleet-review-checkout"
 MARKER_TOOL = "fleet-switchboard review checkout"
 PARENT = ".review"
+DIFFS_DIR = "diffs"            # #1047: `diffs/<path>.diff`, one per changed file
+MATRIX_FILE = "impact-matrix.txt"   # #1047: the impact matrix words, for a reviewer that cannot run a command
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_FILES = 5000
 MAX_TOTAL_BYTES = 100 * 1024 * 1024
@@ -310,7 +312,7 @@ def make_readonly(root):
     os.chmod(root, 0o555)
 
 
-def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text: None, archive=None):
+def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text: None, archive=None, extra_files=None):
     """Materialise PR `repo#number` at commit `head` (read ONCE by the caller; every fetch uses it) under `cwd`, diffed against merge base of
     `base`. Returns the directory path. On any failure everything this call made is removed and the exception (Unsafe, OverBound, Problem) is raised."""
     limits = dict({"file": MAX_FILE_BYTES, "files": MAX_FILES, "total": MAX_TOTAL_BYTES}, **(limits or {}))
@@ -412,7 +414,10 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
             if written > MAX_DIFF_BYTES:
                 raise OverBound("the diff is over the limit of %d bytes" % MAX_DIFF_BYTES)
             diff.append(piece)
+            write_file(root, DIFFS_DIR + "/" + path + ".diff", piece.encode())   # #1047: one diff per changed file, so a reader takes each whole, chunk by chunk
         write_file(root, "pr.diff", "".join(diff).encode())
+        for name, text in sorted((extra_files or {}).items()):
+            write_file(root, name, text.encode())
         _rewrite_marker(root, _marker_bytes({"tool": MARKER_TOOL, "pr": "%s#%d" % (repo, number), "head": head, "base": base,
                                              "merge_base": merge_base, "merge_base_fallback": fallback, "touched": len(touched),
                                              "from_blob_api": from_blob, "altered_in_archive": sorted(altered)}))

@@ -29,7 +29,7 @@ Names below are neutral (`acme-org/widget-api`, `acme-bot`, used only to describ
 | 2 | `git` shim credential route | No token of its own. Network verbs (`push`, `fetch`, `pull`, `clone`, `ls-remote`) are sent through `gh auth git-credential`, which is row 1 | Same as row 1 | Git itself cannot call the settings API, but the token it is given is the row 1 token: yes in the sense that matters |
 | 3 | Token in the shell environment (`GH_TOKEN`, `GITHUB_TOKEN` and the two enterprise names) | Inherited from whoever started the pane | On the machine read: a broad classic token (repository, workflow and organisation administration scopes). The shim replaces it for a repository with a mapping; reads and unmapped repositories fall back to it | Yes (admin of repositories it owns, and organisation administration) |
 | 4 | Keyring logins of `gh` | `gh auth login`, stored by the operating system keyring | Broad classic tokens: the owner-account login includes organisation administration; a login for another account has repository access without it | Yes for repositories where that account is admin. The other-account login must stay unused for settings by policy, not by its scope |
-| 5 | Cloud token mint (#450; the permission check is in the launcher: #545, merged) | An App installation token for one repository, one hour at most, minted inside the pod from the pod's federated identity | Exactly `contents: write`, `pull_requests: write`, `metadata: read`. The mint refuses an answer with an extra key, a higher level or a missing key | No. There is no `Administration` permission. A token a cloud worker holds cannot reach settings |
+| 5 | Cloud token mint (#450; the permission check is in the launcher: #545, merged) | An App installation token for one repository, one hour at most, minted inside the pod from the pod's federated identity | Exactly `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read` (the mint asks for these and checks the answer). The mint refuses an answer with an extra key, a higher level or a missing key. The worker can read issues and their comments of its repository and cannot write issues, labels, merges or settings | No. There is no `Administration` permission. A token a cloud worker holds cannot reach settings |
 | 6 | The switchboard's own calls (daemon, sweeps, intent reads) | The same per-account tokens as row 1, marked `FLEET_SWITCHBOARD_OWN_GH` | Same as row 4 | Yes in scope, but it is the daemon's own process, not an agent's shell |
 
 Reading the table:
@@ -44,7 +44,7 @@ Reading the table:
 
 Option C is recommended; A and B are compared and rejected. All three keep the owner's own login as the only credential that can change settings, rulesets, branch protection and collaborators. Repositories outside the scope above are not touched by any option: no step below edits their entry.
 
-The permission set for an agent on a repository: `contents: write`, `pull_requests: write`, `issues: write`, `checks: read`, `metadata: read`, and never `Administration`. The cloud mint today grants only `contents`, `pull_requests` and `metadata`; the owner adds `issues: write` and `checks: read` to the App.
+The permission set for an agent on a repository: `contents: write`, `pull_requests: write`, `issues: write`, `checks: read`, `metadata: read`, and never `Administration`. The cloud mint today grants only `contents`, `pull_requests`, `issues` (read) and `metadata`; the owner adds `issues: write` and `checks: read` to the App.
 
 ### Option A: a fine-grained token per repository, no Administration (rejected)
 
@@ -125,6 +125,10 @@ Every step that creates or changes a credential is the owner's (see "The owner's
 5. The owner removes the broad token from the agents' environment for in-scope repositories, so there is nothing broader to fall back on.
 6. An agent, with the owner present, runs the live proof of clause (4): an admin call is refused (403 or 404) and a branch push, pull request, label, comment and a merge through the ruleset still work. The same proof checks that the fleet-kit repository itself is unchanged.
 
+## Cloud worker: reading issues
+
+The cloud mint asks for, and accepts, exactly `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read`. The worker can read issues and their comments of its own repository and cannot write issues, labels, merges or settings. The owner step is one numbered step with two actions, done only after the change is merged: add `issues: read` to the App's permissions, then accept it on each installation. Until then every cloud launch is refused before any pod exists, with a line that names `issues` and this step. This is the cloud token's own set and a different credential from the Mac agent set above.
+
 ## Rollback
 
 If the App token breaks agent work on an in-scope repository, return to the current login:
@@ -132,7 +136,7 @@ If the App token breaks agent work on an in-scope repository, return to the curr
 1. Remove that repository's entry from the installation map, or restore the previous `gh_users` entry from the copy kept before step 4. The shims read it on every call, so there is no restart.
 2. Restore the inherited token for the agent's shell, if step 5 removed it.
 3. The previous keyring login was never deleted by this migration, so it is still there.
-4. If the cause was the key, the owner rotates it in the App's settings. If widening the App made cloud tokens refused, narrow the App back to `contents: write`, `pull_requests: write`, `metadata: read`.
+4. If the cause was the key, the owner rotates it in the App's settings. If widening the App made cloud tokens refused, narrow the App back to its previous permissions (the cloud mint now needs `contents: write`, `pull_requests: write`, `issues: read`, `metadata: read`; revert the change that added `issues: read` first, then remove it from the App).
 
 Rollback returns to today's behaviour, including admin reach for agents on that repository, so record why and treat it as temporary.
 

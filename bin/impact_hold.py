@@ -57,7 +57,9 @@ MOVED = ('rating_at',
          'cmd_impact_clear',
          'cmd_impact_delegated',
          'delegated_clear_checks',
+         'delegated_clear_inputs',
          'delegated_clear_pr_checks',
+         'clear_who',
          'delegated_clear_score',
          'delegated_clear_map',
          '_gh_json',
@@ -610,6 +612,11 @@ def _lane_of_issue(engine, repo, issue, orchestrators):
     except IntentError:
         pass   # the chain so far is all that can be told
     default_repo = engine.config.get("intent_repo") if len(getattr(engine, "watches", ()) or ()) > 1 else None
+    registry = load_module("registry")   # #969: an orchestrator's charter is the registry row's `charter`, the ONE record; the live session's metadata (written once at launch, never corrected) is never a second owner
+    reg = registry.read(engine.state_dir) if engine.state_dir is not None else None
+    if reg is None or not reg["whole"]:
+        return None   # an unreadable registry gives no lane: never a guess
+    charters = registry.orchestrator_charters(reg["agents"])
     for number in chain:
         owners = []
         for name, agent in sorted(orchestrators.items()):
@@ -617,14 +624,7 @@ def _lane_of_issue(engine, repo, issue, orchestrators):
             theirs = fleet.get("repo") if isinstance(fleet.get("repo"), str) else default_repo
             if repo and theirs and theirs != repo:
                 continue
-            owned = set()
-            for field in ("issue", "charter"):
-                value = fleet.get(field)
-                if isinstance(value, int) and not isinstance(value, bool):
-                    owned.add(value)
-                elif isinstance(value, str) and value.strip().lstrip("#").isdigit():
-                    owned.add(int(value.strip().lstrip("#")))
-            if number in owned:
+            if charters.get(name) == number:
                 owners.append(name)
         if len(owners) == 1:
             return ("one", owners[0])
@@ -1113,6 +1113,7 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
             detail["order"] = plan_ledger.clip(under_order["text"], 300)
             if under_order.get("threshold"):   # #835: a clear by score shows the score and the threshold it was made under
                 detail["score"], detail["threshold"] = under_order.get("score"), under_order["threshold"]
+                detail["runs"] = under_order.get("runs") or []   # #972: the two runs the clear rests on (record id, rater, cell)
         if fingerprint is not None:
             detail["fingerprint"] = fingerprint
         engine.audit.append(engine.actor, "gate.hold_cleared", pr, detail)   # inside the lock
@@ -1192,7 +1193,7 @@ def delegated_clear_score(engine, module, report, threshold):
         if not rated and not problem:
             problem = "no independent impact rating at this head"
         block = module.score_block()
-        scored = module.judge(block, impact_floor.load_matrix().get("cells"), entries, report, threshold) if not problem and block is not None else None
+        scored = module.judge(block, impact_floor.load_matrix().get("cells"), entries, report, threshold, module.RUNS_REQUIRED) if not problem and block is not None else None
     except Exception as err:
         scored, problem = None, "%s: %s" % (type(err).__name__, _one_line(str(err), 80))
     if scored is None:
@@ -1200,13 +1201,17 @@ def delegated_clear_score(engine, module, report, threshold):
     return scored
 
 
-def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info=None):
-    """(report, None) when this pull request may be cleared under an order, else (None, why). The owner-hold decision is the daemon's own (`pr_floor_report`: no second rule), the rule (the classes
-    never delegated and the clear code) is the matrix's `owner_hold.delegated_clear`; anything unreadable is refused. #661. With a `threshold` (the order's max_level, #835) the SCORE of the
-    independent rating at this head is the rule about the pull request's classes; `info` (a dict) gets the score it read, for the audit of a refusal too."""
+def delegated_clear_inputs(engine, runner, repo, number, take=False, report=None):
+    """(inputs, None) or (None, why): everything the clear's rule needs about one pull request, READ ONLY (GETs): {"report" (the daemon's own `pr_floor_report`), "rule" (the matrix's
+    `owner_hold.delegated_clear`), "files" (the changed files, None when they cannot be read in full), "closure" ({file: reasons or None})}. The file list and the decision must be of ONE head. Read by the
+    clear (`delegated_clear_pr_checks`) and by the line the daemon posts (`clear_who`): one reading, no second copy. #661, #946."""
     try:
-        report = pr_floor_report(engine, repo, number)
-        rule = (impact_floor.load_matrix().get("owner_hold") or {}).get("delegated_clear")
+        report = report if isinstance(report, dict) else pr_floor_report(engine, repo, number)   # the line is given the report the pass just judged: one floor read per pull request per pass
+        matrix = impact_floor.load_matrix()
+        rule = (matrix.get("owner_hold") or {}).get("delegated_clear")
+        listed, problem = impact_floor.clear_code_paths(matrix)   # the ONE reader of the list: the floor holds these paths, the clear refuses them
+        if isinstance(rule, dict) and listed is not None and problem is None:
+            rule = dict(rule, clear_code_paths=listed)
     except (impact_floor.MatrixError, NoticeError, ValueError) as err:
         return None, "the owner-hold decision or its rule cannot be read (%s): refused" % _one_line(str(err), 140)
     files, get = [], impact_carry_get(engine, runner, repo)
@@ -1222,7 +1227,7 @@ def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info
             files = None   # more than 3000 files: not read in full
     except Exception:
         files = None
-    module, base_sha, closure = load_module("delegated_clear"), None, {}
+    base_sha, closure = None, {}
     if files is not None:   # the file list and the decision must be of ONE head: the head read again after the files must still be the one the decision read
         try:
             pull = get("repos/%s/pulls/%d" % (repo, number))
@@ -1236,14 +1241,39 @@ def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info
             return None, "the pull request's head moved while it was being checked (%s, then %s): nothing was cleared" % (str(report.get("head"))[:8], str(after)[:8])
         for item in files:   # a changed file of the daemon's own: each changed LINE is mapped to its definition by the ast of the file it belongs to
             if isinstance(item.get("filename"), str) and impact_floor.matches(item["filename"], (rule or {}).get("closure_files") or []) and not impact_floor.matches(item["filename"], (rule or {}).get("clear_code_paths") or []) and item.get("status") == "modified":
-                closure[item["filename"]] = delegated_clear_map(engine, runner, repo, item, base_sha, rule)
+                closure[item["filename"]] = load_module("delegated_clear").cached_map(load_module("delegated_clear").map_key(engine.state_dir, repo, item, base_sha, rule),
+                                                                                     lambda: delegated_clear_map(engine, runner, repo, item, base_sha, rule), take)   # the line the daemon posts hands what it read to the clear, once
+    return {"report": report, "rule": rule, "files": files, "closure": closure}, None
+
+
+def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info=None):
+    """(report, None) when this pull request may be cleared under an order, else (None, why). The owner-hold decision is the daemon's own (`pr_floor_report`: no second rule), the rule (the classes
+    never delegated and the clear code) is the matrix's `owner_hold.delegated_clear`; anything unreadable is refused. #661. With a `threshold` (the order's max_level, #835) the SCORE of the
+    independent rating at this head is the rule about the pull request's classes; `info` (a dict) gets the score it read, for the audit of a refusal too."""
+    got, why = delegated_clear_inputs(engine, runner, repo, number, True)
+    if why:
+        return None, why
+    report, module = got["report"], load_module("delegated_clear")
     scored = delegated_clear_score(engine, module, report, threshold) if threshold is not None else None
     if scored is not None and info is not None:
         info["score"] = scored["level"]
-    reasons = module.refusals(rule, report, files, impact_floor.matches, closure, scored)
+        info["runs"] = scored.get("runs") or []
+    reasons = module.refusals(got["rule"], report, got["files"], impact_floor.matches, got["closure"], scored)
     if reasons:
         return None, "; ".join(reasons)
     return report, None
+
+
+def clear_who(engine, runner, repo, number, report=None):
+    """`delegated_clear.who_can_clear` for one pull request, from the clear's own inputs (`delegated_clear_inputs`): who can clear it, as plain data (#946; the packet command reads the same). READ ONLY: GETs
+    and nothing else (no label, no state file, no audit line, no send). Inputs that cannot be read give the `unknown` answer, never a confident one."""
+    module, pr = load_module("delegated_clear"), "%s#%d" % (repo, number)
+    got, why = delegated_clear_inputs(engine, runner, repo, number, False, report)
+    block = module.score_block()
+    delegation = module.delegation_of(engine.config, block)
+    if why:
+        return module.who_can_clear(None, None, None, None, None, block, delegation, pr=pr, unread=why)
+    return module.who_can_clear(got["rule"], got["report"], got["files"], impact_floor.matches, got["closure"], block, delegation, pr=pr)
 
 
 def cmd_impact_clear(args, runner, now):
@@ -1319,7 +1349,15 @@ def cmd_impact_clear(args, runner, now):
                     engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), dict({"by": kind[1], "under_order": delegated["number"], "why": _one_line(why, 300)}, **({"score": info.get("score"), "threshold": delegated["threshold"]} if delegated.get("threshold") else {})))
                 sys.stderr.write("%s: impact clear: refused: %s\n" % (PROG, _one_line(why, 600)))
                 return EXIT_USAGE
-            extra = {"head": report["head"], "via": "order:%d" % delegated["number"], "under_order": dict(delegated, score=info.get("score"))}
+            if delegated.get("threshold"):   # #972: a clear by score names both runs it rests on
+                problems = load_module("delegated_clear").reason_problems(reason, info.get("runs") or [])
+                if problems:
+                    why = "; ".join(problems)
+                    if engine.audit is not None:
+                        engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), {"by": kind[1], "under_order": delegated["number"], "why": _one_line(why, 300), "score": info.get("score"), "threshold": delegated["threshold"]})
+                    sys.stderr.write("%s: impact clear: refused: %s\n" % (PROG, _one_line(why, 600)))
+                    return EXIT_USAGE
+            extra = {"head": report["head"], "via": "order:%d" % delegated["number"], "under_order": dict(delegated, score=info.get("score"), runs=info.get("runs"))}
         for line in impact_clear_core(engine, runner, repo, number, kind[1], plan_ledger.clip(redact_command_text(reason), 300), **extra):
             print(line)
     except (NoticeError, IntentError) as err:
