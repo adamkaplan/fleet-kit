@@ -40,9 +40,9 @@ When a function decides from text (an error message, a substring, a pattern, a n
 
 **You record what they returned**, one record per reviewer per head: put the returned block in a file (or pipe it) and run
 `fleet-switchboard review record <pr> --reviewer <role> --block <file or ->`. The verdict, the head and the counts are read from the block (a blocking finding that cites no rule counts as a note), and a block for any commit other
-than the PR's current head is refused. The record is made by your session, so it is a shadow record: `gates` shows it on the panel line and counts it for no gate.
+than the PR's current head is refused. A verdict is recorded exactly as given: the record never refuses or softens it, and a request-changes that cites no rule is kept as request-changes marked `uncited` (it is visible but does not block, as the review laws say). The impact rater's block lists `files-read:` rows and is refused when its list is shorter than the pull request's changed files or a file is read short or counted below GitHub's added plus deleted lines for it (it reads each file's diff in chunks of `RATER_CHUNK_LINES`); run `fleet-switchboard review checkout <pr>` first so it finds `diffs/` and `impact-matrix.txt`. The record is made by your session, so it is a shadow record: `gates` shows it on the panel line and counts it for no gate.
 
-Then fix the blocking findings (each cites a rule; a finding that cites none is only a proposal), functional first and then the standards, push, and run the reviewers again on the new head:
+Then fix the blocking findings (each cites a rule; a finding that cites none counts as a note, and a request-changes whose findings cite none is still recorded, marked `uncited`, and does not block), functional first and then the standards, push, and run the reviewers again on the new head:
 a push voids the earlier records. `fleet-switchboard gates <pr>` prints a `reviewers (plan-review panel verdicts: shadow, not counted by any gate)` line with how many of the five recorded at the current head; it does not block you yet.
 
 Their result is feedback for you. It never replaces the independent review agent's verdict, and a hold is never decided by you or by a reviewer: the switchboard's matrix and path floor decide it.

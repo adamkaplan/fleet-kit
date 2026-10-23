@@ -354,6 +354,195 @@ def warn_low(account, low):
         pass
 
 
+# ---- the top spender (#949): below the low-budget line the lane that spent most in the last hour is told, once an hour per account, and only its non-cached reads wait.
+# There is NO per-agent cap, count or quota here or in any configuration: the top spender is a RANKING of the last hour, recomputed from the daemon's record at every
+# call, never a limit and never remembered. The wait is bounded and ends the moment no account the caller tops is low; nothing is refused.
+#
+# WHAT A CALLER CAN SET. This block reads NO environment variable of its own: the state directory is the account's home from the password database (never HOME,
+# XDG_STATE_HOME or FLEET_SWITCHBOARD_STATE), the switchboard program is the one beside this shim (never FLEET_SWITCHBOARD_BIN), the marker FLEET_SWITCHBOARD_OWN_GH
+# is not honoured here, the timeouts are constants, and it looks at EVERY low account (never the one a configuration variable maps this call to). The one thing it
+# cannot defend is the identity itself: "who is this caller" is the switchboard's answer from the caller's own session and pane. A caller can only make ITSELF wait
+# less, never another agent wait more or the message stop. A test derives every environment name this file reads and lists the ones that switch the wait off.
+SLOW_SECONDS = 2.0            # the longest any one uncached read of the top spender waits
+NOTICE_EVERY = 3600           # at most one message per account in this many seconds
+TRY_EVERY = 300               # at most one ATTEMPT to send per account in this many seconds, whether or not it made a message (a failing or slow switchboard costs one call in this many, not every call)
+WHO_EVERY = 60                # the identity answer is remembered this long (a stamp in the state directory), so a read does not start a process to ask again
+WHO_SECONDS = 3.0             # the identity question's own deadline
+NOT_AGENTS = frozenset(("daemon", "unknown", "other"))   # lanes that are not an agent a message can name
+FIXED_STATE = [None]          # test seams, set by a test's own wrapper in the same process, never from the environment
+FIXED_PROGRAM = [None]
+
+
+def fixed_state_directory():
+    """The switchboard's state directory as the account's home says (the password database), not as any variable says. None when it cannot be told."""
+    if FIXED_STATE[0]:
+        return FIXED_STATE[0]
+    try:
+        import pwd
+        return os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".local", "state", "fleet-switchboard")
+    except Exception:
+        return None
+
+
+def fixed_switchboard():
+    """The switchboard program: the one beside this shim (`../bin/fleet-switchboard` of this file's real path), else the one `install` linked in the account's home
+    (the password database's). Never FLEET_SWITCHBOARD_BIN."""
+    if FIXED_PROGRAM[0]:
+        return FIXED_PROGRAM[0]
+    candidates = [os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin", "fleet-switchboard")]
+    try:
+        import pwd
+        candidates.append(os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".local", "bin", "fleet-switchboard"))
+    except Exception:
+        pass
+    for candidate in candidates:
+        real = os.path.realpath(candidate)
+        if os.path.isfile(real) and os.access(real, os.X_OK):
+            return real
+    return None
+
+
+def low_accounts(state):
+    """{account: (remaining, limit)} for every account the daemon's fresh reading puts below LOW_FRACTION of its budget."""
+    try:
+        with open(os.path.join(state, USAGE_FILE)) as handle:
+            body = json.loads(handle.read(200001))
+        at, found = body["at"], {}
+        if not isinstance(at, (int, float)) or isinstance(at, bool) or time.time() - at > USAGE_FRESH:
+            return {}
+        for account, row in body["accounts"].items():
+            remaining, limit = row["remaining"], row["limit"]
+            if all(isinstance(n, (int, float)) and not isinstance(n, bool) for n in (remaining, limit)) and limit > 0 and remaining < LOW_FRACTION * limit:
+                found[account] = (int(remaining), int(limit))
+        return found
+    except Exception:
+        return {}
+
+
+def top_spender(account, state=None):
+    """(agent, its calls, all agent calls) for the lane that spent most on `account` in the last hour (this hour and the one before it, from the daemon's hourly
+    record), or None. The daemon and an unknown lane are never named. A ranking only: nothing is stored."""
+    try:
+        with open(os.path.join(state or fixed_state_directory(), CALLS_ON)) as handle:
+            hours = json.loads(handle.read(2000001))["hours"]
+        now_hour = int(time.time()) // 3600 * 3600
+        spent = {}
+        for key in (str(now_hour), str(now_hour - 3600)):
+            for lane, accounts in ((hours.get(key) or {}).get("lanes") or {}).items():
+                cell = (accounts or {}).get(account)
+                if isinstance(lane, str) and lane not in NOT_AGENTS and LANE_RE.match(lane) and isinstance(cell, dict):
+                    spent[lane] = spent.get(lane, 0) + sum(n for n in cell.values() if isinstance(n, int) and not isinstance(n, bool) and n > 0)
+        spent = {lane: n for lane, n in spent.items() if n > 0}
+        if not spent:
+            return None
+        top = sorted(spent.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+        return top[0], top[1], sum(spent.values())
+    except Exception:
+        return None
+
+
+def tell_top_spender(state, account):
+    """Ask the switchboard to tell the top spender's orchestrator, when no message went for this account in the last hour (the stamp's age: one stat). The
+    switchboard itself checks the budget, ranks the lanes, claims the hour under a lock and builds the message: all this passes it is the account's name, so
+    a direct call to it cannot invent a message. Never raises, never waits long."""
+    try:
+        binary = fixed_switchboard()
+        if not binary:
+            return
+        stamp = os.path.join(state, "gh-low-told", _digest(account)[:16])
+        try:
+            info = os.stat(stamp)
+            if info.st_size > 0 and 0 <= time.time() - info.st_mtime < NOTICE_EVERY:
+                return
+        except OSError:
+            pass
+        if not fresh_stamp(os.path.join(state, "gh-low-tried", _digest(account)[:16]), TRY_EVERY):
+            return   # an attempt was made a few minutes ago (it may have failed): not again per call
+        subprocess.run([binary, "budget-notice", "--account", str(account)], capture_output=True, timeout=8, env=dict(os.environ, FLEET_SWITCHBOARD_OWN_GH="1"))
+    except Exception:
+        pass
+
+
+def fresh_stamp(path, every):
+    """True when `path` is older than `every` seconds or missing, and then touches it (the attempt is claimed BEFORE it is made). False when it is fresh. Never raises."""
+    try:
+        try:
+            if 0 <= time.time() - os.stat(path).st_mtime < every:
+                return False
+        except OSError:
+            pass
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write("1")
+        return True
+    except Exception:
+        return False   # cannot stamp: do not try, the plain call is the answer
+
+
+def caller_name(state=None):
+    """The caller's fleet name from the fixed switchboard's identity answer (its session, never an environment variable of this file's), or None. The answer is
+    remembered WHO_EVERY seconds per parent process in the state directory, a failed question too (None), so it is asked once and not per call."""
+    try:
+        binary = fixed_switchboard()
+        if not binary:
+            return None
+        memo = os.path.join(state, "gh-who", _digest("%s:%s:%s" % (os.getuid(), os.getppid(), binary))[:16]) if state else None
+        if memo:
+            try:
+                if 0 <= time.time() - os.stat(memo).st_mtime < WHO_EVERY:
+                    with open(memo) as handle:
+                        said = handle.read(100)
+                    return said if NAME_RE.match(said) else None
+            except OSError:
+                pass
+        name = None
+        try:
+            done = subprocess.run([binary, "whoami", "--json"], capture_output=True, text=True, timeout=WHO_SECONDS)
+            name = json.loads(done.stdout).get("name") if done.returncode == 0 else None
+            name = name if isinstance(name, str) and NAME_RE.match(name) else None
+        finally:
+            if memo:
+                try:
+                    os.makedirs(os.path.dirname(memo), mode=0o700, exist_ok=True)
+                    with open(memo, "w") as handle:
+                        handle.write(name or "")
+                except OSError:
+                    pass
+        return name
+    except Exception:
+        return None
+
+
+def low_budget_read(agent=None):
+    """For a READ that will reach GitHub (the cache did not answer it; a write or a cached read never gets here): below the line, for every low account, tell its top
+    spender's orchestrator (the attempt is bounded: once an hour when it worked, once per TRY_EVERY when it did not) and wait SLOW_SECONDS when this caller is a top
+    spender. `agent` is the identity the call already knows, else it is asked (and remembered). Reads nothing from the environment (see above). Never raises, never refuses."""
+    try:
+        state = fixed_state_directory()
+        if not state:
+            return
+        tops = {}
+        for account in low_accounts(state):
+            top = top_spender(account, state)
+            if top is not None:
+                tops[account] = top
+        if not tops:
+            return
+        # IDENTITY FIRST: only the top spender of a low account makes the message attempt (a subprocess) and waits; any other caller, and a caller whose identity
+        # cannot be told (remembered WHO_EVERY seconds as unknown: fail open), does a local ranking read and nothing more.
+        name = agent if isinstance(agent, str) and NAME_RE.match(agent) else caller_name(state)
+        if name is None:
+            return
+        mine = [account for account, top in tops.items() if top[0] == name]
+        if not mine:
+            return
+        for account in mine:
+            tell_top_spender(state, account)
+        time.sleep(SLOW_SECONDS)
+    except Exception:
+        pass
+
+
 def split_response(raw):
     """(status, headers, body bytes) of `gh api -i` output, or None when it is not that shape."""
     cut = raw.find(b"\r\n\r\n")
@@ -393,6 +582,7 @@ def cached_read(gh, env, args, agent, account, low):
         sys.stdout.buffer.flush()
         return 0
     argv = [gh, "api", "-i"] + (["-H", "If-None-Match: " + entry[1]] if entry is not None and entry[1] else []) + [path]
+    low_budget_read(agent)   # an uncached read reaches GitHub here: the top spender's message attempt and bounded wait (a cached answer returned above, with none)
     done = subprocess.run(argv, capture_output=True, env=env)   # the one request (the real gh does not time out either)
     # from here a request is SPENT: whatever happens below, this returns its status and never lets the caller run a second request
     count_now = True
@@ -1963,6 +2153,7 @@ def run(args):
     audit_write(args, lookup, "passed", write, hold_repo, hold_number)
     warn_text(args)
     served = None
+    agent = None
     try:
         own = os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1"
         words = command_words(args)
@@ -1981,6 +2172,8 @@ def run(args):
         served = None   # the cache never fails the command
     if served is not None:
         return served
+    if not write and command_words(args) and command_words(args)[0] not in NO_NETWORK_GROUPS:
+        low_budget_read(agent)   # only a READ that reaches GitHub (not a write, not a cached answer): the top spender's message, and its bounded wait
     count_call(args)
     if plan is None and release_ref:   # a merge under the lock: the lock is released when the merge returns, whatever it returned
         try:

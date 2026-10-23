@@ -6883,7 +6883,7 @@ def retired_agent(retired, name, session):
 
 
 def registry_route(state_dir, name):
-    """Where a message to `name` would go by the registry (#1074; a function only, send does not call it yet): its pane when it has one (as before), else its registry endpoint; None on a half read or an unknown agent."""
+    """Where a message to `name` would go by the registry (#1074; used by send, #1131): its pane when it has one (as before), else its registry endpoint; None on a half read or an unknown agent."""
     registry = load_module("registry")
     reg = registry.read(state_dir)
     row = reg["agents"].get(name) if reg["whole"] else None
@@ -11449,6 +11449,21 @@ def parse_pr_ref(text):
     raise NoticeError("%r is not a pull request: write owner/repo#N or the PR's URL" % _one_line(text, 120))
 
 
+_BARE_PR = re.compile(r"^#?([0-9]+)$")
+
+
+def parse_bare_pr_ref(text, directory=None):
+    """`1234` or `#1234` -> (repo, number), the repository being the `origin` remote of the working directory (`origin_repository`: never a configured
+    default repository). Used by `review laws` only; every other form goes through `parse_pr_ref`. Raises NoticeError saying what to pass."""
+    found = _BARE_PR.match((text or "").strip())
+    if not found or int(found.group(1)) < 1:
+        raise NoticeError("%r is not a pull request: pass 1234, #1234, owner/repo#N or the PR's URL" % _one_line(text, 120))
+    repo, why = origin_repository(None, directory or os.getcwd())
+    if repo is None:
+        raise NoticeError("%s: a bare number needs the working directory's remote: pass owner/repo#N or the PR's URL" % why)
+    return repo, int(found.group(1))
+
+
 @contextmanager
 def pr_notices_lock(state_dir):
     fd = os.open(str(Path(state_dir) / PR_NOTICES_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
@@ -14490,6 +14505,7 @@ class TriageState:
     """Memory only: rebuilt from GitHub and the decision list."""
 
     def __init__(self):
+        self.wanted = 0          # #1140: units a pass wants read (repositories x units), for the skip line
         self.units = {}          # (repo, unit) -> {"at", "data", "truncated", "error"}
         self.unreadable = {}     # repo -> reason, audited once
         self.confirmed, self.attempted, self.alarmed = {}, {}, {}
@@ -14716,7 +14732,9 @@ def triage_refresh(engine, state, repos, units, now, budget, reserve=1, seconds=
             held = state.units.get((repo, unit))
             if held is None or now - held["at"] >= TRIAGE_TTL:
                 todo.append(((held or {"at": 0})["at"], repo, unit))
-    for _, repo, unit in sorted(todo):
+    alerts = set(((engine.config.get("triage") or {}).get("alert_labels") or {}) if isinstance(engine.config.get("triage"), dict) else ())
+    # #1140: the not-yet-read `issues` unit of an alert repository goes first (one list per such repository), then the old order
+    for _, repo, unit in sorted(todo, key=lambda t: (not (t[0] == 0 and t[2] == "issues" and t[1] in alerts),) + t):
         if budget[0] - reserve < 1 or engine.now() - state.started >= seconds:
             break
         try:
@@ -15102,6 +15120,9 @@ def whole_skipped(engine, consumer, name):
     said = engine.__dict__.setdefault("read_whole_said", {})
     if said.get((consumer, name)) != at:
         said[(consumer, name)] = at
+        state = getattr(engine, "triage", None)
+        if name.startswith("issues:") and state is not None and getattr(state, "wanted", 0):
+            why = "%s (%d of %d units read)" % (why, sum(1 for u in state.units.values() if u["error"] is None), state.wanted)   # #1140: how far the cold start has got
         engine._note("whole.skipped", None, {"consumer": consumer, "input": name, "why": why})
     return True
 
@@ -15166,6 +15187,7 @@ def triage_pass(engine, decisions, now, errors=()):
     budget = [cfg.get("calls_per_pass", TRIAGE_CALLS_PER_PASS)]
     seconds = cfg.get("pass_seconds", TRIAGE_PASS_SECONDS)
     units = ["issues", "comments", "merged"] + ["closed:" + l for l in sorted(triage_awaiting_labels(engine))]
+    state.wanted = len(repos) * len(units)
     triage_refresh(engine, state, repos, units, now, budget, max(1, budget[0] // 3), seconds)  # a third kept for fresh checks
     triage_read_live(engine, state, repos, now, budget, max(1, cfg.get("calls_per_pass", TRIAGE_CALLS_PER_PASS) // 3), seconds)
     triage_refresh_ownerless(engine, state, cfg, now, budget, seconds)   # #605: the team repositories' whole lists, after the shared units
@@ -16285,6 +16307,10 @@ def remove_reminders(state_dir, ids):
     return gone
 
 
+def found_reason(why):
+    return "merged" if why.endswith(" is merged") else "closed"
+
+
 class ReminderFacts:
     """`reminder:<id>` facts for reminders that are due. A reminder not yet due is no fact.
 
@@ -16382,6 +16408,20 @@ class ReminderFacts:
             return "%s reported to %s since the launch" % (worker, item["to"])
         return "deliver"
 
+    def notify_drop(self, item, why):
+        """#1132: a reminder dropped because its issue closed or its pull request merged tells its setter ONCE. Called only by the caller
+        that removed the reminder from the file (`gone` was non-empty), so a second sweep finds nothing to drop and sends nothing."""
+        sender = item.get("from")
+        match = re.search(r" is (closed|merged)$", why)
+        if match is None or not isinstance(sender, str) or not sender.strip() or self.engine is None:
+            return
+        reason = "the pull request merged" if match.group(1) == "merged" else "the issue closed"
+        text = "Reminder %s for %s was dropped, unsent: %s (%s). Its text: %s. Set it with --keep-if-closed to keep it." % (
+            item["id"], item["to"], reason, why, item["text"])
+        add_reminder(self.state_dir, sender, self.engine.now(), self.engine.now(), text)
+        if self.engine.audit is not None:
+            self.engine.audit.append(self.engine.actor, "reminder.drop_notice", sender, {"id": item["id"], "why": found_reason(why)})
+
     def __call__(self):
         facts = []
         for item in self.due():
@@ -16394,6 +16434,8 @@ class ReminderFacts:
                     if gone and self.engine is not None and self.engine.audit is not None:
                         self.engine.audit.append(self.engine.actor, "reminder.drop", item["to"],
                                                  {"id": item["id"], "why": found})
+                    if gone:
+                        self.notify_drop(item, found)
                     continue
             text = self.overdue_text(item) if isinstance(item.get("condition"), dict) and isinstance(item["condition"].get("unless_report_from"), str) and self.engine else item["text"]
             facts.append(Fact("reminder:" + item["id"], item["to"], "reminder", text, item["at"],
@@ -16612,16 +16654,81 @@ def cmd_remind(args, runner, now):
             condition[key] = flag
     if number is not None and repo and not condition and not args.keep_if_closed:
         condition["until_closed"] = "%s#%d" % (repo, number)   # a reminder about an issue is moot once it is closed: dropped unsent (`--keep-if-closed` opts out)
+    warning = None
+    if number is not None and repo and not args.keep_if_closed:
+        try:
+            ref_state = read_ref_state(engine, repo, number, "issue")
+        except Exception:   # the warning never fails a command
+            ref_state = "open"   # unreadable: warned as open, never refused
+        if ref_state in ("closed", "merged"):
+            sys.stderr.write("%s: %s#%d is already closed; a reminder about a closed issue is dropped when it is due. "
+                             "Use --keep-if-closed to keep it\n" % (PROG, repo, number))
+            return EXIT_USAGE
+        warning = ("%s: reminder is dropped if it closes (%s#%d closes or its pull request merges), with one notice to you; "
+                   "use --keep-if-closed to keep it\n" % (PROG, repo, number))
     item = add_reminder(state, args.name, parse_when(args.when, moment), moment,
                         " ".join(args.text).strip(), number, sender, repo, condition=condition or None)
     engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),
                                                           "from": sender, "issue": number, "repo": repo})
     print(item["id"])
     sys.stderr.write("%s: reminder for %s %s (now %s)\n" % (PROG, args.name, _print_when(item["at"], moment), _print_when_now(moment)))
+    if warning:
+        sys.stderr.write(warning)
     return EXIT_OK
 
 
 cmd_remind.ensure_on_use = True   # the daemon is alive when it runs
+
+
+def add_budget_notice_parsers(sub):
+    notice = sub.add_parser("budget-notice", help="Tell the orchestrator of the top spender that a GitHub account is low on budget (the gh shim runs this; at most once an hour per account)",
+                            description="`budget-notice --account NAME`: when the account's fresh reading is below the low-budget line, names the agent that made the most agent-shell "
+                                        "GitHub calls in the last hour to that agent's orchestrator (the Chief of Staff when it has none), in one message, at most once an hour per account. "
+                                        "It takes only the account's name: the budget, the ranking and the text all come from the daemon's own records, so a call to it cannot invent "
+                                        "a message. There is no per-agent cap: the shim only makes that agent's reads that are not answered from the cache wait a few seconds while the "
+                                        "account is low.")
+    notice.add_argument("--account", required=True, help="The gh account's name as `status` shows it")
+
+
+def cmd_budget_notice(args, runner, now):
+    """One message, only when the account is low, only once an hour per account, to the orchestrator of the top spender. Exit 0 whether or not a message went: the shim
+    never waits on the answer, and a quiet account is not an error."""
+    calls = load_module("agent_calls")
+    state = ensure_state_dir()
+    account = args.account
+    moment = now()
+    low = calls.low_budget(str(state), account, moment)
+    top = calls.top_spender(str(state), account, moment) if low is not None else None
+    if low is None or top is None:
+        print("no message: %s is not below the low-budget line, or nobody spent on it in the last hour" % _one_line(account, 40))
+        return EXIT_OK
+    engine, state, _config = build_engine(runner, now, "cli")
+    discovery = engine.discover(moment)
+    if discovery is None or discovery.problems:
+        print("no message: the agent list cannot be read")   # nothing was claimed: the next call tries again
+        return EXIT_OK
+    seen = discovery.agents.get(top[0])
+    boss = boss_name(discovery, seen) if seen is not None else None
+    chiefs = chiefs_of_staff(discovery)
+    to = boss if boss in discovery.agents else (chiefs[0] if len(chiefs) == 1 else None)
+    if to is None:
+        print("no message: %s has no orchestrator or Chief of Staff to tell" % top[0])
+        return EXIT_OK
+    if not calls.claim_notice(str(state), account, moment):
+        print("no message: one already went for this account in the last hour")
+        return EXIT_OK
+    text = calls.notice_text(_one_line(account, 40), low[0], low[1], top[0], top[1], top[2])
+    try:
+        item = add_reminder(state, to, moment, moment, text)
+    except Exception:
+        calls.release_notice(str(state), account)   # the hour was claimed and no message was made: give it back
+        raise
+    engine.audit.append("cli", "budget.notice", to, {"account": _one_line(account, 40), "agent": top[0], "id": item["id"]})
+    print("told %s about %s" % (to, top[0]))
+    return EXIT_OK
+
+
+cmd_budget_notice.direct = True   # run by the gh shim: no daemon start, no error mapping
 
 
 # ======================================================= GitHub events (PR 5)
@@ -19564,7 +19671,52 @@ def cmd_send(args, runner, now):
 cmd_send.ensure_on_use = True   # the daemon is alive when it runs
 
 
+def _send_by_registry(args, runner, now):
+    """#1131: an agent with no pane goes to its registry endpoint (cloud channel); None means the old path serves it (a pane, or a name the registry does not hold)."""
+    es = load_module("endpoint_send")
+    found = es.route(load_module("registry"), state_dir_path(), args.name)
+    if found[0] in ("pane", "none"):
+        return None
+    if found[0] == "half":
+        if not found[2]:
+            return None   # the recipient is not known to be an endpoint row: the old path serves a pane agent, or finds nothing
+        sys.stderr.write("%s: not sent: %s\n" % (PROG, found[1]))
+        return EXIT_HELD
+    engine, _, config = build_engine(runner, now, "cli")
+    refusal = intent_refusal(config, args.issue)
+    if refusal:
+        sys.stderr.write("%s: %s\n" % (PROG, refusal))
+        return EXIT_USAGE
+    if args.interrupt:
+        sys.stderr.write("%s: --interrupt is not supported on an endpoint route: nothing sent\n" % PROG)
+        return EXIT_USAGE
+    if args.sender is not None:
+        if os.environ.get(LAB_ENV) != "1":
+            sys.stderr.write("%s: --from is only for the Lab (%s=1); an agent is identified by its pane\n" % (PROG, LAB_ENV))
+            return EXIT_USAGE
+        sender = args.sender
+    else:
+        sender = identify_caller(engine.herdr, engine.v2, os.environ)
+    text = " ".join(args.text).strip()
+    if not text:
+        sys.stderr.write("%s: nothing to send\n" % PROG)
+        return EXIT_USAGE
+    held = es.blocked_reason(args.name, found[2], hold_reason)
+    if held:
+        sys.stderr.write("%s: not sent to %s: hold (%s)\n" % (PROG, args.name, held))
+        return EXIT_HELD
+    ok, line = es.deliver(load_module("cloud_client"), found[1], sender, args.name, text)
+    if not ok:
+        sys.stderr.write("%s: not sent to %s: %s\n" % (PROG, args.name, line))
+        return EXIT_HELD
+    sys.stderr.write("%s: delivered to %s\n" % (PROG, args.name))
+    return EXIT_OK
+
+
 def _cmd_send(args, runner, now):
+    routed = _send_by_registry(args, runner, now)
+    if routed is not None:
+        return routed
     remote = run_cloud("route", args.name)   # a cloud worker has an endpoint record (#371)
     if remote is not None:
         return run_cloud("cmd_send", args, runner, now, remote)
@@ -22897,6 +23049,24 @@ def impact_matrix_words(for_rater=None):
             "floor_rules": dict((score.get("floor") or {}).get("rules") or {}), "lowest_floor_level": (score.get("floor") or {}).get("lowest_level"), "for_rater": for_rater}
 
 
+def impact_matrix_lines(words):
+    """The text `impact matrix` prints, as lines (also written into a review checkout, #1047, so a reviewer subagent in its own worktree can read the matrix without a command)."""
+    for_rater = words.get("for_rater")
+    out = ["impact matrix (the kit's matrix file; read-only)", "severities: %s" % ", ".join(words["severities"]), "probabilities: %s" % ", ".join(words["probabilities"])]
+    for severity in words["severities"]:
+        for probability, cell in words["cells"][severity].items():
+            out.append("cell %s / %s: level %s, action %s" % (severity, probability, cell["level"], cell["action"]))
+    for rule_id, cls in sorted(words["floor_rules"].items()):
+        out.append("floor rule %s: class %s" % (rule_id, cls))
+    if for_rater is not None:
+        out.append("floor report for %s at %s: %s" % (for_rater["pr"], (for_rater["head"] or "unknown head")[:8], "complete" if for_rater["complete"] else "INCOMPLETE file list"))
+        for rule_id, paths in for_rater["floor_hits"].items():
+            out.append("floor hit %s: %s" % (rule_id, ", ".join(paths)))
+        if not for_rater["floor_hits"]:
+            out.append("floor hit: none")
+    return out
+
+
 def cmd_impact_matrix(args, runner, now):
     """`impact matrix [--for-rater <pr>] [--json]`: print the matrix file's severities, probabilities, cells (level and action) and floor rule ids; with `--for-rater` also that pull request's floor report
     (each floor rule id the changed paths hit, and the paths): the SAME `pr_floor_report` `impact floor` prints. Read-only: no ledger, state or audit write. Works with no review laws in the repository."""
@@ -22918,20 +23088,7 @@ def cmd_impact_matrix(args, runner, now):
     if args.json:
         print(json.dumps(words, sort_keys=True))
         return EXIT_OK
-    print("impact matrix (the kit's matrix file; read-only)")
-    print("severities: %s" % ", ".join(words["severities"]))
-    print("probabilities: %s" % ", ".join(words["probabilities"]))
-    for severity in words["severities"]:
-        for probability, cell in words["cells"][severity].items():
-            print("cell %s / %s: level %s, action %s" % (severity, probability, cell["level"], cell["action"]))
-    for rule_id, cls in sorted(words["floor_rules"].items()):
-        print("floor rule %s: class %s" % (rule_id, cls))
-    if for_rater is not None:
-        print("floor report for %s at %s: %s" % (for_rater["pr"], (for_rater["head"] or "unknown head")[:8], "complete" if for_rater["complete"] else "INCOMPLETE file list"))
-        for rule_id, paths in for_rater["floor_hits"].items():
-            print("floor hit %s: %s" % (rule_id, ", ".join(paths)))
-        if not for_rater["floor_hits"]:
-            print("floor hit: none")
+    print("\n".join(impact_matrix_lines(words)))
     return EXIT_OK
 
 
@@ -24470,7 +24627,7 @@ def pr_state_view(ref, body, entries, now, ledger_ref=None, ledger_problem=None)
         for reviewer in plan_ledger.REVIEWERS_NOW:
             found = [e for e in entries if e.get("kind") == "review_record" and e.get("pr") == (ledger_ref or ref) and e.get("head") == entry.get("head") and e.get("reviewer") == reviewer]
             if found:
-                reviews.append({"reviewer": reviewer, "verdict": _text(found[-1].get("verdict"), 20), "head": head})
+                reviews.append(dict({"reviewer": reviewer, "verdict": _text(found[-1].get("verdict"), 20), "head": head}, **({"uncited": True} if found[-1].get("uncited") is True else {})))
     stale_head = bool(examined and head and examined != head)   # what was examined belongs to another head: it is not shown as this head's
     checks = None
     if isinstance(entry.get("checks"), list) and not stale_head:
@@ -24524,7 +24681,7 @@ def pr_state_line(view):
     if view.get("reviews") is None:
         parts.append("reviews unknown (ledger unreadable: %s)" % _plain(view.get("reviews_problem") or "?", 100))
     else:
-        parts.append("reviews %s" % (", ".join("%s %s" % (_plain(r["reviewer"], 20), _plain(r["verdict"], 20)) for r in view["reviews"]) or "none recorded at this head"))
+        parts.append("reviews %s" % (", ".join("%s %s%s" % (_plain(r["reviewer"], 20), _plain(r["verdict"], 20), " (names no rule, does not block)" if r.get("uncited") else "") for r in view["reviews"]) or "none recorded at this head"))
     parts.append("labels %s" % (", ".join(_plain(l, 60) for l in view["labels"]) or "none"))
     parts.append("list read %ds ago" % view["age_seconds"])
     if view.get("why"):
@@ -24800,13 +24957,16 @@ REVIEW_TOTAL_MAX = 90000     # bytes of all of them together
 
 def _review_pr(args, engine):
     """(repo, number, ref, raw) of the PR in `args`, read with the PR's own account; raises ReviewError."""
+    bare = args.review_cmd == "laws" and _BARE_PR.match((args.pr or "").strip())
     try:
-        repo, number = parse_pr_ref(args.pr)
+        repo, number = parse_bare_pr_ref(args.pr) if bare else parse_pr_ref(args.pr)
     except NoticeError as err:
         raise ReviewError(str(err)) from None
     try:
-        raw = read_pr_json(engine, repo, number, "baseRefOid,baseRefName")
+        raw = read_pr_json(engine, repo, number, "baseRefOid,baseRefName,files")
     except NoticeError as err:
+        if bare and isinstance(err, NoticeNotFound):
+            err = "%s: %s does not name a pull request: pass owner/repo#N or the PR's URL" % (err, _one_line(args.pr, 40))
         raise ReviewError(str(err)) from None
     return repo, number, "%s#%d" % (repo, number), raw
 
@@ -24860,8 +25020,8 @@ def parse_review_block(text):
     if not isinstance(text, str) or not text.strip():
         return None, "no verdict block"
     lines = [l.strip() for l in text.splitlines()]
-    fields = {"verdict": None, "head": None, "impact_action": None, "impact_class": None, "impact_severity": None, "impact_probability": None, "impact_reason": None, "blocks": 0, "notes": 0, "findings": 0}
-    started = False
+    fields = {"verdict": None, "head": None, "impact_action": None, "impact_class": None, "impact_severity": None, "impact_probability": None, "impact_reason": None, "blocks": 0, "notes": 0, "findings": 0, "files_read": [], "files_problem": None}
+    started, section = False, "findings"
     for line in lines:
         if line.startswith("verdict:") and not started:
             fields["verdict"], started = line.split(":", 1)[1].strip(), True
@@ -24877,13 +25037,23 @@ def parse_review_block(text):
             fields["impact_probability"] = line.split(":", 1)[1].strip()
         elif started and line.startswith("impact-reason:"):
             fields["impact_reason"] = line.split(":", 1)[1].strip()
+        elif started and line.startswith("files-read:"):
+            section = "files"
+        elif started and line.startswith("findings:"):
+            section = "findings"
+        elif started and section == "files" and line.startswith("- "):
+            row = parse_files_read_row(line[2:]) if len(fields["files_read"]) < FILES_READ_ROWS_MAX else None
+            if row is None:
+                fields["files_problem"] = fields["files_problem"] or "a `files-read:` row is not `- <path> | <lines read> | <lines in its diff>` (numbers): %r" % line[:80]
+            else:
+                fields["files_read"].append(row)
         elif started and line.startswith("- "):
             parts = [p.strip() for p in line[2:].split("|")]
             if len(parts) >= 2 and parts[1] in ("block", "note"):
                 fields["findings"] += 1
                 if parts[1] == "block":
                     if not re.fullmatch(r"R-[A-Z]+-[0-9]+", parts[0]) and not re.fullmatch(r"[A-Za-z0-9_.-]+-[0-9]+", parts[0]):
-                        fields["notes"] += 1   # a blocking finding that cites no rule is a proposal: it never blocks (R-LAW-1)
+                        fields["notes"] += 1   # a blocking finding that cites no rule is counted as a note; the verdict itself is recorded as given and marked uncited (#1047)
                     else:
                         fields["blocks"] += 1
                 else:
@@ -24899,6 +25069,58 @@ def parse_review_block(text):
     if fields["impact_class"] is not None and not IMPACT_CLASS_RE.fullmatch(fields["impact_class"]):
         return None, "`impact-class:` must be one lower-case word naming the class of the impact (see the matrix file's classes)"
     return fields, None
+
+
+def pr_changed_paths(raw):
+    """(paths, None) of the pull request's changed files from GitHub's own list, or (None, why) when that list is not whole: the same test `pr_floor_report` makes (`changedFiles` against the files listed)."""
+    files = raw.get("files")
+    if not isinstance(files, list):
+        return None, "GitHub's list of changed files could not be read"
+    paths = [f.get("path") for f in files if isinstance(f, dict) and isinstance(f.get("path"), str)]
+    total = raw.get("changedFiles") if isinstance(raw.get("changedFiles"), int) else len(paths)
+    if len(paths) < total or raw.get("truncated"):
+        return None, "GitHub listed %d of %d changed files" % (len(paths), total)
+    return paths, None
+
+
+def parse_files_read_row(text):
+    """(path, lines read, lines in its diff) from `<path> | <lines read> | <lines in its diff>`, or None when it is not that shape."""
+    parts = [p.strip() for p in text.rsplit("|", 2)]
+    if len(parts) != 3 or not parts[0] or not parts[1].isdigit() or not parts[2].isdigit() or len(parts[1]) > 9 or len(parts[2]) > 9:
+        return None
+    return parts[0], int(parts[1]), int(parts[2])
+
+
+FILES_READ_ROWS_MAX = 5000   # the most `files-read:` rows a block may list (the checkout's own file limit)
+RATER_CHUNK_LINES = 200   # #1047: the ONE chunk size (diff lines) a rater reads at a time, under the ~280 lines where recorded reads were cut; the agent definition and the refusal text render it from here
+
+
+def pr_changed_bounds(raw):
+    """{path: additions + deletions} from GitHub's own per-file list: a diff has at least that many lines, so no honest count of one is lower (a file with no counts, or none given, is 0)."""
+    out = {}
+    for f in raw.get("files") or []:
+        if isinstance(f, dict) and isinstance(f.get("path"), str):
+            out[f["path"]] = sum(f[k] for k in ("additions", "deletions") if isinstance(f.get(k), int) and not isinstance(f.get(k), bool) and f[k] > 0)
+    return out
+
+
+def whole_read_problem(files_read, listed, bounds=None):
+    """Why a rater's files-read rows are not a whole read of the pull request's changed files `listed` (GitHub's list: paths), or None. Names the missing files and the first unread line.
+    `bounds` ({path: additions + deletions} from GitHub's list) is the least a diff can hold: a row whose total or lines read is below it is refused, whatever the rater's own total says."""
+    rows = {}
+    for path, read, total in files_read:
+        rows[path] = (max(read, rows[path][0]) if path in rows else read, max(total, rows[path][1]) if path in rows else total)
+    missing = [p for p in listed if p not in rows]
+    if missing:
+        return "the files-read list is shorter than the pull request's changed files: not read: %s (first unread line: 1 of each)" % ", ".join(_printable_path(p) for p in missing[:10])
+    for path in listed:
+        read, total = rows[path]
+        bound = (bounds or {}).get(path, 0)
+        if total < bound or read < bound:
+            return "%s: the row says %d lines read of %d in its diff, but GitHub counts %d added and deleted lines, so its diff has at least %d (the bound): read it again to its last line and count them" % (_printable_path(path), read, total, bound, bound)
+        if read < total:
+            return "%s was read to line %d of %d: the first unread line is line %d (chunks of %d lines; read every file to its last line)" % (_printable_path(path), read, total, read + 1, RATER_CHUNK_LINES)
+    return None
 
 
 IMPACT_CLASS_RE = re.compile(r"[a-z][a-z-]{0,31}")
@@ -24988,8 +25210,10 @@ def cmd_review(args, runner, now):
                 if entry.get("kind") == "review_record" and entry.get("pr") == ref and entry.get("head") == at:
                     latest[entry.get("reviewer")] = entry
             for reviewer, entry in sorted(latest.items()):
-                if entry.get("verdict") == "request-changes":
+                if plan_ledger.review_blocks(entry):
                     print("%s recorded request-changes (%s blocking finding(s)) at %s" % (reviewer, entry.get("blocks"), (at or "")[:8]))
+                elif entry.get("verdict") == "request-changes":
+                    print("%s recorded request-changes at %s: it names no rule and does not block (not a blocker)" % (reviewer, (at or "")[:8]))
             return EXIT_OK
         if args.review_cmd == "laws":
             base = raw.get("baseRefOid")
@@ -25010,7 +25234,7 @@ def cmd_review(args, runner, now):
         given = rating_inputs(getattr(args, "raw_argv", ()))   # #835: the rating's inputs come from the raw argv through a private parser, never from the shared namespace (a registrar's set_defaults, a replaced parser or a wrapper cannot reach them); a missing raw argv gives no rating
         action, klass = given.get("impact_action"), given.get("impact_class")
         rating_in = {name: given.get(name) for name in IMPACT_RATING_FIELDS}
-        block_digest, block_fields = None, {}
+        block_digest, block_fields, block_rows, block_problem = None, {}, None, None
         if given.get("block") is not None:   # the reviewer's returned text: the coder session records it
             carried = {"verdict": verdict, "head": args.head, "blocks": args.blocks, "notes": args.notes, "impact_action": action}
             if any(carried[dest] for flag, dest, mode in BLOCK_FLAG_TABLE if mode == "refused"):
@@ -25022,6 +25246,7 @@ def cmd_review(args, runner, now):
             block_raw = block_text.encode("utf-8")
             block_digest, block_fields = (hashlib.sha256(block_raw).hexdigest(), len(block_raw)), {name: fields[name] for name in IMPACT_RATING_FIELDS}
             verdict, args.head, args.blocks, args.notes, action = (fields["verdict"], fields["head"], fields["blocks"], fields["notes"], fields["impact_action"])
+            block_rows, block_problem = fields["files_read"], fields["files_problem"]
             klass = klass or fields["impact_class"]
             for name in IMPACT_RATING_FIELDS:   # the rating's severity and probability (the score is derived from the matrix's cell), and the reason that names a floor rule
                 if rating_in[name] is None:
@@ -25033,8 +25258,7 @@ def cmd_review(args, runner, now):
                 raise ReviewError("--%s must be a number from 0 to 200" % name)
         if verdict == "approve" and args.blocks:
             raise ReviewError("an approve cannot carry blocking findings (%d given)" % args.blocks)
-        if verdict == "request-changes" and not args.blocks:
-            raise ReviewError("request-changes needs at least 1 blocking finding (a finding that cites no rule never blocks)")
+        uncited = verdict == "request-changes" and not args.blocks   # #1047: a verdict is recorded exactly as given; one that cites no rule is MARKED, never refused or softened
         if confirms and verdict != "approve":
             raise ReviewError("--confirms-carry belongs to an approve: a reviewer who found a change to the pull request's own lines does not confirm it")
         if action and reviewer != "impact":
@@ -25071,7 +25295,19 @@ def cmd_review(args, runner, now):
             raise ReviewError("the PR head is unknown: nothing was recorded")
         given = args.head or head
         if not (head.startswith(given) or given.startswith(head)) or len(given) < 7:
-            raise ReviewError("--head %s is not the PR's head (%s): a record belongs to the head it judged, nothing was recorded" % (given[:12], head[:12]))
+            raise ReviewError("the head given (%s) is not the PR's head (%s): a record belongs to the head it judged, nothing was recorded" % (given[:40], head))
+        files_count = None
+        if reviewer == "impact" and block_digest:   # #1047: a rating is recorded only from a whole read, checked against GitHub's own list of changed files (never the block's)
+            if block_problem and verdict != "incomplete":
+                raise ReviewError("refused: %s (nothing was recorded)" % block_problem)
+            listed, listed_problem = pr_changed_paths(raw)
+            if verdict != "incomplete":   # fails toward refusal: a list GitHub did not give whole is never replaced by the block's own
+                if listed is None:
+                    raise ReviewError("refused: %s, so the read cannot be checked (nothing was recorded)" % listed_problem)
+                why_short = whole_read_problem(block_rows, listed, pr_changed_bounds(raw))
+                if why_short:
+                    raise ReviewError("refused: %s (nothing was recorded; record `verdict: incomplete` if you could not read it all)" % why_short)
+            files_count = (len({r[0] for r in block_rows}), len(listed) if listed is not None else None)
         kind = gates_caller_kind(runner, now)
         if kind[0] == "unknown":
             raise ReviewError("refused: %s" % kind[1])
@@ -25079,6 +25315,10 @@ def cmd_review(args, runner, now):
         entry = {"kind": "review_record", "pr": ref, "head": head, "reviewer": reviewer, "verdict": verdict,
                  "blocks": args.blocks, "notes": args.notes, "by": by,
                  "summary": plan_ledger.clip(redact_command_text(args.summary or ""), 200)}
+        if uncited:
+            entry["uncited"] = True   # #1047: the verdict word is the reviewer's own; this only says no finding named a rule
+        if files_count is not None:
+            entry["files_read"], entry["files_total"] = files_count
         if confirms:
             entry["carry_confirmed"] = True   # (#815) read by `impact_hold.carry_confirmer`: only a reviewer's own record at the head it judged
         if action:
@@ -25106,6 +25346,8 @@ def cmd_review(args, runner, now):
         print("recorded %s review %s at %s (%s): %d of %d reviewers recorded at this head%s" % (
             reviewer, verdict, head[:8], ref, len(got["recorded"]), len(got["expected"]),
             "; missing %s" % ", ".join(got["missing"]) if got["missing"] else ""))
+        if entry.get("uncited"):
+            print("note: this request-changes names no rule: it is recorded as given, marked uncited, and does not block")
         if reviewer == "impact" and not (entry.get("impact_severity") and entry.get("impact_probability")):
             sys.stderr.write("%s: review: %s\n" % (PROG, NO_SCORE_TEXT))
         return EXIT_OK
@@ -25154,7 +25396,12 @@ def cmd_review_checkout(args, runner, now):
                 raise rc.Problem("tarball: %s" % _one_line(str(err), 160)) from None
 
         try:
-            path = rc.checkout(api, repo, number, head, base, os.getcwd(), archive=archive, notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
+            try:
+                matrix_text = "\n".join(impact_matrix_lines(impact_matrix_words())) + "\n"   # #1047: the matrix's words, from the file the clear reads, written beside the diff
+            except impact_floor.MatrixError as err:
+                matrix_text = None
+                sys.stderr.write("%s: review checkout: the impact matrix cannot be read, so impact-matrix.txt is not written to the checkout: %s\n" % (PROG, _one_line(str(err), 160)))
+            path = rc.checkout(api, repo, number, head, base, os.getcwd(), extra_files=({rc.MATRIX_FILE: matrix_text} if matrix_text else None), archive=archive, notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
         except rc.OverBound as err:
             sys.stderr.write("%s: review checkout: refused, nothing left behind: %s\n" % (PROG, _one_line(str(err), 400)))
             return EXIT_USAGE
@@ -25309,7 +25556,7 @@ def add_review_parsers(sub):
     review = sub.add_parser("review", help="Reviewer subagents (#179): print the laws from the PR's base commit, record a reviewer's result")
     rsub = review.add_subparsers(dest="review_cmd", required=True)
     laws = rsub.add_parser("laws", help="Print the repository's review laws and overlay as they stand at the PR's BASE commit")
-    laws.add_argument("pr", help="owner/repo#N or the PR's URL")
+    laws.add_argument("pr", help="1234, #1234 (the working directory's remote), owner/repo#N or the PR's URL")
     blockers = rsub.add_parser("blockers", help="Read-only: the reviewers whose LATEST recorded result at the PR's head is request-changes (one line each)")
     blockers.add_argument("pr", help="owner/repo#N or the PR's URL")
     blockers.add_argument("--head", help="The commit to look at (default: the PR's head)")
@@ -26420,6 +26667,8 @@ def heavy_stop_reporter(module, config, make_engine, actor):
     def on_stop(phase, info, holder, lane):
         if phase == "decided":
             module.record_stop(info, holder, audit, sys.stderr.write)
+        elif phase == "lost":   # a waiter died in the line: one audit line, no message (nobody is running)
+            module.record_lost(info, audit, sys.stderr.write)
         else:
             module.tell_lane(info, holder, lane, send, audit, module.ceiling_table(config)["max"], sys.stderr.write)
     return on_stop
@@ -26950,7 +27199,19 @@ def add_agents_parsers(sub):
 JOB_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 JOB_DEAD = "job.dead"
 JOBS_DIR_ENV = "FLEET_JOBS_DIR"
-JOB_WRAPPER = 'exit_path=$1; shift; "$@"; code=$?; printf "%s\\n" "$code" > "$exit_path.tmp" && mv "$exit_path.tmp" "$exit_path"'
+# The wrapper runs the command in the background and waits, so that a signal it can catch (TERM, HUP, INT) is handled at once: it writes the reason ("signal N") and the
+# exit code 128+N, passes the stop on to the command (INT as TERM: a background command ignores INT) and, only once the command is gone, ends (a command that outlives the stop keeps the job alive: the record is never false). A signal that cannot be caught leaves neither file: the daemon says "unknown".
+JOB_WRAPPER = ('exit_path=$1; shift; '
+               'finish() { printf "%s\\n" "$1" > "$exit_path.tmp" && mv "$exit_path.tmp" "$exit_path"; }; '
+               'caught() { printf "signal %s\\n" "$1" > "$exit_path.reason"; kill -"${2:-$1}" "$child" 2>/dev/null; wait "$child"; finish "$((128 + $1))"; exit "$((128 + $1))"; }; '
+               'trap "caught 15" TERM; trap "caught 1" HUP; trap "caught 2 15" INT; '
+               'missing() { printf "fleet-job: %s: %s\\n" "$1" "$2" >&2; finish "$3"; exit "$3"; }; '
+               'case "$1" in */*) [ -e "$1" ] || missing "$1" "No such file or directory" 127; { [ -x "$1" ] && [ ! -d "$1" ]; } || missing "$1" "Permission denied" 126;; '
+               '*) command -v "$1" >/dev/null 2>&1 || missing "$1" "command not found" 127;; esac; '
+               'exec 3>&2 2>/dev/null; "$@" 2>&3 3>&- & child=$!; wait "$child"; code=$?; finish "$code"; exit "$code"')
+JOB_ENDED_MARK = "ended-recorded"   # in the job's directory: the one audit line of how it ended is written once
+JOB_LAST_SEEN_MAX = 160
+JOB_TAIL_BYTES = 4096
 
 
 JOB_SCAN_MAX = 200   # the most job directories one daemon pass looks at
@@ -26999,7 +27260,7 @@ def job_write_atomic(path, text):
 
 def job_paths(name, root=None):
     base = Path(root or jobs_dir()) / name
-    return {"dir": base, "record": base / "job.json", "log": base / "out.log", "exit": base / "exit", "collected": base / "collected"}
+    return {"dir": base, "record": base / "job.json", "log": base / "out.log", "exit": base / "exit", "collected": base / "collected", "reason": base / "exit.reason", "marker": base / JOB_ENDED_MARK}
 
 
 def job_process_token(pid):
@@ -27047,6 +27308,88 @@ def job_state(record, root=None):
     return "alive", None
 
 
+def boot_time():
+    """When the machine last started, in epoch seconds, or None when it cannot be read (Linux /proc/stat, else the BSD/macOS `sysctl kern.boottime`)."""
+    try:
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        done = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL)
+        found = re.search(r"sec\s*=\s*([0-9]+)", done.stdout or "")
+        return float(found.group(1)) if done.returncode == 0 and found else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def job_last_seen(record, root, now):
+    """(the last non-empty line the job printed, how many seconds ago) with control characters turned into spaces and the line bounded; ("", None) when it printed nothing
+    or the log cannot be read. A log line is untrusted text."""
+    path = job_paths(record["name"], root)["log"]
+    try:
+        with open(str(path), "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            handle.seek(max(0, size - JOB_TAIL_BYTES))
+            tail = handle.read(JOB_TAIL_BYTES).decode("utf-8", "replace")
+            age = max(0, int(now - os.fstat(handle.fileno()).st_mtime))
+    except OSError:
+        return "", None
+    lines = [line for line in re.split(r"[\r\n]+", tail) if line.strip()]
+    return (_plain(lines[-1], JOB_LAST_SEEN_MAX).strip() if lines else ""), (age if lines else None)
+
+
+def job_end_reason(record, root, now, boot=None):
+    """How a job that ended without finishing normally ended, as the audit line tells it, or None when it is alive, unknown or finished without a signal. The reason is
+    what can be told: "signal N" (the wrapper caught it and wrote it), "host rebooted" (the machine started after the job did), else "unknown" (an uncatchable signal;
+    its sender cannot be known). Never the command's arguments or environment."""
+    state, code = job_state(record, root)
+    paths = job_paths(record["name"], root)
+    started = float(record.get("started") or 0)
+    if state == "finished":
+        try:
+            said = _plain(paths["reason"].read_text().strip(), 40)
+        except OSError:
+            return None
+        if not re.fullmatch(r"signal [0-9]{1,3}", said):
+            return None
+        reason = said
+    elif state == "dead":
+        booted = (boot or boot_time)()
+        reason = "host rebooted" if booted is not None and started and booted > started else "unknown"
+    else:
+        return None
+    seen, age = job_last_seen(record, root, now)
+    detail = {"reason": reason, "age_seconds": max(0, int(now - started)), "last_seen": seen, "last_seen_age_seconds": age, "source": "job"}
+    if code is not None:
+        detail["exit_code"] = code
+    return detail
+
+
+def job_record_end(record, root, now, audit, boot=None):
+    """The ONE audit line `job.dead` of a job that ended without finishing normally, with its reason and last-seen line; a marker file in the job's directory makes it once
+    whoever looks first (the daemon or `job status`). True when this call wrote it. A sink that fails never raises."""
+    paths = job_paths(record["name"], root)
+    detail = job_end_reason(record, root, now, boot)
+    if detail is None:
+        return False
+    try:
+        fd = os.open(str(paths["marker"]), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.close(fd)
+    except OSError:
+        return False   # another look wrote it, or the directory is not writable
+    try:
+        audit(JOB_DEAD, record["name"], detail)
+    except Exception as err:
+        try:
+            paths["marker"].unlink()   # nothing was written: the next look tries again
+        except OSError:
+            pass
+        sys.stderr.write("%s: job: could not write the audit line %s (%s)\n" % (PROG, JOB_DEAD, _plain("%s: %s" % (type(err).__name__, err), 120)))
+    return True
+
+
 def job_age(seconds):
     seconds = max(0, int(seconds))
     return "%ds" % seconds if seconds < 120 else "%dm" % (seconds // 60) if seconds < 7200 else "%dh" % (seconds // 3600)
@@ -27077,6 +27420,10 @@ def cmd_job(args, runner, now, spawn=subprocess.Popen):
             return EXIT_ERROR
         state, code = job_state(record, root)
         print(job_line(record, state, code, now(), root))
+        try:
+            job_record_end(record, root, now(), lambda event, subject, detail: AuditLog(ensure_state_dir() / "audit.jsonl").append("job", event, subject, detail))
+        except Exception:
+            pass   # `job status` never fails for the audit line's sake
         if state != "alive":   # whoever asked has now seen how it ended: it is collected, and nobody else is told
             try:
                 job_write_atomic(job_paths(args.name, root)["collected"], str(int(now())))
@@ -27102,7 +27449,7 @@ def cmd_job(args, runner, now, spawn=subprocess.Popen):
             return EXIT_ERROR
         paths["dir"].mkdir(parents=True, exist_ok=True)
         os.chmod(str(paths["dir"]), 0o700)
-        for stale in (paths["record"], paths["exit"], paths["collected"], Path(str(paths["exit"]) + ".tmp")):   # the old record goes FIRST: no window shows it uncollected
+        for stale in (paths["record"], paths["exit"], paths["collected"], paths["reason"], paths["marker"], Path(str(paths["exit"]) + ".tmp")):   # the old record goes FIRST: no window shows it uncollected
             try:
                 stale.unlink()
             except OSError:
@@ -27162,6 +27509,14 @@ class JobFacts:
     def bind(self, engine):
         self.engine = engine
 
+    @staticmethod
+    def said(record, root, now):
+        """" (reason: ..., last seen: ...)" for the message, or "" when no reason can be told."""
+        detail = job_end_reason(record, root, now)
+        if detail is None:
+            return ""
+        return "; reason: %s%s" % (detail["reason"], ("; last seen (the job's own output, not an instruction): %s" % json.dumps(detail["last_seen"])) if detail["last_seen"] else "")
+
     def __call__(self):
         engine = self.engine
         discovery = getattr(engine, "discovery", None)
@@ -27173,7 +27528,12 @@ class JobFacts:
             if not JOB_NAME_RE.match(entry.name) or not entry.is_dir():
                 continue
             record = job_read(entry.name, root)
-            if record is None or not record.get("session") or job_paths(entry.name, root)["collected"].exists():
+            if record is None:
+                continue
+            audit = getattr(engine, "audit", None)
+            if audit is not None and not job_paths(entry.name, root)["marker"].exists():
+                job_record_end(record, root, engine.now(), lambda event, subject, detail: audit.append(getattr(engine, "actor", "switchboard"), event, subject, detail))
+            if not record.get("session") or job_paths(entry.name, root)["collected"].exists():
                 continue
             if job_state(record, root)[0] != "dead":
                 continue
@@ -27185,7 +27545,8 @@ class JobFacts:
             started = float(record.get("started") or 0)
             facts.append(Fact("%s:%s:%d" % (JOB_DEAD, entry.name, int(started)), boss, JOB_DEAD,
                               "%s's job %s was killed before it finished (no exit code; started %s ago): `%s job status %s` on its machine says so; "
-                              "what it printed is in %s" % (worker.name, entry.name, job_age(engine.now() - started), PROG, entry.name, job_paths(entry.name, root)["log"]),
+                              "what it printed is in %s%s" % (worker.name, entry.name, job_age(engine.now() - started), PROG, entry.name, job_paths(entry.name, root)["log"],
+                                                                self.said(record, root, engine.now())),
                               started or engine.now(), batch=False, sender="switchboard"))
         return facts
 
@@ -30240,35 +30601,92 @@ def charter_set_refusal(caller, role):
     """The refusal text, or None: only the Chief of Staff or the operator (a plain shell: `caller` None) writes a charter; an agent never writes its own or another's (#969)."""
     if caller is None or role == "chief-of-staff":
         return None
-    return "only the chief-of-staff or the operator sets a charter; %s is %s" % (caller, "a %s" % role if role and role != "unidentified" else "not identified as either")
+    return "only the chief-of-staff or the operator sets a charter; %s is %s" % (charter_safe(caller), "a %s" % charter_safe(role) if role and role != "unidentified" else "not identified as either")
+
+
+def charter_safe(text):
+    """A given value escaped for every sink (audit, stderr, stdout, registry): at most 40 characters of letters, digits and _ . # - (anything else, a newline or markup included, becomes ?)."""
+    return re.sub(r"[^A-Za-z0-9_.#-]", "?", str(text)[:40])
+
+
+def charter_from_refusal(args):
+    """The refusal text, or None: `charter set` never takes `--from` (a named caller), in the Lab or out of it: the caller is always the pane's own agent (#1143)."""
+    if getattr(args, "sender", None) is not None:
+        return "--from is not accepted by charter set; the caller is identified by its pane"
+    return None
 
 
 def cmd_charter(args, runner, now):
     """`charter set <orchestrator> <issue number | none>`: write the orchestrator's registry `charter`, the one record of it (#969). Audited with who, the old and the new value. The live session's metadata
     (written once at launch, never correctable) is not touched and is never read as a second owner."""
     engine, _, _ = build_engine(runner, now, "cli")
+    from_refusal = charter_from_refusal(args)
+    if from_refusal:
+        engine.audit.append(engine.actor, "charter.refused", "agent:%s" % charter_safe(args.name), {"why": "from", "orchestrator": charter_safe(args.name), "caller": "unknown"})
+        sys.stderr.write("%s: charter: %s; nothing was changed\n" % (PROG, from_refusal))
+        return EXIT_USAGE
     caller, role = move_caller(engine, args, runner, now)
-    audit = lambda event, **detail: engine.audit.append(engine.actor, event, "agent:%s" % args.name, dict(detail, caller=caller or "operator", orchestrator=args.name))
+    audit = lambda event, **detail: engine.audit.append(engine.actor, event, "agent:%s" % charter_safe(args.name), dict(detail, caller=charter_safe(caller or "operator"), orchestrator=charter_safe(args.name)))
     refusal = charter_set_refusal(caller, role)
     if refusal:
         audit("charter.refused", why="caller", role=role)
         sys.stderr.write("%s: charter: %s; nothing was changed\n" % (PROG, refusal))
         return EXIT_ERROR
+    safe = charter_safe   # every given value is escaped before any sink (audit, stderr, stdout, registry)
+    if not NAME_RE.match(args.name or ""):
+        audit("charter.refused", why="lane", given=safe(args.name))
+        sys.stderr.write("%s: charter: the lane %r is not a valid agent name; nothing was changed\n" % (PROG, safe(args.name)))
+        return EXIT_USAGE
     raw = (args.charter or "").strip().lower().lstrip("#")
-    value = None if raw == "none" else (int(raw) if raw.isdigit() and int(raw) > 0 else False)
+    value = None if raw == "none" else (int(raw) if re.fullmatch(r"[0-9]{1,9}", raw) and int(raw) > 0 else False)
     if value is False:
-        audit("charter.refused", why="value", given=_one_line(args.charter or "", 40))
-        sys.stderr.write("%s: charter: give an issue number or `none`; nothing was changed\n" % PROG)
+        audit("charter.refused", why="value", given=safe(args.charter or ""))
+        sys.stderr.write("%s: charter: give a positive issue number or `none`, not %r; nothing was changed\n" % (PROG, safe(args.charter or "")))
         return EXIT_USAGE
     registry = load_module("registry")
-    before = registry.read(engine.state_dir)["agents"].get(args.name)
-    got = registry.set_charter(engine.state_dir, args.name, value, caller or "operator", now=now())
+    replace = bool(getattr(args, "replace", False))
+    caller_name = safe(caller or "operator")
+    decided = {}
+    pre = {}
+    row0 = registry.read(engine.state_dir)["agents"].get(args.name)
+    if value is not None and isinstance(row0, dict):   # #1143: the GitHub reads happen BEFORE the registry lock, bound to the issue number and the repo; the lock only re-checks registry facts
+        repo0 = row0.get("repo") or (engine.config.get("intent_repo") if engine.config else None)
+        try:
+            parent = engine.intents.parent(value, repo0)
+            root = engine.intents.parent(parent, repo0) if parent is not None else None
+            pre = {"key": (value, repo0), "parent": parent, "root": root}
+        except Exception as err:
+            pre = {"key": (value, repo0), "error": safe(_one_line(str(err), 80))}
+
+    def guard(doc, row):
+        """The registry facts, judged by the registry INSIDE its one lock with the write that follows (no check-then-act gap); no GitHub read here."""
+        old = row.get("charter")
+        decided["old"] = old
+        if old is not None and old != value and not replace:
+            return ("--replace", "%s already has charter #%s; changing it needs --replace" % (args.name, old))
+        if value is not None and old != value:
+            repo = row.get("repo") or (engine.config.get("intent_repo") if engine.config else None)
+            holders = sorted(n for n, other in doc["agents"].items() if n != args.name and n not in doc["retired"] and other.get("role") == "orchestrator" and other.get("charter") == value and (other.get("repo") or repo) == repo)
+            if holders:
+                return ("already held by", "charter #%d is already held by %s" % (value, ", ".join(holders)))
+            if pre.get("key") != (value, repo):
+                return ("unverified", "cannot read #%d's parent (the repository changed)" % value)
+            if "error" in pre:
+                return ("unverified", "cannot read #%d's parent (%s)" % (value, pre["error"]))
+            if pre["parent"] is None or pre["root"] is not None:
+                return ("not a sub-issue", "#%d is not a sub-issue of the repository's root issue" % value)
+        return None
+    got = registry.set_charter(engine.state_dir, args.name, value, caller_name, now=now(), check=guard)
+    old = decided.get("old")
     if got["problem"]:
-        audit("charter.refused", why=_one_line(got["problem"], 120))
-        sys.stderr.write("%s: charter: %s; nothing was changed\n" % (PROG, got["problem"]))
+        why = got.get("why") or "unknown"
+        audit("charter.refused", why=why, old=old, new=value)
+        sys.stderr.write("%s: charter: %s; nothing was changed\n" % (PROG, _one_line(got["problem"], 200)))
         return EXIT_USAGE
-    audit("charter.set", old=(before or {}).get("charter"), new=value, changed=got["changed"])
-    print("charter of %s: %s -> %s%s" % (args.name, (before or {}).get("charter"), value, "" if got["changed"] else " (unchanged)"))
+    audit("charter.set", old=old, new=value, changed=got["changed"], replace=replace)
+    print("charter of %s: %s -> %s%s" % (args.name, old, value, "" if got["changed"] else " (unchanged)"))
+    row = registry.read(engine.state_dir)["agents"].get(args.name) or {}
+    print("registry row: %s role=%s charter=%s repo=%s" % (args.name, row.get("role"), ("#%s" % row["charter"]) if row.get("charter") is not None else "none", safe(row.get("repo"))))
     return EXIT_OK
 
 
@@ -30283,6 +30701,7 @@ def add_charter_parsers(sub):
                                                 "cannot be corrected, so it is never read as a second owner. Run by the Chief of Staff or the operator; one audit line with the old and the new value.")
     setter.add_argument("name", help="The orchestrator's fleet name")
     setter.add_argument("charter", help="An issue number, or `none`")
+    setter.add_argument("--replace", action="store_true", help="Required to change a charter that is already set (a flag: it takes no value)")
     setter.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
 
 
