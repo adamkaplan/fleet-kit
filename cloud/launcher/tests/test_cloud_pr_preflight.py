@@ -4,6 +4,8 @@ import os, signal, subprocess, sys, tempfile, shutil, time, unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 SCRIPT = os.path.join(ROOT, "bin", "cloud-pr-preflight")
+sys.path.insert(0, os.path.join(ROOT, "cloud", "worker", "tests"))
+import stub_support  # noqa: E402
 PASS = "import sys\nsys.exit(0)\n"
 FAIL = "import sys\nsys.exit(1)\n"
 CHAIN = '#!/bin/sh\nEXCEPTIONS=""\n# tests/test_a.py tests/test_b.py\n'
@@ -183,7 +185,7 @@ class Signals(unittest.TestCase):
     def go(self, sig, script=SCRIPT):
         before = set(os.listdir(tempfile.gettempdir()))
         e = dict(os.environ, CLOUD_PREFLIGHT_TIMEOUT="30", CLOUD_PREFLIGHT_BASE="main")
-        p = subprocess.Popen([sys.executable, script], cwd=self.r.d, env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        p = stub_support.start(self, [sys.executable, script], cwd=self.r.d, env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(100):
             if leftovers(before):
                 break
