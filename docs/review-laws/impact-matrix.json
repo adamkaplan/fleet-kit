@@ -163,6 +163,8 @@
         "bin/orders_copy.py",
         "bin/charter_check.py",
         "bin/cloud_worker.py",
+        "bin/cloud_channel.py",
+        "bin/cloud_channel_server.py",
         "bin/external_adapter.py",
         "bin/delegated_clear.py",
         "bin/impact_hold.py",
@@ -207,6 +209,8 @@
           "bin/orders_copy.py",
           "bin/charter_check.py",
           "bin/cloud_worker.py",
+          "bin/cloud_channel.py",
+          "bin/cloud_channel_server.py",
           "bin/external_adapter.py",
           "bin/delegated_clear.py",
           "bin/impact_hold.py",
@@ -277,6 +281,7 @@
         "only"
       ],
       "exempt": {
+        "bin/agent_calls.py": "release_notice gives back a once-an-hour message claim for an account's budget notice. Trace: its only caller is the budget notice command in bin/fleet-switchboard, which calls it after claim_notice when the reminder could not be added; it truncates a rate-limit file in the state directory and returns nothing, so no role, tier, identity, verdict or clear is produced or read.",
         "bin/spotlight_guard.py": "holds_files tells whether a folder holds an entry. Trace: used only inside bin/spotlight_guard.py (the Spotlight index check of ask #438); the module returns no role, tier, identity, verdict or clear, and nothing in bin/ reads its result as one.",
         "bin/triage_digest.py": "gate is a rate limit on the stale digest (warm-up and interval). Trace: its only caller is the triage digest in bin/fleet-switchboard, where `allowed` decides whether a digest message is SENT now; no role, tier, verdict or clear is produced or read.",
         "bin/triage_plan_open.py": "merged_links reads which links a merged unit names. Trace: its callers are the triage's plan-open check in bin/fleet-switchboard, which only lists findings for people to read; nothing it returns reaches answer_authority, a caller check, a verdict or a clear."
@@ -538,7 +543,9 @@
       "closure_exempt": {
         "bin/agent_reconcile.py": "loaded only by `reconcile_agents_on_read`, called by `cmd_status`'s view reconcile, which the clear never calls",
         "bin/closed_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
+        "bin/cloud_client.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
         "bin/cloud_worker.py": "loaded only by `run_cloud` and `cmd_status`: the cloud commands, not the clear",
+        "bin/endpoint_send.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
         "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
         "bin/health_records.py": "loaded only by the health and pane pass, which the clear does not run",
         "bin/lanes.py": "loaded only by `cmd_move`: the lane command, not the clear",
