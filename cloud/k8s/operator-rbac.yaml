@@ -44,6 +44,11 @@ rules:
   - apiGroups: ["apps"]
     resources: ["statefulsets"]
     verbs: ["get", "list", "watch", "create", "delete"]
+  # A retained disk (ask 1228): the launcher gets, lists, creates and deletes volume claims in this namespace only. No patch, no watch,
+  # no wildcard, nothing cluster-wide. The pod's own account (cw-worker) gains nothing.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "create", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

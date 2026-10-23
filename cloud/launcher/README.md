@@ -293,3 +293,20 @@ A cloud pod has a role. An idle orchestrator-like session measured about 365 MB 
 
 The role is chosen by `--role` (a key of the role table; default `worker`); the orchestrator's size is chosen only by the role, never by `--shape`. The orchestrator holds no contents write and never the App key: the launcher and the reaper mint its token. Owner step for its set: the owner adds issues: write, pull_requests: read, checks: read, metadata: read to the App's permissions and accepts them on each installation.
 <!-- roles:end -->
+
+## A retained disk: session and unpushed work that survive the pod
+
+**The cause.** In short, a pod's own disk is deleted with the pod. A worker ended by an expired token or a deadline strands its unpushed work: in one recorded case two hours of work sat unpushed in a kept pod and was saved only by copying a bundle out by hand. The persistent orchestrator pod has no disk of its own (a memory-backed token volume, a scratch volume and the read-only per-run Secret), and the agent keeps its session under the data directory on memory, so its session and work tree live only as long as the pod. The pre-stop push (ask 1142) stays as the interim.
+
+**What changes.**
+
+- An orchestrator's StatefulSet gets ONE volume claim template named `data` (the claim is `data-NAME-0`, named after the workload), `ReadWriteOnce`, in the cloud namespace, mounted at `/data`. The entrypoint keeps the agent's session at `/data/session` and the work tree at `/data/work` when `CW_DISK_DIR` names a writable mount. The token volume stays memory-backed, the per-run Secret read-only; no token path is under `/data`.
+- Size and class: default 8 GiB (`DISK_DEFAULT_GIB`), at most 32 GiB (`DISK_MAX_GIB`) by `--disk SIZE`; the class is `--disk-class` and an empty value means the cluster's default class (Standard SSD, non-zonal nodes, so the claim follows the pod to any node). Price: 0.075 USD per GiB per month (`DISK_USD_PER_GIB_MONTH`, 0.30 USD per 4 GiB), so the default disk is 0.60 USD per month and the maximum 2.40. A node carries 16 disks.
+- The orchestrator has the disk by default; `--disk off` gives the old pod. A plain worker has none unless it asks with `--disk [SIZE]` (it then gets its own claim `data-NAME` mounted at the same place); its pod is otherwise byte for byte as before.
+- Resume: a launch of the same name finds the claim of that name and attaches it, so the session and an unpushed commit are there after a kill, a restart or a stop and relaunch. A new name gets a new claim; a claim held by a live pod is never given to a second one.
+- `stop` and `retire` KEEP the disk. `stop NAME --delete-disk` or `delete-disk NAME` removes it; `delete-disk` of a disk a live pod holds is refused (exit 6). The retention period is the constant `RETAINED_DISK_DAYS = 7`: the reaper REPORTS each retained disk older than it by name, size and age (`retained disk NAME 8Gi 9d`) on stderr and never deletes one.
+- Cost: `create` prints `disks: N GiB retained at 0.075 USD per GiB-month = X USD per month`, and the spend cap counts the retained disks (a month of each) with the new disk.
+
+**Permissions.** The operator Role in `cloud/k8s/operator-rbac.yaml` gains `persistentvolumeclaims` with exactly `get`, `list`, `create`, `delete` in the cloud namespace (no patch, no watch, no wildcard, no cluster-wide role). The pod's own account (`cw-worker`) gains nothing. No new Azure role: the cluster's own storage class provisions the disk through its in-cluster provisioner. Cluster step, on the owner's word and not before: a server dry run first, `kubectl apply --dry-run=server -f cloud/k8s/operator-rbac.yaml` and a dry run of a sample claim (`kubectl apply --dry-run=server` of a claim of 1Gi in the cloud namespace), then the owner's word, then the real apply. Until then `create` with a disk is forbidden on the real cluster.
+
+**Tests.** `tests/test_cloud_retained_disk.py` (fake cluster, mutants: a build that deletes the claim at stop, one that mounts the disk read-only, one that accepts a claim in another namespace). One live check after the cluster step: kill the pod and see `resumed: session and commit present`.

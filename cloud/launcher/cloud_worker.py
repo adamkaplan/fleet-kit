@@ -46,6 +46,15 @@ ROLES = {"worker": {"shape": None, "token_role": "worker", "persistent": False},
          "orchestrator": {"shape": "ORCH", "token_role": "orchestrator", "persistent": True}}
 PERSISTENT_SPEND_SECONDS = 24 * 3600   # a persistent launch is priced for one day against the spend cap
 MAX_TOKEN_SECONDS = 3600
+# The retained disk (ask 1228). A pod's own disk is deleted with the pod; a persistent role (and a worker that asks) gets ONE volume claim
+# that survives the pod. Stop and retire keep it; only `delete-disk` (or stop --delete-disk) removes it; the reaper only reports it.
+DISK_DEFAULT_GIB = 8                 # the default size; --disk SIZE may ask for up to the maximum
+DISK_MAX_GIB = 32
+DISK_USD_PER_GIB_MONTH = 0.075       # 0.30 USD per month per 4 GiB (Standard SSD list price)
+DISK_STORAGE_CLASS = ""              # empty: the cluster's default class (a launch setting: --disk-class)
+RETAINED_DISK_DAYS = 7               # the reaper reports a retained disk older than this; it never deletes one
+DISK_VOLUME = "data"                 # the volume and the claim template's name; the claim is data-NAME-0 (a StatefulSet's) or data-NAME (a worker's)
+DISK_MOUNT = "/data"                 # the agent's session (data/session) and work tree (data/work) live here; tokens never do
 
 # The git token a worker pushes with is a one-hour installation token (app_token.py caps it at 61 minutes). The launcher mints it once and
 # stores it as the `git-token` key of the per-run Secret; the managed reaper renews it by the SAME mint route before it ends. All of the
@@ -815,6 +824,16 @@ class Kube:
         """Delete the StatefulSet (a persistent role's workload) and wait: the controller would recreate a pod deleted alone."""
         self.run(["delete", "statefulset", name, "--ignore-not-found", "--wait=true", "--timeout=120s"], timeout=150)
 
+    def get_claim(self, name):
+        out = self.run(["get", "persistentvolumeclaim", name, "-o", "json"], ok_missing=True)
+        return json.loads(out) if out else None
+
+    def list_claims(self):
+        return json.loads(self.run(["get", "persistentvolumeclaims", "-l", "app=" + LABEL, "-o", "json"]))["items"]
+
+    def delete_claim(self, name):
+        self.run(["delete", "persistentvolumeclaim", name, "--ignore-not-found", "--wait=false"])
+
     def list_pods(self):
         return json.loads(self.run(["get", "pods", "-l", "app=" + LABEL, "-o", "json"]))["items"]
 
@@ -967,7 +986,62 @@ def pod_deadline_floor(max_hard):
     return parse_duration(max_hard or DEFAULT_MAX_HARD) + POD_DEADLINE_GRACE_SECONDS
 
 
-def render_pod(a, worker, name, now, hard, env, run_names=()):
+def parse_disk(a, role):
+    """None (no disk) or {"gib": N, "class": text}. Absent or `off`: none. `auto`: the role's default (orchestrator: on; worker: off).
+    A bare --disk or a number: that many GiB, at most DISK_MAX_GIB. Anything else refuses."""
+    raw = getattr(a, "disk", None)
+    if raw is None or str(raw) == "off":
+        return None
+    raw = str(raw)
+    if raw == "auto":
+        if not ROLES[role]["persistent"]:
+            return None
+        raw = ""
+    try:
+        gib = int(raw.rstrip("Gi")) if raw else DISK_DEFAULT_GIB
+    except ValueError:
+        raise CloudError("--disk takes a size in GiB (1 to %d), `off`, or nothing" % DISK_MAX_GIB, EXIT_USAGE)
+    if not 1 <= gib <= DISK_MAX_GIB:
+        raise CloudError("--disk is 1 to %d GiB" % DISK_MAX_GIB, EXIT_USAGE)
+    cls = getattr(a, "disk_class", None)
+    return {"gib": gib, "class": DISK_STORAGE_CLASS if cls is None else cls}
+
+
+def claim_name(name, persistent):
+    return "%s-%s-0" % (DISK_VOLUME, name) if persistent else "%s-%s" % (DISK_VOLUME, name)
+
+
+def render_claim(name, worker, disk, namespace=None, template=False):
+    """One volume claim: the StatefulSet's template (template=True, named DISK_VOLUME) or a worker's own claim (data-NAME)."""
+    meta = {"name": DISK_VOLUME if template else claim_name(name, False), "labels": {"app": LABEL, "cw/worker": worker}}
+    if namespace:
+        meta["namespace"] = namespace
+    spec = {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "%dGi" % disk["gib"]}}}
+    if disk["class"]:
+        spec["storageClassName"] = disk["class"]
+    return {"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": meta, "spec": spec}
+
+
+def check_claim_namespace(claim, namespace):
+    """A claim lives in the cloud namespace only; one that names another is refused (exit 2)."""
+    ns = (claim.get("metadata") or {}).get("namespace")
+    if ns is not None and ns != namespace:
+        raise CloudError("a volume claim must be in the cloud namespace %s, not %s" % (namespace, ns), EXIT_USAGE)
+
+
+def gib_of(claim):
+    m = re.fullmatch(r"(\d+)(Gi|Mi|Ti)?", str((((claim.get("spec") or {}).get("resources") or {}).get("requests") or {}).get("storage") or "0"))
+    if not m:
+        return 0
+    return int(m.group(1)) * {"Gi": 1, "Mi": 0, "Ti": 1024, None: 0}[m.group(2)]
+
+
+def disk_line(claims):
+    total = sum(gib_of(c) for c in claims)
+    return "disks: %d GiB retained at %s USD per GiB-month = %.2f USD per month" % (total, ("%.3f" % DISK_USD_PER_GIB_MONTH), total * DISK_USD_PER_GIB_MONTH)
+
+
+def render_pod(a, worker, name, now, hard, env, run_names=(), disk=None):
     image = a.image or env.get("CW_CLOUD_IMAGE")
     if not image:
         raise CloudError("no image: pass --image or set CW_CLOUD_IMAGE", EXIT_USAGE)
@@ -1023,6 +1097,12 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
         pod["spec"]["restartPolicy"] = "Always"
         res = {"cpu": shape["cpu"], "memory": shape["memory"]}
         pod["spec"]["containers"][0]["resources"] = {"requests": dict(res), "limits": dict(res)}
+    if disk:   # the retained disk: a worker's pod names its claim; a StatefulSet's pod gets its volume from the claim template
+        pod["spec"]["containers"][0]["volumeMounts"].append({"name": DISK_VOLUME, "mountPath": DISK_MOUNT})
+        pod["spec"]["containers"][0]["env"].append({"name": "CW_DISK_DIR", "value": DISK_MOUNT})
+        pod["metadata"]["annotations"]["cw/disk"] = "%dGi" % disk["gib"]
+        if not persistent:
+            pod["spec"]["volumes"].append({"name": DISK_VOLUME, "persistentVolumeClaim": {"claimName": claim_name(name, False)}})
     pull = getattr(a, "pull_secret", None)
     if pull:
         pod["spec"]["imagePullSecrets"] = [{"name": pull}]
@@ -1061,9 +1141,16 @@ def render_roles_doc():
     return "\n".join(lines)
 
 
-def render_workload(pod):
+def render_workload(pod, disk=None, worker=None, namespace=None):
     """A persistent role's workload: a one-replica StatefulSet around the pod (its pod is NAME-0; a restart is the controller's)."""
     name, meta = pod["metadata"]["name"], pod["metadata"]
+    wl = _workload(name, meta, pod)
+    if disk:
+        wl["spec"]["volumeClaimTemplates"] = [render_claim(name, worker or meta["labels"]["cw/worker"], disk, namespace, template=True)]
+    return wl
+
+
+def _workload(name, meta, pod):
     return {"apiVersion": "apps/v1", "kind": "StatefulSet",
             "metadata": {"name": name, "labels": {"app": LABEL, "cw/worker": meta["labels"]["cw/worker"]},
                          "annotations": dict(meta["annotations"])},
@@ -1124,11 +1211,20 @@ class Launcher:
     def estimate(self, shape, seconds):
         return SHAPES[shape]["usd_per_hour"] * seconds / 3600
 
-    def check_cap(self, shape, hard_seconds):
+    def claims(self):
+        fn = getattr(self.kube, "list_claims", None)
+        return fn() if fn else []
+
+    def cost_line(self):
+        """The retained disks' line: the price per GiB per month and the total of the disks held now."""
+        return disk_line(self.claims())
+
+    def check_cap(self, shape, hard_seconds, new_gib=0):
         cap = spend_cap(self.env)
         try:
             spent = sum(as_cost(self.cost(p)) for p in self.kube.list_pods())
-            launch = as_cost(self.estimate(shape, hard_seconds))
+            spent += as_cost(sum(gib_of(c) for c in self.claims()) * DISK_USD_PER_GIB_MONTH)   # a retained disk counts, a month of it
+            launch = as_cost(self.estimate(shape, hard_seconds) + new_gib * DISK_USD_PER_GIB_MONTH)
         except CloudError as e:
             if e.code == EXIT_CAP:
                 raise
@@ -1167,10 +1263,21 @@ class Launcher:
                     raise CloudError("--hard is past --max-hard", EXIT_REFUSED)
             run_values = read_run_secret_values(parse_run_secret_fds(a.run_secret_fd))  # before anything is made
             self.kube.add_secrets(*run_values.values())  # known to scrub before the first kubectl call
-            self.check_cap(ROLES[role]["shape"] or a.shape, PERSISTENT_SPEND_SECONDS if persistent else int((hard - now).total_seconds()))
-            spec = render_pod(a, worker, name, now, hard, self.env, sorted(run_values))
+            disk = parse_disk(a, role)
+            ns = getattr(self.kube, "ns", None) or "cw"
+            if getattr(a, "disk_namespace", None) is not None:
+                check_claim_namespace({"metadata": {"namespace": a.disk_namespace}}, ns)
+            self.check_cap(ROLES[role]["shape"] or a.shape, PERSISTENT_SPEND_SECONDS if persistent else int((hard - now).total_seconds()),
+                           disk["gib"] if disk else 0)
+            spec = render_pod(a, worker, name, now, hard, self.env, sorted(run_values), disk)
+            claim = None
+            if disk and not persistent:
+                claim = render_claim(name, worker, disk, ns)
+                check_claim_namespace(claim, ns)
             if persistent:
-                spec = render_workload(spec)
+                spec = render_workload(spec, disk, worker, ns)
+                for t in spec["spec"].get("volumeClaimTemplates", []):
+                    check_claim_namespace(t, ns)
             hits = scan_credentials(spec)
             if hits:
                 raise CloudError("refusing a pod spec with a stored credential: %s" % ", ".join(hits), EXIT_USAGE)
@@ -1184,6 +1291,8 @@ class Launcher:
                                  "type": "Opaque", "stringData": {"password": password}})
                 if run_values:
                     self._make(made, "run", self.kube.create_run_secret, name, name, run_values, *([a.run_id] if getattr(a, "run_id", None) else []))
+                if claim and not self.kube.get_claim(claim["metadata"]["name"]):   # a launch of the same name finds its claim and attaches it
+                    self.kube.apply(claim)
                 if persistent:
                     made["workload"] = False
                     self._make(made, "workload", self.kube.apply, spec)
@@ -1211,6 +1320,8 @@ class Launcher:
                 raise err
             except BaseException as e:  # interrupt or an unexpected exception: clean up, audit, say what was cleaned
                 self._abort(worker, name, made, e)
+            if disk:
+                print("cloud-worker: " + self.cost_line(), file=sys.stderr)
             domain = self.env.get("CW_CLOUD_DOMAIN", "example.internal")
             return {"worker": worker, "url": "https://worker-%s.%s:4096" % (name, domain),
                     "auth_ref": "file:/run/cw/%s.password" % worker, "runtime_id": "pod/" + name,
@@ -1503,7 +1614,47 @@ class Launcher:
                 print("cloud-worker: WARNING: not saved (secret-looking names): %s" % ", ".join(skipped), file=sys.stderr)
             return {"worker": worker, "runtime_id": "pod/" + pn, "pushed": bool(res.get("pushed")),
                     "wip_branch": view["wip_branch"], "skipped": skipped, "record": info.get("record", "")}
-        return self._audited(worker, "stop", go, audit_reason)
+        result = self._audited(worker, "stop", go, audit_reason)
+        if getattr(a, "delete_disk", False):   # the disk is kept by default; only this flag (or delete-disk) removes it, after the stop succeeded
+            self._remove_claims(worker)
+        return result
+
+    def _remove_claims(self, worker):
+        name, gone = pod_name(worker), []
+        for persistent in (True, False):
+            c = claim_name(name, persistent)
+            if self.kube.get_claim(c):
+                self.kube.delete_claim(c)
+                gone.append(c)
+        return gone
+
+    def delete_disk(self, a):
+        """Remove a worker's retained disk. Refused while a pod of that name still holds it (exit 6)."""
+        worker, name = a.worker, pod_name(a.worker)
+
+        def go(info):
+            if not NAME_RE.match(worker or ""):
+                raise CloudError("bad worker name %r" % worker, EXIT_USAGE)
+            if self._need(worker):
+                raise CloudError("worker %s is running and holds its disk; stop it first (stop --delete-disk)" % worker, EXIT_REFUSED)
+            return {"worker": worker, "deleted_claims": self._remove_claims(worker)}
+        return self._audited(worker, "delete-disk", go, getattr(a, "reason", "") or "")
+
+    def report_retained_disks(self, live_names):
+        """The reaper's report: every claim not held by a live pod and older than RETAINED_DISK_DAYS, by name, size and age. Never deletes."""
+        out, now = [], self.clock()
+        for c in self.claims():
+            meta = c.get("metadata") or {}
+            worker = (meta.get("labels") or {}).get("cw/worker")
+            if worker in live_names or not meta.get("creationTimestamp"):
+                continue
+            age = now - parse_iso(meta["creationTimestamp"])
+            if age.days >= RETAINED_DISK_DAYS:
+                line = "retained disk %s %dGi %dd (older than %d days; remove with: cloud-worker delete-disk %s)" % (
+                    meta["name"], gib_of(c), age.days, RETAINED_DISK_DAYS, worker)
+                print("cloud-worker: " + line, file=sys.stderr)
+                out.append(line)
+        return out
 
     def _remove_persistent(self, name, pod_name_, nonce, uid=None):
         """A persistent role's stop: the workload FIRST (else its controller recreates the pod), then the pod, then the Secrets."""
@@ -1793,6 +1944,10 @@ class Launcher:
                     self.reap_results[worker] = dict(self.last_hook or {})
                     out.append((worker, reason, e.code))
         out.extend(self.renew_git_tokens(live, now))
+        try:
+            self.retained = self.report_retained_disks({ann(p, "worker") for p in self.kube.list_pods()})
+        except (CloudError, ValueError, TypeError, KeyError) as e:   # a report that cannot be read never stops the pass
+            print("cloud-worker: retained disks not reported: %s" % self.kube.scrub(e, 200), file=sys.stderr)
         return out
 
     # -- the git token's renewal (one more step of the reaper's pass) --
@@ -2249,6 +2404,10 @@ def build_parser():
     c.add_argument("--image")
     c.add_argument("--stack", action="store_true",
                    help="a pod for a worker that runs a nested Docker stack: the Sysbox runtime class, its own user namespace, the pool's node label; off by default (the default pod is unchanged)")
+    c.add_argument("--disk", nargs="?", const="", default="auto", metavar="SIZE",
+                   help="a retained disk that survives the pod: SIZE in GiB (default %d, at most %d), or `off`. An orchestrator has one by default; a plain worker only when asked" % (DISK_DEFAULT_GIB, DISK_MAX_GIB))
+    c.add_argument("--disk-class", help="the storage class of the disk (default: the cluster's own)")
+    c.add_argument("--disk-namespace", help=argparse.SUPPRESS)
     c.add_argument("--wait", type=int, default=300)
     c.add_argument("--pull-secret", help="name of an existing image-pull Secret (pull-only) for imagePullSecrets")
     c.add_argument("--run-secret-fd", action="append", default=[], metavar="NAME=N",
@@ -2262,6 +2421,7 @@ def build_parser():
                    help="the nonce create recorded: stop acts only when the pod carries it (another run's worker of the same name is left whole, exit 6); without it stop acts by name")
     s.add_argument("--record-dir", help="where the run record goes (default: $CW_RUN_RECORD_DIR, else runs/ beside the audit file)")
     s.add_argument("--no-record", action="store_true", help="write no run record (a record is the default: every stop makes one)")
+    s.add_argument("--delete-disk", action="store_true", help="also remove the retained disk (the default keeps it so the lane can resume)")
     e = cmd("extend")
     e.add_argument("--hard")
     e.add_argument("--idle")
@@ -2269,6 +2429,8 @@ def build_parser():
     d = cmd("delete")
     d.add_argument("--force", action="store_true")
     d.add_argument("--reason", default="")
+    dd = cmd("delete-disk")
+    dd.add_argument("--reason", default="")
     cmd("status")
     cmd("report")
     pr = cmd("prune-records", worker=False)
