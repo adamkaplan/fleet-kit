@@ -372,7 +372,8 @@ class TestAudit(Base):
 
     def test_skips_and_other_refusals(self):
         self.passed("pr", "comment", "3", "-R", "acme-org/other-repo", "-b", "hi", env={"FLEET_SWITCHBOARD_OWN_GH": "1"})
-        self.assertEqual(self.audit(), [])                                                     # the switchboard's own call is not audited
+        self.assertEqual(len(self.audit()), 1)                                                 # #1216: the marker no longer skips the audit line (own calls never reach the shim)
+        self.audit_dir.joinpath("gh-writes.jsonl").unlink()
         self.run_gh("auth", "git-credential", "get")
         self.assertEqual(self.audit(), [])                                                     # nor a git credential call
         self.config({"acme-org/widget-api": {"label": LABEL, "message": MESSAGE}})

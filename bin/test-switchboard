@@ -21621,7 +21621,7 @@ class TestGhShimGateProbe(Base):
                 self.assertEqual((done.returncode, done.stdout.strip()), (7, "real gh out"), "the real gh's exit code and output pass through")
                 self.assertEqual(seen["argv"], list(args))
                 (call,) = self.gate_calls()
-                self.assertEqual(call, "gates-check acme/app#12 --for %s --json own=1" % kind)
+                self.assertEqual(call, "gates-check acme/app#12 --for %s --json own=" % kind)
 
     def review(self, state, who="rev", at="2026-01-01T00:00:00Z"):
         return {"state": state, "author": {"login": who}, "submittedAt": at}
@@ -21899,10 +21899,10 @@ class TestGhShimGateProbe(Base):
         self.assertEqual(self.gate_calls(), [], "the directory's repo is not listed: not asked, not rewritten")
         self.assertEqual(seen["argv"], ["pr", "merge", "5"])
         done, seen = self.run_shim("pr", "merge", "5", env=dict(self.ENFORCE, FAKE_REPO="acme/app"))
-        self.assertEqual(self.gate_calls()[-1], "gates-check acme/app#5 --for merge --json own=1")
+        self.assertEqual(self.gate_calls()[-1], "gates-check acme/app#5 --for merge --json own=")
         self.assertEqual(seen["argv"][-2:], ["--match-head-commit", "a" * 40])
         done, seen = self.run_shim("pr", "merge", "5", env=dict(self.ENFORCE, GH_REPO="acme/app"))
-        self.assertEqual(self.gate_calls()[-1], "gates-check acme/app#5 --for merge --json own=1", "GH_REPO is honoured")
+        self.assertEqual(self.gate_calls()[-1], "gates-check acme/app#5 --for merge --json own=", "GH_REPO is honoured")
         self.calls_log.unlink()
         done, seen = self.run_shim("pr", "merge", "5", env=self.ENFORCE)   # the real gh cannot say which repo: never guess the fleet repo
         self.assertEqual((done.returncode, self.gate_calls()), (7, []))
@@ -21916,7 +21916,7 @@ class TestGhShimGateProbe(Base):
                      ("pr", "merge", "https://github.com/acme/app/pull/5/files")):
             with self.subTest(args=args):
                 done, seen = self.run_shim(*args, env=self.ENFORCE)
-                self.assertEqual(self.gate_calls()[-1], "gates-check acme/app#5 --for merge --json own=1")
+                self.assertEqual(self.gate_calls()[-1], "gates-check acme/app#5 --for merge --json own=")
                 self.assertEqual(seen["argv"], list(args) + ["--match-head-commit", head])
         for args in (("pr", "merge", "5", "-R", "acme/app", "--auto=true"), ("pr", "merge", "5", "-R", "acme/app", "-sd", "--auto")):
             with self.subTest(args=args):
@@ -21995,11 +21995,54 @@ class TestGhShimGateProbe(Base):
         self.run_shim("pr", "merge", "https://github.com/someone/app/pull/9")
         self.assertEqual(self.gate_calls(), [], "a fork's PR is another repo: not listed, not probed")
 
+    def mutant_shim(self, func):
+        """A copy of the whole shim directory in which `func` honours the marker again (returns at once for it); SHIM points at it while the case runs."""
+        source = SHIM.read_text()
+        head = source[source.index("def %s(" % func):]
+        at = head.index(":\n", head.index(")")) + 2
+        guard = '    if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":\n        return None\n'
+        if source[source.index("def %s(" % func) + at - 2 - 1:][:0] == "":
+            pass
+        # a docstring comes first: put the guard after it
+        body = head[at:]
+        stripped = body.lstrip()
+        if stripped.startswith('"""'):
+            end = body.index('"""', body.index('"""') + 3) + 3
+            at += end + 1
+        mutant = source.replace(head, head[:at] + guard + head[at:], 1)
+        ast.parse(mutant)
+        target = self.home / "mutant-shims"
+        shutil.copytree(SHIM.parent, target)
+        (target / "gh").write_text(mutant)
+        return target / "gh"
+
+    def test_mutants_that_honour_the_marker_again_fail_the_cases(self):   # #1216 S6: review probe and gate probe
+        block = [self.review("CHANGES_REQUESTED", "reviewer-a")]
+        self.write_gates({"acme/app": {"mode": "enforce"}})
+        gate = {"FLEET_SWITCHBOARD_OWN_GH": "1", "FAKE_GATE_EXIT": "10", "FAKE_GATE_JSON": json.dumps({"verdict": "refuse", "mode": "enforce", "message": self.REFUSAL})}
+        for func, run in (("review_probe", lambda: self.merge(reviews=block, env={"FLEET_SWITCHBOARD_OWN_GH": "1"})),
+                          ("gate_probe", lambda: self.run_shim("pr", "merge", "12", "-R", "acme/app", env=gate))):
+            with self.subTest(func=func):
+                real = self.run_shim_result_code(run)
+                self.assertEqual(real, 10, "the real shim refuses")
+                global SHIM
+                saved = SHIM
+                SHIM = self.mutant_shim(func)
+                try:
+                    self.assertNotEqual(self.run_shim_result_code(run), 10, "the mutant lets the merge run")
+                finally:
+                    SHIM = saved
+                    shutil.rmtree(self.home / "mutant-shims", ignore_errors=True)
+
+    def run_shim_result_code(self, run):
+        done, seen = run()
+        return done.returncode
+
     def test_the_marker_does_not_skip_the_gate_probe(self):   # #1216 S3: the gate probe does not honour the marker
         self.write_gates({"acme/app": {"mode": "enforce"}})
         done, seen = self.run_shim("pr", "merge", "12", "-R", "acme/app", env={"FLEET_SWITCHBOARD_OWN_GH": "1", "FAKE_GATE_EXIT": "10",
             "FAKE_GATE_JSON": json.dumps({"verdict": "refuse", "mode": "enforce", "message": self.REFUSAL})})
-        self.assertEqual((done.returncode, seen), (1, None), done.stderr)
+        self.assertEqual((done.returncode, seen), (10, None), done.stderr)
         self.assertEqual(len(self.gate_calls()), 1)
 
     def test_the_spool_is_private_clipped_and_bounded(self):
@@ -30230,6 +30273,15 @@ class TestIdentityCheck(ReportBase):
                 self.assertIsNone(seen)
                 self.assertIn("read only", done.stderr)
 
+    def test_s8_the_marker_set_by_a_caller_does_not_lift_the_read_repository_guard(self):   # #1216: read_scope does not honour the marker
+        marker = {"FLEET_SWITCHBOARD_OWN_GH": "1"}
+        for args in (("issue", "comment", "5", "-R", "acme-org/widget-api", "--body", "x"), ("issue", "comment", "5", "-R", "acme-org/other", "--body", "x")):
+            with self.subTest(args=args):
+                done, seen = self.read_repo_run(args, extra_env=marker)
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertIn("refus", done.stderr)
+                self.assertIsNone(seen)
+
     def test_s3_a_repository_that_is_neither_the_workers_own_nor_the_declared_one_is_refused_for_reads_and_writes(self):
         for args in (("issue", "view", "5", "-R", "acme-org/other"), ("pr", "view", "https://github.com/acme-org/other/pull/1"), ("api", "repos/acme-org/other/issues"),
                      ("repo", "view", "acme-org/other"), ("issue", "comment", "5", "-R", "acme-org/other", "--body", "x"),
@@ -30730,21 +30782,19 @@ class TestIdentityCheck(ReportBase):
         }
         for label, env in env_of.items():
             with self.subTest(label):
-                self.assertEqual((env["GH_TOKEN"], env[sb.OWN_GH_ENV]), ("tok-ops", "1"))
-                # the daemon's own env, with a foreign identity somewhere the shim could find it: the account stays
-                self.assertEqual(self.shim_token(dict(env, **self.FOREIGN)), "tok-ops")
-        # without the marker the same call WOULD be re-identified (the regression): the shim swaps in the caller's account
-        unmarked = {k: v for k, v in env_of["a sweep or triage read (gh_api via child_env)"].items() if k != sb.OWN_GH_ENV}
-        self.assertEqual(self.shim_token(unmarked), "tok-personal")
+                self.assertEqual(env["GH_TOKEN"], "tok-ops")
+                self.assertNotIn(sb.OWN_GH_ENV, env)   # #1216 S9: no marker; the call reaches the real gh by path, not the shim
+        # the marker buys nothing at the shim: a caller that sets it is re-identified like any other
+        marked = dict(env_of["a sweep or triage read (gh_api via child_env)"], **{sb.OWN_GH_ENV: "1"})
+        self.assertEqual(self.shim_token(marked), "tok-personal")
 
     def test_a_default_account_call_of_the_daemon_is_not_re_identified_either(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop(sb.OWN_GH_ENV, None)
+            os.environ[sb.OWN_GH_ENV] = "1"
             sb.main(["version"])
-            self.assertEqual(os.environ.get(sb.OWN_GH_ENV), "1")             # every switchboard process is marked
-            inherited = {sb.OWN_GH_ENV: os.environ[sb.OWN_GH_ENV], "GH_TOKEN": "default-token"}
+            self.assertNotIn(sb.OWN_GH_ENV, os.environ)             # #1216: no switchboard process is marked; an inherited marker is dropped
         self.assertIsNone(self.accounts().env_for("elsewhere/repo"))          # no mapping: env None, the child inherits
-        self.assertEqual(self.shim_token(dict(inherited, **self.FOREIGN)), "default-token")
 
     def test_a_real_agents_own_gh_call_is_still_re_identified(self):
         # no marker in an agent's shell (a launch does not copy this process's environment): the #139 behaviour stays
@@ -83447,13 +83497,13 @@ class TestGhShimMergeGate(Base):
         self.assertEqual((done.returncode, seen), (10, None))
         self.assertEqual(len(done.stderr.strip().splitlines()), 1)
         self.assertIn("no gate pass recorded", done.stderr)
-        self.assertEqual(self.merge_calls(), ["merge-gate acme/app#12 --check --json own=1"])
+        self.assertEqual(self.merge_calls(), ["merge-gate acme/app#12 --check --json own="])
 
     def test_an_allowed_merge_is_bound_to_the_checked_head_and_releases_the_lock_when_it_returns(self):
         done, seen = self.run_shim(*self.MERGE, env=self.allowed())
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(seen["argv"], list(self.MERGE) + ["--match-head-commit", self.HEAD])
-        self.assertEqual(self.merge_calls()[-1], "merge-gate acme/app#12 --release own=1")
+        self.assertEqual(self.merge_calls()[-1], "merge-gate acme/app#12 --release own=")
 
     def test_an_allowed_merge_without_the_lock_releases_nothing(self):
         done, seen = self.run_shim(*self.MERGE, env=self.allowed(locked=False))
@@ -83464,7 +83514,7 @@ class TestGhShimMergeGate(Base):
         (self.bin / "gh").write_text((self.bin / "gh").read_text().replace("sys.exit(0)\n", "sys.exit(0)\n", 1).rsplit("sys.exit(0)", 1)[0] + "sys.exit(9)\n")
         done, seen = self.run_shim(*self.MERGE, env=self.allowed())
         self.assertEqual(done.returncode, 9)
-        self.assertEqual(self.merge_calls()[-1], "merge-gate acme/app#12 --release own=1")
+        self.assertEqual(self.merge_calls()[-1], "merge-gate acme/app#12 --release own=")
 
     def test_the_gate_fails_closed_without_a_switchboard_on_an_error_and_on_a_late_answer(self):
         done, seen = self.run_shim(*self.MERGE, binary=False)
@@ -83689,22 +83739,22 @@ class TestGhShimMergeGate(Base):
         self.assertGreater(len(names), 5)
         shim = self.shim_module()
         with mock.patch.dict(os.environ, {n: "x" for n in names}):
-            seen = shim.sb_env(own=True)
+            seen = shim.sb_env()
         kept = sorted(n for n in names if n in seen)
-        self.assertEqual(kept, sorted(set(shim.ENV_ALLOW + ("FLEET_SWITCHBOARD_OWN_GH",)) & set(names)), "only the identity names and the own-call marker survive")
+        self.assertEqual(kept, sorted(set(shim.ENV_ALLOW) & set(names)), "only the identity names survive (never the own-call marker, #1216)")
 
     FAMILIES = {"PYTHONPATH": "/tmp/evil-py", "PYTHONHOME": "/tmp/evil-home", "PYTHONUSERBASE": "/tmp/evil-user", "PYTHONSTARTUP": "/tmp/evil-start", "LD_PRELOAD": "/tmp/evil.so",
                 "LD_LIBRARY_PATH": "/tmp/evil-lib", "DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib", "DYLD_LIBRARY_PATH": "/tmp/evil-dy", "XDG_STATE_HOME": "/tmp/evil-state",
                 "FLEET_SWITCHBOARD_STATE": "/tmp/evil-fsb", "FLEET_SWITCHBOARD_BIN": "/tmp/evil-bin", "MADE_UP_VARIABLE": "1", "PATH": "/tmp/evil-path", "GH_TOKEN": "x"}
     DENY_LIST = '    env = {k: v for k, v in os.environ.items() if not k.startswith(("XDG_", "FLEET_SWITCHBOARD_"))}'
     ALLOW_LIST = '    env = {"PATH": ENV_PATH}\n    for name in ENV_ALLOW:\n        if name in os.environ:\n            env[name] = os.environ[name]'
-    TAIL = '    if own:\n        env["FLEET_SWITCHBOARD_OWN_GH"] = "1"\n    return env'
+    TAIL = '    return env'
 
     def family_problems(self):
         """Which hostile families reach a switchboard through `sb_env`: the names, or the PATH when it is the caller's."""
         shim = self.shim_module()
         with mock.patch.dict(os.environ, self.FAMILIES):
-            env = shim.sb_env(own=True)
+            env = shim.sb_env()
         reached = sorted(n for n in self.FAMILIES if n != "PATH" and n in env)
         return reached + (["PATH"] if env.get("PATH") == self.FAMILIES["PATH"] else [])
 
@@ -83912,7 +83962,7 @@ class TestGhShimMergeGate(Base):
     def test_an_allowed_api_merge_releases_the_lock_when_it_returns(self):
         done, seen = self.run_shim("api", "-X", "PUT", "repos/acme/app/pulls/12/merge", env=self.allowed())
         self.assertEqual((done.returncode, seen["argv"]), (0, ["api", "-X", "PUT", "repos/acme/app/pulls/12/merge"]))
-        self.assertEqual(self.merge_calls()[-1], "merge-gate acme/app#12 --release own=1")
+        self.assertEqual(self.merge_calls()[-1], "merge-gate acme/app#12 --release own=")
 
     def test_a_worker_cannot_switch_the_gate_off_or_point_it_elsewhere_through_its_environment(self):
         other = self.home / "elsewhere"
@@ -86142,6 +86192,45 @@ class TestAssembler(unittest.TestCase):
         self.assertIn("usage: fleet-switchboard status", done.stdout)
 
 
+class TestOwnMarkerNotHonoured(unittest.TestCase):
+    """#1216: shims/gh reads FLEET_SWITCHBOARD_OWN_GH nowhere (derived scan), and each probe has a mutant that honours it again which the case above it fails."""
+    NAME = "FLEET_SWITCHBOARD_OWN_GH"
+
+    def test_the_shim_reads_the_marker_nowhere(self):
+        tree = ast.parse(SHIM.read_text())
+        reads = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Constant) and n.value == self.NAME]
+        self.assertEqual(reads, [], "a string constant naming the marker in shims/gh (a read or a set), by line")
+
+    def test_every_own_call_site_of_the_switchboard_carries_no_marker(self):
+        text = switchboard_source()
+        self.assertNotIn('{OWN_GH_ENV: "1"}', text)
+        self.assertNotIn('setdefault(OWN_GH_ENV', text)
+
+    def test_the_own_call_path_resolves_the_real_gh_beside_the_shim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shimdir, realdir = Path(tmp, "shim"), Path(tmp, "real")
+            shimdir.mkdir(); realdir.mkdir()
+            shimdir.joinpath("gh").write_text(SHIM.read_text()); shimdir.joinpath("gh").chmod(0o755)
+            realdir.joinpath("gh").write_text("#!/bin/sh\nexit 0\n"); realdir.joinpath("gh").chmod(0o755)
+            path = os.pathsep.join([str(shimdir), str(realdir)])
+            self.assertEqual(sb.own_gh_path("gh", {"PATH": path}), str(realdir / "gh"))
+            self.assertEqual(sb.own_gh_path("gh", {"PATH": str(realdir)}), "gh")
+            self.assertEqual(sb.own_gh_path("gh", {"PATH": path, "FLEET_REAL_GH": str(realdir / "gh")}), str(realdir / "gh"))
+            self.assertEqual(sb.own_gh_path("/x/gh", {"PATH": path}), "/x/gh")
+
+    def test_each_mutant_that_honours_the_marker_again_is_seen(self):
+        """Each mutant puts a marker read back into one shim function; the derived scan fails for every one of them (and passes for the real code above)."""
+        source = SHIM.read_text()
+        for func in ("review_probe", "gate_probe", "merge_gate_probe", "read_scope", "audit_write", "read_account_env", "account_env", "count_call"):
+            with self.subTest(func=func):
+                self.assertIn("def %s(" % func, source)
+                head = source[source.index("def %s(" % func):]
+                body_at = head.index(":\n", head.index(")")) + 2
+                mutant = source.replace(head, head[:body_at] + '    if os.environ.get("%s") == "1":\n        return None\n' % self.NAME + head[body_at:], 1)
+                tree = ast.parse(mutant)
+                self.assertTrue([n for n in ast.walk(tree) if isinstance(n, ast.Constant) and n.value == self.NAME], func)
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
@@ -86153,3 +86242,4 @@ if __name__ == "__main__":
         except OSError as _err:
             sys.stderr.write("heavy: cannot start the slot wrapper (%s): running without a slot\n" % (_err.strerror or _err))
     sys.exit(main(sys.argv[1:]))
+
