@@ -115,7 +115,7 @@ class PlanCheckInPod(unittest.TestCase):
         for n in ast.walk(tree):
             if isinstance(n, ast.Import):
                 mods |= {a.name for a in n.names}
-        self.assertEqual(mods - {"json"}, {"sys", "os", "argparse", "plan_check"})
+        self.assertEqual(mods - {"json"}, {"sys", "os", "re", "argparse", "plan_check"})
         guard = ("import socket,sys,runpy\n"
                  "def boom(*a, **k): raise RuntimeError('network')\n"
                  "socket.socket.connect = boom; socket.create_connection = boom; socket.getaddrinfo = boom\n"
@@ -145,6 +145,91 @@ class PlanCheckInPod(unittest.TestCase):
     def test_dockerfile_installs_both(self):
         d = read(os.path.join(WORKER, "Dockerfile")).decode()
         self.assertIn("COPY worker/cw-plan-check worker/plan_check.py /usr/local/bin/", d)
+
+    def test_drift_pin_parse_intent(self):
+        def pieces(path):
+            src = read(path).decode()
+            tree = ast.parse(src)
+            out = {}
+            for n in tree.body:
+                if isinstance(n, ast.FunctionDef) and n.name == "parse_intent":
+                    out["parse_intent"] = ast.get_source_segment(src, n).strip()
+                if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") in ("_HEADING", "_DONE_WHEN"):
+                    out[n.targets[0].id] = ast.get_source_segment(src, n).strip()
+            return out
+        a, b = pieces(SWITCHBOARD), pieces(POD)
+        self.assertEqual(sorted(a), ["_DONE_WHEN", "_HEADING", "parse_intent"])
+        self.assertEqual(a, b)
+
+    def test_parity_corpus(self):
+        base = plan()
+        intent = lambda dw: "## Intent\n\nMake it work.\n%s\n\n" % dw
+        cases = {
+            "no intent": base,
+            "equal": intent("Done when: " + DONE) + base,
+            "differs": intent("Done when: something else") + base,
+            "no done when line": intent("") + base,
+            "fenced": "```\n## Intent\nDone when: other\n```\n" + base,
+            "crlf": (intent("Done when: other") + base).replace("\n", "\r\n"),
+            "two intents": intent("Done when: other") + intent("Done when: third") + base,
+            "list": intent("- Done when: other") + base,
+            "bold": intent("**Done when:** other") + base,
+            "other level": "### Intent\nx\nDone when: other\n" + base,
+            "case": intent("DONE WHEN: other") + base,
+            "empty": intent("Done when:") + base,
+            "equal bold": intent("**Done when:** " + DONE) + base,
+            "scenarios and differs": base + "\n" + intent("Done when: zzz"),
+            "differs vague": intent("Done when: other") + plan(pass_rule="works"),
+        }
+        self.assertGreaterEqual(len(cases), 14)
+        for name, text in cases.items():
+            p = self.write(text)
+            for extra in ((), ("--json",)):
+                pod = self.pod(p, extra)
+                loc = subprocess.run([sys.executable, SWITCHBOARD, "plan", "check", "--file", p, "--done-when", DONE] + list(extra), capture_output=True, text=True)
+                self.assertEqual((pod.returncode, pod.stdout), (loc.returncode, loc.stdout), name)
+        p = self.write(cases["differs"])
+        r = self.pod(p)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("done-when-differs", r.stdout)
+
+    def test_mutants_detected(self):
+        src = read(POD).decode()
+        p = self.write(intent_differs())
+        def run(mut, p=p):
+            return run_on(self, mut, p)
+        def _unused(mut):
+            q = os.path.join(self.tmp.name, "cw-mut")
+            with open(q, "w") as f:
+                f.write(mut)
+            for n in ("plan_check.py",):
+                d = os.path.join(self.tmp.name, n)
+                if not os.path.exists(d):
+                    with open(d, "wb") as f:
+                        f.write(read(os.path.join(WORKER, n)))
+            return subprocess.run([sys.executable, q, "--file", p, "--done-when", DONE], capture_output=True, text=True).returncode
+        self.assertEqual(run(src), 1)
+        self.assertEqual(run(src.replace("plan_own_done_when(text, args.done_when))", "None)")), 0)
+        self.assertEqual(run(src.replace("done_when = done_when or match", "done_when = done_when or None; _x = match")), 0)
+        # no != comparison: an Intent Done-when equal to --done-when would wrongly be reported as differing
+        eq = self.write("## Intent\n\nx\nDone when: %s\n\n" % DONE + plan())
+        self.assertEqual(run_on(self, src, eq), 0)
+        # check() treats an equal plan_own as no defect, so the comparison is pinned in the source too
+        self.assertIn("own if own and own != done_when else None", src)
+
+
+def run_on(self, mut, p):
+    q = os.path.join(self.tmp.name, "cw-mut")
+    with open(q, "w") as f:
+        f.write(mut)
+    d = os.path.join(self.tmp.name, "plan_check.py")
+    with open(d, "wb") as f:
+        f.write(read(os.path.join(WORKER, "plan_check.py")))
+    return subprocess.run([sys.executable, q, "--file", p, "--done-when", DONE], capture_output=True, text=True).returncode
+
+
+def intent_differs():
+    return "## Intent\n\nMake it work.\nDone when: something else\n\n" + plan()
 
 
 PINNED = {'guard.sh': '9bff815feddd3424f2f853c8e002333474845ab7d8091f562bbd9256852a9321', 'opencode-worker.json': '55e257df63d010c9d9cfbda0c219f56005b4c346a84ff00f1d7cee8f05bb69ec'}
