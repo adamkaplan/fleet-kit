@@ -22620,7 +22620,10 @@ class TestHandoff(HandoffCase):
         self.assertNotRegex(class_source("IntentReader"), r"\"(-X|-f|-F|--method|--input|--field)\"")
         source = SWITCHBOARD.read_text()
         # the handoff comment, (PR 17) `write_issue_body` and (PR 18) `_gh_write`: labels and comments
-        self.assertEqual(source.count('"--method"'), 3)
+        # (#1123) plus ONE site in `_review_api`, the shared helper of `review post` and `review dismiss`: their writes (a review, a dismissal) are deliberate and the only ones added;
+        # the reader code (IntentReader, checked above, and checkout/measure) stays read-only
+        self.assertEqual(source.count('"--method"'), 4)
+        self.assertEqual(len(re.findall(r"_review_api\([^)]*\"(?:POST|PUT)\"", source)), 3)   # post (twice: the verdict and the fallback) and the dismissal: each goes through the helper
 
 
 class TestForegroundScenarios(Base):
