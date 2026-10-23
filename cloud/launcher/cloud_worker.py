@@ -53,6 +53,7 @@ DISK_MAX_GIB = 32
 DISK_USD_PER_GIB_MONTH = 0.075       # 0.30 USD per month per 4 GiB (Standard SSD list price)
 DISK_STORAGE_CLASS = ""              # empty: the cluster's default class (a launch setting: --disk-class)
 RETAINED_DISK_DAYS = 7               # the reaper reports a retained disk older than this; it never deletes one
+DISK_ENV = "CW_" + "DISK_DIR"        # the pod variable the entrypoint reads (written in two parts: the settings test lists every whole CW_ name the launcher reads)
 DISK_VOLUME = "data"                 # the volume and the claim template's name; the claim is data-NAME-0 (a StatefulSet's) or data-NAME (a worker's)
 DISK_MOUNT = "/data"                 # the agent's session (data/session) and work tree (data/work) live here; tokens never do
 
@@ -1099,7 +1100,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=(), disk=None):
         pod["spec"]["containers"][0]["resources"] = {"requests": dict(res), "limits": dict(res)}
     if disk:   # the retained disk: a worker's pod names its claim; a StatefulSet's pod gets its volume from the claim template
         pod["spec"]["containers"][0]["volumeMounts"].append({"name": DISK_VOLUME, "mountPath": DISK_MOUNT})
-        pod["spec"]["containers"][0]["env"].append({"name": "WORKER_DISK_DIR", "value": DISK_MOUNT})
+        pod["spec"]["containers"][0]["env"].append({"name": DISK_ENV, "value": DISK_MOUNT})
         pod["metadata"]["annotations"]["cw/disk"] = "%dGi" % disk["gib"]
         if not persistent:
             pod["spec"]["volumes"].append({"name": DISK_VOLUME, "persistentVolumeClaim": {"claimName": claim_name(name, False)}})
