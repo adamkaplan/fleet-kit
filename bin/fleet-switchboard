@@ -169,6 +169,7 @@ HELPER_MODULES = {   # the old `load_<module>()` names: each returns `load_modul
     "load_health_records": "health_records",
     "load_reds": "reds",
     "load_impact_floor": "impact_floor",
+    "load_impact_brief": "impact_brief",
     "load_plan_review": "plan_review",
     "load_external_adapter": "external_adapter",
     "load_decision_sync": "decision_sync",
@@ -23202,7 +23203,10 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
         if review:
             decision = "hold"
     rating_entries = impact_rating_entries(engine.state_dir, "%s#%d" % (repo, number), head)[0] if engine.state_dir is not None and isinstance(head, str) else []
-    return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude, "rating_block": rating_block_note(rating_entries, "%s#%d" % (repo, number), head), "rating_lines": rating_mismatch_lines(engine.state_dir, "%s#%d" % (repo, number), head),
+    brief_module = load_module("impact_brief")   # slice A hook (#1215): the brief is built from the same diff read; display only, no decision reads it yet
+    report_base = {"top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "head": raw.get("headRefOid"), "base": raw.get("baseRefOid"), "complete": complete}
+    brief = brief_module.build_brief(brief_module.facts_from_report(files, report_base))
+    return {"brief": brief, "pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude, "rating_block": rating_block_note(rating_entries, "%s#%d" % (repo, number), head), "rating_lines": rating_mismatch_lines(engine.state_dir, "%s#%d" % (repo, number), head),
             "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete,
             "top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "review_action": record[0] if record else None, "review_class": record[1] if record else None,   # #661: display data the delegated clear reads; no decision changes
             "changed_paths": [p for p in paths if isinstance(p, str)][:200], "unknown": unknown, "rated": [list(r) for r in rated],
@@ -23346,6 +23350,8 @@ def cmd_impact_floor(args, runner, now):
             print("  incomplete: GitHub gave %s of %s changed files, so a path outside those may be a top tier path; this is not a verdict of \"not held\"" % (read, total))
         if blind and owner != "hold":
             print("  rename: the source path of %s was not seen, and it may have been a top tier path; this is not a verdict of \"not held\"" % ", ".join(blind[:3]))
+        if isinstance(report.get("brief"), dict):
+            print(report["brief"]["text"], end="")   # #1215: the one-screen brief; advice only, no decision changes
         print("  path floor (older advisory, not the owner's rule): %s" % report["decision"].upper().replace("-", " "))
         for reason in report["reasons"]:
             print("  %s" % reason)
