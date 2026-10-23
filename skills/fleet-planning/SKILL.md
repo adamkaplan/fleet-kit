@@ -12,7 +12,7 @@ work starts, checked by a command, challenged by independent reviewers, and appr
 ## When a plan is required
 
 Every worker assignment links one: `PLAN: <link>` in the brief, to its own plan or to a section of an ask's, epic's or
-workspace's plan. No plan, no assignment. A tiny work item under an already-reviewed plan section links that section.
+workspace's plan. No plan, no assignment. A tiny work item links the reviewed plan section it is under.
 Who approves: a work item's plan, its orchestrator (the Chief of Staff if it touches a held-PR area); an ask's, the Chief of
 Staff; an epic or workspace plan, the Chief of Staff, then the owner.
 
@@ -32,8 +32,7 @@ Staff; an epic or workspace plan, the Chief of Staff, then the owner.
 4. **Out of scope**, **areas touched** (and whether any is held-PR), **risks and rollback**, **open questions**, **size and
    tier**, and **the integration-branch decision** (stay on main, or `integration/<epic-slug>`).
    **Size** is a T-shirt in AGENT time, never human-days: S under 1 hour, M a few hours, L about a day, XL several days, each with what makes it that
-   size. Never prefer the smaller option merely because it is less work when a larger one
-   simplifies the system. Put `plan-format: 2` and a `size:` line in the plan; `plan check` flags a missing size and days for work under L (a light plan may carry just `size: S`).
+   size. Never prefer the smaller option merely for less work. Put `plan-format: 2` and a `size:` line in the plan; `plan check` flags a missing size and days for work under L (a light plan may carry just `size: S`).
 
 ## Check it
 
@@ -86,7 +85,7 @@ scenarios:
     evaluator: ci
 ```
 
-Bad: `pass: works`, `discriminates: a wrong build would fail this`, or "add a `commission()` method" (how, not what).
+Bad: `pass: works`, `discriminates: a wrong build would fail this`, "add a `commission()` method" (how).
 
 ## Wordings `plan check` accepts
 
@@ -103,3 +102,4 @@ Link it in every brief (`PLAN: <link>`). The worker proves each scenario with `f
 open. The order does not matter (a `ci` verdict recorded before your `prove` counts once the proof exists at the same head, and
 the daemon records `ci` verdicts itself within minutes of green checks): a coder's only extra step is `prove`. A push voids every proof and
 verdict. A hotfix may be waived by the Chief of Staff, logged; the plan is then due retroactively within a day.
+Use `CARRIES: #N` only for a dependency that cannot merge first; the body names both pull requests.

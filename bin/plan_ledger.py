@@ -481,7 +481,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
                     dep_rows, carried_reviews = carried_rows(carries, entries, facts)
                     scen_rows = scen_rows + dep_rows
                 elif carries:
-                    scen_rows = scen_rows + [{"id": "%s plan" % carries["pr"], "status": "missing", "missing": [carries.get("refusal") or "the carried plan cannot be read"],
+                    scen_rows = scen_rows + [{"id": "%s plan" % carries["pr"], "status": "missing", "missing": [carries.get("refusal") or "the carried plan cannot be read"], "void": [], "evaluator": "-", "proof": None, "verdict": None,
                                               "carried_from": carries["pr"]}]
                 bad = [s for s in scen_rows if s["status"] != "ok"]
                 row["detail"] = "%d of %d claimed scenarios proven and judged at %s" % (len(scen_rows) - len(bad), len(scen_rows), head[:8])

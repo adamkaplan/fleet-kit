@@ -35606,6 +35606,192 @@ class TestPrSharesFiles(LedgerBase):
         self.assertEqual(before[0], self.gates_text()[0])
 
 
+class TestCarriesLine(LedgerBase):
+    """#1196: a body line `CARRIES: #N` makes the gates read two plans and reuse the dependency's proofs for the commits identical to its head (by commit, never by name)."""
+
+    PR = "acme/app#9"
+    DEP = "acme/app#10"
+    DEP_HEAD = "d" * 40
+    HEAD = "e" * 40
+
+    def setUp(self):
+        super().setUp()
+        self.dep = {"title": "Dep", "state": "OPEN", "headRefOid": self.DEP_HEAD, "reviewDecision": "", "author": {"login": "shared"},
+                    "body": "PLAN: acme/app#8\ncanon: updated the docs", "labels": [], "reviews": [], "comments": [],
+                    "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]}
+        self.pr.update(headRefOid=self.HEAD, body="PLAN: acme/app#7\nCARRIES: #10\ncanon: updated the docs")
+        self.plan8 = dict(self.plan_issue, number=8)
+        self.compare_status = "ahead"
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1] == "pr" and argv[2] == "view" and argv[3] == "10":
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.dep), "")
+        if argv[0] == FAKE_GH and argv[1] == "api" and "/compare/" in argv[2]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"status": self.compare_status}), "")
+        if argv[0] == FAKE_GH and argv[1] == "api" and re.search(r"/issues/8$", argv[2]):
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.plan8), "")
+        if argv[0] == FAKE_GH and argv[1] == "api" and re.search(r"/issues/8/comments", argv[2]):
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[0] == FAKE_GH and argv[1] == "api" and "/compare/" not in argv[2] and "--method" in argv and "/issues/7" not in argv[2] and "/comments" not in argv[2]:
+            return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
+        saved = list(argv)
+        if "--method" in saved:
+            saved = saved[:saved.index("--method")]
+        return super().route(saved, **kwargs)
+
+    def plan_hash(self):
+        return sb.plan_check.plan_hash(LEDGER_PLAN)
+
+    def record(self, pr, head, who="coder", plan_ref=None):
+        """Every scenario of the plan proven and judged for `pr` at `head`."""
+        h, now = self.plan_hash(), self.world.clock.now()
+        for sid, ev, by in (("S1", "ci", "cibot"), ("S2", "tester", "tst"), ("S3", "reviewer", "rev"), ("U1", "ci", "cibot")):
+            sb.plan_ledger.append_entry(self.world.state, {"kind": "proof", "pr": pr, "scenario": sid, "plan_ref": plan_ref, "plan_hash": h, "head": head, "result": "pass", "by": who}, now)
+            sb.plan_ledger.append_entry(self.world.state, {"kind": "verdict", "pr": pr, "scenario": sid, "plan_ref": plan_ref, "plan_hash": h, "head": head, "result": "pass", "by": by, "evaluator": ev}, now)
+
+    def g1(self):
+        code, report, err = self.gates()
+        return code, report, err
+
+    def test_S2_both_plans_proven_at_the_identical_commits_pass_and_both_plans_are_read(self):
+        self.record(self.PR, self.HEAD, plan_ref="acme/app#7")
+        self.record(self.DEP, self.DEP_HEAD, plan_ref="acme/app#8")
+        code, report, err = self.gates()
+        self.assertIn(code, (0, 1), err)
+        self.assertEqual(self.row(report, "G0a")["status"], "ok")
+        self.assertIn("carried plan %s" % self.DEP, self.row(report, "G0a")["detail"])
+        g1 = self.row(report, "G1")
+        self.assertEqual(g1["status"], "ok", g1)
+        self.assertEqual(len([r for r in report["scenarios"] if r.get("carried_from") == self.DEP]), 4, "the dependency's scenarios are read")
+        self.assertEqual(len(report["scenarios"]), 8, "two plans: 4 + 4 scenarios, no fresh proof was recorded for the dependency's")
+        self.assertEqual(report["carries"]["pr"], self.DEP)
+        self.assertEqual(sum(1 for e in self.ledger() if e["pr"] == self.DEP and e["head"] == self.HEAD), 0)
+
+    def test_the_own_commits_still_need_fresh_proofs(self):
+        self.record(self.DEP, self.DEP_HEAD, plan_ref="acme/app#8")
+        code, report, err = self.gates()
+        g1 = self.row(report, "G1")
+        self.assertEqual(g1["status"], "missing")
+        self.assertEqual(len(g1["missing"]), 4, "the four own scenarios are asked for; none of the dependency's")
+        self.assertFalse(any(m.startswith(self.DEP) for m in g1["missing"]))
+
+    def test_S3_a_dependency_proof_for_other_commits_is_not_reused(self):
+        self.record(self.PR, self.HEAD, plan_ref="acme/app#7")
+        self.record(self.DEP, "c" * 40, plan_ref="acme/app#8")   # proven at a head that is not the commits the dependency holds now
+        code, report, err = self.gates()
+        self.assertEqual(code, 1, err)
+        g1 = self.row(report, "G1")
+        self.assertEqual(g1["status"], "missing")
+        self.assertEqual(len([m for m in g1["missing"] if m.startswith(self.DEP)]), 4)
+        self.assertTrue(all(r["status"] == "missing" for r in report["scenarios"] if r.get("carried_from")))
+
+    def test_S5_a_commit_not_in_the_branch_is_refused_with_the_reason(self):
+        self.compare_status = "diverged"
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        self.assertEqual(code, 2, err)
+        self.assertIn("not in this branch", err)
+
+    def test_S5_a_closed_unmerged_dependency_is_refused_with_the_reason(self):
+        self.dep["state"] = "CLOSED"
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        self.assertEqual(code, 2, err)
+        self.assertIn("closed unmerged", err)
+
+    def test_S5_a_merged_dependency_needs_no_carries_line_and_the_pull_request_reads_as_ordinary(self):
+        self.dep["state"] = "MERGED"
+        self.record(self.PR, self.HEAD, plan_ref="acme/app#7")
+        code, report, err = self.gates()
+        self.assertIsNone(report["carries"])
+        self.assertEqual(len(report["scenarios"]), 4)
+        self.assertEqual(self.row(report, "G1")["status"], "ok")
+
+    def test_U1_a_pull_request_with_no_carries_line_is_read_as_before(self):
+        self.pr["body"] = "PLAN: acme/app#7\ncanon: updated the docs"
+        self.record(self.PR, self.HEAD, plan_ref="acme/app#7")
+        code, report, err = self.gates()
+        self.assertIsNone(report["carries"])
+        self.assertEqual(len(report["scenarios"]), 4)
+        self.assertEqual(self.row(report, "G1")["status"], "ok")
+
+    # -- the clear (S4): pure reads of the floor fact and the gate row
+
+    def clear_state(self, head, names=True):
+        record = {"head": head, "reason": "ok", "by": "owner", "at": 1}
+        if names:
+            record["names"] = [self.PR, self.DEP]
+        (self.world.state / "impact-hold.json").write_text(json.dumps({"clears": {self.PR: record}, "applied": {}}))
+
+    def g6(self, head, floor_fn=None):
+        pl = sb.plan_ledger
+        floor = {"decision": "hold", "reasons": ["gates"], "cleared": False, "unreadable": None, "rehold": "held again"}
+        floor = (floor_fn or sb.floor_for_carries)(floor, self.world.state, self.PR, self.DEP)
+        carries = {"pr": self.DEP, "head": self.DEP_HEAD, "plan": None, "refusal": None}
+        report = pl.evaluate_gates(None, [], None, {"head": head, "carries": carries, "floor": floor}, self.PR)
+        return next(r for r in report["gates"] if r["gate"] == "G6")
+
+    def test_S4_the_clear_records_both_names_and_does_not_carry_to_a_later_head(self):
+        self.clear_state(self.HEAD)
+        record = json.loads((self.world.state / "impact-hold.json").read_text())["clears"][self.PR]
+        self.assertEqual(len(record["names"]), 2)
+        self.assertTrue(sb.plan_ledger.clear_names_both(record, self.PR, self.DEP))
+        self.assertFalse(sb.plan_ledger.clear_names_both({"names": [self.PR]}, self.PR, self.DEP))
+        later = self.g6("f" * 40)
+        self.assertEqual(later["status"], "waiting")
+        self.assertIn("clear is for another head", " ".join(later["missing"]))
+
+    def test_S4_the_clear_state_machinery_never_carries_a_clear_that_names_two_pull_requests(self):
+        self.clear_state(self.HEAD)
+        state, problem = sb.read_impact_state(self.world.state)
+        state["carried"] = {self.PR: {"head": "f" * 40, "from": self.HEAD}}
+        engine = types.SimpleNamespace(config={"impact_hold": {"carry_clear": True}}, state_dir=None)
+        self.assertIsInstance(sb.rehold_reason(engine, state, "acme/app", self.PR, "f" * 40), str)
+
+    # -- S6: the mutants. Each is a wrong build; the clause's checks must fail it and pass the real code.
+
+    def checks(self):
+        """The three behaviours every mutant must break. Raises AssertionError when one fails."""
+        pl = sb.plan_ledger
+        plan = {"result": "pass", "defects": [], "plan_hash": self.plan_hash(), "text": "", "scenarios_parsed": [{"id": "S1", "evaluator": "ci", "proof": "test"}]}
+        dep_plan = dict(plan, plan_hash="sha256:" + "1" * 64)
+        now = self.world.clock.now()
+        entries = []
+        for pr, head, h in ((self.PR, self.HEAD, plan["plan_hash"]), (self.DEP, "c" * 40, dep_plan["plan_hash"])):   # the dependency is proven at OTHER commits
+            entries.append({"seq": len(entries) + 1, "kind": "proof", "pr": pr, "scenario": "S1", "plan_hash": h, "head": head, "result": "pass", "by": "coder"})
+            entries.append({"seq": len(entries) + 1, "kind": "verdict", "pr": pr, "scenario": "S1", "plan_hash": h, "head": head, "result": "pass", "by": "cibot", "evaluator": "ci"})
+        carries = {"pr": self.DEP, "head": self.DEP_HEAD, "plan": dep_plan, "refusal": None}
+        g1 = lambda c: next(r for r in pl.evaluate_gates(plan, entries, None, {"head": self.HEAD, "carries": c}, self.PR)["gates"] if r["gate"] == "G1")
+        assert g1(carries)["status"] == "missing", "a proof for different commits was reused"
+        assert any(m.startswith(self.DEP) for m in g1(carries)["missing"]), "the dependency's scenario is not listed as missing"
+        own_only = [e for e in entries if e["pr"] == self.PR] + [dict(e, pr=self.DEP, head=self.DEP_HEAD, seq=e["seq"] + 10, plan_hash=dep_plan["plan_hash"]) for e in entries if e["pr"] == self.PR]
+        ok = pl.evaluate_gates(plan, own_only, None, {"head": self.HEAD, "carries": carries}, self.PR)
+        assert next(r for r in ok["gates"] if r["gate"] == "G1")["status"] == "ok", "identical commits must pass"
+        assert len(ok["scenarios"]) == 2, "the second plan was ignored"
+        self.clear_state(self.HEAD)
+        later = self.g6("f" * 40)
+        assert later["status"] == "waiting" and "clear is for another head" in " ".join(later["missing"]), "a clear carried to a later head"
+
+    def test_S6_the_real_code_passes_the_checks(self):
+        self.checks()
+
+    def test_S6_a_mutant_that_reuses_proofs_for_different_commits_fails(self):
+        real = sb.load_module("plan_ledger").carried_rows
+
+        def mutant(carries, entries, facts):
+            newest = [e["head"] for e in entries if e.get("pr") == carries["pr"] and e.get("kind") == "proof"]
+            return real(dict(carries, head=newest[-1] if newest else carries["head"]), entries, facts)
+        with mock.patch.object(sb.load_module("plan_ledger"), "carried_rows", mutant), self.assertRaises(AssertionError):
+            self.checks()
+
+    def test_S6_a_mutant_that_ignores_the_second_plan_fails(self):
+        with mock.patch.object(sb.load_module("plan_ledger"), "carried_rows", lambda carries, entries, facts: ([], None)), self.assertRaises(AssertionError):
+            self.checks()
+
+    def test_S6_a_mutant_that_lets_a_clear_carry_to_a_later_head_fails(self):
+        mutant = lambda floor, state, pr, dep_pr: dict(floor, cleared=True, clear_head=None, names_both=True, rehold=None)
+        with mock.patch.object(sb, "floor_for_carries", mutant), self.assertRaises(AssertionError):
+            self.checks()
+
+
 class TestPlanGatesCheck(LedgerBase):
     """#107 slice 3a: `gates-check`, the per-repo mode, the kill switches and the role guard. Nothing enforces: no shim calls it."""
 

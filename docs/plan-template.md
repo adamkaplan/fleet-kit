@@ -190,6 +190,10 @@ scenarios:
 **3. An uncovered Done-when clause.** With `Done when: (1) ... (2) ...`, a plan whose scenarios only say `covers: DW-1`
 fails with `DW-2 is not covered by any S scenario`. Every clause needs a scenario that proves it.
 
+## A pull request that carries another (`CARRIES`)
+
+Use `CARRIES: #N` as a standing line of the pull request body only for a dependency that cannot merge first: the pull request holds the other pull request's commits. The body names both pull requests (its own `PLAN:` line, and `CARRIES: #N` for the other, whose own plan is read too). The gates then require both plans, read each against the scenarios its own commits prove, reuse the dependency's recorded proofs, verdicts and strict read for the commits identical to the dependency's head (by commit, never by name), and ask fresh ones only for the pull request's own commits. The owner's clear is recorded at the head that carries the commits, names both pull requests, and never carries to a later head. When the dependency has merged, merge the default branch into the carrying pull request once: it is then read as an ordinary pull request and needs no `CARRIES` line. A line naming a pull request that is closed unmerged, or whose commits are not in the branch, is refused with the reason. One dependency only.
+
 ## The order of the evidence does not matter
 
 A proof (`prove`) and a verdict count when both exist at the same head and plan hash, in either order; the daemon records the `ci` verdict
