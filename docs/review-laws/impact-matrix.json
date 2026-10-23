@@ -372,6 +372,7 @@
         "bin/item_verdicts.py",
         "bin/plan_review.py",
         "bin/pr_events.py",
+        "bin/pr_files.py",
         "bin/queue_ejections.py",
         "bin/reassign.py",
         "bin/reds.py",
@@ -412,6 +413,9 @@
         "bin/item_verdicts.py": [
           "registrations",
           "validate_item_checks"
+        ],
+        "bin/pr_files.py": [
+          "read"
         ],
         "bin/queue_ejections.py": [
           "validate"

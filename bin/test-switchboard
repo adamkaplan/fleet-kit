@@ -15269,7 +15269,11 @@ class TestClearCarry(unittest.TestCase):
         self.api.changed_files_override = 5
         verdict = self.decide(new)
         self.assertFalse(verdict["carried"])
-        self.assertIn("cut: GitHub lists 2 of 5 files", verdict["reason"])
+        self.assertIn("cut: GitHub listed 2 of 5 changed files", verdict["reason"])   # every page was read and the list is still short of the count: void
+        self.api.changed_files_override = 3001
+        verdict = self.decide(new)
+        self.assertFalse(verdict["carried"])
+        self.assertIn("at most 3000", verdict["reason"])   # more than the platform maximum: void
         self.api.changed_files_override = None
         self.api.fail = "/compare/"
         verdict = self.decide(new)
@@ -15396,7 +15400,10 @@ class TestClearCarry(unittest.TestCase):
         calls = [n for n in ast.walk(ast.parse(main)) if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "own_change_fingerprint"]
         self.assertEqual(len(calls), 1, "the clear's wrapper is the only caller in the switchboard; the carry's decide calls the same function inside the module")
         imports = sorted(a.name for n in ast.walk(ast.parse(text)) if isinstance(n, ast.Import) for a in n.names)
-        self.assertEqual(imports, ["hashlib", "json"], "the carry imports no floor, glob or class code: it decides from GitHub's answers alone")
+        self.assertEqual(imports, ["hashlib", "importlib.util", "json", "os", "sys"], "the carry imports no floor, glob or class code: it decides from GitHub's answers alone (importlib, os and sys only load the shared page reader, bin/pr_files.py)")
+        self.assertFalse([n for n in ast.walk(ast.parse(text)) if isinstance(n, ast.ImportFrom)], "no from-import of floor or class code")
+        self.assertNotIn("impact_floor", text)
+        self.assertEqual(text.count('"pr_files.py"'), 1, "the one shared page reader is loaded by name, once")
 
 
 class TestConflictCarry(unittest.TestCase):
@@ -36591,6 +36598,29 @@ class TestImpactFloorOwnerDecision(LedgerBase):
     def cut(self, *paths, total=3000):
         self.pr.update({"changedFiles": total, "files": [{"path": p, "additions": 1, "deletions": 0} for p in paths]})
 
+    def test_139_files_with_the_top_tier_path_only_among_the_last_39_are_judged_by_the_floor_on_all_139(self):
+        """#1098 end to end: `gh pr view` lists the first 100; the floor follows the pages through the shared reader and holds for the top tier path at file 121."""
+        paths = ["docs/f%03d.md" % n for n in range(139)]
+        paths[120] = "shims/gh"
+        self.pr.update({"changedFiles": 139, "files": [{"path": p, "additions": 1, "deletions": 0} for p in paths[:100]]})
+        requests = []
+
+        def get(path):
+            requests.append(path)
+            page = int(path.rsplit("page=", 1)[1])
+            return [{"filename": p, "status": "modified"} for p in paths[(page - 1) * 100:page * 100]]
+        with mock.patch.object(sb, "impact_carry_get", lambda engine, runner, repo: get), mock.patch.object(sb, "agent_block_states", return_value={}):
+            shown = json.loads(self.floor("--json"))
+            out = self.floor()
+            self.assertEqual((shown["owner_decision"], shown["complete"], shown["files_read"], shown["files_total"]), ("hold", True, 139, 139))
+            self.assertIn("HOLD for the owner", out)
+            self.assertIn("shims/gh", out)
+            self.assertEqual(sorted(set(requests)), ["repos/acme/app/pulls/9/files?per_page=100&page=1", "repos/acme/app/pulls/9/files?per_page=100&page=2"])
+            # the mutant: the first page only (the old reading) misses the path
+            with mock.patch.object(sb.load_module("pr_files"), "read", lambda g, r, n, total=None: (g("repos/%s/pulls/%d/files?per_page=100&page=1" % (r, n)), None)):
+                mutant = json.loads(self.floor("--json"))
+            self.assertNotEqual(mutant["owner_decision"], "hold", "a first-page-only reader misses the top tier path: this test sees it")
+
     def test_a_complete_list_says_how_many_files_were_read_in_the_headline(self):
         self.files("docs/switchboard.md", "docs/plan-template.md")
         out = self.floor()
@@ -36617,7 +36647,9 @@ class TestImpactFloorOwnerDecision(LedgerBase):
 
     def test_a_cut_list_in_a_repo_with_floor_globs_is_held_on_purpose_as_the_daemon_holds_it(self):
         self.cut(*["docs/f%d.md" % n for n in range(100)])   # the repo of this class has floor globs
-        out = self.floor()
+        pages = lambda engine, runner, repo: (lambda path: [{"filename": "docs/f%d.md" % n} for n in range(100)] if path.endswith("page=1") else [])   # GitHub lists 100 and then no more
+        with mock.patch.object(sb, "impact_carry_get", pages):
+            out = self.floor()
         self.assertIn("HOLD for the owner, 100 files read", out.split("\n")[0])
         self.assertIn("floor unknown: GitHub listed 100 of 3000", out)
 
@@ -36740,10 +36772,10 @@ class TestImpactFloorCommandAndPass(LedgerBase):
         self.assertEqual((got["decision"], len(got["rated"])), ("hold", 1))
 
     def test_a_huge_diff_with_a_truncated_file_list_holds_as_unknown_and_the_daemon_records_it(self):
-        self.pr.update({"changedFiles": 3000, "files": [{"path": "src/f%d.py" % n} for n in range(100)]})
+        self.pr.update({"changedFiles": 3001, "files": [{"path": "src/f%d.py" % n} for n in range(100)]})   # more than GitHub will list (#1098)
         report = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
         self.assertEqual((report["decision"], report["complete"], report["floor_paths"]), ("hold", False, []))
-        self.assertIn("GitHub listed 100 of 3000", report["unknown"])
+        self.assertIn("GitHub lists at most 3000 of the 3001", report["unknown"])
         self.assertIn("unknown floor, held on purpose", self.run_as("coder", "impact", "floor", self.PR)[1])
         hub = FakeHub({"acme/app": [{"number": 9, "head": {"sha": LEDGER_HEAD}, "body": "PLAN: acme/app#7", "draft": False}]})
         engine = self.world.new_engine("daemon")
@@ -36752,7 +36784,7 @@ class TestImpactFloorCommandAndPass(LedgerBase):
         sb.ci_record_pass(engine, 100000.0)
         sb.impact_would_hold_pass(engine, 100000.0)
         (event,) = [e for e in self.world.audit() if e["event"] == "gate.would_hold"]
-        self.assertIn("GitHub listed 100 of 3000", event["detail"]["unknown"])
+        self.assertIn("GitHub lists at most 3000 of the 3001", event["detail"]["unknown"])
 
     def test_a_rename_out_of_a_floor_path_still_holds_with_or_without_the_old_path(self):
         self.pr.update({"changedFiles": 1, "files": [{"path": "elsewhere/0002.sql", "previous_filename": "migrations/0002.sql", "changeType": "RENAMED"}]})
@@ -77673,11 +77705,12 @@ class TestClearLine(TestImpactHold):
             if self.fail_on and self.fail_on in path:
                 raise ValueError("the read failed")
             if "/files" in path:
-                return self.listing if "page=1" in path else []
+                page = int(path.rsplit("page=", 1)[1])
+                return self.listing[(page - 1) * 100:page * 100]
             if "/comments" in path:
                 number = re.search(r"/issues/(\d+)/", path).group(1)
                 return [c for c in self.comments if c.get("n", "9") == number] if "page=1" in path else []
-            return {"head": {"sha": self.pr["headRefOid"]}, "base": {"sha": "b" * 40}}
+            return {"head": {"sha": self.pr["headRefOid"]}, "base": {"sha": "b" * 40}, "changed_files": len(self.listing)}
         return get
 
     def route(self, argv, **kwargs):
@@ -77817,6 +77850,42 @@ class TestClearLine(TestImpactHold):
             sb.load_module("delegated_clear").MAP_CACHE.clear()   # the mutant: no shared cache
             sb.delegated_clear_pr_checks(engine, engine.gh_runner, "acme/app", 9)
             self.assertEqual(len(reads), 4, "without the hand-over the clear reads again")
+
+    def big_pr(self, special, status, count=139, at=120):
+        """`count` changed files, `special` the one at index `at` (past the first page of 100): the floor read the first 100 only, the clear's inputs follow every page (#1098)."""
+        paths = ["migrations/0002.sql"] + ["docs/f%03d.md" % n for n in range(count - 1)]
+        paths[at] = special
+        self.set_files(*paths)
+        self.listing[at]["status"] = status
+        self.pr["files"] = [{"path": p} for p in paths[:100]]   # `gh pr view` lists the first 100 only
+        self.pr["changedFiles"] = count
+
+    def test_s3_139_files_the_new_file_past_page_one_is_refused_by_the_clear_and_named_in_the_who_line(self):
+        self.delegation()
+        self.big_pr("bin/new_tool.py", "added")
+        engine = self.world.new_engine("daemon")
+        engine.gh_runner, engine.config, engine.state_dir = self.route, sb.load_config(), self.world.state
+        got = sb.clear_who(engine, engine.gh_runner, "acme/app", 9)
+        self.assertEqual(got["who"], "owner only")
+        self.assertIn("new-file", [o["kind"] for o in got["owner_only"]], got)
+        report, why = sb.delegated_clear_pr_checks(engine, engine.gh_runner, "acme/app", 9)
+        self.assertIsNone(report)
+        self.assertIn("bin/new_tool.py", why)
+        self.assertTrue(any("page=2" in p for p in self.gets if "/files" in p), "the second page was read")
+
+    def test_s3_139_files_a_changed_daemon_file_past_page_one_is_refused_by_the_closure_rule(self):
+        self.delegation()
+        self.mapped = ["it changes f, part of the clear (head file)"]
+        self.big_pr("bin/fleet-switchboard", "modified")
+        engine = self.world.new_engine("daemon")
+        engine.gh_runner, engine.config, engine.state_dir = self.route, sb.load_config(), self.world.state
+        with mock.patch.object(sb, "delegated_clear_map", lambda *a: self.mapped):
+            got = sb.clear_who(engine, engine.gh_runner, "acme/app", 9)
+            report, why = sb.delegated_clear_pr_checks(engine, engine.gh_runner, "acme/app", 9)
+        self.assertEqual(got["who"], "owner only")
+        self.assertIn("closure", [o["kind"] for o in got["owner_only"]], got)
+        self.assertIsNone(report)
+        self.assertIn("part of the clear", why)
 
     def test_u2_a_pull_request_that_holds_nothing_gets_no_comment_and_the_labels_are_unchanged(self):
         self.set_files("src/app.py")
@@ -87138,6 +87207,125 @@ class TestAssembler(unittest.TestCase):
         done = subprocess.run([sys.executable, "-B", str(link), "status", "--help"], capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("usage: fleet-switchboard status", done.stdout)
+
+
+class TestEveryChangedFileIsRead(unittest.TestCase):
+    """#1098: one shared reader of a pull request's changed files, following every page up to the platform's maximum."""
+    TOP = "bin/top_tier.py"
+
+    @staticmethod
+    def module():
+        return sb.load_module("pr_files")
+
+    @staticmethod
+    def fixture(count, top_at=None, total=None, fail_page=None):
+        files = [{"filename": "src/f%04d.txt" % i} for i in range(count)]
+        if top_at is not None:
+            files[top_at] = {"filename": TestEveryChangedFileIsRead.TOP}
+        calls = []
+
+        def get(path):
+            calls.append(path)
+            page = int(path.rsplit("page=", 1)[1])
+            if fail_page == page:
+                raise OSError("down")
+            if fail_page == -page:
+                return {"message": "bad"}
+            return files[(page - 1) * 100:page * 100]
+        return get, calls, files, count if total is None else total
+
+    def run_reader(self, reader, count, **kw):
+        get, calls, files, total = self.fixture(count, **kw)
+        got, why = reader(get, "acme/app", 7, total)
+        return got, why, len(calls)
+
+    def test_139_files_with_the_top_tier_path_in_the_last_39(self):
+        got, why, calls = self.run_reader(self.module().read, 139, top_at=120)
+        self.assertEqual((len(got), why, calls), (139, None, 2))
+        self.assertEqual([f for f in got if f["filename"] == self.TOP], [{"filename": self.TOP}])
+
+    def test_250_files_over_three_pages_with_a_top_tier_path_on_page_3(self):
+        got, why, calls = self.run_reader(self.module().read, 250, top_at=220)
+        self.assertEqual((len(got), calls), (250, 3))
+        self.assertEqual(sum(1 for f in got if f["filename"] == self.TOP), 1)
+
+    def test_exactly_100_and_101_and_fewer(self):
+        for count, requests in ((40, 1), (100, 1), (101, 2), (200, 2)):
+            got, why, calls = self.run_reader(self.module().read, count)
+            self.assertEqual((len(got), why, calls), (count, None, requests), count)
+
+    def test_a_total_above_the_listable_maximum_fails_closed_naming_it(self):
+        get, calls, files, total = self.fixture(100, total=3500)
+        got, why = self.module().read(get, "acme/app", 7, 3500)
+        self.assertIsNone(got)
+        self.assertIn("3000", why)
+        self.assertIn("maximum", why)
+        self.assertEqual(calls, [])
+
+    def test_a_failed_read_is_unknown_never_an_empty_list(self):
+        for kw in ({"fail_page": 2}, {"fail_page": -2}):
+            got, why, calls = self.run_reader(self.module().read, 250, **kw)
+            self.assertIsNone(got, kw)
+            self.assertTrue(why, kw)
+
+    def test_a_list_shorter_than_the_stated_total_is_unknown(self):
+        got, why, calls = self.run_reader(self.module().read, 100, total=139)
+        self.assertIsNone(got)
+        self.assertIn("100 of 139", why)
+
+    def test_the_mutants_fail(self):
+        maximum = self.module().MAX_FILES
+
+        def first_page(get, repo, n, total=None):
+            return get("repos/%s/pulls/%d/files?per_page=100&page=1" % (repo, n)), None
+
+        def two_pages(get, repo, n, total=None):
+            out = []
+            for page in (1, 2):
+                out += get("repos/%s/pulls/%d/files?per_page=100&page=%d" % (repo, n, page))
+            return out, None
+
+        def ignores_maximum(get, repo, n, total=None):
+            out = []
+            for page in range(1, 40):
+                batch = get("repos/%s/pulls/%d/files?per_page=100&page=%d" % (repo, n, page))
+                out += batch
+                if len(batch) < 100:
+                    break
+            return out, None
+
+        def verdicts(reader):
+            bad = []
+            if len(self.run_reader(reader, 139, top_at=120)[0] or []) != 139:
+                bad.append("139")
+            if len(self.run_reader(reader, 250, top_at=220)[0] or []) != 250:
+                bad.append("250")
+            get, calls, files, total = self.fixture(100, total=maximum + 500)
+            if reader(get, "acme/app", 7, maximum + 500)[0] is not None:
+                bad.append("maximum")
+            return bad
+        self.assertEqual(verdicts(self.module().read), [])
+        for mutant in (first_page, two_pages, ignores_maximum):
+            self.assertTrue(verdicts(mutant), mutant.__name__)
+
+    def test_no_reader_has_its_own_files_request(self):
+        found = []
+        for path in sorted(list(BIN.glob("*.py")) + [BIN / "fleet-switchboard"]):
+            if path.name == "pr_files.py":
+                continue
+            if re.search(r"pulls/%d/files|pulls/\{[^}]*\}/files", path.read_text()):
+                found.append(path.name)
+        self.assertEqual(found, [])
+
+    def test_the_readers_use_the_shared_function(self):
+        for name in ("clear_carry.py", "impact_hold.py"):
+            self.assertRegex((BIN / name).read_text(), r"pr_files", name)
+        self.assertIn('load_module("pr_files").read', (BIN / "fleet-switchboard").read_text())
+
+    def test_the_documentation_states_the_rule(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        self.assertEqual(text.count("### Every changed file of a pull request is read (#1098)"), 1)
+        self.assertIn("stated maximum of 3000 files", text)
 
 
 if __name__ == "__main__":

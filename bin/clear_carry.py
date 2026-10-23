@@ -52,6 +52,19 @@ def _get_list(get, path, pages, what, key=None):
     raise CarryVoid("%s is longer than %d items: too long to read in full" % (what, pages * PAGE))
 
 
+def _pr_files():
+    import importlib.util
+    import os
+    import sys
+    if "pr_files" in sys.modules:
+        return sys.modules["pr_files"]
+    spec = importlib.util.spec_from_file_location("pr_files", os.path.join(os.path.dirname(os.path.realpath(__file__)), "pr_files.py"))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pr_files"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _object(get, path, what):
     try:
         answer = get(path)
@@ -88,10 +101,12 @@ def own_change(get, repo, number):
     copy, whose blob id pins its content, and when the head moved while the pages were read (the head is read before AND after)."""
     head, pull = pull_head(get, repo, number)
     base = base_ref_of(pull)
-    files = _get_list(get, "repos/%s/pulls/%d/files?per_page=%d" % (repo, number, PAGE), FILE_PAGES, "the changed files", None)
     total = pull.get("changed_files")
-    if not isinstance(total, int) or isinstance(total, bool) or total != len(files):
-        raise CarryVoid("the changed-file list is cut: GitHub lists %d of %s files" % (len(files), total))
+    if not isinstance(total, int) or isinstance(total, bool):
+        raise CarryVoid("the changed-file list is cut: GitHub gave no count of files")
+    files, why = _pr_files().read(get, repo, number, total)   # the ONE reader of the list (#1098)
+    if files is None:
+        raise CarryVoid("the changed-file list is cut: %s" % why)
     out = []
     for item in files:
         if not isinstance(item, dict) or not isinstance(item.get("filename"), str):

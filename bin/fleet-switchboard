@@ -23174,10 +23174,25 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
             renamed.append(item.get("path"))   # `gh pr view` does not say where it came from
     total = raw.get("changedFiles") if isinstance(raw.get("changedFiles"), int) else len(files)
     complete = len(files) >= total and not raw.get("truncated")
+    cut_why = None
+    if not complete and globs:   # `gh pr view` lists the first 100: follow the pages through the ONE reader (#1098); unknown only when GitHub says there are more than it lists
+        runner = engine.gh_runner or subprocess.run
+        listed, cut_why = load_module("pr_files").read(impact_carry_get(engine, runner, repo), repo, number, total)
+        if listed is not None:
+            files = [dict(f, path=f.get("filename")) for f in listed]
+            complete, cut_why = True, None
+            paths, renamed = [], []
+            for item in files:
+                paths.append(item.get("path"))
+                old = item.get("previous_filename")
+                if isinstance(old, str) and old:
+                    paths.append(old)
+                elif str(item.get("status") or "") in ("renamed", "copied"):
+                    renamed.append(item.get("path"))
     hit = impact_floor.floor_paths(paths, globs, exclude, force)
     unknown = None
     if globs and not complete:
-        unknown = "GitHub listed %d of %d changed files" % (len(files), total)
+        unknown = cut_why or "GitHub listed %d of %d changed files" % (len(files), total)
     elif globs and renamed:
         unknown = "%d renamed or copied file(s) with no known source path (%s)" % (len(renamed), ", ".join(renamed[:3]))
     matrix = impact_floor.load_matrix()
