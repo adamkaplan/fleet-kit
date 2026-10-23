@@ -660,3 +660,102 @@ def mark_seen(state_dir, message_id, now, lock_seconds=LOCK_SECONDS):
             except OSError:
                 pass
             raise
+
+
+# ----------------------------------------------------------------------------- #1194: the two-step clear
+#
+# Step 1 (the understanding reply): the owner's one message that names one offered PR is answered once, in the session, with the PR, the FULL head, what the clear covers and the Questions
+# of the body; a pending record is kept. Step 2 (the confirmation): only the one word "yes" and the number of the pending PR ("yes 1163") clears, bound to that full head. The
+# confirmation is deterministic: no judge is asked. A damaged, oversized or missing pending file means no pending reply (fail toward hold).
+
+PENDING_FILE = "chat-clear-pending.json"
+PENDING_MAX_BYTES = 8192
+PENDING_TTL = 600              # seconds: a pending reply older than this (10 minutes) is not confirmable
+CONFIRM_RE = re.compile(r"^\s*(?:yes)\b[\s,.:!-]*(?:(?:#\s*)?([0-9]+))?[\s.!]*$", re.IGNORECASE)
+YES_START = re.compile(r"^\s*yes\b", re.IGNORECASE)
+HEAD_RE = re.compile(r"^[0-9a-f]{40}$")
+QUESTIONS_HEADER = "## Questions for you"
+QUESTIONS_MAX = 600
+REASONS.update({"no_pending": "there is no pending understanding reply to confirm (say the number first)",
+                "confirm_no_number": "a confirmation is the word yes and the number, for example `yes %s`",
+                "confirm_other_number": "that number is not the one in the pending reply",
+                "stale": "the pending reply is old (over 10 minutes) and must be given again",
+                "offer_old": "the offer is old (over 7 days) and must be shown to you again first",
+                "no_explainer": "this pull request changes the clear machinery and its description has no single explainer block"})
+
+
+def is_confirmation_like(text):
+    """True for a message that starts with the word yes: it is read as a confirmation attempt, never as a first message."""
+    return isinstance(text, str) and len(text) < TEXT_MAX and bool(YES_START.match(text))
+
+
+def confirmation_number(text):
+    """The number of a confirmation ("yes 1163"), 0 for a bare yes, None when the text is not a confirmation at all. Exactly the word yes and at most one number."""
+    match = CONFIRM_RE.match(text) if isinstance(text, str) and len(text) < TEXT_MAX else None
+    if not match:
+        return None
+    return int(match.group(1)) if match.group(1) else 0
+
+
+def _pending_valid(entry):
+    return isinstance(entry, dict) and isinstance(entry.get("pr"), str) and isinstance(entry.get("head"), str) and bool(HEAD_RE.match(entry["head"])) \
+        and isinstance(entry.get("at"), int) and not isinstance(entry.get("at"), bool) and isinstance(entry.get("offer_id"), str) \
+        and isinstance(entry.get("words"), str) and isinstance(entry.get("machinery"), bool)
+
+
+def read_pending(state_dir):
+    """The pending reply {"pr", "head", "offer_id", "at", "words", "machinery"} or None. Missing, oversized, damaged or malformed: None (nothing can be confirmed)."""
+    path = Path(state_dir) / PENDING_FILE
+    try:
+        if path.stat().st_size > PENDING_MAX_BYTES:
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    entry = data.get("pending") if isinstance(data, dict) else None
+    return entry if _pending_valid(entry) else None
+
+
+def write_pending(state_dir, entry, lock_seconds=LOCK_SECONDS):
+    """Record (entry) or drop (None) the pending reply. Atomic, private (0600). One pending reply at a time: a new one replaces the old."""
+    if entry is not None and not _pending_valid(entry):
+        raise ValueError("a pending reply needs the full 40-character head")
+    directory = Path(state_dir)
+    with _locked(state_dir, lock_seconds):
+        fd, tmp = tempfile.mkstemp(prefix=PENDING_FILE + ".", dir=str(directory))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"pending": entry}, handle, sort_keys=True, ensure_ascii=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, str(directory / PENDING_FILE))
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
+def offer_id(pr, offer):
+    """The id that ties a clear to the offer shown: the offers key and its `shown_at`."""
+    return "%s@%s" % (pr, (offer or {}).get("shown_at"))
+
+
+def body_questions(body):
+    """The Questions of a PR body (the text under `## Questions for you`, to the next heading), one clean block; a body without them says so."""
+    text = body if isinstance(body, str) else ""
+    if QUESTIONS_HEADER not in text:
+        return "no Questions section in the description"
+    part = text.split(QUESTIONS_HEADER, 1)[1].split("\n## ", 1)[0].strip()
+    return _clean(part, QUESTIONS_MAX) if part else "no Questions in the description"
+
+
+def reply_text(pr, head, machinery, questions, quoted):
+    """The understanding reply (step 1): the PR, the FULL head, what the clear covers, the Questions, and how to confirm."""
+    number = pr.rsplit("#", 1)[1]
+    covers = ("it CHANGES THE CLEAR MACHINERY (cleared only at this head and only with the explainer block present)" if machinery
+              else "it does not touch the clear machinery")
+    return ("[chat clear] I understood you want to clear %s at head %s; %s.\nQuestions of its description: %s\n"
+            "To confirm say `yes %s` within 10 minutes; a push before then cancels it. (your words: \"%s\")" % (pr, head, covers, questions, number, quoted))
