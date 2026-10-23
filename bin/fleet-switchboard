@@ -23902,7 +23902,8 @@ def add_merge_gate_parsers(sub):
 
 
 def merge_gate_gh(config, runner, repo):
-    """`gh(argv) -> (code, stdout, stderr)` for `repo`'s account, never raising; every call names itself the switchboard's own, so the shim does not probe it."""
+    """`gh(argv, own=True) -> (code, stdout, stderr)` for `repo`'s account, never raising; a call names itself the switchboard's own, so the shim does not probe it,
+    EXCEPT with `own=False` (the one merge call of `--pass --merge`): that call carries no marker, so the shim's own checks (the review check among them) run."""
     accounts = GhAccounts(config, runner, time.time)
     try:
         refuse_excluded(config, repo)
@@ -23910,10 +23911,12 @@ def merge_gate_gh(config, runner, repo):
     except AccountError as err:
         raise LedgerCommandError(str(err)) from None
     env = dict(env if env is not None else os.environ, **{OWN_GH_ENV: "1"})
+    plain_env = {k: v for k, v in env.items() if k != OWN_GH_ENV}
 
-    def gh(argv):
+    def gh(argv, own=True):
         try:
-            done = runner([config["gh"]] + argv, capture_output=True, text=True, timeout=config["call_timeout_seconds"], stdin=subprocess.DEVNULL, env=env)
+            done = runner([config["gh"]] + argv, capture_output=True, text=True, timeout=config["call_timeout_seconds"], stdin=subprocess.DEVNULL,
+                          env=env if own else plain_env)
         except (OSError, subprocess.SubprocessError) as err:
             return 1, "", accounts.scrub(_one_line(str(err), 120))
         return done.returncode, done.stdout or "", accounts.scrub(done.stderr or "")

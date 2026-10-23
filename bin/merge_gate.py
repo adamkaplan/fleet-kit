@@ -404,9 +404,26 @@ def check_merge(reading, gh, conf, state, repo, number, caller, person, waived_h
 MERGE_FLAGS = ("--squash",)   # the one merge method the shim's gated path allows here; never --admin, never an over-review flag
 
 
+def review_blockers(reviews, head="", decision=""):
+    """The SAME rule as `review_blockers` in shims/gh (a test holds the two equal): the reviewers whose latest decisive review (APPROVED, CHANGES_REQUESTED,
+    DISMISSED) is CHANGES_REQUESTED and still blocks this head (at the head, or its commit or the head unknown, or GitHub's decision says so)."""
+    latest = {}
+    for review in reviews if isinstance(reviews, list) else []:
+        if not isinstance(review, dict):
+            continue
+        author = ((review.get("author") or {}).get("login")) if isinstance(review.get("author"), dict) else None
+        state = str(review.get("state") or "").upper()
+        if author and state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            commit = review.get("commit") if isinstance(review.get("commit"), dict) else {}
+            latest[author] = (state, commit.get("oid") if isinstance(commit.get("oid"), str) else "")
+    blocked = str(decision or "").upper() == "CHANGES_REQUESTED"
+    return sorted(who for who, (state, oid) in latest.items()
+                  if state == "CHANGES_REQUESTED" and (blocked or not oid or not head or oid.lower() == head.lower()))
+
+
 def pass_and_merge(reading, gh, conf, state, repo, number, holder, pid, clock, sleep, allow_held=False, alive=pid_alive, wait_seconds=None):
     """`merge-gate --pass --merge`: the pass, then, in this same process, a fresh read of the head, the labels and the gates, then `gh pr merge --squash
-    --match-head-commit <head>`. The merge goes through `gh` (the shim there stays the only authority: a blocking review or a missing pass refuses it).
+    --match-head-commit <head>`. The merge goes through `gh` WITHOUT the own-call marker (`own=False`), so the shim's checks run (a blocking review or a missing pass refuses it); before it, this function reads the reviews itself and refuses a blocking one by name.
     Any mismatch merges nothing and releases the lock. Returns (exit code, lines, audit); `audit` is the ONE record of the run: the pass, each re-read and the outcome."""
     ref = "%s#%d" % (repo, number)
     audit = {"pr": ref, "head": None, "pass": None, "reread": {}, "outcome": None}
@@ -453,7 +470,24 @@ def pass_and_merge(reading, gh, conf, state, repo, number, holder, pid, clock, s
         if locked:
             release(state, repo, before["branch"], holder)
         return done(1, "merge-gate --pass --merge: nothing merged, the lock is released: %s" % problem[1], "refused: %s" % problem[0])
-    code, out, err = gh(["pr", "merge", str(number), "-R", repo] + list(MERGE_FLAGS) + ["--match-head-commit", head])
+    rcode, rout, _ = gh(["pr", "view", str(number), "-R", repo, "--json", "reviews,headRefOid,reviewDecision"])
+    try:
+        rdata = json.loads(rout) if rcode == 0 else None
+    except ValueError:
+        rdata = None
+    if not isinstance(rdata, dict):
+        audit["reread"]["reviews"] = "unreadable"
+        if locked:
+            release(state, repo, before["branch"], holder)
+        return done(1, "merge-gate --pass --merge: nothing merged, the lock is released: the reviews could not be read", "refused: reviews unreadable")
+    blockers = review_blockers(rdata.get("reviews"), head, rdata.get("reviewDecision"))
+    audit["reread"]["reviews"] = "ok" if not blockers else "blocking: %s" % ", ".join(blockers)
+    if blockers:
+        if locked:
+            release(state, repo, before["branch"], holder)
+        return done(10, "merge-gate --pass --merge: nothing merged, the lock is released: %s requested changes (CHANGES_REQUESTED) at the head %s" % (", ".join(blockers), head[:8]),
+                    "refused: blocking review")
+    code, out, err = gh(["pr", "merge", str(number), "-R", repo] + list(MERGE_FLAGS) + ["--match-head-commit", head], own=False)
     if locked:
         release(state, repo, before["branch"], holder)   # the shim frees it too; both are harmless
     if code != 0:
