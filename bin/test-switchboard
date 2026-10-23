@@ -13387,7 +13387,7 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
     PATHS = [REPO / "agents" / "opencode" / "chief-of-staff.md", REPO / "agents" / "opencode" / "cos-subagent.md"]
     PATH = PATHS[0]
     TEMP = "/private/var/folders/ab/T/opencode"
-    MAX_BLOCK_LINES = 210
+    MAX_BLOCK_LINES = 340
 
     @staticmethod
     def block(path):
@@ -13589,6 +13589,127 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
         self.assertIn("keeps you **focused on your job**", text)
         self.assertNotIn("never merge,", text)
         self.assertNotIn("ASKS your principal", text)  # one story: a denial is hard and nothing asks
+
+
+class TestChiefOfStaffSedReads(unittest.TestCase):
+    """#1012: the Chief of Staff may read with `sed` in three spelled-out forms and never write, run or edit in place. The permission engine matches whole-value
+    globs, so the deny list is a fence of listed spellings derived from the sed manual (options -i -s -f -e, commands w W e r R y z F =, the s///w and s///e flags),
+    not a parser of sed. A pipe is split by the engine, so the stdin forms are the same rules."""
+    P = TestChiefOfStaffNativePermissions
+    BASELINE = "d7c4f3d"   # the definition before #1012; everything outside the sed rules must equal it byte for byte
+
+    @classmethod
+    def rules(cls):
+        return cls.P.rules()[1]
+
+    @classmethod
+    def verdict(cls, rules, cmd):
+        """The engine splits a pipeline into its commands and every one must be allowed (a deny anywhere denies)."""
+        parts = cmd.split(" | ")
+        verdicts = [cls.P.evaluate(rules, "shell", p) for p in parts]
+        return "allow" if all(v == "allow" for v in verdicts) else "deny"
+
+    ALLOWED = [
+        "sed -n '120,180p' /var/log/app.log", "sed -n '1,5p' notes.txt",
+        "sed -n '/ERROR/p' /var/log/app.log", "sed -n '/Timeout 30s/p' run.log",
+        "sed -n 's/foo/bar/p' config.txt", "sed -n 's/token=[0-9]*/token=N/p' run.log",
+        "sed -n '120,180p'", "sed -n '2,3p'", "sed -n '/ERROR/p'", "sed -n '/Disk full/p'",
+        "sed -n 's/a/b/p'", "sed -n 's/x y/z/p'",
+    ]
+
+    @classmethod
+    def denied(cls):
+        """Every spelling that can write, run, edit in place or read another file, in file form and in pipe (stdin) form."""
+        bodies = [
+            "sed -i 's/a/b/' f", "sed -i.bak 's/a/b/' f", "sed -ni 's/a/b/p' f", "sed -in 's/a/b/p' f", "sed -n -i 's/a/b/p' f", "sed -n '1,3p' -i f",
+            "sed --in-place 's/a/b/' f", "sed --in-place=.bak 's/a/b/' f", "sed -n --in-place=.bak '1,3p' f", "sed -nsi '1p' f",
+            "sed -s -n '1,3w out' a b", "sed --separate -n '1,3w out' a b", "sed -n -s '1,3p' a b", "sed -n '1,3p' --separate a b",
+            "sed -n '1,3w out.p' f", "sed -n '1,3W out.p' f", "sed -n '/x/w out.p' f", "sed -n '$w out.p' f", "sed -n '15,20w out.p' f",
+            "sed -n '1,3e echo hi.p' f", "sed -n '/x/e touch z.p' f", "sed -n '1,3r /etc/passwd.p' f", "sed -n '1,3R /etc/passwd.p' f",
+            "sed -n '/x/R other.p' f", "sed -n '1!w out.p' f",
+            "sed -n 's/a/b/w out.p' f", "sed -n 's/a/b/e' f", "sed -n 's/a/b/pe' f", "sed -n 's/a/b/pw out.p' f", "sed -n 's/a/b/gw out.p' f",
+            "sed -n -f script.sed f", "sed -n --file=script.sed f", "sed -n --file script.sed f", "sed -n '1,3p' -f s.sed f", "sed -n -e '1p' -e '2w out' f",
+            "sed -n --expression='1p' --expression='2w out' f", "sed -n -e 'p' f", "sed -n '1,3p' -e '2w x' f",
+            "sed -n '1,3y/abc/xyz/' f", "sed -n '1,3z' f", "sed -n '1,3F' f", "sed -n '1,3=' f", "sed -n 'y/a/b/' f", "sed '1,3p' f", "sed 's/a/b/' f",
+            "sed -n '1p;2w out.p' f", "sed -n '1p; 2w out.p' f", "sed -n '1,3p;e id' f", "sed -n '1p\n2w out.p' f", "sed -n $'1p\\n2w out.p' f",
+            "sed -n '1,3p' f > out", "sed -n '1,3p' f >> out", "sed -n '1,3p' <<EOF\nx\nEOF", "sed -n '/a/p' <<'EOF'\nx\nEOF", "sed -n '1,3p' < f",
+            "sed -n \"1,3w out.p\" f", "sed -n '1,3'w' out.p' f", "sed -n 1,3\\w\\ out.p f", "sed -n '1,3p'$(touch x) f", "sed -n '1,3p'`touch x` f",
+            "sed -n '1{w out.p}' f", "sed -n '1,3{w out.p}' f", "sed -n 's/a/b/;w out.p' f", "sed -n '/a/p' f -i", "sed -n -e '1,3p' f",
+        ]
+        for x in "ifse":   # each option alone, behind one letter, behind two, and the long spellings
+            bodies += ["sed -n '1,3p' -%s x" % x, "sed -n '1,3p' -n%s x" % x, "sed -n '1,3p' -nn%s x" % x]
+        bodies += ["sed -n '1,3p' --in-place f", "sed -n '1,3p' --separate f", "sed -n '1,3p' --file=s f", "sed -n '1,3p' --expression=p f", "sed -n '1,3}p' f", "sed -n '1,3{p' f",
+                   "sed -n '1,2p;p' f", "sed -n '1,2p\np' f", "sed -n '1,3p' \"a b\"", "sed -n '1,3p' a\\ b", "sed -n '1,3p' $(ls)", "sed -n '1,3p' `ls`"]
+        for L in "wWerR":   # each command letter behind every address spelling and as an s/// flag
+            bodies += ["sed -n '1,3%s out.p' f" % L, "sed -n '1,$%s out.p' f" % L, "sed -n '1,2!%s out.p' f" % L, "sed -n '/x/%s out/p' f" % L, "sed -n 's,a,b,%s out.p' f" % L,
+                       "sed -n '1,3'%s' out.p' f" % L, "sed -n 's/a/b/g%s out/p' f" % L, "sed -n 's/a/b/%s out/p' f" % L]
+            bodies += ["sed -n '1,%d%s out.p' f" % (d, L) for d in range(10)]
+        return bodies + ["cat f | " + b for b in bodies]
+
+    def run_cases(self, rules):
+        """Number of failing expectations for a rule list: an allowed form denied or a denied spelling allowed."""
+        bad = sum(1 for c in self.ALLOWED if self.verdict(rules, c) != "allow")
+        bad += sum(1 for c in self.denied() if self.verdict(rules, c) == "allow")
+        sed = [i for i, r in enumerate(rules) if r["resource"].startswith("sed ")]
+        allows = [i for i in sed if rules[i]["effect"] == "allow"]
+        denies = [i for i in sed if rules[i]["effect"] == "deny"]
+        if not allows or not denies or min(denies) < max(allows):
+            bad += 1
+        return bad
+
+    def test_the_real_list_passes_the_matcher(self):
+        self.assertEqual(self.run_cases(self.rules()), 0)
+
+    def test_twelve_of_twelve_allowed_and_the_denies_come_after_the_allows(self):
+        rules = self.rules()
+        self.assertEqual(sum(1 for c in self.ALLOWED if self.verdict(rules, c) == "allow"), 12)
+        idx = [(i, r["effect"]) for i, r in enumerate(rules) if r["resource"].startswith("sed ")]
+        self.assertLess(max(i for i, e in idx if e == "allow"), min(i for i, e in idx if e == "deny"))
+
+    def test_no_denied_spelling_is_allowed(self):
+        rules = self.rules()
+        cases = self.denied()
+        self.assertGreaterEqual(len(cases), 25)
+        self.assertEqual([c for c in cases if self.verdict(rules, c) == "allow"], [])
+
+    def test_the_previous_writers_stay_denied(self):
+        rules = self.rules()
+        for c in ("sed -i s/a/b/ f", "sed -n 'w out' f", "tee out", "cat f | tee out", "sed s/a/b/ f"):
+            with self.subTest(c=c):
+                self.assertEqual(self.verdict(rules, c), "deny")
+
+    def test_a_dropped_deny_fails_the_matcher(self):
+        rules = self.rules()
+        survivors = []
+        for i, r in enumerate(rules):
+            if r["resource"].startswith("sed ") and r["effect"] == "deny":
+                if self.run_cases(rules[:i] + rules[i + 1:]) == 0:
+                    survivors.append(r["resource"])
+        self.assertEqual(survivors, [])
+
+    def test_a_loosened_allow_fails_the_matcher(self):
+        rules = self.rules()
+        for i, r in enumerate(rules):
+            if r["resource"].startswith("sed ") and r["effect"] == "allow":
+                m = copy.deepcopy(rules)
+                m[i]["resource"] = "sed *"
+                self.assertGreater(self.run_cases(m), 0, r["resource"])
+
+    def test_denies_moved_before_the_allows_fail_the_matcher(self):
+        rules = self.rules()
+        sed_deny = [r for r in rules if r["resource"].startswith("sed ") and r["effect"] == "deny"]
+        rest = [r for r in rules if r not in sed_deny]
+        first_sed_allow = next(i for i, r in enumerate(rest) if r["resource"].startswith("sed "))
+        self.assertGreater(self.run_cases(rest[:first_sed_allow] + sed_deny + rest[first_sed_allow:]), 0)
+
+    def test_nothing_outside_the_sed_rules_changed(self):
+        now = self.P.PATH.read_text().splitlines(keepends=True)
+        rest = "".join(l for l in now if not (l.startswith("  # sed ") or l.startswith('  - {action: shell, resource: "sed ')))
+        try:
+            before = subprocess.run(["git", "show", "%s:agents/opencode/chief-of-staff.md" % self.BASELINE], cwd=str(REPO), capture_output=True, text=True, check=True).stdout
+        except (subprocess.CalledProcessError, OSError):
+            self.skipTest("the baseline commit is not in this checkout")
+        self.assertEqual(rest, before)
 
 
 class TestCosTriageAllowRule(unittest.TestCase):

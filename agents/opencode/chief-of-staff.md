@@ -94,6 +94,10 @@ permissions:
   - {action: shell, resource: "cat *", effect: allow}
   - {action: shell, resource: "echo *", effect: allow}
   - {action: shell, resource: "printf *", effect: allow}
+  # sed reads only, in three spelled-out forms (a line range, a pattern's lines, a substitution printed); a pipe reads the same forms (the engine splits it)
+  - {action: shell, resource: "sed -n '*,*p' *", effect: allow}
+  - {action: shell, resource: "sed -n '/*/p' *", effect: allow}
+  - {action: shell, resource: "sed -n 's/*/*/p' *", effect: allow}
   - {action: shell, resource: "date *", effect: allow}
   - {action: shell, resource: "sleep *", effect: allow}
   - {action: shell, resource: "timeout * gh pr view *", effect: allow}
@@ -212,6 +216,110 @@ permissions:
   - {action: shell, resource: "cat *.config/gh*", effect: deny}
   - {action: shell, resource: "cat *id_rsa*", effect: deny}
   - {action: shell, resource: "cat *auth.json*", effect: deny}
+  # sed denies come after the allows (last match wins): a fence of listed spellings, not a parser of sed; see docs/switchboard.md (#1012)
+  # sed options -i -s -f -e, alone, combined (-ni, -nsi) or long (--in-place=SUF, --separate, --file, --expression), then punctuation, then the w W e r R commands and the s/// flags
+  - {action: shell, resource: "sed * -i*", effect: deny}
+  - {action: shell, resource: "sed * -?i*", effect: deny}
+  - {action: shell, resource: "sed * -??i*", effect: deny}
+  - {action: shell, resource: "sed * -f*", effect: deny}
+  - {action: shell, resource: "sed * -?f*", effect: deny}
+  - {action: shell, resource: "sed * -??f*", effect: deny}
+  - {action: shell, resource: "sed * -s*", effect: deny}
+  - {action: shell, resource: "sed * -?s*", effect: deny}
+  - {action: shell, resource: "sed * -??s*", effect: deny}
+  - {action: shell, resource: "sed * -e*", effect: deny}
+  - {action: shell, resource: "sed * -?e*", effect: deny}
+  - {action: shell, resource: "sed * -??e*", effect: deny}
+  - {action: shell, resource: "sed *;*", effect: deny}
+  - {action: shell, resource: "sed *\n*", effect: deny}
+  - {action: shell, resource: "sed *<*", effect: deny}
+  - {action: shell, resource: "sed *\"*", effect: deny}
+  - {action: shell, resource: "sed *\\*", effect: deny}
+  - {action: shell, resource: "sed *$(*", effect: deny}
+  - {action: shell, resource: "sed *`*", effect: deny}
+  - {action: shell, resource: "sed *{*", effect: deny}
+  - {action: shell, resource: "sed *}*", effect: deny}
+  - {action: shell, resource: "sed *>*", effect: deny}
+  - {action: shell, resource: "sed *'*0w*'*", effect: deny}
+  - {action: shell, resource: "sed *'*1w*'*", effect: deny}
+  - {action: shell, resource: "sed *'*2w*'*", effect: deny}
+  - {action: shell, resource: "sed *'*3w*'*", effect: deny}
+  - {action: shell, resource: "sed *'*4w*'*", effect: deny}
+  - {action: shell, resource: "sed *'*5w*'*", effect: deny}
+  - {action: shell, resource: "sed *'*6w*'*", effect: deny}
+  - {action: shell, resource: "sed *'*7w*'*", effect: deny}
+  - {action: shell, resource: "sed *'*8w*'*", effect: deny}
+  - {action: shell, resource: "sed *'*9w*'*", effect: deny}
+  - {action: shell, resource: "sed *'*$w*'*", effect: deny}
+  - {action: shell, resource: "sed *'*/w*'*", effect: deny}
+  - {action: shell, resource: "sed *'*!w*'*", effect: deny}
+  - {action: shell, resource: "sed *'*,w*'*", effect: deny}
+  - {action: shell, resource: "sed *'*'w*'*", effect: deny}
+  - {action: shell, resource: "sed *'s/*/*/*w*'*", effect: deny}
+  - {action: shell, resource: "sed *'*0W*'*", effect: deny}
+  - {action: shell, resource: "sed *'*1W*'*", effect: deny}
+  - {action: shell, resource: "sed *'*2W*'*", effect: deny}
+  - {action: shell, resource: "sed *'*3W*'*", effect: deny}
+  - {action: shell, resource: "sed *'*4W*'*", effect: deny}
+  - {action: shell, resource: "sed *'*5W*'*", effect: deny}
+  - {action: shell, resource: "sed *'*6W*'*", effect: deny}
+  - {action: shell, resource: "sed *'*7W*'*", effect: deny}
+  - {action: shell, resource: "sed *'*8W*'*", effect: deny}
+  - {action: shell, resource: "sed *'*9W*'*", effect: deny}
+  - {action: shell, resource: "sed *'*$W*'*", effect: deny}
+  - {action: shell, resource: "sed *'*/W*'*", effect: deny}
+  - {action: shell, resource: "sed *'*!W*'*", effect: deny}
+  - {action: shell, resource: "sed *'*,W*'*", effect: deny}
+  - {action: shell, resource: "sed *'*'W*'*", effect: deny}
+  - {action: shell, resource: "sed *'s/*/*/*W*'*", effect: deny}
+  - {action: shell, resource: "sed *'*0e*'*", effect: deny}
+  - {action: shell, resource: "sed *'*1e*'*", effect: deny}
+  - {action: shell, resource: "sed *'*2e*'*", effect: deny}
+  - {action: shell, resource: "sed *'*3e*'*", effect: deny}
+  - {action: shell, resource: "sed *'*4e*'*", effect: deny}
+  - {action: shell, resource: "sed *'*5e*'*", effect: deny}
+  - {action: shell, resource: "sed *'*6e*'*", effect: deny}
+  - {action: shell, resource: "sed *'*7e*'*", effect: deny}
+  - {action: shell, resource: "sed *'*8e*'*", effect: deny}
+  - {action: shell, resource: "sed *'*9e*'*", effect: deny}
+  - {action: shell, resource: "sed *'*$e*'*", effect: deny}
+  - {action: shell, resource: "sed *'*/e*'*", effect: deny}
+  - {action: shell, resource: "sed *'*!e*'*", effect: deny}
+  - {action: shell, resource: "sed *'*,e*'*", effect: deny}
+  - {action: shell, resource: "sed *'*'e*'*", effect: deny}
+  - {action: shell, resource: "sed *'s/*/*/*e*'*", effect: deny}
+  - {action: shell, resource: "sed *'*0r*'*", effect: deny}
+  - {action: shell, resource: "sed *'*1r*'*", effect: deny}
+  - {action: shell, resource: "sed *'*2r*'*", effect: deny}
+  - {action: shell, resource: "sed *'*3r*'*", effect: deny}
+  - {action: shell, resource: "sed *'*4r*'*", effect: deny}
+  - {action: shell, resource: "sed *'*5r*'*", effect: deny}
+  - {action: shell, resource: "sed *'*6r*'*", effect: deny}
+  - {action: shell, resource: "sed *'*7r*'*", effect: deny}
+  - {action: shell, resource: "sed *'*8r*'*", effect: deny}
+  - {action: shell, resource: "sed *'*9r*'*", effect: deny}
+  - {action: shell, resource: "sed *'*$r*'*", effect: deny}
+  - {action: shell, resource: "sed *'*/r*'*", effect: deny}
+  - {action: shell, resource: "sed *'*!r*'*", effect: deny}
+  - {action: shell, resource: "sed *'*,r*'*", effect: deny}
+  - {action: shell, resource: "sed *'*'r*'*", effect: deny}
+  - {action: shell, resource: "sed *'s/*/*/*r*'*", effect: deny}
+  - {action: shell, resource: "sed *'*0R*'*", effect: deny}
+  - {action: shell, resource: "sed *'*1R*'*", effect: deny}
+  - {action: shell, resource: "sed *'*2R*'*", effect: deny}
+  - {action: shell, resource: "sed *'*3R*'*", effect: deny}
+  - {action: shell, resource: "sed *'*4R*'*", effect: deny}
+  - {action: shell, resource: "sed *'*5R*'*", effect: deny}
+  - {action: shell, resource: "sed *'*6R*'*", effect: deny}
+  - {action: shell, resource: "sed *'*7R*'*", effect: deny}
+  - {action: shell, resource: "sed *'*8R*'*", effect: deny}
+  - {action: shell, resource: "sed *'*9R*'*", effect: deny}
+  - {action: shell, resource: "sed *'*$R*'*", effect: deny}
+  - {action: shell, resource: "sed *'*/R*'*", effect: deny}
+  - {action: shell, resource: "sed *'*!R*'*", effect: deny}
+  - {action: shell, resource: "sed *'*,R*'*", effect: deny}
+  - {action: shell, resource: "sed *'*'R*'*", effect: deny}
+  - {action: shell, resource: "sed *'s/*/*/*R*'*", effect: deny}
 ---
 
 # Chief of Staff
