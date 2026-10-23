@@ -13910,7 +13910,7 @@ def sweep_s5_wait_start(ready_at, since):
     return ready_at
 
 
-def sweep_ready_pass(engine, state, decisions, home, now, cfg):
+def sweep_ready_pass(engine, state, decisions, home, now, cfg, decisions_whole=True):
     """#986: for each held pull request in the cos tier (and not already the owner's), read its gates and keep when it first became ready at its
     current head. A new head or an open gate drops the moment. Fills `state.s5` with the ones that have waited past the threshold; a gate read that
     fails is counted in `state.s5_unchecked` and raises nothing. Reads GitHub only (GET)."""
@@ -13949,8 +13949,9 @@ def sweep_ready_pass(engine, state, decisions, home, now, cfg):
         start = sweep_s5_wait_start(row["at"], parse_iso(d.get("since")))
         if start is not None and now - start >= cfg["aged_cos_hours"] * 3600:
             state.s5[d.get("id") or key] = (head, row["at"], who)
-    for key in [k for k in state.ready if k not in seen]:
-        state.ready.pop(key, None)
+    if decisions_whole:   # a partial list cannot say a pull request is no longer held: keep its moment
+        for key in [k for k in state.ready if k not in seen]:
+            state.ready.pop(key, None)
     if engine.state_dir is not None and json.dumps(state.ready, sort_keys=True) != before:
         try:
             _write_small(engine.state_dir, SWEEP_READY_FILE, dict(sorted(state.ready.items())[:2000]))
@@ -14220,8 +14221,9 @@ def sweep_decisions(engine, decisions, now, errors=()):
     if not notices_whole:
         errors = list(errors or ()) + [{"source": "registry", "error": "the notice read is not whole: %s" % why}]
     defer, deferred = sweep_deferrals(state, errors, repos, now)
-    sweep_ready_pass(engine, state, kept, home, now, cfg)
-    candidates = sweep_findings(engine, state, kept, home, now, cfg, regex, defer, notices_whole or "*" not in defer)
+    whole_list = notices_whole or "*" not in defer
+    sweep_ready_pass(engine, state, kept, home, now, cfg, whole_list)
+    candidates = sweep_findings(engine, state, kept, home, now, cfg, regex, defer, whole_list)
     findings, unchecked = [], 0
     attempts = sorted(candidates, key=lambda c: (state.attempted.get(c, 0), c))  # the longest untried first
     for pair in attempts:

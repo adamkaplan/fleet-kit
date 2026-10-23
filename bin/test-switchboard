@@ -28497,6 +28497,191 @@ class TestSweep(Base):
         self.sweep_with(reading, [self.held_pr()])
         self.assertEqual(self.engine.sweep.current["not_checked"], 1)
 
+    # ---- #986 (review): the REAL sweep_gate_reading and the edge paths of sweep_ready_pass, each with a mutant
+    @contextlib.contextmanager
+    def mutated(self, name, old, new):
+        """Run with the daemon function `name` rebuilt from its source with `old` replaced by `new` (the mutant must change it)."""
+        source = textwrap.dedent(inspect.getsource(getattr(sb, name)))
+        self.assertIn(old, source, name)
+        original = getattr(sb, name)
+        exec(compile(source.replace(old, new, 1), "<mutant>", "exec"), sb.__dict__)
+        try:
+            yield
+        finally:
+            setattr(sb, name, original)
+
+    def real_reading(self, gates, head=HEAD_A, unreadable=None, enforced=("G6",), clear=None, boom=None, mutant=None):
+        """sweep_gate_reading run for real over a fake context (gates table) and a fake who-can-clear answer."""
+        ctx = types.SimpleNamespace(unreadable=unreadable, facts={"head": head} if head else {}, plan=None, entries=[], problem=None, pr="acme/api#600")
+        report = {"gates": [{"gate": g, "status": st} for g, st in gates], "ready": all(st == "ok" for _, st in gates)}
+
+        def context(*a, **k):
+            if boom:
+                raise boom
+            return ctx
+        who = clear if clear is not None else {"who": "owner only", "floor_ids": [], "owner_only": [{"why": "x"}], "threshold": None, "min_rating": None}
+
+        def clear_who(*a, **k):
+            if isinstance(who, Exception):
+                raise who
+            return who
+        stack = contextlib.ExitStack()
+        for name, value in (("_ledger_context", context), ("enforced_gates_of", lambda c: list(enforced) if enforced else None), ("clear_who", clear_who)):
+            stack.enter_context(mock.patch.object(sb, name, value))
+        stack.enter_context(mock.patch.object(sb.plan_ledger, "evaluate_gates", lambda *a, **k: report))
+        with stack:
+            if mutant:
+                with self.mutated("sweep_gate_reading", *mutant):
+                    return sb.sweep_gate_reading(self.engine, "acme/api", 600, self.world.clock.now())
+            return sb.sweep_gate_reading(self.engine, "acme/api", 600, self.world.clock.now())
+
+    READING_CASES = {
+        "ready_with_only_g6_open": dict(gates=[("G0a", "ok"), ("G6", "open")], check=lambda self, r: (self.assertEqual(r[:2], (["G6"], self.HEAD_A)), self.assertIn("Who can clear", r[2]), self.assertIsNone(r[3]))),
+        "another_gate_failing": dict(gates=[("G1", "open"), ("G6", "open")], enforced=("G1", "G6"), check=lambda self, r: self.assertEqual((r[0], r[2]), (["G1", "G6"], None))),
+        "unreadable_context": dict(gates=[("G6", "open")], unreadable="HTTP 502", check=lambda self, r: self.assertEqual((r[:3], "502" in r[3]), ((None, None, None), True))),
+        "no_head": dict(gates=[("G6", "open")], head=None, check=lambda self, r: self.assertEqual((r[:3], r[3]), ((None, None, None), "no head"))),
+        "exception": dict(gates=[("G6", "open")], boom=ValueError("bad"), check=lambda self, r: self.assertEqual((r[:3], r[3]), ((None, None, None), "ValueError: bad"))),
+        "who_unknown": dict(gates=[("G6", "open")], clear=RuntimeError("x"), check=lambda self, r: self.assertEqual((r[0], r[2]), (["G6"], "who can clear it: not known"))),
+        "not_enforced_reads_the_board": dict(gates=[("G1", "open"), ("G6", "open")], enforced=None, check=lambda self, r: self.assertEqual(r[0], ["G1", "G6"])),
+        "head_extraction": dict(gates=[("G6", "open")], head="c" * 40, check=lambda self, r: self.assertEqual(r[1], "c" * 40)),
+    }
+    READING_MUTANTS = {
+        "ready_with_only_g6_open": ('if opened == ["G6"]:', 'if opened == []:'),
+        "another_gate_failing": ('if opened == ["G6"]:', 'if "G6" in opened:'),
+        "unreadable_context": ("if ctx.unreadable or not", "if not"),
+        "no_head": ("or not (ctx.facts or {}).get(\"head\")", "or False"),
+        "exception": ("except Exception as err:", "except KeyError as err:"),
+        "who_unknown": ("            except Exception:\n                line = None", "            except KeyError:\n                line = None"),
+        "not_enforced_reads_the_board": ("plan_ledger.enforced_view(report, enforced_gates_of(ctx))", "plan_ledger.enforced_view(report, ['G6'])"),
+        "head_extraction": ('return opened, ctx.facts["head"], who, None', 'return opened, "0" * 40, who, None'),
+    }
+
+    def test_986_the_real_gate_reading_over_a_fake_ledger(self):
+        for name, case in self.READING_CASES.items():
+            args = {k: v for k, v in case.items() if k != "check"}
+            case["check"](self, self.real_reading(**args))
+
+    def test_986_each_real_gate_reading_path_has_a_mutant_that_fails(self):
+        self.assertEqual(set(self.READING_CASES), set(self.READING_MUTANTS))
+        for name, case in self.READING_CASES.items():
+            args = {k: v for k, v in case.items() if k != "check"}
+            with self.assertRaises((AssertionError, ValueError, KeyError, TypeError), msg=name):
+                case["check"](self, self.real_reading(mutant=self.READING_MUTANTS[name], **args))
+
+    def ready_pass(self, decisions, reading, now=None, whole=True, mutant=None):
+        state = sb.sweep_state(self.engine)
+        now = now if now is not None else self.world.clock.now()
+        with mock.patch.object(sb, "sweep_gate_reading", lambda e, r, n, t: reading(r, n)):
+            if mutant:
+                with self.mutated("sweep_ready_pass", *mutant):
+                    sb.sweep_ready_pass(self.engine, state, decisions, "acme/api", now, self.engine.config["sweep"], whole)
+            else:
+                sb.sweep_ready_pass(self.engine, state, decisions, "acme/api", now, self.engine.config["sweep"], whole)
+        return state
+
+    def ready_file(self):
+        return json.loads(Path(self.world.state, sb.SWEEP_READY_FILE).read_text()) if Path(self.world.state, sb.SWEEP_READY_FILE).exists() else {}
+
+    def edge_cap(self, mutant):
+        held = [self.held_pr(700 + i) for i in range(sb.SWEEP_READY_READS + 1)]
+        reads = []
+        state = self.ready_pass(held, lambda r, n: reads.append(n) or self.ready(), mutant=mutant)
+        self.assertEqual((len(reads), state.s5_unchecked), (sb.SWEEP_READY_READS, 1))
+
+    def edge_roundtrip(self, mutant):
+        held = [self.held_pr()]
+        self.ready_pass(held, lambda r, n: self.ready())
+        self.assertEqual(self.ready_file()["acme/api#600"]["head"], self.HEAD_A)
+        state = sb.sweep_state(self.engine)
+        state.ready, state.ready_loaded = {}, False   # a restart: the moment comes back from the file
+        self.world.tick(3 * 3600)
+        state = self.ready_pass(held, lambda r, n: self.ready(), mutant=mutant)
+        self.assertEqual(len(state.s5), 1)
+
+    def edge_human_skip(self, mutant):
+        human = {"id": "pr:acme/api#600", "kind": "captain", "tier": "human", "repo": "acme/api", "number": 600, "title": "t", "since": self.at()}
+        reads = []
+        state = self.ready_pass([self.held_pr(), human], lambda r, n: reads.append(n) or self.ready(), mutant=mutant)
+        self.assertEqual((reads, state.ready, state.s5_unchecked), ([], {}, 0))
+
+    def edge_prune(self, mutant):
+        self.ready_pass([self.held_pr(601)], lambda r, n: self.ready())
+        self.assertIn("acme/api#601", sb.sweep_state(self.engine).ready)
+        state = self.ready_pass([], lambda r, n: self.ready(), mutant=mutant)
+        self.assertEqual((state.ready, self.ready_file()), ({}, {}))
+
+    def edge_partial_list(self, mutant):
+        self.ready_pass([self.held_pr(601)], lambda r, n: self.ready())
+        state = self.ready_pass([], lambda r, n: self.ready(), whole=False, mutant=mutant)
+        self.assertIn("acme/api#601", state.ready)
+        self.assertIn("acme/api#601", self.ready_file())
+
+    def edge_once_per_head(self, mutant):
+        held = [self.held_pr()]
+        self.hub.open = {600: sweep_issue(600, "MERGE: captain", pr=True)}
+        reading = {"value": self.ready()}
+        self.s5_run(reading, held)
+        self.world.tick(3 * 3600)
+        self.s5_run(reading, held)
+        self.world.tick(60)
+        context = self.mutated("sweep_findings", *mutant) if mutant else contextlib.nullcontext()
+        with context:
+            lines = self.s5_run(reading, held)
+        self.assertEqual(len(lines), 1)
+        self.world.tick(60)
+        reading["value"] = self.ready(self.HEAD_B)   # a new head is a new finding
+        self.world.tick(3 * 3600)
+        self.s5_run(reading, held)
+        self.world.tick(3 * 3600)
+        self.assertEqual(len(self.s5_run(reading, held)), 2)
+
+    def edge_gate_opens(self, mutant):
+        held = [self.held_pr()]
+        self.ready_pass(held, lambda r, n: self.ready())
+        state = self.ready_pass(held, lambda r, n: (["G0a", "G6"], self.HEAD_A, None, None), mutant=mutant)
+        self.assertNotIn("acme/api#600", state.ready)
+
+    def edge_new_head(self, mutant):
+        held = [self.held_pr()]
+        self.ready_pass(held, lambda r, n: self.ready())
+        self.world.tick(3 * 3600)
+        state = self.ready_pass(held, lambda r, n: self.ready(self.HEAD_B), mutant=mutant)
+        self.assertEqual((state.s5, state.ready["acme/api#600"]["head"]), ({}, self.HEAD_B))
+
+    def edge_unreadable(self, mutant):
+        state = self.ready_pass([self.held_pr()], lambda r, n: (None, None, None, "boom"), mutant=mutant)
+        self.assertEqual((state.s5, state.s5_unchecked, state.ready), ({}, 1, {}))
+
+    def edge_write(self, mutant):
+        self.ready_pass([self.held_pr()], lambda r, n: self.ready(), mutant=mutant)
+        self.assertEqual(self.ready_file()["acme/api#600"]["head"], self.HEAD_A)
+
+    EDGES = {
+        "cap": ("edge_cap", ("if reads >= SWEEP_READY_READS:", "if False:")),
+        "persistence_round_trip": ("edge_roundtrip", ("state.ready_loaded = True", "state.ready_loaded = True\n        return")),
+        "human_tier_skip": ("edge_human_skip", ("or sweep_ref_keys(d, home, repos_known) & human_keys", "")),
+        "prune_not_held": ("edge_prune", ("if k not in seen", "if False")),
+        "partial_list_keeps": ("edge_partial_list", ("if decisions_whole:", "if True:")),
+        "gate_opens_again": ("edge_gate_opens", ("state.ready.pop(key, None)   # a gate", "pass   # a gate")),
+        "new_head_restarts": ("edge_new_head", ('row["head"] != head', "False")),
+        "unreadable_not_checked": ("edge_unreadable", ("state.s5_unchecked += 1\n            continue\n        if opened != ", "continue\n        if opened != ")),
+        "write_on_change": ("edge_write", ("_write_small(engine.state_dir, SWEEP_READY_FILE", "(lambda *a: None)(engine.state_dir, SWEEP_READY_FILE")),
+        "raised_once_per_head": ("edge_once_per_head", None),
+    }
+
+    def test_986_the_edge_paths_of_the_ready_pass(self):
+        for name, (method, _) in self.EDGES.items():
+            self.setUp()
+            getattr(self, method)(None)
+
+    def test_986_each_edge_path_has_a_mutant_that_fails(self):
+        for name, (method, mutant) in self.EDGES.items():
+            if mutant is None:   # once per head: the confirmation window that keeps a finding from being raised again
+                mutant = ("now - state.confirmed.get(pair, 0) < SWEEP_TTL", "False")
+            self.setUp()
+            with self.assertRaises((AssertionError, ValueError, KeyError, TypeError), msg=name):
+                getattr(self, method)(mutant)
+
     def test_s5_ref_keys_read_both_spellings_and_an_ambiguous_short_name_resolves_nowhere(self):
         keys = lambda d, repos=("acme/api",): sb.sweep_ref_keys(d, "acme/api", list(repos))
         self.assertEqual(keys({"id": "pr:acme/api#7"}), {("acme/api", 7)})
