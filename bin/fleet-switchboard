@@ -23179,7 +23179,10 @@ def pr_floor_report(engine, repo, number, rated_pairs=(), paged=None):
     if not complete or renamed:   # #967: `gh pr view` lists 100 files at most and no source path of a rename: the paged list has both. Read it ONLY then; a failed read keeps the list as it was (held) and says why
         module = load_module("delegated_clear")
         try:
-            listed, _ = module.read_pr_files(impact_carry_get(engine, engine.gh_runner or subprocess.run, repo), repo, number)
+            listed, pull = module.read_pr_files(impact_carry_get(engine, engine.gh_runner or subprocess.run, repo), repo, number)
+            seen_head = ((pull.get("head") or {}).get("sha") if isinstance(pull.get("head"), dict) else None)
+            if isinstance(raw.get("headRefOid"), str) and isinstance(seen_head, str) and seen_head != raw["headRefOid"]:
+                raise module.FileListError("head_moved", raw["headRefOid"][:8], seen_head[:8])   # the paged list belongs to another head than this report's (#967 M2 low)
             if paged is not None:
                 paged["files"] = listed
             files = [{"path": f.get("filename"), "previous_filename": f.get("previous_filename"), "changeType": str(f.get("status") or "").upper()} for f in listed if isinstance(f.get("filename"), str)]

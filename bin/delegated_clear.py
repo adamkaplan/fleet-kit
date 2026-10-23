@@ -304,6 +304,7 @@ FILE_REFUSALS = {
     "not_a_list": "GitHub's answer for the changed files was not a list (%s)",
     "over_limit": "the pull request has more than %d changed files, more than GitHub lists: too many to read in full",
     "head_moved": "the pull request's head moved while it was being checked (%s, then %s): nothing was cleared",
+    "duplicate": "the changed files repeat %s (page %d, position %d, already listed on page %d): a page was served twice, so the list is not the pull request's own",
     "cut": "GitHub itself says the file list is cut: it listed %d of %d changed files",
     "bad_entry": "page %d, position %d on the page (counting from 1) of the changed files is not a file entry (%s)",
     "no_count": "the pull request's count of changed files was %s, so the list cannot be checked against it",
@@ -369,7 +370,7 @@ def read_pr_files(get, repo, number):
         raise FileListError("no_count", "negative (%d)" % total)
     if total > FILE_LIMIT:
         raise FileListError("over_limit", FILE_LIMIT)
-    files = []
+    files, seen = [], {}
     for page in range(1, FILE_PAGES + 1):
         got = read_with_retry(get, "repos/%s/pulls/%d/files?per_page=%d&page=%d" % (repo, number, FILE_PAGE, page), lambda a: isinstance(a, list), "page %d: " % page)
         for position, entry in enumerate(got, 1):   # a list is not yet a list of files: an entry that is not one is refused with its place, never dropped (dropping it would make the count differ and blame GitHub)
@@ -377,6 +378,9 @@ def read_pr_files(get, repo, number):
                 raise FileListError("bad_entry", page, position, "a %s, not an object" % type(entry).__name__)
             if not isinstance(entry.get("filename"), str) or not entry["filename"]:
                 raise FileListError("bad_entry", page, position, "no file name")
+            if entry["filename"] in seen:   # a file name is unique in a pull request: a repeat means a page was served twice (a page equal to an earlier one repeats every name on it)
+                raise FileListError("duplicate", entry["filename"], page, position, seen[entry["filename"]])
+            seen[entry["filename"]] = page
             files.append(entry)
         if len(got) < FILE_PAGE:
             break
