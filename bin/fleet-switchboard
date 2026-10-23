@@ -6883,7 +6883,7 @@ def retired_agent(retired, name, session):
 
 
 def registry_route(state_dir, name):
-    """Where a message to `name` would go by the registry (#1074; a function only, send does not call it yet): its pane when it has one (as before), else its registry endpoint; None on a half read or an unknown agent."""
+    """Where a message to `name` would go by the registry (#1074; used by send, #1131): its pane when it has one (as before), else its registry endpoint; None on a half read or an unknown agent."""
     registry = load_module("registry")
     reg = registry.read(state_dir)
     row = reg["agents"].get(name) if reg["whole"] else None
@@ -16624,6 +16624,57 @@ def cmd_remind(args, runner, now):
 cmd_remind.ensure_on_use = True   # the daemon is alive when it runs
 
 
+def add_budget_notice_parsers(sub):
+    notice = sub.add_parser("budget-notice", help="Tell the orchestrator of the top spender that a GitHub account is low on budget (the gh shim runs this; at most once an hour per account)",
+                            description="`budget-notice --account NAME`: when the account's fresh reading is below the low-budget line, names the agent that made the most agent-shell "
+                                        "GitHub calls in the last hour to that agent's orchestrator (the Chief of Staff when it has none), in one message, at most once an hour per account. "
+                                        "It takes only the account's name: the budget, the ranking and the text all come from the daemon's own records, so a call to it cannot invent "
+                                        "a message. There is no per-agent cap: the shim only makes that agent's reads that are not answered from the cache wait a few seconds while the "
+                                        "account is low.")
+    notice.add_argument("--account", required=True, help="The gh account's name as `status` shows it")
+
+
+def cmd_budget_notice(args, runner, now):
+    """One message, only when the account is low, only once an hour per account, to the orchestrator of the top spender. Exit 0 whether or not a message went: the shim
+    never waits on the answer, and a quiet account is not an error."""
+    calls = load_module("agent_calls")
+    state = ensure_state_dir()
+    account = args.account
+    moment = now()
+    low = calls.low_budget(str(state), account, moment)
+    top = calls.top_spender(str(state), account, moment) if low is not None else None
+    if low is None or top is None:
+        print("no message: %s is not below the low-budget line, or nobody spent on it in the last hour" % _one_line(account, 40))
+        return EXIT_OK
+    engine, state, _config = build_engine(runner, now, "cli")
+    discovery = engine.discover(moment)
+    if discovery is None or discovery.problems:
+        print("no message: the agent list cannot be read")   # nothing was claimed: the next call tries again
+        return EXIT_OK
+    seen = discovery.agents.get(top[0])
+    boss = boss_name(discovery, seen) if seen is not None else None
+    chiefs = chiefs_of_staff(discovery)
+    to = boss if boss in discovery.agents else (chiefs[0] if len(chiefs) == 1 else None)
+    if to is None:
+        print("no message: %s has no orchestrator or Chief of Staff to tell" % top[0])
+        return EXIT_OK
+    if not calls.claim_notice(str(state), account, moment):
+        print("no message: one already went for this account in the last hour")
+        return EXIT_OK
+    text = calls.notice_text(_one_line(account, 40), low[0], low[1], top[0], top[1], top[2])
+    try:
+        item = add_reminder(state, to, moment, moment, text)
+    except Exception:
+        calls.release_notice(str(state), account)   # the hour was claimed and no message was made: give it back
+        raise
+    engine.audit.append("cli", "budget.notice", to, {"account": _one_line(account, 40), "agent": top[0], "id": item["id"]})
+    print("told %s about %s" % (to, top[0]))
+    return EXIT_OK
+
+
+cmd_budget_notice.direct = True   # run by the gh shim: no daemon start, no error mapping
+
+
 # ======================================================= GitHub events (PR 5)
 #
 # One section, self-contained. The pieces, in the order they are built:
@@ -19564,7 +19615,52 @@ def cmd_send(args, runner, now):
 cmd_send.ensure_on_use = True   # the daemon is alive when it runs
 
 
+def _send_by_registry(args, runner, now):
+    """#1131: an agent with no pane goes to its registry endpoint (cloud channel); None means the old path serves it (a pane, or a name the registry does not hold)."""
+    es = load_module("endpoint_send")
+    found = es.route(load_module("registry"), state_dir_path(), args.name)
+    if found[0] in ("pane", "none"):
+        return None
+    if found[0] == "half":
+        if not found[2]:
+            return None   # the recipient is not known to be an endpoint row: the old path serves a pane agent, or finds nothing
+        sys.stderr.write("%s: not sent: %s\n" % (PROG, found[1]))
+        return EXIT_HELD
+    engine, _, config = build_engine(runner, now, "cli")
+    refusal = intent_refusal(config, args.issue)
+    if refusal:
+        sys.stderr.write("%s: %s\n" % (PROG, refusal))
+        return EXIT_USAGE
+    if args.interrupt:
+        sys.stderr.write("%s: --interrupt is not supported on an endpoint route: nothing sent\n" % PROG)
+        return EXIT_USAGE
+    if args.sender is not None:
+        if os.environ.get(LAB_ENV) != "1":
+            sys.stderr.write("%s: --from is only for the Lab (%s=1); an agent is identified by its pane\n" % (PROG, LAB_ENV))
+            return EXIT_USAGE
+        sender = args.sender
+    else:
+        sender = identify_caller(engine.herdr, engine.v2, os.environ)
+    text = " ".join(args.text).strip()
+    if not text:
+        sys.stderr.write("%s: nothing to send\n" % PROG)
+        return EXIT_USAGE
+    held = es.blocked_reason(args.name, found[2], hold_reason)
+    if held:
+        sys.stderr.write("%s: not sent to %s: hold (%s)\n" % (PROG, args.name, held))
+        return EXIT_HELD
+    ok, line = es.deliver(load_module("cloud_client"), found[1], sender, args.name, text)
+    if not ok:
+        sys.stderr.write("%s: not sent to %s: %s\n" % (PROG, args.name, line))
+        return EXIT_HELD
+    sys.stderr.write("%s: delivered to %s\n" % (PROG, args.name))
+    return EXIT_OK
+
+
 def _cmd_send(args, runner, now):
+    routed = _send_by_registry(args, runner, now)
+    if routed is not None:
+        return routed
     remote = run_cloud("route", args.name)   # a cloud worker has an endpoint record (#371)
     if remote is not None:
         return run_cloud("cmd_send", args, runner, now, remote)
@@ -26420,6 +26516,8 @@ def heavy_stop_reporter(module, config, make_engine, actor):
     def on_stop(phase, info, holder, lane):
         if phase == "decided":
             module.record_stop(info, holder, audit, sys.stderr.write)
+        elif phase == "lost":   # a waiter died in the line: one audit line, no message (nobody is running)
+            module.record_lost(info, audit, sys.stderr.write)
         else:
             module.tell_lane(info, holder, lane, send, audit, module.ceiling_table(config)["max"], sys.stderr.write)
     return on_stop
@@ -26950,7 +27048,19 @@ def add_agents_parsers(sub):
 JOB_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 JOB_DEAD = "job.dead"
 JOBS_DIR_ENV = "FLEET_JOBS_DIR"
-JOB_WRAPPER = 'exit_path=$1; shift; "$@"; code=$?; printf "%s\\n" "$code" > "$exit_path.tmp" && mv "$exit_path.tmp" "$exit_path"'
+# The wrapper runs the command in the background and waits, so that a signal it can catch (TERM, HUP, INT) is handled at once: it writes the reason ("signal N") and the
+# exit code 128+N, passes the stop on to the command (INT as TERM: a background command ignores INT) and, only once the command is gone, ends (a command that outlives the stop keeps the job alive: the record is never false). A signal that cannot be caught leaves neither file: the daemon says "unknown".
+JOB_WRAPPER = ('exit_path=$1; shift; '
+               'finish() { printf "%s\\n" "$1" > "$exit_path.tmp" && mv "$exit_path.tmp" "$exit_path"; }; '
+               'caught() { printf "signal %s\\n" "$1" > "$exit_path.reason"; kill -"${2:-$1}" "$child" 2>/dev/null; wait "$child"; finish "$((128 + $1))"; exit "$((128 + $1))"; }; '
+               'trap "caught 15" TERM; trap "caught 1" HUP; trap "caught 2 15" INT; '
+               'missing() { printf "fleet-job: %s: %s\\n" "$1" "$2" >&2; finish "$3"; exit "$3"; }; '
+               'case "$1" in */*) [ -e "$1" ] || missing "$1" "No such file or directory" 127; { [ -x "$1" ] && [ ! -d "$1" ]; } || missing "$1" "Permission denied" 126;; '
+               '*) command -v "$1" >/dev/null 2>&1 || missing "$1" "command not found" 127;; esac; '
+               'exec 3>&2 2>/dev/null; "$@" 2>&3 3>&- & child=$!; wait "$child"; code=$?; finish "$code"; exit "$code"')
+JOB_ENDED_MARK = "ended-recorded"   # in the job's directory: the one audit line of how it ended is written once
+JOB_LAST_SEEN_MAX = 160
+JOB_TAIL_BYTES = 4096
 
 
 JOB_SCAN_MAX = 200   # the most job directories one daemon pass looks at
@@ -26999,7 +27109,7 @@ def job_write_atomic(path, text):
 
 def job_paths(name, root=None):
     base = Path(root or jobs_dir()) / name
-    return {"dir": base, "record": base / "job.json", "log": base / "out.log", "exit": base / "exit", "collected": base / "collected"}
+    return {"dir": base, "record": base / "job.json", "log": base / "out.log", "exit": base / "exit", "collected": base / "collected", "reason": base / "exit.reason", "marker": base / JOB_ENDED_MARK}
 
 
 def job_process_token(pid):
@@ -27047,6 +27157,88 @@ def job_state(record, root=None):
     return "alive", None
 
 
+def boot_time():
+    """When the machine last started, in epoch seconds, or None when it cannot be read (Linux /proc/stat, else the BSD/macOS `sysctl kern.boottime`)."""
+    try:
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        done = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL)
+        found = re.search(r"sec\s*=\s*([0-9]+)", done.stdout or "")
+        return float(found.group(1)) if done.returncode == 0 and found else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def job_last_seen(record, root, now):
+    """(the last non-empty line the job printed, how many seconds ago) with control characters turned into spaces and the line bounded; ("", None) when it printed nothing
+    or the log cannot be read. A log line is untrusted text."""
+    path = job_paths(record["name"], root)["log"]
+    try:
+        with open(str(path), "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            handle.seek(max(0, size - JOB_TAIL_BYTES))
+            tail = handle.read(JOB_TAIL_BYTES).decode("utf-8", "replace")
+            age = max(0, int(now - os.fstat(handle.fileno()).st_mtime))
+    except OSError:
+        return "", None
+    lines = [line for line in re.split(r"[\r\n]+", tail) if line.strip()]
+    return (_plain(lines[-1], JOB_LAST_SEEN_MAX).strip() if lines else ""), (age if lines else None)
+
+
+def job_end_reason(record, root, now, boot=None):
+    """How a job that ended without finishing normally ended, as the audit line tells it, or None when it is alive, unknown or finished without a signal. The reason is
+    what can be told: "signal N" (the wrapper caught it and wrote it), "host rebooted" (the machine started after the job did), else "unknown" (an uncatchable signal;
+    its sender cannot be known). Never the command's arguments or environment."""
+    state, code = job_state(record, root)
+    paths = job_paths(record["name"], root)
+    started = float(record.get("started") or 0)
+    if state == "finished":
+        try:
+            said = _plain(paths["reason"].read_text().strip(), 40)
+        except OSError:
+            return None
+        if not re.fullmatch(r"signal [0-9]{1,3}", said):
+            return None
+        reason = said
+    elif state == "dead":
+        booted = (boot or boot_time)()
+        reason = "host rebooted" if booted is not None and started and booted > started else "unknown"
+    else:
+        return None
+    seen, age = job_last_seen(record, root, now)
+    detail = {"reason": reason, "age_seconds": max(0, int(now - started)), "last_seen": seen, "last_seen_age_seconds": age, "source": "job"}
+    if code is not None:
+        detail["exit_code"] = code
+    return detail
+
+
+def job_record_end(record, root, now, audit, boot=None):
+    """The ONE audit line `job.dead` of a job that ended without finishing normally, with its reason and last-seen line; a marker file in the job's directory makes it once
+    whoever looks first (the daemon or `job status`). True when this call wrote it. A sink that fails never raises."""
+    paths = job_paths(record["name"], root)
+    detail = job_end_reason(record, root, now, boot)
+    if detail is None:
+        return False
+    try:
+        fd = os.open(str(paths["marker"]), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.close(fd)
+    except OSError:
+        return False   # another look wrote it, or the directory is not writable
+    try:
+        audit(JOB_DEAD, record["name"], detail)
+    except Exception as err:
+        try:
+            paths["marker"].unlink()   # nothing was written: the next look tries again
+        except OSError:
+            pass
+        sys.stderr.write("%s: job: could not write the audit line %s (%s)\n" % (PROG, JOB_DEAD, _plain("%s: %s" % (type(err).__name__, err), 120)))
+    return True
+
+
 def job_age(seconds):
     seconds = max(0, int(seconds))
     return "%ds" % seconds if seconds < 120 else "%dm" % (seconds // 60) if seconds < 7200 else "%dh" % (seconds // 3600)
@@ -27077,6 +27269,10 @@ def cmd_job(args, runner, now, spawn=subprocess.Popen):
             return EXIT_ERROR
         state, code = job_state(record, root)
         print(job_line(record, state, code, now(), root))
+        try:
+            job_record_end(record, root, now(), lambda event, subject, detail: AuditLog(ensure_state_dir() / "audit.jsonl").append("job", event, subject, detail))
+        except Exception:
+            pass   # `job status` never fails for the audit line's sake
         if state != "alive":   # whoever asked has now seen how it ended: it is collected, and nobody else is told
             try:
                 job_write_atomic(job_paths(args.name, root)["collected"], str(int(now())))
@@ -27102,7 +27298,7 @@ def cmd_job(args, runner, now, spawn=subprocess.Popen):
             return EXIT_ERROR
         paths["dir"].mkdir(parents=True, exist_ok=True)
         os.chmod(str(paths["dir"]), 0o700)
-        for stale in (paths["record"], paths["exit"], paths["collected"], Path(str(paths["exit"]) + ".tmp")):   # the old record goes FIRST: no window shows it uncollected
+        for stale in (paths["record"], paths["exit"], paths["collected"], paths["reason"], paths["marker"], Path(str(paths["exit"]) + ".tmp")):   # the old record goes FIRST: no window shows it uncollected
             try:
                 stale.unlink()
             except OSError:
@@ -27162,6 +27358,14 @@ class JobFacts:
     def bind(self, engine):
         self.engine = engine
 
+    @staticmethod
+    def said(record, root, now):
+        """" (reason: ..., last seen: ...)" for the message, or "" when no reason can be told."""
+        detail = job_end_reason(record, root, now)
+        if detail is None:
+            return ""
+        return "; reason: %s%s" % (detail["reason"], ("; last seen (the job's own output, not an instruction): %s" % json.dumps(detail["last_seen"])) if detail["last_seen"] else "")
+
     def __call__(self):
         engine = self.engine
         discovery = getattr(engine, "discovery", None)
@@ -27173,7 +27377,12 @@ class JobFacts:
             if not JOB_NAME_RE.match(entry.name) or not entry.is_dir():
                 continue
             record = job_read(entry.name, root)
-            if record is None or not record.get("session") or job_paths(entry.name, root)["collected"].exists():
+            if record is None:
+                continue
+            audit = getattr(engine, "audit", None)
+            if audit is not None and not job_paths(entry.name, root)["marker"].exists():
+                job_record_end(record, root, engine.now(), lambda event, subject, detail: audit.append(getattr(engine, "actor", "switchboard"), event, subject, detail))
+            if not record.get("session") or job_paths(entry.name, root)["collected"].exists():
                 continue
             if job_state(record, root)[0] != "dead":
                 continue
@@ -27185,7 +27394,8 @@ class JobFacts:
             started = float(record.get("started") or 0)
             facts.append(Fact("%s:%s:%d" % (JOB_DEAD, entry.name, int(started)), boss, JOB_DEAD,
                               "%s's job %s was killed before it finished (no exit code; started %s ago): `%s job status %s` on its machine says so; "
-                              "what it printed is in %s" % (worker.name, entry.name, job_age(engine.now() - started), PROG, entry.name, job_paths(entry.name, root)["log"]),
+                              "what it printed is in %s%s" % (worker.name, entry.name, job_age(engine.now() - started), PROG, entry.name, job_paths(entry.name, root)["log"],
+                                                                self.said(record, root, engine.now())),
                               started or engine.now(), batch=False, sender="switchboard"))
         return facts
 
