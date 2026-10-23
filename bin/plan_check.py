@@ -18,7 +18,7 @@ MAX_SCENARIOS = 200         # a hard limit; the guidance is about 30
 GUIDANCE_SCENARIOS = 30       # per slice, or in total when no scenario has a slice
 GUIDANCE_TOTAL_WITH_SLICES = 80
 
-PROOFS = ("test", "live", "measure", "screenshot")
+PROOFS = ("test", "live", "measure", "screenshot", "review")
 EVALUATORS = ("ci", "tester", "reviewer", "owner")
 # An older plan wrote the owner's evaluator under a personal name; it is still accepted as `owner` (a plan approved with it
 # keeps passing, and its hash, which covers the text as written, does not change), with a warning to rename it.
@@ -29,7 +29,9 @@ OPTIONAL = ("claim", "slice", "phase")
 KNOWN = REQUIRED + OPTIONAL
 # proof -> the evaluators that can record it
 PROOF_EVALUATORS = {"test": ("ci",), "screenshot": ("reviewer", "owner"), "live": ("tester", "owner"),
-                    "measure": ("tester", "owner")}
+                    "measure": ("tester", "owner"), "review": ("reviewer",)}
+# A `review` proof is a reviewer's read of text. A scenario whose subject is code behaviour a test can show is refused: use `test`.
+REVIEW_CODE_RE = re.compile(r"\b(?:exit status|exit code|stdout|stderr|returns?|raises?|throws?|function|endpoint|api call|code behaviou?r|runs? the (?:command|code|tests?))\b", re.IGNORECASE)
 
 ID_RE = re.compile(r"^[SU][0-9]+[a-z]?$")
 COVERS_RE = re.compile(r"^(DW|PC)-([0-9]+)$")
@@ -695,6 +697,8 @@ def validate(scenarios, clauses, text=""):
         proof, evaluator = _normal(scenario.get("proof", "")), _normal(scenario.get("evaluator", ""))
         if proof and proof not in PROOFS:
             bad(ident, "bad-proof", "proof %r must be one of %s" % (proof, "|".join(PROOFS)))
+        if proof == "review" and REVIEW_CODE_RE.search(_normal(scenario.get("text", "")) + " " + _normal(scenario.get("pass", ""))):
+            bad(ident, "review-for-code", "proof review is a reviewer's read of text, not of code behaviour a test can show: use test")
         if evaluator in EVALUATOR_ALIASES:
             warnings.append({"id": ident, "code": "evaluator-alias", "message": "%s: evaluator %r is a deprecated alias of "
                              "%r: rename it" % (ident, evaluator, EVALUATOR_ALIASES[evaluator])})

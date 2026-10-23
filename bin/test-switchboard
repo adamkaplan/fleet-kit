@@ -34580,6 +34580,69 @@ class TestLaunchTesters(LedgerBase):
         self.assertEqual(lt.source_of("tst", {"tester": ["tst"]}, {"tst": {}}), "config")
 
 
+class TestReviewProof(LedgerBase):
+    """#1121: `review` is a reviewer's read of text: accepted by the plan check (evaluator reviewer), a verdict counts only with a quote or a link,
+    and a scenario about code behaviour is refused (use test). The mutants must fail the checks."""
+
+    REVIEW_PLAN = LEDGER_PLAN.replace("    proof: screenshot\n    pass: the header shows the word \"Ready\" after the reply",
+                                      "    proof: review\n    pass: the verdict quotes \"Ready\" from the text it read", 1)
+
+    def setUp(self):
+        super().setUp()
+        self.configure(evaluators={"reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]})
+        self.plan_issue["body"] = self.REVIEW_PLAN
+        self.assertIn("proof: review", self.REVIEW_PLAN)
+
+    def rv(self, evidence):
+        return self.run_as("rev", "verdict", "S3", "--pr", self.PR, "--as", "reviewer", "--result", "pass", "--evidence", evidence)
+
+    def checks(self):
+        """Every assertion of the clause; raises AssertionError when the code under test is wrong."""
+        code, _, err = self.prove("coder", "S3")
+        self.assertEqual(code, 0, err)
+        codes = lambda text: [d["code"] for d in sb.plan_check.check(text, "(1) a (2) b")["defects"]]
+        self.assertNotIn("bad-proof", codes(self.REVIEW_PLAN))
+        self.assertNotIn("evaluator-mismatch", codes(self.REVIEW_PLAN))
+        for other in ("ci", "tester", "owner"):
+            self.assertIn("evaluator-mismatch", codes(self.REVIEW_PLAN.replace("evaluator: reviewer", "evaluator: %s" % other, 1)))
+        code_plan = self.REVIEW_PLAN.replace("the header shows the agent state", "the command returns exit status 0", 1)
+        got = sb.plan_check.check(code_plan, "(1) a (2) b")
+        self.assertIn("review-for-code", [d["code"] for d in got["defects"]])
+        self.assertIn("use test", json.dumps(got))
+        code, out, err = self.run_as("rev", "verdict", "S3", "--pr", self.PR, "--as", "reviewer", "--result", "pass", "--evidence", "looked fine")
+        self.assertEqual(code, 2)
+        self.assertIn("no quote and no link", err)
+        self.assertEqual([e["kind"] for e in self.ledger()], ["proof"])
+        self.assertEqual(self.rv('read: "the header shows Ready"')[0], 0)
+        self.assertEqual(self.rv("read https://example.com/acme/doc#L3")[0], 0)
+
+    def test_the_real_code_passes_every_check(self):
+        self.checks()
+
+    def test_a_mutant_that_accepts_an_empty_review_fails(self):
+        with mock.patch.object(sb.load_plan_ledger(), "review_evidence_problem", lambda evidence: None):
+            with self.assertRaises(AssertionError):
+                self.checks()
+
+    def test_a_mutant_that_accepts_review_for_a_code_scenario_fails(self):
+        with mock.patch.object(sb.load_plan_check(), "REVIEW_CODE_RE", re.compile(r"(?!x)x")):
+            with self.assertRaises(AssertionError):
+                self.checks()
+
+    def test_a_mutant_that_drops_the_type_from_the_check_fails(self):
+        with mock.patch.object(sb.load_plan_check(), "PROOFS", tuple(p for p in sb.load_plan_check().PROOFS if p != "review")):
+            with self.assertRaises(AssertionError):
+                self.checks()
+
+    def test_the_four_old_types_keep_their_evaluators_and_both_docs_list_review(self):
+        self.assertEqual({k: sb.plan_check.PROOF_EVALUATORS[k] for k in ("test", "live", "measure", "screenshot")},
+                         {"test": ("ci",), "live": ("tester", "owner"), "measure": ("tester", "owner"), "screenshot": ("reviewer", "owner")})
+        for doc in ("skills/fleet-planning/SKILL.md", "docs/plan-template.md"):
+            text = (Path(__file__).resolve().parent.parent / doc).read_text()
+            self.assertIn("review", text)
+            self.assertIn("screenshot", text)
+
+
 class TestPlanLedger(LedgerBase):
     # -- prove
 

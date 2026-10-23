@@ -197,6 +197,10 @@ def append_many_checked(state_dir, build, now):
 
 # ----------------------------------------------------------------------------------- who may do what
 
+def proof_of(scenario):
+    return " ".join(str(scenario.get("proof", "")).split())
+
+
 def evaluator_of(scenario):
     name = " ".join(str(scenario.get("evaluator", "")).split())
     return EVALUATOR_ALIASES.get(name, name)
@@ -867,3 +871,16 @@ def refusal_message(prog, check_for, pr, failed, repo):
     return ("%s: %s of %s refused: missing %s. Way out: ask the chief of staff for a logged waiver (`%s waive %s --gates %s "
             "--reason ...`; never for G6 or G8), or the chief of staff can switch the repo to shadow (`%s gates mode %s shadow`)."
             % (prog, check_for, pr, what, prog, pr, ",".join(f["gate"] for f in gates) or "G1", prog, repo))
+
+
+REVIEW_LINK_RE = re.compile(r"https?://\S+")
+REVIEW_QUOTE_RE = re.compile(r"[\"\u201c\u2018`]([^\"\u201d\u2019`\n]*\w[^\"\u201d\u2019`\n]*)[\"\u201d\u2019`]")
+
+
+def review_evidence_problem(evidence):
+    """None when a `review` verdict's evidence carries a countable quote (1 or more words in quotes) of the text read or a link to it,
+    else the named reason."""
+    text = evidence or ""
+    if REVIEW_LINK_RE.search(text) or REVIEW_QUOTE_RE.search(text):
+        return None
+    return "a review verdict has no quote and no link: quote the text you read (in quotation marks) or link to it"
