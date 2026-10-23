@@ -1296,6 +1296,23 @@ def registrar_findings(base_src, head_src, rule):
             if any(v is None or not _is_const_expr(v, literals - {n}) for v in module_values[n]):
                 literals.discard(n)
                 settled = False
+    # an upper-case name the file never binds anywhere (not a store, def, class, parameter or import) is a constant the daemon's loader puts in the module's namespace from another module (`ORDERS_HEADING`): data, as an
+    # upper-case attribute of a module is. A closure name is never data by this rule; and a CALL of it is still held (a call needs exactly one binding of its own).
+    bound_anywhere = set(module_values)
+    for x in ast.walk(head):
+        if isinstance(x, ast.Name) and not isinstance(x.ctx, ast.Load):
+            bound_anywhere.add(x.id)
+        elif isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound_anywhere.add(x.name)
+        elif isinstance(x, ast.arg):
+            bound_anywhere.add(x.arg)
+        elif isinstance(x, ast.alias):
+            bound_anywhere.add((x.asname or x.name).split(".")[0])
+        elif isinstance(x, (ast.Global, ast.Nonlocal)):
+            bound_anywhere.update(x.names)
+        elif isinstance(x, ast.ExceptHandler) and x.name:
+            bound_anywhere.add(x.name)
+    literals |= {x.id for x in ast.walk(head) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) and x.id.isupper() and x.id not in bound_anywhere and x.id not in names}
     def read(label, unit, lines_counted):
         helpers = set()
         for verb, hit in _registrar_unit(unit, names, lines_counted, helpers, opaque, literals, set(defs), pure_builtins, named, verbs, free):
