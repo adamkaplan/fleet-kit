@@ -25387,7 +25387,7 @@ def cmd_review(args, runner, now):
             raise ReviewError("the PR head is unknown: nothing was recorded")
         given = args.head or head
         if not (head.startswith(given) or given.startswith(head)) or len(given) < 7:
-            raise ReviewError("--head %s is not the PR's head (%s): a record belongs to the head it judged, nothing was recorded" % (given[:12], head[:12]))
+            raise ReviewError("the head given (%s) is not the PR's head (%s): a record belongs to the head it judged, nothing was recorded" % (given[:40], head))
         record_step("the agent registry (who is calling)")
         files_count = None
         if reviewer == "impact" and block_digest:   # #1047: a rating is recorded only from a whole read, checked against GitHub's own list of changed files (never the block's)
