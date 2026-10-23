@@ -953,7 +953,7 @@ def authors_hold_labels(names, raw, already):
     return [label for label in ours if label in have and label not in already]
 
 
-def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None, verify=None, under_order=None):
+def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None, verify=None, under_order=None, brief=None):
     """The owner's clear: record it head-bound (the daemon does not re-add the hold for that head) and remove `hold-impact`, plus (#742) every other
     hold label of the fleet's prefix the PR carries at that head (`merge-captain` and each `hold-<reason>`, whoever added it). A DELEGATED clear (`under_order`)
     keeps the narrower rule: only `hold-impact` and a `merge-captain` the switchboard added come off, and it is refused (audited, nothing written) when the PR
@@ -1025,6 +1025,9 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
             if under_order.get("threshold"):   # #835: a clear by score shows the score and the threshold it was made under
                 detail["score"], detail["threshold"] = under_order.get("score"), under_order["threshold"]
                 detail["runs"] = under_order.get("runs") or []   # #972: the two runs the clear rests on (record id, rater, cell)
+        if brief:   # #1215: the brief the clear rests on, its hash, the decider and the reasons: the owner inspects them afterwards
+            detail["brief_digest"], detail["brief_text"] = brief["digest"], brief["text"]
+            detail["decider"], detail["reasons"] = brief.get("decider"), brief.get("reasons")
         if fingerprint is not None:
             detail["fingerprint"] = fingerprint
         engine.audit.append(engine.actor, "gate.hold_cleared", pr, detail)   # inside the lock
@@ -1157,7 +1160,7 @@ def delegated_clear_inputs(engine, runner, repo, number, take=False, report=None
     return {"report": report, "rule": rule, "files": files, "closure": closure}, None
 
 
-def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info=None):
+def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info=None, brief=None):
     """(report, None) when this pull request may be cleared under an order, else (None, why). The owner-hold decision is the daemon's own (`pr_floor_report`: no second rule), the rule (the classes
     never delegated and the clear code) is the matrix's `owner_hold.delegated_clear`; anything unreadable is refused. #661. With a `threshold` (the order's max_level, #835) the SCORE of the
     independent rating at this head is the rule about the pull request's classes; `info` (a dict) gets the score it read, for the audit of a refusal too."""
@@ -1169,10 +1172,28 @@ def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info
     if scored is not None and info is not None:
         info["score"] = scored["level"]
         info["runs"] = scored.get("runs") or []
-    reasons = module.refusals(got["rule"], report, got["files"], impact_floor.matches, got["closure"], scored)
+    if brief is not None:   # #1215: the brief-bound clear; `brief` = (digest, text, reasons). The floor's own brief at THIS head, from the module of slice A
+        floor = floor_brief(engine, repo, report, got["files"])
+        info["floor_brief"] = floor
+        reasons = module.substance_refusals(got["rule"], report, got["files"], impact_floor.matches, got["closure"], scored, floor, brief[0], brief[1], brief[2])
+    else:
+        reasons = module.refusals(got["rule"], report, got["files"], impact_floor.matches, got["closure"], scored)
     if reasons:
         return None, "; ".join(reasons)
     return report, None
+
+
+def floor_brief(engine, repo, report, files):
+    """The brief the floor builds at the report's head: `impact_brief.build_brief(facts)` (slice A's contract), facts assembled from the diff and the report; None when it cannot be built.
+    Only what is read is given: a piece not read is left out and printed `not shown`."""
+    try:
+        mod = load_module("impact_brief")
+        facts = {"files": [{"path": f.get("filename"), "additions": f.get("additions"), "deletions": f.get("deletions"), "status": f.get("status")} for f in files or []],
+                 "ci": None, "reads": None, "rating": None, "body_claim": None, "head": report.get("head"), "base": report.get("base"),
+                 "classes": {p: c for c, ps in (report.get("top_tier_hits") or {}).items() for p in ps}}
+        return mod.build_brief(facts)
+    except Exception:
+        return None
 
 
 def clear_who(engine, runner, repo, number, report=None):
@@ -1245,7 +1266,8 @@ def cmd_impact_clear(args, runner, now):
         extra = {}
         if delegated:   # #661: the checks of THIS pull request, at the head they read, and the clear bound to that head
             info = {}
-            report, why = delegated_clear_pr_checks(engine, runner, repo, number, delegated.get("threshold"), info)
+            report, why = delegated_clear_pr_checks(engine, runner, repo, number, delegated.get("threshold"), info,
+                                                    (getattr(args, "brief_digest", None) or "", getattr(args, "brief_text", None) or "", reason))
             if why:
                 if engine.audit is not None:
                     engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), dict({"by": kind[1], "under_order": delegated["number"], "why": _one_line(why, 300)}, **({"score": info.get("score"), "threshold": delegated["threshold"]} if delegated.get("threshold") else {})))
@@ -1259,7 +1281,8 @@ def cmd_impact_clear(args, runner, now):
                         engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), {"by": kind[1], "under_order": delegated["number"], "why": _one_line(why, 300), "score": info.get("score"), "threshold": delegated["threshold"]})
                     sys.stderr.write("%s: impact clear: refused: %s\n" % (PROG, _one_line(why, 600)))
                     return EXIT_USAGE
-            extra = {"head": report["head"], "via": "order:%d" % delegated["number"], "under_order": dict(delegated, score=info.get("score"), runs=info.get("runs"))}
+            extra = {"head": report["head"], "via": "order:%d" % delegated["number"], "under_order": dict(delegated, score=info.get("score"), runs=info.get("runs")),
+                     "brief": dict(info["floor_brief"], reasons=plan_ledger.clip(redact_command_text(reason), 300))}
         for line in impact_clear_core(engine, runner, repo, number, kind[1], plan_ledger.clip(redact_command_text(reason), 300), **extra):
             print(line)
     except (NoticeError, IntentError) as err:

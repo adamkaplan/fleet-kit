@@ -26304,6 +26304,8 @@ def add_impact_parsers(sub):
     clear = impact_sub.add_parser("clear", help="The owner's own terminal: clear a false impact hold for this head, with a reason (the Chief of Staff only under a standing order of the owner's, with --under-order)")
     clear.add_argument("pr", help="The pull request: owner/repo#N or its URL")
     clear.add_argument("--under-order", type=int, dest="under_order", metavar="N", help="The Chief of Staff only: clear under the owner's standing order N (it must be listed under delegated_clear in the configuration); recorded as her act under that order")
+    clear.add_argument("--brief-digest", dest="brief_digest", help="The Chief of Staff only (#1215): the digest of the impact brief the floor printed at this head; a clear without it, or with a stale one, is refused")
+    clear.add_argument("--brief-text", dest="brief_text", help="The Chief of Staff only (#1215): the text of that brief, recorded with its digest and the reasons in the audit line")
     clear.add_argument("--reason", required=True, help="Why the hold is false (at least 10 characters), logged")
     clear.add_argument("--revoke", action="store_true", help="Take the clear back (and any carry of it): the PR is held again at the daemon's next pass")
 
