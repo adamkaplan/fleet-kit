@@ -23658,7 +23658,7 @@ def chat_clear_apply(engine, cc, pr, offer, quoted, message_id, now, first_words
     lines = impact_clear_core(engine, runner, repo, number, "owner (chat)", words, remove=seen["remove"], head=offer["head"], via=via, verify=verify)
     remove = seen["remove"]
     short = offer["head"][:8]
-    shown_words = quoted.replace("@", "@\u200b").replace("`", "'")   # a public comment: no @mention and no code span can come out of his words
+    shown_words = words.replace("@", "@\u200b").replace("`", "'")   # a public comment: no @mention and no code span can come out of his words
     body = "The owner cleared this hold in his chat with the Chief of Staff, at head `%s`. His words: \"%s\"\n\nRemoved: %s." % (short, shown_words, ", ".join("`%s`" % l for l in remove))
     try:
         comment_as(engine, runner, repo, number, body, "switchboard")
@@ -23734,6 +23734,7 @@ def _chat_clear_confirm(engine, cc, cfg, message, offers, now):
         except Exception as err:
             why = "failed"
             detail["error"] = _one_line(str(err), 160)
+            engine.audit.append(engine.actor, "chat_clear.failed", pr, {"message_id": message["id"], "error": detail["error"]})
         else:
             if raw.get("headRefOid") != pending["head"]:
                 why, short_new = "head_changed", str(raw.get("headRefOid") or "")[:8]

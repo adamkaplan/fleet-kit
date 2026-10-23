@@ -14336,6 +14336,11 @@ class TestChatClearHook(Base):
         self.world.tick(5)
         self.world.v2.start_turn(self.world.sessions["cos"], text, fleet=False, lasts=lasts, **kw)
 
+    def confirm(self, number=9, decisions=None):
+        """#1194 step 2: the owner's one word and the number, after the understanding reply."""
+        self.say("yes %d" % number)
+        self.hook(decisions)
+
     def shown_then_say(self, text, decisions=None):
         self.hook(decisions)            # the offer is recorded (shown) first
         self.say(text)
@@ -14357,17 +14362,19 @@ class TestChatClearHook(Base):
         self.live = True
         self.build()
         self.shown_then_say("9 is good to go")
+        self.assertEqual(self.label_deletes(), [], "the first message clears nothing")
+        self.confirm()
         self.assertEqual(self.label_deletes(), sorted([self.names["hold-impact"], self.names["merge-captain"]]))
         self.assertEqual([w for w in self.writes if w[0] == "POST" and w[1].endswith("/labels")], [], "a clear never ADDS a label")
         (comment,) = self.comments()
         self.assertIn("9 is good to go", comment[2]["body"])
         self.assertIn("`%s`" % self.H1[:8], comment[2]["body"])
         (cleared,) = self.events("gate.hold_cleared")
-        self.assertEqual((cleared["detail"]["head"], cleared["detail"]["reason"], cleared["detail"]["by"]), (self.H1, "9 is good to go", "owner (chat)"))
+        self.assertEqual((cleared["detail"]["head"], cleared["detail"]["reason"], cleared["detail"]["by"]), (self.H1, "9 is good to go | yes 9", "owner (chat)"))
         self.assertTrue(cleared["detail"]["via"].startswith("chat:"))
-        (verdict,) = [e for e in self.events("chat_clear.verdict") if e["detail"]["action"] == "clear"]
+        verdict = [e for e in self.events("chat_clear.verdict") if e["detail"]["action"] == "clear"][0]
         self.assertEqual((verdict["detail"]["quote"], verdict["detail"]["live"], verdict["detail"]["would_clear"]), ("9 is good to go", True, True))
-        self.assertTrue(any("Cleared acme/app#9" in t and "9 is good to go" in t for t in self.cos_texts()), self.cos_texts())
+        self.assertTrue(any("Cleared acme/app#9" in t and "yes 9" in t for t in self.cos_texts()), self.cos_texts())
         self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"][self.PR]["head"], self.H1, "the head-bound state stops the daemon re-adding it")
 
     def test_s2_the_default_is_shadow_the_verdict_is_logged_with_probabilities_and_nothing_is_written_or_sent(self):
@@ -14452,6 +14459,7 @@ class TestChatClearHook(Base):
         self.assertEqual(sb.load_module("chat_clear").read_offers(self.world.state)[self.PR]["head"], self.H2, "the question put the new head in front of him")
         self.say("9 also good to go")
         self.hook(self.decisions(head=self.H2))
+        self.confirm(decisions=self.decisions(head=self.H2))
         self.assertEqual(self.label_deletes(), sorted([self.names["hold-impact"], self.names["merge-captain"]]), "after he was shown the new head, his next words clear it")
         self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"][self.PR]["head"], self.H2, "the state is bound to the head he was shown and GitHub confirmed")
 
@@ -14473,6 +14481,7 @@ class TestChatClearHook(Base):
         self.build()
         self.pr["labels"] = [{"name": self.names["hold-credential"]}, {"name": self.names["parked"]}, {"name": "bug"}]
         self.shown_then_say("9 is good to go", self.decisions(holds=("credential",)))
+        self.confirm(decisions=self.decisions(holds=("credential",)))
         self.assertEqual(self.label_deletes(), [self.names["hold-credential"]], "the credential hold goes; parked, bug and the rest stay")
         self.build()
         self.pr["labels"] = [{"name": self.names["hold-impact"]}, {"name": self.names["hold-security"]}, {"name": self.names["merge-captain"]}]
@@ -14492,9 +14501,9 @@ class TestChatClearHook(Base):
         for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
             for call in [c for c in ast.walk(fn) if isinstance(c, ast.Call)]:
                 name = call.func.id if isinstance(call.func, ast.Name) else None
-                if name in ("chat_clear_pass", "_chat_clear_act", "chat_clear_apply", "_chat_clear_pass"):
+                if name in ("chat_clear_pass", "_chat_clear_act", "_chat_clear_confirm", "chat_clear_apply", "_chat_clear_pass"):
                     callers.setdefault(name, set()).add(fn.name)
-        self.assertEqual(callers, {"chat_clear_pass": {"publish_decisions"}, "_chat_clear_pass": {"chat_clear_pass"}, "_chat_clear_act": {"_chat_clear_pass"}, "chat_clear_apply": {"_chat_clear_act"}})
+        self.assertEqual(callers, {"chat_clear_pass": {"publish_decisions"}, "_chat_clear_pass": {"chat_clear_pass"}, "_chat_clear_act": {"_chat_clear_pass"}, "_chat_clear_confirm": {"_chat_clear_pass"}, "chat_clear_apply": {"_chat_clear_confirm"}})
         self.assertFalse([n for n in callers if any(f.startswith("cmd_") for f in callers[n])], "no command calls the chat clear")
         self.live = True
         self.build(live=True)
@@ -14515,11 +14524,12 @@ class TestChatClearHook(Base):
         self.hook()
         self.say("9 is good to go" + " ok" * 200)   # a plain sentence that passes the floor and is far over the quote limit
         self.hook()
+        self.confirm()
         (comment,) = self.comments()
         (cleared,) = self.events("gate.hold_cleared")
-        (verdict,) = self.events("chat_clear.verdict")
+        verdict = self.events("chat_clear.verdict")[0]
         self.assertEqual(verdict["detail"]["action"], "clear", "the long plain sentence passed the floor")
-        for text in (cleared["detail"]["reason"], verdict["detail"]["quote"]):
+        for text in (verdict["detail"]["quote"], cleared["detail"]["reason"].split(" | ")[0]):
             self.assertLessEqual(len(text), 300)
             self.assertTrue(text.startswith("9 is good to go ok ok"))
             self.assertNotIn("\n", text)
@@ -14579,6 +14589,7 @@ class TestChatClearHook(Base):
         self.live = True
         self.build()
         self.shown_then_say("9 is good to go")
+        self.confirm()
         state = sb.read_impact_state(self.world.state)[0]
         self.assertEqual(state["clears"][self.PR]["head"], self.H1)
         report = {"pr": self.PR, "head": self.H1, "reasons": ["x"], "floor_paths": [], "globs": []}
@@ -14610,6 +14621,8 @@ class TestChatClearHook(Base):
             self.build()
             self.hook()
             self.say("9 is good to go")
+            self.hook()
+            self.say("yes 9")
             reads = {"n": 0}
             real = self.route
 
@@ -14635,6 +14648,8 @@ class TestChatClearHook(Base):
         self.build()
         self.hook()
         self.say("9 is good to go")
+        self.hook()
+        self.say("yes 9")
         real = self.route
 
         def failing(argv, **kwargs):
@@ -14661,8 +14676,9 @@ class TestChatClearHook(Base):
         self.hook()
         self.say("9 is good to go")
         self.hook()
+        self.confirm()
         self.assertTrue(seen and all(token == "tok-app" for token in seen), "every point-of-effect read runs as the repo's own account: %r" % seen)
-        self.assertEqual(len(seen), 2, "one pre-read and the core's own read, nothing from memory")
+        self.assertEqual(len(seen), 4, "the understanding read, the confirmation read, the pre-read and the core's own read, nothing from memory")
 
     def live_verdicts(self):
         return [e["detail"]["live"] for e in self.events("chat_clear.verdict")]
@@ -14679,6 +14695,7 @@ class TestChatClearHook(Base):
             self.hook()
             self.say("9 is good to go")
             self.hook()
+            self.confirm()
             (verdict,) = self.events("chat_clear.verdict")[-1:]
             self.assertEqual(verdict["detail"]["live"], live, file)
             self.assertEqual(bool(self.label_deletes()), live, "labels are removed only while the current file confirms live: %r" % (file,))
@@ -14722,6 +14739,7 @@ class TestChatClearHook(Base):
         self.say("9 is also good to go")
         self.hook()
         self.assertEqual(self.live_verdicts()[-1:], [True], "removed: back to the config's value")
+        self.confirm()
         self.assertEqual(bool(self.label_deletes()), True)
 
     def test_a_kill_file_or_a_broken_config_that_appears_between_two_messages_of_one_pass_stops_the_second_one(self):
@@ -14764,6 +14782,8 @@ class TestChatClearHook(Base):
         self.build(live=True)
         self.hook()
         self.say("9 is good to go")
+        self.hook()
+        self.say("yes 9")
         with mock.patch.object(self.engine, "send", side_effect=RuntimeError("down")):
             self.hook()
         self.assertEqual(self.label_deletes(), sorted([self.names["hold-impact"], self.names["merge-captain"]]), "the clear is made; a reply that cannot be sent is audited")
@@ -14771,6 +14791,8 @@ class TestChatClearHook(Base):
         self.build(live=True)
         self.hook()
         self.say("9 is good to go")
+        self.hook()
+        self.say("yes 9")
         cleared_before = len(self.events("gate.hold_cleared"))
         with mock.patch.object(sb, "comment_as", side_effect=RuntimeError("no comment")):
             self.hook()
@@ -14836,14 +14858,16 @@ class TestChatClearHook(Base):
         tree = ast.parse(Path(sb.__file__).read_text())
         fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
         derived = set()
-        for name in ("_chat_clear_act", "chat_clear_apply"):
+        for name in ("_chat_clear_act", "_chat_clear_confirm", "chat_clear_understand", "chat_clear_apply"):
             for c in ast.walk(fns[name]):
                 if isinstance(c, ast.Call) and any(isinstance(x, ast.Name) and x.id in ("engine", "runner") for x in ast.walk(c)):   # every call that is handed the engine or the gh runner: a route to the world
                     derived.add(ast.unparse(c.func))
         cases = {"chat_clear_apply": "test_light_live_route_clear_core_comment_and_confirmation_write_nothing", "impact_clear_core": "test_light_live_route_clear_core_comment_and_confirmation_write_nothing",
                  "comment_as": "test_light_live_route_clear_core_comment_and_confirmation_write_nothing", "engine.send": "test_light_live_route_the_question_to_the_chief_of_staff_and_the_shown_offer_write_nothing",
                  "cc.show": "test_light_live_route_the_question_to_the_chief_of_staff_and_the_shown_offer_write_nothing",
-                 "engine.audit.append": "assert_all_shadow (the audit is the shadow's own record)", "read_pr_json": "a read: only reached after the live check", "label_names": "a read of the config", "getattr": "a read of the runner"}
+                 "engine.audit.append": "assert_all_shadow (the audit is the shadow's own record)", "read_pr_json": "a read: only reached after the live check", "chat_clear_understand": "test_light_live_route_clear_core_comment_and_confirmation_write_nothing",
+                 "_chat_clear_say": "test_light_live_route_the_question_to_the_chief_of_staff_and_the_shown_offer_write_nothing", "chat_clear_machinery": "a read of the matrix and the files",
+                 "cc.write_pending": "the private pending file, only after the live check", "cc.read_pending": "a read", "cc.is_offerable": "a pure check", "label_names": "a read of the config", "getattr": "a read of the runner"}
         self.assertEqual(derived, set(cases), "a new call that reaches the world has no case: write its test and add its row here")
         for case in cases.values():
             if case.startswith("test_"):
