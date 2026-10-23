@@ -23204,7 +23204,8 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
             decision = "hold"
     rating_entries = impact_rating_entries(engine.state_dir, "%s#%d" % (repo, number), head)[0] if engine.state_dir is not None and isinstance(head, str) else []
     brief_module = load_module("impact_brief")   # slice A hook (#1215): the brief is built from the same diff read; display only, no decision reads it yet
-    report_base = {"top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "head": raw.get("headRefOid"), "base": raw.get("baseRefOid"), "complete": complete}
+    report_base = {"top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "head": raw.get("headRefOid"), "base": raw.get("baseRefOid"), "complete": complete,
+                   "reads": [{"by": e.get("by"), "verdict": e.get("verdict"), "head": e.get("head")} for e in rating_entries], "rating": ({"class": record[1]} if record and record[1] else None)}
     brief = brief_module.build_brief(brief_module.facts_from_report(files, report_base))
     return {"brief": brief, "pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude, "rating_block": rating_block_note(rating_entries, "%s#%d" % (repo, number), head), "rating_lines": rating_mismatch_lines(engine.state_dir, "%s#%d" % (repo, number), head),
             "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete,

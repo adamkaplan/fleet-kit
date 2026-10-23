@@ -40172,7 +40172,8 @@ class TestImpactHold(LedgerBase):
             reason += ": %s" % ", ".join("#%d=%s" % (seq, level) for seq, _, level in self.twin_runs)
         return self.run_as(who, "impact", "clear", self.PR, "--under-order", str(order), "--reason", reason, "--brief-digest", self.FIXTURE_BRIEF["digest"], "--brief-text", self.FIXTURE_BRIEF["text"])
 
-    FIXTURE_BRIEF = {"text": "IMPACT BRIEF (fixture)\nRECOMMENDED DECIDER: Chief of Staff", "decider": "chief_of_staff", "material": [], "why": "fixture."}   # #1215 slice C: the floor's brief at the head (slice A's module is not here)
+    FIXTURE_BRIEF = {"text": "IMPACT BRIEF (fixture)\nRECOMMENDED DECIDER: Chief of Staff", "decider": "chief_of_staff", "material": [], "loosening": [], "why": "fixture.",
+                     "pieces": {"files": "1 file(s)", "classes": "code=1", "ci": "green at aaaaaaaa", "reads": "2 independent reads at head (a, b)", "rating": "Low", "mutants": "4 of 4", "blast": "low"}}   # #1215 slice C: the floor's brief at the head (slice A's module is not here)
     FIXTURE_BRIEF["digest"] = hashlib.sha256(FIXTURE_BRIEF["text"].encode()).hexdigest()
 
     def test_s1_the_chief_of_staff_clears_under_a_listed_order_and_it_is_recorded_as_her_act_under_that_order(self):

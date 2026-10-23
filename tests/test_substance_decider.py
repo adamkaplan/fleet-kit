@@ -16,6 +16,7 @@ def load(path=SRC):
 
 
 DC = load()
+BRIEF = load(ROOT / "bin/impact_brief.py")
 PIECES = {"what": "edits tests", "ci": "green", "reads": "2 independent at head"}
 
 
@@ -29,7 +30,7 @@ def decide(b, classes, mod=DC, matrix=MATRIX):
 
 class Decider(unittest.TestCase):
     def test_S6_owner_only_today_class_without_material_risk_goes_to_chief(self):
-        self.assertEqual(decide(brief(), ["machinery"]), "chief_of_staff")
+        self.assertEqual(decide(brief(), ["authority"]), "chief_of_staff")
         self.assertEqual(decide(brief(), ["identity"]), "chief_of_staff")
 
     def test_S7_each_material_risk_is_escalated(self):
@@ -41,11 +42,11 @@ class Decider(unittest.TestCase):
     def test_S8_same_label_and_class_differ_by_brief(self):
         a, b = brief(), brief(["credentials_widened"])
         self.assertEqual((a["rating"], b["rating"]), ("Low", "Low"))
-        self.assertEqual(decide(a, ["correctness"]), "chief_of_staff")
-        self.assertEqual(decide(b, ["correctness"]), "owner")
+        self.assertEqual(decide(a, ["code"]), "chief_of_staff")
+        self.assertEqual(decide(b, ["code"]), "owner")
 
     def test_S9_owner_only_classes_never_go_to_chief(self):
-        for cls in ("credentials", "issuance", "spend", "merge_shim", "clear_machinery_decision"):
+        for cls in ("merge_shim", "clear_machinery", "an_unnamed_class"):
             self.assertEqual(decide(brief(), [cls]), "owner", cls)
 
     def test_S9_mutant_every_class_chief_is_caught(self):
@@ -56,13 +57,13 @@ class Decider(unittest.TestCase):
         tmp.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(text.replace('if c in rule["owner_only"]:', 'if False:').replace('if c not in rule["chief_of_staff"]:', 'if False:'))
         mut = load(tmp)
-        cleared = [c for c in ("credentials", "issuance", "spend") if decide(brief(), [c], mut) != "owner"]
-        self.assertEqual(len(cleared), 3)
+        cleared = [c for c in ("merge_shim", "clear_machinery", "an_unnamed_class") if decide(brief(), [c], mut) != "owner"]
+        self.assertEqual(len(cleared), 3)  # the mutant clears all three owner-only/unknown classes; the shipped build clears none
         m = json.loads(json.dumps(MATRIX))
         r = m["owner_hold"]["substance_decider"]
         r["chief_of_staff"] += r["owner_only"]
         r["owner_only"] = []
-        self.assertEqual([c for c in ("credentials", "issuance", "spend") if decide(brief(), [c], matrix=m) != "owner"], ["credentials", "issuance", "spend"])
+        self.assertEqual([c for c in ("merge_shim", "clear_machinery", "an_unnamed_class") if decide(brief(), [c], matrix=m) != "owner"], ["merge_shim", "clear_machinery"])
 
     def test_mutant_decide_by_label_or_class_alone_is_caught(self):
         text = SRC.read_text()
@@ -94,7 +95,8 @@ class Decider(unittest.TestCase):
         self.assertFalse(set(r["owner_only"]) & set(r["chief_of_staff"]))
         oh = MATRIX["owner_hold"]
         classes = set(oh["top_tier_classes"]) | set(oh["other_classes"])
-        self.assertLessEqual(classes - {"credentials"}, set(r["owner_only"]) | set(r["chief_of_staff"]))
+        self.assertLessEqual(classes & set(BRIEF.KNOWN_CLASSES), set(r["owner_only"]) | set(r["chief_of_staff"]))
+        self.assertEqual(set(r["owner_only"]) | set(r["chief_of_staff"]), set(BRIEF.KNOWN_CLASSES))   # derived from the code: bin/impact_brief.py
         self.assertEqual(set(r["material_risks"]), set(RISKS))
 
     def test_backstop_block_untouched(self):

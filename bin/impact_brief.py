@@ -160,10 +160,10 @@ def classify(path, top_tier_hits):
 
 
 def facts_from_report(raw_files, report):
-    """Facts for build_brief from `pr_floor_report`'s own reads. CI, reads, mutants and blast radius are not read here yet: they stay absent, so they print `not shown`."""
+    """Facts for build_brief from `pr_floor_report`'s own reads. Reads and rating come from the report (the ledger's records at this head); CI, mutants and blast radius are not read here yet: they stay absent, so they print `not shown` and recommend the owner."""
     hits = report.get("top_tier_hits") or {}
     files = [{"path": f.get("path"), "additions": f.get("additions"), "deletions": f.get("deletions"), "status": str(f.get("changeType") or "modified").lower()}
              for f in raw_files if isinstance(f, dict)]
     complete = report.get("complete") is True
-    return {"files": files if complete else None, "ci": None, "reads": None, "rating": None, "body_claim": None, "head": report.get("head") or "", "base": report.get("base") or "",
+    return {"files": files if complete else None, "ci": None, "reads": report.get("reads"), "rating": report.get("rating"), "body_claim": None, "head": report.get("head") or "", "base": report.get("base") or "",
             "classes": {f["path"]: classify(f["path"], hits) for f in files if isinstance(f["path"], str)}}

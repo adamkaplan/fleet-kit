@@ -58,6 +58,7 @@ MOVED = ('rating_at',
          'delegated_clear_inputs',
          'delegated_clear_pr_checks',
          'floor_brief',
+         'substance_decision',
          'clear_who',
          'delegated_clear_score',
          'delegated_clear_map',
@@ -1177,6 +1178,8 @@ def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info
         floor = floor_brief(engine, repo, report, got["files"])
         info["floor_brief"] = floor
         reasons = module.substance_refusals(got["rule"], report, got["files"], impact_floor.matches, got["closure"], scored, floor, brief[0], brief[1], brief[2])
+        if not reasons and floor is not None and substance_decision(report, floor)[0] != "chief_of_staff":   # the decider and the brief must agree: escalate to the owner
+            reasons = ["escalate to the owner: " + substance_decision(report, floor)[1]]
     else:
         reasons = module.refusals(got["rule"], report, got["files"], impact_floor.matches, got["closure"], scored)
     if reasons:
@@ -1185,16 +1188,18 @@ def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info
 
 
 def floor_brief(engine, repo, report, files):
-    """The brief the floor builds at the report's head: `impact_brief.build_brief(facts)` (slice A's contract), facts assembled from the diff and the report; None when it cannot be built.
-    Only what is read is given: a piece not read is left out and printed `not shown`."""
-    try:
-        mod = load_module("impact_brief")
-        facts = {"files": [{"path": f.get("filename"), "additions": f.get("additions"), "deletions": f.get("deletions"), "status": f.get("status")} for f in files or []],
-                 "ci": None, "reads": None, "rating": None, "body_claim": None, "head": report.get("head"), "base": report.get("base"),
-                 "classes": {p: c for c, ps in (report.get("top_tier_hits") or {}).items() for p in ps}}
-        return mod.build_brief(facts)
-    except Exception:
-        return None
+    """The brief the floor prints at the report's head: the `brief` that `pr_floor_report` built with `impact_brief.build_brief` from the SAME diff read (so the clear compares exactly what `impact floor` printed).
+    None when the report carries none."""
+    brief = report.get("brief") if isinstance(report, dict) else None
+    return brief if isinstance(brief, dict) else None
+
+
+def substance_decision(report, floor):
+    """(decider, why) of `delegated_clear.decide_on_substance` over the real brief, the changed paths' classes (`impact_brief.classify`) and the matrix's `substance_decider` block."""
+    module, briefs = load_module("delegated_clear"), load_module("impact_brief")
+    hits = report.get("top_tier_hits") or {}
+    classes = {p: briefs.classify(p, hits) for p in report.get("changed_paths") or []}
+    return module.decide_on_substance(floor, classes, module.substance_rule(impact_floor.load_matrix()))
 
 
 def clear_who(engine, runner, repo, number, report=None):
