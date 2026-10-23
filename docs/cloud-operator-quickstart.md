@@ -60,6 +60,7 @@ Each setting's name, whether the file requires it, and its kind (name, https URL
 | `CW_CLUSTER_TOKEN_CMD` | no | command | a command that prints a short-lived cluster token (instead of the vault route) |
 | `CW_CLUSTER_ADMIN_CMD` | no | command | a command that prints the cluster administrator kubeconfig (instead of the vault read) |
 | `CW_CLUSTER_ADMIN_SECRET` | no | secret-name | the name of the vault secret that holds the cluster administrator kubeconfig (default `cw-cluster-admin-kubeconfig`): 1 to 127 letters, digits and hyphens; the name, never its content |
+| `CW_STACK_MODEL_SECRET` | no | secret-name | with `launch --cloud --stack` only: the name of the vault secret (same vault as the others) that holds the stack-only model credential: 1 to 127 letters, digits and hyphens; the name, never its value. Ignored without `--stack`. See "A stack-only model credential" |
 | `CW_CLUSTER_TOKEN_DURATION` | no | duration | the cluster token's requested life: 1 to 3 digits and `m` or `h`, from `1m` to `60m` (default `20m`; `1h` is the same as `60m`) |
 | `CW_GIT_TOKEN_CMD` | no | command | a command that prints the one-hour git token; default is the GitHub App mint beside the launcher (`app_token.py`) |
 | `CW_APP_ID_CMD`, `CW_APP_KEY_CMD` | no | command | commands that print the GitHub App's id and key instead of the vault read (`app_token.py`) |
@@ -264,3 +265,40 @@ To verify it:
 - On a worker, its server's `/api/provider` lists `github-copilot` (a pod that lists only the built-in `opencode` provider answers on the free fallback model and is rate limited).
 
 The worker image carries `cloud/worker/entrypoint.sh`, so the order is: merge, an operator rebuilds the image and switches the digest in the settings file, then run the check above on one no-op worker.
+
+## A stack-only model credential
+
+Cause: a cloud worker pod holds only the coder's own model entry (the per-run file `model-auth`, copied into the coder's data directory) and no credential for the containers that the stack starts inside the pod's nested Docker. A stack whose agents need model calls therefore has none, and handing the stack the coder's `model-auth` would put the coder's key into the containers the stack starts. The fix is a second, separate credential that exists only for the stack. The coder's own key is never copied into the stack.
+
+How it travels (only with `launch --cloud --stack` and `CW_STACK_MODEL_SECRET` set; a launch without them is exactly as before): the switchboard reads the named vault secret before any cluster call, hands it to the launcher over an inherited pipe as the per-run secret `stack-model-key` (never an argument, an environment variable or a spec field), the kubelet mounts it read-only at `/run/cw/stack-model-key` (0400), and the entrypoint copies it to a 0600 file on the memory-backed tmpfs (`/run/cw-tmp/stack/model-key`). The stack's start step is `cw-stack-up` (a `docker compose` front end): it gives the compose child, and only that, the variable `CW_STACK_MODEL_KEY`. A service reads it by listing `CW_STACK_MODEL_KEY` under `environment:` in its compose file (no value in the file). `cw-stack-up down` deletes the tmpfs copy; the tmpfs ends with the pod, and the launcher deletes the per-run Secret as it does the others. The kubelet's mount of the Secret stays visible until the pod ends. The audit and the run record carry the secret's name and `delivered`, nothing else. A secret that is missing, empty, over 16384 bytes or unreadable ends the launch with exit 2 before any pod, naming the secret's name.
+
+The honest bound: the coder's shell is the same user and is in the docker group, so it can read the tmpfs file, read the services' environment with `docker inspect` and `docker exec` into a service. The coder CAN read this credential. The protection is not secrecy from the coder: it is that the credential is for one purpose, has a spend cap, can be revoked, is kept out of everything that persists or is shared, and differs from the coder's own key. A repository that wants a narrower exposure may mount the same file with compose `secrets:` (the path is the tmpfs file above); that is an option for the repository, not built here.
+
+The owner's steps (the launcher never creates or changes a credential):
+
+### Step 1: create a dedicated credential
+
+At the model provider, create a credential for stacks only.
+
+### Step 2: give it the narrowest scope
+
+Allow only the model calls the stack makes.
+
+### Step 3: set a spend cap
+
+Set the spend cap at the provider.
+
+### Step 4: store it in the vault
+
+Store it in the cloud vault under a name of your choice (the suggested name is `cw-stack-model-key`) and set `CW_STACK_MODEL_SECRET` to that name in the settings file. To copy an existing key from another vault once, use a pipe so the value is never printed, never a file and never an argument (the value is never in `--value`):
+
+```text
+az keyvault secret show --subscription <src-sub> --vault-name <src-vault> --name <src-secret> --query value -o tsv \
+  | az keyvault secret set --subscription <cloud-sub> --vault-name <cloud-vault> --name cw-stack-model-key --file /dev/stdin
+```
+
+The copy is not run or tested by the launcher; whether the installed `az` accepts `--file /dev/stdin` is checked once in the live run. It makes a second copy of the key; revoking at the provider revokes both.
+
+### Step 5: rotate or revoke at the provider
+
+Revoke or rotate at the provider. The next stack launch then fails at the provider, not in the launcher.

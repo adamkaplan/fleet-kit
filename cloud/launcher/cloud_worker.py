@@ -966,6 +966,7 @@ def ann(pod, key, default=None):
 
 RUN_SECRET_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 RESERVED_RUN_NAMES = {"server-password"}
+STACK_MODEL_KEY = "stack-model-key"   # the per-run Secret key of the stack-only model credential (a stack launch only); never the coder's own key
 SERVER_UID = 1000  # the image's non-root user
 # The pod-level security context of EVERY worker pod (the builder copies it; a stack pod must EQUAL it, whole).
 POD_SECURITY_CONTEXT = {"runAsNonRoot": True, "runAsUser": SERVER_UID, "runAsGroup": SERVER_UID, "fsGroup": SERVER_UID,
@@ -1176,6 +1177,12 @@ class Launcher:
             if hard > max_hard:
                 raise CloudError("--hard is past --max-hard", EXIT_REFUSED)
             run_values = read_run_secret_values(parse_run_secret_fds(a.run_secret_fd))  # before anything is made
+            stack_secret = getattr(a, "stack_model_secret", None)
+            if stack_secret is not None:   # the name only; the value came over the pipe. Both or neither, and only for a stack pod
+                if not getattr(a, "stack", False) or not _VAULT_SECRET_NAME.fullmatch(stack_secret) or STACK_MODEL_KEY not in run_values:
+                    raise CloudError("--stack-model-secret needs --stack, a vault secret name and the %s run secret; nothing was created" % STACK_MODEL_KEY, EXIT_USAGE)
+            elif STACK_MODEL_KEY in run_values:
+                raise CloudError("the %s run secret needs --stack-model-secret NAME; nothing was created" % STACK_MODEL_KEY, EXIT_USAGE)
             agent = getattr(a, "agent", None) or "worker"
             if agent not in AGENTS:   # before any cluster call
                 raise CloudError("--agent must be one of %s, got %r; nothing was created" % (" or ".join(AGENTS), str(agent)[:40]), EXIT_USAGE)
@@ -1230,7 +1237,10 @@ class Launcher:
                     "password_fd": a.password_fd}
         old = self._catch_signals()
         try:
-            return self._audited(worker, "create", go, ("run-secrets=" + ",".join(sorted(parse_run_secret_fds(a.run_secret_fd)))) if a.run_secret_fd else "")
+            reason = ("run-secrets=" + ",".join(sorted(parse_run_secret_fds(a.run_secret_fd)))) if a.run_secret_fd else ""
+            if getattr(a, "stack_model_secret", None) and _VAULT_SECRET_NAME.fullmatch(a.stack_model_secret):   # the name and that it was delivered, nothing else
+                reason = (reason + " " if reason else "") + "stack-model-secret=%s delivered" % a.stack_model_secret
+            return self._audited(worker, "create", go, reason)
         finally:
             self._restore_signals(old)
 
@@ -1944,6 +1954,7 @@ SETTINGS = (
     ("CW_APP_ID_CMD", False, "command"),
     ("CW_APP_INSTALLATION_CMD", False, "command"),
     ("CW_APP_KEY_CMD", False, "command"),
+    ("CW_STACK_MODEL_SECRET", False, "secret-name"),      # the NAME of the vault secret holding the stack-only model credential (a stack launch only); the name, never the value
     ("CW_CLUSTER_ADMIN_SECRET", False, "secret-name"),   # the NAME of the vault secret that holds the cluster administrator route (default cw-cluster-admin-kubeconfig), never its content
     ("CW_CLUSTER_TOKEN_DURATION", False, "duration"),    # the cluster token's requested life (default 20m)
     ("CW_HUB_CHANNEL_URL", False, "name"),         # the channel's address an orchestrator pod is told (default http://cloud-hub.cw.svc:8443/message); not a secret
@@ -2077,6 +2088,7 @@ VALIDATORS = {
     "CW_APP_ID_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
     "CW_APP_INSTALLATION_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
     "CW_APP_KEY_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
+    "CW_STACK_MODEL_SECRET": ("a vault secret name: 1 to 127 letters, digits and hyphens, starting with a letter or digit", lambda v: bool(_VAULT_SECRET_NAME.fullmatch(v))),
     "CW_CLUSTER_ADMIN_SECRET": ("a vault secret name: 1 to 127 letters, digits and hyphens, starting with a letter or digit", lambda v: bool(_VAULT_SECRET_NAME.fullmatch(v))),
     "CW_CLUSTER_TOKEN_DURATION": ("a duration of 1 to 3 digits and m or h, from 1m to 60m (for example 20m or 1h)", _duration_ok),
     "CW_HUB_CHANNEL_URL": ("an http or https URL: a host, an optional port, an optional one-segment path (/message), no user, query or fragment", lambda v: bool(re.fullmatch(r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/[A-Za-z0-9._-]{0,64})?", v))),
@@ -2226,6 +2238,7 @@ def build_parser():
     c.add_argument("--image")
     c.add_argument("--stack", action="store_true",
                    help="a pod for a worker that runs a nested Docker stack: the Sysbox runtime class, its own user namespace, the pool's node label; off by default (the default pod is unchanged)")
+    c.add_argument("--stack-model-secret", metavar="NAME", help="with --stack: the NAME of the vault secret whose value arrives as the run secret %s (audit: the name and 'delivered'); never a value" % STACK_MODEL_KEY)
     c.add_argument("--agent", help="worker (default) or orchestrator: the agent the pod runs (CW_AGENT); any other value is refused before anything is made")
     c.add_argument("--boss", help="with --agent orchestrator: the name of its boss (FLEET_BOSS)")
     c.add_argument("--wait", type=int, default=300)

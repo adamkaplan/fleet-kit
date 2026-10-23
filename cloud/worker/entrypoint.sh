@@ -7,6 +7,7 @@
 #   model-auth       the model provider's access entry, as the one-entry array `opencode auth export` prints: IMPORTED
 #                    (`opencode auth import --standalone`, read from this file on stdin) into OpenCode's own store under a data
 #                    directory on tmpfs, BEFORE the server starts; the server reads only that store. The file is never copied
+#   stack-model-key  a stack-only model credential: copied (0600) to $TMP/stack/model-key for cw-stack-up, never exported
 #   git-token        read at use time by a git credential helper and a gh wrapper; never in git config, argv or the environment
 # A file that is absent is skipped (a pod started without per-run secrets). A file that is present but unreadable or empty
 # REFUSES the start: there is no fallback to another source. Nothing here prints a value.
@@ -70,6 +71,13 @@ XDG_CONFIG_HOME="$cfgdir"; export XDG_CONFIG_HOME
 # a hub pod (any agent; only when the launcher wrote the key): the per-pod channel secret goes from the per-run Secret to the memory-backed file the cloud command reads (a copy, 0400, never printed)
 if usable channel-secret; then
   install -m 0400 "$RUN/channel-secret" "$TMP/channel-token"
+fi
+
+# a stack launched with a stack-only model credential (only when the launcher wrote the key): a 0600 copy on the memory-backed tmpfs for
+# cw-stack-up. It is never exported into this environment and never printed; the coder's own model-auth is never copied there.
+if usable stack-model-key; then
+  ( umask 077; mkdir -p "$TMP/stack" )
+  install -m 0600 "$RUN/stack-model-key" "$TMP/stack/model-key"
 fi
 
 if usable git-token; then

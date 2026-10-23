@@ -379,6 +379,10 @@ read the diff). An image by tag is accepted by design: the operator picks the im
 Details: `docs/cloud-worker-interface.md`. The live runs are in
 "Live proof" below.
 
+## A stack-only model credential
+
+The pod holds only the coder's model entry (`model-auth`); the containers a stack starts hold none, and giving them `model-auth` would put the coder's key into the stack. With `launch --cloud --stack` and the setting `CW_STACK_MODEL_SECRET` (a vault secret name), the switchboard reads that secret before any pod exists and hands it over as the per-run secret `stack-model-key`; the entrypoint copies it to `/run/cw-tmp/stack/model-key` (0600). `cw-stack-up` (use it instead of `docker compose`) gives the compose child the variable `CW_STACK_MODEL_KEY`; a service lists `CW_STACK_MODEL_KEY` under `environment:`. `cw-stack-up down` removes the copy. The audit and run record carry the name and `delivered`. The coder can read this credential (same user, docker group); the protection is purpose-scoping, a spend cap and revocation at the provider. Owner steps: `docs/cloud-operator-quickstart.md`, "A stack-only model credential".
+
 ## Live proof (S10 runtime half and S12), run on a cluster
 
 Needs a cluster with one Ubuntu node whose containerd is 2.x, and `kubectl` pointed at it. Replace `<image>` with the

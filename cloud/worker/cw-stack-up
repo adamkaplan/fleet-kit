@@ -1,0 +1,32 @@
+#!/bin/sh
+# cw-stack-up: the stack's start step, a `docker compose` front end. When this pod was launched with a stack-only model credential, the
+# entrypoint left a 0600 copy on the memory-backed tmpfs ($CW_TMP_DIR/stack/model-key). This wrapper reads it and puts it into the
+# environment of the compose child ONLY, as CW_STACK_MODEL_KEY, then runs `docker compose "$@"`. A service reads it by listing
+# CW_STACK_MODEL_KEY under `environment:` in its compose file (pass-through, no value in the file). It is never in the worker's own
+# environment, never in an argument, never printed. `cw-stack-up ... down ...` deletes the copy once compose has run.
+# The coder's own model entry is never read here. A pod launched without the credential: plain `docker compose`, unchanged.
+set -u
+TMP="${CW_TMP_DIR:-/run/cw-tmp}"
+RUN="${CW_RUN_DIR:-/run/cw}"
+KEY="$TMP/stack/model-key"
+down=0
+for a in "$@"; do [ "$a" = down ] && down=1; done
+if [ ! -e "$KEY" ]; then
+  if [ "$down" = 0 ] && [ -e "$RUN/stack-model-key" ]; then
+    echo "cw-stack-up: the stack model key copy is gone (the stack was stopped); the worker must be launched again for a new one" >&2
+    exit 1
+  fi
+  exec docker compose "$@"
+fi
+if [ ! -r "$KEY" ] || [ ! -s "$KEY" ]; then
+  echo "cw-stack-up: the stack model key copy is unreadable or empty" >&2
+  exit 1
+fi
+v=$(cat "$KEY") || exit 1
+if [ "$down" = 1 ]; then
+  CW_STACK_MODEL_KEY=$v docker compose "$@"
+  code=$?
+  rm -f "$KEY"
+  exit "$code"
+fi
+CW_STACK_MODEL_KEY=$v exec docker compose "$@"
