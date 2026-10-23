@@ -63,97 +63,30 @@ BIN = Path(__file__).resolve().parent
 REPO = BIN.parent
 os.environ["GIT_TERMINAL_PROMPT"] = "0"   # #1050: a test's git never opens a credential dialog
 os.environ["GCM_INTERACTIVE"] = "never"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests" / "switchboard"))   # support import
 
+import importlib
 
-def with_http_head(serve, argv, kwargs, counters=None):
-    """What `gh api -i [-H "If-None-Match: <etag>"] <path>` does, over a fake that answers `gh api <path>` (`serve(argv_without_flags, kwargs)`): the answer
-    gets an HTTP header block with an ETag (a hash of the body) and a conditional read whose tag still matches is answered 304 (exit 1, as the real gh
-    does). Anything that is not exactly that shape goes to `serve` untouched."""
-    argv = list(argv)
-    flags = argv[2:-1]
-    tag_in = flags[2].split(": ", 1)[1] if flags[:2] == ["-i", "-H"] and len(flags) == 3 and flags[2].startswith("If-None-Match: ") else None
-    if not (flags[:1] == ["-i"] and (len(flags) == 1 or tag_in is not None)):
-        return serve(argv, kwargs)
-    plain = serve(argv[:2] + argv[-1:], kwargs)
-    if counters is not None:
-        counters["http"] = counters.get("http", 0) + 1
-    if plain.returncode != 0:
-        return plain
-    tag = 'W/"%s"' % hashlib.sha256(plain.stdout.encode()).hexdigest()[:16]
-    if tag_in == tag:
-        if counters is not None:
-            counters["not_modified"] = counters.get("not_modified", 0) + 1
-        return subprocess.CompletedProcess(argv, 1, "HTTP/2.0 304 Not Modified\r\nEtag: %s\r\n\r\n" % tag, "gh: HTTP 304\n")
-    return subprocess.CompletedProcess(argv, 0, "HTTP/2.0 200 OK\r\nEtag: %s\r\nX-Ratelimit-Remaining: 4000\r\n\r\n%s" % (tag, plain.stdout), plain.stderr)
-
-
-SWITCHBOARD = BIN / "fleet-switchboard"
-
-
-def _manifest_files():
-    """Every file that holds the daemon's code, read from the manifest the entry itself reads (a part cannot escape a scan that reads this list)."""
-    lines = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.lstrip().startswith("#")]
-    return tuple((BIN / n).resolve() for n in lines)
-
-
-SWITCHBOARD_SOURCE_FILES = _manifest_files()
-
-
-def switchboard_source():
-    """The daemon's code as every scan reads it: the files of SWITCHBOARD_SOURCE_FILES, in order, as one text."""
-    return "\n".join(path.read_text() for path in SWITCHBOARD_SOURCE_FILES)
-SCENARIO = BIN / "fleet-scenario"
-
-
-def copy_entry(directory):
-    """The entry with its manifest and its parts, copied into `directory` as the program is laid out in bin/."""
-    directory = Path(directory)
-    shutil.copy(str(SWITCHBOARD), str(directory / "fleet-switchboard"))
-    shutil.copy(str(BIN / "fleet-switchboard.parts"), str(directory / "fleet-switchboard.parts"))
-    shutil.copytree(str(BIN / "switchboard"), str(directory / "switchboard"), dirs_exist_ok=True)
-
-
-def _load(name, path):
-    loader = importlib.machinery.SourceFileLoader(name, str(path))
-    spec = importlib.util.spec_from_loader(name, loader)
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
-
-
-sb = _load("t_fleet_switchboard", SWITCHBOARD)
-
-
-def set_retired(state, retired):
-    """A test sets the retired map: in the registry when it exists (the record), and in retired.json (its derived copy), as the registry itself would."""
-    state = Path(state)
-    (state / "retired.json").write_text(json.dumps(retired))
-    path = state / "registry.json"
-    if path.exists():
-        doc = json.loads(path.read_text())
-        doc["retired"] = retired
-        path.write_text(json.dumps(doc))
-sc = _load("t_fleet_scenario", SCENARIO)
-
-
-def class_source(name, method=None):
-    """The source of a class in bin/fleet-switchboard, or of one of its methods."""
-    source = SWITCHBOARD.read_text()
-    for node in ast.parse(source).body:
-        if isinstance(node, ast.ClassDef) and node.name == name:
-            if method is None:
-                return ast.get_source_segment(source, node)
-            for inner in node.body:
-                if isinstance(inner, ast.FunctionDef) and inner.name == method:
-                    return ast.get_source_segment(source, inner)
-    raise LookupError("%s.%s not found" % (name, method))
-
-
-@contextlib.contextmanager
-def captured():
-    out, err = io.StringIO(), io.StringIO()
-    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-        yield out, err
+_support_core = importlib.import_module("support.core")   # support import
+Base, COS_ALLOWING, COS_ALLOWING_FULL, COS_GUARDS, FakeRunner, REAL_NODE, SAFE_PATH, cos_rules_text = (_support_core.Base, _support_core.COS_ALLOWING, _support_core.COS_ALLOWING_FULL, _support_core.COS_GUARDS, _support_core.FakeRunner, _support_core.REAL_NODE, _support_core.SAFE_PATH, _support_core.cos_rules_text)   # support import
+_support_fake_hubs = importlib.import_module("support.fake_hubs")   # support import
+DECISION_LABEL, FLOOR_CONFIG, FakeHub, FakeTriageHub, LEDGER_HEAD, LEDGER_NEW_HEAD, LEDGER_PLAN, WaitingInputs, sweep_issue, top_tier_migrations, tri_issue, write_report_replay = (_support_fake_hubs.DECISION_LABEL, _support_fake_hubs.FLOOR_CONFIG, _support_fake_hubs.FakeHub, _support_fake_hubs.FakeTriageHub, _support_fake_hubs.LEDGER_HEAD, _support_fake_hubs.LEDGER_NEW_HEAD, _support_fake_hubs.LEDGER_PLAN, _support_fake_hubs.WaitingInputs, _support_fake_hubs.sweep_issue, _support_fake_hubs.top_tier_migrations, _support_fake_hubs.tri_issue, _support_fake_hubs.write_report_replay)   # support import
+_support_fake_jev = importlib.import_module("support.fake_jev")   # support import
+FAKE_SB_SOURCE, FakeJev, FakeOpener, GIT_SHIM, JEV_SETTINGS, KEY_VALUE, SHIM, SHIM_LOOKUP_SECONDS, choice_answer, confident, http_error, jev_reply, noul_answers, write_fake_env = (_support_fake_jev.FAKE_SB_SOURCE, _support_fake_jev.FakeJev, _support_fake_jev.FakeOpener, _support_fake_jev.GIT_SHIM, _support_fake_jev.JEV_SETTINGS, _support_fake_jev.KEY_VALUE, _support_fake_jev.SHIM, _support_fake_jev.SHIM_LOOKUP_SECONDS, _support_fake_jev.choice_answer, _support_fake_jev.confident, _support_fake_jev.http_error, _support_fake_jev.jev_reply, _support_fake_jev.noul_answers, _support_fake_jev.write_fake_env)   # support import
+_support_installs_and_keys = importlib.import_module("support.installs_and_keys")   # support import
+ACME_API, ACME_WEB, API, BAD_STATE_REASON, BAD_TARGET_STATES, CloudReaperInstall, DECISIONS_PLUGIN, DEFAULT_TOKEN, FAKE_TOKENS, FakeDaemons, GOOD_DONE_WHEN, GOOD_PLAN, InstallCase, KeyCase, ORDERS_CHARTER_BODY, PR16_KEY, PR16_NOTICE, RealStatusAfterInstall, TIER_LABELS, WEB, WrittenFilesAreGuarded, secrets_in, tree_of = (_support_installs_and_keys.ACME_API, _support_installs_and_keys.ACME_WEB, _support_installs_and_keys.API, _support_installs_and_keys.BAD_STATE_REASON, _support_installs_and_keys.BAD_TARGET_STATES, _support_installs_and_keys.CloudReaperInstall, _support_installs_and_keys.DECISIONS_PLUGIN, _support_installs_and_keys.DEFAULT_TOKEN, _support_installs_and_keys.FAKE_TOKENS, _support_installs_and_keys.FakeDaemons, _support_installs_and_keys.GOOD_DONE_WHEN, _support_installs_and_keys.GOOD_PLAN, _support_installs_and_keys.InstallCase, _support_installs_and_keys.KeyCase, _support_installs_and_keys.ORDERS_CHARTER_BODY, _support_installs_and_keys.PR16_KEY, _support_installs_and_keys.PR16_NOTICE, _support_installs_and_keys.RealStatusAfterInstall, _support_installs_and_keys.TIER_LABELS, _support_installs_and_keys.WEB, _support_installs_and_keys.WrittenFilesAreGuarded, _support_installs_and_keys.secrets_in, _support_installs_and_keys.tree_of)   # support import
+_support_loader = importlib.import_module("support.loader")   # support import
+SCENARIO, SWITCHBOARD, SWITCHBOARD_SOURCE_FILES, _load, captured, class_source, class_source_fn, copy_entry, sb, sc, set_retired, switchboard_source, with_http_head = (_support_loader.SCENARIO, _support_loader.SWITCHBOARD, _support_loader.SWITCHBOARD_SOURCE_FILES, _support_loader._load, _support_loader.captured, _support_loader.class_source, _support_loader.class_source_fn, _support_loader.copy_entry, _support_loader.sb, _support_loader.sc, _support_loader.set_retired, _support_loader.switchboard_source, _support_loader.with_http_head)   # support import
+_support_orders_and_adapters = importlib.import_module("support.orders_and_adapters")   # support import
+BoundedList, BoundedOut, EA, EXTERNAL_ADAPTER, ExternalAdapterCase, FakeDoorServer, FakeExternal, FakeGhPr, FakePruneDocker, FakeWorkHost, FakeWorkSink, HEAD_A, HEAD_B, PermanentRefusal, PickyExternal, baseline_failing_send, baseline_failing_source, baseline_golden, captain_pr, cos_orders_file, fake_mapping, janitor_review, pr_view_json, put_cos_orders, report, reviewed_janitor_argv, worker = (_support_orders_and_adapters.BoundedList, _support_orders_and_adapters.BoundedOut, _support_orders_and_adapters.EA, _support_orders_and_adapters.EXTERNAL_ADAPTER, _support_orders_and_adapters.ExternalAdapterCase, _support_orders_and_adapters.FakeDoorServer, _support_orders_and_adapters.FakeExternal, _support_orders_and_adapters.FakeGhPr, _support_orders_and_adapters.FakePruneDocker, _support_orders_and_adapters.FakeWorkHost, _support_orders_and_adapters.FakeWorkSink, _support_orders_and_adapters.HEAD_A, _support_orders_and_adapters.HEAD_B, _support_orders_and_adapters.PermanentRefusal, _support_orders_and_adapters.PickyExternal, _support_orders_and_adapters.baseline_failing_send, _support_orders_and_adapters.baseline_failing_source, _support_orders_and_adapters.baseline_golden, _support_orders_and_adapters.captain_pr, _support_orders_and_adapters.cos_orders_file, _support_orders_and_adapters.fake_mapping, _support_orders_and_adapters.janitor_review, _support_orders_and_adapters.pr_view_json, _support_orders_and_adapters.put_cos_orders, _support_orders_and_adapters.report, _support_orders_and_adapters.reviewed_janitor_argv, _support_orders_and_adapters.worker)   # support import
+_support_policy_and_import = importlib.import_module("support.policy_and_import")   # support import
+BUDGET_TEST_MS, FAKE_V1, FLEET_HOOKS, FORBIDDEN_IN_PUBLIC_TEXT, HARNESS, LOW, NODE, POLICY_REPLAY, TRIAL, V1_CHILD, V1_CHILD_ID, V1_FIXTURES, V1_MAIN, V1_MAIN_ID, convert, policy_raw_config, policy_replay_file, v1_export = (_support_policy_and_import.BUDGET_TEST_MS, _support_policy_and_import.FAKE_V1, _support_policy_and_import.FLEET_HOOKS, _support_policy_and_import.FORBIDDEN_IN_PUBLIC_TEXT, _support_policy_and_import.HARNESS, _support_policy_and_import.LOW, _support_policy_and_import.NODE, _support_policy_and_import.POLICY_REPLAY, _support_policy_and_import.TRIAL, _support_policy_and_import.V1_CHILD, _support_policy_and_import.V1_CHILD_ID, _support_policy_and_import.V1_FIXTURES, _support_policy_and_import.V1_MAIN, _support_policy_and_import.V1_MAIN_ID, _support_policy_and_import.convert, _support_policy_and_import.policy_raw_config, _support_policy_and_import.policy_replay_file, _support_policy_and_import.v1_export)   # support import
+_support_scenario_roles = importlib.import_module("support.scenario_roles")   # support import
+AGENT_FILES, BRIEF_30_60, FAKE_GH, FAKE_REPO, GH_BIN, GH_REPO, JEV_REPLAY, LEGACY_POLICY, ROLE_BYTE_LIMITS, WORKER_ROLES, _stdlib_roots, format_scenario_report, is_floor_view, role_of = (_support_scenario_roles.AGENT_FILES, _support_scenario_roles.BRIEF_30_60, _support_scenario_roles.FAKE_GH, _support_scenario_roles.FAKE_REPO, _support_scenario_roles.GH_BIN, _support_scenario_roles.GH_REPO, _support_scenario_roles.JEV_REPLAY, _support_scenario_roles.LEGACY_POLICY, _support_scenario_roles.ROLE_BYTE_LIMITS, _support_scenario_roles.WORKER_ROLES, _support_scenario_roles._stdlib_roots, _support_scenario_roles.format_scenario_report, _support_scenario_roles.is_floor_view, _support_scenario_roles.role_of)   # support import
+_support_service_and_merge = importlib.import_module("support.service_and_merge")   # support import
+FakeMergeGitHub, FakeMergedGh, MG_HEAD, MG_NEWTIP, MG_TIP, V2TransportBase, feed_line, write_lane_hours = (_support_service_and_merge.FakeMergeGitHub, _support_service_and_merge.FakeMergedGh, _support_service_and_merge.MG_HEAD, _support_service_and_merge.MG_NEWTIP, _support_service_and_merge.MG_TIP, _support_service_and_merge.V2TransportBase, _support_service_and_merge.feed_line, _support_service_and_merge.write_lane_hours)   # support import
+_support_wire_fakes = importlib.import_module("support.wire_fakes")   # support import
+DOC_FAULTS, EPOCH, EXPECT_EXAMPLES, FAKE_HERDR, FAKE_OPENCODE, FORBIDDEN_HERDR, FakeHTTP, FakeV2, HERDR_ALLOWED, MSG, REJECTED, SES, SOCKET_ALLOWED, STEP_EXAMPLES, SimClock, TOKEN_NAME, TYPING_VERBS, VALID, _drop, _record_keys, _set, _usage, fact, herdr_typing_violations, mutate, observation, parse_flags, routed = (_support_wire_fakes.DOC_FAULTS, _support_wire_fakes.EPOCH, _support_wire_fakes.EXPECT_EXAMPLES, _support_wire_fakes.FAKE_HERDR, _support_wire_fakes.FAKE_OPENCODE, _support_wire_fakes.FORBIDDEN_HERDR, _support_wire_fakes.FakeHTTP, _support_wire_fakes.FakeV2, _support_wire_fakes.HERDR_ALLOWED, _support_wire_fakes.MSG, _support_wire_fakes.REJECTED, _support_wire_fakes.SES, _support_wire_fakes.SOCKET_ALLOWED, _support_wire_fakes.STEP_EXAMPLES, _support_wire_fakes.SimClock, _support_wire_fakes.TOKEN_NAME, _support_wire_fakes.TYPING_VERBS, _support_wire_fakes.VALID, _support_wire_fakes._drop, _support_wire_fakes._record_keys, _support_wire_fakes._set, _support_wire_fakes._usage, _support_wire_fakes.fact, _support_wire_fakes.herdr_typing_violations, _support_wire_fakes.mutate, _support_wire_fakes.observation, _support_wire_fakes.parse_flags, _support_wire_fakes.routed)   # support import
 
 
 # ------------------------------------------------------- made-up process numbers (#886)
@@ -286,125 +219,6 @@ class StandInPids:
 
 
 # --------------------------------------------------------------------- fakes
-
-class FakeRunner:
-    """Stands in for subprocess.run. Records every call; answers from a script.
-
-    Every call gets `default`, or `route(argv)` when a route is given. An
-    answer is (returncode, stdout, stderr), or an exception instance to raise.
-    """
-
-    def __init__(self, default=(0, '{"data": {}}', ""), route=None):
-        self.calls = []
-        self.default = default
-        self.route = route
-
-    @property
-    def argv(self):
-        return self.calls[-1][0]
-
-    @property
-    def kwargs(self):
-        return self.calls[-1][1]
-
-    def __call__(self, argv, **kwargs):
-        self.calls.append((list(argv), kwargs))
-        answer = self.route(argv) if self.route else self.default
-        if isinstance(answer, BaseException):
-            raise answer
-        code, stdout, stderr = answer
-        return subprocess.CompletedProcess(argv, code, stdout, stderr)
-
-
-SAFE_PATH = "/usr/bin:/bin"
-REAL_NODE = shutil.which("node")   # looked up at import, before a test narrows PATH (the plugin cross-check needs it)
-
-
-def remove_tree_patiently(tmp, tries=20, pause=0.1):
-    """#93: clean a TemporaryDirectory up even when a daemon thread of the test is still writing into it for a
-    moment (`Directory not empty`): try again until it is gone, then let the last error show."""
-    for attempt in range(tries):
-        try:
-            tmp.cleanup()
-            return
-        except OSError:
-            if attempt == tries - 1:
-                raise
-            time.sleep(pause)
-
-
-def cos_rules_text(*rules, shape="flow"):
-    """A chief-of-staff definition's permission list from (resource, effect) pairs, in the installed one-line flow shape (#191) or the older block shape."""
-    if shape == "flow":
-        return '  - {action: "*", resource: "*", effect: deny}\n' + "".join('  - {action: shell, resource: "%s", effect: %s}\n' % r for r in rules)
-    return "".join('  - action: "shell"\n    resource: "%s"\n    effect: %s\n' % r for r in rules)
-
-
-COS_GUARDS = (("fleet-switchboard gates *enforce*", "deny"), ("fleet-switchboard gates *ENFORCE*", "deny"), ("fleet-switchboard gates on*", "deny"),
-              ("fleet-switchboard waive *G6*", "deny"), ("fleet-switchboard waive *G8*", "deny"))
-# the installed shape: broad allows, guards after them
-COS_ALLOWING = cos_rules_text(("fleet-switchboard gates *", "allow"), ("fleet-switchboard waive *", "allow"), *COS_GUARDS)
-COS_ALLOWING_FULL = cos_rules_text(("fleet-switchboard gates *", "allow"), ("fleet-switchboard waive *", "allow"), ("timeout ?? fleet-switchboard *", "allow"),
-                                   *COS_GUARDS, *((r.replace("fleet-switchboard", "timeout * fleet-switchboard", 1), e) for r, e in COS_GUARDS))
-
-
-class Base(unittest.TestCase):
-    def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(remove_tree_patiently, tmp)
-        self.home = Path(tmp.name).resolve()
-        patcher = mock.patch.dict(os.environ, {
-            "HOME": str(self.home),
-            "XDG_CONFIG_HOME": str(self.home / "xdg-config"),
-            "XDG_STATE_HOME": str(self.home / "xdg-state"),
-            # A test that forgets to inject a fake must fail, not reach the
-            # machine's real herdr or OpenCode: neither lives in these.
-            "PATH": SAFE_PATH,
-            # the installed chief-of-staff definition: one that allows the way out of a refusal (the gate preflight reads it)
-            sb.COS_DEFINITION_ENV: str(self.home / "cos-definition.md"),
-        })
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        # The version of a program is asked for under a production bound (3 s) a loaded machine can overrun: tests get a bound that cannot
-        # expire, and a clean cache; the one test of the bound patches its own.
-        bound = mock.patch.object(sb, "PROGRAM_VERSION_SECONDS", 120)
-        bound.start()
-        self.addCleanup(bound.stop)
-        sb._VERSIONS.clear()
-        # No test reads the real machine's load or memory: the cpu and memory guards run in every engine pass, and a loaded CI runner would wake the Chief of
-        # Staff in an unrelated test. A test of the guards patches its own figures over these.
-        guard = sb.load_cpu_guard()
-        for target, name, value in ((os, "getloadavg", lambda: (0.1, 0.1, 0.1)), (guard, "memory_reading", lambda: guard.Memory(0, 10 * 10 ** 9, 5 * 10 ** 9)),
-                                    (guard, "process_table", lambda *a, **k: {})):
-            calm = mock.patch.object(target, name, value)
-            calm.start()
-            self.addCleanup(calm.stop)
-        (self.home / "cos-definition.md").write_text(COS_ALLOWING)
-        for name in (sb.LAB_ENV, sb.FAULT_ENV, "HERDR_PANE_ID", "OPENCODE_SESSION_ID"):
-            os.environ.pop(name, None)
-        self.config_file = self.home / "xdg-config" / "fleet-switchboard" / "config.json"
-        self.state_dir = self.home / "xdg-state" / "fleet-switchboard"
-
-    def write_config(self, obj):
-        self.config_file.parent.mkdir(parents=True, exist_ok=True)
-        self.config_file.write_text(obj if isinstance(obj, str) else json.dumps(obj))
-
-    def fake_bin(self, name, body):
-        path = self.home / name
-        path.write_text("#!/bin/sh\n" + body)
-        os.chmod(str(path), 0o755)
-        return path
-
-    def run_cli(self, path, *argv):
-        env = dict(os.environ)
-        config = Path(env.get("XDG_CONFIG_HOME", "")) / "fleet-switchboard" / "config.json"
-        try:
-            if str(self.home) in config.read_text():   # its opencode is a fake script of this test's own, never the real service
-                env[sb.ALLOW_REAL_V2_ENV] = "1"
-        except OSError:
-            pass
-        return subprocess.run([sys.executable, "-B", str(path), *argv],
-                              capture_output=True, text=True, env=env)
 
 
 # ------------------------------------------------------------------ the config
@@ -596,9 +410,6 @@ class TestStateDir(Base):
 
 # ------------------------------------------------------------- OpenCode v2
 
-SES = "ses_0123456789abcdef"
-MSG = "msg_0123456789abcdef0123456789"
-
 
 class TestV2Client(Base):
     def client(self, **runner_args):
@@ -740,43 +551,6 @@ class TestV2Client(Base):
 
 
 # ------------------------------------------------------------------- herdr
-
-FORBIDDEN_HERDR = ("prompt", "send-keys", "send-text", "run", "focus")
-
-
-def herdr_typing_violations(source):
-    """Every way `source` could make herdr type into a pane or move focus.
-
-    Used on bin/fleet-switchboard, and on a planted violation to show it bites.
-    """
-    found = []
-    tree = ast.parse(source)
-    tokens = [node.value for node in ast.walk(tree)
-              if isinstance(node, ast.Constant) and isinstance(node.value, str) and not re.search(r"\s", node.value)]
-    for token in tokens:
-        if token in ("send-keys", "send-text"):
-            found.append(token)
-        if "focus" in token.lower() and not token.startswith("--no-") and token != "--focus":
-            found.append(token)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef) and node.name == "HerdrClient":
-            for inner in ast.walk(node):
-                if isinstance(inner, ast.Constant) and inner.value in FORBIDDEN_HERDR:
-                    found.append("HerdrClient uses %r" % inner.value)
-    # PR 16: the one `--focus` is `workspace create`, which only a person's own `bootstrap` runs
-    allowed = [inner for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "workspace_create"
-               for inner in ast.walk(node)]
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and node.value == "--focus" and not any(node is inner for inner in allowed):
-            found.append("--focus outside HerdrClient.workspace_create")
-    for token in tokens:  # the socket: any herdr method but the one allowed is a way in
-        if re.match(r"^(agent|pane|tab|workspace|terminal|layout|window|input)\.", token) \
-                and token not in SOCKET_ALLOWED:
-            found.append("socket method %s" % token)
-    for pattern in (r"""["']agent["']\s*,\s*["'](prompt|send-keys)["']""",
-                    r"""["']pane["']\s*,\s*["'](send-text|send-keys|run)["']"""):
-        found.extend(m.group(0) for m in re.finditer(pattern, source))
-    return found
 
 
 class TestHerdrClient(Base):
@@ -1072,20 +846,6 @@ class TestAuditLog(Base):
 
 # ------------------------------------------------------------------ the faults
 
-DOC_FAULTS = ("no-engagement-gate", "no-recheck", "no-dedupe", "steer-not-queue", "no-batch",
-              "no-intent-header", "no-classify", "crash-after-send", "no-policy-judge",
-              "judge-loosens", "no-maxims", "no-worker-source", "no-note-conversion",
-              "no-import-metadata", "idle-wakes", "no-rider", "no-nudge-once", "no-fail-open",
-              "ignore-reports", "no-description",
-              "no-decisions-file", "stale-as-fresh", "decision-resolves-never",  # PR 14
-              "static-repos", "bare-issue-number", "one-account", "repo-create-allowed",  # PR 15
-              "key-missing-silent", "no-ensure-on-use", "shared-profile-default",  # PR 16
-              "key-env-only-unseen",  # PR 16, the first real install
-              "config-read-once", "catch-up-blocks-pass",  # PR 16, reload and the slow catch-up
-              "catch-up-on-fresh-start", "full-window-every-time",  # PR 16, forward only
-              "orders-start-only", "orders-wake", "anyone-can-order", "orders-never-judged",  # PR 17
-              "tier-flat", "cos-orders-unfed", "anyone-edits-cos-orders", "answer-unjudged")  # PR 18
-
 
 class TestFaults(Base):
     def test_the_list_is_the_documented_one(self):
@@ -1156,246 +916,6 @@ class TestMessageId(unittest.TestCase):
 
 
 # ------------------------------------------------------------- the scenarios
-
-VALID = {
-    "id": "N1",
-    "title": "A worker finishes while you are talking to its orchestrator",
-    "problem": 3,
-    "since_pr": 4,
-    "tiers": ["offline", "lab-scripted"],
-    "tags": ["example"],
-    "cast": {
-        "cos": {"role": "chief-of-staff"},
-        "platform": {"role": "orchestrator", "reports_to": "cos", "charter": 1},
-        "coder": {"role": "coder", "reports_to": "platform", "issue": 2},
-        "helper": {"role": "cos-subagent", "reports_to": "cos", "issue": 3},
-    },
-    "issues": {
-        "1": {"intent": "Run the platform", "done_when": None},
-        "2": {"intent": "Add a health check", "done_when": "GET /health returns 200", "parent": 1},
-        "3": {"intent": None},
-    },
-    "steps": [
-        {"at": "0s", "actor": "coder", "do": "turn", "lasts": "30s"},
-        {"at": "10s", "actor": "you", "do": "message", "to": "platform", "text": "status?"},
-        {"at": "10s", "actor": "world", "do": "comment", "issue": 2, "body": "looks good"},
-        {"at": "2m", "actor": "you", "do": "draft", "to": "platform", "text": "and next"},
-        {"at": "2h", "actor": "world", "do": "wait"},
-    ],
-    "expect": [
-        {"name": "one-note", "that": "delivered", "to": "platform", "key": "worker.idle:coder:*",
-         "mode": "note", "count": 1},
-        {"that": "no_machine_turn", "agent": "platform"},
-        {"that": "message_has_intent", "to": "platform", "issue": 2},
-    ],
-    "control": {"fault": "no-engagement-gate", "fails": ["no_machine_turn", "one-note"]},
-}
-
-
-def mutate(change):
-    obj = copy.deepcopy(VALID)
-    change(obj)
-    return obj
-
-
-def _set(path, value):
-    def change(obj):
-        target = obj
-        for part in path[:-1]:
-            target = target[part]
-        target[path[-1]] = value
-    return change
-
-
-def _drop(path):
-    def change(obj):
-        target = obj
-        for part in path[:-1]:
-            target = target[part]
-        del target[path[-1]]
-    return change
-
-
-REJECTED = [
-    # (what, change, a substring of the expected error)
-    ("unknown top-level key", _set(["notes"], "x"), "unknown top-level key 'notes'"),
-    ("id lower case", _set(["id"], "n1"), "id:"),
-    ("id three letters", _set(["id"], "ABC1"), "id:"),
-    ("id no number", _set(["id"], "N"), "id:"),
-    ("id not a string", _set(["id"], 1), "id:"),
-    ("title empty", _set(["title"], " "), "title:"),
-    ("title not a string", _set(["title"], 3), "title:"),
-    ("problem 5", _set(["problem"], 5), "problem:"),
-    ("problem 0", _set(["problem"], 0), "problem:"),
-    ("problem string", _set(["problem"], "3"), "problem:"),
-    ("problem bool", _set(["problem"], True), "problem:"),
-    ("since_pr 0", _set(["since_pr"], 0), "since_pr:"),
-    ("since_pr string", _set(["since_pr"], "4"), "since_pr:"),
-    ("since_pr float", _set(["since_pr"], 1.5), "since_pr:"),
-    ("tiers empty", _set(["tiers"], []), "tiers:"),
-    ("tiers unknown", _set(["tiers"], ["offline", "cloud"]), "tiers:"),
-    ("tiers string", _set(["tiers"], "offline"), "tiers:"),
-    ("tiers repeated", _set(["tiers"], ["offline", "offline"]), "tiers:"),
-    ("tags string", _set(["tags"], "spike"), "tags:"),
-    ("tags non-string", _set(["tags"], [1]), "tags:"),
-    ("cast not an object", _set(["cast"], ["coder"]), "cast:"),
-    ("cast member not an object", _set(["cast", "coder"], "coder"), "cast.coder:"),
-    ("cast role unknown", _set(["cast", "coder", "role"], "reviewer"), "cast.coder.role"),
-    ("cast role missing", _drop(["cast", "cos", "role"]), "cast.cos.role"),
-    ("cast reports_to unknown", _set(["cast", "coder", "reports_to"], "nobody"), "cast.coder.reports_to"),
-    ("cast reports_to self", _set(["cast", "coder", "reports_to"], "coder"), "cast.coder.reports_to"),
-    ("cast issue string", _set(["cast", "coder", "issue"], "2"), "cast.coder.issue"),
-    ("cast charter zero", _set(["cast", "platform", "charter"], 0), "cast.platform.charter"),
-    ("cast unknown key", _set(["cast", "coder", "model"], "x"), "unknown key 'model'"),
-    ("cast name reserved", _set(["cast", "you"], {"role": "coder"}), "reserved"),
-    ("issues not an object", _set(["issues"], []), "issues:"),
-    ("issue key not a number", _set(["issues", "#2"], {"intent": "x"}), "issues.#2"),
-    ("issue not an object", _set(["issues", "2"], "x"), "issues.2:"),
-    ("issue intent missing", _drop(["issues", "2", "intent"]), "issues.2.intent"),
-    ("issue intent not a string", _set(["issues", "2", "intent"], 5), "issues.2.intent"),
-    ("issue done_when not a string", _set(["issues", "2", "done_when"], ["x"]), "issues.2.done_when"),
-    ("issue parent string", _set(["issues", "2", "parent"], "1"), "issues.2.parent"),
-    ("issue unknown key", _set(["issues", "2", "owner"], "x"), "unknown key 'owner'"),
-    ("steps not a list", _set(["steps"], {}), "steps:"),
-    ("step not an object", _set(["steps", 0], "turn"), "steps[0]:"),
-    ("step at without unit", _set(["steps", 1, "at"], "10"), "steps[1].at"),
-    ("step at in days", _set(["steps", 1, "at"], "1d"), "steps[1].at"),
-    ("step at a number", _set(["steps", 1, "at"], 10), "steps[1].at"),
-    ("step at missing", _drop(["steps", 1, "at"]), "steps[1].at"),
-    ("step times decrease", _set(["steps", 4, "at"], "90s"), "times must not decrease"),
-    ("step actor unknown", _set(["steps", 0, "actor"], "nobody"), "steps[0].actor"),
-    ("step actor missing", _drop(["steps", 0, "actor"]), "steps[0].actor"),
-    ("step do unknown", _set(["steps", 0, "do"], "type"), "steps[0].do"),
-    ("step do missing", _drop(["steps", 0, "do"]), "steps[0].do"),
-    ("expect empty", _set(["expect"], []), "expect:"),
-    ("expect not a list", _set(["expect"], {"that": "delivered"}), "expect:"),
-    ("expectation not an object", _set(["expect", 1], "no_machine_turn"), "expect[1]:"),
-    ("expectation that unknown", _set(["expect", 1, "that"], "happy"), "expect[1].that"),
-    ("expectation that missing", _drop(["expect", 2, "that"]), "expect[2].that"),
-    ("expectation name repeated", _set(["expect", 2, "name"], "one-note"), "used twice"),
-    ("expectation name empty", _set(["expect", 2, "name"], ""), "expect[2].name"),
-    ("control not an object", _set(["control"], "no-batch"), "control:"),
-    ("control without a kind", _set(["control"], {"fails": ["no_machine_turn"]}), "exactly one"),
-    ("control with two kinds", _set(["control", "baseline"], "fleet-heartbeat"), "exactly one"),
-    ("control fault unknown", _set(["control", "fault"], "no-safety"), "unknown fault"),
-    ("control baseline empty", _set(["control"], {"baseline": "", "fails": ["one-note"]}), "control.baseline"),
-    ("control variant not an object", _set(["control"], {"variant": "x", "fails": ["one-note"]}), "control.variant"),
-    ("control fails missing", _drop(["control", "fails"]), "control.fails"),
-    ("control fails empty", _set(["control", "fails"], []), "control.fails"),
-    ("control fails not a list", _set(["control", "fails"], "one-note"), "control.fails"),
-    ("control fails unmatched", _set(["control", "fails"], ["one-note", "draft_intact"]), "'draft_intact' matches no"),
-    ("control unknown key", _set(["control", "why"], "x"), "unknown key 'why'"),
-    # Field by field, for the kinds the offline runner implements.
-    ("fact without key", _set(["steps", 2], {"at": "10s", "actor": "world", "do": "fact", "to": "coder",
-                                              "summary": "s"}), "steps[2].key: required"),
-    ("fact to a stranger", _set(["steps", 2], {"at": "10s", "actor": "world", "do": "fact", "to": "nobody",
-                                                "key": "k", "summary": "s"}), "steps[2].to: must be a cast name"),
-    ("fact field typo", _set(["steps", 2], {"at": "10s", "actor": "world", "do": "fact", "too": "coder",
-                                             "to": "coder", "key": "k", "summary": "s"}), "unknown field 'too'"),
-    ("fact batch not a bool", _set(["steps", 2], {"at": "10s", "actor": "world", "do": "fact", "to": "coder",
-                                                   "key": "k", "summary": "s", "batch": "no"}), "steps[2].batch"),
-    ("turn of zero steps", _set(["steps", 0, "steps"], 0), "steps[0].steps"),
-    ("turn lasts forever", _set(["steps", 0, "lasts"], "ever"), "steps[0].lasts"),
-    ("pass with an unknown fault", _set(["steps", 4], {"at": "2h", "actor": "world", "do": "pass",
-                                                        "faults": ["no-safety"]}), "steps[4].faults"),
-    ("wait with a field", _set(["steps", 4, "for"], "ever"), "unknown field 'for'"),
-    ("delivered in an unknown mode", _set(["expect", 0, "mode"], "push"), "expect[0].mode"),
-    ("delivered without key", _drop(["expect", 0, "key"]), "expect[0].key: required"),
-    ("model_saw at an unknown moment", _set(["expect", 1], {"that": "model_saw", "agent": "coder", "key": "k",
-                                                             "when": "later"}), "expect[1].when"),
-    ("message_count without count", _set(["expect", 1], {"that": "message_count", "to": "coder"}),
-     "expect[1].count: required"),
-    # Who may act, and rules across fields.
-    ("an agent sends your message", _set(["steps", 1, "actor"], "coder"), "'coder' cannot message"),
-    ("you take a turn", _set(["steps", 0, "actor"], "you"), "'you' cannot turn"),
-    ("the world drafts", _set(["steps", 3, "actor"], "world"), "'world' cannot draft"),
-    ("your permission answer without to", _set(["steps", 2], {"at": "10s", "actor": "you", "do": "permission"}),
-     "steps[2].to: required for your answer"),
-    ("an agent's ask with a decision", _set(["steps", 2], {"at": "10s", "actor": "coder", "do": "permission",
-                                                            "decision": "once"}), "takes no `to` or `decision`"),
-    ("a draft of two lines", _set(["steps", 3, "text"], "a\nb"), "steps[3].text"),
-    ("within a step that does not exist", _set(["expect", 1], {"that": "within", "agent": "coder", "step": 5,
-                                                                "seconds": 2}), "expect[1].step"),
-    ("a message read back by neither key nor text", _set(["expect", 1], {
-        "that": "metadata_roundtrip", "agent": "coder", "of": "message"}), "exactly one of `key` or `text`"),
-    ("a status nobody reports", _set(["expect", 1], {"that": "status_is", "agent": "coder", "status": "busy",
-                                                      "at": "5s"}), "expect[1].status"),
-    ("no_machine_turn with a field typo", _set(["expect", 1, "agnet"], "platform"), "unknown field 'agnet'"),
-    ("a variant with an unknown key", _set(["control"], {"variant": {"engaged_minutes": 0}, "fails": ["one-note"]}),
-     "control.variant: unknown key"),
-    ("a variant for a step that does not exist", _set(["control"], {"variant": {"steps": {"7": {"text": "x"}}},
-                                                                     "fails": ["one-note"]}), "not the index"),
-    ("a variant that breaks the scenario", _set(["control"], {"variant": {"expect": {"one-note": {"mode": "push"}}},
-                                                               "fails": ["one-note"]}),
-     "control.variant makes expect[0].mode"),
-]
-
-
-# One valid instance of every kind, each field set (the vocabulary is checked in every tier).
-STEP_EXAMPLES = {
-    "turn": {"lasts": "30s", "steps": 2},
-    "message": {"to": "platform", "text": "status?", "lasts": "5s"},
-    "draft": {"to": "platform", "text": "half typed"},
-    "away": {},
-    "delete-state": {},
-    "permission": {"to": "coder", "decision": "always"},
-    "comment": {"issue": 2, "body": "looks good", "repo": "acme/web"},  # PR 15
-    "leave": {"agent": "coder"},  # PR 15
-    "kill-daemon": {}, "restart-daemon": {}, "wait": {},
-    "close-pane": {"agent": "coder"},
-    "edit-intent": {"issue": 2, "intent": "Add a health check and a probe", "done_when": None},
-    "synthetic": {"to": "coder", "key": "k", "text": "t", "id": "same", "resume": False, "delivery": "steer"},
-    "note": {"to": "coder", "key": "k", "text": "t"},
-    "wake": {"to": "coder", "key": "k", "text": "t", "delivery": "queue"},
-    "fact": {"to": "platform", "key": "lab.fact:1", "summary": "s", "kind": "review", "issue": 2,
-             "from": "coder", "batch": False},
-    "pass": {"faults": ["no-dedupe", "crash-after-send"]},
-    "launch": {"agent": "coder", "brief": "Add a health check", "new_workspace": "Acme Web"},
-    "handoff": {"issue": 2, "brief": "Done so far: a\nNext steps: b"},  # PR 8
-    "report": {"state": "done", "text": "PR is up", "issue": 2},  # PR 13
-    "awaiting": {"issue": 5, "on": True, "title": "Pick the database"},  # PR 14
-    "send": {"to": "platform", "text": "use postgres", "issue": 2},
-    "delete-decisions": {},
-    "use": {"command": "decisions"},  # PR 16
-    "bootstrap": {},
-    "close-agent": {"agent": "coder"},
-    "edit-config": {"add_repo": "acme/web", "broken": False},  # PR 16
-    "orders": {"charter": 1, "action": "add", "text": "approve deploys here", "number": 1},  # PR 17
-    "edit-orders": {"charter": 1, "text": "approve deploys here"},
-    "compact": {"agent": "platform", "status": "completed"},
-}
-EXPECT_EXAMPLES = {
-    "delivered": {"to": "platform", "key": "lab.fact:*", "mode": "note", "count": 0, "keys": 1},
-    "message_count": {"to": "platform", "count": 1},
-    "model_saw": {"agent": "platform", "key": "lab.fact:*", "when": "between_steps", "count": 0},
-    "no_machine_turn": {"agent": "platform"},
-    "within": {"agent": "platform", "step": 1, "seconds": 2.5, "key": "k"},
-    "draft_intact": {"agent": "platform", "text": "and next"},
-    "message_has_intent": {"to": "platform", "issue": 2},
-    "classified": {"agent": "cos", "step": 1, "as": "current-work"},
-    "handed_off": {"issue": 3},
-    "toast": {"agent": "coder", "text": "held", "count": 1},
-    "repo_watch": {"repo": "acme/web", "how": "polling"},  # PR 15
-    "repo_membership": {"repo": "acme/web", "joined": True, "left": False},
-    "status_says": {"text": "polling every"},
-    "config_says": {"at": "90s", "text": "INVALID"},  # PR 16
-    "launch_refused": {"agent": "coder", "text": "Acme Web"},
-    "tool_outcome": {"agent": "coder", "tool": "shell", "outcome": "completed"},
-    "judged": {"agent": "cos", "question": "Does it say plainly that the work failed?", "threshold": 0.8},
-    "status_is": {"agent": "coder", "status": ["working", "blocked"], "at": "5s"},
-    "metadata_roundtrip": {"agent": "coder", "of": "message", "text": "status?", "fleet": None},
-    "pane_runs_v2": {"agent": "coder"},
-    "no_typing": {"agent": "coder"},
-    "message_shows": {"to": "platform", "text": "no intent recorded"},  # PR 6
-    "intent_gap": {"issue": 2},
-    "decisions": {"at": "30s", "count": 1, "text": "Which database?"},  # PR 14
-    "decisions_say": {"at": "30s", "text": "not updating"},
-    "status_first_line": {"text": "No decision-model key"},  # PR 16
-    "bootstrap_says": {"step": 1, "text": "already runs"},
-    "fleet_sessions": {"agent": "coder", "count": 1},
-    "orders_on_github": {"charter": 1, "count": 1, "text": "approve deploys"},  # PR 17
-    "orders_refused": {"agent": "coder", "count": 1},
-}
 
 
 class TestScenarioValidator(unittest.TestCase):
@@ -1567,12 +1087,6 @@ class TestScenarioFiles(Base):
 
 # --------------------------------------------------------------------- the CLI
 
-def routed(v2=(0, '{"data": {"version": "2.0.22"}}', ""), herdr=(0, '{"result": {"agents": [{}, {}]}}', "")):
-    """A runner that answers the configured v2 binary and herdr differently."""
-    def route(argv):
-        return v2 if argv[1:2] == ["api"] else herdr
-    return FakeRunner(route=route)
-
 
 class TestStatus(Base):
     def status(self, runner, *argv):
@@ -1714,412 +1228,6 @@ class TestStatus(Base):
 
 
 # ------------------------------------------------- stateful fakes of v2 and herdr
-
-EPOCH = 1800000000.0  # where every simulated clock starts
-FAKE_OPENCODE = "/fake/bin/opencode"
-FAKE_HERDR = "/fake/bin/herdr"
-
-
-class SimClock:
-    """Simulated time. Nothing in these tests sleeps."""
-
-    def __init__(self, start=EPOCH):
-        self.t = float(start)
-
-    def now(self):
-        return self.t
-
-    def ms(self, at=None):
-        return int(round((self.t if at is None else at) * 1000))
-
-
-class FakeHTTP(Exception):
-    def __init__(self, status, name, message):
-        super().__init__(message)
-        self.status, self.name, self.message = status, name, message
-
-
-class Enveloped(list):
-    """A list a fake operation returns with the rest of v2's answer beside `data`."""
-
-    envelope = None
-
-
-def _record_keys(record):
-    """Keys of a transcript message (`metadata`) or an inbox item (`payload.metadata`)."""
-    meta = record.get("metadata") or (record.get("payload") or {}).get("metadata") or {}
-    keys = (meta.get("fleet") or {}).get("keys")
-    return list(keys) if isinstance(keys, list) else []
-
-
-class FakeV2:
-    """`opencode api` with the spike-verified semantics (docs/switchboard.md, S2-S5).
-
-    It is a runner, so the engine reaches it through V2Client._call exactly as
-    it reaches the real binary. Oracles read its state directly: transcripts,
-    the inbox, admissions and every model call.
-
-    - A note (`resume` false, `steer`) on an idle session starts no turn and
-      waits in the inbox; it reaches the model in the same call as the next
-      turn's trigger, placed just before it.
-    - A `steer` item on a busy session is injected at the next step of the turn,
-      or, after the last step, delivered at the end with one more model call.
-    - A `queue` item waits; it runs after the turn's final reply, never between
-      steps, in the same busy span. `time.idle` is written once, at the end.
-    - `resume` true on an idle session starts a turn at once.
-    - inbox.update to `steer` on a waiting item starts a turn when idle; steer
-      to steer is refused with 409.
-    - A repeated message id is admitted once; the repeat returns the original.
-      Ids are global, so a repeat aimed at another session is not admitted
-      there either (the assumption the derived id is built around).
-
-    Not modelled, and refused loudly: a fleet prompt to a busy session. (Yours is
-    modelled in the transcript only: see human_prompt_while_busy.) A turn
-    started by a wake lasts `wake_lasts` seconds (0 by default).
-    """
-
-    def __init__(self, clock):
-        self.clock = clock
-        self.sessions = {}
-        self.admitted = {}     # message id -> admission, across sessions
-        self.model_calls = []
-        self.writes = []       # every write, with the audit line count at that moment
-        self.calls = []
-        self.down = False
-        self.audit_path = None
-        self.wake_lasts = 0
-        self.before_synthetic = None   # a hook run as a synthetic arrives (the end-of-turn race)
-        self.interrupts = []           # every session.interrupt: {"session", "resume", "was_busy", "at"}
-        self._ids = 0
-
-    def _id(self, prefix):
-        self._ids += 1
-        return "%s_fake%06d" % (prefix, self._ids)
-
-    # -- the runner interface
-    def __call__(self, argv, **kwargs):
-        argv = list(argv)
-        self.calls.append(argv)
-        if self.down:
-            return subprocess.CompletedProcess(argv, 1, "", "error: cannot reach the OpenCode service\n")
-        if argv[1:2] != ["api"] or len(argv) < 3:
-            return subprocess.CompletedProcess(argv, 2, "", "fake opencode: only `api` is modelled\n")
-        if argv[2] == "GET":   # `opencode api GET /api/agent` (the registered agents): not modelled here, so the service reads as unreachable
-            return subprocess.CompletedProcess(argv, 1, "", "fake opencode: GET is not modelled\n")
-        op, params, body, rest = argv[2], {}, None, argv[3:]
-        while rest:
-            flag, value, rest = rest[0], rest[1], rest[2:]
-            if flag == "--param":
-                name, _, val = value.partition("=")
-                params[name] = val
-            elif flag == "-d":
-                body = json.loads(value)
-            else:
-                raise AssertionError("fake opencode: unexpected argument %r" % flag)
-        handler = getattr(self, "op_" + op.replace(".", "_"), None)
-        if handler is None:
-            return subprocess.CompletedProcess(argv, 1, '{"name":"NotFound"}', "HTTP 404 Not Found\n")
-        try:
-            data = handler(params, body)
-        except FakeHTTP as err:
-            return subprocess.CompletedProcess(
-                argv, 1, json.dumps({"name": err.name, "message": err.message}),
-                "HTTP %d %s\n" % (err.status, err.name))
-        payload = {"data": data}
-        payload.update(getattr(data, "envelope", None) or {})  # PR 8: a listing's cursor
-        return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
-
-    # -- state helpers
-    def create_session(self, metadata, title="fake", agent=None, directory=None):
-        sid = self._id("ses")
-        self.sessions[sid] = {"id": sid, "title": title, "metadata": copy.deepcopy(metadata),
-                              "agent": agent, "directory": directory,
-                              "created": self.clock.now(), "idle": None, "idle_writes": [], "outcome": None,
-                              "messages": [], "inbox": [], "turn": None, "turns": 0}
-        return sid
-
-    def _session(self, params):
-        session = self.sessions.get(params.get("sessionID"))
-        if session is None:
-            raise FakeHTTP(404, "NotFound", "no such session")
-        return session
-
-    def busy(self, sid):
-        return self.sessions[sid]["turn"] is not None
-
-    def _write(self, op, sid, ident):
-        lines = 0
-        if self.audit_path is not None and Path(self.audit_path).exists():
-            lines = len(Path(self.audit_path).read_text().splitlines())
-        self.writes.append({"op": op, "session": sid, "id": ident, "at": self.clock.now(), "audit_lines": lines})
-
-    def _message(self, s, type_, text, metadata, at, mid=None):
-        message = {"id": mid or self._id("msg"), "sessionID": s["id"], "type": type_, "text": text,
-                   "time": {"created": self.clock.ms(at)}}
-        if metadata is not None:
-            message["metadata"] = copy.deepcopy(metadata)
-        s["messages"].append(message)
-        return message
-
-    def _deliver(self, s, items, at):
-        """Move inbox items into the transcript; they reach the model now."""
-        delivered = []
-        for item in items:
-            s["inbox"].remove(item)
-            delivered.append(self._message(s, item.get("type", "synthetic"), item["text"], item.get("metadata"), at, item["id"]))
-            if item["id"] in self.admitted:  # your own prompt is not a switchboard admission
-                self.admitted[item["id"]]["delivered_at"] = at
-        return delivered
-
-    def _model_call(self, s, phase, inputs, at):
-        self.model_calls.append({"session": s["id"], "at": at, "phase": phase, "turn": s["turns"],
-                                 "inputs": [{"id": m["id"], "type": m["type"], "keys": _record_keys(m)}
-                                            for m in inputs]})
-
-    def _start(self, s, at, lasts=0, steps=1, prompt=None, items=()):
-        """A turn starts. Waiting notes ride in front of what started it (S3)."""
-        s["turns"] += 1
-        items = list(items)
-        notes = [i for i in s["inbox"] if i["delivery"] == "steer" and i not in items]
-        inputs = self._deliver(s, notes, at) + self._deliver(s, items, at)
-        if prompt is not None:
-            inputs.append(self._message(s, "user", prompt[0], prompt[1], at))
-        self._model_call(s, "turn_start", inputs, at)
-        s["turn"] = {"steps": [at + lasts * i / steps for i in range(1, steps)], "end": at + lasts}
-        if lasts <= 0 and steps <= 1:
-            self._finish(s, at)
-
-    def _finish(self, s, at):
-        """The final reply; then whatever waits runs in the same busy span (S3, S4)."""
-        if s["idle"] is not None and at <= s["idle"]:
-            at = s["idle"] + 0.001  # v2's time.idle only moves forward, even for a turn that takes no time
-        self._message(s, "assistant", "reply", None, at)
-        while s["inbox"]:
-            steer = [i for i in s["inbox"] if i["delivery"] == "steer"]
-            self._model_call(s, "after_reply", self._deliver(s, steer or s["inbox"][:1], at), at)
-            self._message(s, "assistant", "reply", None, at)
-        s["turn"] = None
-        s["idle"] = at
-        s["idle_writes"].append(at)
-        s["outcome"] = "success"
-
-    def advance(self):
-        """Run every turn event due by now: steps, then the final reply."""
-        now = self.clock.now()
-        for s in self.sessions.values():
-            while s["turn"] is not None:
-                turn = s["turn"]
-                if turn["steps"] and turn["steps"][0] <= now:
-                    at = turn["steps"].pop(0)
-                    steer = [i for i in s["inbox"] if i["delivery"] == "steer"]
-                    self._model_call(s, "between_steps", self._deliver(s, steer, at), at)
-                elif turn["end"] <= now:
-                    self._finish(s, turn["end"])
-                else:
-                    break
-
-    def start_turn(self, sid, text, fleet, lasts=0, steps=1, metadata=None):
-        """A prompt: yours (no fleet metadata) or the fleet's, starting a turn of `steps` model calls."""
-        s = self.sessions[sid]
-        if s["turn"] is not None:
-            if metadata is None and not fleet:  # PR 8: you type while it works
-                return self.human_prompt_while_busy(sid, text)
-            raise AssertionError("fake opencode: a prompt to a busy session is not modelled")
-        if metadata is None and fleet:
-            metadata = {"fleet": {"from": "fleet-task"}}
-        self._start(s, self.clock.now(), lasts, steps, prompt=(text, metadata))
-
-    def admissions(self, sid):
-        return [a for a in self.admitted.values() if a["session"] == sid]
-
-    def compact(self, sid, status="completed"):
-        """PR 17: a compaction in the transcript, in the shape the Lab measured on v2 2.0.22 (docs/switchboard.md,
-        "Standing orders", Lab proof): a message of type `compaction`, id `msg_...`, `time.created`, `status`
-        running, completed or failed, a `reason`, `summary` and `recent` while running and when completed, an
-        `error` when failed. It keeps its id as it goes from running to completed. Returns its id."""
-        s = self.sessions[sid]
-        message = self._message(s, "compaction", None, None, self.clock.now())
-        del message["text"]
-        message.update(status=status, reason="manual")
-        if status == "failed":
-            message["error"] = {"type": "compaction.failed", "message": "Compaction summary did not match the required template"}
-        else:
-            message.update(summary="## Objective\n- probe\n", recent="[User]: hi")
-        return message["id"]
-
-    def finish_compaction(self, sid, mid, status="completed"):
-        for message in self.sessions[sid]["messages"]:
-            if message["id"] == mid:
-                message["status"] = status
-                message.pop("error", None)
-
-    def human_prompt_while_busy(self, sid, text):
-        """PR 8: you send a message while the session works. It is in the transcript at once,
-        as the TUI shows it, and the running turn goes on undisturbed. When the model first
-        sees it, and how the TUI admits it, is spike SF1's question: nothing here says."""
-        s = self.sessions[sid]
-        at, mid = self.clock.now(), self._id("msg")
-        item = {"id": mid, "sessionID": sid, "type": "user", "text": text, "metadata": None, "resume": False,
-                "delivery": "steer", "time": {"created": self.clock.ms(at)}}
-        s["inbox"].append(item)  # SF1: in the inbox at once, consumed at the next step boundary
-
-    # -- operations
-    def op_server_info(self, params, body):
-        return {"version": "2.0.22-fake"}
-
-    def op_session_create(self, params, body):
-        return self._info(self.sessions[self.create_session(
-            body.get("metadata") or {}, body.get("title"), body.get("agent"),
-            (body.get("location") or {}).get("directory"))])
-
-    def _info(self, s):
-        stamps = [self.clock.ms(s["created"])] + [m["time"]["created"] for m in s["messages"] if isinstance(m.get("time"), dict) and "created" in m["time"]]
-        if s["idle"] is not None:
-            stamps.append(self.clock.ms(s["idle"]))
-        return {"id": s["id"], "title": s["title"], "metadata": copy.deepcopy(s["metadata"]),
-                "time": {"created": self.clock.ms(s["created"]), "updated": max(stamps),
-                         "idle": None if s["idle"] is None else self.clock.ms(s["idle"])},
-                "outcome": s["outcome"], "location": {"directory": s.get("directory")}}
-
-    def op_session_get(self, params, body):
-        return self._info(self._session(params))
-
-    def op_session_active(self, params, body):
-        return {sid: {"type": "busy"} for sid, s in self.sessions.items() if s["turn"] is not None}
-
-    def op_session_message_list(self, params, body):
-        s = self._session(params)
-        messages = list(s["messages"]) if params.get("order") == "asc" else list(reversed(s["messages"]))
-        if "type" in params:
-            messages = [m for m in messages if m["type"] == params["type"]]
-        if "limit" in params:
-            return self.page_of(messages, params)
-        return copy.deepcopy(messages)
-
-    CURSOR_PREFIX = "cur_at_"
-
-    def page_of(self, messages, params):
-        """PR 8: a page and the cursor v2 returns beside it. A cursor token names the
-        offset of the next page, in the listing's own order (newest first by default);
-        `order` and `cursor` together are refused, as v2 says. `previous` points back."""
-        start = 0
-        if "cursor" in params:
-            if "order" in params:
-                raise FakeHTTP(400, "InvalidRequestError", "do not combine cursor with order")
-            if not params["cursor"].startswith(self.CURSOR_PREFIX):
-                raise FakeHTTP(400, "InvalidCursorError", "bad cursor")
-            start = int(params["cursor"][len(self.CURSOR_PREFIX):])
-        size = int(params["limit"])
-        page = Enveloped(copy.deepcopy(messages[start:start + size]))
-        more = start + size < len(messages)
-        page.envelope = {"cursor": {"next": self.CURSOR_PREFIX + str(start + size) if more else None,
-                                    "previous": self.CURSOR_PREFIX + str(max(0, start - size)) if start else None}}
-        return page
-
-    def op_session_interrupt(self, params, body):
-        """VERIFIED in a throwaway v2 2.0.24 (steer probe): the running turn is cut at once (its in-flight tool
-        call aborted), the session is idle with outcome interrupted, and a waiting steering input stays in the
-        inbox unless `resume` is true, which runs it as a new turn. Idle: a no-op, {"interrupted": false}."""
-        s = self._session(params)
-        resume = params.get("resume") == "true"
-        busy = s["turn"] is not None
-        at = self.clock.now()
-        self.interrupts.append({"session": s["id"], "resume": resume, "was_busy": busy, "at": at})
-        self._write("session.interrupt", s["id"], None)
-        if busy:
-            s["turn"] = None
-            s["idle"] = max(at, (s["idle"] or 0) + 0.001)
-            s["idle_writes"].append(s["idle"])
-            s["outcome"] = "interrupted"
-            if resume and s["inbox"]:
-                self._start(s, at, self.wake_lasts, 1, items=[i for i in s["inbox"] if i["delivery"] == "steer"])
-        return {"interrupted": busy}
-
-    def op_session_synthetic(self, params, body):
-        if self.before_synthetic is not None:
-            hook, self.before_synthetic = self.before_synthetic, None
-            hook()
-        s = self._session(params)
-        mid = body["id"]
-        if mid in self.admitted:  # admitted once; the repeat returns the original (S2)
-            return copy.deepcopy(self.admitted[mid]["record"])
-        at = self.clock.now()
-        record = {"id": mid, "sessionID": s["id"], "type": "synthetic"}
-        item = {"id": mid, "sessionID": s["id"], "text": body["text"], "metadata": copy.deepcopy(body.get("metadata")),
-                "resume": body["resume"], "delivery": body["delivery"], "time": {"created": self.clock.ms(at)}}
-        fleet = (body.get("metadata") or {}).get("fleet") or {}
-        self.admitted[mid] = {"id": mid, "session": s["id"], "resume": body["resume"], "delivery": body["delivery"],
-                              "at": at, "delivered_at": None, "keys": list(fleet.get("keys") or []),
-                              "from": fleet.get("from"), "text": body["text"], "record": record,
-                              "description": body.get("description")}
-        self._write("session.synthetic", s["id"], mid)
-        s["inbox"].append(item)
-        if s["turn"] is None and body["resume"]:
-            self._start(s, at, self.wake_lasts, 1, items=[item])
-        return copy.deepcopy(record)
-
-    def op_session_prompt(self, params, body):
-        s = self._session(params)
-        self.start_turn(s["id"], body["text"], fleet=bool((body.get("metadata") or {}).get("fleet")),
-                        metadata=body.get("metadata"))
-        return {"id": s["messages"][-1]["id"]}
-
-    @staticmethod
-    def _inbox_record(item):
-        """An inbox item as v2 2.0.22 returns it: text and metadata under
-        `payload`, and no `resume` (S3, S5)."""
-        return {"id": item["id"], "sessionID": item["sessionID"], "time": copy.deepcopy(item["time"]),
-                "type": item.get("type", "synthetic"), "payload": {"text": item["text"], "metadata": copy.deepcopy(item.get("metadata"))},
-                "delivery": item["delivery"]}
-
-    def op_session_inbox_list(self, params, body):
-        return [self._inbox_record(item) for item in self._session(params)["inbox"]]
-
-    def op_session_inbox_update(self, params, body):
-        s = self._session(params)
-        item = next((i for i in s["inbox"] if i["id"] == params.get("inboxID")), None)
-        if item is None:
-            raise FakeHTTP(404, "NotFound", "no such pending input")
-        if body["delivery"] == "steer" and item["delivery"] == "steer":
-            raise FakeHTTP(409, "Conflict", "Pending input cannot change to steer")
-        self._write("session.inbox.update", s["id"], item["id"])
-        item["delivery"] = body["delivery"]
-        if body["delivery"] == "steer" and s["turn"] is None:
-            self._start(s, self.clock.now(), self.wake_lasts, 1, items=[item])
-        return self._inbox_record(item)
-
-
-HERDR_ALLOWED = (["agent", "list"], ["agent", "get"], ["pane", "report-metadata"], ["notification", "show"],
-                 ["pane", "process-info"], ["pane", "close"], ["workspace", "list"], ["workspace", "create"],
-                 ["plugin", "list"], ["pane", "get"], ["pane", "read"], ["tab", "close"], ["tab", "get"], ["tab", "list"])  # PR 16; #973: the bell migration reads the tab labels once; the control plane reads a pane and closes a stale tab: `status` reads herdr's plugin list; `bootstrap` makes a workspace
-SOCKET_ALLOWED = ("layout.apply",)
-TYPING_VERBS = (["agent", "prompt"], ["agent", "send-keys"], ["agent", "start"], ["pane", "send-text"],
-                ["pane", "send-keys"], ["pane", "run"])
-TOKEN_NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
-
-
-def _usage(argv, text):
-    return subprocess.CompletedProcess(argv, 2, "", "error: %s\n" % text)
-
-
-def parse_flags(args, valued, bare=()):
-    """(positionals, flags) of a herdr subcommand, strictly: an unknown flag, a
-    flag without its value, or a repeated flag is a usage error, as in clap."""
-    positional, flags, i = [], {}, 0
-    while i < len(args):
-        arg = args[i]
-        if arg.startswith("--"):
-            if arg in bare:
-                flags[arg] = True
-            elif arg in valued and i + 1 < len(args):
-                flags.setdefault(arg, []).append(args[i + 1])
-                i += 1
-            else:
-                raise ValueError("unexpected argument %r" % arg)
-        else:
-            positional.append(arg)
-        i += 1
-    return positional, flags
 
 
 class FakeHerdr:
@@ -2515,15 +1623,6 @@ class World:
     def model_calls(self, name, phase=None):
         return [c for c in self.v2.model_calls
                 if c["session"] == self.sessions[name] and (phase is None or c["phase"] == phase)]
-
-
-def fact(key, created=EPOCH, recipient="platform", **extra):
-    return sb.Fact(key, recipient, extra.pop("kind", "lab.fact"), extra.pop("summary", "s %s" % key), created, **extra)
-
-
-def observation(status="idle", human=None, **extra):
-    return sb.Observation("platform", "ses_1", "w1:p1", status, {"name": "platform"},
-                          last_human_prompt=human, **extra)
 
 
 class TestFakeV2(Base):
@@ -6993,7 +6092,6 @@ def _matches(keys, pattern):
     return any(fnmatch.fnmatchcase(key, pattern) for key in keys)
 
 
-JEV_REPLAY = REPO / "scenarios" / "jev" / "replay.json"
 JEV_SCENARIO_CONFIG = {"jev": {"replay": str(JEV_REPLAY)}}  # the hand-written answers every scenario runs against
 
 
@@ -7367,14 +6465,6 @@ def run_scenario(test, scenario):
             "proves_nothing": proves_nothing}
 
 
-def format_scenario_report(report):
-    lines = ["%s: run %d/%d pass; control %s:" % (
-        report["id"], sum(r["ok"] for r in report["run"]), len(report["run"]), report["control_kind"])]
-    for r in report["control"]:
-        lines.append("    %-20s %s  (%s)" % (r["label"], "pass" if r["ok"] else "FAIL", r["seen"]))
-    return "\n".join(lines)
-
-
 class TestOfflineScenarios(Base):
     """One test per scenario file with the offline tier; generated below."""
 
@@ -7544,8 +6634,6 @@ for _path in sc.scenario_files(sc.DEFAULT_DIR):
 # oracle (added to OfflineRun here, so the runner above stays as it was), and
 # the tests. Nothing here reaches a network or a real `gh`.
 
-GH_REPO = "fleet/scratch"
-GH_BIN = "/fake/bin/gh"
 GITHUB_STEPS = ("comment", "kill-forwarder", "occupy-hook", "awaiting")
 
 
@@ -9514,10 +8602,6 @@ class TestGithubScenarios(Base):
 
 # ------------------------------------------------------- portability and hygiene
 
-def _stdlib_roots():
-    paths = {sysconfig.get_paths()[k] for k in ("stdlib", "platstdlib")}
-    return tuple(os.path.realpath(p) for p in paths)
-
 
 class TestAgentRegistryInventory(unittest.TestCase):
     """docs/agent-registry.md (#906): every reader or writer of an agent list or record in the code is a row of its inventory, and the
@@ -10932,8 +10016,6 @@ class TestRemindCLI(PR4Base):
 
 # ---- self-wakes: checkpoint reminders and the daily friction wake (docs/switchboard.md, "Self-wakes")
 
-BRIEF_30_60 = "ISSUE: x\nCHECKPOINT: Report at 30 minutes (kind working, one line); overdue at 60.\n"
-
 
 class TestParseCheckpoint(unittest.TestCase):
     def test_several_phrasings(self):
@@ -11790,14 +10872,6 @@ class TestLabHerdrShim(Base):
 
 import datetime  # noqa: E402  (this section's only import)
 
-FAKE_GH = "/fake/bin/gh"
-def is_floor_view(argv):
-    """A floor read of a pull request: a `pr view` of its files that is not `review record`'s own read (which also asks for the base name, #1047), so a test counting floor reads leaves the record out."""
-    return "files" in argv[-1] and "baseRefName" not in argv[-1]
-FAKE_REPO = "acme/fleet"
-# The judge tests were written for a judge that fires at 0.5 on every call; the defaults of issue 87 (the routine pre-filter, 0.9 for
-# three questions) are tested in TestJudgeAccuracy. These fixtures keep the earlier behaviour so those tests still say what they said.
-LEGACY_POLICY = {"routine_filter": False, "thresholds": {q: 0.5 for q in ("outside_intent", "hard_to_reverse", "speaks_for_you", "outside_scope")}}
 ISSUES_API = "repos/%s/issues/" % FAKE_REPO
 
 
@@ -13339,8 +12413,6 @@ class TestIntentChange(unittest.TestCase):
             sb.intent_change_fact(bad)
 
 
-AGENT_FILES = tuple(sorted((REPO / "agents" / "opencode").glob("*.md"))
-                    + sorted((REPO / "agents" / "copilot").glob("*.agent.md")))
 SHARED_MAXIMS = ("Festina lente", "Chesterton's fence", "Cut the root, not the branch", "Outcomes, not mechanics",
                  "Say it failed", "A diagnosis is not a mandate", "Don't widen the ask",
                  "Permission doesn't travel", "An empty queue is not a mandate")
@@ -13350,29 +12422,6 @@ COS_ONLY_MAXIMS = ("message stands alone", "No change, no message",
 RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", "a key that isn't yours",
           "ready for your principal's eyes", "stuck after trying")
 ROLE_LINE_LIMITS = {"coder": 134, "orchestrator": 180, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
-# chief-of-staff +350: the quiet `.` ack (#96). chief-of-staff +150: the signed-comment sentence. PR 13 (`report`): coder +300, orchestrator +150, chief-of-staff +100
-# chief-of-staff +400: read-only/merge STOP lines (#105; the native permissions list is excluded from the count)
-# #129: the waiting definitions (the label and the Decision-required rule, in the coder and orchestrator; the same-turn
-# escalation line in the chief of staff): coder +500, orchestrator +500, chief-of-staff +100
-# #133: a held PR is held by LABELS (merge-captain and a hold-<reason>), the first line only for a dated window: coder +250, orchestrator +250, chief-of-staff +250
-# #130: +200 B each for the parked sentence
-# #68: coder +150, orchestrator +450: the launch self-wake sentence and the held-PR text for the copilot definitions
-# #109: coder +1 line, +100 B; orchestrator +100 B: the fleet-planning load line
-# #109: chief-of-staff +100 B: the fleet-planning load line
-# one-command verdict text: coder +2 lines +450 B, orchestrator +150 B
-# #34: the one `heavy` line (full suites and e2e runs go through fleet-switchboard heavy): coder +1 line +100 B, orchestrator +90 B
-# two maxims restored in the coder: +2 lines, +200 B
-# hygiene pointer: coder -2 lines, -100 B (three maxims became one pointer to the standards)
-# #107 follow-up: coder +300 B for the spelled-out fallback and the never-your-own rule
-# `pr-state`: coder +1 line +140 B, orchestrator +1 line +120 B: the one sentence that sends an agent to the daemon's cache instead of a GitHub polling loop
-# #401 slice 1: the one-sentence GitHub writing rule in its own short section: coder +4 lines +226 B, orchestrator +2 lines +220 B (the wider runtime's file sets each limit)
-# #341: the one never-`git stash` sentence (the files sat at their caps): coder +86 B, orchestrator +60 B, no new line
-ROLE_BYTE_LIMITS = {"coder": 8585, "orchestrator": 11290, "chief-of-staff": 12097, "cos-subagent": 3500}
-WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
-
-
-def role_of(path):
-    return path.name.split(".")[0]
 
 
 def maxims_block(text):
@@ -16166,7 +15215,6 @@ class TestOneCharter(CharterRig, Base):
         ("bin/fleet_health.py", "figures"): "own: the health figures of one agent from the registry-derived info", ("bin/fleet_health.py", "_resolve_charters"): "own: the registry-derived info",
         ("bin/fleet_health.py", "_refresh_asks"): "own: the registry-derived info", ("bin/switchboard/import_v1.py", "_import_fleet"): "own: the launch/import writer of the session's metadata",
     }
-
 
 
 class TestCharterSetGuard(CharterRig, Base):
@@ -19723,85 +18771,6 @@ class TestIntentScenarios(Base):
 # PR 7: the decision model, the classifier, the judge's combiner
 # ======================================================================
 
-KEY_VALUE = "sk-or-test-0123456789abcdef"  # a made-up key: it only has to be findable
-
-
-class FakeResponse:
-    def __init__(self, body):
-        self._body = body if isinstance(body, bytes) else json.dumps(body).encode()
-        self.closed = False
-
-    def read(self):
-        return self._body
-
-    def close(self):
-        self.closed = True
-
-
-class FakeOpener:
-    """urlopen's shape. Answers from `reply`: a body, or an exception instance to raise."""
-
-    def __init__(self, reply):
-        self.reply, self.calls = reply, []
-
-    def __call__(self, request, timeout=None):
-        self.calls.append({"url": request.full_url, "method": request.get_method(), "timeout": timeout,
-                           "headers": dict(request.header_items()), "body": json.loads(request.data)})
-        if isinstance(self.reply, BaseException):
-            raise self.reply
-        return FakeResponse(self.reply)
-
-
-def http_error(code, body=b"{}"):
-    return sb.urllib.error.HTTPError("https://x.test", code, "msg", {}, io.BytesIO(body))
-
-
-def noul_answers(**given):
-    return {name: {"type": "noul", "noul": p} for name, p in given.items()}
-
-
-def choice_answer(choice, probabilities):
-    return {"type": "choice", "choice": choice, "probabilities": probabilities}
-
-
-def jev_reply(answers, **extra):
-    body = {"model": "typesafe/jev-1.13-20260917", "answers": answers,
-            "usage": {"input_tokens": 120, "output_tokens": 9, "cost": 3.5e-05}}
-    body.update(extra)
-    return body
-
-
-class FakeJev:
-    """The decision model with deterministic answers and no network.
-
-    `rule` is answers (as in a Jev reply), a JevError reason string, None
-    (unreachable), or a function (state, questions) -> one of those.
-    """
-
-    def __init__(self, rule=None, latency_ms=12):
-        self.rule, self.calls, self.latency_ms = rule, [], latency_ms
-
-    def decide(self, state, questions):
-        self.calls.append({"state": state, "questions": questions})
-        answers = self.rule(state, questions) if callable(self.rule) else self.rule
-        if isinstance(answers, str):
-            raise sb.JevError(answers, "fake", latency_ms=self.latency_ms)
-        if answers is None:
-            raise sb.JevError("unreachable", "fake had no answer", latency_ms=self.latency_ms)
-        return {"model": "fake", "answers": sb.check_answers(questions, answers),
-                "usage": {"in": 100, "out": 5, "cost": 3e-05}, "latency_ms": self.latency_ms}
-
-
-def confident(choice, top=0.95, others=("current", "new")):
-    """Answers to a classify question: `choice` at `top`, the rest sharing what is left."""
-    rest = [o for o in others if o != choice]
-    probabilities = {choice: top}
-    probabilities.update({o: (1 - top) / len(rest) for o in rest} if rest else {})
-    return {sb.CLASSIFY_ID: choice_answer(choice, probabilities)}
-
-
-JEV_SETTINGS = dict(sb.JEV_DEFAULTS)
-
 
 class TestJevConfig(Base):
     def config(self, **raw):
@@ -20872,12 +19841,6 @@ class HandoffCase(IntentCase):
         self.assertEqual([c for c in self.gh.calls if "--method" in c], [])
 
 
-SHIM = REPO / "shims" / "gh"
-# The shim looks its identity up with a short deadline (3 s by default, two process starts for an older switchboard). A test that expects a NAME must not
-# depend on how busy the machine is, so its shim runs get the longest deadline the shim allows (10 s). The tests of the deadline itself set their own.
-SHIM_LOOKUP_SECONDS = "10"
-
-
 class TestShimHygiene(unittest.TestCase):
     def test_it_is_executable_portable_stdlib_only_and_impersonal(self):
         text = SHIM.read_text()
@@ -20895,9 +19858,6 @@ class TestShimHygiene(unittest.TestCase):
                              re.IGNORECASE)
         for number, line in enumerate(text.splitlines(), 1):
             self.assertIsNone(pattern.search(line), "%d: %s" % (number, line))
-
-
-GIT_SHIM = REPO / "shims" / "git"
 
 
 class TestGitShim(Base):
@@ -21539,17 +20499,6 @@ class TestGitStashGuard(Base):
                 self.assertEqual(len(re.findall(r"never `git stash`", text, re.I)), 1)
                 self.assertIn("scratch branch", text)
                 self.assertRegex(text, re.compile(r"never `git stash`.{0,600}scratch branch", re.I))
-
-
-def write_fake_env(home, environ):
-    """The shim starts the switchboard with an ALLOW-LISTED environment, so a `FAKE_*` the test sets never reaches a fake switchboard: hand them over the way the
-    account's own program would find them, in a file under TMPDIR (a name the shim does pass). The fake sources it when it is there."""
-    lines = ["%s=%s; export %s" % (k, shlex.quote(v), k) for k, v in sorted(environ.items()) if k.startswith("FAKE_")]
-    (home / "fake-sb.env").write_text("\n".join(lines) + "\n")
-    environ["TMPDIR"] = str(home)
-
-
-FAKE_SB_SOURCE = '[ -f "$TMPDIR/fake-sb.env" ] && . "$TMPDIR/fake-sb.env"\n'
 
 
 class TestGhShimGateProbe(Base):
@@ -22811,17 +21760,6 @@ class TestNativeChildSession(Base):
         found = world.engine.discover(world.clock.now())
         self.assertEqual(list(found.agents), ["cos"])
         self.assertEqual((found.agents["cos"].session_id, found.agents["cos"].conflict), (world.sessions["cos"], []))
-# ============================================================================
-# PR 9: the tool-call policy judge, its plugin and scenarios P1 to P6
-#
-# One section, so the stack rebases cleanly: the offline runner learns the
-# `tool-call` step and the `policy_outcome` oracle by attachment (as PR 4 and
-# PR 5 did), then the tests. Nothing here reaches a real binary or a network:
-# Jev is a replay file, a fake or a fake opener; v2 and GitHub are the fakes.
-# ============================================================================
-POLICY_REPLAY = REPO / "scenarios" / "jev" / "policy.json"
-FLEET_HOOKS = REPO / "plugins" / "fleet-hooks"
-NODE = shutil.which("node")  # found before each test narrows PATH
 
 
 class PolicyCountingJev:
@@ -22833,13 +21771,6 @@ class PolicyCountingJev:
     def decide(self, state, questions):
         self.calls += 1
         return self.inner.decide(state, questions)
-
-
-def policy_raw_config(**policy):
-    """A validated config with the judge on, answering from the replay file."""
-    return sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH,
-                               "intent_repo": FAKE_REPO, "policy": {**LEGACY_POLICY, "enabled": True, **policy},
-                               "jev": {"replay": str(POLICY_REPLAY)}})
 
 
 class PolicyRig:
@@ -23121,14 +22052,6 @@ class TestPolicyCache(Base):
 
 
 # ---------------------------------------------------------- the judge itself
-
-def policy_replay_file(home, rules, name="replay.json"):
-    path = Path(home) / name
-    path.write_text(json.dumps({"rules": rules}))
-    return str(path)
-
-
-LOW = {"outside_intent": 0.0, "hard_to_reverse": 0.0, "speaks_for_you": 0.0, "outside_scope": 0.0}
 
 
 class PolicyCase(IntentCase):
@@ -23748,9 +22671,6 @@ class TestJudgeToolRequestHandling(PolicyCase):
         with captured() as (out, _):
             self.assertEqual(sb.main(["--help"]), 0)
         self.assertIn("judge-tool", out.getvalue())
-
-
-BUDGET_TEST_MS = 1500   # #93: a real-time budget a loaded runner cannot outrun before the worker thread has started
 
 
 class TestJudgeToolBudget(PolicyCase):
@@ -24408,55 +23328,6 @@ class TestPolicyScenarios(Base):
 
 # ---------------------------------------------------------------- the plugin
 
-HARNESS = r"""
-import { EventEmitter } from "node:events";
-import { PassThrough } from "node:stream";
-import plugin, * as hooks from "%(url)s";
-
-const results = {};
-const spawns = [];
-
-function fakeSpawn(script) {
-  return (bin, args, opts) => {
-    const child = new EventEmitter();
-    child.stdin = new PassThrough();
-    child.stdout = new PassThrough();
-    child.killed = null;
-    child.kill = (signal) => { child.killed = signal; };
-    child.unref = () => {};
-    let written = "";
-    child.stdin.on("data", (c) => { written += c; });
-    const record = { bin, args, opts, child, get stdin() { return written; } };
-    spawns.push(record);
-    if (script.throws) throw new Error("spawn failed");
-    if (script.error) setTimeout(() => child.emit("error", new Error("ENOENT")), 1);
-    else if (script.reply !== undefined) {
-      setTimeout(() => {
-        if (script.reply !== null) child.stdout.write(script.reply + "\n");
-        if (script.close !== false) child.emit("close", 0);
-      }, script.delayMs || 1);
-    }
-    return child;
-  };
-}
-
-async function run(name, input, script, timeoutMs = 300) {
-  const spawnFn = fakeSpawn(script);
-  const handler = hooks.makeHandler({ bin: "/abs/fleet-switchboard", timeoutMs, spawnFn });
-  const started = Date.now();
-  await handler(input);
-  const last = spawns[spawns.length - 1];
-  results[name] = { effect: input.effect, message: input.message, ms: Date.now() - started,
-                    killed: last ? last.child.killed : null, spawned: spawns.length };
-}
-
-const base = (effect) => ({ sessionID: "ses_abc", agent: "coder", action: "shell", resources: ["git push --force"], effect });
-const reply = (outcome, reason = "why") => JSON.stringify({ outcome, reason, judged: true, cached: false, latency_ms: 5 });
-
-%(body)s
-
-console.log(JSON.stringify(results));
-"""
 
 HARNESS_CASES = r"""
 await run("tighten-allow-to-ask", base("allow"), { reply: reply("ask", "Needs your yes") });
@@ -24687,24 +23558,7 @@ class TestFleetHooksSource(unittest.TestCase):
         for path in files:
             for number, line in enumerate(path.read_text().splitlines(), 1):
                 self.assertIsNone(pattern.search(line), "%s:%d %s" % (path.name, number, line))
-# ======================================================================
-# PR 10: moving a v1 session into v2 (import-v1), the cutover runbook, M1
-#
-# One section. It extends the fakes and the offline runner by attachment, so
-# nothing above changes except one line in OfflineRun.__init__ (an agent that
-# an `import-v1` step creates does not exist beforehand, as with `launch`).
-# Nothing here runs a real binary: v1 is a fake that answers `export` only.
-# ======================================================================
-FAKE_V1 = "/fake/bin/opencode-v1"
-V1_FIXTURES = REPO / "scenarios" / "v1-fixtures"
-V1_MAIN = V1_FIXTURES / "chief-of-staff-export.json"
-V1_CHILD = V1_FIXTURES / "subagent-export.json"
-V1_MAIN_ID, V1_CHILD_ID = "ses_fixture00000000000001", "ses_fixture00000000000002"
 CUTOVER_DOC = REPO / "docs" / "switchboard-cutover.md"
-
-
-def v1_export(path=V1_MAIN):
-    return json.loads(path.read_text())
 
 
 class FakeV1:
@@ -24939,10 +23793,6 @@ EXPECT_EXAMPLES["lists_asks"] = {"agent": "coder", "issue": 2}
 
 
 # ---- the converter
-
-def convert(export=None, **kwargs):
-    return sb.convert_v1_export(v1_export() if export is None else export, kwargs.pop("fleet", {"name": "chief", "role": "chief-of-staff"}),
-                                **kwargs)
 
 
 class TestImportV1Converter(unittest.TestCase):
@@ -25779,9 +24629,6 @@ class TestM1(Base):
 
 # ---- the runbook and the section's hygiene
 
-FORBIDDEN_IN_PUBLIC_TEXT = re.compile("|".join(["jan" + "us", "sp" + "ire", "adk" + "aplan", "/Us" + "ers/",
-                                                "/ho" + "me/", "direc" + "tor(?!y|ies)"]), re.IGNORECASE)
-
 
 class TestCutoverRunbook(unittest.TestCase):
     def setUp(self):
@@ -25864,8 +24711,6 @@ class TestPR10Source(unittest.TestCase):
 # The trial driver (bin/switchboard-trial): the same isolation as the Lab, with a
 # real model. Nothing here starts a real binary.
 # ======================================================================
-
-TRIAL = _load("t_switchboard_trial", BIN / "switchboard-trial")
 
 
 class TestTrialDriver(Base):
@@ -26209,26 +25054,6 @@ class TestTrialDriver(Base):
         self.assertNotEqual(TRIAL.SERVICE_PORT, 49374)
 
 
-# ======================================================================
-# PR 13: workers report, a bare idle wakes nobody, every message has a line
-#
-# docs/switchboard.md, "Workers report (PR 13)". The faults added here:
-# idle-wakes, no-rider, no-nudge-once, no-fail-open, ignore-reports,
-# no-description.
-# ======================================================================
-REPORT_REPLAY_RULES = [
-    {"contains": "OWED-ME", "noul": {"report_owed": 0.95}},
-    {"contains": "JEV-DOWN", "error": "unreachable"},
-    {"noul": {"report_owed": 0.05}},
-]
-
-
-def write_report_replay(home, rules=None):
-    path = Path(home) / "report-replay.json"
-    path.write_text(json.dumps({"rules": REPORT_REPLAY_RULES if rules is None else rules}))
-    return str(path)
-
-
 class ReportBase(PR4Base):
     """A platform (the boss) and a coder (its worker, issue 2), a decision model that replays rules."""
 
@@ -26261,62 +25086,6 @@ class ReportBase(PR4Base):
     def pass_after(self, seconds):
         self.world.tick(seconds)
         return self.world.engine.run_pass()
-
-
-class StalledHub:
-    """The one list the stalled rule's open-PR input comes from: what `ci_record_pass` reads through `hub.read_pages`."""
-
-    def __init__(self):
-        self.records, self.cut, self.fail = [], False, False
-        self.paths = []
-
-    def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
-        self.paths.append(path)
-        if self.fail:
-            raise sb.GitHubUnavailable("the list could not be read")
-        limit = (cap or 1) * 100   # the real reader stops at its page cap and says so
-        return list(self.records)[:limit], self.cut or len(self.records) > limit
-
-
-class WaitingInputs:
-    """#816: the inputs the shared waiting predicate reads, wired the way the daemon fills them (the PR list and its read-whole mark come from
-    `ci_record_pass` over a fake hub; the issue list is the triage's, marked by hand). Used by the stalled rule's and the idle rule's tests."""
-    REPO = "acme/widget-service"
-
-    def wire_inputs(self):
-        engine = self.world.engine
-        engine.state_dir = self.world.state
-        engine.config["intent_repo"] = self.REPO
-        engine.config["plan_gates"] = {"repos": {self.REPO: {"mode": "shadow"}}}
-        engine.gh_runner = lambda *a, **k: (_ for _ in ()).throw(AssertionError("gh called"))   # no call is made to judge a worker
-        self.hub = engine.hub = StalledHub()
-        self.t0 = self.world.clock.now()
-        self.params = {"head": "a" * 40, "issue_labels": (), "pr_labels": (), "checks": None, "pr": True, "at": self.t0}
-        self.apply()
-        (self.world.state / sb.DECISIONS_FILE).write_text(json.dumps({"decisions": [], "errors": []}))
-
-    def apply(self):
-        """Read the lists as the daemon does: the issue list is the triage's (marked by hand: not this change's code), the PR list is `ci_record_pass`'s."""
-        engine, prm = self.world.engine, self.params
-        at, now = sb.iso(prm["at"]), self.world.clock.now()
-        engine.triage = sb.TriageState()
-        engine.triage.units[(self.REPO, "issues")] = {"at": now, "data": [
-            {"number": n, "updated_at": at, "created_at": at, "labels": [{"name": l} for l in (prm["issue_labels"] if n == 2 else ())]}
-            for n in range(1, 100)], "truncated": False, "error": None}
-        sb.read_mark(engine, "issues:" + self.REPO, True, "", now)
-        sb.read_mark(engine, "decisions", True, "", now)
-        self.hub.records = [{"number": 9, "body": "PLAN: https://github.com/%s/issues/2\n" % self.REPO, "updated_at": at, "created_at": sb.iso(prm["at"] - 86400), "head": {"sha": prm["head"]},
-                             "labels": [{"name": n} for n in prm["pr_labels"]], **prm.get("pr_extra", {})}] if prm["pr"] else []
-        engine.__dict__.pop("ci_record_state", None)
-        engine.__dict__.get("read_whole", {}).pop("pulls:" + self.REPO, None)
-        sb.ci_record_pass(engine, now)
-        if prm["pr"] and prm["checks"] is not None:
-            engine.ci_record_state.pr_state["%s#9" % self.REPO].update(
-                {"examined_head": prm["head"], "checks": [{"name": "ci", "conclusion": c} for c in prm["checks"]]})
-
-    def set_lists(self, **changes):
-        self.params.update(changes)
-        self.apply()
 
 
 class TestIdleAtASeam(WaitingInputs, ReportBase):
@@ -26532,7 +25301,6 @@ STOPPED_NEWS_RULES = [
     {"contains": "NEWS-DOWN", "error": "unreachable"},
     {"contains": "OWED-ME", "noul": {"report_owed": 0.95}},
 ]
-
 
 
 class TestStalledWorking(WaitingInputs, ReportBase):
@@ -27781,19 +26549,6 @@ class FakeSweepHub:
         return data
 
 
-def sweep_issue(number, body="", labels=(), pr=False, author=None, created=None, updated=None):
-    record = {"number": number, "body": body, "labels": [{"name": n} for n in labels]}
-    if created:
-        record["created_at"] = created
-    if updated:
-        record["updated_at"] = updated
-    if author:
-        record["user"] = {"login": author}
-    if pr:
-        record["pull_request"] = {"url": "x"}
-    return record
-
-
 def sweep_comment(number, body, at, cid=None):
     out = {"issue_url": "https://api.github.com/repos/acme/api/issues/%d" % number, "body": body, "created_at": at}
     if cid is not None:
@@ -28561,80 +27316,6 @@ class TestSweep(Base):
         for bad in ({"enabled": "yes"}, {"aged_cos_hours": 0}, {"max_findings": 0}, {"person_names": []}):
             with self.assertRaises(sb.ConfigError):
                 sb.validate_config(dict(base, sweep=bad))
-
-
-# ======================================================================
-# #130: the triage function (rule family T). THE OWNER'S HOLD: it writes nothing to GitHub. Synthetic repos only.
-# ======================================================================
-class FakeTriageHub:
-    """Reads only: read_pages / _read_one over canned repos. A write cannot even be asked for: there is no such method."""
-
-    def __init__(self):
-        self.open, self.comments, self.closed, self.live = {}, {}, {}, {}   # per repo: open {n: rec}; comments [rec]; closed {label: [rec]}
-        self.pulls = {}   # per repo: [recently closed pull request records] (#384)
-        self.calls, self.unreadable = [], set()
-        self.fail = []   # path fragments whose list reads fail (one kind of unit at a time)
-        self.timelines, self.cut = {}, set()   # (repo, number) -> [timeline events] (#576); numbers whose timeline page is not the whole timeline
-        self.cut_open = {}                     # #851: repo -> how many open issues its list read returns before it is cut (the read says it is not whole)
-
-    def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
-        self.calls.append(path)
-        if any(f in path for f in self.fail):
-            raise sb.GitHubUnavailable("HTTP 502: a partial restart read")
-        repo = re.search(r"repos/([^/]+/[^/]+)/", path).group(1)
-        if repo in self.unreadable:
-            raise sb.GitHubUnavailable("HTTP 404: Not Found")
-        match = re.search(r"/issues/(\d+)/timeline", path)
-        if match:
-            number = int(match.group(1))
-            events = self.timelines.get((repo, number))
-            if events is None:
-                raise sb.GitHubUnavailable("HTTP 500: no timeline")
-            return list(events), number in self.cut
-        match = re.search(r"/issues/(\d+)/comments", path)
-        if match:
-            return [c for c in self.comments.get(repo, []) if c["issue_url"].endswith("/%s" % match.group(1))][::-1], False
-        if "/issues/comments" in path:
-            return list(self.comments.get(repo, [])), False
-        if re.search(r"/pulls\?", path):
-            return list(self.pulls.get(repo, [])), False
-        if "state=closed" in path:
-            label = unquote(re.search(r"labels=([^&]+)", path).group(1))
-            return list(self.closed.get(repo, {}).get(label, [])), False
-        if repo in self.cut_open:
-            return list(self.open.get(repo, {}).values())[:self.cut_open[repo]], True
-        return list(self.open.get(repo, {}).values()), False
-
-    def _read_one(self, repo, path, now, fresh=False):
-        self.calls.append(path)
-        number = int(path.rsplit("/", 1)[1])
-        if repo in self.unreadable:
-            raise sb.GitHubUnavailable("HTTP 404: Not Found")
-        for pool in (self.live.get(repo, {}), self.open.get(repo, {})):
-            if number in pool:
-                return dict(pool[number])
-        for records in self.closed.get(repo, {}).values():
-            for record in records:
-                if record["number"] == number:
-                    return dict(record, state="closed")
-        return {"number": number, "state": "closed"}
-
-
-def tri_issue(clock_now, number, created=5.0, updated=None, author="bot", assignees=(), labels=(), body="", pr=False,
-              draft=False, parent=None, repo="acme/api", state="open", title=None):
-    """A record `created` / `updated` days old (updated defaults to created)."""
-    updated = created if updated is None else updated
-    record = {"number": number, "state": state, "body": body, "user": {"login": author},
-              "assignees": [{"login": a} for a in assignees], "labels": [{"name": l} for l in labels],
-              "created_at": sb.iso(clock_now - created * 86400), "updated_at": sb.iso(clock_now - updated * 86400)}
-    if title is not None:
-        record["title"] = title
-    if pr:
-        record["pull_request"] = {"url": "x"}
-        record["draft"] = draft
-    if parent:
-        record["parent_issue_url"] = "https://api.github.com/repos/%s/issues/%d" % (repo, parent)
-    return record
 
 
 def tri_comment(clock_now, number, body, hours_ago=1.0, repo="acme/api"):
@@ -33864,15 +32545,6 @@ class TestReportScenarios(Base):
         self.assertEqual(set(sc.STEP_FIELDS["report"]), {"state", "text", "issue"})
 
 
-# ======================================================================
-# PR 14: Decisions, a read-only list of what waits on the human
-#
-# docs/switchboard.md, "Decisions (PR 14)". The faults added here:
-# no-decisions-file, stale-as-fresh, decision-resolves-never.
-# ======================================================================
-DECISION_LABEL = "me:awaiting-user"
-
-
 class DecisionsBase(ReportBase):
     """A platform (the boss) and a coder (its worker, issue 2); the engine writes into the world's state dir."""
 
@@ -34183,53 +32855,7 @@ class TestCheckPublicNames(Base):
         self.assertEqual((BIN / "check-public-names").read_text().splitlines()[0], "#!/usr/bin/env python3")
 
 
-LEDGER_PLAN = """## Intent
-Commissioning works.
-Done when: (1) an owner can commission an agent; (2) it answers a chat message.
-
-```yaml
-scenarios:
-  - id: S1
-    covers: DW-1
-    text: Given a project with no agents, when an owner commissions one, then it is listed
-    proof: test
-    pass: the list call returns status 200 and exactly 1 agent named "alpha"
-    discriminates: a build that creates nothing returns an empty list and fails
-    evaluator: ci
-  - id: S2
-    covers: DW-2
-    text: Given a commissioned agent, when the owner sends a chat message, then it answers
-    proof: live
-    pass: the reply arrives within 5 s and is longer than 0 characters
-    discriminates: a stub that returns a canned empty reply fails
-    evaluator: tester
-  - id: S3
-    covers: DW-2
-    text: Given the chat window, when the reply arrives, then the header shows the agent state
-    proof: screenshot
-    pass: the header shows the word "Ready" after the reply
-    discriminates: a build that leaves the header blank shows an empty header in the screenshot
-    evaluator: reviewer
-  - id: S4
-    covers: PC-1
-    text: Given a plan section claimed at the epic, when the epic is integrated, then it holds
-    proof: live
-    pass: the integrated build returns status 200 for 3 of 3 sample projects
-    discriminates: a build that drops the third project returns 2 of 3 and fails
-    evaluator: owner
-    claim: epic
-  - id: U1
-    covers: PC-1
-    text: Existing projects with agents are listed exactly as before this change
-    proof: test
-    pass: the golden list output is byte-identical to the stored fixture
-    discriminates: a change in ordering or fields shows as a diff against the fixture
-    evaluator: ci
-```
-"""
-LEDGER_HEAD = "a" * 40
 KEEP_OUT = object()   # a field a raw test record leaves out
-LEDGER_NEW_HEAD = "b" * 40
 
 
 class LedgerBase(Base):
@@ -36401,28 +35027,12 @@ class TestOwnerTerminal(LedgerBase):
         self.assertEqual(self.run_as("cos", "gates", "off")[0], 0)
 
 
-class FakeHub:
-    """The daemon's GitHub reader, for the ci recorder's pass: `read_pages` answers a list of open PRs per repo and counts reads."""
-
-    def __init__(self, prs):
-        self.prs, self.reads, self.down = prs, [], False
-
-    def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
-        self.reads.append(path)
-        if self.down:
-            raise sb.GitHubUnavailable("network unreachable")
-        repo = re.match(r"repos/([^/]+/[^/]+)/pulls", path).group(1)
-        return list(self.prs.get(repo, [])), False
-
-
 IMPACT_TABLE = {   # the plan's table (S10): severity -> probability -> action; H hold, 2 second review, . none
     "Catastrophic": dict(zip(("Improbable", "Remote", "Occasional", "Probable", "Frequent"), "HHHHH")),
     "Critical": dict(zip(("Improbable", "Remote", "Occasional", "Probable", "Frequent"), "2HHHH")),
     "Marginal": dict(zip(("Improbable", "Remote", "Occasional", "Probable", "Frequent"), ".22HH")),
     "Negligible": dict(zip(("Improbable", "Remote", "Occasional", "Probable", "Frequent"), "...22")),
 }
-FLOOR_CONFIG = {"impact_floor": {"repos": {"acme/app": {"globs": ["migrations/**", "api/routes/**", "config/secrets*"],
-                                                         "exclude": ["docs/**"]}}}}
 
 
 class TestImpactFloorPure(unittest.TestCase):
@@ -36521,21 +35131,6 @@ class TestImpactFloorPure(unittest.TestCase):
         self.assertEqual(hit, ["bin/impact_floor.py", "bin/plan_ledger.py", "docs/review-laws/impact-matrix.json", "plugins/fleet-hooks/a.js", "shims/gh",
                                "templates/u.service", "tools/cos-permissions-proof/x.py"])
         self.assertEqual(self.f.floor_for("someone/else"), ([], [], []))
-
-
-def top_tier_migrations(test):
-    """(#451 slice 3) The impact hold labels by the OWNER-HOLD rule, which reads the matrix file's top tier paths. These classes' fixtures use a synthetic path
-    (`migrations/**`) as their floor path: for them the matrix the decision loads gains that one path as a top tier path, so the fixtures keep their
-    meaning: a change to a top tier path holds."""
-    real = sb.impact_floor.load_matrix
-
-    def loaded(path=None):
-        matrix = real(path)
-        matrix["owner_hold"]["top_tier_paths"]["authority"] = list(matrix["owner_hold"]["top_tier_paths"]["authority"]) + ["migrations/**"]
-        return matrix
-    test.top_tier_patcher = mock.patch.object(sb.impact_floor, "load_matrix", loaded)
-    test.top_tier_patcher.start()
-    test.addCleanup(test.top_tier_patcher.stop)
 
 
 class TestImpactFloorOwnerDecision(LedgerBase):
@@ -41745,38 +40340,6 @@ class TestJudgeEval(Base):
                 self.assertIsNone(FORBIDDEN_IN_PUBLIC_TEXT.search(line), "%s:%d %s" % (path.name, number, line))
 
 
-GOOD_PLAN = """## Intent
-Commissioning works.
-Done when: (1) an owner can commission an agent; (2) it answers a chat message.
-
-```yaml
-scenarios:
-  - id: S1
-    covers: DW-1
-    text: Given a project with no agents, when an owner commissions one, then it is listed
-    proof: test
-    pass: the list call returns status 200 and exactly 1 agent named "alpha"
-    discriminates: a build that creates nothing returns an empty list and fails
-    evaluator: ci
-  - id: S2
-    covers: DW-2
-    text: Given a commissioned agent, when the owner sends a chat message, then it answers
-    proof: live
-    pass: the reply arrives within 5 s and is longer than 0 characters
-    discriminates: a stub that returns a canned empty reply fails
-    evaluator: tester
-  - id: U1
-    covers: PC-1
-    text: Existing projects with agents are listed exactly as before this change
-    proof: test
-    pass: the golden list output is byte-identical to the stored fixture
-    discriminates: a change in ordering or fields shows as a diff against the fixture
-    evaluator: ci
-```
-"""
-GOOD_DONE_WHEN = "(1) an owner can commission an agent; (2) it answers a chat message."
-
-
 class TestPlanCheckParser(unittest.TestCase):
     """#135: the strict yaml-subset parser, on synthetic blocks."""
 
@@ -43459,8 +42022,6 @@ class TestReportFoldVariants(unittest.TestCase):
         self.assertEqual(reads, [1240, 1241, 1242])                                  # no read without the hub
 
 
-
-
 class TestDecisionWriteWaitsForTheList(Base):
     """`decisions escalate|resolve|answer|supersede` leave the list showing the new state when they return, or say honestly that it is
     applied at the next pass. The daemon is the one writer of decisions.json: the command only pokes it and reads. Synthetic names."""
@@ -44014,7 +42575,6 @@ class TestDecisionsConfigAndDaemon(DecisionsBase):
         self.assertEqual(self.listed(), [])
 
 
-DECISIONS_PLUGIN = REPO / "plugins" / "fleet-decisions-tui"
 DECISIONS_HARNESS = r"""
 import * as d from "%(url)s";
 import { mkdtempSync, writeFileSync, utimesSync, renameSync, rmSync } from "node:fs";
@@ -44578,11 +43138,6 @@ class TestMultiRepoConfig(Base):
     def test_the_four_faults_are_known(self):
         for name in ("static-repos", "bare-issue-number", "one-account", "repo-create-allowed"):
             self.assertIn(name, sb.KNOWN_FAULTS)
-
-
-ACME_API, ACME_WEB = "acme/api", "acme/web"
-FAKE_TOKENS = {"alice-bot": "tok-alice-bot-SECRET-1111", "acme-ci": "tok-acme-ci-SECRET-2222"}
-DEFAULT_TOKEN = "tok-default-SECRET-0000"
 
 
 class GitHubFarm:
@@ -45839,7 +44394,6 @@ class TestLaunchNewWorkspace(TwoRepoCase):
                 self.assertEqual(herdr([FAKE_HERDR] + argv).returncode, 2)
 
 
-
 class TestRepoInKeysAndListings(TwoRepoCase):
     def test_an_intent_edit_key_names_the_repo_when_the_payload_does(self):
         payload = {"action": "edited", "issue": {"number": 7, "body": "## Intent\nnew\n", "updated_at": "2027-01-15T08:00:00Z"},
@@ -45862,7 +44416,6 @@ class TestRepoInKeysAndListings(TwoRepoCase):
         web = sb.resolve_policy_context(reader, {"name": "web-coder", "issue": 2, "repo": ACME_WEB})
         api = sb.resolve_policy_context(reader, {"name": "x", "issue": 2, "repo": ACME_API})
         self.assertEqual((web["intent"], api["intent"]), ("WEB: build the landing page", "API: add the health check"))
-
 
 
 class TestRepoCommissioningRule(PolicyCase):
@@ -45983,13 +44536,6 @@ class TestStatusPerRepo(Base):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": GH_BIN, "github_repos": [ACME_API]})
         _, out = self.status("--json")
         self.assertEqual({d["account"] for d in json.loads(out)["github"]["detail"]}, {"default"})
-
-
-ALL_FAKE_TOKENS = list(FAKE_TOKENS.values()) + [DEFAULT_TOKEN]
-
-
-def secrets_in(text):
-    return [token for token in ALL_FAKE_TOKENS if token in text]
 
 
 class TestSecretNeverText(TwoRepoCase):
@@ -46416,24 +44962,6 @@ class TestD6Scenario(Base):
 # ======================================================================
 sb.ENSURE_ON_USE = False  # the CLI starts a daemon on use; these suites must never start one by accident
 
-PR16_KEY = "pr16-canary-key-3c91d7a2e8f4"  # a made-up key: it only has to be findable
-PR16_NOTICE = "No decision-model key: messages are not classified and tool calls are not judged."
-
-
-class KeyCase(Base):
-    def setUp(self):
-        super().setUp()
-        os.environ.pop("OPENROUTER_API_KEY", None)
-        self.key_file = self.config_file.parent / "jev.key"
-
-    def put_key(self, text=PR16_KEY, mode=0o600):
-        self.key_file.parent.mkdir(parents=True, exist_ok=True)
-        if self.key_file.exists():
-            self.key_file.unlink()
-        self.key_file.write_text(text + "\n")
-        os.chmod(str(self.key_file), mode)
-        return self.key_file
-
 
 class TestKeyFile(KeyCase):
     def test_the_default_key_file_sits_beside_the_config(self):
@@ -46667,26 +45195,6 @@ class TestStatusSaysWhenThereIsNoKey(StatusCase):
             self.assertRegex(text, r"(?m)^      %s +\S" % label)
         self.assertIn("daemon     not running", text)
         self.assertIn("service    not installed", text)
-
-
-class FakeDaemons:
-    """Stands in for Popen in ensure-on-use tests: like a daemon, the spawned process takes the lock."""
-
-    def __init__(self, test, state):
-        self.state, self.spawned = state, []
-        test.addCleanup(self.close)
-        self.fds = []
-
-    def __call__(self, argv, **kwargs):
-        self.spawned.append((argv, kwargs))
-        fd = os.open(str(self.state / "run.lock"), os.O_RDWR | os.O_CREAT)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        self.fds.append(fd)
-
-    def close(self):
-        for fd in self.fds:
-            os.close(fd)
-        self.fds = []
 
 
 USE_COMMANDS = {
@@ -47279,137 +45787,6 @@ class TestBootstrap(BootstrapCase):
 
 
 # ---- install, the service and the templates
-
-class InstallFakes:
-    """A pretend machine for `install`: OpenCode answers --version, herdr lists and links plugins, and the
-    service managers load and unload. Records every call. Nothing real runs, and nothing real is touched."""
-
-    def __init__(self, home, version="opencode v2.0.22"):
-        self.calls, self.version = [], version
-        self.linked = False
-        self.loaded = False
-        self.reaper_loaded = False
-        self.fail = {}
-        self.integration_calls, self.integration_reports_at = [], None
-        self.binary = str(home / "v2dir" / "opencode.exe")
-        os.makedirs(os.path.dirname(self.binary))
-        Path(self.binary).write_text("#!/bin/sh\n")
-        os.chmod(self.binary, 0o755)
-
-    def __call__(self, argv, **kwargs):
-        argv = list(argv)
-        self.calls.append(argv)
-        for fragment, code in self.fail.items():
-            if fragment in " ".join(argv):
-                return subprocess.CompletedProcess(argv, code, "", "boom: %s" % fragment)
-        ok = lambda out="": subprocess.CompletedProcess(argv, 0, out, "")
-        if argv[0] == self.binary and argv[1:] == ["--version"]:
-            return ok(self.version + "\n")
-        if argv[0] == self.binary:
-            return subprocess.CompletedProcess(argv, 1, "", "not running")
-        if argv[:3] == ["herdr", "plugin", "list"]:
-            return ok("1 plugin installed:\n- board (Board) enabled\n" + ("- fleet-switchboard (Fleet Switchboard) enabled\n" if self.linked else ""))
-        if argv[:3] == ["herdr", "plugin", "link"]:
-            self.linked = True
-            return ok()
-        if argv[:3] == ["herdr", "plugin", "unlink"]:
-            self.linked = False
-            return ok()
-        if argv[:3] == ["herdr", "integration", "status"] or argv[:4] in (["herdr", "integration", "install", "opencode"],
-                                                                        ["herdr", "integration", "uninstall", "opencode"]):
-            # herdr writes its OpenCode integration to $HOME/.config/opencode and ignores XDG_CONFIG_HOME: where
-            # the file lands depends on the HOME the caller gave it, and a link there carries it elsewhere
-            home = (kwargs.get("env") or {}).get("HOME") or os.environ["HOME"]
-            target = os.path.join(home, ".config", "opencode", "plugins", "herdr-agent-state.js")
-            self.integration_calls.append((argv[2], dict(kwargs.get("env") or {})))
-            if argv[2] == "install":
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                Path(target).write_text("// herdr agent state\n")
-                return ok("installed opencode integration at %s\n" % target)
-            if argv[2] == "uninstall":
-                if os.path.exists(target):
-                    os.unlink(target)
-                return ok("uninstalled\n")
-            shown = self.integration_reports_at or target
-            state = "current (v13)" if os.path.exists(target) else "not installed"
-            return ok("claude: current (v10) (/elsewhere/hooks/herdr-agent-state.sh)\nopencode: %s (%s)\n" % (state, shown))
-        reaper = "cloud-reaper" in " ".join(argv)   # the reaper's service is loaded and unloaded on its own
-        if argv[0] == "launchctl":
-            if argv[1] == "print":
-                return subprocess.CompletedProcess(argv, 0 if (self.reaper_loaded if reaper else self.loaded) else 113, "", "")
-            setattr(self, "reaper_loaded" if reaper else "loaded", argv[1] == "bootstrap")
-            return ok()
-        if argv[0] == "systemctl":
-            if "is-enabled" in argv:
-                return subprocess.CompletedProcess(argv, 0 if (self.reaper_loaded if reaper else self.loaded) else 1, "", "")
-            if "enable" in argv:
-                setattr(self, "reaper_loaded" if reaper else "loaded", True)
-            if "disable" in argv:
-                setattr(self, "reaper_loaded" if reaper else "loaded", False)
-            return ok()
-        raise AssertionError("install reached for a real program: %r" % argv)
-
-    def commands(self, program):
-        return [c for c in self.calls if c[0] == program]
-
-
-def tree_of(root):
-    """Every file under root with its content: what a dry run must leave exactly as it was."""
-    found = {}
-    for base, dirs, files in os.walk(str(root)):
-        for name in files:
-            path = os.path.join(base, name)
-            found[path] = open(path, "rb").read()
-        for name in dirs:
-            found[os.path.join(base, name) + "/"] = None
-    return found
-
-
-class InstallCase(Base):
-    PLATFORM = "darwin"
-
-    def setUp(self):
-        super().setUp()
-        os.environ.pop("OPENROUTER_API_KEY", None)
-        os.environ["XDG_DATA_HOME"] = str(self.home / "xdg-data")
-        self.machine = InstallFakes(self.home)
-        self.daemons = FakeDaemons(self, sb.ensure_state_dir())
-        self.data = self.home / "xdg-data" / "fleet-switchboard"
-        self.private = self.data / "profile"            # v2's own profile: XDG_CONFIG_HOME, XDG_DATA_HOME and HOME of its wrapper
-        self.profile = self.private / "config" / "opencode"
-        self.wrapper = self.data / "bin" / "fleet-opencode"
-        self.shared = self.home / "xdg-config" / "opencode"  # what the person's ordinary OpenCode reads
-
-    def install(self, *flags, status="STATUS\n", platform=None):
-        out = io.StringIO()
-        args = sb.build_parser().parse_args(["install"] + [f for f in flags if f != "--dry-run"] + (
-            ["--dry-run"] if "--dry-run" in flags else []))
-        installer = sb.Installer(self.machine, self.daemons, time.time, platform or self.PLATFORM, REPO,
-                                 dry_run="--dry-run" in flags, out=out, shared_profile=args.shared_profile,
-                                 profile=args.profile, gh_user=args.gh_user)
-        try:
-            if args.uninstall:
-                installer.uninstall(not args.no_service, not args.no_herdr_link)
-            else:
-                installer.install(args.opencode, not args.no_service, not args.no_herdr_link,
-                                  status=lambda: status, with_reaper=args.with_cloud_reaper)
-        except sb.InstallError as err:
-            return out.getvalue(), str(err)
-        return out.getvalue(), None
-
-    def statuses(self, text):
-        """step -> its status word(s), from lines like `config   done /path`."""
-        found = {}
-        for line in text.splitlines():
-            match = re.match(r"^(\S+(?: \S+)*?) {2,}(done|already done|would be done|skipped \(.*?\)|will run|would run|FAILED)", line)
-            if match:
-                found.setdefault(match.group(1), []).append(match.group(2))
-        return found
-
-    def service_path(self):
-        if self.PLATFORM == "darwin":
-            return self.home / "Library" / "LaunchAgents" / "com.fleet-kit.switchboard.plist"
-        return self.home / "xdg-config" / "systemd" / "user" / "fleet-kit-switchboard.service"
 
 
 class TestTodolistPlugin(Base):
@@ -48196,194 +46573,7 @@ class TestCloudReaperTemplates(Base):
             self.assertFalse(name.endswith("_TOKEN"), name)   # a path to the token FILE is allowed, a token is not
 
 
-class CloudReaperInstall:
-    def reaper_path(self):
-        if self.PLATFORM == "darwin":
-            return self.home / "Library" / "LaunchAgents" / "com.fleet-kit.cloud-reaper.plist"
-        return self.home / "xdg-config" / "systemd" / "user" / "fleet-kit-cloud-reaper.service"
-
-    def reaper_calls(self):
-        return [c for c in self.machine.calls if c[0] in ("launchctl", "systemctl") and "cloud-reaper" in " ".join(c)
-                or c[:3] == ["systemctl", "--user", "daemon-reload"]]
-
-    def test_the_default_install_does_not_touch_the_reaper(self):
-        out, error = self.install("--opencode", self.machine.binary)
-        self.assertIsNone(error, error)
-        self.assertFalse(self.reaper_path().exists())
-        self.assertNotIn("cloud reaper", out)
-        self.assertFalse([c for c in self.machine.calls if "cloud-reaper" in " ".join(c)])
-
-    def test_opt_in_writes_loads_once_and_a_second_run_changes_nothing(self):
-        out, error = self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
-        self.assertIsNone(error, error)
-        self.assertTrue(self.reaper_path().is_file())
-        self.assertEqual(self.statuses(out)["cloud reaper"], ["will run", "done"])
-        loads = [c for c in self.machine.calls if c[:2] == (["launchctl", "bootstrap"] if self.PLATFORM == "darwin" else [""])[:2]
-                 and str(self.reaper_path()) in c] if self.PLATFORM == "darwin" else \
-            [c for c in self.machine.calls if c[:4] == ["systemctl", "--user", "enable", "--now"] and c[4] == "fleet-kit-cloud-reaper.service"]
-        self.assertEqual(len(loads), 1)
-        second, _ = self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
-        self.assertEqual(self.statuses(second)["cloud reaper"], ["already done"])
-
-    def test_uninstall_unloads_and_removes_it_and_a_never_installed_one_is_silent(self):
-        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
-        out, _ = self.install("--uninstall")
-        self.assertFalse(self.reaper_path().exists())
-        off = ["launchctl", "bootout", "gui/%d/com.fleet-kit.cloud-reaper" % os.getuid()] if self.PLATFORM == "darwin" else \
-            ["systemctl", "--user", "disable", "--now", "fleet-kit-cloud-reaper.service"]
-        self.assertIn(off, self.machine.calls)
-        out2, _ = self.install("--uninstall")
-        self.assertNotIn("cloud reaper", out2)
-
-    def test_a_dry_run_writes_nothing(self):
-        out, _ = self.install("--opencode", self.machine.binary, "--with-cloud-reaper", "--dry-run")
-        self.assertFalse(self.reaper_path().exists())
-        self.assertEqual(self.statuses(out)["cloud reaper"], ["would run", "would be done"])
-        self.assertFalse([c for c in self.machine.calls if c[0] in ("launchctl", "systemctl") and "cloud-reaper" in " ".join(c)
-                          and c[1] in ("bootstrap", "bootout", "enable", "disable")])
-
-    def test_a_changed_setting_unloads_rewrites_and_loads_again_in_that_order(self):
-        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
-        before = len(self.machine.calls)
-        with mock.patch.dict(os.environ, {"CW_CLOUD_NAMESPACE": "acme-cw"}):
-            out, error = self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
-        self.assertIsNone(error, error)
-        order = [c for c in self.machine.calls[before:] if "cloud-reaper" in " ".join(c) and "print" not in c and "is-enabled" not in c]
-        self.assertEqual(len(order), 2, order)
-        self.assertIn("disable" if self.PLATFORM == "linux" else "bootout", order[0])
-        self.assertIn("enable" if self.PLATFORM == "linux" else "bootstrap", order[1])
-        self.assertIn("acme-cw", self.reaper_path().read_text())
-
-    def test_a_failing_load_stops_the_install_with_the_command_named(self):
-        self.machine.fail["bootstrap" if self.PLATFORM == "darwin" else "enable --now fleet-kit-cloud-reaper"] = 5
-        out, error = self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
-        self.assertIsNotNone(error)
-        self.assertRegex(error, "bootstrap|enable")
-
-    SAMPLE_SETTINGS = {"CW_KUBE_CONTEXT": "acme-cw", "CW_CLOUD_NAMESPACE": "acme-cw", "CW_CLOUD_SERVER": "https://api.example.internal:6443",
-                       "CW_CLOUD_TOKEN_FILE": "/home/user/.cw/token", "CW_KUBECONFIG": "/home/user/.kube/config", "CW_KUBECTL": "kubectl",
-                       "CW_CLOUD_CA_FILE": "/home/user/ca.pem", "CW_CLOUD_RECORD_DIR": "/home/user/runs", "CW_RUN_RECORD_DIR": "/home/user/runs",
-                       "CW_CLOUD_AUDIT": "/home/user/audit.jsonl"}
-
-    def test_uninstall_removes_and_unloads_a_reaper_installed_with_any_one_setting_and_with_all(self):
-        self.assertEqual(sorted(self.SAMPLE_SETTINGS), sorted(sb.REAPER_SETTING_NAMES))   # a name added needs a row
-        cases = [{name: value} for name, value in self.SAMPLE_SETTINGS.items()] + [dict(self.SAMPLE_SETTINGS), {}]
-        for settings in cases:
-            with self.subTest(settings=sorted(settings)):
-                self.setUp()
-                with mock.patch.dict(os.environ, settings):
-                    self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
-                self.assertTrue(self.reaper_path().is_file())
-                self.assertTrue(self.machine.reaper_loaded)
-                out, error = self.install("--uninstall")
-                self.assertIsNone(error, error)
-                self.assertFalse(self.reaper_path().exists(), out)
-                self.assertFalse(self.machine.reaper_loaded)   # unloaded, not just deleted
-
-    def test_a_file_that_is_not_ours_is_left_but_the_job_is_still_unloaded(self):
-        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
-        self.reaper_path().write_text("a file someone else made\n")
-        out, _ = self.install("--uninstall")
-        self.assertTrue(self.reaper_path().exists())
-        self.assertFalse(self.machine.reaper_loaded)
-        self.assertIn("the job is unloaded", out)
-
-    def test_uninstall_with_no_service_still_unloads_and_removes_the_reaper(self):
-        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
-        out, _ = self.install("--uninstall", "--no-service")
-        self.assertFalse(self.reaper_path().exists())
-        self.assertTrue(self.service_path().exists())   # the switchboard's own service is what --no-service leaves
-        self.assertFalse(self.machine.reaper_loaded)
-
-    def test_the_settings_come_from_the_environment_and_a_password_one_stops_the_install(self):
-        with mock.patch.dict(os.environ, {"CW_CLOUD_NAMESPACE": "acme-cw"}):
-            self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
-        self.assertIn("CW_CLOUD_NAMESPACE", self.reaper_path().read_text())
-        self.assertIn("acme-cw", self.reaper_path().read_text())
-        with mock.patch.dict(os.environ, {"CW_CLOUD_SERVER": "https://u:p4ss@api.example.internal"}):
-            out, error = self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
-        self.assertIn("CW_CLOUD_SERVER", error)
-        self.assertNotIn("p4ss", error + out)
-
-
-# The states a file the installer writes can be found in: name -> how to make it at `path` (victim is a file elsewhere)
-BAD_TARGET_STATES = {
-    "a symlink": lambda path, victim: os.symlink(str(victim), str(path)),
-    "a FIFO": lambda path, victim: os.mkfifo(str(path)),
-    "a directory": lambda path, victim: os.mkdir(str(path)),
-    "group-writable": lambda path, victim: (path.write_text("mine\n"), os.chmod(str(path), 0o664)),
-    "owned by another user": lambda path, victim: path.write_text("mine\n"),   # the installer is made to see another uid
-}
-
-
-BAD_STATE_REASON = {"a symlink": "symbolic link", "a FIFO": "not a regular file", "a directory": "not a regular file",
-                    "group-writable": "written by its group", "owned by another user": "owned by another user"}
 assert sorted(BAD_STATE_REASON) == sorted(BAD_TARGET_STATES)
-
-
-class WrittenFilesAreGuarded:
-    """One row per file the installer writes (the switchboard's own service file and the reaper's) x one per bad state."""
-
-    def targets(self):
-        return {"service": (self.service_path(), ()), "cloud reaper": (self.reaper_path(), ("--with-cloud-reaper",))}
-
-    def attempt(self, state, path, flags, uninstall=False):
-        victim = self.home / "victim"
-        victim.write_text("precious\n")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        BAD_TARGET_STATES[state](path, victim)
-        patch = mock.patch.object(sb, "current_uid", return_value=os.getuid() + 1) if state == "owned by another user" else mock.patch.object(sb, "current_uid", sb.current_uid)
-        with patch:
-            if uninstall:
-                result = self.install("--uninstall")
-            else:
-                result = self.install("--opencode", self.machine.binary, *flags)
-        return victim, result
-
-    def test_install_refuses_each_bad_state_for_each_file_and_changes_nothing(self):
-        for label, (path, flags) in self.targets().items():
-            for state in BAD_TARGET_STATES:
-                with self.subTest(file=label, state=state):
-                    self.setUp()   # a fresh machine for each row
-                    path, flags = self.targets()[label]
-                    victim, (out, error) = self.attempt(state, path, flags)
-                    self.assertIsNotNone(error, "%s %s: no refusal" % (label, state))
-                    self.assertIn(str(path), error)
-                    self.assertIn(BAD_STATE_REASON[state], error)   # the right check refused it, not another one
-                    self.assertEqual(victim.read_text(), "precious\n")
-                    if state == "a symlink":
-                        self.assertTrue(path.is_symlink())
-                    loads = [c for c in self.machine.calls if c[0] in ("launchctl", "systemctl") and c[1] in ("bootstrap", "enable")
-                             and (label != "cloud reaper" or "cloud-reaper" in " ".join(c))]
-                    self.assertEqual(loads, [])
-
-    def test_uninstall_leaves_each_bad_state_for_each_file_alone_and_says_so(self):
-        for label, (path, flags) in self.targets().items():
-            for state in BAD_TARGET_STATES:
-                with self.subTest(file=label, state=state):
-                    self.setUp()
-                    path, flags = self.targets()[label]
-                    victim, (out, error) = self.attempt(state, path, flags, uninstall=True)
-                    self.assertIsNone(error, error)
-                    self.assertEqual(victim.read_text(), "precious\n")
-                    self.assertTrue(os.path.lexists(str(path)), "%s %s was removed" % (label, state))
-                    self.assertIn("skipped", out)
-
-    def test_uninstall_removes_only_the_file_this_installers_template_makes(self):
-        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
-        self.reaper_path().write_text("a file someone else made\n")
-        out, error = self.install("--uninstall")
-        self.assertTrue(self.reaper_path().exists())
-        self.assertIn("is not the file this installer writes", out)
-        self.reaper_path().unlink()
-
-    def test_a_replaced_file_is_replaced_by_rename_never_written_through(self):
-        self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
-        inode = os.stat(str(self.reaper_path())).st_ino
-        with mock.patch.dict(os.environ, {"CW_CLOUD_NAMESPACE": "acme-cw"}):
-            self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
-        self.assertNotEqual(os.stat(str(self.reaper_path())).st_ino, inode)
-        self.assertEqual([p.name for p in self.reaper_path().parent.iterdir() if p.name.startswith(".")], [])   # no temp file left
 
 
 class TestTheReapersCommandPathIsWalked(InstallCase):
@@ -48913,17 +47103,6 @@ class TestInstallPutsTheCliOnPath(InstallCase):
         out, _ = self.install("--uninstall", "--dry-run")
         self.assertEqual(tree_of(self.home), before)
         self.assertEqual(self.statuses(out)["cli link"], ["would be done"])
-
-
-class RealStatusAfterInstall:
-    """The real `status` an install prints is about the platform install ran for, not the one the tests run on."""
-
-    def installed_status(self, installed_for, host):
-        out = io.StringIO()
-        installer = sb.Installer(self.machine, self.daemons, time.time, installed_for, REPO, out=out)
-        with mock.patch.object(sb.sys, "platform", host):
-            installer.install(self.machine.binary)
-        return out.getvalue()
 
 
 class TestRealStatusAfterInstallOnMacOS(RealStatusAfterInstall, InstallCase):
@@ -49932,15 +48111,6 @@ class TestInstallDocs(unittest.TestCase):
         self.assertIn("thin wrapper for an isolated experiment", text)
         self.assertIn("INSTALL.md", text)
         self.assertIn("fleet-switchboard install", text)
-
-
-# ======================================================================
-# PR 17: standing orders an agent does not forget
-#
-# docs/switchboard.md, "Standing orders (PR 17)". The faults added here:
-# orders-start-only, orders-wake, anyone-can-order, orders-never-judged.
-# ======================================================================
-ORDERS_CHARTER_BODY = "```yaml\norchestrator: platform\nstatus: active\n```\n\nThe charter.\n"
 
 
 class TestParseOrders(unittest.TestCase):
@@ -51263,8 +49433,6 @@ class TestOrdersScenarios(Base):
 # tier-flat, cos-orders-unfed, anyone-edits-cos-orders, answer-unjudged.
 # ======================================================================
 TIER_USER = "me"
-TIER_LABELS = {"awaiting_label": "me:awaiting-user", "awaiting_cos_label": "me:awaiting-cos"}
-API, WEB = "acme/api", "acme/web"
 
 
 @adds_to(FakeV2)
@@ -51731,15 +49899,6 @@ class TestRequestTiers(TierWorld):
     def test_the_audit_log_is_never_read_by_the_derivation(self):
         self.assertNotIn("audit", class_source_fn("decisions_from_requests"))
         self.assertNotIn("audit.jsonl", class_source_fn("derive_decisions"))
-
-
-def class_source_fn(name):
-    """The source of a module-level function of bin/fleet-switchboard."""
-    source = SWITCHBOARD.read_text()
-    for node in ast.parse(source).body:
-        if isinstance(node, ast.FunctionDef) and node.name == name:
-            return ast.get_source_segment(source, node)
-    raise LookupError(name)
 
 
 class TestDecisionViews(TierWorld):
@@ -53323,7 +51482,6 @@ class TestLabelsEnsure(WriteWorld):
             self.assertIn(word, out.getvalue())
 
 
-
 class TestLabelsApplyFromMarkers(WriteWorld):
     """`labels apply-from-markers`: a person's command; a dry run unless --apply; never the daemon's. Neutral names."""
 
@@ -53427,18 +51585,6 @@ class TestLabelsEnsureUsesEachReposAccount(WriteWorld):
 
 
 # ---- the Chief of Staff's orders file
-
-def cos_orders_file(test):
-    return test.config_file.parent / "standing-orders.md"
-
-
-def put_cos_orders(test, text, mtime=None):
-    path = cos_orders_file(test)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text)
-    if mtime is not None:
-        os.utime(str(path), (mtime, mtime))
-    return path
 
 
 class TestCosOrdersFile(Base):
@@ -54084,49 +52230,6 @@ class TestDecisionsPanelLayout(Base):
         source = (DECISIONS_PLUGIN / "tui.tsx").read_text()
         for needle in ("view().sections", "section.title", "THIN(ROW_WIDTH)", "HEAVY(ROW_WIDTH)"):
             self.assertIn(needle, source)
-
-
-# ======================================================================
-# PR notices: `notice pr`, the fourth source of derive_decisions, the Heads-up section's data
-#
-# docs/switchboard.md, "PR notices". A notice is information, not a decision: kind `notice`, tier `human`, id
-# `pr:<repo>#N`, never counted with the decisions. Facts come from one cached `gh pr view` per open notice.
-# ======================================================================
-def pr_view_json(title="Add the parser", state="OPEN", additions=120, deletions=14, files=5, checks=None,
-                 review="APPROVED", **more):
-    checks = [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}] if checks is None else checks
-    return json.dumps(dict({"title": title, "state": state, "additions": additions, "deletions": deletions,
-                            "changedFiles": files, "statusCheckRollup": checks, "reviewDecision": review}, **more))
-
-
-class FakeGhPr:
-    """A `gh` runner for `pr view`: answers per PR number from `answers` (a (code, stdout, stderr) tuple, or an
-    exception); records every call. Reaching for anything else fails the test."""
-
-    def __init__(self, answers=None):
-        self.answers, self.calls = answers or {}, []
-
-    def __call__(self, argv, **kwargs):
-        self.calls.append((list(argv), kwargs))
-        assert argv[1:3] == ["pr", "view"], argv
-        answer = self.answers[int(argv[3])]
-        if isinstance(answer, Exception):
-            raise answer
-        return subprocess.CompletedProcess(argv, answer[0], answer[1], answer[2])
-
-
-HEAD_A, HEAD_B = "a" * 40, "b" * 40
-
-
-def captain_pr(body="MERGE: captain\n\nland it", head=HEAD_A, reviews=None, author="coder-bot", state="OPEN", comments=(), **more):
-    """pr_view_json for a PR with a body, an author, a head and reviews [(login, state, commit oid)]."""
-    fields = {"body": body, "headRefOid": head, "author": {"login": author}, "reviews": [
-        dict({"author": {"login": r[0]}, "state": r[1], "commit": {"oid": r[2]}}, **({"body": r[3]} if len(r) > 3 else {}))
-        for r in (reviews or [])]}
-    fields["comments"] = [{"author": {"login": author}, "body": text + (
-        "\n<!-- fleet-switchboard:from=%s -->" % who if who else "")} for who, text in comments]
-    fields.update(more)
-    return pr_view_json(state=state, **fields)
 
 
 class TestAPrLeavesTheListWhenItIsNotOpen(DecisionsBase):
@@ -56013,8 +54116,6 @@ class TestTierRoleText(unittest.TestCase):
         self.assertIn("standing-orders.md", setup)
 
 
-
-
 # ---- the offline runner learns the PR 18 steps and oracles
 
 STEP_EXAMPLES.update({"decide": {"action": "answer", "ref": "echo hi", "value": "allow", "note": "order 1",
@@ -56203,20 +54304,6 @@ class TestTierScenarios(Base):
             self.assertIn(word, readme)
 
 
-# ======================================================================
-# The Decision baseline (characterisation). It pins what the Decision subsystem does TODAY, through the seams
-# that outlive a refactor: the CLI (`decisions`, `decisions --json`, `decisions --fresh`, `status`, the write
-# commands), decisions.json, the effects on the fake gh and the fake v2, and the plugin's view of the same list.
-# The expected outputs are plain files in scenarios/switchboard/decisions-baseline/ (synthetic names only).
-# A refactor that keeps behaviour changes no test and no file here, only the code under test. To record the
-# files again after a CHANGE OF BEHAVIOUR THAT WAS MEANT: DECISIONS_BASELINE_UPDATE=1 bin/test-switchboard
-# TestDecisionBaseline, then read the diff of the files like any other change. docs/switchboard.md, "Testing".
-#
-# Where only an internal function can be called there is ONE adapter function (named baseline_*, below): the
-# single place to repoint when the engine's decision code moves.
-# ======================================================================
-BASELINE_DIR = REPO / "scenarios" / "switchboard" / "decisions-baseline"
-BASELINE_UPDATE = os.environ.get("DECISIONS_BASELINE_UPDATE") == "1"
 BASELINE_NODE_PRESENT = bool(NODE)
 
 
@@ -56255,22 +54342,6 @@ def baseline_unreadable_inbox(session_id, failure):
         yield
 
 
-def baseline_failing_send(reason):
-    """ADAPTER: the engine's `send` delivers nothing: `reason` is why, or None for an error (today Switchboard.send)."""
-    if reason is None:
-        return mock.patch.object(sb.Switchboard, "send", side_effect=RuntimeError("no such agent"))
-    return mock.patch.object(sb.Switchboard, "send", return_value={"sent": False, "reason": reason})
-
-
-@contextlib.contextmanager
-def baseline_failing_source(name):
-    """ADAPTER: one source of the derivation raises (today the decisions_from_<name> function the derivation calls)."""
-    target = {"v2": "decisions_from_requests", "github": "decisions_from_github", "reports": "decisions_from_reports",
-              "notices": "decisions_from_notices"}[name]
-    with mock.patch.object(sb, target, side_effect=RuntimeError("%s is broken" % name)):
-        yield
-
-
 def baseline_failing_derivation():
     """ADAPTER: the whole derivation raises (today sb.derive_decisions)."""
     return mock.patch.object(sb, "derive_decisions", side_effect=RuntimeError("boom"))
@@ -56282,35 +54353,6 @@ def baseline_derive(engine, now):
     engine.discover(now())
     engine.collect_facts()
     return sb.derive_decisions(engine, now())
-
-
-_BASELINE_JSON_ERROR = re.compile(r"(?:Expecting|Extra data|Unterminated|Invalid|Illegal)[^\n]*")
-
-
-def baseline_portable(data):
-    """`data` with the interpreter's own wording taken out (a json parse error reads differently from Python
-    3.9 to 3.12), so the files are the same on every Python. The product cuts the message at a fixed width, so it is dropped to its end."""
-    if isinstance(data, str):
-        return _BASELINE_JSON_ERROR.sub("<json parse error>", data)
-    if isinstance(data, list):
-        return [baseline_portable(x) for x in data]
-    if isinstance(data, dict):
-        return {k: baseline_portable(v) for k, v in data.items()}
-    return data
-
-
-def baseline_golden(test, name, data):
-    """Compare `data` with the golden file `name`.json (or record it under DECISIONS_BASELINE_UPDATE=1)."""
-    data = baseline_portable(data)
-    text = json.dumps(data, indent=1, sort_keys=True, ensure_ascii=False) + "\n"
-    path = BASELINE_DIR / (name + ".json")
-    if BASELINE_UPDATE:
-        BASELINE_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_text(text)
-        return
-    test.assertTrue(path.exists(), "no golden file %s: record it with DECISIONS_BASELINE_UPDATE=1" % path.name)
-    test.maxDiff = None
-    test.assertEqual(path.read_text(), text, "the Decision baseline %s changed: behaviour changed" % path.name)
 
 
 class BaselineWorld(WriteWorld):
@@ -58013,466 +56055,6 @@ class TestDecisionsStyledPanel(unittest.TestCase):
 # protocol shaped like the contract (two channels, idempotent raise, a cursor feed, error injection, 429 with
 # Retry-After, down and slow). Generic words only: items, seats, feed. No product name appears here.
 
-EXTERNAL_ADAPTER = BIN / "external_adapter.py"
-EA = _load("external_adapter_under_test", EXTERNAL_ADAPTER)
-
-
-class FakeDoorServer:
-    """A stdlib http.server: an HTTP API under /v1 and a JSON-RPC tool channel at /rpc, one credential header."""
-
-    KEY = "k-test-secret-0123456789"
-    NAMESPACE = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
-
-    def __init__(self):
-        import http.server
-        self.items, self.changes, self.log, self.requests = {}, [], [], []
-        self.inject, self.delay, self.down, self.disabled, self.sse = [], 0, False, False, False
-        self.seq, self.now, self.tasks, self.sessions, self.sid = 100, 1000.0, {}, set(), 0
-        self.seen, self.lock = {}, threading.Lock()
-        outer = self
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            protocol_version = "HTTP/1.1"
-
-            def log_message(self, *args):
-                pass
-
-            def do_GET(self):
-                outer.handle(self, "GET")
-
-            def do_POST(self):
-                outer.handle(self, "POST")
-
-            def do_PUT(self):
-                outer.handle(self, "PUT")
-
-            def do_PATCH(self):
-                outer.handle(self, "PATCH")
-
-        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.httpd.daemon_threads = True
-        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
-        self.thread.start()
-        self.url = "http://127.0.0.1:%d" % self.httpd.server_address[1]
-
-    def close(self):
-        self.httpd.shutdown()
-        self.httpd.server_close()
-
-    # ---- helpers for tests
-    def add_change(self, what, item, gap=1, **fields):
-        self.seq += gap
-        change = {"n": self.seq, "what": what, "item": item, "when": "t%d" % self.seq}
-        change.update(fields)
-        self.changes.append(change)
-        return change
-
-    def fail_next(self, op=None, status=500, body=None, headers=None, level="http", count=1):
-        self.inject.append({"op": op, "status": status, "body": body if body is not None else {"code": "x",
-                            "message": "injected"}, "headers": headers or {}, "level": level, "count": count})
-
-    def count(self, op, channel=None):
-        return len([1 for c, o in self.log if o == op and (channel is None or c == channel)])
-
-    # ---- the transport
-    def send(self, h, status, body=None, headers=None, raw=None):
-        data = raw if raw is not None else json.dumps(body).encode("utf-8") if body is not None else b""
-        h.send_response(status)
-        h.send_header("Content-Type", "application/json")
-        h.send_header("Content-Length", str(len(data)))
-        for k, v in (headers or {}).items():
-            h.send_header(k, v)
-        h.end_headers()
-        h.wfile.write(data)
-
-    def handle(self, h, method):
-        length = int(h.headers.get("Content-Length") or 0)
-        raw = h.rfile.read(length) if length else b""
-        if self.down:
-            h.close_connection = True
-            h.connection.shutdown(socket.SHUT_RDWR)
-            return
-        if self.delay:
-            time.sleep(self.delay)
-        with self.lock:
-            self.dispatch_http(h, method, raw)
-
-    def take(self, op, level):
-        for one in self.inject:
-            if one["level"] == level and one["op"] in (None, op):
-                one["count"] -= 1
-                if one["count"] <= 0:
-                    self.inject.remove(one)
-                return one
-        return None
-
-    def dispatch_http(self, h, method, raw):
-        parts = urllib.parse.urlsplit(h.path)
-        got = h.headers.get("X-Auth", "")
-        if got != "Key " + self.KEY:
-            return self.send(h, 401, {"code": "cred", "message": "credential refused: %s" % got})
-        if method in ("POST", "PUT", "PATCH") and "json" not in (h.headers.get("Content-Type") or ""):
-            return self.send(h, 415, {"code": "media", "message": "json only"})
-        query = dict(urllib.parse.parse_qsl(parts.query))
-        if parts.path == "/rpc":
-            return self.rpc(h, raw)
-        op, ident, seat = self.route(method, parts.path)
-        if op is None:
-            return self.send(h, 404, {"code": "nf", "message": "no such path"})
-        shot = self.take(op, "http")
-        if shot:
-            return self.send(h, shot["status"], shot["body"], shot["headers"])
-        try:
-            args = json.loads(raw) if raw else {}
-        except ValueError:
-            return self.send(h, 400, {"code": "bad", "message": "not json"})
-        args.update(query)
-        self.log.append(("http", op))
-        self.requests.append(("http", op, args))
-        status, body, headers = self.run(op, args, ident, seat)
-        self.send(h, status, body, headers)
-
-    ROUTES = [("GET", r"^/v1/seats$", "feed"), ("POST", r"^/v1/items$", "raise"), ("GET", r"^/v1/items$", "items"),
-              ("POST", r"^/v1/items/([^/]+)/revise$", "revise"), ("POST", r"^/v1/items/([^/]+)/withdraw$", "withdraw"),
-              ("POST", r"^/v1/items/([^/]+)/acted$", "acted"),
-              ("PUT", r"^/v1/seats/([^/]+)/tasks/([^/]+)$", "work_put"),
-              ("PATCH", r"^/v1/seats/([^/]+)/tasks/([^/]+)$", "work_patch"),
-              ("POST", r"^/v1/seats/([^/]+)/tasks/([^/]+)/finish$", "work_finish"),
-              ("GET", r"^/v1/seats/([^/]+)/tasks/([^/]+)$", "work_get"),
-              ("GET", r"^/v1/seats/([^/]+)/tasks$", "work_list")]
-
-    def route(self, method, path):
-        for m, pattern, op in self.ROUTES:
-            found = re.match(pattern, path)
-            if m == method and found:
-                groups = [urllib.parse.unquote(g) for g in found.groups()]
-                if op.startswith("work"):
-                    return op, (groups[1] if len(groups) > 1 else None), groups[0]
-                return op, (groups[0] if groups else None), None
-        return None, None, None
-
-    TOOLS = {"seats_list": "feed", "item_raise": "raise", "items_read": "items", "item_revise": "revise",
-             "item_withdraw": "withdraw", "item_acted": "acted"}
-
-    def rpc(self, h, raw):
-        try:
-            msg = json.loads(raw)
-        except ValueError:
-            return self.send(h, 400, {"code": "bad", "message": "not json"})
-        method, mid = msg.get("method"), msg.get("id")
-        if method == "initialize":
-            self.sid += 1
-            session = "sess-%d" % self.sid
-            self.sessions.add(session)
-            return self.reply(h, mid, {"protocolVersion": "2025-03-26", "capabilities": {}}, {"Mcp-Session-Id": session})
-        if h.headers.get("Mcp-Session-Id") not in self.sessions:
-            return self.send(h, self.session_miss, {"code": "nf", "message": "no session"})
-        if mid is None:
-            return self.send(h, 202, raw=b"")
-        if method == "tools/list":
-            return self.reply(h, mid, {"tools": [{"name": n} for n in self.TOOLS]})
-        if method != "tools/call":
-            return self.reply(h, mid, None, error={"code": -32601, "message": "no method"})
-        name, args = msg["params"]["name"], msg["params"].get("arguments", {})
-        op = self.TOOLS.get(name)
-        if op is None:
-            return self.reply(h, mid, {"content": [{"type": "text", "text": "MCP error -32602: unknown tool"}],
-                                       "isError": True})
-        shot = self.take(op, "http")
-        if shot:
-            return self.send(h, shot["status"], shot["body"], shot["headers"])
-        if "bad_schema" in args:
-            return self.reply(h, mid, {"content": [{"type": "text", "text": "MCP error -32602: Input validation "
-                                                                          "error: bad_schema"}], "isError": True})
-        shot = self.take(op, "result")
-        if shot:
-            return self.reply(h, mid, {"content": [{"type": "text", "text": json.dumps(shot["body"])}],
-                                       "isError": True})
-        self.log.append(("tool", op))
-        self.requests.append(("tool", op, args))
-        args = dict(args)
-        ident = args.pop("id", None)
-        status, body, _ = self.run(op, args, ident, None)
-        self.reply(h, mid, {"content": [{"type": "text", "text": json.dumps(body)}], "isError": status >= 300})
-
-    def reply(self, h, mid, result, headers=None, error=None):
-        envelope = {"jsonrpc": "2.0", "id": mid}
-        envelope.update({"error": error} if error else {"result": result})
-        if self.sse:
-            data = ("event: message\ndata: %s\n\n" % json.dumps(envelope)).encode("utf-8")
-            h.send_response(200)
-            h.send_header("Content-Type", "text/event-stream")
-            h.send_header("Content-Length", str(len(data)))
-            for k, v in (headers or {}).items():
-                h.send_header(k, v)
-            h.end_headers()
-            h.wfile.write(data)
-        else:
-            self.send(h, 200, envelope, headers)
-
-    # ---- the made-up protocol
-    RAISE_KEYS = {"op_id", "seat", "label", "body", "advice", "floor", "choices"}
-    RAISE_OPT = {"because", "stakes", "refs"}
-
-    def run(self, op, args, ident, seat):
-        if self.disabled and op not in ("feed", "items", "work_get", "work_list"):
-            return (409 if op.startswith("work") else 403), {"code": "off", "message": "disabled"}, {}
-        return getattr(self, "op_" + op)(args, ident, seat)
-
-    session_miss = 404   # the status of a call that names a session the server does not know
-    page_size = 0   # 0: no paging; else a reply holds this many entries and names the token of the next page
-
-    def paged(self, rows, args):
-        if not self.page_size:
-            return rows, {}
-        start = int(str(args.get("token") or "p0")[1:])
-        chunk = rows[start:start + self.page_size]
-        more = {"more": {"token": "p%d" % (start + self.page_size)}} if start + self.page_size < len(rows) else {}
-        return chunk, more
-
-    def op_feed(self, args, ident, seat):
-        since = int(args.get("since") or 0)
-        new = [c for c in self.changes if c["n"] > since]
-        chunk, more = self.paged(new, args)
-        body = {"state": "off" if self.disabled else "on", "seats": [{"seat": "seat-1"}], "feed": chunk,
-                "cursor": max([c["n"] for c in chunk] + [since])}
-        body.update(more)
-        return 200, body, {}
-
-    def op_raise(self, args, ident, seat):
-        if not self.RAISE_KEYS <= set(args) or set(args) - self.RAISE_KEYS - self.RAISE_OPT:
-            return 400, {"code": "bad", "message": "invalid body"}, {}
-        try:
-            uuid.UUID(args["op_id"])
-        except ValueError:
-            return 400, {"code": "bad", "message": "invalid body"}, {}
-        if args["seat"] != "seat-1":
-            return 404, {"code": "nf", "message": "no such seat"}, {}
-        if not args["body"] or not args["advice"]:
-            return 400, {"code": "bad", "message": "invalid body"}, {}
-        item_id = "it-" + hashlib.sha256(args["op_id"].encode()).hexdigest()[:8]
-        if item_id in self.items:
-            if self.items[item_id]["_args"] != args:
-                return 409, {"code": "clash", "message": "operation conflict"}, {}
-            return 201, {"item": item_id}, {}
-        choices = []
-        for index, choice in enumerate(args["choices"]):
-            one = dict(choice)
-            one.setdefault("key", "k%d" % (index + 1))
-            choices.append(one)
-        self.items[item_id] = {"item": item_id, "state": "unrated", "body": args["body"], "choices": choices,
-                               "advice": args["advice"], "answer": None, "ask_back": None, "withdrawn": None,
-                               "reversals": [], "opened": "t0", "op_id": args["op_id"], "floor": args["floor"],
-                               "label": args["label"], "_args": args}
-        return 201, {"item": item_id}, {}
-
-    def visible(self, item):
-        return {k: v for k, v in item.items() if not k.startswith("_")}
-
-    def op_items(self, args, ident, seat):
-        chunk, more = self.paged([self.visible(i) for i in self.items.values()], args)
-        return 200, dict({"items": chunk, "state": "on"}, **more), {}
-
-    def find(self, ident):
-        return self.items.get(ident)
-
-    def op_revise(self, args, ident, seat):
-        item = self.find(ident)
-        if item is None:
-            return 404, {"code": "nf", "message": "no such item"}, {}
-        if item["answer"] is not None and item["state"] == "closed" or item["withdrawn"]:
-            return 409, {"code": "decided", "message": "read its answer instead"}, {}
-        if not ({"body", "advice", "choices"} & set(args)):
-            return 400, {"code": "bad", "message": "incomplete"}, {}
-        item.update({k: v for k, v in args.items() if k in ("body", "advice", "choices")})
-        item["state"] = "unrated"
-        return 200, {"ok": True}, {}
-
-    def op_withdraw(self, args, ident, seat):
-        item = self.find(ident)
-        if item is None:
-            return 404, {"code": "nf", "message": "no such item"}, {}
-        if item["state"] == "closed":
-            return 409, {"code": "decided", "message": "read its answer instead"}, {}
-        item["withdrawn"] = {"why": args.get("why")}
-        item["state"] = "pulled"
-        return 200, {"ok": True, "withdrawn": item["withdrawn"]}, {}
-
-    def op_acted(self, args, ident, seat):
-        item = self.find(ident)
-        if item is None:
-            return 404, {"code": "nf", "message": "no such item"}, {}
-        known = {(item["answer"] or {}).get("answer_id")} | {r.get("answer_id") for r in item["reversals"]}
-        if args.get("on") not in known:
-            return 409, {"code": "clash", "message": "that is not an answer to this item"}, {}
-        return 200, {"ok": True, "on": args["on"]}, {}
-
-    def task_of(self, seat, ident):
-        return self.tasks.get((seat, ident))
-
-    def needs_reason(self, args):
-        return args.get("state") in ("paused", "stuck") and not args.get("why_state")
-
-    def op_work_put(self, args, ident, seat):
-        if self.needs_reason(args):
-            return 400, {"code": "bad", "message": "say what the work waits for"}, {}
-        if not args.get("title") or ("progress" in args and not (args["progress"] or {}).get("text")):
-            return 400, {"code": "bad", "message": "title or progress text is empty"}, {}
-        task = self.task_of(seat, ident)
-        if task is None:
-            task = {"id": ident, "end": None, "recorded_at": self.now}
-            task.update(args)
-            self.tasks[(seat, ident)] = task
-            return 200, {"task": task, "recorded": True}, {}
-        if task["end"]:
-            return 409, {"code": "task_done", "message": "finished"}, {}
-        return 200, {"task": task, "recorded": False}, {}
-
-    def op_work_patch(self, args, ident, seat):
-        if self.needs_reason(args):
-            return 400, {"code": "bad", "message": "say what the work waits for"}, {}
-        task = self.task_of(seat, ident)
-        if task is None:
-            return 404, {"code": "nf", "message": "no task"}, {}
-        if task["end"]:
-            return 409, {"code": "task_done", "message": "finished"}, {}
-        if all(task.get(k) == v for k, v in args.items()):
-            return 200, {"task": task, "recorded": False}, {}
-        if self.now - task["recorded_at"] < 60:
-            return 429, {"code": "slow", "message": "too soon", "retry_after_s": 60}, {"Retry-After": "60"}
-        task.update(args)
-        task["recorded_at"] = self.now
-        return 200, {"task": task, "recorded": True}, {}
-
-    def op_work_finish(self, args, ident, seat):
-        task = self.task_of(seat, ident)
-        if task is None:
-            return 404, {"code": "nf", "message": "no task"}, {}
-        if task["end"] and task["end"]["state"] != args.get("end"):
-            return 409, {"code": "task_done", "message": "finished otherwise"}, {}
-        task["end"] = {"state": args.get("end"), "said": args.get("said")}
-        return 200, {"task": task, "recorded": True}, {}
-
-    def op_work_get(self, args, ident, seat):
-        task = self.task_of(seat, ident)
-        return (200, {"task": task}, {}) if task else (404, {"code": "nf", "message": "no task"}, {})
-
-    def op_work_list(self, args, ident, seat):
-        return 200, {"tasks": [t for (s, _), t in self.tasks.items() if s == seat]}, {}
-
-
-FAKE_MAPPING = {
-    "mapping_version": 1, "base_url": "http://127.0.0.1:1", "tool_path": "/rpc", "http_prefix": "/v1",
-    "auth": {"header": "X-Auth", "scheme": "Key"}, "key_source": "env:FAKE_DOOR_KEY", "channel": "tool",
-    "project": "seat-1", "timeouts": {"request": 2, "command": 5},
-    "retry": {"attempts": 3, "base_delay": 0.5, "max_delay": 1.5, "max_retry_after_sleep": 5,
-              "default_retry_after": 1},
-    "poll_interval": 30, "work_interval": 60, "idempotency": {"namespace": FakeDoorServer.NAMESPACE},
-    "operations": {
-        "feed": {"tool": "seats_list", "http": {"method": "GET", "path": "/seats"}, "cursor_param": "since",
-                 "next_param": "token"},
-        "raise": {"tool": "item_raise", "http": {"method": "POST", "path": "/items"}},
-        "items": {"tool": "items_read", "http": {"method": "GET", "path": "/items"}, "next_param": "token"},
-        "revise": {"tool": "item_revise", "id_arg": "id", "http": {"method": "POST", "path": "/items/{id}/revise"}},
-        "withdraw": {"tool": "item_withdraw", "id_arg": "id",
-                     "http": {"method": "POST", "path": "/items/{id}/withdraw"}},
-        "acted": {"tool": "item_acted", "id_arg": "id", "http": {"method": "POST", "path": "/items/{id}/acted"}},
-        "work_put": {"http": {"method": "PUT", "path": "/seats/{project}/tasks/{id}"}},
-        "work_patch": {"http": {"method": "PATCH", "path": "/seats/{project}/tasks/{id}"}},
-        "work_finish": {"http": {"method": "POST", "path": "/seats/{project}/tasks/{id}/finish"}},
-        "work_get": {"http": {"method": "GET", "path": "/seats/{project}/tasks/{id}"}},
-        "work_list": {"http": {"method": "GET", "path": "/seats/{project}/tasks"}}},
-    "fields": {
-        "raise": {"idempotency": "op_id", "project": "seat", "class": "label", "text": "body",
-                  "recommendation": "advice", "floor": "floor", "options": "choices", "grounds": "because",
-                  "stakes": "stakes", "evidence": "refs"},
-        "option": {"label": "name", "cost": "price", "recommended": "preferred", "id": "key"},
-        "evidence": {"text": "note", "link": "href"},
-        "revise": {"idempotency": "op_id", "text": "body", "recommendation": "advice", "options": "choices"},
-        "withdraw": {"reason": "why"},
-        "acted": {"idempotency": "op_id", "answer": "on", "outcome": "result", "note": "note"},
-        "work": {"title": "title", "kind": "kind", "state": "state", "state_reason": "why_state", "progress": "progress",
-                 "progress_text": "text", "doer": "doer", "end": "end", "summary": "said"}},
-    "responses": {
-        "item_id": "item", "items": "items",
-        "item": {"id": "item", "status": "state", "text": "body", "answer": "answer", "clarification": "ask_back",
-                 "withdrawn": "withdrawn", "reversals": "reversals", "opened_at": "opened", "idempotency": "op_id"},
-        "feed": {"cursor": "cursor", "changes": "feed", "status": "state"}, "page": {"info": "more", "next": "token"},
-        "change": {"seq": "n", "kind": "what", "item_id": "item", "at": "when", "tier": "level", "floor": "floor",
-                   "text": "body", "awaits_rating": "rerate", "replaces": "replaces", "reason": "why"},
-        "answer": {"id": "answer_id", "disposition": "how", "option_id": "chosen", "text": "words", "rationale": "why",
-                   "clarification": "ask_back", "rejection": "no_reason", "by": "who"},
-        "work": {"item": "task", "items": "tasks", "recorded": "recorded"}},
-    "enums": {
-        "tier": {"low": "minor", "moderate": "middling", "high": "major", "reserved": "sealed"},
-        "disposition": {"accept": "yes", "edit": "reword", "reject": "no", "clarify": "ask"},
-        "status": {"awaiting_rating": "unrated", "with_owner": "waiting", "sent_back": "returned",
-                   "decided": "closed", "withdrawn": "pulled"},
-        "change_kind": {"answered": "answer", "rated": "rating", "revised": "restated", "reversed": "flip",
-                        "withdrawn": "pull"},
-        "outcome": {"done": "did", "undone": "undid", "not_undone": "could_not"},
-        "work_state": {"queued": "waiting", "running": "going", "awaiting": "paused", "blocked": "stuck"},
-        "work_end": {"done": "ok", "failed": "bad", "cancelled": "dropped"},
-        "integration_status": {"active": "on", "disabled": "off"}},
-    "tier_map": {"orchestrator": {"class": "routine", "floor": "low"}, "cos": {"class": "notable", "floor": "high"},
-                 "human": {"class": "grave", "floor": "reserved"}},
-    "roles": [{"when": {"type": "person"}, "role": "human"}, {"when": {"type": "bot"}, "role": "orchestrator"},
-              {"when": {"type": "owner_bot"}, "role": "cos"}],
-    "errors": {"code_field": "code", "message_field": "message", "retry_after_field": "retry_after_s",
-               "codes": {"off": "DisabledError", "decided": "AlreadyDecided", "clash": "Conflict",
-                         "slow": "RateLimited"}},
-    "options": {"id_prefix": "c", "key_marker": "ref:"}, "defaults": {"recommendation": "proceed"}}
-
-
-def fake_mapping(base_url, channel="tool", **over):
-    data = copy.deepcopy(FAKE_MAPPING)
-    data["base_url"], data["channel"] = base_url, channel
-    for key, value in over.items():
-        if isinstance(value, dict) and isinstance(data.get(key), dict):
-            data[key].update(value)
-        else:
-            data[key] = value
-    return data
-
-
-class ExternalAdapterCase(unittest.TestCase):
-    """A fake server, and an adapter on it with recorded sleeps and a controllable clock."""
-
-    def setUp(self):
-        self.server = FakeDoorServer()
-        self.addCleanup(self.server.close)
-        self.slept, self.clock_now = [], [0.0]
-        self.tmp = Path(tempfile.mkdtemp(prefix="ext-adapter-"))
-        self.addCleanup(shutil.rmtree, self.tmp, True)
-
-    def adapter(self, channel="tool", **over):
-        return EA.McpRestAdapter(fake_mapping(self.server.url, channel, **over), sleep=self.slept.append,
-                                 clock=lambda: self.clock_now[0], environ={"FAKE_DOOR_KEY": FakeDoorServer.KEY})
-
-    def push(self, adapter, d, key):
-        """The port's operation for a decision-shaped dict (op, external_id, status, reason are the operation's)."""
-        d = dict(d)
-        op, ext, reason = d.pop("op", None), d.pop("external_id", None), d.pop("reason", None)
-        if op is None:
-            op = "raise" if not ext else ("withdraw" if d.get("status") == "withdrawn" else "revise")
-        operation = {"op": op, "key": "dk:" + key, "external_id": ext, "revision": 1, "decision": d}
-        if reason:
-            operation["note"] = reason
-        done = adapter.push(operation, key)
-        assert set(done) == {"external_id", "url"}, done
-        return done["external_id"]
-
-    def decision(self, **over):
-        found = {"title": "Ship it?", "body": "The build is green.", "tier": "orchestrator",
-                 "recommendation": "yes", "options": ["approve", {"label": "hold", "cost": "a day"}]}
-        found.update(over)
-        return found
-
-    def answer_fields(self, **over):
-        found = {"answer_id": "a-1", "how": "yes", "chosen": "k1", "words": "approve", "who": {"type": "person"}}
-        found.update(over)
-        return found
-
 
 class TestExternalAdapterMapping(ExternalAdapterCase):
     def good(self):
@@ -59263,59 +56845,6 @@ class TestExternalAdapterHygiene(unittest.TestCase):
 
 
 # ---------------------------------------------------------------- external decision systems (the sync engine)
-
-class FakeExternal(sb.decision_core.ExternalDecisionAdapter):
-    """An in-process adapter: items by outside id, idempotent by key, a switch for down, and a queue of events."""
-
-    def __init__(self):
-        self.up, self.items, self.applied_keys, self.calls, self.events = True, {}, {}, [], []
-        self.lose_ack = False   # apply the next write, then fail as if the answer was lost
-
-    def health(self):
-        return None if self.up else "the fake is down"
-
-    def push(self, operation, idempotency_key):
-        self.calls.append((operation["op"], operation["key"], idempotency_key))
-        if not self.up:
-            raise ConnectionError("the fake is down")
-        if idempotency_key in self.applied_keys:
-            return self.applied_keys[idempotency_key]
-        op = operation["op"]
-        if op == "raise":
-            ext = "ext-%d" % (len(self.items) + 1)
-            self.items[ext] = {"key": operation["key"], "decision": operation["decision"], "floor": operation["floor"],
-                               "state": "open", "notes": [], "revisions": [operation["revision"]]}
-        else:
-            ext = operation["external_id"]
-            item = self.items[ext]
-            if op == "revise":
-                item["decision"], item["floor"] = operation["decision"], operation["floor"]
-                item["revisions"].append(operation["revision"])
-            elif op == "status":
-                item["floor"] = operation["floor"]
-                if operation.get("note"):
-                    item["notes"].append(operation["note"])
-            elif op == "withdraw":
-                item["state"] = "withdrawn"
-        answer = {"external_id": ext}
-        self.applied_keys[idempotency_key] = answer
-        if self.lose_ack:
-            self.lose_ack = False
-            raise ConnectionError("the answer was lost")
-        return answer
-
-    def lookup(self, key):
-        for ext, item in self.items.items():
-            if item["key"] == key:
-                return {"external_id": ext, "revision": item["revisions"][-1]}
-        return None
-
-    def pull_changes(self, cursor):
-        start = cursor or 0
-        return list(self.events[start:]), len(self.events)
-
-    def open_items(self):
-        return {e: i for e, i in self.items.items() if i["state"] == "open"}
 
 
 class ExternalWorld(BaselineWorld):
@@ -60251,60 +57780,6 @@ class TestExternalWiring(ExternalWorld):
 
 # ---------------------------------------------------------------- work items from worker assignments
 
-class FakeWorkSink(sb.work_sync.WorkSink):
-    interval = 60
-
-    def __init__(self):
-        self.calls, self.down, self.defer = [], False, None
-
-    def _do(self, *call):
-        if self.down:
-            raise ConnectionError("the sink is down")
-        self.calls.append(call)
-
-    def put(self, work_id, title, **fields):
-        self._do("put", work_id, title, fields)
-
-    def patch(self, work_id, **fields):
-        if self.defer:
-            return {"sent": False, "deferred": True, "due_in": self.defer}
-        self._do("patch", work_id, fields)
-
-    def finish(self, work_id, end, summary, **fields):
-        self._do("finish", work_id, end, summary)
-
-    def kinds(self):
-        return [c[0] for c in self.calls]
-
-
-class FakeWorkHost(sb.work_sync.Host):
-    def __init__(self):
-        self.agent_list, self.report_list, self.link_table, self.events = [], [], {}, []
-
-    def agents(self):
-        return list(self.agent_list)
-
-    def reports(self):
-        return list(self.report_list)
-
-    def title_of(self, repo, issue):
-        return "The ask %s#%d" % (repo.split("/")[1], issue)
-
-    def links(self):
-        return self.link_table
-
-    def audit(self, event, subject, detail):
-        self.events.append((event, subject, detail))
-
-
-def worker(name="w1", issue=2, repo="acme/api", status="idle", **more):
-    return dict({"name": name, "role": "coder", "reports_to": "boss", "repo": repo, "issue": issue, "status": status,
-                 "intent": None}, **more)
-
-
-def report(state, text="", at=1, sender="w1", issue=2):
-    return {"sender": sender, "issue": issue, "repo": "acme/api", "state": state, "text": text, "at": at}
-
 
 class TestWorkItemRules(unittest.TestCase):
     ws = sb.work_sync
@@ -60523,28 +57998,9 @@ class TestWorkItemsThroughTheDaemon(ExternalWorld):
         self.assertEqual(self.sink.calls, [])
 
 
-class PermanentRefusal(Exception):
-    permanent = True
-
-
 class Unavailable(Exception):
     permanent = False
     retry_after = 3
-
-
-class PickyExternal(FakeExternal):
-    """A fake that refuses chosen operations: `refuse[op]` is the exception to raise instead of applying it."""
-
-    def __init__(self):
-        super().__init__()
-        self.refuse, self.seen = {}, []
-
-    def push(self, operation, idempotency_key):
-        self.seen.append(operation)
-        if operation["op"] in self.refuse and self.up:
-            self.calls.append((operation["op"], operation["key"], idempotency_key))
-            raise self.refuse[operation["op"]]
-        return super().push(operation, idempotency_key)
 
 
 class TestSyncSentBack(ExternalWorld):
@@ -61075,8 +58531,6 @@ class TestDecisionsPanelLinks(Base):
         good1, good2, *rest = self.r["safe"]
         self.assertEqual((good1, good2), ("https://github.com/acme/web/issues/5", "https://github.com/acme/web/pull/9"))
         self.assertEqual(rest, [None] * len(rest))
-
-
 
 
 class TestPlanReviewCommands(LedgerBase):
@@ -63765,7 +61219,6 @@ class TestAuditRotation(unittest.TestCase):
         self.assertEqual((entry["detail"]["pruned"], entry["detail"]["archive"].startswith("audit-")), (["audit-2020-01-01.jsonl.gz"], True))
 
 
-
 def hex_id(name):
     return hashlib.sha256(name.encode()).hexdigest()
 
@@ -63822,41 +61275,6 @@ class FakeDocker:
 
     def removals(self):
         return [c for c in self.calls if "rm" in c and "--" in c]
-
-
-class FakePruneDocker:
-    """A scripted docker for `disk prune` and the report: a server version, volumes (name, anonymous, dangling, size text) and a record of every argv.
-    `prune_calls` are the prune commands only (the read-only questions are in `calls`)."""
-
-    def __init__(self, version="29.7.2", volumes=(), exits=(0, 0, 0), outputs=("Total reclaimed space: 1.2GB", "Total reclaimed space: 300MB", "Total reclaimed space: 5MB"),
-                 version_code=0, platform="Docker Desktop 4.89.0", server_api="1.55", client_api="1.55", df_fails=False):
-        self.version, self.volumes, self.version_code = version, list(volumes), version_code
-        self.platform, self.server_api, self.client_api, self.df_fails = platform, server_api, client_api, df_fails
-        self.calls, self.prune_calls = [], []
-        self.replies = iter(zip(exits, outputs))
-
-    def __call__(self, argv, **kwargs):
-        a = list(argv[1:])
-        self.calls.append(a)
-        out = lambda text, code=0, err="": subprocess.CompletedProcess(argv, code, text, err)
-        if a[:1] == ["version"]:
-            return out("%s|%s|%s|%s\n" % (self.version, self.platform, self.server_api, self.client_api), self.version_code, "no server" if self.version_code else "")
-        if a[:2] == ["volume", "ls"]:
-            return out("\n".join(v[0] for v in self.volumes if v[2]))
-        if a[:1] == ["inspect"]:
-            ids = a[a.index("--") + 1:]
-            return out(json.dumps([{"Name": v[0], "Labels": ({"com.docker.volume.anonymous": ""} if v[1] else {"x": "y"})} for v in self.volumes if v[0] in ids]))
-        if a[:2] == ["system", "df"] and "-v" not in a:
-            return out("TYPE TOTAL SIZE\nImages 3 1.2GB\n")
-        if a[:2] == ["system", "df"] and self.df_fails:
-            return out("", 1, "df failed")
-        if a[:2] == ["system", "df"]:
-            return out(json.dumps([{"Name": v[0], "Size": v[3]} for v in self.volumes]))
-        if "prune" in a:
-            self.prune_calls.append(a)
-            code, text = next(self.replies)
-            return out(text, code, "boom" if code else "")
-        raise AssertionError("an unexpected docker call: %r" % a)
 
 
 class TestDiskReport(Base):
@@ -64079,26 +61497,6 @@ class TestDiskReport(Base):
         section = section[:section.index("\n### ", 10)] if "\n### " in section[10:] else section
         for phrase in ("ignored silently", "expired", "kept", "error:"):
             self.assertIn(phrase, section.lower())
-
-
-def reviewed_janitor_argv(argv, run):
-    """`argv` for `disk janitor` with the reviewed fingerprint a person would copy from a dry run: `run(argv)` runs the command and returns its output text."""
-    argv = list(argv)
-    if "--apply" not in argv or "--i-reviewed" in argv:
-        return argv
-    dry = [a for a in argv if a != "--apply"]
-    text = run(dry)
-    found = re.findall(r"preview fingerprint: ([0-9a-f]{16})", text)
-    return argv + ["--i-reviewed", found[-1] if found else "0" * 16]
-
-
-def janitor_review(test, argv):
-    """The full `disk janitor` argv with the fingerprint of a dry run just made, as a person would copy it."""
-    def dry(args):
-        with captured() as (out, err):
-            sb.main(["disk", "janitor", *args], runner=test.routed, now=test.world.clock.now, socket_call=test.world.herdr.socket)
-        return out.getvalue()
-    return ["disk", "janitor", *reviewed_janitor_argv(argv, dry)]
 
 
 class TestTempJanitor(Base):
@@ -64545,35 +61943,6 @@ class TestTempJanitor(Base):
         text = (REPO / "docs" / "switchboard.md").read_text()
         for phrase in ("fleet-keep", "GitHub issue", "temp_janitor"):
             self.assertIn(phrase, text)
-
-
-class CallBound(AssertionError):
-    pass
-
-
-class BoundedList(list):
-    """A list of recorded calls that refuses the 10001st: a mutant that never leaves its loop fails fast instead of growing until the machine is out of memory."""
-    BOUND = 10000
-
-    def append(self, item):
-        if len(self) >= self.BOUND:
-            raise CallBound("call bound of %d recorded calls passed: a loop that never ends" % self.BOUND)
-        super().append(item)
-
-
-class BoundedOut(io.StringIO):
-    """The wrapper's output in a test: refuses more than 1 MB, or more than 10000 writes, for the same reason."""
-    LIMIT = 1024 * 1024
-
-    def __init__(self):
-        super().__init__()
-        self.writes = 0
-
-    def write(self, text):
-        self.writes += 1
-        if self.writes > BoundedList.BOUND or self.tell() + len(text) > self.LIMIT:
-            raise CallBound("call bound passed: the output holds %d bytes after %d writes" % (self.tell(), self.writes))
-        return super().write(text)
 
 
 class TestMadeUpPids(unittest.TestCase):
@@ -70277,7 +67646,6 @@ class TestAgentsVerify(unittest.TestCase):
         self.assertIn("--strict", (REPO / "INSTALL.md").read_text())
 
 
-
 STRUCTURAL_RULE = ("When a function decides from text (an error message, a substring, a pattern, a name list), the first-round finding asks for an allow-list, "
                    "a structured field or exact equality, and for a completeness test derived from the code, with one mutant per member, so the class is closed in one "
                    "round and not found one instance at a time.")
@@ -70686,7 +68054,6 @@ class TestReviewLawsStarterSet(Base):
 
     def test_the_docs_name_the_command(self):
         self.assertIn("review-laws install", (REPO / "docs" / "switchboard.md").read_text())
-
 
 
 class TestReviewerSubagents(LedgerBase):
@@ -72259,136 +69626,6 @@ class TestPlanReviewCore(unittest.TestCase):
 
 # ---- the v2 transport: HTTP to the service with a CLI fallback, and the backpressure breaker (an owner order)
 
-class FakeOpenCodeService:
-    """The OpenCode service, in memory: no socket, no thread, no sleep. It answers like the service (Basic auth `opencode:<password>`, the paths of
-    the operation table); `connect` is the connection factory a test gives V2Http. Knobs: `up`, `delay` (a delay longer than the client's timeout
-    is a timeout), `drop` (the service closes without a reply after receiving the request), `big` (bytes in a transcript reply), `password`."""
-
-    def __init__(self, password="pw-secret-1"):
-        self.password, self.up, self.delay, self.drop, self.big = password, True, 0.0, False, 0
-        self.requests, self.connections = [], 0
-        self.stream = []           # lines GET /api/event streams; a None is a quiet stretch (a read timeout); the stream then closes
-        self.stream_status = 200
-
-    def answer(self, method, path, body, authorization):
-        token = base64.b64encode(("opencode:" + self.password).encode()).decode()
-        if authorization != "Basic " + token:
-            return 401, {"error": "unauthorized"}
-        if path == "/api/event":
-            self.requests.append((method, path, body))
-            return self.stream_status, "STREAM"
-        self.requests.append((method, path, body))
-        if path.startswith("/api/session/ses_a/message"):
-            return 200, {"data": [{"id": "msg_%d" % i, "pad": "x" * (self.big or 1)} for i in range(1 if self.big else 2)], "cursor": {"next": None}}
-        if path == "/api/info":
-            return 200, {"version": "2.0.24"}
-        if path == "/api/session/active":
-            return 200, {"ses_a": {"status": "idle"}}
-        if path.startswith("/api/session/ses_a/synthetic") and method == "POST":
-            return 200, {"ok": True}
-        if path == "/api/session/ses_missing":
-            return 404, {"_tag": "SessionNotFoundError"}
-        return 404, {"error": "no such path"}
-
-    def connect(self, host, port, timeout=None):
-        return FakeServiceConnection(self, timeout)
-
-    def write_service_file(self, path, url="http://127.0.0.1:49374", pid=None, mode=0o600):
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(json.dumps({"id": "x", "version": "2.0.24", "url": url, "pid": pid or os.getpid(), "password": self.password}))
-        os.chmod(str(path), mode)
-
-
-class FakeServiceResponse:
-    def __init__(self, status, raw):
-        self.status, self._raw, self.will_close = status, raw, False
-        self.on_read = None   # a test hook: called before each read (to advance a fake clock)
-
-    def read(self, amount=None):
-        if self.on_read is not None:
-            self.on_read()
-        if amount is None:
-            raw, self._raw = self._raw, b""
-        else:
-            raw, self._raw = self._raw[:amount], self._raw[amount:]
-        return raw
-
-
-class FakeStreamResponse:
-    """An event stream response: readline gives the scripted lines, a None raises the read timeout, the end is b""."""
-
-    def __init__(self, status, lines):
-        self.status, self.lines, self.will_close = status, lines, True
-
-    def readline(self, limit=-1):
-        if not self.lines:
-            return b""
-        line = self.lines.pop(0)
-        if line is None:
-            raise socket.timeout("timed out")
-        raw = (line + "\n").encode()
-        return raw[:limit] if limit and limit > 0 else raw
-
-    def read(self, amount=None):
-        return b"{}"
-
-
-class FakeServiceConnection:
-    """What http.client.HTTPConnection gives V2Http, over the in-memory service."""
-
-    def __init__(self, service, timeout):
-        self.service, self.timeout, self.sock, self.pending, self.broken = service, timeout, None, None, False
-
-    def connect(self):
-        if not self.service.up:
-            raise ConnectionRefusedError(61, "Connection refused")
-        self.sock = object()
-        self.service.connections += 1
-
-    def request(self, method, target, body=None, headers=None):
-        if self.broken or not self.service.up:
-            raise BrokenPipeError(32, "Broken pipe")
-        self.pending = (method, target, body or b"", (headers or {}).get("Authorization"))
-
-    def getresponse(self):
-        method, target, body, auth = self.pending
-        status, obj = self.service.answer(method, target, body, auth)
-        if obj == "STREAM":
-            return FakeStreamResponse(status, list(self.service.stream))
-        if self.service.drop:
-            self.broken = True
-            raise http.client.RemoteDisconnected("Remote end closed connection without response")
-        if self.service.delay > (self.timeout or 1e9):
-            raise socket.timeout("timed out")
-        return FakeServiceResponse(status, json.dumps(obj).encode())
-
-    def close(self):
-        self.sock = None
-
-
-class V2TransportBase(Base):
-    def setUp(self):
-        super().setUp()
-        self.service = FakeOpenCodeService()
-        self.service_file = self.home / "opencode" / "service.json"
-        self.service.write_service_file(self.service_file)
-        self.cli_calls = []
-
-    def runner(self, argv, **kwargs):
-        self.cli_calls.append(argv)
-        return subprocess.CompletedProcess(argv, 0, json.dumps({"data": {"via": "cli"}}), "")
-
-    def write_private(self, text):
-        """A service file that is private to the user (0600), so that only its content or size can be what is wrong with it."""
-        self.service_file.write_text(text)
-        os.chmod(str(self.service_file), 0o600)
-
-    def route(self, timeout=5, alive=None):
-        return sb.V2Http(self.service_file, timeout, alive=alive or (lambda pid: True), connect=self.service.connect)
-
-    def client(self, timeout=5, **kwargs):
-        return sb.V2Client("/fake/bin/opencode", {}, self.runner, timeout, http=self.route(timeout), **kwargs)
-
 
 class TestV2Http(StandInPids, V2TransportBase):
     def test_a_read_goes_over_http_with_the_operations_own_path_and_query_and_the_same_decoded_result(self):
@@ -72899,12 +70136,6 @@ class TestV2ClientBackpressure(Base):
 
 
 # ---- the event feed (#290 slice 2)
-
-def feed_line(kind, session="ses_w", created=None, **data):
-    body = {"id": "evt_%s" % kind, "type": kind, "data": dict({"sessionID": session}, **data)}
-    if created is not None:
-        body["created"] = created
-    return "data: " + json.dumps(body)
 
 
 class TestEventFeedLines(unittest.TestCase):
@@ -75141,7 +72372,6 @@ class TestLoadAlert(Base):
         before = (self.state_dir / "load.json").stat().st_mtime_ns
         self.tick(self.T0 + 60, {"o": self.orch(busy=1, charter=1)})
         self.assertEqual((self.state_dir / "load.json").stat().st_mtime_ns, before)
-
 
 
 def watch_parent(getppid=os.getppid, exit_fn=os._exit, pause=time.sleep, every=2.0, rounds=None):
@@ -79589,25 +76819,6 @@ class TestNewestCiRuns(unittest.TestCase):
         self.assertEqual(json.dumps(self.RERUN), before, "the rollup is not changed")
 
 
-class FakeMergedGh:
-    """`gh` for the merged-label pass: `pr view N` answers from `answers` ((code, stdout, stderr) or an exception); a label DELETE is recorded and succeeds."""
-
-    def __init__(self, answers=None):
-        self.answers, self.reads, self.removed = answers or {}, [], []
-
-    def __call__(self, argv, **kwargs):
-        if argv[1:3] == ["pr", "view"]:
-            self.reads.append((argv[3], argv[argv.index("--repo") + 1]))
-            answer = self.answers[int(argv[3])]
-            if isinstance(answer, Exception):
-                raise answer
-            return subprocess.CompletedProcess(argv, answer[0], answer[1], answer[2])
-        if "--method" in argv and argv[argv.index("--method") + 1] == "DELETE":
-            self.removed.append(urllib.parse.unquote(argv[2].rsplit("/", 1)[1]))
-            return subprocess.CompletedProcess(argv, 0, "{}", "")
-        raise AssertionError("the merged-label pass reaches for nothing else: %r" % (argv,))
-
-
 class StubHub:
     def __init__(self, entries):
         self.entries = entries
@@ -80482,7 +77693,6 @@ class TestCallerWorkspace(unittest.TestCase):
     def test_u3_when_they_agree_nothing_is_said(self):
         self.assertEqual(self.go(self.own, None, OPENCODE_SESSION_ID="ses_own", HERDR_WORKSPACE_ID="wW"), ("wW", ""))
         self.assertEqual(self.go(self.own, None, OPENCODE_SESSION_ID="ses_own"), ("wW", ""))
-
 
 
 class TestSkillsSync(unittest.TestCase):
@@ -82507,12 +79717,6 @@ class TestBatchingDocs(unittest.TestCase):
             self.assertEqual(section.count(phrase), 1, phrase)
 
 
-def write_lane_hours(state, lanes, hour=None):
-    """The daemon's hourly record with `lanes` ({lane: {account: {endpoint class: n}}}) for the current hour (counting on, as the daemon makes it)."""
-    start = int(time.time()) // 3600 * 3600 if hour is None else hour
-    (Path(state) / "agent-calls-hours.json").write_text(json.dumps({"v": 1, "since": time.time() - 7200, "hours": {str(start): {"lanes": lanes}}}))
-
-
 NO_CAP_WORDS = re.compile(r"(cap|quota|ceiling|allowance)", re.I)
 AGENT_WORDS = re.compile(r"(agent|lane|caller|worker|spender)", re.I)
 
@@ -82886,76 +80090,6 @@ class TestBudgetNotice(BaselineWorld):
 
 
 # ---------------------------------------------------------------------------------------------------------------- #962: the fleet's own merge queue
-
-MG_TIP, MG_NEWTIP, MG_HEAD = "1" * 40, "2" * 40, "a" * 40
-
-
-def mg_iso(epoch):
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
-
-
-class FakeMergeGitHub:
-    """A fake GitHub for the merge gate: `fake(argv) -> (code, out, err)`. Reads and writes are logged apart; a close then reopen starts a new run on the
-    CURRENT tip that finishes `rerun_after` seconds later with `rerun_result` (None: never). `sleep` moves the clock and finishes what is due."""
-
-    def __init__(self, number=12, repo="acme-org/widget-service", start=1_800_000_000):
-        self.number, self.repo, self.now = number, repo, start
-        self.tip, self.head, self.base, self.default, self.state, self.labels = MG_TIP, MG_HEAD, "main", "main", "OPEN", []
-        self.runs = [self.make_run(1, "ci", 10, "completed", "success", MG_TIP, start - 600)]
-        self.branch_runs = [{"id": 90, "name": "ci", "workflow_id": 10, "head_sha": MG_TIP, "conclusion": "success", "status": "completed", "created_at": mg_iso(start - 900)}]
-        self.jobs = {2: [{"name": "unit-tests", "conclusion": "failure"}, {"name": "lint", "conclusion": "success"}]}
-        self.reads, self.writes, self.broken = [], [], set()
-        self.rerun_after, self.rerun_result, self.reopen_fails, self.due = 60, "success", False, []
-
-    def clock(self):
-        return self.now
-
-    def sleep(self, seconds):
-        self.now += seconds
-        for run in list(self.due):
-            if self.now >= run["_due"]:
-                run.update(status="completed", conclusion=self.rerun_result)
-                self.due.remove(run)
-
-    def make_run(self, rid, name, workflow, status, conclusion, base, created):
-        return {"id": rid, "name": name, "workflow_id": workflow, "status": status, "conclusion": conclusion, "head_sha": self.head if hasattr(self, "head") else MG_HEAD,
-                "created_at": mg_iso(created), "pull_requests": [{"number": self.number, "base": {"sha": base, "ref": "main"}}]}
-
-    def __call__(self, argv):
-        if argv[0] == "api" and argv[1] == "-X":
-            self.writes.append(list(argv))
-            state = argv[-1].split("=", 1)[1]
-            if state == "closed":
-                self.state = "CLOSED"
-            elif self.reopen_fails:
-                return 1, "", "HTTP 502"
-            else:
-                self.state = "OPEN"
-                run = self.make_run(2, "ci", 10, "in_progress", None, self.tip, self.now)
-                run["_due"] = self.now + self.rerun_after
-                if self.rerun_result is not None:
-                    self.due.append(run)
-                self.runs = [run]
-            return 0, "{}", ""
-        self.reads.append(list(argv))
-        key = " ".join(argv)
-        if any(word in key for word in self.broken):
-            return 1, "", "HTTP 500 boom"
-        if argv[:2] == ["pr", "view"]:
-            return 0, json.dumps({"headRefOid": self.head, "baseRefName": self.base, "state": self.state, "isDraft": False, "labels": [{"name": n} for n in self.labels]}), ""
-        path = argv[1]
-        if path == "repos/%s" % self.repo:
-            return 0, json.dumps({"default_branch": self.default}), ""
-        if "/git/ref/heads/" in path:
-            return 0, json.dumps({"object": {"sha": self.tip}}), ""
-        if "event=pull_request" in path:
-            return 0, json.dumps({"workflow_runs": [{k: v for k, v in r.items() if k != "_due"} for r in self.runs]}), ""
-        if "event=push" in path:
-            return 0, json.dumps({"workflow_runs": self.branch_runs}), ""
-        found = re.search(r"/runs/(\d+)/jobs", path)
-        if found:
-            return 0, json.dumps({"jobs": self.jobs.get(int(found.group(1)), [])}), ""
-        return 1, "", "HTTP 404"
 
 
 class MergeGateBase(Base):
@@ -85018,7 +82152,6 @@ class TestBlockedReport(Base):
             self.block()
             self.wait(25)
         self.assertEqual(len(self.told("cos")), 1)
-
 
 
 # ---- the blocked report's guards, bounds, validator, lock and config key: one row and one mutant each, derived from the code

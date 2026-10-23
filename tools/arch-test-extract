@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""arch-test-extract: cut top-level statements out of the switchboard test file into support modules, byte for byte.
+
+    arch-test-extract --source bin/test-switchboard --plan PLAN.json --out-dir tests/switchboard/support [--package support] [--insert-after-line N] [--write]
+
+PLAN.json maps a support module name to the list of `name@line` entries to move (a top-level def, class or assignment; the line is
+where the statement starts, so a name defined twice is told apart). The comment lines directly above a statement move with it.
+The tool never edits a statement: it cuts the lines, writes them to the module (separated by two blank lines), gives each module
+the source's import block and an explicit `from support.<other> import name, ...` for every name it takes from another module
+(and `from support.paths import BIN, REPO`), and puts an explicit `from support.<module> import name, ...` for every moved name the
+remaining file still uses after line N. A moved statement that uses a name the remaining file keeps is an error (a support module
+never imports the test file). Without --write it only prints what it would move, with line counts.
+"""
+import argparse
+import ast
+import builtins
+import json
+import os
+import sys
+
+
+def defined(node):
+    if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+        return {node.name}
+    names = set()
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                names.add(target.id)
+            elif isinstance(target, (ast.Tuple, ast.List)):
+                names |= {e.id for e in target.elts if isinstance(e, ast.Name)}
+    return names
+
+
+def used(node):
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--source", required=True)
+    ap.add_argument("--plan", required=True)
+    ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--package", default="support")
+    ap.add_argument("--insert-after-line", type=int, required=True, help="the line after which the explicit imports go in the remaining file")
+    ap.add_argument("--write", action="store_true")
+    args = ap.parse_args(argv)
+    text = open(args.source, encoding="utf-8").read()
+    lines = text.split("\n")
+    tree = ast.parse(text)
+    plan = json.load(open(args.plan))
+    by_key = {}
+    for node in tree.body:
+        for name in defined(node):
+            by_key["%s@%d" % (name, node.lineno)] = node
+    home = {}      # name -> module
+    chunks = {}    # module -> [(first, last, node)]
+    for module, keys in plan.items():
+        for key in keys:
+            node = by_key.get(key)
+            if node is None:
+                sys.exit("no top-level statement %s" % key)
+            first = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+            while first > 1 and lines[first - 2].lstrip().startswith("#"):
+                first -= 1
+            if any(c[2] is node for c in chunks.get(module, [])):
+                continue   # a tuple assignment is named once per name
+            chunks.setdefault(module, []).append((first, node.end_lineno, node))
+            for name in defined(node):
+                home[name] = module
+    moved_nodes = {id(c[2]) for cs in chunks.values() for c in cs}
+    kept_defs = set()
+    for node in tree.body:
+        if id(node) not in moved_nodes:
+            kept_defs |= defined(node)
+    imports = [l for l in lines if l.startswith(("import ", "from ")) and not l.startswith("from support")][:60]
+    header = [ln for ln in lines[:args.insert_after_line] if ln.startswith(("import ", "from ")) and ln in imports]
+    problems, outputs = [], {}
+    for module, cs in chunks.items():
+        cs.sort()
+        need = {}
+        for _first, _last, node in cs:
+            for name in used(node):
+                if name in home and home[name] != module:
+                    need.setdefault(home[name], set()).add(name)
+                elif name in kept_defs and name not in home and name not in dir(builtins) and name not in ("BIN", "REPO"):
+                    problems.append("%s: %s uses %s, which the test file keeps" % (module, ",".join(sorted(defined(node))) or "?", name))
+        body = ["\n".join(lines[f - 1:l]) for f, l, _n in cs]
+        head = ["\n".join(header), "from %s.paths import BIN, REPO" % args.package]
+        for other in sorted(need):
+            head.append("from %s.%s import %s" % (args.package, other, ", ".join(sorted(need[other]))))
+        outputs[module] = '"""Shared fakes and helpers of bin/test-switchboard (moved text, unchanged): %s."""\n' % module + "\n".join(head) + "\n\n\n" + "\n\n\n".join(body) + "\n"
+        print("%-12s %5d lines moved, %d statements" % (module, sum(l - f + 1 for f, l, _n in cs), len(cs)))
+    if problems:
+        print("\n".join(sorted(set(problems))))
+        return 1
+    drop = set()
+    for cs in chunks.values():
+        for f, l, _n in cs:
+            drop.update(range(f - 1, l))
+    back = {}
+    for node in tree.body:
+        if id(node) in moved_nodes or node.lineno <= args.insert_after_line:
+            continue
+        for name in used(node) | {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}:
+            if name in home:
+                back.setdefault(home[name], set()).add(name)
+    # names used by kept statements that sit before the insert line (tests above it) are covered by the same import: it is placed before them
+    for node in tree.body:
+        if id(node) not in moved_nodes:
+            for name in used(node):
+                if name in home:
+                    back.setdefault(home[name], set()).add(name)
+    # explicit names, but not a `from support... import`: the hygiene test reads every top-level import of the test file as a third-party module
+    imp = ["import importlib", ""]
+    for m in sorted(back):
+        names = sorted(back[m])
+        imp.append("_support_%s = importlib.import_module(\"%s.%s\")   # support import" % (m, args.package, m))
+        imp.append(("%s = (%s)" % (", ".join(names), ", ".join("_support_%s.%s" % (m, n) for n in names)) if len(names) > 1 else "%s = _support_%s.%s" % (names[0], m, names[0])) + "   # support import")
+    kept = []
+    for i, ln in enumerate(lines):
+        if i in drop:
+            continue
+        kept.append(ln)
+        if i + 1 == args.insert_after_line:
+            kept += ["sys.path.insert(0, str(Path(__file__).resolve().parent.parent / \"tests\" / \"switchboard\"))   # support import", ""] + imp
+    cleaned = []
+    for ln in kept:
+        if ln == "" and len(cleaned) >= 2 and cleaned[-1] == "" and cleaned[-2] == "":
+            continue
+        cleaned.append(ln)
+    print("remaining file: %d lines (was %d)" % (len(cleaned), len(lines)))
+    if args.write:
+        os.makedirs(args.out_dir, exist_ok=True)
+        for module, content in outputs.items():
+            open(os.path.join(args.out_dir, module + ".py"), "w", encoding="utf-8").write(content)
+        open(args.source, "w", encoding="utf-8").write("\n".join(cleaned))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
