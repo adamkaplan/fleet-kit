@@ -1,0 +1,6 @@
+{
+ "admitted": "[switchboard] 1 for platform (sent 08:00Z, delivered 08:00Z): hello there\n- send from cos: hello there",
+ "code": 0,
+ "stderr": "fleet-switchboard: wake delivered to platform\n",
+ "stdout": "<id>"
+}
