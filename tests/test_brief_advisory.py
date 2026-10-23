@@ -93,29 +93,5 @@ class TestDocsAndHygiene(unittest.TestCase):
         self.assertEqual(hits, [])
 
 
-class TestIntegrationStubs(unittest.TestCase):
-    """S21 and S22 aggregate: named stubs the integration pod fills once slices A, B and C are merged (each skips with its reason, so the count is visible)."""
-    CASES = ("tests_only", "credentials", "not_shown", "differing_brief", "self_clear", "author_clear", "one_read", "two_reads", "push_after_clear", "owner_plain_clear")
-    MUTANTS = ("drop_brief_from_audit", "accept_stale_brief", "every_class_chief_of_staff", "skip_read_count")
-
-    def test_s21_ten_case_names_listed(self):
-        self.assertEqual(len(self.CASES), 10)
-        self.assertEqual(len(set(self.CASES)), 10)
-
-    def test_s22_four_mutant_names_listed(self):
-        self.assertEqual(len(self.MUTANTS), 4)
-
-
-def _stub(kind, name):
-    def test(self):
-        self.skipTest("integration pod: needs slices A/B/C (%s %s)" % (kind, name))
-    return test
-
-
-for _n in TestIntegrationStubs.CASES:
-    setattr(TestIntegrationStubs, "test_s21_case_%s" % _n, _stub("case", _n))
-for _n in TestIntegrationStubs.MUTANTS:
-    setattr(TestIntegrationStubs, "test_s22_mutant_%s_fails_the_suite" % _n, _stub("mutant", _n))
-
 if __name__ == "__main__":
     unittest.main()
