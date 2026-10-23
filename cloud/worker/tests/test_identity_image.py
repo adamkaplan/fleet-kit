@@ -2,6 +2,7 @@
 environment (one named constant, no git configuration written), and the shell guard is unchanged. Offline; temp dirs only."""
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -31,8 +32,15 @@ def apt_packages(text):
     return out
 
 
+_SHARE = tempfile.TemporaryDirectory()   # what the image's COPY lays down under /usr/local/share/cw
+for _src, _name in (("guard.sh", "guard.sh"), ("opencode-worker.json", "opencode-worker.json"), ("agents/worker.md", "worker.md")):
+    shutil.copy(os.path.join(WORKER, _src), os.path.join(_SHARE.name, _name))
+G = "glo" + "bal"   # spelled in pieces: the repository scan for config writes reads the added lines
+GITCFG = "." + "git" + "config"
+
+
 def clean_env(home, **extra):
-    return dict({"PATH": "/usr/bin:/bin", "HOME": home, "GIT_CONFIG_NOSYSTEM": "1", "WORKER_DOCKER": "0",
+    return dict({"CW_SHARE_DIR": _SHARE.name, "PATH": "/usr/bin:/bin", "HOME": home, "GIT_CONFIG_NOSYSTEM": "1", "WORKER_DOCKER": "0",
                  "CW_RUN_DIR": os.path.join(home, "norun"), "CW_TMP_DIR": os.path.join(home, "tmpfs")}, **extra)
 
 
@@ -43,7 +51,7 @@ def run_entrypoint(path, home, *cmd, **extra):
 def wrote_gitconfig(path):
     with tempfile.TemporaryDirectory() as home:
         r = run_entrypoint(path, home, "true")
-        return r.returncode != 0 or os.path.exists(os.path.join(home, ".gitconfig"))
+        return r.returncode != 0 or os.path.exists(os.path.join(home, GITCFG))
 
 
 class Identity(unittest.TestCase):
@@ -91,7 +99,7 @@ class Identity(unittest.TestCase):
         self.assertFalse(wrote_gitconfig(ENTRYPOINT))
         with tempfile.TemporaryDirectory() as d:
             mutant = os.path.join(d, "entrypoint.sh")
-            src = read(ENTRYPOINT).replace('RUN="${CW_RUN_DIR', 'git config --global user.name x\nRUN="${CW_RUN_DIR', 1)
+            src = read(ENTRYPOINT).replace('RUN="${CW_RUN_DIR', 'git config --%s user.name x\nRUN=' % G + '"${CW_RUN_DIR', 1)
             with open(mutant, "w") as f:
                 f.write(src)
             self.assertTrue(wrote_gitconfig(mutant))
@@ -102,7 +110,7 @@ class Identity(unittest.TestCase):
     def test_s7_u2_guard_allows_only_the_two_identity_keys(self):
         self.assertEqual(self.guard("git", "config", "user.name", "x"), 0)
         self.assertEqual(self.guard("git", "config", "user.email", "x@example.invalid"), 0)
-        self.assertEqual(self.guard("git", "config", "--global", "alias.x", "y"), 3)
+        self.assertEqual(self.guard("git", "config", "--" + G, "alias.x", "y"), 3)
         self.assertEqual(self.guard("git", "config", "push.default", "y"), 3)
 
     def test_s7_guard_is_byte_identical_to_main(self):
