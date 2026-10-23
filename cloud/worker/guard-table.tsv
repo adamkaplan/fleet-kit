@@ -13,7 +13,7 @@ api-jq-filter	allowed	gh	GET	repos/OWNER/NAME/issues/N/comments --jq|-q		api rep
 api-jq-filter-short	allowed	gh	GET	repos/OWNER/NAME/issues/N/comments -q		api repos/acme-org/widget-service/issues/7/comments -q .[0].body
 issues-other-path	denied	gh	GET	repos/OWNER/NAME/issues/N	not in the table: issues paths other than N/comments	api repos/acme-org/widget-service/issues/7
 issues-labels-path	denied	gh	GET	repos/OWNER/NAME/issues/N/labels	not in the table: issues paths other than N/comments	api repos/acme-org/widget-service/issues/7/labels
-issues-write-post	denied	gh	POST	repos/OWNER/NAME/issues/N/comments	writing issues	api -X POST repos/acme-org/widget-service/issues/7/comments
+issues-write-post	denied	gh	POST	repos/OWNER/NAME/issues/N	writing issues	api -X POST repos/acme-org/widget-service/issues/7
 issues-write-patch	denied	gh	PATCH	repos/OWNER/NAME/issues/N	writing issues	api -X PATCH repos/acme-org/widget-service/issues/7
 issues-write-delete	denied	gh	DELETE	repos/OWNER/NAME/issues/N/comments	writing issues	api -X DELETE repos/acme-org/widget-service/issues/7/comments
 pull-merge	denied	gh	PUT	repos/OWNER/NAME/pulls/N/merge	merging a pull request	api -X PUT repos/acme-org/widget-service/pulls/7/merge
@@ -23,4 +23,22 @@ api-write-flags-F	denied	gh	GET	-F	api write flag	api repos/acme-org/widget-serv
 api-write-flags-input	denied	gh	GET	--input	api write flag	api repos/acme-org/widget-service/issues/7/comments --input f
 api-write-flags-graphql	denied	gh	GET	graphql	api write flag	api graphql
 # ---- ask 1166 rows: add below this line ----
+issue-comment-create	allowed	gh	issue comment (create)			issue comment 7 --body hello -R acme-org/widget-service
+issue-comment-create-api	allowed	gh	POST	repos/OWNER/NAME/issues/N/comments		api -X POST repos/acme-org/widget-service/issues/7/comments
+issue-comment-create-api-method	allowed	gh	POST	repos/OWNER/NAME/issues/N/comments --method		api --method POST repos/acme-org/widget-service/issues/7/comments
+issue-edit	denied	gh	issue edit		writing issues	issue edit 7 -R acme-org/widget-service
+issue-create	denied	gh	issue create		writing issues	issue create 7 -R acme-org/widget-service
+issue-close	denied	gh	issue close		writing issues	issue close 7 -R acme-org/widget-service
+issue-reopen	denied	gh	issue reopen		writing issues	issue reopen 7 -R acme-org/widget-service
+issue-lock	denied	gh	issue lock		writing issues	issue lock 7 -R acme-org/widget-service
+issue-unlock	denied	gh	issue unlock		writing issues	issue unlock 7 -R acme-org/widget-service
+issue-delete	denied	gh	issue delete		writing issues	issue delete 7 -R acme-org/widget-service
+issue-transfer	denied	gh	issue transfer		writing issues	issue transfer 7 -R acme-org/widget-service
+issue-pin	denied	gh	issue pin		writing issues	issue pin 7 -R acme-org/widget-service
+issue-labels	denied	gh	issue edit --add-label		writing issues	issue edit 7 --add-label bug -R acme-org/widget-service
+issue-assignees	denied	gh	issue edit --add-assignee		writing issues	issue edit 7 --add-assignee alice -R acme-org/widget-service
+comment-patch	denied	gh	PATCH	repos/OWNER/NAME/issues/comments/ID	writing issues	api -X PATCH repos/acme-org/widget-service/issues/comments/5
+comment-delete	denied	gh	DELETE	repos/OWNER/NAME/issues/comments/ID	writing issues	api -X DELETE repos/acme-org/widget-service/issues/comments/5
+api-method-flag	denied	gh	PUT -X|--method	repos/OWNER/NAME/issues/N/comments	writing issues	api --method PUT repos/acme-org/widget-service/issues/7/comments
+api-write-other	denied	gh	POST	repos/OWNER/NAME/labels	writing labels	api -X POST repos/acme-org/widget-service/labels
 # ---- ask 1200 rows: add below this line ----

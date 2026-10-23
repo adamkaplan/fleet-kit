@@ -20,8 +20,6 @@
       "gh * issue edit*": "deny",
       "gh issue close*": "deny",
       "gh * issue close*": "deny",
-      "gh issue comment*": "deny",
-      "gh * issue comment*": "deny",
       "gh issue reopen*": "deny",
       "gh * issue reopen*": "deny",
       "gh issue delete*": "deny",
@@ -120,7 +118,11 @@
       "gh api*--raw-field*": "deny",
       "gh api*--input*": "deny",
       "gh api*graphql*": "deny",
-      "gh api*mutation*": "deny"
+      "gh api*mutation*": "deny",
+      "gh issue comment*": "allow",
+      "gh * issue comment*": "allow",
+      "gh api -X POST repos/*/issues/*/comments": "allow",
+      "gh api --method POST repos/*/issues/*/comments": "allow"
     }
   },
   "agent": {
@@ -146,8 +148,6 @@
           "gh * issue edit*": "deny",
           "gh issue close*": "deny",
           "gh * issue close*": "deny",
-          "gh issue comment*": "deny",
-          "gh * issue comment*": "deny",
           "gh issue reopen*": "deny",
           "gh * issue reopen*": "deny",
           "gh issue delete*": "deny",
@@ -246,7 +246,11 @@
           "gh api*--raw-field*": "deny",
           "gh api*--input*": "deny",
           "gh api*graphql*": "deny",
-          "gh api*mutation*": "deny"
+          "gh api*mutation*": "deny",
+          "gh issue comment*": "allow",
+          "gh * issue comment*": "allow",
+          "gh api -X POST repos/*/issues/*/comments": "allow",
+          "gh api --method POST repos/*/issues/*/comments": "allow"
         }
       }
     }

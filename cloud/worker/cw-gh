@@ -286,6 +286,18 @@ def pr_comment(args):
     print(out.get("html_url", ""))
 
 
+def issue_comment(args):
+    """ask 1166: the ONE issue write: a new comment (guard-table.tsv: issue-comment-create). Same request as pr comment."""
+    opts, pos = parse(args, dict(COMMON, **{"--body": ("body", True), "-b": ("body", True), "--body-file": ("body_file", True),
+                                            "-F": ("body_file", True)}))
+    repo = repo_of(opts)
+    body = body_of(opts)
+    if not body:
+        raise Fail("issue comment needs --body or --body-file (this client never prompts)", 2)
+    out = parse_json(request("POST", "/repos/%s/issues/%d/comments" % (repo, number_of(repo, pos)), {"body": body}))
+    print(out.get("html_url", "") if isinstance(out, dict) else "")
+
+
 def pr_checks(args):
     opts, pos = parse(args, COMMON)
     repo = repo_of(opts)
@@ -524,9 +536,13 @@ def api_get(args):
                                 "--jq": ("jq", True), "-q": ("jq", True)})
     if len(pos) != 1:
         raise Fail("api takes exactly one endpoint", 2)
-    if str(opts.get("method", "GET")).upper() != "GET":
-        raise Fail("api is read-only in this pod: GET only", 2)
     p = pos[0]
+    m = str(opts.get("method", "GET")).upper()
+    if m == "POST" and API_ISSUE_COMMENTS.fullmatch(p.strip("/")) and "://" not in p:   # ask 1166: the one api write (issue-comment-create-api)
+        request("POST", "/" + p.strip("/"), {})
+        return
+    if m != "GET":
+        raise Fail("api is read-only in this pod: GET only (the one write is a POST of a comment to issues/N/comments)", 2)
     if "://" in p or "%" in p or ".." in p or ":" in p or "#" in p:
         raise Fail("an endpoint it cannot read: give a path such as repos/OWNER/NAME/pulls/1", 2)
     path = "/" + p.lstrip("/")
@@ -549,7 +565,7 @@ VERBS = {
     ("pr", "create"): pr_create, ("pr", "view"): pr_view, ("pr", "list"): pr_list, ("pr", "comment"): pr_comment,
     ("pr", "checks"): pr_checks, ("pr", "diff"): pr_diff, ("pr", "ready"): pr_ready,
     ("repo", "view"): repo_view,
-    ("issue", "view"): issue_view, ("issue", "list"): issue_list,
+    ("issue", "view"): issue_view, ("issue", "comment"): issue_comment, ("issue", "list"): issue_list,
     ("run", "view"): run_view, ("run", "list"): run_list, ("run", "logs"): run_logs,
     ("api", ""): api_get,
 }

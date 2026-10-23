@@ -251,6 +251,8 @@ api_check() {   # gh api ...: $@ are the words after `api`
     repos/*/pulls/*/merge|repos/*/merges) refuse "merging a pull request" ;;
   esac
   [ "$m" = GET ] && return 0
+  # ask 1166: the ONE issue write: a POST (no body option) of a comment to repos/OWNER/NAME/issues/N/comments (guard-table.tsv: issue-comment-create-api)
+  if [ "$m" = POST ] && [ "$body" = 0 ] && printf '%s' "$p" | grep -Eq '^repos/[^/]+/[^/]+/issues/[0-9]+/comments$'; then return 0; fi
   case "$p" in
     repos/*/pulls/*/reviews|repos/*/pulls/*/reviews/*) refuse "approving or dismissing a pull request review" ;;
     repos/*/issues/*|repos/*/issues) refuse "writing issues" ;;
@@ -287,7 +289,7 @@ do_gh() {
     "pr merge") refuse "merging a pull request" ;;
     "pr review") refuse "approving or dismissing a pull request review" ;;
     "pr edit") for a in "$@"; do case "$a" in --add-label|--add-label=*|--remove-label|--remove-label=*) refuse "writing labels" ;; --add-assignee|--add-assignee=*|--remove-assignee|--remove-assignee=*) refuse "writing assignees" ;; esac; done ;;
-    "issue create"|"issue edit"|"issue close"|"issue comment"|"issue reopen"|"issue delete"|"issue lock"|"issue unlock"|"issue pin"|"issue unpin"|"issue transfer")
+    "issue create"|"issue edit"|"issue close"|"issue reopen"|"issue delete"|"issue lock"|"issue unlock"|"issue pin"|"issue unpin"|"issue transfer")
       refuse "writing issues" ;;
     "label create"|"label edit"|"label delete"|"label clone") refuse "writing labels" ;;
     "workflow run"|"workflow enable"|"workflow disable"|"release create"|"release edit"|"release delete"|"release upload"|"run rerun"|"run cancel")

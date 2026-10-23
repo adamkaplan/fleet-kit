@@ -129,6 +129,7 @@ CALLS = {
     ("pr", "diff"): (["pr", "diff", "9", "-R", REPO, "--name-only"], ("GET", "/repos/%s/pulls/9/files?per_page=100" % REPO), "a.py"),
     ("pr", "ready"): (["pr", "ready", "9", "-R", REPO], ("GET", "/repos/%s/pulls/9" % REPO), "ready for review"),
     ("repo", "view"): (["repo", "view", REPO], ("GET", "/repos/%s" % REPO), "default branch:\tmain"),
+    ("issue", "comment"): (["issue", "comment", "9", "-R", REPO, "--body", "hello"], ("POST", "/repos/%s/issues/9/comments" % REPO), "https://x/pull/9#c1"),   # ask 1166
     ("issue", "view"): (["issue", "view", "3", "-R", REPO], ("GET", "/repos/%s/issues/3" % REPO), "title:\ti"),
     ("issue", "list"): (["issue", "list", "-R", REPO], ("GET", "/repos/%s/issues?state=open&per_page=100" % REPO), "3\ti\topen"),
     ("run", "view"): (["run", "view", "5", "-R", REPO], ("GET", "/repos/%s/actions/runs/5" % REPO), "job\tlint\tcompleted\tfailure"),
@@ -138,7 +139,7 @@ CALLS = {
 }
 
 
-REFUSED = [["issue", "comment", "3", "-b", "x"], ["issue", "create"], ["issue", "edit", "3"], ["issue", "close", "3"], ["pr", "merge", "9"],
+REFUSED = [["issue", "create"], ["issue", "edit", "3"], ["issue", "close", "3"], ["pr", "merge", "9"],
            ["pr", "review", "9"], ["pr", "edit", "9"], ["pr", "close", "9"], ["label", "list"], ["release", "create"], ["workflow", "run"],
            ["extension", "install", "x"], ["alias", "set", "a", "b"], ["auth", "status"], ["repo", "edit"], ["secret", "set", "X"],
            ["run", "rerun", "5"], ["config", "get", "x"], ["pr", "reopen", "9"], ["pr", "update-branch", "9"], ["repo", "clone", "x"]]

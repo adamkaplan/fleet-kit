@@ -38,13 +38,13 @@ API = "https://api.github.com"
 MAX_TOKEN_SECONDS = 61 * 60
 MAX_BYTES = 1_000_000  # the most of any GitHub answer or vault command output that is read
 # THE table of the cloud token's permissions: the request body, the exact check, the refusal text, the preflight's
-# "token permissions" line and the documents all derive from it. issues: read lets the worker read its ask and plan
-# (and their comments); nothing here is a write to an issue. shims/app_mint.py (the Mac shim) keeps its own, different set.
-EXPECTED_PERMISSIONS = {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"}
+# "token permissions" line and the documents all derive from it. issues: write lets the worker read its ask and plan and write one comment
+# (the guard table, cloud/worker/guard-table.tsv, denies every other issue write). shims/app_mint.py (the Mac shim) keeps its own, different set.
+EXPECTED_PERMISSIONS = {"contents": "write", "pull_requests": "write", "issues": "write", "metadata": "read"}
 
 
 def render_permissions(perms=None):
-    """The table as text: `contents: write, pull_requests: write, issues: read, metadata: read`."""
+    """The table as text: `contents: write, pull_requests: write, issues: write, metadata: read`."""
     return ", ".join("%s: %s" % kv for kv in (EXPECTED_PERMISSIONS if perms is None else perms).items())
 
 
