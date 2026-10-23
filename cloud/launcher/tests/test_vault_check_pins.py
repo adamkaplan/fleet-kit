@@ -27,9 +27,9 @@ def mutant(old, new):
 
 class Pins(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="vcpin-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="vcpin-", dir=os.path.realpath(tempfile.gettempdir()))
         self.addCleanup(self.tmp.cleanup)
-        self.root = os.path.join(self.tmp.name, "checkout")
+        self.root = os.path.join(os.path.realpath(self.tmp.name), "checkout")
         os.makedirs(os.path.join(self.root, "scripts", "v2"), mode=0o700)
         self.put(os.path.join("scripts", "v2", "cw_vault_firewall.py"), "")
         for d in (self.tmp.name, self.root, os.path.join(self.root, "scripts"), os.path.join(self.root, "scripts", "v2")):
