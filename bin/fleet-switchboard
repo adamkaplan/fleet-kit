@@ -8399,11 +8399,157 @@ def restore_headless_record(engine, state, name, entry):
     return "%s: its headless record was restored: it is watched again" % name, True
 
 
+def headless_target(engine, discovery, name):
+    """(session, boss, live) of a HEADLESS worker `retire --close` may judge: a live record (discovery shows it headless) or the retirement's headless entry
+    (`retired.json`: session, url, created; the worker is no longer discovered). None when `name` is neither. The boss of a retired worker is read from
+    the stored session metadata (with the boss record applied), as `reattach` reads a dead worker's."""
+    seen = discovery.agents.get(name)
+    if seen is not None:
+        return (seen.session_id, boss_name(discovery, seen), True) if seen.headless and seen.session_id else None
+    entry = (load_module("registry").read(engine.state_dir)["retired"] or {}).get(name)   # the registry's own read (a read that is not whole lists nobody: nothing is judged)
+    kept = entry.get("headless") if isinstance(entry, dict) else None
+    if not isinstance(kept, dict) or not isinstance(kept.get("session"), str):
+        return None
+    sid = entry.get("session") or kept["session"]
+    boss = None
+    try:
+        stored = _fleet_meta(engine.v2.session_get(sid)) or {}
+        stored = load_module("reassign").overlay(engine.state_dir, stored, sid) if stored else stored
+        boss = resolve_boss(discovery, stored.get("reports_to")) if stored.get("reports_to") else None
+    except Exception:
+        boss = None
+    return sid, boss, False
+
+
+def _session_is_gone(engine, sid):
+    """True when the service says the session no longer exists (404); False when it is there; raises for any other answer (the caller fails closed)."""
+    try:
+        engine.v2.session_get(sid)
+        return False
+    except V2Error as err:
+        if err.reason == "http" and err.status == 404:
+            return True
+        raise
+
+
+def headless_close_problem(engine, runner, now, discovery, name, target, force, bulk=False):
+    """(session, None) when `retire --close` may end the headless session of `name` now, ("ended", None) when it is already gone, else (None, why not).
+    Who: as the pane close (the operator, the agent's recorded boss, the Chief of Staff for a direct report; never the caller's own session).
+    What: no turn in progress and no activity within `retire_idle_minutes` (unless --force; the bulk mode never forces), and never while a registered
+    worktree of the worker holds uncommitted or unpushed work (also with --force). Every unreadable fact is a refusal."""
+    sid, boss, _ = target
+    try:
+        info = engine.v2.session_get(sid)
+    except V2Error as err:
+        if err.reason == "http" and err.status == 404:
+            return "ended", None   # already gone: nothing to judge, nothing to change
+        return None, "session %s cannot be read now (%s): nothing was ended" % (sid, _one_line(str(err), 80))
+    except Exception as err:
+        return None, "session %s cannot be read now (%s): nothing was ended" % (sid, _one_line(str(err), 80))
+    kind = gates_caller_kind(runner, now)
+    if kind[0] == "person":
+        who = "the operator"
+    elif kind[0] == "agent":
+        who = kind[1]
+        if who == name:
+            return None, "an agent cannot end its own session"
+        if boss is None or boss != who:
+            return None, "%s may not end %s's session: only the operator, or the agent's own boss (the Chief of Staff for a direct report), may" % (who, name)
+    else:
+        return None, "%s: only the operator or the agent's own boss may end a session" % kind[1]
+    if not force:
+        try:
+            active = engine.v2.session_active()
+        except Exception as err:
+            return None, "the service cannot say whether %s has a turn in progress (%s): nothing was ended" % (name, _one_line(str(err), 80))
+        if not isinstance(active, dict):
+            return None, "the service cannot say whether %s has a turn in progress: nothing was ended" % name
+        if sid in active:
+            return None, "%s has a turn in progress: pass --force to end it anyway" % name
+        window = engine.config.get("retire_idle_minutes")
+        times = info.get("time") if isinstance(info, dict) and isinstance(info.get("time"), dict) else {}
+        last = max([t for t in (_seconds(times.get("updated")), _seconds(times.get("idle")), _seconds(times.get("created"))) if t is not None] or [None], key=lambda t: -1 if t is None else t)
+        if not retire_idle_window_ok(window) or last is None or not math.isfinite(last):
+            return None, "the last activity of %s cannot be read: nothing was ended" % name
+        if now() - last < window * 60:
+            return None, "%s had activity %s ago (within retire_idle_minutes, %s): pass --force to end it anyway" % (name, _idle_span_text(now() - last), window)
+    for path, entry in sorted(read_worktrees(engine.state_dir).items()):
+        if isinstance(entry, dict) and entry.get("agent") == name:
+            facts = worktree_facts(runner, path)
+            if facts["exists"] and (facts["why"] or facts["dirty"] or facts["pushed"] is False):
+                return None, "%s holds uncommitted or unpushed work in %s: --force does not override it, nothing was ended" % (name, path)
+    return sid, None
+
+
+def end_headless_session(engine, runner, now, name, sid, caller, reason="retire --close"):
+    """End the session through the service's own session removal, audit one `headless.closed` line. (line, ok)."""
+    try:
+        with engine._external("headless.session.remove", name, {"session": sid}):
+            engine.v2.session_remove(sid)
+    except V2Error as err:
+        if not (err.reason == "http" and err.status == 404):
+            return "%s: its session %s was NOT ended (%s)" % (name, sid, _one_line(str(err), 100)), False
+    except Exception as err:
+        return "%s: its session %s was NOT ended (%s)" % (name, sid, _one_line(str(err), 100)), False
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "headless.closed", name, {"by": caller, "session": sid, "reason": reason})
+    return "ended the session %s of %s in the service: its memory is released" % (sid, name), True
+
+
+def retire_close_all_retired(engine, runner, now, confirm):
+    """`retire --close --all-retired`: PREVIEW first. Judges every retired headless worker whose session is still in the service by the same rule as one
+    call (never forced) and lists what it would end and what it skips with the reason; ends nothing unless `confirm`."""
+    try:
+        discovery = engine.discover(engine.now())
+        reg = load_module("registry").read(engine.state_dir)
+        if not reg["whole"]:
+            raise RuntimeError(reg["problem"] or "not whole")
+        retired = reg["retired"]
+    except Exception as err:
+        raise LaunchError("the registry cannot be read (%s): nothing was ended" % _one_line(str(err), 100))
+    would, skipped, gone = [], [], 0
+    for name in sorted(retired):
+        target = headless_target(engine, discovery, name)
+        if target is None:
+            continue
+        sid, why = headless_close_problem(engine, runner, now, discovery, name, target, False, bulk=True)
+        if why:
+            skipped.append((name, why))
+        elif sid == "ended":
+            gone += 1
+        else:
+            would.append((name, sid))
+    caller = identify_who(engine, runner, now)
+    ended = 0
+    for name, sid in would:
+        if not confirm:
+            print("would end: %s (session %s)" % (name, sid))
+            continue
+        line, ok = end_headless_session(engine, runner, now, name, sid, caller, "retire --close --all-retired")
+        print(line)
+        if ok:
+            ended += 1
+        else:
+            skipped.append((name, "the service did not end it"))
+    for name, why in skipped:
+        print("skipped: %s: %s" % (name, why))
+    if confirm:
+        print("ended %d, skipped %d, already ended %d" % (ended, len(skipped), gone))
+    else:
+        print("preview: %d would be ended, %d skipped, %d already ended (nothing was ended: run again with --confirm)" % (len(would), len(skipped), gone))
+    return EXIT_OK
+
+
 def cmd_retire(args, runner, now):
     """`retire <name> [--reason TEXT]` / `retire --undo <name>`: a finished worker is RETIRED: the daemon stops reporting it DEAD or DETACHED, `reattach
     --all-detached` skips it, and it is shown once in `status` as retired (dropped after RETIRED_SHOW_DAYS). Nothing is deleted and no tab is closed, unless
     `--close` is given: then the agent's terminal PANE is closed too (see `retire_close_problem`). The caller rule is `reattach`'s: the operator, the
     Chief of Staff or the agent's own boss; others are refused and audited."""
+    if getattr(args, "all_retired", False):
+        if not getattr(args, "close", False) or args.name or args.undo:
+            raise LaunchError("--all-retired goes with --close alone, and takes no name: `%s retire --close --all-retired [--confirm]`" % PROG)
+        engine, state, _ = build_engine(runner, now, "cli")
+        return retire_close_all_retired(engine, runner, now, getattr(args, "confirm", False))
     remote = run_cloud("route", args.name)   # a cloud worker has an endpoint record (#371)
     if remote is not None:
         return run_cloud("cmd_retire", args, runner, now, remote)
@@ -8412,8 +8558,24 @@ def cmd_retire(args, runner, now):
     if not NAME_RE.match(name or ""):
         raise LaunchError("name the agent: `%s retire <name>`" % PROG)
     discovery = engine.discover(engine.now())
+    close_headless = None
+    if getattr(args, "close", False) and not args.undo:
+        close_headless = headless_target(engine, discovery, name)
+        if close_headless is not None and not close_headless[2]:   # already retired: judged from the retirement record, ended after the fact
+            sid, why = headless_close_problem(engine, runner, now, discovery, name, close_headless, getattr(args, "force", False))
+            caller = identify_who(engine, runner, now)
+            if why:
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "headless.close_refused", name, {"session": close_headless[0], "by": caller, "why": _one_line(why, 160)})
+                raise LaunchError("refused: %s" % why)
+            if sid == "ended":
+                print("%s: already ended: its session %s is no longer in the service, nothing was changed" % (name, close_headless[0]))
+                return EXIT_OK
+            line, ok = end_headless_session(engine, runner, now, name, sid, caller)
+            print(line)
+            return EXIT_OK if ok else 1
     hint = ((registry_retired(state).get(name) or {}).get("session") if args.undo else None)   # a retired headless worker is not discovered: its boss is found from its stored session
-    who = reattach_caller_problem(engine, runner, now, discovery, name, hint, lost_headless=not args.undo)
+    who = None if close_headless is not None else reattach_caller_problem(engine, runner, now, discovery, name, hint, lost_headless=not args.undo)   # a headless close is judged by its own, narrower rule
     if who:
         if engine.audit is not None:
             engine.audit.append(engine.actor, "fleetpane.retire_refused", name, {"why": _one_line(who, 160)})
@@ -8421,9 +8583,14 @@ def cmd_retire(args, runner, now):
     reason = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", args.reason or "").split())[:200]
     seen = discovery.agents.get(name)
     known = known_agent(state, name)   # a pruned retired agent is still known
-    close_pane, close_by, close_note, headless_kept = None, None, None, None
+    close_pane, close_by, close_note, headless_kept, headless_sid = None, None, None, None, None
     if getattr(args, "close", False) and not args.undo and seen is not None and seen.headless:
-        close_note = "headless: it has no terminal, so there is nothing to close"
+        headless_sid, why = headless_close_problem(engine, runner, now, discovery, name, close_headless, getattr(args, "force", False))
+        close_by = identify_who(engine, runner, now)
+        if why:
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "headless.close_refused", name, {"session": close_headless[0], "by": close_by, "why": _one_line(why, 160)})
+            raise LaunchError("refused: %s (nothing was retired or ended)" % why)
     elif getattr(args, "close", False) and not args.undo:
         if seen is not None:
             adopt_before_close(engine, runner, now, name)   # #838: a retired worker with no live boss is adopted by its heir first, so the ordinary boss rule judges the close
@@ -8495,7 +8662,13 @@ def cmd_retire(args, runner, now):
         engine.audit.append(engine.actor, "fleetpane.retired", name, {"auto": False, "reason": retired[name]["reason"], "by": retired[name]["by"]})
     if headless_kept is not None:
         print(free_headless_record(engine, state, name))
-    if close_note is not None:
+    if headless_sid is not None:
+        if headless_sid == "ended":
+            line, ok = "its session is already ended", True
+        else:
+            line, ok = end_headless_session(engine, runner, now, name, headless_sid, close_by)
+        print("%s is retired: %s (`%s retire --undo %s` puts the record back)" % (name, line, PROG, name))
+    elif close_note is not None:
         print("%s is retired: not watched, not reattached by --all-detached; %s. Its session keeps running in the service until it finishes or is interrupted (`%s retire --undo %s` reverses the retirement)" % (name, close_note, PROG, name))
     elif close_pane is not None:
         line, _ = retire_close_pane(engine, runner, now, name, close_pane, close_by, getattr(args, "force", False))
@@ -9201,11 +9374,13 @@ def add_close_pane_parsers(sub):
 
 def add_retire_parsers(sub):
     retire = sub.add_parser("retire", help="Mark a finished worker RETIRED (not watched, not reattached); `--undo` reverses. Nothing is deleted or closed")
-    retire.add_argument("name", help="The agent's fleet name")
+    retire.add_argument("name", nargs="?", help="The agent's fleet name")
     retire.add_argument("--reason", help="Why (one line)")
     retire.add_argument("--undo", action="store_true", help="Watch it again")
     retire.add_argument("--close", action="store_true", help="Also close the agent's terminal pane (frees its memory): only its boss, the Chief of Staff for a direct report, or the operator; "
                                                              "the pane is read again and must still hold the agent's own session; never your own pane")
+    retire.add_argument("--all-retired", action="store_true", help="With --close: PREVIEW the retired headless workers whose session still runs in the service and could be ended (nothing is ended without --confirm)")
+    retire.add_argument("--confirm", action="store_true", help="With --close --all-retired: end the sessions the preview lists")
     retire.add_argument("--force", action="store_true", help="With --close: close a pane that is still working (refused for a worker with unpushed or uncommitted work in a registered worktree)")
 
 
