@@ -363,6 +363,51 @@ def refusals(rule, report, files, matches=None, closure=None, scored=None):
     return sorted(set(reasons)) if tidy else reasons
 
 
+# ---- #1215 slice C: the brief-bound clear. The ceiling follows the SUBSTANCE (the brief), the backstops stay (PC-2)
+
+SUBSTANCE_LIFTED = ("class", "review", "machinery", "new-file", "closure")   # the refusal kinds of `refusal_items` that are a class or path ceiling: the brief replaces them. `rating`, `unreadable` stay.
+MATERIAL_RISKS = ("credentials_widened", "issuance_widened", "spend", "irreversible", "speaks_for_owner", "authority_widened")   # the brief contract's fixed list
+
+
+def brief_hash(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest() if isinstance(text, str) else None
+
+
+def brief_refusals(floor_brief, brief_digest, brief_text, reasons):
+    """[why refused] for the brief a Chief of Staff clear carries, against `floor_brief` (what the floor builds at the CURRENT head, or None when it cannot). Nothing is lifted here: the caller
+    only drops the class and path ceilings when this returns []. The brief is compared by its digest; the decider is advice the floor computed from the diff (owner: escalate)."""
+    if not brief_digest or not brief_text:
+        return ["no brief: a clear by the Chief of Staff carries the brief the floor printed (--brief-digest and --brief-text); nothing was written"]
+    if not isinstance(reasons, str) or not reasons.strip():
+        return ["no reasons: a clear by the Chief of Staff carries its reasons"]
+    if not isinstance(floor_brief, dict) or not floor_brief.get("digest"):
+        return ["the floor's brief cannot be built at this head: refused, not shown is never fine"]
+    out = []
+    if brief_hash(brief_text) != brief_digest:
+        out.append("the brief text does not match its digest (%s, not %s)" % (str(brief_hash(brief_text))[:8], str(brief_digest)[:8]))
+    if brief_digest != floor_brief["digest"] or brief_text != floor_brief.get("text"):
+        out.append("the brief differs from what the floor prints at this head (%s, not %s): read the new brief" % (str(floor_brief["digest"])[:8], str(brief_digest)[:8]))
+    if out:
+        return out
+    material = floor_brief.get("material") or []
+    if floor_brief.get("decider") != "chief_of_staff" or material:
+        return ["escalate to the owner: the brief recommends the owner (%s)" % (", ".join(material) or floor_brief.get("why") or "a piece is not shown")]
+    return []
+
+
+def substance_refusals(rule, report, files, matches, closure, scored, floor_brief, brief_digest, brief_text, reasons):
+    """[reasons] for a clear carrying a brief: `brief_refusals`, then `refusal_items` WITHOUT the class and path ceilings. The read count stays: without a score (the two independent
+    runs of `judge`) a machinery path is still refused, so the ceiling is the brief and the backstops are untouched."""
+    found = brief_refusals(floor_brief, brief_digest, brief_text, reasons)
+    if found:
+        return found
+    items, _ = refusal_items(rule, report, files, matches, closure, scored)
+    kept = [i["text"] for i in items if i["kind"] not in SUBSTANCE_LIFTED]
+    if scored is None and any(i["kind"] in ("machinery", "new-file", "closure") for i in items):
+        kept.append("a change to the clear or hold machinery needs 2 independent reads at this head (2 required): none were scored")
+    return sorted(set(kept))
+
+
 # ---- one read of a changed daemon file's blobs (#946): the clear and the line the daemon posts read through the SAME cache
 
 MAP_CACHE = {}

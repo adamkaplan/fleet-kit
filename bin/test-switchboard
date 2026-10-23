@@ -40160,6 +40160,9 @@ class TestImpactHold(LedgerBase):
         patcher = mock.patch.object(sb, "impact_carry_get", lambda engine, runner, repo: (lambda path: (listing if "page=1" in path else []) if "/files" in path else {"merge_base_commit": {"sha": "m" * 40}} if "/compare/" in path else {"head": {"sha": self.pr["headRefOid"]}, "base": {"sha": "b" * 40}}))
         patcher.start()
         self.addCleanup(patcher.stop)
+        brief_patch = mock.patch.object(sb, "floor_brief", lambda engine, repo, report, files: dict(self.FIXTURE_BRIEF))
+        brief_patch.start()
+        self.addCleanup(brief_patch.stop)
 
     TWIN = True
     twin_runs = None
@@ -40167,7 +40170,10 @@ class TestImpactHold(LedgerBase):
     def under(self, who="cos", order=17, reason="the review confirms nothing touches credentials nor identity"):
         if self.twin_runs and reason in ("the review confirms nothing touches credentials nor identity", "the review is clean and the change is a note"):   # #972: the judgement names the runs of the fixture
             reason += ": %s" % ", ".join("#%d=%s" % (seq, level) for seq, _, level in self.twin_runs)
-        return self.run_as(who, "impact", "clear", self.PR, "--under-order", str(order), "--reason", reason)
+        return self.run_as(who, "impact", "clear", self.PR, "--under-order", str(order), "--reason", reason, "--brief-digest", self.FIXTURE_BRIEF["digest"], "--brief-text", self.FIXTURE_BRIEF["text"])
+
+    FIXTURE_BRIEF = {"text": "IMPACT BRIEF (fixture)\nRECOMMENDED DECIDER: Chief of Staff", "decider": "chief_of_staff", "material": [], "why": "fixture."}   # #1215 slice C: the floor's brief at the head (slice A's module is not here)
+    FIXTURE_BRIEF["digest"] = hashlib.sha256(FIXTURE_BRIEF["text"].encode()).hexdigest()
 
     def test_s1_the_chief_of_staff_clears_under_a_listed_order_and_it_is_recorded_as_her_act_under_that_order(self):
         self.delegate()
