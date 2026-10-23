@@ -9,4 +9,3 @@ for f in cloud/launcher/tests/test_*.py; do
   case " $EXCEPTIONS " in *" $n:"*) continue ;; esac
   echo "NOT RUN: $n is neither chained nor in EXCEPTIONS"; echo "RESULT: FAIL"; exit 1
 done
->>>>>>> origin/main
