@@ -1910,6 +1910,26 @@ name) are gone; the Lab itself was only read. Not measured: an automatic
 compaction (`reason` `auto`), which should look the same, and the herdr agent
 state during a compaction.
 
+### Where the Chief of Staff's orders live (#1011)
+
+The orders are in the Chief of Staff's **system prompt**, outside the
+conversation. The `fleet-hooks` plugin adds the file's text (comments stripped,
+word for word) to the system prompt on every model call, only when the agent's
+role is `chief-of-staff`; a worker never gets it. A **compaction** rewrites the
+conversation into a summary and never touches the system prompt, so it cannot
+drop a rule, and an edit of the file shows on the next call. A file over 8 KB
+is refused with a visible note, never cut.
+
+Why the old route lost rules: the orders were a conversation note (`cos_fact`,
+key `orders:cos:<hash8>:<compaction id|start>`), so a compaction summarised the
+note with the rest. Delivery after a compaction could also not run: `V2_LIGHT_OFF`
+turned the compaction read off, `COMPACTION_TTL_MAX` (30 s) remembered the list,
+and the key stayed "already delivered" until a compaction completed. The audit
+line `orders.unreadable` shows a refused file. The conversation note stays as a
+fallback where the service offers no system-prompt hook (the hook name is
+unverified in the running service); the light mode still turns off its
+re-send after a compaction, which the system prompt makes harmless.
+
 ### Decision tiers and the Chief of Staff's orders (PR 18)
 
 Before this PR a decision went straight to you: every `report question`, every
