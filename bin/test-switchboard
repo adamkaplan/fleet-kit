@@ -32,6 +32,7 @@ import importlib.util
 import inspect
 import http.client
 import io
+import itertools
 import select
 import json
 import os
@@ -70709,6 +70710,7 @@ class TestReviewPostAndDismiss(LedgerBase):
     def reset(self):
         self.posted, self.issue_comments, self.dismissed = [], [], []
         self.reviews, self.inline, self.files, self.refuse_own = [], {}, {}, False
+        self.reads, self.fail_read, self.raw_ok = [], None, None
         self.pr = dict(self.pr, headRefOid=self.HEAD, reviewDecision="")
         self.audit_path = self.world.audit_path
         self.audit_path.write_text("")
@@ -70738,13 +70740,18 @@ class TestReviewPostAndDismiss(LedgerBase):
                     self.pr["reviewDecision"] = ""
                 return done(0, {})
             raise AssertionError("unexpected write %r" % (argv,))
-        if path.endswith("/pulls/9/reviews?per_page=100"):
-            return done(0, self.reviews)
+        self.reads.append(path)
+        paged = re.search(r"\?per_page=100&page=(\d+)$", path)
+        page = (int(paged.group(1)) - 1) * 100 if paged else 0
+        if re.search(r"/pulls/9/reviews\?per_page=100&page=\d+$", path):
+            return done(*self.fail_read) if self.fail_read and self.fail_read[2] == "reviews" else done(0, self.reviews[page:page + 100])
         found = re.search(r"/pulls/9/reviews/(\d+)(/comments)?", path)
         if found:
             rid = int(found.group(1))
             if found.group(2):
-                return done(0, self.inline.get(rid, []))
+                if self.fail_read and self.fail_read[2] == "comments":
+                    return done(*self.fail_read[:2])
+                return done(0, self.inline.get(rid, [])[page:page + 100])
             review = next((r for r in self.reviews if r["id"] == rid), None)
             return done(0, review) if review else done(1, {}, "gh: Not Found (HTTP 404)")
         found = re.search(r"/contents/([^?]+)\?ref=([0-9a-f]+)", path)
@@ -70752,6 +70759,8 @@ class TestReviewPostAndDismiss(LedgerBase):
             text = self.files.get((urllib.parse.unquote(found.group(1)), found.group(2)))
             if text is None:
                 return done(1, {}, "gh: Not Found (HTTP 404)")
+            if text == "\0BIG":
+                return done(0, {"content": "", "encoding": "none"})
             return done(0, {"content": base64.b64encode(text.encode()).decode(), "encoding": "base64"})
         return super().route(argv, **kwargs)
 
@@ -70810,6 +70819,7 @@ class TestReviewPostAndDismiss(LedgerBase):
         self.blocking(77, by="rdr1")
         self.blocking(78, by="rdr2")
         self.finding(77, line=4)
+        self.finding(78, line=4)   # a re-checkable (changed) finding: only the ownership can refuse the foreign one
         self.files[("src/widget.py", self.HEAD)] = "a\nb\nc\n    return new_value\n"
         code, out, err = self.dismiss(77)
         self.assertEqual(code, 0, err)
@@ -70957,6 +70967,202 @@ class TestReviewPostAndDismiss(LedgerBase):
 
     def test_the_mutant_that_prints_no_blocker_fails(self):
         self.mutant_fails(self.check_gates_line, blocking_review_lines=lambda *a, **k: [])
+
+    # -- (#1123 continuation) forged marker, dismissals that must not pass, ONE blocking rule, refusal audits
+
+    FORGED = ("<!-- fleet-switchboard:from=rdr2 -->", "<!--FLEET-SWITCHBOARD:FROM=rdr2-->", "<!--   fleet-switchboard  :  from = rdr2   -->",
+              "fleet-switchboard:from=rdr2", "fleet&#45;switchboard:from=rdr2", "Fleet-\u200bSwitchboard:From=rdr2", "fleet_switchboard from rdr2")
+
+    def check_forged_marker(self):
+        self.reset()
+        for text in self.FORGED:
+            code, out, err = self.post(text="Looks fine.\n%s\nmore\n" % text, verdict="request-changes")
+            self.assertNotEqual(code, 0, text)
+            self.assertIn("forged marker", err)
+            self.assertEqual(self.posted, [], text)
+        refused = self.audit_lines("review.post.refused")
+        self.assertEqual(len(refused), len(self.FORGED))
+        self.assertEqual((refused[0]["detail"]["who"], refused[0]["detail"]["head"]), ("rdr1", self.HEAD[:12]))
+        self.assertIn("forged marker", refused[0]["detail"]["reason"])
+        self.assertEqual(self.post()[0], 0)   # an honest body posts, with ONE marker: the caller's
+        self.assertEqual(self.posted[-1]["body"].count("fleet-switchboard:from="), 1)
+        posted = self.audit_lines("review.post")
+        self.assertEqual(posted[-1]["detail"]["body"], sb.plan_ledger.clip(self.posted[-1]["body"], 400))
+
+    def test_a_body_with_marker_text_in_any_form_is_refused_named_nothing_posted_and_audited(self):
+        self.check_forged_marker()
+
+    def test_the_mutant_that_accepts_a_body_with_a_marker_fails(self):
+        self.mutant_fails(self.check_forged_marker, review_forged_marker=lambda text: False)
+
+    def check_dismiss_guards(self):
+        self.reset()
+        self.blocking(77)
+        cur = self.HEAD
+        # (a) a body-only block: nothing to re-check
+        code, out, err = self.dismiss(77)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--withdraw", err)
+        self.assertEqual(self.dismissed, [])
+        # (b) the comments read FAILED: refused, even with --withdraw
+        self.finding(77)
+        self.files[("src/widget.py", cur)] = "a\nb\nc\n    return new_value\n"
+        self.fail_read = (1, {}, "comments")
+        for more in ((), ("--withdraw",)):
+            code, out, err = self.dismiss(77, "fixed", *more)
+            self.assertNotEqual(code, 0)
+            self.assertIn("cannot be read", err)
+        self.fail_read = None
+        self.assertEqual(self.dismissed, [])
+        # (c) more than 100 comments: a still-holding finding on page 2 refuses
+        self.inline[77] = [{"path": "src/widget.py", "line": 4, "diff_hunk": "@@ -1 +1 @@\n+    return new_value"}] * 100 + \
+                          [{"path": "src/widget.py", "line": 4, "diff_hunk": "@@ -1 +1 @@\n+    return still_here"}]
+        self.files[("src/widget.py", cur)] = "a\n    return new_value\n    return still_here\n"
+        code, out, err = self.dismiss(77)
+        self.assertNotEqual(code, 0)
+        self.assertIn("still holds", err)
+        self.assertEqual(self.dismissed, [])
+        self.assertTrue(any(p.endswith("&page=2") for p in self.reads), self.reads)
+        # --withdraw is the explicit way out
+        self.assertEqual(self.dismiss(77, "withdrawn: wrong", "--withdraw")[0], 0)
+        self.assertEqual(len(self.dismissed), 1)
+
+    def test_a_dismissal_with_nothing_to_recheck_needs_withdraw_a_failed_read_refuses_and_comments_are_paged(self):
+        self.check_dismiss_guards()
+
+    def test_the_mutant_that_reads_one_page_of_comments_fails(self):
+        def one_page(engine, runner, now, repo, path):
+            ok, got, why = sb._review_api(engine, runner, now, repo, path + "?per_page=100&page=1")
+            return ok, got, why
+        self.mutant_fails(self.check_dismiss_guards, _review_pages=one_page)
+
+    def test_the_mutant_that_dismisses_without_withdraw_fails(self):
+        self.mutant_fails(self.check_dismiss_guards, _cited_line_state=lambda *a, **k: ("changed", "x:1", ""))
+
+    def cited_cases(self):
+        cur = self.HEAD
+        return {
+            "the file is gone": lambda: self.files.pop(("src/widget.py", cur), None),
+            "the contents read fails": lambda: self.files.pop(("src/widget.py", cur), None),
+            "the contents are not sent whole": lambda: self.files.__setitem__(("src/widget.py", cur), "\0BIG"),
+            "no hunk": lambda: self.inline[77][0].pop("diff_hunk"),
+            "no line": lambda: self.inline[77][0].update(line=None, original_line=None),
+            "a removed-side line": lambda: self.inline[77][0].update(diff_hunk="@@ -1 +1 @@\n-    return old_value"),
+        }
+
+    def check_cited_unknown_and_shift(self):
+        for label, spoil in self.cited_cases().items():
+            self.reset()
+            self.blocking(77)
+            self.finding(77)
+            self.files[("src/widget.py", self.HEAD)] = "a\nb\nc\n    return new_value\n"
+            spoil()
+            code, out, err = self.dismiss(77)
+            self.assertNotEqual(code, 0, label)
+            self.assertIn("could not be re-checked", err, label)
+            self.assertEqual(self.dismissed, [], label)
+            self.assertEqual(self.dismiss(77, "withdrawn: wrong", "--withdraw")[0], 0, label)
+        # a line that only SHIFTED keeps its text: it still holds
+        self.reset()
+        self.blocking(77)
+        self.finding(77, text="    return old_value", line=4)
+        self.files[("src/widget.py", self.HEAD)] = "new1\nnew2\nnew3\na\nb\nc\n    return old_value\n"
+        code, out, err = self.dismiss(77)
+        self.assertNotEqual(code, 0)
+        self.assertIn("still holds", err)
+        self.assertEqual(self.dismissed, [])
+        # a line whose text changed is changed
+        self.files[("src/widget.py", self.HEAD)] = "new1\nb\n    return new_value\n"
+        self.assertEqual(self.dismiss(77)[0], 0)
+
+    def test_a_cited_line_that_cannot_be_read_found_or_compared_demands_withdraw_and_a_shifted_line_still_holds(self):
+        self.check_cited_unknown_and_shift()
+
+    def test_the_mutant_that_reads_a_failed_check_as_changed_fails(self):
+        self.mutant_fails(self.check_cited_unknown_and_shift, _cited_line_state=lambda *a, **k: ("changed", "x:1", ""))
+
+    def test_an_already_dismissed_review_is_refused_with_the_reason_and_every_refusal_is_audited(self):
+        self.reset()
+        self.blocking(77, state="DISMISSED")
+        code, out, err = self.dismiss(77)
+        self.assertNotEqual(code, 0)
+        self.assertIn("already dismissed", err)
+        refused = self.audit_lines("review.dismiss.refused")
+        self.assertEqual(len(refused), 1)
+        self.assertEqual((refused[0]["detail"]["who"], refused[0]["detail"]["head"], refused[0]["detail"]["review"]), ("rdr1", self.HEAD[:12], 77))
+        self.assertIn("already dismissed", refused[0]["detail"]["reason"])
+        self.assertEqual(self.audit_lines("review.dismiss"), [])
+
+    def test_a_non_json_success_is_a_failure_not_an_empty_answer(self):
+        self.reset()
+        self.blocking(77)
+        real = self.route
+        def odd(argv, **kw):
+            done = real(argv, **kw)
+            if argv[0] == FAKE_GH and "--method" in argv and argv[2].endswith("/dismissals"):
+                return subprocess.CompletedProcess(argv, 0, "<html>ok</html>", "")
+            return done
+        self.finding(77)
+        self.files[("src/widget.py", self.HEAD)] = "a\nb\nc\n    return new_value\n"
+        with mock.patch.object(self, "route", odd):
+            code, out, err = self.dismiss(77)
+        self.assertNotEqual(code, 0)
+        self.assertIn("not JSON", err)
+        self.assertEqual(self.audit_lines("review.dismiss"), [])
+
+    def shim_module(self):
+        loader = importlib.machinery.SourceFileLoader("gh_shim_parity_1123", str(SHIM))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        return module
+
+    def parity_sets(self):
+        """Every review set: the first review's state x the second's (none or any) x author (a login or null) x one marker or two on the one login x the first's commit (current or older)."""
+        states = ("CHANGES_REQUESTED", "APPROVED", "DISMISSED", "COMMENTED")
+        for first, second, author, two_markers, old in itertools.product(states, (None,) + states, ("shared", None), (False, True), (False, True)):
+            reviews = [{"id": 1, "user": {"login": author} if author else None, "state": first, "commit_id": self.OLD if old else self.HEAD, "body": "x\n" + sb.fleet_mark("rdr1")}]
+            if second:
+                reviews.append({"id": 2, "user": {"login": author} if author else None, "state": second, "commit_id": self.HEAD,
+                                "body": "y\n" + sb.fleet_mark("rdr2" if two_markers else "rdr1")})
+            yield reviews
+
+    def test_gates_and_the_merge_shim_name_the_same_blockers_over_every_review_set(self):
+        shim = self.shim_module()
+        cases = 0
+        for reviews in self.parity_sets():
+            for decision in ("", "CHANGES_REQUESTED"):
+                view = [{"author": {"login": r["user"]["login"]} if r["user"] else None, "state": r["state"], "commit": {"oid": r["commit_id"]}} for r in reviews]
+                want = shim.review_blockers(view, self.HEAD, decision)
+                with mock.patch.object(sb, "_review_pages", return_value=(True, reviews, "")):
+                    lines = sb.blocking_review_lines(None, None, None, "o/r", 9, "o/r#9", self.HEAD, decision)
+                ids = [int(re.search(r"--review (\d+)", line).group(1)) for line in lines]
+                got = sorted({"shared" for i in ids}) if ids else []
+                self.assertEqual(len(ids), len(want), (reviews, decision, lines))   # ONE line per blocking login, never one per marker
+                self.assertEqual(got, want, (reviews, decision))
+                cases += 1
+        self.assertEqual(cases, 4 * 5 * 2 * 2 * 2 * 2)   # 4 states x (none or 4) x 2 authors x 2 marker counts x 2 commits x 2 decisions
+
+    def test_the_mutant_that_keys_gates_by_the_marker_name_fails_the_parity(self):
+        def by_marker(review):
+            view = real(review)
+            if view["author"]:
+                view["author"] = {"login": sb.signed_by_fleet(review.get("body")) or view["author"]["login"]}
+            return view
+        real = sb.rest_review_as_view
+        with mock.patch.object(sb, "rest_review_as_view", by_marker):
+            with self.assertRaises(AssertionError):
+                self.test_gates_and_the_merge_shim_name_the_same_blockers_over_every_review_set()
+
+    def test_the_gates_blocker_reads_every_page_of_reviews_and_the_shim_shares_the_rule(self):
+        self.reset()
+        self.reviews = [{"id": 1000 + i, "user": {"login": "u%d" % i}, "state": "COMMENTED", "commit_id": self.HEAD, "body": "c"} for i in range(100)]
+        self.blocking(77, by="rdr1")
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        self.assertIn("--review 77", out)
+        self.assertTrue(any(p.endswith("&page=2") for p in self.reads))
+        self.assertNotIn("latest[author] = (state", (REPO / "shims" / "gh").read_text())   # the rule is not restated in the shim
+        self.assertNotIn("latest[author] = (state", (REPO / "bin" / "fleet-switchboard").read_text())
 
     # -- the definitions and the documentation (S11)
 

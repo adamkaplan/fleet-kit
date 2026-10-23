@@ -73,6 +73,8 @@ def _fleet_parts(after=False):
 _fleet_parts()
 import argparse
 import base64
+import html
+import unicodedata
 import http.client
 import urllib.parse
 from contextlib import contextmanager
@@ -22449,7 +22451,7 @@ def cmd_gates(args, runner, now):
         if ctx.plan_problem:
             lines.append("plan not read: %s" % ctx.plan_problem)
         if isinstance(ctx.facts, dict) and ctx.facts.get("review") == "changes requested" and not ctx.unreadable:
-            lines.extend(blocking_review_lines(ctx.engine, runner, now, ctx.repo, ctx.number, ctx.pr))   # #1123: GitHub's decision blocks the merge; say who and how to clear it
+            lines.extend(blocking_review_lines(ctx.engine, runner, now, ctx.repo, ctx.number, ctx.pr, ctx.facts.get("head")))   # #1123: GitHub's decision blocks the merge; say who and how to clear it
         note = rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head")) if isinstance(ctx.facts, dict) else None
         if note:
             lines.append("rating: %s" % note)
@@ -25312,13 +25314,46 @@ def _review_api(engine, runner, now, repo, path, method=None, payload=None):
     try:
         return True, json.loads(done.stdout or "{}"), ""
     except ValueError:
-        return True, {}, ""
+        return False, None, "GitHub answered a success that is not JSON (not trusted): %s" % _one_line(done.stdout or "", 80)
+
+
+REVIEW_PAGE_LIMIT = 50   # pages of 100: a list longer than this is not read whole, and the caller refuses
+
+
+def _review_pages(engine, runner, now, repo, path):
+    """(ok, all items, one-line detail) of a Reviews-API list read page by page to the LAST page (a short page ends it); a failed page, a page that is not a list, or more than REVIEW_PAGE_LIMIT pages fails the whole read."""
+    items = []
+    for page in range(1, REVIEW_PAGE_LIMIT + 1):
+        ok, got, why = _review_api(engine, runner, now, repo, "%s?per_page=100&page=%d" % (path, page))
+        if not ok or not isinstance(got, list):
+            return False, None, why or "page %d is not a list" % page
+        items.extend(got)
+        if len(got) < 100:
+            return True, items, ""
+    return False, None, "more than %d pages" % REVIEW_PAGE_LIMIT
+
+
+def review_refusal_audit(engine, event, ref, name, head, reason, **more):
+    """The audit line of a REFUSED review command (who, which head, the reason); never raises."""
+    try:
+        if engine.audit is not None and name:
+            engine.audit.append(engine.actor, event, ref, dict({"who": name, "head": (head or "")[:12], "reason": plan_ledger.clip(reason, 200)}, **more))
+    except Exception:
+        pass
+
+
+def review_forged_marker(text):
+    """True when `text` holds fleet-switchboard `from=` marker text in ANY form: normalised (HTML entities decoded, NFKC, case folded, every character that is not a letter or digit dropped) so spacing, case, entities, zero-width characters and an HTML comment around it change nothing."""
+    plain = re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKC", html.unescape(html.unescape(text))).casefold())
+    return "fleetswitchboardfrom" in plain
 
 
 def cmd_review_post(args, runner, now):
     """`review post PR --head SHA --verdict V --body-file FILE`: ONE Reviews-API review, its body `Review of <full head>: <VERDICT>` ... the reader's marker."""
+    seen = {}
     try:
         engine, state, config = build_engine(runner, now, "cli", writable=True)
+        seen["engine"] = engine
         if args.verdict not in REVIEW_POST_VERDICTS:
             raise ReviewError("--verdict must be one of %s (nothing was posted)" % ", ".join(REVIEW_POST_VERDICTS))
         if not re.fullmatch(r"[0-9a-f]{40}", args.head or ""):
@@ -25329,7 +25364,11 @@ def cmd_review_post(args, runner, now):
         if redact_command_text(text) != text:
             raise ReviewError("the body holds a secret-shaped value (it is not shown): remove it and post again (nothing was posted)")
         name = _review_caller(runner, now)
+        seen["name"], seen["head"] = name, args.head
         repo, number, ref, raw = _review_pr(args, engine)
+        seen["ref"] = ref
+        if review_forged_marker(text):
+            raise ReviewError("refused (forged marker): the body holds `fleet-switchboard:from=` marker text; the one marker of a review is appended from the caller's registered identity, so a body never carries one (nothing was posted)")
         head = raw.get("headRefOid")
         if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
             raise ReviewError("the PR head is unknown: nothing was posted")
@@ -25347,45 +25386,62 @@ def cmd_review_post(args, runner, now):
         if not ok:
             raise ReviewError("GitHub refused the review: %s (nothing was posted)" % why)
         if engine.audit is not None:
-            engine.audit.append(engine.actor, "review.post", ref, {"who": name, "verdict": args.verdict, "event": event, "head": head[:12]})
+            engine.audit.append(engine.actor, "review.post", ref, {"who": name, "verdict": args.verdict, "event": event, "head": head[:12], "body": plan_ledger.clip(body, 400)})
         if notice:
             print("note: " + notice)
         print("posted %s review (%s) at %s on %s as %s" % (args.verdict, event, head[:8], ref, name))
         return EXIT_OK
     except (ReviewError, ConfigError, IdentityUncertain, CallerError, plan_ledger.LedgerError) as err:
+        review_refusal_audit(seen.get("engine"), "review.post.refused", seen.get("ref"), seen.get("name"), seen.get("head"), str(err), verdict=args.verdict) if seen.get("name") and seen.get("ref") else None
         sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 700)))
         return EXIT_USAGE
 
 
-def _cited_line_unchanged(engine, runner, now, repo, head, comment):
-    """(unchanged, "path:line") of one inline finding: its cited line's text (the last line of its diff hunk) against the same line of the file at `head`."""
+def _cited_line_state(engine, runner, now, repo, head, comment):
+    """("unchanged" | "changed" | "unknown", "path:line" or None, why) of one inline finding. The cited line's TEXT (the last line of the finding's diff hunk: the
+    line as it was at the head the review judged) is looked for in the file at the CURRENT head: found anywhere (a line that only SHIFTED included) is
+    "unchanged" (the finding still holds); absent is "changed". Whatever cannot be told (no path, line or hunk, a removed-side line, the contents unread, the file gone, a file too large to be
+    sent) is "unknown", never "changed"."""
     path, line = comment.get("path"), comment.get("line") or comment.get("original_line")
     hunk = comment.get("diff_hunk") if isinstance(comment.get("diff_hunk"), str) else ""
-    if not isinstance(path, str) or not isinstance(line, int) or not hunk:
-        return False, None
-    cited = hunk.splitlines()[-1][1:]
-    ok, got, _ = _review_api(engine, runner, now, repo, "repos/%s/contents/%s?ref=%s" % (repo, urllib.parse.quote(path), head))
+    where = "%s:%s" % (path, line) if isinstance(path, str) else None
+    if not isinstance(path, str) or not isinstance(line, int):
+        return "unknown", where, "the finding names no file and line"
+    rows = hunk.splitlines()
+    if not rows or not rows[-1][:1] in (" ", "+") or not rows[-1][1:].strip():
+        return "unknown", where, "the finding's hunk gives no cited line to compare"
+    cited = rows[-1][1:]
+    ok, got, why = _review_api(engine, runner, now, repo, "repos/%s/contents/%s?ref=%s" % (repo, urllib.parse.quote(path), head))
     if not ok or not isinstance(got, dict):
-        return False, "%s:%d" % (path, line)   # the file is gone at the head: the finding no longer stands as written
+        return "unknown", where, "the file cannot be read at the head (%s)" % (why or "gone")
+    if got.get("encoding") != "base64":
+        return "unknown", where, "the file's contents were not sent whole"
     try:
         lines = base64.b64decode(got.get("content") or "").decode("utf-8", "replace").splitlines()
     except ValueError:
-        return False, "%s:%d" % (path, line)
-    return (0 < line <= len(lines) and lines[line - 1] == cited), "%s:%d" % (path, line)
+        return "unknown", where, "the file's contents cannot be decoded"
+    return ("unchanged" if cited in lines else "changed"), where, ""
 
 
 def cmd_review_dismiss(args, runner, now):
-    """`review dismiss PR --review ID --reason TEXT`: dismiss the caller's OWN CHANGES_REQUESTED review after re-reading its cited line at the CURRENT head."""
+    """`review dismiss PR --review ID --reason TEXT [--withdraw]`: dismiss the caller's OWN CHANGES_REQUESTED review. Each inline finding's cited line is re-read at the
+    CURRENT head; a finding that still holds refuses, and whatever could not be re-checked (a body-only review, an unreadable or unknown line) needs `--withdraw`
+    (the reader's explicit statement that it withdraws the finding). A failed read refuses."""
+    seen = {}
     try:
         engine, state, config = build_engine(runner, now, "cli", writable=True)
+        seen["engine"] = engine
         reason = (args.reason or "").strip()
         if not reason:
             raise ReviewError("--reason must say why (nothing was dismissed)")
         if redact_command_text(reason) != reason:
             raise ReviewError("the reason holds a secret-shaped value (it is not shown) (nothing was dismissed)")
         name = _review_caller(runner, now)
+        seen["name"] = name
         repo, number, ref, raw = _review_pr(args, engine)
+        seen["ref"] = ref
         head = raw.get("headRefOid")
+        seen["head"] = head
         if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
             raise ReviewError("the PR head is unknown: nothing was dismissed")
         base = "repos/%s/pulls/%d/reviews/%d" % (repo, number, args.review)
@@ -25395,13 +25451,26 @@ def cmd_review_dismiss(args, runner, now):
         owner = signed_by_fleet(review.get("body"))
         if not review_is_own(review, name):
             raise ReviewError("review %d is not yours (it is signed by %s): a reader dismisses only its own review (nothing was dismissed)" % (args.review, owner or "no one"))
-        if str(review.get("state") or "").upper() not in REVIEW_DISMISS_STATES:
+        status = str(review.get("state") or "").upper()
+        if status == "DISMISSED":
+            raise ReviewError("review %d of %s is already dismissed: nothing to dismiss (nothing was done)" % (args.review, ref))
+        if status not in REVIEW_DISMISS_STATES:
             raise ReviewError("review %d is %s, not CHANGES_REQUESTED: nothing to dismiss" % (args.review, str(review.get("state") or "unknown").lower()))
-        ok, found, why = _review_api(engine, runner, now, repo, base + "/comments?per_page=100")
-        for comment in (found if ok and isinstance(found, list) else []):
-            unchanged, where = _cited_line_unchanged(engine, runner, now, repo, head, comment) if isinstance(comment, dict) else (False, None)
-            if unchanged and not args.withdraw:
+        ok, found, why = _review_pages(engine, runner, now, repo, base + "/comments")
+        if not ok:
+            raise ReviewError("the inline comments of review %d cannot be read whole: %s: the block cannot be re-checked, so nothing was dismissed" % (args.review, why))
+        inline = [c for c in found if isinstance(c, dict)]
+        unknown = []
+        for comment in inline:
+            verdict, where, cause = _cited_line_state(engine, runner, now, repo, head, comment)
+            if verdict == "unchanged" and not args.withdraw:
                 raise ReviewError("finding still holds at %s: %s is unchanged (say --withdraw with a reason if the finding was wrong) (nothing was dismissed)" % (head, where))
+            if verdict == "unknown":
+                unknown.append("%s: %s" % (where or "a finding", cause))
+        if not args.withdraw and not inline:
+            raise ReviewError("review %d has no inline finding to re-check at %s (a body-only block): say --withdraw with a reason if the finding is withdrawn (nothing was dismissed)" % (args.review, head))
+        if not args.withdraw and unknown:
+            raise ReviewError("a finding of review %d could not be re-checked at %s (%s): say --withdraw with a reason if the finding is withdrawn (nothing was dismissed)" % (args.review, head, "; ".join(unknown)[:300]))
         ok, _, why = _review_api(engine, runner, now, repo, base + "/dismissals", "PUT", {"message": reason, "event": "DISMISS"})
         if not ok:
             raise ReviewError("GitHub refused the dismissal: %s" % why)
@@ -25409,21 +25478,38 @@ def cmd_review_dismiss(args, runner, now):
         print("dismissed review %d of %s at %s as %s: %s" % (args.review, ref, head[:8], name, _one_line(reason, 120)))
         return EXIT_OK
     except (ReviewError, ConfigError, IdentityUncertain, CallerError, plan_ledger.LedgerError) as err:
+        if seen.get("name") and seen.get("ref"):
+            review_refusal_audit(seen.get("engine"), "review.dismiss.refused", seen["ref"], seen["name"], seen.get("head"), str(err), review=args.review)
         sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 700)))
         return EXIT_USAGE
 
 
-def blocking_review_lines(engine, runner, now, repo, number, pr):
-    """`blocking review:` lines for the reviewers whose LATEST decisive review is CHANGES_REQUESTED (the caller asks only when GitHub's reviewDecision says so)."""
-    ok, reviews, _ = _review_api(engine, runner, now, repo, "repos/%s/pulls/%d/reviews?per_page=100" % (repo, number))
-    latest = {}
-    for review in (reviews if ok and isinstance(reviews, list) else []):
-        if not isinstance(review, dict) or str(review.get("state") or "").upper() not in ("APPROVED", "CHANGES_REQUESTED"):
-            continue
-        who = signed_by_fleet(review.get("body")) or pr_login(review.get("user")) or "unknown"
-        latest[who] = review
-    return ["blocking review: %s CHANGES_REQUESTED at %s (dismiss with: fleet-switchboard review dismiss %s --review %s --reason TEXT)" % (
-        who, str(r.get("commit_id") or "unknown")[:12], pr, r.get("id")) for who, r in sorted(latest.items()) if str(r.get("state")).upper() == "CHANGES_REQUESTED"]
+def load_review_rule():
+    """shims/review_rule.py: the ONE rule of which reviews block, shared with the gh shim's merge check."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "shims", "review_rule.py")
+    spec = importlib.util.spec_from_file_location("review_rule_gates", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def rest_review_as_view(review):
+    """A Reviews-API review in the shape `gh pr view --json reviews` gives the shim's rule (author.login, commit.oid)."""
+    user = review.get("user") if isinstance(review.get("user"), dict) else {}
+    return {"author": {"login": user.get("login")} if user.get("login") else None, "state": review.get("state"),
+            "commit": {"oid": review.get("commit_id")}, "body": review.get("body"), "id": review.get("id")}
+
+
+def blocking_review_lines(engine, runner, now, repo, number, pr, head="", decision="CHANGES_REQUESTED"):
+    """`blocking review:` lines by the SAME rule as the merge shim (`shims/review_rule.py`): per LOGIN the latest decisive review (DISMISSED included) that is CHANGES_REQUESTED and still blocks."""
+    ok, reviews, why = _review_pages(engine, runner, now, repo, "repos/%s/pulls/%d/reviews" % (repo, number))
+    if not ok:
+        return ["blocking review: the reviews could not be read whole (%s): not listed" % why]
+    rows = []
+    for login, review in load_review_rule().blocking_reviews([rest_review_as_view(r) for r in reviews if isinstance(r, dict)], head or "", decision):
+        rows.append("blocking review: %s CHANGES_REQUESTED at %s (dismiss with: fleet-switchboard review dismiss %s --review %s --reason TEXT)" % (
+            signed_by_fleet(review.get("body")) or login, str(review["commit"]["oid"] or "unknown")[:12], pr, review.get("id")))
+    return rows
 
 
 def cmd_review(args, runner, now):
@@ -25839,7 +25925,7 @@ def add_review_parsers(sub):
     dismiss.add_argument("pr", help="owner/repo#N or the PR's URL")
     dismiss.add_argument("--review", required=True, type=int, help="The review's id")
     dismiss.add_argument("--reason", required=True, help="Why it no longer blocks")
-    dismiss.add_argument("--withdraw", action="store_true", help="The finding was wrong: dismiss although the cited line is unchanged (the reason says why)")
+    dismiss.add_argument("--withdraw", action="store_true", help="Your explicit statement that you withdraw the finding: needed when nothing could be re-checked (a body-only review, a line that cannot be read or compared) and to dismiss although the cited line is unchanged (the reason says why)")
     checkout = rsub.add_parser("checkout", help="Write the PR's exact head tree, its diff and the base copies of the touched files into .review/<head sha> here, read-only, and print the path; --remove <dir> removes one")
     checkout.add_argument("pr", nargs="?", help="owner/repo#N or the PR's URL")
     checkout.add_argument("--head", help="The commit to materialise (default: the PR's head, read once at the start)")

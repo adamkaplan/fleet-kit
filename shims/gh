@@ -1459,25 +1459,18 @@ def tagged_blockers(reviews, head):
     return sorted("%s: CHANGES REQUESTED (Review of %s)" % (k, v[1][:8]) for k, v in latest.items() if v[0] == "CHANGES REQUESTED")
 
 
+REVIEW_RULE_MODULE = [None]
+
+
 def review_blockers(reviews, head="", decision=""):
-    """The reviewers whose latest decisive review (APPROVED, CHANGES_REQUESTED or DISMISSED; a plain comment is not decisive) is CHANGES_REQUESTED AND
-    still blocks this head: it is at the PR's current head (its commit oid equals `head`), or its commit or the head is not known, or GitHub's
-    `decision` (reviewDecision) is CHANGES_REQUESTED. A changes-requested review at an OLDER head is superseded by that reviewer's newer review of any
-    kind (a comment included; this rule only) unless GitHub's decision still says CHANGES_REQUESTED; one at the CURRENT head is cleared only by that
-    reviewer's later approval or dismissal, never by a comment, because several agents can share one login. Where GitHub gives no decision (no required
-    reviews) an old-head review does not block: this is a guardrail, GitHub's branch protection is the boundary. `tagged_blockers` is separate."""
-    latest = {}
-    for review in reviews if isinstance(reviews, list) else []:
-        if not isinstance(review, dict):
-            continue
-        author = ((review.get("author") or {}).get("login")) if isinstance(review.get("author"), dict) else None
-        state = str(review.get("state") or "").upper()
-        if author and state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
-            commit = review.get("commit") if isinstance(review.get("commit"), dict) else {}
-            latest[author] = (state, commit.get("oid") if isinstance(commit.get("oid"), str) else "")
-    blocked = str(decision or "").upper() == "CHANGES_REQUESTED"
-    return sorted(who for who, (state, oid) in latest.items()
-                  if state == "CHANGES_REQUESTED" and (blocked or not oid or not head or oid.lower() == head.lower()))
+    """The ONE rule lives in review_rule.py beside this file (shared with `fleet-switchboard gates`); an unloadable module raises, which `review_probe` reports as not checked."""
+    if REVIEW_RULE_MODULE[0] is None:
+        path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "review_rule.py")
+        spec = importlib.util.spec_from_file_location("review_rule", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        REVIEW_RULE_MODULE[0] = module
+    return REVIEW_RULE_MODULE[0].review_blockers(reviews, head, decision)
 
 
 def review_probe(args, found, reason, lookup, gh):
