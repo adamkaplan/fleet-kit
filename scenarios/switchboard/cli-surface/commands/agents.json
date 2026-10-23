@@ -1,4 +1,4 @@
 {
  "command": "agents",
- "help": "usage: fleet-switchboard agents [-h] {verify} ... positional arguments: {verify} verify Ask the running OpenCode service for its agents and compare each of ours with its expected mode and the rules its definition declares options: -h, --help show this help message and exit"
+ "help": "usage: fleet-switchboard agents [-h] {verify,charters} ... positional arguments: {verify,charters} verify Ask the running OpenCode service for its agents and compare each of ours with its expected mode and the rules its definition declares charters Read-only: per live orchestrator, its registry charter and its live session metadata's charter and issue (where a charter number is recorded) options: -h, --help show this help message and exit"
 }

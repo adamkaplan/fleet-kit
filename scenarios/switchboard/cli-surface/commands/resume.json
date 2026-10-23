@@ -1,0 +1,4 @@
+{
+ "command": "resume",
+ "help": "usage: fleet-switchboard resume [-h] [--reason REASON] AGENT `fleet-switchboard resume AGENT` sends the resume text to AGENT's session only when its turn has ended and nothing is open. It refuses an agent with an open permission request or question (that goes to the owner), a session that is working, and an agent resumed in the last 10 minutes. Each resume writes one audit line naming who resumed whom and why. positional arguments: AGENT options: -h, --help show this help message and exit --reason REASON why, for the audit line (default: its turn ended and nothing is open)"
+}
