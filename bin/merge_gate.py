@@ -127,17 +127,30 @@ def read_facts(reading, gh, repo, number, conf):
     return facts
 
 
+def read_merge_ref_checks(reading, gh, repo, number, head):
+    """[{"name","conclusion"}] of the legs of the newest run at `head` (the gate pass's `reopened` run on the merge ref, once the pass re-ran it), read the way read_facts
+    reads it; None when there is no such run or it cannot be read, or when that run has no macOS leg (no gate-pass run happened). Never raises."""
+    try:
+        runs = reading.read_pr_runs(gh, repo, number, head)
+        legs = []
+        for run in runs:
+            legs += reading.read_run_legs(gh, repo, run["id"])
+    except reading.ReadError:
+        return None
+    return legs if any(isinstance(l.get("name"), str) and "(macos-latest)" in l["name"] for l in legs) else None
+
+
 def macos_legs_problem(facts):
     """One line naming the macOS leg of the newest run at the head that is absent, skipped or cancelled (or red), else None. Only `success` is green. Applies when that
     run has the test workflow's ubuntu leg (a repository without these legs has nothing to read); an absent leg asks for a re-run, which the gate pass makes a `reopened` run
     that always has every leg (#1235)."""
-    legs = {l["name"]: l["conclusion"] for l in facts.get("legs") or []}
-    if "test (ubuntu-latest)" not in legs:
-        return None
     mac = _macos_plan()
-    bad = mac._bad(legs, mac.MACOS)
+    legs = mac._by_name(facts.get("legs"))
+    if not (mac.has_legs(legs) or any(r.get("workflow") == "test" for r in facts.get("runs") or [])):
+        return None   # no run of the test workflow: nothing to read
+    bad = mac._bad(legs, mac.UBUNTU) + mac._bad(legs, mac.MACOS)   # fail closed: a test run with no ubuntu leg (renamed, dropped) is refused
     if bad:
-        return "the macOS leg is not green on the merge-ref run of head %s: %s" % ((facts.get("head") or "?")[:8], ", ".join(bad))
+        return "a leg of the test workflow is not green on the run of head %s: %s" % ((facts.get("head") or "?")[:8], ", ".join(bad))
     return None
 
 

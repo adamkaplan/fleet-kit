@@ -2,7 +2,7 @@
 """Which macOS legs a test-workflow run has, and how the gates read them (ask #1235). Pure: no network, no git, no clock.
 
 `plan_matrix` is the decision the workflow's `plan` step makes for a pull request into the default branch (the step calls this file's CLI:
-`python3 bin/macos_plan.py --event pull_request --action synchronize --base main --files a,b --patterns-file list.txt`).
+`python3 bin/macos_plan.py --event pull_request --action synchronize --base main --files-nul-file diff.z --patterns-file list.txt`).
 `legs_reading` is what gate G4 and the gate pass read: the ubuntu legs green at the head, and the macOS legs green at the head or on the gate pass's
 merge-ref run of that head. A leg that is absent, skipped, cancelled or neutral is never green: only the conclusion `success` is.
 """
@@ -46,14 +46,16 @@ def plan_matrix(event, action="", base="", draft=False, labels=(), files=(), pat
         return {"macos": True, "reason": "%s: both legs" % (event or "run")}
     if base != default:
         return {"macos": None, "reason": "a pull request into %s: unchanged, the integration rule decides" % (base or "another branch")}
+    if LABEL in list(labels or []):   # a label always runs macOS, a draft included
+        return {"macos": True, "reason": "the label %s is set" % LABEL}
     if action == "reopened":
         return {"macos": True, "reason": "reopened (the gate pass's run on the merge ref): every leg"}
     if draft:
         return {"macos": False, "reason": "a draft skips macOS until ready_for_review"}
-    if LABEL in list(labels or []):
-        return {"macos": True, "reason": "the label %s is set" % LABEL}
     if not parse_patterns("\n".join(patterns)):
         return {"macos": True, "reason": "the platform-path list holds no pattern: running macOS (fail safe)"}
+    if not [f for f in files if f]:
+        return {"macos": True, "reason": "the diff lists no file: running macOS (fail safe)"}
     hit = [f for f in files if touches([f], patterns)]
     if hit:
         return {"macos": True, "reason": "the diff touches a platform path (%s)" % hit[0]}
@@ -82,11 +84,20 @@ def cancelled_by(old, new):
 
 
 def _by_name(checks):
+    """{name: conclusion}. The same name may be listed twice (the head run and the reopened run, in no guaranteed order): ANY non-success of a duplicate wins, so the
+    order of the list never decides and a duplicate never reads green when one of them is not."""
     out = {}
     for c in checks or []:
         if isinstance(c, dict) and isinstance(c.get("name"), str):
-            out[c["name"]] = str(c.get("conclusion") or "").lower()
+            word = str(c.get("conclusion") or "").lower()
+            if c["name"] not in out or out[c["name"]] == "success":
+                out[c["name"]] = word
     return out
+
+
+def has_legs(names):
+    """True when any name is a leg of the test workflow (`test (<os>)` or `test-cloud (<os>)`): the readings then apply, and a missing ubuntu leg is refused, never skipped over."""
+    return any(isinstance(n, str) and any(n.startswith(leg + " (") for leg in LEGS) for n in names or [])
 
 
 def _bad(found, os_name):
@@ -124,11 +135,14 @@ def main(argv):
     ap.add_argument("--base", default="")
     ap.add_argument("--draft", default="false")
     ap.add_argument("--labels", default="", help="comma-separated")
-    ap.add_argument("--files", default="", help="newline- or comma-separated changed paths")
+    ap.add_argument("--files", default="", help="newline-separated changed paths (a comma belongs to a name)")
+    ap.add_argument("--files-nul-file", default="", help="a file of NUL-separated changed paths (git diff -z), read as UTF-8")
     ap.add_argument("--patterns-file", default="")
     a = ap.parse_args(argv)
     patterns = parse_patterns(open(a.patterns_file).read()) if a.patterns_file else []
-    files = [f for f in a.files.replace(",", "\n").splitlines() if f]
+    files = [f for f in a.files.split("\n") if f]
+    if a.files_nul_file:
+        files = [f.decode("utf-8", "surrogateescape") for f in open(a.files_nul_file, "rb").read().split(b"\0") if f]
     out = plan_matrix(a.event, a.action, a.base, a.draft == "true", [l for l in a.labels.split(",") if l], files, patterns)
     print(json.dumps(out, separators=(",", ":")))
     return 0 if out["macos"] is not None else 3

@@ -1,5 +1,5 @@
 diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
-index 1a548ff..f903d88 100644
+index 1a548ffd..94ddb36f 100644
 --- a/.github/workflows/test.yml
 +++ b/.github/workflows/test.yml
 @@ -22,7 +22,7 @@ permissions:
@@ -11,6 +11,15 @@ index 1a548ff..f903d88 100644
    cancel-in-progress: ${{ github.event_name == 'pull_request' }}
  
  jobs:
+@@ -31,7 +31,7 @@ jobs:
+   #   - a pull request into main: both legs, macOS unconditional (a draft into main skips macOS until ready_for_review);
+   #   - a pull request into any other branch (integration): macOS only when its diff touches a path of the ONE list file, read from the BASE branch, or edits that file, or changes a file under .github/workflows/ (those two are hard-coded in the script);
+   #   - a push, a dispatch: both legs; the nightly: main and integration, each leg named `nightly <ref> (<os>)`.
+-  # No third-party action: a plain `git diff --no-renames --name-only`.
++  # No third-party action: a plain `git diff -z --no-renames --name-only`.
+   plan:
+     name: plan
+     runs-on: ubuntu-latest
 @@ -51,6 +51,8 @@ jobs:
            EVENT: ${{ github.event_name }}
            BASE: ${{ github.base_ref }}
@@ -20,7 +29,7 @@ index 1a548ff..f903d88 100644
          run: |
            python3 - <<'PY'
            import fnmatch, json, os, subprocess
-@@ -69,7 +71,24 @@ jobs:
+@@ -69,7 +71,26 @@ jobs:
            macos = True
            if event == "pull_request":
                if base == "main":
@@ -29,12 +38,14 @@ index 1a548ff..f903d88 100644
 +                  # list from the base too. A reopened run (the gate pass's) always runs every leg. Anything unreadable runs macOS (fail safe).
 +                  macos = True
 +                  tool, plist = os.environ["RUNNER_TEMP"] + "/macos_plan.py", os.environ["RUNNER_TEMP"] + "/platform-paths.txt"
-+                  got = [git("show", "origin/" + base + ":bin/macos_plan.py"), git("show", "origin/" + base + ":" + LIST), git("diff", "--no-renames", "--name-only", "origin/" + base + "...HEAD")]
++                  got = [git("show", "origin/" + base + ":bin/macos_plan.py"), git("show", "origin/" + base + ":" + LIST), subprocess.run(["git", "diff", "-z", "--no-renames", "--name-only", "origin/" + base + "...HEAD"], capture_output=True)]   # -z: a non-ASCII path is never quoted
 +                  if all(g.returncode == 0 for g in got):
 +                      open(tool, "w").write(got[0].stdout)
 +                      open(plist, "w").write(got[1].stdout)
++                      diff = os.environ["RUNNER_TEMP"] + "/changed-files.z"
++                      open(diff, "wb").write(got[2].stdout)   # NUL-separated: a comma or a newline in a name splits nothing
 +                      done = subprocess.run(["python3", tool, "--event", event, "--action", os.environ.get("ACTION", ""), "--base", base, "--draft", "true" if draft else "false",
-+                                             "--labels", os.environ.get("LABELS", ""), "--files", got[2].stdout.replace("\n", ","), "--patterns-file", plist], capture_output=True, text=True)
++                                             "--labels", os.environ.get("LABELS", ""), "--files-nul-file", diff, "--patterns-file", plist], capture_output=True, text=True)
 +                      if done.returncode == 0:
 +                          decision = json.loads(done.stdout)
 +                          macos = decision["macos"]
@@ -46,3 +57,16 @@ index 1a548ff..f903d88 100644
                else:
                    # The list is read from the BASE, never from this pull request's own checkout: a pull request cannot rewrite the
                    # list that gates it. A list edit and a change under the workflow directory always run macOS (both paths are fixed here, not read from the list).
+@@ -79,10 +100,10 @@ jobs:
+                       note("the platform-path list on origin/%s cannot be read or holds no pattern: running macOS (fail safe)" % base)
+                   else:
+                       # --no-renames: a file moved OUT of a listed path is seen under its old name too.
+-                      diff = git("diff", "--no-renames", "--name-only", "origin/" + base + "...HEAD")
++                      diff = git("-c", "core.quotepath=false", "diff", "-z", "--no-renames", "--name-only", "origin/" + base + "...HEAD")
+                       if diff.returncode != 0:
+                           note("the diff against origin/%s failed: running macOS (fail safe)" % base)
+-                      files = diff.stdout.splitlines()
++                      files = [f for f in diff.stdout.split("\0") if f]
+                       if LIST in files:
+                           note("the platform-path list is edited by this pull request: running macOS")
+                       if any(f.startswith(WORKFLOWS) for f in files):

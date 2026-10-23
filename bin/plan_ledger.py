@@ -456,7 +456,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             ci = (facts or {}).get("ci")
             checks = (facts or {}).get("checks") or []
             # #1235: when the test workflow's legs are in the facts, G4 reads the ubuntu legs at the head and the macOS legs at the head or on the gate pass's merge-ref run
-            legs = _macos_plan().legs_reading(checks, (facts or {}).get("merge_ref_checks")) if any(isinstance(c, dict) and c.get("name") == "test (ubuntu-latest)" for c in checks) else None
+            legs = _macos_plan().legs_reading(checks, (facts or {}).get("merge_ref_checks")) if _macos_plan().has_legs([c.get("name") for c in checks if isinstance(c, dict)]) else None
             if ci in ("green", "passing") and legs is not None:
                 if legs[0]:
                     row.update(status="ok", detail="CI %s at %s: %s" % (ci, (head or "?")[:8], legs[2]))
