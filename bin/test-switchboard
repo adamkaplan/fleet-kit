@@ -74904,6 +74904,9 @@ class TestReconcileOnRead(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
+            def no_pane_to_judge(self, row):
+                return sb.load_module("registry").no_pane_to_judge(row)
+
             def reconcile_remove(self, state_dir, name, evidence, whole):
                 self.calls.append((name, evidence, whole))
                 return {"changed": True, "problem": None}
@@ -84935,6 +84938,350 @@ class TestAssembler(unittest.TestCase):
         done = subprocess.run([sys.executable, "-B", str(link), "status", "--help"], capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("usage: fleet-switchboard status", done.stdout)
+
+
+class TestNoPaneToJudge(StandInPids, Base):
+    """#1181: a row with no pane to judge (kind cloud or orchestrator, or an endpoint and no pane) is alive or unknown, never dead."""
+    PASSES = 20
+    ALIVE_BODY = b'[{"id": "msg_example"}]'
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform",))
+        self.engine = sb.Switchboard(dict(self.world.config), sb.V2Client(FAKE_OPENCODE, {}, self.world.v2, 5),
+                                     sb.HerdrClient(FAKE_HERDR, self.world.herdr, socket_call=self.world.herdr.socket),
+                                     sb.AuditLog(self.world.audit_path), sb.fact_sources(self.world.state), self.world.clock.now, "cli")
+        self.engine.state_dir = self.world.state
+        self.reg = sb.load_module("registry")
+        self.live = sb.load_module("endpoint_liveness")
+        self.requests = []
+        self.record_patch = mock.patch.object(self.live, "has_cloud_record", lambda name: True)   # the record lookup is tested on its own below
+        self.record_patch.start()
+        self.addCleanup(self.record_patch.stop)
+
+    def read_ok(self, name, limit):
+        """The stub of THE REUSED CALL (the cloud read of `fleet-switchboard read NAME`): answers."""
+        self.requests.append((name, limit))
+        return True
+
+    def rows(self):
+        self.reg.upsert(self.world.state, "orch-cloud", {"session": "ses_example1", "pane": None, "role": "orchestrator", "kind": "orchestrator",
+                                                          "endpoint": "https://orch.acme.svc/", "workspace": None, "cwd": None})
+        self.reg.upsert(self.world.state, "pilot", {"session": "ses_example2", "pane": None, "role": "coder", "kind": "cloud", "workspace": None, "cwd": None})
+        self.reg.upsert(self.world.state, "bare", {"session": "ses_example3", "pane": None, "role": "coder", "endpoint": "https://bare.acme.svc/", "workspace": None, "cwd": None})
+
+    def one_pass(self):
+        self.engine.discover(self.world.clock.now())
+        sb.pane_health_pass(self.engine, self.world.clock.now())
+        self.world.tick(31)
+
+    def hb(self):
+        import importlib.machinery, importlib.util
+        loader = importlib.machinery.SourceFileLoader("fleet_heartbeat_t", str(BIN / "fleet-heartbeat"))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader("fleet_heartbeat_t", loader))
+        loader.exec_module(module)
+        return module
+
+    def scenario_violations(self):
+        """The S3 run: 20 real passes over three no-pane rows; every finding is one line."""
+        self.rows()
+        found = []
+        with mock.patch.dict(os.environ, {"FLEET_REGISTRY_DIR": str(self.world.state)}):
+            hb = self.hb()
+            for n in range(self.PASSES):
+                self.one_pass()
+                if getattr(self.engine, "pane_alerts", None):
+                    found.append("alert on pass %d" % n)
+            targets, problem = hb.registry_targets()
+        found += ["target %s" % t["name"] for t in targets if t["name"] in ("orch-cloud", "pilot", "bare")]
+        found += ["dead audit %s" % e["subject"] for e in self.world.audit() if e["event"] == "fleetpane.dead" and e.get("subject") in ("orch-cloud", "pilot", "bare")]
+        if "DEAD" in "\n".join(sb.pane_health_status_lines(self.world.state)):
+            found.append("dead hint")
+        found += ["bad state %s" % n for n, v in sb.read_pane_health(self.world.state)["states"].items() if n in ("orch-cloud", "pilot", "bare")]
+        found += ["still in registry? %s" % n for n in ("orch-cloud", "pilot", "bare") if n not in self.reg.read(self.world.state)["agents"]]
+        return found
+
+    def test_the_predicate(self):
+        yes = [{"kind": "cloud"}, {"kind": "orchestrator", "pane": None}, {"kind": "local", "endpoint": "https://a.acme.svc", "pane": None},
+               {"endpoint": "https://a.acme.svc"}, {"kind": "cloud", "role": "coder", "pane": None}]
+        no = [{}, {"kind": "local", "pane": "w1:p1"}, {"pane": None}, {"kind": "local", "pane": None}, {"pane": "w1:p1", "endpoint": None}, None, "x"]
+        self.assertEqual([self.reg.no_pane_to_judge(r) for r in yes], [True] * len(yes))
+        self.assertEqual([self.reg.no_pane_to_judge(r) for r in no], [False] * len(no))
+
+    # -- S2: derived from the code
+    READER_FUNCTIONS = {   # the only functions that read a dead verdict WITHOUT asking: each judges ONE pane that its caller chose, or writes the file
+        "pane_state": "judges the one pane it is handed (herdr's answer); the callers never hand it a no-pane row",
+        "release_stale_binding": "acts on a pane herdr still lists under a name; a no-pane row has none",
+        "write_pane_health": "keeps a dead row's time; judges nothing",
+    }
+
+    @staticmethod
+    def readers_without_the_predicate(source, exempt=(), needles=("PANE_DEAD", "GONE_STATES", "PANE_MISSING_PASSES", "pane_alerts")):
+        import ast
+        tree = ast.parse(source)
+        out = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                text = ast.get_source_segment(source, node) or ""
+                if any(n in text for n in needles) and "no_pane_to_judge" not in text and node.name not in exempt:
+                    out.append(node.name)
+        return sorted(out)
+
+    def test_every_reader_of_the_dead_verdict_and_the_missing_count_uses_the_one_predicate(self):
+        for name in ("fleet-switchboard", "fleet-heartbeat"):
+            source = (BIN / name).read_text()
+            self.assertEqual(self.readers_without_the_predicate(source, exempt=self.READER_FUNCTIONS), [], name)
+        reconcile = (BIN / "agent_reconcile.py").read_text()
+        self.assertIn("no_pane_to_judge", reconcile)
+        self.assertGreaterEqual(len(self.readers_with(( BIN / "fleet-switchboard").read_text())), 4)
+
+    def readers_with(self, source):
+        import ast
+        return [n.name for n in ast.walk(ast.parse(source)) if isinstance(n, ast.FunctionDef)
+                and "no_pane_to_judge" in (ast.get_source_segment(source, n) or "")]
+
+    # -- M2: block level. Every OUTERMOST loop or comprehension (inside a function that mentions a needle) that itself mentions a needle must contain the predicate.
+    BLOCK_NEEDLES = ("PANE_DEAD", "GONE_STATES", "PANE_MISSING_PASSES")
+    BLOCK_EXEMPT = {   # (function, n-th such block in it, 0-based): reason
+        ("pane_health_status_lines", 0): "walks `bad`, which was built with the predicate in the line above it",
+        ("pane_health_pass", 3): "walks `agents` (filtered by the predicate when built) to upsert the registry; a no-pane row is never in it",
+        ("pane_health_pass", 1): "walks `agents`, which was filtered by no_pane_to_judge when built (and the discovery loop above it asks again); a no-pane row is never in it",
+    }
+
+    @classmethod
+    def blocks_without_the_predicate(cls, source, exempt_functions=(), needles=None):
+        import ast
+        needles = needles or cls.BLOCK_NEEDLES
+        loops = (ast.For, ast.AsyncFor, ast.While, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+        out = []
+        for fn in ast.walk(ast.parse(source)):
+            if not isinstance(fn, ast.FunctionDef) or fn.name in exempt_functions:
+                continue
+            found, stack = [], list(ast.iter_child_nodes(fn))
+            while stack:   # outermost loops only, in source order
+                node = stack.pop(0)
+                if isinstance(node, (ast.FunctionDef, ast.Lambda)):
+                    continue
+                if isinstance(node, loops):
+                    found.append(node)
+                else:
+                    stack = list(ast.iter_child_nodes(node)) + stack
+            n = 0
+            for node in found:
+                text = ast.get_source_segment(source, node) or ""
+                if any(w in text for w in needles):
+                    if "no_pane_to_judge" not in text:
+                        out.append((fn.name, n))
+                    n += 1
+        return sorted(out)
+
+    def test_every_guard_block_holds_the_predicate_or_is_in_the_exact_exemption_table(self):
+        source = (BIN / "fleet-switchboard").read_text()
+        hb = (BIN / "fleet-heartbeat").read_text()
+        exempt = set(self.READER_FUNCTIONS)
+        got = self.blocks_without_the_predicate(source, exempt_functions=exempt)
+        self.assertEqual(got, sorted(self.BLOCK_EXEMPT), "the exemption table must be exact: no block missing the predicate beyond it, none listed that holds it")
+        self.assertEqual(self.blocks_without_the_predicate(hb, exempt_functions=exempt), [])
+
+    def test_mutant_the_discovery_loop_guard_removed_fails_the_block_level_test(self):
+        source = (BIN / "fleet-switchboard").read_text()
+        guard = "        if registry.no_pane_to_judge(registered.get(name)):   # #1181: a row with no pane to judge is not judged by a pane (a discovered cloud agent included)\n            continue\n"
+        self.assertEqual(source.count(guard), 1)
+        got = self.blocks_without_the_predicate(source.replace(guard, ""), exempt_functions=set(self.READER_FUNCTIONS))
+        self.assertNotEqual(got, sorted(self.BLOCK_EXEMPT))
+        self.assertIn(("pane_health_pass", 0), got)
+
+    def test_a_planted_unguarded_loop_inside_a_guarded_function_fails_the_block_test(self):
+        planted = "def f(rows, states):\n    for r in rows:\n        if no_pane_to_judge(r):\n            continue\n        x = PANE_DEAD\n    return [n for n in states if states[n] == PANE_DEAD]\n"
+        self.assertEqual(self.blocks_without_the_predicate(planted), [("f", 1)])
+
+    def test_a_planted_reader_without_the_predicate_fails_the_derived_test(self):
+        planted = "def new_reader(states):\n    return [n for n, v in states.items() if v == PANE_DEAD]\n"
+        self.assertEqual(self.readers_without_the_predicate(planted), ["new_reader"])
+
+    # -- S3
+    def test_three_no_pane_rows_survive_twenty_real_passes(self):
+        self.assertEqual(self.scenario_violations(), [])
+
+    def test_the_heartbeat_has_no_target_and_so_no_failure_for_them(self):
+        self.rows()
+        with mock.patch.dict(os.environ, {"FLEET_REGISTRY_DIR": str(self.world.state)}):
+            targets, problem = self.hb().registry_targets()
+        self.assertEqual([t["name"] for t in targets if t["name"] in ("orch-cloud", "pilot", "bare")], [])
+        self.assertIsNone(problem)
+
+    # -- U1 / U2: a local agent with a pane is judged as before
+    def test_a_local_agent_whose_pane_is_gone_is_dead_after_the_set_passes_and_an_endpoint_row_beside_it_is_not(self):
+        self.rows()
+        self.reg.upsert(self.world.state, "gone", {"pane": "w9:p9", "session": "ses_gone", "role": "coder", "workspace": "w9"})
+        for _ in range(sb.PANE_MISSING_PASSES):
+            self.one_pass()
+        dead = [e for e in self.world.audit() if e["event"] == "fleetpane.dead"]
+        baseline = {"dead_targets": ["gone"], "alerts": ["gone"], "missing": {"gone": sb.PANE_MISSING_PASSES}}   # the stored baseline (before #1181)
+        got = {"dead_targets": [e["subject"] for e in dead], "alerts": sorted(self.engine.pane_alerts),
+               "missing": {n: c for n, c in sb.read_pane_health(self.world.state)["missing"].items()}}
+        self.assertEqual(got, baseline)
+        self.assertEqual(self.engine.pane_alerts["gone"]["why"], "herdr no longer lists gone (its pane w9:p9 is gone)")
+
+    # -- S4, U3, U4, U5
+    def answers(self):
+        row = {"endpoint": "https://orch.acme.svc/", "session": "ses_example1"}
+
+        def failing(url, authorization, timeout):
+            raise OSError("refused")
+
+        def failing(name, limit):
+            raise OSError("no tunnel")
+
+        def partial(name, limit):
+            return False   # the read exited non-zero part way
+
+        def slow(name, limit):
+            threading.Event().wait(2)
+            return True
+        out = {"alive": self.live.check("x", row, 0.3, self.read_ok, clock=lambda: 1234)}
+        out["absent"] = self.live.check("x", None, 0.3, self.read_ok)
+        for label, fn in (("failed", failing), ("partial", partial), ("slow", slow)):
+            started = time.monotonic()
+            out[label] = self.live.check_all({"x": row}, 0.3, fn)["x"]
+            out[label + "_elapsed"] = time.monotonic() - started
+        return out
+
+    def liveness_problems(self):
+        got = self.answers()
+        problems = []
+        if got["alive"] != {"verdict": "alive", "at": 1234}:
+            problems.append("alive")
+        problems += [k for k in ("failed", "partial", "slow", "absent") if got[k].get("verdict") != "unknown"]
+        return problems
+
+    def test_the_check_is_alive_with_a_time_or_unknown_never_dead(self):
+        self.assertEqual(self.liveness_problems(), [])
+
+    def test_the_pass_never_calls_the_liveness_check(self):
+        calls = []
+        with mock.patch.object(self.live, "check_all", lambda *a, **k: calls.append(a) or {}), mock.patch.object(self.live, "check", lambda *a, **k: calls.append(a) or {}), \
+                mock.patch.object(self.live, "read_newest", lambda *a, **k: calls.append(a) or True):
+            self.rows()
+            for _ in range(self.PASSES):
+                self.one_pass()
+        self.assertEqual(calls, [])
+        self.assertFalse(hasattr(self.engine, "row_liveness"))
+
+    def test_the_check_is_bounded(self):
+        got = self.answers()
+        self.assertLessEqual(max(got["slow_elapsed"], got["failed_elapsed"]), 0.3 + 1)
+
+    def test_no_cloud_record_is_unknown_and_a_live_local_agent_of_the_name_does_not_make_it_alive(self):
+        self.record_patch.stop()   # back to the real lookup, on an empty state dir
+        state = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, state, True)
+        row = {"endpoint": "https://orch.acme.svc/", "session": "ses_example1"}
+        local_agent_answers = lambda name, limit: True   # a live local agent named "platform" would answer a `read platform`
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": state}):
+            self.assertEqual(self.live.check("platform", row, 0.3, local_agent_answers)["verdict"], "unknown")
+            self.assertEqual(self.live.check_all({"platform": row}, 0.3, local_agent_answers)["platform"]["verdict"], "unknown")
+            os.makedirs(os.path.join(state, "fleet-switchboard", "cloud"))
+            Path(state, "fleet-switchboard", "cloud", "platform.json").write_text("{}")
+            self.assertEqual(self.live.check("platform", row, 0.3, local_agent_answers)["verdict"], "alive")
+        self.assertIn("--cloud-only", (BIN / "endpoint_liveness.py").read_text())
+
+    def test_mutant_a_local_agent_makes_a_cloud_row_alive_is_caught(self):
+        self.record_patch.stop()
+        state = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, state, True)
+        row = {"endpoint": "https://orch.acme.svc/"}
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": state}), mock.patch.object(self.live, "has_cloud_record", lambda name: True):
+            self.assertEqual(self.live.check("platform", row, 0.3, lambda n, l: True)["verdict"], "alive")   # the mutant: the real test above forbids this
+
+    def test_mutant_the_pass_calling_the_check_again_is_caught(self):
+        source = (BIN / "fleet-switchboard").read_text()
+        self.assertNotIn("endpoint_liveness", source)
+        self.assertNotIn("row_liveness", source)
+
+    def test_the_row_holds_an_address_only_and_the_module_handles_no_credential(self):
+        self.rows()
+        self.one_pass()
+        raw = (self.world.state / "registry.json").read_text()
+        for word in ("Bearer", "password", "token", "Basic"):
+            self.assertNotIn(word, raw)
+        source = (BIN / "endpoint_liveness.py").read_text()
+        for word in ("Authorization", "_read_token", ".password", "urllib"):
+            self.assertNotIn(word, source)
+
+    def test_a_failed_slow_or_partial_answer_removes_nothing(self):
+        self.rows()
+        row = {"endpoint": "https://orch.acme.svc/"}
+        for read in (lambda *a: (_ for _ in ()).throw(OSError("x")), lambda *a: False, lambda *a: None):
+            self.assertEqual(self.live.check("orch-cloud", row, 0.3, read)["verdict"], "unknown")
+            self.one_pass()
+            self.assertTrue({"orch-cloud", "pilot", "bare"} <= set(self.reg.read(self.world.state)["agents"]))
+        view = sb.load_module("agent_reconcile").reconcile_on_read(self.world.state, self.reg.read(self.world.state), lambda n, a: {}, self.reg)
+        self.assertEqual(view, [])
+        partial_read = dict(self.reg.read(self.world.state), whole=False)
+        self.assertEqual(sb.load_module("agent_reconcile").reconcile_on_read(self.world.state, partial_read, lambda n, a: {}, self.reg), [])
+
+    # -- M1: a DISCOVERED, non-headless agent whose registry row has no pane
+    def discovered_no_pane_run(self, passes=4, mutate=False):
+        self.rows()
+        found = []
+        func = sb.pane_health_pass
+        if mutate:
+            import ast
+            source = (BIN / "fleet-switchboard").read_text()
+            guard = "        if registry.no_pane_to_judge(registered.get(name)):   # #1181: a row with no pane to judge is not judged by a pane (a discovered cloud agent included)\n            continue\n"
+            self.assertEqual(source.count(guard), 1)
+            tree = ast.parse(source.replace(guard, ""))
+            node = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "pane_health_pass"][0]
+            ns = dict(sb.__dict__)
+            exec(compile(ast.Module([node], []), "mutant", "exec"), ns)
+            func = ns["pane_health_pass"]
+        names = ("orch-cloud", "pilot")
+        for n in range(passes):
+            self.engine.discover(self.world.clock.now())
+            for i, name in enumerate(names):   # discovered by a pane label and a session, though the registry row holds no pane
+                self.engine.discovery.agents[name] = sb.Observation(name, "ses_example%d" % (i + 1), "w9:p%d" % i, "idle", {"role": "coder"})
+            func(self.engine, self.world.clock.now())
+            for name in names:
+                if name in getattr(self.engine, "pane_alerts", None) or {}:
+                    found.append("alert %s pass %d" % (name, n))
+            self.world.tick(31)
+        health = sb.read_pane_health(self.world.state)
+        found += ["state %s" % n for n in health["states"] if n in names]
+        found += ["missing %s" % n for n in health["missing"] if n in names]
+        found += ["dead audit %s" % e["subject"] for e in self.world.audit() if e["event"] == "fleetpane.dead" and e.get("subject") in names]
+        return found
+
+    def test_a_discovered_cloud_or_orchestrator_agent_with_no_pane_is_never_judged_over_four_passes(self):
+        self.assertEqual(self.discovered_no_pane_run(), [])
+
+    def test_mutant_the_discovery_loop_guard_removed_is_caught(self):
+        self.assertNotEqual(self.discovered_no_pane_run(mutate=True), [], "without the guard a discovered cloud agent is judged by its pane")
+
+    # -- S6: three mutants, each fails a test
+    def test_mutant_a_no_pane_row_read_as_dead_is_caught(self):
+        with mock.patch.object(self.reg, "no_pane_to_judge", lambda row: False):
+            found = self.scenario_violations()
+        self.assertTrue(found, "the S3 scenario must fail when a no-pane row is judged by its pane")
+
+    def test_mutant_a_skipped_reader_is_caught(self):
+        source = (BIN / "fleet-heartbeat").read_text()
+        mutated = source.replace("if registry.no_pane_to_judge(agent):", "if False:")
+        self.assertNotEqual(source, mutated)
+        self.assertEqual(self.readers_without_the_predicate(mutated, needles=("GONE_STATES",)), ["registry_targets"])
+
+    def test_mutant_dead_on_a_failed_answer_is_caught(self):
+        with mock.patch.object(self.live, "unknown", lambda why: {"verdict": "dead", "why": why}):
+            self.assertNotEqual(self.liveness_problems(), [])
+
+    # -- S7
+    def test_the_documentation_states_the_rule(self):
+        text = (REPO / "docs" / "agent-registry.md").read_text()
+        section = text.split("## A row with no pane to judge", 1)
+        self.assertEqual(len(section), 2)
+        body = section[1].split("\n## ", 1)[0]
+        for phrase in ("no_pane_to_judge", "alive", "unknown", "cloud:<agent name>"):
+            self.assertIn(phrase, body)
 
 
 if __name__ == "__main__":

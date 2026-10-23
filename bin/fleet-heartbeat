@@ -118,6 +118,8 @@ def registry_targets():
     targets = []
     for name, agent in sorted(agents.items(), key=lambda kv: str(kv[0])):
         pane = agent.get("pane") if isinstance(agent, dict) else None
+        if registry.no_pane_to_judge(agent):   # #1181: a row with no pane to judge is never a wake target (no nudge, so no failure or alert)
+            continue
         if isinstance(pane, str) and pane.strip() and registry.bell_of(agent) and agent.get("state") not in GONE_STATES:
             targets.append({"name": str(name), "pane_id": pane, "workspace_id": agent.get("workspace"), "tab_id": None})
     return targets, None
