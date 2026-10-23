@@ -22448,6 +22448,8 @@ def cmd_gates(args, runner, now):
             lines.append("PR not read: %s" % ctx.unreadable)
         if ctx.plan_problem:
             lines.append("plan not read: %s" % ctx.plan_problem)
+        if isinstance(ctx.facts, dict) and ctx.facts.get("review") == "changes requested" and not ctx.unreadable:
+            lines.extend(blocking_review_lines(ctx.engine, runner, now, ctx.repo, ctx.number, ctx.pr))   # #1123: GitHub's decision blocks the merge; say who and how to clear it
         note = rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head")) if isinstance(ctx.facts, dict) else None
         if note:
             lines.append("rating: %s" % note)
@@ -25246,6 +25248,184 @@ def record_inputs(raw_argv):
     return _private_parse(raw_argv, DECISION_INPUTS, CARRY_FLAG_INPUTS)
 
 
+# ---------------------------------------------------------------- `review post` and `review dismiss` (#1123)
+# The marker a reader's review ends with is written by ONE function, `fleet_mark` (the writer `comment` and `handoff` use too): there is no second one here.
+
+REVIEW_POST_VERDICTS = {"approve": ("APPROVE", "APPROVE"), "request-changes": ("CHANGES REQUESTED", "REQUEST_CHANGES"), "comment": ("COMMENT", "COMMENT")}   # verdict -> (the word in the body's first line, the Reviews API event)
+REVIEW_POST_ROLES = ("reader", "reviewer")   # the registered roles that may post and dismiss a review
+REVIEW_OWN_REFUSAL = re.compile(r"(?i)own pull request|can not approve|can not request changes|cannot approve|cannot request changes")
+REVIEW_DISMISS_STATES = ("CHANGES_REQUESTED",)
+
+
+def review_head_problem(given, current):
+    """None when `given` is the PR's current head, else the refusal (naming both in full)."""
+    if given != current:
+        return "the head given (%s) is not the PR's current head (%s): a review belongs to the head it judged (nothing was posted)" % (given, current)
+    return None
+
+
+def review_post_path(repo, number):
+    """The Reviews API's endpoint: the one a review is posted to (never the issue comments')."""
+    return "repos/%s/pulls/%d/reviews" % (repo, number)
+
+
+def review_is_own(review, name):
+    """True when the review carries the caller's own marker: the reader's identity that posted it (all agents share one login)."""
+    return signed_by_fleet(review.get("body")) == name
+
+
+def review_dismiss_audit(engine, ref, name, review_id, head, reason, withdrawn):
+    """The audit line of a dismissal: who, which review, which head, why."""
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "review.dismiss", ref, {"who": name, "review": review_id, "head": head[:12], "why": plan_ledger.clip(reason, 200), "withdrawn": bool(withdrawn)})
+
+
+def _review_caller(runner, now):
+    """The registered name of the caller of a review command; raises ReviewError for a caller with no registered reader or reviewer role."""
+    kind = gates_caller_kind(runner, now)
+    if kind[0] == "unknown":
+        raise ReviewError("refused: %s" % kind[1])
+    role = kind[2] if kind[0] == "agent" and len(kind) > 2 else None
+    if kind[0] != "agent" or role not in REVIEW_POST_ROLES or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", kind[1] or ""):
+        raise ReviewError("refused: the caller has no registered %s role (%s): only a registered reader posts or dismisses a review (nothing was done)" % (
+            " or ".join(REVIEW_POST_ROLES), kind[1] if kind[0] != "agent" else "role %s" % (role or "none")))
+    return kind[1]
+
+
+def _review_api(engine, runner, now, repo, path, method=None, payload=None):
+    """(ok, parsed or None, one-line detail) of ONE `gh api` call with the repository's own account (a GET unless `method`)."""
+    config = engine.config
+    reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
+    if method is None:
+        try:
+            return True, reader._api(path, repo), ""
+        except IntentError as err:
+            return False, None, _one_line(str(err), 200)
+    env = reader.env_for(repo)
+    try:
+        done = runner([config["gh"], "api", path, "--method", method, "--input", "-"], input=json.dumps(payload), capture_output=True, text=True,
+                      timeout=reader.timeout, **({"env": env} if env is not None else {}))
+    except (OSError, subprocess.SubprocessError) as err:
+        return False, None, _one_line(str(err), 200)
+    if done.returncode != 0:
+        return False, None, reader.accounts.scrub(_one_line(done.stderr or done.stdout or "", 200)) or "exit %d" % done.returncode
+    try:
+        return True, json.loads(done.stdout or "{}"), ""
+    except ValueError:
+        return True, {}, ""
+
+
+def cmd_review_post(args, runner, now):
+    """`review post PR --head SHA --verdict V --body-file FILE`: ONE Reviews-API review, its body `Review of <full head>: <VERDICT>` ... the reader's marker."""
+    try:
+        engine, state, config = build_engine(runner, now, "cli", writable=True)
+        if args.verdict not in REVIEW_POST_VERDICTS:
+            raise ReviewError("--verdict must be one of %s (nothing was posted)" % ", ".join(REVIEW_POST_VERDICTS))
+        if not re.fullmatch(r"[0-9a-f]{40}", args.head or ""):
+            raise ReviewError("--head must be the full 40-character head sha, got %d characters (nothing was posted)" % len(args.head or ""))
+        text = _read_capped(args.body_file, REVIEW_TABLE_MAX).strip()
+        if not text:
+            raise ReviewError("the body file is empty: a review says something (nothing was posted)")
+        if redact_command_text(text) != text:
+            raise ReviewError("the body holds a secret-shaped value (it is not shown): remove it and post again (nothing was posted)")
+        name = _review_caller(runner, now)
+        repo, number, ref, raw = _review_pr(args, engine)
+        head = raw.get("headRefOid")
+        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise ReviewError("the PR head is unknown: nothing was posted")
+        problem = review_head_problem(args.head, head)
+        if problem:
+            raise ReviewError(problem)
+        word, event = REVIEW_POST_VERDICTS[args.verdict]
+        body = "Review of %s: %s\n\n%s\n\n%s" % (head, word, text, fleet_mark(name))
+        path = review_post_path(repo, number)
+        ok, posted, why = _review_api(engine, runner, now, repo, path, "POST", {"commit_id": head, "body": body, "event": event})
+        notice = ""
+        if not ok and event != "COMMENT" and REVIEW_OWN_REFUSAL.search(why):   # the same account's own pull request: a comment-type review, never an issue comment
+            event, notice = "COMMENT", "GitHub refused %s on this account's own pull request: posted as a comment-type review instead" % word
+            ok, posted, why = _review_api(engine, runner, now, repo, path, "POST", {"commit_id": head, "body": body, "event": event})
+        if not ok:
+            raise ReviewError("GitHub refused the review: %s (nothing was posted)" % why)
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "review.post", ref, {"who": name, "verdict": args.verdict, "event": event, "head": head[:12]})
+        if notice:
+            print("note: " + notice)
+        print("posted %s review (%s) at %s on %s as %s" % (args.verdict, event, head[:8], ref, name))
+        return EXIT_OK
+    except (ReviewError, ConfigError, IdentityUncertain, CallerError, plan_ledger.LedgerError) as err:
+        sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 700)))
+        return EXIT_USAGE
+
+
+def _cited_line_unchanged(engine, runner, now, repo, head, comment):
+    """(unchanged, "path:line") of one inline finding: its cited line's text (the last line of its diff hunk) against the same line of the file at `head`."""
+    path, line = comment.get("path"), comment.get("line") or comment.get("original_line")
+    hunk = comment.get("diff_hunk") if isinstance(comment.get("diff_hunk"), str) else ""
+    if not isinstance(path, str) or not isinstance(line, int) or not hunk:
+        return False, None
+    cited = hunk.splitlines()[-1][1:]
+    ok, got, _ = _review_api(engine, runner, now, repo, "repos/%s/contents/%s?ref=%s" % (repo, urllib.parse.quote(path), head))
+    if not ok or not isinstance(got, dict):
+        return False, "%s:%d" % (path, line)   # the file is gone at the head: the finding no longer stands as written
+    try:
+        lines = base64.b64decode(got.get("content") or "").decode("utf-8", "replace").splitlines()
+    except ValueError:
+        return False, "%s:%d" % (path, line)
+    return (0 < line <= len(lines) and lines[line - 1] == cited), "%s:%d" % (path, line)
+
+
+def cmd_review_dismiss(args, runner, now):
+    """`review dismiss PR --review ID --reason TEXT`: dismiss the caller's OWN CHANGES_REQUESTED review after re-reading its cited line at the CURRENT head."""
+    try:
+        engine, state, config = build_engine(runner, now, "cli", writable=True)
+        reason = (args.reason or "").strip()
+        if not reason:
+            raise ReviewError("--reason must say why (nothing was dismissed)")
+        if redact_command_text(reason) != reason:
+            raise ReviewError("the reason holds a secret-shaped value (it is not shown) (nothing was dismissed)")
+        name = _review_caller(runner, now)
+        repo, number, ref, raw = _review_pr(args, engine)
+        head = raw.get("headRefOid")
+        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise ReviewError("the PR head is unknown: nothing was dismissed")
+        base = "repos/%s/pulls/%d/reviews/%d" % (repo, number, args.review)
+        ok, review, why = _review_api(engine, runner, now, repo, base)
+        if not ok or not isinstance(review, dict):
+            raise ReviewError("review %d of %s cannot be read: %s (nothing was dismissed)" % (args.review, ref, why))
+        owner = signed_by_fleet(review.get("body"))
+        if not review_is_own(review, name):
+            raise ReviewError("review %d is not yours (it is signed by %s): a reader dismisses only its own review (nothing was dismissed)" % (args.review, owner or "no one"))
+        if str(review.get("state") or "").upper() not in REVIEW_DISMISS_STATES:
+            raise ReviewError("review %d is %s, not CHANGES_REQUESTED: nothing to dismiss" % (args.review, str(review.get("state") or "unknown").lower()))
+        ok, found, why = _review_api(engine, runner, now, repo, base + "/comments?per_page=100")
+        for comment in (found if ok and isinstance(found, list) else []):
+            unchanged, where = _cited_line_unchanged(engine, runner, now, repo, head, comment) if isinstance(comment, dict) else (False, None)
+            if unchanged and not args.withdraw:
+                raise ReviewError("finding still holds at %s: %s is unchanged (say --withdraw with a reason if the finding was wrong) (nothing was dismissed)" % (head, where))
+        ok, _, why = _review_api(engine, runner, now, repo, base + "/dismissals", "PUT", {"message": reason, "event": "DISMISS"})
+        if not ok:
+            raise ReviewError("GitHub refused the dismissal: %s" % why)
+        review_dismiss_audit(engine, ref, name, args.review, head, reason, args.withdraw)
+        print("dismissed review %d of %s at %s as %s: %s" % (args.review, ref, head[:8], name, _one_line(reason, 120)))
+        return EXIT_OK
+    except (ReviewError, ConfigError, IdentityUncertain, CallerError, plan_ledger.LedgerError) as err:
+        sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 700)))
+        return EXIT_USAGE
+
+
+def blocking_review_lines(engine, runner, now, repo, number, pr):
+    """`blocking review:` lines for the reviewers whose LATEST decisive review is CHANGES_REQUESTED (the caller asks only when GitHub's reviewDecision says so)."""
+    ok, reviews, _ = _review_api(engine, runner, now, repo, "repos/%s/pulls/%d/reviews?per_page=100" % (repo, number))
+    latest = {}
+    for review in (reviews if ok and isinstance(reviews, list) else []):
+        if not isinstance(review, dict) or str(review.get("state") or "").upper() not in ("APPROVED", "CHANGES_REQUESTED"):
+            continue
+        who = signed_by_fleet(review.get("body")) or pr_login(review.get("user")) or "unknown"
+        latest[who] = review
+    return ["blocking review: %s CHANGES_REQUESTED at %s (dismiss with: fleet-switchboard review dismiss %s --review %s --reason TEXT)" % (
+        who, str(r.get("commit_id") or "unknown")[:12], pr, r.get("id")) for who, r in sorted(latest.items()) if str(r.get("state")).upper() == "CHANGES_REQUESTED"]
+
+
 def cmd_review(args, runner, now):
     """`review laws <pr>` (print the laws and overlay from the PR's base commit) and `review record <pr> --reviewer X ...` (a reviewer writes
     its result per head). Reads GitHub with GETs only; `record` writes the hash-chained ledger and the audit."""
@@ -25253,6 +25433,10 @@ def cmd_review(args, runner, now):
         return cmd_review_measure(args, runner, now)
     if args.review_cmd == "checkout":
         return cmd_review_checkout(args, runner, now)
+    if args.review_cmd == "post":
+        return cmd_review_post(args, runner, now)
+    if args.review_cmd == "dismiss":
+        return cmd_review_dismiss(args, runner, now)
     try:
         engine, state, config = build_engine(runner, now, "cli", writable=args.review_cmd == "record")
         repo, number, ref, raw = _review_pr(args, engine)
@@ -25646,6 +25830,16 @@ def add_review_parsers(sub):
     record.add_argument("--confirms-carry", dest="confirms_carry", action="store_true",
                         help="(#815) With an approve: the resolution of a conflict in a merge of main touched no line this pull request adds or removes, so the owner's clear may carry to this head")
     record.add_argument("--summary", help="One line (at most 200 characters)")
+    post = rsub.add_parser("post", allow_abbrev=False, help="Post ONE GitHub review of the PR's current head, signed with your registered name (a reader's review carries its marker)")
+    post.add_argument("pr", help="owner/repo#N or the PR's URL")
+    post.add_argument("--head", required=True, help="The FULL head sha judged (it must be the PR's current head)")
+    post.add_argument("--verdict", required=True, help="approve | request-changes | comment")
+    post.add_argument("--body-file", dest="body_file", required=True, help="File holding the review's text")
+    dismiss = rsub.add_parser("dismiss", allow_abbrev=False, help="Dismiss your OWN CHANGES_REQUESTED review after the fix (re-reads the cited line at the current head)")
+    dismiss.add_argument("pr", help="owner/repo#N or the PR's URL")
+    dismiss.add_argument("--review", required=True, type=int, help="The review's id")
+    dismiss.add_argument("--reason", required=True, help="Why it no longer blocks")
+    dismiss.add_argument("--withdraw", action="store_true", help="The finding was wrong: dismiss although the cited line is unchanged (the reason says why)")
     checkout = rsub.add_parser("checkout", help="Write the PR's exact head tree, its diff and the base copies of the touched files into .review/<head sha> here, read-only, and print the path; --remove <dir> removes one")
     checkout.add_argument("pr", nargs="?", help="owner/repo#N or the PR's URL")
     checkout.add_argument("--head", help="The commit to materialise (default: the PR's head, read once at the start)")

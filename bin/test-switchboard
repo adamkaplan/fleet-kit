@@ -70689,6 +70689,291 @@ class TestReviewLawsStarterSet(Base):
 
 
 
+class TestReviewPostAndDismiss(LedgerBase):
+    """#1123: `review post` (one Reviews-API review carrying the reader's marker) and `review dismiss` (a reader clears its OWN CHANGES_REQUESTED), and the `gates` line for a review that blocks."""
+
+    NAMES = LedgerBase.NAMES + ("rdr1", "rdr2")
+    HEAD = LEDGER_HEAD
+    OLD = "c" * 40
+    SECRETS = ("ghp_" + "a1" * 12, "password = hunter2hunter2")
+
+    def setUp(self):
+        super().setUp()
+        for name in ("rdr1", "rdr2"):   # the readers: their recorded role is `reader`
+            self.world.add_agent(name, fleet={"role": "reader"})
+        self.reset()
+
+    def reset(self):
+        self.posted, self.issue_comments, self.dismissed = [], [], []
+        self.reviews, self.inline, self.files, self.refuse_own = [], {}, {}, False
+        self.pr = dict(self.pr, headRefOid=self.HEAD, reviewDecision="")
+        self.audit_path = self.world.audit_path
+        self.audit_path.write_text("")
+
+    def route(self, argv, **kwargs):
+        if argv[0] != FAKE_GH or argv[1] != "api":
+            return self.world.route(argv, **kwargs) if argv[0] != FAKE_GH else super().route(argv, **kwargs)
+        path = argv[2] if "--method" not in argv else argv[2]
+        done = lambda code, body, err="": subprocess.CompletedProcess(argv, code, json.dumps(body), err)
+        if "--method" in argv:
+            method, sent = argv[argv.index("--method") + 1], json.loads(kwargs.get("input") or "{}")
+            if path.endswith("/issues/9/comments"):
+                self.issue_comments.append(sent)
+                return done(0, {})
+            if path.endswith("/pulls/9/reviews"):
+                if self.refuse_own and sent["event"] != "COMMENT":
+                    return done(1, {}, "gh: Unprocessable Entity: Can not approve your own pull request (HTTP 422)")
+                self.posted.append(sent)
+                return done(0, {"id": 500 + len(self.posted)})
+            if method == "PUT" and path.endswith("/dismissals"):
+                rid = int(re.search(r"/reviews/(\d+)/dismissals", path).group(1))
+                self.dismissed.append((rid, sent))
+                for r in self.reviews:
+                    if r["id"] == rid:
+                        r["state"] = "DISMISSED"
+                if not any(r["state"] == "CHANGES_REQUESTED" for r in self.reviews):
+                    self.pr["reviewDecision"] = ""
+                return done(0, {})
+            raise AssertionError("unexpected write %r" % (argv,))
+        if path.endswith("/pulls/9/reviews?per_page=100"):
+            return done(0, self.reviews)
+        found = re.search(r"/pulls/9/reviews/(\d+)(/comments)?", path)
+        if found:
+            rid = int(found.group(1))
+            if found.group(2):
+                return done(0, self.inline.get(rid, []))
+            review = next((r for r in self.reviews if r["id"] == rid), None)
+            return done(0, review) if review else done(1, {}, "gh: Not Found (HTTP 404)")
+        found = re.search(r"/contents/([^?]+)\?ref=([0-9a-f]+)", path)
+        if found:
+            text = self.files.get((urllib.parse.unquote(found.group(1)), found.group(2)))
+            if text is None:
+                return done(1, {}, "gh: Not Found (HTTP 404)")
+            return done(0, {"content": base64.b64encode(text.encode()).decode(), "encoding": "base64"})
+        return super().route(argv, **kwargs)
+
+    def body_file(self, text="Looks right: R-CODE-3 holds.\n"):
+        path = self.world.state / "review-body.txt"
+        path.write_text(text)
+        return str(path)
+
+    def post(self, who="rdr1", verdict="approve", head=None, text=None, pr=None):
+        return self.run_as(who, "review", "post", pr or self.PR, "--head", head or self.HEAD, "--verdict", verdict, "--body-file", self.body_file(*([text] if text is not None else [])))
+
+    def dismiss(self, rid, reason="fixed in the last push", *more, who="rdr1"):
+        return self.run_as(who, "review", "dismiss", self.PR, "--review", str(rid), "--reason", reason, *more)
+
+    def audit_lines(self, event):
+        return [json.loads(l) for l in self.audit_path.read_text().splitlines() if l.strip() and json.loads(l).get("event") == event]
+
+    def blocking(self, rid=77, by="rdr1", head=None, state="CHANGES_REQUESTED"):
+        self.reviews.append({"id": rid, "user": {"login": "shared"}, "state": state, "commit_id": head or self.HEAD,
+                             "body": "Review of %s: CHANGES REQUESTED\n\nfinding\n\n%s" % (head or self.HEAD, sb.fleet_mark(by))})
+        self.pr["reviewDecision"] = "CHANGES_REQUESTED"
+
+    def finding(self, rid, text="    return old_value", line=4, path="src/widget.py"):
+        self.inline[rid] = [{"path": path, "line": line, "original_line": line, "diff_hunk": "@@ -1,3 +1,4 @@\n context\n+%s" % text}]
+
+    # -- the checks (each used by its test and, with a mutant patched in, expected to fail)
+
+    def check_post_marker(self):
+        self.reset()
+        for verdict, (word, event) in sb.REVIEW_POST_VERDICTS.items():
+            code, out, err = self.post(verdict=verdict)
+            self.assertEqual(code, 0, err)
+            self.assertTrue(self.posted, "no review was posted to the Reviews API")
+            sent = self.posted[-1]
+            self.assertEqual(sent["event"], event)
+            self.assertTrue(sent["body"].startswith("Review of %s: %s\n" % (self.HEAD, word)), sent["body"])
+            self.assertTrue(sent["body"].endswith(sb.fleet_mark("rdr1")), sent["body"])   # the one writer's text for the caller's registered name
+            self.assertEqual(sb.signed_by_fleet(sent["body"]), "rdr1")
+        self.assertEqual((len(self.posted), len(self.issue_comments)), (len(sb.REVIEW_POST_VERDICTS), 0))
+
+    def check_post_head_refusals(self):
+        self.reset()
+        cases = {"another head": dict(head=self.OLD), "a short head": dict(head=self.HEAD[:7]), "a verdict not in the list": dict(verdict="lgtm"),
+                 "an empty body": dict(text="  \n"), "a secret-shaped body": dict(text="token is %s\n" % self.SECRETS[0])}
+        for label, kw in cases.items():
+            code, out, err = self.post(**kw)
+            self.assertNotEqual(code, 0, label)
+            self.assertEqual(self.posted, [], label)
+            if label == "another head":
+                self.assertIn(self.OLD, err)
+                self.assertIn(self.HEAD, err)
+                self.assertIn("current head", err)
+
+    def check_dismiss_own_and_foreign(self):
+        self.reset()
+        self.blocking(77, by="rdr1")
+        self.blocking(78, by="rdr2")
+        self.finding(77, line=4)
+        self.files[("src/widget.py", self.HEAD)] = "a\nb\nc\n    return new_value\n"
+        code, out, err = self.dismiss(77)
+        self.assertEqual(code, 0, err)
+        self.assertEqual([d[0] for d in self.dismissed], [77])
+        lines = self.audit_lines("review.dismiss")
+        self.assertEqual(len(lines), 1)
+        self.assertEqual((lines[0]["detail"]["who"], lines[0]["detail"]["review"], lines[0]["detail"]["head"], lines[0]["detail"]["why"]), ("rdr1", 77, self.HEAD[:12], "fixed in the last push"))
+        code, out, err = self.dismiss(78)
+        self.assertNotEqual(code, 0)
+        self.assertEqual([d[0] for d in self.dismissed], [77])
+        self.assertEqual(len(self.audit_lines("review.dismiss")), 1)
+
+    def check_gates_line(self):
+        self.reset()
+        self.blocking(77, by="rdr1", head=self.OLD)
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        lines = [l for l in out.splitlines() if l.startswith("blocking review:")]
+        self.assertEqual(len(lines), 1, out)
+        self.assertIn("rdr1 CHANGES_REQUESTED at %s" % self.OLD[:12], lines[0])
+        self.assertIn("fleet-switchboard review dismiss", lines[0])
+        self.assertIn("--review 77", lines[0])
+
+    # -- the tests
+
+    def test_a_review_is_posted_with_the_first_line_and_the_readers_marker_for_each_verdict(self):
+        self.check_post_marker()
+
+    def test_each_refusal_posts_nothing_and_the_head_refusal_names_both_heads(self):
+        self.check_post_head_refusals()
+
+    def test_a_secret_shaped_value_is_never_echoed_by_the_refusal(self):
+        for secret in self.SECRETS:
+            with self.subTest(secret=secret):
+                code, out, err = self.post(text="found %s in the config\n" % secret)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(self.posted, [])
+                self.assertNotIn(secret, out + err)
+                self.assertNotIn(secret.split()[-1], out + err)
+        code, out, err = self.dismiss(77, "the key is %s" % self.SECRETS[0])
+        self.assertNotIn(self.SECRETS[0], out + err)
+
+    def test_on_the_same_accounts_own_pull_request_it_falls_back_to_a_comment_type_review_and_says_so(self):
+        for verdict in ("approve", "request-changes"):
+            with self.subTest(verdict=verdict):
+                self.reset()
+                self.refuse_own = True
+                code, out, err = self.post(verdict=verdict)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(len(self.posted), 1)
+                self.assertEqual(self.posted[0]["event"], "COMMENT")   # U5: the Reviews API's comment event
+                self.assertEqual(self.issue_comments, [])
+                self.assertIn("comment-type review", out)
+                self.assertTrue(self.posted[0]["body"].endswith(sb.fleet_mark("rdr1")))
+
+    def test_the_caller_must_be_a_registered_reader_or_reviewer_and_is_named_by_its_registered_name(self):
+        self.reset()
+        self.blocking(77, by="coder")
+        for who in ("coder", None):
+            with self.subTest(who=who):
+                self.assertNotEqual(self.post(who=who)[0], 0)
+                self.assertNotEqual(self.dismiss(77, who=who)[0], 0)
+        self.assertEqual((self.posted, self.dismissed, self.audit_lines("review.dismiss")), ([], [], []))
+        self.assertEqual(self.post(who="rdr2")[0], 0)
+        self.assertEqual(sb.signed_by_fleet(self.posted[0]["body"]), "rdr2")
+
+    def test_a_reader_dismisses_only_its_own_review_after_the_cited_line_changed_and_audits_it(self):
+        self.check_dismiss_own_and_foreign()
+
+    def test_foreign_review_ids_are_never_dismissed(self):
+        self.reset()
+        for rid in (81, 82, 83):
+            self.blocking(rid, by="rdr2")
+            self.assertNotEqual(self.dismiss(rid)[0], 0)
+        self.assertEqual(self.dismissed, [])
+
+    def test_a_finding_whose_cited_line_is_unchanged_at_the_current_head_is_refused_unless_withdrawn(self):
+        self.reset()
+        self.blocking(77)
+        self.finding(77, text="    return old_value", line=4)
+        self.files[("src/widget.py", self.HEAD)] = "a\nb\nc\n    return old_value\n"
+        code, out, err = self.dismiss(77)
+        self.assertNotEqual(code, 0)
+        self.assertIn("finding still holds at %s: src/widget.py:4" % self.HEAD, err)
+        self.assertEqual((self.dismissed, self.audit_lines("review.dismiss")), ([], []))
+        self.files[("src/widget.py", self.HEAD)] = "a\nb\nc\n    return new_value\n"
+        self.assertEqual(self.dismiss(77)[0], 0)
+        self.assertEqual(len(self.dismissed), 1)
+        self.reset()
+        self.blocking(77)
+        self.finding(77)
+        self.files[("src/widget.py", self.HEAD)] = "a\nb\nc\n    return old_value\n"
+        self.assertEqual(self.dismiss(77, "the finding was wrong: the value is checked above", "--withdraw")[0], 0)
+
+    def test_gates_prints_the_blocking_review_at_the_older_head_and_not_after_it_is_dismissed(self):
+        self.check_gates_line()
+        self.assertEqual(self.dismiss(77, "withdrawn", "--withdraw")[0], 0)
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        self.assertNotIn("blocking review:", out)
+
+    def test_every_refusal_writes_no_dismissal_audit_line_and_nothing_is_posted_or_dismissed(self):
+        self.reset()
+        self.blocking(77, by="rdr1")
+        self.blocking(78, by="rdr2")
+        self.blocking(79, by="rdr1", state="APPROVED")
+        self.finding(77)
+        self.files[("src/widget.py", self.HEAD)] = "a\nb\nc\n    return old_value\n"
+        refusals = [("no reason", lambda: self.dismiss(77, " ")), ("a secret in the reason", lambda: self.dismiss(77, self.SECRETS[0])),
+                    ("no registered role", lambda: self.dismiss(77, who="coder")), ("a foreign review", lambda: self.dismiss(78)),
+                    ("a review that is not blocking", lambda: self.dismiss(79)), ("an unknown review", lambda: self.dismiss(99)),
+                    ("the finding unchanged", lambda: self.dismiss(77)), ("a bad head", lambda: self.post(head=self.OLD))]
+        for label, run in refusals:
+            with self.subTest(label):
+                self.assertNotEqual(run()[0], 0)
+        self.assertEqual((self.posted, self.dismissed, self.audit_lines("review.dismiss"), self.audit_lines("review.post")), ([], [], [], []))
+
+    def test_the_marker_has_one_writer_and_the_existing_recording_paths_text_is_unchanged(self):
+        self.assertEqual(sb.fleet_mark("rdr1"), "<!-- fleet-switchboard:from=rdr1 -->")
+        source = (REPO / "bin" / "fleet-switchboard").read_text()
+        self.assertEqual(len(re.findall(r"fleet-switchboard:from=%s", source)), 1)   # the one function that builds the marker
+        self.assertEqual(len(re.findall(r"def cmd_review_post", source)), 1)
+
+    # -- the mutants (S6 and S10): each fails at least one of the checks above
+
+    def mutant_fails(self, check, **patches):
+        with contextlib.ExitStack() as stack:
+            for name, value in patches.items():
+                stack.enter_context(mock.patch.object(sb, name, value))
+            with self.assertRaises(AssertionError):
+                check()
+
+    def test_the_mutant_that_skips_the_head_check_fails(self):
+        self.mutant_fails(self.check_post_head_refusals, review_head_problem=lambda given, current: None)
+
+    def test_the_mutant_that_omits_the_marker_fails(self):
+        self.mutant_fails(self.check_post_marker, fleet_mark=lambda name: "")
+
+    def test_the_mutant_that_posts_an_issue_comment_fails(self):
+        self.mutant_fails(self.check_post_marker, review_post_path=lambda repo, number: "repos/%s/issues/%d/comments" % (repo, number))
+
+    def test_the_mutant_that_dismisses_anyones_review_fails(self):
+        self.mutant_fails(self.check_dismiss_own_and_foreign, review_is_own=lambda review, name: True)
+
+    def test_the_mutant_that_skips_the_audit_fails(self):
+        self.mutant_fails(self.check_dismiss_own_and_foreign, review_dismiss_audit=lambda *a, **k: None)
+
+    def test_the_mutant_that_prints_no_blocker_fails(self):
+        self.mutant_fails(self.check_gates_line, blocking_review_lines=lambda *a, **k: [])
+
+    # -- the definitions and the documentation (S11)
+
+    BARE_POST = re.compile(r"pulls/[^\s`]*/reviews|gh pr review|/dismissals")
+
+    def test_no_reviewer_definition_or_skill_names_the_bare_github_command_and_the_docs_name_both_commands(self):
+        files = sorted((REPO / "agents" / "reviewers").glob("*.md")) + [REPO / "skills" / "fleet-review" / "SKILL.md"]
+        self.assertEqual([f.name for f in files if self.BARE_POST.search(f.read_text())], [])
+        for path in files:
+            with self.subTest(path=path.name):
+                text = path.read_text()
+                self.assertIn("review post", text)
+                self.assertIn("review dismiss", text)
+        docs = (REPO / "docs" / "switchboard.md").read_text()
+        section = docs.split("### Reviews a reader posts and dismisses", 1)[1].split("\n### ", 1)[0]
+        self.assertIn("fleet-switchboard review post", section)
+        self.assertIn("fleet-switchboard review dismiss", section)
+        self.assertRegex(section, r"cloud reader.*token allows")
+
+
 class TestReviewerSubagents(LedgerBase):
     """#179 slice L2: the four reviewer agents, `review laws` (from the base commit) and `review record` with its shadow line in `gates`."""
 
