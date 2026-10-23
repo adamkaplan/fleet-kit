@@ -38,6 +38,7 @@ SHAPES = {"XS": {"cpu": "1", "memory": "2Gi", "usd_per_hour": 0.05, "stack": Fal
           "S": {"cpu": "2", "memory": "4Gi", "usd_per_hour": 0.10, "stack": True},
           "M": {"cpu": "4", "memory": "8Gi", "usd_per_hour": 0.20, "stack": True}}  # list-price estimates, not billed figures
 DEFAULT_SHAPE = "XS"        # a create that names no shape and is not a stack launch (S, M by name only)
+DEFAULT_ORCHESTRATOR_SHAPE = "S"   # an orchestrator launch that names no shape keeps the size it had before XS existed (the role table carries no shape: this is the one place)
 DEFAULT_STACK_SHAPE = "S"   # a stack launch that names no shape (its row must carry stack: true)
 MAX_TOKEN_SECONDS = 3600
 
@@ -1011,7 +1012,7 @@ def pod_deadline_floor(max_hard):
 def check_shape(a):
     """Set a.shape when it names none (XS, or S for a stack launch) and refuse an unknown name, or a row that cannot run a stack, with --stack."""
     if getattr(a, "shape", None) is None:
-        a.shape = DEFAULT_STACK_SHAPE if getattr(a, "stack", False) else DEFAULT_SHAPE
+        a.shape = DEFAULT_STACK_SHAPE if getattr(a, "stack", False) else DEFAULT_ORCHESTRATOR_SHAPE if getattr(a, "agent", None) == "orchestrator" else DEFAULT_SHAPE
     if a.shape not in SHAPES:
         raise CloudError("shape must be one of %s" % ", ".join(SHAPES), EXIT_USAGE)
     if getattr(a, "stack", False) and not SHAPES[a.shape]["stack"]:
@@ -2221,7 +2222,7 @@ def build_parser():
     c.add_argument("--idle", default="10m")
     c.add_argument("--hard", default="2h")
     c.add_argument("--max-hard", default=DEFAULT_MAX_HARD)
-    c.add_argument("--shape", default=None, help="the pod shape, one of %s; unset: %s (%s with --stack)" % (", ".join(SHAPES), DEFAULT_SHAPE, DEFAULT_STACK_SHAPE))
+    c.add_argument("--shape", default=None, help="the pod shape, one of %s; unset: %s (%s with --stack or --agent orchestrator)" % (", ".join(SHAPES), DEFAULT_SHAPE, DEFAULT_STACK_SHAPE))
     c.add_argument("--image")
     c.add_argument("--stack", action="store_true",
                    help="a pod for a worker that runs a nested Docker stack: the Sysbox runtime class, its own user namespace, the pool's node label; off by default (the default pod is unchanged)")

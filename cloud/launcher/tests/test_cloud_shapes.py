@@ -221,5 +221,39 @@ class Parity(unittest.TestCase):
         self.assertNotRegex(text, r"(?i)default[^.\n]{0,40}`S`|`S`[^.\n]{0,40}own default")   # no remaining sentence says S is the default (except for a stack: worded "Leave it out for `S`")
 
 
+class OrchestratorDefault(unittest.TestCase):
+    def shape(self, **kw):
+        a = argparse.Namespace(**kw)
+        cw.check_shape(a)
+        return a.shape
+
+    def test_orchestrator_default_is_s(self):
+        s = self.shape(agent="orchestrator")
+        self.assertEqual(s, "S")
+        self.assertEqual((cw.SHAPES[s]["cpu"], cw.SHAPES[s]["memory"]), ("2", "4Gi"))
+
+    def test_worker_default_is_xs(self):
+        self.assertEqual(self.shape(agent="worker"), "XS")
+        self.assertEqual(self.shape(), "XS")
+
+    def test_stack_default_is_s(self):
+        self.assertEqual(self.shape(stack=True), "S")
+
+    def test_orchestrator_explicit_shape_honoured(self):
+        self.assertEqual(self.shape(agent="orchestrator", shape="M"), "M")
+
+    def test_mutant_ignoring_agent_fails_test_1(self):
+        real = cw.check_shape
+        def mutant(a):
+            a.agent = None
+            return real(a)
+        cw.check_shape = mutant
+        try:
+            with self.assertRaises(AssertionError):
+                self.test_orchestrator_default_is_s()
+        finally:
+            cw.check_shape = real
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -193,7 +193,7 @@ fleet-switchboard retire coder7
 
 ### The light shape (`XS`) and the other shapes
 
-A worker started with no `--shape` and no `--stack` gets `XS` (1 CPU, 2 GiB), the light shape and the default (requests equal limits, no nested Docker). Seven of them are meant to fit on one 8-CPU node (a live check reads the node's requested CPU back; if the system pods ask for more, the number is six and this section says so). `S` (2 CPU, 4 GiB) and `M` (4 CPU, 8 GiB) are chosen only by name: `--shape S`.
+A worker started with no `--shape` and no `--stack` gets `XS` (1 CPU, 2 GiB), the light shape and the default (requests equal limits, no nested Docker). Seven of them are meant to fit on one 8-CPU node (a live check reads the node's requested CPU back; if the system pods ask for more, the number is six and this section says so). `S` (2 CPU, 4 GiB) and `M` (4 CPU, 8 GiB) are chosen only by name: `--shape S`. A worker gets `XS` and an orchestrator (`--agent orchestrator`) gets `S` when `--shape` is not given.
 
 - Belongs in `XS`: a reader (code reading and review), a planner, a tester running short tests, a small edit and commit.
 - Does not belong in `XS`: a nested Docker stack (`--stack` refuses `XS`), an image build, a long full test suite or a build with a large memory peak: name `--shape S` or `M` for those.
