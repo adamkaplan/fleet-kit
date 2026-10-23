@@ -15991,6 +15991,107 @@ def friction_status_line(config, state_dir, now=None):
         "%02d:00" % hour if hour is not None else "every 24 h", section["to"], section["cos_to"], last)
 
 
+# ---- the audited resume (docs/switchboard.md, "A blocked agent is reported"). ONE function resumes an agent whose turn has ended: the
+# `resume` command and the blocked-report pass both call `resume_ended_turn`, so the refusals, the rate limit and the audit line are the same.
+
+RESUME_STATE = "resumes.json"   # {agent: {"at": epoch}}: the last resume of each agent (the rate limit; an ordinary state row)
+RESUME_SECONDS = 600            # one resume per agent per 10 minutes
+RESUME_TEXT = "Your last turn ended without a finished answer (for example a provider error). Carry on from where you stopped."
+RESUME_REASON = "its turn ended and nothing is open"
+RESUME_COMMAND = PROG + " resume"   # the one spelling the report, the documentation, the help and the owner's grant use
+PROVIDER_ERROR = re.compile(r"\b499\b|ECONNRESET|time(?:d)?[ -]?out", re.I)
+
+
+class ResumeRefused(Exception):
+    """The resume was not sent: the reason is the message, and nothing was written."""
+
+
+def last_turn_error(engine, session_id):
+    """The error text of the session's newest message, or "" (none, or it could not be read)."""
+    try:
+        newest = (engine.v2.message_list(session_id, limit=1, order="desc") or [None])[0]
+    except Exception:
+        return ""
+    error = (newest.get("error") or (newest.get("info") or {}).get("error")) if isinstance(newest, dict) else None
+    return _one_line(json.dumps(error) if not isinstance(error, str) else error, 300) if error else ""
+
+
+def resume_ended_turn(engine, caller, name, reason, discovery=None):
+    """Send the resume text to `name`'s session, only when its turn has ended and nothing is open. Raises ResumeRefused (nothing sent, nothing
+    audited) for a missing or unreadable agent, a working session, an open permission request or question (that goes to the owner), and an agent
+    resumed less than RESUME_SECONDS ago. Otherwise one `resume` audit line (who, whom, why) and the send; returns the message id."""
+    caller, reason = blocked_sender(caller), _one_line(reason or RESUME_REASON, 200)
+    now = engine.now()
+    discovery = discovery if discovery is not None else engine.discover(now)
+    seen = discovery.agents.get(name)
+    if seen is None:
+        raise ResumeRefused(discovery.missing(name))
+    seen, why = engine.reobserve(seen, now)   # a read before a write
+    if seen is None:
+        raise ResumeRefused(why)
+    if seen.conflict or seen.problem:
+        raise ResumeRefused(seen.problem or "%s is claimed by more than one session" % name)
+    if seen.status == "working":
+        raise ResumeRefused("%s is working: nothing is sent to a session that is working" % name)
+    if seen.status not in ("idle", "blocked", "working"):
+        raise ResumeRefused("%s has status %s in herdr: only an ended turn is resumed" % (name, seen.status))
+    try:
+        opened = [("permission request", engine.v2.permission_list(seen.session_id)), ("question", engine.v2.form_list(seen.session_id))]
+    except V2Error as err:
+        raise ResumeRefused("v2 unreachable, so an open request cannot be ruled out: %s" % _one_line(str(err), 120)) from None
+    kinds = [kind for kind, found in opened if found]
+    if kinds:
+        raise ResumeRefused("%s has an open %s: that goes to the owner, nothing is sent" % (name, " and an open ".join(kinds)))
+    taken = {}
+
+    def take(state):   # the rate record, under the lock: a second resume inside the window finds this one
+        last = state.get(name, {}).get("at")
+        taken["last"] = last
+        if _is_number(last) and now - last < RESUME_SECONDS:
+            return None
+        state[name] = {"at": now}
+        taken["ok"] = True
+        return state
+    blocked_update(engine.state_dir, RESUME_STATE, take)
+    if not taken.get("ok"):
+        raise ResumeRefused("%s was resumed %d minutes ago: one resume per agent per %d minutes" % (name, int((now - taken["last"]) // 60), RESUME_SECONDS // 60))
+    keys = ["resume:%d" % now]
+    message_id = derive_message_id(seen.session_id, keys)
+    try:
+        engine.v2.synthetic(seen.session_id, RESUME_TEXT, {"fleet": {"keys": keys, "from": "switchboard"}}, True, "queue", message_id,
+                            "Resume: your turn ended, carry on")
+    except Exception:
+        blocked_update(engine.state_dir, RESUME_STATE, lambda s: dict(s, **{name: {"at": taken["last"]}}) if _is_number(taken["last"]) else {k: v for k, v in s.items() if k != name})
+        raise
+    engine.reads.forget(seen.session_id)
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "resume", name, {"by": caller, "reason": reason, "session": seen.session_id, "message_id": message_id})
+    return message_id
+
+
+def resume_first_recovery(engine, discovery, seen, reported):
+    """The automatic first recovery of the blocked report: a stop whose turn error holds HTTP 499, ECONNRESET or a timeout is resumed once,
+    through `resume_ended_turn` (the same refusals, rate limit and audit line), before it is reported. True when it was resumed; never raises."""
+    try:
+        error = last_turn_error(engine, seen.session_id) if reported is None else ""
+        found = PROVIDER_ERROR.search(error)
+        if not found:
+            return False
+        resume_ended_turn(engine, "switchboard", seen.name, "the blocked report found a provider error (%s) after an ended turn" % found.group(0), discovery)
+        return True
+    except Exception:
+        return False
+
+
+def ended_turn_text(name, resumed):
+    """What the blocked report says of an ended turn with nothing open: the real command, or that it was just resumed."""
+    if resumed:
+        return ("an ended turn after a provider error: the switchboard resumed it once just now (`%s %s`, audited); "
+                "a second stop within %d minutes is reported as usual" % (RESUME_COMMAND, name, RESUME_SECONDS // 60))
+    return ("an ended turn with nothing open (the terminal shows it blocked, often after a provider error; not a real question): "
+            "the Chief of Staff may resume it with `%s %s`, which is audited and sends nothing while it works or has anything open" % (RESUME_COMMAND, name))
+
+
 # ---- a long block is reported (docs/switchboard.md, "A blocked agent is reported"). `hold_reason` holds a message for an agent
 # the terminal shows as blocked: nothing is typed into a prompt, and that is right. The missing part was the report. Once per
 # block (repeated at most every `repeat_minutes`, closed with one final line) its boss and the Chief of Staff are told. It reads
@@ -16027,7 +16128,7 @@ def blocked_alert_section(config):
     return dict(BLOCKED_ALERT_DEFAULTS, **(raw or {}))
 
 
-def blocked_kind(engine, observation):
+def blocked_kind(engine, observation, resumed=False):
     """What a blocked agent waits on, in words, as the pass read it: an open permission request or question, or (nothing open) an ended turn."""
     source = next((s for s in engine.sources if isinstance(s, WorkerFacts)), None)
     if source is None:
@@ -16035,8 +16136,7 @@ def blocked_kind(engine, observation):
     kinds = sorted({kind for who, kind, _ in source.requests if who.session_id == observation.session_id})
     if kinds:
         return "an open %s; it goes to the owner" % " and an open ".join("%s request" % k if k == "permission" else k for k in kinds)
-    return ("an ended turn with nothing open (the terminal shows it blocked, often after a provider error; not a real question): "
-            "the Chief of Staff may resume it with one `poke`, which is audited")
+    return ended_turn_text(observation.name, resumed)
 
 
 BLOCKED_HELD_SENDS = "blocked-held-sends.json"   # {agent: {"rows": [{"from", "at"}]}}: sends refused while it was blocked (a `send` stores nothing, so the report counts them here)
@@ -16180,7 +16280,7 @@ def blocked_tick(engine, discovery, held):
             event = "blocked.repeat"
         else:
             continue
-        kind = blocked_kind(engine, seen)
+        kind = blocked_kind(engine, seen, resume_first_recovery(engine, discovery, seen, last))
         tell(seen, blocked_line(engine, seen, entry["since"], now, messages, refusals, kind),
              event, {"since": iso(entry["since"]), "held": len(messages), "refused": len(refusals)})
         entry["reported"] = now
@@ -19196,6 +19296,41 @@ def cmd_ensure(args, spawn=subprocess.Popen):
     outcome = ensure_daemon(state, spawn)
     print("daemon %s" % outcome)
     return EXIT_OK
+
+
+def cmd_resume(args, runner, now):
+    """`resume AGENT [--reason TEXT]`: the audited resume of an agent whose turn has ended (the same `resume_ended_turn` the blocked report uses).
+    Refused (exit 3, nothing sent) for a working session, an open permission request or question, and an agent resumed in the last 10 minutes."""
+    engine, _, _ = build_engine(runner, now, "cli")
+    if args.sender is not None:
+        if os.environ.get(LAB_ENV) != "1":
+            sys.stderr.write("%s: --from is only for the Lab (%s=1); an agent is identified by its pane\n" % (PROG, LAB_ENV))
+            return EXIT_USAGE
+        caller = args.sender
+    else:
+        caller = identify_caller(engine.herdr, engine.v2, os.environ)
+    try:
+        message_id = resume_ended_turn(engine, caller, args.name, args.reason)
+    except ResumeRefused as err:
+        sys.stderr.write("%s: not resumed: %s\n" % (PROG, _one_line(str(err), 300)))
+        return EXIT_HELD
+    print(message_id)
+    sys.stderr.write("%s: resumed %s (audited)\n" % (PROG, args.name))
+    return EXIT_OK
+
+
+cmd_resume.ensure_on_use = True
+
+
+def add_resume_parsers(sub):
+    resume = sub.add_parser("resume", help="Resume an agent whose turn has ended (audited; one per agent per 10 minutes)",
+                            description="`%s AGENT` sends the resume text to AGENT's session only when its turn has ended and nothing is open. It refuses "
+                                        "an agent with an open permission request or question (that goes to the owner), a session that is working, and an "
+                                        "agent resumed in the last %d minutes. Each resume writes one audit line naming who resumed whom and why."
+                                        % (RESUME_COMMAND, RESUME_SECONDS // 60))
+    resume.add_argument("name", metavar="AGENT")
+    resume.add_argument("--reason", default=RESUME_REASON, help="why, for the audit line (default: %(default)s)")
+    resume.add_argument("--from", dest="sender", default=None, help=argparse.SUPPRESS)
 
 
 def cmd_poke(args):

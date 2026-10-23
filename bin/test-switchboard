@@ -13619,7 +13619,7 @@ class TestCosTriageAllowRule(unittest.TestCase):
         for rel in self.FILES:
             with self.subTest(file=rel):
                 got = [m.group(1) for l in self._lines(rel) for m in [re.match(r'  - \{action: shell, resource: "fleet-switchboard ([a-z]+) \*", effect: allow\}$', l)] if m]
-                self.assertEqual(sorted(got), sorted(old[rel.split("/")[-1]] + ["triage", "move", "reassign"]))
+                self.assertEqual(sorted(got), sorted(old[rel.split("/")[-1]] + ["triage", "move", "reassign", "resume"]))
 
 
 class TestCosDelegatedClearPermission(unittest.TestCase):
@@ -47360,6 +47360,7 @@ USE_COMMANDS = {
     "bootstrap": ["bootstrap"], "notice": ["notice", "pr", "acme/api#7", "--from", "coder"],
     "move": ["move", "1", "--to", "2", "--from", "coder"], "reassign": ["reassign", "coder", "--undo", "--from", "coder"],
     "charter": ["charter", "set", "coder", "1", "--from", "coder"],
+    "resume": ["resume", "other"],
 }
 
 
@@ -85171,6 +85172,345 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
                 self.assertIn(str(path.relative_to(BIN.parent)), DERIVED_VIEWS, "%s reads an old agent list: read the registry or list it as derived" % path)
 
 
+class TestResume(Base):
+    """#1110: ONE audited `resume AGENT` command and ONE shared function (`resume_ended_turn`) that the blocked-report pass also calls."""
+    COMMAND = "fleet-switchboard resume coder"
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={})
+        for name, fleet in (("cos", {"role": "chief-of-staff"}), ("platform", {"role": "orchestrator", "reports_to": "cos"}),
+                            ("coder", {"role": "coder", "reports_to": "platform"})):
+            self.world.add_agent(name, fleet=fleet)
+        self.pane = self.world.herdr.panes[self.world.panes["coder"]]
+        self.sid = self.world.sessions["coder"]
+        self.pane["status"] = "blocked"   # the terminal shows an ended turn as blocked
+        os.environ[sb.LAB_ENV] = "1"
+
+    def cli(self, *argv):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        with captured() as (out, err):
+            code = sb.main(["resume"] + list(argv), runner=self.world.route, now=self.world.clock.now)
+        return code, out.getvalue(), err.getvalue()
+
+    def resumes(self):
+        return [a for a in self.world.admissions("coder") if a["text"] == sb.RESUME_TEXT]
+
+    def audited(self):
+        return [e for e in self.world.audit() if e["event"] == "resume"]
+
+    def provider_error(self, text="HTTP 499 client closed request"):
+        self.world.v2.sessions[self.sid]["messages"].append({"id": "msg_err1", "type": "assistant", "error": {"type": "provider", "message": text}})
+
+    def test_an_agent_with_an_ended_turn_is_sent_the_resume_text_once_with_one_audit_line(self):
+        code, out, err = self.cli("coder", "--from", "cos", "--reason", "a provider error stopped it")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.resumes()), 1)
+        (line,) = self.audited()
+        self.assertEqual(line["subject"], "coder")
+        self.assertEqual(line["detail"]["by"], "cos")
+        self.assertIn("provider error", line["detail"]["reason"])
+
+    def test_a_working_session_is_refused_and_nothing_is_sent(self):
+        self.pane["status"] = "working"
+        code, _, err = self.cli("coder", "--from", "cos")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertIn("working", err)
+        self.assertEqual((self.resumes(), self.audited()), ([], []))
+
+    def test_an_open_permission_request_is_refused_and_goes_to_the_owner(self):
+        self.world.v2.ask_permission(self.sid)
+        code, _, err = self.cli("coder", "--from", "cos")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertIn("owner", err)
+        self.assertIn("permission request", err)
+        self.assertEqual((self.resumes(), self.audited()), ([], []))
+
+    def test_an_open_question_is_refused_and_goes_to_the_owner(self):
+        self.world.v2.ask_form(self.sid)
+        code, _, err = self.cli("coder", "--from", "cos")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertIn("question", err)
+        self.assertEqual((self.resumes(), self.audited()), ([], []))
+
+    def test_a_second_resume_inside_ten_minutes_is_refused_and_one_after_it_is_sent(self):
+        self.assertEqual(self.cli("coder", "--from", "cos")[0], 0)
+        self.world.tick(300)
+        code, _, err = self.cli("coder", "--from", "cos")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertIn("one resume per agent per 10 minutes", err)
+        self.assertEqual((len(self.resumes()), len(self.audited())), (1, 1))
+        self.world.tick(400)
+        self.assertEqual(self.cli("coder", "--from", "cos")[0], 0)
+        self.assertEqual((len(self.resumes()), len(self.audited())), (2, 2))
+
+    def test_an_unknown_agent_is_refused(self):
+        code, _, err = self.cli("nobody", "--from", "cos")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertIn("nobody", err)
+
+    def test_the_help_the_report_and_the_docs_name_one_command_spelling(self):
+        (action,) = [a for a in sb.build_parser()._actions if a.__class__.__name__ == "_SubParsersAction"]
+        help_text = " ".join(action.choices["resume"].format_help().split())
+        docs = " ".join((REPO / "docs" / "switchboard.md").read_text().split())
+        report = sb.ended_turn_text("coder", False)
+        spellings = set()
+        for text in (help_text, docs, report):
+            self.assertIn("fleet-switchboard resume", text)
+            spellings |= set(re.findall(r"fleet-switchboard resume", text))
+        self.assertEqual(spellings, {"fleet-switchboard resume"})
+        self.assertNotIn("one `poke`", docs)
+        self.assertNotIn("one `poke`", report)
+
+    # -- the blocked report and the automatic first recovery
+
+    def block(self):
+        self.world.engine.send("platform", "coder", "message for the blocked coder")
+        self.world.tick(90)
+        self.passes()
+
+    def passes(self):
+        self.world.engine.run_pass()
+        self.world.engine.run_pass()
+
+    def wait(self, minutes):
+        self.world.tick(minutes * 60)
+        self.passes()
+
+    def told(self):
+        return [t for t in self.world.admissions("cos") if "Blocked agent" in t["text"]]
+
+    def test_the_report_of_an_ended_turn_names_the_real_command_with_the_agents_name(self):
+        self.block()
+        self.wait(25)
+        (found,) = self.told()
+        self.assertIn(self.COMMAND, found["text"])
+        self.assertNotIn("poke", found["text"])
+        self.assertEqual(self.resumes(), [], "no provider error in the turn: not resumed by the pass")
+
+    def test_the_report_of_an_open_request_says_only_the_owner_can_resume_it_and_names_no_command(self):
+        self.world.v2.ask_permission(self.sid)
+        self.block()
+        self.wait(25)
+        (found,) = self.told()
+        self.assertIn("owner", found["text"])
+        self.assertEqual(found["text"].count("fleet-switchboard resume"), 0)
+
+    def test_a_provider_error_is_resumed_once_before_the_report_and_the_report_says_so(self):
+        self.provider_error()
+        self.block()
+        self.wait(25)
+        self.assertEqual(len(self.resumes()), 1)
+        (line,) = self.audited()
+        self.assertEqual(line["detail"]["by"], "switchboard")
+        self.assertIn("499", line["detail"]["reason"])
+        (found,) = self.told()
+        self.assertIn("resumed", found["text"])
+        self.wait(5)
+        self.assertEqual(len(self.resumes()), 1, "the second pass does not resume again")
+
+    def test_each_provider_error_form_is_recognised_and_another_error_is_not_resumed(self):
+        for text, count in (("read ECONNRESET", 1), ("the request timed out", 1), ("invalid api key", 0)):
+            with self.subTest(error=text):
+                for kept in (sb.RESUME_STATE, sb.BLOCKED_ALERT_STATE, sb.BLOCKED_HELD_SENDS):   # one world per error: nothing of the last one's records
+                    (sb.ensure_state_dir() / kept).unlink() if (sb.ensure_state_dir() / kept).exists() else None
+                world = World(self, agents=(), config={})
+                for name, fleet in (("cos", {"role": "chief-of-staff"}), ("coder", {"role": "coder", "reports_to": "cos"})):
+                    world.add_agent(name, fleet=fleet)
+                world.herdr.panes[world.panes["coder"]]["status"] = "blocked"
+                world.v2.sessions[world.sessions["coder"]]["messages"].append({"id": "msg_e", "type": "assistant", "error": {"message": text}})
+                world.engine.send("cos", "coder", "held message")
+                world.tick(90)
+                world.engine.run_pass()
+                world.tick(25 * 60)
+                world.engine.run_pass()
+                world.engine.run_pass()
+                self.assertEqual(len([a for a in world.admissions("coder") if a["text"] == sb.RESUME_TEXT]), count)
+
+    def test_a_second_stop_inside_ten_minutes_is_reported_as_before_without_a_resume(self):
+        self.provider_error()
+        self.assertEqual(self.cli("coder", "--from", "cos")[0], 0)   # a resume a few minutes ago
+        self.provider_error()
+        self.world.engine.send("platform", "coder", "message for the blocked coder")
+        self.world.tick(60)
+        with mock.patch.object(sb, "RESUME_SECONDS", 3600):   # the stop is reported 25 minutes in; the window of the first resume is still open
+            self.passes()
+            self.wait(25)
+        self.assertEqual(len(self.resumes()), 1)
+        (found,) = self.told()
+        self.assertNotIn("resumed it once just now", found["text"])
+        self.assertIn(self.COMMAND, found["text"])
+
+    def test_the_pass_does_not_resume_an_agent_with_an_open_request_or_a_working_session(self):
+        self.provider_error()
+        self.world.v2.ask_permission(self.sid)
+        self.block()
+        self.wait(25)
+        self.assertEqual(self.resumes(), [])
+        self.assertEqual(self.audited(), [])
+
+    # -- every refusal and failure branch of `resume_ended_turn` (#1110, R-TEST-5): a row per branch, derived from the code by `test_every_branch_has_a_row`
+
+    def stamp(self):
+        path = Path(str(self.world.state)) / sb.RESUME_STATE
+        return json.loads(path.read_text()) if path.exists() else {}
+
+    def no_effect(self, code, err, line):
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertIn(line, err)
+        self.assertEqual((self.resumes(), self.audited(), self.stamp()), ([], [], {}), "a refused resume sends, audits and stamps nothing")
+
+    def after_reobserve(self, change):
+        real = sb.Switchboard.reobserve
+
+        def reobserve(engine, previous, now):
+            seen, why = real(engine, previous, now)
+            return change(seen, why)
+        return mock.patch.object(sb.Switchboard, "reobserve", reobserve)
+
+    def test_branch_unknown_agent(self):
+        self.no_effect(*(lambda r: (r[0], r[2], "nobody not found"))(self.cli("nobody", "--from", "cos")))
+
+    def test_branch_the_agent_cannot_be_read_again(self):
+        with self.after_reobserve(lambda seen, why: (None, "pane p9 of coder cannot be read: gone")):
+            self.no_effect(*(lambda r: (r[0], r[2], "cannot be read: gone"))(self.cli("coder", "--from", "cos")))
+
+    def test_branch_an_agent_claimed_by_two_sessions(self):
+        def change(seen, why):
+            seen.conflict = ["ses_other"]
+            return seen, why
+        with self.after_reobserve(change):
+            self.no_effect(*(lambda r: (r[0], r[2], "claimed by more than one session"))(self.cli("coder", "--from", "cos")))
+
+    def test_branch_an_agent_with_a_problem(self):
+        def change(seen, why):
+            seen.problem = "coder runs the wrong program"
+            return seen, why
+        with self.after_reobserve(change):
+            self.no_effect(*(lambda r: (r[0], r[2], "wrong program"))(self.cli("coder", "--from", "cos")))
+
+    def test_branch_a_working_session(self):
+        self.pane["status"] = "working"
+        self.no_effect(*(lambda r: (r[0], r[2], "nothing is sent to a session that is working"))(self.cli("coder", "--from", "cos")))
+
+    def test_branch_a_status_that_is_not_an_ended_turn(self):
+        def change(seen, why):
+            seen.status = "unknown"
+            return seen, why
+        with self.after_reobserve(change):
+            self.no_effect(*(lambda r: (r[0], r[2], "only an ended turn is resumed"))(self.cli("coder", "--from", "cos")))
+
+    def test_branch_v2_unreachable_fails_closed(self):
+        with mock.patch.object(sb.V2Client, "permission_list", side_effect=sb.V2Error("down")):
+            self.no_effect(*(lambda r: (r[0], r[2], "an open request cannot be ruled out"))(self.cli("coder", "--from", "cos")))
+
+    def test_branch_an_open_request_or_question(self):
+        self.world.v2.ask_permission(self.sid)
+        self.no_effect(*(lambda r: (r[0], r[2], "an open permission request: that goes to the owner"))(self.cli("coder", "--from", "cos")))
+
+    def test_branch_a_second_resume_inside_the_window_and_at_its_edge(self):
+        self.assertEqual(self.cli("coder", "--from", "cos")[0], 0)
+        stamped = self.stamp()
+        self.world.tick(sb.RESUME_SECONDS - 1)
+        code, _, err = self.cli("coder", "--from", "cos")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertIn("one resume per agent per 10 minutes", err)
+        self.assertEqual((len(self.resumes()), len(self.audited()), self.stamp()), (1, 1, stamped))
+        self.world.tick(1)   # exactly RESUME_SECONDS after the first: allowed again
+        self.assertEqual(self.cli("coder", "--from", "cos")[0], 0)
+        self.assertEqual(len(self.resumes()), 2)
+
+    def test_branch_a_send_that_fails_rolls_the_stamp_back_and_a_retry_works(self):
+        with mock.patch.object(sb.V2Client, "synthetic", side_effect=sb.V2Error("send failed")):
+            with self.assertRaises(sb.V2Error):
+                sb.resume_ended_turn(self.world.new_engine("cli"), "cos", "coder", None)
+        self.assertEqual((self.resumes(), self.audited(), self.stamp()), ([], [], {}))
+        self.assertEqual(self.cli("coder", "--from", "cos")[0], 0, "the failed send did not use up the window")
+        self.assertEqual((len(self.resumes()), len(self.audited())), (1, 1))
+
+    def test_branch_a_failed_send_restores_an_older_stamp(self):
+        self.assertEqual(self.cli("coder", "--from", "cos")[0], 0)
+        older = self.stamp()
+        self.world.tick(sb.RESUME_SECONDS + 5)
+        with mock.patch.object(sb.V2Client, "synthetic", side_effect=sb.V2Error("send failed")):
+            with self.assertRaises(sb.V2Error):
+                sb.resume_ended_turn(self.world.new_engine("cli"), "cos", "coder", None)
+        self.assertEqual(self.stamp(), older)
+
+    def test_an_audit_write_that_fails_after_the_send_keeps_the_stamp_so_the_agent_is_not_resumed_twice(self):
+        with mock.patch.object(sb.AuditLog, "append", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                sb.resume_ended_turn(self.world.new_engine("cli"), "cos", "coder", None)
+        self.assertEqual(len(self.resumes()), 1)
+        self.assertIn("coder", self.stamp())
+        code, _, err = self.cli("coder", "--from", "cos")
+        self.assertEqual(code, sb.EXIT_HELD, "%s %s" % (err, self.stamp()))
+        self.assertEqual(len(self.resumes()), 1)
+
+    BRANCH_TESTS = {   # a marker of the branch's source -> the test that drives it
+        "discovery.missing(name)": "test_branch_unknown_agent",
+        "raise ResumeRefused(why)": "test_branch_the_agent_cannot_be_read_again",
+        "claimed by more than one session": "test_branch_an_agent_claimed_by_two_sessions",
+        "nothing is sent to a session that is working": "test_branch_a_working_session",
+        "only an ended turn is resumed": "test_branch_a_status_that_is_not_an_ended_turn",
+        "an open request cannot be ruled out": "test_branch_v2_unreachable_fails_closed",
+        "that goes to the owner, nothing is sent": "test_branch_an_open_request_or_question",
+        "one resume per agent per": "test_branch_a_second_resume_inside_the_window_and_at_its_edge",
+        "except Exception": "test_branch_a_send_that_fails_rolls_the_stamp_back_and_a_retry_works",
+    }
+
+    def test_every_branch_has_a_row(self):
+        text = SWITCHBOARD.read_text()
+        tree = ast.parse(text)
+        (func,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "resume_ended_turn"]
+        branches = []
+        for node in ast.walk(func):
+            if isinstance(node, ast.Raise) and "ResumeRefused" in ast.get_source_segment(text, node):
+                branches.append(ast.get_source_segment(text, node))
+            elif isinstance(node, ast.ExceptHandler) and not any(isinstance(n, ast.Raise) and "ResumeRefused" in ast.get_source_segment(text, n) for n in ast.walk(node)):
+                branches.append("except " + ast.get_source_segment(text, node.type))
+        self.assertGreaterEqual(len(branches), 9)
+        for branch in branches:
+            hits = [marker for marker in self.BRANCH_TESTS if marker in branch]
+            self.assertTrue(hits, "a branch of resume_ended_turn has no test row: %s" % branch)
+        for test in self.BRANCH_TESTS.values():
+            self.assertTrue(hasattr(self, test), test)
+        for kind in ("seen.conflict or seen.problem",):
+            self.assertIn(kind, text)
+
+    # -- the mutants: each is a copy of the code with one line changed, and the named test must fail on it
+
+    MUTANTS = {
+        "resumes a working agent": ('if seen.status == "working":', 'if False:', "test_a_working_session_is_refused_and_nothing_is_sent"),
+        "skips the open request check": ('if kinds:\n        raise ResumeRefused', 'if False:\n        raise ResumeRefused', "test_an_open_permission_request_is_refused_and_goes_to_the_owner"),
+        "skips the audit": ('if engine.audit is not None:\n        engine.audit.append(engine.actor, "resume"', 'if False:\n        engine.audit.append(engine.actor, "resume"', "test_an_agent_with_an_ended_turn_is_sent_the_resume_text_once_with_one_audit_line"),
+        "ignores the rate limit": ('if _is_number(last) and now - last < RESUME_SECONDS:', 'if False:', "test_a_second_resume_inside_ten_minutes_is_refused_and_one_after_it_is_sent"),
+        "keeps the stamp after a failed send": ('        blocked_update(engine.state_dir, RESUME_STATE, lambda s: dict(s, **{name: {"at": taken["last"]}}) if _is_number(taken["last"]) else {k: v for k, v in s.items() if k != name})', '        pass', "test_branch_a_send_that_fails_rolls_the_stamp_back_and_a_retry_works"),
+        "resumes when v2 is unreachable": ('raise ResumeRefused("v2 unreachable, so an open request cannot be ruled out: %s" % _one_line(str(err), 120)) from None', 'opened = []', "test_branch_v2_unreachable_fails_closed"),
+        "resumes an unreadable agent": ('    if seen is None:\n        raise ResumeRefused(why)', '    if False:\n        raise ResumeRefused(why)', "test_branch_the_agent_cannot_be_read_again"),
+        "resumes a conflicted agent": ('if seen.conflict or seen.problem:', 'if False:', "test_branch_an_agent_claimed_by_two_sessions"),
+        "resumes a status that is no ended turn": ('if seen.status not in ("idle", "blocked", "working"):', 'if False:', "test_branch_a_status_that_is_not_an_ended_turn"),
+        "resumes an unknown agent": ('    if seen is None:\n        raise ResumeRefused(discovery.missing(name))', '    if False:\n        raise ResumeRefused(discovery.missing(name))', "test_branch_unknown_agent"),
+        "window edge off by one": ('now - last < RESUME_SECONDS', 'now - last <= RESUME_SECONDS', "test_branch_a_second_resume_inside_the_window_and_at_its_edge"),
+        "resumes twice": ('        resume_ended_turn(engine, "switchboard", seen.name,', '        resume_ended_turn(engine, "switchboard", seen.name, "x", discovery)\n        resume_ended_turn(engine, "switchboard", seen.name,', "test_a_provider_error_is_resumed_once_before_the_report_and_the_report_says_so"),
+        "resumes a non-provider error": ('found = PROVIDER_ERROR.search(error)', 'found = re.search("", error)', "test_each_provider_error_form_is_recognised_and_another_error_is_not_resumed"),
+    }
+
+    def test_every_mutant_is_killed_by_its_named_test(self):
+        text = SWITCHBOARD.read_text()
+        for name, (old, new, test) in sorted(self.MUTANTS.items()):
+            with self.subTest(mutant=name):
+                self.assertEqual(text.count(old), 1, old)
+                module = types.ModuleType("t_fleet_switchboard_resume_mutant")   # compiled here, never through the loader: its bytecode cache would hold the mutant
+                module.__file__ = str(SWITCHBOARD)
+                sys.modules[module.__name__] = module
+                self.addCleanup(sys.modules.pop, module.__name__, None)
+                exec(compile(text.replace(old, new), str(SWITCHBOARD), "exec"), module.__dict__)
+                with mock.patch.dict(globals(), {"sb": module}):
+                    result = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.TestSuite([TestResume(test)]))
+                self.assertTrue(result.failures or result.errors, "the mutant %r survives %s" % (name, test))
+
+
 class TestBlockedReport(Base):
     """A blocked agent with messages held for it is reported to its boss and the Chief of Staff (docs/switchboard.md, "A blocked agent is reported")."""
 
@@ -85264,12 +85604,13 @@ class TestBlockedReport(Base):
         self.assertIn("owner", found["text"])
         self.assertNotIn("poke", found["text"])
 
-    def test_an_ended_turn_with_nothing_open_says_the_chief_of_staff_may_poke_once(self):
+    def test_an_ended_turn_with_nothing_open_names_the_resume_command_with_the_agents_name(self):
         self.block()
         self.wait(25)
         (found,) = self.told("cos")
         self.assertIn("ended turn", found["text"])
-        self.assertIn("poke", found["text"])
+        self.assertIn("fleet-switchboard resume coder", found["text"])
+        self.assertNotIn("poke", found["text"])
 
     def test_the_alert_can_be_set_or_turned_off(self):
         self.assertEqual(sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "blocked_alert": {"minutes": 5}})["blocked_alert"],
@@ -85695,8 +86036,8 @@ BLOCKED_GUARD_KILLERS = {
     'validate_blocked_alert_config:unknown': 'test_blocked_alert_is_a_known_config_key_and_an_unknown_key_inside_it_is_warned_about',
     'validate_blocked_alert_config:not _is_number(section[key]) or section[key] <= 0': 'test_the_alert_can_be_set_or_turned_off',
     'blocked_alert_section:raw is False': 'test_a_block_that_ends_with_messages_still_held_says_so',
-    'blocked_kind:source is None': 'test_an_ended_turn_with_nothing_open_says_the_chief_of_staff_may_poke_once',
-    'blocked_kind:kinds': 'test_an_ended_turn_with_nothing_open_says_the_chief_of_staff_may_poke_once',
+    'blocked_kind:source is None': 'test_an_ended_turn_with_nothing_open_names_the_resume_command_with_the_agents_name',
+    'blocked_kind:kinds': 'test_an_ended_turn_with_nothing_open_names_the_resume_command_with_the_agents_name',
     'blocked_kind:k == "permission"': 'test_the_kind_of_block_for_each_open_request_and_when_it_was_not_read',
     'blocked_update:new is None': 'test_a_block_that_ends_with_messages_still_held_says_so',
     'note_held_send:state_dir is None or observation is None or observation.status != "blocked" or hold_reason(observation) is None': 'test_a_block_that_ends_with_messages_still_held_says_so',
