@@ -611,7 +611,7 @@ class S6Context(Base):
         calls = self.calls()
         self.assertGreater(len(calls), 15)
         verbs = {c[c.index("-n") + 2] for c in calls}
-        self.assertTrue({"create", "get", "annotate", "delete", "exec"} <= verbs, verbs)
+        self.assertTrue({"create", "get", "patch", "delete", "exec"} <= verbs, verbs)
         for c in calls:
             self.assertEqual(c[:4], ["--kubeconfig", "/home/user/.kube/cw-config", "--context", "acme-cw"], c)
 

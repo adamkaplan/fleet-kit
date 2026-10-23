@@ -4,8 +4,9 @@
 #
 # The launcher mounts the per-run files read-only under $CW_RUN_DIR (default /run/cw):
 #   server-password  the headless server's password, handed to the server through its environment (OpenCode reads it only there)
-#   model-auth       the model provider's access entry (JSON): COPIED, mode 600, into a data directory on tmpfs, so the
-#                    server can refresh its short-lived token in the copy and never write it back to the Secret
+#   model-auth       the model provider's access entry, as the one-entry array `opencode auth export` prints: IMPORTED
+#                    (`opencode auth import --standalone`, read from this file on stdin) into OpenCode's own store under a data
+#                    directory on tmpfs, BEFORE the server starts; the server reads only that store. The file is never copied
 #   git-token        read at use time by a git credential helper and a gh wrapper; never in git config, argv or the environment
 # A file that is absent is skipped (a pod started without per-run secrets). A file that is present but unreadable or empty
 # REFUSES the start: there is no fallback to another source. Nothing here prints a value.
@@ -26,16 +27,24 @@ if [ "${WORKER_DOCKER:-1}" = "1" ]; then
   sudo /usr/local/bin/start-dockerd || echo "worker: nested Docker unavailable (see /var/log/dockerd.log)" >&2
 fi
 
+# #1050: no git call in the pod may open a credential dialog or prompt (the helper answers only for github.com)
+GIT_TERMINAL_PROMPT=0; export GIT_TERMINAL_PROMPT
+GCM_INTERACTIVE=never; export GCM_INTERACTIVE
+
 if usable server-password; then
   OPENCODE_SERVER_PASSWORD=$(cat "$RUN/server-password"); export OPENCODE_SERVER_PASSWORD
 fi
 
 if usable model-auth; then
-  # OpenCode keeps provider credentials in <data dir>/opencode/auth.json; the data dir is moved onto tmpfs
+  # The server reads credentials from its own database under <data dir>/opencode (it ignores an auth.json); the data dir is on tmpfs.
+  # The import must succeed before anything starts: a pod that could not take its credential answers nothing (the free fallback model).
   data="$TMP/data"
-  ( umask 077; mkdir -p "$data/opencode"; cat "$RUN/model-auth" > "$data/opencode/auth.json" )
-  chmod 600 "$data/opencode/auth.json"
+  ( umask 077; mkdir -p "$data/opencode" )
   XDG_DATA_HOME="$data"; export XDG_DATA_HOME
+  if ! opencode auth import --standalone < "$RUN/model-auth" > /dev/null 2>&1; then
+    echo "worker: the model credential import failed; refusing to start" >&2
+    exit 1
+  fi
 fi
 
 # the default model and the worker agent: the pod has no OpenCode config, so write one (no secret in it) on tmpfs and point the server at it
@@ -81,12 +90,18 @@ H
     exit 1
   fi
   cat "$guard" > "$bin/cw-guard"; chmod 755 "$bin/cw-guard"
-  real_gh=$(command -v gh || true)
+  real_gh="${CW_GH_CLIENT:-/usr/local/bin/cw-gh}"   # the pod's own client: the real gh is not in the image
+  # FAIL CLOSED: a pod with a token but without its client refuses to start (no worker holds the token with no wrapper in front of it).
+  # CW_GH_CLIENT names the client for tests only; the image never sets it.
+  if [ ! -x "$real_gh" ]; then
+    echo "worker: the gh client $real_gh is missing or not executable; refusing to start" >&2
+    exit 1
+  fi
   real_git=$(command -v git || true)
   if [ -n "$real_gh" ]; then
     cat > "$bin/gh" <<H
 #!/bin/sh
-# refuse the six (exit 3, one line), then run gh. The token is read for this one call and lives only in the environment of that gh process
+# refuse the six (exit 3, one line), then run the pod's GitHub client (cw-gh). The token is read for this one call and lives only in the environment of that process
 "$bin/cw-guard" gh "\$@" || exit \$?
 tok=\$({ tr -d '\\r\\n' < "$tokfile"; } 2>/dev/null) || tok=""
 if [ -z "\$tok" ]; then echo "worker: the git token file is unreadable or empty" >&2; exit 1; fi
