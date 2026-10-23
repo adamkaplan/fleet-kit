@@ -14,6 +14,8 @@ import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "..", "..", "worker", "tests"))
+import stub_support  # noqa: E402
 import test_cloud_worker as base  # noqa: E402
 cw = base.cw
 
@@ -69,7 +71,7 @@ class Driver(base.Base):
         return p, p.stdout + p.stderr
 
     def spawn(self, **env):
-        return subprocess.Popen(self.args(), env=dict(self.denv, **env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        return stub_support.start(self, self.args(), env=dict(self.denv, **env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                 preexec_fn=lambda: [signal.signal(x, signal.SIG_DFL) for x in (signal.SIGINT, signal.SIGTERM)])   # a runner that started us with SIGINT ignored must not hide the interrupt
 
     def read(self, path):
