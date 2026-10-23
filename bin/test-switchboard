@@ -84118,6 +84118,105 @@ class TestMergeGateMutants(MergeGateBase):
                     getattr(self, name)(self.mutant(old, new))
 
 
+class TestMergeGateInFlight(MergeGateBase):
+    """Clause 8 of #1122: a CI run already in flight at the head is waited for, within the wait bound, and then judged."""
+    NEWHEAD = "c" * 40
+
+    def inflight(self, result="success", after=120):
+        run = self.fake.make_run(2, "ci", 10, "in_progress", None, MG_TIP, self.fake.now)
+        run["_due"] = self.fake.now + after
+        self.fake.rerun_result = result
+        if result is not None:
+            self.fake.due.append(run)
+        self.fake.runs = [run]
+
+    def mutant(self, old, new):
+        source = (BIN / "merge_gate.py").read_text()
+        self.assertEqual(source.count(old), 1, old)
+        module = types.ModuleType("merge_gate_mutant")
+        exec(compile(source.replace(old, new), "merge_gate_mutant.py", "exec"), module.__dict__)
+        return module
+
+    def pass_moving(self, gate, at=60, **more):
+        """A pass whose sleep moves the head once `at` seconds went by (a coder pushed again)."""
+        def sleep(seconds):
+            self.fake.sleep(seconds)
+            if self.fake.now >= self.fake.start_now + at and self.fake.head != self.NEWHEAD:
+                self.fake.head = self.NEWHEAD
+                for r in self.fake.runs:
+                    r["head_sha"] = self.NEWHEAD
+        self.fake.start_now = self.fake.now
+        return gate.gate_pass(self.reading, self.fake, self.conf, self.state, self.repo, self.n, "coder-a", made_up_pid(), self.fake.clock, sleep,
+                              alive=lambda pid: True, **more)
+
+    def scenario_green(self, gate):
+        self.inflight("success")
+        ok, lines = self.run_pass(gate=gate)
+        self.assertTrue(ok, lines)
+        self.assertNotIn("still running", " ".join(lines))
+        self.assertEqual(self.fake.writes, [], "the run in flight is waited for, not re-run")
+
+    def scenario_red(self, gate):
+        self.inflight("failure")
+        ok, lines = self.run_pass(gate=gate)
+        self.assertFalse(ok)
+        self.assertIn("unit-tests", lines[-1])
+        self.assertNotIn("still running", lines[-1])
+        self.assertIsNone(gate.read_pass(self.state, self.repo, self.n))
+
+    def scenario_head_moved(self, gate):
+        self.inflight("success", after=600)
+        ok, lines = self.pass_moving(gate)
+        self.assertFalse(ok, lines)
+        self.assertIn(MG_HEAD, lines[-1])
+        self.assertIn(self.NEWHEAD, lines[-1])
+        self.assertIsNone(gate.read_pass(self.state, self.repo, self.n))
+
+    def test_green_continues_the_pass(self):
+        self.scenario_green(self.gate)
+
+    def test_red_is_refused_with_the_failing_checks(self):
+        self.fake.runs = []
+        self.fake.jobs[2] = [{"name": "unit-tests", "conclusion": "failure"}]
+        self.scenario_red(self.gate)
+
+    def test_a_head_moved_during_the_wait_names_both_heads(self):
+        self.scenario_head_moved(self.gate)
+
+    def test_a_wait_beyond_the_bound_names_the_run(self):
+        self.inflight(None)
+        ok, lines = self.run_pass(wait_seconds=300)
+        self.assertFalse(ok)
+        self.assertIn("run 2", lines[-1])
+        self.assertIn("within 5 minutes", lines[-1])
+        self.assertIsNone(self.gate.read_lock(self.state, self.repo, "main"))
+
+    def test_the_default_bound_is_the_configured_wait(self):
+        self.inflight(None)
+        before = self.fake.now
+        ok, lines = self.run_pass()
+        self.assertFalse(ok)
+        self.assertIn("within 45 minutes", lines[-1])
+        self.assertGreaterEqual(self.fake.now - before, 45 * 60)
+
+    def test_the_mutant_that_fails_at_once_fails_the_green_scenario(self):
+        gate = self.mutant('and facts["pr_result"] == "pending"):', 'and False):')
+        with self.assertRaises(AssertionError):
+            self.scenario_green(gate)
+
+    def test_the_mutant_that_ignores_a_moved_head_fails_the_head_scenario(self):
+        gate = self.mutant('if not latest["problems"] and latest["head"] and latest["head"] != seed:', "if False:")
+        with self.assertRaises(AssertionError):
+            self.scenario_head_moved(gate)
+
+    def test_the_real_module_passes_every_scenario(self):
+        for name in ("scenario_green", "scenario_red", "scenario_head_moved"):
+            self.setUp()
+            if name == "scenario_red":
+                self.fake.jobs[2] = [{"name": "unit-tests", "conclusion": "failure"}]
+            getattr(self, name)(self.gate)
+
+
 class TestMergeGateCommand(LedgerBase):
     """The command itself: read-only by default, `--check` for the shim, the owner's terminal and the chief of staff's logged waiver (`waive --gates MG`)."""
 
