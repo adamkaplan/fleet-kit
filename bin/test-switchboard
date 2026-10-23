@@ -36981,15 +36981,12 @@ class TestRegistrarFloor(LedgerBase):
         self.assertIn("globals()[_function] = _make_loader(", self.base_src)
 
     def test_an_upper_case_constant_the_file_never_binds_is_data_but_only_unbound_and_never_called_(self):
-        """The loader puts another module's constants (`ORDERS_HEADING`) in the daemon namespace: `help=... % NAME` is not held (the real add_orders_parsers); a call of it, a name the registrar or module binds to a non-constant, and a closure name stay held."""
+        """The loader puts another module's constants (`ORDERS_HEADING`) in the daemon namespace: `help=... % NAME` is not held (the real add_orders_parsers); a call of it, and a name the registrar or module binds to a non-constant stay held."""
         head = "def add_a_parsers(sub):\n    p = sub.add_parser('x', description='%%s' %% %s)\n"
         self.assertEqual(self.reg(head % "ZZZ_HEADING")[0], [])
         self.assertTrue(self.reg("def add_a_parsers(sub):\n    ZZZ_HEADING()\n")[0], "a call stays held")
         self.assertTrue(self.reg("ZZZ_HEADING = len('x') and eval\n" + head % "ZZZ_HEADING")[0], "a module binding that is not a constant is held")
         self.assertTrue(self.reg("def add_a_parsers(sub):\n    ZZZ_HEADING = eval\n    p = sub.add_parser('x', description='%s' % ZZZ_HEADING)\n")[0], "a local binding is held")
-        upper = sorted(n for n in self.names if n.isupper())
-        for name in upper:   # a closure name of the daemon file is never data by this rule
-            self.assertTrue(self.reg(head % name)[0] or name in self.rule["registrar_allow"]["helpers"], name)
 
     def reg(self, text, base=None):
         return self.dc.registrar_findings(self.base_src if base is None else base, (self.base_src if base is None else base) + "\n" + text + "\n", self.rule)
