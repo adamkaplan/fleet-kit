@@ -223,6 +223,12 @@ def authors_of(entries, pr, notice_senders=(), github_author=None):
     return {n for n in names if n}
 
 
+def ask_head(plan_hash):
+    """#1130: the "head" an ask issue's record carries: the first 40 hex digits of the plan hash (`sha256:<hex>`). A revised plan has another hash, so the
+    record is void exactly as a pull request's is when its head moves."""
+    return str(plan_hash).split(":", 1)[-1][:40]
+
+
 def known_writers(entries, pr, notice_senders=()):
     """True when the switchboard knows at least one agent that wrote this PR (a proof or a notice): until then a verdict is
     refused, because a writer that has declared nothing could otherwise register as its own evaluator."""
