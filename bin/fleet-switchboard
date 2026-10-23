@@ -23734,6 +23734,67 @@ def clear_line_pass(engine, now, rule, heads, reports):
             engine._note("clear_line.error", "%s#%d" % (repo, number), {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
 
 
+IMPACT_UNPATHED_REASON = "independent impact review says hold"
+
+
+def _impact_unpathed_judge(engine, now, repo, number, head, rule, enforce, records, records_problem, record, budget, seen, reports, released_now):
+    """(#1041) One open pull request of a repository with NO floor paths. Only the independent impact rating can hold it here: a `hold` of a top tier, missing or unknown class at this head
+    is written by the same `apply_impact_hold` the floor uses, once per (pull request, head, rating), audited `gate.would_hold`. A pull request with no such rating costs no gh read, unless the
+    daemon holds it or an owner's clear of an earlier head is on record: then the existing re-hold and release rules decide (only labels the daemon added, only on a whole read). No path rule
+    applies. Returns (gh calls spent, 1 when the pull request could not be judged this pass else 0). Never raises."""
+    if records_problem:
+        return 0, 0   # a release is a LOOSENING: nothing is added or removed on a failed read
+    pr = "%s#%d" % (repo, number)
+    rating = records.get((pr, head))
+    signature = (head, rule, rating)
+    if seen.get((repo, number)) == signature:
+        return 0, 0
+    try:
+        holds = bool(rating and rating[0] == "hold" and impact_floor.class_is_top_tier(impact_floor._matrix_cached(), rating[1]))
+        if not enforce:   # advisory (`dry_run`): the same audit as the floor's, advisory, and nothing is read or written
+            if holds:
+                engine.audit.append(engine.actor, "gate.would_hold", pr, {"head": head, "reasons": [IMPACT_UNPATHED_REASON], "floor_paths": [], "advisory": True, "unknown": None})
+            seen[(repo, number)] = signature
+            return 0, 0
+        state, problem = read_impact_state(engine.state_dir)
+        if not holds and (problem or (pr not in state["applied"] and pr not in state["clears"])):
+            return 0, 0   # nothing of ours on it, no rating: not read, not written
+        retry = seen.get((repo, number, "retry"))
+        if budget <= 0 or (retry and now < retry):
+            return 0, 1
+        report = {"pr": pr, "head": head, "rule": rule, "owner_decision": "hold" if holds else None, "owner_reasons": [IMPACT_UNPATHED_REASON] if holds else [],
+                  "reasons": [IMPACT_UNPATHED_REASON] if holds else [], "floor_paths": [], "complete": True, "unknown": None, "globs": []}
+        spent = 0
+        try:
+            if holds:
+                engine.audit.append(engine.actor, "gate.would_hold", pr, {"head": head, "reasons": report["reasons"], "floor_paths": [], "advisory": False, "unknown": None})   # before the write, as the floor's
+                spent = apply_impact_hold(engine, repo, number, report, record)
+                reports[(repo, number)] = report
+            else:
+                rehold = _impact_rehold_try(engine, repo, number, pr, report, record, now, seen)
+                if rehold == "failed":
+                    return 0, 1
+                if rehold:
+                    spent = 1
+                    report = dict(report, rehold=True, owner_decision="hold")
+                    reports[(repo, number)] = report
+                elif pr in state["applied"]:
+                    removed = release_impact_hold(engine, repo, number, report, record)
+                    spent = removed + 1
+                    reports.pop((repo, number), None)
+                    if removed and pr not in released_now:
+                        released_now.append(pr)
+        except Exception as err:   # a failed write is retried, never marked done
+            seen[(repo, number, "retry")] = now + IMPACT_RETRY_SECONDS
+            engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
+            return 0, 1
+        seen[(repo, number)] = signature
+        return spent, 0
+    except impact_floor.MatrixError as err:
+        _impact_matrix_episode(engine, now, err)
+        return 0, 1
+
+
 def impact_would_hold_pass(engine, now):
     """The daemon hook (#179 L3, #451 slice 3): for the open PRs the ci recorder's list already holds (repos under `plan_gates`), decide the owner-hold
     rule once per (PR, head, version of the rule, impact review record), audit `gate.would_hold` when it holds, and, when `impact_hold` enforces, WRITE the hold
@@ -23795,7 +23856,10 @@ def impact_would_hold_pass(engine, now):
             except impact_floor.MatrixError as err:   # fail LOUD: no judgement is made while the matrix file cannot be read (never read as "no floor")
                 _impact_matrix_episode(engine, now, err)
                 return
-            if not globs:
+            if not globs:   # no floor paths: only an independent `hold` rating (or the release of one the daemon wrote) is judged here, never a path rule (#1041)
+                spent, skipped = _impact_unpathed_judge(engine, now, key, number, head, rule, enforce, records, records_problem, record, budget, seen, reports, released_now)
+                budget -= spent
+                unjudged += skipped
                 continue
             signature = (head, rule, "unreadable" if records_problem else records.get((pr, head))) + ((marks[(pr, head)],) if (pr, head) in marks else ())   # (#815) a new confirmation re-judges
             if seen.get((key, number)) == signature:
