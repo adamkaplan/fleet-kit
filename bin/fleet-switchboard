@@ -6094,28 +6094,37 @@ OWN_GH_ENV = "FLEET_SWITCHBOARD_OWN_GH"   # #1216: NEVER set for a gh call any m
 SHIM_HEAD = b'"""gh, signing what an agent says'
 
 
+def is_shim_file(candidate):
+    """True when `candidate` is the fleet gh shim (its docstring opens with SHIM_HEAD in the first 400 bytes)."""
+    try:
+        with open(candidate, "rb") as handle:
+            return SHIM_HEAD in handle.read(400)
+    except OSError:
+        return False
+
+
 def own_gh_path(name, environ=None):
-    """The gh the switchboard's OWN calls run: the real binary by path, never the shim. FLEET_REAL_GH when it names an executable; else, when the first `gh` on
-    PATH is the fleet shim, the next one that is not; else `name` as it is (a path, or a gh that is already the real one)."""
+    """The gh the switchboard's OWN calls run: the real binary by path, never the shim. An absolute `name` is used as it is, unless it IS the shim (refused:
+    ConfigError 'no real gh behind the shim'). `gh`: FLEET_REAL_GH when it names an executable and is not the shim; else the first `gh` on PATH that is not the shim;
+    when PATH holds only the shim, ConfigError (every own call would be re-identified, counted and audited as an agent's). No gh on PATH at all: `name` as it is."""
     environ = os.environ if environ is None else environ
     if name != "gh":
+        if os.path.isabs(name) and os.path.isfile(name) and is_shim_file(name):
+            raise ConfigError("no real gh behind the shim: the configured gh %s is the fleet shim" % name)
         return name
     override = environ.get("FLEET_REAL_GH")
-    if override and os.path.isabs(override) and os.access(override, os.X_OK):
+    if override and os.path.isabs(override) and os.access(override, os.X_OK) and not is_shim_file(override):
         return override
     seen_shim = False
     for entry in (environ.get("PATH") or "").split(os.pathsep):
         candidate = os.path.join(entry, "gh") if entry else ""
         if not (candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
             continue
-        try:
-            with open(candidate, "rb") as handle:
-                shim = SHIM_HEAD in handle.read(400)
-        except OSError:
-            continue
-        if not shim:
-            return candidate if seen_shim else name   # the first gh is already the real one: nothing to resolve
+        if not is_shim_file(candidate):
+            return candidate
         seen_shim = True
+    if seen_shim:
+        raise ConfigError("no real gh behind the shim: PATH holds only the fleet shim (set 'gh' to an absolute path, or FLEET_REAL_GH)")
     return name
 
 
@@ -16832,7 +16841,10 @@ def _validate_github(config, source):
     if not isinstance(config["gh"], str) or not config["gh"].strip():
         raise ConfigError("%s: 'gh' must be a non-empty string (a path or a command name), got %r"
                           % (source, config["gh"]))
-    config["gh"] = own_gh_path(config["gh"])   # #1216: the daemon's own calls name the real gh by path
+    try:
+        config["gh"] = own_gh_path(config["gh"])   # #1216: the daemon's own calls name the real gh by path
+    except ConfigError as err:
+        raise ConfigError("%s: %s" % (source, err)) from None
     if not _is_number(config["github_lookback_hours"]) or config["github_lookback_hours"] <= 0:
         raise ConfigError("%s: 'github_lookback_hours' must be a positive number, got %r"
                           % (source, config["github_lookback_hours"]))

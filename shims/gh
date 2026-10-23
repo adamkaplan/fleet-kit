@@ -357,8 +357,8 @@ def warn_low(account, low):
 # call, never a limit and never remembered. The wait is bounded and ends the moment no account the caller tops is low; nothing is refused.
 #
 # WHAT A CALLER CAN SET. This block reads NO environment variable of its own: the state directory is the account's home from the password database (never HOME,
-# XDG_STATE_HOME or FLEET_SWITCHBOARD_STATE), the switchboard program is the one beside this shim (never FLEET_SWITCHBOARD_BIN), the own-call marker
-# is not honoured here, the timeouts are constants, and it looks at EVERY low account (never the one a configuration variable maps this call to). The one thing it
+# XDG_STATE_HOME or FLEET_SWITCHBOARD_STATE), the switchboard program is the one beside this shim (never FLEET_SWITCHBOARD_BIN), (the retired FLEET_SWITCHBOARD_OWN_GH
+# is read nowhere in this file, the switchboard's own calls run the real gh by path), the timeouts are constants, and it looks at EVERY low account (never the one a configuration variable maps this call to). The one thing it
 # cannot defend is the identity itself: "who is this caller" is the switchboard's answer from the caller's own session and pane. A caller can only make ITSELF wait
 # less, never another agent wait more or the message stop. A test derives every environment name this file reads and lists the ones that switch the wait off.
 SLOW_SECONDS = 2.0            # the longest any one uncached read of the top spender waits
@@ -1850,8 +1850,8 @@ def mg_refuse(why):
 
 def merge_gate_probe(args, lookup, gh):
     """None (run as given), ("refuse", one line) or ("go", args, release_ref): the merge may run with these args; `release_ref` is the pull request whose lock is
-    released when the merge returns (None when no lock was used). The marker FLEET_SWITCHBOARD_OWN_GH is NOT honoured here (a worker can set it): the
-    switchboard's own gh calls never merge through this shim. Routes covered: `pr merge` in any shape (one the shim cannot parse is refused), `gh api` writes to
+    released when the merge returns (None when no lock was used). No environment variable lifts this check (the retired FLEET_SWITCHBOARD_OWN_GH is read nowhere
+    in this file): the switchboard's own gh calls run the real gh by path and never reach this shim. Routes covered: `pr merge` in any shape (one the shim cannot parse is refused), `gh api` writes to
     `pulls/N/merge`, GraphQL merge mutations. Not covered, and said in the docs: an alias the shim cannot see, the web UI, a push to the branch."""
     try:
         args = canonical_pr_merge(args)

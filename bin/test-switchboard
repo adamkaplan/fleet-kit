@@ -12613,6 +12613,9 @@ class TestAgentShellCalls(Base):
         self.assertEqual([a[1] for a in asked if a[0][1:] == ["api", "rate_limit"]], [None])  # no marker any more: the daemon reaches the real gh by path (own_gh_path), so the shim never sees, hence never counts, it
         self.assertEqual([a[0][0] for a in asked if a[0][1:] == ["api", "rate_limit"]], [FAKE_GH])
         self.assertEqual(len(accounts.calls), 0, "the rate-limit read is not a counted call")
+        accounts.read(runner, "repos/acme/app/issues/1", "acme/app", 5)
+        self.assertEqual(len(accounts.calls), 1, "the daemon's OWN counter records a read it makes (the shim's per-account file never sees it)")
+        self.assertEqual(asked[-1][0][0], FAKE_GH)
         body = json.loads((self.state / "github-usage.json").read_text())["accounts"]["acme-a"]
         self.assertEqual((body["used"], body["remaining"], body["reset"]), (4000, 1000, reset))
         text = "\n".join(sb.agent_calls.usage_lines(str(self.state), clock[0]))
@@ -12621,6 +12624,17 @@ class TestAgentShellCalls(Base):
         clock[0] += 61
         sb.record_github_calls(engine)
         self.assertEqual(len([a for a in asked if a[0][1:] == ["api", "rate_limit"]]), 2)
+
+    def test_usage_the_daemons_read_runs_the_real_gh_binary_and_its_own_counter_counts_it_not_the_shims_file(self):
+        real = self.home / "realgh"
+        real.write_text("#!/bin/sh\necho \"real $*\" >> %s\necho '{}'\n" % (self.home / "real.log"))
+        real.chmod(0o755)
+        accounts = sb.GhAccounts({"gh": str(real), "call_timeout_seconds": 5, "gh_users": {}}, subprocess.run, time.time, environ={})
+        done = accounts.read(subprocess.run, "repos/acme/app/issues/1", "acme/app", 5)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual((self.home / "real.log").read_text().splitlines(), ["real api repos/acme/app/issues/1"], "the REAL gh binary ran, by path")
+        self.assertEqual(len(accounts.calls), 1, "the daemon's own counter counted it")
+        self.assertFalse((self.state / "agent-calls.jsonl").exists(), "the shim's per-account call file does not record the daemon's own reads")
 
     def test_usage_a_garbled_read_is_left_out_and_never_raises(self):
         accounts = sb.GhAccounts({"gh": FAKE_GH, "call_timeout_seconds": 5, "gh_users": {"acme/*": "acme-a"}}, lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "not json", ""),
@@ -30304,6 +30318,32 @@ class TestIdentityCheck(ReportBase):
                 self.assertEqual(done.returncode, 1, done.stderr)
                 self.assertIn("refus", done.stderr)
                 self.assertIsNone(seen)
+
+    def with_mutant_shim(self, func, run):
+        """`run()` with the module's SHIM pointing at a copy of the shim directory whose `func` honours the marker again."""
+        global SHIM
+        target = Path(self.home) / ("mutant-" + func)
+        shutil.copytree(SHIM.parent, target)
+        (target / "gh").write_text(marker_mutant_source(func))
+        saved, SHIM = SHIM, target / "gh"
+        try:
+            return run()
+        finally:
+            SHIM = saved
+
+    def test_s9_each_probe_mutant_that_honours_the_marker_again_fails_its_case_through_the_real_shim(self):   # #1216: read_scope, read_account_env, account_env
+        marker = {"FLEET_SWITCHBOARD_OWN_GH": "1"}
+        write = ("issue", "comment", "5", "-R", "acme-org/widget-api", "--body", "x")
+        read = ("issue", "view", "5", "-R", "acme-org/widget-api")
+        own_read = ("issue", "list", "-R", "acme/api")
+        users, tokens = {"acme/*": "acct-personal"}, {"acct-personal": "tok-personal"}
+        cases = {"read_scope": (lambda: self.read_repo_run(write, extra_env=marker), lambda d, seen: d.returncode == 1 and seen is None),
+                 "read_account_env": (lambda: self.read_repo_run(read, extra_env=marker), lambda d, seen: seen is not None and seen["token"] == "tok-bot"),
+                 "account_env": (lambda: self.run_gh_shim("acme/api", users, tokens, args=own_read, extra_env=marker), lambda d, seen: seen is not None and seen["token"] == "tok-personal")}
+        for func, (run, holds) in cases.items():
+            with self.subTest(func=func):
+                self.assertTrue(holds(*run()), "the real shim holds with the marker set")
+                self.assertFalse(holds(*self.with_mutant_shim(func, run)), "the mutant (marker honoured again) fails the case")
 
     def test_s3_a_repository_that_is_neither_the_workers_own_nor_the_declared_one_is_refused_for_reads_and_writes(self):
         for args in (("issue", "view", "5", "-R", "acme-org/other"), ("pr", "view", "https://github.com/acme-org/other/pull/1"), ("api", "repos/acme-org/other/issues"),
@@ -83999,6 +84039,19 @@ class TestGhShimMergeGate(Base):
                 done, seen = self.run_shim(*self.MERGE, env=dict(refuse, **extra))
                 self.assertEqual((done.returncode, seen), (10, None), done.stderr)
 
+    def test_the_merge_gate_probe_mutant_that_honours_the_marker_again_lets_a_refused_merge_run(self):   # #1216: the held-pass / lock probe
+        refuse = {"FAKE_MG_EXIT": "10", "FAKE_MG_JSON": json.dumps({"allowed": False, "reason": "no gate pass recorded"}), "FLEET_SWITCHBOARD_OWN_GH": "1"}
+        done, seen = self.run_shim(*self.MERGE, env=refuse)
+        self.assertEqual((done.returncode, seen), (10, None), "the real shim refuses with the marker set")
+        source = marker_mutant_source("merge_gate_probe")
+        (self.home / "gh-mutant").write_text(source)
+        self.shim_path = self.home / "gh-mutant"
+        try:
+            done, seen = self.run_shim(*self.MERGE, env=refuse)
+            self.assertEqual(done.returncode, 0, "the mutant lets the refused merge run: the case above fails it")
+        finally:
+            self.shim_path = None
+
     def test_the_gate_reads_the_account_home_from_the_password_database_not_from_the_environment(self):
         loader = importlib.machinery.SourceFileLoader("gh_shim_home", str(SHIM))
         shim = importlib.util.module_from_spec(importlib.util.spec_from_loader("gh_shim_home", loader))
@@ -86215,6 +86268,21 @@ class TestAssembler(unittest.TestCase):
         self.assertIn("usage: fleet-switchboard status", done.stdout)
 
 
+def marker_mutant_source(func, ret="None"):
+    """The REAL shim's text with the retired marker honoured again at the top of `func` (after its docstring): `return` / `return None` when the variable is "1"."""
+    source = SHIM.read_text()
+    start = source.index("def %s(" % func)
+    head = source[start:]
+    at = head.index(":\n", head.index(")")) + 2
+    stripped = head[at:].lstrip()
+    if stripped.startswith('"""'):
+        at += head[at:].index('"""') + 3 + head[at:][head[at:].index('"""') + 3:].index('"""') + 3 + 1
+    guard = '    if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":\n        return%s\n' % ("" if ret == "" else " " + ret)
+    mutant = source[:start] + head[:at] + guard + head[at:]
+    ast.parse(mutant)
+    return mutant
+
+
 class TestOwnMarkerNotHonoured(unittest.TestCase):
     """#1216: shims/gh reads FLEET_SWITCHBOARD_OWN_GH nowhere (derived scan), and each probe has a mutant that honours it again which the case above it fails."""
     NAME = "FLEET_SWITCHBOARD_OWN_GH"
@@ -86237,9 +86305,70 @@ class TestOwnMarkerNotHonoured(unittest.TestCase):
             realdir.joinpath("gh").write_text("#!/bin/sh\nexit 0\n"); realdir.joinpath("gh").chmod(0o755)
             path = os.pathsep.join([str(shimdir), str(realdir)])
             self.assertEqual(sb.own_gh_path("gh", {"PATH": path}), str(realdir / "gh"))
-            self.assertEqual(sb.own_gh_path("gh", {"PATH": str(realdir)}), "gh")
+            self.assertEqual(sb.own_gh_path("gh", {"PATH": str(realdir)}), str(realdir / "gh"), "the real gh first on PATH is named by its path")
             self.assertEqual(sb.own_gh_path("gh", {"PATH": path, "FLEET_REAL_GH": str(realdir / "gh")}), str(realdir / "gh"))
             self.assertEqual(sb.own_gh_path("/x/gh", {"PATH": path}), "/x/gh")
+
+    REAL_FAKE = "#!/bin/sh\necho \"real $* token=$GH_TOKEN\" >> \"$FAKE_LOG\"\necho '{\"ok\": 1}'\n"
+
+    def layout(self, tmp, real=True):
+        shimdir, realdir = Path(tmp, "shim"), Path(tmp, "real")
+        shimdir.mkdir(); realdir.mkdir()
+        for entry in SHIM.parent.iterdir():
+            if entry.is_file():
+                shutil.copy(str(entry), str(shimdir / entry.name))
+        if real:
+            realdir.joinpath("gh").write_text(self.REAL_FAKE); realdir.joinpath("gh").chmod(0o755)
+        return shimdir, realdir
+
+    def test_the_daemon_refuses_at_start_when_its_gh_is_the_shim(self):
+        """No real gh behind the shim: PATH holding only the shim, or a configured absolute gh that IS the shim, is refused with the named reason (never run as an agent)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            shimdir, realdir = self.layout(tmp, real=False)
+            with self.assertRaisesRegex(sb.ConfigError, "no real gh behind the shim"):
+                sb.own_gh_path("gh", {"PATH": str(shimdir)})
+            with self.assertRaisesRegex(sb.ConfigError, "no real gh behind the shim"):
+                sb.own_gh_path("gh", {"PATH": str(shimdir), "FLEET_REAL_GH": str(shimdir / "gh")})
+            with self.assertRaisesRegex(sb.ConfigError, "no real gh behind the shim"):
+                sb.own_gh_path(str(shimdir / "gh"), {"PATH": str(shimdir)})
+            done = subprocess.run([sys.executable, str(SWITCHBOARD), "run", "--once"], capture_output=True, text=True, timeout=60,
+                                  env={"PATH": str(shimdir), "HOME": tmp, "XDG_CONFIG_HOME": tmp, "XDG_STATE_HOME": tmp, "FLEET_SWITCHBOARD_STATE": tmp})
+            self.assertNotEqual(done.returncode, 0)
+            self.assertIn("no real gh behind the shim", done.stderr)
+
+    def test_an_absolute_real_gh_is_used_as_it_is_and_a_real_gh_behind_the_shim_is_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shimdir, realdir = self.layout(tmp)
+            self.assertEqual(sb.own_gh_path(str(realdir / "gh"), {"PATH": str(shimdir)}), str(realdir / "gh"))
+            self.assertEqual(sb.own_gh_path("gh", {"PATH": os.pathsep.join([str(shimdir), str(realdir)])}), str(realdir / "gh"))
+            self.assertEqual(sb.own_gh_path("gh", {"PATH": os.pathsep.join([str(shimdir), str(realdir)]), "FLEET_REAL_GH": str(shimdir / "gh")}), str(realdir / "gh"),
+                             "FLEET_REAL_GH naming the shim is ignored")
+            config = {"github_repos": [], "github_events": ["issue_comment"], "gh": str(realdir / "gh"), "github_lookback_hours": 1, "github_port": None, "github_ignore_authors": []}
+            with self.assertRaisesRegex(sb.ConfigError, "no real gh behind the shim"):
+                sb._validate_github(dict(config, gh=str(shimdir / "gh")), "cfg")
+
+    def test_the_resolved_path_prevents_re_identification_the_daemons_call_reaches_the_real_gh_by_path_never_the_shim(self):
+        """The deleted regression, restored: with the marker gone, a daemon call through the SHIM would be re-identified (token swapped). The resolved path never reaches it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            shimdir, realdir = self.layout(tmp)
+            log = Path(tmp, "calls.log")
+            path = os.pathsep.join([str(shimdir), str(realdir)])
+            resolved = sb.own_gh_path("gh", {"PATH": path})
+            self.assertEqual(resolved, str(realdir / "gh"))
+            environ = {"PATH": path, "HOME": tmp, "FAKE_LOG": str(log), "GH_TOKEN": "tok-daemon", "FLEET_SWITCHBOARD_STATE": tmp}
+            done = subprocess.run([resolved, "api", "rate_limit"], capture_output=True, text=True, env=environ, timeout=60)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(log.read_text().splitlines(), ["real api rate_limit token=tok-daemon"], "the fake real gh ran, with the daemon's own token, unswapped")
+            self.assertFalse(Path(tmp, "agent-calls.jsonl").exists(), "the shim never saw it: nothing counted")
+
+    def test_the_shim_is_recognised_by_its_real_file_and_editing_the_docstring_fails_here(self):
+        self.assertTrue(sb.is_shim_file(str(SHIM)), "own_gh_path must know the REAL shims/gh by its signature: update SHIM_HEAD together with the docstring")
+        self.assertIn(sb.SHIM_HEAD, SHIM.read_bytes()[:400])
+        with tempfile.TemporaryDirectory() as tmp:
+            other = Path(tmp, "gh")
+            other.write_text("#!/bin/sh\nexit 0\n"); other.chmod(0o755)
+            self.assertFalse(sb.is_shim_file(str(other)))
+            self.assertFalse(sb.is_shim_file(str(Path(tmp, "missing"))))
 
     def test_each_mutant_that_honours_the_marker_again_is_seen(self):
         """Each mutant puts a marker read back into one shim function; the derived scan fails for every one of them (and passes for the real code above)."""
