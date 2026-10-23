@@ -149,8 +149,11 @@ elif cmd == "get" and args[1] == "events":
     name = args[3].split("involvedObject.name=")[1]
     print(json.dumps({"items": [e for e in st.get("events", []) if e["involvedObject"]["name"] == name]}))
 elif cmd == "get" and args[1] == "statefulset":   # a StatefulSet: NotFound unless the state holds it; a planted lookup failure otherwise
-    if st.get("fail_get_statefulset"):
-        print("Error from server (Forbidden): statefulsets is forbidden", file=sys.stderr); sys.exit(1)
+    fail = st.get("fail_get_statefulset")   # True or "500": an internal error; "forbidden": the RBAC answer (no apps/statefulsets grant)
+    if fail == "forbidden":
+        print('Error from server (Forbidden): statefulsets.apps "%s" is forbidden: User "system:serviceaccount:acme:launcher" cannot get resource "statefulsets" in API group "apps"' % args[2], file=sys.stderr); sys.exit(1)
+    if fail:
+        print("Error from server (InternalError): Internal error occurred: etcd leader changed", file=sys.stderr); sys.exit(1)
     if args[2] not in st.get("statefulsets", {}): missing('statefulsets.apps "%s"' % args[2])
     print(json.dumps(st["statefulsets"][args[2]]))
 elif cmd == "get" and args[1] == "pod":

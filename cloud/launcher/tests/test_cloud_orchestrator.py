@@ -629,7 +629,7 @@ class GoneMatrix(Fx):   # the reproducer matrix: callers x states, each cell's l
     def test_a_lookup_error_on_delete_is_never_answered_deleted(self):
         self.gone()
         def boom(name):
-            raise cw.CloudError("forbidden")
+            raise cw.CloudError("internal error")
         self.kube.get_workload = boom
         with self.assertRaises(cw.CloudError) as c:
             self.L.delete(argparse.Namespace(worker=WORKER, force=True, reason="x"))
@@ -638,11 +638,11 @@ class GoneMatrix(Fx):   # the reproducer matrix: callers x states, each cell's l
         self.assertEqual(list(self.kube.sets), [cw.pod_name(WORKER)])
 
     def test_mutant_swallowed_lookup_error_fails(self):
-        m = load_module("cloud_worker.py", "                except CloudError as e:   # NotFound is an empty answer (below); any OTHER lookup error is never answered \"deleted\"\n                    raise CloudError(\"could not look up statefulset/%s; REMAINS unknown: %s\" % (name, e))",
-                        "                except CloudError as e:\n                    found = None")
+        m = load_module("cloud_worker.py", "            raise CloudError(\"could not look up statefulset/%s; REMAINS unknown: %s\" % (name, e))",
+                        "            return None")
         self.gone()
         def boom(name):
-            raise m.CloudError("forbidden")
+            raise m.CloudError("internal error")
         self.kube.get_workload = boom
         out = m.Launcher(self.kube, self.env, self.clock).delete(argparse.Namespace(worker=WORKER, force=True, reason="x"))
         self.assertTrue(out["deleted"])   # the mutant answers deleted: the real code raises (the test above), so that test fails on it

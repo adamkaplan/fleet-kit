@@ -1514,13 +1514,22 @@ class Launcher:
             pass   # the workload is gone: a pod the controller replaced meanwhile is gone with it
         self._remove(name, nonce)
 
+    def _lookup_workload(self, name):
+        """The StatefulSet of that name, or None. NotFound is None. FORBIDDEN (the Role does not yet grant apps/statefulsets) is None too:
+        the launcher's own create of a StatefulSet would be forbidden under the same RBAC, so none can exist; one line says it was not checked.
+        Any OTHER error (500, timeout, malformed) raises: what remains is unknown."""
+        try:
+            return self.kube.get_workload(name)
+        except CloudError as e:
+            if "forbidden" in str(e).lower():
+                print("cloud-worker: statefulset lookup forbidden: not checked", file=sys.stderr)
+                return None
+            raise CloudError("could not look up statefulset/%s; REMAINS unknown: %s" % (name, e))
+
     def _remove_gone(self, worker, name, nonce):
         """The pod NAME-0 is absent. If a StatefulSet of that name exists it is deleted FIRST (else its controller recreates a pod that
         sits Pending on the Secrets), then the Secrets. With a nonce a StatefulSet of another run is left whole. Raises naming what REMAINS."""
-        try:
-            wl = self.kube.get_workload(name)
-        except CloudError as e:
-            raise CloudError("could not look up statefulset/%s; REMAINS unknown: %s" % (name, e))
+        wl = self._lookup_workload(name)
         if wl and nonce and (((wl.get("spec") or {}).get("template") or {}).get("metadata") or {}).get("annotations", {}).get("cw/run-id") != nonce:
             print("cloud-worker: statefulset/%s is not this run's (its run id does not match); left whole" % name, file=sys.stderr)
             return
@@ -1638,10 +1647,7 @@ class Launcher:
         def go(info):
             pod = self._need(worker)
             if not pod:   # no pod (node loss, eviction): its StatefulSet and Secrets may remain, and are removed
-                try:
-                    found = self.kube.get_workload(name)
-                except CloudError as e:   # NotFound is an empty answer (below); any OTHER lookup error is never answered "deleted"
-                    raise CloudError("could not look up statefulset/%s; REMAINS unknown: %s" % (name, e))
+                found = self._lookup_workload(name)   # NotFound and FORBIDDEN are an empty answer; any OTHER error is never answered "deleted"
                 if found:   # nothing found: the old idempotent answer, byte for byte
                     self._remove_gone(worker, name, None)
                 return {"worker": worker, "runtime_id": "", "deleted": True}
