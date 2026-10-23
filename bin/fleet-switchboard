@@ -15991,6 +15991,107 @@ def friction_status_line(config, state_dir, now=None):
         "%02d:00" % hour if hour is not None else "every 24 h", section["to"], section["cos_to"], last)
 
 
+# ---- the audited resume (docs/switchboard.md, "A blocked agent is reported"). ONE function resumes an agent whose turn has ended: the
+# `resume` command and the blocked-report pass both call `resume_ended_turn`, so the refusals, the rate limit and the audit line are the same.
+
+RESUME_STATE = "resumes.json"   # {agent: {"at": epoch}}: the last resume of each agent (the rate limit; an ordinary state row)
+RESUME_SECONDS = 600            # one resume per agent per 10 minutes
+RESUME_TEXT = "Your last turn ended without a finished answer (for example a provider error). Carry on from where you stopped."
+RESUME_REASON = "its turn ended and nothing is open"
+RESUME_COMMAND = PROG + " resume"   # the one spelling the report, the documentation, the help and the owner's grant use
+PROVIDER_ERROR = re.compile(r"\b499\b|ECONNRESET|time(?:d)?[ -]?out", re.I)
+
+
+class ResumeRefused(Exception):
+    """The resume was not sent: the reason is the message, and nothing was written."""
+
+
+def last_turn_error(engine, session_id):
+    """The error text of the session's newest message, or "" (none, or it could not be read)."""
+    try:
+        newest = (engine.v2.message_list(session_id, limit=1, order="desc") or [None])[0]
+    except Exception:
+        return ""
+    error = (newest.get("error") or (newest.get("info") or {}).get("error")) if isinstance(newest, dict) else None
+    return _one_line(json.dumps(error) if not isinstance(error, str) else error, 300) if error else ""
+
+
+def resume_ended_turn(engine, caller, name, reason, discovery=None):
+    """Send the resume text to `name`'s session, only when its turn has ended and nothing is open. Raises ResumeRefused (nothing sent, nothing
+    audited) for a missing or unreadable agent, a working session, an open permission request or question (that goes to the owner), and an agent
+    resumed less than RESUME_SECONDS ago. Otherwise one `resume` audit line (who, whom, why) and the send; returns the message id."""
+    caller, reason = blocked_sender(caller), _one_line(reason or RESUME_REASON, 200)
+    now = engine.now()
+    discovery = discovery if discovery is not None else engine.discover(now)
+    seen = discovery.agents.get(name)
+    if seen is None:
+        raise ResumeRefused(discovery.missing(name))
+    seen, why = engine.reobserve(seen, now)   # a read before a write
+    if seen is None:
+        raise ResumeRefused(why)
+    if seen.conflict or seen.problem:
+        raise ResumeRefused(seen.problem or "%s is claimed by more than one session" % name)
+    if seen.status == "working":
+        raise ResumeRefused("%s is working: nothing is sent to a session that is working" % name)
+    if seen.status not in ("idle", "blocked", "working"):
+        raise ResumeRefused("%s has status %s in herdr: only an ended turn is resumed" % (name, seen.status))
+    try:
+        opened = [("permission request", engine.v2.permission_list(seen.session_id)), ("question", engine.v2.form_list(seen.session_id))]
+    except V2Error as err:
+        raise ResumeRefused("v2 unreachable, so an open request cannot be ruled out: %s" % _one_line(str(err), 120)) from None
+    kinds = [kind for kind, found in opened if found]
+    if kinds:
+        raise ResumeRefused("%s has an open %s: that goes to the owner, nothing is sent" % (name, " and an open ".join(kinds)))
+    taken = {}
+
+    def take(state):   # the rate record, under the lock: a second resume inside the window finds this one
+        last = state.get(name, {}).get("at")
+        taken["last"] = last
+        if _is_number(last) and now - last < RESUME_SECONDS:
+            return None
+        state[name] = {"at": now}
+        taken["ok"] = True
+        return state
+    blocked_update(engine.state_dir, RESUME_STATE, take)
+    if not taken.get("ok"):
+        raise ResumeRefused("%s was resumed %d minutes ago: one resume per agent per %d minutes" % (name, int((now - taken["last"]) // 60), RESUME_SECONDS // 60))
+    keys = ["resume:%d" % now]
+    message_id = derive_message_id(seen.session_id, keys)
+    try:
+        engine.v2.synthetic(seen.session_id, RESUME_TEXT, {"fleet": {"keys": keys, "from": "switchboard"}}, True, "queue", message_id,
+                            "Resume: your turn ended, carry on")
+    except Exception:
+        blocked_update(engine.state_dir, RESUME_STATE, lambda s: dict(s, **{name: {"at": taken["last"]}}) if _is_number(taken["last"]) else {k: v for k, v in s.items() if k != name})
+        raise
+    engine.reads.forget(seen.session_id)
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "resume", name, {"by": caller, "reason": reason, "session": seen.session_id, "message_id": message_id})
+    return message_id
+
+
+def resume_first_recovery(engine, discovery, seen, reported):
+    """The automatic first recovery of the blocked report: a stop whose turn error holds HTTP 499, ECONNRESET or a timeout is resumed once,
+    through `resume_ended_turn` (the same refusals, rate limit and audit line), before it is reported. True when it was resumed; never raises."""
+    try:
+        error = last_turn_error(engine, seen.session_id) if reported is None else ""
+        found = PROVIDER_ERROR.search(error)
+        if not found:
+            return False
+        resume_ended_turn(engine, "switchboard", seen.name, "the blocked report found a provider error (%s) after an ended turn" % found.group(0), discovery)
+        return True
+    except Exception:
+        return False
+
+
+def ended_turn_text(name, resumed):
+    """What the blocked report says of an ended turn with nothing open: the real command, or that it was just resumed."""
+    if resumed:
+        return ("an ended turn after a provider error: the switchboard resumed it once just now (`%s %s`, audited); "
+                "a second stop within %d minutes is reported as usual" % (RESUME_COMMAND, name, RESUME_SECONDS // 60))
+    return ("an ended turn with nothing open (the terminal shows it blocked, often after a provider error; not a real question): "
+            "the Chief of Staff may resume it with `%s %s`, which is audited and sends nothing while it works or has anything open" % (RESUME_COMMAND, name))
+
+
 # ---- a long block is reported (docs/switchboard.md, "A blocked agent is reported"). `hold_reason` holds a message for an agent
 # the terminal shows as blocked: nothing is typed into a prompt, and that is right. The missing part was the report. Once per
 # block (repeated at most every `repeat_minutes`, closed with one final line) its boss and the Chief of Staff are told. It reads
@@ -16027,7 +16128,7 @@ def blocked_alert_section(config):
     return dict(BLOCKED_ALERT_DEFAULTS, **(raw or {}))
 
 
-def blocked_kind(engine, observation):
+def blocked_kind(engine, observation, resumed=False):
     """What a blocked agent waits on, in words, as the pass read it: an open permission request or question, or (nothing open) an ended turn."""
     source = next((s for s in engine.sources if isinstance(s, WorkerFacts)), None)
     if source is None:
@@ -16035,8 +16136,7 @@ def blocked_kind(engine, observation):
     kinds = sorted({kind for who, kind, _ in source.requests if who.session_id == observation.session_id})
     if kinds:
         return "an open %s; it goes to the owner" % " and an open ".join("%s request" % k if k == "permission" else k for k in kinds)
-    return ("an ended turn with nothing open (the terminal shows it blocked, often after a provider error; not a real question): "
-            "the Chief of Staff may resume it with one `poke`, which is audited")
+    return ended_turn_text(observation.name, resumed)
 
 
 BLOCKED_HELD_SENDS = "blocked-held-sends.json"   # {agent: {"rows": [{"from", "at"}]}}: sends refused while it was blocked (a `send` stores nothing, so the report counts them here)
@@ -16180,7 +16280,7 @@ def blocked_tick(engine, discovery, held):
             event = "blocked.repeat"
         else:
             continue
-        kind = blocked_kind(engine, seen)
+        kind = blocked_kind(engine, seen, resume_first_recovery(engine, discovery, seen, last))
         tell(seen, blocked_line(engine, seen, entry["since"], now, messages, refusals, kind),
              event, {"since": iso(entry["since"]), "held": len(messages), "refused": len(refusals)})
         entry["reported"] = now
@@ -19196,6 +19296,41 @@ def cmd_ensure(args, spawn=subprocess.Popen):
     outcome = ensure_daemon(state, spawn)
     print("daemon %s" % outcome)
     return EXIT_OK
+
+
+def cmd_resume(args, runner, now):
+    """`resume AGENT [--reason TEXT]`: the audited resume of an agent whose turn has ended (the same `resume_ended_turn` the blocked report uses).
+    Refused (exit 3, nothing sent) for a working session, an open permission request or question, and an agent resumed in the last 10 minutes."""
+    engine, _, _ = build_engine(runner, now, "cli")
+    if args.sender is not None:
+        if os.environ.get(LAB_ENV) != "1":
+            sys.stderr.write("%s: --from is only for the Lab (%s=1); an agent is identified by its pane\n" % (PROG, LAB_ENV))
+            return EXIT_USAGE
+        caller = args.sender
+    else:
+        caller = identify_caller(engine.herdr, engine.v2, os.environ)
+    try:
+        message_id = resume_ended_turn(engine, caller, args.name, args.reason)
+    except ResumeRefused as err:
+        sys.stderr.write("%s: not resumed: %s\n" % (PROG, _one_line(str(err), 300)))
+        return EXIT_HELD
+    print(message_id)
+    sys.stderr.write("%s: resumed %s (audited)\n" % (PROG, args.name))
+    return EXIT_OK
+
+
+cmd_resume.ensure_on_use = True
+
+
+def add_resume_parsers(sub):
+    resume = sub.add_parser("resume", help="Resume an agent whose turn has ended (audited; one per agent per 10 minutes)",
+                            description="`%s AGENT` sends the resume text to AGENT's session only when its turn has ended and nothing is open. It refuses "
+                                        "an agent with an open permission request or question (that goes to the owner), a session that is working, and an "
+                                        "agent resumed in the last %d minutes. Each resume writes one audit line naming who resumed whom and why."
+                                        % (RESUME_COMMAND, RESUME_SECONDS // 60))
+    resume.add_argument("name", metavar="AGENT")
+    resume.add_argument("--reason", default=RESUME_REASON, help="why, for the audit line (default: %(default)s)")
+    resume.add_argument("--from", dest="sender", default=None, help=argparse.SUPPRESS)
 
 
 def cmd_poke(args):
@@ -23071,7 +23206,8 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
             "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete,
             "top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "review_action": record[0] if record else None, "review_class": record[1] if record else None,   # #661: display data the delegated clear reads; no decision changes
             "changed_paths": [p for p in paths if isinstance(p, str)][:200], "unknown": unknown, "rated": [list(r) for r in rated],
-            "decision": decision, "reasons": reasons, "owner_decision": owner[0], "owner_reasons": owner[1], "draft": raw.get("isDraft") is True}
+            "decision": decision, "reasons": reasons, "owner_decision": owner[0], "owner_reasons": owner[1], "draft": raw.get("isDraft") is True,
+            "base": raw.get("baseRefOid")}
 
 
 def cmd_impact(args, runner, now):
@@ -23662,6 +23798,38 @@ def chat_clear_apply(engine, cc, pr, offer, quoted, message_id, now):
     return lines
 
 
+def _impact_release_reason(before, base, rule, record, head, new_head):
+    """The reason a hold no longer holds, from what the pull request was last judged on: `base changed`, `rule changed` (the matrix), `record changed` (the
+    impact review record or rating), `head changed`, else `rule no longer holds` (nothing remembered: a restart, or the first judgement). It only names; it decides nothing."""
+    if before is None:
+        return "rule no longer holds"
+    if new_head and before[3] != new_head:
+        return "head changed"
+    if before[0] != base:
+        return "base changed"
+    if before[1] != rule:
+        return "rule changed"
+    if before[2] != record:
+        return "record changed"
+    return "rule no longer holds"
+
+
+def impact_ours(engine):
+    """(the hold state's `applied` records, the problem or None). A state that cannot be read lists none. Which of them are ours for a repo: `applied_for_repo`."""
+    state, problem = read_impact_state(engine.state_dir)
+    if problem:
+        return {}, problem
+    return state.get("applied") or {}, None
+
+
+def _impact_not_checked(engine, what, why):
+    """A hold that cannot be re-checked because an input cannot be read: its labels stay, and this says so ONCE for the episode (`impact.not_checked`)."""
+    if engine.__dict__.get("impact_not_checked") == what:
+        return
+    engine.__dict__["impact_not_checked"] = what
+    engine.audit.append(engine.actor, "impact.not_checked", None, {"input": what, "why": _one_line(str(why), 160), "kept": "every label this daemon added stays until it can be read"})
+
+
 def clear_line_marker(head, line):
     """The hidden marker of the posted line: the head (12 hex) and a hash of the line's content (12 hex). The once-per-content rule is read back from it."""
     return "<!-- fleet-switchboard:clear-line head=%s hash=%s -->" % ((head or "")[:12], hashlib.sha256(line.encode("utf-8")).hexdigest()[:12])
@@ -23758,22 +23926,33 @@ def impact_would_hold_pass(engine, now):
     hold_cfg = (engine.config.get("impact_hold") or {}) if isinstance(engine.config, dict) else {}
     budget = hold_cfg.get("calls_per_pass", cfg.get("calls_per_pass", IMPACT_PASS_CALLS))   # `impact_hold.calls_per_pass` wins when set
     records, records_problem = impact_records(engine.state_dir)
+    basis = engine.__dict__.setdefault("impact_basis", {})   # what each pull request was last judged on (base, rule, record): it NAMES a release's reason, it never skips a judgement
+    judged_at = engine.__dict__.setdefault("impact_judged_at", {})
+    ours_applied, state_problem = impact_ours(engine)   # the pull requests carrying labels this daemon added: judged even when the floor is now empty (#999)
+    if state_problem or (records_problem and any(applied_for_repo(ours_applied, k) for k in state.lists)):
+        _impact_not_checked(engine, "the impact review ledger" if records_problem else "the hold state file", records_problem or state_problem)
+    else:
+        engine.__dict__.pop("impact_not_checked", None)
     marks = impact_carry_marks(engine.state_dir)[0]
     unjudged, live, heads = 0, set(), {}
     for key, (_, listed) in sorted(state.lists.items()):
-        for record in listed:
+        ours_prs = applied_for_repo(ours_applied, key)
+        for record in sorted(listed, key=lambda r: judged_at.get((key, r.get("number")), 0) if isinstance(r, dict) else 0):   # the one judged longest ago first: a small budget never starves a pull request
             number = record.get("number") if isinstance(record, dict) else None
             head = ((record.get("head") or {}).get("sha")) if isinstance(record, dict) else None
-            if not isinstance(number, int) or isinstance(number, bool) or not head or record.get("draft"):
+            if not isinstance(number, int) or isinstance(number, bool) or not head or (record.get("draft") and "%s#%d" % (key, number) not in ours_prs):
                 continue
             pr = "%s#%d" % (key, number)
+            ours = pr in ours_prs
             live.add((key, number))
             heads[(key, number)] = head
             enforce = impact_floor.hold_mode(engine.config, key) == "enforce"
             earlier = reports.get((key, number))
+            listed_base = record.get("base") if isinstance(record.get("base"), dict) else {}   # (#999) the list already carries the base: a RETARGET (a changed base.ref) re-judges with no extra call; a move of the same base's tip is not in the key (it does not change a three-dot diff, and keying on it would re-judge every open pull request at each merge)
+            list_base = listed_base.get("ref")
             backoff = seen.get((key, number, "retry"))
             if earlier is not None and earlier["head"] == head and earlier.get("rule") == rule and earlier.get("owner_decision") != "hold" and enforce and not earlier.get("rehold") \
-                    and not (backoff and now < backoff) and not records_problem and (pr, head) in records and seen.get((key, number)) != (head, rule, records[(pr, head)]):
+                    and not (backoff and now < backoff) and not records_problem and (pr, head) in records and seen.get((key, number)) != (head, rule, records[(pr, head)], list_base):
                 # an impact review record that is new since this head was judged, on a pull request that holds nothing: no gh read (the paths are unchanged).
                 # A `hold` of a top tier, missing or unknown class can only ADD a hold; anything else changes nothing, so it is only noted as seen.
                 newest = records[(pr, head)]
@@ -23782,24 +23961,25 @@ def impact_would_hold_pass(engine, now):
                     try:
                         budget -= apply_impact_hold(engine, key, number, added, record)
                         reports[(key, number)] = added
-                        seen[(key, number)] = (head, rule, newest)
+                        seen[(key, number)] = (head, rule, newest, list_base)
                         engine.audit.append(engine.actor, "gate.would_hold", pr, {"head": head, "reasons": added["reasons"], "floor_paths": [], "advisory": False, "unknown": None})
                     except Exception as err:
                         seen[(key, number, "retry")] = now + IMPACT_RETRY_SECONDS
                         engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
                 else:
-                    seen[(key, number)] = (head, rule, newest)
+                    seen[(key, number)] = (head, rule, newest, list_base)
                 continue
             try:
                 globs = impact_floor.floor_for(key, engine.config)[0]
             except impact_floor.MatrixError as err:   # fail LOUD: no judgement is made while the matrix file cannot be read (never read as "no floor")
                 _impact_matrix_episode(engine, now, err)
                 return
-            if not globs:
+            if not globs and not ours:   # a pull request holding our labels is judged even when the floor is now empty: the release is the point
                 continue
-            signature = (head, rule, "unreadable" if records_problem else records.get((pr, head))) + ((marks[(pr, head)],) if (pr, head) in marks else ())   # (#815) a new confirmation re-judges
+            signature = (head, rule, "unreadable" if records_problem else records.get((pr, head)), list_base) \
+                + ((marks[(pr, head)],) if (pr, head) in marks else ())   # (#815) a new confirmation re-judges
             if seen.get((key, number)) == signature:
-                continue
+                continue   # judged on exactly these inputs: held or not, it costs no call until one of them changes (head, rule, record, base)
             if budget <= 0:
                 unjudged += 1
                 continue
@@ -23817,6 +23997,9 @@ def impact_would_hold_pass(engine, now):
                 continue
             report["rule"] = rule
             owner = report.get("owner_decision")
+            judged_at[(key, number)] = now
+            if owner != "hold":
+                report["release_reason"] = _impact_release_reason(basis.get((key, number)), report.get("base"), rule, signature[2], head, report.get("head"))
             if owner == "hold":
                 engine.audit.append(engine.actor, "gate.would_hold", report["pr"],
                                     {"head": report["head"], "floor_paths": report["floor_paths"][:20], "reasons": report.get("owner_reasons", [])[:10],
@@ -23846,8 +24029,13 @@ def impact_would_hold_pass(engine, now):
                     engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
                     unjudged += 1
                     continue
-            seen[(key, number)] = (report["head"] or head, rule, "unreadable" if records_problem else records.get((pr, report["head"] or head))) + ((marks[(pr, report["head"] or head)],) if (pr, report["head"] or head) in marks else ())
+            judged_head = report["head"] or head
+            seen[(key, number)] = (judged_head, rule, "unreadable" if records_problem else records.get((pr, judged_head)), signature[3]) + ((marks[(pr, judged_head)],) if (pr, judged_head) in marks else ())
+            basis[(key, number)] = (report.get("base"), rule, seen[(key, number)][2], report.get("head") or head)
             reports[(key, number)] = report
+    for memo in (basis, judged_at):   # nothing is kept for a pull request that is no longer open
+        for gone in [k for k in memo if k not in live]:
+            del memo[gone]
     clear_line_pass(engine, now, rule, heads, reports)   # #946: one line per held ready head, who can clear it (reads, then at most one comment each)
     _impact_matrix_recovered(engine, now)   # the file and the floor of every repo were read this pass: a standing episode is over
     if not unjudged and not records_problem and any(impact_floor.hold_mode(engine.config, key) == "enforce" for key, _ in live):
@@ -28126,7 +28314,7 @@ def build_parser():
     launch.add_argument("--branch", help="With --cloud: the branch the worker starts on")
     launch.add_argument("--idle", help="With --cloud: stop after this long idle (default 10m)")
     launch.add_argument("--hard", help="With --cloud: stop after this long whatever it does (default 2h)")
-    launch.add_argument("--shape", help="With --cloud: the pod shape, S (2 CPU, 4 GiB; the launcher's default) or M (4 CPU, 8 GiB)")
+    launch.add_argument("--shape", help="With --cloud: the pod shape, XS (1 CPU, 2 GiB; the launcher's default, no nested Docker), S (2 CPU, 4 GiB; the default with --stack) or M (4 CPU, 8 GiB)")
     launch.add_argument("--stack", action="store_true", help="With --cloud: a pod that can run a nested Docker stack (the Sysbox runtime class, its own user namespace, no capability added, no privileged mode). Off by default; the launch without it is unchanged. The first pod on a fresh node may wait for the node's runtime: the launcher retries")
     pending = sub.add_parser("pending", help="What is pending for an agent, and why it waits or is held")
     pending.add_argument("name", help="The agent's fleet name")
