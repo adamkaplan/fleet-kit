@@ -28402,7 +28402,7 @@ class TestSweep(Base):
             cos("pr:api#503", kind="captain", repo=None), human("pr:acme/api#503", kind="captain", number=503),   # short vs full pr: ref
             cos("pr:acme/api#504", kind="captain", number=504), human("pr:api#504", kind="captain", repo=None),   # and the other way
             cos("d-alone", ask=510),                                                                  # a cos-tier item alone still raises
-            cos("pr:acme/api#511", kind="captain", number=511),                                       # so does a captain PR alone
+            cos("pr:acme/api#511", kind="report", number=511),                                        # so does a report row about a PR (a held PR is judged by its gates, #986)
             cos("d-other-repo", ask=500, repo="acme/web"),                                            # another repo's #500 is not ours
         ]
         self.engine.config["github_repos"] = ["acme/api", "acme/web"]
@@ -28410,6 +28410,92 @@ class TestSweep(Base):
         self.sweep(decisions)
         self.assertEqual([f for f in self.found() if f[0] == "S5"],
                          [("S5", "d-alone"), ("S5", "d-other-repo"), ("S5", "pr:acme/api#511")])
+
+    # ---- #986: S5 for a held pull request is raised from its gates, counted from the moment it became ready at its head
+    HEAD_A, HEAD_B = "a" * 40, "b" * 40
+
+    def held_pr(self, number=600, hold_hours=10):
+        return {"id": "pr:acme/api#%d" % number, "kind": "captain", "tier": "cos", "repo": "acme/api", "number": number, "title": "t",
+                "since": sb.iso(self.world.clock.now() - hold_hours * 3600)}
+
+    def s5_run(self, reading, decisions, mutant=None):
+        """One pass with the gate reading `reading` (a dict that tests change between passes); returns the S5 audit lines so far."""
+        calls = []
+
+        def fake(engine, repo, number, now):
+            calls.append((repo, number))
+            return reading["value"]
+        patches = [mock.patch.object(sb, "sweep_gate_reading", fake)]
+        if mutant == "from_hold":
+            patches.append(mock.patch.object(sb, "sweep_s5_wait_start", lambda ready_at, since: since))
+        if mutant == "raises_not_ready":
+            patches.append(mock.patch.object(sb, "sweep_gate_reading", lambda e, r, n, now: ([], reading["value"][1] or self.HEAD_A, "who can clear it: x", None)
+                                            if reading["value"][0] is not None else reading["value"]))
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            self.sweep(decisions)
+        return [e for e in self.world.audit() if e["event"] == "sweep.finding" and e["detail"]["kind"] == "S5"]
+
+    def ready(self, head=None):
+        return (["G6"], head or self.HEAD_A, "Who can clear this: owner only: x", None)
+
+    def scenario_986(self, mutant=None):
+        """Every plan scenario in one run; raises AssertionError at the first one that does not hold."""
+        decisions = [self.held_pr()]
+        self.hub.open = {600: sweep_issue(600, "MERGE: captain", pr=True)}
+        reading = {"value": None}
+        for opened in (["G0a"], ["G1"], ["G4", "G6"], ["G6b", "G6"]):   # CI pending, review missing, proofs missing, body missing
+            reading["value"] = (opened, self.HEAD_A, None, None)
+            self.assertEqual(self.s5_run(reading, decisions, mutant), [])
+            self.world.tick(3 * 3600)   # past the threshold: a build that raises a not-ready pull request raises it by now
+            self.assertEqual(self.s5_run(reading, decisions, mutant), [])
+        reading["value"] = self.ready()
+        self.assertEqual(self.s5_run(reading, decisions, mutant), [])   # ready now, held for 10 hours: under the threshold counted from ready
+        self.world.tick(3600)
+        self.assertEqual(self.s5_run(reading, decisions, mutant), [])
+        self.world.tick(3600 + 60)
+        (line,) = self.s5_run(reading, decisions, mutant)
+        self.assertEqual(len(self.s5_run(reading, decisions, mutant)), 1)   # a second run: still one
+        text = line["detail"]["text"]
+        self.assertRegex(text, r"head [0-9a-f]{12}\b")
+        self.assertIn("ready at", text)
+        self.assertIn("Who can clear", text)
+        self.world.tick(3600)
+        reading["value"] = (["G0a", "G6"], self.HEAD_A, None, None)   # a gate opens again
+        self.sweep_with(reading, decisions)
+        self.assertEqual(sb.sweep_state(self.engine).s5, {})
+        reading["value"] = self.ready()
+        self.sweep_with(reading, decisions)
+        self.assertEqual(sb.sweep_state(self.engine).s5, {})            # the wait restarts
+        self.world.tick(2 * 3600 + 1)
+        self.sweep_with(reading, decisions)
+        self.assertEqual(len(sb.sweep_state(self.engine).s5), 1)
+        reading["value"] = self.ready(self.HEAD_B)                      # a new head restarts it
+        self.sweep_with(reading, decisions)
+        self.assertEqual(sb.sweep_state(self.engine).s5, {})
+        reading["value"] = (None, None, None, "HTTP 502")               # unreadable: not checked, never raised
+        self.sweep_with(reading, decisions)
+        self.assertEqual((sb.sweep_state(self.engine).s5, sb.sweep_state(self.engine).s5_unchecked), ({}, 1))
+
+    def sweep_with(self, reading, decisions):
+        with mock.patch.object(sb, "sweep_gate_reading", lambda e, r, n, now: reading["value"]):
+            self.sweep(decisions)
+
+    def test_986_a_held_pr_is_raised_only_when_ready_and_after_the_wait_counted_from_ready(self):
+        self.scenario_986()
+
+    def test_986_the_mutants_fail(self):
+        for mutant in ("from_hold", "raises_not_ready"):
+            self.setUp()
+            with self.assertRaises((AssertionError, ValueError), msg=mutant):
+                self.scenario_986(mutant)
+
+    def test_986_the_summary_and_status_count_not_checked(self):
+        reading = {"value": (None, None, None, "boom")}
+        self.hub.open = {600: sweep_issue(600, "x", pr=True)}
+        self.sweep_with(reading, [self.held_pr()])
+        self.assertEqual(self.engine.sweep.current["not_checked"], 1)
 
     def test_s5_ref_keys_read_both_spellings_and_an_ambiguous_short_name_resolves_nowhere(self):
         keys = lambda d, repos=("acme/api",): sb.sweep_ref_keys(d, "acme/api", list(repos))
