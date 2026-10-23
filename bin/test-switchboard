@@ -14873,6 +14873,217 @@ class TestChatClearHook(Base):
             if case.startswith("test_"):
                 self.assertTrue(hasattr(type(self), case), case)
 
+    # ---- #1194: the two-step clear (the understanding reply, then "yes <number>" bound to the full head)
+
+    QUESTIONS = "## Questions for you\n\n1. Is the rename fine? Recommendation: yes.\n\n## Technical\nx"
+
+    def live_ready(self, body=None, **kw):
+        self.live = True
+        self.build(**kw)
+        self.pr["body"] = self.QUESTIONS if body is None else body
+        self.hook()
+
+    def ledger(self):
+        return self.events("gate.hold_cleared")
+
+    def pending(self):
+        return sb.load_module("chat_clear").read_pending(self.world.state)
+
+    def sent(self):
+        return [t for t in self.cos_texts() if "[chat clear]" in t]
+
+    def test_t1_the_whole_path_one_reply_with_the_full_head_then_one_recorded_clear_on_the_confirmation(self):
+        self.live_ready()
+        self.say("9 is good to go")
+        self.hook()
+        (reply,) = self.sent()
+        self.assertIn(self.H1, reply)
+        self.assertIn("acme/app#9", reply)
+        self.assertIn("Is the rename fine? Recommendation: yes.", reply)
+        self.assertIn("does not touch the clear machinery", reply)
+        self.assertEqual((self.ledger(), self.label_deletes()), ([], []), "the first message clears nothing")
+        self.assertEqual(self.pending()["head"], self.H1)
+        for _ in range(2):
+            self.world.tick(5)
+            self.hook()
+        self.assertEqual(len(self.events("chat_clear.verdict")), 1, "the reply carries fleet metadata: the reader never takes it for his words (U3)")
+        self.assertEqual(len(self.jev.calls), 1)
+        self.confirm()
+        (line,) = self.ledger()
+        d = line["detail"]
+        self.assertEqual((d["by"], d["head"], len(d["head"])), ("owner (chat)", self.H1, 40))
+        self.assertEqual(d["reason"], "9 is good to go | yes 9")
+        self.assertIn("offer:acme/app#9@", d["via"])
+        self.assertEqual(len(self.jev.calls), 1, "the confirmation asks no judge (U5)")
+        self.assertIsNone(self.pending(), "a pending reply is consumed once")
+
+    def test_t2_the_chat_line_has_the_shape_of_the_command_line_except_by_words_and_via(self):
+        self.live_ready()
+        self.say("9 is good to go")
+        self.hook()
+        self.confirm()
+        chat = self.ledger()[0]["detail"]
+        self.build()
+        sb.impact_clear_core(self.engine, self.route, self.REPO, 9, "owner", "by hand", remove=None, head=self.H1)
+        command = self.ledger()[0]["detail"]
+        differ = {k for k in set(chat) | set(command) if chat.get(k) != command.get(k)}
+        self.assertLessEqual(differ, {"by", "reason", "via", "remove", "removed"}, differ)
+        self.assertEqual(len(chat["head"]), 40)
+
+    def test_t3_a_head_that_moved_between_the_reply_and_the_confirmation_records_nothing_and_says_the_new_head(self):
+        self.live_ready()
+        self.say("9 is good to go")
+        self.hook()
+        self.pr["headRefOid"] = self.H2
+        self.confirm()
+        self.assertEqual((self.ledger(), self.label_deletes()), ([], []))
+        last = self.sent()[-1]
+        self.assertIn("new head", last)
+        self.assertIn(self.H2[:8], last)
+        self.assertIsNone(self.pending())
+
+    def test_t4_a_pending_reply_older_than_ten_minutes_or_an_offer_older_than_seven_days_records_nothing(self):
+        self.live_ready()
+        self.say("9 is good to go")
+        self.hook()
+        self.world.tick(601)
+        self.confirm()
+        self.assertEqual(self.ledger(), [])
+        self.assertIn("old", self.sent()[-1])
+        self.live_ready()
+        self.say("9 is good to go")
+        self.hook()
+        cc = sb.load_module("chat_clear")
+        offers = cc.read_offers(self.world.state)
+        offers[self.PR]["shown_at"] -= cc.OFFER_TTL + 1000
+        cc.write_offers(self.world.state, offers)
+        self.say("yes 9")
+        with mock.patch.object(cc, "refresh_offers", return_value={"offers": offers, "added": [], "dropped": [], "problem": None, "damaged": []}):
+            self.hook()
+        self.assertEqual(self.ledger(), [])
+        self.assertIn("old", self.sent()[-1])
+
+    def test_t5_a_bare_yes_or_another_number_is_a_question_and_the_pending_reply_stays_for_the_right_one(self):
+        self.live_ready()
+        self.say("9 is good to go")
+        self.hook()
+        before = len(self.sent())
+        self.say("yes")
+        self.hook()
+        self.say("yes 10")
+        self.hook()
+        self.assertEqual((self.ledger(), len(self.sent()) - before), ([], 2))
+        self.assertIsNotNone(self.pending())
+        self.confirm()
+        self.assertEqual(len(self.ledger()), 1)
+
+    def test_t6_messages_that_name_no_number_an_unoffered_one_two_or_a_quoted_one_are_questions_and_pend_nothing(self):
+        self.live_ready()
+        for text in ("approved", "77 is good to go", "see 9 and 10, good to go", "he said \"9 is good to go\" earlier, is that right"):
+            n = len(self.sent())
+            self.say(text)
+            self.hook()
+            self.assertEqual((self.pending(), self.ledger(), len(self.sent()) - n), (None, [], 1), text)
+            self.assertIn("Nothing was cleared", self.sent()[-1])
+        self.assertEqual(len(self.events("chat_clear.verdict")), 4, "each is audited")
+
+    def test_t7_an_agents_message_and_another_sessions_message_are_not_read(self):
+        self.live_ready()
+        self.world.v2.start_turn(self.world.sessions["cos"], "9 is good to go", fleet=True, lasts=0)
+        self.hook()
+        self.world.v2.start_turn(self.world.sessions["coder"], "9 is good to go", fleet=False, lasts=0)
+        self.hook()
+        self.assertEqual((self.sent(), self.pending(), self.ledger(), self.events("chat_clear.verdict")), ([], None, [], []))
+        self.assertEqual(len(sb.load_module("chat_clear").read_offers(self.world.state)), 1)
+
+    def test_t8_a_confirmation_with_no_pending_reply_clears_nothing_and_a_single_message_never_clears(self):
+        self.live_ready()
+        self.say("yes 9")
+        self.hook()
+        self.assertEqual((self.ledger(), self.label_deletes()), ([], []))
+        self.assertIn("no pending", self.sent()[-1])
+        self.say("9 is good to go")
+        self.hook()
+        self.world.tick(601)
+        self.hook()
+        self.assertEqual(self.ledger(), [])
+
+    def test_t9_live_off_writes_only_shadow_lines_including_the_reply_and_the_would_record(self):
+        self.live_ready_off = True
+        self.build(live=False)
+        self.pr["body"] = self.QUESTIONS
+        self.hook()
+        self.say("9 is good to go")
+        self.hook()
+        self.say("yes 9")
+        self.hook()
+        self.assertEqual((self.sent(), self.pending(), self.ledger(), self.writes), ([], None, [], []))
+        verdicts = self.events("chat_clear.verdict")
+        self.assertEqual([v["detail"]["live"] for v in verdicts], [False, False])
+        self.assertEqual([v["detail"]["kind"] for v in verdicts], ["reply", "would-record"])
+
+    def test_t10_a_clear_machinery_path_needs_the_explainer_block_and_other_holds_are_never_pended(self):
+        self.live_ready()
+        with mock.patch.object(sb, "chat_clear_machinery", return_value=True):
+            self.say("9 is good to go")
+            self.hook()
+            self.assertIn("CLEAR MACHINERY", self.sent()[-1])
+            self.confirm()
+            self.assertEqual(self.ledger(), [])
+            self.assertIn("explainer", self.sent()[-1])
+            self.pr["body"] = sb.explainer_block("the clear waits on a terminal command", "the clear is given in chat") + "\n" + self.QUESTIONS
+            self.say("9 is good to go, thanks")
+            self.hook()
+            self.confirm()
+        self.assertEqual(len(self.ledger()), 1)
+        cleared = len(self.ledger())
+        self.build()
+        self.pr["labels"] = [{"name": self.names["hold-security"]}, {"name": self.names["hold-impact"]}]
+        self.hook(self.decisions(holds=("impact", "security")))
+        self.say("9 is good to go")
+        self.hook(self.decisions(holds=("impact", "security")))
+        self.assertEqual((self.pending(), len(self.ledger()) - cleared), (None, 0))
+
+    def test_t11_an_unreachable_judge_never_pends_and_a_judge_picking_another_pr_never_widens(self):
+        self.live_ready()
+        self.engine.jev = self.jev = FakeJev(lambda state, questions: (_ for _ in ()).throw(RuntimeError("down")))
+        self.say("9 is good to go")
+        self.hook()
+        self.assertEqual((self.pending(), self.ledger(), len(self.sent())), (None, [], 1))
+        self.live_ready()
+        self.engine.jev = self.jev = FakeJev(self.picks("acme/app#10", 0.97))
+        self.say("9 is good to go")
+        self.hook()
+        self.assertEqual((self.pending(), self.ledger()), (None, []))
+
+    def test_t12_a_damaged_oversized_or_missing_pending_file_means_no_pending_reply(self):
+        for content in (None, "{not json", "x" * 20000, json.dumps({"pending": {"pr": self.PR, "head": "abc", "at": 1, "offer_id": "x", "words": "w", "machinery": False}})):
+            self.live_ready()
+            path = Path(self.world.state) / "chat-clear-pending.json"
+            if content is not None:
+                path.write_text(content)
+            self.say("yes 9")
+            self.hook()
+            self.assertEqual(self.ledger(), [], content)
+
+    def test_t13_the_pending_file_is_private_and_the_build_never_sets_the_key(self):
+        self.live_ready()
+        self.say("9 is good to go")
+        self.hook()
+        self.assertEqual((Path(self.world.state) / "chat-clear-pending.json").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(sb.chat_clear_config({}), {"enabled": True, "live": False})
+        for tracked in ("config.example.json",):
+            f = Path(sb.__file__).resolve().parent.parent / tracked
+            if f.exists():
+                self.assertNotRegex(f.read_text(), r'"live"\s*:\s*true')
+
+    def test_t14_the_docs_state_the_two_step_clear_the_head_the_key_and_the_cause(self):
+        docs = (Path(sb.__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
+        section = docs[docs.index("### The chat clear (two steps, #1194)"):]
+        section = section.split("\n### ", 1)[0]
+        for needle in ("yes <number>", "full head", "chat_clear.live", "the owner", "10 minutes", "no_number", "6.5 hours"):
+            self.assertIn(needle, section)
+
     # ---- #977: the one allowed session read under v2_light
 
     FIXTURE = Path(__file__).resolve().parent.parent / "scenarios" / "chat-clear" / "owner-prompt-records.json"
