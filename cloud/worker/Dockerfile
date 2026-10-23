@@ -27,6 +27,20 @@ RUN curl -fsSL "https://opencode.ai/files/bin/${OPENCODE_VERSION}/opencode-linux
  && tar -xzf /tmp/oc.tgz -C /usr/local/bin opencode \
  && chmod 0755 /usr/local/bin/opencode && rm /tmp/oc.tgz
 
+# ---- Node runtime (ask 1040): one pinned release, checked against the published checksum list before it is unpacked ----
+# NODE_VERSION and NODE_SHASUMS_URL are the only constants (bump: cloud/README.md). Root-owned /opt/node, linked into /usr/local/bin.
+ARG NODE_VERSION=22.23.2
+ARG NODE_SHASUMS_URL=https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt
+RUN set -eu; case "$(dpkg --print-architecture)" in amd64) a=x64 ;; arm64) a=arm64 ;; *) echo "unsupported architecture" >&2; exit 1 ;; esac \
+ && f="node-v${NODE_VERSION}-linux-${a}.tar.xz" \
+ && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/${f}" -o "/tmp/${f}" \
+ && curl -fsSL "${NODE_SHASUMS_URL}" -o /tmp/SHASUMS256.txt \
+ && (cd /tmp && grep " ${f}\$" SHASUMS256.txt | sha256sum -c -) \
+ && mkdir -p /opt/node && tar -xJf "/tmp/${f}" -C /opt/node --strip-components=1 \
+ && ln -s /opt/node/bin/node /usr/local/bin/node && ln -s /opt/node/bin/npm /usr/local/bin/npm && ln -s /opt/node/bin/npx /usr/local/bin/npx \
+ && chown -R root:root /opt/node && rm -f "/tmp/${f}" /tmp/SHASUMS256.txt
+# ---- end Node runtime ----
+
 # Non-root worker. It may start dockerd (and nothing else) as root: the daemon only
 # runs inside the Sysbox pod's own user namespace.
 RUN userdel -r ubuntu 2>/dev/null || true \

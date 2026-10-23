@@ -15,12 +15,25 @@ Cloud workers serve the organisation's repositories only; no task, test or demo 
 ## What is in the image
 
 Ubuntu 24.04, Python 3, git, `cw-gh` (our own small GitHub client; the real `gh` is not installed: see "The client that replaces the real `gh`"), Docker Engine with the compose plugin, and `opencode` v2 (pinned,
-`OPENCODE_VERSION=2.0.28`, a standalone binary checked against its sha256 before it is unpacked; no node or npm). The
+`OPENCODE_VERSION=2.0.28`, a standalone binary checked against its sha256 before it is unpacked; a standalone binary, not a Node package). The
 launcher's end hook and token mint are copied in as `cw-end-hook` and `cw-token-mint`, and the activity reader as
 `cw-worker-activity` (it reads the v2 object shape of `GET /api/session/active`). `cw-plan-check` and `plan_check.py` (a byte-identical copy of `bin/plan_check.py`, pinned by a CI test) let a worker check its own plan with `cw-plan-check --file PLAN --done-when TEXT`: a pure local read, same output and exit codes (0 pass, 1 fail, 2 unreadable) as `plan check --file`; if the plan has an `## Intent` section with its own `Done when:` line, the pod compares it with `--done-when` exactly as the local check does. Slice B (a retire of a worker whose pod is already gone) is described in `docs/cloud-worker-interface.md`; the image must be rebuilt and published by an operator before pods have the command. It runs as user `worker` (uid 1000). `worker` may run one command as root (`start-dockerd`) through sudo;
 the entrypoint uses it to start the nested `dockerd` and then execs the command. Default command:
 `opencode serve --hostname 0.0.0.0 --port 4096`. Set `WORKER_DOCKER=0` to skip the Docker daemon. No credential is
 built in: `OPENCODE_SERVER_PASSWORD`, `GH_TOKEN` and any cloud identity are supplied by the launcher at run time.
+
+### The toolchain the image carries
+
+Ubuntu 24.04, Python 3 with pip and venv, git, Docker Engine with compose and buildx, `jq`, `opencode` v2, and Node 22 with npm and npx
+(`/opt/node`, root-owned, linked into `/usr/local/bin`). The recorded case: a lane's first database-lane test in a stack pod needed Node and
+npm, the image had neither, and the coder downloaded a Node tarball into its home directory at every launch. Node is now built in:
+the Dockerfile downloads the release for the image's architecture and checks it against the published `SHASUMS256.txt` with `sha256sum -c`
+BEFORE it unpacks; a mismatch fails the build. A repository's own prettier and eslint are its dev dependencies and run through `npx`; the image
+does not install them.
+
+To bump Node: edit `NODE_VERSION` (a full 22.x.y release; the only place the version is written, the checksum address is derived from it) at the
+top of the Node block in `cloud/worker/Dockerfile`, keep it equal to the product repository's `.node-version`, then rebuild and publish the image
+(an operator step) and record the previous digest as the rollback.
 
 ## Per-run secrets in the image
 
