@@ -439,3 +439,101 @@ def check_merge(reading, gh, conf, state, repo, number, caller, person, waived_h
         who = "nobody holds" if lock is None or stale else "%s holds" % lock.get("holder")
         return False, "merge of %s#%d refused: %s the merge lock on %s; %s" % (repo, number, who, facts["branch"], why), None
     return True, "%s %s" % (GATE_PASSED, caller), facts["head"]
+
+
+# ------------------------------------------------------------------------------------------------ pass and merge in one process (#1122)
+
+MERGE_FLAGS = ("--squash",)   # the one merge method the shim's gated path allows here; never --admin, never an over-review flag
+
+
+def review_blockers(reviews, head="", decision=""):
+    """The SAME rule as `review_blockers` in shims/gh (a test holds the two equal): the reviewers whose latest decisive review (APPROVED, CHANGES_REQUESTED,
+    DISMISSED) is CHANGES_REQUESTED and still blocks this head (at the head, or its commit or the head unknown, or GitHub's decision says so)."""
+    latest = {}
+    for review in reviews if isinstance(reviews, list) else []:
+        if not isinstance(review, dict):
+            continue
+        author = ((review.get("author") or {}).get("login")) if isinstance(review.get("author"), dict) else None
+        state = str(review.get("state") or "").upper()
+        if author and state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            commit = review.get("commit") if isinstance(review.get("commit"), dict) else {}
+            latest[author] = (state, commit.get("oid") if isinstance(commit.get("oid"), str) else "")
+    blocked = str(decision or "").upper() == "CHANGES_REQUESTED"
+    return sorted(who for who, (state, oid) in latest.items()
+                  if state == "CHANGES_REQUESTED" and (blocked or not oid or not head or oid.lower() == head.lower()))
+
+
+def pass_and_merge(reading, gh, conf, state, repo, number, holder, pid, clock, sleep, allow_held=False, alive=pid_alive, wait_seconds=None):
+    """`merge-gate --pass --merge`: the pass, then, in this same process, a fresh read of the head, the labels and the gates, then `gh pr merge --squash
+    --match-head-commit <head>`. The merge goes through `gh` WITHOUT the own-call marker (`own=False`), so the shim's checks run (a blocking review or a missing pass refuses it); before it, this function reads the reviews itself and refuses a blocking one by name.
+    Any mismatch merges nothing and releases the lock. Returns (exit code, lines, audit); `audit` is the ONE record of the run: the pass, each re-read and the outcome."""
+    ref = "%s#%d" % (repo, number)
+    audit = {"pr": ref, "head": None, "pass": None, "reread": {}, "outcome": None}
+    lines = []
+
+    def done(code, text, outcome):
+        audit["outcome"] = outcome
+        return code, lines + [text], audit
+
+    before = read_facts(reading, gh, repo, number, conf)
+    audit["head"] = before["head"]
+    if before["problems"]:
+        return done(1, "merge-gate --pass --merge refused: unreadable: %s" % before["problems"][0], "refused: unreadable")
+    if is_held(before["labels"]):
+        return done(1, "merge-gate --pass --merge refused: %s is held for the owner: keep the two-step form (`--pass`, then `gh pr merge`)" % ref, "refused: held")
+    ok, pass_lines = gate_pass(reading, gh, conf, state, repo, number, holder, pid, clock, sleep, allow_held=allow_held, alive=alive, wait_seconds=wait_seconds)
+    lines += pass_lines
+    audit["pass"] = "ok" if ok else (pass_lines[-1][:200] if pass_lines else "blocked")
+    if not ok:
+        return done(1, "merge-gate --pass --merge: nothing merged (the gate did not pass)", "refused: gate did not pass")
+    locked = before["gated"]
+    recorded = read_pass(state, repo, number) if locked else None
+    pass_head = recorded["head"] if recorded else before["head"]
+    pass_tip = recorded["tip"] if recorded else before["tip"]
+    now = read_facts(reading, gh, repo, number, conf)
+    head = now["head"]
+    audit["head"] = head or before["head"]
+    problem = None
+    if now["problems"]:
+        problem = ("unreadable", "unreadable: %s" % now["problems"][0])
+        audit["reread"] = {"head": "unreadable", "labels": "unreadable", "gates": "unreadable", "branch": "unreadable"}
+    else:
+        added = sorted(set(now["labels"]) - set(before["labels"]))
+        allowed, reason, _ = decide(now)
+        checks = (("head", head == pass_head and head == before["head"], "the head moved after the pass (passed at %s, now %s)" % (pass_head[:8], head[:8])),
+                  ("labels", not added and not is_held(now["labels"]), "a label appeared after the pass: %s" % ", ".join(added or now["labels"])),
+                  ("gates", allowed, "a gate is no longer ready: %s" % reason),
+                  ("branch", now["tip"] == pass_tip, "the branch %s moved after the pass (passed on %s, now %s)" % (now["branch"], pass_tip[:8], now["tip"][:8])))
+        for name, good, said in checks:
+            audit["reread"][name] = "ok" if good else said
+            if not good and problem is None:
+                problem = (name, said)
+    if problem:
+        if locked:
+            release(state, repo, before["branch"], holder)
+        return done(1, "merge-gate --pass --merge: nothing merged, the lock is released: %s" % problem[1], "refused: %s" % problem[0])
+    rcode, rout, _ = gh(["pr", "view", str(number), "-R", repo, "--json", "reviews,headRefOid,reviewDecision"])
+    try:
+        rdata = json.loads(rout) if rcode == 0 else None
+    except ValueError:
+        rdata = None
+    if not isinstance(rdata, dict):
+        audit["reread"]["reviews"] = "unreadable"
+        if locked:
+            release(state, repo, before["branch"], holder)
+        return done(1, "merge-gate --pass --merge: nothing merged, the lock is released: the reviews could not be read", "refused: reviews unreadable")
+    blockers = review_blockers(rdata.get("reviews"), head, rdata.get("reviewDecision"))
+    audit["reread"]["reviews"] = "ok" if not blockers else "blocking: %s" % ", ".join(blockers)
+    if blockers:
+        if locked:
+            release(state, repo, before["branch"], holder)
+        return done(10, "merge-gate --pass --merge: nothing merged, the lock is released: %s requested changes (CHANGES_REQUESTED) at the head %s" % (", ".join(blockers), head[:8]),
+                    "refused: blocking review")
+    code, out, err = gh(["pr", "merge", str(number), "-R", repo] + list(MERGE_FLAGS) + ["--match-head-commit", head], own=False)
+    if locked:
+        release(state, repo, before["branch"], holder)   # the shim frees it too; both are harmless
+    if code != 0:
+        said = (err or out or "").strip().splitlines()
+        return done(10 if code == 10 else 1, "merge-gate --pass --merge: the merge was refused or failed (exit %d), the lock is released: %s" % (code, (said[0] if said else "no message")[:300]),
+                    "refused: merge exit %d" % code)
+    return done(0, "merged %s at head %s (squash, --match-head-commit)" % (ref, head[:8]), "merged")
