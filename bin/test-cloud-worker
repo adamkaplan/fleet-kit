@@ -112,9 +112,9 @@ if command == "create":
     if unknown:
         sys.stderr.write("error: unrecognized arguments: " + " ".join(unknown) + "\\n")
         sys.exit(2)
-    shape = argv[argv.index("--shape") + 1] if "--shape" in argv else "S"
-    if shape not in ("S", "M"):
-        sys.stderr.write("error: shape must be S or M\\n")
+    shape = argv[argv.index("--shape") + 1] if "--shape" in argv else "XS"
+    if shape not in ("XS", "S", "M"):
+        sys.stderr.write("error: shape must be XS, S or M\\n")
         sys.exit(2)
 if command == "create":
     for item in argv:
