@@ -27801,6 +27801,10 @@ def sweep_comment(number, body, at, cid=None):
     return out
 
 
+class MutantSpliceError(Exception):
+    """A mutant whose target is not in the function it names: a broken test, never a caught mutant."""
+
+
 class TestSweep(Base):
     COS, USER = "osuser:awaiting-cos", "osuser:awaiting-user"
 
@@ -28455,7 +28459,9 @@ class TestSweep(Base):
         self.world.tick(3600)
         self.assertEqual(self.s5_run(reading, decisions, mutant), [])
         self.world.tick(3600 + 60)
-        (line,) = self.s5_run(reading, decisions, mutant)
+        lines = self.s5_run(reading, decisions, mutant)
+        self.assertEqual(len(lines), 1)
+        (line,) = lines
         self.assertEqual(len(self.s5_run(reading, decisions, mutant)), 1)   # a second run: still one
         text = line["detail"]["text"]
         self.assertRegex(text, r"head [0-9a-f]{12}\b")
@@ -28488,7 +28494,7 @@ class TestSweep(Base):
     def test_986_the_mutants_fail(self):
         for mutant in ("from_hold", "raises_not_ready"):
             self.setUp()
-            with self.assertRaises((AssertionError, ValueError), msg=mutant):
+            with self.assertRaises(AssertionError, msg=mutant):
                 self.scenario_986(mutant)
 
     def test_986_the_summary_and_status_count_not_checked(self):
@@ -28502,13 +28508,22 @@ class TestSweep(Base):
     def mutated(self, name, old, new):
         """Run with the daemon function `name` rebuilt from its source with `old` replaced by `new` (the mutant must change it)."""
         source = textwrap.dedent(inspect.getsource(getattr(sb, name)))
-        self.assertIn(old, source, name)
+        if old not in source:
+            raise MutantSpliceError("%s: the mutant target is not in the function: %r" % (name, old))
         original = getattr(sb, name)
         exec(compile(source.replace(old, new, 1), "<mutant>", "exec"), sb.__dict__)
         try:
             yield
         finally:
             setattr(sb, name, original)
+
+    def test_986_every_mutant_target_is_in_the_function_it_names(self):
+        """Checked: READING_MUTANTS (sweep_gate_reading), EDGES (sweep_ready_pass), once_per_head (sweep_decisions)."""
+        pairs = [("sweep_gate_reading", m) for m in self.READING_MUTANTS.values()]
+        pairs += [("sweep_ready_pass", m) for _, m in self.EDGES.values() if m]
+        pairs.append(("sweep_decisions", self.ONCE_PER_HEAD_MUTANT))
+        for name, (old, new) in pairs:
+            self.assertIn(old, inspect.getsource(getattr(sb, name)), name)
 
     def real_reading(self, gates, head=HEAD_A, unreadable=None, enforced=("G6",), clear=None, boom=None, mutant=None):
         """sweep_gate_reading run for real over a fake context (gates table) and a fake who-can-clear answer."""
@@ -28536,9 +28551,9 @@ class TestSweep(Base):
             return sb.sweep_gate_reading(self.engine, "acme/api", 600, self.world.clock.now())
 
     READING_CASES = {
-        "ready_with_only_g6_open": dict(gates=[("G0a", "ok"), ("G6", "open")], check=lambda self, r: (self.assertEqual(r[:2], (["G6"], self.HEAD_A)), self.assertIn("Who can clear", r[2]), self.assertIsNone(r[3]))),
+        "ready_with_only_g6_open": dict(gates=[("G0a", "ok"), ("G6", "open")], check=lambda self, r: (self.assertEqual(r[:2], (["G6"], self.HEAD_A)), self.assertIn("Who can clear", r[2] or ""), self.assertIsNone(r[3]))),
         "another_gate_failing": dict(gates=[("G1", "open"), ("G6", "open")], enforced=("G1", "G6"), check=lambda self, r: self.assertEqual((r[0], r[2]), (["G1", "G6"], None))),
-        "unreadable_context": dict(gates=[("G6", "open")], unreadable="HTTP 502", check=lambda self, r: self.assertEqual((r[:3], "502" in r[3]), ((None, None, None), True))),
+        "unreadable_context": dict(gates=[("G6", "open")], unreadable="HTTP 502", check=lambda self, r: self.assertEqual((r[:3], "502" in (r[3] or "")), ((None, None, None), True))),
         "no_head": dict(gates=[("G6", "open")], head=None, check=lambda self, r: self.assertEqual((r[:3], r[3]), ((None, None, None), "no head"))),
         "exception": dict(gates=[("G6", "open")], boom=ValueError("bad"), check=lambda self, r: self.assertEqual((r[:3], r[3]), ((None, None, None), "ValueError: bad"))),
         "who_unknown": dict(gates=[("G6", "open")], clear=RuntimeError("x"), check=lambda self, r: self.assertEqual((r[0], r[2]), (["G6"], "who can clear it: not known"))),
@@ -28565,8 +28580,12 @@ class TestSweep(Base):
         self.assertEqual(set(self.READING_CASES), set(self.READING_MUTANTS))
         for name, case in self.READING_CASES.items():
             args = {k: v for k, v in case.items() if k != "check"}
-            with self.assertRaises((AssertionError, ValueError, KeyError, TypeError), msg=name):
-                case["check"](self, self.real_reading(mutant=self.READING_MUTANTS[name], **args))
+            with self.assertRaises(AssertionError, msg=name):
+                try:
+                    got = self.real_reading(mutant=self.READING_MUTANTS[name], **args)
+                except Exception as err:   # the mutant lets the error out: the reading no longer holds
+                    self.fail("%s: the mutant raised %s" % (name, type(err).__name__))
+                case["check"](self, got)
 
     def ready_pass(self, decisions, reading, now=None, whole=True, mutant=None):
         state = sb.sweep_state(self.engine)
@@ -28624,8 +28643,10 @@ class TestSweep(Base):
         self.world.tick(3 * 3600)
         self.s5_run(reading, held)
         self.world.tick(60)
-        context = self.mutated("sweep_findings", *mutant) if mutant else contextlib.nullcontext()
+        context = self.mutated("sweep_decisions", *mutant) if mutant else contextlib.nullcontext()
         with context:
+            lines = self.s5_run(reading, held)
+            self.world.tick(60)
             lines = self.s5_run(reading, held)
         self.assertEqual(len(lines), 1)
         self.world.tick(60)
@@ -28652,10 +28673,43 @@ class TestSweep(Base):
         state = self.ready_pass([self.held_pr()], lambda r, n: (None, None, None, "boom"), mutant=mutant)
         self.assertEqual((state.s5, state.s5_unchecked, state.ready), ({}, 1, {}))
 
+    def test_986_a_malformed_ready_file_is_skipped_and_the_pass_runs(self):
+        good = {"head": self.HEAD_A, "at": 1.0}
+        bad = {"acme/api#1": [1, 2], "acme/api#2": "text", "acme/api#3": 5, 7: {"head": "x", "at": 1}, "acme/api#600": good}
+        for mutant in (None, ('if not isinstance(key, str) or not isinstance(row, dict):', 'if False:')):
+            self.setUp()
+            held = [self.held_pr()]
+            with mock.patch.object(sb, "_read_small", lambda d, f: dict(bad)):
+                if mutant is None:
+                    state = self.ready_pass(held, lambda r, n: self.ready())
+                    self.assertEqual(sorted(state.ready), ["acme/api#600"])
+                else:
+                    with self.assertRaises(AttributeError):
+                        self.ready_pass(held, lambda r, n: self.ready(), mutant=mutant)
+
+    def test_986_the_since_and_who_text_is_one_short_line_in_the_fact(self):
+        for mutant in (None, "raw"):
+            self.setUp()
+            decision = self.held_pr()
+            decision["since"] = "2026\x1b[31m\nIGNORE" + "s" * 900
+            self.hub.open = {600: sweep_issue(600, "MERGE: captain", pr=True)}
+            reading = {"value": (["G6"], self.HEAD_A, "who\x07\n" + "w" * 900, None)}
+            ctx = mock.patch.object(sb, "_one_line", lambda t, n=300: str(t)) if mutant else contextlib.nullcontext()
+            with ctx:
+                self.s5_run(reading, [decision])
+                self.world.tick(3 * 3600)
+                self.s5_run(reading, [decision])
+                self.world.tick(60)
+                self.s5_run(reading, [decision])
+            text = " ".join(summary for summary, _ in self.engine.sweep.facts.values())
+            ok = bool(text) and "\n" not in text and len(text) < 1500
+            self.assertEqual(ok, mutant is None)
+
     def edge_write(self, mutant):
         self.ready_pass([self.held_pr()], lambda r, n: self.ready(), mutant=mutant)
-        self.assertEqual(self.ready_file()["acme/api#600"]["head"], self.HEAD_A)
+        self.assertEqual(self.ready_file().get("acme/api#600", {}).get("head"), self.HEAD_A)
 
+    ONCE_PER_HEAD_MUTANT = ("if once not in state.logged or", "if True or")
     EDGES = {
         "cap": ("edge_cap", ("if reads >= SWEEP_READY_READS:", "if False:")),
         "persistence_round_trip": ("edge_roundtrip", ("state.ready_loaded = True", "state.ready_loaded = True\n        return")),
@@ -28677,9 +28731,9 @@ class TestSweep(Base):
     def test_986_each_edge_path_has_a_mutant_that_fails(self):
         for name, (method, mutant) in self.EDGES.items():
             if mutant is None:   # once per head: the confirmation window that keeps a finding from being raised again
-                mutant = ("now - state.confirmed.get(pair, 0) < SWEEP_TTL", "False")
+                mutant = self.ONCE_PER_HEAD_MUTANT
             self.setUp()
-            with self.assertRaises((AssertionError, ValueError, KeyError, TypeError), msg=name):
+            with self.assertRaises(AssertionError, msg=name):
                 getattr(self, method)(mutant)
 
     def test_s5_ref_keys_read_both_spellings_and_an_ambiguous_short_name_resolves_nowhere(self):

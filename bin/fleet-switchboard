@@ -13918,6 +13918,8 @@ def sweep_ready_pass(engine, state, decisions, home, now, cfg, decisions_whole=T
     if engine.state_dir is not None and not state.ready_loaded:
         state.ready_loaded = True
         for key, row in list(_read_small(engine.state_dir, SWEEP_READY_FILE).items())[:2000]:
+            if not isinstance(key, str) or not isinstance(row, dict):   # a corrupt file: skip the row, never fail the pass
+                continue
             if isinstance(row.get("head"), str) and isinstance(row.get("at"), (int, float)) and not isinstance(row.get("at"), bool):
                 state.ready.setdefault(key, {"head": row["head"], "at": row["at"]})
     repos_known = list(state.repos) + ([home] if home else [])
@@ -14040,7 +14042,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
             if decisions_whole and ready and not (sweep_ref_keys(d, home, repos_known) & human_keys):
                 pair = ("S5", "%s@%s" % (d.get("id"), ready[0][:12]))
                 found.add(pair)
-                state.details[pair] = "head %s, ready at %s, held since %s; %s" % (ready[0][:12], iso(ready[1]), d.get("since") or "?", ready[2])
+                state.details[pair] = _one_line("head %s, ready at %s, held since %s; %s" % (ready[0][:12], iso(ready[1]), _one_line(d.get("since") or "?", 80), _one_line(ready[2], 200)), 400)
             continue
         if (decisions_whole and d.get("tier") == "cos" and d.get("kind") != "notice" and since is not None
                 and now - since >= cfg["aged_cos_hours"] * 3600
