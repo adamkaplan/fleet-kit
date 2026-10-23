@@ -15801,9 +15801,20 @@ class CharterRig:
         self.registry = sb.load_module("registry")
         self.parents = {3: 1, 4: 1, 5: 4, 9: 1, 1: None}
         self.engine.intents = types.SimpleNamespace(parent=lambda number, repo=None: self.parents.get(number), repo=self.REPO, header=lambda *a, **k: None)
-        patcher = mock.patch.object(sb.IntentReader, "parent", lambda reader, number, repo=None: self.parents[number])   # #1143: the command's guard reads the same parents
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # #1218: the command's guard reads REAL shapes: a charter has NO parent and carries the orchestrator label; an ask has the charter as parent
+        self.cmd_parents = {1: None, 3: None, 4: None, 9: None, 5: 4, 6: 3, 7: None}   # 5 and 6 are asks; 7 is a root issue with no label
+        self.cmd_labels = {1: True, 3: True, 4: True, 9: True, 5: False, 6: False, 7: False}
+        self.cmd_reads = []
+        def cmd_parent(reader, number, repo=None):
+            self.cmd_reads.append(("parent", number))
+            return self.cmd_parents[number]
+        def cmd_issue(reader, number, repo=None):
+            self.cmd_reads.append(("issue", number))
+            return types.SimpleNamespace(number=number, labels=[sb.orchestrator_label()] if self.cmd_labels[number] else ["other"])
+        for name, fake in (("parent", cmd_parent), ("issue", cmd_issue)):
+            patcher = mock.patch.object(sb.IntentReader, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
 
     def orchestrator(self, name, charter=None, issue=None, registry=True):
@@ -16193,9 +16204,9 @@ class TestCharterSetGuard(CharterRig, Base):
         code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
         self.assertIn("already held by orch-a", err)
         code, out, err = self.run_as("cos", "charter", "set", "orch-b", "5")
-        self.assertIn("not a sub-issue", err)
-        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "1")
-        self.assertIn("not a sub-issue", err)
+        self.assertIn("is an ask, not a charter", err)
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "7")
+        self.assertIn("is not a charter", err)
         self.assertIsNone(self.row("orch-b")["charter"])
         self.assertEqual([e["event"] for e in self.audit_lines()], ["charter.refused"] * 3)
 
@@ -16242,6 +16253,50 @@ class TestCharterSetGuard(CharterRig, Base):
         self.assertIn("cannot read #3's parent", err)
         self.assertEqual((Path(self.world.state) / "registry.json").read_text(), before)
         self.assertEqual([e["detail"]["why"] for e in self.audit_lines()], ["unverified"])
+
+    def test_a_charter_with_no_parent_and_the_label_is_accepted_and_a_closed_one_too(self):
+        for number in (3, 8):
+            self.cmd_parents[8] = None
+            self.cmd_labels[8] = True   # (8: a closed charter; the shape is all that is read)
+            self.orchestrator("orch-%d" % number, registry=None)
+            code, out, err = self.run_as("cos", "charter", "set", "orch-%d" % number, str(number))
+            self.assertEqual(code, 0, err)
+            self.assertEqual(self.row("orch-%d" % number)["charter"], number)
+
+    def test_an_ask_and_an_unlabelled_root_issue_are_refused_and_nothing_changes(self):
+        self.orchestrator("orch-b", registry=None)
+        before = (Path(self.world.state) / "registry.json").read_text()
+        for number, text in ((6, "is an ask, not a charter"), (7, "not a charter")):
+            code, out, err = self.run_as("cos", "charter", "set", "orch-b", str(number))
+            self.assertEqual(code, 2, err)
+            self.assertIn(text, err)
+        self.assertEqual((Path(self.world.state) / "registry.json").read_text(), before)
+
+    def test_an_unreadable_label_is_refused_unverified(self):
+        self.orchestrator("orch-b", registry=None)
+        def boom(reader, number, repo=None):
+            raise RuntimeError("HTTP 502")
+        with mock.patch.object(sb.IntentReader, "issue", boom):
+            code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertEqual(code, 2, err)
+        self.assertIn("unverified", [e["detail"]["why"] for e in self.audit_lines()][0])
+
+    def test_a_set_reads_at_most_one_more_than_before_and_writes_nothing(self):
+        self.orchestrator("orch-b", registry=None)
+        self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertEqual(self.cmd_reads, [("parent", 3), ("issue", 3)])
+
+    def test_mutant_an_ask_is_accepted(self):
+        self.orchestrator("orch-b", registry=None)
+        with self.without("is an ask"):
+            self.run_as("cos", "charter", "set", "orch-b", "6")
+        self.assertEqual(self.row("orch-b")["charter"], 6)   # the write the real guard refuses: the ask test fails for this mutant
+
+    def test_mutant_an_unlabelled_issue_is_accepted(self):
+        self.orchestrator("orch-b", registry=None)
+        with self.without("not a charter"):
+            self.run_as("cos", "charter", "set", "orch-b", "7")
+        self.assertEqual(self.row("orch-b")["charter"], 7)   # the unlabelled test fails for this mutant
 
     def test_mutant_an_unreadable_parent_passes(self):
         self.orchestrator("orch-b", registry=None)
@@ -16437,7 +16492,7 @@ class TestCharterSetRaceAndSanitising(CharterRig, Base):
     def test_the_parents_are_read_before_the_lock_and_never_inside_it(self):
         self.orchestrator("orch-b", registry=None)
         seen = []
-        real_parent = lambda reader, number, repo=None: (seen.append(("parent", number)), self.parents[number])[1]
+        real_parent = lambda reader, number, repo=None: (seen.append(("parent", number)), self.cmd_parents[number])[1]
         real = self.registry.set_charter
 
         def spy(state_dir, name, charter, by, now=None, check=None):
@@ -16448,7 +16503,7 @@ class TestCharterSetRaceAndSanitising(CharterRig, Base):
         with mock.patch.object(sb.IntentReader, "parent", real_parent), mock.patch.object(self.registry, "set_charter", spy):
             code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
         self.assertEqual(code, 0, err)
-        self.assertEqual(seen, [("parent", 3), ("parent", 1), ("lock",)])   # the GitHub reads, then the registry's critical section; none inside it
+        self.assertEqual(seen, [("parent", 3), ("lock",)])   # (the label read is the rig's issue fake, not recorded here)   # the GitHub reads, then the registry's critical section; none inside it
 
     def test_hostile_values_are_refused_and_escaped_in_every_sink(self):
         self.orchestrator("orch-b", registry=None)
@@ -16479,8 +16534,7 @@ class TestCharterSetRaceAndSanitising(CharterRig, Base):
     def test_the_stdout_row_escapes_a_hostile_repo(self):
         self.orchestrator("orch-b", registry=None)
         self.registry.upsert(self.world.state, "orch-b", {"session": "s-x", "pane": self.world.panes["orch-b"], "role": "orchestrator", "charter": None, "repo": "acme\n<b>x</b>"})
-        with mock.patch.object(sb.IntentReader, "parent", lambda reader, number, repo=None: self.parents[number]):
-            code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
         self.assertEqual(code, 0, err)
         self.assertNotIn("<", out)
         self.assertEqual(out.count("\n"), 2, out)

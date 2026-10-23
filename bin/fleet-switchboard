@@ -28690,9 +28690,11 @@ def cmd_charter(args, runner, now):
     if value is not None and isinstance(row0, dict):   # #1143: the GitHub reads happen BEFORE the registry lock, bound to the issue number and the repo; the lock only re-checks registry facts
         repo0 = row0.get("repo") or (engine.config.get("intent_repo") if engine.config else None)
         try:
-            parent = engine.intents.parent(value, repo0)
-            root = engine.intents.parent(parent, repo0) if parent is not None else None
-            pre = {"key": (value, repo0), "parent": parent, "root": root}
+            parent = engine.intents.parent(value, repo0)   # None only for the "no parent" answer; any other failure raises
+            labelled = None
+            if parent is None:   # a charter has no parent: the one extra read is its label
+                labelled = orchestrator_label(engine.config) in (engine.intents.issue(value, repo0).labels or [])
+            pre = {"key": (value, repo0), "parent": parent, "labelled": labelled}
         except Exception as err:
             pre = {"key": (value, repo0), "error": safe(_one_line(str(err), 80))}
 
@@ -28711,8 +28713,10 @@ def cmd_charter(args, runner, now):
                 return ("unverified", "cannot read #%d's parent (the repository changed)" % value)
             if "error" in pre:
                 return ("unverified", "cannot read #%d's parent (%s)" % (value, pre["error"]))
-            if pre["parent"] is None or pre["root"] is not None:
-                return ("not a sub-issue", "#%d is not a sub-issue of the repository's root issue" % value)
+            if pre["parent"] is not None:
+                return ("is an ask", "#%d is an ask, not a charter (it has a parent, #%s)" % (value, pre["parent"]))
+            if not pre["labelled"]:
+                return ("not a charter", "#%d is not a charter (no parent, but it lacks the %s label)" % (value, orchestrator_label(engine.config)))
         return None
     got = registry.set_charter(engine.state_dir, args.name, value, caller_name, now=now(), check=guard)
     old = decided.get("old")
