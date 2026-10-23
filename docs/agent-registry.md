@@ -29,6 +29,7 @@ rebuilt from another record.
 | `bin/reassign.py:237` | `boss-resolution` | `reassign` resolves the current boss for consent | nobody | `reassign` | derived |
 | `bin/fleet-switchboard:2385` | `discovery.agents` | the agents of the newest `discover()`: name, session, pane, role, charter, repo, workspace, cwd, reports_to | `Engine.discover` (each pass and on demand) | the whole daemon: fact routing, status, pane pass, decisions, chiefs lookup, badges, toasts | primary (the live list), derived from herdr and the v2 service |
 | `bin/cloud_worker.py:976` | `discovery.agents` | looks up a local agent by name before routing | nobody | `route` | derived (reader) |
+| `bin/switchboard/judge.py:53` | `discovery.agents` | the judge's own sessions: the session ids of the discovered agents | nobody | the policy judge's socket | derived (reader) |
 | `bin/impact_hold.py:401` | `discovery.agents` | looks up the orchestrator of a block | nobody | impact hold | derived (reader) |
 | `bin/lanes.py:55` | `discovery.agents` | looks up lanes by agent | nobody | lane resolution | derived (reader) |
 | `bin/queue_ejections.py:365` | `discovery.agents` | routes an ejection to an owner | nobody | `route_of` | derived (reader) |
@@ -42,6 +43,7 @@ rebuilt from another record.
 | `plugins/fleet-decisions-tui/health.mjs:13` | `load.json` | reads the load figures | nobody (reader only) | sidebar health view | derived (reader) |
 | `bin/fleet-switchboard:4239` | `decisions.json` | open decisions, notices, held PRs, each naming agents (boss and worker) | the daemon (`DecisionStore`, atomic, when the list changed) | `decisions` command, sidebar, `fleet_health`, `status` | derived |
 | `bin/decision_core.py:1032` | `decisions.json` | comment only: names the file as the local store | nobody | nobody | derived |
+| `bin/switchboard/judge_request.py:433` | `decisions.json` | reads the open decisions to give the judge the ask's context | nobody (reader only) | the policy judge's request | derived (reader) |
 | `bin/fleet_health.py:298` | `decisions.json` | reads the held PR and waiting decisions per orchestrator | nobody (reader only) | load figures | derived (reader) |
 | `plugins/fleet-decisions-tui/decisions.mjs:9` | `decisions.json` | reads the list for the sidebar | nobody (reader only) | Decisions section | derived (reader) |
 | `bin/decisions_pull.py:28` | `decisions.json` | reads the cloud daemon's list from a configured source command and rewrites the local file (cleaned, atomic, mode 0600); ages its mtime when the source is down | the Mac-side pull (`write_atomic`, `mark_stale`) | the Decisions plugin (`decisions.mjs`) | derived |
