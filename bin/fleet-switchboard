@@ -23584,8 +23584,12 @@ def _chat_clear_pass(engine, decisions, now):
         if not offers:
             engine.audit.append(engine.actor, "chat_clear.dropped", "chat_clear", {"message_id": message["id"], "why": "the offers went away before the message was judged"})
             return
-        verdict = cc.decide(engine.jev, message["text"], offers, message["created"], now, bar)
         live_now, shadow_why = chat_clear_live_now(engine)   # AGAIN, right before acting: a kill file or a broken config that appears during this pass stops the very next message
+        if cc.is_confirmation_like(message["text"]):   # #1194 step 2: deterministic, no judge is asked
+            _chat_clear_confirm(engine, cc, dict(cfg, live=live_now, shadow=shadow_why), message, offers, now)
+            continue
+        verdict = cc.decide(engine.jev, message["text"], offers, message["created"], now, bar)
+        live_now, shadow_why = chat_clear_live_now(engine)
         _chat_clear_act(engine, cc, dict(cfg, live=live_now, shadow=shadow_why), message, verdict, offers, current_heads, now)
 
 
@@ -23599,14 +23603,15 @@ def _chat_clear_act(engine, cc, cfg, message, verdict, offers, current_heads, no
         verdict = dict(verdict, question=cc.question_text("head_changed", offers, [pr], current_heads), shown=[pr])
     detail = {"message_id": message["id"], "quote": quoted, "action": action, "why": why, "pr": pr, "live": live, "would_clear": action == "clear",
               "probabilities": judge.get("probabilities"), "jev_choice": judge.get("jev_choice"), "model": judge.get("model"), "reason": judge.get("reason"),
-              "screen": (verdict.get("screen") or {}).get("why"), "shadow": None if live else cfg.get("shadow")}
+              "screen": (verdict.get("screen") or {}).get("why"), "shadow": None if live else cfg.get("shadow"),
+              "kind": "reply" if action == "clear" else None}   # #1194: in shadow, `reply` is the understanding reply it would send
     engine.audit.append(engine.actor, "chat_clear.verdict", pr or "chat_clear", detail)
     if action == "none" or not live:
         return   # shadow: the verdict is logged and nothing else happens
-    if action == "clear":
+    if action == "clear":   # #1194 step 1: the understanding reply and a pending record; NOTHING is cleared by this message
         try:
-            chat_clear_apply(engine, cc, pr, offers[pr], quoted, message["id"], now)
-        except Exception as err:   # the clear failed or was refused at the point of effect: one question, nothing more
+            chat_clear_understand(engine, cc, pr, offers[pr], quoted, message, now)
+        except Exception as err:
             engine.audit.append(engine.actor, "chat_clear.failed", pr, {"message_id": message["id"], "error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
             verdict = dict(verdict, question=cc.question_text("failed" if not isinstance(err, NoticeError) else "not_held", offers, [pr], current_heads), shown=[pr])
             action = "ask"
@@ -23625,7 +23630,7 @@ def _chat_clear_act(engine, cc, cfg, message, verdict, offers, current_heads, no
                 cc.show(engine.state_dir, shown, head, now)
 
 
-def chat_clear_apply(engine, cc, pr, offer, quoted, message_id, now):
+def chat_clear_apply(engine, cc, pr, offer, quoted, message_id, now, first_words=None, offer_id=None, machinery=False):
     """THE clear. Called only by the daemon's hook, in LIVE mode, for a message that is the owner's own, names exactly this one PR, was confirmed by Jev at the high bar and is newer
     than the offer. At the point of effect it READS THE PR AGAIN: it must be open, at exactly the head the owner was shown, with only owner-tier hold labels and the captain marker
     (any other hold label refuses). It then removes those labels (never any other, never adds one) through the same head-bound core `impact clear` uses, comments with his words,
@@ -23643,10 +23648,14 @@ def chat_clear_apply(engine, cc, pr, offer, quoted, message_id, now):
         if raw.get("headRefOid") != offer["head"] or not cc.is_offerable(names, labels):
             raise NoticeError("%s changed since the owner was shown it: its head or its labels are not what he saw" % pr)
         seen["remove"] = cc.owner_tier_labels(names, labels)
+        if machinery and explainer_defects(raw.get("body") or ""):   # #1194: a clear-machinery path is cleared only with the explainer block present
+            raise NoticeError("%s changes the clear machinery and its description has no single explainer block" % pr)
 
     raw = read_pr_json(engine, repo, number)
     verify(raw)   # a cheap refusal before the core's own read; the core verifies again on the read it clears from
-    lines = impact_clear_core(engine, runner, repo, number, "owner (chat)", quoted, remove=seen["remove"], head=offer["head"], via="chat:%s" % message_id, verify=verify)
+    words = quoted if first_words is None else "%s | %s" % (first_words, quoted)   # his exact words of the message and of the confirmation
+    via = "chat:%s" % message_id + ("" if offer_id is None else " offer:%s" % offer_id)
+    lines = impact_clear_core(engine, runner, repo, number, "owner (chat)", words, remove=seen["remove"], head=offer["head"], via=via, verify=verify)
     remove = seen["remove"]
     short = offer["head"][:8]
     shown_words = quoted.replace("@", "@\u200b").replace("`", "'")   # a public comment: no @mention and no code span can come out of his words
@@ -23660,6 +23669,100 @@ def chat_clear_apply(engine, cc, pr, offer, quoted, message_id, now):
     except Exception as err:
         engine.audit.append(engine.actor, "chat_clear.reply_failed", pr, {"error": _one_line(str(err), 160)})
     return lines
+
+
+def chat_clear_machinery(engine, raw_files, repo_number=None):
+    """True when the PR changes a clear-machinery path (the matrix's `clear_code_paths`), or when that cannot be told (fail toward the stricter rule)."""
+    try:
+        listed, problem = impact_floor.clear_code_paths(impact_floor.load_matrix())
+        files = [f.get("path") for f in (raw_files.get("files") or [])]
+        if problem or listed is None or not all(isinstance(f, str) for f in files):
+            return True
+        return any(impact_floor.matches(f, listed) for f in files)
+    except Exception:
+        return True
+
+
+def _chat_clear_say(engine, cc, pr, text, quoted):
+    try:
+        engine.send("switchboard", "chief-of-staff", "[chat clear] %s\n(your words: \"%s\")" % (text, quoted))   # sent with fleet metadata: the reader never takes it for his words
+    except Exception as err:
+        engine.audit.append(engine.actor, "chat_clear.reply_failed", pr or "chat_clear", {"error": _one_line(str(err), 160)})
+
+
+def chat_clear_understand(engine, cc, pr, offer, quoted, message, now):
+    """Step 1 (live only): ONE reply naming the PR, the FULL head, the covered path class and the Questions; a pending record is kept. Clears nothing."""
+    repo, _, number = pr.rpartition("#")
+    raw = read_pr_json(engine, repo, int(number), "files")
+    if str(raw.get("state") or "").upper() != "OPEN" or raw.get("headRefOid") != offer["head"] or not cc.is_offerable(label_names(engine.config), raw.get("labels") or []):
+        raise NoticeError("%s changed since the owner was shown it" % pr)
+    machinery = chat_clear_machinery(engine, raw)
+    cc.write_pending(engine.state_dir, {"pr": pr, "head": offer["head"], "offer_id": cc.offer_id(pr, offer), "at": int(now), "words": quoted, "machinery": machinery})
+    engine.send("switchboard", "chief-of-staff", cc.reply_text(pr, offer["head"], machinery, cc.body_questions(raw.get("body")), quoted))
+    engine.audit.append(engine.actor, "chat_clear.reply", pr, {"message_id": message["id"], "head": offer["head"], "machinery": machinery})
+
+
+def _chat_clear_confirm(engine, cc, cfg, message, offers, now):
+    """Step 2: "yes <number>" bound to the pending reply's full head. Deterministic: no judge. Live off: only a shadow line (`would-record`), nothing pended, sent or written."""
+    quoted, live = cc.quote(message["text"]), cfg["live"]
+    number = cc.confirmation_number(message["text"])
+    pending = cc.read_pending(engine.state_dir) if live else None
+    detail = {"message_id": message["id"], "quote": quoted, "live": live, "step": "confirm", "pr": pending["pr"] if pending else None, "shadow": None if live else cfg.get("shadow")}
+    if not live:
+        hit = [pr for pr in offers if number and int(pr.rsplit("#", 1)[1]) == number]
+        engine.audit.append(engine.actor, "chat_clear.verdict", hit[0] if hit else "chat_clear", dict(detail, action="confirm", would_clear=bool(hit), kind="would-record" if hit else None, why=None if hit else "no_number"))
+        return
+    why, pr, drop = None, pending["pr"] if pending else None, False
+    short_new = None
+    if pending is None or message["created"] < pending["at"]:
+        why = "no_pending"
+    elif number is None or number == 0:
+        why = "confirm_no_number"
+    elif number != int(pr.rsplit("#", 1)[1]):
+        why = "confirm_other_number"
+    elif now - pending["at"] > cc.PENDING_TTL:
+        why, drop = "stale", True
+    elif pr not in offers or now - (offers[pr].get("shown_at") or 0) > cc.OFFER_TTL:
+        why, drop = "offer_old", True
+    raw = None
+    if why is None:
+        drop = True   # a pending reply is consumed once, whatever follows
+        cc.write_pending(engine.state_dir, None)
+        repo, _, num = pr.rpartition("#")
+        try:
+            raw = read_pr_json(engine, repo, int(num), "files")
+        except Exception as err:
+            why = "failed"
+            detail["error"] = _one_line(str(err), 160)
+        else:
+            if raw.get("headRefOid") != pending["head"]:
+                why, short_new = "head_changed", str(raw.get("headRefOid") or "")[:8]
+            elif str(raw.get("state") or "").upper() != "OPEN" or not cc.is_offerable(label_names(engine.config), raw.get("labels") or []):
+                why = "not_held"
+    if why is None:
+        machinery = chat_clear_machinery(engine, raw)
+        if machinery and explainer_defects(raw.get("body") or ""):
+            why = "no_explainer"
+        else:
+            try:
+                chat_clear_apply(engine, cc, pr, dict(offers[pr], head=pending["head"]), quoted, message["id"], now, first_words=pending["words"], offer_id=pending["offer_id"], machinery=machinery)
+            except Exception as err:
+                engine.audit.append(engine.actor, "chat_clear.failed", pr, {"message_id": message["id"], "error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+                why = "failed" if not isinstance(err, NoticeError) else "not_held"
+            else:
+                engine.audit.append(engine.actor, "chat_clear.verdict", pr, dict(detail, action="clear", why="confirmed", would_clear=True, kind="record"))
+                return
+    if drop and why is not None and pending is not None:
+        cc.write_pending(engine.state_dir, None)
+    text = cc.REASONS.get(why, why)
+    if why == "confirm_no_number":
+        text = text % (pr.rsplit("#", 1)[1] if pr else "NNN")
+    elif why == "head_changed":
+        text = "that pull request has a new head, %s, since I named %s: nothing was recorded, say its number again to see the new head" % (short_new, pending["head"][:8])
+    elif why == "no_pending":
+        text = cc.REASONS["no_pending"]
+    engine.audit.append(engine.actor, "chat_clear.verdict", pr or "chat_clear", dict(detail, action="refuse", why=why, would_clear=False, kind=None))
+    _chat_clear_say(engine, cc, pr, "Nothing was cleared: %s." % text, quoted)
 
 
 def clear_line_marker(head, line):
