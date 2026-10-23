@@ -83664,8 +83664,8 @@ class TestGhShimMergeGate(Base):
             state.mkdir(exist_ok=True)
             conf = module.settings({"merge_gate": {"repos": {}}})
             # the module's own review read is skipped here so the SHIM is the only reader (the module's read is proved in TestMergeGatePassAndMerge)
-            module.review_blockers = lambda *a, **k: []
-            got = module.pass_and_merge(reading, fk, conf, state, "acme/app", 12, "coder-a", 4242, fk.clock, fk.sleep, alive=lambda pid: True)
+            with mock.patch.object(module, "review_blockers", lambda *a, **k: []):   # restored on exit: the module is the shared, cached one
+                got = module.pass_and_merge(reading, fk, conf, state, "acme/app", 12, "coder-a", 4242, fk.clock, fk.sleep, alive=lambda pid: True)
             return got, ran.exists()
 
         (code, lines, audit), ran = run(False, gate)
