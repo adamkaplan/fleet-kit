@@ -109,6 +109,74 @@ class TestReport(unittest.TestCase):
             self.assertEqual(REAL.main(["14-10-2026", "x"], io.StringIO()), 2)
 
 
+class TestInputs(unittest.TestCase):
+    def refused(self, module, flag, value):
+        base = {"--node-price": "0.5", "--node-vcpu": "4", "--node-hours": "20", "--pod-rate": "0"}
+        base[flag] = value
+        extra = ["%s=%s" % kv for kv in base.items()]
+        err = io.StringIO()
+        old, sys.stderr = sys.stderr, err
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                code, text = run(module, write(tmp, "a.jsonl", STOPPED), extra=extra)
+        finally:
+            sys.stderr = old
+        return code, text, err.getvalue()
+
+    def test_nan_and_inf_are_refused_for_every_float_argument(self):
+        for flag in ("--node-price", "--node-vcpu", "--node-hours", "--pod-rate"):
+            for value in ("nan", "inf", "-inf"):
+                code, text, err = self.refused(REAL, flag, value)
+                self.assertEqual(code, 2, (flag, value))
+                self.assertEqual(text, "")
+                self.assertEqual(len(err.splitlines()), 1)
+
+    def test_a_pod_name_with_unicode_is_read(self):
+        lines = [line("2026-10-14T01:00:00Z", "pod/cb-\u00e9t\u00e9-1", "create", 0),
+                 line("2026-10-14T03:00:00Z", "pod/cb-\u00e9t\u00e9-1", "stop", 0.25, worker="w\u00fcrker")]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "u.jsonl"
+            path.write_text("".join(json.dumps(l, ensure_ascii=False) + "\n" for l in lines), encoding="utf-8")
+            code, text = run(REAL, str(path))
+        self.assertEqual(code, 0, text)
+        self.assertIn("pods: 1,", text)
+
+    def test_the_shape_table_matches_the_launcher_and_prices_exactly(self):
+        # launcher shapes: S 2 vCPU, M 4 vCPU. Node 8 vCPU at 0.8 USD/h, one pod for 2 h.
+        self.assertEqual(REAL.SHAPE_VCPU["S"], 2)
+        self.assertEqual(REAL.SHAPE_VCPU["M"], 4)
+        for shape, usd in (("S", "0.40"), ("M", "0.80")):
+            with tempfile.TemporaryDirectory() as tmp:
+                code, text = run(REAL, write(tmp, "a.jsonl", STOPPED),
+                                 extra=("--node-price", "0.8", "--node-vcpu", "8", "--node-hours", "0", "--shape", shape))
+            self.assertIn("(shape %s) %s" % (shape, usd), text)
+
+    def test_a_vcpu_share_of_one_eighth_is_exact(self):
+        # an 8 vCPU node share of 1/8 (1 vCPU) for 2 h at 0.8 USD/h = 0.20
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load(SOURCE.replace('SHAPE_VCPU = {', 'SHAPE_VCPU = {"XS": 1, '))
+            code, text = run(module, write(tmp, "a.jsonl", STOPPED),
+                             extra=("--node-price", "0.8", "--node-vcpu", "8", "--node-hours", "0", "--shape", "XS"))
+        self.assertIn("(shape XS) 0.20", text)
+
+    def test_an_oversize_audit_file_is_refused_in_one_line(self):
+        module = load(SOURCE.replace("MAX_AUDIT_BYTES = 64 * 1024 * 1024", "MAX_AUDIT_BYTES = 1000"))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write(tmp, "big.jsonl", None, "x" * 5000)
+            err = io.StringIO()
+            old, sys.stderr = sys.stderr, err
+            try:
+                code, _ = run(module, path)
+            finally:
+                sys.stderr = old
+        self.assertEqual(code, 2)
+        self.assertEqual(len(err.getvalue().splitlines()), 1)
+        self.assertIn("over", err.getvalue())
+
+    def test_the_real_cap_is_64_mb(self):
+        self.assertEqual(REAL.MAX_AUDIT_BYTES, 64 * 1024 * 1024)
+
+
 def real_audit():
     """A small real-shaped audit: the writer's keys (with actor and reason) and the action names of a real day."""
     def rec(ts, rid, action, cost, ok=True, reason="", worker="widget-service"):
@@ -199,6 +267,15 @@ class TestMutants(unittest.TestCase):
             code, text = TestRealAudit().go(module, day="2026-10-20")
             assert "USD 0 (no audit lines on this day)" in text, text
         self.assertTrue(self.fails(src, case))
+
+    def test_a_check_without_isfinite_is_caught(self):
+        src = mutant("if not math.isfinite(value):", "if False:")
+        for flag in ("--node-price", "--node-vcpu", "--node-hours", "--pod-rate"):
+            for value in ("nan", "inf"):
+                def case(module, flag=flag, value=value):
+                    code, _, _ = TestInputs().refused(module, flag, value)
+                    assert code == 2
+                self.assertTrue(self.fails(src, case), (flag, value))
 
     def fails(self, source, case):
         try:

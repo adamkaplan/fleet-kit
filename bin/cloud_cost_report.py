@@ -12,16 +12,25 @@ price (pod vCPU / node vCPU x node price x pod-hours; shapes S 2, M 4, L 6 vCPU,
 audit does not record the shape). A pod created on the day and not stopped on it runs to the end of the day, and the
 report says so. Actions the report does not cost (create.interrupted, create.failed, create-attempt, renew-git-token) are
 skipped and counted; any other unknown action is malformed. Lines with ok false are listed, not costed.
-Exit 0 on a report, 2 on a malformed line or file.
+Exit 0 on a report, 2 on a malformed line or file. Every float argument must be finite (nan and inf are refused). An audit
+file over 64 MB is refused with a one-line message (it is read with a bounded read, never whole).
+
+Known limits (behaviour left as it is):
+- a pod spanning midnight is costed only on its stop day (its hours start at the start of that day);
+- the shape applies to all pods, because the audit does not record it;
+- two creates of one name resolve to the last one;
+- a clock going backwards is hidden by max(0, ...).
 """
 import argparse
 import datetime
 import json
+import math
 import re
 import sys
 
 ACTIONS = ("create", "stop", "extend", "delete")
 SKIPPED = ("create.interrupted", "create.failed", "create-attempt", "renew-git-token")
+MAX_AUDIT_BYTES = 64 * 1024 * 1024
 SHAPE_VCPU = {"S": 2, "M": 4, "L": 6}
 
 
@@ -39,9 +48,12 @@ def parse_ts(text, where):
 def read_lines(path):
     try:
         with open(path, encoding="utf-8") as handle:
-            raw = handle.read().splitlines()
+            data = handle.read(MAX_AUDIT_BYTES + 1)
+        raw = data.splitlines()
     except (OSError, UnicodeDecodeError) as exc:
         raise Malformed("cannot read %s: %s" % (path, exc.__class__.__name__))
+    if len(data) > MAX_AUDIT_BYTES:
+        raise Malformed("audit file is over %d MB" % (MAX_AUDIT_BYTES // (1024 * 1024)))
     lines = []
     for number, text in enumerate(raw, 1):
         if not text.strip():
@@ -175,6 +187,9 @@ def main(argv, out=None):
             raise Malformed("give exactly one of --node-hours and --node-hours-file")
         if args.node_hours_file is not None:
             args.node_hours = read_hours_file(args.node_hours_file, args.day)
+        for value in (args.node_price, args.node_vcpu, args.node_hours, args.pod_rate):
+            if not math.isfinite(value):
+                raise Malformed("node or pod input is not a finite number")
         if min(args.node_price, args.node_hours, args.pod_rate) < 0 or args.node_vcpu <= 0:
             raise Malformed("negative node or pod input, or node vCPU not above 0")
         lines = read_lines(args.audit)
