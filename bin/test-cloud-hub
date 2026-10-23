@@ -9,9 +9,11 @@ import hashlib
 import http.client
 import io
 import json
+import os
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -161,7 +163,7 @@ class TestHub(unittest.TestCase):
 
     def test_decisions(self):
         with Hub(load()) as hub:
-            self.assertEqual(hub.call("GET", "/decisions"), (200, {"decisions": [], "errors": []}))
+            self.assertEqual(hub.call("GET", "/decisions")[0], 503)    # absent file: 503 since #1158
             hub.decisions.write_text(json.dumps({"decisions": [{"id": 1, "agent": "agent-a"}], "errors": []}))
             self.assertEqual(hub.call("GET", "/decisions")[1]["decisions"], [{"id": 1, "agent": "agent-a"}])
             self.assertEqual(hub.call("GET", "/decisions", token="nope")[0], 401)
@@ -297,6 +299,7 @@ class TestHub(unittest.TestCase):
         with Hub(load()) as hub:
             self.assertEqual(hub.call("GET", "/decisions", token="nope")[0], 401)
             self.assertEqual(hub.call("GET", "/decisions", token=None)[0], 401)
+            hub.decisions.write_text('{"decisions": [], "errors": []}')   # a served file is needed for 200 since #1158
             self.assertEqual(hub.call("GET", "/decisions")[0], 200)
 
 
@@ -324,6 +327,7 @@ class TestSecretsMode(unittest.TestCase):
         with SecretsHub(load()) as hub:
             self.assertEqual(hub.send(token=SECRET_A)[1]["delivered"], True)
             self.assertIn("from agent agent-a", hub.api.got[0][2]["text"])
+            hub.decisions.write_text('{"decisions": [], "errors": []}')   # a served file is needed for 200 since #1158
             self.assertEqual(hub.call("GET", "/decisions", token=SECRET_A)[0], 200)
             self.assertEqual(hub.calls, [])      # no TokenReview call
 
@@ -516,7 +520,11 @@ class TestMutants(unittest.TestCase):
         module = mutant("                if not isinstance(body, dict):\n                    raise ValueError(\"not an object\")", "                pass")
         def check(hub):
             hub.decisions.write_text("[1]")
-            self.assertEqual(hub.call("GET", "/decisions")[0], 503)
+            try:
+                status = hub.call("GET", "/decisions")[0]
+            except (OSError, http.client.HTTPException):
+                status = "dropped"     # the mutant now fails while adding age_seconds to a list
+            self.assertEqual(status, 503)
         self.fails(module, check)
 
     def test_mutant_http_anywhere(self):
@@ -645,6 +653,11 @@ class TestFraming(HardCheck):
                     self.separators_check)
 
 
+def sans_age(body):
+    """The served body without the hub's age_seconds (which is checked where the age is the subject)."""
+    return {k: v for k, v in body.items() if k != "age_seconds"}
+
+
 class TestDecisions(HardCheck):
     DECISIONS = {"decisions": [{"id": 1, "agent": "agent-a"}, {"id": 2, "agent": "agent-b"}, {"id": 3}], "errors": ["daemon error"]}
 
@@ -667,8 +680,8 @@ class TestDecisions(HardCheck):
 
     def scope_check(self, module):
         with self.hub(module) as hub:
-            self.assertEqual(hub.call("GET", "/decisions", token="tok-a")[1], {"decisions": [{"id": 1, "agent": "agent-a"}], "errors": []})
-            self.assertEqual(hub.call("GET", "/decisions", token="tok-b")[1], {"decisions": [{"id": 2, "agent": "agent-b"}], "errors": []})
+            self.assertEqual(sans_age(hub.call("GET", "/decisions", token="tok-a")[1]), {"decisions": [{"id": 1, "agent": "agent-a"}], "errors": []})
+            self.assertEqual(sans_age(hub.call("GET", "/decisions", token="tok-b")[1]), {"decisions": [{"id": 2, "agent": "agent-b"}], "errors": []})
 
     def test_decisions_are_scoped_to_the_caller(self):
         self.scope_check(load())
@@ -678,7 +691,7 @@ class TestDecisions(HardCheck):
 
     def captain_check(self, module):
         with self.hub(module) as hub:
-            self.assertEqual(hub.call("GET", "/decisions", token="tok-cap")[1], self.DECISIONS)
+            self.assertEqual(sans_age(hub.call("GET", "/decisions", token="tok-cap")[1]), self.DECISIONS)
 
     def test_captain_sees_all(self):
         self.captain_check(load())
@@ -861,7 +874,7 @@ class TestNamespaceSetting(unittest.TestCase):
     def scope_check(self, module):
         with NsHub(module, USERS_NS) as hub:
             hub.decisions.write_text(json.dumps({"decisions": [{"id": 1, "agent": "agent-a"}, {"id": 2, "agent": "agent-b"}], "errors": []}))
-            self.assertEqual(hub.call("GET", "/decisions", token="tok-cw")[1], {"decisions": [{"id": 1, "agent": "agent-a"}], "errors": []})
+            self.assertEqual(sans_age(hub.call("GET", "/decisions", token="tok-cw")[1]), {"decisions": [{"id": 1, "agent": "agent-a"}], "errors": []})
 
     def test_reserved_captain_and_scope_use_the_setting(self):
         for check in (self.reserved_check, self.captain_check, self.scope_check):
@@ -933,6 +946,168 @@ class TestNamespaceSetting(unittest.TestCase):
     def test_worker_copies_match_bin(self):
         for name in ("cloud_hub.py", "cloud_channel.py", "cloud_channel_server.py"):
             self.assertEqual((BIN / name).read_text(), (BIN.parent / "cloud" / "worker" / "bin" / name).read_text(), name)
+
+
+AGE_EXPR = 'return json.loads(raw.decode("utf-8")), max(0, int(time.time() - mtime))'
+
+
+def _aged(hub, content, age):
+    hub.decisions.write_text(content)
+    t = time.time() - age
+    os.utime(hub.decisions, (t, t))
+
+
+class TestDecisionsAge(unittest.TestCase):
+    """Issue 1158 hub half: S21..S25, each with a wrong build."""
+    OK = '{"decisions": [{"id": 1, "agent": "agent-a"}], "errors": []}'
+
+    def fails(self, module, check):
+        try:
+            with Hub(module, kube=kube_with({"tok-cap": "captain"})) as hub:
+                check(hub)
+        except AssertionError:
+            return
+        self.fail("mutant survived")
+
+    def test_s21_age_is_an_integer_of_the_mtime(self):
+        with Hub(load()) as hub:
+            _aged(hub, self.OK, 25)
+            status, body = hub.call("GET", "/decisions")
+            self.assertEqual(status, 200)
+            self.assertEqual(body["decisions"], [{"id": 1, "agent": "agent-a"}])
+            self.assertEqual(body["errors"], [])
+            self.assertIs(type(body["age_seconds"]), int)
+            self.assertAlmostEqual(body["age_seconds"], 25, delta=1)
+
+    def test_s21_mutant_float_age(self):
+        module = mutant(AGE_EXPR, 'return json.loads(raw.decode("utf-8")), max(0, time.time() - mtime)')
+        def check(hub):
+            _aged(hub, self.OK, 25)
+            self.assertIs(type(hub.call("GET", "/decisions")[1]["age_seconds"]), int)
+        self.fails(module, check)
+
+    def test_s21_mutant_no_age(self):
+        module = mutant('            body["age_seconds"] = age\n', "")
+        def check(hub):
+            _aged(hub, self.OK, 25)
+            self.assertIn("age_seconds", hub.call("GET", "/decisions")[1])
+        self.fails(module, check)
+
+    def test_s22_age_follows_mtime_not_content(self):
+        def check(hub):
+            _aged(hub, '{"decisions": [], "errors": [], "written_at": "2000-01-01T00:00:00Z"}', 0)
+            self.assertTrue(0 <= hub.call("GET", "/decisions")[1]["age_seconds"] <= 2)
+            _aged(hub, '{"decisions": [], "errors": [], "written_at": "2999-01-01T00:00:00Z"}', 400)
+            self.assertTrue(399 <= hub.call("GET", "/decisions")[1]["age_seconds"] <= 401)
+        with Hub(load()) as hub:
+            check(hub)
+        self.fails(mutant(AGE_EXPR, 'return json.loads(raw.decode("utf-8")), (3600 if b"2000" in raw else 0)'), check)
+
+    def test_s22_age_is_the_hubs_own_not_the_files_claim(self):
+        """A body that carries its own age_seconds does not get to choose it: the hub's clock and the mtime decide."""
+        def check(hub):
+            _aged(hub, '{"decisions": [], "errors": [], "age_seconds": 0}', 400)
+            self.assertTrue(399 <= hub.call("GET", "/decisions", token="tok-cap")[1]["age_seconds"] <= 401)
+        with Hub(load(), kube=kube_with({"tok-cap": "captain"})) as hub:
+            check(hub)
+        self.fails(mutant('            body["age_seconds"] = age\n', '            body.setdefault("age_seconds", age)\n'), check)
+
+    def test_s22_age_is_not_cached(self):
+        """Each answer re-reads the file's mtime: a rewritten file is young again; a mutant that remembers the first age is caught."""
+        def check(hub):
+            _aged(hub, self.OK, 400)
+            first = hub.call("GET", "/decisions")[1]["age_seconds"]
+            _aged(hub, self.OK, 5)
+            second = hub.call("GET", "/decisions")[1]["age_seconds"]
+            self.assertTrue(399 <= first <= 401 and 4 <= second <= 6, (first, second))
+        with Hub(load()) as hub:
+            check(hub)
+        cached = SOURCE.replace(AGE_EXPR, 'return json.loads(raw.decode("utf-8")), _AGE_CACHE.setdefault(path, max(0, int(time.time() - mtime)))')
+        self.assertNotEqual(cached, SOURCE)
+        self.fails(load(cached.replace("def _read_json_aged", "_AGE_CACHE = {}\n\n\ndef _read_json_aged", 1)), check)
+
+    def test_s22_age_is_not_from_the_callers_clock(self):
+        """The age ignores anything the caller sends (a Date header, a query), the way the pull ignores the Mac clock."""
+        def check(hub):
+            _aged(hub, self.OK, 400)
+            conn = http.client.HTTPConnection("127.0.0.1", hub.server.server_address[1], timeout=5)
+            conn.request("GET", "/decisions", headers={"Authorization": "Bearer tok-a", "Date": "Mon, 01 Jan 2001 00:00:00 GMT"})
+            r = conn.getresponse()
+            body = json.loads(r.read())
+            conn.close()
+            self.assertTrue(399 <= body["age_seconds"] <= 401, body)
+        with Hub(load()) as hub:
+            check(hub)
+        mac = SOURCE.replace(AGE_EXPR, 'return json.loads(raw.decode("utf-8")), 0').replace(
+            'body["age_seconds"] = age', 'body["age_seconds"] = 0')
+        self.fails(load(mac), check)
+
+    def test_s22_never_negative(self):
+        with Hub(load()) as hub:
+            _aged(hub, self.OK, -500)    # mtime in the future
+            self.assertEqual(hub.call("GET", "/decisions")[1]["age_seconds"], 0)
+
+    def test_s23_absent_is_503(self):
+        with Hub(load()) as hub:
+            status, body = hub.call("GET", "/decisions")
+            self.assertEqual((status, body.get("error")), (503, "decisions unreadable"))
+            self.assertNotIn("decisions", body)
+            self.assertTrue(any("503" in line for line in hub.lines))
+        def check(hub):
+            self.assertEqual(hub.call("GET", "/decisions")[0], 503)
+        # wrong build: an absent file is the old empty default
+        src = SOURCE.replace("body, age = _read_json_aged(decisions_path)",
+                             "try:\n                    body, age = _read_json_aged(decisions_path)\n"
+                             "                except FileNotFoundError:\n                    body, age = {'decisions': [], 'errors': []}, 0")
+        self.assertNotEqual(src, SOURCE)
+        self.fails(load(src), check)
+
+    def test_s24_unreadable_is_503(self):
+        def check(hub):
+            cases = []
+            for content in ("{not json", "[1, 2]"):
+                _aged(hub, content, 5)
+                cases.append(hub.call("GET", "/decisions")[0])
+            if os.geteuid() != 0:
+                _aged(hub, self.OK, 5)
+                os.chmod(hub.decisions, 0)
+                cases.append(hub.call("GET", "/decisions")[0])
+                os.chmod(hub.decisions, 0o600)
+            self.assertEqual(cases, [503] * len(cases))
+        with Hub(load()) as hub:
+            check(hub)
+        # wrong build: any failure falls back to an empty served body
+        src = SOURCE.replace('                return self._send(503, {"status": 503, "error": "decisions unreadable"})\n            body["age_seconds"] = age',
+                             '                body, age = {"decisions": [], "errors": []}, 0\n            body["age_seconds"] = age')
+        self.assertNotEqual(src, SOURCE)
+        self.fails(load(src), check)
+
+    def test_s25_authentication_still_required(self):
+        with Hub(load()) as hub:
+            _aged(hub, self.OK, 5)
+            for token in (None, ""):
+                status, body = hub.call("GET", "/decisions", token=token)
+                self.assertEqual(status, 401)
+                self.assertNotIn("age_seconds", json.dumps(body))
+            conn = http.client.HTTPConnection("127.0.0.1", hub.server.server_address[1], timeout=5)
+            conn.request("GET", "/decisions", headers={"Authorization": "Bearer "})
+            r = conn.getresponse()
+            self.assertEqual(r.status, 401)
+            self.assertNotIn(b"age_seconds", r.read())
+            conn.close()
+            self.assertEqual(hub.call("GET", "/decisions", token="nope")[0], 401)
+            status, body = hub.call("GET", "/decisions")
+            self.assertEqual(status, 200)
+            self.assertIn("age_seconds", body)
+
+    def test_s25_mutant_served_before_the_check(self):
+        src = SOURCE.replace('                return self._send(404, {"status": 404, "error": "not found"})\n',
+                             '                return self._send(404, {"status": 404, "error": "not found"})\n'
+                             '            if not self.headers.get("Authorization"):\n                return self._send(200, {"age_seconds": 0})\n', 1)
+        self.assertNotEqual(src, SOURCE)
+        def check(hub):
+            self.assertEqual(hub.call("GET", "/decisions", token=None)[0], 401)
+        self.fails(load(src), check)
 
 
 if __name__ == "__main__":
