@@ -12610,7 +12610,8 @@ class TestAgentShellCalls(Base):
         sb.record_github_calls(engine)
         sb.record_github_calls(engine)                                                       # inside the minute: no second read
         self.assertEqual(len([a for a in asked if a[0][1:] == ["api", "rate_limit"]]), 1)
-        self.assertEqual([a[1] for a in asked if a[0][1:] == ["api", "rate_limit"]], ["1"])  # the switchboard's own marker: the shim never counts it
+        self.assertEqual([a[1] for a in asked if a[0][1:] == ["api", "rate_limit"]], [None])  # no marker any more: the daemon reaches the real gh by path (own_gh_path), so the shim never sees, hence never counts, it
+        self.assertEqual([a[0][0] for a in asked if a[0][1:] == ["api", "rate_limit"]], [FAKE_GH])
         self.assertEqual(len(accounts.calls), 0, "the rate-limit read is not a counted call")
         body = json.loads((self.state / "github-usage.json").read_text())["accounts"]["acme-a"]
         self.assertEqual((body["used"], body["remaining"], body["reset"]), (4000, 1000, reset))
@@ -82767,7 +82768,7 @@ class TestShimTopSpender(Base):
     # Every environment name the shim reads, with a hostile value for it. DERIVED from the shim's own code (see `shim_environment_names`): a name the shim starts to read
     # and this table does not list fails the test below, so a new switch cannot appear unseen. SWITCH_OFF lists the names that can still make the caller wait less.
     HOSTILE = {"FLEET_REAL_GH": "/nonexistent/gh", "FLEET_SHIM_CACHE": "off", "FLEET_SHIM_GATE_SECONDS": "0.001", "FLEET_SHIM_LOOKUP_SECONDS": "0.001",
-               "FLEET_SHIM_MERGE_GATE_SECONDS": "0.001", "FLEET_SWITCHBOARD_BIN": "OTHER", "FLEET_SWITCHBOARD_OWN_GH": "1", "FLEET_SWITCHBOARD_STATE": "EMPTY", "GH_HOST": "ghe.example", "GH_REPO": "other/repo",
+               "FLEET_SHIM_MERGE_GATE_SECONDS": "0.001", "FLEET_SWITCHBOARD_BIN": "OTHER", "FLEET_SWITCHBOARD_STATE": "EMPTY", "GH_HOST": "ghe.example", "GH_REPO": "other/repo",
                "PATH": "SAME", "XDG_CONFIG_HOME": "EMPTY", "XDG_STATE_HOME": "EMPTY", "HOME": "EMPTY"}
     SWITCH_OFF = frozenset()   # none: the block reads no variable; who the caller is comes from the switchboard's answer for its session (see the shim's comment)
 
