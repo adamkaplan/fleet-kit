@@ -1,0 +1,157 @@
+"""#1083: the ONE table cloud/worker/guard-table.tsv. Every row runs through the guard layer (guard.sh plus the allow and deny patterns of
+opencode-worker.json, last match wins) and through the client (cw-gh against a loopback stub): they must agree. Mutants: a config that opens
+the whole issues path, and a client that opens it, each make a row fail. Offline; the token is synthetic."""
+import http.server
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+WORKER = os.path.dirname(HERE)
+TABLE = os.path.join(WORKER, "guard-table.tsv")
+GUARD = os.path.join(WORKER, "guard.sh")
+CONF = os.path.join(WORKER, "opencode-worker.json")
+CW_GH = os.path.join(WORKER, "cw-gh")
+TOKEN = "synthetic-" + "Zp4Rt9" * 6
+NEW_IDS = {"issue-comments-read", "pull-reviews-read", "pull-comments-read", "api-jq-filter", "issues-other-path"}
+
+
+def load_conf():
+    with open(CONF) as f:
+        return json.load(f)
+
+
+def rows():
+    out = []
+    for line in open(TABLE).read().splitlines():
+        if line and not line.startswith("#"):
+            f = line.split("\t")
+            assert len(f) == 7, line
+            out.append(dict(zip(("id", "kind", "tool", "method", "path", "why", "example"), f)))
+    return out
+
+
+def conf_decision(conf, line):
+    bash = conf["permission"]["bash"]
+    assert bash == conf["agent"]["worker"]["permission"]["bash"]
+    res = "allow"
+    for pat, v in bash.items():   # opencode: the last matching rule wins
+        if re.fullmatch(".*".join(re.escape(x) for x in pat.split("*")), line, re.S):
+            res = v
+    return res
+
+
+def guard_denies(example, conf=None):
+    args = example.split()
+    r = subprocess.run(["sh", GUARD, "gh"] + args, capture_output=True, text=True, timeout=30, env={"PATH": "/usr/bin:/bin"})
+    if r.returncode == 3:
+        return True
+    assert r.returncode == 0, r.stderr
+    return conf_decision(conf or load_conf(), "gh " + example) == "deny"
+
+
+class Rec(http.server.BaseHTTPRequestHandler):
+    seen = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        Rec.seen.append((self.command, self.path))
+        out = json.dumps([{"body": "hello", "user": {"login": "alice"}, "created_at": "t"}]).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
+    do_POST = do_PATCH = do_PUT = do_DELETE = do_GET
+
+
+class Table(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Rec)
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.base = "http://127.0.0.1:%d" % cls.srv.server_port
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+        cls.addClassCleanup(cls.srv.shutdown)
+
+    def client(self, example, script=CW_GH):
+        Rec.seen = []
+        env = {"PATH": "/usr/bin:/bin", "CW_GH_API_BASE": self.base, "GH_TOKEN": TOKEN, "HOME": "/nonexistent"}
+        return subprocess.run([sys.executable, script] + example.split(), capture_output=True, text=True, env=env, timeout=60, stdin=subprocess.DEVNULL)
+
+    def test_the_table_holds_the_1083_rows_and_a_place_for_the_later_asks(self):
+        ids = {r["id"] for r in rows()}
+        self.assertTrue(NEW_IDS <= ids, NEW_IDS - ids)
+        self.assertEqual(len(ids), len(rows()))   # no id twice
+        text = open(TABLE).read()
+        self.assertIn("ask 1166 rows: add below this line", text)
+        self.assertIn("ask 1200 rows: add below this line", text)
+
+    def test_u2_the_guard_and_the_client_agree_on_every_row(self):
+        for r in rows():
+            with self.subTest(row=r["id"]):
+                denied = r["kind"] == "denied"
+                self.assertEqual(guard_denies(r["example"]), denied, "guard: " + r["id"])
+                p = self.client(r["example"])
+                if denied:
+                    self.assertEqual(p.returncode, 2, (r["id"], p.stderr))
+                    self.assertEqual([x for x in Rec.seen if x[0] != "GET"], [])
+                    self.assertNotIn("issues/7/comments", " ".join(x[1] for x in Rec.seen) if r["id"] != "issues-write-post" else "")
+                else:
+                    self.assertEqual(p.returncode, 0, (r["id"], p.stderr))
+                    self.assertTrue(Rec.seen and all(m == "GET" for m, _ in Rec.seen))
+                self.assertNotIn(TOKEN, p.stdout + p.stderr)
+
+    def test_s8_the_three_reads_pass_and_each_write_and_other_path_is_denied(self):
+        by = {r["id"]: r for r in rows()}
+        for i in ("issue-comments-read", "pull-reviews-read", "pull-comments-read"):
+            self.assertFalse(guard_denies(by[i]["example"]), i)
+        for i in ("issues-write-post", "issues-write-patch", "issues-write-delete", "issues-other-path", "issues-labels-path", "pull-merge", "pull-review-write"):
+            self.assertTrue(guard_denies(by[i]["example"]), i)
+
+    def test_s9_the_jq_filter_applies_client_side_and_the_write_flags_stay_refused(self):
+        for q in ("--jq", "-q"):
+            p = self.client("api repos/acme-org/widget-service/issues/7/comments %s .[0].body" % q)
+            self.assertEqual((p.returncode, p.stdout), (0, "hello\n"), p.stderr)
+            self.assertEqual(len(Rec.seen), 1)
+        for r in rows():
+            if r["id"].startswith("api-write-flags"):
+                self.assertTrue(guard_denies(r["example"]), r["id"])
+                self.assertEqual(self.client(r["example"]).returncode, 2)
+
+    def test_s12_no_new_token_permission_appears(self):
+        # the rows name no permission and no token file; the role permission table (cloud/token-table.txt) is not touched by this ask
+        r = subprocess.run(["git", "diff", "--quiet", "origin/HEAD", "--", "cloud/token-table.txt"], cwd=WORKER, capture_output=True)
+        self.assertIn(r.returncode, (0, 128))   # 128: no origin/HEAD in this checkout
+        for row in rows():
+            self.assertEqual(row["tool"], "gh")
+
+    def test_s10_a_mutant_that_opens_the_whole_issues_path_fails(self):
+        conf = load_conf()
+        conf["permission"]["bash"] = dict(conf["permission"]["bash"])
+        del conf["permission"]["bash"]["gh api*/issues*"]
+        conf["agent"]["worker"]["permission"]["bash"] = conf["permission"]["bash"]
+        bad = [r["id"] for r in rows() if r["kind"] == "denied" and r["method"] == "GET" and "issues" in r["path"]
+               and not guard_denies(r["example"], conf)]
+        self.assertIn("issues-other-path", bad)   # the changed row: the agreement test would fail on it
+
+    def test_s10_a_client_that_opens_the_whole_issues_path_fails_the_agreement(self):
+        src = open(CW_GH).read()
+        old = "        return bool(API_ISSUE_COMMENTS.fullmatch(p))"
+        self.assertIn(old, src)
+        path = os.path.join(self.tmp.name, "cw-gh-mutant")
+        open(path, "w").write(src.replace(old, "        return True", 1))
+        self.assertEqual(self.client("api repos/acme-org/widget-service/issues/7", script=path).returncode, 0)   # the mutant answers where the table says no
+        self.assertEqual(self.client("api repos/acme-org/widget-service/issues/7").returncode, 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
