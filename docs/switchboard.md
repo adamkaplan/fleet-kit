@@ -2576,6 +2576,14 @@ switchboard reads that state once, and when it holds the reminder is dropped uns
 the reason). A state that cannot be read now leaves the reminder to deliver. A reminder with `--issue` and no condition of its
 own gets `--until-closed` for that issue by default, so a reminder about finished work is dropped unsent; `--keep-if-closed` opts out.
 
+**A reminder about an issue is dropped when it closes (#1132).** A reminder is dropped when its issue closes or its pull
+request merges, unless it was set with `--keep-if-closed`. `remind --issue N` says so at creation ("dropped if it closes")
+and names `--keep-if-closed`. When the daemon drops it, the setter gets ONE notice naming the reminder, its text and the
+reason (the issue closed, the pull request merged), audited as `reminder.drop_notice`; the notice is sent only by the sweep
+that removes the reminder, so it is never repeated. An issue already closed at creation is refused (exit 2, "already
+closed") unless `--keep-if-closed` is given, which keeps the reminder and fires it. A reminder without `--issue`, or whose
+issue stays open, behaves as before.
+
 **See and cancel your own reminders.** `remind --list` prints the pending reminders set by you or for you, oldest first
 (id, time, recipient, issue, text; at most 50), and `remind --cancel <id>` removes one of them (audited as `reminder.cancel`);
 another agent's reminder is not shown and is refused as unknown. Reminders live in `reminders.json` in the state directory, are
