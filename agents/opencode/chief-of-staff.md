@@ -38,6 +38,8 @@ permissions:
   - {action: shell, resource: "fleet-switchboard triage *", effect: allow}
   - {action: shell, resource: "fleet-switchboard move *", effect: allow}
   - {action: shell, resource: "fleet-switchboard reassign *", effect: allow}
+  # charter set records an orchestrator's own charter only (guarded and audited); nothing wider
+  - {action: shell, resource: "fleet-switchboard charter set *", effect: allow}
   - {action: shell, resource: "fleet-switchboard handoff *", effect: allow}
   - {action: shell, resource: "fleet-switchboard launch *", effect: allow}
   - {action: shell, resource: "fleet-switchboard reattach *", effect: allow}
