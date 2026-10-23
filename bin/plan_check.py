@@ -904,6 +904,7 @@ EXPLAIN = {
     "bad-evaluator": ("`evaluator` is one of " + "|".join(EVALUATORS), "pick who records the proof"),
     "evaluator-mismatch": ("the evaluator must be able to record the proof: test needs ci, screenshot needs reviewer or owner, live and measure need tester or owner", "change the evaluator or the proof"),
     "live-no-claim": ("a live or tester scenario should say who claims it with a `claim` line (a warning only)", "add `claim: epic` (needs the installed system) or `claim: pr`"),
+    "review-for-code": ("proof `review` is a reviewer's read of text, not of code behaviour a test can show", "use `proof: test` for code behaviour"),
     "bad-claim": ("`claim` is `pr` (default) or `epic`", "remove it or use one of the two"),
     "vague-pass": ("`pass` must be an observable a stranger can decide: a status or exit code, a count or threshold, a quoted value, or a named comparison", "for example `exit status is 0`, `exactly 3 items`, `shows \"Ready\"`"),
     "no-discriminator": ("`discriminates` names the specific wrong build that would FAIL this scenario", "write `a build that <does X> <observable wrong outcome>`"),
