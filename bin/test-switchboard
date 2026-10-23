@@ -13619,7 +13619,7 @@ class TestCosTriageAllowRule(unittest.TestCase):
         for rel in self.FILES:
             with self.subTest(file=rel):
                 got = [m.group(1) for l in self._lines(rel) for m in [re.match(r'  - \{action: shell, resource: "fleet-switchboard ([a-z]+) \*", effect: allow\}$', l)] if m]
-                self.assertEqual(sorted(got), sorted(old[rel.split("/")[-1]] + ["triage", "move", "reassign"]))
+                self.assertEqual(sorted(got), sorted(old[rel.split("/")[-1]] + ["triage", "move", "reassign", "resume"]))
 
 
 class TestCosDelegatedClearPermission(unittest.TestCase):
@@ -39959,6 +39959,670 @@ def _adoption_cells():
 _adoption_cells()
 
 
+CHANGE_KINDS = ("base", "record", "matrix", "rating", "head", "none")   # (#999) what can change under a hold the daemon put on, with the head unchanged: the ONE table every row below derives from
+
+
+class TestImpactReleaseEveryPass(TestImpactRejudge):
+    """#999: the daemon judges every pull request that carries labels it added at EVERY pass, so a hold the rule no longer makes is released whatever changed
+    (the base branch, a record, the matrix, a rating) with the head unchanged. The REAL pass over a fake GitHub that answers only what `gh pr view` answers
+    (the fields asked, the files of the current base); one table of change kinds x (the rule still holds / no longer holds); a mutant per row."""
+
+    HEAD = LEDGER_NEW_HEAD
+    PRN = "acme/app#9"
+
+    def setUp(self):
+        super().setUp()
+        self.fingerprint = "m1"
+        self.migrations_top = False
+        real = sb.impact_floor.load_matrix
+
+        def loaded(path=None):
+            matrix = real(path)
+            if self.migrations_top:
+                matrix["owner_hold"]["top_tier_paths"]["authority"] = list(matrix["owner_hold"]["top_tier_paths"]["authority"]) + ["migrations/**"]
+            return matrix
+        for patcher in (mock.patch.object(sb.impact_floor, "load_matrix", loaded), mock.patch.object(sb.impact_floor, "rule_fingerprint", lambda: self.fingerprint)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def view(self, path, base="1" * 40, ref=None):
+        """The fake world's pull request: the files of its CURRENT base. A retarget is a new base branch (`ref`); a moved tip of the same branch is a new `baseRefOid`."""
+        self.prs[9] = {"headRefOid": self.HEAD, "changedFiles": 1, "files": [{"path": path}], "baseRefOid": base, "baseRef": ref or ("main" if base == "1" * 40 else "base-" + base[0]), "labels": self.prs.get(9, {}).get("labels", [])}
+
+    def record(self, **fields):
+        entry = {"kind": "review_record", "pr": self.PRN, "head": self.HEAD, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "summary": "x"}
+        sb.plan_ledger.append_entry(self.world.state, dict(entry, **fields), 1)
+
+    list_has_base = True   # a mutant turns it off: the list the pass reads then carries no base, as if the memo key had none
+
+    def listed(self, number, labels=(), head=LEDGER_HEAD, draft=False):
+        """The REST list entry, with the base the pull request has NOW (`base.ref`, `base.sha`): the one list the pass already reads. The memo keys on the ref only (#999)."""
+        entry = super().listed(number, labels, head=head, draft=draft)
+        if self.list_has_base and number in self.prs:
+            entry["base"] = {"ref": self.prs[number].get("baseRef", "main"), "sha": self.prs[number].get("baseRefOid")}
+        return entry
+
+    def step(self, advance=1000):
+        self.passes([self.listed(9, self.live_labels, head=self.HEAD)], advance=advance)
+
+    def held_world(self, kind):
+        """A pull request this daemon holds at HEAD: the first pass puts the labels on, the second sees them."""
+        self.live_labels = []
+        if kind in ("base", "head"):
+            self.view("shims/gh")
+        elif kind == "record":
+            self.view("docs/a.md")
+            self.record(impact_action="hold", impact_class="credentials")
+        elif kind == "matrix":
+            self.migrations_top = True
+            self.view("migrations/0002.sql")
+        elif kind == "rating":
+            self.view("docs/a.md")
+            (self.world.state / "impact-hold.json").write_text(json.dumps({"clears": {self.PRN: {"head": LEDGER_HEAD, "reason": "a false hold", "by": "own", "at": 1}}, "applied": {}}))
+        else:
+            self.view("shims/gh")
+        self.step(0)
+        self.assertEqual(len(self.posts(9)), 1, "the daemon held it (%s)" % kind)
+        self.live_labels = self.both()
+        self.step()
+        self.writes.clear()
+
+    def change(self, kind, holds):
+        if kind == "base":
+            self.view("shims/gh" if holds else "docs/a.md", base="2" * 40, ref="release")   # a retarget: another base branch
+        elif kind == "record":
+            self.record(impact_action="hold", impact_class="authority") if holds else self.record(impact_action="second-review")
+        elif kind == "head":
+            self.HEAD = "c" * 40   # a push: the new head, on the same base
+            self.view("shims/gh" if holds else "docs/a.md")
+        elif kind == "matrix":
+            self.fingerprint = "m2"
+            self.migrations_top = holds
+        elif kind == "rating":
+            self.record(impact_action="second-review") if not holds else self.record()   # a record with no action rates nothing: the hold stands
+        else:
+            pass   # "none": the rule's answer and every input are as they were
+
+    def run_row(self, kind, holds, mutant=None):
+        mutant = dict(mutant or {})
+        self.list_has_base = mutant.pop("list_has_base", True)
+        with contextlib.ExitStack() as stack:
+            for target, replacement in mutant.items():
+                owner, _, name = target.rpartition(".")
+                stack.enter_context(mock.patch.object(getattr(sb, owner) if owner else sb, name, replacement))
+            self.held_world(kind)
+            self.change(kind, holds)
+            self.step()
+            self.step()   # the pass after: nothing more is written
+            return [w for w in self.removals(9)], self.events("gate.hold_released")
+
+    def check_row(self, kind, holds, mutant=None):
+        removed, released = self.run_row(kind, holds, mutant)
+        if holds:
+            self.assertEqual((removed, released, self.posts(9)), ([], [], []), "%s: the rule still holds: kept, no write, no audit line" % kind)
+        else:
+            self.assertEqual(sorted(w[1].rsplit("/", 1)[-1] for w in removed), sorted(urllib.parse.quote(n, safe="") for n in self.both()), "%s: released" % kind)
+            (line,) = released
+            self.assertEqual(line["detail"]["reason"], self.REASONS[kind])
+
+    REASONS = {"base": "base changed", "record": "record changed", "matrix": "rule changed", "rating": "record changed", "head": "head changed"}
+    # a row where the rule no longer holds after the change; "none" never releases (it cannot change what the rule says)
+    RELEASING = tuple(k for k in CHANGE_KINDS if k != "none")
+
+    def test_the_table_is_complete_and_every_kind_has_a_row_and_a_mutant(self):
+        self.assertEqual(set(CHANGE_KINDS), set(self.REASONS) | {"none"}, "a kind with no reason, or a reason with no kind")
+        self.assertEqual(set(self.REASONS), set(self.RELEASING), "a releasing kind with no reason")
+        self.assertEqual(set(self.MUTANTS), set(self.RELEASING), "a releasing kind with no mutant")
+        for kind in CHANGE_KINDS:   # every kind has both a still-held row and (but "none") a released row: both are driven by the table tests below
+            self.assertTrue(hasattr(self, "test_row_%s_still_held" % kind), kind)
+        for kind in self.RELEASING:
+            self.assertTrue(hasattr(self, "test_row_%s_released" % kind), kind)
+
+    def test_row_base_released(self):
+        self.check_row("base", False)
+
+    def test_row_base_still_held(self):
+        self.check_row("base", True)
+
+    def test_row_record_released(self):
+        self.check_row("record", False)
+
+    def test_row_record_still_held(self):
+        self.check_row("record", True)
+
+    def test_row_matrix_released(self):
+        self.check_row("matrix", False)
+
+    def test_row_matrix_still_held(self):
+        self.check_row("matrix", True)
+
+    def test_row_rating_released(self):
+        self.check_row("rating", False)
+
+    def test_row_rating_still_held(self):
+        self.check_row("rating", True)
+
+    def test_row_head_released(self):
+        self.check_row("head", False)
+
+    def test_row_head_still_held(self):
+        self.check_row("head", True)
+
+    def test_row_none_still_held(self):
+        self.check_row("none", True)
+
+    # The pre-fix daemon: the head-only memo, blind to one input each. Each releasing row must FAIL under its mutant.
+    NO_BASE = {"list_has_base": False}   # the memo key without the base (the bug)
+    NO_RECORDS = {"impact_records": lambda state_dir: ({}, None)}
+    FROZEN_RULE = {"impact_floor.rule_fingerprint": lambda: "frozen"}
+    MUTANTS = {
+        "base": dict(NO_BASE),                                    # the memo as it was: head, rule and record, never the base (the bug)
+        "record": dict(NO_RECORDS),                               # ... blind to the record
+        "matrix": dict(FROZEN_RULE),                              # ... blind to the rule's version
+        "rating": dict(NO_RECORDS),                               # ... blind to the rating
+        "head": {"_impact_release_reason": lambda *a: "rule no longer holds"},   # a release that cannot say what changed
+    }
+    REASON_BLIND = {"_impact_release_reason": lambda *a: "rule no longer holds"}
+    NEW_HEAD_ONLY = dict(NO_BASE, **dict(NO_RECORDS, **FROZEN_RULE))   # releases only when the head changes
+
+    def mutant_fails(self, kind, mutant):
+        with self.assertRaises(AssertionError):
+            self.check_row(kind, False, mutant)
+
+    def test_the_base_row_fails_under_the_head_only_memo(self):
+        self.mutant_fails("base", self.MUTANTS["base"])
+
+    def test_the_record_row_fails_under_a_memo_blind_to_the_record(self):
+        self.mutant_fails("record", self.MUTANTS["record"])
+
+    def test_the_matrix_row_fails_under_a_memo_blind_to_the_rule(self):
+        self.mutant_fails("matrix", self.MUTANTS["matrix"])
+
+    def test_the_rating_row_fails_under_a_memo_blind_to_the_rating(self):
+        self.mutant_fails("rating", self.MUTANTS["rating"])
+
+    def test_a_daemon_that_releases_only_on_a_new_head_fails_the_base_row_and_releases_on_the_new_head(self):
+        self.mutant_fails("base", self.NEW_HEAD_ONLY)
+
+    def test_the_head_row_fails_under_a_release_that_never_names_the_head(self):
+        self.mutant_fails("head", self.MUTANTS["head"])
+
+    # -- the cost: a held pull request costs nothing between changes (a RATE, not a per-pass count)
+    HELD, PASS_SECONDS, HOUR_PASSES = 30, 5, 720   # 30 held pull requests, a pass every 5 seconds (the default poll), for an hour
+    HOUR_CALLS = 1   # the stated bound: one `gh pr view` for the ONE retarget of the hour (plus its 2 label removals, counted apart); nothing for the 29 unchanged
+
+    def hour_of_passes(self, mutant=None):
+        """30 held pull requests, an hour of passes with the counting fake; one is retargeted half way and no longer holds. (view reads, writes after the hold settled)."""
+        mutant = dict(mutant or {})
+        self.list_has_base = mutant.pop("list_has_base", True)
+        numbers = list(range(100, 100 + self.HELD))
+        for n in numbers:
+            self.prs[n] = {"headRefOid": self.HEAD, "changedFiles": 1, "files": [{"path": "shims/gh"}], "baseRefOid": "1" * 40, "labels": []}
+        held = set()
+
+        def one(advance):
+            self.passes([self.listed(n, self.both() if n in held else [], head=self.HEAD) for n in numbers], advance=advance)
+        with contextlib.ExitStack() as stack:
+            for target, replacement in mutant.items():
+                owner, _, name = target.rpartition(".")
+                stack.enter_context(mock.patch.object(getattr(sb, owner) if owner else sb, name, replacement))
+            for _ in range(40):   # settle: each pass may spend its own call budget, so the labels go on over a few passes
+                one(self.PASS_SECONDS)
+                held |= {int(w[1].split("/issues/")[1].split("/")[0]) for w in self.posts()}
+            self.assertEqual(held, set(numbers), "all 30 are held")
+            one(1000)   # the list is re-read once: every label seen
+            self.view_reads.clear()
+            self.writes.clear()
+            for i in range(self.HOUR_PASSES):
+                if i == self.HOUR_PASSES // 2:   # retargeted: a new base, and the rule no longer holds it
+                    self.prs[100].update(baseRefOid="2" * 40, baseRef="release", files=[{"path": "docs/a.md"}])
+                one(self.PASS_SECONDS)
+            return list(self.view_reads), list(self.writes)
+
+    def test_an_hour_of_passes_over_30_held_pull_requests_costs_one_read_for_the_one_that_changed(self):
+        reads, writes = self.hour_of_passes()
+        self.assertEqual(reads, [100], "one read, for the retargeted pull request: %d reads against %d passes x 30 held" % (len(reads), self.HOUR_PASSES))
+        self.assertLessEqual(len(reads), self.HOUR_CALLS)
+        self.assertEqual(sorted(w[1].rsplit("/", 1)[-1] for w in writes if w[0] == "DELETE"), sorted(urllib.parse.quote(n, safe="") for n in self.both()), "it was released")
+        self.assertEqual([w for w in writes if w[0] != "DELETE"], [], "nothing else was written")
+
+    def test_a_base_tip_that_moves_with_the_same_base_branch_costs_no_extra_read(self):
+        """(#999, rev-2) every merge into the base moves `base.sha` of every open pull request aimed at it: the memo keys on the ref, so 30 held pull requests cost nothing."""
+        numbers = list(range(100, 100 + self.HELD))
+        for n in numbers:
+            self.prs[n] = {"headRefOid": self.HEAD, "changedFiles": 1, "files": [{"path": "shims/gh"}], "baseRefOid": "1" * 40, "labels": []}
+        held = set()
+
+        def one(advance):
+            self.passes([self.listed(n, self.both() if n in held else [], head=self.HEAD) for n in numbers], advance=advance)
+        for _ in range(40):
+            one(self.PASS_SECONDS)
+            held |= {int(w[1].split("/issues/")[1].split("/")[0]) for w in self.posts()}
+        self.assertEqual(held, set(numbers), "all 30 are held")
+        one(1000)
+        self.view_reads.clear()
+        self.writes.clear()
+        for i in range(60):   # the base's tip moves at every pass: the same branch, the same three-dot diff
+            for n in numbers:
+                self.prs[n]["baseRefOid"] = ("%040x" % (i + 2))
+            one(self.PASS_SECONDS)
+        self.assertEqual((self.view_reads, self.writes), ([], []), "a moving tip of the same base costs no read and writes nothing")
+
+    def test_a_changed_base_branch_re_judges_once_and_then_stays_quiet(self):
+        self.held_world("base")
+        self.view_reads.clear()
+        self.view("docs/a.md", base="2" * 40, ref="release")
+        self.step()
+        self.assertEqual(len(self.view_reads), 1, "the retarget: one read")
+        self.step()
+        self.step()
+        self.assertEqual(len(self.view_reads), 1, "and no more at the next passes")
+
+    def test_the_hour_fails_under_a_memo_with_no_base_and_under_a_daemon_that_judges_every_pass(self):
+        with self.assertRaises(AssertionError):   # no base in the key: the retarget is never seen, the release never comes
+            self.assert_hour(self.NO_BASE)
+        every = [0]
+
+        def fresh():
+            every[0] += 1
+            return "m%d" % every[0]
+        with self.assertRaises(AssertionError):   # the pre-memo daemon: every held pull request judged at every pass (a rule that is new at every pass)
+            self.assert_hour({"impact_floor.rule_fingerprint": fresh})
+
+    def assert_hour(self, mutant):
+        reads, writes = self.hour_of_passes(mutant)
+        self.assertEqual(reads, [100])
+        self.assertEqual(len([w for w in writes if w[0] == "DELETE"]), 2)
+
+    def test_every_releasing_kind_has_a_mutant_test(self):
+        for kind in self.RELEASING:
+            self.assertTrue(any(name.startswith("test_the_%s_row_fails" % kind) for name in dir(self)), kind)
+
+    # -- the person's label, the owner's clear, an unreadable input
+
+    def test_a_label_a_person_put_on_is_kept_when_the_base_changes(self):
+        self.held_world("base")
+        self.live_labels = self.both() + ["needs-docs"]
+        self.view("docs/a.md", base="2" * 40)
+        self.step()
+        self.assertEqual(sorted(w[1].rsplit("/", 1)[-1] for w in self.removals(9)), sorted(urllib.parse.quote(n, safe="") for n in self.both()))   # only the two labels it added
+        self.assertEqual([w for w in self.removals(9) if "needs-docs" in w[1]], [])
+
+    def test_an_owners_clear_is_not_undone_by_a_release_pass(self):
+        self.held_world("base")
+        cleared = {"head": self.HEAD, "reason": "a false hold", "by": "own", "at": 5}
+        state = json.loads((self.world.state / "impact-hold.json").read_text())
+        state["clears"][self.PRN] = cleared
+        (self.world.state / "impact-hold.json").write_text(json.dumps(state))
+        self.view("docs/a.md", base="2" * 40)
+        self.step()
+        self.assertEqual(json.loads((self.world.state / "impact-hold.json").read_text())["clears"][self.PRN], cleared)
+
+    def unreadable(self, patch, noted, passes=3):
+        self.held_world("base")
+        self.view("docs/a.md", base="2" * 40)   # the rule no longer holds, but the input that says so cannot be read
+        with patch:
+            for _ in range(passes):
+                self.step(500)
+        self.assertEqual(self.removals(9), [], "nothing released")
+        said = [e["event"] for e in self.world.audit() if e["event"] in noted]
+        self.assertTrue(said and len(said) == len(set(said)), "each said once, not at every pass: %s" % said)
+
+    def test_an_unreadable_matrix_keeps_every_label_and_says_so_once(self):
+        self.unreadable(mock.patch.object(sb.impact_floor, "rule_fingerprint", side_effect=sb.impact_floor.MatrixError("gone")), ("impact.error",))
+
+    def test_an_unreadable_record_ledger_keeps_every_label_and_says_not_checked_once(self):
+        self.unreadable(mock.patch.object(sb, "impact_records", lambda state_dir: ({}, "ledger unreadable")), ("impact.not_checked",))
+
+    def test_an_unreadable_hold_state_keeps_every_label_and_says_not_checked_once(self):
+        self.unreadable(mock.patch.object(sb, "read_impact_state", lambda state_dir: ({"clears": {}, "applied": {}}, "state unreadable")), ("impact.not_checked", "impact.state_unreadable"))
+
+    def test_the_documentation_says_when_a_hold_is_released(self):
+        text = (Path(__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
+        start = text.index("When a hold is released:")
+        paragraph = text[text.rindex("\n", 0, start):text.index("\n", start)]
+        for word in ("base branch", "matrix file", "impact review record", "rating", "draft", "gate.hold_released", "base changed", "rule changed", "record changed",
+                     "a person", "owner", "impact.not_checked", "head changed", "call budget"):
+            self.assertIn(word, paragraph)
+
+    def test_not_checked_is_said_once_for_an_episode_and_again_for_the_next(self):
+        self.held_world("base")
+        self.view("docs/a.md", base="2" * 40)
+        count = lambda: len(self.events("impact.not_checked"))
+        broken = mock.patch.object(sb, "impact_records", lambda state_dir: ({}, "ledger unreadable"))
+        with broken:
+            for _ in range(3):
+                self.step(500)
+        self.assertEqual((count(), self.removals(9)), (1, []))
+        self.step(500)   # the ledger reads again: the rule no longer holds, so it is released (the episode is over)
+        self.assertEqual(len(self.removals(9)), 2)
+        self.held_world_again()
+        with broken:
+            for _ in range(3):
+                self.step(500)
+        self.assertEqual(count(), 2, "a second episode says it once more")
+
+    def held_world_again(self):
+        """The same pull request held again at a new head, so a second episode can begin."""
+        self.HEAD = "d" * 40
+        self.view("shims/gh")
+        self.live_labels = []
+        self.step(500)
+        self.live_labels = self.both()
+        self.step(500)
+        self.view("docs/a.md", base="3" * 40)
+
+    def test_a_hold_that_still_holds_gets_no_write_and_no_audit_line_at_later_passes(self):
+        self.held_world("base")
+        before = (len(self.events("gate.would_hold")), len(self.events("gate.hold_applied")), len(self.writes))
+        for _ in range(4):
+            self.step(500)
+        self.assertEqual((len(self.events("gate.would_hold")), len(self.events("gate.hold_applied")), len(self.writes)), before, "head, rule and record unchanged: judged, kept, silent")
+        self.assertEqual((self.removals(9), self.posts(9)), ([], []))
+
+    def test_the_quiet_keep_is_what_makes_a_holding_pull_request_silent(self):
+        applied = []
+        self.held_world("base")
+        with mock.patch.object(sb, "apply_impact_hold", lambda engine, repo, number, report, record: applied.append(number) or 0):
+            for _ in range(3):
+                self.step(500)
+        self.assertEqual(applied, [], "a hold that still holds is not re-applied at a pass")
+
+    # -- the dry run reads a draft the way the pass does
+
+    def test_the_dry_run_plans_a_release_for_a_draft_that_no_longer_holds_and_nothing_for_one_that_does(self):
+        self.held_world("base")
+        self.view("docs/a.md", base="2" * 40)
+        self.prs[9]["isDraft"] = True
+        code, out, err = self.run_as("coder", "impact", "hold", "--dry-run", "--repo", "acme/app")
+        self.assertEqual(code, 0, err)
+        self.assertIn("acme/app#9  would remove", out)
+        self.view("shims/gh")
+        self.prs[9]["isDraft"] = True
+        code, out, err = self.run_as("coder", "impact", "hold", "--dry-run", "--repo", "acme/app")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("acme/app#9", out, "a draft that holds is planned nothing")
+
+    # -- the rest of the family
+
+    def test_a_repo_whose_floor_is_now_empty_still_releases_what_it_held(self):
+        self.held_world("base")
+        self.view("docs/a.md", base="2" * 40)
+        with mock.patch.object(sb.impact_floor, "floor_for", lambda repo, config=None: ([], [], [])):
+            self.step()
+        self.assertEqual(len(self.removals(9)), 2)
+
+    NO_FLOOR = staticmethod(lambda repo, config=None: ([], [], []))
+
+    def test_the_dry_run_on_a_repo_with_no_floor_and_a_record_of_ours_plans_the_release(self):
+        self.held_world("base")
+        self.view("docs/a.md", base="2" * 40)
+        with mock.patch.object(sb.impact_floor, "floor_for", self.NO_FLOOR):
+            code, out, err = self.run_as("coder", "impact", "hold", "--dry-run", "--repo", "acme/app")
+        self.assertEqual(code, 0, err)
+        self.assertIn("acme/app#9  would remove", out)
+
+    def test_the_dry_run_on_a_repo_with_no_floor_and_no_record_skips_it(self):
+        self.view("shims/gh")
+        self.live_labels = []
+        self.step(0)   # listed and judged once; labels are then ours only if a record says so
+        (self.world.state / "impact-hold.json").write_text(json.dumps({"clears": {}, "applied": {}}))
+        self.live_labels = self.both()
+        self.prs[9]["labels"] = [{"name": n} for n in self.both()]
+        before = len(self.view_reads)
+        with mock.patch.object(sb.impact_floor, "floor_for", self.NO_FLOOR):
+            code, out, err = self.run_as("coder", "impact", "hold", "--dry-run", "--repo", "acme/app")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("acme/app#9", out)
+        self.assertEqual(len(self.view_reads), before, "a repo with no floor and no record of ours is not read")
+
+    # (#999) ONE match, `applied_for_repo`, read by the pass and the dry run: a floorless repo is judged only for a well-formed record of exactly its own pull requests
+    OWN_RECORD = {"head": "a" * 40, "merge_label_added": True, "added": [], "at": 1}
+    APPLIED_ROWS = (   # (what the record is keyed by, its value or None for the real one, whether the floorless repo is judged and released)
+        ("acme/app#9", None, True),
+        ("acme/app2#9", None, False),   # the `#` ends the name: a longer repo name sharing the prefix is not ours
+        ("other/app#9", None, False),
+        ("acme/app#9", "not an object", False),   # a malformed record counts as none
+        ("acme/app#9", ["a list"], False),
+        (None, None, False),   # no record at all
+    )
+
+    def test_applied_for_repo_is_the_one_match_and_every_row_of_it_is_pinned(self):
+        for key, value, judged in self.APPLIED_ROWS:
+            applied = {} if key is None else {key: dict(self.OWN_RECORD) if value is None else value}
+            self.assertEqual(bool(sb.applied_for_repo(applied, "acme/app")), judged, (key, value))
+        self.assertEqual(sb.applied_for_repo(None, "acme/app"), set())
+        self.assertEqual(sb.applied_for_repo({"acme/app#9": {}, "acme/app#10": {}, "acme/app2#1": {}}, "acme/app"), {"acme/app#9", "acme/app#10"})
+
+    def floorless_row(self, key, value):
+        """The held world with its record replaced by the row's, and the repo's floor empty."""
+        self.held_world("base")
+        self.view("docs/a.md", base="2" * 40)
+        state = json.loads((self.world.state / "impact-hold.json").read_text())
+        real = next(iter(state["applied"].values()))
+        state["applied"] = {} if key is None else {key: real if value is None else value}
+        (self.world.state / "impact-hold.json").write_text(json.dumps(state))
+
+    def dry_run_row(self, key, value, judged):
+        self.floorless_row(key, value)
+        before = len(self.view_reads)
+        with mock.patch.object(sb.impact_floor, "floor_for", self.NO_FLOOR):
+            code, out, err = self.run_as("coder", "impact", "hold", "--dry-run", "--repo", "acme/app")
+        self.assertEqual(code, 0, err)
+        self.assertEqual("acme/app#9  would remove" in out, judged, out)
+        if not judged:
+            self.assertEqual(len(self.view_reads), before, "a repo that is not judged is not read")
+
+    def pass_row(self, key, value, judged):
+        self.floorless_row(key, value)
+        before = len(self.view_reads)
+        with mock.patch.object(sb.impact_floor, "floor_for", self.NO_FLOOR):
+            self.step()
+        self.assertEqual(len(self.removals(9)), 2 if judged else 0)
+        self.assertEqual(len(self.view_reads) > before, judged, "a pull request of a repo that is not judged is not read")
+
+    # one test per row of APPLIED_ROWS (a held world is built once per test), through the dry run AND through the pass
+    for _i, _row in enumerate(APPLIED_ROWS):
+        locals()["test_the_dry_run_floorless_row_%d" % _i] = lambda self, _row=_row: self.dry_run_row(*_row)
+        locals()["test_the_pass_floorless_row_%d" % _i] = lambda self, _row=_row: self.pass_row(*_row)
+    del _i, _row
+
+    def test_a_pull_request_no_longer_open_leaves_no_memo(self):
+        self.held_world("base")
+        self.assertIn(("acme/app", 9), self.engine.impact_basis)
+        self.assertIn(("acme/app", 9), self.engine.impact_judged_at)
+        self.passes([], advance=1000)
+        self.assertEqual((self.engine.impact_basis, self.engine.impact_judged_at), ({}, {}))
+
+    def test_the_kept_pass_refreshes_the_basis_so_a_later_release_names_the_last_base(self):
+        self.held_world("base")
+        self.view("shims/gh", base="2" * 40)   # still holds on a new base: kept
+        self.step()
+        self.assertEqual(self.removals(9), [])
+        self.view("docs/a.md", base="1" * 40)   # released on the first base again: the base DID change since the last judgement
+        self.step()
+        (line,) = self.events("gate.hold_released")
+        self.assertEqual(line["detail"]["reason"], "base changed")
+
+    def test_a_pull_request_that_went_draft_is_released_when_the_rule_no_longer_holds_it(self):
+        self.held_world("base")
+        self.view("docs/a.md", base="2" * 40)
+        self.passes([self.listed(9, self.both(), head=self.HEAD, draft=True)], advance=1000)
+        self.assertEqual(len(self.removals(9)), 2)
+
+    def test_a_draft_that_still_holds_keeps_its_labels(self):
+        self.held_world("base")
+        self.passes([self.listed(9, self.both(), head=self.HEAD, draft=True)], advance=1000)
+        self.assertEqual((self.removals(9), self.posts(9)), ([], []))
+
+    def test_the_dry_run_and_the_pass_decide_the_same_after_a_base_change(self):
+        self.held_world("base")
+        self.view("docs/a.md", base="2" * 40)
+        code, out, err = self.run_as("coder", "impact", "hold", "--dry-run", "--repo", "acme/app")
+        self.assertEqual(code, 0, err)
+        self.assertIn("acme/app#9  would remove", out)
+        self.step()
+        self.assertEqual(len(self.removals(9)), 2)
+
+    def retarget(self, number, path):
+        """A new base and the diff of it: the head is unchanged, so only the base in the list tells the pass (#999)."""
+        self.prs[number] = dict(self.prs[number], files=[{"path": path}], baseRefOid="2" * 40, baseRef="release")
+
+    def test_fresh_judgement_stays_inside_the_pass_budget_and_the_oldest_judged_goes_first(self):
+        self.extra_config = dict(self.extra_config, impact_hold={"enabled": True, "calls_per_pass": 3})
+        self.configure()
+        for n in range(9, 14):
+            self.files(n, "shims/gh")
+        self.live_labels = {}
+        records = [self.listed(n) for n in range(9, 14)]
+        self.passes(records)
+        self.passes([self.listed(n, self.both()) for n in range(9, 14)], advance=1000)
+        self.passes([self.listed(n, self.both()) for n in range(9, 14)], advance=1000)
+        before = len(self.view_reads)
+        self.passes([self.listed(n, self.both()) for n in range(9, 14)], advance=1000)
+        self.assertLessEqual(len(self.view_reads) - before, 3)
+        for n in range(9, 14):
+            self.retarget(n, "docs/a.md")
+        for _ in range(6):   # a release spends its read and its removals, so one a pass: every one of the five is reached
+            reads, deletes = len(self.view_reads), len(self.removals())
+            self.passes([self.listed(n, self.both()) for n in range(9, 14)], advance=1000)
+            # THE BOUND: a release is allowed PAST the pass's budget (calls_per_pass 3), but only by its own 1 read and 2 removals, and no second one starts: so one
+            # judgement read and at most 2 DELETEs a pass, never more
+            self.assertLessEqual(len(self.view_reads) - reads, 1)
+            self.assertLessEqual(len(self.removals()) - deletes, 2)
+        self.assertEqual(len({w[1].split("/")[4] for w in self.removals()}), 5)
+        self.assertEqual(len(self.removals()), 10, "two labels each, none twice")
+
+
+    def test_a_due_release_not_reached_waits_and_the_one_judged_longest_ago_goes_first(self):
+        self.extra_config = dict(self.extra_config, impact_hold={"enabled": True, "calls_per_pass": 1})
+        self.configure()
+        for n in (9, 10, 11):
+            self.files(n, "shims/gh")
+        forward = lambda: [self.listed(n, self.both()) for n in (9, 10, 11)]
+        backward = lambda: [self.listed(n, self.both()) for n in (11, 10, 9)]
+        self.seed_applied([9, 10, 11])
+        for _ in range(3):   # a budget of one read a pass: 9, then 10, then 11 is judged (all still hold: kept)
+            self.passes(forward(), advance=1000)
+        self.assertEqual((self.posts(), self.removals()), ([], []))
+        for n in (9, 10, 11):
+            self.retarget(n, "docs/a.md")
+        order = []
+        for _ in range(3):   # all three are due; the list now comes back in the other order, and a release is one a pass
+            before = len(self.removals())
+            self.passes(backward(), advance=1000)
+            order += sorted({w[1].split("/")[4] for w in self.removals()[before:]})
+        self.assertEqual(order, ["9", "10", "11"], "one release a pass, the one judged longest ago first (not the list's order)")
+
+
+    # -- a release whose write FAILS part way (every step of the release): the record is kept, no `gate.hold_released` line, the next pass removes only what remains
+    fault = None   # (step, the failing call's ordinal among the DELETEs) set by a test
+
+    def route(self, argv, **kwargs):
+        step = self.fault
+        if step and argv[0] == FAKE_GH:
+            failed = subprocess.CompletedProcess(argv, 1, "", "HTTP 500: server error")
+            if step == "read" and argv[1:3] == ["pr", "view"] and "files" not in argv[-1] and int(argv[3]) == 9:
+                return failed   # the release's own read of the labels (the floor read asks for the files)
+            if "--method" in argv and argv[argv.index("--method") + 1] == "DELETE":
+                self.deletes_tried = getattr(self, "deletes_tried", 0) + 1
+                if (step, self.deletes_tried) in (("delete1", 1), ("delete2", 2)):
+                    return failed
+        return super().route(argv, **kwargs)
+
+    RELEASE_STEPS = ("read", "delete1", "delete2", "state")   # every step of `release_impact_hold` that can fail: the one table the rows and the mutants derive from
+
+    def failed_release(self, step, mutate=False, extra=None):
+        extra = dict(extra or {})
+        self.list_has_base = True
+        with contextlib.ExitStack() as stack:
+            self.held_world("base")
+            self.live_labels = self.both() + ["needs-docs"]   # a label of a person: never in the record, never touched
+            self.view("docs/a.md", base="2" * 40)
+            self.deletes_tried = 0
+            self.fault = step
+            if step == "state":
+                stack.enter_context(mock.patch.object(sb, "write_impact_state", mock.Mock(side_effect=OSError("disk full"))))
+            for target, replacement in dict(self.release_mutant(step) if mutate else {}, **extra).items():   # after the fault: a mutant wraps the failing call
+                stack.enter_context(mock.patch.object(sb, target, replacement))
+            self.step()
+            self.fault = None
+            kept = json.loads((self.world.state / "impact-hold.json").read_text())["applied"]
+            self.assertIn(self.PRN, kept, "%s failed: the record is KEPT" % step)
+            self.assertEqual(self.events("gate.hold_released"), [], "%s failed: nothing is audited as released" % step)
+            done = sorted(w[1].rsplit("/", 1)[-1] for w in self.removals(9))
+            gone = {"read": [], "delete1": [], "delete2": [urllib.parse.quote(self.names["hold-impact"], safe="")], "state": sorted(urllib.parse.quote(n, safe="") for n in self.both())}[step]
+            self.assertEqual(done, gone, "%s failed: only what was removed before it" % step)
+            self.writes.clear()
+            self.live_labels = [n for n in self.both() + ["needs-docs"] if urllib.parse.quote(n, safe="") not in gone]   # what is left on the pull request now
+            stack.close()   # the failure is over: no mutant, no patched write
+        self.view("docs/a.md", base="2" * 40)
+        self.step(1000)   # past the retry backoff
+        left = sorted(w[1].rsplit("/", 1)[-1] for w in self.removals(9))
+        self.assertEqual(left, sorted(urllib.parse.quote(n, safe="") for n in self.both() if urllib.parse.quote(n, safe="") not in gone), "the next pass removes only what REMAINS, and never the person's label")
+        (line,) = self.events("gate.hold_released")
+        self.assertEqual(self.PRN in json.loads((self.world.state / "impact-hold.json").read_text())["applied"], False, "now the record is gone")
+
+    def release_mutant(self, step):
+        """One mutant a step: the release that goes on as if the step had worked, so it drops the record and audits the release anyway."""
+        def swallow(real):
+            def wrapper(*args, **kwargs):
+                try:
+                    return real(*args, **kwargs)
+                except Exception:
+                    return None
+            return wrapper
+        if step == "read":
+            real = sb.read_pr_json
+
+            def read(engine, repo, number, extra_fields=""):
+                try:
+                    return real(engine, repo, number, extra_fields)
+                except Exception:   # a failed read taken as "both labels are still there, at the head judged"
+                    return {"headRefOid": self.HEAD, "labels": [{"name": n} for n in self.both()]}
+            return {"read_pr_json": read}
+        if step == "state":
+            return {"write_impact_state": swallow(sb.write_impact_state)}
+        return {"change_issue_labels": swallow(sb.change_issue_labels)}   # delete1 and delete2: the first or the second DELETE failed, and the release went on
+
+    def test_a_release_that_removes_a_label_outside_its_record_fails_the_failure_rows(self):
+        everything = {"_labels_ours": lambda names, state, pr: self.both() + ["needs-docs"]}
+        with self.assertRaises(AssertionError):
+            self.failed_release("state", extra=everything)   # every DELETE goes through here, so a label outside the record would show
+
+
+def _failed_release_rows():
+    for step in TestImpactReleaseEveryPass.RELEASE_STEPS:
+        def row(self, step=step):
+            self.failed_release(step)
+
+        def mutant(self, step=step):
+            with self.assertRaises(AssertionError):
+                self.failed_release(step, mutate=True)
+        setattr(TestImpactReleaseEveryPass, "test_a_release_that_fails_at_%s_keeps_the_record_and_the_next_pass_finishes_it" % step, row)
+        setattr(TestImpactReleaseEveryPass, "test_the_%s_failure_row_fails_when_the_release_goes_on_after_it" % step, mutant)
+
+
+_failed_release_rows()
+
+
+def _reason_mutant_test(kind):
+    def test(self):
+        self.mutant_fails(kind, self.REASON_BLIND)
+    test.__name__ = "test_the_%s_row_fails_when_the_release_never_says_what_changed" % kind
+    return test
+
+
+for _kind in TestImpactReleaseEveryPass.RELEASING:
+    _t = _reason_mutant_test(_kind)
+    setattr(TestImpactReleaseEveryPass, _t.__name__, _t)
+
+
+for _name in list(vars(TestImpactRejudge)):   # the subclass reuses the harness, not the tests
+    if _name.startswith("test") and _name not in vars(TestImpactReleaseEveryPass):
+        setattr(TestImpactReleaseEveryPass, _name, None)
+
+
 class TestImpactHold(LedgerBase):
     """#179 slice L4: the switchboard WRITES the hold (two labels), only when `impact_hold.enabled`, only for repos under `plan_gates`, head-bound
     owner clear, kill switches, idempotent, bounded. A fake gh records every write."""
@@ -47793,6 +48457,7 @@ USE_COMMANDS = {
     "bootstrap": ["bootstrap"], "notice": ["notice", "pr", "acme/api#7", "--from", "coder"],
     "move": ["move", "1", "--to", "2", "--from", "coder"], "reassign": ["reassign", "coder", "--undo", "--from", "coder"],
     "charter": ["charter", "set", "coder", "1", "--from", "coder"],
+    "resume": ["resume", "other"],
 }
 
 
@@ -85604,6 +86269,345 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
                 self.assertIn(str(path.relative_to(BIN.parent)), DERIVED_VIEWS, "%s reads an old agent list: read the registry or list it as derived" % path)
 
 
+class TestResume(Base):
+    """#1110: ONE audited `resume AGENT` command and ONE shared function (`resume_ended_turn`) that the blocked-report pass also calls."""
+    COMMAND = "fleet-switchboard resume coder"
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={})
+        for name, fleet in (("cos", {"role": "chief-of-staff"}), ("platform", {"role": "orchestrator", "reports_to": "cos"}),
+                            ("coder", {"role": "coder", "reports_to": "platform"})):
+            self.world.add_agent(name, fleet=fleet)
+        self.pane = self.world.herdr.panes[self.world.panes["coder"]]
+        self.sid = self.world.sessions["coder"]
+        self.pane["status"] = "blocked"   # the terminal shows an ended turn as blocked
+        os.environ[sb.LAB_ENV] = "1"
+
+    def cli(self, *argv):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        with captured() as (out, err):
+            code = sb.main(["resume"] + list(argv), runner=self.world.route, now=self.world.clock.now)
+        return code, out.getvalue(), err.getvalue()
+
+    def resumes(self):
+        return [a for a in self.world.admissions("coder") if a["text"] == sb.RESUME_TEXT]
+
+    def audited(self):
+        return [e for e in self.world.audit() if e["event"] == "resume"]
+
+    def provider_error(self, text="HTTP 499 client closed request"):
+        self.world.v2.sessions[self.sid]["messages"].append({"id": "msg_err1", "type": "assistant", "error": {"type": "provider", "message": text}})
+
+    def test_an_agent_with_an_ended_turn_is_sent_the_resume_text_once_with_one_audit_line(self):
+        code, out, err = self.cli("coder", "--from", "cos", "--reason", "a provider error stopped it")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.resumes()), 1)
+        (line,) = self.audited()
+        self.assertEqual(line["subject"], "coder")
+        self.assertEqual(line["detail"]["by"], "cos")
+        self.assertIn("provider error", line["detail"]["reason"])
+
+    def test_a_working_session_is_refused_and_nothing_is_sent(self):
+        self.pane["status"] = "working"
+        code, _, err = self.cli("coder", "--from", "cos")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertIn("working", err)
+        self.assertEqual((self.resumes(), self.audited()), ([], []))
+
+    def test_an_open_permission_request_is_refused_and_goes_to_the_owner(self):
+        self.world.v2.ask_permission(self.sid)
+        code, _, err = self.cli("coder", "--from", "cos")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertIn("owner", err)
+        self.assertIn("permission request", err)
+        self.assertEqual((self.resumes(), self.audited()), ([], []))
+
+    def test_an_open_question_is_refused_and_goes_to_the_owner(self):
+        self.world.v2.ask_form(self.sid)
+        code, _, err = self.cli("coder", "--from", "cos")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertIn("question", err)
+        self.assertEqual((self.resumes(), self.audited()), ([], []))
+
+    def test_a_second_resume_inside_ten_minutes_is_refused_and_one_after_it_is_sent(self):
+        self.assertEqual(self.cli("coder", "--from", "cos")[0], 0)
+        self.world.tick(300)
+        code, _, err = self.cli("coder", "--from", "cos")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertIn("one resume per agent per 10 minutes", err)
+        self.assertEqual((len(self.resumes()), len(self.audited())), (1, 1))
+        self.world.tick(400)
+        self.assertEqual(self.cli("coder", "--from", "cos")[0], 0)
+        self.assertEqual((len(self.resumes()), len(self.audited())), (2, 2))
+
+    def test_an_unknown_agent_is_refused(self):
+        code, _, err = self.cli("nobody", "--from", "cos")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertIn("nobody", err)
+
+    def test_the_help_the_report_and_the_docs_name_one_command_spelling(self):
+        (action,) = [a for a in sb.build_parser()._actions if a.__class__.__name__ == "_SubParsersAction"]
+        help_text = " ".join(action.choices["resume"].format_help().split())
+        docs = " ".join((REPO / "docs" / "switchboard.md").read_text().split())
+        report = sb.ended_turn_text("coder", False)
+        spellings = set()
+        for text in (help_text, docs, report):
+            self.assertIn("fleet-switchboard resume", text)
+            spellings |= set(re.findall(r"fleet-switchboard resume", text))
+        self.assertEqual(spellings, {"fleet-switchboard resume"})
+        self.assertNotIn("one `poke`", docs)
+        self.assertNotIn("one `poke`", report)
+
+    # -- the blocked report and the automatic first recovery
+
+    def block(self):
+        self.world.engine.send("platform", "coder", "message for the blocked coder")
+        self.world.tick(90)
+        self.passes()
+
+    def passes(self):
+        self.world.engine.run_pass()
+        self.world.engine.run_pass()
+
+    def wait(self, minutes):
+        self.world.tick(minutes * 60)
+        self.passes()
+
+    def told(self):
+        return [t for t in self.world.admissions("cos") if "Blocked agent" in t["text"]]
+
+    def test_the_report_of_an_ended_turn_names_the_real_command_with_the_agents_name(self):
+        self.block()
+        self.wait(25)
+        (found,) = self.told()
+        self.assertIn(self.COMMAND, found["text"])
+        self.assertNotIn("poke", found["text"])
+        self.assertEqual(self.resumes(), [], "no provider error in the turn: not resumed by the pass")
+
+    def test_the_report_of_an_open_request_says_only_the_owner_can_resume_it_and_names_no_command(self):
+        self.world.v2.ask_permission(self.sid)
+        self.block()
+        self.wait(25)
+        (found,) = self.told()
+        self.assertIn("owner", found["text"])
+        self.assertEqual(found["text"].count("fleet-switchboard resume"), 0)
+
+    def test_a_provider_error_is_resumed_once_before_the_report_and_the_report_says_so(self):
+        self.provider_error()
+        self.block()
+        self.wait(25)
+        self.assertEqual(len(self.resumes()), 1)
+        (line,) = self.audited()
+        self.assertEqual(line["detail"]["by"], "switchboard")
+        self.assertIn("499", line["detail"]["reason"])
+        (found,) = self.told()
+        self.assertIn("resumed", found["text"])
+        self.wait(5)
+        self.assertEqual(len(self.resumes()), 1, "the second pass does not resume again")
+
+    def test_each_provider_error_form_is_recognised_and_another_error_is_not_resumed(self):
+        for text, count in (("read ECONNRESET", 1), ("the request timed out", 1), ("invalid api key", 0)):
+            with self.subTest(error=text):
+                for kept in (sb.RESUME_STATE, sb.BLOCKED_ALERT_STATE, sb.BLOCKED_HELD_SENDS):   # one world per error: nothing of the last one's records
+                    (sb.ensure_state_dir() / kept).unlink() if (sb.ensure_state_dir() / kept).exists() else None
+                world = World(self, agents=(), config={})
+                for name, fleet in (("cos", {"role": "chief-of-staff"}), ("coder", {"role": "coder", "reports_to": "cos"})):
+                    world.add_agent(name, fleet=fleet)
+                world.herdr.panes[world.panes["coder"]]["status"] = "blocked"
+                world.v2.sessions[world.sessions["coder"]]["messages"].append({"id": "msg_e", "type": "assistant", "error": {"message": text}})
+                world.engine.send("cos", "coder", "held message")
+                world.tick(90)
+                world.engine.run_pass()
+                world.tick(25 * 60)
+                world.engine.run_pass()
+                world.engine.run_pass()
+                self.assertEqual(len([a for a in world.admissions("coder") if a["text"] == sb.RESUME_TEXT]), count)
+
+    def test_a_second_stop_inside_ten_minutes_is_reported_as_before_without_a_resume(self):
+        self.provider_error()
+        self.assertEqual(self.cli("coder", "--from", "cos")[0], 0)   # a resume a few minutes ago
+        self.provider_error()
+        self.world.engine.send("platform", "coder", "message for the blocked coder")
+        self.world.tick(60)
+        with mock.patch.object(sb, "RESUME_SECONDS", 3600):   # the stop is reported 25 minutes in; the window of the first resume is still open
+            self.passes()
+            self.wait(25)
+        self.assertEqual(len(self.resumes()), 1)
+        (found,) = self.told()
+        self.assertNotIn("resumed it once just now", found["text"])
+        self.assertIn(self.COMMAND, found["text"])
+
+    def test_the_pass_does_not_resume_an_agent_with_an_open_request_or_a_working_session(self):
+        self.provider_error()
+        self.world.v2.ask_permission(self.sid)
+        self.block()
+        self.wait(25)
+        self.assertEqual(self.resumes(), [])
+        self.assertEqual(self.audited(), [])
+
+    # -- every refusal and failure branch of `resume_ended_turn` (#1110, R-TEST-5): a row per branch, derived from the code by `test_every_branch_has_a_row`
+
+    def stamp(self):
+        path = Path(str(self.world.state)) / sb.RESUME_STATE
+        return json.loads(path.read_text()) if path.exists() else {}
+
+    def no_effect(self, code, err, line):
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertIn(line, err)
+        self.assertEqual((self.resumes(), self.audited(), self.stamp()), ([], [], {}), "a refused resume sends, audits and stamps nothing")
+
+    def after_reobserve(self, change):
+        real = sb.Switchboard.reobserve
+
+        def reobserve(engine, previous, now):
+            seen, why = real(engine, previous, now)
+            return change(seen, why)
+        return mock.patch.object(sb.Switchboard, "reobserve", reobserve)
+
+    def test_branch_unknown_agent(self):
+        self.no_effect(*(lambda r: (r[0], r[2], "nobody not found"))(self.cli("nobody", "--from", "cos")))
+
+    def test_branch_the_agent_cannot_be_read_again(self):
+        with self.after_reobserve(lambda seen, why: (None, "pane p9 of coder cannot be read: gone")):
+            self.no_effect(*(lambda r: (r[0], r[2], "cannot be read: gone"))(self.cli("coder", "--from", "cos")))
+
+    def test_branch_an_agent_claimed_by_two_sessions(self):
+        def change(seen, why):
+            seen.conflict = ["ses_other"]
+            return seen, why
+        with self.after_reobserve(change):
+            self.no_effect(*(lambda r: (r[0], r[2], "claimed by more than one session"))(self.cli("coder", "--from", "cos")))
+
+    def test_branch_an_agent_with_a_problem(self):
+        def change(seen, why):
+            seen.problem = "coder runs the wrong program"
+            return seen, why
+        with self.after_reobserve(change):
+            self.no_effect(*(lambda r: (r[0], r[2], "wrong program"))(self.cli("coder", "--from", "cos")))
+
+    def test_branch_a_working_session(self):
+        self.pane["status"] = "working"
+        self.no_effect(*(lambda r: (r[0], r[2], "nothing is sent to a session that is working"))(self.cli("coder", "--from", "cos")))
+
+    def test_branch_a_status_that_is_not_an_ended_turn(self):
+        def change(seen, why):
+            seen.status = "unknown"
+            return seen, why
+        with self.after_reobserve(change):
+            self.no_effect(*(lambda r: (r[0], r[2], "only an ended turn is resumed"))(self.cli("coder", "--from", "cos")))
+
+    def test_branch_v2_unreachable_fails_closed(self):
+        with mock.patch.object(sb.V2Client, "permission_list", side_effect=sb.V2Error("down")):
+            self.no_effect(*(lambda r: (r[0], r[2], "an open request cannot be ruled out"))(self.cli("coder", "--from", "cos")))
+
+    def test_branch_an_open_request_or_question(self):
+        self.world.v2.ask_permission(self.sid)
+        self.no_effect(*(lambda r: (r[0], r[2], "an open permission request: that goes to the owner"))(self.cli("coder", "--from", "cos")))
+
+    def test_branch_a_second_resume_inside_the_window_and_at_its_edge(self):
+        self.assertEqual(self.cli("coder", "--from", "cos")[0], 0)
+        stamped = self.stamp()
+        self.world.tick(sb.RESUME_SECONDS - 1)
+        code, _, err = self.cli("coder", "--from", "cos")
+        self.assertEqual(code, sb.EXIT_HELD, err)
+        self.assertIn("one resume per agent per 10 minutes", err)
+        self.assertEqual((len(self.resumes()), len(self.audited()), self.stamp()), (1, 1, stamped))
+        self.world.tick(1)   # exactly RESUME_SECONDS after the first: allowed again
+        self.assertEqual(self.cli("coder", "--from", "cos")[0], 0)
+        self.assertEqual(len(self.resumes()), 2)
+
+    def test_branch_a_send_that_fails_rolls_the_stamp_back_and_a_retry_works(self):
+        with mock.patch.object(sb.V2Client, "synthetic", side_effect=sb.V2Error("send failed")):
+            with self.assertRaises(sb.V2Error):
+                sb.resume_ended_turn(self.world.new_engine("cli"), "cos", "coder", None)
+        self.assertEqual((self.resumes(), self.audited(), self.stamp()), ([], [], {}))
+        self.assertEqual(self.cli("coder", "--from", "cos")[0], 0, "the failed send did not use up the window")
+        self.assertEqual((len(self.resumes()), len(self.audited())), (1, 1))
+
+    def test_branch_a_failed_send_restores_an_older_stamp(self):
+        self.assertEqual(self.cli("coder", "--from", "cos")[0], 0)
+        older = self.stamp()
+        self.world.tick(sb.RESUME_SECONDS + 5)
+        with mock.patch.object(sb.V2Client, "synthetic", side_effect=sb.V2Error("send failed")):
+            with self.assertRaises(sb.V2Error):
+                sb.resume_ended_turn(self.world.new_engine("cli"), "cos", "coder", None)
+        self.assertEqual(self.stamp(), older)
+
+    def test_an_audit_write_that_fails_after_the_send_keeps_the_stamp_so_the_agent_is_not_resumed_twice(self):
+        with mock.patch.object(sb.AuditLog, "append", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                sb.resume_ended_turn(self.world.new_engine("cli"), "cos", "coder", None)
+        self.assertEqual(len(self.resumes()), 1)
+        self.assertIn("coder", self.stamp())
+        code, _, err = self.cli("coder", "--from", "cos")
+        self.assertEqual(code, sb.EXIT_HELD, "%s %s" % (err, self.stamp()))
+        self.assertEqual(len(self.resumes()), 1)
+
+    BRANCH_TESTS = {   # a marker of the branch's source -> the test that drives it
+        "discovery.missing(name)": "test_branch_unknown_agent",
+        "raise ResumeRefused(why)": "test_branch_the_agent_cannot_be_read_again",
+        "claimed by more than one session": "test_branch_an_agent_claimed_by_two_sessions",
+        "nothing is sent to a session that is working": "test_branch_a_working_session",
+        "only an ended turn is resumed": "test_branch_a_status_that_is_not_an_ended_turn",
+        "an open request cannot be ruled out": "test_branch_v2_unreachable_fails_closed",
+        "that goes to the owner, nothing is sent": "test_branch_an_open_request_or_question",
+        "one resume per agent per": "test_branch_a_second_resume_inside_the_window_and_at_its_edge",
+        "except Exception": "test_branch_a_send_that_fails_rolls_the_stamp_back_and_a_retry_works",
+    }
+
+    def test_every_branch_has_a_row(self):
+        text = SWITCHBOARD.read_text()
+        tree = ast.parse(text)
+        (func,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "resume_ended_turn"]
+        branches = []
+        for node in ast.walk(func):
+            if isinstance(node, ast.Raise) and "ResumeRefused" in ast.get_source_segment(text, node):
+                branches.append(ast.get_source_segment(text, node))
+            elif isinstance(node, ast.ExceptHandler) and not any(isinstance(n, ast.Raise) and "ResumeRefused" in ast.get_source_segment(text, n) for n in ast.walk(node)):
+                branches.append("except " + ast.get_source_segment(text, node.type))
+        self.assertGreaterEqual(len(branches), 9)
+        for branch in branches:
+            hits = [marker for marker in self.BRANCH_TESTS if marker in branch]
+            self.assertTrue(hits, "a branch of resume_ended_turn has no test row: %s" % branch)
+        for test in self.BRANCH_TESTS.values():
+            self.assertTrue(hasattr(self, test), test)
+        for kind in ("seen.conflict or seen.problem",):
+            self.assertIn(kind, text)
+
+    # -- the mutants: each is a copy of the code with one line changed, and the named test must fail on it
+
+    MUTANTS = {
+        "resumes a working agent": ('if seen.status == "working":', 'if False:', "test_a_working_session_is_refused_and_nothing_is_sent"),
+        "skips the open request check": ('if kinds:\n        raise ResumeRefused', 'if False:\n        raise ResumeRefused', "test_an_open_permission_request_is_refused_and_goes_to_the_owner"),
+        "skips the audit": ('if engine.audit is not None:\n        engine.audit.append(engine.actor, "resume"', 'if False:\n        engine.audit.append(engine.actor, "resume"', "test_an_agent_with_an_ended_turn_is_sent_the_resume_text_once_with_one_audit_line"),
+        "ignores the rate limit": ('if _is_number(last) and now - last < RESUME_SECONDS:', 'if False:', "test_a_second_resume_inside_ten_minutes_is_refused_and_one_after_it_is_sent"),
+        "keeps the stamp after a failed send": ('        blocked_update(engine.state_dir, RESUME_STATE, lambda s: dict(s, **{name: {"at": taken["last"]}}) if _is_number(taken["last"]) else {k: v for k, v in s.items() if k != name})', '        pass', "test_branch_a_send_that_fails_rolls_the_stamp_back_and_a_retry_works"),
+        "resumes when v2 is unreachable": ('raise ResumeRefused("v2 unreachable, so an open request cannot be ruled out: %s" % _one_line(str(err), 120)) from None', 'opened = []', "test_branch_v2_unreachable_fails_closed"),
+        "resumes an unreadable agent": ('    if seen is None:\n        raise ResumeRefused(why)', '    if False:\n        raise ResumeRefused(why)', "test_branch_the_agent_cannot_be_read_again"),
+        "resumes a conflicted agent": ('if seen.conflict or seen.problem:', 'if False:', "test_branch_an_agent_claimed_by_two_sessions"),
+        "resumes a status that is no ended turn": ('if seen.status not in ("idle", "blocked", "working"):', 'if False:', "test_branch_a_status_that_is_not_an_ended_turn"),
+        "resumes an unknown agent": ('    if seen is None:\n        raise ResumeRefused(discovery.missing(name))', '    if False:\n        raise ResumeRefused(discovery.missing(name))', "test_branch_unknown_agent"),
+        "window edge off by one": ('now - last < RESUME_SECONDS', 'now - last <= RESUME_SECONDS', "test_branch_a_second_resume_inside_the_window_and_at_its_edge"),
+        "resumes twice": ('        resume_ended_turn(engine, "switchboard", seen.name,', '        resume_ended_turn(engine, "switchboard", seen.name, "x", discovery)\n        resume_ended_turn(engine, "switchboard", seen.name,', "test_a_provider_error_is_resumed_once_before_the_report_and_the_report_says_so"),
+        "resumes a non-provider error": ('found = PROVIDER_ERROR.search(error)', 'found = re.search("", error)', "test_each_provider_error_form_is_recognised_and_another_error_is_not_resumed"),
+    }
+
+    def test_every_mutant_is_killed_by_its_named_test(self):
+        text = SWITCHBOARD.read_text()
+        for name, (old, new, test) in sorted(self.MUTANTS.items()):
+            with self.subTest(mutant=name):
+                self.assertEqual(text.count(old), 1, old)
+                module = types.ModuleType("t_fleet_switchboard_resume_mutant")   # compiled here, never through the loader: its bytecode cache would hold the mutant
+                module.__file__ = str(SWITCHBOARD)
+                sys.modules[module.__name__] = module
+                self.addCleanup(sys.modules.pop, module.__name__, None)
+                exec(compile(text.replace(old, new), str(SWITCHBOARD), "exec"), module.__dict__)
+                with mock.patch.dict(globals(), {"sb": module}):
+                    result = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.TestSuite([TestResume(test)]))
+                self.assertTrue(result.failures or result.errors, "the mutant %r survives %s" % (name, test))
+
+
 class TestBlockedReport(Base):
     """A blocked agent with messages held for it is reported to its boss and the Chief of Staff (docs/switchboard.md, "A blocked agent is reported")."""
 
@@ -85697,12 +86701,13 @@ class TestBlockedReport(Base):
         self.assertIn("owner", found["text"])
         self.assertNotIn("poke", found["text"])
 
-    def test_an_ended_turn_with_nothing_open_says_the_chief_of_staff_may_poke_once(self):
+    def test_an_ended_turn_with_nothing_open_names_the_resume_command_with_the_agents_name(self):
         self.block()
         self.wait(25)
         (found,) = self.told("cos")
         self.assertIn("ended turn", found["text"])
-        self.assertIn("poke", found["text"])
+        self.assertIn("fleet-switchboard resume coder", found["text"])
+        self.assertNotIn("poke", found["text"])
 
     def test_the_alert_can_be_set_or_turned_off(self):
         self.assertEqual(sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "blocked_alert": {"minutes": 5}})["blocked_alert"],
@@ -86128,8 +87133,8 @@ BLOCKED_GUARD_KILLERS = {
     'validate_blocked_alert_config:unknown': 'test_blocked_alert_is_a_known_config_key_and_an_unknown_key_inside_it_is_warned_about',
     'validate_blocked_alert_config:not _is_number(section[key]) or section[key] <= 0': 'test_the_alert_can_be_set_or_turned_off',
     'blocked_alert_section:raw is False': 'test_a_block_that_ends_with_messages_still_held_says_so',
-    'blocked_kind:source is None': 'test_an_ended_turn_with_nothing_open_says_the_chief_of_staff_may_poke_once',
-    'blocked_kind:kinds': 'test_an_ended_turn_with_nothing_open_says_the_chief_of_staff_may_poke_once',
+    'blocked_kind:source is None': 'test_an_ended_turn_with_nothing_open_names_the_resume_command_with_the_agents_name',
+    'blocked_kind:kinds': 'test_an_ended_turn_with_nothing_open_names_the_resume_command_with_the_agents_name',
     'blocked_kind:k == "permission"': 'test_the_kind_of_block_for_each_open_request_and_when_it_was_not_read',
     'blocked_update:new is None': 'test_a_block_that_ends_with_messages_still_held_says_so',
     'note_held_send:state_dir is None or observation is None or observation.status != "blocked" or hold_reason(observation) is None': 'test_a_block_that_ends_with_messages_still_held_says_so',
