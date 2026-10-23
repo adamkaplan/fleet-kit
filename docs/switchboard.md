@@ -5383,6 +5383,31 @@ Agents leave scratch in the opencode temp directory (the system temp directory's
 
 **Working reports with no movement (#811).** A coder or tester (never on a charter) whose last consecutive reports were all `working` for `stalled_working_hours` (default 2) while nothing it owns moved wakes its boss once, with `no movement for <time> on <ref> (worker <name>, <N> working reports; last: <line>)`; the worker is never nagged. Movement is the pull request's head and updated time and the issue's updated time, as the daemon already holds them (no GitHub call). No wake while a reminder naming the issue is due later, a check at the head is running, the ask or the pull request carries an awaiting label, the last report is `blocked` or `question`, or a human decision for the pull request exists. It judges only when the open-PR list, the issue list and the decision list were read whole. One wake per stretch; a second only after the head or an updated time moves and it stalls again. Limits, stated: the rule is inert for a repository outside `plan_gates` (that is what keeps the open-PR list, marked `pulls:<repo>` in the read-whole registry only by that pass) and when the triage issue list is off; an open-PR list read more than 20 minutes ago is not judged; the check-running guard sees checks only for a pull request the daemon examined, which is one with a `PLAN:` link; when several open pull requests name the issue, the newest-moved one is judged; an idle worker is the idle-at-a-seam rule's alone (never woken a second time here); a daemon restart forgets which head it saw change, so one repeat wake is possible after a restart.
 
+## The impact brief and who decides (#1215)
+
+### Cause (from the recorded case)
+
+The owner declined to approve a change only because it touched a path on the matrix, with no reason why it was his. Four places said only the path rule: `impact floor` (`owner_decide` in `bin/impact_floor.py` builds each hold reason as a bare path string; `pr_floor_report` and `cmd_impact_floor` print it), the daemon's hold line (`_apply_impact_hold_locked` in `bin/impact_hold.py` repeats that report), `delegated_clear` (`who_can_clear`, `refusal_items` and `judge` in `bin/delegated_clear.py`: the ceiling was the rating label and the path class) and the matrix (the `delegated_clear` block of `docs/review-laws/impact-matrix.json`: `never_path_classes`, `top_tier_review_classes`). None said what the change can do.
+
+A held pull request carries an **impact brief**: one screen the floor builds from the diff and the records (never from the PR's own text alone). It says what the change can do,
+what it widens or removes, whether it can be undone, whether it touches spend or a credential or speaks for the owner, the evidence (reads at the head, CI, mutants, blast radius)
+and a recommended decider with ONE sentence why. A piece it cannot read is printed `not shown`, never filled, and recommends the owner.
+
+Who decides what:
+
+- **Chief of Staff** decides, on the substance of the brief, every pull request whose brief names no material risk, including a path class that was owner-only before. Such a
+  pull request is advisory: it gets no owner-hold label and the Decisions list shows it as advisory for the Chief of Staff, with the one-sentence why.
+- **Owner** decides when the brief names a material risk, or any piece is `not shown`.
+
+What is escalated to the owner: credentials or issuance widened, spend, irreversible, speaks for the owner (a closed list of four).
+
+The mechanical backstops do not change: no self-clear, no author-clear, two independent reads at the head for a machinery path, a clear bound to its exact head, a push voids it.
+A clear the Chief of Staff records carries its brief, the brief's hash and its reasons in the audit line; a clear with no brief or a differing brief is refused.
+
+The held-body check (G6b) requires a line `Rationale: <one sentence>` right after the opening lines of a held body, and the Decisions list row shows that sentence.
+
+Rationale: the owner's order of 23 October (with that of 22 October): a clear request leads with the rationale; the Chief of Staff applies the judgement, and the owner's clear is only for what might matter.
+
 ## Batching: the integration branch and the batch pull request (#834)
 
 Typical work reaches the default branch in batches, so the owner clears one pull request per repository and can test a whole batch in one stack. This section is the procedure; it changes no gate, no hold and no workflow. It applies only to a repository that has an `integration` branch: batching is opt-in per repository, the Chief of Staff's lane creates the branch (`git push origin origin/<default>:refs/heads/integration`, once, with the owner's word), and a repository without it merges as today.
@@ -5479,28 +5504,3 @@ Cause: `Engine._discover` calls `agent_list` on every pass. With no herdr that c
 The config key `no_multiplexer` (default `false`, so nothing changes) turns that off. With `"no_multiplexer": true` discovery reads the registry and the headless and cloud records only: `agent_list` is never called, no "herdr unreachable" problem is recorded, and the agents input is whole when those records were read without error. The one-time bell migration stays pending. Agents with no pane get no badge, no pane read and no pane delivery, and that is no error. With the key off, discovery, problems, audit lines and call counts are as before (test `TestNoMultiplexer`, scenarios U1 and S2). The tests use a fake multiplexer that raises on any call, and one test is a mutant that keeps calling `agent_list` with the switch on; the count of zero calls catches it. Other commands that call `agent_list` directly (close-pane guards, doctor) are unchanged and still need herdr.
 
 With the key on, the toast step and the badge writes are skipped too (a toast is a multiplexer call; a badge needs a pane), with no error. The tests (`TestNoMultiplexer`) carry one mutant per scenario that names one: the S2 mutant keeps calling `agent_list`, the S3 mutant drops the toast guard, the U1 mutant makes the switch-off path behave as on; each is killed by its own check.
-
-## The impact brief and who decides (#1215)
-
-### Cause (from the recorded case)
-
-The owner declined to approve a change only because it touched a path on the matrix, with no reason why it was his. Four places said only the path rule: `impact floor` (`owner_decide` in `bin/impact_floor.py` builds each hold reason as a bare path string; `pr_floor_report` and `cmd_impact_floor` print it), the daemon's hold line (`_apply_impact_hold_locked` in `bin/impact_hold.py` repeats that report), `delegated_clear` (`who_can_clear`, `refusal_items` and `judge` in `bin/delegated_clear.py`: the ceiling was the rating label and the path class) and the matrix (the `delegated_clear` block of `docs/review-laws/impact-matrix.json`: `never_path_classes`, `top_tier_review_classes`). None said what the change can do.
-
-A held pull request carries an **impact brief**: one screen the floor builds from the diff and the records (never from the PR's own text alone). It says what the change can do,
-what it widens or removes, whether it can be undone, whether it touches spend or a credential or speaks for the owner, the evidence (reads at the head, CI, mutants, blast radius)
-and a recommended decider with ONE sentence why. A piece it cannot read is printed `not shown`, never filled, and recommends the owner.
-
-Who decides what:
-
-- **Chief of Staff** decides, on the substance of the brief, every pull request whose brief names no material risk, including a path class that was owner-only before. Such a
-  pull request is advisory: it gets no owner-hold label and the Decisions list shows it as advisory for the Chief of Staff, with the one-sentence why.
-- **Owner** decides when the brief names a material risk, or any piece is `not shown`.
-
-What is escalated to the owner: credentials or issuance widened, spend, irreversible, speaks for the owner (a closed list of four).
-
-The mechanical backstops do not change: no self-clear, no author-clear, two independent reads at the head for a machinery path, a clear bound to its exact head, a push voids it.
-A clear the Chief of Staff records carries its brief, the brief's hash and its reasons in the audit line; a clear with no brief or a differing brief is refused.
-
-The held-body check (G6b) requires a line `Rationale: <one sentence>` right after the opening lines of a held body, and the Decisions list row shows that sentence.
-
-Rationale: the owner's order of 23 October (with that of 22 October): a clear request leads with the rationale; the Chief of Staff applies the judgement, and the owner's clear is only for what might matter.
