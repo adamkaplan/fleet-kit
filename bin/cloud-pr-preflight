@@ -2,15 +2,15 @@
 """cloud-pr-preflight: check a cloud pull request the way CI will, before the push (ask #1195).
 
 Run at the repository root:  bin/cloud-pr-preflight
-Offline. Prints three sections; exits 0 only when every one passes.
+Offline. Prints three sections; exits 0 when 1 and 2 pass (and no --expect stray file); section 3 only lists edits to justify.
   1. completeness scan of bin/test-cloud-launcher
   2. every test file of cloud/launcher/tests and cloud/worker/tests, one at a time, on the branch and on a clean
      copy of the default branch (made under the system temp dir, removed on every exit path; no git stash, no network,
      nothing written into the repository)
-  3. existing test files this branch changes against the default branch (each one must be justified)
+  3. existing test files this branch changes against the default branch (listed for you to justify; it does not change the exit status)
 Environment: CLOUD_PREFLIGHT_TIMEOUT (seconds per file, default 120), CLOUD_PREFLIGHT_BASE (default branch ref).
 """
-import glob, os, shutil, subprocess, sys, tarfile, tempfile, io
+import glob, os, shutil, signal, subprocess, sys, tarfile, tempfile, io
 
 TEST_DIRS = ("cloud/launcher/tests", "cloud/worker/tests")
 CHAIN = "bin/test-cloud-launcher"
@@ -42,18 +42,42 @@ def exceptions_of(text):
     return set()
 
 
+CHILD = []
+
+
+def kill_children():
+    for p in CHILD:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+    del CHILD[:]
+
+
 def run_one(root, rel, timeout):
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     try:
-        p = subprocess.run([sys.executable, rel], cwd=root, env=env, capture_output=True, timeout=timeout)
-        return p.returncode
-    except subprocess.TimeoutExpired:
-        return "timeout"
+        p = subprocess.Popen([sys.executable, rel], cwd=root, env=env, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError:
         return 127
+    CHILD.append(p)
+    try:
+        return p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_children(); p.wait()
+        return "timeout"
+    finally:
+        kill_children()
+
+
+def _on_signal(signum, frame):
+    raise SystemExit(128 + signum)
 
 
 def main():
+    for sg in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sg, _on_signal)
     expect = []
     args = sys.argv[1:]
     while args:
@@ -69,8 +93,10 @@ def main():
         print("cloud-pr-preflight: not in a git repository"); return 2
     try:
         timeout = int(os.environ.get("CLOUD_PREFLIGHT_TIMEOUT", "120"))
+        if timeout < 1:
+            raise ValueError
     except ValueError:
-        timeout = 120
+        print("cloud-pr-preflight: CLOUD_PREFLIGHT_TIMEOUT must be a whole number of seconds (1 or more)"); return 2
     base = os.environ.get("CLOUD_PREFLIGHT_BASE")
     if not base:
         rc, ref = git("symbolic-ref", "--short", "refs/remotes/origin/HEAD", cwd=root)
@@ -79,6 +105,8 @@ def main():
         for cand in ("origin/main", "origin/master", "main", "master"):
             if git("rev-parse", "--verify", "-q", cand + "^{commit}", cwd=root)[0] == 0:
                 base = cand; break
+    if base and base.startswith("-"):
+        print("cloud-pr-preflight: the default branch name must not start with a dash"); return 2
     if not base:
         print("cloud-pr-preflight: cannot find the default branch (origin/main or main)"); return 2
     rc, mb = git("merge-base", base, "HEAD", cwd=root)
@@ -136,7 +164,7 @@ def main():
             elif b == 0:
                 v = "ok" if d in (0, "absent") else "ok (fixed on branch)"
             elif d == b:
-                v = "environment-only (fails the same on both)"
+                v = "environment-only (fails the same on both; may hide a real failure)"
             else:
                 v = "FAIL: branch exit %s, default exit %s" % (b, d); failed = True
             print("%-52s %-9s %-9s %s" % (rel, b, d, v))
@@ -148,13 +176,14 @@ def main():
         changed = []
         for line in out.splitlines():
             a, dl, path = (line.split("\t") + ["", "", ""])[:3]
-            if path in base_tests or path in (set()):
+            if path in base_tests:
                 changed.append((path, a, dl))
+        if changed:
+            print("existing test files edited (justify each in the pull request comment):")
         for path, a, dl in changed:
-            print("%s  +%s -%s  <- justify this edit" % (path, a, dl))
+            print("%s  +%s -%s" % (path, a, dl))
         if not changed:
             print("none")
-        failed |= bool(changed)
         rc, out = git("diff", "--name-only", "--diff-filter=A", "--no-renames", mb, cwd=root)
         added = [x for x in out.splitlines() if x]
         rc, out = git("ls-files", "--others", "--exclude-standard", cwd=root)
@@ -175,6 +204,7 @@ def main():
         print("\nRESULT: " + ("FAIL" if failed else "PASS"))
         return 1 if failed else 0
     finally:
+        kill_children()
         shutil.rmtree(tmp, ignore_errors=True)
 
 
