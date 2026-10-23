@@ -1,0 +1,594 @@
+#!/usr/bin/env python3
+"""test-cloud-relay: the refusal matrix and end-to-end scenarios of issue 1225 (hub relay), as one suite.
+
+Runs the REAL hub (bin/cloud_hub.py, started in-process through make_hub the way bin/test-cloud-hub does, with the per-pod
+secrets reviewer) and a small in-process FAKE DAEMON that speaks the contract: it PULLS GET /relay/pending and POSTs
+/relay/result/<id>, and runs the real rule code (plan_ledger.append_checked, may_record_verdict, authors_of) on a temp state dir.
+
+    bin/test-cloud-relay
+
+Which slice each test needs (until it lands the test fails, which is expected):
+  - Needs slice A (the hub's POST /relay, GET /relay/pending, POST /relay/result/<id>): every class except TestHarness.
+    Hub-side refusals (S5, S6 repo, S8, S24 hub cases) need only A. Everything that reaches the daemon (S1-S3, S7, S10-S12,
+    S14-S22, S25-S28) needs A plus the fake daemon here, which stands in for slice B.
+  - Needs slice B (the real executor in bin/fleet-switchboard): none of these tests; the fake daemon encodes the same contract and
+    can be swapped for the real one by setting RELAY_REAL_DAEMON in Harness.start_daemon (left as the one place to adapt).
+    S13 (live, real pod, real daemon) is not testable here and is skipped, named in TestLive.
+  - Needs neither: TestHarness (hub and fake daemon start, pure refusal checks are well formed, the mutant daemons differ).
+Hub construction is isolated in Harness.start_hub: if slice A needs extra arguments or environment (daemon credential, wait limit), adapt there.
+
+Mutants (discriminates lines): the fake daemon takes `mutations`; a check that must catch it is run against it and must FAIL there
+(class TestMutants): writes on refusal, skips the author exclusion, takes the role from the request, takes the name from the body,
+scopes call ids globally, stamps the live head, writes gates to the ledger, no work-item check.
+"""
+import hashlib
+import http.client
+import json
+import os
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+sys.path.insert(0, str(BIN))
+import cloud_channel_server  # noqa: E402
+import cloud_hub  # noqa: E402
+import plan_ledger  # noqa: E402
+
+REPO, OTHER_REPO, ISSUE = "acme-org/widget-service", "acme-org/widget-api", 7
+PR = "%s#12" % REPO
+HEAD1, HEAD2 = "a" * 40, "b" * 40
+PLAN = "p" * 64
+GH_TOKEN = "ghp_TESTTOKENVALUE0000000000000000000000"   # never given to the pod or the hub; searched for in every byte seen
+DAEMON = "relay-daemon"
+PODS = {  # pod -> (secret, role in the daemon registry)
+    "coder": ("s-coder", None), "coder2": ("s-coder2", None), "reader": ("s-reader", "reader"), "tester": ("s-tester", "tester"),
+    "reviewer": ("s-reviewer", "reviewer"), "evalcoder": ("s-evalcoder", "reviewer"), DAEMON: ("s-daemon", None),
+}
+ISSUES = {"coder": ISSUE, "coder2": 8, "reader": 9, "tester": 10, "reviewer": 11, "evalcoder": 12}
+
+
+def sha(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def reason_of(body):
+    return str((body or {}).get("reason") or (body or {}).get("error") or "")
+
+
+class FakeDaemon:
+    """Speaks the contract. State: ledger (plan_ledger), call-id index file, audit list, delivered reports."""
+
+    def __init__(self, state, port_of, mutations=()):
+        self.state, self.port_of, self.mut = Path(state), port_of, set(mutations)
+        self.heads = {PR: HEAD2}
+        self.item_holder = {(REPO, ISSUE): "coder"}
+        self.roles = {n: r for n, (_, r) in PODS.items() if r}
+        self.github_author = {PR: "evalcoder"}      # evalcoder opened the PR (and holds an evaluator role: S15/S19)
+        self.audit, self.reports, self.done, self.stop = [], [], set(), False
+        self.index_path = self.state / "relay-callids.json"
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+
+    # ---- pull loop
+    def get(self, method, path, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port_of(), timeout=5)
+        try:
+            conn.request(method, path, json.dumps(body).encode() if body is not None else None,
+                         {"Authorization": "Bearer " + PODS[DAEMON][0]})
+            r = conn.getresponse()
+            return r.status, json.loads(r.read() or b"null")
+        finally:
+            conn.close()
+
+    def loop(self):
+        while not self.stop:
+            try:
+                status, body = self.get("GET", "/relay/pending")
+                for req in (body or {}).get("requests", []) if status == 200 else []:
+                    if req["id"] in self.done:
+                        continue
+                    self.done.add(req["id"])
+                    code, reason, record = self.execute(req)
+                    self.get("POST", "/relay/result/" + req["id"], {"status": code, "reason": reason, "record": record})
+            except (OSError, ValueError, KeyError):
+                pass
+            time.sleep(0.03)
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def close(self):
+        self.stop = True
+        self.thread.join(2)
+
+    # ---- executor
+    def index(self):
+        try:
+            return json.loads(self.index_path.read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def ledger_bytes(self):
+        out = b""
+        for name in (plan_ledger.LEDGER_FILE, plan_ledger.HEAD_FILE):
+            try:
+                out += (self.state / name).read_bytes()
+            except OSError:
+                pass
+        return out
+
+    def entries(self):
+        return plan_ledger.read_ledger(self.state)[0]
+
+    def refuse(self, code, reason, pod, call):
+        self.audit.append({"kind": "refused", "pod": pod, "status": code, "reason": reason})
+        if "writes_on_refusal" in self.mut:
+            plan_ledger.append_entry(self.state, {"kind": "proof", "result": "fail", "pr": call.get("pr"), "by": pod, "head": HEAD2}, time.time())
+        return code, reason, None
+
+    def execute(self, req):
+        pod, call = req["pod"], req["call"]
+        if "body_name" in self.mut and isinstance(call.get("by"), str):
+            pod = call["by"]
+        key = call["call_id"] if "global_callids" in self.mut else pod + "\x00" + call["call_id"]
+        seen = self.index().get(key)
+        if seen:
+            return 200, "replay", seen
+        cmd, args, head = call["command"], call.get("args") or {}, call.get("head")
+        live = self.heads.get(call["pr"])
+        if cmd == "report":
+            self.reports.append((pod, args.get("text")))
+            self.audit.append({"kind": "report", "pod": pod})
+            return 200, "delivered", None
+        if live is None or call["pr"].split("#")[0] != req["repo"] or (cmd != "gates" and False):
+            return self.refuse(403, "pr is not in the pod's repo", pod, call)
+        if "pr_issue" not in self.mut and ISSUES.get(pod) != req["issue"]:
+            return self.refuse(403, "pr not linked to the pod's issue", pod, call)
+        if cmd == "gates":
+            self.audit.append({"kind": "gates", "pod": pod, "pr": call["pr"]})
+            if "gates_write" in self.mut:
+                return 200, "gates", self.append(pod, call, "proof", live, "pass", "gates")
+            return 200, "gate report: G0a pending", None
+        if head is None and "stamp_live_head" in self.mut:
+            head = live
+        if not head:
+            return self.refuse(400, "head required", pod, call)
+        if head != live and "stamp_live_head" not in self.mut:
+            return self.refuse(409, "stale head", pod, call)
+        if "stamp_live_head" in self.mut:
+            head = live
+        if cmd == "prove":
+            if "no_holder" not in self.mut and self.item_holder.get((req["repo"], req["issue"])) != pod:
+                return self.refuse(403, "proof only from the pod holding the work item", pod, call)
+            return 200, "recorded", self.append(pod, call, "proof", head, args.get("result", "pass"), args.get("evidence", "ran it"))
+        if cmd == "verdict":
+            role = args.get("role") if "role_from_request" in self.mut else self.roles.get(pod)
+            allowed = {r: [n for n, rr in self.roles.items() if rr == r] for r in ("reader", "tester", "reviewer")}
+            if "role_from_request" in self.mut and role:
+                allowed.setdefault(role, []).append(pod)
+            authors = plan_ledger.authors_of(self.entries(), call["pr"], github_author=self.github_author.get(call["pr"]))
+            if "skip_author" in self.mut:
+                authors = set()
+            ok, why = plan_ledger.may_record_verdict(role or "reviewer", pod, allowed, authors)
+            if not ok:
+                return self.refuse(403, why, pod, call)
+            return 200, "recorded", self.append(pod, call, "verdict", head, args.get("result", "pass"), args.get("evidence", "saw it"))
+        return self.refuse(400, "command not relayed", pod, call)
+
+    def append(self, pod, call, kind, head, result, evidence):
+        args = call.get("args") or {}
+        stored = plan_ledger.append_checked(self.state, time.time(), lambda entries, seq: {
+            "kind": kind, "result": result, "pr": call["pr"], "head": head, "by": pod, "plan_hash": PLAN,
+            "scenario": args.get("scenario", "S1"), "evidence": evidence, "call_id": call["call_id"]})
+        record = {"seq": stored["seq"], "hash": stored["hash"]}
+        index = self.index()
+        index[call["call_id"] if "global_callids" in self.mut else pod + "\x00" + call["call_id"]] = record
+        self.index_path.write_text(json.dumps(index))
+        self.audit.append({"kind": kind, "pod": pod, "seq": stored["seq"]})
+        return record
+
+
+class Harness:
+    def __init__(self, mutations=()):
+        self.tmp = tempfile.TemporaryDirectory()
+        t = self.t = Path(self.tmp.name)
+        (t / "state").mkdir()
+        (t / "pw").write_text("pw\n")
+        (t / "secrets.json").write_text(json.dumps({n: sha(s) for n, (s, _) in PODS.items()}))
+        agents = {n: {"url": "http://127.0.0.1:9", "session": "ses_" + n.replace("-", "_"), "password_file": str(t / "pw"),
+                      "issue": i, "repo": REPO if n != "coder2" else REPO} for n, i in ISSUES.items()}
+        (t / "agents.json").write_text(json.dumps(agents))
+        self.hub_lines, self.port, self.server = [], 0, None
+        self.start_hub()
+        self.daemon = FakeDaemon(t / "state", lambda: self.port, mutations).start()
+
+    def start_hub(self):
+        """The one place that builds the real hub. Keeps the port across a restart (state lives in the daemon, not the hub)."""
+        reviewer = cloud_hub.make_secrets_reviewer(str(self.t / "secrets.json"))
+        inbox = cloud_hub.Inbox(str(self.t / "agents.json"), timeout=2)
+        self.server = cloud_hub.make_hub(("127.0.0.1", self.port), reviewer, inbox, self.hub_lines.append, str(self.t / "decisions.json"))
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def restart_hub(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.start_hub()
+
+    def close(self):
+        self.daemon.close()
+        self.server.shutdown()
+        self.server.server_close()
+        self.tmp.cleanup()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def raw(self, pod, data, secret=None, path="/relay"):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=40)
+        h = {"Content-Length": str(len(data)), "Content-Type": "application/json"}
+        s = PODS[pod][0] if secret is None and pod in PODS else secret
+        if s:
+            h["Authorization"] = "Bearer " + s
+        try:
+            conn.request("POST", path, data, h)
+            r = conn.getresponse()
+            payload = r.read()
+            try:
+                return r.status, json.loads(payload or b"null")
+            except ValueError:
+                return r.status, {"error": payload.decode("latin-1")}
+        finally:
+            conn.close()
+
+    def relay(self, pod, command, call_id="c1", pr=PR, head=HEAD2, args=None, secret=None, extra=None, drop=()):
+        body = {"call_id": call_id, "command": command, "pr": pr}
+        if head is not None:
+            body["head"] = head
+        body["args"] = args if args is not None else {"scenario": "S1", "evidence": "ran it", "result": "pass"}
+        body.update(extra or {})
+        for k in drop:
+            body.pop(k, None)
+        return self.raw(pod, json.dumps(body).encode(), secret)
+
+    def snapshot(self):
+        return self.daemon.ledger_bytes()
+
+    def kinds(self, kind):
+        return [e for e in self.daemon.entries() if e.get("kind") == kind]
+
+
+def ok_record(test, answer):
+    status, body = answer
+    test.assertEqual(status, 200, answer)
+    test.assertIsInstance(body.get("record"), dict, answer)
+    return body["record"]
+
+
+class Base(unittest.TestCase):
+    mutations = ()
+
+    def setUp(self):
+        self.h = Harness(self.mutations)
+
+    def tearDown(self):
+        self.h.close()
+
+    def refused(self, answer, status, phrase=None):
+        self.assertEqual(answer[0], status, answer)
+        if phrase:
+            self.assertIn(phrase, reason_of(answer[1]), answer)
+        self.assertNotIn("secret", json.dumps(answer[1]).lower().replace("per-pod secret", ""))
+
+
+# ------------------------------------------------------------------------------------------------ harness (needs neither A nor B)
+
+class TestHarness(unittest.TestCase):
+    def test_hub_and_daemon_start(self):
+        with Harness() as h:
+            self.assertGreater(h.port, 0)
+            self.assertTrue(h.daemon.thread.is_alive())
+            status, _ = h.raw("coder", b"{}", path="/nope")
+            self.assertEqual(status, 404)    # the existing hub still refuses unknown routes
+
+    def test_ledger_bytes_see_a_write_and_a_non_write(self):
+        with Harness() as h:
+            before = h.snapshot()
+            self.assertEqual(before, h.snapshot())
+            plan_ledger.append_entry(h.daemon.state, {"kind": "proof", "result": "pass", "pr": PR, "by": "x"}, 1)
+            self.assertNotEqual(before, h.snapshot())
+
+    def test_fake_daemon_executes_without_hub(self):
+        with Harness() as h:
+            d = h.daemon
+            req = lambda pod, **c: {"id": "i", "pod": pod, "repo": REPO, "issue": ISSUES[pod],
+                                    "call": dict({"call_id": "x", "command": "prove", "pr": PR, "head": HEAD2, "args": {}}, **c)}
+            self.assertEqual(d.execute(req("coder"))[0], 200)
+            self.assertEqual(d.execute(req("coder"))[1], "replay")
+            self.assertEqual(d.execute(req("coder", call_id="y", head=HEAD1))[:2], (409, "stale head"))
+            self.assertEqual(d.execute(req("coder2", call_id="z"))[0], 403)
+            self.assertEqual(len(d.entries()), 1)
+
+    def test_secrets_never_in_repo_constants_of_hub(self):
+        self.assertNotIn(GH_TOKEN, Path(cloud_hub.__file__).read_text())
+
+    def test_mutants_are_distinct_and_known(self):
+        known = {"writes_on_refusal", "skip_author", "role_from_request", "body_name", "global_callids", "stamp_live_head", "gates_write", "no_holder"}
+        self.assertEqual(len(known), 8)
+        src = Path(__file__).read_text()
+        for m in known:
+            self.assertGreaterEqual(src.count('"%s"' % m), 2, m)
+
+
+# ------------------------------------------------------------------------------------------------ the contract, against the real hub (needs A)
+
+class TestRelayHappy(Base):
+    def test_S1_S21_prove_one_entry_under_the_secrets_pod(self):   # S1, S21
+        rec = ok_record(self, self.h.relay("coder", "prove", extra={"by": "reviewer", "pod": "captain", "sender": "captain"}))
+        es = self.h.kinds("proof")
+        self.assertEqual(len(es), 1)
+        self.assertEqual((es[0]["by"], es[0]["head"], es[0]["seq"], es[0]["hash"]), ("coder", HEAD2, rec["seq"], rec["hash"]))
+        self.assertEqual([e for e in self.h.daemon.entries() if e["by"] in ("reviewer", "captain")], [])
+
+    def test_S2_verdict_one_entry(self):
+        ok_record(self, self.h.relay("reviewer", "verdict", args={"scenario": "S1", "result": "pass", "evidence": "saw"}))
+        es = self.h.kinds("verdict")
+        self.assertEqual([(e["by"], e["head"]) for e in es], [("reviewer", HEAD2)])
+
+    def test_S3_S25_report_delivers_and_gates_reads(self):   # S3, S25
+        s, _ = self.h.relay("coder", "report", head=None, args={"text": "hello"})
+        self.assertEqual(s, 200)
+        self.assertEqual(self.h.daemon.reports, [("coder", "hello")])
+        before = self.h.snapshot()
+        s, body = self.h.relay("coder", "gates", head=None, args={})
+        self.assertEqual(s, 200)
+        self.assertTrue(reason_of(body) or body.get("report"), body)
+        self.assertEqual(self.h.snapshot(), before)
+        self.assertEqual(len([a for a in self.h.daemon.audit if a["kind"] == "gates"]), 1)
+        self.assertEqual(self.h.kinds("proof") + self.h.kinds("verdict"), [])
+
+    def test_S4_no_github_token_anywhere(self):
+        os.environ.pop("GH_TOKEN", None)   # the pod and hub environments hold none; the daemon's is a local variable only
+        seen = []
+        orig = self.h.raw
+        s, body = self.h.relay("coder", "prove")
+        seen += [json.dumps(body), json.dumps(self.h.daemon.audit), "\n".join(map(str, self.h.hub_lines)), json.dumps(dict(os.environ))]
+        self.assertEqual(s, 200)
+        for blob in seen:
+            self.assertNotIn(GH_TOKEN, blob)
+        for secret, _ in PODS.values():
+            self.assertNotIn(secret, "\n".join(map(str, self.h.hub_lines)) + json.dumps(self.h.daemon.audit))
+
+    def test_S10_chain_and_audit(self):
+        ok_record(self, self.h.relay("coder", "prove", call_id="a"))
+        ok_record(self, self.h.relay("reviewer", "verdict", call_id="b"))
+        self.h.relay("coder", "gates", call_id="g", head=None, args={})
+        entries, problem = plan_ledger.read_ledger(self.h.daemon.state)
+        self.assertIsNone(problem)
+        self.assertEqual([(e["kind"], e["by"]) for e in entries], [("proof", "coder"), ("verdict", "reviewer")])
+        self.assertEqual(len([a for a in self.h.daemon.audit if a["kind"] == "gates"]), 1)
+
+    def test_S11_S23_replay_same_record_even_after_restart(self):   # S11, S23
+        first = ok_record(self, self.h.relay("coder", "prove", call_id="C"))
+        again = ok_record(self, self.h.relay("coder", "prove", call_id="C"))
+        self.h.restart_hub()
+        third = ok_record(self, self.h.relay("coder", "prove", call_id="C"))
+        self.assertEqual((first, first), (again, third))
+        self.assertEqual(len(self.h.daemon.entries()), 1)
+
+    def test_S12_call_ids_are_per_pod(self):
+        a = ok_record(self, self.h.relay("coder", "prove", call_id="same"))
+        ok_record(self, self.h.relay("reviewer", "verdict", call_id="same"))
+        entries = self.h.daemon.entries()
+        self.assertEqual([e["by"] for e in entries], ["coder", "reviewer"])
+        self.assertNotEqual(entries[1]["seq"], a["seq"])
+
+    def test_S22_head_must_be_named_and_current(self):
+        self.refused(self.h.relay("coder", "prove", call_id="o", head=HEAD1), 409, "stale head")
+        self.assertEqual(self.h.daemon.entries(), [])
+        self.assertEqual(self.h.relay("coder", "prove", call_id="n", head=None)[0] // 100, 4)   # named head required
+        self.assertEqual(self.h.daemon.entries(), [])
+        ok_record(self, self.h.relay("coder", "prove", call_id="p", head=HEAD2))
+        self.assertEqual(self.h.daemon.entries()[0]["head"], HEAD2)
+
+
+class TestRefusals(Base):
+    def test_S5_unknown_wrong_missing_secret(self):
+        before = self.h.snapshot()
+        for secret in ("nope", ""):
+            s, _ = self.h.relay("coder", "prove", secret=secret)
+            self.assertIn(s, (401, 404))
+        s, _ = self.h.raw("ghost", json.dumps({"call_id": "x", "command": "prove", "pr": PR, "head": HEAD2, "args": {}}).encode(), secret="unknown-pod-secret")
+        self.assertIn(s, (401, 404))
+        self.assertEqual(self.h.snapshot(), before)
+
+    def test_S6_wrong_repo_or_issue(self):
+        before = self.h.snapshot()
+        self.refused(self.h.relay("coder", "prove", call_id="r", pr="%s#12" % OTHER_REPO), 403)
+        self.refused(self.h.relay("coder2", "prove", call_id="i"), 403)     # coder2 is bound to issue 8, not the PR's
+        self.assertEqual(self.h.snapshot(), before)
+
+    def test_S7_stale_head_prove_and_verdict(self):
+        before = self.h.snapshot()
+        self.refused(self.h.relay("coder", "prove", call_id="p", head=HEAD1), 409, "stale head")
+        self.refused(self.h.relay("reviewer", "verdict", call_id="v", head=HEAD1), 409, "stale head")
+        self.assertEqual(self.h.snapshot(), before)
+
+    def test_S8_unlisted_command_and_oversize(self):
+        before = self.h.snapshot()
+        self.assertEqual(self.h.relay("coder", "notice")[0], 400)
+        big = json.dumps({"call_id": "big", "command": "report", "pr": PR, "args": {"text": "x" * cloud_channel_server.MAX_BODY}}).encode()
+        self.assertGreater(len(big), cloud_channel_server.MAX_BODY)
+        self.assertEqual(self.h.raw("coder", big)[0], 413)
+        self.assertEqual(self.h.snapshot(), before)
+
+    def test_S9_S24_every_refusal_has_its_own_reason_and_writes_nothing(self):   # S9, S24
+        h = self.h
+        before = h.snapshot()
+        big = json.dumps({"call_id": "big", "command": "report", "pr": PR, "args": {"text": "x" * cloud_channel_server.MAX_BODY}}).encode()
+        cases = {
+            "unknown pod": lambda: h.raw("ghost", b"{}", secret="who"),
+            "wrong secret": lambda: h.relay("coder", "prove", secret="wrong"),
+            "wrong repo": lambda: h.relay("coder", "prove", call_id="a", pr="%s#12" % OTHER_REPO),
+            "wrong issue": lambda: h.relay("coder2", "prove", call_id="b"),
+            "stale head": lambda: h.relay("coder", "prove", call_id="c", head=HEAD1),
+            "unlisted command": lambda: h.relay("coder", "notice", call_id="d"),
+            "oversized": lambda: h.raw("coder", big),
+            "no call id": lambda: h.relay("coder", "prove", drop=("call_id",)),
+        }
+        reasons, lines_before = {}, len(h.hub_lines) + len(h.daemon.audit)
+        for name, call in cases.items():
+            s, body = call()
+            self.assertGreaterEqual(s, 400, name)
+            reasons[name] = (s, reason_of(body))
+            self.assertNotEqual(reasons[name][1], "", name)
+        self.assertEqual(len(set(reasons.values())), 8, reasons)
+        self.assertEqual(h.snapshot(), before)
+        lines = [str(x) for x in h.hub_lines + h.daemon.audit][lines_before - len(h.hub_lines + h.daemon.audit):] if False else [str(x) for x in h.hub_lines] + [str(x) for x in h.daemon.audit]
+        for secret, _ in PODS.values():
+            self.assertFalse([l for l in lines if secret in l])
+        self.assertGreaterEqual(len([l for l in lines if "stale head" in l]), 1)
+
+    def test_S8b_missing_call_id_is_400(self):
+        self.assertEqual(self.h.relay("coder", "prove", drop=("call_id",))[0], 400)
+        self.assertEqual(self.h.relay("coder", "prove", call_id="x" * 65)[0], 400)
+        self.assertEqual(self.h.relay("coder", "prove", call_id="bad\x01id")[0], 400)
+
+
+class TestIndependence(Base):
+    def test_S14_author_pod_cannot_verdict_its_own_proof(self):
+        self.h.daemon.roles["coder"] = "reviewer"
+        ok_record(self, self.h.relay("coder", "prove", call_id="p"))
+        before = self.h.snapshot()
+        self.refused(self.h.relay("coder", "verdict", call_id="v"), 403, "author cannot record a verdict on its own work")
+        self.assertEqual(self.h.snapshot(), before)
+
+    def test_S15_S19_head_author_with_evaluator_role_refused(self):   # S15, S19
+        before = self.h.snapshot()
+        self.refused(self.h.relay("evalcoder", "verdict", call_id="v"), 403, "author cannot record a verdict on its own work")
+        self.assertEqual(self.h.snapshot(), before)
+
+    def test_S16_no_role_is_not_registered(self):
+        before = self.h.snapshot()
+        self.refused(self.h.relay("coder2", "verdict", call_id="v", pr=PR), 403, "not registered to record")
+        self.assertEqual(self.h.snapshot(), before)
+
+    def test_S17_S26_roles_reader_tester_reviewer_accepted_others_refused(self):   # S17, S26
+        for pod in ("reader", "tester", "reviewer"):
+            ok_record(self, self.h.relay(pod, "verdict", call_id="v-" + pod, args={"scenario": "S1", "result": "pass", "evidence": "x", "role": "reader"}))
+        self.assertEqual(sorted(e["by"] for e in self.h.kinds("verdict")), ["reader", "reviewer", "tester"])
+        before = self.h.snapshot()
+        for pod in ("coder2",):
+            self.refused(self.h.relay(pod, "verdict", call_id="v2", args={"scenario": "S1", "role": "reviewer", "result": "pass"}), 403)
+        self.assertEqual(self.h.snapshot(), before)
+
+    def test_S18_S27_only_the_holder_proves(self):   # S18, S27
+        before = self.h.snapshot()
+        self.refused(self.h.relay("reviewer", "prove", call_id="p"), 403, "only from the pod holding the work item")
+        self.assertEqual(self.h.snapshot(), before)
+        ok_record(self, self.h.relay("coder", "prove", call_id="p2"))
+        self.assertEqual([e["by"] for e in self.h.kinds("proof")], ["coder"])
+
+    def test_S20_S28_each_rule_names_itself_and_ledger_unchanged(self):   # S20, S28
+        ok_record(self, self.h.relay("coder", "prove", call_id="p"))
+        before = self.h.snapshot()
+        phrases = set()
+        for pod, cmd, phrase in (("evalcoder", "verdict", "author cannot record a verdict on its own work"),
+                                 ("coder2", "verdict", "not registered to record"),
+                                 ("reviewer", "prove", "only from the pod holding the work item")):
+            a = self.h.relay(pod, cmd, call_id="r-" + pod)
+            self.refused(a, 403, phrase)
+            self.assertNotEqual(reason_of(a[1]).strip().lower(), "refused")
+            phrases.add(phrase)
+        self.assertEqual(len(phrases), 3)
+        self.assertEqual(self.h.snapshot(), before)
+
+
+class TestLive(unittest.TestCase):
+    @unittest.skip("S13 is live: a real pod, the installed hub and the real daemon on a throwaway PR; not testable in this suite (needs A and B deployed)")
+    def test_S13(self):
+        pass
+
+
+# ------------------------------------------------------------------------------------------------ mutants: each fake-daemon defect must be CAUGHT (needs A)
+
+def caught(mutation, scenario):
+    """True when `scenario(harness)` raises an assertion against a daemon with `mutation`: the check discriminates."""
+    with Harness((mutation,)) as h:
+        try:
+            scenario(h)
+        except AssertionError:
+            return True
+        return False
+
+
+class TestMutants(unittest.TestCase):
+    def check(self, mutation, scenario):
+        self.assertTrue(caught(mutation, scenario), "mutant %s was not caught" % mutation)
+        with Harness() as h:     # and the same check passes on the faithful daemon
+            scenario(h)
+
+    def test_writes_on_refusal_caught_by_ledger_bytes(self):
+        def scenario(h):
+            before = h.snapshot()
+            h.relay("coder", "prove", call_id="o", head=HEAD1)
+            assert h.snapshot() == before, "ledger bytes changed on a refusal"
+        self.check("writes_on_refusal", scenario)
+
+    def test_skip_author_caught(self):
+        def scenario(h):
+            h.relay("coder", "prove", call_id="p")
+            h.daemon.roles["coder"] = "reviewer"
+            h.relay("coder", "verdict", call_id="v")
+            assert not h.kinds("verdict"), "author recorded a verdict"
+        self.check("skip_author", scenario)
+
+    def test_role_from_request_caught(self):
+        def scenario(h):
+            h.relay("coder2", "verdict", call_id="v", args={"scenario": "S1", "role": "reviewer", "result": "pass"})
+            assert not h.kinds("verdict"), "a pod with no role passed by claiming one"
+        self.check("role_from_request", scenario)
+
+    def test_body_name_caught(self):
+        def scenario(h):
+            h.relay("coder", "prove", extra={"by": "reviewer"})
+            assert [e["by"] for e in h.daemon.entries()] == ["coder"], "name taken from the body"
+        self.check("body_name", scenario)
+
+    def test_global_callids_caught(self):
+        def scenario(h):
+            a = h.relay("coder", "prove", call_id="same")[1].get("record")
+            b = h.relay("reviewer", "verdict", call_id="same")[1].get("record")
+            assert a != b and len(h.daemon.entries()) == 2, "call id shared across pods"
+        self.check("global_callids", scenario)
+
+    def test_stamp_live_head_caught(self):
+        def scenario(h):
+            h.relay("coder", "prove", call_id="n", head=None)
+            h.relay("coder", "prove", call_id="o", head=HEAD1)
+            assert not h.daemon.entries(), "wrote an entry for a missing or stale head"
+        self.check("stamp_live_head", scenario)
+
+    def test_gates_write_caught(self):
+        def scenario(h):
+            before = h.snapshot()
+            h.relay("coder", "gates", head=None, args={})
+            assert h.snapshot() == before, "gates wrote to the ledger"
+        self.check("gates_write", scenario)
+
+    def test_no_holder_caught(self):
+        def scenario(h):
+            h.relay("reviewer", "prove", call_id="p")
+            assert not h.kinds("proof"), "a non-holder recorded a proof"
+        self.check("no_holder", scenario)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=1)
