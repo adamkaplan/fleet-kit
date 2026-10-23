@@ -85040,6 +85040,61 @@ class TestNoPaneToJudge(StandInPids, Base):
         return [n.name for n in ast.walk(ast.parse(source)) if isinstance(n, ast.FunctionDef)
                 and "no_pane_to_judge" in (ast.get_source_segment(source, n) or "")]
 
+    # -- M2: block level. Every OUTERMOST loop or comprehension (inside a function that mentions a needle) that itself mentions a needle must contain the predicate.
+    BLOCK_NEEDLES = ("PANE_DEAD", "GONE_STATES", "PANE_MISSING_PASSES")
+    BLOCK_EXEMPT = {   # (function, n-th such block in it, 0-based): reason
+        ("pane_health_status_lines", 0): "walks `bad`, which was built with the predicate in the line above it",
+        ("pane_health_pass", 3): "walks `agents` (filtered by the predicate when built) to upsert the registry; a no-pane row is never in it",
+        ("pane_health_pass", 1): "walks `agents`, which was filtered by no_pane_to_judge when built (and the discovery loop above it asks again); a no-pane row is never in it",
+    }
+
+    @classmethod
+    def blocks_without_the_predicate(cls, source, exempt_functions=(), needles=None):
+        import ast
+        needles = needles or cls.BLOCK_NEEDLES
+        loops = (ast.For, ast.AsyncFor, ast.While, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+        out = []
+        for fn in ast.walk(ast.parse(source)):
+            if not isinstance(fn, ast.FunctionDef) or fn.name in exempt_functions:
+                continue
+            found, stack = [], list(ast.iter_child_nodes(fn))
+            while stack:   # outermost loops only, in source order
+                node = stack.pop(0)
+                if isinstance(node, (ast.FunctionDef, ast.Lambda)):
+                    continue
+                if isinstance(node, loops):
+                    found.append(node)
+                else:
+                    stack = list(ast.iter_child_nodes(node)) + stack
+            n = 0
+            for node in found:
+                text = ast.get_source_segment(source, node) or ""
+                if any(w in text for w in needles):
+                    if "no_pane_to_judge" not in text:
+                        out.append((fn.name, n))
+                    n += 1
+        return sorted(out)
+
+    def test_every_guard_block_holds_the_predicate_or_is_in_the_exact_exemption_table(self):
+        source = (BIN / "fleet-switchboard").read_text()
+        hb = (BIN / "fleet-heartbeat").read_text()
+        exempt = set(self.READER_FUNCTIONS)
+        got = self.blocks_without_the_predicate(source, exempt_functions=exempt)
+        self.assertEqual(got, sorted(self.BLOCK_EXEMPT), "the exemption table must be exact: no block missing the predicate beyond it, none listed that holds it")
+        self.assertEqual(self.blocks_without_the_predicate(hb, exempt_functions=exempt), [])
+
+    def test_mutant_the_discovery_loop_guard_removed_fails_the_block_level_test(self):
+        source = (BIN / "fleet-switchboard").read_text()
+        guard = "        if registry.no_pane_to_judge(registered.get(name)):   # #1181: a row with no pane to judge is not judged by a pane (a discovered cloud agent included)\n            continue\n"
+        self.assertEqual(source.count(guard), 1)
+        got = self.blocks_without_the_predicate(source.replace(guard, ""), exempt_functions=set(self.READER_FUNCTIONS))
+        self.assertNotEqual(got, sorted(self.BLOCK_EXEMPT))
+        self.assertIn(("pane_health_pass", 0), got)
+
+    def test_a_planted_unguarded_loop_inside_a_guarded_function_fails_the_block_test(self):
+        planted = "def f(rows, states):\n    for r in rows:\n        if no_pane_to_judge(r):\n            continue\n        x = PANE_DEAD\n    return [n for n in states if states[n] == PANE_DEAD]\n"
+        self.assertEqual(self.blocks_without_the_predicate(planted), [("f", 1)])
+
     def test_a_planted_reader_without_the_predicate_fails_the_derived_test(self):
         planted = "def new_reader(states):\n    return [n for n, v in states.items() if v == PANE_DEAD]\n"
         self.assertEqual(self.readers_without_the_predicate(planted), ["new_reader"])
@@ -85165,6 +85220,43 @@ class TestNoPaneToJudge(StandInPids, Base):
         self.assertEqual(view, [])
         partial_read = dict(self.reg.read(self.world.state), whole=False)
         self.assertEqual(sb.load_module("agent_reconcile").reconcile_on_read(self.world.state, partial_read, lambda n, a: {}, self.reg), [])
+
+    # -- M1: a DISCOVERED, non-headless agent whose registry row has no pane
+    def discovered_no_pane_run(self, passes=4, mutate=False):
+        self.rows()
+        found = []
+        func = sb.pane_health_pass
+        if mutate:
+            import ast
+            source = (BIN / "fleet-switchboard").read_text()
+            guard = "        if registry.no_pane_to_judge(registered.get(name)):   # #1181: a row with no pane to judge is not judged by a pane (a discovered cloud agent included)\n            continue\n"
+            self.assertEqual(source.count(guard), 1)
+            tree = ast.parse(source.replace(guard, ""))
+            node = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "pane_health_pass"][0]
+            ns = dict(sb.__dict__)
+            exec(compile(ast.Module([node], []), "mutant", "exec"), ns)
+            func = ns["pane_health_pass"]
+        names = ("orch-cloud", "pilot")
+        for n in range(passes):
+            self.engine.discover(self.world.clock.now())
+            for i, name in enumerate(names):   # discovered by a pane label and a session, though the registry row holds no pane
+                self.engine.discovery.agents[name] = sb.Observation(name, "ses_example%d" % (i + 1), "w9:p%d" % i, "idle", {"role": "coder"})
+            func(self.engine, self.world.clock.now())
+            for name in names:
+                if name in getattr(self.engine, "pane_alerts", None) or {}:
+                    found.append("alert %s pass %d" % (name, n))
+            self.world.tick(31)
+        health = sb.read_pane_health(self.world.state)
+        found += ["state %s" % n for n in health["states"] if n in names]
+        found += ["missing %s" % n for n in health["missing"] if n in names]
+        found += ["dead audit %s" % e["subject"] for e in self.world.audit() if e["event"] == "fleetpane.dead" and e.get("subject") in names]
+        return found
+
+    def test_a_discovered_cloud_or_orchestrator_agent_with_no_pane_is_never_judged_over_four_passes(self):
+        self.assertEqual(self.discovered_no_pane_run(), [])
+
+    def test_mutant_the_discovery_loop_guard_removed_is_caught(self):
+        self.assertNotEqual(self.discovered_no_pane_run(mutate=True), [], "without the guard a discovered cloud agent is judged by its pane")
 
     # -- S6: three mutants, each fails a test
     def test_mutant_a_no_pane_row_read_as_dead_is_caught(self):
