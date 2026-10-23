@@ -16156,13 +16156,13 @@ class TestOneCharter(CharterRig, Base):
         ("bin/fleet-switchboard", "seam_applies"): "set: is this issue number known as a charter",
         ("bin/fleet-switchboard", "owned_numbers"): "registry: the numbers an agent owns (an orchestrator: its row's charter only; others: their own assignment)",
         ("bin/fleet-switchboard", "registry_charter_view"): "registry: every row's charter", ("bin/fleet-switchboard", "triage_context"): "registry: charters via owned_numbers (an orchestrator's issue is never a charter)",
-        ("bin/fleet-switchboard", "identify"): "own: copies the caller's own launch fields into its context",
+        ("bin/switchboard/judge_request.py", "identify"): "own: copies the caller's own launch fields into its context",
         ("bin/fleet-switchboard", "resume_agent"): "own: one agent's own repo lookup", ("bin/fleet-switchboard", "charter_pane_update"): "own: one agent's own charter for its pane",
         ("bin/fleet-switchboard", "_fleet_repo"): "own: one agent's own repo", ("bin/fleet-switchboard", "read_order_notices"): "own: the order notices' own records",
         ("bin/fleet-switchboard", "order_groups"): "own: groups order notices", ("bin/fleet-switchboard", "decisions_from_order_notices"): "own: words order notices",
-        ("bin/fleet-switchboard", "resolve_policy_context"): "own: one agent's own launch context", ("bin/fleet-switchboard", "_valid_context"): "own: a cached own context",
-        ("bin/fleet-switchboard", "charter_orders"): "own: an agent's own charter's orders", ("bin/fleet-switchboard", "charter_guard"): "own: an agent's own charters",
-        ("bin/fleet-switchboard", "ask_context_of"): "own: an agent's own ask context", ("bin/fleet-switchboard", "__call__"): "own: an orchestrator's own orders",
+        ("bin/switchboard/judge_request.py", "resolve_policy_context"): "own: one agent's own launch context", ("bin/fleet-switchboard", "_valid_context"): "own: a cached own context",
+        ("bin/fleet-switchboard", "charter_orders"): "own: an agent's own charter's orders", ("bin/switchboard/judge_request.py", "charter_guard"): "own: an agent's own charters",
+        ("bin/switchboard/judge_request.py", "ask_context_of"): "own: an agent's own ask context", ("bin/fleet-switchboard", "__call__"): "own: an orchestrator's own orders",
         ("bin/fleet_health.py", "figures"): "own: the health figures of one agent from the registry-derived info", ("bin/fleet_health.py", "_resolve_charters"): "own: the registry-derived info",
         ("bin/fleet_health.py", "_refresh_asks"): "own: the registry-derived info", ("bin/switchboard/import_v1.py", "_import_fleet"): "own: the launch/import writer of the session's metadata",
     }
@@ -24212,7 +24212,7 @@ class TestJudgeSocket(PolicyCase):
         self.assertIsNotNone(original)
 
     def test_judge_tool_reads_no_environment_variable_and_never_names_jev(self):
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         tree = ast.parse(source)
         wanted = {"cmd_judge_tool", "ask_judge_daemon", "never_looser", "read_judge_line", "parse_policy_request",
                   "policy_unjudged_reason", "policy_reply", "_guess_configured"}
@@ -24265,9 +24265,10 @@ class TestJudgeToolWritesNothingElsewhere(unittest.TestCase):
     WRITE_PHRASES = ("issue comment", "issue edit", "pr merge", "pr comment", "sub_issues", "/comments", "/labels")
 
     def section(self):
-        source = SWITCHBOARD.read_text()
-        start = source.index(self.START)
-        return source[source.rindex("\n# ====", 0, start):source.index(self.END, start)]
+        """The policy section: its part files, and the statements of it that stay in the entry (S2 keeps the ones the clear's closure reads), between the DEFAULTS line and the next section."""
+        entry = SWITCHBOARD.read_text()
+        kept = entry[entry.index('DEFAULTS["policy"] = None'):entry.index("# PR 10: move a v1 session")]
+        return "\n".join([kept] + [path.read_text() for path in SWITCHBOARD_SOURCE_FILES if path != SWITCHBOARD])
 
     def test_no_herdr_and_no_github_write_is_reachable_from_the_section(self):
         tree = ast.parse(self.section())
@@ -24288,7 +24289,7 @@ class TestJudgeToolWritesNothingElsewhere(unittest.TestCase):
         self.assertEqual(herdr_typing_violations(switchboard_source()), [], "the engine still never types")
 
     def test_the_section_is_one_clearly_marked_block(self):
-        self.assertEqual(SWITCHBOARD.read_text().count("\n# PR 9: the tool-call policy judge"), 1)
+        self.assertEqual(switchboard_source().count("\n# PR 9: the tool-call policy judge"), 1)
 
 
 class TestPolicyBlockedToast(PR4Base):
@@ -30746,7 +30747,7 @@ class TestIdentityCheck(ReportBase):
     # -- the judge, the hooks and status
 
     def test_the_judge_keys_on_the_plugins_session_and_never_on_the_pane_environment(self):
-        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        text = switchboard_source()
         start, end = text.index("def parse_policy_request"), text.index("def _guess_configured")
         self.assertNotIn("HERDR_PANE_ID", text[start:end])
         self.assertIn('data.get("sessionID")', text[start:end])
@@ -70866,6 +70867,105 @@ class TestReviewerSubagents(LedgerBase):
         self.assertEqual(code, 2)
         self.assertIn("base commit is unknown", err)
 
+    # -- review laws: a bare pull request number (#1124)
+
+    def in_clone(self, url):
+        """chdir to a fresh git directory whose origin is `url` (None: no remote at all)."""
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        if url:
+            subprocess.run(["git", "-C", str(root), "config", "remote.origin.url", url], check=True)
+        old = os.getcwd()
+        os.chdir(root)
+        self.addCleanup(os.chdir, old)
+
+    def laws_repos(self, ref):
+        """(code, err, the repositories the law files were read from) for `review laws <ref>`."""
+        del self.contents_calls[:]
+        code, out, err = self.review("coder", "laws", ref)
+        return code, err, sorted({c.split("/contents/")[0] for c in self.contents_calls})
+
+    def test_review_laws_takes_a_bare_number_hash_number_short_form_and_url_alike(self):
+        self.in_clone("https://github.com/acme-org/widget-service.git")
+        for ref in ("1234", "#1234", "acme-org/widget-service#1234", "https://github.com/acme-org/widget-service/pull/1234"):
+            with self.subTest(ref=ref):
+                code, err, repos = self.laws_repos(ref)
+                self.assertEqual((code, repos), (0, ["repos/acme-org/widget-service"]), err)
+
+    def test_a_bare_number_resolves_against_the_working_directory_remote_never_the_configured_default(self):
+        self.in_clone("git@github.com:acme-org/widget-service.git")
+        self.assertEqual(sb.load_config(self.world.config_path)["intent_repo"] if hasattr(self.world, "config_path") else "acme/app", "acme/app")
+        with mock.patch.object(sb, "origin_repository", wraps=sb.origin_repository) as origin:
+            code, err, repos = self.laws_repos("1234")
+        self.assertEqual((code, repos), (0, ["repos/acme-org/widget-service"]), err)
+        self.assertNotIn("repos/acme/app", repos)
+        self.assertEqual(origin.call_count, 1)
+
+    def test_a_bare_number_with_no_remote_or_naming_no_pull_request_is_refused_saying_what_to_pass(self):
+        self.in_clone(None)
+        code, err, repos = self.laws_repos("1234")
+        self.assertEqual((code, repos), (2, []))
+        self.assertIn("owner/repo#N", err)
+        self.in_clone("https://github.com/acme-org/widget-service")
+        real = self.route
+        def none_found(argv, **kw):
+            if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+                return subprocess.CompletedProcess(argv, 1, "", "GraphQL: Could not resolve to a PullRequest with the number of 1234. (repository.pullRequest)")
+            return real(argv, **kw)
+        self.route = none_found
+        code, err, repos = self.laws_repos("1234")
+        self.assertNotEqual(code, 0)
+        self.assertIn("owner/repo#N", err)
+
+    def test_text_that_is_not_a_number_is_not_taken_for_one(self):
+        self.in_clone("https://github.com/acme-org/widget-service")
+        for ref in ("12abc", "0", "#", "1234 5", "pull/1234"):
+            with self.subTest(ref=ref):
+                code, err, repos = self.laws_repos(ref)
+                self.assertEqual((code, repos), (2, []), err)
+                self.assertIn("owner/repo#N", err)
+
+    def test_the_long_forms_print_what_they_always_did(self):
+        self.in_clone(None)
+        outs = []
+        for ref in ("acme/app#9", "https://github.com/acme/app/pull/9"):
+            code, out, err = self.review("coder", "laws", ref)
+            self.assertEqual(code, 0, err)
+            outs.append(out)
+        self.assertEqual(outs[0], outs[1])
+        self.assertIn("at the base commit %s" % self.BASE[:12], outs[0])
+        self.assertIn("base text of REVIEW_LAWS.md", outs[0])
+
+    def test_every_agent_that_names_review_laws_shows_the_bare_form_and_the_docs_list_the_four_forms(self):
+        named = [p for p in (REPO / "agents").rglob("*.md") if "review laws <" in p.read_text()]
+        self.assertTrue(named)
+        self.assertEqual([p.name for p in named if "review laws <pr number>" not in p.read_text()], [])
+        docs = (REPO / "docs" / "switchboard.md").read_text()
+        self.assertEqual(docs.count("`review laws` takes four forms"), 1)
+
+    def test_mutants_of_the_bare_number_parser_are_caught(self):
+        good = sb.parse_bare_pr_ref
+        self.in_clone("https://github.com/acme-org/widget-service")
+        def rejects(text, directory=None):
+            raise sb.NoticeError("rejected")
+        def wrong_repo(text, directory=None):
+            return "acme/app", int(text.lstrip("#"))
+        def any_text(text, directory=None):
+            return "acme-org/widget-service", int("".join(c for c in text if c.isdigit()) or 1)
+        for name, mutant in (("rejects", rejects), ("wrong repository", wrong_repo), ("any text", any_text)):
+            with self.subTest(mutant=name):
+                failed = 0
+                with mock.patch.object(sb, "parse_bare_pr_ref", mutant):
+                    for case in ("test_review_laws_takes_a_bare_number_hash_number_short_form_and_url_alike",
+                                 "test_a_bare_number_resolves_against_the_working_directory_remote_never_the_configured_default",
+                                 "test_text_that_is_not_a_number_is_not_taken_for_one"):
+                        result = unittest.TestResult()
+                        type(self)(case).run(result)
+                        failed += 0 if result.wasSuccessful() else 1
+                self.assertGreaterEqual(failed, 1)
+        self.assertIs(sb.parse_bare_pr_ref, good)
+
     def test_a_law_file_over_the_size_limit_is_cut_and_says_so(self):
         self.contents[("CODING_STANDARDS.md", self.BASE)] = "x" * (sb.REVIEW_FILE_MAX + 500)
         code, out, err = self.review("coder", "laws", self.PR)
@@ -85748,7 +85848,7 @@ class TestAssembler(unittest.TestCase):
         self.assertEqual(lines[0], "fleet-switchboard")
 
     def test_a_second_part_puts_its_names_into_sb_in_the_order_given(self):
-        root = self._copy(["part_a.py", "fleet-switchboard", "switchboard/import_v1.py", "part_b.py"])
+        root = self._copy(["part_a.py", "fleet-switchboard", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py", "part_b.py"])
         (root / "part_a.py").write_text('ORDER = ["a"]\nA_SAW_MAIN = "main" in globals()\nA_FILE = __file__\n')
         (root / "part_b.py").write_text('ORDER.append("b")\nB_SAW_MAIN = "main" in globals()\n')
         module = _load("t_assembled", root / "fleet-switchboard")
@@ -85797,9 +85897,41 @@ class TestAssembler(unittest.TestCase):
         self.assertTrue(_load("t_unnamed_entry", root / "entry").ENTRY_SAW_A)
 
     def test_comments_and_blank_lines_in_a_manifest_are_ignored(self):
-        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard", "switchboard/import_v1.py"])
+        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py"])
         (root / "part_a.py").write_text("FROM_A = 1\n")
         self.assertEqual(_load("t_commented", root / "fleet-switchboard").FROM_A, 1)
+
+    def test_a_manifest_refuses_a_part_outside_the_entrys_directory_or_listed_twice(self):
+        cases = (("a parent path", ["../part_a.py", "fleet-switchboard"], "must be relative"),
+                 ("a nested parent path", ["sub/../../part_a.py", "fleet-switchboard"], "must be relative"),
+                 ("an absolute path", ["/etc/hosts", "fleet-switchboard"], "must be relative"),
+                 ("a duplicate", ["part_a.py", "fleet-switchboard", "part_a.py"], "listed twice"),
+                 ("a duplicate by another spelling", ["part_a.py", "./part_a.py", "fleet-switchboard"], "listed twice"))
+        for label, lines, message in cases:
+            with self.subTest(label):
+                root = self._copy(lines)
+                (root / "part_a.py").write_text("X = 1\n")
+                done = subprocess.run([sys.executable, str(root / "fleet-switchboard"), "status", "--help"], capture_output=True, text=True)
+                self.assertNotEqual(done.returncode, 0)
+                self.assertEqual(len(done.stderr.strip().splitlines()), 1, done.stderr)
+                self.assertIn(message, done.stderr)
+
+    def test_the_manifest_lists_exactly_the_part_files_in_bin_switchboard(self):
+        """No part file is left out of the manifest (it would never run) and none is listed twice."""
+        lines = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.startswith("#")]
+        parts = [n for n in lines if n != "fleet-switchboard"]
+        on_disk = sorted("switchboard/" + p.name for p in (BIN / "switchboard").glob("*.py"))
+        self.assertEqual(sorted(parts), on_disk)
+        self.assertEqual(len(parts), len(set(parts)))
+
+    def test_the_shipped_manifest_lists_the_entry_once_and_every_part_exists_under_bin(self):
+        lines = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.startswith("#")]
+        self.assertEqual(lines.count("fleet-switchboard"), 1)
+        self.assertEqual(len(lines), len(set(lines)))
+        for name in lines:
+            self.assertTrue((BIN / name).is_file(), name)
+            if name != "fleet-switchboard":
+                self.assertLessEqual(len((BIN / name).read_text().splitlines()), 1500, name)
 
     def test_a_symlinked_run_and_the_help_line_still_work(self):
         link = Path(tempfile.mkdtemp()) / "fsb"
