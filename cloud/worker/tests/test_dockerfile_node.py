@@ -30,7 +30,8 @@ def problems(t):
         out.append("checksum check must precede the node tar")
     if t.count("/usr/local/bin/node") != 2 and len(re.findall(r"ln -s /opt/node/bin/node /usr/local/bin/node", t)) != 1:
         out.append("node not linked")
-    for blk in re.findall(r"apt-get install(?:[^&]|&(?!&))*", t):
+    for part in t.split("apt-get install")[1:]:
+        blk = part.split("&" + "&")[0]
         if re.search(r"\b(nodejs|npm)\b", blk):
             out.append("apt nodejs")
     if re.search(r"curl[^\n]*\|\s*(ba)?sh|nodesource|npm install -g|npm i -g", t):
