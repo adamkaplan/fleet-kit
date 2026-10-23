@@ -22102,11 +22102,16 @@ def carries_context(engine, config, repo, number, facts, body, entries, runner, 
     """(#1196) The picture of the dependency named by the body's standing `CARRIES: #N` line, or None (no line, or the dependency has merged: the pull request is then
     read as an ordinary one). {"pr", "head", "plan", "refusal", "author", "notice_senders"}. The refusal is the reason in words (closed unmerged, or its head commit is not in this
     branch: GitHub's compare says the dependency's head is not an ancestor of ours); an unreadable dependency is refused too."""
-    number_dep = plan_ledger.carries_of(body)
+    number_dep, problem = plan_ledger.carries_parse(body)
+    if problem:
+        return {"pr": "%s#?" % repo, "head": None, "plan": None, "refusal": problem, "author": None, "notice_senders": []}
     if number_dep is None:
         return None
     dep_pr = "%s#%d" % (repo, number_dep)
     out = {"pr": dep_pr, "head": None, "plan": None, "refusal": None, "author": None, "notice_senders": []}
+    if number_dep == number:
+        out["refusal"] = "%s cannot carry itself" % dep_pr
+        return out
     try:
         raw = read_pr_json(engine, repo, number_dep)
         dep = pr_facts_from(raw)

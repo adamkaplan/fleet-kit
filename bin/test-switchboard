@@ -35746,6 +35746,173 @@ class TestCarriesLine(LedgerBase):
         engine = types.SimpleNamespace(config={"impact_hold": {"carry_clear": True}}, state_dir=None)
         self.assertIsInstance(sb.rehold_reason(engine, state, "acme/app", self.PR, "f" * 40), str)
 
+    # -- (#1196 fix round) each guard has a test that fails when the guard is removed
+
+    def carry_engine(self):
+        return types.SimpleNamespace(config={"gh": FAKE_GH, "impact_hold": {"enabled": True, "carry_clear": True}}, state_dir=self.world.state, gh_runner=self.route,
+                                     _note=lambda *a, **k: None, audit=None, now=lambda: 1)
+
+    def carried_state(self, names):
+        self.clear_state(self.HEAD, names=names)
+        state, _ = sb.read_impact_state(self.world.state)
+        state["carried"] = {self.PR: {"head": "f" * 40, "from": self.HEAD}}
+        return state
+
+    def test_G_rehold_reason_carries_a_clear_without_names_but_never_one_that_names_two(self):
+        engine = self.carry_engine()
+        self.assertIsNone(sb.rehold_reason(engine, self.carried_state(False), "acme/app", self.PR, "f" * 40), "control: an ordinary clear carries")
+        self.assertIsInstance(sb.rehold_reason(engine, self.carried_state(True), "acme/app", self.PR, "f" * 40), str)
+
+    def test_G_the_carry_decision_is_never_tried_for_a_clear_that_names_two(self):
+        engine = self.carry_engine()
+        cc = sb.load_module("clear_carry")
+        for names, expect_called in ((False, True), (True, False)):
+            self.clear_state(self.HEAD, names=names)
+            with mock.patch.object(cc, "decide", return_value={"carried": True}) as decide:
+                sb.impact_carry_decision(engine, "acme/app", 9, "f" * 40)
+            self.assertEqual(decide.called, expect_called, "names=%s" % names)
+
+    def test_G_a_clear_never_carries_to_a_later_head_directly(self):
+        self.clear_state(self.HEAD)
+        engine = self.carry_engine()
+        self.assertIsNone(sb.impact_carry_decision(engine, "acme/app", 9, "f" * 40))
+        state, _ = sb.read_impact_state(self.world.state)
+        self.assertNotEqual(state["clears"][self.PR]["head"], "f" * 40)
+        self.assertFalse(state.get("carried"))
+        row = self.g6("f" * 40)
+        self.assertEqual(row["status"], "waiting")
+        self.assertIn("clear is for another head", " ".join(row["missing"]))
+
+    def run_clear(self, body):
+        engine = self.world.new_engine("daemon")
+        engine.config.setdefault("impact_hold", {})["enabled"] = True
+        engine.config["gh"] = FAKE_GH
+        engine.gh_runner, engine.state_dir = self.route, self.world.state
+        self.pr["body"] = body
+        sb.impact_clear_core(engine, self.route, "acme/app", 9, "owner", "a false hold: it is a fixture")
+        return json.loads((self.world.state / "impact-hold.json").read_text())["clears"][self.PR]
+
+    def test_G_the_clear_of_a_carrying_pull_request_records_both_names_and_an_ordinary_one_none(self):
+        record = self.run_clear("PLAN: acme/app#7\nCARRIES: #10\n")
+        self.assertEqual(record.get("names"), [self.PR, self.DEP])
+        self.assertTrue(sb.plan_ledger.clear_names_both(record, self.PR, self.DEP))
+        self.assertNotIn("names", self.run_clear("PLAN: acme/app#7\n"))
+
+    def test_G6_a_clear_that_does_not_name_both_is_not_enough(self):
+        self.clear_state(self.HEAD, names=False)
+        row = self.g6(self.HEAD, floor_fn=lambda floor, *a: dict(floor, cleared=True, clear_head=self.HEAD, names_both=False, rehold=None))
+        self.assertEqual(row["status"], "waiting")
+        self.assertIn("does not name both", " ".join(row["missing"]))
+        row = self.g6(self.HEAD, floor_fn=lambda floor, *a: dict(floor, cleared=True, clear_head=self.HEAD, names_both=True, rehold=None))
+        self.assertNotIn("does not name both", " ".join(row.get("missing") or []))
+
+    def test_G0a_a_missing_or_failing_plan_of_the_dependency_makes_the_carrier_not_ready(self):
+        plan = {"result": "pass", "defects": [], "plan_hash": self.plan_hash(), "text": "", "scenarios_parsed": []}
+        pl = sb.plan_ledger
+        def g0a(dep):
+            carries = {"pr": self.DEP, "head": self.DEP_HEAD, "plan": dep, "refusal": None}
+            report = pl.evaluate_gates(plan, [], None, {"head": self.HEAD, "carries": carries}, self.PR)
+            return next(r for r in report["gates"] if r["gate"] == "G0a"), report
+        for dep in (None, dict(plan, result="fail")):
+            row, report = g0a(dep)
+            self.assertEqual(row["status"], "missing")
+            self.assertIn("plan is missing or fails", " ".join(row["missing"]))
+            self.assertFalse(report["ready"])
+        self.assertEqual(g0a(dict(plan))[0]["status"], "ok")
+
+    def test_the_dependencys_own_clear_is_never_reused_for_the_carrier(self):
+        (self.world.state / "impact-hold.json").write_text(json.dumps({"clears": {self.DEP: {"head": self.HEAD, "reason": "ok", "by": "owner", "at": 1, "names": [self.PR, self.DEP]}}, "applied": {}}))
+        floor = sb.floor_for_carries({"decision": "hold", "reasons": ["gates"], "cleared": False, "unreadable": None, "rehold": "held again"}, self.world.state, self.PR, self.DEP)
+        self.assertIsNone(floor["clear_head"])
+        self.assertFalse(floor["names_both"])
+        self.assertFalse(floor["cleared"])
+
+    # -- the line itself: one `CARRIES: #N`, outside fenced code, never its own number
+
+    def refused(self, body):
+        self.pr["body"] = body
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        self.assertEqual(code, 2, err)
+        return err
+
+    def test_M2_several_or_foreign_or_trailing_carries_lines_are_refused(self):
+        for body in ("CARRIES: #10\nCARRIES: #10", "CARRIES: #10, #11", "CARRIES: #10 and #11", "CARRIES: other/repo#10", "CARRIES: #12abc"):
+            err = self.refused("PLAN: acme/app#7\n%s\n" % body)
+            self.assertRegex(err, "more than one CARRIES line|not exactly", body)
+
+    def test_M2_the_parse(self):
+        pl = sb.plan_ledger
+        self.assertEqual(pl.carries_parse("CARRIES: #10\n")[0], 10)
+        self.assertEqual(pl.carries_parse("x\n  CARRIES:   #10  \n")[0], 10)
+        self.assertIsNone(pl.carries_parse("none")[0])
+        self.assertIsNone(pl.carries_parse("none")[1])
+        for body in ("CARRIES: #5\nCARRIES: #5", "CARRIES: #5, #6", "CARRIES: #5 and #6", "CARRIES: other/repo#5", "CARRIES: #12abc"):
+            self.assertEqual(pl.carries_parse(body)[0], None, body)
+            self.assertTrue(pl.carries_parse(body)[1], body)
+
+    def test_M3_a_pull_request_that_carries_itself_is_refused(self):
+        self.assertIn("cannot carry itself", self.refused("PLAN: acme/app#7\nCARRIES: #9\n"))
+
+    def test_M4_a_carries_line_inside_a_fenced_block_is_ignored(self):
+        pl = sb.plan_ledger
+        self.assertIsNone(pl.carries_parse("```\nCARRIES: #10\n```\n")[0])
+        self.assertIsNone(pl.carries_parse("~~~\nCARRIES: #10, #11\n~~~\n")[1])
+        self.assertEqual(pl.carries_parse("```\nCARRIES: #3\n```\nCARRIES: #10\n")[0], 10)
+        self.pr["body"] = "PLAN: acme/app#7\n```\nCARRIES: #10\n```\ncanon: updated the docs"
+        self.record(self.PR, self.HEAD, plan_ref="acme/app#7")
+        code, report, err = self.gates()
+        self.assertIsNone(report["carries"])
+
+    def mutate(self, module_name, function, old, new):
+        """A wrong build: `function` of the module compiled again with the text `old` replaced by `new` (which must exist). Returns (patch target, mutant)."""
+        mod = sb.load_module(module_name)
+        src = Path(mod.__file__).read_text()
+        assert old in src, "the guard text is not in %s: %r" % (module_name, old)
+        ns = dict(mod.__dict__)
+        exec(compile(src.replace(old, new, 1), mod.__file__, "exec"), ns)
+        if module_name == "impact_hold":   # its functions run in the daemon's globals (bind): the mutant too, and it replaces the daemon's name
+            original = ns[function]
+            return sb, types.FunctionType(original.__code__, vars(sb), original.__name__, original.__defaults__, original.__closure__)
+        return mod, ns[function]
+
+    def fails_with(self, module_name, function, old, new, test, also_sb=False):
+        mod, mutant = self.mutate(module_name, function, old, new)
+        with mock.patch.object(mod, function, mutant), self.assertRaises((AssertionError, TypeError)):   # a mutant that crashes is caught too
+            test()
+
+    def test_S6_a_mutant_per_guard_fails_the_guards_test(self):
+        guard = "    if cleared.get(\"names\"):   # (#1196) the clear of a carrying pull request never carries to a later head\n        carried = {}\n"
+        self.fails_with("impact_hold", "rehold_reason", guard, "", self.test_G_rehold_reason_carries_a_clear_without_names_but_never_one_that_names_two, True)
+        guard = "        if cleared.get(\"names\"):   # (#1196) a clear that names two pull requests is for its own head only\n            return None\n"
+        self.fails_with("impact_hold", "impact_carry_decision", guard, "", self.test_G_the_carry_decision_is_never_tried_for_a_clear_that_names_two, True)
+        self.fails_with("impact_hold", "impact_clear_core", 'state["clears"][pr]["names"] =', 'state["clears"][pr]["renamed"] =',
+                        self.test_G_the_clear_of_a_carrying_pull_request_records_both_names_and_an_ordinary_one_none, True)
+        self.fails_with("plan_ledger", "evaluate_gates", 'floor.get("cleared") and not floor.get("names_both"):', "False:",
+                        self.test_G6_a_clear_that_does_not_name_both_is_not_enough)
+        for cond in ('dep is None', 'dep is not None and dep.get("result") != "pass"'):   # a missing plan not caught / a failing plan not caught
+            self.fails_with("plan_ledger", "evaluate_gates", 'elif dep is None or dep.get("result") != "pass":', "elif %s:" % cond,
+                            self.test_G0a_a_missing_or_failing_plan_of_the_dependency_makes_the_carrier_not_ready)
+        self.fails_with("plan_ledger", "evaluate_gates", 'floor.get("clear_head") != head and not floor.get("cleared")', "False",
+                        self.test_G_a_clear_never_carries_to_a_later_head_directly)
+
+    def test_S6_a_mutant_per_line_rule_fails_the_rules_test(self):
+        pl = sb.plan_ledger
+        real = pl.carries_parse
+        def first_only(body):
+            found = re.search(r"(?m)^\s*CARRIES:\s*#(\d+)", body or "")
+            return (int(found.group(1)), None) if found else (None, None)
+        with mock.patch.object(pl, "carries_parse", first_only), self.assertRaises(AssertionError):
+            self.test_M2_the_parse()
+        unfenced = lambda body: real("\n".join(l for l in (body or "").splitlines() if not l.startswith(("```", "~~~"))))
+        with mock.patch.object(pl, "carries_parse", unfenced), self.assertRaises(AssertionError):
+            self.test_M4_a_carries_line_inside_a_fenced_block_is_ignored()
+        # self-carry: remove the guard of the switchboard and the test fails
+        real_ctx = sb.carries_context
+        def no_self_guard(engine, config, repo, number, *a):
+            return real_ctx(engine, config, repo, number + 1000, *a)
+        with mock.patch.object(sb, "carries_context", no_self_guard), self.assertRaises(AssertionError):
+            self.test_M3_a_pull_request_that_carries_itself_is_refused()
+
     # -- S6: the mutants. Each is a wrong build; the clause's checks must fail it and pass the real code.
 
     def checks(self):

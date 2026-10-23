@@ -357,13 +357,41 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
     return out
 
 
-CARRIES_RE = re.compile(r"(?m)^\s*CARRIES:\s*#(\d+)\b")
+CARRIES_LINE_RE = re.compile(r"(?mi)^[ \t]*CARRIES:.*$")
+CARRIES_EXACT_RE = re.compile(r"^[ \t]*CARRIES:[ \t]*#(\d+)[ \t]*$")
+FENCE_RE = re.compile(r"^[ \t]*(```|~~~)")
+
+
+def _outside_fences(body):
+    """The lines of `body` that are not inside a fenced code block."""
+    out, fence = [], None
+    for line in (body or "").splitlines():
+        mark = FENCE_RE.match(line)
+        if mark:
+            fence = None if fence == mark.group(1) else (fence or mark.group(1))
+            continue
+        if fence is None:
+            out.append(line)
+    return out
+
+
+def carries_parse(body):
+    """(#1196) (number, problem): the standing body line `CARRIES: #N` outside fenced code blocks. problem is the reason in words when there is more than one CARRIES
+    line, or a line that is not exactly `#N` (several dependencies, another repository, trailing text); number is then None."""
+    lines = [l for l in _outside_fences(body) if CARRIES_LINE_RE.match(l)]
+    if not lines:
+        return None, None
+    if len(lines) > 1:
+        return None, "more than one CARRIES line: one dependency only"
+    found = CARRIES_EXACT_RE.match(lines[0])
+    if not found:
+        return None, "the CARRIES line %r is not exactly `CARRIES: #N` (one dependency of this repository only)" % lines[0].strip()[:60]
+    return int(found.group(1)), None
 
 
 def carries_of(body):
-    """(#1196) The number N of the standing body line `CARRIES: #N` (the one dependency this pull request carries), else None. Only the first line counts."""
-    found = CARRIES_RE.search(body or "")
-    return int(found.group(1)) if found else None
+    """(#1196) The number N of the standing body line `CARRIES: #N` (outside fenced code), else None (no line, or a refused one: see carries_parse)."""
+    return carries_parse(body)[0]
 
 
 def carries_refusal(dep_pr, dep_state, dep_head, in_branch):
