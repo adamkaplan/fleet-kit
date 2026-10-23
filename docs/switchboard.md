@@ -1927,8 +1927,8 @@ turned the compaction read off, `COMPACTION_TTL_MAX` (30 s) remembered the list,
 and the key stayed "already delivered" until a compaction completed. The audit
 line `orders.unreadable` shows a refused file. The conversation note stays as a
 fallback where the service offers no system-prompt hook (the hook name is
-unverified in the running service); the light mode no longer turns off its
-re-send after a compaction.
+unverified in the running service); the light mode still turns off its
+re-send after a compaction, which the system prompt makes harmless.
 
 ### Decision tiers and the Chief of Staff's orders (PR 18)
 
