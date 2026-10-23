@@ -545,7 +545,6 @@
         "bin/closed_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
         "bin/cloud_client.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
         "bin/cloud_worker.py": "loaded only by `run_cloud` and `cmd_status`: the cloud commands, not the clear",
-        "bin/endpoint_liveness.py": "loaded only by the pane pass (a bounded liveness read of a no-pane row, alive or unknown) and the doctor; the clear never calls it",
         "bin/endpoint_send.py": "loaded only by `_send_by_registry` (the send command's registry route), which delivers a message to a registry endpoint; the clear never calls it",
         "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
         "bin/health_records.py": "loaded only by the health and pane pass, which the clear does not run",

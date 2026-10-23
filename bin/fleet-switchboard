@@ -7237,11 +7237,6 @@ def pane_health_pass(engine, now):
             table.pop(name, None)
     engine.pane_alerts = {n: v for n, v in states.items() if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n in agents and n not in retired
                           and not registry.no_pane_to_judge(registered.get(n))}
-    judged_by_endpoint = {n: row for n, row in registered.items() if registry.no_pane_to_judge(row) and row.get("endpoint") is not None and n not in retired}
-    try:   # #1181: alive with the time, or unknown; one bounded request per row per pass; never a verdict that removes or alerts
-        engine.row_liveness = load_module("endpoint_liveness").check_all(judged_by_endpoint, read=getattr(engine, "liveness_read", None)) if judged_by_endpoint else {}
-    except Exception:
-        engine.row_liveness = {}
     if retired_whole:   # a retired agent (name AND session) leaves the record the pane draws from; its session stays in retired.json for reattach and --undo
         for name in [n for n in agents if retired_agent(retired, n, agents[n].get("session"))]:
             for table in (agents, states, missing):
@@ -9219,6 +9214,7 @@ def add_retire_parsers(sub):
 def add_read_parsers(sub):
     read = sub.add_parser("read", help="The newest messages of an agent's session, oldest first (a cloud worker is read on its own endpoint)")
     read.add_argument("name", help="The agent's fleet name")
+    read.add_argument("--cloud-only", action="store_true", help="Require a cloud record for NAME; never fall to a local agent of that name")
     read.add_argument("--limit", type=int, default=20, help="How many messages (default 20, at most 200)")
 
 

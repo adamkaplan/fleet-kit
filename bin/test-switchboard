@@ -84955,7 +84955,9 @@ class TestNoPaneToJudge(StandInPids, Base):
         self.reg = sb.load_module("registry")
         self.live = sb.load_module("endpoint_liveness")
         self.requests = []
-        self.engine.liveness_read = self.read_ok
+        self.record_patch = mock.patch.object(self.live, "has_cloud_record", lambda name: True)   # the record lookup is tested on its own below
+        self.record_patch.start()
+        self.addCleanup(self.record_patch.stop)
 
     def read_ok(self, name, limit):
         """The stub of THE REUSED CALL (the cloud read of `fleet-switchboard read NAME`): answers."""
@@ -85101,36 +85103,63 @@ class TestNoPaneToJudge(StandInPids, Base):
     def test_the_check_is_alive_with_a_time_or_unknown_never_dead(self):
         self.assertEqual(self.liveness_problems(), [])
 
-    def test_the_pass_is_bounded_and_makes_one_request_per_row(self):
+    def test_the_pass_never_calls_the_liveness_check(self):
+        calls = []
+        with mock.patch.object(self.live, "check_all", lambda *a, **k: calls.append(a) or {}), mock.patch.object(self.live, "check", lambda *a, **k: calls.append(a) or {}), \
+                mock.patch.object(self.live, "read_newest", lambda *a, **k: calls.append(a) or True):
+            self.rows()
+            for _ in range(self.PASSES):
+                self.one_pass()
+        self.assertEqual(calls, [])
+        self.assertFalse(hasattr(self.engine, "row_liveness"))
+
+    def test_the_check_is_bounded(self):
         got = self.answers()
         self.assertLessEqual(max(got["slow_elapsed"], got["failed_elapsed"]), 0.3 + 1)
-        self.requests.clear()
-        self.rows()
-        self.one_pass()
-        by_row = [r[0] for r in self.requests]
-        self.assertEqual(sorted(by_row), ["bare", "orch-cloud"])
-        self.assertTrue(all(r[1] <= self.live.LIVENESS_SECONDS for r in self.requests))
-        self.assertEqual(len(by_row), 2)   # orch-cloud and bare have an endpoint; pilot has none: no request
-        self.assertEqual(len(set(by_row)), 2)
+
+    def test_no_cloud_record_is_unknown_and_a_live_local_agent_of_the_name_does_not_make_it_alive(self):
+        self.record_patch.stop()   # back to the real lookup, on an empty state dir
+        state = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, state, True)
+        row = {"endpoint": "https://orch.acme.svc/", "session": "ses_example1"}
+        local_agent_answers = lambda name, limit: True   # a live local agent named "platform" would answer a `read platform`
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": state}):
+            self.assertEqual(self.live.check("platform", row, 0.3, local_agent_answers)["verdict"], "unknown")
+            self.assertEqual(self.live.check_all({"platform": row}, 0.3, local_agent_answers)["platform"]["verdict"], "unknown")
+            os.makedirs(os.path.join(state, "fleet-switchboard", "cloud"))
+            Path(state, "fleet-switchboard", "cloud", "platform.json").write_text("{}")
+            self.assertEqual(self.live.check("platform", row, 0.3, local_agent_answers)["verdict"], "alive")
+        self.assertIn("--cloud-only", (BIN / "endpoint_liveness.py").read_text())
+
+    def test_mutant_a_local_agent_makes_a_cloud_row_alive_is_caught(self):
+        self.record_patch.stop()
+        state = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, state, True)
+        row = {"endpoint": "https://orch.acme.svc/"}
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": state}), mock.patch.object(self.live, "has_cloud_record", lambda name: True):
+            self.assertEqual(self.live.check("platform", row, 0.3, lambda n, l: True)["verdict"], "alive")   # the mutant: the real test above forbids this
+
+    def test_mutant_the_pass_calling_the_check_again_is_caught(self):
+        source = (BIN / "fleet-switchboard").read_text()
+        self.assertNotIn("endpoint_liveness", source)
+        self.assertNotIn("row_liveness", source)
 
     def test_the_row_holds_an_address_only_and_the_module_handles_no_credential(self):
         self.rows()
         self.one_pass()
-        self.assertTrue(self.requests)
         raw = (self.world.state / "registry.json").read_text()
         for word in ("Bearer", "password", "token", "Basic"):
             self.assertNotIn(word, raw)
         source = (BIN / "endpoint_liveness.py").read_text()
         for word in ("Authorization", "_read_token", ".password", "urllib"):
             self.assertNotIn(word, source)
-        self.assertEqual(self.engine.row_liveness["orch-cloud"]["verdict"], "alive")
 
     def test_a_failed_slow_or_partial_answer_removes_nothing(self):
         self.rows()
+        row = {"endpoint": "https://orch.acme.svc/"}
         for read in (lambda *a: (_ for _ in ()).throw(OSError("x")), lambda *a: False, lambda *a: None):
-            self.engine.liveness_read = read
+            self.assertEqual(self.live.check("orch-cloud", row, 0.3, read)["verdict"], "unknown")
             self.one_pass()
-            self.assertEqual({v["verdict"] for v in self.engine.row_liveness.values()}, {"unknown"})
             self.assertTrue({"orch-cloud", "pilot", "bare"} <= set(self.reg.read(self.world.state)["agents"]))
         view = sb.load_module("agent_reconcile").reconcile_on_read(self.world.state, self.reg.read(self.world.state), lambda n, a: {}, self.reg)
         self.assertEqual(view, [])

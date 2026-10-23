@@ -339,7 +339,7 @@ class DelegatedOrderCheck(DoctorCase):
 class CloudCharter(DoctorCase):
     """#1181: a charter whose pane line is `cloud:<agent name>` is live when its row's endpoint answers, unknown when not, never a dead pane."""
 
-    def charter_run(self, answer):
+    def charter_run(self, answer, record=True):
         import json, socket
         tmp = tempfile.mkdtemp(prefix="test-fleet-doctor.")
         self.addCleanup(shutil.rmtree, tmp, True)
@@ -347,6 +347,10 @@ class CloudCharter(DoctorCase):
         stub.write_text("import sys\nsys.exit(%d)\n" % (0 if answer else 1))
         state = Path(tmp) / "state"
         state.mkdir()
+        xdg = Path(tmp) / "xdg"   # the check needs a CLOUD RECORD: state/cloud/NAME.json under the switchboard's state dir
+        if record:
+            (xdg / "fleet-switchboard" / "cloud").mkdir(parents=True)
+            (xdg / "fleet-switchboard" / "cloud" / "orch-cloud.json").write_text("{}")
         sys.path.insert(0, str(BIN))
         import registry
         registry.upsert(state, "orch-cloud", {"session": "ses_example1", "pane": None, "role": "orchestrator", "kind": "orchestrator",
@@ -365,7 +369,7 @@ class CloudCharter(DoctorCase):
         listener.bind(str(sock))
         self.addCleanup(listener.close)
         run.extra_env.update({"HERDR_SOCKET_PATH": str(sock), "FLEET_REPO": "acme-org/widget-service", "FLEET_REGISTRY_DIR": str(state),
-                              "FLEET_SWITCHBOARD_BIN": str(stub)})
+                              "FLEET_SWITCHBOARD_BIN": str(stub), "XDG_STATE_HOME": str(xdg)})
         run.run()
         return run
 
@@ -381,6 +385,12 @@ class CloudCharter(DoctorCase):
         text = "\n".join(run.lines("charters"))
         self.assertIn("unknown (the endpoint did not answer", text, run.output)
         self.assertNotIn("name a dead pane", text)
+        self.assertNotIn("live", text)
+
+    def test_an_answering_read_without_a_cloud_record_is_unknown(self):   # e.g. a local agent of that name answers `read`
+        run = self.charter_run(True, record=False)
+        text = "\n".join(run.lines("charters"))
+        self.assertIn("unknown (the endpoint did not answer", text, run.output)
         self.assertNotIn("live", text)
 
 
