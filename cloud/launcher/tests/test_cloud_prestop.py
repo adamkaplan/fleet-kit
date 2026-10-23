@@ -42,6 +42,13 @@ class Base(unittest.TestCase):
         # the hook is installed under the names the image gives it
         shutil.copy(HOOK, os.path.join(self.bin, "cw-end-hook"))
         self.out = os.path.join(self.t, "out")
+        # macOS has no GNU timeout: a small stand-in at the front of PATH ('timeout [-k N] SECONDS cmd args' runs cmd args).
+        # CW_TEST_FAKE_TIMEOUT=1 forces the stand-in even where GNU timeout exists.
+        self.fake_timeout = bool(os.environ.get("CW_TEST_FAKE_TIMEOUT")) or shutil.which("timeout") is None
+        if self.fake_timeout:
+            fake = os.path.join(self.bin, "timeout")
+            open(fake, "w").write('#!/bin/sh\nif [ "$1" = -k ]; then shift 2; fi\nshift\nexec "$@"\n')
+            os.chmod(fake, 0o755)
 
     def env(self, **kw):
         e = dict(os.environ, PATH=self.bin + ":/usr/bin:/bin", CW_WORKER="w1", CW_WORKDIR=self.work,
@@ -90,6 +97,8 @@ class Hook(Base):
         self.assertEqual((p.returncode, p.stdout + p.stderr), (0, ""))
 
     def test_hanging_push_gives_up_inside_the_budget_with_one_line(self):
+        if self.fake_timeout:
+            self.skipTest("'timed out' comes from GNU timeout, which is absent (or hidden by CW_TEST_FAKE_TIMEOUT) here")
         self.dirty()
         self.fake_git('case "$*" in *" push "*|"push "*) exec sleep 300;; esac\nexec REAL "$@"\n')
         t0 = time.time()
