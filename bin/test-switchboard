@@ -37411,7 +37411,7 @@ class TestAgentBlockCounts(TestBlockTable):
     # ---- #1126: the floor prints the exact mismatch; a rating is recorded from the verbatim block
     def block_file(self, sev="Marginal", prob="Remote", action="none", klass=""):
         path = self.world.state / "verbatim.txt"
-        path.write_text("verdict: approve\nhead: %s\nimpact-action: %s\n%simpact-severity: %s\nimpact-probability: %s\nimpact-reason: why\nfindings:\n" % (
+        path.write_text("verdict: approve\nhead: %s\nimpact-action: %s\n%simpact-severity: %s\nimpact-probability: %s\nimpact-reason: why\nfiles-read:\n- docs/a.md | 5 | 5\nfindings:\n" % (
             LEDGER_HEAD, action, ("impact-class: %s\n" % klass) if klass else "", sev, prob))
         return str(path)
 
