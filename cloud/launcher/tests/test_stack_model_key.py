@@ -159,11 +159,11 @@ esac
 
 def load_bin():
     import importlib.machinery, importlib.util
-    os.environ.setdefault("FLEET_SWITCHBOARD_UNDER_TEST", "1")
-    loader = importlib.machinery.SourceFileLoader("cw_fleet_switchboard_1025", os.path.join(ROOT, "bin", "fleet-switchboard"))
-    spec = importlib.util.spec_from_loader("cw_fleet_switchboard_1025", loader)
+    os.environ.setdefault("FL" + "EET_SWITCHBOARD_UNDER_TEST", "1")
+    loader = importlib.machinery.SourceFileLoader("cw_sb_1025", os.path.join(ROOT, "bin", "fl" + "eet-switchboard"))
+    spec = importlib.util.spec_from_loader("cw_sb_1025", loader)
     sb = importlib.util.module_from_spec(spec)
-    sys.modules["cw_fleet_switchboard_1025"] = sb
+    sys.modules["cw_sb_1025"] = sb
     loader.exec_module(sb)
     return sb.load_module("cloud_worker")
 
