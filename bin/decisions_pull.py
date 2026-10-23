@@ -6,13 +6,19 @@ daemon keeps the list elsewhere; this program fetches it and writes the same fil
 
 Freshness (#1158). `written_at` is NOT a liveness signal: when the list is unchanged LocalStore.publish only touches the file's mtime, so an
 idle healthy daemon has an old `written_at`; and the generation restarts at 1 on a fresh volume. The liveness is the AGE of the source file,
-which the source command supplies (`--age-command`, one non-negative integer of seconds, measured on the source's own clock). The daemon and
-the plugin are unchanged.
+measured on the source's own clock, and it arrives in ONE of two ways. The daemon and the plugin are unchanged.
 
-  * A good body (an object with `decisions` and `errors` lists) with a supplied age of at most 180 s is written as the daemon writes it (same
+  * A hub source (the hub's GET /decisions): the response is the decisions body plus one top-level integer `age_seconds`, so body and age
+    come from ONE read and cannot race. It is taken out of the body before writing (the written file never has it). It must be an integer
+    (not a bool, float or string), 0 to a day; anything else, or none, is an unreachable source. When it is present it wins: a
+    `--age-command` given as well is not run, and one line on stderr says so.
+  * A plain-file source (no hub: a path, or a command that cats a file): the response has no `age_seconds`, so the age comes from a second
+    command, `--age-command` (one non-negative integer of seconds). This is the only use of that option.
+
+  * A good body (an object with `decisions` and `errors` lists) with an age of at most 180 s is written as the daemon writes it (same
     keys, indent 1, sorted keys, a final newline, mode 0600), to a temporary file and renamed over the old one, with the mtime set to now
     minus the age (the plugin's age is the mtime).
-  * The source unreachable, or its age missing, negative, not an integer, over a day, or over 180 s: the file is kept but its mtime is moved
+  * The source unreachable, or its age (either way) missing, negative, not an integer, over a day, or over 180 s: the file is kept but its mtime is moved
     past the plugin's stale limit, so the panel says "daemon not updating".
   * Garbage (not JSON, not the shape, a generation outside 0 to 2**31 - 1): the file is not touched at all.
   * `written_at` is only a plausibility check: more than 60 s in the future of this clock, the body is not trusted (file aged). Old is fine.
@@ -21,6 +27,12 @@ the plugin are unchanged.
 
 The source is a command that prints the file (for example `kubectl exec switchboard-0 -- cat <state>/decisions.json`), given after `--`.
 No key or token is read, stored or printed here; the command's own credentials are the caller's.
+
+A hub source (a command that GETs /decisions with the caller's own credentials and prints the response):
+
+    bin/decisions_pull.py --state DIR -- COMMAND-THAT-PRINTS-THE-HUB-RESPONSE
+
+A plain-file source:
 
     bin/decisions_pull.py --state DIR --age-command "kubectl exec switchboard-0 -- stat -c %Y /state/decisions.json" -- kubectl exec switchboard-0 -- cat /state/decisions.json
 (an age command prints the age in seconds, for example `echo $(( $(date +%s) - $(stat -c %Y FILE) ))` run on the source side.)
@@ -154,6 +166,19 @@ def parse_age(raw):
     return age
 
 
+def response_age(value):
+    """The age a hub response carries in `age_seconds`: a true integer (never a bool, float or string), 0 to a day; else Unreachable."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise Unreachable("age_seconds is not an integer")
+    return parse_age(str(value))
+
+
+def same_daemon(held, body):
+    """True only when both bodies carry the same usable pid (an integer, not a bool): a missing or odd pid proves no replay."""
+    pid = held.get("daemon_pid")
+    return isinstance(pid, int) and not isinstance(pid, bool) and body.get("daemon_pid") == pid
+
+
 def written_at_in_future(body, now):
     try:
         stamp = datetime.datetime.strptime(body["written_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()
@@ -272,12 +297,24 @@ def pull(state_dir, fetch, now=None, err=None, age=None, reset_generation=False)
         return UNTOUCHED
     try:
         raw = fetch()
-        seconds = parse_age(age() if age is not None else None)
     except Unreachable as why:
         return stale("source unreachable (%s)" % why)
+    garbage, body = None, None
     try:
         body = parse(raw)
     except Garbage as why:
+        garbage = why
+    try:
+        if body is not None and "age_seconds" in body:       # a hub response: body and age from one read
+            seconds = response_age(body.pop("age_seconds"))
+            if age is not None:
+                say(err, "age_seconds from the response is used; --age-command is ignored")
+        else:                                                # a plain-file source: the age comes from the second command
+            seconds = parse_age(age() if age is not None else None)
+    except Unreachable as why:
+        return stale("source unreachable (%s)" % why)
+    if garbage is not None:
+        why = garbage
         say(err, "source answered something that is not the daemon's decisions list (%s); %s untouched" % (why, DECISIONS_FILE))
         return UNTOUCHED
     if seconds > STALE_SECONDS:
@@ -286,7 +323,7 @@ def pull(state_dir, fetch, now=None, err=None, age=None, reset_generation=False)
         return stale("written_at is in the future; body not trusted")
     held = held_body(path)
     new = body.get("generation")
-    if held is not None and new is not None and new < held["generation"] and not reset_generation and body.get("daemon_pid") == held.get("daemon_pid"):
+    if held is not None and new is not None and new < held["generation"] and not reset_generation and same_daemon(held, body):
         return stale("generation %d is lower than the held %d from the same daemon (a stale replay); to accept it once run with "
                      "--reset-generation, or delete %s" % (new, held["generation"], DECISIONS_FILE))
     write_atomic(path, body, now - seconds, now)
@@ -296,7 +333,7 @@ def pull(state_dir, fetch, now=None, err=None, age=None, reset_generation=False)
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--state", default=os.environ.get("FLEET_SWITCHBOARD_STATE"), help="the state directory the plugin reads")
-    parser.add_argument("--age-command", help="a command (one string) that prints the source file's age in whole seconds")
+    parser.add_argument("--age-command", help="plain-file source only: a command (one string) that prints the source file's age in whole seconds (a hub response carries its own age_seconds, which wins)")
     parser.add_argument("--reset-generation", action="store_true", help="accept any in-bound generation once (recovery after a restart)")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="after --: the command that prints the remote decisions.json")
     args = parser.parse_args(argv)
