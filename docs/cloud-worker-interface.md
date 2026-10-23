@@ -104,6 +104,25 @@ Runs inside the pod on `stop`, a hard deadline, an idle stop and a node drain no
 
 A clean tree whose HEAD is already pushed pushes nothing and reports `pushed: false`.
 
+### The retire path: how the end hook pushes (#1018)
+
+**Cause.** The end hook runs inside the pod and, before this change, pushed with the credential the pod was started with: the per-run `git-token`, a one-hour App installation token minted at launch. When that token has expired (a pod older than an hour, or the App was re-created), `git fetch` failed with an authentication error, the hook exited 1, `stop` kept the pod, and the retire was refused with the work stranded in the pod.
+
+**Rules now.**
+
+- **Fresh token.** When this launcher can mint (`CW_GIT_TOKEN_CMD`, or the vault/App settings `app_token.py` reads), `stop` mints a fresh one-repository token at retire time, from the repository recorded on the pod (`CW_REPO`), only when the hook is about to run. It goes to `cw-end-hook --token-stdin` on the standard input of the `kubectl exec -i`, is held in memory only, and is used for the hook's own `git fetch` and `git push`. It is never an argument, in the pod only for the push itself: WHILE THE PUSH RUNS it is in the environment of that one git child inside the pod (a process of the same user there could read it if the agent is still alive), and it is gone when the push ends, never written to a file, a Secret or the run record, and never printed. With a fresh token the hook fetches from and pushes to `https://github.com/<CW_REPO>.git` (the repository the pod was started for), never to the `origin` an agent-writable repository config names; the token is offered over https to that host only, and those two git calls run in a scratch repository that borrows the work's objects and reads none of the agent's repository, global or system configuration (so no hook, proxy, TLS, resolve or remote setting of the repository applies), with only https allowed. A pod that records no repository cannot be minted for: that is a mint failure. A launcher with no mint settings, and an image whose hook predates the flag, behave as before.
+- **Keep, and say so once.** If the mint fails, or the push still fails, the pod stays marked `cw/kept=true`, nothing is deleted (the pod, both Secrets and the run record stay), and `stop` says so once on stderr: the step that failed (`mint` or `push`, never the detail), that the pod and its work are kept, and the recovery route below. A later `retire` mints again.
+- **Never cloned.** A pod whose default checkout `/work/repo` was never made (the clone failed) answers `pushed: false` with the note `no checkout; nothing to push`, and the retire ends the worker. A directory that exists but is no repository is an error: the pod is kept. An explicitly set `CW_WORKDIR` that is missing is also an error.
+- **Secrets' lifetime.** Unchanged: the per-run Secrets go with the pod on a successful retire, and a kept pod keeps its dead token Secret until `delete`; a dead token is not a credential, and the fresh token is never stored, so there is nothing new to expire.
+
+**Recovery route (read-only; run it from the operator's machine).** It reads the pod and deletes nothing; decide afterwards whether to push or to `delete --force`.
+
+```sh
+kubectl exec POD -- git -C /work/repo bundle create - --all > worker.bundle    # the commits
+kubectl exec POD -- tar -C /work -cf - repo > worker-repo.tar                  # the files that were never committed
+git clone worker.bundle recovered                                              # locally
+```
+
 ## 6. Idle and hard limit
 
 - **Idle** = no tool call and no model activity (a running session or step) for `CW_IDLE_SECONDS`. Inbound
