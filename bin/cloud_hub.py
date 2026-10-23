@@ -2,7 +2,7 @@
 
     POST /message    the channel server's route, unchanged: token review, sender pinned to the token, then DELIVERY here.
     GET  /decisions  the JSON object bin/decisions_pull.py accepts, read from the file named by FLEET_CLOUD_HUB_DECISIONS
-                     ({"decisions": [], "errors": []} when the file is absent). The same token review guards it.
+                     plus an integer age_seconds from the file's mtime on the hub's clock; 503 when absent or unreadable). The same token review guards it.
 
 Identity: an agent's bearer token is posted to the in-cluster TokenReview API (the hub's own service account token and CA);
 the authenticated user is mapped to the agent name by cloud_channel.agent_of (namespace pinned), never from a request body.
@@ -256,12 +256,16 @@ def make_hub(address, reviewer, inbox, audit, decisions_path=None, max_handlers=
                     audit(line)
                 return self._send(probe["status"], probe)
             try:
-                body = _read_json(decisions_path, {"decisions": [], "errors": []}) if decisions_path else {"decisions": [], "errors": []}
+                if not decisions_path:
+                    raise FileNotFoundError("no decisions file configured")
+                age = max(0, int(time.time() - os.stat(decisions_path).st_mtime))   # the hub's clock, the file's mtime only
+                body = _read_json(decisions_path, None)
                 if not isinstance(body, dict):
                     raise ValueError("not an object")
             except (OSError, ValueError):
                 audit("refused status=503 reason=decisions unreadable")
                 return self._send(503, {"status": 503, "error": "decisions unreadable"})
+            body["age_seconds"] = age
             audit("decisions served")
             self._send(200, body)
 

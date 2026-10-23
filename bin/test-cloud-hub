@@ -160,7 +160,7 @@ class TestHub(unittest.TestCase):
 
     def test_decisions(self):
         with Hub(load()) as hub:
-            self.assertEqual(hub.call("GET", "/decisions"), (200, {"decisions": [], "errors": []}))
+            self.assertEqual(hub.call("GET", "/decisions")[0], 503)    # absent file: 503 since #1158 (was an empty 200)
             hub.decisions.write_text(json.dumps({"decisions": [{"id": 1}], "errors": []}))
             self.assertEqual(hub.call("GET", "/decisions")[1]["decisions"], [{"id": 1}])
             self.assertEqual(hub.call("GET", "/decisions", token="nope")[0], 401)
@@ -285,6 +285,7 @@ class TestHub(unittest.TestCase):
         with Hub(load()) as hub:
             self.assertEqual(hub.call("GET", "/decisions", token="nope")[0], 401)
             self.assertEqual(hub.call("GET", "/decisions", token=None)[0], 401)
+            hub.decisions.write_text('{"decisions": [], "errors": []}')   # a served file is needed for 200 since #1158
             self.assertEqual(hub.call("GET", "/decisions")[0], 200)
 
 
@@ -312,6 +313,7 @@ class TestSecretsMode(unittest.TestCase):
         with SecretsHub(load()) as hub:
             self.assertEqual(hub.send(token=SECRET_A)[1]["delivered"], True)
             self.assertIn("from agent agent-a", hub.api.got[0][2]["text"])
+            hub.decisions.write_text('{"decisions": [], "errors": []}')   # a served file is needed for 200 since #1158
             self.assertEqual(hub.call("GET", "/decisions", token=SECRET_A)[0], 200)
             self.assertEqual(hub.calls, [])      # no TokenReview call
 
@@ -504,7 +506,11 @@ class TestMutants(unittest.TestCase):
         module = mutant("                if not isinstance(body, dict):\n                    raise ValueError(\"not an object\")", "                pass")
         def check(hub):
             hub.decisions.write_text("[1]")
-            self.assertEqual(hub.call("GET", "/decisions")[0], 503)
+            try:
+                status = hub.call("GET", "/decisions")[0]
+            except (OSError, http.client.HTTPException):
+                status = "dropped"     # the mutant now fails while adding age_seconds to a list
+            self.assertEqual(status, 503)
         self.fails(module, check)
 
     def test_mutant_http_anywhere(self):
@@ -550,6 +556,131 @@ class TestMutants(unittest.TestCase):
             (Path(hub.tmp.name) / "pw").write_text("x" * 5000)
             self.assertEqual(hub.send()[0], 503)
         self.fails(module, check)
+
+
+import os
+import time
+
+AGE_EXPR = "age = max(0, int(time.time() - os.stat(decisions_path).st_mtime))"
+
+
+def _aged(hub, content, age):
+    hub.decisions.write_text(content)
+    t = time.time() - age
+    os.utime(hub.decisions, (t, t))
+
+
+class TestDecisionsAge(unittest.TestCase):
+    """Issue 1158 hub half: S21..S25, each with a wrong build."""
+    OK = '{"decisions": [{"id": 1}], "errors": []}'
+
+    def fails(self, module, check):
+        try:
+            with Hub(module) as hub:
+                check(hub)
+        except AssertionError:
+            return
+        self.fail("mutant survived")
+
+    def test_s21_age_is_an_integer_of_the_mtime(self):
+        with Hub(load()) as hub:
+            _aged(hub, self.OK, 25)
+            status, body = hub.call("GET", "/decisions")
+            self.assertEqual(status, 200)
+            self.assertEqual(body["decisions"], [{"id": 1}])
+            self.assertEqual(body["errors"], [])
+            self.assertIs(type(body["age_seconds"]), int)
+            self.assertAlmostEqual(body["age_seconds"], 25, delta=1)
+
+    def test_s21_mutant_float_age(self):
+        module = mutant(AGE_EXPR, "age = max(0, time.time() - os.stat(decisions_path).st_mtime)")
+        def check(hub):
+            _aged(hub, self.OK, 25)
+            self.assertIs(type(hub.call("GET", "/decisions")[1]["age_seconds"]), int)
+        self.fails(module, check)
+
+    def test_s21_mutant_no_age(self):
+        module = mutant('            body["age_seconds"] = age\n', "")
+        def check(hub):
+            _aged(hub, self.OK, 25)
+            self.assertIn("age_seconds", hub.call("GET", "/decisions")[1])
+        self.fails(module, check)
+
+    def test_s22_age_follows_mtime_not_content(self):
+        def check(hub):
+            _aged(hub, '{"decisions": [], "errors": [], "written_at": "2000-01-01T00:00:00Z"}', 0)
+            self.assertTrue(0 <= hub.call("GET", "/decisions")[1]["age_seconds"] <= 2)
+            _aged(hub, '{"decisions": [], "errors": [], "written_at": "2999-01-01T00:00:00Z"}', 400)
+            self.assertTrue(399 <= hub.call("GET", "/decisions")[1]["age_seconds"] <= 401)
+        with Hub(load()) as hub:
+            check(hub)
+        self.fails(mutant(AGE_EXPR, "age = 3600 if '2000' in open(decisions_path).read() else 0"), check)
+
+    def test_s22_never_negative(self):
+        with Hub(load()) as hub:
+            _aged(hub, self.OK, -500)    # mtime in the future
+            self.assertEqual(hub.call("GET", "/decisions")[1]["age_seconds"], 0)
+
+    def test_s23_absent_is_503(self):
+        with Hub(load()) as hub:
+            status, body = hub.call("GET", "/decisions")
+            self.assertEqual((status, body.get("error")), (503, "decisions unreadable"))
+            self.assertNotIn("decisions", body)
+            self.assertTrue(any("503" in line for line in hub.lines))
+        def check(hub):
+            self.assertEqual(hub.call("GET", "/decisions")[0], 503)
+        # wrong build: an absent file is the old empty default
+        src = SOURCE.replace(AGE_EXPR, "age = 0").replace("body = _read_json(decisions_path, None)",
+                                                            "body = _read_json(decisions_path, {'decisions': [], 'errors': []})")
+        self.assertNotEqual(src, SOURCE)
+        self.fails(load(src), check)
+
+    def test_s24_unreadable_is_503(self):
+        def check(hub):
+            cases = []
+            for content in ("{not json", "[1, 2]"):
+                _aged(hub, content, 5)
+                cases.append(hub.call("GET", "/decisions")[0])
+            if os.geteuid() != 0:
+                _aged(hub, self.OK, 5)
+                os.chmod(hub.decisions, 0)
+                cases.append(hub.call("GET", "/decisions")[0])
+                os.chmod(hub.decisions, 0o600)
+            self.assertEqual(cases, [503] * len(cases))
+        with Hub(load()) as hub:
+            check(hub)
+        # wrong build: any failure falls back to an empty served body
+        src = SOURCE.replace('                return self._send(503, {"status": 503, "error": "decisions unreadable"})\n            body["age_seconds"] = age',
+                             '                body, age = {"decisions": [], "errors": []}, 0\n            body["age_seconds"] = age')
+        self.assertNotEqual(src, SOURCE)
+        self.fails(load(src), check)
+
+    def test_s25_authentication_still_required(self):
+        with Hub(load()) as hub:
+            _aged(hub, self.OK, 5)
+            for token in (None, ""):
+                status, body = hub.call("GET", "/decisions", token=token)
+                self.assertEqual(status, 401)
+                self.assertNotIn("age_seconds", json.dumps(body))
+            conn = http.client.HTTPConnection("127.0.0.1", hub.server.server_address[1], timeout=5)
+            conn.request("GET", "/decisions", headers={"Authorization": "Bearer "})
+            r = conn.getresponse()
+            self.assertEqual(r.status, 401)
+            self.assertNotIn(b"age_seconds", r.read())
+            conn.close()
+            self.assertEqual(hub.call("GET", "/decisions", token="nope")[0], 401)
+            status, body = hub.call("GET", "/decisions")
+            self.assertEqual(status, 200)
+            self.assertIn("age_seconds", body)
+
+    def test_s25_mutant_served_before_the_check(self):
+        src = SOURCE.replace('            header = self.headers.get("Authorization")\n',
+                             '            header = self.headers.get("Authorization")\n'
+                             '            if not header:\n                return self._send(200, {"age_seconds": 0})\n', 1)
+        self.assertNotEqual(src, SOURCE)
+        def check(hub):
+            self.assertEqual(hub.call("GET", "/decisions", token=None)[0], 401)
+        self.fails(load(src), check)
 
 
 if __name__ == "__main__":
