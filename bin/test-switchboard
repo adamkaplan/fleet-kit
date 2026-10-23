@@ -17046,7 +17046,6 @@ class TestClearNotice(Base):
                 sb.clear_notice_pass(self.engine, self.later())
                 self.assertEqual(self.pending(), {}, "the good one is delivered and the poison is gone")
                 self.assertTrue(self.events("gate.clear_notice_quarantined"))
-                self.world.admissions("cos").clear() if False else None
                 self.setUp()
                 self.make_pending("clear")
                 pending = self.pending()
@@ -35132,6 +35131,26 @@ class TestPlanLedger(LedgerBase):
         self.assertIn("LEDGER", self.run_as("coder", "gates", self.PR)[1])
         self.assertTrue(report["ledger_problem"])
 
+    def test_g6_says_a_marker_without_a_hold_when_the_floor_says_not_held(self):
+        facts = {"head": LEDGER_HEAD, "ci": "green", "captain": True, "captain_findings": ["marker-without-label"],
+                 "body": "MERGE: captain", "floor": {"decision": "none"}}
+        row = lambda f: next(r for r in sb.plan_ledger.evaluate_gates(None, [], None, f, self.PR)["gates"] if r["gate"] == "G6")
+        self.assertEqual(row(facts)["status"], "ok")
+        self.assertIn("set MERGE: automatic", row(facts)["detail"])
+        self.assertEqual(row(dict(facts, floor={"decision": "hold"}))["status"], "waiting")
+        self.assertEqual(row(dict(facts, captain_findings=[]))["status"], "waiting")   # a merge-captain label is a hold
+
+    def test_g6_keeps_waiting_when_holds_is_non_empty_or_the_floor_is_absent_or_unreadable(self):
+        facts = {"head": LEDGER_HEAD, "ci": "green", "captain": True, "captain_findings": ["marker-without-label"],
+                 "body": "MERGE: captain", "floor": {"decision": "none"}}
+        row = lambda f: next(r for r in sb.plan_ledger.evaluate_gates(None, [], None, f, self.PR)["gates"] if r["gate"] == "G6")
+        for name, f in (("holds", dict(facts, holds=["hold"])), ("absent", {k: v for k, v in facts.items() if k != "floor"}),
+                        ("unreadable", dict(facts, floor={"unreadable": "boom"}))):
+            with self.subTest(name):
+                self.assertEqual(row(f)["status"], "waiting")
+                self.assertNotIn("set MERGE: automatic", str(row(f)))
+        self.assertEqual(row(facts)["status"], "ok")
+
     def test_g4_g5_and_g6_read_the_pr(self):
         self.all_proven()
         self.pr["statusCheckRollup"] = [{"conclusion": "FAILURE", "status": "COMPLETED"}]
@@ -35350,10 +35369,11 @@ class TestWaive(LedgerBase):
                   "result": "pass", "expires": self.world.clock.now() + 3600}
         sb.plan_ledger.append_entry(self.world.state, forged, self.world.clock.now())
         report = self.gates()[1]
-        self.assertEqual(self.row(report, "G6")["status"], "waiting")               # the owner's hold stands
+        self.assertEqual(self.row(report, "G6")["status"], "ok")                    # a marker without a hold (the floor says not held), never waived into it
+        self.assertIn("set MERGE: automatic", self.row(report, "G6")["detail"])
         self.assertEqual(self.row(report, "G1")["status"], "waived")
         code, payload, _ = self.check()
-        self.assertEqual([f["gate"] for f in payload["failed"]], ["G6", "G6b"])      # still failing (reported: a repo lists G6 to enforce it)
+        self.assertEqual([f["gate"] for f in payload["failed"]], ["G6b"])      # the held PR's body is still checked
         self.assertEqual(self.run_as("coder", "gates-check", self.PR, "--for", "merge")[0], 0)   # G6 is not in this repo's enforced list
 
     def test_a_short_reason_is_refused(self):
@@ -41131,7 +41151,7 @@ class TestCiRecordPass(LedgerBase):
         self.go()
         line = sb.ci_record_status_line(self.world.state, self.t + 30)
         self.assertIn("ci-record: last pass", line)
-        self.assertIn("recorded 2 since the daemon started", line)
+        self.assertIn("recorded 2, already 0 since the daemon started", line)
         self.assertIn("last record", line)
 
     def pr_state(self, ref, *more):
@@ -41392,7 +41412,8 @@ class TestCiRecordPass(LedgerBase):
             with self.subTest(rollup=rollup):
                 self.pr["statusCheckRollup"] = rollup
                 self.go(advance=1000)
-        self.assertEqual((self.verdicts(), self.events("gate.ci_record")), ([], []))
+        self.assertEqual(self.verdicts(), [])
+        self.assertLessEqual([e["detail"].get("skip") for e in self.events("gate.ci_record")], ["pending"])   # at most one skip line per reason, nothing else
 
     def test_a_draft_pr_with_a_plan_gets_its_ci_verdict_so_ready_is_not_a_chicken_and_egg(self):
         self.hub.prs["acme/app"] = [self.listed(9, draft=True)]
@@ -41439,10 +41460,10 @@ class TestCiRecordPass(LedgerBase):
         calls = self.view_calls()
         self.gh_down = True
         self.simulate(minutes=16)      # a 5 s daemon loop for 16 minutes: 192 passes
-        self.assertLessEqual(len(calls), 4, calls)
-        self.assertGreaterEqual(len(calls), 2, "it is retried, with a delay that doubles (5, 10, 20, then 30 minutes)")
+        self.assertLessEqual(len(calls), 7, calls)
+        self.assertGreaterEqual(len(calls), 4, "it is retried at the next pass for the first failures, then with a delay that doubles (5, 10, 20, then 30 minutes)")
         errors = [e["detail"]["retry_in"] for e in self.world.audit() if e["event"] == "ci_record.error"]
-        self.assertEqual(errors[:3], [300, 600, 1200])
+        self.assertEqual(errors[:4], [0, 300, 600, 1200])   # the audit folds the two repeats of the first
         self.gh_down = False
         self.go(advance=3600)
         self.assertEqual(len(self.verdicts()), 2, "and it recovers once it can be read")
@@ -41570,6 +41591,128 @@ class TestCiRecordPass(LedgerBase):
         self.configure(evaluators={"ci": ["switchboard"]})
         self.assertEqual(self.run_as(None, "gates", "mode", "acme/app", "off")[0], 0)
         self.assertEqual(json.loads(self.config_file.read_text())["plan_gates"]["ci_record"], {"calls_per_pass": 12})
+
+
+class TestCiRecordPassOrder(LedgerBase):
+    """#1119: a green CI is recorded within one pass. The pass visits PRs before it re-reads lists, retries a skipped PR first and
+    says every skip once. A counting runner records every gh read; nothing is written to GitHub."""
+
+    REPOS = ("acme/app", "acme/tools", "acme/docs", "acme/infra")
+
+    def setUp(self):
+        super().setUp()
+        self.set_repos(self.REPOS)
+        self.t = 100000.0
+        self.views, self.failing, self.rollups, self.engine_cached = [], {}, {}, None
+        self.view_marks = []
+
+    def set_repos(self, repos, extra=None):
+        plan_gates = {"repos": {r: {"mode": "shadow"} for r in repos}}
+        plan_gates.update(extra or {})
+        self.extra_config = {"plan_gates": plan_gates}
+        self.configure(evaluators={"ci": ["switchboard"], "reviewer": ["rev"], "tester": ["tst"]})
+        self.hub = FakeHub({r: [self.listed(9)] for r in repos})
+
+    def listed(self, number, body="PLAN: acme/app#7", base="main"):
+        return {"number": number, "head": {"sha": LEDGER_HEAD}, "body": body, "draft": False, "base": {"ref": base}}
+
+    def counting(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1] == "pr" and argv[2] == "view":
+            number = int(argv[3].rsplit("#", 1)[-1])
+            self.views.append(number)
+            self.view_marks.append(len(self.hub.reads))
+            if self.failing.get(number, 0) > 0:
+                self.failing[number] -= 1
+                return subprocess.CompletedProcess(argv, 1, "", "gh: connection reset by peer")
+            if number in self.rollups:
+                saved = self.pr["statusCheckRollup"]
+                self.pr["statusCheckRollup"] = self.rollups[number]
+                try:
+                    return self.route(argv, **kwargs)
+                finally:
+                    self.pr["statusCheckRollup"] = saved
+        return self.route(argv, **kwargs)
+
+    def go(self, advance=0):
+        self.t += advance
+        if self.engine_cached is None:
+            engine = self.world.new_engine("daemon")
+            engine.hub, engine.gh_runner = self.hub, self.counting
+            engine.config = sb.load_config()
+            engine.state_dir = self.world.state
+            self.engine_cached = engine
+        sb.ci_record_pass(self.engine_cached, self.t)
+
+    def verdicts(self):
+        return [e for e in self.ledger() if e["kind"] == "verdict"]
+
+    def skips(self):
+        return [(e["subject"], e["detail"]["skip"]) for e in self.world.audit() if e["event"] == "gate.ci_record" and e["detail"].get("skip")]
+
+    def test_a_green_ci_is_recorded_in_one_pass_over_four_stale_lists_with_one_failed_read(self):
+        self.pr["statusCheckRollup"] = [{"status": "IN_PROGRESS", "conclusion": ""}]
+        self.go()                                                    # lists read, CI still running: nothing recorded
+        self.assertEqual(self.verdicts(), [])
+        self.pr["statusCheckRollup"] = [{"conclusion": "SUCCESS", "status": "COMPLETED"}]
+        for key in list(self.hub.prs):                               # another base branch in one of the repositories
+            self.hub.prs[key] = [self.listed(9, base="release/1")]
+        self.failing[9] = 1                                          # one gh read fails once
+        self.views.clear()
+        self.go(advance=sb.CI_RECORD_LIST_TTL + sb.CI_RECORD_PENDING_RETRY + 1)   # the lists are stale
+        self.assertEqual(sorted({(v["pr"], v["scenario"]) for v in self.verdicts()}),
+                         sorted((r + "#9", s) for r in self.REPOS for s in ("S1", "U1")), "all four repositories, in ONE pass")
+        self.assertEqual(len(self.verdicts()), 8, "never twice")
+        self.assertLessEqual(len(self.views) * sb.CI_RECORD_PR_COST, 30)
+
+    def test_a_warm_pass_visits_a_pr_before_it_re_reads_a_stale_list(self):
+        self.pr["statusCheckRollup"] = [{"status": "IN_PROGRESS", "conclusion": ""}]
+        self.go()                                                    # cold: the lists are read first
+        self.view_marks.clear()
+        before = len(self.hub.reads)
+        self.go(advance=sb.CI_RECORD_LIST_TTL + sb.CI_RECORD_PENDING_RETRY + 1)   # every list stale, PRs due
+        self.assertGreater(len(self.hub.reads), before, "the stale lists are read")
+        self.assertTrue(self.view_marks, "PRs are visited")
+        self.assertEqual(self.view_marks[0], before, "the first PR is visited before any list is re-read")
+
+    def test_a_skipped_pr_is_audited_once_with_its_reason_and_visited_first_at_the_next_pass(self):
+        self.set_repos(("acme/app",), {"ci_record": {"calls_per_pass": 12}})
+        self.hub.prs["acme/app"] = [self.listed(9), self.listed(10, body="**PLAN:** acme/app#7"), self.listed(11), self.listed(12)]
+        self.rollups[9] = [{"status": "IN_PROGRESS", "conclusion": ""}]
+        self.failing[11] = 1
+        self.go()
+        self.assertEqual(sorted(self.skips()), [("acme/app#10", "no plan link"), ("acme/app#11", "unreadable"), ("acme/app#12", "budget"),
+                                                ("acme/app#9", "pending")])
+        self.views.clear()
+        self.go(advance=1)
+        self.assertEqual(sorted(self.views[:2]), [11, 12], "the skipped PRs come first")
+        self.assertEqual({v["pr"] for v in self.verdicts()}, {"acme/app#11", "acme/app#12"})
+
+    def test_the_budget_is_never_exceeded_and_nothing_is_written(self):
+        self.set_repos(("acme/app",), {"ci_record": {"calls_per_pass": 10}})
+        self.hub.prs["acme/app"] = [self.listed(n) for n in range(9, 16)]
+        self.go()
+        self.go(advance=1)
+        self.assertLessEqual(len(self.views), 2 * 2, self.views)
+        self.assertEqual(len({(v["pr"], v["scenario"]) for v in self.verdicts()}), len(self.verdicts()))
+
+    def test_a_check_that_finishes_after_the_proofs_is_recorded_at_the_next_pass(self):
+        self.set_repos(("acme/app",))
+        self.pr["statusCheckRollup"] = [{"status": "IN_PROGRESS", "conclusion": ""}]
+        self.go()
+        for sid in ("S1", "U1"):
+            self.assertEqual(self.run_as("coder", "prove", sid, "--pr", self.PR, "--evidence", "ran the suite: 12 passed")[0], 0)
+        self.assertEqual(self.verdicts(), [])
+        self.pr["statusCheckRollup"] = [{"conclusion": "SUCCESS", "status": "COMPLETED"}]
+        self.go(advance=sb.CI_RECORD_PENDING_RETRY + 1)
+        self.assertEqual(sorted(v["scenario"] for v in self.verdicts() if v["by"] == "switchboard"), ["S1", "U1"])
+
+    def test_the_status_line_shows_already_recorded_verdicts(self):
+        self.set_repos(("acme/app",))
+        self.run_as("coder", "gates", "ci-record", self.PR)
+        self.go()
+        self.assertIn("already", sb.ci_record_status_line(self.world.state, self.t))
+        self.assertIn("recorded 0", sb.ci_record_status_line(self.world.state, self.t))
+
 
 
 class TestJudgeEval(Base):

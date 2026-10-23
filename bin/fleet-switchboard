@@ -24453,6 +24453,7 @@ CI_RECORD_PENDING_RETRY = 60   # a PR whose checks are still running is looked a
 CI_RECORD_FAILED_RETRY = 180   # a failing or missing run, or a plan that does not pass yet
 CI_RECORD_STATUS_FILE = "ci-record-status.json"
 CI_RECORD_PR_COST = 4   # calls one PR may use: its view, the plan issue and its comments (charged up front)
+CI_RECORD_RETRY_FAILS = 3   # failures in a row before an unreadable PR backs off; until then it is retried at the next pass
 CI_RECORD_RETRY = (300, 1800)   # an unreadable PR is retried after 5 minutes, doubling, to at most 30
 
 
@@ -24462,10 +24463,22 @@ class CiRecordState:
         self.good = {}      # normalised repo -> (read at, records, cut): the list of the LAST read of it in this process that SUCCEEDED; a failed read removes it (memory only)
         self.checked = {}   # (normalised repo, number) -> {"list_head", "at", "retry_at", "fails"}: the LAST-CHECKED time decides
         self.recorded = 0   # verdicts this process recorded
+        self.already = 0    # verdicts this process found already recorded (a manual `gates ci-record` first leaves these, not `recorded`)
+        self.priority = set()   # (repo, number) skipped by a pass: visited first at the next one
+        self.skipped = {}   # (repo, number) -> the reason last audited, so a skip is one line per PR and reason
         self.last_record = None
         self.written = 0
         self.pr_state = {}  # "owner/repo#N" -> the cached state `pr-state` shows (written to pr-state.json)
         self.pr_state_written = 0
+
+
+def ci_record_skip(engine, state, repo, number, reason):
+    """One audit line for a PR a pass did not record, with its reason; the same PR and reason is not written again."""
+    key = (plan_ledger.normal_repo(repo), number)
+    if state.skipped.get(key) == reason:
+        return
+    state.skipped[key] = reason
+    _gates_audit(engine, "gate.ci_record", "%s#%d" % (repo, number), {"ok": False, "skip": reason, "why": "skipped: " + reason})
 
 
 def ci_record_pass(engine, now):
@@ -24486,73 +24499,109 @@ def ci_record_pass(engine, now):
     state = engine.__dict__.setdefault("ci_record_state", CiRecordState())
     started, seconds = engine.now(), cfg.get("pass_seconds", 10)
     budget = [cfg.get("calls_per_pass", 30)]
-    stale = sorted(((state.lists.get(plan_ledger.normal_repo(r), (0, []))[0], r) for r in repos
-                    if now - state.lists.get(plan_ledger.normal_repo(r), (0, []))[0] >= CI_RECORD_LIST_TTL))
-    for _, repo in stale:
-        if budget[0] < 2 or engine.now() - started >= seconds:
-            break
-        key = plan_ledger.normal_repo(repo)
-        try:
-            records, cut = hub.read_pages("repos/%s/pulls?state=open&per_page=100" % repo, cap=2)
-            budget[0] -= sweep_pages_used(records, cut)
-            state.lists[key] = (now, records)
-            state.good[key] = (now, records, bool(cut) or len(records) >= LABEL_HOLD_LIST_CUT)
-            read_mark(engine, "pulls:" + key, not cut, "the open pull request list was cut", now)   # #811
-        except GitHubUnavailable as err:
-            budget[0] -= 1
-            read_mark(engine, "pulls:" + key, False, "the open pull request list could not be read", now)
-            state.good.pop(key, None)   # a failed read is no evidence: the old list stays for the rows, never for a prune
-            state.lists[key] = (now, state.lists.get(key, (0, []))[1])   # keep the old list and try again after the TTL
-            engine._note("ci_record.unreadable", repo, {"repo": repo, "reason": _one_line(str(err), 160)})
+    budget_total = budget[0]
+
+    def refresh(reserve_time):
+        stale = sorted(((state.lists.get(plan_ledger.normal_repo(r), (0, []))[0], r) for r in repos
+                        if now - state.lists.get(plan_ledger.normal_repo(r), (0, []))[0] >= CI_RECORD_LIST_TTL))
+        for _, repo in stale:
+            if budget[0] < 2 or engine.now() - started >= seconds:
+                break
+            key = plan_ledger.normal_repo(repo)
+            try:
+                records, cut = hub.read_pages("repos/%s/pulls?state=open&per_page=100" % repo, cap=2)
+                budget[0] -= sweep_pages_used(records, cut)
+                state.lists[key] = (now, records)
+                state.good[key] = (now, records, bool(cut) or len(records) >= LABEL_HOLD_LIST_CUT)
+                read_mark(engine, "pulls:" + key, not cut, "the open pull request list was cut", now)   # #811
+            except GitHubUnavailable as err:
+                budget[0] -= 1
+                read_mark(engine, "pulls:" + key, False, "the open pull request list could not be read", now)
+                state.good.pop(key, None)   # a failed read is no evidence: the old list stays for the rows, never for a prune
+                state.lists[key] = (now, state.lists.get(key, (0, []))[1])   # keep the old list and try again after the TTL
+                engine._note("ci_record.unreadable", repo, {"repo": repo, "reason": _one_line(str(err), 160)})
+    cold = any(plan_ledger.normal_repo(r) not in state.lists for r in repos)
+    if cold:
+        refresh(False)   # nothing to visit yet: the lists come first
     pr_state_from_lists(state, repos)
-    todo = []
-    for repo in repos:
-        key = plan_ledger.normal_repo(repo)
-        for record in state.lists.get(key, (0, []))[1]:
-            number = record.get("number") if isinstance(record, dict) else None
-            head = ((record.get("head") or {}).get("sha")) if isinstance(record, dict) else None
-            body = record.get("body") if isinstance(record, dict) and isinstance(record.get("body"), str) else ""
-            if not isinstance(number, int) or isinstance(number, bool) or not plan_ledger.PLAN_LINK_RE.search(body):   # drafts too: `gh pr ready` needs G1 present
-                continue
-            held = state.checked.get((key, number))
-            # Skip a PR that was checked and is not yet due: decided by when it was last CHECKED (not by what the check found), so a PR
-            # that is unreadable, or whose head had moved since the list, is not re-read every pass. A head the list now shows
-            # differently from the one it was checked under is new news and is due at once.
-            if held and held["list_head"] == head and now < held["retry_at"]:
-                continue
-            todo.append(((held or {"at": 0})["at"], repo, number, head))
-    runner = getattr(engine, "gh_runner", None) or subprocess.run
-    for _, repo, number, listed_head in sorted(todo):
-        if budget[0] < CI_RECORD_PR_COST or engine.now() - started >= seconds:
-            break
-        budget[0] -= CI_RECORD_PR_COST
-        key = (plan_ledger.normal_repo(repo), number)
-        fails = (state.checked.get(key) or {}).get("fails", 0)
-        try:
-            ns = types.SimpleNamespace(pr="%s#%d" % (repo, number), plan=None, ask=None, head=None)
-            ctx = _ledger_context(ns, runner, engine.now, True, parts=(engine, engine.state_dir, engine.config))
-            got = ci_record_core(ctx, engine.now, quiet=True)
-            if got["status"] == "unreadable":
-                raise RuntimeError(got["why"])
-            if got["recorded"]:
-                state.recorded += len(got["recorded"])
-                state.last_record = now
-            retry_at = now + CI_RECORD_TTL
-            if got["status"] == "not-green":   # the checks are running (or failed): look again soon, not in a quarter of an hour
-                retry_at = now + (CI_RECORD_PENDING_RETRY if got["ci"] == "pending" else CI_RECORD_FAILED_RETRY)
-            elif got["status"] == "no-plan":
-                retry_at = now + CI_RECORD_FAILED_RETRY
-            if got["head"] and got["head"] != listed_head:
-                # the head moved since the list was read: the next list refresh will show it, so wait for that, not every pass
-                retry_at = max(now + 1, state.lists.get(plan_ledger.normal_repo(repo), (now, []))[0] + CI_RECORD_LIST_TTL)
-            state.checked[key] = {"list_head": listed_head, "at": now, "retry_at": retry_at, "fails": 0}
-            pr_state_enrich(state, repo, number, ctx, now)
-        except Exception as err:
-            fails += 1
-            delay = min(CI_RECORD_RETRY[1], CI_RECORD_RETRY[0] * 2 ** (fails - 1))   # unreadable: 5 min, 10, 20, then 30
-            state.checked[key] = {"list_head": listed_head, "at": now, "retry_at": now + delay, "fails": fails}
-            engine._note("ci_record.error", "%s#%d" % (repo, number), {"error": _one_line("%s: %s" % (type(err).__name__, err), 200),
-                                                                      "retry_in": delay})
+    seen, tried = set(), set()   # seen: visited and settled this pass; tried: visited at all (a failed one may be tried again in the same pass)
+
+    def visit(keep):
+        todo = []
+        for repo in repos:
+            key = plan_ledger.normal_repo(repo)
+            for record in state.lists.get(key, (0, []))[1]:
+                number = record.get("number") if isinstance(record, dict) else None
+                head = ((record.get("head") or {}).get("sha")) if isinstance(record, dict) else None
+                body = record.get("body") if isinstance(record, dict) and isinstance(record.get("body"), str) else ""
+                if not isinstance(number, int) or isinstance(number, bool):
+                    continue
+                if not plan_ledger.PLAN_LINK_RE.search(body):   # drafts too: `gh pr ready` needs G1 present
+                    ci_record_skip(engine, state, repo, number, "no plan link")
+                    continue
+                held = state.checked.get((key, number))
+                # Skip a PR that was checked and is not yet due: decided by when it was last CHECKED (not by what the check found), so a PR
+                # that is unreadable, or whose head had moved since the list, is not re-read every pass. A head the list now shows
+                # differently from the one it was checked under is new news and is due at once.
+                if (key, number) in seen or (held and held["list_head"] == head and now < held["retry_at"]):
+                    continue
+                todo.append((0 if (key, number) in state.priority else 1, (held or {"at": 0})["at"], repo, number, head))
+        runner = getattr(engine, "gh_runner", None) or subprocess.run
+        # PRs first: the lists keep a small share (a stale list is re-read after the visits, with what is left)
+        pr_seconds = seconds if cold else seconds * 0.7
+        ordered = sorted(todo)
+        for index, (_, _, repo, number, listed_head) in enumerate(ordered):
+            if budget[0] < CI_RECORD_PR_COST + keep or engine.now() - started >= pr_seconds:
+                for _, _, r, n, _h in ordered[index:]:   # every skip is one audit line with its reason, and the PR is first next pass
+                    state.priority.add((plan_ledger.normal_repo(r), n))
+                    if (plan_ledger.normal_repo(r), n) not in tried:
+                        ci_record_skip(engine, state, r, n, "budget")
+                break
+            budget[0] -= CI_RECORD_PR_COST
+            key = (plan_ledger.normal_repo(repo), number)
+            seen.add(key)
+            tried.add(key)
+            fails = (state.checked.get(key) or {}).get("fails", 0)
+            try:
+                ns = types.SimpleNamespace(pr="%s#%d" % (repo, number), plan=None, ask=None, head=None)
+                ctx = _ledger_context(ns, runner, engine.now, True, parts=(engine, engine.state_dir, engine.config))
+                got = ci_record_core(ctx, engine.now, quiet=True)
+                if got["status"] == "unreadable":
+                    raise RuntimeError(got["why"])
+                if got["recorded"]:
+                    state.recorded += len(got["recorded"])
+                    state.last_record = now
+                state.already += len(got["already"])
+                state.priority.discard(key)
+                state.skipped.pop(key, None)
+                retry_at = now + CI_RECORD_TTL
+                if got["status"] == "not-green":   # the checks are running (or failed): look again soon, not in a quarter of an hour
+                    retry_at = now + (CI_RECORD_PENDING_RETRY if got["ci"] == "pending" else CI_RECORD_FAILED_RETRY)
+                    if got["ci"] == "pending":
+                        ci_record_skip(engine, state, repo, number, "pending")
+                elif got["status"] == "no-plan":
+                    retry_at = now + CI_RECORD_FAILED_RETRY
+                if got["head"] and got["head"] != listed_head:
+                    # the head moved since the list was read: the next list refresh will show it, so wait for that, not every pass
+                    retry_at = now + CI_RECORD_LIST_TTL   # the list is re-read after the visits, so a list time read here may be stale
+                state.checked[key] = {"list_head": listed_head, "at": now, "retry_at": retry_at, "fails": 0}
+                pr_state_enrich(state, repo, number, ctx, now)
+            except Exception as err:
+                fails += 1
+                # unreadable: the next pass for the first failures in a row (a network blip is not a PR fault), then 5 min, 10, 20, 30
+                delay = 0 if fails < CI_RECORD_RETRY_FAILS else min(CI_RECORD_RETRY[1], CI_RECORD_RETRY[0] * 2 ** (fails - CI_RECORD_RETRY_FAILS))
+                if delay == 0:
+                    state.priority.add(key)
+                    seen.discard(key)   # a failed read is tried once more in this pass, if the budget allows
+                ci_record_skip(engine, state, repo, number, "unreadable")
+                state.checked[key] = {"list_head": listed_head, "at": now, "retry_at": now + delay, "fails": fails}
+                engine._note("ci_record.error", "%s#%d" % (repo, number), {"error": _one_line("%s: %s" % (type(err).__name__, err), 200),
+                                                                          "retry_in": delay})
+    visit(0 if cold or budget_total < CI_RECORD_PR_COST + 2 else 2)   # PRs first; a small share is kept for the lists, never all of a small budget
+    if not cold:
+        refresh(True)
+        pr_state_from_lists(state, repos)
+    visit(0)   # what the refresh shows new (a new PR, an edited body) and a read that failed are seen in the same pass, with what is left
     write_ci_record_status(engine, state, now, len(repos))
     write_pr_state(engine, state, now)
 
@@ -24591,6 +24640,8 @@ def pr_state_from_lists(state, repos):
             seen.add(ref)
             if (state.pr_state.get(ref) or {}).get("via") == "event" and state.pr_state[ref].get("at", 0) > at:
                 continue   # #354: a webhook event newer than this list read is fresher than the list
+            if (state.pr_state.get(ref) or {}).get("state") in ("merged", "closed") and state.pr_state[ref].get("at", 0) >= at:
+                continue   # the pass visits PRs before it re-reads a list: a list read at the same moment is not newer than what the visit found
             head = (record.get("head") or {}).get("sha") if isinstance(record.get("head"), dict) else None
             labels = sorted(_plain(name, 60) for name in ((l.get("name") if isinstance(l, dict) else l) for l in (record.get("labels") if isinstance(record.get("labels"), list) else [])[:20]) if isinstance(name, str) and name)   # label names are GitHub's, set by anyone who can label: one line, no control characters, bounded
             old = state.pr_state.get(ref) or {}
@@ -24780,7 +24831,7 @@ def write_ci_record_status(engine, state, now, repos):
     if state.written and now - state.written < 60 and state.last_record != now:
         return
     state.written = now
-    body = {"at": int(now), "repos": repos, "recorded": state.recorded,
+    body = {"at": int(now), "repos": repos, "recorded": state.recorded, "already": getattr(state, "already", 0),
             "last_record": None if state.last_record is None else int(state.last_record)}
     try:
         state_write(Path(engine.state_dir) / CI_RECORD_STATUS_FILE, json.dumps(body, sort_keys=True), _without(body, "at"), STATE_HEARTBEAT_SECONDS)
@@ -24797,8 +24848,8 @@ def ci_record_status_line(state_dir, now_ts):
         return None
     ago = max(0, int(now_ts - at))
     last = raw.get("last_record")
-    return "ci-record: last pass %s (%s ago), recorded %d since the daemon started%s" % (
-        iso(at), "%d s" % ago if ago < 120 else "%d min" % (ago // 60), recorded,
+    return "ci-record: last pass %s (%s ago), recorded %d, already %d since the daemon started%s" % (
+        iso(at), "%d s" % ago if ago < 120 else "%d min" % (ago // 60), recorded, int(raw.get("already") or 0),
         "; last record " + iso(last) if isinstance(last, (int, float)) else "")
 
 
