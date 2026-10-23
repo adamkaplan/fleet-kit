@@ -22895,6 +22895,53 @@ def rating_block_note(entries, pr, head):
         return "no rating note: the clear module or the matrix could not be read (%s)" % type(err).__name__
 
 
+RETYPED_FORM_TEXT = "made by the retyped-field form (flags, no verbatim block): record it with `review record --block-file FILE`"
+
+
+def rating_mismatch_lines(state_dir, pr, head):
+    """#1126: one line per impact rating recorded for `pr` (at any head): reviewer, head, recorded severity/probability/action, the block's own, and the first differing field (severity, probability, action, head), `agrees`, or `no block to compare` (a rating with no block never agrees).
+    Display only: no verdict reads it. A rating whose head is not `head` says so. Returns [] when there is no ledger or no rating."""
+    if state_dir is None:
+        return []
+    try:
+        entries, problem = plan_ledger.read_ledger(state_dir)
+    except Exception:
+        return []
+    if problem:
+        return []
+    lines = []
+    for e in entries:
+        if not (isinstance(e, dict) and e.get("kind") == "review_record" and e.get("reviewer") == "impact" and e.get("pr") == pr):
+            continue
+        has_block = isinstance(e.get("block_sha256"), str) and e.get("block_sha256") != "none"
+        rec = [e.get("impact_severity"), e.get("impact_probability"), e.get("impact_action")]
+        blk = [e.get("block_impact_severity"), e.get("block_impact_probability"), e.get("block_impact_action")] if has_block else [None, None, None]
+        first = None
+        if isinstance(head, str) and e.get("head") != head:
+            first = "head"
+        else:
+            for name, r, b in zip(("severity", "probability", "action"), rec, blk):
+                if not has_block:
+                    break
+                if name == "action":   # a block with no action line means no action: `none` agrees, any other recorded action differs
+                    r, b = (None if r in (None, "none") else r), (None if b in (None, "none") else b)
+                if r != b:
+                    first = name
+                    break
+        shown = lambda v: "none" if v is None else str(v)
+        line = "%s %s: recorded %s/%s/%s; block %s; %s" % (
+            e.get("reviewer"), str(e.get("head") or "")[:8], shown(rec[0]), shown(rec[1]), shown(rec[2]),
+            "%s/%s/%s" % tuple(shown(v) for v in blk) if has_block else "none kept", "no block to compare" if first is None and not has_block else "agrees" if first is None else "differs first at %s" % first)
+        if first == "head":
+            line += ": the rating's head %s is not the current head %s" % (str(e.get("head") or "")[:8], str(head)[:8])
+        if first and first != "head":
+            line += " (recorded %s, block %s)" % (shown(rec[("severity", "probability", "action").index(first)]), shown(blk[("severity", "probability", "action").index(first)]))
+        if not has_block:
+            line += "; " + RETYPED_FORM_TEXT
+        lines.append(line)
+    return lines
+
+
 def impact_rating_entries(state_dir, pr, head):
     """([ledger entries], problem): every impact reviewer record of EXACTLY this pull request and head (the delegated clear's score is the highest of those whose recorded role counts: `delegated_clear.judge` decides which).
     A ledger that cannot be read, or whose chain is broken, gives ([], why): the score is then unknown. #835."""
@@ -23020,7 +23067,7 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
         if review:
             decision = "hold"
     rating_entries = impact_rating_entries(engine.state_dir, "%s#%d" % (repo, number), head)[0] if engine.state_dir is not None and isinstance(head, str) else []
-    return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude, "rating_block": rating_block_note(rating_entries, "%s#%d" % (repo, number), head),
+    return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude, "rating_block": rating_block_note(rating_entries, "%s#%d" % (repo, number), head), "rating_lines": rating_mismatch_lines(engine.state_dir, "%s#%d" % (repo, number), head),
             "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete,
             "top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "review_action": record[0] if record else None, "review_class": record[1] if record else None,   # #661: display data the delegated clear reads; no decision changes
             "changed_paths": [p for p in paths if isinstance(p, str)][:200], "unknown": unknown, "rated": [list(r) for r in rated],
@@ -23155,6 +23202,8 @@ def cmd_impact_floor(args, runner, now):
             print("  %s: %s" % ("why" if owner == "hold" else "because", reason))
         if report.get("rating_block"):
             print("  rating: %s" % report["rating_block"])
+        for line in report.get("rating_lines") or []:
+            print("  rating considered: %s" % line)
         if owner == "none" and not report.get("owner_reasons") and not cut and not blind:
             print("  because: no changed path is a top tier path of the matrix, and no independent review or rating holds it")
         if cut and owner != "hold":
@@ -25026,9 +25075,11 @@ def parse_review_block(text):
     if not isinstance(text, str) or not text.strip():
         return None, "no verdict block"
     lines = [l.strip() for l in text.splitlines()]
-    fields = {"verdict": None, "head": None, "impact_action": None, "impact_class": None, "impact_severity": None, "impact_probability": None, "impact_reason": None, "blocks": 0, "notes": 0, "findings": 0, "files_read": [], "files_problem": None}
+    fields = {"verdict": None, "head": None, "impact_action": None, "impact_class": None, "impact_severity": None, "impact_probability": None, "impact_reason": None, "blocks": 0, "notes": 0, "findings": 0, "files_read": [], "files_problem": None, "block_count": 0}
     started, section = False, "findings"
     for line in lines:
+        if started and line.startswith("verdict:"):
+            fields["block_count"] += 1   # #1126: a second `verdict:` line before the block ends opens another block (`--block` keeps reading the first verdict and the last rating)
         if line.startswith("verdict:") and not started:
             fields["verdict"], started = line.split(":", 1)[1].strip(), True
         elif started and line.startswith("head:"):
@@ -25150,7 +25201,7 @@ def block_table_text():
 
 BLOCK_TABLE_TEXT = block_table_text()
 NO_SCORE_TEXT = ("recorded WITHOUT a score (no impact severity and probability): it clears nothing by score; add --impact-severity and --impact-probability, or `impact-severity:` and `impact-probability:` lines in the block")
-RATING_INPUTS = IMPACT_RATING_FIELDS + ("impact_action", "impact_class", "block")   # every input of `review record` that decides the rating: read ONLY by `rating_inputs`, from the raw argv
+RATING_INPUTS = IMPACT_RATING_FIELDS + ("impact_action", "impact_class", "block", "block_file")   # every input of `review record` that decides the rating: read ONLY by `rating_inputs`, from the raw argv
 
 
 CARRY_FLAG_INPUTS = ("confirms_carry",)   # (#815) a flag with no value: whether a record confirms a carry
@@ -25241,16 +25292,27 @@ def cmd_review(args, runner, now):
         action, klass = given.get("impact_action"), given.get("impact_class")
         rating_in = {name: given.get(name) for name in IMPACT_RATING_FIELDS}
         block_digest, block_fields, block_rows, block_problem = None, {}, None, None
-        if given.get("block") is not None:   # the reviewer's returned text: the coder session records it
+        from_file = given.get("block_file") is not None
+        block_path = given.get("block") if given.get("block") is not None else given.get("block_file")
+        if given.get("block_file") is not None:   # #1126: the verbatim block, and nothing restated: the rating comes from the block alone
+            restated = [flag for flag, value in (("--block", given.get("block")), ("--verdict", verdict), ("--head", args.head), ("--blocks", args.blocks), ("--notes", args.notes),
+                                                 ("--impact-action", action), ("--impact-class", klass), ("--impact-severity", rating_in["impact_severity"]),
+                                                 ("--impact-probability", rating_in["impact_probability"]), ("--impact-reason", rating_in["impact_reason"])) if value]
+            if restated:
+                raise ReviewError("refused: --block-file takes the rater's block verbatim and derives severity, probability, action and class from it; do not give %s with it (nothing was recorded)" % ", ".join(restated))
+        if block_path is not None:   # the reviewer's returned text: the coder session records it
             carried = {"verdict": verdict, "head": args.head, "blocks": args.blocks, "notes": args.notes, "impact_action": action}
             if any(carried[dest] for flag, dest, mode in BLOCK_FLAG_TABLE if mode == "refused"):
                 raise ReviewError(BLOCK_TABLE_TEXT)
-            block_text = _read_capped(given["block"], REVIEW_TABLE_MAX)
+            block_text = _read_capped(block_path, REVIEW_TABLE_MAX)
             fields, why = parse_review_block(block_text)
             if fields is None:
                 raise ReviewError("refused: %s" % why)
+            if from_file and fields["block_count"] > 0:   # #1126: a verbatim block file is ONE block; the verdict (first block) and the rating (last block) of two would splice
+                raise ReviewError("refused: the file holds %d blocks: a block file is ONE block, the rater's own (nothing was recorded)" % (fields["block_count"] + 1))
             block_raw = block_text.encode("utf-8")
             block_digest, block_fields = (hashlib.sha256(block_raw).hexdigest(), len(block_raw)), {name: fields[name] for name in IMPACT_RATING_FIELDS}
+            block_fields["impact_action"], block_fields["impact_class"] = fields["impact_action"], fields["impact_class"]   # #1126: kept so the floor can print what the block itself said
             verdict, args.head, args.blocks, args.notes, action = (fields["verdict"], fields["head"], fields["blocks"], fields["notes"], fields["impact_action"])
             block_rows, block_problem = fields["files_read"], fields["files_problem"]
             klass = klass or fields["impact_class"]
@@ -25338,6 +25400,7 @@ def cmd_review(args, runner, now):
             entry["block_sha256"] = block_digest[0] if block_digest else "none"
             if block_digest:
                 entry["block_size"] = block_digest[1]
+                entry["record_form"] = "block-file" if from_file else "block"
                 for name, value in block_fields.items():
                     if value:
                         entry["block_" + name] = plan_ledger.clip(redact_command_text(value), 200)
@@ -25572,6 +25635,7 @@ def add_review_parsers(sub):
     record.add_argument("--head", help="The commit judged (default: the PR's head; a different one is refused)")
     record.add_argument("--verdict", help="approve | request-changes | comment | incomplete")
     record.add_argument("--block", help="File (or - for stdin) holding the verdict block a reviewer returned: verdict, head, counts and impact action are read from it. " + BLOCK_TABLE_TEXT)
+    record.add_argument("--block-file", dest="block_file", help="File holding the rater's verbatim block: severity, probability, action, class, verdict and head are read from it and NO restating flag is accepted (only --reviewer, --summary, --confirms-carry)")
     record.add_argument("--blocks", type=int, default=0, help="Blocking findings (each cites a rule)")
     record.add_argument("--notes", type=int, default=0, help="Notes and proposals")
     record.add_argument("--impact-action", dest="impact_action", choices=("hold", "second-review", "none"),
