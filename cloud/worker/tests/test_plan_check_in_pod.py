@@ -129,8 +129,19 @@ class PlanCheckInPod(unittest.TestCase):
 
     def test_u1_guard_and_permissions_untouched(self):
         # Pinned hashes of the files at the time of this change (they must not change for the plan check).
-        for name, digest in PINNED.items():
-            self.assertEqual(hashlib.sha256(read(os.path.join(WORKER, name))).hexdigest(), digest, name)
+        self.assertEqual(hashlib.sha256(read(os.path.join(WORKER, "guard.sh"))).hexdigest(), PINNED["guard.sh"])
+        # opencode-worker.json: a readable pin. The rows that existed before ask 1083 are pinned as one digest of their canonical JSON;
+        # every row an ask adds is listed in ADDED_ROWS below, so a later ask shows its rows as a plain diff line, not a new hash.
+        import json
+        with open(os.path.join(WORKER, "opencode-worker.json")) as f:
+            conf = json.load(f)
+        bash = conf["permission"]["bash"]
+        self.assertEqual(bash, conf["agent"]["worker"]["permission"]["bash"])
+        listed = {k for k, _ in ADDED_ROWS}
+        self.assertEqual([(k, v) for k, v in bash.items() if k in listed], ADDED_ROWS)
+        base = {k: v for k, v in bash.items() if k not in listed}
+        rest = dict(conf, permission={"bash": base}, agent={"worker": dict(conf["agent"]["worker"], permission={"bash": base})})
+        self.assertEqual(hashlib.sha256(json.dumps(rest, sort_keys=True).encode()).hexdigest(), PINNED_JSON_WITHOUT_ADDED_ROWS)
         self.assertNotIn(b"cw-plan-check", read(os.path.join(WORKER, "guard.sh")))
         self.assertNotIn(b"cw-plan-check", read(os.path.join(WORKER, "opencode-worker.json")))
 
@@ -232,7 +243,29 @@ def intent_differs():
     return "## Intent\n\nMake it work.\nDone when: something else\n\n" + plan()
 
 
-PINNED = {'guard.sh': '9bff815feddd3424f2f853c8e002333474845ab7d8091f562bbd9256852a9321', 'opencode-worker.json': '55e257df63d010c9d9cfbda0c219f56005b4c346a84ff00f1d7cee8f05bb69ec'}
+PINNED = {'guard.sh': '9bff815feddd3424f2f853c8e002333474845ab7d8091f562bbd9256852a9321'}
+PINNED_JSON_WITHOUT_ADDED_ROWS = "c14522cff99b9223d881b9f80a3d3397f55ae15a5d6f12a2380b89c9de6fd4be"
+# Rows added to opencode-worker.json, in file order. A pin changes only in the ask whose approved plan names the rows:
+# asks 1166 and 1200 add their rows to THIS list.
+ADDED_ROWS = [   # ask 1083: DW-6 (read an issue's comments and the two pull request read paths, GET only; write methods and flags stay denied)
+    ('gh api*/issues/*/comments', 'allow'),
+    ('gh api*/issues/*/comments *', 'allow'),
+    ('gh api*/issues/*/comments?*', 'allow'),
+    ('gh api*/pulls/*/reviews', 'allow'),
+    ('gh api*/pulls/*/reviews *', 'allow'),
+    ('gh api*/pulls/*/reviews?*', 'allow'),
+    ('gh api*/pulls/*/comments', 'allow'),
+    ('gh api*/pulls/*/comments *', 'allow'),
+    ('gh api*/pulls/*/comments?*', 'allow'),
+    ('gh api*POST*', 'deny'),
+    ('gh api* -f*', 'deny'),
+    ('gh api* -F*', 'deny'),
+    ('gh api*--field*', 'deny'),
+    ('gh api*--raw-field*', 'deny'),
+    ('gh api*--input*', 'deny'),
+    ('gh api*graphql*', 'deny'),
+    ('gh api*mutation*', 'deny'),
+]
 
 if __name__ == "__main__":
     unittest.main()
