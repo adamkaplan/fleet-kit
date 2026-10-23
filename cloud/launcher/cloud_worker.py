@@ -118,8 +118,8 @@ POD_TERMINATION_GRACE_SECONDS = 60
 PRESTOP_BUDGET_SECONDS = 45
 PRESTOP_LIFECYCLE = {"preStop": {"exec": {"command": ["/usr/local/bin/cw-prestop", str(PRESTOP_BUDGET_SECONDS)]}}}
 # The one read-only recovery route for work a hook could not push (a constant string).
-RECOVERY_ROUTE = ("recover read-only: kubectl exec <pod> -- git -C /work/repo log --oneline origin/HEAD..HEAD ; "
-                  "kubectl cp <pod>:/work/repo <local-dir>")
+RECOVERY_ROUTE = ("recover read-only: the work is still in /work/repo of the kept pod; see the pod's own output line "
+                  "(cw-prestop: not pushed) and the run record")
 
 
 def _prestop_differs(pod):

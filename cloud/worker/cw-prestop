@@ -1,6 +1,6 @@
 #!/bin/sh
 # cw-prestop <budget seconds>: the container's preStop hook. Pushes unpushed work to <worker>/wip with the pod's own
-# credential helper (plain git, via ~/.gitconfig). Never forces, never prints a token, always exits 0.
+# credential helper (plain git, through the global git configuration). Never forces, never prints a token, always exits 0.
 budget="${1:-45}"
 GIT_TERMINAL_PROMPT=0
 GCM_INTERACTIVE=never

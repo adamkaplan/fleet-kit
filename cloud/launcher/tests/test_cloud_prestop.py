@@ -157,7 +157,7 @@ class Spec(unittest.TestCase):
                 self.assertTrue(cw.forbidden_pod_fields(pod))
 
     def test_the_refusal_text_names_the_recovery_route(self):
-        self.assertIn("kubectl exec", cw.RECOVERY_ROUTE)
+        self.assertIn("recover read-only", cw.RECOVERY_ROUTE)
         src = open(os.path.join(LAUNCHER, "cloud_worker.py")).read()
         self.assertIn("RECOVERY_ROUTE)", src)
 
