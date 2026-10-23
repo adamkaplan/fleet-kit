@@ -21,6 +21,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin \
  && rm -rf /var/lib/apt/lists/*
 
+# ---- #1165: the build tool `make` (one package, no compiler toolchain: --no-install-recommends) ----
+RUN apt-get update && apt-get install -y --no-install-recommends make \
+ && rm -rf /var/lib/apt/lists/*
+# ---- end #1165 ----
+
 # OpenCode v2: a pinned standalone binary (no node or npm), checked against its sha256 before it is unpacked.
 RUN curl -fsSL "https://opencode.ai/files/bin/${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" -o /tmp/oc.tgz \
  && echo "${OPENCODE_SHA256}  /tmp/oc.tgz" | sha256sum -c - \
