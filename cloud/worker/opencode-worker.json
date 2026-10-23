@@ -120,7 +120,13 @@
       "gh api*--raw-field*": "deny",
       "gh api*--input*": "deny",
       "gh api*graphql*": "deny",
-      "gh api*mutation*": "deny"
+      "gh api*mutation*": "deny",
+      "gh pr edit*": "deny",
+      "gh pr edit * --body-file *": "allow",
+      "gh pr edit*--body-file* --*": "deny",
+      "gh pr edit*--* --body-file*": "deny",
+      "gh pr edit*://*": "deny",
+      "gh pr edit*--repo*": "deny"
     }
   },
   "agent": {
@@ -246,7 +252,13 @@
           "gh api*--raw-field*": "deny",
           "gh api*--input*": "deny",
           "gh api*graphql*": "deny",
-          "gh api*mutation*": "deny"
+          "gh api*mutation*": "deny",
+          "gh pr edit*": "deny",
+          "gh pr edit * --body-file *": "allow",
+          "gh pr edit*--body-file* --*": "deny",
+          "gh pr edit*--* --body-file*": "deny",
+          "gh pr edit*://*": "deny",
+          "gh pr edit*--repo*": "deny"
         }
       }
     }

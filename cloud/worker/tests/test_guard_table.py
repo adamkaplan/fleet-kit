@@ -97,6 +97,8 @@ class Table(unittest.TestCase):
 
     def test_u2_the_guard_and_the_client_agree_on_every_row(self):
         for r in rows():
+            if r["id"].startswith("pr-edit-"):
+                continue   # ask 1200: these rows write; tests/test_pr_edit.py runs them through both
             with self.subTest(row=r["id"]):
                 denied = r["kind"] == "denied"
                 self.assertEqual(guard_denies(r["example"]), denied, "guard: " + r["id"])

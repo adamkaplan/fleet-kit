@@ -236,6 +236,71 @@ def pr_create(args):
     payload = {"title": opts["title"], "body": body, "head": head, "base": base, "draft": bool(opts.get("draft"))}
     out = parse_json(request("POST", "/repos/%s/pulls" % repo, payload))
     print(out.get("html_url", ""))
+    record_pr(out.get("number"))
+
+
+def record_pr(n):
+    """The pod's own record of pull requests it created (the file named by CW_PR_RECORD, one number a line); best effort."""
+    path = os.environ.get("CW_PR_RECORD")
+    if path and isinstance(n, int):
+        try:
+            with open(path, "a") as f:
+                f.write("%d\n" % n)
+        except OSError:
+            pass
+
+
+def recorded(n):
+    path = os.environ.get("CW_PR_RECORD")
+    try:
+        return bool(path) and str(n) in open(path).read().split()
+    except OSError:
+        return False
+
+
+HOLD = "MERGE: captain"
+REFUSE_TAIL = "the repository's rules are the guard; this wrapper is only a convenience"
+
+
+def refused(row):
+    return Fail("refused: %s: %s" % (row, REFUSE_TAIL), 3)
+
+
+def pr_edit(args):
+    """ask 1200: exactly `pr edit N --body-file F`, for the pod's own pull request only (guard-table.tsv: the pr-edit rows)."""
+    for a in args:
+        if a in ("--body", "-b") or a.startswith(("--body=", "-b")):
+            raise refused("pr-edit-inline-body")
+        if "://" in a or a in ("-R", "--repo") or a.startswith(("--repo=", "-R")):
+            raise refused("pr-edit-url-other-repo")
+    if len(args) != 3 or args[1] != "--body-file" or not args[0].isdigit():
+        raise refused("pr-edit-other-option")
+    n = int(args[0])
+    rec = os.environ.get("CW_PR_RECORD")
+    if rec and os.path.exists(rec) and os.path.getsize(rec) > 0 and not recorded(n):
+        raise refused("pr-edit-other-number")
+    repo = repo_of({})
+    try:
+        pr = get_json("/repos/%s/pulls/%d" % (repo, n))
+        head = pr["head"]["ref"]
+        base_repo = pr["base"]["repo"]["full_name"]
+        cur = pr.get("body") or ""
+        if not isinstance(head, str) or not isinstance(base_repo, str) or not isinstance(cur, str):
+            raise ValueError
+    except (Fail, KeyError, TypeError, ValueError):
+        raise refused("pr-edit-read-failed")
+    mine = os.environ.get("CW_BRANCH") or git("symbolic-ref", "--quiet", "--short", "HEAD")
+    if base_repo.lower() != repo.lower() or not ((mine and head == mine) or recorded(n)):
+        raise refused("pr-edit-other-number")
+    try:
+        with open(args[2], encoding="utf-8") as f:
+            new = f.read(1 << 20)
+    except OSError:
+        raise Fail("the body file could not be read", 2)
+    if HOLD in cur.splitlines() and new.splitlines().count(HOLD) != 1:
+        raise refused("pr-edit-no-hold-line")
+    out = parse_json(request("PATCH", "/repos/%s/pulls/%d" % (repo, n), {"body": new}))
+    print(out.get("html_url", ""))
 
 
 def pr_view(args):
@@ -569,6 +634,8 @@ def main(argv):
         args = pre + args
     sys.stdout, sys.stderr = Clean(sys.stdout), Clean(sys.stderr)
     fn = VERBS.get((group, verb))
+    if (group, verb) == ("pr", "edit") and "--body-file" in args:   # ask 1200: outside the verb table, which stays as pinned; any other pr edit is not available
+        fn = pr_edit
     if fn is None:
         listing = ", ".join("%s %s" % (g, v) if v else g for g, v in sorted(VERBS))
         print("cw-gh: '%s' is not available in this pod (the client covers: %s)" % (" ".join(x for x in (group, verb) if x)[:60], listing),

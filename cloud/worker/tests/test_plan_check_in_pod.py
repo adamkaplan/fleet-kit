@@ -243,7 +243,7 @@ def intent_differs():
     return "## Intent\n\nMake it work.\nDone when: something else\n\n" + plan()
 
 
-PINNED = {'guard.sh': '9bff815feddd3424f2f853c8e002333474845ab7d8091f562bbd9256852a9321'}
+PINNED = {'guard.sh': '8e6f5304edc701a18e002028a4a7ec9ad4eac40e0eb8bbec0813ade82585bfcb'}
 PINNED_JSON_WITHOUT_ADDED_ROWS = "c14522cff99b9223d881b9f80a3d3397f55ae15a5d6f12a2380b89c9de6fd4be"
 # Rows added to opencode-worker.json, in file order. A pin changes only in the ask whose approved plan names the rows:
 # asks 1166 and 1200 add their rows to THIS list.
@@ -265,6 +265,13 @@ ADDED_ROWS = [   # ask 1083: DW-6 (read an issue's comments and the two pull req
     ('gh api*--input*', 'deny'),
     ('gh api*graphql*', 'deny'),
     ('gh api*mutation*', 'deny'),
+    # ask 1200: DW-2, DW-3 (a worker edits the body of its own pull request: `pr edit N --body-file F` only; every other pr-edit form stays denied)
+    ('gh pr edit*', 'deny'),
+    ('gh pr edit * --body-file *', 'allow'),
+    ('gh pr edit*--body-file* --*', 'deny'),
+    ('gh pr edit*--* --body-file*', 'deny'),
+    ('gh pr edit*://*', 'deny'),
+    ('gh pr edit*--repo*', 'deny'),
 ]
 
 if __name__ == "__main__":
