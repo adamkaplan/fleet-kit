@@ -26156,6 +26156,15 @@ def held_defects(body):
         return ["the held PR's top is unreadable (%s)" % _one_line("%s: %s" % (type(err).__name__, err), 100)]
 
 
+def _brief_advisory():
+    """Slice D (#1215): the pure brief rules, loaded from bin/brief_advisory.py beside this file."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("brief_advisory", os.path.join(os.path.dirname(os.path.realpath(__file__)), "brief_advisory.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _held_defects(body):
     """What is wrong with the top of a PR body held for the owner (used by `pr-explain --check` and gate G6b). After the opening lines
     (PLAN:, MERGE:, canon:), in this order: `## Why this needs you` (1 to 3 sentences, no placeholder), `## What changes for you` (a Before | After
@@ -26182,7 +26191,7 @@ def _held_defects(body):
     def words(text):
         return len(re.findall(r"[^\W_]", text))   # underscores are not word characters here
 
-    problems = []
+    problems = list(_brief_advisory().rationale_defects(lines))   # G6b (#1215): the one-sentence rationale line on top
     if HELD_WHY not in pos:
         problems.append("the held PR needs a `%s` section after the opening lines" % HELD_WHY)
     else:
