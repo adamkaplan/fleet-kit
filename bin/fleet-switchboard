@@ -4362,10 +4362,10 @@ class V2Reads:
                 self.filled(now)
         return inbox
 
-    def compaction_page(self, session_id, limit, now):
+    def compaction_page(self, session_id, limit, now, always=False):
         """The newest compactions of a session, remembered for `v2_cache_seconds` but at most COMPACTION_TTL_MAX: a fresh compaction is seen within
         that, so an orders fact is delivered at most that late, never wrongly. A write to the session forgets it."""
-        if self.engine.light:
+        if self.engine.light and not always:   # #1011: the Chief of Staff's orders re-send after a compaction is not turned off by the light mode
             return []
         entry, ttl = self.compactions.get(session_id), min(self.ttl(), COMPACTION_TTL_MAX)
         if entry is not None and ttl > 0 and now - entry[1] < ttl:
@@ -31302,7 +31302,7 @@ class OrdersFacts:
         try:
             found = read_cos_orders(engine.config)
             compaction, when = (None, None) if fault("orders-start-only") else completed_compaction(
-                engine.reads.compaction_page(observation.session_id, COMPACTIONS_READ, engine.now()))
+                engine.reads.compaction_page(observation.session_id, COMPACTIONS_READ, engine.now(), always=True))
         except (CosOrdersError, V2Error) as err:  # nothing is guessed; a file too large is refused, not cut
             engine._note("orders.unreadable", observation.name, {"cos": True, "error": _one_line(str(err), 200)})
             return None

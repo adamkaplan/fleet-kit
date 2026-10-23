@@ -606,6 +606,64 @@ export function resolveSettings(env = process.env, deps = {}) {
   return { ...settings, shims };
 }
 
+// #1011: the Chief of Staff's standing orders travel in its system prompt, outside the conversation, so a compaction cannot summarise them away.
+// Same file, same comment strip and same 8 KB refusal as read_cos_orders in bin/fleet-switchboard; the file is read on every call, so an edit shows at once.
+export const COS_ROLE = "chief-of-staff";
+export const COS_ORDERS_MAX_BYTES = 8192;
+export const COS_ORDERS_NAME = "standing-orders.md";
+
+export function cosOrdersPathOf(env = process.env, home = os.homedir()) {
+  if (env.FLEET_SWITCHBOARD_COS_ORDERS_FILE) return env.FLEET_SWITCHBOARD_COS_ORDERS_FILE;
+  const base = env.XDG_CONFIG_HOME || path.join(home, ".config");
+  return path.join(base, "fleet-switchboard", COS_ORDERS_NAME);
+}
+
+// -> { text } (the orders after the comment strip), { note } (a visible refusal) or {} (none).
+export function readCosOrders(file, fsm = fs) {
+  let info;
+  try {
+    info = fsm.statSync(file);
+  } catch {
+    return {};
+  }
+  if (info.size > COS_ORDERS_MAX_BYTES) {
+    return { note: `[switchboard] the standing orders file is ${info.size} bytes: the limit is ${COS_ORDERS_MAX_BYTES} (8 KB). It is refused, not cut; trim it.` };
+  }
+  try {
+    const text = fsm.readFileSync(file, "utf8").replace(/<!--[\s\S]*?-->/g, "").trim();
+    return text ? { text } : {};
+  } catch {
+    return {};
+  }
+}
+
+export function makeSystemHook({ file, roleOf = (input) => input && input.agent, fsm = fs }) {
+  return function transform(input, output) {
+    try {
+      if (!output || !Array.isArray(output.system) || roleOf(input) !== COS_ROLE) return;
+      const found = readCosOrders(typeof file === "function" ? file() : file, fsm);
+      if (found.text) output.system.push(found.text);
+      else if (found.note) output.system.push(found.note);
+    } catch { /* never break a model call */ }
+  };
+}
+
+// The hook name is unverified in the running service (see the header): every known shape is tried; one that is absent is skipped,
+// and the daemon's conversation note stays as the fallback (docs/switchboard.md, orders).
+export function wireSystem(api, hook) {
+  let wired = false;
+  const shapes = [
+    [api.experimental?.chat?.system, "transform"],
+    [api.chat?.system, "transform"],
+    [api.system, "transform"],
+  ];
+  for (const [target, name] of shapes) {
+    if (!wired && target && typeof target.hook === "function") { target.hook(name, hook); wired = true; }
+  }
+  if (!wired && api.hook && typeof api.hook === "function") { api.hook("experimental.chat.system.transform", hook); wired = true; }
+  return wired;
+}
+
 export default {
   id: "fleet.hooks",
   async setup(api, env = process.env, deps = {}) {
@@ -614,6 +672,7 @@ export default {
       const sender = deps.sender === undefined ? makeEventSender({ dir: stateDirOf(env, deps.home) }) : deps.sender;
       if (sender) wireEvents(api, sender); // each part is wired only if the service offers it; never any effect on a tool call
     }
+    wireSystem(api, makeSystemHook({ file: () => cosOrdersPathOf(env, deps.home) }));
     if (shims && api.shell && typeof api.shell.hook === "function") {
       const tmpFor = deps.tmpFor === undefined ? makeTmpResolver({ stateDir: stateDirOf(env, deps.home), root: tmpRootOf(env, deps.home) }) : deps.tmpFor;
       api.shell.hook("create.before", makeShellHook(shims, tmpFor));
