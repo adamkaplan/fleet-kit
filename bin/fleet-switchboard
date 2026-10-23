@@ -22844,7 +22844,7 @@ RETYPED_FORM_TEXT = "made by the retyped-field form (flags, no verbatim block): 
 
 
 def rating_mismatch_lines(state_dir, pr, head):
-    """#1126: one line per impact rating recorded for `pr` (at any head): reviewer, head, recorded severity/probability/action, the block's own, and the first differing field (severity, probability, action, head) or `agrees`.
+    """#1126: one line per impact rating recorded for `pr` (at any head): reviewer, head, recorded severity/probability/action, the block's own, and the first differing field (severity, probability, action, head), `agrees`, or `no block to compare` (a rating with no block never agrees).
     Display only: no verdict reads it. A rating whose head is not `head` says so. Returns [] when there is no ledger or no rating."""
     if state_dir is None:
         return []
@@ -22866,13 +22866,17 @@ def rating_mismatch_lines(state_dir, pr, head):
             first = "head"
         else:
             for name, r, b in zip(("severity", "probability", "action"), rec, blk):
-                if has_block and (b is not None or name != "action") and r != b:
+                if not has_block:
+                    break
+                if name == "action":   # a block with no action line means no action: `none` agrees, any other recorded action differs
+                    r, b = (None if r in (None, "none") else r), (None if b in (None, "none") else b)
+                if r != b:
                     first = name
                     break
         shown = lambda v: "none" if v is None else str(v)
         line = "%s %s: recorded %s/%s/%s; block %s; %s" % (
             e.get("reviewer"), str(e.get("head") or "")[:8], shown(rec[0]), shown(rec[1]), shown(rec[2]),
-            "%s/%s/%s" % tuple(shown(v) for v in blk) if has_block else "none kept", "agrees" if first is None else "differs first at %s" % first)
+            "%s/%s/%s" % tuple(shown(v) for v in blk) if has_block else "none kept", "no block to compare" if first is None and not has_block else "agrees" if first is None else "differs first at %s" % first)
         if first == "head":
             line += ": the rating's head %s is not the current head %s" % (str(e.get("head") or "")[:8], str(head)[:8])
         if first and first != "head":

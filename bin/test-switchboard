@@ -37474,6 +37474,12 @@ class TestAgentBlockCounts(TestBlockTable):
                 self.assertIn("block Marginal", line)
         (line,) = self.lines_for({k: v for k, v in self.ROW.items() if not k.startswith("block_")}, func=func)
         self.assertIn(sb.RETYPED_FORM_TEXT, line)
+        self.assertIn("no block to compare", line)
+        self.assertNotIn("agrees", line)
+        (line,) = self.lines_for(dict(self.ROW, impact_action="hold", block_impact_action=None), func=func)
+        self.assertIn("differs first at action", line)
+        self.assertNotIn("agrees", line)
+        self.assertIn("agrees", self.lines_for(dict(self.ROW, block_impact_action=None), func=func)[0])
         self.assertNotIn(sb.RETYPED_FORM_TEXT, self.lines_for(dict(self.ROW), func=func)[0])
 
     def test_the_floor_names_the_first_differing_field_and_the_old_form(self):
@@ -37499,7 +37505,10 @@ class TestAgentBlockCounts(TestBlockTable):
         real = sb.rating_mismatch_lines
         agrees_always = lambda *a: [l.split("; differs")[0] + "; agrees" if "differs" in l else l for l in real(*a)]
         ignores_head = lambda state, pr, head: real(state, pr, None)
-        for name, mutant in (("agrees with a differing field", agrees_always), ("ignores the head", ignores_head)):
+        no_block_agrees = lambda *a: [l.replace("no block to compare", "agrees") for l in real(*a)]
+        missing_action_agrees = lambda *a: [l.replace("differs first at action", "agrees").split(" (recorded hold, block none)")[0] if "block none/" not in l and "hold, block none)" in l else l for l in real(*a)]
+        for name, mutant in (("agrees with a differing field", agrees_always), ("ignores the head", ignores_head),
+                             ("no block agrees", no_block_agrees), ("missing block action agrees with hold", missing_action_agrees)):
             with self.subTest(mutant=name):
                 with self.assertRaises(AssertionError):
                     self.check_mismatches(mutant)
