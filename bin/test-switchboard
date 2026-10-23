@@ -83899,6 +83899,7 @@ class TestGhShimMergeGate(Base):
 
     HEAD = "a" * 40
 
+    shim_file = None   # where the shim claims to live (its sibling files are looked for there)
     shim_path = None   # a mutated copy of the shim a test runs instead (the shim's own directory stays first on PATH)
 
     def run_shim(self, *args, env=None, binary=True, linked=False):
@@ -83916,7 +83917,7 @@ class TestGhShimMergeGate(Base):
             self.log.unlink()
         runner = ("import importlib.util, importlib.machinery, sys\nloader = importlib.machinery.SourceFileLoader('gh', %r)\nspec = importlib.util.spec_from_loader('gh', loader)\n"
                   "m = importlib.util.module_from_spec(spec)\nloader.exec_module(m)\nm.__file__ = %r\nm.MG_HOME = %r\nm.MG_BINARY = %r\nsys.exit(m.main(sys.argv[1:]))\n"
-                  % (str(self.shim_path or SHIM), str(SHIM), str(self.home), str(self.sb) if binary and not linked else None))   # the gate's home and program are module attributes, never environment
+                  % (str(self.shim_path or SHIM), str(self.shim_file or SHIM), str(self.home), str(self.sb) if binary and not linked else None))   # the gate's home and program are module attributes, never environment
         done = subprocess.run([sys.executable, "-c", runner, *args], capture_output=True, text=True, env=environ, timeout=60)
         return done, (json.loads(self.log.read_text()) if self.log.exists() else None)
 
@@ -83927,6 +83928,43 @@ class TestGhShimMergeGate(Base):
 
     def allowed(self, locked=True):
         return {"FAKE_MG_JSON": json.dumps({"allowed": True, "reason": "x", "head": self.HEAD, "locked": locked})}
+
+    def lone_shim(self, mutate=None):
+        """The REAL shim copied to a scratch directory WITHOUT review_rule.py beside it."""
+        lone = self.home / "lone"
+        lone.mkdir(exist_ok=True)
+        text = SHIM.read_text()
+        if mutate:
+            self.assertIn(mutate[0], text)
+            text = text.replace(*mutate)
+        (lone / "gh").write_text(text)
+        self.assertFalse((lone / "review_rule.py").exists())
+        self.shim_path = self.shim_file = lone / "gh"
+
+    def test_a_shim_without_its_review_rule_file_refuses_the_merge(self):
+        self.lone_shim()
+        done, seen = self.run_shim(*self.MERGE)
+        self.assertEqual((done.returncode, seen), (10, None))
+        self.assertEqual(done.stderr.strip(), "gh: review rule unreadable: review_rule.py: merge refused")
+        done, seen = self.run_shim(*self.MERGE, "--over-review", "a reason that is long enough")
+        self.assertEqual((done.returncode, seen), (10, None))
+
+    def test_the_mutant_that_swallows_the_rule_load_failure_is_caught(self):
+        self.lone_shim(("raise ReviewRuleUnreadable(path)", "raise RuntimeError(path)"))
+        done, seen = self.run_shim(*self.MERGE)
+        self.assertNotEqual((done.returncode, done.stderr.strip()), (10, "gh: review rule unreadable: review_rule.py: merge refused"))   # the test above fails on it
+
+    def test_every_sibling_module_the_shim_loads_ships_beside_it(self):
+        shipped = {p.name for p in SHIM.parent.iterdir() if p.suffix == ".py" or p.name in ("gh", "git")}
+        loaded = set(re.findall(r'"(\w+\.py)"', SHIM.read_text())) & {p.name for p in SHIM.parent.glob("*.py")}
+        self.assertIn("review_rule.py", loaded)
+        self.assertTrue(loaded <= shipped)   # no installer copies files: the service uses the checkout's shims directory whole (docs/switchboard.md)
+
+    def test_gates_name_an_unreadable_rule_file_instead_of_raising(self):
+        with mock.patch.object(sb, "load_review_rule", side_effect=FileNotFoundError("x")), mock.patch.object(sb, "_review_pages", return_value=(True, [], "")):
+            lines = sb.blocking_review_lines(None, None, 0, "a/b", 1, "a/b#1", "h")
+        self.assertEqual(len(lines), 1)
+        self.assertIn("review_rule.py is unreadable", lines[0])
 
     def test_a_refusal_is_one_line_and_the_real_gh_does_not_run(self):
         done, seen = self.run_shim(*self.MERGE, env={"FAKE_MG_EXIT": "10", "FAKE_MG_JSON": json.dumps(

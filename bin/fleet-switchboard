@@ -25505,8 +25505,12 @@ def blocking_review_lines(engine, runner, now, repo, number, pr, head="", decisi
     ok, reviews, why = _review_pages(engine, runner, now, repo, "repos/%s/pulls/%d/reviews" % (repo, number))
     if not ok:
         return ["blocking review: the reviews could not be read whole (%s): not listed" % why]
+    try:
+        rule = load_review_rule()
+    except Exception:
+        return ["blocking review: the rule file shims/review_rule.py is unreadable: blocking reviews not listed"]
     rows = []
-    for login, review in load_review_rule().blocking_reviews([rest_review_as_view(r) for r in reviews if isinstance(r, dict)], head or "", decision):
+    for login, review in rule.blocking_reviews([rest_review_as_view(r) for r in reviews if isinstance(r, dict)], head or "", decision):
         rows.append("blocking review: %s CHANGES_REQUESTED at %s (dismiss with: fleet-switchboard review dismiss %s --review %s --reason TEXT)" % (
             signed_by_fleet(review.get("body")) or login, str(review["commit"]["oid"] or "unknown")[:12], pr, review.get("id")))
     return rows

@@ -1462,13 +1462,20 @@ def tagged_blockers(reviews, head):
 REVIEW_RULE_MODULE = [None]
 
 
+class ReviewRuleUnreadable(Exception):
+    """shims/review_rule.py could not be loaded: the merge is REFUSED (never skipped), or a copy of this shim without its sibling would lose the guardrail."""
+
+
 def review_blockers(reviews, head="", decision=""):
-    """The ONE rule lives in review_rule.py beside this file (shared with `fleet-switchboard gates`); an unloadable module raises, which `review_probe` reports as not checked."""
+    """The ONE rule lives in review_rule.py beside this file (shared with `fleet-switchboard gates`); an unloadable module raises ReviewRuleUnreadable, which `review_probe` turns into a REFUSAL."""
     if REVIEW_RULE_MODULE[0] is None:
         path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "review_rule.py")
-        spec = importlib.util.spec_from_file_location("review_rule", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        try:
+            spec = importlib.util.spec_from_file_location("review_rule", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except Exception:
+            raise ReviewRuleUnreadable(path)
         REVIEW_RULE_MODULE[0] = module
     return REVIEW_RULE_MODULE[0].review_blockers(reviews, head, decision)
 
@@ -1535,6 +1542,8 @@ def review_probe(args, found, reason, lookup, gh):
         why = ("--over-review needs a reason of at least 10 characters" if found else
                "resolve them, or pass --over-review '<reason of at least 10 characters>' (it is logged)")
         return "gh: merge of %s#%d refused: blocking review(s): %s. %s" % (repo, number, names, why)
+    except ReviewRuleUnreadable as err:
+        return "gh: review rule unreadable: %s: merge refused" % gate_clean(os.path.basename(str(err)))
     except Exception:
         sys.stderr.write("gh: review check skipped (an unexpected error): not checked\n")
         return None
