@@ -11449,6 +11449,21 @@ def parse_pr_ref(text):
     raise NoticeError("%r is not a pull request: write owner/repo#N or the PR's URL" % _one_line(text, 120))
 
 
+_BARE_PR = re.compile(r"^#?([0-9]+)$")
+
+
+def parse_bare_pr_ref(text, directory=None):
+    """`1234` or `#1234` -> (repo, number), the repository being the `origin` remote of the working directory (`origin_repository`: never a configured
+    default repository). Used by `review laws` only; every other form goes through `parse_pr_ref`. Raises NoticeError saying what to pass."""
+    found = _BARE_PR.match((text or "").strip())
+    if not found or int(found.group(1)) < 1:
+        raise NoticeError("%r is not a pull request: pass 1234, #1234, owner/repo#N or the PR's URL" % _one_line(text, 120))
+    repo, why = origin_repository(None, directory or os.getcwd())
+    if repo is None:
+        raise NoticeError("%s: a bare number needs the working directory's remote: pass owner/repo#N or the PR's URL" % why)
+    return repo, int(found.group(1))
+
+
 @contextmanager
 def pr_notices_lock(state_dir):
     fd = os.open(str(Path(state_dir) / PR_NOTICES_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
@@ -24942,13 +24957,16 @@ REVIEW_TOTAL_MAX = 90000     # bytes of all of them together
 
 def _review_pr(args, engine):
     """(repo, number, ref, raw) of the PR in `args`, read with the PR's own account; raises ReviewError."""
+    bare = args.review_cmd == "laws" and _BARE_PR.match((args.pr or "").strip())
     try:
-        repo, number = parse_pr_ref(args.pr)
+        repo, number = parse_bare_pr_ref(args.pr) if bare else parse_pr_ref(args.pr)
     except NoticeError as err:
         raise ReviewError(str(err)) from None
     try:
         raw = read_pr_json(engine, repo, number, "baseRefOid,baseRefName,files")
     except NoticeError as err:
+        if bare and isinstance(err, NoticeNotFound):
+            err = "%s: %s does not name a pull request: pass owner/repo#N or the PR's URL" % (err, _one_line(args.pr, 40))
         raise ReviewError(str(err)) from None
     return repo, number, "%s#%d" % (repo, number), raw
 
@@ -25538,7 +25556,7 @@ def add_review_parsers(sub):
     review = sub.add_parser("review", help="Reviewer subagents (#179): print the laws from the PR's base commit, record a reviewer's result")
     rsub = review.add_subparsers(dest="review_cmd", required=True)
     laws = rsub.add_parser("laws", help="Print the repository's review laws and overlay as they stand at the PR's BASE commit")
-    laws.add_argument("pr", help="owner/repo#N or the PR's URL")
+    laws.add_argument("pr", help="1234, #1234 (the working directory's remote), owner/repo#N or the PR's URL")
     blockers = rsub.add_parser("blockers", help="Read-only: the reviewers whose LATEST recorded result at the PR's head is request-changes (one line each)")
     blockers.add_argument("pr", help="owner/repo#N or the PR's URL")
     blockers.add_argument("--head", help="The commit to look at (default: the PR's head)")
