@@ -86135,6 +86135,154 @@ class TestAssembler(unittest.TestCase):
         self.assertIn("usage: fleet-switchboard status", done.stdout)
 
 
+class TestProofCarry(LedgerBase):
+    """#1129: a tester's, live check's or reviewer's proof CARRIES to a new head when the difference touches none of the files it names, the new head is a merge of the default
+    branch or a tests-and-documentation difference, and CI is green there. Fakes only; the carry decision takes the facts GitHub gave."""
+
+    NEW = LEDGER_NEW_HEAD
+    FILES = ["src/widget.py"]
+
+    def setUp(self):
+        super().setUp()
+        self.fake_comments_clear()
+
+    def fake_comments_clear(self):
+        self.comments = []
+
+    def prove_named(self, sid="S2", files=None):
+        extra = []
+        for name in (self.FILES if files is None else files):
+            extra += ["--file", name]
+        self.assertEqual(self.prove("coder", sid, *extra)[0], 0)
+
+    def carry(self, files_changed, merge=False, ci=True):
+        entries, _ = sb.plan_ledger.read_ledger(self.world.state)
+        plan = {"plan_hash": sb.plan_check.plan_hash(LEDGER_PLAN),
+                "scenarios_parsed": [{"id": "S1", "evaluator": "ci"}, {"id": "S2", "evaluator": "tester"}, {"id": "S3", "evaluator": "reviewer"}]}
+        return sb.carry_proofs(self.world.state, self.PR, plan, LEDGER_HEAD, self.NEW,
+                               {"files": files_changed, "merge_of_default": merge, "ci_green": ci}, 1000)
+
+    def carried_lines(self):
+        return [e for e in self.ledger() if e["kind"] == "carried"]
+
+    def bytes_of_ledger_rows(self):
+        return [l for l in (self.world.state / "plan-ledger.jsonl").read_text().splitlines() if '"kind": "proof"' in l]
+
+    def hold_all(self):
+        """Every scenario of the carry plan, as one check a mutant must fail."""
+        self.assertEqual(self.carried_lines(), [])
+        self.assertEqual([d["verdict"] for d in self.carry(["bin/other.py"], merge=True)], ["carry"])
+        self.assertEqual(len(self.carried_lines()), 1)
+
+    def refusals(self):
+        """Each refusal, one case at a time: nothing is carried (a fresh state each time is not needed: a refusal writes nothing)."""
+        got = self.carry(["src/widget.py"], merge=True)
+        self.assertEqual([d["verdict"] for d in got], ["void"])
+        self.assertIn("src/widget.py", got[0]["reason"])
+        got = self.carry(["bin/other.py"], merge=True, ci=False)
+        self.assertEqual([d["verdict"] for d in got], ["refuse"])
+        self.assertIn("CI is not green", got[0]["reason"])
+        got = self.carry(["bin/other.py"], merge=False)
+        self.assertEqual([d["verdict"] for d in got], ["refuse"])
+        self.assertIn("code outside a merge", got[0]["reason"])
+        self.assertEqual(self.carried_lines(), [])
+
+    def test_S2_a_proof_carries_on_a_merge_of_the_default_branch_and_the_gate_shows_its_original_head(self):
+        self.prove_named()
+        self.pr["headRefOid"] = self.NEW
+        self.assertEqual([d["verdict"] for d in self.carry(["bin/other.py"], merge=True)], ["carry"])
+        self.assertEqual(len(self.carried_lines()), 1)
+        code, report, err = self.gates()
+        s2 = next(s for s in report["scenarios"] if s["id"] == "S2")
+        self.assertEqual(s2["carried"][0]["original_head"], LEDGER_HEAD)
+        self.assertEqual(s2["carried"][0]["new_head"], self.NEW)
+        self.assertEqual(s2["void"], [])
+        self.assertEqual(s2["proof"]["result"], "pass")
+        self.assertIn("carried: row #", "\n".join(sb.plan_ledger.render_gates(report, self.PR)))
+
+    def test_S3_a_proof_carries_on_a_tests_and_documentation_only_difference(self):
+        self.prove_named()
+        self.assertEqual([d["verdict"] for d in self.carry(["bin/test-widget", "docs/widget.md"], merge=False)], ["carry"])
+        self.assertEqual(len(self.carried_lines()), 1)
+        self.assertEqual(self.carried_lines()[0]["facts"]["difference"], "tests and documentation only")
+
+    def test_S4_the_carried_line_names_five_fields_and_the_original_row_is_byte_identical(self):
+        self.prove_named()
+        before = self.bytes_of_ledger_rows()
+        self.carry(["bin/other.py"], merge=True)
+        line = self.carried_lines()[0]
+        for field in sb.plan_ledger.CARRY_FIELDS:
+            self.assertIn(field, line)
+        self.assertEqual(len(sb.plan_ledger.CARRY_FIELDS), 5)
+        self.assertEqual((line["old_head"], line["new_head"]), (LEDGER_HEAD, self.NEW))
+        self.assertEqual(sorted(line["facts"]), ["ci", "difference", "named_files_untouched"])
+        self.assertEqual(self.bytes_of_ledger_rows(), before)
+
+    def test_S5_each_refusal_carries_nothing_and_names_its_reason_and_a_touched_file_voids(self):
+        self.prove_named()
+        self.refusals()
+        self.assertEqual(self.carried_lines(), [])
+        # a proof that names no file
+        self.prove_named("S3", files=[])
+        got = self.carry(["bin/other.py"], merge=True)
+        self.assertIn("names no file", [d["reason"] for d in got if d["scenario"] == "S3"][0])
+        self.assertEqual([d["scenario"] for d in got if d["verdict"] == "carry"], ["S2"])
+        self.assertEqual([c["scenario"] for c in self.carried_lines()], ["S2"])
+
+    def test_S6_and_U4_a_ci_proven_id_is_never_carried_and_the_daemon_records_it_as_before(self):
+        self.prove_named("S1")
+        self.prove_named("U1")
+        got = self.carry(["bin/other.py"], merge=True)
+        self.assertEqual(got, [d for d in got if d["verdict"] == "refuse"])
+        self.assertEqual(self.carried_lines(), [])
+        self.pr["headRefOid"] = self.NEW
+        self.assertEqual(self.run_as(None, "gates", "ci-record", self.PR)[0], 0)
+        recorded = [(e["scenario"], e["head"], e["by"], e["kind"]) for e in self.ledger() if e["kind"] == "verdict"]
+        self.assertEqual(sorted(recorded), [("S1", self.NEW, sb.plan_ledger.CI_RECORDER, "verdict"), ("U1", self.NEW, sb.plan_ledger.CI_RECORDER, "verdict")])
+
+    def test_U1_two_of_the_three_conditions_never_carry(self):
+        self.prove_named()
+        cases = [(["src/widget.py"], True, True), (["bin/other.py"], False, True), (["bin/other.py"], True, False)]
+        for files, merge, ci in cases:
+            self.assertNotEqual([d["verdict"] for d in self.carry(files, merge=merge, ci=ci)], ["carry"])
+        self.assertEqual(self.carried_lines(), [])
+
+    def test_U2_a_proof_naming_no_file_is_never_carried_whatever_the_head(self):
+        self.prove_named(files=[])
+        for files, merge in ((["bin/other.py"], True), (["docs/a.md"], False), ([], True)):
+            self.assertEqual([d["verdict"] for d in self.carry(files, merge=merge)], ["refuse"])
+        self.assertEqual(self.carried_lines(), [])
+
+    def mutant(self, **override):
+        real = sb.plan_ledger.carry_decision
+
+        def mutated(row, evaluator, files_changed, merge, ci):
+            return real(row, evaluator, override.get("files", files_changed), override.get("merge", merge), override.get("ci", ci))
+        return mock.patch.object(sb.plan_ledger, "carry_decision", mutated)
+
+    def test_S7_mutant_that_carries_a_touched_named_file_fails(self):
+        self.prove_named()
+        with self.mutant(files=[]), self.assertRaises(AssertionError):
+            self.refusals()
+
+    def test_S7_mutant_that_skips_the_ci_check_fails(self):
+        self.prove_named()
+        with self.mutant(ci=True), self.assertRaises(AssertionError):
+            self.refusals()
+
+    def test_S7_mutant_that_carries_a_code_difference_fails(self):
+        self.prove_named()
+        with self.mutant(merge=True), self.assertRaises(AssertionError):
+            self.refusals()
+
+    def test_S8_the_documentation_states_the_three_conditions_and_the_carried_line(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        start = text.index("## A proof carries to a new head")
+        section = text[start:text.index("\n## ", start + 5)]
+        for item in ("touches none of the files", "merge of the default branch", "CI is green", "`carried`"):
+            self.assertIn(item, section)
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
