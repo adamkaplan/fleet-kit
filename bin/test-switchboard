@@ -16164,7 +16164,7 @@ class TestOneCharter(CharterRig, Base):
         ("bin/fleet-switchboard", "charter_orders"): "own: an agent's own charter's orders", ("bin/switchboard/judge_request.py", "charter_guard"): "own: an agent's own charters",
         ("bin/switchboard/judge_request.py", "ask_context_of"): "own: an agent's own ask context", ("bin/fleet-switchboard", "__call__"): "own: an orchestrator's own orders",
         ("bin/fleet_health.py", "figures"): "own: the health figures of one agent from the registry-derived info", ("bin/fleet_health.py", "_resolve_charters"): "own: the registry-derived info",
-        ("bin/fleet_health.py", "_refresh_asks"): "own: the registry-derived info", ("bin/fleet-switchboard", "_import_fleet"): "own: the launch/import writer of the session's metadata",
+        ("bin/fleet_health.py", "_refresh_asks"): "own: the registry-derived info", ("bin/switchboard/import_v1.py", "_import_fleet"): "own: the launch/import writer of the session's metadata",
     }
 
 
@@ -25832,7 +25832,7 @@ class TestPR10Source(unittest.TestCase):
     def test_the_import_command_runs_only_the_clients_it_is_given(self):
         source = SWITCHBOARD.read_text()
         start = source.index(self.SECTION)
-        section = source[start:source.index("\ndef build_parser")]
+        section = source[start:source.index("\ndef build_parser")] + (BIN / "switchboard" / "import_v1.py").read_text()   # the part holds the rest of the section
         self.assertNotIn("subprocess.run", section, "the runner is injected")
         self.assertNotIn("herdr", section.replace("herdr's", "").lower().replace("herdr_", ""))
 
@@ -25853,7 +25853,7 @@ class TestPR10Source(unittest.TestCase):
             self.assertEqual(repeated, {}, name)
 
     def test_the_v1_binary_is_asked_for_nothing_but_export(self):
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         calls = re.findall(r'runner\(\[binary, "([a-z-]+)"', source)
         self.assertEqual(calls, ["export"])
 
@@ -85848,7 +85848,7 @@ class TestAssembler(unittest.TestCase):
         self.assertEqual(lines[0], "fleet-switchboard")
 
     def test_a_second_part_puts_its_names_into_sb_in_the_order_given(self):
-        root = self._copy(["part_a.py", "fleet-switchboard", "switchboard/judge_request.py", "switchboard/judge.py", "part_b.py"])
+        root = self._copy(["part_a.py", "fleet-switchboard", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py", "part_b.py"])
         (root / "part_a.py").write_text('ORDER = ["a"]\nA_SAW_MAIN = "main" in globals()\nA_FILE = __file__\n')
         (root / "part_b.py").write_text('ORDER.append("b")\nB_SAW_MAIN = "main" in globals()\n')
         module = _load("t_assembled", root / "fleet-switchboard")
@@ -85897,7 +85897,7 @@ class TestAssembler(unittest.TestCase):
         self.assertTrue(_load("t_unnamed_entry", root / "entry").ENTRY_SAW_A)
 
     def test_comments_and_blank_lines_in_a_manifest_are_ignored(self):
-        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard", "switchboard/judge_request.py", "switchboard/judge.py"])
+        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py"])
         (root / "part_a.py").write_text("FROM_A = 1\n")
         self.assertEqual(_load("t_commented", root / "fleet-switchboard").FROM_A, 1)
 
@@ -85915,6 +85915,14 @@ class TestAssembler(unittest.TestCase):
                 self.assertNotEqual(done.returncode, 0)
                 self.assertEqual(len(done.stderr.strip().splitlines()), 1, done.stderr)
                 self.assertIn(message, done.stderr)
+
+    def test_the_manifest_lists_exactly_the_part_files_in_bin_switchboard(self):
+        """No part file is left out of the manifest (it would never run) and none is listed twice."""
+        lines = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.startswith("#")]
+        parts = [n for n in lines if n != "fleet-switchboard"]
+        on_disk = sorted("switchboard/" + p.name for p in (BIN / "switchboard").glob("*.py"))
+        self.assertEqual(sorted(parts), on_disk)
+        self.assertEqual(len(parts), len(set(parts)))
 
     def test_the_shipped_manifest_lists_the_entry_once_and_every_part_exists_under_bin(self):
         lines = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.startswith("#")]
