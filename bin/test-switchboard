@@ -88,13 +88,29 @@ def with_http_head(serve, argv, kwargs, counters=None):
 
 
 SWITCHBOARD = BIN / "fleet-switchboard"
-SWITCHBOARD_SOURCE_FILES = (SWITCHBOARD,)   # every file that holds the daemon's code: a split adds its parts here, so no part escapes the scans that read this list
+
+
+def _manifest_files():
+    """Every file that holds the daemon's code, read from the manifest the entry itself reads (a part cannot escape a scan that reads this list)."""
+    lines = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.lstrip().startswith("#")]
+    return tuple((BIN / n).resolve() for n in lines)
+
+
+SWITCHBOARD_SOURCE_FILES = _manifest_files()
 
 
 def switchboard_source():
     """The daemon's code as every scan reads it: the files of SWITCHBOARD_SOURCE_FILES, in order, as one text."""
     return "\n".join(path.read_text() for path in SWITCHBOARD_SOURCE_FILES)
 SCENARIO = BIN / "fleet-scenario"
+
+
+def copy_entry(directory):
+    """The entry with its manifest and its parts, copied into `directory` as the program is laid out in bin/."""
+    directory = Path(directory)
+    shutil.copy(str(SWITCHBOARD), str(directory / "fleet-switchboard"))
+    shutil.copy(str(BIN / "fleet-switchboard.parts"), str(directory / "fleet-switchboard.parts"))
+    shutil.copytree(str(BIN / "switchboard"), str(directory / "switchboard"), dirs_exist_ok=True)
 
 
 def _load(name, path):
@@ -16084,7 +16100,7 @@ class TestOneCharter(CharterRig, Base):
     def functions_reading_charter():
         """{(file, function): (the function's AST node, whether it enumerates the agents)} for every function that reads a fleet's `charter`, DERIVED from the code."""
         found = {}
-        for rel in ("bin/fleet-switchboard", "bin/impact_hold.py", "bin/lanes.py", "bin/fleet_health.py", "bin/registry.py", "bin/reassign.py"):
+        for rel in ["bin/fleet-switchboard", "bin/impact_hold.py", "bin/lanes.py", "bin/fleet_health.py", "bin/registry.py", "bin/reassign.py"] + ["bin/" + str(f.relative_to(BIN)) for f in SWITCHBOARD_SOURCE_FILES if f != SWITCHBOARD]:
             tree = ast.parse((REPO / rel).read_text())
             for node in ast.walk(tree):
                 if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -16140,13 +16156,13 @@ class TestOneCharter(CharterRig, Base):
         ("bin/fleet-switchboard", "seam_applies"): "set: is this issue number known as a charter",
         ("bin/fleet-switchboard", "owned_numbers"): "registry: the numbers an agent owns (an orchestrator: its row's charter only; others: their own assignment)",
         ("bin/fleet-switchboard", "registry_charter_view"): "registry: every row's charter", ("bin/fleet-switchboard", "triage_context"): "registry: charters via owned_numbers (an orchestrator's issue is never a charter)",
-        ("bin/fleet-switchboard", "identify"): "own: copies the caller's own launch fields into its context",
+        ("bin/switchboard/judge_request.py", "identify"): "own: copies the caller's own launch fields into its context",
         ("bin/fleet-switchboard", "resume_agent"): "own: one agent's own repo lookup", ("bin/fleet-switchboard", "charter_pane_update"): "own: one agent's own charter for its pane",
         ("bin/fleet-switchboard", "_fleet_repo"): "own: one agent's own repo", ("bin/fleet-switchboard", "read_order_notices"): "own: the order notices' own records",
         ("bin/fleet-switchboard", "order_groups"): "own: groups order notices", ("bin/fleet-switchboard", "decisions_from_order_notices"): "own: words order notices",
-        ("bin/fleet-switchboard", "resolve_policy_context"): "own: one agent's own launch context", ("bin/fleet-switchboard", "_valid_context"): "own: a cached own context",
-        ("bin/fleet-switchboard", "charter_orders"): "own: an agent's own charter's orders", ("bin/fleet-switchboard", "charter_guard"): "own: an agent's own charters",
-        ("bin/fleet-switchboard", "ask_context_of"): "own: an agent's own ask context", ("bin/fleet-switchboard", "__call__"): "own: an orchestrator's own orders",
+        ("bin/switchboard/judge_request.py", "resolve_policy_context"): "own: one agent's own launch context", ("bin/fleet-switchboard", "_valid_context"): "own: a cached own context",
+        ("bin/fleet-switchboard", "charter_orders"): "own: an agent's own charter's orders", ("bin/switchboard/judge_request.py", "charter_guard"): "own: an agent's own charters",
+        ("bin/switchboard/judge_request.py", "ask_context_of"): "own: an agent's own ask context", ("bin/fleet-switchboard", "__call__"): "own: an orchestrator's own orders",
         ("bin/fleet_health.py", "figures"): "own: the health figures of one agent from the registry-derived info", ("bin/fleet_health.py", "_resolve_charters"): "own: the registry-derived info",
         ("bin/fleet_health.py", "_refresh_asks"): "own: the registry-derived info", ("bin/fleet-switchboard", "_import_fleet"): "own: the launch/import writer of the session's metadata",
     }
@@ -19260,7 +19276,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
         registers. This is what each command says beside itself: the expected sets are DERIVED from it, never kept as a list in a test."""
         declared = {"direct": set(), "ledger": set(), "ensure_on_use": set()}
         registered = TestSelfRegisteringCli.commands()[0].commands
-        tree = ast.parse(SWITCHBOARD.read_text())
+        tree = ast.parse(switchboard_source())
         plain = {id(node) for node in tree.body}
         for node in ast.walk(tree):    # a declaration written any other way would be invisible to the scan AND to the views: refuse it
             if isinstance(node, ast.Assign) and any(isinstance(x, ast.Attribute) and x.attr in declared and isinstance(x.value, ast.Name)
@@ -24196,7 +24212,7 @@ class TestJudgeSocket(PolicyCase):
         self.assertIsNotNone(original)
 
     def test_judge_tool_reads_no_environment_variable_and_never_names_jev(self):
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         tree = ast.parse(source)
         wanted = {"cmd_judge_tool", "ask_judge_daemon", "never_looser", "read_judge_line", "parse_policy_request",
                   "policy_unjudged_reason", "policy_reply", "_guess_configured"}
@@ -24249,9 +24265,10 @@ class TestJudgeToolWritesNothingElsewhere(unittest.TestCase):
     WRITE_PHRASES = ("issue comment", "issue edit", "pr merge", "pr comment", "sub_issues", "/comments", "/labels")
 
     def section(self):
-        source = SWITCHBOARD.read_text()
-        start = source.index(self.START)
-        return source[source.rindex("\n# ====", 0, start):source.index(self.END, start)]
+        """The policy section: its part files, and the statements of it that stay in the entry (S2 keeps the ones the clear's closure reads), between the DEFAULTS line and the next section."""
+        entry = SWITCHBOARD.read_text()
+        kept = entry[entry.index('DEFAULTS["policy"] = None'):entry.index("# PR 10: move a v1 session")]
+        return "\n".join([kept] + [path.read_text() for path in SWITCHBOARD_SOURCE_FILES if path != SWITCHBOARD])
 
     def test_no_herdr_and_no_github_write_is_reachable_from_the_section(self):
         tree = ast.parse(self.section())
@@ -24272,7 +24289,7 @@ class TestJudgeToolWritesNothingElsewhere(unittest.TestCase):
         self.assertEqual(herdr_typing_violations(switchboard_source()), [], "the engine still never types")
 
     def test_the_section_is_one_clearly_marked_block(self):
-        self.assertEqual(SWITCHBOARD.read_text().count("\n# PR 9: the tool-call policy judge"), 1)
+        self.assertEqual(switchboard_source().count("\n# PR 9: the tool-call policy judge"), 1)
 
 
 class TestPolicyBlockedToast(PR4Base):
@@ -30730,7 +30747,7 @@ class TestIdentityCheck(ReportBase):
     # -- the judge, the hooks and status
 
     def test_the_judge_keys_on_the_plugins_session_and_never_on_the_pane_environment(self):
-        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        text = switchboard_source()
         start, end = text.index("def parse_policy_request"), text.index("def _guess_configured")
         self.assertNotIn("HERDR_PANE_ID", text[start:end])
         self.assertIn('data.get("sessionID")', text[start:end])
@@ -72406,7 +72423,7 @@ class TestV2Http(StandInPids, V2TransportBase):
                 sb.validate_config(dict(base, v2_transport=bad))
 
     def test_every_real_client_construction_passes_the_kill_switch(self):
-        sources = [(REPO / "bin" / "fleet-switchboard").read_text(), (REPO / "bin" / "judge-eval").read_text()]
+        sources = [switchboard_source(), (REPO / "bin" / "judge-eval").read_text()]
         sites = [line for text in sources for line in text.splitlines() if re.search(r"\bV2Client\(", line) and "class V2Client" not in line]
         self.assertGreaterEqual(len(sites), 5)
         for line in sites:
@@ -75039,7 +75056,7 @@ class TestSlice3Modules(Base):
         self.addCleanup(shutil.rmtree, directory, True)
         for path in BIN.glob("*.py"):
             shutil.copy(str(path), str(directory / path.name))
-        shutil.copy(str(SWITCHBOARD), str(directory / "fleet-switchboard"))
+        copy_entry(directory)
         for name, text in extra.items():
             (directory / name).write_text(text)
         return directory
@@ -75068,7 +75085,7 @@ class TestSlice3Modules(Base):
         (directory / "bin").mkdir()
         for path in BIN.glob("*.py"):
             shutil.copy(str(path), str(directory / "bin" / path.name))
-        shutil.copy(str(SWITCHBOARD), str(directory / "bin" / "fleet-switchboard"))
+        copy_entry(directory / "bin")
 
         def git(*args):
             return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"] + list(args), cwd=str(directory),
@@ -75990,7 +76007,7 @@ class TestModuleLoader(Base):
         self.addCleanup(shutil.rmtree, tmp, True)
         held = dict(sys.modules)
         self.addCleanup(lambda: (sys.modules.clear(), sys.modules.update(held)))
-        shutil.copy(SWITCHBOARD, tmp / "fleet-switchboard")
+        copy_entry(tmp)
         for module in BIN.glob("*.py"):
             shutil.copy(module, tmp / module.name)
         for name, text in (extra or {}).items():
@@ -85822,16 +85839,16 @@ class TestAssembler(unittest.TestCase):
         self.addCleanup(shutil.rmtree, str(root), True)
         for sibling in BIN.glob("*.py"):   # the entry loads its sibling modules from its own directory
             shutil.copy(str(sibling), str(root / sibling.name))
-        shutil.copy(str(SWITCHBOARD), str(root / "fleet-switchboard"))
+        copy_entry(root)   # the shipped parts the copied entry needs
         (root / "fleet-switchboard.parts").write_text("\n".join(lines) + "\n")
         return root
 
     def test_the_shipped_manifest_names_the_entry_itself(self):
         lines = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.startswith("#")]
-        self.assertEqual(lines, ["fleet-switchboard"])
+        self.assertEqual(lines[0], "fleet-switchboard")
 
     def test_a_second_part_puts_its_names_into_sb_in_the_order_given(self):
-        root = self._copy(["part_a.py", "fleet-switchboard", "part_b.py"])
+        root = self._copy(["part_a.py", "fleet-switchboard", "switchboard/judge_request.py", "switchboard/judge.py", "part_b.py"])
         (root / "part_a.py").write_text('ORDER = ["a"]\nA_SAW_MAIN = "main" in globals()\nA_FILE = __file__\n')
         (root / "part_b.py").write_text('ORDER.append("b")\nB_SAW_MAIN = "main" in globals()\n')
         module = _load("t_assembled", root / "fleet-switchboard")
@@ -85862,21 +85879,51 @@ class TestAssembler(unittest.TestCase):
         self.assertIn("cannot read the parts manifest", done.stderr)
 
     def test_a_missing_manifest_runs_the_entry_alone(self):
-        root = self._copy(["fleet-switchboard"])
-        (root / "fleet-switchboard.parts").unlink()
-        self.assertTrue(callable(_load("t_no_manifest", root / "fleet-switchboard").main))
+        text = SWITCHBOARD.read_text()
+        block = text[:text.index("\n_fleet_parts()\n") + len("\n_fleet_parts()\n")]   # the assembler's own block, with nothing else
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        (root / "entry").write_text(block + "ENTRY_RAN = True\n")
+        self.assertTrue(_load("t_no_manifest", root / "entry").ENTRY_RAN)
 
     def test_a_manifest_that_does_not_name_the_entry_runs_every_part_before_it(self):
-        root = self._copy(["part_a.py"])
-        (root / "part_a.py").write_text('A_SAW_MAIN = "main" in globals()\n')
-        module = _load("t_unnamed_entry", root / "fleet-switchboard")
-        self.assertFalse(module.A_SAW_MAIN)
-        self.assertTrue(callable(module.main))
+        text = SWITCHBOARD.read_text()
+        block = text[:text.index("\n_fleet_parts()\n") + len("\n_fleet_parts()\n")]
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        (root / "entry").write_text(block + "ENTRY_SAW_A = A_RAN\n")
+        (root / "entry.parts").write_text("part_a.py\n")
+        (root / "part_a.py").write_text("A_RAN = True\n")
+        self.assertTrue(_load("t_unnamed_entry", root / "entry").ENTRY_SAW_A)
 
     def test_comments_and_blank_lines_in_a_manifest_are_ignored(self):
-        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard"])
+        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard", "switchboard/judge_request.py", "switchboard/judge.py"])
         (root / "part_a.py").write_text("FROM_A = 1\n")
         self.assertEqual(_load("t_commented", root / "fleet-switchboard").FROM_A, 1)
+
+    def test_a_manifest_refuses_a_part_outside_the_entrys_directory_or_listed_twice(self):
+        cases = (("a parent path", ["../part_a.py", "fleet-switchboard"], "must be relative"),
+                 ("a nested parent path", ["sub/../../part_a.py", "fleet-switchboard"], "must be relative"),
+                 ("an absolute path", ["/etc/hosts", "fleet-switchboard"], "must be relative"),
+                 ("a duplicate", ["part_a.py", "fleet-switchboard", "part_a.py"], "listed twice"),
+                 ("a duplicate by another spelling", ["part_a.py", "./part_a.py", "fleet-switchboard"], "listed twice"))
+        for label, lines, message in cases:
+            with self.subTest(label):
+                root = self._copy(lines)
+                (root / "part_a.py").write_text("X = 1\n")
+                done = subprocess.run([sys.executable, str(root / "fleet-switchboard"), "status", "--help"], capture_output=True, text=True)
+                self.assertNotEqual(done.returncode, 0)
+                self.assertEqual(len(done.stderr.strip().splitlines()), 1, done.stderr)
+                self.assertIn(message, done.stderr)
+
+    def test_the_shipped_manifest_lists_the_entry_once_and_every_part_exists_under_bin(self):
+        lines = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.startswith("#")]
+        self.assertEqual(lines.count("fleet-switchboard"), 1)
+        self.assertEqual(len(lines), len(set(lines)))
+        for name in lines:
+            self.assertTrue((BIN / name).is_file(), name)
+            if name != "fleet-switchboard":
+                self.assertLessEqual(len((BIN / name).read_text().splitlines()), 1500, name)
 
     def test_a_symlinked_run_and_the_help_line_still_work(self):
         link = Path(tempfile.mkdtemp()) / "fsb"
