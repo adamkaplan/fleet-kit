@@ -242,7 +242,7 @@ class Shape(unittest.TestCase):
         c = base["spec"]["containers"][0]
         self.assertEqual([m["name"] for m in c["volumeMounts"]], ["pw", "tokens", "scratch"])
         self.assertEqual([v["name"] for v in base["spec"]["volumes"]], ["pw", "tokens", "scratch"])
-        self.assertNotIn("CW_DISK_DIR", json.dumps(base))
+        self.assertNotIn("WORKER_DISK_DIR", json.dumps(base))
         a = r.args(role="worker", disk="4")
         withd = cw.render_pod(a, WORKER, NAME, T0, T0 + dt.timedelta(hours=2), r.env, ["git-token"], cw.parse_disk(a, "worker"))
         self.assertEqual([v["name"] for v in withd["spec"]["volumes"]], ["pw", "tokens", "scratch", "data"])

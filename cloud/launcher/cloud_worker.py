@@ -1099,7 +1099,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=(), disk=None):
         pod["spec"]["containers"][0]["resources"] = {"requests": dict(res), "limits": dict(res)}
     if disk:   # the retained disk: a worker's pod names its claim; a StatefulSet's pod gets its volume from the claim template
         pod["spec"]["containers"][0]["volumeMounts"].append({"name": DISK_VOLUME, "mountPath": DISK_MOUNT})
-        pod["spec"]["containers"][0]["env"].append({"name": "CW_DISK_DIR", "value": DISK_MOUNT})
+        pod["spec"]["containers"][0]["env"].append({"name": "WORKER_DISK_DIR", "value": DISK_MOUNT})
         pod["metadata"]["annotations"]["cw/disk"] = "%dGi" % disk["gib"]
         if not persistent:
             pod["spec"]["volumes"].append({"name": DISK_VOLUME, "persistentVolumeClaim": {"claimName": claim_name(name, False)}})

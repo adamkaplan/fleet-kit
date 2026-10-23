@@ -39,8 +39,8 @@ if usable model-auth; then
   # The server reads credentials from its own database under <data dir>/opencode (it ignores an auth.json); the data dir is on tmpfs.
   # The import must succeed before anything starts: a pod that could not take its credential answers nothing (the free fallback model).
   data="$TMP/data"
-  if [ -n "${CW_DISK_DIR:-}" ] && [ -d "$CW_DISK_DIR" ] && [ -w "$CW_DISK_DIR" ]; then   # a retained disk: the session and the work tree outlive the pod
-    data="$CW_DISK_DIR/session"; ( umask 077; mkdir -p "$CW_DISK_DIR/work" )
+  if [ -n "${WORKER_DISK_DIR:-}" ] && [ -d "$WORKER_DISK_DIR" ] && [ -w "$WORKER_DISK_DIR" ]; then   # a retained disk: the session and the work tree outlive the pod
+    data="$WORKER_DISK_DIR/session"; ( umask 077; mkdir -p "$WORKER_DISK_DIR/work" )
   fi
   ( umask 077; mkdir -p "$data/opencode" )
   XDG_DATA_HOME="$data"; export XDG_DATA_HOME
