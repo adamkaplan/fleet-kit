@@ -25017,9 +25017,11 @@ def parse_review_block(text):
     if not isinstance(text, str) or not text.strip():
         return None, "no verdict block"
     lines = [l.strip() for l in text.splitlines()]
-    fields = {"verdict": None, "head": None, "impact_action": None, "impact_class": None, "impact_severity": None, "impact_probability": None, "impact_reason": None, "blocks": 0, "notes": 0, "findings": 0, "files_read": [], "files_problem": None}
+    fields = {"verdict": None, "head": None, "impact_action": None, "impact_class": None, "impact_severity": None, "impact_probability": None, "impact_reason": None, "blocks": 0, "notes": 0, "findings": 0, "files_read": [], "files_problem": None, "block_count": 0}
     started, section = False, "findings"
     for line in lines:
+        if started and line.startswith("verdict:"):
+            fields["block_count"] += 1   # #1126: a second `verdict:` line before the block ends opens another block (`--block` keeps reading the first verdict and the last rating)
         if line.startswith("verdict:") and not started:
             fields["verdict"], started = line.split(":", 1)[1].strip(), True
         elif started and line.startswith("head:"):
@@ -25248,6 +25250,8 @@ def cmd_review(args, runner, now):
             fields, why = parse_review_block(block_text)
             if fields is None:
                 raise ReviewError("refused: %s" % why)
+            if from_file and fields["block_count"] > 0:   # #1126: a verbatim block file is ONE block; the verdict (first block) and the rating (last block) of two would splice
+                raise ReviewError("refused: the file holds %d blocks: a block file is ONE block, the rater's own (nothing was recorded)" % (fields["block_count"] + 1))
             block_raw = block_text.encode("utf-8")
             block_digest, block_fields = (hashlib.sha256(block_raw).hexdigest(), len(block_raw)), {name: fields[name] for name in IMPACT_RATING_FIELDS}
             block_fields["impact_action"], block_fields["impact_class"] = fields["impact_action"], fields["impact_class"]   # #1126: kept so the floor can print what the block itself said

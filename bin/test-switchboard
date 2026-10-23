@@ -37454,6 +37454,32 @@ class TestAgentBlockCounts(TestBlockTable):
     def test_each_refusal_records_nothing(self):
         self.check_refusals()
 
+    def two_block_refusal(self):
+        one = Path(self.block_file())
+        two = self.world.state / "two1126.txt"
+        two.write_text(one.read_text() + one.read_text().replace("Marginal", "Critical"))
+        before = self.ledger()
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block-file", str(two))
+        self.assertNotEqual(code, 0)
+        self.assertIn("the file holds 2 blocks: a block file is ONE block, the rater's own", out + err)
+        self.assertEqual(self.ledger(), before)   # no row, no audit line
+
+    def test_a_block_file_with_two_blocks_is_refused_and_one_block_records(self):
+        self.two_block_refusal()
+        code, out, err = self.record_file()
+        self.assertEqual(code, 0, err)
+
+    def test_the_mutant_that_accepts_a_two_block_file_fails(self):
+        real = sb.parse_review_block
+        def mutant(text):
+            fields, why = real(text)
+            if fields is not None:
+                fields = dict(fields, block_count=0)
+            return fields, why
+        with mock.patch.object(sb, "parse_review_block", mutant):
+            with self.assertRaises(AssertionError):
+                self.two_block_refusal()
+
     ROW = dict(kind="review_record", reviewer="impact", pr="acme/app#7", head="a" * 40, impact_severity="Marginal", impact_probability="Remote", impact_action="none",
                block_sha256="f" * 64, block_impact_severity="Marginal", block_impact_probability="Remote", block_impact_action="none")
 
