@@ -34631,6 +34631,15 @@ class TestReviewProof(LedgerBase):
                       "the output contains Y", "the daemon rejects it", "the shim allows Z", "the file is written with mode 0600"):
             got = sb.plan_check.check(self.REVIEW_PLAN.replace("the header shows the agent state", prose, 1), "(1) a (2) b")
             self.assertIn("review-for-code", [d["code"] for d in got["defects"]], prose)
+        for prose in ("the daemon accepts the request", "the shim sends X", "a message is queued", "the audit line names Y", "the label is removed",
+                      "the daemon denies the request", "the hook deletes the file", "the daemon emits an event", "the worker creates a PR",
+                      "the worker posts a comment", "the gate fails closed", "the daemon stops", "the worker never pushes to main",
+                      "the token is not echoed", "the hook aborts"):
+            got = sb.plan_check.check(self.REVIEW_PLAN.replace("the header shows the agent state", prose, 1), "(1) a (2) b")
+            self.assertIn("review-for-code", [d["code"] for d in got["defects"]], prose)
+        # the trade-off: the net is keyword-based, so a prose scenario using one of these verbs is a false positive (it only pushes toward `test`); the plan reviewer guards what slips through
+        got = sb.plan_check.check(self.REVIEW_PLAN.replace("the header shows the agent state", "the skill explains why the plan has one canonical comment", 1), "(1) a (2) b")
+        self.assertNotIn("review-for-code", [d["code"] for d in got["defects"]])
         got = sb.plan_check.check(self.REVIEW_PLAN.replace("the header shows the agent state", "the skill states that it prints a table", 1), "(1) a (2) b")
         self.assertIn("review-for-code", [d["code"] for d in got["defects"]])   # a known false positive: it only pushes toward `test`
 

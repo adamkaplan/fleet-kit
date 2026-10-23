@@ -31,7 +31,7 @@ KNOWN = REQUIRED + OPTIONAL
 PROOF_EVALUATORS = {"test": ("ci",), "screenshot": ("reviewer", "owner"), "live": ("tester", "owner"),
                     "measure": ("tester", "owner"), "review": ("reviewer",)}
 # A `review` proof is a reviewer's read of text. A scenario whose subject is code behaviour a test can show is refused: use `test`.
-REVIEW_CODE_RE = re.compile(r"\b(?:exit status|exit code|stdout|stderr|returns?|raises?|throws?|function|endpoint|api call|code behaviou?r|runs? the (?:command|code|tests?)|refus(?:es|ed|e)|rejects?|rejected|prints?|printed|logs?|logged|exits?|exited|blocks?|blocked|allows?|allowed|writes?|written|contains?|non-zero|nonzero|mode 0[0-7]+)\b", re.IGNORECASE)
+REVIEW_CODE_RE = re.compile(r"\b(?:exit status|exit code|stdout|stderr|returns?|raises?|throws?|function|endpoint|api call|code behaviou?r|runs? the (?:command|code|tests?)|refus(?:es|ed|e)|rejects?|rejected|prints?|printed|logs?|logged|exits?|exited|blocks?|blocked|allows?|allowed|writes?|written|contains?|non-zero|nonzero|mode 0[0-7]+|accepts?|accepted|sends?|sent|queued|names|removed|denies|denied|deletes?|deleted|emits?|creates?|created|posts?|fails|failed|stops?|aborts?|aborted|never|echoed)\b", re.IGNORECASE)
 
 ID_RE = re.compile(r"^[SU][0-9]+[a-z]?$")
 COVERS_RE = re.compile(r"^(DW|PC)-([0-9]+)$")
