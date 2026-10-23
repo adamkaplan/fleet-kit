@@ -77791,7 +77791,7 @@ class TestWhoCanClear(unittest.TestCase):
 
     def report(self, decision="hold", hits=None, paths=()):
         return {"pr": "acme/app#9", "head": self.H, "owner_decision": decision, "complete": True, "unknown": None, "renamed_no_source": [], "top_tier_hits": hits or {}, "changed_paths": list(paths),
-                "review_action": "none", "review_class": None}
+                "review_action": "none", "review_class": None, "registrar_reasons": []}   # the lint's answer the real report always carries (#964)
 
     @staticmethod
     def file(name, status="modified", previous=None):
