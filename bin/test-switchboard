@@ -3649,6 +3649,17 @@ class TestApprovalCheck(Base):
         err = self.refused("Approved at %s" % self.current(), issues={7: {"done_when": "(1) first clause is stated here (2) a changed second clause"}})
         self.assertIn("Done-when", err)
 
+    def test_no_done_when_anywhere_is_refused_with_its_own_reason(self):
+        err = self.refused("Approved at %s" % self.current(), issues={7: {}})
+        self.assertIn("there is no Done-when on the issue or its ask", err)
+        self.assertRegex(err, r"\(current sha256:[0-9a-f]{64}\)")
+
+    def test_a_plan_with_no_clauses_block_is_refused_with_its_own_reason(self):
+        body = "## Plan (scenarios)\n\nsize: S\n\nno clauses block here\n"
+        err = self.refused("Approved at %s" % self.current(body), comments={7: [body]})
+        self.assertIn("the plan declares no clauses block", err)
+        self.assertNotIn("no longer equal", err)
+
     def test_an_ask_done_when_is_used_when_the_issue_has_none(self):
         issues = {7: {"parent": 6}, 6: {"done_when": APPROVAL_DW, "parent": 5}, 5: {}}
         gh_issues = dict(issues)
