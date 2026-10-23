@@ -2,5 +2,6 @@
 fleet-switchboard
 switchboard/judge_request.py
 switchboard/judge.py
+switchboard/import_v1.py
 switchboard/decisions_a.py
 switchboard/decisions_b.py
