@@ -357,6 +357,47 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
     return out
 
 
+CARRIES_RE = re.compile(r"(?m)^\s*CARRIES:\s*#(\d+)\b")
+
+
+def carries_of(body):
+    """(#1196) The number N of the standing body line `CARRIES: #N` (the one dependency this pull request carries), else None. Only the first line counts."""
+    found = CARRIES_RE.search(body or "")
+    return int(found.group(1)) if found else None
+
+
+def carries_refusal(dep_pr, dep_state, dep_head, in_branch):
+    """(#1196) The reason a CARRIES line is refused, else None: the named pull request is closed unmerged, or its head commit is not in this branch.
+    A merged dependency is not refused here: the pull request is then read as an ordinary one (the caller drops the line)."""
+    if dep_state == "closed":
+        return "%s is closed unmerged: its commits cannot be carried" % dep_pr
+    if not dep_head or not in_branch:
+        return "%s head %s is not in this branch: the commits it names are not here" % (dep_pr, (dep_head or "?")[:8])
+    return None
+
+
+def clear_names_both(clear, pr, dep_pr):
+    """(#1196) True when the owner's clear record names BOTH pull requests (the carrying one and the dependency)."""
+    names = (clear or {}).get("names")
+    return isinstance(names, list) and pr in names and dep_pr in names
+
+
+def carried_rows(carries, entries, facts):
+    """(#1196) The dependency's scenario rows: its recorded proofs and verdicts are reused ONLY for the commit its head names (`scenario_state` compares the head by
+    commit, never by pull request name); a record for any other commit is void. Returns (rows, reviews)."""
+    dep_pr, dep_head, dep_plan = carries["pr"], carries["head"], carries["plan"]
+    authors = authors_of(entries, dep_pr, carries.get("notice_senders") or (), carries.get("author"))
+    rows = []
+    for s in dep_plan["scenarios_parsed"]:
+        if claim_of(s) != "pr":
+            continue
+        row = scenario_state(s, entries, dep_pr, dep_plan["plan_hash"], dep_head, authors)
+        row["id"] = "%s %s" % (dep_pr, row["id"])
+        row["carried_from"] = dep_pr
+        rows.append(row)
+    return rows, review_records_at(entries, dep_pr, dep_head)
+
+
 REVIEWERS = ("code", "architecture", "security", "impact", "test")
 REVIEWERS_NOW = ("code", "architecture", "security", "impact", "test")   # the reviewers that exist today
 REVIEW_VERDICTS = ("approve", "request-changes", "comment", "incomplete")
@@ -402,6 +443,8 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
     every tracked gate that applies to a PR is satisfied; the untracked ones are listed, not counted."""
     head = (facts or {}).get("head")
     authors = authors_of(entries, pr, (facts or {}).get("notice_senders") or (), (facts or {}).get("author"))
+    carries = (facts or {}).get("carries") or None   # (#1196) the one dependency named by `CARRIES: #N`; None for an ordinary pull request
+    carried_reviews = None
     rows, scen_rows = [], []
     for gid, name, scope, owner, tracked in GATES:
         row = {"gate": gid, "name": name, "scope": scope, "decided_by": owner, "tracked": tracked, "status": "untracked",
@@ -418,6 +461,14 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
                 row.update(status="missing", missing=["plan check fails: %d defect(s)" % len(plan["defects"])])
             else:
                 row.update(status="ok", detail="plan hash %s" % plan["plan_hash"])
+            if carries and row["status"] == "ok":   # (#1196) both asks need a plan
+                dep = carries.get("plan")
+                if carries.get("refusal"):
+                    row.update(status="missing", missing=[carries["refusal"]])
+                elif dep is None or dep.get("result") != "pass":
+                    row.update(status="missing", missing=["CARRIES %s: the dependency's plan is missing or fails its check" % carries["pr"]])
+                else:
+                    row["detail"] += "; carried plan %s hash %s" % (carries["pr"], dep["plan_hash"])
         elif gid == "G1":
             if plan is None or plan["result"] != "pass":
                 row.update(status="missing", missing=["needs a plan that passes G0a"])
@@ -426,6 +477,12 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             else:
                 claimed = [s for s in plan["scenarios_parsed"] if claim_of(s) == "pr"]
                 scen_rows = [scenario_state(s, entries, pr, plan["plan_hash"], head, authors) for s in claimed]
+                if carries and not carries.get("refusal") and carries.get("plan") and carries["plan"].get("result") == "pass" and carries.get("head"):
+                    dep_rows, carried_reviews = carried_rows(carries, entries, facts)
+                    scen_rows = scen_rows + dep_rows
+                elif carries:
+                    scen_rows = scen_rows + [{"id": "%s plan" % carries["pr"], "status": "missing", "missing": [carries.get("refusal") or "the carried plan cannot be read"],
+                                              "carried_from": carries["pr"]}]
                 bad = [s for s in scen_rows if s["status"] != "ok"]
                 row["detail"] = "%d of %d claimed scenarios proven and judged at %s" % (len(scen_rows) - len(bad), len(scen_rows), head[:8])
                 none_because = PER_PR_NONE_RE.search(plan.get("text") or "")
@@ -461,6 +518,11 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             elif isinstance(floor, dict) and (floor.get("unreadable") or floor.get("decision") is None):
                 row.update(status="waiting", missing=["the impact floor could not be read for this head (%s): the owner decides, through cos"
                                                       % (floor.get("unreadable") or "no decision")])
+            elif carries and isinstance(floor, dict) and floor.get("clear_head") and floor.get("clear_head") != head and not floor.get("cleared") and floor.get("decision") == "hold":
+                row.update(status="waiting", missing=["clear is for another head (%s): a clear of a carrying pull request is recorded at the head that carries %s and never carries to a later head; the owner clears this head"
+                                                      % (floor["clear_head"][:8], carries["pr"])])
+            elif carries and isinstance(floor, dict) and floor.get("decision") == "hold" and floor.get("cleared") and not floor.get("names_both"):
+                row.update(status="waiting", missing=["the owner's clear does not name both pull requests (%s and %s): the owner clears again" % (pr, carries["pr"])])
             elif isinstance(floor, dict) and floor.get("rehold"):   # (#830) a clear was recorded for ANOTHER head, none for this one, no rating here: held again, whatever the labels say
                 row.update(status="waiting", missing=["held again for the owner at this head: %s; the owner clears this head, or the impact rating at this head says not held"
                                                       % floor["rehold"]])
@@ -500,7 +562,8 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
     ready = all(r["status"] in ("ok", "n/a", "untracked", "waived") for r in rows)
     return {"gates": rows, "ready": ready, "waived": waived, "untracked": [r["gate"] for r in rows if r["status"] == "untracked"],
             "scenarios": scen_rows, "head": head, "plan_hash": (plan or {}).get("plan_hash"),
-            "ledger_problem": ledger_problem, "reviews": review_records_at(entries, pr, head) if head else None}
+            "ledger_problem": ledger_problem, "reviews": review_records_at(entries, pr, head) if head else None,
+            "carries": ({"pr": carries["pr"], "head": carries.get("head"), "reviews": carried_reviews, "refusal": carries.get("refusal")} if carries else None)}
 
 
 SATISFIED = ("ok", "n/a", "untracked", "waived")
