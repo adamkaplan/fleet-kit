@@ -379,6 +379,25 @@ read the diff). An image by tag is accepted by design: the operator picks the im
 Details: `docs/cloud-worker-interface.md`. The live runs are in
 "Live proof" below.
 
+## Pulling prebuilt stack images (ask #1022)
+
+**The cause.** A worker pod sets `automountServiceAccountToken: false` and the guard refuses any pod with a service-account token, so no cloud identity works in a pod today: the label `azure.workload.identity/use` has nothing to exchange. (Whether the cluster's webhook injects a token for the default account is read live by the tester in the live slice; this text changes if it does.) A stack therefore built its images inside the pod, and peaked at 95 percent of its memory limit.
+
+**What a stack pod gets when the three settings are set.** With `CW_STACK_REGISTRY` (a registry host ending in `.azurecr.io`), `CW_STACK_PULL_CLIENT_ID` and `CW_STACK_PULL_TENANT_ID` (GUIDs, not secrets) all set, `create --stack` makes a pod that uses the service account `cw-stack-puller` (manifest: `cloud/k8s/stack-puller-sa.yaml`, token not auto-mounted), has no workload-identity label, and carries one extra volume: a projected service-account token (audience `api://AzureADTokenExchange`, 600 seconds, mode 0400) plus the three values as files, mounted read-only at ONE path, `/opt/cw-registry/token`, whose parent `/opt/cw-registry` is root-owned mode 0700 in the image. With none of the keys set the pod is exactly as before; one or two of them are refused, naming keys and never values.
+
+**The step.** `sudo cw-stack-pull IMAGE...` (a root-run script; the sudoers rule names it and `start-dockerd` only, with `env_reset`) trades the token for an Entra access token, trades that for a short-lived registry credential, logs the nested Docker in with `--password-stdin` into a 0700 directory on the memory tmpfs (files 0600), pulls each image (which must be on the configured registry host, read from the root-only file, never from the caller), and removes the directory on success, failure and SIGTERM. The credential is never an argument, an environment variable, a log line or part of the run record. A pod that never pulls never holds a credential.
+
+**Honest residual risk.** The coder is in the `docker` group, which inside the pod is root-equivalent: a nested container can bind-mount `/` and read the token file. So the isolation covers an accidental or prompt-injected shell (`cat`, `printenv`, a copied log) and any container the stack starts by default; it does not stop a coder who deliberately builds a container to read it. The bound: a 10 minute token, valid only for the exchange for one identity whose only right is to pull from one small registry.
+
+**Owner steps, in order** (the launcher never creates or changes an identity, a credential or a role):
+
+1. Create a user-assigned managed identity (`cw-stack-puller-id`) and give the launcher's operator its **principal id** (the one value the registry's owner needs).
+2. Create a federated credential on it: the cluster's OIDC issuer, subject `system:serviceaccount:<ns>:cw-stack-puller`, audience `api://AzureADTokenExchange`.
+3. The registry's owner grants `AcrPull` to the principal id, at the registry only (no write-capable role).
+4. Apply `cloud/k8s/stack-puller-sa.yaml` with the identity's client id and tenant id as annotations, then set the three keys, then publish the rebuilt image (new files: `cloud/worker/cw-stack-pull`, the Dockerfile lines).
+
+**The check, before any pod exists.** `cloud-worker stack-registry-check --resource-group RG --issuer ISSUER_URL` (needs `CW_STACK_REGISTRY` and `CW_CLOUD_NAMESPACE`; runs with your own `az` login; read-only) prints the principal id and `OK`, or each missing owner step (exit 1, also for a write-capable role), or `CANNOT TELL: <reason>` (exit 2, never a pass). It cannot call the token exchange: only a live stack pod proves that.
+
 ## Live proof (S10 runtime half and S12), run on a cluster
 
 Needs a cluster with one Ubuntu node whose containerd is 2.x, and `kubectl` pointed at it. Replace `<image>` with the
