@@ -45032,6 +45032,58 @@ class TestAccountPerRepo(Base):
         self.assertNotIn("SECRET", error)
 
 
+class TestCredentialRouteRecordedRepo(ReportBase):
+    """#480: the credential route and the worker's launch-recorded repository, together. The identity is the real `whoami --json` of an agent launched with (or without) a
+    repository; the real gh shim then runs on exactly what that said, so a drift in either half shows up here."""
+
+    call = TestIdentityCheck.call
+    run_gh_shim = TestIdentityCheck.run_gh_shim      # the same rig: the real shim in a subprocess with a fake gh, only the identity comes from the real command
+
+    def setUp(self):
+        super().setUp()
+        os.environ.pop(sb.SESSION_ENV, None)
+        sb._WARNED_PANES.clear()
+
+    CRED = ("auth", "git-credential", "get")
+    USERS = {"acme-org/widget-api": "acme-bot"}
+    TOKENS = {"acme-bot": "tok-bot", "acme-default": "tok-default"}
+
+    def route(self, fleet, users=None):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "intent_repo": "acme-org/default-repo"})
+        self.world.add_agent("worker", fleet=fleet)
+        os.environ["HERDR_PANE_ID"] = self.world.panes["worker"]
+        code, out, err = self.call("whoami", "--json")
+        self.assertEqual(code, 0, err)
+        who = json.loads(out)
+        users = dict(self.USERS, **{"acme-org/default-repo": "acme-default"}) if users is None else users
+        done, seen = self.run_gh_shim(who["repo"], users, self.TOKENS, args=self.CRED, own=who["own"])
+        return who, done, seen
+
+    def test_s1_a_worker_launched_with_a_mapped_repository_gets_the_mapped_accounts_token(self):
+        who, done, seen = self.route({"role": "coder", "repo": "acme-org/widget-api", "issue": 5})
+        self.assertEqual((who["repo"], who["own"]), ("acme-org/widget-api", True))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(seen["token"], "tok-bot", "the mapped account, not the default repository's or the inherited login")
+        self.assertNotIn("tok-bot", " ".join(seen["argv"]) + done.stdout + done.stderr)
+
+    def test_s2_a_recorded_repository_with_no_mapping_and_no_owner_wildcard_is_refused(self):
+        who, done, seen = self.route({"role": "coder", "repo": "acme-org/other-svc", "issue": 5})
+        self.assertEqual((who["repo"], who["own"]), ("acme-org/other-svc", True))
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("no GitHub account is mapped", done.stderr)
+        self.assertIsNone(seen, "the real gh never ran: no password was printed")
+        self.assertEqual(done.stdout, "")
+
+    def test_s3_a_worker_with_no_recorded_repository_is_refused_and_the_default_repositorys_account_is_never_used(self):
+        who, done, seen = self.route({"role": "coder", "issue": 5})
+        self.assertEqual((who["repo"], who["own"]), ("acme-org/default-repo", False), "only the configured default is known for it")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("no repository of its own", done.stderr)
+        self.assertIsNone(seen, "the default repository's account (mapped here) was not used")
+        self.assertEqual(done.stdout, "")
+        self.assertNotIn("tok-default", done.stdout + done.stderr)
+
+
 class TwoRepoGH:
     """`gh` for two repos with the same issue numbers and different asks, each readable by one account only."""
 
