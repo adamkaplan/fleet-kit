@@ -608,6 +608,18 @@ class GoneMatrix(Fx):   # the reproducer matrix: callers x states, each cell's l
         out = self.L.stop(argparse.Namespace(worker=WORKER, reason="x", run_id=None, no_record=True, record_dir=None))
         self.assertEqual((out["pushed"], self.left(), order), (False, ([], [], [], []), ["workload", "secrets"]))
 
+    def test_stop_by_name_only_with_no_pod_and_no_statefulset_leaves_planted_secrets_and_deletes_nothing(self):
+        self.launch()
+        self.kube.pods.clear(); self.kube.sets.clear(); self.kube.hold = True   # a cut-off create: only the Secrets remain
+        before = self.left()
+        dels = []
+        for meth in ("delete_pod", "delete_secret", "delete_run_secret", "delete_workload", "delete"):
+            real = getattr(self.kube, meth)
+            setattr(self.kube, meth, lambda *a, _r=real, _m=meth, **k: (dels.append(_m), _r(*a, **k))[1])
+        out = self.L.stop(argparse.Namespace(worker=WORKER, reason="x", run_id=None, no_record=True, record_dir=None))
+        self.assertEqual((out["pushed"], dels, self.left()), (False, [], before))
+        self.assertTrue(before[2] and before[3])
+
     def test_mutant_no_nonce_skip_fails(self):
         m = load_module("cloud_worker.py", "self._remove_gone(worker, name, nonce or None)", "(self._remove_gone(worker, name, nonce) if nonce else None)")
         self.gone()
