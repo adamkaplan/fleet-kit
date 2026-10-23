@@ -55166,6 +55166,30 @@ class TestHeldTop(DecisionsBase):
                 found = self.defects(self.OPEN + self.WHY + table + self.EXAMPLE + self.QS)
                 self.assertEqual((self.named(found, "table"), len(found)), (1, 1), found)
 
+    def test_the_table_is_read_by_header_name_and_each_defect_is_named(self):                               # 1082
+        def run(lines):
+            return self.defects(self.OPEN + self.WHY + "## What changes for you\n\n" + "\n".join(lines) + "\n\n" + self.EXAMPLE + self.QS)
+        a, b, c, d = "The first old thing.", "The first new thing.", "The second old thing.", "The second new thing."
+        ok3 = ["| What | Before | After |", "|---|---|---|", "| Some topic here | %s | %s |" % (a, b), "| Other topic here | %s | %s |" % (c, d)]
+        self.assertEqual(run(ok3), [])
+        ok4 = ["| After | Note | BEFORE | What |", "|---|---|---|---|", "| %s | n/a | %s | x |" % (b, a), "| %s | n/a | %s | y |" % (d, c)]
+        self.assertEqual(run(ok4), [])
+        two = ["| Before | After |", "|---|---|", "| %s | %s |" % (a, b), "| %s | %s |" % (c, d)]
+        cases = [
+            (["| What | After |", "|---|---|", "| x | %s |" % b] * 1 + ["| y | %s |" % d], "no Before column"),
+            (["| What | Before |", "|---|---|", "| x | %s |" % a, "| y | %s |" % c], "no After column"),
+            ([two[0], two[2], two[3]], "no separator row"),
+            (two[:2], "no data row"),
+            (["| What | Before | After | Before |", "|---|---|---|---|", "| x | %s | %s | %s |" % (a, b, a), "| y | %s | %s | %s |" % (c, d, c)], "duplicate Before column"),
+            (["| What | Before | After | After |", "|---|---|---|---|", "| x | %s | %s | %s |" % (a, b, b), "| y | %s | %s | %s |" % (c, d, d)], "duplicate After column"),
+            (ok3[:3] + ["| only | %s |" % c], "every table cell"),
+        ]
+        for lines, text in cases:
+            with self.subTest(text=text):
+                found = run(lines)
+                self.assertEqual(len(found), 1, found)
+                self.assertIn(text, found[0])
+
     def test_the_example_must_be_there_and_not_empty(self):                                                 # S4
         for example in ("", "## Example\n\n"):
             found = self.defects(self.OPEN + self.WHY + self.TABLE + example + self.QS)
