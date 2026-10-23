@@ -28,6 +28,13 @@ def is_secret(path):
     return any(fnmatch.fnmatch(base.lower(), g) for g in SECRET_GLOBS)
 
 
+WORKER_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._-]*$")  # no slash, no space, no leading dash
+
+
+def valid_worker(worker):
+    return bool(WORKER_RE.match(worker)) and ".." not in worker and not worker.endswith((".", ".lock"))
+
+
 def run(workdir, worker, prestop=False):
     status = git(workdir, "status", "--porcelain", "-z", "--untracked-files=all").stdout
     paths = [e[3:] for e in status.split("\0") if len(e) > 3]
@@ -50,9 +57,14 @@ def run(workdir, worker, prestop=False):
 
 
 def prestop_main():
-    """--prestop: silent when there is nothing to do; one JSON line on success or failure is replaced by plain text for cw-prestop."""
+    """--prestop: the branch is always <worker>/wip. The worker name comes from CW_WORKER, set by the pod spec (fixed at container start,
+    the kubelet runs this hook with the spec's environment, not the coder's shell); no argument and no other variable is read.
+    silent when there is nothing to do; one JSON line on success or failure is replaced by plain text for cw-prestop."""
     workdir, worker = os.environ.get("CW_WORKDIR", "/work/repo"), os.environ.get("CW_WORKER", "")
-    if not worker or not os.path.isdir(os.path.join(workdir, ".git")):
+    if not valid_worker(worker):
+        print("cw-prestop: not pushed (the worker name is not valid); work left in %s" % workdir)
+        return 0
+    if not os.path.isdir(os.path.join(workdir, ".git")):
         return 0
     try:
         res = run(workdir, worker, prestop=True)

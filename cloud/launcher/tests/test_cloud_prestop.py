@@ -131,6 +131,90 @@ class Hook(Base):
         self.assertNotIn("ermission", p.stdout + p.stderr)
 
 
+REFSPEC = "origin HEAD:refs/heads/w1/wip"
+
+
+def mutant_hook(dst, how):
+    """A copy of the hook that takes the branch from an argument or an environment variable and does not validate."""
+    s = open(HOOK).read()
+    old = 'os.environ.get("CW_WORKER", "")\n    if not valid_worker(worker):'
+    assert old in s
+    new = {"arg": '(sys.argv[2:3] or [os.environ.get("CW_WORKER", "")])[0]\n    if False:',
+           "env": 'os.environ.get("CW_WIP_NAME") or os.environ.get("CW_WORKER", "")\n    if False:'}[how]
+    open(dst, "w").write(s.replace(old, new))
+
+
+class Refspec(Base):
+    """The pushed branch is <own name>/wip only: not from an argument, not from a variable the coder's shell can write."""
+
+    def setUp(self):
+        super().setUp()
+        self.calls = os.path.join(self.t, "calls")
+        self.fake_git('echo "$@" >> %s\nexec REAL "$@"\n' % self.calls)
+
+    def pushes(self):
+        if not os.path.exists(self.calls):
+            return []
+        return [l.strip() for l in open(self.calls) if " push " in " " + l]
+
+    def run_hook(self, hook, args=(), **kw):
+        return subprocess.run([sys.executable, hook, "--prestop", *args], env=self.env(**kw), capture_output=True, text=True, timeout=30)
+
+    def attacks(self, hook):
+        """Every attempt names another branch; whatever is pushed must be exactly the pod's own."""
+        for args, kw in ((("main",), {}), (("other/wip",), {}), (("--force", "main"), {}),
+                         ((), {"CW_WIP_NAME": "other/wip"}), ((), {"CW_BRANCH": "main", "CW_WIP_BRANCH": "main", "CW_PRESTOP_BRANCH": "other/wip"}),
+                         (("main",), {"CW_WIP_NAME": "main"})):
+            self.dirty()
+            if os.path.exists(self.calls):
+                os.remove(self.calls)
+            self.run_hook(hook, args, **kw)
+            pushed = self.pushes()
+            self.assertEqual(len(pushed), 1, (args, kw, pushed))
+            self.assertEqual(pushed[0], "-C %s push %s" % (self.work, REFSPEC), (args, kw))
+            self.assertEqual(sh("git", "-C", self.origin, "for-each-ref", "--format=%(refname)"), "refs/heads/main\nrefs/heads/w1/wip")
+            sh("git", "-C", self.origin, "update-ref", "-d", "refs/heads/w1/wip")
+            sh("git", "-C", self.work, "reset", "-q", "--hard", "origin/main")
+
+    def malformed(self, hook):
+        for bad in ("a/b", "w1/wip", "a b", "-x", "--force", "..", "a..b", "a/../main", "w1\nmain", "main:main"):
+            self.dirty()
+            if os.path.exists(self.calls):
+                os.remove(self.calls)
+            self.run_hook(hook, CW_WORKER=bad)
+            self.assertEqual(self.pushes(), [], bad)
+            self.assertEqual(sh("git", "-C", self.origin, "for-each-ref", "--format=%(refname)"), "refs/heads/main", bad)
+
+    def test_other_branches_named_by_argument_or_environment_are_never_pushed(self):
+        self.attacks(HOOK)
+
+    def test_a_malformed_own_name_is_refused_with_no_push(self):
+        self.malformed(HOOK)
+        p = self.run_hook(HOOK, CW_WORKER="a/b")
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("not pushed", p.stdout)
+
+    def test_the_shells_environment_cannot_choose_the_name_through_cw_prestop_either(self):
+        self.dirty()
+        p = self.hook(CW_WIP_NAME="other/wip", CW_BRANCH="main")
+        self.assertEqual(p.returncode, 0)
+        self.assertEqual(self.pushes(), ["-C %s push %s" % (self.work, REFSPEC)])
+
+    def test_a_mutant_taking_the_branch_from_an_argument_or_variable_fails_these_tests(self):
+        for how in ("arg", "env"):
+            mut = os.path.join(self.t, "mutant-" + how)
+            mutant_hook(mut, how)
+            for check in (self.attacks, self.malformed):
+                with self.subTest(how=how, check=check.__name__):
+                    with self.assertRaises(AssertionError):
+                        check(mut)
+                    for r in sh("git", "-C", self.origin, "for-each-ref", "--format=%(refname)").split():
+                        if r != "refs/heads/main":
+                            sh("git", "-C", self.origin, "update-ref", "-d", r)
+                    sh("git", "-C", self.work, "reset", "-q", "--hard", "origin/main")
+                    sh("git", "-C", self.work, "clean", "-qfd")
+
+
 class Spec(unittest.TestCase):
     def test_every_pod_has_the_hook_and_the_grace(self):
         self.assertLess(cw.PRESTOP_BUDGET_SECONDS, cw.POD_TERMINATION_GRACE_SECONDS)
