@@ -31434,18 +31434,108 @@ class TestAlertColdStart(Base):
         self.assertEqual(self.sent(), [])
 
     def test_the_skip_line_says_how_far_the_start_has_got(self):
-        self.engine.config["triage"]["alert_labels"] = {}
+        """The counts come from a real pass: the alert repository is unreadable, so its issues input stays unread and the wake says so."""
+        self.hub.unreadable.add(self.ALERT)
         self.passes()
-        self.engine.config["triage"]["alert_labels"] = {self.ALERT: ["ops-alert"]}
-        self.engine.triage.units.clear()
-        self.engine.triage.units[(self.REPOS[0], "issues")] = {"at": 0, "data": [], "truncated": False, "error": None}
-        self.engine.triage.units[(self.REPOS[0], "merged")] = {"at": 0, "data": [], "truncated": False, "error": None}
+        read = len([c for c in self.hub.calls if self.ALERT not in c and "per_page" in c])   # the successful reads, counted from the hub
+        wanted = len(self.REPOS) * (3 + len(sb.triage_awaiting_labels(self.engine)))
+        self.assertGreater(read, 0)
+        lines = [e["detail"]["why"] for e in self.world.audit() if e["event"] == "whole.skipped" and e["detail"]["input"] == "issues:" + self.ALERT]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].endswith("(%d of %d units read)" % (read, wanted)), (lines, read, wanted))
+
+    def test_a_failed_refresh_does_not_count_as_read(self):
+        self.engine.triage = sb.TriageState()
         self.engine.triage.wanted = 30
-        self.engine.read_whole_said = {}
+        self.engine.triage.units[(self.REPOS[0], "issues")] = {"at": 0, "data": [], "truncated": False, "error": None}
+        self.engine.triage.units[(self.REPOS[1], "issues")] = {"at": 0, "data": [], "truncated": False, "error": "HTTP 502"}
         sb.read_mark(self.engine, "issues:" + self.ALERT, False, "issues not read yet", self.world.clock.now())
         sb.whole_skipped(self.engine, "alert_wake", "issues:" + self.ALERT)
-        lines = [e["detail"]["why"] for e in self.world.audit() if e["event"] == "whole.skipped" and e["detail"]["input"] == "issues:" + self.ALERT]
-        self.assertTrue(any("2 of 30 units read" in l for l in lines), lines)
+        lines = [e["detail"]["why"] for e in self.world.audit() if e["event"] == "whole.skipped"]
+        self.assertTrue(any(l.endswith("(1 of 30 units read)") for l in lines), lines)
+
+    def test_a_name_that_is_not_an_issues_input_and_no_wanted_keep_the_plain_line(self):
+        self.engine.triage = sb.TriageState()
+        self.engine.triage.units[(self.REPOS[0], "issues")] = {"at": 0, "data": [], "truncated": False, "error": None}
+        sb.read_mark(self.engine, "agents", False, "agents not read yet", self.world.clock.now())
+        self.engine.triage.wanted = 30
+        sb.whole_skipped(self.engine, "x", "agents")
+        sb.read_mark(self.engine, "issues:" + self.ALERT, False, "issues not read yet", self.world.clock.now())
+        self.engine.triage.wanted = 0
+        sb.whole_skipped(self.engine, "y", "issues:" + self.ALERT)
+        lines = sorted(e["detail"]["why"] for e in self.world.audit() if e["event"] == "whole.skipped")
+        self.assertEqual(lines, ["agents not read yet", "issues not read yet"])
+
+
+class TestAlertRefreshOrder(Base):
+    """#1140: the order in which `triage_refresh` reads, driven for real against the fake hub. Units here: issues, comments, merged."""
+    REPOS = ["acme-org/r%d" % i for i in range(1, 7)]
+    UNITS = ["issues", "comments", "merged"]
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={"github_repos": list(self.REPOS)})
+        self.engine = self.world.engine
+        self.hub = FakeTriageHub()
+        self.engine.hub = self.hub
+        self.state = sb.TriageState()
+        self.state.started = self.engine.now()
+        for repo in self.REPOS:
+            self.hub.open[repo] = {}
+
+    def refresh(self, alerts, budget=100, now=None):
+        self.engine.config["triage"] = {"alert_labels": {r: ["ops-alert"] for r in alerts}}
+        self.hub.calls.clear()
+        sb.triage_refresh(self.engine, self.state, self.REPOS, self.UNITS, now or self.world.clock.now(), [budget], 1)
+        return [self.read_of(c) for c in self.hub.calls]
+
+    @staticmethod
+    def read_of(path):
+        repo = re.search(r"repos/([^/]+/[^/]+)/", path).group(1)
+        unit = "merged" if "/pulls" in path else "comments" if "/issues/comments" in path else "issues"
+        return repo, unit
+
+    def old_order(self, skip=()):
+        return sorted(((r, u) for r in self.REPOS for u in self.UNITS if (r, u) not in skip), key=lambda t: (0,) + t)
+
+    def test_two_alert_repositories_are_read_first_and_the_rest_keep_the_old_order(self):
+        order = self.refresh(["acme-org/r5", "acme-org/r6"])
+        first = [("acme-org/r5", "issues"), ("acme-org/r6", "issues")]
+        self.assertEqual(order[:2], first)
+        self.assertEqual(order[2:], self.old_order(skip=first))   # no other unit waits for more than those two lists, none is dropped
+
+    def test_no_alert_labels_reads_in_the_old_order(self):
+        self.assertEqual(self.refresh([]), self.old_order())
+
+    def test_fresh_alert_units_change_nothing(self):
+        now = self.world.clock.now()
+        for r in ("acme-org/r5", "acme-org/r6"):
+            self.state.units[(r, "issues")] = {"at": now, "data": [], "truncated": False, "error": None}
+        fresh = [("acme-org/r5", "issues"), ("acme-org/r6", "issues")]
+        self.assertEqual(self.refresh(["acme-org/r5", "acme-org/r6"]), self.old_order(skip=fresh))
+
+    def test_a_stale_but_read_alert_unit_keeps_its_place_in_the_old_order(self):
+        now = self.world.clock.now()
+        self.state.units[("acme-org/r6", "issues")] = {"at": now - 10000, "data": [], "truncated": False, "error": None}
+        order = self.refresh(["acme-org/r6"])
+        self.assertNotEqual(order[0], ("acme-org/r6", "issues"))   # a read-but-stale unit is not "not read yet"
+        self.assertEqual(order[-1], ("acme-org/r6", "issues"))   # it has at > 0, so the unread units sort before it
+
+    def test_an_unreadable_alert_repository_does_not_stop_the_others(self):
+        self.hub.unreadable.add("acme-org/r6")
+        order = self.refresh(["acme-org/r6"])
+        self.assertEqual(order[0], ("acme-org/r6", "issues"))
+        self.assertIn("acme-org/r6", self.state.unreadable)
+        for repo in self.REPOS[:5]:
+            for unit in self.UNITS:
+                self.assertIn((repo, unit), self.state.units)
+
+    def test_a_budget_smaller_than_the_alert_lists_reads_only_alert_lists_in_order(self):
+        order = self.refresh(["acme-org/r5", "acme-org/r6"], budget=2)   # one kept in reserve: one read
+        self.assertEqual(order, [("acme-org/r5", "issues")])
+        self.state.units.clear()
+        order = self.refresh(["acme-org/r5", "acme-org/r6"], budget=3)
+        self.assertEqual(order, [("acme-org/r5", "issues"), ("acme-org/r6", "issues")])
 
 
 class TestAlertWake(Base):

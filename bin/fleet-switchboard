@@ -14719,7 +14719,7 @@ def triage_refresh(engine, state, repos, units, now, budget, reserve=1, seconds=
                 todo.append(((held or {"at": 0})["at"], repo, unit))
     alerts = set(((engine.config.get("triage") or {}).get("alert_labels") or {}) if isinstance(engine.config.get("triage"), dict) else ())
     # #1140: the not-yet-read `issues` unit of an alert repository goes first (one list per such repository), then the old order
-    for _, repo, unit in sorted(todo, key=lambda t: (not (t[2] == "issues" and t[1] in alerts),) + t):
+    for _, repo, unit in sorted(todo, key=lambda t: (not (t[0] == 0 and t[2] == "issues" and t[1] in alerts),) + t):
         if budget[0] - reserve < 1 or engine.now() - state.started >= seconds:
             break
         try:
@@ -15107,7 +15107,7 @@ def whole_skipped(engine, consumer, name):
         said[(consumer, name)] = at
         state = getattr(engine, "triage", None)
         if name.startswith("issues:") and state is not None and getattr(state, "wanted", 0):
-            why = "%s (%d of %d units read)" % (why, len(state.units), state.wanted)   # #1140: how far the cold start has got
+            why = "%s (%d of %d units read)" % (why, sum(1 for u in state.units.values() if u["error"] is None), state.wanted)   # #1140: how far the cold start has got
         engine._note("whole.skipped", None, {"consumer": consumer, "input": name, "why": why})
     return True
 
