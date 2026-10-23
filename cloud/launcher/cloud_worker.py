@@ -1219,11 +1219,12 @@ class Launcher:
         """The retained disks' line: the price per GiB per month and the total of the disks held now."""
         return disk_line(self.claims())
 
-    def check_cap(self, shape, hard_seconds, new_gib=0):
+    def check_cap(self, shape, hard_seconds, new_gib=0, count_disks=False):
         cap = spend_cap(self.env)
         try:
             spent = sum(as_cost(self.cost(p)) for p in self.kube.list_pods())
-            spent += as_cost(sum(gib_of(c) for c in self.claims()) * DISK_USD_PER_GIB_MONTH)   # a retained disk counts, a month of it
+            if count_disks:   # a launch with a disk counts the retained ones (a month of each); a plain worker's calls stay pods and secrets only
+                spent += as_cost(sum(gib_of(c) for c in self.claims()) * DISK_USD_PER_GIB_MONTH)
             launch = as_cost(self.estimate(shape, hard_seconds) + new_gib * DISK_USD_PER_GIB_MONTH)
         except CloudError as e:
             if e.code == EXIT_CAP:
@@ -1268,7 +1269,7 @@ class Launcher:
             if getattr(a, "disk_namespace", None) is not None:
                 check_claim_namespace({"metadata": {"namespace": a.disk_namespace}}, ns)
             self.check_cap(ROLES[role]["shape"] or a.shape, PERSISTENT_SPEND_SECONDS if persistent else int((hard - now).total_seconds()),
-                           disk["gib"] if disk else 0)
+                           disk["gib"] if disk else 0, bool(disk))
             spec = render_pod(a, worker, name, now, hard, self.env, sorted(run_values), disk)
             claim = None
             if disk and not persistent:
