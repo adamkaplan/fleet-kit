@@ -42,9 +42,11 @@ COPY launcher/token_mint.py /usr/local/bin/cw-token-mint
 COPY worker/activity.py /usr/local/bin/cw-worker-activity
 COPY worker/cw-gh /usr/local/bin/cw-gh
 COPY worker/probe-reach.sh /usr/local/bin/cw-probe-reach
+COPY worker/cw-plan-check worker/plan_check.py /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/start-dockerd /usr/local/bin/worker-entrypoint \
       /usr/local/bin/cw-end-hook /usr/local/bin/cw-token-mint /usr/local/bin/cw-worker-activity \
-      /usr/local/bin/cw-gh /usr/local/bin/cw-probe-reach \
+      /usr/local/bin/cw-gh /usr/local/bin/cw-probe-reach /usr/local/bin/cw-plan-check \
+ && chmod 0644 /usr/local/bin/plan_check.py \
  && chmod 0755 /usr/local/share/cw/guard.sh && chmod 0644 /usr/local/share/cw/opencode-worker.json /usr/local/share/cw/worker.md
 
 USER worker
