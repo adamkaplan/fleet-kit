@@ -1,0 +1,48 @@
+diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
+index 1a548ff..f903d88 100644
+--- a/.github/workflows/test.yml
++++ b/.github/workflows/test.yml
+@@ -22,7 +22,7 @@ permissions:
+ # its own run). A push to main has a group of its OWN (its commit sha) and cancel-in-progress is false for it: no run of a push to main is ever
+ # cancelled, running or pending (a shared group would let GitHub drop a pending run when a third push queued behind it).
+ concurrency:
+-  group: test-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
++  group: test-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}${{ github.event.action == 'reopened' && '-reopened' || '' }}
+   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+ 
+ jobs:
+@@ -51,6 +51,8 @@ jobs:
+           EVENT: ${{ github.event_name }}
+           BASE: ${{ github.base_ref }}
+           DRAFT: ${{ github.event.pull_request.draft }}
++          ACTION: ${{ github.event.action }}
++          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+         run: |
+           python3 - <<'PY'
+           import fnmatch, json, os, subprocess
+@@ -69,7 +71,24 @@ jobs:
+           macos = True
+           if event == "pull_request":
+               if base == "main":
+-                  macos = not draft
++                  # #1235: the decision is the pure function of bin/macos_plan.py, read from the BASE branch (a pull request cannot rewrite what gates it) with the
++                  # list from the base too. A reopened run (the gate pass's) always runs every leg. Anything unreadable runs macOS (fail safe).
++                  macos = True
++                  tool, plist = os.environ["RUNNER_TEMP"] + "/macos_plan.py", os.environ["RUNNER_TEMP"] + "/platform-paths.txt"
++                  got = [git("show", "origin/" + base + ":bin/macos_plan.py"), git("show", "origin/" + base + ":" + LIST), git("diff", "--no-renames", "--name-only", "origin/" + base + "...HEAD")]
++                  if all(g.returncode == 0 for g in got):
++                      open(tool, "w").write(got[0].stdout)
++                      open(plist, "w").write(got[1].stdout)
++                      done = subprocess.run(["python3", tool, "--event", event, "--action", os.environ.get("ACTION", ""), "--base", base, "--draft", "true" if draft else "false",
++                                             "--labels", os.environ.get("LABELS", ""), "--files", got[2].stdout.replace("\n", ","), "--patterns-file", plist], capture_output=True, text=True)
++                      if done.returncode == 0:
++                          decision = json.loads(done.stdout)
++                          macos = decision["macos"]
++                          note(decision["reason"])
++                      else:
++                          note("bin/macos_plan.py failed on origin/%s: running macOS (fail safe)" % base)
++                  else:
++                      note("bin/macos_plan.py, the platform-path list or the diff cannot be read from origin/%s: running macOS (fail safe)" % base)
+               else:
+                   # The list is read from the BASE, never from this pull request's own checkout: a pull request cannot rewrite the
+                   # list that gates it. A list edit and a change under the workflow directory always run macOS (both paths are fixed here, not read from the list).

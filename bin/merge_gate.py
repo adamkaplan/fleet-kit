@@ -22,6 +22,7 @@ import os
 import re
 import tempfile
 import time
+import importlib.util
 from pathlib import Path
 
 CONFIG_KEY = "merge_gate"   # the module declares its own configuration key (bin/fleet-switchboard config_declarations)
@@ -105,6 +106,10 @@ def read_facts(reading, gh, repo, number, conf):
         runs = reading.read_pr_runs(gh, repo, number, pr["head"])
         facts["runs"] = runs
         results = [reading.run_result(r) for r in runs]
+        legs = []
+        for run in runs:   # #1235: the legs of the newest run at the head, which is the gate pass's run on the merge ref once the pass re-ran it
+            legs += reading.read_run_legs(gh, repo, run["id"])
+        facts["legs"] = legs
         facts["pr_result"] = "none" if not runs else "pending" if "pending" in results else "red" if "red" in results else "green"
         if facts["pr_result"] == "red":
             for run in runs:
@@ -120,6 +125,27 @@ def read_facts(reading, gh, repo, number, conf):
     except reading.ReadError as err:
         facts["problems"].append(str(err))
     return facts
+
+
+def macos_legs_problem(facts):
+    """One line naming the macOS leg of the newest run at the head that is absent, skipped or cancelled (or red), else None. Only `success` is green. Applies when that
+    run has the test workflow's ubuntu leg (a repository without these legs has nothing to read); an absent leg asks for a re-run, which the gate pass makes a `reopened` run
+    that always has every leg (#1235)."""
+    legs = {l["name"]: l["conclusion"] for l in facts.get("legs") or []}
+    if "test (ubuntu-latest)" not in legs:
+        return None
+    mac = _macos_plan()
+    bad = mac._bad(legs, mac.MACOS)
+    if bad:
+        return "the macOS leg is not green on the merge-ref run of head %s: %s" % ((facts.get("head") or "?")[:8], ", ".join(bad))
+    return None
+
+
+def _macos_plan():
+    spec = importlib.util.spec_from_file_location("macos_plan", str(Path(__file__).resolve().parent / "macos_plan.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def decide(facts, waived=False):
@@ -147,6 +173,9 @@ def decide(facts, waived=False):
     if facts["run_base"] != facts["tip"]:
         return False, "%s moved after the last green run (tested on %s, tip now %s): its CI must run again on the current merge ref" % (
             facts["branch"], facts["run_base"][:8], facts["tip"][:8]), "rerun"
+    mac = macos_legs_problem(facts)
+    if mac:
+        return False, mac, "rerun"
     return True, "green at the head %s on the current tip %s" % (facts["head"][:8], facts["tip"][:8]), None
 
 

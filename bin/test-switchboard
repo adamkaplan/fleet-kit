@@ -87140,6 +87140,155 @@ class TestAssembler(unittest.TestCase):
         self.assertIn("usage: fleet-switchboard status", done.stdout)
 
 
+class TestMacosLegs(unittest.TestCase):
+    """Ask #1235: which macOS legs a pull request into main has (the pure decision of bin/macos_plan.py, the one the workflow patch calls), what gate G4 and the
+    gate pass read, the concurrency group model, and the patch file for the workflow edit a cloud worker cannot push."""
+
+    PATCH = REPO / "docs" / "macos-legs-workflow.patch"
+
+    def setUp(self):
+        self.mp = sb.load_module("macos_plan")
+        self.patterns = self.mp.parse_patterns((REPO / ".github" / "macos-platform-paths.txt").read_text())
+
+    def decide(self, **kw):
+        args = dict(event="pull_request", action="synchronize", base="main", draft=False, labels=(), files=("docs/readme.md",), patterns=self.patterns)
+        args.update(kw)
+        return self.mp.plan_matrix(**args)
+
+    def macos_legs(self, **kw):
+        return len([r for r in self.mp.rows(kw.get("event", "pull_request"), self.decide(**kw)["macos"]) if r["os"] == "macos-latest"]) * 2
+
+    def test_s2_the_planning_decision_for_each_case(self):
+        cases = [("a platform path", dict(files=("shims/gh",)), True), ("a docs-only change", dict(), False), ("the label", dict(labels=("needs-mac",)), True),
+                 ("a reopened run", dict(action="reopened"), True), ("a draft", dict(draft=True), False),
+                 ("a push to the default branch", dict(event="push", base=""), True), ("the nightly", dict(event="schedule", base=""), True)]
+        self.assertEqual(len(cases), 7)
+        for name, kw, expected in cases:
+            self.assertEqual(self.decide(**kw)["macos"], expected, name)
+        self.assertEqual([e for _, _, e in cases].count(True), 5)   # in for the platform path, the label, the reopened run, the push, the nightly
+        self.assertEqual(self.macos_legs(), 0, "a docs-only change reports no macOS leg")
+        self.assertEqual(self.macos_legs(files=("INSTALL.md",)), 2)
+        self.assertFalse(self.decide(action="opened")["macos"])
+        self.assertTrue(self.decide(files=(".github/workflows/test.yml",))["macos"])
+        self.assertTrue(self.decide(patterns=())["macos"], "an empty list fails safe")
+
+    def test_s10_the_nightly_and_the_push_keep_both_macos_legs(self):
+        for event in ("schedule", "push"):
+            rows = self.mp.rows(event, self.decide(event=event)["macos"])
+            self.assertEqual(len([r for r in rows if r["os"] == "macos-latest"]), 1, event)   # one row = the `test` and the `test-cloud` leg
+        self.assertEqual([r["name"] for r in self.mp.rows("schedule", True, ("main", "integration"))].count("nightly main (macos-latest)"), 1)
+
+    def test_u1_a_pull_request_into_another_branch_is_left_to_the_unchanged_rule(self):
+        out = self.decide(base="integration")
+        self.assertEqual(out["macos"], None)
+        self.assertIn("unchanged", out["reason"])
+
+    def test_s9_the_platform_list_keeps_shims_plugins_and_the_install_and_service_files(self):
+        self.assertEqual(self.mp.groups_missing(self.patterns), [])
+        for drop in ("shims/**", "plugins/**", "bin/fleet-doctor", "INSTALL.md", "templates/**", "bin/fleet-heartbeat"):
+            fixture = [p for p in self.patterns if p != drop]
+            self.assertNotEqual(self.mp.groups_missing(fixture), [], drop)
+        self.assertEqual(len(self.mp.groups_missing([p for p in self.patterns if p != "shims/**"])), 1)
+
+    GREEN = [{"name": n, "conclusion": "success"} for n in ("test (ubuntu-latest)", "test-cloud (ubuntu-latest)")]
+    MAC = [{"name": n, "conclusion": "success"} for n in ("test (macos-latest)", "test-cloud (macos-latest)")]
+
+    def g4(self, checks, merge_ref=None):
+        pl = sb.plan_ledger
+        return pl._macos_plan().legs_reading(checks, merge_ref)
+
+    def test_s4_macos_ran_at_the_head(self):
+        ok, which, detail = self.g4(self.GREEN + self.MAC)
+        self.assertEqual((ok, which), (True, "head"))
+        self.assertIn("at the head", detail)
+
+    def test_s3_macos_ran_only_on_the_merge_ref_or_never(self):
+        ok, which, detail = self.g4(self.GREEN, self.GREEN + self.MAC)
+        self.assertEqual((ok, which), (True, "merge ref"))
+        self.assertIn("merge ref", detail)
+        self.assertFalse(self.g4(self.GREEN)[0], "macOS never ran")
+        for state in ("skipped", "cancelled"):
+            leg = [dict(self.MAC[0], conclusion=state), self.MAC[1]]
+            ok, _, detail = self.g4(self.GREEN, self.GREEN + leg)
+            self.assertFalse(ok, state)
+            self.assertIn("test (macos-latest) (%s)" % state, detail)
+        self.assertFalse(self.g4(self.GREEN, self.GREEN + self.MAC[:1])[0], "an absent leg")
+        self.assertFalse(self.g4(self.MAC, self.GREEN + self.MAC)[0], "the ubuntu legs are needed at the head")
+
+    def g4_row(self, checks, merge_ref=None):
+        facts = {"ci": "green", "checks": checks, "merge_ref_checks": merge_ref, "head": "a" * 40}
+        plan = {"result": "pass", "defects": [], "scenarios_parsed": [], "text": "", "plan_hash": "x"}
+        rows = sb.plan_ledger.evaluate_gates(plan, [], None, facts, {"head": "a" * 40}, now=0)["gates"]
+        return next(r for r in rows if r["gate"] == "G4")
+
+    def test_g4_row_says_which_it_found(self):
+        self.assertEqual(self.g4_row(self.GREEN + self.MAC)["status"], "ok")
+        self.assertIn("at the head", self.g4_row(self.GREEN + self.MAC)["detail"])
+        self.assertIn("merge ref", self.g4_row(self.GREEN, self.GREEN + self.MAC)["detail"])
+        self.assertEqual(self.g4_row(self.GREEN)["status"], "missing")
+
+    def test_s6_a_mutant_that_reads_an_absent_macos_leg_as_green_fails_the_tests(self):
+        source = (BIN / "macos_plan.py").read_text()
+        mutant = source.replace('if found.get(n) != "success"]', 'if found.get(n) not in ("success", None)]')
+        self.assertNotEqual(mutant, source)
+        ns = {"__name__": "mutant"}
+        exec(compile(mutant, "mutant", "exec"), ns)
+        real = self.mp
+        self.assertFalse(real.legs_reading(self.GREEN)[0])
+        self.assertTrue(ns["legs_reading"](self.GREEN, self.GREEN)[0], "the mutant reads an absent leg as green")
+        self.assertFalse(real.legs_reading(self.GREEN, self.GREEN)[0])
+        skipped = [dict(self.MAC[0], conclusion="skipped"), self.MAC[1]]
+        mutant2 = source.replace('if found.get(n) != "success"]', 'if found.get(n) in ("failure",)]')
+        ns2 = {"__name__": "mutant"}
+        exec(compile(mutant2, "mutant", "exec"), ns2)
+        self.assertTrue(ns2["legs_reading"](self.GREEN, self.GREEN + skipped)[0], "the mutant reads a skipped leg as green")
+        self.assertFalse(real.legs_reading(self.GREEN, self.GREEN + skipped)[0])
+
+    def test_s5_a_reopened_run_is_not_cancelled_by_a_later_push_and_a_superseded_synchronize_run_is(self):
+        sha = "b" * 40
+        reopened, sync, push = ("pull_request", 7, sha, "reopened"), ("pull_request", 7, sha, "synchronize"), ("pull_request", 7, "c" * 40, "synchronize")
+        self.assertFalse(self.mp.cancelled_by(reopened, push), "the reopened run keeps running")
+        self.assertTrue(self.mp.cancelled_by(sync, push), "a superseded synchronize run is cancelled")
+        self.assertFalse(self.mp.cancelled_by(("push", None, sha, ""), ("push", None, "d" * 40, "")), "a push to main is never cancelled")
+
+    def test_the_gate_pass_refuses_a_macos_leg_that_is_absent_skipped_or_cancelled_and_names_it(self):
+        gate = sb.load_module("merge_gate")
+        legs = lambda *mac: [{"name": "test (ubuntu-latest)", "conclusion": "success"}] + [{"name": n, "conclusion": c} for n, c in mac]
+        both = (("test (macos-latest)", "success"), ("test-cloud (macos-latest)", "success"))
+        self.assertIsNone(gate.macos_legs_problem({"legs": legs(*both), "head": "a" * 40}))
+        for name, mac in (("absent", both[:1]), ("skipped", (both[0], ("test-cloud (macos-latest)", "skipped"))), ("cancelled", (("test (macos-latest)", "cancelled"), both[1]))):
+            said = gate.macos_legs_problem({"legs": legs(*mac), "head": "a" * 40})
+            self.assertIsNotNone(said, name)
+            self.assertIn("macos-latest", said)
+            self.assertIn(name, said)
+
+    def test_the_workflow_patch_applies_and_pins_the_planning_decisions(self):
+        patch = self.PATCH.read_text()
+        workflow = (REPO / ".github" / "workflows" / "test.yml").read_text()
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ".github" / "workflows").mkdir(parents=True)
+            (Path(tmp) / ".github" / "workflows" / "test.yml").write_text(workflow)
+            done = subprocess.run(["git", "apply", "--check", str(self.PATCH)], cwd=tmp, capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+        added = "\n".join(l[1:] for l in patch.splitlines() if l.startswith("+") and not l.startswith("+++"))
+        self.assertNotIn(".github/workflows/", "\n".join(l for l in patch.splitlines() if l.startswith("diff --git")).replace(".github/workflows/test.yml", ""))
+        self.assertIn("bin/macos_plan.py", added)
+        self.assertIn('"--action"', added)
+        self.assertIn("github.event.action == 'reopened' && '-reopened'", added)
+        self.assertIn("join(github.event.pull_request.labels.*.name", added)
+        self.assertNotIn("cancel-in-progress", added, "cancel-in-progress is untouched: on for pull requests")
+        self.assertNotIn("schedule", added.replace("macos_plan", ""), "the nightly is untouched")
+
+    def test_s7_the_documentation_says_what_runs_when_what_g4_requires_and_the_label(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        section = text[text.index("**Which macOS legs run (#1235)"):]
+        section = section[:section.index("\n\n**", 5)] if "\n\n**" in section[5:] else section
+        statements = [("a `reopened` run", "what runs when"), ("G4 reads", "G4's requirement"), ("`needs-mac`", "the label")]
+        for needle, what in statements:
+            self.assertIn(needle, section, what)
+        self.assertEqual(len([1 for needle, _ in statements if needle in section]), 3)
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.

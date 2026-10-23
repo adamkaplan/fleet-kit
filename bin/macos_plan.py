@@ -68,6 +68,19 @@ def rows(event, macos, refs=("main",)):
     return [dict(os=o, ref="", name="test (%s)" % o, cloud="test-cloud (%s)" % o) for o in oses]
 
 
+def concurrency_group(workflow, event, number, sha, action=""):
+    """The workflow's concurrency group (a model of the expression in .github/workflows/test.yml): a pull request's runs share one group, so a later push cancels a
+    superseded run; a `reopened` run (the gate pass's) has a group of its own, so a later push of the same head never cancels it. A push or dispatch groups by its sha."""
+    base = "test-%s-%s" % (workflow, number or sha)
+    return base + ("-reopened" if event == "pull_request" and action == "reopened" else "")
+
+
+def cancelled_by(old, new):
+    """True when the newer run `new` cancels the in-progress run `old`; each is (event, number, sha, action). cancel-in-progress is on for pull request events only."""
+    group = lambda r: concurrency_group("test", r[0], r[1], r[2], r[3])
+    return new[0] == "pull_request" and group(old) == group(new)
+
+
 def _by_name(checks):
     out = {}
     for c in checks or []:
@@ -100,7 +113,7 @@ def legs_reading(head_checks, merge_ref_checks=None):
     on_ref = _bad(_by_name(merge_ref_checks), MACOS)
     if on_ref:
         return False, "none", "the macOS legs are not green on the merge-ref run: " + ", ".join(on_ref)
-    return True, "merge ref", "ubuntu legs green at the head; macOS legs green on the gate pass's merge-ref run of that head"
+    return True, "merge ref", "ubuntu legs green at the head; macOS legs green on the gate pass's run on the merge ref of that head"
 
 
 def main(argv):
