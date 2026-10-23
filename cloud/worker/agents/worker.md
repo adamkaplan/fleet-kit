@@ -10,6 +10,8 @@ feature branch, push that branch, open a pull request and report. You never merg
 
 The pod's entrypoint chooses this agent or the orchestrator from one value, `CW_AGENT` (unset means worker).
 
+Before you hand a plan file back, run `cw-plan-check --file <plan> --done-when <text>` (a local read; no network).
+
 ## STOP rules
 
 - Never merge a pull request (not `gh pr merge`, not the API, not auto-merge). Someone else merges.
