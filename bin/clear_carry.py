@@ -35,6 +35,10 @@ class CarryVoid(Exception):
     """The clear does not carry. `str(err)` is the reason, in words: what could not be read, or what changed."""
 
 
+class CarryUnread(CarryVoid):
+    """(#955) The clear does not carry NOW because a read failed (or the head moved while it was read): not a verdict on the batch, so a batch judged again later may carry."""
+
+
 def _get_list(get, path, pages, what, key=None):
     """Every item of a paginated answer, or CarryVoid. `key` names the list inside an object answer. A list that is still full after `pages` pages is cut: void."""
     items = []
@@ -44,7 +48,7 @@ def _get_list(get, path, pages, what, key=None):
         except CarryVoid:
             raise
         except Exception as err:
-            raise CarryVoid("%s could not be read (%s)" % (what, str(err)[:80])) from None
+            raise CarryUnread("%s could not be read (%s)" % (what, str(err)[:80])) from None
         batch = answer.get(key) if key and isinstance(answer, dict) else answer
         if not isinstance(batch, list):
             raise CarryVoid("%s was not a list" % what)
@@ -58,7 +62,7 @@ def _object(get, path, what):
     try:
         answer = get(path)
     except Exception as err:
-        raise CarryVoid("%s could not be read (%s)" % (what, str(err)[:80])) from None
+        raise CarryUnread("%s could not be read (%s)" % (what, str(err)[:80])) from None
     if not isinstance(answer, dict):
         raise CarryVoid("%s was not an object" % what)
     return answer
@@ -358,7 +362,7 @@ def _listing(get, repo, base, head):
         page += 1
         items.extend(_object(get, "%s&page=%d" % (path, page), "the commits of the batch").get("commits") or [])
     if len(items) != total:
-        raise CarryVoid("GitHub lists %d of %d commits of the batch" % (len(items), total))
+        raise CarryUnread("GitHub lists %d of %d commits of the batch" % (len(items), total))
     out = []
     for item in items:
         sha = _sha(item.get("sha")) if isinstance(item, dict) else None
@@ -427,12 +431,14 @@ def batch_decide(get, repo, number, head, member_state, closure_of, protected, b
     * every member either was cleared at exactly that merged head (`member_state(number, head)` -> {"held", "cleared_head", "by"}) or the floor never held it;
     * no member changes a `protected` path (the clear's own code and the matrix) or a line `closure_of(number, files, head)` says is in the clear closure: such a batch needs a clear of its own;
     * no merge of the base branch changed a file (against both its parents) that a member changed;
-    * every line the batch adds or removes is a line of some member's change: the aggregated diff is exactly the union of the member diffs."""
-    verdict = {"carried": False, "reason": None, "head": head, "members": [], "merges": 0, "uncovered": [], "lines": 0, "summary": None}
+    * no line the batch adds or removes is outside the union of the members' changes (a batch that is a strict subset of it still carries)."""
+    verdict = {"carried": False, "reason": None, "head": head, "members": [], "merges": 0, "uncovered": [], "lines": 0, "summary": None, "soft": None}
+    # "soft" says how final a refusal is: "read" (a read failed or the head moved: judged again, a few times), "uncleared" (only members not cleared at their merged head yet: judged again when a clear is
+    # recorded), None (a definite refusal, kept for the head). "uncleared" is set only once every fact has been read in full.
     try:
         now_head, pull = pull_head(get, repo, number)
         if now_head != head:
-            raise CarryVoid("the head moved while it was being read")
+            raise CarryUnread("the head moved while it was being read")
         base = base_ref_of(pull)
         source = pull.get("head") if isinstance(pull.get("head"), dict) else {}
         if source.get("ref") != branch or (source.get("repo") or {}).get("full_name") != repo:
@@ -445,7 +451,7 @@ def batch_decide(get, repo, number, head, member_state, closure_of, protected, b
         tables = {_norm(p) for p in protected or ()}
         if not tables:
             raise CarryVoid("no list of protected paths was given: the batch carry is refused")
-        table, expected, member_paths, problems = [], {}, {}, []
+        table, expected, member_paths, problems, hard = [], {}, {}, [], []
         for m in sorted(members, key=lambda m: m["number"]):
             own, own_head, _ = own_change(get, repo, m["number"])
             commit = _get_list(get, "repos/%s/commits/%s?per_page=%d" % (repo, m["sha"], PAGE), FILE_PAGES, "the files of member #%d" % m["number"], "files")
@@ -455,20 +461,24 @@ def batch_decide(get, repo, number, head, member_state, closure_of, protected, b
             state = member_state(m["number"], own_head)
             held, cleared_head, by = bool(state.get("held")), state.get("cleared_head"), state.get("by")
             row = {"number": m["number"], "head": own_head, "held": held, "cleared_head": cleared_head if held else None, "by": by if held else None, "covered": True, "why": None}
-            why = []
+            why, firm = [], []
             if held and cleared_head != own_head:
                 why.append("held by the floor and %s" % ("cleared at %s, not at the merged head %s (amended after its clear)" % (str(cleared_head)[:8], own_head[:8]) if cleared_head else "never cleared"))
             for f in own:
                 for path in (f["path"], f["previous"]):
                     if path and _norm(path) in tables:
                         why.append("it changes %s, the clear's own code or the impact matrix: the batch needs a clear of its own" % path[:80])
+                        firm.append(1)
             closure = closure_of(m["number"], own, own_head)
             if closure is None:
                 raise CarryVoid("the changes of #%d to the clear's code could not be mapped" % m["number"])
             why.extend("%s: the batch needs a clear of its own" % r for r in closure)
+            firm.extend(closure)
             if why:
                 row["covered"], row["why"] = False, "; ".join(sorted(set(why)))
                 problems.append("#%d %s" % (m["number"], row["why"]))
+                if firm:
+                    hard.append(m["number"])
             for f in squash:
                 member_paths.setdefault(f["path"], m["number"])
             for key, count in _entries(squash).items():
@@ -479,26 +489,32 @@ def batch_decide(get, repo, number, head, member_state, closure_of, protected, b
             vs_first, vs_second = merge_files(get, repo, merge)
             for path in sorted(set(vs_first) & set(vs_second)):
                 if path in member_paths:
+                    hard.append(merge["sha"])
                     problems.append("merge %s of %s changed %s relative to both parents, and member #%d changed it" % (merge["sha"][:8], base, path[:80], member_paths[path]))
         files, files_head, _ = own_change(get, repo, number)
         if files_head != head:
-            raise CarryVoid("the head moved while it was being read")
+            raise CarryUnread("the head moved while it was being read")
         seen = _entries(files)
         verdict["lines"] = sum(seen.values())
         extra = _excess(seen, expected)
         verdict["uncovered"] = ["%s %s" % (k[0][:60], k[1][:60]) for k in sorted(extra)][:20]
         if extra:
+            hard.append("lines")
             problems.append("%d line(s) of the batch are in no member's change: %s" % (sum(extra.values()), "; ".join(verdict["uncovered"][:5])))
         held_rows = [r for r in table if r["held"]]
         free_rows = [r for r in table if not r["held"]]
         verdict["summary"] = "held members (%d): %s; never held (%d): %s; merges of %s: %d" % (
             len(held_rows), ", ".join("#%d %s" % (r["number"], "cleared by %s at %s" % (r["by"] or "someone", str(r["cleared_head"])[:8]) if r["cleared_head"] else "not cleared") for r in held_rows) or "none",
             len(free_rows), ", ".join("#%d" % r["number"] for r in free_rows) or "none", base, len(merges))
+        verdict["soft"] = None if hard else "uncleared"
         if problems:
             raise CarryVoid("; ".join(problems)[:1500] + " (" + verdict["summary"] + ")")
-        verdict["carried"] = True
+        verdict["carried"], verdict["soft"] = True, None
+    except CarryUnread as err:
+        verdict["reason"], verdict["soft"] = str(err), "read"
     except CarryVoid as err:
         verdict["reason"] = str(err)
-    except Exception as err:   # any other trouble holds the batch as it is held today
+    except Exception as err:   # any other trouble holds the batch as it is held today (and is judged again: a read failure is not a verdict)
         verdict["reason"] = "the batch carry could not be decided (%s)" % type(err).__name__
+        verdict["soft"] = "read"
     return verdict

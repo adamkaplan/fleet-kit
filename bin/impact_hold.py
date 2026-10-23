@@ -22,6 +22,9 @@ MOVED = ('rating_at',
          'impact_carry_decision',
          'impact_batch_decision',
          '_batch_record',
+         '_batch_clear_key',
+         '_batch_void_open',
+         '_batch_release',
          'batch_carried',
          'apply_impact_hold',
          '_consume_record',
@@ -204,6 +207,26 @@ def batch_carried(engine, state, repo, pr, head):
     return bool(head) and carried.get("route") == "batch" and carried.get("head") == head and impact_floor.carry_enabled(engine.config, repo)
 
 
+def _batch_clear_key(state):
+    """A short stamp of the recorded clears and carried heads of the pull requests that are not batches: [how many clears, newest clear time, how many carried, newest carry time, sum of the cleared heads' length].
+    It changes when ANY member's clear is recorded, taken back or carried (a batch refusal that was only 'not cleared yet' is judged again then)."""
+    clears = [v for v in (state.get("clears") or {}).values() if isinstance(v, dict)]
+    carried = [v for v in (state.get("carried") or {}).values() if isinstance(v, dict) and v.get("route") != "batch"]
+    newest = lambda rows: max([r["at"] for r in rows if isinstance(r.get("at"), (int, float))] or [0])
+    return "%d:%s:%d:%s" % (len(clears), newest(clears), len(carried), newest(carried))
+
+
+def _batch_void_open(void, state):
+    """True when a kept batch refusal for this head is to be judged again: it was only a failed read (up to BATCH_READ_TRIES times) or only a member not cleared at its merged head, and the members' clears
+    changed since. A definite refusal (no `soft`) is never open. Bounded and memoised by the clear state."""
+    soft = void.get("soft")
+    if soft == "uncleared":
+        return void.get("key") != _batch_clear_key(state)
+    if soft == "read":
+        return isinstance(void.get("tries"), int) and void["tries"] < 3 or void.get("key") != _batch_clear_key(state)
+    return False
+
+
 def impact_batch_decision(engine, repo, number, report):
     """None when no batch carry is to be tried (the switch is off, this head was already decided, or the pull request is not a batch), else the verdict of `clear_carry.batch_decide` for the batch at
     `report["head"]`. Reads GitHub, so it is called WITHOUT the impact-state lock. Never raises. A member's state is read from the recorded clears and from the floor's own report of that member (no second rule)."""
@@ -212,8 +235,11 @@ def impact_batch_decision(engine, repo, number, report):
             return None
         pr, head = "%s#%d" % (repo, number), report["head"]
         state, problem = read_impact_state(engine.state_dir)
-        if problem or (state.get("carried", {}).get(pr) or {}).get("head") == head or (state.get("batch_void", {}).get(pr) or {}).get("head") == head:
-            return None   # an unreadable state carries nothing; decided once per head
+        void = (state.get("batch_void", {}).get(pr) or {})
+        if problem or (state.get("carried", {}).get(pr) or {}).get("head") == head:
+            return None   # an unreadable state carries nothing
+        if void.get("head") == head and not _batch_void_open(void, state):
+            return None   # a DEFINITE refusal is kept for the head; a failed read or a member not cleared yet is judged again (`_batch_void_open`)
         if (state["clears"].get(pr) or {}).get("head") == head:
             return None
         cc = load_module("clear_carry")
@@ -226,14 +252,16 @@ def impact_batch_decision(engine, repo, number, report):
             mpr = "%s#%d" % (repo, member)
             found = pr_floor_report(engine, repo, member)
             if found.get("head") != member_head or found.get("owner_decision") not in ("hold", "second-review", "none"):
-                raise cc.CarryVoid("the floor could not be read for #%d at its merged head" % member)
+                raise cc.CarryUnread("the floor of #%d was read at head %s, not at the merged head %s" % (member, str(found.get("head"))[:8], str(member_head)[:8]))
             current, _ = read_impact_state(engine.state_dir)
             clear = current["clears"].get(mpr) or {}
             carried = current.get("carried", {}).get(mpr) or {}
             cleared_head, by = clear.get("head"), clear.get("by")
+            route = None
             if carried.get("head") == member_head and carried.get("route") != "batch":
                 cleared_head, by = member_head, "%s (carried)" % (by or "the owner")
-            return {"held": found["owner_decision"] == "hold", "cleared_head": cleared_head, "by": (("%s, order %s" % (by, clear["via"])) if clear.get("via") and by == clear.get("by") else by)}
+                route = "%s%s" % (carried.get("route") or "pure", (", confirmation " + str(carried.get("confirmation"))) if carried.get("confirmation") else "")
+            return {"held": found["owner_decision"] == "hold", "cleared_head": cleared_head, "route": route, "by": (("%s, order %s" % (by, clear["via"])) if clear.get("via") and by == clear.get("by") else by)}
 
         def closure_of(member, files, member_head):
             rule = (impact_floor.load_matrix().get("owner_hold") or {}).get("delegated_clear") or {}
@@ -269,21 +297,27 @@ def _batch_record(engine, repo, number, report, verdict):
         _impact_state_noted(engine, problem)
         if (state["clears"].get(pr) or {}).get("head") == head:
             return False
-        members = [{"pr": "%s#%d" % (repo, m["number"]), "head": m["head"], "held": m["held"], "cleared_by": m["by"]} for m in verdict["members"]]
+        members = [{"pr": "%s#%d" % (repo, m["number"]), "head": m["head"], "held": m["held"], "cleared_by": m["by"], **({"route": m["route"]} if m.get("route") else {})} for m in verdict["members"]]
         if verdict["carried"]:   # the members' clears are read again under the lock: one revoked since the verdict was made is not carried
             gone = [x["pr"] for x in members if x["held"] and (state["clears"].get(x["pr"]) or {}).get("head") != x["head"] and (state.get("carried", {}).get(x["pr"]) or {}).get("head") != x["head"]]
             if gone:
-                verdict = dict(verdict, carried=False, reason="the clear of %s was taken back or changed while the batch was judged" % ", ".join(gone[:5]))
+                verdict = dict(verdict, carried=False, soft="uncleared", reason="the clear of %s was taken back or changed while the batch was judged" % ", ".join(gone[:5]))
         if verdict["carried"]:
             state.setdefault("carried", {})[pr] = {"head": head, "route": "batch", "members": members, "at": int(engine.now())}
             state.setdefault("batch_void", {}).pop(pr, None)
             write_impact_state(engine.state_dir, state)
             engine.audit.append(engine.actor, "gate.batch_carried", pr, {"head": head, "members": members, "merges": verdict["merges"], "lines": verdict["lines"],
-                                                                         "why": "every line of the batch is a line of a member that was cleared at its merged head, or of a member the floor never held"})
+                                                                         "why": "no line of the batch is outside the union of the members' changes, and each held member was cleared at its merged head"})
             return True
-        state.setdefault("batch_void", {})[pr] = {"head": head, "reason": _one_line(verdict["reason"] or "", 400)}
+        previous = state.get("batch_void", {}).get(pr) or {}
+        again = previous.get("head") == head
+        void = {"head": head, "reason": _one_line(verdict["reason"] or "", 400)}
+        if verdict.get("soft"):   # not a definite refusal: judged again (a failed read a few times, 'not cleared yet' when a clear is recorded)
+            void.update(soft=verdict["soft"], key=_batch_clear_key(state), tries=(previous.get("tries", 0) + 1) if again and isinstance(previous.get("tries"), int) else 1)
+        state.setdefault("batch_void", {})[pr] = void
         write_impact_state(engine.state_dir, state)
-        engine.audit.append(engine.actor, "gate.batch_carry_held", pr, {"head": head, "reason": _one_line(verdict["reason"] or "", 1200), "members": members, "uncovered": verdict["uncovered"][:10]})
+        if not again or previous.get("reason") != void["reason"]:   # one audit line per head and reason, not one per pass
+            engine.audit.append(engine.actor, "gate.batch_carry_held", pr, {"head": head, "reason": _one_line(verdict["reason"] or "", 1200), "members": members, "uncovered": verdict["uncovered"][:10], "final": not verdict.get("soft")})
         return False
 
 
@@ -293,7 +327,8 @@ def apply_impact_hold(engine, repo, number, report, record):
     bin/clear_carry.py). Returns the number of gh calls spent. The labels are ensured once per repo per process."""
     batch = impact_batch_decision(engine, repo, number, report)   # (#955) a batch pull request: the clears of its members, read before and outside the lock
     if batch is not None and _batch_record(engine, repo, number, report, batch):
-        return 0   # carried: nothing is labelled, nothing is written to GitHub
+        _batch_release(engine, repo, number, report, record)   # (#955) like the single-pull-request carry: the hold the daemon already wrote is released
+        return 0
     carry = impact_carry_decision(engine, repo, number, report["head"])   # reads GitHub: before, and outside, the lock
     with impact_state_lock(engine.state_dir):   # the clear check, the label write and the record are ONE step against an owner clear
         spent = _apply_impact_hold_locked(engine, repo, number, report, record, carry)
@@ -305,6 +340,36 @@ def apply_impact_hold(engine, repo, number, report, record):
         except Exception as err:   # the carry is recorded: nothing here may fail the pass
             engine._note("gate.clear_notify_failed", "%s#%d" % (repo, number), {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
     return spent
+
+
+def _batch_release(engine, repo, number, report, record):
+    """(#955, mirrors the carry of one pull request) A batch that carried and had been held before: drop the daemon's record of its labels, remove the labels it added (`gate.hold_released`), and turn a first-line
+    `MERGE: captain` marker into `MERGE: automatic` (`neutralise_marker`, head-checked: the marker is read by the gate while no merge label says otherwise), then tell the Chief of Staff (`gate.clear_carried`
+    notice, kind carry). Never raises: the carry is recorded and nothing here may fail the pass. Labels the daemon did not add (an author's) are not touched."""
+    pr, head = report["pr"], report["head"]
+    try:
+        with impact_state_lock(engine.state_dir):
+            state, problem = read_impact_state(engine.state_dir)
+            if problem or not batch_carried(engine, state, repo, pr, head):
+                return
+            lifted = _labels_ours(label_names(engine.config), state, pr, wide=True)
+            if state["applied"].pop(pr, None) is not None:
+                write_impact_state(engine.state_dir, state)
+        runner = getattr(engine, "gh_runner", None) or subprocess.run
+        if lifted:
+            raw = read_pr_json(engine, repo, number)
+            if raw.get("headRefOid") == head:
+                live = raw.get("labels")
+                have = {(l.get("name") if isinstance(l, dict) else l) for l in (live if isinstance(live, list) else [])}
+                remove = [l for l in lifted if l in have]
+                if remove:
+                    change_issue_labels(engine, runner, repo, number, remove=remove)
+                    engine.audit.append(engine.actor, "gate.hold_released", pr, {"head": head, "removed": remove, "reasons": ["the clears of the batch's members carried to this head"]})
+        for line in neutralise_marker(engine, runner, repo, number, head):
+            engine._note("gate.batch_marker_remains", pr, {"line": _one_line(line, 200)})
+        notify_clear(engine, "carry", repo, number, head, previous=None, body=(record or {}).get("body"))
+    except Exception as err:
+        engine._note("gate.clear_notify_failed", pr, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
 
 
 def _consume_record(state, pr, clear=None):

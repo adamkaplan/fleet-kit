@@ -84515,7 +84515,7 @@ class BatchOverGit(GitHubOverGit):
 
     def __init__(self, repo_dir):
         super().__init__(repo_dir, branch="integration", base="main", number=100)
-        self.members, self.squash = {}, {}
+        self.members, self.squash, self.member_base = {}, {}, {}
 
     def forget(self):
         self.answers = {}
@@ -84534,7 +84534,7 @@ class BatchOverGit(GitHubOverGit):
             return {"head": {"sha": head, "ref": "integration", "repo": {"full_name": self.REPO}}, "base": {"ref": "main"}, "changed_files": self.changed_files_override if self.changed_files_override is not None else len(files)}
         for number in self.members:
             if tail == "pulls/%d" % number:
-                return {"head": {"sha": self.rev(self.members[number])}, "base": {"ref": "integration", "sha": self.rev("main")}, "merged": True, "merge_commit_sha": self.squash[number], "changed_files": len(self.member_files(number))}
+                return {"head": {"sha": self.rev(self.members[number])}, "base": {"ref": self.member_base.get(number, "integration"), "sha": self.rev("main")}, "merged": True, "merge_commit_sha": self.squash[number], "changed_files": len(self.member_files(number))}
             if tail == "pulls/%d/files" % number:
                 return self.page(self.member_files(number), parsed)
         if tail.startswith("compare/"):
@@ -84808,6 +84808,74 @@ class TestBatchCarry(unittest.TestCase):
             exec(compile(source.replace(old, new), "clear_carry_mutant", "exec"), mutant.__dict__)
             self.assertIn(label, run(mutant), "the mutant '%s' is caught" % name)
 
+    def mutant(self, old, new, name):
+        """clear_carry with ONE check edited out (the source is read, one edit, compiled): a test that holds against the real module and carries against this one fails when the check is removed."""
+        source = (BIN / "clear_carry.py").read_text()
+        self.assertEqual(source.count(old), 1, name)
+        module = types.ModuleType("clear_carry_mutant_%s" % name.replace(" ", "_"))
+        exec(compile(source.replace(old, new), "clear_carry_mutant", "exec"), module.__dict__)
+        return module
+
+    def test_a_commit_is_bound_to_the_merge_of_its_member_into_integration(self):
+        self.standard()
+        self.api.squash[11] = "9" * 40   # GitHub says #11 was merged by another commit: the commit titled (#11) is not its merge
+        self.api.forget()
+        verdict = self.decide(held=(11, 12))
+        self.assertFalse(verdict["carried"])
+        self.assertIn("is not the merge of pull request #11 into integration", verdict["reason"])
+        self.api.squash[11] = self.api.git("log", "--format=%H", "--grep", "(#11)", "-n", "1").strip()
+        self.api.member_base[11] = "main"   # merged into another branch
+        self.api.forget()
+        self.assertIn("is not the merge of pull request #11 into integration", self.decide(held=(11, 12))["reason"])
+        self.api.member_base.clear()
+        self.api.forget()
+        self.assertTrue(self.decide(held=(11, 12))["carried"], "and with the binding true it carries")
+        mutant = self.mutant('if pull.get("merged") is not True or pull.get("merge_commit_sha") != c["sha"] or base_ref_of(pull) != branch:', "if False:", "no merge binding")
+        self.api.squash[11] = "9" * 40
+        self.api.forget()
+        broken = mutant.batch_decide(self.api.get, self.REPO, 100, self.head(), lambda n, h: {"held": n in (11, 12), "cleared_head": self.api.rev("m%d" % n), "by": "the owner"}, lambda n, f, h: [], self.PROTECTED)
+        self.assertTrue(broken["carried"], "the mutant without the binding carries a commit that is not the member's merge, which the real check refuses")
+
+    def test_a_merge_whose_second_parent_is_not_on_the_default_branch_holds(self):
+        self.standard()
+        g = self.api.git
+        earlier = g("log", "--format=%H", "--grep", "(#11)", "-n", "1").strip()   # a commit of integration, not of main
+        tip = self.head()
+        tree = g("rev-parse", tip + "^{tree}").strip()
+        merge = g("commit-tree", tree, "-p", tip, "-p", earlier, "-m", "Merge side into integration").strip()
+        g("reset", "-q", "--hard", merge)
+        self.api.forget()
+        verdict = self.decide(held=(11, 12))
+        self.assertFalse(verdict["carried"])
+        self.assertIn("is not on main: only a merge of the base branch is carried", verdict["reason"])
+        mutant = self.mutant("check_main_side(get, repo, base, {\"sha\": c[\"sha\"], \"parents\": c[\"parents\"]})", "pass", "no second parent check")
+        broken = mutant.batch_decide(self.api.get, self.REPO, 100, self.head(), lambda n, h: {"held": n in (11, 12), "cleared_head": self.api.rev("m%d" % n), "by": "the owner"}, lambda n, f, h: [], self.PROTECTED)
+        self.assertTrue(broken["carried"], "the mutant without the check carries a merge of a side branch")
+
+    def test_a_member_in_the_batch_twice_holds(self):
+        class Anything(str):   # a merge commit sha that equals every commit: isolates the duplicate check from the merge binding
+            def __eq__(self, other):
+                return True
+
+            def __ne__(self, other):
+                return False
+            __hash__ = str.__hash__
+        a, b, root = "a" * 40, "b" * 40, "c" * 40
+
+        def get(path):
+            if "/compare/" in path:
+                return {"status": "ahead", "total_commits": 2, "commits": [{"sha": b, "parents": [{"sha": a}], "commit": {"message": "second (#11)"}},
+                                                                            {"sha": a, "parents": [{"sha": root}], "commit": {"message": "first (#11)"}}]}
+            if path.endswith("/pulls/11"):
+                return {"merged": True, "merge_commit_sha": Anything("d" * 40), "base": {"ref": "integration"}}
+            raise AssertionError(path)
+        with self.assertRaises(self.cc.CarryVoid) as raised:
+            self.cc.batch_members(get, self.REPO, "main", b)
+        self.assertIn("is in the batch twice", str(raised.exception))
+        mutant = self.mutant('if any(m["number"] == number for m in members):', "if False:", "no duplicate check")
+        members, _ = mutant.batch_members(get, self.REPO, "main", b)
+        self.assertEqual([m["number"] for m in members], [11, 11], "the mutant without the check lists the member twice")
+
 
 class TestBatchCarryInTheDaemon(Base):
     """(#955) In the daemon: one audit line per batch head, no label, every reader of "is it held" agrees, the owner's revoke takes it back for good, and a new head is judged afresh."""
@@ -84945,6 +85013,143 @@ class TestBatchCarryInTheDaemon(Base):
         self.assertIsNone(sb.impact_batch_decision(self.engine, self.REPO, 100, report))
         self.assertEqual(self.api.calls, gets, "no read of GitHub for a pull request that is not from the integration branch")
         self.assertEqual((self.events("gate.batch_carried"), self.events("gate.batch_carry_held")), ([], []))
+
+    def route_batch(self, argv, **kwargs):
+        """The shared route, with the body of #100 written back (the marker edit) and the labels of #100 following the adds and deletes."""
+        if argv[0] == FAKE_GH and argv[1] == "api" and "--method" in argv:
+            method = argv[argv.index("--method") + 1]
+            if method == "PATCH" and argv[2].endswith("/pulls/100"):
+                self.body = json.loads(kwargs["input"])["body"]
+                return subprocess.CompletedProcess(argv, 0, "{}", "")
+            if method == "DELETE" and "/issues/100/labels/" in argv[2]:
+                name = urllib.parse.unquote(argv[2].rsplit("/", 1)[1])
+                self.labels = [l for l in self.labels if l != name]
+            if method == "POST" and argv[2].endswith("/issues/100/labels"):
+                self.labels = self.labels + [l for l in json.loads(kwargs["input"]).get("labels", []) if l not in self.labels]
+        return self.route(argv, **kwargs)
+
+    def unclear(self):
+        state = self.state()
+        state["clears"].clear()
+        sb.write_impact_state(self.world.state, state)
+
+    def g6(self):
+        raw = {"state": "OPEN", "headRefOid": self.head, "title": "t", "labels": [{"name": n} for n in self.labels], "body": self.body, "author": {"login": "bot"}}
+        facts = sb.pr_facts_from(raw)
+        facts["floor"] = sb.gate_floor_fact(self.engine, self.world.state, self.REPO, 100, self.head)
+        rows = sb.plan_ledger.evaluate_gates(None, [], None, facts, self.PR)
+        (row,) = [r for r in rows["gates"] if r["gate"] == "G6"]
+        return row
+
+    def test_m1_a_batch_held_first_and_carried_later_is_released_like_the_single_pull_request_carry_and_the_real_g6_reads_it_cleared(self):
+        self.engine.gh_runner = self.route_batch
+        self.unclear()
+        self.body = "MERGE: captain\n\nthe batch\n"
+        self.assertEqual(self.judge() >= 0, True)   # members not cleared yet: held, both labels written
+        self.assertEqual(sorted(self.labels), sorted([self.names["merge-captain"], self.names["hold-impact"]]))
+        self.assertIn(self.PR, self.state()["applied"])
+        self.assertEqual(self.g6()["status"], "waiting", "held: both labels and the marker")
+        self.record_clears(11, 12)   # the owner clears the members afterwards; the SAME head
+        self.judge()
+        state = self.state()
+        self.assertTrue(sb.batch_carried(self.engine, state, self.REPO, self.PR, self.head))
+        self.assertNotIn(self.PR, state["applied"], "the daemon's record of its labels is dropped")
+        self.assertEqual(self.labels, [], "the labels the daemon wrote are removed")
+        (released,) = self.events("gate.hold_released")
+        self.assertEqual(sorted(released["detail"]["removed"]), sorted([self.names["merge-captain"], self.names["hold-impact"]]))
+        self.assertTrue(self.body.startswith("MERGE: automatic"), "the marker line is neutralised: the gate reads the body while no label says otherwise")
+        row = self.g6()
+        self.assertEqual((row["status"], row["detail"]), ("ok", "not a held PR"), "the REAL gate G6 reads the carried batch as cleared")
+        self.assertEqual(len(self.events("gate.batch_carried")), 1)
+        self.judge()
+        self.assertEqual(len(self.events("gate.hold_released")), 1, "once")
+
+    def test_m2_a_batch_opened_first_and_its_members_cleared_after_is_carried_at_the_next_pass_at_the_same_head(self):
+        self.unclear()
+        self.judge()
+        state = self.state()
+        self.assertEqual(state["batch_void"][self.PR]["soft"], "uncleared")
+        self.judge()   # no new clear: not judged again (memoised by the clear state)
+        self.assertEqual(len(self.events("gate.batch_carry_held")), 1)
+        self.record_clears(11, 12)
+        self.judge()
+        self.assertTrue(sb.batch_carried(self.engine, self.state(), self.REPO, self.PR, self.head))
+        self.assertNotIn(self.PR, self.state()["batch_void"], "the refusal of an earlier pass is gone")
+
+    def test_m2_a_failed_read_is_retried_and_is_bounded(self):
+        real_get = self.api.get
+        failing = [True]
+
+        def get(path):
+            if failing[0]:
+                raise RuntimeError("a transient failure of GitHub")
+            return real_get(path)
+        self.api.get = get
+        self.judge()
+        void = self.state()["batch_void"][self.PR]
+        self.assertEqual((void["soft"], void["tries"]), ("read", 1))
+        failing[0] = False
+        self.judge()
+        self.assertTrue(sb.batch_carried(self.engine, self.state(), self.REPO, self.PR, self.head), "the same head, read again: carried")
+        # bounded: a read that keeps failing is judged at most 3 times for a head
+        self.api.get = get
+        failing[0] = True
+        state = self.state()
+        state["carried"].pop(self.PR)
+        sb.write_impact_state(self.world.state, state)
+        for _ in range(6):
+            self.judge()
+        self.assertEqual(self.state()["batch_void"][self.PR]["tries"], 3)
+
+    def test_a_definite_refusal_is_kept_for_the_head(self):
+        self.helper.member(14, "b2.txt", "more\n")
+        self.held = (11, 12, 14)
+        self.record_clears(14)
+        self.helper.write(self.dir, "README.md", "widget api\nextra\n")
+        self.api.git("commit", "-q", "-am", "direct commit")
+        self.api.forget()
+        self.judge()
+        self.assertIsNone(self.state()["batch_void"][self.PR].get("soft"))
+        gets = self.api_gets
+        self.judge()
+        self.assertEqual(self.api_gets, gets, "a definite refusal is not read again at this head")
+
+    def test_every_place_the_batch_carry_writes_or_releases_is_in_one_table(self):
+        """Derived from the source (AST): every function of bin/impact_hold.py that mentions a batch AND writes (set, setdefault, pop) one of the carry's state keys, or removes labels, edits the marker or tells the lane."""
+        import ast
+        source = (BIN / "impact_hold.py").read_text()
+        keys, calls, found = {"carried", "batch_void", "applied"}, {"change_issue_labels", "neutralise_marker", "notify_clear", "write_impact_state"}, {}
+        for fn in ast.walk(ast.parse(source)):
+            if not isinstance(fn, ast.FunctionDef) or "batch" not in (ast.get_source_segment(source, fn) or ""):
+                continue
+            touched = set()
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("setdefault", "pop") and node.args and isinstance(node.args[0], ast.Constant) and node.args[0].value in keys:
+                    touched.add((node.args[0].value, node.func.attr))
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "pop" and isinstance(node.func.value, ast.Call) and isinstance(node.func.value.func, ast.Attribute) and node.func.value.func.attr == "setdefault" and node.func.value.args and isinstance(node.func.value.args[0], ast.Constant) and node.func.value.args[0].value in keys:
+                    touched.add((node.func.value.args[0].value, "pop"))
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "pop" and isinstance(node.func.value, ast.Subscript) and isinstance(node.func.value.slice, ast.Constant) and node.func.value.slice.value in keys:
+                    touched.add((node.func.value.slice.value, "pop"))
+                if isinstance(node, (ast.Assign, ast.Delete)):
+                    for target in node.targets:
+                        if isinstance(target, ast.Subscript):
+                            inner = target.value
+                            if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute) and inner.func.attr == "setdefault" and inner.args and isinstance(inner.args[0], ast.Constant) and inner.args[0].value in keys:
+                                touched.add((inner.args[0].value, "set"))
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in calls and node.func.id != "write_impact_state":
+                    touched.add((node.func.id, "call"))
+            if touched:
+                found[fn.name] = touched
+        table = {   # the members checked, one row per function of impact_hold.py that mentions a batch and writes or releases carry state
+            "_batch_record": {"carried", "batch_void"},   # the verdict: a carry (+ gate.batch_carried), or a refusal (definite, or soft and judged again)
+            "_batch_release": {"applied", "change_issue_labels", "neutralise_marker", "notify_clear"},   # the release of the hold the daemon wrote: record, labels, marker, notice
+            "cmd_impact_clear": {"batch_void", "carried"},   # the owner's revoke of a batch carry, and of a member's clear that a carry relied on
+            "apply_impact_hold": {"notify_clear"},   # the notice of the carry of ONE pull request (unchanged, PC-1); it reaches a batch only through `_batch_release`
+            "_apply_impact_hold_locked": {"applied", "carried", "change_issue_labels"},   # the carry of ONE pull request (unchanged, PC-1): it only READS a batch (`batch_carried`)
+        }
+        self.assertEqual({k: {name for name, _ in v} for k, v in found.items()}, table, "a place that writes or releases the carry's state is not in the table: add it, with a test")
+        for name in ("_batch_record", "_batch_release", "cmd_impact_clear"):
+            self.assertIn(name, found)
 
 
 class TestBlockedReport(Base):
