@@ -45188,13 +45188,13 @@ REAPER_ONLY_STEPS = {
 # the installer starts to call must be classified here: the completeness test fails when one has no row.
 INSTALLER_READERS = ("_one_line", "_read_json_object", "_xdg", "check_writable_target", "collect_status", "config_path",
                      "cos_orders_path", "fault", "format_status", "herdr_integration_status", "home_link_is_ours",
-                     "home_link_path", "load_config", "plugin_report", "private_env", "reaper_file_path", "reaper_settings_problem",
+                     "home_link_path", "load_config", "plugin_report", "private_env", "reaper_file_path", "reaper_login_file", "reaper_settings_problem",
                      "reaper_service_settings", "reaper_settings", "render_reaper", "render_service", "service_file_path",
                      "service_kind", "service_path_dirs", "service_values", "set_file_mode", "state_dir_path",
                      "v2_version_of", "validate_config", "weekly_job_scan")
 INSTALLER_WRITERS = ("ensure_home_link", "ensure_skills_path", "ensure_state_dir", "install_agents",
                      "install_cos_orders_template", "install_decisions_plugin", "install_hooks_plugin", "install_skills",
-                     "install_todolist_plugin", "uninstall_agents", "uninstall_decisions_plugin", "uninstall_hooks_plugin",
+                     "install_todolist_plugin", "make_reaper_login_directory", "uninstall_agents", "uninstall_decisions_plugin", "uninstall_hooks_plugin",
                      "uninstall_skills", "uninstall_skills_path", "uninstall_todolist_plugin", "write_if_changed")
 INSTALLER_STARTERS = ("ensure_daemon",)
 # The writers the reaper-only path may call: the reaper's own service file (through write_if_changed) and the state
@@ -45732,13 +45732,6 @@ class TheReaperOnlyInstall(ReaperOnlyFakes):
     def test_each_bad_settings_file_is_refused_by_name_and_nothing_is_written(self):
         self.assertEqual(self.refusal_failures(), [])
 
-    def test_the_token_file_name_may_come_from_the_environment_but_must_come_from_somewhere(self):
-        self.ensure_cloud_env()
-        with mock.patch.dict(os.environ, {"CW_CLOUD_TOKEN_FILE": ""}):
-            code, out, err = self.run_install("--cloud-reaper-only")
-        self.assertEqual(code, 1)
-        self.assertIn("is missing the cluster login name CW_CLOUD_TOKEN_FILE", err)
-
     def test_a_good_settings_file_passes_and_no_value_is_ever_printed(self):
         out, error = self.reaper_only()
         self.assertIsNone(error, error)
@@ -45786,6 +45779,148 @@ class TheReaperOnlyInstall(ReaperOnlyFakes):
         with mock.patch.object(sb, "reaper_settings_problem", lambda *a, **k: None):
             failed = self.refusal_failures()
         self.assertEqual(len(failed), len(self.refusal_cases()), "the mutant must break every case: %s" % failed)
+
+    # -- the login file's default (ask #982, decision A): the install stays one command
+    def default_login(self):
+        return self.home / ".local" / "state" / "fleet-switchboard" / "cloud-reaper-token"
+
+    def reaper_only_with_default(self, *flags):
+        """The install as the owner runs it: CW_CLOUD_TOKEN_FILE is in neither the environment nor cloud.env."""
+        self.ensure_cloud_env()
+        os.environ.pop("CW_CLOUD_TOKEN_FILE", None)   # the patcher of ensure_cloud_env puts the variable back at the test's end
+        return self.reaper_only_no_token(*flags)
+
+    def reaper_only_no_token(self, *flags):
+        out = io.StringIO()
+        args = sb.build_parser().parse_args(["install", "--cloud-reaper-only"] + list(flags))
+        installer = sb.Installer(self.machine, self.daemons, time.time, self.PLATFORM, REPO, dry_run=args.dry_run, out=out,
+                                 shared_profile=args.shared_profile, profile=args.profile, gh_user=args.gh_user)
+        try:
+            installer.install_cloud_reaper_only()
+        except sb.InstallError as err:
+            return out.getvalue(), str(err)
+        return out.getvalue(), None
+
+    def login_failures(self):
+        """The default's whole behaviour in one run; the labels of what did not hold (a mutant must make this non-empty)."""
+        failed = []
+
+        def check(label, test):
+            try:
+                test()
+            except Exception as err:
+                failed.append("%s: %s" % (label, err))
+
+        self.setUp()
+        path = self.ensure_cloud_env()
+        settings_before = {str(p): (p.read_bytes() if p.is_file() else None) for p in path.parent.rglob("*")}
+        out, error = self.reaper_only_with_default()
+        state = self.default_login()
+        check("one command", lambda: self.assertIsNone(error, error))
+        check("printed", lambda: self.assertIn("cloud reaper: login file %s (default; set CW_CLOUD_TOKEN_FILE to change it)\n" % state, out))
+        check("directory 0700", lambda: self.assertEqual(stat.S_IMODE(os.stat(str(state.parent)).st_mode), 0o700))
+        check("no group or world access", lambda: self.assertEqual(stat.S_IMODE(os.stat(str(state.parent)).st_mode) & 0o077, 0))
+        check("the file is not made by the installer", lambda: self.assertFalse(state.exists()))
+        check("in the service environment", lambda: self.assertIn(str(state), self.reaper_path().read_text()))
+        check("cloud.env byte-identical", lambda: self.assertEqual(
+            {str(p): (p.read_bytes() if p.is_file() else None) for p in path.parent.rglob("*")}, settings_before))
+        check("not in cloud.env", lambda: self.assertNotIn("CW_CLOUD_TOKEN_FILE", path.read_text()))
+        return failed
+
+    def test_the_install_is_one_command_and_the_default_is_chosen_and_printed(self):
+        out, error = self.reaper_only_with_default()
+        self.assertIsNone(error, error)
+        self.assertIn("cloud reaper: login file %s (default; set CW_CLOUD_TOKEN_FILE to change it)" % self.default_login(), out)
+        self.assertTrue(self.default_login().is_absolute())
+        self.assertIn(str(self.default_login()), self.reaper_path().read_text())
+
+    def test_the_default_directory_is_0700_and_the_file_is_not_made_by_the_installer(self):
+        old = os.umask(0)
+        try:
+            out, error = self.reaper_only_with_default()
+        finally:
+            os.umask(old)
+        self.assertIsNone(error, error)
+        self.assertEqual(stat.S_IMODE(os.stat(str(self.default_login().parent)).st_mode), 0o700)
+        self.assertFalse(self.default_login().exists())
+        self.assertEqual(stat.S_IMODE(os.stat(str(self.default_login().parent)).st_mode) & 0o077, 0)
+
+    def test_an_existing_directory_others_can_reach_is_refused_and_never_loosened_or_tightened(self):
+        for mode in (0o755, 0o770, 0o707):
+            self.setUp()
+            self.ensure_cloud_env()
+            state = self.default_login().parent
+            state.mkdir(parents=True)
+            os.chmod(str(state), mode)
+            before = tree_of(self.home)
+            out, error = self.reaper_only_with_default()
+            self.assertIsNotNone(error, "%04o" % mode)
+            self.assertIn("cloud reaper not installed: the login file's directory", error)
+            self.assertEqual(len(error.splitlines()), 1)
+            self.assertEqual(stat.S_IMODE(os.stat(str(state)).st_mode), mode)
+            self.assertEqual(tree_of(self.home), before)
+            self.assertEqual(self.machine.calls, [])
+            self.assertFalse(self.reaper_path().exists())
+
+    def test_the_plist_or_unit_carries_the_default_and_cloud_env_is_byte_identical(self):
+        self.assertEqual(self.login_failures(), [])
+
+    def test_a_dry_run_makes_no_directory_but_prints_the_default(self):
+        self.ensure_cloud_env()
+        os.environ.pop("CW_CLOUD_TOKEN_FILE", None)
+        before = tree_of(self.home)
+        out, error = self.reaper_only_no_token("--dry-run")
+        self.assertIsNone(error, error)
+        self.assertIn("login file %s (default;" % self.default_login(), out)
+        self.assertEqual(tree_of(self.home), before)
+        self.assertFalse(self.default_login().parent.exists())
+
+    def test_a_set_token_file_wins_and_no_default_is_made(self):
+        out, error = self.reaper_only()   # the fixture sets CW_CLOUD_TOKEN_FILE=/home/user/.cw/token
+        self.assertIsNone(error, error)
+        self.assertNotIn("login file", out)
+        self.assertIn("/home/user/.cw/token", self.reaper_path().read_text())
+        self.assertNotIn(str(self.default_login()), self.reaper_path().read_text())
+        self.assertFalse(self.default_login().parent.exists())
+
+    def test_a_relative_token_file_is_refused_by_name(self):
+        self.ensure_cloud_env()
+        before = tree_of(self.home)
+        with mock.patch.dict(os.environ, {"CW_CLOUD_TOKEN_FILE": "state/token"}):
+            code, out, err = self.run_install("--cloud-reaper-only")
+        self.assertEqual(code, 1)
+        self.assertIn("cloud reaper not installed: CW_CLOUD_TOKEN_FILE must be an absolute path", err)
+        self.assertEqual(tree_of(self.home), before)
+        self.assertEqual(self.machine.calls, [])
+
+    def test_a_build_that_writes_the_default_into_cloud_env_is_caught(self):
+        real = sb.make_reaper_login_directory
+
+        def mutant(path):
+            real(path)
+            with open(str(sb.cloud_settings_path()), "a") as handle:
+                handle.write("CW_CLOUD_TOKEN_FILE=%s\n" % path)
+        with mock.patch.object(sb, "make_reaper_login_directory", mutant):
+            failed = self.login_failures()
+        self.assertTrue([f for f in failed if "byte-identical" in f or "not in cloud.env" in f], failed)
+
+    def test_a_build_that_makes_the_directory_0755_is_caught(self):
+        def mutant(path):
+            os.makedirs(str(Path(path).parent))
+            os.chmod(str(Path(path).parent), 0o755)
+        with mock.patch.object(sb, "make_reaper_login_directory", mutant):
+            failed = self.login_failures()
+        self.assertTrue([f for f in failed if "directory 0700" in f], failed)
+
+    def test_a_build_without_the_default_fails_the_one_command_test(self):
+        def mutant(env):
+            value = (env.get("CW_CLOUD_TOKEN_FILE") or "").strip()
+            if value:
+                return value, False, None
+            return None, False, "cloud reaper not installed: the settings file is missing the cluster login name CW_CLOUD_TOKEN_FILE"
+        with mock.patch.object(sb, "reaper_login_file", mutant):
+            failed = self.login_failures()
+        self.assertTrue([f for f in failed if f.startswith("one command")], failed)
 
     def test_the_full_install_does_not_check_the_settings_file(self):
         self.assertFalse(sb.cloud_settings_path().exists())

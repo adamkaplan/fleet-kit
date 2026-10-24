@@ -30611,12 +30611,50 @@ def reaper_settings_problem(path=None, env=None):
         said = said[len("refused: "):] if said.startswith("refused: ") else said
         return head + said.replace("; nothing was called", "") + ": fix it as a launch needs, then run again"
     for name in REAPER_CLUSTER_NAMES + REAPER_VAULT_NAMES:
-        if name == "CW_CLOUD_TOKEN_FILE":   # not a key the launcher's file can hold: the install's environment carries it
-            if not ((os.environ if env is None else env).get(name) or "").strip():
-                return head + "%s is missing the cluster login name %s: set it in the shell that runs the install (the settings file cannot hold it)" % (shown, name)
+        if name == "CW_CLOUD_TOKEN_FILE":   # not a key the launcher's file can hold: reaper_login_file() chooses it (the environment, else a default)
+            continue
         elif name not in values:
             return head + "%s is missing the name %s: add it to the file" % (shown, name)
     return None
+
+
+def reaper_default_login_file():
+    """The reaper's default login file: ~/.local/state/fleet-switchboard/cloud-reaper-token under the real home."""
+    return Path(os.path.expanduser("~")) / ".local" / "state" / "fleet-switchboard" / "cloud-reaper-token"
+
+
+def reaper_login_file(env):
+    """(path, is_default, problem). A set CW_CLOUD_TOKEN_FILE (the install's environment) must be absolute; when it is not
+    set the default applies. `problem` is a named one-line refusal or None. Never touches the disk except to look."""
+    value = (env.get("CW_CLOUD_TOKEN_FILE") or "").strip()
+    if value:
+        if not value.startswith("/"):
+            return None, False, "cloud reaper not installed: CW_CLOUD_TOKEN_FILE must be an absolute path (a relative one is refused): set it to a full path or leave it unset for the default"
+        return value, False, None
+    path = reaper_default_login_file()
+    try:
+        info = os.lstat(str(path.parent))
+    except FileNotFoundError:
+        return str(path), True, None
+    except OSError as err:
+        return None, True, "cloud reaper not installed: the login file's directory cannot be examined (%s)" % type(err).__name__
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        return None, True, ("cloud reaper not installed: the login file's directory %s must be your own plain directory with no group or other access (chmod 700 it)"
+                            % str(path.parent).replace(str(Path.home()), "~", 1))
+    return str(path), True, None
+
+
+def make_reaper_login_directory(path):
+    """The default login file's directory, mode 0700, made when missing (an existing one is never changed). The file is
+    made 0600 by the reaper when it first writes it."""
+    parent = Path(path).parent
+    missing = []
+    while not parent.exists() and parent != parent.parent:
+        missing.append(parent)
+        parent = parent.parent
+    for directory in reversed(missing):
+        os.mkdir(str(directory), 0o700)
+        os.chmod(str(directory), 0o700)
 
 
 def render_reaper(kind, values, settings, kit_root=KIT_ROOT):
@@ -31255,10 +31293,12 @@ class Installer:
         spec.loader.exec_module(walk)
         return walk.parents_problem(str(script)) or walk.entry_problem(os.lstat(str(script)), "the reaper program")
 
-    def reaper_text(self, config, table_from_file=False):
+    def reaper_text(self, config, table_from_file=False, login_file=None):
         """The reaper's service file. `table_from_file` is the reaper-only install: the launcher's own settings file
         is then the only source of the keys it holds, so the service carries none of them."""
         settings = reaper_service_settings(os.environ) if table_from_file else reaper_settings(os.environ)
+        if login_file is not None:   # the default login file: the service environment only, never the owner's settings file
+            settings = dict(settings, CW_CLOUD_TOKEN_FILE=login_file)
         return render_reaper(self.kind, service_values(self.kit_root, service_path_dirs(self.kit_root, [shutil.which("python3")])),
                              settings, self.kit_root)
 
@@ -31280,8 +31320,8 @@ class Installer:
             return [["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), REAPER_LABEL)]]
         return [["systemctl", "--user", "disable", "--now", REAPER_UNIT]]
 
-    def step_reaper(self, config, table_from_file=False):
-        path, text = reaper_file_path(self.kind), self.reaper_text(config, table_from_file)
+    def step_reaper(self, config, table_from_file=False, login_file=None):
+        path, text = reaper_file_path(self.kind), self.reaper_text(config, table_from_file, login_file)
         check_writable_target(path)
         problem = self.reaper_command_problem()
         if problem:
@@ -31422,7 +31462,14 @@ class Installer:
         problem = reaper_settings_problem()   # before anything is written: this path only (the full install does not check)
         if problem:
             raise InstallError(problem)
-        changed = self.step_reaper({}, table_from_file=True)
+        login, is_default, problem = reaper_login_file(os.environ)
+        if problem:
+            raise InstallError(problem)
+        if is_default:
+            self.out.write("cloud reaper: login file %s (default; set CW_CLOUD_TOKEN_FILE to change it)\n" % login)
+            if not self.dry:
+                make_reaper_login_directory(login)
+        changed = self.step_reaper({}, table_from_file=True, login_file=login if is_default else None)
         self.out.write("only the cloud reaper's own service %s: the config, the profile pieces, the command link, "
                        "the plugin link, the switchboard's own service and the daemon were left alone\n"
                        % (("would be installed" if self.dry else "was installed") if changed else "is already installed"))
