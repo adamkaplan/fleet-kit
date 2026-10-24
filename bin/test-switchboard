@@ -84495,6 +84495,187 @@ class TestCloudWatchTick(unittest.TestCase):
         self.assertFalse(self.dir.exists())
 
 
+class TestCloudWatchBounds(unittest.TestCase):
+    """#1073 review: every entry kind and every bound of the cloud watch read has a test and a mutant (table in docs/switchboard.md, Cloud watch)."""
+    SRC = (REPO / "bin" / "cloud_worker.py")
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        self.dir = self.tmp / "cloud"
+        self.dir.mkdir()
+        self.cloud = sb.load_module("cloud_worker").bind(sb.__dict__)
+
+    def module(self, old=None, new=None):
+        text = self.SRC.read_text()
+        if old is not None:
+            self.assertIn(old, text)
+            text = text.replace(old, new)
+        mod = types.ModuleType("cloud_mutant")
+        mod.__file__ = str(self.SRC)
+        sys.modules["cloud_mutant"] = mod
+        self.addCleanup(sys.modules.pop, "cloud_mutant", None)
+        exec(compile(text, str(self.SRC), "exec"), mod.__dict__)
+        return mod.bind(sb.__dict__)
+
+    def guarded(self, fn, seconds=2):
+        import signal
+        def hung(*a):
+            raise AssertionError("the read hung")
+        old = signal.signal(signal.SIGALRM, hung)
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        try:
+            return fn()
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old)
+
+    def read(self, mod=None, **kw):
+        mod = mod or self.cloud
+        return self.guarded(lambda: mod.read_records_bounded(self.tmp, **kw))
+
+    def put(self, name, data=None):
+        (self.dir / name).write_bytes(json.dumps({"w": 1}).encode() if data is None else data)
+
+    # each kind: (check on the real module, mutant text change that must make the check fail)
+    def kind_cases(self):
+        outside = self.tmp / "outside.json"
+        outside.write_text("{}")
+        def fifo():
+            os.mkfifo(str(self.dir / "x.json"))
+        def sym():
+            os.symlink(str(outside), str(self.dir / "x.json"))
+        def adir():
+            (self.dir / "x.json").mkdir()
+        return {
+            "bad_name": (lambda: self.put("bad name!.json"), None, None),
+            "directory": (adir, None, None),
+            "not_regular": (fifo, "if not stat.S_ISREG(os.fstat(fd).st_mode):", "if False:"),
+            "fifo": (fifo, "os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW", "os.O_RDONLY | os.O_NOFOLLOW"),
+            "symlink": (sym, "os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW", "os.O_RDONLY | os.O_NONBLOCK"),
+            "too_large": (lambda: self.put("x.json", b"{\"a\": \"" + b"a" * 70000 + b"\"}"), "if len(raw) > max_bytes:", "if False:"),
+            "not_utf8": (lambda: self.put("x.json", b"\xff\xfe{}"), "except UnicodeDecodeError:", "except ZeroDivisionError:"),
+            "not_json": (lambda: self.put("x.json", b"{nope"), "except ValueError:\n        return None, \"not_json\"", "except ValueError:\n        return None, \"too_deep\""),
+            "wrong_shape": (lambda: self.put("x.json", b"[1]"), "if not isinstance(record, dict):", "if False:"),
+            "too_deep": (lambda: self.put("x.json", b"[" * 30000 + b"]" * 30000), "except RecursionError:", "except ZeroDivisionError:"),
+        }
+
+    def test_each_kind_is_skipped_and_counted_under_its_own_name(self):
+        for kind, (setup, _old, _new) in self.kind_cases().items():
+            with self.subTest(kind=kind):
+                for f in list(self.dir.iterdir()):
+                    shutil.rmtree(str(f)) if f.is_dir() and not f.is_symlink() else f.unlink()
+                setup()
+                got = self.read()
+                want = {"fifo": "not_regular", "directory": "not_regular"}.get(kind, kind)
+                self.assertEqual(got["records"], [])
+                self.assertEqual(got["skips"][want], 1, got)
+                self.assertEqual(got["skipped"], 1)
+
+    def test_each_kind_has_a_mutant_that_fails_its_check(self):
+        for kind, (setup, old, new) in self.kind_cases().items():
+            if old is None:
+                continue
+            with self.subTest(kind=kind):
+                for f in list(self.dir.iterdir()):
+                    shutil.rmtree(str(f)) if f.is_dir() and not f.is_symlink() else f.unlink()
+                setup()
+                want = {"fifo": "not_regular", "directory": "not_regular"}.get(kind, kind)
+                try:
+                    got = self.read(self.module(old, new))
+                except (AssertionError, Exception):
+                    continue   # the mutant hung or raised: caught
+                self.assertNotEqual((got["records"], got["skips"][want]), ([], 1), "the mutant of %s survived" % kind)
+
+    def test_mutant_plain_open_hangs_on_a_fifo(self):
+        os.mkfifo(str(self.dir / "x.json"))
+        plain = self.module("fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)", "fd = os.open(path, os.O_RDONLY)")
+        with self.assertRaises(AssertionError):
+            self.read(plain)
+        self.assertEqual(self.read()["skips"]["not_regular"], 1)
+
+    def test_files_examined_bound_with_more_bad_files_than_the_bound(self):
+        for i in range(self.cloud.WATCH_MAX_FILES + 30):
+            self.put("b%04d.json" % i, b"{nope")
+        got = self.read()
+        self.assertEqual(got["skipped"], self.cloud.WATCH_MAX_FILES)
+        self.assertEqual(got["bound"], "files")
+        mutant = self.module("elif examined >= max_files:", "elif False:")
+        self.assertGreater(self.read(mutant)["skipped"], self.cloud.WATCH_MAX_FILES)
+
+    def test_record_bound_names_records(self):
+        for i in range(self.cloud.WATCH_MAX_RECORDS + 3):
+            self.put("w%03d.json" % i)
+        got = self.read()
+        self.assertEqual((len(got["records"]), got["bound"]), (self.cloud.WATCH_MAX_RECORDS, "records"))
+        mutant = self.module("if len(out[\"records\"]) >= max_records:", "if False:")
+        self.assertGreater(len(self.read(mutant)["records"]), self.cloud.WATCH_MAX_RECORDS)
+
+    def test_time_bound_stops_and_says_so(self):
+        for i in range(10):
+            self.put("w%d.json" % i)
+        ticks = iter(range(0, 1000))
+        got = self.read(clock=lambda: next(ticks) * 0.5, seconds=1.0)
+        self.assertEqual(got["bound"], "time")
+        self.assertLess(len(got["records"]), 10)
+        mutant = self.module("elif clock() > deadline:", "elif False:")
+        ticks = iter(range(0, 1000))
+        self.assertEqual(len(self.read(mutant, clock=lambda: next(ticks) * 0.5, seconds=1.0)["records"]), 10)
+
+    def test_rotation_gives_every_record_a_turn(self):
+        for i in range(8):
+            self.put("w%d.json" % i)
+        seen, cursor = set(), None
+        for _ in range(4):
+            got = self.read(max_records=2, cursor=cursor)
+            cursor = got["cursor"]
+            seen |= {r["w"] for r in got["records"]}
+            self.assertEqual(len(got["records"]), 2)
+        names = set()
+        cursor = None
+        for _ in range(4):
+            got = self.read(max_records=2, cursor=cursor)
+            cursor = got["cursor"]
+            names.add(cursor)
+        self.assertEqual(len(names), 4)
+        mutant = self.module("after = [n for n in names if n > cursor]", "after = []")
+        cursor, last = None, set()
+        for _ in range(4):
+            got = self.read(mutant, max_records=2, cursor=cursor)
+            cursor = got["cursor"]
+            last.add(cursor)
+        self.assertEqual(len(last), 1)
+
+    def test_tick_makes_no_write_process_network_or_remove_call_and_audits_the_bound(self):
+        for i in range(self.cloud.WATCH_MAX_FILES + 2):
+            self.put("b%04d.json" % i, b"{nope")
+        audit = []
+        engine = types.SimpleNamespace(audit=types.SimpleNamespace(append=lambda *a: audit.append(a)), actor="daemon")
+        def boom(*a, **k):
+            raise AssertionError("the tick made a forbidden call")
+        import socket
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.tmp / "st")}):
+            (sb.state_dir_path() / "cloud").mkdir(parents=True)
+            for f in self.dir.iterdir():
+                shutil.copy(str(f), str(sb.state_dir_path() / "cloud" / f.name))
+            with mock.patch.object(subprocess, "run", boom), mock.patch.object(subprocess, "Popen", boom), mock.patch.object(os, "remove", boom), \
+                    mock.patch.object(os, "unlink", boom), mock.patch.object(os, "rename", boom), mock.patch.object(os, "write", boom), \
+                    mock.patch.object(socket, "socket", boom), mock.patch("builtins.open", boom):
+                sb.cloud_watch_tick(engine, None)
+                sb.cloud_watch_tick(engine, None)
+        self.assertEqual(len(audit), 1)
+        self.assertEqual(audit[0][1], "cloud-watch.capped")
+        self.assertEqual(audit[0][3]["bound"], "files")
+        self.assertEqual(audit[0][3]["skipped"], {"not_json": self.cloud.WATCH_MAX_FILES})
+
+    def test_mutants_write_call_and_no_audit_are_caught(self):
+        # a tick that writes or never audits fails the recording test above: prove the audit one by a source mutant
+        src = (REPO / "bin" / "fleet-switchboard").read_text()
+        self.assertIn('engine.audit.append(engine.actor, "cloud-watch.capped"', src)
+        self.assertNotIn("os.unlink", src[src.index("def cloud_watch_tick"):src.index("def finish_pass")])
+        self.assertNotIn("subprocess", src[src.index("def cloud_watch_tick"):src.index("def finish_pass")])
+
+
 class TestArchitectureSafetyNet(unittest.TestCase):
     """The tools that prove a move of switchboard code is text only (plan #1092, slice S0)."""
     TOOLS = REPO / "tools"

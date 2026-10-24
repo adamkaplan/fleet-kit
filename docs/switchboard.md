@@ -5444,7 +5444,26 @@ Each decision was walked against the matrix (its owner-hold meaning and its rati
 
 Cloud workers are outside discovery: `Engine.discover` builds observations only from the multiplexer's agent entries, and a cloud worker has no pane and no local session. Its records live in the cloud record directory, which only `status` and the reaper read. One `cloud_watch_tick` in `finish_pass` (the daemon's existing per-pass step, no new process or thread) reads those records each pass, under try/except like its sibling ticks (a failure is audited with step `cloud-watch`).
 
-Reads are bounded: at most 50 records per pass and 64 KiB per record; an oversize or corrupt file is skipped and counted, and reaching the record cap is audited once (not an error). The tick is read-only and leaves its result on `engine.cloud_watch`. Relaying a cloud worker's report to its lane (#1020) shares this tick instead of adding a second read.
+Reads are bounded and never block. Every file is opened with `O_RDONLY|O_NONBLOCK|O_NOFOLLOW` and read only when `fstat` says it is a regular file (a FIFO named `x.json` cannot hang the pass). The tick is read-only (no write, process, network or remove call) and leaves its result on `engine.cloud_watch`. Reading starts after the last name examined in the previous pass (a cursor, wrapping round), so every record gets a turn. When a bound stops a pass, one audit line `cloud-watch.capped` names the bound and the skipped counts, once per episode (not an error). Relaying a cloud worker's report to its lane (#1020) shares this tick instead of adding a second read.
+
+Bounds: 50 valid records, 200 files examined, 64 KiB per file, 1 s monotonic per tick (`bound` is `records`, `files` or `time`). The result also holds `skips`, a count per kind. Tests are in `TestCloudWatchBounds` (one test and one mutant each; the mutant is the source with the named change, and the test fails on it).
+
+| Entry kind or bound | Skip kind / bound | Test | Mutant |
+|---|---|---|---|
+| name rejected by `valid_name` | `bad_name` | each_kind_is_skipped_and_counted | (counted before any open) |
+| directory | `not_regular` | each_kind_is_skipped_and_counted | (read fails, same kind) |
+| FIFO, no writer | `not_regular` | mutant_plain_open_hangs_on_a_fifo, each_kind | plain `open` without `O_NONBLOCK`; no `S_ISREG` check |
+| symlink | `symlink` | each_kind_is_skipped_and_counted | no `O_NOFOLLOW` |
+| over 64 KiB | `too_large` | each_kind_is_skipped_and_counted | no size check |
+| not UTF-8 | `not_utf8` | each_kind_is_skipped_and_counted | decode error not caught |
+| not JSON | `not_json` | each_kind_is_skipped_and_counted | kind mislabelled |
+| JSON that is not an object | `wrong_shape` | each_kind_is_skipped_and_counted | no shape check |
+| nested too deep | `too_deep` | each_kind_is_skipped_and_counted | recursion error not caught |
+| 50 valid records | `records` | record_bound_names_records | no record cap |
+| 200 files examined | `files` | files_examined_bound_with_more_bad_files_than_the_bound | no file cap |
+| 1 s monotonic | `time` | time_bound_stops_and_says_so | no deadline |
+| start rotates | cursor | rotation_gives_every_record_a_turn | no cursor |
+| no write/process/network/remove; audit once | - | tick_makes_no_write_process_network_or_remove_call | a recorded forbidden call fails the test |
 
 ## The assembler (#1092, slice S1)
 

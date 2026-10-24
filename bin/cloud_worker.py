@@ -207,33 +207,89 @@ def list_records(state):
     return found
 
 
-WATCH_MAX_RECORDS = 50      # the most records one pass reads
+WATCH_MAX_RECORDS = 50      # the most valid records one pass reads
 WATCH_MAX_BYTES = 65536     # the most bytes read from one record
+WATCH_MAX_FILES = 200       # the most files one pass examines, valid or not
+WATCH_SECONDS = 1.0         # the most monotonic time one pass spends
+SKIP_KINDS = ("bad_name", "not_regular", "symlink", "too_large", "not_utf8", "not_json", "wrong_shape", "too_deep")
 
 
-def read_records_bounded(state, max_records=WATCH_MAX_RECORDS, max_bytes=WATCH_MAX_BYTES):
-    """The cloud record directory read for the per-pass watch: {"records": [...], "skipped": n, "capped": bool}. Read-only; never raises on a bad file."""
+def _read_one(path, max_bytes):
+    """One record file: (record, None) or (None, skip kind). Never blocks: O_NONBLOCK (a FIFO with no writer opens at once), O_NOFOLLOW, regular files only."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError as err:
+        import errno
+        return None, ("symlink" if err.errno == errno.ELOOP else "not_regular")
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, "not_regular"
+        raw = b""
+        while len(raw) <= max_bytes:
+            chunk = os.read(fd, max_bytes + 1 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+    except OSError:
+        return None, "not_regular"
+    finally:
+        os.close(fd)
+    if len(raw) > max_bytes:
+        return None, "too_large"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "not_utf8"
+    try:
+        record = json.loads(text)
+    except RecursionError:
+        return None, "too_deep"
+    except ValueError:
+        return None, "not_json"
+    if not isinstance(record, dict):
+        return None, "wrong_shape"
+    return record, None
+
+
+def read_records_bounded(state, max_records=WATCH_MAX_RECORDS, max_bytes=WATCH_MAX_BYTES, max_files=WATCH_MAX_FILES,
+                         seconds=WATCH_SECONDS, cursor=None, clock=None):
+    """The cloud record directory read for the per-pass watch. Read-only; never raises on a bad file, never blocks on one.
+    {"records": [...], "skipped": n, "skips": {kind: n}, "capped": bool, "bound": None|"records"|"files"|"time", "cursor": last name examined}.
+    The start rotates: reading resumes after `cursor`, so every record gets a turn."""
+    import time as _time
+    clock = clock or _time.monotonic
     base = Path(state) / CLOUD_DIR
-    out = {"records": [], "skipped": 0, "capped": False}
+    out = {"records": [], "skipped": 0, "skips": {k: 0 for k in SKIP_KINDS}, "capped": False, "bound": None, "cursor": cursor}
     if not base.is_dir():
         return out
-    for path in sorted(base.glob("*.json")):
+    names = sorted(n for n in os.listdir(str(base)) if n.endswith(".json"))
+    if cursor is not None:
+        after = [n for n in names if n > cursor]
+        names = after + [n for n in names if n <= cursor]
+    deadline = clock() + seconds
+    examined = 0
+    for name in names:
         if len(out["records"]) >= max_records:
+            out["bound"] = "records"
+        elif examined >= max_files:
+            out["bound"] = "files"
+        elif clock() > deadline:
+            out["bound"] = "time"
+        if out["bound"]:
             out["capped"] = True
             break
-        try:
-            if not valid_name(path.name[:-5]):
-                continue
-            with open(str(path), "rb") as handle:
-                raw = handle.read(max_bytes + 1)
-            if len(raw) > max_bytes:
-                raise ValueError("oversize")
-            record = json.loads(raw.decode("utf-8"))
-            if not isinstance(record, dict):
-                raise ValueError("not an object")
-            out["records"].append(record)
-        except Exception:
+        examined += 1
+        out["cursor"] = name
+        kind = None
+        if not valid_name(name[:-5]):
+            kind = "bad_name"
+        else:
+            record, kind = _read_one(str(base / name), max_bytes)
+        if kind:
+            out["skips"][kind] += 1
             out["skipped"] += 1
+        else:
+            out["records"].append(record)
     return out
 
 
