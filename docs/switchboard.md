@@ -4263,6 +4263,18 @@ and the text of `send`, `report`, `remind`, `notice` and `intent` messages is ne
 - **Read vs write of the three config dirs:** reads are allowed (standing orders, audit, installed definitions); redirects and the edit tool are denied there. Limits: the file guards name the places they keep out (`.ssh`, `.aws`, `Documents`, ...) rather than allowing only the repos, because a deny cannot carve out an exception.
 - Proof: `python3 tools/cos-permissions-proof/run.py` (job shapes must run, the out-of-job corpus must be denied, nothing asks). Rollback: restore the previous definition files.
 
+## Ask issue as the subject (#1130)
+
+`prove`, `verdict` and `gates` take `owner/repo#N` of an ASK ISSUE (an issue that is no pull request and no work item) as the subject, so an ask that delivers a report and no pull request can record its verdicts. Before, both commands resolved the subject with `--pr` and refused an issue ("is an issue, not a pull request").
+
+- The subject is resolved in one place, `ask_subject`, called by `_ledger_context`; a pull request is resolved exactly as before.
+- A record is bound to the plan hash of the plan comment on the issue (the newest `Plan (scenarios)` comment). It names the issue where a pull request's record names the head; the stored head is the first 40 hex digits of the plan hash.
+- An issue with no plan comment is refused with the reason ("it has no plan comment"), and nothing is recorded. A record is VOID when the plan hash changed after it ("plan changed" in `gates`), as a pull request's is when its head moves.
+- An issue is an ask only when it is OPEN, has `## Intent` with a `Done when:` line, does not carry the `<user>:orchestrator` label and has a parent issue (a charter has none). Otherwise `prove`, `verdict`, `gates` and `gates ask-close` refuse with that reason and record nothing. The author of the ask may not record a verdict on it (as a pull request's author may not); `prove` stays the author's step.
+- If the issue itself cannot be read, the subject falls back to the pull request path and is refused there (it fails closed). Subject forms: `owner/repo#N` (any repository) resolves to the issue; a bare `N`, `#N` and an issue URL are refused with a named reason, and a pull request URL stays a pull request.
+- `gates <issue>` reads the records like a pull request's: scenarios proven and judged.
+- Closing rule of a report-only ask: every scenario of its plan is proven and judged at the current plan hash. `gates ask-close <owner/repo#N>` names the scenarios recorded (exit 0), or refuses and names each scenario not judged (exit 1). It closes nothing itself.
+
 ## Plan evidence ledger and gates view (#107)
 
 Plan-driven development asks that a worker's proof of each plan scenario, and an evaluator's verdict on it, be held by the

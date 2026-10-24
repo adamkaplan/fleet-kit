@@ -29,6 +29,8 @@ The sender is always the agent the token proves, never a name in the body: a bod
 
 ## Set up the hub
 
+In a cluster the hub is defined by `cloud/k8s/cloud-hub.yaml` (see `docs/cloud-operator-quickstart.md`, section 4c). Install it once with `kubectl create -f cloud/k8s/cloud-hub.yaml`; never apply the whole file again: applying the whole file again resets the registry Secret to empty objects and deregisters every live agent until the launcher registers them again. Change the image with `kubectl -n cw set image deployment/cloud-hub hub=<registry>/<repository>@sha256:<digest>`. Roll back with `kubectl -n cw delete deployment,service -l app.kubernetes.io/part-of=cloud-hub`; adding `secret` to that list also deletes both Secrets (the registry and the per-agent passwords), and running agents cannot message until they are relaunched. An agent's URL has the form `http://<pod name>.cw-agents.cw.svc.cluster.local:4096`. The network boundary of the hub (which pods may reach it, which hosts it may reach) is enforced by the namespace's network policies, which are written in a separate manifest file under ask #1256 (cloud/k8s/cloud-hub-network.yaml); until that file is merged the policies exist only as applied in the cluster.
+
 Start it with `python3 bin/cloud_hub.py` (from `bin/`'s directory or with it importable; it imports `cloud_channel` and
 `cloud_channel_server`). Configure through the environment:
 
