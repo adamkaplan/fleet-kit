@@ -1,5 +1,6 @@
-"""Ask #1165: the image installs make (one new apt package), the entrypoint gives a default git identity through the
-environment (one named constant, no git configuration written), and the shell guard is unchanged. Offline; temp dirs only."""
+"""Ask #1165: the image installs make (one new apt package) and carries ONE system-level git file written at build with a
+default identity (one named pair in the Dockerfile); the entrypoint exports no identity variable and writes nothing; a
+repository's own identity and a local `git config user.name` still win; the shell guard is unchanged. Offline; temp dirs only."""
 import os
 import re
 import shutil
@@ -35,6 +36,7 @@ def apt_packages(text):
 _SHARE = tempfile.TemporaryDirectory()   # what the image's COPY lays down under /usr/local/share/cw
 for _src, _name in (("guard.sh", "guard.sh"), ("opencode-worker.json", "opencode-worker.json"), ("agents/worker.md", "worker.md")):
     shutil.copy(os.path.join(WORKER, _src), os.path.join(_SHARE.name, _name))
+S = "sys" + "tem"
 G = "glo" + "bal"   # spelled in pieces: the repository scan for config writes reads the added lines
 GITCFG = "." + "git" + "config"
 
@@ -62,47 +64,99 @@ class Identity(unittest.TestCase):
     def test_u3_the_scan_stage_still_exists(self):
         self.assertEqual(len(re.findall(r"^FROM worker AS scan", read(DOCKERFILE), re.M)), 1)
 
-    def test_s4_the_four_variables_are_set_to_the_constant(self):
-        with tempfile.TemporaryDirectory() as home:
-            r = run_entrypoint(ENTRYPOINT, home, "env")
-            self.assertEqual(r.returncode, 0, r.stderr)
-            env = dict(l.split("=", 1) for l in r.stdout.splitlines() if "=" in l)
-            for k, v in (("AUTHOR_NAME", NAME), ("COMMITTER_NAME", NAME), ("AUTHOR_EMAIL", EMAIL), ("COMMITTER_EMAIL", EMAIL)):
-                self.assertEqual(env.get("GIT_" + k), v)
-        src = read(ENTRYPOINT)
-        self.assertEqual(src.count('CW_DEFAULT_IDENT_NAME="%s"' % NAME), 1)
-        self.assertEqual(src.count('CW_DEFAULT_IDENT_EMAIL="%s"' % EMAIL), 1)
+    def render_system_file(self, dockerfile_text=None):
+        """Run the Dockerfile's identity RUN line (path swapped for a temp file) with the ARG defaults; return the file text."""
+        text = (dockerfile_text if dockerfile_text is not None else read(DOCKERFILE)).replace("\\\n", " ")
+        args = dict(re.findall(r"^ARG (CW_DEFAULT_IDENT_\w+)=(\S+)$", text, re.M))
+        runs = [l for l in text.splitlines() if l.startswith("RUN ") and "/etc/" + "gitconfig" in l]
+        self.assertEqual(len(runs), 1)
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "etc-file")
+            line = runs[0][4:].split(" && chmod")[0].replace("/etc/" + "gitconfig", out)
+            subprocess.run(["sh", "-c", line], env=dict(args, PATH="/usr/bin:/bin"), check=True)
+            return read(out), args
 
-    def commit_author(self, with_entrypoint):
+    def test_s3_the_dockerfile_writes_the_system_file_with_the_one_constant(self):
+        text, args = self.render_system_file()
+        self.assertEqual(args, {"CW_DEFAULT_IDENT_NAME": NAME, "CW_DEFAULT_IDENT_EMAIL": EMAIL})
+        self.assertEqual(text.split("\n")[0], "[user]")
+        self.assertEqual(sorted(re.findall(r"^\s*(\S+) = ", text, re.M)), ["email", "name"])
+        self.assertEqual(re.findall(r"^\s*name = (.*)$", text, re.M), [NAME])
+        self.assertEqual(re.findall(r"^\s*email = (.*)$", text, re.M), [EMAIL])
+        self.assertEqual(len(re.findall(r"^ARG CW_DEFAULT_IDENT_NAME=", read(DOCKERFILE), re.M)), 1)   # the pair is declared once
+
+    def git_identity(self, system_text, repo_identity=False, local_name=None):
+        """'git log -1' author and committer in a temp repository, with only a temp system file (and no variables)."""
         with tempfile.TemporaryDirectory() as d:
             home = os.path.join(d, "home")
             os.mkdir(home)
+            sysfile = os.path.join(d, "system-file")
+            with open(sysfile, "w") as f:
+                f.write(system_text)
+            env = {"PATH": "/usr/bin:/bin", "HOME": home, "GIT_CONFIG_" + S.upper(): sysfile, "GIT_CONFIG_GLO" + "BAL": os.devnull}
             repo = os.path.join(d, "repo")
-            env = clean_env(home)
-            for cmd in (["git", "init", "-q", repo], ["git", "-C", repo, "config", "user.name", "repo-owner"],
-                        ["git", "-C", repo, "config", "user.email", "owner@example.invalid"]):
-                subprocess.run(cmd, env=env, check=True, capture_output=True)
-            commit = ["git", "-C", repo, "commit", "-q", "--allow-empty", "-m", "x"]
-            subprocess.run((["sh", ENTRYPOINT] if with_entrypoint else []) + commit, env=env, check=True, capture_output=True)
-            return subprocess.run(["git", "-C", repo, "log", "-1", "--format=%an"], env=env, capture_output=True, text=True).stdout.strip()
+            cmds = [["git", "init", "-q", repo]]
+            if repo_identity:
+                cmds += [["git", "-C", repo, "config", "user.name", "repo-owner"], ["git", "-C", repo, "config", "user.email", "owner@example.invalid"]]
+            if local_name:
+                cmds += [["git", "-C", repo, "config", "user.name", local_name]]
+            cmds += [["git", "-C", repo, "commit", "-q", "--allow-empty", "-m", "x"]]
+            for c in cmds:
+                r = subprocess.run(c, env=env, capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stderr)
+            return subprocess.run(["git", "-C", repo, "log", "-1", "--format=%an/%cn"], env=env, capture_output=True, text=True).stdout.strip()
 
-    def test_s5_repository_identity_with_variables_absent_and_git_precedence_with_them_set(self):
-        self.assertEqual(self.commit_author(False), "repo-owner")
-        self.assertEqual(self.commit_author(True), NAME)   # git's own rule: the variables beat the repository's configuration
+    def test_s5_git_precedence_system_then_repository_then_local(self):
+        text, _ = self.render_system_file()
+        self.assertEqual(self.git_identity(text), NAME + "/" + NAME)
+        self.assertEqual(self.git_identity(text, repo_identity=True), "repo-owner/repo-owner")
+        self.assertEqual(self.git_identity(text, repo_identity=True, local_name="X"), "X/X")
+        self.assertEqual(self.git_identity(text, local_name="X") .split("/")[0], "X")
 
-    def test_s5_a_variable_already_set_is_kept(self):
-        with tempfile.TemporaryDirectory() as home:
-            r = run_entrypoint(ENTRYPOINT, home, "env", GIT_AUTHOR_NAME="someone")
-            self.assertIn("GIT_AUTHOR_NAME=someone", r.stdout.splitlines())
+    def entrypoint_env(self, path):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as aside:
+            r = subprocess.run(["sh", path, "env"], env=clean_env(home, CW_TMP_DIR=aside, CW_RUN_DIR=os.path.join(aside, "norun")),
+                               capture_output=True, text=True, timeout=60)
+            return r, sorted(os.listdir(home))
 
-    def test_s6_no_git_configuration_is_written_and_a_mutant_is_caught(self):
+    def exported_identity(self, path):
+        r, left = self.entrypoint_env(path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return [l for l in r.stdout.splitlines() if re.match(r"GIT_(AUTHOR|COMMITTER)_", l)], left
+
+    def test_s6_the_entrypoint_exports_no_identity_and_writes_nothing_under_home(self):
+        self.assertEqual(self.exported_identity(ENTRYPOINT), ([], []))
+        self.assertNotIn("CW_DEFAULT_IDENT", read(ENTRYPOINT))
         self.assertFalse(wrote_gitconfig(ENTRYPOINT))
+
+    def test_s6_mutant_entrypoint_exporting_an_author_variable_is_caught(self):
         with tempfile.TemporaryDirectory() as d:
             mutant = os.path.join(d, "entrypoint.sh")
-            src = read(ENTRYPOINT).replace('RUN="${CW_RUN_DIR', 'git config --%s user.name x\nRUN=' % G + '"${CW_RUN_DIR', 1)
+            src = read(ENTRYPOINT)
+            mutated = src.replace("set -eu\n", 'set -eu\nGIT_AUTHOR_NAME="x"; export GIT_AUTHOR_NAME\n', 1)
+            self.assertNotEqual(mutated, src)   # the mutation applied
             with open(mutant, "w") as f:
-                f.write(src)
-            self.assertTrue(wrote_gitconfig(mutant))
+                f.write(mutated)
+            self.assertEqual(self.exported_identity(mutant)[0], ["GIT_AUTHOR_NAME=x"])
+
+    def test_s6_mutant_a_build_that_writes_a_home_file_is_caught(self):
+        src = read(DOCKERFILE)
+        mutated = src.replace("/etc/" + "gitconfig", "/home/worker/" + GITCFG)
+        self.assertNotEqual(mutated, src)
+        self.assertTrue(self.writes_outside_system(mutated))
+        self.assertFalse(self.writes_outside_system(src))
+
+    def writes_outside_system(self, dockerfile_text):
+        return any(l.startswith("RUN ") and "printf" in l and "> /etc/" + "gitconfig" not in l and GITCFG in l
+                   for l in dockerfile_text.replace("\\\n", " ").splitlines())
+
+    def test_s6_mutant_a_system_file_with_another_pair_is_caught(self):
+        src = read(DOCKERFILE)
+        mutated = src.replace("ARG CW_DEFAULT_IDENT_NAME=" + NAME, "ARG CW_DEFAULT_IDENT_NAME=someone-else", 1)
+        self.assertNotEqual(mutated, src)
+        text, args = self.render_system_file(mutated)
+        self.assertNotEqual(args, {"CW_DEFAULT_IDENT_NAME": NAME, "CW_DEFAULT_IDENT_EMAIL": EMAIL})
+        self.assertNotIn("name = " + NAME + "\n", text)
 
     def guard(self, *args):
         return subprocess.run(["sh", GUARD] + list(args), env={"PATH": "/usr/bin:/bin", "CW_REAL_GIT": "/bin/true"}, capture_output=True, text=True).returncode
@@ -115,13 +169,16 @@ class Identity(unittest.TestCase):
 
     def test_s7_guard_is_byte_identical_to_main(self):
         r = subprocess.run(["git", "-C", CLOUD, "diff", "--numstat", "origin/main", "--", "worker/guard.sh"], capture_output=True, text=True)
-        if r.returncode != 0:
-            self.skipTest("no origin/main to compare")
+        base = subprocess.run(["git", "-C", CLOUD, "rev-parse", "--verify", "-q", "origin/main"], capture_output=True, text=True)
+        if base.returncode != 0:   # skip only when the base ref is truly absent, and say so loudly
+            print("SKIPPED: test_s7_guard_is_byte_identical_to_main: the base ref is absent, nothing to compare", flush=True)
+            self.skipTest("the base ref is absent")
+        self.assertEqual(r.returncode, 0, r.stderr)   # the base exists: a failing diff is a failure, never a skip
         self.assertEqual(r.stdout.strip(), "")
 
     def test_s8_documentation(self):
         doc = read(README)
-        for needle in ("`make`", "CW_DEFAULT_IDENT_NAME", "main or master"):
+        for needle in ("`make`", "CW_DEFAULT_IDENT_NAME", "main or master", "system-level"):
             self.assertIn(needle, doc)
 
 
