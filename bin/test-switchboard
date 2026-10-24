@@ -89178,6 +89178,10 @@ class TestAskIssueSubject(unittest.TestCase):
                 code = getattr(sb, command)(args, None, self.now)
             except sb.LedgerCommandError as exc:
                 return None, str(exc), out.getvalue(), err.getvalue()
+        text = err.getvalue()
+        if code == 2 and ("not recorded:" in text or "refused:" in text) and command != "cmd_gates_ask_close":
+            # the wrapper turns a refusal into a final line on stderr and exit 2: same refusal, same shape as a raised one
+            return None, text.strip(), out.getvalue(), text
         return code, None, out.getvalue(), err.getvalue()
 
     def prove(self, sid, **kw):
