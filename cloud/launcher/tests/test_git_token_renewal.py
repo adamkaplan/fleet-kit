@@ -28,6 +28,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import test_cloud_worker as base  # noqa: E402
 import test_app_token as ta  # noqa: E402
+from app_token import EXPECTED_PERMISSIONS  # noqa: E402  (the one table: the request asks for exactly this set)
 cw = base.cw
 T0 = base.T0
 LAUNCHER = os.path.dirname(HERE)
@@ -276,7 +277,7 @@ class RealMint(Harness):
         by59, swapped, oldest = self.drive_fake_clock()
         self.assertEqual(by59, 1, "the mint was called %s times by T+59 minutes" % by59)
         self.assertEqual(swapped, 30)
-        self.assertEqual(ta.Stub.seen[0][2], {"repositories": ["widget-service"]})   # one repository, the pod's
+        self.assertEqual(ta.Stub.seen[0][2], {"repositories": ["widget-service"], "permissions": dict(EXPECTED_PERMISSIONS)})   # one repository, the pod's
         self.assertLess(oldest, 3600, "a token was %d seconds old" % oldest)
 
     def test_s2_a_renewal_before_expiry_with_one_mint_and_a_token_always_under_an_hour_old(self):
@@ -316,7 +317,7 @@ class RealMint(Harness):
                 self.assertEqual(self.secret(), before)
                 self.assertEqual([(w, c) for w, _, c in res], [(WORKER, 1)])
                 self.assertIn("the mint failed", res[0][1])
-                self.assertEqual(ta.Stub.seen[-1][2], {"repositories": ["widget-service"]})
+                self.assertEqual(ta.Stub.seen[-1][2], {"repositories": ["widget-service"], "permissions": dict(EXPECTED_PERMISSIONS)})
 
     def test_s9_a_vault_lookup_mint_or_secret_failure_keeps_the_old_token_audits_names_the_worker_and_retries(self):
         faults = {

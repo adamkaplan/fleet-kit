@@ -31,4 +31,19 @@ CLOUD_BANNED_WORDS_FILE="$t/list" $chk --extra-source "$t/new.sh" >"$t/o" 2>&1; 
 [ $rc = 1 ] && grep -q "env NEW_SHELL_FLAG" "$t/o" && grep -q "env OTHER_FLAG" "$t/o" && ok "unprefixed shell names exit 1" || bad "unprefixed shell names rc=$rc"
 printf 'x = env.get("CW_NEW_FLAG") or env.get("HOME")\n' > "$t/ok.py"
 CLOUD_BANNED_WORDS_FILE="$t/list" $chk --extra-source "$t/ok.py" >"$t/o" 2>&1; [ $? = 0 ] && ok "prefixed and standard names pass" || bad "prefixed name: $(cat "$t/o")"
+# #1050: the git credential-manager switch is exempt by exact name, from a closed list with a reason each
+python3 - <<'PY' && ok "the exemption list is closed: exactly GCM_INTERACTIVE, with a reason" || bad "exemption list"
+import importlib.machinery, importlib.util, sys
+l = importlib.machinery.SourceFileLoader("cnn", "cloud/tests/check-neutral-names"); m = importlib.util.module_from_spec(importlib.util.spec_from_loader("cnn", l)); l.exec_module(m)
+assert set(m.GIT_STANDARD_ENV) == {"GCM_INTERACTIVE"}, sorted(m.GIT_STANDARD_ENV)
+assert all(len(r) > 20 for r in m.GIT_STANDARD_ENV.values())
+PY
+printf 'GCM_INTERACTIVE=never; export GCM_INTERACTIVE\n' > "$t/gcm.sh"
+CLOUD_BANNED_WORDS_FILE="$t/list" $chk --extra-source "$t/gcm.sh" >"$t/o" 2>&1; [ $? = 0 ] && ok "GCM_INTERACTIVE is exempt" || bad "GCM_INTERACTIVE: $(cat "$t/o")"
+printf 'export GCM_OTHER\nexport GCM_INTERACTIVE_X\nexport XGCM_INTERACTIVE\nexport MADE_UP\n' > "$t/gcm2.sh"
+CLOUD_BANNED_WORDS_FILE="$t/list" $chk --extra-source "$t/gcm2.sh" >"$t/o" 2>&1; rc=$?
+[ $rc = 1 ] && [ "$(grep -c '^name without the cw prefix' "$t/o")" = 4 ] && ok "other cw-less names, near-misses included, still fail" || bad "near-miss names rc=$rc"
+# mutant: a check that exempts every name must fail the rows above
+sed 's/and name not in GIT_STANDARD_ENV:/and False:/' $chk > "$t/mut"; chmod +x "$t/mut"; sed -i.bak 's#^ROOT = .*#ROOT = "'"$PWD"'"#' "$t/mut"
+CLOUD_BANNED_WORDS_FILE="$t/list" "$t/mut" --extra-source "$t/gcm2.sh" >"$t/o" 2>&1; [ $? = 1 ] && bad "the exempt-everything mutant was not caught" || ok "the exempt-everything mutant is caught"
 [ $fail = 0 ] && echo "RESULT: PASS" || { echo "RESULT: FAIL"; exit 1; }

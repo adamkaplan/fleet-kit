@@ -1,0 +1,7 @@
+# The parts of the daemon, in the order they run, relative to this file. The line naming the entry is the entry's own code.
+fleet-switchboard
+switchboard/judge_request.py
+switchboard/judge.py
+switchboard/import_v1.py
+switchboard/decisions_a.py
+switchboard/decisions_b.py

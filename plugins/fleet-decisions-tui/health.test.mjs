@@ -4,7 +4,7 @@ import assert from "node:assert/strict"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { NOT_RECORDED, blockLines, buildBlocks, healthRows, loadInputs, sparkline, bars, toolSeries, concernsHealth } from "./health.mjs"
+import { LEGEND, NOT_RECORDED, blockLines, buildBlocks, healthRows, loadInputs, sparkline, bars, toolSeries, concernsHealth } from "./health.mjs"
 
 const NOW = Date.UTC(2026, 9, 14, 12, 30, 0)
 const pane = {
@@ -41,7 +41,7 @@ const text = (segs) => segs.map((s) => s[0]).join("")
 
 test("workspaces are ordered hottest first, each block is at most 2 lines, and lines fit the width", () => {
   const blocks = buildBlocks(full, NOW)
-  assert.deepEqual(blocks.map((b) => b.name), ["alpha", "beta", "cos", "delta", "eps", "gamma"]) // alert + stalled first, then open asks, then name order for the cold ones
+  assert.deepEqual(blocks.map((b) => b.name), ["alpha", "beta", "cos", "delta", "eps"]) // (the dead one is not drawn) alert + stalled first, then open asks, then name order for the cold ones
   for (const b of blocks) {
     const lines = blockLines(b, 34)
     assert.equal(lines.length, 2)
@@ -75,12 +75,12 @@ test("an empty tool-call table, a stale file and a malformed one are all not rec
   assert.equal(quiet.state, "idle")
 })
 
-test("states: dead beats waiting beats working beats idle", () => {
+test("states: waiting beats working beats idle; a dead lead is not drawn at all", () => {
   const by = Object.fromEntries(buildBlocks(full, NOW).map((b) => [b.name, b.state]))
   assert.equal(by.alpha, "work")
   assert.equal(by.beta, "wait") // one open human decision (the closed one does not count)
-  assert.equal(by.gamma, "dead") // the switchboard found its pane dead
-  assert.equal(by.delta, null) // detached: not recorded, shown as ?
+  assert.equal("gamma" in by, false) // the switchboard found its pane dead: removed on read, never drawn (#919)
+  assert.equal(by.delta, null) // detached: no state word
   assert.equal(by.eps, null) // not checked yet: not dead
   assert.equal(by.cos, "wait") // a decision waits on the owner, which the Chief of Staff presents
 })
@@ -106,7 +106,7 @@ test("loadInputs: files are read from the state directory, a stale or oversize f
 
 test("the rows start with a heading, add 2 lines per workspace, and are empty when no workspace has an orchestrator", () => {
   const rows = healthRows(full, NOW, 34)
-  assert.equal(rows.length, 1 + 4 + 2 * 6 + 1) // heading, four legend lines, two lines a workspace, a spacer
+  assert.equal(rows.length, 1 + 4 + 2 * 5 + 1) // heading, four legend lines, two lines a workspace, a spacer
   assert.equal(text(rows[0].segs).startsWith("Workspaces"), true)
   assert.deepEqual(healthRows({ records: null, load: null, pane: null, decisions: null }, NOW, 34), [])
 })
@@ -140,9 +140,9 @@ test("S2 S9: two workspaces, one lead live and one retired and absent from the s
   const two = { agents: { live: { role: "orchestrator", workspace: "w1", session: "ses_1" }, old: { role: "orchestrator", workspace: "w2", session: "ses_2" } }, states: { live: { state: "attached" } }, missing: {} }
   const blocks = buildBlocks({ pane: two, load: null, records: null, decisions: null }, NOW)
   assert.deepEqual(blocks.map((b) => b.name), ["live"])
-  // a detached lead and a lead found dead are still drawn (they need repair); only a lead with no row is dropped
+  // a detached lead is still drawn (it needs repair); a lead with no row, or found dead, is dropped (#919)
   const kept = { ...two, states: { live: { state: "detached" }, old: { state: "dead" } } }
-  assert.deepEqual(buildBlocks({ pane: kept }, NOW).map((b) => b.name).sort(), ["live", "old"])
+  assert.deepEqual(buildBlocks({ pane: kept }, NOW).map((b) => b.name).sort(), ["live"])
   const seen = []
   const probe = new Proxy({ pane: two }, { get: (t, k) => (seen.push(String(k)), t[k]) })
   buildBlocks(probe, NOW)
@@ -245,7 +245,7 @@ test("the legend names q s d c p ctx and the state words, one line each within t
   const legend = rows.slice(1, 5)
   for (const line of legend) assert.ok(line.length <= 34, line)
   const all = legend.join(" ")
-  for (const word of ["q open", "s stalled", "d decisions", "c busy", "p pushes", "ctx", "work", "idle", "wait", "dead"]) assert.ok(all.includes(word), word)
+  for (const word of ["q open", "s stalled", "d decisions", "c busy", "p pushes", "ctx", "work", "idle", "wait"]) assert.ok(all.includes(word), word)
 })
 
 test("a counter that has some of a workspace's sessions sums those, and steps cover the rest only when it has none", () => {
@@ -255,4 +255,15 @@ test("a counter that has some of a workspace's sessions sums those, and steps co
   const orch = buildBlocks({ ...live, pane: pane2, records: rec }, NOW).find((b) => b.name === "orch")
   assert.equal(orch.sparkKind, "calls")
   assert.deepEqual(orch.spark, new Array(15).fill(2))
+})
+
+test("S4 S10: no block line prints a question mark or the word dead as an agent state", () => {
+  const blocks = buildBlocks(full, NOW)
+  assert.ok(blocks.length > 0)
+  for (const b of blocks) {
+    const text = blockLines(b, 200).map((line) => line.map(([t]) => t).join("")).join("\n")
+    assert.ok(!text.includes("?"), text)
+    assert.ok(!/dead/i.test(text), text)
+  }
+  assert.ok(!LEGEND.join(" ").includes("?") && !/dead/i.test(LEGEND.join(" ")))
 })

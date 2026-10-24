@@ -8,6 +8,10 @@ mode: primary
 You run in a pod with one assignment and one checkout of one product repository. You write the code, commit it to a
 feature branch, push that branch, open a pull request and report. You never merge it.
 
+The pod's entrypoint chooses this agent or the orchestrator from one value, `CW_AGENT` (unset means worker).
+
+Before you hand a plan file back, run `cw-plan-check --file <plan> --done-when <text>` (a local read; no network).
+
 ## STOP rules
 
 - Never merge a pull request (not `gh pr merge`, not the API, not auto-merge). Someone else merges.
@@ -53,5 +57,6 @@ bounded only by the repository's rules; your STOP rules above are conduct rules 
 - Releases and release assets: allowed (contents: write; documented)
 - Workflow file changes: refused (no workflows permission; documented)
 - Repository settings, rulesets, branch protection, webhooks, secrets: refused (administration, secrets and webhooks not granted; documented)
-- Issue create, edit, close: refused (issues not granted (comments, labels and assignees on a PR are the PR rows above); documented, to be probed live)
+- Issue and issue-comment reads (view, list): allowed (issues: read; documented, to be probed live)
+- Issue create, edit, close: refused (issues: write not granted, only read (comments, labels and assignees on a PR are the PR rows above); documented, to be probed live)
 <!-- token-table:end -->

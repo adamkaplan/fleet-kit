@@ -34,8 +34,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run_record  # noqa: E402  (the run record: one module, one function the stop calls)
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")  # the switchboard's agent name rule
-SHAPES = {"S": {"cpu": "2", "memory": "4Gi", "usd_per_hour": 0.10},
-          "M": {"cpu": "4", "memory": "8Gi", "usd_per_hour": 0.20}}  # list-price estimates, not billed figures
+SHAPES = {"XS": {"cpu": "1", "memory": "2Gi", "usd_per_hour": 0.05, "stack": False},   # the light shape: no nested Docker (the default of a non-stack worker)
+          "S": {"cpu": "2", "memory": "4Gi", "usd_per_hour": 0.10, "stack": True},
+          "M": {"cpu": "4", "memory": "8Gi", "usd_per_hour": 0.20, "stack": True}}  # list-price estimates, not billed figures
+DEFAULT_SHAPE = "XS"        # a create that names no shape and is not a stack launch (S, M by name only)
+DEFAULT_ORCHESTRATOR_SHAPE = "S"   # an orchestrator launch that names no shape keeps the size it had before XS existed (the role table carries no shape: this is the one place)
+DEFAULT_STACK_SHAPE = "S"   # a stack launch that names no shape (its row must carry stack: true)
 MAX_TOKEN_SECONDS = 3600
 
 # The git token a worker pushes with is a one-hour installation token (app_token.py caps it at 61 minutes). The launcher mints it once and
@@ -57,8 +61,13 @@ STACK_NODE_SELECTOR = {"sysbox-install": "yes"}   # the POOL label; never gate o
 # stop `sudo start-dockerd`); every capability stays dropped and none is added; never privileged. The pod-level seccomp profile
 # (RuntimeDefault) was not part of the probe either.
 STACK_SECURITY_CONTEXT = {"allowPrivilegeEscalation": True, "capabilities": {"drop": ["ALL"]}}
-STACK_RACE_WINDOW_SECONDS = 240   # a fresh node's containerd is configured ~30-60 s after the pod is scheduled; this bounds the retries
-STACK_ATTEMPTS = 3
+# The fresh-node race retry rule, in ONE place (#1023): there is no attempt count. After a race the launcher pauses
+# STACK_RACE_PAUSE_SECONDS, then recreates the pod; a recreate starts only if at least one pause plus one poll
+# (WAIT_POLL_SECONDS) fits in what is left of STACK_RACE_WINDOW_SECONDS. A fresh node took ~3-5 minutes to be ready end to end.
+# The window stays under the switchboard's own bound on the launcher call (LAUNCH_SECONDS, 900).
+STACK_RACE_WINDOW_SECONDS = 600
+STACK_RACE_PAUSE_SECONDS = 15
+WAIT_POLL_SECONDS = 2   # the pause between two reads of a pending pod
 STACK_RACE_RE = re.compile(r"RuntimeClass handler \S+ does not support user namespaces: the handler \S+ is not known")
 
 
@@ -101,7 +110,7 @@ def _stack_shape_differs(pod):
 # here (and to the frozen fixture tests/fixtures/stack_pod.json) allows them.
 STACK_METADATA_KEYS = {"name", "labels", "annotations"}
 STACK_SPEC_KEYS = {"restartPolicy", "activeDeadlineSeconds", "serviceAccountName", "automountServiceAccountToken", "securityContext", "containers", "volumes",
-                   "imagePullSecrets", "runtimeClassName", "hostUsers", "nodeSelector"}
+                   "imagePullSecrets", "runtimeClassName", "hostUsers", "nodeSelector", "hostname", "subdomain"}
 STACK_CONTAINER_KEYS = {"name", "image", "securityContext", "env", "resources", "readinessProbe", "volumeMounts"}
 STACK_VOLUMES = {"tokens": {"name": "tokens", "emptyDir": {"medium": "Memory"}}, "scratch": {"name": "scratch", "emptyDir": {}}}
 STACK_MOUNT_PATHS = {"pw": "/run/cw", "tokens": "/run/cw-tmp", "scratch": "/work"}
@@ -116,6 +125,8 @@ def _stack_rest_differs(pod):
     return (
         not set(pod.get("metadata", {})) <= STACK_METADATA_KEYS
         or not set(spec) <= STACK_SPEC_KEYS
+        or (("hostname" in spec or "subdomain" in spec)   # exactly these two keys, together: the pod's own name and the one subdomain
+            and (spec.get("subdomain") != HUB_SUBDOMAIN or spec.get("hostname") != pod.get("metadata", {}).get("name")))
         or spec.get("restartPolicy") != "Never" or not isinstance(spec.get("serviceAccountName"), str) or not spec.get("serviceAccountName")
         or len(ks) != 1 or [k.get("name") for k in ks] != ["worker"]   # one container, named worker: no sidecar, even one with the stack context
         or any(not set(k) <= STACK_CONTAINER_KEYS or not isinstance(k.get("image"), str) or not k.get("image") for k in ks)
@@ -169,7 +180,22 @@ CREDENTIAL_PATTERNS = [re.compile(p) for p in (
     r"gh[pousr]_[A-Za-z0-9]{20,}", r"github_pat_[A-Za-z0-9_]{20,}", r"sk-[A-Za-z0-9]{20,}", r"AKIA[0-9A-Z]{16}",
     r"-----BEGIN [A-Z ]*PRIVATE KEY", r"Bearer [A-Za-z0-9._-]{20,}", r"(?i)(client_secret|api[_-]?key)\"\s*:\s*\"[^\"]+")]
 SECRET_ENV_NAME = re.compile(r"(?i)(TOKEN|SECRET|PASSWORD|API_?KEY|CREDENTIAL|^PAT$|_PAT$)")
-ALLOWED_ENV_NAMES = {"CW_TOKEN_ENDPOINT"}  # a URL, not a token
+ALLOWED_ENV_NAMES = {"CW_TOKEN_ENDPOINT", "FLEET_CLOUD_TOKEN_FILE"}  # a URL; and the PATH of the channel secret's file, not the secret
+# #1157: the agent a pod runs. ONE value, two accepted; the five names an orchestrator pod adds to the worker's, and no others.
+AGENTS = ("worker", "orchestrator")
+ORCHESTRATOR_ENV_NAMES = ("CW_AGENT", "FLEET_AGENT_NAME", "FLEET_BOSS", "FLEET_CLOUD_CHANNEL_URL", "FLEET_CLOUD_TOKEN_FILE")
+CHANNEL_SECRET_KEY = "channel-secret"                       # the one new key of the per-run Secret
+CHANNEL_TOKEN_FILE = "/run/cw-tmp/channel-token"        # inside the memory-backed directory; the entrypoint installs the key there
+DEFAULT_CHANNEL_URL = "http://cloud-hub.cw.svc:8443/message"
+DEFAULT_REGISTRY_SECRET = "cloud-hub-registry"
+HUB_PW_SECRET = "cloud-hub-pw"                  # one key per agent: the pod's server password, mounted by the hub at /etc/hub/pw
+HUB_PW_DIR = "/etc/hub/pw"
+CLUSTER_DOMAIN = "cluster.local"   # the one place the cluster domain is named
+HUB_SUBDOMAIN = "cw-agents"   # the headless Service (made by the hub manifests) that gives a hub pod the DNS name <pod>.cw-agents.<namespace>.svc.cluster.local
+
+
+def hub_agent_url(pod_name, namespace):
+    return "http://%s.%s.%s.svc.%s:4096" % (pod_name, HUB_SUBDOMAIN, namespace, CLUSTER_DOMAIN)
 
 
 class ReaperLocked(Exception):
@@ -683,6 +709,9 @@ def scan_credentials(spec):
     return hits
 
 
+REGISTRY_KEYS = ("secrets.json", "agents.json")
+
+
 class Kube:
     """The only door to the cloud: one kubectl call per method. Never puts a secret on a command line."""
 
@@ -880,19 +909,55 @@ class Kube:
                 pass   # the launcher's cleanup finds it unlabelled and says it REMAINS
             raise
 
+    def registry_update(self, secret, change):
+        """Read-modify-write of the hub's registry Secret (keys secrets.json and agents.json, each one JSON object): `change(secrets, agents)`
+        edits both; the patch carries the resourceVersion that was read, so a concurrent write is a Conflict and the pass is repeated."""
+        for _ in range(5):
+            obj = self.get_secret(secret)
+            if not obj:
+                raise CloudError("the hub registry Secret %s is not found" % secret)
+            data = obj.get("data") or {}
+            try:
+                maps = [json.loads(base64.b64decode(data[k]).decode()) if data.get(k) else {} for k in REGISTRY_KEYS]
+                if not all(isinstance(m, dict) for m in maps):
+                    raise ValueError
+            except (ValueError, UnicodeDecodeError):
+                raise CloudError("the hub registry Secret %s is not two JSON objects" % secret) from None
+            change(*maps)
+            body = {"metadata": {"resourceVersion": (obj.get("metadata") or {}).get("resourceVersion")},
+                    "data": {k: base64.b64encode(json.dumps(m, sort_keys=True).encode()).decode() for k, m in zip(REGISTRY_KEYS, maps)}}
+            try:
+                self.run(["patch", "secret", secret, "--type=merge", "--patch-file=/dev/stdin"], stdin=json.dumps(body))
+                return
+            except CloudError as e:
+                if "Conflict" not in str(e) and "modified" not in str(e):
+                    raise
+        raise CloudError("the hub registry Secret %s kept changing; not written" % secret)
+
+    def hub_pw_set(self, secret, key, value):
+        """Set (or, with None, remove) ONE key of the hub's password Secret by a merge patch on stdin; the value is never in an argument."""
+        body = {"data": {key: None if value is None else base64.b64encode(value.encode()).decode()}}
+        if not self.get_secret(secret):
+            raise CloudError("the hub password Secret %s is not found" % secret)
+        self.run(["patch", "secret", secret, "--type=merge", "--patch-file=/dev/stdin"], stdin=json.dumps(body))
+
     def exec(self, name, *cmd, keep_stdout=False, timeout=120):
         return self.run(["exec", name, "--"] + list(cmd), keep_stdout=keep_stdout, timeout=timeout)
 
 
-def _pod_repo(pod):
+def _pod_env(pod, key):
     try:
         for c in pod["spec"]["containers"]:
             for e in c.get("env") or []:
-                if e.get("name") == "CW_REPO" and isinstance(e.get("value"), str):
+                if e.get("name") == key and isinstance(e.get("value"), str):
                     return e["value"][:200]
     except (KeyError, TypeError, AttributeError):
         pass
     return ""
+
+
+def _pod_repo(pod):
+    return _pod_env(pod, "CW_REPO")
 
 
 def ann(pod, key, default=None):
@@ -944,6 +1009,21 @@ def pod_deadline_floor(max_hard):
     return parse_duration(max_hard or DEFAULT_MAX_HARD) + POD_DEADLINE_GRACE_SECONDS
 
 
+def check_shape(a):
+    """Set a.shape when it names none (XS, or S for a stack launch) and refuse an unknown name, or a row that cannot run a stack, with --stack."""
+    if getattr(a, "shape", None) is None:
+        a.shape = DEFAULT_STACK_SHAPE if getattr(a, "stack", False) else DEFAULT_ORCHESTRATOR_SHAPE if getattr(a, "agent", None) == "orchestrator" else DEFAULT_SHAPE
+    if a.shape not in SHAPES:
+        raise CloudError("shape must be one of %s" % ", ".join(SHAPES), EXIT_USAGE)
+    if getattr(a, "stack", False) and not SHAPES[a.shape]["stack"]:
+        raise CloudError("--stack needs a shape that can run a nested Docker stack (%s), not %s" % (", ".join(k for k, v in SHAPES.items() if v["stack"]), a.shape), EXIT_USAGE)
+
+
+def hub_on(env):
+    """The hub setting: the channel address or the registry Secret name is set. Unset, a worker launch is exactly what it was."""
+    return bool((env.get("CW_HUB_CHANNEL_URL") or "").strip() or (env.get("CW_HUB_REGISTRY_SECRET") or "").strip())
+
+
 def render_pod(a, worker, name, now, hard, env, run_names=()):
     image = a.image or env.get("CW_CLOUD_IMAGE")
     if not image:
@@ -958,6 +1038,17 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
          "CW_AUDIT_RUNTIME_ID": "pod/" + name}
     if endpoint:
         e["CW_TOKEN_ENDPOINT"] = endpoint
+    agent = getattr(a, "agent", None) or "worker"
+    if agent not in AGENTS:
+        raise CloudError("--agent must be one of %s, got %r; nothing was created" % (" or ".join(AGENTS), str(agent)[:40]), EXIT_USAGE)
+    if agent == "orchestrator" or hub_on(env):   # with the hub setting unset a worker pod gets none of these: its spec is exactly what it was
+        boss = getattr(a, "boss", None)
+        if (agent == "orchestrator" and not boss) or (boss and not NAME_RE.match(boss)):
+            raise CloudError("--agent orchestrator needs --boss NAME", EXIT_USAGE)
+        if CHANNEL_SECRET_KEY not in run_names:
+            raise CloudError("a hub pod needs its channel secret", EXIT_USAGE)
+        e.update({"CW_AGENT": agent, "FLEET_AGENT_NAME": worker, **({"FLEET_BOSS": boss} if boss else {}),
+                  "FLEET_CLOUD_CHANNEL_URL": env.get("CW_HUB_CHANNEL_URL") or DEFAULT_CHANNEL_URL, "FLEET_CLOUD_TOKEN_FILE": CHANNEL_TOKEN_FILE})
     pw_volume = {"name": "pw", "secret": {"secretName": name + "-pw", "defaultMode": 0o600,
                                           "items": [{"key": "password", "path": "server-password"}]}}
     if run_names:  # one read-only mount at /run/cw holding the password file and each run secret (0400)
@@ -984,6 +1075,8 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
                  "volumes": [pw_volume,
                              {"name": "tokens", "emptyDir": {"medium": "Memory"}},
                              {"name": "scratch", "emptyDir": {}}]}}
+    if "CW_AGENT" in e:   # a hub pod: a stable in-cluster name (the headless Service cw-agents) instead of the pod address
+        pod["spec"]["hostname"], pod["spec"]["subdomain"] = name, HUB_SUBDOMAIN
     pull = getattr(a, "pull_secret", None)
     if pull:
         pod["spec"]["imagePullSecrets"] = [{"name": pull}]
@@ -1069,21 +1162,28 @@ class Launcher:
     def create(self, a):
         worker, name = a.worker, pod_name(a.worker)
         self.run_id, self.foreign = getattr(a, "run_id", None), []   # what this call proved is another's is never deleted
-        made = {"secret": False, "run": False, "pod": False}  # set before the call that may create it: an interrupt may land after
+        made = {"secret": False, "run": False, "pod": False, "reg": None}  # set before the call that may create it: an interrupt may land after
 
         def go(info):
             info["rid"] = "pod/" + name
             check_repo_allowed(a.repo, self.env)  # before anything is read or made
             if not NAME_RE.match(worker):
                 raise CloudError("bad worker name %r" % worker, EXIT_USAGE)
-            if a.shape not in SHAPES:
-                raise CloudError("shape must be S or M", EXIT_USAGE)
+            check_shape(a)   # resolves an unnamed shape; before any cluster, vault or token call
             now = self.clock()
             hard = now + dt.timedelta(seconds=parse_duration(a.hard))
             max_hard = now + dt.timedelta(seconds=parse_duration(a.max_hard))
             if hard > max_hard:
                 raise CloudError("--hard is past --max-hard", EXIT_REFUSED)
             run_values = read_run_secret_values(parse_run_secret_fds(a.run_secret_fd))  # before anything is made
+            agent = getattr(a, "agent", None) or "worker"
+            if agent not in AGENTS:   # before any cluster call
+                raise CloudError("--agent must be one of %s, got %r; nothing was created" % (" or ".join(AGENTS), str(agent)[:40]), EXIT_USAGE)
+            hub = agent == "orchestrator" or hub_on(self.env)
+            if hub:   # the per-pod channel secret: random, only its sha256 leaves the pod's Secret, never printed
+                if CHANNEL_SECRET_KEY in run_values:
+                    raise CloudError("%s is the launcher's own key" % CHANNEL_SECRET_KEY, EXIT_USAGE)
+                run_values[CHANNEL_SECRET_KEY] = secrets.token_hex(32)
             self.kube.add_secrets(*run_values.values())  # known to scrub before the first kubectl call
             self.check_cap(a.shape, int((hard - now).total_seconds()))
             spec = render_pod(a, worker, name, now, hard, self.env, sorted(run_values))
@@ -1100,6 +1200,9 @@ class Launcher:
                                  "type": "Opaque", "stringData": {"password": password}})
                 if run_values:
                     self._make(made, "run", self.kube.create_run_secret, name, name, run_values, *([a.run_id] if getattr(a, "run_id", None) else []))
+                if hub:
+                    made["reg"] = (self._registry_secret(), worker)   # set before the call: a half write is undone by the cleanup
+                    self._register(worker, run_values[CHANNEL_SECRET_KEY], spec, self.env.get("CW_CLOUD_DOMAIN", "example.internal"), password)
                 self._make(made, "pod", self.kube.apply, spec)
                 if getattr(a, "stack", False):
                     self._start_stack_pod(worker, name, spec, made, a.wait)
@@ -1154,6 +1257,46 @@ class Launcher:
                 made[kind] = False
             raise
 
+    def _registry_secret(self):
+        return self.env.get("CW_HUB_REGISTRY_SECRET") or DEFAULT_REGISTRY_SECRET
+
+    def _register(self, agent, channel_secret, spec, domain, password):
+        """The hub's registry: {agent: sha256 hex of the channel secret} and {agent: {url, session, password_file}}. Only the hash is stored."""
+        digest = hashlib.sha256(channel_secret.encode()).hexdigest()
+        name = spec["metadata"]["name"]
+        entry = {"url": hub_agent_url(name, self.env.get("CW_CLOUD_NAMESPACE", "cw")), "session": "", "password_file": "%s/%s" % (HUB_PW_DIR, agent)}
+
+        def change(sec, agents):
+            sec[agent], agents[agent] = digest, entry
+        self.kube.registry_update(self._registry_secret(), change)
+        self.kube.hub_pw_set(HUB_PW_SECRET, agent, password)   # the pod's server password: the hub reads it from the file
+
+    def hub_session(self, a):
+        """Write the session id into the agent's hub entry (a no-op when it has none). Called by the switchboard once the session exists."""
+        if not NAME_RE.match(a.worker or "") or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", a.session or ""):
+            raise CloudError("bad worker name or session id", EXIT_USAGE)
+        found = []
+
+        def change(sec, agents):
+            if a.worker in agents:
+                agents[a.worker]["session"] = a.session
+                found.append(1)
+        self.kube.registry_update(self._registry_secret(), change)
+        return {"worker": a.worker, "registered": bool(found)}
+
+    def _unregister(self, agent):
+        """Remove both entries of the agent (a no-op when absent). A failure is said on stderr and never raised: the stop goes on."""
+        def change(sec, agents):
+            sec.pop(agent, None)
+            agents.pop(agent, None)
+        try:
+            self.kube.registry_update(self._registry_secret(), change)
+            self.kube.hub_pw_set(HUB_PW_SECRET, agent, None)
+            return True
+        except CloudError as e:
+            print("cloud-worker: the hub registry entry of %s could not be removed: %s" % (agent, e), file=sys.stderr)
+            return False
+
     def _mine(self, kind, name):
         """True: carries this call's run id; False: another's (leave whole); None: not there; raises CloudError: unreadable."""
         if not self.run_id:
@@ -1174,6 +1317,8 @@ class Launcher:
         except ValueError:
             pass
         left = []
+        if made.get("reg"):
+            self._unregister(made["reg"][1])
         try:
             for kind, fn, label in (("pod", self.kube.delete_pod, "pod/" + name), ("secret", self.kube.delete_secret, "secret/%s-pw" % name),
                                   ("run", self.kube.delete_run_secret, "secret/%s-run" % name)):
@@ -1225,12 +1370,14 @@ class Launcher:
 
     def _start_stack_pod(self, worker, name, spec, made, seconds):
         """Wait for a stack pod; on the fresh-node race (the runtime handler is not yet known to the node's containerd) delete
-        THE POD ONLY and create it again with the same run id and nonce, at most STACK_ATTEMPTS times inside
-        STACK_RACE_WINDOW_SECONDS. The password Secret and the per-run Secret are made once, before the first attempt, and are
+        THE POD ONLY and create it again with the same run id and nonce, after a pause of STACK_RACE_PAUSE_SECONDS, for as long
+        as one more pause plus one poll fits in STACK_RACE_WINDOW_SECONDS (no attempt count). The password Secret and the per-run Secret are made once, before the first attempt, and are
         never touched here: the pod refers to them by name, so a second attempt reads the same objects. The same bounded retry also
         recreates a pod that VANISHES while pending (it was seen, then a get says not found); a pod never seen, and any other
         failure, are not retried."""
-        deadline = self.clock() + dt.timedelta(seconds=STACK_RACE_WINDOW_SECONDS)
+        began = self.clock()
+        deadline = began + dt.timedelta(seconds=STACK_RACE_WINDOW_SECONDS)
+        self._slept = 0.0   # the seconds this launcher itself slept: a second bound, so a clock that does not advance still ends the loop
         attempt = 1
         while True:
             seen = []   # this attempt's pod: set once a get returned it
@@ -1242,32 +1389,44 @@ class Launcher:
                     seen.append(1)
                     self._raise_on_race(name, pod)
             try:
-                self._wait_ready(name, seconds, watch)
+                # a retry never waits past the window (the first attempt keeps the caller's --wait, as before)
+                self._wait_ready(name, seconds if attempt == 1 else max(0, min(seconds, int((deadline - self.clock()).total_seconds()), int(STACK_RACE_WINDOW_SECONDS - self._slept))), watch)
             except (_FreshNodeRace, _PodVanished) as race:
-                last = attempt >= STACK_ATTEMPTS or self.clock() >= deadline
+                last = not self._retry_fits(deadline)
+                spent = int((self.clock() - began).total_seconds())
                 self.audit(worker, "pod/" + name, "create-attempt", 0.0, False,
-                           "attempt %d of %d: %s%s" % (attempt, STACK_ATTEMPTS, race, "; giving up" if last else "; recreating the pod"))
+                           "attempt %d: %s%s" % (attempt, race, "; giving up" if last else "; pausing %d s, then recreating the pod" % STACK_RACE_PAUSE_SECONDS))
                 if last:
                     if isinstance(race, _PodVanished):
                         raise CloudError("the worker pod could not start: the pod vanished while pending (the fresh-node race: the node's "
-                                         "runtime restarted); gave up after %d attempt(s)" % attempt) from None
+                                         "runtime restarted); gave up after %d attempt(s) in %d s" % (attempt, spent)) from None
                     raise CloudError("the worker pod could not start: the node's runtime handler %s was not ready (the fresh-node race: %s); "
-                                     "gave up after %d attempt(s)" % (STACK_RUNTIME_CLASS, race, attempt)) from None
+                                     "gave up after %d attempt(s) in %d s" % (STACK_RUNTIME_CLASS, race, attempt, spent)) from None
                 if self._mine("pod", name) is False:
                     self.foreign.append("pod/" + name)
                     raise CloudError("the pod %s is not this call's (its run id does not match); left whole" % name) from None
                 self._refuse_if_removed(name, made)   # a stop, the reaper or someone else removed this call's own objects: not the race
+                self._nap(STACK_RACE_PAUSE_SECONDS)   # the pod is deleted and made again only after the pause, never in a tight loop
                 self.kube.delete_pod_and_wait(name)
                 attempt += 1
                 self._make(made, "pod", self.kube.apply, spec)
                 self._refuse_if_removed(name, made)   # a stop that deleted the pod, then its Secrets, may have landed between the check and here
                 continue
             except CloudError as e:
-                self.audit(worker, "pod/" + name, "create-attempt", 0.0, False, "attempt %d of %d: %s" % (attempt, STACK_ATTEMPTS, e))
+                self.audit(worker, "pod/" + name, "create-attempt", 0.0, False, "attempt %d: %s" % (attempt, e))
                 raise
             self._refuse_if_removed(name, made)   # the stop's Secret deletes may have come after the pod went: never report a pod whose Secrets are gone
-            self.audit(worker, "pod/" + name, "create-attempt", 0.0, True, "attempt %d of %d: ready" % (attempt, STACK_ATTEMPTS))
+            self.audit(worker, "pod/" + name, "create-attempt", 0.0, True, "attempt %d: ready" % attempt)
             return
+
+    def _retry_fits(self, deadline):
+        """True when one more pause plus one poll fits in the window that is left."""
+        need = STACK_RACE_PAUSE_SECONDS + WAIT_POLL_SECONDS
+        return (deadline - self.clock()).total_seconds() >= need and STACK_RACE_WINDOW_SECONDS - self._slept >= need
+
+    def _nap(self, seconds):
+        self.sleep(seconds)
+        self._slept = getattr(self, "_slept", 0.0) + seconds
 
     def _refuse_if_removed(self, name, made):
         gone = self._own_objects_gone(name, made)
@@ -1296,6 +1455,7 @@ class Launcher:
 
     def _wait_ready(self, name, seconds, on_pending=None):
         end = self.clock() + dt.timedelta(seconds=seconds)
+        waited = 0.0   # the second bound: the seconds slept here, for a clock that does not advance
         while True:
             pod = self.kube.get_pod(name)
             status = (pod or {}).get("status", {})
@@ -1305,9 +1465,10 @@ class Launcher:
                 return
             if on_pending:
                 on_pending(pod)
-            if self.clock() >= end:
+            if self.clock() >= end or waited >= seconds:
                 raise CloudError("timed out waiting for the worker", EXIT_TIMEOUT)
-            self.sleep(2)
+            self._nap(WAIT_POLL_SECONDS)
+            waited += WAIT_POLL_SECONDS
 
     # -- end hook, stop, delete --
     def run_hook(self, name):
@@ -1331,6 +1492,7 @@ class Launcher:
         def go(info):
             pod = self._need(worker)
             uid = ((pod or {}).get("metadata") or {}).get("uid")
+            self._orchestrator = _pod_env(pod, "FLEET_AGENT_NAME") if pod and _pod_env(pod, "FLEET_CLOUD_TOKEN_FILE") else None   # a hub pod, orchestrator or worker
             if nonce and pod:
                 info["rid"] = "pod/" + name
                 if ann(pod, "run-id") != nonce:   # another run's (or an unlabelled) worker of this name: nothing is changed
@@ -1391,7 +1553,10 @@ class Launcher:
         """Delete the pod and both Secrets (as `delete` does); with a nonce, only those that carry it (the pod, when there, matched already).
         With a uid the pod delete carries it as a precondition: a pod that changed since it was read is left whole, with a refusal."""
         try:
-            return self._remove_bound(name, nonce, uid)
+            got = self._remove_bound(name, nonce, uid)
+            if getattr(self, "_orchestrator", None):   # the pod and its Secrets are gone: so are its hub entries
+                self._unregister(self._orchestrator)
+            return got
         except PodChanged:
             raise CloudError("pod/%s changed since it was read (another pod holds the name now); left whole" % name, EXIT_REFUSED)
 
@@ -1770,7 +1935,7 @@ SETTINGS = (
     ("CW_VAULT_NAME", True, "name"),
     ("CW_CLOUD_NAMESPACE", True, "name"),
     ("CW_KUBECTL", False, "path"),
-    ("CW_MODEL_AUTH_FILE", False, "path"),
+    ("CW_OPENCODE_BIN", False, "path"),
     ("CW_RUN_RECORD_DIR", False, "path"),
     ("CW_CLOUD_SPEND_CAP_USD", False, "number"),
     ("CW_CLUSTER_TOKEN_CMD", False, "command"),
@@ -1781,6 +1946,8 @@ SETTINGS = (
     ("CW_APP_KEY_CMD", False, "command"),
     ("CW_CLUSTER_ADMIN_SECRET", False, "secret-name"),   # the NAME of the vault secret that holds the cluster administrator route (default cw-cluster-admin-kubeconfig), never its content
     ("CW_CLUSTER_TOKEN_DURATION", False, "duration"),    # the cluster token's requested life (default 20m)
+    ("CW_HUB_CHANNEL_URL", False, "name"),         # the channel's address an orchestrator pod is told (default http://cloud-hub.cw.svc:8443/message); not a secret
+    ("CW_HUB_REGISTRY_SECRET", False, "name"),     # the NAME of the hub's registry Secret in the cloud namespace (default cloud-hub-registry), never its content
     ("CW_VAULT_CHECK_DIR", False, "path"),         # the checkout the vault access check runs from; needed only after a vault firewall refusal (see vault_check_dir_problem)
 )
 SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
@@ -1901,7 +2068,7 @@ VALIDATORS = {
     "CW_VAULT_NAME": ("a vault name: 3 to 24 letters, digits and hyphens, starting with a letter", lambda v: bool(_VAULT_NAME.fullmatch(v))),
     "CW_CLOUD_NAMESPACE": ("a DNS label that is not default or kube-*", lambda v: bool(_NAMESPACE.fullmatch(v)) and v != "default" and not v.startswith("kube-")),
     "CW_KUBECTL": ("an absolute path with no .. segment, or a bare program name", lambda v: _path_ok(v) or bool(_BARE_PROGRAM.fullmatch(v))),
-    "CW_MODEL_AUTH_FILE": ("an absolute path with no .. segment", _path_ok),
+    "CW_OPENCODE_BIN": ("an absolute path with no .. segment, or a bare program name", lambda v: _path_ok(v) or bool(_BARE_PROGRAM.fullmatch(v))),
     "CW_RUN_RECORD_DIR": ("an absolute path with no .. segment", _path_ok),
     "CW_CLOUD_SPEND_CAP_USD": ("a number above 0 and at most 100000", _number_ok),
     "CW_CLUSTER_TOKEN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
@@ -1912,6 +2079,8 @@ VALIDATORS = {
     "CW_APP_KEY_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
     "CW_CLUSTER_ADMIN_SECRET": ("a vault secret name: 1 to 127 letters, digits and hyphens, starting with a letter or digit", lambda v: bool(_VAULT_SECRET_NAME.fullmatch(v))),
     "CW_CLUSTER_TOKEN_DURATION": ("a duration of 1 to 3 digits and m or h, from 1m to 60m (for example 20m or 1h)", _duration_ok),
+    "CW_HUB_CHANNEL_URL": ("an http or https URL: a host, an optional port, an optional one-segment path (/message), no user, query or fragment", lambda v: bool(re.fullmatch(r"https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/[A-Za-z0-9._-]{0,64})?", v))),
+    "CW_HUB_REGISTRY_SECRET": ("a Kubernetes name (lowercase letters, digits, - and .)", lambda v: bool(_SECRET_NAME.fullmatch(v))),
     "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
 }
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
@@ -2053,10 +2222,12 @@ def build_parser():
     c.add_argument("--idle", default="10m")
     c.add_argument("--hard", default="2h")
     c.add_argument("--max-hard", default=DEFAULT_MAX_HARD)
-    c.add_argument("--shape", default="S")
+    c.add_argument("--shape", default=None, help="the pod shape, one of %s; unset: %s (%s with --stack or --agent orchestrator)" % (", ".join(SHAPES), DEFAULT_SHAPE, DEFAULT_STACK_SHAPE))
     c.add_argument("--image")
     c.add_argument("--stack", action="store_true",
                    help="a pod for a worker that runs a nested Docker stack: the Sysbox runtime class, its own user namespace, the pool's node label; off by default (the default pod is unchanged)")
+    c.add_argument("--agent", help="worker (default) or orchestrator: the agent the pod runs (CW_AGENT); any other value is refused before anything is made")
+    c.add_argument("--boss", help="with --agent orchestrator: the name of its boss (FLEET_BOSS)")
     c.add_argument("--wait", type=int, default=300)
     c.add_argument("--pull-secret", help="name of an existing image-pull Secret (pull-only) for imagePullSecrets")
     c.add_argument("--run-secret-fd", action="append", default=[], metavar="NAME=N",
@@ -2064,6 +2235,8 @@ def build_parser():
     c.add_argument("--run-id", type=_run_id,
                    help="a caller's nonce (lowercase hex), recorded on the pod and Secrets it creates so the caller can prove they are its own")
     c.add_argument("--password-fd", type=int, help="a file descriptor the caller holds; the password is written there once")
+    h = cmd("hub-session")
+    h.add_argument("--session", required=True)
     s = cmd("stop")
     s.add_argument("--reason", default="")
     s.add_argument("--run-id", type=_run_id,
