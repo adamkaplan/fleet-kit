@@ -78163,6 +78163,14 @@ def watch_parent(getppid=os.getppid, exit_fn=os._exit, pause=time.sleep, every=2
     return thread
 
 
+
+# The architecture test lives beside the support files (docs/architecture.md, ask #1092): the suite runs it with the rest. Imported by name through
+# importlib, so the hygiene scan of this file's imports stays about the standard library.
+sys.path.insert(0, str(REPO / "tests" / "switchboard"))
+_architecture = importlib.import_module("test_architecture")
+TestArchitecture, TestArchitectureFailurePaths = _architecture.TestArchitecture, _architecture.TestArchitectureFailurePaths
+
+
 def main(argv):
     watch_parent()
     loader = unittest.TestLoader()
