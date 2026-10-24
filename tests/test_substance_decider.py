@@ -1,5 +1,5 @@
 """#1215 slice B: the decider follows the brief's substance. Run from the repo root: python3 -m unittest tests.test_substance_decider"""
-import importlib.util, json, re, unittest
+import importlib.util, json, re, shutil, tempfile, unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -53,8 +53,8 @@ class Decider(unittest.TestCase):
         # mutant 1: the code skips the owner-only check; mutant 2: the matrix marks every class chief of staff
         text = SRC.read_text()
         self.assertIn('if c in rule["owner_only"]:', text)
-        tmp = Path("/tmp/opencode/dc_mutant.py")
-        tmp.parent.mkdir(parents=True, exist_ok=True)
+        tmp = Path(tempfile.mkdtemp(prefix="dc-")) / "dc_mutant.py"
+        self.addCleanup(shutil.rmtree, str(tmp.parent), True)
         tmp.write_text(text.replace('if c in rule["owner_only"]:', 'if False:').replace('if c not in rule["chief_of_staff"]:', 'if False:'))
         mut = load(tmp)
         cleared = [c for c in ("merge_shim", "clear_machinery", "an_unnamed_class") if decide(brief(), [c], mut) != "owner"]
@@ -67,7 +67,8 @@ class Decider(unittest.TestCase):
 
     def test_mutant_decide_by_label_or_class_alone_is_caught(self):
         text = SRC.read_text()
-        tmp = Path("/tmp/opencode/dc_mutant2.py")
+        tmp = Path(tempfile.mkdtemp(prefix="dc-")) / "dc_mutant2.py"
+        self.addCleanup(shutil.rmtree, str(tmp.parent), True)
         tmp.write_text(text.replace('if material or any(m not in rule["material_risks"] for m in material):', 'if False:'))
         mut = load(tmp)
         self.assertEqual(decide(brief(["spend"]), ["docs"], mut), "chief_of_staff")  # the mutant ignores the brief ...

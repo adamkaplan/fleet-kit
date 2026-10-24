@@ -177,7 +177,7 @@ class TestMutants(unittest.TestCase):
         return src.replace(old, new, 1)
 
     def run_suite_copy(self, name, mutated, *tokens):
-        tmp = Path(tempfile.mkdtemp(prefix="mut-", dir="/tmp/opencode"))
+        tmp = Path(tempfile.mkdtemp(prefix="mut-"))
         self.addCleanup(shutil.rmtree, str(tmp), True)
         shutil.copytree(BIN, tmp / "bin", ignore=shutil.ignore_patterns("__pycache__"))
         shutil.copytree(ROOT / "docs", tmp / "docs", ignore=shutil.ignore_patterns("__pycache__"))

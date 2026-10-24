@@ -56471,9 +56471,9 @@ class TestPrExplainer(DecisionsBase):
         self.pr["body"] = sb.explainer_insert("x", block)
         code, out, err = self.cli("pr-explain", "acme/api#7", "--check")
         self.assertEqual(code, 1, out)   # a held (captain) PR also needs why, its table, an example and its questions (TestHeldTop)
-        self.pr["body"] = sb.explainer_insert("x\n" + TestHeldTop.TOP + "## For reviewers\n", block)
+        self.pr["body"] = sb.explainer_insert("Rationale: The order of 23 October says the owner decides only what might matter.\n\n" + TestHeldTop.TOP + "## For reviewers\n", block)
         self.assertEqual(self.cli("pr-explain", "acme/api#7", "--check")[0], 0)
-        self.pr["body"] = sb.explainer_insert("x\n" + TestHeldTop.TOP + "## For reviewers\n", block) + "\n" + self.DATAFLOW
+        self.pr["body"] = sb.explainer_insert("Rationale: The order of 23 October says the owner decides only what might matter.\n\n" + TestHeldTop.TOP + "## For reviewers\n", block) + "\n" + self.DATAFLOW
         self.assertEqual(self.cli("pr-explain", "acme/api#7", "--check")[0], 0, "a data-flow diagram below the top is allowed")
 
     def test_check_accepts_a_body_without_a_diagram_and_one_with_a_data_flow_diagram_and_fails_the_summary_flowchart_anywhere(self):
@@ -76439,7 +76439,7 @@ class TestSlice3Modules(Base):
     def test_s1_every_loader_is_generated_and_returns_the_module_load_module_returns(self):
         tree = ast.parse(switchboard_source())
         defined = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
-        self.assertEqual(len(sb.HELPER_MODULES), 22)
+        self.assertEqual(len(sb.HELPER_MODULES), 23)
         self.assertEqual(defined & set(sb.HELPER_MODULES), set(), "0 of the loaders has a def of its own")
         for function, module in sb.HELPER_MODULES.items():
             with self.subTest(function=function):
