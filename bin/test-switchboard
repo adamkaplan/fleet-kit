@@ -90708,6 +90708,45 @@ class TestNoPaneToJudge(StandInPids, Base):
             self.assertIn(phrase, body)
 
 
+
+class TestArchTools(unittest.TestCase):
+    """The two move tools (S0 of #1092): `arch-split-check` reads the surface of the daemon as its own entry assembles it, and `arch-part-cut` never overwrites a part."""
+
+    def tool(self, name, *args):
+        return subprocess.run([sys.executable, "-B", str(REPO / "tools" / name)] + [str(a) for a in args], capture_output=True, text=True)
+
+    def test_the_surface_of_the_daemon_is_read_as_its_entry_assembles_it_not_as_a_text_join(self):
+        listed = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.lstrip().startswith("#")]
+        files = [str(BIN / n) for n in listed]
+        out = Path(tempfile.mkdtemp()) / "surface.txt"
+        self.addCleanup(shutil.rmtree, str(out.parent), True)
+        done = self.tool("arch-split-check", "--write-surface", out, "--after", *files)
+        self.assertEqual(done.returncode, 0, done.stderr[-600:])
+        self.assertEqual(out.read_text().split(), sorted(dir(sb)), "the names the tool reads are the names of the daemon as it loads")
+
+    def test_a_cut_refuses_a_part_name_already_listed_and_a_name_given_twice_and_writes_nothing(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        (root / "switchboard").mkdir()
+        entry = "def one():\n    return 1\n\n\ndef two():\n    return 2\n"
+        (root / "entry").write_text(entry)
+        (root / "entry.parts").write_text("# parts\nentry\nswitchboard/taken.py\n")
+        (root / "switchboard" / "taken.py").write_text("KEEP = 1\n")
+        common = ["--entry", root / "entry", "--manifest", root / "entry.parts", "--parts-dir", root / "switchboard", "--write"]
+        for cuts, word in ((["taken:1:2"], "already listed"), (["fresh:1:2", "fresh:5:6"], "given twice")):
+            with self.subTest(cuts=cuts):
+                done = self.tool("arch-part-cut", *common, *cuts)
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn(word, done.stderr)
+                self.assertEqual((root / "entry").read_text(), entry, "the entry is untouched")
+                self.assertEqual((root / "switchboard" / "taken.py").read_text(), "KEEP = 1\n", "the listed part is not overwritten")
+                self.assertFalse((root / "switchboard" / "fresh.py").exists())
+        done = self.tool("arch-part-cut", *common, "fresh:1:2")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual((root / "switchboard" / "fresh.py").read_text(), "def one():\n    return 1\n")
+        self.assertIn("switchboard/fresh.py", (root / "entry.parts").read_text())
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
