@@ -83147,7 +83147,9 @@ class TestItemVerdicts(unittest.TestCase):
         self.register()
         self.pages.update({"repos/%s" % self.REPO: {"default_branch": "main"},
                            "repos/%s/compare/main...%s" % (self.REPO, self.PIN): {"status": "identical" if on_branch else "diverged"},
-                           "repos/%s/commits/%s/check-runs?per_page=100" % (self.REPO, self.PIN): {"check_runs": runs}})
+                           })
+        for n in range(1, 6):
+            self.pages["repos/%s/commits/%s/check-runs?per_page=100&page=%d" % (self.REPO, self.PIN, n)] = {"check_runs": runs[(n - 1) * 100:n * 100], "total_count": len(runs)}
         ctx = self.ctx()
         if not checks:
             ctx.config = {"plan_gates": {"repos": {self.REPO: {}}}}
@@ -83186,6 +83188,53 @@ class TestItemVerdicts(unittest.TestCase):
         by_name = lambda runs, checks: real(runs, [dict(c, app=r["app"]["slug"]) for c in checks for r in runs[:1]] if runs else checks)
         with mock.patch.object(self.iv, "ci_decision", by_name):
             self.assertEqual(self.ci([other])[0], sb.EXIT_OK, "the mutant accepts the same-named run of another app")
+
+    def _wf(self, run, concl, status="completed"):
+        return dict(self.RUN, conclusion=concl, status=status, details_url="https://github.com/%s/actions/runs/%d/job/1" % (self.REPO, run))
+
+    def _same_workflow(self):
+        import sys
+        ci = sb.load_module("ci_runs")
+        ci._CACHE.clear(); ci._FAILED.clear()
+        old = ci.READER
+        ci.READER = lambda repo, run: (1, "push")
+        self.addCleanup(lambda: (setattr(ci, "READER", old), ci._CACHE.clear(), ci._FAILED.clear()))
+
+    def test_1237_plan_item_ci_record_and_the_gate_agree_on_a_cancelled_first_attempt(self):
+        self._same_workflow()
+        runs = [self._wf(100, "cancelled"), self._wf(101, "success")]
+        self.assertEqual(self.ci(runs)[0], sb.EXIT_OK)
+        rollup = [{"workflowName": "ci", "name": "build", "conclusion": "CANCELLED", "status": "COMPLETED", "detailsUrl": "https://github.com/%s/actions/runs/100/job/1" % self.REPO},
+                  {"workflowName": "ci", "name": "build", "conclusion": "SUCCESS", "status": "COMPLETED", "detailsUrl": "https://github.com/%s/actions/runs/101/job/1" % self.REPO}]
+        self.assertEqual(sb.pr_ci_of(rollup), "green")
+
+    def test_1237_mutant_by_name_any_in_the_plan_item_path_refuses_the_green_head(self):
+        self._same_workflow()
+        with mock.patch.object(sb.load_module("ci_runs"), "latest_check_runs", lambda runs, repo: runs):
+            code, why = self.ci([self._wf(100, "cancelled"), self._wf(101, "success")])
+        self.assertIsNone(code)
+        self.assertIn("did not succeed", why)
+
+    def test_1237_over_the_page_cap_is_refused_naming_the_cap_and_a_failed_page_too(self):
+        runs = [self.RUN] + [dict(self.RUN, name="x%d" % i) for i in range(249)]
+        code, why = self.ci(runs)
+        self.assertEqual(code, sb.EXIT_OK)   # 250 runs are read in 3 pages
+        self.setUp()
+        code, why = self.ci([self.RUN] + [dict(self.RUN, name="x%d" % i) for i in range(599)])
+        self.assertIsNone(code)
+        self.assertIn("more than 500 check runs", why)
+        self.setUp()
+        self.register()
+        real = self.ci
+        code, why = real(runs[:150])
+        self.assertEqual(code, sb.EXIT_OK)
+
+    def test_1237_mutant_one_page_only_reads_a_long_list_as_whole(self):
+        ci = sb.load_module("ci_runs")
+        with mock.patch.object(ci, "CHECK_PAGES", 1):
+            code, why = self.ci([self.RUN] + [dict(self.RUN, name="x%d" % i) for i in range(249)])
+        self.assertIsNone(code)   # with the cap at one page it refuses at 100: the cap is the named constant, not a silent cut
+        self.assertIn("more than 100 check runs", why)
 
     def test_s4_the_item_checks_key_is_validated_by_its_own_module_and_defaults_to_none(self):
         self.assertEqual(self.iv.validate_item_checks(None, "c"), [])
@@ -87904,6 +87953,515 @@ class TestAssembler(unittest.TestCase):
         done = subprocess.run([sys.executable, "-B", str(link), "status", "--help"], capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("usage: fleet-switchboard status", done.stdout)
+
+
+class TestReadCheckRuns1237(unittest.TestCase):
+    """#1237 review: every refusal branch of ci_runs.read_check_runs, missing_workflows and plan_ledger's ci_workflows rule, with a mutant each."""
+
+    @staticmethod
+    def src_module(old=None, new=None):
+        import types
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci_runs.py")
+        text = open(path).read()
+        if old is not None:
+            assert old in text, old
+            text = text.replace(old, new, 1)
+        mod = types.ModuleType("ci_runs_mut")
+        exec(compile(text, path, "exec"), mod.__dict__)
+        return mod
+
+    @staticmethod
+    def page(n, total=None):
+        d = {"check_runs": [{"name": "c%d" % i} for i in range(n)]}
+        if total is not None:
+            d["total_count"] = total
+        return d
+
+    def run_pages(self, pages, mod=None):
+        mod = mod or load_ci_runs()
+        calls = []
+        def api(path):
+            calls.append(path)
+            return pages[len(calls) - 1] if len(calls) <= len(pages) else None
+        return mod.read_check_runs(api, "o/r", "a" * 40), calls
+
+    def refused(self, pages, mod=None):
+        (runs, why), calls = self.run_pages(pages, mod)
+        self.assertEqual(runs, [])
+        self.assertTrue(why, "a refusal")
+        self.assertIn("more than 500 check runs", why)
+        self.assertIn("a page failed", why)
+        return calls
+
+    def test_one_short_page_is_whole(self):
+        (runs, why), calls = self.run_pages([self.page(3, 3)])
+        self.assertEqual((len(runs), why, len(calls)), (3, None, 1))
+        (runs, why), calls = self.run_pages([self.page(3)])   # no total: a short page ends the read
+        self.assertEqual((len(runs), why), (3, None))
+
+    def test_full_pages_end_when_the_total_is_reached(self):
+        (runs, why), calls = self.run_pages([self.page(100, 200), self.page(100, 200)])
+        self.assertEqual((len(runs), why, len(calls)), (200, None, 2))
+        self.assertIn("page=2", calls[1])
+
+    def test_failed_first_page_is_refused_and_names_the_cap(self):
+        self.refused([None])
+
+    def test_failed_later_page_error_or_timeout_is_refused(self):
+        calls = self.refused([self.page(100, 300), None])   # api answers None on an error or a timeout
+        self.assertIn("page=2", calls[1])
+
+    def test_non_dict_body_is_refused(self):
+        for body in ([], "x", 7, [{"check_runs": []}]):
+            self.refused([body])
+
+    def test_wrong_typed_check_runs_is_refused(self):
+        for body in ({"check_runs": "x"}, {"check_runs": None}, {"check_runs": {"a": 1}}, {"total_count": 1}):
+            self.refused([body])
+
+    def test_short_middle_page_does_not_end_the_read_while_the_total_is_larger(self):
+        calls = self.refused([self.page(100, 300), self.page(50, 300)])   # page 3 fails: the read is not whole
+        self.assertEqual(len(calls), 3)
+
+    def test_short_page_with_a_wrong_typed_total_ends_the_read(self):
+        (runs, why), _ = self.run_pages([self.page(100, "x"), self.page(5, "x")])
+        self.assertEqual((len(runs), why), (105, None))
+
+    def test_page_cap_reached_is_refused(self):
+        calls = self.refused([self.page(100, 900)] * 5)
+        self.assertEqual(len(calls), 5)
+
+    def test_mutant_failed_page_read_as_empty_is_caught(self):
+        mod = self.src_module('        if not isinstance(got, list):\n            return [], cap_why()', '        if not isinstance(got, list):\n            got = []')
+        (runs, why), _ = self.run_pages([{"check_runs": "x"}], mod)
+        self.assertIsNone(why)   # the mutant reads a failed page as an empty, whole list
+        with self.assertRaises(AssertionError):
+            self.refused([{"check_runs": "x"}], mod)
+
+    def test_mutant_ignoring_the_cap_is_caught(self):
+        mod = self.src_module("    return [], cap_why()\n\n\ndef latest_check_runs", "    return runs, None\n\n\ndef latest_check_runs")
+        with self.assertRaises(AssertionError):
+            self.refused([self.page(100, 900)] * 5, mod)
+
+    # --- missing_workflows: every branch ---
+    def test_missing_workflows_branches(self):
+        ci = load_ci_runs()
+        self.assertEqual(ci.missing_workflows([{"workflowName": "ci"}], ["ci"]), [])
+        self.assertEqual(ci.missing_workflows([{"workflowName": "ci"}], ["ci", "lint"]), ['no run for workflow "lint"'])
+        self.assertEqual(ci.missing_workflows(None, ["ci"]), ['no run for workflow "ci"'])
+        self.assertEqual(ci.missing_workflows(["x"], ["ci"]), ['no run for workflow "ci"'])
+        self.assertEqual(ci.missing_workflows([{"workflowName": "ci"}], None), [])
+
+    def test_mutant_missing_workflows_never_names_is_caught(self):
+        mod = self.src_module("if w not in have]", "if False]")
+        self.assertEqual(mod.missing_workflows([], ["ci"]), [])   # the mutant; the test above asserts the name
+
+    # --- ci_workflows validation ---
+    def cfg(self, **entry):
+        return {"repos": {"o/r": entry}}
+
+    def validate(self, mod=None, **entry):
+        return (mod or sb.plan_ledger).validate_plan_gates(self.cfg(**entry), "c")["repos"]["o/r"]
+
+    def test_ci_workflows_absent_reads_as_before(self):
+        self.assertNotIn("ci_workflows", self.validate())
+
+    def test_ci_workflows_valid_lists(self):
+        self.assertEqual(self.validate(ci_workflows=["ci", "lint"])["ci_workflows"], ["ci", "lint"])
+        self.assertEqual(self.validate(ci_workflows=[])["ci_workflows"], [])
+        self.assertEqual(len(self.validate(ci_workflows=["w%d" % i for i in range(20)])["ci_workflows"]), 20)
+
+    def bad(self, value, mod=None):
+        with self.assertRaises(ValueError) as cm:
+            self.validate(mod, ci_workflows=value)
+        self.assertIn("ci_workflows", str(cm.exception))
+
+    def test_ci_workflows_not_a_list_is_refused(self):
+        for v in ("ci", {"a": 1}, 3, None, ("ci",)):
+            self.bad(v)
+
+    def test_ci_workflows_over_twenty_is_refused(self):
+        self.bad(["w%d" % i for i in range(21)])
+
+    def test_ci_workflows_non_string_or_empty_is_refused(self):
+        self.bad(["ci", 3])
+        self.bad(["ci", ""])
+        self.bad([None])
+
+    def test_unknown_sibling_key_is_still_refused(self):
+        with self.assertRaises(ValueError) as cm:
+            self.validate(ci_workflows=["ci"], bogus=1)
+        self.assertIn("bogus", str(cm.exception))
+
+    def plan_ledger_mut(self, old, new):
+        import types
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plan_ledger.py")
+        text = open(path).read()
+        assert old in text, old
+        mod = types.ModuleType("plan_ledger_mut")
+        mod.__file__ = path
+        exec(compile(text.replace(old, new, 1), path, "exec"), mod.__dict__)
+        return mod
+
+    def test_mutant_no_length_cap_is_caught(self):
+        mod = self.plan_ledger_mut("isinstance(flows, list) and len(flows) <= 20 and", "isinstance(flows, list) and")
+        self.validate(mod, ci_workflows=["w%d" % i for i in range(21)])   # the mutant accepts
+        with self.assertRaises(AssertionError):
+            self.bad(["w%d" % i for i in range(21)], mod)
+
+    def test_mutant_no_string_check_is_caught(self):
+        mod = self.plan_ledger_mut("all(isinstance(x, str) and x for x in flows)", "True")
+        self.validate(mod, ci_workflows=["ci", 3, ""])
+        with self.assertRaises(AssertionError):
+            self.bad(["ci", 3], mod)
+
+    def test_mutant_no_list_check_is_caught(self):
+        mod = self.plan_ledger_mut("isinstance(flows, list) and len(flows) <= 20 and all(", "len(flows) <= 20 and all(")
+        with self.assertRaises(AssertionError):
+            self.bad("ci", mod)   # the mutant accepts a string
+
+    # --- the gate's use of ci_workflows ---
+    def core(self, cfg, rollup):
+        import types
+        facts = sb.pr_facts_from({"state": "OPEN", "headRefOid": "a" * 40, "statusCheckRollup": rollup})
+        ctx = types.SimpleNamespace(unreadable=None, facts=facts, plan={"result": "pass", "scenarios_parsed": []}, plan_problem=None, engine=None, pr=1, config=cfg, repo="o/r")
+        return sb.ci_record_core(ctx, lambda: 0, quiet=True)
+
+    def test_gate_names_a_listed_workflow_without_a_run_and_leaves_an_unlisted_repo_alone(self):
+        ci = load_ci_runs()
+        ci._CACHE.clear()
+        old = ci.READER
+        ci.READER = lambda repo, run: (1, "push")
+        self.addCleanup(lambda: (setattr(ci, "READER", old), ci._CACHE.clear()))
+        chk = {"workflowName": "ci", "name": "b", "conclusion": "SUCCESS", "status": "COMPLETED", "startedAt": "2026-10-15T11:00:00Z",
+               "completedAt": "2026-10-15T11:30:00Z", "detailsUrl": "https://github.com/o/r/actions/runs/101/job/1"}
+        listed = {"plan_gates": {"repos": {"o/r": {"ci_workflows": ["ci", "deploy"]}}}}
+        got = self.core(listed, [chk])
+        self.assertEqual(got["status"], "not-green")
+        self.assertIn('no run for workflow "deploy"', got["why"])
+        self.assertEqual(self.core({"plan_gates": {"repos": {"o/r": {}}}}, [chk])["status"], "nothing")
+        self.assertEqual(self.core({}, [chk])["status"], "nothing")
+
+
+class TestLatestRunOfWorkflow(unittest.TestCase):
+    """Ask #1237: for each workflow only the LATEST run counts, whatever the check names; pr_ci_of is the one reading ci-record and the gate share."""
+
+    WF = {}   # run id -> (workflow id, event); a run missing here cannot be read
+
+    def setUp(self):
+        ci = load_ci_runs()
+        self.WF = {r: (1, "push") for r in range(100, 106)}
+        ci._CACHE.clear()
+        ci._FAILED.clear()
+        old = ci.READER
+        ci.READER = lambda repo, run: self.WF.get(run)
+        self.addCleanup(lambda: (setattr(ci, "READER", old), ci._CACHE.clear(), ci._FAILED.clear(), setattr(ci, "_clock", __import__("time").monotonic)))
+
+    @staticmethod
+    def chk(flow, run, name, concl, status="COMPLETED"):
+        return {"workflowName": flow, "name": name, "conclusion": concl, "status": status, "startedAt": "2026-10-15T1%d:00:00Z" % (run % 10),
+                "completedAt": "2026-10-15T1%d:30:00Z" % (run % 10), "detailsUrl": "https://github.com/o/r/actions/runs/%d/job/1" % run}
+
+    def first(self):
+        return [self.chk("ci", 100, n, "CANCELLED") for n in ("plan", "matrix.name", "matrix.cloud")]
+
+    def test_s2_cancelled_first_run_then_green_second_run(self):
+        self.assertEqual(sb.pr_ci_of(self.first() + [self.chk("ci", 101, "build", "SUCCESS")]), "green")
+
+    def test_s3_second_run_red_or_running(self):
+        self.assertEqual(sb.pr_ci_of(self.first() + [self.chk("ci", 101, "build", "FAILURE")]), "failing")
+        self.assertEqual(sb.pr_ci_of(self.first() + [self.chk("ci", 101, "build", "", "IN_PROGRESS")]), "pending")
+
+    def test_s4_two_workflows_and_a_cancelled_latest(self):
+        self.assertEqual(sb.pr_ci_of([self.chk("W", 102, "a", "SUCCESS"), self.chk("X", 103, "b", "SUCCESS"), self.chk("X", 104, "b2", "CANCELLED")]), "failing")
+        self.assertEqual(sb.pr_ci_of([self.chk("X", 104, "b2", "CANCELLED")]), "failing")
+
+    def test_s5_no_run_and_queued_named(self):
+        self.assertEqual(sb.pr_ci_of([]), "none")
+        bad = load_ci_runs().not_green_runs(self.first() + [self.chk("ci", 101, "build", "", "QUEUED")])
+        self.assertEqual(bad[0][:2], ('"ci"', 101))
+
+    def test_s6_gate_and_ci_record_both_use_the_latest_run_result(self):
+        """pr_ci_of (the gate's and ci-record's read) and not_green_runs both go through latest_runs: an old red run of the same workflow is ignored by both."""
+        rollup = self.first() + [self.chk("ci", 101, "build", "SUCCESS")]
+        self.assertEqual(sb.pr_ci_of(rollup), "green")
+        self.assertEqual(load_ci_runs().not_green_runs(rollup), [])
+        seen = []
+        real = load_ci_runs().latest_runs
+        load_ci_runs().latest_runs = lambda r, *a: (seen.append(1), real(r, *a))[1]
+        self.addCleanup(setattr, load_ci_runs(), "latest_runs", real)
+        sb.pr_ci_of(rollup)
+        load_ci_runs().not_green_runs(rollup)
+        self.assertEqual(len(seen), 2)
+
+    def test_1237_missing_workflow_and_empty_rollup_are_named(self):
+        ci = load_ci_runs()
+        self.assertEqual(ci.missing_workflows([self.chk("ci", 100, "a", "SUCCESS")], ["ci", "lint"]), ['no run for workflow "lint"'])
+        self.assertEqual(ci.missing_workflows([], ["ci"]), ['no run for workflow "ci"'])
+        self.assertEqual(ci.missing_workflows([], []), [])
+
+    def test_1237_read_cap_is_a_named_constant(self):
+        ci = load_ci_runs()
+        self.assertEqual(ci.READ_CAP, 10)
+        self.WF = {r: (r, "push") for r in range(100, 106)}
+        ci.READ_CAP = 2
+        self.addCleanup(setattr, ci, "READ_CAP", 10)
+        rollup = [self.chk("w%d" % r, r, "a", "SUCCESS") for r in range(100, 105)]
+        self.assertNotEqual(sb.pr_ci_of(rollup), "green")   # past the cap the head is refused as unreadable
+
+    def test_1237_same_run_id_the_higher_attempt_is_the_latest(self):
+        a1 = dict(self.chk("ci", 100, "old", "CANCELLED"), detailsUrl="https://github.com/o/r/actions/runs/100/attempts/1")
+        a2 = dict(self.chk("ci", 100, "new", "SUCCESS"), detailsUrl="https://github.com/o/r/actions/runs/100/attempts/2")
+        self.assertEqual(sb.pr_ci_of([a1, a2]), "green")
+        self.assertEqual(sb.pr_ci_of([a2, a1]), "green")
+
+    def test_1237_rollup_at_the_gh_cap_is_never_green(self):
+        full = [self.chk("ci", 101, "c%d" % i, "SUCCESS") for i in range(100)]
+        self.assertEqual(sb.pr_ci_of(full[:99]), "green")
+        self.assertEqual(sb.pr_ci_of(full), "pending")
+
+    def test_1237_every_reader_of_check_runs_is_in_the_docs_table(self):
+        import re as _re, pathlib
+        root = pathlib.Path(sb.__file__).resolve().parent.parent if hasattr(sb, "__file__") else pathlib.Path(".")
+        docs = (root / "docs" / "switchboard.md").read_text()
+        table = docs.split("Readers of check runs (#1237)", 1)[1].split("\n\n", 2)[1] if "Readers of check runs (#1237)" in docs else ""
+        found = set()
+        for f in (root / "bin").iterdir():
+            if f.name.startswith("test-") or f.suffix not in (".py", "") or not f.is_file():
+                continue
+            text = f.read_text(errors="ignore")
+            for m in _re.finditer(r"commits/%s/check-runs|statusCheckRollup|check_runs\b", text):
+                found.add(f.name)
+        for name in found:
+            self.assertIn("`%s`" % name, table, "%s reads check runs and is not in the docs table" % name)
+
+    def test_u2_status_context_by_name(self):
+        red = {"context": "legacy", "state": "FAILURE", "startedAt": "2026-10-15T10:00:00Z"}
+        green = {"context": "legacy", "state": "SUCCESS", "startedAt": "2026-10-15T11:00:00Z"}
+        self.assertEqual(sb.pr_ci_of([red]), "failing")
+        self.assertEqual(sb.pr_ci_of([red, green]), "green")
+
+
+
+    # --- ask #1237 review: identity, sanitising, edges ---
+    def test_same_name_two_workflows_one_red_reads_not_green_and_both_are_named(self):
+        self.WF.update({100: (1, "push"), 101: (2, "push")})
+        for rollup, red in (([self.chk("ci", 100, "t", "FAILURE"), self.chk("ci", 101, "t", "SUCCESS")], 1),
+                            ([self.chk("ci", 100, "t", "FAILURE"), self.chk("ci", 101, "t", "CANCELLED")], 2)):
+            self.assertEqual(sb.pr_ci_of(rollup), "failing")
+            self.assertEqual(len(load_ci_runs().not_green_runs(rollup)), red)
+        self.assertEqual(load_ci_runs().not_green_runs([self.chk("ci", 100, "t", "FAILURE"), self.chk("ci", 101, "t", "SUCCESS")]), [('"ci"', 100, "failure")])
+        both = [self.chk("ci", 100, "t", "FAILURE"), self.chk("ci", 101, "t", "TIMED_OUT")]
+        self.assertEqual(load_ci_runs().not_green_runs(both), [('"ci"', 100, "failure"), ('"ci"', 101, "timed_out")])
+
+    def test_same_workflow_newer_green_older_red_or_cancelled_reads_green(self):
+        for old in ("FAILURE", "CANCELLED"):
+            r = [self.chk("ci", 100, "t", old), self.chk("ci", 101, "t", "SUCCESS")]
+            self.assertEqual(sb.pr_ci_of(r), "green")
+            self.assertEqual(load_ci_runs().not_green_runs(r), [])
+
+    def test_same_workflow_two_events_a_newer_run_of_another_event_does_not_hide_a_red_one(self):
+        self.WF.update({100: (1, "pull_request"), 101: (1, "push")})
+        r = [self.chk("ci", 100, "t", "FAILURE"), self.chk("ci", 101, "t", "SUCCESS")]
+        self.assertEqual(sb.pr_ci_of(r), "failing")
+        self.assertEqual(load_ci_runs().not_green_runs(r), [('"ci"', 100, "failure")])
+
+    def test_unreadable_identity_fails_closed_and_says_so(self):
+        del self.WF[101]
+        r = [self.chk("ci", 100, "t", "FAILURE"), self.chk("ci", 101, "t", "SUCCESS")]
+        self.assertEqual(sb.pr_ci_of(r), "failing")
+        self.assertEqual(load_ci_runs().not_green_runs(r)[-1], ('"ci"', 101, "identity_unreadable"))
+        self.assertEqual(sb.pr_ci_of([self.chk("ci", 101, "t", "SUCCESS")]), "pending")
+
+    def test_a_read_that_raises_fails_closed(self):
+        ci = load_ci_runs()
+        def boom(repo, run):
+            raise RuntimeError("x")
+        ci.READER = boom
+        self.assertEqual(sb.pr_ci_of([self.chk("ci", 101, "t", "SUCCESS")]), "pending")
+
+    def test_a_reader_answering_garbage_fails_closed(self):
+        load_ci_runs().READER = lambda repo, run: "x"
+        self.assertEqual(sb.pr_ci_of([self.chk("ci", 101, "t", "SUCCESS")]), "pending")
+
+    def test_the_run_read_returns_workflow_id_and_event_or_none(self):
+        ci = load_ci_runs()
+        import subprocess as sp
+        from unittest import mock
+        def fake(out, code=0):
+            return mock.patch.object(sp, "run", return_value=sp.CompletedProcess([], code, out, ""))
+        with fake('{"w": 7, "e": "push"}'):
+            self.assertEqual(ci._read_run("o/r", 5), (7, "push"))
+        with fake('{"w": 7, "e": "push"}', 1):
+            self.assertIsNone(ci._read_run("o/r", 5))
+        with fake('{"w": "7", "e": "push"}'):
+            self.assertIsNone(ci._read_run("o/r", 5))
+        with fake('not json'):
+            self.assertIsNone(ci._read_run("o/r", 5))
+
+    def test_the_identity_is_read_once_per_run_in_a_pass(self):
+        calls = []
+        ci = load_ci_runs()
+        ci.READER = lambda repo, run: (calls.append(run), (1, "push"))[1]
+        r = [self.chk("ci", 101, "a", "SUCCESS"), self.chk("ci", 101, "b", "SUCCESS")]
+        sb.pr_ci_of(r)
+        sb.pr_ci_of(r)
+        self.assertEqual(calls, [101])
+
+    def test_the_name_in_a_refusal_is_clean_quoted_and_bounded(self):
+        r = [self.chk("evil\x1b[31m\nname" + "x" * 500, 101, "t", "FAILURE")]
+        (name, run, state), = load_ci_runs().not_green_runs(r)
+        self.assertEqual((run, state), (101, "failure"))
+        self.assertNotIn("\x1b", name)
+        self.assertNotIn("\n", name)
+        self.assertTrue(name.startswith('"evil[31mname') and name.endswith('..."'))
+        self.assertLessEqual(len(name), 70)
+
+    def test_latest_runs_edges_full_tuples(self):
+        ci = load_ci_runs()
+        c = self.chk
+        no_url = dict(c("ci", 101, "t", "SUCCESS"), detailsUrl=None)
+        bad_url = dict(c("ci", 101, "t", "SUCCESS"), detailsUrl="https://x/actions/runs/abc/job")
+        long_id = dict(c("ci", 101, "t", "SUCCESS"), detailsUrl="https://github.com/o/r/actions/runs/" + "9" * 30)
+        self.assertEqual(ci.latest_runs([no_url, bad_url]), [no_url, bad_url])   # no run id: kept for the by-name rule
+        self.assertEqual(ci.not_green_runs([no_url, bad_url, "str", None]), [])
+        self.assertEqual(ci.latest_runs([long_id]), [long_id])
+        self.assertEqual(ci._run_id(long_id), None)
+        self.assertEqual(ci.latest_runs("x"), [])
+        self.assertEqual(ci.not_green_runs({"a": 1}), [])
+        self.assertEqual(ci.latest_runs([1, "s"]), [1, "s"])
+        noname = c(None, 101, "t", "FAILURE")
+        del noname["workflowName"]
+        self.assertEqual(ci.not_green_runs([noname]), [("", 101, "failure")])
+        ctx = {"context": "legacy", "state": "FAILURE"}
+        self.assertEqual(ci.not_green_runs([ctx, c("ci", 101, "t", "SUCCESS")]), [("", None, "failure")])
+        same = [c("ci", 101, "a", "FAILURE"), c("ci", 101, "b", "SUCCESS")]
+        self.assertEqual(ci.latest_runs(same), same)   # equal run ids: both kept
+        self.assertEqual(ci.not_green_runs(same), [('"ci"', 101, "failure")])
+        mixed = [c("ci", 100, "a", "FAILURE"), c("ci", 102, "b", "SUCCESS"), c("ci", 101, "c", "FAILURE")]
+        self.assertEqual(ci.latest_runs(mixed), [mixed[1]])   # only the highest id counts
+        self.assertEqual(ci.not_green_runs(mixed), [])
+
+    def test_ci_record_core_names_the_not_green_run_and_a_plain_message_without_a_rollup(self):
+        text = (Path(__file__).resolve().parent / "fleet-switchboard").read_text()
+        self.assertIn('"ci_rollup": data.get("statusCheckRollup")', text)
+        facts = sb.pr_facts_from({"state": "OPEN", "statusCheckRollup": self.first() + [self.chk("ci", 101, "build", "", "QUEUED")]})
+        self.assertEqual(facts["ci_rollup"][-1]["name"], "build")
+        self.assertEqual(sb.pr_ci_of(facts["ci_rollup"]), "pending")
+        self.assertEqual(load_ci_runs().not_green_runs(facts["ci_rollup"]), [('"ci"', 101, "queued")])
+        self.assertIn("ci_rollup", sb.pr_facts_from({"state": "OPEN"}))
+
+    def test_ci_record_core_why_names_the_run_and_has_no_suffix_without_a_rollup(self):
+        import types
+        def why(raw):
+            facts = sb.pr_facts_from(dict({"state": "OPEN", "headRefOid": "a" * 40}, **raw))
+            ctx = types.SimpleNamespace(unreadable=None, facts=facts, plan={"result": "pass", "scenarios_parsed": []}, plan_problem=None, engine=None, pr=1)
+            return sb.ci_record_core(ctx, lambda: 0, quiet=True)
+        rollup = self.first() + [self.chk("ci", 101, "build", "", "QUEUED")]
+        got = why({"statusCheckRollup": rollup})
+        self.assertEqual(got["status"], "not-green")
+        self.assertEqual(got["why"], 'CI is pending at aaaaaaaa (only a complete, green run is recorded) ["ci" run 101 is queued]')
+        got = why({})
+        self.assertEqual(got["why"], "CI is none at aaaaaaaa (only a complete, green run is recorded)")
+
+    def test_1237_ci_record_core_refuses_a_missing_expected_workflow_and_an_empty_rollup(self):
+        import types
+        def core(raw):
+            facts = sb.pr_facts_from(dict({"state": "OPEN", "headRefOid": "a" * 40}, **raw))
+            cfg = {"plan_gates": {"repos": {"o/r": {"ci_workflows": ["ci", "lint"]}}}}
+            ctx = types.SimpleNamespace(unreadable=None, facts=facts, plan={"result": "pass", "scenarios_parsed": []}, plan_problem=None, engine=None, pr=1, config=cfg, repo="o/r")
+            return sb.ci_record_core(ctx, lambda: 0, quiet=True)
+        self.WF[102] = (2, "push")
+        got = core({"statusCheckRollup": [self.chk("ci", 101, "build", "SUCCESS")]})
+        self.assertEqual(got["status"], "not-green")
+        self.assertIn('no run for workflow "lint"', got["why"])
+        self.assertIn('no run for workflow "ci"', core({})["why"])
+        self.assertEqual(core({"statusCheckRollup": [self.chk("ci", 101, "build", "SUCCESS"), self.chk("lint", 102, "l", "SUCCESS")]})["status"], "nothing")
+
+    def test_1237_mutant_missing_workflow_ignored_reads_the_head_as_green(self):
+        with mock.patch.object(load_ci_runs(), "missing_workflows", lambda r, e: []):
+            import types
+            facts = sb.pr_facts_from({"state": "OPEN", "headRefOid": "a" * 40, "statusCheckRollup": [self.chk("ci", 101, "build", "SUCCESS")]})
+            cfg = {"plan_gates": {"repos": {"o/r": {"ci_workflows": ["ci", "lint"]}}}}
+            ctx = types.SimpleNamespace(unreadable=None, facts=facts, plan={"result": "pass", "scenarios_parsed": []}, plan_problem=None, engine=None, pr=1, config=cfg, repo="o/r")
+            self.assertEqual(sb.ci_record_core(ctx, lambda: 0, quiet=True)["status"], "nothing", "the mutant passes: the test above fails on it")
+
+    # --- ask #1237 round 2: bounded calls, the PR's own repo, bounded caches ---
+    def test_read_run_timeout_and_oserror_give_none(self):
+        import subprocess as sp
+        from unittest import mock
+        ci = load_ci_runs()
+        for exc in (sp.TimeoutExpired("gh", 20), OSError("no gh"), ValueError("x")):
+            with mock.patch.object(sp, "run", side_effect=exc):
+                self.assertIsNone(ci._read_run("o/r", 5))
+        with mock.patch.object(sp, "run", return_value=sp.CompletedProcess([], 0, '{"w": true, "e": "push"}', "")):
+            self.assertIsNone(ci._read_run("o/r", 5))   # a bool is not a workflow id
+        with mock.patch.object(sp, "run", return_value=sp.CompletedProcess([], 0, '{"w": 1, "e": "x" }'.replace('"x" ', '"' + "e" * 90 + '"'), "")):
+            self.assertIsNone(ci._read_run("o/r", 5))   # an event over the bound
+        with mock.patch.object(sp, "run", return_value=sp.CompletedProcess([], 0, '{"w": 1, "e": "push"}', "")) as run:
+            ci._read_run("o/r", 5)
+            self.assertEqual(run.call_args.kwargs["timeout"], ci.READ_TIMEOUT)
+
+    def test_many_distinct_runs_are_read_up_to_the_cap_and_the_rest_fail_closed_naming_the_cap(self):
+        ci = load_ci_runs()
+        calls = []
+        ci.READER = lambda repo, run: (calls.append(run), (run, "push"))[1]
+        rollup = [self.chk("ci", 200 + n, "t%d" % n, "SUCCESS") for n in range(15)]
+        bad = ci.not_green_runs(rollup)
+        self.assertEqual(len(calls), 10)
+        ci._CACHE.clear()
+        self.assertEqual(sb.pr_ci_of(rollup), "pending")
+        self.assertEqual(len(bad), 5)
+        self.assertIn("read cap 10", bad[0][2])
+
+    def test_a_url_naming_another_repo_is_unreadable_and_never_read(self):
+        ci = load_ci_runs()
+        calls = []
+        ci.READER = lambda repo, run: (calls.append(repo), (1, "push"))[1]
+        foreign = dict(self.chk("ci", 105, "t", "SUCCESS"), detailsUrl="https://github.com/evil/other/actions/runs/105/job/1")
+        rollup = [self.chk("ci", 100, "a", "FAILURE"), self.chk("ci", 101, "b", "SUCCESS"), foreign]
+        self.assertEqual(ci.not_green_runs(rollup)[-1], ('"ci"', 105, "identity_unreadable"))
+        self.assertEqual(calls, ["o/r", "o/r"])
+        self.assertEqual(sb.pr_ci_of(rollup), "pending")
+        self.assertEqual(ci.latest_runs([foreign], "o/r")[0]["status"], ci.UNREADABLE)
+        self.assertEqual(ci.own_repo([foreign, self.chk("ci", 1, "a", "SUCCESS"), self.chk("ci", 2, "a", "SUCCESS")]), "o/r")
+        self.assertEqual(ci.own_repo([foreign, self.chk("ci", 1, "a", "SUCCESS")]), "")   # a tie names none
+
+    def test_a_failed_read_is_retried_only_after_the_negative_cache_window(self):
+        ci = load_ci_runs()
+        now = [1000.0]
+        ci._clock = lambda: now[0]
+        calls = []
+        ci.READER = lambda repo, run: (calls.append(run), None)[1]
+        r = [self.chk("ci", 101, "t", "SUCCESS")]
+        for _ in range(3):
+            sb.pr_ci_of(r)
+        self.assertEqual(calls, [101])
+        now[0] += ci.FAIL_WINDOW + 1
+        sb.pr_ci_of(r)
+        self.assertEqual(calls, [101, 101])
+
+    def test_the_cache_key_keeps_two_repos_apart(self):
+        ci = load_ci_runs()
+        ci.READER = lambda repo, run: (1 if repo == "o/r" else 2, "push")
+        a, b = self.chk("ci", 101, "t", "SUCCESS"), dict(self.chk("ci", 101, "t", "SUCCESS"), detailsUrl="https://github.com/p/q/actions/runs/101/job/1")
+        ci.latest_runs([a], "o/r")
+        ci.latest_runs([b], "p/q")
+        self.assertEqual((ci._CACHE[("o/r", 101)], ci._CACHE[("p/q", 101)]), ((1, "push"), (2, "push")))
+
+    def test_the_caches_are_bounded_oldest_dropped(self):
+        ci = load_ci_runs()
+        for n in range(ci.CACHE_MAX + 20):
+            ci._put(ci._CACHE, ("o/r", n), (n, "push"))
+            ci._put(ci._FAILED, ("o/r", n), 0)
+        self.assertEqual((len(ci._CACHE), len(ci._FAILED)), (ci.CACHE_MAX, ci.CACHE_MAX))
+        self.assertNotIn(("o/r", 0), ci._CACHE)
+        self.assertIn(("o/r", ci.CACHE_MAX + 19), ci._CACHE)
+
+
+
+def load_ci_runs():
+    return sb.load_module("ci_runs")
 
 
 class TestNoPaneToJudge(StandInPids, Base):
