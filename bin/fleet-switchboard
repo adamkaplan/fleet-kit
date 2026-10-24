@@ -17997,6 +17997,7 @@ def _cmd_send(args, runner, now):
     if lane_problem:
         sys.stderr.write("%s: not sent, %s\n" % (PROG, lane_problem))
         return EXIT_USAGE
+    verdict = check_approval(config, runner, now, text, repo, number)   # #951: only a message that starts `Approved at sha256:`; GETs only; never raises
     try:
         outcome = engine.send(sender, args.name, text, number, repo, interrupt=args.interrupt)
     except InterruptRefused as err:
@@ -18008,9 +18009,55 @@ def _cmd_send(args, runner, now):
     if not outcome["sent"]:
         sys.stderr.write("%s: not sent to %s: %s (%s)\n" % (PROG, args.name, outcome["action"], outcome["reason"]))
         return EXIT_HELD
+    record_approval(engine, verdict, sender, args.name, repo, number)
     print(outcome["message_id"])
     sys.stderr.write("%s: %s delivered to %s\n" % (PROG, outcome["action"], args.name))
     return EXIT_OK
+
+
+def check_approval(config, runner, now, text, repo, number):
+    """#951: None for a message that carries no approval (nothing is read). Otherwise the verdict of `plan_approval.evaluate`, from GET reads of the
+    issue, its comments and (when it has no Done-when of its own) its ask. FAIL MODE: any failure to read is a refusal line, never an error:
+    the message is delivered either way."""
+    module = load_module("plan_approval")
+    value = module.approval_value(text)
+    if value is None:
+        return None
+    if number is None:
+        return {"ok": False, "line": "approval not recorded: the message names no issue (use --issue); the message was delivered"}
+    try:
+        reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
+        issue = reader.issue(number, repo)
+        done_when = issue.done_when
+        if not done_when:
+            ask, _ = reader.ask_of(number, repo)
+            done_when = reader.issue(ask, repo).done_when if ask != number else None
+        comments = []
+        for page in range(1, PLAN_COMMENT_PAGES + 1):
+            got = reader._api("repos/%s/issues/%d/comments?per_page=100&page=%d" % (repo, number, page), repo)
+            if not isinstance(got, list):
+                raise IntentError("gh", "the comments did not come back as a list")
+            comments.extend(got)
+            if len(got) < 100:
+                break
+        return module.evaluate(value, comments, done_when, load_plan_check())
+    except Exception as err:
+        return {"ok": False, "line": "approval not recorded: the issue could not be read (%s); the message was delivered" % _one_line(str(err), 120)}
+
+
+def record_approval(engine, verdict, sender, recipient, repo, number):
+    """Audit a passing approval with both hashes, or print the one refusal line. A no-approval message (None) is untouched."""
+    if verdict is None:
+        return
+    if not verdict["ok"]:
+        sys.stderr.write("%s: %s\n" % (PROG, verdict["line"]))
+        return
+    if engine.audit is not None:
+        try:
+            engine.audit.append(engine.actor, "plan.approved", "%s#%d" % (repo, number),
+                                {"from": sender, "to": recipient, "plan_hash": verdict["plan_hash"], "done_when_hash": verdict["done_when_hash"]})
+        except OSError:
+            pass
 
 
 def cmd_report(args, runner, now):

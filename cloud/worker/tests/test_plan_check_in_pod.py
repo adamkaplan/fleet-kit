@@ -275,7 +275,7 @@ def order_problems(keys):
     return [k for k in MOVED_DENY_ORDER if keys.index(k) < last_allow]
 
 
-PINNED = {'guard.sh': '9bff815feddd3424f2f853c8e002333474845ab7d8091f562bbd9256852a9321'}
+PINNED = {'guard.sh': 'ba4d51aa043d450a4832210fb6492295e7bd7c7e61a4abd2a70cc75baea19bca'}
 PINNED_JSON_WITHOUT_ADDED_ROWS = "c14522cff99b9223d881b9f80a3d3397f55ae15a5d6f12a2380b89c9de6fd4be"
 # Rows added to opencode-worker.json, in file order. A pin changes only in the ask whose approved plan names the rows:
 # Lower and capitalised method words after -X or --method are denied too (the glob is case sensitive; a mixed form such as pOsT is not covered here, the client refuses it).
@@ -314,6 +314,13 @@ ADDED_ROWS = [   # ask 1083: DW-6 (read an issue's comments and the two pull req
     ('gh api*--input*', 'deny'),
     ('gh api*graphql*', 'deny'),
     ('gh api*mutation*', 'deny'),
+    # ask 1200: DW-2, DW-3 (a worker edits the body of its own pull request: `pr edit N --body-file F` only; every other pr-edit form stays denied)
+    ('gh pr edit*', 'deny'),
+    ('gh pr edit * --body-file *', 'allow'),
+    ('gh pr edit*--body-file* --*', 'deny'),
+    ('gh pr edit*--* --body-file*', 'deny'),
+    ('gh pr edit*://*', 'deny'),
+    ('gh pr edit*--repo*', 'deny'),
 ]
 ADDED_ALLOWS = [k for k, v in ADDED_ROWS if v == 'allow']
 # The three deny rows that exist before ask 1083 and were moved: their order, and they come after every added allow row above.

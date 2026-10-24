@@ -3562,7 +3562,193 @@ class TestSteerToWorking(Base):
         self.assertEqual(code, 0, err)
 
 
+PLAN_CLAUSES = ["first clause is stated here", "second clause is stated here"]
+APPROVAL_DW = "(1) %s (2) %s" % tuple(PLAN_CLAUSES)
+
+
+def plan_body(clauses=PLAN_CLAUSES, extra=""):
+    lines = "\n".join('  DW-%d: "%s"' % (i, c) for i, c in enumerate(clauses, 1))
+    return "## Plan (scenarios)\n\nsize: S\n%s\n\n```yaml\nclauses:\n%s\n```\n" % (extra, lines)
+
+
+class ApprovalGH:
+    """A gh that serves GETs of one issue, its comments and its parent; records every call; a write raises."""
+
+    def __init__(self, issues, comments, down=False):
+        self.issues, self.comments, self.down, self.calls = issues, comments, down, []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(argv)
+        if len(argv) != 3 or argv[:2] != [FAKE_GH, "api"]:
+            raise AssertionError("an approval check may only GET: %r" % argv)
+        if self.down:
+            return subprocess.CompletedProcess(argv, 1, "", "gh: network unreachable\n")
+        path = argv[2]
+        found = re.match(r"^repos/%s/issues/(\d+)(/comments\?per_page=100&page=1|/parent)?$" % re.escape(FAKE_REPO), path)
+        number = int(found.group(1)) if found else 0
+        if not found or number not in self.issues:
+            return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
+        if found.group(2) == "/parent":
+            parent = self.issues[number].get("parent")
+            if parent is None:
+                return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)\n")
+            data = {"number": parent, "body": intent_body("i", self.issues[parent].get("done_when"))}
+        elif found.group(2):
+            data = [{"id": i + 1, "created_at": "2027-01-01T00:00:0%dZ" % i, "body": b} for i, b in enumerate(self.comments.get(number, []))]
+        else:
+            data = {"number": number, "body": intent_body("an intent", self.issues[number].get("done_when"))}
+        return subprocess.CompletedProcess(argv, 0, json.dumps(data), "")
+
+
+class TestApprovalCheck(Base):
+    """#951: `Approved at sha256:X` is recorded only for the plan's current hash and the issue's current Done-when."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform", "coder"))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO})
+
+    def send(self, text, issues=None, comments=None, down=False):
+        issues = issues if issues is not None else {7: {"done_when": APPROVAL_DW}}
+        gh = ApprovalGH(issues, comments if comments is not None else {7: [plan_body()]}, down)
+        self.gh = gh
+
+        def runner(argv, **kwargs):
+            return gh(argv, **kwargs) if argv[0] == FAKE_GH else self.world.route(argv, **kwargs)
+        with captured() as (out, err):
+            code = sb.main(["send", "--from", "cos", "--issue", "7", "platform", text], runner=runner, now=self.world.clock.now,
+                           wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        return code, err.getvalue()
+
+    def approved(self):
+        return [e for e in self.world.audit() if e["event"] == "plan.approved"]
+
+    def delivered(self):
+        return len(self.world.admissions("platform"))
+
+    def current(self, body=None):
+        return sb.plan_check.plan_hash(body or plan_body())
+
+    def test_current_hash_and_equal_clauses_is_recorded_with_both_hashes(self):
+        code, err = self.send("Approved at %s" % self.current())
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("approval not recorded", err)
+        self.assertEqual(self.delivered(), 1)
+        (event,) = self.approved()
+        self.assertEqual(event["detail"]["plan_hash"], self.current())
+        self.assertRegex(event["detail"]["done_when_hash"], r"^sha256:[0-9a-f]{64}$")
+        self.assertNotEqual(event["detail"]["done_when_hash"], event["detail"]["plan_hash"])
+
+    def refused(self, text, **kw):
+        code, err = self.send(text, **kw)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.approved(), [])
+        self.assertEqual(self.delivered(), 1)
+        self.assertEqual(err.count("approval not recorded"), 1, err)
+        self.assertEqual([c for c in self.gh.calls if c[2:3] and "--method" in c], [])
+        return err
+
+    def test_a_stale_hash_is_refused_with_the_current_hash(self):
+        err = self.refused("Approved at %s" % self.current(plan_body(extra="older")))
+        self.assertRegex(err, r"the plan has changed \(current sha256:[0-9a-f]{64}\)")
+
+    def test_clauses_that_differ_from_the_done_when_are_refused(self):
+        err = self.refused("Approved at %s" % self.current(), issues={7: {"done_when": "(1) first clause is stated here (2) a changed second clause"}})
+        self.assertIn("Done-when", err)
+
+    def test_no_done_when_anywhere_is_refused_with_its_own_reason(self):
+        err = self.refused("Approved at %s" % self.current(), issues={7: {}})
+        self.assertIn("there is no Done-when on the issue or its ask", err)
+        self.assertRegex(err, r"\(current sha256:[0-9a-f]{64}\)")
+
+    def test_a_plan_with_no_clauses_block_is_refused_with_its_own_reason(self):
+        body = "## Plan (scenarios)\n\nsize: S\n\nno clauses block here\n"
+        err = self.refused("Approved at %s" % self.current(body), comments={7: [body]})
+        self.assertIn("the plan declares no clauses block", err)
+        self.assertNotIn("no longer equal", err)
+
+    def test_an_ask_done_when_is_used_when_the_issue_has_none(self):
+        issues = {7: {"parent": 6}, 6: {"done_when": APPROVAL_DW, "parent": 5}, 5: {}}
+        gh_issues = dict(issues)
+        code, err = self.send("Approved at %s" % self.current(), issues=gh_issues)
+        self.assertEqual(len(self.approved()), 1, err)
+        self.world.audit_path.unlink()
+        self.world.v2.admissions = lambda sid, _o=self.world.v2.admissions: _o(sid)[1:]
+        gh_issues[6] = {"done_when": "(1) first clause is stated here (2) changed", "parent": 5}
+        self.refused("Approved at %s" % self.current(), issues=gh_issues)
+
+    def test_two_plan_comments_are_refused(self):
+        newer = plan_body(extra="newer")
+        err = self.refused("Approved at %s" % self.current(newer), comments={7: [plan_body(), newer]})
+        self.assertIn("2 plan comments", err)
+
+    def test_an_unreadable_issue_is_not_recorded_and_the_message_is_delivered(self):
+        self.refused("Approved at %s" % self.current(), down=True)
+
+    def test_a_prefix_never_approves(self):
+        err = self.refused("Approved at sha256:%s" % self.current()[7:15])
+        self.assertIn("full 64-character hash", err)
+
+    def test_a_message_without_an_approval_reads_nothing(self):
+        for text in ("hello", "I Approved at %s" % self.current(), "not Approved at sha256:%s" % ("a" * 64)):
+            code, err = self.send(text)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(err.count("\n"), 1, err)
+            self.assertNotIn("approval", err)
+            self.assertEqual([c for c in self.gh.calls if "comments" in c[2]], [], text)   # the message path's own intent reads stay; the check adds none
+        self.assertEqual(self.approved(), [])
+
+    def test_the_documentation_shows_the_check_and_every_answer(self):
+        text = (BIN.parent / "docs" / "switchboard.md").read_text()
+        self.assertEqual(text.count("#951"), 1)
+        section = text[text.index("#951"):]
+        section = section[:section.index("\n\n")] if "\n\n" in section else section
+        for answer in ("the plan has changed", "the plan's clauses no longer equal the current Done-when", "plan comments", "full 64-character hash",
+                       "could not be read", "approval not recorded"):
+            self.assertIn(answer, " ".join(section.split()))
+
+
 # ------------------------------------------------------------------- the CLI
+
+class TestApprovalExemptionGuard(unittest.TestCase):
+    """#951: while bin/plan_approval.py is exempt from the authority list, no module of the clear/hold closure may depend on it."""
+
+    MESSAGE = "list bin/plan_approval.py as an authority module, then drop the exemption"
+    NEEDLES = ("plan_approval", "plan.approved")
+
+    def setUp(self):
+        self.matrix = json.loads((REPO / "docs/review-laws/impact-matrix.json").read_text())
+        hold = self.matrix["owner_hold"]
+        names = hold["delegated_clear"]["clear_code_paths"] + hold["top_tier_paths"]["authority"]
+        self.modules = sorted({p for p in names if p.startswith("bin/") and p.endswith(".py")})
+
+    def exemption_stands(self):
+        block = self.matrix["owner_hold"]["top_tier_paths"]
+        return "bin/plan_approval.py" in self.matrix["owner_hold"]["authority_modules"]["exempt"] and "bin/plan_approval.py" not in block["authority"]
+
+    def offenders(self, texts):
+        return sorted(name for name, text in texts.items() if any(n in text for n in self.NEEDLES))
+
+    def real_texts(self):
+        return {name: (REPO / name).read_text() for name in self.modules}
+
+    def test_the_closure_is_derived_and_complete(self):
+        for name in ("bin/delegated_clear.py", "bin/impact_hold.py", "bin/impact_floor.py", "bin/merge_gate.py", "bin/plan_ledger.py"):
+            self.assertIn(name, self.modules)
+
+    def test_no_clear_or_hold_module_depends_on_plan_approval(self):
+        if not self.exemption_stands():
+            self.skipTest("the exemption is gone")
+        self.assertEqual(self.offenders(self.real_texts()), [], self.MESSAGE)
+
+    def test_mutant_an_import_in_a_closure_module_fails_the_scan(self):
+        texts = self.real_texts()
+        texts["bin/merge_gate.py"] = "import plan_approval\n" + texts["bin/merge_gate.py"]
+        self.assertEqual(self.offenders(texts), ["bin/merge_gate.py"], self.MESSAGE)
+        texts = self.real_texts()
+        texts["bin/impact_hold.py"] += "\nx = 'plan.approved'\n"
+        self.assertEqual(self.offenders(texts), ["bin/impact_hold.py"], self.MESSAGE)
+
 
 class TestEngineCLI(Base):
     def setUp(self):
