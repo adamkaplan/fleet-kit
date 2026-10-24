@@ -196,27 +196,7 @@ def _bindings(tree):
     return bound
 
 
-def _sys_names(tree):
-    """The names `sys` is bound to in the file (`import sys`, `import sys as s`)."""
-    names = {"sys"}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            names |= {item.asname for item in node.names if item.name == "sys" and item.asname}
-    return names
-
-
-def _is_sys_modules_read(node, sys_names):
-    """True for `sys.modules`, `getattr(sys, "modules")`, `vars(sys)["modules"]` and `sys.__dict__["modules"]`, with `sys` under any name it is bound to."""
-    if isinstance(node, ast.Attribute):
-        return node.attr == "modules" and isinstance(node.value, ast.Name) and node.value.id in sys_names
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr" and len(node.args) >= 2:
-        return isinstance(node.args[0], ast.Name) and node.args[0].id in sys_names and isinstance(node.args[1], ast.Constant) and node.args[1].value == "modules"
-    if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) and node.slice.value == "modules":
-        base = node.value
-        if isinstance(base, ast.Call) and isinstance(base.func, ast.Name) and base.func.id == "vars" and base.args:
-            return isinstance(base.args[0], ast.Name) and base.args[0].id in sys_names
-        return isinstance(base, ast.Attribute) and base.attr == "__dict__" and isinstance(base.value, ast.Name) and base.value.id in sys_names
-    return False
+SAFE_SYS = ("argv", "executable", "exit", "path", "platform", "stderr", "stdin", "stdout", "version_info")   # the plain attributes of `sys` that load nothing
 
 
 def _followed_primitive(func, bound):
@@ -243,7 +223,8 @@ def dynamic_uses(path):
     or the builtin name, with `(non-constant)`, `(relative)` or `(reference)` where it is not a plain call."""
     tree = ast.parse(Path(path).read_text(encoding="utf-8"))
     bound = _bindings(tree)
-    sys_names = _sys_names(tree)
+    sys_names = {"sys"} | {item.asname for node in ast.walk(tree) if isinstance(node, ast.Import) for item in node.names if item.name == "sys" and item.asname}
+    parent = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
     uses, consumed, call_of = [], set(), {}
     for node, scope in _walk_scopes(tree):
         if isinstance(node, ast.Call):
@@ -254,6 +235,8 @@ def dynamic_uses(path):
                 if constant is not None:
                     uses.append((node.lineno, scope, primitive, "followed", constant))
                     consumed.update(id(n) for n in ast.walk(node.func))
+                    if constant.split(".")[0] in LOADER_MODULES + ("sys",):   # `__import__("sys")` hands back the module object itself
+                        uses.append((node.lineno, scope, "import(%s)" % constant.split(".")[0], "site", None))
     for node, scope in _walk_scopes(tree):
         if isinstance(node, ast.Import):
             for item in node.names:
@@ -261,8 +244,19 @@ def dynamic_uses(path):
                     uses.append((node.lineno, scope, "import(%s)" % item.name.split(".")[0], "site", None))
         elif isinstance(node, ast.ImportFrom):
             root = (node.module or "").split(".")[0]
-            if node.level == 0 and (root in LOADER_MODULES or (node.module == "sys" and any(i.name == "modules" for i in node.names))):
-                uses.append((node.lineno, scope, "import(%s)" % ("sys.modules" if node.module == "sys" else root), "site", None))
+            if node.level == 0 and root in LOADER_MODULES:
+                uses.append((node.lineno, scope, "import(%s)" % root, "site", None))
+            elif node.level == 0 and node.module == "sys":
+                for item in node.names:
+                    if item.name not in SAFE_SYS:   # modules, __dict__, *, and anything else that is not a plain attribute
+                        uses.append((node.lineno, scope, "import(sys.%s)" % item.name, "site", None))
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and id(node) not in consumed and node.id in sys_names and node.id not in bound:
+            above = parent.get(id(node))
+            if isinstance(above, ast.Attribute) and above.value is node:
+                if above.attr not in SAFE_SYS:
+                    uses.append((node.lineno, scope, "sys.modules" if above.attr == "modules" else "sys.%s" % above.attr, "site", None))
+            else:   # `m = sys`, `vars(sys)`, `getattr(sys, name)`: the module object itself
+                uses.append((node.lineno, scope, "sys(object)", "site", None))
         elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and id(node) not in consumed:
             if node.id in bound:
                 uses.append((node.lineno, scope, bound[node.id][0], "site", None))
@@ -279,8 +273,6 @@ def dynamic_uses(path):
                     relative = isinstance(first, ast.Constant) and isinstance(first.value, str) and (first.value.startswith(".") or len(call.args) > 1 or bool(call.keywords))
                     kind = node.id + ("(relative)" if relative else "(non-constant)")
                 uses.append((node.lineno, scope, kind, "site", None))
-        elif _is_sys_modules_read(node, sys_names):
-            uses.append((node.lineno, scope, "sys.modules", "site", None))
         elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and node.attr == "load_module" and id(node) not in consumed:
             call = call_of.get(id(node))   # `loader.load_module(n)`: the daemon's name for loading a module, on any object
             if call is None:
@@ -295,8 +287,6 @@ def dynamic_uses(path):
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr" and len(node.args) >= 2 \
                 and isinstance(node.args[1], ast.Constant) and node.args[1].value in NAMED_BY_STRING:
             uses.append((node.lineno, scope, "%s(string)" % node.args[1].value, "site", None))
-        elif _is_sys_modules_read(node, sys_names):
-            uses.append((node.lineno, scope, "sys.modules", "site", None))
     return sorted(uses, key=lambda u: (u[0], u[2], u[3]))
 
 
@@ -737,9 +727,17 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
         "sys.modules": ("import sys\n\ndef f(k, n):\n    return getattr(sys.modules['importlib'], k)(n)\n", ["f:sys.modules"]),
         "sys.modules imported by name": ("from sys import modules\n\ndef f(k):\n    return modules[k]\n", ["<module>:import(sys.modules)", "f:sys.modules"]),
         "sys.modules through an alias of sys": ("import sys as s\n\ndef f(k):\n    return s.modules[k]\n", ["f:sys.modules"]),
-        "getattr(sys, 'modules')": ("import sys\n\ndef f(k):\n    return getattr(sys, 'modules')[k]\n", ["f:sys.modules"]),
-        "vars(sys)['modules']": ("import sys\n\ndef f(k):\n    return vars(sys)['modules'][k]\n", ["f:sys.modules"]),
-        "sys.__dict__['modules']": ("import sys\n\ndef f(k):\n    return sys.__dict__['modules'][k]\n", ["f:sys.modules"]),
+        "getattr(sys, 'modules')": ("import sys\n\ndef f(k):\n    return getattr(sys, 'modules')[k]\n", ["f:sys(object)"]),
+        "getattr(sys, <variable>)": ("import sys\n\ndef f(k):\n    return getattr(sys, k)\n", ["f:sys(object)"]),
+        "vars(sys)['modules']": ("import sys\n\ndef f(k):\n    return vars(sys)['modules'][k]\n", ["f:sys(object)"]),
+        "vars(sys).get('modules')": ("import sys\n\ndef f():\n    return vars(sys).get('modules')\n", ["f:sys(object)"]),
+        "sys.__dict__['modules']": ("import sys\n\ndef f(k):\n    return sys.__dict__['modules'][k]\n", ["f:sys.__dict__"]),
+        "sys.__dict__.get('modules')": ("import sys\n\ndef f():\n    return sys.__dict__.get('modules')\n", ["f:sys.__dict__"]),
+        "sys bound to another name": ("import sys\nm = sys\n\ndef f(k):\n    return m.modules[k]\n", ["<module>:sys(object)"]),
+        "sys.modules off __import__('sys')": ("def f():\n    return __import__('sys').modules\n", ["f:import(sys)"]),
+        "sys.modules off import_module('sys')": ("import importlib\n\ndef f():\n    return importlib.import_module('sys').modules\n", [IM, "f:import(sys)"]),
+        "star import of sys": ("from sys import *\n", ["<module>:import(sys.*)"]),
+        "star import of a loader module": ("from importlib import *\n", [IM]),
         "load_module on an object": ("def f(loader, n):\n    return loader.load_module(n)\n", ["f:load_module(non-constant)"]),
         "load_module on a nested object": ("def f(s, n):\n    return s.loader.load_module(n)\n", ["f:load_module(non-constant)"]),
         "load_module on an object, relative": ("def f(loader):\n    return loader.load_module('.x', 'p')\n", ["f:load_module(relative)"]),
@@ -764,7 +762,7 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
                 for site, c in sorted(counts.items())]
 
     def test_every_dynamic_import_the_test_cannot_follow_is_a_listed_site_by_function_and_kind(self):
-        self.assertGreaterEqual(len(self.DYNAMIC_FORMS), 55)
+        self.assertGreaterEqual(len(self.DYNAMIC_FORMS), 65)
         for name, (source, sites) in self.DYNAMIC_FORMS.items():
             with self.subTest(form=name):
                 self.assertEqual(self.problems(parts={"low.py": source}), self.messages(sites))
@@ -783,6 +781,7 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
             "a local variable named like a module that is not imported": "def f(imp):\n    return imp.x\n",
             "re.compile": "import re\nP = re.compile('x')\n",
             "reload on another object": "def f(x):\n    return x.reload()\n",
+            "the plain attributes of sys": "import sys\n\ndef f():\n    sys.stderr.write(str(sys.argv))\n    sys.exit(1)\n",
         }
         for name, source in outside.items():
             with self.subTest(form=name):
