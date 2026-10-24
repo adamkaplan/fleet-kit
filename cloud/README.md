@@ -27,12 +27,13 @@ built in: `OPENCODE_SERVER_PASSWORD`, `GH_TOKEN` and any cloud identity are supp
 Ubuntu 24.04, Python 3 with pip and venv, git, Docker Engine with compose and buildx, `jq`, `opencode` v2, and Node 22 with npm and npx
 (`/opt/node`, root-owned, linked into `/usr/local/bin`). The recorded case: a lane's first database-lane test in a stack pod needed Node and
 npm, the image had neither, and the coder downloaded a Node tarball into its home directory at every launch. Node is now built in:
-the Dockerfile downloads the release for the image's architecture and checks it against the published `SHASUMS256.txt` with `sha256sum -c`
-BEFORE it unpacks; a mismatch fails the build. A repository's own prettier and eslint are its dev dependencies and run through `npx`; the image
+the Dockerfile pins the sha256 of the release tarball (`.tar.xz`) per architecture (x64, arm64) as constants beside `NODE_VERSION`, downloads
+the release for the image's architecture and checks it with `sha256sum -c` against the pinned value BEFORE it unpacks; a mismatch fails the build.
+No checksum list is downloaded and no checksum address can be overridden. The added image size was not measured. A repository's own prettier and eslint are its dev dependencies and run through `npx`; the image
 does not install them.
 
-To bump Node: edit `NODE_VERSION` (a full 22.x.y release; the only place the version is written, the checksum address is derived from it) at the
-top of the Node block in `cloud/worker/Dockerfile`, keep it equal to the product repository's `.node-version`, then rebuild and publish the image
+To bump Node: update `NODE_VERSION` (a full 22.x.y release; the only place the version is written) AND both sha256 constants (`NODE_SHA256_X64`,
+`NODE_SHA256_ARM64`) at the top of the Node block in `cloud/worker/Dockerfile`, keep the version equal to the product repository's `.node-version`, then rebuild and publish the image
 (an operator step) and record the previous digest as the rollback.
 
 ## Per-run secrets in the image
