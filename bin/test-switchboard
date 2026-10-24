@@ -17618,7 +17618,7 @@ class TestConflictCarryInTheDaemon(Base):
 
     def build(self, carry):
         impact = {"enabled": True, "carry_clear": carry} if carry is not None else {"enabled": True}
-        self.world = World(self, agents=(), config={"gh": FAKE_GH, "impact_hold": impact, "plan_evaluators": {"reviewer": ["rev1"]}})
+        self.world = World(self, agents=(), config={"gh": FAKE_GH, "impact_hold": impact, "plan_evaluators": {"reviewer": self.reviewers}})
         self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
         self.engine = self.world.new_engine("daemon")
         self.engine.gh_runner, self.engine.state_dir = self.route, self.world.state
@@ -87401,11 +87401,15 @@ class TestAskIssueSubject(unittest.TestCase):
         self.pr_readable = False
         self.caller = "coder1"
         self.pages = {"repos/%s/issues/1130/comments?per_page=100&page=1" % self.REPO: [{"id": 5, "created_at": "2026-01-01", "body": "## Plan (scenarios): x\n"}]}
-        self.issue = {"user": {"login": "human"}, "body": "ask", "state": "open"}
+        self.issue = {"user": {"login": "human"}, "body": "## Intent\nreport it\nDone when: reported\n", "state": "open", "parent_issue_url": "https://api.github.com/repos/acme-org/widget-service/issues/1000",
+                      "labels": []}
+        self.reviewers = ["rev1"]
 
     def api(self, path, repo=None):
         if path == "repos/%s/issues/1130" % self.REPO:
             return self.issue
+        if path.startswith("repos/other-org/gadget/issues/7"):
+            return dict(self.issue) if "/comments" not in path else []
         if path == "repos/%s/issues/9" % self.REPO:
             return {"pull_request": {"url": "x"}, "user": {"login": "a"}}
         if "/comments" in path and not self.has_plan:
@@ -87431,7 +87435,7 @@ class TestAskIssueSubject(unittest.TestCase):
             setattr(args, k, v)
         engine = types.SimpleNamespace(intents=types.SimpleNamespace(_api=self.api), audit=None, actor="t", herdr=None, v2=None,
                                        discover=lambda now: types.SimpleNamespace(agents={}), now=lambda: 1.0)
-        config = {"intent_repo": self.REPO, "plan_evaluators": {"reviewer": ["rev1"]}}
+        config = {"intent_repo": self.REPO, "plan_evaluators": {"reviewer": self.reviewers}}
         picture = ({"head": self.HEAD, "ci": "green"}, "PLAN: %s" % self.ASK, [], None) if self.pr_readable and subject == self.PR else (None, "", [], "no pull request found")
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(sb, "build_engine", lambda *a, **k: (engine, self.state, config)), mock.patch.object(sb, "pr_picture", lambda *a: picture), \
@@ -87514,6 +87518,88 @@ class TestAskIssueSubject(unittest.TestCase):
         with mock.patch.object(sb, "ask_plan_comment", lambda *a: "x"):
             self.assertEqual(self.prove("S1")[0], sb.EXIT_OK)
         self.assertEqual(len(self.entries()), 1)    # the refusal test above fails on it
+
+    def refused_everywhere(self, needle):
+        for command in ("prove", "judge"):
+            code, why, _, _ = getattr(self, command)("S1")
+            self.assertIsNone(code)
+            self.assertIn(needle, why)
+        code, why, _, _ = self.run_cmd("cmd_gates_ask_close")
+        self.assertIsNone(code)
+        self.assertIn(needle, why)
+        self.assertEqual(self.entries(), [])
+
+    def test_m1_a_closed_issue_is_refused(self):
+        self.issue["state"] = "closed"
+        self.refused_everywhere("is closed")
+
+    def test_m1_an_issue_with_no_done_when_is_refused(self):
+        self.issue["body"] = "## Intent\nreport it\n"
+        self.refused_everywhere("no `## Intent`")
+        self.issue["body"] = "just text"
+        self.refused_everywhere("no `## Intent`")
+
+    def test_m1_a_charter_is_refused_by_label_and_by_having_no_parent(self):
+        self.issue["labels"] = [{"name": "someone:orchestrator"}]
+        self.refused_everywhere("a charter (it carries")
+        self.issue["labels"] = []
+        del self.issue["parent_issue_url"]
+        self.refused_everywhere("no parent issue")
+
+    def test_m1_mutants_that_accept_each_case_record_one(self):
+        for change, key in (({"state": "closed"}, "state"), ({"body": "## Intent\nx\n"}, "body"), ({"labels": [{"name": "u:orchestrator"}]}, "labels")):
+            self.issue.update(change)
+            with mock.patch.object(sb, "ask_refusal", lambda *a: None):
+                self.assertEqual(self.prove("S1")[0], sb.EXIT_OK, key)
+            self.assertEqual(len(self.entries()), 1)    # the refusal tests above fail on it
+            self.setUp()
+
+    def test_m2_the_author_of_the_ask_may_not_record_the_verdict_but_may_prove(self):
+        self.reviewers = ["rev1", "human"]
+        self.caller = "human"
+        self.assertEqual(self.run_cmd("cmd_prove", scenario=["S1"])[0], sb.EXIT_OK)       # the author's step
+        self.caller = "human"
+        code, why, _, _ = self.run_cmd("cmd_verdict", scenario="S1")
+        self.assertIsNone(code)
+        self.assertIn("author of the ask", why)
+        self.assertEqual([e["kind"] for e in self.entries()], ["proof"])
+
+    def test_m2_the_author_alone_is_a_known_writer_so_another_agent_may_judge(self):
+        self.assertEqual(self.judge("S1")[0], sb.EXIT_OK)    # no proof recorded yet: the ask's author is the known writer
+
+    def test_m2_mutants_that_drop_the_author_fail_these_tests(self):
+        real = sb.plan_ledger.known_writers
+        with mock.patch.object(sb.plan_ledger, "known_writers", lambda entries, pr, senders=(): bool(real(entries, pr, ()))):
+            code, why, _, _ = self.judge("S1")
+        self.assertIsNone(code)          # the mutant refuses: "the author alone is a known writer" fails on it
+        self.assertIn("no writer", why)
+        self.reviewers = ["rev1", "human"]
+        self.prove("S1")
+        orig = sb.item_issue
+        def no_author(*a):
+            got = orig(*a)
+            return dict(got, author=None)
+        self.caller = "human"
+        with mock.patch.object(sb, "item_issue", no_author):
+            code, why = self.run_cmd("cmd_verdict", scenario="S1")[:2]
+        self.assertEqual(code, sb.EXIT_OK, why)   # the mutant lets the author judge: the refusal test above fails on it
+
+    def test_p1_every_subject_form_resolves_to_the_issue_or_is_refused_by_name(self):
+        for form in ("acme-org/widget-service#1130",):
+            self.assertEqual(self.prove("S1", subject=form)[0], sb.EXIT_OK)
+        for form in ("1130", "#1130", "https://github.com/acme-org/widget-service/issues/1130"):
+            for command in ("prove", "judge"):
+                code, why, _, _ = getattr(self, command)("S1", subject=form)
+                self.assertIsNone(code, form)
+                self.assertTrue(why, form)
+        self.assertEqual({e["pr"] for e in self.entries()}, {self.ASK})
+        code, why, _, _ = self.prove("S1", subject="https://github.com/acme-org/widget-service/pull/9")
+        self.assertNotIn("ask", (why or "").split("refused")[0])    # a pull request URL stays a pull request subject
+
+    def test_p2_another_repositorys_issue_is_resolved_or_refused_by_name(self):
+        code, why, _, _ = self.prove("S1", subject="other-org/gadget#7")
+        self.assertTrue(code == sb.EXIT_OK or why)
+        self.assertTrue(all(e["pr"] == "other-org/gadget#7" for e in self.entries()))
 
     def test_s7_the_docs_state_the_issue_subject_the_hash_binding_and_the_closing_rule(self):
         text = (Path(__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()

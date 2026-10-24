@@ -22179,8 +22179,11 @@ def plan_source_for(explicit, entries, pr, body, default_repo=None):
     return source or explicit
 
 
-def checked_plan(engine_config, source, ask, runner, now):
-    """The plan at `source`, checked: {"result", "defects", "scenarios_parsed", "plan_hash", "source"}."""
+def checked_plan(engine_config, source, ask, runner, now, text=None, done_when=None):
+    """The plan at `source`, checked: {"result", "defects", "scenarios_parsed", "plan_hash", "source"}. With `text` (a plan already read) nothing is read again."""
+    if text is not None:
+        parsed = plan_check.parse_scenarios(plan_check.scenario_block(text))
+        return dict(plan_check.check(text, done_when, None), scenarios_parsed=parsed, source="plan comment of %s" % source, text=text)
     ns = types.SimpleNamespace(source=source, file=None, ask=ask, done_when=None)
     text, label, result = load_plan(ns, runner, now)
     parsed = plan_check.parse_scenarios(plan_check.scenario_block(text))
@@ -22193,6 +22196,21 @@ def _ledger_pr(args):
     except NoticeError as err:
         raise LedgerCommandError(str(err)) from None
     return repo, number, "%s#%d" % (repo, number)
+
+
+def ask_refusal(issue, ref):
+    """#1130: why an issue is no ASK that may take a verdict (None when it is one). An ask is OPEN, carries `## Intent` and `Done when:`, is no charter (the
+    `<user>:orchestrator` label, as `item_chain` readers and the charter scan recognise one) and is a sub-issue of a charter (it has a parent)."""
+    if str(issue.get("state") or "").lower() == "closed":
+        return "%s is an issue, not a pull request, and it is closed: a closed issue takes no record" % ref
+    intent, done_when = parse_intent(issue.get("body"))
+    if not intent or not done_when:
+        return "%s is an issue, not a pull request, and has no `## Intent` with a `Done when:` line: it is not an ask" % ref
+    if any(str(l).endswith(":orchestrator") for l in issue.get("labels") or ()):
+        return "%s is an issue, not a pull request, and a charter (it carries the orchestrator label), not an ask" % ref
+    if not issue.get("parent"):
+        return "%s is an issue, not a pull request, and has no parent issue: a charter, not an ask (an ask is a sub-issue of a charter)" % ref
+    return None
 
 
 def ask_plan_comment(engine, repo, number):
@@ -22229,14 +22247,18 @@ def ask_subject(engine, repo, number, entries, unreadable, explicit, runner, now
             named = None
         if named != (repo, number):
             raise LedgerCommandError("--plan %s is not the plan of %s: an ask issue is bound to the plan comment on the issue itself" % (explicit, ref))
-    if ask_plan_comment(engine, repo, number) is None:
+    why = ask_refusal(issue, ref)
+    if why:
+        raise LedgerCommandError("refused: %s, nothing was recorded" % why)
+    comment = ask_plan_comment(engine, repo, number)   # read ONCE: the same read serves the check here and the hash below
+    if comment is None:
         if not writable:
             return {"facts": {"author": issue["author"], "ask_issue": True}, "plan": None,
                     "plan_problem": "%s is an issue with no plan comment: there is nothing to bind a record to" % ref}
         raise LedgerCommandError("refused: %s is an issue, not a pull request, and it has no plan comment: a record would bind to nothing, nothing was recorded" % ref)
     plan, problem = None, None
     try:
-        plan = checked_plan({}, ref, None, runner, now)
+        plan = checked_plan({}, ref, None, runner, now, text=comment, done_when=parse_intent(issue["body"])[1])
     except (PlanInputError, ValueError, ConfigError, IntentError) as err:
         problem = _one_line(str(err), 200)
     facts = {"author": issue["author"], "ask_issue": True, "notice_senders": [], "body": issue["body"], "state": issue["state"],
@@ -22426,6 +22448,8 @@ def cmd_verdict(args, runner, now):
             launch, sessions, fleets = launched_testers_for(ctx)
             allowed = load_launch_testers().evaluators(allowed, launch)
         ok, why = plan_ledger.may_record_verdict(named, caller, allowed, authors)
+        if getattr(ctx, "ask_issue", False) and caller and caller == ctx.facts.get("author"):   # #1130: the author of the ask may not judge it, as a PR's author may not
+            ok, why = False, "%s is the author of the ask %s: the author of an ask cannot record a verdict on it (`prove` is the author's step)" % (caller, ctx.pr)
         if ok and named == "tester" and caller in launch:
             why = load_launch_testers().lane_refusal(caller, launch, authors, sessions, fleets)
             ok = why is None
@@ -22703,8 +22727,9 @@ def item_issue(engine, repo, number):
     if data.get("pull_request"):
         raise LedgerCommandError("%s#%d is a pull request: use --pr (the pull request rules apply to it, not the work item rules)" % (repo, number))
     user = data.get("user") if isinstance(data.get("user"), dict) else {}
+    labels = [l.get("name") if isinstance(l, dict) else l for l in (data.get("labels") if isinstance(data.get("labels"), list) else [])]
     return {"author": user.get("login") if isinstance(user.get("login"), str) else None, "body": data.get("body") if isinstance(data.get("body"), str) else "",
-            "state": data.get("state"), "parent": parent_of(data)}
+            "state": data.get("state"), "parent": parent_of(data), "labels": [l for l in labels if isinstance(l, str)]}
 
 
 def item_chain(engine, repo, number, parent, limit=4):
