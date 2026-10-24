@@ -151,7 +151,8 @@ def helper_modules(entry_path):
 # modules or builtins (a module object handed in by a caller, `globals()[name]`): that is outside the stated rule.
 LOADER_MODULES = ("importlib", "pkgutil", "runpy", "pydoc", "imp", "zipimport", "builtins", "__builtins__")
 BUILTIN_NAMES = ("__import__", "exec", "eval", "compile", "load_module")
-NAMED_BY_STRING = BUILTIN_NAMES + ("import_module", "__builtins__", "builtins")   # a builtin named by a string key: a use of the builtin
+LOADING_NAMES = BUILTIN_NAMES + ("import_module", "__builtins__", "builtins")   # a loading builtin reached as an attribute of any object
+NAMED_BY_STRING = LOADING_NAMES + ("sys",) + LOADER_MODULES   # the loading builtins and the modules themselves, reached by a string key   # a builtin named by a string key: a use of the builtin
 FOLLOWED = ("__import__", "import_module", "load_module")   # followed only as a direct call with a constant string; every other use is a site
 
 
@@ -211,7 +212,7 @@ def _followed_primitive(func, bound):
         if func.attr == "load_module":
             return "load_module"
         base = func.value
-        if isinstance(base, ast.Name) and ((bound.get(base.id) or (base.id, None))[0] in ("importlib", "builtins", "__builtins__")):
+        if isinstance(base, ast.Name) and ((bound.get(base.id) or (base.id, None))[0] in ("importlib", "builtins")):
             return func.attr
     return None
 
@@ -276,7 +277,7 @@ def dynamic_uses(path):
                 uses.append((node.lineno, scope, kind, "site", None))
         elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and node.attr == "sys":   # `os.sys.modules`: the module object off another module
             uses.append((node.lineno, scope, "sys(object)", "site", None))
-        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and node.attr in NAMED_BY_STRING and id(node) not in consumed \
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and node.attr in LOADING_NAMES and id(node) not in consumed \
                 and not (node.attr == "compile" and isinstance(node.value, ast.Name) and node.value.id in ("re", "regex")) \
                 and not (isinstance(node.value, ast.Name) and (node.value.id in bound or node.value.id in ("builtins", "__builtins__"))):   # the module use is the site
             call = call_of.get(id(node))   # `obj.load_module(n)`, `g["__builtins__"].__import__(n)`, `.eval(t)`: a loading builtin reached on any object
@@ -527,9 +528,9 @@ class TestArchitectureDocument(unittest.TestCase):
 
     def test_the_document_names_every_module_and_builtin_the_dynamic_import_rule_uses(self):
         section = _section(self.text, "Dynamic imports not followed")
-        for name in LOADER_MODULES + BUILTIN_NAMES + ("sys.modules", "import_module"):
+        for name in LOADER_MODULES + BUILTIN_NAMES + ("sys", "sys.modules", "import_module"):
             with self.subTest(name=name):
-                self.assertIn(name, section, "the rule uses %s: the document must name it" % name)
+                self.assertRegex(section, r"(?<![\w.])%s(?![\w])" % re.escape(name), "the rule uses %s: the document must name it, as a whole word" % name)
 
     def test_the_entry_is_the_only_unit_of_layer_six_and_every_part_is_below_it(self):
         units, _allowed = parse_document(self.text)
@@ -728,7 +729,7 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
         # round 3: the module is the unit of the rule, however it is reached
         "getattr on an alias of the module": ("import importlib as il\n\ndef f(k, n):\n    return getattr(il, k)(n)\n", [IM, "f:importlib"]),
         "module bound to another name": ("import importlib\nm = importlib\n\ndef f(k, n):\n    return getattr(m, k)(n)\n", [IM, "<module>:importlib"]),
-        "sys.modules": ("import sys\n\ndef f(k, n):\n    return getattr(sys.modules['importlib'], k)(n)\n", ["f:sys.modules"]),
+        "sys.modules": ("import sys\n\ndef f(k, n):\n    return getattr(sys.modules['importlib'], k)(n)\n", ["f:sys.modules", "f:importlib(string)"]),
         "sys.modules imported by name": ("from sys import modules\n\ndef f(k):\n    return modules[k]\n", ["<module>:import(sys.modules)", "f:sys.modules"]),
         "sys.modules through an alias of sys": ("import sys as s\n\ndef f(k):\n    return s.modules[k]\n", ["f:sys.modules"]),
         "getattr(sys, 'modules')": ("import sys\n\ndef f(k):\n    return getattr(sys, 'modules')[k]\n", ["f:sys(object)"]),
@@ -738,8 +739,8 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
         "sys.__dict__['modules']": ("import sys\n\ndef f(k):\n    return sys.__dict__['modules'][k]\n", ["f:sys.__dict__"]),
         "sys.__dict__.get('modules')": ("import sys\n\ndef f():\n    return sys.__dict__.get('modules')\n", ["f:sys.__dict__"]),
         "sys bound to another name": ("import sys\nm = sys\n\ndef f(k):\n    return m.modules[k]\n", ["<module>:sys(object)"]),
-        "sys.modules off __import__('sys')": ("def f():\n    return __import__('sys').modules\n", ["f:import(sys)"]),
-        "sys.modules off import_module('sys')": ("import importlib\n\ndef f():\n    return importlib.import_module('sys').modules\n", [IM, "f:import(sys)"]),
+        "sys.modules off __import__('sys')": ("def f():\n    return __import__('sys').modules\n", ["f:import(sys)", "f:sys(string)"]),
+        "sys.modules off import_module('sys')": ("import importlib\n\ndef f():\n    return importlib.import_module('sys').modules\n", [IM, "f:import(sys)", "f:sys(string)"]),
         "sys off another module": ("import os\n\ndef f(k):\n    return os.sys.modules[k]\n", ["f:sys(object)"]),
         "sys imported from another module": ("from os import sys as s\n\ndef f(k):\n    return s.modules[k]\n", ["f:sys.modules"]),
         "builtins by the string key, then __import__": ("def f():\n    return globals()['__builtins__'].__import__('x')\n", ["f:__builtins__(string)", "f:__import__(non-constant)"]),
@@ -754,6 +755,12 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
         "the builtin by its string key through itemgetter": ("import operator\n\ndef f(n):\n    return operator.itemgetter('__import__')(globals())(n)\n", ["f:__import__(string)"]),
         "a loading builtin as a dict key": ("TABLE = {'compile': 1}\n", ["<module>:compile(string)"]),
         "a constant name with **kwargs": ("import importlib\n\ndef f(kw):\n    return importlib.import_module('high', **kw)\n", [IM, "f:importlib"]),
+        "sys by the string key": ("import sys\n\ndef f(k):\n    return globals()['sys'].modules[k]\n", ["f:sys(string)"]),
+        "sys by getattr on another module": ("import os\n\ndef f():\n    return getattr(os, 'sys').modules\n", ["f:sys(string)"]),
+        "sys by vars of another module": ("import os\n\ndef f():\n    return vars(os)['sys']\n", ["f:sys(string)"]),
+        "a loader module by its string key": ("def f(g):\n    return g['importlib']\n", ["f:importlib(string)"]),
+        "a loader module named by getattr": ("def f(g):\n    return getattr(g, 'pkgutil')\n", ["f:pkgutil(string)"]),
+        "__builtins__ with a constant __import__": ("def f():\n    return __builtins__.__import__('high')\n", ["f:__builtins__"]),
         "star import of sys": ("from sys import *\n", ["<module>:import(sys.*)"]),
         "star import of a loader module": ("from importlib import *\n", [IM]),
         "load_module on an object": ("def f(loader, n):\n    return loader.load_module(n)\n", ["f:load_module(non-constant)"]),
