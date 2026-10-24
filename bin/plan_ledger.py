@@ -11,12 +11,16 @@ Two halves, both free of GitHub, v2 and the clock (the caller passes what it rea
 
 The rules that need a decision of policy are inputs, not choices made here: who may be an evaluator is configuration.
 """
+import errno
 import fcntl
 import hashlib
 import json
 import os
 import re
+import signal
+import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -26,15 +30,72 @@ GENESIS = "0" * 64
 EVIDENCE_KINDS = ("proof", "verdict", "consensus", "waiver")   # a consensus entry is written by the plan review engine (a later slice)
 REVIEW_KINDS = ("round", "lane_session", "lane", "response", "escalation", "decision", "abandoned", "reminder", "review_record")   # the plan review engine's records (#109)
 ITEM_KINDS = ("item_tester",)   # #770: the registration of a tester for a work item that has no pull request; written by `launch` only (bin/item_verdicts.py)
-KINDS = EVIDENCE_KINDS + REVIEW_KINDS + ITEM_KINDS
+CARRY_KINDS = ("carried",)   # #1129: a proof or verdict that holds at a new head (see `carry_decision`); its own line, the original row is never touched
+KINDS = EVIDENCE_KINDS + REVIEW_KINDS + ITEM_KINDS + CARRY_KINDS
 RESULTS = ("pass", "fail")
 EVIDENCE_LIMIT = 500
 FIELD_LIMIT = 200
 EVALUATOR_ALIASES = {"adam": "owner"}
 
+# THE bound of every wait of a recording command (`prove`, `verdict`, `review record`): the ledger lock, each GitHub read, the agent registry. One
+# number, read at the time of the wait (never a copy): a command that has not recorded within it says so and names the read-only check (#1049).
+RECORD_WAIT_SECONDS = 30
+RECORD_PROGRESS_SECONDS = 3   # a wait this long says what it waits for
+LOCK_STEP = "the ledger lock"
+IN_CRITICAL = False   # True while an entry is being written: the command's own alarm is held back, so a timeout never hides a record that landed
+step_hook = None      # the recording command's: called with what is being waited for
+
 
 class LedgerError(Exception):
     """The ledger cannot be written or read as it must be."""
+
+
+class LedgerRefused(LedgerError):
+    """A record the ledger refuses to write (#1049): nothing was written."""
+
+
+class LedgerLockTimeout(LedgerError):
+    """The ledger lock was not free within RECORD_WAIT_SECONDS: nothing was written."""
+
+
+def _lock_exclusive(fd):
+    """flock(LOCK_EX) bounded by RECORD_WAIT_SECONDS: polls, says what it waits for after RECORD_PROGRESS_SECONDS, and raises
+    LedgerLockTimeout at the bound. A wait with no end is how a recording command once timed out without a word."""
+    started, said, wait = time.monotonic(), False, RECORD_WAIT_SECONDS
+    if step_hook is not None:
+        step_hook(LOCK_STEP)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as err:
+            if err.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                raise
+        waited = time.monotonic() - started
+        if waited >= wait:
+            raise LedgerLockTimeout("timed out after %ds waiting for %s" % (wait, LOCK_STEP))
+        if not said and waited >= min(RECORD_PROGRESS_SECONDS, wait):
+            said = True
+            sys.stderr.write("fleet-switchboard: waiting for %s (another process holds it; giving up after %ds)\n" % (LOCK_STEP, wait))
+            sys.stderr.flush()
+        time.sleep(0.05)
+
+
+@contextmanager
+def _critical():
+    """Hold the recording command's alarm back while an entry is written (the signal stays pending and the handler drops it while IN_CRITICAL)."""
+    global IN_CRITICAL
+    try:
+        before = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+    except (AttributeError, ValueError, OSError):
+        yield
+        return
+    IN_CRITICAL = True
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, before)   # a pending alarm is delivered here, while IN_CRITICAL still says to drop it
+        IN_CRITICAL = False
 
 
 def _canonical(entry):
@@ -116,7 +177,7 @@ def append_checked(state_dir, now, build):
     path = Path(state_dir) / LEDGER_FILE
     fd = os.open(str(path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        _lock_exclusive(fd)
         entries, problem = read_ledger(state_dir)
         if problem:
             raise LedgerError("the ledger is not trustworthy, nothing was recorded: %s" % problem)
@@ -143,7 +204,7 @@ def append_many(state_dir, entries_in, now):
     path = Path(state_dir) / LEDGER_FILE
     fd = os.open(str(path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        _lock_exclusive(fd)
         have, problem = read_ledger(state_dir)
         if problem:
             raise LedgerError("the ledger is not trustworthy, nothing was recorded: %s" % problem)
@@ -171,7 +232,7 @@ def append_many_checked(state_dir, build, now):
     path = Path(state_dir) / LEDGER_FILE
     fd = os.open(str(path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        _lock_exclusive(fd)
         have, problem = read_ledger(state_dir)
         if problem:
             raise LedgerError("the ledger is not trustworthy, nothing was recorded: %s" % problem)
@@ -194,6 +255,84 @@ def append_many_checked(state_dir, build, now):
     finally:
         os.close(fd)
     return stored
+
+
+# What makes two records the SAME record (#1049): the identity (kind, pull request, head, scenario, evaluator or reviewer, and who recorded it: two testers'
+# identical verdicts are two records) and what was judged. The newest entry of an identity decides: a pass after a fail at one head is a new record (readers take the latest), a retry of the newest is not.
+JUDGED_FIELDS = {
+    "proof": ("result", "plan_hash"),
+    "verdict": ("result", "plan_hash"),
+    "review_record": ("verdict", "blocks", "notes", "impact_action", "impact_class", "impact_severity", "impact_probability", "carry_confirmed", "block_sha256"),
+}
+RECORDED_KINDS = tuple(JUDGED_FIELDS)   # the kinds the recording commands write: derived by the tests from the commands
+
+
+def record_identity(entry):
+    # a proof is the author's step: the same proof by another agent is the same record; a verdict or a review by another agent is its own fact
+    return (entry.get("kind"), entry.get("pr"), entry.get("head"), entry.get("scenario"), entry.get("evaluator") or entry.get("reviewer"),
+            None if entry.get("kind") == "proof" else entry.get("by"))
+
+
+STALE_PASS_REASON = "a newer fail is recorded at this head: re-test at a new head or waive"
+
+
+def stale_pass(entries, entry):
+    """True when `entry` is a pass whose key already holds a pass, with a newer fail after it: writing it would flip the verdict back (#1049)."""
+    if entry.get("kind") not in EVIDENCE_KINDS or entry.get("result") != "pass":
+        return False
+    ident = record_identity(entry)
+    same = [e for e in entries if record_identity(e) == ident]
+    if not same or same[-1].get("result") != "fail":
+        return False
+    return any(e.get("result") == "pass" and e.get("plan_hash") == entry.get("plan_hash") for e in same)
+
+
+def already_recorded(entries, entry):
+    """The newest entry with the same identity as `entry` when it also judged the same thing, else None."""
+    ident = record_identity(entry)
+    newest = next((e for e in reversed(entries) if record_identity(e) == ident), None)
+    if newest is None or any(newest.get(f) != entry.get(f) for f in JUDGED_FIELDS.get(entry.get("kind"), ())):
+        return None
+    return newest
+
+
+def append_once(state_dir, entries_in, now):
+    """`append_many` that never records the same record twice: under the exclusive lock, an entry whose identity's newest entry judged the same thing
+    is not written. Returns [(entry, already)] in order: the stored entry, and True when it was already there (nothing written for it). The new ones
+    are written with ONE write, or none; the command's alarm is held back from the lock to the end of the write."""
+    for entry in entries_in:
+        if entry.get("kind") not in KINDS or (entry.get("kind") in EVIDENCE_KINDS and entry.get("result") not in RESULTS):
+            raise LedgerError("an entry is a proof, a verdict, a consensus or a waiver with a result of pass or fail, or a plan review record")
+    path = Path(state_dir) / LEDGER_FILE
+    fd = os.open(str(path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        _lock_exclusive(fd)
+        with _critical():
+            have, problem = read_ledger(state_dir)
+            if problem:
+                raise LedgerError("the ledger is not trustworthy, nothing was recorded: %s" % problem)
+            out, fresh, prev = [], [], have[-1]["hash"] if have else GENESIS
+            for entry in entries_in:
+                found = already_recorded(have + fresh, entry)
+                if found is not None:
+                    out.append((found, True))
+                    continue
+                if stale_pass(have + fresh, entry):
+                    raise LedgerRefused(STALE_PASS_REASON)
+                one = dict(entry, seq=len(have) + len(fresh) + 1, ts=int(now), prev=prev)
+                one["hash"] = entry_hash(one)
+                fresh.append(one)
+                prev = one["hash"]
+                out.append((one, False))
+            if fresh:
+                data = "".join(json.dumps(one, sort_keys=True, ensure_ascii=False) + "\n" for one in fresh).encode("utf-8")
+                if os.write(fd, data) != len(data):
+                    raise LedgerError("the ledger write was short: nothing was recorded")
+                os.fsync(fd)
+                _write_head(state_dir, fresh[-1])
+    finally:
+        os.close(fd)
+    return out
 
 
 # ----------------------------------------------------------------------------------- who may do what
@@ -226,6 +365,12 @@ def authors_of(entries, pr, notice_senders=(), github_author=None):
     names.update(notice_senders)
     names.add(github_author)
     return {n for n in names if n}
+
+
+def ask_head(plan_hash):
+    """#1130: the "head" an ask issue's record carries: the first 40 hex digits of the plan hash (`sha256:<hex>`). A revised plan has another hash, so the
+    record is void exactly as a pull request's is when its head moves."""
+    return str(plan_hash).split(":", 1)[-1][:40]
 
 
 def known_writers(entries, pr, notice_senders=()):
@@ -338,11 +483,14 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
     only for THIS plan hash and THIS head; one for another is shown as void, not hidden."""
     sid, evaluator = scenario["id"], evaluator_of(scenario)
     out = {"id": sid, "evaluator": evaluator, "claim": claim_of(scenario), "missing": [], "void": []}
+    carried = carried_seqs(entries, pr, head)   # #1129: {seq of the proof or verdict: its carried line}
     for kind in ("proof", "verdict"):
         mine = [e for e in entries if e.get("pr") == pr and e.get("scenario") == sid and e.get("kind") == kind
                 and (kind == "proof" or e.get("evaluator") == evaluator)]
-        fresh = [e for e in mine if e.get("plan_hash") == plan_hash and e.get("head") == head]
+        fresh = [e for e in mine if e.get("plan_hash") == plan_hash and (e.get("head") == head or e.get("seq") in carried)]
         newest = fresh[-1] if fresh else None
+        if newest and newest.get("head") != head:
+            out.setdefault("carried", []).append(carried_view(newest, carried[newest["seq"]]))
         if not newest and mine:
             why = "plan changed" if mine[-1].get("plan_hash") != plan_hash else "head moved"
             out["void"].append("%s #%d void: %s" % (kind, mine[-1]["seq"], why))
@@ -360,6 +508,56 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
         out["missing"].append("the verdict is by an author of the PR (not accepted)")
     out["status"] = "ok" if not out["missing"] else "missing"
     return out
+
+
+# ----------------------------------------------------------------------------------- the carry of a proof (#1129)
+
+CARRY_EVALUATORS = ("tester", "live", "reviewer")   # the types of proof that may carry; `ci` ids are re-recorded by the daemon, never carried
+CARRY_FIELDS = ("proof", "scenario", "old_head", "new_head", "facts")
+DOC_TEST_RE = re.compile(r"(^|/)(tests?|docs?)/|(^|/)test-[^/]*$|(^|/)test_[^/]*$|\.(md|rst|txt)$")
+
+
+def carried_seqs(entries, pr, head):
+    """{seq of a proof or verdict: its `carried` line} for the carries of `pr` whose new head is `head`. Empty without a head."""
+    found = {}
+    for entry in entries if head else ():
+        if entry.get("kind") == "carried" and entry.get("pr") == pr and entry.get("new_head") == head and isinstance(entry.get("proof"), int):
+            found[entry["proof"]] = entry
+    return found
+
+
+def carried_view(row, line):
+    """What the gate shows of a carried proof: the ORIGINAL head the proof was recorded at, and the carry line that holds it here."""
+    return {"proof": row["seq"], "original_head": row.get("head"), "carried_line": line["seq"], "new_head": line["new_head"]}
+
+
+def is_tests_docs_only(files):
+    return bool(files) and all(DOC_TEST_RE.search(str(f)) for f in files)
+
+
+def carry_decision(row, evaluator, files_changed, merge_of_default, ci_green):
+    """(verdict, reason) for one proof or verdict `row` and a new head: verdict is "carry", "void" (a file the proof names is touched) or "refuse".
+    All three conditions are required: (a) none of the files the proof names is in `files_changed`; (b) the new head is a merge of the default branch or its
+    difference is tests and documentation only; (c) CI is green at the new head. A proof proven by CI, of another type, or naming no file is never carried."""
+    named = [f for f in (row.get("files") or ()) if isinstance(f, str) and f]
+    if evaluator not in CARRY_EVALUATORS:
+        return "refuse", "a %s proof is not carried (CI ids are re-recorded at each green head)" % evaluator
+    if not named:
+        return "refuse", "the proof names no file: it is never carried"
+    touched = sorted(set(named) & set(files_changed))
+    if touched:
+        return "void", "the difference touches a file the proof names: %s" % ", ".join(touched)
+    if not (merge_of_default or is_tests_docs_only(files_changed)):
+        return "refuse", "the difference is code outside a merge of the default branch"
+    if ci_green is not True:
+        return "refuse", "CI is not green at the new head"
+    return "carry", "carried"
+
+
+def carry_line(row, scenario, old_head, new_head, merge_of_default, pr):
+    """The ONE ledger line of a carry: the proof, the old head, the new head and the three facts. The proof's own row is never rewritten."""
+    return {"kind": "carried", "pr": pr, "proof": row["seq"], "scenario": scenario, "plan_hash": row.get("plan_hash"), "old_head": old_head, "new_head": new_head,
+            "facts": {"named_files_untouched": True, "difference": "merge of the default branch" if merge_of_default else "tests and documentation only", "ci": "green"}}
 
 
 CARRIES_LINE_RE = re.compile(r"(?mi)^[ \t]*CARRIES:.*$")
@@ -668,6 +866,8 @@ def render_gates(report, pr):
     for s in report.get("scenarios", []):
         for note in s["void"]:
             lines.append("  %s: %s" % (s["id"], note))
+        for view in s.get("carried") or ():   # #1129: a carried proof is shown with the head it was recorded at
+            lines.append("  %s: carried: row #%d recorded at %s, held here by carried line #%d" % (s["id"], view["proof"], str(view["original_head"])[:8], view["carried_line"]))
     rating = report.get("impact_rating")
     if isinstance(rating, dict):
         lines.append("  " + impact_rating_line(rating, report.get("head")))
