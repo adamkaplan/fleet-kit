@@ -27358,6 +27358,7 @@ def cmd_charter(args, runner, now):
             parent = engine.intents.parent(value, repo0)   # None only for the "no parent" answer; any other failure raises
             labelled = None
             if parent is None:   # a charter has no parent: the one extra read is its label
+                engine.intents.invalidate(value, repo0)   # #1249: the label read is never a cached answer
                 labelled = orchestrator_label(engine.config) in (engine.intents.issue(value, repo0).labels or [])
             pre = {"key": (value, repo0), "parent": parent, "labelled": labelled}
         except Exception as err:
