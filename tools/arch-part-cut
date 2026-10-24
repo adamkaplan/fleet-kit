@@ -25,6 +25,13 @@ def main(argv=None):
     text = open(args.entry, encoding="utf-8").read()
     lines = text.split("\n")
     tree = ast.parse(text)
+    listed = {line.strip() for line in open(args.manifest, encoding="utf-8").read().splitlines() if line.strip() and not line.lstrip().startswith("#")}
+    names = [spec.split(":")[0] for spec in args.cuts]
+    for name in names:
+        if "switchboard/%s.py" % name in listed:
+            sys.exit("%s: a part of that name is already listed in %s: a cut never overwrites a part" % (name, args.manifest))
+    if len(set(names)) != len(names):
+        sys.exit("a part name is given twice")
     cuts = []
     for spec in args.cuts:
         name, first, last = spec.split(":")
