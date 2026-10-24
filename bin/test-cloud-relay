@@ -36,6 +36,7 @@ BIN = Path(__file__).resolve().parent
 sys.path.insert(0, str(BIN))
 import cloud_channel_server  # noqa: E402
 import cloud_hub  # noqa: E402
+import cloud_relay  # noqa: E402
 import plan_ledger  # noqa: E402
 
 REPO, OTHER_REPO, ISSUE = "acme-org/widget-service", "acme-org/widget-api", 7
@@ -69,7 +70,7 @@ class FakeDaemon:
         self.roles = {n: r for n, (_, r) in PODS.items() if r}
         self.github_author = {PR: "evalcoder"}      # evalcoder opened the PR (and holds an evaluator role: S15/S19)
         self.audit, self.reports, self.done, self.stop = [], [], set(), False
-        self.index_path = self.state / "relay-callids.json"
+        self.index_path = self.state / "relay_calls.json"
         self.thread = threading.Thread(target=self.loop, daemon=True)
 
     # ---- pull loop
@@ -134,7 +135,7 @@ class FakeDaemon:
         pod, call = req["pod"], req["call"]
         if "body_name" in self.mut and isinstance(call.get("by"), str):
             pod = call["by"]
-        key = call["call_id"] if "global_callids" in self.mut else pod + "\x00" + call["call_id"]
+        key = call["call_id"] if "global_callids" in self.mut else pod + "\n" + call["call_id"]
         seen = self.index().get(key)
         if seen:
             return 200, "replay", seen
@@ -186,7 +187,7 @@ class FakeDaemon:
             "scenario": args.get("scenario", "S1"), "evidence": evidence, "call_id": call["call_id"]})
         record = {"seq": stored["seq"], "hash": stored["hash"]}
         index = self.index()
-        index[call["call_id"] if "global_callids" in self.mut else pod + "\x00" + call["call_id"]] = record
+        index[call["call_id"] if "global_callids" in self.mut else pod + "\n" + call["call_id"]] = record
         self.index_path.write_text(json.dumps(index))
         self.audit.append({"kind": kind, "pod": pod, "seq": stored["seq"]})
         return record
@@ -198,11 +199,11 @@ class Harness:
         t = self.t = Path(self.tmp.name)
         (t / "state").mkdir()
         (t / "pw").write_text("pw\n")
-        (t / "secrets.json").write_text(json.dumps({n: sha(s) for n, (s, _) in PODS.items()}))
+        (t / "secrets.json").write_text(json.dumps(dict({n: sha(s) for n, (s, _) in PODS.items()}, ghost=sha("s-ghost"))))   # ghost: a valid secret, no repo binding
         agents = {n: {"url": "http://127.0.0.1:9", "session": "ses_" + n.replace("-", "_"), "password_file": str(t / "pw"),
                       "issue": i, "repo": REPO if n != "coder2" else REPO} for n, i in ISSUES.items()}
         (t / "agents.json").write_text(json.dumps(agents))
-        self.hub_lines, self.port, self.server = [], 0, None
+        self.hub_lines, self.port, self.server, self.mutations = [], 0, None, set(mutations)
         self.start_hub()
         self.daemon = FakeDaemon(t / "state", lambda: self.port, mutations).start()
 
@@ -210,7 +211,13 @@ class Harness:
         """The one place that builds the real hub. Keeps the port across a restart (state lives in the daemon, not the hub)."""
         reviewer = cloud_hub.make_secrets_reviewer(str(self.t / "secrets.json"))
         inbox = cloud_hub.Inbox(str(self.t / "agents.json"), timeout=2)
-        self.server = cloud_hub.make_hub(("127.0.0.1", self.port), reviewer, inbox, self.hub_lines.append, str(self.t / "decisions.json"))
+        agents_path = str(self.t / "agents.json")
+        relay = cloud_relay.Relay(lambda: cloud_hub._read_json(agents_path, {}), wait=20)
+        if "body_name" in self.mutations:   # mutant of the hub: the name claimed in the body overrides the secret's pod
+            real_submit = relay.submit
+            relay.submit = lambda pod, body: real_submit(body.get("by") if isinstance(body, dict) and isinstance(body.get("by"), str) else pod, body)
+        self.server = cloud_hub.make_hub(("127.0.0.1", self.port), reviewer, inbox, self.hub_lines.append, str(self.t / "decisions.json"),
+                                         relay=relay, daemon=DAEMON)
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
@@ -347,7 +354,7 @@ class TestRelayHappy(Base):
         self.assertEqual(s, 200)
         self.assertEqual(self.h.daemon.reports, [("coder", "hello")])
         before = self.h.snapshot()
-        s, body = self.h.relay("coder", "gates", head=None, args={})
+        s, body = self.h.relay("coder", "gates", call_id="c2", head=None, args={})
         self.assertEqual(s, 200)
         self.assertTrue(reason_of(body) or body.get("report"), body)
         self.assertEqual(self.h.snapshot(), before)
@@ -434,7 +441,7 @@ class TestRefusals(Base):
         before = h.snapshot()
         big = json.dumps({"call_id": "big", "command": "report", "pr": PR, "args": {"text": "x" * cloud_channel_server.MAX_BODY}}).encode()
         cases = {
-            "unknown pod": lambda: h.raw("ghost", b"{}", secret="who"),
+            "unknown pod": lambda: h.raw("ghost", b"{}", secret="s-ghost"),
             "wrong secret": lambda: h.relay("coder", "prove", secret="wrong"),
             "wrong repo": lambda: h.relay("coder", "prove", call_id="a", pr="%s#12" % OTHER_REPO),
             "wrong issue": lambda: h.relay("coder2", "prove", call_id="b"),
