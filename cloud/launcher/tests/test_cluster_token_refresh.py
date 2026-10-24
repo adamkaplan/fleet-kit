@@ -595,6 +595,224 @@ class TheServiceFile(Refresh):
         self.assertNotIn("CW_CLUSTER_TOKEN_RETRY", text)
 
 
+class MintGuards(Refresh):
+    """Ask #1060 review: the mint command's program, account, duration and namespace are fixed or checked; the child's environment is minimal;
+    the retry gap is pinned on a fake clock, forwards and backwards. Each guard has a mutant that fails its test."""
+
+    def outcome(self, module=None, env=None, duration="30m"):
+        """The failure kind of one mint ("ok" when it made a token), through the given build of the module."""
+        module = module or cw
+        try:
+            module.cluster_token(env if env is not None else self.env, duration, now=self.clock().timestamp())
+        except Exception as e:   # the mutant module has a ClusterLogin class of its own
+            return getattr(e, "kind", type(e).__name__)
+        return "ok"
+
+    def mutate(self, old, new, count=1):
+        self.assertIn(old, SOURCE)
+        text = SOURCE.replace(old, new)
+        self.assertNotEqual(text, SOURCE)   # the mutation applied
+        return mutant_module(text)
+
+    def settings_file(self, mode, text="CW_VAULT_NAME=acme-vault\n"):
+        directory = os.path.join(self.tmp.name, "cfg", cw.CONFIG_DIR_NAME)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        os.chmod(os.path.dirname(directory), 0o700)
+        os.chmod(directory, 0o700)
+        path = os.path.join(directory, cw.SETTINGS_FILE_NAME)
+        with open(path, "w") as f:
+            f.write(text)
+        os.chmod(path, mode)
+        self.env["XDG_CONFIG_HOME"] = os.path.join(self.tmp.name, "cfg")
+        return path
+
+    # -- the program --
+    def test_a_program_that_is_not_an_absolute_checked_file_is_refused_with_no_vault_read(self):
+        writable = self.write_fake("writable-kubectl", FAKE_KUBECTL)
+        os.chmod(writable, 0o775)
+        plain = os.path.join(self.bin, "not-executable")
+        with open(plain, "w") as f:
+            f.write("x")
+        for value in ("sh", "kubectl", "./kubectl", "bin/kubectl", os.path.join(self.bin, "missing"), self.bin, writable, plain):
+            with self.subTest(value=value):
+                env = dict(self.env, CW_KUBECTL=value)
+                self.assertEqual(self.outcome(env=env), "kubectl-refused")
+                self.assertEqual(self.vault_reads(), [])
+
+    def test_a_link_to_a_good_absolute_file_is_allowed(self):
+        link = os.path.join(self.bin, "kubectl-link")
+        os.symlink(os.path.join(self.bin, "kubectl"), link)
+        self.assertEqual(self.outcome(env=dict(self.env, CW_KUBECTL=link)), "ok")
+
+    def test_with_no_setting_the_fixed_list_is_searched_in_order(self):
+        self.assertEqual(cw.MINT_KUBECTL_PATHS, ("/opt/homebrew/bin/kubectl", "/usr/local/bin/kubectl", "/usr/bin/kubectl"))
+        env = dict(self.env)
+        del env["CW_KUBECTL"]
+        found = [p for p in cw.MINT_KUBECTL_PATHS if os.path.isfile(p)]
+        if found:
+            self.assertEqual(cw.mint_kubectl(env), os.path.realpath(found[0]))
+        else:
+            self.assertEqual(self.outcome(env=env), "kubectl-refused")   # none of the fixed places holds one: nothing is searched on PATH
+            self.assertEqual(self.vault_reads(), [])
+
+    def test_the_mutant_that_accepts_any_program_fails(self):
+        env = dict(self.env, CW_KUBECTL="sh")
+        self.assertEqual(self.outcome(env=env), "kubectl-refused")
+        module = self.mutate("if _kubectl_problem(setting):", "if False:")
+        self.assertNotEqual(self.outcome(module, env), "kubectl-refused")
+
+    # -- the namespace --
+    def test_a_namespace_that_is_not_a_dns_label_is_refused_with_no_vault_read(self):
+        for value in ("c w", "cw;ls", "CW", "-cw", "cw-", "a" * 64, "cw\n", "cw.x", "$(x)"):
+            with self.subTest(value=value):
+                self.assertEqual(self.outcome(env=dict(self.env, CW_CLOUD_NAMESPACE=value)), "namespace-refused")
+                self.assertEqual(self.vault_reads(), [])
+        for value in ("cw", "a", "a" * 63, "acme-1"):
+            with self.subTest(value=value):
+                self.assertNotEqual(self.outcome(env=dict(self.env, CW_CLOUD_NAMESPACE=value)), "namespace-refused")
+
+    def test_the_mutant_that_skips_the_namespace_check_fails(self):
+        env = dict(self.env, CW_CLOUD_NAMESPACE="CW")
+        self.assertEqual(self.outcome(env=env), "namespace-refused")
+        module = self.mutate('if not _NAMESPACE_LABEL.fullmatch(namespace) or "\\n" in namespace:', "if False:")
+        self.assertNotEqual(self.outcome(module, env), "namespace-refused")
+
+    # -- the fixed command --
+    def mint_argv(self, module=None, expect="ok"):
+        env = dict(self.env, CW_ACCOUNT="acme-admin", CW_CLUSTER_ACCOUNT="acme-admin", CW_TOKEN_ACCOUNT="acme-admin", CW_OPERATOR="acme-admin",
+                   CW_CLUSTER_TOKEN_DURATION="5m", CW_CLUSTER_TOKEN_ARGS="--audience=x", CW_KUBECTL_ARGS="get pods")
+        self.assertEqual(self.outcome(module, env), expect)
+        return [e["argv"] for e in self.token_log()][-1]
+
+    def test_no_setting_changes_the_account_the_duration_or_the_subcommand(self):
+        argv = self.mint_argv()
+        self.assertEqual([a for a in argv if not a.startswith("/dev/fd/")],
+                         ["--kubeconfig", "-n", "cw", "create", "token", "cw-operator", "--duration=30m"])
+        self.assertTrue(argv[1].startswith("/dev/fd/"))
+
+    def test_the_mutant_that_reads_the_account_from_the_environment_fails(self):
+        self.assertIn("cw-operator", self.mint_argv())
+        module = self.mutate('MINT_ACCOUNT, "--duration=%dm"', 'env.get("CW_ACCOUNT", MINT_ACCOUNT), "--duration=%dm"')
+        # the fake cluster answers only for cw-operator: the mutant's other account never reaches the token log and the mint fails
+        self.mint_argv(module, expect="mint-failed")
+        self.assertEqual(self.token_log()[1:], [])
+
+    # -- the settings file --
+    def test_a_settings_file_that_others_can_write_refuses_the_custom_commands(self):
+        for name, value in (("CW_CLUSTER_ADMIN_CMD", "echo x"), ("CW_CLUSTER_TOKEN_CMD", "echo x"), ("CW_KUBECTL", os.path.join(self.bin, "kubectl"))):
+            with self.subTest(name=name):
+                self.settings_file(0o660)
+                env = dict(self.env, **{name: value})
+                self.assertEqual(self.outcome(env=env), "settings-untrusted")
+                self.assertEqual(self.vault_reads(), [])
+        self.settings_file(0o600)   # the same file, private: the command is honoured
+        self.assertNotEqual(self.outcome(env=dict(self.env, CW_CLUSTER_TOKEN_CMD="echo x")), "settings-untrusted")
+        self.assertEqual(cw.REFRESH_REASONS["settings-untrusted"].split(":")[0][:21], "the settings file is ")
+
+    def test_the_mutant_that_skips_the_settings_file_check_fails(self):
+        self.settings_file(0o660)
+        env = dict(self.env, CW_CLUSTER_TOKEN_CMD="echo x")
+        self.assertEqual(self.outcome(env=env), "settings-untrusted")
+        module = self.mutate('if problem:\n            raise ClusterLogin("settings-untrusted")', "if False:\n            raise ClusterLogin(\"settings-untrusted\")")
+        self.assertNotEqual(self.outcome(module, env), "settings-untrusted")
+
+    # -- the child's environment --
+    def child_envs(self):
+        out = [e["env"] for e in self.token_log()]
+        with open(self.vault_log + ".env") as f:
+            out += [json.loads(l) for l in f if l.strip()]
+        return out
+
+    def planted(self):
+        return dict(self.env, FAKE_SECRET_VAR="s" + "x" * 12, GITHUB_TOKEN="g" + "y" * 12, CW_HUB_PASSWORD="h" + "z" * 12, LANG="C.UTF-8")
+
+    def test_the_child_gets_a_minimal_environment(self):
+        self.assertEqual(self.outcome(env=self.planted()), "ok")
+        found = self.child_envs()
+        self.assertEqual(len(found), 2)
+        for child in found:
+            self.assertNotIn("FAKE_SECRET_VAR", child)
+            self.assertNotIn("GITHUB_TOKEN", child)
+            self.assertFalse([k for k in child if k.startswith(("CW_", "FAKE_"))], sorted(child))
+            self.assertEqual(child["KUBECONFIG"], "/dev/null")
+            self.assertEqual(child["PATH"], "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+            self.assertEqual(child["HOME"], self.home)
+            self.assertLessEqual(set(child), {"PATH", "HOME", "LANG", "KUBECONFIG", "AZURE_CONFIG_DIR", "LC_CTYPE"}, sorted(child))
+        self.assertNotIn("AZURE_CONFIG_DIR", found[0])
+
+    def test_the_az_settings_directory_passes_only_when_the_person_set_it(self):
+        self.assertEqual(self.outcome(env=dict(self.env, AZURE_CONFIG_DIR="/home/acme/.azure")), "ok")
+        self.assertTrue(all(c.get("AZURE_CONFIG_DIR") == "/home/acme/.azure" for c in self.child_envs()))
+
+    def test_the_mutant_that_passes_the_whole_environment_fails(self):
+        module = self.mutate("env=child_env", "env=env")
+        self.assertEqual(self.outcome(module, self.planted()), "ok")
+        self.assertTrue(any("FAKE_SECRET_VAR" in c for c in self.child_envs()))
+
+    def test_the_mutant_that_drops_the_empty_kubeconfig_fails(self):
+        module = self.mutate('"KUBECONFIG": os.devnull', '"KUBECONFIG_X": os.devnull')
+        self.assertEqual(self.outcome(module), "ok")
+        self.assertTrue(any(c.get("KUBECONFIG") != "/dev/null" for c in self.child_envs()))
+
+    def test_the_token_command_limit_is_a_named_constant_of_a_sane_value(self):
+        self.assertEqual(cw.TOKEN_CMD_SECONDS, 60)
+        self.assertIn("timeout=TOKEN_CMD_SECONDS", SOURCE)
+
+    # -- the token file --
+    def test_a_token_file_that_others_can_read_counts_as_expired(self):
+        self.write_token_file(make_token(self.exp))
+        self.assertGreater(cw.token_file_life_left(self.token_file, self.clock().timestamp()), 3000)
+        os.chmod(self.token_file, 0o644)
+        self.assertIsNone(cw.token_file_life_left(self.token_file, self.clock().timestamp()))
+
+    # -- the retry gap, on a fake clock --
+    def failing(self, module=None):
+        self.set_vault("fail")
+        module = module or cw
+        return module.ClusterTokenRefresher(self.env, self.clock)
+
+    def gap_run(self, module=None):
+        """A failed refresh, then +60 s, then +301 s: the vault reads after each step."""
+        refresher = self.failing(module)
+        refresher.run()
+        first = len(self.vault_reads())
+        self.clock.advance(seconds=60)
+        refresher.run()
+        second = len(self.vault_reads())
+        self.clock.advance(seconds=241)   # 301 s after the failure
+        refresher.run()
+        return first, second, len(self.vault_reads())
+
+    def test_the_retry_gap_holds_for_300_seconds_then_reads_the_vault_once(self):
+        self.assertEqual(self.gap_run(), (1, 1, 2))
+
+    def test_both_gap_mutants_fail(self):
+        for old, new in (("self.last_failure = (now, reason)", "self.last_failure = None"),
+                         ("0 <= now - self.last_failure[0] < CLUSTER_TOKEN_RETRY_SECONDS", "now - self.last_failure[0] < 0")):
+            with self.subTest(mutant=new):
+                self.reset()
+                text = SOURCE.replace(old, new)
+                self.assertNotEqual(text, SOURCE)
+                self.assertNotEqual(self.gap_run(mutant_module(text)), (1, 1, 2))
+
+    def test_a_clock_that_jumps_back_an_hour_retries(self):
+        refresher = self.failing()
+        refresher.run()
+        self.assertEqual(len(self.vault_reads()), 1)
+        self.clock.advance(seconds=-3600)
+        refresher.run()
+        self.assertEqual(len(self.vault_reads()), 2)
+
+    def test_the_mutant_without_the_lower_bound_fails_the_backwards_clock_test(self):
+        text = SOURCE.replace("0 <= now - self.last_failure[0] < CLUSTER_TOKEN_RETRY_SECONDS", "now - self.last_failure[0] < CLUSTER_TOKEN_RETRY_SECONDS")
+        self.assertNotEqual(text, SOURCE)
+        refresher = self.failing(mutant_module(text))
+        refresher.run()
+        self.clock.advance(seconds=-3600)
+        refresher.run()
+        self.assertEqual(len(self.vault_reads()), 1)   # the real build reads twice (the test above)
+
+
 class TheRunner(unittest.TestCase):
     """S12: the new file is chained in the launcher's test runner and the completeness check is happy."""
 
