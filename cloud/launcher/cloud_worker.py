@@ -48,7 +48,11 @@ CLUSTER_TOKEN_MAX_SECONDS = 3600       # the cap: a cluster token lives at most 
 CLUSTER_TOKEN_DURATION = "60m"         # the reaper's requested life: the cap, so a pass that stops a worker never meets an expiry
 CLUSTER_TOKEN_REFRESH_MARGIN_SECONDS = 1200   # the reaper's margin: the file is renewed when less than 20 minutes are left (about every 40 minutes)
 CLUSTER_TOKEN_RETRY_SECONDS = 300      # after a failed refresh: the next attempt is no sooner than this (the vault is read at most every 5 minutes)
-TOKEN_CMD_SECONDS = 60                 # a vault read or a mint: its own run limit
+TOKEN_CMD_SECONDS = 60                 # a vault read or a mint: its own run limit (seconds; a test pins it)
+MINT_ACCOUNT = "cw-operator"           # the ONE account the mint step makes a token for: fixed in code, no setting changes it
+MINT_KUBECTL_PATHS = ("/opt/homebrew/bin/kubectl", "/usr/local/bin/kubectl", "/usr/bin/kubectl")   # searched in order when CW_KUBECTL is not set
+MINT_PATH = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"   # the PATH of the mint step's children
+_NAMESPACE_LABEL = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")   # a DNS-1123 label: the namespace
 # What a vault refusal FOR THE FIREWALL looks like: the text the vault's client prints for its data plane. Matched case-insensitively in the error
 # text only (never printed). Any other vault error (no permission, no such secret, not signed in, unreachable) matches neither.
 FIREWALL_MARKERS = ("client address is not authorized and caller is not a trusted service", "forbiddenbyfirewall")
@@ -770,6 +774,66 @@ def token_expiry(token):
     return claims[0] if claims else None
 
 
+def mint_env(env):
+    """The environment of the mint step's children (az, kubectl, sh -c): minimal. A fixed PATH, HOME, LANG, the az settings directory only when
+    the person set it, and KUBECONFIG=/dev/null. Nothing else: no token, no CW_ setting, no other variable of the reaper."""
+    out = {"PATH": MINT_PATH, "HOME": env.get("HOME") or "", "LANG": env.get("LANG") or "C.UTF-8", "KUBECONFIG": os.devnull}
+    if env.get("AZURE_CONFIG_DIR"):
+        out["AZURE_CONFIG_DIR"] = env["AZURE_CONFIG_DIR"]
+    return out
+
+
+def mint_minutes(duration):
+    """The requested minutes of the token, as an integer, from "Nm" (or "Nh"); ClusterLogin("duration-refused") otherwise."""
+    m = re.fullmatch(r"([0-9]{1,3})([mh])", str(duration))
+    if not m:
+        raise ClusterLogin("duration-refused")
+    minutes = int(m.group(1)) * (60 if m.group(2) == "h" else 1)
+    if not 1 <= minutes <= CLUSTER_TOKEN_MAX_SECONDS // 60:
+        raise ClusterLogin("duration-refused")
+    return minutes
+
+
+def _kubectl_problem(path):
+    """None when `path` is an absolute path to an existing regular executable file (after links) that is not group- or world-writable."""
+    if not path or not os.path.isabs(path):
+        return "is not an absolute path"
+    real = os.path.realpath(path)
+    try:
+        info = os.stat(real)
+    except OSError:
+        return "does not exist"
+    if not stat.S_ISREG(info.st_mode) or not os.access(real, os.X_OK):
+        return "is not an executable file"
+    if info.st_mode & 0o022:
+        return "is group- or world-writable"
+    return None
+
+
+def mint_kubectl(env):
+    """The kubectl the mint step runs: CW_KUBECTL when set (an absolute path, checked), else the first of MINT_KUBECTL_PATHS that passes.
+    A bare name, a relative path or a program that fails the check is refused (ClusterLogin("kubectl-refused")); nothing is read before."""
+    setting = (env.get("CW_KUBECTL") or "").strip()
+    if setting:
+        if _kubectl_problem(setting):
+            raise ClusterLogin("kubectl-refused")
+        return os.path.realpath(setting)
+    for path in MINT_KUBECTL_PATHS:
+        if _kubectl_problem(path) is None:
+            return path
+    raise ClusterLogin("kubectl-refused")
+
+
+def settings_file_problem(env):
+    """None when there is no settings file or it is private to this user (the launcher's own check: regular, owned by the user, mode 0600);
+    else the reason. Used before a custom command or program from the settings is honoured."""
+    try:
+        _read_settings_file(settings_path(env))
+    except CloudError as e:
+        return str(e)
+    return None
+
+
 def cluster_token(env, duration, capture=None, now=None, recovery=None):
     """THE cluster login: a token for the namespaced operator account, in memory, at most an hour.
 
@@ -782,23 +846,34 @@ def cluster_token(env, duration, capture=None, now=None, recovery=None):
     clock = time.time() if now is None else now
     capture = capture or capture_command
     custom = (env.get("CW_CLUSTER_TOKEN_CMD") or "").strip()
+    admin = (env.get("CW_CLUSTER_ADMIN_CMD") or "").strip()
+    if custom or admin or (env.get("CW_KUBECTL") or "").strip():
+        problem = settings_file_problem(env)   # a custom command or program is honoured only while the settings file is private to this user
+        if problem:
+            raise ClusterLogin("settings-untrusted")
+    child_env = mint_env(env)
     if custom:
-        ran = capture(["sh", "-c", custom], env=env)
+        ran = capture(["sh", "-c", custom], env=child_env)
         if ran is None or ran[0] != 0:
             raise ClusterLogin("token-command-failed")
         token = ran[1].strip()
     else:
-        admin = (env.get("CW_CLUSTER_ADMIN_CMD") or "").strip()
+        minutes = mint_minutes(duration)
+        namespace = (env.get("CW_CLOUD_NAMESPACE") or "cw")
+        if not _NAMESPACE_LABEL.fullmatch(namespace) or "\n" in namespace:
+            raise ClusterLogin("namespace-refused")
+        kubectl = mint_kubectl(env)   # every refusal is BEFORE the vault is read
         if admin:
             argv = ["sh", "-c", admin]
         else:
             sub, vault = (env.get("CW_VAULT_SUBSCRIPTION") or "").strip(), (env.get("CW_VAULT_NAME") or "").strip()
             if not sub or not vault:
                 raise ClusterLogin("vault-settings-missing")
-            argv = ["az", "keyvault", "secret", "show", "--subscription", sub, "--vault-name", vault,
+            az = shutil.which("az", path=env.get("PATH") or MINT_PATH) or "az"
+            argv = [az, "keyvault", "secret", "show", "--subscription", sub, "--vault-name", vault,
                     "--name", env.get("CW_CLUSTER_ADMIN_SECRET") or "cw-cluster-admin-kubeconfig", "--query", "value", "-o", "tsv"]
         def read():
-            return capture(argv, env=env)
+            return capture(argv, env=child_env)
         ran = read()
         recovered = False
         if recovery is not None and not admin and firewall_refused(ran):   # only the default vault read, only a firewall refusal, once
@@ -807,8 +882,9 @@ def cluster_token(env, duration, capture=None, now=None, recovery=None):
         if ran is None or ran[0] != 0 or not ran[1].strip() or len(ran[1]) > 1000000:
             raise ClusterLogin("admin-unreadable", firewall=firewall_refused(ran), recovered=recovered)
         admin_config = ran[1]
-        minted = capture([env.get("CW_KUBECTL", "kubectl"), "--kubeconfig", "/dev/fd/{fd}", "-n", env.get("CW_CLOUD_NAMESPACE", "cw"), "create",
-                          "token", "cw-operator", "--duration=" + duration], env=dict(env, KUBECONFIG=os.devnull), feed=admin_config)
+        # The command is fixed in code: only the program (an absolute, checked path), the namespace (a DNS label) and the minutes come from outside.
+        minted = capture([kubectl, "--kubeconfig", "/dev/fd/{fd}", "-n", namespace, "create", "token", MINT_ACCOUNT, "--duration=%dm" % minutes],
+                         env=child_env, feed=admin_config)
         del admin_config
         if minted is None or minted[0] != 0:
             raise ClusterLogin("mint-failed")
@@ -831,6 +907,9 @@ def token_file_life_left(path, now):
     empty, unreadable or unreadable-as-a-token file counts as expired)."""
     try:
         with open(path) as f:
+            info = os.fstat(f.fileno())
+            if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                return None   # not the user's own private file: it counts as expired (and is replaced by a private one)
             body = f.read(65536)
     except OSError:
         return None
@@ -883,6 +962,10 @@ REFRESH_REASONS = {
     "not-a-token": "the answer is not a token",
     "too-long": "the token lives over the 60 minutes allowed",
     "token-command-failed": "the token command failed",
+    "settings-untrusted": "the settings file is not private to this user (mode 0600, owned by the user): its custom commands are refused",
+    "kubectl-refused": "the mint program is not an absolute path to a plain executable file (CW_KUBECTL)",
+    "namespace-refused": "the namespace is not a DNS label (CW_CLOUD_NAMESPACE)",
+    "duration-refused": "the requested token life is not a whole number of minutes",
 }
 FIREWALL_REASON = "the vault refused this machine"   # the firewall refused this machine: the launch path's own words
 
@@ -968,7 +1051,7 @@ class ClusterTokenRefresher:
         if not self.enabled():
             return TokenRefresh("skipped")   # another login kind: nothing is read and nothing is written
         now = self.clock().timestamp()
-        if self.last_failure is not None and now - self.last_failure[0] < CLUSTER_TOKEN_RETRY_SECONDS:
+        if self.last_failure is not None and 0 <= now - self.last_failure[0] < CLUSTER_TOKEN_RETRY_SECONDS:   # a negative gap (the clock went back) counts as expired
             return TokenRefresh("waiting", self.last_failure[1])   # the retry gap: no new attempt yet
         path = self.path()
         life = token_file_life_left(path, now)

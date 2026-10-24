@@ -54,11 +54,15 @@ def make_token(exp):
 FAKE_AZ = '''#!/usr/bin/env python3
 """A fake vault client for the reaper's refresh tests: it prints the administrator kubeconfig (assembled at run time) or fails."""
 import os, sys
-mode = open(os.environ["FAKE_VAULT_MODE"]).read().strip() if os.environ.get("FAKE_VAULT_MODE") else "ok"
-seed = os.environ.get("FAKE_ADMIN_SEED", "acme-admin")
+import json as _json, os as _os
+_cfg = _json.load(open(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "fake.json")))   # the fakes' settings: the mint step's child gets no such variables
+mode = open(_cfg["FAKE_VAULT_MODE"]).read().strip() if _cfg.get("FAKE_VAULT_MODE") else "ok"
+seed = _cfg.get("FAKE_ADMIN_SEED", "acme-admin")
 value = %s
-with open(os.environ["FAKE_VAULT_LOG"], "a") as f:
+with open(_cfg["FAKE_VAULT_LOG"], "a") as f:
     f.write(" ".join(sys.argv[1:]) + "\\n")
+with open(_cfg["FAKE_VAULT_LOG"] + ".env", "a") as f:
+    f.write(_json.dumps(dict(os.environ), sort_keys=True) + "\\n")
 if mode == "fail":
     sys.stderr.write("ERROR: (Forbidden) the vault refused this request\\n")
     sys.exit(1)
@@ -73,6 +77,8 @@ sys.stdout.write(value + "\\n")
 FAKE_KUBECTL = '''#!/usr/bin/env python3
 """A fake kubectl for the reaper's refresh tests: the one `create token` command, and the pod calls (the repository's own fake)."""
 import base64, hashlib, json, os, sys
+import json as _json, os as _os
+_cfg = _json.load(open(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "fake.json")))   # the fakes' settings: the mint step's child gets no such variables
 
 args = sys.argv[1:]
 if args and args[0] == "--kubeconfig" and "cw-operator" in args:
@@ -85,16 +91,16 @@ if args and args[0] == "--kubeconfig" and "cw-operator" in args:
         seen["admin_sha256"] = hashlib.sha256(body.strip().encode()).hexdigest()
     except OSError:
         pass
-    with open(os.environ["FAKE_TOKEN_LOG"], "a") as f:
+    with open(_cfg["FAKE_TOKEN_LOG"], "a") as f:
         f.write(json.dumps(seen, sort_keys=True) + "\\n")
-    mode = os.environ.get("FAKE_TOKEN_MODE", "ok")
+    mode = _cfg.get("FAKE_TOKEN_MODE", "ok")
     if mode == "refuse":
         sys.stderr.write("Error from server (Forbidden): tokens is forbidden\\n")
         sys.exit(1)
     if mode == "garbage":
         sys.stdout.write("not a token at all\\n")
         sys.exit(0)
-    exp = int(os.environ.get("FAKE_TOKEN_EXP", "0"))
+    exp = int(_cfg.get("FAKE_TOKEN_EXP", "0"))
     payload = base64.urlsafe_b64encode(json.dumps({"exp": exp}, sort_keys=True, separators=(",", ":")).encode()).decode().rstrip("=")
     sys.stdout.write("%s." + payload + ".%s")
     sys.exit(0)
@@ -172,6 +178,7 @@ class Refresh(base.Base):
         }
         with open(self.env["FAKE_KUBE_STATE"], "w") as f:
             json.dump({"pods": {}}, f)
+        self.sync_fakes()
         for path in (self.token_file, self.vault_log, self.token_log_path, self.env["CW_CLOUD_AUDIT"]):
             if os.path.exists(path):
                 os.unlink(path)
@@ -188,8 +195,14 @@ class Refresh(base.Base):
         with open(self.vault_mode, "w") as f:
             f.write(mode)
 
+    def sync_fakes(self):
+        """The fakes read their settings from a file beside them (the mint step's child has no FAKE_ variable)."""
+        with open(os.path.join(self.bin, "fake.json"), "w") as f:
+            json.dump({k: v for k, v in self.env.items() if k.startswith("FAKE_")}, f)
+
     def set_token_mode(self, mode):
         self.env["FAKE_TOKEN_MODE"] = mode
+        self.sync_fakes()
 
     def token_log(self):
         """What the fake cluster saw of the one token command."""
