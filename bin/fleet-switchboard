@@ -12497,6 +12497,8 @@ def sweep_gate_reading(engine, repo, number, now):
             return None, None, None, _one_line("the plan could not be read: %s" % ctx.plan_problem, 120)
         if ctx.problem:   # a corrupt ledger makes G1 untrustworthy: not checked
             return None, None, None, _one_line("the ledger could not be read: %s" % ctx.problem, 120)
+        if ((ctx.facts or {}).get("carries") or {}).get("unreadable"):   # the dependency named by CARRIES: could not be read: not checked
+            return None, None, None, "the carried dependency could not be read"
         if (ctx.facts or {}).get("body_unreadable"):   # a body that is not text: G5 and the held-body check would say missing
             return None, None, None, "the body could not be read"
         report = plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr, now=now)
@@ -21006,6 +21008,7 @@ def carries_context(engine, config, repo, number, facts, body, entries, runner, 
         dep = pr_facts_from(raw)
     except (NoticeError, AttributeError) as err:
         out["refusal"] = "%s could not be read: %s" % (dep_pr, _one_line(str(err), 120))
+        out["unreadable"] = True   # #986: S5 counts a pull request whose dependency could not be read as not checked
         return out
     if str(raw.get("state")).upper() == "MERGED":
         return None

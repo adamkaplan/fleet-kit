@@ -28663,9 +28663,9 @@ class TestSweep(Base):
         for name, (old, new) in pairs:
             self.assertIn(old, inspect.getsource(getattr(sb, name)), name)
 
-    def real_reading(self, gates, head=HEAD_A, unreadable=None, draft=False, floor=None, enforced=("G6",), clear=None, boom=None, mutant=None, plan_problem=None, problem=None, body_unreadable=False, captain=False):
+    def real_reading(self, gates, head=HEAD_A, unreadable=None, draft=False, floor=None, enforced=("G6",), clear=None, boom=None, mutant=None, plan_problem=None, problem=None, body_unreadable=False, captain=False, carries=None):
         """sweep_gate_reading run for real over a fake context (gates table) and a fake who-can-clear answer."""
-        ctx = types.SimpleNamespace(unreadable=unreadable, facts=dict({"head": head} if head else {}, draft=draft, captain=captain, body_unreadable=body_unreadable, **({"floor": floor} if floor is not None else {})), plan=None, entries=[], problem=problem, plan_problem=plan_problem, pr="acme/api#600")
+        ctx = types.SimpleNamespace(unreadable=unreadable, facts=dict({"head": head} if head else {}, draft=draft, captain=captain, body_unreadable=body_unreadable, **({"carries": carries} if carries else {}), **({"floor": floor} if floor is not None else {})), plan=None, entries=[], problem=problem, plan_problem=plan_problem, pr="acme/api#600")
         report = {"gates": [{"gate": g, "status": st} for g, st in gates], "ready": all(st == "ok" for _, st in gates)}
 
         def context(*a, **k):
@@ -28705,6 +28705,8 @@ class TestSweep(Base):
         "plan_unreadable": dict(gates=[("G0a", "missing"), ("G6", "open")], plan_problem="HTTP 502", check=lambda self, r: self.assertEqual((r[:3], bool(r[3])), ((None, None, None), True))),
         "ledger_corrupt": dict(gates=[("G1", "missing"), ("G6", "open")], problem="not JSON", check=lambda self, r: self.assertEqual((r[:3], bool(r[3])), ((None, None, None), True))),
         "body_unreadable": dict(gates=[("G5", "missing"), ("G6", "open")], body_unreadable=True, check=lambda self, r: self.assertEqual((r[:3], bool(r[3])), ((None, None, None), True))),
+        "carries_unreadable": dict(gates=[("G0a", "missing"), ("G6", "open")], carries={"pr": "acme/api#5", "refusal": "could not be read", "unreadable": True}, check=lambda self, r: self.assertEqual((r[:3], bool(r[3])), ((None, None, None), True))),
+        "carries_refused_is_not_ready": dict(gates=[("G0a", "missing"), ("G6", "open")], carries={"pr": "acme/api#5", "refusal": "closed unmerged"}, check=lambda self, r: self.assertEqual(r[0], ["G0a", "G6"])),
         "floor_none_and_hold_all": dict(gates=[("G6", "waiting")], floor={"decision": None, "unreadable": None, "rehold": "a clear for another head", "holds": ["hold-all"]}, check=lambda self, r: self.assertEqual((r[:3], bool(r[3])), ((None, None, None), True))),
         "floor_wrong_type": dict(gates=[("G6", "waiting")], floor="hold", check=lambda self, r: self.assertEqual((r[:3], bool(r[3])), ((None, None, None), True))),
         "floor_absent_label_set": dict(gates=[("G6", "waiting")], captain=True, check=lambda self, r: self.assertEqual((r[0], r[1]), (["G6"], self.HEAD_A))),
@@ -28727,6 +28729,8 @@ class TestSweep(Base):
         "plan_unreadable": ("if ctx.plan_problem:", "if False:"),
         "ledger_corrupt": ("if ctx.problem:", "if False:"),
         "body_unreadable": ('if (ctx.facts or {}).get("body_unreadable"):', "if False:"),
+        "carries_unreadable": ('if ((ctx.facts or {}).get("carries") or {}).get("unreadable"):', "if False:"),
+        "carries_refused_is_not_ready": ('if ((ctx.facts or {}).get("carries") or {}).get("unreadable"):', 'if (ctx.facts or {}).get("carries"):'),
         "floor_none_and_hold_all": ('if isinstance(floor, dict) and floor.get("decision") is None:', 'if isinstance(floor, dict) and floor.get("decision") is None and not floor.get("rehold"):'),
         "floor_wrong_type": ("if floor is not None and not isinstance(floor, dict):", "if False:"),
         "floor_absent_label_set": ("if floor is not None and not isinstance(floor, dict):", "if not isinstance(floor, dict):"),

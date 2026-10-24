@@ -2315,13 +2315,14 @@ fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["the o
 | `body_unreadable` | NOT CHECKED | the body is unread, not empty |
 | `captain` | None means no marker; a held PR is read through the floor and the labels | the sweep row is the held fact; a missing marker makes G6 not open: NOT READY |
 | `holds` | None means no hold label; same as captain | same |
+| `carries` | a dependency (`CARRIES: #N`) that could not be read is NOT CHECKED; a refused one (closed unmerged, head not in the branch, no plan, a compare that fails) is NOT READY | a read error is not a refusal; a refusal opens a gate, and each extra read (the dependency view, compare, its plan) is counted by the runner and charged |
 | `floor` | NOT CHECKED when None-decision (with or without a hold-all or re-hold), unreadable, re-hold unreadable or not a dict; absent with the label set: the label alone holds, the reading goes on; absent with no label: G6 not open, NOT READY | an unreadable floor would say G6 waiting, a false ready |
 | `held_check` | a raising check is NOT CHECKED (exception); a missing one on a held PR is G6b missing: NOT READY | the one `held_defects` check, local |
 | `reviews` | view field, not read by the gate board (the ledger's review records are) | listed so a future reader of it needs a row |
 | `labels` | view field reduced to `captain` and `holds` | same |
 | `runs` | view field reduced to `ci` | same |
 
-S5 fact audit: 19 fact keys read by `evaluate_gates`, `_ledger_context`, `pr_picture` and `sweep_gate_reading`, 4 external calls (PR view, plan fetch, floor view, `clear_who`): each has a row above and a test (script `test_986_every_fact_the_gates_read_has_a_row_in_the_table`).
+S5 fact audit: 20 fact keys read by `evaluate_gates`, `_ledger_context`, `pr_picture` and `sweep_gate_reading`, 4 external calls (PR view, plan fetch, floor view, `clear_who`): each has a row above and a test (script `test_986_every_fact_the_gates_read_has_a_row_in_the_table`).
 
 History (#986): a captain-row-alone S5 case (a cos-tier `captain` row with nothing else) is judged by its gates, not by the row's age; the one existing test line that expected it to fire from the row alone was edited.
 
