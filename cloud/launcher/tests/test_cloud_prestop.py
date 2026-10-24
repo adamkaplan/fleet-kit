@@ -355,6 +355,269 @@ class Hostile(Base):
             sh("git", "-C", self.work, *safe, "clean", "-qfd")
 
 
+# GRAMMAR TABLE: every class of git configuration key that can redirect a remote, run a program, change what is sent or to whom, or include
+# another file. {HOST} is the host prefix, {OTHER} a second remote, {SCRIPT} a marker-writing script, {INC} a file with a hostile url rule.
+HOSTILE_URL = "https://other.example/x/y.git"
+CFG_G, CFG_S = "GIT_CONFIG_" + "GLOBAL", "GIT_CONFIG_" + "SYSTEM"
+GRAMMAR = {
+    "redirect a remote": [
+        ("remote.origin.url", HOSTILE_URL), ("remote.origin.pushurl", HOSTILE_URL), ("remote.evil.url", HOSTILE_URL),
+        ("remote.evil.pushurl", HOSTILE_URL), ("url.{OTHER}.insteadOf", "{HOST}"), ("url.{OTHER}.pushInsteadOf", "{HOST}"),
+        ("branch.main.remote", "evil"), ("branch.main.pushRemote", "evil"), ("remote.pushDefault", "evil"), ("push.default", "current")],
+    "run a program": [
+        ("core.hooksPath", "{SCRIPT}"), ("core.sshCommand", "{SCRIPT}"), ("core.fsmonitor", "{SCRIPT}"), ("core.askPass", "{SCRIPT}"),
+        ("core.gitProxy", "{SCRIPT}"), ("core.pager", "{SCRIPT}"), ("core.editor", "{SCRIPT}"), ("credential.helper", "!{SCRIPT}"),
+        ("credential.https://github.com.helper", "!{SCRIPT}"), ("filter.evil.clean", "{SCRIPT}"), ("filter.evil.smudge", "{SCRIPT}"),
+        ("filter.evil.process", "{SCRIPT}"), ("diff.evil.textconv", "{SCRIPT}"), ("diff.evil.command", "{SCRIPT}"),
+        ("merge.evil.driver", "{SCRIPT}"), ("gpg.program", "{SCRIPT}"), ("sendemail.smtpServer", "{SCRIPT}"), ("alias.push", "!{SCRIPT}"),
+        ("protocol.ext.allow", "always"), ("protocol.allow", "always"), ("uploadpack.packObjectsHook", "{SCRIPT}"),
+        ("remote.origin.receivepack", "{SCRIPT}"), ("remote.origin.uploadpack", "{SCRIPT}")],
+    "change what is sent or to whom": [
+        ("http.proxy", "http://other.example:3128"), ("http.https://github.com/.proxy", "http://other.example:3128"),
+        ("http.extraHeader", "X-Evil: 1"), ("http.https://github.com/.extraHeader", "X-Evil: 1"), ("http.followRedirects", "true"),
+        ("http.sslCAInfo", "/tmp/evil-ca"), ("http.sslVerify", "false"), ("http.cookieFile", "/tmp/evil-cookies"),
+        ("credential.useHttpPath", "false"), ("credential.username", "evil"), ("http.curloptResolve", "github.com:443:127.0.0.1"),
+        ("http.proxyAuthMethod", "basic")],
+    "include another file": [("include.path", "{INC}"), ("includeIf.gitdir:/.path", "{INC}")],
+}
+DANGEROUS_ENV = {"GIT_CONFIG": "/dev/null", "GIT_DIR": "/nonexistent", "GIT_WORK_TREE": "/nonexistent", "GIT_INDEX_FILE": "/nonexistent",
+                 "GIT_ASKPASS": "/bin/false", "SSH_ASKPASS": "/bin/false", "GIT_SSH": "/bin/false", "GIT_SSH_COMMAND": "false",
+                 "GIT_EXTERNAL_DIFF": "/bin/false", "GIT_PAGER": "false", "GIT_PROXY_COMMAND": "false", "all_proxy": "http://other.example",
+                 "ALL_PROXY": "http://other.example", "http_proxy": "http://other.example", "HTTPS_PROXY": "http://other.example",
+                 "https_proxy": "http://other.example", "XDG_CONFIG_HOME": "/tmp/nowhere", "GIT_TERMINAL_PROMPT": "1"}
+
+
+class Grammar(Base):
+    """Completeness of the allow-list against the grammar table, and the reader's named exploits, each with mutants."""
+
+    def setUp(self):
+        super().setUp()
+        self.marker = os.path.join(self.t, "marker")
+        self.calls = os.path.join(self.t, "calls")
+        self.envlog = os.path.join(self.t, "envlog")
+        self.script = os.path.join(self.t, "script")
+        open(self.script, "w").write("#!/bin/sh\necho ran >> %s\nexit 1\n" % self.marker)
+        os.chmod(self.script, 0o755)
+        self.host = "file://%s/" % self.t
+        self.other = "file://%s/other-remote/" % self.t
+        self.inc = os.path.join(self.t, "included")
+        open(self.inc, "w").write('[url "%s"]\n\tinsteadOf = %s\n\tpushInsteadOf = %s\n' % (self.other, self.host, self.host))
+        self.cfg = os.path.join(self.work, ".git", "config")
+        self.plain = open(self.cfg).read()
+        self.base_head = sh("git", "-C", self.work, "rev-parse", "HEAD")
+        self.fake_git('echo "$@" >> %s\n{ echo "ARGS $@"; env | sort; echo "HOMEFILES $(ls -A "$HOME" | wc -l)"; echo; } >> %s\nexec REAL "$@"\n'
+                      % (self.calls, self.envlog))
+
+    def fill(self, v):
+        return v.replace("{HOST}", self.host).replace("{OTHER}", self.other).replace("{SCRIPT}", self.script).replace("{INC}", self.inc)
+
+    def table(self):
+        return [(cls, self.fill(k), self.fill(v)) for cls, rows in GRAMMAR.items() for k, v in rows]
+
+    def calls_list(self):
+        return [l.strip() for l in open(self.calls)] if os.path.exists(self.calls) else []
+
+    def reset(self):
+        for f in (self.calls, self.envlog, self.marker, os.path.join(self.t, "helper.log")):
+            if os.path.exists(f):
+                os.remove(f)
+        open(self.cfg, "w").write(self.plain)
+        for r in sh("git", "-C", self.origin, "for-each-ref", "--format=%(refname)").split():
+            if r != "refs/heads/main":
+                sh("git", "-C", self.origin, "update-ref", "-d", r)
+        sh("git", "-C", self.work, "reset", "-q", "--hard", self.base_head)
+        sh("git", "-C", self.work, "clean", "-qfd")
+
+    def other_refs(self):
+        return sh("git", "-C", self.evil, "for-each-ref", "--format=%(refname)")
+
+    def go(self, hook, **kw):
+        self.reset()
+        self.dirty()
+        return self.run_hook(hook, **kw)
+
+    def run_hook(self, hook, **kw):
+        return subprocess.run([self.seam(hook), "--prestop"], env=self.env(**kw), capture_output=True, text=True, timeout=30)
+
+    def set_local(self, key, value):
+        sh("git", "-C", self.work, "config", "--local", "--" + "add", key, value)
+
+    def global_files(self, key, value):
+        """The same key in the home file, the global-override file, and the variables: returns environment overrides."""
+        home = os.path.join(self.t, "hostile-home")
+        os.makedirs(home, exist_ok=True)
+        gfile = os.path.join(home, ".git" + "config")
+        for f in (gfile, os.path.join(home, "other")):
+            open(f, "w").close()
+            sh("git", "config", "-f", f, "--" + "add", key, value)
+        return {"HOME": home, CFG_G: os.path.join(home, "other"), CFG_S: os.path.join(home, "other"),
+                "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": key, "GIT_CONFIG_VALUE_0": value,
+                "GIT_CONFIG_PARAMETERS": "'%s'='%s'" % (key, value)}
+
+    def non_config_calls(self):
+        return [c for c in self.calls_list() if " config --local " not in c]
+
+    def snapshot(self):
+        """argv of every call and the environment of every call without the per-run values."""
+        env = [l for l in open(self.envlog).read().splitlines()
+               if not l.startswith(("HOME=", "PWD=", "OLDPWD=", "SHLVL=", "_="))]
+        return self.calls_list(), env
+
+    # ---- completeness: each key of the table, three ways
+    def test_each_key_in_the_repository_config_is_refused_with_nothing_run_or_sent(self):
+        n = 0
+        for cls, key, value in self.table():
+            with self.subTest(cls=cls, key=key):
+                self.reset()
+                self.set_local(key, value)
+                self.dirty()
+                p = self.run_hook(HOOK)
+                n += 1
+                self.assertFalse(os.path.exists(self.marker), "a program of the repository ran")
+                self.assertTrue(p.stdout.startswith("cw-prestop: not pushed ("), p.stdout + p.stderr)
+                self.assertIn("work left in %s" % self.work, p.stdout)
+                self.assertEqual(self.non_config_calls(), [], "git went further than reading the configuration")
+                self.assertEqual(self.wip(), "")
+                self.assertEqual(self.other_refs(), "")
+                self.assertFalse(os.path.exists(os.path.join(self.t, "helper.log")), "the helper was called")
+                self.assertTrue(os.path.exists(os.path.join(self.work, "work.txt")))
+        self.assertGreater(n, 40)
+
+    def test_the_same_keys_in_home_global_and_environment_change_nothing(self):
+        p = self.go(HOOK)
+        self.assertEqual(self.wip(), sh("git", "-C", self.work, "rev-parse", "HEAD"), p.stdout + p.stderr)
+        base_argv, base_env = self.snapshot()
+        for cls, key, value in self.table():
+            with self.subTest(cls=cls, key=key):
+                self.reset()
+                self.dirty()
+                p = self.run_hook(HOOK, **self.global_files(key, value))
+                self.assertFalse(os.path.exists(self.marker), "a program ran")
+                self.assertEqual(self.other_refs(), "", "the push landed in the other remote")
+                self.assertEqual(self.wip(), sh("git", "-C", self.work, "rev-parse", "HEAD"), p.stdout + p.stderr)
+                self.assertEqual(self.snapshot(), (base_argv, base_env))
+
+    def test_the_environment_the_caller_hands_over_is_dropped_and_pinned_values_are_set(self):
+        self.go(HOOK, **DANGEROUS_ENV)
+        argv, env = self.snapshot()
+        names = {l.split("=", 1)[0] for l in env if "=" in l}
+        for bad in list(DANGEROUS_ENV) + ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"]:
+            self.assertNotIn(bad, names - {"GIT_TERMINAL_PROMPT"})
+        for want in (CFG_G + "=/dev/null", CFG_S + "=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0"):
+            self.assertIn(want, env)
+        self.assertIn("HOMEFILES 0", env)   # an empty private home
+        self.assertEqual(self.wip(), sh("git", "-C", self.work, "rev-parse", "HEAD"))
+
+    # ---- the reader's named exploits and the argv pins; each scenario passes on the real hook and fails on its mutant
+    def scenario_include(self, hook):   # (a)
+        self.reset()
+        self.set_local("include.path", self.inc)
+        self.dirty()
+        p = self.run_hook(hook)
+        self.assertEqual(self.other_refs(), "", "the push landed in the other remote")
+        self.assertIn("not a plain one: include.path", p.stdout)
+
+    def scenario_local_insteadof(self, hook):
+        self.reset()
+        self.set_local("url.%s.insteadOf" % self.other, self.host)
+        self.set_local("url.%s.pushInsteadOf" % self.other, self.host)
+        self.dirty()
+        self.run_hook(hook)
+        self.assertEqual(self.other_refs(), "", "the push landed in the other remote")
+
+    def scenario_global(self, hook):    # (b)
+        self.reset()
+        self.dirty()
+        env = self.global_files("url.%s.insteadOf" % self.other, self.host)
+        sh("git", "config", "-f", env[CFG_G], "url.%s.pushInsteadOf" % self.other, self.host)
+        for k in ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_PARAMETERS"):
+            del env[k]
+        self.run_hook(hook, **env)
+        self.assertEqual(self.other_refs(), "", "the push landed in the other remote")
+        self.assertEqual(self.wip(), sh("git", "-C", self.work, "rev-parse", "HEAD"))
+
+    def scenario_variables(self, hook):
+        self.reset()
+        self.dirty()
+        self.run_hook(hook, GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="url.%s.insteadOf" % self.other, GIT_CONFIG_VALUE_0=self.host,
+                      GIT_CONFIG_KEY_1="url.%s.pushInsteadOf" % self.other, GIT_CONFIG_VALUE_1=self.host)
+        self.assertEqual(self.other_refs(), "", "the push landed in the other remote")
+
+    def scenario_credential(self, hook):   # (c)
+        self.reset()
+        self.set_local("credential.helper", "!" + self.script)
+        self.dirty()
+        p = self.run_hook(hook)
+        self.assertFalse(os.path.exists(self.marker), "the repository's helper ran")
+        self.assertFalse(os.path.exists(os.path.join(self.t, "helper.log")), "a helper received something")
+        self.assertIn("not a plain one: credential.helper", p.stdout)
+
+    def scenario_transport_keys(self, hook):   # (d)
+        for key in ("http.proxy", "http.extraHeader", "core.gitProxy", "core.askPass"):
+            self.reset()
+            self.set_local(key, self.script)
+            self.dirty()
+            p = self.run_hook(hook)
+            self.assertFalse(os.path.exists(self.marker))
+            self.assertEqual((self.wip(), self.non_config_calls()), ("", []), key)
+            self.assertIn("not a plain one: " + key.lower(), p.stdout)
+
+    def scenario_pins(self, hook):
+        self.go(hook)
+        calls = self.non_config_calls()
+        self.assertTrue(calls)
+        for c in calls:
+            self.assertTrue(c.startswith("-C %s %s " % (self.work, self.opts)), c)
+        self.assertIn("-c credential.helper= -c credential.helper=%s " % self.helper, calls[0])
+        pushes = [c for c in calls if " push " in c]
+        self.assertEqual(pushes, ["-C %s %s push %s" % (self.work, self.opts, self.refspec)])
+
+    SCENARIOS = ("include", "local_insteadof", "global", "variables", "credential", "transport_keys", "pins")
+
+    def test_named_exploits_are_all_closed(self):
+        for name in self.SCENARIOS:
+            with self.subTest(scenario=name):
+                getattr(self, "scenario_" + name)(HOOK)
+
+    def test_mutants_are_each_caught(self):
+        muts = {
+            "allow-list removed": ("local_insteadof", [("if key not in ALLOWED_KEYS and not ALLOWED_RE.match(key):", "if False:")]),
+            "global config not pinned": ("global", [('"GIT_CONFIG_" + "GLOBAL": "/dev/null"', '"GIT_CONFIG_" + "GLOBAL": os.environ.get("GIT_CONFIG_" + "GLOBAL", "/dev/null")')]),
+            "credential reset removed": ("pins", [('"credential.helper=", "credential.helper=" + helper]', '"credential.helper=" + helper]')]),
+            "includes not followed": ("include", [('"--includes", ', ""), ('ALLOWED_KEYS = {', 'ALLOWED_KEYS = {"include.path", ')]),
+            "environment not scrubbed": ("variables", [("if k in KEEP_ENV}", "if True}")]),
+            "explicit URL replaced by origin": ("pins", [('git(workdir, "push", "--no-verify", url,', 'git(workdir, "push", "--no-verify", "origin",')]),
+        }
+        for name, (scenario, edits) in muts.items():
+            mut = os.path.join(self.t, "mut-" + name.replace(" ", "-"))
+            s = open(HOOK).read()
+            for old, new in edits:
+                self.assertIn(old, s, name)
+                s = s.replace(old, new)
+            self.assertNotEqual(s, open(HOOK).read())   # the mutation applied
+            open(mut, "w").write(s)
+            with self.subTest(mutant=name):
+                with self.assertRaises(AssertionError):
+                    getattr(self, "scenario_" + scenario)(mut)
+
+    # ---- the seam and the helper
+    def test_the_seam_is_not_reachable_from_the_environment(self):
+        self.assertEqual(cw_end_hook.HOST_URL, "https://github.com/")
+        self.assertEqual(cw_end_hook.HELPER_DIR, "/run/cw-tmp/bin")
+        code = [l for l in open(HOOK).read().splitlines() if not l.lstrip().startswith("#")]
+        for name in ("HOST_URL", "HELPER_DIR"):
+            self.assertEqual([l for l in code if l.startswith(name + " =")], [l for l in code if l.startswith(name + " =")][:1])
+            self.assertFalse([l for l in code if name in l and "environ" in l])
+        self.assertEqual(len([l for l in code if "HOST_URL" in l]), 2)   # the definition and the one use
+
+    def test_without_the_pods_helper_nothing_is_pushed(self):
+        self.reset()
+        self.dirty()
+        p = subprocess.run([self.seam(HOOK, helper_dir=os.path.join(self.t, "nowhere")), "--prestop"], env=self.env(), capture_output=True, text=True)
+        self.assertIn("the pod's credential helper was not found", p.stdout)
+        self.assertEqual((self.wip(), self.calls_list()), ("", []))
+
+
 class Spec(unittest.TestCase):
     def test_every_pod_has_the_hook_and_the_grace(self):
         self.assertLess(cw.PRESTOP_BUDGET_SECONDS, cw.POD_TERMINATION_GRACE_SECONDS)
