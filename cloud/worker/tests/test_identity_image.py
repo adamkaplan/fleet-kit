@@ -158,6 +158,27 @@ class Identity(unittest.TestCase):
         self.assertNotEqual(args, {"CW_DEFAULT_IDENT_NAME": NAME, "CW_DEFAULT_IDENT_EMAIL": EMAIL})
         self.assertNotIn("name = " + NAME + "\n", text)
 
+    def identity_variable_lines(self, dockerfile_text):
+        """ENV/ARG lines that set a GIT_AUTHOR_* or GIT_COMMITTER_* variable, plus any export of one, anywhere."""
+        text = dockerfile_text.replace("\\\n", " ")
+        pat = re.compile(r"(?:^|\s)GIT_(?:AUTHOR|COMMITTER)_\w*(?=[=\s]|$)")
+        bad = [l for l in text.splitlines() if re.match(r"\s*(ENV|ARG)\s", l, re.I) and pat.search(l)]
+        return bad + re.findall(r"export\s+GIT_(?:AUTHOR|COMMITTER)\w*", text)
+
+    def test_s6_the_dockerfile_sets_no_author_or_committer_variable(self):
+        self.assertEqual(self.identity_variable_lines(read(DOCKERFILE)), [])
+        self.assertEqual(len(re.findall(r"GIT_(?:AUTHOR|COMMITTER)_\w*\s*=", read(DOCKERFILE))), 0)
+
+    def test_s6_mutant_dockerfile_env_author_variable_is_caught(self):
+        src = read(DOCKERFILE)
+        for add in ("ENV GIT_AUTHOR_NAME=x", "ENV GIT_COMMITTER_EMAIL y", "ENV A=1 GIT_COMMITTER_EMAIL=y"):
+            mutated = src.rstrip("\n") + "\n" + add + "\n"
+            self.assertNotEqual(mutated, src)   # the mutation applied
+            self.assertIn(add, mutated)
+            self.assertNotEqual(self.identity_variable_lines(mutated), [], add)
+        mutated = src.rstrip("\n") + "\nRUN export GIT_AUTHOR_NAME=x\n"
+        self.assertNotEqual(self.identity_variable_lines(mutated), [])
+
     def guard(self, *args):
         return subprocess.run(["sh", GUARD] + list(args), env={"PATH": "/usr/bin:/bin", "CW_REAL_GIT": "/bin/true"}, capture_output=True, text=True).returncode
 
