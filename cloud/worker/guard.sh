@@ -253,6 +253,7 @@ api_check() {   # gh api ...: $@ are the words after `api`
   [ "$m" = GET ] && return 0
   case "$p" in
     repos/*/pulls/*/reviews|repos/*/pulls/*/reviews/*) refuse "approving or dismissing a pull request review" ;;
+    repos/*/pulls/[0-9]*) [ "$m" = PATCH ] && refuse "pr-edit-api" ;;
     repos/*/issues/*|repos/*/issues) refuse "writing issues" ;;
     repos/*/labels|repos/*/labels/*) refuse "writing labels" ;;
     repos/*/git/refs|repos/*/git/refs/*) refuse "force-pushing or pushing to the default branch" ;;
@@ -262,6 +263,20 @@ api_check() {   # gh api ...: $@ are the words after `api`
       refuse "changing repository settings" ;;
   esac
   case "$m" in PATCH|PUT|DELETE) case "$p" in repos/*) refuse "changing repository settings" ;; esac ;; esac
+  return 0
+}
+
+pr_edit_check() {   # ask 1200: the words after `pr edit`: only `N --body-file F`, N one of the pod's own numbers when it keeps a record
+  for a in "$@"; do
+    case "$a" in
+      --body|--body=*|-b|-b?*) refuse "pr-edit-inline-body" ;;
+      *://*|-R|-R?*|--repo|--repo=*) refuse "pr-edit-url-other-repo" ;;
+    esac
+  done
+  { [ $# -eq 3 ] && [ "$2" = --body-file ]; } || refuse "pr-edit-other-option"
+  case "$1" in ""|*[!0-9]*) refuse "pr-edit-other-option" ;; esac
+  { [ -n "${CW_PR_RECORD:-}" ] && [ -s "$CW_PR_RECORD" ]; } || refuse "pr-edit-no-record"   # fail closed: no record, no edit
+  grep -qx -- "$1" "$CW_PR_RECORD" || refuse "pr-edit-other-number"
   return 0
 }
 
@@ -286,7 +301,7 @@ do_gh() {
     "config "*) refuse "changing the gh configuration" ;;
     "pr merge") refuse "merging a pull request" ;;
     "pr review") refuse "approving or dismissing a pull request review" ;;
-    "pr edit") for a in "$@"; do case "$a" in --add-label|--add-label=*|--remove-label|--remove-label=*) refuse "writing labels" ;; --add-assignee|--add-assignee=*|--remove-assignee|--remove-assignee=*) refuse "writing assignees" ;; esac; done ;;
+    "pr edit") for a in "$@"; do case "$a" in --add-label|--add-label=*|--remove-label|--remove-label=*) refuse "writing labels" ;; --add-assignee|--add-assignee=*|--remove-assignee|--remove-assignee=*) refuse "writing assignees" ;; esac; done; pr_edit_check "$@" ;;
     "issue create"|"issue edit"|"issue close"|"issue comment"|"issue reopen"|"issue delete"|"issue lock"|"issue unlock"|"issue pin"|"issue unpin"|"issue transfer")
       refuse "writing issues" ;;
     "label create"|"label edit"|"label delete"|"label clone") refuse "writing labels" ;;
