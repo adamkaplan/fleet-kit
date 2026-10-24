@@ -73,6 +73,8 @@ def _fleet_parts(after=False):
 _fleet_parts()
 import argparse
 import base64
+import html
+import unicodedata
 import http.client
 import urllib.parse
 from contextlib import contextmanager
@@ -82,6 +84,7 @@ import ast
 import copy
 import errno
 import fcntl
+import functools
 import getpass
 import gzip
 import hashlib
@@ -218,11 +221,6 @@ def refuse_cloud_name(name):
         return
 
 
-
-
-
-
-
 def health_recorder(engine):
     """The engine's recorder of what it has already read (#357), made on first use. None when it cannot be made: health is never in a pass's way."""
     held = getattr(engine, "health", None)
@@ -281,15 +279,12 @@ def health_write(engine, state, now):
         _health_fault(engine, "write", err)
 
 
-
-
 class _LazyImpactFloor:
     def __getattr__(self, name):
         return getattr(load_impact_floor(), name)
 
 
 impact_floor = _LazyImpactFloor()
-
 
 
 class _LazyPlanReview:
@@ -323,22 +318,16 @@ class _LazyPlanCheck:
 plan_check = _LazyPlanCheck()
 
 
-
-
 decision_sync = load_decision_sync()
-
 
 
 work_sync = load_work_sync()
 
 
-
 agent_calls = load_agent_calls()
 
 
-
 triage_digest = load_triage_digest()
-
 
 
 dead_hint = load_dead_hint()
@@ -11458,7 +11447,6 @@ def read_decisions_file(path):
     return body if ok else None
 
 
-
 # ---------------------------------------------------------------- how many v2 calls the daemon makes (every one is an `opencode api` process)
 V2_CALLS_FILE = "v2-calls.json"
 
@@ -14905,477 +14893,6 @@ def blocked_tick(engine, discovery, held):
     if changed or done:
         blocked_update(engine.state_dir, BLOCKED_ALERT_STATE, lambda _: state)
     return done
-
-
-# ---- reminders
-
-def parse_when(text, now):
-    """`30m`, `+2h`, `1d` (from now), or an ISO-8601 time with an offset or `Z`. Epoch seconds."""
-    match = re.fullmatch(r"\+?([0-9]+)([smhd])", text.strip())
-    if match:
-        return now + int(match.group(1)) * REMINDER_UNITS[match.group(2)]
-    try:
-        moment = datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
-    except ValueError:
-        raise ReminderError("when must be a delay such as 30m, 2h or 1d, or an ISO time with a zone "
-                            "such as 2030-01-02T09:00:00Z, got %r" % text) from None
-    if moment.tzinfo is None:
-        raise ReminderError("when %r has no time zone; add Z or an offset" % text)
-    return moment.timestamp()
-
-
-class ReminderError(FactError):
-    """reminders.json cannot be read or written, or a reminder cannot be made."""
-
-
-@contextmanager
-def reminders_lock(state_dir):
-    """Serialises the CLI and the daemon around the read-modify-write of reminders.json."""
-    fd = os.open(str(Path(state_dir) / REMINDER_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        os.close(fd)
-
-
-def read_reminders(state_dir):
-    path = Path(state_dir) / REMINDERS
-    try:
-        raw = json.loads(path.read_text())
-    except FileNotFoundError:
-        return []
-    except (OSError, ValueError) as err:
-        raise ReminderError("cannot read %s: %s" % (path, err)) from None
-    items = raw.get("reminders") if isinstance(raw, dict) else None
-    if not isinstance(items, list):
-        raise ReminderError("%s must hold {\"reminders\": [...]}" % path)
-    for item in items:
-        if not (isinstance(item, dict) and isinstance(item.get("id"), str) and isinstance(item.get("to"), str)
-                and _is_number(item.get("at")) and isinstance(item.get("text"), str)):
-            raise ReminderError("%s has a reminder without id, to, at and text: %r" % (path, item))
-        if item.get("condition") is not None and not isinstance(item["condition"], dict):
-            raise ReminderError("%s has a reminder whose condition is not an object: %r" % (path, item))
-    return items
-
-
-def write_reminders(state_dir, items):
-    """Replace reminders.json atomically, mode 0600: a crash leaves the old file or the new one."""
-    path = Path(state_dir) / REMINDERS
-    temp = path.with_name("%s.%d.tmp" % (REMINDERS, os.getpid()))
-    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w") as handle:
-            json.dump({"reminders": items}, handle, indent=1, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(str(temp), str(path))
-    except BaseException:
-        try:
-            os.unlink(str(temp))
-        except OSError:
-            pass
-        raise
-
-
-def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo=None, condition=None):
-    if not isinstance(to, str) or not to.strip():
-        raise ReminderError("a reminder needs the name of the agent it is for")
-    if not text.strip():
-        raise ReminderError("a reminder needs text")
-    item = {"id": uuid.uuid4().hex[:12], "to": to, "at": float(at), "created": float(created),
-            "text": text, "issue": issue, "from": sender}
-    if repo:
-        item["repo"] = repo  # PR 15: the repo `issue` is in
-    if condition:
-        item["condition"] = dict(condition)  # checked when it is due: {"unless_report_from", "since"} or {"while_running"}
-    with reminders_lock(state_dir):
-        write_reminders(state_dir, read_reminders(state_dir) + [item])
-    return item
-
-
-def remove_reminders(state_dir, ids):
-    """Drop these ids from reminders.json. Returns the ids that were there."""
-    with reminders_lock(state_dir):
-        items = read_reminders(state_dir)
-        gone = [item["id"] for item in items if item["id"] in ids]
-        if gone:
-            write_reminders(state_dir, [item for item in items if item["id"] not in ids])
-    return gone
-
-
-def found_reason(why):
-    return "merged" if why.endswith(" is merged") else "closed"
-
-
-class ReminderFacts:
-    """`reminder:<id>` facts for reminders that are due. A reminder not yet due is no fact.
-
-    A due reminder skips the batch window: it is one event at an exact time.
-    It stays in the file until its key shows in the recipient's transcript or
-    inbox (prune_delivered_reminders), so a crash before delivery loses nothing.
-    """
-
-    __name__ = "reminder_facts"
-
-    def __init__(self, state_dir):
-        self.state_dir, self.engine = Path(state_dir), None
-
-    def bind(self, engine):
-        self.engine = engine
-
-    def due(self):
-        now = self.engine.now() if self.engine else time.time()
-        return [item for item in read_reminders(self.state_dir) if item["at"] <= now]
-
-    def until_holds(self, condition):
-        """A reminder's cancel condition (`until_closed` an issue, `until_merged` a pull request, each `owner/repo#N`):
-        the reason it is moot, or None (not met, or cannot be read now: the reminder stays)."""
-        for key, kind in (("until_closed", "issue"), ("until_merged", "pr")):
-            ref = condition.get(key)
-            match = re.fullmatch(r"([\w.-]+/[\w.-]+)#([0-9]+)", ref) if isinstance(ref, str) else None
-            if match is None or self.engine is None:
-                continue
-            try:
-                state = read_ref_state(self.engine, match.group(1), int(match.group(2)), kind)
-            except (NoticeError, OSError, ValueError):
-                continue
-            if (key == "until_closed" and state in ("closed", "merged")) or (key == "until_merged" and state == "merged"):
-                return "%s is %s" % (ref, state)
-        return None
-
-    def last_report(self, worker, boss=None):
-        """When `worker` last made a report (to anyone) or sent a message to `boss` (epoch seconds, from `last-reports.json`), or None. A time in the
-        future is no sign of life: a damaged or forged record cannot silence the wake for good."""
-        try:
-            entry = _read_small(self.state_dir, LAST_REPORT_FILE).get(worker, {})
-            sends = entry.get("send_to") if isinstance(entry.get("send_to"), dict) else {}
-            times = [entry.get("at"), sends.get(boss) if isinstance(boss, str) else None]
-        except (OSError, AttributeError):
-            return None
-        now = self.engine.now() if self.engine else time.time()
-        times = [float(t) for t in times if _is_number(t) and t <= now + 60]
-        return max(times) if times else None
-
-    def overdue_text(self, item):
-        """The wake's text with the fact the boss needs: when the worker last reported, or that it has not since the launch."""
-        worker, since = item["condition"].get("unless_report_from"), item["condition"].get("since", 0)
-        last = self.last_report(worker, item["to"]) if isinstance(worker, str) else None
-        if last is None:
-            tail = "no report from %s since launch" % _plain(worker, 60)
-        else:
-            tail = "last report from %s %s ago%s" % (_plain(worker, 60), _age_text(max(0, int(self.engine.now() - last))), "" if not _is_number(since) or last >= since else " (before this launch)")
-        return "%s (%s)" % (item["text"], tail)
-
-    def verdict(self, item):
-        """For a due conditional reminder: None (cannot tell yet: it stays), "deliver", or the reason to drop it.
-        One read of the boss's transcript and inbox, and only for a reminder that is due and has a condition."""
-        condition, discovery = item["condition"], self.engine.discovery if self.engine else None
-        moot = self.until_holds(condition)
-        if moot:
-            return moot  # a cancel condition holds: dropped (audited by the caller)
-        if discovery is None:
-            return None
-        worker = condition.get("unless_report_from") or condition.get("while_running")
-        if isinstance(worker, str) and worker not in discovery.agents:
-            return "%s is gone" % worker if not discovery.problems else None
-        if not isinstance(condition.get("unless_report_from"), str):
-            return "deliver"
-        boss, since = discovery.agents.get(item["to"]), condition.get("since", 0)
-        if not _is_number(since):  # a forged or damaged condition is no condition: deliver, audited
-            if self.engine is not None and self.engine.audit is not None:
-                self.engine.audit.append(self.engine.actor, "reminder.condition_unusable", item["to"],
-                                         {"id": item["id"]})
-            return "deliver"
-        last = self.last_report(worker, item["to"])
-        if last is not None and last >= since:   # the durable record `report` writes for EVERY report (a rider, a direct one, to any boss): it needs no read of the boss's transcript, which v2_light never makes and a delivered rider no longer shows
-            return "%s reported to its boss since the launch (%s ago)" % (worker, _age_text(max(0, int(self.engine.now() - last))))
-        if boss is None:
-            return None
-        try:
-            lines = synthetic_lines(self.engine, boss.session_id, since, waiting=True)
-            riders = read_report_riders(self.state_dir)
-        except (V2Error, ReminderError):
-            return None
-        for _, _, _, line in lines:
-            match = REPORT_LINE.match(line) or SEND_LINE.match(line)
-            if match and match.group(1) == worker:
-                return "%s reported to %s since the launch" % (worker, item["to"])
-        if any(r.get("from") == worker and r["to"] == item["to"] and r["created"] >= since for r in riders):
-            return "%s reported to %s since the launch" % (worker, item["to"])
-        return "deliver"
-
-    def notify_drop(self, item, why):
-        """#1132: a reminder dropped because its issue closed or its pull request merged tells its setter ONCE. Called only by the caller
-        that removed the reminder from the file (`gone` was non-empty), so a second sweep finds nothing to drop and sends nothing."""
-        sender = item.get("from")
-        match = re.search(r" is (closed|merged)$", why)
-        if match is None or not isinstance(sender, str) or not sender.strip() or self.engine is None:
-            return
-        reason = "the pull request merged" if match.group(1) == "merged" else "the issue closed"
-        text = "Reminder %s for %s was dropped, unsent: %s (%s). Its text: %s. Set it with --keep-if-closed to keep it." % (
-            item["id"], item["to"], reason, why, item["text"])
-        add_reminder(self.state_dir, sender, self.engine.now(), self.engine.now(), text)
-        if self.engine.audit is not None:
-            self.engine.audit.append(self.engine.actor, "reminder.drop_notice", sender, {"id": item["id"], "why": found_reason(why)})
-
-    def __call__(self):
-        facts = []
-        for item in self.due():
-            if item.get("condition"):
-                found = self.verdict(item)
-                if found is None:
-                    continue
-                if found != "deliver":
-                    gone = remove_reminders(self.state_dir, {item["id"]})
-                    if gone and self.engine is not None and self.engine.audit is not None:
-                        self.engine.audit.append(self.engine.actor, "reminder.drop", item["to"],
-                                                 {"id": item["id"], "why": found})
-                    if gone:
-                        self.notify_drop(item, found)
-                    continue
-            text = self.overdue_text(item) if isinstance(item.get("condition"), dict) and isinstance(item["condition"].get("unless_report_from"), str) and self.engine else item["text"]
-            facts.append(Fact("reminder:" + item["id"], item["to"], "reminder", text, item["at"],
-                              issue=item.get("issue"), batch=False, sender=item.get("from"), repo=item.get("repo")))
-        return facts
-
-
-def prune_delivered_reminders(engine, discovery):
-    """Forget the due reminders whose key is already in their recipient's transcript or inbox."""
-    source = next((s for s in engine.sources if isinstance(s, ReminderFacts)), None)
-    if source is None:
-        return []
-    by_recipient = {}
-    for item in source.due():
-        by_recipient.setdefault(item["to"], []).append(item)
-    delivered = []
-    for name, items in sorted(by_recipient.items()):
-        observation = discovery.agents.get(name)
-        if observation is None:
-            continue
-        try:
-            keys, _ = engine.delivered_keys(observation.session_id, min(i["at"] for i in items) - SINCE_SLACK)
-        except V2Error:
-            continue
-        delivered += [item["id"] for item in items if "reminder:" + item["id"] in keys]
-    gone = remove_reminders(source.state_dir, set(delivered)) if delivered else []
-    if gone and engine.audit is not None:
-        engine.audit.append(engine.actor, "reminder.prune", None, {"ids": gone})
-    return gone
-
-
-# ---- checkpoint reminders: a launch sets them from the brief's CHECKPOINT (docs/switchboard.md, "Self-wakes")
-
-CHECKPOINT_WORKER_TEXT = "checkpoint due: report now, one line"
-CHECKPOINT_OVERDUE_TEXT = "%s has not reported since launch: overdue checkpoint"
-_CP_UNIT = r"(seconds?|secs?|minutes?|mins?|hours?|hrs?|[smh])?"
-_CP_UNITS = {"s": 1, "m": 60, "h": 3600}
-CHECKPOINT_MAX_SECONDS = 30 * 86400  # a checkpoint or overdue further out than this is refused, never an error
-CHECKPOINT_MAX_DIGITS = 6
-
-
-def how_long(seconds):
-    """A length of time as words, exact to the second: `15 min`, `1 min 30 s`, `2 h 5 min`, `1 d 2 h`. Never rounds: the line a lane reads must be the stored time."""
-    seconds = int(round(abs(seconds)))
-    parts = []
-    for unit, size in (("d", 86400), ("h", 3600), ("min", 60), ("s", 1)):
-        count, seconds = divmod(seconds, size)
-        if count:
-            parts.append("%d %s" % (count, unit))
-    return " ".join(parts) if parts else "0 s"
-
-
-def reminder_when(at, now):
-    """The words the three routes print for one reminder, built from the STORED time and the same `now`: `in 15 min, at 2030-01-02T15:05:05Z` (or `15 min ago`)."""
-    return ("in %s" % how_long(at - now) if at >= now else "%s ago" % how_long(now - at)) + ", at %s" % iso(at)
-
-
-def _print_when_now(now):
-    try:
-        return iso(now)
-    except Exception:
-        return str(now)
-
-
-def _print_when(at, now):
-    """`reminder_when`, but the printing never fails a command: a reminder that was made still exits 0 (the plain clock time is the fallback)."""
-    try:
-        return reminder_when(at, now)
-    except Exception:
-        return "at %s" % at
-
-
-def _cp_when(text, moment):
-    """parse_when for a checkpoint flag, bounded: too many digits or further than CHECKPOINT_MAX_SECONDS is refused."""
-    if re.search(r"[0-9]{%d}" % (CHECKPOINT_MAX_DIGITS + 1), text):
-        raise ReminderError("%r is too large; a checkpoint is at most 30 days out" % text[:40])
-    at = parse_when(text, moment)
-    if not moment - CHECKPOINT_MAX_SECONDS <= at <= moment + CHECKPOINT_MAX_SECONDS:
-        raise ReminderError("%r is too far out; a checkpoint is at most 30 days away" % text[:40])
-    return at
-
-
-def _cp_seconds(number, unit, default):
-    unit = (unit or default or "")[:1].lower()
-    return int(number) * _CP_UNITS[unit] if unit in _CP_UNITS else None
-
-
-def parse_checkpoint(brief):
-    """(checkpoint seconds, overdue seconds) from the brief's CHECKPOINT line, or None. Best effort and never an
-    error: 'Report at 30 minutes ...; overdue at 60', 'in 20m, overdue 45m'. A bare overdue number takes the
-    unit of the checkpoint; no unit anywhere, a missing part, or an overdue that is not later = None."""
-    line = next((l for l in (brief or "").splitlines() if re.match(r"\s*CHECKPOINT\s*:", l, re.I)), None)
-    if line is None:
-        return None
-    over = re.search(r"\boverdue(?:\s+(?:at|after|in|by))?\s+(\d{1,6})\s*" + _CP_UNIT + r"\b", line, re.I)
-    if over is None:
-        return None
-    head = line[:over.start()]
-    first = re.search(r"\b(?:at|in|after|within)\s+(\d{1,6})\s*" + _CP_UNIT + r"\b", head, re.I)
-    if first is None:
-        return None
-    checkpoint = _cp_seconds(first.group(1), first.group(2), over.group(2))
-    overdue = _cp_seconds(over.group(1), over.group(2), first.group(2))
-    if checkpoint is None or overdue is None or checkpoint <= 0 or overdue <= checkpoint:
-        return None
-    if overdue > CHECKPOINT_MAX_SECONDS:
-        return None
-    return checkpoint, overdue
-
-
-def set_checkpoint_reminders(engine, state, name, boss, issue, repo, brief, checkpoint, overdue, launched, moment):
-    """Make the launch's two reminders. `checkpoint`/`overdue` are --checkpoint/--overdue (delays or ISO times) or
-    None; with neither, the brief's CHECKPOINT line is parsed. Returns one line for the launch output, or None.
-    Never raises: the worker is already running."""
-    try:
-        notes = []
-        if boss:  # #102: the overdue wake goes to the registered agent the role name chief-of-staff stands for
-            try:
-                boss = resolve_boss(engine.discover(engine.now()), boss)
-            except Exception:
-                pass  # the fleet cannot be read now: the name as given
-        if checkpoint is None and overdue is None:
-            parsed = parse_checkpoint(brief)
-            if parsed is None:
-                return ("no checkpoint reminders: no --checkpoint/--overdue and the brief's CHECKPOINT line could "
-                        "not be read as 'at <N> minutes ... overdue at <M>'")
-            checkpoint, overdue = ("%ds" % parsed[0], "%ds" % parsed[1])
-        when_worker = _cp_when(checkpoint, moment) if checkpoint is not None else None
-        when_boss = _cp_when(overdue, moment) if overdue is not None and boss else None  # both checked before either is made
-        made = []
-        if when_worker is not None:
-            item = add_reminder(state, name, when_worker, moment, CHECKPOINT_WORKER_TEXT, issue, boss, repo,
-                                condition={"while_running": name})
-            made.append(("worker", item))
-        if overdue is not None:
-            if not boss:
-                notes.append("no overdue reminder: the launch names no --reports-to")
-            else:
-                item = add_reminder(state, boss, when_boss, moment, CHECKPOINT_OVERDUE_TEXT % name, issue, name, repo,
-                                    condition={"unless_report_from": name, "since": launched})
-                made.append(("overdue", item))
-        for which, item in made:
-            engine.audit.append("cli", "reminder.add", item["to"], {"id": item["id"], "at": iso(item["at"]),
-                                                                   "from": item.get("from"), "issue": issue,
-                                                                   "repo": repo, "for": "checkpoint-" + which})
-        notes[:0] = ["%s reminder %s" % (which, _print_when(item["at"], moment)) for which, item in made]
-        return "checkpoint reminders (now %s): " % _print_when_now(moment) + "; ".join(notes) if notes else None
-    except (ReminderError, OSError, ValueError, OverflowError) as err:
-        return "no checkpoint reminders: %s" % _one_line(str(err), 200)
-
-
-REMIND_LIST_MAX = 50   # reminders `remind --list` prints
-
-
-def remind_manage(args, engine, state, sender, moment):
-    """`remind --list` (the caller's own pending reminders: set by it or for it) and `remind --cancel <id>` (one of those, by id). Nothing else is
-    shown or touched: another agent's reminder is not listed and is refused with the same words as an unknown id."""
-    if args.list_mine and args.cancel:
-        sys.stderr.write("%s: remind: give --list or --cancel, not both\n" % PROG)
-        return EXIT_USAGE
-    if args.name or args.when or args.text:
-        sys.stderr.write("%s: remind: --list and --cancel take no recipient, time or text\n" % PROG)
-        return EXIT_USAGE
-    try:
-        mine = [item for item in read_reminders(state) if sender in (item.get("to"), item.get("from"))]
-    except ReminderError as err:
-        sys.stderr.write("%s: remind: %s\n" % (PROG, _one_line(str(err), 200)))
-        return EXIT_ERROR
-    if args.list_mine:
-        mine.sort(key=lambda item: item["at"])
-        for item in mine[:REMIND_LIST_MAX]:
-            print("%s  %s  to=%s  issue=%s  %s" % (item["id"], iso(item["at"]), item["to"], item.get("issue") or "-", _one_line(item["text"], 120)))
-        if len(mine) > REMIND_LIST_MAX:
-            print("(%d more not shown)" % (len(mine) - REMIND_LIST_MAX))
-        if not mine:
-            sys.stderr.write("%s: no pending reminders for %s\n" % (PROG, sender))
-        return EXIT_OK
-    if args.cancel not in {item["id"] for item in mine}:
-        sys.stderr.write("%s: remind: no pending reminder %s of yours (see `%s remind --list`)\n" % (PROG, _one_line(args.cancel, 40), PROG))
-        return EXIT_USAGE
-    if not remove_reminders(state, {args.cancel}):   # delivered or cancelled between the read and the removal
-        sys.stderr.write("%s: remind: reminder %s is already gone\n" % (PROG, _one_line(args.cancel, 40)))
-        return EXIT_USAGE
-    engine.audit.append("cli", "reminder.cancel", sender, {"id": args.cancel})
-    print("cancelled %s" % args.cancel)
-    return EXIT_OK
-
-
-def cmd_remind(args, runner, now):
-    engine, state, config = build_engine(runner, now, "cli")
-    if args.sender is not None:
-        if os.environ.get(LAB_ENV) != "1":
-            sys.stderr.write("%s: --from is only for the Lab (%s=1); an agent is identified by its pane\n"
-                             % (PROG, LAB_ENV))
-            return EXIT_USAGE
-        sender = args.sender
-    else:
-        sender = identify_caller(engine.herdr, engine.v2, os.environ)
-    moment = now()
-    if args.list_mine or args.cancel:
-        return remind_manage(args, engine, state, sender, moment)
-    if not args.name or not args.when or not args.text:
-        sys.stderr.write("%s: remind needs <name> <when> <text> (or --list, or --cancel <id>)\n" % PROG)
-        return EXIT_USAGE
-    try:
-        repo, number = resolve_for_sender(engine, config, args.issue, sender)
-    except IssueRefError as err:
-        sys.stderr.write("%s: %s\n" % (PROG, err))
-        return EXIT_USAGE
-    condition = {}
-    for flag, key in ((args.until_closed, "until_closed"), (args.until_merged, "until_merged")):
-        if flag:
-            if not re.fullmatch(r"[\w.-]+/[\w.-]+#[0-9]+", flag):
-                sys.stderr.write("%s: --until-closed/--until-merged take OWNER/REPO#N, got %r\n" % (PROG, flag[:60]))
-                return EXIT_USAGE
-            condition[key] = flag
-    if number is not None and repo and not condition and not args.keep_if_closed:
-        condition["until_closed"] = "%s#%d" % (repo, number)   # a reminder about an issue is moot once it is closed: dropped unsent (`--keep-if-closed` opts out)
-    warning = None
-    if number is not None and repo and not args.keep_if_closed:
-        try:
-            ref_state = read_ref_state(engine, repo, number, "issue")
-        except Exception:   # the warning never fails a command
-            ref_state = "open"   # unreadable: warned as open, never refused
-        if ref_state in ("closed", "merged"):
-            sys.stderr.write("%s: %s#%d is already closed; a reminder about a closed issue is dropped when it is due. "
-                             "Use --keep-if-closed to keep it\n" % (PROG, repo, number))
-            return EXIT_USAGE
-        warning = ("%s: reminder is dropped if it closes (%s#%d closes or its pull request merges), with one notice to you; "
-                   "use --keep-if-closed to keep it\n" % (PROG, repo, number))
-    item = add_reminder(state, args.name, parse_when(args.when, moment), moment,
-                        " ".join(args.text).strip(), number, sender, repo, condition=condition or None)
-    engine.audit.append("cli", "reminder.add", args.name, {"id": item["id"], "at": iso(item["at"]),
-                                                          "from": sender, "issue": number, "repo": repo})
-    print(item["id"])
-    sys.stderr.write("%s: reminder for %s %s (now %s)\n" % (PROG, args.name, _print_when(item["at"], moment), _print_when_now(moment)))
-    if warning:
-        sys.stderr.write(warning)
-    return EXIT_OK
-
-
-cmd_remind.ensure_on_use = True   # the daemon is alive when it runs
 
 
 def add_budget_notice_parsers(sub):
@@ -19906,820 +19423,6 @@ def cmd_plan_template(args, runner, now):
     return EXIT_OK
 
 
-# ---------------------------------------------------------------- `plan review` (#109 part 2, slice R2)
-#
-# docs/plan-review-engine-design.md. R2: the ledger records, and `start`, `verdict`, `respond`, `status`, `abandon`, with real lane launching
-# (the existing `launch_agent`; tests use the fake herdr). Inert by default: `plan_review.enabled` is false. It writes the ledger and audit
-# and launches lane sessions; it writes nothing to GitHub. NOT here (later slices): the daemon's read of a lane's final message (R3), the
-# closing round, the consensus write, escalation and `decide` (R4), `report` (R5). So no consensus record is ever written by this slice.
-
-class ReviewError(Exception):
-    """A `plan review` command that cannot go on (exit 2): said in one line, nothing was recorded."""
-
-
-REVIEW_ACTIONS = ("start", "verdict", "respond", "status", "abandon", "decide", "tick", "close", "report")
-DECISIONS_HEADING_RE = re.compile(r"(?m)^##[ \t]+Decisions[ \t]*$")
-REVIEW_TABLE_MAX = 65536     # bytes read from a response table or a verdict block
-REVIEW_OBJECTIONS_MAX = 20   # objections in one verdict
-
-
-def _read_capped(path, limit):
-    """The text of a file or stdin (`-`), refused when it is over `limit` bytes: one entry cannot bloat the ledger."""
-    text = sys.stdin.read(limit + 1) if path in (None, "-") else Path(path).read_text(encoding="utf-8")
-    if len(text.encode("utf-8")) > limit:
-        raise ReviewError("the input is over %d bytes" % limit)
-    return text
-PATH_TOKEN_RE = re.compile(r"[A-Za-z0-9_.@~+-]*(?:/[A-Za-z0-9_.@~+-]+)*")
-
-
-def review_lane_send_problem(config, recipient, sender):
-    """A plan review lane takes no message from an agent: its brief is its only input (the plan is untrusted text, and so is any message).
-    Only the switchboard itself may send to a lane of an open review. Applies only when the engine is on; fails open (None) on any trouble."""
-    try:
-        if sender == PROG or not (config.get("plan_review") or {}).get("enabled"):
-            return None
-        entries, problem = plan_ledger.read_ledger(ensure_state_dir())
-        if problem or not any(e.get("kind") == "lane_session" and e.get("session") == recipient for e in entries):
-            return None
-        review = next(e["review"] for e in entries if e.get("kind") == "lane_session" and e.get("session") == recipient)
-        rnd = _round_of(entries, review)
-        if plan_review.lineage_state([e for e in entries if e.get("lineage") == rnd["lineage"]], rnd["plan_hash"])["open_review"]:
-            return "%s is a reviewer lane of the open plan review %s: it takes no message from an agent" % (recipient, review)
-    except Exception:
-        return None
-    return None
-
-
-def review_config(config):
-    cfg = config.get("plan_review")
-    if not cfg or not cfg.get("enabled"):
-        raise ReviewError("the plan review engine is off: set `plan_review.enabled` to true in the switchboard config")
-    return cfg
-
-
-def review_entries(state):
-    entries, problem = plan_ledger.read_ledger(state)
-    if problem:
-        raise ReviewError("the ledger is not trustworthy, nothing was recorded: %s" % problem)
-    return entries
-
-
-def review_caller(runner, now, who):
-    """(kind, name): `start` and `abandon` are for a person at a shell or a registered orchestrator or the chief of staff; `respond` is
-    the planner (the round's recorded starter)."""
-    got = gates_caller_kind(runner, now)
-    if got[0] == "person":
-        return "person", "owner"
-    if got[0] == "agent" and got[2] in ("orchestrator", "chief-of-staff"):
-        return "agent", got[1]
-    raise ReviewError("%s may not %s: only a registered orchestrator, the chief of staff, or a person at a shell" % (got[1], who))
-
-
-def _review_record(engine, state, entry, now):
-    stored = plan_ledger.append_entry(state, entry, now())
-    if engine.audit is not None:
-        engine.audit.append(engine.actor, "plan.review.%s" % entry["kind"], entry.get("lineage") or "-",
-                            {"review": entry.get("review"), "round": entry.get("round"), "lane": entry.get("lane"),
-                             "seq": stored["seq"], "chain": stored["hash"]})
-    return stored
-
-
-def _plan_ask_problem(config, runner, now, plan_repo, plan_number, ask_repo, ask_number):
-    """None when the plan issue IS the ask or sits under it (its parent chain, up to 6 links, reaches the ask), read from GitHub with the
-    repo's account like `plan check`; else a sentence. The caller's `--ask` is only a claim: this is what makes the lineage the ask's."""
-    if (plan_repo.lower(), plan_number) == (ask_repo.lower(), ask_number):
-        return None
-    reader = IntentReader(config["gh"], plan_repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
-    repo, number = plan_repo, plan_number
-    for _ in range(6):
-        issue = reader._api("repos/%s/issues/%d" % (repo, number), repo)
-        parent = parent_of(issue) if isinstance(issue, dict) else None
-        if not parent:
-            break
-        if (repo.lower(), parent) == (ask_repo.lower(), ask_number):
-            return None
-        number = parent
-    return "%s#%d is not the ask's plan: its issue is not %s#%d and does not sit under it (a plan is reviewed under the ask it serves)" % (
-        plan_repo, plan_number, ask_repo, ask_number)
-
-
-def _unit_paths(text):
-    """Every path-like token in the plan text: a plan that names a held path anywhere is reviewed in full (err to full; the plan's own
-    claim about its areas is not read)."""
-    return sorted({m for m in PATH_TOKEN_RE.findall(text or "") if "/" in m or "." in m})
-
-
-def _ask_facts(config, runner, now, ask_text, default_repo):
-    """(repo, number, kind, parent lineage or None, intent, done_when) of the ask a plan serves, from the issue itself: a charter is an
-    `epic`, an issue with a parent a `work_item`, else an `ask`."""
-    repo, number, _ = parse_plan_source(ask_text, default_repo)
-    reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
-    issue = reader._api("repos/%s/issues/%d" % (repo, number), repo)
-    if not isinstance(issue, dict):
-        raise ReviewError("cannot read the ask %s#%d" % (repo, number))
-    parent = parent_of(issue)
-    charter = bool(_CHARTER_BLOCK.search(issue.get("body") if isinstance(issue.get("body"), str) else ""))
-    kind = "work_item" if parent else ("epic" if charter else "ask")
-    found = IssueIntent.from_api(issue)
-    return (repo, number, kind, plan_review.lineage_key(repo, parent) if parent else None, found.intent or "", found.done_when or "")
-
-
-def _abandoned(entries, review):
-    """True when the review was abandoned: it takes no verdict, no response, no closing round and no consensus (a new `start` for the ask is how
-    it goes on: the lineage's count continues)."""
-    return any(e.get("kind") == "abandoned" and e.get("review") == review for e in entries)
-
-
-def _refuse_if_abandoned(entries, review):
-    if _abandoned(entries, review):
-        raise ReviewError("refused: review %s was abandoned: it takes no more verdicts, responses, closing round or consensus "
-                          "(`plan review start` for the same ask opens a new review and the count continues)" % review)
-
-
-def _round_of(entries, review):
-    rounds = [e for e in entries if e.get("kind") == "round" and e.get("review") == review]
-    if not rounds:
-        raise ReviewError("no review %s" % review)
-    return rounds[-1]
-
-
-def _sessions_of(entries, review, number):
-    return {e["lane"]: e["session"] for e in entries if e.get("kind") == "lane_session" and e.get("review") == review
-            and e.get("round") == number}
-
-
-def _verdicts_of(entries, review, number):
-    return {e["lane"]: e for e in entries if e.get("kind") == "lane" and e.get("review") == review and e.get("round") == number}
-
-
-def _carried(entries, lineage, lane):
-    """The lane's own open blocking objections from the lineage's earlier rounds (what its next round must answer)."""
-    mine = [e for e in entries if e.get("lineage") == lineage and e.get("kind") == "lane" and e.get("lane") == lane]
-    latest = {}
-    for entry in mine:
-        for obj in entry.get("objections") or []:
-            latest[obj["id"]] = dict(obj, lane=lane)
-    return [o for o in latest.values() if o.get("severity") == "blocking" and o.get("state") not in plan_review.CLOSED_STATES]
-
-
-def _launch_lanes(engine, state, cfg, round_entry, text, intent, done_when, now, planner):
-    """Launch up to `max_parallel` of the round's waiting lanes (the rest wait for a verdict). Each success is recorded as a `lane_session`."""
-    entries = review_entries(state)
-    launched = _sessions_of(entries, round_entry["review"], round_entry["round"])
-    active = [l for l in launched if l not in _verdicts_of(entries, round_entry["review"], round_entry["round"])]
-    room = max(0, cfg["max_parallel"] - len(active))
-    workspace = cfg.get("workspace") or os.environ.get("HERDR_WORKSPACE_ID")
-    directory = cfg.get("dir") or os.getcwd()
-    made = []
-    for lane in [l for l in round_entry["lanes"] if l not in launched][:room]:
-        name = "planrev-%s-%s-r%d" % (round_entry["review"], lane.lower(), round_entry["round"])
-        brief = plan_review.lane_brief(lane, round_entry["plan_ref"], round_entry["plan_hash"], text, intent, done_when,
-                                       carried=_carried(entries, round_entry["lineage"], lane), closing=bool(round_entry.get("closing")))
-        try:
-            done = launch_agent(engine, name, cfg["lane_agent"], directory, workspace, role="reviewer", reports_to=None,
-                                issue=round_entry.get("ask_number"), brief=brief)
-        except LaunchError as err:
-            raise ReviewError("lane %s did not launch (%s): the review stays open and the lane waits" % (lane, _one_line(str(err), 160))) from None
-        _review_record(engine, state, {"kind": "lane_session", "lineage": round_entry["lineage"], "review": round_entry["review"],
-                                       "round": round_entry["round"], "lane": lane, "session": name, "pane": done.get("pane"),
-                                       "by": planner}, now)
-        made.append((lane, name, done.get("pane")))
-    return made
-
-
-def _ask_texts(config, runner, now, rnd):
-    """(intent, done_when) of the round's ask, read again for the next round's briefs."""
-    repo, _, number = rnd["lineage"].rpartition("#")
-    got = _ask_facts(config, runner, now, "%s#%s" % (repo, number), config.get("intent_repo"))
-    return got[4], got[5]
-
-
-def review_start(args, runner, now, socket_call=None):
-    config = load_config()
-    cfg = review_config(config)
-    _, planner = review_caller(runner, now, "start a plan review")
-    engine, state, _ = build_engine(runner, now, "cli", writable=True, socket_call=socket_call)
-    default_repo = config.get("intent_repo")
-    ns = types.SimpleNamespace(source=args.source, file=None, ask=args.ask, done_when=None)
-    text, label, result = load_plan(ns, runner, now)
-    if result["result"] != "pass":
-        raise ReviewError("the plan fails `plan check` (%d defect(s)): fix it first" % len(result["defects"]))
-    plan_hash = result["plan_hash"]
-    ask_repo, ask_number, kind, parent_lineage, ask_intent, ask_done = _ask_facts(config, runner, now, args.ask, default_repo)
-    lineage = plan_review.lineage_key(ask_repo, ask_number)
-    plan_repo, plan_number, _ = parse_plan_source(args.source, default_repo)
-    plan_ref = "%s#%d" % (plan_repo, plan_number)
-    problem = _plan_ask_problem(config, runner, now, plan_repo, plan_number, ask_repo, ask_number)
-    if problem:
-        raise ReviewError("refused: %s" % problem)
-    hits = plan_review.path_hits(_unit_paths(text), cfg["held_globs"])
-    chosen = {}
-
-    def decide(entries, seq):
-        """Everything that decides whether this review may open, and its id, under the ledger lock with the ledger as it stands."""
-        for entry in entries:   # a plan source belongs to ONE ask
-            if entry.get("kind") == "round" and entry.get("plan_ref") == plan_ref and entry.get("lineage") != lineage:
-                raise ReviewError("%s is already under the review of %s: a plan does not move to another ask's count" % (plan_ref, entry["lineage"]))
-        mine = [e for e in entries if e.get("lineage") == lineage]
-        ok, why = plan_review.may_start(plan_review.lineage_state(mine, plan_hash), plan_hash)
-        if not ok:
-            raise ReviewError("refused: %s" % why)
-        day_ago = now() - 86400
-        if not plan_review.starts_today_ok(len([e for e in entries if e.get("kind") == "round" and e.get("start") and e.get("by") == planner
-                                               and e.get("ts", 0) >= day_ago]), cfg["starts_per_day"]):
-            raise ReviewError("refused: %s has started %d reviews in the last day (the limit)" % (planner, cfg["starts_per_day"]))
-        has_consensus = bool(parent_lineage) and any(e.get("kind") == "consensus" and e.get("lineage") == parent_lineage for e in entries)
-        tier, tier_why = plan_review.compute_tier(kind, hits, cfg["held_globs"], ask_has_consensus=has_consensus, requested=args.tier)
-        lanes = plan_review.lanes_for_tier(tier, held_area=bool(hits))
-        used = len([e for e in mine if e.get("kind") == "lane_session"])
-        if not plan_review.session_budget_ok(used, len(lanes), cfg["session_cap"]):
-            raise ReviewError("refused: the lineage has used %d of its %d lane sessions" % (used, cfg["session_cap"]))
-        chosen.update(review="rv%d" % seq, tier=tier, why=tier_why, lanes=lanes)   # the id comes from the appended sequence number
-        return {"kind": "round", "lineage": lineage, "review": chosen["review"], "round": 1, "closing": False, "start": True,
-                "ask_number": ask_number, "plan_ref": plan_ref, "plan_hash": plan_hash, "scenario_hash": result.get("scenario_hash"),
-                "tier": tier, "tier_why": tier_why, "lanes": lanes, "held_area": bool(hits), "by": planner}
-
-    stored = plan_ledger.append_checked(state, now(), decide)
-    if engine.audit is not None:
-        engine.audit.append(engine.actor, "plan.review.round", lineage, {"review": chosen["review"], "round": 1, "seq": stored["seq"],
-                                                                            "chain": stored["hash"]})
-    made = _launch_lanes(engine, state, cfg, stored, text, ask_intent, ask_done, now, planner)
-    return {"review": chosen["review"], "lineage": lineage, "tier": chosen["tier"], "why": chosen["why"], "lanes": chosen["lanes"],
-            "launched": made, "plan_hash": plan_hash}
-
-
-def _launch_waiting(engine, state, cfg, config, runner, now, rnd):
-    """After a verdict: launch the round's waiting lanes (up to `max_parallel` running). Best effort: a launch problem is returned, not raised."""
-    entries = review_entries(state)
-    sessions, verdicts = _sessions_of(entries, rnd["review"], rnd["round"]), _verdicts_of(entries, rnd["review"], rnd["round"])
-    if all(l in sessions for l in rnd["lanes"]) or all(l in verdicts for l in rnd["lanes"]):
-        return [], None
-    try:
-        ns = types.SimpleNamespace(source=rnd["plan_ref"], file=None, ask=None, done_when=None)
-        text = load_plan(ns, runner, now)[0]
-        made = _launch_lanes(engine, state, cfg, rnd, text, *_ask_texts(config, runner, now, rnd), now, rnd["by"])
-        return made, None
-    except (ReviewError, PlanInputError, ValueError, ConfigError, IntentError) as err:
-        return [], _one_line(str(err), 200)
-
-
-def review_verdict(args, runner, now, socket_call=None):
-    """The fallback path (the daemon's own read of a lane's final message is R3): a lane records its verdict for its own lane."""
-    config = load_config()
-    cfg = review_config(config)
-    engine, state, _ = build_engine(runner, now, "cli", writable=True, socket_call=socket_call)
-    entries = review_entries(state)
-    _refuse_if_abandoned(entries, args.review)
-    rnd = _round_of(entries, args.review)
-    caller = identify_caller(engine.herdr, engine.v2, os.environ)
-    sessions = _sessions_of(entries, args.review, rnd["round"])
-    if sessions.get(args.lane) != caller:
-        raise ReviewError("refused: %s is not the session launched for lane %s of this round (that is %s)" % (
-            caller, args.lane, sessions.get(args.lane) or "not launched"))
-    if caller == rnd["by"]:
-        raise ReviewError("refused: the planner cannot record a lane's verdict")
-    if args.lane in _verdicts_of(entries, args.review, rnd["round"]):
-        raise ReviewError("refused: lane %s already has its verdict for this round" % args.lane)
-    text = _read_capped(args.file, REVIEW_TABLE_MAX)
-    parsed, why = plan_review.parse_verdict_block(text, rnd["plan_hash"], args.lane)
-    if parsed is None:
-        raise ReviewError("refused: %s" % why)
-    if len(parsed["objections"]) > REVIEW_OBJECTIONS_MAX:
-        raise ReviewError("refused: %d objections in one verdict (at most %d): say the strongest" % (len(parsed["objections"]), REVIEW_OBJECTIONS_MAX))
-    entry = {"kind": "lane", "lineage": rnd["lineage"], "review": args.review, "round": rnd["round"], "lane": args.lane,
-             "verdict": parsed["verdict"], "plan_hash": rnd["plan_hash"], "objections": parsed["objections"], "by": caller}
-    def guarded(ledger, seq):
-        _refuse_if_abandoned(ledger, args.review)   # under the lock: an abandon that landed meanwhile still wins
-        if any(e.get("kind") == "lane" and e.get("review") == args.review and e.get("round") == rnd["round"] and e.get("lane") == args.lane for e in ledger):
-            raise ReviewError("refused: lane %s already has its verdict for this round" % args.lane)
-        return entry
-    stored = plan_ledger.append_checked(state, now(), guarded)
-    if engine.audit is not None:
-        engine.audit.append(engine.actor, "plan.review.lane", rnd["lineage"], {"review": args.review, "round": rnd["round"], "lane": args.lane,
-                                                                                "seq": stored["seq"], "chain": stored["hash"]})
-    made, trouble = _launch_waiting(engine, state, cfg, config, runner, now, rnd)
-    out = {"recorded": args.lane, "verdict": parsed["verdict"], "objections": len(parsed["objections"]),
-           "launched_next": [lane for lane, _, _ in made]}
-    if trouble:
-        out["waiting_lanes_not_launched"] = trouble
-    if rnd.get("closing"):
-        out.update(_closing_outcome(engine, state, cfg, config, runner, now, args.review))
-    return out
-
-
-def _closing_outcome(engine, state, cfg, config, runner, now, review):
-    """Once every lane of a closing round has reported: write the consensus (every lane of the tier approved the exact final hash and nothing
-    blocking is open), or escalate a blocking objection raised on the final text, or say it is still pending. The tally is computed from the
-    ledger alone; the consensus is bound to the final plan hash."""
-    entries = review_entries(state)
-    rnd = _round_of(entries, review)
-    if _abandoned(entries, review):
-        return {}
-    if not rnd.get("closing") or any(l not in _verdicts_of(entries, review, rnd["round"]) for l in rnd["lanes"]):
-        return {}
-    lineage = [e for e in entries if e.get("lineage") == rnd["lineage"]]
-    st = plan_review.lineage_state(lineage, rnd["plan_hash"])
-    lane_entries = [e for e in lineage if e.get("kind") == "lane"]
-    verdict, why = plan_review.decide_consensus(lane_entries, rnd["lanes"], rnd["plan_hash"], rounds_left=plan_review._rounds_left(st))
-    if verdict == "escalate":
-        out = _escalate(engine, state, cfg, config, runner, now, rnd, st, "", rnd["by"])
-        return {"tally": "escalate", "tally_why": why, "escalated": out["escalated"], "boss": out["boss"], "owner_only": out["owner_only"]}
-    if verdict != "consensus":
-        return {"tally": verdict, "tally_why": why}
-
-    def write(ledger, seq):
-        """Under the lock, from the ledger as it stands: the same tally, and not twice for one hash."""
-        _refuse_if_abandoned(ledger, review)
-        mine = [e for e in ledger if e.get("lineage") == rnd["lineage"]]
-        again, _ = plan_review.decide_consensus([e for e in mine if e.get("kind") == "lane"], rnd["lanes"], rnd["plan_hash"],
-                                                rounds_left=plan_review._rounds_left(plan_review.lineage_state(mine, rnd["plan_hash"])))
-        if again != "consensus":
-            raise ReviewError("the tally changed: no consensus")
-        if any(e.get("kind") == "consensus" and e.get("plan_hash") == rnd["plan_hash"] for e in ledger):
-            raise ReviewError("a consensus already exists at this hash")
-        return {"kind": "consensus", "result": "pass", "pr": "-", "scenario": "-", "lineage": rnd["lineage"], "review": review,
-                "plan_hash": rnd["plan_hash"], "plan_ref": rnd["plan_ref"], "tier": rnd["tier"], "lanes": rnd["lanes"],
-                "rounds": st["rounds"], "closing_round": rnd["round"], "by": "plan-review"}
-    try:
-        stored = plan_ledger.append_checked(state, now(), write)
-    except ReviewError as err:
-        return {"tally": "pending", "tally_why": str(err)}
-    if engine.audit is not None:
-        engine.audit.append(engine.actor, "plan.review.consensus", rnd["lineage"], {"review": review, "plan_hash": rnd["plan_hash"],
-                                                                                    "seq": stored["seq"], "chain": stored["hash"]})
-    return {"tally": "consensus", "consensus_at": rnd["plan_hash"]}
-
-
-def review_close(args, runner, now, socket_call=None):
-    """The closing round: the planner publishes the FINAL synthesized revision (`plan check` PASS, a `## Decisions` section); every lane of the tier
-    then confirms that exact text or objects. Only an approve at that hash from every lane makes a consensus: no closing round, no consensus.
-    Outside the 3-round cap, once per final hash, never with a blocking objection open or an escalation undecided."""
-    config = load_config()
-    cfg = review_config(config)
-    _, planner = review_caller(runner, now, "close a plan review")
-    engine, state, _ = build_engine(runner, now, "cli", writable=True, socket_call=socket_call)
-    entries = review_entries(state)
-    _refuse_if_abandoned(entries, args.review)
-    rnd = _round_of(entries, args.review)
-    if planner != rnd["by"] and planner != "owner":
-        raise ReviewError("refused: only the planner who started the review (%s) closes it" % rnd["by"])
-    missing = [l for l in rnd["lanes"] if l not in _verdicts_of(entries, args.review, rnd["round"])]
-    if missing:
-        raise ReviewError("refused: lanes %s have not reported for round %d" % (", ".join(missing), rnd["round"]))
-    ns = types.SimpleNamespace(source=args.plan_ref, file=None, ask=None, done_when=None)
-    text, label, result = load_plan(ns, runner, now)
-    if result["result"] != "pass":
-        raise ReviewError("the final revision fails `plan check` (%d defect(s))" % len(result["defects"]))
-    if not DECISIONS_HEADING_RE.search(text):
-        raise ReviewError("the final revision has no `## Decisions` section (the synthesis the planner owes: decision, drivers, alternatives, why)")
-    plan_repo, plan_number, _ = parse_plan_source(args.plan_ref, config.get("intent_repo"))
-    ask_repo, _, ask_number = rnd["lineage"].rpartition("#")
-    problem = _plan_ask_problem(config, runner, now, plan_repo, plan_number, ask_repo, int(ask_number))
-    if problem:
-        raise ReviewError("refused: %s" % problem)
-    lanes = plan_review.lanes_for_tier(rnd["tier"], held_area=bool(rnd.get("held_area")))
-    used = len([e for e in entries if e.get("lineage") == rnd["lineage"] and e.get("kind") == "lane_session"])
-    if not plan_review.session_budget_ok(used, len(lanes), cfg["session_cap"]):
-        raise ReviewError("refused: the lineage has used %d of its %d lane sessions" % (used, cfg["session_cap"]))
-    plan_ref = "%s#%d" % (plan_repo, plan_number)
-
-    def decide(ledger, seq):
-        _refuse_if_abandoned(ledger, args.review)
-        mine = [e for e in ledger if e.get("lineage") == rnd["lineage"]]
-        later = [e for e in ledger if e.get("kind") == "round" and e.get("review") == args.review and e.get("round") > rnd["round"]]
-        if later:
-            raise ReviewError("refused: round %d of this review is already open" % later[-1]["round"])
-        ok, why = plan_review.may_open_round(plan_review.lineage_state(mine, result["plan_hash"]), closing=True, plan_hash=result["plan_hash"])
-        if not ok:
-            raise ReviewError("refused: %s" % why)
-        return {"kind": "round", "lineage": rnd["lineage"], "review": args.review, "round": rnd["round"] + 1, "closing": True,
-                "ask_number": rnd.get("ask_number"), "plan_ref": plan_ref, "plan_hash": result["plan_hash"],
-                "scenario_hash": result.get("scenario_hash"), "tier": rnd["tier"], "lanes": lanes,
-                "held_area": rnd.get("held_area", False), "by": rnd["by"]}
-
-    stored = plan_ledger.append_checked(state, now(), decide)
-    made = _launch_lanes(engine, state, cfg, stored, text, *_ask_texts(config, runner, now, rnd), now, rnd["by"])
-    return {"review": args.review, "closing_round": stored["round"], "lanes": lanes, "launched": made, "plan_hash": result["plan_hash"]}
-
-
-def review_report(args, runner, now):
-    """What the review cost and what the reviewers caught: per round and lane the wall time, the verdict and the objections by severity, how many
-    the planner accepted and rejected, the objection titles, the totals, and the rounds to consensus. Token and money cost are NOT measured (the
-    harness records none yet): it says so, and records the session names so a later measure can join them."""
-    config = load_config()
-    review_config(config)
-    state = ensure_state_dir()
-    entries = review_entries(state)
-    rnd = _round_of(entries, args.review)
-    mine = [e for e in entries if e.get("lineage") == rnd["lineage"]]
-    rounds = sorted([e for e in mine if e.get("kind") == "round" and e.get("review") == args.review], key=lambda e: e["round"])
-    out_rounds, caught, total_sessions = [], [], 0
-    for r in rounds:
-        starts = {}
-        for e in mine:
-            if e.get("kind") == "lane_session" and e.get("review") == args.review and e.get("round") == r["round"]:
-                starts.setdefault(e["lane"], e["ts"])
-                total_sessions += 1
-        lanes = {}
-        for e in mine:
-            if e.get("kind") == "lane" and e.get("review") == args.review and e.get("round") == r["round"]:
-                blocking = len([o for o in e["objections"] if o["severity"] == "blocking"])
-                lanes[e["lane"]] = {"verdict": e["verdict"], "blocking": blocking, "advisory": len(e["objections"]) - blocking,
-                                    "seconds": e["ts"] - starts.get(e["lane"], e["ts"])}
-                for o in e["objections"]:
-                    if o["state"] == "open":
-                        caught.append({"round": r["round"], "lane": e["lane"], "id": o["id"], "severity": o["severity"], "text": o["text"]})
-        responses = [e for e in mine if e.get("kind") == "response" and e.get("review") == args.review and e.get("round") == r["round"]]
-        out_rounds.append({"round": r["round"], "closing": bool(r.get("closing")), "lanes": lanes,
-                           "accepted": sum(e.get("accepted", 0) for e in responses), "rejected": sum(e.get("rejected", 0) for e in responses)})
-    consensus = next((e for e in reversed(mine) if e.get("kind") == "consensus" and e.get("review") == args.review), None)
-    end = consensus["ts"] if consensus else max(e["ts"] for e in mine)
-    return {"review": args.review, "lineage": rnd["lineage"], "tier": rounds[0]["tier"], "rounds": out_rounds,
-            "rounds_to_consensus": len([r for r in rounds if not r.get("closing")]) if consensus else None,
-            "consensus": ({"plan_hash": consensus["plan_hash"], "overridden_by": consensus.get("overridden_by")} if consensus else None),
-            "escalations": len([e for e in mine if e.get("kind") == "escalation" and e.get("review") == args.review]),
-            "sessions": total_sessions, "wall_seconds": end - rounds[0]["ts"],
-            "caught": caught[:60], "caught_total": len(caught),
-            "cost": "tokens and money are not measured (the harness records none yet); the lane session names are in the ledger to join a later measure"}
-
-
-def review_status(args, runner, now):
-    config = load_config()
-    review_config(config)
-    state = ensure_state_dir()
-    entries = review_entries(state)
-    rnd = _round_of(entries, args.review)
-    mine = [e for e in entries if e.get("lineage") == rnd["lineage"]]
-    st = plan_review.lineage_state(mine, rnd["plan_hash"])
-    sessions, verdicts = _sessions_of(entries, args.review, rnd["round"]), _verdicts_of(entries, args.review, rnd["round"])
-    lanes = {lane: ("verdict:%s" % verdicts[lane]["verdict"] if lane in verdicts else "running" if lane in sessions else "waiting")
-             for lane in rnd["lanes"]}
-    return {"review": args.review, "lineage": rnd["lineage"], "round": rnd["round"], "tier": rnd["tier"], "plan_hash": rnd["plan_hash"],
-            "rounds_used": st["rounds"], "lanes": lanes, "open_blocking": st["open_blocking"], "open_review": st["open_review"],
-            "undecided_escalation": st["undecided"],
-            "overridden": st["overridden"].get(rnd["plan_hash"]), "consensus": rnd["plan_hash"] in st["consensus_hashes"],
-            "closing": bool(rnd.get("closing")),
-            "next": ("respond: the planner answers the open objections" if all(l in verdicts for l in rnd["lanes"]) and st["open_blocking"]
-                     else ("the consensus is recorded" if rnd["plan_hash"] in st["consensus_hashes"]
-                           else "tally pending: see `plan review close` (the closing round)") if all(l in verdicts for l in rnd["lanes"])
-                     else "waiting for the lanes")}
-
-
-def review_respond(args, runner, now, socket_call=None):
-    """The planner answers a finished round: the response table (every open blocking objection named), the new revision (`plan check`
-    PASS, a new hash), and the next round for the lanes that still object (plus L1 when the scenarios changed)."""
-    config = load_config()
-    cfg = review_config(config)
-    _, planner = review_caller(runner, now, "respond to a plan review")
-    engine, state, _ = build_engine(runner, now, "cli", writable=True, socket_call=socket_call)
-    entries = review_entries(state)
-    _refuse_if_abandoned(entries, args.review)
-    rnd = _round_of(entries, args.review)
-    if planner != rnd["by"] and planner != "owner":
-        raise ReviewError("refused: only the planner who started the review (%s) answers it" % rnd["by"])
-    verdicts = _verdicts_of(entries, args.review, rnd["round"])
-    missing = [l for l in rnd["lanes"] if l not in verdicts]
-    if missing:
-        raise ReviewError("refused: lanes %s have not reported for round %d" % (", ".join(missing), rnd["round"]))
-    mine = [e for e in entries if e.get("lineage") == rnd["lineage"]]
-    st = plan_review.lineage_state(mine, rnd["plan_hash"])
-    if not st["open_blocking"]:
-        raise ReviewError("nothing blocking is open: the next step is the closing round (`plan review close`), not another round")
-    ok, why = plan_review.may_open_round(st)
-    if not ok and st["undecided"]:
-        raise ReviewError("refused: %s" % why)
-    table = _read_capped(args.table, REVIEW_TABLE_MAX)
-    if not ok:   # the rounds are spent: what survives ESCALATES (recorded, and the boss told), it is never dropped
-        return _escalate(engine, state, cfg, config, runner, now, rnd, st, table, planner)
-    answered = {m.group(1) for m in re.finditer(r"(?m)^\s*([A-Za-z0-9]+/O[0-9]{1,3})\s*:\s*(?:accept|reject)\b", table)}
-    absent = [k for k in st["open_blocking"] if k not in answered]
-    if absent:
-        raise ReviewError("refused: the response table needs one line `<lane>/<id>: accept|reject, why` for each open objection; missing %s"
-                          % ", ".join(absent))
-    ns = types.SimpleNamespace(source=args.plan_ref, file=None, ask=None, done_when=None)
-    text, label, result = load_plan(ns, runner, now)
-    if result["result"] != "pass":
-        raise ReviewError("the new revision fails `plan check` (%d defect(s))" % len(result["defects"]))
-    if result["plan_hash"] == rnd["plan_hash"]:
-        raise ReviewError("the revision has the same plan hash: a new round needs a changed plan")
-    plan_repo, plan_number, _ = parse_plan_source(args.plan_ref, config.get("intent_repo"))
-    ask_repo, _, ask_number = rnd["lineage"].rpartition("#")
-    problem = _plan_ask_problem(config, runner, now, plan_repo, plan_number, ask_repo, int(ask_number))
-    if problem:
-        raise ReviewError("refused: %s" % problem)
-    # the next lanes come from the lineage's OPEN objections (their lanes), plus L1 when the scenarios changed: a lane-wide approve that
-    # omitted an id leaves it open, and its lane runs again; a round with no lane to run is refused, never opened.
-    objecting = {k.split("/", 1)[0] for k in st["open_blocking"]}
-    if result.get("scenario_hash") != rnd.get("scenario_hash"):
-        objecting.add("L1")
-    lanes = sorted(objecting & set(plan_review.LANES))
-    if not lanes:
-        raise ReviewError("refused: no lane has an open objection to re-run: nothing would review the new round")
-    used = len([e for e in mine if e.get("kind") == "lane_session"])
-    if not plan_review.session_budget_ok(used, len(lanes), cfg["session_cap"]):
-        raise ReviewError("refused: the lineage has used %d of its %d lane sessions" % (used, cfg["session_cap"]))
-    plan_ref = "%s#%d" % (plan_repo, plan_number)
-
-    def decide(entries, seq):
-        """Under the ledger lock: this review is still at the round the planner answered, and the round may open."""
-        _refuse_if_abandoned(entries, args.review)
-        later = [e for e in entries if e.get("kind") == "round" and e.get("review") == args.review and e.get("round") > rnd["round"]]
-        if later:
-            raise ReviewError("refused: round %d of this review is already open" % later[-1]["round"])
-        now_state = plan_review.lineage_state([e for e in entries if e.get("lineage") == rnd["lineage"]], rnd["plan_hash"])
-        allowed, why_not = plan_review.may_open_round(now_state)
-        if not allowed:
-            raise ReviewError("refused: %s" % why_not)
-        return {"kind": "round", "lineage": rnd["lineage"], "review": args.review, "round": rnd["round"] + 1, "closing": False,
-                "ask_number": rnd.get("ask_number"), "plan_ref": plan_ref, "plan_hash": result["plan_hash"],
-                "scenario_hash": result.get("scenario_hash"), "tier": rnd["tier"], "lanes": lanes,
-                "held_area": rnd.get("held_area", False), "by": rnd["by"]}
-
-    stored = plan_ledger.append_checked(state, now(), decide)
-    _review_record(engine, state, {"kind": "response", "lineage": rnd["lineage"], "review": args.review, "round": rnd["round"],
-                                   "table_hash": hashlib.sha256(table.encode("utf-8")).hexdigest(), "plan_ref": plan_ref,
-                                   "accepted": len(re.findall(r"(?m)^\s*[A-Za-z0-9]+/O[0-9]{1,3}\s*:\s*accept\b", table)),
-                                   "rejected": len(re.findall(r"(?m)^\s*[A-Za-z0-9]+/O[0-9]{1,3}\s*:\s*reject\b", table)),
-                                   "plan_hash": result["plan_hash"], "by": planner}, now)
-    made = _launch_lanes(engine, state, cfg, stored, text, *_ask_texts(config, runner, now, rnd), now, rnd["by"])
-    return {"review": args.review, "round": stored["round"], "lanes": lanes, "launched": made, "plan_hash": result["plan_hash"]}
-
-
-def _boss_of_planner(engine, planner):
-    """The agent that decides an escalation: the planner's boss, else the chief of staff (a person planner has none)."""
-    discovery = engine.discover(engine.now())
-    me = discovery.agents.get(planner)
-    boss = boss_name(discovery, me) if me is not None else None
-    return boss or resolve_boss(discovery, "chief-of-staff") or "chief-of-staff"
-
-
-def _escalation_target(engine, planner, already_escalated=False):
-    """(boss, owner_only) for an escalation: the planner's boss, else the chief of staff; but a planner that IS that boss (the chief of staff's
-    own plan) cannot judge its own plan, so the escalation goes to the owner directly, as does any escalation after the rounds that follow
-    an earlier one."""
-    boss = _boss_of_planner(engine, planner)
-    if already_escalated or boss == planner:
-        return "owner", True
-    return boss, False
-
-
-def _tell(engine, recipient, text):
-    """The switchboard's own message through the outbox (a sender no agent can be). Never raises: the ledger holds the fact either way."""
-    try:
-        outcome = engine.send(PROG, recipient, text)
-        return bool(outcome.get("sent"))
-    except (MessageTooLong, InterruptRefused, Exception):
-        return False
-
-
-def _response_of(table, key):
-    match = re.search(r"(?m)^\s*%s\s*:\s*((?:accept|reject)\b.*)$" % re.escape(key), table or "")
-    return match.group(1).strip() if match else ""
-
-
-def _escalate(engine, state, cfg, config, runner, now, rnd, st, table, planner):
-    """Record an `escalation` entry for every blocking objection still open (with the planner's response beside it) and tell the boss. After an
-    earlier escalation the rounds that follow it are spent: the escalation is then the owner's alone."""
-    boss, owner_only = _escalation_target(engine, planner, bool(st["escalated"]))
-    told = []
-    lanes_entries = [e for e in review_entries(state) if e.get("lineage") == rnd["lineage"] and e.get("kind") == "lane"]
-    objections = {}
-    for entry in lanes_entries:
-        for obj in entry.get("objections") or []:
-            objections["%s/%s" % (entry["lane"], obj["id"])] = dict(obj, lane=entry["lane"])
-    for key in st["open_blocking"]:
-        obj = objections.get(key, {"id": key.split("/", 1)[-1], "lane": key.split("/", 1)[0], "text": ""})
-        response = _response_of(table, key)
-        def once(entries, seq, key=key, obj=obj, response=response):
-            """Under the ledger lock: an objection already escalated and undecided is not escalated (or announced) twice."""
-            if key in _escalations(entries, rnd["review"]):
-                raise ReviewError("%s is already escalated" % key)
-            return {"kind": "escalation", "lineage": rnd["lineage"], "review": rnd["review"], "round": rnd["round"],
-                    "objection": key, "lane": obj["lane"], "text": plan_ledger.clip(obj.get("text"), 400),
-                    "response": plan_ledger.clip(response, 400), "boss": boss, "owner_only": owner_only,
-                    "plan_hash": rnd["plan_hash"], "held_area": bool(rnd.get("held_area")), "by": planner}
-        try:
-            stored = plan_ledger.append_checked(state, now(), once)
-        except ReviewError:
-            continue
-        if engine.audit is not None:
-            engine.audit.append(engine.actor, "plan.review.escalation", rnd["lineage"], {"review": rnd["review"], "objection": key,
-                                                                                          "seq": stored["seq"], "chain": stored["hash"]})
-        recipient = "chief-of-staff" if owner_only else boss
-        told.append((key, _tell(engine, recipient, plan_review.escalation_message(rnd["lineage"], dict(obj, id=key), response))))
-    return {"review": rnd["review"], "escalated": [k for k, _ in told], "boss": boss, "owner_only": owner_only,
-            "told": [k for k, ok in told if ok], "not_delivered": [k for k, ok in told if not ok],
-            "next": "decide: `plan review decide %s --objection <lane/id> --accept|--override --reason ...`" % rnd["review"]}
-
-
-def _escalations(entries, review):
-    """The review's undecided escalations, newest entry per objection."""
-    latest = {}
-    for entry in entries:
-        if entry.get("review") != review:
-            continue
-        if entry.get("kind") == "escalation":
-            latest[entry["objection"]] = entry
-        elif entry.get("kind") == "decision":
-            latest.pop(entry.get("objection"), None)
-    return latest
-
-
-def review_decide(args, runner, now):
-    """Resolve an escalated objection: `--accept` (the planner revises, within the rounds left) or `--override` (with a reason): an override of
-    the last open one writes the `consensus` entry, marked `overridden_by` with the reason. The risk lane and held-PR areas: the owner only."""
-    config = load_config()
-    review_config(config)
-    engine, state, _ = build_engine(runner, now, "cli", writable=True)
-    got = gates_caller_kind(runner, now)
-    if got[0] == "person":
-        kind, who = "person", "owner"
-    elif got[0] == "agent":
-        kind, who = "agent", got[1]
-    else:
-        raise ReviewError("refused: %s" % got[1])
-    action = "override" if args.override else "accept"
-    reason = " ".join((args.reason or "").split())
-    if len(reason) < plan_ledger.WAIVER_REASON_MIN:
-        raise ReviewError("a reason of at least %d characters is required" % plan_ledger.WAIVER_REASON_MIN)
-    outcome = {}
-
-    def build(entries, seq):
-        _refuse_if_abandoned(entries, args.review)
-        escalations = _escalations(entries, args.review)
-        esc = escalations.get(args.objection)
-        if esc is None:
-            raise ReviewError("refused: %s has no undecided escalation in %s (open: %s)" % (args.objection, args.review, ", ".join(sorted(escalations)) or "none"))
-        planner = _round_of(entries, args.review)["by"]
-        if kind == "agent" and who == planner:
-            ok, why = False, "the planner of a plan cannot decide an objection to it: only the owner at a terminal, or a boss that is not the planner"
-        else:
-            ok, why = plan_review.decision_allowed(action, esc.get("lane"), esc.get("held_area"), esc.get("owner_only"), kind, who == esc.get("boss"))
-        if not ok:
-            _gates_audit(engine, "plan.review.decide.refused", args.review, {"by": who, "objection": args.objection, "why": why})
-            raise ReviewError("refused: %s" % why)
-        outcome.update(esc=esc, others=[k for k in escalations if k != args.objection])
-        return {"kind": "decision", "lineage": esc["lineage"], "review": args.review, "objection": args.objection, "action": action,
-                "reason": plan_ledger.clip(reason, 300), "by": who, "decider": kind}
-
-    stored = plan_ledger.append_checked(state, now(), build)
-    esc = outcome["esc"]
-    if engine.audit is not None:
-        engine.audit.append(engine.actor, "plan.review.decision", esc["lineage"], {"review": args.review, "objection": args.objection,
-                                                                                    "action": action, "by": who, "seq": stored["seq"]})
-    result = {"decided": args.objection, "action": action, "by": who}
-    entries = review_entries(state)
-    if action == "override" and not outcome["others"]:
-        mine = [e for e in entries if e.get("review") == args.review]
-        accepted = [e for e in mine if e.get("kind") == "decision" and e.get("action") == "accept"]
-        rnd = _round_of(entries, args.review)
-        # the last open objection was overridden and nothing awaits a revision: the consensus is written, marked overridden
-        if not accepted or accepted[-1]["seq"] < max(e["seq"] for e in mine if e.get("kind") == "escalation"):
-            if not _abandoned(entries, args.review) and not any(e.get("kind") == "consensus" and e.get("plan_hash") == rnd["plan_hash"] for e in entries):
-                consensus = plan_ledger.append_entry(state, {"kind": "consensus", "result": "pass", "pr": "-", "scenario": "-",
-                                                             "lineage": rnd["lineage"], "review": args.review, "plan_hash": rnd["plan_hash"],
-                                                             "plan_ref": rnd["plan_ref"], "tier": rnd["tier"], "lanes": rnd["lanes"],
-                                                             "rounds": rnd["round"], "overridden_by": who, "override_reason": plan_ledger.clip(reason, 300),
-                                                             "by": "plan-review"}, now())
-                result["consensus"] = "written, overridden by %s" % who
-                if engine.audit is not None:
-                    engine.audit.append(engine.actor, "plan.review.consensus", rnd["lineage"], {"review": args.review, "overridden_by": who,
-                                                                                                "seq": consensus["seq"], "chain": consensus["hash"]})
-    elif action == "accept":
-        _tell(engine, _round_of(entries, args.review)["by"], "Plan review %s: objection %s was accepted by %s: revise the plan (%s). Then `plan review respond`."
-              % (args.review, args.objection, who, plan_ledger.clip(reason, 200)))
-        result["next"] = "the planner revises and runs `plan review respond` (the rounds after an escalation are limited to %d)" % plan_review.POST_ESCALATION_ROUNDS
-    return result
-
-
-def review_tick(args, runner, now, socket_call=None):
-    """Housekeeping over the open reviews (run by a person, an orchestrator, the chief of staff or a timer): a lane with no verdict after
-    `lane_timeout_seconds` is relaunched once and then escalated as unavailable; an escalation nobody decided gets a reminder every
-    `escalation_hours`. Never counts a stalled lane as an approval."""
-    config = load_config()
-    cfg = review_config(config)
-    review_caller(runner, now, "run the plan review housekeeping")
-    engine, state, _ = build_engine(runner, now, "cli", writable=True, socket_call=socket_call)
-    entries = review_entries(state)
-    done = {"relaunched": [], "unavailable": [], "reminded": []}
-    reviews = sorted({e["review"] for e in entries if e.get("kind") == "round"})
-    for review in reviews:
-        rnd = _round_of(entries, review)
-        mine = [e for e in entries if e.get("lineage") == rnd["lineage"]]
-        st = plan_review.lineage_state(mine, rnd["plan_hash"])
-        if not st["open_review"]:
-            continue
-        sessions = [e for e in entries if e.get("kind") == "lane_session" and e.get("review") == review and e.get("round") == rnd["round"]]
-        times = {}
-        for e in sessions:
-            times[e["lane"]] = e["ts"]
-        verdict_lanes = set(_verdicts_of(entries, review, rnd["round"]))
-        for lane, started in sorted(plan_review.stuck_lanes(rnd["lanes"], times, verdict_lanes, now(), cfg["lane_timeout_seconds"]).items()):
-            tries = len([e for e in sessions if e["lane"] == lane])
-            if tries <= plan_review.LANE_RETRIES:
-                name = "planrev-%s-%s-r%d-retry%d" % (review, lane.lower(), rnd["round"], tries)
-
-                def claim(ledger, seq, lane=lane, tries=tries, name=name):
-                    """Under the ledger lock: the relaunch is claimed once (two ticks cannot both relaunch the same lane)."""
-                    have = [e for e in ledger if e.get("kind") == "lane_session" and e.get("review") == review and e.get("round") == rnd["round"]
-                            and e.get("lane") == lane]
-                    if len(have) != tries or any(e.get("session") == name for e in have):
-                        raise ReviewError("already relaunched")
-                    return {"kind": "lane_session", "lineage": rnd["lineage"], "review": review, "round": rnd["round"], "lane": lane,
-                            "session": name, "pane": None, "retry": tries, "by": "plan-review"}
-                try:
-                    plan_ledger.append_checked(state, now(), claim)
-                except ReviewError:
-                    continue
-                try:
-                    ns = types.SimpleNamespace(source=rnd["plan_ref"], file=None, ask=None, done_when=None)
-                    text = load_plan(ns, runner, now)[0]
-                    brief = plan_review.lane_brief(lane, rnd["plan_ref"], rnd["plan_hash"], text, *_ask_texts(config, runner, now, rnd),
-                                                   carried=_carried(entries, rnd["lineage"], lane), closing=bool(rnd.get("closing")))
-                    launch_agent(engine, name, cfg["lane_agent"], cfg.get("dir") or os.getcwd(),
-                                 cfg.get("workspace") or os.environ.get("HERDR_WORKSPACE_ID"), role="reviewer", reports_to=None,
-                                 issue=rnd.get("ask_number"), brief=brief)
-                    done["relaunched"].append(lane)
-                except (LaunchError, PlanInputError, ValueError, ConfigError, IntentError):
-                    pass   # the claim stands: the next tick finds the lane still silent with its retry spent, and escalates it
-                continue
-            boss, owner_only = _escalation_target(engine, rnd["by"])
-            key = "%s/unavailable" % lane
-
-            def unavailable(ledger, seq, lane=lane, key=key, boss=boss, owner_only=owner_only):
-                if key in _escalations(ledger, review):
-                    raise ReviewError("already escalated")
-                return {"kind": "escalation", "lineage": rnd["lineage"], "review": review, "round": rnd["round"], "objection": key,
-                        "lane": lane, "text": "lane %s gave no verdict after a relaunch" % lane, "response": "", "boss": boss,
-                        "owner_only": owner_only, "plan_hash": rnd["plan_hash"], "held_area": bool(rnd.get("held_area")), "by": "plan-review"}
-            try:
-                plan_ledger.append_checked(state, now(), unavailable)
-            except ReviewError:
-                continue
-            _tell(engine, "chief-of-staff" if owner_only else boss,
-                  "Plan review %s: lane %s is unavailable (no verdict after a relaunch); a stalled lane never counts as an approval. "
-                  "Decide with `plan review decide %s --objection %s --accept|--override --reason ...`." % (review, lane, review, key))
-            done["unavailable"].append((lane, boss))
-        for key, esc in _escalations(entries, review).items():
-            def remind(ledger, seq, key=key, esc=esc):
-                times = [e["ts"] for e in ledger if e.get("kind") == "reminder" and e.get("review") == review and e.get("objection") == key]
-                if not plan_review.reminder_due(esc["ts"], max(times) if times else None, now(), cfg["escalation_hours"]):
-                    raise ReviewError("not due")
-                return {"kind": "reminder", "lineage": rnd["lineage"], "review": review, "objection": key, "by": "plan-review"}
-            try:
-                plan_ledger.append_checked(state, now(), remind)
-            except ReviewError:
-                continue
-            _tell(engine, "chief-of-staff" if esc.get("owner_only") else esc.get("boss"),
-                  "Reminder: plan review %s has an escalation (%s) undecided for over %d hours." % (review, key, cfg["escalation_hours"]))
-            done["reminded"].append(key)
-        entries = review_entries(state)
-    done["unavailable"] = [l for l, _ in done["unavailable"]]
-    return done
-
-
-def review_abandon(args, runner, now):
-    config = load_config()
-    review_config(config)
-    _, who = review_caller(runner, now, "abandon a plan review")
-    engine, state, _ = build_engine(runner, now, "cli", writable=True)
-    entries = review_entries(state)
-    rnd = _round_of(entries, args.review)
-    if _abandoned(entries, args.review):
-        raise ReviewError("review %s is already abandoned" % args.review)
-    reason = " ".join((args.reason or "").split())
-    if len(reason) < plan_ledger.WAIVER_REASON_MIN:
-        raise ReviewError("a reason of at least %d characters is required" % plan_ledger.WAIVER_REASON_MIN)
-    _review_record(engine, state, {"kind": "abandoned", "lineage": rnd["lineage"], "review": args.review, "round": rnd["round"],
-                                   "reason": plan_ledger.clip(reason, 300), "by": who}, now)
-    closed = []
-    for key, esc in sorted(_escalations(review_entries(state), args.review).items()):   # an abandoned review's escalations are closed, so a new start is not refused for ever
-        _review_record(engine, state, {"kind": "decision", "lineage": rnd["lineage"], "review": args.review, "objection": key,
-                                       "action": "abandoned", "reason": plan_ledger.clip(reason, 300), "by": who, "decider": "abandon"}, now)
-        closed.append(key)
-    return {"abandoned": args.review, "lineage": rnd["lineage"], "by": who, "escalations_closed": closed}
-
-
-def cmd_plan_review(args, runner, now, socket_call=None):
-    """`plan review start|verdict|respond|status|abandon`: exit 0 done, 2 refused or unusable. One JSON object on stdout with --json."""
-    try:
-        action = {"start": review_start, "verdict": review_verdict, "respond": review_respond, "status": review_status,
-                  "abandon": review_abandon, "decide": review_decide, "tick": review_tick, "close": review_close,
-                  "report": review_report}[args.review_action]
-        done = (action(args, runner, now, socket_call) if args.review_action in ("start", "respond", "verdict", "tick", "close")
-                else action(args, runner, now))
-    except (ReviewError, PlanInputError, ValueError, ConfigError, IntentError, plan_ledger.LedgerError, CallerError, IdentityUncertain,
-            LaunchError, OSError) as err:
-        sys.stderr.write("%s: plan review: %s\n" % (PROG, _one_line(str(err), 400)))
-        return EXIT_USAGE
-    if getattr(args, "json", False):
-        print(json.dumps(done, sort_keys=True))
-    else:
-        for key, value in done.items():
-            print("%s: %s" % (key, value if not isinstance(value, (list, dict)) else json.dumps(value, sort_keys=True)))
-    return EXIT_OK
-
-
 # ---------------------------------------------------------------- `prove`, `verdict`, `gates` (#107): the evidence ledger
 
 PLAN_LINE_RE = re.compile(r"(?m)^\s*PLAN:\s*(\S+)")
@@ -20728,6 +19431,128 @@ LEDGER_PR_PATTERN = r"owner/repo#N or the PR's URL"
 
 class LedgerCommandError(Exception):
     """A `prove`, `verdict` or `gates` command that cannot go on (exit 2): a usage problem, said in one line."""
+
+
+# ---- #1049: what a recording command (`prove`, `verdict`, `review record`) always ends with. One final line: `recorded #<id> ...`, `already recorded #<id> ...`
+# or `not recorded: <reason>`; the exit status is non-zero unless it recorded (or found it already recorded). Every wait of the command is bounded by the ONE
+# constant `plan_ledger.RECORD_WAIT_SECONDS` (the ledger lock, each GitHub read, the agent registry): a command that is cut says what it waited for and the
+# read-only command that shows whether the record landed. The set of recording commands is the set of functions marked by `@recording(...)`.
+
+class RecordTimeout(BaseException):
+    """The recording command's own bound passed. A BaseException on purpose: no `except Exception` on the way (a best-effort read) can swallow it."""
+
+    def __init__(self, step):
+        super().__init__(step)
+        self.step = step
+
+
+RECORD_ERRORS_USAGE = (LedgerCommandError, PlanInputError, plan_ledger.LedgerError)   # exit 2, as `dispatch` maps a ledger command's own errors
+
+
+def record_errors_failed():
+    """Exit 1, as `dispatch` maps them (looked up when needed: some are defined further down the file)."""
+    return (V2Error, HerdrError, ConfigError, FaultError, FactError, CallerError, LockError, LaunchError, IntentError, InstallError)
+
+
+_record_step = ["starting"]
+
+
+def record_step(name):
+    """Say what the recording command waits for now (the alarm names it when it says it is still waiting, or gives up)."""
+    _record_step[0] = name
+
+
+def not_recorded_timeout(pr, step):
+    """The one line of a cut command: names the bound, what it waited for and the read-only command that shows whether it landed."""
+    return ("not recorded: timed out after %ds, check the ledger before retrying (it was waiting for %s): run `fleet-switchboard gates %s`"
+            % (load_plan_ledger().RECORD_WAIT_SECONDS, step, (str(pr) if re.fullmatch(r"[\w./:#@-]+", str(pr)) else shlex.quote(str(pr)))))
+
+
+def recorded_line(label, pr, head, outcomes):
+    """The final success line from [(stored entry, already)]: `recorded #3, #4 (...)`, `already recorded #3 (...)` or both."""
+    fresh = ["#%d" % e["seq"] for e, already in outcomes if not already]
+    older = ["#%d" % e["seq"] for e, already in outcomes if already]
+    said = "; ".join(x for x in ("recorded " + ", ".join(fresh) if fresh else "", "already recorded " + ", ".join(older) if older else "") if x)
+    return "%s (%s %s at %s)" % (said, label, pr, (head or "")[:8])
+
+
+def run_recording(fn, a, kw, args):
+    """Run the recording command `fn` under its bound. A refusal ends `not recorded: <reason>` (exit 2, or 1 for an environment error); the
+    bound ends `not recorded: timed out after Ns, check the ledger before retrying ...` (exit 1) and the alarm is held back while an entry is
+    written, so a command is never cut after its record landed."""
+    ledger = load_plan_ledger()   # the module itself: the lazy `plan_ledger` name would take an assignment onto itself
+    pr = getattr(args, "pr", None) or "<pr>"
+    wait, progress = ledger.RECORD_WAIT_SECONDS, ledger.RECORD_PROGRESS_SECONDS
+    armed = threading.current_thread() is threading.main_thread() and hasattr(signal, "setitimer")
+    said = [False]
+    before_hook, before_handler = ledger.step_hook, None
+
+    def on_alarm(signum, frame):
+        if ledger.IN_CRITICAL:
+            return
+        step = _record_step[0]
+        if not said[0] and wait > progress:
+            said[0] = True
+            if step != ledger.LOCK_STEP:   # the lock's own wait says it already
+                sys.stderr.write("%s: waiting for %s (giving up after %ds)\n" % (PROG, step, wait))
+                sys.stderr.flush()
+            signal.setitimer(signal.ITIMER_REAL, wait - progress)
+            return
+        raise RecordTimeout(step)
+
+    record_step("starting")
+    ledger.step_hook = record_step
+    try:
+        if armed:
+            before_handler = signal.signal(signal.SIGALRM, on_alarm)
+            signal.setitimer(signal.ITIMER_REAL, progress if wait > progress else wait)
+        try:
+            return fn(*a, **kw)
+        finally:
+            if armed:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+    except RecordTimeout as cut:
+        sys.stderr.write(not_recorded_timeout(pr, cut.step) + "\n")
+        return EXIT_ERROR
+    except ledger.LedgerLockTimeout:
+        sys.stderr.write(not_recorded_timeout(pr, ledger.LOCK_STEP) + "\n")
+        return EXIT_ERROR
+    except RECORD_ERRORS_USAGE as err:
+        sys.stderr.write("not recorded: %s\n" % _one_line(str(err), 400))
+        return EXIT_USAGE
+    except record_errors_failed() as err:
+        sys.stderr.write("not recorded: %s\n" % _one_line(str(err), 400))
+        return EXIT_ERROR
+    finally:
+        ledger.step_hook = before_hook
+        if armed and before_handler is not None:
+            signal.signal(signal.SIGALRM, before_handler)
+
+
+def recording(kind, applies=None):
+    """Mark a command function as a recording command of `kind` (`proof`, `verdict`, `review_record`), run under `run_recording`. `applies(args)`
+    says which of its forms record (`review` records only for `review record`). Marked functions are the ONE list: `RECORDING_COMMANDS` is read from them."""
+    def mark(fn):
+        @functools.wraps(fn)
+        def run(*a, **kw):
+            args = a[0] if a else kw.get("args")
+            if applies is not None and not applies(args):
+                return fn(*a, **kw)
+            return run_recording(fn, a, kw, args)
+        run.records = kind
+        return run
+    return mark
+
+
+def is_review_record(args):
+    """`review record` (the only form of `review` that writes)."""
+    return args.review_cmd == "record"
+
+
+def recording_commands():
+    """{command name: kind} of every function marked `@recording`, read from this module (never a list to edit)."""
+    return {name[4:].replace("_", "-"): fn.records for name, fn in sorted(globals().items())
+            if name.startswith("cmd_") and callable(fn) and isinstance(getattr(fn, "records", None), str)}
 
 
 def pr_picture(engine, repo, number, state):
@@ -20771,8 +19596,11 @@ def plan_source_for(explicit, entries, pr, body, default_repo=None):
     return source or explicit
 
 
-def checked_plan(engine_config, source, ask, runner, now):
-    """The plan at `source`, checked: {"result", "defects", "scenarios_parsed", "plan_hash", "source"}."""
+def checked_plan(engine_config, source, ask, runner, now, text=None, done_when=None):
+    """The plan at `source`, checked: {"result", "defects", "scenarios_parsed", "plan_hash", "source"}. With `text` (a plan already read) nothing is read again."""
+    if text is not None:
+        parsed = plan_check.parse_scenarios(plan_check.scenario_block(text))
+        return dict(plan_check.check(text, done_when, None), scenarios_parsed=parsed, source="plan comment of %s" % source, text=text)
     ns = types.SimpleNamespace(source=source, file=None, ask=ask, done_when=None)
     text, label, result = load_plan(ns, runner, now)
     parsed = plan_check.parse_scenarios(plan_check.scenario_block(text))
@@ -20787,24 +19615,98 @@ def _ledger_pr(args):
     return repo, number, "%s#%d" % (repo, number)
 
 
+def ask_refusal(issue, ref):
+    """#1130: why an issue is no ASK that may take a verdict (None when it is one). An ask is OPEN, carries `## Intent` and `Done when:`, is no charter (the
+    `<user>:orchestrator` label, as `item_chain` readers and the charter scan recognise one) and is a sub-issue of a charter (it has a parent)."""
+    if str(issue.get("state") or "").lower() == "closed":
+        return "%s is an issue, not a pull request, and it is closed: a closed issue takes no record" % ref
+    intent, done_when = parse_intent(issue.get("body"))
+    if not intent or not done_when:
+        return "%s is an issue, not a pull request, and has no `## Intent` with a `Done when:` line: it is not an ask" % ref
+    if any(str(l).endswith(":orchestrator") for l in issue.get("labels") or ()):
+        return "%s is an issue, not a pull request, and a charter (it carries the orchestrator label), not an ask" % ref
+    if not issue.get("parent"):
+        return "%s is an issue, not a pull request, and has no parent issue: a charter, not an ask (an ask is a sub-issue of a charter)" % ref
+    return None
+
+
+def ask_plan_comment(engine, repo, number):
+    """The newest plan comment (a heading `Plan (scenarios)`) of the issue `repo#number`, or None. GETs only; a page that cannot be read is no plan."""
+    comments = []
+    try:
+        for page in range(1, PLAN_COMMENT_PAGES + 1):
+            got = engine.intents._api("repos/%s/issues/%d/comments?per_page=100&page=%d" % (repo, number, page), repo)
+            if not isinstance(got, list):
+                break
+            comments.extend(got)
+            if len(got) < 100:
+                break
+    except (IntentError, AttributeError):
+        return None
+    text, source = plan_check.select_plan_text("", comments)
+    return text if source != "issue body" else None
+
+
+def ask_subject(engine, repo, number, entries, unreadable, explicit, runner, now, writable):
+    """#1130: `verdict`, `prove` and `gates` on an ASK ISSUE (an issue that is no pull request and no work item). None when the number is not such an
+    issue (the pull request rules then apply exactly as before). Else {"facts", "plan", "plan_problem"}: the plan is the plan comment on the issue, and the
+    "head" of the subject is the plan hash (`plan_ledger.ask_head`), so a record names the issue and the hash, and a revised plan voids it as a moved head does.
+    An issue with no plan comment is refused (LedgerCommandError) with its reason: a record would bind to nothing."""
+    ref = "%s#%d" % (repo, number)
+    try:
+        issue = item_issue(engine, repo, number)
+    except LedgerCommandError:
+        return None
+    if explicit:
+        try:
+            named = parse_plan_source(explicit, repo)[:2]
+        except PlanInputError:
+            named = None
+        if named != (repo, number):
+            raise LedgerCommandError("--plan %s is not the plan of %s: an ask issue is bound to the plan comment on the issue itself" % (explicit, ref))
+    why = ask_refusal(issue, ref)
+    if why:
+        raise LedgerCommandError("refused: %s, nothing was recorded" % why)
+    comment = ask_plan_comment(engine, repo, number)   # read ONCE: the same read serves the check here and the hash below
+    if comment is None:
+        if not writable:
+            return {"facts": {"author": issue["author"], "ask_issue": True}, "plan": None,
+                    "plan_problem": "%s is an issue with no plan comment: there is nothing to bind a record to" % ref}
+        raise LedgerCommandError("refused: %s is an issue, not a pull request, and it has no plan comment: a record would bind to nothing, nothing was recorded" % ref)
+    plan, problem = None, None
+    try:
+        plan = checked_plan({}, ref, None, runner, now, text=comment, done_when=parse_intent(issue["body"])[1])
+    except (PlanInputError, ValueError, ConfigError, IntentError) as err:
+        problem = _one_line(str(err), 200)
+    facts = {"author": issue["author"], "ask_issue": True, "notice_senders": [], "body": issue["body"], "state": issue["state"],
+             "head": plan_ledger.ask_head(plan["plan_hash"]) if plan else None}
+    return {"facts": facts, "plan": plan, "plan_problem": problem}
+
+
 def _ledger_context(args, runner, now, writable, parts=None, floor=False):
     """Everything `prove`, `verdict` and `gates` share: the engine, state, PR ref, its picture and its checked plan. `parts` is
     (engine, state, config) when the caller already has them (the daemon's pass); else the engine is built."""
     engine, state, config = parts if parts is not None else build_engine(runner, now, "cli", writable=writable)
     repo, number, pr = _ledger_pr(args)
     entries, problem = plan_ledger.read_ledger(state)
+    record_step("a GitHub read of %s" % pr)
     facts, body, senders, unreadable = pr_picture(engine, repo, number, state)
     if writable:   # #770: an item's entries are written only by the item commands
-        why = item_entry_refusal(engine, repo, number, entries, unreadable)
+        why = item_entry_refusal(engine, repo, number, entries, unreadable, True)
         if why:
             _gates_audit(engine, "plan.item.refused", pr, {"item": pr, "why": why, "stage": "pull request command"})
             raise LedgerCommandError("refused: %s" % why)
+    ask = ask_subject(engine, repo, number, entries, unreadable, args.plan, runner, now, writable) if unreadable else None   # #1130: the ONE place a subject that is an issue is resolved
+    if ask is not None:
+        return types.SimpleNamespace(engine=engine, state=state, config=config, repo=repo, number=number, pr=pr, entries=entries, problem=problem,
+                                     facts=ask["facts"], unreadable=None, source=pr, plan=ask["plan"], plan_problem=ask["plan_problem"], ask_issue=True)
     facts = dict(facts or {}, body=body, notice_senders=senders, held_check=lambda: held_defects(body))
     if floor and facts.get("head"):
         facts["floor"] = gate_floor_fact(engine, state, repo, number, facts["head"])
     source = plan_source_for(args.plan, entries, pr, body, config.get("intent_repo"))
     plan, plan_problem = None, None
     if source:
+        record_step("a GitHub read of the plan %s" % source)
         try:
             plan = checked_plan(config, source, args.ask, runner, now)
         except (PlanInputError, ValueError, ConfigError, IntentError) as err:
@@ -20886,6 +19788,8 @@ def _scenario_of(ctx, sid):
 
 def _head_of(ctx, args):
     known = (ctx.facts or {}).get("head")
+    if getattr(ctx, "ask_issue", False) and not known:
+        raise LedgerCommandError("the plan hash of %s is unknown: nothing was recorded" % ctx.pr)
     head = args.head or known
     if known and args.head and not (known.startswith(args.head) or args.head.startswith(known)):
         raise LedgerCommandError("--head %s is not the PR's head (%s): nothing was recorded" % (args.head[:12], known[:12]))
@@ -20895,12 +19799,13 @@ def _head_of(ctx, args):
 
 
 def _record(ctx, args, now, entry):
-    stored = plan_ledger.append_entry(ctx.state, entry, now())
-    if ctx.engine.audit is not None:
+    """(stored entry, already): the entry written, or the identical one already there (nothing written, no audit line: #1049)."""
+    (stored, already), = plan_ledger.append_once(ctx.state, [entry], now())
+    if not already and ctx.engine.audit is not None:
         ctx.engine.audit.append(ctx.engine.actor, "plan.%s" % entry["kind"], ctx.pr,
                                 {"scenario": entry["scenario"], "result": entry["result"], "seq": stored["seq"], "by": entry["by"],
                                  "chain": stored["hash"]})
-    return stored
+    return stored, already
 
 
 def _evidence(args):
@@ -20917,16 +19822,19 @@ def _already_proven(ctx, sid, plan_hash, head, result):
     return fresh[-1] if fresh and fresh[-1].get("result") == result else None
 
 
+@recording("proof")
 def cmd_prove(args, runner, now):
     """`prove <scenario>... --pr <repo#N> --evidence ...`: the calling agent records what it ran and saw for each named scenario of
     the PR's plan, at the PR's head, bound to the plan's hash. It records a PROOF; it never records a verdict. Each scenario gets one
     line: recorded (stdout), or already recorded at this head and plan hash (stdout, counts as recorded), or refused with its
-    reason (stderr). Exit 0 when every named scenario is recorded; EXIT_PARTIAL when any was refused. What applies to the whole
+    reason (stderr), then ONE final line (#1049): `recorded #<id> ...`, `already recorded #<id> ...` or, when any was refused, `not recorded: ...`.
+    Exit 0 when every named scenario is recorded; EXIT_PARTIAL when any was refused. What applies to the whole
     command (no plan, a failing plan check, no caller, no evidence, an unknown head) stays a usage error: nothing is recorded."""
     ctx = _ledger_context(args, runner, now, True)
+    record_step("the agent registry (who is calling)")
     caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
     _plan_usable(ctx)
-    refused, common = 0, None
+    refused, common, outcomes = 0, None, []
     for sid in dict.fromkeys(args.scenario):
         try:
             _scenario_of(ctx, sid)
@@ -20938,18 +19846,24 @@ def cmd_prove(args, runner, now):
             head = _head_of(ctx, args)
             common = (head, _evidence(args))
         head, evidence = common
-        found = _already_proven(ctx, sid, ctx.plan["plan_hash"], head, args.result)
-        if found:
-            print("already recorded proof #%d: %s %s at %s (%s), bound to plan %s" % (found["seq"], sid, args.result, head[:8], ctx.pr,
-                                                                                  ctx.plan["plan_hash"][:19]))
-            continue
         entry = {"kind": "proof", "pr": ctx.pr, "scenario": sid, "plan_ref": ctx.source,
                  "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
                  "evidence": evidence, "command": plan_ledger.clip(redact_command_text(args.command or "")),
+                 **({"files": sorted(set(args.file))} if getattr(args, "file", None) else {}),
                  "env": "%s %s" % (sys.platform, "python%d.%d" % sys.version_info[:2])}
-        stored = _record(ctx, args, now, entry)
-        print("recorded proof #%d: %s %s at %s (%s), bound to plan %s" % (stored["seq"], sid, args.result,
-                                                                          head[:8], ctx.pr, entry["plan_hash"][:19]))
+        try:
+            stored, already = _record(ctx, args, now, entry)
+        except plan_ledger.LedgerRefused as err:
+            print("not recorded: %s: %s" % (sid, err), file=sys.stderr)
+            refused += 1
+            continue
+        outcomes.append((stored, already))
+        print("%s proof #%d: %s %s at %s (%s), bound to plan %s" % ("already recorded" if already else "recorded", stored["seq"], sid, args.result,
+                                                                    head[:8], ctx.pr, entry["plan_hash"][:19]))
+    if outcomes:
+        print(recorded_line("proof", ctx.pr, common[0], outcomes))
+    if refused:
+        print("not recorded: %d of %d scenarios refused (the reasons are above)" % (refused, len(set(args.scenario))), file=sys.stderr)
     return EXIT_PARTIAL if refused else EXIT_OK
 
 
@@ -20974,9 +19888,11 @@ def launched_testers_for(ctx):
     return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions, fleets
 
 
+@recording("verdict")
 def cmd_verdict(args, runner, now):
     """`verdict <scenario> --pr <repo#N> --as <evaluator> --result ...`: record the evaluator's verdict for a scenario. Only
-    the evaluator the scenario names, only by an agent registered for it (`plan_evaluators`), never by a writer of the PR."""
+    the evaluator the scenario names, only by an agent registered for it (`plan_evaluators`), never by a writer of the PR.
+    It ends with one line (#1049): `recorded #<id> ...`, `already recorded #<id> ...` (the same record again writes nothing) or `not recorded: <reason>`."""
     ctx = _ledger_context(args, runner, now, True)
     every = bool(getattr(args, "all_scenarios", False))
     if every:   # `--all`: every per-PR scenario this evaluator judges, in one command; never another evaluator's
@@ -21000,21 +19916,26 @@ def cmd_verdict(args, runner, now):
     if named == "owner":
         # The owner's verdict comes only from the owner's own terminal: a caller with NO agent session. An agent (even an
         # unregistered one, even the chief of staff) is refused; so is an uncertain identity.
+        record_step("the agent registry (who is calling)")
         got = gates_caller_kind(runner, now)
         caller, ok = "owner", got[0] == "person"
         why = None if ok else "only the owner, from the owner's own terminal (no agent session), may record `owner` verdicts; %s is %s" % (
             got[1], "an agent" if got[0] == "agent" else "not known")
     else:
+        record_step("the agent registry (who is calling)")
         caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
-        if not plan_ledger.known_writers(ctx.entries, ctx.pr, senders):
+        if not plan_ledger.known_writers(ctx.entries, ctx.pr, list(senders) + [ctx.facts.get("author")] * bool(getattr(ctx, "ask_issue", False))):
             raise LedgerCommandError("refused: no writer of %s is known to the switchboard (nobody has recorded a proof or sent its "
                                      "`notice pr`): its author must do that first, so the author can be excluded" % ctx.pr)
         allowed, launch, sessions, fleets = ctx.config.get("plan_evaluators"), {}, {}, {}
         authors = plan_ledger.authors_of(ctx.entries, ctx.pr, senders, ctx.facts.get("author"))
         if named == "tester":   # #372: the configured list UNION the testers the launch record names for this repo; any trouble reading it is the configured list alone
+            record_step("the agent registry (the launched testers)")
             launch, sessions, fleets = launched_testers_for(ctx)
             allowed = load_launch_testers().evaluators(allowed, launch)
         ok, why = plan_ledger.may_record_verdict(named, caller, allowed, authors)
+        if getattr(ctx, "ask_issue", False) and caller and caller == ctx.facts.get("author"):   # #1130: the author of the ask may not judge it, as a PR's author may not
+            ok, why = False, "%s is the author of the ask %s: the author of an ask cannot record a verdict on it (`prove` is the author's step)" % (caller, ctx.pr)
         if ok and named == "tester" and caller in launch:
             why = load_launch_testers().lane_refusal(caller, launch, authors, sessions, fleets)
             ok = why is None
@@ -21033,12 +19954,18 @@ def cmd_verdict(args, runner, now):
             raise LedgerCommandError("refused: %s: %s; nothing was recorded" % (target["id"], problem))
     entries = [{"kind": "verdict", "pr": ctx.pr, "scenario": target["id"], "plan_ref": ctx.source,
                 "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
-                "evaluator": named, "evidence": evidence} for target in targets]
+                "evaluator": named, "evidence": evidence, **({"files": sorted(set(args.file))} if getattr(args, "file", None) else {})} for target in targets]
     try:
-        stored = plan_ledger.append_many(ctx.state, entries, now())   # all of them or none
+        done = plan_ledger.append_once(ctx.state, entries, now())   # all of the new ones or none; one already there is not written again
+    except plan_ledger.LedgerLockTimeout:
+        raise
     except plan_ledger.LedgerError as err:
         raise LedgerCommandError("%s" % err) from None
-    for entry, one in zip(entries, stored):
+    for entry, (one, already) in zip(entries, done):
+        if already:
+            print("already recorded %s verdict #%d: %s %s at %s (%s), bound to plan %s" % (named, one["seq"], entry["scenario"], args.result,
+                                                                                         head[:8], ctx.pr, entry["plan_hash"][:19]))
+            continue
         if ctx.engine.audit is not None:
             detail = {"scenario": entry["scenario"], "result": entry["result"], "seq": one["seq"], "by": entry["by"], "chain": one["hash"]}
             if named == "tester" and caller in launch and load_launch_testers().source_of(caller, ctx.config.get("plan_evaluators"), launch) == "launch record":
@@ -21046,6 +19973,7 @@ def cmd_verdict(args, runner, now):
             ctx.engine.audit.append(ctx.engine.actor, "plan.verdict", ctx.pr, detail)
         print("recorded %s verdict #%d: %s %s at %s (%s), bound to plan %s" % (named, one["seq"], entry["scenario"], args.result,
                                                                              head[:8], ctx.pr, entry["plan_hash"][:19]))
+    print(recorded_line("%s verdict" % named, ctx.pr, head, done))
     return EXIT_OK
 
 
@@ -21203,6 +20131,9 @@ def cmd_gates(args, runner, now):
         return cmd_gates_preflight(args, runner, now)
     if args.pr == "stats":
         return cmd_gates_stats(args, runner, now)
+    if args.pr == "ask-close":   # #1130: the closing rule of a report-only ask
+        args.pr = args.rest[0] if args.rest else ""
+        return cmd_gates_ask_close(args, runner, now)
     ctx = _ledger_context(args, runner, now, False, floor=True)
     plan = ctx.plan
     report = plan_ledger.evaluate_gates(plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr,
@@ -21232,6 +20163,8 @@ def cmd_gates(args, runner, now):
             lines.append("PR not read: %s" % ctx.unreadable)
         if ctx.plan_problem:
             lines.append("plan not read: %s" % ctx.plan_problem)
+        if isinstance(ctx.facts, dict) and ctx.facts.get("review") == "changes requested" and not ctx.unreadable:
+            lines.extend(blocking_review_lines(ctx.engine, runner, now, ctx.repo, ctx.number, ctx.pr, ctx.facts.get("head")))   # #1123: GitHub's decision blocks the merge; say who and how to clear it
         note = rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head")) if isinstance(ctx.facts, dict) else None
         if note:
             lines.append("rating: %s" % note)
@@ -21243,6 +20176,29 @@ def cmd_gates(args, runner, now):
         return EXIT_USAGE
     ok = report["ready"] if getattr(args, "all_gates", False) else report["ready_enforced"]   # --all: the full board
     return EXIT_OK if ok else EXIT_ERROR
+
+
+def cmd_gates_ask_close(args, runner, now):
+    """`gates ask-close <owner/repo#N>`: the closing rule of a report-only ask (#1130): the ask may close when EVERY scenario of its plan comment is proven and
+    judged at the current plan hash. Exit 0 names the scenarios recorded; exit 1 refuses and names each unjudged scenario. Reads only: it closes nothing."""
+    ctx = _ledger_context(args, runner, now, False)
+    if not getattr(ctx, "ask_issue", False):
+        raise LedgerCommandError("%s is not an ask issue: the closing rule of a report-only ask applies to an issue with a plan comment" % ctx.pr)
+    if ctx.plan is None or ctx.plan["result"] != "pass":
+        raise LedgerCommandError("cannot close %s: %s" % (ctx.pr, ctx.plan_problem or "its plan fails `plan check`"))
+    head = ctx.facts.get("head")
+    authors = plan_ledger.authors_of(ctx.entries, ctx.pr, (), ctx.facts.get("author"))
+    rows = [plan_ledger.scenario_state(x, ctx.entries, ctx.pr, ctx.plan["plan_hash"], head, authors) for x in ctx.plan["scenarios_parsed"]]
+    open_rows = [r for r in rows if r["status"] != "ok"]
+    if open_rows:
+        for r in open_rows:
+            print("not judged: %s: %s" % (r["id"], "; ".join(r["missing"] + r["void"])), file=sys.stderr)
+        print("refused: %s stays open: %d of %d scenarios are not proven and judged at plan %s" % (ctx.pr, len(open_rows), len(rows), ctx.plan["plan_hash"][:19]),
+              file=sys.stderr)
+        return EXIT_ERROR
+    print("%s may close: %d of %d scenarios proven and judged at plan %s: %s" % (ctx.pr, len(rows), len(rows), ctx.plan["plan_hash"][:19],
+                                                                          ", ".join(r["id"] for r in rows)))
+    return EXIT_OK
 
 
 cmd_gates.ledger = True   # state and GETs only; its own errors are usage errors
@@ -21274,8 +20230,9 @@ def item_issue(engine, repo, number):
     if data.get("pull_request"):
         raise LedgerCommandError("%s#%d is a pull request: use --pr (the pull request rules apply to it, not the work item rules)" % (repo, number))
     user = data.get("user") if isinstance(data.get("user"), dict) else {}
+    labels = [l.get("name") if isinstance(l, dict) else l for l in (data.get("labels") if isinstance(data.get("labels"), list) else [])]
     return {"author": user.get("login") if isinstance(user.get("login"), str) else None, "body": data.get("body") if isinstance(data.get("body"), str) else "",
-            "state": data.get("state"), "parent": parent_of(data)}
+            "state": data.get("state"), "parent": parent_of(data), "labels": [l for l in labels if isinstance(l, str)]}
 
 
 def item_chain(engine, repo, number, parent, limit=4):
@@ -21343,14 +20300,14 @@ def item_agents(ctx):
     return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions, fleets
 
 
-def item_entry_refusal(engine, repo, number, entries, unreadable):
+def item_entry_refusal(engine, repo, number, entries, unreadable, allow_ask=False):
     """Why the ORDINARY pull request commands (prove, verdict, gates ci-record, waive) must not write for `repo#number`, or None. They refuse a number that is an ISSUE (the pull request
     could not be read and GitHub says it is an issue) and a number that has an item registration: an item's entries are written only by item-prove, item-verdict and item-ci-record.
     A real pull request is never affected (it is read, and has no registration)."""
     ref = "%s#%d" % (repo, number)
     if load_module("item_verdicts").registrations(entries, ref):
         return "%s is a work item (a tester is registered for it): its proofs and verdicts are written only by item-prove, item-verdict and gates item-ci-record" % ref
-    if unreadable:
+    if unreadable and not allow_ask:
         try:
             item_issue(engine, repo, number)
         except LedgerCommandError:
@@ -22739,6 +21696,49 @@ def cmd_gates_stats(args, runner, now):
     return EXIT_OK
 
 
+def carry_head_facts(get, repo, old_head, new_head):
+    """#1129: what the carry decision reads of GitHub, through `get(path)` (a GET that raises on failure): {"files": names changed between the two heads, "merge_of_default": bool,
+    "ci_green": bool}. The new head is a merge of the default branch when it has two parents and the second is already in the default branch. Any read that fails raises: no carry."""
+    compared = get("repos/%s/compare/%s...%s" % (repo, old_head, new_head))
+    files = [f["filename"] for f in (compared.get("files") or []) if isinstance(f, dict) and isinstance(f.get("filename"), str)]
+    commit = get("repos/%s/commits/%s" % (repo, new_head))
+    parents = [p.get("sha") for p in (commit.get("parents") or []) if isinstance(p, dict)]
+    merge = False
+    if len(parents) == 2:
+        default = get("repos/%s" % repo).get("default_branch")
+        inside = get("repos/%s/compare/%s...%s" % (repo, default, parents[1]))
+        merge = isinstance(inside, dict) and inside.get("status") in ("behind", "identical")
+    runs = (get("repos/%s/commits/%s/check-runs" % (repo, new_head)) or {}).get("check_runs") or []
+    green = bool(runs) and all(r.get("status") == "completed" and r.get("conclusion") in ("success", "neutral", "skipped") for r in runs)
+    return {"files": files, "merge_of_default": merge, "ci_green": green}
+
+
+def carry_proofs(state, pr, plan, old_head, new_head, facts, now):
+    """#1129: decide, for each proof and verdict of `pr` that holds at `old_head`, whether it carries to `new_head`, and write ONE `carried` line for each that does.
+    `facts` is `carry_head_facts`. Returns [{"proof": seq, "scenario", "verdict", "reason"}] (one per row decided); a "void" verdict writes nothing (the head moved, the row is
+    void as always). The original rows are never touched. A carry of the same proof to the same head is written once."""
+    entries, problem = plan_ledger.read_ledger(state)
+    if problem:
+        raise LedgerCommandError("the ledger is not trustworthy, nothing was carried: %s" % problem)
+    evaluators = {x["id"]: plan_ledger.evaluator_of(x) for x in plan["scenarios_parsed"]}
+    holding = plan_ledger.carried_seqs(entries, pr, old_head)
+    done = plan_ledger.carried_seqs(entries, pr, new_head)
+    out = []
+    for row in entries:
+        if row.get("pr") != pr or row.get("kind") not in ("proof", "verdict") or row.get("result") != "pass" or row.get("plan_hash") != plan["plan_hash"]:
+            continue
+        if row.get("head") != old_head and row["seq"] not in holding:
+            continue
+        sid = row.get("scenario")
+        if row["seq"] in done:
+            continue
+        verdict, reason = plan_ledger.carry_decision(row, evaluators.get(sid), facts["files"], facts["merge_of_default"], facts["ci_green"])
+        if verdict == "carry":
+            plan_ledger.append_entry(state, plan_ledger.carry_line(row, sid, old_head, new_head, facts["merge_of_default"], pr), now)
+        out.append({"proof": row["seq"], "scenario": sid, "verdict": verdict, "reason": reason})
+    return out
+
+
 def gates_carried_note(report, ctx):
     """The gate row of a PR whose owner's clear CARRIED to its current head says so (G6 `carried from <head>`), and the report gains `carried`. Reads the local state file only."""
     try:
@@ -23736,6 +22736,7 @@ def add_ledger_parsers(sub):
     prove.add_argument("--evidence", required=True, help="A link, or what you ran and saw")
     prove.add_argument("--result", choices=("pass", "fail"), default="pass")
     prove.add_argument("--command", help="The command you ran, if any")
+    prove.add_argument("--file", action="append", default=None, help="A file the proof names (repeatable); a proof that names no file is never carried to a new head")
     verdict = sub.add_parser("verdict", help="Record an evaluator's verdict for a scenario (only the evaluator the "
                                              "scenario names, never a writer of the PR)")
     common(verdict)
@@ -23747,6 +22748,7 @@ def add_ledger_parsers(sub):
     verdict.add_argument("--as", dest="evaluator", required=True, choices=("ci", "tester", "reviewer", "owner"))
     verdict.add_argument("--result", choices=("pass", "fail"), required=True)
     verdict.add_argument("--evidence", required=True, help="A link, or the evaluator's own artefact")
+    verdict.add_argument("--file", action="append", default=None, help="A file the verdict names (repeatable); a verdict that names no file is never carried to a new head")
     # #770: a work item with no pull request has its own commands (the pull request commands above keep their exact surface)
     iprove = sub.add_parser("item-prove", help="Record proof for a plan scenario of a work item that has no pull request, at its reference commit")
     iverdict = sub.add_parser("item-verdict", help="A tester registered for a work item (by its orchestrator's launch) records its verdict, at the item's reference commit")
@@ -24107,15 +23109,288 @@ def record_inputs(raw_argv):
     return _private_parse(raw_argv, DECISION_INPUTS, CARRY_FLAG_INPUTS)
 
 
+# ---------------------------------------------------------------- `review post` and `review dismiss` (#1123)
+# The marker a reader's review ends with is written by ONE function, `fleet_mark` (the writer `comment` and `handoff` use too): there is no second one here.
+
+REVIEW_POST_VERDICTS = {"approve": ("APPROVE", "APPROVE"), "request-changes": ("CHANGES REQUESTED", "REQUEST_CHANGES"), "comment": ("COMMENT", "COMMENT")}   # verdict -> (the word in the body's first line, the Reviews API event)
+REVIEW_POST_ROLES = ("reader", "reviewer")   # the registered roles that may post and dismiss a review
+REVIEW_OWN_REFUSAL = re.compile(r"(?i)own pull request|can not approve|can not request changes|cannot approve|cannot request changes")
+REVIEW_DISMISS_STATES = ("CHANGES_REQUESTED",)
+
+
+def review_head_problem(given, current):
+    """None when `given` is the PR's current head, else the refusal (naming both in full)."""
+    if given != current:
+        return "the head given (%s) is not the PR's current head (%s): a review belongs to the head it judged (nothing was posted)" % (given, current)
+    return None
+
+
+def review_post_path(repo, number):
+    """The Reviews API's endpoint: the one a review is posted to (never the issue comments')."""
+    return "repos/%s/pulls/%d/reviews" % (repo, number)
+
+
+def review_is_own(review, name):
+    """True when the review carries the caller's own marker: the reader's identity that posted it (all agents share one login)."""
+    return signed_by_fleet(review.get("body")) == name
+
+
+def review_dismiss_audit(engine, ref, name, review_id, head, reason, withdrawn):
+    """The audit line of a dismissal: who, which review, which head, why."""
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "review.dismiss", ref, {"who": name, "review": review_id, "head": head[:12], "why": plan_ledger.clip(reason, 200), "withdrawn": bool(withdrawn)})
+
+
+def _review_caller(runner, now):
+    """The registered name of the caller of a review command; raises ReviewError for a caller with no registered reader or reviewer role."""
+    kind = gates_caller_kind(runner, now)
+    if kind[0] == "unknown":
+        raise ReviewError("refused: %s" % kind[1])
+    role = kind[2] if kind[0] == "agent" and len(kind) > 2 else None
+    if kind[0] != "agent" or role not in REVIEW_POST_ROLES or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", kind[1] or ""):
+        raise ReviewError("refused: the caller has no registered %s role (%s): only a registered reader posts or dismisses a review (nothing was done)" % (
+            " or ".join(REVIEW_POST_ROLES), kind[1] if kind[0] != "agent" else "role %s" % (role or "none")))
+    return kind[1]
+
+
+def _review_api(engine, runner, now, repo, path, method=None, payload=None):
+    """(ok, parsed or None, one-line detail) of ONE `gh api` call with the repository's own account (a GET unless `method`)."""
+    config = engine.config
+    reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
+    if method is None:
+        try:
+            return True, reader._api(path, repo), ""
+        except IntentError as err:
+            return False, None, _one_line(str(err), 200)
+    env = reader.env_for(repo)
+    try:
+        done = runner([config["gh"], "api", path, "--method", method, "--input", "-"], input=json.dumps(payload), capture_output=True, text=True,
+                      timeout=reader.timeout, **({"env": env} if env is not None else {}))
+    except (OSError, subprocess.SubprocessError) as err:
+        return False, None, _one_line(str(err), 200)
+    if done.returncode != 0:
+        return False, None, reader.accounts.scrub(_one_line(done.stderr or done.stdout or "", 200)) or "exit %d" % done.returncode
+    try:
+        return True, json.loads(done.stdout or "{}"), ""
+    except ValueError:
+        return False, None, "GitHub answered a success that is not JSON (not trusted): %s" % _one_line(done.stdout or "", 80)
+
+
+REVIEW_PAGE_LIMIT = 50   # pages of 100: a list longer than this is not read whole, and the caller refuses
+
+
+def _review_pages(engine, runner, now, repo, path):
+    """(ok, all items, one-line detail) of a Reviews-API list read page by page to the LAST page (a short page ends it); a failed page, a page that is not a list, or more than REVIEW_PAGE_LIMIT pages fails the whole read."""
+    items = []
+    for page in range(1, REVIEW_PAGE_LIMIT + 1):
+        ok, got, why = _review_api(engine, runner, now, repo, "%s?per_page=100&page=%d" % (path, page))
+        if not ok or not isinstance(got, list):
+            return False, None, why or "page %d is not a list" % page
+        items.extend(got)
+        if len(got) < 100:
+            return True, items, ""
+    return False, None, "more than %d pages" % REVIEW_PAGE_LIMIT
+
+
+def review_refusal_audit(engine, event, ref, name, head, reason, **more):
+    """The audit line of a REFUSED review command (who, which head, the reason); never raises."""
+    try:
+        if engine.audit is not None and name:
+            engine.audit.append(engine.actor, event, ref, dict({"who": name, "head": (head or "")[:12], "reason": plan_ledger.clip(reason, 200)}, **more))
+    except Exception:
+        pass
+
+
+def review_forged_marker(text):
+    """True when `text` holds fleet-switchboard `from=` marker text in ANY form: normalised (HTML entities decoded, NFKC, case folded, every character that is not a letter or digit dropped) so spacing, case, entities, zero-width characters and an HTML comment around it change nothing."""
+    plain = re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKC", html.unescape(html.unescape(text))).casefold())
+    return "fleetswitchboardfrom" in plain
+
+
+def cmd_review_post(args, runner, now):
+    """`review post PR --head SHA --verdict V --body-file FILE`: ONE Reviews-API review, its body `Review of <full head>: <VERDICT>` ... the reader's marker."""
+    seen = {}
+    try:
+        engine, state, config = build_engine(runner, now, "cli", writable=True)
+        seen["engine"] = engine
+        if args.verdict not in REVIEW_POST_VERDICTS:
+            raise ReviewError("--verdict must be one of %s (nothing was posted)" % ", ".join(REVIEW_POST_VERDICTS))
+        if not re.fullmatch(r"[0-9a-f]{40}", args.head or ""):
+            raise ReviewError("--head must be the full 40-character head sha, got %d characters (nothing was posted)" % len(args.head or ""))
+        text = _read_capped(args.body_file, REVIEW_TABLE_MAX).strip()
+        if not text:
+            raise ReviewError("the body file is empty: a review says something (nothing was posted)")
+        if redact_command_text(text) != text:
+            raise ReviewError("the body holds a secret-shaped value (it is not shown): remove it and post again (nothing was posted)")
+        name = _review_caller(runner, now)
+        seen["name"], seen["head"] = name, args.head
+        repo, number, ref, raw = _review_pr(args, engine)
+        seen["ref"] = ref
+        if review_forged_marker(text):
+            raise ReviewError("refused (forged marker): the body holds `fleet-switchboard:from=` marker text; the one marker of a review is appended from the caller's registered identity, so a body never carries one (nothing was posted)")
+        head = raw.get("headRefOid")
+        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise ReviewError("the PR head is unknown: nothing was posted")
+        problem = review_head_problem(args.head, head)
+        if problem:
+            raise ReviewError(problem)
+        word, event = REVIEW_POST_VERDICTS[args.verdict]
+        body = "Review of %s: %s\n\n%s\n\n%s" % (head, word, text, fleet_mark(name))
+        path = review_post_path(repo, number)
+        ok, posted, why = _review_api(engine, runner, now, repo, path, "POST", {"commit_id": head, "body": body, "event": event})
+        notice = ""
+        if not ok and event != "COMMENT" and REVIEW_OWN_REFUSAL.search(why):   # the same account's own pull request: a comment-type review, never an issue comment
+            event, notice = "COMMENT", "GitHub refused %s on this account's own pull request: posted as a comment-type review instead" % word
+            ok, posted, why = _review_api(engine, runner, now, repo, path, "POST", {"commit_id": head, "body": body, "event": event})
+        if not ok:
+            raise ReviewError("GitHub refused the review: %s (nothing was posted)" % why)
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "review.post", ref, {"who": name, "verdict": args.verdict, "event": event, "head": head[:12], "body": plan_ledger.clip(body, 400)})
+        if notice:
+            print("note: " + notice)
+        print("posted %s review (%s) at %s on %s as %s" % (args.verdict, event, head[:8], ref, name))
+        return EXIT_OK
+    except (ReviewError, ConfigError, IdentityUncertain, CallerError, plan_ledger.LedgerError) as err:
+        review_refusal_audit(seen.get("engine"), "review.post.refused", seen.get("ref"), seen.get("name"), seen.get("head"), str(err), verdict=args.verdict) if seen.get("name") and seen.get("ref") else None
+        sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 700)))
+        return EXIT_USAGE
+
+
+def _cited_line_state(engine, runner, now, repo, head, comment):
+    """("unchanged" | "changed" | "unknown", "path:line" or None, why) of one inline finding. The cited line's TEXT (the last line of the finding's diff hunk: the
+    line as it was at the head the review judged) is looked for in the file at the CURRENT head: found anywhere (a line that only SHIFTED included) is
+    "unchanged" (the finding still holds); absent is "changed". Whatever cannot be told (no path, line or hunk, a removed-side line, the contents unread, the file gone, a file too large to be
+    sent) is "unknown", never "changed"."""
+    path, line = comment.get("path"), comment.get("line") or comment.get("original_line")
+    hunk = comment.get("diff_hunk") if isinstance(comment.get("diff_hunk"), str) else ""
+    where = "%s:%s" % (path, line) if isinstance(path, str) else None
+    if not isinstance(path, str) or not isinstance(line, int):
+        return "unknown", where, "the finding names no file and line"
+    rows = hunk.splitlines()
+    if not rows or not rows[-1][:1] in (" ", "+") or not rows[-1][1:].strip():
+        return "unknown", where, "the finding's hunk gives no cited line to compare"
+    cited = rows[-1][1:]
+    ok, got, why = _review_api(engine, runner, now, repo, "repos/%s/contents/%s?ref=%s" % (repo, urllib.parse.quote(path), head))
+    if not ok or not isinstance(got, dict):
+        return "unknown", where, "the file cannot be read at the head (%s)" % (why or "gone")
+    if got.get("encoding") != "base64":
+        return "unknown", where, "the file's contents were not sent whole"
+    try:
+        lines = base64.b64decode(got.get("content") or "").decode("utf-8", "replace").splitlines()
+    except ValueError:
+        return "unknown", where, "the file's contents cannot be decoded"
+    return ("unchanged" if cited in lines else "changed"), where, ""
+
+
+def cmd_review_dismiss(args, runner, now):
+    """`review dismiss PR --review ID --reason TEXT [--withdraw]`: dismiss the caller's OWN CHANGES_REQUESTED review. Each inline finding's cited line is re-read at the
+    CURRENT head; a finding that still holds refuses, and whatever could not be re-checked (a body-only review, an unreadable or unknown line) needs `--withdraw`
+    (the reader's explicit statement that it withdraws the finding). A failed read refuses."""
+    seen = {}
+    try:
+        engine, state, config = build_engine(runner, now, "cli", writable=True)
+        seen["engine"] = engine
+        reason = (args.reason or "").strip()
+        if not reason:
+            raise ReviewError("--reason must say why (nothing was dismissed)")
+        if redact_command_text(reason) != reason:
+            raise ReviewError("the reason holds a secret-shaped value (it is not shown) (nothing was dismissed)")
+        name = _review_caller(runner, now)
+        seen["name"] = name
+        repo, number, ref, raw = _review_pr(args, engine)
+        seen["ref"] = ref
+        head = raw.get("headRefOid")
+        seen["head"] = head
+        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise ReviewError("the PR head is unknown: nothing was dismissed")
+        base = "repos/%s/pulls/%d/reviews/%d" % (repo, number, args.review)
+        ok, review, why = _review_api(engine, runner, now, repo, base)
+        if not ok or not isinstance(review, dict):
+            raise ReviewError("review %d of %s cannot be read: %s (nothing was dismissed)" % (args.review, ref, why))
+        owner = signed_by_fleet(review.get("body"))
+        if not review_is_own(review, name):
+            raise ReviewError("review %d is not yours (it is signed by %s): a reader dismisses only its own review (nothing was dismissed)" % (args.review, owner or "no one"))
+        status = str(review.get("state") or "").upper()
+        if status == "DISMISSED":
+            raise ReviewError("review %d of %s is already dismissed: nothing to dismiss (nothing was done)" % (args.review, ref))
+        if status not in REVIEW_DISMISS_STATES:
+            raise ReviewError("review %d is %s, not CHANGES_REQUESTED: nothing to dismiss" % (args.review, str(review.get("state") or "unknown").lower()))
+        ok, found, why = _review_pages(engine, runner, now, repo, base + "/comments")
+        if not ok:
+            raise ReviewError("the inline comments of review %d cannot be read whole: %s: the block cannot be re-checked, so nothing was dismissed" % (args.review, why))
+        inline = [c for c in found if isinstance(c, dict)]
+        unknown = []
+        for comment in inline:
+            verdict, where, cause = _cited_line_state(engine, runner, now, repo, head, comment)
+            if verdict == "unchanged" and not args.withdraw:
+                raise ReviewError("finding still holds at %s: %s is unchanged (say --withdraw with a reason if the finding was wrong) (nothing was dismissed)" % (head, where))
+            if verdict == "unknown":
+                unknown.append("%s: %s" % (where or "a finding", cause))
+        if not args.withdraw and not inline:
+            raise ReviewError("review %d has no inline finding to re-check at %s (a body-only block): say --withdraw with a reason if the finding is withdrawn (nothing was dismissed)" % (args.review, head))
+        if not args.withdraw and unknown:
+            raise ReviewError("a finding of review %d could not be re-checked at %s (%s): say --withdraw with a reason if the finding is withdrawn (nothing was dismissed)" % (args.review, head, "; ".join(unknown)[:300]))
+        ok, _, why = _review_api(engine, runner, now, repo, base + "/dismissals", "PUT", {"message": reason, "event": "DISMISS"})
+        if not ok:
+            raise ReviewError("GitHub refused the dismissal: %s" % why)
+        review_dismiss_audit(engine, ref, name, args.review, head, reason, args.withdraw)
+        print("dismissed review %d of %s at %s as %s: %s" % (args.review, ref, head[:8], name, _one_line(reason, 120)))
+        return EXIT_OK
+    except (ReviewError, ConfigError, IdentityUncertain, CallerError, plan_ledger.LedgerError) as err:
+        if seen.get("name") and seen.get("ref"):
+            review_refusal_audit(seen.get("engine"), "review.dismiss.refused", seen["ref"], seen["name"], seen.get("head"), str(err), review=args.review)
+        sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 700)))
+        return EXIT_USAGE
+
+
+def load_review_rule():
+    """shims/review_rule.py: the ONE rule of which reviews block, shared with the gh shim's merge check."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "shims", "review_rule.py")
+    spec = importlib.util.spec_from_file_location("review_rule_gates", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def rest_review_as_view(review):
+    """A Reviews-API review in the shape `gh pr view --json reviews` gives the shim's rule (author.login, commit.oid)."""
+    user = review.get("user") if isinstance(review.get("user"), dict) else {}
+    return {"author": {"login": user.get("login")} if user.get("login") else None, "state": review.get("state"),
+            "commit": {"oid": review.get("commit_id")}, "body": review.get("body"), "id": review.get("id")}
+
+
+def blocking_review_lines(engine, runner, now, repo, number, pr, head="", decision="CHANGES_REQUESTED"):
+    """`blocking review:` lines by the SAME rule as the merge shim (`shims/review_rule.py`): per LOGIN the latest decisive review (DISMISSED included) that is CHANGES_REQUESTED and still blocks."""
+    ok, reviews, why = _review_pages(engine, runner, now, repo, "repos/%s/pulls/%d/reviews" % (repo, number))
+    if not ok:
+        return ["blocking review: the reviews could not be read whole (%s): not listed" % why]
+    try:
+        rule = load_review_rule()
+    except Exception:
+        return ["blocking review: the rule file shims/review_rule.py is unreadable: blocking reviews not listed"]
+    rows = []
+    for login, review in rule.blocking_reviews([rest_review_as_view(r) for r in reviews if isinstance(r, dict)], head or "", decision):
+        rows.append("blocking review: %s CHANGES_REQUESTED at %s (dismiss with: fleet-switchboard review dismiss %s --review %s --reason TEXT)" % (
+            signed_by_fleet(review.get("body")) or login, str(review["commit"]["oid"] or "unknown")[:12], pr, review.get("id")))
+    return rows
+
+
+@recording("review_record", applies=is_review_record)
 def cmd_review(args, runner, now):
     """`review laws <pr>` (print the laws and overlay from the PR's base commit) and `review record <pr> --reviewer X ...` (a reviewer writes
-    its result per head). Reads GitHub with GETs only; `record` writes the hash-chained ledger and the audit."""
+    its result per head). Reads GitHub with GETs only; `record` writes the hash-chained ledger and the audit, and ends with one line (#1049):
+    `recorded #<id> ...`, `already recorded #<id> ...` or `not recorded: <reason>`."""
     if args.review_cmd == "measure":
         return cmd_review_measure(args, runner, now)
     if args.review_cmd == "checkout":
         return cmd_review_checkout(args, runner, now)
+    if args.review_cmd == "post":
+        return cmd_review_post(args, runner, now)
+    if args.review_cmd == "dismiss":
+        return cmd_review_dismiss(args, runner, now)
     try:
         engine, state, config = build_engine(runner, now, "cli", writable=args.review_cmd == "record")
+        record_step("a GitHub read of the pull request")
         repo, number, ref, raw = _review_pr(args, engine)
         head = raw.get("headRefOid") if isinstance(raw.get("headRefOid"), str) else None
         if args.review_cmd == "blockers":
@@ -24225,6 +23500,7 @@ def cmd_review(args, runner, now):
         given = args.head or head
         if not (head.startswith(given) or given.startswith(head)) or len(given) < 7:
             raise ReviewError("the head given (%s) is not the PR's head (%s): a record belongs to the head it judged, nothing was recorded" % (given[:40], head))
+        record_step("the agent registry (who is calling)")
         files_count = None
         if reviewer == "impact" and block_digest:   # #1047: a rating is recorded only from a whole read, checked against GitHub's own list of changed files (never the block's)
             if block_problem and verdict != "incomplete":
@@ -24237,6 +23513,7 @@ def cmd_review(args, runner, now):
                 if why_short:
                     raise ReviewError("refused: %s (nothing was recorded; record `verdict: incomplete` if you could not read it all)" % why_short)
             files_count = (len({r[0] for r in block_rows}), len(listed) if listed is not None else None)
+
         kind = gates_caller_kind(runner, now)
         if kind[0] == "unknown":
             raise ReviewError("refused: %s" % kind[1])
@@ -24267,22 +23544,29 @@ def cmd_review(args, runner, now):
                         entry["block_" + name] = plan_ledger.clip(redact_command_text(value), 200)
         if impact_class:
             entry["impact_class"] = impact_class   # #451 slice 2: the class of the impact that drives the action; a missing one holds for the owner
-        stored = plan_ledger.append_entry(state, entry, now())
-        if engine.audit is not None:
+        (stored, already), = plan_ledger.append_once(state, [entry], now())   # the same record again writes nothing (#1049)
+        if engine.audit is not None and not already:
             engine.audit.append(engine.actor, "review.record", ref, {"reviewer": reviewer, "verdict": verdict, "head": head[:12],
                                                                     "by": by, "seq": stored["seq"], "chain": stored["hash"]})
         entries, problem = plan_ledger.read_ledger(state)
         got = plan_ledger.review_records_at(entries, ref, head)
-        print("recorded %s review %s at %s (%s): %d of %d reviewers recorded at this head%s" % (
-            reviewer, verdict, head[:8], ref, len(got["recorded"]), len(got["expected"]),
+        print("%s %s review %s at %s (%s): %d of %d reviewers recorded at this head%s" % (
+            "already recorded" if already else "recorded", reviewer, verdict, head[:8], ref, len(got["recorded"]), len(got["expected"]),
             "; missing %s" % ", ".join(got["missing"]) if got["missing"] else ""))
         if entry.get("uncited"):
             print("note: this request-changes names no rule: it is recorded as given, marked uncited, and does not block")
         if reviewer == "impact" and not (entry.get("impact_severity") and entry.get("impact_probability")):
             sys.stderr.write("%s: review: %s\n" % (PROG, NO_SCORE_TEXT))
+        sys.stdout.flush()
+        print(recorded_line("%s review" % reviewer, ref, head, [(stored, already)]))
         return EXIT_OK
+    except plan_ledger.LedgerLockTimeout:
+        raise
     except (ReviewError, plan_ledger.LedgerError, ConfigError, IdentityUncertain, CallerError) as err:
-        sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 700)))
+        if args.review_cmd == "record":   # #1049: a record that did not happen says so, last
+            sys.stderr.write("not recorded: %s\n" % _one_line(str(err), 700))
+        else:
+            sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 700)))
         return EXIT_USAGE
 
 
@@ -24507,6 +23791,16 @@ def add_review_parsers(sub):
     record.add_argument("--confirms-carry", dest="confirms_carry", action="store_true",
                         help="(#815) With an approve: the resolution of a conflict in a merge of main touched no line this pull request adds or removes, so the owner's clear may carry to this head")
     record.add_argument("--summary", help="One line (at most 200 characters)")
+    post = rsub.add_parser("post", allow_abbrev=False, help="Post ONE GitHub review of the PR's current head, signed with your registered name (a reader's review carries its marker)")
+    post.add_argument("pr", help="owner/repo#N or the PR's URL")
+    post.add_argument("--head", required=True, help="The FULL head sha judged (it must be the PR's current head)")
+    post.add_argument("--verdict", required=True, help="approve | request-changes | comment")
+    post.add_argument("--body-file", dest="body_file", required=True, help="File holding the review's text")
+    dismiss = rsub.add_parser("dismiss", allow_abbrev=False, help="Dismiss your OWN CHANGES_REQUESTED review after the fix (re-reads the cited line at the current head)")
+    dismiss.add_argument("pr", help="owner/repo#N or the PR's URL")
+    dismiss.add_argument("--review", required=True, type=int, help="The review's id")
+    dismiss.add_argument("--reason", required=True, help="Why it no longer blocks")
+    dismiss.add_argument("--withdraw", action="store_true", help="Your explicit statement that you withdraw the finding: needed when nothing could be re-checked (a body-only review, a line that cannot be read or compared) and to dismiss although the cited line is unchanged (the reason says why)")
     checkout = rsub.add_parser("checkout", help="Write the PR's exact head tree, its diff and the base copies of the touched files into .review/<head sha> here, read-only, and print the path; --remove <dir> removes one")
     checkout.add_argument("pr", nargs="?", help="owner/repo#N or the PR's URL")
     checkout.add_argument("--head", help="The commit to materialise (default: the PR's head, read once at the start)")
@@ -24517,310 +23811,6 @@ def add_review_parsers(sub):
     measure.add_argument("--scan", type=int, default=MEASURE_SCAN_MAX, help="Merged PRs read (default %d; the escape check looks among them)" % MEASURE_SCAN_MAX)
     measure.add_argument("--split", type=int, help="A merged PR number: the baseline is the --count merged before it, the after is --count from it on")
     measure.add_argument("--json", action="store_true", help="Machine-readable rows")
-
-
-# ---------------------------------------------------------------- `pr-explain` (#179, slice L6)
-#
-# The explainer is NOT a reviewer: reviewers give no advice and no summaries. It writes, for the PR description, (a) a short before and after
-# pseudo-code WHY block on every PR. It never writes a summary flowchart (ask #687: a Mermaid diagram belongs only where it shows data flow, system
-# design or component design, never at the top of a body). This command is the simplest thing that works without write authority: it reads the PR once (a GET) and PRINTS the block (or the
-# whole new body with the block put in once); the author pastes it with their own `gh pr edit --body-file`. `--check` judges a body.
-
-EXPLAINER_BEGIN = "<!-- pr-explainer:begin -->"
-EXPLAINER_END = "<!-- pr-explainer:end -->"
-EXPLAINER_HEADER_RE = re.compile(r"^(?:PLAN|MERGE|canon):", re.I)   # the lines a body opens with; the block goes right after them
-# The generated summary flowchart this tool used to write (four boxes: Changes, Touches, Irreversible, Risk). It is never emitted; a body that still holds it fails
-# `--check`. Detection is by the four box labels inside ONE Mermaid fence, read line by line (bounded, linear, no lowered copy, ASCII-only matching).
-SUMMARY_FLOWCHART_LABELS = ("Changes", "Touches", "Irreversible", "Risk")
-_SUMMARY_LABEL = re.compile(r'[\["(]\s*(%s)\s*:' % "|".join(SUMMARY_FLOWCHART_LABELS), re.A | re.I)   # built from the tuple: one list of labels
-_SUMMARY_LINE_MAX = 400   # a box label is short: the rest of a longer line is not looked at
-_SUMMARY_BODY_MAX = 1 << 20   # a body is cut at 1 MB for this check (GitHub's own limit is 65536 characters)
-_SUMMARY_FENCE_RE = re.compile(r"^(?:[ \t>]|[-*+][ \t]|\d{1,9}[.)][ \t])*(`{3,}|~{3,})(.*)$")   # a fence at any indent, inside quotes, or opened after any run of quote marks and list markers: GitHub renders those too (each prefix piece starts with a different character, so the run has one way to match: linear)
-SUMMARY_FLOWCHART_DEFECT = ("the body holds the generated summary flowchart (a Mermaid diagram whose boxes are Changes:, Touches:, Irreversible:, Risk:): remove it; "
-                            "a diagram is only for data flow, system design or component design")
-
-
-def summary_flowchart_found(body):
-    """True when a Mermaid fence ANYWHERE in the body holds the four labelled boxes of the generated summary flowchart (Changes:, Touches:, Irreversible:, Risk:). One
-    pass over the lines under a step budget; each line is cut to _SUMMARY_LINE_MAX; fences are read as the held-body scan reads them (three or more backticks or
-    tildes, closed by the same character at least as long, an unclosed fence running to the end) but at ANY indent and behind blockquote marks, since GitHub renders a fence
-    nested in a list item or a quote; it is a lint for the generator's own output (a renamed label is not caught, and it errs toward finding it: a closing line written `- ```` counts), not a boundary; no lowered copy is indexed
-    (ASCII-only folding). A diagram that shows data flow (without all four labels in ONE fence) is not it."""
-    lines = str(body or "")[:_SUMMARY_BODY_MAX].splitlines()   # any line break, CR-only included
-    budget = _held_steps(len(lines))
-    fence, mermaid, seen = None, False, set()
-    for line in lines:
-        _held_spend(budget)
-        text = line[:_SUMMARY_LINE_MAX]
-        found = _SUMMARY_FENCE_RE.match(text)
-        opens = found and not (found.group(1)[0] == "`" and "`" in found.group(2))
-        words = found.group(2).split() if opens else []
-        if opens and words and _ascii_lower(words[0]) == "mermaid":   # a Mermaid opener always (re)starts the scan, even inside a decoy fence: a decoy cannot hide the real one
-            fence, mermaid, seen = (found.group(1)[0], len(found.group(1))), True, set()
-            continue
-        if fence is None:
-            if opens:
-                fence, mermaid, seen = (found.group(1)[0], len(found.group(1))), False, set()
-            continue
-        if found and found.group(1)[0] == fence[0] and len(found.group(1)) >= fence[1] and not found.group(2).strip():
-            if mermaid and len(seen) == len(SUMMARY_FLOWCHART_LABELS):
-                return True
-            fence = None
-        elif mermaid:
-            for label in _SUMMARY_LABEL.finditer(text):
-                seen.add(label.group(1).capitalize())
-    return fence is not None and mermaid and len(seen) == len(SUMMARY_FLOWCHART_LABELS)   # a fence left open at the end of the body counts too
-
-
-def summary_flowchart_defects(body):
-    """The defect list for the summary flowchart: [] when absent, one message when found, and a message (never a raise) when the scan could not finish."""
-    try:
-        return [SUMMARY_FLOWCHART_DEFECT] if summary_flowchart_found(body) else []
-    except ValueError as err:
-        return ["the body could not be scanned for the summary flowchart (%s)" % _one_line(str(err), 100)]
-
-
-def explainer_text(text):
-    """A before or after line made safe for the block: one line, and never a marker comment, a comment close or a code fence (any of them would
-    end the block early, add a second marker or break the fenced why part)."""
-    plain = " ".join(str(text or "").split())
-    for bad in (EXPLAINER_BEGIN, EXPLAINER_END, "<!--", "-->", "```"):
-        plain = plain.replace(bad, " ")
-    return " ".join(plain.split())
-
-
-def explainer_block(why_before, why_after):
-    """The ONE block of a PR description: the why part (every PR), between two marker comments. Never a diagram."""
-    why_before, why_after = explainer_text(why_before), explainer_text(why_after)
-    parts = [EXPLAINER_BEGIN, ""]
-    parts += ["**Why (before and after)**", "", "```text", "before: %s" % why_before, "after:  %s" % why_after, "```", "", EXPLAINER_END]
-    return "\n".join(parts)
-
-
-def explainer_insert(body, block):
-    """`body` with `block` in it ONCE: any block already there (between the markers) is removed first, and the new one goes right after the lines the
-    body opens with (`PLAN:`, `MERGE:`, `canon:`), so a gate that reads the first line still sees it."""
-    body = body or ""
-    while EXPLAINER_BEGIN in body and EXPLAINER_END in body.split(EXPLAINER_BEGIN, 1)[1]:
-        head, rest = body.split(EXPLAINER_BEGIN, 1)
-        body = head.rstrip("\n") + "\n" + rest.split(EXPLAINER_END, 1)[1].lstrip("\n")
-    lines = body.split("\n")
-    at = 0
-    while at < len(lines) and (EXPLAINER_HEADER_RE.match(lines[at]) or (not lines[at].strip() and at and EXPLAINER_HEADER_RE.match(lines[at - 1]))):
-        at += 1
-    if HELD_WHY in body:   # a held PR's top part stays first: the block goes below it, where the technical section begins
-        at = next((i for i, l in enumerate(lines) if l.strip() in HELD_PARTS), at)
-        at += held_top_end(lines[at:])
-    head, tail = lines[:at], lines[at:]
-    return "\n".join(head + ([""] if head and head[-1].strip() else []) + block.split("\n") + ([""] if tail and tail[0].strip() else []) + tail)
-
-
-def explainer_defects(body):
-    """What is wrong with a PR description's explainer: exactly one block, a why part with a real before and a real after (no placeholder left), and no
-    generated summary flowchart anywhere in the body. A body with no diagram passes."""
-    body = body or ""
-    count = body.count(EXPLAINER_BEGIN)
-    if count != 1 or body.count(EXPLAINER_END) != 1 or body.index(EXPLAINER_BEGIN) > body.index(EXPLAINER_END):
-        return ["the description has %d explainer blocks: it carries exactly one (between %s and %s)" % (count, EXPLAINER_BEGIN, EXPLAINER_END)] + (
-            summary_flowchart_defects(body))
-    inner = body.split(EXPLAINER_BEGIN, 1)[1].split(EXPLAINER_END, 1)[0]
-    problems = []
-    why = re.search(r"```text\n(.*?)```", inner, re.S)
-    before = re.search(r"^before: (.+)$", why.group(1), re.M) if why else None
-    after = re.search(r"^after: +(.+)$", why.group(1), re.M) if why else None
-    if not why or not before or not after:
-        problems.append("the why part needs a ```text block with a `before:` line and an `after:` line")
-    elif any(re.search(r"<[^>]*>", m.group(1)) for m in (before, after)):
-        problems.append("the why part still has a placeholder in <angle brackets>")
-    problems += summary_flowchart_defects(body)
-    return problems
-
-
-HELD_WHY = "## Why this needs you"
-HELD_TABLE = "## What changes for you"
-HELD_EXAMPLE = "## Example"
-HELD_QUESTIONS = "## Questions for you"
-HELD_PARTS = (HELD_WHY, HELD_TABLE, HELD_EXAMPLE, HELD_QUESTIONS)
-def _held_none(line):
-    """True for the line `Questions: none`, then an optional one-line parenthetical (and an optional final dot). Plain string tests: no backtracking."""
-    line = line.strip()
-    if not line.startswith("Questions: none"):
-        return False
-    tail = line[len("Questions: none"):].strip()
-    return tail in ("", ".") or (tail.startswith("(") and (tail.endswith(")") or tail.endswith(").")))
-
-
-def pr_is_held(labels, body, now=None):
-    """A PR is held for the owner: it carries a hold label, or (the same rule as everywhere) a merge-captain label or the legacy first line."""
-    return bool(pr_hold_reasons(labels)) or is_captain({"labels": labels, "body": body}, now)
-
-
-_HELD_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-HELD_BODY_MAX = 70000   # a longer body is not read (GitHub's own cap is 65536)
-_HELD_PLACEHOLDER_RE = re.compile(r"<[^<>]*>")   # linear: the class stops at the next `<`
-
-
-_ASCII_LOWER = {c: c + 32 for c in range(ord("A"), ord("Z") + 1)}
-
-
-def _ascii_lower(text):
-    """`text` with only A-Z lowered: the length never changes (str.lower() can make a string LONGER, e.g. U+0130), so an index found in the copy is
-    an index of the original. ONE helper for every case-insensitive scan of a held body."""
-    return text.translate(_ASCII_LOWER)
-
-
-def _held_steps(size):
-    """A fresh step budget for one scan loop: each iteration spends one, and running out raises (the body is then unreadable), so no input can hang the daemon."""
-    return [4 * size + 64]
-
-
-def _held_spend(budget):
-    budget[0] -= 1
-    if budget[0] < 0:
-        raise ValueError("the scan did not finish within its step budget")
-
-
-_HTML_SPACE = " \t\n\f\r"   # HTML whitespace: space, tab, LF, FF, CR (not NBSP, not a vertical tab)
-_HTML_SPACE_RE = re.compile(r"[ \t\n\f\r]+")
-
-
-def _held_skip_space(text, i):
-    """The first index at or after `i` that is not HTML whitespace: the ONE helper for every attribute step."""
-    while i < len(text) and text[i] in _HTML_SPACE:
-        i += 1
-    return i
-
-
-def _held_class_tokens(tag):
-    """The class tokens (ASCII-lowered) of an HTML tag's text: a linear walk over every `class` (HTML whitespace around the name and the `=`, quoted either
-    way or bare); tokens are separated by HTML whitespace only."""
-    low = _ascii_lower(tag)
-    budget = _held_steps(len(low))
-    tokens, at = [], low.find("class")
-    while at >= 0:
-        _held_spend(budget)
-        i = _held_skip_space(low, at + 5)
-        if i < len(low) and low[i] == "=":
-            i = _held_skip_space(low, i + 1)
-            if i < len(low) and low[i] in "\"'":
-                end = low.find(low[i], i + 1)
-                end = len(low) if end < 0 else end
-                tokens += [t for t in _HTML_SPACE_RE.split(low[i + 1:end]) if t]
-                i = end
-            else:
-                end = i
-                while end < len(low) and low[end] not in _HTML_SPACE and low[end] != ">":
-                    end += 1
-                tokens += [t for t in _HTML_SPACE_RE.split(low[i:end]) if t]
-                i = end
-        at = low.find("class", max(i, at + 5))
-    return tokens
-
-
-def _held_tag_end(line, at):
-    """Index of the `>` that closes the tag opened at `at`, skipping quoted attribute values (a `>` inside quotes does not close it); -1 when it never closes."""
-    i, size = at, len(line)
-    while i < size:
-        c = line[i]
-        if c in "\"'":
-            i = line.find(c, i + 1)
-            if i < 0:
-                return -1
-        elif c == ">":
-            return i
-        i += 1
-    return -1
-
-
-def _held_pre_mermaid(line):
-    """True when `line` opens a `<pre>` whose class tokens include `mermaid`, or a `<pre` that is never closed on the line (it cannot be judged, so it
-    counts). Each `<pre` is walked to its closing `>` with `find` and the search resumes after it: linear, no window, no backtracking."""
-    low = _ascii_lower(line)
-    budget = _held_steps(len(low))
-    at = low.find("<pre")
-    while at >= 0:
-        _held_spend(budget)
-        after = low[at + 4:at + 5]
-        if not after.isalpha():
-            end = _held_tag_end(line, at)
-            if end < 0:
-                return True
-            if "mermaid" in _held_class_tokens(line[at:end]):
-                return True
-            at = low.find("<pre", end)
-        else:
-            at = low.find("<pre", at + 4)
-    return False
-
-
-def held_scan(lines):
-    """(clean, mermaid): `clean` is `lines` with every fenced code block (fences included: three or more backticks or tildes, up to three spaces of
-    indent, closed by the same character at least as long, an unclosed fence running to the end) and every HTML comment blanked, so a heading
-    counts only outside them (the explainer block's own opening marker is kept); `mermaid` lists the indexes where a Mermaid block opens (a fence
-    whose info string starts with `mermaid`, any case, or a `<pre class=mermaid>`)."""
-    clean, mermaid, fence, comment = [], [], None, False
-    for i, line in enumerate(lines):
-        if fence is not None:
-            found = _HELD_FENCE_RE.match(line)
-            if found and found.group(1)[0] == fence[0] and len(found.group(1)) >= fence[1] and not found.group(2).strip():
-                fence = None
-            clean.append("")
-            continue
-        if not comment:
-            found = _HELD_FENCE_RE.match(line)
-            if found and not (found.group(1)[0] == "`" and "`" in found.group(2)):
-                fence = (found.group(1)[0], len(found.group(1)))
-                words = found.group(2).split()
-                if words and _ascii_lower(words[0]) == "mermaid":
-                    mermaid.append(i)
-                clean.append("")
-                continue
-            if line.strip() == EXPLAINER_BEGIN:
-                clean.append(line)
-                continue
-        if _held_pre_mermaid(line):
-            mermaid.append(i)
-        parts, pos, size = [], 0, len(line)   # walk with an index: no slicing, no growing concatenation
-        budget = _held_steps(size)
-        while pos < size:
-            _held_spend(budget)
-            if comment:
-                end = line.find("-->", pos)
-                if end < 0:
-                    pos = size
-                else:
-                    comment, pos = False, end + 3
-            else:
-                start = line.find("<!--", pos)
-                if start < 0:
-                    parts.append(line[pos:])
-                    pos = size
-                else:
-                    parts.append(line[pos:start])
-                    comment, pos = True, start + 4
-        out = "".join(parts)
-        clean.append(out)
-    return clean, mermaid
-
-
-def held_top_end(rest):
-    """Index in `rest` where the top part ends (PC-5): the first heading (outside code fences and comments) after the first top part that is not one of
-    the four top parts, or the explainer block's opening marker; the end of the body when there is none. `rest` is the body after the opening lines."""
-    clean = held_scan(rest)[0]
-    first = next((i for i, l in enumerate(clean) if l.strip() in HELD_PARTS), None)
-    if first is None:
-        return len(rest)
-    return next((i for i in range(first + 1, len(rest)) if (clean[i].startswith("#") and clean[i].strip() not in HELD_PARTS) or clean[i].strip() == EXPLAINER_BEGIN), len(rest))
-
-
-def held_defects(body):
-    """The ONE check of a held PR's top (see `_held_defects`); anything it cannot read is a defect, never a pass."""
-    try:
-        if len(body or "") > HELD_BODY_MAX:
-            return ["the held PR's top is unreadable: the body is longer than %d characters" % HELD_BODY_MAX]
-        return _held_defects(body)
-    except Exception as err:   # a body it cannot parse fails: unreadable, never ok
-        return ["the held PR's top is unreadable (%s)" % _one_line("%s: %s" % (type(err).__name__, err), 100)]
 
 
 _BRIEF_ADVISORY = []   # the loaded module, once (it was reloaded on every call)
@@ -24836,140 +23826,6 @@ def _brief_advisory():
     spec.loader.exec_module(mod)
     _BRIEF_ADVISORY.append(mod)
     return mod
-
-
-def _held_defects(body):
-    """What is wrong with the top of a PR body held for the owner (used by `pr-explain --check` and gate G6b). After the opening lines
-    (PLAN:, MERGE:, canon:), in this order: `## Why this needs you` (1 to 3 sentences, no placeholder), `## What changes for you` (a Before | After
-    table of 2 to 4 rows of real cells), `## Example` (real text), `## Questions for you` (a numbered list, each item with `Recommendation:`) or the
-    line `Questions: none (reason)`. An image may sit anywhere in the top; a Mermaid block in the top is a defect; nothing below the top part is
-    judged, except that the generated summary flowchart (four boxes: Changes:, Touches:, Irreversible:, Risk:) is a defect ANYWHERE in the body. Headings count only outside code fences and comments. Reads the body only."""
-    lines = (body or "").split("\n")
-    clean_all, mermaid_all = held_scan(lines)
-    at = 0
-    while at < len(lines) and (EXPLAINER_HEADER_RE.match(lines[at]) or not clean_all[at].strip()):
-        at += 1
-    rest = lines[at:]
-    top_end = held_top_end(rest)
-    top = clean_all[at:at + top_end]
-    pos = {}
-    for i, l in enumerate(top):
-        pos.setdefault(l.strip(), i)
-
-    def section(name):
-        start = pos[name] + 1
-        stop = next((i for i in range(start, len(top)) if top[i].startswith("## ")), len(top))
-        return top[start:stop]
-
-    def words(text):
-        return len(re.findall(r"[^\W_]", text))   # underscores are not word characters here
-
-    problems = list(_brief_advisory().rationale_defects(lines))   # G6b (#1215): the one-sentence rationale line on top
-    if HELD_WHY not in pos:
-        problems.append("the held PR needs a `%s` section after the opening lines" % HELD_WHY)
-    else:
-        text = " ".join(l.strip() for l in section(HELD_WHY) if l.strip() and not l.strip().startswith("!["))
-        sentences = [x for x in re.split(r"(?<=[.!?])\s+", text) if x.strip()]
-        if words(text) < 3 or _HELD_PLACEHOLDER_RE.search(text):
-            problems.append("`%s` is empty or still has a <placeholder>" % HELD_WHY)
-        elif len(sentences) > 3:
-            problems.append("`%s` has %d sentences: it is one to three" % (HELD_WHY, len(sentences)))
-    if HELD_TABLE not in pos:
-        problems.append("the held PR needs a `%s` table (Before | After, 2 to 4 rows)" % HELD_TABLE)
-    else:
-        rows = [[c.strip() for c in l.strip().strip("|").split("|")] for l in section(HELD_TABLE) if l.strip().startswith("|")]
-        head = [_ascii_lower(c) for c in rows[0]] if rows else []
-        data = [r for r in rows[2:]] if len(rows) >= 2 and all(re.fullmatch(r":?-{3,}:?", c) for c in rows[1]) else None
-        if head != ["before", "after"] or data is None:
-            problems.append("`%s`: the table needs a Before and an After column (a header row, a separator row, then the rows)" % HELD_TABLE)
-        elif not 2 <= len(data) <= 4:
-            problems.append("`%s`: the table has %d rows, it is 2 to 4" % (HELD_TABLE, len(data)))
-        elif any(len(r) != 2 or any(words(c) < 3 or _HELD_PLACEHOLDER_RE.search(c) for c in r) for r in data):
-            problems.append("`%s`: every table cell is a plain sentence (at least 3 word characters, no <placeholder>)" % HELD_TABLE)
-    if HELD_EXAMPLE not in pos:
-        problems.append("the held PR needs an `%s` section: one concrete case in a few lines" % HELD_EXAMPLE)
-    else:
-        text = " ".join(l.strip() for l in section(HELD_EXAMPLE) if l.strip() and not l.strip().startswith("!["))
-        if len(text) < 20 or _HELD_PLACEHOLDER_RE.search(text):
-            problems.append("`%s` is empty, too short (20 characters) or still has a <placeholder>" % HELD_EXAMPLE)
-    if any(at <= m < at + top_end for m in mermaid_all):
-        problems.append("the top part shows a Mermaid diagram: it goes below, in the technical section")
-    if summary_flowchart_found(body):   # ANYWHERE in the body, the top part or below it or inside the explainer markers (ask #687)
-        problems.append(SUMMARY_FLOWCHART_DEFECT)
-    nones = [i for i, l in enumerate(top) if _held_none(l)]
-    if HELD_QUESTIONS in pos:
-        section_lines = [l for l in section(HELD_QUESTIONS) if l.strip()]
-        items, cur = [], None
-        for l in section_lines:
-            if re.match(r"^\s*\d+\.\s", l):
-                cur = [l]
-                items.append(cur)
-            elif cur is not None:
-                cur.append(l)
-        if items:
-            for n, item in enumerate(items, 1):
-                if "Recommendation:" not in " ".join(item):
-                    problems.append("question %d has no `Recommendation:`" % n)
-        elif not (len(section_lines) == 1 and _held_none(section_lines[0])):
-            problems.append("`%s` is a numbered list (each with `Recommendation:`) or exactly one line `Questions: none (reason)`" % HELD_QUESTIONS)
-    elif len(nones) != 1:
-        problems.append("the held PR needs `%s` (a numbered list, each question with `Recommendation:`) or the line `Questions: none (reason)`" % HELD_QUESTIONS)
-    order = [pos[n] for n in HELD_PARTS if n in pos]
-    if HELD_QUESTIONS not in pos and len(nones) == 1:
-        order.append(nones[0])
-    if order != sorted(order):
-        problems.append("the order is wrong: Why this needs you, What changes for you, Example, then Questions for you")
-    return problems
-
-
-def cmd_pr_explain(args, runner, now):
-    """`pr-explain <owner/repo#N>`: read the PR once and print the explainer block (the why part), or with
-    `--body-file F` the whole new body with the block in once, or with `--check` judge the description it has. It writes nothing anywhere."""
-    try:
-        repo, number = parse_pr_ref(args.pr)
-    except NoticeError as err:
-        sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 300)))
-        return EXIT_USAGE
-    engine, _, _ = build_engine(runner, now, "cli", writable=False)
-    try:
-        pr = read_pr_json(engine, repo, number)
-    except NoticeError as err:
-        sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 300)))
-        return EXIT_ERROR
-    body = pr.get("body") if isinstance(pr.get("body"), str) else ""
-    if args.check:
-        problems = explainer_defects(body)
-        if pr_is_held(pr.get("labels") or [], body):
-            problems += [p for p in held_defects(body) if p not in problems]   # the summary flowchart is named once
-        for problem in problems:
-            print("DEFECT: %s" % problem)
-        print("explainer: %s" % ("FAIL" if problems else "PASS"))
-        return EXIT_ERROR if problems else EXIT_OK
-    block = explainer_block(args.before or "<what happened before, one or two lines>", args.after or "<what happens after, one or two lines>")
-    if args.body_file:
-        try:
-            current = body if args.body_file == "-" else Path(args.body_file).read_text()
-        except OSError as err:
-            sys.stderr.write("%s: pr-explain: cannot read %s: %s\n" % (PROG, args.body_file, getattr(err, "strerror", None) or err))
-            return EXIT_USAGE
-        print(explainer_insert(current, block))
-    else:
-        print(block)
-    return EXIT_OK
-
-
-cmd_pr_explain.direct = True   # no error mapping, no daemon start
-
-
-def add_pr_explain_parsers(sub):
-    explain = sub.add_parser("pr-explain", help="Print the PR explainer block: a before/after why part (read-only; never a diagram)",
-                             description="Reads the PR once and PRINTS the block for its description; it writes nothing. Paste it, or use --body-file to get the whole "
-                                         "new body with the block in once, then `gh pr edit --body-file`. --check judges the description the PR has.")
-    explain.add_argument("pr", help="The pull request: owner/repo#N or its URL")
-    explain.add_argument("--before", help="The behaviour before, one or two lines")
-    explain.add_argument("--after", help="The behaviour after, one or two lines")
-    explain.add_argument("--body-file", help="A file with a PR body (or - for the PR's own): print it with the block in once")
-    explain.add_argument("--check", action="store_true", help="Judge the PR description: one block, a real why part, no generated summary flowchart")
 
 
 def add_impact_parsers(sub):
@@ -26847,9 +25703,6 @@ def _audit_tail(state_dir):
     return out
 
 
-
-
-
 # PR 10: move a v1 session into v2 (`import-v1`)
 #
 # One section, so the stack rebases cleanly. docs/switchboard.md, "v1
@@ -26915,8 +25768,6 @@ def _v2_session_list_page(self, directory=None, cursor=None, limit=V1_LIST_PAGE)
         raise V2Error("bad_json", None, "session.list returned no data list")
     following = (body.get("cursor") or {}).get("next")
     return body["data"], following if isinstance(following, str) and following else None
-
-
 
 
 def build_parser():
@@ -27555,6 +26406,9 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
             args.text = list(args.text or []) + extra   # words after an option (`remind a 1h --issue 3 the text`): argparse lets an optional positional end early
         elif extra:
             parser.error("unrecognized arguments: %s" % " ".join(extra))
+        conflict = reaper_only_conflict(args)   # in the parser, before anything is written or loaded
+        if conflict:
+            parser.error(conflict)
     except SystemExit as exit_:
         return EXIT_USAGE if exit_.code not in (0, None) else EXIT_OK
     if getattr(args, "action", None) == "review" and (set(held) != set(RATING_PATH_FUNCTIONS) or any(globals().get(name) is not fn or fn.__code__ is not code for name, (fn, code) in held.items())):
@@ -27600,6 +26454,20 @@ SERVICE_UNIT = "fleet-kit-switchboard.service"
 REAPER_LABEL = "com.fleet-kit.cloud-reaper"
 REAPER_UNIT = "fleet-kit-cloud-reaper.service"
 REAPER_INTERVAL_SECONDS = 60   # seconds between the managed reaper's passes: never slower than the reaper's own floor (REAP_FLOOR_SECONDS in cloud_worker.py)
+REAPER_FILE_MODE = 0o600   # the reaper's service file is private: it holds names and paths only, but every other private file of the kit is 0600
+# The cloud launcher's own settings file and the keys its one table holds. When that file exists it is the ONLY source of
+# those settings, so the reaper's service must not carry them too: a key set differently in the file and in the service
+# environment makes every start of the reaper refuse. The launcher owns the table (cloud/launcher/cloud_worker.py); the
+# test in bin/test-switchboard holds the two lists equal.
+CLOUD_SETTINGS_FILE_NAME = "cloud.env"
+CLOUD_ENV_SETTING_NAMES = ("CW_ALLOWED_REPOS", "CW_TOOLING_REPO", "CW_CLOUD_IMAGE", "CW_CLOUD_SERVER", "CW_CLOUD_CA_FILE",
+                            "CW_PULL_SECRET", "CW_VAULT_SUBSCRIPTION", "CW_VAULT_NAME", "CW_CLOUD_NAMESPACE", "CW_KUBECTL",
+                            "CW_OPENCODE_BIN", "CW_RUN_RECORD_DIR", "CW_CLOUD_SPEND_CAP_USD", "CW_CLUSTER_TOKEN_CMD",
+                            "CW_CLUSTER_ADMIN_CMD", "CW_GIT_TOKEN_CMD", "CW_APP_ID_CMD", "CW_APP_INSTALLATION_CMD",
+                            "CW_APP_KEY_CMD", "CW_CLUSTER_ADMIN_SECRET", "CW_CLUSTER_TOKEN_DURATION", "CW_HUB_CHANNEL_URL",
+                            "CW_HUB_REGISTRY_SECRET", "CW_VAULT_CHECK_DIR")
+REAPER_CLUSTER_NAMES = ("CW_CLOUD_SERVER", "CW_CLOUD_NAMESPACE", "CW_CLOUD_TOKEN_FILE")   # the cluster login the reaper needs (the token file: the install's environment, else a default)
+REAPER_VAULT_NAMES = ("CW_VAULT_NAME", "CW_VAULT_SUBSCRIPTION")   # the vault names (CW_CLUSTER_ADMIN_SECRET has a default: optional)
 # The reaper's NON-SECRET settings the installer copies from its own environment into the service (names of a cluster or a
 # namespace, paths of files). A token is never among them: the reaper reads the token FILE by path.
 REAPER_SETTING_NAMES = ("CW_KUBE_CONTEXT", "CW_KUBECONFIG", "CW_KUBECTL", "CW_CLOUD_SERVER", "CW_CLOUD_TOKEN_FILE",
@@ -28007,30 +26875,51 @@ def check_writable_target(path):
         raise InstallError("%s can be written by its group or others (mode %o); fix it and run again" % (path, info.st_mode & 0o777))
 
 
-def write_if_changed(path, content):
+def set_file_mode(path, mode):
+    """The file's mode, set when it is not the one asked for. True when it changed it. The mode asked for is the
+    one to set: a private file never gets a wider one."""
+    try:
+        info = os.lstat(str(path))
+    except OSError:
+        return False
+    if stat.S_IMODE(info.st_mode) == mode:
+        return False
+    os.chmod(str(path), mode)
+    return True
+
+
+def write_if_changed(path, content, mode=None):
     """Write `content` unless the file already holds it. True when it wrote. The target is checked first
     (check_writable_target), and a write goes to a temporary file beside it and is renamed over it, so a file
-    that appears in between is replaced, never written through."""
+    that appears in between is replaced, never written through.
+
+    `mode` is the mode the file must have when it is written, and when it already holds the content (an identical
+    file is given the mode too). None keeps today's behaviour: the mode of the umask, and the mode of a file that
+    is replaced."""
     path = Path(path)
     check_writable_target(path)
     try:
         if path.read_text() == content:
+            if mode is not None:
+                set_file_mode(path, mode)
             return False
     except OSError:
         pass
     path.parent.mkdir(parents=True, exist_ok=True)
     mask = os.umask(0)
     os.umask(mask)
-    mode = (0o666 & ~mask) & ~0o022
+    file_mode = (0o666 & ~mask) & ~0o022
     try:
-        mode = stat.S_IMODE(os.lstat(str(path)).st_mode)   # a replaced file keeps its mode
+        file_mode = stat.S_IMODE(os.lstat(str(path)).st_mode)   # a replaced file keeps its mode
     except OSError:
         pass
+    if mode is not None:
+        file_mode = mode
     fd, temp = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w") as handle:
             handle.write(content)
-        os.chmod(temp, mode)
+        os.chmod(temp, file_mode)
         os.replace(temp, str(path))
     except BaseException:
         try:
@@ -28490,6 +27379,147 @@ def reaper_settings(env):
                 "name": "a short name", "server": "an https address with no user, query or fragment"}[kind]))
         found[name] = value
     return found
+
+
+def cloud_settings_path():
+    """Where the cloud launcher's own settings file is: the switchboard's own config directory, `cloud.env`."""
+    return config_path().parent / CLOUD_SETTINGS_FILE_NAME
+
+
+def reaper_service_settings(env, settings_file=None):
+    """The settings the reaper's service file carries: the environment's, minus the keys the cloud launcher's own
+    settings file holds when that file exists. The file is then the only source of those keys, and a key set
+    differently in the file and in the service environment makes every start of the reaper refuse; without the file
+    every setting is copied, as it always was."""
+    found = reaper_settings(env)
+    path = Path(settings_file) if settings_file is not None else cloud_settings_path()
+    if path.exists():
+        found = {name: value for name, value in found.items() if name not in CLOUD_ENV_SETTING_NAMES}
+    return found
+
+
+def launcher_module():
+    """The cloud launcher's own module (<kit>/cloud/launcher/cloud_worker.py), loaded by path under its own name so it
+    never meets bin/cloud_worker.py. The installer judges the settings file with the launcher's own reader."""
+    import importlib.util
+    path = KIT_ROOT / "cloud" / "launcher" / "cloud_worker.py"
+    spec = importlib.util.spec_from_file_location("fleet_kit_cloud_launcher", str(path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_launcher_module():
+    """(module, None), or (None, ONE named refusal) when the launcher's own module cannot be loaded (absent, unreadable, a
+    syntax error, an error on import). Only the class name of the error is shown, never its text."""
+    try:
+        return launcher_module(), None
+    except Exception as err:
+        return None, ("cloud reaper not installed: the launcher module cloud/launcher/cloud_worker.py could not be loaded (%s)"
+                      % type(err).__name__)
+
+
+def reaper_settings_problem(path=None, env=None):
+    """None when the reaper-only install may write its service, else ONE line saying what is wrong and what to do. The
+    rule is the launcher's own: this CALLS the launcher's reader (_read_settings_file, then parse_settings), so the
+    installer refuses exactly what a launch would refuse (a quoted value, an unknown line, a bad server, namespace, vault
+    name or subscription, a missing CW_ALLOWED_REPOS or CW_CLOUD_IMAGE, a hard link, a symlink, a directory, a file or a
+    parent directory others can write, a foreign owner). The reaper's own names (cluster login, vault names) are then
+    required on top. The launcher's refusal text names the file and the line, never a value."""
+    path = Path(path) if path is not None else cloud_settings_path()
+    shown = str(path)
+    home = str(Path.home())
+    if shown.startswith(home + os.sep):
+        shown = "~" + shown[len(home):]
+    head = "cloud reaper not installed: "
+    if not os.path.lexists(str(path)):
+        return head + "%s is missing: create it (mode 600) with the settings a launch needs" % shown
+    launcher, load_problem = load_launcher_module()
+    if load_problem:
+        return load_problem
+    try:
+        text = launcher._read_settings_file(str(path))
+        if text is None:
+            return head + "%s is missing: create it (mode 600) with the settings a launch needs" % shown
+        values = launcher.parse_settings(text, shown)
+    except launcher.CloudError as err:
+        said = " ".join(str(err).split()).replace(str(path), shown)
+        said = said[len("refused: "):] if said.startswith("refused: ") else said
+        return head + said.replace("; nothing was called", "") + ": fix it as a launch needs, then run again"
+    for name in REAPER_CLUSTER_NAMES + REAPER_VAULT_NAMES:
+        if name == "CW_CLOUD_TOKEN_FILE":   # not a key the launcher's file can hold: reaper_login_file() chooses it (the environment, else a default)
+            continue
+        elif name not in values:
+            return head + "%s is missing the name %s: add it to the file" % (shown, name)
+    return None
+
+
+def reaper_default_login_file():
+    """The reaper's default login file: ~/.local/state/fleet-switchboard/cloud-reaper-token under the real home. It does NOT
+    follow XDG_STATE_HOME (decision: the service and its tests pin this path); set CW_CLOUD_TOKEN_FILE to put it elsewhere."""
+    return Path(os.path.expanduser("~")) / ".local" / "state" / "fleet-switchboard" / "cloud-reaper-token"
+
+
+def login_file_stat(path):
+    """lstat of the login file (a seam for the tests): never follows a symlink."""
+    return os.lstat(str(path))
+
+
+def login_file_problem(path):
+    """None when `path` is absent or a plain file of the user's own with mode 0600 (no group or other access); else ONE
+    named line. Never reads the file."""
+    try:
+        info = login_file_stat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        return "cloud reaper not installed: %s cannot be examined (%s): remove it or set CW_CLOUD_TOKEN_FILE" % (path, type(err).__name__)
+    shown = str(path).replace(str(Path.home()), "~", 1) if str(path).startswith(str(Path.home()) + os.sep) else str(path)
+    if stat.S_ISLNK(info.st_mode):
+        why = "a symlink"
+    elif not stat.S_ISREG(info.st_mode):
+        why = "not a regular file"
+    elif info.st_uid != os.geteuid():
+        why = "not yours"
+    elif stat.S_IMODE(info.st_mode) & 0o077:
+        why = "accessible by others"
+    else:
+        return None
+    return "cloud reaper not installed: %s already exists and is %s: remove it or set CW_CLOUD_TOKEN_FILE" % (shown, why)
+
+
+def reaper_login_file(env):
+    """(path, is_default, problem). A set CW_CLOUD_TOKEN_FILE (the install's environment) must be absolute; when it is not
+    set the default applies. `problem` is a named one-line refusal or None. Never touches the disk except to look."""
+    value = (env.get("CW_CLOUD_TOKEN_FILE") or "").strip()
+    if value:
+        if not value.startswith("/"):
+            return None, False, "cloud reaper not installed: CW_CLOUD_TOKEN_FILE must be an absolute path (a relative one is refused): set it to a full path or leave it unset for the default"
+        return value, False, login_file_problem(value)
+    path = reaper_default_login_file()
+    try:
+        info = os.lstat(str(path.parent))
+    except FileNotFoundError:
+        return str(path), True, None
+    except OSError as err:
+        return None, True, "cloud reaper not installed: the login file's directory cannot be examined (%s)" % type(err).__name__
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        return None, True, ("cloud reaper not installed: the login file's directory %s must be your own plain directory with no group or other access (chmod 700 it)"
+                            % str(path.parent).replace(str(Path.home()), "~", 1))
+    return str(path), True, login_file_problem(path)
+
+
+def make_reaper_login_directory(path):
+    """The default login file's directory, mode 0700, made when missing (an existing one is never changed). The file is
+    made 0600 by the reaper when it first writes it."""
+    parent = Path(path).parent
+    missing = []
+    while not parent.exists() and parent != parent.parent:
+        missing.append(parent)
+        parent = parent.parent
+    for directory in reversed(missing):
+        os.mkdir(str(directory), 0o700)
+        os.chmod(str(directory), 0o700)
 
 
 def render_reaper(kind, values, settings, kit_root=KIT_ROOT):
@@ -29128,9 +28158,14 @@ class Installer:
         spec.loader.exec_module(walk)
         return walk.parents_problem(str(script)) or walk.entry_problem(os.lstat(str(script)), "the reaper program")
 
-    def reaper_text(self, config):
+    def reaper_text(self, config, table_from_file=False, login_file=None):
+        """The reaper's service file. `table_from_file` is the reaper-only install: the launcher's own settings file
+        is then the only source of the keys it holds, so the service carries none of them."""
+        settings = reaper_service_settings(os.environ) if table_from_file else reaper_settings(os.environ)
+        if login_file is not None:   # the default login file: the service environment only, never the owner's settings file
+            settings = dict(settings, CW_CLOUD_TOKEN_FILE=login_file)
         return render_reaper(self.kind, service_values(self.kit_root, service_path_dirs(self.kit_root, [shutil.which("python3")])),
-                             reaper_settings(os.environ), self.kit_root)
+                             settings, self.kit_root)
 
     def reaper_loaded(self):
         uid = os.getuid()
@@ -29150,8 +28185,8 @@ class Installer:
             return [["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), REAPER_LABEL)]]
         return [["systemctl", "--user", "disable", "--now", REAPER_UNIT]]
 
-    def step_reaper(self, config):
-        path, text = reaper_file_path(self.kind), self.reaper_text(config)
+    def step_reaper(self, config, table_from_file=False, login_file=None):
+        path, text = reaper_file_path(self.kind), self.reaper_text(config, table_from_file, login_file)
         check_writable_target(path)
         problem = self.reaper_command_problem()
         if problem:
@@ -29160,21 +28195,25 @@ class Installer:
         on_disk = path.read_text() if path.exists() else None
         loaded = self.reaper_loaded()
         if on_disk == text and loaded:
-            return self.say("cloud reaper", "already done", str(path))
+            set_file_mode(path, REAPER_FILE_MODE)   # an identical file still gets the private mode
+            self.say("cloud reaper", "already done", str(path))
+            return False
         what = "load" if on_disk == text else "write and load"
         commands = " && ".join(" ".join(c) for c in self.reaper_load_commands(path))
         self.say("cloud reaper", "will run" if not self.dry else "would run", "%s: %s" % (what, commands))
         if self.dry:
-            return self.say("cloud reaper", "would be done", str(path))
+            self.say("cloud reaper", "would be done", str(path))
+            return True
         ensure_state_dir()
         if on_disk != text:
             if loaded:
                 for command in self.reaper_unload_commands():
                     self.run_checked(command, " ".join(command))
-            write_if_changed(path, text)
+        write_if_changed(path, text, mode=REAPER_FILE_MODE)
         for command in self.reaper_load_commands(path):
             self.run_checked(command, " ".join(command))
         self.say("cloud reaper", "done", str(path))
+        return True
 
     def reaper_is_ours(self, path, text):
         """True when the file at `path` is a rendering of the reaper template: the CW_* settings lines are set aside on BOTH sides and
@@ -29206,6 +28245,12 @@ class Installer:
             except InstallError as err:
                 removable, note = False, str(err)
         loaded = self.reaper_loaded()
+        if loaded and not os.path.lexists(str(path)) and not note:
+            unload = " && ".join(" ".join(c) for c in self.reaper_unload_commands())
+            if not self.dry:
+                for command in self.reaper_unload_commands():
+                    self.run_checked(command, " ".join(command))
+            return self.say("cloud reaper", "would run" if self.dry else "done", "%s: the job was loaded and has no file to remove" % unload)
         if loaded:
             self.say("cloud reaper", "would run" if self.dry else "will run", " && ".join(" ".join(c) for c in self.reaper_unload_commands()))
             if not self.dry:
@@ -29268,6 +28313,53 @@ class Installer:
         self.step_janitor_job()
         self.step_ensure(ensure or (lambda: ensure_daemon(ensure_state_dir(), self.spawn)),
                          status or (lambda: format_status(collect_status(self.runner, self.now, self.platform))))
+
+    # -- the reaper's service and nothing else (ask #982)
+    def install_cloud_reaper_only(self):
+        """Install and load ONLY the cloud worker's reaper service. Nothing else on the machine is touched: no config
+        key, no profile piece, no command link, no plugin link, no switchboard service and no daemon. The state
+        directory (the reaper's log) is the one other thing made, and the service file is written with mode 0600.
+
+        The launcher's own settings file, when it exists, is the only source of the settings it holds, so the service
+        carries none of them: a key set differently in the file and in the service makes every start refuse."""
+        if self.kind is None:
+            return self.say("cloud reaper", "skipped (no service manager known for this platform)")
+        problem = reaper_settings_problem()   # before anything is written: this path only (the full install does not check)
+        if problem:
+            raise InstallError(problem)
+        login, is_default, problem = reaper_login_file(os.environ)
+        if problem:
+            raise InstallError(problem)
+        if is_default:
+            self.out.write("cloud reaper: login file %s (default; set CW_CLOUD_TOKEN_FILE to change it)\n" % login)
+            if not self.dry:
+                make_reaper_login_directory(login)
+        changed = self.step_reaper({}, table_from_file=True, login_file=login if is_default else None)
+        self.out.write("only the cloud reaper's own service %s: the config, the profile pieces, the command link, "
+                       "the plugin link, the switchboard's own service and the daemon were left alone\n"
+                       % (("would be installed" if self.dry else "was installed") if changed else "is already installed"))
+        self.out.write("the reaper logs into the cluster by itself, from the settings the service carries (a token file "
+                       "by path, or a context) and from the settings file it reads at every start; without a login it "
+                       "writes `cluster login failed: ...` and the service restarts it every 30 seconds\n")
+
+    def uninstall_cloud_reaper_only(self):
+        """The way back of install_cloud_reaper_only: unload the reaper's job and remove ONLY its service file (the
+        plist or the unit). Nothing else is touched: no plugin, agent, skill, wrapper, link, service, config or profile.
+        Nothing installed: one line, and success."""
+        if self.kind is None:
+            return self.say("cloud reaper", "skipped (no service manager known for this platform)")
+        if not os.path.lexists(str(reaper_file_path(self.kind))) and not self.reaper_loaded():
+            self.out.write("cloud reaper: not installed\n")
+            return
+        self.remove_reaper()
+        self.out.write("only the cloud reaper's own service %s: the plugins, the agents, the skills, the wrapper, the command link, "
+                       "the switchboard's own service, the config and the profile were left alone\n"
+                       % ("would be removed" if self.dry else "was removed"))
+        login = reaper_default_login_file()
+        self.out.write("the login file %s and its directory were left in place (a leftover token file when the reaper has "
+                       "run): to remove it, run `rm %s` and, when nothing else is in it, `rmdir %s` "
+                       "(a login file you set with CW_CLOUD_TOKEN_FILE is yours to remove)\n"
+                       % (login, shlex.quote(str(login)), shlex.quote(str(login.parent))))
 
     # -- the reverse of 3 to 5
     def uninstall(self, with_service=True, with_link=True):
@@ -29388,17 +28480,51 @@ class Installer:
 
 
 def cmd_install(args, runner, now, spawn=subprocess.Popen):
+    conflict = reaper_only_conflict(args)
+    if conflict:
+        sys.stderr.write("%s: install refused: %s\n" % (PROG, conflict))
+        return EXIT_USAGE
     installer = Installer(runner, spawn, now, dry_run=args.dry_run, shared_profile=args.shared_profile,
                           profile=args.profile, gh_user=args.gh_user)
     try:
-        if args.uninstall:
+        if args.uninstall and args.cloud_reaper_only:
+            installer.uninstall_cloud_reaper_only()
+        elif args.uninstall:
             installer.uninstall(not args.no_service, not args.no_herdr_link)
+        elif args.cloud_reaper_only:
+            installer.install_cloud_reaper_only()
         else:
             installer.install(args.opencode, not args.no_service, not args.no_herdr_link, with_reaper=args.with_cloud_reaper)
     except InstallError as err:
         sys.stderr.write("%s: install stopped: %s\n" % (PROG, err))
         return EXIT_ERROR
     return EXIT_OK
+
+
+# The options `install --cloud-reaper-only` refuses, and why each of them is about the FULL install that the new
+# option does not do. One table: the completeness test in bin/test-switchboard holds every option of the install
+# parser to it, so a later option must be classified here.
+REAPER_ONLY_OPTION = "--cloud-reaper-only"
+REAPER_ONLY_REFUSALS = {
+    "--with-cloud-reaper": ("with_cloud_reaper", "the full install installs the reaper with the rest of the kit"),
+    "--no-service": ("no_service", "the reaper's service is the only service this option installs"),
+    "--no-herdr-link": ("no_herdr_link", "the herdr plugin link belongs to the full install"),
+    "--shared-profile": ("shared_profile", "the profile pieces belong to the full install"),
+    "--profile": ("profile", "the profile belongs to the full install"),
+    "--opencode": ("opencode", "the OpenCode binary belongs to the full install"),
+    "--gh-user": ("gh_user", "the gh account belongs to the full install"),
+}
+
+
+def reaper_only_conflict(args):
+    """The option `--cloud-reaper-only` refuses, or None. Nothing is written and no service is called when this
+    answers: the check runs in the parser, before the installer does anything."""
+    if not getattr(args, "cloud_reaper_only", False):
+        return None
+    for option, (dest, why) in REAPER_ONLY_REFUSALS.items():
+        if getattr(args, dest, None):
+            return "%s cannot be used with %s: %s" % (REAPER_ONLY_OPTION, option, why)
+    return None
 
 
 def add_install_parsers(sub):
@@ -29415,6 +28541,13 @@ def add_install_parsers(sub):
     install.add_argument("--with-cloud-reaper", dest="with_cloud_reaper", action="store_true",
                          help="Also install and load the cloud worker reaper as a service (opt-in: it needs a cluster login; "
                               "its non-secret CW_* settings are copied from this environment)")
+    install.add_argument("--cloud-reaper-only", dest="cloud_reaper_only", action="store_true",
+                         help="Install and load ONLY the cloud worker reaper's own service (opt-in: it needs a cluster login). "
+                              "It writes the reaper's service file (mode 0600) and the state directory (the reaper's log) "
+                              "and loads the service; it leaves alone the config, the profile pieces, the command link, "
+                              "the plugin link, the switchboard's own service and the daemon. It first checks the settings file "
+                              "(cloud.env: mode 600, the cluster login and vault names) and refuses with one line. "
+                              "With --uninstall it removes ONLY the reaper's service")
     install.add_argument("--no-herdr-link", dest="no_herdr_link", action="store_true",
                          help="Do not link herdr's plugin (it starts the daemon whenever herdr starts)")
     install.add_argument("--shared-profile", dest="shared_profile", action="store_true",
