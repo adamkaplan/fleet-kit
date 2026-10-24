@@ -102,6 +102,12 @@ SWITCHBOARD_SOURCE_FILES = _manifest_files()
 def switchboard_source():
     """The daemon's code as every scan reads it: the files of SWITCHBOARD_SOURCE_FILES, in order, as one text."""
     return "\n".join(path.read_text() for path in SWITCHBOARD_SOURCE_FILES)
+
+
+def daemon_text(path):
+    """The text of a file for a scan: for the entry, the daemon's whole source (the entry and every part of the manifest); for any other file, the file."""
+    path = Path(path)
+    return switchboard_source() if path.resolve() == SWITCHBOARD else path.read_text()
 SCENARIO = BIN / "fleet-scenario"
 
 
@@ -138,7 +144,7 @@ sc = _load("t_fleet_scenario", SCENARIO)
 
 def class_source(name, method=None):
     """The source of a class in bin/fleet-switchboard, or of one of its methods."""
-    source = SWITCHBOARD.read_text()
+    source = switchboard_source()
     for node in ast.parse(source).body:
         if isinstance(node, ast.ClassDef) and node.name == name:
             if method is None:
@@ -965,11 +971,11 @@ class TestHerdrClient(Base):
 
     def test_the_source_scan_catches_a_planted_violation(self):
         # A gate never seen failing is decoration.
-        planted = SWITCHBOARD.read_text().replace(
+        planted = switchboard_source().replace(
             "    def notification_show(self, title, body=None):",
             "    def wake(self, pane, text):\n        return self._call(\"agent\", \"prompt\", pane, text)\n\n"
             "    def notification_show(self, title, body=None):")
-        self.assertNotEqual(planted, SWITCHBOARD.read_text())
+        self.assertNotEqual(planted, switchboard_source())
         self.assertTrue(herdr_typing_violations(planted))
         for snippet in ('x = ["pane", "send-text", p]', 'x = ("pane", "run", p)', 'x = ["tab", "focus"]',
                         'x = "pane.send_text"', 'x = "agent.prompt"', 'y = {"focus": True}',
@@ -6658,7 +6664,7 @@ class TestLaunch(StandInPids, Base):
         self.assertEqual(code, 0, err.getvalue())
 
     def test_close_is_used_by_launch_alone(self):
-        tree = ast.parse(SWITCHBOARD.read_text())
+        tree = ast.parse(switchboard_source())
         callers = set()
         for function in ast.walk(tree):
             if isinstance(function, ast.FunctionDef):
@@ -9669,7 +9675,7 @@ class TestHygiene(unittest.TestCase):
     def test_standard_library_only(self):
         roots = _stdlib_roots()
         for name in self.FILES:
-            tree = ast.parse((BIN / name).read_text())
+            tree = ast.parse(daemon_text(BIN / name))
             modules = set()
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
@@ -10469,7 +10475,7 @@ class TestWorkerBlockedFacts(PR4Base):
 
     def test_there_is_one_toast_path_the_render_step(self):
         """PR 3's render owns every toast; a second mechanism would be a second way to do it."""
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         self.assertNotIn("ToastBoard", source)
         calls = [n for n in ast.walk(ast.parse(source)) if isinstance(n, ast.Call)
                  and isinstance(n.func, ast.Attribute) and n.func.attr == "notification_show"]
@@ -11501,7 +11507,7 @@ class TestFrictionWake(FrictionBase):
         self.assertNotIn("none yet", sb.friction_status_line(cfg, self.world.state))
         off = sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         self.assertEqual(sb.friction_status_line(off, self.world.state), "friction wake: off")
-        text = (REPO / "bin" / "fleet-switchboard").read_text()   # and `status` prints it, indented under the others
+        text = switchboard_source()   # and `status` prints it, indented under the others
         self.assertIn('report["friction"] = friction_status_line(config, state)', text)
         self.assertIn('lines.extend("      " + report["friction"]', text)
 
@@ -14000,7 +14006,7 @@ class TestChatClearOffers(unittest.TestCase):
         for word in ("subprocess", "urllib", "socket", "change_issue_labels"):
             self.assertNotIn(word, source, "slice 1 reaches nothing: no process, no network, no GitHub write")
         import ast
-        main = (Path(sb.__file__).parent / "fleet-switchboard").read_text()
+        main = switchboard_source()
         for fn in [n for n in ast.walk(ast.parse(main)) if isinstance(n, ast.FunctionDef) and n.name.startswith("cmd_")]:
             self.assertNotIn("chat_clear", ast.get_source_segment(main, fn), "%s: no command reaches the chat clear (slice 3's hook is the daemon's alone; TestChatClearHook S7 counts the call sites)" % fn.name)
 
@@ -14487,7 +14493,7 @@ class TestChatClearHook(Base):
 
     def test_s7_nothing_but_the_daemons_publish_calls_the_hook_and_no_command_takes_text_as_the_owners_word(self):
         import ast
-        tree = ast.parse((Path(sb.__file__)).read_text())
+        tree = ast.parse(switchboard_source())
         callers = {}
         for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
             for call in [c for c in ast.walk(fn) if isinstance(c, ast.Call)]:
@@ -14833,7 +14839,7 @@ class TestChatClearHook(Base):
 
     def test_light_live_every_route_that_can_write_is_behind_the_one_live_decision(self):
         import ast
-        tree = ast.parse(Path(sb.__file__).read_text())
+        tree = ast.parse(switchboard_source())
         fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
         derived = set()
         for name in ("_chat_clear_act", "chat_clear_apply"):
@@ -15388,7 +15394,7 @@ class TestClearCarry(unittest.TestCase):
 
     def test_s8_there_is_one_fingerprint_function_and_the_carry_code_holds_no_path_or_class_literal(self):
         import ast
-        main = Path(sb.__file__).read_text() + "\n" + (Path(sb.__file__).parent / "impact_hold.py").read_text()   # #532: the clear's wrapper moved to bin/impact_hold.py, still "the switchboard's" code
+        main = switchboard_source() + "\n" + (Path(sb.__file__).parent / "impact_hold.py").read_text()   # #532: the clear's wrapper moved to bin/impact_hold.py, still "the switchboard's" code
         module = Path(sb.__file__).parent / "clear_carry.py"
         text = module.read_text()
         defs = [n.name for src in (main, text) for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and "fingerprint" in n.name]
@@ -15801,9 +15807,20 @@ class CharterRig:
         self.registry = sb.load_module("registry")
         self.parents = {3: 1, 4: 1, 5: 4, 9: 1, 1: None}
         self.engine.intents = types.SimpleNamespace(parent=lambda number, repo=None: self.parents.get(number), repo=self.REPO, header=lambda *a, **k: None)
-        patcher = mock.patch.object(sb.IntentReader, "parent", lambda reader, number, repo=None: self.parents[number])   # #1143: the command's guard reads the same parents
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # #1218: the command's guard reads REAL shapes: a charter has NO parent and carries the orchestrator label; an ask has the charter as parent
+        self.cmd_parents = {1: None, 3: None, 4: None, 9: None, 5: 4, 6: 3, 7: None}   # 5 and 6 are asks; 7 is a root issue with no label
+        self.cmd_labels = {1: True, 3: True, 4: True, 9: True, 5: False, 6: False, 7: False}
+        self.cmd_reads = []
+        def cmd_parent(reader, number, repo=None):
+            self.cmd_reads.append(("parent", number))
+            return self.cmd_parents[number]
+        def cmd_issue(reader, number, repo=None):
+            self.cmd_reads.append(("issue", number))
+            return types.SimpleNamespace(number=number, labels=[sb.orchestrator_label()] if self.cmd_labels[number] else ["other"])
+        for name, fake in (("parent", cmd_parent), ("issue", cmd_issue)):
+            patcher = mock.patch.object(sb.IntentReader, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
 
     def orchestrator(self, name, charter=None, issue=None, registry=True):
@@ -16006,7 +16023,7 @@ class TestOneCharter(CharterRig, Base):
 
     def test_the_readers_that_fall_back_to_a_retired_orchestrators_record_are_derived_from_the_code_and_each_has_its_row(self):
         callers = set()
-        for node in ast.walk(ast.parse((REPO / "bin" / "fleet-switchboard").read_text())):
+        for node in ast.walk(ast.parse(switchboard_source())):
             if isinstance(node, ast.FunctionDef) and node.name != "registry_retired_owners":
                 if any(isinstance(s, ast.Call) and isinstance(s.func, ast.Name) and s.func.id == "registry_retired_owners" for s in ast.walk(node)):
                     callers.add(node.name)
@@ -16158,8 +16175,8 @@ class TestOneCharter(CharterRig, Base):
         ("bin/fleet-switchboard", "registry_charter_view"): "registry: every row's charter", ("bin/fleet-switchboard", "triage_context"): "registry: charters via owned_numbers (an orchestrator's issue is never a charter)",
         ("bin/switchboard/judge_request.py", "identify"): "own: copies the caller's own launch fields into its context",
         ("bin/fleet-switchboard", "resume_agent"): "own: one agent's own repo lookup", ("bin/fleet-switchboard", "charter_pane_update"): "own: one agent's own charter for its pane",
-        ("bin/fleet-switchboard", "_fleet_repo"): "own: one agent's own repo", ("bin/fleet-switchboard", "read_order_notices"): "own: the order notices' own records",
-        ("bin/fleet-switchboard", "order_groups"): "own: groups order notices", ("bin/fleet-switchboard", "decisions_from_order_notices"): "own: words order notices",
+        ("bin/fleet-switchboard", "_fleet_repo"): "own: one agent's own repo", ("bin/switchboard/decisions_b.py", "read_order_notices"): "own: the order notices' own records",
+        ("bin/switchboard/decisions_b.py", "order_groups"): "own: groups order notices", ("bin/switchboard/decisions_b.py", "decisions_from_order_notices"): "own: words order notices",
         ("bin/switchboard/judge_request.py", "resolve_policy_context"): "own: one agent's own launch context", ("bin/fleet-switchboard", "_valid_context"): "own: a cached own context",
         ("bin/fleet-switchboard", "charter_orders"): "own: an agent's own charter's orders", ("bin/switchboard/judge_request.py", "charter_guard"): "own: an agent's own charters",
         ("bin/switchboard/judge_request.py", "ask_context_of"): "own: an agent's own ask context", ("bin/fleet-switchboard", "__call__"): "own: an orchestrator's own orders",
@@ -16193,9 +16210,9 @@ class TestCharterSetGuard(CharterRig, Base):
         code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
         self.assertIn("already held by orch-a", err)
         code, out, err = self.run_as("cos", "charter", "set", "orch-b", "5")
-        self.assertIn("not a sub-issue", err)
-        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "1")
-        self.assertIn("not a sub-issue", err)
+        self.assertIn("is an ask, not a charter", err)
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "7")
+        self.assertIn("is not a charter", err)
         self.assertIsNone(self.row("orch-b")["charter"])
         self.assertEqual([e["event"] for e in self.audit_lines()], ["charter.refused"] * 3)
 
@@ -16242,6 +16259,50 @@ class TestCharterSetGuard(CharterRig, Base):
         self.assertIn("cannot read #3's parent", err)
         self.assertEqual((Path(self.world.state) / "registry.json").read_text(), before)
         self.assertEqual([e["detail"]["why"] for e in self.audit_lines()], ["unverified"])
+
+    def test_a_charter_with_no_parent_and_the_label_is_accepted_and_a_closed_one_too(self):
+        for number in (3, 8):
+            self.cmd_parents[8] = None
+            self.cmd_labels[8] = True   # (8: a closed charter; the shape is all that is read)
+            self.orchestrator("orch-%d" % number, registry=None)
+            code, out, err = self.run_as("cos", "charter", "set", "orch-%d" % number, str(number))
+            self.assertEqual(code, 0, err)
+            self.assertEqual(self.row("orch-%d" % number)["charter"], number)
+
+    def test_an_ask_and_an_unlabelled_root_issue_are_refused_and_nothing_changes(self):
+        self.orchestrator("orch-b", registry=None)
+        before = (Path(self.world.state) / "registry.json").read_text()
+        for number, text in ((6, "is an ask, not a charter"), (7, "not a charter")):
+            code, out, err = self.run_as("cos", "charter", "set", "orch-b", str(number))
+            self.assertEqual(code, 2, err)
+            self.assertIn(text, err)
+        self.assertEqual((Path(self.world.state) / "registry.json").read_text(), before)
+
+    def test_an_unreadable_label_is_refused_unverified(self):
+        self.orchestrator("orch-b", registry=None)
+        def boom(reader, number, repo=None):
+            raise RuntimeError("HTTP 502")
+        with mock.patch.object(sb.IntentReader, "issue", boom):
+            code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertEqual(code, 2, err)
+        self.assertIn("unverified", [e["detail"]["why"] for e in self.audit_lines()][0])
+
+    def test_a_set_reads_at_most_one_more_than_before_and_writes_nothing(self):
+        self.orchestrator("orch-b", registry=None)
+        self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertEqual(self.cmd_reads, [("parent", 3), ("issue", 3)])
+
+    def test_mutant_an_ask_is_accepted(self):
+        self.orchestrator("orch-b", registry=None)
+        with self.without("is an ask"):
+            self.run_as("cos", "charter", "set", "orch-b", "6")
+        self.assertEqual(self.row("orch-b")["charter"], 6)   # the write the real guard refuses: the ask test fails for this mutant
+
+    def test_mutant_an_unlabelled_issue_is_accepted(self):
+        self.orchestrator("orch-b", registry=None)
+        with self.without("not a charter"):
+            self.run_as("cos", "charter", "set", "orch-b", "7")
+        self.assertEqual(self.row("orch-b")["charter"], 7)   # the unlabelled test fails for this mutant
 
     def test_mutant_an_unreadable_parent_passes(self):
         self.orchestrator("orch-b", registry=None)
@@ -16437,7 +16498,7 @@ class TestCharterSetRaceAndSanitising(CharterRig, Base):
     def test_the_parents_are_read_before_the_lock_and_never_inside_it(self):
         self.orchestrator("orch-b", registry=None)
         seen = []
-        real_parent = lambda reader, number, repo=None: (seen.append(("parent", number)), self.parents[number])[1]
+        real_parent = lambda reader, number, repo=None: (seen.append(("parent", number)), self.cmd_parents[number])[1]
         real = self.registry.set_charter
 
         def spy(state_dir, name, charter, by, now=None, check=None):
@@ -16448,7 +16509,7 @@ class TestCharterSetRaceAndSanitising(CharterRig, Base):
         with mock.patch.object(sb.IntentReader, "parent", real_parent), mock.patch.object(self.registry, "set_charter", spy):
             code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
         self.assertEqual(code, 0, err)
-        self.assertEqual(seen, [("parent", 3), ("parent", 1), ("lock",)])   # the GitHub reads, then the registry's critical section; none inside it
+        self.assertEqual(seen, [("parent", 3), ("lock",)])   # (the label read is the rig's issue fake, not recorded here)   # the GitHub reads, then the registry's critical section; none inside it
 
     def test_hostile_values_are_refused_and_escaped_in_every_sink(self):
         self.orchestrator("orch-b", registry=None)
@@ -16479,8 +16540,7 @@ class TestCharterSetRaceAndSanitising(CharterRig, Base):
     def test_the_stdout_row_escapes_a_hostile_repo(self):
         self.orchestrator("orch-b", registry=None)
         self.registry.upsert(self.world.state, "orch-b", {"session": "s-x", "pane": self.world.panes["orch-b"], "role": "orchestrator", "charter": None, "repo": "acme\n<b>x</b>"})
-        with mock.patch.object(sb.IntentReader, "parent", lambda reader, number, repo=None: self.parents[number]):
-            code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
         self.assertEqual(code, 0, err)
         self.assertNotIn("<", out)
         self.assertEqual(out.count("\n"), 2, out)
@@ -16888,7 +16948,7 @@ class TestClearNotice(Base):
     def test_the_kinds_table_is_complete_derived_from_the_callers(self):
         import ast
         seen = set()
-        for path in (BIN / "fleet-switchboard", BIN / "impact_hold.py"):
+        for path in (*SWITCHBOARD_SOURCE_FILES, BIN / "impact_hold.py"):
             for node in ast.walk(ast.parse(path.read_text())):
                 if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "notify_clear" and len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
                     seen.add(node.args[1].value)
@@ -17579,7 +17639,7 @@ class TestClearCarryInTheDaemon(Base):
 
     def test_the_gates_command_calls_the_carried_note_and_a_state_error_is_said_not_swallowed(self):
         import ast
-        main = Path(sb.__file__).read_text()
+        main = switchboard_source()
         fn = next(n for n in ast.walk(ast.parse(main)) if isinstance(n, ast.FunctionDef) and n.name == "cmd_gates")
         self.assertIn("gates_carried_note(report, ctx)", ast.get_source_segment(main, fn))
         report = {"gates": [{"gate": "G6", "status": "ok", "detail": "not a held PR"}], "head": "a" * 40}
@@ -19514,7 +19574,7 @@ class TestIntegrationBranchVerdictText(unittest.TestCase):
         self.assertEqual((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().count(self.SKILL), 1)
 
     def test_the_refusal_wording_is_the_one_the_command_prints(self):
-        self.assertIn("no per-PR scenario of this plan is judged by %s", (REPO / "bin" / "fleet-switchboard").read_text())
+        self.assertIn("no per-PR scenario of this plan is judged by %s", switchboard_source())
 
     def test_the_texts_name_roles_never_agents_or_people(self):
         for text in (self.DOC, self.SKILL):
@@ -20415,7 +20475,7 @@ class TestPR7Source(unittest.TestCase):
         self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
     def test_the_decision_model_section_is_one_clearly_marked_block(self):
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         self.assertEqual(source.count("\n# PR 7: the decision model"), 1)
 
     def test_the_replay_answers_name_no_private_text(self):
@@ -20822,7 +20882,7 @@ class TestDecorationIsAFact(ActingCase):
 
     def test_the_source_is_registered_and_the_engine_has_no_second_way_to_write(self):
         self.assertIsNotNone(sb.foreground_source(self.world.engine))
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         section = source.split("# PR 8: foreground and background", 1)[1].split("# Worker events, reminders", 1)[0]
         for forbidden in ("v2.synthetic(", "v2.prompt(", "herdr.agent_prompt"):
             self.assertNotIn(forbidden, section.split("def launch_agent")[0], forbidden)
@@ -22618,7 +22678,7 @@ class TestHandoff(HandoffCase):
         writes = [c for c in self.gh.calls if len(c) != 3]
         self.assertEqual(len(writes), 1)
         self.assertNotRegex(class_source("IntentReader"), r"\"(-X|-f|-F|--method|--input|--field)\"")
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         # the handoff comment, (PR 17) `write_issue_body` and (PR 18) `_gh_write`: labels and comments
         self.assertEqual(source.count('"--method"'), 3)
 
@@ -22699,7 +22759,7 @@ class TestForegroundScenarios(Base):
 
 class TestPR8Source(unittest.TestCase):
     def test_the_foreground_section_is_one_clearly_marked_block(self):
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         self.assertEqual(source.count("\n# PR 8: foreground and background"), 1)
 
     def test_the_engine_still_never_types(self):
@@ -22708,7 +22768,7 @@ class TestPR8Source(unittest.TestCase):
     def test_no_top_level_name_is_defined_twice_in_the_big_files(self):
         for name in ("fleet-switchboard", "test-switchboard", "fleet-scenario", "proof-switchboard"):
             seen = {}
-            for node in ast.parse((BIN / name).read_text()).body:
+            for node in ast.parse(daemon_text(BIN / name)).body:
                 names = [node.name] if isinstance(node, (ast.FunctionDef, ast.ClassDef)) else [
                     t.id for t in getattr(node, "targets", []) if isinstance(t, ast.Name)]
                 for each in names:
@@ -24266,7 +24326,7 @@ class TestJudgeToolWritesNothingElsewhere(unittest.TestCase):
 
     def section(self):
         """The policy section: its part files, and the statements of it that stay in the entry (S2 keeps the ones the clear's closure reads), between the DEFAULTS line and the next section."""
-        entry = SWITCHBOARD.read_text()
+        entry = switchboard_source()
         kept = entry[entry.index('DEFAULTS["policy"] = None'):entry.index("# PR 10: move a v1 session")]
         return "\n".join([kept] + [path.read_text() for path in SWITCHBOARD_SOURCE_FILES if path != SWITCHBOARD])
 
@@ -25824,13 +25884,13 @@ class TestPR10Source(unittest.TestCase):
     SECTION = "\n# PR 10: move a v1 session into v2"
 
     def test_the_section_is_one_clearly_marked_block(self):
-        self.assertEqual(SWITCHBOARD.read_text().count(self.SECTION), 1)
+        self.assertEqual(switchboard_source().count(self.SECTION), 1)
 
     def test_the_engine_still_never_types(self):
         self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
     def test_the_import_command_runs_only_the_clients_it_is_given(self):
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         start = source.index(self.SECTION)
         section = source[start:source.index("\ndef build_parser")] + (BIN / "switchboard" / "import_v1.py").read_text()   # the part holds the rest of the section
         self.assertNotIn("subprocess.run", section, "the runner is injected")
@@ -25838,7 +25898,7 @@ class TestPR10Source(unittest.TestCase):
 
     def test_no_top_level_name_is_defined_twice_in_any_bin_file(self):
         for name in ("fleet-switchboard", "fleet-scenario", "test-switchboard", "proof-switchboard"):
-            tree = ast.parse((BIN / name).read_text())
+            tree = ast.parse(daemon_text(BIN / name))
             seen = {}
             for node in tree.body:
                 names = []
@@ -27731,7 +27791,7 @@ class TestBossAlias(ReportBase):
         self.assertEqual([f for f in self.derive() if f.sender == "cos"], [], "no worker facts for cos about itself")
 
     def test_every_boss_lookup_goes_through_boss_name(self):
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         start = source.index("def boss_name(")
         lookups = [i for i in range(len(source)) if source.startswith("_boss_of(", i)]
         offenders = []
@@ -29787,8 +29847,8 @@ class TestTriage(Base):
         self.assertEqual([e["detail"]["ref"] for e in self.world.audit() if e["event"] == "triage.dismissed"], ["acme/api#160"])
 
     def test_nothing_in_the_triage_can_write_to_github(self):
-        source = Path(sb.__file__).read_text() if hasattr(sb, "__file__") else ""
-        text = open(str(REPO / "bin" / "fleet-switchboard")).read()
+        source = switchboard_source() if hasattr(sb, "__file__") else ""
+        text = switchboard_source()
         start, end = text.index("# ---- #130: the triage function"), text.index("# ---- the daily friction wake")
         section = text[start:end]
         for forbidden in ("--method", "-X ", "issue edit", "issue comment", "issue close", "add-label", "--add-label",
@@ -30849,7 +30909,7 @@ class TestCaptainLabels(Base):
         self.assertFalse(sb.pr_facts_from(dict(data, labels=[], body="plain"))["captain"])
 
     def test_every_caller_reads_the_one_helper(self):
-        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        text = switchboard_source()
         callers = [l for l in text.splitlines() if "pr_is_captain(" in l and not l.lstrip().startswith(("def ", "return pr_marker"))]
         self.assertEqual(callers, [], "a caller still reads the first line alone: %r" % callers)
 
@@ -31017,7 +31077,7 @@ class TestCaptainSweepFindings(TestSweep):
         self.assertEqual([f for f in self.found() if f[0] == "S6a"], [])
 
     def test_the_sweep_writes_nothing_to_github(self):
-        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        text = switchboard_source()
         start, end = text.index("def sweep_read_repo"), text.index("class SweepFacts")
         for forbidden in ("--method", "-X ", "issue edit", "issue comment", "add-label", "POST", "PATCH", "DELETE"):
             self.assertNotIn(forbidden, text[start:end], forbidden)
@@ -34381,7 +34441,7 @@ class TestG1UnwrittenClaim(LedgerBase):
     def test_no_consumer_of_a_claim_defaults_it_to_pr_on_its_own(self):
         import re as _re
         for name in ("fleet-switchboard", "plan_ledger.py"):
-            text = (BIN / name).read_text()
+            text = daemon_text(BIN / name)
             self.assertEqual(_re.findall(r'\.get\("claim"\) or "pr"', text), [], name + " reads a claim without claim_of")
 
     def test_a_tester_scenario_whose_proof_is_not_a_measure_stays_claimed(self):
@@ -34578,6 +34638,112 @@ class TestLaunchTesters(LedgerBase):
         self.assertEqual(lt.status_lines({"tester": ["tst"]}, fleets, {}, {"acme/app"}, repo_of),
                          ["      tester     tst: config (any repo)", "      tester     t1: launch record (acme/app)"])
         self.assertEqual(lt.source_of("tst", {"tester": ["tst"]}, {"tst": {}}), "config")
+
+
+class TestReviewProof(LedgerBase):
+    """#1121: `review` is a reviewer's read of text: accepted by the plan check (evaluator reviewer), a verdict counts only with a quote or a link,
+    and a scenario about code behaviour is refused (use test). The mutants must fail the checks."""
+
+    REVIEW_PLAN = LEDGER_PLAN.replace("    proof: screenshot\n    pass: the header shows the word \"Ready\" after the reply",
+                                      "    proof: review\n    pass: the verdict quotes \"Ready\" from the text it read", 1)
+
+    def setUp(self):
+        super().setUp()
+        self.configure(evaluators={"reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]})
+        self.plan_issue["body"] = self.REVIEW_PLAN
+        self.assertIn("proof: review", self.REVIEW_PLAN)
+
+    def rv(self, evidence):
+        return self.run_as("rev", "verdict", "S3", "--pr", self.PR, "--as", "reviewer", "--result", "pass", "--evidence", evidence)
+
+    def checks(self):
+        """Every assertion of the clause; raises AssertionError when the code under test is wrong."""
+        code, _, err = self.prove("coder", "S3")
+        self.assertEqual(code, 0, err)
+        codes = lambda text: [d["code"] for d in sb.plan_check.check(text, "(1) a (2) b")["defects"]]
+        self.assertNotIn("bad-proof", codes(self.REVIEW_PLAN))
+        self.assertNotIn("evaluator-mismatch", codes(self.REVIEW_PLAN))
+        for other in ("ci", "tester", "owner"):
+            self.assertIn("evaluator-mismatch", codes(self.REVIEW_PLAN.replace("evaluator: reviewer", "evaluator: %s" % other, 1)))
+        code_plan = self.REVIEW_PLAN.replace("the header shows the agent state", "the command returns exit status 0", 1)
+        got = sb.plan_check.check(code_plan, "(1) a (2) b")
+        self.assertIn("review-for-code", [d["code"] for d in got["defects"]])
+        self.assertIn("use test", json.dumps(got))
+        code, out, err = self.run_as("rev", "verdict", "S3", "--pr", self.PR, "--as", "reviewer", "--result", "pass", "--evidence", "looked fine")
+        self.assertEqual(code, 2)
+        self.assertIn("no quote and no link", err)
+        self.assertEqual([e["kind"] for e in self.ledger()], ["proof"])
+        self.assertEqual(self.rv('read: "the header shows Ready"')[0], 0)
+        self.assertEqual(self.rv("read https://example.com/acme/doc#L3")[0], 0)
+        scen = {"text": "Given the chat window, when the reply arrives, then the header shows the agent state", "pass": "the verdict quotes Ready from the text it read"}
+        problem = sb.load_plan_ledger().review_evidence_problem
+        for bad in ('"a"', '"ab"', '"abc"', '"okay fine"', "`ok`", "\u201cok\u201d", "http://x", "https://a", "https://example.com", "https://localhost/x",
+                    '"' + "junk " * 1000 + '"', '"Given the chat window, when the reply arrives, then the header shows the agent state"', '\u201cGiven the  chat window, when the reply arrives, then the header shows the AGENT state\u201d',
+                    "`the verdict quotes Ready from the text it read`", "`The verdict quotes ready from the text it read`", '"12345 67890 !!!???"', '"\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014"',
+                    "", "looked fine", "https://" + "a" * 500 + ".com/x"):
+            self.assertIsNotNone(problem(bad, scen), bad[:40])
+        for good in ('"the header shows Ready"', '"Ready to go now"', "`the header says Ready`", "see https://example.com/a", "https://example.org#L3"):
+            self.assertIsNone(problem(good, scen), good)
+        self.assertEqual(self.rv('"ab"')[0], 2)
+        self.assertEqual(self.rv('"Given the chat window, when the reply arrives, then the header shows the agent state"')[0], 2)
+        self.assertEqual(self.rv("https://a")[0], 2)
+        for prose in ("the daemon refuses X", "the command prints Y", "no secret is logged", "the CLI exits non-zero", "the hook blocks the push",
+                      "the output contains Y", "the daemon rejects it", "the shim allows Z", "the file is written with mode 0600"):
+            got = sb.plan_check.check(self.REVIEW_PLAN.replace("the header shows the agent state", prose, 1), "(1) a (2) b")
+            self.assertIn("review-for-code", [d["code"] for d in got["defects"]], prose)
+        for prose in ("the daemon accepts the request", "the shim sends X", "a message is queued", "the audit line names Y", "the label is removed",
+                      "the daemon denies the request", "the hook deletes the file", "the daemon emits an event", "the worker creates a PR",
+                      "the worker posts a comment", "the gate fails closed", "the daemon stops", "the worker never pushes to main",
+                      "the token is not echoed", "the hook aborts"):
+            got = sb.plan_check.check(self.REVIEW_PLAN.replace("the header shows the agent state", prose, 1), "(1) a (2) b")
+            self.assertIn("review-for-code", [d["code"] for d in got["defects"]], prose)
+        # the trade-off: the net is keyword-based, so a prose scenario using one of these verbs is a false positive (it only pushes toward `test`); the plan reviewer guards what slips through
+        got = sb.plan_check.check(self.REVIEW_PLAN.replace("the header shows the agent state", "the skill explains why the plan has one canonical comment", 1), "(1) a (2) b")
+        self.assertNotIn("review-for-code", [d["code"] for d in got["defects"]])
+        got = sb.plan_check.check(self.REVIEW_PLAN.replace("the header shows the agent state", "the skill states that it prints a table", 1), "(1) a (2) b")
+        self.assertIn("review-for-code", [d["code"] for d in got["defects"]])   # a known false positive: it only pushes toward `test`
+
+    def test_the_real_code_passes_every_check(self):
+        self.checks()
+
+    def test_a_mutant_that_accepts_an_empty_review_fails(self):
+        with mock.patch.object(sb.load_plan_ledger(), "review_evidence_problem", lambda evidence, scenario=None: None):
+            with self.assertRaises(AssertionError):
+                self.checks()
+
+    def test_a_mutant_with_no_minimum_fails(self):
+        with mock.patch.object(sb.load_plan_ledger(), "REVIEW_QUOTE_MIN_WORDS", 1), mock.patch.object(sb.load_plan_ledger(), "REVIEW_QUOTE_MIN_CHARS", 1):
+            with self.assertRaises(AssertionError):
+                self.checks()
+
+    def test_a_mutant_that_accepts_the_scenarios_own_text_fails(self):
+        real = sb.load_plan_ledger().review_evidence_problem
+        with mock.patch.object(sb.load_plan_ledger(), "review_evidence_problem", lambda evidence, scenario=None: real(evidence)):
+            with self.assertRaises(AssertionError):
+                self.checks()
+
+    def test_a_mutant_that_accepts_any_host_fails(self):
+        with mock.patch.object(sb.load_plan_ledger(), "_review_link_ok", lambda url: True):
+            with self.assertRaises(AssertionError):
+                self.checks()
+
+    def test_a_mutant_that_accepts_review_for_a_code_scenario_fails(self):
+        with mock.patch.object(sb.load_plan_check(), "REVIEW_CODE_RE", re.compile(r"(?!x)x")):
+            with self.assertRaises(AssertionError):
+                self.checks()
+
+    def test_a_mutant_that_drops_the_type_from_the_check_fails(self):
+        with mock.patch.object(sb.load_plan_check(), "PROOFS", tuple(p for p in sb.load_plan_check().PROOFS if p != "review")):
+            with self.assertRaises(AssertionError):
+                self.checks()
+
+    def test_the_four_old_types_keep_their_evaluators_and_both_docs_list_review(self):
+        self.assertEqual({k: sb.plan_check.PROOF_EVALUATORS[k] for k in ("test", "live", "measure", "screenshot")},
+                         {"test": ("ci",), "live": ("tester", "owner"), "measure": ("tester", "owner"), "screenshot": ("reviewer", "owner")})
+        for doc in ("skills/fleet-planning/SKILL.md", "docs/plan-template.md"):
+            text = (Path(__file__).resolve().parent.parent / doc).read_text()
+            self.assertIn("review", text)
+            self.assertIn("screenshot", text)
 
 
 class TestPlanLedger(LedgerBase):
@@ -35185,7 +35351,7 @@ class TestPlanLedger(LedgerBase):
         with mock.patch.object(sb, "load_plan_ledger", side_effect=FileNotFoundError("plan_ledger.py is gone")):
             with self.assertRaises(FileNotFoundError):
                 sb.plan_ledger.LEDGER_FILE
-        text = SWITCHBOARD.read_text()
+        text = switchboard_source()
         self.assertNotRegex(text, r"(?m)^plan_ledger = load_plan_ledger\(\)")
 
     def test_the_new_files_carry_nothing_private(self):
@@ -35399,7 +35565,7 @@ class TestWaive(LedgerBase):
         self.assertEqual(self.waive(who=None)[0], 0)                                 # the owner's own terminal still may
 
     def test_waive_asks_the_one_shared_terminal_check_and_has_no_copy_of_it(self):
-        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        text = switchboard_source()
         body = text[text.index("def cmd_waive"):text.index("def cmd_gates(args")]
         self.assertIn("gates_caller_kind(", body)
         self.assertNotIn("isatty", body)
@@ -35604,6 +35770,359 @@ class TestPrSharesFiles(LedgerBase):
         self.open_prs = [self.pr_of(12, "a")]   # this pull request is not in the listing at all
         self.assertEqual(self.shares(self.gates_text()[1]), [])
         self.assertEqual(before[0], self.gates_text()[0])
+
+
+class TestCarriesLine(LedgerBase):
+    """#1196: a body line `CARRIES: #N` makes the gates read two plans and reuse the dependency's proofs for the commits identical to its head (by commit, never by name)."""
+
+    PR = "acme/app#9"
+    DEP = "acme/app#10"
+    DEP_HEAD = "d" * 40
+    HEAD = "e" * 40
+
+    def setUp(self):
+        super().setUp()
+        self.dep = {"title": "Dep", "state": "OPEN", "headRefOid": self.DEP_HEAD, "reviewDecision": "", "author": {"login": "shared"},
+                    "body": "PLAN: acme/app#8\ncanon: updated the docs", "labels": [], "reviews": [], "comments": [],
+                    "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]}
+        self.pr.update(headRefOid=self.HEAD, body="PLAN: acme/app#7\nCARRIES: #10\ncanon: updated the docs")
+        self.plan8 = dict(self.plan_issue, number=8)
+        self.compare_status = "ahead"
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1] == "pr" and argv[2] == "view" and argv[3] == "10":
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.dep), "")
+        if argv[0] == FAKE_GH and argv[1] == "api" and "/compare/" in argv[2]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"status": self.compare_status}), "")
+        if argv[0] == FAKE_GH and argv[1] == "api" and re.search(r"/issues/8$", argv[2]):
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.plan8), "")
+        if argv[0] == FAKE_GH and argv[1] == "api" and re.search(r"/issues/8/comments", argv[2]):
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[0] == FAKE_GH and argv[1] == "api" and "/compare/" not in argv[2] and "--method" in argv and "/issues/7" not in argv[2] and "/comments" not in argv[2]:
+            return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
+        saved = list(argv)
+        if "--method" in saved:
+            saved = saved[:saved.index("--method")]
+        return super().route(saved, **kwargs)
+
+    def plan_hash(self):
+        return sb.plan_check.plan_hash(LEDGER_PLAN)
+
+    def record(self, pr, head, who="coder", plan_ref=None):
+        """Every scenario of the plan proven and judged for `pr` at `head`."""
+        h, now = self.plan_hash(), self.world.clock.now()
+        for sid, ev, by in (("S1", "ci", "cibot"), ("S2", "tester", "tst"), ("S3", "reviewer", "rev"), ("U1", "ci", "cibot")):
+            sb.plan_ledger.append_entry(self.world.state, {"kind": "proof", "pr": pr, "scenario": sid, "plan_ref": plan_ref, "plan_hash": h, "head": head, "result": "pass", "by": who}, now)
+            sb.plan_ledger.append_entry(self.world.state, {"kind": "verdict", "pr": pr, "scenario": sid, "plan_ref": plan_ref, "plan_hash": h, "head": head, "result": "pass", "by": by, "evaluator": ev}, now)
+
+    def g1(self):
+        code, report, err = self.gates()
+        return code, report, err
+
+    def test_S2_both_plans_proven_at_the_identical_commits_pass_and_both_plans_are_read(self):
+        self.record(self.PR, self.HEAD, plan_ref="acme/app#7")
+        self.record(self.DEP, self.DEP_HEAD, plan_ref="acme/app#8")
+        code, report, err = self.gates()
+        self.assertIn(code, (0, 1), err)
+        self.assertEqual(self.row(report, "G0a")["status"], "ok")
+        self.assertIn("carried plan %s" % self.DEP, self.row(report, "G0a")["detail"])
+        g1 = self.row(report, "G1")
+        self.assertEqual(g1["status"], "ok", g1)
+        self.assertEqual(len([r for r in report["scenarios"] if r.get("carried_from") == self.DEP]), 4, "the dependency's scenarios are read")
+        self.assertEqual(len(report["scenarios"]), 8, "two plans: 4 + 4 scenarios, no fresh proof was recorded for the dependency's")
+        self.assertEqual(report["carries"]["pr"], self.DEP)
+        self.assertEqual(sum(1 for e in self.ledger() if e["pr"] == self.DEP and e["head"] == self.HEAD), 0)
+
+    def test_the_own_commits_still_need_fresh_proofs(self):
+        self.record(self.DEP, self.DEP_HEAD, plan_ref="acme/app#8")
+        code, report, err = self.gates()
+        g1 = self.row(report, "G1")
+        self.assertEqual(g1["status"], "missing")
+        self.assertEqual(len(g1["missing"]), 4, "the four own scenarios are asked for; none of the dependency's")
+        self.assertFalse(any(m.startswith(self.DEP) for m in g1["missing"]))
+
+    def test_S3_a_dependency_proof_for_other_commits_is_not_reused(self):
+        self.record(self.PR, self.HEAD, plan_ref="acme/app#7")
+        self.record(self.DEP, "c" * 40, plan_ref="acme/app#8")   # proven at a head that is not the commits the dependency holds now
+        code, report, err = self.gates()
+        self.assertEqual(code, 1, err)
+        g1 = self.row(report, "G1")
+        self.assertEqual(g1["status"], "missing")
+        self.assertEqual(len([m for m in g1["missing"] if m.startswith(self.DEP)]), 4)
+        self.assertTrue(all(r["status"] == "missing" for r in report["scenarios"] if r.get("carried_from")))
+
+    def test_S5_a_commit_not_in_the_branch_is_refused_with_the_reason(self):
+        self.compare_status = "diverged"
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        self.assertEqual(code, 2, err)
+        self.assertIn("not in this branch", err)
+
+    def test_S5_a_closed_unmerged_dependency_is_refused_with_the_reason(self):
+        self.dep["state"] = "CLOSED"
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        self.assertEqual(code, 2, err)
+        self.assertIn("closed unmerged", err)
+
+    def test_S5_a_merged_dependency_needs_no_carries_line_and_the_pull_request_reads_as_ordinary(self):
+        self.dep["state"] = "MERGED"
+        self.record(self.PR, self.HEAD, plan_ref="acme/app#7")
+        code, report, err = self.gates()
+        self.assertIsNone(report["carries"])
+        self.assertEqual(len(report["scenarios"]), 4)
+        self.assertEqual(self.row(report, "G1")["status"], "ok")
+
+    def test_U1_a_pull_request_with_no_carries_line_is_read_as_before(self):
+        self.pr["body"] = "PLAN: acme/app#7\ncanon: updated the docs"
+        self.record(self.PR, self.HEAD, plan_ref="acme/app#7")
+        code, report, err = self.gates()
+        self.assertIsNone(report["carries"])
+        self.assertEqual(len(report["scenarios"]), 4)
+        self.assertEqual(self.row(report, "G1")["status"], "ok")
+
+    # -- the clear (S4): pure reads of the floor fact and the gate row
+
+    def clear_state(self, head, names=True):
+        record = {"head": head, "reason": "ok", "by": "owner", "at": 1}
+        if names:
+            record["names"] = [self.PR, self.DEP]
+        (self.world.state / "impact-hold.json").write_text(json.dumps({"clears": {self.PR: record}, "applied": {}}))
+
+    def g6(self, head, floor_fn=None):
+        pl = sb.plan_ledger
+        floor = {"decision": "hold", "reasons": ["gates"], "cleared": False, "unreadable": None, "rehold": "held again"}
+        floor = (floor_fn or sb.floor_for_carries)(floor, self.world.state, self.PR, self.DEP)
+        carries = {"pr": self.DEP, "head": self.DEP_HEAD, "plan": None, "refusal": None}
+        report = pl.evaluate_gates(None, [], None, {"head": head, "carries": carries, "floor": floor}, self.PR)
+        return next(r for r in report["gates"] if r["gate"] == "G6")
+
+    def test_S4_the_clear_records_both_names_and_does_not_carry_to_a_later_head(self):
+        self.clear_state(self.HEAD)
+        record = json.loads((self.world.state / "impact-hold.json").read_text())["clears"][self.PR]
+        self.assertEqual(len(record["names"]), 2)
+        self.assertTrue(sb.plan_ledger.clear_names_both(record, self.PR, self.DEP))
+        self.assertFalse(sb.plan_ledger.clear_names_both({"names": [self.PR]}, self.PR, self.DEP))
+        later = self.g6("f" * 40)
+        self.assertEqual(later["status"], "waiting")
+        self.assertIn("clear is for another head", " ".join(later["missing"]))
+
+    def test_S4_the_clear_state_machinery_never_carries_a_clear_that_names_two_pull_requests(self):
+        self.clear_state(self.HEAD)
+        state, problem = sb.read_impact_state(self.world.state)
+        state["carried"] = {self.PR: {"head": "f" * 40, "from": self.HEAD}}
+        engine = types.SimpleNamespace(config={"impact_hold": {"carry_clear": True}}, state_dir=None)
+        self.assertIsInstance(sb.rehold_reason(engine, state, "acme/app", self.PR, "f" * 40), str)
+
+    # -- (#1196 fix round) each guard has a test that fails when the guard is removed
+
+    def carry_engine(self):
+        return types.SimpleNamespace(config={"gh": FAKE_GH, "impact_hold": {"enabled": True, "carry_clear": True}}, state_dir=self.world.state, gh_runner=self.route,
+                                     _note=lambda *a, **k: None, audit=None, now=lambda: 1)
+
+    def carried_state(self, names):
+        self.clear_state(self.HEAD, names=names)
+        state, _ = sb.read_impact_state(self.world.state)
+        state["carried"] = {self.PR: {"head": "f" * 40, "from": self.HEAD}}
+        return state
+
+    def test_G_rehold_reason_carries_a_clear_without_names_but_never_one_that_names_two(self):
+        engine = self.carry_engine()
+        self.assertIsNone(sb.rehold_reason(engine, self.carried_state(False), "acme/app", self.PR, "f" * 40), "control: an ordinary clear carries")
+        self.assertIsInstance(sb.rehold_reason(engine, self.carried_state(True), "acme/app", self.PR, "f" * 40), str)
+
+    def test_G_the_carry_decision_is_never_tried_for_a_clear_that_names_two(self):
+        engine = self.carry_engine()
+        cc = sb.load_module("clear_carry")
+        for names, expect_called in ((False, True), (True, False)):
+            self.clear_state(self.HEAD, names=names)
+            with mock.patch.object(cc, "decide", return_value={"carried": True}) as decide:
+                sb.impact_carry_decision(engine, "acme/app", 9, "f" * 40)
+            self.assertEqual(decide.called, expect_called, "names=%s" % names)
+
+    def test_G_a_clear_never_carries_to_a_later_head_directly(self):
+        self.clear_state(self.HEAD)
+        engine = self.carry_engine()
+        self.assertIsNone(sb.impact_carry_decision(engine, "acme/app", 9, "f" * 40))
+        state, _ = sb.read_impact_state(self.world.state)
+        self.assertNotEqual(state["clears"][self.PR]["head"], "f" * 40)
+        self.assertFalse(state.get("carried"))
+        row = self.g6("f" * 40)
+        self.assertEqual(row["status"], "waiting")
+        self.assertIn("clear is for another head", " ".join(row["missing"]))
+
+    def run_clear(self, body):
+        engine = self.world.new_engine("daemon")
+        engine.config.setdefault("impact_hold", {})["enabled"] = True
+        engine.config["gh"] = FAKE_GH
+        engine.gh_runner, engine.state_dir = self.route, self.world.state
+        self.pr["body"] = body
+        sb.impact_clear_core(engine, self.route, "acme/app", 9, "owner", "a false hold: it is a fixture")
+        return json.loads((self.world.state / "impact-hold.json").read_text())["clears"][self.PR]
+
+    def test_G_the_clear_of_a_carrying_pull_request_records_both_names_and_an_ordinary_one_none(self):
+        record = self.run_clear("PLAN: acme/app#7\nCARRIES: #10\n")
+        self.assertEqual(record.get("names"), [self.PR, self.DEP])
+        self.assertTrue(sb.plan_ledger.clear_names_both(record, self.PR, self.DEP))
+        self.assertNotIn("names", self.run_clear("PLAN: acme/app#7\n"))
+
+    def test_G6_a_clear_that_does_not_name_both_is_not_enough(self):
+        self.clear_state(self.HEAD, names=False)
+        row = self.g6(self.HEAD, floor_fn=lambda floor, *a: dict(floor, cleared=True, clear_head=self.HEAD, names_both=False, rehold=None))
+        self.assertEqual(row["status"], "waiting")
+        self.assertIn("does not name both", " ".join(row["missing"]))
+        row = self.g6(self.HEAD, floor_fn=lambda floor, *a: dict(floor, cleared=True, clear_head=self.HEAD, names_both=True, rehold=None))
+        self.assertNotIn("does not name both", " ".join(row.get("missing") or []))
+
+    def test_G0a_a_missing_or_failing_plan_of_the_dependency_makes_the_carrier_not_ready(self):
+        plan = {"result": "pass", "defects": [], "plan_hash": self.plan_hash(), "text": "", "scenarios_parsed": []}
+        pl = sb.plan_ledger
+        def g0a(dep):
+            carries = {"pr": self.DEP, "head": self.DEP_HEAD, "plan": dep, "refusal": None}
+            report = pl.evaluate_gates(plan, [], None, {"head": self.HEAD, "carries": carries}, self.PR)
+            return next(r for r in report["gates"] if r["gate"] == "G0a"), report
+        for dep in (None, dict(plan, result="fail")):
+            row, report = g0a(dep)
+            self.assertEqual(row["status"], "missing")
+            self.assertIn("plan is missing or fails", " ".join(row["missing"]))
+            self.assertFalse(report["ready"])
+        self.assertEqual(g0a(dict(plan))[0]["status"], "ok")
+
+    def test_the_dependencys_own_clear_is_never_reused_for_the_carrier(self):
+        (self.world.state / "impact-hold.json").write_text(json.dumps({"clears": {self.DEP: {"head": self.HEAD, "reason": "ok", "by": "owner", "at": 1, "names": [self.PR, self.DEP]}}, "applied": {}}))
+        floor = sb.floor_for_carries({"decision": "hold", "reasons": ["gates"], "cleared": False, "unreadable": None, "rehold": "held again"}, self.world.state, self.PR, self.DEP)
+        self.assertIsNone(floor["clear_head"])
+        self.assertFalse(floor["names_both"])
+        self.assertFalse(floor["cleared"])
+
+    # -- the line itself: one `CARRIES: #N`, outside fenced code, never its own number
+
+    def refused(self, body):
+        self.pr["body"] = body
+        code, out, err = self.run_as("coder", "gates", self.PR)
+        self.assertEqual(code, 2, err)
+        return err
+
+    def test_M2_several_or_foreign_or_trailing_carries_lines_are_refused(self):
+        for body in ("CARRIES: #10\nCARRIES: #10", "CARRIES: #10, #11", "CARRIES: #10 and #11", "CARRIES: other/repo#10", "CARRIES: #12abc"):
+            err = self.refused("PLAN: acme/app#7\n%s\n" % body)
+            self.assertRegex(err, "more than one CARRIES line|not exactly", body)
+
+    def test_M2_the_parse(self):
+        pl = sb.plan_ledger
+        self.assertEqual(pl.carries_parse("CARRIES: #10\n")[0], 10)
+        self.assertEqual(pl.carries_parse("x\n  CARRIES:   #10  \n")[0], 10)
+        self.assertIsNone(pl.carries_parse("none")[0])
+        self.assertIsNone(pl.carries_parse("none")[1])
+        for body in ("CARRIES: #5\nCARRIES: #5", "CARRIES: #5, #6", "CARRIES: #5 and #6", "CARRIES: other/repo#5", "CARRIES: #12abc"):
+            self.assertEqual(pl.carries_parse(body)[0], None, body)
+            self.assertTrue(pl.carries_parse(body)[1], body)
+
+    def test_M3_a_pull_request_that_carries_itself_is_refused(self):
+        self.assertIn("cannot carry itself", self.refused("PLAN: acme/app#7\nCARRIES: #9\n"))
+
+    def test_M4_a_carries_line_inside_a_fenced_block_is_ignored(self):
+        pl = sb.plan_ledger
+        self.assertIsNone(pl.carries_parse("```\nCARRIES: #10\n```\n")[0])
+        self.assertIsNone(pl.carries_parse("~~~\nCARRIES: #10, #11\n~~~\n")[1])
+        self.assertEqual(pl.carries_parse("```\nCARRIES: #3\n```\nCARRIES: #10\n")[0], 10)
+        self.pr["body"] = "PLAN: acme/app#7\n```\nCARRIES: #10\n```\ncanon: updated the docs"
+        self.record(self.PR, self.HEAD, plan_ref="acme/app#7")
+        code, report, err = self.gates()
+        self.assertIsNone(report["carries"])
+
+    def mutate(self, module_name, function, old, new):
+        """A wrong build: `function` of the module compiled again with the text `old` replaced by `new` (which must exist). Returns (patch target, mutant)."""
+        mod = sb.load_module(module_name)
+        src = Path(mod.__file__).read_text()
+        assert old in src, "the guard text is not in %s: %r" % (module_name, old)
+        ns = dict(mod.__dict__)
+        exec(compile(src.replace(old, new, 1), mod.__file__, "exec"), ns)
+        if module_name == "impact_hold":   # its functions run in the daemon's globals (bind): the mutant too, and it replaces the daemon's name
+            original = ns[function]
+            return sb, types.FunctionType(original.__code__, vars(sb), original.__name__, original.__defaults__, original.__closure__)
+        return mod, ns[function]
+
+    def fails_with(self, module_name, function, old, new, test, also_sb=False):
+        mod, mutant = self.mutate(module_name, function, old, new)
+        with mock.patch.object(mod, function, mutant), self.assertRaises((AssertionError, TypeError)):   # a mutant that crashes is caught too
+            test()
+
+    def test_S6_a_mutant_per_guard_fails_the_guards_test(self):
+        guard = "    if cleared.get(\"names\"):   # (#1196) the clear of a carrying pull request never carries to a later head\n        carried = {}\n"
+        self.fails_with("impact_hold", "rehold_reason", guard, "", self.test_G_rehold_reason_carries_a_clear_without_names_but_never_one_that_names_two, True)
+        guard = "        if cleared.get(\"names\"):   # (#1196) a clear that names two pull requests is for its own head only\n            return None\n"
+        self.fails_with("impact_hold", "impact_carry_decision", guard, "", self.test_G_the_carry_decision_is_never_tried_for_a_clear_that_names_two, True)
+        self.fails_with("impact_hold", "impact_clear_core", 'state["clears"][pr]["names"] =', 'state["clears"][pr]["renamed"] =',
+                        self.test_G_the_clear_of_a_carrying_pull_request_records_both_names_and_an_ordinary_one_none, True)
+        self.fails_with("plan_ledger", "evaluate_gates", 'floor.get("cleared") and not floor.get("names_both"):', "False:",
+                        self.test_G6_a_clear_that_does_not_name_both_is_not_enough)
+        for cond in ('dep is None', 'dep is not None and dep.get("result") != "pass"'):   # a missing plan not caught / a failing plan not caught
+            self.fails_with("plan_ledger", "evaluate_gates", 'elif dep is None or dep.get("result") != "pass":', "elif %s:" % cond,
+                            self.test_G0a_a_missing_or_failing_plan_of_the_dependency_makes_the_carrier_not_ready)
+        self.fails_with("plan_ledger", "evaluate_gates", 'floor.get("clear_head") != head and not floor.get("cleared")', "False",
+                        self.test_G_a_clear_never_carries_to_a_later_head_directly)
+
+    def test_S6_a_mutant_per_line_rule_fails_the_rules_test(self):
+        pl = sb.plan_ledger
+        real = pl.carries_parse
+        def first_only(body):
+            found = re.search(r"(?m)^\s*CARRIES:\s*#(\d+)", body or "")
+            return (int(found.group(1)), None) if found else (None, None)
+        with mock.patch.object(pl, "carries_parse", first_only), self.assertRaises(AssertionError):
+            self.test_M2_the_parse()
+        unfenced = lambda body: real("\n".join(l for l in (body or "").splitlines() if not l.startswith(("```", "~~~"))))
+        with mock.patch.object(pl, "carries_parse", unfenced), self.assertRaises(AssertionError):
+            self.test_M4_a_carries_line_inside_a_fenced_block_is_ignored()
+        # self-carry: remove the guard of the switchboard and the test fails
+        real_ctx = sb.carries_context
+        def no_self_guard(engine, config, repo, number, *a):
+            return real_ctx(engine, config, repo, number + 1000, *a)
+        with mock.patch.object(sb, "carries_context", no_self_guard), self.assertRaises(AssertionError):
+            self.test_M3_a_pull_request_that_carries_itself_is_refused()
+
+    # -- S6: the mutants. Each is a wrong build; the clause's checks must fail it and pass the real code.
+
+    def checks(self):
+        """The three behaviours every mutant must break. Raises AssertionError when one fails."""
+        pl = sb.plan_ledger
+        plan = {"result": "pass", "defects": [], "plan_hash": self.plan_hash(), "text": "", "scenarios_parsed": [{"id": "S1", "evaluator": "ci", "proof": "test"}]}
+        dep_plan = dict(plan, plan_hash="sha256:" + "1" * 64)
+        now = self.world.clock.now()
+        entries = []
+        for pr, head, h in ((self.PR, self.HEAD, plan["plan_hash"]), (self.DEP, "c" * 40, dep_plan["plan_hash"])):   # the dependency is proven at OTHER commits
+            entries.append({"seq": len(entries) + 1, "kind": "proof", "pr": pr, "scenario": "S1", "plan_hash": h, "head": head, "result": "pass", "by": "coder"})
+            entries.append({"seq": len(entries) + 1, "kind": "verdict", "pr": pr, "scenario": "S1", "plan_hash": h, "head": head, "result": "pass", "by": "cibot", "evaluator": "ci"})
+        carries = {"pr": self.DEP, "head": self.DEP_HEAD, "plan": dep_plan, "refusal": None}
+        g1 = lambda c: next(r for r in pl.evaluate_gates(plan, entries, None, {"head": self.HEAD, "carries": c}, self.PR)["gates"] if r["gate"] == "G1")
+        assert g1(carries)["status"] == "missing", "a proof for different commits was reused"
+        assert any(m.startswith(self.DEP) for m in g1(carries)["missing"]), "the dependency's scenario is not listed as missing"
+        own_only = [e for e in entries if e["pr"] == self.PR] + [dict(e, pr=self.DEP, head=self.DEP_HEAD, seq=e["seq"] + 10, plan_hash=dep_plan["plan_hash"]) for e in entries if e["pr"] == self.PR]
+        ok = pl.evaluate_gates(plan, own_only, None, {"head": self.HEAD, "carries": carries}, self.PR)
+        assert next(r for r in ok["gates"] if r["gate"] == "G1")["status"] == "ok", "identical commits must pass"
+        assert len(ok["scenarios"]) == 2, "the second plan was ignored"
+        self.clear_state(self.HEAD)
+        later = self.g6("f" * 40)
+        assert later["status"] == "waiting" and "clear is for another head" in " ".join(later["missing"]), "a clear carried to a later head"
+
+    def test_S6_the_real_code_passes_the_checks(self):
+        self.checks()
+
+    def test_S6_a_mutant_that_reuses_proofs_for_different_commits_fails(self):
+        real = sb.load_module("plan_ledger").carried_rows
+
+        def mutant(carries, entries, facts):
+            newest = [e["head"] for e in entries if e.get("pr") == carries["pr"] and e.get("kind") == "proof"]
+            return real(dict(carries, head=newest[-1] if newest else carries["head"]), entries, facts)
+        with mock.patch.object(sb.load_module("plan_ledger"), "carried_rows", mutant), self.assertRaises(AssertionError):
+            self.checks()
+
+    def test_S6_a_mutant_that_ignores_the_second_plan_fails(self):
+        with mock.patch.object(sb.load_module("plan_ledger"), "carried_rows", lambda carries, entries, facts: ([], None)), self.assertRaises(AssertionError):
+            self.checks()
+
+    def test_S6_a_mutant_that_lets_a_clear_carry_to_a_later_head_fails(self):
+        mutant = lambda floor, state, pr, dep_pr: dict(floor, cleared=True, clear_head=None, names_both=True, rehold=None)
+        with mock.patch.object(sb, "floor_for_carries", mutant), self.assertRaises(AssertionError):
+            self.checks()
 
 
 class TestPlanGatesCheck(LedgerBase):
@@ -36389,7 +36908,7 @@ class TestOwnerTerminal(LedgerBase):
         self.assertEqual(self.run_as(None, "gates", "off")[0], 0)
 
     def test_the_terminal_check_is_one_function_used_by_every_owner_only_command(self):
-        text = SWITCHBOARD.read_text()
+        text = switchboard_source()
         self.assertEqual(text.count("owner_terminal_problem()"), 1, "the check is called from exactly one place")
         for name in ("gates_caller_may_switch", "cmd_verdict"):
             self.assertIn("gates_caller_kind(", inspect.getsource(getattr(sb, name)), name)
@@ -37062,7 +37581,7 @@ class TestImpactClassAndNarrowForm(LedgerBase):
             self.assertEqual(code, 2)
             self.assertIn("run the review again", err)
         self.assertEqual([e["impact_class"] for e in self.hold_records()], ["novelty"])
-        source = (REPO / "bin" / "fleet-switchboard").read_text()
+        source = switchboard_source()
         rule = impact_floor.owner_hold_rule(impact_floor.load_matrix())
         names = rule[0] + rule[1]   # no line of the code lists several of the classes (single words like "data" occur elsewhere)
         self.assertEqual([l for l in source.splitlines() if sum(1 for c in names if re.search(r"[\"']%s[\"']" % c, l)) >= 3], [])
@@ -37359,7 +37878,7 @@ class TestBlockTable(LedgerBase):
         definition = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
         self.assertEqual(definition.split("<!-- block-table:begin -->\n", 1)[1].split("\n<!-- block-table:end -->", 1)[0], text)
         self.assertEqual(self.record("--head", LEDGER_HEAD)[2].count(text), 1)
-        self.assertEqual((REPO / "bin" / "fleet-switchboard").read_text().count('("--verdict", "verdict", "refused")'), 1)
+        self.assertEqual(switchboard_source().count('("--verdict", "verdict", "refused")'), 1)
 
     def test_the_definitions_example_block_parses_to_a_record_with_a_score(self):
         definition = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
@@ -38073,7 +38592,7 @@ class TestWholeRead(LedgerBase):
         import ast
         found = set()
         for name in ("plan_ledger.py", "fleet-switchboard"):
-            text = (REPO / "bin" / name).read_text()
+            text = daemon_text(REPO / "bin" / name)
             for node in ast.walk(ast.parse(text)):
                 if isinstance(node, ast.FunctionDef):
                     inner = [n for n in ast.walk(node) if isinstance(n, ast.FunctionDef) and n is not node]
@@ -38134,7 +38653,7 @@ class TestWholeRead(LedgerBase):
         self.assertEqual(region, "RATER_CHUNK_LINES = %d" % sb.RATER_CHUNK_LINES)
         self.assertEqual(text.count("RATER_CHUNK_LINES"), 1)
         self.assertEqual(text.count(str(sb.RATER_CHUNK_LINES)), 1)
-        self.assertEqual((REPO / "bin" / "fleet-switchboard").read_text().count("RATER_CHUNK_LINES = "), 1)
+        self.assertEqual(switchboard_source().count("RATER_CHUNK_LINES = "), 1)
         self.assertIn("one changed file at a time", text)
         self.assertIn("in the changed-file order", text.replace("one each, in the changed-file order", "in the changed-file order"))
 
@@ -38692,7 +39211,7 @@ class TestImpactRejudge(LedgerBase):
         refs = ("CAPTAIN_HOLD_LABELS", "OWNER_HOLD_KEY", "OTHER_HOLD_KEYS")
         found, uses_owner = {}, {}
         for path in sorted(glob.glob(str(Path(sb.KIT_ROOT) / "bin" / "*.py")) + [str(Path(sb.KIT_ROOT) / "bin" / "fleet-switchboard")]):
-            tree = ast.parse(Path(path).read_text())
+            tree = ast.parse(daemon_text(path))
             for node in ast.walk(tree):
                 if isinstance(node, ast.FunctionDef):
                     inside = list(ast.walk(node))
@@ -39797,7 +40316,7 @@ class TestImpactHold(LedgerBase):
         """The readers are DERIVED from the code: every function that calls `rehold_reason` (the one rule) is in the table, and the table holds nothing else but the two gate rows."""
         import ast
         callers = set()
-        for path in (BIN / "fleet-switchboard", BIN / "impact_hold.py"):
+        for path in (*SWITCHBOARD_SOURCE_FILES, BIN / "impact_hold.py"):
             for node in ast.parse(path.read_text()).body:
                 if isinstance(node, ast.FunctionDef) and any(isinstance(x, ast.Call) and getattr(x.func, "id", "") == "rehold_reason" for x in ast.walk(node)):
                     callers.add(node.name)
@@ -40212,7 +40731,7 @@ class TestImpactHold(LedgerBase):
                 self.assertTrue(set(readers) <= set(roots.get("bin/" + path.name) or []), "%s has a config reader (%s) that is not a root" % (path.name, readers))
         # the modules the clear loads or runs, DERIVED: every loader of the daemon (a `load_module("x")` call, a name in HELPER_MODULES, a function that returns one) is enumerated by ast; a module
         # is judged when the clear reaches its loader, the daemon loads it at import, it has a config reader, or the recorded run executed it; every other loaded module is listed with its reason
-        daemon, hold = ast.parse((BIN / "fleet-switchboard").read_text()), ast.parse((BIN / "impact_hold.py").read_text())
+        daemon, hold = ast.parse(switchboard_source()), ast.parse((BIN / "impact_hold.py").read_text())
         names = {p.stem for p in BIN.glob("*.py")}
         helper = next(ast.literal_eval(n.value) for n in daemon.body if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "HELPER_MODULES" for t in n.targets))
         defs = {n.name: n for n in daemon.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
@@ -40268,7 +40787,7 @@ class TestImpactHold(LedgerBase):
         self.assertEqual([k for k, v in counts.items() if v > 1], [], "each function of the moved clear code is defined once (a later copy would silently replace the first)")
         for pinned in ("impact_carry_get", "fetch_orders", "read_pr_json", "HELPER_MODULES", "_make_loader"):
             self.assertIn(pinned, rule["closure_roots"])
-        table = (BIN / "fleet-switchboard").read_text().split("\n")
+        table = switchboard_source().split("\n")
         k = next(i for i, l in enumerate(table) if l.strip().startswith('"load_agent_presence":'))
         mutated = list(table)
         mutated[k] = mutated[k].replace('"agent_presence"', '"lanes"')
@@ -40497,7 +41016,7 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(module.refusals(rule, good, [{"filename": "bin/fleet-switchboard", "status": "modified"}], sb.impact_floor.matches, {"bin/fleet-switchboard": []}), [])
 
     def real_source(self):
-        return (BIN / "fleet-switchboard").read_text()
+        return switchboard_source()
 
     def edit_one_line_under(self, source, name):
         """The source with one comment added at the end of the first body line of module-level function `name` (a one-line change right under the def), and its unified diff."""
@@ -40524,7 +41043,7 @@ class TestImpactHold(LedgerBase):
 
     def test_an_unrelated_edit_in_the_daemon_file_is_allowed_and_a_new_call_into_the_clear_is_refused(self):
         source = self.real_source()
-        for name in ("cmd_triage", "format_decisions_status", "decisions_from_notices", "triage_pass"):
+        for name in ("cmd_triage", "format_decisions_status", "sweep_summary", "triage_pass"):
             self.assertIn("def %s(" % name, source)
             head, diff = self.edit_one_line_under(source, name)
             self.assertEqual(self.closure_check(head, diff), [], name)
@@ -41053,7 +41572,7 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(self.deletes() != [], code == 0)
         source = (Path(sb.__file__).parent / "impact_hold.py").read_text() + (Path(sb.__file__).parent / "delegated_clear.py").read_text()
         self.assertNotIn("os.environ", source)
-        self.assertEqual(len(re.findall(r"max_level", (Path(sb.__file__)).read_text())), 0, "the daemon file never reads or writes a threshold")
+        self.assertEqual(len(re.findall(r"max_level", switchboard_source())), 0, "the daemon file never reads or writes a threshold")
 
     def test_s8b_s14_the_order_must_be_named_exist_and_be_unedited_whatever_the_threshold(self):
         self.score_config("Serious")
@@ -41697,7 +42216,7 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(found, known, "a registrar uses the shared parser beyond its own commands: a NEW finding is a decision (the rating is immune to it, but the reviewer must look)")
 
     def test_s20_s23_no_agent_command_writes_the_threshold_and_no_committed_file_sets_one(self):
-        daemon = Path(sb.__file__).read_text()
+        daemon = switchboard_source()
         self.assertEqual(daemon.count("max_level"), 0)
         root = Path(sb.__file__).parent.parent
         listed = subprocess.run(["git", "-C", str(root), "ls-files"], capture_output=True, text=True).stdout.split()
@@ -43265,7 +43784,7 @@ class TestPlanCheckCommand(Base):
             code, out, err = self.run_cmd("acme/app#7")
         self.assertEqual(code, 2)
         self.assertIn("cannot be loaded", err)
-        text = SWITCHBOARD.read_text()
+        text = switchboard_source()
         self.assertNotRegex(text, r"(?m)^plan_check = load_plan_check\(\)")
 
     def test_it_only_reads_and_never_ensures_the_daemon(self):
@@ -44199,7 +44718,7 @@ class TestDecisionWriteWaitsForTheList(Base):
         before = (path.read_text(), path.stat().st_mtime_ns)
         self.finish("escalate", ["api#7"])
         self.assertEqual((path.read_text(), path.stat().st_mtime_ns), before)
-        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        text = switchboard_source()
         body = text[text.index("def refreshed_or_honest_line"):text.index("def finish_decision_write")]
         for forbidden in ("write_text", "os.replace", "open(", "publish", "write_decisions"):
             self.assertNotIn(forbidden, body, forbidden)
@@ -52400,7 +52919,7 @@ class TestRequestTiers(TierWorld):
 
 def class_source_fn(name):
     """The source of a module-level function of bin/fleet-switchboard."""
-    source = SWITCHBOARD.read_text()
+    source = switchboard_source()
     for node in ast.parse(source).body:
         if isinstance(node, ast.FunctionDef) and node.name == name:
             return ast.get_source_segment(source, node)
@@ -54062,7 +54581,7 @@ class TestLabelsApplyFromMarkers(WriteWorld):
         self.assertEqual(self.main("labels", "apply-from-markers", "--apply", "--dry-run")[0], 2)
 
     def test_it_is_a_persons_command_never_the_daemons_nor_the_sweeps_nor_the_triages(self):
-        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        text = switchboard_source()
         callers = [l.strip() for l in text.splitlines() if "apply_from_markers(" in l and "def " not in l]
         self.assertEqual(len(callers), 1)                                  # the one call is inside cmd_labels_apply
         start, end = text.index("def cmd_labels_apply"), text.index("# ---- orders --cos")
@@ -54528,7 +55047,7 @@ class TestCosOrdersFact(OrdersDeliveryCase):
 
     def test_there_is_one_delivery_path_for_both_kinds_of_orders(self):
         self.assertIn("orders_note", class_source_fn("compose"))
-        self.assertEqual(len(re.findall(r"def orders_note", SWITCHBOARD.read_text())), 1)
+        self.assertEqual(len(re.findall(r"def orders_note", switchboard_source())), 1)
 
 
 @adds_to(TestLaunch)
@@ -60907,7 +61426,7 @@ class TestExternalWiring(ExternalWorld):
         self.assertEqual(done.stdout.strip(), "False True", "registered by name, loaded by nobody")
 
     def test_the_loader_is_the_one_the_core_uses(self):
-        text = SWITCHBOARD.read_text()
+        text = switchboard_source()
         self.assertIs(sb.load_external_adapter(), sb.load_module("external_adapter"))   # #437: the loaders are generated from HELPER_MODULES, not written as a def each
         self.assertEqual(sb.HELPER_MODULES["load_external_adapter"], "external_adapter")
         self.assertNotIn("\nimport external_adapter", text)
@@ -70188,7 +70707,7 @@ class LightProbe:
 
 def light_guard_sites():
     """Every READ of `engine.light` in bin/fleet-switchboard, derived from the code: (qualified function, ordinal in it) -> (first line, last line)."""
-    tree, found, counts = ast.parse(Path(SWITCHBOARD).read_text()), {}, collections.Counter()
+    tree, found, counts = ast.parse(switchboard_source()), {}, collections.Counter()
 
     def walk(node, stack):
         for child in ast.iter_child_nodes(node):
@@ -75875,7 +76394,7 @@ class TestSlice3Modules(Base):
     GOOD = {"temp_janitor": [None, {"days": 3}], "chat_clear": [None, {"live": True}], "impact_floor": [None, {"enabled": True}]}
 
     def test_s1_every_loader_is_generated_and_returns_the_module_load_module_returns(self):
-        tree = ast.parse(SWITCHBOARD.read_text())
+        tree = ast.parse(switchboard_source())
         defined = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
         self.assertEqual(len(sb.HELPER_MODULES), 22)
         self.assertEqual(defined & set(sb.HELPER_MODULES), set(), "0 of the loaders has a def of its own")
@@ -76729,6 +77248,9 @@ class TestReconcileOnRead(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
+            def no_pane_to_judge(self, row):
+                return sb.load_module("registry").no_pane_to_judge(row)
+
             def reconcile_remove(self, state_dir, name, evidence, whole):
                 self.calls.append((name, evidence, whole))
                 return {"changed": True, "problem": None}
@@ -77260,7 +77782,7 @@ class TestAuthorityModulesGuard(unittest.TestCase):
     def test_s3_the_code_names_no_module_of_the_rule_the_matrix_file_does(self):
         modules = [g for g in self.block["top_tier_paths"]["authority"] if g.startswith("bin/") and g.endswith(".py")] + list(self.block["authority_modules"]["exempt"])
         self.assertTrue(len(modules) >= 12)
-        for code in [BIN / "fleet-switchboard"] + sorted(BIN.glob("*.py")):   # the code; the tests (this file) name modules as fixtures
+        for code in [*SWITCHBOARD_SOURCE_FILES] + sorted(BIN.glob("*.py")):   # the code; the tests (this file) name modules as fixtures
             text = code.read_text()
             for module in modules:
                 self.assertNotIn('"%s"' % module, text, "%s writes the path %s in code" % (code.name, module))
@@ -77574,7 +78096,7 @@ class TestWhoCanClear(unittest.TestCase):
                     continue
         self.assertEqual(count, 1)
         self.assertTrue(callable(self.module.who_can_clear))
-        daemon, hold = ast.parse((BIN / "fleet-switchboard").read_text()), ast.parse((BIN / "impact_hold.py").read_text())
+        daemon, hold = ast.parse(switchboard_source()), ast.parse((BIN / "impact_hold.py").read_text())
         calls = lambda tree, fn: {getattr(c.func, "attr", getattr(c.func, "id", "")) for f in ast.walk(tree) if isinstance(f, ast.FunctionDef) and f.name == fn for c in ast.walk(f) if isinstance(c, ast.Call)}
         self.assertIn("clear_who", calls(daemon, "clear_line_post"))
         self.assertIn("who_can_clear", calls(hold, "clear_who"))
@@ -77856,7 +78378,7 @@ class TestClearLine(TestImpactHold):
     @staticmethod
     def mutated(edits):
         """The daemon's functions with `edits` ([(function, old, new)]) applied: {name: function}. An edit whose `old` is not in the source fails the test (a stale mutant)."""
-        source, made = (BIN / "fleet-switchboard").read_text(), {}
+        source, made = switchboard_source(), {}
         for name in sorted({e[0] for e in edits}):
             start = source.index("def %s(" % name)
             body = source[start:source.index("\ndef ", start + 5)]
@@ -77926,7 +78448,7 @@ class TestClearLine(TestImpactHold):
                 self.run_pass(args, edits)
                 self.assertEqual(self.posts() == [], want_ok, self.posts())
         # completeness: a new guard (continue, break or raise before the post) is a new row above
-        tree = ast.parse((BIN / "fleet-switchboard").read_text())
+        tree = ast.parse(switchboard_source())
         fn = lambda name: next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
         stops = [n for n in ast.walk(fn("clear_line_pass")) if isinstance(n, (ast.Continue, ast.Break))]
         self.assertEqual(len(stops), 4, "continue/break guards of the pass: gate (hold, enforce, head, rule), memo/retry, cleared, budget: one row each above")
@@ -81982,7 +82504,7 @@ class TestPreflightPr(unittest.TestCase):
         self.assertEqual(self.sentence_count(text + "\n" + self.SENTENCE), 2)
 
     def test_s6_the_class_list_is_one_table_with_each_class_once(self):
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         self.assertEqual(source.count("PREFLIGHT_CLASSES = ("), 1)
         table = source.split("PREFLIGHT_CLASSES = (", 1)[1].split("\n)\n", 1)[0]
         names = [row[0] for row in sb.PREFLIGHT_CLASSES]
@@ -82171,7 +82693,7 @@ class TestFocusedLocalRuns(unittest.TestCase):
     def test_the_marker_preflight_looks_for_is_in_the_text_the_wrapper_writes(self):
         hs = sb.load_heavy_slots()
         text = hs.second_job_notice(self.state_for_marker(), "/work/a", [{"kind": "full", "worktree": "/work/a", "name": "n", "pid": 1, "since": 1}])
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         literal = re.search(r'"(heavy: refused: [^"]+)" in \(done\.stderr', source).group(1)
         self.assertTrue(text.startswith(literal), text)
 
@@ -83097,7 +83619,7 @@ class TestItemVerdicts(unittest.TestCase):
         import subprocess as sp
         for name in ("may_record_verdict", "scenario_state", "authors_of"):
             self.assertTrue(callable(getattr(sb.plan_ledger, name)))
-        text = SWITCHBOARD.read_text()
+        text = switchboard_source()
         for name in ("ci_record_core", "launched_testers_for"):
             self.assertEqual(text.count("def %s(" % name), 1)
 
@@ -83435,7 +83957,7 @@ class TestShimTopSpender(Base):
 
     def test_s4_no_per_agent_cap_count_or_quota_exists_in_the_shim_its_configuration_or_the_daemons_budget_code(self):
         sources = {"shims/gh": SHIM.read_text(), "bin/agent_calls.py": (BIN / "agent_calls.py").read_text()}
-        config = ast.parse((BIN / "fleet-switchboard").read_text())
+        config = ast.parse(switchboard_source())
         defaults = next(n for n in config.body if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "DEFAULTS" for t in n.targets))
         sources["DEFAULTS"] = ast.unparse(defaults.value)
         for name, text in sorted(sources.items()):
@@ -84583,7 +85105,7 @@ class TestGhShimMergeGate(Base):
         self.shim_path = None
 
     def test_every_xdg_and_fleet_switchboard_name_the_switchboard_reads_is_dropped_from_its_environment_unless_listed(self):
-        names = sorted(set(re.findall(r'"((?:XDG_|FLEET_SWITCHBOARD_)[A-Z_]+)"', (BIN / "fleet-switchboard").read_text())))
+        names = sorted(set(re.findall(r'"((?:XDG_|FLEET_SWITCHBOARD_)[A-Z_]+)"', switchboard_source())))
         self.assertGreater(len(names), 5)
         shim = self.shim_module()
         with mock.patch.dict(os.environ, {n: "x" for n in names}):
@@ -85296,7 +85818,7 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
     def registry_callers(self):
         """Every function (or method) of bin/fleet-switchboard that calls the registry seam, found by the AST."""
         seam = {"registry_read", "registry_retired", "registry_retired_strict", "read_retired", "read_retired_strict", "registry_agents_strict"}
-        tree = ast.parse((BIN / "fleet-switchboard").read_text())
+        tree = ast.parse(switchboard_source())
         found = set()
         for node in tree.body:
             owners = [(node.name, node)] if isinstance(node, ast.FunctionDef) else \
@@ -85887,7 +86409,7 @@ class TestBlockedReport(Base):
         discovery = self.world.engine.discover(self.world.clock.now())
         self.assert_waits_for_the_lock(lambda: sb.blocked_tick(self.world.engine, discovery, {}))
         self.assert_waits_for_the_lock(lambda: sb.blocked_update(self.world.state, sb.BLOCKED_ALERT_STATE, lambda s: None))
-        text = (BIN / "fleet-switchboard").read_text()
+        text = switchboard_source()
         body = text.split("def blocked_update(", 1)[1].split("\ndef ", 1)[0]
         outside = text.replace(body, "")
         for name in ("BLOCKED_HELD_SENDS", "BLOCKED_ALERT_STATE"):
@@ -86375,7 +86897,7 @@ class TestBlockedMutants(Base):
         return bool(result.failures or result.errors)
 
     def test_the_table_covers_every_guard_of_the_code_and_names_only_real_tests(self):
-        text = SWITCHBOARD.read_text()
+        text = switchboard_source()
         self.assertEqual(sorted(blocked_guards(text)), sorted(BLOCKED_GUARD_KILLERS), "a guard without a row (or a row without a guard): add its row and its mutant")
         for test in list(BLOCKED_GUARD_KILLERS.values()) + [row[3] for row in BLOCKED_TEXT_MUTANTS.values()]:
             self.assertTrue(hasattr(TestBlockedReport, test), test)
@@ -86386,7 +86908,7 @@ class TestBlockedMutants(Base):
             self.assertEqual(text.count(row[1]) if row[0] is None else 1, 1, row[1])
 
     def test_no_function_of_the_report_lies_outside_the_derived_region(self):
-        text = SWITCHBOARD.read_text()
+        text = switchboard_source()
         names = blocked_functions(text)
         self.assertTrue({"blocked_tick", "blocked_update", "note_held_send", "blocked_lock", "blocked_sender"} <= names, names)
         outside = {n.name for n in ast.parse(text).body if isinstance(n, ast.FunctionDef) and ("blocked" in n.name or n.name == "note_held_send")} - names
@@ -86402,7 +86924,7 @@ class TestBlockedMutants(Base):
         self.assertEqual(survivors, [], "these negated guards pass their named test")
 
     def test_every_bound_lock_validator_and_key_mutant_is_killed_by_its_named_test(self):
-        text, survivors = SWITCHBOARD.read_text(), []
+        text, survivors = switchboard_source(), []
         for ident, (anchor, old, new, test) in sorted(BLOCKED_TEXT_MUTANTS.items()):
             at = text.index(anchor) if anchor else 0
             where = text.index(old, at)
@@ -86982,7 +87504,7 @@ class TestPaneExitBoundaries(TestPaneExit):
     @staticmethod
     def new_code():
         import ast
-        tree = ast.parse(SWITCHBOARD.read_text())
+        tree = ast.parse(switchboard_source())
         wanted = {"pane_exit_events", "pane_exit_read_log", "_pane_matches", "pane_exit_audit_tail", "_pane_exit_asked", "pane_exit_runs", "pane_exit_active",
                   "pane_exit_pass", "PaneExitFacts"}
         return [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in wanted]
@@ -87641,6 +88163,350 @@ class TestAskIssueSubject(unittest.TestCase):
         self.prove("S9")                                   # an unknown scenario
         self.run_cmd("cmd_prove", scenario=["S1"], plan="acme-org/widget-service#5")   # another plan
         self.assertEqual(self.entries(), [])
+
+
+class TestNoPaneToJudge(StandInPids, Base):
+    """#1181: a row with no pane to judge (kind cloud or orchestrator, or an endpoint and no pane) is alive or unknown, never dead."""
+    PASSES = 20
+    ALIVE_BODY = b'[{"id": "msg_example"}]'
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform",))
+        self.engine = sb.Switchboard(dict(self.world.config), sb.V2Client(FAKE_OPENCODE, {}, self.world.v2, 5),
+                                     sb.HerdrClient(FAKE_HERDR, self.world.herdr, socket_call=self.world.herdr.socket),
+                                     sb.AuditLog(self.world.audit_path), sb.fact_sources(self.world.state), self.world.clock.now, "cli")
+        self.engine.state_dir = self.world.state
+        self.reg = sb.load_module("registry")
+        self.live = sb.load_module("endpoint_liveness")
+        self.requests = []
+        self.record_patch = mock.patch.object(self.live, "has_cloud_record", lambda name: True)   # the record lookup is tested on its own below
+        self.record_patch.start()
+        self.addCleanup(self.record_patch.stop)
+
+    def read_ok(self, name, limit):
+        """The stub of THE REUSED CALL (the cloud read of `fleet-switchboard read NAME`): answers."""
+        self.requests.append((name, limit))
+        return True
+
+    def rows(self):
+        self.reg.upsert(self.world.state, "orch-cloud", {"session": "ses_example1", "pane": None, "role": "orchestrator", "kind": "orchestrator",
+                                                          "endpoint": "https://orch.acme.svc/", "workspace": None, "cwd": None})
+        self.reg.upsert(self.world.state, "pilot", {"session": "ses_example2", "pane": None, "role": "coder", "kind": "cloud", "workspace": None, "cwd": None})
+        self.reg.upsert(self.world.state, "bare", {"session": "ses_example3", "pane": None, "role": "coder", "endpoint": "https://bare.acme.svc/", "workspace": None, "cwd": None})
+
+    def one_pass(self):
+        self.engine.discover(self.world.clock.now())
+        sb.pane_health_pass(self.engine, self.world.clock.now())
+        self.world.tick(31)
+
+    def hb(self):
+        import importlib.machinery, importlib.util
+        loader = importlib.machinery.SourceFileLoader("fleet_heartbeat_t", str(BIN / "fleet-heartbeat"))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader("fleet_heartbeat_t", loader))
+        loader.exec_module(module)
+        return module
+
+    def scenario_violations(self):
+        """The S3 run: 20 real passes over three no-pane rows; every finding is one line."""
+        self.rows()
+        found = []
+        with mock.patch.dict(os.environ, {"FLEET_REGISTRY_DIR": str(self.world.state)}):
+            hb = self.hb()
+            for n in range(self.PASSES):
+                self.one_pass()
+                if getattr(self.engine, "pane_alerts", None):
+                    found.append("alert on pass %d" % n)
+            targets, problem = hb.registry_targets()
+        found += ["target %s" % t["name"] for t in targets if t["name"] in ("orch-cloud", "pilot", "bare")]
+        found += ["dead audit %s" % e["subject"] for e in self.world.audit() if e["event"] == "fleetpane.dead" and e.get("subject") in ("orch-cloud", "pilot", "bare")]
+        if "DEAD" in "\n".join(sb.pane_health_status_lines(self.world.state)):
+            found.append("dead hint")
+        found += ["bad state %s" % n for n, v in sb.read_pane_health(self.world.state)["states"].items() if n in ("orch-cloud", "pilot", "bare")]
+        found += ["still in registry? %s" % n for n in ("orch-cloud", "pilot", "bare") if n not in self.reg.read(self.world.state)["agents"]]
+        return found
+
+    def test_the_predicate(self):
+        yes = [{"kind": "cloud"}, {"kind": "orchestrator", "pane": None}, {"kind": "local", "endpoint": "https://a.acme.svc", "pane": None},
+               {"endpoint": "https://a.acme.svc"}, {"kind": "cloud", "role": "coder", "pane": None}]
+        no = [{}, {"kind": "local", "pane": "w1:p1"}, {"pane": None}, {"kind": "local", "pane": None}, {"pane": "w1:p1", "endpoint": None}, None, "x"]
+        self.assertEqual([self.reg.no_pane_to_judge(r) for r in yes], [True] * len(yes))
+        self.assertEqual([self.reg.no_pane_to_judge(r) for r in no], [False] * len(no))
+
+    # -- S2: derived from the code
+    READER_FUNCTIONS = {   # the only functions that read a dead verdict WITHOUT asking: each judges ONE pane that its caller chose, or writes the file
+        "pane_state": "judges the one pane it is handed (herdr's answer); the callers never hand it a no-pane row",
+        "release_stale_binding": "acts on a pane herdr still lists under a name; a no-pane row has none",
+        "write_pane_health": "keeps a dead row's time; judges nothing",
+    }
+
+    @staticmethod
+    def readers_without_the_predicate(source, exempt=(), needles=("PANE_DEAD", "GONE_STATES", "PANE_MISSING_PASSES", "pane_alerts")):
+        import ast
+        tree = ast.parse(source)
+        out = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                text = ast.get_source_segment(source, node) or ""
+                if any(n in text for n in needles) and "no_pane_to_judge" not in text and node.name not in exempt:
+                    out.append(node.name)
+        return sorted(out)
+
+    def test_every_reader_of_the_dead_verdict_and_the_missing_count_uses_the_one_predicate(self):
+        for name in ("fleet-switchboard", "fleet-heartbeat"):
+            source = (BIN / name).read_text()
+            self.assertEqual(self.readers_without_the_predicate(source, exempt=self.READER_FUNCTIONS), [], name)
+        reconcile = (BIN / "agent_reconcile.py").read_text()
+        self.assertIn("no_pane_to_judge", reconcile)
+        self.assertGreaterEqual(len(self.readers_with(( BIN / "fleet-switchboard").read_text())), 4)
+
+    def readers_with(self, source):
+        import ast
+        return [n.name for n in ast.walk(ast.parse(source)) if isinstance(n, ast.FunctionDef)
+                and "no_pane_to_judge" in (ast.get_source_segment(source, n) or "")]
+
+    # -- M2: block level. Every OUTERMOST loop or comprehension (inside a function that mentions a needle) that itself mentions a needle must contain the predicate.
+    BLOCK_NEEDLES = ("PANE_DEAD", "GONE_STATES", "PANE_MISSING_PASSES")
+    BLOCK_EXEMPT = {   # (function, n-th such block in it, 0-based): reason
+        ("pane_health_status_lines", 0): "walks `bad`, which was built with the predicate in the line above it",
+        ("pane_health_pass", 3): "walks `agents` (filtered by the predicate when built) to upsert the registry; a no-pane row is never in it",
+        ("pane_health_pass", 1): "walks `agents`, which was filtered by no_pane_to_judge when built (and the discovery loop above it asks again); a no-pane row is never in it",
+    }
+
+    @classmethod
+    def blocks_without_the_predicate(cls, source, exempt_functions=(), needles=None):
+        import ast
+        needles = needles or cls.BLOCK_NEEDLES
+        loops = (ast.For, ast.AsyncFor, ast.While, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+        out = []
+        for fn in ast.walk(ast.parse(source)):
+            if not isinstance(fn, ast.FunctionDef) or fn.name in exempt_functions:
+                continue
+            found, stack = [], list(ast.iter_child_nodes(fn))
+            while stack:   # outermost loops only, in source order
+                node = stack.pop(0)
+                if isinstance(node, (ast.FunctionDef, ast.Lambda)):
+                    continue
+                if isinstance(node, loops):
+                    found.append(node)
+                else:
+                    stack = list(ast.iter_child_nodes(node)) + stack
+            n = 0
+            for node in found:
+                text = ast.get_source_segment(source, node) or ""
+                if any(w in text for w in needles):
+                    if "no_pane_to_judge" not in text:
+                        out.append((fn.name, n))
+                    n += 1
+        return sorted(out)
+
+    def test_every_guard_block_holds_the_predicate_or_is_in_the_exact_exemption_table(self):
+        source = (BIN / "fleet-switchboard").read_text()
+        hb = (BIN / "fleet-heartbeat").read_text()
+        exempt = set(self.READER_FUNCTIONS)
+        got = self.blocks_without_the_predicate(source, exempt_functions=exempt)
+        self.assertEqual(got, sorted(self.BLOCK_EXEMPT), "the exemption table must be exact: no block missing the predicate beyond it, none listed that holds it")
+        self.assertEqual(self.blocks_without_the_predicate(hb, exempt_functions=exempt), [])
+
+    def test_mutant_the_discovery_loop_guard_removed_fails_the_block_level_test(self):
+        source = (BIN / "fleet-switchboard").read_text()
+        guard = "        if registry.no_pane_to_judge(registered.get(name)):   # #1181: a row with no pane to judge is not judged by a pane (a discovered cloud agent included)\n            continue\n"
+        self.assertEqual(source.count(guard), 1)
+        got = self.blocks_without_the_predicate(source.replace(guard, ""), exempt_functions=set(self.READER_FUNCTIONS))
+        self.assertNotEqual(got, sorted(self.BLOCK_EXEMPT))
+        self.assertIn(("pane_health_pass", 0), got)
+
+    def test_a_planted_unguarded_loop_inside_a_guarded_function_fails_the_block_test(self):
+        planted = "def f(rows, states):\n    for r in rows:\n        if no_pane_to_judge(r):\n            continue\n        x = PANE_DEAD\n    return [n for n in states if states[n] == PANE_DEAD]\n"
+        self.assertEqual(self.blocks_without_the_predicate(planted), [("f", 1)])
+
+    def test_a_planted_reader_without_the_predicate_fails_the_derived_test(self):
+        planted = "def new_reader(states):\n    return [n for n, v in states.items() if v == PANE_DEAD]\n"
+        self.assertEqual(self.readers_without_the_predicate(planted), ["new_reader"])
+
+    # -- S3
+    def test_three_no_pane_rows_survive_twenty_real_passes(self):
+        self.assertEqual(self.scenario_violations(), [])
+
+    def test_the_heartbeat_has_no_target_and_so_no_failure_for_them(self):
+        self.rows()
+        with mock.patch.dict(os.environ, {"FLEET_REGISTRY_DIR": str(self.world.state)}):
+            targets, problem = self.hb().registry_targets()
+        self.assertEqual([t["name"] for t in targets if t["name"] in ("orch-cloud", "pilot", "bare")], [])
+        self.assertIsNone(problem)
+
+    # -- U1 / U2: a local agent with a pane is judged as before
+    def test_a_local_agent_whose_pane_is_gone_is_dead_after_the_set_passes_and_an_endpoint_row_beside_it_is_not(self):
+        self.rows()
+        self.reg.upsert(self.world.state, "gone", {"pane": "w9:p9", "session": "ses_gone", "role": "coder", "workspace": "w9"})
+        for _ in range(sb.PANE_MISSING_PASSES):
+            self.one_pass()
+        dead = [e for e in self.world.audit() if e["event"] == "fleetpane.dead"]
+        baseline = {"dead_targets": ["gone"], "alerts": ["gone"], "missing": {"gone": sb.PANE_MISSING_PASSES}}   # the stored baseline (before #1181)
+        got = {"dead_targets": [e["subject"] for e in dead], "alerts": sorted(self.engine.pane_alerts),
+               "missing": {n: c for n, c in sb.read_pane_health(self.world.state)["missing"].items()}}
+        self.assertEqual(got, baseline)
+        self.assertEqual(self.engine.pane_alerts["gone"]["why"], "herdr no longer lists gone (its pane w9:p9 is gone)")
+
+    # -- S4, U3, U4, U5
+    def answers(self):
+        row = {"endpoint": "https://orch.acme.svc/", "session": "ses_example1"}
+
+        def failing(url, authorization, timeout):
+            raise OSError("refused")
+
+        def failing(name, limit):
+            raise OSError("no tunnel")
+
+        def partial(name, limit):
+            return False   # the read exited non-zero part way
+
+        def slow(name, limit):
+            threading.Event().wait(2)
+            return True
+        out = {"alive": self.live.check("x", row, 0.3, self.read_ok, clock=lambda: 1234)}
+        out["absent"] = self.live.check("x", None, 0.3, self.read_ok)
+        for label, fn in (("failed", failing), ("partial", partial), ("slow", slow)):
+            started = time.monotonic()
+            out[label] = self.live.check_all({"x": row}, 0.3, fn)["x"]
+            out[label + "_elapsed"] = time.monotonic() - started
+        return out
+
+    def liveness_problems(self):
+        got = self.answers()
+        problems = []
+        if got["alive"] != {"verdict": "alive", "at": 1234}:
+            problems.append("alive")
+        problems += [k for k in ("failed", "partial", "slow", "absent") if got[k].get("verdict") != "unknown"]
+        return problems
+
+    def test_the_check_is_alive_with_a_time_or_unknown_never_dead(self):
+        self.assertEqual(self.liveness_problems(), [])
+
+    def test_the_pass_never_calls_the_liveness_check(self):
+        calls = []
+        with mock.patch.object(self.live, "check_all", lambda *a, **k: calls.append(a) or {}), mock.patch.object(self.live, "check", lambda *a, **k: calls.append(a) or {}), \
+                mock.patch.object(self.live, "read_newest", lambda *a, **k: calls.append(a) or True):
+            self.rows()
+            for _ in range(self.PASSES):
+                self.one_pass()
+        self.assertEqual(calls, [])
+        self.assertFalse(hasattr(self.engine, "row_liveness"))
+
+    def test_the_check_is_bounded(self):
+        got = self.answers()
+        self.assertLessEqual(max(got["slow_elapsed"], got["failed_elapsed"]), 0.3 + 1)
+
+    def test_no_cloud_record_is_unknown_and_a_live_local_agent_of_the_name_does_not_make_it_alive(self):
+        self.record_patch.stop()   # back to the real lookup, on an empty state dir
+        state = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, state, True)
+        row = {"endpoint": "https://orch.acme.svc/", "session": "ses_example1"}
+        local_agent_answers = lambda name, limit: True   # a live local agent named "platform" would answer a `read platform`
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": state}):
+            self.assertEqual(self.live.check("platform", row, 0.3, local_agent_answers)["verdict"], "unknown")
+            self.assertEqual(self.live.check_all({"platform": row}, 0.3, local_agent_answers)["platform"]["verdict"], "unknown")
+            os.makedirs(os.path.join(state, "fleet-switchboard", "cloud"))
+            Path(state, "fleet-switchboard", "cloud", "platform.json").write_text("{}")
+            self.assertEqual(self.live.check("platform", row, 0.3, local_agent_answers)["verdict"], "alive")
+        self.assertIn("--cloud-only", (BIN / "endpoint_liveness.py").read_text())
+
+    def test_mutant_a_local_agent_makes_a_cloud_row_alive_is_caught(self):
+        self.record_patch.stop()
+        state = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, state, True)
+        row = {"endpoint": "https://orch.acme.svc/"}
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": state}), mock.patch.object(self.live, "has_cloud_record", lambda name: True):
+            self.assertEqual(self.live.check("platform", row, 0.3, lambda n, l: True)["verdict"], "alive")   # the mutant: the real test above forbids this
+
+    def test_mutant_the_pass_calling_the_check_again_is_caught(self):
+        source = (BIN / "fleet-switchboard").read_text()
+        self.assertNotIn("endpoint_liveness", source)
+        self.assertNotIn("row_liveness", source)
+
+    def test_the_row_holds_an_address_only_and_the_module_handles_no_credential(self):
+        self.rows()
+        self.one_pass()
+        raw = (self.world.state / "registry.json").read_text()
+        for word in ("Bearer", "password", "token", "Basic"):
+            self.assertNotIn(word, raw)
+        source = (BIN / "endpoint_liveness.py").read_text()
+        for word in ("Authorization", "_read_token", ".password", "urllib"):
+            self.assertNotIn(word, source)
+
+    def test_a_failed_slow_or_partial_answer_removes_nothing(self):
+        self.rows()
+        row = {"endpoint": "https://orch.acme.svc/"}
+        for read in (lambda *a: (_ for _ in ()).throw(OSError("x")), lambda *a: False, lambda *a: None):
+            self.assertEqual(self.live.check("orch-cloud", row, 0.3, read)["verdict"], "unknown")
+            self.one_pass()
+            self.assertTrue({"orch-cloud", "pilot", "bare"} <= set(self.reg.read(self.world.state)["agents"]))
+        view = sb.load_module("agent_reconcile").reconcile_on_read(self.world.state, self.reg.read(self.world.state), lambda n, a: {}, self.reg)
+        self.assertEqual(view, [])
+        partial_read = dict(self.reg.read(self.world.state), whole=False)
+        self.assertEqual(sb.load_module("agent_reconcile").reconcile_on_read(self.world.state, partial_read, lambda n, a: {}, self.reg), [])
+
+    # -- M1: a DISCOVERED, non-headless agent whose registry row has no pane
+    def discovered_no_pane_run(self, passes=4, mutate=False):
+        self.rows()
+        found = []
+        func = sb.pane_health_pass
+        if mutate:
+            import ast
+            source = (BIN / "fleet-switchboard").read_text()
+            guard = "        if registry.no_pane_to_judge(registered.get(name)):   # #1181: a row with no pane to judge is not judged by a pane (a discovered cloud agent included)\n            continue\n"
+            self.assertEqual(source.count(guard), 1)
+            tree = ast.parse(source.replace(guard, ""))
+            node = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "pane_health_pass"][0]
+            ns = dict(sb.__dict__)
+            exec(compile(ast.Module([node], []), "mutant", "exec"), ns)
+            func = ns["pane_health_pass"]
+        names = ("orch-cloud", "pilot")
+        for n in range(passes):
+            self.engine.discover(self.world.clock.now())
+            for i, name in enumerate(names):   # discovered by a pane label and a session, though the registry row holds no pane
+                self.engine.discovery.agents[name] = sb.Observation(name, "ses_example%d" % (i + 1), "w9:p%d" % i, "idle", {"role": "coder"})
+            func(self.engine, self.world.clock.now())
+            for name in names:
+                if name in getattr(self.engine, "pane_alerts", None) or {}:
+                    found.append("alert %s pass %d" % (name, n))
+            self.world.tick(31)
+        health = sb.read_pane_health(self.world.state)
+        found += ["state %s" % n for n in health["states"] if n in names]
+        found += ["missing %s" % n for n in health["missing"] if n in names]
+        found += ["dead audit %s" % e["subject"] for e in self.world.audit() if e["event"] == "fleetpane.dead" and e.get("subject") in names]
+        return found
+
+    def test_a_discovered_cloud_or_orchestrator_agent_with_no_pane_is_never_judged_over_four_passes(self):
+        self.assertEqual(self.discovered_no_pane_run(), [])
+
+    def test_mutant_the_discovery_loop_guard_removed_is_caught(self):
+        self.assertNotEqual(self.discovered_no_pane_run(mutate=True), [], "without the guard a discovered cloud agent is judged by its pane")
+
+    # -- S6: three mutants, each fails a test
+    def test_mutant_a_no_pane_row_read_as_dead_is_caught(self):
+        with mock.patch.object(self.reg, "no_pane_to_judge", lambda row: False):
+            found = self.scenario_violations()
+        self.assertTrue(found, "the S3 scenario must fail when a no-pane row is judged by its pane")
+
+    def test_mutant_a_skipped_reader_is_caught(self):
+        source = (BIN / "fleet-heartbeat").read_text()
+        mutated = source.replace("if registry.no_pane_to_judge(agent):", "if False:")
+        self.assertNotEqual(source, mutated)
+        self.assertEqual(self.readers_without_the_predicate(mutated, needles=("GONE_STATES",)), ["registry_targets"])
+
+    def test_mutant_dead_on_a_failed_answer_is_caught(self):
+        with mock.patch.object(self.live, "unknown", lambda why: {"verdict": "dead", "why": why}):
+            self.assertNotEqual(self.liveness_problems(), [])
+
+    # -- S7
+    def test_the_documentation_states_the_rule(self):
+        text = (REPO / "docs" / "agent-registry.md").read_text()
+        section = text.split("## A row with no pane to judge", 1)
+        self.assertEqual(len(section), 2)
+        body = section[1].split("\n## ", 1)[0]
+        for phrase in ("no_pane_to_judge", "alive", "unknown", "cloud:<agent name>"):
+            self.assertIn(phrase, body)
 
 
 if __name__ == "__main__":
