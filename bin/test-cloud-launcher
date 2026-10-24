@@ -1,6 +1,7 @@
 #!/bin/sh
 # test-cloud-launcher: offline tests for the cloud-worker launcher (fake kubectl, fake clock). Prints RESULT: PASS.
 cd "$(dirname "$0")/.." || exit 1
+python3 cloud/launcher/tests/test_cloud_retire_push.py || { echo "RESULT: FAIL"; exit 1; }
 # Completeness check: every test_*.py must be named below, or listed here with a reason.
 EXCEPTIONS="test_cloud_pod_deadline.py:slow(26s),not-yet-chained test_cloud_stop_nonce.py:slow(57s),not-yet-chained test_reaper_record_family.py:did-not-finish-in-120s,not-yet-chained"
 for f in cloud/launcher/tests/test_*.py; do

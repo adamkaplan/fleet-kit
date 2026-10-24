@@ -211,6 +211,8 @@ elif cmd == "delete":
     if kind == "secret": st.get("secret_labels", {}).pop(name, None)
     save()
 elif cmd == "exec":
+    stdin_on = args[1] == "-i"   # kubectl exec -i: the command's standard input is the caller's
+    if stdin_on: args = [args[0]] + args[2:]
     name, tool = args[1], args[3]
     if tool in ("ls", "cat", "git") and os.environ.get("FAKE_KUBE_EXEC_SLEEP"):   # a slow read: the record's calls only, never the end hook
         import time
@@ -239,6 +241,12 @@ elif cmd == "exec":
         if fs["type"] != "file" and "-L" in script:
             print("not a regular file", file=sys.stderr); sys.exit(3)
         sys.stdout.write(fs["content"] if fs["type"] == "file" else fs.get("target", ""))
+    elif tool == "git" and args[4:6] == ["-C", "/work/repo"] and "bundle" in args:   # the documented read-only recovery: writes nothing
+        r = subprocess.run(["git", "-C", st["hook_env"]["CW_WORKDIR"]] + args[6:], capture_output=True)
+        sys.stdout.buffer.write(r.stdout); sys.stdout.flush(); sys.exit(r.returncode)
+    elif tool == "tar" and args[4:5] == ["-C"]:   # the documented read-only copy of the files: `tar -C /work -cf - repo`
+        r = subprocess.run(["tar", "-C", os.path.dirname(st["hook_env"]["CW_WORKDIR"])] + args[6:-1] + [os.path.basename(st["hook_env"]["CW_WORKDIR"])], capture_output=True)
+        sys.stdout.buffer.write(r.stdout); sys.stdout.flush(); sys.exit(r.returncode)
     elif tool == "git":
         if st.get("head_sha"): print(st["head_sha"])
         else: sys.exit(1)
@@ -259,7 +267,8 @@ elif cmd == "exec":
         if st["hook_result"].get("error"): sys.exit(1)
     elif tool == "cw-end-hook":
         env = dict(os.environ, **st["hook_env"])
-        p = subprocess.run([sys.executable, os.path.join(HERE, "..", "end_hook.py")], env=env, capture_output=True, text=True)
+        p = subprocess.run([sys.executable, st.get("hook_path") or os.path.join(HERE, "..", "end_hook.py")] + args[4:], env=env,
+                           capture_output=True, text=True, input=sys.stdin.read() if stdin_on else None)
         sys.stdout.write(p.stdout)
         if p.returncode:
             sys.stdout.write(p.stdout); sys.exit(p.returncode)

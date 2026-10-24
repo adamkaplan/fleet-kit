@@ -656,6 +656,10 @@ class OptionShaped(Dir):
 SWITCHBOARD_PREFIX = "FL" + "EET_CLOUD_"   # written in two parts: test_cw_names bans the retired prefix as text anywhere under cloud/ (this one is the switchboard's own, in bin/)
 PREFIXES = ("CW_", SWITCHBOARD_PREFIX)   # every environment prefix the launch wiring and the launcher read
 NOT_SETTINGS = {
+    # set by end_hook for ONE git child at retire time (the credential helper reads them): the token itself comes from the launcher on stdin
+    "CW_PUSH_TOKEN": "the fresh push token, in the environment of the one git child that pushes inside the pod; never read from the operator",
+    "CW_PUSH_HOST": "the one host the push helper answers for, set by end_hook for that git child from its fixed base",
+    "CW_PUSH_SCHEME": "the one scheme the push helper answers for, set by end_hook for that git child from its fixed base",
     # set by the code itself for the pod or a child: never read from the operator
     "CW_WORKER": "set by the launcher into the pod's environment (the worker's own name); end_hook reads it inside the pod",
     "CW_REPO": "set by the launcher into the pod's environment from --repo; read back from the pod spec",
