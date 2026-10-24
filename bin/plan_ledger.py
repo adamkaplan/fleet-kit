@@ -22,6 +22,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 LEDGER_FILE = "plan-ledger.jsonl"
 HEAD_FILE = "plan-ledger.head"   # {"seq", "hash"} of the newest entry: a second place the chain's end is written
@@ -29,7 +30,8 @@ GENESIS = "0" * 64
 EVIDENCE_KINDS = ("proof", "verdict", "consensus", "waiver")   # a consensus entry is written by the plan review engine (a later slice)
 REVIEW_KINDS = ("round", "lane_session", "lane", "response", "escalation", "decision", "abandoned", "reminder", "review_record")   # the plan review engine's records (#109)
 ITEM_KINDS = ("item_tester",)   # #770: the registration of a tester for a work item that has no pull request; written by `launch` only (bin/item_verdicts.py)
-KINDS = EVIDENCE_KINDS + REVIEW_KINDS + ITEM_KINDS
+CARRY_KINDS = ("carried",)   # #1129: a proof or verdict that holds at a new head (see `carry_decision`); its own line, the original row is never touched
+KINDS = EVIDENCE_KINDS + REVIEW_KINDS + ITEM_KINDS + CARRY_KINDS
 RESULTS = ("pass", "fail")
 EVIDENCE_LIMIT = 500
 FIELD_LIMIT = 200
@@ -335,6 +337,10 @@ def append_once(state_dir, entries_in, now):
 
 # ----------------------------------------------------------------------------------- who may do what
 
+def proof_of(scenario):
+    return " ".join(str(scenario.get("proof", "")).split())
+
+
 def evaluator_of(scenario):
     name = " ".join(str(scenario.get("evaluator", "")).split())
     return EVALUATOR_ALIASES.get(name, name)
@@ -359,6 +365,12 @@ def authors_of(entries, pr, notice_senders=(), github_author=None):
     names.update(notice_senders)
     names.add(github_author)
     return {n for n in names if n}
+
+
+def ask_head(plan_hash):
+    """#1130: the "head" an ask issue's record carries: the first 40 hex digits of the plan hash (`sha256:<hex>`). A revised plan has another hash, so the
+    record is void exactly as a pull request's is when its head moves."""
+    return str(plan_hash).split(":", 1)[-1][:40]
 
 
 def known_writers(entries, pr, notice_senders=()):
@@ -471,11 +483,14 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
     only for THIS plan hash and THIS head; one for another is shown as void, not hidden."""
     sid, evaluator = scenario["id"], evaluator_of(scenario)
     out = {"id": sid, "evaluator": evaluator, "claim": claim_of(scenario), "missing": [], "void": []}
+    carried = carried_seqs(entries, pr, head)   # #1129: {seq of the proof or verdict: its carried line}
     for kind in ("proof", "verdict"):
         mine = [e for e in entries if e.get("pr") == pr and e.get("scenario") == sid and e.get("kind") == kind
                 and (kind == "proof" or e.get("evaluator") == evaluator)]
-        fresh = [e for e in mine if e.get("plan_hash") == plan_hash and e.get("head") == head]
+        fresh = [e for e in mine if e.get("plan_hash") == plan_hash and (e.get("head") == head or e.get("seq") in carried)]
         newest = fresh[-1] if fresh else None
+        if newest and newest.get("head") != head:
+            out.setdefault("carried", []).append(carried_view(newest, carried[newest["seq"]]))
         if not newest and mine:
             why = "plan changed" if mine[-1].get("plan_hash") != plan_hash else "head moved"
             out["void"].append("%s #%d void: %s" % (kind, mine[-1]["seq"], why))
@@ -493,6 +508,125 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
         out["missing"].append("the verdict is by an author of the PR (not accepted)")
     out["status"] = "ok" if not out["missing"] else "missing"
     return out
+
+
+# ----------------------------------------------------------------------------------- the carry of a proof (#1129)
+
+CARRY_EVALUATORS = ("tester", "live", "reviewer")   # the types of proof that may carry; `ci` ids are re-recorded by the daemon, never carried
+CARRY_FIELDS = ("proof", "scenario", "old_head", "new_head", "facts")
+DOC_TEST_RE = re.compile(r"(^|/)(tests?|docs?)/|(^|/)test-[^/]*$|(^|/)test_[^/]*$|\.(md|rst|txt)$")
+
+
+def carried_seqs(entries, pr, head):
+    """{seq of a proof or verdict: its `carried` line} for the carries of `pr` whose new head is `head`. Empty without a head."""
+    found = {}
+    for entry in entries if head else ():
+        if entry.get("kind") == "carried" and entry.get("pr") == pr and entry.get("new_head") == head and isinstance(entry.get("proof"), int):
+            found[entry["proof"]] = entry
+    return found
+
+
+def carried_view(row, line):
+    """What the gate shows of a carried proof: the ORIGINAL head the proof was recorded at, and the carry line that holds it here."""
+    return {"proof": row["seq"], "original_head": row.get("head"), "carried_line": line["seq"], "new_head": line["new_head"]}
+
+
+def is_tests_docs_only(files):
+    return bool(files) and all(DOC_TEST_RE.search(str(f)) for f in files)
+
+
+def carry_decision(row, evaluator, files_changed, merge_of_default, ci_green):
+    """(verdict, reason) for one proof or verdict `row` and a new head: verdict is "carry", "void" (a file the proof names is touched) or "refuse".
+    All three conditions are required: (a) none of the files the proof names is in `files_changed`; (b) the new head is a merge of the default branch or its
+    difference is tests and documentation only; (c) CI is green at the new head. A proof proven by CI, of another type, or naming no file is never carried."""
+    named = [f for f in (row.get("files") or ()) if isinstance(f, str) and f]
+    if evaluator not in CARRY_EVALUATORS:
+        return "refuse", "a %s proof is not carried (CI ids are re-recorded at each green head)" % evaluator
+    if not named:
+        return "refuse", "the proof names no file: it is never carried"
+    touched = sorted(set(named) & set(files_changed))
+    if touched:
+        return "void", "the difference touches a file the proof names: %s" % ", ".join(touched)
+    if not (merge_of_default or is_tests_docs_only(files_changed)):
+        return "refuse", "the difference is code outside a merge of the default branch"
+    if ci_green is not True:
+        return "refuse", "CI is not green at the new head"
+    return "carry", "carried"
+
+
+def carry_line(row, scenario, old_head, new_head, merge_of_default, pr):
+    """The ONE ledger line of a carry: the proof, the old head, the new head and the three facts. The proof's own row is never rewritten."""
+    return {"kind": "carried", "pr": pr, "proof": row["seq"], "scenario": scenario, "plan_hash": row.get("plan_hash"), "old_head": old_head, "new_head": new_head,
+            "facts": {"named_files_untouched": True, "difference": "merge of the default branch" if merge_of_default else "tests and documentation only", "ci": "green"}}
+
+
+CARRIES_LINE_RE = re.compile(r"(?mi)^[ \t]*CARRIES:.*$")
+CARRIES_EXACT_RE = re.compile(r"^[ \t]*CARRIES:[ \t]*#(\d+)[ \t]*$")
+FENCE_RE = re.compile(r"^[ \t]*(```|~~~)")
+
+
+def _outside_fences(body):
+    """The lines of `body` that are not inside a fenced code block."""
+    out, fence = [], None
+    for line in (body or "").splitlines():
+        mark = FENCE_RE.match(line)
+        if mark:
+            fence = None if fence == mark.group(1) else (fence or mark.group(1))
+            continue
+        if fence is None:
+            out.append(line)
+    return out
+
+
+def carries_parse(body):
+    """(#1196) (number, problem): the standing body line `CARRIES: #N` outside fenced code blocks. problem is the reason in words when there is more than one CARRIES
+    line, or a line that is not exactly `#N` (several dependencies, another repository, trailing text); number is then None."""
+    lines = [l for l in _outside_fences(body) if CARRIES_LINE_RE.match(l)]
+    if not lines:
+        return None, None
+    if len(lines) > 1:
+        return None, "more than one CARRIES line: one dependency only"
+    found = CARRIES_EXACT_RE.match(lines[0])
+    if not found:
+        return None, "the CARRIES line %r is not exactly `CARRIES: #N` (one dependency of this repository only)" % lines[0].strip()[:60]
+    return int(found.group(1)), None
+
+
+def carries_of(body):
+    """(#1196) The number N of the standing body line `CARRIES: #N` (outside fenced code), else None (no line, or a refused one: see carries_parse)."""
+    return carries_parse(body)[0]
+
+
+def carries_refusal(dep_pr, dep_state, dep_head, in_branch):
+    """(#1196) The reason a CARRIES line is refused, else None: the named pull request is closed unmerged, or its head commit is not in this branch.
+    A merged dependency is not refused here: the pull request is then read as an ordinary one (the caller drops the line)."""
+    if dep_state == "closed":
+        return "%s is closed unmerged: its commits cannot be carried" % dep_pr
+    if not dep_head or not in_branch:
+        return "%s head %s is not in this branch: the commits it names are not here" % (dep_pr, (dep_head or "?")[:8])
+    return None
+
+
+def clear_names_both(clear, pr, dep_pr):
+    """(#1196) True when the owner's clear record names BOTH pull requests (the carrying one and the dependency)."""
+    names = (clear or {}).get("names")
+    return isinstance(names, list) and pr in names and dep_pr in names
+
+
+def carried_rows(carries, entries, facts):
+    """(#1196) The dependency's scenario rows: its recorded proofs and verdicts are reused ONLY for the commit its head names (`scenario_state` compares the head by
+    commit, never by pull request name); a record for any other commit is void. Returns (rows, reviews)."""
+    dep_pr, dep_head, dep_plan = carries["pr"], carries["head"], carries["plan"]
+    authors = authors_of(entries, dep_pr, carries.get("notice_senders") or (), carries.get("author"))
+    rows = []
+    for s in dep_plan["scenarios_parsed"]:
+        if claim_of(s) != "pr":
+            continue
+        row = scenario_state(s, entries, dep_pr, dep_plan["plan_hash"], dep_head, authors)
+        row["id"] = "%s %s" % (dep_pr, row["id"])
+        row["carried_from"] = dep_pr
+        rows.append(row)
+    return rows, review_records_at(entries, dep_pr, dep_head)
 
 
 REVIEWERS = ("code", "architecture", "security", "impact", "test")
@@ -540,6 +674,8 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
     every tracked gate that applies to a PR is satisfied; the untracked ones are listed, not counted."""
     head = (facts or {}).get("head")
     authors = authors_of(entries, pr, (facts or {}).get("notice_senders") or (), (facts or {}).get("author"))
+    carries = (facts or {}).get("carries") or None   # (#1196) the one dependency named by `CARRIES: #N`; None for an ordinary pull request
+    carried_reviews = None
     rows, scen_rows = [], []
     for gid, name, scope, owner, tracked in GATES:
         row = {"gate": gid, "name": name, "scope": scope, "decided_by": owner, "tracked": tracked, "status": "untracked",
@@ -556,6 +692,14 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
                 row.update(status="missing", missing=["plan check fails: %d defect(s)" % len(plan["defects"])])
             else:
                 row.update(status="ok", detail="plan hash %s" % plan["plan_hash"])
+            if carries and row["status"] == "ok":   # (#1196) both asks need a plan
+                dep = carries.get("plan")
+                if carries.get("refusal"):
+                    row.update(status="missing", missing=[carries["refusal"]])
+                elif dep is None or dep.get("result") != "pass":
+                    row.update(status="missing", missing=["CARRIES %s: the dependency's plan is missing or fails its check" % carries["pr"]])
+                else:
+                    row["detail"] += "; carried plan %s hash %s" % (carries["pr"], dep["plan_hash"])
         elif gid == "G1":
             if plan is None or plan["result"] != "pass":
                 row.update(status="missing", missing=["needs a plan that passes G0a"])
@@ -564,6 +708,12 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             else:
                 claimed = [s for s in plan["scenarios_parsed"] if claim_of(s) == "pr"]
                 scen_rows = [scenario_state(s, entries, pr, plan["plan_hash"], head, authors) for s in claimed]
+                if carries and not carries.get("refusal") and carries.get("plan") and carries["plan"].get("result") == "pass" and carries.get("head"):
+                    dep_rows, carried_reviews = carried_rows(carries, entries, facts)
+                    scen_rows = scen_rows + dep_rows
+                elif carries:
+                    scen_rows = scen_rows + [{"id": "%s plan" % carries["pr"], "status": "missing", "missing": [carries.get("refusal") or "the carried plan cannot be read"], "void": [], "evaluator": "-", "proof": None, "verdict": None,
+                                              "carried_from": carries["pr"]}]
                 bad = [s for s in scen_rows if s["status"] != "ok"]
                 row["detail"] = "%d of %d claimed scenarios proven and judged at %s" % (len(scen_rows) - len(bad), len(scen_rows), head[:8])
                 none_because = PER_PR_NONE_RE.search(plan.get("text") or "")
@@ -599,6 +749,11 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             elif isinstance(floor, dict) and (floor.get("unreadable") or floor.get("decision") is None):
                 row.update(status="waiting", missing=["the impact floor could not be read for this head (%s): the owner decides, through cos"
                                                       % (floor.get("unreadable") or "no decision")])
+            elif carries and isinstance(floor, dict) and floor.get("clear_head") and floor.get("clear_head") != head and not floor.get("cleared") and floor.get("decision") == "hold":
+                row.update(status="waiting", missing=["clear is for another head (%s): a clear of a carrying pull request is recorded at the head that carries %s and never carries to a later head; the owner clears this head"
+                                                      % (floor["clear_head"][:8], carries["pr"])])
+            elif carries and isinstance(floor, dict) and floor.get("decision") == "hold" and floor.get("cleared") and not floor.get("names_both"):
+                row.update(status="waiting", missing=["the owner's clear does not name both pull requests (%s and %s): the owner clears again" % (pr, carries["pr"])])
             elif isinstance(floor, dict) and floor.get("rehold"):   # (#830) a clear was recorded for ANOTHER head, none for this one, no rating here: held again, whatever the labels say
                 row.update(status="waiting", missing=["held again for the owner at this head: %s; the owner clears this head, or the impact rating at this head says not held"
                                                       % floor["rehold"]])
@@ -638,7 +793,8 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
     ready = all(r["status"] in ("ok", "n/a", "untracked", "waived") for r in rows)
     return {"gates": rows, "ready": ready, "waived": waived, "untracked": [r["gate"] for r in rows if r["status"] == "untracked"],
             "scenarios": scen_rows, "head": head, "plan_hash": (plan or {}).get("plan_hash"),
-            "ledger_problem": ledger_problem, "reviews": review_records_at(entries, pr, head) if head else None}
+            "ledger_problem": ledger_problem, "reviews": review_records_at(entries, pr, head) if head else None,
+            "carries": ({"pr": carries["pr"], "head": carries.get("head"), "reviews": carried_reviews, "refusal": carries.get("refusal")} if carries else None)}
 
 
 SATISFIED = ("ok", "n/a", "untracked", "waived")
@@ -710,6 +866,8 @@ def render_gates(report, pr):
     for s in report.get("scenarios", []):
         for note in s["void"]:
             lines.append("  %s: %s" % (s["id"], note))
+        for view in s.get("carried") or ():   # #1129: a carried proof is shown with the head it was recorded at
+            lines.append("  %s: carried: row #%d recorded at %s, held here by carried line #%d" % (s["id"], view["proof"], str(view["original_head"])[:8], view["carried_line"]))
     rating = report.get("impact_rating")
     if isinstance(rating, dict):
         lines.append("  " + impact_rating_line(rating, report.get("head")))
@@ -1005,3 +1163,47 @@ def refusal_message(prog, check_for, pr, failed, repo):
     return ("%s: %s of %s refused: missing %s. Way out: ask the chief of staff for a logged waiver (`%s waive %s --gates %s "
             "--reason ...`; never for G6 or G8), or the chief of staff can switch the repo to shadow (`%s gates mode %s shadow`)."
             % (prog, check_for, pr, what, prog, pr, ",".join(f["gate"] for f in gates) or "G1", prog, repo))
+
+
+REVIEW_LINK_RE = re.compile(r"https?://[^\s\"'`<>\u201c\u201d]+")
+# One quote is one pair of matching marks: "..", \u201c..\u201d, \u2018..\u2019 or `..`.
+REVIEW_QUOTE_RE = re.compile(r"\"([^\"\n]+)\"|\u201c([^\u201d\n]+)\u201d|\u2018([^\u2019\n]+)\u2019|`([^`\n]+)`")
+REVIEW_QUOTE_MIN_WORDS, REVIEW_QUOTE_MIN_CHARS, REVIEW_QUOTE_MIN_LETTERS, REVIEW_TEXT_MAX = 3, 15, 3, 400
+
+
+def _review_norm(text):
+    return " ".join(str(text or "").casefold().split())
+
+
+def _review_link_ok(url):
+    """A link counts with a real host (a dot between non-empty labels, the last of 2+ letters) and a path or fragment."""
+    if len(url) > REVIEW_TEXT_MAX:
+        return False
+    parts = urlsplit(url)
+    host = (parts.hostname or "").rstrip(".")
+    labels = host.split(".")
+    if len(labels) < 2 or not all(labels) or not (len(labels[-1]) >= 2 and labels[-1].isalpha()):
+        return False
+    return len(parts.path.strip("/")) > 0 or len(parts.fragment) > 0
+
+
+def review_evidence_problem(evidence, scenario=None):
+    """None when a `review` verdict's evidence carries a countable quote of the text read or a link to it, else the named reason.
+    A quote has 3+ words or 15+ characters, 3+ letters, at most 400 characters, and is not the scenario's own text, pass or discriminates
+    text; a link has a real host and a path or fragment. The ONE rule: the verdict command calls it once per scenario."""
+    text = evidence or ""
+    own = {_review_norm((scenario or {}).get(k)) for k in ("text", "pass", "discriminates")} - {""}
+    for url in REVIEW_LINK_RE.findall(text):
+        if _review_link_ok(url.rstrip(".,;:)")):
+            return None
+    for match in REVIEW_QUOTE_RE.finditer(text):
+        quote = next(g for g in match.groups() if g is not None).strip()
+        if len(quote) > REVIEW_TEXT_MAX or sum(c.isalpha() for c in quote) < REVIEW_QUOTE_MIN_LETTERS:
+            continue
+        if len(quote.split()) < REVIEW_QUOTE_MIN_WORDS and len(quote) < REVIEW_QUOTE_MIN_CHARS:
+            continue
+        if _review_norm(quote) in own:
+            continue
+        return None
+    return ("a review verdict has no quote and no link: quote the text you read (in quotation marks: 3+ words or 15+ characters, at most "
+            "400, not the scenario's own text) or link to it (a real host such as example.com, and a path or fragment)")

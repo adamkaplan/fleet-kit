@@ -191,9 +191,17 @@ fleet-switchboard retire coder7
 
 `retire` stops the worker: the end hook pushes its work and the pod and its Secrets are deleted.
 
+### The light shape (`XS`) and the other shapes
+
+A worker started with no `--shape` and no `--stack` gets `XS` (1 CPU, 2 GiB), the light shape and the default (requests equal limits, no nested Docker). Seven of them are meant to fit on one 8-CPU node (a live check reads the node's requested CPU back; if the system pods ask for more, the number is six and this section says so). `S` (2 CPU, 4 GiB) and `M` (4 CPU, 8 GiB) are chosen only by name: `--shape S`. A worker gets `XS` and an orchestrator (`--agent orchestrator`) gets `S` when `--shape` is not given.
+
+- Belongs in `XS`: a reader (code reading and review), a planner, a tester running short tests, a small edit and commit.
+- Does not belong in `XS`: a nested Docker stack (`--stack` refuses `XS`), an image build, a long full test suite or a build with a large memory peak: name `--shape S` or `M` for those.
+- A pod killed for memory is fixed afterwards: raise the shape for that work with `--shape S`.
+
 ### A worker with a nested Docker stack
 
-Add `--stack` (and, if you want, `--shape S|M`) to the same command for a worker that runs a Docker Compose stack inside its pod:
+Add `--stack` (and, if you want, `--shape S|M`; XS cannot run a stack) to the same command for a worker that runs a Docker Compose stack inside its pod:
 
 ```text
 fleet-switchboard launch coder7 --cloud --stack --agent coder --repo acme-org/widget-service --branch main \
@@ -202,9 +210,9 @@ fleet-switchboard launch coder7 --cloud --stack --agent coder --repo acme-org/wi
 
 - `--stack` is handed to the launcher's `create` and only then: a launch without it builds exactly the pod it always did.
 - The pod runs on the Sysbox runtime class (`sysbox-runc`) in its own user namespace, as a non-root user. No capability is added, it is never privileged, and it has no host path, Docker socket or service-account token.
-- `--shape` is `S` (2 CPU, 4 GiB) or `M` (4 CPU, 8 GiB). Leave it out for the launcher's own default, `S` (4 GiB): the measured stack lane peaked at 0.8 to 1.35 GiB. The memory limit stays; the pod is never unlimited.
+- With `--stack`, `--shape` is `S` (2 CPU, 4 GiB) or `M` (4 CPU, 8 GiB). Leave it out for `S` (4 GiB): the measured stack lane peaked at 0.8 to 1.35 GiB. The memory limit stays; the pod is never unlimited.
 - The first pod on a fresh node may wait for the node's runtime to be ready (a short delay, a few minutes at most); the launcher notices that case and creates the pod again after a pause of 15 seconds (`STACK_RACE_PAUSE_SECONDS`), for as long as a retry fits in a window of 600 seconds (`STACK_RACE_WINDOW_SECONDS`); a fresh node can take 3 to 5 minutes. If the window ends, the launcher says so once (the attempts and the seconds spent) and leaves no pod. You do not retry it.
-- `--stack` needs `--cloud`, and an unknown `--shape` is refused with `--stack`. `--stack` without `--cloud` is refused first of all; an unknown shape is refused right after the allow-list check (step 1 of section 2). Both exit 2 before any token is minted or any cluster call is made, and the order of section 2 is unchanged. `--shape` without `--stack` is passed to the launcher as before.
+- `--stack` needs `--cloud`, and an unknown `--shape`, and `XS`, are refused with `--stack`. `--stack` without `--cloud` is refused first of all; an unknown shape is refused right after the allow-list check (step 1 of section 2). Both exit 2 before any token is minted or any cluster call is made, and the order of section 2 is unchanged. `--shape` without `--stack` is passed to the launcher as before.
 
 ## 4. What a worker can and cannot do
 
@@ -225,8 +233,56 @@ Turn it off: `fleet-switchboard install --uninstall` unloads and removes it (wit
 Its log: `cloud-reaper-stderr.log` in the switchboard state directory (journalctl on Linux). Each time it ends it writes one line
 `<UTC time> reaper exiting: WHY`, and the service then restarts it.
 
+### The reaper is unattended: it keeps its own cluster login fresh
+
+The reaper needs a cluster login. In the token-file login (the one the service file names: `CW_CLOUD_TOKEN_FILE`
+for the token file, `CW_CLOUD_SERVER` for the cluster and `CW_CLOUD_NAMESPACE` for the namespace), the token in
+that file lives at most sixty minutes. The reaper therefore refreshes it itself, at the start of every pass: it
+reads the cluster administrator kubeconfig from the vault (`CW_VAULT_SUBSCRIPTION` and `CW_VAULT_NAME` for the
+vault, `CW_CLUSTER_ADMIN_SECRET` for the name of the secret inside it), hands that value to one
+`kubectl create token cw-operator` command over a pipe, and writes the token it gets back to the token file with
+mode `0600`, by an atomic replace. The old file stays whole if anything fails.
+
+The unattended reaper uses a fixed route: it ignores `CW_KUBECTL`, `CW_CLUSTER_ADMIN_CMD` and `CW_CLUSTER_TOKEN_CMD`, and runs `az` and
+`kubectl` only from fixed absolute paths (a custom command belongs to the launch path). When the vault holds the minter kubeconfig, that
+token is long-lived (not cluster admin, but whoever reads it can mint `cw-operator` tokens until its Secret is deleted): see the launcher
+README for who holds it and how to rotate it.
+
+What this means for you: **the reaper runs unattended** for days, and no one has to refresh the token file. The
+administrator value is never in a file, never in an argument and never in the service file (the service file
+holds names and paths only, as before). The token that lands in the file holds the operator account's own rights
+in the workers namespace and nothing more; the administrator login is used for that one command and dropped.
+
+**The manual install comment on the installer ask is superseded**: it recorded that a person had to refresh the
+token file by hand. The reaper does that now, by itself.
+
+If a refresh fails (the vault, the login or the token request), the old file stays as it is, one audit line
+names the reason (`refresh-cluster-token`), the pass report names the failure, and the reaper tries again five
+minutes later. A vault that refuses this machine is named as such; the reaper never runs the vault access check
+(that check belongs to the launch path alone).
+
 When the Mac sleeps, the reaper pauses. Workers keep their pod-side floor (the pod's own limit, the cap plus 300 s, PR #880 once it
 merges), so a sleeping Mac delays a stop but cannot leave a worker running past that floor.
+
+## 4c. The cloud hub (cloud/k8s/cloud-hub.yaml)
+
+Cause: the hub (the channel server) exists as code, but nothing started it in the cluster, and the launcher's per-pod registration writes to a registry Secret that did not exist. One file now defines, in the `cw` namespace only: Deployment `cloud-hub` (one replica), Service `cloud-hub` (ClusterIP, 8443), the headless Service `cw-agents` (selector `app=cw-worker`, port 4096, publishes not-ready addresses: pods register a name under this Service, `http://<pod name>.cw-agents.cw.svc.cluster.local:4096`, so the hub can reach them) and Secrets `cloud-hub-registry` (keys `secrets.json` and `agents.json`, each `{}`, mounted read-only at `/etc/hub`) and `cloud-hub-pw` (empty: the launcher adds one key per agent name later; mounted read-only at `/etc/hub/pw`, so an agent's `password_file` is `/etc/hub/pw/<name>`; nested under the Secret mount: this works on the cluster's runtime; if a runtime refuses it use `/etc/hub-pw` and `/etc/hub-pw/<name>`). The container command is `python3 /usr/local/bin/cloud_hub.py` (`cloud/worker/Dockerfile` copies the hub and its modules to `/usr/local/bin`; the manifest, these docs and the test use that real path). The environment is exactly `FLEET_CLOUD_CHANNEL_LISTEN`, `FLEET_CLOUD_HUB_AGENTS`, `FLEET_CLOUD_HUB_SECRETS` (its presence selects the secrets mode) and `FLEET_CLOUD_HUB_DECISIONS`. The container runs non-root (uid 1000, fsGroup 1000, seccomp RuntimeDefault, CPU limit 500m) with a read-only root filesystem; Secret volumes use defaultMode 0440 (JSON form 288: not world readable; 0400 would leave root-owned files unreadable to uid 1000, so group read plus fsGroup); only `/var/hub` and `/tmp` (emptyDirs) are writable. Every object carries the label `app.kubernetes.io/part-of=cloud-hub`. The names live in `cloud/launcher/hub_registry.py` and a test compares them with the manifest.
+
+Before you apply: replace the placeholder `IMAGE_DIGEST` with the settings' `CW_CLOUD_IMAGE` (a `name@sha256:...` reference; the file holds no real digest). The substituted value must carry `@sha256:` (a digest, never a floating tag). The pod runs only from an image built from the Dockerfile that holds the hub files.
+
+- Order in the file: Secrets, Services, Deployment.
+- Network boundary: the network boundary of the hub (which pods may reach it, which hosts it may reach) is enforced by the namespace's network policies, which are written in a separate manifest file under ask #1256 (cloud/k8s/cloud-hub-network.yaml); until that file is merged the policies exist only as applied in the cluster.
+- Pull secret: the Deployment pulls its image with the secret `cw-pull`, which must exist in the namespace (the launcher's `CW_PULL_SECRET`).
+- Check (server dry run, first install): `kubectl create --dry-run=server -f cloud/k8s/cloud-hub.yaml`. Expected result lines: five lines ending `created (server dry run)`.
+- First install: `kubectl create -f cloud/k8s/cloud-hub.yaml`. Create refuses to overwrite an existing object: a second run fails with AlreadyExists on the Secrets, so it cannot reset the registry.
+- Verify: `kubectl -n cw get deployment,service,secret -l app.kubernetes.io/part-of=cloud-hub` shows the five objects.
+- Changing the hub later: applying the whole file again resets the registry Secret to empty objects and deregisters every live agent until the launcher registers them again. So never re-apply the whole file; patch in place. For the image: `kubectl -n cw set image deployment/cloud-hub hub=<registry>/<repository>@sha256:<digest>` (the container is named `hub`). For other fields: `kubectl -n cw patch deployment cloud-hub ...`. To apply the Deployment and Services only, apply a copy of the file with the two documents of kind Secret removed.
+- The empty `cloud-hub-pw` Secret: a later apply may leave the launcher-added keys alone but does not guarantee it: do not re-apply.
+- Delay: kubelet refreshes mounted Secret contents within about a minute, so a newly launched agent can need up to ~60 s before it can message through the hub.
+- Smoke check: the hub has no unauthenticated health path (`GET /decisions` needs a token), so readiness is a TCP check on 8443. From a pod in `cw`, `nc -z cloud-hub 8443` must succeed.
+- Rollback that keeps the Secrets: `kubectl -n cw delete deployment,service -l app.kubernetes.io/part-of=cloud-hub`. Do not add `secret` to that list: `kubectl delete deployment,service,secret -l <label>` also deletes BOTH Secrets (the registry and the per-agent passwords), and running agents cannot message after such a rollback until they are relaunched.
+
+State: the decisions file is on an emptyDir at `/var/hub`; it is lost when the pod restarts. Tests (offline, no cluster): `python3 cloud/launcher/tests/test_cloud_hub_manifest.py`.
 
 ## 5. Known gaps
 
