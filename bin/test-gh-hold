@@ -430,6 +430,12 @@ HOSTILE = ["", "   ", "\n", "acme-org/", "/widget-api", "acme-org", "acme-org/..
            "https://github.com/acme-org/widget-api", "acme-org/widget api", None, 5, ["acme-org/widget-api"]]
 
 
+def daemon_source():
+    """The daemon's whole source: the entry and every part of its manifest, in manifest order."""
+    lines = [n.strip() for n in (REPO / "bin" / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.lstrip().startswith("#")]
+    return "\n".join((REPO / "bin" / n).read_text() for n in lines)
+
+
 REPO_SHAPE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
@@ -489,7 +495,7 @@ class TestSharedMatcher(unittest.TestCase):
                 self.assertIsNone(self.m.account_for(users, text))
 
     def test_the_guard_is_untouched_by_this_change_and_the_shim_does_not_import_it(self):
-        self.assertNotIn("repo_match", (REPO / "bin" / "fleet-switchboard").read_text())
+        self.assertNotIn("repo_match", daemon_source())
 
     def test_s4_the_docs_no_longer_say_the_matching_is_the_same_for_every_caller(self):
         text = (REPO / "docs" / "switchboard.md").read_text()

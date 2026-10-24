@@ -13,6 +13,7 @@ daemon's globals and are not meant to be called from this module's own namespace
 import types
 
 MOVED = ('rating_at',
+         'applied_for_repo',
          '_plan_hold',
          'rehold_reason',
          'gate_floor_fact',
@@ -86,6 +87,8 @@ def rehold_reason(engine, state, repo, pr, head):
     if not isinstance(cleared, dict) or not cleared.get("head") or (head and cleared.get("head") == head):
         return None
     carried = (state.get("carried") or {}).get(pr) or {}
+    if cleared.get("names"):   # (#1196) the clear of a carrying pull request never carries to a later head
+        carried = {}
     if head and carried.get("head") == head and carried.get("from") == cleared.get("head") and impact_floor.carry_enabled(engine.config, repo):
         return None
     if head and rating_at(engine, pr, head)[0]:
@@ -107,6 +110,12 @@ def gate_floor_fact(engine, state, repo, number, head):
                 "rehold": None if problem else rehold_reason(engine, clears, repo, report["pr"], head)}   # the OWNER-HOLD decision: the one the daemon's labels follow (#451)
     except Exception as err:   # an unreadable diff, a matrix error, a missing file: all the same answer
         return {"decision": None, "reasons": [], "cleared": False, "rehold": None, "unreadable": _one_line("%s: %s" % (type(err).__name__, err), 150)}
+
+
+def applied_for_repo(applied, repo):
+    """(#999) The pull requests of exactly `repo` whose `applied` record lists labels this daemon added: a key is `<repo>#<number>` (the `#` ends the name, so
+    `acme/web` never takes `acme/web2#1`), and a record that is not an object is no record of ours. The ONE match the daemon's pass and `impact hold --dry-run` share."""
+    return {pr for pr, entry in (applied or {}).items() if isinstance(pr, str) and pr.startswith(repo + "#") and isinstance(entry, dict)}
 
 
 def read_impact_state(state_dir):
@@ -180,6 +189,8 @@ def impact_carry_decision(engine, repo, number, head):
         state, _ = read_impact_state(engine.state_dir)
         cleared = state["clears"].get(pr) or {}
         if not cleared.get("head") or cleared.get("head") == head:
+            return None
+        if cleared.get("names"):   # (#1196) a clear that names two pull requests is for its own head only
             return None
         if (state.get("carried", {}).get(pr) or {}).get("head") == head or (state.get("carry_void", {}).get(pr) or {}).get("head") == head:
             return None   # decided once per new head: no repeated reads and no repeated audit lines
@@ -997,6 +1008,9 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
             remove = list(remove)
         head_now = current
         state["clears"][pr] = {"head": head_now, "reason": reason, "by": who, "at": int(engine.now()), "removed": sorted(remove)}   # `removed`: the labels a re-hold at a new head puts back (#830)
+        carried_number = plan_ledger.carries_of(raw.get("body"))   # (#1196) a carrying pull request: the clear names BOTH pull requests and is for this head only
+        if carried_number is not None:
+            state["clears"][pr]["names"] = [pr, "%s#%d" % (repo, carried_number)]
         _consume_record(state, pr)   # the labels it took off were the daemon's record: consumed with the clear, in this write
         state.get("carried", {}).pop(pr, None)   # a new clear starts from this head: an earlier carry is not part of it
         state.get("carry_void", {}).pop(pr, None)
@@ -1333,8 +1347,8 @@ def impact_plan(engine, report, labels, state, records, records_problem):
     names = label_names(engine.config)
     have = set(labels or ())
     pr = report["pr"]
-    if report.get("draft"):
-        return "none", []   # the daemon judges no draft pull request
+    if report.get("draft") and report.get("owner_decision") == "hold":
+        return "none", []   # the daemon adds no hold to a draft pull request (it still releases one the rule no longer holds, #999)
     if report.get("owner_decision") == "hold":
         carried = (state.get("carried", {}).get(pr) or {}).get("head") == report["head"] and impact_floor.carry_enabled(engine.config, report["pr"].rpartition("#")[0])
         if (state["clears"].get(pr) or {}).get("head") == report["head"] or carried:   # the owner's clear, or a clear carried over a pure merge of main (#510)
@@ -1364,7 +1378,7 @@ def cmd_impact_hold(args, runner, now):
         except impact_floor.MatrixError as err:   # the matrix file cannot be read: say so and stop, never read it as "no floor"
             sys.stderr.write("%s: impact hold: %s\n" % (PROG, _one_line(str(err), 200)))
             return EXIT_ERROR
-        if not has_floor:
+        if not has_floor and not applied_for_repo(read_impact_state(state)[0].get("applied"), repo):   # a repo with no floor now is still judged while it holds labels of ours (#999)
             continue
         try:
             items = read_open_items(engine, runner, repo)[0]
@@ -1427,7 +1441,7 @@ def release_impact_hold(engine, repo, number, report, record):
         del state["applied"][pr]
         write_impact_state(engine.state_dir, state)
         engine.audit.append(engine.actor, "gate.hold_released", pr, {"head": report["head"], "removed": remove, "reasons": report.get("owner_reasons", [])[:5],
-                                                                      "rule": engine.__dict__.get("impact_rule")})
+                                                                      "reason": report.get("release_reason") or "rule no longer holds", "rule": engine.__dict__.get("impact_rule")})
         return len(remove)
 
 
