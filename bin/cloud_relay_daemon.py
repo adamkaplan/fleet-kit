@@ -36,13 +36,17 @@ NEEDS_LINK = cloud_relay.NEEDS_LINK
 PENDING_CAP = 4 * 1024 * 1024   # bytes of the hub's pending list; larger is refused
 TOKEN_CAP = 4096                # bytes of the token file
 REASON_FIXED = "relay failed"
+REASON_MAX = 1900               # the hub refuses a reason over 2000 characters; every answer is clipped below that
+INDEX_READ_CAP = 8 * 1024 * 1024   # bytes of relay_calls.json read; the file is written only by this daemon (INDEX_MAX entries), a larger one is treated as damaged
 PR_RE, CALL_ID_RE, SHA_RE = cloud_relay.PR, cloud_relay.CALL_ID, cloud_relay.HEAD
 
 
 class Refuse(Exception):
-    def __init__(self, status, reason):
+    """`reason` goes to the pod (fixed or allow-listed text only); `detail`, when given, goes to the audit instead."""
+
+    def __init__(self, status, reason, detail=None):
         super().__init__(reason)
-        self.status, self.reason = status, reason
+        self.status, self.reason, self.detail = status, reason, detail
 
 
 class Replay(Exception):
@@ -64,7 +68,11 @@ class Index:
 
     def _read(self):
         try:
-            data = json.loads(self.path.read_text())
+            with open(str(self.path), "rb") as handle:
+                raw = handle.read(INDEX_READ_CAP + 1)
+            if len(raw) > INDEX_READ_CAP:
+                return {}
+            data = json.loads(raw.decode())
             return data if isinstance(data, dict) else {}
         except (OSError, ValueError):
             return {}
@@ -74,7 +82,7 @@ class Index:
 
     def put(self, pod, call_id, record):
         lock = self.path.with_name(INDEX_FILE + ".lock")
-        with open(str(lock), "a") as lk:
+        with os.fdopen(os.open(str(lock), os.O_WRONLY | os.O_CREAT, 0o600), "a") as lk:
             fcntl.flock(lk, fcntl.LOCK_EX)
             data = self._read()
             key = "%s\n%s" % (pod, call_id)
@@ -139,7 +147,7 @@ class Executor:
                 raise Refuse(400, "call_id must be printable ASCII, 1 to 64 characters")
             command = call.get("command")
             if command not in COMMANDS:
-                raise Refuse(400, "command %r is not one of %s" % (command, ", ".join(COMMANDS)))
+                raise Refuse(400, "command is not one of %s" % ", ".join(COMMANDS))
             m = PR_RE.fullmatch(pr)
             if not m:
                 raise Refuse(400, "pr must be owner/repo#N")
@@ -155,7 +163,10 @@ class Executor:
             if command == "gates":   # read-only and not indexed: nothing to replay
                 out = self.backend.gates(pr)
                 self.backend.audit("gates", pr, {"by": pod, "call_id": cid})
-                return 200, json.dumps(out, sort_keys=True), None
+                text = json.dumps(out, sort_keys=True)
+                if len(text) > REASON_MAX:   # a clipped JSON would be unreadable: send a short valid one
+                    text = json.dumps({"ready": out.get("ready") if isinstance(out, dict) else None, "truncated": True})
+                return 200, text, None
             if command == "report":   # delivered once per call id; kept under its own key ("report\n...", no seq or hash), so it never answers a prove or verdict
                 seen = self.index.get("report\n" + pod, cid)
                 digest = hashlib.sha256(json.dumps(args, sort_keys=True, default=str).encode()).hexdigest()
@@ -182,11 +193,11 @@ class Executor:
             self.index.put(pod, cid, rep.record)
             return 200, "replay: already recorded", _answer(rep.record)
         except Refuse as err:
-            self.backend.audit("relay.refused", pr, {"by": pod, "status": err.status, "why": err.reason})
+            self.backend.audit("relay.refused", pr, {"by": pod, "status": err.status, "why": clean_text(err.detail or err.reason)})
             return err.status, err.reason, None
         except plan_ledger.LedgerError as err:
-            self.backend.audit("relay.refused", pr, {"by": pod, "status": 409, "why": str(err)})
-            return 409, str(err), None
+            self.backend.audit("relay.refused", pr, {"by": pod, "status": 409, "why": clean_text(err)})
+            return 409, "the ledger refused the write", None
 
     def _write(self, command, pod, req, call, pr, cid, args):
         b, head = self.backend, call["head"]
@@ -194,9 +205,9 @@ class Executor:
         plan = b.plan(pr)
         scenario = (plan or {}).get("scenarios", {}).get(sid)
         if not scenario:
-            raise Refuse(400, "the plan has no scenario %s" % sid)
+            raise Refuse(400, "the plan has no such scenario", "the plan has no scenario %s" % clean_text(sid, 80))
         if scenario.get("claim", "pr") != "pr":
-            raise Refuse(400, "%s is claimed at the epic, not per PR" % sid)
+            raise Refuse(400, "that scenario is claimed at the epic, not per PR")
         result = args.get("result")
         if result not in plan_ledger.RESULTS:
             raise Refuse(400, "result must be pass or fail")
@@ -212,7 +223,7 @@ class Executor:
         else:
             named = scenario.get("evaluator")
             if args.get("evaluator", named) != named:
-                raise Refuse(400, "scenario %s is judged by %s" % (sid, named))
+                raise Refuse(400, "the scenario is judged by %s" % clean_text(named, 80))
             facts = b.pr_facts(pr)
             entries, _ = plan_ledger.read_ledger(self.state)
             senders = facts.get("notice_senders") or ()
@@ -254,6 +265,7 @@ def pass_once(executor, fetch, post):
             continue
         try:
             status, reason, record = executor.handle(req)
+            reason = str(reason)[:REASON_MAX]
         except Exception as err:   # one bad request must not abort the batch or block later passes: answer it 500 with a fixed reason
             status, reason, record = 500, REASON_FIXED, None   # the detail stays daemon-side, never sent to the pod
             with contextlib.suppress(Exception):
@@ -315,7 +327,7 @@ class SwitchboardBackend:
         try:
             self.host._plan_usable(ctx)
         except self.host.LedgerCommandError as err:
-            raise Refuse(400, str(err)) from None
+            raise Refuse(400, "the plan is not usable", clean_text(err)) from None
         return {"source": ctx.source, "hash": ctx.plan["plan_hash"],
                 "scenarios": {x["id"]: {"evaluator": plan_ledger.evaluator_of(x), "claim": plan_ledger.claim_of(x)}
                               for x in ctx.plan["scenarios_parsed"] if x.get("id")}}
@@ -363,11 +375,16 @@ def pass_if_configured(engine, host, runner, now, environ=os.environ):
     if not url or not tokfile:
         return 0
     try:
-        with open(tokfile, "rb") as handle:
-            raw = handle.read(TOKEN_CAP + 1)
-        if len(raw) > TOKEN_CAP:
-            raise ValueError("token file over %d bytes" % TOKEN_CAP)
-        token = raw.decode().strip()
+        try:
+            with open(tokfile, "rb") as handle:
+                raw = handle.read(TOKEN_CAP + 1)
+            if len(raw) > TOKEN_CAP:
+                engine._note("relay.pass_failed", None, {"error": "token file over %d bytes" % TOKEN_CAP})
+                return 0
+            token = raw.decode().strip()
+        except Exception as err:   # only the class name: the message may carry the file's path or content
+            engine._note("relay.pass_failed", None, {"error": type(err).__name__})
+            return 0
         fetch, post = http_transport(url, token)
         backend = SwitchboardBackend(host, (engine, engine.state_dir, engine.config), runner, now)
         return pass_once(Executor(engine.state_dir, backend, now), fetch, post)

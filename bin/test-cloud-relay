@@ -431,9 +431,14 @@ class TestRelayHappy(Base):
         self.assertEqual([e for e in self.h.daemon.entries() if e["by"] in ("reviewer", "captain")], [])
 
     def test_S2_verdict_one_entry(self):
-        ok_record(self, self.h.relay("reviewer", "verdict", args={"scenario": "S1", "result": "pass", "evidence": "saw"}))
-        es = self.h.kinds("verdict")
-        self.assertEqual([(e["by"], e["head"]) for e in es], [("reviewer", HEAD2)])
+        # the scenario is the one the plan gives the pod's own evaluator role (SCENARIO_OF), as in test_S17_S26; each pod is checked
+        for pod in ("reviewer", "reader", "tester"):
+            answer = self.h.relay(pod, "verdict", call_id="v-" + pod, args={"scenario": SCENARIO_OF[pod], "result": "pass", "evidence": "saw"})
+            self.assertEqual(answer[0], 200, answer)
+            ok_record(self, answer)
+            es = [e for e in self.h.kinds("verdict") if e["by"] == pod]
+            self.assertEqual([(e["by"], e["head"], e["scenario"]) for e in es], [(pod, HEAD2, SCENARIO_OF[pod])])
+        self.assertEqual(len(self.h.kinds("verdict")), 3)
 
     def test_S3_S25_report_delivers_and_gates_reads(self):   # S3, S25
         s, _ = self.h.relay("coder", "report", head=None, args={"text": "hello"})

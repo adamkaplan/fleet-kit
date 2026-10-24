@@ -24,6 +24,14 @@ One document to set up, run and take down the cloud hub and the pod-side command
     prove holder check and the verdict evaluator registry are. A refused relay call is forgotten by the hub, so the same call_id may be
     sent again once the cause is fixed; a call_id reused with a different command, pr or head is 409.
   - `send` text is at most 2000 characters; `report` text at most 300.
+  - Relay timing assumption: the hub waits 30 s (`cloud_relay.WAIT`) for the daemon's answer. The daemon answers on each of its passes,
+    so its pass interval must be shorter than that wait; with a longer interval the pod's call gets 504. That is safe: the entry stays
+    queued and the same call_id is replay-safe (the daemon records the call id in the entry itself).
+  - Relay configuration that must agree: the hub's agents map decides which issue and repo a pod is bound to (pod-binding), and the
+    daemon's `relay_holders` config decides which pod may prove for that issue. If they disagree, the prove is refused 403 (fail closed).
+  - `FLEET_CLOUD_HUB_DAEMON` must not name a reserved agent (`captain`, `switchboard`, ...): the hub refuses to start with a ValueError
+    (nothing is bound, the process exits non-zero) rather than run with a daemon credential the reserved-name check would lock out.
+  - The relay's reasons to a pod are fixed or allow-listed text, clipped under 2000 characters; the detail stays in the daemon's audit.
 
 The sender is always the agent the token proves, never a name in the body: a body naming another sender is refused 403.
 

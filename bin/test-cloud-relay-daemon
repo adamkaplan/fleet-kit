@@ -2,6 +2,19 @@
 """test-cloud-relay-daemon: offline tests for bin/cloud_relay_daemon.py (#1225 slice B) with a fake hub and a temp ledger.
 
     bin/test-cloud-relay-daemon
+
+Two kinds of mutant test, kept apart:
+  * test-cloud-relay's FakeDaemon mutants (writes_on_refusal, skip_author, role_from_request, global_callids, stamp_live_head,
+    gates_write, no_holder, pr_issue) are switches in a hand-written harness. They test the HARNESS (that its assertions can fail), not the
+    real Executor.
+  * class RealRuleMutants below monkeypatches the REAL rule in cloud_relay_daemon / plan_ledger, runs the same refusal check the
+    guarding test makes, and asserts that check then FAILS (the guarding test catches the mutant). Real rule -> guarding real test:
+      head re-check (_same_head, inside append)  -> test_stale_head, test_head_moves_inside_decision
+      prove holder (backend.holder_of check)     -> test_proof_from_non_holder_403
+      author exclusion (plan_ledger.authors_of / may_record_verdict) -> test_author_verdict_403, test_github_author_verdict_403
+      evaluator role (backend.evaluators registry) -> test_non_evaluator_403
+      PR-issue link (backend.pr_issues check)    -> test_pr_not_linked_to_the_pods_issue_refused_for_all_three
+      call-id scope per pod (Index key)          -> test_same_call_id_two_pods
 """
 import json
 import sys
@@ -79,7 +92,7 @@ PROVE = dict(scenario="S1", result="pass", evidence="ran it")
 VERDICT = dict(scenario="S1", result="pass", evidence="saw it")
 
 
-class Case(unittest.TestCase):
+class Fixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -117,6 +130,9 @@ class Case(unittest.TestCase):
         self.assertEqual(self.raw(), before)
         self.assertEqual(len(self.backend.audits), audits + 1)
 
+
+
+class Case(Fixture):
     def test_prove_and_verdict_chain(self):
         a = self.proved()
         b = self.run_one(TESTER, "verdict", **VERDICT)
@@ -331,7 +347,7 @@ class Case(unittest.TestCase):
 
     def test_scenario_result_evidence_epic_and_evaluator_refusals(self):
         self.proved()
-        self.refused(400, "no scenario S9", CODER, "prove", scenario="S9", result="pass", evidence="x")
+        self.refused(400, "no such scenario", CODER, "prove", scenario="S9", result="pass", evidence="x")
         self.refused(400, "result must be", CODER, "prove", scenario="S1", result="maybe", evidence="x")
         self.refused(400, "evidence is required", CODER, "prove", scenario="S1", result="pass", evidence="  ")
         self.refused(400, "judged by tester", TESTER, "verdict", evaluator="reader", **VERDICT)
@@ -428,6 +444,124 @@ class Case(unittest.TestCase):
             relay.http_transport("http://hub.example.com", "tok")
         relay.http_transport("https://hub.example.com", "tok")
         relay.http_transport("http://hub.fleet.svc", "tok")
+
+
+class RealRuleMutants(unittest.TestCase):
+    """Each test removes or inverts ONE real rule (monkeypatched in the real code) and shows the guarding test then fails."""
+
+    def caught(self, guard, prep=None):
+        """Run the guarding test of Case with the mutant in place; it must fail. `prep(case)` mutates a backend, it runs after setUp."""
+        case = Case(guard)
+        case.setUp()
+        if prep:
+            prep(case)
+        try:
+            with self.assertRaises(AssertionError, msg="the mutant survived %s" % guard):
+                getattr(case, guard)()
+        finally:
+            case.doCleanups()
+            case.tmp.cleanup()
+
+    def patch(self, owner, name, value):
+        old = getattr(owner, name)
+        setattr(owner, name, value)
+        self.addCleanup(setattr, owner, name, old)
+        return old
+
+    def test_unmutated_guards_pass(self):   # the same guards, run for real, so a mutant test cannot pass through a broken guard
+        for guard in ("test_stale_head", "test_head_moves_inside_decision", "test_proof_from_non_holder_403", "test_author_verdict_403",
+                      "test_github_author_verdict_403", "test_non_evaluator_403",
+                      "test_pr_not_linked_to_the_pods_issue_refused_for_all_three", "test_same_call_id_two_pods"):
+            case = Case(guard)
+            case.setUp()
+            getattr(case, guard)()
+            case.tmp.cleanup()
+
+    def test_mutant_head_recheck_removed(self):
+        self.patch(relay, "_same_head", lambda known, given: True)
+        self.caught("test_stale_head")
+        self.caught("test_head_moves_inside_decision")
+
+    def test_mutant_holder_check_removed(self):
+        orig = relay.Executor._write
+
+        def no_holder(ex, command, pod, req, call, pr, cid, args):
+            ex.backend.holder_of = lambda r, i: pod   # the check can no longer refuse anyone
+            return orig(ex, command, pod, req, call, pr, cid, args)
+        self.patch(relay.Executor, "_write", no_holder)
+        self.caught("test_proof_from_non_holder_403")
+
+    def test_mutant_author_exclusion_removed(self):
+        self.patch(plan_ledger, "authors_of", lambda *a, **k: set())
+        self.caught("test_author_verdict_403")
+        self.caught("test_github_author_verdict_403")
+
+    def test_mutant_evaluator_role_check_removed(self):
+        self.patch(plan_ledger, "may_record_verdict", lambda *a, **k: (True, ""))
+        self.caught("test_non_evaluator_403")
+
+    def test_mutant_pr_issue_link_removed(self):
+        self.caught("test_pr_not_linked_to_the_pods_issue_refused_for_all_three", lambda case: setattr(case.backend, "pr_issues", lambda pr: {1, 2}))
+
+    def test_mutant_call_id_global_not_per_pod(self):
+        key = lambda pod: "any" if "\n" not in pod else pod
+        get, put = relay.Index.get, relay.Index.put
+        self.patch(relay.Index, "get", lambda self, pod, cid: get(self, key(pod), cid))
+        self.patch(relay.Index, "put", lambda self, pod, cid, rec: put(self, key(pod), cid, rec))
+        self.caught("test_same_call_id_two_pods")
+
+
+class ReplyHygiene(Fixture):
+    def test_plan_and_ledger_errors_are_fixed_reasons_with_detail_in_audit(self):
+        self.proved()
+        self.refused(400, "no such scenario", CODER, "prove", scenario="S9<script>", result="pass", evidence="x")
+        got = self.hub.results[max(self.hub.results, key=lambda r: int(r[1:]))]
+        self.assertNotIn("S9", got["reason"])
+        self.assertIn("S9", json.dumps(self.backend.audits[-1][1]))
+        self.backend.plan = lambda pr: (_ for _ in ()).throw(relay.Refuse(400, "the plan is not usable", "plan secret detail"))
+        self.refused(400, "the plan is not usable", CODER, "prove", **PROVE)
+        self.assertNotIn("secret detail", json.dumps(self.hub.results))
+        self.assertIn("secret detail", json.dumps(self.backend.audits[-1][1]))
+
+    def test_ledger_error_reason_is_fixed(self):
+        def boom(*a, **k):
+            raise plan_ledger.LedgerError("/private/path broke")
+        old = plan_ledger.append_checked
+        plan_ledger.append_checked = boom
+        self.addCleanup(setattr, plan_ledger, "append_checked", old)
+        got = self.run_one(CODER, "prove", **PROVE)
+        self.assertEqual((got["status"], got["reason"]), (409, "the ledger refused the write"))
+        self.assertIn("/private/path", json.dumps(self.backend.audits[-1][1]))
+
+    def test_every_reason_is_clipped_under_the_hub_limit(self):
+        self.backend.gates = lambda pr: {"ready": False, "pad": "x" * 5000}
+        rid = self.hub.submit(CODER, "gates", head=None)
+        relay.pass_once(self.ex, self.hub.fetch, self.hub.post)
+        self.assertLess(len(self.hub.results[rid]["reason"]), 2000)
+        self.assertEqual(json.loads(self.hub.results[rid]["reason"])["truncated"], True)
+        self.refused(400, "not one of", CODER, "x" * 5000, head=None)
+        self.assertLess(len(max((r["reason"] for r in self.hub.results.values()), key=len)), 2000)
+
+    def test_token_file_read_failure_records_only_the_class_name(self):
+        notes = []
+
+        class Engine:
+            state_dir, config = "/nonexistent", {}
+
+            def _note(self, *a):
+                notes.append(a)
+        env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": "/nonexistent/secret-path/token"}
+        relay.pass_if_configured(Engine(), None, None, lambda: 1, environ=env)
+        self.assertEqual(notes[0][2], {"error": "FileNotFoundError"})
+
+    def test_index_lock_is_mode_0600_and_oversized_index_is_ignored(self):
+        idx = relay.Index(self.state)
+        idx.put("p", "c", {"seq": 1, "hash": "h"})
+        self.assertEqual((Path(self.state) / (relay.INDEX_FILE + ".lock")).stat().st_mode & 0o777, 0o600)
+        old = relay.INDEX_READ_CAP
+        relay.INDEX_READ_CAP = 10
+        self.addCleanup(setattr, relay, "INDEX_READ_CAP", old)
+        self.assertEqual(idx._read(), {})
 
 
 if __name__ == "__main__":

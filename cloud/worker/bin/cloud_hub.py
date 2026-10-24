@@ -265,6 +265,8 @@ def make_hub(address, reviewer, inbox, audit, decisions_path=None, max_handlers=
     """The channel server with the hub's two additions: GET /decisions and 404 for an agent not in the map."""
     if relay is not None and not daemon:
         raise ValueError("the relay needs the daemon's agent name (FLEET_CLOUD_HUB_DAEMON), set explicitly")
+    if daemon in RESERVED:
+        raise ValueError("FLEET_CLOUD_HUB_DAEMON names a reserved agent; choose another name")
 
     if relay is not None:
         relay.deny.add(daemon)   # the daemon credential is not a pod: it cannot place calls
@@ -437,6 +439,8 @@ def serve(environ, reviewer=None, inbox=None, audit=None):
             reviewer = make_reviewer(audience=environ.get(AUDIENCE_ENV) or None)
     inbox = inbox or Inbox(environ.get(AGENTS_ENV))
     daemon = (environ.get(DAEMON_ENV) or "").strip()
+    if daemon in RESERVED:   # fail mode: the hub refuses to start (ValueError, nothing bound, the process exits non-zero); it never runs with a daemon name the reserved check would lock out
+        raise ValueError("FLEET_CLOUD_HUB_DAEMON names a reserved agent (%s); the hub does not start" % ", ".join(sorted(RESERVED)))
     relay = None
     if daemon:   # the relay is on only when the daemon's agent name is set explicitly: no default name a pod could register as
         relay = cloud_relay.Relay(lambda: _read_json(environ[AGENTS_ENV], {}) if environ.get(AGENTS_ENV) else {})
