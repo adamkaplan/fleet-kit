@@ -102,6 +102,80 @@ def parse(text):
     return docs
 
 
+PART = {"app.kubernetes.io/part-of": "cloud-hub", "cw/run": "first-ask"}
+EXCEPT = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+          "169.254.0.0/16", "168.63.129.16/32", "127.0.0.0/8"]
+PRIVATE_NETS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+
+def pol(name, labels, spec):
+    md = {"name": name, "namespace": "cw"}
+    if labels:
+        md["labels"] = dict(labels)
+    return {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy", "metadata": md, "spec": spec}
+
+
+def sel(app):
+    return {"matchLabels": {"app": app}}
+
+
+def tcp(*ports):
+    return [{"port": p, "protocol": "TCP"} for p in ports]
+
+
+# The six policies exactly as applied, as plain structures (key order is not significant).
+EXPECTED = {
+    "allow-egress": pol("allow-egress", None, {
+        "podSelector": {}, "policyTypes": ["Egress"],
+        "egress": [
+            {"ports": [{"port": 53, "protocol": "UDP"}, {"port": 53, "protocol": "TCP"}],
+             "to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
+                     "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}}}]},
+            {"ports": tcp(443, 80),
+             "to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": list(EXCEPT)}}]},
+        ]}),
+    "cloud-agents-ingress-from-hub": pol("cloud-agents-ingress-from-hub", PART, {
+        "podSelector": sel("cw-worker"), "policyTypes": ["Ingress"],
+        "ingress": [{"from": [{"podSelector": sel("cloud-hub")}], "ports": tcp(4096)}]}),
+    "cloud-agents-to-hub": pol("cloud-agents-to-hub", PART, {
+        "podSelector": sel("cw-worker"), "policyTypes": ["Egress"],
+        "egress": [{"to": [{"podSelector": sel("cloud-hub")}], "ports": tcp(8443)}]}),
+    "cloud-hub-ingress": pol("cloud-hub-ingress", PART, {
+        "podSelector": sel("cloud-hub"), "policyTypes": ["Ingress"],
+        "ingress": [{"from": [{"podSelector": sel("cw-worker")}], "ports": tcp(8443)}]}),
+    "cloud-hub-to-agents": pol("cloud-hub-to-agents", PART, {
+        "podSelector": sel("cloud-hub"), "policyTypes": ["Egress"],
+        "egress": [{"to": [{"podSelector": sel("cw-worker")}], "ports": tcp(4096)}]}),
+    "default-deny": pol("default-deny", None, {
+        "podSelector": {}, "policyTypes": ["Ingress", "Egress"]}),
+}
+
+
+def empty_selector(node):
+    """True when an empty podSelector or namespaceSelector sits anywhere inside a peer."""
+    if isinstance(node, dict):
+        return any((k in ("podSelector", "namespaceSelector") and v == {}) or empty_selector(v)
+                   for k, v in node.items())
+    if isinstance(node, list):
+        return any(empty_selector(v) for v in node)
+    return False
+
+
+def ipblock_problems(ip, n):
+    import ipaddress
+    bad = []
+    try:
+        net = ipaddress.ip_network(ip.get("cidr"))
+    except (ValueError, TypeError):
+        return ["unreadable cidr in %s" % n]
+    inside = any(net.version == 4 and net.subnet_of(ipaddress.ip_network(r)) for r in PRIVATE_NETS + EXCEPT[3:4])
+    if net.prefixlen < 8 and str(net) != "0.0.0.0/0":
+        bad.append("cidr broader than /8 in %s" % n)
+    if not inside and not all(e in (ip.get("except") or []) for e in EXCEPT):
+        bad.append("ipBlock without the full except list in %s" % n)
+    return bad
+
+
 def rules(doc):
     spec = doc.get("spec") or {}
     for d in ("ingress", "egress"):
@@ -116,6 +190,14 @@ def problems(text):
         docs = parse(text)
     except Refused as e:
         return ["refused: %s" % e]
+    try:
+        return _check(docs, text)
+    except (AttributeError, TypeError, KeyError):
+        return ["unexpected shape"]
+
+
+def _check(docs, text):
+    bad = []
     if len(docs) != 6:
         bad.append("documents: %d" % len(docs))
     bad += ["kind %s" % d.get("kind") for d in docs if d.get("kind") != "NetworkPolicy"]
@@ -125,35 +207,23 @@ def problems(text):
     if names != NAMES:
         bad.append("names %s" % names)
     by = {d["metadata"]["name"]: d for d in docs}
-    dd = by.get("default-deny")
-    if dd is None:
-        bad.append("default-deny missing")
-    else:
-        s = dd["spec"]
-        if s.get("podSelector") != {} or sorted(s.get("policyTypes") or []) != ["Egress", "Ingress"] \
-                or list(rules(dd)):
-            bad.append("default-deny shape")
-    hi = by.get("cloud-hub-ingress")
-    if hi is not None:
-        rs = [r for _, r in rules(hi)]
-        ok = (hi["spec"].get("podSelector") == {"matchLabels": {"app": "cloud-hub"}} and len(rs) == 1
-              and rs[0].get("from") == [{"podSelector": {"matchLabels": {"app": "cw-worker"}}}]
-              and rs[0].get("ports") == [{"port": 8443, "protocol": "TCP"}])
-        if not ok:
-            bad.append("hub ingress shape")
-    for d in docs:
-        n = d.get("metadata", {}).get("name")
-        for _, r in rules(d):
-            for peer in (r.get("from") or []) + (r.get("to") or []):
-                if peer.get("podSelector") == {} or peer.get("namespaceSelector") == {}:
-                    bad.append("empty selector in %s" % n)
-                ip = peer.get("ipBlock")
-                if ip and ip.get("cidr") == "0.0.0.0/0" and \
-                        not all(p in (ip.get("except") or []) for p in PRIVATE):
-                    bad.append("wide ipBlock in %s" % n)
-            for p in r.get("ports") or []:
-                if "endPort" in p:
-                    bad.append("port range in %s" % n)
+    for n in NAMES:
+        if by.get(n) != EXPECTED[n]:
+            bad.append("policy %s differs from the applied one" % n)
+    try:
+        for d in docs:
+            n = d["metadata"]["name"]
+            for _, r in rules(d):
+                for peer in (r.get("from") or []) + (r.get("to") or []):
+                    if empty_selector(peer):
+                        bad.append("empty selector in %s" % n)
+                    if "ipBlock" in peer:
+                        bad += ipblock_problems(peer["ipBlock"], n)
+                for p in r.get("ports") or []:
+                    if "endPort" in p:
+                        bad.append("port range in %s" % n)
+    except (AttributeError, TypeError, KeyError):
+        bad.append("unexpected shape")
     for n in HUB:
         lab = (by.get(n, {}).get("metadata") or {}).get("labels") or {}
         if lab.get("app.kubernetes.io/part-of") != "cloud-hub":
@@ -296,9 +366,39 @@ class T(unittest.TestCase):
             "deny loses Egress": t.replace("    - Ingress\n    - Egress\n", "    - Ingress\n"),
             "port range": t.replace("        - port: 4096\n", "        - port: 4096\n          endPort: 4100\n", 1),
         }
+        for r in EXCEPT:
+            muts["except %s dropped" % r] = t.replace("              - %s\n" % r, "", 1)
+        muts["cidr 0.0.0.0/1 without except"] = re.sub(
+            r"            cidr: 0.0.0.0/0\n            except:\n(              - .*\n)+", "            cidr: 0.0.0.0/1\n", t, count=1)
+        muts["port 22 added to allow-egress"] = t.replace("        - port: 80\n          protocol: TCP\n",
+            "        - port: 80\n          protocol: TCP\n        - port: 22\n          protocol: TCP\n", 1)
+        i = t.index("name: cloud-agents-ingress-from-hub")
+        muts["ports block dropped from agents ingress"] = t[:i] + t[i:].replace(
+            "      ports:\n        - port: 4096\n          protocol: TCP\n", "", 1)
+        muts["other source app"] = t[:i] + t[i:].replace("app: cloud-hub", "app: other", 1)
+        muts["namespaceSelector added to hub ingress"] = t.replace(
+            "        - podSelector:\n            matchLabels:\n              app: cw-worker\n      ports:\n        - port: 8443",
+            "        - namespaceSelector:\n            matchLabels:\n              a: b\n          podSelector:\n            matchLabels:\n              app: cw-worker\n      ports:\n        - port: 8443", 1)
+        muts["changed selector"] = t.replace("k8s-app: kube-dns", "k8s-app: other", 1)
+        muts["changed worker port"] = t.replace("port: 8443\n          protocol: TCP\n      to:", "port: 8444\n          protocol: TCP\n      to:", 1)
         for name, m in muts.items():
             self.assertNotEqual(m, t, name + " not applied")
             self.assertTrue(problems(m), name + " not caught")
+        for name in ("except 169.254.0.0/16 dropped", "except 127.0.0.0/8 dropped",
+                     "except 100.64.0.0/10 dropped", "cidr 0.0.0.0/1 without except"):
+            self.assertTrue(any("except" in x for x in problems(muts[name])), name + ": general check silent")
+
+    def test_empty_selector_nested_in_ipblock_peer(self):
+        t = self.text.replace("        - ipBlock:\n            cidr: 0.0.0.0/0\n",
+                              "        - podSelector: {}\n          ipBlock:\n            cidr: 0.0.0.0/0\n", 1)
+        self.assertNotEqual(t, self.text)
+        self.assertIn("empty selector in allow-egress", problems(t))
+
+    def test_cidr_rules(self):
+        self.assertEqual(ipblock_problems({"cidr": "10.1.0.0/16"}, "x"), [])
+        self.assertEqual(ipblock_problems({"cidr": "0.0.0.0/0", "except": EXCEPT}, "x"), [])
+        self.assertTrue(ipblock_problems({"cidr": "8.0.0.0/7", "except": EXCEPT}, "x"))
+        self.assertTrue(ipblock_problems({"cidr": "203.0.113.0/24"}, "x"))
 
 
 if __name__ == "__main__":
