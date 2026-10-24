@@ -695,15 +695,33 @@ REGISTRAR_SOURCE_MAX = 4000000
 
 def registrar_pattern(tree):
     """The compiled `REGISTRAR_NAME_RE` of a daemon file (read from its text, never held here), or None when it is not a literal `re.compile("...")`."""
-    for node in tree.body:
+    last = None
+    for node in tree.body:   # Python uses the LAST binding of the name, so the LAST assignment is read (the first is not what runs)
         if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "REGISTRAR_NAME_RE" for t in node.targets):
-            call = node.value
-            if isinstance(call, ast.Call) and call.args and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str):
-                try:
-                    return re.compile(call.args[0].value)
-                except re.error:
-                    return None
+            last = node
+    if last is None:
+        return None
+    call = last.value
+    if isinstance(call, ast.Call) and call.args and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str):
+        try:
+            return re.compile(call.args[0].value)
+        except re.error:
+            return None
     return None
+
+
+def _pattern_rebound(tree, added):
+    """True when the head binds `REGISTRAR_NAME_RE` more than once (a second assignment, an augmented one, an import, a `global`, a loop target...) and a line the pull request added is one of the bindings: Python uses the last
+    binding, so the name that selects the registrars is not changed by a line the pull request adds beside another."""
+    bindings = []
+    for x in ast.walk(tree):
+        if isinstance(x, ast.Name) and x.id == "REGISTRAR_NAME_RE" and isinstance(x.ctx, (ast.Store, ast.Del)):
+            bindings.append(x)
+        elif isinstance(x, ast.Global) and "REGISTRAR_NAME_RE" in x.names:
+            bindings.append(x)
+        elif isinstance(x, (ast.Import, ast.ImportFrom)) and any((a.asname or a.name).split(".")[0] == "REGISTRAR_NAME_RE" for a in x.names):
+            bindings.append(x)
+    return len(bindings) > 1 and any(_spans(b, added) for b in bindings)
 
 
 def _chain_root(node):
@@ -1029,6 +1047,11 @@ def _registrar_unit(unit, names, added, helpers=None, opaque=(), literals=(), re
                     bad = unsafe(value)
                     if bad:
                         note(x, "calls", label(bad))
+            if isinstance(x.func, ast.Name) and (x.func.id in builtins or x.func.id in named_helpers) and x.func.id not in kinds:   # a call of the table: each argument is run through the same value check (`min(..., key=exit)` runs `exit`)
+                for arg in list(x.args) + [k.value for k in x.keywords]:
+                    bad = unsafe(arg)
+                    if bad:
+                        note(x, "calls", label(bad))
             if fname in ("__import__", "import_module"):
                 note(x, "imports", label(callee))
             elif verb_chain(x) or callee in data or (isinstance(x.func, ast.Name) and (x.func.id in defined or (x.func.id in (set(readable) | set(named_helpers) | set(builtins)) and x.func.id not in kinds))) or (isinstance(x.func, ast.Attribute) and _root(x.func) is None and isinstance(x.func.value, ast.Constant)):
@@ -1243,6 +1266,8 @@ def registrar_findings(base_src, head_src, rule):
     if lines is None:
         return None, "the diff of the daemon file cannot be read"
     added = set(lines[1])
+    if _pattern_rebound(head, added):
+        return None, "a changed line binds the registrar name pattern of the daemon file"
     allow = rule.get("registrar_allow") if isinstance(rule, dict) else None
     if allow is not None and not (isinstance(allow, dict) and all(isinstance(allow.get(k, []), list) and all(isinstance(v, str) for v in allow.get(k, [])) for k in ("pure_builtins", "helpers", "parser_methods", "free_keywords"))):
         return None, "the registrar allow table of the rule cannot be read"

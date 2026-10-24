@@ -37555,6 +37555,24 @@ class TestRegistrarFloor(LedgerBase):
                 bad.append("an untouched writer called at import")
         except Exception:
             bad.append("untouched writer rows")
+        has("a table builtin's keyword argument runs a name outside the table", reg("int(1, key=exit)"), ("calls", "exit"))
+        has("a table builtin's positional argument runs a name outside the table", reg("str(open)"), ("calls", "open"))
+        has("a table builtin's argument read from a dict that holds a name outside the table", reg("d = {'a': exit}\nint(1, key=d['a'])"), ("calls", "a value argparse may run"))
+        clean("a table builtin with a literal argument", reg("int('1')"))
+        try:   # the pattern Python uses is the LAST assignment: a later one that matches a new name is read, and a changed line that binds the name is held
+            later = "REGISTRAR_NAME_RE = re.compile(r'zz_.*')\ndef zz_evil(sub):\n    import os\n"
+            got, why = dc.registrar_findings(fake, fake + later, rule)
+            if not (why or any(g[0] == "zz_evil" for g in (got or []))):
+                bad.append("a later pattern assignment hides a registrar")
+            import ast as _ast
+            if not dc.registrar_pattern(_ast.parse(fake + later)).fullmatch("zz_evil"):
+                bad.append("the pattern read is not the last assignment")
+            if not why:
+                bad.append("a changed line that binds the pattern a second time is not held")
+            if dc.registrar_findings(fake + later, fake + later, rule)[1] is not None:
+                bad.append("an untouched second binding is held")
+        except Exception:
+            bad.append("pattern last-assignment rows")
         has("a nested parameter named like a builtin", reg("def g(int):\n    int('y')\ng(print)"), ("calls", "int"))
         clean("a pure builtin of the table", reg("sub.add_parser('x', default=int('1'), help=str(2))"))
         has("a builtin outside the table", reg("sorted(sub)"), ("calls", "sorted"))
@@ -37700,6 +37718,9 @@ class TestRegistrarFloor(LedgerBase):
         ("a readable helper is not allowed", "(x.func.id in (set(readable) | set(named_helpers) | set(builtins)) and x.func.id not in kinds)", "(x.func.id in (set(named_helpers) | set(builtins)) and x.func.id not in kinds)"),
         ("a nested parameter is not a binding", "if isinstance(x, ast.arg) and id(x) not in own_args:", "if False:"),
         ("two defs are one function", "len(k) == 1 and k[0] in (\"def\", \"lambda\")", "k and all(v in (\"def\", \"lambda\") for v in k)"),
+        ("the first pattern assignment is read", "    for node in tree.body:   # Python uses the LAST binding of the name, so the LAST assignment is read (the first is not what runs)\n        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == \"REGISTRAR_NAME_RE\" for t in node.targets):\n            last = node", "    for node in tree.body:\n        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == \"REGISTRAR_NAME_RE\" for t in node.targets):\n            last = last or node"),
+        ("a changed line that binds the pattern is not held", "if _pattern_rebound(head, added):", "if False:"),
+        ("the arguments of a table builtin are not checked", "for arg in list(x.args) + [k.value for k in x.keywords]:\n                    bad = unsafe(arg)", "for arg in []:\n                    bad = unsafe(arg)"),
         ("a rebound table builtin stays callable", "(x.func.id in (set(readable) | set(named_helpers) | set(builtins)) and x.func.id not in kinds)", "(x.func.id in (set(readable) | set(named_helpers) | set(builtins)))"),
         ("a keyword is always free", "if key in free_keywords:\n                        continue", "if True:\n                        continue"),
         ("action takes any value", "if key == \"action\" and not (isinstance(value, ast.Constant) and isinstance(value.value, str)):", "if False:"),
