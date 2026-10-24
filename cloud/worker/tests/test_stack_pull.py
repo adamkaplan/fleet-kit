@@ -152,6 +152,88 @@ class Cleanup(Fixture):
         self.assertEqual(os.listdir(self.base), [])
 
 
+class Transport(unittest.TestCase):
+    def test_an_http_address_is_refused(self):
+        with self.assertRaises(sp.Refused) as c:
+            sp.http_post("http://login.example.internal/token", {"a": "b"})
+        self.assertEqual(c.exception.code, 2)
+
+    def test_a_redirect_is_not_followed(self):
+        import http.server
+        import threading
+        hits = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                hits.append(self.path)
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                if self.path == "/first":
+                    self.send_response(302)
+                    self.send_header("Location", "/second")
+                    self.end_headers()
+                else:
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+
+            do_GET = do_POST
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        url = "http://127.0.0.1:%d/first" % srv.server_port
+        # http_post refuses http, so drive the same opener it builds
+        req = sp.urllib.request.Request(url, data=b"client_assertion=x", method="POST")
+        with self.assertRaises(sp.urllib.error.HTTPError) as c:
+            sp.urllib.request.build_opener(sp._NoRedirect).open(req, timeout=5)
+        self.assertEqual(c.exception.code, 302)
+        self.assertEqual(hits, ["/first"])
+        # and a mutant opener that follows does reach /second
+        sp.urllib.request.build_opener().open(sp.urllib.request.Request(url, data=b"x", method="POST"), timeout=5)
+        self.assertEqual(hits[-1], "/second")
+
+    def test_http_post_builds_its_opener_with_the_no_redirect_handler(self):
+        seen = []
+        real = sp.urllib.request.build_opener
+
+        def spy(*handlers):
+            seen.extend(handlers)
+            raise OSError("stop")
+        sp.urllib.request.build_opener = spy
+        try:
+            self.assertEqual(sp.http_post("https://login.example.internal/t", {}), (0, {}))
+        finally:
+            sp.urllib.request.build_opener = real
+        self.assertEqual(seen, [sp._NoRedirect])
+
+
+class Modes(Fixture):
+    def test_directory_0700_and_config_0600_even_when_the_defaults_are_looser(self):
+        real_mk, real_run = sp.tempfile.mkdtemp, self.runner
+
+        def loose_mkdtemp(**kw):
+            d = real_mk(**kw)
+            os.chmod(d, 0o755)
+            return d
+
+        def loose_runner(argv, input=None, env=None, **kw):
+            if argv[1] == "login":
+                with open(os.path.join(env["DOCKER_CONFIG"], "config.json"), "w") as f:
+                    f.write("{}")
+                os.chmod(os.path.join(env["DOCKER_CONFIG"], "config.json"), 0o644)
+            return real_run(argv, input=input, env=env, **kw)
+        sp.tempfile.mkdtemp = loose_mkdtemp
+        self.addCleanup(setattr, sp.tempfile, "mkdtemp", real_mk)
+        self.runner = loose_runner
+        code, _ = self.go()
+        self.assertEqual(code, 0)
+        pull = [m for d, m in zip(self.dockers, self.modes) if d["argv"][1] == "pull"][0]
+        self.assertEqual(pull, (0o700, [0o600]))
+
+
 class ImageFiles(unittest.TestCase):
     def test_dockerfile_directory_sudoers_and_script(self):   # S4, S16
         with open(os.path.join(ROOT, "cloud", "worker", "Dockerfile")) as f:

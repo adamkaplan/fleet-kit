@@ -85,6 +85,12 @@ class Check(unittest.TestCase):
         self.set(fics=[{"issuer": ISSUER, "subject": "system:serviceaccount:cw:cw-worker", "audiences": ["api://AzureADTokenExchange"]}])
         self.assertEqual(self.run_check()[0], 1)
 
+    def test_wrong_audience_is_missing(self):
+        self.set(fics=[{"issuer": ISSUER, "subject": "system:serviceaccount:cw:cw-stack-puller", "audiences": ["api://other"]}])
+        code, out = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertIn("owner step 2", out)
+
     def test_missing_role(self):   # S5
         self.set(roles=[])
         code, out = self.run_check()
