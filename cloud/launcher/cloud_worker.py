@@ -834,42 +834,49 @@ def settings_file_problem(env):
     return None
 
 
-def cluster_token(env, duration, capture=None, now=None, recovery=None):
+def cluster_token(env, duration, capture=None, now=None, recovery=None, strict=False):
     """THE cluster login: a token for the namespaced operator account, in memory, at most an hour.
 
     The route is the launch's own: CW_CLUSTER_TOKEN_CMD (a command that prints one), else the administrator kubeconfig read from the vault
     (CW_CLUSTER_ADMIN_CMD, else `az keyvault secret show` with the vault's subscription and name) and `kubectl create token cw-operator
     --duration=...` run with it on a pipe. `duration` is the requested life ("Nm"). `recovery` (the launch only) is the vault access check: it
     runs once, after a firewall refusal, and the vault is read once more. Nothing is cached or kept: the administrator value is dropped when the
-    one command ends. A failure raises ClusterLogin: its kind says which step failed, never a value."""
+    one command ends. A failure raises ClusterLogin: its kind says which step failed, never a value.
+
+    `strict` (default False) is the UNATTENDED reaper's mode: an absolute checked kubectl, the fixed account and subcommand, a DNS-label namespace,
+    the settings file's 0600 check before a custom command, and a minimal child environment. strict=False is the interactive launch path (a person's
+    own shell): the full environment, the program found on PATH, no extra refusals."""
     env = dict(env)
     clock = time.time() if now is None else now
     capture = capture or capture_command
     custom = (env.get("CW_CLUSTER_TOKEN_CMD") or "").strip()
     admin = (env.get("CW_CLUSTER_ADMIN_CMD") or "").strip()
-    if custom or admin or (env.get("CW_KUBECTL") or "").strip():
+    if strict and (custom or admin or (env.get("CW_KUBECTL") or "").strip()):
         problem = settings_file_problem(env)   # a custom command or program is honoured only while the settings file is private to this user
         if problem:
             raise ClusterLogin("settings-untrusted")
-    child_env = mint_env(env)
+    child_env = mint_env(env) if strict else env
     if custom:
         ran = capture(["sh", "-c", custom], env=child_env)
         if ran is None or ran[0] != 0:
             raise ClusterLogin("token-command-failed")
         token = ran[1].strip()
     else:
-        minutes = mint_minutes(duration)
-        namespace = (env.get("CW_CLOUD_NAMESPACE") or "cw")
-        if not _NAMESPACE_LABEL.fullmatch(namespace) or "\n" in namespace:
-            raise ClusterLogin("namespace-refused")
-        kubectl = mint_kubectl(env)   # every refusal is BEFORE the vault is read
+        if strict:
+            minutes = mint_minutes(duration)
+            namespace = (env.get("CW_CLOUD_NAMESPACE") or "cw")
+            if not _NAMESPACE_LABEL.fullmatch(namespace) or "\n" in namespace:
+                raise ClusterLogin("namespace-refused")
+            kubectl = mint_kubectl(env)   # every refusal is BEFORE the vault is read
+        else:
+            namespace, kubectl = env.get("CW_CLOUD_NAMESPACE", "cw"), env.get("CW_KUBECTL", "kubectl")
         if admin:
             argv = ["sh", "-c", admin]
         else:
             sub, vault = (env.get("CW_VAULT_SUBSCRIPTION") or "").strip(), (env.get("CW_VAULT_NAME") or "").strip()
             if not sub or not vault:
                 raise ClusterLogin("vault-settings-missing")
-            az = shutil.which("az", path=env.get("PATH") or MINT_PATH) or "az"
+            az = (shutil.which("az", path=env.get("PATH") or MINT_PATH) or "az") if strict else "az"
             argv = [az, "keyvault", "secret", "show", "--subscription", sub, "--vault-name", vault,
                     "--name", env.get("CW_CLUSTER_ADMIN_SECRET") or "cw-cluster-admin-kubeconfig", "--query", "value", "-o", "tsv"]
         def read():
@@ -883,8 +890,9 @@ def cluster_token(env, duration, capture=None, now=None, recovery=None):
             raise ClusterLogin("admin-unreadable", firewall=firewall_refused(ran), recovered=recovered)
         admin_config = ran[1]
         # The command is fixed in code: only the program (an absolute, checked path), the namespace (a DNS label) and the minutes come from outside.
-        minted = capture([kubectl, "--kubeconfig", "/dev/fd/{fd}", "-n", namespace, "create", "token", MINT_ACCOUNT, "--duration=%dm" % minutes],
-                         env=child_env, feed=admin_config)
+        mint_argv = [kubectl, "--kubeconfig", "/dev/fd/{fd}", "-n", namespace, "create", "token", MINT_ACCOUNT,
+                     "--duration=%dm" % minutes if strict else "--duration=" + duration]
+        minted = capture(mint_argv, env=child_env if strict else dict(env, KUBECONFIG=os.devnull), feed=admin_config)
         del admin_config
         if minted is None or minted[0] != 0:
             raise ClusterLogin("mint-failed")
@@ -1058,7 +1066,7 @@ class ClusterTokenRefresher:
         if life is not None and life >= CLUSTER_TOKEN_REFRESH_MARGIN_SECONDS:
             return TokenRefresh("fresh")   # the file has life left: it is left alone
         try:
-            token = cluster_token(self.env, duration=CLUSTER_TOKEN_DURATION, capture=self.capture, now=now)
+            token = cluster_token(self.env, duration=CLUSTER_TOKEN_DURATION, capture=self.capture, now=now, strict=True)
             write_token_file(path, token)
         except ClusterLogin as e:
             reason = refresh_reason(e)

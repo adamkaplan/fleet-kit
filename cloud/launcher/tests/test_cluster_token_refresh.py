@@ -599,11 +599,11 @@ class MintGuards(Refresh):
     """Ask #1060 review: the mint command's program, account, duration and namespace are fixed or checked; the child's environment is minimal;
     the retry gap is pinned on a fake clock, forwards and backwards. Each guard has a mutant that fails its test."""
 
-    def outcome(self, module=None, env=None, duration="30m"):
+    def outcome(self, module=None, env=None, duration="30m", strict=True):
         """The failure kind of one mint ("ok" when it made a token), through the given build of the module."""
         module = module or cw
         try:
-            module.cluster_token(env if env is not None else self.env, duration, now=self.clock().timestamp())
+            module.cluster_token(env if env is not None else self.env, duration, now=self.clock().timestamp(), strict=strict)
         except Exception as e:   # the mutant module has a ClusterLogin class of its own
             return getattr(e, "kind", type(e).__name__)
         return "ok"
@@ -692,7 +692,7 @@ class MintGuards(Refresh):
 
     def test_the_mutant_that_reads_the_account_from_the_environment_fails(self):
         self.assertIn("cw-operator", self.mint_argv())
-        module = self.mutate('MINT_ACCOUNT, "--duration=%dm"', 'env.get("CW_ACCOUNT", MINT_ACCOUNT), "--duration=%dm"')
+        module = self.mutate('MINT_ACCOUNT,\n                     "--duration=%dm"', 'env.get("CW_ACCOUNT", MINT_ACCOUNT),\n                     "--duration=%dm"')
         # the fake cluster answers only for cw-operator: the mutant's other account never reaches the token log and the mint fails
         self.mint_argv(module, expect="mint-failed")
         self.assertEqual(self.token_log()[1:], [])
@@ -753,6 +753,42 @@ class MintGuards(Refresh):
         module = self.mutate('"KUBECONFIG": os.devnull', '"KUBECONFIG_X": os.devnull')
         self.assertEqual(self.outcome(module), "ok")
         self.assertTrue(any(c.get("KUBECONFIG") != "/dev/null" for c in self.child_envs()))
+
+    # -- the two entries: the reaper is strict, the launch is not --
+    def test_the_launch_call_keeps_its_previous_behaviour(self):
+        """The compatibility pin: strict=False accepts a bare-name CW_KUBECTL and passes the full environment."""
+        env = dict(self.planted(), CW_KUBECTL="kubectl", PATH=self.bin + os.pathsep + os.environ.get("PATH", ""))
+        self.assertEqual(self.outcome(env=env, strict=False), "ok")
+        self.assertTrue(any("FAKE_SECRET_VAR" in c for c in self.child_envs()))
+        self.assertEqual(self.outcome(env=env, strict=True), "kubectl-refused")
+
+    def test_the_launch_default_is_not_strict(self):
+        import inspect
+        self.assertIs(inspect.signature(cw.cluster_token).parameters["strict"].default, False)
+
+    def test_a_build_where_launch_is_strict_fails_the_compatibility_test(self):
+        module = self.mutate("recovery=None, strict=False):", "recovery=None, strict=True):")
+        env = dict(self.env, CW_KUBECTL="kubectl", PATH=self.bin + os.pathsep + os.environ.get("PATH", ""))
+        self.assertEqual(self._launch_call(module, env), "kubectl-refused")
+        self.assertEqual(self._launch_call(cw, env), "ok")
+
+    def _launch_call(self, module, env):
+        try:
+            module.cluster_token(env, "30m", now=self.clock().timestamp())   # the launch's call: no strict argument
+        except Exception as e:
+            return getattr(e, "kind", type(e).__name__)
+        return "ok"
+
+    def test_the_reapers_refresher_is_strict_and_a_build_with_strict_false_fails(self):
+        env = dict(self.env, CW_KUBECTL="sh")
+        refresher = cw.ClusterTokenRefresher(env, self.clock)
+        self.assertEqual(refresher.run().reason, cw.REFRESH_REASONS["kubectl-refused"])
+        self.assertEqual(self.vault_reads(), [])
+        self.reset()
+        module = self.mutate("now=now, strict=True)", "now=now, strict=False)")
+        env = dict(self.env, CW_KUBECTL="sh")
+        mutant = module.ClusterTokenRefresher(env, self.clock)
+        self.assertNotEqual(mutant.run().reason, cw.REFRESH_REASONS["kubectl-refused"])
 
     def test_the_token_command_limit_is_a_named_constant_of_a_sane_value(self):
         self.assertEqual(cw.TOKEN_CMD_SECONDS, 60)
