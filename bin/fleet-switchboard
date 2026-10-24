@@ -21855,7 +21855,8 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
             decision = "hold"
     rating_entries = impact_rating_entries(engine.state_dir, "%s#%d" % (repo, number), head)[0] if engine.state_dir is not None and isinstance(head, str) else []
     brief_module = load_module("impact_brief")   # slice A hook (#1215): the brief is built from the same diff read; display only, no decision reads it yet
-    report_base = {"top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "head": raw.get("headRefOid"), "base": raw.get("baseRefOid"), "complete": complete,
+    report_base = {"top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "owner_paths": ((matrix.get("owner_hold") or {}).get("substance_decider") or {}).get("owner_only_paths") or {},
+                   "ci": pr_ci_of(raw.get("statusCheckRollup")), "unknown": unknown, "head": raw.get("headRefOid"), "base": raw.get("baseRefOid"), "complete": complete,
                    "reads": [{"by": e.get("by"), "verdict": e.get("verdict"), "head": e.get("head")} for e in rating_entries], "rating": ({"class": record[1]} if record and record[1] else None)}
     brief = brief_module.build_brief(brief_module.facts_from_report(files, report_base))
     return {"brief": brief, "pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude, "rating_block": rating_block_note(rating_entries, "%s#%d" % (repo, number), head), "rating_lines": rating_mismatch_lines(engine.state_dir, "%s#%d" % (repo, number), head),
@@ -24822,12 +24823,18 @@ def held_defects(body):
         return ["the held PR's top is unreadable (%s)" % _one_line("%s: %s" % (type(err).__name__, err), 100)]
 
 
+_BRIEF_ADVISORY = []   # the loaded module, once (it was reloaded on every call)
+
+
 def _brief_advisory():
-    """Slice D (#1215): the pure brief rules, loaded from bin/brief_advisory.py beside this file."""
+    """Slice D (#1215): the pure brief rules, loaded from bin/brief_advisory.py beside this file (loaded once, then cached)."""
+    if _BRIEF_ADVISORY:
+        return _BRIEF_ADVISORY[0]
     import importlib.util
     spec = importlib.util.spec_from_file_location("brief_advisory", os.path.join(os.path.dirname(os.path.realpath(__file__)), "brief_advisory.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    _BRIEF_ADVISORY.append(mod)
     return mod
 
 

@@ -764,7 +764,8 @@ def decide_on_substance(brief, classes, rule):
         return OWNER, "the brief names a material risk (%s): escalate to the owner." % ", ".join(sorted(str(m) for m in material))
     if loosening:
         return OWNER, "the brief names an accept path it loosens: escalate to the owner."
-    missing = sorted(k for k, v in pieces.items() if v == NOT_SHOWN or v is None)
+    blocking = brief.get("blocking_gaps")   # the brief's own list of the gaps that block (a tests-and-docs-only change is not blocked by an unread rating, mutants or blast radius); a brief without it: every gap blocks
+    missing = sorted(k for k, v in pieces.items() if (v == NOT_SHOWN or v is None) and (not isinstance(blocking, list) or k in blocking or v is None))
     if missing or not pieces:
         return OWNER, "a piece of the brief is %s (%s): escalate to the owner." % (NOT_SHOWN, ", ".join(missing) or "all")
     names = sorted({str(c) for c in classes}) if not isinstance(classes, dict) else sorted({str(c) for c in classes.values()})

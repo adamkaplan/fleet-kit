@@ -40045,6 +40045,9 @@ for _name in list(vars(TestImpactRejudge)):   # the subclass reuses the harness,
         setattr(TestImpactReleaseEveryPass, _name, None)
 
 
+REAL_FLOOR_BRIEF = sb.floor_brief   # #1215 PC-9: the real function, for the tests that must not run on the fixture brief
+
+
 class TestImpactHold(LedgerBase):
     """#179 slice L4: the switchboard WRITES the hold (two labels), only when `impact_hold.enabled`, only for repos under `plan_gates`, head-bound
     owner clear, kill switches, idempotent, bounded. A fake gh records every write."""
@@ -40924,6 +40927,96 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(code, 0)   # #1215: no review class is no ceiling either: the brief decides
         self.assertEqual(len([w for w in self.writes if w[0] == "DELETE"]), 1)
 
+    # ---- #1215 PC-9 (d): REAL-PATH assertions. These run the real floor (no mocked brief): the brief is built by `pr_floor_report` from the diff the fake gh lists.
+    def real_floor(self, path, additions=3, deletions=1, review=("none", None), change="MODIFIED", extra_files=(), ci="SUCCESS"):
+        self.delegate()
+        self.floor_pr(path=path)
+        self.files_of_pr(path)
+        self.pr["files"] = [{"path": path, "additions": additions, "deletions": deletions, "changeType": change}] + list(extra_files)
+        self.pr["changedFiles"] = len(self.pr["files"])
+        self.pr["statusCheckRollup"] = [{"name": "ci", "status": "COMPLETED", "conclusion": ci}]
+        self.passes()
+        self.review = (review, None)
+        with mock.patch.object(sb, "floor_brief", REAL_FLOOR_BRIEF):
+            report = sb.pr_floor_report(self.engine_cached, "acme/app", 9)
+        return report
+
+    def real_clear(self, path, **kw):
+        """(code, out, err, brief) of the CoS's clear over the REAL floor brief of that change."""
+        report = self.real_floor(path, **kw)
+        with mock.patch.object(sb, "floor_brief", REAL_FLOOR_BRIEF):
+            code, out, err = self.under(brief=report["brief"])
+        return code, out, err, report["brief"]
+
+    def test_real_path_a_credentials_path_and_an_identity_path_are_refused_by_the_real_brief(self):   # U4: the reworked test_s3 assertion, on the real floor
+        for path in ("shims/gh", "bin/switchboard-trial", "cloud/launcher/token_mint.py"):
+            self.writes.clear()
+            code, out, err, brief = self.real_clear(path)
+            self.assertEqual(code, 2, (path, err))
+            self.assertEqual(brief["decider"], "owner", path)
+            self.assertIn("escalate to the owner", err, path)
+            self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [], path)
+
+    def test_real_path_review_classes_authority_identity_and_none_on_an_authority_path_are_refused_by_the_real_brief(self):   # U4
+        for review in (("hold", "authority"), ("hold", "identity"), ("hold", None), (None, None)):
+            self.writes.clear()
+            code, out, err, brief = self.real_clear("bin/reassign.py", review=review)
+            self.assertEqual(code, 2, (review, err))
+            self.assertIn("escalate to the owner", err, review)
+            self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [], review)
+
+    def test_real_path_the_daemon_file_and_the_chat_clear_are_refused_by_the_real_brief(self):   # U4
+        for path in ("bin/fleet-switchboard", "bin/chat_clear.py"):
+            self.writes.clear()
+            code, out, err, brief = self.real_clear(path)
+            self.assertEqual(code, 2, (path, err))
+            self.assertEqual(brief["decider"], "owner", path)
+            self.assertIn("escalate to the owner", err, path)
+            self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [], path)
+
+    def test_real_path_every_machinery_glob_is_refused_by_the_real_brief(self):   # U4: the reworked machinery-glob loop (it accepted code 0)
+        paths = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]["clear_code_paths"]
+        for glob in paths:
+            path = glob.replace("**", "x.txt").replace("*", "x") if "*" in glob else glob
+            with self.subTest(path=path):
+                self.writes.clear()
+                code, out, err, brief = self.real_clear(path)
+                self.assertEqual(code, 2, (path, err))
+                self.assertEqual(brief["decider"], "owner", path)
+                self.assertEqual(self.deletes(), [])
+                self.ledger_reset()
+
+    def test_s31_the_real_floor_gives_the_chief_of_staff_a_tests_only_change_and_the_owner_a_credentials_change(self):
+        tests_only = self.real_floor("tests/test_x.py", review=("none", None))["brief"]
+        self.assertEqual((tests_only["decider"], tests_only["material"]), ("chief_of_staff", []), tests_only["text"])
+        self.assertIn("CI: green at", tests_only["text"])
+        self.assertEqual(self.real_floor("cloud/launcher/token_mint.py")["brief"]["decider"], "owner")
+        no_ci = self.real_floor("tests/test_x.py", ci="FAILURE")["brief"]
+        self.assertEqual(no_ci["pieces"]["ci"], "red at %s" % LEDGER_HEAD[:8])
+
+    def test_s30_the_clear_machinerys_own_files_are_owner_only_and_their_hold_label_is_kept(self):
+        for path in ("bin/impact_brief.py", "bin/brief_advisory.py", "bin/fleet-switchboard"):
+            with self.subTest(path=path):
+                report = self.real_floor(path, additions=50, deletions=50)
+                brief = report["brief"]
+                self.assertIn("clear_machinery", brief["pieces"]["classes"], path)
+                self.assertEqual((brief["decider"], bool(brief["material"])), ("owner", True), path)
+                if path != "bin/fleet-switchboard":   # the daemon file is not a held path by name (the matrix note): its class and decider are what is read above
+                    self.assertEqual(report["owner_decision"], "hold", path)
+                if report["owner_decision"] == "hold":
+                    what, labels = sb.impact_plan(self.engine_cached, report, [], sb.read_impact_state(self.world.state)[0], {}, None)
+                    self.assertIn(what, ("add", "held"), path)
+
+    def test_s32_a_forged_digest_and_text_that_match_each_other_but_not_the_floors_are_refused(self):
+        report = self.real_floor("cloud/launcher/token_mint.py")
+        forged = "IMPACT BRIEF forged\nRECOMMENDED DECIDER: Chief of Staff\n"
+        with mock.patch.object(sb, "floor_brief", REAL_FLOOR_BRIEF):
+            code, out, err = self.under(brief={"digest": hashlib.sha256(forged.encode()).hexdigest(), "text": forged})
+        self.assertEqual(code, 2, err)
+        self.assertIn("differs", err)
+        self.assertEqual(self.events("gate.hold_cleared"), [])
+        self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [])
+
     def test_s4_the_clear_and_hold_machinery_files_and_a_change_to_the_clear_closure_are_refused_other_bin_edits_pass(self):
         self.delegate()
         self.floor_pr(path="migrations/0002.sql")
@@ -41746,11 +41839,9 @@ class TestImpactHold(LedgerBase):
                 self.scored_pr(path)
                 self.rate(*self.cell_of("Low"), reason=" ".join(self.block()["floor"]["rules"]))
                 code, out, err = self.under()
-                if code == 2:   # #1215: refused for the read count or the rating floor; cleared only on the two independent runs the fixture records (S15)
-                    self.assertTrue("clear or hold machinery" in err or "below the floor" in err, err)
-                    self.assertEqual(self.deletes(), [])
-                else:
-                    self.assertEqual((code, len(self.twin_runs or [])), (0, 2), err)
+                self.assertEqual(code, 2, err)   # #1215: every machinery path is refused: by the owner-only class of the real path list (the brief's decider), the rating floor or the clear-code list
+                self.assertTrue("clear or hold machinery" in err or "below the floor" in err or "escalate to the owner" in err, err)
+                self.assertEqual(self.deletes(), [])
                 self.ledger_reset()
 
     def test_s15_s16_a_delegated_clear_shows_score_threshold_head_and_judgement_and_is_listed_and_a_refusal_is_not(self):
@@ -88297,7 +88388,7 @@ class TestNoPaneToJudge(StandInPids, Base):
 def _collect_brief_tests():
     sys.path.insert(0, str(REPO))   # `tests.*` and the bin modules they import
     sys.path.insert(0, str(BIN))
-    for name in ("test_substance_decider", "test_brief_clear", "test_brief_advisory", "test_brief_integration"):
+    for name in ("test_substance_decider", "test_brief_clear", "test_brief_advisory", "test_brief_integration", "test_brief_fix"):
         spec = importlib.util.spec_from_file_location("brief_" + name, REPO / "tests" / (name + ".py"))
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)

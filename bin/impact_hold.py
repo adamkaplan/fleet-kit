@@ -1205,8 +1205,10 @@ def substance_decision(report, floor):
     """(decider, why) of `delegated_clear.decide_on_substance` over the real brief, the changed paths' classes (`impact_brief.classify`) and the matrix's `substance_decider` block."""
     module, briefs = load_module("delegated_clear"), load_module("impact_brief")
     hits = report.get("top_tier_hits") or {}
-    classes = {p: briefs.classify(p, hits) for p in report.get("changed_paths") or []}
-    return module.decide_on_substance(floor, classes, module.substance_rule(impact_floor.load_matrix()))
+    rule = module.substance_rule(impact_floor.load_matrix())
+    owner_paths = (rule or {}).get("owner_only_paths") or {}
+    classes = {p: briefs.classify(p, hits, owner_paths) for p in report.get("changed_paths") or []}
+    return module.decide_on_substance(floor, classes, rule)
 
 
 def clear_who(engine, runner, repo, number, report=None):

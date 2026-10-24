@@ -51,7 +51,8 @@ class BriefTests(unittest.TestCase):
 
     def test_s4_unreadable_pieces_not_shown(self):
         for key in ("ci", "reads", "files", "mutants", "blast", "rating"):
-            b = self.m.build_brief(facts(**{key: None}))
+            soft = key in ("mutants", "blast", "rating")   # a change of tests only is not blocked by these three (they still print "not shown"); a change of code is
+            b = self.m.build_brief(facts("bin/x.py", "code", **{key: None}) if soft else facts(**{key: None}))
             self.assertEqual(b["decider"], "owner", key)
             self.assertIn("not shown", b["text"], key)
         b = self.m.build_brief(facts(ci=None))
@@ -65,7 +66,7 @@ class BriefTests(unittest.TestCase):
     def test_s5_body_claim_ignored(self):
         b = self.m.build_brief(facts("bin/cred.py", "credentials", body_claim="tests only"))
         self.assertEqual(b["decider"], "owner")
-        self.assertIn("CAN DO: bin/cred.py", b["text"])
+        self.assertIn('CAN DO: "bin/cred.py"', b["text"])
         self.assertNotIn("tests only", b["text"])
         self.assertEqual(self.m.build_brief(facts(body_claim="credentials"))["decider"], "chief_of_staff")
 
@@ -91,17 +92,22 @@ class BriefTests(unittest.TestCase):
         self.assertEqual((a["decider"], b["decider"]), ("chief_of_staff", "owner"))
 
     def test_deletion_only_on_sensitive_path_is_tightening(self):
+        # PC-9(a): removing a refusal IS the loosening: a deletion-only change to a sensitive path is material, the owner's
         f = facts("bin/cred.py", "credentials")
         f["files"][0].update(additions=0, deletions=5)
         b = self.m.build_brief(f)
-        self.assertEqual((b["decider"], b["material"]), ("chief_of_staff", []))
+        self.assertEqual((b["decider"], b["material"]), ("owner", ["credentials_widened"]))
+        f["files"][0].update(additions=0, deletions=0)   # a change that adds and removes nothing (a mode change) is still tightening only
+        self.assertEqual(self.m.build_brief(f)["decider"], "chief_of_staff")
 
     def test_owner_only_class(self):
-        self.assertEqual(self.m.build_brief(facts("bin/shim", "merge_shim"))["decider"], "owner")
+        f = facts("bin/shim", "merge_shim")
+        f["files"][0].update(additions=0, deletions=0)   # nothing added or removed: only the class makes it the owner's
+        self.assertEqual(self.m.build_brief(f)["decider"], "owner")
 
     def test_floor_decision_report_unchanged_shape(self):
         b = self.m.build_brief(facts())
-        self.assertEqual(sorted(b), ["decider", "digest", "head", "loosening", "material", "pieces", "text", "why"])
+        self.assertEqual(sorted(b), ["blocking_gaps", "decider", "digest", "head", "loosening", "material", "pieces", "text", "why"])
         self.assertEqual(tuple(b["pieces"]), self.m.PIECE_NAMES)
         self.assertEqual(len(b["digest"]), 64)
 
@@ -168,7 +174,7 @@ class MutantTests(unittest.TestCase):
         self.fails('text = "\\n".join(_cut(l) for l in lines[:MAX_LINES]) + "\\n"', 'text = "\\n".join(lines) + "\\n"', "test_s26_deterministic_one_screen")
 
     def test_additions_ignored(self):
-        self.fails('f["additions"] is None or f["additions"] > 0 or', "False and", "test_s3_credentials_owner")
+        self.fails('cls in CLASS_RISK and (f["additions"] is None or', 'cls in CLASS_RISK and False and (f["additions"] is None or', "test_s3_credentials_owner")
 
     def test_owner_only_ignored(self):
         self.fails("            if cls in OWNER_ONLY_CLASSES:", "            if False:", "test_owner_only_class")

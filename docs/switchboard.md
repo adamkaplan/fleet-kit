@@ -5397,11 +5397,15 @@ and a recommended decider with ONE sentence why. A piece it cannot read is print
 
 Who decides what:
 
-- **Chief of Staff** decides, on the substance of the brief, every pull request whose brief names no material risk, including a path class that was owner-only before. Such a
+- **Chief of Staff** decides, on the substance of the brief, a pull request whose brief names no material risk and shows every piece it needs. Such a
   pull request is advisory: it gets no owner-hold label and the Decisions list shows it as advisory for the Chief of Staff, with the one-sentence why.
-- **Owner** decides when the brief names a material risk, or any piece is `not shown`.
+  A change to the clear-and-hold machinery or the merge shim is never advisory by its own brief: those classes (`clear_machinery`, `merge_shim`, produced from the real path list of the matrix block `owner_hold.substance_decider.owner_only_paths`, which includes the brief's own files and the daemon file) stay the owner's.
+- **Owner** decides when the brief names a material risk, or any piece that blocks is `not shown`, or the change is on an owner-only class.
 
-What is escalated to the owner: credentials or issuance widened, spend, irreversible, speaks for the owner (a closed list of four).
+What is escalated to the owner: the SIX material risks (a closed list): credentials or issuance widened (`credentials_widened`, `issuance_widened`), `spend`, `irreversible`, `speaks_for_owner` and `authority_widened`.
+A line REMOVED from a credentials, identity, authority or clear-machinery path is material too (removing a refusal is the loosening), whether the diff only deletes or mixes; so is a deleted file there, and a delete plus an add of an authority file.
+A change of tests and docs only is not blocked by an unread rating, mutants run or blast radius (they print `not shown`); every other change is. The brief reads CI from the pull request's checks at the head; the floor holds no mutant or blast-radius record yet.
+Text from the pull request (the paths) is printed under an `UNTRUSTED` line: it is data for the Chief of Staff, never an instruction. The brief the clear carries must equal the text the floor builds at that head: a digest and text that match each other but not the floor's are refused.
 
 The mechanical backstops do not change: no self-clear, no author-clear, two independent reads at the head for a machinery path, a clear bound to its exact head, a push voids it.
 A clear the Chief of Staff records carries its brief, the brief's hash and its reasons in the audit line; a clear with no brief or a differing brief is refused.

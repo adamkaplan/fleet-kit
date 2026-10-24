@@ -69,7 +69,7 @@ class TestRealBriefToDecider(unittest.TestCase):
 
     def test_s6_an_owner_only_class_today_with_no_widening_is_cleared_on_the_substance(self):
         f = facts("cloud/launcher/token_mint.py", "credentials")
-        f["files"][0].update(additions=0, deletions=5)   # the diff only removes: nothing widened
+        f["files"][0].update(additions=0, deletions=0)   # the diff adds and removes no line (PC-9: a deletion is material): nothing widened
         b = ib.build_brief(f)
         self.assertEqual(b["decider"], "chief_of_staff", b["text"])
         self.assertTrue(dc.refusals(RULE, {"owner_decision": "hold", "complete": True, "top_tier_hits": {"credentials": ["cloud/launcher/token_mint.py"]}, "changed_paths": ["cloud/launcher/token_mint.py"], "head": HEAD}, [], lambda p, g: p in g, {}, None))
@@ -111,7 +111,7 @@ class TestRealBriefToDecider(unittest.TestCase):
         report = {"top_tier_hits": {}, "head": HEAD, "base": "main", "complete": True, "reads": [], "rating": None}
         b = ib.build_brief(ib.facts_from_report([{"path": "tests/x.py", "additions": 1, "deletions": 0, "changeType": "MODIFIED"}], report))
         self.assertEqual(b["head"], HEAD)
-        self.assertEqual(b["decider"], "owner")   # CI, mutants and blast radius are not read from the records yet: not shown, so the owner
+        self.assertEqual(b["decider"], "owner")   # no CI result in this report: not shown, so the owner (the real floor with a CI result is tested in tests.test_brief_real_floor)
 
 
 class TestTablesDerivedFromTheCode(unittest.TestCase):
