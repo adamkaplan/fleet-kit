@@ -110,9 +110,6 @@
       "gh api*/pulls/*/comments": "allow",
       "gh api*/pulls/*/comments *": "allow",
       "gh api*/pulls/*/comments?*": "allow",
-      "gh api*PATCH*": "deny",
-      "gh api*PUT*": "deny",
-      "gh api*DELETE*": "deny",
       "gh api*POST*": "deny",
       "gh api*-X post*": "deny",
       "gh api*--method post*": "deny",
@@ -142,7 +139,10 @@
       "gh pr edit*--body-file* --*": "deny",
       "gh pr edit*--* --body-file*": "deny",
       "gh pr edit*://*": "deny",
-      "gh pr edit*--repo*": "deny"
+      "gh pr edit*--repo*": "deny",
+      "gh api*PATCH*": "deny",
+      "gh api*PUT*": "deny",
+      "gh api*DELETE*": "deny"
     }
   },
   "agent": {
@@ -258,9 +258,6 @@
           "gh api*/pulls/*/comments": "allow",
           "gh api*/pulls/*/comments *": "allow",
           "gh api*/pulls/*/comments?*": "allow",
-          "gh api*PATCH*": "deny",
-          "gh api*PUT*": "deny",
-          "gh api*DELETE*": "deny",
           "gh api*POST*": "deny",
           "gh api*-X post*": "deny",
           "gh api*--method post*": "deny",
@@ -290,7 +287,10 @@
           "gh pr edit*--body-file* --*": "deny",
           "gh pr edit*--* --body-file*": "deny",
           "gh pr edit*://*": "deny",
-          "gh pr edit*--repo*": "deny"
+          "gh pr edit*--repo*": "deny",
+          "gh api*PATCH*": "deny",
+          "gh api*PUT*": "deny",
+          "gh api*DELETE*": "deny"
         }
       }
     }

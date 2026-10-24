@@ -275,9 +275,8 @@ pr_edit_check() {   # ask 1200: the words after `pr edit`: only `N --body-file F
   done
   { [ $# -eq 3 ] && [ "$2" = --body-file ]; } || refuse "pr-edit-other-option"
   case "$1" in ""|*[!0-9]*) refuse "pr-edit-other-option" ;; esac
-  if [ -n "${CW_PR_RECORD:-}" ] && [ -s "$CW_PR_RECORD" ]; then
-    grep -qx -- "$1" "$CW_PR_RECORD" || refuse "pr-edit-other-number"
-  fi
+  { [ -n "${CW_PR_RECORD:-}" ] && [ -s "$CW_PR_RECORD" ]; } || refuse "pr-edit-no-record"   # fail closed: no record, no edit
+  grep -qx -- "$1" "$CW_PR_RECORD" || refuse "pr-edit-other-number"
   return 0
 }
 
