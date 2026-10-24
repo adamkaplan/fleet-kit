@@ -103,3 +103,4 @@ Link it in every brief (`PLAN: <link>`). The worker proves each scenario with `f
 open. The order does not matter (a `ci` verdict recorded before your `prove` counts once the proof exists at the same head, and
 the daemon records `ci` verdicts itself within minutes of green checks): a coder's only extra step is `prove`. A push voids every proof and
 verdict. A hotfix may be waived by the Chief of Staff, logged; the plan is then due retroactively within a day.
+`CARRIES: #N`: see plan-template.

@@ -22226,9 +22226,61 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False):
             plan = checked_plan(config, source, args.ask, runner, now)
         except (PlanInputError, ValueError, ConfigError, IntentError) as err:
             plan_problem = _one_line(str(err), 200)
+    carries = carries_context(engine, config, repo, number, facts, body, entries, runner, now) if not writable else None
+    if carries:
+        facts["carries"] = carries
+        if isinstance(facts.get("floor"), dict):
+            facts["floor"] = floor_for_carries(facts["floor"], state, pr, carries["pr"])
     return types.SimpleNamespace(engine=engine, state=state, config=config, repo=repo, number=number, pr=pr, entries=entries,
                                  problem=problem, facts=facts, unreadable=unreadable, source=source, plan=plan,
                                  plan_problem=plan_problem)
+
+
+def floor_for_carries(floor, state, pr, dep_pr):
+    """(#1196) The floor fact of a carrying pull request: the head its clear was recorded at, and whether that clear names both pull requests."""
+    clear = (read_impact_state(state)[0].get("clears") or {}).get(pr) or {}
+    return dict(floor, clear_head=clear.get("head"), names_both=plan_ledger.clear_names_both(clear, pr, dep_pr))
+
+
+def carries_context(engine, config, repo, number, facts, body, entries, runner, now):
+    """(#1196) The picture of the dependency named by the body's standing `CARRIES: #N` line, or None (no line, or the dependency has merged: the pull request is then
+    read as an ordinary one). {"pr", "head", "plan", "refusal", "author", "notice_senders"}. The refusal is the reason in words (closed unmerged, or its head commit is not in this
+    branch: GitHub's compare says the dependency's head is not an ancestor of ours); an unreadable dependency is refused too."""
+    number_dep, problem = plan_ledger.carries_parse(body)
+    if problem:
+        return {"pr": "%s#?" % repo, "head": None, "plan": None, "refusal": problem, "author": None, "notice_senders": []}
+    if number_dep is None:
+        return None
+    dep_pr = "%s#%d" % (repo, number_dep)
+    out = {"pr": dep_pr, "head": None, "plan": None, "refusal": None, "author": None, "notice_senders": []}
+    if number_dep == number:
+        out["refusal"] = "%s cannot carry itself" % dep_pr
+        return out
+    try:
+        raw = read_pr_json(engine, repo, number_dep)
+        dep = pr_facts_from(raw)
+    except (NoticeError, AttributeError) as err:
+        out["refusal"] = "%s could not be read: %s" % (dep_pr, _one_line(str(err), 120))
+        return out
+    if str(raw.get("state")).upper() == "MERGED":
+        return None
+    dep_head = raw.get("headRefOid") if isinstance(raw.get("headRefOid"), str) else None
+    in_branch = False
+    if dep_head and facts and facts.get("head"):
+        try:
+            answer = impact_carry_get(engine, runner, repo)("repos/%s/compare/%s...%s" % (repo, dep_head, facts["head"]))
+            in_branch = isinstance(answer, dict) and answer.get("status") in ("ahead", "identical")
+        except Exception:
+            in_branch = False
+    out.update(head=dep_head, author=dep.get("author"), refusal=plan_ledger.carries_refusal(dep_pr, dep["state"], dep_head, in_branch))
+    dep_body = raw.get("body") if isinstance(raw.get("body"), str) else ""
+    source, _ = authoritative_plan(entries, dep_pr, dep_body)
+    if source:
+        try:
+            out["plan"] = checked_plan(config, source, None, runner, now)
+        except (PlanInputError, ValueError, ConfigError, IntentError):
+            out["plan"] = None
+    return out
 
 
 def _plan_usable(ctx):
@@ -22570,6 +22622,7 @@ def cmd_gates(args, runner, now):
                                         now=now())
     report["plan_problem"] = ctx.plan_problem
     report["pr_unreadable"] = ctx.unreadable
+    carry_refused = (ctx.facts.get("carries") or {}).get("refusal")
     report["impact_rating"] = gate_impact_rating(ctx.state, ctx.pr, ctx.facts.get("head"))   # #892: output text only; no gate reads it
     gates_carried_note(report, ctx)
     plan_ledger.enforced_view(report, enforced_gates_of(ctx))
@@ -22598,6 +22651,9 @@ def cmd_gates(args, runner, now):
         if report.get("plan_changed"):
             lines.append("PLAN CHANGED: %s" % report["plan_changed"])
         print("\n".join(lines))
+    if carry_refused:   # (#1196) a CARRIES line that cannot stand cannot be read as a judgment: exit 2 with the reason
+        print("CARRIES refused: %s" % carry_refused, file=sys.stderr)
+        return EXIT_USAGE
     ok = report["ready"] if getattr(args, "all_gates", False) else report["ready_enforced"]   # --all: the full board
     return EXIT_OK if ok else EXIT_ERROR
 
