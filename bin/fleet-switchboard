@@ -22195,18 +22195,6 @@ def _ledger_pr(args):
     return repo, number, "%s#%d" % (repo, number)
 
 
-def merge_ref_checks_fact(config, runner, repo, number, facts):
-    """The legs of the newest run at the head (the gate pass's merge-ref run), read only when the rollup lacks a green macOS leg; None when there is none or it cannot be read."""
-    mac = plan_ledger._macos_plan()
-    if not mac._bad(mac._by_name(facts.get("checks")), mac.MACOS):
-        return None
-    try:
-        gate, reading = load_module("merge_gate"), load_module("pr_reading")
-        return gate.read_merge_ref_checks(reading, merge_gate_gh(config, runner, repo), repo, number, facts["head"])
-    except Exception:   # best effort: no reading is "no gate-pass run", which G4 refuses
-        return None
-
-
 def _ledger_context(args, runner, now, writable, parts=None, floor=False):
     """Everything `prove`, `verdict` and `gates` share: the engine, state, PR ref, its picture and its checked plan. `parts` is
     (engine, state, config) when the caller already has them (the daemon's pass); else the engine is built."""
@@ -22220,8 +22208,6 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False):
             _gates_audit(engine, "plan.item.refused", pr, {"item": pr, "why": why, "stage": "pull request command"})
             raise LedgerCommandError("refused: %s" % why)
     facts = dict(facts or {}, body=body, notice_senders=senders, held_check=lambda: held_defects(body))
-    if facts.get("head") and plan_ledger._macos_plan().has_legs([c.get("name") for c in facts.get("checks") or [] if isinstance(c, dict)]):
-        facts["merge_ref_checks"] = merge_ref_checks_fact(config, runner, repo, number, facts)   # #1235: the gate pass's run on the merge ref, for G4
     if floor and facts.get("head"):
         facts["floor"] = gate_floor_fact(engine, state, repo, number, facts["head"])
     source = plan_source_for(args.plan, entries, pr, body, config.get("intent_repo"))

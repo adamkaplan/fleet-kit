@@ -249,15 +249,6 @@ def may_record_verdict(evaluator, caller, allowed, authors):
 
 # ----------------------------------------------------------------------------------- waivers
 
-def _macos_plan():
-    """bin/macos_plan.py, loaded by path from beside this file (the legs reading of gate G4, #1235)."""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("macos_plan", str(Path(__file__).resolve().parent / "macos_plan.py"))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 WAIVABLE = ("G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5", "MG")   # G0 to G5: what the chief of staff may waive for a hotfix; MG: the merge gate (#962), at the PR's head
 NEVER_WAIVABLE = {"G6": "the owner's hold on a held PR", "G7": "the epic integration", "G8": "production"}
 WAIVER_REASON_MIN = 20
@@ -454,15 +445,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
                     row["detail"] += "; epic-claimed, proven after the merge at the integration head: %s" % ", ".join(epic)
         elif gid == "G4":
             ci = (facts or {}).get("ci")
-            checks = (facts or {}).get("checks") or []
-            # #1235: when the test workflow's legs are in the facts, G4 reads the ubuntu legs at the head and the macOS legs at the head or on the gate pass's merge-ref run
-            legs = _macos_plan().legs_reading(checks, (facts or {}).get("merge_ref_checks")) if _macos_plan().has_legs([c.get("name") for c in checks if isinstance(c, dict)]) else None
-            if ci in ("green", "passing") and legs is not None:
-                if legs[0]:
-                    row.update(status="ok", detail="CI %s at %s: %s" % (ci, (head or "?")[:8], legs[2]))
-                else:
-                    row.update(status="missing", missing=["CI: " + legs[2]])
-            elif ci in ("green", "passing"):
+            if ci in ("green", "passing"):
                 row.update(status="ok", detail="CI %s at %s" % (ci, (head or "?")[:8]))
             elif (facts or {}).get("draft") is True and ci == "none":   # #770: a draft whose workflow skips drafts has no run at all, and "CI is failing" sends the author the wrong way; a draft WITH runs keeps the failing line
                 row.update(status="missing", missing=["draft: no CI run seen; this repo's workflow may skip drafts; mark ready, then wait"])

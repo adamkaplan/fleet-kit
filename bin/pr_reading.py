@@ -102,15 +102,6 @@ def read_pr_runs(gh, repo, number, head):
     return out
 
 
-def read_run_legs(gh, repo, run_id):
-    """[{"name", "conclusion"}] of the jobs of one run (the latest attempt), as lower-case words; a skipped job is `skipped`, never green. Raises ReadError."""
-    data = _json(gh, ["api", "repos/%s/actions/runs/%s/jobs?filter=latest&per_page=100" % (repo, run_id)], "the jobs of run %s" % run_id)
-    jobs = data.get("jobs") if isinstance(data, dict) else None
-    if not isinstance(jobs, list):
-        raise ReadError("the jobs of run %s answered no job list" % run_id)
-    return [{"name": str(j.get("name")), "conclusion": str(j.get("conclusion") or j.get("status") or "").lower()} for j in jobs if isinstance(j, dict)]
-
-
 def run_result(run):
     """`green`, `red` or `pending` for one run: only a completed run with a green conclusion is green; anything unknown is red or pending, never green."""
     if run.get("status") != "completed":
