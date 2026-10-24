@@ -645,7 +645,7 @@ INERT = {
     "user.email": ("t@invalid", "a plain string written into commits"),
     "remote.origin.url": (URL, "the one URL key: compared to CW_REPO, and never used (the hook pushes to its own explicit URL)"),
     "remote.origin.pushurl": (URL, "the other URL key: compared to CW_REPO, and never used"),
-    "remote.origin.fetch": ("+refs/heads/*:refs/remotes/origin/*", "a refspec: any value is harmless, the hook's fetch is explicit"),
+    "remote.origin.fetch": ("+refs/heads/*:refs/remotes/origin/*", "a refspec: ANY value is harmless, the hook's fetch names its own refspec and URL"),
     "init.defaultbranch": ("main", "a branch name used only by git init"),
     "receive.denycurrentbranch": ("refuse", "a policy word read by a receiving repository, never by the hook"),
 }
@@ -778,6 +778,14 @@ class EarlyReturns(Base):
         p = self.run_main(CW_WORKDIR=work)
         self.one_line(p, ".git is a file: a linked worktree or a separate git directory is not supported); work left in %s" % work)
         self.assertNotIn("w.txt", p.stdout)   # git is never asked in such a directory
+
+    def test_a_repository_name_starting_with_a_symbol_is_refused(self):
+        self.dirty()
+        for bad in ("-o/r", "o/-r", ".o/r", "o/.r", "_o/r", "o/_r"):
+            with self.subTest(repo=bad):
+                self.one_line(self.run_main(CW_REPO=bad), "repository name")
+        self.assertTrue(cw_end_hook.REPO_RE.match("acme-org/widget-service"))
+        self.assertTrue(cw_end_hook.REPO_RE.match("0rg/9.x_y-z"))
 
     def test_a_push_failure_prints_one_line_with_the_names(self):
         self.dirty()
