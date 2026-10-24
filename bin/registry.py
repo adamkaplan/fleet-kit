@@ -407,6 +407,19 @@ def endpoint_problem(fields):
     return None
 
 
+NO_PANE_KINDS = ("cloud", "orchestrator")
+
+
+def no_pane_to_judge(row):
+    """THE predicate (#1181): this row has no pane to judge. A row of kind `cloud` or `orchestrator` (with or without an endpoint), or a row that holds an
+    endpoint and no pane. Every supervising reader of the dead verdict or the missing count asks it; none reads such a row as dead (PC-1)."""
+    if not isinstance(row, dict):
+        return False
+    if row.get("kind") in NO_PANE_KINDS:
+        return True
+    return row.get("endpoint") is not None and not row.get("pane")
+
+
 def route_for(row):
     """Where a message to this agent WOULD go (a function only: send does not call it yet): its pane when it has one (as before), else its registry endpoint; None when neither."""
     if not isinstance(row, dict):
@@ -462,23 +475,36 @@ def duplicate_charters(agents, repos=None):
     return {key: sorted(names) for key, names in found.items() if len(names) > 1}
 
 
-def set_charter(state_dir, name, charter, by, now=None):
+def set_charter(state_dir, name, charter, by, now=None, check=None):
     """Write an orchestrator's registry charter (an issue number, or None to clear it): the ONLY command-side writer of the field. One audit event with the old and the new value and who ran it.
     Refused (nothing written, a problem line) for an agent not in the registry, one retired, or one that is not an orchestrator, and for a value that is not an issue number or None."""
+    refused = []
+    def reject(why, text):
+        refused.append((why, text))
+        return False, [], text
     def change(doc):
         row = doc["agents"].get(name)
-        if not isinstance(row, dict) or name in doc["retired"]:
-            return False, [], "%s is not a registered agent" % name
+        if not isinstance(row, dict):
+            return reject("absent", "%s is not a registered agent" % name)
+        if name in doc["retired"]:
+            return reject("retired", "%s is retired" % name)
         if row.get("role") != ORCHESTRATOR:
-            return False, [], "%s is not an orchestrator" % name
+            return reject("not an orchestrator", "%s is not an orchestrator" % name)
         if charter is not None and not is_charter(charter):
-            return False, [], "a charter is an issue number or none"
+            return reject("value", "a charter is an issue number or none")
+        if check is not None:
+            verdict = check(doc, row)   # #1143: the caller's guard, judged on THIS locked read, so check and write are one step
+            if verdict:
+                return reject(*verdict)
         old = row.get("charter")
         if old == charter:
             return False, [], None
         row["charter"] = charter
         return True, [{"event": "charter", "name": name, "old": old, "new": charter, "by": by}], None
-    return _mutate(state_dir, change, now)
+    got = _mutate(state_dir, change, now)
+    if refused:
+        got = dict(got, why=refused[0][0])
+    return got
 
 
 def bell_of(agent):
