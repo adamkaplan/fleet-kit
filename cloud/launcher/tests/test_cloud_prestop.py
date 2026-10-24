@@ -32,8 +32,23 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.t = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.t, True)
-        self.origin, self.work, self.bin = (os.path.join(self.t, n) for n in ("origin.git", "repo", "bin"))
+        # the fake remote lives where the host constant's test value points: <t>/<owner>/<name>.git (see seam())
+        self.origin, self.work, self.bin = (os.path.join(self.t, n) for n in (REPO + ".git", "repo", "bin"))
+        self.evil = os.path.join(self.t, "other-remote", REPO + ".git")   # a second remote the agent would like the push to land in
         os.makedirs(self.bin)
+        os.makedirs(os.path.dirname(self.origin))
+        os.makedirs(os.path.dirname(self.evil))
+        self.helper_dir = os.path.join(self.t, "helper")
+        self.helper = os.path.join(self.helper_dir, "git-credential-cw")
+        os.makedirs(self.helper_dir)
+        # a fake pod helper that records every call; the password is a fake assembled here
+        open(self.helper, "w").write("#!/bin/sh\ncat >> %s/helper.log\necho \"$1\" >> %s/helper.log\nprintf 'username=x\\npassword=%s\\n'\n"
+                                     % (self.t, self.t, "pw-" + "fake"))
+        os.chmod(self.helper, 0o755)
+        self.opts = " ".join(cw_end_hook.safe_opts(self.helper))
+        self.push_url = "file://%s/%s.git" % (self.t, REPO)
+        self.refspec = "--no-verify %s HEAD:refs/heads/w1/wip" % self.push_url
+        sh("git", "init", "-q", "--bare", "-b", "main", self.evil)
         sh("git", "init", "-q", "--bare", "-b", "main", self.origin)
         sh("git", "clone", "-q", self.origin, self.work)
         for k, v in (("user.name", "t"), ("user.email", "t@invalid")):
@@ -43,11 +58,9 @@ class Base(unittest.TestCase):
         sh("git", "-C", self.work, "commit", "-qm", "base")
         sh("git", "-C", self.work, "push", "-q", "origin", "HEAD:main")
         # the hook is installed under the names the image gives it
-        # the fake remote: origin is named like the pod's repository and the (global) git configuration maps that github URL to the local bare repo
+        # origin is named like the pod's repository; the hook never uses it (it pushes to the explicit address, which the seam points at the bare repo)
         sh("git", "-C", self.work, "remote", "set-url", "origin", URL)
-        self.gitconfig = os.path.join(self.t, ".gitconfig")
-        open(self.gitconfig, "w").write('[url "%s"]\n\tinsteadOf = %s\n' % (self.origin, URL))
-        shutil.copy(HOOK, os.path.join(self.bin, "cw-end-hook"))
+        shutil.copy(self.seam(HOOK), os.path.join(self.bin, "cw-end-hook"))
         self.out = os.path.join(self.t, "out")
         # macOS has no GNU timeout: a small stand-in at the front of PATH ('timeout [-k N] SECONDS cmd args' runs cmd args).
         # CW_TEST_FAKE_TIMEOUT=1 forces the stand-in even where GNU timeout exists.
@@ -57,9 +70,21 @@ class Base(unittest.TestCase):
             open(fake, "w").write('#!/bin/sh\nif [ "$1" = -k ]; then shift 2; fi\nshift\nexec "$@"\n')
             os.chmod(fake, 0o755)
 
+    def seam(self, hook, helper_dir=None):
+        """TEST-ONLY SEAM (documented once, here): a launcher script that imports the hook module from `hook` and patches its host constant
+        to a file:// prefix and its helper directory to the fake one. The real hook reads neither from the environment, so the agent cannot."""
+        n = len([f for f in os.listdir(self.t) if f.startswith("seam-")])
+        path = os.path.join(self.t, "seam-%d.py" % n)
+        open(path, "w").write(
+            "#!%s\nimport importlib.util, importlib.machinery, sys\nsp = importlib.util.spec_from_loader('end_hook_under_test', importlib.machinery.SourceFileLoader('end_hook_under_test', %r))\n"
+            "m = importlib.util.module_from_spec(sp)\nsp.loader.exec_module(m)\nm.HOST_URL = %r\nm.HELPER_DIR = %r\nsys.exit(m.main())\n"
+            % (sys.executable, hook, "file://%s/" % self.t, helper_dir or self.helper_dir))
+        os.chmod(path, 0o755)
+        return path
+
     def env(self, **kw):
         e = dict(os.environ, PATH=self.bin + ":/usr/bin:/bin", CW_WORKER="w1", CW_WORKDIR=self.work,
-                 CW_REPO=REPO, HOME=self.t, GIT_CONFIG_GLOBAL=self.gitconfig, CW_PRESTOP_OUT=self.out)
+                 CW_REPO=REPO, HOME=self.t, CW_PRESTOP_OUT=self.out)
         e.update(kw)
         return e
 
@@ -92,8 +117,7 @@ class Hook(Base):
         self.assertNotIn(".env", sh("git", "-C", self.origin, "ls-tree", "-r", "--name-only", "w1/wip"))
         pushes = [l for l in open(os.path.join(self.t, "calls")) if " push " in " " + l]
         self.assertEqual(len(pushes), 1)
-        for bad in ("force", "lease", "+", " -f"):
-            self.assertNotIn(bad.replace("+", "+r"), pushes[0].replace("+refs", "+r").replace("--no-verify", ""))
+        self.assertEqual(pushes[0].strip(), "-C %s %s push %s" % (self.work, self.opts, self.refspec))   # exact: no force, no lease, no other refspec
 
     def test_clean_tree_or_no_repository_does_nothing(self):
         self.fake_git('echo "$@" >> %s/calls\nexec REAL "$@"\n' % self.t)
@@ -147,10 +171,6 @@ class Hook(Base):
         self.assertNotIn("ermission", p.stdout + p.stderr)
 
 
-REFSPEC = "--no-verify %s HEAD:refs/heads/w1/wip" % URL
-OPTS = " ".join(cw_end_hook.SAFE_OPTS)
-
-
 def mutant_hook(dst, how):
     """A copy of the hook that takes the branch from an argument or an environment variable and does not validate."""
     s = open(HOOK).read()
@@ -175,7 +195,7 @@ class Refspec(Base):
         return [l.strip() for l in open(self.calls) if " push " in " " + l]
 
     def run_hook(self, hook, args=(), **kw):
-        return subprocess.run([sys.executable, hook, "--prestop", *args], env=self.env(**kw), capture_output=True, text=True, timeout=30)
+        return subprocess.run([self.seam(hook), "--prestop", *args], env=self.env(**kw), capture_output=True, text=True, timeout=30)
 
     def attacks(self, hook):
         """Every attempt names another branch; whatever is pushed must be exactly the pod's own."""
@@ -188,7 +208,7 @@ class Refspec(Base):
             self.run_hook(hook, args, **kw)
             pushed = self.pushes()
             self.assertEqual(len(pushed), 1, (args, kw, pushed))
-            self.assertEqual(pushed[0], "-C %s %s push %s" % (self.work, OPTS, REFSPEC), (args, kw))
+            self.assertEqual(pushed[0], "-C %s %s push %s" % (self.work, self.opts, self.refspec), (args, kw))
             self.assertEqual(sh("git", "-C", self.origin, "for-each-ref", "--format=%(refname)"), "refs/heads/main\nrefs/heads/w1/wip")
             sh("git", "-C", self.origin, "update-ref", "-d", "refs/heads/w1/wip")
             sh("git", "-C", self.work, "reset", "-q", "--hard", "origin/main")
@@ -215,7 +235,7 @@ class Refspec(Base):
         self.dirty()
         p = self.hook(CW_WIP_NAME="other/wip", CW_BRANCH="main")
         self.assertEqual(p.returncode, 0)
-        self.assertEqual(self.pushes(), ["-C %s %s push %s" % (self.work, OPTS, REFSPEC)])
+        self.assertEqual(self.pushes(), ["-C %s %s push %s" % (self.work, self.opts, self.refspec)])
 
     def test_a_mutant_taking_the_branch_from_an_argument_or_variable_fails_these_tests(self):
         for how in ("arg", "env"):
@@ -254,10 +274,10 @@ class Hostile(Base):
         hooks = os.path.join(self.work, ".git", "hooks")
         for h in ("pre-commit", "pre-push", "post-commit", "commit-msg", "reference-transaction"):
             shutil.copy(script, os.path.join(hooks, h))
-        for k, v in (("core.sshCommand", script), ("core.fsmonitor", script), ("diff.evil.textconv", script),
-                     ("remote.origin.pushurl", "https://github.com/other-org/elsewhere.git"),
-                     ("url.https://github.com/other-org/.insteadOf", "https://github.com/acme-org/")):
-            sh("git", "-C", self.work, "config", k, v)
+        # hostile CONFIGURATION keys are refused outright now (see HostileConfig); this class keeps the hostile hooks and attributes files
+        self.hostile_keys = (("core.sshCommand", script), ("core.fsmonitor", script), ("diff.evil.textconv", script),
+                             ("remote.origin.pushurl", "https://github.com/other-org/elsewhere.git"),
+                             ("url.https://github.com/other-org/.insteadOf", "https://github.com/acme-org/"))
         for f in ("marker", "calls"):
             if os.path.exists(os.path.join(self.t, f)):
                 os.remove(os.path.join(self.t, f))
@@ -267,7 +287,7 @@ class Hostile(Base):
         return [l.strip() for l in open(self.calls) if " push " in " " + l] if os.path.exists(self.calls) else []
 
     def run_hook(self, hook):
-        return subprocess.run([sys.executable, hook, "--prestop"], env=self.env(), capture_output=True, text=True, timeout=30)
+        return subprocess.run([self.seam(hook), "--prestop"], env=self.env(), capture_output=True, text=True, timeout=30)
 
     def good(self, hook):
         """Targets the explicit URL only, with every option present, and no agent command ran."""
@@ -275,26 +295,26 @@ class Hostile(Base):
         p = self.run_hook(hook)
         self.assertFalse(os.path.exists(self.marker), "an agent hook or command ran")
         pushes = self.pushes()
-        self.assertEqual(pushes, ["-C %s %s push %s" % (self.work, OPTS, REFSPEC)], p.stdout)
+        self.assertEqual(pushes, ["-C %s %s push %s" % (self.work, self.opts, self.refspec)], p.stdout)
         self.assertIn("-c core.hooksPath=/dev/null", pushes[0])
         self.assertNotIn("other-org", pushes[0])
 
     def test_hostile_repository_runs_nothing_and_pushes_to_the_explicit_url(self):
-        # origin itself is hostile-free here (same repository): the hostile part is hooks, commands, pushurl, insteadOf
-        sh("git", "-C", self.work, "config", "--unset-all", "url.https://github.com/other-org/.insteadOf")
+        # the hostile part left in the repository is its hooks and attributes (configuration keys are refused: next tests)
         self.good(HOOK)
         self.assertEqual(self.wip(), sh("git", "-C", self.work, "rev-parse", "HEAD"))
 
     def test_insteadof_in_the_repository_for_our_url_pushes_nothing(self):
+        for k, v in self.hostile_keys:
+            sh("git", "-C", self.work, "config", k, v)
         self.dirty()
         p = self.run_hook(HOOK)
         self.assertEqual(self.pushes(), [])
         self.assertEqual(self.wip(), "")
         self.assertFalse(os.path.exists(self.marker))
-        self.assertEqual(p.stdout.strip(), "cw-prestop: not pushed (origin points elsewhere); work left in %s" % self.work)
+        self.assertEqual(p.stdout.strip(), "cw-prestop: not pushed (the repository configuration is not a plain one: core.sshcommand); work left in %s" % self.work)
 
     def test_origin_pointing_elsewhere_pushes_nothing_and_prints_one_line(self):
-        sh("git", "-C", self.work, "config", "--unset-all", "url.https://github.com/other-org/.insteadOf")
         for url in ("https://github.com/other-org/elsewhere.git", "git@github.com:other-org/widget-service.git"):
             sh("git", "-C", self.work, "config", "remote.origin.url", url)
             self.dirty()
@@ -306,12 +326,11 @@ class Hostile(Base):
         self.good(HOOK)   # same repository after normalising case, scp form and .git
 
     def test_mutants_are_each_caught(self):
-        sh("git", "-C", self.work, "config", "--unset-all", "url.https://github.com/other-org/.insteadOf")
         base = sh("git", "-C", self.work, "rev-parse", "HEAD")
-        muts = {"hooksPath": ('"-c", "core.hooksPath=/dev/null", ', ""),
+        muts = {"hooksPath": ('"core.hooksPath=/dev/null", ', ""),
                 "no-verify": ('"--no-verify", url', "url"),
                 "pushurl": ('git(workdir, "push", "--no-verify", url,', 'git(workdir, "push", "--no-verify", "origin",'),
-                "origin-check": ("if cur and norm_repo(cur) != repo.lower():", "if False:")}
+                "origin-check": ('if key in ("remote.origin.url", "remote.origin.pushurl") and norm_repo(value) != repo.lower():', "if False:")}
         for name, (old, new) in muts.items():
             mut = os.path.join(self.t, "mut-" + name)
             mutate(mut, old, new)
