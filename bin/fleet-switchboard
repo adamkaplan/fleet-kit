@@ -28124,6 +28124,9 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
             args.text = list(args.text or []) + extra   # words after an option (`remind a 1h --issue 3 the text`): argparse lets an optional positional end early
         elif extra:
             parser.error("unrecognized arguments: %s" % " ".join(extra))
+        conflict = reaper_only_conflict(args)   # in the parser, before anything is written or loaded
+        if conflict:
+            parser.error(conflict)
     except SystemExit as exit_:
         return EXIT_USAGE if exit_.code not in (0, None) else EXIT_OK
     if getattr(args, "action", None) == "review" and (set(held) != set(RATING_PATH_FUNCTIONS) or any(globals().get(name) is not fn or fn.__code__ is not code for name, (fn, code) in held.items())):
@@ -28169,6 +28172,20 @@ SERVICE_UNIT = "fleet-kit-switchboard.service"
 REAPER_LABEL = "com.fleet-kit.cloud-reaper"
 REAPER_UNIT = "fleet-kit-cloud-reaper.service"
 REAPER_INTERVAL_SECONDS = 60   # seconds between the managed reaper's passes: never slower than the reaper's own floor (REAP_FLOOR_SECONDS in cloud_worker.py)
+REAPER_FILE_MODE = 0o600   # the reaper's service file is private: it holds names and paths only, but every other private file of the kit is 0600
+# The cloud launcher's own settings file and the keys its one table holds. When that file exists it is the ONLY source of
+# those settings, so the reaper's service must not carry them too: a key set differently in the file and in the service
+# environment makes every start of the reaper refuse. The launcher owns the table (cloud/launcher/cloud_worker.py); the
+# test in bin/test-switchboard holds the two lists equal.
+CLOUD_SETTINGS_FILE_NAME = "cloud.env"
+CLOUD_ENV_SETTING_NAMES = ("CW_ALLOWED_REPOS", "CW_TOOLING_REPO", "CW_CLOUD_IMAGE", "CW_CLOUD_SERVER", "CW_CLOUD_CA_FILE",
+                            "CW_PULL_SECRET", "CW_VAULT_SUBSCRIPTION", "CW_VAULT_NAME", "CW_CLOUD_NAMESPACE", "CW_KUBECTL",
+                            "CW_OPENCODE_BIN", "CW_RUN_RECORD_DIR", "CW_CLOUD_SPEND_CAP_USD", "CW_CLUSTER_TOKEN_CMD",
+                            "CW_CLUSTER_ADMIN_CMD", "CW_GIT_TOKEN_CMD", "CW_APP_ID_CMD", "CW_APP_INSTALLATION_CMD",
+                            "CW_APP_KEY_CMD", "CW_CLUSTER_ADMIN_SECRET", "CW_CLUSTER_TOKEN_DURATION", "CW_HUB_CHANNEL_URL",
+                            "CW_HUB_REGISTRY_SECRET", "CW_VAULT_CHECK_DIR")
+REAPER_CLUSTER_NAMES = ("CW_CLOUD_SERVER", "CW_CLOUD_NAMESPACE", "CW_CLOUD_TOKEN_FILE")   # the cluster login the reaper needs (the token file: the install's environment, else a default)
+REAPER_VAULT_NAMES = ("CW_VAULT_NAME", "CW_VAULT_SUBSCRIPTION")   # the vault names (CW_CLUSTER_ADMIN_SECRET has a default: optional)
 # The reaper's NON-SECRET settings the installer copies from its own environment into the service (names of a cluster or a
 # namespace, paths of files). A token is never among them: the reaper reads the token FILE by path.
 REAPER_SETTING_NAMES = ("CW_KUBE_CONTEXT", "CW_KUBECONFIG", "CW_KUBECTL", "CW_CLOUD_SERVER", "CW_CLOUD_TOKEN_FILE",
@@ -28576,30 +28593,51 @@ def check_writable_target(path):
         raise InstallError("%s can be written by its group or others (mode %o); fix it and run again" % (path, info.st_mode & 0o777))
 
 
-def write_if_changed(path, content):
+def set_file_mode(path, mode):
+    """The file's mode, set when it is not the one asked for. True when it changed it. The mode asked for is the
+    one to set: a private file never gets a wider one."""
+    try:
+        info = os.lstat(str(path))
+    except OSError:
+        return False
+    if stat.S_IMODE(info.st_mode) == mode:
+        return False
+    os.chmod(str(path), mode)
+    return True
+
+
+def write_if_changed(path, content, mode=None):
     """Write `content` unless the file already holds it. True when it wrote. The target is checked first
     (check_writable_target), and a write goes to a temporary file beside it and is renamed over it, so a file
-    that appears in between is replaced, never written through."""
+    that appears in between is replaced, never written through.
+
+    `mode` is the mode the file must have when it is written, and when it already holds the content (an identical
+    file is given the mode too). None keeps today's behaviour: the mode of the umask, and the mode of a file that
+    is replaced."""
     path = Path(path)
     check_writable_target(path)
     try:
         if path.read_text() == content:
+            if mode is not None:
+                set_file_mode(path, mode)
             return False
     except OSError:
         pass
     path.parent.mkdir(parents=True, exist_ok=True)
     mask = os.umask(0)
     os.umask(mask)
-    mode = (0o666 & ~mask) & ~0o022
+    file_mode = (0o666 & ~mask) & ~0o022
     try:
-        mode = stat.S_IMODE(os.lstat(str(path)).st_mode)   # a replaced file keeps its mode
+        file_mode = stat.S_IMODE(os.lstat(str(path)).st_mode)   # a replaced file keeps its mode
     except OSError:
         pass
+    if mode is not None:
+        file_mode = mode
     fd, temp = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w") as handle:
             handle.write(content)
-        os.chmod(temp, mode)
+        os.chmod(temp, file_mode)
         os.replace(temp, str(path))
     except BaseException:
         try:
@@ -29059,6 +29097,147 @@ def reaper_settings(env):
                 "name": "a short name", "server": "an https address with no user, query or fragment"}[kind]))
         found[name] = value
     return found
+
+
+def cloud_settings_path():
+    """Where the cloud launcher's own settings file is: the switchboard's own config directory, `cloud.env`."""
+    return config_path().parent / CLOUD_SETTINGS_FILE_NAME
+
+
+def reaper_service_settings(env, settings_file=None):
+    """The settings the reaper's service file carries: the environment's, minus the keys the cloud launcher's own
+    settings file holds when that file exists. The file is then the only source of those keys, and a key set
+    differently in the file and in the service environment makes every start of the reaper refuse; without the file
+    every setting is copied, as it always was."""
+    found = reaper_settings(env)
+    path = Path(settings_file) if settings_file is not None else cloud_settings_path()
+    if path.exists():
+        found = {name: value for name, value in found.items() if name not in CLOUD_ENV_SETTING_NAMES}
+    return found
+
+
+def launcher_module():
+    """The cloud launcher's own module (<kit>/cloud/launcher/cloud_worker.py), loaded by path under its own name so it
+    never meets bin/cloud_worker.py. The installer judges the settings file with the launcher's own reader."""
+    import importlib.util
+    path = KIT_ROOT / "cloud" / "launcher" / "cloud_worker.py"
+    spec = importlib.util.spec_from_file_location("fleet_kit_cloud_launcher", str(path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_launcher_module():
+    """(module, None), or (None, ONE named refusal) when the launcher's own module cannot be loaded (absent, unreadable, a
+    syntax error, an error on import). Only the class name of the error is shown, never its text."""
+    try:
+        return launcher_module(), None
+    except Exception as err:
+        return None, ("cloud reaper not installed: the launcher module cloud/launcher/cloud_worker.py could not be loaded (%s)"
+                      % type(err).__name__)
+
+
+def reaper_settings_problem(path=None, env=None):
+    """None when the reaper-only install may write its service, else ONE line saying what is wrong and what to do. The
+    rule is the launcher's own: this CALLS the launcher's reader (_read_settings_file, then parse_settings), so the
+    installer refuses exactly what a launch would refuse (a quoted value, an unknown line, a bad server, namespace, vault
+    name or subscription, a missing CW_ALLOWED_REPOS or CW_CLOUD_IMAGE, a hard link, a symlink, a directory, a file or a
+    parent directory others can write, a foreign owner). The reaper's own names (cluster login, vault names) are then
+    required on top. The launcher's refusal text names the file and the line, never a value."""
+    path = Path(path) if path is not None else cloud_settings_path()
+    shown = str(path)
+    home = str(Path.home())
+    if shown.startswith(home + os.sep):
+        shown = "~" + shown[len(home):]
+    head = "cloud reaper not installed: "
+    if not os.path.lexists(str(path)):
+        return head + "%s is missing: create it (mode 600) with the settings a launch needs" % shown
+    launcher, load_problem = load_launcher_module()
+    if load_problem:
+        return load_problem
+    try:
+        text = launcher._read_settings_file(str(path))
+        if text is None:
+            return head + "%s is missing: create it (mode 600) with the settings a launch needs" % shown
+        values = launcher.parse_settings(text, shown)
+    except launcher.CloudError as err:
+        said = " ".join(str(err).split()).replace(str(path), shown)
+        said = said[len("refused: "):] if said.startswith("refused: ") else said
+        return head + said.replace("; nothing was called", "") + ": fix it as a launch needs, then run again"
+    for name in REAPER_CLUSTER_NAMES + REAPER_VAULT_NAMES:
+        if name == "CW_CLOUD_TOKEN_FILE":   # not a key the launcher's file can hold: reaper_login_file() chooses it (the environment, else a default)
+            continue
+        elif name not in values:
+            return head + "%s is missing the name %s: add it to the file" % (shown, name)
+    return None
+
+
+def reaper_default_login_file():
+    """The reaper's default login file: ~/.local/state/fleet-switchboard/cloud-reaper-token under the real home. It does NOT
+    follow XDG_STATE_HOME (decision: the service and its tests pin this path); set CW_CLOUD_TOKEN_FILE to put it elsewhere."""
+    return Path(os.path.expanduser("~")) / ".local" / "state" / "fleet-switchboard" / "cloud-reaper-token"
+
+
+def login_file_stat(path):
+    """lstat of the login file (a seam for the tests): never follows a symlink."""
+    return os.lstat(str(path))
+
+
+def login_file_problem(path):
+    """None when `path` is absent or a plain file of the user's own with mode 0600 (no group or other access); else ONE
+    named line. Never reads the file."""
+    try:
+        info = login_file_stat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        return "cloud reaper not installed: %s cannot be examined (%s): remove it or set CW_CLOUD_TOKEN_FILE" % (path, type(err).__name__)
+    shown = str(path).replace(str(Path.home()), "~", 1) if str(path).startswith(str(Path.home()) + os.sep) else str(path)
+    if stat.S_ISLNK(info.st_mode):
+        why = "a symlink"
+    elif not stat.S_ISREG(info.st_mode):
+        why = "not a regular file"
+    elif info.st_uid != os.geteuid():
+        why = "not yours"
+    elif stat.S_IMODE(info.st_mode) & 0o077:
+        why = "accessible by others"
+    else:
+        return None
+    return "cloud reaper not installed: %s already exists and is %s: remove it or set CW_CLOUD_TOKEN_FILE" % (shown, why)
+
+
+def reaper_login_file(env):
+    """(path, is_default, problem). A set CW_CLOUD_TOKEN_FILE (the install's environment) must be absolute; when it is not
+    set the default applies. `problem` is a named one-line refusal or None. Never touches the disk except to look."""
+    value = (env.get("CW_CLOUD_TOKEN_FILE") or "").strip()
+    if value:
+        if not value.startswith("/"):
+            return None, False, "cloud reaper not installed: CW_CLOUD_TOKEN_FILE must be an absolute path (a relative one is refused): set it to a full path or leave it unset for the default"
+        return value, False, login_file_problem(value)
+    path = reaper_default_login_file()
+    try:
+        info = os.lstat(str(path.parent))
+    except FileNotFoundError:
+        return str(path), True, None
+    except OSError as err:
+        return None, True, "cloud reaper not installed: the login file's directory cannot be examined (%s)" % type(err).__name__
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        return None, True, ("cloud reaper not installed: the login file's directory %s must be your own plain directory with no group or other access (chmod 700 it)"
+                            % str(path.parent).replace(str(Path.home()), "~", 1))
+    return str(path), True, login_file_problem(path)
+
+
+def make_reaper_login_directory(path):
+    """The default login file's directory, mode 0700, made when missing (an existing one is never changed). The file is
+    made 0600 by the reaper when it first writes it."""
+    parent = Path(path).parent
+    missing = []
+    while not parent.exists() and parent != parent.parent:
+        missing.append(parent)
+        parent = parent.parent
+    for directory in reversed(missing):
+        os.mkdir(str(directory), 0o700)
+        os.chmod(str(directory), 0o700)
 
 
 def render_reaper(kind, values, settings, kit_root=KIT_ROOT):
@@ -29697,9 +29876,14 @@ class Installer:
         spec.loader.exec_module(walk)
         return walk.parents_problem(str(script)) or walk.entry_problem(os.lstat(str(script)), "the reaper program")
 
-    def reaper_text(self, config):
+    def reaper_text(self, config, table_from_file=False, login_file=None):
+        """The reaper's service file. `table_from_file` is the reaper-only install: the launcher's own settings file
+        is then the only source of the keys it holds, so the service carries none of them."""
+        settings = reaper_service_settings(os.environ) if table_from_file else reaper_settings(os.environ)
+        if login_file is not None:   # the default login file: the service environment only, never the owner's settings file
+            settings = dict(settings, CW_CLOUD_TOKEN_FILE=login_file)
         return render_reaper(self.kind, service_values(self.kit_root, service_path_dirs(self.kit_root, [shutil.which("python3")])),
-                             reaper_settings(os.environ), self.kit_root)
+                             settings, self.kit_root)
 
     def reaper_loaded(self):
         uid = os.getuid()
@@ -29719,8 +29903,8 @@ class Installer:
             return [["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), REAPER_LABEL)]]
         return [["systemctl", "--user", "disable", "--now", REAPER_UNIT]]
 
-    def step_reaper(self, config):
-        path, text = reaper_file_path(self.kind), self.reaper_text(config)
+    def step_reaper(self, config, table_from_file=False, login_file=None):
+        path, text = reaper_file_path(self.kind), self.reaper_text(config, table_from_file, login_file)
         check_writable_target(path)
         problem = self.reaper_command_problem()
         if problem:
@@ -29729,21 +29913,25 @@ class Installer:
         on_disk = path.read_text() if path.exists() else None
         loaded = self.reaper_loaded()
         if on_disk == text and loaded:
-            return self.say("cloud reaper", "already done", str(path))
+            set_file_mode(path, REAPER_FILE_MODE)   # an identical file still gets the private mode
+            self.say("cloud reaper", "already done", str(path))
+            return False
         what = "load" if on_disk == text else "write and load"
         commands = " && ".join(" ".join(c) for c in self.reaper_load_commands(path))
         self.say("cloud reaper", "will run" if not self.dry else "would run", "%s: %s" % (what, commands))
         if self.dry:
-            return self.say("cloud reaper", "would be done", str(path))
+            self.say("cloud reaper", "would be done", str(path))
+            return True
         ensure_state_dir()
         if on_disk != text:
             if loaded:
                 for command in self.reaper_unload_commands():
                     self.run_checked(command, " ".join(command))
-            write_if_changed(path, text)
+        write_if_changed(path, text, mode=REAPER_FILE_MODE)
         for command in self.reaper_load_commands(path):
             self.run_checked(command, " ".join(command))
         self.say("cloud reaper", "done", str(path))
+        return True
 
     def reaper_is_ours(self, path, text):
         """True when the file at `path` is a rendering of the reaper template: the CW_* settings lines are set aside on BOTH sides and
@@ -29775,6 +29963,12 @@ class Installer:
             except InstallError as err:
                 removable, note = False, str(err)
         loaded = self.reaper_loaded()
+        if loaded and not os.path.lexists(str(path)) and not note:
+            unload = " && ".join(" ".join(c) for c in self.reaper_unload_commands())
+            if not self.dry:
+                for command in self.reaper_unload_commands():
+                    self.run_checked(command, " ".join(command))
+            return self.say("cloud reaper", "would run" if self.dry else "done", "%s: the job was loaded and has no file to remove" % unload)
         if loaded:
             self.say("cloud reaper", "would run" if self.dry else "will run", " && ".join(" ".join(c) for c in self.reaper_unload_commands()))
             if not self.dry:
@@ -29837,6 +30031,53 @@ class Installer:
         self.step_janitor_job()
         self.step_ensure(ensure or (lambda: ensure_daemon(ensure_state_dir(), self.spawn)),
                          status or (lambda: format_status(collect_status(self.runner, self.now, self.platform))))
+
+    # -- the reaper's service and nothing else (ask #982)
+    def install_cloud_reaper_only(self):
+        """Install and load ONLY the cloud worker's reaper service. Nothing else on the machine is touched: no config
+        key, no profile piece, no command link, no plugin link, no switchboard service and no daemon. The state
+        directory (the reaper's log) is the one other thing made, and the service file is written with mode 0600.
+
+        The launcher's own settings file, when it exists, is the only source of the settings it holds, so the service
+        carries none of them: a key set differently in the file and in the service makes every start refuse."""
+        if self.kind is None:
+            return self.say("cloud reaper", "skipped (no service manager known for this platform)")
+        problem = reaper_settings_problem()   # before anything is written: this path only (the full install does not check)
+        if problem:
+            raise InstallError(problem)
+        login, is_default, problem = reaper_login_file(os.environ)
+        if problem:
+            raise InstallError(problem)
+        if is_default:
+            self.out.write("cloud reaper: login file %s (default; set CW_CLOUD_TOKEN_FILE to change it)\n" % login)
+            if not self.dry:
+                make_reaper_login_directory(login)
+        changed = self.step_reaper({}, table_from_file=True, login_file=login if is_default else None)
+        self.out.write("only the cloud reaper's own service %s: the config, the profile pieces, the command link, "
+                       "the plugin link, the switchboard's own service and the daemon were left alone\n"
+                       % (("would be installed" if self.dry else "was installed") if changed else "is already installed"))
+        self.out.write("the reaper logs into the cluster by itself, from the settings the service carries (a token file "
+                       "by path, or a context) and from the settings file it reads at every start; without a login it "
+                       "writes `cluster login failed: ...` and the service restarts it every 30 seconds\n")
+
+    def uninstall_cloud_reaper_only(self):
+        """The way back of install_cloud_reaper_only: unload the reaper's job and remove ONLY its service file (the
+        plist or the unit). Nothing else is touched: no plugin, agent, skill, wrapper, link, service, config or profile.
+        Nothing installed: one line, and success."""
+        if self.kind is None:
+            return self.say("cloud reaper", "skipped (no service manager known for this platform)")
+        if not os.path.lexists(str(reaper_file_path(self.kind))) and not self.reaper_loaded():
+            self.out.write("cloud reaper: not installed\n")
+            return
+        self.remove_reaper()
+        self.out.write("only the cloud reaper's own service %s: the plugins, the agents, the skills, the wrapper, the command link, "
+                       "the switchboard's own service, the config and the profile were left alone\n"
+                       % ("would be removed" if self.dry else "was removed"))
+        login = reaper_default_login_file()
+        self.out.write("the login file %s and its directory were left in place (a leftover token file when the reaper has "
+                       "run): to remove it, run `rm %s` and, when nothing else is in it, `rmdir %s` "
+                       "(a login file you set with CW_CLOUD_TOKEN_FILE is yours to remove)\n"
+                       % (login, shlex.quote(str(login)), shlex.quote(str(login.parent))))
 
     # -- the reverse of 3 to 5
     def uninstall(self, with_service=True, with_link=True):
@@ -29957,17 +30198,51 @@ class Installer:
 
 
 def cmd_install(args, runner, now, spawn=subprocess.Popen):
+    conflict = reaper_only_conflict(args)
+    if conflict:
+        sys.stderr.write("%s: install refused: %s\n" % (PROG, conflict))
+        return EXIT_USAGE
     installer = Installer(runner, spawn, now, dry_run=args.dry_run, shared_profile=args.shared_profile,
                           profile=args.profile, gh_user=args.gh_user)
     try:
-        if args.uninstall:
+        if args.uninstall and args.cloud_reaper_only:
+            installer.uninstall_cloud_reaper_only()
+        elif args.uninstall:
             installer.uninstall(not args.no_service, not args.no_herdr_link)
+        elif args.cloud_reaper_only:
+            installer.install_cloud_reaper_only()
         else:
             installer.install(args.opencode, not args.no_service, not args.no_herdr_link, with_reaper=args.with_cloud_reaper)
     except InstallError as err:
         sys.stderr.write("%s: install stopped: %s\n" % (PROG, err))
         return EXIT_ERROR
     return EXIT_OK
+
+
+# The options `install --cloud-reaper-only` refuses, and why each of them is about the FULL install that the new
+# option does not do. One table: the completeness test in bin/test-switchboard holds every option of the install
+# parser to it, so a later option must be classified here.
+REAPER_ONLY_OPTION = "--cloud-reaper-only"
+REAPER_ONLY_REFUSALS = {
+    "--with-cloud-reaper": ("with_cloud_reaper", "the full install installs the reaper with the rest of the kit"),
+    "--no-service": ("no_service", "the reaper's service is the only service this option installs"),
+    "--no-herdr-link": ("no_herdr_link", "the herdr plugin link belongs to the full install"),
+    "--shared-profile": ("shared_profile", "the profile pieces belong to the full install"),
+    "--profile": ("profile", "the profile belongs to the full install"),
+    "--opencode": ("opencode", "the OpenCode binary belongs to the full install"),
+    "--gh-user": ("gh_user", "the gh account belongs to the full install"),
+}
+
+
+def reaper_only_conflict(args):
+    """The option `--cloud-reaper-only` refuses, or None. Nothing is written and no service is called when this
+    answers: the check runs in the parser, before the installer does anything."""
+    if not getattr(args, "cloud_reaper_only", False):
+        return None
+    for option, (dest, why) in REAPER_ONLY_REFUSALS.items():
+        if getattr(args, dest, None):
+            return "%s cannot be used with %s: %s" % (REAPER_ONLY_OPTION, option, why)
+    return None
 
 
 def add_install_parsers(sub):
@@ -29984,6 +30259,13 @@ def add_install_parsers(sub):
     install.add_argument("--with-cloud-reaper", dest="with_cloud_reaper", action="store_true",
                          help="Also install and load the cloud worker reaper as a service (opt-in: it needs a cluster login; "
                               "its non-secret CW_* settings are copied from this environment)")
+    install.add_argument("--cloud-reaper-only", dest="cloud_reaper_only", action="store_true",
+                         help="Install and load ONLY the cloud worker reaper's own service (opt-in: it needs a cluster login). "
+                              "It writes the reaper's service file (mode 0600) and the state directory (the reaper's log) "
+                              "and loads the service; it leaves alone the config, the profile pieces, the command link, "
+                              "the plugin link, the switchboard's own service and the daemon. It first checks the settings file "
+                              "(cloud.env: mode 600, the cluster login and vault names) and refuses with one line. "
+                              "With --uninstall it removes ONLY the reaper's service")
     install.add_argument("--no-herdr-link", dest="no_herdr_link", action="store_true",
                          help="Do not link herdr's plugin (it starts the daemon whenever herdr starts)")
     install.add_argument("--shared-profile", dest="shared_profile", action="store_true",
