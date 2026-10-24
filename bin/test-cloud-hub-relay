@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""test-cloud-relay: offline tests for the hub relay (bin/cloud_relay.py, routes in bin/cloud_hub.py) and `cloud_cli.py relay`.
+"""test-cloud-hub-relay: offline tests for the hub relay (bin/cloud_relay.py, routes in bin/cloud_hub.py) and `cloud_cli.py relay`.
 
 A stub daemon pulls /relay/pending and posts /relay/result with the daemon credential. No GitHub token exists anywhere here.
 
-    bin/test-cloud-relay
+    bin/test-cloud-hub-relay
 """
 import hashlib
 import http.client
