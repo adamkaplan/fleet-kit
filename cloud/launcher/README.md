@@ -29,6 +29,13 @@ Launcher, reaper, end hook and token mint for cloud workers, built to `docs/clou
   label); the account, the subcommand and the duration are fixed in code. The vault names (`CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME`,
   `CW_CLUSTER_ADMIN_SECRET`) stay settings. A person who needs a custom command uses the launch path. The children run with a minimal
   environment (a fixed `PATH`, `HOME`, `LANG`, `AZURE_CONFIG_DIR` only when you set it, `KUBECONFIG=/dev/null`) and nothing else.
+  If one of those three names is set (in the process environment or in `cloud.env`), the refresh still uses the fixed route and the reaper
+  names the setting, never its value: on the first pass and then at most once an hour it prints `cluster login: CW_KUBECTL is ignored in the
+  unattended refresh (the reaper uses a fixed kubectl path); use the launch path for a custom command` on stderr and writes one audit line
+  (action `ignored-setting-notice`) per name. The settings the reaper's `cloud.env` needs are NAMES only: the cluster server
+  (`CW_CLOUD_SERVER`), the namespace (`CW_CLOUD_NAMESPACE`), the token file (`CW_CLOUD_TOKEN_FILE`), the vault names (`CW_VAULT_NAME`,
+  `CW_VAULT_SUBSCRIPTION`), `CW_CLUSTER_ADMIN_SECRET` (the NAME of the vault secret, not its content), and optionally
+  `CW_CLUSTER_TOKEN_DURATION`.
   **The minter credential is LONG-LIVED.** The vault holds a long-lived minter token for ONE account's tokens (`cw-operator` in the cloud
   namespace): not cluster admin, but not short-lived. The Secret `cw-minter-token` is a `kubernetes.io/service-account-token` Secret, so the
   control plane fills it with a NON-EXPIRING bearer token for `cw-minter`. Whoever reads that vault secret can mint `cw-operator` tokens (up to

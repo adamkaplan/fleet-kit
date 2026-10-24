@@ -59,6 +59,11 @@ _NAMESPACE_LABEL = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")   # a DNS-1
 FIREWALL_MARKERS = ("client address is not authorized and caller is not a trusted service", "forbiddenbyfirewall")
 REAPER_RUNTIME_ID = "reaper"           # the reaper's own runtime id in the audit (it acts on no worker)
 REFRESH_ACTION = "refresh-cluster-token"   # the audit action of the reaper's own login refresh
+IGNORED_SETTING_ACTION = "ignored-setting-notice"   # the audit action of the notice that a setting is ignored by the unattended refresh
+IGNORED_SETTINGS = ("CW_KUBECTL", "CW_CLUSTER_ADMIN_CMD", "CW_CLUSTER_TOKEN_CMD")   # the names the strict route ignores
+IGNORED_NOTICE_SECONDS = 3600          # each ignored name is named on the first pass and then at most once an hour
+IGNORED_NOTICE = ("cluster login: %s is ignored in the unattended refresh (the reaper uses a fixed %s path); "
+                  "use the launch path for a custom command")
 
 # The git token a worker pushes with is a one-hour installation token (app_token.py caps it at 61 minutes). The launcher mints it once and
 # stores it as the `git-token` key of the per-run Secret; the managed reaper renews it by the SAME mint route before it ends. All of the
@@ -1047,6 +1052,33 @@ class ClusterTokenRefresher:
         self.audit_file = audit_path(self.env)
         self.kube = None            # the Kube, when there is one: its scrubber knows this run's secrets
         self.last_failure = None    # (when, reason): the retry gap and the reason of the last failure
+        self.noticed = {}           # ignored setting name -> when it was last named
+        self.notices = []           # the notice lines due in the last run (names only, never a value)
+
+    def ignored_settings(self):
+        """The ignored names that are set (non-empty) in the process environment or in the settings file; names only. An unreadable file is
+        not an error here: the strict route does not depend on it."""
+        found = {n for n in IGNORED_SETTINGS if (self.env.get(n) or "").strip()}
+        try:
+            text = _read_settings_file(settings_path(self.env))
+            values = {m.group(1): m.group(2) for m in re.finditer(r"^[ \t]*([A-Z0-9_]+)=(.*)$", text or "", re.M)}   # names only matter: no value is kept or shown
+        except CloudError:
+            values = {}
+        found |= {n for n in IGNORED_SETTINGS if str(values.get(n) or "").strip()}
+        return [n for n in IGNORED_SETTINGS if n in found]
+
+    def note_ignored(self, now):
+        """The notice for each ignored setting that is set, on the first pass and then at most once an hour: one line and one audit line each."""
+        self.notices = []
+        for name in self.ignored_settings():
+            last = self.noticed.get(name)
+            if last is not None and 0 <= now - last < IGNORED_NOTICE_SECONDS:
+                continue
+            self.noticed[name] = now
+            line = IGNORED_NOTICE % (name, "az" if name == "CW_CLUSTER_ADMIN_CMD" else "kubectl")
+            self.notices.append(line)
+            write_audit(self.audit_file, {"ts": iso(self.clock()), "worker": "", "runtime_id": REAPER_RUNTIME_ID, "action": IGNORED_SETTING_ACTION,
+                                          "cost_estimate_usd": 0.0, "ok": True, "actor": pwd.getpwuid(os.getuid()).pw_name, "reason": line})
 
     def scrub(self, text, limit=1000):
         return self.kube.scrub(text, limit) if self.kube else scrub(text, (), limit)
@@ -1065,6 +1097,7 @@ class ClusterTokenRefresher:
         if not self.enabled():
             return TokenRefresh("skipped")   # another login kind: nothing is read and nothing is written
         now = self.clock().timestamp()
+        self.note_ignored(now)
         if self.last_failure is not None and 0 <= now - self.last_failure[0] < CLUSTER_TOKEN_RETRY_SECONDS:   # a negative gap (the clock went back) counts as expired
             return TokenRefresh("waiting", self.last_failure[1])   # the retry gap: no new attempt yet
         path = self.path()
@@ -2764,6 +2797,8 @@ def _reap_main(env, a, sleep, clock=None, refresher=None, kube=None):
         L = Launcher(kube, env, clock, sleep) if kube is not None else None
         while True:
             refresh = refresher.run()
+            for line in getattr(refresher, "notices", []):
+                print(line, file=sys.stderr)   # the stdout line of a pass is the JSON report; the notice names a setting, never a value
             if kube is not None and refresh.token:
                 kube.add_secrets(refresh.token)   # the new token is a secret from now on: the scrubber knows it
             note = "cluster token not refreshed: %s" % refresh.reason if refresh.state in ("failed", "waiting") else ""

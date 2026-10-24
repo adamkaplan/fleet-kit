@@ -8,6 +8,7 @@ The families are derived from the code, never listed twice:
   * the mode of the written file is checked with two mutants (a build that writes it without the owner-only mode fails).
 """
 import base64
+import datetime
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -702,6 +703,66 @@ class MintGuards(Refresh):
                 self.settings_file(0o600, "%s=%s\n" % (name, script))
                 self.assertEqual(self.outcome(env=dict(self.env, **{name: script})), "ok")
                 self.assertFalse(os.path.exists(self.marker))
+
+    def run_pass(self, env, module=None):
+        """One refresher run on a missing token file (a refresh is due): the refresher, its result."""
+        refresher = (module or cw).ClusterTokenRefresher(env, self.clock)
+        return refresher, refresher.run()
+
+    def notice_audit(self):
+        return [l for l in self.audit() if l.get("action") == "ignored-setting-notice"]
+
+    def test_an_ignored_setting_is_named_once_per_pass_window_and_the_fixed_route_still_runs(self):
+        script = self.marker_script()
+        for name in ("CW_KUBECTL", "CW_CLUSTER_ADMIN_CMD", "CW_CLUSTER_TOKEN_CMD"):
+            for where in ("environment", "file"):
+                with self.subTest(name=name, where=where):
+                    self.reset()
+                    if os.path.exists(self.marker):
+                        os.unlink(self.marker)
+                    env = dict(self.env)
+                    env.pop("CW_KUBECTL")   # the fixture sets it: only the name under test is set
+                    if where == "environment":
+                        env[name] = script
+                    else:
+                        self.settings_file(0o600, "%s=%s\n" % (name, script))
+                        env["XDG_CONFIG_HOME"] = self.env["XDG_CONFIG_HOME"]
+                    refresher, result = self.run_pass(env)
+                    self.assertEqual(result.state, "written")   # the fixed route ran
+                    self.assertFalse(os.path.exists(self.marker))
+                    self.assertEqual(refresher.notices, ["cluster login: %s is ignored in the unattended refresh (the reaper uses a fixed %s path); "
+                                                         "use the launch path for a custom command" % (name, "az" if name == "CW_CLUSTER_ADMIN_CMD" else "kubectl")])
+                    self.assertNotIn(script, refresher.notices[0])   # a name, never a value
+                    lines = self.notice_audit()
+                    self.assertEqual(len(lines), 1)
+                    self.assertNotIn(script, json.dumps(lines))
+                    self.clock.t = self.clock.t + datetime.timedelta(seconds=60)
+                    refresher.run()
+                    self.assertEqual(refresher.notices, [])   # not again within the hour
+                    self.assertEqual(len(self.notice_audit()), 1)
+                    self.clock.t = self.clock.t + datetime.timedelta(seconds=3600)
+                    refresher.run()
+                    self.assertEqual(len(refresher.notices), 1)   # and again after an hour
+                    self.assertEqual(len(self.notice_audit()), 2)
+
+    def test_no_notice_when_no_ignored_setting_is_set(self):
+        env = dict(self.env)
+        env.pop("CW_KUBECTL")
+        refresher, result = self.run_pass(env)
+        self.assertEqual(result.state, "written")
+        self.assertEqual(refresher.notices, [])
+        self.assertEqual(self.notice_audit(), [])
+
+    def test_the_mutant_without_the_notice_fails(self):
+        env = dict(self.env, CW_KUBECTL=self.marker_script())
+        refresher, _ = self.run_pass(env)
+        self.assertEqual(len(refresher.notices), 1)
+        module = self.mutate("        self.note_ignored(now)\n", "")
+        self.reset()
+        env = dict(self.env, CW_KUBECTL=self.marker_script())
+        refresher, result = self.run_pass(env, module)
+        self.assertEqual(result.state, "written")
+        self.assertEqual(refresher.notices, [])   # the mutant says nothing: the test above would fail
 
     def test_the_mutant_that_honours_kubectl_again_fails(self):
         script = self.marker_script()
