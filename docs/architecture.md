@@ -125,12 +125,24 @@ Kinds (the number is exact: see rule 7): `namespace` (a part uses names the entr
 
 ## Dynamic imports not followed
 
-The derivation follows `import`, `from . import x`, constant-string `__import__("x")` and `importlib.import_module("x")`, `load_module("x")` and the `load_x()` helpers. It does not follow a non-constant argument or a load by path; each unit with such sites is listed with the number of sites. A new site fails the test until its row is written; a row with no site fails it too.
+The derivation follows `import`, `from . import x`, `from .x import y`, and a constant-string `__import__("x")`, `importlib.import_module("x")` and `load_module("x")`, however the call is spelled or bound (`imp = __import__`, `from importlib import import_module as im`, `getattr(importlib, "import_module")`), and the `load_x()` helpers. It does not follow, and lists here by the enclosing function and the kind of call, with a count: a non-constant argument, a load by path or by text (`exec`, `eval`, `compile`, `find_spec`, `spec_from_file_location`, `SourceFileLoader`, `run_path`) and a relative import of level two or more. A new site, a swapped site, a wrong count or a stale row fails the test.
 
-| Unit | Sites | What |
-|---|---|---|
-| `agent_reconcile.py` | 1 | loads a sibling module by path |
-| `cloud_worker.py` | 3 | loads sibling modules by path |
-| `cpu_guard.py` | 1 | loads a sibling module by path |
-| `external_adapter.py` | 1 | loads a sibling module by path |
-| `fleet-switchboard` | 9 | the assembler and the helper loader load modules and parts by path (`spec_from_file_location`, `load_module(name)`) |
+| Unit | Site | Count | What |
+|---|---|---|---|
+| `agent_reconcile.py` | `_load_registry:spec_from_file_location` | 1 | loads a module by path |
+| `cloud_worker.py` | `_lib:spec_from_file_location` | 1 | loads a module by path |
+| `cloud_worker.py` | `_walk:spec_from_file_location` | 1 | loads a module by path |
+| `cloud_worker.py` | `model_entry:spec_from_file_location` | 1 | loads a module by path |
+| `cpu_guard.py` | `slots_text:spec_from_file_location` | 1 | loads a module by path |
+| `external_adapter.py` | `_load_core:spec_from_file_location` | 1 | loads a module by path |
+| `fleet-switchboard` | `Installer.reaper_command_problem:spec_from_file_location` | 1 | loads a module by path |
+| `fleet-switchboard` | `_declared_module:load_module(non-constant)` | 1 | loads the module its argument names |
+| `fleet-switchboard` | `_declared_module:spec_from_file_location` | 1 | loads a module by path |
+| `fleet-switchboard` | `_fleet_parts:compile` | 1 | compiles a part's text |
+| `fleet-switchboard` | `_fleet_parts:exec` | 1 | runs a part's code in the entry's namespace |
+| `fleet-switchboard` | `_make_loader.loader:load_module(non-constant)` | 1 | loads the module its argument names |
+| `fleet-switchboard` | `launcher_module:spec_from_file_location` | 1 | loads a module by path |
+| `fleet-switchboard` | `load_module:spec_from_file_location` | 1 | loads a module by path |
+| `fleet-switchboard` | `load_review_rule:spec_from_file_location` | 1 | loads a module by path |
+| `fleet-switchboard` | `validate_app_config:spec_from_file_location` | 1 | loads a module by path |
+| `fleet-switchboard` | `validate_hold_labels_config:spec_from_file_location` | 1 | loads a module by path |
