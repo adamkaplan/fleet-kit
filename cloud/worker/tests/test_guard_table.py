@@ -152,6 +152,27 @@ class Table(unittest.TestCase):
         self.assertEqual(self.client("api repos/acme-org/widget-service/issues/7", script=path).returncode, 0)   # the mutant answers where the table says no
         self.assertEqual(self.client("api repos/acme-org/widget-service/issues/7").returncode, 2)
 
+    def test_m1_the_client_refuses_a_path_that_is_not_normal_and_makes_no_request(self):
+        for bad in ("repos/acme-org/widget-service/./issues/1", "repos/acme-org/widget-service//issues/1", "repositories/1/issues/1",
+                    "repos/acme-org/widget-service/issues/1/../1", "repos/acme-org/widget-service/%2e/issues/1",
+                    "repos/acme-org/widget-service/issues%2F1", "repos/acme-org/widget-service/%2E%2E/issues/1",
+                    "repos/acme-org/widget-service/issues/1/comments//", "user"):
+            with self.subTest(path=bad):
+                p = self.client("api " + bad)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertEqual(Rec.seen, [])
+
+    def test_m1_a_mutant_without_the_normalisation_lets_those_paths_through(self):
+        src = open(CW_GH).read()
+        old = "    if not api_path_clean(path):   # normalisation check BEFORE the allow check\n        return False\n"
+        self.assertIn(old, src)
+        path = os.path.join(self.tmp.name, "cw-gh-nonorm")
+        open(path, "w").write(src.replace(old, "", 1))
+        for bad in ("repos/acme-org/widget-service/./issues/1", "repos/acme-org/widget-service//issues/1", "repositories/1/issues/1"):
+            p = self.client("api " + bad, script=path)
+            self.assertEqual(p.returncode, 0, bad)   # the mutant sends the GET: the test above would fail on it
+            self.assertEqual(len(Rec.seen), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
