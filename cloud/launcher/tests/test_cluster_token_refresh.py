@@ -28,6 +28,7 @@ sys.path.insert(0, HERE)
 import test_cloud_worker as base  # noqa: E402
 
 cw = base.cw
+REAL_KUBECTL_PATHS, REAL_AZ_PATHS = cw.MINT_KUBECTL_PATHS, cw.MINT_AZ_PATHS   # the real fixed lists (the tests patch the module constants)
 SOURCE_PATH = os.path.join(LAUNCHER, "cloud_worker.py")
 with open(SOURCE_PATH) as _source:
     SOURCE = _source.read()
@@ -123,6 +124,7 @@ def mutant_module(text):
     module = types.ModuleType("cloud_worker_mode_mutant")
     module.__file__ = SOURCE_PATH
     exec(compile(text, SOURCE_PATH, "exec"), module.__dict__)
+    module.MINT_KUBECTL_PATHS, module.MINT_AZ_PATHS = cw.MINT_KUBECTL_PATHS, cw.MINT_AZ_PATHS   # the fixed lists point at this case's fakes
     return module
 
 
@@ -149,6 +151,9 @@ class Refresh(base.Base):
         os.makedirs(self.tmpdir, exist_ok=True)
         self.write_fake("az", FAKE_AZ)
         self.write_fake("kubectl", FAKE_KUBECTL)
+        cw.MINT_KUBECTL_PATHS = (os.path.join(self.bin, "kubectl"),)   # the strict route's fixed lists, pointed at the fakes
+        cw.MINT_AZ_PATHS = (os.path.join(self.bin, "az"),)
+        self.addCleanup(self.restore_lists)
         self.vault_mode = os.path.join(d, "vault.mode")
         self.vault_log = os.path.join(d, "vault.log")
         self.token_log_path = os.path.join(d, "tokens.jsonl")
@@ -182,6 +187,9 @@ class Refresh(base.Base):
         for path in (self.token_file, self.vault_log, self.token_log_path, self.env["CW_CLOUD_AUDIT"]):
             if os.path.exists(path):
                 os.unlink(path)
+
+    def restore_lists(self):
+        cw.MINT_KUBECTL_PATHS, cw.MINT_AZ_PATHS = REAL_KUBECTL_PATHS, REAL_AZ_PATHS
 
     # -- the fakes --
     def write_fake(self, name, text):
@@ -635,31 +643,87 @@ class MintGuards(Refresh):
             f.write("x")
         for value in ("sh", "kubectl", "./kubectl", "bin/kubectl", os.path.join(self.bin, "missing"), self.bin, writable, plain):
             with self.subTest(value=value):
-                env = dict(self.env, CW_KUBECTL=value)
-                self.assertEqual(self.outcome(env=env), "kubectl-refused")
+                cw.MINT_KUBECTL_PATHS = (value,)   # the fixed list holds a bad entry
+                self.assertEqual(self.outcome(), "kubectl-refused")
                 self.assertEqual(self.vault_reads(), [])
 
     def test_a_link_to_a_good_absolute_file_is_allowed(self):
         link = os.path.join(self.bin, "kubectl-link")
         os.symlink(os.path.join(self.bin, "kubectl"), link)
-        self.assertEqual(self.outcome(env=dict(self.env, CW_KUBECTL=link)), "ok")
+        cw.MINT_KUBECTL_PATHS = (link,)
+        self.assertEqual(self.outcome(), "ok")
 
-    def test_with_no_setting_the_fixed_list_is_searched_in_order(self):
-        self.assertEqual(cw.MINT_KUBECTL_PATHS, ("/opt/homebrew/bin/kubectl", "/usr/local/bin/kubectl", "/usr/bin/kubectl"))
-        env = dict(self.env)
-        del env["CW_KUBECTL"]
-        found = [p for p in cw.MINT_KUBECTL_PATHS if os.path.isfile(p)]
-        if found:
-            self.assertEqual(cw.mint_kubectl(env), os.path.realpath(found[0]))
-        else:
-            self.assertEqual(self.outcome(env=env), "kubectl-refused")   # none of the fixed places holds one: nothing is searched on PATH
-            self.assertEqual(self.vault_reads(), [])
+    def test_the_fixed_lists_are_searched_in_order_and_az_is_never_found_on_path(self):
+        self.assertEqual(REAL_KUBECTL_PATHS, ("/opt/homebrew/bin/kubectl", "/usr/local/bin/kubectl", "/usr/bin/kubectl"))
+        self.assertEqual(REAL_AZ_PATHS, ("/opt/homebrew/bin/az", "/usr/local/bin/az", "/usr/bin/az"))
+        good = os.path.join(self.bin, "kubectl")
+        cw.MINT_KUBECTL_PATHS = (os.path.join(self.bin, "missing"), good, "/nonexistent/kubectl")
+        self.assertEqual(cw.mint_kubectl(), os.path.realpath(good))
+        cw.MINT_AZ_PATHS = (os.path.join(self.bin, "missing"),)   # a good az is on PATH (self.bin) but not in the list
+        self.assertEqual(self.outcome(), "az-refused")
+        self.assertEqual(self.vault_reads(), [])
 
     def test_the_mutant_that_accepts_any_program_fails(self):
-        env = dict(self.env, CW_KUBECTL="sh")
-        self.assertEqual(self.outcome(env=env), "kubectl-refused")
-        module = self.mutate("if _kubectl_problem(setting):", "if False:")
-        self.assertNotEqual(self.outcome(module, env), "kubectl-refused")
+        cw.MINT_KUBECTL_PATHS = ("sh",)
+        self.assertEqual(self.outcome(), "kubectl-refused")
+        module = self.mutate("if _kubectl_problem(path) is None:\n            return os.path.realpath(path)\n    raise ClusterLogin(\"kubectl-refused\")",
+                             "return os.path.realpath(path)\n    raise ClusterLogin(\"kubectl-refused\")")
+        self.assertNotEqual(self.outcome(module), "kubectl-refused")
+
+    def test_the_mutant_that_finds_az_on_path_fails(self):
+        cw.MINT_AZ_PATHS = (os.path.join(self.bin, "missing"),)
+        self.assertEqual(self.outcome(), "az-refused")
+        module = self.mutate('az = az_path if strict else "az"', 'az = (shutil.which("az", path=env.get("PATH") or MINT_PATH) or "az") if strict else "az"')
+        module = self.mutate_more(module, "            az_path = mint_az()\n", "")
+        self.assertEqual(self.outcome(module), "ok")   # the mutant ran the az found on PATH: caught
+
+    def mutate_more(self, module, old, new):
+        text = SOURCE.replace('az = az_path if strict else "az"', 'az = (shutil.which("az", path=env.get("PATH") or MINT_PATH) or "az") if strict else "az"').replace(old, new)
+        self.assertNotEqual(text, SOURCE)
+        return mutant_module(text)
+
+    # -- the fixed route: no setting or variable names the program or the command --
+    def marker_script(self):
+        self.marker = os.path.join(self.tmp.name, "marker")
+        path = self.write_fake("marker-program", "#!/bin/sh\necho ran > %s\nexit 1\n" % self.marker)
+        return path
+
+    def test_the_strict_route_ignores_the_program_and_command_settings_in_the_environment(self):
+        script = self.marker_script()
+        for name, value in (("CW_KUBECTL", script), ("CW_CLUSTER_ADMIN_CMD", script), ("CW_CLUSTER_TOKEN_CMD", script)):
+            with self.subTest(name=name):
+                self.assertEqual(self.outcome(env=dict(self.env, **{name: value})), "ok")
+                self.assertFalse(os.path.exists(self.marker))   # the marker program never ran
+
+    def test_the_strict_route_ignores_the_same_settings_in_the_settings_file(self):
+        script = self.marker_script()
+        for name in ("CW_KUBECTL", "CW_CLUSTER_ADMIN_CMD", "CW_CLUSTER_TOKEN_CMD"):
+            with self.subTest(name=name):
+                self.settings_file(0o600, "%s=%s\n" % (name, script))
+                self.assertEqual(self.outcome(env=dict(self.env, **{name: script})), "ok")
+                self.assertFalse(os.path.exists(self.marker))
+
+    def test_the_mutant_that_honours_kubectl_again_fails(self):
+        script = self.marker_script()
+        env = dict(self.env, CW_KUBECTL=script)
+        self.assertEqual(self.outcome(env=env), "ok")
+        self.assertFalse(os.path.exists(self.marker))
+        module = self.mutate("            kubectl = mint_kubectl()", "            kubectl = env.get(\"CW_KUBECTL\") or mint_kubectl()")
+        self.assertNotEqual(self.outcome(module, env), "ok")
+        self.assertTrue(os.path.exists(self.marker))   # caught: the mutant ran the program
+
+    def test_the_mutant_that_honours_a_command_setting_again_fails(self):
+        script = self.marker_script()
+        for name in ("CW_CLUSTER_ADMIN_CMD", "CW_CLUSTER_TOKEN_CMD"):
+            with self.subTest(name=name):
+                if os.path.exists(self.marker):
+                    os.unlink(self.marker)
+                env = dict(self.env, **{name: script})
+                self.assertEqual(self.outcome(env=env), "ok")
+                self.assertFalse(os.path.exists(self.marker))
+                module = self.mutate("        custom = admin = \"\"   #", "        pass   #")
+                self.assertNotEqual(self.outcome(module, env), "ok")
+                self.assertTrue(os.path.exists(self.marker))
 
     # -- the namespace --
     def test_a_namespace_that_is_not_a_dns_label_is_refused_with_no_vault_read(self):
@@ -697,24 +761,27 @@ class MintGuards(Refresh):
         self.mint_argv(module, expect="mint-failed")
         self.assertEqual(self.token_log()[1:], [])
 
-    # -- the settings file --
-    def test_a_settings_file_that_others_can_write_refuses_the_custom_commands(self):
-        for name, value in (("CW_CLUSTER_ADMIN_CMD", "echo x"), ("CW_CLUSTER_TOKEN_CMD", "echo x"), ("CW_KUBECTL", os.path.join(self.bin, "kubectl"))):
-            with self.subTest(name=name):
-                self.settings_file(0o660)
-                env = dict(self.env, **{name: value})
-                self.assertEqual(self.outcome(env=env), "settings-untrusted")
-                self.assertEqual(self.vault_reads(), [])
-        self.settings_file(0o600)   # the same file, private: the command is honoured
-        self.assertNotEqual(self.outcome(env=dict(self.env, CW_CLUSTER_TOKEN_CMD="echo x")), "settings-untrusted")
-        self.assertEqual(cw.REFRESH_REASONS["settings-untrusted"].split(":")[0][:21], "the settings file is ")
+    # -- the settings file: where a value came from --
+    def test_a_value_set_only_in_the_process_environment_is_ignored_whatever_the_file(self):
+        script = self.marker_script()
+        path = self.settings_file(0o660)   # a file others can write, holding no such value
+        self.assertIsNotNone(cw.settings_file_problem(self.env))
+        self.assertNotIn("CW_CLUSTER_TOKEN_CMD", open(path).read())
+        self.assertEqual(self.outcome(env=dict(self.env, CW_CLUSTER_TOKEN_CMD=script)), "ok")   # the value came from the process only: ignored
+        self.assertFalse(os.path.exists(self.marker))
 
-    def test_the_mutant_that_skips_the_settings_file_check_fails(self):
-        self.settings_file(0o660)
-        env = dict(self.env, CW_CLUSTER_TOKEN_CMD="echo x")
-        self.assertEqual(self.outcome(env=env), "settings-untrusted")
-        module = self.mutate('if problem:\n            raise ClusterLogin("settings-untrusted")', "if False:\n            raise ClusterLogin(\"settings-untrusted\")")
-        self.assertNotEqual(self.outcome(module, env), "settings-untrusted")
+    def test_a_value_that_came_from_the_file_is_ignored_too_and_the_file_check_reads_that_file(self):
+        script = self.marker_script()
+        path = self.settings_file(0o600, "CW_CLUSTER_TOKEN_CMD=%s\n" % script)
+        self.assertIn(script, open(path).read())   # the value is in the file
+        self.assertIsNone(cw.settings_file_problem(self.env))
+        self.assertEqual(self.outcome(), "ok")
+        self.assertFalse(os.path.exists(self.marker))
+        os.chmod(path, 0o660)
+        self.assertIsNotNone(cw.settings_file_problem(self.env))   # the check follows the file at the settings path
+        self.assertEqual(self.outcome(), "ok")
+        self.assertFalse(os.path.exists(self.marker))
+        self.assertEqual(cw.REFRESH_REASONS["settings-untrusted"].split(":")[0][:21], "the settings file is ")
 
     # -- the child's environment --
     def child_envs(self):
@@ -757,10 +824,10 @@ class MintGuards(Refresh):
     # -- the two entries: the reaper is strict, the launch is not --
     def test_the_launch_call_keeps_its_previous_behaviour(self):
         """The compatibility pin: strict=False accepts a bare-name CW_KUBECTL and passes the full environment."""
-        env = dict(self.planted(), CW_KUBECTL="kubectl", PATH=self.bin + os.pathsep + os.environ.get("PATH", ""))
+        env = dict(self.planted(), CW_CLOUD_NAMESPACE="CW", PATH=self.bin + os.pathsep + os.environ.get("PATH", ""))
         self.assertEqual(self.outcome(env=env, strict=False), "ok")
         self.assertTrue(any("FAKE_SECRET_VAR" in c for c in self.child_envs()))
-        self.assertEqual(self.outcome(env=env, strict=True), "kubectl-refused")
+        self.assertEqual(self.outcome(env=env, strict=True), "namespace-refused")
 
     def test_the_launch_default_is_not_strict(self):
         import inspect
@@ -768,8 +835,8 @@ class MintGuards(Refresh):
 
     def test_a_build_where_launch_is_strict_fails_the_compatibility_test(self):
         module = self.mutate("recovery=None, strict=False):", "recovery=None, strict=True):")
-        env = dict(self.env, CW_KUBECTL="kubectl", PATH=self.bin + os.pathsep + os.environ.get("PATH", ""))
-        self.assertEqual(self._launch_call(module, env), "kubectl-refused")
+        env = dict(self.env, CW_CLOUD_NAMESPACE="CW", PATH=self.bin + os.pathsep + os.environ.get("PATH", ""))
+        self.assertEqual(self._launch_call(module, env), "namespace-refused")
         self.assertEqual(self._launch_call(cw, env), "ok")
 
     def _launch_call(self, module, env):
@@ -795,12 +862,12 @@ class MintGuards(Refresh):
             inspect.signature(cw.cluster_token).bind(self.env, "30m", bogus=1)
         for name in ("CW_STRICT", "FLEET_STRICT", "STRICT", "CW_CLUSTER_STRICT", "CW_MINT_STRICT"):
             for value in ("1", "0", "true", "false"):
-                env = dict(self.planted(), CW_KUBECTL="kubectl", PATH=self.bin + os.pathsep + os.environ.get("PATH", ""), **{name: value})
+                env = dict(self.planted(), CW_CLOUD_NAMESPACE="CW", PATH=self.bin + os.pathsep + os.environ.get("PATH", ""), **{name: value})
                 self.reset()
                 self.assertEqual(self._launch_call(cw, env), "ok", (name, value))   # still the launch's behaviour
                 self.assertTrue(any("FAKE_SECRET_VAR" in c for c in self.child_envs()))
-                env = dict(self.env, CW_KUBECTL="sh", **{name: value})
-                self.assertEqual(self.outcome(env=env), "kubectl-refused", (name, value))   # and the reaper's route stays strict
+                env = dict(self.env, CW_CLOUD_NAMESPACE="CW", **{name: value})
+                self.assertEqual(self.outcome(env=env), "namespace-refused", (name, value))   # and the reaper's route stays strict
         for flag in (["reap", "--strict"], ["--strict", "reap"], ["status", "--strict=false"], ["reap", "--strict", "1"]):
             with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
                 self.assertEqual(cw.main(flag, env=dict(self.env)), cw.EXIT_USAGE, flag)
@@ -809,24 +876,24 @@ class MintGuards(Refresh):
         module = self.mutate("recovery=None, strict=False):", "recovery=None, strict=True):")
         import inspect
         self.assertIs(inspect.signature(module.cluster_token).parameters["strict"].default, True)   # the default pin catches it
-        env = dict(self.env, CW_KUBECTL="kubectl", PATH=self.bin + os.pathsep + os.environ.get("PATH", ""))
-        self.assertEqual(self._launch_call(module, env), "kubectl-refused")   # the compatibility pin catches it
+        env = dict(self.env, CW_CLOUD_NAMESPACE="CW", PATH=self.bin + os.pathsep + os.environ.get("PATH", ""))
+        self.assertEqual(self._launch_call(module, env), "namespace-refused")   # the compatibility pin catches it
 
     def test_a_build_whose_reaper_relies_on_the_default_fails_the_guard_tests(self):
         module = self.mutate("now=now, strict=True)", "now=now)")   # the default is False: the reaper is no longer explicit
-        env = dict(self.env, CW_KUBECTL="sh")
-        self.assertNotEqual(module.ClusterTokenRefresher(env, self.clock).run().reason, cw.REFRESH_REASONS["kubectl-refused"])
+        env = dict(self.env, CW_CLOUD_NAMESPACE="CW")
+        self.assertNotEqual(module.ClusterTokenRefresher(env, self.clock).run().reason, cw.REFRESH_REASONS["namespace-refused"])
 
     def test_the_reapers_refresher_is_strict_and_a_build_with_strict_false_fails(self):
-        env = dict(self.env, CW_KUBECTL="sh")
+        env = dict(self.env, CW_CLOUD_NAMESPACE="CW")
         refresher = cw.ClusterTokenRefresher(env, self.clock)
-        self.assertEqual(refresher.run().reason, cw.REFRESH_REASONS["kubectl-refused"])
+        self.assertEqual(refresher.run().reason, cw.REFRESH_REASONS["namespace-refused"])
         self.assertEqual(self.vault_reads(), [])
         self.reset()
         module = self.mutate("now=now, strict=True)", "now=now, strict=False)")
-        env = dict(self.env, CW_KUBECTL="sh")
+        env = dict(self.env, CW_CLOUD_NAMESPACE="CW")
         mutant = module.ClusterTokenRefresher(env, self.clock)
-        self.assertNotEqual(mutant.run().reason, cw.REFRESH_REASONS["kubectl-refused"])
+        self.assertNotEqual(mutant.run().reason, cw.REFRESH_REASONS["namespace-refused"])
 
     def test_the_token_command_limit_is_a_named_constant_of_a_sane_value(self):
         self.assertEqual(cw.TOKEN_CMD_SECONDS, 60)
