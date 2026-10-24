@@ -207,6 +207,22 @@ class Table(unittest.TestCase):
             missing, _ = self.missing_deny_rows(conf)
             self.assertEqual(sorted(w for _, w in missing), [drop, drop], drop)
 
+    def test_low_lower_and_capitalised_method_words_are_denied_in_the_shell_layer_and_by_the_client(self):
+        for m in ("post", "Post", "patch", "Patch", "put", "Put", "delete", "Delete"):
+            for fl in ("-X", "--method"):
+                ex = "api %s %s repos/acme-org/widget-service/pulls/7/comments" % (fl, m)
+                with self.subTest(ex=ex):
+                    self.assertEqual(conf_decision(load_conf(), "gh " + ex), "deny")
+                    self.assertEqual(self.client(ex).returncode, 2)
+                    self.assertEqual(Rec.seen, [])
+        self.assertEqual(conf_decision(load_conf(), "gh api -X GET repos/acme-org/widget-service/pulls/7/comments"), "allow")
+
+    def test_low_an_unsupported_jq_expression_is_refused_before_any_request(self):
+        for expr in (".[]|.body", "map(.id)", ".a|length", "$ENV", ".[0].body?"):
+            p = self.client("api repos/acme-org/widget-service/issues/7/comments --jq " + expr)
+            self.assertEqual(p.returncode, 2, expr)
+            self.assertEqual(Rec.seen, [], expr)
+
 
 if __name__ == "__main__":
     unittest.main()

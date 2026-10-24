@@ -278,6 +278,7 @@ def order_problems(keys):
 PINNED = {'guard.sh': '9bff815feddd3424f2f853c8e002333474845ab7d8091f562bbd9256852a9321'}
 PINNED_JSON_WITHOUT_ADDED_ROWS = "c14522cff99b9223d881b9f80a3d3397f55ae15a5d6f12a2380b89c9de6fd4be"
 # Rows added to opencode-worker.json, in file order. A pin changes only in the ask whose approved plan names the rows:
+# Lower and capitalised method words after -X or --method are denied too (the glob is case sensitive; a mixed form such as pOsT is not covered here, the client refuses it).
 # asks 1166 and 1200 add their rows to THIS list.
 ADDED_ROWS = [   # ask 1083: DW-6 (read an issue's comments and the two pull request read paths, GET only; write methods and flags stay denied)
     ('gh api*/issues/*/comments', 'allow'),
@@ -290,6 +291,22 @@ ADDED_ROWS = [   # ask 1083: DW-6 (read an issue's comments and the two pull req
     ('gh api*/pulls/*/comments *', 'allow'),
     ('gh api*/pulls/*/comments?*', 'allow'),
     ('gh api*POST*', 'deny'),
+    ('gh api*-X post*', 'deny'),
+    ('gh api*--method post*', 'deny'),
+    ('gh api*-X Post*', 'deny'),
+    ('gh api*--method Post*', 'deny'),
+    ('gh api*-X patch*', 'deny'),
+    ('gh api*--method patch*', 'deny'),
+    ('gh api*-X Patch*', 'deny'),
+    ('gh api*--method Patch*', 'deny'),
+    ('gh api*-X put*', 'deny'),
+    ('gh api*--method put*', 'deny'),
+    ('gh api*-X Put*', 'deny'),
+    ('gh api*--method Put*', 'deny'),
+    ('gh api*-X delete*', 'deny'),
+    ('gh api*--method delete*', 'deny'),
+    ('gh api*-X Delete*', 'deny'),
+    ('gh api*--method Delete*', 'deny'),
     ('gh api* -f*', 'deny'),
     ('gh api* -F*', 'deny'),
     ('gh api*--field*', 'deny'),

@@ -549,6 +549,8 @@ def api_get(args):
         raise Fail("GraphQL is not available in this pod", 2)
     if not api_path_allowed(path):
         raise Fail("this api path is not in the pod's table (cloud/worker/guard-table.tsv)", 2)
+    if "jq" in opts:
+        jq_check(opts["jq"])   # an unsupported expression is refused BEFORE the request
     raw = request("GET", path).decode("utf-8", "replace")
     if "jq" in opts:   # a client-side filter of the GET answer: no further request
         for v in jq_apply(opts["jq"], parse_json(raw)):
