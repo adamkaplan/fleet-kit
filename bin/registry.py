@@ -407,6 +407,19 @@ def endpoint_problem(fields):
     return None
 
 
+NO_PANE_KINDS = ("cloud", "orchestrator")
+
+
+def no_pane_to_judge(row):
+    """THE predicate (#1181): this row has no pane to judge. A row of kind `cloud` or `orchestrator` (with or without an endpoint), or a row that holds an
+    endpoint and no pane. Every supervising reader of the dead verdict or the missing count asks it; none reads such a row as dead (PC-1)."""
+    if not isinstance(row, dict):
+        return False
+    if row.get("kind") in NO_PANE_KINDS:
+        return True
+    return row.get("endpoint") is not None and not row.get("pane")
+
+
 def route_for(row):
     """Where a message to this agent WOULD go (a function only: send does not call it yet): its pane when it has one (as before), else its registry endpoint; None when neither."""
     if not isinstance(row, dict):
