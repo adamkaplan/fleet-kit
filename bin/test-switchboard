@@ -75413,6 +75413,51 @@ class TestLoadAlert(Base):
         fig = self.latest()["orch"]
         self.assertEqual((fig["busy"], fig["idle"]), (1, 1))
 
+    def _cloud_run(self, patch=None):
+        """#1097 R-TEST-1/2: load_tick over a fake cloud record directory: lane orch has 2 live, 1 finished, 1 stale (past deadline), 1 unreadable record; lane orchb has none."""
+        cdir = self.state_dir / "cloud"
+        cdir.mkdir(exist_ok=True)
+        for n, extra in (("l1", {}), ("l2", {}), ("fin", {}), ("old", {"hard_deadline": "2001-01-01T00:00:00Z"})):
+            (cdir / (n + ".json")).write_text(json.dumps(dict({"worker": n, "reports_to": "orch"}, **extra)))
+        (cdir / "bad.json").write_text("{not json")
+        (self.state_dir / "last-reports.json").write_text(json.dumps({"fin": {"state": "done", "at": self.T0}}))
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=None,
+                                       config={"load_alert": self.health.validate({"enabled": True}, "x")})
+        mk = lambda n, role, status="idle", boss=None: types.SimpleNamespace(name=n, session_id=n, status=status, fleet={"role": role, "charter": 1, "repo": "acme/widget", "reports_to": boss})
+        discovery = types.SimpleNamespace(agents={"orch": mk("orch", "orchestrator"), "orchb": mk("orchb", "orchestrator"),
+                                                  "c1": mk("c1", "coder", "working", "orch"), "c2": mk("c2", "coder", "idle", "orch")})
+        if patch:
+            patch()
+        sb.load_tick(engine, discovery)
+        return self.latest()
+
+    def test_the_cloud_figure_is_in_the_load_record_and_the_health_status(self):
+        """Lane with cloud workers (2 live; finished, stale and unreadable records not counted), lane with none (0), local counts apart; the figure is also in the hourly series."""
+        latest = self._cloud_run()
+        self.assertEqual((latest["orch"]["busy"], latest["orch"]["idle"], latest["orch"]["cloud"]), (1, 1, 2))
+        self.assertEqual((latest["orchb"]["busy"], latest["orchb"]["idle"], latest["orchb"]["cloud"]), (0, 0, 0))
+        series = json.loads((self.state_dir / "load.json").read_text())["series"]["orch"]["hours"]
+        self.assertEqual([h["cloud"] for h in series.values()], [2])
+
+    def test_mutant_dropping_the_cloud_count_in_load_tick_is_caught(self):
+        original = sb.live_cloud_by_lane
+        sb.live_cloud_by_lane = lambda *a, **k: {}   # the mutant: the cloud count is dropped
+        try:
+            self.assertEqual(self._cloud_run()["orch"]["cloud"], 0)
+        finally:
+            sb.live_cloud_by_lane = original
+        self.assertEqual(self._cloud_run()["orch"]["cloud"], 2)   # the real build differs from the mutant
+
+    def test_mutant_dropping_the_cloud_figure_in_fleet_health_is_caught(self):
+        health = self.health
+        real = health.figures
+        health.figures = lambda name, info, *a, **k: real(name, dict(info, cloud=0), *a, **k)   # the mutant: health drops cloud
+        try:
+            self.assertEqual(self._cloud_run()["orch"]["cloud"], 0)
+        finally:
+            health.figures = real
+        self.assertEqual(self._cloud_run()["orch"]["cloud"], 2)
+
     def _load_names(self, orchs, retired=None, bodies=None, unreadable=False):
         """Run load_tick over `orchs` ({name: session}) and return the names that got figures."""
         if retired is not None:
