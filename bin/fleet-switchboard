@@ -10928,7 +10928,8 @@ def decisions_from_github(engine, now):
                       "bare": True, "repo": record["repo"], "tier": record.get("tier") or "human",
                       "rows": record.get("rows") or [], "raised_by": record.get("raised_by"),
                       "parent": record.get("parent"), "closed": bool(record.get("closed")),
-                      "waits_for": record.get("waits_for") or []})
+                      "waits_for": record.get("waits_for") or [],
+                      "plan_kind": hub.plan_kind(record["repo"], record["number"])})
     return items, problems
 
 
@@ -16665,6 +16666,31 @@ class GitHubHub:
         with self.lock:
             self._cache[key] = (now + GITHUB_LOOKUP_TTL, data)
         return data
+
+    def plan_kind(self, repo, number):
+        """"plan", "noplan" or "unknown" for an issue: whether a comment of it is the plan comment (the reading `plan check` uses,
+        plan_check.select_plan_text). One read of the first 100 comments per issue, cached for GITHUB_LOOKUP_TTL; a failed read is
+        remembered for GITHUB_LOOKUP_RETRY and says "unknown", never a guess."""
+        key = ("plan-kind", plan_ledger.normal_repo(repo), number)
+        now = self.now()
+        with self.lock:
+            cached = self._cache.get(key)
+            if cached and now < cached[0]:
+                return cached[1]
+        kind = "unknown"
+        ttl = GITHUB_LOOKUP_RETRY
+        try:
+            pages = self.gh_api("repos/%s/issues/%d/comments?per_page=100" % (repo, number), paginate=False,
+                                timeout=min(self.config["call_timeout_seconds"], GITHUB_ROUTE_READ_TIMEOUT))
+            comments = pages[0] if pages and isinstance(pages[0], list) else None
+            if comments is not None:
+                kind = "plan" if plan_check.select_plan_text("", comments)[1] != "issue body" else "noplan"
+                ttl = GITHUB_LOOKUP_TTL
+        except Exception:
+            pass
+        with self.lock:
+            self._cache[key] = (now + ttl, kind)
+        return kind
 
     def open_issues_count(self, repo):
         """The repository's own count of open issues and pull requests (`open_issues_count` of `repos/<repo>`), one read; None when it cannot be told. Raises GitHubUnavailable."""
