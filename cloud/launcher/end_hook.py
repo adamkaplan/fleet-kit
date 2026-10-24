@@ -27,7 +27,7 @@ HOST_URL = "https://github.com/"
 HELPER_DIR = "/run/cw-tmp/bin"   # the directory entrypoint.sh fills ($TMP/bin, TMP=/run/cw-tmp); the helper is git-credential-cw in it
 HELPER_NAME = "git-credential-cw"
 KEEP_ENV = ("PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TZ", "TMPDIR")
-REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")   # owner and name start with a letter or a digit
 
 
 def safe_opts(helper):
@@ -134,8 +134,6 @@ def config_refusal(workdir, repo, ctx):
 
 def run(workdir, worker, prestop=False, repo=None, ctx=None):
     url = HOST_URL + "%s.git" % repo if prestop else None
-    if prestop:
-        config_refusal(workdir, repo, ctx)
     status = git(workdir, "status", "--porcelain", "-z", "--untracked-files=all", ctx=ctx).stdout
     paths = [e[3:] for e in status.split("\0") if len(e) > 3]
     skipped = sorted(p for p in paths if is_secret(p))
@@ -163,41 +161,91 @@ def run(workdir, worker, prestop=False, repo=None, ctx=None):
     return {"pushed": True, "wip_branch": branch, "skipped": skipped}
 
 
+MAX_NAMES = 50
+PREFIX = "cw-prestop: "
+
+
+def unpushed_names(workdir, ctx, trusted):
+    """Names (never contents) of the files whose work is not on a remote, at most MAX_NAMES, sorted; best effort, never raises.
+    Untrusted configuration (a refusal, a bad name): only `ls-files --others` runs, which applies no filter and no hook; once the
+    configuration has passed the allow-list the status of the tree and the commits on no remote branch are listed too."""
+    names = set()
+
+    def add(text):
+        for n in text.replace("\0", "\n").split("\n"):
+            if n.strip():
+                names.add("".join(c if c.isprintable() else "?" for c in n)[:100])
+    try:
+        add(git(workdir, "ls-files", "--others", "--exclude-standard", "-z", check=False, ctx=ctx).stdout)
+        if trusted:
+            status = git(workdir, "status", "--porcelain", "-z", "--untracked-files=all", check=False, ctx=ctx).stdout
+            add("\n".join(e[3:] for e in status.split("\0") if len(e) > 3))
+            add(git(workdir, "log", "--name-only", "--pretty=format:", "-z", "HEAD", "--not", "--remotes", check=False, ctx=ctx).stdout)
+    except (OSError, ValueError):
+        pass
+    return sorted(names)
+
+
+def report(workdir, reason, ctx=None, trusted=False, names=True):
+    """THE durable trace: exactly one line with a stable prefix, on stdout AND stderr (cw-prestop keeps the last line in the container's
+    output, which the pod's log collector keeps; the launcher itself does not collect the hook's output). It says plainly that the work
+    is LOST when the pod ends, and lists the unpushed file names (at most MAX_NAMES) so a person can ask for them while the pod exists."""
+    own = None
+    listed = []
+    if names:
+        try:
+            if ctx is None:
+                own = ctx = Ctx("/nonexistent")
+            listed = unpushed_names(workdir, ctx, trusted)
+        except OSError:
+            listed = []
+        finally:
+            if own:
+                own.close()
+    line = "%snot pushed (%s); work left in %s and is LOST when the pod ends" % (PREFIX, reason, workdir)
+    if listed:
+        line += "; unpushed files: " + ", ".join(listed[:MAX_NAMES]) + (" (+%d more)" % (len(listed) - MAX_NAMES) if len(listed) > MAX_NAMES else "")
+    print(line)
+    print(line, file=sys.stderr)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    return 0
+
+
 def prestop_main():
     """--prestop: the branch is always <worker>/wip. The worker name comes from CW_WORKER, set by the pod spec (fixed at container start,
     the kubelet runs this hook with the spec's environment, not the coder's shell); no argument and no other variable is read.
-    silent when there is nothing to do; one JSON line on success or failure is replaced by plain text for cw-prestop."""
+    Silent only when there is nothing to save; EVERY other return prints one `cw-prestop: ...` line (see report)."""
     workdir, worker = os.environ.get("CW_WORKDIR", "/work/repo"), os.environ.get("CW_WORKER", "")
     if not valid_worker(worker):
-        print("cw-prestop: not pushed (the worker name is not valid); work left in %s" % workdir)
-        return 0
+        return report(workdir, "the worker name is not valid", names=False)
+    if not os.path.exists(os.path.join(workdir, ".git")):
+        return report(workdir, "there is no git repository here", names=False)
     if not os.path.isdir(os.path.join(workdir, ".git")):
-        return 0
+        return report(workdir, ".git is a file: a linked worktree or a separate git directory is not supported", names=False)
     repo = os.environ.get("CW_REPO", "")
-    if not REPO_RE.match(repo) or repo.startswith(".") or ".." in repo:
-        print("cw-prestop: not pushed (the repository name is not valid); work left in %s" % workdir)
-        return 0
+    if not REPO_RE.match(repo) or ".." in repo:
+        return report(workdir, "the repository name is not valid")
     helper = find_helper()
     if not helper:
-        print("cw-prestop: not pushed (the pod's credential helper was not found); work left in %s" % workdir)
-        return 0
+        return report(workdir, "the pod's credential helper was not found")
     ctx = Ctx(helper)
+    trusted = False
     try:
+        config_refusal(workdir, repo, ctx)
+        trusted = True
         res = run(workdir, worker, prestop=True, repo=repo, ctx=ctx)
         if res["pushed"]:
             print("cw-prestop: saved work to %s" % res["wip_branch"])
         return 0
     except OriginElsewhere:
-        print("cw-prestop: not pushed (origin points elsewhere); work left in %s" % workdir)
-        return 0
+        return report(workdir, "origin points elsewhere", ctx)
     except ConfigRefused as e:
-        print("cw-prestop: not pushed (the repository configuration is not a plain one: %s); work left in %s" % (e, workdir))
-        return 0
+        return report(workdir, "the repository configuration is not a plain one: %s" % e, ctx)
     except (RuntimeError, OSError) as e:
         msg = " ".join(str(e).split())
         msg = re.sub(r"https?://\S+", "<url>", msg)[:80]
-        print("cw-prestop: not pushed (%s); work left in %s" % (msg, workdir))
-        return 0
+        return report(workdir, msg, ctx, trusted)
     finally:
         ctx.close()
 

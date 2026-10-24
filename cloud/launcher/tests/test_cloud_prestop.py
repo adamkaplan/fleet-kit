@@ -124,8 +124,9 @@ class Hook(Base):
         p = self.hook()
         self.assertEqual((p.returncode, p.stdout + p.stderr), (0, ""))
         self.assertFalse([l for l in open(os.path.join(self.t, "calls")) if " push " in " " + l])
-        p = self.hook(CW_WORKDIR=os.path.join(self.t, "nothing"))
-        self.assertEqual((p.returncode, p.stdout + p.stderr), (0, ""))
+        p = self.hook(CW_WORKDIR=os.path.join(self.t, "nothing"))   # no repository: one line now (see EarlyReturns), never a push
+        self.assertEqual(p.returncode, 0)
+        self.assertEqual(len(p.stdout.strip().splitlines()), 1)
 
     def test_hanging_push_gives_up_inside_the_budget_with_one_line(self):
         if self.fake_timeout:
@@ -312,7 +313,7 @@ class Hostile(Base):
         self.assertEqual(self.pushes(), [])
         self.assertEqual(self.wip(), "")
         self.assertFalse(os.path.exists(self.marker))
-        self.assertEqual(p.stdout.strip(), "cw-prestop: not pushed (the repository configuration is not a plain one: core.sshcommand); work left in %s" % self.work)
+        self.assertEqual(p.stdout.strip(), "cw-prestop: not pushed (the repository configuration is not a plain one: core.sshcommand); work left in %s and is LOST when the pod ends; unpushed files: work.txt" % self.work)
 
     def test_origin_pointing_elsewhere_pushes_nothing_and_prints_one_line(self):
         for url in ("https://github.com/other-org/elsewhere.git", "git@github.com:other-org/widget-service.git"):
@@ -321,7 +322,7 @@ class Hostile(Base):
             p = self.run_hook(HOOK)
             self.assertEqual(self.pushes(), [])
             self.assertEqual(self.wip(), "")
-            self.assertEqual(p.stdout.strip(), "cw-prestop: not pushed (origin points elsewhere); work left in %s" % self.work)
+            self.assertEqual(p.stdout.strip(), "cw-prestop: not pushed (origin points elsewhere); work left in %s and is LOST when the pod ends; unpushed files: work.txt" % self.work)
         sh("git", "-C", self.work, "config", "remote.origin.url", "git@github.com:ACME-ORG/Widget-Service")
         self.good(HOOK)   # same repository after normalising case, scp form and .git
 
@@ -458,7 +459,8 @@ class Grammar(Base):
                 "GIT_CONFIG_PARAMETERS": "'%s'='%s'" % (key, value)}
 
     def non_config_calls(self):
-        return [c for c in self.calls_list() if " config --local " not in c]
+        # reading the configuration and listing the untracked file names (ls-files --others: no filter, no hook) are the only calls of a refusal
+        return [c for c in self.calls_list() if " config --local " not in c and " ls-files --others " not in c]
 
     def snapshot(self):
         """argv of every call and the environment of every call without the per-run values."""
@@ -618,7 +620,8 @@ class Grammar(Base):
         self.dirty()
         p = subprocess.run([self.seam(HOOK, helper_dir=os.path.join(self.t, "nowhere")), "--prestop"], env=self.env(), capture_output=True, text=True)
         self.assertIn("the pod's credential helper was not found", p.stdout)
-        self.assertEqual((self.wip(), self.calls_list()), ("", []))
+        self.assertEqual((self.wip(), self.non_config_calls()), ("", []))
+        self.assertEqual(len(p.stdout.strip().splitlines()), 1)
 
 
 
@@ -731,6 +734,66 @@ class Completeness(Base):
         m = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(m)
         self.assertNotEqual(set(INERT), set(m.ALLOWED_KEYS))   # the table test fails on any key added to the list
+
+
+class EarlyReturns(Base):
+    """Medium 1: every refusal and early return prints exactly ONE line with the stable prefix on stdout AND stderr, says the work is LOST,
+    and (where git can be asked safely) lists the unpushed file names, at most 50."""
+
+    def one_line(self, p, *needles):
+        for stream in (p.stdout, p.stderr):
+            lines = stream.strip().splitlines()
+            self.assertEqual(len(lines), 1, (p.stdout, p.stderr))
+            self.assertTrue(lines[0].startswith("cw-prestop: not pushed ("), lines[0])
+            self.assertIn("is LOST when the pod ends", lines[0])
+            for n in needles:
+                self.assertIn(n, lines[0])
+        self.assertEqual(p.stdout, p.stderr)
+        self.assertEqual(self.wip(), "")
+
+    def run_main(self, helper_dir=None, **kw):
+        return subprocess.run([self.seam(HOOK, helper_dir=helper_dir), "--prestop"], env=self.env(**kw), capture_output=True, text=True)
+
+    def test_each_early_return_prints_one_line(self):
+        self.dirty()
+        self.one_line(self.run_main(CW_WORKER="a/b"), "worker name")
+        self.one_line(self.run_main(CW_REPO="o/r@evil"), "repository name", "work.txt")
+        self.one_line(self.run_main(CW_REPO="../r"), "repository name")
+        self.one_line(self.run_main(helper_dir=os.path.join(self.t, "nowhere")), "credential helper", "work.txt")
+        self.one_line(self.run_main(CW_WORKDIR=os.path.join(self.t, "nothing")), "no git repository")
+        sh("git", "-C", self.work, "config", "core.sshCommand", "false")
+        self.one_line(self.run_main(), "not a plain one: core.sshcommand", "work.txt")
+
+    def test_a_push_failure_prints_one_line_with_the_names(self):
+        self.dirty()
+        shutil.rmtree(self.origin)
+        self.one_line(self.run_main(), "work.txt")
+
+    def test_names_only_and_at_most_fifty(self):
+        for i in range(60):
+            open(os.path.join(self.work, "f%02d.txt" % i), "w").write("SECRET-CONTENT")
+        sh("git", "-C", self.work, "config", "core.sshCommand", "false")
+        p = self.run_main()
+        self.one_line(p, "(+10 more)")
+        self.assertNotIn("SECRET-CONTENT", p.stdout)
+        self.assertEqual(p.stdout.count(".txt"), 50)
+
+    def test_the_prefix_line_reaches_the_container_output_through_cw_prestop(self):
+        self.dirty()
+        sh("git", "-C", self.work, "config", "core.sshCommand", "false")
+        p = self.hook()
+        self.assertEqual(len(p.stdout.strip().splitlines()), 1)
+        self.assertIn("LOST", p.stdout)
+
+    def test_a_mutant_that_returns_silently_is_caught(self):
+        s = open(HOOK).read()
+        mut = os.path.join(self.t, "mut-silent")
+        open(mut, "w").write(s.replace('return report(workdir, "the pod\'s credential helper was not found")', "return 0"))
+        self.assertNotEqual(open(mut).read(), s)
+        self.dirty()
+        p = subprocess.run([self.seam(mut, helper_dir=os.path.join(self.t, "nowhere")), "--prestop"], env=self.env(), capture_output=True, text=True)
+        with self.assertRaises(AssertionError):
+            self.one_line(p)
 
 
 class AutoGc(Base):

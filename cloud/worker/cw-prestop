@@ -8,7 +8,7 @@ export GIT_TERMINAL_PROMPT GCM_INTERACTIVE
 out=$(timeout -k 2 "$budget" cw-end-hook --prestop 2>&1)
 rc=$?
 if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-  out="cw-prestop: not pushed (timed out); work left in ${CW_WORKDIR:-/work/repo}"
+  out="cw-prestop: not pushed (timed out); work left in ${CW_WORKDIR:-/work/repo} and is LOST when the pod ends"
 fi
 if [ -n "$out" ]; then
   line=$(printf '%s\n' "$out" | tail -n 1)
