@@ -152,6 +152,9 @@ def helper_modules(entry_path):
 LOADER_MODULES = ("importlib", "pkgutil", "runpy", "pydoc", "imp", "zipimport", "builtins", "__builtins__")
 BUILTIN_NAMES = ("__import__", "exec", "eval", "compile", "load_module")
 LOADING_NAMES = BUILTIN_NAMES + ("import_module", "__builtins__", "builtins")   # a loading builtin reached as an attribute of any object
+LOADER_IDENTIFIERS = LOADER_MODULES + ("import_module", "find_spec", "spec_from_file_location", "spec_from_loader", "module_from_spec", "exec_module", "run_path",
+                                       "run_module", "SourceFileLoader", "SourcelessFileLoader", "ExtensionFileLoader", "zipimporter", "resolve_name", "load_source",
+                                       "load_compiled")   # an identifier of the import machinery: counted wherever it appears, whatever it was imported from
 NAMED_BY_STRING = LOADING_NAMES + ("sys",) + LOADER_MODULES   # the loading builtins and the modules themselves, reached by a string key   # a builtin named by a string key: a use of the builtin
 FOLLOWED = ("__import__", "import_module", "load_module")   # followed only as a direct call with a constant string; every other use is a site
 
@@ -217,6 +220,13 @@ def _followed_primitive(func, bound):
     return None
 
 
+def _chain_root(node):
+    """The Name at the root of `a.b.c`, or None."""
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return node if isinstance(node, ast.Name) else None
+
+
 def dynamic_uses(path):
     """[(line, scope, kind, how, constant)] for every use of a module that can load code by name, of `sys.modules` and of the loading builtins. `how` is
     `followed` (a direct call with a constant module name: `constant` holds it) or `site`. A kind is `import(module)` for an import statement, the module
@@ -240,6 +250,7 @@ def dynamic_uses(path):
                     if constant.split(".")[0] in LOADER_MODULES + ("sys",):   # `__import__("sys")` hands back the module object itself
                         uses.append((node.lineno, scope, "import(%s)" % constant.split(".")[0], "site", None))
     for node, scope in _walk_scopes(tree):
+        before = len(uses)
         if isinstance(node, ast.Import):
             for item in node.names:
                 if item.name.split(".")[0] in LOADER_MODULES:
@@ -292,6 +303,16 @@ def dynamic_uses(path):
             uses.append((node.lineno, scope, kind, "site", None))
         elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in NAMED_BY_STRING:
             uses.append((node.lineno, scope, "%s(string)" % node.value, "site", None))   # a loading builtin or `__builtins__` named by a string, wherever it is used
+        if len(uses) == before:   # nothing above counted this node: the identifiers of the import machinery count wherever they appear
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and id(node) not in consumed and node.id in LOADER_IDENTIFIERS:
+                uses.append((node.lineno, scope, node.id, "site", None))   # `imp`, `import_module`, `importlib` from any source
+            elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and id(node) not in consumed and node.attr in LOADER_IDENTIFIERS \
+                    and not (_chain_root(node) is not None and (_chain_root(node).id in bound or _chain_root(node).id in ("builtins", "__builtins__"))):
+                uses.append((node.lineno, scope, node.attr, "site", None))   # `pkg.runpy.run_path`, `spec.loader.exec_module`
+            elif isinstance(node, ast.ImportFrom):
+                for item in node.names:   # `from helpers import importlib`, `from .compat import import_module`: wherever it is imported from
+                    if item.name in LOADER_IDENTIFIERS or item.asname in LOADER_IDENTIFIERS:
+                        uses.append((node.lineno, scope, "import(%s)" % item.name, "site", None))
     return sorted(uses, key=lambda u: (u[0], u[2], u[3]))
 
 
@@ -704,20 +725,20 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
         "builtins.exec": ("import builtins\n\ndef f(text):\n    builtins.exec(text)\n", ["<module>:import(builtins)", "f:builtins"]),
         "constant exec": ("def f():\n    exec('import high')\n", ["f:exec"]),
         # round 1: what the primitive is BOUND to
-        "alias by assignment": ("imp = __import__\n\ndef f(n):\n    return imp(n)\n", ["<module>:__import__(reference)"]),
-        "alias with a constant call": ("imp = __import__\n\ndef f():\n    return imp('high')\n", ["<module>:__import__(reference)"]),
+        "alias by assignment": ("ld = __import__\n\ndef f(n):\n    return ld(n)\n", ["<module>:__import__(reference)"]),
+        "alias with a constant call": ("ld = __import__\n\ndef f():\n    return ld('high')\n", ["<module>:__import__(reference)"]),
         "from-import alias": ("from importlib import import_module as im\n\ndef f(n):\n    return im(n)\n", [IM, "f:importlib"]),
         "getattr call": ("import importlib\n\ndef f(n):\n    return getattr(importlib, 'import_module')(n)\n", [IM, "f:importlib", "f:import_module(string)"]),
         "getattr stored": ("import importlib\nload = getattr(importlib, 'import_module')\n", [IM, "<module>:importlib", "<module>:import_module(string)"]),
         "alias chain": ("a = __import__\nb = a\nc = b\nd = c\ne = d\n\ndef f(n):\n    return e(n)\n", ["<module>:__import__(reference)"]),
         "relative level two": ("from ..high import X\n", ["<module>:from-import(relative level 2)"]),
         # round 2: not an assignment statement at all
-        "parameter default": ("def f(n, imp=__import__):\n    return imp(n)\n", ["f:__import__(reference)"]),
-        "parameter default with a constant call": ("def f(imp=__import__):\n    return imp('high')\n", ["f:__import__(reference)"]),
-        "class attribute": ("class C:\n    imp = __import__\n\n    def run(self, n):\n        return self.imp(n)\n", ["C:__import__(reference)"]),
-        "conditional expression": ("imp = __import__ if True else None\n", ["<module>:__import__(reference)"]),
-        "annotated assignment": ("imp: object = __import__\n", ["<module>:__import__(reference)"]),
-        "walrus": ("def f(n):\n    return (imp := __import__)(n)\n", ["f:__import__(reference)"]),
+        "parameter default": ("def f(n, ld=__import__):\n    return ld(n)\n", ["f:__import__(reference)"]),
+        "parameter default with a constant call": ("def f(ld=__import__):\n    return ld('high')\n", ["f:__import__(reference)"]),
+        "class attribute": ("class C:\n    ld = __import__\n\n    def run(self, n):\n        return self.ld(n)\n", ["C:__import__(reference)"]),
+        "conditional expression": ("ld = __import__ if True else None\n", ["<module>:__import__(reference)"]),
+        "annotated assignment": ("ld: object = __import__\n", ["<module>:__import__(reference)"]),
+        "walrus": ("def f(n):\n    return (ld := __import__)(n)\n", ["f:__import__(reference)"]),
         "tuple assignment": ("a, b = __import__, 1\n", ["<module>:__import__(reference)"]),
         "functools.partial": ("import functools\n\ndef f():\n    return functools.partial(__import__, 'high')\n", ["f:__import__(reference)"]),
         "map": ("def f(names):\n    return list(map(__import__, names))\n", ["f:__import__(reference)"]),
@@ -761,6 +782,16 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
         "a loader module by its string key": ("def f(g):\n    return g['importlib']\n", ["f:importlib(string)"]),
         "a loader module named by getattr": ("def f(g):\n    return getattr(g, 'pkgutil')\n", ["f:pkgutil(string)"]),
         "__builtins__ with a constant __import__": ("def f():\n    return __builtins__.__import__('high')\n", ["f:__builtins__"]),
+        # round 7: an identifier of the import machinery counts wherever it appears, whatever it was imported from
+        "a loader module imported from a helper": ("from helpers import importlib\n\ndef f(n):\n    return importlib.import_module(n)\n", ["<module>:import(importlib)", "f:import_module(non-constant)", "f:importlib"]),
+        "a loader module imported relatively": ("from .compat import importlib\n\ndef f(n):\n    return importlib.import_module(n)\n", ["<module>:import(importlib)", "f:import_module(non-constant)", "f:importlib"]),
+        "a loader module as an attribute of any object": ("def f(pkg, x):\n    return pkg.runpy.run_path(x)\n", ["f:run_path", "f:runpy"]),
+        "import_module imported from elsewhere": ("from helpers import import_module\n\ndef f(n):\n    return import_module(n)\n", ["<module>:import(import_module)", "f:import_module"]),
+        "import_module imported from elsewhere, constant": ("from helpers import import_module\n\ndef f():\n    return import_module('high')\n", ["<module>:import(import_module)", "f:import_module"]),
+        "exec imported from elsewhere": ("from helpers import exec\n\ndef f(t):\n    exec(t)\n", ["f:exec"]),
+        "find_spec imported from elsewhere": ("from helpers import find_spec\n", ["<module>:import(find_spec)"]),
+        "exec_module on any object": ("def f(s, m):\n    s.loader.exec_module(m)\n", ["f:exec_module"]),
+        "a loader module aliased from a helper": ("from helpers import importlib as il\n\ndef f(n):\n    return il.import_module(n)\n", ["<module>:import(importlib)", "f:import_module(non-constant)"]),
         "star import of sys": ("from sys import *\n", ["<module>:import(sys.*)"]),
         "star import of a loader module": ("from importlib import *\n", [IM]),
         "load_module on an object": ("def f(loader, n):\n    return loader.load_module(n)\n", ["f:load_module(non-constant)"]),
@@ -779,6 +810,7 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
         "loader classes": ("from importlib.machinery import SourcelessFileLoader, ExtensionFileLoader\n\ndef f(p):\n    return SourcelessFileLoader('x', p), ExtensionFileLoader('y', p)\n",
                            [IM, "f:importlib", "f:importlib"]),
         "imp.load_compiled": ("import imp\n\ndef f(p):\n    return imp.load_compiled('x', p)\n", ["<module>:import(imp)", "f:imp"]),
+        "a local variable named imp (over-counted by design)": ("def f(imp):\n    return imp.x\n", ["f:imp"]),
     }
 
     def messages(self, sites):
@@ -804,9 +836,9 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
     def test_what_is_outside_the_stated_rule_is_silent_and_says_so(self):
         outside = {
             "a module object handed in by the caller": "def f(m, n):\n    return getattr(m, n)\n",
-            "exec_module on a spec that came from elsewhere": "def f(s, m):\n    s.loader.exec_module(m)\n",
+            "a name assembled at run time": "def f(g):\n    return g['sy' + 's']\n",
+            "a re-export under another name": "from helpers import loader as get\n\ndef f(n):\n    return get(n)\n",
             "globals() with a variable key": "def f(k, n):\n    return globals()[k](n)\n",
-            "a local variable named like a module that is not imported": "def f(imp):\n    return imp.x\n",
             "re.compile": "import re\nP = re.compile('x')\n",
             "reload on another object": "def f(x):\n    return x.reload()\n",
             "regex.compile as an attribute": "import regex\nP = regex.compile('x')\n",

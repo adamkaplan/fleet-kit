@@ -129,44 +129,61 @@ This is a closed, conservative rule. It over-counts by design and fails closed: 
 
 **What is a site.** Any `import` or `from ... import` of a module that can load code by name: `importlib` (and `importlib.util`, `importlib.machinery`), `pkgutil`, `runpy`, `pydoc`, `imp`, `zipimport`, `builtins`; any use of a name bound to one of them (the module object itself, however it is reached: a call, an attribute, `getattr`, a subscript, `vars(...)`, `__dict__`, `operator.attrgetter`, an argument, an alias, `m = importlib`); any use of `sys` other than its plain attributes `argv`, `executable`, `exit`, `path`, `platform`, `stderr`, `stdin`, `stdout` and `version_info` (so `sys.modules` however it is reached, `sys.__dict__`, `vars(sys)`, `getattr(sys, ...)`, `m = sys`, `from sys import modules` or `*`, `from X import sys`, `os.sys`, and the module object returned by `__import__("sys")` all count); `builtins` and `__builtins__`; the builtins `__import__`, `exec`, `eval` and `compile`, and the daemon's own `load_module` (also as `obj.load_module(...)` on any object), as a call with a non-constant, relative (leading dot) or package argument, as a reference (a default, a class attribute, a dict value, a conditional, a tuple, a walrus, an argument of `map` or `functools.partial`), or named by a string anywhere (a key, an argument, `.get("__import__")`, `itemgetter`, `getattr(x, "exec")`, `g["__builtins__"]`, a name in a list: any string that is exactly the name of a loading builtin, of `sys` or of one of these modules counts, so `globals()["sys"]` and `getattr(os, "sys")` are sites), or reached as an attribute of any object (`obj.load_module(...)`, `g["__builtins__"].__import__(...)`, `.eval(...)`; `re.compile` is not one); and a relative import of level two or more.
 
+**Identifiers.** Every occurrence of an identifier of the import machinery (the modules above, `import_module`, `find_spec`, `spec_from_file_location`, `spec_from_loader`, `module_from_spec`, `exec_module`, `run_path`, `run_module`, `SourceFileLoader`, `SourcelessFileLoader`, `ExtensionFileLoader`, `zipimporter`, `resolve_name`, `load_source`, `load_compiled`) as a name, an attribute of any object or an import alias is a site, wherever it was imported from (`from helpers import importlib`, `from .compat import import_module`, `pkg.runpy.run_path`, `spec.loader.exec_module`). A local variable that happens to be called `imp` counts: over-counting by design.
+
 **What is followed.** Only a direct call with a constant module name, spelled as such: `__import__("x")`, `importlib.import_module("x")`, `from importlib import import_module` then `import_module("x")`, and `load_module("x")` (also as `obj.load_module("x")` on any object); and the `load_x()` helpers. Everything else is a site, and the import statement of the module still counts as one.
 
-**What is outside the rule**, said plainly: a way to load code that involves none of these modules or builtins, for example a module object handed in by a caller (`def f(m, n): return getattr(m, n)`), a name looked up in `globals()` with a variable key, or `exec_module` on a spec that came from somewhere else. It is not listed and not chased.
+**What is outside the rule**, said plainly: a name re-exported under another name (`from helpers import loader as get`), a name assembled at run time (`'sy' + 's'`, an f-string), and a way to load code that involves none of these modules or builtins, for example a module object handed in by a caller (`def f(m, n): return getattr(m, n)`), a name looked up in `globals()` with a variable key. It is not listed and not chased.
 
 A site is listed by the function it sits in and its kind, with a count: `import(module)` for an import statement, the module name for a use of the module object, `sys.modules`, or the builtin with `(non-constant)`, `(relative)`, `(reference)` or `(string)`. A new site, a swapped site, a wrong count or a stale row fails the test.
 
 | Unit | Site | Count | What |
 |---|---|---|---|
-| `agent_reconcile.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name |
+| `agent_reconcile.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
+| `agent_reconcile.py` | `_load_registry:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `agent_reconcile.py` | `_load_registry:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `charter_check.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `closed_labels.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
-| `cloud_worker.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name |
+| `cloud_way_back_check.py` | `check:imp` | 3 | uses the module object (a call, an attribute, an argument) |
+| `cloud_way_back_check.py` | `check_fixture_shape:imp` | 4 | uses the module object (a call, an attribute, an argument) |
+| `cloud_worker.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
+| `cloud_worker.py` | `_lib:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `cloud_worker.py` | `_lib:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cloud_worker.py` | `_registry_note:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
+| `cloud_worker.py` | `_walk:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `cloud_worker.py` | `_walk:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cloud_worker.py` | `bind:sys.modules` | 1 | uses `sys` beyond its plain attributes |
+| `cloud_worker.py` | `model_entry:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `cloud_worker.py` | `model_entry:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
-| `cpu_guard.py` | `slots_text:import(importlib)` | 1 | imports a module that can load code by name |
+| `cpu_guard.py` | `slots_text:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `cpu_guard.py` | `slots_text:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `cpu_guard.py` | `slots_text:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
-| `external_adapter.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name |
+| `external_adapter.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
+| `external_adapter.py` | `_load_core:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `external_adapter.py` | `_load_core:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `external_adapter.py` | `_load_core:sys.modules` | 3 | uses `sys` beyond its plain attributes |
-| `fleet-switchboard` | `<module>:import(importlib)` | 1 | imports a module that can load code by name |
-| `fleet-switchboard` | `Installer.reaper_command_problem:import(importlib)` | 1 | imports a module that can load code by name |
+| `fleet-switchboard` | `<module>:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
+| `fleet-switchboard` | `Installer.reaper_command_problem:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `fleet-switchboard` | `Installer.reaper_command_problem:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `fleet-switchboard` | `Installer.reaper_command_problem:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `fleet-switchboard` | `_declared_module:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `fleet-switchboard` | `_declared_module:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `_declared_module:load_module(non-constant)` | 1 | a dynamic load |
 | `fleet-switchboard` | `_fleet_parts:compile` | 1 | compiles a part's text |
 | `fleet-switchboard` | `_fleet_parts:exec` | 1 | execs text |
 | `fleet-switchboard` | `_fleet_parts:exec(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `fleet-switchboard` | `_make_loader.loader:load_module(non-constant)` | 1 | a dynamic load |
-| `fleet-switchboard` | `launcher_module:import(importlib)` | 1 | imports a module that can load code by name |
+| `fleet-switchboard` | `launcher_module:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
+| `fleet-switchboard` | `launcher_module:import(importlib)` | 1 | imports a module that can load code by name, or one of its identifiers |
 | `fleet-switchboard` | `launcher_module:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `fleet-switchboard` | `load_module:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `fleet-switchboard` | `load_module:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `load_module:sys.modules` | 4 | uses `sys` beyond its plain attributes |
+| `fleet-switchboard` | `load_review_rule:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `fleet-switchboard` | `load_review_rule:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `fleet-switchboard` | `validate_app_config:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `fleet-switchboard` | `validate_app_config:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `fleet-switchboard` | `validate_hold_labels_config:exec_module` | 1 | uses an identifier of the import machinery (exec_module) |
 | `fleet-switchboard` | `validate_hold_labels_config:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `lanes.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `merged_labels.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
