@@ -87915,9 +87915,10 @@ class TestLatestRunOfWorkflow(unittest.TestCase):
         ci = load_ci_runs()
         self.WF = {r: (1, "push") for r in range(100, 106)}
         ci._CACHE.clear()
+        ci._FAILED.clear()
         old = ci.READER
         ci.READER = lambda repo, run: self.WF.get(run)
-        self.addCleanup(lambda: (setattr(ci, "READER", old), ci._CACHE.clear()))
+        self.addCleanup(lambda: (setattr(ci, "READER", old), ci._CACHE.clear(), ci._FAILED.clear(), setattr(ci, "_clock", __import__("time").monotonic)))
 
     @staticmethod
     def chk(flow, run, name, concl, status="COMPLETED"):
@@ -87950,7 +87951,7 @@ class TestLatestRunOfWorkflow(unittest.TestCase):
         self.assertEqual(load_ci_runs().not_green_runs(rollup), [])
         seen = []
         real = load_ci_runs().latest_runs
-        load_ci_runs().latest_runs = lambda r: (seen.append(1), real(r))[1]
+        load_ci_runs().latest_runs = lambda r, *a: (seen.append(1), real(r, *a))[1]
         self.addCleanup(setattr, load_ci_runs(), "latest_runs", real)
         sb.pr_ci_of(rollup)
         load_ci_runs().not_green_runs(rollup)
@@ -88084,6 +88085,78 @@ class TestLatestRunOfWorkflow(unittest.TestCase):
         self.assertEqual(got["why"], 'CI is pending at aaaaaaaa (only a complete, green run is recorded) ["ci" run 101 is queued]')
         got = why({})
         self.assertEqual(got["why"], "CI is none at aaaaaaaa (only a complete, green run is recorded)")
+
+    # --- ask #1237 round 2: bounded calls, the PR's own repo, bounded caches ---
+    def test_read_run_timeout_and_oserror_give_none(self):
+        import subprocess as sp
+        from unittest import mock
+        ci = load_ci_runs()
+        for exc in (sp.TimeoutExpired("gh", 20), OSError("no gh"), ValueError("x")):
+            with mock.patch.object(sp, "run", side_effect=exc):
+                self.assertIsNone(ci._read_run("o/r", 5))
+        with mock.patch.object(sp, "run", return_value=sp.CompletedProcess([], 0, '{"w": true, "e": "push"}', "")):
+            self.assertIsNone(ci._read_run("o/r", 5))   # a bool is not a workflow id
+        with mock.patch.object(sp, "run", return_value=sp.CompletedProcess([], 0, '{"w": 1, "e": "x" }'.replace('"x" ', '"' + "e" * 90 + '"'), "")):
+            self.assertIsNone(ci._read_run("o/r", 5))   # an event over the bound
+        with mock.patch.object(sp, "run", return_value=sp.CompletedProcess([], 0, '{"w": 1, "e": "push"}', "")) as run:
+            ci._read_run("o/r", 5)
+            self.assertEqual(run.call_args.kwargs["timeout"], ci.READ_TIMEOUT)
+
+    def test_many_distinct_runs_are_read_up_to_the_cap_and_the_rest_fail_closed_naming_the_cap(self):
+        ci = load_ci_runs()
+        calls = []
+        ci.READER = lambda repo, run: (calls.append(run), (run, "push"))[1]
+        rollup = [self.chk("ci", 200 + n, "t%d" % n, "SUCCESS") for n in range(15)]
+        bad = ci.not_green_runs(rollup)
+        self.assertEqual(len(calls), 10)
+        ci._CACHE.clear()
+        self.assertEqual(sb.pr_ci_of(rollup), "pending")
+        self.assertEqual(len(bad), 5)
+        self.assertIn("read cap 10", bad[0][2])
+
+    def test_a_url_naming_another_repo_is_unreadable_and_never_read(self):
+        ci = load_ci_runs()
+        calls = []
+        ci.READER = lambda repo, run: (calls.append(repo), (1, "push"))[1]
+        foreign = dict(self.chk("ci", 105, "t", "SUCCESS"), detailsUrl="https://github.com/evil/other/actions/runs/105/job/1")
+        rollup = [self.chk("ci", 100, "a", "FAILURE"), self.chk("ci", 101, "b", "SUCCESS"), foreign]
+        self.assertEqual(ci.not_green_runs(rollup)[-1], ('"ci"', 105, "identity_unreadable"))
+        self.assertEqual(calls, ["o/r", "o/r"])
+        self.assertEqual(sb.pr_ci_of(rollup), "pending")
+        self.assertEqual(ci.latest_runs([foreign], "o/r")[0]["status"], ci.UNREADABLE)
+        self.assertEqual(ci.own_repo([foreign, self.chk("ci", 1, "a", "SUCCESS"), self.chk("ci", 2, "a", "SUCCESS")]), "o/r")
+        self.assertEqual(ci.own_repo([foreign, self.chk("ci", 1, "a", "SUCCESS")]), "")   # a tie names none
+
+    def test_a_failed_read_is_retried_only_after_the_negative_cache_window(self):
+        ci = load_ci_runs()
+        now = [1000.0]
+        ci._clock = lambda: now[0]
+        calls = []
+        ci.READER = lambda repo, run: (calls.append(run), None)[1]
+        r = [self.chk("ci", 101, "t", "SUCCESS")]
+        for _ in range(3):
+            sb.pr_ci_of(r)
+        self.assertEqual(calls, [101])
+        now[0] += ci.FAIL_WINDOW + 1
+        sb.pr_ci_of(r)
+        self.assertEqual(calls, [101, 101])
+
+    def test_the_cache_key_keeps_two_repos_apart(self):
+        ci = load_ci_runs()
+        ci.READER = lambda repo, run: (1 if repo == "o/r" else 2, "push")
+        a, b = self.chk("ci", 101, "t", "SUCCESS"), dict(self.chk("ci", 101, "t", "SUCCESS"), detailsUrl="https://github.com/p/q/actions/runs/101/job/1")
+        ci.latest_runs([a], "o/r")
+        ci.latest_runs([b], "p/q")
+        self.assertEqual((ci._CACHE[("o/r", 101)], ci._CACHE[("p/q", 101)]), ((1, "push"), (2, "push")))
+
+    def test_the_caches_are_bounded_oldest_dropped(self):
+        ci = load_ci_runs()
+        for n in range(ci.CACHE_MAX + 20):
+            ci._put(ci._CACHE, ("o/r", n), (n, "push"))
+            ci._put(ci._FAILED, ("o/r", n), 0)
+        self.assertEqual((len(ci._CACHE), len(ci._FAILED)), (ci.CACHE_MAX, ci.CACHE_MAX))
+        self.assertNotIn(("o/r", 0), ci._CACHE)
+        self.assertIn(("o/r", ci.CACHE_MAX + 19), ci._CACHE)
 
 
 
