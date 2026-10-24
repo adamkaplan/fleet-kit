@@ -40,6 +40,7 @@ COPY worker/guard.sh worker/opencode-worker.json worker/agents/worker.md worker/
 COPY launcher/end_hook.py /usr/local/bin/cw-end-hook
 COPY launcher/token_mint.py /usr/local/bin/cw-token-mint
 COPY worker/activity.py /usr/local/bin/cw-worker-activity
+COPY worker/guard-table.tsv /usr/local/share/cw/guard-table.tsv
 COPY worker/cw-gh /usr/local/bin/cw-gh
 COPY worker/probe-reach.sh /usr/local/bin/cw-probe-reach
 COPY worker/bin/cloud_cli.py /usr/local/bin/cw-cloud
