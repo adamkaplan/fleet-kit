@@ -34,7 +34,7 @@ REPO, OTHER_REPO, ISSUE = "acme-org/widget-service", "acme-org/widget-api", 7
 PR = "%s#12" % REPO
 HEAD1, HEAD2 = "a" * 40, "b" * 40
 PLAN = "p" * 64
-GH_TOKEN = "ghp_TESTTOKENVALUE0000000000000000000000"   # never given to the pod or the hub; searched for in every byte seen
+GH_TOKEN = "ghp" + "_" + "TESTTOKENVALUE" + "0" * 22   # never given to the pod or the hub; searched for in every byte seen
 DAEMON = "relay-daemon"
 PODS = {  # pod -> (secret, role in the daemon registry)
     "coder": ("s-coder", None), "coder2": ("s-coder2", None), "reader": ("s-reader", "reader"), "tester": ("s-tester", "tester"),

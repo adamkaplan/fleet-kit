@@ -273,7 +273,8 @@ class Entrypoint(unittest.TestCase):
 # S3: each copy under cloud/worker equals its source when the source is in this checkout; a missing source is skipped by name
 COPIES = {"bin/cloud_cli.py": "cloud/worker/bin/cloud_cli.py", "bin/cloud_client.py": "cloud/worker/bin/cloud_client.py",
           "agents/opencode/orchestrator.md": "cloud/worker/agents/orchestrator.md", "bin/cloud_hub.py": "cloud/worker/bin/cloud_hub.py",
-          "bin/cloud_channel.py": "cloud/worker/bin/cloud_channel.py", "bin/cloud_channel_server.py": "cloud/worker/bin/cloud_channel_server.py"}
+          "bin/cloud_channel.py": "cloud/worker/bin/cloud_channel.py", "bin/cloud_channel_server.py": "cloud/worker/bin/cloud_channel_server.py",
+          "bin/cloud_relay.py": "cloud/worker/bin/cloud_relay.py"}
 
 
 def drift(root, source, copy):
@@ -302,7 +303,7 @@ class Drift(unittest.TestCase):
     def test_the_dockerfile_copies_each_file(self):
         text = open(os.path.join(ROOT, "cloud", "worker", "Dockerfile")).read()
         for needle in ("worker/agents/orchestrator.md", "worker/bin/cloud_cli.py /usr/local/bin/cw-cloud", "worker/bin/cloud_client.py",
-                       "worker/bin/cloud_hub.py", "worker/bin/cloud_channel.py", "worker/bin/cloud_channel_server.py"):
+                       "worker/bin/cloud_hub.py", "worker/bin/cloud_channel.py", "worker/bin/cloud_channel_server.py", "worker/bin/cloud_relay.py"):
             self.assertIn(needle, text)
 
 
