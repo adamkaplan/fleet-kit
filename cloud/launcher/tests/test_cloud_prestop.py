@@ -1,5 +1,5 @@
 """Ask #1142: the pod's pre-stop hook (cw-prestop / cw-end-hook --prestop). Fake cluster = run the rendered spec's own command."""
-import argparse, datetime as dt, os, shutil, subprocess, sys, tempfile, time, unittest
+import argparse, datetime as dt, importlib.machinery, importlib.util, os, re, shutil, subprocess, sys, tempfile, time, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -620,6 +620,117 @@ class Grammar(Base):
         self.assertIn("the pod's credential helper was not found", p.stdout)
         self.assertEqual((self.wip(), self.calls_list()), ("", []))
 
+
+
+# THE INERT TABLE: every allow-listed key and why git's own documentation makes it inert (it names no command, no path to run and no URL
+# other than the one compared to CW_REPO). git 2.43 documentation, git-config(1) and the sections named. A key whose value is a COMMAND,
+# a PATH or a URL is out; remote.origin.url and remote.origin.pushurl are the only URL keys and the hook compares them to CW_REPO.
+INERT = {
+    "core.repositoryformatversion": ("0", "a number the repository format check reads"),
+    "core.filemode": ("true", "a boolean: whether the executable bit is trusted"),
+    "core.bare": ("false", "a boolean: whether the repository has a work tree"),
+    "core.logallrefupdates": ("true", "a boolean: whether reflogs are written"),
+    "core.ignorecase": ("false", "a boolean: case folding of file names"),
+    "core.precomposeunicode": ("true", "a boolean: unicode normalisation of file names"),
+    "core.symlinks": ("true", "a boolean: whether symbolic links are real"),
+    "user.name": ("t", "a plain string written into commits"),
+    "user.email": ("t@invalid", "a plain string written into commits"),
+    "remote.origin.url": (URL, "the one URL key: compared to CW_REPO, and never used (the hook pushes to its own explicit URL)"),
+    "remote.origin.pushurl": (URL, "the other URL key: compared to CW_REPO, and never used"),
+    "remote.origin.fetch": ("+refs/heads/*:refs/remotes/origin/*", "a refspec: any value is harmless, the hook's fetch is explicit"),
+    "init.defaultbranch": ("main", "a branch name used only by git init"),
+    "receive.denycurrentbranch": ("refuse", "a policy word read by a receiving repository, never by the hook"),
+}
+INERT_FORMS = {"branch.main.remote": "origin", "branch.main.merge": "refs/heads/main", "branch.a.b.remote": ".", "branch.cw/task.merge": "refs/heads/x"}
+KEYS_FIXTURE = os.path.join(HERE, "fixtures", "git-2.43-config-keys.txt")   # `git help -c` of git 2.43.0, checked in as plain text
+
+
+def instantiate(name):
+    """A concrete key from a documentation key name: <placeholders> become x (remote names: evil, never origin)."""
+    if name.startswith("remote.<name>."):
+        name = name.replace("<name>", "evil", 1)
+    return re.sub(r"<[^>]*>", "x", name).replace("*", "x")
+
+
+class Completeness(Base):
+    """The allow-list is CLOSED: every key git documents that is not in the inert table is refused, so a key added later is refused too."""
+
+    def refusal(self, key, value):
+        cfg = os.path.join(self.work, ".git", "config")
+        with open(cfg, "w") as f:
+            f.write(self.plain)
+        try:
+            sh("git", "-C", self.work, "config", "--local", "--" + "add", key, value)
+        except subprocess.CalledProcessError:
+            return True   # git itself cannot store this name (a documentation pattern such as gitweb.remote_heads): it can never be in a repository
+        try:
+            cw_end_hook.config_refusal(self.work, REPO, self.ctx)
+        except (cw_end_hook.ConfigRefused, RuntimeError):   # RuntimeError: git cannot read the repository (core.worktree, extensions.*): nothing is pushed either
+            return True
+        return False
+
+    def setUp(self):
+        super().setUp()
+        self.plain = open(os.path.join(self.work, ".git", "config")).read()
+        self.ctx = cw_end_hook.Ctx(self.helper)
+        self.addCleanup(self.ctx.close)
+        self.ctx.env["PATH"] = "/usr/bin:/bin"
+
+    def doc_keys(self):
+        keys = [l.strip() for l in open(KEYS_FIXTURE) if l.strip() and not l.startswith("#")]
+        live = subprocess.run([GIT, "help", "-c"], capture_output=True, text=True)
+        if live.returncode == 0 and live.stdout.strip():
+            keys += [l.strip() for l in live.stdout.splitlines() if l.strip()]   # a newer git in the image adds its own keys
+        return sorted(set(keys))
+
+    def test_the_inert_table_is_exactly_the_allow_list(self):
+        self.assertEqual(set(INERT), set(cw_end_hook.ALLOWED_KEYS))
+        for key, (_, why) in INERT.items():
+            self.assertTrue(why and len(why) < 120, key)
+
+    def test_every_inert_key_is_accepted(self):
+        for key, (value, _) in INERT.items():
+            with self.subTest(key=key):
+                self.assertFalse(self.refusal(key, value))
+        for key, value in INERT_FORMS.items():
+            with self.subTest(key=key):
+                self.assertFalse(self.refusal(key, value))
+
+    def test_every_documented_key_not_in_the_table_is_refused(self):
+        keys = self.doc_keys()
+        self.assertGreater(len(keys), 800)
+        refused = 0
+        for name in keys:
+            key = instantiate(name)
+            if key.lower() in INERT or re.match(r"^branch\.[^.]+\.(remote|merge)$", key.lower()):
+                continue
+            with self.subTest(key=key):
+                self.assertTrue(self.refusal(key, "1"), "an undocumented-as-inert key is accepted: " + key)
+                refused += 1
+        self.assertGreater(refused, 800)
+
+    def test_the_branch_forms_are_exact(self):
+        for key, value in (("branch.main.remote", "evil"), ("branch.main.remote", "https://other.example/x.git"), ("branch.main.merge", "x"),
+                           ("branch.main.pushremote", "origin"), ("branch.main.rebase", "true"), ("branch.main.description", "x"),
+                           ("branch.autosetupmerge", "true"), ("branch.main.remote.x", "origin")):
+            with self.subTest(key=key, value=value):
+                self.assertTrue(self.refusal(key, value))
+
+    def write_mut(self, text):
+        path = os.path.join(self.t, "mut_eh.py")
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def test_a_wildcard_in_the_allow_list_is_caught(self):
+        s = open(HOOK).read()
+        for old, new in (("ALLOWED_KEYS = {", 'ALLOWED_KEYS = {"gc.recentobjectshook", '),):
+            self.assertIn(old, s)
+        mut = s.replace("ALLOWED_KEYS = {", 'ALLOWED_KEYS = {"gc.recentobjectshook", ')
+        spec = importlib.util.spec_from_loader("mut_eh", importlib.machinery.SourceFileLoader("mut_eh", self.write_mut(mut)))
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        self.assertNotEqual(set(INERT), set(m.ALLOWED_KEYS))   # the table test fails on any key added to the list
 
 
 class AutoGc(Base):
