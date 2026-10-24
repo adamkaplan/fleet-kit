@@ -618,6 +618,40 @@ class Grammar(Base):
         self.assertEqual((self.wip(), self.calls_list()), ("", []))
 
 
+
+class LaunchSequence(Base):
+    """Fail-closed must not mean fail-always: the config a normal launch writes (clone, task branch, the worker's identity, commit,
+    push -u) has ZERO refusals from the allow-list."""
+
+    def test_the_configuration_of_a_normal_clone_is_plain(self):
+        for depth in ((), ("--depth", "1")):
+            with self.subTest(depth=depth):
+                d = tempfile.mkdtemp(dir=self.t)
+                work = os.path.join(d, "repo")
+                sh("git", "clone", "-q", *depth, "file://" + self.origin, work)
+                sh("git", "-C", work, "checkout", "-q", "-b", "cw/task")
+                sh("git", "-C", work, "config", "user.name", "worker")
+                sh("git", "-C", work, "config", "user.email", "worker@users.noreply.github.com")
+                open(os.path.join(work, "n.txt"), "w").write("n")
+                sh("git", "-C", work, "add", "n.txt")
+                sh("git", "-C", work, "commit", "-qm", "c")
+                sh("git", "-C", work, "push", "-q", "-u", "origin", "cw/task")
+                keys = sh("git", "-C", work, "config", "--local", "--list", "--name-only").split()
+                print("keys of a normal clone (%s): %s" % (depth or "full", sorted(set(keys))))
+                sh("git", "-C", work, "remote", "set-url", "origin", URL)   # the pod's clone names the repository's address
+                ctx = cw_end_hook.Ctx(self.helper)
+                self.addCleanup(ctx.close)
+                ctx.env["PATH"] = "/usr/bin:/bin"   # the real git: the pod shell's PATH wrapper is not part of the test
+                cw_end_hook.config_refusal(work, REPO, ctx)   # raises on any refusal
+
+    def test_a_refusal_names_the_key_never_the_value(self):
+        sh("git", "-C", self.work, "config", "core.sshCommand", "SECRET-VALUE-MARK")
+        self.dirty()
+        p = subprocess.run([self.seam(HOOK), "--prestop"], env=self.env(), capture_output=True, text=True)
+        self.assertIn("not a plain one: core.sshcommand)", p.stdout)
+        self.assertNotIn("SECRET-VALUE-MARK", p.stdout + p.stderr)
+
+
 class Spec(unittest.TestCase):
     def test_every_pod_has_the_hook_and_the_grace(self):
         self.assertLess(cw.PRESTOP_BUDGET_SECONDS, cw.POD_TERMINATION_GRACE_SECONDS)
