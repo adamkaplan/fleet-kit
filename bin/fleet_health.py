@@ -794,6 +794,7 @@ def _refresh_asks(ctx, state, now, rows=()):
     state["unattributed"] = unattributed
     counts, nobody, notices = attribute_decisions(ctx, state, budget, asks_by_name, charter_numbers, now, problems)
     state["decision_counts"], state["decisions_unattributed"], state["pr_notices"] = counts, nobody, notices
+    state["cloud_unplaced"] = int(getattr(ctx, "cloud_unplaced", 0) or 0)   # #1097: live cloud workers whose boss is not an orchestrator lane (or has none)
     held = held_prs(ctx.state_dir)
     state["held_links"] = {k: sorted(v) for k, v in resolve_held_links(ctx, state, budget, held, now, problems).items()}
     state["reads"] = budget.to_state()
@@ -891,6 +892,8 @@ def status_lines(state_dir, now):
             num(f["oldest_stall_hours"]), num(f["moved_1h"]), num(f.get("charter_moves_1h")), f["messages"], num(f["decisions"]), f["busy"], f["idle"], (" +%d\u2601 cloud" % f["cloud"]) if f.get("cloud") else ""))
         if f.get("waiting_owner_pr") or f.get("waiting_time"):
             out[-1] += "; " + waiting_phrase(f)
+    if state.get("cloud_unplaced"):
+        out.append("  %d live cloud worker(s) with no orchestrator lane (no boss, or a boss that is not an orchestrator)" % state["cloud_unplaced"])
     if state.get("decisions_unattributed"):
         out.append("  %d decision(s) not attributed (the parent of their issue could not be read, or no orchestrator's charter is on its chain)" % state["decisions_unattributed"])
     if state.get("pr_notices"):

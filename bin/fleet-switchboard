@@ -27090,6 +27090,16 @@ CLOUD_NO_BOSS_LANE = "(no boss)"   # #1097: the named fallback lane of a cloud w
 _CLOUD_TRUNCATED = {}              # state dir -> True while the listing is cut (one audit line per episode)
 
 
+CLOUD_BOSS_MAX = 64
+
+
+def _cloud_boss(value):
+    """#1097: the lane key a record's reports_to gives: a string with its control characters removed and at most CLOUD_BOSS_MAX long; else "" (no boss)."""
+    if not isinstance(value, str):
+        return ""
+    return "".join(ch for ch in value if ch.isprintable())[:CLOUD_BOSS_MAX].strip()
+
+
 def _cloud_when(text):
     try:
         return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
@@ -27142,10 +27152,10 @@ def live_cloud_by_lane(state_dir, discovery, retired, last_reports, audit=None, 
                     continue   # no valid hard deadline is no evidence of life; a past one is an ended pod
                 if "last_report_at" in record:
                     seen = _cloud_when(record.get("last_report_at"))
-                    if seen is None or now - seen > CLOUD_LOAD_STALE_SECONDS:
-                        continue
-                boss = record.get("reports_to")
-                lane = resolve_boss(discovery, boss) if isinstance(boss, str) and boss else CLOUD_NO_BOSS_LANE
+                    if seen is None or seen > now or now - seen > CLOUD_LOAD_STALE_SECONDS:
+                        continue   # a future-dated report is not fresh (a forged or skewed clock cannot keep a record live)
+                boss = _cloud_boss(record.get("reports_to"))
+                lane = resolve_boss(discovery, boss) if boss else CLOUD_NO_BOSS_LANE
                 counts[lane] = counts.get(lane, 0) + 1
     except OSError as err:
         if audit is not None:
@@ -27184,6 +27194,7 @@ def load_tick(engine, discovery):
     retired, last_reports = listed["retired"], _read_small(engine.state_dir, LAST_REPORT_FILE)
     orchestrators = {}
     cloud_live = live_cloud_by_lane(engine.state_dir, discovery, retired, last_reports, engine.audit)
+    cloud_unplaced = sum(n for lane, n in cloud_live.items() if lane not in discovery.agents or (discovery.agents[lane].fleet or {}).get("role") != "orchestrator")   # live cloud workers no load row shows
     for name, seen in sorted(discovery.agents.items()):
         fleet = seen.fleet or {}
         if fleet.get("role") != "orchestrator":
@@ -27254,6 +27265,7 @@ def load_tick(engine, discovery):
     pending = []
     context = health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, read_parent=read_parent, cos=cos, wake=wake,
                                       time_up=budget.spent, pending=pending, reminders=reminders, pr_refs=pr_refs, links_gate=links_gate, notices_unread=getattr(engine, "notice_unread", 0), **meter)
+    context.cloud_unplaced = cloud_unplaced
     sent = health.tick(context)
     if getattr(context, "links_complete", False):
         engine.awaiting_held_links = False   # #796: one pass with every human-tier held PR's links whole: the alert may judge from now on

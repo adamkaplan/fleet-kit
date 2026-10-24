@@ -77285,6 +77285,33 @@ class TestCloudLoad(Base):
         self.assertIn("\\u2601 cloud", src)
         self.assertIn('(" +%d\\u2601 cloud" % f["cloud"]) if f.get("cloud")', src)
 
+    def test_a_boss_with_control_characters_is_cleaned_at_the_source_and_a_non_string_is_no_boss(self):
+        self.rec("e", reports_to="a\x1b[31mb\nc"); self.rec("l", reports_to="x" * 500); self.rec("n", reports_to=["orch"]); self.rec("i", reports_to=7)
+        out = self.count()
+        self.assertEqual(out["a[31mbc"], 1)
+        self.assertEqual(out["x" * sb.CLOUD_BOSS_MAX], 1)
+        self.assertEqual(out[sb.CLOUD_NO_BOSS_LANE], 2)
+        self.assertTrue(all(k.isprintable() and len(k) <= sb.CLOUD_BOSS_MAX for k in out))
+        mutant = self.mutant("_cloud_boss(record.get(\"reports_to\"))", "str(record.get(\"reports_to\") or \"\")")   # the mutant: the raw string is the key
+        self.assertNotEqual(self.count(mutant), out)
+
+    def test_a_future_dated_last_report_is_not_fresh(self):
+        self.rec("f", last_report_at="2998-01-01T00:00:00Z")
+        self.assertEqual(self.count(), {})
+        mutant = self.mutant("seen is None or seen > now or", "seen is None or")
+        self.assertEqual(mutant(self.state_dir, self.disc, {}, {}, None), {"orch": 1})
+
+    def test_a_cloud_worker_with_no_orchestrator_lane_is_shown_in_status(self):
+        fh = sb.load_fleet_health()
+        src = (BIN / "fleet_health.py").read_text()
+        self.assertIn('state.get("cloud_unplaced")', src)
+        self.assertIn('state["cloud_unplaced"] = int(getattr(ctx, "cloud_unplaced", 0) or 0)', src)
+        import tempfile
+        d = tempfile.mkdtemp()
+        (Path(d) / "load.json").write_text(json.dumps({"latest": {"o": {"open_asks": 0, "stalled": 0, "oldest_stall_hours": None, "moved_1h": 0, "messages": 0, "decisions": 0, "busy": 0, "idle": 0}}, "cloud_unplaced": 2}))
+        lines = fh.status_lines(d, 1000)
+        self.assertTrue(any("2 live cloud worker(s) with no orchestrator lane" in l for l in lines), lines)
+
     def test_now_is_injected(self):
         self.rec("w", hard_deadline="2030-01-01T00:00:00Z")
         self.assertEqual(self.disc and sb.live_cloud_by_lane(self.state_dir, self.disc, {}, {}, None, 1893456001.0 - 86400 * 365 * 5), {"orch": 1})
