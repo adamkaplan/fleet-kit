@@ -4281,7 +4281,7 @@ them) and to the PR's **head** (a push voids them; the view shows them as void, 
 | Last line | Meaning | Exit |
 |---|---|---|
 | `recorded #<id> (...)` | the record was written; `<id>` is its row in the ledger (several rows: `recorded #3, #4`) | 0 |
-| `already recorded #<id> (...)` | the same record was already the newest of its kind: nothing was written. The same record is the same pull request, head, scenario, kind, evaluator or reviewer, recording agent and judgement (result and plan hash; for a review, the verdict and the rating). A pass after a fail at one head is a new record. | 0 |
+| `already recorded #<id> (...)` | the same record was already the newest of its kind: nothing was written. The same record is the same pull request, head, scenario, kind, evaluator or reviewer, recording agent and judgement (result and plan hash; for a review, the verdict and the rating). The recording agent is part of the key for a verdict and a review (two testers' identical verdicts are two facts) but NOT for a `prove`: a prove is the author's step, so the same prove by another agent at the same head is `already recorded #<first id>`. A pass after a fail at one head is a new record, unless that key already holds a pass (see below). | 0 |
 | `not recorded: <reason>` | a refusal (a head that is not the pull request's, a scenario that does not exist, an evaluator that may not record) or the bound below; nothing was written, the status is not 0 (2 for a refusal, 1 for a timeout) | not 0 |
 
 **The bound.** Every wait of these commands (the ledger lock, each GitHub read, the agent registry that says who is calling) is bounded by ONE constant, `RECORD_WAIT_SECONDS` in `bin/plan_ledger.py` (30 seconds). After `RECORD_PROGRESS_SECONDS` (3) a wait says what it waits for (`waiting for the ledger lock`, `waiting for a GitHub read of ...`). At the bound the command ends:
@@ -4291,6 +4291,19 @@ not recorded: timed out after 30s, check the ledger before retrying (it was wait
 ```
 
 **Before a retry after a timeout, run that read-only command** (`fleet-switchboard gates <repo#N>`, which lists the proofs, verdicts and reviews held for the pull request at its head): if the record is there, it landed. A retry of a record that did land prints `already recorded #<id>` and writes nothing, so retrying is safe either way. The alarm is held back while an entry is written, so a command is never cut after its record landed. Before this change the ledger lock was the one wait with no bound (a held lock made a call wait until the caller killed it, which printed nothing), while the GitHub reads (8 seconds each) and the daemon start (2 seconds) already ended on their own.
+
+**A stale pass is refused.** Only the newest row of a key counts. Pass, fail, then pass again at one key would flip the verdict back to pass, so that third write is refused: nothing is written, the status is not 0, and the last line is:
+
+```text
+not recorded: a newer fail is recorded at this head: re-test at a new head or waive
+```
+
+The verdict stays fail. A fail after a pass still records (the more severe one wins).
+
+**Limits of the final line.**
+- The audit append and the review's read of the ledger run after the record is written. If the command is cut there, `not recorded` can be printed for a row that landed. This is narrow. A retry is safe: it prints `already recorded`.
+- Other ledger-writing commands are exempt: `waive`, `ci-record`, `item prove`, `item verdict`, `item tester` and `consensus`. They get the bounded lock but no final line.
+- A partial `prove` prints `recorded #..` on standard output and `not recorded: N of M scenarios refused` on standard error. The two lines are on different streams and are not unified; the exit status is 4.
 
 **The plan is the PR's, not the writer's:** the `PLAN: <link>` line of the PR body, else the plan of the PR's first ledger entry. `--plan` may only repeat it (or name the first plan when there is none yet); a different one is refused. Change the plan by changing the PR body's `PLAN:` line, which voids the earlier entries (the view says `PLAN CHANGED`). The plan's hash is computed from the GitHub text at that link.
 

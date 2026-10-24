@@ -22237,7 +22237,12 @@ def cmd_prove(args, runner, now):
                  "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
                  "evidence": evidence, "command": plan_ledger.clip(redact_command_text(args.command or "")),
                  "env": "%s %s" % (sys.platform, "python%d.%d" % sys.version_info[:2])}
-        stored, already = _record(ctx, args, now, entry)
+        try:
+            stored, already = _record(ctx, args, now, entry)
+        except plan_ledger.LedgerRefused as err:
+            print("not recorded: %s: %s" % (sid, err), file=sys.stderr)
+            refused += 1
+            continue
         outcomes.append((stored, already))
         print("%s proof #%d: %s %s at %s (%s), bound to plan %s" % ("already recorded" if already else "recorded", stored["seq"], sid, args.result,
                                                                     head[:8], ctx.pr, entry["plan_hash"][:19]))

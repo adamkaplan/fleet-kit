@@ -35002,8 +35002,8 @@ class TestPlanLedger(LedgerBase):
         self.all_proven()
         self.assertEqual(self.prove("coder", "S1", result="fail")[0], 0)
         self.assertEqual(self.gates()[0], 1)
-        self.assertEqual(self.prove("coder", "S1")[0], 0)
-        self.assertEqual(self.gates()[0], 0)
+        self.assertEqual(self.prove("coder", "S1")[0], 4)   # #1049 M1: a pass after pass, fail at one head is refused: the fail stays the newest
+        self.assertEqual(self.gates()[0], 1)
         self.assertEqual(self.verdict("cibot", "S1", "ci", "fail")[0], 0)
         code, report, _ = self.gates()
         self.assertEqual(code, 1)
@@ -35297,13 +35297,17 @@ class TestRecordingCommands(LedgerBase):
         self.assertEqual(len(self.ledger()) - base, 5)
 
     def test_a_pass_after_a_fail_at_one_head_is_a_new_record_and_a_retry_of_the_newest_is_not(self):
-        self.assertEqual(self.prove("coder", "U1", result="pass")[0], 0)
         self.assertEqual(self.prove("coder", "U1", result="fail")[0], 0)
         code, out, err = self.prove("coder", "U1", result="pass")
         self.assertEqual(code, 0, err)
-        self.assertRegex(self.last(out), r"^recorded #4 ")                                  # the newest was the fail: the latest reader must see the pass
+        self.assertRegex(self.last(out), r"^recorded #3 ")                                  # the newest was the fail, no pass before it: the latest reader must see the pass
         code, out, err = self.prove("coder", "U1", result="pass")
-        self.assertRegex(self.last(out), r"^already recorded #4 ")
+        self.assertRegex(self.last(out), r"^already recorded #3 ")
+        # #1049 M1: pass, fail, pass at one key is a stale retry; it is refused (S8 in the verdict test) and the fail stays the newest
+        self.assertEqual(self.prove("coder", "U1", result="fail")[0], 0)
+        code, out, err = self.prove("coder", "U1", result="pass")
+        self.assertNotEqual(code, 0)
+        self.assertIn("not recorded: U1: a newer fail is recorded at this head", err)
 
     def test_two_testers_identical_verdicts_are_two_records(self):
         self.assertEqual(self.verdict("tst", "S2", "tester")[0], 0)
@@ -35377,6 +35381,62 @@ class TestRecordingCommands(LedgerBase):
             with self.subTest(command=name), mock.patch.object(sb, "EXIT_USAGE", 0):
                 with self.assertRaises(AssertionError):
                     self.check_refusal(name)
+
+    # -- #1049 S8 / S9: a stale pass never flips a fail back; `by` is in the key for a verdict and a review, not for a prove
+
+    REFUSAL = "a newer fail is recorded at this head: re-test at a new head or waive"
+
+    def check_stale_pass(self):
+        self.assertEqual(self.run_as("tst", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "judged it")[0], 0)
+        self.assertEqual(self.run_as("tst", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "fail", "--evidence", "broke")[0], 0)
+        before = len(self.rows("verdict"))
+        code, out, err = self.run_as("tst", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "judged it")
+        self.assertNotEqual(code, 0, out)
+        self.assertEqual(self.last(err), "not recorded: " + self.REFUSAL)
+        self.assertEqual(len(self.rows("verdict")), before, "the stale pass wrote a row")
+        self.assertEqual(self.rows("verdict")[-1]["result"], "fail")
+
+    def test_s8_a_pass_retry_after_a_newer_fail_is_refused_and_writes_nothing(self):
+        self.check_stale_pass()
+
+    def test_s8_a_fail_after_a_pass_still_records(self):
+        self.assertEqual(self.run_as("tst", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "x")[0], 0)
+        code, out, err = self.run_as("tst", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "fail", "--evidence", "y")
+        self.assertEqual(code, 0, err)
+        self.assertRegex(self.last(out), r"^recorded #\d+ ")
+
+    def test_s8_a_mutant_that_writes_the_third_row_is_caught(self):
+        with mock.patch.object(self.ledger_module, "stale_pass", lambda entries, entry: False):
+            with self.assertRaises(AssertionError):
+                self.check_stale_pass()
+
+    def check_prove_key(self):
+        self.assertEqual(self.prove("coder", "S1")[0], 0)   # (setUp proved S1 by the coder already)
+        before = len(self.rows("prove"))
+        code, out, err = self.prove("tst", "S1")
+        self.assertEqual(code, 0, err)
+        self.assertRegex(self.last(out), r"^already recorded #\d+ ")
+        self.assertEqual(len(self.rows("prove")), before, "a prove by another agent wrote a row")
+
+    def test_s9_a_prove_by_another_agent_is_already_recorded(self):
+        self.check_prove_key()
+
+    def test_s9_a_verdict_by_another_agent_is_a_second_row(self):
+        self.configure({"reviewer": ["rev"], "tester": ["tst", "other"], "owner": ["own"], "ci": ["cibot"]})
+        self.assertEqual(self.run_as("tst", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "a")[0], 0)
+        n = len(self.rows("verdict"))
+        code, out, err = self.run_as("other", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "b")
+        self.assertEqual(code, 0, err)
+        self.assertRegex(self.last(out), r"^recorded #")
+        self.assertEqual(len(self.rows("verdict")), n + 1)
+
+    def test_s9_a_mutant_with_by_in_the_prove_key_is_caught(self):
+        real = self.ledger_module.record_identity
+        def mutant(entry):
+            return real(entry) + (entry.get("by"),)
+        with mock.patch.object(self.ledger_module, "record_identity", mutant):
+            with self.assertRaises(AssertionError):
+                self.check_prove_key()
 
     def test_the_documentation_states_the_three_outcomes_and_the_check_before_a_retry(self):
         text = (BIN.parent / "docs" / "switchboard.md").read_text(encoding="utf-8")

@@ -48,6 +48,10 @@ class LedgerError(Exception):
     """The ledger cannot be written or read as it must be."""
 
 
+class LedgerRefused(LedgerError):
+    """A record the ledger refuses to write (#1049): nothing was written."""
+
+
 class LedgerLockTimeout(LedgerError):
     """The ledger lock was not free within RECORD_WAIT_SECONDS: nothing was written."""
 
@@ -262,8 +266,23 @@ RECORDED_KINDS = tuple(JUDGED_FIELDS)   # the kinds the recording commands write
 
 
 def record_identity(entry):
+    # a proof is the author's step: the same proof by another agent is the same record; a verdict or a review by another agent is its own fact
     return (entry.get("kind"), entry.get("pr"), entry.get("head"), entry.get("scenario"), entry.get("evaluator") or entry.get("reviewer"),
-            entry.get("by"))
+            None if entry.get("kind") == "proof" else entry.get("by"))
+
+
+STALE_PASS_REASON = "a newer fail is recorded at this head: re-test at a new head or waive"
+
+
+def stale_pass(entries, entry):
+    """True when `entry` is a pass whose key already holds a pass, with a newer fail after it: writing it would flip the verdict back (#1049)."""
+    if entry.get("kind") not in EVIDENCE_KINDS or entry.get("result") != "pass":
+        return False
+    ident = record_identity(entry)
+    same = [e for e in entries if record_identity(e) == ident]
+    if not same or same[-1].get("result") != "fail":
+        return False
+    return any(e.get("result") == "pass" and e.get("plan_hash") == entry.get("plan_hash") for e in same)
 
 
 def already_recorded(entries, entry):
@@ -296,6 +315,8 @@ def append_once(state_dir, entries_in, now):
                 if found is not None:
                     out.append((found, True))
                     continue
+                if stale_pass(have + fresh, entry):
+                    raise LedgerRefused(STALE_PASS_REASON)
                 one = dict(entry, seq=len(have) + len(fresh) + 1, ts=int(now), prev=prev)
                 one["hash"] = entry_hash(one)
                 fresh.append(one)
