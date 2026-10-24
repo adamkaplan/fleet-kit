@@ -36,6 +36,8 @@ Launcher, reaper, end hook and token mint for cloud workers, built to `docs/clou
   (`CW_CLOUD_SERVER`), the namespace (`CW_CLOUD_NAMESPACE`), the token file (`CW_CLOUD_TOKEN_FILE`), the vault names (`CW_VAULT_NAME`,
   `CW_VAULT_SUBSCRIPTION`), `CW_CLUSTER_ADMIN_SECRET` (the NAME of the vault secret, not its content), and optionally
   `CW_CLUSTER_TOKEN_DURATION`.
+  The fixed kubectl and az lists are /opt/homebrew/bin, /usr/local/bin and /usr/bin: the check requires a regular executable that is not group- or world-writable and owned by root or the reaper's own user, and it does not check the parent directories. Homebrew's directory is writable by the installing user, so a process running as the same user can plant a user-owned executable there: a residual of any same-user service, not a fix.
+  The reaper's az keeps HOME and AZURE_CONFIG_DIR from the reaper's environment: whoever sets that environment can change which login state az uses, but not which program runs.
   **The minter credential is LONG-LIVED.** The vault holds a long-lived minter token for ONE account's tokens (`cw-operator` in the cloud
   namespace): not cluster admin, but not short-lived. The Secret `cw-minter-token` is a `kubernetes.io/service-account-token` Secret, so the
   control plane fills it with a NON-EXPIRING bearer token for `cw-minter`. Whoever reads that vault secret can mint `cw-operator` tokens (up to
