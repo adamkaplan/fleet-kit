@@ -110,6 +110,28 @@ os.execv(sys.executable, [sys.executable, os.environ["FAKE_REAL_KUBECTL"]] + arg
 ''' % (TOKEN_HEADER, TOKEN_SIGNATURE)
 
 
+ENV_MARKER = "--- invocation ---"
+# The wrapper's own variables: sh adds them at its start; they are not the reaper's.
+SHELL_ADDED = {"PWD", "SHLVL", "_"}
+
+
+def read_env_log(path):
+    """The environments a wrapper recorded (one dict per invocation), minus the shell's own three names."""
+    out = []
+    try:
+        with open(path) as f:
+            for line in f.read().split("\n"):
+                if line == ENV_MARKER:
+                    out.append({})
+                elif out and "=" in line:
+                    k, v = line.split("=", 1)
+                    if k not in SHELL_ADDED:
+                        out[-1][k] = v
+    except OSError:
+        pass
+    return out
+
+
 def load_installer():
     """The installer (bin/<the kit's own program>) by path: it renders the reaper's service file."""
     path = os.path.join(ROOT, "bin", "fl" + "eet-switchboard")   # the name is written in two parts: the neutral-names test bans it under cloud/
@@ -193,10 +215,26 @@ class Refresh(base.Base):
         cw.MINT_KUBECTL_PATHS, cw.MINT_AZ_PATHS = REAL_KUBECTL_PATHS, REAL_AZ_PATHS
 
     # -- the fakes --
+    interpreter = "/usr/bin/env python3"   # the seam: what the wrapper runs the python body with
+
     def write_fake(self, name, text):
+        """A python fake is two files: a POSIX shell wrapper (the program the reaper runs) that records its raw environment BEFORE any
+        interpreter starts, then runs the python body (<name>.py) unchanged. Other texts are written as they are."""
         path = os.path.join(self.bin, name)
-        with open(path, "w") as f:
-            f.write(text)
+        if text.startswith("#!/usr/bin/env python3"):
+            with open(path + ".py", "w") as f:
+                f.write(text)
+            log = path + ".envlog"
+            guard = ' case " $* " in *" cw-operator "*) ;; *) exec %s "$0.PY" "$@";; esac\n' % self.interpreter if name.endswith("kubectl") else ""
+            guard = guard.replace('"$0.PY"', '"%s.py"' % path)
+            script = ("#!/bin/sh\n" + guard.replace(" case", "case", 1) +
+                      "{ echo '%s'; env; } >> '%s'\n" % (ENV_MARKER, log) +
+                      'exec %s "%s.py" "$@"\n' % (self.interpreter, path))
+            with open(path, "w") as f:
+                f.write(script)
+        else:
+            with open(path, "w") as f:
+                f.write(text)
         os.chmod(path, 0o755)
         return path
 
@@ -846,10 +884,7 @@ class MintGuards(Refresh):
 
     # -- the child's environment --
     def child_envs(self):
-        out = [e["env"] for e in self.token_log()]
-        with open(self.vault_log + ".env") as f:
-            out += [json.loads(l) for l in f if l.strip()]
-        return out
+        return (read_env_log(os.path.join(self.bin, "kubectl.envlog")) + read_env_log(os.path.join(self.bin, "az.envlog")))
 
     def planted(self):
         return dict(self.env, FAKE_SECRET_VAR="s" + "x" * 12, GITHUB_TOKEN="g" + "y" * 12, CW_HUB_PASSWORD="h" + "z" * 12, LANG="C.UTF-8")
@@ -867,6 +902,38 @@ class MintGuards(Refresh):
             self.assertEqual(child["HOME"], self.home)
             self.assertLessEqual(set(child), {"PATH", "HOME", "LANG", "KUBECONFIG", "AZURE_CONFIG_DIR", "LC_CTYPE"}, sorted(child))
         self.assertNotIn("AZURE_CONFIG_DIR", found[0])
+
+    def apple_shim(self):
+        """A python3 that injects the variables Apple's shim adds, then runs the real python."""
+        path = os.path.join(self.tmp.name, "apple-python3")
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\nexport CPATH=/x LIBRARY_PATH=/x MANPATH=/x SDKROOT=/x __CF_USER_TEXT_ENCODING=0x1F5:0:0\nexec %s \"$@\"\n" % sys.executable)
+        os.chmod(path, 0o755)
+        return path
+
+    def with_shim(self):
+        Refresh.interpreter = self.apple_shim()
+        self.addCleanup(setattr, Refresh, "interpreter", "/usr/bin/env python3")
+        self.write_fake("az", FAKE_AZ)
+        self.write_fake("kubectl", FAKE_KUBECTL)
+
+    def test_interpreter_noise_cannot_matter_to_the_minimal_environment_check(self):
+        self.with_shim()
+        self.assertEqual(self.outcome(env=self.planted()), "ok")
+        found = self.child_envs()
+        self.assertEqual(len(found), 2)
+        for child in found:
+            self.assertLessEqual(set(child), {"PATH", "HOME", "LANG", "KUBECONFIG", "AZURE_CONFIG_DIR", "LC_CTYPE"}, sorted(child))
+        with open(os.path.join(self.bin, "az.py")) as f:   # the shim really ran: the python body's own view has the noise
+            self.assertIn("os.environ", f.read())
+
+    def test_the_mutant_that_passes_the_whole_environment_still_fails_with_the_shim(self):
+        self.with_shim()
+        module = self.mutate("env=child_env", "env=env")
+        self.assertEqual(self.outcome(module, self.planted()), "ok")
+        found = self.child_envs()
+        self.assertTrue(any("FAKE_SECRET_VAR" in c for c in found))
+        self.assertFalse(all(set(c) <= {"PATH", "HOME", "LANG", "KUBECONFIG", "AZURE_CONFIG_DIR", "LC_CTYPE"} for c in found))
 
     def test_the_az_settings_directory_passes_only_when_the_person_set_it(self):
         self.assertEqual(self.outcome(env=dict(self.env, AZURE_CONFIG_DIR="/home/acme/.azure")), "ok")
