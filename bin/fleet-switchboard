@@ -20503,6 +20503,10 @@ def cmd_item_ci_record(args, runner, now):
                 _item_audit(ctx, "plan.item.ci_record", dict(audit, ok=False, why=refusal))
                 raise LedgerCommandError("%s at %s: nothing was recorded" % (refusal, pin[:8]))
             runs = ci_mod.latest_check_runs(runs, ctx.repo)
+            absent = ci_mod.missing_workflows_of_checks(runs, (setting or {}).get("ci_workflows") or [], ctx.repo)
+            if absent:
+                _item_audit(ctx, "plan.item.ci_record", dict(audit, ok=False, why="; ".join(absent[:3])))
+                raise LedgerCommandError("%s at %s: nothing was recorded" % ("; ".join(absent[:3]), pin[:8]))
     except (IntentError, AttributeError) as err:
         _item_audit(ctx, "plan.item.ci_record", dict(audit, ok=False, why="the checks could not be read: %s" % _one_line(str(err), 120)))
         raise LedgerCommandError("the checks at %s could not be read: nothing was recorded" % pin[:8]) from None
@@ -22262,7 +22266,7 @@ def ci_record_core(ctx, now, quiet=False):
     if not head:
         return dict(out, status="no-head", why="the PR's head is unknown")
     expected = (plan_ledger.repo_setting(getattr(ctx, "config", None) or {}, getattr(ctx, "repo", "")) or {}).get("ci_workflows") or []
-    absent = load_module("ci_runs").missing_workflows(load_module("ci_runs").newest((ctx.facts or {}).get("ci_rollup")), expected)
+    absent = load_module("ci_runs").missing_workflows(load_module("ci_runs").newest((ctx.facts or {}).get("ci_rollup")), expected, getattr(ctx, "repo", None))
     if absent:
         if not quiet:
             _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="; ".join(absent[:3])))

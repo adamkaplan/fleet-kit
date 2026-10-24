@@ -84958,7 +84958,7 @@ class TestItemVerdicts(unittest.TestCase):
     # ---- S3/S4: CI verdicts of the repository's own checks
     RUN = {"name": "build", "status": "completed", "conclusion": "success", "app": {"slug": "github-actions"}}
 
-    def ci(self, runs, on_branch=True, checks=True):
+    def ci(self, runs, on_branch=True, checks=True, workflows=None):
         self.register()
         self.pages.update({"repos/%s" % self.REPO: {"default_branch": "main"},
                            "repos/%s/compare/main...%s" % (self.REPO, self.PIN): {"status": "identical" if on_branch else "diverged"},
@@ -84968,6 +84968,8 @@ class TestItemVerdicts(unittest.TestCase):
         ctx = self.ctx()
         if not checks:
             ctx.config = {"plan_gates": {"repos": {self.REPO: {}}}}
+        if workflows is not None:
+            ctx.config["plan_gates"]["repos"][self.REPO]["ci_workflows"] = workflows
         with mock.patch.object(sb, "item_context", lambda a, r, n, w: ctx):
             try:
                 return sb.cmd_item_ci_record(types.SimpleNamespace(rest=[self.ITEM], plan=None, ask=None), None, self.now), None
@@ -85029,6 +85031,83 @@ class TestItemVerdicts(unittest.TestCase):
             code, why = self.ci([self._wf(100, "cancelled"), self._wf(101, "success")])
         self.assertIsNone(code)
         self.assertIn("did not succeed", why)
+
+    # ---- #1237 round 3: ONE fixtures table of API shapes, run through BOTH the gate and the item path: the same verdict from both
+    def _cr(self, run, concl, job=1, at="10", cid=1, name="build", status="completed"):
+        return dict(self.RUN, name=name, conclusion=concl, status=status, id=cid, started_at="2026-10-15T%s:00:00Z" % at, completed_at="2026-10-15T%s:30:00Z" % at,
+                    details_url="https://github.com/%s/actions/runs/%d/job/%d" % (self.REPO, run, job))
+
+    def shape_rows(self):
+        """(label, check runs in the Checks API shape, {run id: (workflow id, display name)} (a missing run is unreadable), expected workflow ids, green?)."""
+        cr = self._cr
+        many = [cr(100, "success", name="x%d" % i, cid=i) for i in range(1, 120)] + [cr(100, "success", cid=500), cr(101, "failure", cid=501)]
+        return [
+            ("green baseline", [cr(100, "success")], {100: (1, "ci")}, [], True),
+            ("cancelled-then-green", [cr(100, "cancelled"), cr(101, "success")], {100: (1, "ci"), 101: (1, "ci")}, [], True),
+            ("rerun inside one run", [cr(100, "cancelled", job=1, at="10", cid=1), cr(100, "success", job=2, at="11", cid=2)], {100: (1, "ci")}, [], True),
+            ("rerun inside one run, the newest red", [cr(100, "success", job=1, at="10", cid=1), cr(100, "failure", job=2, at="11", cid=2)], {100: (1, "ci")}, [], False),
+            ("two workflows with one display name, one red", [cr(100, "success"), cr(101, "failure")], {100: (1, "ci"), 101: (2, "ci")}, [], False),
+            ("more than one page", many, {100: (1, "ci"), 101: (2, "ci")}, [], False),
+            ("a missing expected workflow", [cr(100, "success")], {100: (1, "ci")}, ["2"], False),
+            ("an expected workflow present", [cr(100, "success")], {100: (7, "anything")}, ["7"], True),
+            ("an author-named workflow test", [cr(100, "success")], {100: (9, "test")}, ["7"], False),
+            ("unreadable identity", [cr(100, "success")], {}, [], False),
+        ]
+
+    def gate_verdict(self, runs, wf, expected):
+        names = {100: "ci", 101: "ci"}
+        rollup = [{"workflowName": wf.get(int(r["details_url"].split("/runs/")[1].split("/")[0]), (0, "ci"))[1], "name": r["name"], "conclusion": r["conclusion"].upper(), "status": "COMPLETED",
+                   "startedAt": r["started_at"], "completedAt": r["completed_at"], "detailsUrl": r["details_url"]} for r in runs[:99]]
+        if len(runs) > 99:   # the gate reads one rollup page: more than it holds is never green (the item path pages and reads the red run)
+            rollup = rollup[:99] + [{"workflowName": "ci", "name": "build", "conclusion": "FAILURE", "status": "COMPLETED", "detailsUrl": runs[-1]["details_url"]}]
+        facts = sb.pr_facts_from({"state": "OPEN", "headRefOid": "a" * 40, "statusCheckRollup": rollup})
+        cfg = {"plan_gates": {"repos": {self.REPO: {"ci_workflows": expected}}}}
+        ctx = types.SimpleNamespace(unreadable=None, facts=facts, plan={"result": "pass", "scenarios_parsed": []}, plan_problem=None, engine=None, pr=1, config=cfg, repo=self.REPO)
+        return sb.ci_record_core(ctx, lambda: 0, quiet=True)["status"] == "nothing"
+
+    def run_shapes(self):
+        ci = sb.load_module("ci_runs")
+        got = {}
+        for label, runs, wf, expected, want in self.shape_rows():
+            self.setUp()
+            ci._CACHE.clear(); ci._FAILED.clear(); ci._PATH.clear()
+            old = ci.READER
+            ci.READER = lambda repo, run, wf=wf: (wf[run][0], "push") if run in wf else None
+            try:
+                code, why = self.ci(runs, workflows=expected)
+                item = code == sb.EXIT_OK
+                ci._CACHE.clear(); ci._FAILED.clear()
+                gate = self.gate_verdict(runs, wf, expected)
+            finally:
+                ci.READER = old
+                ci._CACHE.clear(); ci._FAILED.clear()
+            got[label] = (item, gate, want)
+        return got
+
+    def test_1237_every_api_shape_gives_the_same_verdict_from_the_gate_and_the_item_path(self):
+        for label, (item, gate, want) in self.run_shapes().items():
+            self.assertEqual((item, gate), (want, want), label)
+
+    def test_1237_the_docs_list_exactly_the_shapes_of_the_table(self):
+        import re as _re
+        text = open(os.path.join(os.path.dirname(os.path.abspath(sb.__file__)), "..", "docs", "switchboard.md")).read()
+        block = _re.search(r"<!-- ci-shapes:begin -->\n(.*?)<!-- ci-shapes:end -->", text, _re.S).group(1)
+        listed = [line[2:].strip() for line in block.splitlines() if line.startswith("- ")]
+        self.assertEqual(listed, [row[0] for row in self.shape_rows()])
+
+    def test_1237_mutant_by_name_only_in_the_item_path_fails_the_rerun_row(self):
+        with mock.patch.object(sb.load_module("ci_runs"), "latest_check_runs", lambda runs, repo: [r for r in runs if isinstance(r, dict)]):
+            got = self.run_shapes()
+        self.assertNotEqual(got["rerun inside one run"][0], True)
+        self.assertNotEqual(got["cancelled-then-green"][0], True)
+
+    def test_1237_mutant_matching_the_display_name_lets_the_author_named_workflow_pass(self):
+        ci = sb.load_module("ci_runs")
+        real = ci.missing_workflows
+        with mock.patch.object(ci, "missing_workflows_of_checks", lambda runs, expected, repo: []):
+            got = self.run_shapes()
+        self.assertTrue(got["a missing expected workflow"][0])   # the item path with the list ignored reads green: the table row catches it
+        self.assertTrue(got["an author-named workflow test"][0])
 
     def test_1237_over_the_page_cap_is_refused_naming_the_cap_and_a_failed_page_too(self):
         runs = [self.RUN] + [dict(self.RUN, name="x%d" % i) for i in range(249)]
@@ -90086,21 +90165,28 @@ class TestReadCheckRuns1237(unittest.TestCase):
             self.refused([{"check_runs": "x"}], mod)
 
     def test_mutant_ignoring_the_cap_is_caught(self):
-        mod = self.src_module("    return [], cap_why()\n\n\ndef latest_check_runs", "    return runs, None\n\n\ndef latest_check_runs")
+        mod = self.src_module("    return [], cap_why()\n\n\ndef _stamp", "    return runs, None\n\n\ndef _stamp")
         with self.assertRaises(AssertionError):
             self.refused([self.page(100, 900)] * 5, mod)
 
     # --- missing_workflows: every branch ---
     def test_missing_workflows_branches(self):
         ci = load_ci_runs()
-        self.assertEqual(ci.missing_workflows([{"workflowName": "ci"}], ["ci"]), [])
-        self.assertEqual(ci.missing_workflows([{"workflowName": "ci"}], ["ci", "lint"]), ['no run for workflow "lint"'])
-        self.assertEqual(ci.missing_workflows(None, ["ci"]), ['no run for workflow "ci"'])
-        self.assertEqual(ci.missing_workflows(["x"], ["ci"]), ['no run for workflow "ci"'])
-        self.assertEqual(ci.missing_workflows([{"workflowName": "ci"}], None), [])
+        ci._CACHE.clear()
+        ci._CACHE[("o/r", 100)] = (1, "push")
+        row = {"workflowName": "ci", "detailsUrl": "https://github.com/o/r/actions/runs/100/job/1"}
+        self.assertEqual(ci.missing_workflows([row], ["1"], "o/r"), [])
+        self.assertEqual(ci.missing_workflows([row], ["1", "2"], "o/r"), ['no run for workflow "2"'])
+        self.assertEqual(ci.missing_workflows([row], ["ci"], "o/r"), ['no run for workflow "ci"'])   # the display name never matches
+        ci._PATH[("o/r", 100)] = ".github/workflows/ci.yml"
+        self.assertEqual(ci.missing_workflows([row], [".github/workflows/ci.yml"], "o/r"), [])
+        ci._CACHE.clear(); ci._PATH.clear()
+        self.assertEqual(ci.missing_workflows(None, ["1"]), ['no run for workflow "1"'])
+        self.assertEqual(ci.missing_workflows(["x"], ["1"]), ['no run for workflow "1"'])
+        self.assertEqual(ci.missing_workflows([row], None), [])
 
     def test_mutant_missing_workflows_never_names_is_caught(self):
-        mod = self.src_module("if w not in have]", "if False]")
+        mod = self.src_module("if str(w) not in have]", "if False]")
         self.assertEqual(mod.missing_workflows([], ["ci"]), [])   # the mutant; the test above asserts the name
 
     # --- ci_workflows validation ---
@@ -90182,10 +90268,10 @@ class TestReadCheckRuns1237(unittest.TestCase):
         self.addCleanup(lambda: (setattr(ci, "READER", old), ci._CACHE.clear()))
         chk = {"workflowName": "ci", "name": "b", "conclusion": "SUCCESS", "status": "COMPLETED", "startedAt": "2026-10-15T11:00:00Z",
                "completedAt": "2026-10-15T11:30:00Z", "detailsUrl": "https://github.com/o/r/actions/runs/101/job/1"}
-        listed = {"plan_gates": {"repos": {"o/r": {"ci_workflows": ["ci", "deploy"]}}}}
+        listed = {"plan_gates": {"repos": {"o/r": {"ci_workflows": ["1", "2"]}}}}
         got = self.core(listed, [chk])
         self.assertEqual(got["status"], "not-green")
-        self.assertIn('no run for workflow "deploy"', got["why"])
+        self.assertIn('no run for workflow "2"', got["why"])
         self.assertEqual(self.core({"plan_gates": {"repos": {"o/r": {}}}}, [chk])["status"], "nothing")
         self.assertEqual(self.core({}, [chk])["status"], "nothing")
 
@@ -90243,8 +90329,8 @@ class TestLatestRunOfWorkflow(unittest.TestCase):
 
     def test_1237_missing_workflow_and_empty_rollup_are_named(self):
         ci = load_ci_runs()
-        self.assertEqual(ci.missing_workflows([self.chk("ci", 100, "a", "SUCCESS")], ["ci", "lint"]), ['no run for workflow "lint"'])
-        self.assertEqual(ci.missing_workflows([], ["ci"]), ['no run for workflow "ci"'])
+        self.assertEqual(ci.missing_workflows(ci.newest([self.chk("ci", 100, "a", "SUCCESS")]), ["1", "2"], "o/r"), ['no run for workflow "2"'])
+        self.assertEqual(ci.missing_workflows([], ["1"]), ['no run for workflow "1"'])
         self.assertEqual(ci.missing_workflows([], []), [])
 
     def test_1237_read_cap_is_a_named_constant(self):
@@ -90415,21 +90501,21 @@ class TestLatestRunOfWorkflow(unittest.TestCase):
         import types
         def core(raw):
             facts = sb.pr_facts_from(dict({"state": "OPEN", "headRefOid": "a" * 40}, **raw))
-            cfg = {"plan_gates": {"repos": {"o/r": {"ci_workflows": ["ci", "lint"]}}}}
+            cfg = {"plan_gates": {"repos": {"o/r": {"ci_workflows": ["1", "2"]}}}}
             ctx = types.SimpleNamespace(unreadable=None, facts=facts, plan={"result": "pass", "scenarios_parsed": []}, plan_problem=None, engine=None, pr=1, config=cfg, repo="o/r")
             return sb.ci_record_core(ctx, lambda: 0, quiet=True)
         self.WF[102] = (2, "push")
         got = core({"statusCheckRollup": [self.chk("ci", 101, "build", "SUCCESS")]})
         self.assertEqual(got["status"], "not-green")
-        self.assertIn('no run for workflow "lint"', got["why"])
-        self.assertIn('no run for workflow "ci"', core({})["why"])
+        self.assertIn('no run for workflow "2"', got["why"])
+        self.assertIn('no run for workflow "1"', core({})["why"])
         self.assertEqual(core({"statusCheckRollup": [self.chk("ci", 101, "build", "SUCCESS"), self.chk("lint", 102, "l", "SUCCESS")]})["status"], "nothing")
 
     def test_1237_mutant_missing_workflow_ignored_reads_the_head_as_green(self):
-        with mock.patch.object(load_ci_runs(), "missing_workflows", lambda r, e: []):
+        with mock.patch.object(load_ci_runs(), "missing_workflows", lambda r, e, repo=None: []):
             import types
             facts = sb.pr_facts_from({"state": "OPEN", "headRefOid": "a" * 40, "statusCheckRollup": [self.chk("ci", 101, "build", "SUCCESS")]})
-            cfg = {"plan_gates": {"repos": {"o/r": {"ci_workflows": ["ci", "lint"]}}}}
+            cfg = {"plan_gates": {"repos": {"o/r": {"ci_workflows": ["1", "2"]}}}}
             ctx = types.SimpleNamespace(unreadable=None, facts=facts, plan={"result": "pass", "scenarios_parsed": []}, plan_problem=None, engine=None, pr=1, config=cfg, repo="o/r")
             self.assertEqual(sb.ci_record_core(ctx, lambda: 0, quiet=True)["status"], "nothing", "the mutant passes: the test above fails on it")
 

@@ -73,6 +73,7 @@ def _run_id(entry):
 
 UNREADABLE = "IDENTITY_UNREADABLE"   # status given to a run whose workflow identity could not be read: never green (fails closed)
 _CACHE = {}   # (owner/repo, run id) -> (workflow id, event); a run's workflow never changes, so one bounded read per distinct run
+_PATH = {}   # (owner/repo, run id) -> workflow file path, read with the identity
 _FAILED = {}   # (owner/repo, run id) -> monotonic time of a failed read: not retried before FAIL_WINDOW passes
 READER = None   # tests (or a caller with its own gh runner) set a function (repo, run id) -> (workflow id, event) or None
 READ_CAP = 10   # at most this many gh reads per call; the other distinct runs are marked unreadable (fail closed)
@@ -113,12 +114,14 @@ def _read_run(repo, run):
     import json
     import subprocess
     try:
-        done = subprocess.run(["gh", "api", "repos/%s/actions/runs/%d" % (repo, run), "--jq", "{w: .workflow_id, e: .event}"],
+        done = subprocess.run(["gh", "api", "repos/%s/actions/runs/%d" % (repo, run), "--jq", "{w: .workflow_id, e: .event, p: .path}"],
                               capture_output=True, text=True, timeout=READ_TIMEOUT)
         data = json.loads(done.stdout) if done.returncode == 0 else None
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     if isinstance(data, dict) and type(data.get("w")) is int and isinstance(data.get("e"), str) and re.fullmatch(r"[a-z_]{1,40}", data["e"]):
+        if isinstance(data.get("p"), str) and re.fullmatch(r"\.github/workflows/[\w.-]{1,100}", data["p"]):
+            _put(_PATH, (repo, run), data["p"])
         return (data["w"], data["e"])
     return None
 
@@ -258,19 +261,54 @@ def read_check_runs(api, repo, sha):
     return [], cap_why()
 
 
+def _stamp(r):
+    """Ordering of two check runs of one name inside one workflow run (a rerun of a job): newest started_at, completed_at, then check-run id."""
+    return (str(r.get("started_at") or ""), str(r.get("completed_at") or ""), r.get("id") if isinstance(r.get("id"), int) else 0)
+
+
 def latest_check_runs(runs, repo):
-    """The Checks API's `runs` ({name, status, conclusion, details_url, app}) without the checks of an OLDER run of a workflow: the same reading
-    as `latest_runs` (it is the one function), fed the url of each check run."""
+    """The Checks API's `runs` ({name, status, conclusion, details_url, app}) without the checks of an OLDER run of a workflow (the same reading
+    as `latest_runs`: the one function, fed the url of each check run), and, inside one workflow run, only the NEWEST check run of each
+    (run id, name, app): a rerun of one job leaves two check runs of one name under one run id."""
     entries = [dict(r, detailsUrl=r.get("details_url") or r.get("html_url") or "") if isinstance(r, dict) else r for r in runs or []]
     kept = latest_runs(entries, repo)
+    best = {}
+    for e in kept:
+        run = _run_id(e) if isinstance(e, dict) else None
+        if run is not None:
+            app = e.get("app") if isinstance(e.get("app"), dict) else {}
+            key = (run, e.get("name"), app.get("slug"))
+            if key not in best or _stamp(e) > _stamp(best[key]):
+                best[key] = e
     out = []
     for e in kept:
         if isinstance(e, dict):
+            run = _run_id(e)
+            if run is not None:
+                app = e.get("app") if isinstance(e.get("app"), dict) else {}
+                if best[(run, e.get("name"), app.get("slug"))] is not e:
+                    continue
             out.append(dict({k: v for k, v in e.items() if k != "detailsUrl"}, **({"status": "unreadable", "conclusion": None} if e.get("status") in (UNREADABLE, CAP_STATUS) else {})))
     return out
 
 
-def missing_workflows(rollup, expected):
-    """["no run for workflow X"] for each EXPECTED workflow (`plan_gates.repos.<repo>.ci_workflows`) with no check at the head; an empty rollup misses all."""
-    have = {e.get("workflowName") for e in (rollup if isinstance(rollup, list) else []) if isinstance(e, dict)}
-    return ["no run for workflow %s" % _clean(w) for w in (expected or []) if w not in have]
+def missing_workflows(rollup, expected, repo=None):
+    """["no run for workflow X"] for each EXPECTED workflow (`plan_gates.repos.<repo>.ci_workflows`: a workflow ID or its `.github/workflows/<file>` path,
+    NEVER the display name, which the PR's author writes) with no check at the head. Entries carry `detailsUrl` (the rollup's, or a check run's
+    details_url); a run whose identity was not read matches nothing. An empty rollup misses all."""
+    entries = [e for e in (rollup if isinstance(rollup, list) else []) if isinstance(e, dict)]
+    repo = own_repo(entries, repo)
+    have = set()
+    for e in entries:
+        run = _run_id(e)
+        ident = _cached_identity(e, run, repo) if run is not None else None
+        if ident is not None:
+            have.add(str(ident[0]))
+            if _PATH.get((repo, run)):
+                have.add(_PATH[(repo, run)])
+    return ["no run for workflow %s" % _clean(w) for w in (expected or []) if str(w) not in have]
+
+
+def missing_workflows_of_checks(runs, expected, repo):
+    """The same, for the Checks API's list (the item path): one function, the entries given the url the rollup calls detailsUrl."""
+    return missing_workflows([dict(r, detailsUrl=r.get("details_url") or r.get("html_url") or "") for r in runs or [] if isinstance(r, dict)], expected, repo)
