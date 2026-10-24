@@ -28969,6 +28969,16 @@ def launcher_module():
     return module
 
 
+def load_launcher_module():
+    """(module, None), or (None, ONE named refusal) when the launcher's own module cannot be loaded (absent, unreadable, a
+    syntax error, an error on import). Only the class name of the error is shown, never its text."""
+    try:
+        return launcher_module(), None
+    except Exception as err:
+        return None, ("cloud reaper not installed: the launcher module cloud/launcher/cloud_worker.py could not be loaded (%s)"
+                      % type(err).__name__)
+
+
 def reaper_settings_problem(path=None, env=None):
     """None when the reaper-only install may write its service, else ONE line saying what is wrong and what to do. The
     rule is the launcher's own: this CALLS the launcher's reader (_read_settings_file, then parse_settings), so the
@@ -28984,7 +28994,9 @@ def reaper_settings_problem(path=None, env=None):
     head = "cloud reaper not installed: "
     if not os.path.lexists(str(path)):
         return head + "%s is missing: create it (mode 600) with the settings a launch needs" % shown
-    launcher = launcher_module()
+    launcher, load_problem = load_launcher_module()
+    if load_problem:
+        return load_problem
     try:
         text = launcher._read_settings_file(str(path))
         if text is None:
@@ -29003,8 +29015,37 @@ def reaper_settings_problem(path=None, env=None):
 
 
 def reaper_default_login_file():
-    """The reaper's default login file: ~/.local/state/fleet-switchboard/cloud-reaper-token under the real home."""
+    """The reaper's default login file: ~/.local/state/fleet-switchboard/cloud-reaper-token under the real home. It does NOT
+    follow XDG_STATE_HOME (decision: the service and its tests pin this path); set CW_CLOUD_TOKEN_FILE to put it elsewhere."""
     return Path(os.path.expanduser("~")) / ".local" / "state" / "fleet-switchboard" / "cloud-reaper-token"
+
+
+def login_file_stat(path):
+    """lstat of the login file (a seam for the tests): never follows a symlink."""
+    return os.lstat(str(path))
+
+
+def login_file_problem(path):
+    """None when `path` is absent or a plain file of the user's own with mode 0600 (no group or other access); else ONE
+    named line. Never reads the file."""
+    try:
+        info = login_file_stat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        return "cloud reaper not installed: %s cannot be examined (%s): remove it or set CW_CLOUD_TOKEN_FILE" % (path, type(err).__name__)
+    shown = str(path).replace(str(Path.home()), "~", 1) if str(path).startswith(str(Path.home()) + os.sep) else str(path)
+    if stat.S_ISLNK(info.st_mode):
+        why = "a symlink"
+    elif not stat.S_ISREG(info.st_mode):
+        why = "not a regular file"
+    elif info.st_uid != os.geteuid():
+        why = "not yours"
+    elif stat.S_IMODE(info.st_mode) & 0o077:
+        why = "accessible by others"
+    else:
+        return None
+    return "cloud reaper not installed: %s already exists and is %s: remove it or set CW_CLOUD_TOKEN_FILE" % (shown, why)
 
 
 def reaper_login_file(env):
@@ -29014,7 +29055,7 @@ def reaper_login_file(env):
     if value:
         if not value.startswith("/"):
             return None, False, "cloud reaper not installed: CW_CLOUD_TOKEN_FILE must be an absolute path (a relative one is refused): set it to a full path or leave it unset for the default"
-        return value, False, None
+        return value, False, login_file_problem(value)
     path = reaper_default_login_file()
     try:
         info = os.lstat(str(path.parent))
@@ -29025,7 +29066,7 @@ def reaper_login_file(env):
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
         return None, True, ("cloud reaper not installed: the login file's directory %s must be your own plain directory with no group or other access (chmod 700 it)"
                             % str(path.parent).replace(str(Path.home()), "~", 1))
-    return str(path), True, None
+    return str(path), True, login_file_problem(path)
 
 
 def make_reaper_login_directory(path):
@@ -29874,6 +29915,11 @@ class Installer:
         self.out.write("only the cloud reaper's own service %s: the plugins, the agents, the skills, the wrapper, the command link, "
                        "the switchboard's own service, the config and the profile were left alone\n"
                        % ("would be removed" if self.dry else "was removed"))
+        login = reaper_default_login_file()
+        self.out.write("the login file %s and its directory were left in place (a leftover token file when the reaper has "
+                       "run): to remove it, run `rm %s` and, when nothing else is in it, `rmdir %s` "
+                       "(a login file you set with CW_CLOUD_TOKEN_FILE is yours to remove)\n"
+                       % (login, shlex.quote(str(login)), shlex.quote(str(login.parent))))
 
     # -- the reverse of 3 to 5
     def uninstall(self, with_service=True, with_link=True):

@@ -49689,7 +49689,7 @@ REAPER_ONLY_STEPS = {
 # the installer starts to call must be classified here: the completeness test fails when one has no row.
 INSTALLER_READERS = ("_one_line", "_read_json_object", "_xdg", "check_writable_target", "collect_status", "config_path",
                      "cos_orders_path", "fault", "format_status", "herdr_integration_status", "home_link_is_ours",
-                     "home_link_path", "load_config", "plugin_report", "private_env", "reaper_file_path", "reaper_login_file", "reaper_settings_problem",
+                     "home_link_path", "load_config", "plugin_report", "private_env", "reaper_default_login_file", "reaper_file_path", "reaper_login_file", "reaper_settings_problem",
                      "reaper_service_settings", "reaper_settings", "render_reaper", "render_service", "service_file_path",
                      "service_kind", "service_path_dirs", "service_values", "set_file_mode", "state_dir_path",
                      "v2_version_of", "validate_config", "weekly_job_scan")
@@ -50432,6 +50432,171 @@ class TheReaperOnlyInstall(ReaperOnlyFakes):
         with mock.patch.object(sb, "reaper_login_file", mutant):
             failed = self.login_failures()
         self.assertTrue([f for f in failed if f.startswith("one command")], failed)
+
+    # -- the leftover login file and XDG_STATE_HOME (review round)
+    def test_the_uninstall_says_the_login_file_and_its_directory_are_left_and_how_to_remove_them(self):
+        self.reaper_only()
+        self.machine.calls.clear()
+        out = io.StringIO()
+        installer = sb.Installer(self.machine, self.daemons, time.time, self.PLATFORM, REPO, out=out)
+        installer.uninstall_cloud_reaper_only()
+        text = out.getvalue()
+        login = str(sb.reaper_default_login_file())
+        self.assertIn("the login file %s and its directory were left in place (a leftover token file" % login, text)
+        self.assertIn("`rm %s`" % login, text)
+        self.assertIn("`rmdir %s`" % str(Path(login).parent), text)
+
+    def test_the_quickstart_says_the_login_file_is_left(self):
+        text = (REPO / "docs" / "cloud-operator-quickstart.md").read_text()
+        self.assertIn("It leaves the login file and its directory in place (a leftover token file", text)
+
+    def test_the_default_login_file_ignores_xdg_state_home_and_the_docs_say_so(self):
+        state = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(state), True)
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(state)}):
+            self.assertEqual(sb.reaper_login_file({})[0], str(self.default_login()))
+        text = (REPO / "docs" / "cloud-operator-quickstart.md").read_text()
+        self.assertIn("it does not follow `XDG_STATE_HOME`", text)
+
+    # -- the launcher module cannot be loaded (review round: a named refusal, never a traceback)
+    LOADER_LINE = "cloud reaper not installed: the launcher module cloud/launcher/cloud_worker.py could not be loaded (%s)"
+
+    def kit_with_launcher(self, content=None, make=None):
+        kit = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(kit), True)
+        (kit / "cloud" / "launcher").mkdir(parents=True)
+        target = kit / "cloud" / "launcher" / "cloud_worker.py"
+        if make is not None:
+            make(target)
+        elif content is not None:
+            target.write_text(content)
+        return kit
+
+    def loader_cases(self):
+        def unreadable(target):
+            target.write_text("x = 1\n")
+            os.chmod(str(target), 0)
+        return [("a missing file", None, None, "FileNotFoundError"),
+                ("a directory in its place", None, lambda t: t.mkdir(), "IsADirectoryError"),
+                ("a syntax error", "def (:\n", None, "SyntaxError"),
+                ("an error on import", "raise RuntimeError('boom-secret-text')\n", None, "RuntimeError"),
+                ("an unreadable file", None, unreadable, None)]
+
+    def loader_failures(self):
+        failed = []
+        for label, content, make, name in self.loader_cases():
+            kit = self.kit_with_launcher(content, make)
+            if label == "an unreadable file" and os.access(str(kit / "cloud" / "launcher" / "cloud_worker.py"), os.R_OK):
+                continue   # a privileged user reads a mode 0 file: the case cannot be made
+            self.ensure_cloud_env()
+            before = tree_of(self.home)
+            with mock.patch.object(sb, "KIT_ROOT", kit):
+                try:
+                    out, error = self.reaper_only()
+                except Exception as err:   # a raw traceback is the failure
+                    failed.append("%s: raised %s" % (label, type(err).__name__))
+                    continue
+            if label == "an unreadable file":
+                ok = error is not None and error.startswith(self.LOADER_LINE.split("(%s)")[0])
+            else:
+                ok = error == self.LOADER_LINE % name
+            if not ok:
+                failed.append("%s: %r" % (label, error))
+            elif tree_of(self.home) != before or "boom-secret-text" in error:
+                failed.append("%s: wrote something or showed the error text" % label)
+        return failed
+
+    def test_a_launcher_module_that_cannot_be_loaded_is_one_named_refusal_and_nothing_is_written(self):
+        self.assertEqual(self.loader_failures(), [])
+        self.assertEqual(self.machine.calls, [])
+
+    def test_the_unguarded_loader_is_caught(self):
+        def raw():
+            return sb.launcher_module(), None
+        with mock.patch.object(sb, "load_launcher_module", raw):
+            failed = self.loader_failures()
+        self.assertTrue(failed, "the mutant must be caught")
+        self.assertTrue([f for f in failed if "raised" in f], failed)
+
+    # -- the login file is checked as a file (review round)
+    def login_state_cases(self):
+        def link(path):
+            victim = self.home / "victim"
+            victim.write_text("x")
+            os.symlink(str(victim), str(path))
+
+        def folder(path):
+            path.mkdir()
+
+        def loose(path):
+            path.write_text("x")
+            os.chmod(str(path), 0o644)
+        return [("a symlink", link, "is a symlink"), ("a directory", folder, "is not a regular file"),
+                ("mode 0644", loose, "is accessible by others")]
+
+    def login_state_failures(self, explicit):
+        failed = []
+        for label, make, words in self.login_state_cases():
+            home = Path(tempfile.mkdtemp())
+            self.addCleanup(shutil.rmtree, str(home), True)
+            path = home / "cloud-reaper-token"
+            make(path)
+            if explicit:
+                env = {"CW_CLOUD_TOKEN_FILE": str(path)}
+            else:
+                self.default_login().parent.mkdir(parents=True, exist_ok=True)
+                os.chmod(str(self.default_login().parent), 0o700)
+                os.rename(str(path), str(self.default_login()))
+                path = self.default_login()
+                env = {}
+            problem = sb.reaper_login_file(env)[2]
+            if not (problem and problem.startswith("cloud reaper not installed: ") and " already exists and %s:" % words in problem
+                    and problem.endswith("remove it or set CW_CLOUD_TOKEN_FILE") and "\n" not in problem):
+                failed.append("%s: %r" % (label, problem))
+            if not explicit:
+                shutil.rmtree(str(self.default_login()), True) if path.is_dir() and not path.is_symlink() else os.unlink(str(path))
+        return failed
+
+    def test_a_login_file_that_is_a_symlink_a_directory_or_loose_is_refused_by_name_default_and_explicit(self):
+        self.assertEqual(self.login_state_failures(True), [])
+        self.assertEqual(self.login_state_failures(False), [])
+
+    def test_the_default_login_path_as_a_symlink_stops_the_install_and_writes_nothing(self):
+        self.ensure_cloud_env()
+        os.environ.pop("CW_CLOUD_TOKEN_FILE", None)
+        self.default_login().parent.mkdir(parents=True)
+        os.chmod(str(self.default_login().parent), 0o700)
+        victim = self.home / "victim"
+        victim.write_text("x")
+        os.symlink(str(victim), str(self.default_login()))
+        before = tree_of(self.home)
+        code, out, err = self.run_install("--cloud-reaper-only")
+        self.assertEqual(code, 1)
+        self.assertIn("already exists and is a symlink: remove it or set CW_CLOUD_TOKEN_FILE", err)
+        self.assertEqual(tree_of(self.home), before)
+        self.assertEqual(self.machine.calls, [])
+
+    def test_a_login_file_of_another_owner_is_refused_through_the_stat_seam(self):
+        path = self.home / "tok"
+        path.write_text("x")
+        os.chmod(str(path), 0o600)
+        real = os.lstat(str(path))
+        other = os.stat_result((real.st_mode, real.st_ino, real.st_dev, 1, real.st_uid + 1, real.st_gid, 1, 0, 0, 0))
+        with mock.patch.object(sb, "login_file_stat", lambda p: other):
+            problem = sb.reaper_login_file({"CW_CLOUD_TOKEN_FILE": str(path)})[2]
+        self.assertIn("already exists and is not yours: remove it or set CW_CLOUD_TOKEN_FILE", problem)
+
+    def test_a_regular_file_of_your_own_mode_0600_or_an_absent_file_is_fine(self):
+        path = self.home / "tok"
+        self.assertIsNone(sb.reaper_login_file({"CW_CLOUD_TOKEN_FILE": str(path)})[2])
+        path.write_text("x")
+        os.chmod(str(path), 0o600)
+        self.assertIsNone(sb.reaper_login_file({"CW_CLOUD_TOKEN_FILE": str(path)})[2])
+
+    def test_a_build_that_does_not_check_the_login_file_is_caught(self):
+        with mock.patch.object(sb, "login_file_problem", lambda path: None):
+            self.assertTrue(self.login_state_failures(True))
+            self.assertTrue(self.login_state_failures(False))
 
     def test_the_full_install_does_not_check_the_settings_file(self):
         self.assertFalse(sb.cloud_settings_path().exists())
