@@ -446,10 +446,14 @@ def print_comments(rows):
         print(CUT_NOTE)
 
 
-def jq_apply(expr, data):
-    """A small client-side subset of jq: `.`, `.key`, `[N]`, `[]`, chained (`.[0].body`, `.[].user.login`). Anything else is refused."""
+def jq_check(expr):
     if not re.fullmatch(r"\.(?:(?:\.?[A-Za-z_][A-Za-z0-9_]*)|\[\d*\])*", expr):
         raise Fail("--jq supports only paths such as .[0].body or .[].user.login", 2)
+
+
+def jq_apply(expr, data):
+    """A small client-side subset of jq: `.`, `.key`, `[N]`, `[]`, chained (`.[0].body`, `.[].user.login`). Anything else is refused."""
+    jq_check(expr)
     vals = [data]
     for m in re.finditer(r"\.?([A-Za-z_][A-Za-z0-9_]*)|\[(\d*)\]", expr):
         out = []
@@ -576,7 +580,18 @@ API_ISSUE = re.compile(r"repos/[^/]+/[^/]+/issues(/.*)?", re.I)
 API_ISSUE_COMMENTS = re.compile(r"repos/[^/]+/[^/]+/issues/\d+/comments", re.I)
 
 
+def api_path_clean(path):
+    """Fail closed: only repos/<segment>/... with no empty, `.` or `..` segment, no percent-encoding and no backslash."""
+    p = path.split("?")[0]
+    if not p.startswith("/") or "%" in p or "\\" in p:
+        return False
+    segs = (p[1:-1] if p.endswith("/") else p[1:]).split("/")
+    return segs[0] == "repos" and len(segs) >= 3 and all(s not in ("", ".", "..") for s in segs)
+
+
 def api_path_allowed(path):
+    if not api_path_clean(path):   # normalisation check BEFORE the allow check
+        return False
     p = path.split("?")[0].strip("/")
     if API_ISSUE.fullmatch(p):
         return bool(API_ISSUE_COMMENTS.fullmatch(p))
@@ -599,6 +614,8 @@ def api_get(args):
         raise Fail("GraphQL is not available in this pod", 2)
     if not api_path_allowed(path):
         raise Fail("this api path is not in the pod's table (cloud/worker/guard-table.tsv)", 2)
+    if "jq" in opts:
+        jq_check(opts["jq"])   # an unsupported expression is refused BEFORE the request
     raw = request("GET", path).decode("utf-8", "replace")
     if "jq" in opts:   # a client-side filter of the GET answer: no further request
         for v in jq_apply(opts["jq"], parse_json(raw)):
