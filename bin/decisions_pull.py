@@ -7,7 +7,9 @@ daemon keeps the list elsewhere; this program fetches it and writes the same fil
   * A good body (an object with `decisions` and `errors` lists) is written as the daemon writes it (same keys, indent 1, sorted keys, a
     final newline, mode 0600), to a temporary file and renamed over the old one, with the mtime set to now (the plugin's age is the mtime).
   * The source unreachable: the file is kept but its mtime is moved past the plugin's stale limit, so the panel says "daemon not updating".
-  * Garbage (not JSON, not the shape): the file is not touched at all.
+  * Garbage (not JSON, not the shape, written_at or generation missing or of the wrong type): the file is not touched at all.
+  * A body whose written_at is older than STALE_SECONDS, or whose generation is lower than the held file's, is not written; the held file
+    is aged as when the source is unreachable.
 
 The source is a command that prints the file (for example `kubectl exec switchboard-0 -- cat <state>/decisions.json`), given after `--`.
 No key or token is read, stored or printed here; the command's own credentials are the caller's.
@@ -202,6 +204,38 @@ def say(err, text):
     print("decisions_pull: %s" % text, file=err)
 
 
+def _written_at(body):
+    """The body's written_at as epoch seconds (Garbage when it, or the generation, is missing or of the wrong type)."""
+    gen = body.get("generation")
+    if isinstance(gen, bool) or not isinstance(gen, int):
+        raise Garbage("generation missing or not an integer")
+    text = body.get("written_at")
+    if not isinstance(text, str):
+        raise Garbage("written_at missing or not a string")
+    try:
+        parsed = datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        raise Garbage("written_at is not a UTC timestamp")
+    return parsed.replace(tzinfo=datetime.timezone.utc).timestamp()
+
+
+def _held_generation(path):
+    """The generation of the file already held, or None when there is none or it has no usable one."""
+    try:
+        with open(str(path), "rb") as handle:
+            held = json.loads(handle.read(MAX_BYTES + 1).decode("utf-8")).get("generation")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return held if isinstance(held, int) and not isinstance(held, bool) else None
+
+
+def _keep_old(path, now, err, reason):
+    """Refuse the body: age the held file as in the unreachable case and say why (never the body)."""
+    mark_stale(path, now)
+    say(err, "%s; %s kept and marked stale" % (reason, DECISIONS_FILE))
+    return STALED
+
+
 def pull(state_dir, fetch, now=None, err=None):
     """One pull. `fetch()` returns the source's bytes or raises Unreachable. Returns WROTE, STALED or UNTOUCHED; says why on `err` otherwise."""
     now = time.time() if now is None else now
@@ -220,6 +254,17 @@ def pull(state_dir, fetch, now=None, err=None):
     except Garbage as why:
         say(err, "source answered something that is not the daemon's decisions list (%s); %s untouched" % (why, DECISIONS_FILE))
         return UNTOUCHED
+    try:
+        written = _written_at(body)
+        held = _held_generation(path)
+    except Garbage as why:
+        say(err, "source body has no usable freshness (%s); %s untouched" % (why, DECISIONS_FILE))
+        return UNTOUCHED
+    age = now - written
+    if age > STALE_SECONDS:
+        return _keep_old(path, now, err, "source body is %d s old (limit %d)" % (age, STALE_SECONDS))
+    if held is not None and body["generation"] < held:
+        return _keep_old(path, now, err, "source generation %d is lower than the held %d" % (body["generation"], held))
     write_atomic(path, body, now)
     return WROTE
 
