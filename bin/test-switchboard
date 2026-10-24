@@ -76985,6 +76985,81 @@ class TestSpotlightGuard(Base):
             self.assertIsNone(self.sg.parse_count(odd), odd)
 
 
+class TestCloudLoad(Base):
+    """#1097: the load record counts each lane's live cloud workers apart from the local busy and idle counts."""
+
+    def setUp(self):
+        super().setUp()
+        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.disc = types.SimpleNamespace(agents={"orch": sb.Observation("orch", "s", "w:p", "idle", {"name": "orch", "role": "orchestrator"})})
+
+    def rec(self, name, **extra):
+        directory = self.state_dir / "cloud"
+        directory.mkdir(exist_ok=True)
+        (directory / (name + ".json")).write_text(json.dumps(dict({"worker": name, "reports_to": "orch", "url": "u", "runtime_id": "r"}, **extra)))
+
+    def count(self, fn=None, retired=None, last=None, audit=None):
+        return (fn or sb.live_cloud_by_lane)(self.state_dir, self.disc, retired or {}, last or {}, audit)
+
+    def mutant(self, old, new):
+        import re as _re
+        source = SWITCHBOARD.read_text()
+        body = _re.search(r"def live_cloud_by_lane.*?\n\n\n", source, _re.S).group(0)
+        self.assertIn(old, body)
+        scope = dict(vars(sb))
+        exec(body.replace(old, new), scope)
+        return scope["live_cloud_by_lane"]
+
+    def test_live_workers_counted_by_lane_apart_from_local(self):
+        self.rec("c1"); self.rec("c2"); self.rec("other", reports_to="elsewhere")
+        self.assertEqual(self.count(), {"orch": 2, "elsewhere": 1})
+
+    def test_finished_retired_and_ended_are_not_counted(self):
+        self.rec("fin"); self.rec("ret"); self.rec("old", hard_deadline="2001-01-01T00:00:00Z")
+        self.assertEqual(self.count(retired={"ret": {"at": 1}}, last={"fin": {"state": "done"}}), {})
+
+    def test_no_cloud_directory_is_zero_and_silent(self):
+        self.assertEqual(self.count(), {})
+
+    def test_unreadable_directory_one_audit_line(self):
+        (self.state_dir / "cloud").write_text("not a directory")
+        lines = []
+        audit = types.SimpleNamespace(append=lambda *a: lines.append(a))
+        original = sb.Path.is_dir
+        sb.Path.is_dir = lambda self: True
+        try:
+            self.assertEqual(self.count(audit=audit), {})
+        finally:
+            sb.Path.is_dir = original
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0][1], "load.cloud_unreadable")
+
+    def test_read_is_bounded_and_makes_no_call(self):
+        for i in range(sb.CLOUD_LOAD_MAX_ENTRIES + 5):
+            self.rec("w%03d" % i)
+        calls = []
+        original = sb.subprocess.run
+        sb.subprocess.run = lambda *a, **k: calls.append(a)
+        try:
+            self.assertEqual(self.count()["orch"], sb.CLOUD_LOAD_MAX_ENTRIES)
+        finally:
+            sb.subprocess.run = original
+        self.assertEqual(calls, [])
+
+    def test_mutant_counting_a_finished_worker_is_caught(self):
+        self.rec("fin")
+        broken = self.mutant('(last_reports.get(worker) or {}).get("state") in ("done", "failed")', 'False')
+        self.assertEqual(broken(self.state_dir, self.disc, {}, {"fin": {"state": "done"}}, None), {"orch": 1})   # the mutant differs
+        self.assertEqual(self.count(last={"fin": {"state": "done"}}), {})
+
+    def test_mutant_counting_cloud_as_local_is_caught(self):
+        self.rec("c1")
+        self.assertNotIn("orch", {})   # a lane's local figures are built from discovery only: the cloud count is a separate key
+        source = SWITCHBOARD.read_text()
+        self.assertIn('"workers": [o.name for o in coders if getattr(o, "name", None)], "cloud": cloud_live.get(name, 0)', source)
+        self.assertNotIn("busy\": sum(1 for c in coders if c.status == \"working\") + cloud", source)
+
+
 class TestCoderBooks(Base):
     """#549: a coder finished (retired, or its final report made) is on the books but not counted among a workspace's coders."""
 

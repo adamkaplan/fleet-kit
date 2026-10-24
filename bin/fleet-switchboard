@@ -27078,6 +27078,48 @@ def coder_finished(obs, retired, last_reports):
     return (last_reports.get(name) or {}).get("state") in ("done", "failed")
 
 
+CLOUD_LOAD_MAX_ENTRIES = 200      # #1097: the most cloud records one pass reads for the load line
+CLOUD_LOAD_MAX_BYTES = 65536      # and the most bytes of one record
+
+
+def live_cloud_by_lane(state_dir, discovery, retired, last_reports, audit=None):
+    """#1097: {lane name: live cloud workers} from the files under the cloud record directory (one bounded listing, no GitHub read, no process). A worker
+    that is retired, made its final report, or is past its hard deadline is not counted. A lane is the boss the local coders' rule gives (`resolve_boss`).
+    An unreadable directory gives {} and ONE audit line; a record that cannot be read is skipped."""
+    base = Path(state_dir) / "cloud"
+    counts = {}
+    try:
+        if not base.is_dir():
+            return counts
+        names = sorted(e for e in os.listdir(str(base)) if e.endswith(".json"))[:CLOUD_LOAD_MAX_ENTRIES]
+    except OSError as err:
+        if audit is not None:
+            audit.append("daemon", "load.cloud_unreadable", None, {"why": _one_line(str(err), 120)})
+        return {}
+    now = time.time()
+    for fname in names:
+        worker = fname[:-5]
+        try:
+            with open(str(base / fname), "rb") as handle:
+                record = json.loads(handle.read(CLOUD_LOAD_MAX_BYTES).decode("utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if not isinstance(record, dict) or record.get("worker") != worker:
+            continue
+        if worker in retired or (last_reports.get(worker) or {}).get("state") in ("done", "failed") or record.get("retired"):
+            continue
+        try:
+            ended = datetime.strptime(record.get("hard_deadline"), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp() < now
+        except (TypeError, ValueError):
+            ended = False
+        boss = record.get("reports_to")
+        if ended or not isinstance(boss, str) or not boss:
+            continue
+        lane = resolve_boss(discovery, boss)
+        counts[lane] = counts.get(lane, 0) + 1
+    return counts
+
+
 HELD_LINKS_WAIT_SECONDS = 900   # #796: after a start the alert waits at most this long for every human-tier held PR's links, so an unreadable one cannot silence it for ever
 
 
@@ -27099,6 +27141,7 @@ def load_tick(engine, discovery):
         return []
     retired, last_reports = listed["retired"], _read_small(engine.state_dir, LAST_REPORT_FILE)
     orchestrators = {}
+    cloud_live = live_cloud_by_lane(engine.state_dir, discovery, retired, last_reports, engine.audit)
     for name, seen in sorted(discovery.agents.items()):
         fleet = seen.fleet or {}
         if fleet.get("role") != "orchestrator":
@@ -27111,7 +27154,7 @@ def load_tick(engine, discovery):
         orchestrators[name] = {"charter": charter_or_first_seen(engine, name, fleet),   # a fallback: the charter is found by the yaml that names the agent; the registry's, never the launch metadata (#969)
                                "repo": _fleet_repo(fleet, engine.config) or (engine.intents.repo if engine.intents is not None else None),
                                "busy": sum(1 for c in coders if c.status == "working"), "idle": sum(1 for c in coders if c.status == "idle"),
-                               "workers": [o.name for o in coders if getattr(o, "name", None)],
+                               "workers": [o.name for o in coders if getattr(o, "name", None)], "cloud": cloud_live.get(name, 0),
                                "messages": sum(1 for r in reminders if r.get("to") == name and isinstance(r.get("at"), (int, float)) and r["at"] <= now)}
     cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None)
     pr_refs = {key.lower(): (held.get("facts") or {}).get("refs") or [] for key, held in list(getattr(engine, "notice_facts", {}).items())

@@ -371,7 +371,7 @@ def serving_waits(asks, held, links, reminders, names, now, stalled_hours):
 def figures(name, info, rows, now, cfg):
     """One orchestrator's figures. `info`: asks [{repo, number, first_seen}] or None (unreadable), busy, idle, messages, decisions."""
     out = {"name": name, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"], "decisions": info["decisions"],
-           "open_asks": None, "active_asks": None, "stalled": None, "stalled_asks": [], "oldest_stall_hours": None, "moved_1h": None, "moved_backlog": None,
+           "cloud": info.get("cloud") or 0, "open_asks": None, "active_asks": None, "stalled": None, "stalled_asks": [], "oldest_stall_hours": None, "moved_1h": None, "moved_backlog": None,
            "waiting_owner": None, "waiting_cos": None, "waiting_live": None, "parked": None, "charter_moves_1h": None,
            "waiting_owner_pr": None, "waiting_time": None}
     asks = info.get("asks")
@@ -838,7 +838,7 @@ def tick(ctx):
             serving = serving_waits(asks, held, state.get("held_links") or {}, reminders, names, now, ctx.cfg["stalled_hours"])
             asks = [dict(a, via_pr=serving[(a["repo"], a["number"])]) if serving.get((a["repo"], a["number"])) in ("owner_pr", "cos_pr")
                     else dict(a, timed=True) if serving.get((a["repo"], a["number"])) == "time" else a for a in asks]
-        fig = figures(name, {"asks": asks, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"],
+        fig = figures(name, {"asks": asks, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"], "cloud": info.get("cloud") or 0,
                              "decisions": None if waiting is None else waiting.get(name, 0),
                              "charter": (state.get("charter_of") or {}).get(name), "repo": info.get("repo")}, rows, now, ctx.cfg)
         latest[name] = fig
@@ -849,7 +849,7 @@ def tick(ctx):
             for gone in sorted(history)[:-HISTORY_DAYS]:
                 del history[gone]
         mine = old if isinstance(old, dict) and old.get("day") == day else {"day": day, "hours": {}}
-        mine["hours"][hour] = {k: fig[k] for k in ("open_asks", "active_asks", "waiting_owner", "waiting_owner_pr", "waiting_time", "waiting_cos", "waiting_live", "parked", "stalled", "stalled_asks", "moved_1h", "moved_backlog", "charter_moves_1h", "busy", "idle", "messages", "decisions", "oldest_stall_hours")}
+        mine["hours"][hour] = {k: fig[k] for k in ("open_asks", "active_asks", "waiting_owner", "waiting_owner_pr", "waiting_time", "waiting_cos", "waiting_live", "parked", "stalled", "stalled_asks", "moved_1h", "moved_backlog", "charter_moves_1h", "busy", "idle", "cloud", "messages", "decisions", "oldest_stall_hours")}
         series[name] = mine
         before = episodes.get(name)
         text, episodes[name] = judge(fig, ctx.cfg, before)
