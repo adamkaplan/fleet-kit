@@ -7953,7 +7953,7 @@ ADOPT_BY_DAEMON = "the switchboard"
 # Every function that reads a worker's boss from the raw `reports_to` text, and why it may. Anything else must go through `boss_name` (the lookup that
 # resolves the role alias and the boss record). A test scans this file for `reports_to` readers and fails when one is not in this table.
 BOSS_READ_SITES = {
-    "bin/fleet-switchboard:_boss_of": "the literal text; `boss_name` is built on it",
+    "bin/switchboard/handoff.py:_boss_of": "the literal text; `boss_name` is built on it",
     "bin/fleet-switchboard:notice_boss": "resolves the text through `resolve_boss`, over a discovery that already applies the boss record",
     "bin/fleet-switchboard:reattach_caller_problem": "a dead agent is not discovered: its STORED metadata, overlaid with the boss record",
     "bin/fleet-switchboard:adoption_orphans": "reads the old boss text only for the audit row and the `bosses` filter; presence is judged by `boss_name`",
