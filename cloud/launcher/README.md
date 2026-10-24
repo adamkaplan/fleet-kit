@@ -18,6 +18,34 @@ Launcher, reaper, end hook and token mint for cloud workers, built to `docs/clou
   `<UTC time> reaper exiting: WHY`: end of its pass, stopped by a signal, stopped by an interrupt, an error (a crash in a pass), or
   `cluster login failed: ...` (a login failure exits non-zero). A restarted reaper stops by name and finds no pod for one the last
   pass already stopped, so nothing is stopped twice. Only one reaper runs at a time: it takes an exclusive lock (a 0600 file named for the user's namespace in `~/.local/state/cw-cloud/locks`, found through the password database, so a different audit file, state directory or login (a token file, a kube context, a kubeconfig) is still a rival; one user runs one reaper per namespace. The lock directory itself is checked for owner and mode, its parents are not walked, which is adequate for a lock) before its first pass and a second one exits at once with `not started: another reaper holds the lock` (the kernel drops the lock when a holder dies, however it dies). A stop uses the pod's own run id where the pod carries one. The installer writes the service file only when the target is a plain file of the user's own (never through a symlink), by temp file and rename, and its uninstall removes only a file the template makes (a regular file of the user's own with other content is overwritten by install, by rename, as the installer's own path; a symlink, a non-regular file, a foreign or group-writable file is refused). Path settings must be absolute paths of plain characters. A `path_walk` earlier on `sys.path` (the launcher directory or `PYTHONPATH`) would win over the kit's: that is the same user's own environment, not a boundary. While the Mac sleeps the reaper pauses.
+
+  **The reaper's own cluster login and the minter.** The reaper keeps its own login fresh (the token file, renewed when under 20 minutes
+  are left). The mint runs one fixed command: a `kubectl` at an absolute path (`CW_KUBECTL` when set, which must be an absolute path to a
+  plain executable file that is not group- or world-writable; else the first of `/opt/homebrew/bin/kubectl`, `/usr/local/bin/kubectl`,
+  `/usr/bin/kubectl`) `create token cw-operator --duration=Nm`, with `-n` the namespace (`CW_CLOUD_NAMESPACE`, which must be a DNS-1123
+  label). The account, the subcommand and the duration are fixed in code; no variable changes them. The command and the vault client run
+  with a minimal environment (a fixed `PATH`, `HOME`, `LANG`, `AZURE_CONFIG_DIR` only when you set it, `KUBECONFIG=/dev/null`) and nothing
+  else. **`cloud.env` is a TRUSTED file**: whoever can write it (or sets the environment of the reaper or launcher) can redirect the cluster
+  login, so the reaper honours `CW_CLUSTER_ADMIN_CMD`, `CW_CLUSTER_TOKEN_CMD` and `CW_KUBECTL` only while the file is mode 0600, owned by the
+  running user and the only name of the file (the launcher's own check); otherwise it refuses them with a named reason. A custom command set
+  in the process environment with no `cloud.env` is the service's own environment and is trusted as such.
+  The credential behind the vault secret named by `CW_CLUSTER_ADMIN_SECRET` is a MINTER-ONLY kubeconfig: a ServiceAccount (`cw-minter`) whose
+  only right is `create` on `serviceaccounts/token` for `cw-operator`. It used to be a cluster administrator's kubeconfig, and the code is
+  safe under both. On this deployment the minter is live.
+  *The minter manifest* is `cloud/k8s/cw-minter.yaml` (four objects in namespace `cw`, label `app: cw-minter`, no secret in the file: the
+  ServiceAccount, a Role with the one rule, the RoleBinding and the token Secret that the cluster fills in). To apply it: run a server dry
+  run first (`kubectl apply --dry-run=server -f cloud/k8s/cw-minter.yaml`), get the Chief of Staff's word, then
+  `kubectl apply -f cloud/k8s/cw-minter.yaml`. Build the kubeconfig of `cw-minter` (the server, the cluster CA and the token of the Secret
+  `cw-minter-token`) and put it in the vault under the secret NAME that `CW_CLUSTER_ADMIN_SECRET` names, by pipe, never printed. Check it:
+  `kubectl auth can-i create serviceaccounts/token -n cw` with the minter's own kubeconfig answers yes (and `can-i` for pods answers no); a real `kubectl create token cw-operator` with the minter's kubeconfig works
+  and the same for `default` is refused. Rollback: `kubectl delete -n cw -l app=cw-minter serviceaccount,role,rolebinding,secret`, and point
+  `CW_CLUSTER_ADMIN_SECRET` back at the earlier secret name.
+  *Token file limits.* The token file's expiry is read from the token's own `exp` claim, which is NOT verified (the file is the person's, mode
+  0600 and the user's own: a file that others can read, or that is not the user's, counts as expired and is replaced). A token with no
+  readable `exp` (not a JWT) is accepted at mint time with no lifetime check, and the file then counts as expired on every read, so it is
+  renewed at each retry gap (at most every 5 minutes). After a failed refresh the next try is no sooner than 300 s later; a clock that
+  jumps back counts as expired and retries. `main` calls the refresh once before the loop and the loop's first pass checks again: harmless
+  (the second is a no-op, the file is fresh).
 - `end_hook.py`, installed in the image as `cw-end-hook`: WIP commit, push to `<worker>/wip`, one JSON line.
 - `token_mint.py`, installed as `cw-token-mint`: mints a token at start and on demand, refuses more than 3600 s,
   writes it to a tmpfs file only.

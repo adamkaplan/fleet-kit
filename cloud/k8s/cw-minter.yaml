@@ -1,0 +1,51 @@
+# The minter: the cloud reaper's own login credential. Its only right is to create a token for the cw-operator account in this
+# namespace (create on serviceaccounts/token, resourceNames cw-operator). It holds no secret here: the Secret below is an empty
+# token request that the cluster fills in. Nothing is cluster-wide and no rule uses a wildcard.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cw-minter
+  namespace: cw
+  labels:
+    app: cw-minter
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cw-minter
+  namespace: cw
+  labels:
+    app: cw-minter
+rules:
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    resourceNames: ["cw-operator"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cw-minter
+  namespace: cw
+  labels:
+    app: cw-minter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cw-minter
+subjects:
+  - kind: ServiceAccount
+    name: cw-minter
+    namespace: cw
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cw-minter-token
+  namespace: cw
+  labels:
+    app: cw-minter
+  annotations:
+    kubernetes.io/service-account.name: cw-minter
+type: kubernetes.io/service-account-token
