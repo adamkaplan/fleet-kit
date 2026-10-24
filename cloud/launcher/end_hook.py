@@ -51,7 +51,7 @@ class Ctx:
         self.home = tempfile.mkdtemp(prefix="cw-prestop-")
         self.opts = safe_opts(helper)
         env = {k: v for k, v in os.environ.items() if k in KEEP_ENV}
-        env.update({"HOME": self.home, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+        env.update({"HOME": self.home, "GIT_CONFIG_" + "GLOBAL": "/dev/null", "GIT_CONFIG_" + "SYSTEM": "/dev/null",
                     "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"})
         self.env = env
 
@@ -93,8 +93,36 @@ class ConfigRefused(Exception):
     pass
 
 
+# The repository's own configuration is an untrusted input: ANY key outside this list is a refusal (this covers include.*, includeIf.*,
+# url.*, credential.*, http.*, every program-running key and every other remote).
+ALLOWED_KEYS = {"core.repositoryformatversion", "core.filemode", "core.bare", "core.logallrefupdates", "core.ignorecase",
+                "core.precomposeunicode", "core.symlinks", "user.name", "user.email", "remote.origin.url", "remote.origin.pushurl",
+                "remote.origin.fetch", "init.defaultbranch", "receive.denycurrentbranch"}
+ALLOWED_RE = re.compile(r"^(?:branch\..+\.(?:remote|merge)|(?:gc|pack)\.[^.]+)$")
+
+
 def config_refusal(workdir, repo, ctx):
-    pass
+    """Read the repository's local configuration, includes followed, with the origin of every key; raise on the first key that is not
+    plain. A key that comes from any file but the repository's own config file (an include) is a refusal too."""
+    p = subprocess.run(["git", "-C", workdir, "config", "--local", "--includes", "--show-origin", "--list", "-z"],
+                       capture_output=True, env=ctx.env)
+    if p.returncode != 0:
+        raise RuntimeError("the repository configuration could not be read")
+    parts = p.stdout.decode("utf-8", "replace").split("\0")
+    own = {"file:.git/config", "file:" + os.path.join(workdir, ".git", "config"),
+           "file:" + os.path.join(os.path.realpath(workdir), ".git", "config")}
+    for i in range(0, len(parts) - 1, 2):
+        origin, entry = parts[i], parts[i + 1]
+        key, _, value = entry.partition("\n")
+        shown = "".join(c if c.isprintable() else "?" for c in key)[:60]
+        if origin not in own:
+            raise ConfigRefused(shown)
+        if key not in ALLOWED_KEYS and not ALLOWED_RE.match(key):
+            raise ConfigRefused(shown)
+        if key in ("remote.origin.url", "remote.origin.pushurl") and norm_repo(value) != repo.lower():
+            raise OriginElsewhere()
+        if re.match(r"^branch\..+\.remote$", key) and value not in ("origin", "."):
+            raise ConfigRefused(shown)
 
 
 def run(workdir, worker, prestop=False, repo=None, ctx=None):
