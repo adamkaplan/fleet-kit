@@ -155,6 +155,12 @@ def _identity_of_run(entry, run, repo, budget=None):
     return got
 
 
+def _attempt(entry):
+    """The run attempt named in a details url (`.../runs/<id>/attempts/<n>`), 0 when it names none: attempts of one run id share the id, the higher attempt is the later."""
+    found = re.search(r"/attempts/(\d{1,4})(?:/|$)", entry.get("detailsUrl") or "")
+    return int(found.group(1)) if found else 0
+
+
 def latest_runs(rollup, repo=None):
     """`rollup` without the checks of an OLDER run of a workflow. A workflow is its STABLE identity (the workflow id read from the run), never
     its display name (the PR author writes that: a second workflow could take the real one's name). Runs are grouped by (workflow id, event):
@@ -175,14 +181,14 @@ def latest_runs(rollup, repo=None):
             capped.add((repo, run))
         known.append((run, ident))
         if ident is not None:
-            top[ident] = max(top.get(ident, run), run)
+            top[ident] = max(top.get(ident, (run, 0)), (run, _attempt(entry)))
     out = []
     for entry, (run, ident) in zip(rollup, known):
         if run is None:
             out.append(entry)
         elif ident is None:
             out.append(dict(entry, status=CAP_STATUS if (repo, run) in capped else UNREADABLE, conclusion=""))
-        elif run >= top[ident]:
+        elif (run, _attempt(entry)) >= top[ident]:
             out.append(entry)
     return out
 
@@ -223,3 +229,48 @@ def newest(rollup):
         best = max(key(item) for item in pool)
         keep.update(position for position, entry in pool if key((position, entry)) == best)   # a tie keeps every tied run
     return [entry for position, entry in enumerate(rollup) if position in keep]
+
+
+CHECK_PAGES = 5   # pages of the Checks API read for one commit; a longer list is REFUSED (never read as whole)
+CHECK_PAGE_SIZE = 100
+ROLLUP_CAP = 100   # gh's statusCheckRollup is one page of this size: a rollup that reaches it may be cut, so it is never green
+
+
+def cap_why():
+    return "more than %d check runs (%d pages of %d) or a page failed: the list is not read as whole" % (CHECK_PAGES * CHECK_PAGE_SIZE, CHECK_PAGES, CHECK_PAGE_SIZE)
+
+
+def read_check_runs(api, repo, sha):
+    """(runs, refusal) for the check runs of `sha`: `api(path)` answers the decoded page or None. Up to CHECK_PAGES pages; a failed page, or a list
+    longer than the bound, gives refusal=cap_why() (the caller records nothing)."""
+    runs = []
+    for page in range(1, CHECK_PAGES + 1):
+        data = api("repos/%s/commits/%s/check-runs?per_page=%d&page=%d" % (repo, sha, CHECK_PAGE_SIZE, page))
+        got = data.get("check_runs") if isinstance(data, dict) else None
+        if not isinstance(got, list):
+            return [], cap_why()
+        runs.extend(got)
+        total = data.get("total_count")
+        if len(got) < CHECK_PAGE_SIZE and (not isinstance(total, int) or len(runs) >= total):
+            return runs, None
+        if isinstance(total, int) and len(runs) >= total:
+            return runs, None
+    return [], cap_why()
+
+
+def latest_check_runs(runs, repo):
+    """The Checks API's `runs` ({name, status, conclusion, details_url, app}) without the checks of an OLDER run of a workflow: the same reading
+    as `latest_runs` (it is the one function), fed the url of each check run."""
+    entries = [dict(r, detailsUrl=r.get("details_url") or r.get("html_url") or "") if isinstance(r, dict) else r for r in runs or []]
+    kept = latest_runs(entries, repo)
+    out = []
+    for e in kept:
+        if isinstance(e, dict):
+            out.append(dict({k: v for k, v in e.items() if k != "detailsUrl"}, **({"status": "unreadable", "conclusion": None} if e.get("status") in (UNREADABLE, CAP_STATUS) else {})))
+    return out
+
+
+def missing_workflows(rollup, expected):
+    """["no run for workflow X"] for each EXPECTED workflow (`plan_gates.repos.<repo>.ci_workflows`) with no check at the head; an empty rollup misses all."""
+    have = {e.get("workflowName") for e in (rollup if isinstance(rollup, list) else []) if isinstance(e, dict)}
+    return ["no run for workflow %s" % _clean(w) for w in (expected or []) if w not in have]

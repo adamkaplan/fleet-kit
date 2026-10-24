@@ -83147,7 +83147,9 @@ class TestItemVerdicts(unittest.TestCase):
         self.register()
         self.pages.update({"repos/%s" % self.REPO: {"default_branch": "main"},
                            "repos/%s/compare/main...%s" % (self.REPO, self.PIN): {"status": "identical" if on_branch else "diverged"},
-                           "repos/%s/commits/%s/check-runs?per_page=100" % (self.REPO, self.PIN): {"check_runs": runs}})
+                           })
+        for n in range(1, 6):
+            self.pages["repos/%s/commits/%s/check-runs?per_page=100&page=%d" % (self.REPO, self.PIN, n)] = {"check_runs": runs[(n - 1) * 100:n * 100], "total_count": len(runs)}
         ctx = self.ctx()
         if not checks:
             ctx.config = {"plan_gates": {"repos": {self.REPO: {}}}}
@@ -83186,6 +83188,53 @@ class TestItemVerdicts(unittest.TestCase):
         by_name = lambda runs, checks: real(runs, [dict(c, app=r["app"]["slug"]) for c in checks for r in runs[:1]] if runs else checks)
         with mock.patch.object(self.iv, "ci_decision", by_name):
             self.assertEqual(self.ci([other])[0], sb.EXIT_OK, "the mutant accepts the same-named run of another app")
+
+    def _wf(self, run, concl, status="completed"):
+        return dict(self.RUN, conclusion=concl, status=status, details_url="https://github.com/%s/actions/runs/%d/job/1" % (self.REPO, run))
+
+    def _same_workflow(self):
+        import sys
+        ci = sb.load_module("ci_runs")
+        ci._CACHE.clear(); ci._FAILED.clear()
+        old = ci.READER
+        ci.READER = lambda repo, run: (1, "push")
+        self.addCleanup(lambda: (setattr(ci, "READER", old), ci._CACHE.clear(), ci._FAILED.clear()))
+
+    def test_1237_plan_item_ci_record_and_the_gate_agree_on_a_cancelled_first_attempt(self):
+        self._same_workflow()
+        runs = [self._wf(100, "cancelled"), self._wf(101, "success")]
+        self.assertEqual(self.ci(runs)[0], sb.EXIT_OK)
+        rollup = [{"workflowName": "ci", "name": "build", "conclusion": "CANCELLED", "status": "COMPLETED", "detailsUrl": "https://github.com/%s/actions/runs/100/job/1" % self.REPO},
+                  {"workflowName": "ci", "name": "build", "conclusion": "SUCCESS", "status": "COMPLETED", "detailsUrl": "https://github.com/%s/actions/runs/101/job/1" % self.REPO}]
+        self.assertEqual(sb.pr_ci_of(rollup), "green")
+
+    def test_1237_mutant_by_name_any_in_the_plan_item_path_refuses_the_green_head(self):
+        self._same_workflow()
+        with mock.patch.object(sb.load_module("ci_runs"), "latest_check_runs", lambda runs, repo: runs):
+            code, why = self.ci([self._wf(100, "cancelled"), self._wf(101, "success")])
+        self.assertIsNone(code)
+        self.assertIn("did not succeed", why)
+
+    def test_1237_over_the_page_cap_is_refused_naming_the_cap_and_a_failed_page_too(self):
+        runs = [self.RUN] + [dict(self.RUN, name="x%d" % i) for i in range(249)]
+        code, why = self.ci(runs)
+        self.assertEqual(code, sb.EXIT_OK)   # 250 runs are read in 3 pages
+        self.setUp()
+        code, why = self.ci([self.RUN] + [dict(self.RUN, name="x%d" % i) for i in range(599)])
+        self.assertIsNone(code)
+        self.assertIn("more than 500 check runs", why)
+        self.setUp()
+        self.register()
+        real = self.ci
+        code, why = real(runs[:150])
+        self.assertEqual(code, sb.EXIT_OK)
+
+    def test_1237_mutant_one_page_only_reads_a_long_list_as_whole(self):
+        ci = sb.load_module("ci_runs")
+        with mock.patch.object(ci, "CHECK_PAGES", 1):
+            code, why = self.ci([self.RUN] + [dict(self.RUN, name="x%d" % i) for i in range(249)])
+        self.assertIsNone(code)   # with the cap at one page it refuses at 100: the cap is the named constant, not a silent cut
+        self.assertIn("more than 100 check runs", why)
 
     def test_s4_the_item_checks_key_is_validated_by_its_own_module_and_defaults_to_none(self):
         self.assertEqual(self.iv.validate_item_checks(None, "c"), [])
@@ -87957,6 +88006,47 @@ class TestLatestRunOfWorkflow(unittest.TestCase):
         load_ci_runs().not_green_runs(rollup)
         self.assertEqual(len(seen), 2)
 
+    def test_1237_missing_workflow_and_empty_rollup_are_named(self):
+        ci = load_ci_runs()
+        self.assertEqual(ci.missing_workflows([self.chk("ci", 100, "a", "SUCCESS")], ["ci", "lint"]), ['no run for workflow "lint"'])
+        self.assertEqual(ci.missing_workflows([], ["ci"]), ['no run for workflow "ci"'])
+        self.assertEqual(ci.missing_workflows([], []), [])
+
+    def test_1237_read_cap_is_a_named_constant(self):
+        ci = load_ci_runs()
+        self.assertEqual(ci.READ_CAP, 10)
+        self.WF = {r: (r, "push") for r in range(100, 106)}
+        ci.READ_CAP = 2
+        self.addCleanup(setattr, ci, "READ_CAP", 10)
+        rollup = [self.chk("w%d" % r, r, "a", "SUCCESS") for r in range(100, 105)]
+        self.assertNotEqual(sb.pr_ci_of(rollup), "green")   # past the cap the head is refused as unreadable
+
+    def test_1237_same_run_id_the_higher_attempt_is_the_latest(self):
+        a1 = dict(self.chk("ci", 100, "old", "CANCELLED"), detailsUrl="https://github.com/o/r/actions/runs/100/attempts/1")
+        a2 = dict(self.chk("ci", 100, "new", "SUCCESS"), detailsUrl="https://github.com/o/r/actions/runs/100/attempts/2")
+        self.assertEqual(sb.pr_ci_of([a1, a2]), "green")
+        self.assertEqual(sb.pr_ci_of([a2, a1]), "green")
+
+    def test_1237_rollup_at_the_gh_cap_is_never_green(self):
+        full = [self.chk("ci", 101, "c%d" % i, "SUCCESS") for i in range(100)]
+        self.assertEqual(sb.pr_ci_of(full[:99]), "green")
+        self.assertEqual(sb.pr_ci_of(full), "pending")
+
+    def test_1237_every_reader_of_check_runs_is_in_the_docs_table(self):
+        import re as _re, pathlib
+        root = pathlib.Path(sb.__file__).resolve().parent.parent if hasattr(sb, "__file__") else pathlib.Path(".")
+        docs = (root / "docs" / "switchboard.md").read_text()
+        table = docs.split("Readers of check runs (#1237)", 1)[1].split("\n\n", 2)[1] if "Readers of check runs (#1237)" in docs else ""
+        found = set()
+        for f in (root / "bin").iterdir():
+            if f.name.startswith("test-") or f.suffix not in (".py", "") or not f.is_file():
+                continue
+            text = f.read_text(errors="ignore")
+            for m in _re.finditer(r"commits/%s/check-runs|statusCheckRollup|check_runs\b", text):
+                found.add(f.name)
+        for name in found:
+            self.assertIn("`%s`" % name, table, "%s reads check runs and is not in the docs table" % name)
+
     def test_u2_status_context_by_name(self):
         red = {"context": "legacy", "state": "FAILURE", "startedAt": "2026-10-15T10:00:00Z"}
         green = {"context": "legacy", "state": "SUCCESS", "startedAt": "2026-10-15T11:00:00Z"}
@@ -88085,6 +88175,28 @@ class TestLatestRunOfWorkflow(unittest.TestCase):
         self.assertEqual(got["why"], 'CI is pending at aaaaaaaa (only a complete, green run is recorded) ["ci" run 101 is queued]')
         got = why({})
         self.assertEqual(got["why"], "CI is none at aaaaaaaa (only a complete, green run is recorded)")
+
+    def test_1237_ci_record_core_refuses_a_missing_expected_workflow_and_an_empty_rollup(self):
+        import types
+        def core(raw):
+            facts = sb.pr_facts_from(dict({"state": "OPEN", "headRefOid": "a" * 40}, **raw))
+            cfg = {"plan_gates": {"repos": {"o/r": {"ci_workflows": ["ci", "lint"]}}}}
+            ctx = types.SimpleNamespace(unreadable=None, facts=facts, plan={"result": "pass", "scenarios_parsed": []}, plan_problem=None, engine=None, pr=1, config=cfg, repo="o/r")
+            return sb.ci_record_core(ctx, lambda: 0, quiet=True)
+        self.WF[102] = (2, "push")
+        got = core({"statusCheckRollup": [self.chk("ci", 101, "build", "SUCCESS")]})
+        self.assertEqual(got["status"], "not-green")
+        self.assertIn('no run for workflow "lint"', got["why"])
+        self.assertIn('no run for workflow "ci"', core({})["why"])
+        self.assertEqual(core({"statusCheckRollup": [self.chk("ci", 101, "build", "SUCCESS"), self.chk("lint", 102, "l", "SUCCESS")]})["status"], "nothing")
+
+    def test_1237_mutant_missing_workflow_ignored_reads_the_head_as_green(self):
+        with mock.patch.object(load_ci_runs(), "missing_workflows", lambda r, e: []):
+            import types
+            facts = sb.pr_facts_from({"state": "OPEN", "headRefOid": "a" * 40, "statusCheckRollup": [self.chk("ci", 101, "build", "SUCCESS")]})
+            cfg = {"plan_gates": {"repos": {"o/r": {"ci_workflows": ["ci", "lint"]}}}}
+            ctx = types.SimpleNamespace(unreadable=None, facts=facts, plan={"result": "pass", "scenarios_parsed": []}, plan_problem=None, engine=None, pr=1, config=cfg, repo="o/r")
+            self.assertEqual(sb.ci_record_core(ctx, lambda: 0, quiet=True)["status"], "nothing", "the mutant passes: the test above fails on it")
 
     # --- ask #1237 round 2: bounded calls, the PR's own repo, bounded caches ---
     def test_read_run_timeout_and_oserror_give_none(self):
