@@ -1296,6 +1296,8 @@ def cmd_read(args, runner, now):
         raise LaunchError("name the agent: `%s read <name>`" % H["PROG"])
     limit = max(1, min(int(args.limit), 200))
     record = route(args.name)
+    if record is None and getattr(args, "cloud_only", False):
+        raise LaunchError("%s has no cloud record" % args.name)
     engine, state, config = H["build_engine"](runner, now, "cli", writable=False)
     if record is not None:
         session = _session_of(record)
