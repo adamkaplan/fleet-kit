@@ -37718,7 +37718,6 @@ class TestRegistrarFloor(LedgerBase):
         ("a readable helper is not allowed", "(x.func.id in (set(readable) | set(named_helpers) | set(builtins)) and x.func.id not in kinds)", "(x.func.id in (set(named_helpers) | set(builtins)) and x.func.id not in kinds)"),
         ("a nested parameter is not a binding", "if isinstance(x, ast.arg) and id(x) not in own_args:", "if False:"),
         ("two defs are one function", "len(k) == 1 and k[0] in (\"def\", \"lambda\")", "k and all(v in (\"def\", \"lambda\") for v in k)"),
-        ("the first pattern assignment is read", "    for node in tree.body:   # Python uses the LAST binding of the name, so the LAST assignment is read (the first is not what runs)\n        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == \"REGISTRAR_NAME_RE\" for t in node.targets):\n            last = node", "    for node in tree.body:\n        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == \"REGISTRAR_NAME_RE\" for t in node.targets):\n            last = last or node"),
         ("a changed line that binds the pattern is not held", "if _pattern_rebound(head, added):", "if False:"),
         ("the arguments of a table builtin are not checked", "for arg in list(x.args) + [k.value for k in x.keywords]:\n                    bad = unsafe(arg)", "for arg in []:\n                    bad = unsafe(arg)"),
         ("a rebound table builtin stays callable", "(x.func.id in (set(readable) | set(named_helpers) | set(builtins)) and x.func.id not in kinds)", "(x.func.id in (set(readable) | set(named_helpers) | set(builtins)))"),
@@ -37747,6 +37746,96 @@ class TestRegistrarFloor(LedgerBase):
         for label, old, new in self.MUTANTS:
             with self.subTest(label):
                 self.assertTrue(self.table_failures(self.mutant_module(old, new)), "the mutant survives: %s" % label)
+
+    N = "REGISTRAR_NAME_RE"
+    # one form per member of PATTERN_BINDERS (the node class that binds the name): the text that binds it
+    PATTERN_FORMS = {
+        "Name": ["REGISTRAR_NAME_RE += 'x'", "for REGISTRAR_NAME_RE in (1,):\n    pass", "with open('x') as REGISTRAR_NAME_RE:\n    pass", "(REGISTRAR_NAME_RE := 1)", "del REGISTRAR_NAME_RE", "REGISTRAR_NAME_RE: int = 1", "type REGISTRAR_NAME_RE = int"],
+        "Attribute": ["REGISTRAR_NAME_RE.fullmatch = lambda n: n.startswith('zz_')"], "Subscript": ["REGISTRAR_NAME_RE['a'] = 1"],
+        "Import": ["import os as REGISTRAR_NAME_RE"], "ImportFrom": ["from os import path as REGISTRAR_NAME_RE"],
+        "FunctionDef": ["def REGISTRAR_NAME_RE():\n    pass"], "AsyncFunctionDef": ["async def REGISTRAR_NAME_RE():\n    pass"],
+        "ClassDef": ["class REGISTRAR_NAME_RE:\n    fullmatch = staticmethod(lambda n: n.startswith('zz_'))"],
+        "ExceptHandler": ["try:\n    pass\nexcept Exception as REGISTRAR_NAME_RE:\n    pass"],
+        "MatchAs": ["match 1:\n    case REGISTRAR_NAME_RE:\n        pass"], "MatchStar": ["match [1]:\n    case [*REGISTRAR_NAME_RE]:\n        pass"],
+        "MatchMapping": ["match {}:\n    case {**REGISTRAR_NAME_RE}:\n        pass"],
+        "Global": ["def zz_f():\n    global REGISTRAR_NAME_RE"], "Nonlocal": ["def zz_f():\n    def zz_g():\n        nonlocal REGISTRAR_NAME_RE"],
+        "arg": ["def zz_f(REGISTRAR_NAME_RE):\n    pass"], "TypeVar": ["def zz_f[REGISTRAR_NAME_RE]():\n    pass"], "ParamSpec": ["def zz_f[**REGISTRAR_NAME_RE]():\n    pass"], "TypeVarTuple": ["def zz_f[*REGISTRAR_NAME_RE]():\n    pass"],
+    }
+    PATTERN_BASE = "import re\nREGISTRAR_NAME_RE = re.compile(r'add_[a-z0-9_]+_parsers')\ndef main():\n    pass\n"
+    PATTERN_IDENT_FIELDS = ("name", "names", "id", "arg", "rest", "asname", "attr")
+
+    def pattern_failures(self, dc):
+        """Rows that fail on module `dc`: every form of every member is a binding node by the table and a changed line of it is held, the exploits of the review are held end to end, and the table covers the running Python."""
+        import ast as _ast
+        bad = []
+        rule = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": []}
+        for kind, texts in self.PATTERN_FORMS.items():
+            for text in texts:
+                head = self.PATTERN_BASE + text + "\n"
+                try:
+                    tree = _ast.parse(head)
+                except SyntaxError:
+                    continue   # a form the running Python cannot parse
+                nodes = [x for x in _ast.walk(tree) if type(x).__name__ == kind and not (kind == "Name" and x.id != self.N) and not (kind in ("Attribute", "Subscript") and isinstance(x.ctx, _ast.Load))]
+                if not nodes or not (kind in dc.PATTERN_BINDERS and any(dc.PATTERN_BINDERS[kind](x) for x in nodes)):
+                    bad.append("table: " + kind)
+                got, why = dc.registrar_findings(self.PATTERN_BASE, head + "def zz_evil(sub):\n    import os\n", rule)
+                if not why:
+                    bad.append("end to end: " + text)
+                added = set(range(len(self.PATTERN_BASE.split("\n")), len(head.split("\n")) + 1))
+                if dc.registrar_pattern(tree) is not None and not dc._pattern_rebound(tree, added):
+                    bad.append("held: " + text)
+        early = "import re\n"   # a binding BEFORE the literal one is not the last (the pattern is read), but a changed line of it is held
+        for kind, texts in self.PATTERN_FORMS.items():
+            for text in texts:
+                head = early + text + "\n" + self.PATTERN_BASE[len(early):]
+                try:
+                    tree = _ast.parse(head)
+                except SyntaxError:
+                    continue
+                if dc.registrar_pattern(tree) is not None and not dc._pattern_rebound(tree, set(range(2, 2 + len(text.split("\n"))))):
+                    bad.append("early binding not held: " + text)
+        for text in ("REGISTRAR_NAME_RE = zz_pattern('x')", "REGISTRAR_NAME_RE = re.compile(zz_text)", "REGISTRAR_NAME_RE = zz_a = re.compile('x')"):
+            try:
+                if dc.registrar_pattern(_ast.parse(self.PATTERN_BASE + text + "\n")) is not None:
+                    bad.append("not a literal compile: " + text)
+            except Exception:
+                bad.append("not a literal compile (error): " + text)
+        if dc.registrar_pattern(_ast.parse(self.PATTERN_BASE + "class REGISTRAR_NAME_RE:\n    pass\n")) is not None:
+            bad.append("the last binding is a class")
+        if dc.registrar_pattern(_ast.parse(self.PATTERN_BASE)) is None:
+            bad.append("the plain pattern is read")
+        for name, node in vars(_ast).items():   # completeness over the running Python: a class with an identifier field is in the table or stated as no binder
+            if isinstance(node, type) and issubclass(node, _ast.AST) and set(node._fields) & set(self.PATTERN_IDENT_FIELDS):
+                if name not in dc.PATTERN_BINDERS and name not in dc.PATTERN_NOT_BINDERS_NAMES:
+                    bad.append("class in no table: " + name)
+        class Future(_ast.AST):
+            _fields = ("name",)
+        if not dc._binds_pattern(Future(name=self.N)) or dc._binds_pattern(Future(name="other")):
+            bad.append("a future class is held by default")
+        return bad
+
+    def test_every_binding_form_of_the_registrar_pattern_is_held_and_the_grammar_is_complete(self):
+        self.assertEqual(self.pattern_failures(self.dc), [])
+        got, why = self.dc.registrar_findings(self.base_src, self.base_src, self.rule)
+        self.assertIsNone(why)
+        self.assertEqual(got, [], "the real registrars give 0 findings")
+        print("registrar findings over the real daemon file: %d" % len(got))
+
+    def test_a_mutant_that_drops_any_one_binding_member_fails(self):
+        for kind in list(self.dc.PATTERN_BINDERS):
+            with self.subTest(kind):
+                module = self.mutant_module("PATTERN_NAME = ", "PATTERN_NAME = ")
+                module.PATTERN_BINDERS = {k: v for k, v in module.PATTERN_BINDERS.items() if k != kind}
+                self.assertTrue(self.pattern_failures(module), "a lint without %s survives" % kind)
+
+    def test_mutants_of_the_pattern_rule_fail(self):
+        for label, old, new in (("the default for an unknown class", "    if kind in PATTERN_NOT_BINDERS_NAMES or not isinstance(x, ast.AST):\n        return False\n    for field in", "    return False\n    for field in"),
+                                ("the last binding is not checked", "    if last is not top[-1] and not any(y is last for y in ast.walk(top[-1].targets[0])):\n        return None\n", ""),
+                                ("a literal compile is not required", "    if not _literal_compile(top[-1]) or len(top[-1].targets) != 1:\n        return None\n", ""),
+                                ("a changed binding is not held", "return any(_spans(b, added) for b in odd) or (len(bindings) > 1 and any(_spans(b, added) for b in bindings))", "return False")):
+            with self.subTest(label):
+                self.assertTrue(self.pattern_failures(self.mutant_module(old, new)), "the mutant survives: " + label)
 
     HOSTILE = "global %s\n%s = None"
 

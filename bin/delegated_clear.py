@@ -693,35 +693,81 @@ def closure_refusals(base_src, head_src, patch, roots, entry_points, module_leve
 REGISTRAR_SOURCE_MAX = 4000000
 
 
+PATTERN_NAME = "REGISTRAR_NAME_RE"
+
+
+def _store_root(x):
+    """True for a Store or Del of an attribute or an item whose chain starts at the pattern name (`REGISTRAR_NAME_RE.fullmatch = ...`): it changes what the name does at run time."""
+    return isinstance(x, (ast.Attribute, ast.Subscript)) and isinstance(x.ctx, (ast.Store, ast.Del)) and isinstance(_chain_root(x), ast.Name) and _chain_root(x).id == PATTERN_NAME
+
+
+# Every ast node class that can bind (or rebind) a name, as a predicate "this node binds PATTERN_NAME". The table is checked by a completeness test over every class of the running Python's `ast` (a class in neither this table
+# nor PATTERN_NOT_BINDERS fails the test, and at run time an unlisted class is held BY DEFAULT when any string field of it is the name).
+PATTERN_BINDERS = {
+    "Name": lambda x: x.id == PATTERN_NAME and isinstance(x.ctx, (ast.Store, ast.Del)),   # assignment, augmented/annotated, for/with/comprehension targets, walrus, del, type alias name
+    "Attribute": _store_root, "Subscript": _store_root,
+    "Import": lambda x: any((a.asname or a.name).split(".")[0] == PATTERN_NAME for a in x.names),
+    "ImportFrom": lambda x: any((a.asname or a.name).split(".")[0] == PATTERN_NAME for a in x.names),
+    "FunctionDef": lambda x: x.name == PATTERN_NAME, "AsyncFunctionDef": lambda x: x.name == PATTERN_NAME, "ClassDef": lambda x: x.name == PATTERN_NAME,
+    "ExceptHandler": lambda x: x.name == PATTERN_NAME,
+    "MatchAs": lambda x: x.name == PATTERN_NAME, "MatchStar": lambda x: x.name == PATTERN_NAME, "MatchMapping": lambda x: x.rest == PATTERN_NAME,
+    "Global": lambda x: PATTERN_NAME in x.names, "Nonlocal": lambda x: PATTERN_NAME in x.names,
+    "arg": lambda x: x.arg == PATTERN_NAME,
+    "TypeVar": lambda x: x.name == PATTERN_NAME, "ParamSpec": lambda x: x.name == PATTERN_NAME, "TypeVarTuple": lambda x: x.name == PATTERN_NAME,
+}
+PATTERN_NOT_BINDERS_NAMES = ("TypeAlias", "alias", "keyword", "MatchClass", "FormattedValue", "Module", "Interactive", "Expression", "FunctionType")   # no binding of their own (alias is read through its import; keyword and MatchClass name callee members)
+
+
+def _binds_pattern(x):
+    """True when node `x` binds, rebinds, deletes or stores through the name `REGISTRAR_NAME_RE`: by the table, and for a class of the running Python the table does not know, by default (any string field equal to the name)."""
+    kind = type(x).__name__
+    if kind in PATTERN_BINDERS:
+        return bool(PATTERN_BINDERS[kind](x))
+    if kind in PATTERN_NOT_BINDERS_NAMES or not isinstance(x, ast.AST):
+        return False
+    for field in getattr(x, "_fields", ()):
+        value = getattr(x, field, None)
+        if value == PATTERN_NAME or (isinstance(value, list) and PATTERN_NAME in value):
+            return True
+    return False
+
+
+def pattern_bindings(tree):
+    """Every node of the tree that binds the name, in source order."""
+    found = [x for x in ast.walk(tree) if _binds_pattern(x)]
+    return sorted(found, key=lambda x: (getattr(x, "lineno", 0), getattr(x, "col_offset", 0)))
+
+
+def _literal_compile(node):
+    call = node.value if isinstance(node, ast.Assign) else None
+    return (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == "compile" and isinstance(call.func.value, ast.Name) and call.func.value.id == "re"
+            and len(call.args) >= 1 and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str))
+
+
 def registrar_pattern(tree):
-    """The compiled `REGISTRAR_NAME_RE` of a daemon file (read from its text, never held here), or None when it is not a literal `re.compile("...")`."""
-    last = None
-    for node in tree.body:   # Python uses the LAST binding of the name, so the LAST assignment is read (the first is not what runs)
-        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "REGISTRAR_NAME_RE" for t in node.targets):
-            last = node
-    if last is None:
+    """The compiled `REGISTRAR_NAME_RE` of a daemon file (read from its text, never held here), or None when the LAST binding of the name, by any form, is not a module-level `NAME = re.compile("...")`: fail closed."""
+    bindings = pattern_bindings(tree)
+    top = [n for n in tree.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == PATTERN_NAME for t in n.targets)]
+    if not bindings or not top:
         return None
-    call = last.value
-    if isinstance(call, ast.Call) and call.args and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str):
-        try:
-            return re.compile(call.args[0].value)
-        except re.error:
-            return None
-    return None
+    last = bindings[-1]
+    if last is not top[-1] and not any(y is last for y in ast.walk(top[-1].targets[0])):
+        return None
+    if not _literal_compile(top[-1]) or len(top[-1].targets) != 1:
+        return None
+    try:
+        return re.compile(top[-1].value.args[0].value)
+    except re.error:
+        return None
 
 
 def _pattern_rebound(tree, added):
-    """True when the head binds `REGISTRAR_NAME_RE` more than once (a second assignment, an augmented one, an import, a `global`, a loop target...) and a line the pull request added is one of the bindings: Python uses the last
-    binding, so the name that selects the registrars is not changed by a line the pull request adds beside another."""
-    bindings = []
-    for x in ast.walk(tree):
-        if isinstance(x, ast.Name) and x.id == "REGISTRAR_NAME_RE" and isinstance(x.ctx, (ast.Store, ast.Del)):
-            bindings.append(x)
-        elif isinstance(x, ast.Global) and "REGISTRAR_NAME_RE" in x.names:
-            bindings.append(x)
-        elif isinstance(x, (ast.Import, ast.ImportFrom)) and any((a.asname or a.name).split(".")[0] == "REGISTRAR_NAME_RE" for a in x.names):
-            bindings.append(x)
-    return len(bindings) > 1 and any(_spans(b, added) for b in bindings)
+    """True when a line the pull request added is a binding of `REGISTRAR_NAME_RE` of ANY form (table `PATTERN_BINDERS`) other than a lone module-level assignment, or one of several bindings: Python uses the last binding, so
+    the name that selects the registrars is not changed by a line the pull request adds beside another (a class, a def, an except name, a match capture, an attribute store...)."""
+    bindings = pattern_bindings(tree)
+    plain = [b for b in bindings if isinstance(b, ast.Name) and any(b is t for n in tree.body if isinstance(n, ast.Assign) for t in n.targets)]
+    odd = [b for b in bindings if b not in plain]
+    return any(_spans(b, added) for b in odd) or (len(bindings) > 1 and any(_spans(b, added) for b in bindings))
 
 
 def _chain_root(node):
