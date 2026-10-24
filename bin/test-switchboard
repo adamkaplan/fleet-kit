@@ -87603,6 +87603,30 @@ class TestMacosLegs(unittest.TestCase):
             self.assertIn("macos-latest", said)
             self.assertIn(name, said)
 
+    def decide_facts(self, *mac):
+        legs = [{"name": n, "conclusion": "success"} for n in ("test (ubuntu-latest)", "test-cloud (ubuntu-latest)")] + [{"name": n, "conclusion": c} for n, c in mac]
+        run = {"workflow": "test", "result": "green", "workflow_id": 1}
+        return {"problems": [], "state": "OPEN", "gated": True, "branch": "main", "branch_result": "green", "branch_runs": [], "pr_result": "green", "failing": [],
+                "run_base": "b" * 40, "tip": "b" * 40, "head": "a" * 40, "runs": [run], "legs": legs, "repo": "acme/widget", "number": 5, "labels": []}
+
+    def test_decide_refuses_an_absent_skipped_or_cancelled_macos_leg_and_asks_for_a_rerun(self):
+        gate = sb.load_module("merge_gate")
+        both = (("test (macos-latest)", "success"), ("test-cloud (macos-latest)", "success"))
+        self.assertEqual(gate.decide(self.decide_facts(*both))[0], True)
+        for name, mac in (("absent", both[:1]), ("skipped", (both[0], ("test-cloud (macos-latest)", "skipped"))), ("cancelled", (("test (macos-latest)", "cancelled"), both[1]))):
+            allowed, reason, need = gate.decide(self.decide_facts(*mac))
+            self.assertEqual((allowed, need), (False, "rerun"), name)
+            self.assertIn("macos-latest", reason, name)
+
+    def test_a_mutant_that_drops_the_macos_call_from_decide_fails_the_decide_test(self):
+        source = (BIN / "merge_gate.py").read_text()
+        mutant = source.replace("    if mac:\n        return False, mac, \"rerun\"", "    if False:\n        return False, mac, \"rerun\"")
+        self.assertNotEqual(mutant, source)
+        module = types.ModuleType("merge_gate_mutant")
+        module.__file__ = str(BIN / "merge_gate.py")
+        exec(compile(mutant, "merge_gate_mutant.py", "exec"), module.__dict__)
+        self.assertTrue(module.decide(self.decide_facts(("test (macos-latest)", "skipped")))[0], "the mutant lets a skipped macOS leg through")
+
     def test_the_workflow_patch_is_applied_to_the_workflow_and_pins_the_planning_decisions(self):
         patch = self.PATCH.read_text()
         workflow = (REPO / ".github" / "workflows" / "test.yml").read_text()
