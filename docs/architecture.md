@@ -8,11 +8,14 @@ A **unit** is a file: the entry `bin/fleet-switchboard`, a part under `bin/switc
 1. Every unit has a layer (the table below). A unit may depend on its own layer or a lower one, and on the units named in its **Also may use** column. Nothing else.
 2. A dependency is derived, never declared. For a part or the entry it is a name the unit uses that another unit defines at its top level (the parts share one namespace); a name the entry imports and a part relies on is counted apart (kind `entry-import`). For a flat module it is an `import` of another `bin/*.py` module, or `load_module` of one from the daemon.
 3. Two units of one layer may not depend on each other in a cycle.
-4. No unit file is over 1,500 lines and no test file over 2,500 lines.
-5. Every file of `bin/*.py`, `bin/switchboard/*.py` and the entry is a row of the unit table, and every row is a file.
-6. Today's code breaks some of these rules: the daemon grew as one namespace. Each break is a row of **Known violations**, with a ceiling. A violation that is not a row fails the test; a row with no violation left fails the test (delete it); a count that went over its ceiling fails the test. The list only shrinks. It must end empty.
+4. No unit file is over 1,500 lines, and no test file (`bin/test-*` and `tests/switchboard/**`) over 2,500 lines.
+5. A name two units define and a third reads is an ambiguous owner: which one is meant is not decided by the code, so it is a violation (kind `ambiguous`; the row's To is the owners joined by `+`).
+6. Every file of `bin/*.py`, `bin/switchboard/*.py` and the entry is a row of the unit table, and every row is a file.
+7. Today's code breaks some of these rules: the daemon grew as one namespace. Each break is a row of **Known violations**, with its count. A violation that is not a row fails the test; a row with no violation left fails the test (delete it); a count that went over its ceiling fails the test. The list only shrinks. It must end empty.
 
 ## Layers
+
+The **Holds** column is descriptive: only the layer numbers are enforced.
 
 | Layer | Name | Holds |
 |---|---|---|
@@ -97,25 +100,37 @@ A **unit** is a file: the entry `bin/fleet-switchboard`, a part under `bin/switc
 
 ## Known violations
 
-Kinds: `namespace` (a part uses names the entry defines: one namespace), `entry-import` (a part relies on an import the entry made), `size` (a file over its limit: the ceiling is in lines), `cycle` (units of one layer that depend on each other).
+Kinds (the number is exact: see rule 7): `namespace` (a part uses names the entry defines: one namespace), `entry-import` (a part relies on an import the entry made), `size` (a file over its limit: the ceiling is in lines), `ambiguous` (a name defined by two units and read by a third), `import` (a unit reaches a higher layer by an import or `load_module`), `cycle` (units of one layer that depend on each other).
 
-| From | To | Kind | Ceiling | Why it is allowed today |
+| From | To | Kind | Count | Why it is allowed today |
 |---|---|---|---|---|
-| `bin/test-switchboard` | `-` | size | 91,000 | the one test file; the test split (ST0 and its follow-ups) moves its fakes and classes beside the units |
-| `fleet-switchboard` | `-` | size | 31,000 | the entry still holds every section not yet moved to a part; each move slice lowers the ceiling |
-| `switchboard/decisions_a.py` | `fleet-switchboard` | entry-import | 10 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/decisions_b.py` | `fleet-switchboard` | entry-import | 10 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/import_v1.py` | `fleet-switchboard` | entry-import | 10 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/judge.py` | `fleet-switchboard` | entry-import | 10 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/judge_request.py` | `fleet-switchboard` | entry-import | 10 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/plan_review.py` | `fleet-switchboard` | entry-import | 10 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/pr_explain.py` | `fleet-switchboard` | entry-import | 5 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `bin/test-switchboard` | `-` | size | 90,747 | the one test file; the test split (ST0 and its follow-ups) moves its fakes and classes beside the units |
+| `fleet-switchboard` | `-` | size | 30,597 | the entry still holds every section not yet moved to a part; each move slice lowers the ceiling |
+| `switchboard/decisions_a.py` | `fleet-switchboard` | entry-import | 7 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/decisions_b.py` | `fleet-switchboard` | entry-import | 9 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/import_v1.py` | `fleet-switchboard` | entry-import | 7 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/judge.py` | `fleet-switchboard` | entry-import | 9 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/judge_request.py` | `fleet-switchboard` | entry-import | 8 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/plan_review.py` | `fleet-switchboard` | entry-import | 7 | the part relies on a standard-library module the entry imported; it gets its own import line |
+| `switchboard/pr_explain.py` | `fleet-switchboard` | entry-import | 3 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/reminders.py` | `fleet-switchboard` | entry-import | 10 | the part relies on a standard-library module the entry imported; it gets its own import line |
-| `switchboard/decisions_a.py` | `fleet-switchboard` | namespace | 40 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/decisions_a.py` | `fleet-switchboard` | namespace | 39 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/decisions_b.py` | `fleet-switchboard` | namespace | 40 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/import_v1.py` | `fleet-switchboard` | namespace | 25 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
-| `switchboard/judge.py` | `fleet-switchboard` | namespace | 20 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/import_v1.py` | `fleet-switchboard` | namespace | 21 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+| `switchboard/judge.py` | `fleet-switchboard` | namespace | 17 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/judge_request.py` | `fleet-switchboard` | namespace | 30 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/plan_review.py` | `fleet-switchboard` | namespace | 30 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/pr_explain.py` | `fleet-switchboard` | namespace | 10 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
 | `switchboard/reminders.py` | `fleet-switchboard` | namespace | 30 | one namespace: the part was cut out of the entry unchanged and reads the entry's names; its rewiring gives it imports |
+
+## Dynamic imports not followed
+
+The derivation follows `import`, `from . import x`, constant-string `__import__("x")` and `importlib.import_module("x")`, `load_module("x")` and the `load_x()` helpers. It does not follow a non-constant argument or a load by path; each unit with such sites is listed with the number of sites. A new site fails the test until its row is written; a row with no site fails it too.
+
+| Unit | Sites | What |
+|---|---|---|
+| `agent_reconcile.py` | 1 | loads a sibling module by path |
+| `cloud_worker.py` | 3 | loads sibling modules by path |
+| `cpu_guard.py` | 1 | loads a sibling module by path |
+| `external_adapter.py` | 1 | loads a sibling module by path |
+| `fleet-switchboard` | 9 | the assembler and the helper loader load modules and parts by path (`spec_from_file_location`, `load_module(name)`) |
