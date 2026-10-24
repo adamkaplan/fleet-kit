@@ -205,6 +205,9 @@ class T(base.T):
         # the foreign-owner wrapper around the mutant: accepted
         self.assertEqual(self.edit(7, f, script=self.foreign_owner(m)).returncode, 0)
 
+    def test_r2_a_body_with_a_nul_byte_is_refused(self):
+        self.refused(self.edit(7, self.file("nul", "A\nMERGE: captain\n\0x\n")), "pr-edit-body-nul")
+
 
 # only this file's own tests run: drop every inherited one
 for _n in [n for n in dir(base.T) if n.startswith("test_")]:

@@ -367,6 +367,8 @@ def pr_edit(args):
     if head_repo.lower() != repo.lower():   # a fork's pull request with the same branch name is not the pod's own
         raise refused("pr-edit-other-number")
     new = read_body_file(args[2])
+    if "\0" in new:
+        raise refused("pr-edit-body-nul")
     if has_other_separator(new):
         raise refused("pr-edit-body-separator")
     if HOLD in lines_of(cur) and lines_of(new).count(HOLD) != 1:
