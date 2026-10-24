@@ -10,3 +10,5 @@ if [ -n "${FAKE_OC_ECHO:-}" ]; then cat "$rec/stdin"; cat "$rec/stdin" >&2; fi
 [ -z "${FAKE_OC_FAIL:-}" ] || exit 1
 echo imported > "${XDG_DATA_HOME:?}/opencode/store"
 echo import >> "$rec/order"
+# FAKE_OC_STORE: write the credential into the store, as the real server does (its database); a recognisable value for the disk scan
+[ -z "${FAKE_OC_STORE:-}" ] || cat "$rec/stdin" > "${XDG_DATA_HOME}/opencode/opencode.db"

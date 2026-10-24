@@ -8,6 +8,7 @@
 #                    (`opencode auth import --standalone`, read from this file on stdin) into OpenCode's own store under a data
 #                    directory on tmpfs, BEFORE the server starts; the server reads only that store. The file is never copied
 #   git-token        read at use time by a git credential helper and a gh wrapper; never in git config, argv or the environment
+# CW_DISK_DIR (a retained disk) holds the work tree and the agent's state directory only; the credential store is never on it.
 # A file that is absent is skipped (a pod started without per-run secrets). A file that is present but unreadable or empty
 # REFUSES the start: there is no fallback to another source. Nothing here prints a value.
 set -eu
@@ -38,16 +39,23 @@ fi
 if usable model-auth; then
   # The server reads credentials from its own database under <data dir>/opencode (it ignores an auth.json); the data dir is on tmpfs.
   # The import must succeed before anything starts: a pod that could not take its credential answers nothing (the free fallback model).
-  data="$TMP/data"
-  if [ -n "${CW_DISK_DIR:-}" ] && [ -d "$CW_DISK_DIR" ] && [ -w "$CW_DISK_DIR" ]; then   # a retained disk: the session and the work tree outlive the pod
-    data="$CW_DISK_DIR/session"; ( umask 077; mkdir -p "$CW_DISK_DIR/work" )
-  fi
+  data="$TMP/data"   # ALWAYS tmpfs: the server keeps the credential and the sessions in ONE database (opencode.db), so that directory never goes on the disk
   ( umask 077; mkdir -p "$data/opencode" )
   XDG_DATA_HOME="$data"; export XDG_DATA_HOME
   if ! opencode auth import --standalone < "$RUN/model-auth" > /dev/null 2>&1; then
     echo "worker: the model credential import failed; refusing to start" >&2
     exit 1
   fi
+fi
+
+# A retained disk ($CW_DISK_DIR, a writable mount) holds ONLY the work tree and the agent's state directory (prompt history, no credential store):
+# the credential is imported into tmpfs on EVERY start. The server's session database sits in the same file as the credential, so it is NOT retained.
+if [ -n "${CW_DISK_DIR:-}" ] && [ -d "$CW_DISK_DIR" ] && [ -w "$CW_DISK_DIR" ]; then
+  ( umask 077; mkdir -p "$CW_DISK_DIR/state" "$CW_DISK_DIR/work/repo" )
+  XDG_STATE_HOME="$CW_DISK_DIR/state"; export XDG_STATE_HOME
+  # the task's clone path (CW_WORK_DIR/repo, default /work/repo) is the disk's: an existing clone is kept, an empty directory is cloned into
+  wk="${CW_WORK_DIR:-/work}"
+  if [ -d "$wk" ] && [ -w "$wk" ] && [ ! -e "$wk/repo" ] && [ ! -L "$wk/repo" ]; then ln -s "$CW_DISK_DIR/work/repo" "$wk/repo"; fi
 fi
 
 # the default model and the worker agent: the pod has no OpenCode config, so write one (no secret in it) on tmpfs and point the server at it

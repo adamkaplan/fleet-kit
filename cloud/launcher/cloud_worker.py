@@ -55,7 +55,7 @@ DISK_STORAGE_CLASS = ""              # empty: the cluster's default class (a lau
 RETAINED_DISK_DAYS = 7               # the reaper reports a retained disk older than this; it never deletes one
 DISK_ENV = "CW_" + "DISK_DIR"        # the pod variable the entrypoint reads (written in two parts: the settings test lists every whole CW_ name the launcher reads)
 DISK_VOLUME = "data"                 # the volume and the claim template's name; the claim is data-NAME-0 (a StatefulSet's) or data-NAME (a worker's)
-DISK_MOUNT = "/data"                 # the agent's session (data/session) and work tree (data/work) live here; tokens never do
+DISK_MOUNT = "/data"                 # the work tree (data/work) and the agent's state directory (data/state) live here; the credential store and the tokens never do
 
 # The git token a worker pushes with is a one-hour installation token (app_token.py caps it at 61 minutes). The launcher mints it once and
 # stores it as the `git-token` key of the per-run Secret; the managed reaper renews it by the SAME mint route before it ends. All of the
