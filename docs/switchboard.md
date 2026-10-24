@@ -1154,6 +1154,8 @@ characters each), with an ellipsis only past that. The issue title comes from wh
 never from a new `gh` read: the open decision's own title (the hub's picture), else the intent reader's cached
 issue; a report whose issue is in neither keeps its report line.
 
+**Kind marker (issue 1094).** Legend: every row starts with one emoji for its kind: 🔀 pull request, 📋 issue with a plan, 📝 issue without one, ❔ kind not readable (the symbols are `KIND_MARKS` in `plugins/fleet-decisions-tui/decisions.mjs`; the daemon's `plan_kind` reads an issue's plan comment once, cached ten minutes).
+
 **Clicking a row (issue 66).** A decision row links to its issue (`https://github.com/<repo>/issues/<ask>`, for an
 issue decision, a report with an issue number and a batch) and a heads-up row to its PR
 (`https://github.com/<repo>/pull/<number>`); a row with no repo or no number has no link and behaves as before. The

@@ -44793,7 +44793,9 @@ class TestDecisionsFromGitHub(Base):
         issue["labels"] = []
         self.gh.send("issues", {"action": "unlabeled", "issue": dict(issue), "label": {"name": DECISION_LABEL}})
         self.assertEqual(self.derive()[0], [])
-        self.assertEqual(len(self.gh.api_calls), calls)
+        added = self.gh.api_calls[calls:]
+        self.assertEqual([p for p in added if "/comments" not in p], [])   # #1094: only the plan kind's one cached read of the issue's comments
+        self.assertLessEqual(len(added), 1)
 
     def test_the_catch_up_read_asks_for_open_issues_only(self):
         self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
@@ -54112,6 +54114,7 @@ class TestBatchEntry(BatchWorld):
         self.gh.calls.clear()
         self.entry("api#101")
         reads = [c[2] for c in self.gh.calls]
+        reads = [r for r in reads if "/comments" not in r]   # #1094: the plan kind reads an issue's comments (cached), counted in TestPlanKind
         self.assertTrue(all("/issues?labels=" in r for r in reads), reads)
         self.assertEqual(len(reads), 4, "two reads (one per label) of each of the two repos, as before")
 
@@ -64457,6 +64460,47 @@ class TestV2ReadVolume(Base):
         for key, value in (("v2_cache_seconds", -1), ("v2_reads_per_pass", "8"), ("v2_reads_per_minute", True)):
             with self.subTest(key=key), self.assertRaises(sb.ConfigError):
                 sb.validate_config({"opencode": FAKE_OPENCODE, key: value})
+
+
+class TestPlanKind(unittest.TestCase):
+    """#1094: GitHubHub.plan_kind: plan / noplan / unknown, one cached read per issue, no write."""
+
+    def hub(self, answers):
+        import types
+        calls, t = [], [0.0]
+
+        def gh_api(path, paginate=True, timeout=None, **kw):
+            calls.append(path)
+            a = answers(path) if callable(answers) else answers
+            if isinstance(a, Exception):
+                raise a
+            return [a]
+        hub = types.SimpleNamespace(lock=threading.RLock(), _cache={}, now=lambda: t[0], gh_api=gh_api,
+                                    config={"call_timeout_seconds": 5})
+        return hub, calls, t
+
+    def kind(self, hub, n=1):
+        return sb.GitHubHub.plan_kind(hub, "acme/api", n)
+
+    def test_the_three_kinds(self):
+        plan = [{"id": 1, "created_at": "2026-01-01", "body": "## Plan (scenarios)\n\nx"}]
+        self.assertEqual(self.kind(self.hub(plan)[0]), "plan")
+        self.assertEqual(self.kind(self.hub([{"id": 1, "body": "hello"}])[0]), "noplan")
+        self.assertEqual(self.kind(self.hub(sb.GitHubUnavailable("down"))[0]), "unknown")
+        self.assertEqual(self.kind(self.hub({"not": "a list"})[0]), "unknown")
+
+    def test_a_second_refresh_within_the_ttl_adds_no_read(self):
+        hub, calls, t = self.hub([])
+        for n in range(1, 6):
+            self.kind(hub, n)
+        self.assertEqual(len(calls), 5)
+        for n in range(1, 6):
+            self.kind(hub, n)
+        self.assertEqual(len(calls), 5, "no read of the second refresh")
+        t[0] += sb.GITHUB_LOOKUP_TTL + 1
+        self.kind(hub, 1)
+        self.assertEqual(len(calls), 6)
+        self.assertTrue(all(c.startswith("repos/") and "comments" in c for c in calls))
 
 
 class TestWriteOnlyOnChange(Base):
