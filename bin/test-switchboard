@@ -28520,8 +28520,9 @@ class TestSweep(Base):
     def test_986_every_mutant_target_is_in_the_function_it_names(self):
         """Checked: READING_MUTANTS (sweep_gate_reading), EDGES (sweep_ready_pass), once_per_head (sweep_decisions)."""
         pairs = [("sweep_gate_reading", m) for m in self.READING_MUTANTS.values()]
-        pairs += [("sweep_ready_pass", m) for _, m in self.EDGES.values() if m]
+        pairs += [("sweep_ready_pass", m) for k, (_, m) in self.EDGES.items() if m and k != "ready_share_of_budget"]
         pairs.append(("sweep_decisions", self.ONCE_PER_HEAD_MUTANT))
+        pairs.append(("sweep_decisions", self.EDGES["ready_share_of_budget"][1]))
         for name, (old, new) in pairs:
             self.assertIn(old, inspect.getsource(getattr(sb, name)), name)
 
@@ -28793,6 +28794,38 @@ class TestSweep(Base):
         self.ready_pass([self.held_pr()], lambda r, n: self.ready(), mutant=mutant)
         self.assertEqual(self.ready_file().get("acme/api#600", {}).get("head"), self.HEAD_A)
 
+    def edge_share(self, mutant):
+        """#986 review: the FULL sweep with many held PRs and a small budget serves BOTH the held PRs and the S1 verification."""
+        held = [self.held_pr(700 + i) for i in range(60)]
+        self.hub.open = {n: sweep_issue(n, "## Decision required\nx") for n in range(100, 103)}
+        self.hub.open.update({700 + i: sweep_issue(700 + i, "MERGE: captain", pr=True) for i in range(60)})
+        self.engine.config["sweep"]["calls_per_pass"] = 12
+        reads, verified = [], []
+        reading = lambda e, r, n, t: reads.append(n) or self.ready()
+        real = sb.sweep_verify
+        def spy(engine, state, kind, ref, now, cfg, regex, budget):
+            verdict = real(engine, state, kind, ref, now, cfg, regex, budget)
+            if verdict:
+                verified.append(ref)
+            return verdict
+        passes = 0
+        with mock.patch.object(sb, "sweep_gate_reading", reading), mock.patch.object(sb, "sweep_verify", spy):
+            for _ in range(260):
+                passes += 1
+                verified.clear()
+                if mutant:
+                    with self.mutated("sweep_decisions", *mutant):
+                        self.sweep(list(held))
+                else:
+                    self.sweep(list(held))
+                self.assertEqual(len(set(verified)), 3, "pass %d: the other findings are verified every pass" % passes)
+                sb.sweep_state(self.engine).confirmed.clear()   # the 15-minute trust is spent: verify again
+                self.world.tick(60)
+                if set(reads) >= set(range(700, 760)):
+                    break
+        self.assertLessEqual(passes, 200)   # every held PR read within a bounded cycle (the S4 re-check of 60 PRs takes its half every 15 minutes: slow, never starved)
+        self.assertEqual(set(reads), set(range(700, 760)))
+
     ONCE_PER_HEAD_MUTANT = ("if once not in state.logged or", "if True or")
     EDGES = {
         "cap": ("edge_cap", ("if reads >= SWEEP_READY_READS or", "if False or")),
@@ -28805,6 +28838,7 @@ class TestSweep(Base):
         "unreadable_not_checked": ("edge_unreadable", ("state.s5_unchecked += 1\n            continue\n        if opened != ", "continue\n        if opened != ")),
         "write_on_change": ("edge_write", ("_write_small(engine.state_dir, SWEEP_READY_FILE", "(lambda *a: None)(engine.state_dir, SWEEP_READY_FILE")),
         "raised_once_per_head": ("edge_once_per_head", None),
+        "ready_share_of_budget": ("edge_share", ("ready_share = [max(budget[0] // 2,", "ready_share = [max(budget[0],")),
         "fair_cap_least_recently_read": ("edge_fair_cap", ("todo.sort(key=lambda t: (t[0], t[1]))", "todo.sort(key=lambda t: 0)")),
         "fair_budget": ("edge_fair_budget", ("(budget is not None and budget[0] < SWEEP_READY_READ_COST)", "False")),
         "fair_time": ("edge_fair_time", ("or engine.now() - state.started >= SWEEP_PASS_SECONDS:", ":")),

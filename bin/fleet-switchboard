@@ -13914,8 +13914,9 @@ def sweep_ready_pass(engine, state, decisions, home, now, cfg, decisions_whole=T
     fails is counted in `state.s5_unchecked` and raises nothing. Reads GitHub only (GET).
     Fairness: the held pull requests are read least recently read first (`state.ready_read`), so one the cap, the shared call budget or the
     pass time left unread is first in line on the next pass: none stays hidden. The moment kept is when the sweep first OBSERVED the pull
-    request ready, not when it became ready: after a restart without the state file, or after passes that did not read it, the wait restarts,
-    so a finding can be late, never early. A clock that goes backwards makes now - start negative: nothing is raised until it catches up."""
+    request ready, not when it became ready: after a restart without the state file the wait restarts (a pull request not read on a pass keeps its
+    moment, the wait does not restart), so a finding can be late, never early. The pass draws at most half of the call budget left
+    (at least one reading when the budget allows two), the rest is for verifying the findings. The read order is in memory only. A clock that goes backwards makes now - start negative: nothing is raised until it catches up."""
     state.s5, state.s5_unchecked = {}, 0
     if engine.state_dir is not None and not state.ready_loaded:
         state.ready_loaded = True
@@ -14235,7 +14236,10 @@ def sweep_decisions(engine, decisions, now, errors=()):
         errors = list(errors or ()) + [{"source": "registry", "error": "the notice read is not whole: %s" % why}]
     defer, deferred = sweep_deferrals(state, errors, repos, now)
     whole_list = notices_whole or "*" not in defer
-    sweep_ready_pass(engine, state, kept, home, now, cfg, whole_list, budget)
+    ready_share = [max(budget[0] // 2, SWEEP_READY_READ_COST if budget[0] >= 2 * SWEEP_READY_READ_COST else 0)]   # #986: at most half of what is left, so the findings' verification keeps the rest
+    ready_start = ready_share[0]
+    sweep_ready_pass(engine, state, kept, home, now, cfg, whole_list, ready_share)
+    budget[0] -= ready_start - ready_share[0]
     candidates = sweep_findings(engine, state, kept, home, now, cfg, regex, defer, whole_list)
     findings, unchecked = [], 0
     attempts = sorted(candidates, key=lambda c: (state.attempted.get(c, 0), c))  # the longest untried first
