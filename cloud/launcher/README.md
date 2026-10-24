@@ -21,15 +21,25 @@ Launcher, reaper, end hook and token mint for cloud workers, built to `docs/clou
 
   **The reaper's own cluster login and the minter.** The reaper keeps its own login fresh (the token file, renewed when under 20 minutes
   are left). The UNATTENDED reaper pins its mint command (`strict`, below); the interactive launch path keeps its previous behaviour, since it
-  runs in the person's own shell, which can read the vault with the person's own login anyway. The launch path keeps its previous behaviour: `CW_KUBECTL`, `CW_CLUSTER_ADMIN_CMD` and `CW_CLOUD_NAMESPACE` can still be set by whoever controls the launcher's environment (an interactive shell with the person's own login): unchanged. The new guards protect the UNATTENDED reaper service. With the minter credential (a ServiceAccount that can only create tokens for `cw-operator`) the administrator credential no longer travels this route: the residual risk is the minter's token for `cw-operator` only. This is a stated limit, not a fix. The reaper's mint runs one fixed command: a `kubectl` at an absolute path (`CW_KUBECTL` when set, which must be an absolute path to a
-  plain executable file that is not group- or world-writable; else the first of `/opt/homebrew/bin/kubectl`, `/usr/local/bin/kubectl`,
-  `/usr/bin/kubectl`) `create token cw-operator --duration=Nm`, with `-n` the namespace (`CW_CLOUD_NAMESPACE`, which must be a DNS-1123
-  label). The account, the subcommand and the duration are fixed in code; no variable changes them. The command and the vault client run
-  with a minimal environment (a fixed `PATH`, `HOME`, `LANG`, `AZURE_CONFIG_DIR` only when you set it, `KUBECONFIG=/dev/null`) and nothing
-  else. **`cloud.env` is a TRUSTED file**: whoever can write it (or sets the environment of the reaper or launcher) can redirect the cluster
-  login, so the reaper honours `CW_CLUSTER_ADMIN_CMD`, `CW_CLUSTER_TOKEN_CMD` and `CW_KUBECTL` only while the file is mode 0600, owned by the
-  running user and the only name of the file (the launcher's own check); otherwise it refuses them with a named reason. A custom command set
-  in the process environment with no `cloud.env` is the service's own environment and is trusted as such.
+  runs in the person's own shell, which can read the vault with the person's own login anyway. The launch path keeps its previous behaviour: `CW_KUBECTL`, `CW_CLUSTER_ADMIN_CMD` and `CW_CLOUD_NAMESPACE` can still be set by whoever controls the launcher's environment (an interactive shell with the person's own login): unchanged. The new guards protect the UNATTENDED reaper service. With the minter credential (a ServiceAccount that can only create tokens for `cw-operator`) the administrator credential no longer travels this route: the residual risk is the minter's token for `cw-operator` only. This is a stated limit, not a fix. The unattended reaper uses a fixed route: it ignores `CW_KUBECTL`, `CW_CLUSTER_ADMIN_CMD` and `CW_CLUSTER_TOKEN_CMD` (neither
+  the environment nor `cloud.env` is read for them). It reads the vault through `az`, and runs `kubectl`, each resolved to an absolute path
+  from a FIXED list (`/opt/homebrew/bin/az`, `/usr/local/bin/az`, `/usr/bin/az`; `/opt/homebrew/bin/kubectl`, `/usr/local/bin/kubectl`,
+  `/usr/bin/kubectl`), never from `PATH`, and only an existing regular executable file that is not group- or world-writable and is owned by
+  root or the running user. The command is `create token cw-operator --duration=Nm` with `-n` the namespace (`CW_CLOUD_NAMESPACE`, a DNS-1123
+  label); the account, the subcommand and the duration are fixed in code. The vault names (`CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME`,
+  `CW_CLUSTER_ADMIN_SECRET`) stay settings. A person who needs a custom command uses the launch path. The children run with a minimal
+  environment (a fixed `PATH`, `HOME`, `LANG`, `AZURE_CONFIG_DIR` only when you set it, `KUBECONFIG=/dev/null`) and nothing else.
+  **The minter credential is LONG-LIVED.** The vault holds a long-lived minter token for ONE account's tokens (`cw-operator` in the cloud
+  namespace): not cluster admin, but not short-lived. The Secret `cw-minter-token` is a `kubernetes.io/service-account-token` Secret, so the
+  control plane fills it with a NON-EXPIRING bearer token for `cw-minter`. Whoever reads that vault secret can mint `cw-operator` tokens (up to
+  the server's maximum lifetime) until the Secret is deleted. The Role bounds the ACCOUNT (only `create` on `serviceaccounts/token` for
+  `cw-operator`), not the LIFETIME: a holder using the API directly can ask for a token longer than 60 minutes; the 60-minute cap is in the
+  launcher code only, and this change does not enforce the server's maximum. Who holds the vault copy: the vault's readers, that is the operators
+  and the launcher's settings route. A short-lived alternative exists in principle (an Entra login through `CW_CLUSTER_TOKEN_CMD` on the launch
+  path); that is a later ask.
+  *Rotate the minter token:* delete the Secret `cw-minter-token` and re-apply the manifest (`kubectl apply -f cloud/k8s/cw-minter.yaml`) so the
+  control plane issues a new token; write the new kubeconfig into the vault under the same secret name by pipe (never printed); then check
+  (the `can-i` and `create token` checks below).
   The credential behind the vault secret named by `CW_CLUSTER_ADMIN_SECRET` is a MINTER-ONLY kubeconfig: a ServiceAccount (`cw-minter`) whose
   only right is `create` on `serviceaccounts/token` for `cw-operator`. It used to be a cluster administrator's kubeconfig, and the code is
   safe under both. On this deployment the minter is live.
@@ -39,8 +49,8 @@ Launcher, reaper, end hook and token mint for cloud workers, built to `docs/clou
   `kubectl apply -f cloud/k8s/cw-minter.yaml`. Build the kubeconfig of `cw-minter` (the server, the cluster CA and the token of the Secret
   `cw-minter-token`) and put it in the vault under the secret NAME that `CW_CLUSTER_ADMIN_SECRET` names, by pipe, never printed. Check it:
   `kubectl auth can-i create serviceaccounts/token -n cw` with the minter's own kubeconfig answers yes (and `can-i` for pods answers no); a real `kubectl create token cw-operator` with the minter's kubeconfig works
-  and the same for `default` is refused. Rollback: `kubectl delete -n cw -l app=cw-minter serviceaccount,role,rolebinding,secret`, and point
-  `CW_CLUSTER_ADMIN_SECRET` back at the earlier secret name.
+  and the same for `default` is refused. Rollback: revert `CW_CLUSTER_ADMIN_SECRET` in the settings FIRST (point it back at the earlier secret name), then delete the minter
+  objects (`kubectl -n cw delete -l app=cw-minter serviceaccount,role,rolebinding,secret`), then the vault secret.
   *Token file limits.* The token file's expiry is read from the token's own `exp` claim, which is NOT verified (the file is the person's, mode
   0600 and the user's own: a file that others can read, or that is not the user's, counts as expired and is replaced). A token with no
   readable `exp` (not a JWT) is accepted at mint time with no lifetime check, and the file then counts as expired on every read, so it is

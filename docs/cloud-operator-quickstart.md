@@ -243,6 +243,11 @@ vault, `CW_CLUSTER_ADMIN_SECRET` for the name of the secret inside it), hands th
 `kubectl create token cw-operator` command over a pipe, and writes the token it gets back to the token file with
 mode `0600`, by an atomic replace. The old file stays whole if anything fails.
 
+The unattended reaper uses a fixed route: it ignores `CW_KUBECTL`, `CW_CLUSTER_ADMIN_CMD` and `CW_CLUSTER_TOKEN_CMD`, and runs `az` and
+`kubectl` only from fixed absolute paths (a custom command belongs to the launch path). When the vault holds the minter kubeconfig, that
+token is long-lived (not cluster admin, but whoever reads it can mint `cw-operator` tokens until its Secret is deleted): see the launcher
+README for who holds it and how to rotate it.
+
 What this means for you: **the reaper runs unattended** for days, and no one has to refresh the token file. The
 administrator value is never in a file, never in an argument and never in the service file (the service file
 holds names and paths only, as before). The token that lands in the file holds the operator account's own rights
