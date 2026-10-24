@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""test-cloud-relay-daemon: offline tests for bin/cloud_relay_daemon.py (#1225 slice B) with a fake hub and a temp ledger.
+
+    bin/test-cloud-relay-daemon
+"""
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+sys.path.insert(0, str(BIN))
+import cloud_relay_daemon as relay  # noqa: E402
+import plan_ledger  # noqa: E402
+
+PR, REPO, HEAD = "acme-org/widget-service#7", "acme-org/widget-service", "a" * 40
+CODER, TESTER = "widget-api-coder", "widget-api-tester"
+
+
+class FakeBackend:
+    def __init__(self):
+        self.head, self.audits, self.reported = HEAD, [], []
+        self.author, self.senders = None, ()
+
+    def live_head(self, pr):
+        return self.head
+
+    def plan(self, pr):
+        return {"source": "acme-org/widget-service#1", "hash": "sha256:" + "b" * 64,
+                "scenarios": {"S1": {"evaluator": "tester", "claim": "pr"}}}
+
+    def pr_facts(self, pr):
+        return {"author": self.author, "notice_senders": self.senders}
+
+    def evaluators(self, evaluator):
+        return [TESTER]
+
+    def holder_of(self, repo, issue):
+        return CODER
+
+    def gates(self, pr):
+        return {"ready": False}
+
+    def report(self, pod, args):
+        self.reported.append((pod, args))
+
+    def audit(self, kind, pr, detail):
+        self.audits.append((kind, detail))
+
+
+class FakeHub:
+    """Speaks the contract: pending (oldest first, max 10) and result."""
+    def __init__(self):
+        self.queue, self.results = [], {}
+        self.n = 0
+
+    def submit(self, pod, command, issue=1, repo=REPO, pr=PR, head=HEAD, cid=None, **args):
+        self.n += 1
+        call = {"call_id": cid or "c%d" % self.n, "command": command, "pr": pr, "args": args}
+        if head:
+            call["head"] = head
+        rid = "r%d" % self.n
+        self.queue.append({"id": rid, "pod": pod, "repo": repo, "issue": issue, "call": call})
+        return rid
+
+    def fetch(self):
+        return {"requests": list(self.queue[:10])}
+
+    def post(self, rid, body):
+        self.results[rid] = body
+        self.queue = [q for q in self.queue if q["id"] != rid]
+
+
+PROVE = dict(scenario="S1", result="pass", evidence="ran it")
+VERDICT = dict(scenario="S1", result="pass", evidence="saw it")
+
+
+class Case(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = self.tmp.name
+        self.backend, self.hub = FakeBackend(), FakeHub()
+        self.ex = self.fresh()
+
+    def fresh(self):
+        return relay.Executor(self.state, self.backend, lambda: 1000)
+
+    def run_one(self, *a, ex=None, **k):
+        rid = self.hub.submit(*a, **k)
+        relay.pass_once(ex or self.ex, self.hub.fetch, self.hub.post)
+        return self.hub.results[rid]
+
+    def raw(self):
+        p = Path(self.state) / plan_ledger.LEDGER_FILE
+        return p.read_bytes() if p.exists() else b""
+
+    def entries(self):
+        got, problem = plan_ledger.read_ledger(self.state)
+        self.assertIsNone(problem)
+        return got
+
+    def proved(self):
+        return self.run_one(CODER, "prove", **PROVE)
+
+    def refused(self, status, phrase, *a, **k):
+        before = self.raw()
+        audits = len(self.backend.audits)
+        got = self.run_one(*a, **k)
+        self.assertEqual(got["status"], status, got)
+        self.assertIn(phrase, got["reason"])
+        self.assertIsNone(got["record"])
+        self.assertEqual(self.raw(), before)
+        self.assertEqual(len(self.backend.audits), audits + 1)
+
+    def test_prove_and_verdict_chain(self):
+        a = self.proved()
+        b = self.run_one(TESTER, "verdict", **VERDICT)
+        self.assertEqual((a["status"], b["status"]), (200, 200))
+        es = self.entries()
+        self.assertEqual([(e["kind"], e["by"], e["head"]) for e in es], [("proof", CODER, HEAD), ("verdict", TESTER, HEAD)])
+        self.assertEqual(es[1]["prev"], es[0]["hash"])
+        self.assertEqual(b["record"], {"seq": 2, "hash": es[1]["hash"]})
+
+    def test_gates_writes_audit_only(self):
+        got = self.run_one(CODER, "gates", head=None)
+        self.assertEqual(got["status"], 200)
+        self.assertEqual(self.entries(), [])
+        self.assertEqual([k for k, _ in self.backend.audits], ["gates"])
+
+    def test_report_delivered_once(self):
+        got = self.run_one(CODER, "report", head=None, state="done", text="x", cid="same")
+        again = self.run_one(CODER, "report", head=None, state="done", text="x", cid="same")
+        self.assertEqual((got["status"], again["status"], len(self.backend.reported)), (200, 200, 1))
+
+    def test_replay_same_record_also_fresh_process(self):
+        first = self.run_one(CODER, "prove", cid="X", **PROVE)
+        before = self.raw()
+        for ex in (self.ex, self.fresh()):
+            again = self.run_one(CODER, "prove", cid="X", ex=ex, **PROVE)
+            self.assertEqual(again["record"], first["record"])
+        self.assertEqual(self.raw(), before)
+        (Path(self.state) / relay.INDEX_FILE).unlink()   # even the index file lost: the entry remembers
+        again = self.run_one(CODER, "prove", cid="X", ex=self.fresh(), **PROVE)
+        self.assertEqual(again["record"], first["record"])
+        self.assertEqual(len(self.entries()), 1)
+
+    def test_same_call_id_two_pods(self):
+        a = self.run_one(CODER, "prove", cid="X", **PROVE)
+        self.backend.holder_of = lambda r, i: "other"
+        b = self.run_one("other", "prove", cid="X", **PROVE)
+        self.assertNotEqual(a["record"]["seq"], b["record"]["seq"])
+
+    def test_stale_head(self):
+        self.proved()
+        self.backend.head = "c" * 40
+        self.refused(409, "stale head", CODER, "prove", **PROVE)
+        self.refused(409, "stale head", TESTER, "verdict", **VERDICT)
+
+    def test_head_moves_inside_decision(self):
+        heads = iter([HEAD, "c" * 40])
+        self.backend.live_head = lambda pr: next(heads, "c" * 40)
+        self.backend.live_head = lambda pr: "c" * 40
+        self.refused(409, "stale head", CODER, "prove", **PROVE)
+
+    def test_author_verdict_403(self):
+        self.proved()
+        self.backend.evaluators = lambda e: [CODER, TESTER]
+        self.refused(403, "author cannot record a verdict on its own work", CODER, "verdict", **VERDICT)
+
+    def test_github_author_verdict_403(self):
+        self.proved()
+        self.backend.author = TESTER
+        self.refused(403, "author cannot record a verdict on its own work", TESTER, "verdict", **VERDICT)
+
+    def test_non_evaluator_403(self):
+        self.proved()
+        self.refused(403, "not registered to record tester verdicts", "stranger", "verdict", **VERDICT)
+
+    def test_proof_from_non_holder_403(self):
+        self.refused(403, "proof only from the pod holding the work item", TESTER, "prove", **PROVE)
+
+    def test_wrong_repo_and_bad_requests(self):
+        self.refused(403, "bound repo", CODER, "prove", repo="acme-org/other", **PROVE)
+        self.refused(400, "not one of", CODER, "notice", head=None)
+        self.refused(400, "needs the head", CODER, "prove", head=None, **PROVE)
+        self.refused(400, "call_id", CODER, "prove", cid="bad id\x7f", **PROVE)
+
+    def test_verdict_without_known_writer_403(self):
+        self.refused(403, "no writer", TESTER, "verdict", **VERDICT)
+
+
+if __name__ == "__main__":
+    unittest.main()

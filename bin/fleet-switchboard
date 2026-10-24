@@ -6054,6 +6054,7 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
                     on_reload(watch)  # does not return when the daemon re-executes itself
                 try:
                     engine.run_pass()
+                    load_module("cloud_relay_daemon").pass_if_configured(engine, sys.modules[__name__], subprocess.run, engine.now)
                 except Exception as err:
                     engine._failed(None, "pass", err, {"errors": []})
                 done += 1
