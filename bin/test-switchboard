@@ -17618,7 +17618,7 @@ class TestConflictCarryInTheDaemon(Base):
 
     def build(self, carry):
         impact = {"enabled": True, "carry_clear": carry} if carry is not None else {"enabled": True}
-        self.world = World(self, agents=(), config={"gh": FAKE_GH, "impact_hold": impact, "plan_evaluators": {"reviewer": self.reviewers}})
+        self.world = World(self, agents=(), config={"gh": FAKE_GH, "impact_hold": impact, "plan_evaluators": {"reviewer": ["rev1"]}})
         self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
         self.engine = self.world.new_engine("daemon")
         self.engine.gh_runner, self.engine.state_dir = self.route, self.world.state
