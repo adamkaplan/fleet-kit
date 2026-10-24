@@ -190,6 +190,17 @@ class TestHub(unittest.TestCase):
         self.assertFalse(module.serve({"FLEET_CLOUD_CHANNEL_LISTEN": "garbage"}, reviewer=object(), inbox=object(), audit=print))
         self.assertEqual(started, [])
 
+    def test_reserved_daemon_name_refuses_to_start(self):
+        module = load()
+        started = []
+        module.make_hub = lambda *a, **k: types.SimpleNamespace(serve_forever=lambda: started.append(1))
+        for name in sorted(module.RESERVED):
+            with self.assertRaises(ValueError):
+                module.serve({"FLEET_CLOUD_CHANNEL_LISTEN": "127.0.0.1:8080", "FLEET_CLOUD_HUB_DAEMON": " %s " % name}, reviewer=object(), inbox=object(), audit=print)
+            with self.assertRaises(ValueError):   # make_hub itself refuses too
+                load().make_hub(("127.0.0.1", 0), object(), object(), print, relay=module.cloud_relay.Relay(lambda: {}), daemon=name)
+        self.assertEqual(started, [])
+
     def test_starts_with_a_valid_listen_value(self):
         module = load()
         started = []

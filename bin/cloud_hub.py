@@ -43,10 +43,12 @@ import urllib.request
 
 import cloud_channel
 import cloud_channel_server
+import cloud_relay
 
 AGENTS_ENV = "FLEET_CLOUD_HUB_AGENTS"
 DECISIONS_ENV = "FLEET_CLOUD_HUB_DECISIONS"
 SECRETS_ENV = "FLEET_CLOUD_HUB_SECRETS"
+DAEMON_ENV = "FLEET_CLOUD_HUB_DAEMON"   # the agent name the daemon credential proves (required for the relay: no default)
 AUDIENCE_ENV = "FLEET_CLOUD_CHANNEL_AUDIENCE"
 API = "https://kubernetes.default.svc/apis/authentication.k8s.io/v1/tokenreviews"
 SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
@@ -259,8 +261,16 @@ def json_audit(stream=None):
     return audit
 
 
-def make_hub(address, reviewer, inbox, audit, decisions_path=None, max_handlers=None):
+def make_hub(address, reviewer, inbox, audit, decisions_path=None, max_handlers=None, relay=None, daemon=None):
     """The channel server with the hub's two additions: GET /decisions and 404 for an agent not in the map."""
+    if relay is not None and not daemon:
+        raise ValueError("the relay needs the daemon's agent name (FLEET_CLOUD_HUB_DAEMON), set explicitly")
+    if daemon in RESERVED:
+        raise ValueError("FLEET_CLOUD_HUB_DAEMON names a reserved agent; choose another name")
+
+    if relay is not None:
+        relay.deny.add(daemon)   # the daemon credential is not a pod: it cannot place calls
+
     def unreserved(token, audience):
         status = reviewer(token, audience)
         user = status.get("user") if isinstance(status, dict) else None
@@ -286,12 +296,95 @@ def make_hub(address, reviewer, inbox, audit, decisions_path=None, max_handlers=
             local.unknown = False
             super()._send(status, payload)
 
+        def _caller(self):
+            """(token verified agent name) or None after answering 401/503. The daemon credential has the name `daemon`."""
+            header = self.headers.get("Authorization")
+            if not (header and header.startswith(cloud_channel.BEARER) and header[len(cloud_channel.BEARER):].strip()):
+                self._deny(401, "no token")
+                return None
+            try:
+                name = cloud_relay.pod_of(reviewer, header[len(cloud_channel.BEARER):].strip())
+            except cloud_relay.Refusal as err:
+                self._deny(err.status, err.reason)
+                return None
+            if name is None or name in RESERVED:
+                self._deny(401, "token not authenticated")
+                return None
+            return name
+
+        def _deny(self, status, reason, pod=None):
+            audit("refused status=%d reason=%s%s" % (status, reason, " pod=%s" % cloud_channel._clean(pod) if pod else ""))
+            self._send(status, {"status": status, "error": reason})
+
+        def _body(self):
+            """The parsed JSON object, or None after answering."""
+            if self.headers.get("Transfer-Encoding") is not None:
+                self._deny(400, "transfer-encoding not accepted")
+                return None
+            length = (self.headers.get("Content-Length", "0") or "0").strip()
+            if not (length.isascii() and length.isdigit()):
+                self._deny(400, "bad length")
+                return None
+            if int(length) > cloud_channel_server.MAX_BODY:
+                self._deny(413, "body too large")
+                return None
+            try:
+                raw = self.rfile.read(int(length))
+                if len(raw) < int(length):
+                    raise TimeoutError("short")
+            except (TimeoutError, OSError):
+                self._deny(408, "request timeout")
+                return None
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except ValueError:
+                self._deny(400, "body is not JSON")
+                return None
+
+        def _relay_post(self):
+            self.close_connection = True
+            pod = self._caller()
+            if pod is None:
+                return
+            if self.path == "/relay":
+                try:   # size first (413 before any parse), then the rules; nothing is queued on a refusal
+                    if relay is None:
+                        raise cloud_relay.Refusal(404, "relay not configured")
+                    body = self._body()
+                    if body is None:
+                        return
+                    status, payload = relay.submit(pod, body)
+                except cloud_relay.Refusal as err:
+                    return self._deny(err.status, err.reason, pod)
+                audit("relay status=%d pod=%s command=%s" % (status, cloud_channel._clean(pod), cloud_channel._clean(body.get("command"))))
+                return self._send(status, payload)
+            if pod != daemon:
+                return self._deny(403, "daemon credential only", pod)
+            body = self._body()
+            if body is None:
+                return
+            try:
+                relay.result(self.path[len("/relay/result/"):], body)
+            except cloud_relay.Refusal as err:
+                return self._deny(err.status, err.reason, pod)
+            audit("relay result accepted status=%s" % cloud_channel._clean(body.get("status")))
+            self._send(200, {"status": 200})
+
         def do_POST(self):
             local.unknown = False
+            if relay is not None and (self.path == "/relay" or re.fullmatch(r"/relay/result/[0-9a-f]{32}", self.path)):
+                return self._relay_post()
             super().do_POST()
 
         def do_GET(self):
             self.close_connection = True
+            if self.path == "/relay/pending" and relay is not None:
+                pod = self._caller()
+                if pod is None:
+                    return
+                if pod != daemon:
+                    return self._deny(403, "daemon credential only", pod)
+                return self._send(200, {"requests": relay.list_pending()})
             if self.path != "/decisions":
                 return self._send(404, {"status": 404, "error": "not found"})
             header = self.headers.get("Authorization")
@@ -345,7 +438,13 @@ def serve(environ, reviewer=None, inbox=None, audit=None):
         else:
             reviewer = make_reviewer(audience=environ.get(AUDIENCE_ENV) or None)
     inbox = inbox or Inbox(environ.get(AGENTS_ENV))
-    make_hub(address, reviewer, inbox, audit or json_audit(), environ.get(DECISIONS_ENV)).serve_forever()
+    daemon = (environ.get(DAEMON_ENV) or "").strip()
+    if daemon in RESERVED:   # fail mode: the hub refuses to start (ValueError, nothing bound, the process exits non-zero); it never runs with a daemon name the reserved check would lock out
+        raise ValueError("FLEET_CLOUD_HUB_DAEMON names a reserved agent (%s); the hub does not start" % ", ".join(sorted(RESERVED)))
+    relay = None
+    if daemon:   # the relay is on only when the daemon's agent name is set explicitly: no default name a pod could register as
+        relay = cloud_relay.Relay(lambda: _read_json(environ[AGENTS_ENV], {}) if environ.get(AGENTS_ENV) else {})
+    make_hub(address, reviewer, inbox, audit or json_audit(), environ.get(DECISIONS_ENV), relay=relay, daemon=daemon or None).serve_forever()
     return True
 
 

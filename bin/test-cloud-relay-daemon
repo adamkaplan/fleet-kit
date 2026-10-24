@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""test-cloud-relay-daemon: offline tests for bin/cloud_relay_daemon.py (#1225 slice B) with a fake hub and a temp ledger.
+
+    bin/test-cloud-relay-daemon
+
+Two kinds of mutant test, kept apart:
+  * test-cloud-relay's FakeDaemon mutants (writes_on_refusal, skip_author, role_from_request, global_callids, stamp_live_head,
+    gates_write, no_holder, pr_issue) are switches in a hand-written harness. They test the HARNESS (that its assertions can fail), not the
+    real Executor.
+  * class RealRuleMutants below monkeypatches the REAL rule in cloud_relay_daemon / plan_ledger, runs the same refusal check the
+    guarding test makes, and asserts that check then FAILS (the guarding test catches the mutant). Real rule -> guarding real test:
+      head re-check (_same_head, inside append)  -> test_stale_head, test_head_moves_inside_decision
+      prove holder (backend.holder_of check)     -> test_proof_from_non_holder_403
+      author exclusion (plan_ledger.authors_of / may_record_verdict) -> test_author_verdict_403, test_github_author_verdict_403
+      evaluator role (backend.evaluators registry) -> test_non_evaluator_403
+      PR-issue link (backend.pr_issues check)    -> test_pr_not_linked_to_the_pods_issue_refused_for_all_three
+      call-id scope per pod (Index key)          -> test_same_call_id_two_pods
+"""
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+sys.path.insert(0, str(BIN))
+import cloud_relay_daemon as relay  # noqa: E402
+import plan_ledger  # noqa: E402
+
+PR, REPO, HEAD = "acme-org/widget-service#7", "acme-org/widget-service", "a" * 40
+CODER, TESTER = "widget-api-coder", "widget-api-tester"
+
+
+class FakeBackend:
+    def __init__(self):
+        self.head, self.audits, self.reported = HEAD, [], []
+        self.author, self.senders = None, ()
+
+    def live_head(self, pr):
+        return self.head
+
+    def plan(self, pr):
+        return {"source": "acme-org/widget-service#1", "hash": "sha256:" + "b" * 64,
+                "scenarios": {"S1": {"evaluator": "tester", "claim": "pr"}}}
+
+    def pr_facts(self, pr):
+        return {"author": self.author, "notice_senders": self.senders}
+
+    def evaluators(self, evaluator):
+        return [TESTER]
+
+    def holder_of(self, repo, issue):
+        return CODER
+
+    def pr_issues(self, pr):
+        return {1}
+
+    def gates(self, pr):
+        return {"ready": False}
+
+    def report(self, pod, args):
+        self.reported.append((pod, args))
+
+    def audit(self, kind, pr, detail):
+        self.audits.append((kind, detail))
+
+
+class FakeHub:
+    """Speaks the contract: pending (oldest first, max 10) and result."""
+    def __init__(self):
+        self.queue, self.results = [], {}
+        self.n = 0
+
+    def submit(self, pod, command, issue=1, repo=REPO, pr=PR, head=HEAD, cid=None, **args):
+        self.n += 1
+        call = {"call_id": cid or "c%d" % self.n, "command": command, "pr": pr, "args": args}
+        if head:
+            call["head"] = head
+        rid = "r%d" % self.n
+        self.queue.append({"id": rid, "pod": pod, "repo": repo, "issue": issue, "call": call})
+        return rid
+
+    def fetch(self):
+        return {"requests": list(self.queue[:10])}
+
+    def post(self, rid, body):
+        self.results[rid] = body
+        self.queue = [q for q in self.queue if q.get("id") != rid]
+
+
+PROVE = dict(scenario="S1", result="pass", evidence="ran it")
+VERDICT = dict(scenario="S1", result="pass", evidence="saw it")
+
+
+class Fixture(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = self.tmp.name
+        self.backend, self.hub = FakeBackend(), FakeHub()
+        self.ex = self.fresh()
+
+    def fresh(self):
+        return relay.Executor(self.state, self.backend, lambda: 1000)
+
+    def run_one(self, *a, ex=None, **k):
+        rid = self.hub.submit(*a, **k)
+        relay.pass_once(ex or self.ex, self.hub.fetch, self.hub.post)
+        return self.hub.results[rid]
+
+    def raw(self):
+        p = Path(self.state) / plan_ledger.LEDGER_FILE
+        return p.read_bytes() if p.exists() else b""
+
+    def entries(self):
+        got, problem = plan_ledger.read_ledger(self.state)
+        self.assertIsNone(problem)
+        return got
+
+    def proved(self):
+        return self.run_one(CODER, "prove", **PROVE)
+
+    def refused(self, status, phrase, *a, **k):
+        before = self.raw()
+        audits = len(self.backend.audits)
+        got = self.run_one(*a, **k)
+        self.assertEqual(got["status"], status, got)
+        self.assertIn(phrase, got["reason"])
+        self.assertIsNone(got["record"])
+        self.assertEqual(self.raw(), before)
+        self.assertEqual(len(self.backend.audits), audits + 1)
+
+
+
+class Case(Fixture):
+    def test_prove_and_verdict_chain(self):
+        a = self.proved()
+        b = self.run_one(TESTER, "verdict", **VERDICT)
+        self.assertEqual((a["status"], b["status"]), (200, 200))
+        es = self.entries()
+        self.assertEqual([(e["kind"], e["by"], e["head"]) for e in es], [("proof", CODER, HEAD), ("verdict", TESTER, HEAD)])
+        self.assertEqual(es[1]["prev"], es[0]["hash"])
+        self.assertEqual(b["record"], {"seq": 2, "hash": es[1]["hash"]})
+
+    def test_gates_writes_audit_only(self):
+        got = self.run_one(CODER, "gates", head=None)
+        self.assertEqual(got["status"], 200)
+        self.assertEqual(self.entries(), [])
+        self.assertEqual([k for k, _ in self.backend.audits], ["gates"])
+
+    def test_report_delivered_once(self):
+        got = self.run_one(CODER, "report", head=None, state="done", text="x", cid="same")
+        again = self.run_one(CODER, "report", head=None, state="done", text="x", cid="same")
+        self.assertEqual((got["status"], again["status"], len(self.backend.reported)), (200, 200, 1))
+
+    def test_replay_same_record_also_fresh_process(self):
+        first = self.run_one(CODER, "prove", cid="X", **PROVE)
+        before = self.raw()
+        for ex in (self.ex, self.fresh()):
+            again = self.run_one(CODER, "prove", cid="X", ex=ex, **PROVE)
+            self.assertEqual(again["record"], first["record"])
+        self.assertEqual(self.raw(), before)
+        (Path(self.state) / relay.INDEX_FILE).unlink()   # even the index file lost: the entry remembers
+        again = self.run_one(CODER, "prove", cid="X", ex=self.fresh(), **PROVE)
+        self.assertEqual(again["record"], first["record"])
+        self.assertEqual(len(self.entries()), 1)
+
+    def test_same_call_id_two_pods(self):
+        a = self.run_one(CODER, "prove", cid="X", **PROVE)
+        self.backend.holder_of = lambda r, i: "other"
+        b = self.run_one("other", "prove", cid="X", **PROVE)
+        self.assertNotEqual(a["record"]["seq"], b["record"]["seq"])
+
+    def test_stale_head(self):
+        self.proved()
+        self.backend.head = "c" * 40
+        self.refused(409, "stale head", CODER, "prove", **PROVE)
+        self.refused(409, "stale head", TESTER, "verdict", **VERDICT)
+
+    def test_head_moves_inside_decision(self):
+        calls, plan = [], self.backend.plan
+
+        def moving_plan(pr):   # the head is right while the request is checked and moves before the write's own look
+            calls.append(pr)
+            out = plan(pr)
+            if len(calls) == 1:
+                self.backend.head = "c" * 40
+            return out
+        self.backend.plan = moving_plan
+        self.refused(409, "stale head", CODER, "prove", **PROVE)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.entries(), [])
+        self.assertEqual(self.raw(), b"")
+
+    def test_author_verdict_403(self):
+        self.proved()
+        self.backend.evaluators = lambda e: [CODER, TESTER]
+        self.refused(403, "author cannot record a verdict on its own work", CODER, "verdict", **VERDICT)
+
+    def test_github_author_verdict_403(self):
+        self.proved()
+        self.backend.author = TESTER
+        self.refused(403, "author cannot record a verdict on its own work", TESTER, "verdict", **VERDICT)
+
+    def test_non_evaluator_403(self):
+        self.proved()
+        self.refused(403, "not registered to record tester verdicts", "stranger", "verdict", **VERDICT)
+
+    def test_proof_from_non_holder_403(self):
+        self.refused(403, "proof only from the pod holding the work item", TESTER, "prove", **PROVE)
+
+    def test_wrong_repo_and_bad_requests(self):
+        self.refused(400, "needs the head", CODER, "prove", head=HEAD[:7], **PROVE)   # a prefix is not the live sha
+        self.refused(403, "bound repo", CODER, "prove", repo="acme-org/other", **PROVE)
+        self.refused(400, "not one of", CODER, "notice", head=None)
+        self.refused(400, "needs the head", CODER, "prove", head=None, **PROVE)
+        self.refused(400, "call_id", CODER, "prove", cid="bad id\x7f", **PROVE)
+
+    def test_verdict_without_known_writer_403(self):
+        self.refused(403, "no writer", TESTER, "verdict", **VERDICT)
+
+    # ---- finding 1: replay index
+    def test_report_replay_is_not_a_400_and_not_indexed(self):
+        self.run_one(CODER, "report", head=None, state="done", text="x", cid="R")
+        self.assertEqual([v for v in relay.Index(self.state)._read().values() if "seq" in v], [])   # no null seq or hash is ever indexed
+        again = self.run_one(CODER, "report", head=None, state="done", text="x", cid="R")
+        self.assertEqual(again["status"], 200)
+        self.assertIsNone(again["record"])
+
+    def test_prove_reusing_a_gates_or_report_call_id_writes(self):
+        self.run_one(CODER, "gates", head=None, cid="G")
+        self.run_one(CODER, "report", head=None, state="d", text="x", cid="R")
+        for cid in ("G", "R"):
+            got = self.run_one(CODER, "prove", cid=cid, **PROVE)
+            self.assertEqual((got["status"], got["record"]["seq"]), (200, len(self.entries())), got)
+        self.assertEqual(len(self.entries()), 2)
+
+    def test_call_id_reused_for_another_call_is_409(self):
+        self.proved()
+        self.backend.evaluators = lambda e: [CODER, TESTER]
+        for kw in (dict(command="verdict", pod=CODER), dict(command="prove", head="d" * 40, pod=CODER)):
+            before = self.raw()
+            pod, cmd = kw.pop("pod"), kw.pop("command")
+            got = self.run_one(pod, cmd, cid=self.last_cid(), **dict(PROVE, **kw))
+            self.assertEqual(got["status"], 409, got)
+            self.assertIn("call_id reused for a different call", got["reason"])
+            self.assertEqual(self.raw(), before)
+        for ex in (self.ex, self.fresh()):   # also when only the entry remembers (no index file)
+            (Path(self.state) / relay.INDEX_FILE).unlink(missing_ok=True)
+            got = self.run_one(CODER, "prove", cid=self.last_cid(), ex=ex, **dict(PROVE, head="d" * 40))
+            self.assertEqual(got["status"], 409, got)
+
+    def last_cid(self):
+        return self.entries()[0]["call_id"]
+
+    def test_verdict_replay_same_record(self):
+        self.proved()
+        first = self.run_one(TESTER, "verdict", cid="V", **VERDICT)
+        for ex in (self.ex, self.fresh()):
+            again = self.run_one(TESTER, "verdict", cid="V", ex=ex, **VERDICT)
+            self.assertEqual(again["record"], first["record"])
+        self.assertEqual(len(self.entries()), 2)
+
+    def test_replay_inside_build_when_the_index_is_gone(self):
+        first = self.run_one(CODER, "prove", cid="X", **PROVE)
+        (Path(self.state) / relay.INDEX_FILE).unlink()
+        again = self.run_one(CODER, "prove", cid="X", **PROVE)
+        self.assertEqual((again["status"], again["record"]), (200, first["record"]))
+        self.assertEqual(len(self.entries()), 1)
+        self.assertEqual(set(relay.Index(self.state)._read()["%s\nX" % CODER]), {"seq", "hash", "command", "pr", "head"})
+
+    # ---- finding 2: index file
+    def test_index_is_pruned_and_uses_unique_tmp_names(self):
+        old = relay.INDEX_MAX
+        relay.INDEX_MAX = 3
+        self.addCleanup(setattr, relay, "INDEX_MAX", old)
+        idx = relay.Index(self.state)
+        for i in range(6):
+            idx.put("p", "c%d" % i, {"seq": i, "hash": "h"})
+        self.assertEqual(sorted(idx._read()), ["p\nc3", "p\nc4", "p\nc5"])
+        self.assertEqual([p.name for p in Path(self.state).iterdir() if p.name.endswith(".tmp")], [])
+
+    def test_index_concurrent_puts_lose_nothing(self):
+        import threading
+        idx = relay.Index(self.state)
+        ts = [threading.Thread(target=lambda i=i: idx.put("p", "c%d" % i, {"seq": i, "hash": "h"})) for i in range(20)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(len(idx._read()), 20)
+
+    # ---- finding 3, 8: pass_once and pass_if_configured
+    def test_pass_once_survives_a_raising_backend(self):
+        a = self.hub.submit(CODER, "gates", head=None)
+        b = self.hub.submit(CODER, "report", head=None, state="d", text="x")
+        orig = self.backend.gates
+
+        def boom(pr):
+            raise RuntimeError("github down")
+        self.backend.gates = boom
+        self.assertEqual(relay.pass_once(self.ex, self.hub.fetch, self.hub.post), 2)
+        self.assertEqual(self.hub.results[a]["status"], 500)
+        self.assertEqual(self.hub.results[a]["reason"], "relay failed")
+        self.assertNotIn("github down", json.dumps(self.hub.results))
+        self.assertTrue(any(k == "relay.failed" and "github down" in d["error"] for k, d in self.backend.audits))
+        self.assertEqual(self.hub.results[b]["status"], 200)
+        self.backend.gates = orig
+
+    def test_pass_once_takes_at_most_ten_and_skips_no_id(self):
+        self.hub.queue.append({"pod": CODER, "repo": REPO, "issue": 1, "call": {}})
+        ids = [self.hub.submit(CODER, "gates", head=None) for _ in range(12)]
+        self.assertEqual(relay.pass_once(self.ex, self.hub.fetch, self.hub.post), 9)   # the id-less one takes a slot of the 10
+        self.assertEqual(len(self.hub.results), 9)
+        self.assertEqual(relay.pass_once(self.ex, self.hub.fetch, self.hub.post), 3)
+        self.assertEqual(set(self.hub.results), set(ids))
+
+    def test_pass_if_configured_never_raises(self):
+        notes = []
+
+        class Engine:
+            state_dir, config = "/nonexistent", {}
+
+            def _note(self, *a):
+                notes.append(a)
+        self.assertEqual(relay.pass_if_configured(Engine(), None, None, lambda: 1, environ={}), 0)
+        self.assertEqual(notes, [])
+        env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": "/nonexistent/token"}
+        self.assertEqual(relay.pass_if_configured(Engine(), None, None, lambda: 1, environ=env), 0)
+        self.assertEqual(notes[0][0], "relay.pass_failed")
+
+    # ---- finding 5, 8: link to the pod's issue; the remaining refusals
+    def test_pr_not_linked_to_the_pods_issue_refused_for_all_three(self):
+        self.proved()
+        for pod, cmd, kw in ((CODER, "prove", PROVE), (TESTER, "verdict", VERDICT), (CODER, "gates", {})):
+            self.refused(403, "pr not linked to the pod's issue", pod, cmd, issue=2, head=None if cmd == "gates" else HEAD, **kw)
+
+    def test_recheck_of_the_verdict_rule_inside_build(self):
+        self.proved()
+        calls = []
+
+        def evaluators(e):   # registered at the first look, no longer by the time of the write
+            calls.append(e)
+            return [TESTER] if len(calls) == 1 else []
+        self.backend.evaluators = evaluators
+        self.refused(403, "registered to record tester verdicts", TESTER, "verdict", **VERDICT)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(self.entries()), 1)
+
+    def test_scenario_result_evidence_epic_and_evaluator_refusals(self):
+        self.proved()
+        self.refused(400, "no such scenario", CODER, "prove", scenario="S9", result="pass", evidence="x")
+        self.refused(400, "result must be", CODER, "prove", scenario="S1", result="maybe", evidence="x")
+        self.refused(400, "evidence is required", CODER, "prove", scenario="S1", result="pass", evidence="  ")
+        self.refused(400, "judged by tester", TESTER, "verdict", evaluator="reader", **VERDICT)
+        plan = self.backend.plan
+        self.backend.plan = lambda pr: dict(plan(pr), scenarios={"S1": {"evaluator": "tester", "claim": "epic"}})
+        self.refused(400, "claimed at the epic", CODER, "prove", **PROVE)
+
+
+    def test_report_ignores_pod_issue_and_everything(self):
+        rid = self.hub.submit(CODER, "report", head=None, state="withdrawn", text="x", cid="R1")
+        self.hub.queue[0]["call"]["args"].update(issue="other/repo#99", everything=True)
+        relay.pass_once(self.ex, self.hub.fetch, self.hub.post)
+        self.assertEqual(self.hub.results[rid]["status"], 200)
+        (pod, args), = self.backend.reported
+        self.assertEqual(args, {"state": "withdrawn", "text": "x", "issue": 1})
+
+    def test_report_for_unlinked_pr_refused_and_writes_nothing(self):
+        self.refused(403, "pr not linked", CODER, "report", issue=2, head=None, state="done", text="x")
+        self.assertEqual(self.backend.reported, [])
+
+    def test_report_text_control_characters_stripped(self):
+        self.run_one(CODER, "report", head=None, state="done", text="a\x1b[31mb\x00\nc\u0085d", cid="R2")
+        self.assertEqual(self.backend.reported[0][1]["text"], "a [31mb c d")
+
+    def test_report_replay_with_other_text_is_409(self):
+        self.run_one(CODER, "report", head=None, state="done", text="x", cid="R3")
+        got = self.run_one(CODER, "report", head=None, state="done", text="y", cid="R3")
+        self.assertEqual(got["status"], 409)
+        self.assertEqual(len(self.backend.reported), 1)
+
+    def test_needs_head_is_the_hubs(self):
+        self.assertIs(relay.NEEDS_HEAD, relay.cloud_relay.NEEDS_HEAD)
+
+    def test_token_file_over_cap_refused(self):
+        notes = []
+
+        class Engine:
+            state_dir, config = "/nonexistent", {}
+
+            def _note(self, *a):
+                notes.append(a)
+        tok = Path(self.state) / "tok"
+        tok.write_text("x" * (relay.TOKEN_CAP + 1))
+        env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": str(tok)}
+        self.assertEqual(relay.pass_if_configured(Engine(), None, None, lambda: 1, environ=env), 0)
+        self.assertIn("token file over", notes[0][2]["error"])
+
+    def serve(self, handler_body):
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                handler_body(self)
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return "http://127.0.0.1:%d" % srv.server_port
+
+    def test_pending_answer_over_cap_refused(self):
+        old = relay.PENDING_CAP
+        relay.PENDING_CAP = 100
+        self.addCleanup(setattr, relay, "PENDING_CAP", old)
+
+        def body(h):
+            data = b'{"requests": [], "pad": "' + b"x" * 200 + b'"}'
+            h.send_response(200)
+            h.send_header("Content-Length", str(len(data)))
+            h.end_headers()
+            h.wfile.write(data)
+        fetch, _ = relay.http_transport(self.serve(body), "tok")
+        with self.assertRaises(ValueError):
+            fetch()
+
+    def test_redirect_is_not_followed(self):
+        seen = []
+        target = self.serve(lambda h: (seen.append(h.headers.get("Authorization")), h.send_response(200), h.end_headers()))
+
+        def body(h):
+            h.send_response(302)
+            h.send_header("Location", target + "/x")
+            h.end_headers()
+        fetch, _ = relay.http_transport(self.serve(body), "tok")
+        with self.assertRaises(Exception):
+            fetch()
+        self.assertEqual(seen, [])
+
+    def test_plain_http_to_public_host_refused(self):
+        with self.assertRaises(ValueError):
+            relay.http_transport("http://hub.example.com", "tok")
+        relay.http_transport("https://hub.example.com", "tok")
+        relay.http_transport("http://hub.fleet.svc", "tok")
+
+
+class RealRuleMutants(unittest.TestCase):
+    """Each test removes or inverts ONE real rule (monkeypatched in the real code) and shows the guarding test then fails."""
+
+    def caught(self, guard, prep=None):
+        """Run the guarding test of Case with the mutant in place; it must fail. `prep(case)` mutates a backend, it runs after setUp."""
+        case = Case(guard)
+        case.setUp()
+        if prep:
+            prep(case)
+        try:
+            with self.assertRaises(AssertionError, msg="the mutant survived %s" % guard):
+                getattr(case, guard)()
+        finally:
+            case.doCleanups()
+            case.tmp.cleanup()
+
+    def patch(self, owner, name, value):
+        old = getattr(owner, name)
+        setattr(owner, name, value)
+        self.addCleanup(setattr, owner, name, old)
+        return old
+
+    def test_unmutated_guards_pass(self):   # the same guards, run for real, so a mutant test cannot pass through a broken guard
+        for guard in ("test_stale_head", "test_head_moves_inside_decision", "test_proof_from_non_holder_403", "test_author_verdict_403",
+                      "test_github_author_verdict_403", "test_non_evaluator_403",
+                      "test_pr_not_linked_to_the_pods_issue_refused_for_all_three", "test_same_call_id_two_pods"):
+            case = Case(guard)
+            case.setUp()
+            getattr(case, guard)()
+            case.tmp.cleanup()
+
+    def test_mutant_head_recheck_removed(self):
+        self.patch(relay, "_same_head", lambda known, given: True)
+        self.caught("test_stale_head")
+        self.caught("test_head_moves_inside_decision")
+
+    def test_mutant_holder_check_removed(self):
+        orig = relay.Executor._write
+
+        def no_holder(ex, command, pod, req, call, pr, cid, args):
+            ex.backend.holder_of = lambda r, i: pod   # the check can no longer refuse anyone
+            return orig(ex, command, pod, req, call, pr, cid, args)
+        self.patch(relay.Executor, "_write", no_holder)
+        self.caught("test_proof_from_non_holder_403")
+
+    def test_mutant_author_exclusion_removed(self):
+        self.patch(plan_ledger, "authors_of", lambda *a, **k: set())
+        self.caught("test_author_verdict_403")
+        self.caught("test_github_author_verdict_403")
+
+    def test_mutant_evaluator_role_check_removed(self):
+        self.patch(plan_ledger, "may_record_verdict", lambda *a, **k: (True, ""))
+        self.caught("test_non_evaluator_403")
+
+    def test_mutant_pr_issue_link_removed(self):
+        self.caught("test_pr_not_linked_to_the_pods_issue_refused_for_all_three", lambda case: setattr(case.backend, "pr_issues", lambda pr: {1, 2}))
+
+    def test_mutant_call_id_global_not_per_pod(self):
+        key = lambda pod: "any" if "\n" not in pod else pod
+        get, put = relay.Index.get, relay.Index.put
+        self.patch(relay.Index, "get", lambda self, pod, cid: get(self, key(pod), cid))
+        self.patch(relay.Index, "put", lambda self, pod, cid, rec: put(self, key(pod), cid, rec))
+        self.caught("test_same_call_id_two_pods")
+
+
+class ReplyHygiene(Fixture):
+    def test_plan_and_ledger_errors_are_fixed_reasons_with_detail_in_audit(self):
+        self.proved()
+        self.refused(400, "no such scenario", CODER, "prove", scenario="S9<script>", result="pass", evidence="x")
+        got = self.hub.results[max(self.hub.results, key=lambda r: int(r[1:]))]
+        self.assertNotIn("S9", got["reason"])
+        self.assertIn("S9", json.dumps(self.backend.audits[-1][1]))
+        self.backend.plan = lambda pr: (_ for _ in ()).throw(relay.Refuse(400, "the plan is not usable", "plan secret detail"))
+        self.refused(400, "the plan is not usable", CODER, "prove", **PROVE)
+        self.assertNotIn("secret detail", json.dumps(self.hub.results))
+        self.assertIn("secret detail", json.dumps(self.backend.audits[-1][1]))
+
+    def test_ledger_error_reason_is_fixed(self):
+        def boom(*a, **k):
+            raise plan_ledger.LedgerError("/private/path broke")
+        old = plan_ledger.append_checked
+        plan_ledger.append_checked = boom
+        self.addCleanup(setattr, plan_ledger, "append_checked", old)
+        got = self.run_one(CODER, "prove", **PROVE)
+        self.assertEqual((got["status"], got["reason"]), (409, "the ledger refused the write"))
+        self.assertIn("/private/path", json.dumps(self.backend.audits[-1][1]))
+
+    def test_every_reason_is_clipped_under_the_hub_limit(self):
+        self.backend.gates = lambda pr: {"ready": False, "pad": "x" * 5000}
+        rid = self.hub.submit(CODER, "gates", head=None)
+        relay.pass_once(self.ex, self.hub.fetch, self.hub.post)
+        self.assertLess(len(self.hub.results[rid]["reason"]), 2000)
+        self.assertEqual(json.loads(self.hub.results[rid]["reason"])["truncated"], True)
+        self.refused(400, "not one of", CODER, "x" * 5000, head=None)
+        self.assertLess(len(max((r["reason"] for r in self.hub.results.values()), key=len)), 2000)
+
+    def test_token_file_read_failure_records_only_the_class_name(self):
+        notes = []
+
+        class Engine:
+            state_dir, config = "/nonexistent", {}
+
+            def _note(self, *a):
+                notes.append(a)
+        env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": "/nonexistent/secret-path/token"}
+        relay.pass_if_configured(Engine(), None, None, lambda: 1, environ=env)
+        self.assertEqual(notes[0][2], {"error": "FileNotFoundError"})
+
+    def test_index_lock_is_mode_0600_and_oversized_index_is_ignored(self):
+        idx = relay.Index(self.state)
+        idx.put("p", "c", {"seq": 1, "hash": "h"})
+        self.assertEqual((Path(self.state) / (relay.INDEX_FILE + ".lock")).stat().st_mode & 0o777, 0o600)
+        old = relay.INDEX_READ_CAP
+        relay.INDEX_READ_CAP = 10
+        self.addCleanup(setattr, relay, "INDEX_READ_CAP", old)
+        self.assertEqual(idx._read(), {})
+
+
+if __name__ == "__main__":
+    unittest.main()
