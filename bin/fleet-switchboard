@@ -13505,7 +13505,8 @@ SWEEP_LIST_PAGES = 2          # pages one list read follows (200 records); more 
 SWEEP_PR_COMMENTS = 5         # the last comments of an item that are searched for the phrases
 SWEEP_FILE = "sweep.json"
 SWEEP_READY_FILE = "sweep-ready.json"   # #986: per held pull request, the head and the moment it first became ready for the owner's decision (S5 counts the wait from it)
-SWEEP_READY_READS = 10   # held pull requests whose gates one pass may read; the rest are counted as not checked
+SWEEP_READY_READS = 10   # held pull requests whose gates one pass may read; the rest are counted as not checked and read first on the next pass
+SWEEP_READY_READ_COST = 4   # calls of the shared pass budget one gate reading is charged (it makes several GETs)
 SWEEP_ALARMED_FILE = "sweep-alarmed.json"   # #805: when each finding was last raised, so the re-alarm window survives a restart
 SWEEP_KINDS = {"S6a": "first-line marker without the merge-captain label (our PR)", "S6b": "merge label and first-line marker disagree",
                "S1a": "decision section without an awaiting label", "S1b": "awaiting label without a decision section",
@@ -13690,6 +13691,8 @@ class SweepState:
         self.started = 0         # when this pass's sweep began (the time budget)
         self.ready = {}          # "repo#n" -> {"head", "at"}: the first moment the pull request was ready at that head (#986)
         self.ready_loaded = False
+        self.ready_read = {}     # "repo#n" -> the order of its last gate reading (the least recently read goes first)
+        self.read_seq = 0
         self.s5 = {}             # decision id -> (head, ready time, who clears) for each held pull request that has waited past the threshold
         self.s5_unchecked = 0    # held pull requests whose gates could not be read this pass: never raised (#986)
         self.details = {}        # (kind, ref) -> the finding's own sentence
@@ -13905,15 +13908,14 @@ def sweep_gate_reading(engine, repo, number, now):
         return None, None, None, _one_line("%s: %s" % (type(err).__name__, err), 120)
 
 
-def sweep_s5_wait_start(ready_at, since):
-    """When the wait of a ready held pull request starts: the moment it became ready, never the hold (#986)."""
-    return ready_at
-
-
-def sweep_ready_pass(engine, state, decisions, home, now, cfg, decisions_whole=True):
+def sweep_ready_pass(engine, state, decisions, home, now, cfg, decisions_whole=True, budget=None):
     """#986: for each held pull request in the cos tier (and not already the owner's), read its gates and keep when it first became ready at its
     current head. A new head or an open gate drops the moment. Fills `state.s5` with the ones that have waited past the threshold; a gate read that
-    fails is counted in `state.s5_unchecked` and raises nothing. Reads GitHub only (GET)."""
+    fails is counted in `state.s5_unchecked` and raises nothing. Reads GitHub only (GET).
+    Fairness: the held pull requests are read least recently read first (`state.ready_read`), so one the cap, the shared call budget or the
+    pass time left unread is first in line on the next pass: none stays hidden. The moment kept is when the sweep first OBSERVED the pull
+    request ready, not when it became ready: after a restart without the state file, or after passes that did not read it, the wait restarts,
+    so a finding can be late, never early. A clock that goes backwards makes now - start negative: nothing is raised until it catches up."""
     state.s5, state.s5_unchecked = {}, 0
     if engine.state_dir is not None and not state.ready_loaded:
         state.ready_loaded = True
@@ -13928,15 +13930,23 @@ def sweep_ready_pass(engine, state, decisions, home, now, cfg, decisions_whole=T
         if d.get("tier", "human") == "human" and d.get("kind") != "notice":
             human_keys |= sweep_ref_keys(d, home, repos_known)
     seen, reads, before = set(), 0, json.dumps(state.ready, sort_keys=True)
+    todo = []
     for d in decisions:
         held = sweep_held_pr(d, home)
         if not held or d.get("kind") == "notice" or sweep_ref_keys(d, home, repos_known) & human_keys:
             continue
-        key = "%s#%d" % held
-        seen.add(key)
-        if reads >= SWEEP_READY_READS:
+        seen.add("%s#%d" % held)
+        todo.append((state.ready_read.get("%s#%d" % held, 0), "%s#%d" % held, held, d))
+    todo.sort(key=lambda t: (t[0], t[1]))   # the least recently read first
+    for _, key, held, d in todo:
+        if reads >= SWEEP_READY_READS or (budget is not None and budget[0] < SWEEP_READY_READ_COST) \
+                or engine.now() - state.started >= SWEEP_PASS_SECONDS:
             state.s5_unchecked += 1
             continue
+        if budget is not None:
+            budget[0] -= SWEEP_READY_READ_COST
+        state.read_seq += 1
+        state.ready_read[key] = state.read_seq   # an order, not a time: it cannot tie or go backwards
         reads += 1
         opened, head, who, why = sweep_gate_reading(engine, held[0], held[1], now)
         if opened is None:
@@ -13948,12 +13958,13 @@ def sweep_ready_pass(engine, state, decisions, home, now, cfg, decisions_whole=T
         row = state.ready.get(key)
         if not row or row["head"] != head:   # a new head restarts the wait
             row = state.ready[key] = {"head": head, "at": now}
-        start = sweep_s5_wait_start(row["at"], parse_iso(d.get("since")))
-        if start is not None and now - start >= cfg["aged_cos_hours"] * 3600:
+        if now - row["at"] >= cfg["aged_cos_hours"] * 3600:
             state.s5[d.get("id") or key] = (head, row["at"], who)
     if decisions_whole:   # a partial list cannot say a pull request is no longer held: keep its moment
         for key in [k for k in state.ready if k not in seen]:
             state.ready.pop(key, None)
+    for key in [k for k in state.ready_read if k not in seen] if decisions_whole else []:
+        state.ready_read.pop(key, None)
     if engine.state_dir is not None and json.dumps(state.ready, sort_keys=True) != before:
         try:
             _write_small(engine.state_dir, SWEEP_READY_FILE, dict(sorted(state.ready.items())[:2000]))
@@ -14224,7 +14235,7 @@ def sweep_decisions(engine, decisions, now, errors=()):
         errors = list(errors or ()) + [{"source": "registry", "error": "the notice read is not whole: %s" % why}]
     defer, deferred = sweep_deferrals(state, errors, repos, now)
     whole_list = notices_whole or "*" not in defer
-    sweep_ready_pass(engine, state, kept, home, now, cfg, whole_list)
+    sweep_ready_pass(engine, state, kept, home, now, cfg, whole_list, budget)
     candidates = sweep_findings(engine, state, kept, home, now, cfg, regex, defer, whole_list)
     findings, unchecked = [], 0
     attempts = sorted(candidates, key=lambda c: (state.attempted.get(c, 0), c))  # the longest untried first

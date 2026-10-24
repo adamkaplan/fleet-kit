@@ -28430,14 +28430,14 @@ class TestSweep(Base):
             calls.append((repo, number))
             return reading["value"]
         patches = [mock.patch.object(sb, "sweep_gate_reading", fake)]
-        if mutant == "from_hold":
-            patches.append(mock.patch.object(sb, "sweep_s5_wait_start", lambda ready_at, since: since))
         if mutant == "raises_not_ready":
             patches.append(mock.patch.object(sb, "sweep_gate_reading", lambda e, r, n, now: ([], reading["value"][1] or self.HEAD_A, "who can clear it: x", None)
                                             if reading["value"][0] is not None else reading["value"]))
         with contextlib.ExitStack() as stack:
             for patch in patches:
                 stack.enter_context(patch)
+            if mutant == "from_hold":   # the REAL code, counting from the hold
+                stack.enter_context(self.mutated("sweep_ready_pass", 'if now - row["at"] >= ', 'if now - (parse_iso(d.get("since")) or now) >= '))
             self.sweep(decisions)
         return [e for e in self.world.audit() if e["event"] == "sweep.finding" and e["detail"]["kind"] == "S5"]
 
@@ -28587,15 +28587,17 @@ class TestSweep(Base):
                     self.fail("%s: the mutant raised %s" % (name, type(err).__name__))
                 case["check"](self, got)
 
-    def ready_pass(self, decisions, reading, now=None, whole=True, mutant=None):
+    def ready_pass(self, decisions, reading, now=None, whole=True, mutant=None, budget=None, spent=False):
         state = sb.sweep_state(self.engine)
         now = now if now is not None else self.world.clock.now()
+        state.started = self.engine.now() - (sb.SWEEP_PASS_SECONDS + 1 if spent else 0)
+        extra = {"budget": budget}
         with mock.patch.object(sb, "sweep_gate_reading", lambda e, r, n, t: reading(r, n)):
             if mutant:
                 with self.mutated("sweep_ready_pass", *mutant):
-                    sb.sweep_ready_pass(self.engine, state, decisions, "acme/api", now, self.engine.config["sweep"], whole)
+                    sb.sweep_ready_pass(self.engine, state, decisions, "acme/api", now, self.engine.config["sweep"], whole, **extra)
             else:
-                sb.sweep_ready_pass(self.engine, state, decisions, "acme/api", now, self.engine.config["sweep"], whole)
+                sb.sweep_ready_pass(self.engine, state, decisions, "acme/api", now, self.engine.config["sweep"], whole, **extra)
         return state
 
     def ready_file(self):
@@ -28705,13 +28707,95 @@ class TestSweep(Base):
             ok = bool(text) and "\n" not in text and len(text) < 1500
             self.assertEqual(ok, mutant is None)
 
+
+    # ---- #986 (review): every skip/limit path of sweep_ready_pass gives the skipped pull request a turn on a later pass.
+    # Checked: the cap, the shared call budget, the pass time, the human-tier skip, a partial list, an unreadable read, a clock going backwards.
+    def read_order(self, held, passes, **kw):
+        """Run `passes` passes; returns the list of the numbers read per pass."""
+        out = []
+        for _ in range(passes):
+            reads = []
+            self.ready_pass(held, lambda r, n: reads.append(n) or self.ready(), **kw)
+            out.append(reads)
+            self.world.tick(60)
+        return out
+
+    def edge_fair_cap(self, mutant):
+        held = [self.held_pr(700 + i) for i in range(25)]
+        rounds = -(-25 // sb.SWEEP_READY_READS)
+        seen = set()
+        for reads in self.read_order(held, rounds, mutant=mutant):
+            seen |= set(reads)
+        self.assertEqual(len(seen), 25)   # every one within ceil(25/10) passes
+
+    def edge_fair_budget(self, mutant):
+        held = [self.held_pr(700 + i) for i in range(5)]
+        cost = sb.SWEEP_READY_READ_COST
+        first, second = [], []
+        state = self.ready_pass(held, lambda r, n: first.append(n) or self.ready(), budget=[cost * 2 + cost - 1], mutant=mutant)
+        self.assertEqual((len(first), state.s5_unchecked), (2, 3))
+        self.world.tick(60)
+        self.ready_pass(held, lambda r, n: second.append(n) or self.ready(), budget=[cost * 3], mutant=mutant)
+        self.assertEqual(set(first) & set(second[:3]), set())   # the unread ones go first
+
+    def edge_fair_time(self, mutant):
+        held = [self.held_pr(700 + i) for i in range(3)]
+        reads = []
+        state = self.ready_pass(held, lambda r, n: reads.append(n) or self.ready(), spent=True, mutant=mutant)
+        self.assertEqual((reads, state.s5_unchecked), ([], 3))
+        self.ready_pass(held, lambda r, n: reads.append(n) or self.ready())
+        self.assertEqual(sorted(reads), [700, 701, 702])
+
+    def edge_fair_human(self, mutant):
+        human = {"id": "pr:acme/api#700", "kind": "captain", "tier": "human", "repo": "acme/api", "number": 700, "title": "t", "since": self.at()}
+        reads = []
+        self.ready_pass([self.held_pr(700), human], lambda r, n: reads.append(n) or self.ready(), mutant=mutant)
+        self.assertEqual(reads, [])
+        self.ready_pass([self.held_pr(700)], lambda r, n: reads.append(n) or self.ready(), mutant=mutant)   # the owner's row is gone: its turn
+        self.assertEqual(reads, [700])
+
+    def edge_fair_partial(self, mutant):
+        held = [self.held_pr(700 + i) for i in range(12)]
+        self.read_order(held, 1)
+        before = dict(sb.sweep_state(self.engine).ready_read)
+        self.ready_pass([], lambda r, n: self.ready(), whole=False, mutant=mutant)
+        self.assertEqual(sb.sweep_state(self.engine).ready_read, before)   # the order survives a partial list
+        reads = []
+        self.ready_pass(held, lambda r, n: reads.append(n) or self.ready())
+        self.assertEqual(sorted(reads[:2]), [710, 711])
+
+    def edge_fair_unreadable(self, mutant):
+        held = [self.held_pr(700 + i) for i in range(11)]
+        reading = lambda r, n: (None, None, None, "boom") if n == 700 else self.ready()
+        passes = []
+        for _ in range(3):
+            reads = []
+            self.ready_pass(held, lambda r, n: reads.append(n) or reading(r, n), mutant=mutant)
+            passes.append(reads)
+            self.world.tick(60)
+        self.assertIn(710, passes[1][:1])      # the unreadable one does not keep the 11th out
+        self.assertIn(700, passes[2])          # and gets its turn again
+
+    def test_986_a_clock_going_backwards_raises_nothing_until_it_catches_up(self):
+        """Safe: now - start is negative, so nothing is raised early; it is raised when the clock passes the threshold again."""
+        for mutant in (None, ('if now - row["at"] >= ', 'if abs(now - row["at"]) >= ')):
+            self.setUp()
+            held = [self.held_pr()]
+            t0 = self.world.clock.now()
+            self.ready_pass(held, lambda r, n: self.ready(), now=t0)
+            state = self.ready_pass(held, lambda r, n: self.ready(), now=t0 - 3 * 3600, mutant=mutant)
+            self.assertEqual(state.s5 == {}, mutant is None)
+            if mutant is None:
+                state = self.ready_pass(held, lambda r, n: self.ready(), now=t0 + 3 * 3600)
+                self.assertEqual(len(state.s5), 1)
+
     def edge_write(self, mutant):
         self.ready_pass([self.held_pr()], lambda r, n: self.ready(), mutant=mutant)
         self.assertEqual(self.ready_file().get("acme/api#600", {}).get("head"), self.HEAD_A)
 
     ONCE_PER_HEAD_MUTANT = ("if once not in state.logged or", "if True or")
     EDGES = {
-        "cap": ("edge_cap", ("if reads >= SWEEP_READY_READS:", "if False:")),
+        "cap": ("edge_cap", ("if reads >= SWEEP_READY_READS or", "if False or")),
         "persistence_round_trip": ("edge_roundtrip", ("state.ready_loaded = True", "state.ready_loaded = True\n        return")),
         "human_tier_skip": ("edge_human_skip", ("or sweep_ref_keys(d, home, repos_known) & human_keys", "")),
         "prune_not_held": ("edge_prune", ("if k not in seen", "if False")),
@@ -28721,6 +28805,12 @@ class TestSweep(Base):
         "unreadable_not_checked": ("edge_unreadable", ("state.s5_unchecked += 1\n            continue\n        if opened != ", "continue\n        if opened != ")),
         "write_on_change": ("edge_write", ("_write_small(engine.state_dir, SWEEP_READY_FILE", "(lambda *a: None)(engine.state_dir, SWEEP_READY_FILE")),
         "raised_once_per_head": ("edge_once_per_head", None),
+        "fair_cap_least_recently_read": ("edge_fair_cap", ("todo.sort(key=lambda t: (t[0], t[1]))", "todo.sort(key=lambda t: 0)")),
+        "fair_budget": ("edge_fair_budget", ("(budget is not None and budget[0] < SWEEP_READY_READ_COST)", "False")),
+        "fair_time": ("edge_fair_time", ("or engine.now() - state.started >= SWEEP_PASS_SECONDS:", ":")),
+        "fair_human_skip": ("edge_fair_human", ("or sweep_ref_keys(d, home, repos_known) & human_keys", "")),
+        "fair_partial_list": ("edge_fair_partial", ("if decisions_whole else []", "if True else []")),
+        "fair_unreadable": ("edge_fair_unreadable", ("state.ready_read[key] = state.read_seq", "pass")),
     }
 
     def test_986_the_edge_paths_of_the_ready_pass(self):
