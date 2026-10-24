@@ -173,6 +173,40 @@ class Table(unittest.TestCase):
             self.assertEqual(p.returncode, 0, bad)   # the mutant sends the GET: the test above would fail on it
             self.assertEqual(len(Rec.seen), 1)
 
+    FLAG_PATTERNS = {"-f": "gh api* -f*", "-F": "gh api* -F*", "--input": "gh api*--input*", "graphql": "gh api*graphql*"}
+
+    def table_deny_patterns(self):
+        """The permission patterns that the table's denied rows need in opencode-worker.json (the method rows and the flag rows)."""
+        out = set()
+        for r in rows():
+            if r["kind"] != "denied":
+                continue
+            if r["method"] in ("POST", "PATCH", "PUT", "DELETE"):
+                out.add("gh api*%s*" % r["method"])
+            if r["path"] in self.FLAG_PATTERNS:
+                out.add(self.FLAG_PATTERNS[r["path"]])
+        return out
+
+    def missing_deny_rows(self, conf):
+        """Table deny rows absent from either bash block, and method deny rows of the file that the table does not list."""
+        want = self.table_deny_patterns()
+        blocks = (conf["permission"]["bash"], conf["agent"]["worker"]["permission"]["bash"])
+        missing = [(i, w) for i, b in enumerate(blocks) for w in sorted(want) if b.get(w) != "deny"]
+        extra = [k for k, v in blocks[0].items() if v == "deny" and re.fullmatch(r"gh api\*(POST|PATCH|PUT|DELETE)\*", k) and k not in want]
+        return missing, extra
+
+    def test_m2_every_deny_row_of_the_table_is_in_the_permission_file_and_back(self):
+        self.assertEqual(self.missing_deny_rows(load_conf()), ([], []))
+        self.assertEqual(len(self.table_deny_patterns()), 8)
+
+    def test_m2_a_mutant_that_drops_a_deny_row_is_seen(self):
+        for drop in ("gh api*POST*", "gh api*graphql*"):
+            conf = json.loads(json.dumps(load_conf()))
+            del conf["permission"]["bash"][drop]
+            del conf["agent"]["worker"]["permission"]["bash"][drop]
+            missing, _ = self.missing_deny_rows(conf)
+            self.assertEqual(sorted(w for _, w in missing), [drop, drop], drop)
+
 
 if __name__ == "__main__":
     unittest.main()
