@@ -125,24 +125,55 @@ Kinds (the number is exact: see rule 7): `namespace` (a part uses names the entr
 
 ## Dynamic imports not followed
 
-The derivation follows `import`, `from . import x`, `from .x import y`, and a constant-string `__import__("x")`, `importlib.import_module("x")` and `load_module("x")`, however the call is spelled or bound (`imp = __import__`, `from importlib import import_module as im`, `getattr(importlib, "import_module")`), and the `load_x()` helpers. It does not follow, and lists here by the enclosing function and the kind of call, with a count: a non-constant argument, a load by path or by text (`exec`, `eval`, `compile`, `find_spec`, `spec_from_file_location`, `SourceFileLoader`, `run_path`) and a relative import of level two or more. A new site, a swapped site, a wrong count or a stale row fails the test.
+The derivation follows `import`, `from . import x`, `from .x import y`, and a direct call with a constant module name: `__import__("x")`, `importlib.import_module("x")` or `load_module("x")`, spelled as such, and the `load_x()` helpers. Nothing else is followed. It reads what is spelled, never an assignment: every other use of an import primitive (`__import__`, `import_module`, `load_module`, `find_spec`, `spec_from_file_location`, `module_from_spec`, `exec_module`, `SourceFileLoader`, `run_path`, `run_module`, `importlib.reload`, and the builtins `exec`, `eval`, `compile` as a bare name or `builtins.<name>`) is a site, and so is each of these: a primitive used as a value (a default, a class attribute, a dict value, a conditional, a tuple, a walrus, an argument of `map` or `functools.partial`, `globals()["__import__"]`, `getattr(importlib, "import_module")`), a call with a non-constant, relative (leading dot) or package argument, an aliased `from m import primitive as other`, and a relative import of level two or more.
+
+A site is listed here by the function it sits in and the kind of use, with a count; the kind is the primitive, with `(non-constant)`, `(relative)`, `(reference)` or `(alias)` where it is not a plain call. A new site, a swapped site, a wrong count or a stale row fails the test. A `getattr` on the import machinery with a name decided at run time cannot be listed: it fails the test, because what it loads cannot be said.
+
+What the test cannot follow, and says so by listing it: a name built at run time, code loaded by path or from text, and anything reached through another object (`self.loader.exec_module`). Over-counting is possible and safe: a bare reference counts even when the name is never called, and a method that happens to be called `exec_module` counts. Under-counting is the risk the table exists to keep small.
 
 | Unit | Site | Count | What |
 |---|---|---|---|
+| `agent_reconcile.py` | `_load_registry:exec_module` | 1 | runs the module of a spec |
+| `agent_reconcile.py` | `_load_registry:module_from_spec` | 1 | builds the module of a spec |
 | `agent_reconcile.py` | `_load_registry:spec_from_file_location` | 1 | loads a module by path |
+| `cloud_worker.py` | `_lib:exec_module` | 1 | runs the module of a spec |
+| `cloud_worker.py` | `_lib:module_from_spec` | 1 | builds the module of a spec |
 | `cloud_worker.py` | `_lib:spec_from_file_location` | 1 | loads a module by path |
+| `cloud_worker.py` | `_registry_note:load_module(non-constant)` | 1 | loads the module its argument names |
+| `cloud_worker.py` | `_walk:exec_module` | 1 | runs the module of a spec |
+| `cloud_worker.py` | `_walk:module_from_spec` | 1 | builds the module of a spec |
 | `cloud_worker.py` | `_walk:spec_from_file_location` | 1 | loads a module by path |
+| `cloud_worker.py` | `model_entry:exec_module` | 1 | runs the module of a spec |
+| `cloud_worker.py` | `model_entry:module_from_spec` | 1 | builds the module of a spec |
 | `cloud_worker.py` | `model_entry:spec_from_file_location` | 1 | loads a module by path |
+| `cpu_guard.py` | `slots_text:exec_module` | 1 | runs the module of a spec |
+| `cpu_guard.py` | `slots_text:module_from_spec` | 1 | builds the module of a spec |
 | `cpu_guard.py` | `slots_text:spec_from_file_location` | 1 | loads a module by path |
+| `external_adapter.py` | `_load_core:exec_module` | 1 | runs the module of a spec |
+| `external_adapter.py` | `_load_core:module_from_spec` | 1 | builds the module of a spec |
 | `external_adapter.py` | `_load_core:spec_from_file_location` | 1 | loads a module by path |
+| `fleet-switchboard` | `Installer.reaper_command_problem:exec_module` | 1 | runs the module of a spec |
+| `fleet-switchboard` | `Installer.reaper_command_problem:module_from_spec` | 1 | builds the module of a spec |
 | `fleet-switchboard` | `Installer.reaper_command_problem:spec_from_file_location` | 1 | loads a module by path |
+| `fleet-switchboard` | `_declared_module:exec_module` | 1 | runs the module of a spec |
 | `fleet-switchboard` | `_declared_module:load_module(non-constant)` | 1 | loads the module its argument names |
+| `fleet-switchboard` | `_declared_module:module_from_spec` | 1 | builds the module of a spec |
 | `fleet-switchboard` | `_declared_module:spec_from_file_location` | 1 | loads a module by path |
 | `fleet-switchboard` | `_fleet_parts:compile` | 1 | compiles a part's text |
 | `fleet-switchboard` | `_fleet_parts:exec` | 1 | runs a part's code in the entry's namespace |
 | `fleet-switchboard` | `_make_loader.loader:load_module(non-constant)` | 1 | loads the module its argument names |
+| `fleet-switchboard` | `launcher_module:exec_module` | 1 | runs the module of a spec |
+| `fleet-switchboard` | `launcher_module:module_from_spec` | 1 | builds the module of a spec |
 | `fleet-switchboard` | `launcher_module:spec_from_file_location` | 1 | loads a module by path |
+| `fleet-switchboard` | `load_module:exec_module` | 1 | runs the module of a spec |
+| `fleet-switchboard` | `load_module:module_from_spec` | 1 | builds the module of a spec |
 | `fleet-switchboard` | `load_module:spec_from_file_location` | 1 | loads a module by path |
+| `fleet-switchboard` | `load_review_rule:exec_module` | 1 | runs the module of a spec |
+| `fleet-switchboard` | `load_review_rule:module_from_spec` | 1 | builds the module of a spec |
 | `fleet-switchboard` | `load_review_rule:spec_from_file_location` | 1 | loads a module by path |
+| `fleet-switchboard` | `validate_app_config:exec_module` | 1 | runs the module of a spec |
+| `fleet-switchboard` | `validate_app_config:module_from_spec` | 1 | builds the module of a spec |
 | `fleet-switchboard` | `validate_app_config:spec_from_file_location` | 1 | loads a module by path |
+| `fleet-switchboard` | `validate_hold_labels_config:exec_module` | 1 | runs the module of a spec |
+| `fleet-switchboard` | `validate_hold_labels_config:module_from_spec` | 1 | builds the module of a spec |
 | `fleet-switchboard` | `validate_hold_labels_config:spec_from_file_location` | 1 | loads a module by path |
