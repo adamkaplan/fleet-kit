@@ -75439,6 +75439,28 @@ class TestLoadAlert(Base):
         series = json.loads((self.state_dir / "load.json").read_text())["series"]["orch"]["hours"]
         self.assertEqual([h["cloud"] for h in series.values()], [2])
 
+    def test_mutant_counting_cloud_as_local_is_caught(self):
+        """Real load_tick over fake discovery and fake cloud records; a spliced mutant that adds cloud workers to busy fails the exact figures."""
+        def figures(latest):
+            return {k: (latest[k]["busy"], latest[k]["idle"], latest[k]["cloud"]) for k in ("orch", "orchb")}
+        self.assertEqual(figures(self._cloud_run()), {"orch": (1, 1, 2), "orchb": (0, 0, 0)})
+        source = SWITCHBOARD.read_text()
+        import re as _re
+        body = _re.search(r"def load_tick\(.*?\n\n\n", source, _re.S).group(0)
+        old = '"busy": sum(1 for c in coders if c.status == "working"),'
+        self.assertIn(old, body)
+        scope = dict(vars(sb))
+        exec(body.replace(old, '"busy": sum(1 for c in coders if c.status == "working") + cloud_live.get(name, 0),'), scope)
+        real = sb.load_tick
+        def patch():
+            sb.load_tick = scope["load_tick"]
+        try:
+            mutated = figures(self._cloud_run(patch))
+        finally:
+            sb.load_tick = real
+        self.assertEqual(mutated["orch"][0], 3)   # the mutant shows busy 3
+        self.assertNotEqual(mutated, {"orch": (1, 1, 2), "orchb": (0, 0, 0)})
+
     def test_mutant_dropping_the_cloud_count_in_load_tick_is_caught(self):
         original = sb.live_cloud_by_lane
         sb.live_cloud_by_lane = lambda *a, **k: {}   # the mutant: the cloud count is dropped
@@ -77097,12 +77119,46 @@ class TestCloudLoad(Base):
         self.assertEqual(broken(self.state_dir, self.disc, {}, {"fin": {"state": "done"}}, None), {"orch": 1})   # the mutant differs
         self.assertEqual(self.count(last={"fin": {"state": "done"}}), {})
 
-    def test_mutant_counting_cloud_as_local_is_caught(self):
-        self.rec("c1")
-        self.assertNotIn("orch", {})   # a lane's local figures are built from discovery only: the cloud count is a separate key
-        source = SWITCHBOARD.read_text()
-        self.assertIn('"workers": [o.name for o in coders if getattr(o, "name", None)], "cloud": cloud_live.get(name, 0)', source)
-        self.assertNotIn("busy\": sum(1 for c in coders if c.status == \"working\") + cloud", source)
+    def test_no_boss_worker_counted_under_named_fallback_lane(self):
+        self.rec("c1"); self.rec("lone"); 
+        p = self.state_dir / "cloud" / "lone.json"
+        record = json.loads(p.read_text()); record.pop("reports_to"); p.write_text(json.dumps(record))
+        self.assertEqual(self.count(), {"orch": 1, sb.CLOUD_NO_BOSS_LANE: 1})
+
+    def test_truncation_writes_one_audit_line_per_episode(self):
+        for i in range(sb.CLOUD_LOAD_MAX_ENTRIES + 3):
+            self.rec("w%03d" % i)
+        lines = []
+        audit = types.SimpleNamespace(append=lambda *a: lines.append(a))
+        sb._CLOUD_TRUNCATED.clear()
+        self.count(audit=audit); self.count(audit=audit)
+        self.assertEqual([l[1] for l in lines], ["load.cloud_truncated"])
+        self.assertEqual(lines[0][3]["name"], "CLOUD_LOAD_MAX_ENTRIES")
+        for i in range(10):
+            (self.state_dir / "cloud" / ("w%03d.json" % i)).unlink()
+        self.count(audit=audit)            # the episode ends
+        for i in range(10):
+            self.rec("w%03d" % i)
+        self.count(audit=audit)            # a new episode
+        self.assertEqual(len(lines), 2)
+
+    def test_mutant_silent_truncation_is_caught(self):
+        for i in range(sb.CLOUD_LOAD_MAX_ENTRIES + 3):
+            self.rec("w%03d" % i)
+        broken = self.mutant('"load.cloud_truncated"', '"load.nothing"')
+        lines = []
+        audit = types.SimpleNamespace(append=lambda *a: lines.append(a))
+        sb._CLOUD_TRUNCATED.clear()
+        broken(self.state_dir, self.disc, {}, {}, audit)
+        self.assertNotIn("load.cloud_truncated", [l[1] for l in lines])   # the mutant differs
+        sb._CLOUD_TRUNCATED.clear()
+        self.count(audit=audit)
+        self.assertIn("load.cloud_truncated", [l[1] for l in lines])
+
+    def test_now_is_injected(self):
+        self.rec("w", hard_deadline="2030-01-01T00:00:00Z")
+        self.assertEqual(self.disc and sb.live_cloud_by_lane(self.state_dir, self.disc, {}, {}, None, 1893456001.0 - 86400 * 365 * 5), {"orch": 1})
+        self.assertEqual(sb.live_cloud_by_lane(self.state_dir, self.disc, {}, {}, None, 1893456001.0), {})   # 2030-01-01T00:00:01Z
 
 
 class TestCoderBooks(Base):

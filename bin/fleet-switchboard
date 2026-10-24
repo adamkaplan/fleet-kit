@@ -27083,21 +27083,34 @@ CLOUD_LOAD_MAX_ENTRIES = 200      # #1097: the most cloud records one pass reads
 CLOUD_LOAD_MAX_BYTES = 65536      # and the most bytes of one record
 
 
-def live_cloud_by_lane(state_dir, discovery, retired, last_reports, audit=None):
+CLOUD_NO_BOSS_LANE = "(no boss)"   # #1097: the named fallback lane of a cloud worker whose record has no reports_to
+_CLOUD_TRUNCATED = {}              # state dir -> True while the listing is cut (one audit line per episode)
+
+
+def live_cloud_by_lane(state_dir, discovery, retired, last_reports, audit=None, now=None):
     """#1097: {lane name: live cloud workers} from the files under the cloud record directory (one bounded listing, no GitHub read, no process). A worker
     that is retired, made its final report, or is past its hard deadline is not counted. A lane is the boss the local coders' rule gives (`resolve_boss`).
-    An unreadable directory gives {} and ONE audit line; a record that cannot be read is skipped."""
+    An unreadable directory gives {} and ONE audit line; a record that cannot be read is skipped. A record without reports_to is counted under
+    CLOUD_NO_BOSS_LANE. A listing cut at CLOUD_LOAD_MAX_ENTRIES writes ONE audit line (load.cloud_truncated) per episode. `now` is injected (default: the clock)."""
     base = Path(state_dir) / "cloud"
     counts = {}
     try:
         if not base.is_dir():
             return counts
-        names = sorted(e for e in os.listdir(str(base)) if e.endswith(".json"))[:CLOUD_LOAD_MAX_ENTRIES]
+        names = sorted(e for e in os.listdir(str(base)) if e.endswith(".json"))
     except OSError as err:
         if audit is not None:
             audit.append("daemon", "load.cloud_unreadable", None, {"why": _one_line(str(err), 120)})
         return {}
-    now = time.time()
+    key = str(state_dir)
+    if len(names) > CLOUD_LOAD_MAX_ENTRIES:
+        if not _CLOUD_TRUNCATED.get(key) and audit is not None:
+            audit.append("daemon", "load.cloud_truncated", None, {"limit": CLOUD_LOAD_MAX_ENTRIES, "entries": len(names), "name": "CLOUD_LOAD_MAX_ENTRIES"})
+        _CLOUD_TRUNCATED[key] = True
+        names = names[:CLOUD_LOAD_MAX_ENTRIES]
+    else:
+        _CLOUD_TRUNCATED[key] = False
+    now = time.time() if now is None else now
     for fname in names:
         worker = fname[:-5]
         try:
@@ -27114,9 +27127,9 @@ def live_cloud_by_lane(state_dir, discovery, retired, last_reports, audit=None):
         except (TypeError, ValueError):
             ended = False
         boss = record.get("reports_to")
-        if ended or not isinstance(boss, str) or not boss:
+        if ended:
             continue
-        lane = resolve_boss(discovery, boss)
+        lane = resolve_boss(discovery, boss) if isinstance(boss, str) and boss else CLOUD_NO_BOSS_LANE
         counts[lane] = counts.get(lane, 0) + 1
     return counts
 
