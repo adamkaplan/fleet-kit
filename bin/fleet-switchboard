@@ -7974,6 +7974,7 @@ BOSS_READ_SITES = {
     "bin/fleet_health.py:reconstruct_day": "history: the boss named in a past `v2.session.create` audit row",
     "bin/item_verdicts.py:excluded": "reads the fleets the discovery built (the boss record already applied); it only EXCLUDES writers, so a worker adopted by a registered orchestrator is excluded too",
     "bin/launch_testers.py:launched": "history: the boss named in a launch record, not a live lookup",
+    "bin/fleet-switchboard:live_cloud_by_lane": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record, then resolved by resolve_boss, for the load line count only",
     "bin/cloud_worker.py:cmd_retire": "a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record)",
 }
 
@@ -27078,6 +27079,99 @@ def coder_finished(obs, retired, last_reports):
     return (last_reports.get(name) or {}).get("state") in ("done", "failed")
 
 
+CLOUD_LOAD_MAX_ENTRIES = 200      # #1097: the most cloud records one pass reads for the load line
+CLOUD_LOAD_MAX_SCAN = 2000        # and the most directory entries it examines (of any name)
+CLOUD_LOAD_SECONDS = 0.5          # and the most time (monotonic) it spends
+CLOUD_LOAD_MAX_BYTES = 65536      # and the most bytes of one record
+CLOUD_LOAD_STALE_SECONDS = 3600   # a record that carries last_report_at older than this is not live
+
+
+CLOUD_NO_BOSS_LANE = "(no boss)"   # #1097: the named fallback lane of a cloud worker whose record has no reports_to (counted, but no load row shows it)
+_CLOUD_TRUNCATED = {}              # state dir -> True while the listing is cut (one audit line per episode)
+
+
+CLOUD_BOSS_MAX = 64
+
+
+def _cloud_boss(value):
+    """#1097: the lane key a record's reports_to gives: a string with its control characters removed and at most CLOUD_BOSS_MAX long; else "" (no boss)."""
+    if not isinstance(value, str):
+        return ""
+    return "".join(ch for ch in value if ch.isprintable())[:CLOUD_BOSS_MAX].strip()
+
+
+def _cloud_when(text):
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def live_cloud_by_lane(state_dir, discovery, retired, last_reports, audit=None, now=None, clock=None):
+    """#1097: {lane name: live cloud workers} from the files under the cloud record directory (one bounded scan, no GitHub read, no process). A worker
+    that is retired, made its final report, or is past its hard deadline is not counted; a record WITHOUT a valid hard_deadline (no evidence of liveness)
+    is not counted either, nor one whose last_report_at (if present) is older than CLOUD_LOAD_STALE_SECONDS. A lane is the boss the local coders' rule gives
+    (`resolve_boss`). The files are read by cloud_worker.read_record_file (never blocks, no symlink, regular files only); a hostile file is skipped.
+    An unreadable directory gives {} and ONE audit line. The scan stops at CLOUD_LOAD_MAX_SCAN entries examined, CLOUD_LOAD_MAX_ENTRIES records read or
+    CLOUD_LOAD_SECONDS (injected `clock`, monotonic): ONE audit line (load.cloud_truncated, "bound": files|records|time) per episode. `now` is injected."""
+    base = Path(state_dir) / "cloud"
+    counts = {}
+    clock = clock or time.monotonic
+    deadline = clock() + CLOUD_LOAD_SECONDS
+    now = time.time() if now is None else now
+    reader = load_module("cloud_worker").read_record_file
+    examined = read = 0
+    bound = None
+    try:
+        if not base.is_dir():
+            return counts
+        with os.scandir(str(base)) as it:
+            for entry in it:
+                if examined >= CLOUD_LOAD_MAX_SCAN:
+                    bound = "files"
+                    break
+                if clock() > deadline:
+                    bound = "time"
+                    break
+                examined += 1
+                fname = entry.name
+                if not fname.endswith(".json"):
+                    continue
+                if read >= CLOUD_LOAD_MAX_ENTRIES:
+                    bound = "records"
+                    break
+                read += 1
+                worker = fname[:-5]
+                record, _kind = reader(base / fname, CLOUD_LOAD_MAX_BYTES)
+                if record is None or record.get("worker") != worker:
+                    continue
+                if worker in retired or (last_reports.get(worker) or {}).get("state") in ("done", "failed") or record.get("retired"):
+                    continue
+                ends = _cloud_when(record.get("hard_deadline"))
+                if ends is None or ends < now:
+                    continue   # no valid hard deadline is no evidence of life; a past one is an ended pod
+                if "last_report_at" in record:
+                    seen = _cloud_when(record.get("last_report_at"))
+                    if seen is None or seen > now or now - seen > CLOUD_LOAD_STALE_SECONDS:
+                        continue   # a future-dated report is not fresh (a forged or skewed clock cannot keep a record live)
+                boss = _cloud_boss(record.get("reports_to"))
+                lane = resolve_boss(discovery, boss) if boss else CLOUD_NO_BOSS_LANE
+                counts[lane] = counts.get(lane, 0) + 1
+    except OSError as err:
+        if audit is not None:
+            audit.append("daemon", "load.cloud_unreadable", None, {"why": _one_line(str(err), 120)})
+        return {}
+    key = str(state_dir)
+    if bound:
+        if not _CLOUD_TRUNCATED.get(key) and audit is not None:
+            audit.append("daemon", "load.cloud_truncated", None, {"bound": bound, "limit": {"files": CLOUD_LOAD_MAX_SCAN, "records": CLOUD_LOAD_MAX_ENTRIES, "time": CLOUD_LOAD_SECONDS}[bound],
+                                                                  "entries": examined, "name": {"files": "CLOUD_LOAD_MAX_SCAN", "records": "CLOUD_LOAD_MAX_ENTRIES", "time": "CLOUD_LOAD_SECONDS"}[bound]})
+        _CLOUD_TRUNCATED[key] = True
+    else:
+        _CLOUD_TRUNCATED[key] = False
+    return counts
+
+
 HELD_LINKS_WAIT_SECONDS = 900   # #796: after a start the alert waits at most this long for every human-tier held PR's links, so an unreadable one cannot silence it for ever
 
 
@@ -27099,6 +27193,8 @@ def load_tick(engine, discovery):
         return []
     retired, last_reports = listed["retired"], _read_small(engine.state_dir, LAST_REPORT_FILE)
     orchestrators = {}
+    cloud_live = live_cloud_by_lane(engine.state_dir, discovery, retired, last_reports, engine.audit)
+    cloud_unplaced = sum(n for lane, n in cloud_live.items() if lane not in discovery.agents or (discovery.agents[lane].fleet or {}).get("role") != "orchestrator")   # live cloud workers no load row shows
     for name, seen in sorted(discovery.agents.items()):
         fleet = seen.fleet or {}
         if fleet.get("role") != "orchestrator":
@@ -27111,7 +27207,7 @@ def load_tick(engine, discovery):
         orchestrators[name] = {"charter": charter_or_first_seen(engine, name, fleet),   # a fallback: the charter is found by the yaml that names the agent; the registry's, never the launch metadata (#969)
                                "repo": _fleet_repo(fleet, engine.config) or (engine.intents.repo if engine.intents is not None else None),
                                "busy": sum(1 for c in coders if c.status == "working"), "idle": sum(1 for c in coders if c.status == "idle"),
-                               "workers": [o.name for o in coders if getattr(o, "name", None)],
+                               "workers": [o.name for o in coders if getattr(o, "name", None)], "cloud": cloud_live.get(name, 0),
                                "messages": sum(1 for r in reminders if r.get("to") == name and isinstance(r.get("at"), (int, float)) and r["at"] <= now)}
     cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None)
     pr_refs = {key.lower(): (held.get("facts") or {}).get("refs") or [] for key, held in list(getattr(engine, "notice_facts", {}).items())
@@ -27169,6 +27265,7 @@ def load_tick(engine, discovery):
     pending = []
     context = health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, read_parent=read_parent, cos=cos, wake=wake,
                                       time_up=budget.spent, pending=pending, reminders=reminders, pr_refs=pr_refs, links_gate=links_gate, notices_unread=getattr(engine, "notice_unread", 0), **meter)
+    context.cloud_unplaced = cloud_unplaced
     sent = health.tick(context)
     if getattr(context, "links_complete", False):
         engine.awaiting_held_links = False   # #796: one pass with every human-tier held PR's links whole: the alert may judge from now on
