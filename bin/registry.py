@@ -14,6 +14,7 @@ Python 3.9+, standard library only; loaded by path from beside bin/fleet-switchb
 
 import fcntl
 import json
+from urllib.parse import urlsplit, parse_qsl
 import os
 import time
 from pathlib import Path
@@ -28,8 +29,39 @@ MAX_BYTES = 4000000
 AUDIT_MAX_BYTES = 512000
 RETIRED_KEEP_SECONDS = 4 * 7 * 86400   # a retirement long past the status window is dropped (the bound the old retired.json had)
 STATES = ("working", "blocked", "idle", "detached", "dead")
-AGENT_FIELDS = ("session", "pane", "role", "charter", "repo", "workspace", "cwd")   # the seven fields the old readers use
-RECORD_FIELDS = ("pane", "role", "charter", "repo", "workspace", "cwd")             # what a retirement keeps of an agent row
+ORCHESTRATOR = "orchestrator"   # the role of an agent that owns a charter (a name, not a comparison: this module decides nothing about who may act)
+PROJECTIONS = ("discovery", "change", "record")   # the three fixed-list views of a row: discovery from the registry, the pane pass's change test, the retirement record
+REQUIRED_FIELDS = ("session", "pane", "role", "charter", "repo", "workspace", "cwd")   # the seven fields every row carries (None when unknown)
+OPTIONAL_FIELDS = ("endpoint",)   # additive fields: written only when given, never as null (no field is added to a row that has none)
+ROW_FIELDS = REQUIRED_FIELDS + OPTIONAL_FIELDS + ("state", "kind", "run_id", "since", "bell")   # THE tuple: every field a row can hold; each projection below derives from it
+# A field is in all three projections unless named here, with the reason. A field of ROW_FIELDS in no projection and not exempt fails the completeness test.
+EXEMPT = {
+    ("session", "record"): "kept as the retirement entry's own `session`",
+    ("state", "discovery"): "the pane pass takes the state from its own verdict",
+    ("state", "record"): "a retired agent has no live state",
+    ("kind", "discovery"): "the pane pass judges local rows only",
+    ("kind", "change"): "never changed by the pane pass",
+    ("kind", "record"): "kept by pane_record's non-local rule",
+    ("run_id", "discovery"): "the pane pass judges local rows only",
+    ("run_id", "change"): "never changed by the pane pass",
+    ("run_id", "record"): "kept by pane_record's non-local rule",
+    ("since", "discovery"): "set by the registry",
+    ("since", "change"): "set by the registry",
+    ("since", "record"): "set by the registry",
+    ("bell", "discovery"): "a person's opt-in, kept by upsert",
+    ("bell", "change"): "a person's opt-in, kept by upsert",
+    ("bell", "record"): "a person's opt-in, not a pane field",
+}
+
+
+def fields_of(projection):
+    """The fields of one projection, derived from ROW_FIELDS and EXEMPT (the only place a projection's list is made)."""
+    return tuple(f for f in ROW_FIELDS if (f, projection) not in EXEMPT)
+
+
+AGENT_FIELDS = fields_of("discovery")   # what discovery takes of a row
+CHANGE_FIELDS = fields_of("change")     # what the pane pass compares (state included)
+RECORD_FIELDS = fields_of("record")     # what a retirement keeps of an agent row
 LOCK_SECONDS = 5
 BELL_MIGRATED = "bell-migrated.json"   # written once the one-time migration of the live bell state into the `bell` field has run
 BELL_DEFAULT = False   # a record with no `bell` field: the heartbeat's opt-in is OFF until `set_bell` (or `fleet-heartbeat bell NAME on`) turns it on; the ONE place the default lives
@@ -118,8 +150,8 @@ def pane_record(row):
 
 def _agent(fields, state="idle", since=None):
     """A complete Agent: the seven fields, `state`, `kind`, `run_id`, `since`; a new optional field given is kept."""
-    out = {k: fields.get(k) for k in AGENT_FIELDS}
-    out.update({k: v for k, v in fields.items() if k not in out and k not in ("seen",)})
+    out = {k: fields.get(k) for k in REQUIRED_FIELDS}
+    out.update({k: v for k, v in fields.items() if k not in out and k not in ("seen",) and not (k in OPTIONAL_FIELDS and v is None)})
     out["state"] = out.get("state") if out.get("state") in STATES else state
     out["kind"] = out.get("kind") or "local"
     out["run_id"] = out.get("run_id")
@@ -351,6 +383,54 @@ def unretire(state_dir, name):
     return _mutate(state_dir, change)
 
 
+_SECRET_QUERY = ("token", "access_token", "auth", "key", "apikey", "api_key", "secret", "password", "passwd", "sig", "signature", "credential")
+
+
+def endpoint_problem(fields):
+    """Why a row may not be written for its endpoint, or None. An endpoint is an address only (PC-4): a URL with a userinfo part or a credential-shaped
+    query is refused; a row with an endpoint holds no pane (PC-7)."""
+    if not isinstance(fields, dict) or fields.get("endpoint") is None:
+        return None
+    value = fields["endpoint"]
+    if not isinstance(value, str) or not value.strip() or len(value) > 2000:
+        return "endpoint must be a non-empty address string: nothing written"
+    if fields.get("pane") is not None:
+        return "a row with an endpoint holds no pane: nothing written"
+    try:
+        parts = urlsplit(value if "//" in value else "//" + value)
+        userinfo = "@" in (parts.netloc or "")
+        query = parse_qsl(parts.query, keep_blank_values=True)
+    except ValueError:
+        return "endpoint is not an address: nothing written"
+    if userinfo or any(k.lower() in _SECRET_QUERY for k, _ in query):
+        return "endpoint holds a credential (an address only): nothing written"
+    return None
+
+
+NO_PANE_KINDS = ("cloud", "orchestrator")
+
+
+def no_pane_to_judge(row):
+    """THE predicate (#1181): this row has no pane to judge. A row of kind `cloud` or `orchestrator` (with or without an endpoint), or a row that holds an
+    endpoint and no pane. Every supervising reader of the dead verdict or the missing count asks it; none reads such a row as dead (PC-1)."""
+    if not isinstance(row, dict):
+        return False
+    if row.get("kind") in NO_PANE_KINDS:
+        return True
+    return row.get("endpoint") is not None and not row.get("pane")
+
+
+def route_for(row):
+    """Where a message to this agent WOULD go (a function only: send does not call it yet): its pane when it has one (as before), else its registry endpoint; None when neither."""
+    if not isinstance(row, dict):
+        return None
+    if row.get("pane") is not None:
+        return {"via": "pane", "to": row["pane"]}
+    if row.get("endpoint") is not None:
+        return {"via": "endpoint", "to": row["endpoint"]}
+    return None
+
+
 def upsert(state_dir, name, agent, now=None):
     """Add or update an agent. NO CHURN: nothing changed writes nothing (`changed: false`). An agent retired for this very session is refused."""
     def change(doc):
@@ -358,6 +438,9 @@ def upsert(state_dir, name, agent, now=None):
         if covers(doc["retired"].get(name), (agent or {}).get("session")):
             return False, [], "%s is retired for this session" % name
         fields = dict(agent or {})
+        refused = endpoint_problem(fields)
+        if refused:
+            return False, [], refused
         if "bell" not in fields:
             if isinstance((old or {}).get("bell"), bool):
                 fields["bell"] = old["bell"]   # a pass that records state never forgets the opt-in a person set
@@ -369,6 +452,59 @@ def upsert(state_dir, name, agent, now=None):
         doc["agents"][name] = new
         return True, [{"event": "update" if old else "add", "name": name}] if not old else [], None   # an audit line on add only: a change of state is no event
     return _mutate(state_dir, change, now)
+
+
+def is_charter(value):
+    """True for an issue number a charter can be (a positive int, never a bool)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def orchestrator_charters(agents):
+    """{name: charter number} of the orchestrators of a registry's `agents` that record a charter (rows with none are left out). The ONE reading of "whose charter is this" (#969)."""
+    return {name: row["charter"] for name, row in (agents or {}).items()
+            if isinstance(row, dict) and row.get("role") == ORCHESTRATOR and is_charter(row.get("charter"))}
+
+
+def duplicate_charters(agents, repos=None):
+    """{(repo, charter): [names]} of a charter number recorded by two or more orchestrators of the same repo (sorted names). `repos` maps an agent name to its repo when the row has none."""
+    found = {}
+    for name, number in orchestrator_charters(agents).items():
+        row = agents[name]
+        repo = row.get("repo") or (repos or {}).get(name)
+        found.setdefault((repo, number), []).append(name)
+    return {key: sorted(names) for key, names in found.items() if len(names) > 1}
+
+
+def set_charter(state_dir, name, charter, by, now=None, check=None):
+    """Write an orchestrator's registry charter (an issue number, or None to clear it): the ONLY command-side writer of the field. One audit event with the old and the new value and who ran it.
+    Refused (nothing written, a problem line) for an agent not in the registry, one retired, or one that is not an orchestrator, and for a value that is not an issue number or None."""
+    refused = []
+    def reject(why, text):
+        refused.append((why, text))
+        return False, [], text
+    def change(doc):
+        row = doc["agents"].get(name)
+        if not isinstance(row, dict):
+            return reject("absent", "%s is not a registered agent" % name)
+        if name in doc["retired"]:
+            return reject("retired", "%s is retired" % name)
+        if row.get("role") != ORCHESTRATOR:
+            return reject("not an orchestrator", "%s is not an orchestrator" % name)
+        if charter is not None and not is_charter(charter):
+            return reject("value", "a charter is an issue number or none")
+        if check is not None:
+            verdict = check(doc, row)   # #1143: the caller's guard, judged on THIS locked read, so check and write are one step
+            if verdict:
+                return reject(*verdict)
+        old = row.get("charter")
+        if old == charter:
+            return False, [], None
+        row["charter"] = charter
+        return True, [{"event": "charter", "name": name, "old": old, "new": charter, "by": by}], None
+    got = _mutate(state_dir, change, now)
+    if refused:
+        got = dict(got, why=refused[0][0])
+    return got
 
 
 def bell_of(agent):
@@ -428,6 +564,12 @@ def reconcile_remove(state_dir, name, evidence, whole):
         row = doc["agents"].get(name)
         if row is None:
             return False, [], None
+        if row.get("pane") is None and row.get("endpoint") is not None:   # a no-pane row: removed only on a bounded check's evidence of death (the same function, one verdict)
+            if not isinstance(evidence, dict) or evidence.get("endpoint_verdict") != "dead":
+                why = "%s has no pane and no evidence of death for its endpoint: nothing removed" % name
+                return False, [{"event": "reconcile_refused", "name": name, "evidence": evidence if isinstance(evidence, dict) else None, "why": why}], why
+            doc["agents"].pop(name)
+            return True, [{"event": "reconcile_remove", "name": name, "evidence": evidence, "session": row.get("session")}], None
         if row.get("state") != "dead" or not isinstance(evidence, dict) or evidence.get("pane_listed") is not False \
                 or evidence.get("process_found") is not False:
             why = "%s is not shown dead by the evidence: nothing removed" % name

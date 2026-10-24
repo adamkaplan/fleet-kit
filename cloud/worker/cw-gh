@@ -11,7 +11,7 @@ Verbs (the one table, VERBS below; docs and tests are derived from it):
   pr create|view|list|comment|checks|diff|ready, repo view, issue view|list (read only), run view|list|logs (read only),
   api (GET only).
 Everything else exits 2 with one line. The token is read from GH_TOKEN (set by the wrapper for this one call) and is never
-printed. Output differs from the real gh: `--json` prints the raw REST object, `--jq` and `--template` are not supported.
+printed. Output differs from the real gh: `--json` prints the raw REST object, `--template` is not supported; `issue view --comments` prints the comments (at most 50 and 20000 bytes), and `api --jq`/`-q` is a small client-side path filter.
 Exit 0 ok, 1 failed (an HTTP error names its status), 2 not available or bad usage, 8 `pr checks` with checks pending.
 """
 import http.client
@@ -31,6 +31,9 @@ MAX_BYTES = 20 * 1024 * 1024
 MAX_LOG = 5 * 1024 * 1024  # of log text printed
 TIMEOUT = 60
 MAX_ENTRIES = 2000
+MAX_COMMENTS = 50       # `issue view --comments`: at most this many comments ...
+MAX_COMMENT_BYTES = 20000   # ... and at most this many bytes of comment text
+CUT_NOTE = "[cut: more comments not shown]"
 # Text from outside (titles, bodies, logs) never reaches the agent's terminal with control, escape or bidi characters in it.
 UNSAFE = re.compile("[\\x00-\\x08\\x0b-\\x1f\\x7f-\\x9f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069]")
 
@@ -344,15 +347,61 @@ def repo_view(args):
 
 
 def issue_view(args):
-    opts, pos = parse(args, COMMON)
+    opts, pos = parse(args, dict(COMMON, **{"--comments": ("comments", False), "-c": ("comments", False)}))
     repo = repo_of(opts)
     if len(pos) != 1 or not pos[0].lstrip("#").isdigit():
         raise Fail("issue view needs an issue number", 2)
-    i = get_json("/repos/%s/issues/%d" % (repo, int(pos[0].lstrip("#"))))
+    n = int(pos[0].lstrip("#"))
+    i = get_json("/repos/%s/issues/%d" % (repo, n))
     if "json" in opts:
         return show(i, opts)
     print("title:\t%s\nstate:\t%s\nurl:\t%s\nlabels:\t%s\n--\n%s" % (
         i.get("title"), i.get("state"), i.get("html_url"), ", ".join(x.get("name", "") for x in i.get("labels", [])), i.get("body") or ""))
+    if "comments" in opts:
+        print_comments(get_json("/repos/%s/issues/%d/comments?per_page=%d" % (repo, n, MAX_COMMENTS + 1)))
+
+
+def print_comments(rows):
+    """Read only, bounded: at most MAX_COMMENTS comments and MAX_COMMENT_BYTES bytes of text, then CUT_NOTE as the last line."""
+    if not isinstance(rows, list) or not rows:
+        print("--\nno comments")
+        return
+    print("--\ncomments:")
+    used, shown, cut = 0, 0, len(rows) > MAX_COMMENTS
+    for c in rows[:MAX_COMMENTS]:
+        block = "--- comment by %s at %s\n%s" % ((c.get("user") or {}).get("login"), c.get("created_at"), c.get("body") or "")
+        size = len(block.encode("utf-8", "replace"))
+        if used + size > MAX_COMMENT_BYTES:
+            cut = True
+            break
+        used += size
+        shown += 1
+        print(block)
+    if cut:
+        print(CUT_NOTE)
+
+
+def jq_check(expr):
+    if not re.fullmatch(r"\.(?:(?:\.?[A-Za-z_][A-Za-z0-9_]*)|\[\d*\])*", expr):
+        raise Fail("--jq supports only paths such as .[0].body or .[].user.login", 2)
+
+
+def jq_apply(expr, data):
+    """A small client-side subset of jq: `.`, `.key`, `[N]`, `[]`, chained (`.[0].body`, `.[].user.login`). Anything else is refused."""
+    jq_check(expr)
+    vals = [data]
+    for m in re.finditer(r"\.?([A-Za-z_][A-Za-z0-9_]*)|\[(\d*)\]", expr):
+        out = []
+        for v in vals:
+            if m.group(1):
+                out.append(v.get(m.group(1)) if isinstance(v, dict) else None)
+            elif m.group(2) == "":
+                out.extend(v if isinstance(v, list) else [])
+            else:
+                k = int(m.group(2))
+                out.append(v[k] if isinstance(v, list) and k < len(v) else None)
+        vals = out
+    return vals
 
 
 def issue_list(args):
@@ -460,9 +509,34 @@ def run_logs(args):
     sys.stdout.write(run_logs_text(repo_of(opts), run_id(pos)) + "\n")
 
 
+# The api paths the pod reads (guard-table.tsv: issue-comments-read, pull-reviews-read, pull-comments-read, issues-other-path).
+# An issues path is allowed only as repos/OWNER/NAME/issues/N/comments; every other issues path is refused.
+API_ISSUE = re.compile(r"repos/[^/]+/[^/]+/issues(/.*)?", re.I)
+API_ISSUE_COMMENTS = re.compile(r"repos/[^/]+/[^/]+/issues/\d+/comments", re.I)
+
+
+def api_path_clean(path):
+    """Fail closed: only repos/<segment>/... with no empty, `.` or `..` segment, no percent-encoding and no backslash."""
+    p = path.split("?")[0]
+    if not p.startswith("/") or "%" in p or "\\" in p:
+        return False
+    segs = (p[1:-1] if p.endswith("/") else p[1:]).split("/")
+    return segs[0] == "repos" and len(segs) >= 3 and all(s not in ("", ".", "..") for s in segs)
+
+
+def api_path_allowed(path):
+    if not api_path_clean(path):   # normalisation check BEFORE the allow check
+        return False
+    p = path.split("?")[0].strip("/")
+    if API_ISSUE.fullmatch(p):
+        return bool(API_ISSUE_COMMENTS.fullmatch(p))
+    return True
+
+
 def api_get(args):
     """Read-only: one endpoint path, GET. No body field, no input, no other method, no GraphQL, no host."""
-    opts, pos = parse(args, {"-X": ("method", True), "--method": ("method", True), "-R": ("repo", True)})
+    opts, pos = parse(args, {"-X": ("method", True), "--method": ("method", True), "-R": ("repo", True),
+                                "--jq": ("jq", True), "-q": ("jq", True)})
     if len(pos) != 1:
         raise Fail("api takes exactly one endpoint", 2)
     if str(opts.get("method", "GET")).upper() != "GET":
@@ -473,7 +547,16 @@ def api_get(args):
     path = "/" + p.lstrip("/")
     if path.split("?")[0].rstrip("/").lower().endswith("graphql"):
         raise Fail("GraphQL is not available in this pod", 2)
-    sys.stdout.write(request("GET", path).decode("utf-8", "replace"))
+    if not api_path_allowed(path):
+        raise Fail("this api path is not in the pod's table (cloud/worker/guard-table.tsv)", 2)
+    if "jq" in opts:
+        jq_check(opts["jq"])   # an unsupported expression is refused BEFORE the request
+    raw = request("GET", path).decode("utf-8", "replace")
+    if "jq" in opts:   # a client-side filter of the GET answer: no further request
+        for v in jq_apply(opts["jq"], parse_json(raw)):
+            print(v if isinstance(v, str) else json.dumps(v))
+        return
+    sys.stdout.write(raw)
     if not sys.stdout.isatty():
         sys.stdout.write("\n")
 
