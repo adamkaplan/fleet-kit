@@ -86938,6 +86938,7 @@ class TestBlockedReport(Base):
         self.assertIn("reported", old)
         fresh = self.world.v2.create_session({"fleet": {"name": "coder", "role": "coder", "reports_to": "platform"}})
         self.pane["session"] = fresh
+        self.pane["program"] = "%s -s %s" % (FAKE_OPENCODE, fresh)   # the pane's process runs the new session too
         self.world.engine.send("cos", "coder", "again")
         self.passes()
         new = sb._read_small(self.world.state, sb.BLOCKED_ALERT_STATE)["coder"]
