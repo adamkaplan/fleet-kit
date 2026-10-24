@@ -20772,8 +20772,11 @@ def plan_source_for(explicit, entries, pr, body, default_repo=None):
     return source or explicit
 
 
-def checked_plan(engine_config, source, ask, runner, now):
-    """The plan at `source`, checked: {"result", "defects", "scenarios_parsed", "plan_hash", "source"}."""
+def checked_plan(engine_config, source, ask, runner, now, text=None, done_when=None):
+    """The plan at `source`, checked: {"result", "defects", "scenarios_parsed", "plan_hash", "source"}. With `text` (a plan already read) nothing is read again."""
+    if text is not None:
+        parsed = plan_check.parse_scenarios(plan_check.scenario_block(text))
+        return dict(plan_check.check(text, done_when, None), scenarios_parsed=parsed, source="plan comment of %s" % source, text=text)
     ns = types.SimpleNamespace(source=source, file=None, ask=ask, done_when=None)
     text, label, result = load_plan(ns, runner, now)
     parsed = plan_check.parse_scenarios(plan_check.scenario_block(text))
@@ -20788,6 +20791,74 @@ def _ledger_pr(args):
     return repo, number, "%s#%d" % (repo, number)
 
 
+def ask_refusal(issue, ref):
+    """#1130: why an issue is no ASK that may take a verdict (None when it is one). An ask is OPEN, carries `## Intent` and `Done when:`, is no charter (the
+    `<user>:orchestrator` label, as `item_chain` readers and the charter scan recognise one) and is a sub-issue of a charter (it has a parent)."""
+    if str(issue.get("state") or "").lower() == "closed":
+        return "%s is an issue, not a pull request, and it is closed: a closed issue takes no record" % ref
+    intent, done_when = parse_intent(issue.get("body"))
+    if not intent or not done_when:
+        return "%s is an issue, not a pull request, and has no `## Intent` with a `Done when:` line: it is not an ask" % ref
+    if any(str(l).endswith(":orchestrator") for l in issue.get("labels") or ()):
+        return "%s is an issue, not a pull request, and a charter (it carries the orchestrator label), not an ask" % ref
+    if not issue.get("parent"):
+        return "%s is an issue, not a pull request, and has no parent issue: a charter, not an ask (an ask is a sub-issue of a charter)" % ref
+    return None
+
+
+def ask_plan_comment(engine, repo, number):
+    """The newest plan comment (a heading `Plan (scenarios)`) of the issue `repo#number`, or None. GETs only; a page that cannot be read is no plan."""
+    comments = []
+    try:
+        for page in range(1, PLAN_COMMENT_PAGES + 1):
+            got = engine.intents._api("repos/%s/issues/%d/comments?per_page=100&page=%d" % (repo, number, page), repo)
+            if not isinstance(got, list):
+                break
+            comments.extend(got)
+            if len(got) < 100:
+                break
+    except (IntentError, AttributeError):
+        return None
+    text, source = plan_check.select_plan_text("", comments)
+    return text if source != "issue body" else None
+
+
+def ask_subject(engine, repo, number, entries, unreadable, explicit, runner, now, writable):
+    """#1130: `verdict`, `prove` and `gates` on an ASK ISSUE (an issue that is no pull request and no work item). None when the number is not such an
+    issue (the pull request rules then apply exactly as before). Else {"facts", "plan", "plan_problem"}: the plan is the plan comment on the issue, and the
+    "head" of the subject is the plan hash (`plan_ledger.ask_head`), so a record names the issue and the hash, and a revised plan voids it as a moved head does.
+    An issue with no plan comment is refused (LedgerCommandError) with its reason: a record would bind to nothing."""
+    ref = "%s#%d" % (repo, number)
+    try:
+        issue = item_issue(engine, repo, number)
+    except LedgerCommandError:
+        return None
+    if explicit:
+        try:
+            named = parse_plan_source(explicit, repo)[:2]
+        except PlanInputError:
+            named = None
+        if named != (repo, number):
+            raise LedgerCommandError("--plan %s is not the plan of %s: an ask issue is bound to the plan comment on the issue itself" % (explicit, ref))
+    why = ask_refusal(issue, ref)
+    if why:
+        raise LedgerCommandError("refused: %s, nothing was recorded" % why)
+    comment = ask_plan_comment(engine, repo, number)   # read ONCE: the same read serves the check here and the hash below
+    if comment is None:
+        if not writable:
+            return {"facts": {"author": issue["author"], "ask_issue": True}, "plan": None,
+                    "plan_problem": "%s is an issue with no plan comment: there is nothing to bind a record to" % ref}
+        raise LedgerCommandError("refused: %s is an issue, not a pull request, and it has no plan comment: a record would bind to nothing, nothing was recorded" % ref)
+    plan, problem = None, None
+    try:
+        plan = checked_plan({}, ref, None, runner, now, text=comment, done_when=parse_intent(issue["body"])[1])
+    except (PlanInputError, ValueError, ConfigError, IntentError) as err:
+        problem = _one_line(str(err), 200)
+    facts = {"author": issue["author"], "ask_issue": True, "notice_senders": [], "body": issue["body"], "state": issue["state"],
+             "head": plan_ledger.ask_head(plan["plan_hash"]) if plan else None}
+    return {"facts": facts, "plan": plan, "plan_problem": problem}
+
+
 def _ledger_context(args, runner, now, writable, parts=None, floor=False):
     """Everything `prove`, `verdict` and `gates` share: the engine, state, PR ref, its picture and its checked plan. `parts` is
     (engine, state, config) when the caller already has them (the daemon's pass); else the engine is built."""
@@ -20796,10 +20867,14 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False):
     entries, problem = plan_ledger.read_ledger(state)
     facts, body, senders, unreadable = pr_picture(engine, repo, number, state)
     if writable:   # #770: an item's entries are written only by the item commands
-        why = item_entry_refusal(engine, repo, number, entries, unreadable)
+        why = item_entry_refusal(engine, repo, number, entries, unreadable, True)
         if why:
             _gates_audit(engine, "plan.item.refused", pr, {"item": pr, "why": why, "stage": "pull request command"})
             raise LedgerCommandError("refused: %s" % why)
+    ask = ask_subject(engine, repo, number, entries, unreadable, args.plan, runner, now, writable) if unreadable else None   # #1130: the ONE place a subject that is an issue is resolved
+    if ask is not None:
+        return types.SimpleNamespace(engine=engine, state=state, config=config, repo=repo, number=number, pr=pr, entries=entries, problem=problem,
+                                     facts=ask["facts"], unreadable=None, source=pr, plan=ask["plan"], plan_problem=ask["plan_problem"], ask_issue=True)
     facts = dict(facts or {}, body=body, notice_senders=senders, held_check=lambda: held_defects(body))
     if floor and facts.get("head"):
         facts["floor"] = gate_floor_fact(engine, state, repo, number, facts["head"])
@@ -20887,6 +20962,8 @@ def _scenario_of(ctx, sid):
 
 def _head_of(ctx, args):
     known = (ctx.facts or {}).get("head")
+    if getattr(ctx, "ask_issue", False) and not known:
+        raise LedgerCommandError("the plan hash of %s is unknown: nothing was recorded" % ctx.pr)
     head = args.head or known
     if known and args.head and not (known.startswith(args.head) or args.head.startswith(known)):
         raise LedgerCommandError("--head %s is not the PR's head (%s): nothing was recorded" % (args.head[:12], known[:12]))
@@ -21007,7 +21084,7 @@ def cmd_verdict(args, runner, now):
             got[1], "an agent" if got[0] == "agent" else "not known")
     else:
         caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
-        if not plan_ledger.known_writers(ctx.entries, ctx.pr, senders):
+        if not plan_ledger.known_writers(ctx.entries, ctx.pr, list(senders) + [ctx.facts.get("author")] * bool(getattr(ctx, "ask_issue", False))):
             raise LedgerCommandError("refused: no writer of %s is known to the switchboard (nobody has recorded a proof or sent its "
                                      "`notice pr`): its author must do that first, so the author can be excluded" % ctx.pr)
         allowed, launch, sessions, fleets = ctx.config.get("plan_evaluators"), {}, {}, {}
@@ -21016,6 +21093,8 @@ def cmd_verdict(args, runner, now):
             launch, sessions, fleets = launched_testers_for(ctx)
             allowed = load_launch_testers().evaluators(allowed, launch)
         ok, why = plan_ledger.may_record_verdict(named, caller, allowed, authors)
+        if getattr(ctx, "ask_issue", False) and caller and caller == ctx.facts.get("author"):   # #1130: the author of the ask may not judge it, as a PR's author may not
+            ok, why = False, "%s is the author of the ask %s: the author of an ask cannot record a verdict on it (`prove` is the author's step)" % (caller, ctx.pr)
         if ok and named == "tester" and caller in launch:
             why = load_launch_testers().lane_refusal(caller, launch, authors, sessions, fleets)
             ok = why is None
@@ -21204,6 +21283,9 @@ def cmd_gates(args, runner, now):
         return cmd_gates_preflight(args, runner, now)
     if args.pr == "stats":
         return cmd_gates_stats(args, runner, now)
+    if args.pr == "ask-close":   # #1130: the closing rule of a report-only ask
+        args.pr = args.rest[0] if args.rest else ""
+        return cmd_gates_ask_close(args, runner, now)
     ctx = _ledger_context(args, runner, now, False, floor=True)
     plan = ctx.plan
     report = plan_ledger.evaluate_gates(plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr,
@@ -21248,6 +21330,29 @@ def cmd_gates(args, runner, now):
     return EXIT_OK if ok else EXIT_ERROR
 
 
+def cmd_gates_ask_close(args, runner, now):
+    """`gates ask-close <owner/repo#N>`: the closing rule of a report-only ask (#1130): the ask may close when EVERY scenario of its plan comment is proven and
+    judged at the current plan hash. Exit 0 names the scenarios recorded; exit 1 refuses and names each unjudged scenario. Reads only: it closes nothing."""
+    ctx = _ledger_context(args, runner, now, False)
+    if not getattr(ctx, "ask_issue", False):
+        raise LedgerCommandError("%s is not an ask issue: the closing rule of a report-only ask applies to an issue with a plan comment" % ctx.pr)
+    if ctx.plan is None or ctx.plan["result"] != "pass":
+        raise LedgerCommandError("cannot close %s: %s" % (ctx.pr, ctx.plan_problem or "its plan fails `plan check`"))
+    head = ctx.facts.get("head")
+    authors = plan_ledger.authors_of(ctx.entries, ctx.pr, (), ctx.facts.get("author"))
+    rows = [plan_ledger.scenario_state(x, ctx.entries, ctx.pr, ctx.plan["plan_hash"], head, authors) for x in ctx.plan["scenarios_parsed"]]
+    open_rows = [r for r in rows if r["status"] != "ok"]
+    if open_rows:
+        for r in open_rows:
+            print("not judged: %s: %s" % (r["id"], "; ".join(r["missing"] + r["void"])), file=sys.stderr)
+        print("refused: %s stays open: %d of %d scenarios are not proven and judged at plan %s" % (ctx.pr, len(open_rows), len(rows), ctx.plan["plan_hash"][:19]),
+              file=sys.stderr)
+        return EXIT_ERROR
+    print("%s may close: %d of %d scenarios proven and judged at plan %s: %s" % (ctx.pr, len(rows), len(rows), ctx.plan["plan_hash"][:19],
+                                                                          ", ".join(r["id"] for r in rows)))
+    return EXIT_OK
+
+
 cmd_gates.ledger = True   # state and GETs only; its own errors are usage errors
 
 
@@ -21277,8 +21382,9 @@ def item_issue(engine, repo, number):
     if data.get("pull_request"):
         raise LedgerCommandError("%s#%d is a pull request: use --pr (the pull request rules apply to it, not the work item rules)" % (repo, number))
     user = data.get("user") if isinstance(data.get("user"), dict) else {}
+    labels = [l.get("name") if isinstance(l, dict) else l for l in (data.get("labels") if isinstance(data.get("labels"), list) else [])]
     return {"author": user.get("login") if isinstance(user.get("login"), str) else None, "body": data.get("body") if isinstance(data.get("body"), str) else "",
-            "state": data.get("state"), "parent": parent_of(data)}
+            "state": data.get("state"), "parent": parent_of(data), "labels": [l for l in labels if isinstance(l, str)]}
 
 
 def item_chain(engine, repo, number, parent, limit=4):
@@ -21346,14 +21452,14 @@ def item_agents(ctx):
     return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions, fleets
 
 
-def item_entry_refusal(engine, repo, number, entries, unreadable):
+def item_entry_refusal(engine, repo, number, entries, unreadable, allow_ask=False):
     """Why the ORDINARY pull request commands (prove, verdict, gates ci-record, waive) must not write for `repo#number`, or None. They refuse a number that is an ISSUE (the pull request
     could not be read and GitHub says it is an issue) and a number that has an item registration: an item's entries are written only by item-prove, item-verdict and item-ci-record.
     A real pull request is never affected (it is read, and has no registration)."""
     ref = "%s#%d" % (repo, number)
     if load_module("item_verdicts").registrations(entries, ref):
         return "%s is a work item (a tester is registered for it): its proofs and verdicts are written only by item-prove, item-verdict and gates item-ci-record" % ref
-    if unreadable:
+    if unreadable and not allow_ask:
         try:
             item_issue(engine, repo, number)
         except LedgerCommandError:

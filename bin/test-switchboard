@@ -83987,7 +83987,7 @@ class TestItemVerdicts(unittest.TestCase):
     def test_mutant_without_the_refusal_the_pull_request_command_writes_the_item_verdict_around_every_defence(self):
         self.issue_page()
         sb.plan_ledger.append_entry(self.state, {"kind": "proof", "pr": self.ITEM, "scenario": "S9", "plan_hash": "sha256:p", "head": self.PIN, "result": "pass", "by": "c1"}, self.now())
-        with mock.patch.object(sb, "item_entry_refusal", lambda *a: None):
+        with mock.patch.object(sb, "item_entry_refusal", lambda *a: None), mock.patch.object(sb, "ask_subject", lambda *a: None):
             code, why = self.pr_path("cmd_verdict")              # t2 is registered for nothing, and there is no registration for the item
         self.assertEqual(code, sb.EXIT_OK, why)
         forged = [e for e in self.entries() if e.get("kind") == "verdict"]
@@ -88626,6 +88626,265 @@ class TestAssembler(unittest.TestCase):
         done = subprocess.run([sys.executable, "-B", str(link), "status", "--help"], capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("usage: fleet-switchboard status", done.stdout)
+
+
+class TestAskIssueSubject(unittest.TestCase):
+    """#1130: `prove`, `verdict` and `gates` accept an ASK ISSUE as the subject, bound to the hash of the plan comment on it. Fakes only."""
+
+    REPO, ASK, PR = "acme-org/widget-service", "acme-org/widget-service#1130", "acme-org/widget-service#9"
+    HEAD = "d" * 40
+    SCEN = [{"id": "S1", "evaluator": "reviewer", "proof": "test", "claim": "pr"}, {"id": "S2", "evaluator": "reviewer", "proof": "test", "claim": "pr"},
+            {"id": "S3", "evaluator": "reviewer", "proof": "test", "claim": "pr"}]
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.state = Path(self.dir)
+        self.hash = "sha256:" + "1" * 64
+        self.has_plan = True
+        self.pr_readable = False
+        self.caller = "coder1"
+        self.pages = {"repos/%s/issues/1130/comments?per_page=100&page=1" % self.REPO: [{"id": 5, "created_at": "2026-01-01", "body": "## Plan (scenarios): x\n"}]}
+        self.issue = {"user": {"login": "human"}, "body": "## Intent\nreport it\nDone when: reported\n", "state": "open", "parent_issue_url": "https://api.github.com/repos/acme-org/widget-service/issues/1000",
+                      "labels": []}
+        self.reviewers = ["rev1"]
+
+    def api(self, path, repo=None):
+        if path == "repos/%s/issues/1130" % self.REPO:
+            return self.issue
+        if path.startswith("repos/other-org/gadget/issues/7"):
+            return dict(self.issue) if "/comments" not in path else []
+        if path == "repos/%s/issues/9" % self.REPO:
+            return {"pull_request": {"url": "x"}, "user": {"login": "a"}}
+        if "/comments" in path and not self.has_plan:
+            return []
+        if path in self.pages:
+            return self.pages[path]
+        raise sb.IntentError("not_found", path)
+
+    def plan(self):
+        return {"result": "pass", "defects": [], "scenarios_parsed": self.SCEN, "plan_hash": getattr(self, "stale_hash", None) or self.hash, "text": "", "source": "comment 5"}
+
+    def now(self):
+        return 1_000_000
+
+    def entries(self):
+        return sb.plan_ledger.read_ledger(self.state)[0]
+
+    def run_cmd(self, command, subject=None, **kw):
+        """(exit or None, refusal text or None, stdout, stderr)."""
+        args = types.SimpleNamespace(pr=subject or self.ASK, plan=None, ask=None, head=None, scenario=["S1"], all_scenarios=False, evaluator="reviewer",
+                                     result="pass", evidence="ran it", command=None, json=False, rest=[], all_gates=False)
+        for k, v in kw.items():
+            setattr(args, k, v)
+        engine = types.SimpleNamespace(intents=types.SimpleNamespace(_api=self.api), audit=None, actor="t", herdr=None, v2=None,
+                                       discover=lambda now: types.SimpleNamespace(agents={}), now=lambda: 1.0)
+        config = {"intent_repo": self.REPO, "plan_evaluators": {"reviewer": self.reviewers}}
+        picture = ({"head": self.HEAD, "ci": "green"}, "PLAN: %s" % self.ASK, [], None) if self.pr_readable and subject == self.PR else (None, "", [], "no pull request found")
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sb, "build_engine", lambda *a, **k: (engine, self.state, config)), mock.patch.object(sb, "pr_picture", lambda *a: picture), \
+                mock.patch.object(sb, "identify_caller", lambda *a: self.caller), mock.patch.object(sb, "checked_plan", lambda *a, **k: self.plan()), \
+                mock.patch.object(sb, "launched_testers_for", lambda c: ({}, {}, {})), mock.patch.object(sb, "read_open_overlap", lambda *a: None), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = getattr(sb, command)(args, None, self.now)
+            except sb.LedgerCommandError as exc:
+                return None, str(exc), out.getvalue(), err.getvalue()
+        return code, None, out.getvalue(), err.getvalue()
+
+    def prove(self, sid, **kw):
+        self.caller = "coder1"
+        return self.run_cmd("cmd_prove", scenario=[sid], **kw)
+
+    def judge(self, sid, **kw):
+        self.caller = "rev1"
+        return self.run_cmd("cmd_verdict", scenario=sid, **kw)
+
+    def record_all(self, ids=("S1", "S2", "S3")):
+        for sid in ids:
+            self.assertEqual(self.prove(sid)[0], sb.EXIT_OK)
+            self.assertEqual(self.judge(sid)[0], sb.EXIT_OK, self.judge(sid))
+
+    def test_s2_a_proof_and_a_verdict_on_an_issue_name_the_issue_and_the_plan_hash(self):
+        self.assertEqual(self.prove("S1")[0], sb.EXIT_OK)
+        self.assertEqual(self.judge("S1")[0], sb.EXIT_OK)
+        rows = self.entries()
+        self.assertEqual([(e["kind"], e["pr"], e["plan_hash"], e["head"]) for e in rows],
+                         [("proof", self.ASK, self.hash, "1" * 40), ("verdict", self.ASK, self.hash, "1" * 40)])
+
+    def test_s3_an_issue_with_no_plan_comment_is_refused_by_name_and_a_revised_plan_voids_the_record(self):
+        self.has_plan = False
+        for command in ("prove", "judge"):
+            code, why, _, _ = getattr(self, command)("S1")
+            self.assertIsNone(code)
+            self.assertIn("has no plan comment", why)
+        self.assertEqual(self.entries(), [])
+        self.has_plan = True
+        self.record_all(("S1",))
+        self.hash = "sha256:" + "2" * 64
+        out = self.run_cmd("cmd_gates")[2]
+        self.assertIn("proof #1 void: plan changed", out)
+
+    def test_s4_gates_on_the_issue_shows_the_scenarios_proven_and_judged(self):
+        self.record_all()
+        out = self.run_cmd("cmd_gates", json=True)[2]
+        g1 = next(g for g in json.loads(out)["gates"] if g["gate"] == "G1")
+        self.assertEqual(g1["status"], "ok")
+        self.assertIn("3 of 3 claimed scenarios proven and judged", g1["detail"])
+
+    def test_s5_the_closing_command_names_what_was_recorded_or_refuses_naming_the_unjudged_scenario(self):
+        self.record_all(("S1", "S2"))
+        self.assertEqual(self.prove("S3")[0], sb.EXIT_OK)
+        code, why, out, err = self.run_cmd("cmd_gates_ask_close")
+        self.assertEqual(code, sb.EXIT_ERROR)
+        self.assertIn("not judged: S3", err)
+        self.assertEqual(out, "")
+        self.assertEqual(self.judge("S3")[0], sb.EXIT_OK)
+        code, why, out, err = self.run_cmd("cmd_gates_ask_close")
+        self.assertEqual(code, sb.EXIT_OK)
+        self.assertIn("S1, S2, S3", out)
+
+    def test_s6_mutant_that_records_on_a_pull_request_subject_only_fails(self):
+        with mock.patch.object(sb, "ask_subject", lambda *a, **k: None):
+            self.assertIsNone(self.prove("S1")[0])
+        self.assertEqual(self.entries(), [])
+        self.assertEqual(self.prove("S1")[0], sb.EXIT_OK)    # the real build records
+
+    def test_s6_mutant_that_ignores_the_hash_keeps_a_record_valid_after_a_revised_plan(self):
+        self.record_all(("S1",))
+        self.hash = "sha256:" + "2" * 64        # the plan was revised; the mutant keeps binding to the hash it first read
+        self.stale_hash = "sha256:" + "1" * 64
+        out = self.run_cmd("cmd_gates")[2]
+        self.assertNotIn("void", out)       # the mutant leaves the old proof valid: the void test above fails on it
+
+    def test_s6_mutant_that_accepts_an_issue_with_no_plan_records_one(self):
+        self.has_plan = False
+        with mock.patch.object(sb, "ask_plan_comment", lambda *a: "x"):
+            self.assertEqual(self.prove("S1")[0], sb.EXIT_OK)
+        self.assertEqual(len(self.entries()), 1)    # the refusal test above fails on it
+
+    def refused_everywhere(self, needle):
+        for command in ("prove", "judge"):
+            code, why, _, _ = getattr(self, command)("S1")
+            self.assertIsNone(code)
+            self.assertIn(needle, why)
+        code, why, _, _ = self.run_cmd("cmd_gates_ask_close")
+        self.assertIsNone(code)
+        self.assertIn(needle, why)
+        self.assertEqual(self.entries(), [])
+
+    def test_m1_a_closed_issue_is_refused(self):
+        self.issue["state"] = "closed"
+        self.refused_everywhere("is closed")
+
+    def test_m1_an_issue_with_no_done_when_is_refused(self):
+        self.issue["body"] = "## Intent\nreport it\n"
+        self.refused_everywhere("no `## Intent`")
+        self.issue["body"] = "just text"
+        self.refused_everywhere("no `## Intent`")
+
+    def test_m1_a_charter_is_refused_by_label_and_by_having_no_parent(self):
+        self.issue["labels"] = [{"name": "someone:orchestrator"}]
+        self.refused_everywhere("a charter (it carries")
+        self.issue["labels"] = []
+        del self.issue["parent_issue_url"]
+        self.refused_everywhere("no parent issue")
+
+    def test_m1_mutants_that_accept_each_case_record_one(self):
+        for change, key in (({"state": "closed"}, "state"), ({"body": "## Intent\nx\n"}, "body"), ({"labels": [{"name": "u:orchestrator"}]}, "labels")):
+            self.issue.update(change)
+            with mock.patch.object(sb, "ask_refusal", lambda *a: None):
+                self.assertEqual(self.prove("S1")[0], sb.EXIT_OK, key)
+            self.assertEqual(len(self.entries()), 1)    # the refusal tests above fail on it
+            self.setUp()
+
+    def test_m2_the_author_of_the_ask_may_not_record_the_verdict_but_may_prove(self):
+        self.reviewers = ["rev1", "human"]
+        self.caller = "human"
+        self.assertEqual(self.run_cmd("cmd_prove", scenario=["S1"])[0], sb.EXIT_OK)       # the author's step
+        self.caller = "human"
+        code, why, _, _ = self.run_cmd("cmd_verdict", scenario="S1")
+        self.assertIsNone(code)
+        self.assertIn("author of the ask", why)
+        self.assertEqual([e["kind"] for e in self.entries()], ["proof"])
+
+    def test_m2_the_author_alone_is_a_known_writer_so_another_agent_may_judge(self):
+        self.assertEqual(self.judge("S1")[0], sb.EXIT_OK)    # no proof recorded yet: the ask's author is the known writer
+
+    def test_m2_mutants_that_drop_the_author_fail_these_tests(self):
+        real = sb.plan_ledger.known_writers
+        with mock.patch.object(sb.plan_ledger, "known_writers", lambda entries, pr, senders=(): bool(real(entries, pr, ()))):
+            code, why, _, _ = self.judge("S1")
+        self.assertIsNone(code)          # the mutant refuses: "the author alone is a known writer" fails on it
+        self.assertIn("no writer", why)
+        self.reviewers = ["rev1", "human"]
+        self.prove("S1")
+        orig = sb.item_issue
+        def no_author(*a):
+            got = orig(*a)
+            return dict(got, author=None)
+        self.caller = "human"
+        with mock.patch.object(sb, "item_issue", no_author):
+            code, why = self.run_cmd("cmd_verdict", scenario="S1")[:2]
+        self.assertEqual(code, sb.EXIT_OK, why)   # the mutant lets the author judge: the refusal test above fails on it
+
+    def test_p1_every_subject_form_resolves_to_the_issue_or_is_refused_by_name(self):
+        for form in ("acme-org/widget-service#1130",):
+            self.assertEqual(self.prove("S1", subject=form)[0], sb.EXIT_OK)
+        for form in ("1130", "#1130", "https://github.com/acme-org/widget-service/issues/1130"):
+            for command in ("prove", "judge"):
+                code, why, _, _ = getattr(self, command)("S1", subject=form)
+                self.assertIsNone(code, form)
+                self.assertTrue(why, form)
+        self.assertEqual({e["pr"] for e in self.entries()}, {self.ASK})
+        code, why, _, _ = self.prove("S1", subject="https://github.com/acme-org/widget-service/pull/9")
+        self.assertNotIn("ask", (why or "").split("refused")[0])    # a pull request URL stays a pull request subject
+
+    def test_p2_another_repositorys_issue_is_resolved_or_refused_by_name(self):
+        code, why, _, _ = self.prove("S1", subject="other-org/gadget#7")
+        self.assertTrue(code == sb.EXIT_OK or why)
+        self.assertTrue(all(e["pr"] == "other-org/gadget#7" for e in self.entries()))
+
+    def test_s7_the_docs_state_the_issue_subject_the_hash_binding_and_the_closing_rule(self):
+        text = (Path(__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
+        section = text.split("## Ask issue as the subject", 1)[1].split("\n## ", 1)[0]
+        for needle in ("plan comment", "plan hash", "gates ask-close"):
+            self.assertIn(needle, section)
+
+    def test_u1_a_pull_request_subject_behaves_as_before(self):
+        self.pr_readable = True
+        self.hash = "sha256:" + "1" * 64
+        results = []
+        self.caller = "coder1"
+        results.append(self.run_cmd("cmd_prove", subject=self.PR)[:2])
+        self.caller = "rev1"
+        results.append(self.run_cmd("cmd_verdict", subject=self.PR, scenario="S1")[:2])      # a verdict on a PR with a known writer
+        self.caller = "coder1"
+        results.append(self.run_cmd("cmd_verdict", subject=self.PR, scenario="S1")[:2])       # the writer judging its own work
+        results.append(self.run_cmd("cmd_prove", subject=self.PR, scenario=["S9"])[:2])      # an unknown scenario
+        self.assertEqual(results[0][0], sb.EXIT_OK)
+        self.assertEqual(results[1][0], sb.EXIT_OK)
+        self.assertIn("refused", results[2][1])
+        self.assertEqual(results[3][0], sb.EXIT_PARTIAL)
+        self.assertEqual({e["head"] for e in self.entries()}, {self.HEAD})      # a pull request's record still names the head
+
+    def test_u2_a_revised_plan_voids_the_old_record_and_a_new_record_counts(self):
+        self.record_all(("S1",))
+        self.hash = "sha256:" + "2" * 64
+        self.assertEqual(self.prove("S1")[0], sb.EXIT_OK)
+        report = json.loads(self.run_cmd("cmd_gates", json=True)[2])
+        s1 = next(g for g in report["gates"] if g["gate"] == "G1")
+        self.assertIn("S1", " ".join(s1["missing"]))
+        proofs = [e for e in self.entries() if e["kind"] == "proof"]
+        self.assertEqual([e["plan_hash"] for e in proofs], ["sha256:" + "1" * 64, "sha256:" + "2" * 64])
+
+    def test_u3_no_refusal_writes_a_row(self):
+        self.has_plan = False
+        self.prove("S1"), self.judge("S1")
+        self.has_plan = True
+        self.prove("S9")                                   # an unknown scenario
+        self.run_cmd("cmd_prove", scenario=["S1"], plan="acme-org/widget-service#5")   # another plan
+        self.assertEqual(self.entries(), [])
 
 
 class TestNoPaneToJudge(StandInPids, Base):
