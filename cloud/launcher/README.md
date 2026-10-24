@@ -21,7 +21,7 @@ Launcher, reaper, end hook and token mint for cloud workers, built to `docs/clou
 
   **The reaper's own cluster login and the minter.** The reaper keeps its own login fresh (the token file, renewed when under 20 minutes
   are left). The UNATTENDED reaper pins its mint command (`strict`, below); the interactive launch path keeps its previous behaviour, since it
-  runs in the person's own shell, which can read the vault with the person's own login anyway. The reaper's mint runs one fixed command: a `kubectl` at an absolute path (`CW_KUBECTL` when set, which must be an absolute path to a
+  runs in the person's own shell, which can read the vault with the person's own login anyway. The launch path keeps its previous behaviour: `CW_KUBECTL`, `CW_CLUSTER_ADMIN_CMD` and `CW_CLOUD_NAMESPACE` can still be set by whoever controls the launcher's environment (an interactive shell with the person's own login): unchanged. The new guards protect the UNATTENDED reaper service. With the minter credential (a ServiceAccount that can only create tokens for `cw-operator`) the administrator credential no longer travels this route: the residual risk is the minter's token for `cw-operator` only. This is a stated limit, not a fix. The reaper's mint runs one fixed command: a `kubectl` at an absolute path (`CW_KUBECTL` when set, which must be an absolute path to a
   plain executable file that is not group- or world-writable; else the first of `/opt/homebrew/bin/kubectl`, `/usr/local/bin/kubectl`,
   `/usr/bin/kubectl`) `create token cw-operator --duration=Nm`, with `-n` the namespace (`CW_CLOUD_NAMESPACE`, which must be a DNS-1123
   label). The account, the subcommand and the duration are fixed in code; no variable changes them. The command and the vault client run

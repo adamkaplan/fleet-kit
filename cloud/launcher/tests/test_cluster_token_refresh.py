@@ -779,6 +779,44 @@ class MintGuards(Refresh):
             return getattr(e, "kind", type(e).__name__)
         return "ok"
 
+    def test_no_argument_or_variable_of_the_launch_path_reaches_strict(self):
+        """Only the reaper's refresher sets strict: no CW_ name, flag or argument of the launch changes the launch path."""
+        import inspect
+        with open(os.path.join(ROOT, "bin", "cloud_worker.py")) as f:
+            launch = f.read()
+        self.assertEqual(list(inspect.signature(cw.cluster_token).parameters)[-1], "strict")
+        self.assertIn("def cluster_token(env=None, now=None, recovery=None):", launch)   # the launch entry has no such argument
+        self.assertEqual(re.findall(r"cluster_token\(([^)]*)\)", launch.split("def cluster_token(env=None")[1].split("\ndef ")[0]).count("strict"), 0)
+        self.assertNotIn("strict", launch.lower())
+        self.assertEqual(len(re.findall(r"strict=True", SOURCE.split("class ClusterTokenRefresher")[1].split("\ndef spend_cap")[0])), 1)
+        self.assertEqual(len(re.findall(r"cluster_token\([^)]*strict=True", SOURCE)), 1)   # the one explicit call: the refresher's
+        self.assertFalse(re.search(r"(environ|env)\.get\([^)]*[Ss][Tt][Rr][Ii][Cc][Tt]|environ\[[^]]*[Ss][Tt][Rr][Ii][Cc][Tt]", SOURCE))   # no setting is read for it
+        with self.assertRaises(TypeError):
+            inspect.signature(cw.cluster_token).bind(self.env, "30m", bogus=1)
+        for name in ("CW_STRICT", "FLEET_STRICT", "STRICT", "CW_CLUSTER_STRICT", "CW_MINT_STRICT"):
+            for value in ("1", "0", "true", "false"):
+                env = dict(self.planted(), CW_KUBECTL="kubectl", PATH=self.bin + os.pathsep + os.environ.get("PATH", ""), **{name: value})
+                self.reset()
+                self.assertEqual(self._launch_call(cw, env), "ok", (name, value))   # still the launch's behaviour
+                self.assertTrue(any("FAKE_SECRET_VAR" in c for c in self.child_envs()))
+                env = dict(self.env, CW_KUBECTL="sh", **{name: value})
+                self.assertEqual(self.outcome(env=env), "kubectl-refused", (name, value))   # and the reaper's route stays strict
+        for flag in (["reap", "--strict"], ["--strict", "reap"], ["status", "--strict=false"], ["reap", "--strict", "1"]):
+            with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                self.assertEqual(cw.main(flag, env=dict(self.env)), cw.EXIT_USAGE, flag)
+
+    def test_a_build_whose_default_is_strict_fails_the_pins(self):
+        module = self.mutate("recovery=None, strict=False):", "recovery=None, strict=True):")
+        import inspect
+        self.assertIs(inspect.signature(module.cluster_token).parameters["strict"].default, True)   # the default pin catches it
+        env = dict(self.env, CW_KUBECTL="kubectl", PATH=self.bin + os.pathsep + os.environ.get("PATH", ""))
+        self.assertEqual(self._launch_call(module, env), "kubectl-refused")   # the compatibility pin catches it
+
+    def test_a_build_whose_reaper_relies_on_the_default_fails_the_guard_tests(self):
+        module = self.mutate("now=now, strict=True)", "now=now)")   # the default is False: the reaper is no longer explicit
+        env = dict(self.env, CW_KUBECTL="sh")
+        self.assertNotEqual(module.ClusterTokenRefresher(env, self.clock).run().reason, cw.REFRESH_REASONS["kubectl-refused"])
+
     def test_the_reapers_refresher_is_strict_and_a_build_with_strict_false_fails(self):
         env = dict(self.env, CW_KUBECTL="sh")
         refresher = cw.ClusterTokenRefresher(env, self.clock)
