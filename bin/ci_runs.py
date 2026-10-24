@@ -58,38 +58,96 @@ def _identity(entry, position):
     if not isinstance(name, str) or not name:
         return ("unnamed", position)   # names no check: its own check, never merged with another
     workflow = entry.get("workflowName")
-    return (workflow if isinstance(workflow, str) else "", name)
+    run = _run_id(entry)
+    ident = _identity_of_run(entry, run) if run is not None else None   # cached: the stable identity, never the author's display name
+    return (workflow if isinstance(workflow, str) else "", ident, name)
 
 
 def _run_id(entry):
     """The workflow run id of a check run (from its detailsUrl `.../actions/runs/<id>/...`), or None (a status context, or no url)."""
     url = entry.get("detailsUrl")
-    found = re.search(r"/actions/runs/(\d+)", url) if isinstance(url, str) else None
+    found = re.search(r"/actions/runs/(\d{1,12})(?:/|$)", url) if isinstance(url, str) else None
     return int(found.group(1)) if found else None
 
 
+UNREADABLE = "IDENTITY_UNREADABLE"   # status given to a run whose workflow identity could not be read: never green (fails closed)
+_CACHE = {}   # (owner/repo, run id) -> (workflow id, event) or None; a run's workflow never changes, so one bounded read per distinct run
+READER = None   # tests (or a caller with its own gh runner) set a function (repo, run id) -> (workflow id, event) or None
+
+
+def _read_run(repo, run):
+    """ONE bounded read of a run: (workflow id, event) from `gh api repos/<repo>/actions/runs/<id>`, or None when it cannot be read."""
+    import json
+    import subprocess
+    try:
+        done = subprocess.run(["gh", "api", "repos/%s/actions/runs/%d" % (repo, run), "--jq", "{w: .workflow_id, e: .event}"],
+                              capture_output=True, text=True, timeout=20)
+        data = json.loads(done.stdout) if done.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if isinstance(data, dict) and isinstance(data.get("w"), int) and isinstance(data.get("e"), str):
+        return (data["w"], data["e"])
+    return None
+
+
+def _identity_of_run(entry, run):
+    """(workflow id, event) of the run behind `entry`, cached; None when unreadable (the caller fails closed)."""
+    found = re.search(r"github\.com/([\w.-]+/[\w.-]+)/actions/runs/", entry.get("detailsUrl") or "")
+    repo = found.group(1) if found else ""
+    key = (repo, run)
+    if key not in _CACHE:
+        got = None
+        try:
+            got = (READER or _read_run)(repo, run) if repo else None
+        except Exception:
+            got = None
+        if not (isinstance(got, tuple) and len(got) == 2):
+            return None   # an unreadable identity is never cached as readable
+        _CACHE[key] = got
+    return _CACHE[key]
+
+
 def latest_runs(rollup):
-    """`rollup` without the checks of an OLDER run of a workflow: for each workflow only its LATEST run (the highest run id, ids grow with
-    creation) counts, whatever the check names. Entries with no workflow or no run id (status contexts) are kept for the by-name rule."""
+    """`rollup` without the checks of an OLDER run of a workflow. A workflow is its STABLE identity (the workflow id read from the run), never
+    its display name (the PR author writes that: a second workflow could take the real one's name). Runs are grouped by (workflow id, event):
+    a newer run of another event never hides a red older one (the fail-closed choice). The highest run id of a group counts (ids grow with
+    creation). A run whose identity cannot be read is kept and marked UNREADABLE (never green). Entries with no run id (status contexts) are kept."""
     if not isinstance(rollup, list):
         return []
+    known = []
     top = {}
     for entry in rollup:
-        run = _run_id(entry) if isinstance(entry, dict) and isinstance(entry.get("workflowName"), str) else None
-        if run is not None:
-            flow = entry["workflowName"]
-            top[flow] = max(top.get(flow, run), run)
-    return [e for e in rollup if not (isinstance(e, dict) and isinstance(e.get("workflowName"), str) and _run_id(e) is not None
-                                      and _run_id(e) < top[e["workflowName"]])]
+        run = _run_id(entry) if isinstance(entry, dict) else None
+        ident = _identity_of_run(entry, run) if run is not None else None
+        known.append((run, ident))
+        if ident is not None:
+            top[ident] = max(top.get(ident, run), run)
+    out = []
+    for entry, (run, ident) in zip(rollup, known):
+        if run is None:
+            out.append(entry)
+        elif ident is None:
+            out.append(dict(entry, status=UNREADABLE, conclusion=""))
+        elif run >= top[ident]:
+            out.append(entry)
+    return out
+
+
+def _clean(text, limit=60):
+    """A workflow name safe to show: control characters dropped, bounded, quoted."""
+    text = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", str(text))
+    return '"%s"' % (text[:limit] + ("..." if len(text) > limit else ""))
 
 
 def not_green_runs(rollup):
-    """[(workflow, run id, state)] of the latest runs that are not complete and green, for a refusal that names them."""
+    """[(workflow, run id, state)] of the latest runs that are not complete and green, for a refusal that names them. The workflow name is
+    author-controlled text: it comes out sanitised, quoted and length-limited (or "" for a status context)."""
     bad = []
     for e in newest(rollup):
         word = str(e.get("conclusion") or e.get("state") or "").upper()
         if _unfinished(e) or word not in ("SUCCESS", "NEUTRAL", "SKIPPED"):
-            bad.append((e.get("workflowName") or "", _run_id(e), (word or str(e.get("status") or "pending")).lower()))
+            name = e.get("workflowName")
+            bad.append((_clean(name) if isinstance(name, str) and name else "", _run_id(e), (word or str(e.get("status") or "pending")).lower()))
     return bad
 
 

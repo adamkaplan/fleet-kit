@@ -87909,6 +87909,16 @@ class TestAssembler(unittest.TestCase):
 class TestLatestRunOfWorkflow(unittest.TestCase):
     """Ask #1237: for each workflow only the LATEST run counts, whatever the check names; pr_ci_of is the one reading ci-record and the gate share."""
 
+    WF = {}   # run id -> (workflow id, event); a run missing here cannot be read
+
+    def setUp(self):
+        ci = load_ci_runs()
+        self.WF = {r: (1, "push") for r in range(100, 106)}
+        ci._CACHE.clear()
+        old = ci.READER
+        ci.READER = lambda repo, run: self.WF.get(run)
+        self.addCleanup(lambda: (setattr(ci, "READER", old), ci._CACHE.clear()))
+
     @staticmethod
     def chk(flow, run, name, concl, status="COMPLETED"):
         return {"workflowName": flow, "name": name, "conclusion": concl, "status": status, "startedAt": "2026-10-15T1%d:00:00Z" % (run % 10),
@@ -87931,17 +87941,150 @@ class TestLatestRunOfWorkflow(unittest.TestCase):
     def test_s5_no_run_and_queued_named(self):
         self.assertEqual(sb.pr_ci_of([]), "none")
         bad = load_ci_runs().not_green_runs(self.first() + [self.chk("ci", 101, "build", "", "QUEUED")])
-        self.assertEqual(bad[0][:2], ("ci", 101))
+        self.assertEqual(bad[0][:2], ('"ci"', 101))
 
-    def test_s6_one_definition(self):
-        text = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci_runs.py")).read()
-        self.assertEqual(text.count("def latest_runs("), 1)
+    def test_s6_gate_and_ci_record_both_use_the_latest_run_result(self):
+        """pr_ci_of (the gate's and ci-record's read) and not_green_runs both go through latest_runs: an old red run of the same workflow is ignored by both."""
+        rollup = self.first() + [self.chk("ci", 101, "build", "SUCCESS")]
+        self.assertEqual(sb.pr_ci_of(rollup), "green")
+        self.assertEqual(load_ci_runs().not_green_runs(rollup), [])
+        seen = []
+        real = load_ci_runs().latest_runs
+        load_ci_runs().latest_runs = lambda r: (seen.append(1), real(r))[1]
+        self.addCleanup(setattr, load_ci_runs(), "latest_runs", real)
+        sb.pr_ci_of(rollup)
+        load_ci_runs().not_green_runs(rollup)
+        self.assertEqual(len(seen), 2)
 
     def test_u2_status_context_by_name(self):
         red = {"context": "legacy", "state": "FAILURE", "startedAt": "2026-10-15T10:00:00Z"}
         green = {"context": "legacy", "state": "SUCCESS", "startedAt": "2026-10-15T11:00:00Z"}
         self.assertEqual(sb.pr_ci_of([red]), "failing")
         self.assertEqual(sb.pr_ci_of([red, green]), "green")
+
+
+
+    # --- ask #1237 review: identity, sanitising, edges ---
+    def test_same_name_two_workflows_one_red_reads_not_green_and_both_are_named(self):
+        self.WF.update({100: (1, "push"), 101: (2, "push")})
+        for rollup, red in (([self.chk("ci", 100, "t", "FAILURE"), self.chk("ci", 101, "t", "SUCCESS")], 1),
+                            ([self.chk("ci", 100, "t", "FAILURE"), self.chk("ci", 101, "t", "CANCELLED")], 2)):
+            self.assertEqual(sb.pr_ci_of(rollup), "failing")
+            self.assertEqual(len(load_ci_runs().not_green_runs(rollup)), red)
+        self.assertEqual(load_ci_runs().not_green_runs([self.chk("ci", 100, "t", "FAILURE"), self.chk("ci", 101, "t", "SUCCESS")]), [('"ci"', 100, "failure")])
+        both = [self.chk("ci", 100, "t", "FAILURE"), self.chk("ci", 101, "t", "TIMED_OUT")]
+        self.assertEqual(load_ci_runs().not_green_runs(both), [('"ci"', 100, "failure"), ('"ci"', 101, "timed_out")])
+
+    def test_same_workflow_newer_green_older_red_or_cancelled_reads_green(self):
+        for old in ("FAILURE", "CANCELLED"):
+            r = [self.chk("ci", 100, "t", old), self.chk("ci", 101, "t", "SUCCESS")]
+            self.assertEqual(sb.pr_ci_of(r), "green")
+            self.assertEqual(load_ci_runs().not_green_runs(r), [])
+
+    def test_same_workflow_two_events_a_newer_run_of_another_event_does_not_hide_a_red_one(self):
+        self.WF.update({100: (1, "pull_request"), 101: (1, "push")})
+        r = [self.chk("ci", 100, "t", "FAILURE"), self.chk("ci", 101, "t", "SUCCESS")]
+        self.assertEqual(sb.pr_ci_of(r), "failing")
+        self.assertEqual(load_ci_runs().not_green_runs(r), [('"ci"', 100, "failure")])
+
+    def test_unreadable_identity_fails_closed_and_says_so(self):
+        del self.WF[101]
+        r = [self.chk("ci", 100, "t", "FAILURE"), self.chk("ci", 101, "t", "SUCCESS")]
+        self.assertEqual(sb.pr_ci_of(r), "failing")
+        self.assertEqual(load_ci_runs().not_green_runs(r)[-1], ('"ci"', 101, "identity_unreadable"))
+        self.assertEqual(sb.pr_ci_of([self.chk("ci", 101, "t", "SUCCESS")]), "pending")
+
+    def test_a_read_that_raises_fails_closed(self):
+        ci = load_ci_runs()
+        def boom(repo, run):
+            raise RuntimeError("x")
+        ci.READER = boom
+        self.assertEqual(sb.pr_ci_of([self.chk("ci", 101, "t", "SUCCESS")]), "pending")
+
+    def test_a_reader_answering_garbage_fails_closed(self):
+        load_ci_runs().READER = lambda repo, run: "x"
+        self.assertEqual(sb.pr_ci_of([self.chk("ci", 101, "t", "SUCCESS")]), "pending")
+
+    def test_the_run_read_returns_workflow_id_and_event_or_none(self):
+        ci = load_ci_runs()
+        import subprocess as sp
+        from unittest import mock
+        def fake(out, code=0):
+            return mock.patch.object(sp, "run", return_value=sp.CompletedProcess([], code, out, ""))
+        with fake('{"w": 7, "e": "push"}'):
+            self.assertEqual(ci._read_run("o/r", 5), (7, "push"))
+        with fake('{"w": 7, "e": "push"}', 1):
+            self.assertIsNone(ci._read_run("o/r", 5))
+        with fake('{"w": "7", "e": "push"}'):
+            self.assertIsNone(ci._read_run("o/r", 5))
+        with fake('not json'):
+            self.assertIsNone(ci._read_run("o/r", 5))
+
+    def test_the_identity_is_read_once_per_run_in_a_pass(self):
+        calls = []
+        ci = load_ci_runs()
+        ci.READER = lambda repo, run: (calls.append(run), (1, "push"))[1]
+        r = [self.chk("ci", 101, "a", "SUCCESS"), self.chk("ci", 101, "b", "SUCCESS")]
+        sb.pr_ci_of(r)
+        sb.pr_ci_of(r)
+        self.assertEqual(calls, [101])
+
+    def test_the_name_in_a_refusal_is_clean_quoted_and_bounded(self):
+        r = [self.chk("evil\x1b[31m\nname" + "x" * 500, 101, "t", "FAILURE")]
+        (name, run, state), = load_ci_runs().not_green_runs(r)
+        self.assertEqual((run, state), (101, "failure"))
+        self.assertNotIn("\x1b", name)
+        self.assertNotIn("\n", name)
+        self.assertTrue(name.startswith('"evil[31mname') and name.endswith('..."'))
+        self.assertLessEqual(len(name), 70)
+
+    def test_latest_runs_edges_full_tuples(self):
+        ci = load_ci_runs()
+        c = self.chk
+        no_url = dict(c("ci", 101, "t", "SUCCESS"), detailsUrl=None)
+        bad_url = dict(c("ci", 101, "t", "SUCCESS"), detailsUrl="https://x/actions/runs/abc/job")
+        long_id = dict(c("ci", 101, "t", "SUCCESS"), detailsUrl="https://github.com/o/r/actions/runs/" + "9" * 30)
+        self.assertEqual(ci.latest_runs([no_url, bad_url]), [no_url, bad_url])   # no run id: kept for the by-name rule
+        self.assertEqual(ci.not_green_runs([no_url, bad_url, "str", None]), [])
+        self.assertEqual(ci.latest_runs([long_id]), [long_id])
+        self.assertEqual(ci._run_id(long_id), None)
+        self.assertEqual(ci.latest_runs("x"), [])
+        self.assertEqual(ci.not_green_runs({"a": 1}), [])
+        self.assertEqual(ci.latest_runs([1, "s"]), [1, "s"])
+        noname = c(None, 101, "t", "FAILURE")
+        del noname["workflowName"]
+        self.assertEqual(ci.not_green_runs([noname]), [("", 101, "failure")])
+        ctx = {"context": "legacy", "state": "FAILURE"}
+        self.assertEqual(ci.not_green_runs([ctx, c("ci", 101, "t", "SUCCESS")]), [("", None, "failure")])
+        same = [c("ci", 101, "a", "FAILURE"), c("ci", 101, "b", "SUCCESS")]
+        self.assertEqual(ci.latest_runs(same), same)   # equal run ids: both kept
+        self.assertEqual(ci.not_green_runs(same), [('"ci"', 101, "failure")])
+        mixed = [c("ci", 100, "a", "FAILURE"), c("ci", 102, "b", "SUCCESS"), c("ci", 101, "c", "FAILURE")]
+        self.assertEqual(ci.latest_runs(mixed), [mixed[1]])   # only the highest id counts
+        self.assertEqual(ci.not_green_runs(mixed), [])
+
+    def test_ci_record_core_names_the_not_green_run_and_a_plain_message_without_a_rollup(self):
+        text = (Path(__file__).resolve().parent / "fleet-switchboard").read_text()
+        self.assertIn('"ci_rollup": data.get("statusCheckRollup")', text)
+        facts = sb.pr_facts_from({"state": "OPEN", "statusCheckRollup": self.first() + [self.chk("ci", 101, "build", "", "QUEUED")]})
+        self.assertEqual(facts["ci_rollup"][-1]["name"], "build")
+        self.assertEqual(sb.pr_ci_of(facts["ci_rollup"]), "pending")
+        self.assertEqual(load_ci_runs().not_green_runs(facts["ci_rollup"]), [('"ci"', 101, "queued")])
+        self.assertIn("ci_rollup", sb.pr_facts_from({"state": "OPEN"}))
+
+    def test_ci_record_core_why_names_the_run_and_has_no_suffix_without_a_rollup(self):
+        import types
+        def why(raw):
+            facts = sb.pr_facts_from(dict({"state": "OPEN", "headRefOid": "a" * 40}, **raw))
+            ctx = types.SimpleNamespace(unreadable=None, facts=facts, plan={"result": "pass", "scenarios_parsed": []}, plan_problem=None, engine=None, pr=1)
+            return sb.ci_record_core(ctx, lambda: 0, quiet=True)
+        rollup = self.first() + [self.chk("ci", 101, "build", "", "QUEUED")]
+        got = why({"statusCheckRollup": rollup})
+        self.assertEqual(got["status"], "not-green")
+        self.assertEqual(got["why"], 'CI is pending at aaaaaaaa (only a complete, green run is recorded) ["ci" run 101 is queued]')
+        got = why({})
+        self.assertEqual(got["why"], "CI is none at aaaaaaaa (only a complete, green run is recorded)")
+
 
 
 def load_ci_runs():
