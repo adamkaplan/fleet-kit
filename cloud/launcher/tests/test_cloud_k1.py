@@ -277,7 +277,7 @@ def rbac_docs(text=None):
 
 
 class S3S7Manifest(unittest.TestCase):
-    def test_role_resources_are_exactly_the_six_and_nothing_cluster_wide_or_wild(self):
+    def test_role_resources_are_exactly_the_seven_and_nothing_cluster_wide_or_wild(self):
         self.check_role(rbac_docs())
 
     def check_role(self, docs):
@@ -289,12 +289,14 @@ class S3S7Manifest(unittest.TestCase):
         role = roles[0]
         self.assertEqual(role["ns"], "cw")
         self.assertEqual(sorted(r for rule in role["rules"] for r in rule["resources"]),
-                         sorted(["pods", "pods/log", "pods/exec", "pods/portforward", "secrets", "statefulsets"]))
+                         sorted(["pods", "pods/log", "pods/exec", "pods/portforward", "secrets", "statefulsets", "persistentvolumeclaims"]))
         self.assertEqual({g for rule in role["rules"] for g in rule["groups"]}, {"", "apps"})
         self.assertNotIn("*", "".join(role["text"].split()).replace('apiGroups:[""]', ""))
         self.assertEqual([r["verbs"] for r in role["rules"] if r["resources"] == ["pods/portforward"]], [["create"]])
         self.assertEqual([(r["groups"], r["verbs"]) for r in role["rules"] if r["resources"] == ["statefulsets"]],
                          [(["apps"], ["get", "list", "watch", "create", "delete"])])
+        self.assertEqual([(r["groups"], r["verbs"]) for r in role["rules"] if r["resources"] == ["persistentvolumeclaims"]],
+                         [([""], ["get", "list", "create", "delete"])])
         for rule in role["rules"]:
             self.assertFalse({"*", "escalate", "bind", "impersonate"} & set(rule["verbs"]))
 
