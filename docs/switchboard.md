@@ -4345,6 +4345,16 @@ retroactive plan; a waiver for another head, another PR or after its expiry does
 the gate reads `waived (by <who>, <reason>, due <time>)`, never `ok`, and the report lists `WAIVED (not passed)`. The cos permission corpus
 and allowed commands still have to be extended with `waive` (a permission change, held for the owner).
 
+## A proof carries to a new head (#1129)
+
+A proof is bound to the head it was recorded at. A tester's, live check's or reviewer's proof (or verdict) that names its files (`prove --file PATH`, `verdict --file PATH`, repeatable) CARRIES to a new head when ALL THREE hold:
+
+1. the difference between the old and the new head touches none of the files the proof names;
+2. the new head is a merge of the default branch, or a difference of tests and documentation only;
+3. CI is green at the new head.
+
+A carry is ONE ledger line of its own, kind `carried`, with the fields `proof` (the sequence number of the row), `scenario`, `old_head`, `new_head` and `facts` (`named_files_untouched`, `difference`, `ci`). The original proof row is never changed. `gates` shows the proof as carried, with the head it was recorded at. A proof that names no file is never carried; a proof whose named file is touched is void as before; proofs proven by CI are re-recorded by the daemon at each green head and are never carried. A carry never turns a proof into one for a head that fails any condition. The decision is `plan_ledger.carry_decision`; `fleet-switchboard`'s `carry_proofs` writes the lines from `carry_head_facts`. Reverting leaves the lines readable and ignored.
+
 ## The merge gate and the merge lock: the fleet's own merge queue (#962)
 
 **It is the fleet's own merge queue.** Two pull requests that were each green against an older default branch can merge minutes apart and fail together (the

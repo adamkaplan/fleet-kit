@@ -26,7 +26,8 @@ GENESIS = "0" * 64
 EVIDENCE_KINDS = ("proof", "verdict", "consensus", "waiver")   # a consensus entry is written by the plan review engine (a later slice)
 REVIEW_KINDS = ("round", "lane_session", "lane", "response", "escalation", "decision", "abandoned", "reminder", "review_record")   # the plan review engine's records (#109)
 ITEM_KINDS = ("item_tester",)   # #770: the registration of a tester for a work item that has no pull request; written by `launch` only (bin/item_verdicts.py)
-KINDS = EVIDENCE_KINDS + REVIEW_KINDS + ITEM_KINDS
+CARRY_KINDS = ("carried",)   # #1129: a proof or verdict that holds at a new head (see `carry_decision`); its own line, the original row is never touched
+KINDS = EVIDENCE_KINDS + REVIEW_KINDS + ITEM_KINDS + CARRY_KINDS
 RESULTS = ("pass", "fail")
 EVIDENCE_LIMIT = 500
 FIELD_LIMIT = 200
@@ -344,11 +345,14 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
     only for THIS plan hash and THIS head; one for another is shown as void, not hidden."""
     sid, evaluator = scenario["id"], evaluator_of(scenario)
     out = {"id": sid, "evaluator": evaluator, "claim": claim_of(scenario), "missing": [], "void": []}
+    carried = carried_seqs(entries, pr, head)   # #1129: {seq of the proof or verdict: its carried line}
     for kind in ("proof", "verdict"):
         mine = [e for e in entries if e.get("pr") == pr and e.get("scenario") == sid and e.get("kind") == kind
                 and (kind == "proof" or e.get("evaluator") == evaluator)]
-        fresh = [e for e in mine if e.get("plan_hash") == plan_hash and e.get("head") == head]
+        fresh = [e for e in mine if e.get("plan_hash") == plan_hash and (e.get("head") == head or e.get("seq") in carried)]
         newest = fresh[-1] if fresh else None
+        if newest and newest.get("head") != head:
+            out.setdefault("carried", []).append(carried_view(newest, carried[newest["seq"]]))
         if not newest and mine:
             why = "plan changed" if mine[-1].get("plan_hash") != plan_hash else "head moved"
             out["void"].append("%s #%d void: %s" % (kind, mine[-1]["seq"], why))
@@ -366,6 +370,56 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
         out["missing"].append("the verdict is by an author of the PR (not accepted)")
     out["status"] = "ok" if not out["missing"] else "missing"
     return out
+
+
+# ----------------------------------------------------------------------------------- the carry of a proof (#1129)
+
+CARRY_EVALUATORS = ("tester", "live", "reviewer")   # the types of proof that may carry; `ci` ids are re-recorded by the daemon, never carried
+CARRY_FIELDS = ("proof", "scenario", "old_head", "new_head", "facts")
+DOC_TEST_RE = re.compile(r"(^|/)(tests?|docs?)/|(^|/)test-[^/]*$|(^|/)test_[^/]*$|\.(md|rst|txt)$")
+
+
+def carried_seqs(entries, pr, head):
+    """{seq of a proof or verdict: its `carried` line} for the carries of `pr` whose new head is `head`. Empty without a head."""
+    found = {}
+    for entry in entries if head else ():
+        if entry.get("kind") == "carried" and entry.get("pr") == pr and entry.get("new_head") == head and isinstance(entry.get("proof"), int):
+            found[entry["proof"]] = entry
+    return found
+
+
+def carried_view(row, line):
+    """What the gate shows of a carried proof: the ORIGINAL head the proof was recorded at, and the carry line that holds it here."""
+    return {"proof": row["seq"], "original_head": row.get("head"), "carried_line": line["seq"], "new_head": line["new_head"]}
+
+
+def is_tests_docs_only(files):
+    return bool(files) and all(DOC_TEST_RE.search(str(f)) for f in files)
+
+
+def carry_decision(row, evaluator, files_changed, merge_of_default, ci_green):
+    """(verdict, reason) for one proof or verdict `row` and a new head: verdict is "carry", "void" (a file the proof names is touched) or "refuse".
+    All three conditions are required: (a) none of the files the proof names is in `files_changed`; (b) the new head is a merge of the default branch or its
+    difference is tests and documentation only; (c) CI is green at the new head. A proof proven by CI, of another type, or naming no file is never carried."""
+    named = [f for f in (row.get("files") or ()) if isinstance(f, str) and f]
+    if evaluator not in CARRY_EVALUATORS:
+        return "refuse", "a %s proof is not carried (CI ids are re-recorded at each green head)" % evaluator
+    if not named:
+        return "refuse", "the proof names no file: it is never carried"
+    touched = sorted(set(named) & set(files_changed))
+    if touched:
+        return "void", "the difference touches a file the proof names: %s" % ", ".join(touched)
+    if not (merge_of_default or is_tests_docs_only(files_changed)):
+        return "refuse", "the difference is code outside a merge of the default branch"
+    if ci_green is not True:
+        return "refuse", "CI is not green at the new head"
+    return "carry", "carried"
+
+
+def carry_line(row, scenario, old_head, new_head, merge_of_default, pr):
+    """The ONE ledger line of a carry: the proof, the old head, the new head and the three facts. The proof's own row is never rewritten."""
+    return {"kind": "carried", "pr": pr, "proof": row["seq"], "scenario": scenario, "plan_hash": row.get("plan_hash"), "old_head": old_head, "new_head": new_head,
+            "facts": {"named_files_untouched": True, "difference": "merge of the default branch" if merge_of_default else "tests and documentation only", "ci": "green"}}
 
 
 CARRIES_LINE_RE = re.compile(r"(?mi)^[ \t]*CARRIES:.*$")
@@ -674,6 +728,8 @@ def render_gates(report, pr):
     for s in report.get("scenarios", []):
         for note in s["void"]:
             lines.append("  %s: %s" % (s["id"], note))
+        for view in s.get("carried") or ():   # #1129: a carried proof is shown with the head it was recorded at
+            lines.append("  %s: carried: row #%d recorded at %s, held here by carried line #%d" % (s["id"], view["proof"], str(view["original_head"])[:8], view["carried_line"]))
     rating = report.get("impact_rating")
     if isinstance(rating, dict):
         lines.append("  " + impact_rating_line(rating, report.get("head")))
