@@ -28430,12 +28430,11 @@ class TestSweep(Base):
             calls.append((repo, number))
             return reading["value"]
         patches = [mock.patch.object(sb, "sweep_gate_reading", fake)]
-        if mutant == "raises_not_ready":
-            patches.append(mock.patch.object(sb, "sweep_gate_reading", lambda e, r, n, now: ([], reading["value"][1] or self.HEAD_A, "who can clear it: x", None)
-                                            if reading["value"][0] is not None else reading["value"]))
         with contextlib.ExitStack() as stack:
             for patch in patches:
                 stack.enter_context(patch)
+            if mutant == "raises_not_ready":   # the REAL code, treating every readable pull request as ready
+                stack.enter_context(self.mutated("sweep_ready_pass", 'if opened != ["G6"]:', 'if False:'))
             if mutant == "from_hold":   # the REAL code, counting from the hold
                 stack.enter_context(self.mutated("sweep_ready_pass", 'if now - row["at"] >= ', 'if now - (parse_iso(d.get("since")) or now) >= '))
             self.sweep(decisions)
@@ -28502,6 +28501,84 @@ class TestSweep(Base):
         self.hub.open = {600: sweep_issue(600, "x", pr=True)}
         self.sweep_with(reading, [self.held_pr()])
         self.assertEqual(self.engine.sweep.current["not_checked"], 1)
+        self.world.tick(5400)
+        self.sweep_with(reading, [self.held_pr()])   # unreadable on every pass: the age grows
+        current = self.engine.sweep.current
+        self.assertEqual((current["not_checked"], current["not_checked_oldest_seconds"]), (1, 5400))
+        text = "\n".join(sb.sweep_status_lines(current))
+        self.assertIn("1 held pull request(s) not checked for S5", text)
+        self.assertIn("oldest 1h30m", text)
+        self.assertNotIn("not checked for S5", "\n".join(sb.sweep_status_lines(dict(current, not_checked=0))))
+        with self.mutated("sweep_ready_pass", "state.not_checked_since.setdefault(key, now)\n            state.s5_unchecked += 1\n            continue\n        state.not_checked_since.pop", "state.s5_unchecked += 1\n            continue\n        state.not_checked_since.pop"):
+            self.setUp()
+            self.hub.open = {600: sweep_issue(600, "x", pr=True)}
+            self.sweep_with(reading, [self.held_pr()])
+            self.world.tick(5400)
+            self.sweep_with(reading, [self.held_pr()])
+            self.assertEqual(self.engine.sweep.current["not_checked_oldest_seconds"], 0)
+
+    def findings(self, decisions, s5, whole=True, now=None):
+        state = sb.sweep_state(self.engine)
+        state.s5 = s5
+        return sb.sweep_findings(self.engine, state, decisions, "acme/api", now or self.world.clock.now(), dict(sb.SWEEP_DEFAULTS), None, decisions_whole=whole)
+
+    FINDINGS_CASES = {   # name -> (mutant (function, old, new), check)
+        "raised_for_a_ready_held_pr": None,
+        "partial_list_raises_nothing": ("sweep_findings", "if decisions_whole and ready and not", "if ready and not"),
+        "owners_row_hides_it": ("sweep_findings", "if decisions_whole and ready and not (sweep_ref_keys(d, home, repos_known) & human_keys):", "if decisions_whole and ready:"),
+        "nothing_ready_nothing_raised": ("sweep_findings", "if decisions_whole and ready and not", "if decisions_whole and not"),
+        "never_falls_back_to_the_hold_clock": ("sweep_findings", "            continue\n        if (decisions_whole and d.get(\"tier\") == \"cos\"", "            pass\n        if (decisions_whole and d.get(\"tier\") == \"cos\""),
+        "an_issue_is_not_a_held_pr": ("sweep_held_pr", 'decision.get("kind") == "captain" and', ""),
+    }
+
+    def findings_case(self, name):
+        held = self.held_pr()
+        ready = {"pr:acme/api#600": (self.HEAD_A, self.world.clock.now(), "Who can clear this: owner only")}
+        s5 = lambda f: [x for x in f if x[0] == "S5"]
+        if name == "raised_for_a_ready_held_pr":
+            self.assertEqual(s5(self.findings([held], ready)), [("S5", "pr:acme/api#600@" + self.HEAD_A[:12])])
+        elif name == "partial_list_raises_nothing":
+            self.assertEqual(s5(self.findings([held], ready, whole=False)), [])
+        elif name == "owners_row_hides_it":
+            owner = {"id": "pr:api#600", "kind": "captain", "tier": "human", "repo": None, "number": 600, "title": "t", "since": self.at()}
+            self.assertEqual(s5(self.findings([held, owner], ready)), [])
+        elif name == "nothing_ready_nothing_raised":
+            self.assertEqual(s5(self.findings([held], {})), [])
+        elif name == "never_falls_back_to_the_hold_clock":
+            self.assertEqual(s5(self.findings([held], {})), [])   # held 10 hours, past the threshold, but not ready: the old hold clock raises it
+        elif name == "an_issue_is_not_a_held_pr":
+            issue = {"id": "d-alone", "kind": "issue", "tier": "cos", "repo": "acme/api", "ask": 510, "title": "t", "since": sb.iso(self.world.clock.now() - 10 * 3600)}
+            self.assertEqual(s5(self.findings([issue], {})), [("S5", "d-alone")])   # an issue keeps the hold clock
+
+    def test_986_the_s5_branch_of_the_findings_guards_and_their_mutants(self):
+        """Guards checked: decisions_whole, the owner's row (human_keys), the ready entry, no fall back to the hold clock, an issue is not a held PR."""
+        for name, mutant in self.FINDINGS_CASES.items():
+            self.setUp()
+            self.findings_case(name)
+            if mutant is None:
+                continue
+            self.setUp()
+            with self.assertRaises((AssertionError, TypeError), msg=name):
+                with self.mutated(*mutant):
+                    self.findings_case(name)
+
+    def test_986_the_wait_is_ripe_at_exactly_the_threshold(self):
+        for mutant in (None, ('if now - row["at"] >= ', 'if now - row["at"] > ')):
+            self.setUp()
+            held, t0 = [self.held_pr()], self.world.clock.now()
+            self.ready_pass(held, lambda r, n: self.ready(), now=t0)
+            state = self.ready_pass(held, lambda r, n: self.ready(), now=t0 + self.engine.config["sweep"]["aged_cos_hours"] * 3600, mutant=mutant)
+            self.assertEqual(len(state.s5) == 1, mutant is None)
+
+    def test_986_a_row_that_is_not_a_held_pr_is_never_read(self):
+        issue = {"id": "d-x", "kind": "issue", "tier": "cos", "repo": "acme/api", "ask": 510, "title": "t", "since": sb.iso(self.world.clock.now() - 10 * 3600)}
+        for mutant in (None, ("sweep_held_pr", 'decision.get("kind") == "captain" and', "")):
+            self.setUp()
+            reads = []
+            ctx = self.mutated(*mutant) if mutant else contextlib.nullcontext()
+            with ctx:
+                self.ready_pass([issue], lambda r, n: reads.append(n) or self.ready())
+            self.assertEqual(reads == [], mutant is None)
 
     # ---- #986 (review): the REAL sweep_gate_reading and the edge paths of sweep_ready_pass, each with a mutant
     @contextlib.contextmanager
@@ -28526,9 +28603,9 @@ class TestSweep(Base):
         for name, (old, new) in pairs:
             self.assertIn(old, inspect.getsource(getattr(sb, name)), name)
 
-    def real_reading(self, gates, head=HEAD_A, unreadable=None, enforced=("G6",), clear=None, boom=None, mutant=None):
+    def real_reading(self, gates, head=HEAD_A, unreadable=None, draft=False, enforced=("G6",), clear=None, boom=None, mutant=None):
         """sweep_gate_reading run for real over a fake context (gates table) and a fake who-can-clear answer."""
-        ctx = types.SimpleNamespace(unreadable=unreadable, facts={"head": head} if head else {}, plan=None, entries=[], problem=None, pr="acme/api#600")
+        ctx = types.SimpleNamespace(unreadable=unreadable, facts=dict({"head": head} if head else {}, draft=draft), plan=None, entries=[], problem=None, pr="acme/api#600")
         report = {"gates": [{"gate": g, "status": st} for g, st in gates], "ready": all(st == "ok" for _, st in gates)}
 
         def context(*a, **k):
@@ -28558,7 +28635,11 @@ class TestSweep(Base):
         "no_head": dict(gates=[("G6", "open")], head=None, check=lambda self, r: self.assertEqual((r[:3], r[3]), ((None, None, None), "no head"))),
         "exception": dict(gates=[("G6", "open")], boom=ValueError("bad"), check=lambda self, r: self.assertEqual((r[:3], r[3]), ((None, None, None), "ValueError: bad"))),
         "who_unknown": dict(gates=[("G6", "open")], clear=RuntimeError("x"), check=lambda self, r: self.assertEqual((r[0], r[2]), (["G6"], "who can clear it: not known"))),
-        "not_enforced_reads_the_board": dict(gates=[("G1", "open"), ("G6", "open")], enforced=None, check=lambda self, r: self.assertEqual(r[0], ["G1", "G6"])),
+        "enforced_without_g6": dict(gates=[("G0a", "ok"), ("G1", "ok"), ("G4", "ok"), ("G6", "open")], enforced=("G0a", "G1"), check=lambda self, r: self.assertEqual(r[:2], (["G6"], self.HEAD_A))),
+        "g4_unenforced_and_pending": dict(gates=[("G0a", "ok"), ("G4", "pending"), ("G6", "open")], enforced=("G0a", "G1"), check=lambda self, r: self.assertEqual((r[0], r[2]), (["G4", "G6"], None))),
+        "g4_unenforced_and_green": dict(gates=[("G0a", "ok"), ("G4", "ok"), ("G6", "open")], enforced=("G0a",), check=lambda self, r: self.assertEqual(r[0], ["G6"])),
+        "all_enforced": dict(gates=[("G0a", "ok"), ("G1", "ok"), ("G4", "ok"), ("G6", "open")], enforced=("G0a", "G1", "G4", "G6"), check=lambda self, r: self.assertEqual(r[0], ["G6"])),
+        "draft_is_not_ready": dict(gates=[("G4", "ok"), ("G6", "open")], draft=True, check=lambda self, r: self.assertEqual((r[0], r[2]), (["draft", "G6"], None))),
         "head_extraction": dict(gates=[("G6", "open")], head="c" * 40, check=lambda self, r: self.assertEqual(r[1], "c" * 40)),
     }
     READING_MUTANTS = {
@@ -28568,7 +28649,11 @@ class TestSweep(Base):
         "no_head": ("or not (ctx.facts or {}).get(\"head\")", "or False"),
         "exception": ("except Exception as err:", "except KeyError as err:"),
         "who_unknown": ("            except Exception:\n                line = None", "            except KeyError:\n                line = None"),
-        "not_enforced_reads_the_board": ("plan_ledger.enforced_view(report, enforced_gates_of(ctx))", "plan_ledger.enforced_view(report, ['G6'])"),
+        "enforced_without_g6": ('opened = [r["gate"] for r in report["gates"] if r["status"] not in plan_ledger.SATISFIED]', 'opened = [r["gate"] for r in report["gates"] if r["gate"] in (enforced_gates_of(ctx) or ()) and r["status"] not in plan_ledger.SATISFIED]'),
+        "g4_unenforced_and_pending": ('if r["status"] not in plan_ledger.SATISFIED]', 'if r["status"] not in plan_ledger.SATISFIED and (r["gate"] in (enforced_gates_of(ctx) or ()) or r["gate"] == "G6")]'),
+        "g4_unenforced_and_green": ('if r["status"] not in plan_ledger.SATISFIED]', 'if r["status"] not in plan_ledger.SATISFIED or r["gate"] == "G4"]'),
+        "all_enforced": ('opened = [r["gate"] for r in report["gates"]', 'opened = [] and [r["gate"] for r in report["gates"]'),
+        "draft_is_not_ready": ('if (ctx.facts or {}).get("draft") is True:', 'if False:'),
         "head_extraction": ('return opened, ctx.facts["head"], who, None', 'return opened, "0" * 40, who, None'),
     }
 
@@ -28835,7 +28920,7 @@ class TestSweep(Base):
         "partial_list_keeps": ("edge_partial_list", ("if decisions_whole:", "if True:")),
         "gate_opens_again": ("edge_gate_opens", ("state.ready.pop(key, None)   # a gate", "pass   # a gate")),
         "new_head_restarts": ("edge_new_head", ('row["head"] != head', "False")),
-        "unreadable_not_checked": ("edge_unreadable", ("state.s5_unchecked += 1\n            continue\n        if opened != ", "continue\n        if opened != ")),
+        "unreadable_not_checked": ("edge_unreadable", ("state.s5_unchecked += 1\n            continue\n        state.not_checked_since.pop", "continue\n        state.not_checked_since.pop")),
         "write_on_change": ("edge_write", ("_write_small(engine.state_dir, SWEEP_READY_FILE", "(lambda *a: None)(engine.state_dir, SWEEP_READY_FILE")),
         "raised_once_per_head": ("edge_once_per_head", None),
         "ready_share_of_budget": ("edge_share", ("ready_share = [max(budget[0] // 2,", "ready_share = [max(budget[0],")),

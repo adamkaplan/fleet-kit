@@ -13694,6 +13694,8 @@ class SweepState:
         self.ready_read = {}     # "repo#n" -> the order of its last gate reading (the least recently read goes first)
         self.read_seq = 0
         self.s5 = {}             # decision id -> (head, ready time, who clears) for each held pull request that has waited past the threshold
+        self.not_checked_since = {}   # "repo#n" -> when it was first not checked (unreadable or skipped), until it is read
+        self.s5_oldest = 0       # seconds the longest not-checked held pull request has gone unread
         self.s5_unchecked = 0    # held pull requests whose gates could not be read this pass: never raised (#986)
         self.details = {}        # (kind, ref) -> the finding's own sentence
 
@@ -13894,8 +13896,9 @@ def sweep_gate_reading(engine, repo, number, now):
         if ctx.unreadable or not (ctx.facts or {}).get("head"):
             return None, None, None, _one_line(str(ctx.unreadable or "no head"), 120)
         report = plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr, now=now)
-        plan_ledger.enforced_view(report, enforced_gates_of(ctx))
-        opened = list(report["open_enforced"]) if report.get("enforced") else [r["gate"] for r in report["gates"] if r["status"] not in plan_ledger.SATISFIED]
+        opened = [r["gate"] for r in report["gates"] if r["status"] not in plan_ledger.SATISFIED]   # the FULL board, whichever gates are enforced: S5 means every gate but the owner's clear is met
+        if (ctx.facts or {}).get("draft") is True:
+            opened.insert(0, "draft")   # a draft is not ready, whatever CI says
         who = None
         if opened == ["G6"]:
             try:
@@ -13917,7 +13920,7 @@ def sweep_ready_pass(engine, state, decisions, home, now, cfg, decisions_whole=T
     request ready, not when it became ready: after a restart without the state file the wait restarts (a pull request not read on a pass keeps its
     moment, the wait does not restart), so a finding can be late, never early. The pass draws at most half of the call budget left
     (at least one reading when the budget allows two), the rest is for verifying the findings. The read order is in memory only. A clock that goes backwards makes now - start negative: nothing is raised until it catches up."""
-    state.s5, state.s5_unchecked = {}, 0
+    state.s5, state.s5_unchecked, state.s5_oldest = {}, 0, 0
     if engine.state_dir is not None and not state.ready_loaded:
         state.ready_loaded = True
         for key, row in list(_read_small(engine.state_dir, SWEEP_READY_FILE).items())[:2000]:
@@ -13942,6 +13945,7 @@ def sweep_ready_pass(engine, state, decisions, home, now, cfg, decisions_whole=T
     for _, key, held, d in todo:
         if reads >= SWEEP_READY_READS or (budget is not None and budget[0] < SWEEP_READY_READ_COST) \
                 or engine.now() - state.started >= SWEEP_PASS_SECONDS:
+            state.not_checked_since.setdefault(key, now)
             state.s5_unchecked += 1
             continue
         if budget is not None:
@@ -13951,8 +13955,10 @@ def sweep_ready_pass(engine, state, decisions, home, now, cfg, decisions_whole=T
         reads += 1
         opened, head, who, why = sweep_gate_reading(engine, held[0], held[1], now)
         if opened is None:
+            state.not_checked_since.setdefault(key, now)
             state.s5_unchecked += 1
             continue
+        state.not_checked_since.pop(key, None)
         if opened != ["G6"]:
             state.ready.pop(key, None)   # a gate is open: not ready; the wait restarts when it is ready again
             continue
@@ -13961,6 +13967,10 @@ def sweep_ready_pass(engine, state, decisions, home, now, cfg, decisions_whole=T
             row = state.ready[key] = {"head": head, "at": now}
         if now - row["at"] >= cfg["aged_cos_hours"] * 3600:
             state.s5[d.get("id") or key] = (head, row["at"], who)
+    for key in list(state.not_checked_since):
+        if key not in seen:
+            state.not_checked_since.pop(key, None)
+    state.s5_oldest = max([now - t for t in state.not_checked_since.values()] or [0])
     if decisions_whole:   # a partial list cannot say a pull request is no longer held: keep its moment
         for key in [k for k in state.ready if k not in seen]:
             state.ready.pop(key, None)
@@ -14294,7 +14304,7 @@ def sweep_decisions(engine, decisions, now, errors=()):
     state.current = {"enabled": cfg["enabled"], "counts": counts, "total": len(findings),
                      "truncated": sorted(r for r, p in state.repos.items() if p.get("truncated")),
                      "unreadable": sorted(r for r, p in state.repos.items() if p.get("error")), "at": iso(now),
-                     "deferred": deferred, "unchecked": unchecked, "not_checked": state.s5_unchecked,
+                     "deferred": deferred, "unchecked": unchecked, "not_checked": state.s5_unchecked, "not_checked_oldest_seconds": int(max(state.s5_oldest, 0)),
                      "unattributed": getattr(state, "unattributed", 0)}
     sweep_write(engine, state)
     return kept if cfg["enabled"] else decisions
@@ -19107,6 +19117,9 @@ def sweep_status_lines(sweep):
     if sweep.get("unchecked"):
         lines.append("      sweep      %d finding(s) not checked this pass (call budget or a failed read): neither "
                      "raised nor audited" % sweep["unchecked"])
+    if sweep.get("not_checked"):
+        lines.append("      sweep      %d held pull request(s) not checked for S5 (gates unreadable or not reached); oldest %s: never raised"
+                     % (sweep["not_checked"], format_age(sweep.get("not_checked_oldest_seconds") or 0)))
     return lines
 
 
