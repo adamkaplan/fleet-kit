@@ -333,6 +333,9 @@ class TestHostileInput(Base):
     def test_a_missing_module_refuses_while_a_hold_is_named(self):
         copy = self.home / "shimcopy"
         copy.mkdir()
+        for sibling in (REPO / "shims").glob("*.py"):              # the shim as installed: every sibling module, from the real directory
+            if sibling.name != MODULE.name:
+                shutil.copy(str(sibling), str(copy / sibling.name))
         shutil.copy(str(SHIM), str(copy / "gh"))
         done, _ = self.run_gh("pr", "merge", "7", "-R", CFG_REPO, shim=copy / "gh")
         self.assertEqual(done.returncode, 1)

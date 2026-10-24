@@ -73,6 +73,8 @@ def _fleet_parts(after=False):
 _fleet_parts()
 import argparse
 import base64
+import html
+import unicodedata
 import http.client
 import urllib.parse
 from contextlib import contextmanager
@@ -82,6 +84,7 @@ import ast
 import copy
 import errno
 import fcntl
+import functools
 import getpass
 import gzip
 import hashlib
@@ -17052,6 +17055,128 @@ class LedgerCommandError(Exception):
     """A `prove`, `verdict` or `gates` command that cannot go on (exit 2): a usage problem, said in one line."""
 
 
+# ---- #1049: what a recording command (`prove`, `verdict`, `review record`) always ends with. One final line: `recorded #<id> ...`, `already recorded #<id> ...`
+# or `not recorded: <reason>`; the exit status is non-zero unless it recorded (or found it already recorded). Every wait of the command is bounded by the ONE
+# constant `plan_ledger.RECORD_WAIT_SECONDS` (the ledger lock, each GitHub read, the agent registry): a command that is cut says what it waited for and the
+# read-only command that shows whether the record landed. The set of recording commands is the set of functions marked by `@recording(...)`.
+
+class RecordTimeout(BaseException):
+    """The recording command's own bound passed. A BaseException on purpose: no `except Exception` on the way (a best-effort read) can swallow it."""
+
+    def __init__(self, step):
+        super().__init__(step)
+        self.step = step
+
+
+RECORD_ERRORS_USAGE = (LedgerCommandError, PlanInputError, plan_ledger.LedgerError)   # exit 2, as `dispatch` maps a ledger command's own errors
+
+
+def record_errors_failed():
+    """Exit 1, as `dispatch` maps them (looked up when needed: some are defined further down the file)."""
+    return (V2Error, HerdrError, ConfigError, FaultError, FactError, CallerError, LockError, LaunchError, IntentError, InstallError)
+
+
+_record_step = ["starting"]
+
+
+def record_step(name):
+    """Say what the recording command waits for now (the alarm names it when it says it is still waiting, or gives up)."""
+    _record_step[0] = name
+
+
+def not_recorded_timeout(pr, step):
+    """The one line of a cut command: names the bound, what it waited for and the read-only command that shows whether it landed."""
+    return ("not recorded: timed out after %ds, check the ledger before retrying (it was waiting for %s): run `fleet-switchboard gates %s`"
+            % (load_plan_ledger().RECORD_WAIT_SECONDS, step, (str(pr) if re.fullmatch(r"[\w./:#@-]+", str(pr)) else shlex.quote(str(pr)))))
+
+
+def recorded_line(label, pr, head, outcomes):
+    """The final success line from [(stored entry, already)]: `recorded #3, #4 (...)`, `already recorded #3 (...)` or both."""
+    fresh = ["#%d" % e["seq"] for e, already in outcomes if not already]
+    older = ["#%d" % e["seq"] for e, already in outcomes if already]
+    said = "; ".join(x for x in ("recorded " + ", ".join(fresh) if fresh else "", "already recorded " + ", ".join(older) if older else "") if x)
+    return "%s (%s %s at %s)" % (said, label, pr, (head or "")[:8])
+
+
+def run_recording(fn, a, kw, args):
+    """Run the recording command `fn` under its bound. A refusal ends `not recorded: <reason>` (exit 2, or 1 for an environment error); the
+    bound ends `not recorded: timed out after Ns, check the ledger before retrying ...` (exit 1) and the alarm is held back while an entry is
+    written, so a command is never cut after its record landed."""
+    ledger = load_plan_ledger()   # the module itself: the lazy `plan_ledger` name would take an assignment onto itself
+    pr = getattr(args, "pr", None) or "<pr>"
+    wait, progress = ledger.RECORD_WAIT_SECONDS, ledger.RECORD_PROGRESS_SECONDS
+    armed = threading.current_thread() is threading.main_thread() and hasattr(signal, "setitimer")
+    said = [False]
+    before_hook, before_handler = ledger.step_hook, None
+
+    def on_alarm(signum, frame):
+        if ledger.IN_CRITICAL:
+            return
+        step = _record_step[0]
+        if not said[0] and wait > progress:
+            said[0] = True
+            if step != ledger.LOCK_STEP:   # the lock's own wait says it already
+                sys.stderr.write("%s: waiting for %s (giving up after %ds)\n" % (PROG, step, wait))
+                sys.stderr.flush()
+            signal.setitimer(signal.ITIMER_REAL, wait - progress)
+            return
+        raise RecordTimeout(step)
+
+    record_step("starting")
+    ledger.step_hook = record_step
+    try:
+        if armed:
+            before_handler = signal.signal(signal.SIGALRM, on_alarm)
+            signal.setitimer(signal.ITIMER_REAL, progress if wait > progress else wait)
+        try:
+            return fn(*a, **kw)
+        finally:
+            if armed:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+    except RecordTimeout as cut:
+        sys.stderr.write(not_recorded_timeout(pr, cut.step) + "\n")
+        return EXIT_ERROR
+    except ledger.LedgerLockTimeout:
+        sys.stderr.write(not_recorded_timeout(pr, ledger.LOCK_STEP) + "\n")
+        return EXIT_ERROR
+    except RECORD_ERRORS_USAGE as err:
+        sys.stderr.write("not recorded: %s\n" % _one_line(str(err), 400))
+        return EXIT_USAGE
+    except record_errors_failed() as err:
+        sys.stderr.write("not recorded: %s\n" % _one_line(str(err), 400))
+        return EXIT_ERROR
+    finally:
+        ledger.step_hook = before_hook
+        if armed and before_handler is not None:
+            signal.signal(signal.SIGALRM, before_handler)
+
+
+def recording(kind, applies=None):
+    """Mark a command function as a recording command of `kind` (`proof`, `verdict`, `review_record`), run under `run_recording`. `applies(args)`
+    says which of its forms record (`review` records only for `review record`). Marked functions are the ONE list: `RECORDING_COMMANDS` is read from them."""
+    def mark(fn):
+        @functools.wraps(fn)
+        def run(*a, **kw):
+            args = a[0] if a else kw.get("args")
+            if applies is not None and not applies(args):
+                return fn(*a, **kw)
+            return run_recording(fn, a, kw, args)
+        run.records = kind
+        return run
+    return mark
+
+
+def is_review_record(args):
+    """`review record` (the only form of `review` that writes)."""
+    return args.review_cmd == "record"
+
+
+def recording_commands():
+    """{command name: kind} of every function marked `@recording`, read from this module (never a list to edit)."""
+    return {name[4:].replace("_", "-"): fn.records for name, fn in sorted(globals().items())
+            if name.startswith("cmd_") and callable(fn) and isinstance(getattr(fn, "records", None), str)}
+
+
 def pr_picture(engine, repo, number, state):
     """(facts, body, notice senders) of a PR, best effort: ({}, "", []) with a reason string when it cannot be read."""
     try:
@@ -17093,8 +17218,11 @@ def plan_source_for(explicit, entries, pr, body, default_repo=None):
     return source or explicit
 
 
-def checked_plan(engine_config, source, ask, runner, now):
-    """The plan at `source`, checked: {"result", "defects", "scenarios_parsed", "plan_hash", "source"}."""
+def checked_plan(engine_config, source, ask, runner, now, text=None, done_when=None):
+    """The plan at `source`, checked: {"result", "defects", "scenarios_parsed", "plan_hash", "source"}. With `text` (a plan already read) nothing is read again."""
+    if text is not None:
+        parsed = plan_check.parse_scenarios(plan_check.scenario_block(text))
+        return dict(plan_check.check(text, done_when, None), scenarios_parsed=parsed, source="plan comment of %s" % source, text=text)
     ns = types.SimpleNamespace(source=source, file=None, ask=ask, done_when=None)
     text, label, result = load_plan(ns, runner, now)
     parsed = plan_check.parse_scenarios(plan_check.scenario_block(text))
@@ -17109,24 +17237,98 @@ def _ledger_pr(args):
     return repo, number, "%s#%d" % (repo, number)
 
 
+def ask_refusal(issue, ref):
+    """#1130: why an issue is no ASK that may take a verdict (None when it is one). An ask is OPEN, carries `## Intent` and `Done when:`, is no charter (the
+    `<user>:orchestrator` label, as `item_chain` readers and the charter scan recognise one) and is a sub-issue of a charter (it has a parent)."""
+    if str(issue.get("state") or "").lower() == "closed":
+        return "%s is an issue, not a pull request, and it is closed: a closed issue takes no record" % ref
+    intent, done_when = parse_intent(issue.get("body"))
+    if not intent or not done_when:
+        return "%s is an issue, not a pull request, and has no `## Intent` with a `Done when:` line: it is not an ask" % ref
+    if any(str(l).endswith(":orchestrator") for l in issue.get("labels") or ()):
+        return "%s is an issue, not a pull request, and a charter (it carries the orchestrator label), not an ask" % ref
+    if not issue.get("parent"):
+        return "%s is an issue, not a pull request, and has no parent issue: a charter, not an ask (an ask is a sub-issue of a charter)" % ref
+    return None
+
+
+def ask_plan_comment(engine, repo, number):
+    """The newest plan comment (a heading `Plan (scenarios)`) of the issue `repo#number`, or None. GETs only; a page that cannot be read is no plan."""
+    comments = []
+    try:
+        for page in range(1, PLAN_COMMENT_PAGES + 1):
+            got = engine.intents._api("repos/%s/issues/%d/comments?per_page=100&page=%d" % (repo, number, page), repo)
+            if not isinstance(got, list):
+                break
+            comments.extend(got)
+            if len(got) < 100:
+                break
+    except (IntentError, AttributeError):
+        return None
+    text, source = plan_check.select_plan_text("", comments)
+    return text if source != "issue body" else None
+
+
+def ask_subject(engine, repo, number, entries, unreadable, explicit, runner, now, writable):
+    """#1130: `verdict`, `prove` and `gates` on an ASK ISSUE (an issue that is no pull request and no work item). None when the number is not such an
+    issue (the pull request rules then apply exactly as before). Else {"facts", "plan", "plan_problem"}: the plan is the plan comment on the issue, and the
+    "head" of the subject is the plan hash (`plan_ledger.ask_head`), so a record names the issue and the hash, and a revised plan voids it as a moved head does.
+    An issue with no plan comment is refused (LedgerCommandError) with its reason: a record would bind to nothing."""
+    ref = "%s#%d" % (repo, number)
+    try:
+        issue = item_issue(engine, repo, number)
+    except LedgerCommandError:
+        return None
+    if explicit:
+        try:
+            named = parse_plan_source(explicit, repo)[:2]
+        except PlanInputError:
+            named = None
+        if named != (repo, number):
+            raise LedgerCommandError("--plan %s is not the plan of %s: an ask issue is bound to the plan comment on the issue itself" % (explicit, ref))
+    why = ask_refusal(issue, ref)
+    if why:
+        raise LedgerCommandError("refused: %s, nothing was recorded" % why)
+    comment = ask_plan_comment(engine, repo, number)   # read ONCE: the same read serves the check here and the hash below
+    if comment is None:
+        if not writable:
+            return {"facts": {"author": issue["author"], "ask_issue": True}, "plan": None,
+                    "plan_problem": "%s is an issue with no plan comment: there is nothing to bind a record to" % ref}
+        raise LedgerCommandError("refused: %s is an issue, not a pull request, and it has no plan comment: a record would bind to nothing, nothing was recorded" % ref)
+    plan, problem = None, None
+    try:
+        plan = checked_plan({}, ref, None, runner, now, text=comment, done_when=parse_intent(issue["body"])[1])
+    except (PlanInputError, ValueError, ConfigError, IntentError) as err:
+        problem = _one_line(str(err), 200)
+    facts = {"author": issue["author"], "ask_issue": True, "notice_senders": [], "body": issue["body"], "state": issue["state"],
+             "head": plan_ledger.ask_head(plan["plan_hash"]) if plan else None}
+    return {"facts": facts, "plan": plan, "plan_problem": problem}
+
+
 def _ledger_context(args, runner, now, writable, parts=None, floor=False):
     """Everything `prove`, `verdict` and `gates` share: the engine, state, PR ref, its picture and its checked plan. `parts` is
     (engine, state, config) when the caller already has them (the daemon's pass); else the engine is built."""
     engine, state, config = parts if parts is not None else build_engine(runner, now, "cli", writable=writable)
     repo, number, pr = _ledger_pr(args)
     entries, problem = plan_ledger.read_ledger(state)
+    record_step("a GitHub read of %s" % pr)
     facts, body, senders, unreadable = pr_picture(engine, repo, number, state)
     if writable:   # #770: an item's entries are written only by the item commands
-        why = item_entry_refusal(engine, repo, number, entries, unreadable)
+        why = item_entry_refusal(engine, repo, number, entries, unreadable, True)
         if why:
             _gates_audit(engine, "plan.item.refused", pr, {"item": pr, "why": why, "stage": "pull request command"})
             raise LedgerCommandError("refused: %s" % why)
+    ask = ask_subject(engine, repo, number, entries, unreadable, args.plan, runner, now, writable) if unreadable else None   # #1130: the ONE place a subject that is an issue is resolved
+    if ask is not None:
+        return types.SimpleNamespace(engine=engine, state=state, config=config, repo=repo, number=number, pr=pr, entries=entries, problem=problem,
+                                     facts=ask["facts"], unreadable=None, source=pr, plan=ask["plan"], plan_problem=ask["plan_problem"], ask_issue=True)
     facts = dict(facts or {}, body=body, notice_senders=senders, held_check=lambda: held_defects(body))
     if floor and facts.get("head"):
         facts["floor"] = gate_floor_fact(engine, state, repo, number, facts["head"])
     source = plan_source_for(args.plan, entries, pr, body, config.get("intent_repo"))
     plan, plan_problem = None, None
     if source:
+        record_step("a GitHub read of the plan %s" % source)
         try:
             plan = checked_plan(config, source, args.ask, runner, now)
         except (PlanInputError, ValueError, ConfigError, IntentError) as err:
@@ -17208,6 +17410,8 @@ def _scenario_of(ctx, sid):
 
 def _head_of(ctx, args):
     known = (ctx.facts or {}).get("head")
+    if getattr(ctx, "ask_issue", False) and not known:
+        raise LedgerCommandError("the plan hash of %s is unknown: nothing was recorded" % ctx.pr)
     head = args.head or known
     if known and args.head and not (known.startswith(args.head) or args.head.startswith(known)):
         raise LedgerCommandError("--head %s is not the PR's head (%s): nothing was recorded" % (args.head[:12], known[:12]))
@@ -17217,12 +17421,13 @@ def _head_of(ctx, args):
 
 
 def _record(ctx, args, now, entry):
-    stored = plan_ledger.append_entry(ctx.state, entry, now())
-    if ctx.engine.audit is not None:
+    """(stored entry, already): the entry written, or the identical one already there (nothing written, no audit line: #1049)."""
+    (stored, already), = plan_ledger.append_once(ctx.state, [entry], now())
+    if not already and ctx.engine.audit is not None:
         ctx.engine.audit.append(ctx.engine.actor, "plan.%s" % entry["kind"], ctx.pr,
                                 {"scenario": entry["scenario"], "result": entry["result"], "seq": stored["seq"], "by": entry["by"],
                                  "chain": stored["hash"]})
-    return stored
+    return stored, already
 
 
 def _evidence(args):
@@ -17239,16 +17444,19 @@ def _already_proven(ctx, sid, plan_hash, head, result):
     return fresh[-1] if fresh and fresh[-1].get("result") == result else None
 
 
+@recording("proof")
 def cmd_prove(args, runner, now):
     """`prove <scenario>... --pr <repo#N> --evidence ...`: the calling agent records what it ran and saw for each named scenario of
     the PR's plan, at the PR's head, bound to the plan's hash. It records a PROOF; it never records a verdict. Each scenario gets one
     line: recorded (stdout), or already recorded at this head and plan hash (stdout, counts as recorded), or refused with its
-    reason (stderr). Exit 0 when every named scenario is recorded; EXIT_PARTIAL when any was refused. What applies to the whole
+    reason (stderr), then ONE final line (#1049): `recorded #<id> ...`, `already recorded #<id> ...` or, when any was refused, `not recorded: ...`.
+    Exit 0 when every named scenario is recorded; EXIT_PARTIAL when any was refused. What applies to the whole
     command (no plan, a failing plan check, no caller, no evidence, an unknown head) stays a usage error: nothing is recorded."""
     ctx = _ledger_context(args, runner, now, True)
+    record_step("the agent registry (who is calling)")
     caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
     _plan_usable(ctx)
-    refused, common = 0, None
+    refused, common, outcomes = 0, None, []
     for sid in dict.fromkeys(args.scenario):
         try:
             _scenario_of(ctx, sid)
@@ -17260,18 +17468,24 @@ def cmd_prove(args, runner, now):
             head = _head_of(ctx, args)
             common = (head, _evidence(args))
         head, evidence = common
-        found = _already_proven(ctx, sid, ctx.plan["plan_hash"], head, args.result)
-        if found:
-            print("already recorded proof #%d: %s %s at %s (%s), bound to plan %s" % (found["seq"], sid, args.result, head[:8], ctx.pr,
-                                                                                  ctx.plan["plan_hash"][:19]))
-            continue
         entry = {"kind": "proof", "pr": ctx.pr, "scenario": sid, "plan_ref": ctx.source,
                  "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
                  "evidence": evidence, "command": plan_ledger.clip(redact_command_text(args.command or "")),
+                 **({"files": sorted(set(args.file))} if getattr(args, "file", None) else {}),
                  "env": "%s %s" % (sys.platform, "python%d.%d" % sys.version_info[:2])}
-        stored = _record(ctx, args, now, entry)
-        print("recorded proof #%d: %s %s at %s (%s), bound to plan %s" % (stored["seq"], sid, args.result,
-                                                                          head[:8], ctx.pr, entry["plan_hash"][:19]))
+        try:
+            stored, already = _record(ctx, args, now, entry)
+        except plan_ledger.LedgerRefused as err:
+            print("not recorded: %s: %s" % (sid, err), file=sys.stderr)
+            refused += 1
+            continue
+        outcomes.append((stored, already))
+        print("%s proof #%d: %s %s at %s (%s), bound to plan %s" % ("already recorded" if already else "recorded", stored["seq"], sid, args.result,
+                                                                    head[:8], ctx.pr, entry["plan_hash"][:19]))
+    if outcomes:
+        print(recorded_line("proof", ctx.pr, common[0], outcomes))
+    if refused:
+        print("not recorded: %d of %d scenarios refused (the reasons are above)" % (refused, len(set(args.scenario))), file=sys.stderr)
     return EXIT_PARTIAL if refused else EXIT_OK
 
 
@@ -17296,9 +17510,11 @@ def launched_testers_for(ctx):
     return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions, fleets
 
 
+@recording("verdict")
 def cmd_verdict(args, runner, now):
     """`verdict <scenario> --pr <repo#N> --as <evaluator> --result ...`: record the evaluator's verdict for a scenario. Only
-    the evaluator the scenario names, only by an agent registered for it (`plan_evaluators`), never by a writer of the PR."""
+    the evaluator the scenario names, only by an agent registered for it (`plan_evaluators`), never by a writer of the PR.
+    It ends with one line (#1049): `recorded #<id> ...`, `already recorded #<id> ...` (the same record again writes nothing) or `not recorded: <reason>`."""
     ctx = _ledger_context(args, runner, now, True)
     every = bool(getattr(args, "all_scenarios", False))
     if every:   # `--all`: every per-PR scenario this evaluator judges, in one command; never another evaluator's
@@ -17322,21 +17538,26 @@ def cmd_verdict(args, runner, now):
     if named == "owner":
         # The owner's verdict comes only from the owner's own terminal: a caller with NO agent session. An agent (even an
         # unregistered one, even the chief of staff) is refused; so is an uncertain identity.
+        record_step("the agent registry (who is calling)")
         got = gates_caller_kind(runner, now)
         caller, ok = "owner", got[0] == "person"
         why = None if ok else "only the owner, from the owner's own terminal (no agent session), may record `owner` verdicts; %s is %s" % (
             got[1], "an agent" if got[0] == "agent" else "not known")
     else:
+        record_step("the agent registry (who is calling)")
         caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
-        if not plan_ledger.known_writers(ctx.entries, ctx.pr, senders):
+        if not plan_ledger.known_writers(ctx.entries, ctx.pr, list(senders) + [ctx.facts.get("author")] * bool(getattr(ctx, "ask_issue", False))):
             raise LedgerCommandError("refused: no writer of %s is known to the switchboard (nobody has recorded a proof or sent its "
                                      "`notice pr`): its author must do that first, so the author can be excluded" % ctx.pr)
         allowed, launch, sessions, fleets = ctx.config.get("plan_evaluators"), {}, {}, {}
         authors = plan_ledger.authors_of(ctx.entries, ctx.pr, senders, ctx.facts.get("author"))
         if named == "tester":   # #372: the configured list UNION the testers the launch record names for this repo; any trouble reading it is the configured list alone
+            record_step("the agent registry (the launched testers)")
             launch, sessions, fleets = launched_testers_for(ctx)
             allowed = load_launch_testers().evaluators(allowed, launch)
         ok, why = plan_ledger.may_record_verdict(named, caller, allowed, authors)
+        if getattr(ctx, "ask_issue", False) and caller and caller == ctx.facts.get("author"):   # #1130: the author of the ask may not judge it, as a PR's author may not
+            ok, why = False, "%s is the author of the ask %s: the author of an ask cannot record a verdict on it (`prove` is the author's step)" % (caller, ctx.pr)
         if ok and named == "tester" and caller in launch:
             why = load_launch_testers().lane_refusal(caller, launch, authors, sessions, fleets)
             ok = why is None
@@ -17355,12 +17576,18 @@ def cmd_verdict(args, runner, now):
             raise LedgerCommandError("refused: %s: %s; nothing was recorded" % (target["id"], problem))
     entries = [{"kind": "verdict", "pr": ctx.pr, "scenario": target["id"], "plan_ref": ctx.source,
                 "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
-                "evaluator": named, "evidence": evidence} for target in targets]
+                "evaluator": named, "evidence": evidence, **({"files": sorted(set(args.file))} if getattr(args, "file", None) else {})} for target in targets]
     try:
-        stored = plan_ledger.append_many(ctx.state, entries, now())   # all of them or none
+        done = plan_ledger.append_once(ctx.state, entries, now())   # all of the new ones or none; one already there is not written again
+    except plan_ledger.LedgerLockTimeout:
+        raise
     except plan_ledger.LedgerError as err:
         raise LedgerCommandError("%s" % err) from None
-    for entry, one in zip(entries, stored):
+    for entry, (one, already) in zip(entries, done):
+        if already:
+            print("already recorded %s verdict #%d: %s %s at %s (%s), bound to plan %s" % (named, one["seq"], entry["scenario"], args.result,
+                                                                                         head[:8], ctx.pr, entry["plan_hash"][:19]))
+            continue
         if ctx.engine.audit is not None:
             detail = {"scenario": entry["scenario"], "result": entry["result"], "seq": one["seq"], "by": entry["by"], "chain": one["hash"]}
             if named == "tester" and caller in launch and load_launch_testers().source_of(caller, ctx.config.get("plan_evaluators"), launch) == "launch record":
@@ -17368,6 +17595,7 @@ def cmd_verdict(args, runner, now):
             ctx.engine.audit.append(ctx.engine.actor, "plan.verdict", ctx.pr, detail)
         print("recorded %s verdict #%d: %s %s at %s (%s), bound to plan %s" % (named, one["seq"], entry["scenario"], args.result,
                                                                              head[:8], ctx.pr, entry["plan_hash"][:19]))
+    print(recorded_line("%s verdict" % named, ctx.pr, head, done))
     return EXIT_OK
 
 
@@ -17525,6 +17753,9 @@ def cmd_gates(args, runner, now):
         return cmd_gates_preflight(args, runner, now)
     if args.pr == "stats":
         return cmd_gates_stats(args, runner, now)
+    if args.pr == "ask-close":   # #1130: the closing rule of a report-only ask
+        args.pr = args.rest[0] if args.rest else ""
+        return cmd_gates_ask_close(args, runner, now)
     ctx = _ledger_context(args, runner, now, False, floor=True)
     plan = ctx.plan
     report = plan_ledger.evaluate_gates(plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr,
@@ -17554,6 +17785,8 @@ def cmd_gates(args, runner, now):
             lines.append("PR not read: %s" % ctx.unreadable)
         if ctx.plan_problem:
             lines.append("plan not read: %s" % ctx.plan_problem)
+        if isinstance(ctx.facts, dict) and ctx.facts.get("review") == "changes requested" and not ctx.unreadable:
+            lines.extend(blocking_review_lines(ctx.engine, runner, now, ctx.repo, ctx.number, ctx.pr, ctx.facts.get("head")))   # #1123: GitHub's decision blocks the merge; say who and how to clear it
         note = rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head")) if isinstance(ctx.facts, dict) else None
         if note:
             lines.append("rating: %s" % note)
@@ -17565,6 +17798,29 @@ def cmd_gates(args, runner, now):
         return EXIT_USAGE
     ok = report["ready"] if getattr(args, "all_gates", False) else report["ready_enforced"]   # --all: the full board
     return EXIT_OK if ok else EXIT_ERROR
+
+
+def cmd_gates_ask_close(args, runner, now):
+    """`gates ask-close <owner/repo#N>`: the closing rule of a report-only ask (#1130): the ask may close when EVERY scenario of its plan comment is proven and
+    judged at the current plan hash. Exit 0 names the scenarios recorded; exit 1 refuses and names each unjudged scenario. Reads only: it closes nothing."""
+    ctx = _ledger_context(args, runner, now, False)
+    if not getattr(ctx, "ask_issue", False):
+        raise LedgerCommandError("%s is not an ask issue: the closing rule of a report-only ask applies to an issue with a plan comment" % ctx.pr)
+    if ctx.plan is None or ctx.plan["result"] != "pass":
+        raise LedgerCommandError("cannot close %s: %s" % (ctx.pr, ctx.plan_problem or "its plan fails `plan check`"))
+    head = ctx.facts.get("head")
+    authors = plan_ledger.authors_of(ctx.entries, ctx.pr, (), ctx.facts.get("author"))
+    rows = [plan_ledger.scenario_state(x, ctx.entries, ctx.pr, ctx.plan["plan_hash"], head, authors) for x in ctx.plan["scenarios_parsed"]]
+    open_rows = [r for r in rows if r["status"] != "ok"]
+    if open_rows:
+        for r in open_rows:
+            print("not judged: %s: %s" % (r["id"], "; ".join(r["missing"] + r["void"])), file=sys.stderr)
+        print("refused: %s stays open: %d of %d scenarios are not proven and judged at plan %s" % (ctx.pr, len(open_rows), len(rows), ctx.plan["plan_hash"][:19]),
+              file=sys.stderr)
+        return EXIT_ERROR
+    print("%s may close: %d of %d scenarios proven and judged at plan %s: %s" % (ctx.pr, len(rows), len(rows), ctx.plan["plan_hash"][:19],
+                                                                          ", ".join(r["id"] for r in rows)))
+    return EXIT_OK
 
 
 cmd_gates.ledger = True   # state and GETs only; its own errors are usage errors
@@ -17596,8 +17852,9 @@ def item_issue(engine, repo, number):
     if data.get("pull_request"):
         raise LedgerCommandError("%s#%d is a pull request: use --pr (the pull request rules apply to it, not the work item rules)" % (repo, number))
     user = data.get("user") if isinstance(data.get("user"), dict) else {}
+    labels = [l.get("name") if isinstance(l, dict) else l for l in (data.get("labels") if isinstance(data.get("labels"), list) else [])]
     return {"author": user.get("login") if isinstance(user.get("login"), str) else None, "body": data.get("body") if isinstance(data.get("body"), str) else "",
-            "state": data.get("state"), "parent": parent_of(data)}
+            "state": data.get("state"), "parent": parent_of(data), "labels": [l for l in labels if isinstance(l, str)]}
 
 
 def item_chain(engine, repo, number, parent, limit=4):
@@ -17665,14 +17922,14 @@ def item_agents(ctx):
     return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions, fleets
 
 
-def item_entry_refusal(engine, repo, number, entries, unreadable):
+def item_entry_refusal(engine, repo, number, entries, unreadable, allow_ask=False):
     """Why the ORDINARY pull request commands (prove, verdict, gates ci-record, waive) must not write for `repo#number`, or None. They refuse a number that is an ISSUE (the pull request
     could not be read and GitHub says it is an issue) and a number that has an item registration: an item's entries are written only by item-prove, item-verdict and item-ci-record.
     A real pull request is never affected (it is read, and has no registration)."""
     ref = "%s#%d" % (repo, number)
     if load_module("item_verdicts").registrations(entries, ref):
         return "%s is a work item (a tester is registered for it): its proofs and verdicts are written only by item-prove, item-verdict and gates item-ci-record" % ref
-    if unreadable:
+    if unreadable and not allow_ask:
         try:
             item_issue(engine, repo, number)
         except LedgerCommandError:
@@ -19054,6 +19311,49 @@ def cmd_gates_stats(args, runner, now):
     return EXIT_OK
 
 
+def carry_head_facts(get, repo, old_head, new_head):
+    """#1129: what the carry decision reads of GitHub, through `get(path)` (a GET that raises on failure): {"files": names changed between the two heads, "merge_of_default": bool,
+    "ci_green": bool}. The new head is a merge of the default branch when it has two parents and the second is already in the default branch. Any read that fails raises: no carry."""
+    compared = get("repos/%s/compare/%s...%s" % (repo, old_head, new_head))
+    files = [f["filename"] for f in (compared.get("files") or []) if isinstance(f, dict) and isinstance(f.get("filename"), str)]
+    commit = get("repos/%s/commits/%s" % (repo, new_head))
+    parents = [p.get("sha") for p in (commit.get("parents") or []) if isinstance(p, dict)]
+    merge = False
+    if len(parents) == 2:
+        default = get("repos/%s" % repo).get("default_branch")
+        inside = get("repos/%s/compare/%s...%s" % (repo, default, parents[1]))
+        merge = isinstance(inside, dict) and inside.get("status") in ("behind", "identical")
+    runs = (get("repos/%s/commits/%s/check-runs" % (repo, new_head)) or {}).get("check_runs") or []
+    green = bool(runs) and all(r.get("status") == "completed" and r.get("conclusion") in ("success", "neutral", "skipped") for r in runs)
+    return {"files": files, "merge_of_default": merge, "ci_green": green}
+
+
+def carry_proofs(state, pr, plan, old_head, new_head, facts, now):
+    """#1129: decide, for each proof and verdict of `pr` that holds at `old_head`, whether it carries to `new_head`, and write ONE `carried` line for each that does.
+    `facts` is `carry_head_facts`. Returns [{"proof": seq, "scenario", "verdict", "reason"}] (one per row decided); a "void" verdict writes nothing (the head moved, the row is
+    void as always). The original rows are never touched. A carry of the same proof to the same head is written once."""
+    entries, problem = plan_ledger.read_ledger(state)
+    if problem:
+        raise LedgerCommandError("the ledger is not trustworthy, nothing was carried: %s" % problem)
+    evaluators = {x["id"]: plan_ledger.evaluator_of(x) for x in plan["scenarios_parsed"]}
+    holding = plan_ledger.carried_seqs(entries, pr, old_head)
+    done = plan_ledger.carried_seqs(entries, pr, new_head)
+    out = []
+    for row in entries:
+        if row.get("pr") != pr or row.get("kind") not in ("proof", "verdict") or row.get("result") != "pass" or row.get("plan_hash") != plan["plan_hash"]:
+            continue
+        if row.get("head") != old_head and row["seq"] not in holding:
+            continue
+        sid = row.get("scenario")
+        if row["seq"] in done:
+            continue
+        verdict, reason = plan_ledger.carry_decision(row, evaluators.get(sid), facts["files"], facts["merge_of_default"], facts["ci_green"])
+        if verdict == "carry":
+            plan_ledger.append_entry(state, plan_ledger.carry_line(row, sid, old_head, new_head, facts["merge_of_default"], pr), now)
+        out.append({"proof": row["seq"], "scenario": sid, "verdict": verdict, "reason": reason})
+    return out
+
+
 def gates_carried_note(report, ctx):
     """The gate row of a PR whose owner's clear CARRIED to its current head says so (G6 `carried from <head>`), and the report gains `carried`. Reads the local state file only."""
     try:
@@ -20051,6 +20351,7 @@ def add_ledger_parsers(sub):
     prove.add_argument("--evidence", required=True, help="A link, or what you ran and saw")
     prove.add_argument("--result", choices=("pass", "fail"), default="pass")
     prove.add_argument("--command", help="The command you ran, if any")
+    prove.add_argument("--file", action="append", default=None, help="A file the proof names (repeatable); a proof that names no file is never carried to a new head")
     verdict = sub.add_parser("verdict", help="Record an evaluator's verdict for a scenario (only the evaluator the "
                                              "scenario names, never a writer of the PR)")
     common(verdict)
@@ -20062,6 +20363,7 @@ def add_ledger_parsers(sub):
     verdict.add_argument("--as", dest="evaluator", required=True, choices=("ci", "tester", "reviewer", "owner"))
     verdict.add_argument("--result", choices=("pass", "fail"), required=True)
     verdict.add_argument("--evidence", required=True, help="A link, or the evaluator's own artefact")
+    verdict.add_argument("--file", action="append", default=None, help="A file the verdict names (repeatable); a verdict that names no file is never carried to a new head")
     # #770: a work item with no pull request has its own commands (the pull request commands above keep their exact surface)
     iprove = sub.add_parser("item-prove", help="Record proof for a plan scenario of a work item that has no pull request, at its reference commit")
     iverdict = sub.add_parser("item-verdict", help="A tester registered for a work item (by its orchestrator's launch) records its verdict, at the item's reference commit")
@@ -20422,15 +20724,288 @@ def record_inputs(raw_argv):
     return _private_parse(raw_argv, DECISION_INPUTS, CARRY_FLAG_INPUTS)
 
 
+# ---------------------------------------------------------------- `review post` and `review dismiss` (#1123)
+# The marker a reader's review ends with is written by ONE function, `fleet_mark` (the writer `comment` and `handoff` use too): there is no second one here.
+
+REVIEW_POST_VERDICTS = {"approve": ("APPROVE", "APPROVE"), "request-changes": ("CHANGES REQUESTED", "REQUEST_CHANGES"), "comment": ("COMMENT", "COMMENT")}   # verdict -> (the word in the body's first line, the Reviews API event)
+REVIEW_POST_ROLES = ("reader", "reviewer")   # the registered roles that may post and dismiss a review
+REVIEW_OWN_REFUSAL = re.compile(r"(?i)own pull request|can not approve|can not request changes|cannot approve|cannot request changes")
+REVIEW_DISMISS_STATES = ("CHANGES_REQUESTED",)
+
+
+def review_head_problem(given, current):
+    """None when `given` is the PR's current head, else the refusal (naming both in full)."""
+    if given != current:
+        return "the head given (%s) is not the PR's current head (%s): a review belongs to the head it judged (nothing was posted)" % (given, current)
+    return None
+
+
+def review_post_path(repo, number):
+    """The Reviews API's endpoint: the one a review is posted to (never the issue comments')."""
+    return "repos/%s/pulls/%d/reviews" % (repo, number)
+
+
+def review_is_own(review, name):
+    """True when the review carries the caller's own marker: the reader's identity that posted it (all agents share one login)."""
+    return signed_by_fleet(review.get("body")) == name
+
+
+def review_dismiss_audit(engine, ref, name, review_id, head, reason, withdrawn):
+    """The audit line of a dismissal: who, which review, which head, why."""
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "review.dismiss", ref, {"who": name, "review": review_id, "head": head[:12], "why": plan_ledger.clip(reason, 200), "withdrawn": bool(withdrawn)})
+
+
+def _review_caller(runner, now):
+    """The registered name of the caller of a review command; raises ReviewError for a caller with no registered reader or reviewer role."""
+    kind = gates_caller_kind(runner, now)
+    if kind[0] == "unknown":
+        raise ReviewError("refused: %s" % kind[1])
+    role = kind[2] if kind[0] == "agent" and len(kind) > 2 else None
+    if kind[0] != "agent" or role not in REVIEW_POST_ROLES or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", kind[1] or ""):
+        raise ReviewError("refused: the caller has no registered %s role (%s): only a registered reader posts or dismisses a review (nothing was done)" % (
+            " or ".join(REVIEW_POST_ROLES), kind[1] if kind[0] != "agent" else "role %s" % (role or "none")))
+    return kind[1]
+
+
+def _review_api(engine, runner, now, repo, path, method=None, payload=None):
+    """(ok, parsed or None, one-line detail) of ONE `gh api` call with the repository's own account (a GET unless `method`)."""
+    config = engine.config
+    reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
+    if method is None:
+        try:
+            return True, reader._api(path, repo), ""
+        except IntentError as err:
+            return False, None, _one_line(str(err), 200)
+    env = reader.env_for(repo)
+    try:
+        done = runner([config["gh"], "api", path, "--method", method, "--input", "-"], input=json.dumps(payload), capture_output=True, text=True,
+                      timeout=reader.timeout, **({"env": env} if env is not None else {}))
+    except (OSError, subprocess.SubprocessError) as err:
+        return False, None, _one_line(str(err), 200)
+    if done.returncode != 0:
+        return False, None, reader.accounts.scrub(_one_line(done.stderr or done.stdout or "", 200)) or "exit %d" % done.returncode
+    try:
+        return True, json.loads(done.stdout or "{}"), ""
+    except ValueError:
+        return False, None, "GitHub answered a success that is not JSON (not trusted): %s" % _one_line(done.stdout or "", 80)
+
+
+REVIEW_PAGE_LIMIT = 50   # pages of 100: a list longer than this is not read whole, and the caller refuses
+
+
+def _review_pages(engine, runner, now, repo, path):
+    """(ok, all items, one-line detail) of a Reviews-API list read page by page to the LAST page (a short page ends it); a failed page, a page that is not a list, or more than REVIEW_PAGE_LIMIT pages fails the whole read."""
+    items = []
+    for page in range(1, REVIEW_PAGE_LIMIT + 1):
+        ok, got, why = _review_api(engine, runner, now, repo, "%s?per_page=100&page=%d" % (path, page))
+        if not ok or not isinstance(got, list):
+            return False, None, why or "page %d is not a list" % page
+        items.extend(got)
+        if len(got) < 100:
+            return True, items, ""
+    return False, None, "more than %d pages" % REVIEW_PAGE_LIMIT
+
+
+def review_refusal_audit(engine, event, ref, name, head, reason, **more):
+    """The audit line of a REFUSED review command (who, which head, the reason); never raises."""
+    try:
+        if engine.audit is not None and name:
+            engine.audit.append(engine.actor, event, ref, dict({"who": name, "head": (head or "")[:12], "reason": plan_ledger.clip(reason, 200)}, **more))
+    except Exception:
+        pass
+
+
+def review_forged_marker(text):
+    """True when `text` holds fleet-switchboard `from=` marker text in ANY form: normalised (HTML entities decoded, NFKC, case folded, every character that is not a letter or digit dropped) so spacing, case, entities, zero-width characters and an HTML comment around it change nothing."""
+    plain = re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKC", html.unescape(html.unescape(text))).casefold())
+    return "fleetswitchboardfrom" in plain
+
+
+def cmd_review_post(args, runner, now):
+    """`review post PR --head SHA --verdict V --body-file FILE`: ONE Reviews-API review, its body `Review of <full head>: <VERDICT>` ... the reader's marker."""
+    seen = {}
+    try:
+        engine, state, config = build_engine(runner, now, "cli", writable=True)
+        seen["engine"] = engine
+        if args.verdict not in REVIEW_POST_VERDICTS:
+            raise ReviewError("--verdict must be one of %s (nothing was posted)" % ", ".join(REVIEW_POST_VERDICTS))
+        if not re.fullmatch(r"[0-9a-f]{40}", args.head or ""):
+            raise ReviewError("--head must be the full 40-character head sha, got %d characters (nothing was posted)" % len(args.head or ""))
+        text = _read_capped(args.body_file, REVIEW_TABLE_MAX).strip()
+        if not text:
+            raise ReviewError("the body file is empty: a review says something (nothing was posted)")
+        if redact_command_text(text) != text:
+            raise ReviewError("the body holds a secret-shaped value (it is not shown): remove it and post again (nothing was posted)")
+        name = _review_caller(runner, now)
+        seen["name"], seen["head"] = name, args.head
+        repo, number, ref, raw = _review_pr(args, engine)
+        seen["ref"] = ref
+        if review_forged_marker(text):
+            raise ReviewError("refused (forged marker): the body holds `fleet-switchboard:from=` marker text; the one marker of a review is appended from the caller's registered identity, so a body never carries one (nothing was posted)")
+        head = raw.get("headRefOid")
+        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise ReviewError("the PR head is unknown: nothing was posted")
+        problem = review_head_problem(args.head, head)
+        if problem:
+            raise ReviewError(problem)
+        word, event = REVIEW_POST_VERDICTS[args.verdict]
+        body = "Review of %s: %s\n\n%s\n\n%s" % (head, word, text, fleet_mark(name))
+        path = review_post_path(repo, number)
+        ok, posted, why = _review_api(engine, runner, now, repo, path, "POST", {"commit_id": head, "body": body, "event": event})
+        notice = ""
+        if not ok and event != "COMMENT" and REVIEW_OWN_REFUSAL.search(why):   # the same account's own pull request: a comment-type review, never an issue comment
+            event, notice = "COMMENT", "GitHub refused %s on this account's own pull request: posted as a comment-type review instead" % word
+            ok, posted, why = _review_api(engine, runner, now, repo, path, "POST", {"commit_id": head, "body": body, "event": event})
+        if not ok:
+            raise ReviewError("GitHub refused the review: %s (nothing was posted)" % why)
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "review.post", ref, {"who": name, "verdict": args.verdict, "event": event, "head": head[:12], "body": plan_ledger.clip(body, 400)})
+        if notice:
+            print("note: " + notice)
+        print("posted %s review (%s) at %s on %s as %s" % (args.verdict, event, head[:8], ref, name))
+        return EXIT_OK
+    except (ReviewError, ConfigError, IdentityUncertain, CallerError, plan_ledger.LedgerError) as err:
+        review_refusal_audit(seen.get("engine"), "review.post.refused", seen.get("ref"), seen.get("name"), seen.get("head"), str(err), verdict=args.verdict) if seen.get("name") and seen.get("ref") else None
+        sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 700)))
+        return EXIT_USAGE
+
+
+def _cited_line_state(engine, runner, now, repo, head, comment):
+    """("unchanged" | "changed" | "unknown", "path:line" or None, why) of one inline finding. The cited line's TEXT (the last line of the finding's diff hunk: the
+    line as it was at the head the review judged) is looked for in the file at the CURRENT head: found anywhere (a line that only SHIFTED included) is
+    "unchanged" (the finding still holds); absent is "changed". Whatever cannot be told (no path, line or hunk, a removed-side line, the contents unread, the file gone, a file too large to be
+    sent) is "unknown", never "changed"."""
+    path, line = comment.get("path"), comment.get("line") or comment.get("original_line")
+    hunk = comment.get("diff_hunk") if isinstance(comment.get("diff_hunk"), str) else ""
+    where = "%s:%s" % (path, line) if isinstance(path, str) else None
+    if not isinstance(path, str) or not isinstance(line, int):
+        return "unknown", where, "the finding names no file and line"
+    rows = hunk.splitlines()
+    if not rows or not rows[-1][:1] in (" ", "+") or not rows[-1][1:].strip():
+        return "unknown", where, "the finding's hunk gives no cited line to compare"
+    cited = rows[-1][1:]
+    ok, got, why = _review_api(engine, runner, now, repo, "repos/%s/contents/%s?ref=%s" % (repo, urllib.parse.quote(path), head))
+    if not ok or not isinstance(got, dict):
+        return "unknown", where, "the file cannot be read at the head (%s)" % (why or "gone")
+    if got.get("encoding") != "base64":
+        return "unknown", where, "the file's contents were not sent whole"
+    try:
+        lines = base64.b64decode(got.get("content") or "").decode("utf-8", "replace").splitlines()
+    except ValueError:
+        return "unknown", where, "the file's contents cannot be decoded"
+    return ("unchanged" if cited in lines else "changed"), where, ""
+
+
+def cmd_review_dismiss(args, runner, now):
+    """`review dismiss PR --review ID --reason TEXT [--withdraw]`: dismiss the caller's OWN CHANGES_REQUESTED review. Each inline finding's cited line is re-read at the
+    CURRENT head; a finding that still holds refuses, and whatever could not be re-checked (a body-only review, an unreadable or unknown line) needs `--withdraw`
+    (the reader's explicit statement that it withdraws the finding). A failed read refuses."""
+    seen = {}
+    try:
+        engine, state, config = build_engine(runner, now, "cli", writable=True)
+        seen["engine"] = engine
+        reason = (args.reason or "").strip()
+        if not reason:
+            raise ReviewError("--reason must say why (nothing was dismissed)")
+        if redact_command_text(reason) != reason:
+            raise ReviewError("the reason holds a secret-shaped value (it is not shown) (nothing was dismissed)")
+        name = _review_caller(runner, now)
+        seen["name"] = name
+        repo, number, ref, raw = _review_pr(args, engine)
+        seen["ref"] = ref
+        head = raw.get("headRefOid")
+        seen["head"] = head
+        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise ReviewError("the PR head is unknown: nothing was dismissed")
+        base = "repos/%s/pulls/%d/reviews/%d" % (repo, number, args.review)
+        ok, review, why = _review_api(engine, runner, now, repo, base)
+        if not ok or not isinstance(review, dict):
+            raise ReviewError("review %d of %s cannot be read: %s (nothing was dismissed)" % (args.review, ref, why))
+        owner = signed_by_fleet(review.get("body"))
+        if not review_is_own(review, name):
+            raise ReviewError("review %d is not yours (it is signed by %s): a reader dismisses only its own review (nothing was dismissed)" % (args.review, owner or "no one"))
+        status = str(review.get("state") or "").upper()
+        if status == "DISMISSED":
+            raise ReviewError("review %d of %s is already dismissed: nothing to dismiss (nothing was done)" % (args.review, ref))
+        if status not in REVIEW_DISMISS_STATES:
+            raise ReviewError("review %d is %s, not CHANGES_REQUESTED: nothing to dismiss" % (args.review, str(review.get("state") or "unknown").lower()))
+        ok, found, why = _review_pages(engine, runner, now, repo, base + "/comments")
+        if not ok:
+            raise ReviewError("the inline comments of review %d cannot be read whole: %s: the block cannot be re-checked, so nothing was dismissed" % (args.review, why))
+        inline = [c for c in found if isinstance(c, dict)]
+        unknown = []
+        for comment in inline:
+            verdict, where, cause = _cited_line_state(engine, runner, now, repo, head, comment)
+            if verdict == "unchanged" and not args.withdraw:
+                raise ReviewError("finding still holds at %s: %s is unchanged (say --withdraw with a reason if the finding was wrong) (nothing was dismissed)" % (head, where))
+            if verdict == "unknown":
+                unknown.append("%s: %s" % (where or "a finding", cause))
+        if not args.withdraw and not inline:
+            raise ReviewError("review %d has no inline finding to re-check at %s (a body-only block): say --withdraw with a reason if the finding is withdrawn (nothing was dismissed)" % (args.review, head))
+        if not args.withdraw and unknown:
+            raise ReviewError("a finding of review %d could not be re-checked at %s (%s): say --withdraw with a reason if the finding is withdrawn (nothing was dismissed)" % (args.review, head, "; ".join(unknown)[:300]))
+        ok, _, why = _review_api(engine, runner, now, repo, base + "/dismissals", "PUT", {"message": reason, "event": "DISMISS"})
+        if not ok:
+            raise ReviewError("GitHub refused the dismissal: %s" % why)
+        review_dismiss_audit(engine, ref, name, args.review, head, reason, args.withdraw)
+        print("dismissed review %d of %s at %s as %s: %s" % (args.review, ref, head[:8], name, _one_line(reason, 120)))
+        return EXIT_OK
+    except (ReviewError, ConfigError, IdentityUncertain, CallerError, plan_ledger.LedgerError) as err:
+        if seen.get("name") and seen.get("ref"):
+            review_refusal_audit(seen.get("engine"), "review.dismiss.refused", seen["ref"], seen["name"], seen.get("head"), str(err), review=args.review)
+        sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 700)))
+        return EXIT_USAGE
+
+
+def load_review_rule():
+    """shims/review_rule.py: the ONE rule of which reviews block, shared with the gh shim's merge check."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "shims", "review_rule.py")
+    spec = importlib.util.spec_from_file_location("review_rule_gates", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def rest_review_as_view(review):
+    """A Reviews-API review in the shape `gh pr view --json reviews` gives the shim's rule (author.login, commit.oid)."""
+    user = review.get("user") if isinstance(review.get("user"), dict) else {}
+    return {"author": {"login": user.get("login")} if user.get("login") else None, "state": review.get("state"),
+            "commit": {"oid": review.get("commit_id")}, "body": review.get("body"), "id": review.get("id")}
+
+
+def blocking_review_lines(engine, runner, now, repo, number, pr, head="", decision="CHANGES_REQUESTED"):
+    """`blocking review:` lines by the SAME rule as the merge shim (`shims/review_rule.py`): per LOGIN the latest decisive review (DISMISSED included) that is CHANGES_REQUESTED and still blocks."""
+    ok, reviews, why = _review_pages(engine, runner, now, repo, "repos/%s/pulls/%d/reviews" % (repo, number))
+    if not ok:
+        return ["blocking review: the reviews could not be read whole (%s): not listed" % why]
+    try:
+        rule = load_review_rule()
+    except Exception:
+        return ["blocking review: the rule file shims/review_rule.py is unreadable: blocking reviews not listed"]
+    rows = []
+    for login, review in rule.blocking_reviews([rest_review_as_view(r) for r in reviews if isinstance(r, dict)], head or "", decision):
+        rows.append("blocking review: %s CHANGES_REQUESTED at %s (dismiss with: fleet-switchboard review dismiss %s --review %s --reason TEXT)" % (
+            signed_by_fleet(review.get("body")) or login, str(review["commit"]["oid"] or "unknown")[:12], pr, review.get("id")))
+    return rows
+
+
+@recording("review_record", applies=is_review_record)
 def cmd_review(args, runner, now):
     """`review laws <pr>` (print the laws and overlay from the PR's base commit) and `review record <pr> --reviewer X ...` (a reviewer writes
-    its result per head). Reads GitHub with GETs only; `record` writes the hash-chained ledger and the audit."""
+    its result per head). Reads GitHub with GETs only; `record` writes the hash-chained ledger and the audit, and ends with one line (#1049):
+    `recorded #<id> ...`, `already recorded #<id> ...` or `not recorded: <reason>`."""
     if args.review_cmd == "measure":
         return cmd_review_measure(args, runner, now)
     if args.review_cmd == "checkout":
         return cmd_review_checkout(args, runner, now)
+    if args.review_cmd == "post":
+        return cmd_review_post(args, runner, now)
+    if args.review_cmd == "dismiss":
+        return cmd_review_dismiss(args, runner, now)
     try:
         engine, state, config = build_engine(runner, now, "cli", writable=args.review_cmd == "record")
+        record_step("a GitHub read of the pull request")
         repo, number, ref, raw = _review_pr(args, engine)
         head = raw.get("headRefOid") if isinstance(raw.get("headRefOid"), str) else None
         if args.review_cmd == "blockers":
@@ -20540,6 +21115,7 @@ def cmd_review(args, runner, now):
         given = args.head or head
         if not (head.startswith(given) or given.startswith(head)) or len(given) < 7:
             raise ReviewError("the head given (%s) is not the PR's head (%s): a record belongs to the head it judged, nothing was recorded" % (given[:40], head))
+        record_step("the agent registry (who is calling)")
         files_count = None
         if reviewer == "impact" and block_digest:   # #1047: a rating is recorded only from a whole read, checked against GitHub's own list of changed files (never the block's)
             if block_problem and verdict != "incomplete":
@@ -20552,6 +21128,7 @@ def cmd_review(args, runner, now):
                 if why_short:
                     raise ReviewError("refused: %s (nothing was recorded; record `verdict: incomplete` if you could not read it all)" % why_short)
             files_count = (len({r[0] for r in block_rows}), len(listed) if listed is not None else None)
+
         kind = gates_caller_kind(runner, now)
         if kind[0] == "unknown":
             raise ReviewError("refused: %s" % kind[1])
@@ -20582,22 +21159,29 @@ def cmd_review(args, runner, now):
                         entry["block_" + name] = plan_ledger.clip(redact_command_text(value), 200)
         if impact_class:
             entry["impact_class"] = impact_class   # #451 slice 2: the class of the impact that drives the action; a missing one holds for the owner
-        stored = plan_ledger.append_entry(state, entry, now())
-        if engine.audit is not None:
+        (stored, already), = plan_ledger.append_once(state, [entry], now())   # the same record again writes nothing (#1049)
+        if engine.audit is not None and not already:
             engine.audit.append(engine.actor, "review.record", ref, {"reviewer": reviewer, "verdict": verdict, "head": head[:12],
                                                                     "by": by, "seq": stored["seq"], "chain": stored["hash"]})
         entries, problem = plan_ledger.read_ledger(state)
         got = plan_ledger.review_records_at(entries, ref, head)
-        print("recorded %s review %s at %s (%s): %d of %d reviewers recorded at this head%s" % (
-            reviewer, verdict, head[:8], ref, len(got["recorded"]), len(got["expected"]),
+        print("%s %s review %s at %s (%s): %d of %d reviewers recorded at this head%s" % (
+            "already recorded" if already else "recorded", reviewer, verdict, head[:8], ref, len(got["recorded"]), len(got["expected"]),
             "; missing %s" % ", ".join(got["missing"]) if got["missing"] else ""))
         if entry.get("uncited"):
             print("note: this request-changes names no rule: it is recorded as given, marked uncited, and does not block")
         if reviewer == "impact" and not (entry.get("impact_severity") and entry.get("impact_probability")):
             sys.stderr.write("%s: review: %s\n" % (PROG, NO_SCORE_TEXT))
+        sys.stdout.flush()
+        print(recorded_line("%s review" % reviewer, ref, head, [(stored, already)]))
         return EXIT_OK
+    except plan_ledger.LedgerLockTimeout:
+        raise
     except (ReviewError, plan_ledger.LedgerError, ConfigError, IdentityUncertain, CallerError) as err:
-        sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 700)))
+        if args.review_cmd == "record":   # #1049: a record that did not happen says so, last
+            sys.stderr.write("not recorded: %s\n" % _one_line(str(err), 700))
+        else:
+            sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 700)))
         return EXIT_USAGE
 
 
@@ -20822,6 +21406,16 @@ def add_review_parsers(sub):
     record.add_argument("--confirms-carry", dest="confirms_carry", action="store_true",
                         help="(#815) With an approve: the resolution of a conflict in a merge of main touched no line this pull request adds or removes, so the owner's clear may carry to this head")
     record.add_argument("--summary", help="One line (at most 200 characters)")
+    post = rsub.add_parser("post", allow_abbrev=False, help="Post ONE GitHub review of the PR's current head, signed with your registered name (a reader's review carries its marker)")
+    post.add_argument("pr", help="owner/repo#N or the PR's URL")
+    post.add_argument("--head", required=True, help="The FULL head sha judged (it must be the PR's current head)")
+    post.add_argument("--verdict", required=True, help="approve | request-changes | comment")
+    post.add_argument("--body-file", dest="body_file", required=True, help="File holding the review's text")
+    dismiss = rsub.add_parser("dismiss", allow_abbrev=False, help="Dismiss your OWN CHANGES_REQUESTED review after the fix (re-reads the cited line at the current head)")
+    dismiss.add_argument("pr", help="owner/repo#N or the PR's URL")
+    dismiss.add_argument("--review", required=True, type=int, help="The review's id")
+    dismiss.add_argument("--reason", required=True, help="Why it no longer blocks")
+    dismiss.add_argument("--withdraw", action="store_true", help="Your explicit statement that you withdraw the finding: needed when nothing could be re-checked (a body-only review, a line that cannot be read or compared) and to dismiss although the cited line is unchanged (the reason says why)")
     checkout = rsub.add_parser("checkout", help="Write the PR's exact head tree, its diff and the base copies of the touched files into .review/<head sha> here, read-only, and print the path; --remove <dir> removes one")
     checkout.add_argument("pr", nargs="?", help="owner/repo#N or the PR's URL")
     checkout.add_argument("--head", help="The commit to materialise (default: the PR's head, read once at the start)")
@@ -23410,6 +24004,9 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
             args.text = list(args.text or []) + extra   # words after an option (`remind a 1h --issue 3 the text`): argparse lets an optional positional end early
         elif extra:
             parser.error("unrecognized arguments: %s" % " ".join(extra))
+        conflict = reaper_only_conflict(args)   # in the parser, before anything is written or loaded
+        if conflict:
+            parser.error(conflict)
     except SystemExit as exit_:
         return EXIT_USAGE if exit_.code not in (0, None) else EXIT_OK
     if getattr(args, "action", None) == "review" and (set(held) != set(RATING_PATH_FUNCTIONS) or any(globals().get(name) is not fn or fn.__code__ is not code for name, (fn, code) in held.items())):
@@ -23455,6 +24052,20 @@ SERVICE_UNIT = "fleet-kit-switchboard.service"
 REAPER_LABEL = "com.fleet-kit.cloud-reaper"
 REAPER_UNIT = "fleet-kit-cloud-reaper.service"
 REAPER_INTERVAL_SECONDS = 60   # seconds between the managed reaper's passes: never slower than the reaper's own floor (REAP_FLOOR_SECONDS in cloud_worker.py)
+REAPER_FILE_MODE = 0o600   # the reaper's service file is private: it holds names and paths only, but every other private file of the kit is 0600
+# The cloud launcher's own settings file and the keys its one table holds. When that file exists it is the ONLY source of
+# those settings, so the reaper's service must not carry them too: a key set differently in the file and in the service
+# environment makes every start of the reaper refuse. The launcher owns the table (cloud/launcher/cloud_worker.py); the
+# test in bin/test-switchboard holds the two lists equal.
+CLOUD_SETTINGS_FILE_NAME = "cloud.env"
+CLOUD_ENV_SETTING_NAMES = ("CW_ALLOWED_REPOS", "CW_TOOLING_REPO", "CW_CLOUD_IMAGE", "CW_CLOUD_SERVER", "CW_CLOUD_CA_FILE",
+                            "CW_PULL_SECRET", "CW_VAULT_SUBSCRIPTION", "CW_VAULT_NAME", "CW_CLOUD_NAMESPACE", "CW_KUBECTL",
+                            "CW_OPENCODE_BIN", "CW_RUN_RECORD_DIR", "CW_CLOUD_SPEND_CAP_USD", "CW_CLUSTER_TOKEN_CMD",
+                            "CW_CLUSTER_ADMIN_CMD", "CW_GIT_TOKEN_CMD", "CW_APP_ID_CMD", "CW_APP_INSTALLATION_CMD",
+                            "CW_APP_KEY_CMD", "CW_CLUSTER_ADMIN_SECRET", "CW_CLUSTER_TOKEN_DURATION", "CW_HUB_CHANNEL_URL",
+                            "CW_HUB_REGISTRY_SECRET", "CW_VAULT_CHECK_DIR")
+REAPER_CLUSTER_NAMES = ("CW_CLOUD_SERVER", "CW_CLOUD_NAMESPACE", "CW_CLOUD_TOKEN_FILE")   # the cluster login the reaper needs (the token file: the install's environment, else a default)
+REAPER_VAULT_NAMES = ("CW_VAULT_NAME", "CW_VAULT_SUBSCRIPTION")   # the vault names (CW_CLUSTER_ADMIN_SECRET has a default: optional)
 # The reaper's NON-SECRET settings the installer copies from its own environment into the service (names of a cluster or a
 # namespace, paths of files). A token is never among them: the reaper reads the token FILE by path.
 REAPER_SETTING_NAMES = ("CW_KUBE_CONTEXT", "CW_KUBECONFIG", "CW_KUBECTL", "CW_CLOUD_SERVER", "CW_CLOUD_TOKEN_FILE",
@@ -23862,30 +24473,51 @@ def check_writable_target(path):
         raise InstallError("%s can be written by its group or others (mode %o); fix it and run again" % (path, info.st_mode & 0o777))
 
 
-def write_if_changed(path, content):
+def set_file_mode(path, mode):
+    """The file's mode, set when it is not the one asked for. True when it changed it. The mode asked for is the
+    one to set: a private file never gets a wider one."""
+    try:
+        info = os.lstat(str(path))
+    except OSError:
+        return False
+    if stat.S_IMODE(info.st_mode) == mode:
+        return False
+    os.chmod(str(path), mode)
+    return True
+
+
+def write_if_changed(path, content, mode=None):
     """Write `content` unless the file already holds it. True when it wrote. The target is checked first
     (check_writable_target), and a write goes to a temporary file beside it and is renamed over it, so a file
-    that appears in between is replaced, never written through."""
+    that appears in between is replaced, never written through.
+
+    `mode` is the mode the file must have when it is written, and when it already holds the content (an identical
+    file is given the mode too). None keeps today's behaviour: the mode of the umask, and the mode of a file that
+    is replaced."""
     path = Path(path)
     check_writable_target(path)
     try:
         if path.read_text() == content:
+            if mode is not None:
+                set_file_mode(path, mode)
             return False
     except OSError:
         pass
     path.parent.mkdir(parents=True, exist_ok=True)
     mask = os.umask(0)
     os.umask(mask)
-    mode = (0o666 & ~mask) & ~0o022
+    file_mode = (0o666 & ~mask) & ~0o022
     try:
-        mode = stat.S_IMODE(os.lstat(str(path)).st_mode)   # a replaced file keeps its mode
+        file_mode = stat.S_IMODE(os.lstat(str(path)).st_mode)   # a replaced file keeps its mode
     except OSError:
         pass
+    if mode is not None:
+        file_mode = mode
     fd, temp = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w") as handle:
             handle.write(content)
-        os.chmod(temp, mode)
+        os.chmod(temp, file_mode)
         os.replace(temp, str(path))
     except BaseException:
         try:
@@ -24345,6 +24977,147 @@ def reaper_settings(env):
                 "name": "a short name", "server": "an https address with no user, query or fragment"}[kind]))
         found[name] = value
     return found
+
+
+def cloud_settings_path():
+    """Where the cloud launcher's own settings file is: the switchboard's own config directory, `cloud.env`."""
+    return config_path().parent / CLOUD_SETTINGS_FILE_NAME
+
+
+def reaper_service_settings(env, settings_file=None):
+    """The settings the reaper's service file carries: the environment's, minus the keys the cloud launcher's own
+    settings file holds when that file exists. The file is then the only source of those keys, and a key set
+    differently in the file and in the service environment makes every start of the reaper refuse; without the file
+    every setting is copied, as it always was."""
+    found = reaper_settings(env)
+    path = Path(settings_file) if settings_file is not None else cloud_settings_path()
+    if path.exists():
+        found = {name: value for name, value in found.items() if name not in CLOUD_ENV_SETTING_NAMES}
+    return found
+
+
+def launcher_module():
+    """The cloud launcher's own module (<kit>/cloud/launcher/cloud_worker.py), loaded by path under its own name so it
+    never meets bin/cloud_worker.py. The installer judges the settings file with the launcher's own reader."""
+    import importlib.util
+    path = KIT_ROOT / "cloud" / "launcher" / "cloud_worker.py"
+    spec = importlib.util.spec_from_file_location("fleet_kit_cloud_launcher", str(path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_launcher_module():
+    """(module, None), or (None, ONE named refusal) when the launcher's own module cannot be loaded (absent, unreadable, a
+    syntax error, an error on import). Only the class name of the error is shown, never its text."""
+    try:
+        return launcher_module(), None
+    except Exception as err:
+        return None, ("cloud reaper not installed: the launcher module cloud/launcher/cloud_worker.py could not be loaded (%s)"
+                      % type(err).__name__)
+
+
+def reaper_settings_problem(path=None, env=None):
+    """None when the reaper-only install may write its service, else ONE line saying what is wrong and what to do. The
+    rule is the launcher's own: this CALLS the launcher's reader (_read_settings_file, then parse_settings), so the
+    installer refuses exactly what a launch would refuse (a quoted value, an unknown line, a bad server, namespace, vault
+    name or subscription, a missing CW_ALLOWED_REPOS or CW_CLOUD_IMAGE, a hard link, a symlink, a directory, a file or a
+    parent directory others can write, a foreign owner). The reaper's own names (cluster login, vault names) are then
+    required on top. The launcher's refusal text names the file and the line, never a value."""
+    path = Path(path) if path is not None else cloud_settings_path()
+    shown = str(path)
+    home = str(Path.home())
+    if shown.startswith(home + os.sep):
+        shown = "~" + shown[len(home):]
+    head = "cloud reaper not installed: "
+    if not os.path.lexists(str(path)):
+        return head + "%s is missing: create it (mode 600) with the settings a launch needs" % shown
+    launcher, load_problem = load_launcher_module()
+    if load_problem:
+        return load_problem
+    try:
+        text = launcher._read_settings_file(str(path))
+        if text is None:
+            return head + "%s is missing: create it (mode 600) with the settings a launch needs" % shown
+        values = launcher.parse_settings(text, shown)
+    except launcher.CloudError as err:
+        said = " ".join(str(err).split()).replace(str(path), shown)
+        said = said[len("refused: "):] if said.startswith("refused: ") else said
+        return head + said.replace("; nothing was called", "") + ": fix it as a launch needs, then run again"
+    for name in REAPER_CLUSTER_NAMES + REAPER_VAULT_NAMES:
+        if name == "CW_CLOUD_TOKEN_FILE":   # not a key the launcher's file can hold: reaper_login_file() chooses it (the environment, else a default)
+            continue
+        elif name not in values:
+            return head + "%s is missing the name %s: add it to the file" % (shown, name)
+    return None
+
+
+def reaper_default_login_file():
+    """The reaper's default login file: ~/.local/state/fleet-switchboard/cloud-reaper-token under the real home. It does NOT
+    follow XDG_STATE_HOME (decision: the service and its tests pin this path); set CW_CLOUD_TOKEN_FILE to put it elsewhere."""
+    return Path(os.path.expanduser("~")) / ".local" / "state" / "fleet-switchboard" / "cloud-reaper-token"
+
+
+def login_file_stat(path):
+    """lstat of the login file (a seam for the tests): never follows a symlink."""
+    return os.lstat(str(path))
+
+
+def login_file_problem(path):
+    """None when `path` is absent or a plain file of the user's own with mode 0600 (no group or other access); else ONE
+    named line. Never reads the file."""
+    try:
+        info = login_file_stat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        return "cloud reaper not installed: %s cannot be examined (%s): remove it or set CW_CLOUD_TOKEN_FILE" % (path, type(err).__name__)
+    shown = str(path).replace(str(Path.home()), "~", 1) if str(path).startswith(str(Path.home()) + os.sep) else str(path)
+    if stat.S_ISLNK(info.st_mode):
+        why = "a symlink"
+    elif not stat.S_ISREG(info.st_mode):
+        why = "not a regular file"
+    elif info.st_uid != os.geteuid():
+        why = "not yours"
+    elif stat.S_IMODE(info.st_mode) & 0o077:
+        why = "accessible by others"
+    else:
+        return None
+    return "cloud reaper not installed: %s already exists and is %s: remove it or set CW_CLOUD_TOKEN_FILE" % (shown, why)
+
+
+def reaper_login_file(env):
+    """(path, is_default, problem). A set CW_CLOUD_TOKEN_FILE (the install's environment) must be absolute; when it is not
+    set the default applies. `problem` is a named one-line refusal or None. Never touches the disk except to look."""
+    value = (env.get("CW_CLOUD_TOKEN_FILE") or "").strip()
+    if value:
+        if not value.startswith("/"):
+            return None, False, "cloud reaper not installed: CW_CLOUD_TOKEN_FILE must be an absolute path (a relative one is refused): set it to a full path or leave it unset for the default"
+        return value, False, login_file_problem(value)
+    path = reaper_default_login_file()
+    try:
+        info = os.lstat(str(path.parent))
+    except FileNotFoundError:
+        return str(path), True, None
+    except OSError as err:
+        return None, True, "cloud reaper not installed: the login file's directory cannot be examined (%s)" % type(err).__name__
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        return None, True, ("cloud reaper not installed: the login file's directory %s must be your own plain directory with no group or other access (chmod 700 it)"
+                            % str(path.parent).replace(str(Path.home()), "~", 1))
+    return str(path), True, login_file_problem(path)
+
+
+def make_reaper_login_directory(path):
+    """The default login file's directory, mode 0700, made when missing (an existing one is never changed). The file is
+    made 0600 by the reaper when it first writes it."""
+    parent = Path(path).parent
+    missing = []
+    while not parent.exists() and parent != parent.parent:
+        missing.append(parent)
+        parent = parent.parent
+    for directory in reversed(missing):
+        os.mkdir(str(directory), 0o700)
+        os.chmod(str(directory), 0o700)
 
 
 def render_reaper(kind, values, settings, kit_root=KIT_ROOT):
@@ -24983,9 +25756,14 @@ class Installer:
         spec.loader.exec_module(walk)
         return walk.parents_problem(str(script)) or walk.entry_problem(os.lstat(str(script)), "the reaper program")
 
-    def reaper_text(self, config):
+    def reaper_text(self, config, table_from_file=False, login_file=None):
+        """The reaper's service file. `table_from_file` is the reaper-only install: the launcher's own settings file
+        is then the only source of the keys it holds, so the service carries none of them."""
+        settings = reaper_service_settings(os.environ) if table_from_file else reaper_settings(os.environ)
+        if login_file is not None:   # the default login file: the service environment only, never the owner's settings file
+            settings = dict(settings, CW_CLOUD_TOKEN_FILE=login_file)
         return render_reaper(self.kind, service_values(self.kit_root, service_path_dirs(self.kit_root, [shutil.which("python3")])),
-                             reaper_settings(os.environ), self.kit_root)
+                             settings, self.kit_root)
 
     def reaper_loaded(self):
         uid = os.getuid()
@@ -25005,8 +25783,8 @@ class Installer:
             return [["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), REAPER_LABEL)]]
         return [["systemctl", "--user", "disable", "--now", REAPER_UNIT]]
 
-    def step_reaper(self, config):
-        path, text = reaper_file_path(self.kind), self.reaper_text(config)
+    def step_reaper(self, config, table_from_file=False, login_file=None):
+        path, text = reaper_file_path(self.kind), self.reaper_text(config, table_from_file, login_file)
         check_writable_target(path)
         problem = self.reaper_command_problem()
         if problem:
@@ -25015,21 +25793,25 @@ class Installer:
         on_disk = path.read_text() if path.exists() else None
         loaded = self.reaper_loaded()
         if on_disk == text and loaded:
-            return self.say("cloud reaper", "already done", str(path))
+            set_file_mode(path, REAPER_FILE_MODE)   # an identical file still gets the private mode
+            self.say("cloud reaper", "already done", str(path))
+            return False
         what = "load" if on_disk == text else "write and load"
         commands = " && ".join(" ".join(c) for c in self.reaper_load_commands(path))
         self.say("cloud reaper", "will run" if not self.dry else "would run", "%s: %s" % (what, commands))
         if self.dry:
-            return self.say("cloud reaper", "would be done", str(path))
+            self.say("cloud reaper", "would be done", str(path))
+            return True
         ensure_state_dir()
         if on_disk != text:
             if loaded:
                 for command in self.reaper_unload_commands():
                     self.run_checked(command, " ".join(command))
-            write_if_changed(path, text)
+        write_if_changed(path, text, mode=REAPER_FILE_MODE)
         for command in self.reaper_load_commands(path):
             self.run_checked(command, " ".join(command))
         self.say("cloud reaper", "done", str(path))
+        return True
 
     def reaper_is_ours(self, path, text):
         """True when the file at `path` is a rendering of the reaper template: the CW_* settings lines are set aside on BOTH sides and
@@ -25061,6 +25843,12 @@ class Installer:
             except InstallError as err:
                 removable, note = False, str(err)
         loaded = self.reaper_loaded()
+        if loaded and not os.path.lexists(str(path)) and not note:
+            unload = " && ".join(" ".join(c) for c in self.reaper_unload_commands())
+            if not self.dry:
+                for command in self.reaper_unload_commands():
+                    self.run_checked(command, " ".join(command))
+            return self.say("cloud reaper", "would run" if self.dry else "done", "%s: the job was loaded and has no file to remove" % unload)
         if loaded:
             self.say("cloud reaper", "would run" if self.dry else "will run", " && ".join(" ".join(c) for c in self.reaper_unload_commands()))
             if not self.dry:
@@ -25123,6 +25911,53 @@ class Installer:
         self.step_janitor_job()
         self.step_ensure(ensure or (lambda: ensure_daemon(ensure_state_dir(), self.spawn)),
                          status or (lambda: format_status(collect_status(self.runner, self.now, self.platform))))
+
+    # -- the reaper's service and nothing else (ask #982)
+    def install_cloud_reaper_only(self):
+        """Install and load ONLY the cloud worker's reaper service. Nothing else on the machine is touched: no config
+        key, no profile piece, no command link, no plugin link, no switchboard service and no daemon. The state
+        directory (the reaper's log) is the one other thing made, and the service file is written with mode 0600.
+
+        The launcher's own settings file, when it exists, is the only source of the settings it holds, so the service
+        carries none of them: a key set differently in the file and in the service makes every start refuse."""
+        if self.kind is None:
+            return self.say("cloud reaper", "skipped (no service manager known for this platform)")
+        problem = reaper_settings_problem()   # before anything is written: this path only (the full install does not check)
+        if problem:
+            raise InstallError(problem)
+        login, is_default, problem = reaper_login_file(os.environ)
+        if problem:
+            raise InstallError(problem)
+        if is_default:
+            self.out.write("cloud reaper: login file %s (default; set CW_CLOUD_TOKEN_FILE to change it)\n" % login)
+            if not self.dry:
+                make_reaper_login_directory(login)
+        changed = self.step_reaper({}, table_from_file=True, login_file=login if is_default else None)
+        self.out.write("only the cloud reaper's own service %s: the config, the profile pieces, the command link, "
+                       "the plugin link, the switchboard's own service and the daemon were left alone\n"
+                       % (("would be installed" if self.dry else "was installed") if changed else "is already installed"))
+        self.out.write("the reaper logs into the cluster by itself, from the settings the service carries (a token file "
+                       "by path, or a context) and from the settings file it reads at every start; without a login it "
+                       "writes `cluster login failed: ...` and the service restarts it every 30 seconds\n")
+
+    def uninstall_cloud_reaper_only(self):
+        """The way back of install_cloud_reaper_only: unload the reaper's job and remove ONLY its service file (the
+        plist or the unit). Nothing else is touched: no plugin, agent, skill, wrapper, link, service, config or profile.
+        Nothing installed: one line, and success."""
+        if self.kind is None:
+            return self.say("cloud reaper", "skipped (no service manager known for this platform)")
+        if not os.path.lexists(str(reaper_file_path(self.kind))) and not self.reaper_loaded():
+            self.out.write("cloud reaper: not installed\n")
+            return
+        self.remove_reaper()
+        self.out.write("only the cloud reaper's own service %s: the plugins, the agents, the skills, the wrapper, the command link, "
+                       "the switchboard's own service, the config and the profile were left alone\n"
+                       % ("would be removed" if self.dry else "was removed"))
+        login = reaper_default_login_file()
+        self.out.write("the login file %s and its directory were left in place (a leftover token file when the reaper has "
+                       "run): to remove it, run `rm %s` and, when nothing else is in it, `rmdir %s` "
+                       "(a login file you set with CW_CLOUD_TOKEN_FILE is yours to remove)\n"
+                       % (login, shlex.quote(str(login)), shlex.quote(str(login.parent))))
 
     # -- the reverse of 3 to 5
     def uninstall(self, with_service=True, with_link=True):
@@ -25243,17 +26078,51 @@ class Installer:
 
 
 def cmd_install(args, runner, now, spawn=subprocess.Popen):
+    conflict = reaper_only_conflict(args)
+    if conflict:
+        sys.stderr.write("%s: install refused: %s\n" % (PROG, conflict))
+        return EXIT_USAGE
     installer = Installer(runner, spawn, now, dry_run=args.dry_run, shared_profile=args.shared_profile,
                           profile=args.profile, gh_user=args.gh_user)
     try:
-        if args.uninstall:
+        if args.uninstall and args.cloud_reaper_only:
+            installer.uninstall_cloud_reaper_only()
+        elif args.uninstall:
             installer.uninstall(not args.no_service, not args.no_herdr_link)
+        elif args.cloud_reaper_only:
+            installer.install_cloud_reaper_only()
         else:
             installer.install(args.opencode, not args.no_service, not args.no_herdr_link, with_reaper=args.with_cloud_reaper)
     except InstallError as err:
         sys.stderr.write("%s: install stopped: %s\n" % (PROG, err))
         return EXIT_ERROR
     return EXIT_OK
+
+
+# The options `install --cloud-reaper-only` refuses, and why each of them is about the FULL install that the new
+# option does not do. One table: the completeness test in bin/test-switchboard holds every option of the install
+# parser to it, so a later option must be classified here.
+REAPER_ONLY_OPTION = "--cloud-reaper-only"
+REAPER_ONLY_REFUSALS = {
+    "--with-cloud-reaper": ("with_cloud_reaper", "the full install installs the reaper with the rest of the kit"),
+    "--no-service": ("no_service", "the reaper's service is the only service this option installs"),
+    "--no-herdr-link": ("no_herdr_link", "the herdr plugin link belongs to the full install"),
+    "--shared-profile": ("shared_profile", "the profile pieces belong to the full install"),
+    "--profile": ("profile", "the profile belongs to the full install"),
+    "--opencode": ("opencode", "the OpenCode binary belongs to the full install"),
+    "--gh-user": ("gh_user", "the gh account belongs to the full install"),
+}
+
+
+def reaper_only_conflict(args):
+    """The option `--cloud-reaper-only` refuses, or None. Nothing is written and no service is called when this
+    answers: the check runs in the parser, before the installer does anything."""
+    if not getattr(args, "cloud_reaper_only", False):
+        return None
+    for option, (dest, why) in REAPER_ONLY_REFUSALS.items():
+        if getattr(args, dest, None):
+            return "%s cannot be used with %s: %s" % (REAPER_ONLY_OPTION, option, why)
+    return None
 
 
 def add_install_parsers(sub):
@@ -25270,6 +26139,13 @@ def add_install_parsers(sub):
     install.add_argument("--with-cloud-reaper", dest="with_cloud_reaper", action="store_true",
                          help="Also install and load the cloud worker reaper as a service (opt-in: it needs a cluster login; "
                               "its non-secret CW_* settings are copied from this environment)")
+    install.add_argument("--cloud-reaper-only", dest="cloud_reaper_only", action="store_true",
+                         help="Install and load ONLY the cloud worker reaper's own service (opt-in: it needs a cluster login). "
+                              "It writes the reaper's service file (mode 0600) and the state directory (the reaper's log) "
+                              "and loads the service; it leaves alone the config, the profile pieces, the command link, "
+                              "the plugin link, the switchboard's own service and the daemon. It first checks the settings file "
+                              "(cloud.env: mode 600, the cluster login and vault names) and refuses with one line. "
+                              "With --uninstall it removes ONLY the reaper's service")
     install.add_argument("--no-herdr-link", dest="no_herdr_link", action="store_true",
                          help="Do not link herdr's plugin (it starts the daemon whenever herdr starts)")
     install.add_argument("--shared-profile", dest="shared_profile", action="store_true",
