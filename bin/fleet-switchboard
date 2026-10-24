@@ -73,6 +73,8 @@ def _fleet_parts(after=False):
 _fleet_parts()
 import argparse
 import base64
+import html
+import unicodedata
 import http.client
 import urllib.parse
 from contextlib import contextmanager
@@ -20770,8 +20772,11 @@ def plan_source_for(explicit, entries, pr, body, default_repo=None):
     return source or explicit
 
 
-def checked_plan(engine_config, source, ask, runner, now):
-    """The plan at `source`, checked: {"result", "defects", "scenarios_parsed", "plan_hash", "source"}."""
+def checked_plan(engine_config, source, ask, runner, now, text=None, done_when=None):
+    """The plan at `source`, checked: {"result", "defects", "scenarios_parsed", "plan_hash", "source"}. With `text` (a plan already read) nothing is read again."""
+    if text is not None:
+        parsed = plan_check.parse_scenarios(plan_check.scenario_block(text))
+        return dict(plan_check.check(text, done_when, None), scenarios_parsed=parsed, source="plan comment of %s" % source, text=text)
     ns = types.SimpleNamespace(source=source, file=None, ask=ask, done_when=None)
     text, label, result = load_plan(ns, runner, now)
     parsed = plan_check.parse_scenarios(plan_check.scenario_block(text))
@@ -20786,6 +20791,74 @@ def _ledger_pr(args):
     return repo, number, "%s#%d" % (repo, number)
 
 
+def ask_refusal(issue, ref):
+    """#1130: why an issue is no ASK that may take a verdict (None when it is one). An ask is OPEN, carries `## Intent` and `Done when:`, is no charter (the
+    `<user>:orchestrator` label, as `item_chain` readers and the charter scan recognise one) and is a sub-issue of a charter (it has a parent)."""
+    if str(issue.get("state") or "").lower() == "closed":
+        return "%s is an issue, not a pull request, and it is closed: a closed issue takes no record" % ref
+    intent, done_when = parse_intent(issue.get("body"))
+    if not intent or not done_when:
+        return "%s is an issue, not a pull request, and has no `## Intent` with a `Done when:` line: it is not an ask" % ref
+    if any(str(l).endswith(":orchestrator") for l in issue.get("labels") or ()):
+        return "%s is an issue, not a pull request, and a charter (it carries the orchestrator label), not an ask" % ref
+    if not issue.get("parent"):
+        return "%s is an issue, not a pull request, and has no parent issue: a charter, not an ask (an ask is a sub-issue of a charter)" % ref
+    return None
+
+
+def ask_plan_comment(engine, repo, number):
+    """The newest plan comment (a heading `Plan (scenarios)`) of the issue `repo#number`, or None. GETs only; a page that cannot be read is no plan."""
+    comments = []
+    try:
+        for page in range(1, PLAN_COMMENT_PAGES + 1):
+            got = engine.intents._api("repos/%s/issues/%d/comments?per_page=100&page=%d" % (repo, number, page), repo)
+            if not isinstance(got, list):
+                break
+            comments.extend(got)
+            if len(got) < 100:
+                break
+    except (IntentError, AttributeError):
+        return None
+    text, source = plan_check.select_plan_text("", comments)
+    return text if source != "issue body" else None
+
+
+def ask_subject(engine, repo, number, entries, unreadable, explicit, runner, now, writable):
+    """#1130: `verdict`, `prove` and `gates` on an ASK ISSUE (an issue that is no pull request and no work item). None when the number is not such an
+    issue (the pull request rules then apply exactly as before). Else {"facts", "plan", "plan_problem"}: the plan is the plan comment on the issue, and the
+    "head" of the subject is the plan hash (`plan_ledger.ask_head`), so a record names the issue and the hash, and a revised plan voids it as a moved head does.
+    An issue with no plan comment is refused (LedgerCommandError) with its reason: a record would bind to nothing."""
+    ref = "%s#%d" % (repo, number)
+    try:
+        issue = item_issue(engine, repo, number)
+    except LedgerCommandError:
+        return None
+    if explicit:
+        try:
+            named = parse_plan_source(explicit, repo)[:2]
+        except PlanInputError:
+            named = None
+        if named != (repo, number):
+            raise LedgerCommandError("--plan %s is not the plan of %s: an ask issue is bound to the plan comment on the issue itself" % (explicit, ref))
+    why = ask_refusal(issue, ref)
+    if why:
+        raise LedgerCommandError("refused: %s, nothing was recorded" % why)
+    comment = ask_plan_comment(engine, repo, number)   # read ONCE: the same read serves the check here and the hash below
+    if comment is None:
+        if not writable:
+            return {"facts": {"author": issue["author"], "ask_issue": True}, "plan": None,
+                    "plan_problem": "%s is an issue with no plan comment: there is nothing to bind a record to" % ref}
+        raise LedgerCommandError("refused: %s is an issue, not a pull request, and it has no plan comment: a record would bind to nothing, nothing was recorded" % ref)
+    plan, problem = None, None
+    try:
+        plan = checked_plan({}, ref, None, runner, now, text=comment, done_when=parse_intent(issue["body"])[1])
+    except (PlanInputError, ValueError, ConfigError, IntentError) as err:
+        problem = _one_line(str(err), 200)
+    facts = {"author": issue["author"], "ask_issue": True, "notice_senders": [], "body": issue["body"], "state": issue["state"],
+             "head": plan_ledger.ask_head(plan["plan_hash"]) if plan else None}
+    return {"facts": facts, "plan": plan, "plan_problem": problem}
+
+
 def _ledger_context(args, runner, now, writable, parts=None, floor=False):
     """Everything `prove`, `verdict` and `gates` share: the engine, state, PR ref, its picture and its checked plan. `parts` is
     (engine, state, config) when the caller already has them (the daemon's pass); else the engine is built."""
@@ -20794,10 +20867,14 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False):
     entries, problem = plan_ledger.read_ledger(state)
     facts, body, senders, unreadable = pr_picture(engine, repo, number, state)
     if writable:   # #770: an item's entries are written only by the item commands
-        why = item_entry_refusal(engine, repo, number, entries, unreadable)
+        why = item_entry_refusal(engine, repo, number, entries, unreadable, True)
         if why:
             _gates_audit(engine, "plan.item.refused", pr, {"item": pr, "why": why, "stage": "pull request command"})
             raise LedgerCommandError("refused: %s" % why)
+    ask = ask_subject(engine, repo, number, entries, unreadable, args.plan, runner, now, writable) if unreadable else None   # #1130: the ONE place a subject that is an issue is resolved
+    if ask is not None:
+        return types.SimpleNamespace(engine=engine, state=state, config=config, repo=repo, number=number, pr=pr, entries=entries, problem=problem,
+                                     facts=ask["facts"], unreadable=None, source=pr, plan=ask["plan"], plan_problem=ask["plan_problem"], ask_issue=True)
     facts = dict(facts or {}, body=body, notice_senders=senders, held_check=lambda: held_defects(body))
     if floor and facts.get("head"):
         facts["floor"] = gate_floor_fact(engine, state, repo, number, facts["head"])
@@ -20885,6 +20962,8 @@ def _scenario_of(ctx, sid):
 
 def _head_of(ctx, args):
     known = (ctx.facts or {}).get("head")
+    if getattr(ctx, "ask_issue", False) and not known:
+        raise LedgerCommandError("the plan hash of %s is unknown: nothing was recorded" % ctx.pr)
     head = args.head or known
     if known and args.head and not (known.startswith(args.head) or args.head.startswith(known)):
         raise LedgerCommandError("--head %s is not the PR's head (%s): nothing was recorded" % (args.head[:12], known[:12]))
@@ -21005,7 +21084,7 @@ def cmd_verdict(args, runner, now):
             got[1], "an agent" if got[0] == "agent" else "not known")
     else:
         caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
-        if not plan_ledger.known_writers(ctx.entries, ctx.pr, senders):
+        if not plan_ledger.known_writers(ctx.entries, ctx.pr, list(senders) + [ctx.facts.get("author")] * bool(getattr(ctx, "ask_issue", False))):
             raise LedgerCommandError("refused: no writer of %s is known to the switchboard (nobody has recorded a proof or sent its "
                                      "`notice pr`): its author must do that first, so the author can be excluded" % ctx.pr)
         allowed, launch, sessions, fleets = ctx.config.get("plan_evaluators"), {}, {}, {}
@@ -21014,6 +21093,8 @@ def cmd_verdict(args, runner, now):
             launch, sessions, fleets = launched_testers_for(ctx)
             allowed = load_launch_testers().evaluators(allowed, launch)
         ok, why = plan_ledger.may_record_verdict(named, caller, allowed, authors)
+        if getattr(ctx, "ask_issue", False) and caller and caller == ctx.facts.get("author"):   # #1130: the author of the ask may not judge it, as a PR's author may not
+            ok, why = False, "%s is the author of the ask %s: the author of an ask cannot record a verdict on it (`prove` is the author's step)" % (caller, ctx.pr)
         if ok and named == "tester" and caller in launch:
             why = load_launch_testers().lane_refusal(caller, launch, authors, sessions, fleets)
             ok = why is None
@@ -21202,6 +21283,9 @@ def cmd_gates(args, runner, now):
         return cmd_gates_preflight(args, runner, now)
     if args.pr == "stats":
         return cmd_gates_stats(args, runner, now)
+    if args.pr == "ask-close":   # #1130: the closing rule of a report-only ask
+        args.pr = args.rest[0] if args.rest else ""
+        return cmd_gates_ask_close(args, runner, now)
     ctx = _ledger_context(args, runner, now, False, floor=True)
     plan = ctx.plan
     report = plan_ledger.evaluate_gates(plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr,
@@ -21231,6 +21315,8 @@ def cmd_gates(args, runner, now):
             lines.append("PR not read: %s" % ctx.unreadable)
         if ctx.plan_problem:
             lines.append("plan not read: %s" % ctx.plan_problem)
+        if isinstance(ctx.facts, dict) and ctx.facts.get("review") == "changes requested" and not ctx.unreadable:
+            lines.extend(blocking_review_lines(ctx.engine, runner, now, ctx.repo, ctx.number, ctx.pr, ctx.facts.get("head")))   # #1123: GitHub's decision blocks the merge; say who and how to clear it
         note = rating_block_note(ctx.entries, ctx.pr, ctx.facts.get("head")) if isinstance(ctx.facts, dict) else None
         if note:
             lines.append("rating: %s" % note)
@@ -21242,6 +21328,29 @@ def cmd_gates(args, runner, now):
         return EXIT_USAGE
     ok = report["ready"] if getattr(args, "all_gates", False) else report["ready_enforced"]   # --all: the full board
     return EXIT_OK if ok else EXIT_ERROR
+
+
+def cmd_gates_ask_close(args, runner, now):
+    """`gates ask-close <owner/repo#N>`: the closing rule of a report-only ask (#1130): the ask may close when EVERY scenario of its plan comment is proven and
+    judged at the current plan hash. Exit 0 names the scenarios recorded; exit 1 refuses and names each unjudged scenario. Reads only: it closes nothing."""
+    ctx = _ledger_context(args, runner, now, False)
+    if not getattr(ctx, "ask_issue", False):
+        raise LedgerCommandError("%s is not an ask issue: the closing rule of a report-only ask applies to an issue with a plan comment" % ctx.pr)
+    if ctx.plan is None or ctx.plan["result"] != "pass":
+        raise LedgerCommandError("cannot close %s: %s" % (ctx.pr, ctx.plan_problem or "its plan fails `plan check`"))
+    head = ctx.facts.get("head")
+    authors = plan_ledger.authors_of(ctx.entries, ctx.pr, (), ctx.facts.get("author"))
+    rows = [plan_ledger.scenario_state(x, ctx.entries, ctx.pr, ctx.plan["plan_hash"], head, authors) for x in ctx.plan["scenarios_parsed"]]
+    open_rows = [r for r in rows if r["status"] != "ok"]
+    if open_rows:
+        for r in open_rows:
+            print("not judged: %s: %s" % (r["id"], "; ".join(r["missing"] + r["void"])), file=sys.stderr)
+        print("refused: %s stays open: %d of %d scenarios are not proven and judged at plan %s" % (ctx.pr, len(open_rows), len(rows), ctx.plan["plan_hash"][:19]),
+              file=sys.stderr)
+        return EXIT_ERROR
+    print("%s may close: %d of %d scenarios proven and judged at plan %s: %s" % (ctx.pr, len(rows), len(rows), ctx.plan["plan_hash"][:19],
+                                                                          ", ".join(r["id"] for r in rows)))
+    return EXIT_OK
 
 
 cmd_gates.ledger = True   # state and GETs only; its own errors are usage errors
@@ -21273,8 +21382,9 @@ def item_issue(engine, repo, number):
     if data.get("pull_request"):
         raise LedgerCommandError("%s#%d is a pull request: use --pr (the pull request rules apply to it, not the work item rules)" % (repo, number))
     user = data.get("user") if isinstance(data.get("user"), dict) else {}
+    labels = [l.get("name") if isinstance(l, dict) else l for l in (data.get("labels") if isinstance(data.get("labels"), list) else [])]
     return {"author": user.get("login") if isinstance(user.get("login"), str) else None, "body": data.get("body") if isinstance(data.get("body"), str) else "",
-            "state": data.get("state"), "parent": parent_of(data)}
+            "state": data.get("state"), "parent": parent_of(data), "labels": [l for l in labels if isinstance(l, str)]}
 
 
 def item_chain(engine, repo, number, parent, limit=4):
@@ -21342,14 +21452,14 @@ def item_agents(ctx):
     return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions, fleets
 
 
-def item_entry_refusal(engine, repo, number, entries, unreadable):
+def item_entry_refusal(engine, repo, number, entries, unreadable, allow_ask=False):
     """Why the ORDINARY pull request commands (prove, verdict, gates ci-record, waive) must not write for `repo#number`, or None. They refuse a number that is an ISSUE (the pull request
     could not be read and GitHub says it is an issue) and a number that has an item registration: an item's entries are written only by item-prove, item-verdict and item-ci-record.
     A real pull request is never affected (it is read, and has no registration)."""
     ref = "%s#%d" % (repo, number)
     if load_module("item_verdicts").registrations(entries, ref):
         return "%s is a work item (a tester is registered for it): its proofs and verdicts are written only by item-prove, item-verdict and gates item-ci-record" % ref
-    if unreadable:
+    if unreadable and not allow_ask:
         try:
             item_issue(engine, repo, number)
         except LedgerCommandError:
@@ -24099,6 +24209,272 @@ def record_inputs(raw_argv):
     return _private_parse(raw_argv, DECISION_INPUTS, CARRY_FLAG_INPUTS)
 
 
+# ---------------------------------------------------------------- `review post` and `review dismiss` (#1123)
+# The marker a reader's review ends with is written by ONE function, `fleet_mark` (the writer `comment` and `handoff` use too): there is no second one here.
+
+REVIEW_POST_VERDICTS = {"approve": ("APPROVE", "APPROVE"), "request-changes": ("CHANGES REQUESTED", "REQUEST_CHANGES"), "comment": ("COMMENT", "COMMENT")}   # verdict -> (the word in the body's first line, the Reviews API event)
+REVIEW_POST_ROLES = ("reader", "reviewer")   # the registered roles that may post and dismiss a review
+REVIEW_OWN_REFUSAL = re.compile(r"(?i)own pull request|can not approve|can not request changes|cannot approve|cannot request changes")
+REVIEW_DISMISS_STATES = ("CHANGES_REQUESTED",)
+
+
+def review_head_problem(given, current):
+    """None when `given` is the PR's current head, else the refusal (naming both in full)."""
+    if given != current:
+        return "the head given (%s) is not the PR's current head (%s): a review belongs to the head it judged (nothing was posted)" % (given, current)
+    return None
+
+
+def review_post_path(repo, number):
+    """The Reviews API's endpoint: the one a review is posted to (never the issue comments')."""
+    return "repos/%s/pulls/%d/reviews" % (repo, number)
+
+
+def review_is_own(review, name):
+    """True when the review carries the caller's own marker: the reader's identity that posted it (all agents share one login)."""
+    return signed_by_fleet(review.get("body")) == name
+
+
+def review_dismiss_audit(engine, ref, name, review_id, head, reason, withdrawn):
+    """The audit line of a dismissal: who, which review, which head, why."""
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "review.dismiss", ref, {"who": name, "review": review_id, "head": head[:12], "why": plan_ledger.clip(reason, 200), "withdrawn": bool(withdrawn)})
+
+
+def _review_caller(runner, now):
+    """The registered name of the caller of a review command; raises ReviewError for a caller with no registered reader or reviewer role."""
+    kind = gates_caller_kind(runner, now)
+    if kind[0] == "unknown":
+        raise ReviewError("refused: %s" % kind[1])
+    role = kind[2] if kind[0] == "agent" and len(kind) > 2 else None
+    if kind[0] != "agent" or role not in REVIEW_POST_ROLES or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", kind[1] or ""):
+        raise ReviewError("refused: the caller has no registered %s role (%s): only a registered reader posts or dismisses a review (nothing was done)" % (
+            " or ".join(REVIEW_POST_ROLES), kind[1] if kind[0] != "agent" else "role %s" % (role or "none")))
+    return kind[1]
+
+
+def _review_api(engine, runner, now, repo, path, method=None, payload=None):
+    """(ok, parsed or None, one-line detail) of ONE `gh api` call with the repository's own account (a GET unless `method`)."""
+    config = engine.config
+    reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
+    if method is None:
+        try:
+            return True, reader._api(path, repo), ""
+        except IntentError as err:
+            return False, None, _one_line(str(err), 200)
+    env = reader.env_for(repo)
+    try:
+        done = runner([config["gh"], "api", path, "--method", method, "--input", "-"], input=json.dumps(payload), capture_output=True, text=True,
+                      timeout=reader.timeout, **({"env": env} if env is not None else {}))
+    except (OSError, subprocess.SubprocessError) as err:
+        return False, None, _one_line(str(err), 200)
+    if done.returncode != 0:
+        return False, None, reader.accounts.scrub(_one_line(done.stderr or done.stdout or "", 200)) or "exit %d" % done.returncode
+    try:
+        return True, json.loads(done.stdout or "{}"), ""
+    except ValueError:
+        return False, None, "GitHub answered a success that is not JSON (not trusted): %s" % _one_line(done.stdout or "", 80)
+
+
+REVIEW_PAGE_LIMIT = 50   # pages of 100: a list longer than this is not read whole, and the caller refuses
+
+
+def _review_pages(engine, runner, now, repo, path):
+    """(ok, all items, one-line detail) of a Reviews-API list read page by page to the LAST page (a short page ends it); a failed page, a page that is not a list, or more than REVIEW_PAGE_LIMIT pages fails the whole read."""
+    items = []
+    for page in range(1, REVIEW_PAGE_LIMIT + 1):
+        ok, got, why = _review_api(engine, runner, now, repo, "%s?per_page=100&page=%d" % (path, page))
+        if not ok or not isinstance(got, list):
+            return False, None, why or "page %d is not a list" % page
+        items.extend(got)
+        if len(got) < 100:
+            return True, items, ""
+    return False, None, "more than %d pages" % REVIEW_PAGE_LIMIT
+
+
+def review_refusal_audit(engine, event, ref, name, head, reason, **more):
+    """The audit line of a REFUSED review command (who, which head, the reason); never raises."""
+    try:
+        if engine.audit is not None and name:
+            engine.audit.append(engine.actor, event, ref, dict({"who": name, "head": (head or "")[:12], "reason": plan_ledger.clip(reason, 200)}, **more))
+    except Exception:
+        pass
+
+
+def review_forged_marker(text):
+    """True when `text` holds fleet-switchboard `from=` marker text in ANY form: normalised (HTML entities decoded, NFKC, case folded, every character that is not a letter or digit dropped) so spacing, case, entities, zero-width characters and an HTML comment around it change nothing."""
+    plain = re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKC", html.unescape(html.unescape(text))).casefold())
+    return "fleetswitchboardfrom" in plain
+
+
+def cmd_review_post(args, runner, now):
+    """`review post PR --head SHA --verdict V --body-file FILE`: ONE Reviews-API review, its body `Review of <full head>: <VERDICT>` ... the reader's marker."""
+    seen = {}
+    try:
+        engine, state, config = build_engine(runner, now, "cli", writable=True)
+        seen["engine"] = engine
+        if args.verdict not in REVIEW_POST_VERDICTS:
+            raise ReviewError("--verdict must be one of %s (nothing was posted)" % ", ".join(REVIEW_POST_VERDICTS))
+        if not re.fullmatch(r"[0-9a-f]{40}", args.head or ""):
+            raise ReviewError("--head must be the full 40-character head sha, got %d characters (nothing was posted)" % len(args.head or ""))
+        text = _read_capped(args.body_file, REVIEW_TABLE_MAX).strip()
+        if not text:
+            raise ReviewError("the body file is empty: a review says something (nothing was posted)")
+        if redact_command_text(text) != text:
+            raise ReviewError("the body holds a secret-shaped value (it is not shown): remove it and post again (nothing was posted)")
+        name = _review_caller(runner, now)
+        seen["name"], seen["head"] = name, args.head
+        repo, number, ref, raw = _review_pr(args, engine)
+        seen["ref"] = ref
+        if review_forged_marker(text):
+            raise ReviewError("refused (forged marker): the body holds `fleet-switchboard:from=` marker text; the one marker of a review is appended from the caller's registered identity, so a body never carries one (nothing was posted)")
+        head = raw.get("headRefOid")
+        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise ReviewError("the PR head is unknown: nothing was posted")
+        problem = review_head_problem(args.head, head)
+        if problem:
+            raise ReviewError(problem)
+        word, event = REVIEW_POST_VERDICTS[args.verdict]
+        body = "Review of %s: %s\n\n%s\n\n%s" % (head, word, text, fleet_mark(name))
+        path = review_post_path(repo, number)
+        ok, posted, why = _review_api(engine, runner, now, repo, path, "POST", {"commit_id": head, "body": body, "event": event})
+        notice = ""
+        if not ok and event != "COMMENT" and REVIEW_OWN_REFUSAL.search(why):   # the same account's own pull request: a comment-type review, never an issue comment
+            event, notice = "COMMENT", "GitHub refused %s on this account's own pull request: posted as a comment-type review instead" % word
+            ok, posted, why = _review_api(engine, runner, now, repo, path, "POST", {"commit_id": head, "body": body, "event": event})
+        if not ok:
+            raise ReviewError("GitHub refused the review: %s (nothing was posted)" % why)
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "review.post", ref, {"who": name, "verdict": args.verdict, "event": event, "head": head[:12], "body": plan_ledger.clip(body, 400)})
+        if notice:
+            print("note: " + notice)
+        print("posted %s review (%s) at %s on %s as %s" % (args.verdict, event, head[:8], ref, name))
+        return EXIT_OK
+    except (ReviewError, ConfigError, IdentityUncertain, CallerError, plan_ledger.LedgerError) as err:
+        review_refusal_audit(seen.get("engine"), "review.post.refused", seen.get("ref"), seen.get("name"), seen.get("head"), str(err), verdict=args.verdict) if seen.get("name") and seen.get("ref") else None
+        sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 700)))
+        return EXIT_USAGE
+
+
+def _cited_line_state(engine, runner, now, repo, head, comment):
+    """("unchanged" | "changed" | "unknown", "path:line" or None, why) of one inline finding. The cited line's TEXT (the last line of the finding's diff hunk: the
+    line as it was at the head the review judged) is looked for in the file at the CURRENT head: found anywhere (a line that only SHIFTED included) is
+    "unchanged" (the finding still holds); absent is "changed". Whatever cannot be told (no path, line or hunk, a removed-side line, the contents unread, the file gone, a file too large to be
+    sent) is "unknown", never "changed"."""
+    path, line = comment.get("path"), comment.get("line") or comment.get("original_line")
+    hunk = comment.get("diff_hunk") if isinstance(comment.get("diff_hunk"), str) else ""
+    where = "%s:%s" % (path, line) if isinstance(path, str) else None
+    if not isinstance(path, str) or not isinstance(line, int):
+        return "unknown", where, "the finding names no file and line"
+    rows = hunk.splitlines()
+    if not rows or not rows[-1][:1] in (" ", "+") or not rows[-1][1:].strip():
+        return "unknown", where, "the finding's hunk gives no cited line to compare"
+    cited = rows[-1][1:]
+    ok, got, why = _review_api(engine, runner, now, repo, "repos/%s/contents/%s?ref=%s" % (repo, urllib.parse.quote(path), head))
+    if not ok or not isinstance(got, dict):
+        return "unknown", where, "the file cannot be read at the head (%s)" % (why or "gone")
+    if got.get("encoding") != "base64":
+        return "unknown", where, "the file's contents were not sent whole"
+    try:
+        lines = base64.b64decode(got.get("content") or "").decode("utf-8", "replace").splitlines()
+    except ValueError:
+        return "unknown", where, "the file's contents cannot be decoded"
+    return ("unchanged" if cited in lines else "changed"), where, ""
+
+
+def cmd_review_dismiss(args, runner, now):
+    """`review dismiss PR --review ID --reason TEXT [--withdraw]`: dismiss the caller's OWN CHANGES_REQUESTED review. Each inline finding's cited line is re-read at the
+    CURRENT head; a finding that still holds refuses, and whatever could not be re-checked (a body-only review, an unreadable or unknown line) needs `--withdraw`
+    (the reader's explicit statement that it withdraws the finding). A failed read refuses."""
+    seen = {}
+    try:
+        engine, state, config = build_engine(runner, now, "cli", writable=True)
+        seen["engine"] = engine
+        reason = (args.reason or "").strip()
+        if not reason:
+            raise ReviewError("--reason must say why (nothing was dismissed)")
+        if redact_command_text(reason) != reason:
+            raise ReviewError("the reason holds a secret-shaped value (it is not shown) (nothing was dismissed)")
+        name = _review_caller(runner, now)
+        seen["name"] = name
+        repo, number, ref, raw = _review_pr(args, engine)
+        seen["ref"] = ref
+        head = raw.get("headRefOid")
+        seen["head"] = head
+        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise ReviewError("the PR head is unknown: nothing was dismissed")
+        base = "repos/%s/pulls/%d/reviews/%d" % (repo, number, args.review)
+        ok, review, why = _review_api(engine, runner, now, repo, base)
+        if not ok or not isinstance(review, dict):
+            raise ReviewError("review %d of %s cannot be read: %s (nothing was dismissed)" % (args.review, ref, why))
+        owner = signed_by_fleet(review.get("body"))
+        if not review_is_own(review, name):
+            raise ReviewError("review %d is not yours (it is signed by %s): a reader dismisses only its own review (nothing was dismissed)" % (args.review, owner or "no one"))
+        status = str(review.get("state") or "").upper()
+        if status == "DISMISSED":
+            raise ReviewError("review %d of %s is already dismissed: nothing to dismiss (nothing was done)" % (args.review, ref))
+        if status not in REVIEW_DISMISS_STATES:
+            raise ReviewError("review %d is %s, not CHANGES_REQUESTED: nothing to dismiss" % (args.review, str(review.get("state") or "unknown").lower()))
+        ok, found, why = _review_pages(engine, runner, now, repo, base + "/comments")
+        if not ok:
+            raise ReviewError("the inline comments of review %d cannot be read whole: %s: the block cannot be re-checked, so nothing was dismissed" % (args.review, why))
+        inline = [c for c in found if isinstance(c, dict)]
+        unknown = []
+        for comment in inline:
+            verdict, where, cause = _cited_line_state(engine, runner, now, repo, head, comment)
+            if verdict == "unchanged" and not args.withdraw:
+                raise ReviewError("finding still holds at %s: %s is unchanged (say --withdraw with a reason if the finding was wrong) (nothing was dismissed)" % (head, where))
+            if verdict == "unknown":
+                unknown.append("%s: %s" % (where or "a finding", cause))
+        if not args.withdraw and not inline:
+            raise ReviewError("review %d has no inline finding to re-check at %s (a body-only block): say --withdraw with a reason if the finding is withdrawn (nothing was dismissed)" % (args.review, head))
+        if not args.withdraw and unknown:
+            raise ReviewError("a finding of review %d could not be re-checked at %s (%s): say --withdraw with a reason if the finding is withdrawn (nothing was dismissed)" % (args.review, head, "; ".join(unknown)[:300]))
+        ok, _, why = _review_api(engine, runner, now, repo, base + "/dismissals", "PUT", {"message": reason, "event": "DISMISS"})
+        if not ok:
+            raise ReviewError("GitHub refused the dismissal: %s" % why)
+        review_dismiss_audit(engine, ref, name, args.review, head, reason, args.withdraw)
+        print("dismissed review %d of %s at %s as %s: %s" % (args.review, ref, head[:8], name, _one_line(reason, 120)))
+        return EXIT_OK
+    except (ReviewError, ConfigError, IdentityUncertain, CallerError, plan_ledger.LedgerError) as err:
+        if seen.get("name") and seen.get("ref"):
+            review_refusal_audit(seen.get("engine"), "review.dismiss.refused", seen["ref"], seen["name"], seen.get("head"), str(err), review=args.review)
+        sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 700)))
+        return EXIT_USAGE
+
+
+def load_review_rule():
+    """shims/review_rule.py: the ONE rule of which reviews block, shared with the gh shim's merge check."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "shims", "review_rule.py")
+    spec = importlib.util.spec_from_file_location("review_rule_gates", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def rest_review_as_view(review):
+    """A Reviews-API review in the shape `gh pr view --json reviews` gives the shim's rule (author.login, commit.oid)."""
+    user = review.get("user") if isinstance(review.get("user"), dict) else {}
+    return {"author": {"login": user.get("login")} if user.get("login") else None, "state": review.get("state"),
+            "commit": {"oid": review.get("commit_id")}, "body": review.get("body"), "id": review.get("id")}
+
+
+def blocking_review_lines(engine, runner, now, repo, number, pr, head="", decision="CHANGES_REQUESTED"):
+    """`blocking review:` lines by the SAME rule as the merge shim (`shims/review_rule.py`): per LOGIN the latest decisive review (DISMISSED included) that is CHANGES_REQUESTED and still blocks."""
+    ok, reviews, why = _review_pages(engine, runner, now, repo, "repos/%s/pulls/%d/reviews" % (repo, number))
+    if not ok:
+        return ["blocking review: the reviews could not be read whole (%s): not listed" % why]
+    try:
+        rule = load_review_rule()
+    except Exception:
+        return ["blocking review: the rule file shims/review_rule.py is unreadable: blocking reviews not listed"]
+    rows = []
+    for login, review in rule.blocking_reviews([rest_review_as_view(r) for r in reviews if isinstance(r, dict)], head or "", decision):
+        rows.append("blocking review: %s CHANGES_REQUESTED at %s (dismiss with: fleet-switchboard review dismiss %s --review %s --reason TEXT)" % (
+            signed_by_fleet(review.get("body")) or login, str(review["commit"]["oid"] or "unknown")[:12], pr, review.get("id")))
+    return rows
+
+
 def cmd_review(args, runner, now):
     """`review laws <pr>` (print the laws and overlay from the PR's base commit) and `review record <pr> --reviewer X ...` (a reviewer writes
     its result per head). Reads GitHub with GETs only; `record` writes the hash-chained ledger and the audit."""
@@ -24106,6 +24482,10 @@ def cmd_review(args, runner, now):
         return cmd_review_measure(args, runner, now)
     if args.review_cmd == "checkout":
         return cmd_review_checkout(args, runner, now)
+    if args.review_cmd == "post":
+        return cmd_review_post(args, runner, now)
+    if args.review_cmd == "dismiss":
+        return cmd_review_dismiss(args, runner, now)
     try:
         engine, state, config = build_engine(runner, now, "cli", writable=args.review_cmd == "record")
         repo, number, ref, raw = _review_pr(args, engine)
@@ -24499,6 +24879,16 @@ def add_review_parsers(sub):
     record.add_argument("--confirms-carry", dest="confirms_carry", action="store_true",
                         help="(#815) With an approve: the resolution of a conflict in a merge of main touched no line this pull request adds or removes, so the owner's clear may carry to this head")
     record.add_argument("--summary", help="One line (at most 200 characters)")
+    post = rsub.add_parser("post", allow_abbrev=False, help="Post ONE GitHub review of the PR's current head, signed with your registered name (a reader's review carries its marker)")
+    post.add_argument("pr", help="owner/repo#N or the PR's URL")
+    post.add_argument("--head", required=True, help="The FULL head sha judged (it must be the PR's current head)")
+    post.add_argument("--verdict", required=True, help="approve | request-changes | comment")
+    post.add_argument("--body-file", dest="body_file", required=True, help="File holding the review's text")
+    dismiss = rsub.add_parser("dismiss", allow_abbrev=False, help="Dismiss your OWN CHANGES_REQUESTED review after the fix (re-reads the cited line at the current head)")
+    dismiss.add_argument("pr", help="owner/repo#N or the PR's URL")
+    dismiss.add_argument("--review", required=True, type=int, help="The review's id")
+    dismiss.add_argument("--reason", required=True, help="Why it no longer blocks")
+    dismiss.add_argument("--withdraw", action="store_true", help="Your explicit statement that you withdraw the finding: needed when nothing could be re-checked (a body-only review, a line that cannot be read or compared) and to dismiss although the cited line is unchanged (the reason says why)")
     checkout = rsub.add_parser("checkout", help="Write the PR's exact head tree, its diff and the base copies of the touched files into .review/<head sha> here, read-only, and print the path; --remove <dir> removes one")
     checkout.add_argument("pr", nargs="?", help="owner/repo#N or the PR's URL")
     checkout.add_argument("--head", help="The commit to materialise (default: the PR's head, read once at the start)")
