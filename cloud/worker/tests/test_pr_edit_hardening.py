@@ -191,6 +191,27 @@ class T(base.T):
         self.assertEqual(self.edit(7, self.file("body-b", "A\nMERGE: captain\n")).returncode, 0)
         self.assertEqual(len(patches()), 1)
 
+    def test_m1_a_hardlink_to_the_git_config_is_refused_and_a_normal_file_is_accepted(self):
+        cfg = os.path.join(self.work, ".git", "config")
+        link = os.path.join(self.tmp.name, "hl.txt")
+        os.link(cfg, link)
+        self.addCleanup(os.unlink, link)
+        PRS[7] = pr(body="plain")
+        self.refused(self.edit(7, link), "pr-edit-body-file-linked")
+        self.assertEqual(self.edit(7, self.file("nlink1", "A\n")).returncode, 0)
+        self.assertEqual(len(patches()), 1)
+
+    def test_m1_mutant_without_the_nlink_check_publishes_the_hardlink(self):
+        m = self.mut("mut-nonlink", "    if st.st_nlink > 1:", "    if False:")
+        self.assertIn("if False:", open(m).read())
+        cfg = os.path.join(self.work, ".git", "config")
+        link = os.path.join(self.tmp.name, "hl2.txt")
+        os.link(cfg, link)
+        self.addCleanup(os.unlink, link)
+        PRS[7] = pr(body="plain")
+        self.assertEqual(self.edit(7, link, script=m).returncode, 0)   # the mutant publishes it
+        self.assertEqual(self.edit(7, link).returncode, 3)
+
     def test_r1_mutant_without_the_git_check_publishes_the_git_config(self):
         m = self.mut("mut-nogit", "    check_body_path(path, real)\n", "    pass\n")
         cfg = os.path.join(self.work, ".git", "config")
