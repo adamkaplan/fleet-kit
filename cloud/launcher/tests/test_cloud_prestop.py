@@ -764,6 +764,16 @@ class EarlyReturns(Base):
         sh("git", "-C", self.work, "config", "core.sshCommand", "false")
         self.one_line(self.run_main(), "not a plain one: core.sshcommand", "work.txt")
 
+    def test_a_dot_git_file_is_refused_with_one_line(self):
+        # a linked worktree or a separate git directory: .git is a FILE
+        work = os.path.join(self.t, "linked")
+        sh("git", "-C", self.work, "worktree", "add", "-q", "--detach", work)
+        open(os.path.join(work, "w.txt"), "w").write("x")
+        self.assertTrue(os.path.isfile(os.path.join(work, ".git")))
+        p = self.run_main(CW_WORKDIR=work)
+        self.one_line(p, ".git is a file: a linked worktree or a separate git directory is not supported); work left in %s" % work)
+        self.assertNotIn("w.txt", p.stdout)   # git is never asked in such a directory
+
     def test_a_push_failure_prints_one_line_with_the_names(self):
         self.dirty()
         shutil.rmtree(self.origin)
