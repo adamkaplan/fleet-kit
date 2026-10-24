@@ -18,6 +18,7 @@ import os
 import re
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 LEDGER_FILE = "plan-ledger.jsonl"
 HEAD_FILE = "plan-ledger.head"   # {"seq", "hash"} of the newest entry: a second place the chain's end is written
@@ -196,6 +197,10 @@ def append_many_checked(state_dir, build, now):
 
 
 # ----------------------------------------------------------------------------------- who may do what
+
+def proof_of(scenario):
+    return " ".join(str(scenario.get("proof", "")).split())
+
 
 def evaluator_of(scenario):
     name = " ".join(str(scenario.get("evaluator", "")).split())
@@ -958,3 +963,47 @@ def refusal_message(prog, check_for, pr, failed, repo):
     return ("%s: %s of %s refused: missing %s. Way out: ask the chief of staff for a logged waiver (`%s waive %s --gates %s "
             "--reason ...`; never for G6 or G8), or the chief of staff can switch the repo to shadow (`%s gates mode %s shadow`)."
             % (prog, check_for, pr, what, prog, pr, ",".join(f["gate"] for f in gates) or "G1", prog, repo))
+
+
+REVIEW_LINK_RE = re.compile(r"https?://[^\s\"'`<>\u201c\u201d]+")
+# One quote is one pair of matching marks: "..", \u201c..\u201d, \u2018..\u2019 or `..`.
+REVIEW_QUOTE_RE = re.compile(r"\"([^\"\n]+)\"|\u201c([^\u201d\n]+)\u201d|\u2018([^\u2019\n]+)\u2019|`([^`\n]+)`")
+REVIEW_QUOTE_MIN_WORDS, REVIEW_QUOTE_MIN_CHARS, REVIEW_QUOTE_MIN_LETTERS, REVIEW_TEXT_MAX = 3, 15, 3, 400
+
+
+def _review_norm(text):
+    return " ".join(str(text or "").casefold().split())
+
+
+def _review_link_ok(url):
+    """A link counts with a real host (a dot between non-empty labels, the last of 2+ letters) and a path or fragment."""
+    if len(url) > REVIEW_TEXT_MAX:
+        return False
+    parts = urlsplit(url)
+    host = (parts.hostname or "").rstrip(".")
+    labels = host.split(".")
+    if len(labels) < 2 or not all(labels) or not (len(labels[-1]) >= 2 and labels[-1].isalpha()):
+        return False
+    return len(parts.path.strip("/")) > 0 or len(parts.fragment) > 0
+
+
+def review_evidence_problem(evidence, scenario=None):
+    """None when a `review` verdict's evidence carries a countable quote of the text read or a link to it, else the named reason.
+    A quote has 3+ words or 15+ characters, 3+ letters, at most 400 characters, and is not the scenario's own text, pass or discriminates
+    text; a link has a real host and a path or fragment. The ONE rule: the verdict command calls it once per scenario."""
+    text = evidence or ""
+    own = {_review_norm((scenario or {}).get(k)) for k in ("text", "pass", "discriminates")} - {""}
+    for url in REVIEW_LINK_RE.findall(text):
+        if _review_link_ok(url.rstrip(".,;:)")):
+            return None
+    for match in REVIEW_QUOTE_RE.finditer(text):
+        quote = next(g for g in match.groups() if g is not None).strip()
+        if len(quote) > REVIEW_TEXT_MAX or sum(c.isalpha() for c in quote) < REVIEW_QUOTE_MIN_LETTERS:
+            continue
+        if len(quote.split()) < REVIEW_QUOTE_MIN_WORDS and len(quote) < REVIEW_QUOTE_MIN_CHARS:
+            continue
+        if _review_norm(quote) in own:
+            continue
+        return None
+    return ("a review verdict has no quote and no link: quote the text you read (in quotation marks: 3+ words or 15+ characters, at most "
+            "400, not the scenario's own text) or link to it (a real host such as example.com, and a path or fragment)")
