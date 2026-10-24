@@ -34770,9 +34770,10 @@ class TestPlanLedger(LedgerBase):
     def test_prove_names_every_scenario_and_exits_4_when_one_was_not_recorded(self):
         code, out, err = self.prove_many("coder", "S4", "U1")
         self.assertEqual(code, 4, err)
-        self.assertEqual(len(out.strip().splitlines()), 1)
+        self.assertEqual(len(out.strip().splitlines()), 2)   # the scenario's line, then the one final line (#1049)
         self.assertRegex(out, r"^recorded proof #1: U1 pass at %s \(acme/app#9\), bound to plan sha256:" % LEDGER_HEAD[:8])
-        self.assertEqual(len(err.strip().splitlines()), 1)
+        self.assertEqual(len(err.strip().splitlines()), 2)   # the refusal, then `not recorded:` last
+        self.assertRegex(err.strip().splitlines()[-1], r"^not recorded: 1 of 2 scenarios refused")
         self.assertIn("S4", err)
         self.assertIn("claimed at the epic", err)
         self.assertEqual([e["scenario"] for e in self.ledger()], ["U1"])
@@ -34781,9 +34782,10 @@ class TestPlanLedger(LedgerBase):
         code, out, err = self.prove_many("coder", "S1", "U1")
         self.assertEqual((code, err), (0, ""))
         lines = out.strip().splitlines()
-        self.assertEqual(len(lines), 2)
+        self.assertEqual(len(lines), 3)   # one per scenario, then the final line
         self.assertIn(": S1 pass", lines[0])
         self.assertIn(": U1 pass", lines[1])
+        self.assertRegex(lines[2], r"^recorded #1, #2 \(proof ")
         self.assertEqual([e["scenario"] for e in self.ledger()], ["S1", "U1"])
 
     def test_prove_reports_a_scenario_already_recorded_at_this_head_and_plan(self):
@@ -35251,8 +35253,8 @@ class TestPlanLedger(LedgerBase):
         self.all_proven()
         self.assertEqual(self.prove("coder", "S1", result="fail")[0], 0)
         self.assertEqual(self.gates()[0], 1)
-        self.assertEqual(self.prove("coder", "S1")[0], 0)
-        self.assertEqual(self.gates()[0], 0)
+        self.assertEqual(self.prove("coder", "S1")[0], 4)   # #1049 M1: a pass after pass, fail at one head is refused: the fail stays the newest
+        self.assertEqual(self.gates()[0], 1)
         self.assertEqual(self.verdict("cibot", "S1", "ci", "fail")[0], 0)
         code, report, _ = self.gates()
         self.assertEqual(code, 1)
@@ -35362,6 +35364,337 @@ class TestPlanLedger(LedgerBase):
         for path in (BIN / "plan_ledger.py",):
             for number, line in enumerate(path.read_text().splitlines(), 1):
                 self.assertIsNone(FORBIDDEN_IN_PUBLIC_TEXT.search(line), "%s:%d %s" % (path.name, number, line))
+
+
+class TestRecordingCommands(LedgerBase):
+    """#1049: every recording command (the set is read from the code: the functions marked `@recording`) ends with ONE line, `recorded #<id>`, `already recorded #<id>` or
+    `not recorded: <reason>`, within ONE bound (`RECORD_WAIT_SECONDS`), and the same record again writes nothing. One row per member; one mutant per member."""
+
+    WAIT, PROGRESS = 2, 1   # the bound and the first word, shortened for the tests (the real values are the module's constants)
+    EXEMPT = {   # commands that reach a ledger append and are NOT recording commands of this contract (the plan's out-of-scope list); a new one is a failure until it is placed
+        "gates": "reads; its `ci-record` form is the daemon's recorder", "gates_ci_record": "the built-in `ci` recorder",
+        "item_prove": "a work item, not a pull request", "item_verdict": "a work item, not a pull request", "item_ci_record": "a work item, not a pull request",
+        "waive": "a waiver, not a proof or a verdict", "launch": "registers a tester; not a record of a judgement",
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.ledger_module = sb.load_plan_ledger()
+        for name, value in (("RECORD_WAIT_SECONDS", self.WAIT), ("RECORD_PROGRESS_SECONDS", self.PROGRESS)):
+            patcher = mock.patch.object(self.ledger_module, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.slow_read = 0
+        self.assertEqual(self.prove("coder", "S1")[0], 0)   # a known writer of the PR, so a verdict can be judged
+        self.holders = []
+        self.addCleanup(self.release)
+
+    def release(self):
+        while self.holders:
+            holder = self.holders.pop()
+            holder.kill()
+            holder.wait()
+            holder.stdout.close()
+
+    def route(self, argv, **kwargs):
+        if self.slow_read and argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+            time.sleep(self.slow_read)
+        return super().route(argv, **kwargs)
+
+    def hold_the_lock(self):
+        path = self.world.state / "plan-ledger.jsonl"
+        code = "import fcntl,os,sys,time\nfd=os.open(sys.argv[1],os.O_RDWR|os.O_CREAT)\nfcntl.flock(fd,fcntl.LOCK_EX)\nprint('held',flush=True)\ntime.sleep(60)\n"
+        self.release()   # one holder at a time: a second would wait for the first
+        holder = subprocess.Popen([sys.executable, "-c", code, str(path)], stdout=subprocess.PIPE, text=True)
+        self.holders.append(holder)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+
+    def invoke(self, name, head=None):
+        """One real run of the recording command `name`: (code, out, err). `head` is a wrong head for a refusal."""
+        if name == "prove":
+            return self.run_as("coder", "prove", "U1", "--pr", self.PR, "--evidence", "ran it: 3 passed", "--result", "pass", *(("--head", head) if head else ()))
+        if name == "verdict":
+            return self.run_as("tst", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "judged it", *(("--head", head) if head else ()))
+        if name == "review":
+            return self.run_as("coder", "review", "record", self.PR, "--reviewer", self.ledger_module.REVIEWERS[0], "--verdict", "approve", "--head", head or LEDGER_HEAD)
+        raise AssertionError("no way to run the recording command %r: add it to invoke()" % name)
+
+    KIND = {"prove": "proof", "verdict": "verdict", "review": "review_record"}
+
+    def rows(self, name):
+        return [e for e in self.ledger() if e["kind"] == self.KIND[name]]
+
+    def members(self):
+        return sorted(sb.recording_commands())
+
+    @staticmethod
+    def last(text):
+        lines = text.strip().splitlines()
+        return lines[-1] if lines else ""
+
+    # -- the checks (each is also run against a mutant below: it must fail there)
+
+    def check_success(self, name):
+        before = len(self.rows(name))
+        code, out, err = self.invoke(name)
+        self.assertEqual(code, 0, err)
+        found = re.match(r"^recorded #(\d+) ", self.last(out))
+        self.assertTrue(found, (name, out))
+        self.assertEqual(len(self.rows(name)), before + 1)
+        self.assertEqual(int(found.group(1)), self.rows(name)[-1]["seq"])
+
+    def check_refusal(self, name):
+        before = len(self.ledger())
+        code, out, err = self.invoke(name, head="f" * 40)
+        self.assertNotEqual(code, 0, (name, out, err))
+        self.assertRegex(self.last(err), r"^not recorded: .*head", name)
+        self.assertEqual(len(self.ledger()), before)
+
+    def check_retry(self, name):
+        first = self.invoke(name)
+        self.assertEqual(first[0], 0, first[2])
+        first_id = self.rows(name)[-1]["seq"]
+        count = len(self.ledger())
+        code, out, err = self.invoke(name)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.last(out).split(" (")[0], "already recorded #%d" % first_id, (name, out))
+        self.assertEqual(len(self.ledger()), count, "a retry wrote a row")
+
+    def check_timeout(self, name, hold=True):
+        before = self.ledger()
+        if hold:
+            self.hold_the_lock()
+        else:
+            self.slow_read = self.WAIT + 2
+        started = time.monotonic()
+        code, out, err = self.invoke(name)
+        elapsed = time.monotonic() - started
+        self.assertNotEqual(code, 0, (name, err))
+        self.assertLess(elapsed, self.WAIT + 1 + (0 if hold else 0.5), "waited past the bound")
+        self.assertRegex(self.last(err), r"^not recorded: timed out after %ds, check the ledger before retrying" % self.WAIT, (name, err))
+        self.assertIn("fleet-switchboard gates %s" % self.PR, self.last(err))
+        self.assertEqual(len(re.findall(r"waiting for (the ledger lock|a GitHub read)", err)), 2, err)   # said once while waiting, once in the last line
+        self.assertEqual(self.ledger(), before)
+        return err
+
+    # -- the rows
+
+    def test_the_members_are_the_marked_functions_and_every_kind_is_covered(self):
+        self.assertEqual(self.members(), ["prove", "review", "verdict"])
+        self.assertEqual(sorted(self.KIND), self.members())
+        self.assertEqual(sorted(sb.recording_commands().values()), sorted(self.ledger_module.RECORDED_KINDS))
+        self.assertEqual(sorted(self.KIND.values()), sorted(self.ledger_module.JUDGED_FIELDS))
+
+    def test_a_command_that_reaches_a_ledger_append_is_a_recording_command_or_named_exempt(self):
+        """Derived from the code: every `cmd_*` function that reaches a `plan_ledger.append_*` call, through the module's own functions, is marked or exempt."""
+        tree = ast.parse(SWITCHBOARD.read_text(encoding="utf-8"))
+        funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+        def called(node):
+            names = set()
+            for call in (c for c in ast.walk(node) if isinstance(c, ast.Call)):
+                f = call.func
+                if isinstance(f, ast.Name):
+                    names.add(f.id)
+                elif isinstance(f, ast.Attribute):
+                    names.add("plan_ledger." + f.attr if isinstance(f.value, ast.Name) and f.value.id == "plan_ledger" else f.attr)
+            return names
+        reach = {k for k, n in funcs.items() if any(c.startswith("plan_ledger.append") for c in called(n))}
+        changed = True
+        while changed:
+            changed = False
+            for name, node in funcs.items():
+                if name not in reach and called(node) & reach:
+                    reach.add(name)
+                    changed = True
+        commands = {n[4:] for n in reach if n.startswith("cmd_")}
+        marked = {n.replace("-", "_") for n in sb.recording_commands()}
+        self.assertEqual(sorted(commands - marked - set(self.EXEMPT)), [], "a command writes the ledger and is neither a recording command (@recording) nor exempt")
+        self.assertEqual(sorted(marked - commands), [])
+        self.assertEqual(sorted(set(self.EXEMPT) - commands), [], "an exempt command no longer writes the ledger: remove it from EXEMPT")
+
+    def test_success_prints_the_id_and_exits_zero(self):
+        for name in self.members():
+            with self.subTest(command=name):
+                self.check_success(name)
+
+    def test_a_refusal_prints_the_reason_last_and_exits_non_zero(self):
+        for name in self.members():
+            with self.subTest(command=name):
+                self.check_refusal(name)
+
+    def test_a_scenario_that_does_not_exist_is_refused_the_same_way(self):
+        code, out, err = self.run_as("coder", "prove", "S99", "--pr", self.PR, "--evidence", "x", "--result", "pass")
+        self.assertNotEqual(code, 0)
+        self.assertRegex(self.last(err), r"^not recorded: ")
+        code, out, err = self.run_as("tst", "verdict", "S99", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "x")
+        self.assertNotEqual(code, 0)
+        self.assertRegex(self.last(err), r"^not recorded: .*S99")
+
+    def test_the_same_record_again_writes_nothing_and_says_so_with_the_first_id(self):
+        for name in self.members():
+            with self.subTest(command=name):
+                self.check_retry(name)
+
+    def test_a_new_head_scenario_kind_or_reviewer_is_a_new_record(self):
+        base = len(self.ledger())
+        self.assertEqual(self.prove("coder", "U1")[0], 0)                                   # a new scenario
+        self.pr["headRefOid"] = "b" * 40
+        self.assertEqual(self.prove("coder", "S1")[0], 0)                                   # the same scenario at a new head
+        self.assertEqual(self.verdict("cibot", "S1", "ci")[0], 0)                          # another kind of the same scenario and head
+        for reviewer in self.ledger_module.REVIEWERS[:2]:                                   # another reviewer at the same head
+            code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", reviewer, "--verdict", "approve", "--head", "b" * 40)
+            self.assertEqual(code, 0, err)
+            self.assertRegex(self.last(out), r"^recorded #")
+        self.assertEqual(len(self.ledger()) - base, 5)
+
+    def test_a_pass_after_a_fail_at_one_head_is_a_new_record_and_a_retry_of_the_newest_is_not(self):
+        self.assertEqual(self.prove("coder", "U1", result="fail")[0], 0)
+        code, out, err = self.prove("coder", "U1", result="pass")
+        self.assertEqual(code, 0, err)
+        self.assertRegex(self.last(out), r"^recorded #3 ")                                  # the newest was the fail, no pass before it: the latest reader must see the pass
+        code, out, err = self.prove("coder", "U1", result="pass")
+        self.assertRegex(self.last(out), r"^already recorded #3 ")
+        # #1049 M1: pass, fail, pass at one key is a stale retry; it is refused (S8 in the verdict test) and the fail stays the newest
+        self.assertEqual(self.prove("coder", "U1", result="fail")[0], 0)
+        code, out, err = self.prove("coder", "U1", result="pass")
+        self.assertNotEqual(code, 0)
+        self.assertIn("not recorded: U1: a newer fail is recorded at this head", err)
+
+    def test_two_testers_identical_verdicts_are_two_records(self):
+        self.assertEqual(self.verdict("tst", "S2", "tester")[0], 0)
+        code, out, err = self.run_as("tst", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "again")
+        self.assertRegex(self.last(out), r"^already recorded #")
+        self.configure(evaluators={"reviewer": ["rev"], "tester": ["tst", "other"], "owner": ["own"], "ci": ["cibot"]})
+        code, out, err = self.run_as("other", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "judged it too")
+        self.assertEqual(code, 0, err)
+        self.assertRegex(self.last(out), r"^recorded #")
+
+    def test_a_lock_held_past_the_bound_prints_the_timeout_line_and_says_what_it_waits_for(self):
+        for name in self.members():
+            with self.subTest(command=name):
+                err = self.check_timeout(name)
+                self.assertEqual(len(re.findall(r"waiting for the ledger lock", err.split("not recorded:")[0])), 1)
+
+    def test_a_slow_github_read_is_bounded_by_the_same_constant(self):
+        for name in self.members():
+            with self.subTest(command=name):
+                err = self.check_timeout(name, hold=False)
+                self.assertIn("a GitHub read", err.split("not recorded:")[0])
+                self.assertIn("waiting for a GitHub read", err.split("not recorded:")[1])
+
+    def test_an_alarm_that_arrives_while_an_entry_is_written_does_not_hide_the_record(self):
+        original = self.ledger_module._write_head
+        def late(state_dir, entry):
+            time.sleep(self.WAIT + 0.5)   # the bound passes inside the critical section
+            return original(state_dir, entry)
+        before = len(self.rows("prove"))
+        with mock.patch.object(self.ledger_module, "_write_head", late):
+            code, out, err = self.invoke("prove")
+        self.assertEqual(code, 0, err)
+        self.assertRegex(self.last(out), r"^recorded #\d+ ")
+        self.assertEqual(len(self.rows("prove")), before + 1)
+
+    def test_every_wait_reads_its_bound_from_the_one_constant(self):
+        """No flock outside the bounded helper, no literal or missing timeout in the recording path, and the helper reads the constant."""
+        ledger_text = (BIN / "plan_ledger.py").read_text(encoding="utf-8")
+        tree = ast.parse(ledger_text)
+        helper = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_lock_exclusive")
+        self.assertIn("RECORD_WAIT_SECONDS", {n.id for n in ast.walk(helper) if isinstance(n, ast.Name)})
+        flocks_outside = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "flock"
+                          and not (helper.lineno <= n.lineno <= helper.end_lineno)]
+        self.assertEqual(flocks_outside, [], "a ledger wait outside `_lock_exclusive` has no bound")
+        text = SWITCHBOARD.read_text(encoding="utf-8")
+        functions = {n.name: n for n in ast.parse(text).body if isinstance(n, ast.FunctionDef)}
+        bad = []
+        for name in ("run_recording", "cmd_prove", "cmd_verdict", "cmd_review", "_ledger_context", "_record", "_head_of"):
+            for call in (c for c in ast.walk(functions[name]) if isinstance(c, ast.Call)):
+                for kw in call.keywords:
+                    if kw.arg in ("timeout", "patience") and isinstance(kw.value, ast.Constant):
+                        bad.append((name, call.lineno))
+        self.assertEqual(bad, [], "a wait in the recording path with its own literal timeout")
+
+    # -- the mutants: each must fail at least one of the checks above, for every member
+
+    def test_a_mutant_that_prints_nothing_on_a_timeout_is_caught(self):
+        for name in self.members():
+            with self.subTest(command=name), mock.patch.object(sb, "not_recorded_timeout", lambda pr, step: ""):
+                with self.assertRaises(AssertionError):
+                    self.check_timeout(name)
+
+    def test_a_mutant_that_records_on_retry_is_caught(self):
+        for name in self.members():
+            with self.subTest(command=name), mock.patch.object(self.ledger_module, "already_recorded", lambda entries, entry: None):
+                with self.assertRaises(AssertionError):
+                    self.check_retry(name)
+
+    def test_a_mutant_that_exits_zero_on_a_refusal_is_caught(self):
+        for name in self.members():
+            with self.subTest(command=name), mock.patch.object(sb, "EXIT_USAGE", 0):
+                with self.assertRaises(AssertionError):
+                    self.check_refusal(name)
+
+    # -- #1049 S8 / S9: a stale pass never flips a fail back; `by` is in the key for a verdict and a review, not for a prove
+
+    REFUSAL = "a newer fail is recorded at this head: re-test at a new head or waive"
+
+    def check_stale_pass(self):
+        self.assertEqual(self.run_as("tst", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "judged it")[0], 0)
+        self.assertEqual(self.run_as("tst", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "fail", "--evidence", "broke")[0], 0)
+        before = len(self.rows("verdict"))
+        code, out, err = self.run_as("tst", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "judged it")
+        self.assertNotEqual(code, 0, out)
+        self.assertEqual(self.last(err), "not recorded: " + self.REFUSAL)
+        self.assertEqual(len(self.rows("verdict")), before, "the stale pass wrote a row")
+        self.assertEqual(self.rows("verdict")[-1]["result"], "fail")
+
+    def test_s8_a_pass_retry_after_a_newer_fail_is_refused_and_writes_nothing(self):
+        self.check_stale_pass()
+
+    def test_s8_a_fail_after_a_pass_still_records(self):
+        self.assertEqual(self.run_as("tst", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "x")[0], 0)
+        code, out, err = self.run_as("tst", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "fail", "--evidence", "y")
+        self.assertEqual(code, 0, err)
+        self.assertRegex(self.last(out), r"^recorded #\d+ ")
+
+    def test_s8_a_mutant_that_writes_the_third_row_is_caught(self):
+        with mock.patch.object(self.ledger_module, "stale_pass", lambda entries, entry: False):
+            with self.assertRaises(AssertionError):
+                self.check_stale_pass()
+
+    def check_prove_key(self):
+        self.assertEqual(self.prove("coder", "S1")[0], 0)   # (setUp proved S1 by the coder already)
+        before = len(self.rows("prove"))
+        code, out, err = self.prove("tst", "S1")
+        self.assertEqual(code, 0, err)
+        self.assertRegex(self.last(out), r"^already recorded #\d+ ")
+        self.assertEqual(len(self.rows("prove")), before, "a prove by another agent wrote a row")
+
+    def test_s9_a_prove_by_another_agent_is_already_recorded(self):
+        self.check_prove_key()
+
+    def test_s9_a_verdict_by_another_agent_is_a_second_row(self):
+        self.configure({"reviewer": ["rev"], "tester": ["tst", "other"], "owner": ["own"], "ci": ["cibot"]})
+        self.assertEqual(self.run_as("tst", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "a")[0], 0)
+        n = len(self.rows("verdict"))
+        code, out, err = self.run_as("other", "verdict", "S2", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "b")
+        self.assertEqual(code, 0, err)
+        self.assertRegex(self.last(out), r"^recorded #")
+        self.assertEqual(len(self.rows("verdict")), n + 1)
+
+    def test_s9_a_mutant_with_by_in_the_prove_key_is_caught(self):
+        real = self.ledger_module.record_identity
+        def mutant(entry):
+            return real(entry) + (entry.get("by"),)
+        with mock.patch.object(self.ledger_module, "record_identity", mutant):
+            with self.assertRaises(AssertionError):
+                self.check_prove_key()
+
+    def test_the_documentation_states_the_three_outcomes_and_the_check_before_a_retry(self):
+        text = (BIN.parent / "docs" / "switchboard.md").read_text(encoding="utf-8")
+        found = re.search(r"(?ms)^#+ What a recording command ends with \(#1049\)\n(.*?)(?=^#+ |\Z)", text)
+        self.assertTrue(found, "docs/switchboard.md has no section 'What a recording command ends with (#1049)'")
+        for phrase in ("recorded #", "already recorded #", "not recorded:", "timed out after", "fleet-switchboard gates"):
+            self.assertIn(phrase, found.group(1))
 
 
 class TestLedgerReadRace(unittest.TestCase):
@@ -37848,6 +38181,9 @@ class TestBlockTable(LedgerBase):
                     self.assertEqual(len(self.records()), before)
                 else:
                     self.assertEqual(code, 0, err)
+                    if out.strip().splitlines()[-1].startswith("already recorded"):   # #1049: the same record as the newest is not written again
+                        self.assertEqual(len(self.records()), before)
+                        continue
                     self.assertEqual(len(self.records()), before + 1)
                     if flag != "--summary":
                         self.assertEqual(self.records()[-1].get("carry_confirmed" if dest == "confirms_carry" else dest), (self.ROW_FLAGS[flag] or (True,))[0])
@@ -83957,7 +84293,11 @@ class TestItemVerdicts(unittest.TestCase):
                 mock.patch.object(sb, "identify_caller", lambda *a: caller), mock.patch.object(sb, "checked_plan", lambda *a, **k: self.plan), \
                 mock.patch.object(sb, "launched_testers_for", lambda c: (launch, self.sessions, self.fleets)), mock.patch.object(sb, "gates_caller_kind", lambda *a: ("agent", "x", "chief-of-staff")):
             try:
-                return getattr(sb, command)(args, None, self.now), None
+                with captured() as (out, err):
+                    code = getattr(sb, command)(args, None, self.now)
+                if code == sb.EXIT_USAGE:   # #1049: a recording command ends `not recorded: <reason>` (exit 2) instead of raising
+                    return None, err.getvalue()
+                return code, None
             except sb.LedgerCommandError as err:
                 return None, str(err)
 
@@ -88838,6 +89178,10 @@ class TestAskIssueSubject(unittest.TestCase):
                 code = getattr(sb, command)(args, None, self.now)
             except sb.LedgerCommandError as exc:
                 return None, str(exc), out.getvalue(), err.getvalue()
+        text = err.getvalue()
+        if code == 2 and ("not recorded:" in text or "refused:" in text) and command != "cmd_gates_ask_close":
+            # the wrapper turns a refusal into a final line on stderr and exit 2: same refusal, same shape as a raised one
+            return None, text.strip(), out.getvalue(), text
         return code, None, out.getvalue(), err.getvalue()
 
     def prove(self, sid, **kw):
