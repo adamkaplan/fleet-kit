@@ -36,6 +36,8 @@ CHECKPOINT: <a UTC time or an agreed event, with an overdue time>
 
 A coder that posts a plan also reports `working: plan posted <hash> <url>` (a report arrives even when a send is lost).
 
+A coder brief says: durable helper scripts go in the agent's own scratch directory (once #948 provides it), until then in a named directory under the switchboard's state area that no janitor lists (e.g. `~/.local/state/fleet-switchboard/scratch/<agent>`); the shared temporary directory is for one session's scratch only (the OS clears it at boot and files unread for 3 days).
+
 A brief for a credential, permission or privileged-script change links `docs/adversarial-checklist.md`.
 The pull request body answers each item of it in one line. A Mermaid diagram appears only where it shows data flow, system design or component design, never at the top of a body and never as a summary of what changes, what it touches, what is irreversible and the risk.
 
