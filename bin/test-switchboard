@@ -2667,7 +2667,7 @@ class TestFacts(Base):
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
 
     def test_every_fact_source_class_in_the_module_is_registered(self):   # #1030: derived, so a new source cannot be left out
         registered = {type(s).__name__ for s in sb.fact_sources(self.home)}
@@ -11398,7 +11398,7 @@ class TestFrictionWake(FrictionBase):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "plan_wake_facts", "alert_wake_facts", "red_ci_facts", "job_facts", "pane_facts", "pane_exit_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts", "heavy_orphan_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
         self.make("off")
@@ -15812,9 +15812,13 @@ class CharterRig:
         self.cmd_labels = {1: True, 3: True, 4: True, 9: True, 5: False, 6: False, 7: False}
         self.cmd_reads = []
         def cmd_parent(reader, number, repo=None):
+            if repo != self.REPO:
+                raise sb.IntentError("not_found", "read for the wrong repository: %r" % (repo,))   # #1141: the fake honours the repo argument
             self.cmd_reads.append(("parent", number))
             return self.cmd_parents[number]
         def cmd_issue(reader, number, repo=None):
+            if repo != self.REPO:
+                raise sb.IntentError("not_found", "read for the wrong repository: %r" % (repo,))
             self.cmd_reads.append(("issue", number))
             return types.SimpleNamespace(number=number, labels=[sb.orchestrator_label()] if self.cmd_labels[number] else ["other"])
         for name, fake in (("parent", cmd_parent), ("issue", cmd_issue)):
@@ -16194,6 +16198,14 @@ class TestCharterSetGuard(CharterRig, Base):
 
     def audit_lines(self):
         return [e for e in self.world.audit() if e["event"].startswith("charter.") and e["event"] != "charter.disagree"]
+
+    def test_label_is_read_fresh_and_for_the_right_repository(self):
+        self.orchestrator("orch-b", registry=None)
+        seen = []
+        with mock.patch.object(sb.IntentReader, "invalidate", lambda reader, issue, repo=None: seen.append((issue, repo))):
+            self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertIn((3, self.REPO), seen)
+        self.assertTrue(all(r[0] == "parent" or r[0] == "issue" for r in self.cmd_reads))
 
     def test_non_orchestrator_is_refused_and_audited(self):
         self.world.add_agent("worker", fleet={"role": "coder", "reports_to": "orch-b", "repo": self.REPO})
@@ -32340,6 +32352,125 @@ class TestAlertRefreshOrder(Base):
         self.state.units.clear()
         order = self.refresh(["acme-org/r5", "acme-org/r6"], budget=3)
         self.assertEqual(order, [("acme-org/r5", "issues"), ("acme-org/r6", "issues")])
+
+
+class TestRedCi(Base):
+    """#1141: a required check failing at a worker-owned open head, and a red or green default branch, are told once. Real catch-up judge, fakes and temp dirs."""
+    REPO = "acme-org/widget-service"
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={"github_repos": [self.REPO]})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.world.add_agent("orch", fleet={"role": "orchestrator", "charter": 1, "repo": self.REPO})
+        self.world.add_agent("other", fleet={"role": "orchestrator", "charter": 2, "repo": "acme-org/other-service"})
+        self.world.add_agent("worker", fleet={"role": "coder", "issue": 7, "repo": self.REPO, "reports_to": "orch"})
+        self.engine = self.world.engine
+        self.engine.config["red_ci_required"] = {self.REPO: ["build"]}
+        self.engine.discover(self.world.clock.now())
+        self.source = sb.RedCiFacts()
+        self.source.bind(self.engine)
+        self.rid = 100
+
+    def run_rec(self, conclusion, head="h1", name="build", pr=7, branch="main", status="completed"):
+        self.rid += 1
+        rec = {"id": self.rid, "name": name, "status": status, "conclusion": conclusion, "head_sha": head, "head_branch": branch,
+               "html_url": "https://example.test/run/%d" % self.rid, "created_at": "2026-10-24T10:%02d:00Z" % (self.rid % 60), "pull_requests": [{"number": pr}] if pr else []}
+        return rec
+
+    def feed(self, *runs):
+        self.world.tick(1)
+        sb.red_ci_runs(self.engine, self.REPO, list(runs), self.world.clock.now())
+
+    def lines(self, name):
+        self.engine.sources = [self.source]
+        return [f.summary for f in self.engine.collect_facts()[0] if f.recipient == name]
+
+    def test_failure_once_per_head_and_check(self):
+        self.feed(self.run_rec("failure", "h1"))
+        self.assertEqual(len(self.lines("orch")), 1)
+        self.assertIn("h1", self.lines("orch")[0])
+        self.assertIn("https://example.test/run/", self.lines("orch")[0])
+        self.feed(self.run_rec("failure", "h1"))
+        self.assertEqual(len(self.lines("orch")), 1)    # same head and check again: none
+        self.feed(self.run_rec("failure", "h2"))
+        self.assertEqual(len(self.lines("orch")), 2)    # a new head is a new event
+        self.assertEqual(self.lines("cos"), [])
+        self.assertEqual(self.lines("other"), [])
+
+    def test_restart_does_not_repeat(self):
+        self.feed(self.run_rec("failure", "h1"))
+        self.engine.red_ci = None
+        self.feed(self.run_rec("failure", "h1"))
+        self.assertEqual(len(self.lines("orch")), 1)
+
+    def test_nothing_for_quiet_conclusions_or_unrequired_or_unowned(self):
+        for conclusion, status in (("cancelled", "completed"), ("skipped", "completed"), ("neutral", "completed"), (None, "in_progress")):
+            self.feed(self.run_rec(conclusion, "h9", status=status))
+        self.feed(self.run_rec("failure", "h9", name="lint"))       # not required
+        self.feed(self.run_rec("failure", "h9", pr=55))             # no worker owns #55
+        self.assertEqual(self.lines("orch"), [])
+
+    def test_red_branch_alarm_receivers_and_green(self):
+        self.feed(self.run_rec("failure", "m1", pr=None))
+        for name in ("orch", "cos"):
+            self.assertEqual(len(self.lines(name)), 1, name)
+        self.assertEqual(self.lines("other"), [])
+        self.assertEqual(self.lines("worker"), [])
+        self.feed(self.run_rec("failure", "m1", pr=None))
+        self.assertEqual(len(self.lines("orch")), 1)
+        self.feed(self.run_rec("success", "m2", pr=None))
+        for name in ("orch", "cos"):
+            self.assertEqual(len(self.lines(name)), 2, name)
+            self.assertTrue(any("green again" in l for l in self.lines(name)))
+
+    def test_cancelled_default_run_alarms_nobody(self):
+        self.feed(self.run_rec("cancelled", "m1", pr=None))
+        self.assertEqual(self.lines("cos") + self.lines("orch"), [])
+
+    def test_no_orchestrator_remembers_nothing(self):
+        self.engine.config["red_ci_required"] = {self.REPO: ["build"]}
+        self.engine.discovery.agents.pop("orch")
+        self.feed(self.run_rec("failure", "h1"))
+        self.assertEqual(self.engine.red_ci.told, {})
+
+    def test_hourly_bound(self):
+        for i in range(sb.RED_CI_PER_HOUR + 5):
+            self.feed(self.run_rec("failure", "x%d" % i))
+        self.assertEqual(len(self.lines("orch")), sb.RED_CI_PER_HOUR)
+
+    def test_mutants_fail(self):
+        def scenario():
+            self.setUp()
+            self.feed(self.run_rec("failure", "h1")); self.feed(self.run_rec("failure", "h1"))
+            repeat = len(self.lines("orch"))
+            self.feed(self.run_rec("cancelled", "m0", pr=None))
+            cancelled = len(self.lines("cos"))
+            self.feed(self.run_rec("failure", "m1", pr=None)); self.feed(self.run_rec("success", "m2", pr=None))
+            return repeat, cancelled, len(self.lines("cos"))
+        self.assertEqual(scenario(), (1, 0, 2))
+        module = sb.load_module("red_ci")
+        real_tell = sb.red_ci_tell
+        def repeating(engine, state, key, repo, text, names, now):
+            state.told.pop(key, None)
+            repeating.n += 1
+            return real_tell(engine, state, key + "#%d" % repeating.n, repo, text, names, now)
+        repeating.n = 0
+        with mock.patch.object(sb, "red_ci_tell", repeating):
+            self.assertNotEqual(scenario()[0], 1)
+        with mock.patch.dict(module.COLOUR, {"cancelled": "red"}):
+            self.assertNotEqual(scenario()[1], 0)
+        with mock.patch.dict(module.COLOUR, {"success": "none"}):
+            self.assertNotEqual(scenario()[2], 2)
+
+    def test_table_is_complete_and_agrees_with_the_existing_notice(self):
+        module = sb.load_module("red_ci")
+        known = {"success", "failure", "neutral", "cancelled", "skipped", "timed_out", "action_required", "stale", "startup_failure"}
+        self.assertEqual(set(module.COLOUR), known)
+        self.assertTrue({k for k, v in module.COLOUR.items() if v == "red"} <= set(sb.ACTIONABLE_CONCLUSIONS))
+        self.assertEqual(module.colour({"status": "in_progress", "conclusion": "failure"}), "none")
+        self.assertEqual(module.colour({"conclusion": "unheard-of"}), "none")
+
 
 
 class TestAlertWake(Base):
