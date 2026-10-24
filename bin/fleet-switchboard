@@ -29642,7 +29642,7 @@ CLOUD_ENV_SETTING_NAMES = ("CW_ALLOWED_REPOS", "CW_TOOLING_REPO", "CW_CLOUD_IMAG
                             "CW_MODEL_AUTH_FILE", "CW_RUN_RECORD_DIR", "CW_CLOUD_SPEND_CAP_USD", "CW_CLUSTER_TOKEN_CMD",
                             "CW_CLUSTER_ADMIN_CMD", "CW_GIT_TOKEN_CMD", "CW_APP_ID_CMD", "CW_APP_INSTALLATION_CMD",
                             "CW_APP_KEY_CMD", "CW_CLUSTER_ADMIN_SECRET", "CW_CLUSTER_TOKEN_DURATION", "CW_VAULT_CHECK_DIR")
-REAPER_CLUSTER_NAMES = ("CW_CLOUD_SERVER", "CW_CLOUD_NAMESPACE", "CW_CLOUD_TOKEN_FILE")   # the cluster login the reaper needs
+REAPER_CLUSTER_NAMES = ("CW_CLOUD_SERVER", "CW_CLOUD_NAMESPACE", "CW_CLOUD_TOKEN_FILE")   # the cluster login the reaper needs (the token file: the install's environment, else a default)
 REAPER_VAULT_NAMES = ("CW_VAULT_NAME", "CW_VAULT_SUBSCRIPTION")   # the vault names (CW_CLUSTER_ADMIN_SECRET has a default: optional)
 # The reaper's NON-SECRET settings the installer copies from its own environment into the service (names of a cluster or a
 # namespace, paths of files). A token is never among them: the reaper reads the token FILE by path.
@@ -30574,61 +30574,48 @@ def reaper_service_settings(env, settings_file=None):
     return found
 
 
-def settings_file_stat(path):
-    """The settings file's stat (a link is not followed). A seam for the tests."""
-    return os.lstat(str(path))
-
-
-def settings_file_text(path):
-    """The settings file's text. A seam for the tests."""
-    with open(str(path), "r", encoding="utf-8") as handle:
-        return handle.read()
+def launcher_module():
+    """The cloud launcher's own module (<kit>/cloud/launcher/cloud_worker.py), loaded by path under its own name so it
+    never meets bin/cloud_worker.py. The installer judges the settings file with the launcher's own reader."""
+    import importlib.util
+    path = KIT_ROOT / "cloud" / "launcher" / "cloud_worker.py"
+    spec = importlib.util.spec_from_file_location("fleet_kit_cloud_launcher", str(path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def reaper_settings_problem(path=None, env=None):
     """None when the reaper-only install may write its service, else ONE line saying what is wrong and what to do. The
-    rule is the launcher's own (cloud/launcher/cloud_worker.py, _read_settings_file): the file exists, is a regular file of
-    the user's own, and nobody else may read or write it (0600). It must hold the cluster login names and the vault names.
-    CW_CLOUD_TOKEN_FILE is not a key the launcher's file can hold: it comes from the environment of the install (it is
-    carried into the service), so the environment counts for that one name. A value is never printed."""
+    rule is the launcher's own: this CALLS the launcher's reader (_read_settings_file, then parse_settings), so the
+    installer refuses exactly what a launch would refuse (a quoted value, an unknown line, a bad server, namespace, vault
+    name or subscription, a missing CW_ALLOWED_REPOS or CW_CLOUD_IMAGE, a hard link, a symlink, a directory, a file or a
+    parent directory others can write, a foreign owner). The reaper's own names (cluster login, vault names) are then
+    required on top. The launcher's refusal text names the file and the line, never a value."""
     path = Path(path) if path is not None else cloud_settings_path()
-    env = os.environ if env is None else env
     shown = str(path)
     home = str(Path.home())
     if shown.startswith(home + os.sep):
         shown = "~" + shown[len(home):]
-    head = "cloud reaper not installed: %s " % shown
+    head = "cloud reaper not installed: "
+    if not os.path.lexists(str(path)):
+        return head + "%s is missing: create it (mode 600) with the settings a launch needs" % shown
+    launcher = launcher_module()
     try:
-        info = settings_file_stat(path)
-    except FileNotFoundError:
-        return head + "is missing: create it (mode 600) with the cluster login and the vault names"
-    except OSError as err:
-        return head + "cannot be examined (%s): fix its directory and run again" % type(err).__name__
-    if not stat.S_ISREG(info.st_mode):
-        return head + "is not a regular file (a link or something else): make it a plain file of your own, mode 600"
-    if info.st_uid != os.geteuid():
-        return head + "is owned by another user: it must be your own file"
-    mode = stat.S_IMODE(info.st_mode)
-    if mode & 0o077:
-        what = "group-readable" if mode & 0o040 else "group-writable" if mode & 0o020 else "open to others"
-        return head + "is %s (%04o): chmod 600 it" % (what, mode)
-    try:
-        text = settings_file_text(path)
-    except (OSError, UnicodeDecodeError) as err:
-        return head + "cannot be read (%s): chmod 600 it, as your own file" % type(err).__name__
-    held = set()
-    for line in text.split("\n"):
-        key, sign, value = line.strip().partition("=")
-        if sign and not key.startswith("#") and value.strip():
-            held.add(key.strip())
-    for name in REAPER_CLUSTER_NAMES:
-        if name not in held and not (name == "CW_CLOUD_TOKEN_FILE" and (env.get(name) or "").strip()):
-            where = ("set it in the shell that runs the install (the settings file cannot hold it)"
-                     if name == "CW_CLOUD_TOKEN_FILE" else "add it to the file")
-            return head + "is missing the cluster login name %s: %s" % (name, where)
-    for name in REAPER_VAULT_NAMES:
-        if name not in held:
-            return head + "is missing the vault name %s: add it to the file" % name
+        text = launcher._read_settings_file(str(path))
+        if text is None:
+            return head + "%s is missing: create it (mode 600) with the settings a launch needs" % shown
+        values = launcher.parse_settings(text, shown)
+    except launcher.CloudError as err:
+        said = " ".join(str(err).split()).replace(str(path), shown)
+        said = said[len("refused: "):] if said.startswith("refused: ") else said
+        return head + said.replace("; nothing was called", "") + ": fix it as a launch needs, then run again"
+    for name in REAPER_CLUSTER_NAMES + REAPER_VAULT_NAMES:
+        if name == "CW_CLOUD_TOKEN_FILE":   # not a key the launcher's file can hold: the install's environment carries it
+            if not ((os.environ if env is None else env).get(name) or "").strip():
+                return head + "%s is missing the cluster login name %s: set it in the shell that runs the install (the settings file cannot hold it)" % (shown, name)
+        elif name not in values:
+            return head + "%s is missing the name %s: add it to the file" % (shown, name)
     return None
 
 
