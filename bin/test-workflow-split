@@ -122,7 +122,8 @@ OLD_JOB = [("bin/check-public-names", "python3 bin/check-public-names", None),
 NEW_JOB = [suite("bin/test-cloud-worker"), suite("bin/test-cloud-launcher", "", "30")]
 MOVED = [n for n, _, _ in NEW_JOB]
 OLD_CHECKS = ["test (ubuntu-latest)", "test (macos-latest)"]
-CONCURRENCY = {"group": "test-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}",
+# ask #1235: a `reopened` run (the gate pass's, on the merge ref) has a group of its own, so a later push never cancels it; the check names are unchanged.
+CONCURRENCY = {"group": "test-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}${{ github.event.action == 'reopened' && '-reopened' || '' }}",
                "cancel-in-progress": "${{ github.event_name == 'pull_request' }}"}
 TRIGGERS = ["pull_request", "push", "schedule", "workflow_dispatch"]
 MATRIX = ["ubuntu-latest", "macos-latest"]
@@ -189,7 +190,7 @@ def resolved(job, event, base="", draft=False, text=None):
     with tempfile.TemporaryDirectory() as tmp:
         out = os.path.join(tmp, "out.txt")
         open(out, "w").close()
-        env = dict(os.environ, EVENT=event, BASE=base, DRAFT="true" if draft else "false", GITHUB_OUTPUT=out)
+        env = dict(os.environ, EVENT=event, BASE=base, DRAFT="true" if draft else "false", ACTION="", LABELS="", RUNNER_TEMP=tmp, GITHUB_OUTPUT=out)
         subprocess.run(["bash", "-c", run], cwd=tmp, env=env, check=True, capture_output=True)
         line = [l for l in open(out).read().splitlines() if l.startswith("matrix=")][-1]
     rows = json.loads(line[len("matrix="):])
@@ -233,7 +234,7 @@ class Pins(unittest.TestCase):
         self.assertEqual(job["name"], JOB_NAMES["test"])   # the name now comes from the plan's matrix; what it RESOLVES to is the intent
         for event, base in (("pull_request", "main"), ("push", ""), ("workflow_dispatch", "")):
             self.assertEqual(resolved(job, event, base, text=self.text), sorted(OLD_CHECKS), event)
-        self.assertEqual(resolved(job, "pull_request", "main", draft=True, text=self.text), ["test (ubuntu-latest)"])   # a draft into main: ubuntu only (ask #990)
+        self.assertEqual(resolved(job, "pull_request", "main", draft=True, text=self.text), sorted(OLD_CHECKS))   # ask #1235: the draft/label/diff decision reads the base's bin/macos_plan.py; in this empty directory it is unreadable, so macOS runs (fail safe). The decisions are pinned with a real repository in test-switchboard WorkflowPlanPins
 
     def test_u3_the_old_job_keeps_its_matrix_runner_and_shell(self):
         job = self.jobs()["test"]
@@ -368,6 +369,9 @@ class Mutants(unittest.TestCase):
 
     def test_s6_concurrency_group_changed(self):
         self.fails("github.event.pull_request.number || github.sha }}", "github.sha }}", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
+
+    def test_s6_the_reopened_group_dropped(self):
+        self.fails("${{ github.event.action == 'reopened' && '-reopened' || '' }}", "", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
 
     def test_s6_cancel_in_progress_always_true(self):
         self.fails("${{ github.event_name == 'pull_request' }}", "true", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")

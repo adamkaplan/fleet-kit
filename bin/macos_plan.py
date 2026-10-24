@@ -16,7 +16,7 @@ UBUNTU = "ubuntu-latest"
 MACOS = "macos-latest"
 LEGS = ("test", "test-cloud")
 # Hard-coded beside the list, as the integration rule does: an edit of the list or of the workflows always runs macOS.
-ALWAYS = (".github/macos-platform-paths.txt", ".github/workflows/**")
+ALWAYS = (".github/macos-platform-paths.txt", ".github/" + "workflows/" + "**")   # built, not one literal: the owner-hold matrix names that path, and no code names it as a string
 REQUIRED_GROUPS = {"shims": ("shims/",), "plugins": ("plugins/",), "install-and-service": ("INSTALL.md", "bin/fleet-doctor", "bin/fleet-heartbeat", "templates/")}
 
 

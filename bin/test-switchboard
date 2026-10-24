@@ -9859,7 +9859,7 @@ class WorkflowPlanPins(unittest.TestCase):
         check("\n  test:\n    needs: plan\n    name: ${{ matrix.name }}\n" in text, "test is named by the plan's name")
         check("\n  test-cloud:\n    needs: plan\n    name: ${{ matrix.cloud }}\n" in text, "test-cloud is named by the plan's cloud name")
         check(jobs.count("include: ${{ fromJSON(needs.plan.outputs.matrix) }}") == 2, "both take the plan's matrix")
-        check('"origin/" + base + ":bin/macos_plan.py"' in text and text.count('"diff", "--no-renames", "--name-only"') == 2, "the plan reads bin/macos_plan.py from the base and both diffs ignore renames")
+        check('"origin/" + base + ":bin/macos_plan.py"' in text and text.count('"--no-renames", "--name-only"') == 2, "the plan reads bin/macos_plan.py from the base and both diffs ignore renames")
         check(jobs.count("ref: ${{ matrix.ref }}") == 2, "the nightly leg checks out its own ref")
         check("PATH_LIST" not in text and 'LIST = ".github/macos-platform-paths.txt"' in text and "origin/\" + base + \":\" + LIST" in text, "the plan reads the one list file, from the base")
         groups = self.groups(listtext)
@@ -9966,7 +9966,7 @@ class WorkflowPlanPins(unittest.TestCase):
             ("the fail-safe lines not in the summary", swap("summary.write(message", "summary.write(''"), listtext),
             ("the summary written only for the log", swap('if os.environ.get("GITHUB_STEP_SUMMARY"):', "if False:"), listtext),
             ("the path list emptied", text, "# group: shims\n"),
-            ("renames detected", text.replace('"diff", "--no-renames", "--name-only"', '"diff", "--name-only"'), listtext),
+            ("renames detected", text.replace('"--no-renames", "--name-only"', '"--name-only"'), listtext),
             ("a failed diff skips macOS", swap("macos = diff.returncode != 0 or LIST in files or any(", "macos = diff.returncode == 0 and any("), listtext),
             ("an empty list runs no macOS", swap("if not patterns:", "if False:"), listtext),
             ("a missing list crashes", swap("if shown.returncode == 0 else []", "if shown.returncode == 0 else [][0]"), listtext),
@@ -84050,6 +84050,7 @@ class TestMergeGatePassAndMerge(MergeGateBase):
         source = (BIN / "merge_gate.py").read_text()
         self.assertEqual(source.count(old), 1, old)
         module = types.ModuleType("merge_gate_mutant")
+        module.__file__ = str(BIN / "merge_gate.py")   # the module reads its sibling macos_plan.py
         exec(compile(source.replace(old, new), "merge_gate_mutant.py", "exec"), module.__dict__)
         return module
 
@@ -84074,6 +84075,7 @@ class TestMergeGateMutants(MergeGateBase):
         source = (BIN / "merge_gate.py").read_text()
         self.assertEqual(source.count(old), 1, "the mutation target must be in the module exactly once: " + old)
         module = types.ModuleType("merge_gate_mutant")
+        module.__file__ = str(BIN / "merge_gate.py")   # the module reads its sibling macos_plan.py
         exec(compile(source.replace(old, new), "merge_gate_mutant.py", "exec"), module.__dict__)
         return module
 
@@ -84291,6 +84293,7 @@ class TestGhShimMergeGate(Base):
         old = '["--match-head-commit", head], own=False)'
         self.assertEqual(source.count(old), 1)
         mutant = types.ModuleType("merge_gate_mutant")
+        mutant.__file__ = str(BIN / "merge_gate.py")   # the module reads its sibling macos_plan.py
         exec(compile(source.replace(old, '["--match-head-commit", head], own=True)'), "merge_gate_mutant.py", "exec"), mutant.__dict__)
         with self.assertRaises(AssertionError):
             self.test_pass_and_merge_through_the_real_shim_refuses_a_blocking_review(mutant)
@@ -87498,6 +87501,90 @@ class TestMacosLegs(unittest.TestCase):
         self.assertTrue(ns2["legs_reading"](self.GREEN, self.GREEN + skipped)[0], "the mutant reads a skipped leg as green")
         self.assertFalse(real.legs_reading(self.GREEN, self.GREEN + skipped)[0])
 
+    def fake_gh(self, head, runs):
+        """A gh that answers the run list at `head` and the jobs of each run: runs = {run id: [(job name, conclusion)]}, newest id last."""
+        def gh(argv):
+            url = argv[1] if argv[0] == "api" else ""
+            if "/actions/runs?" in url:
+                return 0, json.dumps({"workflow_runs": [{"id": i, "name": "test", "workflow_id": 1, "head_sha": head, "status": "completed", "conclusion": "success",
+                                                         "created_at": "2026-01-01T00:00:%02dZ" % i, "pull_requests": []} for i in runs]}), ""
+            for i, jobs in runs.items():
+                if "/runs/%s/jobs" % i in url:
+                    return 0, json.dumps({"jobs": [{"name": n, "conclusion": c} for n, c in jobs]}), ""
+            return 1, "", "no such call"
+        return gh
+
+    def real_g4(self, rollup, runs):
+        """G4 through the REAL fact-building path: _ledger_context builds the facts (the rollup's checks, then merge_ref_checks from the runs at the head), evaluate_gates reads them."""
+        head = "a" * 40
+        facts = {"head": head, "ci": "green", "checks": rollup, "body": "", "state": "open"}
+        ctx_facts = {}
+        with mock.patch.object(sb, "build_engine", return_value=(object(), {}, {"intent_repo": None})), \
+             mock.patch.object(sb, "pr_picture", return_value=(dict(facts), "", [], None)), \
+             mock.patch.object(sb.plan_ledger, "read_ledger", return_value=([], None)), \
+             mock.patch.object(sb, "merge_gate_gh", return_value=self.fake_gh(head, runs)):
+            ctx = sb._ledger_context(types.SimpleNamespace(pr="acme/widget#5", plan=None, ask=None, head=None), subprocess.run, lambda: 0, False)
+        self.assertIn("merge_ref_checks", ctx.facts)
+        plan = {"result": "pass", "defects": [], "scenarios_parsed": [], "text": "", "plan_hash": "x"}
+        rows = sb.plan_ledger.evaluate_gates(plan, [], None, ctx.facts, {"head": head}, now=0)["gates"]
+        return next(r for r in rows if r["gate"] == "G4"), ctx.facts
+
+    def test_g4_merge_ref_is_reachable_through_the_real_fact_path_for_each_situation(self):
+        jobs = lambda *c: [(n, "success") for n in ("test (ubuntu-latest)", "test-cloud (ubuntu-latest)")] + list(c)
+        mac = [("test (macos-latest)", "success"), ("test-cloud (macos-latest)", "success")]
+        # head: the rollup already holds green macOS legs
+        row, _ = self.real_g4(self.GREEN + self.MAC, {1: jobs(*mac)})
+        self.assertEqual(row["status"], "ok")
+        self.assertIn("at the head", row["detail"])
+        # merge ref: the rollup lacks macOS; the newest run at the head (the gate pass's reopened run) has green macOS legs
+        row, facts = self.real_g4(self.GREEN, {1: jobs(), 2: jobs(*mac)})
+        self.assertEqual(row["status"], "ok")
+        self.assertIn("merge ref", row["detail"])
+        self.assertEqual(len(facts["merge_ref_checks"]), 4)
+        # never: no macOS leg anywhere (no gate-pass run), and a skipped leg on the newest run
+        row, facts = self.real_g4(self.GREEN, {1: jobs()})
+        self.assertEqual((row["status"], facts["merge_ref_checks"]), ("missing", None))
+        row, _ = self.real_g4(self.GREEN, {1: jobs(), 2: jobs(("test (macos-latest)", "skipped"), mac[1])})
+        self.assertEqual(row["status"], "missing")
+
+    def test_a_duplicate_check_name_never_reads_green_when_one_of_them_is_not_in_either_order(self):
+        bad, good = dict(self.MAC[0], conclusion="failure"), self.MAC[0]
+        for order in ((bad, good), (good, bad)):
+            self.assertFalse(self.g4(self.GREEN + [order[0], order[1], self.MAC[1]])[0], order)
+        self.assertTrue(self.g4(self.GREEN + [good, good, self.MAC[1]])[0])
+        source = (BIN / "macos_plan.py").read_text()
+        mutant = source.replace('if c["name"] not in out or out[c["name"]] == "success":', 'if True:')
+        self.assertNotEqual(mutant, source)
+        ns = {"__name__": "mutant"}
+        exec(compile(mutant, "mutant", "exec"), ns)
+        results = [ns["legs_reading"](self.GREEN + [a, b, self.MAC[1]])[0] for a, b in ((bad, good), (good, bad))]
+        self.assertIn(True, results, "the last-wins mutant reads one order as green")
+
+    def test_a_test_run_with_no_ubuntu_leg_is_refused_by_the_gate_pass_and_g4(self):
+        gate = sb.load_module("merge_gate")
+        renamed = [{"name": n, "conclusion": "success"} for n in ("test (linux)", "test (macos-latest)", "test-cloud (macos-latest)")]
+        said = gate.macos_legs_problem({"legs": renamed, "head": "a" * 40})
+        self.assertIn("ubuntu-latest", said or "")
+        self.assertIn("ubuntu-latest", gate.macos_legs_problem({"legs": [], "runs": [{"workflow": "test"}], "head": "a" * 40}) or "")
+        self.assertIsNone(gate.macos_legs_problem({"legs": [], "runs": [{"workflow": "lint"}], "head": "a" * 40}))
+        self.assertNotEqual(self.g4_row(renamed, renamed)["status"], "ok")
+
+    def test_the_plan_reads_non_ascii_paths_commas_the_label_on_a_draft_and_an_empty_diff(self):
+        self.assertTrue(self.decide(files=("shims/\u00e9.sh",))["macos"])
+        self.assertFalse(self.decide(files=("docs/a,b.md",))["macos"])
+        self.assertTrue(self.decide(files=("docs/a,shims/x",))["macos"] is False, "a comma is part of the name")
+        self.assertTrue(self.decide(draft=True, labels=("needs-mac",))["macos"])
+        self.assertFalse(self.decide(draft=True)["macos"])
+        self.assertTrue(self.decide(files=())["macos"], "an empty diff runs macOS")
+        with tempfile.TemporaryDirectory() as tmp:
+            lst, z = Path(tmp) / "l.txt", Path(tmp) / "d.z"
+            lst.write_text("shims/**\n")
+            for names, expected in (("shims/\u00e9.sh", True), ("docs/a,b.md\0docs/c.md", False), ("", True)):
+                z.write_bytes(names.encode() + (b"\0" if names else b""))
+                done = subprocess.run([sys.executable, str(BIN / "macos_plan.py"), "--event", "pull_request", "--base", "main", "--files-nul-file", str(z), "--patterns-file", str(lst)],
+                                      capture_output=True, text=True)
+                self.assertEqual(json.loads(done.stdout)["macos"], expected, names)
+
     def test_s5_a_reopened_run_is_not_cancelled_by_a_later_push_and_a_superseded_synchronize_run_is(self):
         sha = "b" * 40
         reopened, sync, push = ("pull_request", 7, sha, "reopened"), ("pull_request", 7, sha, "synchronize"), ("pull_request", 7, "c" * 40, "synchronize")
@@ -87507,7 +87594,7 @@ class TestMacosLegs(unittest.TestCase):
 
     def test_the_gate_pass_refuses_a_macos_leg_that_is_absent_skipped_or_cancelled_and_names_it(self):
         gate = sb.load_module("merge_gate")
-        legs = lambda *mac: [{"name": "test (ubuntu-latest)", "conclusion": "success"}] + [{"name": n, "conclusion": c} for n, c in mac]
+        legs = lambda *mac: [{"name": n, "conclusion": "success"} for n in ("test (ubuntu-latest)", "test-cloud (ubuntu-latest)")] + [{"name": n, "conclusion": c} for n, c in mac]
         both = (("test (macos-latest)", "success"), ("test-cloud (macos-latest)", "success"))
         self.assertIsNone(gate.macos_legs_problem({"legs": legs(*both), "head": "a" * 40}))
         for name, mac in (("absent", both[:1]), ("skipped", (both[0], ("test-cloud (macos-latest)", "skipped"))), ("cancelled", (("test (macos-latest)", "cancelled"), both[1]))):
