@@ -273,8 +273,8 @@ LINE_SEPARATORS = ("\u2028", "\u2029", "\u0085", "\x0b", "\x0c", "\x1c", "\x1d",
 
 
 def lines_of(text):
-    """Lines as a reader that splits on \\n only sees them (a trailing \\r dropped). Never str.splitlines(): it splits on more."""
-    return [l[:-1] if l.endswith("\r") else l for l in text.split("\n")]
+    """Lines as a reader that splits on \\n only sees them (a trailing \\r is part of the line). Never str.splitlines(): it splits on more."""
+    return text.split("\n")
 
 
 def has_other_separator(text):
@@ -371,7 +371,8 @@ def pr_edit(args):
         raise refused("pr-edit-body-nul")
     if has_other_separator(new):
         raise refused("pr-edit-body-separator")
-    if HOLD in lines_of(cur) and lines_of(new).count(HOLD) != 1:
+    # a hold line is the whole line, exactly ('MERGE: captain\r' is not one); the new body keeps the same number of them
+    if HOLD in lines_of(cur) and lines_of(new).count(HOLD) != lines_of(cur).count(HOLD):
         raise refused("pr-edit-no-hold-line")
     out = parse_json(request("PATCH", "/repos/%s/pulls/%d" % (repo, n), {"body": new}))
     print(out.get("html_url", ""))

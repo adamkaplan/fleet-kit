@@ -36,7 +36,7 @@ class T(base.T):
     def test_h1_mutant_with_splitlines_lets_the_split_line_through(self):
         src = open(CW_GH).read()
         for old, new in (("    if has_other_separator(new):", "    if False:"),
-                         ('return [l[:-1] if l.endswith("\\r") else l for l in text.split("\\n")]', "return text.splitlines()")):
+                         ('return text.split("\\n")', "return text.splitlines()")):
             self.assertIn(old, src)
             src = src.replace(old, new, 1)
         m = os.path.join(self.tmp.name, "mut-splitlines")
@@ -207,6 +207,19 @@ class T(base.T):
 
     def test_r2_a_body_with_a_nul_byte_is_refused(self):
         self.refused(self.edit(7, self.file("nul", "A\nMERGE: captain\n\0x\n")), "pr-edit-body-nul")
+
+    def test_r2_a_carriage_return_hold_line_is_not_a_hold_line(self):
+        PRS[7] = pr(body="A\nMERGE: captain\n")
+        self.refused(self.edit(7, self.file("crhold", "A\nMERGE: captain\r\n")), "pr-edit-no-hold-line")   # CRLF form: not the hold line
+        PRS[7] = pr(body="A\nMERGE: captain\r\n")   # a strict reader sees no hold line here: nothing to protect
+        self.assertEqual(self.edit(7, self.nohold).returncode, 0)
+        PRS[7] = pr(body="A\nMERGE: captain\n")
+        self.refused(self.edit(7, self.file("lonecr", "A\nMERGE: captain\rB\n")), "pr-edit-body-separator")
+
+    def test_r2_two_hold_lines_may_not_drop_to_one(self):
+        PRS[7] = pr(body="MERGE: captain\nA\nMERGE: captain\n")
+        self.refused(self.edit(7, self.hold), "pr-edit-no-hold-line")
+        self.assertEqual(self.edit(7, self.file("two", "MERGE: captain\nB\nMERGE: captain\n")).returncode, 0)
 
 
 # only this file's own tests run: drop every inherited one
