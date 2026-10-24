@@ -195,15 +195,129 @@ def validate_config(raw):
     for name, entry in repos.items():
         if not isinstance(entry, dict):
             raise ValueError("'impact_floor.repos.%s' must be an object" % name)
-        extra = sorted(set(entry) - {"globs", "exclude", "force"})
+        extra = sorted(set(entry) - {"globs", "exclude", "force", "hold", "hold_exclude"})
         if extra:
             raise ValueError("'impact_floor.repos.%s' has key(s) this tool does not read: %s" % (name, ", ".join(extra)))
         for key in ("globs", "exclude", "force"):
             value = entry.get(key, [])
             if not isinstance(value, list) or not all(isinstance(x, str) and x.strip() for x in value):
                 raise ValueError("'impact_floor.repos.%s.%s' must be a list of non-empty path globs, got %r" % (name, key, value))
-        if not entry.get("globs"):
+        if "hold" in entry or "hold_exclude" in entry:
+            problem = hold_problem(entry)
+            if problem:
+                raise ValueError("'impact_floor.repos.%s.%s" % (name, problem))
+            _refuse_machinery_excludes(name, entry.get("hold_exclude") or [])
+        elif not entry.get("globs"):
             raise ValueError("'impact_floor.repos.%s.globs' must name at least one glob" % name)
+
+
+HOLD_CLASSES = ("identity", "credentials", "authority", "execution")   # the four classes an entry may list (the operator's own names, not kit-wide data)
+
+
+def hold_problem(entry):
+    """None when the `hold` / `hold_exclude` keys of a repos entry are well formed, else the rest of the message (starting at the key, naming it). One reader for the
+    configuration check and for the decision (which falls back to the kit-wide default on a problem)."""
+    hold = entry.get("hold", {})
+    if not isinstance(hold, dict):
+        return "hold' must be an object with the classes %s" % ", ".join(HOLD_CLASSES)
+    unknown = sorted(set(hold) - set(HOLD_CLASSES))
+    if unknown:
+        return "hold' has class(es) this tool does not read: %s (the classes are %s)" % (", ".join(map(str, unknown)), ", ".join(HOLD_CLASSES))
+    for cls in HOLD_CLASSES + ("hold_exclude",):
+        value = hold.get(cls, []) if cls != "hold_exclude" else entry.get("hold_exclude", [])
+        if not isinstance(value, list) or not all(isinstance(x, str) and x.strip() for x in value):
+            key = "hold_exclude" if cls == "hold_exclude" else "hold.%s" % cls
+            return "%s' must be a list of non-empty path globs, got %r" % (key, value)
+    return None
+
+
+def _literal_dir(pattern):
+    """The directory part of a canonical glob before its first wildcard segment (a file name with no wildcard counts by its directory)."""
+    parts, out = canonical(pattern)[0].split("/"), []
+    for i, seg in enumerate(parts):
+        if any(c in seg for c in "*?["):
+            return "/".join(out)
+        out.append(seg)
+    return "/".join(out[:-1])
+
+
+def _sample(pattern):
+    return canonical(re.sub(r"\*\*|\*|\?", "x", pattern))[0]
+
+
+def machinery_paths(matrix):
+    """Every machinery pattern the matrix names: clear_code_paths, never_carried_paths and the closure files (read from the matrix; none is written here)."""
+    block = (matrix.get("owner_hold") or {}) if isinstance(matrix, dict) else {}
+    listed = list(clear_code_paths(matrix)[0] or []) + list(carry_never_paths(matrix))
+    closure = (block.get("delegated_clear") or {}).get("closure_files") if isinstance(block.get("delegated_clear"), dict) else None
+    return sorted({x for x in listed + (closure if isinstance(closure, list) else []) if isinstance(x, str)})
+
+
+def exclude_hits_machinery(glob, machinery):
+    """The machinery patterns a `hold_exclude` glob reaches: they overlap (by pattern, after `canonical`, either way round) and the glob does not sit strictly above
+    the machinery's directory under a named directory (`docs/**` is allowed beside `docs/review-laws/impact-matrix.json`; `bin/**`, `**` and `bin/impact_*.py` are not).
+    The hold itself never depends on this check: the machinery is held after, and apart from, any entry."""
+    prefix, found = _literal_dir(glob), []
+    for m in machinery:
+        if not (matches(_sample(m), [glob]) or matches(_sample(glob), [m]) or matches(m, [glob])):
+            continue
+        mdir = _literal_dir(m)
+        if prefix and prefix != mdir and (mdir + "/").startswith(prefix + "/"):
+            continue
+        found.append(m)
+    return found
+
+
+def _refuse_machinery_excludes(name, excludes):
+    if not excludes:
+        return
+    try:
+        machinery = machinery_paths(_matrix_cached())
+    except MatrixError as err:
+        raise ValueError("'impact_floor.repos.%s.hold_exclude' cannot be checked against the machinery paths: %s" % (name, err)) from None
+    for glob in excludes:
+        hit = exclude_hits_machinery(glob, machinery)
+        if hit:
+            raise ValueError("'impact_floor.repos.%s.hold_exclude' names %r, which reaches the clear and hold machinery (%s): the machinery is never excluded" % (name, glob, ", ".join(hit[:3])))
+
+
+def entry_hold(config, repo, matrix=None):
+    """The per-repository owner hold of `repo`: None when its `impact_floor.repos` entry has no `hold` / `hold_exclude` key (the kit-wide default, as before);
+    ("invalid", why) when it cannot be read (the caller applies the kit-wide default and says so, never no hold); else ("ok", {class: globs}, exclude, replaces)
+    where `replaces` is False for the kit repository (named in the matrix floor): there the entry only ADDS holds and the matrix top tier paths still apply."""
+    wanted = (repo or "").lower()
+    section = (config or {}).get("impact_floor") if isinstance(config, dict) else None
+    repos = section.get("repos") if isinstance(section, dict) else None
+    if section is not None and not isinstance(section, dict) or repos is not None and not isinstance(repos, dict):
+        return None
+    for name, entry in (repos or {}).items():
+        if isinstance(name, str) and name.lower() == wanted:
+            if not isinstance(entry, dict) or not ("hold" in entry or "hold_exclude" in entry):
+                return None
+            try:
+                problem = hold_problem(entry)
+            except Exception as err:   # anything odd about the entry: fail towards the kit-wide default
+                problem = "%s' unreadable: %s" % ("hold", type(err).__name__)
+            if problem:
+                return "invalid", problem
+            try:
+                kit = {n.lower() for n in default_floors(matrix)}
+            except MatrixError:
+                kit = {wanted}
+            hold = entry.get("hold", {})
+            return "ok", {cls: list(hold.get(cls) or []) for cls in HOLD_CLASSES}, list(entry.get("hold_exclude") or []), wanted not in kit
+    return None
+
+
+def entry_hits(paths, hold, exclude):
+    """[(class, glob, path)] of the changed paths that match a listed glob of the entry and no exclude (an empty class lists nothing)."""
+    out = []
+    for cls in HOLD_CLASSES:
+        for glob in hold.get(cls) or []:
+            for p in sorted({p for p in paths if isinstance(p, str)}):
+                if matches(p, [glob]) and not matches_named(p, exclude):
+                    out.append((cls, glob, p))
+    return out
 
 
 def load_matrix(path=None):
@@ -471,7 +585,7 @@ def class_is_top_tier(matrix, cls):
     return cls.strip().lower() not in rule[1]
 
 
-def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=(), narrow=None, record=None):
+def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=(), narrow=None, record=None, entry=None):
     """The decision under the owner-hold rule. `paths`: every changed path (a deletion and a rename's old path too); `impacts`: [(severity, probability, class)]
     from the independent rating (class may be None); `floor_hit`: the paths that hit the old floor (floor_paths). Returns (decision, reasons):
 
@@ -484,7 +598,9 @@ def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=(), narrow=None
     `narrow` ({path: "unchanged"|"changed"|"added"|"removed"|"unreadable"}, from the caller's content reads) judges the paths the matrix file's
     `narrow_by_diff` block names: only a changed permission block holds; an added, removed or unreadable one holds; a path with no entry is unread and
     holds; more such paths than the block allows hold without being read. `record` ((action, class) of the independent impact reviewer's record for
-    this head, or None): a hold action of a top tier, missing or unknown class holds, of a class the matrix file names as not top tier asks for a second review."""
+    this head, or None): a hold action of a top tier, missing or unknown class holds, of a class the matrix file names as not top tier asks for a second review.
+    `entry` (from `entry_hold`, default None: nothing changes): a repository's own hold. ("ok", ...) replaces the top tier PATH hold of that repository (not for the
+    kit repository, where it only adds); ("invalid", why) applies the kit-wide default and says so. The machinery holds below run whatever the entry says."""
     reasons = []
     if owner_hold_rule(matrix) is None:   # FAIL CLOSED: no usable rule means every change holds for the owner
         reasons.append("owner_hold rule missing or malformed in the impact matrix file: every change holds")
@@ -500,9 +616,15 @@ def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=(), narrow=None
         machinery = sorted({p for p in paths if isinstance(p, str) and matches(p, listed)})
         if machinery:
             reasons.append("clear_code_paths (the clear and hold machinery, never delegated): %s" % ", ".join(machinery[:5]) + (" ..." if len(machinery) > 5 else ""))
-    hits = top_tier_hits(paths, matrix)
+    replaced = isinstance(entry, tuple) and entry[0] == "ok" and entry[3]
+    if isinstance(entry, tuple) and entry[0] == "invalid":
+        reasons.append("impact_floor.repos.<repo>.hold unreadable or invalid (%s): kit-wide default applied" % entry[1])
+    if isinstance(entry, tuple) and entry[0] == "ok":
+        for cls, glob, path in entry_hits(paths, entry[1], entry[2]):
+            reasons.append("owner hold (%s): %s matches %s" % (cls, path, glob))
+    hits = {} if replaced else top_tier_hits(paths, matrix)
     prose = []   # narrow paths whose permission block did not change: no hold from the path
-    narrowed, limit = narrow_paths(matrix, paths)
+    narrowed, limit = ([], None) if replaced else narrow_paths(matrix, paths)
     if narrowed:
         if len(narrowed) > limit:
             reasons.append("more than %d definitions with a narrow rule changed (%d): not read, held" % (limit, len(narrowed)))
