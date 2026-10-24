@@ -352,9 +352,9 @@ class S4Audit(Base):
 
     def test_spend_cap_exit_5(self):
         self.env["CW_CLOUD_SPEND_CAP_USD"] = "0.25"
-        self.create("coder7")
+        self.create("coder7", "--shape", "S")   # S by name: the cost is the S rate (the unnamed default is XS, #1081)
         self.clock.advance(hours=1)
-        self.assertEqual(self.run_cli("create", "coder8", "--repo", "a/b", "--branch", "m")[0], 5)
+        self.assertEqual(self.run_cli("create", "coder8", "--repo", "a/b", "--branch", "m", "--shape", "S")[0], 5)
 
     def test_idempotent_stop_and_delete_of_gone_worker(self):
         self.assertEqual(self.run_cli("stop", "nobody")[0], 0)
@@ -777,8 +777,8 @@ class S8Cap(Base):
         self.assertEqual(self.st()["pods"], {})
 
     def test_unset_cap_refuses_when_running_pods_already_cost_25(self):
-        self.create("coder8")
-        self.clock.advance(hours=300)  # 0.10 USD/h
+        self.create("coder8", "--shape", "S")
+        self.clock.advance(hours=300)  # S: 0.10 USD/h (the unnamed default XS is 0.05)
         self.assertEqual(self.create_code()[0], 5)
 
     def test_zero_negative_and_junk_are_refused(self):
