@@ -164,6 +164,7 @@ Each guard has a test that fails when it is removed (in `bin/test-cloud-hub` and
 The hub speaks plain http; there is no TLS in the listener. The intended deployment is the hub and the agent pods in one
 namespace, with a NetworkPolicy admitting only agent pods to the hub port. The code does not require or enforce this. The bearer
 token and message text cross that network unencrypted. The hub does not check the source of a request beyond the token.
+The network policies that implement this boundary are in cloud/k8s/cloud-hub-network.yaml (the six policies exactly as applied).
 
 What the code does accept as an agent (`bin/cloud_channel.py`): a token whose username is `system:serviceaccount:<namespace>:<name>`
 (prefix `system:serviceaccount:`) with the namespace exactly `fleet-agents` (the `NAMESPACE` constant) and a name that is a valid

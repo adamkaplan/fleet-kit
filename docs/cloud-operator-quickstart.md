@@ -236,6 +236,21 @@ Its log: `cloud-reaper-stderr.log` in the switchboard state directory (journalct
 When the Mac sleeps, the reaper pauses. Workers keep their pod-side floor (the pod's own limit, the cap plus 300 s, PR #880 once it
 merges), so a sleeping Mac delays a stop but cannot leave a worker running past that floor.
 
+## 4c. The namespace's network policies
+
+Cause: an independent read of the hub's manifest set found no network policy in the repository, while the cluster carried six applied by hand. None was in a file. They are now in `cloud/k8s/cloud-hub-network.yaml`, exactly as applied (a test fails when a rule is widened). The six policies:
+
+- `allow-egress`: every pod may reach name resolution (port 53) and the public internet on ports 80 and 443, with the private ranges excluded.
+- `cloud-agents-ingress-from-hub`: worker pods accept the hub on port 4096 only.
+- `cloud-agents-to-hub`: worker pods may send to the hub on port 8443 only.
+- `cloud-hub-ingress`: the hub accepts worker pods of the same namespace on port 8443 only.
+- `cloud-hub-to-agents`: the hub may send to worker pods on port 4096 only.
+- `default-deny`: every pod is denied in both directions unless a policy above allows it.
+
+Apply: run a server dry run first, `kubectl -n cw apply --dry-run=server -f cloud/k8s/cloud-hub-network.yaml` (all six should report unchanged), then apply the whole file in the order of its documents. Apply the allow policies before the default deny; a default deny applied first would cut every pod off. First check afterwards: a worker pod can still resolve names and the hub answers its health path.
+
+Roll back: `kubectl -n cw delete networkpolicy -l app.kubernetes.io/part-of=cloud-hub` removes the four hub policies; `kubectl -n cw delete networkpolicy allow-egress default-deny` removes the two namespace-wide ones. Deleting default-deny without allow-egress, or the reverse, changes the whole namespace's reachability.
+
 ## 5. Known gaps
 
 - Stopping a worker by name alone: #682.
