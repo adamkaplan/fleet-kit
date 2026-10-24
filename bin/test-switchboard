@@ -3703,6 +3703,46 @@ class TestApprovalCheck(Base):
 
 # ------------------------------------------------------------------- the CLI
 
+class TestApprovalExemptionGuard(unittest.TestCase):
+    """#951: while bin/plan_approval.py is exempt from the authority list, no module of the clear/hold closure may depend on it."""
+
+    MESSAGE = "list bin/plan_approval.py as an authority module, then drop the exemption"
+    NEEDLES = ("plan_approval", "plan.approved")
+
+    def setUp(self):
+        self.matrix = json.loads((REPO / "docs/review-laws/impact-matrix.json").read_text())
+        hold = self.matrix["owner_hold"]
+        names = hold["delegated_clear"]["clear_code_paths"] + hold["top_tier_paths"]["authority"]
+        self.modules = sorted({p for p in names if p.startswith("bin/") and p.endswith(".py")})
+
+    def exemption_stands(self):
+        block = self.matrix["owner_hold"]["top_tier_paths"]
+        return "bin/plan_approval.py" in self.matrix["owner_hold"]["authority_modules"]["exempt"] and "bin/plan_approval.py" not in block["authority"]
+
+    def offenders(self, texts):
+        return sorted(name for name, text in texts.items() if any(n in text for n in self.NEEDLES))
+
+    def real_texts(self):
+        return {name: (REPO / name).read_text() for name in self.modules}
+
+    def test_the_closure_is_derived_and_complete(self):
+        for name in ("bin/delegated_clear.py", "bin/impact_hold.py", "bin/impact_floor.py", "bin/merge_gate.py", "bin/plan_ledger.py"):
+            self.assertIn(name, self.modules)
+
+    def test_no_clear_or_hold_module_depends_on_plan_approval(self):
+        if not self.exemption_stands():
+            self.skipTest("the exemption is gone")
+        self.assertEqual(self.offenders(self.real_texts()), [], self.MESSAGE)
+
+    def test_mutant_an_import_in_a_closure_module_fails_the_scan(self):
+        texts = self.real_texts()
+        texts["bin/merge_gate.py"] = "import plan_approval\n" + texts["bin/merge_gate.py"]
+        self.assertEqual(self.offenders(texts), ["bin/merge_gate.py"], self.MESSAGE)
+        texts = self.real_texts()
+        texts["bin/impact_hold.py"] += "\nx = 'plan.approved'\n"
+        self.assertEqual(self.offenders(texts), ["bin/impact_hold.py"], self.MESSAGE)
+
+
 class TestEngineCLI(Base):
     def setUp(self):
         super().setUp()
