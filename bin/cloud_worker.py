@@ -45,7 +45,8 @@ CLOUD_WORKER_AGENT = "worker"   # the agent the image defines (cloud/worker/agen
 # The options of the launcher's `create` that `launch --cloud` hands over: ONE table. Taken from the launcher on main (commit fb4b9f2,
 # cloud/launcher/cloud_worker.py `create`: --shape S|M, --stack); a name here that the launcher does not know makes its create fail (exit 2).
 CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss"}
-LAUNCHER_SHAPES = ("S", "M")   # the launcher's SHAPES keys; the launcher's own default (S) applies when --shape is not given
+LAUNCHER_SHAPES = ("XS", "S", "M")   # the launcher's SHAPES keys; the launcher's own default (XS, or S with --stack) applies when --shape is not given
+LAUNCHER_STACK_SHAPES = ("S", "M")   # the rows with stack: true; --stack with another shape is refused here, before any call
 POD_DIR_ROOTS = ("/work", "/home/worker")   # the only roots a cloud session directory may be under (a local path does not exist in the pod)
 WORK_REPO = "/work/repo"      # where the worker clones the repository: the launcher's end hook (CW_WORKDIR default) pushes from here
 SETUP_PREAMBLE = """Setup (do this first, before the task below):
@@ -1137,8 +1138,8 @@ def _launch(args, runner, now, reserve):
     source = use_settings()   # before any setting is read: the allow-list, the preflight and the launcher all read this one source
     print("%s: cloud settings from %s" % (H["PROG"], source), file=sys.stderr)
     check_allowed(repo)   # before anything is read, minted or created
-    if getattr(args, "stack", False) and args.shape and args.shape not in LAUNCHER_SHAPES:   # exact membership in a tuple; after the allow-list, before the preflight, any token or call
-        raise Refusal("--shape %r is not a pod shape (%s); nothing was created" % (str(args.shape)[:40], " or ".join(LAUNCHER_SHAPES)))
+    if getattr(args, "stack", False) and args.shape and args.shape not in LAUNCHER_STACK_SHAPES:   # exact membership in a tuple; after the allow-list, before the preflight, any token or call
+        raise Refusal("--shape %r is not a pod shape (%s); nothing was created" % (str(args.shape)[:40], " or ".join(LAUNCHER_STACK_SHAPES)))
     try:   # the repository preflight, before any token is minted; FAIL CLOSED: a missing, killed or silent program refuses (stdout stays the one JSON line)
         print(_lib().check_repo_preflight(repo, {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}), file=sys.stderr)
     except _lib().CloudError as err:
@@ -1359,6 +1360,8 @@ def cmd_read(args, runner, now):
         raise LaunchError("name the agent: `%s read <name>`" % H["PROG"])
     limit = max(1, min(int(args.limit), 200))
     record = route(args.name)
+    if record is None and getattr(args, "cloud_only", False):
+        raise LaunchError("%s has no cloud record" % args.name)
     engine, state, config = H["build_engine"](runner, now, "cli", writable=False)
     if record is not None:
         session = _session_of(record)
