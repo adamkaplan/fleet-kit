@@ -10,9 +10,10 @@ One document to set up, run and take down the cloud hub and the pod-side command
   - `POST /message`: JSON body `{"sender", "recipient", "key", "text"}` with `Authorization: Bearer <token>`.
   - `GET /decisions`: serves the JSON object from the file named by `FLEET_CLOUD_HUB_DECISIONS`
     (`{"decisions": [], "errors": []}` if the file is absent), behind the same token check and the same reserved-name refusal as
-    POST (a token of a reserved service account is refused 401 here too). The answer is scoped per caller: a decision that has an
-    `"agent"` field is served only to the agent of that name; a decision with no `"agent"` field is served to every authenticated
-    agent; the `errors` list is not served.
+    POST (a token of a reserved service account other than the captain is refused 401 here too). The answer is scoped per caller: the captain sees the whole file; any other agent sees only the
+    decisions whose `"agent"` field equals its pinned name (a decision with no `"agent"` field is the captain's alone; no `errors`).
+    This is a trust choice: the captain is the orchestrator's own boss identity, and no pod can obtain that name (it is a reserved
+    name: refused on send, and a secrets file that names it refuses everyone).
   - POST to a path other than /message and GET to a path other than /decisions answer 404. PUT, DELETE and PATCH answer 405 on
     any path. GET /message answers 404. HEAD and OPTIONS are not handled (501).
 - **The pod command** (`bin/cloud_cli.py`) runs in an agent pod and sends through the channel (via `bin/cloud_client.py`):
@@ -144,14 +145,14 @@ The command makes up to 3 tries with one key. It retries only on a transport fai
 
 ## Hardening guards
 
-Each guard has a test that fails when it is removed (`bin/test-cloud-hub-hardening`, `bin/test-cloud-cli-hardening`):
+Each guard has a test that fails when it is removed (in `bin/test-cloud-hub` and `bin/test-cloud-cli`):
 
-- **Framing.** The end marker of each message carries a fresh random nonce the body cannot know. A body that holds the hub's header
+- **Framing.** Both markers of each message carry a fresh random nonce the body cannot know. A body that holds the hub's header
   shape (`[Message from agent`) or either marker is refused (503 to the sender, nothing delivered). Control characters, C1 controls,
   U+2028/U+2029 and bidirectional controls are stripped from the body.
 - **Decisions read.** Same reserved-name refusal as send, and scoped per agent (see above).
 - **Agent URL host.** See the `url` rule above.
-- **Plain http from the command.** Refused unless loopback or named in `FLEET_CLOUD_ALLOW_HTTP_HOST`. For an in-cluster hub over
+- **Plain http from the command.** Refused unless loopback, a `.svc` / `.svc.cluster.local` name, or named in `FLEET_CLOUD_ALLOW_HTTP_HOST`. For an in-cluster hub over
   http, set that variable to the hub's host name.
 - **Dedupe.** The key holds the token-pinned sender; each sender keeps at most 1000 remembered keys (its own oldest is forgotten
   first), and the global cap forgets the oldest key of the sender holding the most, so one sender cannot flush another's.

@@ -63,7 +63,7 @@ def make_post(url):
 
 
 def _http_allowed(parts, env):
-    """The bearer token goes over plain http only to a loopback host, or to the host named by FLEET_CLOUD_ALLOW_HTTP_HOST."""
+    """The bearer token goes over plain http only to a loopback or cluster-local (.svc, .svc.cluster.local) host, or to the host named by FLEET_CLOUD_ALLOW_HTTP_HOST."""
     try:
         host = (parts.hostname or "").lower()
     except ValueError:
@@ -73,7 +73,9 @@ def _http_allowed(parts, env):
             return True
     except ValueError:
         pass
-    return host == "localhost" or (bool(host) and host == env.get("FLEET_CLOUD_ALLOW_HTTP_HOST", "").strip().lower())
+    if host == "localhost" or host.endswith(".svc") or host.endswith(".svc.cluster.local"):
+        return True
+    return (bool(host) and host == env.get("FLEET_CLOUD_ALLOW_HTTP_HOST", "").strip().lower())
 
 
 def _usage(line):
