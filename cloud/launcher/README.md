@@ -101,6 +101,9 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
 | `CW_GIT_TOKEN_CMD` | prints the one-hour git token for the repository (default: `app_token.py OWNER/NAME`, same settings as `run_task.py`); the managed reaper runs the same command to renew the token every 30 minutes |
 | `CW_OPENCODE_BIN` | the `opencode` program (default `opencode` on `PATH`); the launcher runs `opencode auth export` (fixed arguments, scrubbed environment, output through a pipe, in memory) and keeps only the one `github-copilot` entry, as a one-entry array. Refused by name: command missing or failing, no entry, two entries, an inactive entry, an entry that is not `oauth`; nothing is created |
 | `CW_PULL_SECRET` | optional: the image pull secret name passed to `create` |
+| `CW_HUB_CHANNEL_URL` | the address of the hub's channel an orchestrator or hub pod is told (`FLEET_CLOUD_CHANNEL_URL`); an `http` or `https` URL with a host, an optional port and an optional one-segment path; not a secret; default `http://cloud-hub.cw.svc:8443/message`. **Set (this or `CW_HUB_REGISTRY_SECRET`) = the hub setting is on: every launch registers** with the hub (a worker launch included), and a launch needs the headless Service `cw-agents` |
+| `CW_HUB_REGISTRY_SECRET` | the NAME of the hub's registry Secret in the cloud namespace (never its content); a Kubernetes name; default `cloud-hub-registry`. **Set (this or `CW_HUB_CHANNEL_URL`) = the hub setting is on: every launch registers.** Unset, a worker launch is exactly what it was |
+| `--agent` (not a setting) | `worker` (default) or `orchestrator`: the agent the pod runs, passed to the pod as `CW_AGENT`; any other value is refused before anything is made; `--agent orchestrator` needs `--boss NAME` |
 
 - **A cluster token per use.** Every command that needs the cluster mints its own token at that moment: the administrator
   kubeconfig is read from the vault by command and given to `kubectl create token cw-operator` on a pipe (never a file or
@@ -144,7 +147,7 @@ The password reaches slice C once, on a file descriptor it passes with `--passwo
 
 **Other choices where the contract was silent.** Deadlines live on the pod as annotations (`cw/hard-deadline`,
 `cw/idle-seconds`); the reaper honours the record's `hard_deadline` read-only when `CW_CLOUD_RECORD_DIR` is set.
-**The cluster-side floor.** Every pod from `render_pod` (the one builder; shapes S and M, with or without a pull secret or run secrets) sets
+**The cluster-side floor.** Every pod from `render_pod` (the one builder; shapes XS, S and M, with or without a pull secret or run secrets) sets
 `spec.activeDeadlineSeconds` = the `--max-hard` cap + `POD_DEADLINE_GRACE_SECONDS` (300 s). The cap, not the initial hard limit, because
 Kubernetes cannot raise the field on a running pod, so `extend` within the cap must stay legal; the grace lets the reaper (record, end hook)
 act first. The cap's default is 8h, so the floor is always finite. A pod past it is `Failed` with reason `DeadlineExceeded`; `stop` and the
@@ -155,7 +158,7 @@ the create's own clock, so the floor can trail the stored cap by scheduling time
 exceeding the hard limit and alerting is not decided: it exits 1 from `reap` so a scheduler can alert). The spend cap
 is read from `CW_CLOUD_SPEND_CAP_USD`; unset or empty means the prototype's USD 25, and zero, negative, non-numeric,
 `nan`, `inf` or a cost that cannot be read refuses `create` (exit 5). The check adds this launch's estimate (hard limit times the shape's rate) to what the running pods already cost. A worker name with `_` maps to `-` plus a 4-hex
-hash for the pod name. Shape rates are placeholders (`S` 0.10, `M` 0.20 USD/hour); `create` refuses a spec with a stored credential.
+hash for the pod name. Shape rates are placeholders (`XS` 0.05, `S` 0.10, `M` 0.20 USD/hour; XS, 1 CPU and 2 GiB, is what a worker gets from a non-stack create; an orchestrator with no `--shape` gets `S`); `create` refuses a spec with a stored credential.
 
 **Not in this slice.** Automatic detection of a node drain notice: the end hook runs on `stop`, the idle stop and the hard limit; a drain is handled today by the operator running `stop --reason "node drain"`. The `cw-worker` service account's cloud identity and what it may do belong to the image/cluster setup (slice A and the platform), not here. `bin/test-cloud-launcher` is not yet wired into CI (the suite lists are CI's own).
 

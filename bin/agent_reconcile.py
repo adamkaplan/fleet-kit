@@ -39,7 +39,18 @@ def has_no_live_data(agent, live):
     return live.get("pane") is False and live.get("process") is False
 
 
-def reconcile_on_read(state_dir, read, live_check, registry=None):
+def unknown_endpoint_check(name, agent):
+    """The default check of a no-pane row's endpoint: "unknown", never dead. A cloud lane's feeder supplies a real one (a bounded probe or a lease)."""
+    return "unknown"
+
+
+def has_no_pane(agent):
+    """A row with an endpoint and no pane: its liveness is not provable with the terminal multiplexer."""
+    return isinstance(agent, dict) and agent.get("pane") is None and agent.get("endpoint") is not None
+
+
+# TODO(#1066, PR #1075): when the process-evidence verdict lands, this and `has_no_live_data` must call that ONE dead-verdict function (U6).
+def reconcile_on_read(state_dir, read, live_check, registry=None, endpoint_check=None):
     """Called by a view with the registry read it is drawing from. Returns the names removed.
 
     Acts only on a whole read. For each agent whose recorded state is `dead` (the registry refuses any other), it
@@ -51,6 +62,21 @@ def reconcile_on_read(state_dir, read, live_check, registry=None):
     removed = []
     for name, agent in sorted((read.get("agents") or {}).items()):
         if not isinstance(agent, dict):
+            continue
+        if has_no_pane(agent):
+            # Unknown, never dead: removed only when the bounded check answers exactly "dead" (a failed, unreachable or unknown answer keeps the row).
+            try:
+                verdict = (endpoint_check or unknown_endpoint_check)(name, agent)
+            except Exception:
+                continue
+            if verdict != "dead":
+                continue
+            try:
+                result = registry.reconcile_remove(state_dir, name, {"endpoint_verdict": "dead", "checked_at": int(time.time())}, True)
+            except Exception:
+                continue
+            if isinstance(result, dict) and result.get("changed"):
+                removed.append(name)
             continue
         if agent.get("state") != DEAD:
             continue   # the registry removes only an agent recorded dead; the pane pass records it, a view never marks one
