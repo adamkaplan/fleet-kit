@@ -233,6 +233,34 @@ Turn it off: `fleet-switchboard install --uninstall` unloads and removes it (wit
 Its log: `cloud-reaper-stderr.log` in the switchboard state directory (journalctl on Linux). Each time it ends it writes one line
 `<UTC time> reaper exiting: WHY`, and the service then restarts it.
 
+### The reaper is unattended: it keeps its own cluster login fresh
+
+The reaper needs a cluster login. In the token-file login (the one the service file names: `CW_CLOUD_TOKEN_FILE`
+for the token file, `CW_CLOUD_SERVER` for the cluster and `CW_CLOUD_NAMESPACE` for the namespace), the token in
+that file lives at most sixty minutes. The reaper therefore refreshes it itself, at the start of every pass: it
+reads the cluster administrator kubeconfig from the vault (`CW_VAULT_SUBSCRIPTION` and `CW_VAULT_NAME` for the
+vault, `CW_CLUSTER_ADMIN_SECRET` for the name of the secret inside it), hands that value to one
+`kubectl create token cw-operator` command over a pipe, and writes the token it gets back to the token file with
+mode `0600`, by an atomic replace. The old file stays whole if anything fails.
+
+The unattended reaper uses a fixed route: it ignores `CW_KUBECTL`, `CW_CLUSTER_ADMIN_CMD` and `CW_CLUSTER_TOKEN_CMD`, and runs `az` and
+`kubectl` only from fixed absolute paths (a custom command belongs to the launch path). When the vault holds the minter kubeconfig, that
+token is long-lived (not cluster admin, but whoever reads it can mint `cw-operator` tokens until its Secret is deleted): see the launcher
+README for who holds it and how to rotate it.
+
+What this means for you: **the reaper runs unattended** for days, and no one has to refresh the token file. The
+administrator value is never in a file, never in an argument and never in the service file (the service file
+holds names and paths only, as before). The token that lands in the file holds the operator account's own rights
+in the workers namespace and nothing more; the administrator login is used for that one command and dropped.
+
+**The manual install comment on the installer ask is superseded**: it recorded that a person had to refresh the
+token file by hand. The reaper does that now, by itself.
+
+If a refresh fails (the vault, the login or the token request), the old file stays as it is, one audit line
+names the reason (`refresh-cluster-token`), the pass report names the failure, and the reaper tries again five
+minutes later. A vault that refuses this machine is named as such; the reaper never runs the vault access check
+(that check belongs to the launch path alone).
+
 When the Mac sleeps, the reaper pauses. Workers keep their pod-side floor (the pod's own limit, the cap plus 300 s, PR #880 once it
 merges), so a sleeping Mac delays a stop but cannot leave a worker running past that floor.
 
