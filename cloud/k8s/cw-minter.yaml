@@ -1,6 +1,10 @@
-# The minter: the cloud reaper's own login credential. Its only right is to create a token for the cw-operator account in this
-# namespace (create on serviceaccounts/token, resourceNames cw-operator). It holds no secret here: the Secret below is an empty
-# token request that the cluster fills in. Nothing is cluster-wide and no rule uses a wildcard.
+# The minter: the cloud reaper's own login credential. The Role's only right is to create a token for the cw-operator account in this
+# namespace (create on serviceaccounts/token, resourceNames cw-operator). Nothing is cluster-wide and no rule uses a wildcard.
+# THE CREDENTIAL IS LONG-LIVED: the Secret below is a kubernetes.io/service-account-token Secret, which the control plane fills with a
+# NON-EXPIRING bearer token for cw-minter (valid until the Secret is deleted). The Role bounds the ACCOUNT (only cw-operator's tokens), not
+# the LIFETIME: a holder using the API directly can request a cw-operator token longer than 60 minutes, up to the server's maximum (the
+# 60-minute cap is in the launcher code only). Whoever reads the vault copy of this token can mint cw-operator tokens until the Secret is
+# deleted. To rotate: delete the Secret cw-minter-token, re-apply this file so a new token is issued, and replace the vault secret.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
