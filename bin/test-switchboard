@@ -39223,6 +39223,7 @@ class TestImpactRejudge(LedgerBase):
         table = {"fleet_labels": (True, "a remover: the merged cleanup never removes it"),
                  "run_pass": (True, "the merged cleanup audits that it merged against it"),
                  "_labels_ours": (True, "the record never lists it as ours"),
+                 "recorded": (True, "the closed pass drops it from the record's labels: never removed"),
                  "_apply_impact_hold_locked": (True, "the rule never writes, restores or adopts it"),
                  "authors_hold_labels": (False, "the owner's plain clear lifts every fleet hold label, it included"),
                  "impact_clear_core": (True, "the delegated clear refuses it; the plain clear lifts it"),
@@ -80939,6 +80940,163 @@ class TestMergedLabels(Base):
         self.assertTrue(sb._issue_pr_merged({"pull_request": {"merged_at": "2026-10-15T10:00:00Z"}}))
         for record in ({"pull_request": {"merged_at": None}}, {"pull_request": {}}, {}, None, {"pull_request": "x"}):
             self.assertFalse(sb._issue_pr_merged(record), record)
+
+
+class TestClosedPrLabels(Base):
+    """Ask #963: a pull request closed WITHOUT merging loses exactly the labels the daemon's own record says it added, and nothing else."""
+
+    PR = "acme/api#7"
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={"gh": FAKE_GH, "github_repos": ["acme/api"], "excluded_repos": ["acme/secret"]})
+        self.names = sb.label_names(self.world.config)
+        self.mine = [self.names["merge-captain"], self.names["hold-impact"]]
+        self.engine = self.world.new_engine()
+
+    def record(self, *labels, pr=None):
+        state, _ = sb.read_impact_state(self.world.state)
+        state["applied"][pr or self.PR] = {"head": "a" * 40, "merge_label_added": True, "added": sorted(labels), "at": 1}
+        sb.write_impact_state(self.world.state, state)
+
+    def view(self, state="CLOSED", labels=()):
+        return (0, json.dumps({"state": state, "labels": [{"name": n} for n in labels], "headRefOid": "a" * 40}), "")
+
+    def entry(self, state="closed"):
+        return {"state": state, "head": "a" * 40, "labels": [], "at": 1, "via": "event"}
+
+    def go(self, entries, gh, calls=None):
+        self.engine.hub, self.engine.gh_runner = StubHub(entries), gh
+        module = sb.load_module("closed_pr_labels")
+        ns = types.SimpleNamespace(**{n: getattr(sb, n) for n in module.NEEDS})
+        return module.run_pass(ns, self.engine, self.world.clock.now(), calls or sb.IMPACT_PASS_CALLS)
+
+    def audit(self, event):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def test_s2_the_daemons_recorded_labels_come_off_with_one_audit_line(self):
+        self.record(*self.mine)
+        gh = FakeMergedGh({7: self.view(labels=self.mine)})
+        self.go({self.PR: self.entry()}, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.mine))
+        (line,) = self.audit("closed.labels_removed")
+        self.assertEqual((line["subject"], sorted(line["detail"]["labels"])), (self.PR, sorted(self.mine)))
+
+    def test_s3_a_person_label_and_an_unrecorded_hold_label_stay(self):
+        self.record(self.names["hold-impact"])
+        gh = FakeMergedGh({7: self.view(labels=["bug", self.names["hold-security"]])})
+        self.go({self.PR: self.entry()}, gh)
+        self.assertEqual((gh.removed, self.audit("closed.labels_removed")), ([], []))
+
+    def test_s4_only_the_recorded_labels_come_off_when_a_persons_label_is_there_too(self):
+        self.record(*self.mine)
+        gh = FakeMergedGh({7: self.view(labels=self.mine + ["bug", self.names["hold-security"]])})
+        self.go({self.PR: self.entry()}, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.mine), "bug and the unrecorded hold-security stay")
+
+    def test_s5_the_owners_hold_stays_even_when_the_record_lists_it(self):
+        owner = self.names["hold-owner"]
+        self.record(*self.mine, owner)
+        gh = FakeMergedGh({7: self.view(labels=self.mine + [owner])})
+        self.go({self.PR: self.entry()}, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.mine))
+        self.assertNotIn(owner, gh.removed)
+
+    def test_u3_a_closed_pull_request_with_only_the_owners_hold_is_left_alone(self):
+        owner = self.names["hold-owner"]
+        self.record(owner)
+        gh = FakeMergedGh({7: self.view(labels=[owner])})
+        self.go({self.PR: self.entry()}, gh)
+        self.assertEqual((gh.removed, self.audit("closed.labels_removed")), ([], []))
+
+    def test_u4_no_record_means_no_read_and_no_removal(self):
+        gh = FakeMergedGh({7: self.view(labels=self.mine)})
+        self.go({self.PR: self.entry()}, gh)
+        self.assertEqual((gh.reads, gh.removed), ([], []))
+
+    def test_s6_a_merged_or_open_pull_request_is_not_touched_by_this_pass(self):
+        self.record(*self.mine)
+        self.record(*self.mine, pr="acme/api#8")
+        gh = FakeMergedGh({7: self.view("MERGED", self.mine), 8: self.view("OPEN", self.mine)})
+        self.go({self.PR: self.entry("merged"), "acme/api#8": self.entry("open")}, gh)
+        self.assertEqual((gh.reads, gh.removed, self.audit("closed.labels_removed")), ([], [], []))
+
+    def test_s7_an_unreadable_state_a_non_closed_fresh_state_or_a_corrupt_record_removes_nothing(self):
+        self.record(*self.mine)
+        gh = FakeMergedGh({7: (1, "", "gh: HTTP 502")})
+        self.go({self.PR: self.entry()}, gh)
+        self.assertEqual((gh.removed, len(self.audit("closed.labels_read_failed"))), ([], 1))
+        for fresh in ("MERGED", "OPEN"):
+            self.engine.__dict__.pop("closed_pr_labels", None)
+            gh = FakeMergedGh({7: self.view(fresh, self.mine)})
+            self.go({self.PR: self.entry()}, gh)
+            self.assertEqual(gh.removed, [], fresh)
+        (Path(self.world.state) / sb.IMPACT_STATE_FILE).write_text("{not json")
+        self.engine.__dict__.pop("closed_pr_labels", None)
+        gh = FakeMergedGh({7: self.view(labels=self.mine)})
+        self.go({self.PR: self.entry()}, gh)
+        self.assertEqual((gh.reads, gh.removed), ([], []))
+
+    def test_s8_a_second_pass_writes_nothing(self):
+        self.record(*self.mine)
+        gh = FakeMergedGh({7: self.view(labels=self.mine)})
+        self.go({self.PR: self.entry()}, gh)
+        self.engine.__dict__.pop("closed_pr_labels", None)   # even a restarted daemon: the record was consumed
+        self.go({self.PR: self.entry()}, gh)
+        self.assertEqual((len(gh.removed), len(gh.reads), len(self.audit("closed.labels_removed"))), (2, 1, 1))
+
+    def test_a_failed_label_write_keeps_the_record_and_is_tried_again_after_the_back_off(self):
+        self.record(*self.mine)
+        gh = FakeMergedGh({7: self.view(labels=self.mine)})
+        real = sb.change_issue_labels
+        with mock.patch.object(sb, "change_issue_labels", side_effect=RuntimeError("boom")):
+            self.go({self.PR: self.entry()}, gh)
+        self.assertEqual((gh.removed, self.audit("closed.labels_removed")), ([], []))
+        self.assertIn(self.PR, sb.read_impact_state(self.world.state)[0]["applied"], "the record is kept")
+        self.go({self.PR: self.entry()}, gh)
+        self.assertEqual(len(gh.reads), 1, "inside the back-off: no second read")
+        self.world.tick(sb.load_module("closed_pr_labels").RETRY_SECONDS + 1)
+        self.go({self.PR: self.entry()}, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.mine))
+
+    def test_a_failed_read_is_said_once_and_tried_again_after_the_back_off(self):
+        self.record(*self.mine)
+        gh = FakeMergedGh({7: (1, "", "gh: HTTP 502")})
+        self.go({self.PR: self.entry()}, gh)
+        self.go({self.PR: self.entry()}, gh)
+        self.assertEqual((len(gh.reads), len(self.audit("closed.labels_read_failed"))), (1, 1))
+        self.world.tick(sb.load_module("closed_pr_labels").RETRY_SECONDS + 1)
+        gh.answers[7] = self.view(labels=self.mine)
+        self.go({self.PR: self.entry()}, gh)
+        self.assertEqual((sorted(gh.removed), len(self.audit("closed.labels_read_failed"))), (sorted(self.mine), 1))
+
+    def test_an_excluded_repo_is_never_read_and_a_corrupt_record_is_said_once(self):
+        self.record(*self.mine, pr="acme/secret#7")
+        gh = FakeMergedGh({7: self.view(labels=self.mine)})
+        self.go({"acme/secret#7": self.entry(), "other/repo#7": self.entry()}, gh)
+        self.assertEqual((gh.reads, gh.removed), ([], []))
+        (Path(self.world.state) / sb.IMPACT_STATE_FILE).write_text("{not json")
+        self.go({self.PR: self.entry()}, gh)
+        self.go({self.PR: self.entry()}, gh)
+        self.assertEqual((gh.reads, len(self.audit("closed.labels_record_unreadable"))), ([], 1))
+
+    def test_label_removals_count_against_the_cap(self):
+        for n in (10, 11):
+            self.record(*self.mine, pr="acme/api#%d" % n)
+        gh = FakeMergedGh({10: self.view(labels=self.mine), 11: self.view(labels=self.mine)})
+        spent = self.go({"acme/api#10": self.entry(), "acme/api#11": self.entry()}, gh, calls=3)
+        self.assertEqual((spent, len(gh.reads)), (3, 1), "1 read and 2 writes spend the cap of 3: the second pull request waits")
+
+    def test_u2_the_reads_stay_within_the_cap(self):
+        entries = {}
+        answers = {}
+        for n in range(10, 20):
+            self.record(*self.mine, pr="acme/api#%d" % n)
+            entries["acme/api#%d" % n] = self.entry()
+            answers[n] = self.view(labels=[])
+        gh = FakeMergedGh(answers)
+        self.go(entries, gh, calls=6)
+        self.assertEqual(len(gh.reads), 6)
 
 
 class StubIssueHub:
