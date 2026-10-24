@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """app-token: print a one-hour GitHub App installation token for ONE repository, to stdout, and nothing else.
 
-usage: app_token.py OWNER/REPO
+usage: app_token.py OWNER/REPO [ROLE]   (ROLE: a key of ROLE_PERMISSIONS; default worker)
 
 The App id and private key are read from the vault by commands (stdout of each, in memory only):
   CW_APP_ID_CMD, CW_APP_KEY_CMD
@@ -43,14 +43,27 @@ MAX_BYTES = 1_000_000  # the most of any GitHub answer or vault command output t
 EXPECTED_PERMISSIONS = {"contents": "write", "pull_requests": "write", "issues": "read", "metadata": "read"}
 
 
+# THE table of the token roles: role to the EXACT permission set the mint requests and checks. The worker's row is unchanged. The orchestrator's
+# row has issues write, pull requests and checks read, and NO contents key: it holds no contents write. The role is an argument of the mint,
+# never read from a pod (a flipped annotation must not widen a token).
+ROLE_PERMISSIONS = {"worker": EXPECTED_PERMISSIONS,
+                    "orchestrator": {"issues": "write", "pull_requests": "read", "checks": "read", "metadata": "read"}}
+
+
+def role_permissions(role="worker"):
+    if role not in ROLE_PERMISSIONS:
+        die("unknown token role: %s" % str(role)[:40], 2)
+    return ROLE_PERMISSIONS[role]
+
+
 def render_permissions(perms=None):
     """The table as text: `contents: write, pull_requests: write, issues: read, metadata: read`."""
     return ", ".join("%s: %s" % kv for kv in (EXPECTED_PERMISSIONS if perms is None else perms).items())
 
 
-def owner_step():
-    """The one place that says what the owner does when the App lacks a permission of the table."""
-    return "the owner adds %s to the App's permissions and accepts them on each installation" % render_permissions()
+def owner_step(role="worker"):
+    """The one place that says what the owner does when the App lacks a permission of the role's set."""
+    return "the owner adds %s to the App's permissions and accepts them on each installation" % render_permissions(ROLE_PERMISSIONS[role])
 
 
 def open_url(req, timeout=30):
@@ -89,6 +102,7 @@ def http_error_text(code, retry_after=None):
     return "GitHub refused the request (HTTP %d)" % code
 
 
+ROLE_IN_USE = ["worker"]  # the role of the mint in progress, so a 403 or 422 names that role's owner step
 MINTED = []  # the one token minted and not yet printed: a refusal after the mint revokes it (never in a message)
 
 
@@ -175,16 +189,17 @@ def api_base():
     return base.rstrip("/")
 
 
-def check_permissions(perms):
-    """Refuse unless perms is exactly EXPECTED_PERMISSIONS. Names a key, never a value."""
+def check_permissions(perms, role="worker"):
+    """Refuse unless perms is exactly the role's set (EXPECTED_PERMISSIONS for the worker). Names a key, never a value."""
+    expected = role_permissions(role)
     if not isinstance(perms, dict):
         die("refusing: the answer carries no permissions object")
     for k in sorted(perms):
-        if k not in EXPECTED_PERMISSIONS:
+        if k not in expected:
             die("refusing: the token carries an extra permission: %s" % str(k)[:40])
-    for k, want in EXPECTED_PERMISSIONS.items():
+    for k, want in expected.items():
         if k not in perms:
-            die("refusing: the token lacks the permission: %s (%s)" % (k, owner_step()))
+            die("refusing: the token lacks the permission: %s (%s)" % (k, owner_step(role)))
         if perms[k] != want:
             die("refusing: the token has a different level for the permission: %s" % k)
 
@@ -209,9 +224,9 @@ def github_json(method, path, jwt, body=None, not_found=None):
             die(not_found)
         if e.code == 422 and method == "POST":
             die("the App's installation does not cover this repository: add it to the installation (HTTP 422); "
-                "if the App lacks a requested permission, %s" % owner_step())
+                "if the App lacks a requested permission, %s" % owner_step(ROLE_IN_USE[0]))
         if e.code == 403 and method == "POST":  # the App may not hold, or the installation not yet accept, a requested permission
-            die("%s; if the App lacks a requested permission, %s" % (http_error_text(e.code, e.headers.get("Retry-After") if e.headers else None), owner_step()))
+            die("%s; if the App lacks a requested permission, %s" % (http_error_text(e.code, e.headers.get("Retry-After") if e.headers else None), owner_step(ROLE_IN_USE[0])))
         die(http_error_text(e.code, e.headers.get("Retry-After") if e.headers else None))
     except TimeoutError:
         die("the GitHub request timed out: the launch is refused and nothing was minted")
@@ -246,8 +261,10 @@ def find_installation(target, jwt):
     return inst, owner_id
 
 
-def mint(target):
-    """Return a token for target (OWNER/REPO), or exit through die(). Never prints."""
+def mint(target, role="worker"):
+    """Return a token for target (OWNER/REPO) with the permission set of role, or exit through die(). Never prints."""
+    wanted = role_permissions(role)
+    ROLE_IN_USE[0] = role
     repo = target.split("/", 1)[1]
     app_id = vault("CW_APP_ID_CMD", "cw-app-id").strip()
     if not app_id.isdigit():
@@ -261,7 +278,7 @@ def mint(target):
     del key
     inst, owner_id = find_installation(target, jwt)
     ans = github_json("POST", "/app/installations/%d/access_tokens" % inst, jwt,
-                      {"repositories": [repo], "permissions": dict(EXPECTED_PERMISSIONS)})
+                      {"repositories": [repo], "permissions": dict(wanted)})
     token = ans.get("token") if isinstance(ans, dict) else None
     repos = ans.get("repositories") if isinstance(ans, dict) else None
     if not isinstance(token, str) or not token:
@@ -283,15 +300,15 @@ def mint(target):
         die("the answer has no readable expiry")
     if exp - dt.datetime.now(dt.timezone.utc).timestamp() > MAX_TOKEN_SECONDS:
         die("refusing: the token lives longer than 61 minutes")
-    check_permissions(ans.get("permissions"))
+    check_permissions(ans.get("permissions"), role)
     MINTED.clear()
     return token
 
 
 def main(argv):
-    if len(argv) != 1 or not valid_target(argv[0]):
-        die("usage: app_token.py OWNER/REPO", 2)
-    sys.stdout.write(mint(argv[0]))
+    if len(argv) not in (1, 2) or not valid_target(argv[0]) or (len(argv) == 2 and argv[1] not in ROLE_PERMISSIONS):
+        die("usage: app_token.py OWNER/REPO [%s]" % "|".join(ROLE_PERMISSIONS), 2)
+    sys.stdout.write(mint(argv[0], argv[1] if len(argv) == 2 else "worker"))
     sys.stdout.flush()
 
 

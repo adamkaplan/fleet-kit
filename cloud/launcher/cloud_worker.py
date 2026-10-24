@@ -36,10 +36,19 @@ import run_record  # noqa: E402  (the run record: one module, one function the s
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")  # the switchboard's agent name rule
 SHAPES = {"XS": {"cpu": "1", "memory": "2Gi", "usd_per_hour": 0.05, "stack": False},   # the light shape: no nested Docker (the default of a non-stack worker)
           "S": {"cpu": "2", "memory": "4Gi", "usd_per_hour": 0.10, "stack": True},
-          "M": {"cpu": "4", "memory": "8Gi", "usd_per_hour": 0.20, "stack": True}}  # list-price estimates, not billed figures
+          "M": {"cpu": "4", "memory": "8Gi", "usd_per_hour": 0.20, "stack": True},  # list-price estimates, not billed figures
+          # The orchestrator role's row: requests = limits, no nested-Docker runtime. Chosen ONLY by the role (never by --shape). The idle
+          # measurement (365 MB resident, 456 MiB boot peak, about 1% of a core) fits; a working orchestrator is not measured yet.
+          "ORCH": {"cpu": "250m", "memory": "768Mi", "usd_per_hour": 0.02, "stack": False, "role_only": True}}
+SHAPE_CHOICES = tuple(k for k, v in SHAPES.items() if not v.get("role_only"))   # what --shape may name
 DEFAULT_SHAPE = "XS"        # a create that names no shape and is not a stack launch (S, M by name only)
 DEFAULT_ORCHESTRATOR_SHAPE = "S"   # an orchestrator launch that names no shape keeps the size it had before XS existed (the role table carries no shape: this is the one place)
 DEFAULT_STACK_SHAPE = "S"   # a stack launch that names no shape (its row must carry stack: true)
+# THE role table: role to its shape row, its token role (app_token.ROLE_PERMISSIONS) and its mode. The launcher, the reaper, the mint and the
+# docs read it. A persistent role is a one-replica StatefulSet, restart Always, no deadline, no idle limit; it ends only on an explicit stop.
+ROLES = {"worker": {"shape": None, "token_role": "worker", "persistent": False},
+         "orchestrator": {"shape": "ORCH", "token_role": "orchestrator", "persistent": True}}
+PERSISTENT_SPEND_SECONDS = 24 * 3600   # a persistent launch is priced for one day against the spend cap
 MAX_TOKEN_SECONDS = 3600
 
 # The git token a worker pushes with is a one-hour installation token (app_token.py caps it at 61 minutes). The launcher mints it once and
@@ -372,19 +381,20 @@ def check_repo_allowed(repo, env):
         raise CloudError("refused: %s is not on the cloud allow-list" % scrub(repo, (), 120), EXIT_USAGE)
 
 
-def git_token_cmd(repo, env):
+def git_token_cmd(repo, env, role="worker"):
     """The command that mints the git token for ONE repository: CW_GIT_TOKEN_CMD, else app_token.py beside this file. The launch (run_task.py)
     and the renewal run the same command; the renewal builds it here and the driver's own line in run_task.py is pinned equal by a test."""
     raw = env.get("CW_GIT_TOKEN_CMD")
-    return shlex.split(raw) if raw else [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_token.py"), repo]
+    argv = shlex.split(raw) if raw else [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_token.py"), repo]
+    return argv + [role] if role != "worker" and not raw else argv   # the worker's command is unchanged; a role is an extra argument of the real mint
 
 
-def run_git_token_cmd(cmd, repo, env, register=None):
+def run_git_token_cmd(cmd, repo, env, register=None, role="worker"):
     """THE mint call (the launch and the renewal both come here): run cmd for repo in env, return the token it printed. Never prints, never puts
     the token in an argument or a file. register(text) hears the child's stdout before it is judged, so a caller's scrubber knows it.
     Raises CloudError(EXIT_USAGE) with no value in the text."""
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=GIT_TOKEN_MINT_SECONDS, stdin=subprocess.DEVNULL, env=dict(env, GH_REPO=repo))
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=GIT_TOKEN_MINT_SECONDS, stdin=subprocess.DEVNULL, env=dict(env, GH_REPO=repo, **({"CW_GIT_TOKEN_ROLE": role} if role != "worker" else {})))
     except (OSError, subprocess.TimeoutExpired, ValueError):
         p = None
     if p and register:
@@ -792,7 +802,7 @@ class Kube:
         if p.returncode != 0:
             if keep_stdout and p.stdout.strip():
                 return p.stdout  # the caller reads the failure from the tool's own JSON
-            if ok_missing and "NotFound" in p.stderr:
+            if ok_missing and (p.stderr.strip().splitlines() or [""])[-1].startswith("Error from server (NotFound):"):   # kubectl's own status form, nothing looser
                 return None
             last = (self.scrub(p.stderr, limit=SCRUB_OUTPUT_MAX).strip().splitlines() or ["failed"])[-1]
             raise CloudError("kubectl %s: %s" % (args[0], self.scrub(last)))
@@ -820,6 +830,14 @@ class Kube:
     def get_pod(self, name):
         out = self.run(["get", "pod", name, "-o", "json"], ok_missing=True)
         return json.loads(out) if out else None
+
+    def get_workload(self, name):
+        out = self.run(["get", "statefulset", name, "-o", "json"], ok_missing=True)
+        return json.loads(out) if out else None
+
+    def delete_workload(self, name):
+        """Delete the StatefulSet (a persistent role's workload) and wait: the controller would recreate a pod deleted alone."""
+        self.run(["delete", "statefulset", name, "--ignore-not-found", "--wait=true", "--timeout=120s"], timeout=150)
 
     def list_pods(self):
         return json.loads(self.run(["get", "pods", "-l", "app=" + LABEL, "-o", "json"]))["items"]
@@ -1013,8 +1031,8 @@ def check_shape(a):
     """Set a.shape when it names none (XS, or S for a stack launch) and refuse an unknown name, or a row that cannot run a stack, with --stack."""
     if getattr(a, "shape", None) is None:
         a.shape = DEFAULT_STACK_SHAPE if getattr(a, "stack", False) else DEFAULT_ORCHESTRATOR_SHAPE if getattr(a, "agent", None) == "orchestrator" else DEFAULT_SHAPE
-    if a.shape not in SHAPES:
-        raise CloudError("shape must be one of %s" % ", ".join(SHAPES), EXIT_USAGE)
+    if a.shape not in SHAPE_CHOICES:   # a role-only row (the orchestrator role's) is never picked by --shape; the role chooses its own
+        raise CloudError("shape must be one of %s" % ", ".join(SHAPE_CHOICES), EXIT_USAGE)
     if getattr(a, "stack", False) and not SHAPES[a.shape]["stack"]:
         raise CloudError("--stack needs a shape that can run a nested Docker stack (%s), not %s" % (", ".join(k for k, v in SHAPES.items() if v["stack"]), a.shape), EXIT_USAGE)
 
@@ -1032,10 +1050,16 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
     endpoint = env.get("CW_TOKEN_ENDPOINT")
     if not endpoint and not run_names:  # git access then comes from a per-run secret instead
         raise CloudError("no token endpoint: set CW_TOKEN_ENDPOINT", EXIT_USAGE)
-    shape = SHAPES[a.shape]
+    role = getattr(a, "role", None) or "worker"
+    persistent = ROLES[role]["persistent"]
+    if persistent and (stack or "git-token" not in run_names):   # an orchestrator has the per-run Secret route only, and no nested Docker
+        raise CloudError("an orchestrator needs the per-run git-token Secret and no --stack", EXIT_USAGE)
+    shape = SHAPES[ROLES[role]["shape"] or a.shape]
     e = {"CW_WORKER": worker, "CW_REPO": a.repo, "CW_BRANCH": a.branch,
-         "CW_IDLE_SECONDS": str(parse_duration(a.idle)), "CW_HARD_DEADLINE": iso(hard),
+         "CW_IDLE_SECONDS": str(parse_duration(a.idle)), "CW_HARD_DEADLINE": iso(hard) if hard else "",
          "CW_AUDIT_RUNTIME_ID": "pod/" + name}
+    if persistent:
+        endpoint = None   # never a token endpoint: the pod cannot mint
     if endpoint:
         e["CW_TOKEN_ENDPOINT"] = endpoint
     agent = getattr(a, "agent", None) or "worker"
@@ -1057,7 +1081,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
             {"secret": {"name": name + "-run", "items": [{"key": k, "path": k, "mode": 0o400} for k in run_names]}}]}}
     pod = {"apiVersion": "v1", "kind": "Pod", "metadata": {
         "name": name, "labels": {"app": LABEL, "cw/worker": worker, "azure.workload.identity/use": "true"},
-        "annotations": {"cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
+        "annotations": {"cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard) if hard else "",
                         "cw/idle-seconds": e["CW_IDLE_SECONDS"], "cw/shape": a.shape,
                         "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard or DEFAULT_MAX_HARD))),
                         **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {})}},
@@ -1075,6 +1099,16 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
                  "volumes": [pw_volume,
                              {"name": "tokens", "emptyDir": {"medium": "Memory"}},
                              {"name": "scratch", "emptyDir": {}}]}}
+    if persistent:   # the pod of a persistent role: restart Always, no deadline, no idle limit, no workload identity, requests = limits
+        del pod["metadata"]["labels"]["azure.workload.identity/use"]
+        for k in ("cw/hard-deadline", "cw/idle-seconds", "cw/max-hard"):
+            del pod["metadata"]["annotations"][k]
+        pod["metadata"]["annotations"].update({"cw/shape": ROLES[role]["shape"], "cw/role": role, "cw/workload": name})
+        del pod["spec"]["activeDeadlineSeconds"]
+        pod["spec"]["containers"][0]["env"] = [x for x in pod["spec"]["containers"][0]["env"] if x["name"] not in ("CW_IDLE_SECONDS", "CW_HARD_DEADLINE")]
+        pod["spec"]["restartPolicy"] = "Always"
+        res = {"cpu": shape["cpu"], "memory": shape["memory"]}
+        pod["spec"]["containers"][0]["resources"] = {"requests": dict(res), "limits": dict(res)}
     if "CW_AGENT" in e:   # a hub pod: a stable in-cluster name (the headless Service cw-agents) instead of the pod address
         pod["spec"]["hostname"], pod["spec"]["subdomain"] = name, HUB_SUBDOMAIN
     pull = getattr(a, "pull_secret", None)
@@ -1090,6 +1124,40 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
     if bad:
         raise CloudError("refusing a pod spec with a forbidden field: %s" % ", ".join(bad), EXIT_USAGE)
     return pod
+
+
+ROLES_BEGIN, ROLES_END = "<!-- roles:begin -->", "<!-- roles:end -->"
+
+
+def render_roles_doc():
+    """The documentation block of the roles, derived from ROLES, SHAPES and app_token.ROLE_PERMISSIONS (so it cannot drift): the role, its mode,
+    its shape row, its token set, and the cost of one always-on node (24 times the row's rate; a list-price estimate, not a billed figure)."""
+    import app_token
+    lines = ["| Role | Mode | Pod size (requests = limits for a persistent role) | Token set | List-price estimate |", "|---|---|---|---|---|"]
+    for role, row in ROLES.items():
+        shape = SHAPES[row["shape"] or "S"]
+        mode = "persistent: one-replica StatefulSet, restart Always, no deadline, no idle limit, ends only on an explicit stop" \
+            if row["persistent"] else "worker: restart Never, hard deadline, idle limit"
+        cost = "USD %.2f per hour, USD %.2f per day always on" % (shape["usd_per_hour"], 24 * shape["usd_per_hour"]) if row["persistent"] \
+            else "USD %.2f per hour (shape S)" % shape["usd_per_hour"]
+        lines.append("| `%s` | %s | %s CPU, %s | %s | %s |" % (role, mode, shape["cpu"], shape["memory"],
+                                                              app_token.render_permissions(app_token.ROLE_PERMISSIONS[row["token_role"]]), cost))
+    lines.append("")
+    lines.append("The role is chosen by `--role` (a key of the role table; default `worker`); the orchestrator's size is chosen only by the role, never by `--shape`. "
+                 "The orchestrator holds no contents write and never the App key: the launcher and the reaper mint its token. "
+                 "Owner step for its set: " + app_token.owner_step("orchestrator") + ".")
+    return "\n".join(lines)
+
+
+def render_workload(pod):
+    """A persistent role's workload: a one-replica StatefulSet around the pod (its pod is NAME-0; a restart is the controller's)."""
+    name, meta = pod["metadata"]["name"], pod["metadata"]
+    return {"apiVersion": "apps/v1", "kind": "StatefulSet",
+            "metadata": {"name": name, "labels": {"app": LABEL, "cw/worker": meta["labels"]["cw/worker"]},
+                         "annotations": dict(meta["annotations"])},
+            "spec": {"replicas": 1, "serviceName": name, "podManagementPolicy": "OrderedReady",
+                     "selector": {"matchLabels": {"cw/worker": meta["labels"]["cw/worker"]}},
+                     "template": {"metadata": {"labels": dict(meta["labels"]), "annotations": dict(meta["annotations"])}, "spec": pod["spec"]}}}
 
 
 class Launcher:
@@ -1139,7 +1207,7 @@ class Launcher:
         if not NAME_RE.match(worker or ""):
             raise CloudError("bad worker name %r" % worker, EXIT_USAGE)
         pod = self.kube.get_pod(pod_name(worker))
-        return pod
+        return pod or self.kube.get_pod(pod_name(worker) + "-0")   # a persistent role's pod is NAME-0 (its StatefulSet's)
 
     def estimate(self, shape, seconds):
         return SHAPES[shape]["usd_per_hour"] * seconds / 3600
@@ -1162,6 +1230,8 @@ class Launcher:
     def create(self, a):
         worker, name = a.worker, pod_name(a.worker)
         self.run_id, self.foreign = getattr(a, "run_id", None), []   # what this call proved is another's is never deleted
+        role = getattr(a, "role", None) or "worker"
+        persistent = ROLES.get(role, {}).get("persistent", False)
         made = {"secret": False, "run": False, "pod": False, "reg": None}  # set before the call that may create it: an interrupt may land after
 
         def go(info):
@@ -1169,12 +1239,19 @@ class Launcher:
             check_repo_allowed(a.repo, self.env)  # before anything is read or made
             if not NAME_RE.match(worker):
                 raise CloudError("bad worker name %r" % worker, EXIT_USAGE)
+            if role not in ROLES:
+                raise CloudError("role must be %s" % " or ".join(ROLES), EXIT_USAGE)
+            if persistent and getattr(a, "stack", False):
+                raise CloudError("an orchestrator runs no nested Docker stack (--stack)", EXIT_USAGE)
             check_shape(a)   # resolves an unnamed shape; before any cluster, vault or token call
             now = self.clock()
-            hard = now + dt.timedelta(seconds=parse_duration(a.hard))
-            max_hard = now + dt.timedelta(seconds=parse_duration(a.max_hard))
-            if hard > max_hard:
-                raise CloudError("--hard is past --max-hard", EXIT_REFUSED)
+            if persistent:
+                hard = None   # no deadline: it ends only on an explicit stop
+            else:
+                hard = now + dt.timedelta(seconds=parse_duration(a.hard))
+                max_hard = now + dt.timedelta(seconds=parse_duration(a.max_hard))
+                if hard > max_hard:
+                    raise CloudError("--hard is past --max-hard", EXIT_REFUSED)
             run_values = read_run_secret_values(parse_run_secret_fds(a.run_secret_fd))  # before anything is made
             agent = getattr(a, "agent", None) or "worker"
             if agent not in AGENTS:   # before any cluster call
@@ -1185,12 +1262,14 @@ class Launcher:
                     raise CloudError("%s is the launcher's own key" % CHANNEL_SECRET_KEY, EXIT_USAGE)
                 run_values[CHANNEL_SECRET_KEY] = secrets.token_hex(32)
             self.kube.add_secrets(*run_values.values())  # known to scrub before the first kubectl call
-            self.check_cap(a.shape, int((hard - now).total_seconds()))
+            self.check_cap(ROLES[role]["shape"] or a.shape, PERSISTENT_SPEND_SECONDS if persistent else int((hard - now).total_seconds()))
             spec = render_pod(a, worker, name, now, hard, self.env, sorted(run_values))
+            if persistent:
+                spec = render_workload(spec)
             hits = scan_credentials(spec)
             if hits:
                 raise CloudError("refusing a pod spec with a stored credential: %s" % ", ".join(hits), EXIT_USAGE)
-            if self.kube.get_pod(name):
+            if self.kube.get_pod(name) or (persistent and (self.kube.get_workload(name) or self.kube.get_pod(name + "-0"))):
                 raise CloudError("worker %s already exists" % worker, EXIT_EXISTS)
             password = secrets.token_urlsafe(32)
             self.kube.add_secrets(password)
@@ -1203,8 +1282,15 @@ class Launcher:
                 if hub:
                     made["reg"] = (self._registry_secret(), worker)   # set before the call: a half write is undone by the cleanup
                     self._register(worker, run_values[CHANNEL_SECRET_KEY], spec, self.env.get("CW_CLOUD_DOMAIN", "example.internal"), password)
-                self._make(made, "pod", self.kube.apply, spec)
-                if getattr(a, "stack", False):
+                if persistent:
+                    made["workload"] = False
+                    self._make(made, "workload", self.kube.apply, spec)
+                    self._wait_ready(name + "-0", a.wait)
+                else:
+                    self._make(made, "pod", self.kube.apply, spec)
+                if persistent:
+                    pass
+                elif getattr(a, "stack", False):
                     self._start_stack_pod(worker, name, spec, made, a.wait)
                 else:
                     self._wait_ready(name, a.wait)
@@ -1226,8 +1312,9 @@ class Launcher:
             domain = self.env.get("CW_CLOUD_DOMAIN", "example.internal")
             return {"worker": worker, "url": "https://worker-%s.%s:4096" % (name, domain),
                     "auth_ref": "file:/run/cw/%s.password" % worker, "runtime_id": "pod/" + name,
-                    "idle_deadline": iso(now + dt.timedelta(seconds=parse_duration(a.idle))), "hard_deadline": iso(hard),
-                    "password_fd": a.password_fd}
+                    "idle_deadline": None if persistent else iso(now + dt.timedelta(seconds=parse_duration(a.idle))),
+                    "hard_deadline": None if persistent else iso(hard), "password_fd": a.password_fd,
+                    **({"role": role, "runtime_id": "pod/" + name + "-0"} if persistent else {})}
         old = self._catch_signals()
         try:
             return self._audited(worker, "create", go, ("run-secrets=" + ",".join(sorted(parse_run_secret_fds(a.run_secret_fd)))) if a.run_secret_fd else "")
@@ -1320,6 +1407,12 @@ class Launcher:
         if made.get("reg"):
             self._unregister(made["reg"][1])
         try:
+            if made.get("workload"):   # the workload first, or its controller recreates the pod
+                try:
+                    self.kube.delete_workload(name)
+                    self.kube.delete_pod(name + "-0")
+                except CloudError:
+                    left.append("statefulset/" + name)
             for kind, fn, label in (("pod", self.kube.delete_pod, "pod/" + name), ("secret", self.kube.delete_secret, "secret/%s-pw" % name),
                                   ("run", self.kube.delete_run_secret, "secret/%s-run" % name)):
                 if made[kind]:
@@ -1492,18 +1585,22 @@ class Launcher:
         def go(info):
             pod = self._need(worker)
             uid = ((pod or {}).get("metadata") or {}).get("uid")
+            pn = ((pod or {}).get("metadata") or {}).get("name") or name   # a persistent role's pod is NAME-0
+            remove = (lambda n, nn, u: self._remove_persistent(n, pn, nn, u)) if pod and ann(pod, "workload") else self._remove
             self._orchestrator = _pod_env(pod, "FLEET_AGENT_NAME") if pod and _pod_env(pod, "FLEET_CLOUD_TOKEN_FILE") else None   # a hub pod, orchestrator or worker
             if nonce and pod:
-                info["rid"] = "pod/" + name
+                info["rid"] = "pod/" + pn
                 if ann(pod, "run-id") != nonce:   # another run's (or an unlabelled) worker of this name: nothing is changed
                     raise CloudError("worker %s does not match run id %s; nothing was stopped or deleted" % (worker, nonce), EXIT_REFUSED)
             if not pod:
-                if nonce:   # no pod: this run's own Secrets (carrying the nonce) may remain from a cut-off create; another's are left whole
-                    self._remove(name, nonce)
+                # no pod: with a nonce, this run's own objects (carrying it) may remain from a cut-off create; another run's are left whole.
+                # With NO nonce the caller names the worker itself, so it owns it: the StatefulSet (FIRST) and that name's Secrets go.
+                # (The nonce rule exists only to protect ANOTHER run's objects.)
+                self._remove_gone(worker, name, nonce or None)
                 return {"worker": worker, "runtime_id": "", "pushed": False, "wip_branch": None}
-            info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
+            info["rid"], info["cost"] = "pod/" + pn, self.cost(pod)
             if not getattr(a, "no_record", False):   # BEFORE the hook and the delete; never raises, never holds the stop back
-                where = self.recorder.record(worker, name, reason or "stop", repo=_pod_repo(pod), started=ann(pod, "started") or "",
+                where = self.recorder.record(worker, pn, reason or "stop", repo=_pod_repo(pod), started=ann(pod, "started") or "",
                                              root=getattr(a, "record_dir", None))
                 if where:
                     info["record"] = where
@@ -1512,26 +1609,26 @@ class Launcher:
             if phase in ("Failed", "Succeeded") and ann(pod, "kept") != "true":  # a pod kept for unpushed work is never deleted here
                 # No container is running, so no hook can run and a kept pod would only linger: delete it and its
                 # Secrets, and say so.
-                self._remove(name, nonce, uid)
+                remove(name, nonce, uid)
                 print("cloud-worker: pod was %s; end hook not run; deleted" % phase, file=sys.stderr)
                 self._hook_record(info, {"ran": False, "pushed": False, "wip_branch": None, "skipped": [], "note": "pod was %s; end hook not run" % phase})
-                return {"worker": worker, "runtime_id": "pod/" + name, "pushed": False, "wip_branch": None,
+                return {"worker": worker, "runtime_id": "pod/" + pn, "pushed": False, "wip_branch": None,
                         "skipped": [], "note": "pod was %s; end hook not run" % phase, "record": info.get("record", "")}
             try:
-                res = self.run_hook(name)
+                res = self.run_hook(pn)
             except CloudError as e:
                 res = {"pushed": False, "wip_branch": None, "error": str(e)}
             view = self._hook_view(res)   # every field text from the pod: a string, scrubbed, short
             self.last_hook = {k: view[k] for k in ("pushed", "wip_branch", "error")}
             self._hook_record(info, dict(view, ran=True))
             if view["error"]:
-                note = self._mark(name, uid, kept="true")  # the pod is kept: the commit is not safe yet
+                note = self._mark(pn, uid, kept="true")  # the pod is kept: the commit is not safe yet
                 raise CloudError("end hook could not push, pod kept: %s%s" % (view["error"], "; " + note if note else ""), EXIT_HOOK)
             note = ""
             try:
-                note = self._mark(name, uid, hook_ran="true")
+                note = self._mark(pn, uid, hook_ran="true")
             finally:
-                self._remove(name, nonce, uid)  # the hook succeeded: whatever happens next, the pod and its Secrets go (that pod only)
+                remove(name, nonce, uid)  # the hook succeeded: whatever happens next, the pod and its Secrets go (that pod only)
             if note:
                 raise CloudError(note, EXIT_REFUSED)
             skipped, note = [], ""
@@ -1545,9 +1642,49 @@ class Launcher:
                 print("cloud-worker: end hook: %s; nothing to push" % note, file=sys.stderr)
             if skipped:  # these files were not pushed and went with the pod: say so, loudly
                 print("cloud-worker: WARNING: not saved (secret-looking names): %s" % ", ".join(skipped), file=sys.stderr)
-            return {"worker": worker, "runtime_id": "pod/" + name, "pushed": bool(res.get("pushed")),
+            return {"worker": worker, "runtime_id": "pod/" + pn, "pushed": bool(res.get("pushed")),
                     "wip_branch": view["wip_branch"], "skipped": skipped, "record": info.get("record", "")}
         return self._audited(worker, "stop", go, audit_reason)
+
+    def _remove_persistent(self, name, pod_name_, nonce, uid=None):
+        """A persistent role's stop: the workload FIRST (else its controller recreates the pod), then the pod, then the Secrets."""
+        self.kube.delete_workload(name)
+        try:
+            self.kube.delete_pod(pod_name_, uid)
+        except PodChanged:
+            pass   # the workload is gone: a pod the controller replaced meanwhile is gone with it
+        self._remove(name, nonce)
+
+    def _lookup_workload(self, name):
+        """The StatefulSet of that name, or None. NotFound is None. FORBIDDEN (the Role does not yet grant apps/statefulsets) is None too:
+        the launcher's own create of a StatefulSet would be forbidden under the same RBAC, so none can exist; one line says it was not checked.
+        Any OTHER error (500, timeout, malformed) raises: what remains is unknown."""
+        try:
+            return self.kube.get_workload(name)
+        except CloudError as e:
+            if str(e).startswith("kubectl get: Error from server (Forbidden):"):   # strict prefix: a 5xx that merely says the word is NOT this
+                print("cloud-worker: statefulset lookup forbidden: not checked", file=sys.stderr)
+                return None
+            raise CloudError("could not look up statefulset/%s; REMAINS unknown: %s" % (name, e))
+
+    def _remove_gone(self, worker, name, nonce):
+        """The pod NAME-0 is absent. If a StatefulSet of that name exists it is deleted FIRST (else its controller recreates a pod that
+        sits Pending on the Secrets), then the Secrets. With a nonce a StatefulSet of another run is left whole. Raises naming what REMAINS."""
+        wl = self._lookup_workload(name)
+        if wl and nonce and (((wl.get("spec") or {}).get("template") or {}).get("metadata") or {}).get("annotations", {}).get("cw/run-id") != nonce:
+            print("cloud-worker: statefulset/%s is not this run's (its run id does not match); left whole" % name, file=sys.stderr)
+            return
+        if wl:
+            try:
+                self._remove_persistent(name, name + "-0", nonce)
+            except CloudError as e:
+                if "REMAINS" in str(e):
+                    raise
+                raise CloudError("delete incomplete; REMAINS: statefulset/%s (and its Secrets); delete with: %s; cause: %s" % (
+                    name, self.kube.delete_command("statefulset", name), e))
+        elif nonce:
+            self._remove(name, nonce)
+        # no StatefulSet and no nonce: nothing is deleted (the original path)
 
     def _remove(self, name, nonce, uid=None):
         """Delete the pod and both Secrets (as `delete` does); with a nonce, only those that carry it (the pod, when there, matched already).
@@ -1653,13 +1790,22 @@ class Launcher:
 
         def go(info):
             pod = self._need(worker)
-            if not pod:
+            if not pod:   # no pod (node loss, eviction): its StatefulSet and Secrets may remain, and are removed
+                found = self._lookup_workload(name)   # NotFound and FORBIDDEN are an empty answer; any OTHER error is never answered "deleted"
+                if found:   # nothing found: the old idempotent answer, byte for byte
+                    self._remove_gone(worker, name, None)
                 return {"worker": worker, "runtime_id": "", "deleted": True}
             info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
             if ann(pod, "hook-ran") != "true" and not a.force:
                 raise CloudError("end hook has not run; use --force to delete anyway", EXIT_REFUSED)
+            uid = (pod.get("metadata") or {}).get("uid")
             try:
-                self.kube.delete(name, (pod.get("metadata") or {}).get("uid"))
+                if ann(pod, "workload"):   # a persistent role: the workload FIRST, then its pod, then the Secrets
+                    pn = (pod.get("metadata") or {}).get("name") or name + "-0"
+                    self._remove_persistent(ann(pod, "workload"), pn, None, uid)
+                    name_ = "pod/" + pn
+                    return {"worker": worker, "runtime_id": name_, "deleted": True}
+                self.kube.delete(name, uid)
             except PodChanged:
                 raise CloudError("pod/%s changed since it was read; left whole (run delete again)" % name, EXIT_REFUSED)
             return {"worker": worker, "runtime_id": "pod/" + name, "deleted": True}
@@ -1674,6 +1820,8 @@ class Launcher:
             if not pod:
                 raise CloudError("unknown worker %s" % worker, EXIT_USAGE)
             info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
+            if ann(pod, "workload"):
+                raise CloudError("worker %s has no deadline (a persistent role); nothing to extend" % worker, EXIT_REFUSED)
             hard = parse_iso(ann(pod, "hard-deadline"))
             if a.hard:
                 hard = hard + dt.timedelta(seconds=parse_duration(a.hard[1:])) if a.hard.startswith("+") else self._iso_arg(a.hard)
@@ -1733,6 +1881,22 @@ class Launcher:
                 print("cloud-worker: WARNING: no usable record for %s; using the pod's own deadline" % ann(pod, "worker"), file=sys.stderr)
         return min(hard, parse_iso(ann(pod, "max-hard", iso(hard))))  # a record never lengthens a life past the cap
 
+    def _record_role(self, worker):
+        """The role the switchboard's worker record names (the trusted source, read only): "worker" when none is named or it is unreadable."""
+        rd = self.env.get("CW_CLOUD_RECORD_DIR")
+        if not rd or not NAME_RE.match(worker or ""):
+            return "worker"
+        try:
+            with open(os.path.join(rd, worker + ".json")) as f:
+                role = json.load(f).get("role")
+        except (OSError, ValueError, AttributeError):
+            return "worker"
+        return role if role in ROLES else "worker"
+
+    def _persistent(self, pod):
+        """Persistence is read from the role table through the RECORD's role, never from a pod annotation or a missing deadline."""
+        return ROLES[self._record_role(ann(pod, "worker"))]["persistent"]
+
     def reap(self):
         """One pass: stop every pod past its hard deadline or idle too long. Returns [(worker, reason, exit)]."""
         out, now, live = [], self.clock(), []
@@ -1740,6 +1904,9 @@ class Launcher:
         for pod in self.kube.list_pods():
             worker = ann(pod, "worker")
             reason = None
+            if self._persistent(pod):   # ends only on an explicit stop: no deadline, no idle limit; every other check (cap, scans, renewal) stays
+                live.append(pod)
+                continue
             try:
                 hard = self.hard_deadline(pod)
             except (ValueError, TypeError):
@@ -1845,9 +2012,10 @@ class Launcher:
 
     def _renew_git_token(self, pod, now):
         """True: renewed. False: nothing to do (quietly). Raises _NotRenewed(reason): refused or failed, the old token untouched."""
-        name, worker = pod["metadata"]["name"], ann(pod, "worker")
+        name, worker = ann(pod, "workload") or pod["metadata"]["name"], ann(pod, "worker")   # the Secrets carry the workload's name
         if (pod.get("status") or {}).get("phase") != "Running":
             return False
+        role = self._record_role(worker)   # the token's role is the record's, never the pod annotation's
         secret = self.kube.get_run_secret(name)
         meta = (secret or {}).get("metadata") or {}
         labels = meta.get("labels") or {}
@@ -1876,7 +2044,8 @@ class Launcher:
         except CloudError:
             raise _NotRenewed("repository not on the allow-list") from None
         try:
-            token = run_git_token_cmd(git_token_cmd(repo, self.env), repo, dict(os.environ, **self.env), register=self.kube.add_secrets)
+            token = run_git_token_cmd(git_token_cmd(repo, self.env, ROLES[role]["token_role"]), repo, dict(os.environ, **self.env),
+                                      register=self.kube.add_secrets, role=ROLES[role]["token_role"])
         except CloudError as e:
             raise _NotRenewed("the mint failed: %s" % e) from None
         self.kube.add_secrets(token)
@@ -2222,7 +2391,9 @@ def build_parser():
     c.add_argument("--idle", default="10m")
     c.add_argument("--hard", default="2h")
     c.add_argument("--max-hard", default=DEFAULT_MAX_HARD)
-    c.add_argument("--shape", default=None, help="the pod shape, one of %s; unset: %s (%s with --stack or --agent orchestrator)" % (", ".join(SHAPES), DEFAULT_SHAPE, DEFAULT_STACK_SHAPE))
+    c.add_argument("--shape", default=None, help="the pod shape, one of %s; unset: %s (%s with --stack or --agent orchestrator)" % (", ".join(SHAPE_CHOICES), DEFAULT_SHAPE, DEFAULT_STACK_SHAPE))
+    c.add_argument("--role", default="worker", choices=sorted(ROLES),
+                   help="the role table's key: orchestrator is a persistent, small, restart-Always pod with a token of its own role (no deadline, no contents write); default worker")
     c.add_argument("--image")
     c.add_argument("--stack", action="store_true",
                    help="a pod for a worker that runs a nested Docker stack: the Sysbox runtime class, its own user namespace, the pool's node label; off by default (the default pod is unchanged)")

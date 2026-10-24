@@ -34,7 +34,7 @@ used, because it moves when you work in other clusters.
 
 ## Service-account login, per-run secrets, image pull secret
 With `CW_CLOUD_SERVER` and `CW_CLOUD_TOKEN_FILE` set (and optionally `CW_CLOUD_CA_FILE`) the launcher logs in as the
-`cw-operator` account of `cloud/k8s/operator-rbac.yaml` (one namespaced Role: pods, logs, exec, port-forward, secrets; no
+`cw-operator` account of `cloud/k8s/operator-rbac.yaml` (one namespaced Role: pods, logs, exec, port-forward, secrets, and statefulsets with get, list, watch, create, delete for a persistent role; no
 wildcard, nothing cluster-wide). Every `kubectl` call carries a generated `--kubeconfig` (mode 0600, private temp dir, removed at
 exit) whose only credential is the token file's path. It never uses `--token` or an administrator kubeconfig, and refuses
 if `CW_KUBECONFIG` or `CW_KUBE_CONTEXT` is also set. A missing or unreadable token file exits 3 (`token unavailable`) with no call.
@@ -42,6 +42,11 @@ if `CW_KUBECONFIG` or `CW_KUBE_CONTEXT` is also set. A missing or unreadable tok
 `create --pull-secret NAME` sets `imagePullSecrets`. `create --run-secret-fd NAME=N` (repeatable) reads each value once from
 descriptor `N`, pipes it to `kubectl` on stdin into one Secret `<pod>-run`, and mounts it read-only at `/run/cw/NAME` (0400).
 The Secret goes with the pod at `stop`, `delete` and a failed or interrupted `create`; a pod kept because the end hook failed keeps it.
+A `stop` by name only (no run id) or a `delete` of a worker whose pod is absent removes its StatefulSet first, then its Secrets: the caller named the worker, so it owns it (a run id exists only to protect another run's objects, and a different run id leaves everything whole). A `delete` whose StatefulSet lookup fails for any reason but NotFound exits non-zero and never answers `deleted`.
+
+Do NOT remove the `statefulsets` rights from the Role while orchestrators run: a StatefulSet created while the right existed would become unlookable, the plain-worker cleanup would treat the lookup as `statefulset lookup forbidden: not checked`, and it would remove that worker's Secrets while the set lives. Only a status that starts `Error from server (Forbidden):` counts as forbidden; any other error (a 5xx that merely says the word included) leaves it `REMAINS unknown`.
+
+After this change merges, an operator must apply the manifest (`kubectl apply -f cloud/k8s/operator-rbac.yaml`) on the owner's word; until then `launch --role orchestrator` is forbidden on the real cluster.
 
 Accepted scope of the role: `cw-operator` can get and list every secret in the workers namespace (a Role cannot limit `list` by label), so the namespace must hold only worker pods and their per-pod secrets; that is enforced in the deployment repository, not here.
 
@@ -182,6 +187,10 @@ The managed reaper's loop (`reap --loop`) does it, as one more step of each pass
   call, and the file is a whole-directory projected volume (no `subPath`) that the kubelet refreshes, usually within a minute or two.
 - **For which repository.** The pod's `CW_REPO` must equal the `repo` of the switchboard's worker record (read only, `CW_CLOUD_RECORD_DIR`, which the renewal therefore needs in the reaper's
   environment) and be on `CW_ALLOWED_REPOS`. A missing or unreadable record, a mismatch, a pod that is not running or past its hard limit, or a Secret that is not this run's stops the renewal.
+- **The reaper MUST have `CW_CLOUD_RECORD_DIR` set.** The role (worker or orchestrator) comes from the switchboard's worker record only. With the variable unset, or the record missing or
+  unreadable, the role reads as `worker`: an orchestrator is then treated as a worker, skipped by the renewal pass without a message, and its token dies at one hour.
+- **A pod that is gone.** `stop` and `delete` of a persistent role whose pod `<name>-0` is absent (node loss, eviction, the gap before the controller recreates it) but whose
+  StatefulSet remains delete the StatefulSet first, then the Secrets; a StatefulSet of another run id is left whole, and a failed delete names `statefulset/<name>` as REMAINING.
 - **The reaper's own needs.** It runs the mint, so it reads the vault settings (`CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME`, from the settings file as the launcher does) and needs a signed-in `az` session and a network path the vault accepts.
   Without them every renewal fails closed (below) and workers behave as before: they lose push at one hour.
 - **When it fails** (the vault, the lookup, the mint or the patch): the old token stays, one audit line (`action: renew-git-token`, `ok: false`, the reason, never a value) is written, and the next pass tries again. The worker is
@@ -274,3 +283,16 @@ value; otherwise read from the vault; `CW_APP_INSTALLATION_CMD` and the vault se
 `CW_GITHUB_API_BASE` (tests), `CW_PREFLIGHT_TOKEN_CMD` (tests: replaces the mint in the preflight).
 
 **Repository allow-list.** `create` (and the driver, `run-task`, through the same function `check_repo_allowed`) launches only for a repository the owner listed. `CW_ALLOWED_REPOS` is a comma-separated list of `OWNER/NAME`, compared exactly and case-insensitively; no wildcard. Unset, empty, or any entry that is not `OWNER/NAME` shaped (a dot segment, a space, a `*`, an extra slash) refuses everything (fail closed). `CW_TOOLING_REPO` (`OWNER/NAME`) names the tooling's own repository, which is refused even when it is listed; unset adds no extra check, malformed refuses. A refused repository exits `2` with `refused: <repo> is not on the cloud allow-list` before any `kubectl` call, so nothing is created. Both settings are read from the environment of whoever runs the launcher or the driver, like the other `CW_` settings: the operator exports them in the shell (or the service unit) that starts it. An agent running as the same user could set them for a command it runs, so the list is a mistake-guard for the operator, not a boundary; the stops are the token's one-repository scope and the repository's own rules. The check compares spellings: a renamed or transferred repository is not matched by its old name, and an entry or tooling value ending in `.git` is malformed and refuses. The guard table is `docs/cloud-guard-parity.md`.
+
+## Roles: worker and orchestrator
+
+A cloud pod has a role. An idle orchestrator-like session measured about 365 MB resident (a container peak of 456 MiB at boot) and about 1% of a core; the `orchestrator` role is sized from that and is one small always-on pod. Generated from the launcher's tables (`render_roles_doc`); a test pins it.
+
+<!-- roles:begin -->
+| Role | Mode | Pod size (requests = limits for a persistent role) | Token set | List-price estimate |
+|---|---|---|---|---|
+| `worker` | worker: restart Never, hard deadline, idle limit | 2 CPU, 4Gi | contents: write, pull_requests: write, issues: read, metadata: read | USD 0.10 per hour (shape S) |
+| `orchestrator` | persistent: one-replica StatefulSet, restart Always, no deadline, no idle limit, ends only on an explicit stop | 250m CPU, 768Mi | issues: write, pull_requests: read, checks: read, metadata: read | USD 0.02 per hour, USD 0.48 per day always on |
+
+The role is chosen by `--role` (a key of the role table; default `worker`); the orchestrator's size is chosen only by the role, never by `--shape`. The orchestrator holds no contents write and never the App key: the launcher and the reaper mint its token. Owner step for its set: the owner adds issues: write, pull_requests: read, checks: read, metadata: read to the App's permissions and accepts them on each installation.
+<!-- roles:end -->

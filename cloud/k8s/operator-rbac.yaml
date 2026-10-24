@@ -39,6 +39,11 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "create", "patch", "delete"]
+  # A persistent role's one-replica StatefulSet: the launcher gets it, creates it, and deletes it (with --wait, which lists and watches).
+  # It never patches or updates one.
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
