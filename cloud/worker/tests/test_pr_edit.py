@@ -49,8 +49,8 @@ class H(http.server.BaseHTTPRequestHandler):
     do_POST = do_PUT = do_DELETE = do_PATCH
 
 
-def pr(head=BRANCH, base=REPO, body="PLAN: x\nMERGE: captain\n\nold"):
-    return {"head": {"ref": head}, "base": {"repo": {"full_name": base}}, "body": body}
+def pr(head=BRANCH, base=REPO, body="PLAN: x\nMERGE: captain\n\nold", head_repo=REPO):
+    return {"head": {"ref": head, "repo": {"full_name": head_repo}}, "base": {"repo": {"full_name": base}}, "body": body}
 
 
 def patches():
@@ -234,7 +234,7 @@ class T(unittest.TestCase):
         for name, old, new, probe in (
             ("title edit", 'if len(args) != 3 or args[1] != "--body-file" or not args[0].isdigit():', "if False:", "pr edit 7 --body-file %s --title x" % self.hold),
             ("inline body", 'if a in ("--body", "-b") or a.startswith(("--body=", "-b")):', "if False:", "pr edit 7 --body-file %s --body x" % self.hold),
-            ("no hold check", 'if HOLD in cur.splitlines() and', "if False and", "pr edit 7 --body-file " + self.nohold),
+            ("no hold check", 'if HOLD in lines_of(cur) and', "if False and", "pr edit 7 --body-file " + self.nohold),
             ("failed read", 'except (Fail, KeyError, TypeError, ValueError):\n        raise refused("pr-edit-read-failed")', "except (KeyError, TypeError, ValueError):\n        raise refused('pr-edit-read-failed')", "pr edit 404 --body-file " + self.hold),
         ):
             with self.subTest(mutant=name):

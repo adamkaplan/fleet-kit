@@ -19,6 +19,7 @@ import io
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import urllib.error
@@ -259,11 +260,59 @@ def recorded(n):
 
 
 HOLD = "MERGE: captain"
+BODY_MAX = 1 << 20
 REFUSE_TAIL = "the repository's rules are the guard; this wrapper is only a convenience"
 
 
 def refused(row):
     return Fail("refused: %s: %s" % (row, REFUSE_TAIL), 3)
+
+
+LINE_SEPARATORS = ("\u2028", "\u2029", "\u0085", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e")
+
+
+def lines_of(text):
+    """Lines as a reader that splits on \\n only sees them (a trailing \\r dropped). Never str.splitlines(): it splits on more."""
+    return [l[:-1] if l.endswith("\r") else l for l in text.split("\n")]
+
+
+def has_other_separator(text):
+    """True when the text holds a line separator other than \\n (a lone \\r, U+2028, U+2029, U+0085, \\x0b, \\x0c, \\x1c-\\x1e)."""
+    return any(c in text for c in LINE_SEPARATORS) or "\r" in text.replace("\r\n", "")
+
+
+def real_body_file(path):
+    """The regular file a body may be read from: its real path (symlinks resolved) is inside the worktree or under /tmp."""
+    real = os.path.realpath(path)
+    roots = [os.path.realpath("/tmp")]
+    top = git("rev-parse", "--show-toplevel")
+    roots.append(os.path.realpath(top or os.getcwd()))
+    if not any(real == r or real.startswith(r.rstrip("/") + "/") for r in roots):
+        raise refused("pr-edit-body-file-outside")
+    try:
+        st = os.stat(real)
+    except OSError:
+        raise Fail("the body file could not be read", 2)
+    if not stat.S_ISREG(st.st_mode):
+        raise refused("pr-edit-body-file-not-regular")
+    if st.st_size > BODY_MAX:
+        raise refused("pr-edit-body-file-too-large")
+    return real
+
+
+def read_body_file(path):
+    real = real_body_file(path)
+    try:
+        with open(real, "rb") as f:
+            raw = f.read(BODY_MAX + 1)
+    except OSError:
+        raise Fail("the body file could not be read", 2)
+    if len(raw) > BODY_MAX:
+        raise refused("pr-edit-body-file-too-large")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Fail("the body file is not text (not UTF-8)", 2)
 
 
 def pr_edit(args):
@@ -283,21 +332,22 @@ def pr_edit(args):
     try:
         pr = get_json("/repos/%s/pulls/%d" % (repo, n))
         head = pr["head"]["ref"]
+        head_repo = pr["head"]["repo"]["full_name"]
         base_repo = pr["base"]["repo"]["full_name"]
         cur = pr.get("body") or ""
-        if not isinstance(head, str) or not isinstance(base_repo, str) or not isinstance(cur, str):
+        if not isinstance(head, str) or not isinstance(head_repo, str) or not isinstance(base_repo, str) or not isinstance(cur, str):
             raise ValueError
     except (Fail, KeyError, TypeError, ValueError):
         raise refused("pr-edit-read-failed")
     mine = os.environ.get("CW_BRANCH") or git("symbolic-ref", "--quiet", "--short", "HEAD")
     if base_repo.lower() != repo.lower() or not ((mine and head == mine) or recorded(n)):
         raise refused("pr-edit-other-number")
-    try:
-        with open(args[2], encoding="utf-8") as f:
-            new = f.read(1 << 20)
-    except OSError:
-        raise Fail("the body file could not be read", 2)
-    if HOLD in cur.splitlines() and new.splitlines().count(HOLD) != 1:
+    if head_repo.lower() != repo.lower():   # a fork's pull request with the same branch name is not the pod's own
+        raise refused("pr-edit-other-number")
+    new = read_body_file(args[2])
+    if has_other_separator(new):
+        raise refused("pr-edit-body-separator")
+    if HOLD in lines_of(cur) and lines_of(new).count(HOLD) != 1:
         raise refused("pr-edit-no-hold-line")
     out = parse_json(request("PATCH", "/repos/%s/pulls/%d" % (repo, n), {"body": new}))
     print(out.get("html_url", ""))
