@@ -212,6 +212,20 @@ class T(base.T):
         self.assertEqual(self.edit(7, link, script=m).returncode, 0)   # the mutant publishes it
         self.assertEqual(self.edit(7, link).returncode, 3)
 
+    RESIDUAL = ("This narrows what a worker can publish as its own pull request's body; it does not close it: a file the "
+                "worker itself copies to an innocent name in its worktree or /tmp can still be published. The boundary is "
+                "the token and what the pod holds, not this check.")
+    DOC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "docs", "cloud-worker-interface.md")
+
+    def test_m2_the_docs_state_the_residual_plainly(self):
+        self.assertIn(self.RESIDUAL, open(self.DOC).read())
+        self.assertNotIn("exactly once", open(self.DOC).read())
+
+    def test_m2_mutant_docs_without_the_sentence_fail_the_check(self):
+        mutated = open(self.DOC).read().replace(self.RESIDUAL, "", 1)
+        self.assertNotEqual(mutated, open(self.DOC).read())
+        self.assertNotIn(self.RESIDUAL, mutated)
+
     def test_r1_mutant_without_the_git_check_publishes_the_git_config(self):
         m = self.mut("mut-nogit", "    check_body_path(path, real)\n", "    pass\n")
         cfg = os.path.join(self.work, ".git", "config")
