@@ -102,6 +102,12 @@ SWITCHBOARD_SOURCE_FILES = _manifest_files()
 def switchboard_source():
     """The daemon's code as every scan reads it: the files of SWITCHBOARD_SOURCE_FILES, in order, as one text."""
     return "\n".join(path.read_text() for path in SWITCHBOARD_SOURCE_FILES)
+
+
+def daemon_text(path):
+    """The text of a file for a scan: for the entry, the daemon's whole source (the entry and every part of the manifest); for any other file, the file."""
+    path = Path(path)
+    return switchboard_source() if path.resolve() == SWITCHBOARD else path.read_text()
 SCENARIO = BIN / "fleet-scenario"
 
 
@@ -138,7 +144,7 @@ sc = _load("t_fleet_scenario", SCENARIO)
 
 def class_source(name, method=None):
     """The source of a class in bin/fleet-switchboard, or of one of its methods."""
-    source = SWITCHBOARD.read_text()
+    source = switchboard_source()
     for node in ast.parse(source).body:
         if isinstance(node, ast.ClassDef) and node.name == name:
             if method is None:
@@ -965,11 +971,11 @@ class TestHerdrClient(Base):
 
     def test_the_source_scan_catches_a_planted_violation(self):
         # A gate never seen failing is decoration.
-        planted = SWITCHBOARD.read_text().replace(
+        planted = switchboard_source().replace(
             "    def notification_show(self, title, body=None):",
             "    def wake(self, pane, text):\n        return self._call(\"agent\", \"prompt\", pane, text)\n\n"
             "    def notification_show(self, title, body=None):")
-        self.assertNotEqual(planted, SWITCHBOARD.read_text())
+        self.assertNotEqual(planted, switchboard_source())
         self.assertTrue(herdr_typing_violations(planted))
         for snippet in ('x = ["pane", "send-text", p]', 'x = ("pane", "run", p)', 'x = ["tab", "focus"]',
                         'x = "pane.send_text"', 'x = "agent.prompt"', 'y = {"focus": True}',
@@ -6658,7 +6664,7 @@ class TestLaunch(StandInPids, Base):
         self.assertEqual(code, 0, err.getvalue())
 
     def test_close_is_used_by_launch_alone(self):
-        tree = ast.parse(SWITCHBOARD.read_text())
+        tree = ast.parse(switchboard_source())
         callers = set()
         for function in ast.walk(tree):
             if isinstance(function, ast.FunctionDef):
@@ -9669,7 +9675,7 @@ class TestHygiene(unittest.TestCase):
     def test_standard_library_only(self):
         roots = _stdlib_roots()
         for name in self.FILES:
-            tree = ast.parse((BIN / name).read_text())
+            tree = ast.parse(daemon_text(BIN / name))
             modules = set()
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
@@ -10469,7 +10475,7 @@ class TestWorkerBlockedFacts(PR4Base):
 
     def test_there_is_one_toast_path_the_render_step(self):
         """PR 3's render owns every toast; a second mechanism would be a second way to do it."""
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         self.assertNotIn("ToastBoard", source)
         calls = [n for n in ast.walk(ast.parse(source)) if isinstance(n, ast.Call)
                  and isinstance(n.func, ast.Attribute) and n.func.attr == "notification_show"]
@@ -11501,7 +11507,7 @@ class TestFrictionWake(FrictionBase):
         self.assertNotIn("none yet", sb.friction_status_line(cfg, self.world.state))
         off = sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         self.assertEqual(sb.friction_status_line(off, self.world.state), "friction wake: off")
-        text = (REPO / "bin" / "fleet-switchboard").read_text()   # and `status` prints it, indented under the others
+        text = switchboard_source()   # and `status` prints it, indented under the others
         self.assertIn('report["friction"] = friction_status_line(config, state)', text)
         self.assertIn('lines.extend("      " + report["friction"]', text)
 
@@ -14000,7 +14006,7 @@ class TestChatClearOffers(unittest.TestCase):
         for word in ("subprocess", "urllib", "socket", "change_issue_labels"):
             self.assertNotIn(word, source, "slice 1 reaches nothing: no process, no network, no GitHub write")
         import ast
-        main = (Path(sb.__file__).parent / "fleet-switchboard").read_text()
+        main = switchboard_source()
         for fn in [n for n in ast.walk(ast.parse(main)) if isinstance(n, ast.FunctionDef) and n.name.startswith("cmd_")]:
             self.assertNotIn("chat_clear", ast.get_source_segment(main, fn), "%s: no command reaches the chat clear (slice 3's hook is the daemon's alone; TestChatClearHook S7 counts the call sites)" % fn.name)
 
@@ -14487,7 +14493,7 @@ class TestChatClearHook(Base):
 
     def test_s7_nothing_but_the_daemons_publish_calls_the_hook_and_no_command_takes_text_as_the_owners_word(self):
         import ast
-        tree = ast.parse((Path(sb.__file__)).read_text())
+        tree = ast.parse(switchboard_source())
         callers = {}
         for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
             for call in [c for c in ast.walk(fn) if isinstance(c, ast.Call)]:
@@ -14833,7 +14839,7 @@ class TestChatClearHook(Base):
 
     def test_light_live_every_route_that_can_write_is_behind_the_one_live_decision(self):
         import ast
-        tree = ast.parse(Path(sb.__file__).read_text())
+        tree = ast.parse(switchboard_source())
         fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
         derived = set()
         for name in ("_chat_clear_act", "chat_clear_apply"):
@@ -15388,7 +15394,7 @@ class TestClearCarry(unittest.TestCase):
 
     def test_s8_there_is_one_fingerprint_function_and_the_carry_code_holds_no_path_or_class_literal(self):
         import ast
-        main = Path(sb.__file__).read_text() + "\n" + (Path(sb.__file__).parent / "impact_hold.py").read_text()   # #532: the clear's wrapper moved to bin/impact_hold.py, still "the switchboard's" code
+        main = switchboard_source() + "\n" + (Path(sb.__file__).parent / "impact_hold.py").read_text()   # #532: the clear's wrapper moved to bin/impact_hold.py, still "the switchboard's" code
         module = Path(sb.__file__).parent / "clear_carry.py"
         text = module.read_text()
         defs = [n.name for src in (main, text) for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and "fingerprint" in n.name]
@@ -16017,7 +16023,7 @@ class TestOneCharter(CharterRig, Base):
 
     def test_the_readers_that_fall_back_to_a_retired_orchestrators_record_are_derived_from_the_code_and_each_has_its_row(self):
         callers = set()
-        for node in ast.walk(ast.parse((REPO / "bin" / "fleet-switchboard").read_text())):
+        for node in ast.walk(ast.parse(switchboard_source())):
             if isinstance(node, ast.FunctionDef) and node.name != "registry_retired_owners":
                 if any(isinstance(s, ast.Call) and isinstance(s.func, ast.Name) and s.func.id == "registry_retired_owners" for s in ast.walk(node)):
                     callers.add(node.name)
@@ -16169,8 +16175,8 @@ class TestOneCharter(CharterRig, Base):
         ("bin/fleet-switchboard", "registry_charter_view"): "registry: every row's charter", ("bin/fleet-switchboard", "triage_context"): "registry: charters via owned_numbers (an orchestrator's issue is never a charter)",
         ("bin/switchboard/judge_request.py", "identify"): "own: copies the caller's own launch fields into its context",
         ("bin/fleet-switchboard", "resume_agent"): "own: one agent's own repo lookup", ("bin/fleet-switchboard", "charter_pane_update"): "own: one agent's own charter for its pane",
-        ("bin/fleet-switchboard", "_fleet_repo"): "own: one agent's own repo", ("bin/fleet-switchboard", "read_order_notices"): "own: the order notices' own records",
-        ("bin/fleet-switchboard", "order_groups"): "own: groups order notices", ("bin/fleet-switchboard", "decisions_from_order_notices"): "own: words order notices",
+        ("bin/fleet-switchboard", "_fleet_repo"): "own: one agent's own repo", ("bin/switchboard/decisions_b.py", "read_order_notices"): "own: the order notices' own records",
+        ("bin/switchboard/decisions_b.py", "order_groups"): "own: groups order notices", ("bin/switchboard/decisions_b.py", "decisions_from_order_notices"): "own: words order notices",
         ("bin/switchboard/judge_request.py", "resolve_policy_context"): "own: one agent's own launch context", ("bin/fleet-switchboard", "_valid_context"): "own: a cached own context",
         ("bin/fleet-switchboard", "charter_orders"): "own: an agent's own charter's orders", ("bin/switchboard/judge_request.py", "charter_guard"): "own: an agent's own charters",
         ("bin/switchboard/judge_request.py", "ask_context_of"): "own: an agent's own ask context", ("bin/fleet-switchboard", "__call__"): "own: an orchestrator's own orders",
@@ -16942,7 +16948,7 @@ class TestClearNotice(Base):
     def test_the_kinds_table_is_complete_derived_from_the_callers(self):
         import ast
         seen = set()
-        for path in (BIN / "fleet-switchboard", BIN / "impact_hold.py"):
+        for path in (*SWITCHBOARD_SOURCE_FILES, BIN / "impact_hold.py"):
             for node in ast.walk(ast.parse(path.read_text())):
                 if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "notify_clear" and len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
                     seen.add(node.args[1].value)
@@ -17633,7 +17639,7 @@ class TestClearCarryInTheDaemon(Base):
 
     def test_the_gates_command_calls_the_carried_note_and_a_state_error_is_said_not_swallowed(self):
         import ast
-        main = Path(sb.__file__).read_text()
+        main = switchboard_source()
         fn = next(n for n in ast.walk(ast.parse(main)) if isinstance(n, ast.FunctionDef) and n.name == "cmd_gates")
         self.assertIn("gates_carried_note(report, ctx)", ast.get_source_segment(main, fn))
         report = {"gates": [{"gate": "G6", "status": "ok", "detail": "not a held PR"}], "head": "a" * 40}
@@ -19568,7 +19574,7 @@ class TestIntegrationBranchVerdictText(unittest.TestCase):
         self.assertEqual((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().count(self.SKILL), 1)
 
     def test_the_refusal_wording_is_the_one_the_command_prints(self):
-        self.assertIn("no per-PR scenario of this plan is judged by %s", (REPO / "bin" / "fleet-switchboard").read_text())
+        self.assertIn("no per-PR scenario of this plan is judged by %s", switchboard_source())
 
     def test_the_texts_name_roles_never_agents_or_people(self):
         for text in (self.DOC, self.SKILL):
@@ -20469,7 +20475,7 @@ class TestPR7Source(unittest.TestCase):
         self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
     def test_the_decision_model_section_is_one_clearly_marked_block(self):
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         self.assertEqual(source.count("\n# PR 7: the decision model"), 1)
 
     def test_the_replay_answers_name_no_private_text(self):
@@ -20876,7 +20882,7 @@ class TestDecorationIsAFact(ActingCase):
 
     def test_the_source_is_registered_and_the_engine_has_no_second_way_to_write(self):
         self.assertIsNotNone(sb.foreground_source(self.world.engine))
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         section = source.split("# PR 8: foreground and background", 1)[1].split("# Worker events, reminders", 1)[0]
         for forbidden in ("v2.synthetic(", "v2.prompt(", "herdr.agent_prompt"):
             self.assertNotIn(forbidden, section.split("def launch_agent")[0], forbidden)
@@ -22672,7 +22678,7 @@ class TestHandoff(HandoffCase):
         writes = [c for c in self.gh.calls if len(c) != 3]
         self.assertEqual(len(writes), 1)
         self.assertNotRegex(class_source("IntentReader"), r"\"(-X|-f|-F|--method|--input|--field)\"")
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         # the handoff comment, (PR 17) `write_issue_body` and (PR 18) `_gh_write`: labels and comments
         self.assertEqual(source.count('"--method"'), 3)
 
@@ -22753,7 +22759,7 @@ class TestForegroundScenarios(Base):
 
 class TestPR8Source(unittest.TestCase):
     def test_the_foreground_section_is_one_clearly_marked_block(self):
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         self.assertEqual(source.count("\n# PR 8: foreground and background"), 1)
 
     def test_the_engine_still_never_types(self):
@@ -22762,7 +22768,7 @@ class TestPR8Source(unittest.TestCase):
     def test_no_top_level_name_is_defined_twice_in_the_big_files(self):
         for name in ("fleet-switchboard", "test-switchboard", "fleet-scenario", "proof-switchboard"):
             seen = {}
-            for node in ast.parse((BIN / name).read_text()).body:
+            for node in ast.parse(daemon_text(BIN / name)).body:
                 names = [node.name] if isinstance(node, (ast.FunctionDef, ast.ClassDef)) else [
                     t.id for t in getattr(node, "targets", []) if isinstance(t, ast.Name)]
                 for each in names:
@@ -24320,7 +24326,7 @@ class TestJudgeToolWritesNothingElsewhere(unittest.TestCase):
 
     def section(self):
         """The policy section: its part files, and the statements of it that stay in the entry (S2 keeps the ones the clear's closure reads), between the DEFAULTS line and the next section."""
-        entry = SWITCHBOARD.read_text()
+        entry = switchboard_source()
         kept = entry[entry.index('DEFAULTS["policy"] = None'):entry.index("# PR 10: move a v1 session")]
         return "\n".join([kept] + [path.read_text() for path in SWITCHBOARD_SOURCE_FILES if path != SWITCHBOARD])
 
@@ -25878,13 +25884,13 @@ class TestPR10Source(unittest.TestCase):
     SECTION = "\n# PR 10: move a v1 session into v2"
 
     def test_the_section_is_one_clearly_marked_block(self):
-        self.assertEqual(SWITCHBOARD.read_text().count(self.SECTION), 1)
+        self.assertEqual(switchboard_source().count(self.SECTION), 1)
 
     def test_the_engine_still_never_types(self):
         self.assertEqual(herdr_typing_violations(switchboard_source()), [])
 
     def test_the_import_command_runs_only_the_clients_it_is_given(self):
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         start = source.index(self.SECTION)
         section = source[start:source.index("\ndef build_parser")] + (BIN / "switchboard" / "import_v1.py").read_text()   # the part holds the rest of the section
         self.assertNotIn("subprocess.run", section, "the runner is injected")
@@ -25892,7 +25898,7 @@ class TestPR10Source(unittest.TestCase):
 
     def test_no_top_level_name_is_defined_twice_in_any_bin_file(self):
         for name in ("fleet-switchboard", "fleet-scenario", "test-switchboard", "proof-switchboard"):
-            tree = ast.parse((BIN / name).read_text())
+            tree = ast.parse(daemon_text(BIN / name))
             seen = {}
             for node in tree.body:
                 names = []
@@ -27785,7 +27791,7 @@ class TestBossAlias(ReportBase):
         self.assertEqual([f for f in self.derive() if f.sender == "cos"], [], "no worker facts for cos about itself")
 
     def test_every_boss_lookup_goes_through_boss_name(self):
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         start = source.index("def boss_name(")
         lookups = [i for i in range(len(source)) if source.startswith("_boss_of(", i)]
         offenders = []
@@ -29841,8 +29847,8 @@ class TestTriage(Base):
         self.assertEqual([e["detail"]["ref"] for e in self.world.audit() if e["event"] == "triage.dismissed"], ["acme/api#160"])
 
     def test_nothing_in_the_triage_can_write_to_github(self):
-        source = Path(sb.__file__).read_text() if hasattr(sb, "__file__") else ""
-        text = open(str(REPO / "bin" / "fleet-switchboard")).read()
+        source = switchboard_source() if hasattr(sb, "__file__") else ""
+        text = switchboard_source()
         start, end = text.index("# ---- #130: the triage function"), text.index("# ---- the daily friction wake")
         section = text[start:end]
         for forbidden in ("--method", "-X ", "issue edit", "issue comment", "issue close", "add-label", "--add-label",
@@ -30903,7 +30909,7 @@ class TestCaptainLabels(Base):
         self.assertFalse(sb.pr_facts_from(dict(data, labels=[], body="plain"))["captain"])
 
     def test_every_caller_reads_the_one_helper(self):
-        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        text = switchboard_source()
         callers = [l for l in text.splitlines() if "pr_is_captain(" in l and not l.lstrip().startswith(("def ", "return pr_marker"))]
         self.assertEqual(callers, [], "a caller still reads the first line alone: %r" % callers)
 
@@ -31071,7 +31077,7 @@ class TestCaptainSweepFindings(TestSweep):
         self.assertEqual([f for f in self.found() if f[0] == "S6a"], [])
 
     def test_the_sweep_writes_nothing_to_github(self):
-        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        text = switchboard_source()
         start, end = text.index("def sweep_read_repo"), text.index("class SweepFacts")
         for forbidden in ("--method", "-X ", "issue edit", "issue comment", "add-label", "POST", "PATCH", "DELETE"):
             self.assertNotIn(forbidden, text[start:end], forbidden)
@@ -34435,7 +34441,7 @@ class TestG1UnwrittenClaim(LedgerBase):
     def test_no_consumer_of_a_claim_defaults_it_to_pr_on_its_own(self):
         import re as _re
         for name in ("fleet-switchboard", "plan_ledger.py"):
-            text = (BIN / name).read_text()
+            text = daemon_text(BIN / name)
             self.assertEqual(_re.findall(r'\.get\("claim"\) or "pr"', text), [], name + " reads a claim without claim_of")
 
     def test_a_tester_scenario_whose_proof_is_not_a_measure_stays_claimed(self):
@@ -35345,7 +35351,7 @@ class TestPlanLedger(LedgerBase):
         with mock.patch.object(sb, "load_plan_ledger", side_effect=FileNotFoundError("plan_ledger.py is gone")):
             with self.assertRaises(FileNotFoundError):
                 sb.plan_ledger.LEDGER_FILE
-        text = SWITCHBOARD.read_text()
+        text = switchboard_source()
         self.assertNotRegex(text, r"(?m)^plan_ledger = load_plan_ledger\(\)")
 
     def test_the_new_files_carry_nothing_private(self):
@@ -35559,7 +35565,7 @@ class TestWaive(LedgerBase):
         self.assertEqual(self.waive(who=None)[0], 0)                                 # the owner's own terminal still may
 
     def test_waive_asks_the_one_shared_terminal_check_and_has_no_copy_of_it(self):
-        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        text = switchboard_source()
         body = text[text.index("def cmd_waive"):text.index("def cmd_gates(args")]
         self.assertIn("gates_caller_kind(", body)
         self.assertNotIn("isatty", body)
@@ -36902,7 +36908,7 @@ class TestOwnerTerminal(LedgerBase):
         self.assertEqual(self.run_as(None, "gates", "off")[0], 0)
 
     def test_the_terminal_check_is_one_function_used_by_every_owner_only_command(self):
-        text = SWITCHBOARD.read_text()
+        text = switchboard_source()
         self.assertEqual(text.count("owner_terminal_problem()"), 1, "the check is called from exactly one place")
         for name in ("gates_caller_may_switch", "cmd_verdict"):
             self.assertIn("gates_caller_kind(", inspect.getsource(getattr(sb, name)), name)
@@ -37575,7 +37581,7 @@ class TestImpactClassAndNarrowForm(LedgerBase):
             self.assertEqual(code, 2)
             self.assertIn("run the review again", err)
         self.assertEqual([e["impact_class"] for e in self.hold_records()], ["novelty"])
-        source = (REPO / "bin" / "fleet-switchboard").read_text()
+        source = switchboard_source()
         rule = impact_floor.owner_hold_rule(impact_floor.load_matrix())
         names = rule[0] + rule[1]   # no line of the code lists several of the classes (single words like "data" occur elsewhere)
         self.assertEqual([l for l in source.splitlines() if sum(1 for c in names if re.search(r"[\"']%s[\"']" % c, l)) >= 3], [])
@@ -37872,7 +37878,7 @@ class TestBlockTable(LedgerBase):
         definition = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
         self.assertEqual(definition.split("<!-- block-table:begin -->\n", 1)[1].split("\n<!-- block-table:end -->", 1)[0], text)
         self.assertEqual(self.record("--head", LEDGER_HEAD)[2].count(text), 1)
-        self.assertEqual((REPO / "bin" / "fleet-switchboard").read_text().count('("--verdict", "verdict", "refused")'), 1)
+        self.assertEqual(switchboard_source().count('("--verdict", "verdict", "refused")'), 1)
 
     def test_the_definitions_example_block_parses_to_a_record_with_a_score(self):
         definition = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
@@ -38586,7 +38592,7 @@ class TestWholeRead(LedgerBase):
         import ast
         found = set()
         for name in ("plan_ledger.py", "fleet-switchboard"):
-            text = (REPO / "bin" / name).read_text()
+            text = daemon_text(REPO / "bin" / name)
             for node in ast.walk(ast.parse(text)):
                 if isinstance(node, ast.FunctionDef):
                     inner = [n for n in ast.walk(node) if isinstance(n, ast.FunctionDef) and n is not node]
@@ -38647,7 +38653,7 @@ class TestWholeRead(LedgerBase):
         self.assertEqual(region, "RATER_CHUNK_LINES = %d" % sb.RATER_CHUNK_LINES)
         self.assertEqual(text.count("RATER_CHUNK_LINES"), 1)
         self.assertEqual(text.count(str(sb.RATER_CHUNK_LINES)), 1)
-        self.assertEqual((REPO / "bin" / "fleet-switchboard").read_text().count("RATER_CHUNK_LINES = "), 1)
+        self.assertEqual(switchboard_source().count("RATER_CHUNK_LINES = "), 1)
         self.assertIn("one changed file at a time", text)
         self.assertIn("in the changed-file order", text.replace("one each, in the changed-file order", "in the changed-file order"))
 
@@ -39205,7 +39211,7 @@ class TestImpactRejudge(LedgerBase):
         refs = ("CAPTAIN_HOLD_LABELS", "OWNER_HOLD_KEY", "OTHER_HOLD_KEYS")
         found, uses_owner = {}, {}
         for path in sorted(glob.glob(str(Path(sb.KIT_ROOT) / "bin" / "*.py")) + [str(Path(sb.KIT_ROOT) / "bin" / "fleet-switchboard")]):
-            tree = ast.parse(Path(path).read_text())
+            tree = ast.parse(daemon_text(path))
             for node in ast.walk(tree):
                 if isinstance(node, ast.FunctionDef):
                     inside = list(ast.walk(node))
@@ -40310,7 +40316,7 @@ class TestImpactHold(LedgerBase):
         """The readers are DERIVED from the code: every function that calls `rehold_reason` (the one rule) is in the table, and the table holds nothing else but the two gate rows."""
         import ast
         callers = set()
-        for path in (BIN / "fleet-switchboard", BIN / "impact_hold.py"):
+        for path in (*SWITCHBOARD_SOURCE_FILES, BIN / "impact_hold.py"):
             for node in ast.parse(path.read_text()).body:
                 if isinstance(node, ast.FunctionDef) and any(isinstance(x, ast.Call) and getattr(x.func, "id", "") == "rehold_reason" for x in ast.walk(node)):
                     callers.add(node.name)
@@ -40725,7 +40731,7 @@ class TestImpactHold(LedgerBase):
                 self.assertTrue(set(readers) <= set(roots.get("bin/" + path.name) or []), "%s has a config reader (%s) that is not a root" % (path.name, readers))
         # the modules the clear loads or runs, DERIVED: every loader of the daemon (a `load_module("x")` call, a name in HELPER_MODULES, a function that returns one) is enumerated by ast; a module
         # is judged when the clear reaches its loader, the daemon loads it at import, it has a config reader, or the recorded run executed it; every other loaded module is listed with its reason
-        daemon, hold = ast.parse((BIN / "fleet-switchboard").read_text()), ast.parse((BIN / "impact_hold.py").read_text())
+        daemon, hold = ast.parse(switchboard_source()), ast.parse((BIN / "impact_hold.py").read_text())
         names = {p.stem for p in BIN.glob("*.py")}
         helper = next(ast.literal_eval(n.value) for n in daemon.body if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "HELPER_MODULES" for t in n.targets))
         defs = {n.name: n for n in daemon.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
@@ -40781,7 +40787,7 @@ class TestImpactHold(LedgerBase):
         self.assertEqual([k for k, v in counts.items() if v > 1], [], "each function of the moved clear code is defined once (a later copy would silently replace the first)")
         for pinned in ("impact_carry_get", "fetch_orders", "read_pr_json", "HELPER_MODULES", "_make_loader"):
             self.assertIn(pinned, rule["closure_roots"])
-        table = (BIN / "fleet-switchboard").read_text().split("\n")
+        table = switchboard_source().split("\n")
         k = next(i for i, l in enumerate(table) if l.strip().startswith('"load_agent_presence":'))
         mutated = list(table)
         mutated[k] = mutated[k].replace('"agent_presence"', '"lanes"')
@@ -41010,7 +41016,7 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(module.refusals(rule, good, [{"filename": "bin/fleet-switchboard", "status": "modified"}], sb.impact_floor.matches, {"bin/fleet-switchboard": []}), [])
 
     def real_source(self):
-        return (BIN / "fleet-switchboard").read_text()
+        return switchboard_source()
 
     def edit_one_line_under(self, source, name):
         """The source with one comment added at the end of the first body line of module-level function `name` (a one-line change right under the def), and its unified diff."""
@@ -41037,7 +41043,7 @@ class TestImpactHold(LedgerBase):
 
     def test_an_unrelated_edit_in_the_daemon_file_is_allowed_and_a_new_call_into_the_clear_is_refused(self):
         source = self.real_source()
-        for name in ("cmd_triage", "format_decisions_status", "decisions_from_notices", "triage_pass"):
+        for name in ("cmd_triage", "format_decisions_status", "sweep_summary", "triage_pass"):
             self.assertIn("def %s(" % name, source)
             head, diff = self.edit_one_line_under(source, name)
             self.assertEqual(self.closure_check(head, diff), [], name)
@@ -41566,7 +41572,7 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(self.deletes() != [], code == 0)
         source = (Path(sb.__file__).parent / "impact_hold.py").read_text() + (Path(sb.__file__).parent / "delegated_clear.py").read_text()
         self.assertNotIn("os.environ", source)
-        self.assertEqual(len(re.findall(r"max_level", (Path(sb.__file__)).read_text())), 0, "the daemon file never reads or writes a threshold")
+        self.assertEqual(len(re.findall(r"max_level", switchboard_source())), 0, "the daemon file never reads or writes a threshold")
 
     def test_s8b_s14_the_order_must_be_named_exist_and_be_unedited_whatever_the_threshold(self):
         self.score_config("Serious")
@@ -42210,7 +42216,7 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(found, known, "a registrar uses the shared parser beyond its own commands: a NEW finding is a decision (the rating is immune to it, but the reviewer must look)")
 
     def test_s20_s23_no_agent_command_writes_the_threshold_and_no_committed_file_sets_one(self):
-        daemon = Path(sb.__file__).read_text()
+        daemon = switchboard_source()
         self.assertEqual(daemon.count("max_level"), 0)
         root = Path(sb.__file__).parent.parent
         listed = subprocess.run(["git", "-C", str(root), "ls-files"], capture_output=True, text=True).stdout.split()
@@ -43778,7 +43784,7 @@ class TestPlanCheckCommand(Base):
             code, out, err = self.run_cmd("acme/app#7")
         self.assertEqual(code, 2)
         self.assertIn("cannot be loaded", err)
-        text = SWITCHBOARD.read_text()
+        text = switchboard_source()
         self.assertNotRegex(text, r"(?m)^plan_check = load_plan_check\(\)")
 
     def test_it_only_reads_and_never_ensures_the_daemon(self):
@@ -44712,7 +44718,7 @@ class TestDecisionWriteWaitsForTheList(Base):
         before = (path.read_text(), path.stat().st_mtime_ns)
         self.finish("escalate", ["api#7"])
         self.assertEqual((path.read_text(), path.stat().st_mtime_ns), before)
-        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        text = switchboard_source()
         body = text[text.index("def refreshed_or_honest_line"):text.index("def finish_decision_write")]
         for forbidden in ("write_text", "os.replace", "open(", "publish", "write_decisions"):
             self.assertNotIn(forbidden, body, forbidden)
@@ -52913,7 +52919,7 @@ class TestRequestTiers(TierWorld):
 
 def class_source_fn(name):
     """The source of a module-level function of bin/fleet-switchboard."""
-    source = SWITCHBOARD.read_text()
+    source = switchboard_source()
     for node in ast.parse(source).body:
         if isinstance(node, ast.FunctionDef) and node.name == name:
             return ast.get_source_segment(source, node)
@@ -54575,7 +54581,7 @@ class TestLabelsApplyFromMarkers(WriteWorld):
         self.assertEqual(self.main("labels", "apply-from-markers", "--apply", "--dry-run")[0], 2)
 
     def test_it_is_a_persons_command_never_the_daemons_nor_the_sweeps_nor_the_triages(self):
-        text = (REPO / "bin" / "fleet-switchboard").read_text()
+        text = switchboard_source()
         callers = [l.strip() for l in text.splitlines() if "apply_from_markers(" in l and "def " not in l]
         self.assertEqual(len(callers), 1)                                  # the one call is inside cmd_labels_apply
         start, end = text.index("def cmd_labels_apply"), text.index("# ---- orders --cos")
@@ -55041,7 +55047,7 @@ class TestCosOrdersFact(OrdersDeliveryCase):
 
     def test_there_is_one_delivery_path_for_both_kinds_of_orders(self):
         self.assertIn("orders_note", class_source_fn("compose"))
-        self.assertEqual(len(re.findall(r"def orders_note", SWITCHBOARD.read_text())), 1)
+        self.assertEqual(len(re.findall(r"def orders_note", switchboard_source())), 1)
 
 
 @adds_to(TestLaunch)
@@ -61420,7 +61426,7 @@ class TestExternalWiring(ExternalWorld):
         self.assertEqual(done.stdout.strip(), "False True", "registered by name, loaded by nobody")
 
     def test_the_loader_is_the_one_the_core_uses(self):
-        text = SWITCHBOARD.read_text()
+        text = switchboard_source()
         self.assertIs(sb.load_external_adapter(), sb.load_module("external_adapter"))   # #437: the loaders are generated from HELPER_MODULES, not written as a def each
         self.assertEqual(sb.HELPER_MODULES["load_external_adapter"], "external_adapter")
         self.assertNotIn("\nimport external_adapter", text)
@@ -70701,7 +70707,7 @@ class LightProbe:
 
 def light_guard_sites():
     """Every READ of `engine.light` in bin/fleet-switchboard, derived from the code: (qualified function, ordinal in it) -> (first line, last line)."""
-    tree, found, counts = ast.parse(Path(SWITCHBOARD).read_text()), {}, collections.Counter()
+    tree, found, counts = ast.parse(switchboard_source()), {}, collections.Counter()
 
     def walk(node, stack):
         for child in ast.iter_child_nodes(node):
@@ -76388,7 +76394,7 @@ class TestSlice3Modules(Base):
     GOOD = {"temp_janitor": [None, {"days": 3}], "chat_clear": [None, {"live": True}], "impact_floor": [None, {"enabled": True}]}
 
     def test_s1_every_loader_is_generated_and_returns_the_module_load_module_returns(self):
-        tree = ast.parse(SWITCHBOARD.read_text())
+        tree = ast.parse(switchboard_source())
         defined = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
         self.assertEqual(len(sb.HELPER_MODULES), 22)
         self.assertEqual(defined & set(sb.HELPER_MODULES), set(), "0 of the loaders has a def of its own")
@@ -77776,7 +77782,7 @@ class TestAuthorityModulesGuard(unittest.TestCase):
     def test_s3_the_code_names_no_module_of_the_rule_the_matrix_file_does(self):
         modules = [g for g in self.block["top_tier_paths"]["authority"] if g.startswith("bin/") and g.endswith(".py")] + list(self.block["authority_modules"]["exempt"])
         self.assertTrue(len(modules) >= 12)
-        for code in [BIN / "fleet-switchboard"] + sorted(BIN.glob("*.py")):   # the code; the tests (this file) name modules as fixtures
+        for code in [*SWITCHBOARD_SOURCE_FILES] + sorted(BIN.glob("*.py")):   # the code; the tests (this file) name modules as fixtures
             text = code.read_text()
             for module in modules:
                 self.assertNotIn('"%s"' % module, text, "%s writes the path %s in code" % (code.name, module))
@@ -78090,7 +78096,7 @@ class TestWhoCanClear(unittest.TestCase):
                     continue
         self.assertEqual(count, 1)
         self.assertTrue(callable(self.module.who_can_clear))
-        daemon, hold = ast.parse((BIN / "fleet-switchboard").read_text()), ast.parse((BIN / "impact_hold.py").read_text())
+        daemon, hold = ast.parse(switchboard_source()), ast.parse((BIN / "impact_hold.py").read_text())
         calls = lambda tree, fn: {getattr(c.func, "attr", getattr(c.func, "id", "")) for f in ast.walk(tree) if isinstance(f, ast.FunctionDef) and f.name == fn for c in ast.walk(f) if isinstance(c, ast.Call)}
         self.assertIn("clear_who", calls(daemon, "clear_line_post"))
         self.assertIn("who_can_clear", calls(hold, "clear_who"))
@@ -78372,7 +78378,7 @@ class TestClearLine(TestImpactHold):
     @staticmethod
     def mutated(edits):
         """The daemon's functions with `edits` ([(function, old, new)]) applied: {name: function}. An edit whose `old` is not in the source fails the test (a stale mutant)."""
-        source, made = (BIN / "fleet-switchboard").read_text(), {}
+        source, made = switchboard_source(), {}
         for name in sorted({e[0] for e in edits}):
             start = source.index("def %s(" % name)
             body = source[start:source.index("\ndef ", start + 5)]
@@ -78442,7 +78448,7 @@ class TestClearLine(TestImpactHold):
                 self.run_pass(args, edits)
                 self.assertEqual(self.posts() == [], want_ok, self.posts())
         # completeness: a new guard (continue, break or raise before the post) is a new row above
-        tree = ast.parse((BIN / "fleet-switchboard").read_text())
+        tree = ast.parse(switchboard_source())
         fn = lambda name: next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
         stops = [n for n in ast.walk(fn("clear_line_pass")) if isinstance(n, (ast.Continue, ast.Break))]
         self.assertEqual(len(stops), 4, "continue/break guards of the pass: gate (hold, enforce, head, rule), memo/retry, cleared, budget: one row each above")
@@ -82498,7 +82504,7 @@ class TestPreflightPr(unittest.TestCase):
         self.assertEqual(self.sentence_count(text + "\n" + self.SENTENCE), 2)
 
     def test_s6_the_class_list_is_one_table_with_each_class_once(self):
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         self.assertEqual(source.count("PREFLIGHT_CLASSES = ("), 1)
         table = source.split("PREFLIGHT_CLASSES = (", 1)[1].split("\n)\n", 1)[0]
         names = [row[0] for row in sb.PREFLIGHT_CLASSES]
@@ -82687,7 +82693,7 @@ class TestFocusedLocalRuns(unittest.TestCase):
     def test_the_marker_preflight_looks_for_is_in_the_text_the_wrapper_writes(self):
         hs = sb.load_heavy_slots()
         text = hs.second_job_notice(self.state_for_marker(), "/work/a", [{"kind": "full", "worktree": "/work/a", "name": "n", "pid": 1, "since": 1}])
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         literal = re.search(r'"(heavy: refused: [^"]+)" in \(done\.stderr', source).group(1)
         self.assertTrue(text.startswith(literal), text)
 
@@ -83613,7 +83619,7 @@ class TestItemVerdicts(unittest.TestCase):
         import subprocess as sp
         for name in ("may_record_verdict", "scenario_state", "authors_of"):
             self.assertTrue(callable(getattr(sb.plan_ledger, name)))
-        text = SWITCHBOARD.read_text()
+        text = switchboard_source()
         for name in ("ci_record_core", "launched_testers_for"):
             self.assertEqual(text.count("def %s(" % name), 1)
 
@@ -83951,7 +83957,7 @@ class TestShimTopSpender(Base):
 
     def test_s4_no_per_agent_cap_count_or_quota_exists_in_the_shim_its_configuration_or_the_daemons_budget_code(self):
         sources = {"shims/gh": SHIM.read_text(), "bin/agent_calls.py": (BIN / "agent_calls.py").read_text()}
-        config = ast.parse((BIN / "fleet-switchboard").read_text())
+        config = ast.parse(switchboard_source())
         defaults = next(n for n in config.body if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "DEFAULTS" for t in n.targets))
         sources["DEFAULTS"] = ast.unparse(defaults.value)
         for name, text in sorted(sources.items()):
@@ -85099,7 +85105,7 @@ class TestGhShimMergeGate(Base):
         self.shim_path = None
 
     def test_every_xdg_and_fleet_switchboard_name_the_switchboard_reads_is_dropped_from_its_environment_unless_listed(self):
-        names = sorted(set(re.findall(r'"((?:XDG_|FLEET_SWITCHBOARD_)[A-Z_]+)"', (BIN / "fleet-switchboard").read_text())))
+        names = sorted(set(re.findall(r'"((?:XDG_|FLEET_SWITCHBOARD_)[A-Z_]+)"', switchboard_source())))
         self.assertGreater(len(names), 5)
         shim = self.shim_module()
         with mock.patch.dict(os.environ, {n: "x" for n in names}):
@@ -85812,7 +85818,7 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
     def registry_callers(self):
         """Every function (or method) of bin/fleet-switchboard that calls the registry seam, found by the AST."""
         seam = {"registry_read", "registry_retired", "registry_retired_strict", "read_retired", "read_retired_strict", "registry_agents_strict"}
-        tree = ast.parse((BIN / "fleet-switchboard").read_text())
+        tree = ast.parse(switchboard_source())
         found = set()
         for node in tree.body:
             owners = [(node.name, node)] if isinstance(node, ast.FunctionDef) else \
@@ -86403,7 +86409,7 @@ class TestBlockedReport(Base):
         discovery = self.world.engine.discover(self.world.clock.now())
         self.assert_waits_for_the_lock(lambda: sb.blocked_tick(self.world.engine, discovery, {}))
         self.assert_waits_for_the_lock(lambda: sb.blocked_update(self.world.state, sb.BLOCKED_ALERT_STATE, lambda s: None))
-        text = (BIN / "fleet-switchboard").read_text()
+        text = switchboard_source()
         body = text.split("def blocked_update(", 1)[1].split("\ndef ", 1)[0]
         outside = text.replace(body, "")
         for name in ("BLOCKED_HELD_SENDS", "BLOCKED_ALERT_STATE"):
@@ -86891,7 +86897,7 @@ class TestBlockedMutants(Base):
         return bool(result.failures or result.errors)
 
     def test_the_table_covers_every_guard_of_the_code_and_names_only_real_tests(self):
-        text = SWITCHBOARD.read_text()
+        text = switchboard_source()
         self.assertEqual(sorted(blocked_guards(text)), sorted(BLOCKED_GUARD_KILLERS), "a guard without a row (or a row without a guard): add its row and its mutant")
         for test in list(BLOCKED_GUARD_KILLERS.values()) + [row[3] for row in BLOCKED_TEXT_MUTANTS.values()]:
             self.assertTrue(hasattr(TestBlockedReport, test), test)
@@ -86902,7 +86908,7 @@ class TestBlockedMutants(Base):
             self.assertEqual(text.count(row[1]) if row[0] is None else 1, 1, row[1])
 
     def test_no_function_of_the_report_lies_outside_the_derived_region(self):
-        text = SWITCHBOARD.read_text()
+        text = switchboard_source()
         names = blocked_functions(text)
         self.assertTrue({"blocked_tick", "blocked_update", "note_held_send", "blocked_lock", "blocked_sender"} <= names, names)
         outside = {n.name for n in ast.parse(text).body if isinstance(n, ast.FunctionDef) and ("blocked" in n.name or n.name == "note_held_send")} - names
@@ -86918,7 +86924,7 @@ class TestBlockedMutants(Base):
         self.assertEqual(survivors, [], "these negated guards pass their named test")
 
     def test_every_bound_lock_validator_and_key_mutant_is_killed_by_its_named_test(self):
-        text, survivors = SWITCHBOARD.read_text(), []
+        text, survivors = switchboard_source(), []
         for ident, (anchor, old, new, test) in sorted(BLOCKED_TEXT_MUTANTS.items()):
             at = text.index(anchor) if anchor else 0
             where = text.index(old, at)
@@ -87498,7 +87504,7 @@ class TestPaneExitBoundaries(TestPaneExit):
     @staticmethod
     def new_code():
         import ast
-        tree = ast.parse(SWITCHBOARD.read_text())
+        tree = ast.parse(switchboard_source())
         wanted = {"pane_exit_events", "pane_exit_read_log", "_pane_matches", "pane_exit_audit_tail", "_pane_exit_asked", "pane_exit_runs", "pane_exit_active",
                   "pane_exit_pass", "PaneExitFacts"}
         return [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in wanted]

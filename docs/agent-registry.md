@@ -24,12 +24,16 @@ rebuilt from another record.
 | `bin/fleet-switchboard:4331` | `boss-overrides.json` | per worker: the boss a reassign set, bound to one session | `reassign` (bin/reassign.py, under a lock) | discovery overlay (`Engine.discover`, headless records), `reattach_caller_problem` | primary (clear machinery) |
 | `bin/reassign.py:4` | `boss-overrides.json` | the same file: reads and writes the overrides | `run_reassign` | `overlay` | primary (clear machinery) |
 | `bin/fleet-switchboard:3382` | `boss-resolution` | no file: `resolve_boss` and `boss_name` map `reports_to` (or the role alias) to a registered agent from the discovery | nobody | sends, reports, decisions, reattach, pane pass, `steers_into_turn` | derived from discovery (clear machinery) |
+| `bin/switchboard/decisions_a.py:209` | `boss-resolution` | the decisions list resolves each worker's boss through `resolve_boss` | nobody | the Decisions list (`decisions_from_reports`) | derived (reader) |
+| `bin/switchboard/decisions_b.py:459` | `boss-resolution` | the external-decision host resolves a decision's boss through `boss_name` | nobody | external decision sync | derived (reader) |
 | `bin/impact_hold.py:426` | `boss-resolution` | the impact hold resolves a boss through `boss_name`/`resolve_boss` | nobody | impact hold routing | derived |
 | `bin/lanes.py:197` | `boss-resolution` | the lane rule resolves a boss | nobody | lane resolution | derived |
 | `bin/reassign.py:237` | `boss-resolution` | `reassign` resolves the current boss for consent | nobody | `reassign` | derived |
 | `bin/fleet-switchboard:2385` | `discovery.agents` | the agents of the newest `discover()`: name, session, pane, role, charter, repo, workspace, cwd, reports_to | `Engine.discover` (each pass and on demand) | the whole daemon: fact routing, status, pane pass, decisions, chiefs lookup, badges, toasts | primary (the live list), derived from herdr and the v2 service |
 | `bin/cloud_worker.py:976` | `discovery.agents` | looks up a local agent by name before routing | nobody | `route` | derived (reader) |
 | `bin/switchboard/judge.py:53` | `discovery.agents` | the judge's own sessions: the session ids of the discovered agents | nobody | the policy judge's socket | derived (reader) |
+| `bin/switchboard/decisions_a.py:209` | `discovery.agents` | the decisions list reads the discovered agents to find each worker's boss | nobody | the Decisions list | derived (reader) |
+| `bin/switchboard/decisions_b.py:457` | `discovery.agents` | the external-decision host reads the newest discovery | nobody | external decision sync | derived (reader) |
 | `bin/impact_hold.py:401` | `discovery.agents` | looks up the orchestrator of a block | nobody | impact hold | derived (reader) |
 | `bin/lanes.py:55` | `discovery.agents` | looks up lanes by agent | nobody | lane resolution | derived (reader) |
 | `bin/queue_ejections.py:365` | `discovery.agents` | routes an ejection to an owner | nobody | `route_of` | derived (reader) |
@@ -44,6 +48,8 @@ rebuilt from another record.
 | `bin/fleet-switchboard:4239` | `decisions.json` | open decisions, notices, held PRs, each naming agents (boss and worker) | the daemon (`DecisionStore`, atomic, when the list changed) | `decisions` command, sidebar, `fleet_health`, `status` | derived |
 | `bin/decision_core.py:1032` | `decisions.json` | comment only: names the file as the local store | nobody | nobody | derived |
 | `bin/switchboard/judge_request.py:433` | `decisions.json` | reads the open decisions to give the judge the ask's context | nobody (reader only) | the policy judge's request | derived (reader) |
+| `bin/switchboard/decisions_a.py:274` | `decisions.json` | comment only: the decisions list never rewrites the projection by itself | nobody | nobody | derived |
+| `bin/switchboard/decisions_b.py:281` | `decisions.json` | comment only: names the projection among what the store keeps | nobody | nobody | derived |
 | `bin/fleet_health.py:298` | `decisions.json` | reads the held PR and waiting decisions per orchestrator | nobody (reader only) | load figures | derived (reader) |
 | `plugins/fleet-decisions-tui/decisions.mjs:9` | `decisions.json` | reads the list for the sidebar | nobody (reader only) | Decisions section | derived (reader) |
 | `bin/decisions_pull.py:28` | `decisions.json` | reads the cloud daemon's list from a configured source command and rewrites the local file (cleaned, atomic, mode 0600); ages its mtime when the source is down | the Mac-side pull (`write_atomic`, `mark_stale`) | the Decisions plugin (`decisions.mjs`) | derived |
