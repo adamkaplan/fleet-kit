@@ -8,8 +8,15 @@ resolved, and answers `POST /relay/result/<id>`. Every refusal writes nothing to
 The world (GitHub, the plan, the registry, the audit) is a Backend, so the rules are testable with a fake; `SwitchboardBackend` is the real one.
 One ledger entry per prove or verdict, written by `plan_ledger.append_checked` under its flock; the head is re-read from GitHub INSIDE
 that decision. Replay memory: `relay_calls.json` (pod + call id -> seq, hash), backed by the call id stored in the entry itself.
+
+Report delivery is AT-LEAST-ONCE: the report is delivered, then the index record is written; a crash between the two delivers it again on
+replay. A report replay with a different pr or different args under the same call id is 409.
+
+The PR-to-issue link comes from the PR body's closing keywords (and the plan's issue). It is NOT a security boundary: anyone who can edit
+the PR body can set it. The boundaries are the prove holder check (`relay_holders`) and the verdict evaluator registry (`plan_evaluators`).
 """
 import contextlib
+import hashlib
 import fcntl
 import json
 import os
@@ -24,6 +31,11 @@ import cloud_relay  # noqa: E402  (the one definition of the wire shapes, shared
 INDEX_FILE = "relay_calls.json"
 INDEX_MAX = 5000   # entries kept; the oldest are pruned (the ledger's own call ids still answer a pruned replay)
 COMMANDS = cloud_relay.COMMANDS
+NEEDS_HEAD = cloud_relay.NEEDS_HEAD
+NEEDS_LINK = cloud_relay.NEEDS_LINK
+PENDING_CAP = 4 * 1024 * 1024   # bytes of the hub's pending list; larger is refused
+TOKEN_CAP = 4096                # bytes of the token file
+REASON_FIXED = "relay failed"
 PR_RE, CALL_ID_RE, SHA_RE = cloud_relay.PR, cloud_relay.CALL_ID, cloud_relay.HEAD
 
 
@@ -83,6 +95,13 @@ class Index:
                     os.unlink(str(tmp))
 
 
+def clean_text(value, limit=2000):
+    """Control characters (all of Cc, newlines and tabs included) become spaces; whitespace is collapsed; clipped. engine.report then
+    enforces its own one-line limit."""
+    text = "".join(" " if (ord(c) < 32 or 0x7f <= ord(c) < 0xa0) else c for c in str(value or ""))
+    return " ".join(text.split())[:limit]
+
+
 def _from_entries(entries, pod, call_id):
     for e in entries:
         if e.get("by") == pod and e.get("call_id") == call_id:
@@ -127,9 +146,9 @@ class Executor:
             if m.group(1) != req.get("repo"):
                 raise Refuse(403, "pr is not in the pod's bound repo")
             args = call.get("args") if isinstance(call.get("args"), dict) else {}
-            if command in ("prove", "verdict") and not SHA_RE.fullmatch(str(call.get("head") or "")):
+            if command in NEEDS_HEAD and not SHA_RE.fullmatch(str(call.get("head") or "")):
                 raise Refuse(400, "%s needs the head sha it judged" % command)
-            if command in ("gates", "prove", "verdict"):   # the PR must be the one linked to the issue this pod is bound to
+            if command in NEEDS_LINK:   # the PR must be the one linked to the issue this pod is bound to
                 linked = {str(i) for i in (self.backend.pr_issues(pr) or ())}
                 if str(req.get("issue")) not in linked:
                     raise Refuse(403, "pr not linked to the pod's issue")
@@ -139,12 +158,14 @@ class Executor:
                 return 200, json.dumps(out, sort_keys=True), None
             if command == "report":   # delivered once per call id; kept under its own key ("report\n...", no seq or hash), so it never answers a prove or verdict
                 seen = self.index.get("report\n" + pod, cid)
+                digest = hashlib.sha256(json.dumps(args, sort_keys=True, default=str).encode()).hexdigest()
                 if seen:
-                    if seen.get("pr") != pr:
+                    if seen.get("pr") != pr or seen.get("args") != digest:
                         raise Refuse(409, "call_id reused for a different call")
                     return 200, "replay: already reported", None
-                self.backend.report(pod, args)
-                self.index.put("report\n" + pod, cid, {"command": "report", "pr": pr})
+                # only the state and the text come from the pod; the issue is the hub's, and `everything` is dropped
+                self.backend.report(pod, {"state": args.get("state"), "text": clean_text(args.get("text")), "issue": req.get("issue")})
+                self.index.put("report\n" + pod, cid, {"command": "report", "pr": pr, "args": digest})
                 return 200, "reported", None
             known = self.index.get(pod, cid)
             if known:
@@ -233,8 +254,10 @@ def pass_once(executor, fetch, post):
             continue
         try:
             status, reason, record = executor.handle(req)
-        except Exception as err:   # one bad request must not abort the batch or block later passes: answer it 500 with the reason
-            status, reason, record = 500, "relay failed: %s" % " ".join(str(err).split())[:160], None
+        except Exception as err:   # one bad request must not abort the batch or block later passes: answer it 500 with a fixed reason
+            status, reason, record = 500, REASON_FIXED, None   # the detail stays daemon-side, never sent to the pod
+            with contextlib.suppress(Exception):
+                executor.backend.audit("relay.failed", None, {"id": rid, "error": clean_text(err, 160)})
         try:
             post(rid, {"status": status, "reason": reason, "record": record})
         except Exception:   # the hub could not take this answer: leave it to expire there, go on with the rest
@@ -245,15 +268,31 @@ def pass_once(executor, fetch, post):
 
 def http_transport(base, token):
     """(fetch, post) over HTTPS with the daemon credential the decisions pull already uses (`token` is read by the caller, never printed)."""
+    import urllib.error
+    import urllib.parse
     import urllib.request
+    import cloud_cli
     base = base.rstrip("/")
+    parts = urllib.parse.urlsplit(base)
+    if parts.scheme not in ("http", "https") or not parts.netloc or "@" in parts.netloc:
+        raise ValueError("hub url must be http(s) without user information")
+    if parts.scheme == "http" and not cloud_cli._http_allowed(parts, {}):
+        raise ValueError("plain http to a host that is not loopback or cluster-local is refused")
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):   # the bearer is never forwarded
+            return None
+    opener = urllib.request.build_opener(NoRedirect)
 
     def call(path, body=None):
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(base + path, data=data, method="POST" if body is not None else "GET",
                                      headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            return json.loads(resp.read() or b"{}")
+        with opener.open(req, timeout=20) as resp:
+            raw = resp.read(PENDING_CAP + 1)
+            if len(raw) > PENDING_CAP:
+                raise ValueError("hub answer over %d bytes" % PENDING_CAP)
+            return json.loads(raw or b"{}")
     return (lambda: call("/relay/pending")), (lambda rid, body: call("/relay/result/" + rid, body))
 
 
@@ -310,7 +349,7 @@ class SwitchboardBackend:
         return plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") else None, ctx.pr, now=self.now())
 
     def report(self, pod, args):
-        self.parts[0].report(pod, args.get("state"), args.get("text") or "", args.get("issue"), bool(args.get("everything")))
+        self.parts[0].report(pod, args.get("state"), args.get("text") or "", args.get("issue"), False)
 
     def audit(self, kind, pr, detail):
         engine = self.parts[0]
@@ -324,7 +363,11 @@ def pass_if_configured(engine, host, runner, now, environ=os.environ):
     if not url or not tokfile:
         return 0
     try:
-        token = Path(tokfile).read_text().strip()
+        with open(tokfile, "rb") as handle:
+            raw = handle.read(TOKEN_CAP + 1)
+        if len(raw) > TOKEN_CAP:
+            raise ValueError("token file over %d bytes" % TOKEN_CAP)
+        token = raw.decode().strip()
         fetch, post = http_transport(url, token)
         backend = SwitchboardBackend(host, (engine, engine.state_dir, engine.config), runner, now)
         return pass_once(Executor(engine.state_dir, backend, now), fetch, post)

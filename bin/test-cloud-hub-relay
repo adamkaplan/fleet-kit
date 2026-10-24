@@ -185,6 +185,21 @@ class TestRoundTrip(unittest.TestCase):
             hub.daemon_answer(200, "", {"seq": 2, "hash": "h2"})
             self.assertEqual(hub.relay_call()[1]["record"], {"seq": 2, "hash": "h2"})
 
+    def test_same_call_id_for_a_different_call_is_409(self):
+        with Hub(wait=0.1) as hub:
+            self.assertEqual(hub.relay_call()[0], 504)
+            for over in (dict(command="verdict"), dict(pr="acme-org/widget-service#13"), dict(head="b" * 40)):
+                status, body = hub.relay_call(**over)
+                self.assertEqual((status, body["error"]), (409, "call_id reused for a different call"))
+            self.assertEqual(len(hub.call("GET", "/relay/pending", who="daemon")[1]["requests"]), 1)
+
+    def test_a_refused_answer_is_not_replayable(self):
+        with Hub(wait=0.1) as hub:
+            self.assertEqual(hub.relay_call()[0], 504)
+            hub.daemon_answer(403, "pr not linked")
+            self.assertEqual(hub.relay_call()[0], 504)   # queued afresh, not answered from the cache
+            self.assertEqual(len(hub.call("GET", "/relay/pending", who="daemon")[1]["requests"]), 1)
+
     def test_call_ids_are_scoped_per_pod(self):
         with Hub(wait=0.1) as hub:
             hub.relay_call()

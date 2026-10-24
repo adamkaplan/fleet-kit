@@ -9,7 +9,8 @@ Refusals (answered before anything is queued, one audit line each, never the sec
 map, 400 unlisted command / missing or malformed call id / bad fields, 413 oversized, 403 PR outside the pod's bound repo.
 Stale head and the independence rules are the daemon's: it answers them through /relay/result.
 The queue is in memory and bounded; the hub keeps no ledger and no GitHub token. The daemon is the source of truth for call ids
-(pod + call_id -> record); a replay here joins the entry already queued or answered, else queues again and the daemon dedupes.
+(pod + call_id -> record); a replay here joins the entry already queued or answered (200 only: a refused or failed answer is forgotten, so the same call_id is
+evaluated afresh; a replay whose command, pr or head differs is 409), else queues again and the daemon dedupes.
 A call not answered within WAIT seconds gets 504 and its entry stays queued, so the same call id is replay-safe.
 """
 import collections
@@ -23,6 +24,7 @@ import cloud_channel
 # The one definition of the wire shapes; the daemon (cloud_relay_daemon) imports these.
 COMMANDS = ("report", "prove", "verdict", "gates")
 NEEDS_HEAD = ("prove", "verdict")
+NEEDS_LINK = ("gates", "prove", "verdict", "report")   # the PR must be linked to the pod's issue
 CALL_ID = re.compile(r"[\x21-\x7e]{1,64}")
 PR = re.compile(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]{1,9})")
 HEAD = re.compile(r"[0-9a-f]{40}")   # the full live sha, never a prefix
@@ -43,6 +45,11 @@ class Refusal(Exception):
         self.status, self.reason = status, reason
 
 
+def fingerprint(call):
+    """What makes two calls with one call_id the same call: command, pr and head."""
+    return (call.get("command"), call.get("pr"), call.get("head"))
+
+
 class Entry:
     def __init__(self, pod, repo, issue, call):
         self.id = uuid.uuid4().hex
@@ -50,6 +57,7 @@ class Entry:
         self.done = threading.Event()
         self.answer = None
         self.born = None
+        self.fingerprint = fingerprint(call)
 
 
 class Relay:
@@ -114,6 +122,8 @@ class Relay:
         with self.lock:
             self._expire()
             entry = self.by_call.get(key)
+            if entry is not None and entry.fingerprint != fingerprint(call):
+                return 409, {"status": 409, "error": "call_id reused for a different call"}
             if entry is None:
                 if sum(1 for e in self.pending.values() if e.pod == pod) >= self.max_per_pod:
                     raise Refusal(503, "per-pod cap reached: %d unanswered calls from this pod" % self.max_per_pod)
@@ -164,7 +174,11 @@ class Relay:
                 raise Refusal(404, "no such pending request")
             entry.answer = (status, payload)
             key = (entry.pod, entry.call["call_id"])
-            self.finished[key] = entry
+            if status != 200:   # a refusal is not replayable from here: the same id is evaluated afresh once the cause is fixed
+                if self.by_call.get(key) is entry:
+                    del self.by_call[key]
+            else:
+                self.finished[key] = entry
             while len(self.finished) > MAX_DONE:
                 old, _ = self.finished.popitem(last=False)
                 self.by_call.pop(old, None)

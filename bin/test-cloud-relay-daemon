@@ -225,7 +225,7 @@ class Case(unittest.TestCase):
         for kw in (dict(command="verdict", pod=CODER), dict(command="prove", head="d" * 40, pod=CODER)):
             before = self.raw()
             pod, cmd = kw.pop("pod"), kw.pop("command")
-            got = self.run_one(pod, cmd, cid="c1" if False else self.last_cid(), **dict(PROVE, **kw))
+            got = self.run_one(pod, cmd, cid=self.last_cid(), **dict(PROVE, **kw))
             self.assertEqual(got["status"], 409, got)
             self.assertIn("call_id reused for a different call", got["reason"])
             self.assertEqual(self.raw(), before)
@@ -283,7 +283,9 @@ class Case(unittest.TestCase):
         self.backend.gates = boom
         self.assertEqual(relay.pass_once(self.ex, self.hub.fetch, self.hub.post), 2)
         self.assertEqual(self.hub.results[a]["status"], 500)
-        self.assertIn("github down", self.hub.results[a]["reason"])
+        self.assertEqual(self.hub.results[a]["reason"], "relay failed")
+        self.assertNotIn("github down", json.dumps(self.hub.results))
+        self.assertTrue(any(k == "relay.failed" and "github down" in d["error"] for k, d in self.backend.audits))
         self.assertEqual(self.hub.results[b]["status"], 200)
         self.backend.gates = orig
 
@@ -336,6 +338,96 @@ class Case(unittest.TestCase):
         plan = self.backend.plan
         self.backend.plan = lambda pr: dict(plan(pr), scenarios={"S1": {"evaluator": "tester", "claim": "epic"}})
         self.refused(400, "claimed at the epic", CODER, "prove", **PROVE)
+
+
+    def test_report_ignores_pod_issue_and_everything(self):
+        rid = self.hub.submit(CODER, "report", head=None, state="withdrawn", text="x", cid="R1")
+        self.hub.queue[0]["call"]["args"].update(issue="other/repo#99", everything=True)
+        relay.pass_once(self.ex, self.hub.fetch, self.hub.post)
+        self.assertEqual(self.hub.results[rid]["status"], 200)
+        (pod, args), = self.backend.reported
+        self.assertEqual(args, {"state": "withdrawn", "text": "x", "issue": 1})
+
+    def test_report_for_unlinked_pr_refused_and_writes_nothing(self):
+        self.refused(403, "pr not linked", CODER, "report", issue=2, head=None, state="done", text="x")
+        self.assertEqual(self.backend.reported, [])
+
+    def test_report_text_control_characters_stripped(self):
+        self.run_one(CODER, "report", head=None, state="done", text="a\x1b[31mb\x00\nc\u0085d", cid="R2")
+        self.assertEqual(self.backend.reported[0][1]["text"], "a [31mb c d")
+
+    def test_report_replay_with_other_text_is_409(self):
+        self.run_one(CODER, "report", head=None, state="done", text="x", cid="R3")
+        got = self.run_one(CODER, "report", head=None, state="done", text="y", cid="R3")
+        self.assertEqual(got["status"], 409)
+        self.assertEqual(len(self.backend.reported), 1)
+
+    def test_needs_head_is_the_hubs(self):
+        self.assertIs(relay.NEEDS_HEAD, relay.cloud_relay.NEEDS_HEAD)
+
+    def test_token_file_over_cap_refused(self):
+        notes = []
+
+        class Engine:
+            state_dir, config = "/nonexistent", {}
+
+            def _note(self, *a):
+                notes.append(a)
+        tok = Path(self.state) / "tok"
+        tok.write_text("x" * (relay.TOKEN_CAP + 1))
+        env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": str(tok)}
+        self.assertEqual(relay.pass_if_configured(Engine(), None, None, lambda: 1, environ=env), 0)
+        self.assertIn("token file over", notes[0][2]["error"])
+
+    def serve(self, handler_body):
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                handler_body(self)
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return "http://127.0.0.1:%d" % srv.server_port
+
+    def test_pending_answer_over_cap_refused(self):
+        old = relay.PENDING_CAP
+        relay.PENDING_CAP = 100
+        self.addCleanup(setattr, relay, "PENDING_CAP", old)
+
+        def body(h):
+            data = b'{"requests": [], "pad": "' + b"x" * 200 + b'"}'
+            h.send_response(200)
+            h.send_header("Content-Length", str(len(data)))
+            h.end_headers()
+            h.wfile.write(data)
+        fetch, _ = relay.http_transport(self.serve(body), "tok")
+        with self.assertRaises(ValueError):
+            fetch()
+
+    def test_redirect_is_not_followed(self):
+        seen = []
+        target = self.serve(lambda h: (seen.append(h.headers.get("Authorization")), h.send_response(200), h.end_headers()))
+
+        def body(h):
+            h.send_response(302)
+            h.send_header("Location", target + "/x")
+            h.end_headers()
+        fetch, _ = relay.http_transport(self.serve(body), "tok")
+        with self.assertRaises(Exception):
+            fetch()
+        self.assertEqual(seen, [])
+
+    def test_plain_http_to_public_host_refused(self):
+        with self.assertRaises(ValueError):
+            relay.http_transport("http://hub.example.com", "tok")
+        relay.http_transport("https://hub.example.com", "tok")
+        relay.http_transport("http://hub.fleet.svc", "tok")
 
 
 if __name__ == "__main__":

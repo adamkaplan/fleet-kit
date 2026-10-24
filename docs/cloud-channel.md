@@ -20,6 +20,9 @@ One document to set up, run and take down the cloud hub and the pod-side command
   - `cloud_cli.py send RECIPIENT TEXT...`
   - `cloud_cli.py report KIND TEXT...`, where KIND is one of `done failed blocked question working paused withdrawn`.
     A report goes to the agent named by `FLEET_BOSS`, as the text `report: KIND: TEXT`.
+  - The relay's PR-to-issue link comes from the PR body's closing keywords (and the plan's issue). It is not a security boundary: the
+    prove holder check and the verdict evaluator registry are. A refused relay call is forgotten by the hub, so the same call_id may be
+    sent again once the cause is fixed; a call_id reused with a different command, pr or head is 409.
   - `send` text is at most 2000 characters; `report` text at most 300.
 
 The sender is always the agent the token proves, never a name in the body: a body naming another sender is refused 403.
