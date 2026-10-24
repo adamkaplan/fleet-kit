@@ -860,7 +860,7 @@ class MintGuards(Refresh):
         self.assertFalse(re.search(r"(environ|env)\.get\([^)]*[Ss][Tt][Rr][Ii][Cc][Tt]|environ\[[^]]*[Ss][Tt][Rr][Ii][Cc][Tt]", SOURCE))   # no setting is read for it
         with self.assertRaises(TypeError):
             inspect.signature(cw.cluster_token).bind(self.env, "30m", bogus=1)
-        for name in ("CW_STRICT", "FLEET_STRICT", "STRICT", "CW_CLUSTER_STRICT", "CW_MINT_STRICT"):
+        for name in ("CW_STRICT", "CW_UNATTENDED_STRICT", "STRICT", "CW_CLUSTER_STRICT", "CW_MINT_STRICT"):
             for value in ("1", "0", "true", "false"):
                 env = dict(self.planted(), CW_CLOUD_NAMESPACE="CW", PATH=self.bin + os.pathsep + os.environ.get("PATH", ""), **{name: value})
                 self.reset()
