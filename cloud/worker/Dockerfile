@@ -26,6 +26,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends make \
  && rm -rf /var/lib/apt/lists/*
 # ---- end #1165 ----
 
+# ---- #1165 identity: ONE system-level git file, written at image build (nothing at run time, nothing in the home directory) ----
+# The pair below is the ONE constant. A repository's own configured identity, and a local `git config user.name/user.email`,
+# still win over it (git's own order: system, then global, then local). The entrypoint exports no identity variable.
+ARG CW_DEFAULT_IDENT_NAME=cloud-worker
+ARG CW_DEFAULT_IDENT_EMAIL=cloud-worker@users.noreply.github.com
+RUN printf '[user]\n\tname = %s\n\temail = %s\n' "${CW_DEFAULT_IDENT_NAME}" "${CW_DEFAULT_IDENT_EMAIL}" > /etc/gitconfig \
+ && chmod 0644 /etc/gitconfig
+# ---- end #1165 identity ----
+
 # OpenCode v2: a pinned standalone binary (no node or npm), checked against its sha256 before it is unpacked.
 RUN curl -fsSL "https://opencode.ai/files/bin/${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" -o /tmp/oc.tgz \
  && echo "${OPENCODE_SHA256}  /tmp/oc.tgz" | sha256sum -c - \

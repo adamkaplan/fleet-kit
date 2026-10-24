@@ -11,10 +11,6 @@
 # A file that is absent is skipped (a pod started without per-run secrets). A file that is present but unreadable or empty
 # REFUSES the start: there is no fallback to another source. Nothing here prints a value.
 set -eu
-# #1165: the default git identity, in ONE place (a neutral role name and a no-reply address). Exported below as the four
-# variables git reads for author and committer; no git configuration is written for it.
-CW_DEFAULT_IDENT_NAME="cloud-worker"
-CW_DEFAULT_IDENT_EMAIL="cloud-worker@users.noreply.github.com"
 RUN="${CW_RUN_DIR:-/run/cw}"
 TMP="${CW_TMP_DIR:-/run/cw-tmp}"   # tmpfs (an in-memory emptyDir), writable by the worker user
 
@@ -30,12 +26,6 @@ usable() {
 if [ "${WORKER_DOCKER:-1}" = "1" ]; then
   sudo /usr/local/bin/start-dockerd || echo "worker: nested Docker unavailable (see /var/log/dockerd.log)" >&2
 fi
-
-# #1165: default identity through the environment, only for a variable not already set (the caller's own value stands)
-GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-$CW_DEFAULT_IDENT_NAME}"; export GIT_AUTHOR_NAME
-GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-$CW_DEFAULT_IDENT_EMAIL}"; export GIT_AUTHOR_EMAIL
-GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-$CW_DEFAULT_IDENT_NAME}"; export GIT_COMMITTER_NAME
-GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-$CW_DEFAULT_IDENT_EMAIL}"; export GIT_COMMITTER_EMAIL
 
 # #1050: no git call in the pod may open a credential dialog or prompt (the helper answers only for github.com)
 GIT_TERMINAL_PROMPT=0; export GIT_TERMINAL_PROMPT
