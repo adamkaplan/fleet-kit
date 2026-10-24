@@ -125,55 +125,43 @@ Kinds (the number is exact: see rule 7): `namespace` (a part uses names the entr
 
 ## Dynamic imports not followed
 
-The derivation follows `import`, `from . import x`, `from .x import y`, and a direct call with a constant module name: `__import__("x")`, `importlib.import_module("x")` or `load_module("x")`, spelled as such, and the `load_x()` helpers. Nothing else is followed. It reads what is spelled, never an assignment: every other use of an import primitive (`__import__`, `import_module`, `load_module`, `find_spec`, `spec_from_file_location`, `module_from_spec`, `exec_module`, `SourceFileLoader`, `run_path`, `run_module`, `importlib.reload`, and the builtins `exec`, `eval`, `compile` as a bare name or `builtins.<name>`) is a site, and so is each of these: a primitive used as a value (a default, a class attribute, a dict value, a conditional, a tuple, a walrus, an argument of `map` or `functools.partial`, `globals()["__import__"]`, `getattr(importlib, "import_module")`), a call with a non-constant, relative (leading dot) or package argument, an aliased `from m import primitive as other`, and a relative import of level two or more.
+This is a closed, conservative rule. It over-counts by design and fails closed: a use the test did not foresee is a site, not silence.
 
-A site is listed here by the function it sits in and the kind of use, with a count; the kind is the primitive, with `(non-constant)`, `(relative)`, `(reference)` or `(alias)` where it is not a plain call. A new site, a swapped site, a wrong count or a stale row fails the test. A `getattr` on the import machinery with a name decided at run time cannot be listed: it fails the test, because what it loads cannot be said.
+**What is a site.** Any `import` or `from ... import` of a module that can load code by name: `importlib` (and `importlib.util`, `importlib.machinery`), `pkgutil`, `runpy`, `pydoc`, `imp`, `zipimport`, `builtins`; any use of a name bound to one of them (the module object itself, however it is reached: a call, an attribute, `getattr`, a subscript, `vars(...)`, `__dict__`, `operator.attrgetter`, an argument, an alias, `m = importlib`); any use of `sys.modules`; `builtins` and `__builtins__`; the builtins `__import__`, `exec`, `eval` and `compile`, and the daemon's own `load_module`, as a call with a non-constant, relative (leading dot) or package argument, as a reference (a default, a class attribute, a dict value, a conditional, a tuple, a walrus, an argument of `map` or `functools.partial`), or named by a string key (`globals()["__import__"]`, `getattr(x, "exec")`); and a relative import of level two or more.
 
-What the test cannot follow, and says so by listing it: a name built at run time, code loaded by path or from text, and anything reached through another object (`self.loader.exec_module`). Over-counting is possible and safe: a bare reference counts even when the name is never called, and a method that happens to be called `exec_module` counts. Under-counting is the risk the table exists to keep small.
+**What is followed.** Only a direct call with a constant module name, spelled as such: `__import__("x")`, `importlib.import_module("x")`, `from importlib import import_module` then `import_module("x")`, and `load_module("x")`; and the `load_x()` helpers. Everything else is a site, and the import statement of the module still counts as one.
+
+**What is outside the rule**, said plainly: a way to load code that involves none of these modules or builtins, for example a module object handed in by a caller (`def f(m, n): return getattr(m, n)`), a name looked up in `globals()` with a variable key, or `exec_module` on a spec that came from somewhere else. It is not listed and not chased.
+
+A site is listed by the function it sits in and its kind, with a count: `import(module)` for an import statement, the module name for a use of the module object, `sys.modules`, or the builtin with `(non-constant)`, `(relative)`, `(reference)` or `(string)`. A new site, a swapped site, a wrong count or a stale row fails the test.
 
 | Unit | Site | Count | What |
 |---|---|---|---|
-| `agent_reconcile.py` | `_load_registry:exec_module` | 1 | runs the module of a spec |
-| `agent_reconcile.py` | `_load_registry:module_from_spec` | 1 | builds the module of a spec |
-| `agent_reconcile.py` | `_load_registry:spec_from_file_location` | 1 | loads a module by path |
-| `cloud_worker.py` | `_lib:exec_module` | 1 | runs the module of a spec |
-| `cloud_worker.py` | `_lib:module_from_spec` | 1 | builds the module of a spec |
-| `cloud_worker.py` | `_lib:spec_from_file_location` | 1 | loads a module by path |
-| `cloud_worker.py` | `_registry_note:load_module(non-constant)` | 1 | loads the module its argument names |
-| `cloud_worker.py` | `_walk:exec_module` | 1 | runs the module of a spec |
-| `cloud_worker.py` | `_walk:module_from_spec` | 1 | builds the module of a spec |
-| `cloud_worker.py` | `_walk:spec_from_file_location` | 1 | loads a module by path |
-| `cloud_worker.py` | `model_entry:exec_module` | 1 | runs the module of a spec |
-| `cloud_worker.py` | `model_entry:module_from_spec` | 1 | builds the module of a spec |
-| `cloud_worker.py` | `model_entry:spec_from_file_location` | 1 | loads a module by path |
-| `cpu_guard.py` | `slots_text:exec_module` | 1 | runs the module of a spec |
-| `cpu_guard.py` | `slots_text:module_from_spec` | 1 | builds the module of a spec |
-| `cpu_guard.py` | `slots_text:spec_from_file_location` | 1 | loads a module by path |
-| `external_adapter.py` | `_load_core:exec_module` | 1 | runs the module of a spec |
-| `external_adapter.py` | `_load_core:module_from_spec` | 1 | builds the module of a spec |
-| `external_adapter.py` | `_load_core:spec_from_file_location` | 1 | loads a module by path |
-| `fleet-switchboard` | `Installer.reaper_command_problem:exec_module` | 1 | runs the module of a spec |
-| `fleet-switchboard` | `Installer.reaper_command_problem:module_from_spec` | 1 | builds the module of a spec |
-| `fleet-switchboard` | `Installer.reaper_command_problem:spec_from_file_location` | 1 | loads a module by path |
-| `fleet-switchboard` | `_declared_module:exec_module` | 1 | runs the module of a spec |
-| `fleet-switchboard` | `_declared_module:load_module(non-constant)` | 1 | loads the module its argument names |
-| `fleet-switchboard` | `_declared_module:module_from_spec` | 1 | builds the module of a spec |
-| `fleet-switchboard` | `_declared_module:spec_from_file_location` | 1 | loads a module by path |
+| `agent_reconcile.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name |
+| `agent_reconcile.py` | `_load_registry:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `cloud_worker.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name |
+| `cloud_worker.py` | `_lib:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `cloud_worker.py` | `_registry_note:load_module(string)` | 1 | a dynamic load |
+| `cloud_worker.py` | `_walk:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `cloud_worker.py` | `bind:sys.modules` | 1 | reads `sys.modules` |
+| `cloud_worker.py` | `model_entry:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `cpu_guard.py` | `slots_text:import(importlib)` | 1 | imports a module that can load code by name |
+| `cpu_guard.py` | `slots_text:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `external_adapter.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name |
+| `external_adapter.py` | `_load_core:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `external_adapter.py` | `_load_core:sys.modules` | 3 | reads `sys.modules` |
+| `fleet-switchboard` | `<module>:import(importlib)` | 1 | imports a module that can load code by name |
+| `fleet-switchboard` | `Installer.reaper_command_problem:import(importlib)` | 1 | imports a module that can load code by name |
+| `fleet-switchboard` | `Installer.reaper_command_problem:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `fleet-switchboard` | `_declared_module:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `fleet-switchboard` | `_declared_module:load_module(non-constant)` | 1 | a dynamic load |
 | `fleet-switchboard` | `_fleet_parts:compile` | 1 | compiles a part's text |
-| `fleet-switchboard` | `_fleet_parts:exec` | 1 | runs a part's code in the entry's namespace |
-| `fleet-switchboard` | `_make_loader.loader:load_module(non-constant)` | 1 | loads the module its argument names |
-| `fleet-switchboard` | `launcher_module:exec_module` | 1 | runs the module of a spec |
-| `fleet-switchboard` | `launcher_module:module_from_spec` | 1 | builds the module of a spec |
-| `fleet-switchboard` | `launcher_module:spec_from_file_location` | 1 | loads a module by path |
-| `fleet-switchboard` | `load_module:exec_module` | 1 | runs the module of a spec |
-| `fleet-switchboard` | `load_module:module_from_spec` | 1 | builds the module of a spec |
-| `fleet-switchboard` | `load_module:spec_from_file_location` | 1 | loads a module by path |
-| `fleet-switchboard` | `load_review_rule:exec_module` | 1 | runs the module of a spec |
-| `fleet-switchboard` | `load_review_rule:module_from_spec` | 1 | builds the module of a spec |
-| `fleet-switchboard` | `load_review_rule:spec_from_file_location` | 1 | loads a module by path |
-| `fleet-switchboard` | `validate_app_config:exec_module` | 1 | runs the module of a spec |
-| `fleet-switchboard` | `validate_app_config:module_from_spec` | 1 | builds the module of a spec |
-| `fleet-switchboard` | `validate_app_config:spec_from_file_location` | 1 | loads a module by path |
-| `fleet-switchboard` | `validate_hold_labels_config:exec_module` | 1 | runs the module of a spec |
-| `fleet-switchboard` | `validate_hold_labels_config:module_from_spec` | 1 | builds the module of a spec |
-| `fleet-switchboard` | `validate_hold_labels_config:spec_from_file_location` | 1 | loads a module by path |
+| `fleet-switchboard` | `_fleet_parts:exec` | 1 | execs text |
+| `fleet-switchboard` | `_make_loader.loader:load_module(non-constant)` | 1 | a dynamic load |
+| `fleet-switchboard` | `launcher_module:import(importlib)` | 1 | imports a module that can load code by name |
+| `fleet-switchboard` | `launcher_module:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `fleet-switchboard` | `load_module:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `fleet-switchboard` | `load_module:sys.modules` | 4 | reads `sys.modules` |
+| `fleet-switchboard` | `load_review_rule:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `fleet-switchboard` | `validate_app_config:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `fleet-switchboard` | `validate_hold_labels_config:importlib` | 2 | uses the module object (a call, an attribute, an argument) |

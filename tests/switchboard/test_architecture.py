@@ -144,38 +144,20 @@ def helper_modules(entry_path):
     return {}
 
 
-BUILTIN_PRIMITIVES = ("exec", "eval", "compile")   # a bare name, or `builtins.<name>`: `re.compile` is not one
-ATTRIBUTE_PRIMITIVES = ("__import__", "import_module", "load_module", "find_spec", "spec_from_file_location", "SourceFileLoader", "run_path", "run_module",
-                        "module_from_spec", "exec_module", "load_source")
-MODULE_ONLY = {"reload": ("importlib",)}   # an attribute that is a primitive only on these names
-PRIMITIVES = BUILTIN_PRIMITIVES + ATTRIBUTE_PRIMITIVES + tuple(MODULE_ONLY)
-FOLLOWED = ("__import__", "import_module", "load_module")   # followed when called directly with a constant string; every other use is a listed site
-
-
-def _primitive(node):
-    """The import primitive an expression SPELLS, or None: a bare name, an attribute (`importlib.import_module`), `builtins.exec`, or `getattr(x, "name")`."""
-    if isinstance(node, ast.Name):
-        return node.id if node.id in PRIMITIVES else None
-    if isinstance(node, ast.Attribute):
-        if node.attr in ATTRIBUTE_PRIMITIVES:
-            return node.attr
-        if node.attr in BUILTIN_PRIMITIVES and isinstance(node.value, ast.Name) and node.value.id in ("builtins", "__builtins__"):
-            return node.attr
-        if node.attr in MODULE_ONLY and isinstance(node.value, ast.Name) and node.value.id in MODULE_ONLY[node.attr]:
-            return node.attr
-        return None
-    if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) and node.slice.value in PRIMITIVES:
-        return node.slice.value   # globals()["__import__"], vars(importlib)["import_module"]
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr" and len(node.args) >= 2:
-        arg = node.args[1]
-        if isinstance(arg, ast.Constant) and arg.value in PRIMITIVES:
-            return arg.value
-    return None
+# The rule is about the modules that can load code by name, not about the names of their functions (that list never ends): any import of one of
+# them, any use of a name bound to one, and any use of `sys.modules`, is a site, together with the builtins `__import__`, `exec`, `eval` and `compile`
+# and the daemon's own `load_module`. The one exception is a direct call with a constant module name, which is followed. It over-counts by design
+# and fails closed: a use the test did not foresee is a site, not silence. What it does NOT cover is a way to load code that involves none of these
+# modules or builtins (a module object handed in by a caller, `globals()[name]`): that is outside the stated rule.
+LOADER_MODULES = ("importlib", "pkgutil", "runpy", "pydoc", "imp", "zipimport", "builtins", "__builtins__")
+BUILTIN_NAMES = ("__import__", "exec", "eval", "compile", "load_module")
+NAMED_BY_STRING = BUILTIN_NAMES + ("import_module",)   # a builtin named by a string key: a use of the builtin
+FOLLOWED = ("__import__", "import_module", "load_module")   # followed only as a direct call with a constant string; every other use is a site
 
 
 def _direct_constant(call):
-    """The constant module name of a followed call such as `__import__("x")` or `import_module("x")`, or None when the argument is not a constant string
-    or is relative (a leading dot) or comes with a package."""
+    """The constant module name of a call such as `__import__("x")` or `import_module("x")`, or None when the argument is not a constant string, is
+    relative (a leading dot) or comes with a package."""
     arg = call.args[0] if call.args else None
     if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)) or arg.value.startswith(".") or not arg.value:
         return None
@@ -194,63 +176,98 @@ def _walk_scopes(tree):
     yield from visit(tree, [])
 
 
+def _bindings(tree):
+    """{name: (module, original name or None)} for every name an `import` or `from ... import` binds to one of the loader modules or to `sys.modules`,
+    tracked by name over the whole file (an alias over-counts, which is safe)."""
+    bound = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for item in node.names:
+                root = item.name.split(".")[0]
+                if root in LOADER_MODULES:
+                    bound[item.asname or root] = (root, None)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            root = node.module.split(".")[0]
+            for item in node.names:
+                if root in LOADER_MODULES:
+                    bound[item.asname or item.name] = (root, item.name)
+                elif node.module == "sys" and item.name == "modules":
+                    bound[item.asname or item.name] = ("sys.modules", None)
+    return bound
+
+
+def _followed_primitive(func, bound):
+    """`import_module`, `__import__` or `load_module` when the called expression spells it directly, else None."""
+    if isinstance(func, ast.Name):
+        if func.id in ("__import__", "load_module"):
+            return func.id
+        module, original = bound.get(func.id, (None, None))
+        if module in ("importlib", "builtins") and original in ("import_module", "__import__"):
+            return original
+    elif isinstance(func, ast.Attribute) and func.attr in FOLLOWED:
+        if func.attr == "load_module":
+            return "load_module"
+        base = func.value
+        if isinstance(base, ast.Name) and ((bound.get(base.id) or (base.id, None))[0] in ("importlib", "builtins", "__builtins__")):
+            return func.attr
+    return None
+
+
 def dynamic_uses(path):
-    """[(line, scope, primitive, how, constant)] for every use of an import primitive in the file. `how` is `followed` (a direct call with a constant
-    module name: `constant` holds it), `non-constant`, `relative` (a leading dot or a package argument), `call` (a primitive that is never followed:
-    `exec`, `find_spec`, ...), `reference` (the primitive named but not called directly: a default, an attribute, an argument, a dict value, a
-    conditional, a walrus, a tuple, `partial`, `map`, `globals()[...]`, `getattr(x, "name")` not called) or `alias` (`from m import name as other`).
-    It looks at what is spelled, never at an assignment: a name bound to a primitive is a reference at the place it is bound."""
+    """[(line, scope, kind, how, constant)] for every use of a module that can load code by name, of `sys.modules` and of the loading builtins. `how` is
+    `followed` (a direct call with a constant module name: `constant` holds it) or `site`. A kind is `import(module)` for an import statement, the module
+    name for a use of the module object or of a name bound to it (however it is reached: an attribute, `getattr`, a subscript, an argument), `sys.modules`,
+    or the builtin name, with `(non-constant)`, `(relative)` or `(reference)` where it is not a plain call."""
     tree = ast.parse(Path(path).read_text(encoding="utf-8"))
-    uses, consumed = [], set()
+    bound = _bindings(tree)
+    uses, consumed, call_of = [], set(), {}
     for node, scope in _walk_scopes(tree):
         if isinstance(node, ast.Call):
-            primitive = _primitive(node.func)
-            if primitive is None:
-                continue
-            consumed.add(id(node.func))
-            if primitive in FOLLOWED:
-                constant = _direct_constant(node)
-                if constant is not None and not isinstance(node.func, ast.Subscript) and not isinstance(node.func, ast.Call):
-                    uses.append((node.lineno, scope, primitive, "followed", constant))
-                else:
-                    first = node.args[0] if node.args else None
-                    relative = isinstance(first, ast.Constant) and isinstance(first.value, str) and (first.value.startswith(".") or len(node.args) > 1 or bool(node.keywords))
-                    uses.append((node.lineno, scope, primitive, "relative" if relative else "non-constant", None))
-            else:
-                uses.append((node.lineno, scope, primitive, "call", None))
-    for node, scope in _walk_scopes(tree):
-        if id(node) in consumed:
-            continue
-        if isinstance(node, (ast.Name, ast.Attribute, ast.Subscript)) and isinstance(getattr(node, "ctx", None), ast.Load):
-            primitive = _primitive(node)
+            call_of[id(node.func)] = node
+            primitive = _followed_primitive(node.func, bound)
             if primitive is not None:
-                uses.append((node.lineno, scope, primitive, "reference", None))
-        elif isinstance(node, ast.Call) and _primitive(node) is not None and id(node) not in consumed:
-            uses.append((node.lineno, scope, _primitive(node), "reference", None))   # getattr(x, "name") that is not called directly
-        elif isinstance(node, ast.ImportFrom):
-            for item in node.names:
-                if item.name in PRIMITIVES and item.asname and item.asname != item.name:
-                    uses.append((node.lineno, scope, item.name, "alias", None))
-    return sorted(uses, key=lambda u: (u[0], u[2], u[3]))
-
-
-def dynamic_attribute_problems(path):
-    """[(line, scope)] of every `getattr(importlib..., <not a constant>)`: which attribute of the import machinery is read is decided at run time, so the
-    test cannot say what it loads. It is never allowed (not a row)."""
-    tree = ast.parse(Path(path).read_text(encoding="utf-8"))
-    found = []
+                constant = _direct_constant(node)
+                if constant is not None:
+                    uses.append((node.lineno, scope, primitive, "followed", constant))
+                    consumed.update(id(n) for n in ast.walk(node.func))
     for node, scope in _walk_scopes(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr" and len(node.args) >= 2:
-            base, name = node.args[0], node.args[1]
-            spelled = base.id if isinstance(base, ast.Name) else (base.attr if isinstance(base, ast.Attribute) else "")
-            if spelled in ("importlib", "util", "machinery", "runpy", "builtins", "__builtins__") and not isinstance(name, ast.Constant):
-                found.append((node.lineno, scope))
-    return found
+        if isinstance(node, ast.Import):
+            for item in node.names:
+                if item.name.split(".")[0] in LOADER_MODULES:
+                    uses.append((node.lineno, scope, "import(%s)" % item.name.split(".")[0], "site", None))
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".")[0]
+            if node.level == 0 and (root in LOADER_MODULES or (node.module == "sys" and any(i.name == "modules" for i in node.names))):
+                uses.append((node.lineno, scope, "import(%s)" % ("sys.modules" if node.module == "sys" else root), "site", None))
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and id(node) not in consumed:
+            if node.id in bound:
+                uses.append((node.lineno, scope, bound[node.id][0], "site", None))
+            elif node.id in ("builtins", "__builtins__"):   # never imported by name: `__builtins__` is always there
+                uses.append((node.lineno, scope, node.id, "site", None))
+            elif node.id in BUILTIN_NAMES:
+                call = call_of.get(id(node))
+                if call is None:
+                    kind = node.id + "(reference)"
+                elif node.id in ("exec", "eval", "compile"):
+                    kind = node.id
+                else:
+                    first = call.args[0] if call.args else None
+                    relative = isinstance(first, ast.Constant) and isinstance(first.value, str) and (first.value.startswith(".") or len(call.args) > 1 or bool(call.keywords))
+                    kind = node.id + ("(relative)" if relative else "(non-constant)")
+                uses.append((node.lineno, scope, kind, "site", None))
+        elif isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) and node.slice.value in NAMED_BY_STRING:
+            uses.append((node.lineno, scope, "%s(string)" % node.slice.value, "site", None))   # globals()["__import__"], builtins.__dict__["exec"]
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr" and len(node.args) >= 2 \
+                and isinstance(node.args[1], ast.Constant) and node.args[1].value in NAMED_BY_STRING:
+            uses.append((node.lineno, scope, "%s(string)" % node.args[1].value, "site", None))
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and node.attr == "modules" and isinstance(node.value, ast.Name) and node.value.id == "sys":
+            uses.append((node.lineno, scope, "sys.modules", "site", None))
+    return sorted(uses, key=lambda u: (u[0], u[2], u[3]))
 
 
 def loaded_modules(path, helpers):
     """The flat modules a file of the daemon loads: a direct `load_module("x")` and the `load_x()` helpers."""
-    found = {constant for _line, _scope, primitive, how, constant in dynamic_uses(path) if how == "followed" and primitive == "load_module"}
+    found = {constant for _line, _scope, kind, how, constant in dynamic_uses(path) if how == "followed" and kind == "load_module"}
     for node in ast.walk(ast.parse(Path(path).read_text(encoding="utf-8"))):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in helpers:
             found.add(helpers[node.func.id])
@@ -271,19 +288,16 @@ def imported_modules(path, flat):
                 found.add(node.module.split(".")[0])
             elif node.level == 1:
                 found |= {a.name for a in node.names}
-    for _line, _scope, primitive, how, constant in dynamic_uses(path):
-        if how == "followed" and primitive in ("__import__", "import_module"):
+    for _line, _scope, kind, how, constant in dynamic_uses(path):
+        if how == "followed" and kind in ("__import__", "import_module"):
             found.add(constant.split(".")[0])
     return found & flat
 
 
 def unfollowed_sites(path):
-    """[(line, "scope:kind")] of every use the derivation does not follow: everything but a direct call with a constant module name, plus a relative
-    import of level two or more. The kind is the primitive, with `(non-constant)`, `(relative)`, `(reference)` or `(alias)` where it is not a call."""
-    sites = []
-    for line, scope, primitive, how, _constant in dynamic_uses(path):
-        if how != "followed":
-            sites.append((line, "%s:%s" % (scope, primitive if how == "call" else "%s(%s)" % (primitive, how))))
+    """[(line, "scope:kind")] of every use the derivation does not follow: all of dynamic_uses that is not a direct constant call, and a relative
+    import of level two or more."""
+    sites = [(line, "%s:%s" % (scope, kind)) for line, scope, kind, how, _constant in dynamic_uses(path) if how == "site"]
     for node, scope in _walk_scopes(ast.parse(Path(path).read_text(encoding="utf-8"))):
         if isinstance(node, ast.ImportFrom) and node.level >= 2:
             sites.append((node.lineno, "%s:from-import(relative level %d)" % (scope, node.level)))
@@ -446,9 +460,6 @@ def check(root, text):
             problems.append("violation row %s -> %s (%s) matches no violation any more: delete the row" % key)
         if not why.strip():
             problems.append("violation row %s -> %s (%s) has no reason" % key)
-    for unit in sorted(files & set(units)):
-        for line, scope in dynamic_attribute_problems(Path(root) / "bin" / unit):
-            problems.append("%s reads an attribute of the import machinery by a name decided at run time, in %s (line %d): the test cannot say what it loads, and this is never allowed" % (unit, scope, line))
     listed = parse_dynamic(text)
     seen = unfollowed(root, units)
     for key, count in sorted(seen.items()):
@@ -624,8 +635,8 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
         }
         for name, source in forms.items():
             with self.subTest(form=name):
-                problems = self.problems(flat={"low.py": source, "high.py": "X = 1\n"}, doc_units={"low.py": 1, "high.py": 3})
-                self.assertEqual(len(problems), 1, problems)
+                problems = [p for p in self.problems(flat={"low.py": source, "high.py": "X = 1\n"}, doc_units={"low.py": 1, "high.py": 3}) if p.startswith("new violation")]
+                self.assertEqual(len(problems), 1, problems)   # the import of the module itself is a site too, which is not a violation of the layers
                 self.assertIn("new violation low.py -> high.py (import, 1)", problems[0])
 
     def test_a_part_that_loads_a_flat_module_directly_or_imports_it_is_followed(self):
@@ -635,67 +646,98 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
                 self.assertEqual(len(problems), 1, problems)
                 self.assertIn("new violation switchboard/low.py -> high.py (import, 1)", problems[0])
 
-    # Every form below is something the derivation cannot follow: each must be a listed site, by the function it sits in and the kind of use.
+    IM = "<module>:import(importlib)"
+
+    # Every form below is a way to load code by name that the derivation does not follow: each is a list of sites (the function it sits in and the
+    # kind of use), one per use, and the test proves each form is listed, and that a wrong count is named. A new form is one new line.
     DYNAMIC_FORMS = {
         # the spellings
-        "non-constant import_module": ("import importlib\n\ndef f(n):\n    return importlib.import_module(n)\n", "f:import_module(non-constant)"),
-        "non-constant __import__": ("def f(n):\n    return __import__(n)\n", "f:__import__(non-constant)"),
-        "non-constant load_module": ("def f(n):\n    return load_module(n)\n", "f:load_module(non-constant)"),
-        "path load": ("import importlib.util\n\ndef f(p):\n    return importlib.util.spec_from_file_location('x', p)\n", "f:spec_from_file_location"),
-        "source loader": ("import importlib.machinery\n\ndef f(p):\n    return importlib.machinery.SourceFileLoader('x', p)\n", "f:SourceFileLoader"),
-        "run_path": ("import runpy\n\ndef f(p):\n    return runpy.run_path(p)\n", "f:run_path"),
-        "run_module": ("import runpy\n\ndef f(n):\n    return runpy.run_module(n)\n", "f:run_module"),
-        "module_from_spec": ("import importlib.util\n\ndef f(s):\n    return importlib.util.module_from_spec(s)\n", "f:module_from_spec"),
-        "exec_module": ("def f(s, m):\n    s.loader.exec_module(m)\n", "f:exec_module"),
-        "find_spec": ("import importlib.util\n\ndef f():\n    return importlib.util.find_spec('high')\n", "f:find_spec"),
-        "reload": ("import importlib\n\ndef f(m):\n    importlib.reload(m)\n", "f:reload"),
-        "exec of text": ("def f(text):\n    exec(text)\n", "f:exec"),
-        "eval of text": ("def f(text):\n    return eval(text)\n", "f:eval"),
-        "compile of text": ("def f(text):\n    return compile(text, 'x', 'exec')\n", "f:compile"),
-        "builtins.exec": ("import builtins\n\ndef f(text):\n    builtins.exec(text)\n", "f:exec"),
-        "constant exec": ("def f():\n    exec('import high')\n", "f:exec"),
+        "non-constant import_module": ("import importlib\n\ndef f(n):\n    return importlib.import_module(n)\n", [IM, "f:importlib"]),
+        "non-constant __import__": ("def f(n):\n    return __import__(n)\n", ["f:__import__(non-constant)"]),
+        "non-constant load_module": ("def f(n):\n    return load_module(n)\n", ["f:load_module(non-constant)"]),
+        "path load": ("import importlib.util\n\ndef f(p):\n    return importlib.util.spec_from_file_location('x', p)\n", [IM, "f:importlib"]),
+        "source loader": ("import importlib.machinery\n\ndef f(p):\n    return importlib.machinery.SourceFileLoader('x', p)\n", [IM, "f:importlib"]),
+        "run_path": ("import runpy\n\ndef f(p):\n    return runpy.run_path(p)\n", ["<module>:import(runpy)", "f:runpy"]),
+        "run_module": ("import runpy\n\ndef f(n):\n    return runpy.run_module(n)\n", ["<module>:import(runpy)", "f:runpy"]),
+        "module_from_spec": ("import importlib.util\n\ndef f(s):\n    return importlib.util.module_from_spec(s)\n", [IM, "f:importlib"]),
+        "find_spec": ("import importlib.util\n\ndef f():\n    return importlib.util.find_spec('high')\n", [IM, "f:importlib"]),
+        "reload": ("import importlib\n\ndef f(m):\n    importlib.reload(m)\n", [IM, "f:importlib"]),
+        "exec of text": ("def f(text):\n    exec(text)\n", ["f:exec"]),
+        "eval of text": ("def f(text):\n    return eval(text)\n", ["f:eval"]),
+        "compile of text": ("def f(text):\n    return compile(text, 'x', 'exec')\n", ["f:compile"]),
+        "builtins.exec": ("import builtins\n\ndef f(text):\n    builtins.exec(text)\n", ["<module>:import(builtins)", "f:builtins"]),
+        "constant exec": ("def f():\n    exec('import high')\n", ["f:exec"]),
         # round 1: what the primitive is BOUND to
-        "alias by assignment": ("imp = __import__\n\ndef f(n):\n    return imp(n)\n", "<module>:__import__(reference)"),
-        "alias with a constant call": ("imp = __import__\n\ndef f():\n    return imp('high')\n", "<module>:__import__(reference)"),
-        "from-import alias": ("from importlib import import_module as im\n\ndef f(n):\n    return im(n)\n", "<module>:import_module(alias)"),
-        "getattr call": ("import importlib\n\ndef f(n):\n    return getattr(importlib, 'import_module')(n)\n", "f:import_module(non-constant)"),
-        "getattr stored": ("import importlib\nload = getattr(importlib, 'import_module')\n", "<module>:import_module(reference)"),
-        "alias chain": ("a = __import__\nb = a\nc = b\nd = c\ne = d\n\ndef f(n):\n    return e(n)\n", "<module>:__import__(reference)"),
-        "relative level two": ("from ..high import X\n", "<module>:from-import(relative level 2)"),
+        "alias by assignment": ("imp = __import__\n\ndef f(n):\n    return imp(n)\n", ["<module>:__import__(reference)"]),
+        "alias with a constant call": ("imp = __import__\n\ndef f():\n    return imp('high')\n", ["<module>:__import__(reference)"]),
+        "from-import alias": ("from importlib import import_module as im\n\ndef f(n):\n    return im(n)\n", [IM, "f:importlib"]),
+        "getattr call": ("import importlib\n\ndef f(n):\n    return getattr(importlib, 'import_module')(n)\n", [IM, "f:importlib", "f:import_module(string)"]),
+        "getattr stored": ("import importlib\nload = getattr(importlib, 'import_module')\n", [IM, "<module>:importlib", "<module>:import_module(string)"]),
+        "alias chain": ("a = __import__\nb = a\nc = b\nd = c\ne = d\n\ndef f(n):\n    return e(n)\n", ["<module>:__import__(reference)"]),
+        "relative level two": ("from ..high import X\n", ["<module>:from-import(relative level 2)"]),
         # round 2: not an assignment statement at all
-        "parameter default": ("def f(n, imp=__import__):\n    return imp(n)\n", "f:__import__(reference)"),
-        "parameter default with a constant call": ("def f(imp=__import__):\n    return imp('high')\n", "f:__import__(reference)"),
-        "class attribute": ("class C:\n    imp = __import__\n\n    def run(self, n):\n        return self.imp(n)\n", "C:__import__(reference)"),
-        "conditional expression": ("imp = __import__ if True else None\n", "<module>:__import__(reference)"),
-        "annotated assignment": ("imp: object = __import__\n", "<module>:__import__(reference)"),
-        "walrus": ("def f(n):\n    return (imp := __import__)(n)\n", "f:__import__(reference)"),
-        "tuple assignment": ("a, b = __import__, 1\n", "<module>:__import__(reference)"),
-        "functools.partial": ("import functools\n\ndef f():\n    return functools.partial(__import__, 'high')\n", "f:__import__(reference)"),
-        "map": ("def f(names):\n    return list(map(__import__, names))\n", "f:__import__(reference)"),
-        "dict value": ("TABLE = {'i': __import__}\n\ndef f(n):\n    return TABLE['i'](n)\n", "<module>:__import__(reference)"),
-        "globals lookup": ("def f(n):\n    return globals()['__import__'](n)\n", "f:__import__(non-constant)"),
-        "relative through the package argument": ("import importlib\n\ndef f():\n    return importlib.import_module('..high', 'pkg')\n", "f:import_module(relative)"),
-        "constant with a package argument": ("import importlib\n\ndef f():\n    return importlib.import_module('high', 'pkg')\n", "f:import_module(relative)"),
+        "parameter default": ("def f(n, imp=__import__):\n    return imp(n)\n", ["f:__import__(reference)"]),
+        "parameter default with a constant call": ("def f(imp=__import__):\n    return imp('high')\n", ["f:__import__(reference)"]),
+        "class attribute": ("class C:\n    imp = __import__\n\n    def run(self, n):\n        return self.imp(n)\n", ["C:__import__(reference)"]),
+        "conditional expression": ("imp = __import__ if True else None\n", ["<module>:__import__(reference)"]),
+        "annotated assignment": ("imp: object = __import__\n", ["<module>:__import__(reference)"]),
+        "walrus": ("def f(n):\n    return (imp := __import__)(n)\n", ["f:__import__(reference)"]),
+        "tuple assignment": ("a, b = __import__, 1\n", ["<module>:__import__(reference)"]),
+        "functools.partial": ("import functools\n\ndef f():\n    return functools.partial(__import__, 'high')\n", ["f:__import__(reference)"]),
+        "map": ("def f(names):\n    return list(map(__import__, names))\n", ["f:__import__(reference)"]),
+        "dict value": ("TABLE = {'i': __import__}\n\ndef f(n):\n    return TABLE['i'](n)\n", ["<module>:__import__(reference)"]),
+        "globals lookup by the builtin's name": ("def f(n):\n    return globals()['__import__'](n)\n", ["f:__import__(string)"]),
+        "getattr with a variable name": ("import importlib\n\ndef f(k, n):\n    return getattr(importlib, k)(n)\n", [IM, "f:importlib"]),
+        "relative through the package argument": ("import importlib\n\ndef f():\n    return importlib.import_module('..high', 'pkg')\n", [IM, "f:importlib"]),
+        "constant with a package argument": ("import importlib\n\ndef f():\n    return importlib.import_module('high', 'pkg')\n", [IM, "f:importlib"]),
+        # round 3: the module is the unit of the rule, however it is reached
+        "getattr on an alias of the module": ("import importlib as il\n\ndef f(k, n):\n    return getattr(il, k)(n)\n", [IM, "f:importlib"]),
+        "module bound to another name": ("import importlib\nm = importlib\n\ndef f(k, n):\n    return getattr(m, k)(n)\n", [IM, "<module>:importlib"]),
+        "sys.modules": ("import sys\n\ndef f(k, n):\n    return getattr(sys.modules['importlib'], k)(n)\n", ["f:sys.modules"]),
+        "sys.modules imported by name": ("from sys import modules\n\ndef f(k):\n    return modules[k]\n", ["<module>:import(sys.modules)", "f:sys.modules"]),
+        "vars of the module": ("import importlib\n\ndef f(k, n):\n    return vars(importlib)[k](n)\n", [IM, "f:importlib"]),
+        "__dict__ of the module": ("import importlib\n\ndef f(k, n):\n    return importlib.__dict__[k](n)\n", [IM, "f:importlib"]),
+        "__dict__ of builtins": ("import builtins\n\ndef f(n):\n    return builtins.__dict__['__import__'](n)\n", ["<module>:import(builtins)", "f:builtins", "f:__import__(string)"]),
+        "pkgutil.resolve_name": ("import pkgutil\n\ndef f(n):\n    return pkgutil.resolve_name(n)\n", ["<module>:import(pkgutil)", "f:pkgutil"]),
+        "pydoc.locate": ("import pydoc\n\ndef f(n):\n    return pydoc.locate(n)\n", ["<module>:import(pydoc)", "f:pydoc"]),
+        "operator.attrgetter on the module": ("import importlib, operator\n\ndef f():\n    return operator.attrgetter('import_module')(importlib)('high')\n", [IM, "f:importlib"]),
+        "zipimport": ("import zipimport\n\ndef f(p):\n    return zipimport.zipimporter(p)\n", ["<module>:import(zipimport)", "f:zipimport"]),
+        "builtins bound to another name": ("import builtins\nb = builtins\n\ndef f(t):\n    b.exec(t)\n", ["<module>:import(builtins)", "<module>:builtins"]),
+        "spec_from_loader": ("from importlib.util import spec_from_loader\n\ndef f(l):\n    return spec_from_loader('x', l)\n", [IM, "f:importlib"]),
+        "loader classes": ("from importlib.machinery import SourcelessFileLoader, ExtensionFileLoader\n\ndef f(p):\n    return SourcelessFileLoader('x', p), ExtensionFileLoader('y', p)\n",
+                           [IM, "f:importlib", "f:importlib"]),
+        "imp.load_compiled": ("import imp\n\ndef f(p):\n    return imp.load_compiled('x', p)\n", ["<module>:import(imp)", "f:imp"]),
     }
 
-    def test_every_dynamic_import_the_test_cannot_follow_is_a_listed_site_by_function_and_kind(self):
-        self.assertGreaterEqual(len(self.DYNAMIC_FORMS), 30)
-        for name, (source, site) in self.DYNAMIC_FORMS.items():
-            with self.subTest(form=name):
-                problems = self.problems(parts={"low.py": source})
-                self.assertEqual(problems, ["switchboard/low.py has 1 dynamic import(s) at %s that the test does not follow and the table 'Dynamic imports not followed' does not list" % site])
-                row = "| `switchboard/low.py` | `%s` | 1 | a site |\n" % site
-                self.assertEqual(self.problems(parts={"low.py": source}, doc_dynamic=row), [])
-                self.assertEqual(self.problems(parts={"low.py": source}, doc_dynamic=row.replace("| 1 |", "| 2 |")),
-                                 ["switchboard/low.py has 1 dynamic import(s) at %s not followed, the table says 2: write 1" % site])
+    def messages(self, sites):
+        counts = collections.Counter(sites)
+        return ["switchboard/low.py has %d dynamic import(s) at %s that the test does not follow and the table 'Dynamic imports not followed' does not list" % (c, site)
+                for site, c in sorted(counts.items())]
 
-    def test_a_getattr_on_the_import_machinery_by_a_name_decided_at_run_time_is_never_allowed(self):
-        source = "import importlib\n\ndef f(k, n):\n    return getattr(importlib, k)(n)\n"
-        problems = self.problems(parts={"low.py": source})
-        self.assertEqual(len(problems), 1, problems)
-        self.assertIn("switchboard/low.py reads an attribute of the import machinery by a name decided at run time, in f (line 4)", problems[0])
-        with_row = self.problems(parts={"low.py": source}, doc_dynamic="| `switchboard/low.py` | `f:getattr` | 1 | a site |\n")
-        self.assertIn(problems[0], with_row, "a row cannot allow it")
+    def test_every_dynamic_import_the_test_cannot_follow_is_a_listed_site_by_function_and_kind(self):
+        self.assertGreaterEqual(len(self.DYNAMIC_FORMS), 45)
+        for name, (source, sites) in self.DYNAMIC_FORMS.items():
+            with self.subTest(form=name):
+                self.assertEqual(self.problems(parts={"low.py": source}), self.messages(sites))
+                rows = "".join("| `switchboard/low.py` | `%s` | %d | a site |\n" % (site, c) for site, c in sorted(collections.Counter(sites).items()))
+                self.assertEqual(self.problems(parts={"low.py": source}, doc_dynamic=rows), [])
+                first = sorted(collections.Counter(sites).items())[0]
+                wrong = rows.replace("`%s` | %d |" % first, "`%s` | %d |" % (first[0], first[1] + 1), 1)
+                self.assertEqual(self.problems(parts={"low.py": source}, doc_dynamic=wrong),
+                                 ["switchboard/low.py has %d dynamic import(s) at %s not followed, the table says %d: write %d" % (first[1], first[0], first[1] + 1, first[1])])
+
+    def test_what_is_outside_the_stated_rule_is_silent_and_says_so(self):
+        outside = {
+            "a module object handed in by the caller": "def f(m, n):\n    return getattr(m, n)\n",
+            "exec_module on a spec that came from elsewhere": "def f(s, m):\n    s.loader.exec_module(m)\n",
+            "globals() with a variable key": "def f(k, n):\n    return globals()[k](n)\n",
+            "a local variable named like a module that is not imported": "def f(imp):\n    return imp.x\n",
+            "re.compile": "import re\nP = re.compile('x')\n",
+            "reload on another object": "def f(x):\n    return x.reload()\n",
+        }
+        for name, source in outside.items():
+            with self.subTest(form=name):
+                self.assertEqual(self.problems(parts={"low.py": source}), [])
 
     def test_a_listed_site_that_is_gone_and_a_swapped_site_are_reported(self):
         gone = self.problems(parts={"low.py": "X = 1\n"}, doc_dynamic="| `switchboard/low.py` | `f:exec` | 1 | a site |\n")
@@ -709,19 +751,21 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
             "importlib.import_module": "import importlib\n\ndef f():\n    return importlib.import_module('high')\n",
             "__import__": "def f():\n    return __import__('high')\n",
             "bare import_module": "from importlib import import_module\n\ndef f():\n    return import_module('high')\n",
-            "getattr called at once": "import importlib\n\ndef f():\n    return getattr(importlib, 'import_module')('high')\n",
         }
         for name, source in followed.items():
             with self.subTest(form=name):
                 problems = self.problems(parts={"low.py": source}, flat={"high.py": "X = 1\n"}, doc_units={"high.py": 3})
-                if name == "getattr called at once":   # not a direct spelling: a listed site, never an edge
-                    self.assertEqual(len(problems), 1, problems)
-                    self.assertIn("dynamic import(s) at f:import_module(non-constant)", problems[0])
-                    continue
-                self.assertEqual(len(problems), 1, problems)
-                self.assertIn("new violation switchboard/low.py -> high.py (import, 1)", problems[0])
-        self.assertEqual(self.problems(parts={"low.py": "import re\nPATTERN = re.compile('x')\n"}), [], "`re.compile` is not a dynamic import")
-        self.assertEqual(self.problems(parts={"low.py": "import importlib\n\ndef f(x):\n    return x.reload()\n"}), [], "`.reload` on another object is not a dynamic import")
+                self.assertTrue(any("new violation switchboard/low.py -> high.py (import, 1)" in p for p in problems), problems)
+                self.assertFalse(any("f:" in p for p in problems), "the followed call itself is not a site: %s" % problems)
+        not_followed = {
+            "getattr called at once": "import importlib\n\ndef f():\n    return getattr(importlib, 'import_module')('high')\n",
+            "alias": "imp = __import__\n\ndef f():\n    return imp('high')\n",
+        }
+        for name, source in not_followed.items():
+            with self.subTest(form=name):
+                problems = self.problems(parts={"low.py": source}, flat={"high.py": "X = 1\n"}, doc_units={"high.py": 3})
+                self.assertFalse(any("(import, 1)" in p and "-> high.py" in p for p in problems), "never an edge: %s" % problems)
+                self.assertTrue(any("dynamic import(s)" in p for p in problems), problems)
 
 
 if __name__ == "__main__":
