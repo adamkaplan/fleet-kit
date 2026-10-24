@@ -13896,6 +13896,11 @@ def sweep_gate_reading(engine, repo, number, now):
         if ctx.unreadable or not (ctx.facts or {}).get("head"):
             return None, None, None, _one_line(str(ctx.unreadable or "no head"), 120)
         report = plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr, now=now)
+        floor = (ctx.facts or {}).get("floor")
+        if isinstance(floor, dict) and floor.get("decision") is None:   # #986 round 4: an impact floor that could not be read is not a whole reading (G6 would say "waiting"): not checked
+            return None, None, None, _one_line("the impact floor could not be read: %s" % (floor.get("unreadable") or "no decision"), 120)
+        if isinstance(floor, dict) and floor.get("unreadable"):   # the re-hold read failed too (impact-state file corrupt: rehold None): not checked
+            return None, None, None, _one_line("the impact state could not be read: %s" % floor["unreadable"], 120)
         opened = [r["gate"] for r in report["gates"] if r["status"] not in plan_ledger.SATISFIED]   # the FULL board, whichever gates are enforced: S5 means every gate but the owner's clear is met
         if (ctx.facts or {}).get("draft") is True:
             opened.insert(0, "draft")   # a draft is not ready, whatever CI says
