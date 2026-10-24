@@ -169,6 +169,7 @@ HELPER_MODULES = {   # the old `load_<module>()` names: each returns `load_modul
     "load_health_records": "health_records",
     "load_reds": "reds",
     "load_impact_floor": "impact_floor",
+    "load_impact_brief": "impact_brief",
     "load_plan_review": "plan_review",
     "load_external_adapter": "external_adapter",
     "load_decision_sync": "decision_sync",
@@ -21853,7 +21854,11 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
         if review:
             decision = "hold"
     rating_entries = impact_rating_entries(engine.state_dir, "%s#%d" % (repo, number), head)[0] if engine.state_dir is not None and isinstance(head, str) else []
-    return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude, "rating_block": rating_block_note(rating_entries, "%s#%d" % (repo, number), head), "rating_lines": rating_mismatch_lines(engine.state_dir, "%s#%d" % (repo, number), head),
+    brief_module = load_module("impact_brief")   # slice A hook (#1215): the brief is built from the same diff read; display only, no decision reads it yet
+    report_base = {"top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "head": raw.get("headRefOid"), "base": raw.get("baseRefOid"), "complete": complete,
+                   "reads": [{"by": e.get("by"), "verdict": e.get("verdict"), "head": e.get("head")} for e in rating_entries], "rating": ({"class": record[1]} if record and record[1] else None)}
+    brief = brief_module.build_brief(brief_module.facts_from_report(files, report_base))
+    return {"brief": brief, "pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude, "rating_block": rating_block_note(rating_entries, "%s#%d" % (repo, number), head), "rating_lines": rating_mismatch_lines(engine.state_dir, "%s#%d" % (repo, number), head),
             "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete,
             "top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "review_action": record[0] if record else None, "review_class": record[1] if record else None,   # #661: display data the delegated clear reads; no decision changes
             "changed_paths": [p for p in paths if isinstance(p, str)][:200], "unknown": unknown, "rated": [list(r) for r in rated],
@@ -21997,6 +22002,8 @@ def cmd_impact_floor(args, runner, now):
             print("  incomplete: GitHub gave %s of %s changed files, so a path outside those may be a top tier path; this is not a verdict of \"not held\"" % (read, total))
         if blind and owner != "hold":
             print("  rename: the source path of %s was not seen, and it may have been a top tier path; this is not a verdict of \"not held\"" % ", ".join(blind[:3]))
+        if isinstance(report.get("brief"), dict):
+            print(report["brief"]["text"], end="")   # #1215: the one-screen brief; advice only, no decision changes
         print("  path floor (older advisory, not the owner's rule): %s" % report["decision"].upper().replace("-", " "))
         for reason in report["reasons"]:
             print("  %s" % reason)
@@ -24815,6 +24822,15 @@ def held_defects(body):
         return ["the held PR's top is unreadable (%s)" % _one_line("%s: %s" % (type(err).__name__, err), 100)]
 
 
+def _brief_advisory():
+    """Slice D (#1215): the pure brief rules, loaded from bin/brief_advisory.py beside this file."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("brief_advisory", os.path.join(os.path.dirname(os.path.realpath(__file__)), "brief_advisory.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _held_defects(body):
     """What is wrong with the top of a PR body held for the owner (used by `pr-explain --check` and gate G6b). After the opening lines
     (PLAN:, MERGE:, canon:), in this order: `## Why this needs you` (1 to 3 sentences, no placeholder), `## What changes for you` (a Before | After
@@ -24841,7 +24857,7 @@ def _held_defects(body):
     def words(text):
         return len(re.findall(r"[^\W_]", text))   # underscores are not word characters here
 
-    problems = []
+    problems = list(_brief_advisory().rationale_defects(lines))   # G6b (#1215): the one-sentence rationale line on top
     if HELD_WHY not in pos:
         problems.append("the held PR needs a `%s` section after the opening lines" % HELD_WHY)
     else:
@@ -24969,6 +24985,8 @@ def add_impact_parsers(sub):
     clear = impact_sub.add_parser("clear", help="The owner's own terminal: clear a false impact hold for this head, with a reason (the Chief of Staff only under a standing order of the owner's, with --under-order)")
     clear.add_argument("pr", help="The pull request: owner/repo#N or its URL")
     clear.add_argument("--under-order", type=int, dest="under_order", metavar="N", help="The Chief of Staff only: clear under the owner's standing order N (it must be listed under delegated_clear in the configuration); recorded as her act under that order")
+    clear.add_argument("--brief-digest", dest="brief_digest", help="The Chief of Staff only (#1215): the digest of the impact brief the floor printed at this head; a clear without it, or with a stale one, is refused")
+    clear.add_argument("--brief-text", dest="brief_text", help="The Chief of Staff only (#1215): the text of that brief, recorded with its digest and the reasons in the audit line")
     clear.add_argument("--reason", required=True, help="Why the hold is false (at least 10 characters), logged")
     clear.add_argument("--revoke", action="store_true", help="Take the clear back (and any carry of it): the PR is held again at the daemon's next pass")
 
