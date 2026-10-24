@@ -151,7 +151,7 @@ def helper_modules(entry_path):
 # modules or builtins (a module object handed in by a caller, `globals()[name]`): that is outside the stated rule.
 LOADER_MODULES = ("importlib", "pkgutil", "runpy", "pydoc", "imp", "zipimport", "builtins", "__builtins__")
 BUILTIN_NAMES = ("__import__", "exec", "eval", "compile", "load_module")
-NAMED_BY_STRING = BUILTIN_NAMES + ("import_module",)   # a builtin named by a string key: a use of the builtin
+NAMED_BY_STRING = BUILTIN_NAMES + ("import_module", "__builtins__", "builtins")   # a builtin named by a string key: a use of the builtin
 FOLLOWED = ("__import__", "import_module", "load_module")   # followed only as a direct call with a constant string; every other use is a site
 
 
@@ -223,7 +223,8 @@ def dynamic_uses(path):
     or the builtin name, with `(non-constant)`, `(relative)` or `(reference)` where it is not a plain call."""
     tree = ast.parse(Path(path).read_text(encoding="utf-8"))
     bound = _bindings(tree)
-    sys_names = {"sys"} | {item.asname for node in ast.walk(tree) if isinstance(node, ast.Import) for item in node.names if item.name == "sys" and item.asname}
+    sys_names = {"sys"} | {item.asname for node in ast.walk(tree) if isinstance(node, ast.Import) for item in node.names if item.name == "sys" and item.asname} \
+        | {item.asname or item.name for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module != "sys" for item in node.names if item.name == "sys"}
     parent = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
     uses, consumed, call_of = [], set(), {}
     for node, scope in _walk_scopes(tree):
@@ -273,14 +274,20 @@ def dynamic_uses(path):
                     relative = isinstance(first, ast.Constant) and isinstance(first.value, str) and (first.value.startswith(".") or len(call.args) > 1 or bool(call.keywords))
                     kind = node.id + ("(relative)" if relative else "(non-constant)")
                 uses.append((node.lineno, scope, kind, "site", None))
-        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and node.attr == "load_module" and id(node) not in consumed:
-            call = call_of.get(id(node))   # `loader.load_module(n)`: the daemon's name for loading a module, on any object
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and node.attr == "sys":   # `os.sys.modules`: the module object off another module
+            uses.append((node.lineno, scope, "sys(object)", "site", None))
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and node.attr in NAMED_BY_STRING and id(node) not in consumed \
+                and not (node.attr == "compile" and isinstance(node.value, ast.Name) and node.value.id in ("re", "regex")) \
+                and not (isinstance(node.value, ast.Name) and (node.value.id in bound or node.value.id in ("builtins", "__builtins__"))):   # the module use is the site
+            call = call_of.get(id(node))   # `obj.load_module(n)`, `g["__builtins__"].__import__(n)`, `.eval(t)`: a loading builtin reached on any object
             if call is None:
-                kind = "load_module(reference)"
+                kind = node.attr + "(reference)"
+            elif node.attr in ("exec", "eval", "compile"):
+                kind = node.attr
             else:
                 first = call.args[0] if call.args else None
                 relative = isinstance(first, ast.Constant) and isinstance(first.value, str) and (first.value.startswith(".") or len(call.args) > 1 or bool(call.keywords))
-                kind = "load_module" + ("(relative)" if relative else "(non-constant)")
+                kind = node.attr + ("(relative)" if relative else "(non-constant)")
             uses.append((node.lineno, scope, kind, "site", None))
         elif isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) and node.slice.value in NAMED_BY_STRING:
             uses.append((node.lineno, scope, "%s(string)" % node.slice.value, "site", None))   # globals()["__import__"], builtins.__dict__["exec"]
@@ -736,6 +743,13 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
         "sys bound to another name": ("import sys\nm = sys\n\ndef f(k):\n    return m.modules[k]\n", ["<module>:sys(object)"]),
         "sys.modules off __import__('sys')": ("def f():\n    return __import__('sys').modules\n", ["f:import(sys)"]),
         "sys.modules off import_module('sys')": ("import importlib\n\ndef f():\n    return importlib.import_module('sys').modules\n", [IM, "f:import(sys)"]),
+        "sys off another module": ("import os\n\ndef f(k):\n    return os.sys.modules[k]\n", ["f:sys(object)"]),
+        "sys imported from another module": ("from os import sys as s\n\ndef f(k):\n    return s.modules[k]\n", ["f:sys.modules"]),
+        "builtins by the string key, then __import__": ("def f():\n    return globals()['__builtins__'].__import__('x')\n", ["f:__builtins__(string)", "f:__import__(non-constant)"]),
+        "builtins off __globals__, then eval": ("def f(g, t):\n    return g.__globals__['__builtins__'].eval(t)\n", ["f:__builtins__(string)", "f:eval"]),
+        "getattr for the builtins": ("def f(g):\n    return getattr(g, '__builtins__')\n", ["f:__builtins__(string)"]),
+        "a loading builtin as an attribute of any object": ("def f(o):\n    return o.__import__\n", ["f:__import__(reference)"]),
+        "exec as an attribute of any object": ("def f(o, t):\n    o.exec(t)\n", ["f:exec"]),
         "star import of sys": ("from sys import *\n", ["<module>:import(sys.*)"]),
         "star import of a loader module": ("from importlib import *\n", [IM]),
         "load_module on an object": ("def f(loader, n):\n    return loader.load_module(n)\n", ["f:load_module(non-constant)"]),
@@ -749,7 +763,7 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
         "pydoc.locate": ("import pydoc\n\ndef f(n):\n    return pydoc.locate(n)\n", ["<module>:import(pydoc)", "f:pydoc"]),
         "operator.attrgetter on the module": ("import importlib, operator\n\ndef f():\n    return operator.attrgetter('import_module')(importlib)('high')\n", [IM, "f:importlib"]),
         "zipimport": ("import zipimport\n\ndef f(p):\n    return zipimport.zipimporter(p)\n", ["<module>:import(zipimport)", "f:zipimport"]),
-        "builtins bound to another name": ("import builtins\nb = builtins\n\ndef f(t):\n    b.exec(t)\n", ["<module>:import(builtins)", "<module>:builtins"]),
+        "builtins bound to another name": ("import builtins\nb = builtins\n\ndef f(t):\n    b.exec(t)\n", ["<module>:import(builtins)", "<module>:builtins", "f:exec"]),
         "spec_from_loader": ("from importlib.util import spec_from_loader\n\ndef f(l):\n    return spec_from_loader('x', l)\n", [IM, "f:importlib"]),
         "loader classes": ("from importlib.machinery import SourcelessFileLoader, ExtensionFileLoader\n\ndef f(p):\n    return SourcelessFileLoader('x', p), ExtensionFileLoader('y', p)\n",
                            [IM, "f:importlib", "f:importlib"]),
@@ -762,7 +776,10 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
                 for site, c in sorted(counts.items())]
 
     def test_every_dynamic_import_the_test_cannot_follow_is_a_listed_site_by_function_and_kind(self):
-        self.assertGreaterEqual(len(self.DYNAMIC_FORMS), 65)
+        for required in ("alias by assignment", "parameter default", "walrus", "functools.partial", "getattr with a variable name", "sys bound to another name",
+                         "sys off another module", "builtins by the string key, then __import__", "pkgutil.resolve_name", "operator.attrgetter on the module",
+                         "load_module on an object", "relative through the package argument"):
+            self.assertIn(required, self.DYNAMIC_FORMS)
         for name, (source, sites) in self.DYNAMIC_FORMS.items():
             with self.subTest(form=name):
                 self.assertEqual(self.problems(parts={"low.py": source}), self.messages(sites))
@@ -781,8 +798,10 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
             "a local variable named like a module that is not imported": "def f(imp):\n    return imp.x\n",
             "re.compile": "import re\nP = re.compile('x')\n",
             "reload on another object": "def f(x):\n    return x.reload()\n",
-            "the plain attributes of sys": "import sys\n\ndef f():\n    sys.stderr.write(str(sys.argv))\n    sys.exit(1)\n",
+            "re.compile as an attribute": "import re\nP = re.compile('x')\n",
         }
+        for attribute in SAFE_SYS:
+            outside["sys.%s" % attribute] = "import sys\n\ndef f():\n    return sys.%s\n" % attribute
         for name, source in outside.items():
             with self.subTest(form=name):
                 self.assertEqual(self.problems(parts={"low.py": source}), [])
