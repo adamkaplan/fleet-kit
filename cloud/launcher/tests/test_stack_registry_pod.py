@@ -96,6 +96,71 @@ class S3Guard(unittest.TestCase):
         self.assertIn(ROW, cw.forbidden_pod_fields(pod))
 
 
+def _mutated(old, new):
+    """cloud_worker with ONE source line changed: shows a test would catch that mutation (the mutant accepts what the real code refuses)."""
+    import types
+    with open(cw.__file__) as f:
+        src = f.read()
+    assert src.count(old) == 1, old
+    mod = types.ModuleType("cw_mutant")
+    mod.__file__ = cw.__file__
+    exec(compile(src.replace(old, new), cw.__file__, "exec"), mod.__dict__)
+    return mod
+
+
+def _with_puller(pod):
+    """Give any pod the puller pieces exactly as render_pod does for a stack pod."""
+    pod["spec"]["serviceAccountName"] = cw.PULLER_SERVICE_ACCOUNT
+    pod["metadata"].get("labels", {}).pop(cw.PULLER_LABEL, None)
+    pod["spec"]["volumes"].append(copy.deepcopy(cw.PULLER_VOLUME))
+    pod["spec"]["containers"][0]["volumeMounts"].append({"name": "registry-token", "mountPath": cw.PULLER_MOUNT_PATH, "readOnly": True})
+    return pod
+
+
+class TokenRowStackCondition(unittest.TestCase):
+    STACK_COND = '_is_stack(pod) and spec.get("serviceAccountName") == PULLER_SERVICE_ACCOUNT'
+
+    def test_a_stack_pod_with_the_puller_pieces_passes(self):   # (c)
+        self.assertEqual(cw.forbidden_pod_fields(build_reg()), [])
+        self.assertEqual(cw.forbidden_pod_fields(_with_puller(build(_args(stack=True)))), [])
+
+    def test_non_stack_pod_with_the_puller_volume_mount_and_account_is_refused(self):   # (a)
+        pod = _with_puller(build(_args()))
+        self.assertFalse(cw._is_stack(pod))
+        self.assertIn(ROW, cw.forbidden_pod_fields(pod))
+
+    def test_non_stack_pod_with_a_plain_token_is_refused(self):   # (b)
+        pod = build(_args())
+        pod["spec"]["automountServiceAccountToken"] = True
+        self.assertIn(ROW, cw.forbidden_pod_fields(pod))
+
+    def test_mutant_without_the_stack_condition_accepts_a_non_stack_pod(self):   # (a) mutant
+        m = _mutated(self.STACK_COND, 'spec.get("serviceAccountName") == PULLER_SERVICE_ACCOUNT')
+        pod = _with_puller(build(_args()))
+        self.assertNotIn(ROW, m.forbidden_pod_fields(pod))   # the mutant accepts it ...
+        self.assertIn(ROW, cw.forbidden_pod_fields(pod))     # ... the real guard refuses it
+
+    def test_a_duplicated_puller_volume_is_refused(self):
+        pod = build_reg()
+        pod["spec"]["volumes"].append(copy.deepcopy(cw.PULLER_VOLUME))
+        self.assertTrue(cw.forbidden_pod_fields(pod))
+        self.assertIn(ROW, cw.forbidden_pod_fields(pod))
+
+    def test_the_count_clause_is_redundant_with_the_single_source_list(self):
+        # vols.count(PULLER_VOLUME) == 1 cannot be pinned alone: two identical volumes already fail the one-element list clause before it.
+        m = _mutated("        and vols.count(PULLER_VOLUME) == 1\n", "")
+        pod = build_reg()
+        pod["spec"]["volumes"].append(copy.deepcopy(cw.PULLER_VOLUME))
+        self.assertIn(ROW, m.forbidden_pod_fields(pod))
+
+    def test_a_puller_volume_not_last_is_refused_and_the_ordering_mutant_accepts_it(self):
+        pod = build_reg()
+        pod["spec"]["volumes"].insert(0, pod["spec"]["volumes"].pop())
+        self.assertTrue(cw.forbidden_pod_fields(pod))
+        m = _mutated("        or (_has_puller_volume(pod) and vols[-1] != PULLER_VOLUME)\n", "")
+        self.assertEqual(m.forbidden_pod_fields(pod), [])
+
+
 class U1U2Unchanged(unittest.TestCase):
     def test_default_pod_ignores_the_keys_and_has_no_token(self):   # U1
         pod = build_reg(_args(), keys=KEYS)
