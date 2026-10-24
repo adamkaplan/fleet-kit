@@ -45188,7 +45188,7 @@ REAPER_ONLY_STEPS = {
 # the installer starts to call must be classified here: the completeness test fails when one has no row.
 INSTALLER_READERS = ("_one_line", "_read_json_object", "_xdg", "check_writable_target", "collect_status", "config_path",
                      "cos_orders_path", "fault", "format_status", "herdr_integration_status", "home_link_is_ours",
-                     "home_link_path", "load_config", "plugin_report", "private_env", "reaper_file_path",
+                     "home_link_path", "load_config", "plugin_report", "private_env", "reaper_file_path", "reaper_settings_problem",
                      "reaper_service_settings", "reaper_settings", "render_reaper", "render_service", "service_file_path",
                      "service_kind", "service_path_dirs", "service_values", "set_file_mode", "state_dir_path",
                      "v2_version_of", "validate_config", "weekly_job_scan")
@@ -45219,8 +45219,26 @@ INSTALLER_FILE_MODES = {
 class ReaperOnlyFakes:
     """The reaper-only install (ask #982): the parser's own arguments, the fake machine, the fake home."""
 
+    CLOUD_ENV_GOOD = ("CW_CLOUD_SERVER=api.acme.example:6443\nCW_CLOUD_NAMESPACE=acme-cw\n"
+                      "CW_VAULT_NAME=acme-vault\nCW_VAULT_SUBSCRIPTION=acme-sub\n")
+
+    def ensure_cloud_env(self, text=None, mode=0o600):
+        """The settings file the reaper-only install requires, as a good one: 0600, the user's own, the cluster login names
+        and the vault names (the token file name comes from the environment of the install, set here for the test).
+        Written only when there is none yet. Returns its path."""
+        path = sb.cloud_settings_path()
+        patcher = mock.patch.dict(os.environ, {"CW_CLOUD_TOKEN_FILE": "/home/user/.cw/token"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(self.CLOUD_ENV_GOOD if text is None else text)
+            os.chmod(str(path), mode)
+        return path
+
     def reaper_only(self, *flags, hook=None):
         """`install --cloud-reaper-only` as the parser gives it. Returns (output, error)."""
+        self.ensure_cloud_env()
         out = io.StringIO()
         args = sb.build_parser().parse_args(["install", "--cloud-reaper-only"] + [f for f in flags if f != "--dry-run"] + (
             ["--dry-run"] if "--dry-run" in flags else []))
@@ -45239,7 +45257,13 @@ class ReaperOnlyFakes:
         """`install` as the CLI runs it: the parser's arguments, the fake machine, the fake daemon. (code, out, err)."""
         out, err = io.StringIO(), io.StringIO()
         args = sb.build_parser().parse_args(["install"] + list(argv))
-        with mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err):
+        real = sb.Installer
+
+        def installer(runner, spawn, now, **kwargs):   # the platform and the kit of the test, not the real ones
+            return real(runner, spawn, now, self.PLATFORM, REPO, **kwargs)
+
+        with mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err), \
+                mock.patch.object(sb, "Installer", installer):
             code = sb.cmd_install(args, self.machine, time.time, self.daemons)
         return code, out.getvalue(), err.getvalue()
 
@@ -45285,6 +45309,7 @@ class TheReaperOnlyInstall(ReaperOnlyFakes):
 
     def test_it_writes_the_service_file_and_the_state_directory_and_nothing_else(self):
         self.fresh_state_dir()
+        self.ensure_cloud_env()
         before = tree_of(self.home)
         out, error = self.reaper_only()
         self.assertIsNone(error, error)
@@ -45355,13 +45380,14 @@ class TheReaperOnlyInstall(ReaperOnlyFakes):
         self.assertEqual([name for name, why in REAPER_ONLY_STEPS.items() if why.startswith("called")], ["step_reaper"])
 
     def test_each_contradicting_option_is_refused_before_anything_is_written(self):
-        cases = (("--with-cloud-reaper", None), ("--uninstall", None), ("--no-service", None), ("--no-herdr-link", None),
+        cases = (("--with-cloud-reaper", None), ("--no-service", None), ("--no-herdr-link", None),
                  ("--shared-profile", None), ("--profile", "/home/user/profile"), ("--opencode", "/home/user/opencode"),
                  ("--gh-user", "someone"))
         self.assertEqual(sorted(option for option, _ in cases), sorted(sb.REAPER_ONLY_REFUSALS))
         for option, value in cases:
             with self.subTest(option=option):
                 self.setUp()
+                self.ensure_cloud_env()
                 before = tree_of(self.home)
                 code, out, err = self.run_install("--cloud-reaper-only", option, *([value] if value else []))
                 self.assertEqual(code, 2)
@@ -45376,7 +45402,7 @@ class TheReaperOnlyInstall(ReaperOnlyFakes):
         options = set()
         for entry in action.choices["install"]._actions:
             options.update(entry.option_strings)
-        allowed = {"--cloud-reaper-only", "--dry-run", "-h", "--help"}
+        allowed = {"--cloud-reaper-only", "--dry-run", "--uninstall", "-h", "--help"}
         self.assertEqual(options - set(sb.REAPER_ONLY_REFUSALS) - allowed, set(),
                          "an option of the install parser has no row: refuse it with --cloud-reaper-only, or allow it")
 
@@ -45435,10 +45461,7 @@ class TheReaperOnlyInstall(ReaperOnlyFakes):
             os.umask(old)
 
     def test_the_service_carries_no_key_the_settings_file_holds(self):
-        settings = sb.cloud_settings_path()
-        settings.parent.mkdir(parents=True, exist_ok=True)
-        settings.write_text("CW_CLOUD_NAMESPACE=acme-cw\n")
-        os.chmod(str(settings), 0o600)
+        self.ensure_cloud_env()
         with mock.patch.dict(os.environ, {"CW_CLOUD_NAMESPACE": "other-ns"}):
             out, error = self.reaper_only()
         self.assertIsNone(error, error)
@@ -45447,10 +45470,7 @@ class TheReaperOnlyInstall(ReaperOnlyFakes):
             self.assertNotIn(name, text)
 
     def test_the_settings_the_file_does_not_hold_are_still_carried(self):
-        settings = sb.cloud_settings_path()
-        settings.parent.mkdir(parents=True, exist_ok=True)
-        settings.write_text("CW_CLOUD_NAMESPACE=acme-cw\n")
-        os.chmod(str(settings), 0o600)
+        self.ensure_cloud_env()
         with mock.patch.dict(os.environ, {"CW_CLOUD_NAMESPACE": "acme-cw", "CW_CLOUD_TOKEN_FILE": "/home/user/.cw/token"}):
             out, error = self.reaper_only()
         self.assertIsNone(error, error)
@@ -45458,14 +45478,14 @@ class TheReaperOnlyInstall(ReaperOnlyFakes):
         self.assertNotIn("CW_CLOUD_NAMESPACE", text)
         self.assertIn("CW_CLOUD_TOKEN_FILE", text)
 
-    def test_without_the_settings_file_the_service_carries_the_settings_as_before(self):
+    def test_without_the_settings_file_the_reaper_only_install_refuses_and_writes_nothing(self):
         self.assertFalse(sb.cloud_settings_path().exists())
+        before = tree_of(self.home)
         with mock.patch.dict(os.environ, {"CW_CLOUD_NAMESPACE": "acme-cw"}):
-            out, error = self.reaper_only()
-        self.assertIsNone(error, error)
-        text = self.reaper_path().read_text()
-        self.assertIn("CW_CLOUD_NAMESPACE", text)
-        self.assertIn("acme-cw", text)
+            code, out, err = self.run_install("--cloud-reaper-only")
+        self.assertEqual(code, 1)
+        self.assertIn("cloud reaper not installed: ", err)
+        self.assertEqual(tree_of(self.home), before)
 
     def test_the_settings_table_of_the_launcher_is_the_one_the_installer_knows(self):
         """The launcher owns the table (cloud/launcher/cloud_worker.py); the installer must know the same names."""
@@ -45486,6 +45506,7 @@ class TheReaperOnlyInstall(ReaperOnlyFakes):
 
     def test_a_pasted_token_is_refused_by_name_and_nothing_is_written(self):
         token = "".join(chr(97 + (i * 11) % 26) for i in range(48))   # built at run time: not a literal
+        self.ensure_cloud_env()
         before = tree_of(self.home)
         with mock.patch.dict(os.environ, {"CW_CLOUD_TOKEN_FILE": token}):
             code, out, err = self.run_install("--cloud-reaper-only")
@@ -45529,12 +45550,173 @@ class TheReaperOnlyInstall(ReaperOnlyFakes):
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
 
     def test_a_dry_run_writes_nothing(self):
+        self.ensure_cloud_env()
         before = tree_of(self.home)
         out, error = self.reaper_only("--dry-run")
         self.assertIsNone(error, error)
         self.assertEqual(self.statuses(out)["cloud reaper"], ["would run", "would be done"])
         self.assertEqual(tree_of(self.home), before)
         self.assertEqual(self.reaper_load_calls(), [])
+
+
+    # ---- the way back, and the settings check (the review of ask #982)
+
+    def full_install_fixture(self):
+        out, error = self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.assertIsNone(error, error)
+        self.assertTrue(self.reaper_path().is_file())
+
+    def removal_diff(self, *flags):
+        """Run `install --uninstall --cloud-reaper-only` on a full install: (code, out, the paths that changed or went)."""
+        self.full_install_fixture()
+        before = tree_of(self.home)
+        code, out, err = self.run_install("--uninstall", "--cloud-reaper-only", *flags)
+        after = tree_of(self.home)
+        changed = {path for path in set(before) | set(after) if before.get(path, "gone") != after.get(path, "gone")}
+        return code, out, changed
+
+    def test_the_reaper_only_removal_removes_only_the_reapers_file(self):
+        code, out, changed = self.removal_diff()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(changed, {str(self.reaper_path())})
+        self.assertFalse(self.reaper_path().exists())
+        unloads = [c for c in self.machine.calls if any(word in ("bootout", "disable") for word in c)]
+        self.assertEqual(len(unloads), 1, unloads)
+        self.assertIn("cloud-reaper", " ".join(unloads[0]))
+        self.assertTrue(self.machine.loaded)   # the switchboard's own job is untouched
+
+    def test_a_second_reaper_only_removal_is_one_line_and_changes_nothing(self):
+        self.removal_diff()
+        before, calls = tree_of(self.home), len(self.machine.calls)
+        code, out, err = self.run_install("--uninstall", "--cloud-reaper-only")
+        self.assertEqual((code, out), (0, "cloud reaper: not installed\n"))
+        self.assertEqual(tree_of(self.home), before)
+        self.assertEqual([c for c in self.machine.calls[calls:] if any(w in ("bootout", "disable", "bootstrap", "enable") for w in c)], [])
+
+    def test_a_reaper_only_removal_dry_run_changes_nothing_and_says_what_it_would_do(self):
+        self.full_install_fixture()
+        before, calls = tree_of(self.home), len(self.machine.calls)
+        code, out, err = self.run_install("--uninstall", "--cloud-reaper-only", "--dry-run")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(tree_of(self.home), before)
+        self.assertTrue(self.reaper_path().exists())
+        self.assertEqual([c for c in self.machine.calls[calls:] if any(w in ("bootout", "disable") for w in c)], [])
+        self.assertIn("would run", out)
+        self.assertIn("would be removed", out)
+
+    def test_a_removal_that_also_removes_the_plugin_link_is_caught(self):
+        real = sb.Installer.uninstall_cloud_reaper_only
+        extra = []
+
+        def mutant(installer):
+            real(installer)
+            for plugin in sorted(self.profile.rglob("fleet-hooks.js")):
+                plugin.unlink()
+                extra.append(plugin)
+
+        with mock.patch.object(sb.Installer, "uninstall_cloud_reaper_only", mutant):
+            code, out, changed = self.removal_diff()
+        self.assertTrue(extra, "the fixture holds a plugin piece for the mutant to remove")
+        self.assertNotEqual(changed, {str(self.reaper_path())}, "the check above must see the extra removal")
+
+    def test_the_loaded_job_with_no_file_is_one_clear_line_in_the_full_removal(self):
+        self.machine.reaper_loaded = True
+        code, out, err = self.run_install("--uninstall", "--no-service", "--no-herdr-link")
+        lines = [line for line in out.splitlines() if "cloud reaper" in line]
+        self.assertEqual(len(lines), 1, out)
+        self.assertIn("no file to remove", lines[0])
+        self.assertNotIn("already done", lines[0])
+
+    def test_a_dry_run_of_an_installed_reaper_says_already_installed_in_both_places(self):
+        out, error = self.reaper_only()
+        self.assertIsNone(error, error)
+        out, error = self.reaper_only("--dry-run")
+        self.assertIsNone(error, error)
+        self.assertEqual(self.statuses(out)["cloud reaper"], ["already done"])
+        self.assertIn("is already installed", out)
+        self.assertNotIn("would be installed", out)
+
+    def refusal_cases(self):
+        def drop(name):
+            return lambda path: path.write_text("".join(l + "\n" for l in self.CLOUD_ENV_GOOD.split("\n") if l and not l.startswith(name + "=")))
+
+        def stranger(path):
+            real = os.lstat(str(path))
+            fake = types.SimpleNamespace(st_mode=real.st_mode, st_uid=real.st_uid + 1)
+            return mock.patch.object(sb, "settings_file_stat", lambda p: fake)
+
+        def unreadable(path):
+            def boom(p):
+                raise PermissionError(13, "denied")
+            return mock.patch.object(sb, "settings_file_text", boom)
+
+        return [
+            ("missing", "is missing: create it", lambda path: path.unlink(), None),
+            ("mode 0644", "is group-readable (0644): chmod 600 it", lambda path: os.chmod(str(path), 0o644), None),
+            ("mode 0620", "is group-writable (0620): chmod 600 it", lambda path: os.chmod(str(path), 0o620), None),
+            ("unreadable", "cannot be read (PermissionError)", None, unreadable),
+            ("not the user's", "is owned by another user", None, stranger),
+            ("no cluster server", "is missing the cluster login name CW_CLOUD_SERVER", drop("CW_CLOUD_SERVER"), None),
+            ("no namespace", "is missing the cluster login name CW_CLOUD_NAMESPACE", drop("CW_CLOUD_NAMESPACE"), None),
+            ("no vault name", "is missing the vault name CW_VAULT_NAME", drop("CW_VAULT_NAME"), None),
+            ("no vault subscription", "is missing the vault name CW_VAULT_SUBSCRIPTION", drop("CW_VAULT_SUBSCRIPTION"), None),
+        ]
+
+    def refusal_failures(self):
+        """Each bad settings file: exit 1, ONE named line on stderr, nothing written, no service manager call.
+        The labels of the cases that did not hold."""
+        failed = []
+        for label, expected, prepare, patch_factory in self.refusal_cases():
+            try:
+                self.setUp()
+                path = self.ensure_cloud_env()
+                if prepare is not None:
+                    prepare(path)
+                before = tree_of(self.home)
+                if patch_factory is None:
+                    code, out, err = self.run_install("--cloud-reaper-only")
+                else:
+                    with patch_factory(path):
+                        code, out, err = self.run_install("--cloud-reaper-only")
+                self.assertEqual(code, 1, label)
+                self.assertIn("cloud reaper not installed: ", err, label)
+                self.assertIn(expected, err, label)
+                self.assertEqual(len([line for line in err.splitlines() if line.strip()]), 1, label)
+                self.assertNotIn("acme-", out + err, label)
+                self.assertEqual(tree_of(self.home), before, label)
+                self.assertEqual(self.machine.calls, [], label)
+                self.assertFalse(self.reaper_path().exists(), label)
+            except AssertionError as err:
+                failed.append("%s: %s" % (label, err))
+        return failed
+
+    def test_each_bad_settings_file_is_refused_by_name_and_nothing_is_written(self):
+        self.assertEqual(self.refusal_failures(), [])
+
+    def test_the_token_file_name_may_come_from_the_environment_but_must_come_from_somewhere(self):
+        self.ensure_cloud_env()
+        with mock.patch.dict(os.environ, {"CW_CLOUD_TOKEN_FILE": ""}):
+            code, out, err = self.run_install("--cloud-reaper-only")
+        self.assertEqual(code, 1)
+        self.assertIn("is missing the cluster login name CW_CLOUD_TOKEN_FILE", err)
+
+    def test_a_good_settings_file_passes_and_no_value_is_ever_printed(self):
+        out, error = self.reaper_only()
+        self.assertIsNone(error, error)
+        self.assertTrue(self.reaper_path().exists())
+        self.assertIsNone(sb.reaper_settings_problem(env={"CW_CLOUD_TOKEN_FILE": "/home/user/.cw/token"}))
+        self.assertNotIn("acme-vault", out)
+
+    def test_an_install_with_no_settings_check_is_caught(self):
+        with mock.patch.object(sb, "reaper_settings_problem", lambda *a, **k: None):
+            failed = self.refusal_failures()
+        self.assertEqual(len(failed), len(self.refusal_cases()), "the mutant must break every case: %s" % failed)
+
+    def test_the_full_install_does_not_check_the_settings_file(self):
+        self.assertFalse(sb.cloud_settings_path().exists())
+        out, error = self.install("--opencode", self.machine.binary, "--with-cloud-reaper")
+        self.assertIsNone(error, error)
+        self.assertTrue(self.reaper_path().exists())
 
 
 class TestTheReaperOnlyInstallOnMacOS(TheReaperOnlyInstall, InstallCase):
@@ -45570,7 +45752,11 @@ class TestTheReaperOnlyDryRunLive(Base):
         self.stub("systemctl", "#!/bin/sh\ncase \"$*\" in *is-enabled*) exit 1 ;; *) exit 1 ;; esac\n")
         home = self.home / "throwaway"
         home.mkdir()
-        env = {"HOME": str(home), "PATH": "%s:%s" % (self.home / "stub", os.environ.get("PATH", "")),
+        settings = home / ".config" / "fleet-switchboard" / "cloud.env"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(ReaperOnlyFakes.CLOUD_ENV_GOOD)
+        os.chmod(str(settings), 0o600)
+        env = {"HOME": str(home), "CW_CLOUD_TOKEN_FILE": "/home/user/.cw/token", "PATH": "%s:%s" % (self.home / "stub", os.environ.get("PATH", "")),
                "XDG_CONFIG_HOME": str(home / ".config"), "XDG_STATE_HOME": str(home / ".local" / "state"),
                "FLEET_SWITCHBOARD_UNDER_TEST": "1"}
         done = subprocess.run([sys.executable, "-B", str(root / "bin" / "fleet-switchboard"), "install",
@@ -45578,7 +45764,7 @@ class TestTheReaperOnlyDryRunLive(Base):
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("cloud reaper", done.stdout)
         self.assertIn("would run", done.stdout)
-        self.assertEqual(sorted(str(p) for p in home.rglob("*")), [])
+        self.assertEqual(sorted(str(p) for p in home.rglob("*")), sorted([str(home / ".config"), str(settings.parent), str(settings)]))
 
 
 class TestTheTrialSharesTheInstaller(Base):
