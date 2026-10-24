@@ -87955,6 +87955,194 @@ class TestAssembler(unittest.TestCase):
         self.assertIn("usage: fleet-switchboard status", done.stdout)
 
 
+class TestReadCheckRuns1237(unittest.TestCase):
+    """#1237 review: every refusal branch of ci_runs.read_check_runs, missing_workflows and plan_ledger's ci_workflows rule, with a mutant each."""
+
+    @staticmethod
+    def src_module(old=None, new=None):
+        import types
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci_runs.py")
+        text = open(path).read()
+        if old is not None:
+            assert old in text, old
+            text = text.replace(old, new, 1)
+        mod = types.ModuleType("ci_runs_mut")
+        exec(compile(text, path, "exec"), mod.__dict__)
+        return mod
+
+    @staticmethod
+    def page(n, total=None):
+        d = {"check_runs": [{"name": "c%d" % i} for i in range(n)]}
+        if total is not None:
+            d["total_count"] = total
+        return d
+
+    def run_pages(self, pages, mod=None):
+        mod = mod or load_ci_runs()
+        calls = []
+        def api(path):
+            calls.append(path)
+            return pages[len(calls) - 1] if len(calls) <= len(pages) else None
+        return mod.read_check_runs(api, "o/r", "a" * 40), calls
+
+    def refused(self, pages, mod=None):
+        (runs, why), calls = self.run_pages(pages, mod)
+        self.assertEqual(runs, [])
+        self.assertTrue(why, "a refusal")
+        self.assertIn("more than 500 check runs", why)
+        self.assertIn("a page failed", why)
+        return calls
+
+    def test_one_short_page_is_whole(self):
+        (runs, why), calls = self.run_pages([self.page(3, 3)])
+        self.assertEqual((len(runs), why, len(calls)), (3, None, 1))
+        (runs, why), calls = self.run_pages([self.page(3)])   # no total: a short page ends the read
+        self.assertEqual((len(runs), why), (3, None))
+
+    def test_full_pages_end_when_the_total_is_reached(self):
+        (runs, why), calls = self.run_pages([self.page(100, 200), self.page(100, 200)])
+        self.assertEqual((len(runs), why, len(calls)), (200, None, 2))
+        self.assertIn("page=2", calls[1])
+
+    def test_failed_first_page_is_refused_and_names_the_cap(self):
+        self.refused([None])
+
+    def test_failed_later_page_error_or_timeout_is_refused(self):
+        calls = self.refused([self.page(100, 300), None])   # api answers None on an error or a timeout
+        self.assertIn("page=2", calls[1])
+
+    def test_non_dict_body_is_refused(self):
+        for body in ([], "x", 7, [{"check_runs": []}]):
+            self.refused([body])
+
+    def test_wrong_typed_check_runs_is_refused(self):
+        for body in ({"check_runs": "x"}, {"check_runs": None}, {"check_runs": {"a": 1}}, {"total_count": 1}):
+            self.refused([body])
+
+    def test_short_middle_page_does_not_end_the_read_while_the_total_is_larger(self):
+        calls = self.refused([self.page(100, 300), self.page(50, 300)])   # page 3 fails: the read is not whole
+        self.assertEqual(len(calls), 3)
+
+    def test_short_page_with_a_wrong_typed_total_ends_the_read(self):
+        (runs, why), _ = self.run_pages([self.page(100, "x"), self.page(5, "x")])
+        self.assertEqual((len(runs), why), (105, None))
+
+    def test_page_cap_reached_is_refused(self):
+        calls = self.refused([self.page(100, 900)] * 5)
+        self.assertEqual(len(calls), 5)
+
+    def test_mutant_failed_page_read_as_empty_is_caught(self):
+        mod = self.src_module('        if not isinstance(got, list):\n            return [], cap_why()', '        if not isinstance(got, list):\n            got = []')
+        (runs, why), _ = self.run_pages([{"check_runs": "x"}], mod)
+        self.assertIsNone(why)   # the mutant reads a failed page as an empty, whole list
+        with self.assertRaises(AssertionError):
+            self.refused([{"check_runs": "x"}], mod)
+
+    def test_mutant_ignoring_the_cap_is_caught(self):
+        mod = self.src_module("    return [], cap_why()\n\n\ndef latest_check_runs", "    return runs, None\n\n\ndef latest_check_runs")
+        with self.assertRaises(AssertionError):
+            self.refused([self.page(100, 900)] * 5, mod)
+
+    # --- missing_workflows: every branch ---
+    def test_missing_workflows_branches(self):
+        ci = load_ci_runs()
+        self.assertEqual(ci.missing_workflows([{"workflowName": "ci"}], ["ci"]), [])
+        self.assertEqual(ci.missing_workflows([{"workflowName": "ci"}], ["ci", "lint"]), ['no run for workflow "lint"'])
+        self.assertEqual(ci.missing_workflows(None, ["ci"]), ['no run for workflow "ci"'])
+        self.assertEqual(ci.missing_workflows(["x"], ["ci"]), ['no run for workflow "ci"'])
+        self.assertEqual(ci.missing_workflows([{"workflowName": "ci"}], None), [])
+
+    def test_mutant_missing_workflows_never_names_is_caught(self):
+        mod = self.src_module("if w not in have]", "if False]")
+        self.assertEqual(mod.missing_workflows([], ["ci"]), [])   # the mutant; the test above asserts the name
+
+    # --- ci_workflows validation ---
+    def cfg(self, **entry):
+        return {"repos": {"o/r": entry}}
+
+    def validate(self, mod=None, **entry):
+        return (mod or sb.plan_ledger).validate_plan_gates(self.cfg(**entry), "c")["repos"]["o/r"]
+
+    def test_ci_workflows_absent_reads_as_before(self):
+        self.assertNotIn("ci_workflows", self.validate())
+
+    def test_ci_workflows_valid_lists(self):
+        self.assertEqual(self.validate(ci_workflows=["ci", "lint"])["ci_workflows"], ["ci", "lint"])
+        self.assertEqual(self.validate(ci_workflows=[])["ci_workflows"], [])
+        self.assertEqual(len(self.validate(ci_workflows=["w%d" % i for i in range(20)])["ci_workflows"]), 20)
+
+    def bad(self, value, mod=None):
+        with self.assertRaises(ValueError) as cm:
+            self.validate(mod, ci_workflows=value)
+        self.assertIn("ci_workflows", str(cm.exception))
+
+    def test_ci_workflows_not_a_list_is_refused(self):
+        for v in ("ci", {"a": 1}, 3, None, ("ci",)):
+            self.bad(v)
+
+    def test_ci_workflows_over_twenty_is_refused(self):
+        self.bad(["w%d" % i for i in range(21)])
+
+    def test_ci_workflows_non_string_or_empty_is_refused(self):
+        self.bad(["ci", 3])
+        self.bad(["ci", ""])
+        self.bad([None])
+
+    def test_unknown_sibling_key_is_still_refused(self):
+        with self.assertRaises(ValueError) as cm:
+            self.validate(ci_workflows=["ci"], bogus=1)
+        self.assertIn("bogus", str(cm.exception))
+
+    def plan_ledger_mut(self, old, new):
+        import types
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plan_ledger.py")
+        text = open(path).read()
+        assert old in text, old
+        mod = types.ModuleType("plan_ledger_mut")
+        mod.__file__ = path
+        exec(compile(text.replace(old, new, 1), path, "exec"), mod.__dict__)
+        return mod
+
+    def test_mutant_no_length_cap_is_caught(self):
+        mod = self.plan_ledger_mut("isinstance(flows, list) and len(flows) <= 20 and", "isinstance(flows, list) and")
+        self.validate(mod, ci_workflows=["w%d" % i for i in range(21)])   # the mutant accepts
+        with self.assertRaises(AssertionError):
+            self.bad(["w%d" % i for i in range(21)], mod)
+
+    def test_mutant_no_string_check_is_caught(self):
+        mod = self.plan_ledger_mut("all(isinstance(x, str) and x for x in flows)", "True")
+        self.validate(mod, ci_workflows=["ci", 3, ""])
+        with self.assertRaises(AssertionError):
+            self.bad(["ci", 3], mod)
+
+    def test_mutant_no_list_check_is_caught(self):
+        mod = self.plan_ledger_mut("isinstance(flows, list) and len(flows) <= 20 and all(", "len(flows) <= 20 and all(")
+        with self.assertRaises(AssertionError):
+            self.bad("ci", mod)   # the mutant accepts a string
+
+    # --- the gate's use of ci_workflows ---
+    def core(self, cfg, rollup):
+        import types
+        facts = sb.pr_facts_from({"state": "OPEN", "headRefOid": "a" * 40, "statusCheckRollup": rollup})
+        ctx = types.SimpleNamespace(unreadable=None, facts=facts, plan={"result": "pass", "scenarios_parsed": []}, plan_problem=None, engine=None, pr=1, config=cfg, repo="o/r")
+        return sb.ci_record_core(ctx, lambda: 0, quiet=True)
+
+    def test_gate_names_a_listed_workflow_without_a_run_and_leaves_an_unlisted_repo_alone(self):
+        ci = load_ci_runs()
+        ci._CACHE.clear()
+        old = ci.READER
+        ci.READER = lambda repo, run: (1, "push")
+        self.addCleanup(lambda: (setattr(ci, "READER", old), ci._CACHE.clear()))
+        chk = {"workflowName": "ci", "name": "b", "conclusion": "SUCCESS", "status": "COMPLETED", "startedAt": "2026-10-15T11:00:00Z",
+               "completedAt": "2026-10-15T11:30:00Z", "detailsUrl": "https://github.com/o/r/actions/runs/101/job/1"}
+        listed = {"plan_gates": {"repos": {"o/r": {"ci_workflows": ["ci", "deploy"]}}}}
+        got = self.core(listed, [chk])
+        self.assertEqual(got["status"], "not-green")
+        self.assertIn('no run for workflow "deploy"', got["why"])
+        self.assertEqual(self.core({"plan_gates": {"repos": {"o/r": {}}}}, [chk])["status"], "nothing")
+        self.assertEqual(self.core({}, [chk])["status"], "nothing")
+
+
 class TestLatestRunOfWorkflow(unittest.TestCase):
     """Ask #1237: for each workflow only the LATEST run counts, whatever the check names; pr_ci_of is the one reading ci-record and the gate share."""
 
