@@ -35489,7 +35489,7 @@ class TestRecordingCommands(LedgerBase):
 
     def test_a_command_that_reaches_a_ledger_append_is_a_recording_command_or_named_exempt(self):
         """Derived from the code: every `cmd_*` function that reaches a `plan_ledger.append_*` call, through the module's own functions, is marked or exempt."""
-        tree = ast.parse(SWITCHBOARD.read_text(encoding="utf-8"))
+        tree = ast.parse(switchboard_source())   # the whole daemon: the entry and every part
         funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
         def called(node):
             names = set()
@@ -35605,7 +35605,7 @@ class TestRecordingCommands(LedgerBase):
         flocks_outside = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "flock"
                           and not (helper.lineno <= n.lineno <= helper.end_lineno)]
         self.assertEqual(flocks_outside, [], "a ledger wait outside `_lock_exclusive` has no bound")
-        text = SWITCHBOARD.read_text(encoding="utf-8")
+        text = switchboard_source()   # the whole daemon: the entry and every part
         functions = {n.name: n for n in ast.parse(text).body if isinstance(n, ast.FunctionDef)}
         bad = []
         for name in ("run_recording", "cmd_prove", "cmd_verdict", "cmd_review", "_ledger_context", "_record", "_head_of"):
@@ -50126,7 +50126,7 @@ class ReaperOnlyFakes:
 
     def installer_functions(self):
         """The module-level functions the installer's steps call, from the code: a new one must be classified."""
-        tree = ast.parse((REPO / "bin" / "fleet-switchboard").read_text())
+        tree = ast.parse(switchboard_source())   # the entry and every part
         module = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
         installer = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Installer")
         called = {node.func.id for node in ast.walk(installer)
@@ -73452,7 +73452,7 @@ class TestReviewPostAndDismiss(LedgerBase):
 
     def test_the_marker_has_one_writer_and_the_existing_recording_paths_text_is_unchanged(self):
         self.assertEqual(sb.fleet_mark("rdr1"), "<!-- fleet-switchboard:from=rdr1 -->")
-        source = (REPO / "bin" / "fleet-switchboard").read_text()
+        source = switchboard_source()   # the entry and every part
         self.assertEqual(len(re.findall(r"fleet-switchboard:from=%s", source)), 1)   # the one function that builds the marker
         self.assertEqual(len(re.findall(r"def cmd_review_post", source)), 1)
 
@@ -73677,7 +73677,7 @@ class TestReviewPostAndDismiss(LedgerBase):
         self.assertIn("--review 77", out)
         self.assertTrue(any(p.endswith("&page=2") for p in self.reads))
         self.assertNotIn("latest[author] = (state", (REPO / "shims" / "gh").read_text())   # the rule is not restated in the shim
-        self.assertNotIn("latest[author] = (state", (REPO / "bin" / "fleet-switchboard").read_text())
+        self.assertNotIn("latest[author] = (state", switchboard_source())
 
     # -- the definitions and the documentation (S11)
 
@@ -80447,19 +80447,19 @@ class TestOwnerClearModule(unittest.TestCase):
             self.assertIs(getattr(sb, name).__globals__, vars(sb), name + " runs in the daemon's own globals, as before the move")
 
     def test_s5_s7_none_of_the_moved_functions_is_defined_in_the_daemon_file_and_one_registration_names_the_module(self):
-        source = self.daemon.read_text()
+        source = switchboard_source()   # the entry and every part: a moved function defined in any of them is named
         self.assertEqual(self.defined(source) & set(self.module.MOVED), set())
         self.assertEqual(source.count('load_module("impact_hold").bind('), 1)
 
     def test_s7_a_moved_function_copied_back_into_the_daemon_is_named(self):
         name = self.module.MOVED[0]
-        copied = self.daemon.read_text() + "\n\ndef %s(*args):\n    return None\n" % name
+        copied = switchboard_source() + "\n\ndef %s(*args):\n    return None\n" % name
         self.assertEqual(sorted(self.defined(copied) & set(self.module.MOVED)), [name])
 
     def test_s3_no_code_outside_the_matrix_names_a_top_tier_path_as_a_literal(self):
         import ast
         listed = {g for globs in self.matrix["owner_hold"]["top_tier_paths"].values() for g in globs}
-        files = sorted(BIN.glob("*.py")) + [self.daemon]
+        files = sorted(BIN.glob("*.py")) + list(SWITCHBOARD_SOURCE_FILES)   # the entry and every part, from the one list
         hits = []
         for path in files:
             for node in ast.walk(ast.parse(path.read_text())):
@@ -81653,7 +81653,7 @@ class TestAdoption(LanesCase):
         return found
 
     def sites(self):
-        names = ["bin/fleet-switchboard", "bin/switchboard/handoff.py"] + sorted(str(p.relative_to(REPO)) for p in (REPO / "bin").glob("*.py"))
+        names = [str(p.relative_to(REPO)) for p in SWITCHBOARD_SOURCE_FILES] + sorted(str(p.relative_to(REPO)) for p in (REPO / "bin").glob("*.py"))   # the entry and every part, from the one list
         return self.scan({rel: (REPO / rel).read_text() for rel in names})
 
     def test_every_reader_of_a_workers_boss_is_in_the_table_and_the_table_has_no_stale_member(self):   # S15
@@ -90467,7 +90467,7 @@ class TestNoPaneToJudge(StandInPids, Base):
             self.assertEqual(self.readers_without_the_predicate(source, exempt=self.READER_FUNCTIONS), [], name)
         reconcile = (BIN / "agent_reconcile.py").read_text()
         self.assertIn("no_pane_to_judge", reconcile)
-        self.assertGreaterEqual(len(self.readers_with(( BIN / "fleet-switchboard").read_text())), 4)
+        self.assertGreaterEqual(len(self.readers_with(switchboard_source())), 4)   # the entry and every part
 
     def readers_with(self, source):
         import ast
@@ -90510,7 +90510,7 @@ class TestNoPaneToJudge(StandInPids, Base):
         return sorted(out)
 
     def test_every_guard_block_holds_the_predicate_or_is_in_the_exact_exemption_table(self):
-        source = (BIN / "fleet-switchboard").read_text()
+        source = switchboard_source()   # the entry and every part
         hb = (BIN / "fleet-heartbeat").read_text()
         exempt = set(self.READER_FUNCTIONS)
         got = self.blocks_without_the_predicate(source, exempt_functions=exempt)
@@ -90629,7 +90629,7 @@ class TestNoPaneToJudge(StandInPids, Base):
             self.assertEqual(self.live.check("platform", row, 0.3, lambda n, l: True)["verdict"], "alive")   # the mutant: the real test above forbids this
 
     def test_mutant_the_pass_calling_the_check_again_is_caught(self):
-        source = (BIN / "fleet-switchboard").read_text()
+        source = switchboard_source()   # the entry and every part
         self.assertNotIn("endpoint_liveness", source)
         self.assertNotIn("row_liveness", source)
 
