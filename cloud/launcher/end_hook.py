@@ -35,7 +35,9 @@ def safe_opts(helper):
     pins = ["core.hooksPath=/dev/null", "core.fsmonitor=false", "core.sshCommand=false", "protocol.ext.allow=never",
             "core.pager=cat", "diff.external=", "core.attributesFile=/dev/null", "http.proxy=", "http.extraHeader=",
             "core.gitProxy=", "core.askPass=", "http.sslVerify=true", "http.followRedirects=false", "credential.useHttpPath=true",
-            "credential.helper=", "credential.helper=" + helper]
+            "credential.helper=", "credential.helper=" + helper,
+            # an automatic gc/maintenance run must never happen inside the hook (gc has keys that run a program)
+            "gc.auto=0", "maintenance.auto=false", "receive.autogc=false"]
     return [x for pin in pins for x in ("-c", pin)]
 
 
@@ -98,7 +100,9 @@ class ConfigRefused(Exception):
 ALLOWED_KEYS = {"core.repositoryformatversion", "core.filemode", "core.bare", "core.logallrefupdates", "core.ignorecase",
                 "core.precomposeunicode", "core.symlinks", "user.name", "user.email", "remote.origin.url", "remote.origin.pushurl",
                 "remote.origin.fetch", "init.defaultbranch", "receive.denycurrentbranch"}
-ALLOWED_RE = re.compile(r"^(?:branch\..+\.(?:remote|merge)|(?:gc|pack)\.[^.]+)$")
+# NO wildcard section: gc.* and pack.* are gone (gc.recentObjectsHook runs a command). The only pattern is the two exact named forms
+# branch.<name>.remote (value origin or .) and branch.<name>.merge (value refs/heads/...).
+BRANCH_RE = re.compile(r"^branch\.(.+)\.(remote|merge)$")
 
 
 def config_refusal(workdir, repo, ctx):
@@ -117,11 +121,14 @@ def config_refusal(workdir, repo, ctx):
         shown = "".join(c if c.isprintable() else "?" for c in key)[:60]
         if origin not in own:
             raise ConfigRefused(shown)
-        if key not in ALLOWED_KEYS and not ALLOWED_RE.match(key):
+        if key not in ALLOWED_KEYS and not BRANCH_RE.match(key):
             raise ConfigRefused(shown)
         if key in ("remote.origin.url", "remote.origin.pushurl") and norm_repo(value) != repo.lower():
             raise OriginElsewhere()
-        if re.match(r"^branch\..+\.remote$", key) and value not in ("origin", "."):
+        m = BRANCH_RE.match(key)
+        if m and m.group(2) == "remote" and value not in ("origin", "."):
+            raise ConfigRefused(shown)
+        if m and m.group(2) == "merge" and not value.startswith("refs/heads/"):
             raise ConfigRefused(shown)
 
 

@@ -371,7 +371,10 @@ GRAMMAR = {
         ("filter.evil.process", "{SCRIPT}"), ("diff.evil.textconv", "{SCRIPT}"), ("diff.evil.command", "{SCRIPT}"),
         ("merge.evil.driver", "{SCRIPT}"), ("gpg.program", "{SCRIPT}"), ("sendemail.smtpServer", "{SCRIPT}"), ("alias.push", "!{SCRIPT}"),
         ("protocol.ext.allow", "always"), ("protocol.allow", "always"), ("uploadpack.packObjectsHook", "{SCRIPT}"),
-        ("remote.origin.receivepack", "{SCRIPT}"), ("remote.origin.uploadpack", "{SCRIPT}")],
+        ("remote.origin.receivepack", "{SCRIPT}"), ("remote.origin.uploadpack", "{SCRIPT}"),
+        ("gc.recentObjectsHook", "{SCRIPT}"), ("gc.cruftPacks", "true"), ("gc.auto", "1"), ("pack.packSizeLimit", "1"),
+        ("gc.autoDetach", "false"), ("gc.pruneExpire", "now"), ("pack.threads", "1"), ("maintenance.auto", "true"),
+        ("receive.autogc", "true"), ("branch.main.merge", "x")],
     "change what is sent or to whom": [
         ("http.proxy", "http://other.example:3128"), ("http.https://github.com/.proxy", "http://other.example:3128"),
         ("http.extraHeader", "X-Evil: 1"), ("http.https://github.com/.extraHeader", "X-Evil: 1"), ("http.followRedirects", "true"),
@@ -581,9 +584,9 @@ class Grammar(Base):
 
     def test_mutants_are_each_caught(self):
         muts = {
-            "allow-list removed": ("local_insteadof", [("if key not in ALLOWED_KEYS and not ALLOWED_RE.match(key):", "if False:")]),
+            "allow-list removed": ("local_insteadof", [("if key not in ALLOWED_KEYS and not BRANCH_RE.match(key):", "if False:")]),
             "global config not pinned": ("global", [('"GIT_CONFIG_" + "GLOBAL": "/dev/null"', '"GIT_CONFIG_" + "GLOBAL": os.environ.get("GIT_CONFIG_" + "GLOBAL", "/dev/null")')]),
-            "credential reset removed": ("pins", [('"credential.helper=", "credential.helper=" + helper]', '"credential.helper=" + helper]')]),
+            "credential reset removed": ("pins", [('"credential.helper=", "credential.helper=" + helper,', '"credential.helper=" + helper,')]),
             "includes not followed": ("include", [('"--includes", ', ""), ('ALLOWED_KEYS = {', 'ALLOWED_KEYS = {"include.path", ')]),
             "environment not scrubbed": ("variables", [("if k in KEEP_ENV}", "if True}")]),
             "explicit URL replaced by origin": ("pins", [('git(workdir, "push", "--no-verify", url,', 'git(workdir, "push", "--no-verify", "origin",')]),
@@ -617,6 +620,89 @@ class Grammar(Base):
         self.assertIn("the pod's credential helper was not found", p.stdout)
         self.assertEqual((self.wip(), self.calls_list()), ("", []))
 
+
+
+class AutoGc(Base):
+    """The reader's high: a repo-local gc.recentObjectsHook runs a program when an auto-gc fires inside the hook."""
+
+    def gc_repo(self, extra=()):
+        script = os.path.join(self.t, "gcscript")
+        self.marker = os.path.join(self.t, "gcmarker")
+        cfg = os.path.join(self.work, ".git", "config")
+        if not hasattr(self, "plain_cfg"):
+            self.plain_cfg = open(cfg).read()
+            open(script, "w").write("#!/bin/sh\necho ran >> %s\nexit 1\n" % self.marker)
+            os.chmod(script, 0o755)
+            # loose (unreachable) objects so that an auto-gc has a reason to run: gc.auto=1 fires at more than one loose object in objects/17
+            n, d = 0, os.path.join(self.work, ".git", "objects", "17")
+            while len(os.listdir(d)) < 3 if os.path.isdir(d) else True:
+                n += 1
+                subprocess.run([GIT, "-C", self.work, "hash-object", "-w", "--stdin"], input="loose %d" % n, text=True, capture_output=True, check=True)
+        with open(cfg, "w") as f:
+            f.write(self.plain_cfg)
+        if os.path.exists(self.marker):
+            os.remove(self.marker)
+        for k, v in (("gc.auto", "1"), ("gc.autoDetach", "false"), ("gc.pruneExpire", "now"), ("gc.recentObjectsHook", script)):
+            sh("git", "-C", self.work, "config", "--" + "add", k, v)
+
+    def test_gc_keys_in_the_repository_are_refused_and_the_script_never_runs(self):
+        for key, value in (("gc.recentObjectsHook", None), ("gc.cruftPacks", "true"), ("pack.packSizeLimit", "1"), ("gc.auto", "1")):
+            with self.subTest(key=key):
+                self.gc_repo([])
+                if value is not None:
+                    sh("git", "-C", self.work, "config", "--" + "add", key, value)
+                p = subprocess.run([self.seam(HOOK), "--prestop"], env=self.env(), capture_output=True, text=True)
+                self.assertFalse(os.path.exists(self.marker), "the gc hook ran")
+                self.assertIn("not a plain one: ", p.stdout)
+                self.assertEqual(self.wip(), "")
+
+    def test_the_pins_stop_an_auto_gc_even_when_the_allow_list_lets_the_key_through(self):
+        # the pins alone: run git with the hook's pinned options inside a repo that has the hostile keys
+        self.gc_repo([])
+        ctx = cw_end_hook.Ctx(self.helper)
+        self.addCleanup(ctx.close)
+        ctx.env["PATH"] = "/usr/bin:/bin"
+        cw_end_hook.git(self.work, "commit", "--allow-empty", "-qm", "e", ctx=ctx)
+        cw_end_hook.git(self.work, "fetch", "--prune", "file://" + self.origin, "+refs/heads/*:refs/remotes/origin/*", ctx=ctx)
+        self.assertFalse(os.path.exists(self.marker), "an auto-gc ran inside the hook's git call")
+        # and the unpinned call does fire it (the fixture really triggers gc)
+        sh("git", "-C", self.work, "commit", "-q", "--allow-empty", "-m", "f")
+        self.assertTrue(os.path.exists(self.marker), "the fixture does not trigger an auto-gc: the test proves nothing")
+
+    def variant(self, text, name):
+        mut = os.path.join(self.t, "mut-" + name)
+        open(mut, "w").write(text)
+        self.assertNotEqual(text, open(HOOK).read(), name)
+        if os.path.exists(self.marker):
+            os.remove(self.marker)
+        self.dirty()
+        p = subprocess.run([self.seam(mut), "--prestop"], env=self.env(), capture_output=True, text=True)
+        self.refused = "not a plain one" in p.stdout
+        ran = os.path.exists(self.marker)
+        sh("git", "-C", self.work, "reset", "-q", "--hard", self.head)
+        sh("git", "-C", self.work, "clean", "-qfd")
+        return ran
+
+    def test_mutants_wildcard_restored_and_gc_pin_removed_are_caught(self):
+        s = open(HOOK).read()
+        check = "if key not in ALLOWED_KEYS and not BRANCH_RE.match(key):"
+        pin = '"gc.auto=0", '
+        self.assertIn(check, s)
+        self.assertIn(pin, s)
+        self.gc_repo([])
+        self.head = sh("git", "-C", self.work, "rev-parse", "HEAD")
+        self.assertFalse(self.variant(s + "\n", "original"), "the real hook ran the gc script")
+        self.assertTrue(self.refused)
+        wild = s.replace(check, "if key not in ALLOWED_KEYS and not BRANCH_RE.match(key) and not re.match(r'^(gc|pack)[.][^.]+$', key):")
+        self.assertFalse(self.variant(wild, "wildcard"), "the pins stop the script even then")
+        self.assertFalse(self.refused, "a restored wildcard still refuses gc.recentObjectsHook: the refusal test would not catch it")
+        # the allow-list bypassed ALONE: the pins still stop the gc; with the gc.auto pin removed too the script runs
+        self.assertFalse(self.variant(s.replace(check, "if False:"), "bypass"), "the pins alone did not stop the auto-gc")
+        self.assertTrue(self.variant(s.replace(check, "if False:").replace(pin, "").replace('"maintenance.auto=false", ', "").replace(', "receive.autogc=false"', ""), "bypass-nopin"),
+                        "removing the gc pins is not caught")
+        # each pin alone is enough (belt and braces): removing ONE leaves the gc stopped
+        for one in (pin, '"maintenance.auto=false", ', ', "receive.autogc=false"'):
+            self.assertFalse(self.variant(s.replace(check, "if False:").replace(one, ""), "bypass-one"), one)
 
 
 class LaunchSequence(Base):
