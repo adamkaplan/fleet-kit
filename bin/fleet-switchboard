@@ -28022,9 +28022,10 @@ REAPER_FILE_MODE = 0o600   # the reaper's service file is private: it holds name
 CLOUD_SETTINGS_FILE_NAME = "cloud.env"
 CLOUD_ENV_SETTING_NAMES = ("CW_ALLOWED_REPOS", "CW_TOOLING_REPO", "CW_CLOUD_IMAGE", "CW_CLOUD_SERVER", "CW_CLOUD_CA_FILE",
                             "CW_PULL_SECRET", "CW_VAULT_SUBSCRIPTION", "CW_VAULT_NAME", "CW_CLOUD_NAMESPACE", "CW_KUBECTL",
-                            "CW_MODEL_AUTH_FILE", "CW_RUN_RECORD_DIR", "CW_CLOUD_SPEND_CAP_USD", "CW_CLUSTER_TOKEN_CMD",
+                            "CW_OPENCODE_BIN", "CW_RUN_RECORD_DIR", "CW_CLOUD_SPEND_CAP_USD", "CW_CLUSTER_TOKEN_CMD",
                             "CW_CLUSTER_ADMIN_CMD", "CW_GIT_TOKEN_CMD", "CW_APP_ID_CMD", "CW_APP_INSTALLATION_CMD",
-                            "CW_APP_KEY_CMD", "CW_CLUSTER_ADMIN_SECRET", "CW_CLUSTER_TOKEN_DURATION", "CW_VAULT_CHECK_DIR")
+                            "CW_APP_KEY_CMD", "CW_CLUSTER_ADMIN_SECRET", "CW_CLUSTER_TOKEN_DURATION", "CW_HUB_CHANNEL_URL",
+                            "CW_HUB_REGISTRY_SECRET", "CW_VAULT_CHECK_DIR")
 REAPER_CLUSTER_NAMES = ("CW_CLOUD_SERVER", "CW_CLOUD_NAMESPACE", "CW_CLOUD_TOKEN_FILE")   # the cluster login the reaper needs (the token file: the install's environment, else a default)
 REAPER_VAULT_NAMES = ("CW_VAULT_NAME", "CW_VAULT_SUBSCRIPTION")   # the vault names (CW_CLUSTER_ADMIN_SECRET has a default: optional)
 # The reaper's NON-SECRET settings the installer copies from its own environment into the service (names of a cluster or a
