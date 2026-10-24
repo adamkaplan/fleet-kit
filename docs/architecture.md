@@ -127,7 +127,7 @@ Kinds (the number is exact: see rule 7): `namespace` (a part uses names the entr
 
 This is a closed, conservative rule. It over-counts by design and fails closed: a use the test did not foresee is a site, not silence.
 
-**What is a site.** Any `import` or `from ... import` of a module that can load code by name: `importlib` (and `importlib.util`, `importlib.machinery`), `pkgutil`, `runpy`, `pydoc`, `imp`, `zipimport`, `builtins`; any use of a name bound to one of them (the module object itself, however it is reached: a call, an attribute, `getattr`, a subscript, `vars(...)`, `__dict__`, `operator.attrgetter`, an argument, an alias, `m = importlib`); any use of `sys` other than its plain attributes `argv`, `executable`, `exit`, `path`, `platform`, `stderr`, `stdin`, `stdout` and `version_info` (so `sys.modules` however it is reached, `sys.__dict__`, `vars(sys)`, `getattr(sys, ...)`, `m = sys`, `from sys import modules` or `*`, `from X import sys`, `os.sys`, and the module object returned by `__import__("sys")` all count); `builtins` and `__builtins__`; the builtins `__import__`, `exec`, `eval` and `compile`, and the daemon's own `load_module` (also as `obj.load_module(...)` on any object), as a call with a non-constant, relative (leading dot) or package argument, as a reference (a default, a class attribute, a dict value, a conditional, a tuple, a walrus, an argument of `map` or `functools.partial`), or named by a string key (`globals()["__import__"]`, `getattr(x, "exec")`, `g["__builtins__"]`), or reached as an attribute of any object (`obj.load_module(...)`, `g["__builtins__"].__import__(...)`, `.eval(...)`; `re.compile` is not one); and a relative import of level two or more.
+**What is a site.** Any `import` or `from ... import` of a module that can load code by name: `importlib` (and `importlib.util`, `importlib.machinery`), `pkgutil`, `runpy`, `pydoc`, `imp`, `zipimport`, `builtins`; any use of a name bound to one of them (the module object itself, however it is reached: a call, an attribute, `getattr`, a subscript, `vars(...)`, `__dict__`, `operator.attrgetter`, an argument, an alias, `m = importlib`); any use of `sys` other than its plain attributes `argv`, `executable`, `exit`, `path`, `platform`, `stderr`, `stdin`, `stdout` and `version_info` (so `sys.modules` however it is reached, `sys.__dict__`, `vars(sys)`, `getattr(sys, ...)`, `m = sys`, `from sys import modules` or `*`, `from X import sys`, `os.sys`, and the module object returned by `__import__("sys")` all count); `builtins` and `__builtins__`; the builtins `__import__`, `exec`, `eval` and `compile`, and the daemon's own `load_module` (also as `obj.load_module(...)` on any object), as a call with a non-constant, relative (leading dot) or package argument, as a reference (a default, a class attribute, a dict value, a conditional, a tuple, a walrus, an argument of `map` or `functools.partial`), or named by a string anywhere (a key, an argument, `.get("__import__")`, `itemgetter`, `getattr(x, "exec")`, `g["__builtins__"]`, a name in a list: any string that is exactly one of these names counts), or reached as an attribute of any object (`obj.load_module(...)`, `g["__builtins__"].__import__(...)`, `.eval(...)`; `re.compile` is not one); and a relative import of level two or more.
 
 **What is followed.** Only a direct call with a constant module name, spelled as such: `__import__("x")`, `importlib.import_module("x")`, `from importlib import import_module` then `import_module("x")`, and `load_module("x")`; and the `load_x()` helpers. Everything else is a site, and the import statement of the module still counts as one.
 
@@ -139,17 +139,19 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 |---|---|---|---|
 | `agent_reconcile.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name |
 | `agent_reconcile.py` | `_load_registry:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `charter_check.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
+| `closed_labels.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `cloud_worker.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name |
 | `cloud_worker.py` | `_lib:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
-| `cloud_worker.py` | `_registry_note:load_module(string)` | 1 | a dynamic load |
+| `cloud_worker.py` | `_registry_note:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `cloud_worker.py` | `_walk:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
-| `cloud_worker.py` | `bind:sys.modules` | 1 | reads `sys.modules` |
+| `cloud_worker.py` | `bind:sys.modules` | 1 | uses `sys` beyond its plain attributes |
 | `cloud_worker.py` | `model_entry:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `cpu_guard.py` | `slots_text:import(importlib)` | 1 | imports a module that can load code by name |
 | `cpu_guard.py` | `slots_text:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `external_adapter.py` | `<module>:import(importlib)` | 1 | imports a module that can load code by name |
 | `external_adapter.py` | `_load_core:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
-| `external_adapter.py` | `_load_core:sys.modules` | 3 | reads `sys.modules` |
+| `external_adapter.py` | `_load_core:sys.modules` | 3 | uses `sys` beyond its plain attributes |
 | `fleet-switchboard` | `<module>:import(importlib)` | 1 | imports a module that can load code by name |
 | `fleet-switchboard` | `Installer.reaper_command_problem:import(importlib)` | 1 | imports a module that can load code by name |
 | `fleet-switchboard` | `Installer.reaper_command_problem:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
@@ -157,11 +159,17 @@ A site is listed by the function it sits in and its kind, with a count: `import(
 | `fleet-switchboard` | `_declared_module:load_module(non-constant)` | 1 | a dynamic load |
 | `fleet-switchboard` | `_fleet_parts:compile` | 1 | compiles a part's text |
 | `fleet-switchboard` | `_fleet_parts:exec` | 1 | execs text |
+| `fleet-switchboard` | `_fleet_parts:exec(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
 | `fleet-switchboard` | `_make_loader.loader:load_module(non-constant)` | 1 | a dynamic load |
 | `fleet-switchboard` | `launcher_module:import(importlib)` | 1 | imports a module that can load code by name |
 | `fleet-switchboard` | `launcher_module:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `load_module:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
-| `fleet-switchboard` | `load_module:sys.modules` | 4 | reads `sys.modules` |
+| `fleet-switchboard` | `load_module:sys.modules` | 4 | uses `sys` beyond its plain attributes |
 | `fleet-switchboard` | `load_review_rule:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `validate_app_config:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
 | `fleet-switchboard` | `validate_hold_labels_config:importlib` | 2 | uses the module object (a call, an attribute, an argument) |
+| `lanes.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
+| `merged_labels.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
+| `orders_copy.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
+| `queue_ejections.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |
+| `reassign.py` | `<module>:load_module(string)` | 1 | names a loading builtin by a string (a name in a list counts: over-counting by design) |

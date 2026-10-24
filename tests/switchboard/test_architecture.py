@@ -161,7 +161,7 @@ def _direct_constant(call):
     arg = call.args[0] if call.args else None
     if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)) or arg.value.startswith(".") or not arg.value:
         return None
-    if len(call.args) > 1 or any(k.arg in ("package", "globals", "locals", "fromlist", "level") for k in call.keywords):
+    if len(call.args) > 1 or any(k.arg is None or k.arg in ("package", "globals", "locals", "fromlist", "level") for k in call.keywords):
         return None
     return arg.value
 
@@ -289,11 +289,8 @@ def dynamic_uses(path):
                 relative = isinstance(first, ast.Constant) and isinstance(first.value, str) and (first.value.startswith(".") or len(call.args) > 1 or bool(call.keywords))
                 kind = node.attr + ("(relative)" if relative else "(non-constant)")
             uses.append((node.lineno, scope, kind, "site", None))
-        elif isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) and node.slice.value in NAMED_BY_STRING:
-            uses.append((node.lineno, scope, "%s(string)" % node.slice.value, "site", None))   # globals()["__import__"], builtins.__dict__["exec"]
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr" and len(node.args) >= 2 \
-                and isinstance(node.args[1], ast.Constant) and node.args[1].value in NAMED_BY_STRING:
-            uses.append((node.lineno, scope, "%s(string)" % node.args[1].value, "site", None))
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in NAMED_BY_STRING:
+            uses.append((node.lineno, scope, "%s(string)" % node.value, "site", None))   # a loading builtin or `__builtins__` named by a string, wherever it is used
     return sorted(uses, key=lambda u: (u[0], u[2], u[3]))
 
 
@@ -702,7 +699,7 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
         "reload": ("import importlib\n\ndef f(m):\n    importlib.reload(m)\n", [IM, "f:importlib"]),
         "exec of text": ("def f(text):\n    exec(text)\n", ["f:exec"]),
         "eval of text": ("def f(text):\n    return eval(text)\n", ["f:eval"]),
-        "compile of text": ("def f(text):\n    return compile(text, 'x', 'exec')\n", ["f:compile"]),
+        "compile of text": ("def f(text):\n    return compile(text, 'x', 'exec')\n", ["f:compile", "f:exec(string)"]),   # the mode string is a use of the name too: over-counting by design
         "builtins.exec": ("import builtins\n\ndef f(text):\n    builtins.exec(text)\n", ["<module>:import(builtins)", "f:builtins"]),
         "constant exec": ("def f():\n    exec('import high')\n", ["f:exec"]),
         # round 1: what the primitive is BOUND to
@@ -750,6 +747,13 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
         "getattr for the builtins": ("def f(g):\n    return getattr(g, '__builtins__')\n", ["f:__builtins__(string)"]),
         "a loading builtin as an attribute of any object": ("def f(o):\n    return o.__import__\n", ["f:__import__(reference)"]),
         "exec as an attribute of any object": ("def f(o, t):\n    o.exec(t)\n", ["f:exec"]),
+        "the builtin by its string key through .get": ("def f(n):\n    return globals().get('__import__')(n)\n", ["f:__import__(string)"]),
+        "the builtins module by its string key through .get": ("def f():\n    return globals().get('__builtins__')\n", ["f:__builtins__(string)"]),
+        "the builtin by its string key through .pop": ("def f(d):\n    return d.pop('exec')\n", ["f:exec(string)"]),
+        "the builtin by its string key through setdefault": ("def f(d):\n    return d.setdefault('eval', None)\n", ["f:eval(string)"]),
+        "the builtin by its string key through itemgetter": ("import operator\n\ndef f(n):\n    return operator.itemgetter('__import__')(globals())(n)\n", ["f:__import__(string)"]),
+        "a loading builtin as a dict key": ("TABLE = {'compile': 1}\n", ["<module>:compile(string)"]),
+        "a constant name with **kwargs": ("import importlib\n\ndef f(kw):\n    return importlib.import_module('high', **kw)\n", [IM, "f:importlib"]),
         "star import of sys": ("from sys import *\n", ["<module>:import(sys.*)"]),
         "star import of a loader module": ("from importlib import *\n", [IM]),
         "load_module on an object": ("def f(loader, n):\n    return loader.load_module(n)\n", ["f:load_module(non-constant)"]),
@@ -761,7 +765,7 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
         "__dict__ of builtins": ("import builtins\n\ndef f(n):\n    return builtins.__dict__['__import__'](n)\n", ["<module>:import(builtins)", "f:builtins", "f:__import__(string)"]),
         "pkgutil.resolve_name": ("import pkgutil\n\ndef f(n):\n    return pkgutil.resolve_name(n)\n", ["<module>:import(pkgutil)", "f:pkgutil"]),
         "pydoc.locate": ("import pydoc\n\ndef f(n):\n    return pydoc.locate(n)\n", ["<module>:import(pydoc)", "f:pydoc"]),
-        "operator.attrgetter on the module": ("import importlib, operator\n\ndef f():\n    return operator.attrgetter('import_module')(importlib)('high')\n", [IM, "f:importlib"]),
+        "operator.attrgetter on the module": ("import importlib, operator\n\ndef f():\n    return operator.attrgetter('import_module')(importlib)('high')\n", [IM, "f:importlib", "f:import_module(string)"]),
         "zipimport": ("import zipimport\n\ndef f(p):\n    return zipimport.zipimporter(p)\n", ["<module>:import(zipimport)", "f:zipimport"]),
         "builtins bound to another name": ("import builtins\nb = builtins\n\ndef f(t):\n    b.exec(t)\n", ["<module>:import(builtins)", "<module>:builtins", "f:exec"]),
         "spec_from_loader": ("from importlib.util import spec_from_loader\n\ndef f(l):\n    return spec_from_loader('x', l)\n", [IM, "f:importlib"]),
@@ -798,7 +802,7 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
             "a local variable named like a module that is not imported": "def f(imp):\n    return imp.x\n",
             "re.compile": "import re\nP = re.compile('x')\n",
             "reload on another object": "def f(x):\n    return x.reload()\n",
-            "re.compile as an attribute": "import re\nP = re.compile('x')\n",
+            "regex.compile as an attribute": "import regex\nP = regex.compile('x')\n",
         }
         for attribute in SAFE_SYS:
             outside["sys.%s" % attribute] = "import sys\n\ndef f():\n    return sys.%s\n" % attribute
