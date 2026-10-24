@@ -15,6 +15,9 @@ bin_cw = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bin_cw)
 
 
+USER_SHAPES = {k: v for k, v in cw.SHAPES.items() if not v.get("role_only")}   # what --shape may name; a role_only row (ORCH) is a role's own size
+
+
 def read(rel):
     with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
         return f.read()
@@ -47,7 +50,7 @@ class Shapes(base.Base):
 
     # S4: the default, the names, the stack launch
     def test_s4_no_shape_is_xs_and_a_name_is_what_it_names(self):
-        for name, row in cw.SHAPES.items():
+        for name, row in USER_SHAPES.items():
             with self.subTest(shape=name):
                 pod = self.made("--shape", name)
                 self.assertEqual(limits(pod)["limits"], {"cpu": row["cpu"], "memory": row["memory"]})
@@ -64,7 +67,7 @@ class Shapes(base.Base):
 
     def test_every_stack_row_can_run_a_stack_and_the_others_are_refused_first(self):
         self.assertTrue(cw.SHAPES[cw.DEFAULT_STACK_SHAPE]["stack"])
-        for name, row in cw.SHAPES.items():
+        for name, row in USER_SHAPES.items():
             with self.subTest(shape=name):
                 self.write_state({"pods": {}})
                 code, out, err = self.run_cli("create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main", "--stack", "--shape", name)
@@ -84,16 +87,50 @@ class Shapes(base.Base):
                 code, out, err = self.run_cli("create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main", "--shape", bad)
                 self.assertEqual(code, 2, err)
                 self.assertEqual(self.calls(), [])
-                for name in cw.SHAPES:
+                for name in USER_SHAPES:
                     self.assertIn(name, err)
 
     # U3: finite limits on every row
     def test_u3_every_shape_renders_finite_limits_equal_to_its_row(self):
-        for name, row in cw.SHAPES.items():
+        for name, row in USER_SHAPES.items():
             with self.subTest(shape=name):
                 lim = limits(self.made("--shape", name))["limits"]
                 self.assertEqual(lim, {"cpu": row["cpu"], "memory": row["memory"]})
                 self.assertTrue(lim["cpu"] and lim["memory"])
+
+    def test_orch_is_a_role_only_row_and_the_orchestrator_role_renders_it(self):
+        row = cw.SHAPES["ORCH"]
+        self.assertEqual((row["cpu"], row["memory"], row.get("role_only")), ("250m", "768Mi", True))
+        self.assertNotIn("ORCH", USER_SHAPES)
+        self.assertEqual(cw.ROLES["orchestrator"]["shape"], "ORCH")
+        args = argparse.Namespace(repo="acme-org/widget-service", branch="main", idle="10m", image="registry.example.internal/acme/worker@sha256:" + "0" * 64,
+                                  role="orchestrator", shape=None, stack=False, agent=None, boss=None, max_hard=None, hard=None)
+        import datetime as dt
+        now = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        pod = cw.render_pod(args, "coder7", "cw-coder7", now, None, {}, ["git-token"])
+        self.assertEqual(limits({"spec": pod["spec"]})["limits"], {"cpu": "250m", "memory": "768Mi"})
+        self.assertEqual(pod["metadata"]["annotations"]["cw/shape"], "ORCH")
+
+    def refuses_orch(self):
+        """True when `--shape ORCH` is refused before any call, naming exactly the user-selectable shapes."""
+        if os.path.exists(self.env["FAKE_KUBE_CALLS"]):
+            os.remove(self.env["FAKE_KUBE_CALLS"])
+        code, out, err = self.run_cli("create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main", "--shape", "ORCH")
+        return code == 2 and self.calls() == [] and "shape must be one of %s" % ", ".join(USER_SHAPES) in err
+
+    def test_shape_orch_is_refused_for_a_user_launch_listing_the_user_shapes(self):
+        self.assertEqual(list(USER_SHAPES), ["XS", "S", "M"])
+        self.assertTrue(self.refuses_orch())
+
+    def test_a_check_without_the_role_only_exclusion_accepts_orch(self):
+        def no_exclusion(a):
+            if getattr(a, "shape", None) is None:
+                a.shape = cw.DEFAULT_SHAPE
+            if a.shape not in cw.SHAPES:
+                raise cw.CloudError("shape must be one of %s" % ", ".join(USER_SHAPES), cw.EXIT_USAGE)
+        with self.patched("check_shape", no_exclusion):
+            self.assertFalse(self.refuses_orch())
+        self.assertTrue(self.refuses_orch())
 
     def test_the_cost_of_an_unnamed_worker_is_half_an_s_pod(self):
         self.assertEqual(cw.SHAPES["XS"]["usd_per_hour"] * 2, cw.SHAPES["S"]["usd_per_hour"])
@@ -177,11 +214,11 @@ class Parity(unittest.TestCase):
         return re.findall(r"\b(XS|S|M|L)\b", text)
 
     def test_the_switchboard_launch_check_lists_the_table(self):
-        self.assertEqual(set(bin_cw.LAUNCHER_SHAPES), set(cw.SHAPES))
-        self.assertEqual(set(bin_cw.LAUNCHER_STACK_SHAPES), {k for k, v in cw.SHAPES.items() if v["stack"]})
+        self.assertEqual(set(bin_cw.LAUNCHER_SHAPES), set(USER_SHAPES))
+        self.assertEqual(set(bin_cw.LAUNCHER_STACK_SHAPES), {k for k, v in USER_SHAPES.items() if v["stack"]})
 
     def test_the_launch_preflight_refuses_stack_with_each_non_stack_row(self):
-        for name, row in cw.SHAPES.items():
+        for name, row in USER_SHAPES.items():
             with self.subTest(shape=name):
                 refused = name not in bin_cw.LAUNCHER_STACK_SHAPES
                 self.assertEqual(refused, not row["stack"])
@@ -189,23 +226,25 @@ class Parity(unittest.TestCase):
     def test_the_fake_launcher_and_the_help_texts_read_the_table(self):
         fake = read("bin/test-cloud-worker")
         self.assertIn('if "--shape" in argv else "%s"' % cw.DEFAULT_SHAPE, fake)
-        self.assertIn("shape not in (%s)" % ", ".join('"%s"' % k for k in cw.SHAPES), fake)
+        self.assertIn("shape not in (%s)" % ", ".join('"%s"' % k for k in USER_SHAPES), fake)
         help_text = [a for a in cw.build_parser()._subparsers._group_actions[0].choices["create"]._actions if a.dest == "shape"][0].help
-        for name in cw.SHAPES:
+        for name in USER_SHAPES:
             self.assertIn(name, help_text)
         self.assertIn("unset: %s" % cw.DEFAULT_SHAPE, help_text)
         launch = re.search(r'launch\.add_argument\("--shape", help="([^"]*)"', read("bin/" + "fl" + "eet-switchboard")).group(1)
-        for name, row in cw.SHAPES.items():
+        for name, row in USER_SHAPES.items():
             self.assertIn("%s (%s CPU, %s GiB" % (name, row["cpu"], row["memory"][:-2]), launch)
         self.assertIn("%s (1 CPU, 2 GiB; the launcher's default" % cw.DEFAULT_SHAPE, launch)
 
     def test_the_docs_list_every_shape_and_say_the_default(self):
         text = read("docs/cloud-operator-quickstart.md")
-        for name, row in cw.SHAPES.items():
+        for name, row in USER_SHAPES.items():
             self.assertIn("`%s` (%s CPU, %s GiB)" % (name, row["cpu"], row["memory"][:-2]), text, name)
         interface = read("docs/cloud-worker-interface.md")
-        self.assertIn("`--shape %s`" % "\\|".join(cw.SHAPES), interface)
+        self.assertIn("`--shape %s`" % "\\|".join(USER_SHAPES), interface)
         self.assertIn("`%s`" % cw.DEFAULT_SHAPE, interface)
+        orch = cw.SHAPES["ORCH"]
+        self.assertIn("`ORCH` (%s CPU, %s Mi) is the orchestrator role's own shape: not selectable with `--shape`" % (orch["cpu"], orch["memory"][:-2]), text)
         self.assertIn("(`%s` %.2f" % ("XS", cw.SHAPES["XS"]["usd_per_hour"]), read("cloud/launcher/README.md"))
 
     def test_s7_the_light_shape_section(self):
