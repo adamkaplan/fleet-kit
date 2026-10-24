@@ -1,25 +1,15 @@
 #!/usr/bin/env python3
 """test-cloud-relay: the refusal matrix and end-to-end scenarios of issue 1225 (hub relay), as one suite.
-
 Runs the REAL hub (bin/cloud_hub.py, started in-process through make_hub the way bin/test-cloud-hub does, with the per-pod
-secrets reviewer) and a small in-process FAKE DAEMON that speaks the contract: it PULLS GET /relay/pending and POSTs
-/relay/result/<id>, and runs the real rule code (plan_ledger.append_checked, may_record_verdict, authors_of) on a temp state dir.
+secrets reviewer) and, by default, the REAL daemon executor (cloud_relay_daemon.Executor with a fake Backend standing in for
+GitHub, the plan and the registry) on a temp state dir. It PULLS GET /relay/pending and POSTs /relay/result/<id> through the real
+pass_once, so every refusal reason in the matrix is the real one. A small FakeDaemon is kept only where a mutant needs it.
 
     bin/test-cloud-relay
 
-Which slice each test needs (until it lands the test fails, which is expected):
-  - Needs slice A (the hub's POST /relay, GET /relay/pending, POST /relay/result/<id>): every class except TestHarness.
-    Hub-side refusals (S5, S6 repo, S8, S24 hub cases) need only A. Everything that reaches the daemon (S1-S3, S7, S10-S12,
-    S14-S22, S25-S28) needs A plus the fake daemon here, which stands in for slice B.
-  - Needs slice B (the real executor in bin/fleet-switchboard): none of these tests; the fake daemon encodes the same contract and
-    can be swapped for the real one by setting RELAY_REAL_DAEMON in Harness.start_daemon (left as the one place to adapt).
-    S13 (live, real pod, real daemon) is not testable here and is skipped, named in TestLive.
-  - Needs neither: TestHarness (hub and fake daemon start, pure refusal checks are well formed, the mutant daemons differ).
-Hub construction is isolated in Harness.start_hub: if slice A needs extra arguments or environment (daemon credential, wait limit), adapt there.
-
-Mutants (discriminates lines): the fake daemon takes `mutations`; a check that must catch it is run against it and must FAIL there
-(class TestMutants): writes on refusal, skips the author exclusion, takes the role from the request, takes the name from the body,
-scopes call ids globally, stamps the live head, writes gates to the ledger, no work-item check.
+Mutants (discriminates lines): a check that must catch a mutant is run against it and must FAIL there. The mutant lists are derived
+from FakeDaemon.MUTANTS, RealDaemon.MUTANTS and HUB_MUTANTS, and every one needs a catching scenario in SCENARIOS.
+S13 (live, real pod, real daemon) is not testable here and is skipped, named in TestLive.
 """
 import hashlib
 import http.client
@@ -37,6 +27,7 @@ sys.path.insert(0, str(BIN))
 import cloud_channel_server  # noqa: E402
 import cloud_hub  # noqa: E402
 import cloud_relay  # noqa: E402
+import cloud_relay_daemon  # noqa: E402
 import plan_ledger  # noqa: E402
 
 REPO, OTHER_REPO, ISSUE = "acme-org/widget-service", "acme-org/widget-api", 7
@@ -47,9 +38,11 @@ GH_TOKEN = "ghp_TESTTOKENVALUE0000000000000000000000"   # never given to the pod
 DAEMON = "relay-daemon"
 PODS = {  # pod -> (secret, role in the daemon registry)
     "coder": ("s-coder", None), "coder2": ("s-coder2", None), "reader": ("s-reader", "reader"), "tester": ("s-tester", "tester"),
-    "reviewer": ("s-reviewer", "reviewer"), "evalcoder": ("s-evalcoder", "reviewer"), DAEMON: ("s-daemon", None),
+    "reviewer": ("s-reviewer", "reviewer"), "evalcoder": ("s-evalcoder", "reviewer"), "norole": ("s-norole", None), DAEMON: ("s-daemon", None),
 }
-ISSUES = {"coder": ISSUE, "coder2": 8, "reader": 9, "tester": 10, "reviewer": 11, "evalcoder": 12}
+# every pod that works on the PR is bound to its issue; coder2 is bound to another one (the wrong-issue case)
+ISSUES = {"coder": ISSUE, "coder2": 8, "reader": ISSUE, "tester": ISSUE, "reviewer": ISSUE, "evalcoder": ISSUE, "norole": ISSUE}
+SCENARIO_OF = {"reviewer": "S1", "reader": "S2", "tester": "S3"}   # the plan names one evaluator per scenario
 
 
 def sha(text):
@@ -60,20 +53,18 @@ def reason_of(body):
     return str((body or {}).get("reason") or (body or {}).get("error") or "")
 
 
-class FakeDaemon:
-    """Speaks the contract. State: ledger (plan_ledger), call-id index file, audit list, delivered reports."""
+class DaemonBase:
+    """The pull side shared by both daemons: talks to the real hub, and reads the ledger."""
 
-    def __init__(self, state, port_of, mutations=()):
-        self.state, self.port_of, self.mut = Path(state), port_of, set(mutations)
+    def __init__(self, state, port_of):
+        self.state, self.port_of = Path(state), port_of
         self.heads = {PR: HEAD2}
         self.item_holder = {(REPO, ISSUE): "coder"}
         self.roles = {n: r for n, (_, r) in PODS.items() if r}
         self.github_author = {PR: "evalcoder"}      # evalcoder opened the PR (and holds an evaluator role: S15/S19)
-        self.audit, self.reports, self.done, self.stop = [], [], set(), False
-        self.index_path = self.state / "relay_calls.json"
+        self.audit, self.reports, self.stop = [], [], False
         self.thread = threading.Thread(target=self.loop, daemon=True)
 
-    # ---- pull loop
     def get(self, method, path, body=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port_of(), timeout=5)
         try:
@@ -87,13 +78,7 @@ class FakeDaemon:
     def loop(self):
         while not self.stop:
             try:
-                status, body = self.get("GET", "/relay/pending")
-                for req in (body or {}).get("requests", []) if status == 200 else []:
-                    if req["id"] in self.done:
-                        continue
-                    self.done.add(req["id"])
-                    code, reason, record = self.execute(req)
-                    self.get("POST", "/relay/result/" + req["id"], {"status": code, "reason": reason, "record": record})
+                self.pull()
             except (OSError, ValueError, KeyError):
                 pass
             time.sleep(0.03)
@@ -105,13 +90,6 @@ class FakeDaemon:
     def close(self):
         self.stop = True
         self.thread.join(2)
-
-    # ---- executor
-    def index(self):
-        try:
-            return json.loads(self.index_path.read_text())
-        except (OSError, ValueError):
-            return {}
 
     def ledger_bytes(self):
         out = b""
@@ -125,6 +103,98 @@ class FakeDaemon:
     def entries(self):
         return plan_ledger.read_ledger(self.state)[0]
 
+
+class RealBackend:
+    """The world for the real Executor: GitHub, the plan, the registry, the audit. `env` holds the daemon's GitHub token, which must
+    never leave it; `last_headers` is what the daemon sent GitHub on its last call."""
+
+    def __init__(self, daemon, mutations=()):
+        self.d, self.mut, self.env, self.last_headers = daemon, set(mutations), {"GH_TOKEN": GH_TOKEN}, {}
+        self.senders = ["evalcoder"]   # the PR's author has written a notice, so a writer of the PR is known
+
+    def _github(self):
+        self.last_headers = {"Authorization": "token " + self.env["GH_TOKEN"]}
+
+    def live_head(self, pr):
+        self._github()
+        return self.d.heads.get(pr)
+
+    def plan(self, pr):
+        self._github()
+        return {"source": "%s#%d" % (REPO, ISSUE), "hash": "sha256:" + "b" * 64,
+                "scenarios": {sid: {"evaluator": role, "claim": "pr"} for role, sid in SCENARIO_OF.items()}}
+
+    def pr_issues(self, pr):
+        self._github()
+        return {ISSUE} if pr == PR else set()
+
+    def pr_facts(self, pr):
+        return {"author": self.d.github_author.get(pr), "notice_senders": self.senders}
+
+    def evaluators(self, evaluator):
+        return [n for n, r in self.d.roles.items() if r == evaluator]
+
+    def holder_of(self, repo, issue):
+        return self.d.item_holder.get((repo, issue))
+
+    def gates(self, pr):
+        self._github()
+        out = {"ready": False}
+        if "echo_token" in self.mut:   # mutant: the token leaks into an answer
+            out["debug"] = dict(self.env)
+        return out
+
+    def report(self, pod, args):
+        self.d.reports.append((pod, args.get("text")))
+
+    def audit(self, kind, pr, detail):
+        line = dict(detail, kind=kind, pr=pr)
+        if "log_auth" in self.mut:   # mutant: the Authorization header is logged
+            line["headers"] = dict(self.last_headers)
+        self.d.audit.append(line)
+
+
+class RealDaemon(DaemonBase):
+    """The real cloud_relay_daemon.Executor behind the real hub, driven by the real pass_once."""
+    MUTANTS = ("echo_token", "log_auth")
+
+    def __init__(self, state, port_of, mutations=()):
+        super().__init__(state, port_of)
+        self.backend = RealBackend(self, mutations)
+        self.executor = cloud_relay_daemon.Executor(str(state), self.backend, time.time)
+
+    def pull(self):
+        cloud_relay_daemon.pass_once(self.executor, lambda: self.get("GET", "/relay/pending")[1],
+                                     lambda rid, body: self.get("POST", "/relay/result/" + rid, body))
+
+
+class FakeDaemon(DaemonBase):
+    """A hand-written daemon, kept only for the mutants (it has switches the real executor does not). State: ledger, index file."""
+    MUTANTS = ("writes_on_refusal", "skip_author", "role_from_request", "global_callids", "stamp_live_head", "gates_write",
+               "no_holder", "pr_issue")
+
+    def __init__(self, state, port_of, mutations=()):
+        super().__init__(state, port_of)
+        self.mut, self.done = set(mutations), set()
+        self.pr_issue = {PR: ISSUE}
+        self.index_path = self.state / "relay_calls.json"
+
+    def pull(self):
+        status, body = self.get("GET", "/relay/pending")
+        for req in (body or {}).get("requests", []) if status == 200 else []:
+            if req["id"] in self.done:
+                continue
+            self.done.add(req["id"])
+            code, reason, record = self.execute(req)
+            self.get("POST", "/relay/result/" + req["id"], {"status": code, "reason": reason, "record": record})
+
+    # ---- executor
+    def index(self):
+        try:
+            return json.loads(self.index_path.read_text())
+        except (OSError, ValueError):
+            return {}
+
     def refuse(self, code, reason, pod, call):
         self.audit.append({"kind": "refused", "pod": pod, "status": code, "reason": reason})
         if "writes_on_refusal" in self.mut:
@@ -133,8 +203,6 @@ class FakeDaemon:
 
     def execute(self, req):
         pod, call = req["pod"], req["call"]
-        if "body_name" in self.mut and isinstance(call.get("by"), str):
-            pod = call["by"]
         key = call["call_id"] if "global_callids" in self.mut else pod + "\n" + call["call_id"]
         seen = self.index().get(key)
         if seen:
@@ -145,9 +213,9 @@ class FakeDaemon:
             self.reports.append((pod, args.get("text")))
             self.audit.append({"kind": "report", "pod": pod})
             return 200, "delivered", None
-        if live is None or call["pr"].split("#")[0] != req["repo"] or (cmd != "gates" and False):
+        if live is None or call["pr"].split("#")[0] != req["repo"]:
             return self.refuse(403, "pr is not in the pod's repo", pod, call)
-        if "pr_issue" not in self.mut and ISSUES.get(pod) != req["issue"]:
+        if "pr_issue" not in self.mut and self.pr_issue.get(call["pr"]) != req["issue"]:
             return self.refuse(403, "pr not linked to the pod's issue", pod, call)
         if cmd == "gates":
             self.audit.append({"kind": "gates", "pod": pod, "pr": call["pr"]})
@@ -193,6 +261,9 @@ class FakeDaemon:
         return record
 
 
+HUB_MUTANTS = ("body_name",)
+
+
 class Harness:
     def __init__(self, mutations=()):
         self.tmp = tempfile.TemporaryDirectory()
@@ -205,7 +276,8 @@ class Harness:
         (t / "agents.json").write_text(json.dumps(agents))
         self.hub_lines, self.port, self.server, self.mutations = [], 0, None, set(mutations)
         self.start_hub()
-        self.daemon = FakeDaemon(t / "state", lambda: self.port, mutations).start()
+        kind = FakeDaemon if set(mutations) & set(FakeDaemon.MUTANTS) else RealDaemon   # the fake only where a mutant needs it
+        self.daemon = kind(t / "state", lambda: self.port, mutations).start()
 
     def start_hub(self):
         """The one place that builds the real hub. Keeps the port across a restart (state lives in the daemon, not the hub)."""
@@ -295,6 +367,21 @@ class Base(unittest.TestCase):
         self.assertNotIn("secret", json.dumps(answer[1]).lower().replace("per-pod secret", ""))
 
 
+def s4_no_token(test, h):
+    """S4: the daemon's backend holds a GitHub-style token in its env and sends it to GitHub; it must appear in no byte that any other
+    component sees: the request, the answers, the hub log, the daemon audit, the pod's environment."""
+    os.environ.pop("GH_TOKEN", None)
+    pod_env = json.dumps(dict(os.environ))
+    request = json.dumps({"call_id": "t1", "command": "prove", "pr": PR, "head": HEAD2, "args": {"scenario": "S1"}})
+    answers = [h.relay("coder", "prove", call_id="t1"), h.relay("coder", "gates", call_id="t2", head=None, args={}),
+               h.relay("coder", "report", call_id="t3", head=None, args={"text": "hi"}),
+               h.relay("coder", "prove", call_id="t4", head=HEAD1)]   # a refusal's answer too
+    test.assertEqual([a[0] for a in answers], [200, 200, 200, 409], answers)
+    test.assertTrue(h.daemon.backend.last_headers, "the daemon never used its token: the check would be empty")
+    for blob in (pod_env, request, json.dumps(answers), "\n".join(map(str, h.hub_lines)), json.dumps(h.daemon.audit)):
+        test.assertNotIn(GH_TOKEN, blob)
+
+
 # ------------------------------------------------------------------------------------------------ harness (needs neither A nor B)
 
 class TestHarness(unittest.TestCase):
@@ -312,9 +399,15 @@ class TestHarness(unittest.TestCase):
             plan_ledger.append_entry(h.daemon.state, {"kind": "proof", "result": "pass", "pr": PR, "by": "x"}, 1)
             self.assertNotEqual(before, h.snapshot())
 
-    def test_fake_daemon_executes_without_hub(self):
+    def test_default_daemon_is_the_real_executor(self):
         with Harness() as h:
+            self.assertIsInstance(h.daemon, RealDaemon)
+            self.assertIsInstance(h.daemon.executor, cloud_relay_daemon.Executor)
+
+    def test_fake_daemon_executes_without_hub(self):
+        with Harness(("no_holder",)) as h:
             d = h.daemon
+            d.mut.discard("no_holder")
             req = lambda pod, **c: {"id": "i", "pod": pod, "repo": REPO, "issue": ISSUES[pod],
                                     "call": dict({"call_id": "x", "command": "prove", "pr": PR, "head": HEAD2, "args": {}}, **c)}
             self.assertEqual(d.execute(req("coder"))[0], 200)
@@ -325,13 +418,6 @@ class TestHarness(unittest.TestCase):
 
     def test_secrets_never_in_repo_constants_of_hub(self):
         self.assertNotIn(GH_TOKEN, Path(cloud_hub.__file__).read_text())
-
-    def test_mutants_are_distinct_and_known(self):
-        known = {"writes_on_refusal", "skip_author", "role_from_request", "body_name", "global_callids", "stamp_live_head", "gates_write", "no_holder"}
-        self.assertEqual(len(known), 8)
-        src = Path(__file__).read_text()
-        for m in known:
-            self.assertGreaterEqual(src.count('"%s"' % m), 2, m)
 
 
 # ------------------------------------------------------------------------------------------------ the contract, against the real hub (needs A)
@@ -362,16 +448,7 @@ class TestRelayHappy(Base):
         self.assertEqual(self.h.kinds("proof") + self.h.kinds("verdict"), [])
 
     def test_S4_no_github_token_anywhere(self):
-        os.environ.pop("GH_TOKEN", None)   # the pod and hub environments hold none; the daemon's is a local variable only
-        seen = []
-        orig = self.h.raw
-        s, body = self.h.relay("coder", "prove")
-        seen += [json.dumps(body), json.dumps(self.h.daemon.audit), "\n".join(map(str, self.h.hub_lines)), json.dumps(dict(os.environ))]
-        self.assertEqual(s, 200)
-        for blob in seen:
-            self.assertNotIn(GH_TOKEN, blob)
-        for secret, _ in PODS.values():
-            self.assertNotIn(secret, "\n".join(map(str, self.h.hub_lines)) + json.dumps(self.h.daemon.audit))
+        s4_no_token(self, self.h)
 
     def test_S10_chain_and_audit(self):
         ok_record(self, self.h.relay("coder", "prove", call_id="a"))
@@ -419,7 +496,8 @@ class TestRefusals(Base):
     def test_S6_wrong_repo_or_issue(self):
         before = self.h.snapshot()
         self.refused(self.h.relay("coder", "prove", call_id="r", pr="%s#12" % OTHER_REPO), 403)
-        self.refused(self.h.relay("coder2", "prove", call_id="i"), 403)     # coder2 is bound to issue 8, not the PR's
+        for cmd in ("prove", "verdict", "gates"):   # coder2 is bound to issue 8, not the PR's
+            self.refused(self.h.relay("coder2", cmd, call_id="i-" + cmd, head=None if cmd == "gates" else HEAD2), 403, "pr not linked to the pod's issue")
         self.assertEqual(self.h.snapshot(), before)
 
     def test_S7_stale_head_prove_and_verdict(self):
@@ -450,7 +528,7 @@ class TestRefusals(Base):
             "oversized": lambda: h.raw("coder", big),
             "no call id": lambda: h.relay("coder", "prove", drop=("call_id",)),
         }
-        reasons, lines_before = {}, len(h.hub_lines) + len(h.daemon.audit)
+        reasons = {}
         for name, call in cases.items():
             s, body = call()
             self.assertGreaterEqual(s, 400, name)
@@ -458,7 +536,7 @@ class TestRefusals(Base):
             self.assertNotEqual(reasons[name][1], "", name)
         self.assertEqual(len(set(reasons.values())), 8, reasons)
         self.assertEqual(h.snapshot(), before)
-        lines = [str(x) for x in h.hub_lines + h.daemon.audit][lines_before - len(h.hub_lines + h.daemon.audit):] if False else [str(x) for x in h.hub_lines] + [str(x) for x in h.daemon.audit]
+        lines = [str(x) for x in h.hub_lines] + [str(x) for x in h.daemon.audit]
         for secret, _ in PODS.values():
             self.assertFalse([l for l in lines if secret in l])
         self.assertGreaterEqual(len([l for l in lines if "stale head" in l]), 1)
@@ -484,16 +562,16 @@ class TestIndependence(Base):
 
     def test_S16_no_role_is_not_registered(self):
         before = self.h.snapshot()
-        self.refused(self.h.relay("coder2", "verdict", call_id="v", pr=PR), 403, "not registered to record")
+        self.refused(self.h.relay("norole", "verdict", call_id="v"), 403, "not registered to record")
         self.assertEqual(self.h.snapshot(), before)
 
     def test_S17_S26_roles_reader_tester_reviewer_accepted_others_refused(self):   # S17, S26
         for pod in ("reader", "tester", "reviewer"):
-            ok_record(self, self.h.relay(pod, "verdict", call_id="v-" + pod, args={"scenario": "S1", "result": "pass", "evidence": "x", "role": "reader"}))
+            ok_record(self, self.h.relay(pod, "verdict", call_id="v-" + pod, args={"scenario": SCENARIO_OF[pod], "result": "pass", "evidence": "x", "role": "reader"}))
         self.assertEqual(sorted(e["by"] for e in self.h.kinds("verdict")), ["reader", "reviewer", "tester"])
         before = self.h.snapshot()
-        for pod in ("coder2",):
-            self.refused(self.h.relay(pod, "verdict", call_id="v2", args={"scenario": "S1", "role": "reviewer", "result": "pass"}), 403)
+        for pod in ("norole",):
+            self.refused(self.h.relay(pod, "verdict", call_id="v2", args={"scenario": "S1", "role": "reviewer", "result": "pass", "evidence": "x"}), 403, "not registered to record")
         self.assertEqual(self.h.snapshot(), before)
 
     def test_S18_S27_only_the_holder_proves(self):   # S18, S27
@@ -508,7 +586,7 @@ class TestIndependence(Base):
         before = self.h.snapshot()
         phrases = set()
         for pod, cmd, phrase in (("evalcoder", "verdict", "author cannot record a verdict on its own work"),
-                                 ("coder2", "verdict", "not registered to record"),
+                                 ("norole", "verdict", "not registered to record"),
                                  ("reviewer", "prove", "only from the pod holding the work item")):
             a = self.h.relay(pod, cmd, call_id="r-" + pod)
             self.refused(a, 403, phrase)
@@ -536,65 +614,77 @@ def caught(mutation, scenario):
         return False
 
 
+def _writes_on_refusal(h):
+    before = h.snapshot()
+    h.relay("coder", "prove", call_id="o", head=HEAD1)
+    assert h.snapshot() == before, "ledger bytes changed on a refusal"
+
+
+def _skip_author(h):
+    h.relay("coder", "prove", call_id="p")
+    h.daemon.roles["coder"] = "reviewer"
+    h.relay("coder", "verdict", call_id="v")
+    assert not h.kinds("verdict"), "author recorded a verdict"
+
+
+def _role_from_request(h):
+    h.relay("norole", "verdict", call_id="v", args={"scenario": "S1", "role": "reviewer", "result": "pass"})
+    assert not h.kinds("verdict"), "a pod with no role passed by claiming one"
+
+
+def _body_name(h):
+    h.relay("coder", "prove", extra={"by": "reviewer"})
+    assert [e["by"] for e in h.daemon.entries()] == ["coder"], "name taken from the body"
+
+
+def _global_callids(h):
+    a = h.relay("coder", "prove", call_id="same")[1].get("record")
+    b = h.relay("reviewer", "verdict", call_id="same")[1].get("record")
+    assert a != b and len(h.daemon.entries()) == 2, "call id shared across pods"
+
+
+def _stamp_live_head(h):
+    h.relay("coder", "prove", call_id="n", head=None)
+    h.relay("coder", "prove", call_id="o", head=HEAD1)
+    assert not h.daemon.entries(), "wrote an entry for a missing or stale head"
+
+
+def _gates_write(h):
+    before = h.snapshot()
+    h.relay("coder", "gates", head=None, args={})
+    assert h.snapshot() == before, "gates wrote to the ledger"
+
+
+def _no_holder(h):
+    h.relay("reviewer", "prove", call_id="p")
+    assert not h.kinds("proof"), "a non-holder recorded a proof"
+
+
+def _pr_issue(h):   # a pod bound to another issue must not be served for this PR (gates is not guarded by the holder rule)
+    status, _ = h.relay("coder2", "gates", head=None, args={})
+    assert status == 403, "a pod bound to another issue read this PR's gates (status %s)" % status
+
+
+def _leaks_token(h):
+    s4_no_token(unittest.TestCase(), h)
+
+
+SCENARIOS = {"writes_on_refusal": _writes_on_refusal, "skip_author": _skip_author, "role_from_request": _role_from_request,
+             "body_name": _body_name, "global_callids": _global_callids, "stamp_live_head": _stamp_live_head,
+             "gates_write": _gates_write, "no_holder": _no_holder, "pr_issue": _pr_issue,
+             "echo_token": _leaks_token, "log_auth": _leaks_token}
+
+
 class TestMutants(unittest.TestCase):
-    def check(self, mutation, scenario):
+    def check(self, mutation):
+        scenario = SCENARIOS[mutation]   # a mutant without a catching scenario is an error
         self.assertTrue(caught(mutation, scenario), "mutant %s was not caught" % mutation)
         with Harness() as h:     # and the same check passes on the faithful daemon
             scenario(h)
 
-    def test_writes_on_refusal_caught_by_ledger_bytes(self):
-        def scenario(h):
-            before = h.snapshot()
-            h.relay("coder", "prove", call_id="o", head=HEAD1)
-            assert h.snapshot() == before, "ledger bytes changed on a refusal"
-        self.check("writes_on_refusal", scenario)
 
-    def test_skip_author_caught(self):
-        def scenario(h):
-            h.relay("coder", "prove", call_id="p")
-            h.daemon.roles["coder"] = "reviewer"
-            h.relay("coder", "verdict", call_id="v")
-            assert not h.kinds("verdict"), "author recorded a verdict"
-        self.check("skip_author", scenario)
-
-    def test_role_from_request_caught(self):
-        def scenario(h):
-            h.relay("coder2", "verdict", call_id="v", args={"scenario": "S1", "role": "reviewer", "result": "pass"})
-            assert not h.kinds("verdict"), "a pod with no role passed by claiming one"
-        self.check("role_from_request", scenario)
-
-    def test_body_name_caught(self):
-        def scenario(h):
-            h.relay("coder", "prove", extra={"by": "reviewer"})
-            assert [e["by"] for e in h.daemon.entries()] == ["coder"], "name taken from the body"
-        self.check("body_name", scenario)
-
-    def test_global_callids_caught(self):
-        def scenario(h):
-            a = h.relay("coder", "prove", call_id="same")[1].get("record")
-            b = h.relay("reviewer", "verdict", call_id="same")[1].get("record")
-            assert a != b and len(h.daemon.entries()) == 2, "call id shared across pods"
-        self.check("global_callids", scenario)
-
-    def test_stamp_live_head_caught(self):
-        def scenario(h):
-            h.relay("coder", "prove", call_id="n", head=None)
-            h.relay("coder", "prove", call_id="o", head=HEAD1)
-            assert not h.daemon.entries(), "wrote an entry for a missing or stale head"
-        self.check("stamp_live_head", scenario)
-
-    def test_gates_write_caught(self):
-        def scenario(h):
-            before = h.snapshot()
-            h.relay("coder", "gates", head=None, args={})
-            assert h.snapshot() == before, "gates wrote to the ledger"
-        self.check("gates_write", scenario)
-
-    def test_no_holder_caught(self):
-        def scenario(h):
-            h.relay("reviewer", "prove", call_id="p")
-            assert not h.kinds("proof"), "a non-holder recorded a proof"
-        self.check("no_holder", scenario)
+for _m in FakeDaemon.MUTANTS + RealDaemon.MUTANTS + HUB_MUTANTS:
+    setattr(TestMutants, "test_%s_caught" % _m, lambda self, _m=_m: self.check(_m))
 
 
 if __name__ == "__main__":
