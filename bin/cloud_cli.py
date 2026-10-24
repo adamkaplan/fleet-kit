@@ -5,9 +5,11 @@
     cloud_cli.py report KIND TEXT...
 
 Environment: FLEET_AGENT_NAME (sender), FLEET_BOSS (report target), FLEET_CLOUD_CHANNEL_URL (http URL of the channel),
-FLEET_CLOUD_TOKEN_FILE (optional; default is the projected token path).
+FLEET_CLOUD_TOKEN_FILE (optional; default is the projected token path),
+FLEET_CLOUD_ALLOW_HTTP_HOST (optional; the one non-loopback host that may be sent the token over plain http).
 Prints one line. Exit 0 delivered, 1 refused, 2 bad usage or missing environment. Never prints the token.
 """
+import ipaddress
 import json
 import os
 import sys
@@ -60,6 +62,20 @@ def make_post(url):
     return post
 
 
+def _http_allowed(parts, env):
+    """The bearer token goes over plain http only to a loopback host, or to the host named by FLEET_CLOUD_ALLOW_HTTP_HOST."""
+    try:
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return False
+    try:
+        if ipaddress.ip_address(host).is_loopback:
+            return True
+    except ValueError:
+        pass
+    return host == "localhost" or (bool(host) and host == env.get("FLEET_CLOUD_ALLOW_HTTP_HOST", "").strip().lower())
+
+
 def _usage(line):
     print(line)
     return 2
@@ -85,6 +101,8 @@ def main(argv, env=None, post=None):
         return _usage("cloud_cli: FLEET_CLOUD_CHANNEL_URL must be set to an http or https URL")
     if "@" in parts.netloc:
         return _usage("cloud_cli: FLEET_CLOUD_CHANNEL_URL must not contain user information")
+    if parts.scheme == "http" and not _http_allowed(parts, env):
+        return _usage("cloud_cli: plain http to a host that is not loopback is refused (set FLEET_CLOUD_ALLOW_HTTP_HOST to that host to allow it)")
     if cmd == "send" and len(text) > MAX_SEND:
         return _usage("cloud_cli: text over %d characters" % MAX_SEND)
     token_path = env.get("FLEET_CLOUD_TOKEN_FILE") or cloud_client.TOKEN_PATH
