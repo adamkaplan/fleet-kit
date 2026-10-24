@@ -18,6 +18,7 @@ import os
 import re
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 LEDGER_FILE = "plan-ledger.jsonl"
 HEAD_FILE = "plan-ledger.head"   # {"seq", "hash"} of the newest entry: a second place the chain's end is written
@@ -197,6 +198,10 @@ def append_many_checked(state_dir, build, now):
 
 # ----------------------------------------------------------------------------------- who may do what
 
+def proof_of(scenario):
+    return " ".join(str(scenario.get("proof", "")).split())
+
+
 def evaluator_of(scenario):
     name = " ".join(str(scenario.get("evaluator", "")).split())
     return EVALUATOR_ALIASES.get(name, name)
@@ -357,20 +362,110 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
     return out
 
 
+CARRIES_LINE_RE = re.compile(r"(?mi)^[ \t]*CARRIES:.*$")
+CARRIES_EXACT_RE = re.compile(r"^[ \t]*CARRIES:[ \t]*#(\d+)[ \t]*$")
+FENCE_RE = re.compile(r"^[ \t]*(```|~~~)")
+
+
+def _outside_fences(body):
+    """The lines of `body` that are not inside a fenced code block."""
+    out, fence = [], None
+    for line in (body or "").splitlines():
+        mark = FENCE_RE.match(line)
+        if mark:
+            fence = None if fence == mark.group(1) else (fence or mark.group(1))
+            continue
+        if fence is None:
+            out.append(line)
+    return out
+
+
+def carries_parse(body):
+    """(#1196) (number, problem): the standing body line `CARRIES: #N` outside fenced code blocks. problem is the reason in words when there is more than one CARRIES
+    line, or a line that is not exactly `#N` (several dependencies, another repository, trailing text); number is then None."""
+    lines = [l for l in _outside_fences(body) if CARRIES_LINE_RE.match(l)]
+    if not lines:
+        return None, None
+    if len(lines) > 1:
+        return None, "more than one CARRIES line: one dependency only"
+    found = CARRIES_EXACT_RE.match(lines[0])
+    if not found:
+        return None, "the CARRIES line %r is not exactly `CARRIES: #N` (one dependency of this repository only)" % lines[0].strip()[:60]
+    return int(found.group(1)), None
+
+
+def carries_of(body):
+    """(#1196) The number N of the standing body line `CARRIES: #N` (outside fenced code), else None (no line, or a refused one: see carries_parse)."""
+    return carries_parse(body)[0]
+
+
+def carries_refusal(dep_pr, dep_state, dep_head, in_branch):
+    """(#1196) The reason a CARRIES line is refused, else None: the named pull request is closed unmerged, or its head commit is not in this branch.
+    A merged dependency is not refused here: the pull request is then read as an ordinary one (the caller drops the line)."""
+    if dep_state == "closed":
+        return "%s is closed unmerged: its commits cannot be carried" % dep_pr
+    if not dep_head or not in_branch:
+        return "%s head %s is not in this branch: the commits it names are not here" % (dep_pr, (dep_head or "?")[:8])
+    return None
+
+
+def clear_names_both(clear, pr, dep_pr):
+    """(#1196) True when the owner's clear record names BOTH pull requests (the carrying one and the dependency)."""
+    names = (clear or {}).get("names")
+    return isinstance(names, list) and pr in names and dep_pr in names
+
+
+def carried_rows(carries, entries, facts):
+    """(#1196) The dependency's scenario rows: its recorded proofs and verdicts are reused ONLY for the commit its head names (`scenario_state` compares the head by
+    commit, never by pull request name); a record for any other commit is void. Returns (rows, reviews)."""
+    dep_pr, dep_head, dep_plan = carries["pr"], carries["head"], carries["plan"]
+    authors = authors_of(entries, dep_pr, carries.get("notice_senders") or (), carries.get("author"))
+    rows = []
+    for s in dep_plan["scenarios_parsed"]:
+        if claim_of(s) != "pr":
+            continue
+        row = scenario_state(s, entries, dep_pr, dep_plan["plan_hash"], dep_head, authors)
+        row["id"] = "%s %s" % (dep_pr, row["id"])
+        row["carried_from"] = dep_pr
+        rows.append(row)
+    return rows, review_records_at(entries, dep_pr, dep_head)
+
+
 REVIEWERS = ("code", "architecture", "security", "impact", "test")
 REVIEWERS_NOW = ("code", "architecture", "security", "impact", "test")   # the reviewers that exist today
 REVIEW_VERDICTS = ("approve", "request-changes", "comment", "incomplete")
+
+
+# #1047: every function that reads the `uncited` mark, as (file, function): the one table; a completeness test derives the set from the source and fails when one is missing.
+UNCITED_CONSUMERS = (("plan_ledger.py", "review_blocks"), ("plan_ledger.py", "review_records_at"), ("plan_ledger.py", "render_gates"),
+                     ("fleet-switchboard", "pr_state_view"), ("fleet-switchboard", "pr_state_line"), ("fleet-switchboard", "parse_review_block"), ("fleet-switchboard", "cmd_review"))
+
+
+def review_blocks(entry):
+    """The ONE blocking decision for a review record: only a request-changes that names a rule blocks. An uncited request-changes is recorded and
+    shown ("names no rule") but, as the review laws say (R-LAW-1, R-LAW-8), a finding that cites no rule does not block."""
+    return entry.get("verdict") == "request-changes" and entry.get("uncited") is not True
 
 
 def review_records_at(entries, pr, head, expected=REVIEWERS_NOW):
     """The reviewer records of PR `pr` AT `head` (the latest per reviewer wins): {"expected", "recorded": {reviewer: verdict}, "missing"}.
     A record at another head does not count: a push voids it. SHADOW: this is shown by `gates`, never counted towards ready, and a record
     names the session that wrote it, which while agents share one account is a mistake guard and not a boundary."""
-    recorded = {}
+    recorded, uncited, blocking = {}, [], []
     for entry in entries:
         if entry.get("kind") == "review_record" and entry.get("pr") == pr and entry.get("head") == head and entry.get("reviewer") in expected:
             recorded[entry["reviewer"]] = entry.get("verdict")
-    return {"expected": list(expected), "recorded": recorded, "missing": [r for r in expected if r not in recorded]}
+            if review_blocks(entry):
+                if entry["reviewer"] not in blocking:
+                    blocking.append(entry["reviewer"])
+            elif entry["reviewer"] in blocking:
+                blocking.remove(entry["reviewer"])
+            if entry.get("uncited") is True and entry.get("verdict") == "request-changes":
+                if entry["reviewer"] not in uncited:
+                    uncited.append(entry["reviewer"])
+            elif entry["reviewer"] in uncited:
+                uncited.remove(entry["reviewer"])
+    return {"expected": list(expected), "recorded": recorded, "uncited": uncited, "blocking": blocking, "missing": [r for r in expected if r not in recorded]}
 
 
 def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
@@ -381,6 +476,8 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
     every tracked gate that applies to a PR is satisfied; the untracked ones are listed, not counted."""
     head = (facts or {}).get("head")
     authors = authors_of(entries, pr, (facts or {}).get("notice_senders") or (), (facts or {}).get("author"))
+    carries = (facts or {}).get("carries") or None   # (#1196) the one dependency named by `CARRIES: #N`; None for an ordinary pull request
+    carried_reviews = None
     rows, scen_rows = [], []
     for gid, name, scope, owner, tracked in GATES:
         row = {"gate": gid, "name": name, "scope": scope, "decided_by": owner, "tracked": tracked, "status": "untracked",
@@ -397,6 +494,14 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
                 row.update(status="missing", missing=["plan check fails: %d defect(s)" % len(plan["defects"])])
             else:
                 row.update(status="ok", detail="plan hash %s" % plan["plan_hash"])
+            if carries and row["status"] == "ok":   # (#1196) both asks need a plan
+                dep = carries.get("plan")
+                if carries.get("refusal"):
+                    row.update(status="missing", missing=[carries["refusal"]])
+                elif dep is None or dep.get("result") != "pass":
+                    row.update(status="missing", missing=["CARRIES %s: the dependency's plan is missing or fails its check" % carries["pr"]])
+                else:
+                    row["detail"] += "; carried plan %s hash %s" % (carries["pr"], dep["plan_hash"])
         elif gid == "G1":
             if plan is None or plan["result"] != "pass":
                 row.update(status="missing", missing=["needs a plan that passes G0a"])
@@ -405,6 +510,12 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             else:
                 claimed = [s for s in plan["scenarios_parsed"] if claim_of(s) == "pr"]
                 scen_rows = [scenario_state(s, entries, pr, plan["plan_hash"], head, authors) for s in claimed]
+                if carries and not carries.get("refusal") and carries.get("plan") and carries["plan"].get("result") == "pass" and carries.get("head"):
+                    dep_rows, carried_reviews = carried_rows(carries, entries, facts)
+                    scen_rows = scen_rows + dep_rows
+                elif carries:
+                    scen_rows = scen_rows + [{"id": "%s plan" % carries["pr"], "status": "missing", "missing": [carries.get("refusal") or "the carried plan cannot be read"], "void": [], "evaluator": "-", "proof": None, "verdict": None,
+                                              "carried_from": carries["pr"]}]
                 bad = [s for s in scen_rows if s["status"] != "ok"]
                 row["detail"] = "%d of %d claimed scenarios proven and judged at %s" % (len(scen_rows) - len(bad), len(scen_rows), head[:8])
                 none_because = PER_PR_NONE_RE.search(plan.get("text") or "")
@@ -440,6 +551,11 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             elif isinstance(floor, dict) and (floor.get("unreadable") or floor.get("decision") is None):
                 row.update(status="waiting", missing=["the impact floor could not be read for this head (%s): the owner decides, through cos"
                                                       % (floor.get("unreadable") or "no decision")])
+            elif carries and isinstance(floor, dict) and floor.get("clear_head") and floor.get("clear_head") != head and not floor.get("cleared") and floor.get("decision") == "hold":
+                row.update(status="waiting", missing=["clear is for another head (%s): a clear of a carrying pull request is recorded at the head that carries %s and never carries to a later head; the owner clears this head"
+                                                      % (floor["clear_head"][:8], carries["pr"])])
+            elif carries and isinstance(floor, dict) and floor.get("decision") == "hold" and floor.get("cleared") and not floor.get("names_both"):
+                row.update(status="waiting", missing=["the owner's clear does not name both pull requests (%s and %s): the owner clears again" % (pr, carries["pr"])])
             elif isinstance(floor, dict) and floor.get("rehold"):   # (#830) a clear was recorded for ANOTHER head, none for this one, no rating here: held again, whatever the labels say
                 row.update(status="waiting", missing=["held again for the owner at this head: %s; the owner clears this head, or the impact rating at this head says not held"
                                                       % floor["rehold"]])
@@ -479,7 +595,8 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
     ready = all(r["status"] in ("ok", "n/a", "untracked", "waived") for r in rows)
     return {"gates": rows, "ready": ready, "waived": waived, "untracked": [r["gate"] for r in rows if r["status"] == "untracked"],
             "scenarios": scen_rows, "head": head, "plan_hash": (plan or {}).get("plan_hash"),
-            "ledger_problem": ledger_problem, "reviews": review_records_at(entries, pr, head) if head else None}
+            "ledger_problem": ledger_problem, "reviews": review_records_at(entries, pr, head) if head else None,
+            "carries": ({"pr": carries["pr"], "head": carries.get("head"), "reviews": carried_reviews, "refusal": carries.get("refusal")} if carries else None)}
 
 
 SATISFIED = ("ok", "n/a", "untracked", "waived")
@@ -558,7 +675,9 @@ def render_gates(report, pr):
     if reviews:
         lines.append("  reviewers (plan-review panel verdicts: shadow, not counted by any gate): %d of %d recorded at %s%s" % (
             len(reviews["recorded"]), len(reviews["expected"]), (report.get("head") or "?")[:8],
-            ": " + ", ".join("%s %s" % kv for kv in sorted(reviews["recorded"].items())) if reviews["recorded"] else "")
+            ": " + ", ".join("%s %s%s" % (kv + (" (names no rule, does not block)" if kv[0] in (reviews.get("uncited") or []) else "",)) for kv in sorted(reviews["recorded"].items())) if reviews["recorded"] else "")
+            + ("; %d blocking review(s)" % len(reviews.get("blocking") or []) if reviews.get("blocking") else "")
+            + ("; %d request-changes names no rule and does not block" % len(reviews["uncited"]) if reviews.get("uncited") else "")
             + ("; missing %s" % ", ".join(reviews["missing"]) if reviews["missing"] else ""))
     if report["untracked"]:
         lines.append("not tracked yet (not counted): %s" % ", ".join(report["untracked"]))
@@ -844,3 +963,47 @@ def refusal_message(prog, check_for, pr, failed, repo):
     return ("%s: %s of %s refused: missing %s. Way out: ask the chief of staff for a logged waiver (`%s waive %s --gates %s "
             "--reason ...`; never for G6 or G8), or the chief of staff can switch the repo to shadow (`%s gates mode %s shadow`)."
             % (prog, check_for, pr, what, prog, pr, ",".join(f["gate"] for f in gates) or "G1", prog, repo))
+
+
+REVIEW_LINK_RE = re.compile(r"https?://[^\s\"'`<>\u201c\u201d]+")
+# One quote is one pair of matching marks: "..", \u201c..\u201d, \u2018..\u2019 or `..`.
+REVIEW_QUOTE_RE = re.compile(r"\"([^\"\n]+)\"|\u201c([^\u201d\n]+)\u201d|\u2018([^\u2019\n]+)\u2019|`([^`\n]+)`")
+REVIEW_QUOTE_MIN_WORDS, REVIEW_QUOTE_MIN_CHARS, REVIEW_QUOTE_MIN_LETTERS, REVIEW_TEXT_MAX = 3, 15, 3, 400
+
+
+def _review_norm(text):
+    return " ".join(str(text or "").casefold().split())
+
+
+def _review_link_ok(url):
+    """A link counts with a real host (a dot between non-empty labels, the last of 2+ letters) and a path or fragment."""
+    if len(url) > REVIEW_TEXT_MAX:
+        return False
+    parts = urlsplit(url)
+    host = (parts.hostname or "").rstrip(".")
+    labels = host.split(".")
+    if len(labels) < 2 or not all(labels) or not (len(labels[-1]) >= 2 and labels[-1].isalpha()):
+        return False
+    return len(parts.path.strip("/")) > 0 or len(parts.fragment) > 0
+
+
+def review_evidence_problem(evidence, scenario=None):
+    """None when a `review` verdict's evidence carries a countable quote of the text read or a link to it, else the named reason.
+    A quote has 3+ words or 15+ characters, 3+ letters, at most 400 characters, and is not the scenario's own text, pass or discriminates
+    text; a link has a real host and a path or fragment. The ONE rule: the verdict command calls it once per scenario."""
+    text = evidence or ""
+    own = {_review_norm((scenario or {}).get(k)) for k in ("text", "pass", "discriminates")} - {""}
+    for url in REVIEW_LINK_RE.findall(text):
+        if _review_link_ok(url.rstrip(".,;:)")):
+            return None
+    for match in REVIEW_QUOTE_RE.finditer(text):
+        quote = next(g for g in match.groups() if g is not None).strip()
+        if len(quote) > REVIEW_TEXT_MAX or sum(c.isalpha() for c in quote) < REVIEW_QUOTE_MIN_LETTERS:
+            continue
+        if len(quote.split()) < REVIEW_QUOTE_MIN_WORDS and len(quote) < REVIEW_QUOTE_MIN_CHARS:
+            continue
+        if _review_norm(quote) in own:
+            continue
+        return None
+    return ("a review verdict has no quote and no link: quote the text you read (in quotation marks: 3+ words or 15+ characters, at most "
+            "400, not the scenario's own text) or link to it (a real host such as example.com, and a path or fragment)")
