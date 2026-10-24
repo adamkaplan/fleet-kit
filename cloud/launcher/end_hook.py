@@ -9,29 +9,59 @@ import fnmatch
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
 SECRET_GLOBS = [".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*", "*credentials*",
                 "*secret*", "*.kubeconfig", "kubeconfig", ".netrc", ".npmrc"]
 
 
-# Pre-stop git runs inside a repository the agent controls: neutralise everything in it that would run code or pick a target.
-SAFE_OPTS = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.sshCommand=false",
-             "-c", "protocol.ext.allow=never", "-c", "core.pager=cat", "-c", "diff.external=",
-             "-c", "core.attributesFile=/dev/null", "-c", "url.https://github.com/.insteadOf=https://github.com/"]
-DROP_ENV = ("GIT_SSH", "GIT_SSH_COMMAND", "GIT_EXTERNAL_DIFF", "GIT_PAGER", "GIT_ASKPASS", "SSH_ASKPASS",
-            "GIT_CONFIG_NOSYSTEM", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS")
+# Pre-stop git runs inside a repository the agent controls. ALLOW-LIST design: git reads NO global or system configuration and
+# no variable of the caller; the only configuration it sees is the pinned -c options below plus the repository's own file, which
+# is read first and refused unless every key of it is on a short allow-list (see config_refusal).
+# TEST SEAM (the only one): the tests import this module and patch HOST_URL (a file:// prefix standing for the host) and HELPER_DIR.
+# Nothing here is read from the environment, so the agent cannot move the push target or the credential helper.
+HOST_URL = "https://github.com/"
+HELPER_DIR = "/run/cw-tmp/bin"   # the directory entrypoint.sh fills ($TMP/bin, TMP=/run/cw-tmp); the helper is git-credential-cw in it
+HELPER_NAME = "git-credential-cw"
+KEEP_ENV = ("PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TZ", "TMPDIR")
 REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 
 
-def git(workdir, *args, check=True, safe=False):
-    cmd = ["git", "-C", workdir] + (SAFE_OPTS if safe else []) + list(args)
-    env = None
-    if safe:
-        env = {k: v for k, v in os.environ.items() if k not in DROP_ENV}
-        env["GIT_TERMINAL_PROMPT"] = "0"
-    p = subprocess.run(cmd, capture_output=True, text=True, env=env)
+def safe_opts(helper):
+    """Pinned configuration of every pre-stop git call. credential.helper is reset (empty value) before the one fixed helper."""
+    pins = ["core.hooksPath=/dev/null", "core.fsmonitor=false", "core.sshCommand=false", "protocol.ext.allow=never",
+            "core.pager=cat", "diff.external=", "core.attributesFile=/dev/null", "http.proxy=", "http.extraHeader=",
+            "core.gitProxy=", "core.askPass=", "http.sslVerify=true", "http.followRedirects=false", "credential.useHttpPath=true",
+            "credential.helper=", "credential.helper=" + helper]
+    return [x for pin in pins for x in ("-c", pin)]
+
+
+def find_helper():
+    """The pod's credential helper (written by entrypoint.sh, answers only for github.com); None if it is not there."""
+    p = os.path.join(HELPER_DIR, HELPER_NAME)
+    return p if os.path.isfile(p) and not os.path.islink(p) and os.access(p, os.X_OK) else None
+
+
+class Ctx:
+    """The scrubbed environment and pinned options of one pre-stop run; `home` is an empty private directory."""
+    def __init__(self, helper):
+        self.home = tempfile.mkdtemp(prefix="cw-prestop-")
+        self.opts = safe_opts(helper)
+        env = {k: v for k, v in os.environ.items() if k in KEEP_ENV}
+        env.update({"HOME": self.home, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+                    "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"})
+        self.env = env
+
+    def close(self):
+        shutil.rmtree(self.home, True)
+
+
+def git(workdir, *args, check=True, ctx=None, opts=True):
+    cmd = ["git", "-C", workdir] + (ctx.opts if ctx and opts else []) + list(args)
+    p = subprocess.run(cmd, capture_output=True, text=True, env=ctx.env if ctx else None)
     if check and p.returncode != 0:
         raise RuntimeError((p.stderr.strip().splitlines() or ["git %s failed" % args[0]])[-1])
     return p
@@ -59,39 +89,40 @@ class OriginElsewhere(Exception):
     pass
 
 
-def run(workdir, worker, prestop=False, repo=None):
-    sf = prestop
-    url = "https://github.com/%s.git" % repo if prestop else None
+class ConfigRefused(Exception):
+    pass
+
+
+def config_refusal(workdir, repo, ctx):
+    pass
+
+
+def run(workdir, worker, prestop=False, repo=None, ctx=None):
+    url = HOST_URL + "%s.git" % repo if prestop else None
     if prestop:
-        cur = git(workdir, "config", "--local", "--get", "remote.origin.url", check=False, safe=True).stdout.strip()
-        if cur and norm_repo(cur) != repo.lower():
-            raise OriginElsewhere()
-        rw = git(workdir, "config", "--local", "--get-regexp", r"^url\..*\.(insteadof|pushinsteadof)$", check=False, safe=True).stdout
-        base = "https://github.com/%s.git" % repo
-        if any(base.startswith(l.split(None, 1)[1]) for l in rw.splitlines() if " " in l):
-            raise OriginElsewhere()
-    status = git(workdir, "status", "--porcelain", "-z", "--untracked-files=all", safe=sf).stdout
+        config_refusal(workdir, repo, ctx)
+    status = git(workdir, "status", "--porcelain", "-z", "--untracked-files=all", ctx=ctx).stdout
     paths = [e[3:] for e in status.split("\0") if len(e) > 3]
     skipped = sorted(p for p in paths if is_secret(p))
     if paths:
         keep = [p for p in paths if not is_secret(p)]
         if keep:
-            git(workdir, "add", "-A", "--", *keep, safe=sf)
-            if git(workdir, "diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv", check=False, safe=sf).returncode != 0:
+            git(workdir, "add", "-A", "--", *keep, ctx=ctx)
+            if git(workdir, "diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv", check=False, ctx=ctx).returncode != 0:
                 git(workdir, "-c", "user.name=cw-worker", "-c", "user.email=cw-worker@invalid",
-                    "commit", *(["--no-verify"] if prestop else []), "-m", "WIP: work in progress saved by %s at the end of the worker" % worker, safe=sf)
+                    "commit", *(["--no-verify"] if prestop else []), "-m", "WIP: work in progress saved by %s at the end of the worker" % worker, ctx=ctx)
     # refs must be current: a stale one could call unpushed work safe. prestop fetches from the explicit URL, never the configured origin
     if prestop:
-        git(workdir, "fetch", "--prune", url, "+refs/heads/*:refs/remotes/origin/*", safe=True)
+        git(workdir, "fetch", "--prune", url, "+refs/heads/*:refs/remotes/origin/*", ctx=ctx)
     else:
         git(workdir, "fetch", "--prune", "origin")
-    contained = git(workdir, "branch", "-r", "--contains", "HEAD", safe=sf).stdout.strip()
+    contained = git(workdir, "branch", "-r", "--contains", "HEAD", ctx=ctx).stdout.strip()
     if contained:
         return {"pushed": False, "wip_branch": None, "skipped": skipped}
     branch = "%s/wip" % worker
-    # prestop: a plain push, never forced and no lease: a non-fast-forward answer is a failure, not an overwrite
+    # prestop: a plain push to the explicit URL, never forced and no lease: a non-fast-forward answer is a failure, not an overwrite
     if prestop:
-        git(workdir, "push", "--no-verify", url, "HEAD:refs/heads/" + branch, safe=True)
+        git(workdir, "push", "--no-verify", url, "HEAD:refs/heads/" + branch, ctx=ctx)
     else:
         git(workdir, "push", "--force-with-lease", "origin", "HEAD:refs/heads/" + branch)
     return {"pushed": True, "wip_branch": branch, "skipped": skipped}
@@ -111,19 +142,29 @@ def prestop_main():
     if not REPO_RE.match(repo) or repo.startswith(".") or ".." in repo:
         print("cw-prestop: not pushed (the repository name is not valid); work left in %s" % workdir)
         return 0
+    helper = find_helper()
+    if not helper:
+        print("cw-prestop: not pushed (the pod's credential helper was not found); work left in %s" % workdir)
+        return 0
+    ctx = Ctx(helper)
     try:
-        res = run(workdir, worker, prestop=True, repo=repo)
+        res = run(workdir, worker, prestop=True, repo=repo, ctx=ctx)
         if res["pushed"]:
             print("cw-prestop: saved work to %s" % res["wip_branch"])
         return 0
     except OriginElsewhere:
         print("cw-prestop: not pushed (origin points elsewhere); work left in %s" % workdir)
         return 0
+    except ConfigRefused as e:
+        print("cw-prestop: not pushed (the repository configuration is not a plain one: %s); work left in %s" % (e, workdir))
+        return 0
     except (RuntimeError, OSError) as e:
         msg = " ".join(str(e).split())
         msg = re.sub(r"https?://\S+", "<url>", msg)[:80]
         print("cw-prestop: not pushed (%s); work left in %s" % (msg, workdir))
         return 0
+    finally:
+        ctx.close()
 
 
 def main():
