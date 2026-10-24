@@ -103,6 +103,12 @@ class StackUp(unittest.TestCase):
         self.assertNotIn(STACK, again.stdout + again.stderr)
         self.assertEqual(len((again.stderr).strip().splitlines()), 1)
 
+    def test_a_service_named_down_as_a_later_argument_does_not_stop(self):
+        self.entry("true")
+        r = self.up("up", "-d", "down")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.exists(self.copy()))   # the copy stays: only a first argument `down` removes it
+
     def test_without_the_key_nothing_is_copied_and_compose_runs_as_before(self):
         os.remove(os.path.join(self.run_dir, "stack-model-key"))
         self.assertEqual(self.entry("true").returncode, 0)
