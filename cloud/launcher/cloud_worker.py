@@ -1034,12 +1034,25 @@ def gib_of(claim):
     m = re.fullmatch(r"(\d+)(Gi|Mi|Ti)?", str((((claim.get("spec") or {}).get("resources") or {}).get("requests") or {}).get("storage") or "0"))
     if not m:
         return 0
-    return int(m.group(1)) * {"Gi": 1, "Mi": 0, "Ti": 1024, None: 0}[m.group(2)]
+    n, unit = int(m.group(1)), m.group(2)
+    return -(-n // 1024) if unit == "Mi" else n * {"Gi": 1, "Ti": 1024, None: 0}[unit]   # Mi rounds UP to a whole GiB (the cap never under-counts)
 
 
 def disk_line(claims):
     total = sum(gib_of(c) for c in claims)
     return "disks: %d GiB retained at %s USD per GiB-month = %.2f USD per month" % (total, ("%.3f" % DISK_USD_PER_GIB_MONTH), total * DISK_USD_PER_GIB_MONTH)
+
+
+def verify_claim(claim, worker, gib=None):
+    """A claim of this name is attached or deleted only when this launcher made it: the app label, the worker's own cw/worker label,
+    and (for an attach) a size not smaller than the one asked. Returns a one-line reason when it is not, else ''."""
+    meta = claim.get("metadata") or {}
+    labels = meta.get("labels") or {}
+    if labels.get("app") != LABEL or labels.get("cw/worker") != worker:
+        return "volume claim %s is not this launcher's claim for %s (its app / cw/worker labels differ); it is left untouched" % (meta.get("name"), worker)
+    if gib is not None and gib_of(claim) < gib:
+        return "volume claim %s holds %d GiB, less than the %d GiB asked; it is left untouched" % (meta.get("name"), gib_of(claim), gib)
+    return ""
 
 
 def render_pod(a, worker, name, now, hard, env, run_names=(), disk=None):
@@ -1285,6 +1298,11 @@ class Launcher:
                 raise CloudError("refusing a pod spec with a stored credential: %s" % ", ".join(hits), EXIT_USAGE)
             if self.kube.get_pod(name) or (persistent and (self.kube.get_workload(name) or self.kube.get_pod(name + "-0"))):
                 raise CloudError("worker %s already exists" % worker, EXIT_EXISTS)
+            if disk:   # an existing claim of the derived name is attached only when it is this worker's own and not smaller (before anything is made)
+                existing = self.kube.get_claim(claim_name(name, persistent))
+                bad = verify_claim(existing, worker, disk["gib"]) if existing else ""
+                if bad:
+                    raise CloudError(bad, EXIT_REFUSED)
             password = secrets.token_urlsafe(32)
             self.kube.add_secrets(password)
             # The check above is not atomic with the creates below; each create is (AlreadyExists fails exactly one of two callers).
@@ -1294,6 +1312,7 @@ class Launcher:
                 if run_values:
                     self._make(made, "run", self.kube.create_run_secret, name, name, run_values, *([a.run_id] if getattr(a, "run_id", None) else []))
                 if claim and not self.kube.get_claim(claim["metadata"]["name"]):   # a launch of the same name finds its claim and attaches it
+                    made["claim"] = True
                     self.kube.apply(claim)
                 if persistent:
                     made["workload"] = False
@@ -1319,8 +1338,12 @@ class Launcher:
                 note = self._run_secret_note(name, made, left)
                 if note:
                     err = CloudError("%s; %s" % (err, note), err.code)
+                dnote = self._disk_note(worker, name, persistent) if disk else ""
+                if dnote:
+                    err = CloudError("%s; %s" % (err, dnote), err.code)
                 raise err
             except BaseException as e:  # interrupt or an unexpected exception: clean up, audit, say what was cleaned
+                self._disk_report = self._disk_note(worker, name, persistent) if disk else ""
                 self._abort(worker, name, made, e)
             if disk:
                 print("cloud-worker: " + self.cost_line(), file=sys.stderr)
@@ -1419,6 +1442,23 @@ class Launcher:
             return "create failed; per-run secret %s-run REMAINS: delete it with: %s" % (name, self.kube.delete_command("secret", name + "-run"))
         return "create failed; per-run secret %s-run cleaned" % name
 
+    def _disk_note(self, worker, name, persistent):
+        """After a failed create: the disk claim is KEPT (never deleted by a failed launch); say so once, with the delete command, and for a
+        claim that is still Pending the storage class and the claim's own condition message."""
+        cname = claim_name(name, persistent)
+        try:
+            c = self.kube.get_claim(cname)
+        except CloudError:
+            return ""
+        if not c:
+            return ""
+        st = c.get("status") or {}
+        out = "disk claim %s is kept" % cname
+        if st.get("phase") == "Pending":
+            msgs = "; ".join(str(x.get("message")) for x in st.get("conditions", []) if x.get("message"))
+            out += " but is Pending (storage class %s%s)" % ((c.get("spec") or {}).get("storageClassName") or "the cluster default", ": " + self.kube.scrub(msgs, 200) if msgs else "")
+        return out + "; delete it with: cloud-worker delete-disk %s" % worker
+
     def _abort(self, worker, name, made, exc):
         interrupted = isinstance(exc, (Interrupted, KeyboardInterrupt))
         left = self._cleanup(name, made)
@@ -1429,6 +1469,9 @@ class Launcher:
         note = self._run_secret_note(name, made, left)
         if note:
             reason += "; " + note
+        if getattr(self, "_disk_report", ""):
+            reason += "; " + self._disk_report
+            self._disk_report = ""
         self.audit(worker, "pod/" + name, "create.interrupted" if interrupted else "create.failed", 0.0, False, reason)
         err = CloudError("create %s" % reason, EXIT_INTERRUPTED if interrupted else EXIT_CLOUD)
         err.audited = True
@@ -1625,7 +1668,11 @@ class Launcher:
         name, gone = pod_name(worker), []
         for persistent in (True, False):
             c = claim_name(name, persistent)
-            if self.kube.get_claim(c):
+            found = self.kube.get_claim(c)
+            if found:
+                bad = verify_claim(found, worker)
+                if bad:
+                    raise CloudError(bad, EXIT_REFUSED)
                 self.kube.delete_claim(c)
                 gone.append(c)
         return gone
