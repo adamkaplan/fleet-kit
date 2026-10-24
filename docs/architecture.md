@@ -11,7 +11,11 @@ A **unit** is a file: the entry `bin/fleet-switchboard`, a part under `bin/switc
 4. No unit file is over 1,500 lines, and no test file (`bin/test-*` and `tests/switchboard/**`) over 2,500 lines.
 5. A name two units define and a third reads is an ambiguous owner: which one is meant is not decided by the code, so it is a violation (kind `ambiguous`; the row's To is the owners joined by `+`).
 6. Every file of `bin/*.py`, `bin/switchboard/*.py` and the entry is a row of the unit table, and every row is a file.
-7. Today's code breaks some of these rules: the daemon grew as one namespace. Each break is a row of **Known violations**, with its count. A violation that is not a row fails the test; a row with no violation left fails the test (delete it); a count that went over its ceiling fails the test. The list only shrinks. It must end empty.
+7. Today's code breaks some of these rules: the daemon grew as one namespace. Each break is a row of **Known violations**, with its count. A violation that is not a row fails the test; a row with no violation left fails the test (delete it); a dependency count that is not exactly its row's number fails the test (more is a new break; fewer means the row is written lower, and the message names the number). The two `size` rows (the entry and `bin/test-switchboard`) are ceilings with headroom: a file within its ceiling passes, a file over it fails with the number to write and what to do, and a row more than 3,000 lines above its file fails with the lower number to write. The list only shrinks. It must end empty. A move that lowers a count lowers its row in the same pull request.
+
+## Where a new test goes
+
+A new file `tests/switchboard/test_<unit>.py` is preferred, named for the unit it is about, and it is picked up by `bin/test-switchboard` like `test_architecture.py`. Appending to `bin/test-switchboard` is allowed until the test split empties it, within the size row's headroom; when a change would go past the ceiling, the test names where the new tests go (a file under `tests/switchboard/`) or which row to lower.
 
 ## Layers
 
@@ -37,6 +41,7 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 | `closed_labels.py` | 0 | a closed issue never keeps asking for an answer | |
 | `dead_hint.py` | 0 | what is known about a dead agent and what to do about it (pure text) | |
 | `merged_labels.py` | 0 | a merged pull request does not keep its hold | |
+| `plan_approval.py` | 0 | the check of an approval sent as a message (pure) | |
 | `path_walk.py` | 0 | one walk up from a trusted path, shared by the cloud launcher and the installer | |
 | `repo_exclusion.py` | 0 | repositories the owner keeps out of the fleet's view are never watched or read | |
 | `report_fold.py` | 0 | folding a report into an earlier send | |
@@ -100,12 +105,12 @@ The **Holds** column is descriptive: only the layer numbers are enforced.
 
 ## Known violations
 
-Kinds (the number is exact: see rule 7): `namespace` (a part uses names the entry defines: one namespace), `entry-import` (a part relies on an import the entry made), `size` (a file over its limit: the ceiling is in lines), `ambiguous` (a name defined by two units and read by a third), `import` (a unit reaches a higher layer by an import or `load_module`), `cycle` (units of one layer that depend on each other).
+Kinds (the number is exact, except `size`, a ceiling with headroom: see rule 7): `namespace` (a part uses names the entry defines: one namespace), `entry-import` (a part relies on an import the entry made), `size` (a file over its limit: the ceiling is in lines), `ambiguous` (a name defined by two units and read by a third), `import` (a unit reaches a higher layer by an import or `load_module`), `cycle` (units of one layer that depend on each other).
 
 | From | To | Kind | Count | Why it is allowed today |
 |---|---|---|---|---|
-| `bin/test-switchboard` | `-` | size | 90,747 | the one test file; the test split (ST0 and its follow-ups) moves its fakes and classes beside the units |
-| `fleet-switchboard` | `-` | size | 30,597 | the entry still holds every section not yet moved to a part; each move slice lowers the ceiling |
+| `bin/test-switchboard` | `-` | size | 92,500 | the one test file; the test split (ST0 and its follow-ups) moves its fakes and classes beside the units |
+| `fleet-switchboard` | `-` | size | 31,500 | the entry still holds every section not yet moved to a part; each move slice lowers the ceiling |
 | `switchboard/decisions_a.py` | `fleet-switchboard` | entry-import | 7 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/decisions_b.py` | `fleet-switchboard` | entry-import | 9 | the part relies on a standard-library module the entry imported; it gets its own import line |
 | `switchboard/import_v1.py` | `fleet-switchboard` | entry-import | 7 | the part relies on a standard-library module the entry imported; it gets its own import line |
@@ -133,7 +138,7 @@ This is a closed, conservative rule. It over-counts by design and fails closed: 
 
 **What is followed.** Only a direct call with a constant module name, spelled as such: `__import__("x")`, `importlib.import_module("x")`, `from importlib import import_module` then `import_module("x")`, and `load_module("x")` (also as `obj.load_module("x")` on any object); and the `load_x()` helpers. Everything else is a site, and the import statement of the module still counts as one.
 
-**What is outside the rule**, said plainly: a name re-exported under another name (`from helpers import loader as get`), a name assembled at run time (`'sy' + 's'`, an f-string), and a way to load code that involves none of these modules or builtins, for example a module object handed in by a caller (`def f(m, n): return getattr(m, n)`), a name looked up in `globals()` with a variable key. It is not listed and not chased.
+**What is outside the rule**, said plainly: a name re-exported under another name (`from helpers import loader as get`), a name assembled at run time (`'sy' + 's'`, an f-string), and a way to load code that involves none of these modules or builtins, for example a module object handed in by a caller (`def f(m, n): return getattr(m, n)`), a name looked up in `globals()` with a variable key. It is not listed and not chased. Primitives that the rule does not name and the test does not list either: `ctypes`, `marshal`, `types.ModuleType`, `code` and `codeop`, `py_compile` and `compileall`, `pickle`, and `__loader__` and `sys.meta_path` reached other than through `sys`. They are limits of the stated rule, not hidden: a change that uses one is reviewed, not counted.
 
 A site is listed by the function it sits in and its kind, with a count: `import(module)` for an import statement, the module name for a use of the module object, `sys.modules`, or the builtin with `(non-constant)`, `(relative)`, `(reference)` or `(string)`. A new site, a swapped site, a wrong count or a stale row fails the test.
 

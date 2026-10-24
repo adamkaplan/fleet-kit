@@ -10,7 +10,8 @@ and `symtable` and fails when:
     matches a violation: the list only shrinks, and it is exact;
   - two units of one layer depend on each other (a cycle);
   - a name is defined by two units and a third reads it (an ambiguous owner: which one is meant is not decided by the code);
-  - a source file is over 1,500 lines or a test file over 2,500 (unless it is a `size` row with a ceiling).
+  - a source file is over 1,500 lines or a test file over 2,500 (unless it is a `size` row: a ceiling with headroom, lowered when a PR leaves more than
+    3,000 lines of it unused, and named with the number to write when it is exceeded).
 
 Dynamic imports it cannot follow (a non-constant `import_module`, `load_module` or `__import__`, a path-based load) are counted per unit and listed
 in the document's "Dynamic imports not followed" table, so the blind spot is visible and cannot grow unseen.
@@ -35,6 +36,7 @@ SOURCE_LIMIT = 1500
 TEST_LIMIT = 2500
 LAYERS = range(0, 7)
 KINDS = ("namespace", "entry-import", "ambiguous", "import", "size", "cycle")
+SIZE_UNUSED = 3000   # a size row is a ceiling with headroom; it is lowered when more than this many lines of it are unused
 
 
 # ---------------------------------------------------------------- the document
@@ -500,6 +502,15 @@ def check(root, text):
     for key, count in sorted(actual.items()):
         if key not in allowed:
             problems.append("new violation %s -> %s (%s, %d): fix it, or add a row to Known violations with its reason" % (key[0], key[1], key[2], count))
+        elif key[2] == "size":   # a ceiling with headroom, not an exact count
+            ceiling = allowed[key][0]
+            new_row = -(-(count + 500) // 500) * 500
+            where = ("write the new tests in tests/switchboard/test_<unit>.py, or lower another row" if key[0].startswith(("bin/test-", "tests/"))
+                     else "put the new code in a part file bin/switchboard/<job>.py, or lower another row")
+            if count > ceiling:
+                problems.append("%s is %d lines, over its ceiling of %d: %s (a growth that is meant: write %d in its row)" % (key[0], count, ceiling, where, new_row))
+            elif count + SIZE_UNUSED < ceiling:
+                problems.append("%s is down to %d lines, %d under its ceiling of %d: write %d in its row" % (key[0], count, ceiling - count, ceiling, new_row))
         elif count > allowed[key][0]:
             problems.append("violation %s -> %s (%s) is %d, over its row's %d: a new break" % (key[0], key[1], key[2], count, allowed[key][0]))
         elif count < allowed[key][0]:
@@ -670,6 +681,29 @@ class TestArchitectureDocumentFailurePaths(unittest.TestCase):
         self.assertEqual(self.problems(entry=entry), ["new violation fleet-switchboard -> - (size, %d): fix it, or add a row to Known violations with its reason" % (SOURCE_LIMIT + 1)])
         row = "| `fleet-switchboard` | `-` | size | %d | being split |\n" % (SOURCE_LIMIT + 1)
         self.assertEqual(self.problems(entry=entry, doc_violations=row), [])
+
+    def test_a_size_row_is_a_ceiling_with_headroom_and_says_what_to_do_beyond_it(self):
+        base = 3000
+        big = "X = 1\n" * base
+        row = lambda ceiling: "| `bin/test-big` | `-` | size | %d | being split |\n" % ceiling
+        for growth in (0, 1, 1000, 1500):   # growth within the headroom passes
+            with self.subTest(growth=growth):
+                root, text = self.build(doc_violations=row(base + 1500))
+                (root / "bin" / "test-big").write_text("x = 1\n" * (base + growth))
+                self.assertEqual(check(root, text), [])
+        root, text = self.build(doc_violations=row(base + 1500))   # beyond it fails, and names what to do and the number
+        (root / "bin" / "test-big").write_text("x = 1\n" * (base + 1501))
+        self.assertEqual(check(root, text), ["bin/test-big is 4501 lines, over its ceiling of 4500: write the new tests in tests/switchboard/test_<unit>.py, "
+                                             "or lower another row (a growth that is meant: write 5500 in its row)"])
+        root, text = self.build(doc_violations="| `fleet-switchboard` | `-` | size | %d | being split |\n" % (SOURCE_LIMIT + 10), entry="X = 1\n" * (SOURCE_LIMIT + 11))
+        self.assertEqual(check(root, text), ["fleet-switchboard is 1511 lines, over its ceiling of 1510: put the new code in a part file bin/switchboard/<job>.py, "
+                                             "or lower another row (a growth that is meant: write 2500 in its row)"])
+        root, text = self.build(doc_violations=row(base + 3500))   # a PR that shrinks the file leaves the ceiling too high: it names the number to write
+        (root / "bin" / "test-big").write_text("x = 1\n" * base)
+        self.assertEqual(check(root, text), ["bin/test-big is down to 3000 lines, 3500 under its ceiling of 6500: write 3500 in its row"])
+        root, text = self.build(doc_violations=row(base + 3000))   # exactly the allowed slack is fine
+        (root / "bin" / "test-big").write_text("x = 1\n" * base)
+        self.assertEqual(check(root, text), [])
 
     def test_a_name_two_units_define_and_a_third_reads_is_an_ambiguous_owner(self):
         parts = {"a.py": "def f():\n    return 1\n", "b.py": "def f():\n    return 2\n", "c.py": "def g():\n    return f()\n"}
