@@ -11878,7 +11878,7 @@ def pr_facts_from(data):
             "reviews_older": pr_review_older(data.get("reviews"), head, pr_login(data.get("author"))),
             "head_at": pr_head_time(data.get("commits")),
             "additions": count("additions"), "deletions": count("deletions"), "files": count("changedFiles"),
-            "ci": pr_ci_of(data.get("statusCheckRollup")), "review": review,
+            "ci": pr_ci_of(data.get("statusCheckRollup")), "ci_rollup": data.get("statusCheckRollup"), "review": review,
             # PR 52: a conflict is `mergeable` CONFLICTING, found in the read a notice already costs; the head
             # commit is what makes it one event per push
             "mergeable": str(data.get("mergeable") or "").upper() or None,
@@ -24607,7 +24607,8 @@ def ci_record_core(ctx, now, quiet=False):
     if ci != "green":
         if not quiet:
             _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="CI is %s at the head" % ci))
-        return dict(out, status="not-green", why="CI is %s at %s (only a complete, green run is recorded)" % (ci, head[:8]))
+        named = "; ".join("%s run %s is %s" % (w or "status", r, st) for w, r, st in load_module("ci_runs").not_green_runs((ctx.facts or {}).get("ci_rollup"))[:3]) if (ctx.facts or {}).get("ci_rollup") else ""
+        return dict(out, status="not-green", why="CI is %s at %s (only a complete, green run is recorded)%s" % (ci, head[:8], " [%s]" % named if named else ""))
     if not wanted:
         if not quiet:   # nothing was recorded, so this is NOT proof that the recorder works (ok stays False for the preflight)
             _gates_audit(ctx.engine, "gate.ci_record", ctx.pr, dict(detail, ok=False, why="no scenario names ci"))

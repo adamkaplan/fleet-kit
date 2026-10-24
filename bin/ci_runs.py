@@ -15,6 +15,7 @@ keeps, for each check, only the run that decides; every reader of the rollup goe
   by guessing.
 """
 
+import re
 from datetime import datetime, timezone
 
 _ZERO_YEAR = 1   # gh's "no completion time" is 0001-01-01T00:00:00Z
@@ -60,11 +61,44 @@ def _identity(entry, position):
     return (workflow if isinstance(workflow, str) else "", name)
 
 
+def _run_id(entry):
+    """The workflow run id of a check run (from its detailsUrl `.../actions/runs/<id>/...`), or None (a status context, or no url)."""
+    url = entry.get("detailsUrl")
+    found = re.search(r"/actions/runs/(\d+)", url) if isinstance(url, str) else None
+    return int(found.group(1)) if found else None
+
+
+def latest_runs(rollup):
+    """`rollup` without the checks of an OLDER run of a workflow: for each workflow only its LATEST run (the highest run id, ids grow with
+    creation) counts, whatever the check names. Entries with no workflow or no run id (status contexts) are kept for the by-name rule."""
+    if not isinstance(rollup, list):
+        return []
+    top = {}
+    for entry in rollup:
+        run = _run_id(entry) if isinstance(entry, dict) and isinstance(entry.get("workflowName"), str) else None
+        if run is not None:
+            flow = entry["workflowName"]
+            top[flow] = max(top.get(flow, run), run)
+    return [e for e in rollup if not (isinstance(e, dict) and isinstance(e.get("workflowName"), str) and _run_id(e) is not None
+                                      and _run_id(e) < top[e["workflowName"]])]
+
+
+def not_green_runs(rollup):
+    """[(workflow, run id, state)] of the latest runs that are not complete and green, for a refusal that names them."""
+    bad = []
+    for e in newest(rollup):
+        word = str(e.get("conclusion") or e.get("state") or "").upper()
+        if _unfinished(e) or word not in ("SUCCESS", "NEUTRAL", "SKIPPED"):
+            bad.append((e.get("workflowName") or "", _run_id(e), (word or str(e.get("status") or "pending")).lower()))
+    return bad
+
+
 def newest(rollup):
     """`rollup` (gh's statusCheckRollup) with only the run that decides for each check, in the original order. Anything that is not a list
     gives []; an entry that is not a dict is dropped (as every reader of the rollup already skipped it)."""
     if not isinstance(rollup, list):
         return []
+    rollup = latest_runs(rollup)   # only the latest run of each workflow counts
     groups = {}
     for position, entry in enumerate(rollup):
         if isinstance(entry, dict):

@@ -87384,6 +87384,48 @@ class TestAssembler(unittest.TestCase):
         self.assertIn("usage: fleet-switchboard status", done.stdout)
 
 
+class TestLatestRunOfWorkflow(unittest.TestCase):
+    """Ask #1237: for each workflow only the LATEST run counts, whatever the check names; pr_ci_of is the one reading ci-record and the gate share."""
+
+    @staticmethod
+    def chk(flow, run, name, concl, status="COMPLETED"):
+        return {"workflowName": flow, "name": name, "conclusion": concl, "status": status, "startedAt": "2026-10-15T1%d:00:00Z" % (run % 10),
+                "completedAt": "2026-10-15T1%d:30:00Z" % (run % 10), "detailsUrl": "https://github.com/o/r/actions/runs/%d/job/1" % run}
+
+    def first(self):
+        return [self.chk("ci", 100, n, "CANCELLED") for n in ("plan", "matrix.name", "matrix.cloud")]
+
+    def test_s2_cancelled_first_run_then_green_second_run(self):
+        self.assertEqual(sb.pr_ci_of(self.first() + [self.chk("ci", 101, "build", "SUCCESS")]), "green")
+
+    def test_s3_second_run_red_or_running(self):
+        self.assertEqual(sb.pr_ci_of(self.first() + [self.chk("ci", 101, "build", "FAILURE")]), "failing")
+        self.assertEqual(sb.pr_ci_of(self.first() + [self.chk("ci", 101, "build", "", "IN_PROGRESS")]), "pending")
+
+    def test_s4_two_workflows_and_a_cancelled_latest(self):
+        self.assertEqual(sb.pr_ci_of([self.chk("W", 102, "a", "SUCCESS"), self.chk("X", 103, "b", "SUCCESS"), self.chk("X", 104, "b2", "CANCELLED")]), "failing")
+        self.assertEqual(sb.pr_ci_of([self.chk("X", 104, "b2", "CANCELLED")]), "failing")
+
+    def test_s5_no_run_and_queued_named(self):
+        self.assertEqual(sb.pr_ci_of([]), "none")
+        bad = load_ci_runs().not_green_runs(self.first() + [self.chk("ci", 101, "build", "", "QUEUED")])
+        self.assertEqual(bad[0][:2], ("ci", 101))
+
+    def test_s6_one_definition(self):
+        text = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci_runs.py")).read()
+        self.assertEqual(text.count("def latest_runs("), 1)
+
+    def test_u2_status_context_by_name(self):
+        red = {"context": "legacy", "state": "FAILURE", "startedAt": "2026-10-15T10:00:00Z"}
+        green = {"context": "legacy", "state": "SUCCESS", "startedAt": "2026-10-15T11:00:00Z"}
+        self.assertEqual(sb.pr_ci_of([red]), "failing")
+        self.assertEqual(sb.pr_ci_of([red, green]), "green")
+
+
+def load_ci_runs():
+    return sb.load_module("ci_runs")
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
