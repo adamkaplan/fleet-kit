@@ -483,12 +483,7 @@ class RealRuleMutants(unittest.TestCase):
         self.caught("test_head_moves_inside_decision")
 
     def test_mutant_holder_check_removed(self):
-        orig = relay.Executor._write
-
-        def no_holder(ex, command, pod, req, call, pr, cid, args):
-            ex.backend.holder_of = lambda r, i: pod   # the check can no longer refuse anyone
-            return orig(ex, command, pod, req, call, pr, cid, args)
-        self.patch(relay.Executor, "_write", no_holder)
+        self.patch(relay.Executor, "_check_holder", lambda ex, pod, req: None)
         self.caught("test_proof_from_non_holder_403")
 
     def test_mutant_author_exclusion_removed(self):
@@ -501,7 +496,8 @@ class RealRuleMutants(unittest.TestCase):
         self.caught("test_non_evaluator_403")
 
     def test_mutant_pr_issue_link_removed(self):
-        self.caught("test_pr_not_linked_to_the_pods_issue_refused_for_all_three", lambda case: setattr(case.backend, "pr_issues", lambda pr: {1, 2}))
+        self.patch(relay.Executor, "_check_linked", lambda ex, pr, req: None)
+        self.caught("test_pr_not_linked_to_the_pods_issue_refused_for_all_three")
 
     def test_mutant_call_id_global_not_per_pod(self):
         key = lambda pod: "any" if "\n" not in pod else pod

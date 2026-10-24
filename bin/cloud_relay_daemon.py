@@ -157,9 +157,7 @@ class Executor:
             if command in NEEDS_HEAD and not SHA_RE.fullmatch(str(call.get("head") or "")):
                 raise Refuse(400, "%s needs the head sha it judged" % command)
             if command in NEEDS_LINK:   # the PR must be the one linked to the issue this pod is bound to
-                linked = {str(i) for i in (self.backend.pr_issues(pr) or ())}
-                if str(req.get("issue")) not in linked:
-                    raise Refuse(403, "pr not linked to the pod's issue")
+                self._check_linked(pr, req)
             if command == "gates":   # read-only and not indexed: nothing to replay
                 out = self.backend.gates(pr)
                 self.backend.audit("gates", pr, {"by": pod, "call_id": cid})
@@ -199,6 +197,15 @@ class Executor:
             self.backend.audit("relay.refused", pr, {"by": pod, "status": 409, "why": clean_text(err)})
             return 409, "the ledger refused the write", None
 
+    def _check_linked(self, pr, req):
+        linked = {str(i) for i in (self.backend.pr_issues(pr) or ())}
+        if str(req.get("issue")) not in linked:
+            raise Refuse(403, "pr not linked to the pod's issue")
+
+    def _check_holder(self, pod, req):
+        if self.backend.holder_of(req.get("repo"), req.get("issue")) != pod:
+            raise Refuse(403, "proof only from the pod holding the work item")
+
     def _write(self, command, pod, req, call, pr, cid, args):
         b, head = self.backend, call["head"]
         sid = args.get("scenario")
@@ -217,8 +224,7 @@ class Executor:
         base = {"pr": pr, "scenario": sid, "plan_ref": plan["source"], "plan_hash": plan["hash"], "head": head,
                 "result": result, "by": pod, "evidence": evidence, "call_id": cid}
         if command == "prove":
-            if b.holder_of(req.get("repo"), req.get("issue")) != pod:
-                raise Refuse(403, "proof only from the pod holding the work item")
+            self._check_holder(pod, req)
             entry = dict(base, kind="proof", command=plan_ledger.clip(str(args.get("command") or "")), env="relay")
         else:
             named = scenario.get("evaluator")
