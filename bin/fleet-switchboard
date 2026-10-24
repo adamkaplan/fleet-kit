@@ -7974,6 +7974,7 @@ BOSS_READ_SITES = {
     "bin/fleet_health.py:reconstruct_day": "history: the boss named in a past `v2.session.create` audit row",
     "bin/item_verdicts.py:excluded": "reads the fleets the discovery built (the boss record already applied); it only EXCLUDES writers, so a worker adopted by a registered orchestrator is excluded too",
     "bin/launch_testers.py:launched": "history: the boss named in a launch record, not a live lookup",
+    "bin/fleet-switchboard:live_cloud_by_lane": "a cloud worker's own endpoint record (not a discovered agent): its reports_to is read from the record, then resolved by resolve_boss, for the load line count only",
     "bin/cloud_worker.py:cmd_retire": "a cloud worker's own endpoint record (not a discovered agent: out of scope of the boss record)",
 }
 
