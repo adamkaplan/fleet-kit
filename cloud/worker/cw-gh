@@ -374,7 +374,9 @@ def pr_edit(args):
     if has_other_separator(new):
         raise refused("pr-edit-body-separator")
     # a hold line is the whole line, exactly ('MERGE: captain\r' is not one); the new body keeps the same number of them
-    if HOLD in lines_of(cur) and lines_of(new).count(HOLD) != lines_of(cur).count(HOLD):
+    # (the CURRENT body may come from the web page with CRLF: its hold line then ends in \r and still counts)
+    cur_holds = [l for l in lines_of(cur) if l in (HOLD, HOLD + "\r")]
+    if cur_holds and lines_of(new).count(HOLD) != len(cur_holds):
         raise refused("pr-edit-no-hold-line")
     out = parse_json(request("PATCH", "/repos/%s/pulls/%d" % (repo, n), {"body": new}))
     print(out.get("html_url", ""))

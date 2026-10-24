@@ -24,7 +24,7 @@ class T(base.T):
                 self.refused(self.edit(7, f), "pr-edit-body-separator")
 
     def test_h1_crlf_bodies_still_work_and_the_hold_line_is_found(self):
-        f = self.file("crlf", "A\r\nMERGE: captain\r\nB\r\n")
+        f = self.file("crlf", "A\r\nMERGE: captain\nB\r\n")   # CRLF elsewhere is fine; the hold line is exact in the new body
         PRS[7] = pr(body="x\r\nMERGE: captain\r\n")
         self.assertEqual(self.edit(7, f).returncode, 0)
         self.assertEqual(len(patches()), 1)
@@ -226,6 +226,36 @@ class T(base.T):
         self.assertNotEqual(mutated, open(self.DOC).read())
         self.assertNotIn(self.RESIDUAL, mutated)
 
+    def test_l1_a_crlf_current_body_hold_line_is_protected_but_a_crlf_new_one_is_not_accepted(self):
+        PRS[7] = pr(body="x\r\nMERGE: captain\r\n")
+        self.refused(self.edit(7, self.nohold), "pr-edit-no-hold-line")
+        self.refused(self.edit(7, self.file("crnew", "A\r\nMERGE: captain\r\n")), "pr-edit-no-hold-line")
+        PRS[7] = pr(body="x\r\nMERGE: captain\r\n")
+        self.assertEqual(self.edit(7, self.file("lfnew", "A\nMERGE: captain\n")).returncode, 0)
+
+    def test_l1_mutant_exact_current_line_only_lifts_the_crlf_protection(self):
+        m = self.mut("mut-crcur", 'l in (HOLD, HOLD + "\\r")]', 'l == HOLD]')
+        PRS[7] = pr(body="x\r\nMERGE: captain\r\n")
+        self.assertEqual(self.edit(7, self.nohold, script=m).returncode, 0)
+        self.assertEqual(self.edit(7, self.nohold).returncode, 3)
+
+    def test_l3_the_secret_globs_equal_the_end_hooks(self):
+        import importlib.util
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..")
+        spec = importlib.util.spec_from_file_location("end_hook_x", os.path.join(root, "cloud", "launcher", "end_hook.py"))
+        eh = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(eh)
+        import re
+        src = open(CW_GH).read()
+        mine = eval(re.search(r"^SECRET_GLOBS = (\[.*?\])", src, re.S | re.M).group(1))
+        self.assertEqual(mine, list(eh.SECRET_GLOBS))
+
+    def test_l3_mutant_with_an_extra_glob_differs(self):
+        m = self.mut("mut-glob", '".npmrc"]', '".npmrc", "*.extra"]')
+        src = open(m).read()
+        self.assertIn('"*.extra"', src)
+        self.assertNotIn('"*.extra"', open(CW_GH).read())
+
     def test_r1_mutant_without_the_git_check_publishes_the_git_config(self):
         m = self.mut("mut-nogit", "    check_body_path(path, real)\n", "    pass\n")
         cfg = os.path.join(self.work, ".git", "config")
@@ -246,8 +276,8 @@ class T(base.T):
     def test_r2_a_carriage_return_hold_line_is_not_a_hold_line(self):
         PRS[7] = pr(body="A\nMERGE: captain\n")
         self.refused(self.edit(7, self.file("crhold", "A\nMERGE: captain\r\n")), "pr-edit-no-hold-line")   # CRLF form: not the hold line
-        PRS[7] = pr(body="A\nMERGE: captain\r\n")   # a strict reader sees no hold line here: nothing to protect
-        self.assertEqual(self.edit(7, self.nohold).returncode, 0)
+        PRS[7] = pr(body="A\nMERGE: captain\r\n")   # ask 1200 low (a): a CRLF CURRENT body is protected
+        self.refused(self.edit(7, self.nohold), "pr-edit-no-hold-line")
         PRS[7] = pr(body="A\nMERGE: captain\n")
         self.refused(self.edit(7, self.file("lonecr", "A\nMERGE: captain\rB\n")), "pr-edit-body-separator")
 
