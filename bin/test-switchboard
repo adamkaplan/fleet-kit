@@ -37822,6 +37822,70 @@ class TestRegistrarFloor(LedgerBase):
         self.assertEqual(got, [], "the real registrars give 0 findings")
         print("registrar findings over the real daemon file: %d" % len(got))
 
+    EVIL = "def zz_evil(sub):\n    import os; os.system(\"x\")\n"
+    MODULE_LEVEL = ('for node in _import_time_statements(head.body):', 'for node in ():')
+    WRITER_LEVEL = ('if _spans(node, added):\n            found.append(("a changed line of a function that writes', 'if False:\n            found.append(("a changed line of a function that writes')
+
+    def rebind_held(self, module, spelling):
+        """True when the REAL owner_decide holds the daemon file text with the spelling and `zz_evil` appended; an exception of a mutant counts as not held."""
+        head = self.base_src + "\n" + spelling + "\n" + self.EVIL
+        try:
+            got, why = module.registrar_findings(self.base_src, head, self.rule)
+        except Exception:
+            return False
+        report = {"findings": got, "closure": self.names, "why": why}
+        decision, reasons = sb.impact_floor.owner_decide(sb.impact_floor.load_matrix(), ["bin/fleet-switchboard"], [], registrar=report)
+        return decision == "hold" and any(r.startswith("registrar ") for r in reasons)
+
+    def pin_layer(self, spelling, *layers):
+        self.assertTrue(self.rebind_held(self.dc, spelling), "held, not 'none, no findings': " + spelling)
+        module = self.mutant_module(*layers[0])
+        module._applied = [layers[0]]
+        for anchor in layers[1:]:
+            module = self.mutant_module_chain(module, *anchor)
+        self.assertFalse(self.rebind_held(module, spelling), "a mutant without the named layer(s) still holds it")
+
+    def mutant_module_chain(self, module, old, new):
+        import types
+        path = BIN / "delegated_clear.py"
+        text = path.read_text()
+        for o, n in list(getattr(module, "_applied", [])) + [(old, new)]:
+            self.assertEqual(text.count(o), 1, o)
+            text = text.replace(o, n)
+        mutant = types.ModuleType("delegated_clear_mutant")
+        mutant.__file__ = str(path)
+        exec(compile(text, str(path), "exec"), mutant.__dict__)
+        mutant._applied = getattr(module, "_applied", []) + [(old, new)]
+        return mutant
+
+    def test_globals_update_of_the_pattern_is_held_by_the_module_level_statement_layer(self):
+        """Held by the module-level default-deny layer of `registrar_findings` (an added expression statement or namespace reach, `_import_time_statements`); the pattern stays '^a$' for _pattern_rebound, so it is NOT that layer."""
+        self.pin_layer('globals().update(REGISTRAR_NAME_RE=__import__("re").compile("^a$"))', self.MODULE_LEVEL)
+
+    def test_exec_of_the_pattern_is_held_by_the_module_level_statement_layer(self):
+        """Held by the module-level default-deny layer (expression statement and namespace reach: `exec` is in NAMESPACE_NAMES)."""
+        self.pin_layer('exec("REGISTRAR_NAME_RE=__import__(\'re\').compile(\'^a$\')")', self.MODULE_LEVEL)
+
+    def test_a_store_through_sys_modules_of_the_pattern_is_held_by_the_module_level_layer(self):
+        """Held by the module-level namespace-reach layer (`modules` is in NAMESPACE_NAMES, and the store is not a plain binding of the pattern for _pattern_rebound)."""
+        self.pin_layer('sys.modules[__name__].REGISTRAR_NAME_RE=__import__("re").compile("^a$")', self.MODULE_LEVEL)
+
+    def test_a_class_built_with_type_that_rebinds_the_pattern_is_held_by_the_writer_and_module_layers(self):
+        """Held by two layers, both removed by the mutant: a changed line of a function (the lambda) that writes a namespace, and the module-level statement layer for the call."""
+        self.pin_layer('type("X", (), {"__init__": lambda self: globals().update(REGISTRAR_NAME_RE=__import__("re").compile("^a$"))})()', self.MODULE_LEVEL, self.WRITER_LEVEL)
+
+    def test_vars_update_of_the_pattern_is_held_by_the_module_level_statement_layer(self):
+        """Held by the module-level default-deny layer (`vars` is in NAMESPACE_NAMES)."""
+        self.pin_layer('vars().update(REGISTRAR_NAME_RE=__import__("re").compile("^a$"))', self.MODULE_LEVEL)
+
+    def test_a_dict_merge_into_globals_is_held_by_the_module_level_layer_or_the_parser(self):
+        """`globals() |= {...}` does not parse (a call is not an assignment target): held by the fail-closed parse layer of `registrar_findings` (SyntaxError is read as unreadable). `globals().__ior__({...})` and `{**globals(), ...}` are held by the module-level layer."""
+        self.assertTrue(self.rebind_held(self.dc, 'globals() |= {"REGISTRAR_" + "NAME_RE": 1}'))
+        module = self.mutant_module("except (SyntaxError, ValueError, KeyError", "except (ValueError, KeyError")
+        self.assertFalse(self.rebind_held(module, 'globals() |= {"REGISTRAR_" + "NAME_RE": 1}'), "a mutant without the parse layer holds it")
+        self.pin_layer('globals().__ior__({"REGISTRAR_" + "NAME_RE": __import__("re").compile("^a$")})', self.MODULE_LEVEL)
+        self.pin_layer('zz_merged = {**globals(), "REGISTRAR_" + "NAME_RE": __import__("re").compile("^a$")}', self.MODULE_LEVEL)
+
     def test_a_mutant_that_drops_any_one_binding_member_fails(self):
         for kind in list(self.dc.PATTERN_BINDERS):
             with self.subTest(kind):
