@@ -1,5 +1,5 @@
 """cloud/k8s/cloud-hub.yaml (ask #1161): offline parse, kind list, label on every object, empty Secret, shared names."""
-import json, os, sys, unittest
+import copy, json, os, re, sys, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -20,7 +20,8 @@ def kinds_bad(docs):
 
 class T(unittest.TestCase):
     def setUp(self):
-        self.text = open(PATH).read()
+        with open(PATH) as fh:
+            self.text = fh.read()
         self.docs = parse(self.text)
 
     def test_kinds(self):
@@ -103,6 +104,131 @@ class T(unittest.TestCase):
         self.assertEqual(len(s["spec"]["ports"]), 1)
         p = s["spec"]["ports"][0]
         self.assertEqual((p["port"], p["name"], p["protocol"]), (4096, "agent", "TCP"))
+
+
+def _read(*parts):
+    with open(os.path.join(HERE, "..", "..", "..", *parts)) as fh:
+        return fh.read()
+
+
+def section_4c(text):
+    s = text.index("## 4c.")
+    return text[s:text.index("\n## ", s + 5)]
+
+
+PLAIN_APPLY = "kubectl -n cw apply -f cloud/k8s/cloud-hub.yaml"
+
+
+def docs_problems(sec):
+    out = []
+    if "kubectl apply -f cloud/k8s/cloud-hub.yaml" in sec or PLAIN_APPLY in sec:
+        out.append("plain apply")
+    for need in ("kubectl create -f cloud/k8s/cloud-hub.yaml", "set image", "AlreadyExists",
+                 "deregisters every live agent", "delete deployment,service -l", "@sha256:",
+                 ".svc.cluster.local", "created (server dry run)", "get deployment,service,secret"):
+        if need not in sec:
+            out.append("missing " + need)
+    return out
+
+
+class Mut(unittest.TestCase):
+    def setUp(self):
+        with open(PATH) as fh:
+            self.docs = parse(fh.read())
+
+    def dep(self, docs):
+        return [d for d in docs if d["kind"] == "Deployment"][0]
+
+    def bad(self, docs):
+        d = self.dep(docs)
+        sp = d["spec"]["template"]["spec"]
+        c = sp["containers"][0]
+        out = []
+        if sp.get("hostNetwork") or sp.get("hostPID") or sp.get("hostIPC"):
+            out.append("host")
+        if c["securityContext"].get("privileged"):
+            out.append("privileged")
+        if c["securityContext"].get("capabilities") != {"drop": ["ALL"]}:
+            out.append("caps")
+        if sp["securityContext"].get("runAsUser") in (0, None):
+            out.append("root")
+        if c["securityContext"].get("runAsUser") == 0:
+            out.append("root")
+        if c["securityContext"].get("allowPrivilegeEscalation") is not False:
+            out.append("escalation")
+        if any("hostPath" in v for v in sp["volumes"]):
+            out.append("hostpath")
+        if sp.get("automountServiceAccountToken") is not False:
+            out.append("token")
+        for s in docs:
+            if s["kind"] == "Service" and s["metadata"]["name"] == "cloud-hub" and s["spec"].get("type") != "ClusterIP":
+                out.append("svctype")
+        return out
+
+    def test_clean(self):
+        self.assertEqual(self.bad(self.docs), [])
+
+    def mutant(self, fn, want):
+        docs = copy.deepcopy(self.docs)
+        fn(docs)
+        self.assertNotEqual(docs, self.docs)
+        self.assertIn(want, self.bad(docs))
+
+    def test_mutants(self):
+        def sp(d): return self.dep(d)["spec"]["template"]["spec"]
+        def cs(d): return sp(d)["containers"][0]["securityContext"]
+        self.mutant(lambda d: sp(d).update(hostNetwork=True), "host")
+        self.mutant(lambda d: cs(d).update(privileged=True), "privileged")
+        self.mutant(lambda d: cs(d)["capabilities"].update(add=["NET_ADMIN"]), "caps")
+        self.mutant(lambda d: sp(d)["securityContext"].update(runAsUser=0), "root")
+        self.mutant(lambda d: cs(d).update(allowPrivilegeEscalation=True), "escalation")
+        self.mutant(lambda d: sp(d)["volumes"].append({"name": "h", "hostPath": {"path": "/"}}), "hostpath")
+        self.mutant(lambda d: sp(d).update(automountServiceAccountToken=True), "token")
+        for ty in ("LoadBalancer", "NodePort"):
+            def f(d, ty=ty):
+                [x for x in d if x["kind"] == "Service" and x["metadata"]["name"] == "cloud-hub"][0]["spec"]["type"] = ty
+            self.mutant(f, "svctype")
+
+    def test_path_and_nested_pw_mount(self):
+        c = self.dep(self.docs)["spec"]["template"]["spec"]["containers"][0]
+        self.assertEqual(c["command"][1], "/usr/local/bin/cloud_hub.py")
+        self.assertIn("/usr/local/bin/", _read("cloud", "worker", "Dockerfile"))
+        self.assertIn("cloud_hub.py", _read("cloud", "worker", "Dockerfile"))
+
+    def test_header_names_network_policy_ask(self):
+        self.assertIn("ask #1256 (cloud/k8s/cloud-hub-network.yaml)", _read("cloud", "k8s", "cloud-hub.yaml"))
+
+
+class Docs(unittest.TestCase):
+    def setUp(self):
+        self.sec = section_4c(_read("docs", "cloud-operator-quickstart.md"))
+
+    def test_docs_ok(self):
+        self.assertEqual(docs_problems(self.sec), [])
+        self.assertIn("ask #1256 (cloud/k8s/cloud-hub-network.yaml)", self.sec)
+
+    def test_channel_doc(self):
+        t = _read("docs", "cloud-channel.md")
+        self.assertIn("deregisters every live agent", t)
+        self.assertIn("kubectl create -f cloud/k8s/cloud-hub.yaml", t)
+        self.assertIn("cw.svc.cluster.local", t)
+
+    def test_mutant_plain_apply_fails(self):
+        mut = self.sec.replace("kubectl create -f cloud/k8s/cloud-hub.yaml", PLAIN_APPLY)
+        self.assertNotEqual(mut, self.sec)
+        self.assertIn("plain apply", docs_problems(mut))
+
+    def test_mutant_no_dereg_sentence_fails(self):
+        mut = self.sec.replace("deregisters every live agent", "x")
+        self.assertIn("missing deregisters every live agent", docs_problems(mut))
+
+    def test_mutant_no_digest_rule_fails(self):
+        mut = self.sec.replace("@sha256:", "")
+        self.assertTrue(docs_problems(mut))
+
+    def test_mutant_svc_short_form_fails(self):
+        mut = self.sec.replace(".svc.cluster.local", ".svc")
+        self.assertTrue(docs_problems(mut))
 
 
 if __name__ == "__main__":
