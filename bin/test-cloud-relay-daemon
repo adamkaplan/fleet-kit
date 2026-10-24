@@ -39,6 +39,9 @@ class FakeBackend:
     def holder_of(self, repo, issue):
         return CODER
 
+    def pr_issues(self, pr):
+        return {1}
+
     def gates(self, pr):
         return {"ready": False}
 
@@ -69,7 +72,7 @@ class FakeHub:
 
     def post(self, rid, body):
         self.results[rid] = body
-        self.queue = [q for q in self.queue if q["id"] != rid]
+        self.queue = [q for q in self.queue if q.get("id") != rid]
 
 
 PROVE = dict(scenario="S1", result="pass", evidence="ran it")
@@ -159,10 +162,19 @@ class Case(unittest.TestCase):
         self.refused(409, "stale head", TESTER, "verdict", **VERDICT)
 
     def test_head_moves_inside_decision(self):
-        heads = iter([HEAD, "c" * 40])
-        self.backend.live_head = lambda pr: next(heads, "c" * 40)
-        self.backend.live_head = lambda pr: "c" * 40
+        calls, plan = [], self.backend.plan
+
+        def moving_plan(pr):   # the head is right while the request is checked and moves before the write's own look
+            calls.append(pr)
+            out = plan(pr)
+            if len(calls) == 1:
+                self.backend.head = "c" * 40
+            return out
+        self.backend.plan = moving_plan
         self.refused(409, "stale head", CODER, "prove", **PROVE)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.entries(), [])
+        self.assertEqual(self.raw(), b"")
 
     def test_author_verdict_403(self):
         self.proved()
@@ -182,6 +194,7 @@ class Case(unittest.TestCase):
         self.refused(403, "proof only from the pod holding the work item", TESTER, "prove", **PROVE)
 
     def test_wrong_repo_and_bad_requests(self):
+        self.refused(400, "needs the head", CODER, "prove", head=HEAD[:7], **PROVE)   # a prefix is not the live sha
         self.refused(403, "bound repo", CODER, "prove", repo="acme-org/other", **PROVE)
         self.refused(400, "not one of", CODER, "notice", head=None)
         self.refused(400, "needs the head", CODER, "prove", head=None, **PROVE)
@@ -189,6 +202,140 @@ class Case(unittest.TestCase):
 
     def test_verdict_without_known_writer_403(self):
         self.refused(403, "no writer", TESTER, "verdict", **VERDICT)
+
+    # ---- finding 1: replay index
+    def test_report_replay_is_not_a_400_and_not_indexed(self):
+        self.run_one(CODER, "report", head=None, state="done", text="x", cid="R")
+        self.assertEqual([v for v in relay.Index(self.state)._read().values() if "seq" in v], [])   # no null seq or hash is ever indexed
+        again = self.run_one(CODER, "report", head=None, state="done", text="x", cid="R")
+        self.assertEqual(again["status"], 200)
+        self.assertIsNone(again["record"])
+
+    def test_prove_reusing_a_gates_or_report_call_id_writes(self):
+        self.run_one(CODER, "gates", head=None, cid="G")
+        self.run_one(CODER, "report", head=None, state="d", text="x", cid="R")
+        for cid in ("G", "R"):
+            got = self.run_one(CODER, "prove", cid=cid, **PROVE)
+            self.assertEqual((got["status"], got["record"]["seq"]), (200, len(self.entries())), got)
+        self.assertEqual(len(self.entries()), 2)
+
+    def test_call_id_reused_for_another_call_is_409(self):
+        self.proved()
+        self.backend.evaluators = lambda e: [CODER, TESTER]
+        for kw in (dict(command="verdict", pod=CODER), dict(command="prove", head="d" * 40, pod=CODER)):
+            before = self.raw()
+            pod, cmd = kw.pop("pod"), kw.pop("command")
+            got = self.run_one(pod, cmd, cid="c1" if False else self.last_cid(), **dict(PROVE, **kw))
+            self.assertEqual(got["status"], 409, got)
+            self.assertIn("call_id reused for a different call", got["reason"])
+            self.assertEqual(self.raw(), before)
+        for ex in (self.ex, self.fresh()):   # also when only the entry remembers (no index file)
+            (Path(self.state) / relay.INDEX_FILE).unlink(missing_ok=True)
+            got = self.run_one(CODER, "prove", cid=self.last_cid(), ex=ex, **dict(PROVE, head="d" * 40))
+            self.assertEqual(got["status"], 409, got)
+
+    def last_cid(self):
+        return self.entries()[0]["call_id"]
+
+    def test_verdict_replay_same_record(self):
+        self.proved()
+        first = self.run_one(TESTER, "verdict", cid="V", **VERDICT)
+        for ex in (self.ex, self.fresh()):
+            again = self.run_one(TESTER, "verdict", cid="V", ex=ex, **VERDICT)
+            self.assertEqual(again["record"], first["record"])
+        self.assertEqual(len(self.entries()), 2)
+
+    def test_replay_inside_build_when_the_index_is_gone(self):
+        first = self.run_one(CODER, "prove", cid="X", **PROVE)
+        (Path(self.state) / relay.INDEX_FILE).unlink()
+        again = self.run_one(CODER, "prove", cid="X", **PROVE)
+        self.assertEqual((again["status"], again["record"]), (200, first["record"]))
+        self.assertEqual(len(self.entries()), 1)
+        self.assertEqual(set(relay.Index(self.state)._read()["%s\nX" % CODER]), {"seq", "hash", "command", "pr", "head"})
+
+    # ---- finding 2: index file
+    def test_index_is_pruned_and_uses_unique_tmp_names(self):
+        old = relay.INDEX_MAX
+        relay.INDEX_MAX = 3
+        self.addCleanup(setattr, relay, "INDEX_MAX", old)
+        idx = relay.Index(self.state)
+        for i in range(6):
+            idx.put("p", "c%d" % i, {"seq": i, "hash": "h"})
+        self.assertEqual(sorted(idx._read()), ["p\nc3", "p\nc4", "p\nc5"])
+        self.assertEqual([p.name for p in Path(self.state).iterdir() if p.name.endswith(".tmp")], [])
+
+    def test_index_concurrent_puts_lose_nothing(self):
+        import threading
+        idx = relay.Index(self.state)
+        ts = [threading.Thread(target=lambda i=i: idx.put("p", "c%d" % i, {"seq": i, "hash": "h"})) for i in range(20)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(len(idx._read()), 20)
+
+    # ---- finding 3, 8: pass_once and pass_if_configured
+    def test_pass_once_survives_a_raising_backend(self):
+        a = self.hub.submit(CODER, "gates", head=None)
+        b = self.hub.submit(CODER, "report", head=None, state="d", text="x")
+        orig = self.backend.gates
+
+        def boom(pr):
+            raise RuntimeError("github down")
+        self.backend.gates = boom
+        self.assertEqual(relay.pass_once(self.ex, self.hub.fetch, self.hub.post), 2)
+        self.assertEqual(self.hub.results[a]["status"], 500)
+        self.assertIn("github down", self.hub.results[a]["reason"])
+        self.assertEqual(self.hub.results[b]["status"], 200)
+        self.backend.gates = orig
+
+    def test_pass_once_takes_at_most_ten_and_skips_no_id(self):
+        self.hub.queue.append({"pod": CODER, "repo": REPO, "issue": 1, "call": {}})
+        ids = [self.hub.submit(CODER, "gates", head=None) for _ in range(12)]
+        self.assertEqual(relay.pass_once(self.ex, self.hub.fetch, self.hub.post), 9)   # the id-less one takes a slot of the 10
+        self.assertEqual(len(self.hub.results), 9)
+        self.assertEqual(relay.pass_once(self.ex, self.hub.fetch, self.hub.post), 3)
+        self.assertEqual(set(self.hub.results), set(ids))
+
+    def test_pass_if_configured_never_raises(self):
+        notes = []
+
+        class Engine:
+            state_dir, config = "/nonexistent", {}
+
+            def _note(self, *a):
+                notes.append(a)
+        self.assertEqual(relay.pass_if_configured(Engine(), None, None, lambda: 1, environ={}), 0)
+        self.assertEqual(notes, [])
+        env = {"FLEET_RELAY_HUB_URL": "http://127.0.0.1:9", "FLEET_RELAY_HUB_TOKEN_FILE": "/nonexistent/token"}
+        self.assertEqual(relay.pass_if_configured(Engine(), None, None, lambda: 1, environ=env), 0)
+        self.assertEqual(notes[0][0], "relay.pass_failed")
+
+    # ---- finding 5, 8: link to the pod's issue; the remaining refusals
+    def test_pr_not_linked_to_the_pods_issue_refused_for_all_three(self):
+        self.proved()
+        for pod, cmd, kw in ((CODER, "prove", PROVE), (TESTER, "verdict", VERDICT), (CODER, "gates", {})):
+            self.refused(403, "pr not linked to the pod's issue", pod, cmd, issue=2, head=None if cmd == "gates" else HEAD, **kw)
+
+    def test_recheck_of_the_verdict_rule_inside_build(self):
+        self.proved()
+        calls = []
+
+        def evaluators(e):   # registered at the first look, no longer by the time of the write
+            calls.append(e)
+            return [TESTER] if len(calls) == 1 else []
+        self.backend.evaluators = evaluators
+        self.refused(403, "registered to record tester verdicts", TESTER, "verdict", **VERDICT)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(self.entries()), 1)
+
+    def test_scenario_result_evidence_epic_and_evaluator_refusals(self):
+        self.proved()
+        self.refused(400, "no scenario S9", CODER, "prove", scenario="S9", result="pass", evidence="x")
+        self.refused(400, "result must be", CODER, "prove", scenario="S1", result="maybe", evidence="x")
+        self.refused(400, "evidence is required", CODER, "prove", scenario="S1", result="pass", evidence="  ")
+        self.refused(400, "judged by tester", TESTER, "verdict", evaluator="reader", **VERDICT)
+        plan = self.backend.plan
+        self.backend.plan = lambda pr: dict(plan(pr), scenarios={"S1": {"evaluator": "tester", "claim": "epic"}})
+        self.refused(400, "claimed at the epic", CODER, "prove", **PROVE)
 
 
 if __name__ == "__main__":

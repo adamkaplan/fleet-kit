@@ -9,20 +9,22 @@ The world (GitHub, the plan, the registry, the audit) is a Backend, so the rules
 One ledger entry per prove or verdict, written by `plan_ledger.append_checked` under its flock; the head is re-read from GitHub INSIDE
 that decision. Replay memory: `relay_calls.json` (pod + call id -> seq, hash), backed by the call id stored in the entry itself.
 """
+import contextlib
+import fcntl
 import json
 import os
-import re
 import sys
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import plan_ledger  # noqa: E402
+import cloud_relay  # noqa: E402  (the one definition of the wire shapes, shared with the hub)
 
 INDEX_FILE = "relay_calls.json"
-COMMANDS = ("report", "prove", "verdict", "gates")
-PR_RE = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$")
-CALL_ID_RE = re.compile(r"^[\x21-\x7e]{1,64}$")
-SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+INDEX_MAX = 5000   # entries kept; the oldest are pruned (the ledger's own call ids still answer a pruned replay)
+COMMANDS = cloud_relay.COMMANDS
+PR_RE, CALL_ID_RE, SHA_RE = cloud_relay.PR, cloud_relay.CALL_ID, cloud_relay.HEAD
 
 
 class Refuse(Exception):
@@ -38,11 +40,12 @@ class Replay(Exception):
 
 
 def _same_head(known, given):
-    return bool(known) and bool(given) and (known.startswith(given) or given.startswith(known))
+    return bool(known) and bool(given) and known == given
 
 
 class Index:
-    """pod + call id -> {seq, hash}. A separate daemon-side file; a missing or damaged file falls back to the entries' own call ids."""
+    """pod + call id -> {seq, hash, command, pr, head}, for prove and verdict only. A separate daemon-side file, written under a flock
+    with a unique temp name and pruned to INDEX_MAX (oldest first); a missing or damaged file falls back to the entries' own call ids."""
 
     def __init__(self, state_dir):
         self.path = Path(state_dir) / INDEX_FILE
@@ -58,27 +61,47 @@ class Index:
         return self._read().get("%s\n%s" % (pod, call_id))
 
     def put(self, pod, call_id, record):
-        data = self._read()
-        data["%s\n%s" % (pod, call_id)] = record
-        tmp = self.path.with_name(INDEX_FILE + ".tmp")
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write(json.dumps(data, sort_keys=True))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(str(tmp), str(self.path))
+        lock = self.path.with_name(INDEX_FILE + ".lock")
+        with open(str(lock), "a") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            data = self._read()
+            key = "%s\n%s" % (pod, call_id)
+            data.pop(key, None)
+            data[key] = record     # json keeps insertion order: the newest is last
+            while len(data) > INDEX_MAX:
+                data.pop(next(iter(data)))
+            tmp = self.path.with_name("%s.%d.%s.tmp" % (INDEX_FILE, os.getpid(), uuid.uuid4().hex))
+            try:
+                fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w") as handle:
+                    handle.write(json.dumps(data))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(str(tmp), str(self.path))
+            finally:
+                with contextlib.suppress(OSError):
+                    os.unlink(str(tmp))
 
 
 def _from_entries(entries, pod, call_id):
     for e in entries:
         if e.get("by") == pod and e.get("call_id") == call_id:
-            return {"seq": e["seq"], "hash": e["hash"]}
+            return {"seq": e["seq"], "hash": e["hash"], "command": {"proof": "prove", "verdict": "verdict"}.get(e.get("kind")),
+                    "pr": e.get("pr"), "head": e.get("head")}
     return None
+
+
+def _same_call(known, command, pr, head):
+    return known.get("command") == command and known.get("pr") == pr and known.get("head") == head
+
+
+def _answer(known):
+    return {"seq": known["seq"], "hash": known["hash"]}
 
 
 class Executor:
     """backend needs: live_head(pr), plan(pr) -> {"source","hash","scenarios":{sid:{"evaluator","claim"}}},
-    pr_facts(pr) -> {"author","notice_senders"}, evaluators(evaluator), holder_of(repo, issue), gates(pr), report(pod, args), audit(kind, pr, detail)."""
+    pr_issues(pr) -> {issue numbers the PR is linked to}, pr_facts(pr) -> {"author","notice_senders"}, evaluators(evaluator), holder_of(repo, issue), gates(pr), report(pod, args), audit(kind, pr, detail)."""
 
     def __init__(self, state_dir, backend, now):
         self.state, self.backend, self.now = state_dir, backend, now
@@ -93,39 +116,50 @@ class Executor:
             if not isinstance(pod, str) or not pod:
                 raise Refuse(400, "no pod named")
             cid = call.get("call_id")
-            if not isinstance(cid, str) or not CALL_ID_RE.match(cid):
+            if not isinstance(cid, str) or not CALL_ID_RE.fullmatch(cid):
                 raise Refuse(400, "call_id must be printable ASCII, 1 to 64 characters")
             command = call.get("command")
             if command not in COMMANDS:
                 raise Refuse(400, "command %r is not one of %s" % (command, ", ".join(COMMANDS)))
-            m = PR_RE.match(pr)
+            m = PR_RE.fullmatch(pr)
             if not m:
                 raise Refuse(400, "pr must be owner/repo#N")
             if m.group(1) != req.get("repo"):
                 raise Refuse(403, "pr is not in the pod's bound repo")
             args = call.get("args") if isinstance(call.get("args"), dict) else {}
-            if command in ("prove", "verdict") and not SHA_RE.match(str(call.get("head") or "")):
+            if command in ("prove", "verdict") and not SHA_RE.fullmatch(str(call.get("head") or "")):
                 raise Refuse(400, "%s needs the head sha it judged" % command)
-            known = self.index.get(pod, cid)
-            if known and command in ("prove", "verdict"):
-                return 200, "replay: already recorded", known
-            if command == "gates":
+            if command in ("gates", "prove", "verdict"):   # the PR must be the one linked to the issue this pod is bound to
+                linked = {str(i) for i in (self.backend.pr_issues(pr) or ())}
+                if str(req.get("issue")) not in linked:
+                    raise Refuse(403, "pr not linked to the pod's issue")
+            if command == "gates":   # read-only and not indexed: nothing to replay
                 out = self.backend.gates(pr)
                 self.backend.audit("gates", pr, {"by": pod, "call_id": cid})
-                self.index.put(pod, cid, {"seq": None, "hash": None})
                 return 200, json.dumps(out, sort_keys=True), None
-            if command == "report":
-                if known:
-                    return 200, "replay: already reported", known
+            if command == "report":   # delivered once per call id; kept under its own key ("report\n...", no seq or hash), so it never answers a prove or verdict
+                seen = self.index.get("report\n" + pod, cid)
+                if seen:
+                    if seen.get("pr") != pr:
+                        raise Refuse(409, "call_id reused for a different call")
+                    return 200, "replay: already reported", None
                 self.backend.report(pod, args)
-                self.index.put(pod, cid, {"seq": None, "hash": None})
+                self.index.put("report\n" + pod, cid, {"command": "report", "pr": pr})
                 return 200, "reported", None
+            known = self.index.get(pod, cid)
+            if known:
+                if not _same_call(known, command, pr, call["head"]):
+                    raise Refuse(409, "call_id reused for a different call")
+                return 200, "replay: already recorded", _answer(known)
             record = self._write(command, pod, req, call, pr, cid, args)
-            self.index.put(pod, cid, record)
+            self.index.put(pod, cid, dict(record, command=command, pr=pr, head=call["head"]))
             return 200, "recorded", record
         except Replay as rep:
+            if not _same_call(rep.record, command, pr, call.get("head")):
+                self.backend.audit("relay.refused", pr, {"by": pod, "status": 409, "why": "call_id reused for a different call"})
+                return 409, "call_id reused for a different call", None
             self.index.put(pod, cid, rep.record)
-            return 200, "replay: already recorded", rep.record
+            return 200, "replay: already recorded", _answer(rep.record)
         except Refuse as err:
             self.backend.audit("relay.refused", pr, {"by": pod, "status": err.status, "why": err.reason})
             return err.status, err.reason, None
@@ -197,8 +231,14 @@ def pass_once(executor, fetch, post):
         rid = req.get("id")
         if not isinstance(rid, str) or not rid:
             continue
-        status, reason, record = executor.handle(req)
-        post(rid, {"status": status, "reason": reason, "record": record})
+        try:
+            status, reason, record = executor.handle(req)
+        except Exception as err:   # one bad request must not abort the batch or block later passes: answer it 500 with the reason
+            status, reason, record = 500, "relay failed: %s" % " ".join(str(err).split())[:160], None
+        try:
+            post(rid, {"status": status, "reason": reason, "record": record})
+        except Exception:   # the hub could not take this answer: leave it to expire there, go on with the rest
+            continue
         done += 1
     return done
 
@@ -250,6 +290,20 @@ class SwitchboardBackend:
 
     def holder_of(self, repo, issue):   # fail closed: only a holder the daemon's config names
         return (self.parts[2].get("relay_holders") or {}).get("%s#%s" % (repo, issue))
+
+    def pr_issues(self, pr):
+        """Issue numbers the PR is linked to: its closing keywords (Closes/Fixes/Resolves [owner/repo]#N) in the body, and its plan's issue."""
+        import re
+        ctx = self._ctx(pr)
+        repo = ctx.repo
+        found = set()
+        for m in re.finditer(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#([0-9]+)", str((ctx.facts or {}).get("body") or ""), re.I):
+            if m.group(1) in (None, repo):
+                found.add(int(m.group(2)))
+        m = re.fullmatch(r"([^#]+)#([0-9]+)", str(ctx.source or ""))
+        if m and m.group(1) == repo:
+            found.add(int(m.group(2)))
+        return found
 
     def gates(self, pr):
         ctx = self._ctx(pr, writable=False)

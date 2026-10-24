@@ -46,7 +46,7 @@ import cloud_relay
 AGENTS_ENV = "FLEET_CLOUD_HUB_AGENTS"
 DECISIONS_ENV = "FLEET_CLOUD_HUB_DECISIONS"
 SECRETS_ENV = "FLEET_CLOUD_HUB_SECRETS"
-DAEMON_ENV = "FLEET_CLOUD_HUB_DAEMON"   # the agent name the daemon credential proves (default "daemon")
+DAEMON_ENV = "FLEET_CLOUD_HUB_DAEMON"   # the agent name the daemon credential proves (required for the relay: no default)
 AUDIENCE_ENV = "FLEET_CLOUD_CHANNEL_AUDIENCE"
 API = "https://kubernetes.default.svc/apis/authentication.k8s.io/v1/tokenreviews"
 SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
@@ -219,8 +219,14 @@ def json_audit(stream=None):
     return audit
 
 
-def make_hub(address, reviewer, inbox, audit, decisions_path=None, max_handlers=None, relay=None, daemon="daemon"):
+def make_hub(address, reviewer, inbox, audit, decisions_path=None, max_handlers=None, relay=None, daemon=None):
     """The channel server with the hub's two additions: GET /decisions and 404 for an agent not in the map."""
+    if relay is not None and not daemon:
+        raise ValueError("the relay needs the daemon's agent name (FLEET_CLOUD_HUB_DAEMON), set explicitly")
+
+    if relay is not None:
+        relay.deny.add(daemon)   # the daemon credential is not a pod: it cannot place calls
+
     def unreserved(token, audience):
         status = reviewer(token, audience)
         user = status.get("user") if isinstance(status, dict) else None
@@ -375,9 +381,11 @@ def serve(environ, reviewer=None, inbox=None, audit=None):
         else:
             reviewer = make_reviewer(audience=environ.get(AUDIENCE_ENV) or None)
     inbox = inbox or Inbox(environ.get(AGENTS_ENV))
-    relay = cloud_relay.Relay(lambda: _read_json(environ[AGENTS_ENV], {}) if environ.get(AGENTS_ENV) else {})
-    make_hub(address, reviewer, inbox, audit or json_audit(), environ.get(DECISIONS_ENV), relay=relay,
-             daemon=environ.get(DAEMON_ENV) or "daemon").serve_forever()
+    daemon = (environ.get(DAEMON_ENV) or "").strip()
+    relay = None
+    if daemon:   # the relay is on only when the daemon's agent name is set explicitly: no default name a pod could register as
+        relay = cloud_relay.Relay(lambda: _read_json(environ[AGENTS_ENV], {}) if environ.get(AGENTS_ENV) else {})
+    make_hub(address, reviewer, inbox, audit or json_audit(), environ.get(DECISIONS_ENV), relay=relay, daemon=daemon or None).serve_forever()
     return True
 
 

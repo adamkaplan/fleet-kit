@@ -20,14 +20,20 @@ import uuid
 
 import cloud_channel
 
+# The one definition of the wire shapes; the daemon (cloud_relay_daemon) imports these.
 COMMANDS = ("report", "prove", "verdict", "gates")
 NEEDS_HEAD = ("prove", "verdict")
 CALL_ID = re.compile(r"[\x21-\x7e]{1,64}")
 PR = re.compile(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]{1,9})")
-HEAD = re.compile(r"[0-9a-f]{7,64}")
+HEAD = re.compile(r"[0-9a-f]{40}")   # the full live sha, never a prefix
 WAIT = 30.0
 BATCH = 10
 MAX_PENDING = 200
+MAX_PER_POD = 20
+PENDING_TTL = 120.0   # seconds an unanswered entry may wait for the daemon before it is dropped
+MAX_ARGS = 16
+MAX_ARG_KEY = 64
+MAX_ARG_VALUE = 8192
 MAX_DONE = 1000
 
 
@@ -43,12 +49,15 @@ class Entry:
         self.pod, self.repo, self.issue, self.call = pod, repo, issue, call
         self.done = threading.Event()
         self.answer = None
+        self.born = None
 
 
 class Relay:
-    def __init__(self, agents_read, wait=WAIT):
+    def __init__(self, agents_read, wait=WAIT, ttl=PENDING_TTL, max_pending=MAX_PENDING, max_per_pod=MAX_PER_POD, clock=time.monotonic):
         self.agents_read = agents_read   # () -> {agent: {"repo", "issue", ...}}
         self.wait = wait
+        self.deny = set()   # names that are not pods (the daemon credential): refused 403 once the pod is known to the map
+        self.ttl, self.max_pending, self.max_per_pod, self.clock = ttl, max_pending, max_per_pod, clock
         self.lock = threading.Lock()
         self.pending = collections.OrderedDict()   # id -> Entry, unanswered
         self.by_call = {}                          # (pod, call_id) -> Entry (unanswered or recently answered)
@@ -59,10 +68,13 @@ class Relay:
         try:
             agents = self.agents_read()
         except (OSError, ValueError):
+            # fail closed: with the agents map unavailable no pod can be bound to a repo, so every call is refused 503 (never guessed, never queued)
             raise Refusal(503, "agents map unreadable")
         record = agents.get(pod) if isinstance(agents, dict) else None
         if not isinstance(record, dict) or not isinstance(record.get("repo"), str):
             raise Refusal(404, "unknown pod: not bound to a repo")
+        if pod in self.deny:
+            raise Refusal(403, "the daemon credential cannot relay as a pod")
         if not isinstance(body, dict):
             raise Refusal(400, "body must be a JSON object")
         command = body.get("command")
@@ -85,6 +97,11 @@ class Relay:
         args = body.get("args", {})
         if not isinstance(args, dict):
             raise Refusal(400, "args must be an object")
+        for key, value in args.items():
+            if len(args) > MAX_ARGS or not isinstance(key, str) or len(key) > MAX_ARG_KEY:
+                raise Refusal(400, "args: at most %d fields, names up to %d characters" % (MAX_ARGS, MAX_ARG_KEY))
+            if not (value is None or isinstance(value, (bool, int)) or (isinstance(value, str) and len(value) <= MAX_ARG_VALUE)):
+                raise Refusal(400, "args.%s: a string up to %d characters, a number, a boolean or null" % (key[:MAX_ARG_KEY], MAX_ARG_VALUE))
         call = {"call_id": call_id, "command": command, "pr": pr, "args": args}
         if head is not None:
             call["head"] = head
@@ -95,19 +112,33 @@ class Relay:
         record, call = self.validate(pod, body)
         key = (pod, call["call_id"])
         with self.lock:
+            self._expire()
             entry = self.by_call.get(key)
             if entry is None:
-                if len(self.pending) >= MAX_PENDING:
-                    raise Refusal(503, "relay queue full")
+                if sum(1 for e in self.pending.values() if e.pod == pod) >= self.max_per_pod:
+                    raise Refusal(503, "per-pod cap reached: %d unanswered calls from this pod" % self.max_per_pod)
+                if len(self.pending) >= self.max_pending:
+                    raise Refusal(503, "global cap reached: relay queue full (%d)" % self.max_pending)
                 entry = Entry(pod, record["repo"], record.get("issue"), call)
+                entry.born = self.clock()
                 self.pending[entry.id] = entry
                 self.by_call[key] = entry
         if not entry.done.wait(self.wait):
             return 504, {"status": 504, "error": "daemon did not answer in time; replay with the same call_id"}
         return entry.answer
 
+    def _expire(self):
+        """Drop unanswered entries older than the TTL (caller holds the lock); their waiters are answered 504."""
+        now = self.clock()
+        for eid in [i for i, e in self.pending.items() if now - e.born > self.ttl]:
+            entry = self.pending.pop(eid)
+            self.by_call.pop((entry.pod, entry.call["call_id"]), None)
+            entry.answer = (504, {"status": 504, "error": "daemon did not answer within %ds; entry dropped, replay with the same call_id" % self.ttl})
+            entry.done.set()
+
     def list_pending(self):
         with self.lock:
+            self._expire()
             return [{"id": e.id, "pod": e.pod, "repo": e.repo, "issue": e.issue, "call": e.call}
                     for e in list(self.pending.values())[:BATCH]]
 
@@ -127,6 +158,7 @@ class Relay:
         if status != 200:
             payload["error"] = reason
         with self.lock:
+            self._expire()
             entry = self.pending.pop(entry_id, None)
             if entry is None:
                 raise Refusal(404, "no such pending request")
