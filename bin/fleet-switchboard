@@ -13506,7 +13506,7 @@ SWEEP_PR_COMMENTS = 5         # the last comments of an item that are searched f
 SWEEP_FILE = "sweep.json"
 SWEEP_READY_FILE = "sweep-ready.json"   # #986: per held pull request, the head and the moment it first became ready for the owner's decision (S5 counts the wait from it)
 SWEEP_READY_READS = 10   # held pull requests whose gates one pass may read; the rest are counted as not checked and read first on the next pass
-SWEEP_READY_READ_COST = 4   # calls of the shared pass budget one gate reading is charged (it makes several GETs)
+SWEEP_READY_READ_COST = 7   # least calls of the shared pass budget one gate reading is charged: a ready reading makes at least 7 GETs (PR view 1, plan issue + 1 comments page 2, floor view 1 + narrowed agent reads, clear_who 3), a non-ready one at least 4; the calls a reading REALLY makes are counted (engine.reading_calls) and the excess over this is charged too
 SWEEP_ALARMED_FILE = "sweep-alarmed.json"   # #805: when each finding was last raised, so the re-alarm window survives a restart
 SWEEP_KINDS = {"S6a": "first-line marker without the merge-captain label (our PR)", "S6b": "merge label and first-line marker disagree",
                "S1a": "decision section without an awaiting label", "S1b": "awaiting label without a decision section",
@@ -13889,14 +13889,29 @@ def sweep_held_pr(decision, home):
 
 def sweep_gate_reading(engine, repo, number, now):
     """(open gates, head, who clears it, None) read the way `gates` reads a pull request, or (None, None, None, why) when it cannot be read. GETs only."""
+    original = getattr(engine, "gh_runner", None)
+    calls = [0]
     try:
-        runner = getattr(engine, "gh_runner", None) or subprocess.run
+        real = original or subprocess.run
+
+        def runner(*a, **k):   # every call a reading makes is counted, and charged against the shared budget
+            calls[0] += 1
+            return real(*a, **k)
+        engine.gh_runner = runner
         ns = types.SimpleNamespace(pr="%s#%d" % (repo, number), plan=None, ask=None, head=None)
         ctx = _ledger_context(ns, runner, lambda: now, False, parts=(engine, engine.state_dir, engine.config), floor=True)
         if ctx.unreadable or not (ctx.facts or {}).get("head"):
             return None, None, None, _one_line(str(ctx.unreadable or "no head"), 120)
+        if ctx.plan_problem:   # #986 round 5: a plan that could not be read is not "no plan" (G0a would say missing): not checked
+            return None, None, None, _one_line("the plan could not be read: %s" % ctx.plan_problem, 120)
+        if ctx.problem:   # a corrupt ledger makes G1 untrustworthy: not checked
+            return None, None, None, _one_line("the ledger could not be read: %s" % ctx.problem, 120)
+        if (ctx.facts or {}).get("body_unreadable"):   # a body that is not text: G5 and the held-body check would say missing
+            return None, None, None, "the body could not be read"
         report = plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr, now=now)
         floor = (ctx.facts or {}).get("floor")
+        if floor is not None and not isinstance(floor, dict):   # a floor of the wrong type is not a reading
+            return None, None, None, "the impact floor has an unexpected shape"
         if isinstance(floor, dict) and floor.get("decision") is None:   # #986 round 4: an impact floor that could not be read is not a whole reading (G6 would say "waiting"): not checked
             return None, None, None, _one_line("the impact floor could not be read: %s" % (floor.get("unreadable") or "no decision"), 120)
         if isinstance(floor, dict) and floor.get("unreadable"):   # the re-hold read failed too (impact-state file corrupt: rehold None): not checked
@@ -13914,6 +13929,9 @@ def sweep_gate_reading(engine, repo, number, now):
         return opened, ctx.facts["head"], who, None
     except Exception as err:
         return None, None, None, _one_line("%s: %s" % (type(err).__name__, err), 120)
+    finally:
+        engine.gh_runner = original
+        engine.reading_calls = calls[0]
 
 
 def sweep_ready_pass(engine, state, decisions, home, now, cfg, decisions_whole=True, budget=None):
@@ -13958,8 +13976,12 @@ def sweep_ready_pass(engine, state, decisions, home, now, cfg, decisions_whole=T
         state.read_seq += 1
         state.ready_read[key] = state.read_seq   # an order, not a time: it cannot tie or go backwards
         reads += 1
+        engine.reading_calls = 0
         opened, head, who, why = sweep_gate_reading(engine, held[0], held[1], now)
+        if budget is not None:
+            budget[0] = max(0, budget[0] - max(0, (getattr(engine, "reading_calls", 0) or 0) - SWEEP_READY_READ_COST))   # the calls really made beyond the least charge
         if opened is None:
+            state.ready.pop(key, None)   # an unread pass drops the moment: the wait restarts, late and never early
             state.not_checked_since.setdefault(key, now)
             state.s5_unchecked += 1
             continue
@@ -14251,7 +14273,7 @@ def sweep_decisions(engine, decisions, now, errors=()):
         errors = list(errors or ()) + [{"source": "registry", "error": "the notice read is not whole: %s" % why}]
     defer, deferred = sweep_deferrals(state, errors, repos, now)
     whole_list = notices_whole or "*" not in defer
-    ready_share = [max(budget[0] // 2, SWEEP_READY_READ_COST if budget[0] >= 2 * SWEEP_READY_READ_COST else 0)]   # #986: at most half of what is left, so the findings' verification keeps the rest
+    ready_share = [max(budget[0] // 2, SWEEP_READY_READ_COST if budget[0] >= SWEEP_READY_READ_COST else 0)]   # #986: at most half of what is left, so the findings' verification keeps the rest
     ready_start = ready_share[0]
     sweep_ready_pass(engine, state, kept, home, now, cfg, whole_list, ready_share)
     budget[0] -= ready_start - ready_share[0]
@@ -22285,6 +22307,8 @@ def pr_picture(engine, repo, number, state):
     except (NoticeError, AttributeError) as err:
         return None, "", [], _one_line(str(err), 160)
     body = raw.get("body") if isinstance(raw.get("body"), str) else ""
+    if not isinstance(raw.get("body"), str) and not ("body" in raw and raw["body"] is None):
+        facts["body_unreadable"] = True   # #986: a body that is not text is unread, not empty (S5 counts it not checked)
     item = next((i for i in read_pr_notices(state) if i["repo"] == repo and i["number"] == number), None)
     return facts, body, notice_senders(item) if item else [], None
 
