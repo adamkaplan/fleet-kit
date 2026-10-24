@@ -1,5 +1,11 @@
 # Network policies of the cloud namespace (six NetworkPolicy documents).
 #
+# Two limits, as applied (nothing here changes them):
+#  (a) allow-egress selects EVERY pod of the namespace (podSelector: {}), so the hub itself may also reach the
+#      internet on ports 80 and 443 outside the excepted private ranges.
+#  (b) No cluster or pod CIDR is excepted: acceptable only because the cluster's ranges lie inside the private
+#      ranges that are excepted (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10).
+#
 # What this is: the namespace's network boundary, exactly as applied in the cluster
 # (read-only capture, server dry run: all six unchanged). Nothing here is widened.
 #

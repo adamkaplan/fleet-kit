@@ -302,7 +302,7 @@ State: the decisions file is on an emptyDir at `/var/hub`; it is lost when the p
 
 Cause: an independent read of the hub's manifest set found no network policy in the repository, while the cluster carried six applied by hand. None was in a file. They are now in `cloud/k8s/cloud-hub-network.yaml`, exactly as applied (a test fails when a rule is widened). The six policies:
 
-- `allow-egress`: every pod may reach name resolution (port 53) and the public internet on ports 80 and 443, with the private ranges excluded.
+- `allow-egress`: every pod may reach name resolution (port 53) and the public internet on ports 80 and 443, with the private ranges excluded. It selects EVERY pod of the namespace, so the hub itself may also reach the internet on ports 80 and 443 outside the excepted private ranges. No cluster or pod CIDR is excepted: acceptable only because the cluster's ranges lie inside the private ranges that are excepted (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10).
 - `cloud-agents-ingress-from-hub`: worker pods accept the hub on port 4096 only.
 - `cloud-agents-to-hub`: worker pods may send to the hub on port 8443 only.
 - `cloud-hub-ingress`: the hub accepts worker pods of the same namespace on port 8443 only.

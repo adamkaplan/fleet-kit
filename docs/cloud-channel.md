@@ -45,7 +45,7 @@ Audit lines go to stdout as JSON lines `{"ts", "line"}`; no token is logged.
 
 Default (no `FLEET_CLOUD_HUB_SECRETS`): the hub posts the bearer token to the in-cluster TokenReview API
 (`https://kubernetes.default.svc/apis/authentication.k8s.io/v1/tokenreviews`) using its own service account token and CA from
-`/var/run/secrets/kubernetes.io/serviceaccount`. The token must be authenticated and belong to a ServiceAccount in the namespace `fleet-agents`; the ServiceAccount name is the agent name
+`/var/run/secrets/kubernetes.io/serviceaccount`. The token must be authenticated and belong to a ServiceAccount in the pinned namespace (`cw` in the live cluster; see the note under "What the code does accept"); the ServiceAccount name is the agent name
 (lowercase letters, digits, `-`, at most 63 characters). The token must carry the channel audience. By default that is `fleet-switchboard`. If `FLEET_CLOUD_CHANNEL_AUDIENCE` is set, the hub asks the cluster for that audience instead. If the cluster cannot be asked the answer is 503: nothing is let through.
 
 Reserved names (`captain`, `switchboard`, `fleet-switchboard`, `hub`, `admin`) are refused as sender or recipient (403), and a
@@ -56,7 +56,7 @@ names out of that namespace.
 
 When `FLEET_CLOUD_HUB_SECRETS` is set, the hub hashes the bearer token with SHA-256 and compares it
 (`hmac.compare_digest`, against every entry) with the digests in `secrets.json`. A match yields the agent whose entry matched, in
-namespace `fleet-agents`. The file is read at each request (at most 8 MiB).
+the pinned namespace (`cw` in the live cluster). The file is read at each request (at most 8 MiB).
 
 It refuses every request (401 or 503) if the file is missing, empty or malformed, is not an object, holds a duplicate digest, or
 names a reserved agent.
@@ -166,11 +166,11 @@ Each guard has a test that fails when it is removed (in `bin/test-cloud-hub` and
 The hub speaks plain http; there is no TLS in the listener. The intended deployment is the hub and the agent pods in one
 namespace, with a NetworkPolicy admitting only agent pods to the hub port. The code does not require or enforce this. The bearer
 token and message text cross that network unencrypted. The hub does not check the source of a request beyond the token.
-The network policies that implement this boundary are in cloud/k8s/cloud-hub-network.yaml (the six policies exactly as applied).
+The network policies that implement this boundary are in cloud/k8s/cloud-hub-network.yaml (the six policies exactly as applied). Two limits of those policies, as applied: `allow-egress` selects every pod of the namespace, so the hub itself may also reach the internet on ports 80 and 443 outside the excepted private ranges; and no cluster or pod CIDR is excepted, which is acceptable only because the cluster's ranges lie inside the private ranges that are excepted (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10).
 
 What the code does accept as an agent (`bin/cloud_channel.py`): a token whose username is `system:serviceaccount:<namespace>:<name>`
-(prefix `system:serviceaccount:`) with the namespace exactly `fleet-agents` (the `NAMESPACE` constant) and a name that is a valid
-agent name. Any ServiceAccount in that namespace is accepted, wherever the request comes from; any other namespace is refused.
+(prefix `system:serviceaccount:`) with the namespace exactly the pinned one (the `NAMESPACE` constant) and a name that is a valid
+agent name. Any ServiceAccount in that namespace is accepted, wherever the request comes from; any other namespace is refused. The live namespace is `cw`, the one the network policies in `cloud/k8s/cloud-hub-network.yaml` name; the constant in `bin/cloud_channel.py` still reads `fleet-agents` in this change (a code change is out of scope here), so a deployment in `cw` must pass `namespace=` accordingly or the constant must be changed in a separate ask.
 
 ## Take down
 
