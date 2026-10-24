@@ -75418,7 +75418,7 @@ class TestLoadAlert(Base):
         cdir = self.state_dir / "cloud"
         cdir.mkdir(exist_ok=True)
         for n, extra in (("l1", {}), ("l2", {}), ("fin", {}), ("old", {"hard_deadline": "2001-01-01T00:00:00Z"})):
-            (cdir / (n + ".json")).write_text(json.dumps(dict({"worker": n, "reports_to": "orch"}, **extra)))
+            (cdir / (n + ".json")).write_text(json.dumps(dict({"worker": n, "reports_to": "orch", "hard_deadline": "2999-01-01T00:00:00Z"}, **extra)))
         (cdir / "bad.json").write_text("{not json")
         (self.state_dir / "last-reports.json").write_text(json.dumps({"fin": {"state": "done", "at": self.T0}}))
         engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=None,
@@ -77063,7 +77063,7 @@ class TestCloudLoad(Base):
     def rec(self, name, **extra):
         directory = self.state_dir / "cloud"
         directory.mkdir(exist_ok=True)
-        (directory / (name + ".json")).write_text(json.dumps(dict({"worker": name, "reports_to": "orch", "url": "u", "runtime_id": "r"}, **extra)))
+        (directory / (name + ".json")).write_text(json.dumps(dict({"worker": name, "reports_to": "orch", "url": "u", "runtime_id": "r", "hard_deadline": "2999-01-01T00:00:00Z"}, **extra)))
 
     def count(self, fn=None, retired=None, last=None, audit=None):
         return (fn or sb.live_cloud_by_lane)(self.state_dir, self.disc, retired or {}, last or {}, audit)
@@ -77154,6 +77154,136 @@ class TestCloudLoad(Base):
         sb._CLOUD_TRUNCATED.clear()
         self.count(audit=audit)
         self.assertIn("load.cloud_truncated", [l[1] for l in lines])
+
+    def _raw(self, name, data=b""):
+        d = self.state_dir / "cloud"; d.mkdir(exist_ok=True)
+        (d / name).write_bytes(data)
+
+    def _alarm(self, fn):
+        import signal as _sig
+        def boom(*a):
+            raise AssertionError("the read blocked")
+        old = _sig.signal(_sig.SIGALRM, boom); _sig.alarm(3)
+        try:
+            return fn()
+        finally:
+            _sig.alarm(0); _sig.signal(_sig.SIGALRM, old)
+
+    def _cw_mutant(self, old, new, *more):
+        src = (BIN / "cloud_worker.py").read_text()
+        pairs = [(old, new)] + [(more[i], more[i + 1]) for i in range(0, len(more), 2)]
+        for a, b in pairs:
+            self.assertIn(a, src)
+            src = src.replace(a, b)
+        mod = types.ModuleType("cw_mut")
+        mod.__dict__["__file__"] = str(BIN / "cloud_worker.py")
+        exec(compile(src, "cw_mut", "exec"), mod.__dict__)
+        return mod
+
+    def _with_reader(self, mod, fn):
+        real = sb.load_module
+        sb.load_module = lambda n: mod
+        try:
+            return fn()
+        finally:
+            sb.load_module = real
+
+    def test_fifo_does_not_block(self):
+        self.rec("ok")
+        os.mkfifo(str(self.state_dir / "cloud" / "f.json"))
+        self.assertEqual(self._alarm(self.count), {"orch": 1})
+
+    def test_mutant_blocking_open_is_caught(self):
+        self.rec("ok")
+        os.mkfifo(str(self.state_dir / "cloud" / "f.json"))
+        mod = self._cw_mutant("os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr", "os.O_RDONLY | os.O_NOFOLLOW | getattr")
+        with self.assertRaises(AssertionError):
+            self._with_reader(mod, lambda: self._alarm(self.count))   # the mutant hangs; the alarm fails it
+
+    def test_symlink_is_not_followed(self):
+        self.rec("real", reports_to="orch")
+        d = self.state_dir / "cloud"
+        os.symlink(str(d / "real.json"), str(d / "link.json"))
+        (d / "real.json").write_text(json.dumps({"worker": "link", "reports_to": "orch", "hard_deadline": "2999-01-01T00:00:00Z"}))   # the target names the link's worker
+        self.assertEqual(self.count(), {})   # real.json names "link", not "real": skipped; link.json is a symlink: skipped
+        mod = self._cw_mutant("os.O_NONBLOCK | os.O_NOFOLLOW | getattr", "os.O_NONBLOCK | getattr")
+        self.assertEqual(self._with_reader(mod, self.count), {"orch": 1})   # the mutant follows the link
+
+    def test_hostile_files_are_skipped(self):
+        self.rec("ok")
+        self._raw("huge.json", json.dumps({"worker": "huge", "reports_to": "orch", "hard_deadline": "2999-01-01T00:00:00Z", "pad": "x" * (sb.CLOUD_LOAD_MAX_BYTES + 10)}).encode())
+        self._raw("bin.json", b"\xff\xfe\x00")
+        self._raw("bad.json", b"{not json")
+        self._raw("list.json", b"[1]")
+        (self.state_dir / "cloud" / "dir.json").mkdir()
+        self.assertEqual(self._alarm(self.count), {"orch": 1})
+
+    def test_mutant_unbounded_read_is_caught(self):
+        self._raw("huge.json", json.dumps({"worker": "huge", "reports_to": "orch", "hard_deadline": "2999-01-01T00:00:00Z", "pad": "x" * (sb.CLOUD_LOAD_MAX_BYTES + 10)}).encode())
+        mod = self._cw_mutant("    if len(raw) > max_bytes:\n        return None, \"too_large\"\n", "", "os.read(fd, max_bytes + 1 - len(raw))", "os.read(fd, 1 << 20)")
+        self.assertEqual(self.count(), {})
+        self.assertEqual(self._with_reader(mod, self.count), {"orch": 1})   # no size bound: the huge record is read and counted
+
+    def test_mutant_non_dict_accepted_is_caught(self):
+        self._raw("list.json", b"[1]")
+        mod = self._cw_mutant("    if not isinstance(record, dict):\n        return None, \"wrong_shape\"\n", "")
+        with self.assertRaises(Exception):
+            self._with_reader(mod, self.count)   # the mutant passes a list on, and the caller breaks on it
+        self.assertEqual(self.count(), {})
+
+    def test_mutant_non_utf8_and_bad_json_and_directory_are_caught(self):
+        self.rec("ok")
+        self._raw("bin.json", b"\xff")
+        (self.state_dir / "cloud" / "dir.json").mkdir()
+        self._raw("bad.json", b"{")
+        for pair in (("    except UnicodeDecodeError:\n        return None, \"not_utf8\"", "    except UnicodeDecodeError:\n        raise RuntimeError('x')"),
+                         ("    except (ValueError, RecursionError):\n        return None, \"not_json\"", "    except RecursionError:\n        return None, \"not_json\""),
+                         ("    except OSError:\n        return None, \"not_regular\"\n    finally", "    except OSError:\n        raise\n    finally",
+                          "        if not stat.S_ISREG(os.fstat(fd).st_mode):\n            return None, \"not_regular\"\n", "")):
+            mod = self._cw_mutant(*pair)
+            try:
+                got = self._with_reader(mod, self.count)
+            except Exception:
+                continue   # the mutant breaks the pass: caught
+            self.assertNotEqual(got, {"orch": 1}, pair[0][:40])   # or loses the good record: caught
+        self.assertEqual(self.count(), {"orch": 1})
+
+    def test_record_without_valid_hard_deadline_is_not_live(self):
+        self.rec("a"); self.rec("b", hard_deadline="garbage"); self.rec("c", last_report_at="2001-01-01T00:00:00Z")
+        d = self.state_dir / "cloud"
+        r = json.loads((d / "a.json").read_text()); r.pop("hard_deadline"); (d / "a.json").write_text(json.dumps(r))
+        self.assertEqual(self.count(), {})
+        self.rec("fresh")
+        self.assertEqual(self.count(), {"orch": 1})
+        broken = self.mutant("if ends is None or ends < now:", "if ends is not None and ends < now:")
+        self.assertEqual(broken(self.state_dir, self.disc, {}, {}, None), {"orch": 3})   # the mutant counts the evidence-free records a and b with the fresh one
+
+    def test_scan_stops_at_the_files_bound_and_the_time_bound(self):
+        for i in range(20):
+            self.rec("w%02d" % i)
+        lines = []
+        audit = types.SimpleNamespace(append=lambda *a: lines.append(a))
+        old = sb.CLOUD_LOAD_MAX_SCAN
+        try:
+            sb.CLOUD_LOAD_MAX_SCAN = 5; sb._CLOUD_TRUNCATED.clear()
+            self.assertLessEqual(self.count(audit=audit).get("orch", 0), 5)
+            self.assertEqual(lines[-1][3]["bound"], "files")
+            sb.CLOUD_LOAD_MAX_SCAN = 10 ** 6; sb._CLOUD_TRUNCATED.clear()
+            ticks = iter(range(0, 1000))
+            out = sb.live_cloud_by_lane(self.state_dir, self.disc, {}, {}, audit, None, lambda: next(ticks) * 0.3)
+            self.assertLess(out.get("orch", 0), 20)
+            self.assertEqual(lines[-1][3]["bound"], "time")
+            broken = self.mutant("if clock() > deadline:", "if False:")
+            sb._CLOUD_TRUNCATED.clear(); ticks = iter(range(0, 1000))
+            self.assertEqual(broken(self.state_dir, self.disc, {}, {}, audit, None, lambda: next(ticks) * 0.3), {"orch": 20})
+        finally:
+            sb.CLOUD_LOAD_MAX_SCAN = old
+
+    def test_load_line_text_carries_the_cloud_mark(self):
+        fh = sb.load_fleet_health()
+        src = (BIN / "fleet_health.py").read_text()
+        self.assertIn("\\u2601 cloud", src)
+        self.assertIn('(" +%d\\u2601 cloud" % f["cloud"]) if f.get("cloud")', src)
 
     def test_now_is_injected(self):
         self.rec("w", hard_deadline="2030-01-01T00:00:00Z")

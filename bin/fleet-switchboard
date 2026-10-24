@@ -27080,57 +27080,85 @@ def coder_finished(obs, retired, last_reports):
 
 
 CLOUD_LOAD_MAX_ENTRIES = 200      # #1097: the most cloud records one pass reads for the load line
+CLOUD_LOAD_MAX_SCAN = 2000        # and the most directory entries it examines (of any name)
+CLOUD_LOAD_SECONDS = 0.5          # and the most time (monotonic) it spends
 CLOUD_LOAD_MAX_BYTES = 65536      # and the most bytes of one record
+CLOUD_LOAD_STALE_SECONDS = 3600   # a record that carries last_report_at older than this is not live
 
 
-CLOUD_NO_BOSS_LANE = "(no boss)"   # #1097: the named fallback lane of a cloud worker whose record has no reports_to
+CLOUD_NO_BOSS_LANE = "(no boss)"   # #1097: the named fallback lane of a cloud worker whose record has no reports_to (counted, but no load row shows it)
 _CLOUD_TRUNCATED = {}              # state dir -> True while the listing is cut (one audit line per episode)
 
 
-def live_cloud_by_lane(state_dir, discovery, retired, last_reports, audit=None, now=None):
-    """#1097: {lane name: live cloud workers} from the files under the cloud record directory (one bounded listing, no GitHub read, no process). A worker
-    that is retired, made its final report, or is past its hard deadline is not counted. A lane is the boss the local coders' rule gives (`resolve_boss`).
-    An unreadable directory gives {} and ONE audit line; a record that cannot be read is skipped. A record without reports_to is counted under
-    CLOUD_NO_BOSS_LANE. A listing cut at CLOUD_LOAD_MAX_ENTRIES writes ONE audit line (load.cloud_truncated) per episode. `now` is injected (default: the clock)."""
+def _cloud_when(text):
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def live_cloud_by_lane(state_dir, discovery, retired, last_reports, audit=None, now=None, clock=None):
+    """#1097: {lane name: live cloud workers} from the files under the cloud record directory (one bounded scan, no GitHub read, no process). A worker
+    that is retired, made its final report, or is past its hard deadline is not counted; a record WITHOUT a valid hard_deadline (no evidence of liveness)
+    is not counted either, nor one whose last_report_at (if present) is older than CLOUD_LOAD_STALE_SECONDS. A lane is the boss the local coders' rule gives
+    (`resolve_boss`). The files are read by cloud_worker.read_record_file (never blocks, no symlink, regular files only); a hostile file is skipped.
+    An unreadable directory gives {} and ONE audit line. The scan stops at CLOUD_LOAD_MAX_SCAN entries examined, CLOUD_LOAD_MAX_ENTRIES records read or
+    CLOUD_LOAD_SECONDS (injected `clock`, monotonic): ONE audit line (load.cloud_truncated, "bound": files|records|time) per episode. `now` is injected."""
     base = Path(state_dir) / "cloud"
     counts = {}
+    clock = clock or time.monotonic
+    deadline = clock() + CLOUD_LOAD_SECONDS
+    now = time.time() if now is None else now
+    reader = load_module("cloud_worker").read_record_file
+    examined = read = 0
+    bound = None
     try:
         if not base.is_dir():
             return counts
-        names = sorted(e for e in os.listdir(str(base)) if e.endswith(".json"))
+        with os.scandir(str(base)) as it:
+            for entry in it:
+                if examined >= CLOUD_LOAD_MAX_SCAN:
+                    bound = "files"
+                    break
+                if clock() > deadline:
+                    bound = "time"
+                    break
+                examined += 1
+                fname = entry.name
+                if not fname.endswith(".json"):
+                    continue
+                if read >= CLOUD_LOAD_MAX_ENTRIES:
+                    bound = "records"
+                    break
+                read += 1
+                worker = fname[:-5]
+                record, _kind = reader(base / fname, CLOUD_LOAD_MAX_BYTES)
+                if record is None or record.get("worker") != worker:
+                    continue
+                if worker in retired or (last_reports.get(worker) or {}).get("state") in ("done", "failed") or record.get("retired"):
+                    continue
+                ends = _cloud_when(record.get("hard_deadline"))
+                if ends is None or ends < now:
+                    continue   # no valid hard deadline is no evidence of life; a past one is an ended pod
+                if "last_report_at" in record:
+                    seen = _cloud_when(record.get("last_report_at"))
+                    if seen is None or now - seen > CLOUD_LOAD_STALE_SECONDS:
+                        continue
+                boss = record.get("reports_to")
+                lane = resolve_boss(discovery, boss) if isinstance(boss, str) and boss else CLOUD_NO_BOSS_LANE
+                counts[lane] = counts.get(lane, 0) + 1
     except OSError as err:
         if audit is not None:
             audit.append("daemon", "load.cloud_unreadable", None, {"why": _one_line(str(err), 120)})
         return {}
     key = str(state_dir)
-    if len(names) > CLOUD_LOAD_MAX_ENTRIES:
+    if bound:
         if not _CLOUD_TRUNCATED.get(key) and audit is not None:
-            audit.append("daemon", "load.cloud_truncated", None, {"limit": CLOUD_LOAD_MAX_ENTRIES, "entries": len(names), "name": "CLOUD_LOAD_MAX_ENTRIES"})
+            audit.append("daemon", "load.cloud_truncated", None, {"bound": bound, "limit": {"files": CLOUD_LOAD_MAX_SCAN, "records": CLOUD_LOAD_MAX_ENTRIES, "time": CLOUD_LOAD_SECONDS}[bound],
+                                                                  "entries": examined, "name": {"files": "CLOUD_LOAD_MAX_SCAN", "records": "CLOUD_LOAD_MAX_ENTRIES", "time": "CLOUD_LOAD_SECONDS"}[bound]})
         _CLOUD_TRUNCATED[key] = True
-        names = names[:CLOUD_LOAD_MAX_ENTRIES]
     else:
         _CLOUD_TRUNCATED[key] = False
-    now = time.time() if now is None else now
-    for fname in names:
-        worker = fname[:-5]
-        try:
-            with open(str(base / fname), "rb") as handle:
-                record = json.loads(handle.read(CLOUD_LOAD_MAX_BYTES).decode("utf-8"))
-        except (OSError, ValueError, UnicodeError):
-            continue
-        if not isinstance(record, dict) or record.get("worker") != worker:
-            continue
-        if worker in retired or (last_reports.get(worker) or {}).get("state") in ("done", "failed") or record.get("retired"):
-            continue
-        try:
-            ended = datetime.strptime(record.get("hard_deadline"), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp() < now
-        except (TypeError, ValueError):
-            ended = False
-        boss = record.get("reports_to")
-        if ended:
-            continue
-        lane = resolve_boss(discovery, boss) if isinstance(boss, str) and boss else CLOUD_NO_BOSS_LANE
-        counts[lane] = counts.get(lane, 0) + 1
     return counts
 
 

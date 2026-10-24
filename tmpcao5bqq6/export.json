@@ -1,0 +1,1 @@
+[{"id": "id-model", "integrationID": "github-copilot", "label": "acme", "active": true, "value": {"type": "oauth", "refresh": "ghu_ModelRefreshSecret0123456789", "access": "gho_ModelAccessSecret9876543210", "expires": 0}}, {"id": "id-other", "integrationID": "other", "label": "x", "active": true, "value": {"type": "api", "key": "must-not-travel"}}]
