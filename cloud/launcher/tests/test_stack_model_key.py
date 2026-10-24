@@ -219,6 +219,91 @@ class Refusals(unittest.TestCase):
         self.assertIn('[CREATE_OPTION["stack_model_secret"], stack_model[0]]', src)   # the option carries the NAME
 
 
+class Sentinel(Exception):
+    pass
+
+
+class NonStackReadsNothing(unittest.TestCase):
+    """The guard 'without --stack the setting is ignored': a counter on the vault read, run through the real _launch (stopped at the launcher lookup,
+    which comes right after the read), and the mutant (the read made unconditional) that the non-stack test must catch."""
+    def setUp(self):
+        self.bin = load_bin()
+        self.bin_launch_original = self.bin._launch
+        self.calls = []
+
+    def args(self, stack):
+        import types
+        return types.SimpleNamespace(name="coder7", resume=False, headless=False, agent="worker", reports_to=None, dir=None, repo="acme-org/widget-service",
+                                     branch="work-branch", shape=None, idle=None, hard=None, brief_file=None, stack=stack)
+
+    def run_launch(self, stack, fn=None):
+        b = self.bin
+        calls = self.calls
+
+        def fake_read(env=None):
+            calls.append(1)
+            return (NAME, STACK)
+
+        def stop():
+            raise Sentinel()
+
+        class Eng:
+            def discover(self, now):
+                return types.SimpleNamespace(agents={})
+
+            def now(self):
+                return 0
+        import types
+        lib = types.SimpleNamespace(check_repo_preflight=lambda repo, env: "ok")
+        saved = {k: getattr(b, k) for k in ("stack_model_secret", "launcher_argv", "use_settings", "check_allowed", "_lib", "load_record", "H")}
+        h = dict(b.H, LaunchError=type('LaunchError', (Exception,), {}), NAME_RE=re.compile('[a-z0-9]+'), RESERVED_AGENT_NAMES=(), LANE_NAME_PREFIX='lane-', PROG='sb', launch_repo=lambda a: a.repo, build_engine=lambda r, n, c: (Eng(), object(), None), read_brief=lambda f, i: "brief")
+        try:
+            b.stack_model_secret, b.launcher_argv, b.use_settings, b.check_allowed = fake_read, stop, (lambda: "test"), (lambda repo: None)
+            b._lib, b.load_record, b.H = (lambda: lib), (lambda st, n: None), h
+            old = os.environ.get("CW_STACK_MODEL_SECRET")
+            os.environ["CW_STACK_MODEL_SECRET"] = NAME   # the setting is present
+            try:
+                with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                    (fn or b._launch)(self.args(stack), None, lambda: 0, lambda st: None)
+            except Sentinel:
+                pass
+            finally:
+                if old is None:
+                    os.environ.pop("CW_STACK_MODEL_SECRET", None)
+                else:
+                    os.environ["CW_STACK_MODEL_SECRET"] = old
+        finally:
+            for k, v in saved.items():
+                setattr(b, k, v)
+
+    def test_a_non_stack_launch_makes_no_vault_read_and_a_stack_launch_makes_one(self):
+        self.run_launch(False)
+        self.assertEqual(self.calls, [])
+        self.run_launch(True)
+        self.assertEqual(self.calls, [1])
+
+    def test_the_read_is_guarded_in_the_source_once(self):
+        src = read("bin/cloud_worker.py")
+        self.assertIn('if getattr(args, "stack", False) else None', src)   # the read is guarded where it is made
+        self.assertEqual(src.count("stack_model = stack_model_secret()"), 1)
+
+    def test_mutant_an_unconditional_read_is_caught(self):
+        src = read("bin/cloud_worker.py")
+        guarded = 'stack_model = stack_model_secret() if getattr(args, "stack", False) else None'
+        self.assertIn(guarded, src)
+        tree = ast.parse(src.replace(guarded, "stack_model = stack_model_secret()"))
+        fn = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_launch"][0]
+        mod = ast.Module(body=[fn], type_ignores=[])
+        ns = self.bin.__dict__
+        exec(compile(mod, "mutant", "exec"), ns)
+        mutant = ns["_launch"]
+        try:
+            self.run_launch(False, fn=mutant)
+        finally:
+            ns["_launch"] = self.bin_launch_original
+        self.assertEqual(self.calls, [1])   # the mutant reads although --stack is absent: the real test above would fail
+
+
 class Mutants(DeliveryBase):
     """S9: the scan fails for a build that places the value in the pod's environment, in an argument, or in the launcher's environment."""
     def _pod_with_value(self, where):
