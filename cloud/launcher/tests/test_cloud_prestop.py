@@ -70,15 +70,18 @@ class Base(unittest.TestCase):
             open(fake, "w").write('#!/bin/sh\nif [ "$1" = -k ]; then shift 2; fi\nshift\nexec "$@"\n')
             os.chmod(fake, 0o755)
 
-    def seam(self, hook, helper_dir=None):
+    def seam(self, hook, helper_dir=None, git_bin=None):
         """TEST-ONLY SEAM (documented once, here): a launcher script that imports the hook module from `hook` and patches its host constant
         to a file:// prefix and its helper directory to the fake one. The real hook reads neither from the environment, so the agent cannot."""
         n = len([f for f in os.listdir(self.t) if f.startswith("seam-")])
         path = os.path.join(self.t, "seam-%d.py" % n)
         open(path, "w").write(
             "#!%s\nimport importlib.util, importlib.machinery, sys\nsp = importlib.util.spec_from_loader('end_hook_under_test', importlib.machinery.SourceFileLoader('end_hook_under_test', %r))\n"
-            "m = importlib.util.module_from_spec(sp)\nsp.loader.exec_module(m)\nm.HOST_URL = %r\nm.HELPER_DIR = %r\nsys.exit(m.main())\n"
-            % (sys.executable, hook, "file://%s/" % self.t, helper_dir or self.helper_dir))
+            "m = importlib.util.module_from_spec(sp)\nsp.loader.exec_module(m)\nm.HOST_URL = %r\nm.HELPER_DIR = %r\n"
+            "import os\nif os.path.exists(%r):\n    m.GIT_BIN = %r\n"   # the logging fake git of a test, when the test made one
+            "if %r:\n    m.GIT_BIN = %r\nsys.exit(m.main())\n"
+            % (sys.executable, hook, "file://%s/" % self.t, helper_dir or self.helper_dir,
+               os.path.join(self.bin, "git"), os.path.join(self.bin, "git"), git_bin, git_bin))
         os.chmod(path, 0o755)
         return path
 
@@ -614,6 +617,8 @@ class Grammar(Base):
             self.assertEqual([l for l in code if l.startswith(name + " =")], [l for l in code if l.startswith(name + " =")][:1])
             self.assertFalse([l for l in code if name in l and "environ" in l])
         self.assertEqual(len([l for l in code if "HOST_URL" in l]), 2)   # the definition and the one use
+        self.assertFalse([l for l in code if "GIT_BIN" in l and "environ" in l])
+        self.assertEqual(cw_end_hook.GIT_BIN, "/usr/bin/git" if os.path.exists("/usr/bin/git") else cw_end_hook.GIT_CANDIDATES[0])
 
     def test_without_the_pods_helper_nothing_is_pushed(self):
         self.reset()
@@ -794,6 +799,35 @@ class EarlyReturns(Base):
         p = self.hook()
         self.assertEqual(len(p.stdout.strip().splitlines()), 1)
         self.assertIn("LOST", p.stdout)
+
+    def guard_on_path(self):
+        # the pod's guard wrapper first on PATH: refuses a git call whose environment carries git configuration variables
+        guard = os.path.join(self.bin, "git")
+        with open(guard, "w") as f:
+            f.write('#!/bin/sh\nenv | grep -q "^GIT_CONFIG_[A-Z]*=." && { echo "refused: git configuration from the environment" >&2; exit 3; }\nexec %s "$@"\n' % GIT)
+        os.chmod(guard, 0o755)
+
+    def test_the_hook_pushes_with_a_refusing_guard_wrapper_first_on_path(self):
+        self.guard_on_path()
+        self.dirty()
+        p = subprocess.run([self.seam(HOOK, git_bin=GIT), "--prestop"], env=self.env(), capture_output=True, text=True)
+        self.assertIn("saved work to w1/wip", p.stdout, p.stdout + p.stderr)
+        self.assertEqual(self.wip(), sh("git", "-C", self.work, "rev-parse", "HEAD"))
+        # the guard really refuses what the hook would send it
+        g = subprocess.run([os.path.join(self.bin, "git"), "--version"], env=dict(os.environ, **{CFG_G: "/dev/null"}), capture_output=True, text=True)
+        self.assertEqual(g.returncode, 3)
+
+    def test_a_mutant_finding_git_by_path_fails_with_the_guard(self):
+        self.guard_on_path()
+        self.dirty()
+        s = open(HOOK).read()
+        self.assertIn("[GIT_BIN, ", s)
+        mut = os.path.join(self.t, "mut-pathgit")
+        with open(mut, "w") as f:
+            f.write(s.replace("[GIT_BIN, ", '["git", '))
+        p = subprocess.run([self.seam(mut, git_bin=GIT), "--prestop"], env=self.env(), capture_output=True, text=True)
+        self.assertNotIn("saved work", p.stdout)
+        self.assertEqual(self.wip(), "")
 
     def test_a_mutant_that_returns_silently_is_caught(self):
         s = open(HOOK).read()

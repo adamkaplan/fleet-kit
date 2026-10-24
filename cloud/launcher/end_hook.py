@@ -26,6 +26,21 @@ SECRET_GLOBS = [".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*",
 HOST_URL = "https://github.com/"
 HELPER_DIR = "/run/cw-tmp/bin"   # the directory entrypoint.sh fills ($TMP/bin, TMP=/run/cw-tmp); the helper is git-credential-cw in it
 HELPER_NAME = "git-credential-cw"
+# git is run by ABSOLUTE path, never found on PATH: in a pod the guard wrapper ($TMP/bin/git, first on the entrypoint's PATH) refuses the
+# hook's own calls (GIT_CONFIG_GLOBAL in the environment) and would make every pre-stop push fail. The wrapper itself execs the real
+# binary the image installs (cloud/worker/entrypoint.sh: CW_REAL_GIT, found before the wrapper exists); the image's git package puts
+# it at /usr/bin/git. Test seam: the tests patch GIT_BIN like the two constants above.
+GIT_CANDIDATES = ("/usr/bin/git", "/usr/local/bin/git")
+
+
+def _real_git():
+    for c in GIT_CANDIDATES:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return GIT_CANDIDATES[0]
+
+
+GIT_BIN = _real_git()
 KEEP_ENV = ("PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TZ", "TMPDIR")
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")   # owner and name start with a letter or a digit
 
@@ -62,7 +77,7 @@ class Ctx:
 
 
 def git(workdir, *args, check=True, ctx=None, opts=True):
-    cmd = ["git", "-C", workdir] + (ctx.opts if ctx and opts else []) + list(args)
+    cmd = [GIT_BIN, "-C", workdir] + (ctx.opts if ctx and opts else []) + list(args)
     p = subprocess.run(cmd, capture_output=True, text=True, env=ctx.env if ctx else None)
     if check and p.returncode != 0:
         raise RuntimeError((p.stderr.strip().splitlines() or ["git %s failed" % args[0]])[-1])
@@ -108,7 +123,7 @@ BRANCH_RE = re.compile(r"^branch\.(.+)\.(remote|merge)$")
 def config_refusal(workdir, repo, ctx):
     """Read the repository's local configuration, includes followed, with the origin of every key; raise on the first key that is not
     plain. A key that comes from any file but the repository's own config file (an include) is a refusal too."""
-    p = subprocess.run(["git", "-C", workdir, "config", "--local", "--includes", "--show-origin", "--list", "-z"],
+    p = subprocess.run([GIT_BIN, "-C", workdir, "config", "--local", "--includes", "--show-origin", "--list", "-z"],
                        capture_output=True, env=ctx.env)
     if p.returncode != 0:
         raise RuntimeError("the repository configuration could not be read")
