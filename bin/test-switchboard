@@ -55183,12 +55183,32 @@ class TestHeldTop(DecisionsBase):
             (["| What | Before | After | Before |", "|---|---|---|---|", "| x | %s | %s | %s |" % (a, b, a), "| y | %s | %s | %s |" % (c, d, c)], "duplicate Before column"),
             (["| What | Before | After | After |", "|---|---|---|---|", "| x | %s | %s | %s |" % (a, b, b), "| y | %s | %s | %s |" % (c, d, d)], "duplicate After column"),
             (ok3[:3] + ["| only | %s |" % c], "every table cell"),
+            (["| What | Before | After |", "|---|---|", ok3[2], ok3[3]], "separator row has 2 columns, the header has 3"),
+            (["| Before | After |", "|---|---|---|", two[2], two[3]], "separator row has 3 columns, the header has 2"),
+            (ok3[:2] + ["| | | |", ok3[3]], "every table cell"),
+            (["```"] + ok3 + ["```"], "inside a code fence"),
         ]
         for lines, text in cases:
             with self.subTest(text=text):
                 found = run(lines)
                 self.assertEqual(len(found), 1, found)
                 self.assertIn(text, found[0])
+
+    def test_before_equal_to_after_is_accepted_and_a_dropped_length_check_is_caught(self):                  # 1082
+        # The ask only requires the two named columns and plain sentences; it does not forbid a row whose Before and After match.
+        same = "The same plain sentence."
+        rows = ["| Before | After |", "|---|---|", "| %s | %s |" % (same, same), "| %s | %s |" % (same, same)]
+        body = self.OPEN + self.WHY + "## What changes for you\n\n" + "\n".join(rows) + "\n\n" + self.EXAMPLE + self.QS
+        self.assertEqual(self.defects(body), [])
+        import inspect
+        src = inspect.getsource(sb._held_defects)
+        mutant_src = src.replace("has_sep = sep_cells and len(rows[1]) == len(head)", "has_sep = sep_cells")
+        self.assertNotEqual(src, mutant_src)
+        ns = dict(vars(sb))
+        exec(mutant_src, ns)
+        bad = self.OPEN + self.WHY + "## What changes for you\n\n| What | Before | After |\n|---|---|\n| x | %s | %s |\n| y | %s | %s |\n\n" % (same, same, same, same) + self.EXAMPLE + self.QS
+        self.assertTrue(any("separator row has 2" in d for d in self.defects(bad)))
+        self.assertFalse(any("separator row has 2" in d for d in ns["_held_defects"](bad)))
 
     def test_the_example_must_be_there_and_not_empty(self):                                                 # S4
         for example in ("", "## Example\n\n"):

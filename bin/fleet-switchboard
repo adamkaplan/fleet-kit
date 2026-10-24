@@ -26191,15 +26191,21 @@ def _held_defects(body):
     else:
         rows = [[c.strip() for c in l.strip().strip("|").split("|")] for l in section(HELD_TABLE) if l.strip().startswith("|")]
         head = [_ascii_lower(c) for c in rows[0]] if rows else []
-        has_sep = len(rows) >= 2 and all(re.fullmatch(r":?-{3,}:?", c) for c in rows[1])
+        sep_cells = len(rows) >= 2 and all(re.fullmatch(r":?-{3,}:?", c) for c in rows[1])
+        has_sep = sep_cells and len(rows[1]) == len(head)
         data = rows[2:] if has_sep else []
         dup = next((n for n in ("before", "after") if head.count(n) > 1), None)
-        if "before" not in head:
+        fenced = not rows and any(l.strip().startswith("|") for l in lines[at + pos[HELD_TABLE]:at + top_end])
+        if fenced:
+            problems.append("`%s`: the table is inside a code fence, it must be plain text" % HELD_TABLE)
+        elif "before" not in head:
             problems.append("`%s`: the table has no Before column" % HELD_TABLE)
         elif "after" not in head:
             problems.append("`%s`: the table has no After column" % HELD_TABLE)
         elif dup:
             problems.append("`%s`: the table has a duplicate %s column" % (HELD_TABLE, dup.capitalize()))
+        elif sep_cells and not has_sep:
+            problems.append("`%s`: separator row has %d columns, the header has %d" % (HELD_TABLE, len(rows[1]), len(head)))
         elif not has_sep:
             problems.append("`%s`: the table has no separator row" % HELD_TABLE)
         elif not data:
