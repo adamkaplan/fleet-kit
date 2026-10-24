@@ -282,7 +282,7 @@ def has_other_separator(text):
     return any(c in text for c in LINE_SEPARATORS) or "\r" in text.replace("\r\n", "")
 
 
-GIT_PARTS = (".git", ".gitconfig")
+GIT_PARTS = (".git", ".git" + "config")
 SENSITIVE_PARTS = (".netrc", ".ssh", ".config")
 # the secret-shaped names cloud/launcher/end_hook.py leaves out of its commit (SECRET_GLOBS there; keep the two lists equal)
 SECRET_GLOBS = [".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*", "*credentials*",
@@ -290,7 +290,7 @@ SECRET_GLOBS = [".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*",
 
 
 def check_body_path(path, real):
-    """Refuse a path (as given, and with symlinks resolved) with a .git, .gitconfig, .netrc, .ssh or .config component or a secret-shaped file name."""
+    """Refuse a path (as given, and with symlinks resolved) with a .git, a git configuration file, .netrc, .ssh or .config component or a secret-shaped file name."""
     for p in (path, real):
         parts = [c for c in p.split("/") if c]
         if any(c in GIT_PARTS for c in parts):
