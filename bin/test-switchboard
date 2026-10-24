@@ -28857,17 +28857,65 @@ class TestSweep(Base):
         self.ready_pass([self.held_pr()], reading, budget=budget, mutant=mutant)
         self.assertEqual(budget[0], 100 - 30)
 
+    FACT_FUNCTIONS = (("plan_ledger", "evaluate_gates"), ("plan_ledger", "carried_rows"), ("sb", "_ledger_context"), ("sb", "pr_picture"), ("sb", "sweep_gate_reading"), ("sb", "carries_context"))
+    FACT_HELPERS = {"carried_rows", "carries_context", "evaluate_gates"}   # the functions `facts` may be passed to: each is scanned too
+
+    @classmethod
+    def fact_sources(cls, overrides=None):
+        out = {}
+        for module, name in cls.FACT_FUNCTIONS:
+            out[name] = textwrap.dedent(inspect.getsource(getattr(sb.plan_ledger if module == "plan_ledger" else sb, name)))
+        out.update(overrides or {})
+        return out
+
     @staticmethod
-    def gate_fact_names(gates=None):
-        """Every input `evaluate_gates` reads (its arguments and `facts` keys), and every fact `_ledger_context`, `pr_picture` and `sweep_gate_reading` set or read."""
-        gates = gates or inspect.getsource(sb.plan_ledger.evaluate_gates)
+    def fact_scan(sources):
+        """(keys, unrecognised): every key the functions read, set or pass on `facts` (or `ctx.facts`), found with the ast module. Recognised: a subscript or
+        .get with a literal key, dict(facts, k=...) keywords, a truth test, a pass to a scanned helper, the context carrier and the return of the picture.
+        Anything else (a bare pass to another function, an iteration, a computed key) is unrecognised."""
+        keys, bad = set(), []
+        helpers = ("carried_rows", "carries_context", "evaluate_gates")
+        for fname, source in sources.items():
+            tree = ast.parse(source)
+            parent = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+            for node in ast.walk(tree):
+                named = isinstance(node, ast.Name) and node.id == "facts"
+                carried = isinstance(node, ast.Attribute) and node.attr == "facts" and isinstance(node.value, ast.Name) and node.value.id in ("ctx", "ns")
+                if not (named or carried) or isinstance(getattr(node, "ctx", None), ast.Store) or isinstance(parent.get(node), ast.arg):
+                    continue
+                at, up = node, parent.get(node)
+                while isinstance(up, ast.IfExp) and at is not up.test or isinstance(up, ast.BoolOp) and isinstance(up.op, ast.Or):
+                    at, up = up, parent.get(up)   # `facts or {}`, `facts if ... else None`
+                call = up if isinstance(up, ast.Call) else None
+                if isinstance(up, ast.keyword):
+                    call = parent.get(up)
+                if isinstance(up, ast.Subscript) and up.value is at and isinstance(up.slice, ast.Constant) and isinstance(up.slice.value, str):
+                    keys.add(up.slice.value)
+                elif isinstance(up, ast.Attribute) and up.attr == "get" and isinstance(parent.get(up), ast.Call) and parent[up].args and isinstance(parent[up].args[0], ast.Constant) and isinstance(parent[up].args[0].value, str):
+                    keys.add(parent[up].args[0].value)
+                elif call is not None and isinstance(up, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "dict":
+                    keys |= {k.arg for k in call.keywords if k.arg}
+                elif call is not None and isinstance(up, ast.Call) and at in call.args and (getattr(call.func, "id", None) in helpers or getattr(call.func, "attr", None) in helpers):
+                    pass   # passed to a helper whose source is scanned too
+                elif isinstance(up, ast.keyword) and isinstance(call.func, ast.Attribute) and call.func.attr == "SimpleNamespace":
+                    pass   # the context carrier
+                elif isinstance(up, ast.BoolOp) and isinstance(up.op, ast.And) and at is not up.values[-1] or isinstance(up, (ast.If, ast.UnaryOp)) or isinstance(up, ast.IfExp):
+                    pass   # a truth test
+                elif isinstance(up, ast.Tuple) and isinstance(parent.get(up), ast.Return):
+                    pass   # pr_picture returns the facts to the caller, which is scanned
+                else:
+                    bad.append("%s line %s: facts used in an unrecognised way" % (fname, getattr(node, "lineno", "?")))
+        return keys, bad
+
+    @classmethod
+    def gate_fact_names(cls, overrides=None):
+        """Every input `evaluate_gates` reads (its arguments) and every `facts` key the gate path and its helpers read or set (the ast module), plus the context fields the reading checks."""
+        sources = cls.fact_sources(overrides)
         names = set(inspect.signature(sb.plan_ledger.evaluate_gates).parameters)
-        names |= set(re.findall(r'facts or \{\}\)\.get\("(\w+)"\)', gates))
-        ctx = inspect.getsource(sb._ledger_context)
-        names |= set(re.findall(r'facts\["(\w+)"\]', ctx)) | set(re.findall(r'\b(\w+)=(?:body|senders|lambda)', ctx.split("facts = dict(", 1)[1].split("\n", 1)[0]))
-        names |= set(re.findall(r'facts\["(\w+)"\]', inspect.getsource(sb.pr_picture)))
-        reading = inspect.getsource(sb.sweep_gate_reading)
-        names |= set(re.findall(r'ctx\.(plan_problem|problem|unreadable)\b', reading)) | set(re.findall(r'facts or \{\}\)\.get\("(\w+)"\)', reading))
+        keys, bad = cls.fact_scan(sources)
+        assert not bad, bad
+        names |= keys
+        names |= set(re.findall(r'ctx\.(plan_problem|problem|unreadable)\b', sources["sweep_gate_reading"]))
         return {"ledger_problem" if n == "problem" else n for n in names}
 
     @staticmethod
@@ -28879,51 +28927,188 @@ class TestSweep(Base):
     def fact_gaps(self, names, rows):
         return sorted(names - rows)
 
+    def fact_problems(self, overrides=None, rows=None):
+        """Why the completeness check would fail: an unrecognised use of facts, or a key with no row."""
+        keys, bad = self.fact_scan(self.fact_sources(overrides))
+        names = keys | set(inspect.signature(sb.plan_ledger.evaluate_gates).parameters) | {"ledger_problem", "plan_problem", "unreadable"}
+        return bad + ["no row: %s" % n for n in self.fact_gaps(names, self.docs_fact_rows() if rows is None else rows)]
+
+    def fact_mutants(self):
+        """(label, overrides): a key added in each spelling, and bare passes of facts."""
+        ev, cr = self.fact_sources()["evaluate_gates"], self.fact_sources()["carried_rows"]
+        head = '    head = (facts or {}).get("head")'
+        self.assertIn(head, ev)
+        first = cr.split("\n", 1)
+        yield "get", {"evaluate_gates": ev.replace(head, head + '\n    _zz = facts.get("zz_new") if facts else None', 1)}
+        yield "subscript", {"evaluate_gates": ev.replace(head, head + '\n    _zz = facts["zz_new"]', 1)}
+        yield "helper", {"carried_rows": first[0] + '\n    _zz = (facts or {}).get("zz_new")\n' + first[1]}
+        yield "unknown_pass", {"evaluate_gates": ev.replace(head, head + '\n    _zz = mystery(facts)', 1)}
+        yield "iteration", {"evaluate_gates": ev.replace(head, head + '\n    _zz = [k for k in facts]', 1)}
+
     def test_986_every_fact_the_gates_read_has_a_row_in_the_table(self):
-        names, rows = self.gate_fact_names(), self.docs_fact_rows()
-        self.assertTrue({"head", "ci", "draft", "body", "captain", "holds", "floor", "author", "notice_senders", "held_check", "plan", "entries", "ledger_problem", "plan_problem", "body_unreadable"} <= names)
-        self.assertEqual(self.fact_gaps(names, rows), [])
-        # the mutants: a dropped row, and a new fact added to the source without a row
-        self.assertEqual(self.fact_gaps(names, rows - {"floor"}), ["floor"])
-        self.assertEqual(self.fact_gaps(names | {"brand_new_fact"}, rows), ["brand_new_fact"])
-        source = inspect.getsource(sb.plan_ledger.evaluate_gates).replace('(facts or {}).get("ci")', '(facts or {}).get("zzz_new")', 1)
-        self.assertIn("zzz_new", self.gate_fact_names(source))
-        self.assertEqual(self.fact_gaps(self.gate_fact_names(source), rows), ["zzz_new"])
+        names = self.gate_fact_names()
+        self.assertTrue({"head", "ci", "draft", "body", "captain", "holds", "floor", "author", "notice_senders", "held_check", "carries", "plan", "entries", "ledger_problem", "plan_problem", "body_unreadable"} <= names)
+        self.assertEqual(self.fact_problems(), [])
+        self.assertEqual(self.fact_gaps(names, self.docs_fact_rows() - {"floor"}), ["floor"])   # a dropped row
+        audit = Path(__file__).resolve().parent.parent.joinpath("docs", "switchboard.md").read_text().split("S5 fact audit: ", 1)[1]
+        self.assertEqual(audit.split(" ", 1)[0], str(len(names)))   # the figure in the docs is the computed one
 
-    def counted_reading(self, ready):
-        """The REAL sweep_gate_reading over fakes that make the calls a reading makes (PR view 1, plan issue + 1 comments page 2, floor view 1, and for a ready
-        one clear_who 3); returns the calls its counting runner saw."""
-        counted = []
-        self.engine.gh_runner = lambda *a, **k: counted.append(1) or types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
+    def test_986_a_new_fact_in_any_spelling_fails_the_completeness_test(self):
+        for label, overrides in self.fact_mutants():
+            self.assertTrue(self.fact_problems(overrides), label)
+            if label in ("get", "subscript", "helper"):
+                self.assertEqual(self.fact_problems(overrides), ["no row: zz_new"], label)
 
-        def context(args, run, *a, **k):
-            for _ in range(1 + 2 + 1):
-                run(["gh"])
-            return types.SimpleNamespace(unreadable=None, facts={"head": self.HEAD_A, "draft": False}, plan=None, entries=[], problem=None, plan_problem=None, pr="acme/api#600")
+    PH = "sha256:" + "0" * 64
 
-        def clear_who(engine, run, *a, **k):
-            for _ in range(3):
-                run(["gh"])
-            return {"who": "owner only", "floor_ids": [], "owner_only": [{"why": "x"}], "threshold": None, "min_rating": None}
-        report = {"gates": [{"gate": "G6", "status": "open"}] + ([] if ready else [{"gate": "G4", "status": "pending"}]), "ready": False}
-        with mock.patch.object(sb, "_ledger_context", context), mock.patch.object(sb, "clear_who", clear_who), \
-                mock.patch.object(sb.plan_ledger, "evaluate_gates", lambda *a, **k: report):
-            sb.sweep_gate_reading(self.engine, "acme/api", 600, self.world.clock.now())
-        return len(counted)
+    def board_reading(self, change=None, plan="ok", entries="ok", ledger_problem=None, plan_problem=None, unreadable=None, boom=None, mutant=None, mutant_board=None):
+        """The REAL sweep_gate_reading with the REAL plan_ledger.evaluate_gates (nothing of the board is mocked) over a ready-looking baseline in which `change`
+        sets, drops or empties facts. Only the reads of GitHub (the context) and the who-can-clear answer are given."""
+        facts = {"head": self.HEAD_A, "ci": "green", "draft": False, "body": "canon: n/a nothing to update here", "captain": True, "holds": None, "author": "bob", "notice_senders": ["bob"], "held_check": lambda: []}
+        for key, value in (change or {}).items():
+            if value is KeyError:
+                facts.pop(key, None)
+            else:
+                facts[key] = value
+        the_plan = {"result": "pass", "defects": [], "plan_hash": self.PH, "text": "", "scenarios_parsed": [{"id": "S1", "evaluator": "ci", "proof": "test"}]} if plan == "ok" else None
+        pr = "acme/api#600"
+        ledger = [{"seq": 1, "kind": "proof", "pr": pr, "scenario": "S1", "plan_hash": self.PH, "head": self.HEAD_A, "result": "pass", "by": "coder"},
+                  {"seq": 2, "kind": "verdict", "pr": pr, "scenario": "S1", "plan_hash": self.PH, "head": self.HEAD_A, "result": "pass", "by": "cibot", "evaluator": "ci"}] if entries == "ok" else []
+        ctx = types.SimpleNamespace(unreadable=unreadable, facts=facts, plan=the_plan, entries=ledger, problem=ledger_problem, plan_problem=plan_problem, pr=pr)
+
+        def context(*a, **k):
+            if boom:
+                raise boom
+            return ctx
+        who = {"who": "owner only", "floor_ids": [], "owner_only": [{"why": "x"}], "threshold": None, "min_rating": None}
+        with mock.patch.object(sb, "_ledger_context", context), mock.patch.object(sb, "clear_who", lambda *a, **k: who):
+            board = contextlib.ExitStack()
+            if mutant_board:
+                source = textwrap.dedent(inspect.getsource(sb.plan_ledger.evaluate_gates))
+                self.assertIn(mutant_board[0], source)
+                scope = dict(sb.plan_ledger.__dict__)
+                exec(compile(source.replace(mutant_board[0], mutant_board[1], 1), "<mutant>", "exec"), scope)
+                board.enter_context(mock.patch.object(sb.plan_ledger, "evaluate_gates", scope["evaluate_gates"]))
+            with board:
+                if mutant:
+                    with self.mutated("sweep_gate_reading", *mutant):
+                        return sb.sweep_gate_reading(self.engine, "acme/api", 600, self.world.clock.now())
+                return sb.sweep_gate_reading(self.engine, "acme/api", 600, self.world.clock.now())
+
+    # (row of the table, the case, how the baseline changes, the outcome the table states). READY: the one open gate is the owner's clear.
+    BOARD_ROWS = (
+        ("baseline", "nothing changed", {}, {}, "ready"),
+        ("plan", "the PR names no plan", {}, {"plan": None}, "not ready"),
+        ("entries", "no proof or verdict in the ledger", {}, {"entries": None}, "not ready"),
+        ("plan_problem", "the plan fetch failed", {}, {"plan_problem": "HTTP 502"}, "not checked"),
+        ("ledger_problem", "the ledger is corrupt", {}, {"ledger_problem": "not JSON"}, "not checked"),
+        ("unreadable", "the PR view failed", {}, {"unreadable": "HTTP 502"}, "not checked"),
+        ("head", "no head", {"head": KeyError}, {}, "not checked"),
+        ("ci", "ci is None", {"ci": None}, {}, "not ready"),
+        ("ci", "ci is absent", {"ci": KeyError}, {}, "not ready"),
+        ("ci", "ci says none", {"ci": "none"}, {}, "not ready"),
+        ("draft", "a draft", {"draft": True}, {}, "not ready"),
+        ("body", "the body is empty", {"body": ""}, {}, "not ready"),
+        ("body", "the body is None", {"body": None}, {}, "not ready"),
+        ("body_unreadable", "the body is not text", {"body_unreadable": True}, {}, "not checked"),
+        ("captain", "captain None and no floor: G6 is not open", {"captain": None}, {}, "not ready"),
+        ("holds", "holds None (only the label of a hold)", {"holds": None}, {}, "ready"),
+        ("holds", "holds absent", {"holds": KeyError}, {}, "ready"),
+        ("author", "author None: the proof writers still exclude", {"author": None}, {}, "ready"),
+        ("notice_senders", "notice_senders absent: the proof writers still exclude", {"notice_senders": KeyError}, {}, "ready"),
+        ("held_check", "no held_check on a held PR", {"held_check": KeyError}, {}, "not ready"),
+        ("held_check", "a raising held_check", {"held_check": lambda: 1 / 0}, {}, "not checked"),
+        ("held_check", "a held_check that finds a defect", {"held_check": lambda: ["no table"]}, {}, "not ready"),
+        ("floor", "floor without a decision", {"floor": {"decision": None, "unreadable": None, "rehold": None}}, {}, "not checked"),
+        ("floor", "floor of the wrong type", {"floor": "hold"}, {}, "not checked"),
+        ("floor", "re-hold unreadable", {"floor": {"decision": "hold", "unreadable": "bad json", "rehold": None}}, {}, "not checked"),
+        ("floor", "floor absent, the label alone holds", {"floor": KeyError}, {}, "ready"),
+        ("floor", "floor absent and no label", {"floor": KeyError, "captain": None}, {}, "not ready"),
+        ("carries", "the dependency is unreadable", {"carries": {"pr": "acme/api#5", "refusal": "x", "unreadable": True}}, {}, "not checked"),
+        ("carries", "the dependency is refused", {"carries": {"pr": "acme/api#5", "refusal": "closed unmerged"}}, {}, "not ready"),
+    )
+    BOARD_MUTANTS = (   # (rows of the class it must break, where (None: the reading, "board": evaluate_gates), old, new)
+        ("flip", None, 'if opened == ["G6"]:', 'if opened == []:'),
+        ("unreadable", None, "if ctx.unreadable or not", "if not"),
+        ("plan_problem", None, "if ctx.plan_problem:", "if False:"),
+        ("ledger_problem", None, "if ctx.problem:", "if False:"),
+        ("body_unreadable", None, 'if (ctx.facts or {}).get("body_unreadable"):', "if False:"),
+        ("draft", None, 'if (ctx.facts or {}).get("draft") is True:', "if False:"),
+        ("floor", None, "if floor is not None and not isinstance(floor, dict):", "if False:"),
+        ("carries", None, 'if ((ctx.facts or {}).get("carries") or {}).get("unreadable"):', "if False:"),
+        ("held_check", None, "except Exception as err:", "except KeyError as err:"),
+        ("ci", "board", 'if ci in ("green", "passing"):', "if True:"),
+        ("body", "board", 'ok, detail = canon_status((facts or {}).get("body"))', "ok, detail = True, ''"),
+        ("held_check", "board", "elif not callable(check):", "elif False:"),
+        ("captain", "board", 'if (facts or {}).get("captain"):', "if True:"),
+        ("plan", "board", 'if plan is None:\n                row.update(status="missing"', 'if False:\n                row.update(status="missing"'),
+    )
+
+    def board_outcome(self, got):
+        return "not checked" if got[0] is None else ("ready" if got[0] == ["G6"] and got[1] == self.HEAD_A and "Who can clear" in (got[2] or "") else "not ready")
+
+    def board_run(self, case, mutant=None, board=None):
+        row, label, change, kw, expected = case
+        return self.board_outcome(self.board_reading(change, mutant=mutant, mutant_board=board, **kw))
+
+    def test_986_every_row_of_the_table_is_probed_through_the_real_board(self):
+        for case in self.BOARD_ROWS:
+            self.assertEqual(self.board_run(case), case[4], case[:2])
+        self.assertEqual({c[0] for c in self.BOARD_ROWS} - {"baseline"}, self.docs_fact_rows() & {c[0] for c in self.BOARD_ROWS})
+        # every row of the docs table is tested here, or says in its own words that it is not a gate input
+        untested = self.docs_fact_rows() - {c[0] for c in self.BOARD_ROWS}
+        self.assertEqual(sorted(untested), sorted(self.NOT_PROBED))
+
+    NOT_PROBED = ["facts", "now", "pr"]   # always set, or the whole view (the `unreadable` row is probed)
+
+    def test_986_a_mutant_per_row_class_fails_the_real_board_probe(self):
+        for rows, where, old, new in self.BOARD_MUTANTS:
+            cases = [c for c in self.BOARD_ROWS if rows == "flip" or c[0] == rows]
+            self.assertTrue(cases, rows)
+            failed = []
+            for case in cases:
+                try:
+                    got = self.board_run(case, mutant=(old, new) if where is None else None, board=(old, new) if where == "board" else None)
+                except Exception as err:
+                    got = "raised %s" % type(err).__name__
+                failed.append(got != case[4])
+            self.assertTrue(any(failed), (rows, old))
+
+    def counted_calls(self):
+        """(calls the REAL reading makes, calls the REAL clear_who makes), each counted by a fake gh that serves a pull request (with a plan), its plan issue
+        and no comments: the real PR view, plan fetch, floor view (_ledger_context, gate_floor_fact) and clear_who run over it."""
+        log = []
+        pr = {"title": "t", "state": "OPEN", "headRefOid": "a" * 40, "isDraft": False, "labels": [{"name": "merge-captain"}], "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}], "reviews": [], "comments": [], "author": {"login": "bob"},
+              "body": "PLAN: acme/api#10\ncanon: n/a nothing to update here\n"}
+
+        def run(argv, *a, **k):
+            argv = list(argv)
+            log.append(" ".join(argv[1:6]))
+            out = json.dumps(pr) if argv[1:3] == ["pr", "view"] else ("[]" if "comments" in " ".join(argv) else json.dumps({"body": GOOD_PLAN, "number": 10, "state": "open"}))
+            return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+        self.engine.gh_runner = run
+        sb.sweep_gate_reading(self.engine, "acme/api", 600, self.world.clock.now())
+        reading = len(log)
+        self.assertEqual(self.engine.reading_calls, reading)   # the reading's own counter agrees with the runner
+        log.clear()
+        sb.clear_who(self.engine, run, "acme/api", 600)
+        return reading, len(log)
 
     def call_counter_case(self, cost):
-        ready, other = self.counted_reading(True), self.counted_reading(False)
-        self.assertEqual((ready, other), (7, 4))
-        self.assertLessEqual(ready, cost)   # the least charge covers a ready reading; one that makes more is charged its real calls
-        self.assertLessEqual(other, cost)
+        reading, who = self.counted_calls()
+        self.assertGreaterEqual(reading, 4)   # PR view, floor view (a second PR view), plan issue, one comments page: the real functions made them
+        self.assertGreaterEqual(who, 1)
+        # the worst case this fake can show: a reading that goes on to clear_who; a hold with more reads is charged by its REAL count (edge_real_calls)
+        self.assertLessEqual(reading + who, cost)
+        self.assertLessEqual(reading, cost)
 
     def test_986_a_reading_makes_no_more_calls_than_it_is_charged(self):
         self.call_counter_case(sb.SWEEP_READY_READ_COST)
 
     def test_986_a_lowered_call_cost_fails_the_call_counter(self):
         with self.assertRaises(AssertionError):
-            self.call_counter_case(4)   # the old constant
-        with mock.patch.object(sb, "SWEEP_READY_READ_COST", 4), self.assertRaises(AssertionError):
+            self.call_counter_case(5)   # a constant below the counted worst case
+        with mock.patch.object(sb, "SWEEP_READY_READ_COST", 5), self.assertRaises(AssertionError):
             self.call_counter_case(sb.SWEEP_READY_READ_COST)
 
     def edge_unreadable(self, mutant):
