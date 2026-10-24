@@ -4294,6 +4294,37 @@ them) and to the PR's **head** (a push voids them; the view shows them as void, 
 | `fleet-switchboard verdict <scenario> --pr <repo#N> --as ci\|tester\|reviewer\|owner --result pass\|fail` | a VERDICT, only as the evaluator the scenario names, only by an agent listed for it in the config key `plan_evaluators`, and never by a writer of the PR |
 | `fleet-switchboard gates <repo#N> [--json]` | nothing: it reads |
 
+#### What a recording command ends with (#1049)
+
+`prove`, `verdict` and `review record` write the ledger, and each ends with ONE final line, so a call that timed out is never mistaken for one that recorded:
+
+| Last line | Meaning | Exit |
+|---|---|---|
+| `recorded #<id> (...)` | the record was written; `<id>` is its row in the ledger (several rows: `recorded #3, #4`) | 0 |
+| `already recorded #<id> (...)` | the same record was already the newest of its kind: nothing was written. The same record is the same pull request, head, scenario, kind, evaluator or reviewer, recording agent and judgement (result and plan hash; for a review, the verdict and the rating). The recording agent is part of the key for a verdict and a review (two testers' identical verdicts are two facts) but NOT for a `prove`: a prove is the author's step, so the same prove by another agent at the same head is `already recorded #<first id>`. A pass after a fail at one head is a new record, unless that key already holds a pass (see below). | 0 |
+| `not recorded: <reason>` | a refusal (a head that is not the pull request's, a scenario that does not exist, an evaluator that may not record) or the bound below; nothing was written, the status is not 0 (2 for a refusal, 1 for a timeout) | not 0 |
+
+**The bound.** Every wait of these commands (the ledger lock, each GitHub read, the agent registry that says who is calling) is bounded by ONE constant, `RECORD_WAIT_SECONDS` in `bin/plan_ledger.py` (30 seconds). After `RECORD_PROGRESS_SECONDS` (3) a wait says what it waits for (`waiting for the ledger lock`, `waiting for a GitHub read of ...`). At the bound the command ends:
+
+```text
+not recorded: timed out after 30s, check the ledger before retrying (it was waiting for the ledger lock): run `fleet-switchboard gates acme/app#9`
+```
+
+**Before a retry after a timeout, run that read-only command** (`fleet-switchboard gates <repo#N>`, which lists the proofs, verdicts and reviews held for the pull request at its head): if the record is there, it landed. A retry of a record that did land prints `already recorded #<id>` and writes nothing, so retrying is safe either way. The alarm is held back while an entry is written, so a command is never cut after its record landed. Before this change the ledger lock was the one wait with no bound (a held lock made a call wait until the caller killed it, which printed nothing), while the GitHub reads (8 seconds each) and the daemon start (2 seconds) already ended on their own.
+
+**A stale pass is refused.** Only the newest row of a key counts. Pass, fail, then pass again at one key would flip the verdict back to pass, so that third write is refused: nothing is written, the status is not 0, and the last line is:
+
+```text
+not recorded: a newer fail is recorded at this head: re-test at a new head or waive
+```
+
+The verdict stays fail. A fail after a pass still records (the more severe one wins).
+
+**Limits of the final line.**
+- The audit append and the review's read of the ledger run after the record is written. If the command is cut there, `not recorded` can be printed for a row that landed. This is narrow. A retry is safe: it prints `already recorded`.
+- Other ledger-writing commands are exempt: `waive`, `ci-record`, `item prove`, `item verdict`, `item tester`, `consensus` and `carry_proofs` (the automatic writer, called by nothing yet). They get the bounded lock but no final line.
+- A partial `prove` prints `recorded #..` on standard output and `not recorded: N of M scenarios refused` on standard error. The two lines are on different streams and are not unified; the exit status is 4.
+
 **The plan is the PR's, not the writer's:** the `PLAN: <link>` line of the PR body, else the plan of the PR's first ledger entry. `--plan` may only repeat it (or name the first plan when there is none yet); a different one is refused. Change the plan by changing the PR body's `PLAN:` line, which voids the earlier entries (the view says `PLAN CHANGED`). The plan's hash is computed from the GitHub text at that link.
 
 **Who may be an evaluator is configuration, and the default is nobody.** `plan_evaluators` maps an evaluator to fleet agent
@@ -4344,6 +4375,16 @@ audit line. It is bound to **the head it was recorded at** (a push needs a new o
 retroactive plan; a waiver for another head, another PR or after its expiry does nothing. `gates` and `gates-check` honour a valid waiver:
 the gate reads `waived (by <who>, <reason>, due <time>)`, never `ok`, and the report lists `WAIVED (not passed)`. The cos permission corpus
 and allowed commands still have to be extended with `waive` (a permission change, held for the owner).
+
+## A proof carries to a new head (#1129)
+
+A proof is bound to the head it was recorded at. A tester's, live check's or reviewer's proof (or verdict) that names its files (`prove --file PATH`, `verdict --file PATH`, repeatable) CARRIES to a new head when ALL THREE hold:
+
+1. the difference between the old and the new head touches none of the files the proof names;
+2. the new head is a merge of the default branch, or a difference of tests and documentation only;
+3. CI is green at the new head.
+
+A carry is ONE ledger line of its own, kind `carried`, with the fields `proof` (the sequence number of the row), `scenario`, `old_head`, `new_head` and `facts` (`named_files_untouched`, `difference`, `ci`). The original proof row is never changed. `gates` shows the proof as carried, with the head it was recorded at. A proof that names no file is never carried; a proof whose named file is touched is void as before; proofs proven by CI are re-recorded by the daemon at each green head and are never carried. A carry never turns a proof into one for a head that fails any condition. The decision is `plan_ledger.carry_decision`; `fleet-switchboard`'s `carry_proofs` writes the lines from `carry_head_facts`. Reverting leaves the lines readable and ignored.
 
 ## The merge gate and the merge lock: the fleet's own merge queue (#962)
 
@@ -5486,6 +5527,7 @@ Each decision was walked against the matrix (its owner-hold meaning and its rati
 - Today the manifest names the entry and the policy judge's two parts (slice S2): `switchboard/judge_request.py` (the request, the routine pre-filter, standing authority, the caches and the reply) and `switchboard/judge.py` (the judge, the judge socket and the plugin push). They are the text of the old region of the entry, unchanged, and run after the entry. The statements of that region that the clear's closure reads stay in the entry, in place (`POLICY_DEFAULTS`, `POLICY_CACHE_BYTES`, `POLICY_CONTEXT_FILE`, `validate_policy_config`, `_checked_policy_thresholds`, `_SECRET_PATTERNS`, `redact_command_text`, `_STANDING_AUTHORITY`, `_ORDERS_HEADING`, `_ANY_HEADING`, `_ORDER_BULLET`, `_legacy_authority`, `_orders_section`, `section_orders`, `parse_orders`, `fetch_charter_body`, `fetch_orders`, `BoundedFileCache`, `_valid_context`, `POLICY_AUDIT_TAIL`, `_audit_tail`): they move with the clear batch (S13), which makes the closure derivation read every file of the manifest. No part is listed before the entry: no statement outside the region uses a moved name at import time (an ast check), and the parts run before `derive_action_groups()` reads the commands' marks. `DEFAULTS["policy"] = None` stays in the entry at the region's old place, so the key order of `DEFAULTS` is as it was. Tests that scan the daemon's source read every file of the manifest.
 - Slice S3 moved the v1 import converter (the `import-v1` section: the converter, the v2 shape checker and the command) to `switchboard/import_v1.py`, text unchanged, listed after the entry. Statements of that section stay in the entry, in place: `V1_MOVE_DEFAULTS` with the `DEFAULTS.update(V1_MOVE_DEFAULTS)` line (import time reads it, and the key order of `DEFAULTS` is as it was), `V1_LIST_PAGE`, `validate_v1_move_config`, `_v2_session_import` and `_v2_session_list_page` (the clear's closure reads them; they move with the clear batch, S13). No statement outside the section reads a moved name at import time (an ast check, run when the part was cut).
 - Slice S4 moved the decisions code (the escalated-request, PR-notice, order-notice and external-decision sections) to `switchboard/decisions_a.py` and `switchboard/decisions_b.py`, text unchanged, listed after the entry. 44 statements of those sections stay in the entry, in place, because the clear's closure reads them (`resolve_boss`, `boss_name`, `parse_pr_ref`, `read_pr_notices`, `read_pr_facts`, `read_pr_json`, `pr_marker`, `pr_hold_reasons`, `read_decisions_file`, `validate_order_burst` and what they read); they move with the clear batch (S13). The registry inventory (`docs/agent-registry.md`) names the part files for the readers that moved.
+- Slice S5 moved three whole sections no open pull request touched, each one job, to `switchboard/reminders.py` (the reminders file, `remind`, checkpoint reminders), `switchboard/plan_review.py` (`plan review`, slice R2) and `switchboard/pr_explain.py` (`pr-explain` and the held-body checks), text unchanged, listed after the entry. The waiting-on-the-person sweep and the triage code stay in the entry until the pull requests that edit them have merged. `tools/arch-part-cut` makes the cut and `tools/arch-split-check` proves it.
 
 ## Running with no terminal multiplexer (#1072)
 

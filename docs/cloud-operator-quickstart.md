@@ -233,8 +233,50 @@ Turn it off: `fleet-switchboard install --uninstall` unloads and removes it (wit
 Its log: `cloud-reaper-stderr.log` in the switchboard state directory (journalctl on Linux). Each time it ends it writes one line
 `<UTC time> reaper exiting: WHY`, and the service then restarts it.
 
+### The reaper is unattended: it keeps its own cluster login fresh
+
+The reaper needs a cluster login. In the token-file login (the one the service file names: `CW_CLOUD_TOKEN_FILE`
+for the token file, `CW_CLOUD_SERVER` for the cluster and `CW_CLOUD_NAMESPACE` for the namespace), the token in
+that file lives at most sixty minutes. The reaper therefore refreshes it itself, at the start of every pass: it
+reads the cluster administrator kubeconfig from the vault (`CW_VAULT_SUBSCRIPTION` and `CW_VAULT_NAME` for the
+vault, `CW_CLUSTER_ADMIN_SECRET` for the name of the secret inside it), hands that value to one
+`kubectl create token cw-operator` command over a pipe, and writes the token it gets back to the token file with
+mode `0600`, by an atomic replace. The old file stays whole if anything fails.
+
+The unattended reaper uses a fixed route: it ignores `CW_KUBECTL`, `CW_CLUSTER_ADMIN_CMD` and `CW_CLUSTER_TOKEN_CMD`, and runs `az` and
+`kubectl` only from fixed absolute paths (a custom command belongs to the launch path). When the vault holds the minter kubeconfig, that
+token is long-lived (not cluster admin, but whoever reads it can mint `cw-operator` tokens until its Secret is deleted): see the launcher
+README for who holds it and how to rotate it.
+
+What this means for you: **the reaper runs unattended** for days, and no one has to refresh the token file. The
+administrator value is never in a file, never in an argument and never in the service file (the service file
+holds names and paths only, as before). The token that lands in the file holds the operator account's own rights
+in the workers namespace and nothing more; the administrator login is used for that one command and dropped.
+
+**The manual install comment on the installer ask is superseded**: it recorded that a person had to refresh the
+token file by hand. The reaper does that now, by itself.
+
+If a refresh fails (the vault, the login or the token request), the old file stays as it is, one audit line
+names the reason (`refresh-cluster-token`), the pass report names the failure, and the reaper tries again five
+minutes later. A vault that refuses this machine is named as such; the reaper never runs the vault access check
+(that check belongs to the launch path alone).
+
 When the Mac sleeps, the reaper pauses. Workers keep their pod-side floor (the pod's own limit, the cap plus 300 s, PR #880 once it
 merges), so a sleeping Mac delays a stop but cannot leave a worker running past that floor.
+
+### The reaper alone (nothing else on the machine)
+
+`fleet-switchboard install --cloud-reaper-only` installs and loads the reaper's own service and nothing else. It writes the reaper's service file (mode `0600`) and the state directory (the reaper's log), and loads the service; it leaves alone the config, the profile pieces, the command link, the plugin link, the switchboard's own service and the daemon. Use it on a machine that runs the reaper and not the switchboard: a dry run (`--dry-run`) prints what it would do and writes nothing.
+
+Before it writes anything the reaper-only install reads your settings file, `~/.config/fleet-switchboard/cloud.env`, with the launcher's own reader: it is the same settings file a launch needs, and the installer refuses what a launch would refuse. So the file must exist, be a regular file of your own with one hard link (no symlink, no directory), mode `0600`, in a directory that only you can write; hold `CW_ALLOWED_REPOS`, `CW_CLOUD_IMAGE` (an image by digest), `CW_CLOUD_SERVER` (an https URL with a DNS host), `CW_CLOUD_NAMESPACE`, `CW_VAULT_NAME` and `CW_VAULT_SUBSCRIPTION` (a GUID) with valid values (`CW_CLUSTER_ADMIN_SECRET` has a default and is optional); and be plain `KEY=VALUE` lines. A quoted value, an unknown line (an `export ` line, for example) or a repeated key is refused. The token file name `CW_CLOUD_TOKEN_FILE` is not a key that file can hold. The install is ONE command: when `CW_CLOUD_TOKEN_FILE` is not set in the shell that runs it, the install uses a default login file, `~/.local/state/fleet-switchboard/cloud-reaper-token` (under your real home; it does not follow `XDG_STATE_HOME`: set `CW_CLOUD_TOKEN_FILE` to put the file elsewhere), and prints `cloud reaper: login file <path> (default; set CW_CLOUD_TOKEN_FILE to change it)`. It makes that directory with mode `0700` when it is missing (an existing directory that group or others can reach is refused with a named line, never changed), the reaper itself makes the file `0600` when it first writes it, and the path goes into the service's environment only: the install never edits `cloud.env`. A `CW_CLOUD_TOKEN_FILE` you set must be an absolute path (a relative one is refused) and is carried into the service instead. When anything is wrong it refuses with ONE line that carries the launcher's own wording, for example `cloud reaper not installed: the settings file ~/.config/fleet-switchboard/cloud.env has mode 0644: it must be 0600 (nobody else may read or write it): fix it as a launch needs, then run again`, exits non-zero and writes nothing; it never prints a value. The vault names are not carried into the service: the file is their only source and the reaper reads it at every start. The full install with `--with-cloud-reaper` does not make this check.
+
+Prerequisites: the Mac must be awake (the reaper pauses when it sleeps), and the vault must be reachable from this machine (it is behind a source-address allowlist: from another network the refresh is refused and the reaper keeps its old token until it ends).
+
+The way back is as small as the way in: `fleet-switchboard install --uninstall --cloud-reaper-only` unloads the reaper's job and removes ONLY the reaper's service file (the plist or the unit). It leaves the login file and its directory in place (a leftover token file once the reaper has run): the uninstall prints the `rm` and `rmdir` lines that remove them, and a login file you set with `CW_CLOUD_TOKEN_FILE` is yours to remove. It touches nothing else (no plugin, agent or skill piece, no wrapper, no link, no switchboard service, no config, no profile). Run again with nothing installed it prints `cloud reaper: not installed` and succeeds; with `--dry-run` it prints what it would do and does nothing.
+
+Do not use plain `--uninstall` (or `--uninstall --no-service`) for that: on a full install it removes much more than the reaper. It also unlinks the herdr plugin (unless `--no-herdr-link`), and removes the plugin, agent and skill pieces, the wrapper and the command link; only the switchboard's own service is skipped by `--no-service`.
+
+The settings of the service: when your own settings file (`~/.config/fleet-switchboard/cloud.env`) exists, the service carries none of the keys that file holds — the file is then the only source of them, and a key set differently in the file and in the service makes every start of the reaper refuse. Without that file the service copies the non-secret `CW_*` settings of the shell that runs the install, as `--with-cloud-reaper` always did.
 
 ## 4c. The cloud hub (cloud/k8s/cloud-hub.yaml)
 
