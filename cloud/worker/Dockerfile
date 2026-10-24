@@ -2,6 +2,8 @@
 # Nested Docker needs the Sysbox runtime. Runs as a non-root user. No secret is
 # built in: the launcher supplies every credential at start (see cloud/README.md).
 # Base pinned by the index digest of ubuntu:24.04 (read from the registry); bump both together.
+# The real `gh` is NOT installed: the worker's GitHub verbs come from cw-gh, a small client of our own (cloud/README.md,
+# "What the token allows"). That narrows accidents only; the token's scope and the repository's rules are the boundary.
 # apt packages below are deliberately unversioned: they follow the base's security updates.
 FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 AS worker
 ARG OPENCODE_VERSION=2.0.28
@@ -15,11 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
  && echo "deb [signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable" \
       > /etc/apt/sources.list.d/docker.list \
- && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli.gpg \
- && echo "deb [signed-by=/etc/apt/keyrings/githubcli.gpg] https://cli.github.com/packages stable main" \
-      > /etc/apt/sources.list.d/github-cli.list \
  && apt-get update && apt-get install -y --no-install-recommends \
-      docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin gh \
+      docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin \
  && rm -rf /var/lib/apt/lists/*
 
 # OpenCode v2: a pinned standalone binary (no node or npm), checked against its sha256 before it is unpacked.
@@ -37,13 +36,21 @@ RUN userdel -r ubuntu 2>/dev/null || true \
 
 COPY worker/start-dockerd.sh /usr/local/bin/start-dockerd
 COPY worker/entrypoint.sh /usr/local/bin/worker-entrypoint
-COPY worker/guard.sh worker/opencode-worker.json worker/agents/worker.md /usr/local/share/cw/
+COPY worker/guard.sh worker/opencode-worker.json worker/agents/worker.md worker/agents/orchestrator.md /usr/local/share/cw/
 COPY launcher/end_hook.py /usr/local/bin/cw-end-hook
 COPY launcher/token_mint.py /usr/local/bin/cw-token-mint
 COPY worker/activity.py /usr/local/bin/cw-worker-activity
+COPY worker/cw-gh /usr/local/bin/cw-gh
+COPY worker/probe-reach.sh /usr/local/bin/cw-probe-reach
+COPY worker/bin/cloud_cli.py /usr/local/bin/cw-cloud
+COPY worker/bin/cloud_client.py worker/bin/cloud_hub.py worker/bin/cloud_channel.py worker/bin/cloud_channel_server.py /usr/local/bin/
+COPY worker/cw-plan-check worker/plan_check.py /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/start-dockerd /usr/local/bin/worker-entrypoint \
       /usr/local/bin/cw-end-hook /usr/local/bin/cw-token-mint /usr/local/bin/cw-worker-activity \
- && chmod 0755 /usr/local/share/cw/guard.sh && chmod 0644 /usr/local/share/cw/opencode-worker.json /usr/local/share/cw/worker.md
+      /usr/local/bin/cw-gh /usr/local/bin/cw-probe-reach /usr/local/bin/cw-plan-check /usr/local/bin/cw-cloud \
+      /usr/local/bin/cloud_client.py /usr/local/bin/cloud_hub.py /usr/local/bin/cloud_channel.py /usr/local/bin/cloud_channel_server.py \
+ && chmod 0644 /usr/local/bin/plan_check.py \
+ && chmod 0755 /usr/local/share/cw/guard.sh && chmod 0644 /usr/local/share/cw/opencode-worker.json /usr/local/share/cw/worker.md /usr/local/share/cw/orchestrator.md
 
 USER worker
 WORKDIR /home/worker

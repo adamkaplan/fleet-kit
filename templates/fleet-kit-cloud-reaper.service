@@ -13,8 +13,13 @@
 # passes, never slower than the reaper's own floor of once a minute) and REAPER_ENV (the reaper's
 # NON-SECRET settings read from the installer's environment).
 #
-# There is nothing private in this file: the reaper reads the operator's token FILE by path. When the
+# There is nothing private in this file: the reaper reads the operator's token FILE by path. To renew workers' git tokens it runs the
+# launcher's mint, which reads the vault settings from the settings file. When the
 # cloud launcher's settings file lands, the reaper reads it as the launcher does.
+#
+# Plainly: the reaper can now REACH THE VAULT. It holds no key itself, but through the mint it can obtain a git token for any pod, worker
+# record and allow-list entry that match, bounded only by the three checks (the pod's repository equals the worker record's, the repository
+# is on the allow-list, the Secret is this run's).
 #
 # Read the log with: journalctl --user -u fleet-kit-cloud-reaper.service
 

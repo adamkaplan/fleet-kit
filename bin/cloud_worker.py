@@ -44,8 +44,9 @@ DEFAULT_DIRECTORY = "/work"   # the session's directory in the pod: the scratch 
 CLOUD_WORKER_AGENT = "worker"   # the agent the image defines (cloud/worker/agents/worker.md): a cloud session always runs it; the local --agent name is only recorded
 # The options of the launcher's `create` that `launch --cloud` hands over: ONE table. Taken from the launcher on main (commit fb4b9f2,
 # cloud/launcher/cloud_worker.py `create`: --shape S|M, --stack); a name here that the launcher does not know makes its create fail (exit 2).
-CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack"}
-LAUNCHER_SHAPES = ("S", "M")   # the launcher's SHAPES keys; the launcher's own default (S) applies when --shape is not given
+CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack", "agent": "--agent", "boss": "--boss"}
+LAUNCHER_SHAPES = ("XS", "S", "M")   # the launcher's SHAPES keys; the launcher's own default (XS, or S with --stack) applies when --shape is not given
+LAUNCHER_STACK_SHAPES = ("S", "M")   # the rows with stack: true; --stack with another shape is refused here, before any call
 POD_DIR_ROOTS = ("/work", "/home/worker")   # the only roots a cloud session directory may be under (a local path does not exist in the pod)
 WORK_REPO = "/work/repo"      # where the worker clones the repository: the launcher's end hook (CW_WORKDIR default) pushes from here
 SETUP_PREAMBLE = """Setup (do this first, before the task below):
@@ -1066,16 +1067,18 @@ def refusals(function):
 
 
 def model_entry():
-    """The github-copilot entry of the OpenCode auth file (the driver's rule), as one JSON text; nothing else of the file."""
-    path = os.environ.get("CW_MODEL_AUTH_FILE") or os.path.expanduser("~/.local/share/opencode/auth.json")
+    """The live model credential: the ONE provider entry of OpenCode's own store (`opencode auth export`, in memory), as a one-element JSON array."""
+    path = Path(__file__).resolve().parent.parent / "cloud" / "launcher" / "model_credential.py"
+    spec = importlib.util.spec_from_file_location("cw_model_credential", str(path))
+    module = importlib.util.module_from_spec(spec)
     try:
-        with open(path) as handle:
-            entry = json.loads(handle.read(1000001)[:1000000]).get(MODEL_PROVIDER)
-    except (OSError, ValueError, AttributeError):
-        entry = None
-    if not entry or not isinstance(entry, dict):
-        raise Refusal("the model auth file is missing, unreadable or has no %s entry; nothing was created" % MODEL_PROVIDER)
-    return json.dumps({MODEL_PROVIDER: entry})
+        spec.loader.exec_module(module)
+    except Exception as err:
+        raise CloudError("the model credential reader is not found beside this program (%s)" % _one(str(err), 80)) from None
+    try:
+        return module.read_provider_entry(MODEL_PROVIDER)
+    except module.ModelCredentialError as err:
+        raise Refusal(str(err)) from None
 
 
 def git_token(repo, cluster):
@@ -1119,6 +1122,8 @@ def _launch(args, runner, now, reserve):
         raise LaunchError("--cloud and --headless do not combine: a cloud worker has its own endpoint, a headless one runs in the local service")
     if not args.agent:
         raise LaunchError("--agent is required")
+    if args.agent == "orchestrator" and not args.reports_to:
+        raise Refusal("--agent orchestrator needs --reports-to BOSS (the pod's FLEET_BOSS); nothing was created")
     if args.dir:
         given = str(args.dir)   # a normal absolute path (no `..`, no doubled or trailing slash) under a pod root
         if given != os.path.normpath(given) or not any(given == root or given.startswith(root + "/") for root in POD_DIR_ROOTS):
@@ -1133,8 +1138,8 @@ def _launch(args, runner, now, reserve):
     source = use_settings()   # before any setting is read: the allow-list, the preflight and the launcher all read this one source
     print("%s: cloud settings from %s" % (H["PROG"], source), file=sys.stderr)
     check_allowed(repo)   # before anything is read, minted or created
-    if getattr(args, "stack", False) and args.shape and args.shape not in LAUNCHER_SHAPES:   # exact membership in a tuple; after the allow-list, before the preflight, any token or call
-        raise Refusal("--shape %r is not a pod shape (%s); nothing was created" % (str(args.shape)[:40], " or ".join(LAUNCHER_SHAPES)))
+    if getattr(args, "stack", False) and args.shape and args.shape not in LAUNCHER_STACK_SHAPES:   # exact membership in a tuple; after the allow-list, before the preflight, any token or call
+        raise Refusal("--shape %r is not a pod shape (%s); nothing was created" % (str(args.shape)[:40], " or ".join(LAUNCHER_STACK_SHAPES)))
     try:   # the repository preflight, before any token is minted; FAIL CLOSED: a missing, killed or silent program refuses (stdout stays the one JSON line)
         print(_lib().check_repo_preflight(repo, {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}), file=sys.stderr)
     except _lib().CloudError as err:
@@ -1153,6 +1158,11 @@ def _launch(args, runner, now, reserve):
     for key, value in (("idle", args.idle), ("hard", args.hard), ("shape", args.shape)):
         if value:
             options += [CREATE_OPTION[key], str(value)]
+    if args.agent == "orchestrator":   # only on request: a worker launch hands the launcher exactly what it always did
+        options += [CREATE_OPTION["agent"], args.agent, CREATE_OPTION["boss"], args.reports_to]
+    hub = bool((os.environ.get("CW_HUB_CHANNEL_URL") or "").strip() or (os.environ.get("CW_HUB_REGISTRY_SECRET") or "").strip())   # the hub setting
+    if hub and args.agent != "orchestrator":   # a worker joins the hub too: the launcher reads the setting itself, it only needs the boss
+        options += [CREATE_OPTION["boss"], args.reports_to] if args.reports_to else []
     if getattr(args, "stack", False):   # only on request: a launch without --stack hands the launcher exactly what it always did
         options.append(CREATE_OPTION["stack"])
     if os.environ.get("CW_PULL_SECRET"):
@@ -1222,10 +1232,14 @@ def _launch(args, runner, now, reserve):
         try:
             with tunnel(cluster, record) as live:
                 v2 = remote_v2(state, live, engine.config["call_timeout_seconds"])
-                session = v2.session_create(CLOUD_WORKER_AGENT, name, args.dir or DEFAULT_DIRECTORY,
+                session = v2.session_create(args.agent if args.agent == "orchestrator" else CLOUD_WORKER_AGENT, name, args.dir or DEFAULT_DIRECTORY,
                                             {"fleet": fleet, "cloud": {"runtime_id": record["runtime_id"], "agent": CLOUD_WORKER_AGENT}})["id"]
                 record["session"] = session
                 save_record(state, record)
+                if hub:   # the hub entry gets the session id (the launcher's one verb for it; the cluster login is the launcher's own)
+                    hcode, _, hnote = run_launcher(runner, "hub-session", name, ["--session", session], 120, cluster=cluster)
+                    if hcode != 0:
+                        raise CloudError("the hub entry could not be given the session: %s" % _reason(hcode, hnote))
                 if brief:
                     v2.prompt(session, SETUP_PREAMBLE % {"repo": repo, "branch": branch} + brief, {"fleet": {"from": "switchboard", "brief": True}})
         except (H["V2Error"], H["V2Unreachable"], CloudError, OSError, KeyError, TypeError) as err:
@@ -1346,6 +1360,8 @@ def cmd_read(args, runner, now):
         raise LaunchError("name the agent: `%s read <name>`" % H["PROG"])
     limit = max(1, min(int(args.limit), 200))
     record = route(args.name)
+    if record is None and getattr(args, "cloud_only", False):
+        raise LaunchError("%s has no cloud record" % args.name)
     engine, state, config = H["build_engine"](runner, now, "cli", writable=False)
     if record is not None:
         session = _session_of(record)
