@@ -3,6 +3,7 @@ request, and the guard's record check. Offline; synthetic names; files only unde
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -72,7 +73,11 @@ class T(base.T):
         m = os.path.join(self.tmp.name, "mut-noresolve")
         open(m, "w").write(src.replace(old, "    real = os.path.abspath(path)\n", 1))
         link = os.path.join(self.tmp.name, "link2")
-        os.symlink("/etc/hostname", link)
+        fd, outside = tempfile.mkstemp(dir="/var/tmp")   # owned by this user, outside /tmp and the worktree
+        self.addCleanup(os.unlink, outside)
+        os.write(fd, b"plain text\n")
+        os.close(fd)
+        os.symlink(outside, link)
         PRS[7] = pr(body="plain")
         self.assertEqual(self.edit(7, link, script=m).returncode, 0)
         self.assertEqual(self.edit(7, link).returncode, 3)
@@ -133,9 +138,78 @@ class T(base.T):
         self.assertEqual(r.returncode, 0)
 
 
+    # ---- ask 1200, review round: body-file roots, owner, NUL, exact hold lines ----
+    def mut(self, name, old, new):
+        src = open(CW_GH).read()
+        self.assertIn(old, src)   # the mutation applies
+        m = os.path.join(self.tmp.name, name)
+        open(m, "w").write(src.replace(old, new, 1))
+        return m
+
+    def foreign_owner(self, target=CW_GH):
+        """A script that runs the client with os.stat answering a different owner for every file."""
+        p = os.path.join(self.tmp.name, "other-uid.py")
+        open(p, "w").write("import os, runpy, sys\nreal = os.stat\n"
+                           "class S:\n    def __init__(s, st): s.st = st\n"
+                           "    def __getattr__(s, n): return os.getuid() + 1 if n == 'st_uid' else getattr(s.st, n)\n"
+                           "os.stat = lambda *a, **k: S(real(*a, **k))\n"
+                           "sys.argv = [%r] + sys.argv[1:]\nrunpy.run_path(%r, run_name='__main__')\n" % (target, target))
+        return p
+
+    def wfile(self, name, text="A\nMERGE: captain\n"):
+        p = os.path.join(self.work, name)
+        open(p, "w").write(text)
+        return p
+
+    def test_r1_the_git_config_is_refused(self):
+        cfg = os.path.join(self.work, ".git", "config")
+        self.assertTrue(os.path.isfile(cfg))
+        self.refused(self.edit(7, cfg), "pr-edit-body-file-git")
+
+    def test_r1_a_symlink_into_a_git_directory_is_refused(self):
+        link = os.path.join(self.tmp.name, "gitlink")
+        os.symlink(os.path.join(self.work, ".git", "config"), link)
+        self.refused(self.edit(7, link), "pr-edit-body-file-git")
+
+    def test_r1_sensitive_names_are_refused(self):
+        for name in (".netrc", "my-credentials.txt", "x.pem", ".env", "id_rsa"):
+            with self.subTest(name=name):
+                self.refused(self.edit(7, self.file(name, "A\nMERGE: captain\n")), "pr-edit-body-file-sensitive")
+        d = os.path.join(self.tmp.name, ".ssh")
+        os.mkdir(d)
+        open(os.path.join(d, "note"), "w").write("A\nMERGE: captain\n")
+        self.refused(self.edit(7, os.path.join(d, "note")), "pr-edit-body-file-sensitive")
+
+    def test_r1_a_file_of_another_owner_or_a_writable_file_is_refused(self):
+        f = self.file("theirs", "A\nMERGE: captain\n")
+        self.refused(self.edit(7, f, script=self.foreign_owner()), "pr-edit-body-file-not-owned")
+        os.chmod(f, 0o666)
+        self.refused(self.edit(7, f), "pr-edit-body-file-not-owned")
+
+    def test_r1_a_normal_file_in_the_worktree_and_in_tmp_is_accepted(self):
+        self.assertEqual(self.edit(7, self.wfile("body-a")).returncode, 0)
+        self.assertEqual(self.edit(7, self.file("body-b", "A\nMERGE: captain\n")).returncode, 0)
+        self.assertEqual(len(patches()), 1)
+
+    def test_r1_mutant_without_the_git_check_publishes_the_git_config(self):
+        m = self.mut("mut-nogit", "    check_body_path(path, real)\n", "    pass\n")
+        cfg = os.path.join(self.work, ".git", "config")
+        PRS[7] = pr(body="plain")
+        self.assertEqual(self.edit(7, cfg, script=m).returncode, 0)   # the mutant publishes it
+        self.assertEqual(self.edit(7, cfg).returncode, 3)
+
+    def test_r1_mutant_without_the_owner_check_publishes_a_foreign_file(self):
+        m = self.mut("mut-noowner", "    if st.st_uid != os.getuid() or st.st_mode & 0o022:", "    if False:")
+        f = self.file("theirs2", "A\nMERGE: captain\n")
+        self.assertEqual(self.edit(7, f, script=self.foreign_owner()).returncode, 3)
+        # the foreign-owner wrapper around the mutant: accepted
+        self.assertEqual(self.edit(7, f, script=self.foreign_owner(m)).returncode, 0)
+
+
 # only this file's own tests run: drop every inherited one
 for _n in [n for n in dir(base.T) if n.startswith("test_")]:
     setattr(T, _n, None)
+
 
 if __name__ == "__main__":
     unittest.main()
