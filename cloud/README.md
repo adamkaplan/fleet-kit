@@ -153,6 +153,24 @@ A task that needs one of these is a task for a person or for the repository's ow
 
 Through them, the actions of the table marked allowed remain possible: bounded by the repository's rules, not by the pod.
 
+## The orchestrator agent (#1157)
+
+**Cause.** Before this change the pod's agent was fixed: `entrypoint.sh` wrote only `worker.md`, and `cmd_launch` only recorded `--agent`, so no pod could run an orchestrator.
+
+The entrypoint now picks the agent from ONE value, `CW_AGENT`: `worker` (also when unset) or `orchestrator`; any other value exits 1 with a message naming `CW_AGENT` before the server starts. `launch --cloud --agent orchestrator --reports-to BOSS` sets it (a worker launch sets nothing new and renders the same pod as before; any other `--agent` on `launch --cloud` stays the local role name, only recorded; the launcher's own `create --agent` refuses any value but `worker` or `orchestrator` with exit 2 before any cluster call).
+
+An orchestrator pod gets exactly five more environment names, all non-secret: `CW_AGENT`, `FLEET_AGENT_NAME` (the launch's name), `FLEET_BOSS` (`--reports-to`), `FLEET_CLOUD_CHANNEL_URL` (settings row `CW_HUB_CHANNEL_URL`, default `http://cloud-hub.cw.svc:8443/message`) and `FLEET_CLOUD_TOKEN_FILE` (`/run/cw-tmp/channel-token`, the path of the channel secret). The volume list and the token set are the worker's; there is no new token role.
+
+**The hub's address for a pod.** A hub pod (an orchestrator, or any launch while the hub setting is on) gets exactly two more spec keys, `spec.hostname` (the pod's name) and `spec.subdomain` (`cw-agents`); the stack-pod allow-list admits exactly these two, together, with that subdomain. The launcher registers `http://<pod name>.cw-agents.<namespace>.svc.cluster.local:4096` (the cluster domain is the constant `CLUSTER_DOMAIN`) (namespace from `CW_CLOUD_NAMESPACE`, default `cw`), a name the hub accepts over http; no pod address is read. A launch with the hub setting needs the headless Service `cw-agents` (clusterIP None, selector `app=cw-worker`, port 4096) in that namespace; the hub manifests create it, the launcher does not.
+
+**The hub settings (launcher side).** `CW_HUB_CHANNEL_URL`: the channel address a hub pod is told, not a secret, default `http://cloud-hub.cw.svc:8443/message`. `CW_HUB_REGISTRY_SECRET`: the name of the hub's registry Secret in the cloud namespace, default `cloud-hub-registry`. Either one set means the hub setting is on: every launch registers, and each launch needs the headless Service `cw-agents`; both unset, a worker launch is exactly what it was. `CW_AGENT` is not a setting: the launch's `--agent` (`worker` default, or `orchestrator` with `--boss`) chooses it. Both rows are in the launcher's settings table (`cloud/launcher/README.md`) and in the code's one table, which `test_cloud_settings.py` checks.
+
+**Channel credential (tightening-only).** The launcher draws a random 32-byte secret per pod and adds it to the pod's per-run Secret as ONE new key, `channel-secret`; the entrypoint copies it (mode 0400) into the memory-backed directory `/run/cw-tmp`. It expires with the pod and is never printed. The launcher registers the pod in the hub's registry Secret (`CW_HUB_REGISTRY_SECRET`, default `cloud-hub-registry`; keys `secrets.json` and `agents.json`): only the sha256 of the secret is stored; the pod's server password goes to a key named for the agent in the Secret `cloud-hub-pw` (mounted by the hub at `/etc/hub/pw`); `stop` removes all three entries. A failed registration refuses the launch and removes what it made. The registry is the launcher's only new cluster write.
+
+**The image changes: an operator rebuild after merge.** The image now carries `orchestrator.md` beside `worker.md` and the cloud command and hub files (`cloud/worker/bin/`, byte-identical copies of `bin/` files, checked by `cloud/launcher/tests/test_orchestrator_agent.py`). Rebuild and publish it once after merge (see "Build and scan the image").
+
+**Branch names.** The pod's shell guard refuses a push (or any git command line) that contains the words `main` or `master` anywhere in it, so a branch name that contains them (for example `impact/sync-main`) is refused: name branches without those words.
+
 ## The operator driver
 
 ```sh
