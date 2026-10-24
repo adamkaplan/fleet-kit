@@ -28871,8 +28871,8 @@ class TestSweep(Base):
     @staticmethod
     def fact_scan(sources):
         """(keys, unrecognised): every key the functions read, set or pass on `facts` (or `ctx.facts`), found with the ast module. Recognised: a subscript or
-        .get with a literal key, dict(facts, k=...) keywords, a truth test, a pass to a scanned helper, the context carrier and the return of the picture.
-        Anything else (a bare pass to another function, an iteration, a computed key) is unrecognised."""
+        .get with a literal key, a truth test, `facts = dict(facts or {}, k=...)` onto the same name, a pass to a scanned helper, the context carrier and the return of the picture.
+        Anything else is unrecognised and FAILS: a copy (dict(facts), {**facts}, copy.copy, an alias), .items/.keys/.values/.copy, getattr, an iteration, a computed key, a bare pass."""
         keys, bad = set(), []
         helpers = ("carried_rows", "carries_context", "evaluate_gates")
         for fname, source in sources.items():
@@ -28893,11 +28893,11 @@ class TestSweep(Base):
                     keys.add(up.slice.value)
                 elif isinstance(up, ast.Attribute) and up.attr == "get" and isinstance(parent.get(up), ast.Call) and parent[up].args and isinstance(parent[up].args[0], ast.Constant) and isinstance(parent[up].args[0].value, str):
                     keys.add(parent[up].args[0].value)
-                elif call is not None and isinstance(up, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "dict":
-                    keys |= {k.arg for k in call.keywords if k.arg}
+                elif isinstance(up, ast.Call) and up.args and up.args[0] is at and isinstance(up.func, ast.Name) and up.func.id == "dict" and isinstance(parent.get(up), ast.Assign) and [getattr(t, "id", None) for t in parent[up].targets] == ["facts"] and not any(k.arg is None for k in up.keywords):
+                    keys |= {k.arg for k in up.keywords}   # `facts = dict(facts or {}, k=...)`: the same name extended in place (a copy to ANOTHER name is unrecognised)
                 elif call is not None and isinstance(up, ast.Call) and at in call.args and (getattr(call.func, "id", None) in helpers or getattr(call.func, "attr", None) in helpers):
                     pass   # passed to a helper whose source is scanned too
-                elif isinstance(up, ast.keyword) and isinstance(call.func, ast.Attribute) and call.func.attr == "SimpleNamespace":
+                elif isinstance(up, ast.keyword) and up.arg and isinstance(call.func, ast.Attribute) and call.func.attr == "SimpleNamespace":
                     pass   # the context carrier
                 elif isinstance(up, ast.BoolOp) and isinstance(up.op, ast.And) and at is not up.values[-1] or isinstance(up, (ast.If, ast.UnaryOp)) or isinstance(up, ast.IfExp):
                     pass   # a truth test
@@ -28944,6 +28944,34 @@ class TestSweep(Base):
         yield "helper", {"carried_rows": first[0] + '\n    _zz = (facts or {}).get("zz_new")\n' + first[1]}
         yield "unknown_pass", {"evaluate_gates": ev.replace(head, head + '\n    _zz = mystery(facts)', 1)}
         yield "iteration", {"evaluate_gates": ev.replace(head, head + '\n    _zz = [k for k in facts]', 1)}
+
+    # every spelling of a read or copy of facts the scan must not let through, applied to each scanned function
+    FACT_SPELLINGS = (
+        "_z = dict(facts)", "_z = dict(facts or {})", "_z = dict(facts, zz_new=1)", "_z = {**facts}", "_z = f(**facts)", "_z = facts.items()",
+        "_z = facts.keys()", "_z = facts.values()", "_z = facts.copy()", "_z = copy.copy(facts)", "_z = getattr(facts, 'get')('zz_new')",
+        "_z = facts.get(_k)", "_z = facts[_k]", "_z = facts", "_z = facts or {}", "_z = [k for k in facts]", "_z = 'zz_new' in facts",
+        "_z = list(facts)", "_z = (_w := facts)", "_z = lambda: facts", "_z = facts.setdefault('zz_new', 1)", "_z = facts | {}",
+        "_z = copy.deepcopy(facts)", "_z = vars(facts)", "_z = {**(facts or {})}", "_z = SimpleNamespace(**facts)", "_z = other(facts=facts)",
+    )
+
+    @staticmethod
+    def with_line(source, line):
+        """`source` with `line` inserted as the first statement of the function body (after a docstring)."""
+        func = ast.parse(source).body[0]
+        first = func.body[0]
+        at = func.body[1] if len(func.body) > 1 and isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) else first
+        lines = source.split("\n")
+        lines.insert(at.lineno - 1, " " * at.col_offset + line)
+        return "\n".join(lines)
+
+    def test_986_every_spelling_of_a_facts_read_fails_the_scan_in_every_function(self):
+        sources = self.fact_sources()
+        self.assertEqual(self.fact_problems(), [])
+        for fname in ("evaluate_gates", "carried_rows", "_ledger_context"):
+            for line in self.FACT_SPELLINGS:
+                problems = self.fact_problems({fname: self.with_line(sources[fname], line)})
+                self.assertTrue(problems, (fname, line))
+                self.assertTrue(any(fname in p and "line" in p for p in problems), (fname, line, problems))
 
     def test_986_every_fact_the_gates_read_has_a_row_in_the_table(self):
         names = self.gate_fact_names()
