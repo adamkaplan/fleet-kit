@@ -221,6 +221,14 @@ def made_up_pid():
     raise AssertionError("a test asked for more made-up process numbers than fit above %d: a wrap inside one test would make their order depend on the machine" % start)
 
 
+def s5_issue(number, body="", labels=(), pr=False, draft=None, **kw):
+    """The shared sweep_issue plus a draft flag, kept out of the shared fake (#1044)."""
+    record = sweep_issue(number, body, labels, pr=pr, **kw)
+    if draft is not None:
+        record["draft"] = draft
+    return record
+
+
 class PidTable(dict):
     """`self.px[4242]`: the made-up number a test uses where it once wrote the literal 4242. The same key is the same number inside one test, and
     each test gets numbers of its own."""
@@ -10055,7 +10063,7 @@ class TestReminders(PR4Base):
         self.assertEqual(self.world.engine.run_pass()["sent"], [])
         self.assertEqual(len(self.world.admissions("platform")), 1)
         self.assertEqual(sb.read_reminders(self.world.state), [], "the reminder is the loss")
-        self.world.tick(3600)
+        self.world.tick(86400)
         self.assertEqual(self.world.engine.run_pass()["sent"], [])
 
 
@@ -25976,7 +25984,7 @@ class TestLegitimateWaiting(WaitingInputs, ReportBase):
             "ci queued": (lambda: self.set_lists(checks=["queued"]), lambda: self.set_lists(checks=["success"])),
             "review requested": (lambda: self.set_lists(pr_extra={"requested_reviewers": [{"login": "reviewer-one"}]}), lambda: self.set_lists(pr_extra={})),
             "review requested of a team": (lambda: self.set_lists(pr_extra={"requested_teams": [{"slug": "maintainers"}]}), lambda: self.set_lists(pr_extra={})),
-            "younger than the review window": (lambda: self.set_lists(pr_extra={"created_at": sb.iso(now() - 600)}), lambda: self.world.tick(3600)),
+            "younger than the review window": (lambda: self.set_lists(pr_extra={"created_at": sb.iso(now() - 600)}), lambda: self.world.tick(86400)),
             "reminder due later": (reminder, drop_reminders),
             "issue awaiting label": (lambda: self.set_lists(issue_labels=[sb.awaiting_cos_label(cfg)]), lambda: self.set_lists(issue_labels=[])),
             "pull request awaiting label": (lambda: self.set_lists(pr_labels=[sb.awaiting_label(cfg)]), lambda: self.set_lists(pr_labels=[])),
@@ -27175,7 +27183,7 @@ class TestSweep(Base):
         self.sweep_real([])
         self.assertEqual(len(pending()), 1)                                          # raised once
         self.engine.sweep = None                                                     # the daemon restarts: memory only is gone
-        self.world.tick(3600)
+        self.world.tick(86400)
         self.sweep_real([])
         self.assertEqual(pending(), [])                                              # inside the window: not raised again
         self.engine.sweep = None
@@ -27219,7 +27227,7 @@ class TestSweep(Base):
                     self.sweep_real([])
                     self.assertEqual(len(self.lines(ref)), 1)
                     self.engine.sweep, self.engine._last = None, {}                   # the daemon restarts: memory only is gone, the audit's repeat filter too
-                    self.world.tick(3600)
+                    self.world.tick(86400)
                     self.sweep_real([])
                     self.assertEqual(len(self.lines(ref)), 1)                         # not logged again
                     self.assertEqual(self.engine.sweep.facts, {})                     # not woken
@@ -27557,31 +27565,31 @@ class TestSweep(Base):
         return time.strftime("%Y-%m-%d", time.gmtime(self.world.clock.now() + days * 86400))
 
     def test_s5_skips_a_draft_pull_request_and_counts_it(self):
-        found, skipped = self.s5_case({5: sweep_issue(5, "x", pr=True, draft=True)}, aged=(5,))
+        found, skipped = self.s5_case({5: s5_issue(5, "x", pr=True, draft=True)}, aged=(5,))
         self.assertEqual(found, [])
         self.assertEqual(skipped, {"draft": 1, "parked": 0})
         self.assertIn("1 draft", "\n".join(sb.sweep_status_lines(sb.sweep_state(self.engine).current)))
 
     def test_s5_skips_a_ready_pull_request_of_a_parked_ask_and_counts_it(self):
         issues = {7: sweep_issue(7, "Parked until: %s\n" % self.future(), [self.PARKED]),
-                  8: sweep_issue(8, "Closes #7\n", pr=True, draft=False)}
+                  8: s5_issue(8, "Closes #7\n", pr=True, draft=False)}
         found, skipped = self.s5_case(issues, aged=(8,))
         self.assertEqual(found, [])
         self.assertEqual(skipped, {"draft": 0, "parked": 1})
 
     def test_s5_flags_as_before_an_expired_or_unreadable_date_a_missing_label_and_a_ready_pull_request(self):
         past = time.strftime("%Y-%m-%d", time.gmtime(self.world.clock.now() - 3 * 86400))
-        issues = {1: sweep_issue(1, "Parked until: %s\n" % past, [self.PARKED]), 2: sweep_issue(2, "Closes #1\n", pr=True, draft=False),
+        issues = {1: s5_issue(1, "Parked until: %s\n" % past, [self.PARKED]), 2: s5_issue(2, "Closes #1\n", pr=True, draft=False),
                   3: sweep_issue(3, "Parked until: soon\n", [self.PARKED]), 4: sweep_issue(4, "Closes #3\n", pr=True),
                   5: sweep_issue(5, "Parked until: %s\n" % self.future()), 6: sweep_issue(6, "Closes #5\n", pr=True),
-                  9: sweep_issue(9, "plain", pr=True, draft=False)}
+                  9: s5_issue(9, "plain", pr=True, draft=False)}
         found, skipped = self.s5_case(issues, aged=(2, 4, 6, 9))
         self.assertEqual(len(found), 4)
         self.assertEqual(skipped, {"draft": 0, "parked": 0})
 
     def test_s5_makes_no_read_beyond_the_baseline_for_draft_and_parked_cases(self):
         issues = {7: sweep_issue(7, "Parked until: %s\n" % self.future(), [self.PARKED]),
-                  8: sweep_issue(8, "Closes #7\n", pr=True), 9: sweep_issue(9, "x", pr=True, draft=True)}
+                  8: s5_issue(8, "Closes #7\n", pr=True), 9: s5_issue(9, "x", pr=True, draft=True)}
         self.s5_case(issues, aged=(8, 9))
         self.assertFalse([r for r in self.hub.reads if "issues/8" in str(r) or "issues/9" in str(r)], "no new read of the draft or parked PR")
         self.assertLessEqual(len(self.hub.single), 2, "at most the one withdrawal check per distinct decision; S5 adds none")
@@ -27662,7 +27670,7 @@ class TestSweep(Base):
             self.assertEqual(self.s5_run(reading, decisions, mutant), [])
         reading["value"] = self.ready()
         self.assertEqual(self.s5_run(reading, decisions, mutant), [])   # ready now, held for 10 hours: under the threshold counted from ready
-        self.world.tick(3600)
+        self.world.tick(86400)
         self.assertEqual(self.s5_run(reading, decisions, mutant), [])
         self.world.tick(3600 + 60)
         lines = self.s5_run(reading, decisions, mutant)
@@ -27673,7 +27681,7 @@ class TestSweep(Base):
         self.assertRegex(text, r"head [0-9a-f]{12}\b")
         self.assertIn("ready at", text)
         self.assertIn("Who can clear", text)
-        self.world.tick(3600)
+        self.world.tick(86400)
         reading["value"] = (["G0a", "G6"], self.HEAD_A, None, None)   # a gate opens again
         self.sweep_with(reading, decisions)
         self.assertEqual(sb.sweep_state(self.engine).s5, {})
@@ -27802,18 +27810,18 @@ class TestSweep(Base):
     def test_1044_held_draft_is_skipped_counted_and_not_read(self):
         for mutant in (None, self.S5_HELD_MUTANTS["ignore_draft"]):
             self.setUp()
-            state, reads = self.s5_held({600: sweep_issue(600, "x", pr=True, draft=True)}, mutant)
+            state, reads = self.s5_held({600: s5_issue(600, "x", pr=True, draft=True)}, mutant)
             self.assertEqual(reads == [] and state.s5_skipped["draft"] == 1 and state.s5_unchecked == 0 and not state.ready, mutant is None)
 
     def test_1044_held_ready_pr_of_a_parked_ask_is_skipped_counted_and_not_read(self):
-        issues = {7: sweep_issue(7, "Parked until: %s\n" % self.future(), [self.PARKED]), 600: sweep_issue(600, "Closes #7\n", pr=True, draft=False)}
+        issues = {7: s5_issue(7, "Parked until: %s\n" % self.future(), [self.PARKED]), 600: s5_issue(600, "Closes #7\n", pr=True, draft=False)}
         for mutant in (None, self.S5_HELD_MUTANTS["ignore_parked"]):
             self.setUp()
             state, reads = self.s5_held(issues, mutant)
             self.assertEqual(reads == [] and state.s5_skipped["parked"] == 1 and state.s5_unchecked == 0 and not state.s5, mutant is None)
 
     def test_1044_held_pr_clock_starts_only_after_the_park_ends(self):
-        issues = {7: sweep_issue(7, "Parked until: %s\n" % self.future(1), [self.PARKED]), 600: sweep_issue(600, "Closes #7\n", pr=True, draft=False)}
+        issues = {7: s5_issue(7, "Parked until: %s\n" % self.future(1), [self.PARKED]), 600: s5_issue(600, "Closes #7\n", pr=True, draft=False)}
         self.hub.open = dict(issues)
         held = self.held_pr(600)
         self.sweep([held])
@@ -27826,9 +27834,27 @@ class TestSweep(Base):
         self.assertEqual(state.ready["acme/api#600"]["at"], t0, "the clock starts now, not earlier")
         self.assertEqual(state.s5, {})
 
-    def test_1044_the_early_continue_in_findings_is_not_the_only_path(self):
-        src = inspect.getsource(sb.sweep_ready_pass)
-        self.assertLess(src.index("sweep_s5_skip"), src.index("SWEEP_READY_READS or"))
+    def test_1044_park_then_unpark_restarts_the_ready_clock(self):
+        pops = ("            state.ready.pop(key, None)\n            state.ready_read.pop(key, None)\n            state.not_checked_since.pop(key, None)\n            continue", "            continue")
+        key = "acme/api#600"
+        for mutant in (None, pops):
+            self.setUp()
+            self.hub.open = {7: sweep_issue(7, "Parked until: %s\n" % self.future(1), [self.PARKED]), 600: s5_issue(600, "Closes #7\n", pr=True, draft=False)}
+            held = self.held_pr(600)
+            self.sweep([held])
+            ctx = self.mutated("sweep_ready_pass", *mutant) if mutant else contextlib.nullcontext()
+            with ctx:
+                state = sb.sweep_state(self.engine)
+                state.ready[key] = {"head": self.HEAD_A, "at": self.world.clock.now() - 100}   # a ready row exists
+                state.ready_read[key], state.not_checked_since[key] = 1, 1
+                state = self.ready_pass([held], lambda r, n: self.ready())   # parked
+                gone = state.ready == {} and key not in state.ready_read and key not in state.not_checked_since
+                self.world.tick(2 * 86400)   # un-parked: the date has passed
+                self.sweep([held])
+                now = self.world.clock.now()
+                state = self.ready_pass([held], lambda r, n: self.ready())
+                restarted = state.ready.get(key, {}).get("at") == now
+            self.assertEqual(gone and restarted, mutant is None, mutant)
 
     def test_1044_every_s5_path_is_in_the_docs_table(self):
         doc = (Path(__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
@@ -29454,7 +29480,7 @@ class TestTriage(Base):
                     self.world.tick(120)
                     self.pass_now()
                     self.assertEqual([d["woken"] for d in self.tlines(ref)], [True, False])   # due and held: logged, not woken
-                    self.world.tick(3600)
+                    self.world.tick(86400)
                     self.pass_now()
                     self.assertEqual([d["woken"] for d in self.tlines(ref)], [True, False, True])   # the wake goes: logged once more
 
@@ -31657,7 +31683,7 @@ class TestTriageDigest(Base):
     def test_s3_a_changed_item_surfaces_at_once_and_its_backoff_restarts(self):
         self.add(140, created=3, updated=0.2, labels=["kind"])
         self.passes(1)                                             # shown on day 0 and day 1: next step is 3 days
-        self.world.tick(3600)
+        self.world.tick(86400)
         self.add(140, created=3, updated=0.01, labels=["kind"])     # a new comment: it was updated just now
         self.engine.triage.units.clear()
         self.assertEqual(len(self.passes(0)), 1)                   # surfaced at once
@@ -53875,7 +53901,7 @@ class TestRequestTiers(TierWorld):
     def test_an_agent_blocked_forever_is_never_hidden_from_you(self):
         self.block_(timed=True)
         for _ in range(3):
-            self.world.tick(3600)
+            self.world.tick(86400)
         self.assertEqual([d["tier"] for d in self.listed()], ["human"])
 
     def test_an_escalated_request_is_yours_at_once_and_the_marker_is_disposable(self):

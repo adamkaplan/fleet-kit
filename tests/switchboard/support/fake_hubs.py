@@ -125,10 +125,8 @@ class WaitingInputs:
         self.apply()
 
 
-def sweep_issue(number, body="", labels=(), pr=False, author=None, created=None, updated=None, draft=None):
+def sweep_issue(number, body="", labels=(), pr=False, author=None, created=None, updated=None):
     record = {"number": number, "body": body, "labels": [{"name": n} for n in labels]}
-    if draft is not None:
-        record["draft"] = draft
     if created:
         record["created_at"] = created
     if updated:
