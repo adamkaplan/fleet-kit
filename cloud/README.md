@@ -15,19 +15,36 @@ Cloud workers serve the organisation's repositories only; no task, test or demo 
 ## What is in the image
 
 Ubuntu 24.04, Python 3, git, `cw-gh` (our own small GitHub client; the real `gh` is not installed: see "The client that replaces the real `gh`"), Docker Engine with the compose plugin, and `opencode` v2 (pinned,
-`OPENCODE_VERSION=2.0.28`, a standalone binary checked against its sha256 before it is unpacked; no node or npm). The
+`OPENCODE_VERSION=2.1.4`, a standalone binary checked against its sha256 before it is unpacked; a standalone binary, not a Node package). The agent release is pinned by version and tarball sha256; the pin is a security floor: the agent release built on Bun 1.4.4 or later (the earlier runtime embeds trust roots that are being withdrawn); floor 2.1.3 (Bun 1.4.4). To bump: update `OPENCODE_VERSION` and `OPENCODE_SHA256` in `cloud/worker/Dockerfile`, run `python3 cloud/worker/tests/test_dockerfile_agent.py` (it refuses a version below the floor), then run `CW_ROOT_LIST=<file the person provides> python3 cloud/worker/scan-embedded-roots.py <unpacked binary>` (an operator tool, not in the image; the list is never kept in the repository) and put its output in the PR (it prints list indexes and 8-hex hash prefixes, never labels; exit 2 when nothing was examined). No match is not proof of absence outside the forms listed; not detected: DER with a length form other than 0x81, 0x82 or 0x83, a certificate shorter than 300 or longer than 2500 bytes (0x81 form: outside 128..258), indefinite length, PEM with a split or compressed body, a compressed section of the binary, a certificate split in pieces, UTF-16 strings, base64 outside PEM markers. The previous image digest stays the rollback. The
 launcher's end hook and token mint are copied in as `cw-end-hook` and `cw-token-mint`, and the activity reader as
-`cw-worker-activity` (it reads the v2 object shape of `GET /api/session/active`). It runs as user `worker` (uid 1000). `worker` may run one command as root (`start-dockerd`) through sudo;
+`cw-worker-activity` (it reads the v2 object shape of `GET /api/session/active`). `cw-plan-check` and `plan_check.py` (a byte-identical copy of `bin/plan_check.py`, pinned by a CI test) let a worker check its own plan with `cw-plan-check --file PLAN --done-when TEXT`: a pure local read, same output and exit codes (0 pass, 1 fail, 2 unreadable) as `plan check --file`; if the plan has an `## Intent` section with its own `Done when:` line, the pod compares it with `--done-when` exactly as the local check does. Slice B (a retire of a worker whose pod is already gone) is described in `docs/cloud-worker-interface.md`; the image must be rebuilt and published by an operator before pods have the command. It runs as user `worker` (uid 1000). `worker` may run one command as root (`start-dockerd`) through sudo;
 the entrypoint uses it to start the nested `dockerd` and then execs the command. Default command:
 `opencode serve --hostname 0.0.0.0 --port 4096`. Set `WORKER_DOCKER=0` to skip the Docker daemon. No credential is
 built in: `OPENCODE_SERVER_PASSWORD`, `GH_TOKEN` and any cloud identity are supplied by the launcher at run time.
+
+### The toolchain the image carries
+
+Ubuntu 24.04, Python 3 with pip and venv, git, Docker Engine with compose and buildx, `jq`, `opencode` v2, and Node 22 with npm and npx
+(`/opt/node`, root-owned, linked into `/usr/local/bin`). The recorded case: a lane's first database-lane test in a stack pod needed Node and
+npm, the image had neither, and the coder downloaded a Node tarball into its home directory at every launch. Node is now built in:
+the Dockerfile pins the sha256 of the release tarball (`.tar.xz`) per architecture (x64, arm64) as constants beside `NODE_VERSION`, downloads
+the release for the image's architecture and checks it with `sha256sum -c` against the pinned value BEFORE it unpacks; a mismatch fails the build.
+No checksum list is downloaded and no checksum address can be overridden. The added image size was not measured. A repository's own prettier and eslint are its dev dependencies and run through `npx`; the image
+does not install them.
+
+The pinned version is a security floor: Node >= 22.23.4 (the older 22.23.2 carries trust roots that are being withdrawn).
+
+To bump Node: update `NODE_VERSION` (a full 22.x.y release; the only place the version is written) AND both sha256 constants (`NODE_SHA256_X64`,
+`NODE_SHA256_ARM64`) at the top of the Node block in `cloud/worker/Dockerfile`, keep the version equal to the product repository's `.node-version`, then rebuild and publish the image
+(an operator step) and record the previous digest as the rollback.
 
 ## Per-run secrets in the image
 
 The launcher mounts per-run files read-only under `/run/cw` (`CW_RUN_DIR`). The entrypoint, which never prints a value:
 
 - `server-password`: read into `OPENCODE_SERVER_PASSWORD` for the server it starts (OpenCode reads the password only from its environment).
-- `model-auth`: the model provider's access entry (JSON), copied with mode 600 to `<tmpfs>/data/opencode/auth.json` (`XDG_DATA_HOME`), so the server refreshes its short-lived token in the copy and never in the Secret. A model config naming `CW_MODEL` (default `github-copilot/claude-sonnet-5.5`) is written beside it (`XDG_CONFIG_HOME`); it holds no secret.
+- `model-auth`: the model provider's access entry (JSON), the one-entry array `opencode auth export` prints, IMPORTED with `opencode auth import --standalone` (read from the mounted file on stdin) into OpenCode's own store under `<tmpfs>/data` (`XDG_DATA_HOME`) BEFORE the server starts, because the server reads only that store and ignores an `auth.json`. A failed import refuses the start with `worker: the model credential import failed; refusing to start`; the Secret file is never written. A model config naming `CW_MODEL` (default `github-copilot/claude-sonnet-5.5`) is written beside it (`XDG_CONFIG_HOME`); it holds no secret.
+  A worker can read this credential (the one-entry array, refresh token included, and the store under `XDG_DATA_HOME`) for the life of its pod; the shell deny rules do not guard it. The pod holds a launch-time snapshot: a revoked or rotated credential ends that pod's turns, and the operator's rotated token is not pushed to a running pod. A stale `CW_MODEL_AUTH_FILE` (retired) is refused as an unknown setting in a settings file and silently ignored in the process environment. An old image with the new launcher answers on the free model; the old launcher with the new image refuses at the import.
 - `git-token`: never copied. A git credential helper (`git config --global`, so every process of the worker user sees it, including a fresh-environment `kubectl exec` such as the end hook) and a `gh` wrapper read the file at call time. The helper answers only for `https://github.com`; the token is never in git config, argv or the environment. The directory is the path baked in when the files were generated (a caller's `CW_RUN_DIR` changes nothing), and at every call an unreadable or empty token file makes both fail with one line and a non-zero exit (never an empty password, never a `gh` with an empty token). The `gh` wrapper runs the guard and then `cw-gh`, which has only the verbs listed under "The client that replaces the real `gh`"; the boundary is the token's own permissions (a per-run, one-repository App token) and the repository's rules, not the wrapper or the client. The managed reaper replaces the Secret's token about every 30 minutes (see `launcher/README.md`, "The git token and its renewal"); the kubelet refreshes the whole-directory mount, so the next call reads the new token. The server password is in the server's environment, so every process the agent starts can read it; that is accepted by design.
 - The `git-token` also carries `issues: read` (one table in `cloud/launcher/app_token.py`), so the worker can read its repository's issues and their comments. The wrapper still refuses every write to an issue, a label or a merge.
 
@@ -152,6 +169,24 @@ A task that needs one of these is a task for a person or for the repository's ow
 
 Through them, the actions of the table marked allowed remain possible: bounded by the repository's rules, not by the pod.
 
+## The orchestrator agent (#1157)
+
+**Cause.** Before this change the pod's agent was fixed: `entrypoint.sh` wrote only `worker.md`, and `cmd_launch` only recorded `--agent`, so no pod could run an orchestrator.
+
+The entrypoint now picks the agent from ONE value, `CW_AGENT`: `worker` (also when unset) or `orchestrator`; any other value exits 1 with a message naming `CW_AGENT` before the server starts. `launch --cloud --agent orchestrator --reports-to BOSS` sets it (a worker launch sets nothing new and renders the same pod as before; any other `--agent` on `launch --cloud` stays the local role name, only recorded; the launcher's own `create --agent` refuses any value but `worker` or `orchestrator` with exit 2 before any cluster call).
+
+An orchestrator pod gets exactly five more environment names, all non-secret: `CW_AGENT`, `FLEET_AGENT_NAME` (the launch's name), `FLEET_BOSS` (`--reports-to`), `FLEET_CLOUD_CHANNEL_URL` (settings row `CW_HUB_CHANNEL_URL`, default `http://cloud-hub.cw.svc:8443/message`) and `FLEET_CLOUD_TOKEN_FILE` (`/run/cw-tmp/channel-token`, the path of the channel secret). The volume list and the token set are the worker's; there is no new token role.
+
+**The hub's address for a pod.** A hub pod (an orchestrator, or any launch while the hub setting is on) gets exactly two more spec keys, `spec.hostname` (the pod's name) and `spec.subdomain` (`cw-agents`); the stack-pod allow-list admits exactly these two, together, with that subdomain. The launcher registers `http://<pod name>.cw-agents.<namespace>.svc.cluster.local:4096` (the cluster domain is the constant `CLUSTER_DOMAIN`) (namespace from `CW_CLOUD_NAMESPACE`, default `cw`), a name the hub accepts over http; no pod address is read. A launch with the hub setting needs the headless Service `cw-agents` (clusterIP None, selector `app=cw-worker`, port 4096) in that namespace; the hub manifests create it, the launcher does not.
+
+**The hub settings (launcher side).** `CW_HUB_CHANNEL_URL`: the channel address a hub pod is told, not a secret, default `http://cloud-hub.cw.svc:8443/message`. `CW_HUB_REGISTRY_SECRET`: the name of the hub's registry Secret in the cloud namespace, default `cloud-hub-registry`. Either one set means the hub setting is on: every launch registers, and each launch needs the headless Service `cw-agents`; both unset, a worker launch is exactly what it was. `CW_AGENT` is not a setting: the launch's `--agent` (`worker` default, or `orchestrator` with `--boss`) chooses it. Both rows are in the launcher's settings table (`cloud/launcher/README.md`) and in the code's one table, which `test_cloud_settings.py` checks.
+
+**Channel credential (tightening-only).** The launcher draws a random 32-byte secret per pod and adds it to the pod's per-run Secret as ONE new key, `channel-secret`; the entrypoint copies it (mode 0400) into the memory-backed directory `/run/cw-tmp`. It expires with the pod and is never printed. The launcher registers the pod in the hub's registry Secret (`CW_HUB_REGISTRY_SECRET`, default `cloud-hub-registry`; keys `secrets.json` and `agents.json`): only the sha256 of the secret is stored; the pod's server password goes to a key named for the agent in the Secret `cloud-hub-pw` (mounted by the hub at `/etc/hub/pw`); `stop` removes all three entries. A failed registration refuses the launch and removes what it made. The registry is the launcher's only new cluster write.
+
+**The image changes: an operator rebuild after merge.** The image now carries `orchestrator.md` beside `worker.md` and the cloud command and hub files (`cloud/worker/bin/`, byte-identical copies of `bin/` files, checked by `cloud/launcher/tests/test_orchestrator_agent.py`). Rebuild and publish it once after merge (see "Build and scan the image").
+
+**Branch names.** The pod's shell guard refuses a push (or any git command line) that contains the words `main` or `master` anywhere in it, so a branch name that contains them (for example `impact/sync-main`) is refused: name branches without those words.
+
 ## The operator driver
 
 ```sh
@@ -159,8 +194,8 @@ export CW_KUBE_CONTEXT=<context>      # or CW_CLOUD_SERVER + CW_CLOUD_TOKEN_FILE
 cloud/launcher/run_task.py WORKER OWNER/NAME BRANCH BRIEF_FILE [--pull-secret NAME] [--image IMAGE]
 ```
 
-The target repository is an argument and has no default. The driver reads the model entry (the `github-copilot` entry of
-`CW_MODEL_AUTH_FILE`, default `~/.local/share/opencode/auth.json`) and a git token (the output of `CW_GIT_TOKEN_CMD`;
+The target repository is an argument and has no default. The driver reads the model entry (the one `github-copilot` entry of OpenCode's own
+credential store, read with `opencode auth export` in a scrubbed environment through a pipe, in memory; `CW_OPENCODE_BIN` names the program) and a git token (the output of `CW_GIT_TOKEN_CMD`;
 default `app_token.py OWNER/NAME` beside the driver, the one-hour GitHub App token) in memory, creates the pod through
 the launcher with both handed over inherited pipes (`--run-secret-fd`), port-forwards, opens a session, sends the brief,
 waits for idle, then stops the worker (the end hook pushes the work; the pod and its Secrets are deleted).
@@ -172,7 +207,7 @@ waits for idle, then stops the worker (the end hook pushes the work; the pod and
 - Every line it prints passes through the launcher's one `scrub()`. No secret is in an argument, an environment
   variable of a child, a log or a file; the only file is a private temporary directory (`CW_TMPDIR`) holding the
   port-forward's own log, removed at exit. The server password comes back on a pipe and stays in memory.
-- A missing or unreadable input (auth file, entry, token command, brief) refuses before anything is created. A second run
+- A missing or unreadable input (the export command, its entry, token command, brief) refuses before anything is created. A second run
   with a worker name that exists refuses and changes nothing. So does a run that LOSES a race for the name (another run made
   the worker while this one minted its token): the launcher exits with its own code (7, "already exists") and the driver
   returns without an end hook and without deleting anything. The driver acts on a worker only when it can prove it is
@@ -208,6 +243,8 @@ after install, so a worker pod selects the pool label `sysbox-install=yes` itsel
 ```sh
 cloud/tests/test-cloud          # prints RESULT: PASS
 ```
+
+**The rule for every test of the cloud tree (#956):** a test that starts a server or another long-lived child process starts it through `cloud/worker/tests/stub_support.py` (`start` registers the cleanup first; the cleanup kills the child's whole process group, waits, and asserts the port is free), or registers its own cleanup for that very process. The stub server also ends by itself (on SIGTERM, when its parent is gone, and after an idle cap), because a SIGKILLed runner runs no cleanup. `cloud/launcher/tests/test_stub_cleanup.py` scans the cloud tests by syntax tree and fails any start site that does neither, with a case and a mutant per site. The scan reads direct calls and the usual import aliases; it does not follow an alias of a callable (`P = subprocess.Popen`), `functools.partial`, or `__import__`/`importlib.import_module`, so review such a start by hand. The port check counts only a refused connect as free; the stub names its parent through `STUB_PARENT_PID` (set by `stub_support`), so a parent that dies during startup still ends it.
 
 It runs `kubectl apply --dry-run=client` on each manifest (an offline parse when no API server answers), runs the
 manifest's own `sed` on a legacy-keyed config twice (second pass changes nothing), and checks the scan: 0 hits on a clean
@@ -345,7 +382,8 @@ path, Docker socket or service-account token. Without `--stack` the pod is byte-
 pins it). The container's security context (`STACK_SECURITY_CONTEXT` in `cloud/launcher/cloud_worker.py`) was live-probed
 with the cluster default only: the smallest set that lets the daemon start is decided by the next live run, one variation
 at a time. A create that lands on a fresh node can hit the "handler sysbox-runc is not known" race; the launcher recreates the
-pod (not the Secrets) up to 3 times.
+pod (not the Secrets) after a pause of 15 seconds (`STACK_RACE_PAUSE_SECONDS`), for as long as one more pause fits in a
+window of 600 seconds (`STACK_RACE_WINDOW_SECONDS`); there is no attempt count.
 
 The stack pod is pinned whole, like the default pod: `cloud/launcher/tests/fixtures/stack_pod.json` is the pod the stack create
 builds, and `stack_create_objects.json` is every other object the create makes (the password Secret, the run Secret and its

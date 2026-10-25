@@ -21,6 +21,7 @@ permissions:
   - {action: external_directory, resource: "/Users/*/.local/state/fleet-switchboard*", effect: allow}
   - {action: external_directory, resource: "/Users/*/.config/opencode*", effect: allow}
   - {action: shell, resource: "fleet-switchboard send *", effect: allow}
+  - {action: shell, resource: "fleet-switchboard resume *", effect: allow}
   - {action: shell, resource: "fleet-switchboard report *", effect: allow}
   - {action: shell, resource: "fleet-switchboard remind *", effect: allow}
   - {action: shell, resource: "fleet-switchboard intent *", effect: allow}
@@ -38,6 +39,8 @@ permissions:
   - {action: shell, resource: "fleet-switchboard triage *", effect: allow}
   - {action: shell, resource: "fleet-switchboard move *", effect: allow}
   - {action: shell, resource: "fleet-switchboard reassign *", effect: allow}
+  # charter set records an orchestrator's own charter only (guarded and audited); nothing wider
+  - {action: shell, resource: "fleet-switchboard charter set *", effect: allow}
   - {action: shell, resource: "fleet-switchboard handoff *", effect: allow}
   - {action: shell, resource: "fleet-switchboard launch *", effect: allow}
   - {action: shell, resource: "fleet-switchboard reattach *", effect: allow}

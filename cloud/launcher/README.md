@@ -17,7 +17,55 @@ Launcher, reaper, end hook and token mint for cloud workers, built to `docs/clou
   token FILE by path. After the private settings file lands, the reaper reads it as the launcher does. Every ending writes one line
   `<UTC time> reaper exiting: WHY`: end of its pass, stopped by a signal, stopped by an interrupt, an error (a crash in a pass), or
   `cluster login failed: ...` (a login failure exits non-zero). A restarted reaper stops by name and finds no pod for one the last
-  pass already stopped, so nothing is stopped twice. Only one reaper runs at a time: it takes an exclusive lock (a 0600 file named for the user's namespace in `~/.local/state/cw-cloud/locks`, found through the password database, so a different audit file, state directory or login (a token file, a kube context, a kubeconfig) is still a rival; one user runs one reaper per namespace. The lock directory itself is checked for owner and mode, its parents are not walked, which is adequate for a lock) before its first pass and a second one exits at once with `not started: another reaper holds the lock` (the kernel drops the lock when a holder dies, however it dies). A stop uses the pod's own run id where the pod carries one. The installer writes the service file only when the target is a plain file of the user's own (never through a symlink), by temp file and rename, and its uninstall removes only a file the template makes (a regular file of the user's own with other content is overwritten by install, by rename, as the installer's own path; a symlink, a non-regular file, a foreign or group-writable file is refused). Path settings must be absolute paths of plain characters. A `path_walk` earlier on `sys.path` (the launcher directory or `PYTHONPATH`) would win over the kit's: that is the same user's own environment, not a boundary. While the Mac sleeps the reaper pauses.
+  pass already stopped, so nothing is stopped twice. Only one reaper runs at a time: it takes an exclusive lock (a 0600 file named for the user's namespace in `~/.local/state/cw-cloud/locks`, found through the password database, so a different audit file, state directory or login (a token file, a kube context, a kubeconfig) is still a rival; one user runs one reaper per namespace. The lock directory itself is checked for owner and mode, its parents are not walked, which is adequate for a lock) before its first pass and a second one exits at once with `not started: another reaper holds the lock` (the kernel drops the lock when a holder dies, however it dies). A stop uses the pod's own run id where the pod carries one. The installer writes the service file only when the target is a plain file of the user's own (never through a symlink), by temp file and rename, and its uninstall removes only a file the template makes (a regular file of the user's own with other content is overwritten by install, by rename, as the installer's own path; a symlink, a non-regular file, a foreign or group-writable file is refused). Path settings must be absolute paths of plain characters. A `path_walk` earlier on `sys.path` (the launcher directory or `PYTHONPATH`) would win over the kit's: that is the same user's own environment, not a boundary. While the Mac sleeps the reaper pauses. The installer's `--cloud-reaper-only` option installs and loads that service and nothing else: it writes the reaper's service file (mode 0600) and the state directory, and leaves the config, the profile pieces, the command link, the plugin link, the switchboard's own service and the daemon alone. It first checks the settings file (`cloud.env`: a regular file of the user's own, mode 0600, with the cluster login names `CW_CLOUD_SERVER`, `CW_CLOUD_NAMESPACE` and `CW_CLOUD_TOKEN_FILE` (the last from the install's environment) and the vault names `CW_VAULT_NAME`, `CW_VAULT_SUBSCRIPTION`) and refuses with one named line, writing nothing; the full `--with-cloud-reaper` install does not check. The way back is `install --uninstall --cloud-reaper-only`, which removes only the reaper's service file; plain `--uninstall` (and `--uninstall --no-service`) removes more than the reaper: the herdr plugin link (unless `--no-herdr-link`), the plugin, agent and skill pieces, the wrapper and the command link. Prerequisites: the Mac must be awake (the reaper pauses when it sleeps) and the vault must be reachable from this machine (a source-address allowlist: from another network the refresh is refused and the reaper keeps its old token until it ends).
+
+  **The reaper's own cluster login and the minter.** The reaper keeps its own login fresh (the token file, renewed when under 20 minutes
+  are left). The UNATTENDED reaper pins its mint command (`strict`, below); the interactive launch path keeps its previous behaviour, since it
+  runs in the person's own shell, which can read the vault with the person's own login anyway. The launch path keeps its previous behaviour: `CW_KUBECTL`, `CW_CLUSTER_ADMIN_CMD` and `CW_CLOUD_NAMESPACE` can still be set by whoever controls the launcher's environment (an interactive shell with the person's own login): unchanged. The new guards protect the UNATTENDED reaper service. With the minter credential (a ServiceAccount that can only create tokens for `cw-operator`) the administrator credential no longer travels this route: the residual risk is the minter's token for `cw-operator` only. This is a stated limit, not a fix. The unattended reaper uses a fixed route: it ignores `CW_KUBECTL`, `CW_CLUSTER_ADMIN_CMD` and `CW_CLUSTER_TOKEN_CMD` (neither
+  the environment nor `cloud.env` is read for them). It reads the vault through `az`, and runs `kubectl`, each resolved to an absolute path
+  from a FIXED list (`/opt/homebrew/bin/az`, `/usr/local/bin/az`, `/usr/bin/az`; `/opt/homebrew/bin/kubectl`, `/usr/local/bin/kubectl`,
+  `/usr/bin/kubectl`), never from `PATH`, and only an existing regular executable file that is not group- or world-writable and is owned by
+  root or the running user. The command is `create token cw-operator --duration=Nm` with `-n` the namespace (`CW_CLOUD_NAMESPACE`, a DNS-1123
+  label); the account, the subcommand and the duration are fixed in code. The vault names (`CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME`,
+  `CW_CLUSTER_ADMIN_SECRET`) stay settings. A person who needs a custom command uses the launch path. The children run with a minimal
+  environment (a fixed `PATH`, `HOME`, `LANG`, `AZURE_CONFIG_DIR` only when you set it, `KUBECONFIG=/dev/null`) and nothing else.
+  If one of those three names is set (in the process environment or in `cloud.env`), the refresh still uses the fixed route and the reaper
+  names the setting, never its value: on the first pass and then at most once an hour it prints `cluster login: CW_KUBECTL is ignored in the
+  unattended refresh (the reaper uses a fixed kubectl path); use the launch path for a custom command` on stderr and writes one audit line
+  (action `ignored-setting-notice`) per name. The settings the reaper's `cloud.env` needs are NAMES only: the cluster server
+  (`CW_CLOUD_SERVER`), the namespace (`CW_CLOUD_NAMESPACE`), the token file (`CW_CLOUD_TOKEN_FILE`), the vault names (`CW_VAULT_NAME`,
+  `CW_VAULT_SUBSCRIPTION`), `CW_CLUSTER_ADMIN_SECRET` (the NAME of the vault secret, not its content), and optionally
+  `CW_CLUSTER_TOKEN_DURATION`.
+  The fixed kubectl and az lists are /opt/homebrew/bin, /usr/local/bin and /usr/bin: the check requires a regular executable that is not group- or world-writable and owned by root or the reaper's own user, and it does not check the parent directories. Homebrew's directory is writable by the installing user, so a process running as the same user can plant a user-owned executable there: a residual of any same-user service, not a fix.
+  The reaper's az keeps HOME and AZURE_CONFIG_DIR from the reaper's environment: whoever sets that environment can change which login state az uses, but not which program runs.
+  **The minter credential is LONG-LIVED.** The vault holds a long-lived minter token for ONE account's tokens (`cw-operator` in the cloud
+  namespace): not cluster admin, but not short-lived. The Secret `cw-minter-token` is a `kubernetes.io/service-account-token` Secret, so the
+  control plane fills it with a NON-EXPIRING bearer token for `cw-minter`. Whoever reads that vault secret can mint `cw-operator` tokens (up to
+  the server's maximum lifetime) until the Secret is deleted. The Role bounds the ACCOUNT (only `create` on `serviceaccounts/token` for
+  `cw-operator`), not the LIFETIME: a holder using the API directly can ask for a token longer than 60 minutes; the 60-minute cap is in the
+  launcher code only, and this change does not enforce the server's maximum. Who holds the vault copy: the vault's readers, that is the operators
+  and the launcher's settings route. A short-lived alternative exists in principle (an Entra login through `CW_CLUSTER_TOKEN_CMD` on the launch
+  path); that is a later ask.
+  *Rotate the minter token:* delete the Secret `cw-minter-token` and re-apply the manifest (`kubectl apply -f cloud/k8s/cw-minter.yaml`) so the
+  control plane issues a new token; write the new kubeconfig into the vault under the same secret name by pipe (never printed); then check
+  (the `can-i` and `create token` checks below).
+  The credential behind the vault secret named by `CW_CLUSTER_ADMIN_SECRET` is a MINTER-ONLY kubeconfig: a ServiceAccount (`cw-minter`) whose
+  only right is `create` on `serviceaccounts/token` for `cw-operator`. It used to be a cluster administrator's kubeconfig, and the code is
+  safe under both. On this deployment the minter is live.
+  *The minter manifest* is `cloud/k8s/cw-minter.yaml` (four objects in namespace `cw`, label `app: cw-minter`, no secret in the file: the
+  ServiceAccount, a Role with the one rule, the RoleBinding and the token Secret that the cluster fills in). To apply it: run a server dry
+  run first (`kubectl apply --dry-run=server -f cloud/k8s/cw-minter.yaml`), get the Chief of Staff's word, then
+  `kubectl apply -f cloud/k8s/cw-minter.yaml`. Build the kubeconfig of `cw-minter` (the server, the cluster CA and the token of the Secret
+  `cw-minter-token`) and put it in the vault under the secret NAME that `CW_CLUSTER_ADMIN_SECRET` names, by pipe, never printed. Check it:
+  `kubectl auth can-i create serviceaccounts/token -n cw` with the minter's own kubeconfig answers yes (and `can-i` for pods answers no); a real `kubectl create token cw-operator` with the minter's kubeconfig works
+  and the same for `default` is refused. Rollback: revert `CW_CLUSTER_ADMIN_SECRET` in the settings FIRST (point it back at the earlier secret name), then delete the minter
+  objects (`kubectl -n cw delete -l app=cw-minter serviceaccount,role,rolebinding,secret`), then the vault secret.
+  *Token file limits.* The token file's expiry is read from the token's own `exp` claim, which is NOT verified (the file is the person's, mode
+  0600 and the user's own: a file that others can read, or that is not the user's, counts as expired and is replaced). A token with no
+  readable `exp` (not a JWT) is accepted at mint time with no lifetime check, and the file then counts as expired on every read, so it is
+  renewed at each retry gap (at most every 5 minutes). After a failed refresh the next try is no sooner than 300 s later; a clock that
+  jumps back counts as expired and retries. `main` calls the refresh once before the loop and the loop's first pass checks again: harmless
+  (the second is a no-op, the file is fresh).
 - `end_hook.py`, installed in the image as `cw-end-hook`: WIP commit, push to `<worker>/wip`, one JSON line.
 - `token_mint.py`, installed as `cw-token-mint`: mints a token at start and on demand, refuses more than 3600 s,
   writes it to a tmpfs file only.
@@ -79,13 +127,13 @@ say which pod or secret REMAINS, and the exit is non-zero (130 for a signal).
 
 ## The stack create and the fresh-node race
 
-`create --stack` watches a Pending pod for a bounded window (4 minutes, at most 3 attempts) and recreates it, with the same
+`create --stack` watches a Pending pod for a bounded window (`STACK_RACE_WINDOW_SECONDS`, 600 seconds, with a pause of `STACK_RACE_PAUSE_SECONDS`, 15 seconds, before each recreate; there is no attempt count) and recreates it, with the same
 run id and nonce and without touching the per-run secrets, in two cases. First, the node's runtime handler is not yet
 known (the exact `FailedCreatePodSandBox` message): the node's runtime is configured by the installer about 30 to 60
 seconds after scheduling. Second, the pending pod vanishes: a get that saw the pod then says not found, which live run B
-saw when that runtime restart took the Pending pod object with it. Each attempt writes one audit line (`attempt N of 3`,
-and `pod vanished` for the second case). Before a recreate the launcher checks that this call's own Secrets are still there: a missing one means an outside deletion (a stop, the reaper), which fails the create without recreating (the check also runs after a recreate and before ready; it narrows the race with a stop in flight and cannot close it, as the pod and Secret deletes are not one step: a stop deletes the pod first and the Secrets later, so the creator can recreate and the Secret deletes land after the last check; if that pod never starts, the create's own wait ends and its cleanup deletes it; if it started and was reported ready, the stop has finished and the only later catch is the reaper at `--hard` (or idle)). A pod that was never seen, and every other failure, is not retried. The window is checked after each attempt ends, so it bounds the count of attempts, not the wall time (worst case 3 times the `--wait` plus 150 s of delete wait). After the
-attempts or the window the create fails and the message names the race or the vanish. See `docs/cloud-worker-interface.md`.
+saw when that runtime restart took the Pending pod object with it. Each attempt writes one audit line (`attempt N`,
+and `pod vanished` for the second case). Before a recreate the launcher checks that this call's own Secrets are still there: a missing one means an outside deletion (a stop, the reaper), which fails the create without recreating (the check also runs after a recreate and before ready; it narrows the race with a stop in flight and cannot close it, as the pod and Secret deletes are not one step: a stop deletes the pod first and the Secrets later, so the creator can recreate and the Secret deletes land after the last check; if that pod never starts, the create's own wait ends and its cleanup deletes it; if it started and was reported ready, the stop has finished and the only later catch is the reaper at `--hard` (or idle)). A pod that was never seen, and every other failure, is not retried. A recreate starts only if one more pause plus one poll (2 seconds, `WAIT_POLL_SECONDS`) fits in what is left of the window, and a retry's wait is cut to the time left, so the window bounds the wall time (the delete wait of up to 150 s per recreate aside). After the
+window the create fails with one message that names the race or the vanish, the attempts made and the seconds spent. See `docs/cloud-worker-interface.md`.
 
 ## Driving a cloud worker from the switchboard (`launch --cloud`, `send`, `read`, `status`, `retire`)
 
@@ -99,8 +147,11 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
 | `CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME` | the vault that holds the cluster administrator credential (secret `CW_CLUSTER_ADMIN_SECRET`, default `cw-cluster-admin-kubeconfig`; or a command in `CW_CLUSTER_ADMIN_CMD`) |
 | `CW_CLUSTER_TOKEN_DURATION` | the token's requested life, default `20m`, at most `60m` (kubectl's own floor is 10 minutes) |
 | `CW_GIT_TOKEN_CMD` | prints the one-hour git token for the repository (default: `app_token.py OWNER/NAME`, same settings as `run_task.py`); the managed reaper runs the same command to renew the token every 30 minutes |
-| `CW_MODEL_AUTH_FILE` | the OpenCode auth file; only its `github-copilot` entry is used |
+| `CW_OPENCODE_BIN` | the `opencode` program (default `opencode` on `PATH`); the launcher runs `opencode auth export` (fixed arguments, scrubbed environment, output through a pipe, in memory) and keeps only the one `github-copilot` entry, as a one-entry array. Refused by name: command missing or failing, no entry, two entries, an inactive entry, an entry that is not `oauth`; nothing is created |
 | `CW_PULL_SECRET` | optional: the image pull secret name passed to `create` |
+| `CW_HUB_CHANNEL_URL` | the address of the hub's channel an orchestrator or hub pod is told (`FLEET_CLOUD_CHANNEL_URL`); an `http` or `https` URL with a host, an optional port and an optional one-segment path; not a secret; default `http://cloud-hub.cw.svc:8443/message`. **Set (this or `CW_HUB_REGISTRY_SECRET`) = the hub setting is on: every launch registers** with the hub (a worker launch included), and a launch needs the headless Service `cw-agents` |
+| `CW_HUB_REGISTRY_SECRET` | the NAME of the hub's registry Secret in the cloud namespace (never its content); a Kubernetes name; default `cloud-hub-registry`. **Set (this or `CW_HUB_CHANNEL_URL`) = the hub setting is on: every launch registers.** Unset, a worker launch is exactly what it was |
+| `--agent` (not a setting) | `worker` (default) or `orchestrator`: the agent the pod runs, passed to the pod as `CW_AGENT`; any other value is refused before anything is made; `--agent orchestrator` needs `--boss NAME` |
 
 - **A cluster token per use.** Every command that needs the cluster mints its own token at that moment: the administrator
   kubeconfig is read from the vault by command and given to `kubectl create token cw-operator` on a pipe (never a file or
@@ -144,7 +195,7 @@ The password reaches slice C once, on a file descriptor it passes with `--passwo
 
 **Other choices where the contract was silent.** Deadlines live on the pod as annotations (`cw/hard-deadline`,
 `cw/idle-seconds`); the reaper honours the record's `hard_deadline` read-only when `CW_CLOUD_RECORD_DIR` is set.
-**The cluster-side floor.** Every pod from `render_pod` (the one builder; shapes S and M, with or without a pull secret or run secrets) sets
+**The cluster-side floor.** Every pod from `render_pod` (the one builder; shapes XS, S and M, with or without a pull secret or run secrets) sets
 `spec.activeDeadlineSeconds` = the `--max-hard` cap + `POD_DEADLINE_GRACE_SECONDS` (300 s). The cap, not the initial hard limit, because
 Kubernetes cannot raise the field on a running pod, so `extend` within the cap must stay legal; the grace lets the reaper (record, end hook)
 act first. The cap's default is 8h, so the floor is always finite. A pod past it is `Failed` with reason `DeadlineExceeded`; `stop` and the
@@ -155,7 +206,7 @@ the create's own clock, so the floor can trail the stored cap by scheduling time
 exceeding the hard limit and alerting is not decided: it exits 1 from `reap` so a scheduler can alert). The spend cap
 is read from `CW_CLOUD_SPEND_CAP_USD`; unset or empty means the prototype's USD 25, and zero, negative, non-numeric,
 `nan`, `inf` or a cost that cannot be read refuses `create` (exit 5). The check adds this launch's estimate (hard limit times the shape's rate) to what the running pods already cost. A worker name with `_` maps to `-` plus a 4-hex
-hash for the pod name. Shape rates are placeholders (`S` 0.10, `M` 0.20 USD/hour); `create` refuses a spec with a stored credential.
+hash for the pod name. Shape rates are placeholders (`XS` 0.05, `S` 0.10, `M` 0.20 USD/hour; XS, 1 CPU and 2 GiB, is what a worker gets from a non-stack create; an orchestrator with no `--shape` gets `S`); `create` refuses a spec with a stored credential.
 
 **Not in this slice.** Automatic detection of a node drain notice: the end hook runs on `stop`, the idle stop and the hard limit; a drain is handled today by the operator running `stop --reason "node drain"`. The `cw-worker` service account's cloud identity and what it may do belong to the image/cluster setup (slice A and the platform), not here. `bin/test-cloud-launcher` is not yet wired into CI (the suite lists are CI's own).
 
@@ -198,6 +249,42 @@ the next run's names.
 | `stop`: `annotate kept` and `annotate hook-ran` | the pod (its `uid`) at the start | one merge patch by name after the hook | Yes: the patch body carries the `uid` (the API server refuses a mismatch). A changed pod is not marked, with one audit line: for `hook-ran` that leaves `delete` refusing (the safe side), for `kept` the failed hook's error is reported with it |
 | `delete` (no run id given) | the pod (its `uid`) | deletes the pod (bound to that `uid`) and both Secrets | The pod delete is bound; the two Secrets are deleted by name, by the operator's explicit command, with no run id to compare (`--force` is its own statement). Note: `delete` without `--force` trusts the `hook-ran` marker, which a stop now writes only onto the pod it read |
 | `extend` | the pod (its `uid`) | annotates the deadline, bound to that `uid` | Yes: a changed pod is not extended (run it again) |
+
+## The reaper's own cluster login (unattended)
+
+**The cause.** The reaper logs in to the cluster with the namespaced operator's token file (`CW_CLOUD_TOKEN_FILE`,
+with `CW_CLOUD_SERVER` and `CW_CLOUD_NAMESPACE`). A token of that account lives at most sixty minutes
+(`MAX_TOKEN_SECONDS`). Nothing in this repository used to create or refresh that file: the only minting,
+`cluster_token` in the launch wiring, runs in memory for a launch and never reached the reaper's driver. So an
+installed reaper stopped working within the hour: every pass failed the cluster call, the reaper exited with an
+`error:` line and the service restarted it every 30 seconds.
+
+**The fix.** The reaper keeps its own login fresh, without a person. At the start of every pass, when the token
+file is missing or has less than `CLUSTER_TOKEN_REFRESH_MARGIN_SECONDS` (1200, so 20 minutes) of life left, the
+reaper makes a fresh short-lived token for the namespaced operator account itself, by the same route the launch
+uses in memory: the cluster administrator kubeconfig is read from the vault (`CW_VAULT_SUBSCRIPTION` and
+`CW_VAULT_NAME` for the vault, `CW_CLUSTER_ADMIN_SECRET` for the name of the secret inside it) into memory and
+handed to the one `kubectl create token cw-operator` command over a pipe (`/dev/fd/N`: never a file, never an
+argument, never printed), and the administrator value is dropped when that command ends. The token is written to
+the token file with mode `0600`, by an atomic replace (a temp file in the same directory, then `os.replace`), so
+there is never a moment with another mode and the old file stays whole if anything fails. The token that lands in
+the file holds the operator account's own rights in the namespace and nothing more.
+
+**What it reads.** The token file (`CW_CLOUD_TOKEN_FILE`), the cluster (`CW_CLOUD_SERVER`), the namespace
+(`CW_CLOUD_NAMESPACE`), the vault (`CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME`) and the name of the secret inside it
+(`CW_CLUSTER_ADMIN_SECRET`). No new setting name is added: the margin and the requested life (60 minutes, the
+cap) are constants of the launcher. The reaper's service file and its environment still carry names and paths
+only; no token and no administrator value ever reaches them.
+
+**When it fails.** The old file stays as it is, one audit line names the reason (`refresh-cluster-token`, one line
+per change of reason), the pass report names the failure (`cluster token not refreshed: WHY`), and the next
+attempt follows the retry gap (`CLUSTER_TOKEN_RETRY_SECONDS`, 300): the vault is read at most once every five
+minutes, so a failing vault never spins. A vault that refuses this machine is named as such, and the reaper never
+runs the vault access check (that check belongs to the launch path alone). Another login is never touched:
+`CW_KUBE_CONTEXT` and `CW_KUBECONFIG` are left alone, and no other credential is ever tried.
+
+**The manual install comment on the installer ask is superseded**: it recorded that a person had to refresh the
+token file by hand. The reaper does that now, by itself, and runs unattended for days.
 
 ## Server-side guards: `app_token.py` and `preflight.py`
 
