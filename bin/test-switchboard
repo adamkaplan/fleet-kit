@@ -90151,9 +90151,47 @@ class TestReadCheckRuns1237(unittest.TestCase):
         m = self.src_module("total < len(runs):", "False:")
         (runs, why), _ = self.run_pages([self.page(100, 50)], m)
         self.assertEqual(len(runs), 100)
-        m = self.src_module("return (t if isinstance(t, str) else \"\", _attempt(entry), run)", "return (0, 0, run)")
+        m = self.src_module("return (1, _when(entry), _attempt(entry), run)", "return (0, run, _attempt(entry))")
         kept = self.latest_of([self.lrun(900, "2026-01-01T00:00:00Z"), self.lrun(500, "2026-02-01T00:00:00Z")], m)
         self.assertTrue(kept[0]["detailsUrl"].endswith("/900"))
+        # the mutant that sorts a missing time first drops the queued newer run
+        m = self.src_module("untimed[ident] = untimed.get(ident, False) or _when(entry) is None", "untimed[ident] = False")
+        m._when = lambda e, _w=m._when: _w(e) or m.__dict__.setdefault("_MIN", __import__("datetime").datetime(1, 1, 1, tzinfo=__import__("datetime").timezone.utc))
+        kept = self.latest_of(self.mixed(), m)
+        self.assertEqual([e["detailsUrl"].rsplit("/", 1)[1] for e in kept], ["500"])
+        m = self.src_module("t.strip().replace(\"Z\", \"+00:00\")", "t.strip().replace(\"Q\", \"\")")
+        kept = self.latest_of([self.lrun(900, "2026-01-01T00:00:00+00:00"), self.lrun(500, "2026-01-01T00:00:00.5Z")], m)
+        self.assertEqual(len(kept), 1)
+
+    def mixed(self):
+        queued = {"name": "j", "detailsUrl": "https://github.com/o/r/actions/runs/900", "status": "QUEUED", "conclusion": ""}
+        return [self.lrun(500, "2026-01-01T00:00:00Z"), queued]
+
+    def ids(self, kept):
+        return [e["detailsUrl"].rsplit("/", 1)[1] for e in kept]
+
+    def test_1281_missing_malformed_mixed_times_fail_closed(self):
+        self.assertEqual(self.ids(self.latest_of(self.mixed())), ["900"])          # the queued newer run is the latest
+        self.assertEqual(self.ids(self.latest_of(list(reversed(self.mixed())))), ["900"])
+        for bad in ("garbage", 5, ["x"]):
+            kept = self.latest_of([self.lrun(500, "2026-01-01T00:00:00Z"), self.lrun(900, bad)])
+            self.assertEqual(self.ids(kept), ["900"])
+        sb_ = load_ci_runs()
+        self.assertIsNone(sb_._when({"created_at": "garbage"}))
+        self.assertIsNone(sb_._when({}))
+
+    def test_1281_times_compare_as_instants(self):
+        z = self.latest_of([self.lrun(900, "2026-01-01T00:00:00+00:00"), self.lrun(500, "2026-01-01T00:00:00Z")])
+        self.assertEqual(self.ids(z), ["900"])                                     # same instant: the id decides
+        k = self.latest_of([self.lrun(900, "2026-01-01T00:00:00.100Z"), self.lrun(500, "2026-01-01T00:00:00.900Z")])
+        self.assertEqual(self.ids(k), ["500"])
+        k = self.latest_of([self.lrun(900, "2026-01-01T01:00:00+02:00"), self.lrun(500, "2026-01-01T00:30:00Z")])
+        self.assertEqual(self.ids(k), ["500"])
+
+    def test_1281_comparison_table_in_docs_is_complete(self):
+        doc = (ROOT / "docs" / "switchboard.md").read_text() if "ROOT" in globals() else open("docs/switchboard.md").read()
+        for row in ("latest_runs group order", "newest per-check order", "latest_check_runs", "Field per reader"):
+            self.assertIn(row, doc)
 
     def test_1281_error_text_names_ids_or_paths(self):
         with self.assertRaises(ValueError) as cm:

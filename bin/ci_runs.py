@@ -164,23 +164,43 @@ def _attempt(entry):
     return int(found.group(1)) if found else 0
 
 
-def _order(entry, run):
-    """Order of runs of one workflow: created_at (or the start time), then run attempt, then run id. A missing time is "" (the old rule)."""
-    t = entry.get("created_at") or entry.get("createdAt") or entry.get("started_at") or entry.get("startedAt") or ""
-    return (t if isinstance(t, str) else "", _attempt(entry), run)
+def _when(entry):
+    """The instant of an entry as an aware datetime (created_at/createdAt, else started_at/startedAt), None when missing or unparsable."""
+    from datetime import datetime, timezone
+    for key in ("created_at", "createdAt", "started_at", "startedAt"):
+        t = entry.get(key)
+        if t:
+            if not isinstance(t, str):
+                return None
+            try:
+                d = datetime.fromisoformat(t.strip().replace("Z", "+00:00").replace("z", "+00:00"))
+            except ValueError:
+                return None
+            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _order(entry, run, timed=True):
+    """Order of runs of one workflow. With a usable time on EVERY entry of the group: (time, attempt, run id). If any entry lacks a usable
+    time the whole group uses the old rule (run id, then attempt), so a queued newer run is never dropped."""
+    if timed:
+        return (1, _when(entry), _attempt(entry), run)
+    return (0, run, _attempt(entry))
 
 
 def latest_runs(rollup, repo=None):
     """`rollup` without the checks of an OLDER run of a workflow. A workflow is its STABLE identity (the workflow id read from the run), never
     its display name (the PR author writes that: a second workflow could take the real one's name). Runs are grouped by (workflow id, event):
-    a newer run of another event never hides a red older one (the fail-closed choice). The latest of a group counts (created_at, then run attempt, then the highest run id). A run whose identity cannot be read (another repo, a failed read, over the read cap) is kept and marked UNREADABLE (never
-    green). Entries with no run id (status contexts) are kept."""
+    a newer run of another event never hides a red older one (the fail-closed choice). The latest of a group counts (time, then run
+    attempt, then the highest run id; a group with any missing or unparsable time uses run id, then attempt). A run whose identity cannot
+    be read (another repo, a failed read, over the read cap) is kept and marked UNREADABLE (never green). Entries with no run id (status contexts) are kept."""
     if not isinstance(rollup, list):
         return []
     repo = own_repo(rollup, repo)
     budget = [READ_CAP]
     known = []
     top = {}
+    untimed = {}
     capped = set()
     for entry in rollup:
         run = _run_id(entry) if isinstance(entry, dict) else None
@@ -189,14 +209,18 @@ def latest_runs(rollup, repo=None):
             capped.add((repo, run))
         known.append((run, ident))
         if ident is not None:
-            top[ident] = max(top.get(ident, _order(entry, run)), _order(entry, run))
+            untimed[ident] = untimed.get(ident, False) or _when(entry) is None
+    for entry, (run, ident) in zip(rollup, known):
+        if ident is not None:
+            o = _order(entry, run, not untimed[ident])
+            top[ident] = max(top.get(ident, o), o)
     out = []
     for entry, (run, ident) in zip(rollup, known):
         if run is None:
             out.append(entry)
         elif ident is None:
             out.append(dict(entry, status=CAP_STATUS if (repo, run) in capped else UNREADABLE, conclusion=""))
-        elif _order(entry, run) >= top[ident]:
+        elif _order(entry, run, not untimed[ident]) >= top[ident]:
             out.append(entry)
     return out
 
