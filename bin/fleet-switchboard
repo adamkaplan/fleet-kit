@@ -3721,6 +3721,7 @@ def run_daemon(engine, state_dir, poll, wait=None, passes=None, record=None, wat
                     on_reload(watch)  # does not return when the daemon re-executes itself
                 try:
                     engine.run_pass()
+                    load_module("cloud_relay_daemon").pass_if_configured(engine, sys.modules[__name__], subprocess.run, engine.now)
                 except Exception as err:
                     engine._failed(None, "pass", err, {"errors": []})
                 done += 1
@@ -21526,6 +21527,7 @@ def build_parser():
     remind.add_argument("text", nargs="*", help="The reminder")
     remind.add_argument("--list", dest="list_mine", action="store_true", help="Show your own pending reminders (id, time, recipient, issue, text)")
     remind.add_argument("--cancel", metavar="ID", help="Cancel one of your pending reminders by its id (see --list)")
+    remind.add_argument("--key", default=None, help="Name the purpose: arming again with the same key replaces your pending reminder of that key.")
     remind.add_argument("--keep-if-closed", action="store_true", help="With --issue: deliver even if that issue has been closed "
                         "(by default a reminder about an issue is dropped, unsent, once the issue is closed)")
     remind.add_argument("--issue", type=issue_arg, help="The issue the reminder is about")

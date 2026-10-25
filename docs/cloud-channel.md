@@ -20,7 +20,31 @@ One document to set up, run and take down the cloud hub and the pod-side command
   - `cloud_cli.py send RECIPIENT TEXT...`
   - `cloud_cli.py report KIND TEXT...`, where KIND is one of `done failed blocked question working paused withdrawn`.
     A report goes to the agent named by `FLEET_BOSS`, as the text `report: KIND: TEXT`.
+  - The relay's PR-to-issue link comes from the PR body's closing keywords (and the plan's issue). It is not a security boundary: the
+    prove holder check and the verdict evaluator registry are. A refused relay call is forgotten by the hub, so the same call_id may be
+    sent again once the cause is fixed; a call_id reused with a different command, pr or head is 409.
   - `send` text is at most 2000 characters; `report` text at most 300.
+  - Relay timing assumption: the hub waits 30 s (`cloud_relay.WAIT`) for the daemon's answer. The daemon answers on each of its passes,
+    so its pass interval must be shorter than that wait; with a longer interval the pod's call gets 504. That is safe: the entry stays
+    queued and the same call_id is replay-safe (the daemon records the call id in the entry itself).
+  - Relay configuration that must agree: the hub's agents map decides which issue and repo a pod is bound to (pod-binding), and the
+    daemon's `relay_holders` config decides which pod may prove for that issue. If they disagree, the prove is refused 403 (fail closed).
+  - `FLEET_CLOUD_HUB_DAEMON` must not name a reserved agent (`captain`, `switchboard`, ...): the hub refuses to start with a ValueError
+    (nothing is bound, the process exits non-zero) rather than run with a daemon credential the reserved-name check would lock out.
+  - The relay's reasons to a pod are fixed or allow-listed text, clipped under 2000 characters; the detail stays in the daemon's audit.
+  - Relay daemon bounds (#1225): one hub request has a TOTAL deadline of 30 s wall clock (`READ_DEADLINE`); past it the read is a failed
+    pass (`relay.pass_failed`) and the next pass retries. The live PR head is read BEFORE the ledger lock under a 10 s timeout (late: 504,
+    nothing written); under the lock the daemon only compares it with the head the request judged, so no GitHub call holds the lock.
+    Worst case per pass: 10 requests, each at most 4 GitHub context reads (report 1, gates 2, prove 3, verdict 4), so at most 40.
+  - Report is at-most-once per call id: claimed (pending), delivered, marked done. A report CAN BE LOST (a crash or an error between claim
+    and delivery) but is never duplicated; for `report` the ask's "exactly one" reads "at most one". A replay of a pending claim answers 409
+    "lost or still pending: resend with a NEW call_id" and never delivers again.
+  - Relay pass wall clock: every hub request (connect, headers, body, response; GET and POST) has one 30 s deadline (`READ_DEADLINE`), so
+    a hub trickling headers is cut too; a pass has a 60 s budget (`PASS_BUDGET`) after which no new request is started (the rest wait for the
+    next pass). Worst case for the hub transport of one pass: 60 s + the 30 s of the last request = 90 s, plus the GitHub reads of the request
+    being handled (the 40 context reads above). Claims are in `relay_reports.json`, apart from `relay_calls.json`, so a pruned or missing
+    `relay_calls.json` cannot cause a second delivery; only deleting `relay_reports.json` itself, or more than 50000 newer reports, can.
+  - A refused relay call writes one audit line (`relay.refused`, `by` and `pr` clipped) on purpose; the ledger and files stay unchanged.
 
 The sender is always the agent the token proves, never a name in the body: a body naming another sender is refused 403.
 

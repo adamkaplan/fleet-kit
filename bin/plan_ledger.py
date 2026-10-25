@@ -949,7 +949,7 @@ def validate_plan_gates(raw, source):
         if "ci_workflows" in entry:   # #1237: workflow names the gate expects a run of at the head
             flows = entry["ci_workflows"]
             if not (isinstance(flows, list) and len(flows) <= 20 and all(isinstance(x, str) and x for x in flows)):
-                raise ValueError("%s: 'ci_workflows' must be a list of at most 20 workflow names" % name)
+                raise ValueError("%s: 'ci_workflows' must be a list of at most 20 workflow ids or paths" % name)
             repos[name]["ci_workflows"] = flows
     record = raw.get("ci_record") if raw.get("ci_record") is not None else {}
     if not isinstance(record, dict) or set(record) - {"enabled", "calls_per_pass", "pass_seconds"}:

@@ -2385,7 +2385,7 @@ for one repo shows that repo's notices; the Chief of Staff's and yours show all.
 - unreadable identity
 <!-- ci-shapes:end -->
 
-**Readers of check runs (#1237).** Every reader of the check-runs or the rollup, by source file (a test derives them by grep and fails on a reader missing here):
+**Readers of check runs (#1237).** Status contexts (no workflow) are grouped by their context name. A run's time is the MAX start time over its jobs (a run is as new as its latest job; the field order is `created_at`/`createdAt`, then `started_at`/`startedAt`). A run is dropped only when another run of the same workflow identity is BOTH at least as late AND has a higher-or-equal run id/attempt. Where the two orders disagree, BOTH runs are read, so a red in either is seen. A missing, unparsable, naive or date-only time in the group falls back to the old rule (run id, then attempt). A stale red of an older, late-starting run stays red until a run dominates it: it can cost a manual re-run. Every reader of the check-runs or the rollup, by source file (a test derives them by grep and fails on a reader missing here):
 
 | Reader (file: function) | Pages and cap | At the cap | Test and mutant | Branches and tests (`TestReadCheckRuns1237`) |
 |---|---|---|---|---|
@@ -2394,7 +2394,16 @@ for one repo shows that repo's notices; the Chief of Staff's and yours show all.
 | `ci_runs.py`: `latest_runs`, `latest_check_runs`, `not_green_runs`, `newest` | no read of their own | run identity: at most `ci_runs.READ_CAP` = 10 `gh api` reads per pass; past it the run is refused as unreadable (safe, but a head with more than 10 distinct runs may be refused) | `test_1237_read_cap_is_a_named_constant` | `missing_workflows`: `test_missing_workflows_branches`, `test_mutant_missing_workflows_never_names_is_caught`; `plan_ledger` `ci_workflows` (absent, valid, not a list, over 20, non-string/empty, unknown sibling): `test_ci_workflows_*`, `test_unknown_sibling_key_is_still_refused`, mutants `test_mutant_no_length_cap_is_caught`, `test_mutant_no_string_check_is_caught`, `test_mutant_no_list_check_is_caught` |
 | `item_verdicts.py`: `ci_decision` | fed by the reader above | none | the plan-item tests above | none new |
 
-Both the gate and the plan-item `ci-record` use the latest run of each workflow (`latest_runs`; `latest_check_runs` feeds it the Checks API shape): the highest run id, then the higher attempt (`/attempts/N` in the url). Status contexts keep the by-name rule (they have no run). **Expected workflows:** `plan_gates.repos.<repo>.ci_workflows` (a list of workflow ids or paths, default none; the gate reads no required-checks list). Each listed workflow with no run at the head, and an empty rollup, is refused as `no run for workflow X`; with the list absent an empty rollup reads `none` as before.
+Both the gate and the plan-item `ci-record` use the latest run of each workflow (`latest_runs`; `latest_check_runs` feeds it the Checks API shape): a run is dropped only when another has both a later-or-equal time and a higher-or-equal run id and attempt (`/attempts/N` in the url); where the two orders disagree both runs are read (a group with any missing or unparsable time falls back to run id and attempt). Status contexts are grouped by name (they have no run, so no workflow). A first page that is full while `total_count` is below the runs read is refused like the cap. **Expected workflows:** `plan_gates.repos.<repo>.ci_workflows` (a list of workflow ids or paths, default none; the gate reads no required-checks list). Each listed workflow with no run at the head, and an empty rollup, is refused as `no run for workflow X`; with the list absent an empty rollup reads `none` as before.
+
+**Comparisons the CI read makes between runs (#1281).** Every comparison, its fields and the safe direction on doubt (a test checks this table):
+
+| Comparison | Fields | Missing, malformed or mixed time |
+|---|---|---|
+| latest_runs group order (also `newest` and `latest_check_runs`, which call it) | `created_at`/`createdAt` if present, else `started_at`/`startedAt` (GraphQL rollup carries `startedAt`/`completedAt`, REST check-runs `started_at`/`completed_at`; neither carries a created time, so the start time is what compares), parsed to an aware instant (`Z` and `+00:00` equal; fractions count), a run is dropped only when another run has BOTH a later-or-equal time AND a higher-or-equal (run id, attempt); where the two orders disagree both runs are read (all their jobs); an older attempt of a kept run id keeps each job with no newer attempt (partial re-run) | if ANY entry of the group has no usable time, the whole group uses run id, then attempt (a queued run has no start time and must stay the latest); never read as complete and green |
+| newest per-check order | started, completed, then position | an entry with no time is older (unchanged, verdict order); an unfinished run makes the check pending |
+| latest_check_runs | `started_at`, `completed_at`, check-run id | unchanged |
+| Field per reader | rollup: `startedAt`; Checks API: `started_at` | see above |
 
 **The newest run of each check decides the CI verdict (#534).** `statusCheckRollup` lists every run at a head, so a red run that was re-run green stays in it. The verdict (`pr-state`, the gate's checks row, the notices' facts line) and the checks list read it through `bin/ci_runs.py`, in this order: a check (identified by its workflow and name; a status context by its context) with ANY unfinished run is pending, whatever older runs say (so an older run that finishes after a newer one started never hides the running one); otherwise the completed run that STARTED last decides (so a green re-run supersedes the red run it replaced, and an older attempt that fails late does not override a newer run), with runs that started together ordered by completion and a full tie keeping every tied run (a failing one fails). An entry with no time is older than one with a time; an entry that names no check is its own check; a check is listed once. Nothing is ever read greener by guessing. The time-to-green measure in `measure_row` reads the rollup for a metric, not a verdict, and is unchanged.
 
@@ -2751,7 +2760,13 @@ own gets `--until-closed` for that issue by default, so a reminder about finishe
 
 **A reminder about an issue is dropped when it closes (#1132).** A reminder is dropped when its issue closes or its pull
 request merges, unless it was set with `--keep-if-closed`. `remind --issue N` says so at creation ("dropped if it closes")
-and names `--keep-if-closed`. When the daemon drops it, the setter gets ONE notice naming the reminder, its text and the
+and names `--keep-if-closed`.
+
+`remind --key <text>` names the purpose: arming again with the same key replaces your pending reminder of that key (one pending per
+owner and key; another owner's or another key's reminder is never touched), and `remind --list` shows the key. A fired, undelivered
+reminder is dropped when a newer one of the same owner and key is due and will be delivered (one `reminder.drop_superseded` audit line names both ids). A
+delivery 5 minutes or more after its due time says "late by N min". Arming a text over 4000 characters (the delivery cap) prints a
+warning with the number of characters over. A newer reminder still in the future does NOT drop an older fired one: the older is delivered (with its late note) and the newer fires as usual, so a lane never gets nothing. A keyed reminder needs a known sender (an unidentified caller is refused). The key is cut at 80 characters, so two longer keys with the same first 80 characters are one key. The match is the owner and the key, not the recipient `to`. A cut body ends with an ellipsis before the note. The late note is added before the 4000 cap and kept: the body is cut, not the note. Without `--key` nothing changes. When the daemon drops it, the setter gets ONE notice naming the reminder, its text and the
 reason (the issue closed, the pull request merged), audited as `reminder.drop_notice`; the notice is sent only by the sweep
 that removes the reminder, so it is never repeated. An issue already closed at creation is refused (exit 2, "already
 closed") unless `--keep-if-closed` is given, which keeps the reminder and fires it. A reminder without `--issue`, or whose
@@ -5751,6 +5766,7 @@ All three also have the limit mutant (`WATCH_MAX_DEPTH = 10**9`), which fails on
 - Slice S4 moved the decisions code (the escalated-request, PR-notice, order-notice and external-decision sections) to `switchboard/decisions_a.py` and `switchboard/decisions_b.py`, text unchanged, listed after the entry. 44 statements of those sections stay in the entry, in place, because the clear's closure reads them (`resolve_boss`, `boss_name`, `parse_pr_ref`, `read_pr_notices`, `read_pr_facts`, `read_pr_json`, `pr_marker`, `pr_hold_reasons`, `read_decisions_file`, `validate_order_burst` and what they read); they move with the clear batch (S13). The registry inventory (`docs/agent-registry.md`) names the part files for the readers that moved.
 - Slice S5 moved three whole sections no open pull request touched, each one job, to `switchboard/reminders.py` (the reminders file, `remind`, checkpoint reminders), `switchboard/plan_review.py` (`plan review`, slice R2) and `switchboard/pr_explain.py` (`pr-explain` and the held-body checks), text unchanged, listed after the entry. The waiting-on-the-person sweep and the triage code stay in the entry until the pull requests that edit them have merged. `tools/arch-part-cut` makes the cut and `tools/arch-split-check` proves it.
 - Slice S6 moved the daemon's core sections no open pull request touched and no test reads from the entry, one job each, to `switchboard/audit.py` (the audit log), `switchboard/v2_transport.py` (the OpenCode v2 client and its HTTP transport), `switchboard/facts.py` (the fact sources), `switchboard/decision.py` (the delivery decision), `switchboard/engine.py` (the engine) and `switchboard/jev.py` (the Jev client and the classifier), text unchanged. `v2_transport.py` and `facts.py` are listed right after the entry because earlier parts read their classes when they load. The event feed, the policy judge's questions and shadow mode, the heavy-reader budget block and the blocked-agent report stay in the entry.
+- The units of the switchboard, their layers, their jobs and what each may depend on are written in `docs/architecture.md`; `tests/switchboard/test_architecture.py` (run by `bin/test-switchboard`) derives the real dependencies from the code and fails when the two disagree. Known breaks are rows of its violations table with a ceiling, and the table only shrinks.
 
 ## Running with no terminal multiplexer (#1072)
 
@@ -5865,3 +5881,17 @@ State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every
 - **Sender derivation follows ONE wrapper level** (a call through a wrapper of the base calls is found; a wrapper of a wrapper is not).
 - **The load key's subject is the agent only.**
 - Every place agent text reaches a daemon message (header lead, item summary via `_clean_line`/`one_line`, keys by data) and every place numbering or order is decided (`compose`, `numbered_lines`) has a hostile-text test.
+
+### Where a reminder is dropped, replaced, delayed or rewritten
+
+| Place | What happens | Loss case probed by |
+| --- | --- | --- |
+| `reminders_lock` in `add_reminder` | a keyed arming replaces the pending item of the same owner and key | other owner/key, fired item, sender-less |
+| `reminder.drop_superseded` / `drop_superseded_item` | a fired older item is dropped for a newer due one that will be delivered, re-checked in one locked read-modify-write | newer in the future, gated (verdict not `deliver`), unresolved (None), cancelled or pruned between read and drop: the older is delivered or kept; mutants: restore the old rule, drop outside the lock |
+| `superseded` / `verdict` / `until_closed` | match is owner+key (not the recipient `to`) | gated newer keeps the older |
+| mutant results (run by hand) | restore the old drop rule: killed; drop without re-checking the kept item in the lock: killed | `TestReminders` |
+| `remove_reminders` / `prune_delivered_reminders` | cancel, condition drop, prune of delivered items | `--cancel` and condition tests |
+| `reminder.drop` / `reminder.drop_notice` | the issue closed or the pull request merged | `--keep-if-closed` |
+| `--cancel` | removes one of your own reminders by id | `remind_manage` tests |
+| `late by` | a note after 5 minutes, before the cap | exact text and cap tests |
+| `TEXT_CAP` | the 4000 cap equals `MESSAGE_CAP`; arming warns | 4003 vs 4000 |
