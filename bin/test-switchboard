@@ -76966,7 +76966,7 @@ class TestLoadAlert(Base):
         def figures(latest):
             return {k: (latest[k]["busy"], latest[k]["idle"], latest[k]["cloud"]) for k in ("orch", "orchb")}
         self.assertEqual(figures(self._cloud_run()), {"orch": (1, 1, 2), "orchb": (0, 0, 0)})
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         import re as _re
         body = _re.search(r"def load_tick\(.*?\n\n\n", source, _re.S).group(0)
         old = '"busy": sum(1 for c in coders if c.status == "working"),'
@@ -78944,7 +78944,7 @@ class TestCloudLoad(Base):
 
     def mutant(self, old, new):
         import re as _re
-        source = SWITCHBOARD.read_text()
+        source = switchboard_source()
         body = _re.search(r"def live_cloud_by_lane.*?\n\n\n", source, _re.S).group(0)
         self.assertIn(old, body)
         scope = dict(vars(sb))
@@ -90693,12 +90693,17 @@ class TestAssembler(unittest.TestCase):
         (root / "fleet-switchboard.parts").write_text("\n".join(lines) + "\n")
         return root
 
+    @staticmethod
+    def _shipped_parts():
+        """The parts the shipped manifest lists after the entry, from the one list (a part added to the manifest needs no edit here)."""
+        return [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.startswith("#") and n.strip() != "fleet-switchboard"]
+
     def test_the_shipped_manifest_names_the_entry_itself(self):
         lines = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.startswith("#")]
         self.assertEqual(lines[0], "fleet-switchboard")
 
     def test_a_second_part_puts_its_names_into_sb_in_the_order_given(self):
-        root = self._copy(["part_a.py", "fleet-switchboard", "switchboard/v2_transport.py", "switchboard/facts.py", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py", "switchboard/handoff.py", "part_b.py"])
+        root = self._copy(["part_a.py", "fleet-switchboard"] + self._shipped_parts() + ["part_b.py"])
         (root / "part_a.py").write_text('ORDER = ["a"]\nA_SAW_MAIN = "main" in globals()\nA_FILE = __file__\n')
         (root / "part_b.py").write_text('ORDER.append("b")\nB_SAW_MAIN = "main" in globals()\n')
         module = _load("t_assembled", root / "fleet-switchboard")
@@ -90747,7 +90752,7 @@ class TestAssembler(unittest.TestCase):
         self.assertTrue(_load("t_unnamed_entry", root / "entry").ENTRY_SAW_A)
 
     def test_comments_and_blank_lines_in_a_manifest_are_ignored(self):
-        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard", "switchboard/v2_transport.py", "switchboard/facts.py", "switchboard/judge_request.py", "switchboard/judge.py", "switchboard/import_v1.py", "switchboard/handoff.py"])
+        root = self._copy(["# the parts", "", "part_a.py", "  ", "fleet-switchboard"] + self._shipped_parts())
         (root / "part_a.py").write_text("FROM_A = 1\n")
         self.assertEqual(_load("t_commented", root / "fleet-switchboard").FROM_A, 1)
 
