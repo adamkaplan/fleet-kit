@@ -66,9 +66,10 @@ def run(repo, preflight=OKPF, env=None, script_text=None, timeout=60):
         shutil.rmtree(d, ignore_errors=True)
 
 
-def spawner(pidfile, tail=""):
-    return ("import sys\nfrom subprocess import Popen as start\np = start(['sleep', '77'])\n"
-            "open(%r, 'w').write(str(p.pid))\n%s\nimport time\ntime.sleep(77)\n" % (pidfile, tail))
+def spawner(pidfile):
+    """A script that starts a grandchild (sleep 77), records its pid, then sleeps: the plain fixture file with the pid path filled in."""
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "prepush_spawner.py")) as fh:
+        return fh.read().replace("@PIDFILE@", pidfile)
 
 
 def alive(pid):
