@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -64,6 +65,13 @@ class Fixture(unittest.TestCase):
         return code, out.getvalue() + err.getvalue()
 
 
+def check_no_volume_args(tc, argvs):
+    for argv in argvs:
+        for el in argv:
+            tc.assertNotEqual(el, "-v")
+            tc.assertFalse(str(el).startswith("--volume"), el)
+
+
 class Pull(Fixture):
     def test_success_uses_stdin_and_pulls(self):   # S9, S4
         code, out = self.go()
@@ -74,12 +82,26 @@ class Pull(Fixture):
         pulls = [d for d in self.dockers if d["argv"][1] == "pull"]
         self.assertEqual(len(pulls), 1)
         blob = repr([d["argv"] for d in self.dockers]) + repr([d["env"] for d in self.dockers])
-        for bad in (REFRESH, ACCESS, TOKEN, self.tok, "-v", "--volume"):
+        for bad in (REFRESH, ACCESS, TOKEN, self.tok):
             self.assertNotIn(bad, blob)
+        check_no_volume_args(self, [d["argv"] for d in self.dockers])
         for secret in (TOKEN, ACCESS, REFRESH):
             self.assertNotIn(secret, out)
         self.assertEqual(self.posts[0][1]["client_assertion"], TOKEN)
         self.assertTrue(self.posts[1][0].startswith("https://" + HOST))
+
+    def test_volume_check_mutants(self):
+        for extra in ("-v", "--volume=x"):
+            argv = ["docker", "pull", "img"]
+            mutated = argv + [extra]
+            self.assertIn(extra, mutated)
+            with self.assertRaises(AssertionError):
+                check_no_volume_args(self, [mutated])
+        check_no_volume_args(self, [["docker", "pull", "img"]])
+
+    def test_success_ignores_host_environment(self):
+        with mock.patch.dict(os.environ, {"FOO": "a-vb", "BAR": "--volume=z"}):
+            self.test_success_uses_stdin_and_pulls()
 
     def test_another_host_is_refused_without_a_pull(self):   # S9
         code, out = self.go(["other.azurecr.io/x:1"])
