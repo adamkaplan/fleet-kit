@@ -90179,6 +90179,223 @@ class TestNoPaneToJudge(StandInPids, Base):
             self.assertIn(phrase, body)
 
 
+
+class TestArchTools(unittest.TestCase):
+    """The two move tools (S0 of #1092): `arch-split-check` reads the surface of the daemon as its own entry assembles it, and `arch-part-cut` never overwrites a part."""
+
+    def tool(self, name, *args):
+        return subprocess.run([sys.executable, "-B", str(REPO / "tools" / name)] + [str(a) for a in args], capture_output=True, text=True)
+
+    def test_the_surface_of_the_daemon_is_read_as_its_entry_assembles_it_not_as_a_text_join(self):
+        listed = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.lstrip().startswith("#")]
+        files = [str(BIN / n) for n in listed]
+        out = Path(tempfile.mkdtemp()) / "surface.txt"
+        self.addCleanup(shutil.rmtree, str(out.parent), True)
+        done = self.tool("arch-split-check", "--write-surface", out, "--after", *files)
+        self.assertEqual(done.returncode, 0, done.stderr[-600:])
+        self.assertEqual(out.read_text().split(), sorted(dir(sb)), "the names the tool reads are the names of the daemon as it loads")
+
+    def test_a_cut_refuses_a_part_name_already_listed_and_a_name_given_twice_and_writes_nothing(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        (root / "switchboard").mkdir()
+        entry = "def one():\n    return 1\n\n\ndef two():\n    return 2\n"
+        (root / "entry").write_text(entry)
+        (root / "entry.parts").write_text("# parts\nentry\nswitchboard/taken.py\n")
+        (root / "switchboard" / "taken.py").write_text("KEEP = 1\n")
+        common = ["--entry", root / "entry", "--manifest", root / "entry.parts", "--parts-dir", root / "switchboard", "--write"]
+        for cuts, word in ((["taken:1:2"], "already exists"), (["fresh:1:2", "fresh:5:6"], "given twice")):
+            with self.subTest(cuts=cuts):
+                done = self.tool("arch-part-cut", *common, *cuts)
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn(word, done.stderr)
+                self.assertEqual((root / "entry").read_text(), entry, "the entry is untouched")
+                self.assertEqual((root / "switchboard" / "taken.py").read_text(), "KEEP = 1\n", "the listed part is not overwritten")
+                self.assertFalse((root / "switchboard" / "fresh.py").exists())
+        done = self.tool("arch-part-cut", *common, "fresh:1:2")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual((root / "switchboard" / "fresh.py").read_text(), "def one():\n    return 1\n")
+        self.assertIn("switchboard/fresh.py", (root / "entry.parts").read_text())
+
+    @staticmethod
+    def snapshot(root):
+        return {str(p.relative_to(root)): p.read_bytes() for p in sorted(Path(root).rglob("*")) if p.is_file()}
+
+    def cut_tree(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        (root / "switchboard").mkdir()
+        (root / "out").mkdir()
+        (root / "entry").write_text("def one():\n    return 1\n\n\ndef two():\n    return 2\n")
+        (root / "entry.parts").write_text("# parts\nentry\nswitchboard/taken.py\n")
+        (root / "switchboard" / "taken.py").write_text("KEEP = 1\n")
+        (root / "switchboard" / "Mixed.py").write_text("MIXED = 1\n")   # differs from a new name only in case
+        (root / "switchboard" / "exists.py").write_text("EXISTS = 1\n")   # on disk, not in the manifest
+        return root, ["--entry", root / "entry", "--manifest", root / "entry.parts", "--parts-dir", root / "switchboard", "--write"]
+
+    def test_a_cut_refuses_a_traversal_an_outside_name_an_existing_file_and_a_bad_range_and_writes_nothing(self):
+        root, common = self.cut_tree()
+        before = self.snapshot(root)
+        refused = (
+            ("a path traversal", ["../out/esc:1:2"], "lower-case letters"),
+            ("an absolute name", ["/tmp/escape:1:2"], "lower-case letters"),
+            ("a name with a directory", ["sub/x:1:2"], "lower-case letters"),
+            ("a capital", ["Part:1:2"], "lower-case letters"),
+            ("a name that ends in a newline", ["fresh\n:1:2"], "lower-case letters"),
+            ("a name that is only a newline", ["\n:1:2"], "lower-case letters"),
+            ("a name with a leading digit", ["1fresh:1:2"], "lower-case letters"),
+            ("a lookalike name", ["fresh\u200b:1:2"], "lower-case letters"),
+            ("a name that matches an existing file but for case", ["mixed:1:2"], "already exists"),
+            ("an existing file that is not listed", ["exists:1:2"], "already exists"),
+            ("a listed part", ["taken:1:2"], "already exists"),
+            ("a range outside the entry", ["fresh:1:99"], "not inside the entry"),
+            ("a reversed range", ["fresh:6:1"], "not inside the entry"),
+            ("a statement cut in two", ["fresh:1:1"], "cut by"),
+            ("two cuts that overlap", ["a:1:2", "b:2:2"], "overlap"),
+            ("a valid cut then an existing file: the first is not written", ["fresh:1:2", "exists:5:6"], "already exists"),
+            ("a valid cut then a traversal: the first is not written", ["fresh:1:2", "../out/esc:5:6"], "lower-case letters"),
+            ("a spec that is not NAME:FIRST:LAST", ["fresh"], "not NAME:FIRST:LAST"),
+        )
+        for label, cuts, word in refused:
+            with self.subTest(case=label):
+                done = self.tool("arch-part-cut", *common, *cuts)
+                self.assertNotEqual(done.returncode, 0, done.stdout)
+                self.assertIn("nothing written", done.stderr)
+                self.assertIn(word, done.stderr)
+                self.assertNotIn("Traceback", done.stderr)
+                self.assertEqual(self.snapshot(root), before, "no file changed, no file appeared: the entry, the manifest, the parts and the directory outside")
+
+    def test_a_symlinked_or_outside_parts_directory_is_refused_and_nothing_is_written(self):
+        root, common = self.cut_tree()
+        outside = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(outside), True)
+        (root / "link").symlink_to(outside)
+        before, outside_before = self.snapshot(root), self.snapshot(outside)
+        for label, parts in (("a symlinked directory", root / "link"), ("a directory outside the manifest's", outside)):
+            with self.subTest(case=label):
+                args = [a for a in common]
+                args[args.index("--parts-dir") + 1] = parts
+                done = self.tool("arch-part-cut", *args, "fresh:1:2")
+                self.assertNotEqual(done.returncode, 0, done.stdout)
+                self.assertIn("nothing written", done.stderr)
+                self.assertNotIn("Traceback", done.stderr)
+                self.assertEqual(self.snapshot(root), before)
+                self.assertEqual(self.snapshot(outside), outside_before)
+
+    def test_a_cut_that_would_leave_a_decorator_behind_is_refused_and_one_that_takes_it_is_not(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        (root / "switchboard").mkdir()
+        entry = "import functools\n\n\n@functools.lru_cache(None)\ndef cached():\n    return 1\n\n\ndef plain():\n    return 2\n"
+        (root / "entry").write_text(entry)
+        (root / "entry.parts").write_text("entry\n")
+        common = ["--entry", root / "entry", "--manifest", root / "entry.parts", "--parts-dir", root / "switchboard", "--write"]
+        before = self.snapshot(root)
+        done = self.tool("arch-part-cut", *common, "fresh:5:6")   # from the def line: the decorator on line 4 stays behind
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("cut by", done.stderr)
+        self.assertEqual(self.snapshot(root), before)
+        done = self.tool("arch-part-cut", *common, "fresh:4:6")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual((root / "switchboard" / "fresh.py").read_text(), "@functools.lru_cache(None)\ndef cached():\n    return 1\n")
+
+    def test_a_part_that_does_not_parse_is_a_named_failure_in_the_statement_comparison(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        (root / "good.py").write_text("A = 1\n")
+        (root / "bad.py").write_text("def broken(:\n")
+        done = self.split_check([root / "good.py"], [root / "bad.py"], "--no-surface")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn("Traceback", done.stdout + done.stderr)
+        self.assertIn("bad.py does not parse", done.stderr)
+        missing = self.split_check([root / "good.py"], [root / "absent.py"], "--no-surface")
+        self.assertNotIn("Traceback", missing.stdout + missing.stderr)
+        self.assertIn("cannot read", missing.stderr)
+
+    def test_a_cut_writes_only_inside_the_parts_directory_and_lists_the_part_relative_to_the_manifest(self):
+        root, common = self.cut_tree()
+        done = self.tool("arch-part-cut", *common, "fresh:1:2")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(sorted(self.snapshot(root)), ["entry", "entry.parts", "switchboard/Mixed.py", "switchboard/exists.py", "switchboard/fresh.py", "switchboard/taken.py"])
+        self.assertEqual((root / "entry.parts").read_text().splitlines()[-1], "switchboard/fresh.py")
+        self.assertEqual(list((root / "out").iterdir()), [])
+
+    def split_check(self, before, after, *flags):
+        return self.tool("arch-split-check", "--before", *before, "--after", *after, *flags)
+
+    def test_a_side_that_cannot_be_loaded_is_a_named_failure_after_the_statement_differences_not_a_traceback(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        (root / "a.py").write_text("A = 1\n")
+        (root / "b.py").write_text("B = 2\n")
+        (root / "b_bad.py").write_text("B = undefined_name_here\n")
+        done = self.split_check([root / "a.py", root / "b.py"], [root / "a.py", root / "b_bad.py"])
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertNotIn("Traceback", done.stdout + done.stderr)
+        self.assertIn("statement removed or changed (before): b.py:1 Assign B", done.stdout)   # the differences come first and name the part
+        self.assertIn("statement added or changed (after): b_bad.py:1 Assign B", done.stdout)
+        self.assertIn("after: cannot load the program (in b_bad.py:1): NameError", done.stdout)
+        self.assertLess(done.stdout.index("statement removed"), done.stdout.index("after: cannot load"))
+        self.assertIn("surface not read", done.stdout)
+
+    def entry_tree(self, with_manifest=True):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        for sibling in BIN.glob("*.py"):
+            shutil.copy(str(sibling), str(root / sibling.name))
+        if with_manifest:
+            copy_entry(root)
+        else:
+            shutil.copy(str(SWITCHBOARD), str(root / "fleet-switchboard"))
+        return root
+
+    def test_a_part_of_the_daemon_that_uses_an_undefined_name_at_load_time_is_named_by_part_and_side(self):
+        root = self.entry_tree()
+        part = root / "switchboard" / "judge.py"
+        part.write_text(part.read_text() + "\nLOAD_TIME_USE = an_undefined_name_at_load_time\n")
+        listed = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.lstrip().startswith("#")]
+        done = self.split_check([BIN / n for n in listed], [root / n for n in listed])
+        self.assertEqual(done.returncode, 1, done.stdout[-400:] + done.stderr[-400:])
+        self.assertNotIn("Traceback", done.stdout + done.stderr)
+        self.assertIn("statement added or changed (after): judge.py", done.stdout)
+        self.assertIn("after: cannot load the program (in judge.py:", done.stdout)
+        self.assertIn("NameError", done.stdout)
+
+    def test_an_entry_with_no_manifest_beside_it_is_a_named_failure_that_says_how_to_lay_it_out(self):
+        lone = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(lone), True)
+        shutil.copy(str(SWITCHBOARD), str(lone / "fleet-switchboard"))   # the entry alone, as `git show REV:bin/fleet-switchboard > tmp` leaves it
+        done = self.split_check([lone / "fleet-switchboard"], [lone / "fleet-switchboard"])
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertNotIn("Traceback", done.stdout + done.stderr)
+        self.assertIn("before: cannot load the program", done.stdout)
+        self.assertIn("fleet-switchboard.parts", done.stdout)
+
+    def test_a_file_given_that_is_not_in_the_manifest_beside_the_entry_is_refused_by_name(self):
+        root = self.entry_tree()
+        extra = root / "extra_part.py"
+        extra.write_text("EXTRA = 1\n")
+        listed = [n.strip() for n in (BIN / "fleet-switchboard.parts").read_text().splitlines() if n.strip() and not n.lstrip().startswith("#")]
+        done = self.split_check([root / n for n in listed], [root / n for n in listed] + [extra])
+        self.assertEqual(done.returncode, 1, done.stdout[-300:])
+        self.assertNotIn("Traceback", done.stdout + done.stderr)
+        self.assertIn("after: extra_part.py is not in", done.stdout)
+        self.assertIn("would not reach the surface", done.stdout)
+
+    def test_a_hostile_pair_one_statement_dropped_and_one_added_is_named_by_the_statements_and_by_the_surface(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root), True)
+        (root / "before.py").write_text("KEEP = 1\n\n\ndef dropped():\n    return 1\n")
+        (root / "after.py").write_text("KEEP = 1\n\n\ndef added():\n    return 1\n")   # the same number of statements: only the multiset differs
+        done = self.split_check([root / "before.py"], [root / "after.py"])
+        self.assertEqual(done.returncode, 1, done.stdout)
+        for line in ("statement removed or changed (before): before.py:4 FunctionDef dropped", "statement added or changed (after): after.py:4 FunctionDef added",
+                     "name only before: dropped", "name only after: added"):
+            self.assertIn(line, done.stdout)
+        same = self.split_check([root / "before.py"], [root / "before.py"])
+        self.assertEqual(same.returncode, 0, same.stdout)
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
