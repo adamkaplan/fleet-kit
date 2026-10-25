@@ -59,7 +59,7 @@ class Running:
         module.TOTAL_DEADLINE = deadline if deadline is not None else 10.0
         self.inbox, self.lines = FakeInbox(), []
         self.host = host
-        self.server = module.make_server((host, 0), reviewer, self.inbox, self.lines.append, max_handlers)
+        self.server = module.make_server((host, 0), reviewer, self.inbox, self.lines.append, max_handlers, namespace="fleet-agents")
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.last_headers = ""
 
