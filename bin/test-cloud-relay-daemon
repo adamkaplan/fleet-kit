@@ -911,6 +911,109 @@ class HubReadAndTransport(unittest.TestCase):
         self.addCleanup(srv.shutdown)
         return "http://127.0.0.1:%d" % srv.server_port
 
+    def _hang_connect(self, mod):
+        """Every connect waits on a gate (a hanging DNS/connect), then really connects. Returns the gate."""
+        import http.client
+        import threading
+        gate = threading.Event()
+        real = http.client.HTTPConnection.connect
+
+        def slow(conn):
+            gate.wait(20)
+            return real(conn)
+        http.client.HTTPConnection.connect = slow
+        self.addCleanup(setattr, http.client.HTTPConnection, "connect", real)
+        self.addCleanup(gate.set)
+        return gate
+
+    def _threads_hanging(self, mod):
+        import threading
+        before = threading.active_count()
+        self._hang_connect(mod)
+        old, mod.READ_DEADLINE = mod.READ_DEADLINE, 0.3
+        self.addCleanup(setattr, mod, "READ_DEADLINE", old)
+        fetch, _ = mod.http_transport("http://127.0.0.1:9", "tok")
+        for _ in range(4):
+            with self.assertRaises(mod.PassCut):
+                fetch()
+        return threading.active_count() - before
+
+    def test_repeated_cut_passes_keep_one_worker_thread(self):
+        self.assertLessEqual(self._threads_hanging(relay), 2)   # one worker (+ at most its watchdog Timer), never one more per pass
+
+    def test_mutant_without_the_in_flight_check_is_caught(self):
+        mod = load_backend_module("if inflight and inflight[0].is_alive():", "if False:")
+        self.assertGreater(self._threads_hanging(mod), 2)
+
+    def _late_post_scenario(self, mod):
+        import json
+        import threading
+        import http.server
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        hub = FakeHub()
+        hub.submit(CODER, "prove", cid="late", **PROVE)
+        req = hub.queue[0]
+        posts = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                data = json.dumps({"requests": [req]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_POST(self):
+                posts.append(self.path)
+                n = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(n)
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        import http.client
+        gate = threading.Event()
+        real = http.client.HTTPConnection.connect
+        slow_for = {"post": True}
+        http.client.HTTPConnection.connect = lambda conn: (gate.wait(20) if slow_for["post"] and slow_for.get("armed") else None, real(conn))[1]
+        self.addCleanup(setattr, http.client.HTTPConnection, "connect", real)
+        self.addCleanup(gate.set)
+        old, mod.READ_DEADLINE = mod.READ_DEADLINE, 0.4
+        self.addCleanup(setattr, mod, "READ_DEADLINE", old)
+        fetch, post = mod.http_transport("http://127.0.0.1:%d" % srv.server_port, "tok")
+        ex = relay.Executor(tmp.name, FakeBackend(), lambda: 1000)
+        slow_for["armed"] = True   # only the POST connect hangs: the GET below is made with the gate open first
+        gate.set()
+        pending = fetch()
+        gate.clear()
+        status, reason, record = ex.handle(pending["requests"][0])   # pass 1 executes: one ledger record
+        with self.assertRaises(mod.PassCut):
+            post(req["id"], {"status": status, "reason": reason, "record": record})   # the POST connect hangs: cut
+        gate.set()   # the late thread now completes after the cut
+        import time
+        time.sleep(0.5)
+        slow_for["armed"] = False
+        status2, _, record2 = ex.handle(fetch()["requests"][0])   # next pass: the same request is a replay
+        post(req["id"], {"status": status2, "reason": "", "record": record2})
+        entries, _ = plan_ledger.read_ledger(tmp.name)
+        return len(entries), len(posts)
+
+    def test_late_post_after_the_cut_is_not_made_and_the_replay_writes_one_record(self):
+        self.assertEqual(self._late_post_scenario(relay), (1, 1))
+
+    def test_mutant_without_the_cancel_check_is_caught(self):
+        mod = load_backend_module("if cancel is not None and cancel.is_set():", "if False:")
+        self.assertEqual(self._late_post_scenario(mod), (1, 2))   # the late thread also posted
+
     def test_a_trickling_hub_is_cut_at_the_total_deadline(self):
         import time
         old = relay.READ_DEADLINE

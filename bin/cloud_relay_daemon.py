@@ -18,7 +18,7 @@ call id). Claims live in their own file (`relay_reports.json`, REPORT_MAX entrie
 damaged claim file refuses with 500 rather than forgetting). A report replay with a different pr or different args under the same call id is 409.
 Refusals (daemon-only credential, repo, allow-list, rules) write an AUDIT line `relay.refused` on purpose and leave the ledger and files
 byte-identical. The hub's 1000-entry finished cache can be flooded to evict another pod's hub-side replay record; the daemon-side dedupe
-above still holds it. Every hub request (connect, headers, body, response; GET and POST) has ONE wall-clock deadline (READ_DEADLINE 30 s), and a relay pass a budget (PASS_BUDGET 60 s: later requests wait for the next pass); each hub request runs in a worker thread joined at READ_DEADLINE (DNS and every connect attempt included; a late thread is abandoned and the pass records relay pass cut), so the transport of a pass is at most PASS_BUDGET + READ_DEADLINE = 90 s. The up to 40 GitHub context reads of a pass carry NO deadline inside the pass budget: they are unbounded. The hub read has a TOTAL deadline (READ_DEADLINE) and the live head is read OUTSIDE the ledger flock (bounded by HEAD_TIMEOUT, refused 504 with nothing written when late); inside the flock the build only compares it with the head the request judged: no network under the lock.
+above still holds it. Every hub request (connect, headers, body, response; GET and POST) has ONE wall-clock deadline (READ_DEADLINE 30 s), and a relay pass a budget (PASS_BUDGET 60 s: later requests wait for the next pass); each hub request runs in a worker thread joined at READ_DEADLINE (DNS and every connect attempt included; a late thread is abandoned and the pass records relay pass cut), so the transport of a pass is at most PASS_BUDGET + READ_DEADLINE = 90 s. Only ONE hub worker thread lives at a time (a new request while an abandoned one runs is refused as a cut: "previous request still running"), and a cut sets a cancel flag checked after connect and before the send, so a late thread never POSTs; a late GET result is discarded silently. The up to 40 GitHub context reads of a pass carry NO deadline inside the pass budget: they are unbounded. The hub read has a TOTAL deadline (READ_DEADLINE) and the live head is read OUTSIDE the ledger flock (bounded by HEAD_TIMEOUT, refused 504 with nothing written when late); inside the flock the build only compares it with the head the request judged: no network under the lock.
 GitHub reads per pass, worst case: at most 10 requests, each making _ctx reads (a ledger context = PR facts and plan from GitHub): report 1 (link), gates 2, prove 3 (link, plan, live head), verdict 4 (link, plan, PR facts, live head); so at most 10 x 4 = 40 context reads per pass.
 Memory limit, exactly: report claims survive restarts and a missing or pruned relay_calls.json (own file, REPORT_MAX 50000 entries; beyond that the oldest claim is forgotten, and a deleted relay_reports.json is an empty memory, so a report with that call id would then be delivered again). A damaged file refuses instead.
 
@@ -410,27 +410,39 @@ def http_transport(base, token):
 
     import http.client
 
+    inflight, inflight_lock = [], threading.Lock()
+
     def call(path, body=None):
         """The request in a WORKER THREAD joined at READ_DEADLINE: DNS, every connect attempt and everything else share ONE wall clock. When
         the join times out the thread is abandoned (daemon) and PassCut is raised; the request stays at the hub."""
         box = []
+        with inflight_lock:
+            if inflight and inflight[0].is_alive():   # ONE in-flight worker: no new thread while an abandoned one still runs
+                raise PassCut("previous request still running")
+            cancel = threading.Event()
 
-        def run():
-            try:
-                box.append((True, _call(path, body)))
-            except BaseException as err:
-                box.append((False, err))
-        worker = threading.Thread(target=run, daemon=True)
-        worker.start()
+            def run():
+                try:
+                    box.append((True, _call(path, body, cancel)))
+                except BaseException as err:
+                    box.append((False, err))
+                finally:
+                    with inflight_lock:
+                        if inflight and inflight[0] is threading.current_thread():
+                            inflight.clear()
+            worker = threading.Thread(target=run, daemon=True)
+            inflight[:] = [worker]
+            worker.start()
         worker.join(READ_DEADLINE)
         if not box:
+            cancel.set()   # the pass is cut: a late thread must not POST
             raise PassCut("relay pass cut")
         ok, value = box[0]
         if ok:
             return value
         raise value
 
-    def _call(path, body=None):
+    def _call(path, body=None, cancel=None):
         """One request under ONE wall-clock deadline (READ_DEADLINE) covering connect, headers, body and response: the socket timeout is the
         REMAINING time at each step, and a watchdog shuts the socket at the deadline (a hub trickling headers one byte at a time is cut)."""
         data = None if body is None else json.dumps(body).encode()
@@ -449,8 +461,11 @@ def http_transport(base, token):
         watchdog.daemon = True
         watchdog.start()
         try:
+            conn.connect()   # DNS + connect: bounded by the timeout above
+            if cancel is not None and cancel.is_set():   # the pass was cut while we waited: nothing is sent (a GET result is discarded, a POST is not made)
+                raise PassCut("relay pass cut")
             conn.request("POST" if data is not None else "GET", (parts.path or "") + path, body=data,
-                         headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})   # connect happens here: bounded by the timeout above
+                         headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
             if conn.sock is not None:
                 conn.sock.settimeout(max(0.05, end - time.monotonic()))
             resp = conn.getresponse()
