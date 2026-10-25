@@ -86303,6 +86303,58 @@ class FakePullFiles:
         return len([c for c in self.calls if c.endswith("&page=%d" % page)])
 
 
+class TestEveryReaderOfAPullRequestsFileList(unittest.TestCase):
+    """#967 S12: the readers of a pull request's file list are DERIVED from the source and compared with the docs table."""
+
+    FILES = ["bin/fleet-switchboard", "bin/impact_hold.py", "bin/delegated_clear.py", "bin/clear_carry.py"]
+    PAT = re.compile(r"pulls/[^\"']*/files|--json.*\bfiles\b")
+    FIELDS = re.compile(r"[A-Za-z,]*\bfiles\b[A-Za-z,]*")
+
+    @classmethod
+    def derive(cls, sources):
+        found = set()
+        for name, text in sources.items():
+            def walk(node, stack):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    stack = stack + [node.name]
+                if isinstance(node, ast.Constant) and isinstance(node.value, str) and stack and len(node.value) < 200:
+                    v = node.value
+                    if ("/" in v and cls.PAT.search(v)) or ("," in v and cls.FIELDS.fullmatch(v)):
+                        found.add((name, stack[0]))
+                for child in ast.iter_child_nodes(node):
+                    walk(child, stack)
+            walk(ast.parse(text), [])
+        return found
+
+    @classmethod
+    def sources(cls):
+        names = cls.FILES + sorted(str(p.relative_to(BIN.parent)) for p in (BIN / "switchboard").glob("*.py"))
+        return {n: (BIN.parent / n).read_text() for n in names}
+
+    @staticmethod
+    def table():
+        doc = (BIN.parent / "docs" / "switchboard.md").read_text()
+        block = doc.split("**Every reader of a pull request's file list (#967)**", 1)[1].split("**Every branch", 1)[0]
+        return {(m.group(2), m.group(1)) for m in re.finditer(r"^\| `([^`]+)` \| `([^`]+)` \|", block, re.M)}
+
+    def check(self, sources):
+        derived, table = self.derive(sources), self.table()
+        self.assertEqual(sorted(derived - table), [], "a reader of the file list is not in the docs table")
+        self.assertEqual(sorted(table - derived), [], "a table row names no reader")
+
+    def test_967_every_reader_of_a_pull_requests_file_list_is_in_the_table(self):
+        sources = self.sources()
+        derived = self.derive(sources)
+        for func in ("read_pr_files", "pr_floor_report", "own_change", "_review_pr"):
+            self.assertIn(func, {f for _, f in derived})
+        self.check(sources)
+        # mutant: a spliced NEW reader of pulls/N/files must fail the check
+        mutant = dict(sources)
+        mutant["bin/fleet-switchboard"] += '\n\ndef spliced_new_reader(get, repo, n):\n    return get("repos/%s/pulls/%d/files" % (repo, n))\n'
+        with self.assertRaises(AssertionError):
+            self.check(mutant)
+
+
 class TestPullFileListRead(LedgerBase):
     """#967: a pull request's changed files are read in full or refused with ONE named reason; a failed read is never called a cut list. The REAL `delegated_clear_pr_checks`, `pr_floor_report` and
     `read_pr_files` over a fake GitHub that serves pages of 100, errors on a chosen page, stops at 3000 and says nothing it would not say."""

@@ -4970,6 +4970,16 @@ What each refusal means, and what to do:
 
 **Which errors are retried, and the reason's length (#967).** A read is tried twice only when the error is transient (`is_transient`): a 5xx, a timeout, a connection error, or an answer that is not JSON. A 403, a 404, a 422, a `gh` that cannot run and an answer over the size cap are asked ONCE. The HTTP status is the one `gh` printed on its own first line (the `status` of the error), never a number found in a body's text. The reason text of a failed read (`error_class`) is cut to 300 characters (`REASON_MAX`), saying how many were left out; the status and the class are kept in full. Bounds of the other lists: at most 3 file names in a refusal (`[:3]`), each a path GitHub itself bounds, then the one `AUDIT_LINE_MAX` cap.
 
+**Every reader of a pull request's file list (#967)** (a test DERIVES the readers from the source with `ast`, any function holding the string of `pulls/<n>/files`, or a `--json`/`read_pr_json` field list with `files`, and fails when one is missing here or a row names no reader):
+
+| Reader | File | Shared pager (`read_pr_files`) | Why not |
+|---|---|---|---|
+| `read_pr_files` | `bin/delegated_clear.py` | it is the shared pager | the pages, one retry, up to 3000 files |
+| `pr_floor_report` | `bin/fleet-switchboard` | uses it (the floor and the clear) | reads `gh pr view --json files` first, pages only when that list cannot vouch for itself |
+| `_review_pr` | `bin/fleet-switchboard` | no | the review command's hint reader of the first 100 files from `gh pr view`; it judges nothing and clears nothing |
+| `read_open_overlap` | `bin/fleet-switchboard` | no | `gh pr list --json files` for overlap warnings only; a cut list there only hides a warning |
+| `own_change` | `bin/clear_carry.py` | no | its own pager (`_get_list`) is fail-closed: a page that fails refuses the carry |
+
 **Every branch of the file-list read** (`read_pr_files`, `read_with_retry`, `error_class`; a test derives the branches from the code and fails when a row is missing):
 
 | Branch | Trigger | Retry | Refusal text | Test and mutant |
