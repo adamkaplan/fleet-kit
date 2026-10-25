@@ -15876,9 +15876,9 @@ class TestOneCharter(CharterRig, Base):
         # (CHECKED against the code below); set: asks only whether a number is a charter, never counts or names an owner
         ("bin/fleet-switchboard", "guard"): "registry: the charter set guard, on the registry lock's own read",
         ("bin/impact_hold.py", "_lane_of_issue"): "registry: the lane lookup", ("bin/lanes.py", "charter_orchestrators"): "registry: move's lookup",
-        ("bin/fleet-switchboard", "adoption_heir"): "registry: the heir of an orphan", ("bin/fleet-switchboard", "plan_wake_route"): "registry: the orchestrator a plan wakes",
+        ("bin/fleet-switchboard", "adoption_heir"): "registry: the heir of an orphan", ("bin/switchboard/plan_notice.py", "plan_wake_route"): "registry: the orchestrator a plan wakes",
         ("bin/fleet-switchboard", "asks_of_caller"): "registry: the asks an agent is accountable for", ("bin/fleet-switchboard", "register_item_tester"): "registry: the launching orchestrator's charter gates a registration",
-        ("bin/fleet-switchboard", "load_tick"): "registry: an orchestrator's charter in the load figures", ("bin/fleet-switchboard", "worker_charter"): "registry: a worker's boss's charter (the worker's own is its launch context)",
+        ("bin/switchboard/heavy_budget.py", "load_tick"): "registry: an orchestrator's charter in the load figures", ("bin/fleet-switchboard", "worker_charter"): "registry: a worker's boss's charter (the worker's own is its launch context)",
         ("bin/fleet-switchboard", "charter_or_first_seen"): "registry: the row's charter, else the launch value of an agent with no row yet",
         ("bin/fleet-switchboard", "registry_retired_owners"): "registry: the charter a retired orchestrator's record kept",
         ("bin/registry.py", "orchestrator_charters"): "registry: the one reading", ("bin/registry.py", "duplicate_charters"): "registry: duplicates", ("bin/registry.py", "set_charter"): "writer: the audited setter",
