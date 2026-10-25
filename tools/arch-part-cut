@@ -20,7 +20,7 @@ import sys
 import tempfile
 
 
-NAME_RE = re.compile(r"^[a-z0-9_]+$")
+NAME_RE = re.compile(r"^[a-z_][a-z0-9_]*$")   # importable: no leading digit
 
 
 def refuse(message):
@@ -47,6 +47,11 @@ def main(argv=None):
     if not os.path.isdir(parts_dir):
         refuse("the parts directory %s does not exist" % args.parts_dir)
     manifest_dir = os.path.dirname(os.path.realpath(args.manifest))
+    if os.path.islink(args.parts_dir.rstrip("/") or "/"):
+        refuse("the parts directory %s is a symlink" % args.parts_dir)
+    if os.path.commonpath([parts_dir, manifest_dir]) != manifest_dir:
+        refuse("the parts directory %s is not under the manifest's directory" % args.parts_dir)
+    on_disk = {entry.lower() for entry in os.listdir(parts_dir)}
     listed = {line.strip() for line in manifest_text.splitlines() if line.strip() and not line.lstrip().startswith("#")}
     cuts, seen, claimed = [], set(), set()
     for spec in args.cuts:
@@ -55,7 +60,7 @@ def main(argv=None):
             refuse("%r is not NAME:FIRST:LAST" % spec)
         name = fields[0]
         if not NAME_RE.fullmatch(name):   # fullmatch: `$` would let a trailing newline through
-            refuse("part name %r: a name is lower-case letters, digits and underscores only (no path)" % name)
+            refuse("part name %r: a name is lower-case letters, digits and underscores only, not starting with a digit (no path)" % name)
         if name in seen:
             refuse("a part name is given twice: %s" % name)
         seen.add(name)
@@ -69,7 +74,7 @@ def main(argv=None):
         if os.path.dirname(os.path.realpath(target)) != parts_dir:
             refuse("%s: the part would be written outside %s" % (name, args.parts_dir))
         entry_name = os.path.relpath(target, manifest_dir).replace(os.sep, "/")
-        if entry_name in listed or os.path.lexists(target):
+        if entry_name in listed or os.path.lexists(target) or (name + ".py").lower() in on_disk:
             refuse("%s: a part of that name already exists (%s%s): a cut never overwrites a part" % (name, entry_name, ", listed in the manifest" if entry_name in listed else ""))
         while lines[last - 1].strip() == "" and last > first:
             last -= 1

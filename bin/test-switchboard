@@ -90758,6 +90758,7 @@ class TestArchTools(unittest.TestCase):
         (root / "entry").write_text("def one():\n    return 1\n\n\ndef two():\n    return 2\n")
         (root / "entry.parts").write_text("# parts\nentry\nswitchboard/taken.py\n")
         (root / "switchboard" / "taken.py").write_text("KEEP = 1\n")
+        (root / "switchboard" / "Mixed.py").write_text("MIXED = 1\n")   # differs from a new name only in case
         (root / "switchboard" / "exists.py").write_text("EXISTS = 1\n")   # on disk, not in the manifest
         return root, ["--entry", root / "entry", "--manifest", root / "entry.parts", "--parts-dir", root / "switchboard", "--write"]
 
@@ -90771,6 +90772,9 @@ class TestArchTools(unittest.TestCase):
             ("a capital", ["Part:1:2"], "lower-case letters"),
             ("a name that ends in a newline", ["fresh\n:1:2"], "lower-case letters"),
             ("a name that is only a newline", ["\n:1:2"], "lower-case letters"),
+            ("a name with a leading digit", ["1fresh:1:2"], "lower-case letters"),
+            ("a lookalike name", ["fresh\u200b:1:2"], "lower-case letters"),
+            ("a name that matches an existing file but for case", ["mixed:1:2"], "already exists"),
             ("an existing file that is not listed", ["exists:1:2"], "already exists"),
             ("a listed part", ["taken:1:2"], "already exists"),
             ("a range outside the entry", ["fresh:1:99"], "not inside the entry"),
@@ -90789,6 +90793,23 @@ class TestArchTools(unittest.TestCase):
                 self.assertIn(word, done.stderr)
                 self.assertNotIn("Traceback", done.stderr)
                 self.assertEqual(self.snapshot(root), before, "no file changed, no file appeared: the entry, the manifest, the parts and the directory outside")
+
+    def test_a_symlinked_or_outside_parts_directory_is_refused_and_nothing_is_written(self):
+        root, common = self.cut_tree()
+        outside = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(outside), True)
+        (root / "link").symlink_to(outside)
+        before, outside_before = self.snapshot(root), self.snapshot(outside)
+        for label, parts in (("a symlinked directory", root / "link"), ("a directory outside the manifest's", outside)):
+            with self.subTest(case=label):
+                args = [a for a in common]
+                args[args.index("--parts-dir") + 1] = parts
+                done = self.tool("arch-part-cut", *args, "fresh:1:2")
+                self.assertNotEqual(done.returncode, 0, done.stdout)
+                self.assertIn("nothing written", done.stderr)
+                self.assertNotIn("Traceback", done.stderr)
+                self.assertEqual(self.snapshot(root), before)
+                self.assertEqual(self.snapshot(outside), outside_before)
 
     def test_a_cut_that_would_leave_a_decorator_behind_is_refused_and_one_that_takes_it_is_not(self):
         root = Path(tempfile.mkdtemp())
