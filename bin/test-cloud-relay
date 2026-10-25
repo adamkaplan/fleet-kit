@@ -261,7 +261,18 @@ class FakeDaemon(DaemonBase):
         return record
 
 
-HUB_MUTANTS = ("body_name",)
+HUB_MUTANTS = ("body_name", "real_hub_pod_of", "real_hub_caller")   # the last two mutate the REAL hub source (cloud_relay.pod_of, cloud_hub._caller)
+
+
+def mutated_hub_module(old, new):
+    """cloud_hub's real source with ONE replacement, as a fresh module."""
+    import types
+    src = (BIN / "cloud_hub.py").read_text()
+    assert src.count(old) == 1, old
+    mod = types.ModuleType("cloud_hub_mut")
+    mod.__file__ = str(BIN / "cloud_hub.py")
+    exec(compile(src.replace(old, new), mod.__file__, "exec"), mod.__dict__)
+    return mod
 
 
 class Harness:
@@ -275,20 +286,26 @@ class Harness:
                       "issue": i, "repo": REPO if n != "coder2" else REPO} for n, i in ISSUES.items()}
         (t / "agents.json").write_text(json.dumps(agents))
         self.hub_lines, self.port, self.server, self.mutations = [], 0, None, set(mutations)
+        self.hub = cloud_hub
+        self.real_pod_of = cloud_relay.pod_of
+        if "real_hub_pod_of" in self.mutations:   # the real pod_of names every authenticated pod "reviewer"
+            cloud_relay.pod_of = lambda reviewer, token, namespace: "reviewer" if self.real_pod_of(reviewer, token, namespace) == "coder" else self.real_pod_of(reviewer, token, namespace)
+        if "real_hub_caller" in self.mutations:   # the real _caller hands back another pod's name
+            self.hub = mutated_hub_module("            return name\n\n        def _deny", "            return 'reviewer' if name == 'coder' else name\n\n        def _deny")
         self.start_hub()
         kind = FakeDaemon if set(mutations) & set(FakeDaemon.MUTANTS) else RealDaemon   # the fake only where a mutant needs it
         self.daemon = kind(t / "state", lambda: self.port, mutations).start()
 
     def start_hub(self):
         """The one place that builds the real hub. Keeps the port across a restart (state lives in the daemon, not the hub)."""
-        reviewer = cloud_hub.make_secrets_reviewer(str(self.t / "secrets.json"), "fleet-agents")
+        reviewer = self.hub.make_secrets_reviewer(str(self.t / "secrets.json"), "fleet-agents")
         inbox = cloud_hub.Inbox(str(self.t / "agents.json"), timeout=2)
         agents_path = str(self.t / "agents.json")
         relay = cloud_relay.Relay(lambda: cloud_hub._read_json(agents_path, {}), wait=20)
         if "body_name" in self.mutations:   # mutant of the hub: the name claimed in the body overrides the secret's pod
             real_submit = relay.submit
             relay.submit = lambda pod, body: real_submit(body.get("by") if isinstance(body, dict) and isinstance(body.get("by"), str) else pod, body)
-        self.server = cloud_hub.make_hub(("127.0.0.1", self.port), reviewer, inbox, self.hub_lines.append, str(self.t / "decisions.json"),
+        self.server = self.hub.make_hub(("127.0.0.1", self.port), reviewer, inbox, self.hub_lines.append, str(self.t / "decisions.json"),
                                          relay=relay, daemon=DAEMON, namespace="fleet-agents")
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -299,6 +316,7 @@ class Harness:
         self.start_hub()
 
     def close(self):
+        cloud_relay.pod_of = self.real_pod_of
         self.daemon.close()
         self.server.shutdown()
         self.server.server_close()
@@ -675,7 +693,7 @@ def _leaks_token(h):
 
 
 SCENARIOS = {"writes_on_refusal": _writes_on_refusal, "skip_author": _skip_author, "role_from_request": _role_from_request,
-             "body_name": _body_name, "global_callids": _global_callids, "stamp_live_head": _stamp_live_head,
+             "body_name": _body_name, "real_hub_pod_of": _body_name, "real_hub_caller": _body_name, "global_callids": _global_callids, "stamp_live_head": _stamp_live_head,
              "gates_write": _gates_write, "no_holder": _no_holder, "pr_issue": _pr_issue,
              "echo_token": _leaks_token, "log_auth": _leaks_token}
 

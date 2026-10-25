@@ -298,6 +298,25 @@ class Case(Fixture):
         self.assertEqual(relay.pass_once(self.ex, self.hub.fetch, self.hub.post), 1)
         self.assertEqual(self.hub.results[rid]["status"], 200)
 
+    def test_verdict_rechecks_the_roles_inside_the_append(self):
+        """The tester becomes a writer (records a proof) between the first role check and the append: the in-build re-check refuses."""
+        self.proved()
+        real, calls = self.backend.evaluators, []
+
+        def racing(name):
+            calls.append(name)
+            if len(calls) == 1:   # right after the first (pre-lock) check passed, the tester's own proof lands on the chain
+                proof = {k: v for k, v in self.entries()[0].items() if k not in ("seq", "ts", "prev", "hash")}
+                plan_ledger.append_checked(self.state, 1000, lambda entries, seq: dict(proof, by=TESTER, call_id="race"))
+            return real(name)
+        self.backend.evaluators = racing
+        before = len(self.entries())
+        got = self.run_one(TESTER, "verdict", cid="RC", **VERDICT)
+        self.assertEqual(got["status"], 403, got)
+        self.assertIn("author cannot record a verdict on its own work", got["reason"])
+        self.assertEqual(len(self.entries()), before + 1)   # only the racing proof; no verdict
+        self.assertEqual([e["kind"] for e in self.entries()], ["proof", "proof"])
+
     # ---- finding 2: index file
     def test_index_is_pruned_and_uses_unique_tmp_names(self):
         old = relay.INDEX_MAX
@@ -545,6 +564,20 @@ class RealRuleMutants(unittest.TestCase):
     def test_mutant_replay_in_build_ignores_args(self):
         self.patch(plan_ledger, "clip", lambda text, *a: "ran it")   # the replay's evidence comparison collapses
         self.caught("test_replay_with_different_args_after_the_index_is_gone_is_409")
+
+    def test_mutant_in_build_verdict_recheck_removed(self):
+        """The REAL source with the re-check's refusal removed (not a monkeypatch of a helper)."""
+        mod = load_backend_module("                if not ok2:\n                    raise Refuse(403, \"refused: %s\" % why2)\n", "                pass\n")
+        case = Case("test_verdict_rechecks_the_roles_inside_the_append")
+        case.setUp()
+        case.fresh = lambda: mod.Executor(case.state, case.backend, lambda: 1000)
+        case.ex = case.fresh()
+        try:
+            with self.assertRaises(AssertionError):
+                case.test_verdict_rechecks_the_roles_inside_the_append()
+        finally:
+            case.doCleanups()
+            case.tmp.cleanup()
 
     def test_mutant_call_id_global_not_per_pod(self):
         key = lambda pod: "any" if "\n" not in pod else pod
