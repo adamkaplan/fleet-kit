@@ -1301,7 +1301,7 @@ class Kube:
             shutil.rmtree(self.dir, ignore_errors=True)
             self.dir = None
 
-    def run(self, args, stdin=None, ok_missing=False, keep_stdout=False, timeout=120):
+    def run(self, args, stdin=None, ok_missing=False, keep_stdout=False, timeout=120, missing_what=None):
         if not self.context:  # never fall back to the active context
             raise CloudError("CW_KUBE_CONTEXT is not set; refusing to run kubectl against an unnamed context", EXIT_USAGE)
         cmd = [self.bin] + (["--kubeconfig", self.kubeconfig] if self.kubeconfig else []) + \
@@ -1313,7 +1313,7 @@ class Kube:
         if p.returncode != 0:
             if keep_stdout and p.stdout.strip():
                 return p.stdout  # the caller reads the failure from the tool's own JSON
-            if ok_missing and "NotFound" in p.stderr:
+            if ok_missing and "NotFound" in p.stderr and (missing_what is None or (missing_what in p.stderr and " not found" in p.stderr)):
                 return None
             last = (self.scrub(p.stderr, limit=SCRUB_OUTPUT_MAX).strip().splitlines() or ["failed"])[-1]
             raise CloudError("kubectl %s: %s" % (args[0], self.scrub(last)))
@@ -1339,7 +1339,7 @@ class Kube:
         return json.loads(out) if out else None
 
     def get_pod(self, name):
-        out = self.run(["get", "pod", name, "-o", "json"], ok_missing=True)
+        out = self.run(["get", "pod", name, "-o", "json"], ok_missing=True, missing_what='pods "%s"' % name)
         return json.loads(out) if out else None
 
     def list_pods(self):
@@ -2071,8 +2071,13 @@ class Launcher:
                 if nonce:   # no pod: this run's own Secrets (carrying the nonce) may remain from a cut-off create; another's are left whole
                     self._remove(name, nonce)
                 # The pod read said NotFound (an operator deleted it); any other read error raised in _need above and never reaches here.
-                # By name nothing else is touched: a pinned test (test_cloud_stop_nonce) keeps a by-name stop of a gone pod from deleting Secrets.
-                return {"worker": worker, "runtime_id": "", "pushed": False, "wip_branch": None, "pod_gone": True}
+                removed = []
+                if not nonce:   # by name, pod NotFound: only this worker's own two Secrets (exact names) may be left over; nothing else is touched
+                    for full, fn in ((name + "-pw", self.kube.delete_secret), (name + "-run", self.kube.delete_run_secret)):
+                        if self.kube.get_secret(full):
+                            fn(name)
+                            removed.append(full)
+                return {"worker": worker, "runtime_id": "", "pushed": False, "wip_branch": None, "pod_gone": True, "secrets_removed": removed}
             info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
             if not getattr(a, "no_record", False):   # BEFORE the hook and the delete; never raises, never holds the stop back
                 where = self.recorder.record(worker, name, reason or "stop", repo=_pod_repo(pod), started=ann(pod, "started") or "",

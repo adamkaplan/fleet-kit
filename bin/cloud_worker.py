@@ -1817,12 +1817,16 @@ def cmd_retire(args, runner, now, record):
     # The run record (slice 3, #638) is written by the launcher's stop; no call is needed here when it lands: this is its hook point (after the
     # end hook, before the endpoint record goes).
     _registry_note(engine, "retire", state, args.name, reason)
-    remove_record(state, args.name)
     wip, pushed = (body or {}).get("wip_branch"), (body or {}).get("pushed")
     if isinstance(body, dict) and body.get("pod_gone") is True:   # only the launcher's explicit reply: an unreadable pod never says it
-        _audit(engine, "cloud.name_freed", args.name, {"why": "pod gone", "runtime_id": record.get("runtime_id")})
-        print("%s is retired: its pod was already gone; the name is free to launch again" % args.name)
+        got = body.get("secrets_removed")
+        got = [x for x in got if isinstance(x, str)][:10] if isinstance(got, list) else []
+        _audit(engine, "cloud.name_freed", args.name, {"why": "pod gone", "runtime_id": record.get("runtime_id"), "secrets_removed": got})
+        remove_record(state, args.name)
+        print("%s is retired: its pod was already gone; the name is free to launch again; %s" % (
+            args.name, "Secrets removed: " + ", ".join(got) if got else "no Secrets were left"))
         return H["EXIT_OK"]
+    remove_record(state, args.name)
     print("%s is retired: its pod and scratch volume are deleted%s" % (
         args.name, "; work was pushed to branch %s" % wip if pushed and wip else "; nothing needed pushing" if pushed is False else ""))
     return H["EXIT_OK"]
