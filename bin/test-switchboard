@@ -45111,7 +45111,9 @@ class TestDecisionsFromGitHub(Base):
         issue["labels"] = []
         self.gh.send("issues", {"action": "unlabeled", "issue": dict(issue), "label": {"name": DECISION_LABEL}})
         self.assertEqual(self.derive()[0], [])
-        self.assertEqual(len(self.gh.api_calls), calls)
+        added = self.gh.api_calls[calls:]
+        self.assertEqual([p for p in added if "/comments" not in p], [])   # #1094: only the plan kind's one cached read of the issue's comments
+        self.assertLessEqual(len(added), 1)
 
     def test_the_catch_up_read_asks_for_open_issues_only(self):
         self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
@@ -45632,8 +45634,8 @@ class TestDecisionsPlugin(Base):
         self.assertEqual(view["rows"], [])
         (group,) = view["groups"]  # these two carry no repo: one group
         first, second = group["entries"]
-        self.assertEqual((first["head"], first["lines"]), ("#2ab 12m", ["Close #2? and a second deploy run?"]))
-        self.assertEqual(second["head"], "platform-481 45s")
+        self.assertEqual((first["head"], first["lines"]), ("❔ #2ab 12m", ["Close #2? and a second deploy run?"]))
+        self.assertEqual(second["head"], "❔ platform-481 45s")
         self.assertEqual(len(second["lines"]), 2)  # at most two lines, whatever the title
         self.assertTrue(second["lines"][-1].endswith("\u2026"))
         self.assertTrue("".join(second["lines"]).replace(" ", "").startswith("permission:shellxxxx"))
@@ -45651,7 +45653,7 @@ class TestDecisionsPlugin(Base):
         start = lines.index("Cleanup of stale issues (2 rows)")
         self.assertEqual(lines[start:start + 5], ["Cleanup of stale issues (2 rows)", "web#7: close it",
                                                   "web#9: close as duplicate of web#7", "and also label the other issue",
-                                                  "api#101 2h"])
+                                                  "❔ api#101 2h"])
         self.assertTrue(all(len(line) <= 34 for line in lines))
 
     def test_wrapping_keeps_every_word_and_breaks_an_over_long_word_hard(self):
@@ -45675,11 +45677,11 @@ class TestDecisionsPlugin(Base):
         self.assertEqual(lines[0], "Decisions (3) for you")
         heavy = "\u2501" * 34
         self.assertEqual(lines.count(heavy), 2)  # above the section and between the repos
-        self.assertEqual(lines[1:7], [heavy, "Waits on you (3)", "acme/api", "api only", "api#1 3m", heavy])
+        self.assertEqual(lines[1:7], [heavy, "Waits on you (3)", "acme/api", "api only", "❔ api#1 3m", heavy])
         self.assertEqual(lines[7:9], ["acme/web", "older web"])
         self.assertEqual(lines[9], "q" * 33 + "\u2026")  # two lines, then an ellipsis
-        self.assertEqual(lines[10:13], ["web#2 50m", "\u2504" * 34, "newer web"])  # a thin rule between entries
-        self.assertEqual(lines[13], "web#9 5m")
+        self.assertEqual(lines[10:13], ["❔ web#2 50m", "\u2504" * 34, "newer web"])  # a thin rule between entries
+        self.assertEqual(lines[13], "❔ web#9 5m")
 
     def test_a_file_older_than_the_stale_bound_is_not_current_and_says_so(self):
         self.assertEqual((self.r["staleStatus"], self.r["edge"]), ("stale", "ok"))
@@ -45694,7 +45696,7 @@ class TestDecisionsPlugin(Base):
     def test_unreadable_sources_are_said_and_junk_entries_are_skipped(self):
         self.assertEqual(self.r["errorsView"]["rows"][-1]["text"], "1 source(s) unreadable")
         (group,) = self.r["junkView"]["groups"]
-        self.assertEqual([(e["head"], e["lines"]) for e in group["entries"]], [("#1 ?", ["fine"])])
+        self.assertEqual([(e["head"], e["lines"]) for e in group["entries"]], [("❔ #1 ?", ["fine"])])
 
     def test_ages_read_the_same_as_the_command_prints_them(self):
         self.assertEqual(self.r["ages"], ["0s", "59s", "1m", "11m", "59m", "1h", "1h05m", "2h", "23h59m", "1d", "3d", "0s"])
@@ -47864,8 +47866,8 @@ console.log(JSON.stringify([entryOf(d, now), entryOf({ ...d, id: "api#2", repo: 
         done = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 0, done.stderr)
         long_e, short_e = json.loads(done.stdout.strip().splitlines()[-1])
-        self.assertEqual(long_e["head"], "acme/site#2ab 1m")
-        self.assertEqual(short_e["head"], "api#2 1m")
+        self.assertEqual(long_e["head"], "❔ acme/site#2ab 1m")
+        self.assertEqual(short_e["head"], "❔ api#2 1m")
         self.assertEqual(len(long_e["lines"]), 2)  # two lines at most, the second ending in an ellipsis
         self.assertTrue(long_e["lines"][1].endswith("\u2026"))
         self.assertTrue(all(len(x) <= 34 for x in long_e["lines"]))
@@ -55054,6 +55056,7 @@ class TestBatchEntry(BatchWorld):
         self.gh.calls.clear()
         self.entry("api#101")
         reads = [c[2] for c in self.gh.calls]
+        reads = [r for r in reads if "/comments" not in r]   # #1094: the plan kind reads an issue's comments (cached), counted in TestPlanKind
         self.assertTrue(all("/issues?labels=" in r for r in reads), reads)
         self.assertEqual(len(reads), 4, "two reads (one per label) of each of the two repos, as before")
 
@@ -55124,8 +55127,11 @@ class TestBatchAnswer(BatchWorld):
         self.assertEqual(self.gh.names(API, 3), ["bug"])
         self.assertEqual([c for c in self.gh.comments if (c["repo"], c["issue"]) != self.batch], [])
         for call in self.gh.calls:  # the daemon's listing reads aside, nothing names an issue but the batch
-            if "/issues?" not in call[2]:
-                self.assertRegex(call[2], r"^repos/acme/api/issues/101/", "a call that is not about the batch: %r" % call)
+            if "/issues?" in call[2]:
+                continue
+            if re.fullmatch(r"repos/acme/api/issues/\d+/comments\?per_page=100", call[2]) and "--method" not in call:
+                continue  # the plan-kind READ (#1094): a GET of a row issue's comments is a read, never a touch
+            self.assertRegex(call[2], r"^repos/acme/api/issues/101/", "a call that is not about the batch: %r" % call)
 
     def test_as_recommended_posts_one_comment_with_every_row_and_takes_both_labels_off(self):
         code, out, err = self.answer("--as-recommended")
@@ -56174,14 +56180,14 @@ class TestDecisionsPanelLayout(Base):
 
     def test_an_entry_is_its_headline_in_two_lines_at_most_then_id_and_age(self):
         entry = self.r["entry"]
-        self.assertEqual(entry["head"], "api#2 1h30m")
+        self.assertEqual(entry["head"], "❔ api#2 1h30m")
         self.assertEqual(len(entry["lines"]), 2)
         self.assertTrue(entry["lines"][1].endswith("\u2026"))
         self.assertNotIn("RAW", " ".join(entry["lines"]))  # the headline, not the raw title
         self.assertEqual(self.r["noHeadline"]["lines"], ["only a title"])  # an older daemon's file: the title
 
     def test_a_folded_report_names_its_agent_on_the_id_line(self):
-        self.assertEqual(self.r["via"], "web#7 10m coder")
+        self.assertEqual(self.r["via"], "❔ web#7 10m coder")
 
     def test_entries_are_separated_thinly_and_repos_and_sections_heavily(self):
         lines = self.r["lines"]
@@ -56189,8 +56195,8 @@ class TestDecisionsPanelLayout(Base):
         self.assertEqual(lines[:3], ["Decisions (6) all", heavy, "Waits on you (4)"])
         self.assertEqual(lines.count(thin), 1)  # only the two web entries of the first section share a repo
         at = lines.index(thin)
-        self.assertEqual(lines[at - 2:at + 3], ["web for you", "web#7 10m coder", thin, "second for you", "web#8 5m"])
-        self.assertEqual(lines.index("Waits on cos (1, 0 over 1h)") - 1, lines.index(heavy, lines.index("web#8 5m")))
+        self.assertEqual(lines[at - 2:at + 3], ["web for you", "❔ web#7 10m coder", thin, "second for you", "❔ web#8 5m"])
+        self.assertEqual(lines.index("Waits on cos (1, 0 over 1h)") - 1, lines.index(heavy, lines.index("❔ web#8 5m")))
         self.assertTrue(all(len(x) <= 34 for x in lines))
 
     def test_the_tui_draws_the_sections_and_the_rules(self):
@@ -58051,11 +58057,11 @@ class TestHeadsUpPanelLayout(Base):
         e = self.r["entries"]["pr:web#9"]
         self.assertEqual(e["lines"], ["web#9 Add the retry budget to the", "client"])
         self.assertEqual(e["facts"], ["+120/-14, 5 files, CI failing, no", "review"])
-        self.assertEqual(e["head"], "pr:web#9 12m")
+        self.assertEqual(e["head"], "🔀 pr:web#9 12m")
         lines = self.r["humanLines"]
-        at = lines.index("pr:web#9 12m")
+        at = lines.index("🔀 pr:web#9 12m")
         self.assertEqual(lines[at - 4:at + 1], ["web#9 Add the retry budget to the", "client",
-                                               "+120/-14, 5 files, CI failing, no", "review", "pr:web#9 12m"])
+                                               "+120/-14, 5 files, CI failing, no", "review", "🔀 pr:web#9 12m"])
 
     def test_the_headline_is_cut_at_two_lines_and_a_hold_shows_when_it_merges_after_in_utc(self):
         e = self.r["entries"]["pr:api#12"]
@@ -59809,7 +59815,7 @@ class TestPanelCaptainRows(Base):
                 self.assertIn(self.PR, links)
                 self.assertIn("https://github.com/acme-org/widget-host/issues/41", links)
                 self.assertNotIn("https://github.com/acme-org/widget-host/issues/132", links)
-        self.assertEqual(self.r["entry"][1], ["widget-host#132 1d", self.PR])
+        self.assertEqual(self.r["entry"][1], ["🔀 widget-host#132 1d", self.PR])
 
     def test_the_id_is_the_short_ref_and_the_age_is_on_the_line(self):
         for mode in ("plain", "v3"):
@@ -59869,7 +59875,7 @@ r.ageSegs = [30, 3599, 86399, 86400].map((s) => lineWith([mk("web#1", "o/web", "
 r.ageLine = textOf(lineWith([mk("web#1", "o/web", "human", "x", 300)], human, (l) => l.id === "web#1"));
 // PR number coloured by state; the real id is kept on the line
 const prLine = (extra) => lineWith([pr(5, "o/a", 100, extra)], human, (l) => l.id);
-r.prState = [{ ci: "failing", review: "none" }, { ci: "green", review: "approved" }, { ci: "green", review: "none" }, { ci: "pending", review: "none" }].map((e) => prLine(e).segs.map((s) => [s[0].split(" ")[0], s[1]])[0]);
+r.prState = [{ ci: "failing", review: "none" }, { ci: "green", review: "approved" }, { ci: "green", review: "none" }, { ci: "pending", review: "none" }].map((e) => prLine(e).segs.map((s) => [s[0].split(" ")[0], s[1]])[1]);
 r.prId = [prLine({}).id, textOf(prLine({}))];
 // a decision that needs you: two lines, bold headline, id muted
 r.need = rows([mk("a#1", "o/a", "human", "Which database?", 600)], human).slice(-3).map((l) => [textOf(l), l.segs.map((s) => s[1])]);
@@ -59885,7 +59891,7 @@ r.plainFirst = d.viewLines(d.buildView(snap(mix), now, 34, chief)).slice(0, 3);
 // links and control characters
 const linked = rows([mk("web#1", "acme/web", "human", "Q?", 60, { ask: 12 }), pr(5, "acme/web", 60), mk("x#1", "bad repo", "human", "H", 60, { ask: 3 })], human);
 r.links = linked.filter((l) => l.url).map((l) => [textOf(l), l.url, !!l.id]);
-r.noLink = linked.filter((l) => !l.url).map((l) => textOf(l)).filter((t) => /bad repo|^H$/.test(t));
+r.noLink = linked.filter((l) => !l.url).map((l) => textOf(l)).filter((t) => /bad repo|^\u2754 H$/.test(t));
 const esc = rows([mk("e#1", "acme/e", "human", "bad\u001b]8;;http://x\u0007title", 60, { ask: 1, rows: [{ text: "r\u001b[31mow" }] })], human);
 r.ctrl = esc.map((l) => textOf(l)).filter((t) => /title|31m/.test(t));
 // iteration 3
@@ -59944,9 +59950,9 @@ class TestDecisionsStyledPanel(unittest.TestCase):
     def test_the_layout_in_the_chief_of_staffs_view(self):
         self.assertEqual(self.r["chief"], [
             "Decisions                      all", "2 need human \u00b7 3 PRs", "3 on cos (2 over 1h)", " ",
-            "Waits on you", "a", "Pick a cache", "a#2" + " " * 28 + "20m", " ", "Which database?", "a#1" + " " * 28 + "10m", " ",
-            "Heads-up", "a", "#6 Add a thing" + " " * 15 + "1h06m", "#5 Add a thing" + " " * 18 + "1m", " ",
-            "c", "#7 Add a thing" + " " * 18 + "1d", " ",
+            "Waits on you", "a", "❔ Pick a cache", "a#2" + " " * 28 + "20m", " ", "❔ Which database?", "a#1" + " " * 28 + "10m", " ",
+            "Heads-up", "a", "🔀 #6 Add a thing" + " " * 12 + "1h06m", "🔀 #5 Add a thing" + " " * 15 + "1m", " ",
+            "c", "🔀 #7 Add a thing" + " " * 15 + "1d", " ",
             "Waits on cos", "b" + " " * 20 + "3 \u00b7 oldest 1d"])
 
     def test_a_humans_view_has_no_cos_section_only_a_count(self):
@@ -59956,7 +59962,7 @@ class TestDecisionsStyledPanel(unittest.TestCase):
     def test_nothing_empty_is_drawn_and_no_rule(self):
         self.assertEqual(self.r["none"], ["Decisions                  for you", "0 need you", " ", "nothing waiting"])
         self.assertEqual(self.r["onlyCos"][1:], ["1 with cos", " ", "nothing waiting"])
-        self.assertEqual(self.r["onlyPr"][-3:], ["Heads-up", "a", "#5 Add a thing" + " " * 18 + "1m"])
+        self.assertEqual(self.r["onlyPr"][-3:], ["Heads-up", "a", "🔀 #5 Add a thing" + " " * 15 + "1m"])
         for name in ("chief", "human", "none", "onlyPr"):
             for line in self.r[name]:
                 self.assertFalse(set(line) & set("\u2501\u2504"), line)
@@ -59973,12 +59979,13 @@ class TestDecisionsStyledPanel(unittest.TestCase):
         self.assertEqual(self.r["prId"][0], "pr:o/a#5")
 
     def test_what_needs_you_is_two_lines_bold_headline_and_a_quiet_id(self):
-        self.assertEqual(self.r["need"], [["a", ["b"]], ["Which database?", ["b"]], ["a#1|10m", ["m"]]])
+        self.assertEqual(self.r["need"], [["a", ["b"]], ["❔ Which database?", ["", "b"]], ["a#1|10m", ["m"]]])
 
     def test_a_repo_name_is_shortened_only_when_unambiguous(self):
         self.assertIn("acme/web", self.r["clash"])
         self.assertIn("other/web", self.r["clash"])
-        self.assertIn("see #9 and other/web#4 and web#3", self.r["clash"])
+        self.assertIn("❔ see #9 and other/web#4 and", self.r["clash"])
+        self.assertIn("web#3", self.r["clash"])
         self.assertEqual(self.r["tidy"], ["fix web#9, #4.", "web", "true"])
 
     def test_the_states_the_plain_view_has(self):
@@ -59994,11 +60001,11 @@ class TestDecisionsStyledPanel(unittest.TestCase):
         self.assertEqual(self.r["plainFirst"][0], "Decisions (5) all")
 
     def test_every_line_of_an_entry_carries_its_link_and_no_control_character_reaches_a_line(self):
-        self.assertEqual(self.r["links"], [["Q?", "https://github.com/acme/web/issues/12", False],
+        self.assertEqual(self.r["links"], [["❔ Q?", "https://github.com/acme/web/issues/12", False],
                                            ["web#1|1m", "https://github.com/acme/web/issues/12", True],
-                                           ["#5 Add a thing|1m", "https://github.com/acme/web/pull/5", True]])
-        self.assertEqual(self.r["noLink"], ["bad repo", "H"])
-        self.assertEqual(self.r["ctrl"], ["bad]8;;http://xtitle", "r[31mow"])
+                                           ["🔀 #5 Add a thing|1m", "https://github.com/acme/web/pull/5", True]])
+        self.assertEqual(self.r["noLink"], ["bad repo", "❔ H"])
+        self.assertEqual(self.r["ctrl"], ["❔ bad]8;;http://xtitle", "r[31mow"])
 
     def test_iteration_3_hues_are_stable_and_glyphs_are_one_cell(self):
         v3 = self.r["v3"]
@@ -60013,12 +60020,12 @@ class TestDecisionsStyledPanel(unittest.TestCase):
     def test_iteration_3_marks_kind_and_state_and_keeps_the_text(self):
         v3 = self.r["v3"]
         by = {t: (st, right) for t, st, right in v3["styles"]}
-        self.assertEqual(by["\u2717 #6 Add a thing" + " " * 0 + "|1h06m"][0][0], "e", "failing: a red glyph")
-        self.assertEqual(by["\u2713 #5 Add a thing|1m"][0][0], "s", "ready: a green glyph")
-        self.assertEqual(by["\u25c6 #7 Add a thing|1d"][0][0], "m", "other: a quiet glyph")
+        self.assertEqual(by["🔀 \u2717 #6 Add a thing|1h06m"][0][1], "e", "failing: a red glyph")
+        self.assertEqual(by["🔀 \u2713 #5 Add a thing|1m"][0][1], "s", "ready: a green glyph")
+        self.assertEqual(by["🔀 \u25c6 #7 Add a thing|1d"][0][1], "m", "other: a quiet glyph")
         for text, (styles, right) in by.items():
-            if text[:1] in "\u2717\u2713\u25c6":
-                self.assertTrue(styles[1].startswith("p"), "the PR number takes the project hue: " + text)
+            if text.startswith("🔀 "):
+                self.assertTrue(styles[2].startswith("p"), "the PR number takes the project hue: " + text)
             if right:
                 self.assertTrue(right[-1].endswith("t"), "the age is italic: " + text)
         self.assertEqual(v3["size"][-1], ["  +900/-100", ["", "a", "m", "r"]], "the size uses the diff colours")
@@ -64273,11 +64280,11 @@ class TestDecisionsPanelOrder(unittest.TestCase):
     def test_the_plain_view_draws_the_order_nested_with_next_and_waits_for(self):
         lines = self.r["plain"]
         at = {name: i for i, name in enumerate(lines)}
-        heads = [l for l in lines if l.strip().startswith("#")]
-        self.assertEqual([h.strip().split(" ")[0] for h in heads], ["#2", "#1", "#3"], "by order, not oldest first")
-        self.assertIn("#2 1d02h \u00b7 next".replace("1d02h", [h for h in heads if h.startswith("#2")][0].split(" ")[1]), lines)
-        blocked = [h for h in heads if h.strip().startswith("#1")][0]
-        self.assertTrue(blocked.startswith("  #1 "), "indented under what it waits for")
+        heads = [l for l in lines if l.strip().startswith("❔ #")]
+        self.assertEqual([h.strip().split(" ")[1] for h in heads], ["#2", "#1", "#3"], "by order, not oldest first")
+        self.assertIn("❔ #2 1d02h \u00b7 next".replace("1d02h", [h for h in heads if h.startswith("❔ #2")][0].split(" ")[2]), lines)
+        blocked = [h for h in heads if h.strip().startswith("❔ #1")][0]
+        self.assertTrue(blocked.startswith("  ❔ #1 "), "indented under what it waits for")
         self.assertTrue(blocked.endswith("\u00b7 waits for #2"))
 
     def test_the_styled_panel_indents_the_blocked_item_and_marks_next_and_cycle(self):
@@ -64738,6 +64745,123 @@ class TestV2ReadVolume(Base):
         for key, value in (("v2_cache_seconds", -1), ("v2_reads_per_pass", "8"), ("v2_reads_per_minute", True)):
             with self.subTest(key=key), self.assertRaises(sb.ConfigError):
                 sb.validate_config({"opencode": FAKE_OPENCODE, key: value})
+
+
+class TestPlanKind(unittest.TestCase):
+    """#1094: GitHubHub.plan_kind: plan / noplan / unknown, one cached read per issue, no write."""
+
+    def hub(self, answers):
+        import types
+        calls, t = [], [0.0]
+
+        def gh_api(path, paginate=True, timeout=None, **kw):
+            calls.append(path)
+            a = answers(path) if callable(answers) else answers
+            if isinstance(a, Exception):
+                raise a
+            return [a]
+        hub = types.SimpleNamespace(lock=threading.RLock(), _cache={}, now=lambda: t[0], gh_api=gh_api,
+                                    config={"call_timeout_seconds": 5})
+        return hub, calls, t
+
+    def kind(self, hub, n=1):
+        return sb.GitHubHub.plan_kind(hub, "acme/api", n)
+
+    def test_the_three_kinds(self):
+        plan = [{"id": 1, "created_at": "2026-01-01", "body": "## Plan (scenarios)\n\nx"}]
+        self.assertEqual(self.kind(self.hub(plan)[0]), "plan")
+        self.assertEqual(self.kind(self.hub([{"id": 1, "body": "hello"}])[0]), "noplan")
+        self.assertEqual(self.kind(self.hub(sb.GitHubUnavailable("down"))[0]), "unknown")
+        self.assertEqual(self.kind(self.hub({"not": "a list"})[0]), "unknown")
+
+    def test_a_second_refresh_within_the_ttl_adds_no_read(self):
+        hub, calls, t = self.hub([])
+        for n in range(1, 6):
+            self.kind(hub, n)
+        self.assertEqual(len(calls), 5)
+        for n in range(1, 6):
+            self.kind(hub, n)
+        self.assertEqual(len(calls), 5, "no read of the second refresh")
+        t[0] += sb.GITHUB_LOOKUP_TTL + 1
+        self.kind(hub, 1)
+        self.assertEqual(len(calls), 6)
+        self.assertTrue(all(c.startswith("repos/") and "comments" in c for c in calls))
+
+    def test_a_full_page_never_reads_noplan_and_a_plan_on_it_is_unknown(self):
+        full = [{"id": i, "created_at": "2026-01-01", "body": "x"} for i in range(100)]
+        self.assertEqual(self.kind(self.hub(full)[0]), "unknown")
+        full[3]["body"] = "## Plan (scenarios)\n\nx"
+        self.assertEqual(self.kind(self.hub(full)[0]), "unknown")
+        self.assertEqual(self.kind(self.hub(full[:99])[0]), "plan")
+
+    def test_a_plan_in_the_body_reads_noplan(self):
+        body = "## Plan (scenarios)\n\nx"
+
+        def answers(path):
+            return {"body": body} if path.endswith("/issues/1") else [{"id": 1, "body": "hi"}]
+        hub, calls, t = self.hub(answers)
+        self.assertEqual(self.kind(hub), "noplan")   # the ask says a plan COMMENT; a plan-looking BODY does not count
+
+    def test_every_row_is_read_over_several_refreshes(self):
+        hub, calls, t = self.hub([])
+        hub.plan_kind = lambda r, n, b=None: sb.GitHubHub.plan_kind(hub, r, n, b)
+        records = [{"repo": "acme/api", "number": n} for n in range(60)]
+        for _ in range(7):
+            sb.GitHubHub.plan_kinds(hub, records, [sb.PLAN_KIND_READS_PER_REFRESH])
+        self.assertEqual(len(calls), 60)
+        kinds = sb.GitHubHub.plan_kinds(hub, records, [sb.PLAN_KIND_READS_PER_REFRESH])
+        self.assertEqual(set(kinds.values()), {"noplan"})
+
+    def test_never_read_rows_are_served_before_retries(self):
+        bad = set(range(11))
+
+        def answers(path):
+            n = int(path.split("/issues/")[1].split("/")[0])
+            return sb.GitHubUnavailable("x") if n in bad else []
+        hub, calls, t = self.hub(answers)
+        hub.plan_kind = lambda r, n, b=None: sb.GitHubHub.plan_kind(hub, r, n, b)
+        records = [{"repo": "acme/api", "number": n} for n in range(11)]
+        sb.GitHubHub.plan_kinds(hub, records, [10])
+        t[0] += sb.GITHUB_LOOKUP_RETRY + 1
+        records += [{"repo": "acme/api", "number": n} for n in range(100, 105)]
+        calls.clear()
+        kinds = sb.GitHubHub.plan_kinds(hub, records, [10])
+        for n in range(100, 105):
+            self.assertEqual(kinds[("acme/api", n)], "noplan")
+
+    def test_one_page_one_call_no_pagination(self):
+        hub, calls, t = self.hub([])
+        seen = []
+        orig = hub.gh_api
+        hub.gh_api = lambda path, paginate=True, **kw: (seen.append(paginate), orig(path, paginate=paginate, **kw))[1]
+        self.kind(hub)
+        self.assertEqual(seen, [False])
+        self.assertIn("per_page=100", calls[0])
+
+    def test_a_failed_read_is_retried_after_the_short_ttl_not_the_full_one(self):
+        for err in (sb.GitHubUnavailable("403"), sb.GitHubUnavailable("404"), TimeoutError("t")):
+            hub, calls, t = self.hub(err)
+            self.assertEqual(self.kind(hub), "unknown")
+            self.kind(hub)
+            self.assertEqual(len(calls), 1)
+            t[0] += sb.GITHUB_LOOKUP_RETRY + 1
+            self.kind(hub)
+            self.assertEqual(len(calls), 2, "retried after the short ttl")
+
+    def test_a_refresh_makes_at_most_the_cap_of_reads(self):
+        hub, calls, t = self.hub([])
+        budget = [sb.PLAN_KIND_READS_PER_REFRESH]
+        kinds = [sb.GitHubHub.plan_kind(hub, "acme/api", n, budget) for n in range(60)]
+        self.assertEqual(len(calls), sb.PLAN_KIND_READS_PER_REFRESH)
+        self.assertEqual(kinds.count("unknown"), 60 - sb.PLAN_KIND_READS_PER_REFRESH)
+        self.assertEqual(sb.PLAN_KIND_READS_PER_REFRESH, 10)
+
+    def test_the_cache_is_bounded(self):
+        hub, calls, t = self.hub([])
+        for n in range(sb.PLAN_KIND_CACHE_MAX + 50):
+            self.kind(hub, n)
+        self.assertLessEqual(len(hub._cache), sb.PLAN_KIND_CACHE_MAX)
+
 
 
 class TestWriteOnlyOnChange(Base):

@@ -7724,7 +7724,8 @@ def batch_body(name, rows):
 
 
 def decisions_from_github(engine, now):
-    """(items, problems): the open issues with your label, from the hub's picture. No `gh` call is made here."""
+    """(items, problems): the open issues with your label, from the hub's picture. The listing makes no `gh` call; each issue's plan kind
+    (#1094) is one cached read of its comments, at most PLAN_KIND_READS_PER_REFRESH new reads per call (the rest read "unknown" until the next refresh)."""
     if not decision_repos(engine):
         return [], []
     hub = engine.hub
@@ -7734,6 +7735,8 @@ def decisions_from_github(engine, now):
     records, problems = hub.awaiting_listing()
     agents = engine.discovery.agents if engine.discovery is not None else {}
     items = []
+    budget = [PLAN_KIND_READS_PER_REFRESH]
+    kinds = GitHubHub.plan_kinds(hub, records, budget)
     for record in records:
         numbers = [record["number"]] + ([record["parent"]] if record.get("parent") else [])
         items.append({"kind": "issue", "title": record["title"] or "issue #%d" % record["number"],
@@ -7742,7 +7745,8 @@ def decisions_from_github(engine, now):
                       "bare": True, "repo": record["repo"], "tier": record.get("tier") or "human",
                       "rows": record.get("rows") or [], "raised_by": record.get("raised_by"),
                       "parent": record.get("parent"), "closed": bool(record.get("closed")),
-                      "waits_for": record.get("waits_for") or []})
+                      "waits_for": record.get("waits_for") or [],
+                      "plan_kind": kinds[(record["repo"], record["number"])]})
     return items, problems
 
 
@@ -10539,6 +10543,8 @@ GITHUB_CONFLICT_RETRY = 1800   # seconds between attempts, and catch-up reads, w
 GITHUB_CATCHUP_DELAY = 10      # seconds after a start: the forwarder has connected, so no gap remains
 GITHUB_LOOKUP_TTL = 600
 GITHUB_LOOKUP_RETRY = 60
+PLAN_KIND_READS_PER_REFRESH = 10   # #1094: new plan-kind reads of one decisions refresh
+PLAN_KIND_CACHE_MAX = 512          # #1094: plan-kind entries kept (expired first, then the oldest)
 GITHUB_BODY_LIMIT = 5 * 1024 * 1024
 GITHUB_QUEUE_LIMIT = 2000
 GITHUB_ROUTE_SECONDS = 5       # per pass: the time routing may spend on `gh api` lookups; the rest waits a pass
@@ -11747,6 +11753,53 @@ class GitHubHub:
         with self.lock:
             self._cache[key] = (now + GITHUB_LOOKUP_TTL, data)
         return data
+
+    def plan_kinds(self, records, budget):
+        """{(repo, number): kind} for the records, spending `budget` on never-read issues FIRST and on retries (an expired entry, e.g. a
+        persistent failure) last, so retries cannot starve rows that were never read (#1094)."""
+        def seen(r):
+            with self.lock:
+                return ("plan-kind", plan_ledger.normal_repo(r["repo"]), r["number"]) in self._cache
+        out = {}
+        for r in sorted(records, key=seen):
+            out[(r["repo"], r["number"])] = self.plan_kind(r["repo"], r["number"], budget)
+        return out
+
+    def plan_kind(self, repo, number, budget=None):
+        """"plan", "noplan" or "unknown" for an issue: whether a comment of it is the plan comment (the reading `plan check` uses,
+        plan_check.select_plan_text; it does not check the author, the latest heading comment counts whoever wrote it; a plan in the
+        issue BODY reads "noplan": the ask says a plan COMMENT). One read of the first 100 comments, cached for GITHUB_LOOKUP_TTL; a failed
+        read is remembered for GITHUB_LOOKUP_RETRY and says "unknown". A full page (100) with no plan found reads "unknown" (the plan may
+        be past it), and a plan found on a full page reads "unknown" too (a later revised plan may supersede it). `budget` is a one-item
+        list, the new reads left of this refresh: spent, a miss reads "unknown" with no read and no cache entry."""
+        key = ("plan-kind", plan_ledger.normal_repo(repo), number)
+        now = self.now()
+        with self.lock:
+            cached = self._cache.get(key)
+            if cached and now < cached[0]:
+                return cached[1]
+        if budget is not None:
+            if budget[0] <= 0:
+                return "unknown"
+            budget[0] -= 1
+        kind = "unknown"
+        ttl = GITHUB_LOOKUP_RETRY
+        try:
+            pages = self.gh_api("repos/%s/issues/%d/comments?per_page=100" % (repo, number), paginate=False,
+                                timeout=min(self.config["call_timeout_seconds"], GITHUB_ROUTE_READ_TIMEOUT))
+            comments = pages[0] if pages and isinstance(pages[0], list) else None
+            if comments is not None and len(comments) < 100:
+                kind = "plan" if plan_check.select_plan_text("", comments)[1] != "issue body" else "noplan"
+                ttl = GITHUB_LOOKUP_TTL
+        except Exception:
+            pass
+        with self.lock:
+            self._cache[key] = (now + ttl, kind)
+            mine = [k for k in self._cache if k[0] == "plan-kind"]
+            if len(mine) > PLAN_KIND_CACHE_MAX:
+                for k in sorted(mine, key=lambda k: self._cache[k][0])[:len(mine) - PLAN_KIND_CACHE_MAX]:
+                    del self._cache[k]
+        return kind
 
     def open_issues_count(self, repo):
         """The repository's own count of open issues and pull requests (`open_issues_count` of `repos/<repo>`), one read; None when it cannot be told. Raises GitHubUnavailable."""
