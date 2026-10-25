@@ -11271,11 +11271,14 @@ SWEEP_PASS_SECONDS = 8        # no new read is started once the sweep has spent 
 SWEEP_LIST_PAGES = 2          # pages one list read follows (200 records); more is shown as capped
 SWEEP_PR_COMMENTS = 5         # the last comments of an item that are searched for the phrases
 SWEEP_FILE = "sweep.json"
+SWEEP_READY_FILE = "sweep-ready.json"   # #986: per held pull request, the head and the moment it first became ready for the owner's decision (S5 counts the wait from it)
+SWEEP_READY_READS = 10   # held pull requests whose gates one pass may read; the rest are counted as not checked and read first on the next pass
+SWEEP_READY_READ_COST = 7   # least calls of the shared pass budget one gate reading is charged: a ready reading makes at least 7 GETs (PR view 1, plan issue + 1 comments page 2, floor view 1 + narrowed agent reads, clear_who 3), a non-ready one at least 4; the calls a reading REALLY makes are counted (engine.reading_calls) and the excess over this is charged too
 SWEEP_ALARMED_FILE = "sweep-alarmed.json"   # #805: when each finding was last raised, so the re-alarm window survives a restart
 SWEEP_KINDS = {"S6a": "first-line marker without the merge-captain label (our PR)", "S6b": "merge label and first-line marker disagree",
                "S1a": "decision section without an awaiting label", "S1b": "awaiting label without a decision section",
                "S2": "held for the person but not marked as a captain PR (no merge-captain label)", "S3": "said to wait on the person, not in their tier",
-               "S5": "cos-tier decision aged (and not already in the owner's tier)",
+               "S5": "cos-tier decision aged (and not already in the owner's tier); a held pull request only once it is ready for the owner's decision and has waited since then",
                "S7": "decisions that wait for each other (a cycle): none of them can be done first",
                "S8": "a decision waits for an issue that is closed or missing",
                "S9": "a merge or hold label left on a closed, unmerged PR",
@@ -11453,6 +11456,15 @@ class SweepState:
         self.current = {}        # the last run's counts
         self.strong = sweep_strong_re(SWEEP_DEFAULTS["person_names"])
         self.started = 0         # when this pass's sweep began (the time budget)
+        self.ready = {}          # "repo#n" -> {"head", "at"}: the first moment the pull request was ready at that head (#986)
+        self.ready_loaded = False
+        self.ready_read = {}     # "repo#n" -> the order of its last gate reading (the least recently read goes first)
+        self.read_seq = 0
+        self.s5 = {}             # decision id -> (head, ready time, who clears) for each held pull request that has waited past the threshold
+        self.not_checked_since = {}   # "repo#n" -> when it was first not checked (unreadable or skipped), until it is read
+        self.s5_oldest = 0       # seconds the longest not-checked held pull request has gone unread
+        self.s5_unchecked = 0    # held pull requests whose gates could not be read this pass: never raised (#986)
+        self.details = {}        # (kind, ref) -> the finding's own sentence
 
 
 def sweep_alarmed_load(engine, state, now, cfg):
@@ -11634,12 +11646,146 @@ def sweep_within(when, now, seconds):
     return isinstance(when, (int, float)) and 0 <= now - when < seconds
 
 
+def sweep_held_pr(decision, home):
+    """(repo, number) when a cos-tier decision is a held pull request (a captain row about a pull request), else None (#986)."""
+    ref = sweep_ref_of(decision, home)
+    if decision.get("kind") == "captain" and decision.get("tier") == "cos" and ref and ref[0]:
+        return ref
+    return None
+
+
+def sweep_gate_reading(engine, repo, number, now):
+    """(open gates, head, who clears it, None) read the way `gates` reads a pull request, or (None, None, None, why) when it cannot be read. GETs only."""
+    original = getattr(engine, "gh_runner", None)
+    calls = [0]
+    try:
+        real = original or subprocess.run
+
+        def runner(*a, **k):   # every call a reading makes is counted, and charged against the shared budget
+            calls[0] += 1
+            return real(*a, **k)
+        engine.gh_runner = runner
+        ns = types.SimpleNamespace(pr="%s#%d" % (repo, number), plan=None, ask=None, head=None)
+        ctx = _ledger_context(ns, runner, lambda: now, False, parts=(engine, engine.state_dir, engine.config), floor=True)
+        if ctx.unreadable or not (ctx.facts or {}).get("head"):
+            return None, None, None, _one_line(str(ctx.unreadable or "no head"), 120)
+        if ctx.plan_problem:   # #986 round 5: a plan that could not be read is not "no plan" (G0a would say missing): not checked
+            return None, None, None, _one_line("the plan could not be read: %s" % ctx.plan_problem, 120)
+        if ctx.problem:   # a corrupt ledger makes G1 untrustworthy: not checked
+            return None, None, None, _one_line("the ledger could not be read: %s" % ctx.problem, 120)
+        if ((ctx.facts or {}).get("carries") or {}).get("unreadable"):   # the dependency named by CARRIES: could not be read: not checked
+            return None, None, None, "the carried dependency could not be read"
+        if (ctx.facts or {}).get("body_unreadable"):   # a body that is not text: G5 and the held-body check would say missing
+            return None, None, None, "the body could not be read"
+        report = plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr, now=now)
+        floor = (ctx.facts or {}).get("floor")
+        if floor is not None and not isinstance(floor, dict):   # a floor of the wrong type is not a reading
+            return None, None, None, "the impact floor has an unexpected shape"
+        if isinstance(floor, dict) and floor.get("decision") is None:   # #986 round 4: an impact floor that could not be read is not a whole reading (G6 would say "waiting"): not checked
+            return None, None, None, _one_line("the impact floor could not be read: %s" % (floor.get("unreadable") or "no decision"), 120)
+        if isinstance(floor, dict) and floor.get("unreadable"):   # the re-hold read failed too (impact-state file corrupt: rehold None): not checked
+            return None, None, None, _one_line("the impact state could not be read: %s" % floor["unreadable"], 120)
+        opened = [r["gate"] for r in report["gates"] if r["status"] not in plan_ledger.SATISFIED]   # the FULL board, whichever gates are enforced: S5 means every gate but the owner's clear is met
+        if (ctx.facts or {}).get("draft") is True:
+            opened.insert(0, "draft")   # a draft is not ready, whatever CI says
+        who = None
+        if opened == ["G6"]:
+            try:
+                line = load_module("delegated_clear").clear_line(clear_who(engine, runner, repo, number, report))
+            except Exception:
+                line = None
+            who = line or "who can clear it: not known"
+        return opened, ctx.facts["head"], who, None
+    except Exception as err:
+        return None, None, None, _one_line("%s: %s" % (type(err).__name__, err), 120)
+    finally:
+        engine.gh_runner = original
+        engine.reading_calls = calls[0]
+
+
+def sweep_ready_pass(engine, state, decisions, home, now, cfg, decisions_whole=True, budget=None):
+    """#986: for each held pull request in the cos tier (and not already the owner's), read its gates and keep when it first became ready at its
+    current head. A new head or an open gate drops the moment. Fills `state.s5` with the ones that have waited past the threshold; a gate read that
+    fails is counted in `state.s5_unchecked` and raises nothing. Reads GitHub only (GET).
+    Fairness: the held pull requests are read least recently read first (`state.ready_read`), so one the cap, the shared call budget or the
+    pass time left unread is first in line on the next pass: none stays hidden. The moment kept is when the sweep first OBSERVED the pull
+    request ready, not when it became ready: after a restart without the state file the wait restarts (a pull request not read on a pass keeps its
+    moment, the wait does not restart), so a finding can be late, never early. The pass draws at most half of the call budget left
+    (at least one reading when the budget allows two), the rest is for verifying the findings. The read order is in memory only. A clock that goes backwards makes now - start negative: nothing is raised until it catches up."""
+    state.s5, state.s5_unchecked, state.s5_oldest = {}, 0, 0
+    if engine.state_dir is not None and not state.ready_loaded:
+        state.ready_loaded = True
+        for key, row in list(_read_small(engine.state_dir, SWEEP_READY_FILE).items())[:2000]:
+            if not isinstance(key, str) or not isinstance(row, dict):   # a corrupt file: skip the row, never fail the pass
+                continue
+            if isinstance(row.get("head"), str) and isinstance(row.get("at"), (int, float)) and not isinstance(row.get("at"), bool):
+                state.ready.setdefault(key, {"head": row["head"], "at": row["at"]})
+    repos_known = list(state.repos) + ([home] if home else [])
+    human_keys = set()
+    for d in decisions:
+        if d.get("tier", "human") == "human" and d.get("kind") != "notice":
+            human_keys |= sweep_ref_keys(d, home, repos_known)
+    seen, reads, before = set(), 0, json.dumps(state.ready, sort_keys=True)
+    todo = []
+    for d in decisions:
+        held = sweep_held_pr(d, home)
+        if not held or d.get("kind") == "notice" or sweep_ref_keys(d, home, repos_known) & human_keys:
+            continue
+        seen.add("%s#%d" % held)
+        todo.append((state.ready_read.get("%s#%d" % held, 0), "%s#%d" % held, held, d))
+    todo.sort(key=lambda t: (t[0], t[1]))   # the least recently read first
+    for _, key, held, d in todo:
+        if reads >= SWEEP_READY_READS or (budget is not None and budget[0] < SWEEP_READY_READ_COST) \
+                or engine.now() - state.started >= SWEEP_PASS_SECONDS:
+            state.not_checked_since.setdefault(key, now)
+            state.s5_unchecked += 1
+            continue
+        if budget is not None:
+            budget[0] -= SWEEP_READY_READ_COST
+        state.read_seq += 1
+        state.ready_read[key] = state.read_seq   # an order, not a time: it cannot tie or go backwards
+        reads += 1
+        engine.reading_calls = 0
+        opened, head, who, why = sweep_gate_reading(engine, held[0], held[1], now)
+        if budget is not None:
+            budget[0] = max(0, budget[0] - max(0, (getattr(engine, "reading_calls", 0) or 0) - SWEEP_READY_READ_COST))   # the calls really made beyond the least charge
+        if opened is None:
+            state.ready.pop(key, None)   # an unread pass drops the moment: the wait restarts, late and never early
+            state.not_checked_since.setdefault(key, now)
+            state.s5_unchecked += 1
+            continue
+        state.not_checked_since.pop(key, None)
+        if opened != ["G6"]:
+            state.ready.pop(key, None)   # a gate is open: not ready; the wait restarts when it is ready again
+            continue
+        row = state.ready.get(key)
+        if not row or row["head"] != head:   # a new head restarts the wait
+            row = state.ready[key] = {"head": head, "at": now}
+        if now - row["at"] >= cfg["aged_cos_hours"] * 3600:
+            state.s5[d.get("id") or key] = (head, row["at"], who)
+    for key in list(state.not_checked_since):
+        if key not in seen:
+            state.not_checked_since.pop(key, None)
+    state.s5_oldest = max([now - t for t in state.not_checked_since.values()] or [0])
+    if decisions_whole:   # a partial list cannot say a pull request is no longer held: keep its moment
+        for key in [k for k in state.ready if k not in seen]:
+            state.ready.pop(key, None)
+    for key in [k for k in state.ready_read if k not in seen] if decisions_whole else []:
+        state.ready_read.pop(key, None)
+    if engine.state_dir is not None and json.dumps(state.ready, sort_keys=True) != before:
+        try:
+            _write_small(engine.state_dir, SWEEP_READY_FILE, dict(sorted(state.ready.items())[:2000]))
+        except OSError:
+            pass   # a disposable file: a failed write costs a restarted wait after a restart
+
+
 def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), decisions_whole=True):
     """The S1, S2, S3 and S5 findings: [(kind, "repo#n")], sorted. Reads nothing: it works on what the refresh kept.
     `defer` holds the repos (or "*": all) whose human-tier decisions are not all known this pass (their source failed or
     is still unread): S3, the only kind that a missing decision can raise falsely, is not judged for them. S1 reads only
     labels and bodies, S5 only the cos-tier decisions that ARE listed: neither waits."""
     found = set()
+    state.details = {}
     state.sources = {}   # (kind, ref) -> what raised it: {"source": "comment:<id>" | "report:<id>" | "body", "match": the phrase}
     awaiting = {awaiting_label(engine.config), awaiting_cos_label(engine.config)}
     human = {sweep_ref_of(d, home) for d in decisions if d.get("tier", "human") == "human" and d.get("kind") != "notice"}
@@ -11709,6 +11855,13 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
             found.add(("S3", ref_text(*target)))
             state.sources[("S3", ref_text(*target))] = {"source": "report:%s" % d.get("id"), "match": matched[0] if matched else ""}
         since = parse_iso(d.get("since"))
+        if sweep_held_pr(d, home) and d.get("kind") != "notice":   # #986: a held pull request is raised from its gates (sweep_ready_pass), once per head
+            ready = getattr(state, "s5", {}).get(d.get("id"))
+            if decisions_whole and ready and not (sweep_ref_keys(d, home, repos_known) & human_keys):
+                pair = ("S5", "%s@%s" % (d.get("id"), ready[0][:12]))
+                found.add(pair)
+                state.details[pair] = _one_line("head %s, ready at %s, held since %s; %s" % (ready[0][:12], iso(ready[1]), _one_line(d.get("since") or "?", 80), _one_line(ready[2], 200)), 400)
+            continue
         if (decisions_whole and d.get("tier") == "cos" and d.get("kind") != "notice" and since is not None
                 and now - since >= cfg["aged_cos_hours"] * 3600
                 and not (sweep_ref_keys(d, home, repos_known) & human_keys)):   # already the owner's: not stale for cos
@@ -11888,7 +12041,12 @@ def sweep_decisions(engine, decisions, now, errors=()):
     if not notices_whole:
         errors = list(errors or ()) + [{"source": "registry", "error": "the notice read is not whole: %s" % why}]
     defer, deferred = sweep_deferrals(state, errors, repos, now)
-    candidates = sweep_findings(engine, state, kept, home, now, cfg, regex, defer, notices_whole or "*" not in defer)
+    whole_list = notices_whole or "*" not in defer
+    ready_share = [max(budget[0] // 2, SWEEP_READY_READ_COST if budget[0] >= SWEEP_READY_READ_COST else 0)]   # #986: at most half of what is left, so the findings' verification keeps the rest
+    ready_start = ready_share[0]
+    sweep_ready_pass(engine, state, kept, home, now, cfg, whole_list, ready_share)
+    budget[0] -= ready_start - ready_share[0]
+    candidates = sweep_findings(engine, state, kept, home, now, cfg, regex, defer, whole_list)
     findings, unchecked = [], 0
     attempts = sorted(candidates, key=lambda c: (state.attempted.get(c, 0), c))  # the longest untried first
     for pair in attempts:
@@ -11928,6 +12086,8 @@ def sweep_decisions(engine, decisions, now, errors=()):
             if (kind, ref) in woken:
                 state.woken_logged.add(once)
             detail = {"kind": kind, "ref": ref, "what": SWEEP_KINDS[kind], "woken": (kind, ref) in woken}
+            if (kind, ref) in state.details:
+                detail["text"] = _one_line(state.details[(kind, ref)], 400)
             if (kind, ref) in state.sources:
                 detail["source"] = state.sources[(kind, ref)]["source"]   # #805: what raised it, so the reason is readable from the audit
                 detail["match"] = _one_line(state.sources[(kind, ref)]["match"], 80)
@@ -11940,7 +12100,7 @@ def sweep_decisions(engine, decisions, now, errors=()):
     state.current = {"enabled": cfg["enabled"], "counts": counts, "total": len(findings),
                      "truncated": sorted(r for r, p in state.repos.items() if p.get("truncated")),
                      "unreadable": sorted(r for r, p in state.repos.items() if p.get("error")), "at": iso(now),
-                     "deferred": deferred, "unchecked": unchecked,
+                     "deferred": deferred, "unchecked": unchecked, "not_checked": state.s5_unchecked, "not_checked_oldest_seconds": int(max(state.s5_oldest, 0)),
                      "unattributed": getattr(state, "unattributed", 0)}
     sweep_write(engine, state)
     return kept if cfg["enabled"] else decisions
@@ -11954,7 +12114,7 @@ def sweep_queue_fact(state, due, now, cfg):
     key = "sweep:%s:%d" % (digest, int(now // (cfg["realarm_hours"] * 3600)))
     kinds = sorted({k for k, _ in due})
     summary = "sweep: %d finding%s: %s%s. %s. Resolve or escalate each; the sweep changes nothing." % (
-        len(due), "" if len(due) == 1 else "s", ", ".join("%s %s" % (ref, kind) for kind, ref in shown),
+        len(due), "" if len(due) == 1 else "s", ", ".join("%s %s%s" % (ref, kind, " (%s)" % state.details[(kind, ref)] if (kind, ref) in state.details else "") for kind, ref in shown),
         " (+%d more)" % (len(due) - len(shown)) if len(due) > len(shown) else "",
         "; ".join("%s = %s" % (k, SWEEP_KINDS[k]) for k in kinds))
     for pair in due:
@@ -14838,6 +14998,9 @@ def sweep_status_lines(sweep):
     if sweep.get("unchecked"):
         lines.append("      sweep      %d finding(s) not checked this pass (call budget or a failed read): neither "
                      "raised nor audited" % sweep["unchecked"])
+    if sweep.get("not_checked"):
+        lines.append("      sweep      %d held pull request(s) not checked for S5 (gates unreadable or not reached); oldest %s: never raised"
+                     % (sweep["not_checked"], format_age(sweep.get("not_checked_oldest_seconds") or 0)))
     return lines
 
 
@@ -17353,6 +17516,8 @@ def pr_picture(engine, repo, number, state):
     except (NoticeError, AttributeError) as err:
         return None, "", [], _one_line(str(err), 160)
     body = raw.get("body") if isinstance(raw.get("body"), str) else ""
+    if not isinstance(raw.get("body"), str) and not ("body" in raw and raw["body"] is None):
+        facts["body_unreadable"] = True   # #986: a body that is not text is unread, not empty (S5 counts it not checked)
     item = next((i for i in read_pr_notices(state) if i["repo"] == repo and i["number"] == number), None)
     return facts, body, notice_senders(item) if item else [], None
 
@@ -17536,6 +17701,7 @@ def carries_context(engine, config, repo, number, facts, body, entries, runner, 
         dep = pr_facts_from(raw)
     except (NoticeError, AttributeError) as err:
         out["refusal"] = "%s could not be read: %s" % (dep_pr, _one_line(str(err), 120))
+        out["unreadable"] = True   # #986: S5 counts a pull request whose dependency could not be read as not checked
         return out
     if str(raw.get("state")).upper() == "MERGED":
         return None
