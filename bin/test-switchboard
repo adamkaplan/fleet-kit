@@ -19569,6 +19569,11 @@ class TestBuilderChecklist(unittest.TestCase):
         "i": "Compare failure messages, not only test names",
         "j": "say which git version the tests ran on",
     }
+    RULES = {
+        "b": "(opens without blocking, refuses links, accepts only regular files, bounds the count, the size and the time)",
+        "i": "and keep new strings and comments clear of the added-lines scans",
+        "e": "the pod's git token expires after about an hour and a late open fails",
+    }
     BRIEF = "Every builder brief carries the builder checklist below by default; a brief that leaves an item out says why in one line."
 
     def text(self):
@@ -19576,6 +19581,7 @@ class TestBuilderChecklist(unittest.TestCase):
 
     def problems(self, text):
         found = [k for k, v in self.ITEMS.items() if text.count("- (%s) " % k) != 1 or v not in text]
+        found += ["rule " + k for k, v in self.RULES.items() if v not in text]
         if self.BRIEF not in text or "## Builder checklist" not in text:
             found.append("brief")
         return found
@@ -19590,10 +19596,19 @@ class TestBuilderChecklist(unittest.TestCase):
             with self.subTest(item=key):
                 self.assertEqual(self.problems(text.replace(self.ITEMS[key], "")), [key])
         self.assertEqual(self.problems(text.replace(self.BRIEF, "")), ["brief"])
+        for key, rule in self.RULES.items():   # three more mutants: strip the unpinned rule of (b), (i), (e)
+            with self.subTest(rule=key):
+                self.assertEqual(self.problems(text.replace(rule, "")), ["rule " + key])
 
     def test_item_b_names_no_invented_reader(self):
-        self.assertIn("`_read_settings_file`", self.text())
-        self.assertTrue((REPO / "cloud" / "launcher" / "cloud_worker.py").read_text().count("def _read_settings_file(") == 1)
+        import ast
+        text = self.text()
+        self.assertIn("`read_record_file(path, max_bytes)` in `bin/cloud_worker.py`", text)
+        self.assertNotIn("has no such shared module", text)
+        tree = ast.parse((REPO / "bin" / "cloud_worker.py").read_text())
+        found = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "read_record_file"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual([a.arg for a in found[0].args.args], ["path", "max_bytes"])
 
 
 class TestOwnMeasurementTester(unittest.TestCase):
