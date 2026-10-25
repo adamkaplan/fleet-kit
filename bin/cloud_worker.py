@@ -150,7 +150,7 @@ def _write_private(path, text):
 
 def _read_private(path, limit):
     """The text of a private regular file (ours, mode 0600, not a symlink), at most `limit` bytes; OSError/ValueError otherwise."""
-    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)   # O_NONBLOCK: a FIFO in the record directory must not block the open
     with os.fdopen(fd, "rb") as handle:
         found = os.fstat(handle.fileno())
         if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid() or found.st_mode & 0o077:
@@ -159,6 +159,42 @@ def _read_private(path, limit):
     if len(raw) > limit:
         raise ValueError("too large")
     return raw.decode("utf-8")
+
+
+def read_record_file(path, max_bytes):
+    """The ONE safe read of a file in the cloud record directory (#1097, the family of #1073): (record dict, None) or (None, kind). Never blocks (O_NONBLOCK,
+    so a FIFO cannot hang the open), never follows a symlink (O_NOFOLLOW), reads only a regular file (fstat), at most max_bytes. Never raises.
+    kind: not_regular, too_large, not_utf8, not_json, wrong_shape."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return None, "not_regular"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, "not_regular"
+        raw = b""
+        while len(raw) <= max_bytes:
+            chunk = os.read(fd, max_bytes + 1 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+    except OSError:
+        return None, "not_regular"
+    finally:
+        os.close(fd)
+    if len(raw) > max_bytes:
+        return None, "too_large"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "not_utf8"
+    try:
+        record = json.loads(text)
+    except (ValueError, RecursionError):
+        return None, "not_json"
+    if not isinstance(record, dict):
+        return None, "wrong_shape"
+    return record, None
 
 
 def load_record(state, name):
