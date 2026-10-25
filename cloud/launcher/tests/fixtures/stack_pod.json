@@ -55,6 +55,16 @@
             }
           ],
           "image": "registry.example.internal/worker:1",
+          "lifecycle": {
+            "preStop": {
+              "exec": {
+                "command": [
+                  "/usr/local/bin/cw-prestop",
+                  "45"
+                ]
+              }
+            }
+          },
           "name": "worker",
           "readinessProbe": {
             "tcpSocket": {
@@ -108,6 +118,7 @@
         }
       },
       "serviceAccountName": "cw-worker",
+      "terminationGracePeriodSeconds": 60,
       "volumes": [
         {
           "name": "pw",
@@ -192,6 +203,16 @@
             }
           ],
           "image": "registry.example.internal/worker:1",
+          "lifecycle": {
+            "preStop": {
+              "exec": {
+                "command": [
+                  "/usr/local/bin/cw-prestop",
+                  "45"
+                ]
+              }
+            }
+          },
           "name": "worker",
           "readinessProbe": {
             "tcpSocket": {
@@ -250,6 +271,7 @@
         }
       },
       "serviceAccountName": "cw-worker",
+      "terminationGracePeriodSeconds": 60,
       "volumes": [
         {
           "name": "pw",
