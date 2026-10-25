@@ -86425,16 +86425,16 @@ class TestPrClaimLine(LedgerBase):
         claimed = sb.plan_ledger.pr_scenarios(self.scenarios, "```\nignored\n```\nPLAN: real#1\nCLAIMS: S1")[0]
         self.assertEqual([s["id"] for s in claimed], ["S1"])
 
-    FENCED = "```\nPLAN: other/x#9\n```\nPLAN: acme/app#7\nCLAIMS: S1\n"
+    FENCED = "```\nPLAN: acme/other-service#9\n```\nPLAN: acme/app#7\nCLAIMS: S1\n"
 
     def fenced_plan_read(self, reader):
         return reader([], 1, self.FENCED)[0]
 
     def test_a_fenced_plan_line_before_the_real_one_is_read_by_no_gate_and_no_claim(self):
         self.assertEqual(self.fenced_plan_read(sb.authoritative_plan), "acme/app#7")
-        self.assertEqual(sb.authoritative_plan([], 1, "<!--\nPLAN: other/x#9\n-->\nPLAN: acme/app#7")[0], "acme/app#7")
+        self.assertEqual(sb.authoritative_plan([], 1, "<!--\nPLAN: acme/other-service#9\n-->\nPLAN: acme/app#7")[0], "acme/app#7")
         self.assertEqual(sb.plan_ledger.claim_text(self.FENCED), "S1")
-        self.assertEqual(sb.authoritative_plan([], 1, "```\nPLAN: other/x#9\n```\n"), (None, None))
+        self.assertEqual(sb.authoritative_plan([], 1, "```\nPLAN: acme/other-service#9\n```\n"), (None, None))
 
     def test_mutant_authoritative_plan_on_the_raw_body_fails_the_fenced_line_test(self):
         def mutant(entries, pr, body):
