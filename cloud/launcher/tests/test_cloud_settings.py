@@ -20,7 +20,9 @@ OPTIONAL_SAMPLES = {"CW_TOOLING_REPO": "acme-org/tooling", "CW_CLOUD_CA_FILE": "
                     "CW_GIT_TOKEN_CMD": "cat /home/user/git", "CW_APP_ID_CMD": "cat /home/user/id", "CW_APP_INSTALLATION_CMD": "cat /home/user/inst",
                     "CW_APP_KEY_CMD": "cat /home/user/key", "CW_VAULT_CHECK_DIR": "/home/user/check",
                     "CW_CLUSTER_ADMIN_SECRET": "acme-cluster-admin", "CW_CLUSTER_TOKEN_DURATION": "20m", "CW_STACK_MODEL_SECRET": "acme-stack-model",
-                    "CW_HUB_CHANNEL_URL": "http://cloud-hub.cw.svc:8443/message", "CW_HUB_REGISTRY_SECRET": "cloud-hub-registry"}
+                    "CW_HUB_CHANNEL_URL": "http://cloud-hub.cw.svc:8443/message", "CW_HUB_REGISTRY_SECRET": "cloud-hub-registry",
+                    "CW_STACK_REGISTRY": "acme-registry.azurecr.io", "CW_STACK_PULL_CLIENT_ID": "11111111-2222-3333-4444-555555555555",
+                    "CW_STACK_PULL_TENANT_ID": "66666666-7777-8888-9999-000000000000"}
 SAMPLES = {   # one value per secret shape (built here, never a real secret)
     "a JWT": "eyJhbGciOiJIUzI1" + "." + "eyJzdWIiOiJ4eHh4",
     "a PEM header": "-----BEGIN " + "PRIVATE KEY-----",
@@ -64,6 +66,10 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
     "CW_CLUSTER_TOKEN_CMD": ["-x"], "CW_CLUSTER_ADMIN_CMD": ["--x"], "CW_GIT_TOKEN_CMD": ["-x"], "CW_APP_ID_CMD": ["-x"],
     "CW_APP_INSTALLATION_CMD": ["-x"], "CW_APP_KEY_CMD": ["-x"],
     "CW_VAULT_CHECK_DIR": ["check", "/a/../b", "-x"],
+    "CW_STACK_REGISTRY": ["https://acme-registry.azurecr.io", "acme-registry.azurecr.io/x", "acme-registry.azurecr.io:443", "10.0.0.1", "azurecr.io", "acme-registry",
+                          "acme.example.com", "-acme.azurecr.io", "Acme.azurecr.io", "user@acme.azurecr.io", "ghp_" + "A1b2C3d4E5f6G7h8.azurecr.io", "0x7f000001"],
+    "CW_STACK_PULL_CLIENT_ID": ["x", "1111", "-1111-2222"],
+    "CW_STACK_PULL_TENANT_ID": ["x", "1111", "-1111-2222"],
     "CW_HUB_CHANNEL_URL": ["ftp://hub.example", "http://user@hub.example", "http://hub.example/x?y=1", "hub.example", "http://hub example", "$(x)"],
     "CW_HUB_REGISTRY_SECRET": ["A_B", "a b", "-", "a/b", "$(x)", "UPPER"],
     "CW_STACK_MODEL_SECRET": ["https://vault.example.internal/secrets/x", "/home/user/secret", "a b", "a_b", "a.b", "a/b", "a" * 128, "$(x)", "-x", "--help"],
@@ -105,7 +111,7 @@ class Tables(unittest.TestCase):
     def test_every_setting_has_a_known_kind_and_the_samples_cover_the_table(self):
         self.assertEqual({k for k, _, _ in cw.SETTINGS}, set(GOOD) | set(OPTIONAL_SAMPLES))
         self.assertEqual(set(cw.SETTING_REQUIRED), set(GOOD))
-        self.assertLessEqual({kind for _, _, kind in cw.SETTINGS}, {"name", "path", "command", "digest-ref", "number", "secret-name", "duration"})
+        self.assertLessEqual({kind for _, _, kind in cw.SETTINGS}, {"name", "path", "command", "digest-ref", "number", "secret-name", "duration", "guid", "registry-host"})
         self.assertEqual(len(cw.SETTINGS), len({k for k, _, _ in cw.SETTINGS}))
         self.assertIn(("CW_VAULT_CHECK_DIR", False, "path"), cw.SETTINGS)   # reserved for the pre-check, optional
 

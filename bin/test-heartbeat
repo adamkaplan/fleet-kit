@@ -424,6 +424,7 @@ class FakeRegistry:
         self.problem = problem
 
     bell_of = staticmethod(REAL_REGISTRY.bell_of)
+    no_pane_to_judge = staticmethod(REAL_REGISTRY.no_pane_to_judge)
 
     def read(self, state_dir):
         if not self.whole:
@@ -1454,6 +1455,7 @@ class TestRegistryIdentity(Base):
 
         class Returns:
             bell_of = staticmethod(REAL_REGISTRY.bell_of)
+            no_pane_to_judge = staticmethod(REAL_REGISTRY.no_pane_to_judge)
 
             def __init__(self, value):
                 self.value = value

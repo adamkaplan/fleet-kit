@@ -46,7 +46,7 @@ def unknown_endpoint_check(name, agent):
 
 def has_no_pane(agent):
     """A row with an endpoint and no pane: its liveness is not provable with the terminal multiplexer."""
-    return isinstance(agent, dict) and agent.get("pane") is None and agent.get("endpoint") is not None
+    return _load_registry().no_pane_to_judge(agent)
 
 
 # TODO(#1066, PR #1075): when the process-evidence verdict lands, this and `has_no_live_data` must call that ONE dead-verdict function (U6).
@@ -63,7 +63,7 @@ def reconcile_on_read(state_dir, read, live_check, registry=None, endpoint_check
     for name, agent in sorted((read.get("agents") or {}).items()):
         if not isinstance(agent, dict):
             continue
-        if has_no_pane(agent):
+        if registry.no_pane_to_judge(agent):
             # Unknown, never dead: removed only when the bounded check answers exactly "dead" (a failed, unreachable or unknown answer keeps the row).
             try:
                 verdict = (endpoint_check or unknown_endpoint_check)(name, agent)
