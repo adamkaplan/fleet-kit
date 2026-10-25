@@ -2751,7 +2751,13 @@ own gets `--until-closed` for that issue by default, so a reminder about finishe
 
 **A reminder about an issue is dropped when it closes (#1132).** A reminder is dropped when its issue closes or its pull
 request merges, unless it was set with `--keep-if-closed`. `remind --issue N` says so at creation ("dropped if it closes")
-and names `--keep-if-closed`. When the daemon drops it, the setter gets ONE notice naming the reminder, its text and the
+and names `--keep-if-closed`.
+
+`remind --key <text>` names the purpose: arming again with the same key replaces your pending reminder of that key (one pending per
+owner and key; another owner's or another key's reminder is never touched), and `remind --list` shows the key. A fired, undelivered
+reminder is dropped when a newer one of the same owner and key exists (one `reminder.drop_superseded` audit line names both ids). A
+delivery 5 minutes or more after its due time says "late by N min". Arming a text over 4000 characters (the delivery cap) prints a
+warning with the number of characters over. Without `--key` nothing changes. When the daemon drops it, the setter gets ONE notice naming the reminder, its text and the
 reason (the issue closed, the pull request merged), audited as `reminder.drop_notice`; the notice is sent only by the sweep
 that removes the reminder, so it is never repeated. An issue already closed at creation is refused (exit 2, "already
 closed") unless `--keep-if-closed` is given, which keeps the reminder and fires it. A reminder without `--issue`, or whose
