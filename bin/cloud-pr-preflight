@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """cloud-pr-preflight: check a cloud pull request the way CI will, before the push (ask #1195).
 
-Run at the repository root:  bin/cloud-pr-preflight
+Run at the repository root:  bin/cloud-pr-preflight [--quick]
+--quick (ask #1299): section 2 runs only the test files that read a changed file plus the named scans of bin/cloud_quick.py
+(each a file and one selector), on the branch and on the clean base; same three sections and exit codes. Default: every file. CLOUD_PREFLIGHT_MODE=quick is the same as --quick (bin/cloud-prepush sets it).
+A quick run that selects nothing for a non-empty change fails (never clean).
 Offline. Prints three sections; exits 0 when 1 and 2 pass (and no --expect stray file); section 3 only lists edits to justify.
   1. completeness scan of bin/test-cloud-launcher
   2. every test file of cloud/launcher/tests and cloud/worker/tests, one at a time, on the branch and on a clean
@@ -11,6 +14,12 @@ Offline. Prints three sections; exits 0 when 1 and 2 pass (and no --expect stray
 Environment: CLOUD_PREFLIGHT_TIMEOUT (seconds per file, default 120), CLOUD_PREFLIGHT_BASE (default branch ref).
 """
 import glob, os, shutil, signal, subprocess, sys, tarfile, tempfile, io
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+try:
+    import cloud_quick  # noqa: E402  (the shared quick-mode selection, bin/cloud_quick.py)
+except ImportError:  # a copy of this script placed alone: only the full mode works
+    cloud_quick = None
 
 TEST_DIRS = ("cloud/launcher/tests", "cloud/worker/tests")
 CHAIN = "bin/test-cloud-launcher"
@@ -54,10 +63,10 @@ def kill_children():
     del CHILD[:]
 
 
-def run_one(root, rel, timeout):
+def run_one(root, rel, timeout, selector=None):
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
     try:
-        p = subprocess.Popen([sys.executable, rel], cwd=root, env=env, stdout=subprocess.DEVNULL,
+        p = subprocess.Popen([sys.executable, rel] + ([selector] if selector else []), cwd=root, env=env, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError:
         return 127
@@ -79,15 +88,18 @@ def main():
     for sg in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sg, _on_signal)
     expect = []
+    quick = os.environ.get("CLOUD_PREFLIGHT_MODE") == "quick" and cloud_quick is not None
     args = sys.argv[1:]
     while args:
         a = args.pop(0)
         if a == "--expect" and args:
             expect.append(args.pop(0))
+        elif a == "--quick" and cloud_quick is not None:
+            quick = True
         elif a.startswith("--expect="):
             expect.append(a.split("=", 1)[1])
         else:
-            print("usage: cloud-pr-preflight [--expect PATH-PREFIX]..."); return 2
+            print("usage: cloud-pr-preflight [--quick] [--expect PATH-PREFIX]..."); return 2
     rc, root = git("rev-parse", "--show-toplevel")
     if rc:
         print("cloud-pr-preflight: not in a git repository"); return 2
@@ -146,14 +158,38 @@ def main():
         failed |= bool(bad)
         print("scan: " + ("FAIL" if bad else "ok"))
 
-        print("\n== 2. every test file, one at a time (timeout %ds each) ==" % timeout)
+        sel_of = {}
+        if quick:
+            rc, out = git("diff", "--name-only", "--no-renames", mb, cwd=root)
+            changed_files = {x for x in out.splitlines() if x}
+            rc, out = git("ls-files", "--others", "--exclude-standard", cwd=root)
+            changed_files |= {x for x in out.splitlines() if x}
+            tracked = git("ls-files", cwd=root)[1].split("\n")
+            allowed = lambda r: r in set(tests_in(root))
+            picks = [(r, None) for r in cloud_quick.readers(root, tracked, changed_files, allowed)]
+            have = {r for r, _ in picks}
+            picks += [(r, s) for r, s in cloud_quick.select_quick(root, tracked, set(), cloud_quick.SCAN_TESTS) if r not in have]
+            names = []
+            for r, s in picks:
+                key = r if s is None else r + "::" + s
+                sel_of[key] = (r, s)
+                names.append(key)
+            names = sorted(names)
+            print("\n== 2. quick mode: %d check(s) that read the %d changed file(s), plus the named scans (timeout %ds each) =="
+                  % (len(names), len(changed_files), timeout))
+            if changed_files and not names:
+                print("NOT RUN: quick mode selected no check for a non-empty change; this is not a clean result")
+                failed = True
+        else:
+            print("\n== 2. every test file, one at a time (timeout %ds each) ==" % timeout)
+            names = sorted(set(tests_in(root)) | base_tests)
         print("%-52s %-9s %-9s %s" % ("file", "branch", "default", "verdict"))
-        names = sorted(set(tests_in(root)) | base_tests)
         verdicts = []
         for rel in names:
-            b = run_one(root, rel, timeout) if os.path.exists(os.path.join(root, rel)) else "absent"
-            d = run_one(basedir, rel, timeout) if rel in base_tests else "absent"
-            n = os.path.basename(rel)
+            path, sel = sel_of.get(rel, (rel, None))
+            b = run_one(root, path, timeout, sel) if os.path.exists(os.path.join(root, path)) else "absent"
+            d = run_one(basedir, path, timeout, sel) if os.path.exists(os.path.join(basedir, path)) else "absent"
+            n = os.path.basename(path)
             if "timeout" in (b, d):
                 if n in TIMEOUT_ALLOW:
                     v = "not run (allowed: %s)" % TIMEOUT_ALLOW[n]

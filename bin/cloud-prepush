@@ -22,7 +22,14 @@ import time
 
 # Repository-wide scan tests (one list). Entries that do not exist in a repository are skipped there; --check-list
 # verifies that every entry exists in this one.
-SCAN_TESTS = ["bin/test-switchboard"]
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+try:
+    import cloud_quick  # noqa: E402  (the shared list and selection, bin/cloud_quick.py)
+    SCAN_TESTS = cloud_quick.SCAN_TESTS  # (file, selector) pairs; one list for both commands
+except ImportError:  # a copy of this script placed alone (an offline test): the whole-file scan of before
+    SCAN_TESTS = [("bin/test-switchboard", None)]
+PREFLIGHT_MODE = ["quick"]  # set from CLOUD_PREPUSH_PREFLIGHT (quick by default, or full)
+SCAN_SELECTOR = {}  # file -> selector, set by select() for a scan picked only as a scan
 # Bounds: CLOUD_PREPUSH_TIMEOUT seconds per test and side (default 120); CLOUD_PREPUSH_TOTAL seconds overall (default 1500).
 # A timeout, or a test not reached when the overall deadline expires, counts as "could not run". Invalid value: exit 2.
 # The two sides run one after the other, one test at a time (a pod has a hard memory limit): no parallelism.
@@ -133,9 +140,11 @@ def select(root, changed):
             continue
         if rel in changed or any(n in text for n in names):
             picked.append(rel)
-    for rel in SCAN_TESTS:
+    SCAN_SELECTOR.clear()
+    for rel, sel in SCAN_TESTS:
         if os.path.isfile(os.path.join(root, rel)) and rel not in picked:
             picked.append(rel)
+            SCAN_SELECTOR[rel] = sel
     return sorted(picked)
 
 
@@ -144,6 +153,8 @@ def run_one(root, rel, tmp, limit):
     if not os.path.isfile(path):
         return ("absent", None)
     cmd = [sys.executable, path] if rel.endswith(".py") else [path]
+    if SCAN_SELECTOR.get(rel):
+        cmd.append(SCAN_SELECTOR[rel])  # a scan runs one class or method, never the whole suite
     env = child_env(tmp)
     try:
         rc, text, timed_out = run_group(cmd, root, env, limit)
@@ -165,6 +176,8 @@ def preflight(root, base, scratch, limit):
         return False, ["could not run the preflight: " + path + " is missing"]
     env = child_env(scratch)
     env["CLOUD_PREFLIGHT_BASE"] = base  # the preflight takes its base from this variable, never from an option
+    if PREFLIGHT_MODE[0] == "quick":
+        env["CLOUD_PREFLIGHT_MODE"] = "quick"  # the preflight reads the quick mode from this variable (same as --quick)
     state = {"next": 0}
 
     def tick(el):
@@ -195,7 +208,7 @@ def main(argv):
         return 0
     if len(argv) == 1 and argv[0] == "--check-list":
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        bad = [s for s in SCAN_TESTS if not os.path.isfile(os.path.join(root, s))]
+        bad = [s for s, _ in SCAN_TESTS if not os.path.isfile(os.path.join(root, s))]
         for s in bad:
             print("listed scan test missing: " + s)
         return 1 if bad else 0
@@ -208,6 +221,9 @@ def main(argv):
         TIMEOUT_S = positive("CLOUD_PREPUSH_TIMEOUT", TIMEOUT)
         TOTAL_S = positive("CLOUD_PREPUSH_TOTAL", TOTAL)
         PF_S = positive("CLOUD_PREPUSH_PREFLIGHT_TIMEOUT", PREFLIGHT_TIMEOUT)
+        MODE = os.environ.get("CLOUD_PREPUSH_PREFLIGHT", "quick")
+        if MODE not in ("quick", "full"):
+            return refuse("CLOUD_PREPUSH_PREFLIGHT must be quick or full")
     except ValueError as e:
         return refuse("%s must be a whole number of seconds (1 or more)" % e)
     started = time.monotonic()
@@ -233,13 +249,15 @@ def main(argv):
     os.mkdir(os.path.join(tmp, "tb"))
     signal.signal(signal.SIGTERM, _term)
     try:
-        return stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started, PF_S)
+        return stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started, PF_S, MODE)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started, PF_S):
+def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started, PF_S, MODE="quick"):
     # Step 1: the preflight of the pod, before any test.
+    PREFLIGHT_MODE[0] = MODE
+    print("cloud-prepush: preflight mode: " + MODE, file=sys.stderr, flush=True)
     ok, plines = preflight(root, base, scratch, max(1, min(PF_S, int(TOTAL_S - (time.monotonic() - started)))))
     if not ok:
         for l in plines:
