@@ -63,7 +63,20 @@ def kill_children():
     del CHILD[:]
 
 
-QUICK_TOTAL = int(os.environ.get("CLOUD_PREFLIGHT_QUICK_TOTAL", "240"))  # seconds for the whole quick run (240: the pre-push command's own tests still fit in a 300 s pod)
+QUICK_TOTAL_DEFAULT = 240  # seconds for the whole quick run (the pre-push command's own tests still fit in a 300 s pod)
+
+
+def quick_total():
+    """CLOUD_PREFLIGHT_QUICK_TOTAL: a positive whole number of seconds; read only by a quick run. ValueError when invalid."""
+    raw = os.environ.get("CLOUD_PREFLIGHT_QUICK_TOTAL")
+    if raw is None:
+        return QUICK_TOTAL_DEFAULT
+    if not raw.isascii() or not raw.isdigit() or int(raw) < 1:
+        raise ValueError(raw)
+    return int(raw)
+
+
+QUICK_TOTAL = QUICK_TOTAL_DEFAULT
 
 
 def run_one(root, rel, timeout, selector=None):
@@ -116,6 +129,12 @@ def main():
     rc, root = git("rev-parse", "--show-toplevel")
     if rc:
         print("cloud-pr-preflight: not in a git repository"); return 2
+    global QUICK_TOTAL
+    if quick:
+        try:
+            QUICK_TOTAL = quick_total()
+        except ValueError:
+            print("cloud-pr-preflight: CLOUD_PREFLIGHT_QUICK_TOTAL must be a whole number of seconds (1 or more)"); return 2
     try:
         timeout = int(os.environ.get("CLOUD_PREFLIGHT_TIMEOUT", "120"))
         if timeout < 1:
@@ -178,8 +197,9 @@ def main():
             rc, out = git("ls-files", "--others", "--exclude-standard", cwd=root)
             changed_files |= {x for x in out.splitlines() if x}
             tracked = git("ls-files", cwd=root)[1].split("\n")
-            allowed = lambda r: r in set(tests_in(root))
-            reads = cloud_quick.readers(root, tracked, changed_files, allowed)
+            every = cloud_quick.readers(root, tracked, changed_files)  # the same reader rule as bin/cloud-prepush
+            reads, cannot = cloud_quick.split_readers(every)  # reads: the readers a quick run can start
+            reason = cloud_quick.not_run_reason(every, changed_files) if changed_files else None
             picks = cloud_quick.add_scans(root, [(r, None) for r in reads], cloud_quick.SCAN_TESTS)
             names = []
             for r, s in picks:
@@ -188,11 +208,14 @@ def main():
                 names.append(key)
             names = sorted(names)
             print("\n== 2. quick mode: %s, plus the named scans (timeout %ds each) =="
-                  % (cloud_quick.mode_line(len(reads), len(changed_files)), timeout))
+                  % (cloud_quick.mode_line(len(every), len(changed_files)), timeout))
             if changed_files and not names:
                 print("NOT RUN: quick mode selected no check for a non-empty change; this is not a clean result")
-            elif changed_files and not reads:
-                print("NOT RUN: no check reads " + ", ".join(sorted(changed_files)))
+            if reason:
+                print("NOT RUN: " + reason)
+            for line in cloud_quick.cannot_lines(every):
+                print(line)
+            failed |= bool(cannot)
             if changed_files and not reads:
                 print("\nRESULT: FAIL")
                 return 1  # decided from the reader picks alone: no scan is started
@@ -206,7 +229,8 @@ def main():
             path, sel = sel_of.get(rel, (rel, None))
             remaining = QUICK_TOTAL - (time.monotonic() - t_start)
             if quick and remaining <= 0:
-                print("NOT RUN: quick run exceeded %d s (stopped before %s)" % (QUICK_TOTAL, rel))
+                print("NOT RUN: quick run exceeded %d s (selected %d files, ran %d; stopped before %s)"
+                      % (QUICK_TOTAL, len(names), len(verdicts), rel))
                 failed = True
                 break
             if quick and path in cloud_quick.HEAVY:

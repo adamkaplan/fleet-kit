@@ -174,7 +174,7 @@ class QuickMode(unittest.TestCase):
         mutant = text.replace('picked = [(r, None) for r in readers(root, tracked, changed)]',
                               'picked = [(r, None) for r in readers(root, tracked, changed or set(), lambda rel: True)]')
         mutant = mutant.replace("names = {os.path.basename(c) for c in changed}", "names = {''}")
-        self.assertNotEqual(mutant, text)
+        self.assertTrue(mutant != text)
         script = tool_dir(self.tmp, mutant)
         with self.assertRaises(AssertionError):
             assert_quick_is_smaller(self, repo, script)
@@ -211,6 +211,128 @@ class PrepushDefault(unittest.TestCase):
         self.assertIn("MODE=None ARGS=[]", p.stdout)
         p = self.run_pp(CLOUD_PREPUSH_PREFLIGHT="fast")
         self.assertEqual(p.returncode, 2, p.stderr)
+
+
+def make_shell_reader_repo(tmp):
+    """Base: bin/tool.txt and a shell suite bin/test-thing that names it. Branch: edits bin/tool.txt."""
+    repo = os.path.join(tmp, "repo")
+    os.makedirs(repo)
+    git(repo, "init", "-q", "-b", "trunk")
+    put(repo, "bin/tool.txt", "one\n")
+    put(repo, "bin/test-thing", "#!/bin/sh\n# reads tool.txt\nexit 0\n")
+    put(repo, TD + "test_other.py", PASS)
+    put(repo, "bin/test-cloud-launcher", "#!/bin/sh\n# tests/test_other.py\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "base")
+    git(repo, "checkout", "-q", "-b", "feat")
+    put(repo, "bin/tool.txt", "two\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "change")
+    return repo
+
+
+def both_tools(tmp, preflight_text=None):
+    """One directory holding the real preflight (or a mutant of it), the helper and the pre-push command."""
+    script = tool_dir(tmp)
+    d = os.path.dirname(script)
+    shutil.copy(os.path.join(BIN, "cloud-prepush"), d)
+    if preflight_text is not None:
+        with open(script, "w") as f:
+            f.write(preflight_text)
+    return script, os.path.join(d, "cloud-prepush")
+
+
+def run_both(repo, script, prepush, tmp, **env):
+    rc1, out1 = run_pf(repo, script, "--quick")
+    e = dict(ENV, TMPDIR=tmp, **env)
+    p = subprocess.run([sys.executable, prepush, "trunk"], cwd=repo, capture_output=True, text=True, env=e, timeout=300)
+    return (rc1, out1), (p.returncode, p.stdout + p.stderr)
+
+
+def not_run_lines(out):
+    return sorted(l for l in out.splitlines() if l.startswith("NOT RUN: no check") or l.endswith("cannot run in quick"))
+
+
+class OneReaderDecision(unittest.TestCase):
+    """The preflight and the pre-push command ask the same function what a reader is and what no reader means."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="quick-one-", dir=os.environ.get("TMPDIR"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_m1_the_same_change_gives_the_same_verdict_and_reason_in_both(self):
+        repo = make_shell_reader_repo(self.tmp)
+        script, prepush = both_tools(self.tmp)
+        (rc1, out1), (rc2, out2) = run_both(repo, script, prepush, self.tmp)
+        self.assertEqual((rc1, rc2), (1, 1), out1 + out2)
+        self.assertEqual(not_run_lines(out1), not_run_lines(out2))
+        self.assertIn("NOT RUN: no check that can run in quick reads bin/tool.txt", out1)
+        self.assertIn("NOT RUN: bin/test-thing cannot run in quick", out1)
+        self.assertNotIn("the preflight did not pass", out2)
+        self.assertNotIn("RESULT: PASS", out1)
+
+    def test_m1_a_change_nothing_reads_gives_the_same_reason_in_both(self):
+        repo = make_shell_reader_repo(self.tmp)
+        git(repo, "checkout", "-q", "trunk")
+        git(repo, "checkout", "-q", "-b", "feat2")
+        put(repo, "c.txt", "unread\n")
+        git(repo, "add", "c.txt")
+        git(repo, "commit", "-q", "-m", "unread")
+        script, prepush = both_tools(self.tmp)
+        (rc1, out1), (rc2, out2) = run_both(repo, script, prepush, self.tmp)
+        self.assertEqual((rc1, rc2), (1, 1))
+        self.assertEqual(not_run_lines(out1), not_run_lines(out2))
+        self.assertIn("NOT RUN: no check reads c.txt", out1)
+
+    def test_m1_mutant_a_separate_reader_rule_in_the_preflight_is_caught(self):
+        repo = make_shell_reader_repo(self.tmp)
+        with open(os.path.join(BIN, "cloud-pr-preflight")) as f:
+            text = f.read()
+        mutant = text.replace("every = cloud_quick.readers(root, tracked, changed_files)",
+                              "every = cloud_quick.readers(root, tracked, changed_files, lambda r: r in set(tests_in(root)))")
+        self.assertTrue(mutant != text)
+        script, prepush = both_tools(self.tmp, mutant)
+        (rc1, out1), (rc2, out2) = run_both(repo, script, prepush, self.tmp)
+        self.assertNotEqual(not_run_lines(out1), not_run_lines(out2))
+
+    def test_m2_the_bound_says_how_many_files_were_selected_and_how_many_ran(self):
+        repo = make_repo(self.tmp)
+        put(repo, TD + "test_slow_a.py", "# reads a.txt\nimport time\ntime.sleep(3)\n")
+        put(repo, TD + "test_slow_b.py", "# reads a.txt\nimport time\ntime.sleep(3)\n")
+        put(repo, "bin/test-cloud-launcher", "#!/bin/sh\n# tests/test_reads_a.py tests/test_other.py tests/test_other2.py tests/test_slow_a.py tests/test_slow_b.py\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "slow")
+        env = dict(ENV, CLOUD_PREFLIGHT_BASE="trunk", TMPDIR=self.tmp, CLOUD_PREFLIGHT_QUICK_TOTAL="1")
+        p = subprocess.run([sys.executable, tool_dir(self.tmp), "--quick"], cwd=repo, capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertRegex(p.stdout, r"NOT RUN: quick run exceeded 1 s \(selected 3 files, ran 2; stopped before ")
+
+    def test_m3_a_bad_quick_total_is_refused_in_one_line_and_only_in_quick(self):
+        repo = make_repo(self.tmp)
+        script = tool_dir(self.tmp)
+        for bad in ("abc", "0", "-5", "", "1.5"):
+            with self.subTest(value=bad):
+                env = dict(ENV, CLOUD_PREFLIGHT_BASE="trunk", TMPDIR=self.tmp, CLOUD_PREFLIGHT_QUICK_TOTAL=bad)
+                p = subprocess.run([sys.executable, script, "--quick"], cwd=repo, capture_output=True, text=True, env=env, timeout=120)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertEqual(len((p.stdout + p.stderr).strip().splitlines()), 1)
+                self.assertIn("CLOUD_PREFLIGHT_QUICK_TOTAL must be a whole number of seconds (1 or more)", p.stdout)
+                self.assertNotIn("Traceback", p.stderr)
+                full = subprocess.run([sys.executable, script], cwd=repo, capture_output=True, text=True, env=env, timeout=120)
+                self.assertEqual(full.returncode, 0, full.stdout + full.stderr)
+
+    def test_m3_mutant_a_bare_int_at_import_is_caught(self):
+        repo = make_repo(self.tmp)
+        with open(os.path.join(BIN, "cloud-pr-preflight")) as f:
+            text = f.read()
+        mutant = text.replace("QUICK_TOTAL = QUICK_TOTAL_DEFAULT\n", 'QUICK_TOTAL = int(os.environ.get("CLOUD_PREFLIGHT_QUICK_TOTAL", "240"))\n')
+        self.assertTrue(mutant != text)
+        script = tool_dir(self.tmp)
+        with open(script, "w") as f:
+            f.write(mutant)
+        env = dict(ENV, CLOUD_PREFLIGHT_BASE="trunk", TMPDIR=self.tmp, CLOUD_PREFLIGHT_QUICK_TOTAL="abc")
+        p = subprocess.run([sys.executable, script], cwd=repo, capture_output=True, text=True, env=env, timeout=120)
+        self.assertNotEqual(p.returncode, 0)  # the mutant breaks the full mode: the test above would fail on it
 
 
 if __name__ == "__main__":

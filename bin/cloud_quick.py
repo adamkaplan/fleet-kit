@@ -45,6 +45,32 @@ def readers(root, tracked, changed, test_ok=is_test):
     return sorted(out)
 
 
+def cannot_run_quick(rel):
+    """A whole shell suite under bin/ (not one of the named scans) cannot finish in a quick run."""
+    return rel.startswith("bin/test-") and rel not in {r for r, _ in SCAN_TESTS}
+
+
+def split_readers(reads):
+    """(runnable, cannot): the readers a quick run can start, and those it cannot."""
+    return [r for r in reads if not cannot_run_quick(r)], [r for r in reads if cannot_run_quick(r)]
+
+
+def not_run_reason(reads, changed):
+    """The ONE no-reader verdict of both commands: None when a quick run can start a reader, else the true reason."""
+    names = ", ".join(sorted(changed))
+    if not reads:
+        return "no check reads " + names
+    runnable, cannot = split_readers(reads)
+    if runnable:
+        return None
+    return "no check that can run in quick reads %s (cannot run in quick: %s)" % (names, ", ".join(sorted(cannot)))
+
+
+def cannot_lines(reads):
+    """One line per reader a quick run cannot start: never silently skipped."""
+    return ["NOT RUN: %s cannot run in quick" % r for r in split_readers(reads)[1]]
+
+
 def mode_line(n_readers, n_changed):
     """The mode line: the match is on the basename, so a doc change can select many files."""
     return "%d checks that read the %d files (basename match)" % (n_readers, n_changed)

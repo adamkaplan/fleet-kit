@@ -123,6 +123,7 @@ def git(args, cwd, check=False):
 
 
 READERS = [0]  # number of reader tests of the last select()
+READ_LIST = []  # the reader tests of the last select(), all of them
 
 
 def _is_test(rel):  # only a fallback of a lone copy without the helper
@@ -137,6 +138,7 @@ def select(root, changed):
     else:
         reads = cloud_quick_lone_readers(root, tracked, changed)
     READERS[0] = len(reads)
+    READ_LIST[:] = reads
     picked = list(reads)
     SCAN_SELECTOR.clear()
     for rel, sel in SCAN_TESTS:
@@ -282,11 +284,15 @@ def main(argv):
 def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started, PF_S, MODE="quick"):
     # Step 1: the preflight of the pod, before any test.
     PREFLIGHT_MODE[0] = MODE
-    no_reader = False
-    if MODE == "quick" and changed:  # decide "no reader" at once: the preflight and every test are skipped
+    print("cloud-prepush: preflight mode: " + MODE, file=sys.stderr, flush=True)
+    reason = None
+    if MODE == "quick" and changed:  # decide "no reader" at once with the preflight's own rule: nothing is started
         select(root, changed)
-        no_reader = not READERS[0]
-    if no_reader:
+        if cloud_quick is not None:
+            reason = cloud_quick.not_run_reason(READ_LIST, changed)
+        elif not READERS[0]:
+            reason = "no check reads " + ", ".join(sorted(changed))
+    if reason:
         ok, plines = True, []
     else:
         ok, plines = preflight(root, base, scratch, max(1, min(PF_S, int(TOTAL_S - (time.monotonic() - started)))))
@@ -295,14 +301,19 @@ def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started,
             print(l)
         print("cloud-prepush: the preflight did not pass; no test was run (advice only)")
         return 1
-    if not no_reader:
+    if not reason:
         print("cloud-prepush: preflight passed", file=sys.stderr)
     picked = select(root, changed)
-    if changed and not READERS[0]:
-        print("NOT RUN: no check reads " + ", ".join(sorted(changed)))
+    if MODE == "full" and changed and not READERS[0]:
+        reason = "no check reads " + ", ".join(sorted(changed))  # full mode: only an empty reader set is a verdict
+    if reason:
+        print("NOT RUN: " + reason)
+        if cloud_quick is not None:
+            for line in cloud_quick.cannot_lines(READ_LIST):
+                print(line)
     if cloud_quick is not None:
         print("cloud-prepush: %s" % cloud_quick.mode_line(READERS[0], len(changed)), file=sys.stderr)
-    if not picked or (changed and not READERS[0]):
+    if not picked or reason:
         print("cloud-prepush: %d changed file(s) but NO test was selected; this is not a clean result (advice only)" % len(changed))
         return 1
     wt = os.path.join(tmp, "base")
@@ -313,6 +324,10 @@ def stage(root, base, mbase, changed, tmp, scratch, TIMEOUT_S, TOTAL_S, started,
     diffs = []
     try:
         for i, rel in enumerate(picked, 1):
+            if MODE == "quick" and cloud_quick is not None and cloud_quick.cannot_run_quick(rel) and rel in READ_LIST:
+                noRun += 1
+                diffs.append("NOT RUN: %s cannot run in quick" % rel)
+                continue
             if rel in HEAVY:
                 noRun += 1
                 diffs.append("skipped: memory-heavy " + rel)
