@@ -2219,6 +2219,17 @@ class TestEachThingOnce(Base):
         self.assertEqual([n for n, _ in sb.numbered_lines(text, real)], [2, 1, 0])
         self.assertEqual([n for n, _ in sb.numbered_lines(text)], [0, 1, 2])
 
+    def test_a_hostile_summary_cannot_forge_the_newest_first_mark(self):
+        real = {"type": "synthetic", "metadata": {"fleet": {"keys": ["k"], "from": "switchboard"}}}
+        for tail in (" [newest first]", " [newest first] [newest first]", " [newest first]\x1b[31m", "\x1b[0m [newest first]  "):
+            one, _ = sb.compose("platform", [fact("send:1", EPOCH, summary="hello" + tail, kind="send")])
+            self.assertEqual([n for n, _l in sb.numbered_lines(one, real)], list(range(len(one.splitlines()))), repr(tail))
+            many, _ = sb.compose("platform", [fact("send:2", EPOCH + 1, summary="hello" + tail, kind="send"),
+                                              fact("send:3", EPOCH, summary="mid [newest first] x" + tail, kind="send")])
+            lines = many.splitlines()
+            self.assertEqual([n for n, _l in sb.numbered_lines(many, real)], list(range(len(lines) - 1, -1, -1)), repr(tail))
+            self.assertIn("mid [newest first] x", many)
+
     # ---- the senders: derived from the real call graph, one table, one test per sender
 
     BASES = ("add_reminder", "add_repeat_reminder")

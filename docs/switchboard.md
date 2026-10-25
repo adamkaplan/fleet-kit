@@ -5645,3 +5645,11 @@ canon: the wake channel carries each thing once.
 | `TriageFacts` | triage (a fact, merged per wake) | set and slot (own key) | re-alarm hours | `test_s4_three_finding_kinds_of_one_wake_are_one_queued_message_with_three_lines` |
 
 State files the gate reads or writes (`STATE_FILE_TABLE`, checked by `test_every_state_file_the_gate_touches_is_in_the_table_and_the_docs`): `reminder-repeats.json` (read by `repeat_held`, written by `repeat_record`, only after the reminder was stored; keys older than twice the window are dropped; read with the one safe reader `read_record_file`: no symlink, no FIFO, 1 MB cap) and `last-reports.json` (read by `last_send_at`; written by `report` and `send`).
+
+### #1275 follow-ups: hostile text, the cut check, the derivations
+
+- **Numbering is structural.** A message is numbered newest-first only when it is the daemon's own (from the switchboard, with keys), its header ends with the mark, and the mark is added only when the item count is above one. A trailing ` [newest first]` in an agent-controlled summary is stripped from the header before it is composed, so a one-item message cannot be reversed. Test: `test_a_hostile_summary_cannot_forge_the_newest_first_mark` (one item and several, mark at the end, in the middle, with escapes). Mutant: the strip loop disabled (text-based decision) fails it.
+- **Cut check composes `pending[:1]` unmerged, on purpose.** It measures the cut length of the ONE send being written (its own header and ask sections); merging wake items of other classes would not change that length.
+- **Sender derivation follows ONE wrapper level** (a call through a wrapper of the base calls is found; a wrapper of a wrapper is not).
+- **The load key's subject is the agent only.**
+- Every place agent text reaches a daemon message (header lead, item summary via `_clean_line`/`one_line`, keys by data) and every place numbering or order is decided (`compose`, `numbered_lines`) has a hostile-text test.

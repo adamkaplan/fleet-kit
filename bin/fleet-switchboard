@@ -3620,7 +3620,10 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
             names = sorted({f.sender for f in taken if f.supersedes and f.sender})
             when = (when[:-1] + "; " if when else " (") + "supersedes %d earlier message%s from %s on this issue, still waiting: sent %s)" % (
                 len(waiting), "" if len(waiting) == 1 else "s", ", ".join(names) or "the same sender", ", ".join(clock_utc(t) for t in waiting[:5]))
-        head = "[switchboard] %d for %s%s: %s" % (count, recipient, when, _one_line(lead.summary, 200))
+        lead_text = _one_line(lead.summary, 200)
+        while lead_text.rstrip().endswith(NEWEST_FIRST_MARK.strip()):   # an agent's text must never forge the daemon's mark (numbering): only the count decides it
+            lead_text = lead_text.rstrip()[:-len(NEWEST_FIRST_MARK.strip())].rstrip()
+        head = "[switchboard] %d for %s%s: %s" % (count, recipient, when, lead_text)
         if count > 1:
             head += NEWEST_FIRST_MARK   # #1275: a reader of the transcript puts the lines back in time order
         idle = [fact for fact in taken if fact.kind == WORKER_IDLE and fact.rider and getattr(fact, "clean", False)]
@@ -4869,6 +4872,7 @@ class Switchboard:
                                 repos=repos, delivered=self.now())
         sent = next((fact for fact in carried if fact.kind == "send"), None)
         if sent is not None and "\n[cut at %d characters]" % MESSAGE_CAP in text[-40:]:  # never cut silently
+            # Unmerged on purpose: this measures the cut length of the ONE send being written (its own header and ask sections); merging wake items of other classes would not change that length.
             whole, _ = compose(plan.recipient, plan.pending[:1], cap=10 ** 9, section=section_resolver(self, observation),
                                repos=repos, delivered=self.now())
             allowed = max(0, len(sent.summary) - (len(whole) - MESSAGE_CAP))
