@@ -2977,6 +2977,11 @@ class Switchboard:
             # #1275: only the asks of the CARRIED facts are told (compose rendered every fact's header)
             self.intents.discard_told()
             compose(plan.recipient, carried, section=section_resolver(self, observation), repos=repos, delivered=self.now())
+        for fact in carried:   # #1302: the lines a shortening dropped are not lost without a trace: ONE bounded audit line per fact
+            gone = getattr(fact, "dropped_lines", None)
+            if gone and self.audit is not None:
+                self.audit.append(self.actor, "shortened", plan.recipient, {
+                    "kind": fact.kind, "key": fact.key, "count": len(gone), "lines": [line[:300] for line in gone[:20]]})
         keys = []
         sent_lines = whole_lines(text)
         for fact in carried:

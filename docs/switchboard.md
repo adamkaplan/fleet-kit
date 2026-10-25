@@ -5812,7 +5812,13 @@ canon: the wake channel carries each thing once.
 - **Answered.** An item the Chief of Staff already answered (a send by it to that agent since the finding; the record is per recipient, not per issue) is not re-raised until its state changes, and for at most 6 hours after the answer.
 - **One message per wake.** Sweeps, triage and load alerts of one wake are one message, one line per item (`merge_wake_facts`, called by the delivery; the first blocked report, an owner wait and a held PR are never folded in).
 - **Order.** `compose` (`compose_order`) puts every pass-through fact (owner wait, held PR, first blocked report, send) BEFORE the reminders (the merged wake fact and the sweep/triage/load items not merged yet), whatever their age; each group is newest first, ties keep the key order. A newer result is never held behind older reminders, and an older owner wait or send is never held behind a newer merged fact: under the message cap the reminders are the ones that wait.
-- **Never cut (#1302).** A single sweep or triage finding over the 4000-character message cap is never cut: `compose` shortens it at its source (one line per item, the count left named, its text cleaned), the cut marker appears on sends only, and a send over the cap is still refused. Over-cap finding kinds: sweep, triage (`OVER_CAP_FINDING_KINDS`, checked by a test).
+- **Never cut (#1302).** A single over-cap fact is never cut for every non-send kind: `compose` shortens it (lines dropped from the end, the count named as "and N more lines not shown", its text cleaned; then flat cuts), at any position (a fact behind others is shortened once it leads a message). A finding over the cap is delivered shortened with the count of dropped lines, and the dropped lines are in the audit (event `shortened`: kind, key, count, the first 300 characters of at most 20 lines), so nothing is lost without a trace. A key is acknowledged once its fact was delivered (shortened); a merged member only if its line is in the message. A send keeps the cut marker by design and a send over the cap is refused.
+
+| Kind (builder) | Over the cap |
+|---|---|
+| sweep (`sweep_queue_fact`), triage (`alert_labels`), alert, wake (merged), plan, pane, headless.*, decoration, intent.edit, report, worker.*, nudge, disk, cpu, mem, spotlight, reminder, janitor, orders-free kinds | shortened (merged into one `wake` first where `merge_wake_facts` applies) |
+| send | cut marker, refused to the sender when too long |
+| orders | the whole orders note (not cut here) |
 - **Short header.** After the first delivery of an ask on a day, its group header is one line of at most 160 characters; the full Intent and Done-when come again on the first delivery of the next day.
 
 | Sender function | Finding kind | Repeat key | Window | Test |

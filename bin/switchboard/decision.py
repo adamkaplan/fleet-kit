@@ -191,7 +191,7 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
         text = render(count)
         if len(text) <= cap:
             return text, facts[:count]
-    if facts[0].kind in ("sweep", "triage") and not getattr(facts[0], "shortened", False):   # #1302: a finding over the cap is shortened at its source (one line per item, the rest named as a count), never cut
+    if facts[0].kind != "send" and not getattr(facts[0], "shortened", False):   # #1302: every non-send fact over the cap (any kind, any position: it is facts[0] once the ones before it are carried) is shortened, the rest named as a count; sends keep the cut marker
         for short in shortened_findings(facts[0], len(text) - cap):
             again, carried = compose(recipient, [short] + facts[1:], cap, section, repos, delivered)
             if len(again) <= cap and "[cut at" not in again[-40:]:
@@ -207,14 +207,20 @@ def shortened_findings(fact, over):
     out = []
     for keep in range(len(lines) - 1, 0, -1):
         left = len(lines) - keep
-        out.append("\n".join(lines[:keep] + ["\u2026 and %d more line%s not shown (shortened at its source)" % (left, "" if left == 1 else "s")]))
+        out.append((lines[keep:], "\n".join(lines[:keep] + ["\u2026 and %d more line%s not shown (shortened at its source)" % (left, "" if left == 1 else "s")])))
     flat = " ".join(lines)
     for size in (2000, 1000, 500, 200, 50, 0):
-        out.append("%s\u2026 (shortened at its source, %d characters not shown)" % (flat[:size], max(0, len(flat) - size)))
-    for text in out:
+        used, gone = 0, []
+        for line in lines:
+            if used >= size:
+                gone.append(line)
+            used += len(line) + 1
+        out.append((gone, "%s\u2026 (shortened at its source, %d characters not shown)" % (flat[:size], max(0, len(flat) - size))))
+    for dropped, text in out:
         short = copy.copy(fact)
         short.summary = text
         short.shortened = True
+        short.dropped_lines = list(dropped)   # the delivery writes them to the audit (one bounded line)
         yield short
 
 

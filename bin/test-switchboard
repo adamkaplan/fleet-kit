@@ -2038,12 +2038,57 @@ class TestCompose(unittest.TestCase):
         self.assertNotIn("[cut at", text)
         self.assertIn("characters not shown", text)
 
-    def test_the_over_cap_table_names_every_long_builder_1302(self):
-        import re as _re
-        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "switchboard", "decision.py")).read()
-        listed = set(_re.findall(r'kind in \(([^)]*)\) and not', src)[0].replace('"', "").replace(" ", "").split(","))
-        self.assertEqual(listed, set(OVER_CAP_FINDING_KINDS))   # the code's kinds and the table are one list
-        self.assertEqual(set(OVER_CAP_FINDING_KINDS), {"sweep", "triage"})
+    def test_the_over_cap_table_names_every_kind_by_ast_1302(self):
+        import ast as _ast, glob as _glob
+        here = os.path.dirname(os.path.abspath(__file__))
+        found = set()
+        for path in [os.path.join(here, "fleet-switchboard")] + _glob.glob(os.path.join(here, "switchboard", "*.py")):
+            for node in _ast.walk(_ast.parse(open(path).read())):
+                if isinstance(node, _ast.Call) and getattr(node.func, "id", None) == "Fact" and len(node.args) > 2 \
+                        and isinstance(node.args[2], _ast.Constant) and isinstance(node.args[2].value, str):
+                    found.add(node.args[2].value)
+        self.assertEqual(found - set(OVER_CAP_KIND_TABLE), set())   # a new kind without a row fails here
+        self.assertEqual(OVER_CAP_KIND_TABLE["send"], "cut")
+
+    def test_every_non_send_kind_over_cap_is_shortened_at_any_position_1302(self):
+        for kind, how in OVER_CAP_KIND_TABLE.items():
+            if how != "shortened":
+                continue
+            body = "\n".join("item %03d %s" % (n, "z" * 60) for n in range(100))
+            big = fact("%s:big" % kind, EPOCH, kind=kind, summary=body)
+            small = fact("%s:small" % kind, EPOCH + 5, kind=kind, summary="ok")
+            for facts in ([big], [small, big], [big, small]):
+                pending = list(facts)
+                seen = set()
+                for _ in range(5):
+                    if not pending:
+                        break
+                    text, carried = sb.compose("platform", pending, cap=4000)
+                    self.assertLessEqual(len(text), 4000, kind)
+                    self.assertNotIn("[cut at", text, kind)
+                    seen |= {f.key for f in carried}
+                    pending = [f for f in pending if f.key not in {c.key for c in carried}]
+                self.assertEqual(seen, {f.key for f in facts}, kind)
+
+    def test_sizes_are_shortened_finite_never_cut_1302(self):
+        import time as _t
+        for body in ("a" * 4001, "b\n" * 6000, "\u00e9\u4e2d" * 6000, "w " * (1 << 19)):
+            started = _t.time()
+            text, carried = sb.compose("platform", [fact("s:1", kind="sweep", summary=body)], cap=4000)
+            self.assertLessEqual(len(text), 4000)
+            self.assertNotIn("[cut at", text)
+            self.assertLess(_t.time() - started, 60)
+            self.assertEqual([f.key for f in carried], ["s:1"])
+
+    def test_a_shortened_fact_keeps_its_dropped_lines_for_the_audit_1302(self):
+        body = "\n".join("item %03d %s" % (n, "z" * 60) for n in range(100))
+        _, carried = sb.compose("platform", [fact("s:1", kind="sweep", summary=body)], cap=4000)
+        self.assertTrue(carried[0].dropped_lines)
+        self.assertTrue(all(line.startswith("item") for line in carried[0].dropped_lines))
+
+    def test_a_send_keeps_the_cut_marker_1302(self):
+        text, _ = sb.compose("platform", [fact("send:1", kind="send", summary="y" * 6000)], cap=4000)
+        self.assertIn("[cut at 4000 characters]", text)
 
     def test_one_item_longer_than_the_cap_is_cut_and_says_so(self):
         text, carried = sb.compose("platform", [fact("big", summary="y" * 5000)], cap=500)
@@ -83474,7 +83519,9 @@ def _clock_at(hour, minute, second=0):
     return calendar.timegm((2027, 1, 15, hour, minute, second))
 
 
-OVER_CAP_FINDING_KINDS = ("sweep", "triage")   # sweep_queue_fact and the triage digest facts
+OVER_CAP_FINDING_KINDS = ("sweep", "triage")
+OVER_CAP_KIND_TABLE = {k: "shortened" for k in ("sweep", "triage", "alert", "plan", "pane", "headless.restarted", "headless.lost", "headless.route", "janitor", "disk", "cpu", "cpu-top", "mem", "spotlight", "reminder", "intent.edit", "wake")}
+OVER_CAP_KIND_TABLE["send"] = "cut"   # sweep_queue_fact and the triage digest facts
 
 
 class TestMessageTimes(unittest.TestCase):
