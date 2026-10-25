@@ -75831,6 +75831,73 @@ class TestLoadAlert(Base):
         fig = self.latest()["orch"]
         self.assertEqual((fig["busy"], fig["idle"]), (1, 1))
 
+    def _cloud_run(self, patch=None):
+        """#1097 R-TEST-1/2: load_tick over a fake cloud record directory: lane orch has 2 live, 1 finished, 1 stale (past deadline), 1 unreadable record; lane orchb has none."""
+        cdir = self.state_dir / "cloud"
+        cdir.mkdir(exist_ok=True)
+        for n, extra in (("l1", {}), ("l2", {}), ("fin", {}), ("old", {"hard_deadline": "2001-01-01T00:00:00Z"})):
+            (cdir / (n + ".json")).write_text(json.dumps(dict({"worker": n, "reports_to": "orch", "hard_deadline": "2999-01-01T00:00:00Z"}, **extra)))
+        (cdir / "bad.json").write_text("{not json")
+        (self.state_dir / "last-reports.json").write_text(json.dumps({"fin": {"state": "done", "at": self.T0}}))
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=None,
+                                       config={"load_alert": self.health.validate({"enabled": True}, "x")})
+        mk = lambda n, role, status="idle", boss=None: types.SimpleNamespace(name=n, session_id=n, status=status, fleet={"role": role, "charter": 1, "repo": "acme/widget", "reports_to": boss})
+        discovery = types.SimpleNamespace(agents={"orch": mk("orch", "orchestrator"), "orchb": mk("orchb", "orchestrator"),
+                                                  "c1": mk("c1", "coder", "working", "orch"), "c2": mk("c2", "coder", "idle", "orch")})
+        if patch:
+            patch()
+        sb.load_tick(engine, discovery)
+        return self.latest()
+
+    def test_the_cloud_figure_is_in_the_load_record_and_the_health_status(self):
+        """Lane with cloud workers (2 live; finished, stale and unreadable records not counted), lane with none (0), local counts apart; the figure is also in the hourly series."""
+        latest = self._cloud_run()
+        self.assertEqual((latest["orch"]["busy"], latest["orch"]["idle"], latest["orch"]["cloud"]), (1, 1, 2))
+        self.assertEqual((latest["orchb"]["busy"], latest["orchb"]["idle"], latest["orchb"]["cloud"]), (0, 0, 0))
+        series = json.loads((self.state_dir / "load.json").read_text())["series"]["orch"]["hours"]
+        self.assertEqual([h["cloud"] for h in series.values()], [2])
+
+    def test_mutant_counting_cloud_as_local_is_caught(self):
+        """Real load_tick over fake discovery and fake cloud records; a spliced mutant that adds cloud workers to busy fails the exact figures."""
+        def figures(latest):
+            return {k: (latest[k]["busy"], latest[k]["idle"], latest[k]["cloud"]) for k in ("orch", "orchb")}
+        self.assertEqual(figures(self._cloud_run()), {"orch": (1, 1, 2), "orchb": (0, 0, 0)})
+        source = SWITCHBOARD.read_text()
+        import re as _re
+        body = _re.search(r"def load_tick\(.*?\n\n\n", source, _re.S).group(0)
+        old = '"busy": sum(1 for c in coders if c.status == "working"),'
+        self.assertIn(old, body)
+        scope = dict(vars(sb))
+        exec(body.replace(old, '"busy": sum(1 for c in coders if c.status == "working") + cloud_live.get(name, 0),'), scope)
+        real = sb.load_tick
+        def patch():
+            sb.load_tick = scope["load_tick"]
+        try:
+            mutated = figures(self._cloud_run(patch))
+        finally:
+            sb.load_tick = real
+        self.assertEqual(mutated["orch"][0], 3)   # the mutant shows busy 3
+        self.assertNotEqual(mutated, {"orch": (1, 1, 2), "orchb": (0, 0, 0)})
+
+    def test_mutant_dropping_the_cloud_count_in_load_tick_is_caught(self):
+        original = sb.live_cloud_by_lane
+        sb.live_cloud_by_lane = lambda *a, **k: {}   # the mutant: the cloud count is dropped
+        try:
+            self.assertEqual(self._cloud_run()["orch"]["cloud"], 0)
+        finally:
+            sb.live_cloud_by_lane = original
+        self.assertEqual(self._cloud_run()["orch"]["cloud"], 2)   # the real build differs from the mutant
+
+    def test_mutant_dropping_the_cloud_figure_in_fleet_health_is_caught(self):
+        health = self.health
+        real = health.figures
+        health.figures = lambda name, info, *a, **k: real(name, dict(info, cloud=0), *a, **k)   # the mutant: health drops cloud
+        try:
+            self.assertEqual(self._cloud_run()["orch"]["cloud"], 0)
+        finally:
+            health.figures = real
+        self.assertEqual(self._cloud_run()["orch"]["cloud"], 2)
+
     def _load_names(self, orchs, retired=None, bodies=None, unreadable=False):
         """Run load_tick over `orchs` ({name: session}) and return the names that got figures."""
         if retired is not None:
@@ -77673,6 +77740,272 @@ class TestSpotlightGuard(Base):
         self.assertEqual(self.sg.parse_count("57\n"), 57)
         for odd in ("", "abc\n", "12 files\n", "1\n2x\n"):
             self.assertIsNone(self.sg.parse_count(odd), odd)
+
+
+class TestCloudLoad(Base):
+    """#1097: the load record counts each lane's live cloud workers apart from the local busy and idle counts."""
+
+    def setUp(self):
+        super().setUp()
+        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.disc = types.SimpleNamespace(agents={"orch": sb.Observation("orch", "s", "w:p", "idle", {"name": "orch", "role": "orchestrator"})})
+
+    def rec(self, name, **extra):
+        directory = self.state_dir / "cloud"
+        directory.mkdir(exist_ok=True)
+        (directory / (name + ".json")).write_text(json.dumps(dict({"worker": name, "reports_to": "orch", "url": "u", "runtime_id": "r", "hard_deadline": "2999-01-01T00:00:00Z"}, **extra)))
+
+    def count(self, fn=None, retired=None, last=None, audit=None):
+        return (fn or sb.live_cloud_by_lane)(self.state_dir, self.disc, retired or {}, last or {}, audit)
+
+    def mutant(self, old, new):
+        import re as _re
+        source = SWITCHBOARD.read_text()
+        body = _re.search(r"def live_cloud_by_lane.*?\n\n\n", source, _re.S).group(0)
+        self.assertIn(old, body)
+        scope = dict(vars(sb))
+        exec(body.replace(old, new), scope)
+        return scope["live_cloud_by_lane"]
+
+    def test_live_workers_counted_by_lane_apart_from_local(self):
+        self.rec("c1"); self.rec("c2"); self.rec("other", reports_to="elsewhere")
+        self.assertEqual(self.count(), {"orch": 2, "elsewhere": 1})
+
+    def test_finished_retired_and_ended_are_not_counted(self):
+        self.rec("fin"); self.rec("ret"); self.rec("old", hard_deadline="2001-01-01T00:00:00Z")
+        self.assertEqual(self.count(retired={"ret": {"at": 1}}, last={"fin": {"state": "done"}}), {})
+
+    def test_no_cloud_directory_is_zero_and_silent(self):
+        self.assertEqual(self.count(), {})
+
+    def test_unreadable_directory_one_audit_line(self):
+        (self.state_dir / "cloud").write_text("not a directory")
+        lines = []
+        audit = types.SimpleNamespace(append=lambda *a: lines.append(a))
+        original = sb.Path.is_dir
+        sb.Path.is_dir = lambda self: True
+        try:
+            self.assertEqual(self.count(audit=audit), {})
+        finally:
+            sb.Path.is_dir = original
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0][1], "load.cloud_unreadable")
+
+    def test_read_is_bounded_and_makes_no_call(self):
+        for i in range(sb.CLOUD_LOAD_MAX_ENTRIES + 5):
+            self.rec("w%03d" % i)
+        calls = []
+        original = sb.subprocess.run
+        sb.subprocess.run = lambda *a, **k: calls.append(a)
+        try:
+            self.assertEqual(self.count()["orch"], sb.CLOUD_LOAD_MAX_ENTRIES)
+        finally:
+            sb.subprocess.run = original
+        self.assertEqual(calls, [])
+
+    def test_mutant_counting_a_finished_worker_is_caught(self):
+        self.rec("fin")
+        broken = self.mutant('(last_reports.get(worker) or {}).get("state") in ("done", "failed")', 'False')
+        self.assertEqual(broken(self.state_dir, self.disc, {}, {"fin": {"state": "done"}}, None), {"orch": 1})   # the mutant differs
+        self.assertEqual(self.count(last={"fin": {"state": "done"}}), {})
+
+    def test_no_boss_worker_counted_under_named_fallback_lane(self):
+        self.rec("c1"); self.rec("lone"); 
+        p = self.state_dir / "cloud" / "lone.json"
+        record = json.loads(p.read_text()); record.pop("reports_to"); p.write_text(json.dumps(record))
+        self.assertEqual(self.count(), {"orch": 1, sb.CLOUD_NO_BOSS_LANE: 1})
+
+    def test_truncation_writes_one_audit_line_per_episode(self):
+        for i in range(sb.CLOUD_LOAD_MAX_ENTRIES + 3):
+            self.rec("w%03d" % i)
+        lines = []
+        audit = types.SimpleNamespace(append=lambda *a: lines.append(a))
+        sb._CLOUD_TRUNCATED.clear()
+        self.count(audit=audit); self.count(audit=audit)
+        self.assertEqual([l[1] for l in lines], ["load.cloud_truncated"])
+        self.assertEqual(lines[0][3]["name"], "CLOUD_LOAD_MAX_ENTRIES")
+        for i in range(10):
+            (self.state_dir / "cloud" / ("w%03d.json" % i)).unlink()
+        self.count(audit=audit)            # the episode ends
+        for i in range(10):
+            self.rec("w%03d" % i)
+        self.count(audit=audit)            # a new episode
+        self.assertEqual(len(lines), 2)
+
+    def test_mutant_silent_truncation_is_caught(self):
+        for i in range(sb.CLOUD_LOAD_MAX_ENTRIES + 3):
+            self.rec("w%03d" % i)
+        broken = self.mutant('"load.cloud_truncated"', '"load.nothing"')
+        lines = []
+        audit = types.SimpleNamespace(append=lambda *a: lines.append(a))
+        sb._CLOUD_TRUNCATED.clear()
+        broken(self.state_dir, self.disc, {}, {}, audit)
+        self.assertNotIn("load.cloud_truncated", [l[1] for l in lines])   # the mutant differs
+        sb._CLOUD_TRUNCATED.clear()
+        self.count(audit=audit)
+        self.assertIn("load.cloud_truncated", [l[1] for l in lines])
+
+    def _raw(self, name, data=b""):
+        d = self.state_dir / "cloud"; d.mkdir(exist_ok=True)
+        (d / name).write_bytes(data)
+
+    def _alarm(self, fn):
+        import signal as _sig
+        def boom(*a):
+            raise AssertionError("the read blocked")
+        old = _sig.signal(_sig.SIGALRM, boom); _sig.alarm(3)
+        try:
+            return fn()
+        finally:
+            _sig.alarm(0); _sig.signal(_sig.SIGALRM, old)
+
+    def _cw_mutant(self, old, new, *more):
+        src = (BIN / "cloud_worker.py").read_text()
+        pairs = [(old, new)] + [(more[i], more[i + 1]) for i in range(0, len(more), 2)]
+        for a, b in pairs:
+            self.assertIn(a, src)
+            src = src.replace(a, b)
+        mod = types.ModuleType("cw_mut")
+        mod.__dict__["__file__"] = str(BIN / "cloud_worker.py")
+        exec(compile(src, "cw_mut", "exec"), mod.__dict__)
+        return mod
+
+    def _with_reader(self, mod, fn):
+        real = sb.load_module
+        sb.load_module = lambda n: mod
+        try:
+            return fn()
+        finally:
+            sb.load_module = real
+
+    def test_fifo_does_not_block(self):
+        self.rec("ok")
+        os.mkfifo(str(self.state_dir / "cloud" / "f.json"))
+        self.assertEqual(self._alarm(self.count), {"orch": 1})
+
+    def test_mutant_blocking_open_is_caught(self):
+        self.rec("ok")
+        os.mkfifo(str(self.state_dir / "cloud" / "f.json"))
+        mod = self._cw_mutant("os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr", "os.O_RDONLY | os.O_NOFOLLOW | getattr")
+        with self.assertRaises(AssertionError):
+            self._with_reader(mod, lambda: self._alarm(self.count))   # the mutant hangs; the alarm fails it
+
+    def test_symlink_is_not_followed(self):
+        self.rec("real", reports_to="orch")
+        d = self.state_dir / "cloud"
+        os.symlink(str(d / "real.json"), str(d / "link.json"))
+        (d / "real.json").write_text(json.dumps({"worker": "link", "reports_to": "orch", "hard_deadline": "2999-01-01T00:00:00Z"}))   # the target names the link's worker
+        self.assertEqual(self.count(), {})   # real.json names "link", not "real": skipped; link.json is a symlink: skipped
+        mod = self._cw_mutant("os.O_NONBLOCK | os.O_NOFOLLOW | getattr", "os.O_NONBLOCK | getattr")
+        self.assertEqual(self._with_reader(mod, self.count), {"orch": 1})   # the mutant follows the link
+
+    def test_hostile_files_are_skipped(self):
+        self.rec("ok")
+        self._raw("huge.json", json.dumps({"worker": "huge", "reports_to": "orch", "hard_deadline": "2999-01-01T00:00:00Z", "pad": "x" * (sb.CLOUD_LOAD_MAX_BYTES + 10)}).encode())
+        self._raw("bin.json", b"\xff\xfe\x00")
+        self._raw("bad.json", b"{not json")
+        self._raw("list.json", b"[1]")
+        (self.state_dir / "cloud" / "dir.json").mkdir()
+        self.assertEqual(self._alarm(self.count), {"orch": 1})
+
+    def test_mutant_unbounded_read_is_caught(self):
+        self._raw("huge.json", json.dumps({"worker": "huge", "reports_to": "orch", "hard_deadline": "2999-01-01T00:00:00Z", "pad": "x" * (sb.CLOUD_LOAD_MAX_BYTES + 10)}).encode())
+        mod = self._cw_mutant("    if len(raw) > max_bytes:\n        return None, \"too_large\"\n", "", "os.read(fd, max_bytes + 1 - len(raw))", "os.read(fd, 1 << 20)")
+        self.assertEqual(self.count(), {})
+        self.assertEqual(self._with_reader(mod, self.count), {"orch": 1})   # no size bound: the huge record is read and counted
+
+    def test_mutant_non_dict_accepted_is_caught(self):
+        self._raw("list.json", b"[1]")
+        mod = self._cw_mutant("    if not isinstance(record, dict):\n        return None, \"wrong_shape\"\n", "")
+        with self.assertRaises(Exception):
+            self._with_reader(mod, self.count)   # the mutant passes a list on, and the caller breaks on it
+        self.assertEqual(self.count(), {})
+
+    def test_mutant_non_utf8_and_bad_json_and_directory_are_caught(self):
+        self.rec("ok")
+        self._raw("bin.json", b"\xff")
+        (self.state_dir / "cloud" / "dir.json").mkdir()
+        self._raw("bad.json", b"{")
+        for pair in (("    except UnicodeDecodeError:\n        return None, \"not_utf8\"", "    except UnicodeDecodeError:\n        raise RuntimeError('x')"),
+                         ("    except (ValueError, RecursionError):\n        return None, \"not_json\"", "    except RecursionError:\n        return None, \"not_json\""),
+                         ("    except OSError:\n        return None, \"not_regular\"\n    finally", "    except OSError:\n        raise\n    finally",
+                          "        if not stat.S_ISREG(os.fstat(fd).st_mode):\n            return None, \"not_regular\"\n", "")):
+            mod = self._cw_mutant(*pair)
+            try:
+                got = self._with_reader(mod, self.count)
+            except Exception:
+                continue   # the mutant breaks the pass: caught
+            self.assertNotEqual(got, {"orch": 1}, pair[0][:40])   # or loses the good record: caught
+        self.assertEqual(self.count(), {"orch": 1})
+
+    def test_record_without_valid_hard_deadline_is_not_live(self):
+        self.rec("a"); self.rec("b", hard_deadline="garbage"); self.rec("c", last_report_at="2001-01-01T00:00:00Z")
+        d = self.state_dir / "cloud"
+        r = json.loads((d / "a.json").read_text()); r.pop("hard_deadline"); (d / "a.json").write_text(json.dumps(r))
+        self.assertEqual(self.count(), {})
+        self.rec("fresh")
+        self.assertEqual(self.count(), {"orch": 1})
+        broken = self.mutant("if ends is None or ends < now:", "if ends is not None and ends < now:")
+        self.assertEqual(broken(self.state_dir, self.disc, {}, {}, None), {"orch": 3})   # the mutant counts the evidence-free records a and b with the fresh one
+
+    def test_scan_stops_at_the_files_bound_and_the_time_bound(self):
+        for i in range(20):
+            self.rec("w%02d" % i)
+        lines = []
+        audit = types.SimpleNamespace(append=lambda *a: lines.append(a))
+        old = sb.CLOUD_LOAD_MAX_SCAN
+        try:
+            sb.CLOUD_LOAD_MAX_SCAN = 5; sb._CLOUD_TRUNCATED.clear()
+            self.assertLessEqual(self.count(audit=audit).get("orch", 0), 5)
+            self.assertEqual(lines[-1][3]["bound"], "files")
+            sb.CLOUD_LOAD_MAX_SCAN = 10 ** 6; sb._CLOUD_TRUNCATED.clear()
+            ticks = iter(range(0, 1000))
+            out = sb.live_cloud_by_lane(self.state_dir, self.disc, {}, {}, audit, None, lambda: next(ticks) * 0.3)
+            self.assertLess(out.get("orch", 0), 20)
+            self.assertEqual(lines[-1][3]["bound"], "time")
+            broken = self.mutant("if clock() > deadline:", "if False:")
+            sb._CLOUD_TRUNCATED.clear(); ticks = iter(range(0, 1000))
+            self.assertEqual(broken(self.state_dir, self.disc, {}, {}, audit, None, lambda: next(ticks) * 0.3), {"orch": 20})
+        finally:
+            sb.CLOUD_LOAD_MAX_SCAN = old
+
+    def test_load_line_text_carries_the_cloud_mark(self):
+        fh = sb.load_fleet_health()
+        src = (BIN / "fleet_health.py").read_text()
+        self.assertIn("\\u2601 cloud", src)
+        self.assertIn('(" +%d\\u2601 cloud" % f["cloud"]) if f.get("cloud")', src)
+
+    def test_a_boss_with_control_characters_is_cleaned_at_the_source_and_a_non_string_is_no_boss(self):
+        self.rec("e", reports_to="a\x1b[31mb\nc"); self.rec("l", reports_to="x" * 500); self.rec("n", reports_to=["orch"]); self.rec("i", reports_to=7)
+        out = self.count()
+        self.assertEqual(out["a[31mbc"], 1)
+        self.assertEqual(out["x" * sb.CLOUD_BOSS_MAX], 1)
+        self.assertEqual(out[sb.CLOUD_NO_BOSS_LANE], 2)
+        self.assertTrue(all(k.isprintable() and len(k) <= sb.CLOUD_BOSS_MAX for k in out))
+        mutant = self.mutant("_cloud_boss(record.get(\"reports_to\"))", "str(record.get(\"reports_to\") or \"\")")   # the mutant: the raw string is the key
+        self.assertNotEqual(self.count(mutant), out)
+
+    def test_a_future_dated_last_report_is_not_fresh(self):
+        self.rec("f", last_report_at="2998-01-01T00:00:00Z")
+        self.assertEqual(self.count(), {})
+        mutant = self.mutant("seen is None or seen > now or", "seen is None or")
+        self.assertEqual(mutant(self.state_dir, self.disc, {}, {}, None), {"orch": 1})
+
+    def test_a_cloud_worker_with_no_orchestrator_lane_is_shown_in_status(self):
+        fh = sb.load_fleet_health()
+        src = (BIN / "fleet_health.py").read_text()
+        self.assertIn('state.get("cloud_unplaced")', src)
+        self.assertIn('state["cloud_unplaced"] = int(getattr(ctx, "cloud_unplaced", 0) or 0)', src)
+        import tempfile
+        d = tempfile.mkdtemp()
+        (Path(d) / "load.json").write_text(json.dumps({"latest": {"o": {"open_asks": 0, "stalled": 0, "oldest_stall_hours": None, "moved_1h": 0, "messages": 0, "decisions": 0, "busy": 0, "idle": 0}}, "cloud_unplaced": 2}))
+        lines = fh.status_lines(d, 1000)
+        self.assertTrue(any("2 live cloud worker(s) with no orchestrator lane" in l for l in lines), lines)
+
+    def test_now_is_injected(self):
+        self.rec("w", hard_deadline="2030-01-01T00:00:00Z")
+        self.assertEqual(self.disc and sb.live_cloud_by_lane(self.state_dir, self.disc, {}, {}, None, 1893456001.0 - 86400 * 365 * 5), {"orch": 1})
+        self.assertEqual(sb.live_cloud_by_lane(self.state_dir, self.disc, {}, {}, None, 1893456001.0), {})   # 2030-01-01T00:00:01Z
 
 
 class TestCoderBooks(Base):
