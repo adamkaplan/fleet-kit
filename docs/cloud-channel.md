@@ -9,7 +9,11 @@ One document to set up, run and take down the cloud hub and the pod-side command
   to the recipient agent's OpenCode session. Routes:
   - `POST /message`: JSON body `{"sender", "recipient", "key", "text"}` with `Authorization: Bearer <token>`.
   - `GET /decisions`: serves the JSON object from the file named by `FLEET_CLOUD_HUB_DECISIONS`
-    (`{"decisions": [], "errors": []}` if the file is absent), behind the same token check.
+    (`{"decisions": [], "errors": []}` if the file is absent), behind the same token check and the same reserved-name refusal as
+    POST (a token of a reserved service account other than the captain is refused 401 here too). The answer is scoped per caller: the captain sees the whole file; any other agent sees only the
+    decisions whose `"agent"` field equals its pinned name (a decision with no `"agent"` field is the captain's alone; no `errors`).
+    This is a trust choice: the captain is the orchestrator's own boss identity, and no pod can obtain that name (it is a reserved
+    name: refused on send, and a secrets file that names it refuses everyone).
   - POST to a path other than /message and GET to a path other than /decisions answer 404. PUT, DELETE and PATCH answer 405 on
     any path. GET /message answers 404. HEAD and OPTIONS are not handled (501).
 - **The pod command** (`bin/cloud_cli.py`) runs in an agent pod and sends through the channel (via `bin/cloud_client.py`):
@@ -22,6 +26,8 @@ The sender is always the agent the token proves, never a name in the body: a bod
 
 ## Set up the hub
 
+In a cluster the hub is defined by `cloud/k8s/cloud-hub.yaml` (see `docs/cloud-operator-quickstart.md`, section 4c). Install it once with `kubectl create -f cloud/k8s/cloud-hub.yaml`; never apply the whole file again: applying the whole file again resets the registry Secret to empty objects and deregisters every live agent until the launcher registers them again. Change the image with `kubectl -n cw set image deployment/cloud-hub hub=<registry>/<repository>@sha256:<digest>`. Roll back with `kubectl -n cw delete deployment,service -l app.kubernetes.io/part-of=cloud-hub`; adding `secret` to that list also deletes both Secrets (the registry and the per-agent passwords), and running agents cannot message until they are relaunched. An agent's URL has the form `http://<pod name>.cw-agents.cw.svc.cluster.local:4096`. The network boundary of the hub (which pods may reach it, which hosts it may reach) is enforced by the namespace's network policies, which are written in a separate manifest file under ask #1256 (cloud/k8s/cloud-hub-network.yaml); until that file is merged the policies exist only as applied in the cluster.
+
 Start it with `python3 bin/cloud_hub.py` (from `bin/`'s directory or with it importable; it imports `cloud_channel` and
 `cloud_channel_server`). Configure through the environment:
 
@@ -31,6 +37,7 @@ Start it with `python3 bin/cloud_hub.py` (from `bin/`'s directory or with it imp
 | `FLEET_CLOUD_HUB_AGENTS` | Path to the `agents.json` file (below). Read at each message. |
 | `FLEET_CLOUD_HUB_SECRETS` | Path to the `secrets.json` file (below). When set, secrets mode is used instead of the cluster TokenReview. |
 | `FLEET_CLOUD_HUB_DECISIONS` | Path to the JSON file served at `GET /decisions`. |
+| `FLEET_CLOUD_AGENT_NAMESPACE` | Required when listening: the namespace agent accounts belong to (a namespace name; the manifest sets `cw`). Read once at start; missing or malformed stops the hub with `cloud-hub: FLEET_CLOUD_AGENT_NAMESPACE missing or not a namespace name`. |
 | `FLEET_CLOUD_CHANNEL_AUDIENCE` | Optional (TokenReview mode only): the audience the token must be issued for. |
 
 Audit lines go to stdout as JSON lines `{"ts", "line"}`; no token is logged.
@@ -39,18 +46,22 @@ Audit lines go to stdout as JSON lines `{"ts", "line"}`; no token is logged.
 
 Default (no `FLEET_CLOUD_HUB_SECRETS`): the hub posts the bearer token to the in-cluster TokenReview API
 (`https://kubernetes.default.svc/apis/authentication.k8s.io/v1/tokenreviews`) using its own service account token and CA from
-`/var/run/secrets/kubernetes.io/serviceaccount`. The token must be authenticated and belong to a ServiceAccount in the namespace `fleet-agents`; the ServiceAccount name is the agent name
+`/var/run/secrets/kubernetes.io/serviceaccount`. The token must be authenticated and belong to a ServiceAccount in the namespace named by `FLEET_CLOUD_AGENT_NAMESPACE` (value `cw` in the manifest); the ServiceAccount name is the agent name
 (lowercase letters, digits, `-`, at most 63 characters). The token must carry the channel audience. By default that is `fleet-switchboard`. If `FLEET_CLOUD_CHANNEL_AUDIENCE` is set, the hub asks the cluster for that audience instead. If the cluster cannot be asked the answer is 503: nothing is let through.
 
 Reserved names (`captain`, `switchboard`, `fleet-switchboard`, `hub`, `admin`) are refused as sender or recipient (403), and a
 token that proves a reserved name is refused. Service accounts in the agents' namespace are trusted as agents, so keep reserved
 names out of that namespace.
 
+### Cause of the namespace setting (ask #1273)
+
+The code once pinned a constant named `fleet-agents` as the namespace a token must come from, while the hub runs in, and the launcher makes agent accounts for, the namespace `cw`. The constant is gone: the namespace is the one setting `FLEET_CLOUD_AGENT_NAMESPACE`. Nothing was broken: the prefix is only a label in secrets mode (the live hub's mode); in TokenReview mode an account of `cw` would have been refused and one of the old name accepted. Registries written by the launcher hold no namespace; one written by hand that names the old namespace must be rewritten before TokenReview mode is turned on.
+
 ### Secrets mode
 
 When `FLEET_CLOUD_HUB_SECRETS` is set, the hub hashes the bearer token with SHA-256 and compares it
 (`hmac.compare_digest`, against every entry) with the digests in `secrets.json`. A match yields the agent whose entry matched, in
-namespace `fleet-agents`. The file is read at each request (at most 8 MiB).
+the namespace named by `FLEET_CLOUD_AGENT_NAMESPACE` (the prefix is only a label in secrets mode). The file is read at each request (at most 8 MiB).
 
 It refuses every request (401 or 503) if the file is missing, empty or malformed, is not an object, holds a duplicate digest, or
 names a reserved agent.
@@ -77,7 +88,9 @@ A JSON object keyed by agent name:
 ```
 
 - `url`: `http` or `https`. `http` is accepted only for loopback, `localhost`, a `.svc` or `.svc.cluster.local` host, or a bare
-  single-label host; any other host must be `https`.
+  single-label host; any other host must be `https`. The host is parsed with the `ipaddress` module: a literal address passes only if
+  it is loopback (link-local, unspecified, multicast and private addresses are refused), and a name with an all-digit label, a `0x`
+  label or no letter (integer, octal, hex and dotless forms of an address) is refused.
 - `session`: letters, digits, `_`, `-`, 1 to 100 characters.
 - `password_file`: file holding the agent's OpenCode password (at most 4096 characters, no control characters, trailing newline
   removed); sent as Basic auth with user `opencode`.
@@ -102,6 +115,7 @@ secret itself in the file.
 | `FLEET_AGENT_NAME` | This agent's name (the sender). Required. |
 | `FLEET_BOSS` | The agent that `report` goes to. Required for `report`. |
 | `FLEET_CLOUD_CHANNEL_URL` | `http` or `https` URL of the hub, without user information. The command posts to this URL exactly as given, so it must include the `/message` path; redirects are refused. |
+| `FLEET_CLOUD_ALLOW_HTTP_HOST` | Optional. The command refuses to send the token over plain `http` unless the host is loopback or is exactly this host (one line, exit 2, no request). |
 | `FLEET_CLOUD_TOKEN_FILE` | Optional path to the token file; default `/var/run/secrets/tokens/fleet-switchboard`. |
 
 The token file is read at each try: ASCII token characters only, at most 4096 bytes. The token is never printed.
@@ -136,14 +150,31 @@ The command makes up to 3 tries with one key. It retries only on a transport fai
 - The remembered keys are held in memory only, at most 10000 pairs, the least recently seen key is forgotten first (a repeat refreshes a key). A hub restart forgets all of them, so
   a duplicate is possible after a restart (and after a key ages out of the 10000).
 
+## Hardening guards
+
+Each guard has a test that fails when it is removed (in `bin/test-cloud-hub` and `bin/test-cloud-cli`):
+
+- **Framing.** Both markers of each message carry a fresh random nonce the body cannot know. A body that holds the hub's header
+  shape (`[Message from agent`) or either marker is refused (503 to the sender, nothing delivered). Control characters, C1 controls,
+  U+2028/U+2029 and bidirectional controls are stripped from the body.
+- **Decisions read.** Same reserved-name refusal as send, and scoped per agent (see above).
+- **Agent URL host.** See the `url` rule above.
+- **Plain http from the command.** Refused unless loopback, a `.svc` / `.svc.cluster.local` name, or named in `FLEET_CLOUD_ALLOW_HTTP_HOST`. For an in-cluster hub over
+  http, set that variable to the hub's host name.
+- **Dedupe.** The key holds the token-pinned sender; each sender keeps at most 1000 remembered keys (its own oldest is forgotten
+  first), and the global cap forgets the oldest key of the sender holding the most, so one sender cannot flush another's.
+- **Command limits.** 10 second timeout, 64 KiB cap on a reply body, one-line output, sender stripped, the hub's reason shown in a
+  refusal, default token path `/var/run/secrets/tokens/fleet-switchboard`.
+
 ## Network boundary
 
 The hub speaks plain http; there is no TLS in the listener. The intended deployment is the hub and the agent pods in one
 namespace, with a NetworkPolicy admitting only agent pods to the hub port. The code does not require or enforce this. The bearer
 token and message text cross that network unencrypted. The hub does not check the source of a request beyond the token.
+The network policies that implement this boundary are in cloud/k8s/cloud-hub-network.yaml (the six policies exactly as applied). Two limits of those policies, as applied: `allow-egress` selects every pod of the namespace, so the hub itself may also reach the internet on ports 80 and 443 outside the excepted private ranges; and no cluster or pod CIDR is excepted, which is acceptable only because the cluster's ranges lie inside the private ranges that are excepted (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10).
 
 What the code does accept as an agent (`bin/cloud_channel.py`): a token whose username is `system:serviceaccount:<namespace>:<name>`
-(prefix `system:serviceaccount:`) with the namespace exactly `fleet-agents` (the `NAMESPACE` constant) and a name that is a valid
+(prefix `system:serviceaccount:`) with the namespace exactly the one named by `FLEET_CLOUD_AGENT_NAMESPACE` (value `cw` in the manifest; read once at start) and a name that is a valid
 agent name. Any ServiceAccount in that namespace is accepted, wherever the request comes from; any other namespace is refused.
 
 ## Take down
