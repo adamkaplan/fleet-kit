@@ -118,11 +118,19 @@ def _from_entries(entries, pod, call_id):
     for e in entries:
         if e.get("by") == pod and e.get("call_id") == call_id:
             return {"seq": e["seq"], "hash": e["hash"], "command": {"proof": "prove", "verdict": "verdict"}.get(e.get("kind")),
-                    "pr": e.get("pr"), "head": e.get("head")}
+                    "pr": e.get("pr"), "head": e.get("head"), "scenario": e.get("scenario"), "result": e.get("result"),
+                    "evidence": e.get("evidence")}
     return None
 
 
-def _same_call(known, command, pr, head):
+def args_digest(args):
+    return hashlib.sha256(json.dumps(args, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _same_call(known, command, pr, head, digest=None):
+    """Same command, pr, head and (when the record carries one) the same args digest: a replay must be the call that was recorded."""
+    if "args" in known and known.get("args") != digest:
+        return False
     return known.get("command") == command and known.get("pr") == pr and known.get("head") == head
 
 
@@ -182,18 +190,21 @@ class Executor:
                 return 200, "reported", None
             known = self.index.get(pod, cid)
             if known:
-                if not _same_call(known, command, pr, call["head"]):
+                if not _same_call(known, command, pr, call["head"], args_digest(args)):
                     raise Refuse(409, "call_id reused for a different call")
                 return 200, "replay: already recorded", _answer(known)
             record = self._write(command, pod, req, call, pr, cid, args)
-            self.index.put(pod, cid, dict(record, command=command, pr=pr, head=call["head"]))
+            self.index.put(pod, cid, dict(record, command=command, pr=pr, head=call["head"], args=args_digest(args)))
             return 200, "recorded", record
         except Replay as rep:
-            if not _same_call(rep.record, command, pr, call.get("head")):
+            first = rep.record   # rebuilt from the ledger entry: no digest, so compare what the entry holds
+            clipped = plan_ledger.clip(str(args.get("evidence") or "").strip(), plan_ledger.EVIDENCE_LIMIT)
+            if (not _same_call(first, command, pr, call.get("head")) or first.get("scenario") != args.get("scenario")
+                    or first.get("result") != args.get("result") or first.get("evidence") != clipped):
                 self.backend.audit("relay.refused", pr, {"by": pod, "status": 409, "why": "call_id reused for a different call"})
                 return 409, "call_id reused for a different call", None
-            self.index.put(pod, cid, rep.record)
-            return 200, "replay: already recorded", _answer(rep.record)
+            self.index.put(pod, cid, dict(_answer(first), command=command, pr=pr, head=call.get("head"), args=args_digest(args)))
+            return 200, "replay: already recorded", _answer(first)
         except Refuse as err:
             self.backend.audit("relay.refused", pr, {"by": pod, "status": err.status, "why": clean_text(err.detail or err.reason)})
             return err.status, err.reason, None
@@ -270,6 +281,8 @@ def pass_once(executor, fetch, post):
     pending = fetch() or {}
     done = 0
     for req in (pending.get("requests") or [])[:10]:
+        if not isinstance(req, dict):
+            continue
         rid = req.get("id")
         if not isinstance(rid, str) or not RID_RE.fullmatch(rid):   # the id goes into a URL path: only what the hub generates
             continue

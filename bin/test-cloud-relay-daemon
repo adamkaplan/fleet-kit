@@ -85,7 +85,7 @@ class FakeHub:
 
     def post(self, rid, body):
         self.results[rid] = body
-        self.queue = [q for q in self.queue if q.get("id") != rid]
+        self.queue = [q for q in self.queue if not isinstance(q, dict) or q.get("id") != rid]
 
 
 PROVE = dict(scenario="S1", result="pass", evidence="ran it")
@@ -267,7 +267,36 @@ class Case(Fixture):
         again = self.run_one(CODER, "prove", cid="X", **PROVE)
         self.assertEqual((again["status"], again["record"]), (200, first["record"]))
         self.assertEqual(len(self.entries()), 1)
-        self.assertEqual(set(relay.Index(self.state)._read()["%s\nX" % CODER]), {"seq", "hash", "command", "pr", "head"})
+        self.assertEqual(set(relay.Index(self.state)._read()["%s\nX" % CODER]), {"seq", "hash", "command", "pr", "head", "args"})
+
+    def test_replay_with_different_args_is_409_and_writes_nothing(self):
+        self.proved()
+        self.run_one(CODER, "prove", cid="R", **PROVE)
+        self.run_one(TESTER, "verdict", cid="RV", **VERDICT)
+        for who, cmd, base in ((CODER, "prove", PROVE), (TESTER, "verdict", VERDICT)):
+            cid = "R" if cmd == "prove" else "RV"
+            for change in ({"evidence": "other words"}, {"result": "fail"}, {"scenario": "S2"}):
+                before, audits = self.raw(), len(self.backend.audits)
+                got = self.run_one(who, cmd, cid=cid, **dict(base, **change))
+                self.assertEqual((got["status"], got["reason"], got["record"]), (409, "call_id reused for a different call", None))
+                self.assertEqual(self.raw(), before)
+            same = self.run_one(who, cmd, cid=cid, **base)
+            self.assertEqual((same["status"], same["reason"]), (200, "replay: already recorded"))
+
+    def test_replay_with_different_args_after_the_index_is_gone_is_409(self):
+        first = self.run_one(CODER, "prove", cid="X", **PROVE)
+        (Path(self.state) / relay.INDEX_FILE).unlink()
+        before = self.raw()
+        got = self.run_one(CODER, "prove", cid="X", **dict(PROVE, evidence="different"))
+        self.assertEqual((got["status"], got["record"]), (409, None))
+        self.assertEqual(self.raw(), before)
+
+    def test_non_dict_entry_does_not_abort_the_batch(self):
+        rid = self.hub.submit(CODER, "prove", **PROVE)
+        self.hub.queue.insert(0, "junk")
+        self.hub.queue.insert(0, None)
+        self.assertEqual(relay.pass_once(self.ex, self.hub.fetch, self.hub.post), 1)
+        self.assertEqual(self.hub.results[rid]["status"], 200)
 
     # ---- finding 2: index file
     def test_index_is_pruned_and_uses_unique_tmp_names(self):
@@ -478,7 +507,9 @@ class RealRuleMutants(unittest.TestCase):
     def test_unmutated_guards_pass(self):   # the same guards, run for real, so a mutant test cannot pass through a broken guard
         for guard in ("test_stale_head", "test_head_moves_inside_decision", "test_proof_from_non_holder_403", "test_author_verdict_403",
                       "test_github_author_verdict_403", "test_non_evaluator_403",
-                      "test_pr_not_linked_to_the_pods_issue_refused_for_all_three", "test_same_call_id_two_pods"):
+                      "test_pr_not_linked_to_the_pods_issue_refused_for_all_three", "test_same_call_id_two_pods",
+                      "test_replay_with_different_args_is_409_and_writes_nothing",
+                      "test_replay_with_different_args_after_the_index_is_gone_is_409"):
             case = Case(guard)
             case.setUp()
             getattr(case, guard)()
@@ -505,6 +536,15 @@ class RealRuleMutants(unittest.TestCase):
     def test_mutant_pr_issue_link_removed(self):
         self.patch(relay.Executor, "_check_linked", lambda ex, pr, req: None)
         self.caught("test_pr_not_linked_to_the_pods_issue_refused_for_all_three")
+
+    def test_mutant_args_digest_ignored(self):
+        same = relay._same_call
+        self.patch(relay, "_same_call", lambda known, command, pr, head, digest=None: same(dict(known, args=digest) if "args" in known else known, command, pr, head, digest))
+        self.caught("test_replay_with_different_args_is_409_and_writes_nothing")
+
+    def test_mutant_replay_in_build_ignores_args(self):
+        self.patch(plan_ledger, "clip", lambda text, *a: "ran it")   # the replay's evidence comparison collapses
+        self.caught("test_replay_with_different_args_after_the_index_is_gone_is_409")
 
     def test_mutant_call_id_global_not_per_pod(self):
         key = lambda pod: "any" if "\n" not in pod else pod

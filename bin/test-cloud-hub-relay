@@ -193,6 +193,33 @@ class TestRoundTrip(unittest.TestCase):
                 self.assertEqual((status, body["error"]), (409, "call_id reused for a different call"))
             self.assertEqual(len(hub.call("GET", "/relay/pending", who="daemon")[1]["requests"]), 1)
 
+    def test_same_call_id_with_different_args_is_409_and_same_args_joins(self):
+        with Hub(wait=0.1) as hub:
+            self.assertEqual(hub.relay_call()[0], 504)
+            status, body = hub.relay_call(args={"scenario": "S2"})
+            self.assertEqual((status, body["error"]), (409, "call_id reused for a different call"))
+            self.assertEqual(hub.relay_call(args={"scenario": "S1"})[0], 504)   # the same call joins the queued entry
+            self.assertEqual(len(hub.call("GET", "/relay/pending", who="daemon")[1]["requests"]), 1)
+
+    def test_mutant_fingerprint_without_args_lets_a_different_call_join(self):
+        old = cloud_relay.fingerprint
+        cloud_relay.fingerprint = lambda call: (call.get("command"), call.get("pr"), call.get("head"))
+        try:
+            with Hub(wait=0.1) as hub:
+                hub.relay_call()
+                self.assertNotEqual(hub.relay_call(args={"scenario": "S2"})[0], 409)   # the mutant is what the test above forbids
+        finally:
+            cloud_relay.fingerprint = old
+
+    def test_arg_key_is_not_echoed_in_the_refusal(self):
+        with Hub() as hub:
+            key = "k\x1b[31m\nforged-line"
+            status, body = hub.relay_call(args={key: {"nested": 1}})
+            self.assertEqual(status, 400)
+            self.assertNotIn("forged", body["error"])
+            self.assertFalse(any("forged" in l for l in hub.lines), hub.lines)
+            self.assertFalse(any("\x1b" in l for l in hub.lines))
+
     def test_a_refused_answer_is_not_replayable(self):
         with Hub(wait=0.1) as hub:
             self.assertEqual(hub.relay_call()[0], 504)

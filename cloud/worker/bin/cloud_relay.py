@@ -14,6 +14,8 @@ evaluated afresh; a replay whose command, pr or head differs is 409), else queue
 A call not answered within WAIT seconds gets 504 and its entry stays queued, so the same call id is replay-safe.
 """
 import collections
+import hashlib
+import json
 import re
 import threading
 import time
@@ -49,8 +51,9 @@ class Refusal(Exception):
 
 
 def fingerprint(call):
-    """What makes two calls with one call_id the same call: command, pr and head."""
-    return (call.get("command"), call.get("pr"), call.get("head"))
+    """What makes two calls with one call_id the same call: command, pr, head and a digest of the whole args (evidence text included)."""
+    args = json.dumps(call.get("args"), sort_keys=True, default=str)
+    return (call.get("command"), call.get("pr"), call.get("head"), hashlib.sha256(args.encode()).hexdigest())
 
 
 class Entry:
@@ -138,7 +141,7 @@ class Relay:
             if len(args) > MAX_ARGS or not isinstance(key, str) or len(key) > MAX_ARG_KEY:
                 raise Refusal(400, "args: at most %d fields, names up to %d characters" % (MAX_ARGS, MAX_ARG_KEY))
             if not (value is None or isinstance(value, (bool, int)) or (isinstance(value, str) and len(value) <= MAX_ARG_VALUE)):
-                raise Refusal(400, "args.%s: a string up to %d characters, a number, a boolean or null" % (key[:MAX_ARG_KEY], MAX_ARG_VALUE))
+                raise Refusal(400, "args: a value is a string up to %d characters, a number, a boolean or null" % MAX_ARG_VALUE)
         call = {"call_id": call_id, "command": command, "pr": pr, "args": args}
         if head is not None:
             call["head"] = head
