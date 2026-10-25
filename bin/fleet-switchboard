@@ -3574,7 +3574,7 @@ def superseded_by(facts):
 
 
 def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, delivered=None):
-    """One message for `facts`, oldest first. Returns (text, the facts it carries). With `delivered` (epoch) the header says when the
+    """One message for `facts`, newest first (a newer result is never held behind older reminders). Returns (text, the facts it carries). With `delivered` (epoch) the header says when the
     message was sent (the carried facts' creation) and when it is delivered; a send that a NEWER one from the same sender about the
     same issue replaces (`superseded_by`) stays in the message, marked, so no key is left out of what is acknowledged.
 
@@ -3584,13 +3584,16 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
     cap is cut, and says so. With `section` (PR 6, see sectioned_lines) every
     item that names an issue sits under its ask's Intent lines.
     """
-    facts = sorted(facts, key=lambda fact: (fact.created, fact.key))
+    facts = sorted(facts, key=lambda fact: (-fact.created, fact.key))   # #1275: newest first; ties keep the key order
     if not facts:
         raise ValueError("nothing to compose")
     if facts[0].orders:  # PR 17: the orders note, whole: every order
         return orders_note(recipient, facts[0], repos), facts[:1]
 
     replaced = {}
+    if section is not None:   # one answer per ask for the whole compose (the retries under the cap must not turn a full header into a brief one)
+        _asked, _section = {}, section
+        section = lambda issue, repo=None: _asked.setdefault((issue, repo), _section(issue, repo))
 
     def item(fact):
         where = " (issue %s)" % issue_tag(fact.repo, fact.issue, repos) if fact.issue else ""
@@ -14835,8 +14838,10 @@ def blocked_tick(engine, discovery, held):
         if cos and cos not in recipients:
             recipients.append(cos)
         recipients = [r for r in recipients if r != observation.name]
-        for who in recipients:
-            add_reminder(engine.state_dir, who, now, now, "Blocked agent: " + text)
+        for who in recipients:   # #1275: only a REPEAT of the same state is held (6 hours); the first report and the end line always pass
+            state_key = "%s|%s|%s" % (event, detail.get("held"), detail.get("refused"))
+            add_repeat_reminder(engine.state_dir, who, now, now, "Blocked agent: " + text, "blocked-agent", observation.name, state_key,
+                                first=event != "blocked.repeat", answered_at=last_send_at(engine.state_dir, who, observation.name) if who == cos else None)
         if engine.audit is not None:
             engine.audit.append(engine.actor, event, observation.name, dict(detail, told=recipients, text=_one_line(text, 400)))
 
@@ -18684,6 +18689,7 @@ DEFAULTS.update(INTENT_DEFAULTS)
 NO_INTENT = "no intent recorded"
 INTENT_TTL = 300        # seconds a cached issue is trusted; a webhook invalidates it sooner
 INTENT_TTL_LIVE = 1800  # ... while the repo's webhook forwarder is live (the same one that cached it): the webhook is what invalidates
+ASK_BRIEF = 160  # characters of an ask's header after its first delivery of the day
 INTENT_LINE_LIMIT = 240  # characters per header line
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
@@ -18962,9 +18968,14 @@ class IntentReader:
         ask_issue = self.issue(ask, repo)
         if ask_issue.charter:
             return None
+        lines = ask_lines(ask_issue, issue_tag(repo, ask, repos))
+        day, told = int(self.now() // 86400), self.__dict__.setdefault("_told_day", {})
+        if told.get((repo, ask)) == day:   # #1275: the full Intent and Done-when only on the first delivery per ask per day
+            lines = [_one_line(" ".join(lines), ASK_BRIEF)]
+        told[(repo, ask)] = day
         if work is None:
-            return ask, ask_lines(ask_issue, issue_tag(repo, ask, repos)), None, []
-        return (ask, ask_lines(ask_issue, issue_tag(repo, ask, repos)), work,
+            return ask, lines, None, []
+        return (ask, lines, work,
                 work_lines(self.issue(work, repo), issue_tag(repo, work, repos)))
 
     def missing_intent(self, number, repo=None):
@@ -26061,7 +26072,8 @@ def load_tick(engine, discovery):
         return int(found.group(2)) if found and found.group(1).lower() == str(repo).lower() else None
 
     def wake(text):
-        add_reminder(engine.state_dir, cos, now, now, text)
+        if add_repeat_reminder(engine.state_dir, cos, now, now, text, "load-alert", "load", text) is None:
+            return   # #1275: the same alert text within 6 hours is a repeat
         if engine.audit is not None:
             engine.audit.append(engine.actor, "load.alert", cos, {"text": _one_line(text, 400)})
 
@@ -26273,6 +26285,7 @@ def cmd_charter(args, runner, now):
             parent = engine.intents.parent(value, repo0)   # None only for the "no parent" answer; any other failure raises
             labelled = None
             if parent is None:   # a charter has no parent: the one extra read is its label
+                engine.intents.invalidate(value, repo0)   # #1275: the label is read fresh, never from the ttl cache
                 labelled = orchestrator_label(engine.config) in (engine.intents.issue(value, repo0).labels or [])
             pre = {"key": (value, repo0), "parent": parent, "labelled": labelled}
         except Exception as err:

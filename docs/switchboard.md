@@ -5580,3 +5580,22 @@ Cause: a review marker (`<!-- fleet-switchboard:from=NAME -->`) was written only
 - `gates` prints `blocking review: <name> CHANGES_REQUESTED at <head> (dismiss with: fleet-switchboard review dismiss ...)` for each LOGIN whose latest decisive review (dismissals count) is CHANGES_REQUESTED while GitHub's reviewDecision says so: the same rule as the merge shim, one function in `shims/review_rule.py`, with a parity test.
 
 The reviewer definitions and the review skill name these commands, not the bare GitHub command. A cloud reader can use them once its token allows it (a separate question for the owner).
+
+## Each thing once on the Chief of Staff's wake channel (#1275)
+
+canon: the wake channel carries each thing once.
+
+- **6 hours.** A reminder with the same kind, the same subject and an unchanged state is delivered at most once per 6 hours; a change of state delivers at once. The first report of a dead or blocked agent, an owner wait and a held PR are never held: only repeats are.
+- **Answered.** An item the Chief of Staff already answered (a send to that agent since the finding) is not re-raised until its state changes.
+- **One message per wake.** Sweeps, triage and load alerts of one wake are one message, one line per item (`merge_wake`).
+- **Newest first.** `compose` orders a message newest first (oldest last); ties keep the key order. A newer result is never held behind older reminders, and under the message cap the older ones are the ones that wait.
+- **Short header.** After the first delivery of an ask on a day, its group header is one line of at most 160 characters; the full Intent and Done-when come again on the first delivery of the next day.
+
+| Sender function | Finding kind | Repeat key | Window | Test |
+| --- | --- | --- | --- | --- |
+| `tell` | Blocked agent | agent, recipient, held, refused | 6 hours; first report and end line at once | `test_s2_s3_the_same_state_is_delivered_once_per_six_hours` |
+| `load_tick` | load alert | alert text | 6 hours | `test_blocked_agent_and_load_alert_senders_are_gated` |
+| `friction_tick` | friction wake | slot (own state) | per slot | `test_s7_the_table_names_every_sender_found_in_the_source` |
+| `cmd_budget_notice` | budget notice | account (own claim) | 1 hour | `test_s7_the_table_names_every_sender_found_in_the_source` |
+| `_impact_matrix_episode` | impact matrix unreadable | episode (own state) | per episode | `test_s7_the_table_names_every_sender_found_in_the_source` |
+| `_impact_post_list` | owner-hold rule list | rule version (own state) | per rule | `test_s7_the_table_names_every_sender_found_in_the_source` |

@@ -2886,12 +2886,12 @@ class TestCompose(unittest.TestCase):
             fact("a", EPOCH, summary="First thing"),
         ])
         self.assertEqual(text.splitlines(), [
-            "[switchboard] 2 for platform: First thing",
-            "- lab.fact from the fleet: First thing",
+            "[switchboard] 2 for platform: Second with detail",
             "- review from coder (issue #7): Second",
             "  with detail",
+            "- lab.fact from the fleet: First thing",
         ])
-        self.assertEqual([f.key for f in carried], ["a", "b"])
+        self.assertEqual([f.key for f in carried], ["b", "a"])   # #1275: newest first
 
     def test_the_cap_leaves_the_rest_pending_and_says_so(self):
         facts = [fact("k%02d" % n, EPOCH + n, summary="x" * 300) for n in range(30)]
@@ -2899,13 +2899,99 @@ class TestCompose(unittest.TestCase):
         self.assertLessEqual(len(text), 1000)
         self.assertEqual(len(carried), 2)
         self.assertTrue(text.endswith("\u2026 and 28 more: run fleet-switchboard pending platform"))
-        self.assertEqual([f.key for f in carried], ["k00", "k01"])
+        self.assertEqual([f.key for f in carried], ["k29", "k28"])
 
     def test_one_item_longer_than_the_cap_is_cut_and_says_so(self):
         text, carried = sb.compose("platform", [fact("big", summary="y" * 5000)], cap=500)
         self.assertEqual(len(text), 500)
         self.assertTrue(text.endswith("[cut at 500 characters]"))
         self.assertEqual(len(carried), 1)
+
+
+class TestEachThingOnce(Base):
+    """#1275: repeats collapse by (kind, subject, state), newest first, one message per wake, a short header, the finding table is complete."""
+
+    def setUp(self):
+        super().setUp()
+        self.state = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
+        self.addCleanup(shutil.rmtree, self.state, True)
+
+    def blocked(self, now, state="blocked.repeat|1|0", first=False, answered=None):
+        return sb.add_repeat_reminder(self.state, "cos", now, now, "Blocked agent: x", "blocked-agent", "coder", state, first=first, answered_at=answered)
+
+    def test_s2_s3_the_same_state_is_delivered_once_per_six_hours(self):
+        self.assertIsNotNone(self.blocked(0))
+        self.assertIsNone(self.blocked(3600))
+        self.assertIsNone(self.blocked(6 * 3600 - 60))
+        self.assertIsNotNone(self.blocked(6 * 3600))
+        self.assertIsNotNone(self.blocked(6 * 3600 + 10, state="blocked.repeat|2|0"), "a state change is at once")
+        self.assertEqual(len(sb.read_reminders(self.state)), 3)
+
+    def test_s5_an_answered_item_is_not_re_raised_until_its_state_changes(self):
+        self.blocked(0)
+        self.assertIsNone(self.blocked(7 * 3600, answered=100), "answered after the finding: not re-raised even past 6 hours")
+        self.assertIsNotNone(self.blocked(7 * 3600 + 1, state="blocked.repeat|9|0", answered=100))
+
+    def test_u1_a_first_report_an_owner_wait_and_a_held_pr_are_never_held(self):
+        self.blocked(0, state="blocked.report|1|0", first=True)
+        self.assertIsNotNone(self.blocked(60, state="blocked.report|1|0", first=True), "a first report of the same state passes")
+        self.assertIsNotNone(sb.add_repeat_reminder(self.state, "cos", 0, 0, "owner wait", "owner-wait", "pr1", "s"))
+        self.assertIsNotNone(sb.add_repeat_reminder(self.state, "cos", 0, 0, "held pr", "held-pr", "pr2", "s"))
+        self.assertIsNotNone(sb.add_repeat_reminder(self.state, "cos", 0, 0, "dead", "dead-agent", "coder", "s"))
+
+    def test_s6_the_newer_result_goes_first_and_the_old_reminder_last(self):
+        old = fact("reminder:old", EPOCH, summary="old reminder", kind="reminder")
+        new = fact("result:new", EPOCH + 7200, summary="newer result", kind="report")
+        text, carried = sb.compose("cos", [old, new])
+        lines = text.splitlines()
+        self.assertIn("newer result", lines[1])
+        self.assertIn("old reminder", lines[2])
+        self.assertEqual([f.key for f in carried], ["result:new", "reminder:old"])
+
+    def test_s4_one_wake_is_one_message_one_line_per_item(self):
+        items = [("sweep", "S5 a"), ("sweep", "S5 b"), ("triage", "T1 a"), ("triage", "T2 b"), ("load", "high")]
+        text = sb.merge_wake(items)
+        self.assertEqual(len(text.splitlines()), 6)   # one header and five lines
+        for cls, line in items:
+            self.assertIn(line, text)
+
+    def test_s7_the_table_names_every_sender_found_in_the_source(self):
+        found = set()
+
+        def walk(node, stack):
+            for child in ast.iter_child_nodes(node):
+                inner = stack + [child.name] if isinstance(child, ast.FunctionDef) else stack
+                if isinstance(child, ast.Call) and getattr(child.func, "id", None) in ("add_reminder", "add_repeat_reminder") and stack:
+                    found.add("load_tick" if stack[-1] == "wake" else stack[-1])   # load_tick's inner wake is load_tick's send
+                walk(child, inner)
+        walk(ast.parse(Path(SWITCHBOARD).read_text()), [])
+        found.discard("add_repeat_reminder")
+        docs = (Path(SWITCHBOARD).parent.parent / "docs" / "switchboard.md").read_text()
+        self.assertEqual(sorted(found - set(sb.FINDING_TABLE)), [], "a finding sender is missing from FINDING_TABLE")
+        for name in sb.FINDING_TABLE:
+            self.assertIn("`%s`" % name, docs, "%s is missing from the docs table" % name)
+
+    def test_blocked_agent_and_load_alert_senders_are_gated(self):
+        src = Path(SWITCHBOARD).read_text()
+        self.assertIn('"Blocked agent: " + text, "blocked-agent"', src)
+        self.assertIn('"load-alert", "load", text', src)
+
+    def test_s10_s11_the_header_is_short_after_the_first_delivery_of_the_day(self):
+        long_text = "Intent: " + "x" * 1000
+        clock = {"t": 1000.0}
+        reader = sb.IntentReader.__new__(sb.IntentReader)
+        reader.now = lambda: clock["t"]
+        reader.repo = "o/r"
+        issue = types.SimpleNamespace(charter=False, number=5, intent=long_text, done_when="d" * 500, repo="o/r")
+        reader.issue = lambda n, repo=None: issue
+        reader.ask_of = lambda n, repo=None: (5, None)
+        full = reader.header(5)[1]
+        self.assertGreater(sum(len(l) for l in full), 300)
+        short = reader.header(5)[1]
+        self.assertEqual(len(short), 1)
+        self.assertLessEqual(len(short[0]), 160)
+        clock["t"] += 86400
+        self.assertGreater(sum(len(l) for l in reader.header(5)[1]), 300, "the next day carries the full text again")
 
 
 # ------------------------------------------------------------------ delivering
@@ -15999,12 +16085,18 @@ class CharterRig:
         self.cmd_labels = {1: True, 3: True, 4: True, 9: True, 5: False, 6: False, 7: False}
         self.cmd_reads = []
         def cmd_parent(reader, number, repo=None):
-            self.cmd_reads.append(("parent", number))
+            self.cmd_reads.append(("parent", number, repo))
+            if not repo:   # #1275: the fake honours the repo argument (a call without it fails)
+                raise sb.IntentError("not_found", "wrong repo %r" % (repo,))
             return self.cmd_parents[number]
         def cmd_issue(reader, number, repo=None):
-            self.cmd_reads.append(("issue", number))
+            self.cmd_reads.append(("issue", number, repo))
+            if not repo:
+                raise sb.IntentError("not_found", "wrong repo %r" % (repo,))
             return types.SimpleNamespace(number=number, labels=[sb.orchestrator_label()] if self.cmd_labels[number] else ["other"])
-        for name, fake in (("parent", cmd_parent), ("issue", cmd_issue)):
+        def cmd_invalidate(reader, number, repo=None):
+            self.cmd_reads.append(("invalidate", number, repo))
+        for name, fake in (("parent", cmd_parent), ("issue", cmd_issue), ("invalidate", cmd_invalidate)):
             patcher = mock.patch.object(sb.IntentReader, name, fake)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -16403,6 +16495,12 @@ class TestCharterSetGuard(CharterRig, Base):
         self.assertIsNone(self.row("orch-b")["charter"])
         self.assertEqual([e["event"] for e in self.audit_lines()], ["charter.refused"] * 3)
 
+    def test_1275_the_guard_reads_with_the_repo_and_a_fresh_label(self):
+        self.orchestrator("orch-b", registry=None)
+        code, out, err = self.run_as("cos", "charter", "set", "orch-b", "3")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.cmd_reads, [("parent", 3, self.REPO), ("invalidate", 3, self.REPO), ("issue", 3, self.REPO)])
+
     def test_changing_a_set_charter_needs_replace(self):
         self.orchestrator("orch-b", registry=3)
         code, out, err = self.run_as("cos", "charter", "set", "orch-b", "4")
@@ -16477,7 +16575,7 @@ class TestCharterSetGuard(CharterRig, Base):
     def test_a_set_reads_at_most_one_more_than_before_and_writes_nothing(self):
         self.orchestrator("orch-b", registry=None)
         self.run_as("cos", "charter", "set", "orch-b", "3")
-        self.assertEqual(self.cmd_reads, [("parent", 3), ("issue", 3)])
+        self.assertEqual([r[:2] for r in self.cmd_reads if r[0] != "invalidate"], [("parent", 3), ("issue", 3)])
 
     def test_mutant_an_ask_is_accepted(self):
         self.orchestrator("orch-b", registry=None)

@@ -86,6 +86,78 @@ def add_reminder(state_dir, to, at, created, text, issue=None, sender=None, repo
     return item
 
 
+# ---- repeats (#1275): a reminder repeated for the same (kind, subject, state) is delivered once per REPEAT_WINDOW
+
+REPEAT_WINDOW = 6 * 3600
+REPEAT_FILE = "reminder-repeats.json"
+
+
+def _repeat_read(state_dir):
+    try:
+        raw = json.loads((Path(state_dir) / REPEAT_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def last_send_at(state_dir, sender, recipient):
+    """When `sender` last sent to `recipient` (last-reports.json `send_to`), or None."""
+    try:
+        entry = _read_small(state_dir, LAST_REPORT_FILE).get(sender, {})
+        sent = (entry.get("send_to") or {}).get(recipient)
+    except (OSError, AttributeError):
+        return None
+    return float(sent) if _is_number(sent) else None
+
+
+def repeat_due(state_dir, to, kind, subject, state, now, first=False, answered_at=None, window=None):
+    """True when a reminder of this (kind, subject, state) for `to` is to be delivered now, and remembers it.
+    A first sight, a changed state and a `first` report always pass (an owner wait, a held PR and the FIRST report of a
+    dead or blocked agent are never repeats). An unchanged state is held for `window` seconds (6 hours), and
+    while it stays unchanged after `answered_at` (a send on that item since the finding) it is not re-raised."""
+    window = REPEAT_WINDOW if window is None else window
+    key = "%s|%s|%s" % (kind, subject, to)
+    with reminders_lock(state_dir):
+        known = _repeat_read(state_dir)
+        before = known.get(key)
+        if not first and isinstance(before, dict) and before.get("state") == state and _is_number(before.get("at")):
+            if answered_at is not None and answered_at >= before["at"]:
+                return False
+            if now - before["at"] < window:
+                return False
+        known[key] = {"state": state, "at": float(now)}
+        path = Path(state_dir) / REPEAT_FILE
+        temp = path.with_name("%s.%d.tmp" % (REPEAT_FILE, os.getpid()))
+        temp.write_text(json.dumps(known, sort_keys=True))
+        os.replace(str(temp), str(path))
+    return True
+
+
+def add_repeat_reminder(state_dir, to, at, created, text, kind, subject, state, first=False, answered_at=None, **more):
+    """add_reminder behind the repeat rule: returns the item, or None when it is a repeat held back."""
+    if not repeat_due(state_dir, to, kind, subject, state, at, first=first, answered_at=answered_at):
+        return None
+    return add_reminder(state_dir, to, at, created, text, **more)
+
+
+# The table of every finding kind sent to the Chief of Staff, by the function that sends it:
+# function -> (kind, repeat key, window, test). docs/switchboard.md carries the same table; a test derives the senders from the source.
+FINDING_TABLE = {
+    "tell": ("Blocked agent", "(agent, recipient, held, refused)", "6 hours; first report and end line at once", "test_s2_s3_the_same_state_is_delivered_once_per_six_hours"),
+    "load_tick": ("load alert", "(alert text)", "6 hours", "test_blocked_agent_and_load_alert_senders_are_gated"),
+    "friction_tick": ("friction wake", "once per slot (own slot state)", "per slot", "test_s7_the_table_names_every_sender_found_in_the_source"),
+    "cmd_budget_notice": ("budget notice", "once per hour per account (own claim)", "1 hour", "test_s7_the_table_names_every_sender_found_in_the_source"),
+    "_impact_matrix_episode": ("impact matrix unreadable", "once per episode (own state)", "per episode", "test_s7_the_table_names_every_sender_found_in_the_source"),
+    "_impact_post_list": ("owner-hold rule list", "once per rule version (own state)", "per rule", "test_s7_the_table_names_every_sender_found_in_the_source"),
+}
+
+
+def merge_wake(items):
+    """One message per wake: `items` is [(class, line)]; one line per item, one header with the count."""
+    lines = ["- %s: %s" % (cls, " ".join(str(line).split())) for cls, line in items]
+    return "[switchboard] %d item%s this wake\n%s" % (len(lines), "" if len(lines) == 1 else "s", "\n".join(lines))
+
+
 def remove_reminders(state_dir, ids):
     """Drop these ids from reminders.json. Returns the ids that were there."""
     with reminders_lock(state_dir):
