@@ -2942,7 +2942,16 @@ class Switchboard:
                                  "ask sections are added; the allowed text for this message is %d characters: nothing was "
                                  "sent. Write it to a file in the opencode temp dir and send the path"
                                  % (len(sent.summary), MESSAGE_CAP, allowed))
-        keys = [key for fact in carried for key in (getattr(fact, "members", None) or [fact.key])]
+        if getattr(self, "intents", None) is not None and hasattr(self.intents, "discard_told"):
+            # #1275: only the asks of the CARRIED facts are told (compose rendered every fact's header)
+            self.intents.discard_told()
+            compose(plan.recipient, carried, section=section_resolver(self, observation), repos=repos, delivered=self.now())
+        keys = []
+        for fact in carried:
+            lines = getattr(fact, "member_lines", None)
+            for key in (getattr(fact, "members", None) or [fact.key]):
+                if lines is None or lines.get(key, "") in text:   # a merged member counts only if its line is in the message
+                    keys.append(key)
         # The id lives in v2's namespace, so it is derived from the session the
         # recipient runs now: a relaunched agent is a new recipient for v2.
         message_id = derive_message_id(observation.session_id, keys)

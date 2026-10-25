@@ -226,20 +226,34 @@ def wake_class_of(fact):
     return fact.kind if fact.kind in WAKE_KINDS else getattr(fact, "wake_class", None)
 
 
-def merge_wake_facts(recipient, facts):
-    """The facts of ONE wake for `recipient` with the sweep, triage and load-alert items folded into one fact (one line per item, oldest
-    last). Everything else (an owner wait, a held PR, a blocked agent's report, a send) is passed through untouched. One such fact stays
-    as it is. The merged fact carries every member's key, so each is acknowledged once it is delivered."""
+WAKE_MERGE_BUDGET = 3000   # characters of merged text: the cap (4000) less compose's header, group lines and the "and N more" line
+
+
+def merge_wake_facts(recipient, facts, budget=None):
+    """The facts of ONE wake for `recipient` with the sweep, triage and load-alert items folded into one fact (one line per item, newest
+    first). Only as many items as FIT in `budget` (header included) are merged; the REST stay separate pending facts for the next message, so
+    every finding is delivered over successive messages and none is lost. Everything else (an owner wait, a held PR, a blocked agent's report,
+    a send) is passed through untouched. The merged fact keeps `members` (keys) and `member_lines`; deliver acknowledges only the carried ones."""
+    budget = WAKE_MERGE_BUDGET if budget is None else budget
     mine = [f for f in facts if wake_class_of(f)]
     if len(mine) < 2:
         return list(facts)
     mine.sort(key=lambda f: (-f.created, f.key))
-    keys = [f.key for f in mine]
+    take = 0
+    for count in range(1, len(mine) + 1):
+        if len(merge_wake([(wake_class_of(f), f.summary) for f in mine[:count]])) > budget:
+            break
+        take = count
+    if take < 2:
+        return list(facts)
+    group, rest = mine[:take], mine[take:]
+    keys = [f.key for f in group]
     merged = Fact("wake:" + hashlib.sha256("|".join(keys).encode()).hexdigest()[:12], recipient, "wake",
-                  merge_wake([(wake_class_of(f), f.summary) for f in mine]), max(f.created for f in mine),
-                  batch=all(f.batch for f in mine), sender="switchboard")
+                  merge_wake([(wake_class_of(f), f.summary) for f in group]), max(f.created for f in group),
+                  batch=all(f.batch for f in group), sender="switchboard")
     merged.members = keys
-    return [f for f in facts if not wake_class_of(f)] + [merged]
+    merged.member_lines = {f.key: "- %s: %s" % (_clean_line(wake_class_of(f)), _clean_line(f.summary)) for f in group}
+    return [f for f in facts if not wake_class_of(f)] + rest + [merged]
 
 
 def remove_reminders(state_dir, ids):

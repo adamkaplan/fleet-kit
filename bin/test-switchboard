@@ -2092,6 +2092,41 @@ class TestEachThingOnce(Base):
         self.assertEqual(len(merged), 4)
         self.assertNotIn("\x1b", sb.merge_wake([("sweep", "bad \x1b[31mred\x1b[0m \x07 line")]))
 
+    def many_world(self):
+        world = World(self, agents=("platform",))
+        for n in range(20):
+            world.fact("platform", "sweep:%d" % n, "sweep finding %02d " % n + "x" * 280, kind="sweep")
+        world.tick(120)
+        return world
+
+    def test_cap_20_findings_of_300_chars_are_all_delivered_over_successive_messages_none_lost(self):
+        world = self.many_world()
+        for _ in range(30):
+            world.engine.run_pass()
+            world.tick(120)
+        texts = [m["text"] for m in world.admissions("platform")]
+        self.assertGreater(len(texts), 1)
+        for text in texts:
+            self.assertLessEqual(len(text), sb.MESSAGE_CAP)
+            self.assertNotIn("[cut at", text)
+        for n in range(20):
+            self.assertEqual(sum("sweep finding %02d " % n in t for t in texts), 1, n)
+
+    def test_cap_merge_only_what_fits_and_the_rest_stay_pending(self):
+        facts = [fact("s%d" % n, kind="sweep") for n in range(20)]
+        for f in facts:
+            f.summary = "x" * 300
+        merged = sb.merge_wake_facts("platform", facts)
+        (wake,) = [f for f in merged if f.kind == "wake"]
+        self.assertLess(len(wake.members), 20)
+        self.assertEqual(len(wake.members) + len([f for f in merged if f.kind != "wake"]), 20)
+        self.assertLessEqual(len(wake.summary), sb.WAKE_MERGE_BUDGET)
+
+    def test_mutant_merging_everything_loses_findings(self):
+        with mock.patch.object(sb, "WAKE_MERGE_BUDGET", 10 ** 9):
+            with self.assertRaises(AssertionError):
+                self.test_cap_20_findings_of_300_chars_are_all_delivered_over_successive_messages_none_lost()
+
     def test_the_delivered_message_acknowledges_every_member_key(self):
         world = self.wake_world()
         (sent,) = world.admissions("platform")
